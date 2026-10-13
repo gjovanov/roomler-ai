@@ -1,8 +1,9 @@
 # FR-97: OS parity — what one OS does, the other two do, or the device says why not
 
 **Issue:** [#2082](https://github.com/gjovanov/roomler-ai/issues/2082) · **Status:** in progress — P0a (#2081, #2085)
-shipped in 0.4.132 and field-verified (AC1); P0b-1 (#2098) and P0b-2a (#2104) merged; P0b-3 (#2108) in review;
-P0b-2b not started · **Owner:** the agent on all
+shipped in 0.4.132 and field-verified (AC1); P0b-1 (#2098, server) live since the hosted promote of `c6bcdb2de`;
+P0b-2a (#2104, device) ships in 0.4.133; P0b-3 (#2108, admin row) merged, not yet promoted; P0b-2b not started;
+P1a (the macOS exit client) in review · **Owner:** the agent on all
 three platforms; the network module for the route gate (P0b) ·
 **Depends on:** [FR-43](FR-43-macos-single-enrollment.md) P3 (one Mac, one row, in the mesh),
 [FR-94](FR-94-fleet-rpc-system-on-windows.md) (Windows exec as SYSTEM),
@@ -101,7 +102,7 @@ prevent, and the guard re-asserts it on every tick.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | N1 | In the mesh on a default install | ✅ | ✅ | ❌ | The default `.pkg` installs the per-user half, which cannot create a utun; the mesh needs `--daemon-token`, a second enrollment and a second device row (`scripts/install.sh:408-411`, `packaging/macos/com.roomler.daemon.plist` header) | FR-43 P3 |
-| N2 | Exit node, client | ✅ | ✅ | ❌ unsafe | S1; no original-default capture (`tun.rs:1931-1939`, `3471-3503` are `cfg(any(linux, windows))`) | P0a, P1a |
+| N2 | Exit node, client | ✅ | ✅ | 🟡 withheld since 0.4.132; routes with P1a, DNS with P1c | S1; no original-default capture (`tun.rs:1931-1939`, `3471-3503` are `cfg(any(linux, windows))`) | P0a, P1a |
 | N3 | Exit node, serving v4 | 🟡 WinNAT; Home ❌ | ✅ iptables | ❌ | Silent no-op (`nat.rs:353-355`); Home: #2077 | P0b, P1b, P4e |
 | N4 | Exit node, serving v6 | ⛔ WinNAT has no v6 (`nat.rs:245-251`) | ✅ ip6tables | ❌ | — | P1b; Windows: D1 |
 | N5 | Subnet router, serving | 🟡 WinNAT; Home ❌ | ✅ | ❌ | Same no-op; routes still advertised and approvable | P0b, P1b |
@@ -111,6 +112,8 @@ prevent, and the guard re-asserts it on every tick.
 | N9 | LAN-direct egress pin; own-route repair | ✅ `IP_UNICAST_IF` (`direct.rs:466-507`), `lan_repair.rs` | ❌ | ❌ | The field case was Windows + AnyConnect | §7 (evidence first) |
 | N10 | Per-org TUN (multi-org) | ✅ | ✅ | ❓ | One utun per org in code (`agents/roomlerd/src/overlay.rs:303-316`), never run on a Mac; `roomler org join` still warns it is unsupported (`org_join.rs:561-566`, stale) | P1d |
 | N11 | Port-holder diagnostics | ✅ | ✅ | 🟡 `Unknown` (`port_holder.rs:316-323`) | Diagnostics only | P1d |
+| N12 | Exit client: the pins follow the uplink | ❌ | ❌ | ✅ P1a | Found in P1a. Linux and Windows pin through the default captured once at bring-up and never re-read it (`TunIo::stale_host_exemptions` keeps its empty default there). After a network change under an active exit, a pin the OS did not flush with the old interface still points at a next hop that no longer answers: the exit's carrier dies, the teardown removes the `/1`s, and a stale `/32` for the coordination server keeps the control WS from coming back until a restart. Code reading; not reproduced yet | P0e |
+| N13 | Exit client: no pin outlives the daemon | ❌ | ❌ | ❌ | Found in P1a. `purge_exit_routes` (boot and every pre-`process::exit` path) removes the `/1`s and the DNS steer, never the `/32`/`/128` pins through the physical uplink, and nothing records which host routes were ours. Harmless on the same network; after a network change the OS did not flush them with, a black hole for the endpoint, the coordination server's included. On a Mac, P1a repoints a leftover pin in place if the next run is an exit client again; nothing removes one otherwise. Code reading | P0e |
 
 At parity already: TUN bring-up; v4 and v6 ULA addressing (the exit-node doc's "utun v4-only" is stale,
 `tun.rs:4704-4737`); route-change subscriptions (`NotifyRouteChange2` · `ip monitor` · `route -n monitor`);
@@ -201,7 +204,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 
 | Doc | Says | Code |
 |---|---|---|
-| `docs/overlay-exit-nodes.md:228` | macOS utun is v4-only; exit routing not wired | v6 is assigned (`tun.rs:4704-4737`); the client half is wired except for the exemptions (S1) |
+| `docs/overlay-exit-nodes.md:228` | macOS utun is v4-only; exit routing not wired | v6 is assigned (`tun.rs:4704-4737`); the client half is wired except for the exemptions (S1). **Fixed with P1a:** a per-OS table and a macOS client section |
 | `ui/docs/content/network/exit-nodes.md` | no platform caveat; v4, v6 and DNS all routed | Windows exits are v6 fail-closed; macOS and Windows Home cannot serve |
 | `docs/overlay-exit-nodes.md:250-252` | approval needs a re-join | the server re-fans at once (`overlay_route.rs:301,375`) |
 | `ui/docs/content/network/multi-org.md:87`, `org_join.rs:561-566` | a Mac cannot run a per-org TUN | the per-org utun code is unconditional (N10) |
@@ -278,16 +281,36 @@ flowchart TB
 
 ### 3.4 P1a — the macOS exit client
 
-Mirror the Linux arm with the BSD tools the macOS code already drives (`netstate.rs:774-800` parses `route -n get`):
+Mirror the Linux arm with the BSD tools the macOS code already drives, and close two gaps the Linux arm has (N12):
 
-1. At bring-up, capture the original v4 and v6 defaults (`route -n get default`, `route -n get -inet6 default`).
-   Lift `orig_default` / `orig_default_v6` out of their `cfg(any(linux, windows))` fence (`tun.rs:1931-1939`,
-   `3471-3503`).
-2. `add_host_exemption`: `route -n add -host <ip> <gw>`; for v6, `route -n add -inet6 -host <ip6> <gw6>`, scoping a
-   link-local gateway to its interface (`fe80::1%en0`).
-3. Read it back with `route -n get <ip>`. The answer must name the uplink, never `utunN`; anything else is an `Err`,
-   and the gate withholds.
-4. `del_host_exemption` is symmetric; the boot purge already removes the `/1`s (`tun.rs:4603-4646`).
+1. **The uplink, per family.** At bring-up, `route -n get [-inet6] default` gives the next hop and the interface
+   (`tun.rs:3854`). It is kept in a mutex rather than a fixed field like `orig_default`, because it is RE-READ before
+   every pin (`current_uplink`, `tun.rs:5420`): a Mac that booted without a network still pins once it has one, and
+   one that changed networks pins through the new uplink. `bsd_default_uplink` (`tun.rs:332`) refuses a route on our
+   own utun, one narrower than `/0` (a `/1` also prints `destination: default`; only the mask tells), and one with no
+   next-hop address (another VPN's interface route). A family with no usable default keeps what it had, so a network
+   in transit does not move the pins.
+2. **`add_host_exemption`** (`tun.rs:4742`) looks first, because BSD `route` has no idempotent write (#1856): a pin
+   that holds is left alone; a static host route through another next hop is repointed with `route change`, which
+   leaves no instant where the endpoint falls into the `/1`s; an interface route for the address is replaced;
+   anything else gets `route add -host <ip> <gw>` (`-inet6` and a zoned `fe80::1%en0` for v6).
+3. **The read-back decides** (`bsd_exemption_holds`, `tun.rs:384`): a STATIC host route for exactly the address,
+   flagged GATEWAY, through the uplink's next hop, on its interface. A clone of the default route (`WASCLONED`) shows
+   the same gateway and is not a pin: it expires and is re-cloned from whatever covers the address by then, our `/1`
+   under an exit. On a mismatch after a successful write, the route written comes out again and the call errs.
+4. **The pins follow the uplink.** `TunIo::stale_host_exemptions` (new; `tun.rs:4838` on macOS, an empty default
+   elsewhere) names the pins that no longer read back through the current uplink. The gate (`route_guard.rs:570`)
+   asks at most every 3 s, re-pins each, and DELETES one it cannot re-pin before forgetting it, so an untracked
+   route never outlives the exit. Then the usual rule applies: a v4 pin missing means WITHHOLD.
+5. **`del_host_exemption`** removes only a static host route for exactly the address, never one on our utun (a peer
+   route). The boot purge already removes the `/1`s (`tun.rs:4603-4646` at the time of writing); pins an unclean exit
+   leaves behind are N13, all three OSes.
+6. **The two 0.4.132 follow-ups.** The pin WARN fires once per (endpoint, cause) (`note_exemption_failure`,
+   `route_guard.rs:370`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
+   (`exemption_withheld_reason`, `route_guard.rs:382`) instead of `no original default route?`.
+
+Kill switch: `ROOMLERD_EXIT_CLIENT_MACOS=0` refuses every exemption, as 0.4.132 did. DNS is not steered yet (P1c):
+`roomler status` says `DNS NOT steered`.
 
 ```mermaid
 sequenceDiagram
@@ -307,9 +330,9 @@ sequenceDiagram
     end
 ```
 
-⚠️ A Wi-Fi ↔ Ethernet change moves the default gateway. The exemptions are pinned to the captured gateway, so on a
-default-route change (the macOS `route -n monitor` backend already classifies these) re-capture and re-pin before
-re-asserting the `/1`s, in the same order as the first install.
+⚠️ A Wi-Fi ↔ Ethernet change moves the default gateway. Step 4 is what follows it: the re-check reads the uplink
+again and re-pins with the `/1`s left in place. A pin that cannot follow is removed, and the gate withholds until one
+can.
 
 ### 3.5 P1b — serving on macOS (exit and subnet router) — D1
 
@@ -459,7 +482,8 @@ model on Windows, so the three agree on what the mode means.
 | **P0b** | The NAT probe gates the offer; the server fans approved ∩ advertised; the Windows revert restores forwarding; an OS chip and the reason in the admin UI (S2, #2077) | device `ROOMLERD_ROUTE_OFFER_UNPROBED=1`; a server flag for the plain fan | Win11 Home and Pro, Linux, macOS cells | S–M |
 | **P0c** | Honest caps: `opus` only with a capture backend; the image-event cap only where watched; no clipboard cap on a root Linux daemon without a display; Ctrl+Alt+Del only where the host can send it; the wizard offered only where it installs the agent; a netstack node's exit status never `active` | — | a test per word, failing on master | S |
 | **P0d** | Measure: the native architecture in the hello; a server count of capability words by OS and architecture | — | the server | S |
-| **P1a** | macOS exit client | `overlay_exit_node` unset; `ROOMLERD_EXIT_CLIENT_MACOS=0` | vmtest: a macOS client of a Linux exit | M |
+| **P0e** | Exit-client pins on all three: they follow the uplink on Linux and Windows too (N12), and a ledger lets the boot and pre-exit purge remove the ones an unclean exit left (N13) | — (a safety fix) | a Linux and a Windows client changing networks under an active exit, red first; `kill -9`, then a network change | M |
+| **P1a** | macOS exit client | `overlay_exit_node` unset; `ROOMLERD_EXIT_CLIENT_MACOS=0` | the macOS kernel tests in CI (a staged capture of TEST-NET-3); vmtest: a macOS client of a Linux exit | M |
 | **P1b** | macOS exit + subnet serving through pf (D1) | `ROOMLERD_PF_NAT=0` | vmtest: a macOS exit for Linux and Windows clients | M–L |
 | **P1c** | macOS DNS: MagicDNS + the exit catch-all | `ROOMLERD_MACOS_DNS_STEER=0` | vmtest | M |
 | **P1d** | A macOS per-org utun run once; the stale warning; the port holder | — | vmtest, two orgs | S |
@@ -497,8 +521,8 @@ model on Windows, so the three agree on what the mode means.
 Kill switches named `ROOMLERD_*`, and `ssh_sftp_as_user`, are proposed names. `[apps] enabled`, `hive_adopt`,
 `power_policy` and `ssh_account_mode` exist today.
 
-**Order.** P0 ships in one release before anything else; P0a can go out ahead of the FR on its own issue (D9). Then
-P1, the headline and the only place a Mac can be wedged. Then P2, P3 and P4 in the order field demand sets, P5 after
+**Order.** P0 ships in one release before anything else; P0a can go out ahead of the FR on its own issue (D9). P0e
+was found while building P1a and follows it. Then P1, the headline and the only place a Mac can be wedged. Then P2, P3 and P4 in the order field demand sets, P5 after
 FR-94, and P6 and P7 alongside. A phase sized L splits into its own FR when it starts, as FR-95 split from FR-93.
 Each phase ships in an agent release (the `ship-it` skill owns the mechanics) and is field-verified before the next
 one depends on it.
@@ -546,6 +570,9 @@ one depends on it.
 - [ ] **AC16 (docs):** `docs/platform-support.md` (a mermaid map, the per-pillar tables, the reason for every ⛔,
   `file:line` anchors), the user-facing `ui/docs/content/reference/platform-support.md`, every row of §2.8
   corrected, and the `docs/README.md` index row.
+- [ ] **AC17 (P0e):** a Linux and a Windows exit client that change networks under an active exit re-pin through the
+  new uplink within one sweep, and the control WS stays up; after a `kill -9` and a network change, no exemption
+  route is left on any of the three OSes. Red first on the current release.
 
 ## 6. Open decisions (operator)
 

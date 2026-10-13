@@ -326,6 +326,10 @@ impl TunIo for SplitTun {
     async fn del_host_exemption(&self, ip: std::net::IpAddr) {
         self.inner.del_host_exemption(ip).await
     }
+
+    async fn stale_host_exemptions(&self, pinned: &[std::net::IpAddr]) -> Vec<std::net::IpAddr> {
+        self.inner.stale_host_exemptions(pinned).await
+    }
 }
 
 /// Warn when an OS daemon already answers on the address+port we are about to
@@ -441,6 +445,26 @@ mod tests {
             let _ = self.seen.send(packet.to_vec());
             Ok(())
         }
+        /// Everything is stale, so a shim that kept the trait's empty default
+        /// shows up as an empty answer.
+        async fn stale_host_exemptions(
+            &self,
+            pinned: &[std::net::IpAddr],
+        ) -> Vec<std::net::IpAddr> {
+            pinned.to_vec()
+        }
+    }
+
+    /// FR-97 P1a — the stale-exemption check reaches the real device. Keeping
+    /// the trait's empty default here would quietly switch off the re-pin on
+    /// every host that serves SSH, which is when the OS device sits under
+    /// this shim.
+    #[tokio::test]
+    async fn the_stale_exemption_check_reaches_the_os_device() {
+        let (mock, _seen) = mock_os_tun();
+        let split = SplitTun::wrap(mock, SELF_IP, 10, 1280, PORT);
+        let pinned = [std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))];
+        assert_eq!(split.stale_host_exemptions(&pinned).await, pinned.to_vec());
     }
 
     fn mock_os_tun() -> (Arc<MockOsTun>, mpsc::UnboundedReceiver<Vec<u8>>) {

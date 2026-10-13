@@ -8151,4 +8151,216 @@ mod tests {
                 .dns_steered
         );
     }
+
+    // ---- FR-97 P1a — pins that stop holding, and the cause they report ----
+
+    #[test]
+    fn a_pin_failure_is_news_once_per_cause() {
+        let mut st = ExitRoutingState::default();
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(note_exemption_failure(&mut st, ip, "no IPv4 default route"));
+        assert!(
+            !note_exemption_failure(&mut st, ip, "no IPv4 default route"),
+            "the same cause again is not news: the gate retries every few seconds"
+        );
+        assert!(
+            note_exemption_failure(&mut st, ip, "route refused the pin"),
+            "a new cause is"
+        );
+        let other: IpAddr = "198.51.100.9".parse().unwrap();
+        assert!(
+            note_exemption_failure(&mut st, other, "route refused the pin"),
+            "and it is per endpoint"
+        );
+        // It pinned, which clears it, so failing again later is news again.
+        st.exemption_failures.remove(&ip);
+        assert!(note_exemption_failure(&mut st, ip, "route refused the pin"));
+    }
+
+    #[test]
+    fn the_withheld_reason_names_the_lowest_missing_v4_cause() {
+        let mut st = ExitRoutingState::default();
+        let a: IpAddr = "198.51.100.9".parse().unwrap();
+        let b: IpAddr = "203.0.113.7".parse().unwrap();
+        let v6: IpAddr = "2001:db8::7".parse().unwrap();
+        let want: HashSet<IpAddr> = [a, b, v6].into_iter().collect();
+        st.exemption_failures.insert(a, "cause a".into());
+        st.exemption_failures.insert(b, "cause b".into());
+        st.exemption_failures.insert(v6, "cause v6".into());
+        assert_eq!(
+            exemption_withheld_reason(&want, &st),
+            "carrier-endpoint exemption for 198.51.100.9 unavailable: cause a"
+        );
+        // Once that one pins, the next is named. v6 never decides the v4 gate.
+        st.exemptions.insert(a);
+        assert_eq!(
+            exemption_withheld_reason(&want, &st),
+            "carrier-endpoint exemption for 203.0.113.7 unavailable: cause b"
+        );
+        st.exemption_failures.clear();
+        assert_eq!(
+            exemption_withheld_reason(&want, &st),
+            "carrier-endpoint exemption for 203.0.113.7 unavailable",
+            "no recorded cause still names the endpoint"
+        );
+    }
+
+    #[test]
+    fn the_pin_recheck_is_bounded() {
+        let t0 = Instant::now();
+        assert!(exemption_recheck_due(None, t0), "never checked: due");
+        assert!(!exemption_recheck_due(Some(t0), t0));
+        assert!(!exemption_recheck_due(
+            Some(t0),
+            t0 + EXEMPTION_RECHECK_EVERY - Duration::from_millis(1)
+        ));
+        assert!(exemption_recheck_due(
+            Some(t0),
+            t0 + EXEMPTION_RECHECK_EVERY
+        ));
+    }
+
+    /// A device for the exit gate: pins succeed or fail on demand, the device
+    /// names the pins it scripts as stale, and every route call is recorded.
+    struct ExemptionTun {
+        pin_ok: std::sync::atomic::AtomicBool,
+        stale: std::sync::Mutex<Vec<IpAddr>>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+    impl ExemptionTun {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                pin_ok: std::sync::atomic::AtomicBool::new(true),
+                stale: std::sync::Mutex::new(Vec::new()),
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn log(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+        fn take_calls(&self) -> Vec<String> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+    }
+    #[async_trait]
+    impl TunIo for ExemptionTun {
+        async fn read_packet(&self) -> io::Result<Vec<u8>> {
+            std::future::pending().await
+        }
+        async fn write_packet(&self, _packet: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+        async fn add_cidr_route(&self, cidr: &str) -> io::Result<()> {
+            self.log(format!("add {cidr}"));
+            Ok(())
+        }
+        async fn del_cidr_route(&self, cidr: &str) {
+            self.log(format!("del {cidr}"));
+        }
+        async fn add_host_exemption(&self, ip: IpAddr) -> io::Result<()> {
+            self.log(format!("pin {ip}"));
+            if self.pin_ok.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "no IPv4 default route through a gateway to pin it on",
+                ))
+            }
+        }
+        async fn del_host_exemption(&self, ip: IpAddr) {
+            self.log(format!("unpin {ip}"));
+        }
+        async fn stale_host_exemptions(&self, pinned: &[IpAddr]) -> Vec<IpAddr> {
+            self.log(format!("recheck {}", pinned.len()));
+            std::mem::take(&mut *self.stale.lock().unwrap())
+        }
+    }
+
+    /// FR-97 P1a — the uplink moves under an active exit (Wi-Fi ↔ Ethernet).
+    /// A pin that stops holding is re-pinned through the new uplink with the
+    /// `/1`s left in place; one that cannot be re-pinned is DELETED before it
+    /// is forgotten, and the exit is withheld with the device's own cause. A
+    /// forgotten host route on a dead next hop black-holes the endpoint it
+    /// was pinned for, and no later teardown would ever remove it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pin_that_stops_holding_is_repinned_or_removed_never_forgotten() {
+        let kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let tun = ExemptionTun::new();
+        let tf: TunFactory = {
+            let m = tun.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let id = exit_oid(0x31);
+        let server: IpAddr = "203.0.113.7".parse().unwrap();
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280)
+            .with_exit_node(Some(id.to_hex()), vec![server]);
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let dev: Arc<dyn TunIo> = tun.clone();
+        let mut peers = HashMap::new();
+        peers.insert(id, exit_np(id, "exit-a", vec!["0.0.0.0/0".into()]));
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            id,
+            Installed::base(
+                [7u8; 32],
+                Ipv4Addr::new(100, 64, 0, 1),
+                DirectTier::Lan,
+                Instant::now(),
+            ),
+        );
+        let mut st = ExitRoutingState::default();
+
+        rt.reconcile_exit_routing(&mut wg, &dev, &by_node, &peers, &mut st)
+            .await;
+        assert!(st.split_default_installed && st.exemptions.contains(&server));
+        assert_eq!(
+            tun.take_calls().first().map(String::as_str),
+            Some("pin 203.0.113.7"),
+            "pinned BEFORE the /1s"
+        );
+
+        // The uplink moved and the new one takes the pin: re-pinned in place,
+        // nothing torn down.
+        *tun.stale.lock().unwrap() = vec![server];
+        rt.reconcile_exit_routing(&mut wg, &dev, &by_node, &peers, &mut st)
+            .await;
+        assert_eq!(tun.take_calls(), ["recheck 1", "pin 203.0.113.7"]);
+        assert!(st.split_default_installed && st.exemptions.contains(&server));
+
+        // A carrier event right after does not re-check again.
+        rt.reconcile_exit_routing(&mut wg, &dev, &by_node, &peers, &mut st)
+            .await;
+        assert!(tun.take_calls().is_empty(), "the re-check is bounded");
+
+        // It moves again, and this time the pin cannot follow.
+        st.exemptions_checked_at = None;
+        tun.pin_ok.store(false, std::sync::atomic::Ordering::SeqCst);
+        *tun.stale.lock().unwrap() = vec![server];
+        rt.reconcile_exit_routing(&mut wg, &dev, &by_node, &peers, &mut st)
+            .await;
+        let calls = tun.take_calls();
+        let unpin = calls
+            .iter()
+            .position(|c| c == "unpin 203.0.113.7")
+            .unwrap_or_else(|| panic!("a pin that cannot follow is deleted: {calls:?}"));
+        assert!(
+            calls[..unpin].iter().any(|c| c == "pin 203.0.113.7"),
+            "after the re-pin was tried: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "del 0.0.0.0/1"),
+            "and the /1s come out: {calls:?}"
+        );
+        assert!(!st.split_default_installed);
+        assert!(st.exemptions.is_empty());
+        assert_eq!(
+            st.withheld_reason.as_deref(),
+            Some(
+                "carrier-endpoint exemption for 203.0.113.7 unavailable: \
+                 no IPv4 default route through a gateway to pin it on"
+            ),
+            "the status names the device's cause"
+        );
+    }
 }
