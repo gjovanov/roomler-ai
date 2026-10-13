@@ -105,6 +105,13 @@ pub struct HiveSettings {
     /// refused `not_prepared`.
     #[serde(default = "hive_default_promote_join_secs")]
     pub promote_join_secs: u64,
+    /// FR-90 P2f-2b — a teleport's target may take the workspace's first
+    /// pack as one thin against what its folder's repository holds already
+    /// (`ROOMLER__HIVE__TELEPORT_HAVE_WANT`; git's have and want). Default
+    /// OFF until the operator confirms FR-90's decision 16: such a target
+    /// holds the checkpoint without its whole pack's blobs.
+    #[serde(default)]
+    pub teleport_have_want: bool,
 }
 
 fn hive_default_promote_prepare_secs() -> u64 {
@@ -132,6 +139,7 @@ impl Default for HiveSettings {
             promote_drain_secs: hive_default_promote_drain_secs(),
             promote_sync_secs: hive_default_promote_sync_secs(),
             promote_join_secs: hive_default_promote_join_secs(),
+            teleport_have_want: false,
         }
     }
 }
@@ -1157,6 +1165,23 @@ mod s6_tests {
             Some("5.9.157.221")
         );
         assert_eq!(s.resolve_announced_ip(Some("also")), None);
+    }
+}
+
+#[cfg(test)]
+mod hive_settings_tests {
+    use super::HiveSettings;
+
+    /// FR-90 P2f-2b — a teleport's have and want ships OFF, both where the
+    /// settings are built whole and where a file leaves the key out: what
+    /// turns it on is the operator's word on decision 16, never an upgrade.
+    #[test]
+    fn a_teleports_have_and_want_is_off_until_turned_on() {
+        assert!(!HiveSettings::default().teleport_have_want);
+        let absent: HiveSettings = toml::from_str("").expect("every key defaults");
+        assert!(!absent.teleport_have_want, "a file without the key");
+        let on: HiveSettings = toml::from_str("teleport_have_want = true").unwrap();
+        assert!(on.teleport_have_want);
     }
 }
 

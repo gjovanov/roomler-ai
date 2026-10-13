@@ -393,6 +393,20 @@ impl Checkpoints {
         }
     }
 
+    /// P2f-2b — where this session runs, and as whom, for the `pack` a member
+    /// asks of it ([`super::packer::Workplace`]): the account and environment
+    /// its checkpoints are taken as, and its folder and state directory.
+    pub(crate) fn workplace(&self) -> super::packer::Workplace {
+        super::packer::Workplace {
+            who: super::materializer::Who {
+                account: self.account.clone(),
+                env: self.env.clone(),
+            },
+            folder: self.folder.clone(),
+            state_dir: self.state_dir.clone(),
+        }
+    }
+
     /// Take the checkpoint after `turn` and keep it: its blobs first, so a
     /// member that sees the event can fetch every one, then the event. One
     /// that fails is logged and answered, for the caller to [`Self::say`];

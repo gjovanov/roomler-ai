@@ -766,6 +766,9 @@ async fn begin(
         user_email: user.email,
         caller: user.display_name,
         teleport: kind == Kind::Teleport,
+        // P2f-2b — the target may take the workspace against its clone: a
+        // teleport's only, and only once the operator turned it on.
+        have_want: kind == Kind::Teleport && state.teleport_have_want,
     };
     let hub = &state.fleet.rc_hub;
     let pushed = match kind {

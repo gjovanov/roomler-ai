@@ -4361,6 +4361,7 @@ async fn handle_server_msg(
             user_email,
             caller,
             teleport,
+            have_want,
         } => {
             #[cfg(hive_host)]
             crate::hive::handle_prepare(
@@ -4378,6 +4379,7 @@ async fn handle_server_msg(
                     lease: true,
                 },
                 teleport,
+                have_want,
                 ctx.is_primary,
                 outbound_tx.clone(),
             );
@@ -4392,6 +4394,7 @@ async fn handle_server_msg(
                     &user_email,
                     &caller,
                     teleport,
+                    have_want,
                 );
                 debug!(session = %session_id, "rc:hive.prepare ignored — this build does not run agent sessions");
             }

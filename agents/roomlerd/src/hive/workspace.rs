@@ -687,6 +687,32 @@ pub(crate) fn holds(
     }
 }
 
+/// FR-90 P2f-2b — the commit the folder's own repository's `HEAD` names,
+/// when the folder is in one that has a commit: one more have to offer,
+/// which a source holds when this clone is behind its own. A shadow's is
+/// none (what it holds is the session's own, never the person's), nor is a
+/// missing folder's. Makes nothing.
+pub(crate) fn head_of(
+    git: &Git,
+    folder: &Path,
+    state_dir: &Path,
+) -> Result<Option<String>, String> {
+    match existing_repo(git, folder, state_dir)? {
+        Some(repo) if repo.kind == RepoKind::Own => Ok(run(
+            cmd(git, folder, Some(&repo), None).args([
+                "rev-parse",
+                "--verify",
+                "-q",
+                "HEAD^{commit}",
+            ]),
+            "rev-parse HEAD",
+        )
+        .ok()
+        .filter(|h| is_object_id(h))),
+        _ => Ok(None),
+    }
+}
+
 // ─── P2b-4b: the reverse — a checkpoint's workspace put into a folder ───────
 
 /// Where a materialize puts the workspace: the folder's own repository, or a
@@ -1734,7 +1760,17 @@ mod tests {
                 .is_empty()
         );
         assert!(!plain_state.exists(), "no shadow made");
+        // P2f-2b — the folder's own `HEAD`, one more have to offer; none for
+        // a folder in no repository, and nothing made for asking.
+        assert_eq!(
+            head_of(&git, dir, state.path()).unwrap(),
+            Some(head.clone()),
+            "a repository's own HEAD"
+        );
+        assert_eq!(head_of(&under, &plain, &plain_state).unwrap(), None);
+        assert!(!plain_state.exists(), "no shadow made for its HEAD either");
         let missing = root.path().join("missing");
+        assert_eq!(head_of(&under, &missing, &plain_state).unwrap(), None);
         assert!(
             holds(&under, &missing, &plain_state, std::slice::from_ref(&head))
                 .unwrap()
