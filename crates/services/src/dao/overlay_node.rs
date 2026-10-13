@@ -89,6 +89,10 @@ pub struct NewOverlayNode {
     pub supports_overlay_echo: bool,
     pub supports_org_relay: bool,
     pub advertised_routes: Vec<String>,
+    /// FR-97 P0b — the join's word on why `advertised_routes` is empty
+    /// although the device was configured to offer routes. `None` = offering
+    /// as configured.
+    pub route_offer_withheld: Option<String>,
 }
 
 impl OverlayNodeDao {
@@ -145,6 +149,7 @@ impl OverlayNodeDao {
             supports_overlay_echo,
             supports_org_relay,
             advertised_routes,
+            route_offer_withheld,
         } = new;
         let now = DateTime::now();
         let node = OverlayNode {
@@ -188,6 +193,7 @@ impl OverlayNodeDao {
             approved_routes: Vec::new(),
             // P5 — never an exit node until an admin toggles it on.
             is_exit_node: false,
+            route_offer_withheld,
             status: AgentStatus::Online,
             last_seen_at: now,
             created_at: now,
@@ -223,6 +229,7 @@ impl OverlayNodeDao {
         supports_overlay_echo: bool,
         supports_org_relay: bool,
         advertised_routes: &[String],
+        route_offer_withheld: Option<&str>,
     ) -> DaoResult<OverlayNode> {
         let node_ref_bson = bson::to_bson(node_ref).unwrap_or(bson::Bson::Null);
         self.base
@@ -239,6 +246,9 @@ impl OverlayNodeDao {
                         // `approved_routes` is admin-controlled and intentionally
                         // NOT touched here, so approvals survive a rejoin.
                         "advertised_routes": advertised_routes,
+                        // FR-97 P0b — and why they are empty, refreshed with
+                        // them: null clears a reason the device no longer has.
+                        "route_offer_withheld": route_offer_withheld,
                         "wg_public_key": wg_public_key,
                         "key_epoch": key_epoch as i64,
                         // Refresh BOTH buckets from the join (rc.135) — a DHCP

@@ -102,6 +102,7 @@ pub async fn relay_overlay_msg_from_node(
             org_primary,
             relay_port,
             advertised_routes,
+            route_offer_withheld,
             ..
         } => {
             handle_overlay_join(
@@ -122,6 +123,7 @@ pub async fn relay_overlay_msg_from_node(
                 org_primary,
                 relay_port,
                 advertised_routes,
+                route_offer_withheld,
             )
             .await;
             None
@@ -248,8 +250,19 @@ async fn handle_overlay_join(
     org_primary: Option<bool>,
     relay_port: Option<u16>,
     advertised_routes: Vec<String>,
+    route_offer_withheld: Option<String>,
 ) {
     let node_ref = ident.node_ref();
+    // FR-97 P0b — the device's own words, shown to admins: bounded and kept to
+    // printable text, whatever the device sent (it bounds its own to 200).
+    let route_offer_withheld = route_offer_withheld
+        .map(|s| {
+            s.chars()
+                .filter(|c| !c.is_control())
+                .take(300)
+                .collect::<String>()
+        })
+        .filter(|s| !s.trim().is_empty());
     // FR-47 — refuse OUT LOUD. Every early return below used to be a
     // server-side `warn!` and nothing else, leaving the node waiting on a
     // netmap that would never arrive; `refuse` sends the reason when the node
@@ -357,6 +370,7 @@ async fn handle_overlay_join(
                     supports_overlay_echo,
                     supports_org_relay,
                     &advertised_routes,
+                    route_offer_withheld.as_deref(),
                 )
                 .await
             {
@@ -462,6 +476,7 @@ async fn handle_overlay_join(
                         supports_overlay_echo,
                         supports_org_relay,
                         advertised_routes: advertised_routes.clone(),
+                        route_offer_withheld: route_offer_withheld.clone(),
                     })
                     .await
                 {
@@ -2900,6 +2915,7 @@ mod tests {
             advertised_routes: vec![],
             approved_routes: vec![],
             is_exit_node: false,
+            route_offer_withheld: None,
             status: AgentStatus::Online,
             last_seen_at: now,
             created_at: now,

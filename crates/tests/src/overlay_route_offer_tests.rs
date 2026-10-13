@@ -78,13 +78,22 @@ async fn recv_t(ws: &mut Ws, want: &str, wait: Duration) -> Option<Value> {
 
 /// A real `rc:overlay.join` advertising `routes`; returns the joiner's netmap.
 async fn join_offering(ws: &mut Ws, seed: u8, routes: &[&str]) -> Value {
-    let msg = json!({
+    join_with(ws, seed, routes, None).await
+}
+
+/// A real `rc:overlay.join` advertising `routes` and, when `withheld` is set,
+/// saying why it offers nothing (FR-97 P0b); returns the joiner's netmap.
+async fn join_with(ws: &mut Ws, seed: u8, routes: &[&str], withheld: Option<&str>) -> Value {
+    let mut msg = json!({
         "t": "rc:overlay.join",
         "wg_public_key": BASE64.encode([seed; 32]),
         "mtu": 1280,
         "endpoints": [format!("203.0.113.{seed}:51820")],
         "advertised_routes": routes,
     });
+    if let Some(why) = withheld {
+        msg["route_offer_withheld"] = json!(why);
+    }
     ws.send(Message::Text(msg.to_string().into()))
         .await
         .expect("send join");
@@ -180,6 +189,11 @@ async fn an_exit_that_stops_offering_its_default_route_stops_being_one() {
         "approving the exit: {}",
         resp.status()
     );
+    // FR-97 P0b — the admin UI replaces the row with this response, so it
+    // carries the device's OS like the list does (or the OS chip would vanish
+    // on every toggle).
+    let toggled: Value = resp.json().await.unwrap();
+    assert_eq!(toggled["os"], "linux", "the toggle response names the OS");
 
     let wait = Duration::from_secs(10);
     let approved = routes_upserted(&mut client_ws, &exit_ip, has_default, wait).await;
@@ -205,4 +219,64 @@ async fn an_exit_that_stops_offering_its_default_route_stops_being_one() {
         restored.is_some(),
         "the offer is back, and the stored approval with it"
     );
+}
+
+/// The admin overlay-node row for `ip`.
+async fn node_row(app: &TestApp, seeded: &SeededTenant, ip: &str) -> Value {
+    let nodes: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/overlay-node", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    nodes["items"]
+        .as_array()
+        .expect("node list")
+        .iter()
+        .find(|n| n["overlay_ip"] == ip)
+        .cloned()
+        .expect("the node's row")
+}
+
+/// FR-97 P0b — a device that cannot forward or NAT advertises nothing and
+/// says why on its join. Without the reason such a node had no row worth
+/// showing: nothing advertised, not eligible, gone from the routes table. The
+/// admin row now carries the device's own words and its OS, and a later join
+/// from a device that can serve again clears them.
+#[tokio::test]
+async fn a_device_that_cannot_serve_says_why_in_the_admin_row() {
+    let app = TestApp::spawn().await;
+    let seeded: SeededTenant = app.seed_tenant("p0b-withheld").await;
+    let (_agent, token) = enroll(&app, &seeded, "p0b-withheld").await;
+    let mut ws = connect(&app, &token).await;
+
+    let why = "WinNAT is not available on this edition of Windows (Invalid class)";
+    let ip = join_with(&mut ws, 3, &[], Some(why)).await["self_ip"]
+        .as_str()
+        .expect("the device's own address")
+        .to_string();
+    let row = node_row(&app, &seeded, &ip).await;
+    assert_eq!(
+        row["route_offer_withheld"], why,
+        "the device's reason, verbatim"
+    );
+    assert_eq!(
+        row["can_be_exit_node"], false,
+        "nothing offered, nothing to approve"
+    );
+    assert_eq!(row["os"], "linux", "the OS the device enrolled with");
+
+    // The device can serve again: its next join offers /0 and says nothing.
+    join_offering(&mut ws, 3, &[DEFAULT_ROUTE]).await;
+    let row = node_row(&app, &seeded, &ip).await;
+    assert!(
+        row["route_offer_withheld"].is_null(),
+        "a reason the device no longer gives is cleared: {row}"
+    );
+    assert_eq!(row["can_be_exit_node"], true);
 }

@@ -27,6 +27,12 @@ export interface OverlayNode {
   // to its agent / tunnel-client row on these (name is a lossy DNS label).
   agent_id?: string
   tunnel_client_id?: string
+  // FR-97 P0b — the backing agent's OS, for display only: what a device can
+  // serve is what it says in `route_offer_withheld`, never inferred from this.
+  os?: 'linux' | 'macos' | 'windows'
+  // FR-97 P0b — the device's own reason for offering no `/0` and no subnet
+  // route although it was configured to (it cannot forward or NAT).
+  route_offer_withheld?: string
 }
 
 interface OverlayNodeListResponse {
