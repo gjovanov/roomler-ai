@@ -87,6 +87,8 @@ mod oauth_tests;
 #[cfg(test)]
 mod overlay_growth_tests;
 #[cfg(test)]
+mod overlay_route_offer_tests;
+#[cfg(test)]
 mod overlay_tests;
 #[cfg(test)]
 mod pagination_tests;
