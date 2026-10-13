@@ -219,13 +219,77 @@ persists across reboot, so `purge_exit_dns()` removes the tagged rule.
 
 ## Platform support
 
-| Capability            | Linux (`overlay-l3`) | Windows (`overlay-l3`) |
-|-----------------------|----------------------|------------------------|
-| v4 egress + NAT       | iptables MASQUERADE  | WinNAT                 |
-| v6 egress + NAT       | ip6tables MASQUERADE | ✗ → v6 **fail-closed** |
-| `/32`/`/128` exemptions | `ip route … [onlink]` | `netsh … nexthop`   |
-| DNS steering          | `resolvectl … ~.`    | NRPT `.`-root rule     |
-| macOS                 | — (utun v4-only; exit routing not wired) | — |
+| Capability | Linux (`overlay-l3`) | Windows (`overlay-l3`) | macOS (`overlay-l3`) |
+|---|---|---|---|
+| **Client**: v4 egress through an exit | ✓ | ✓ | ✓ (FR-97 P1a) |
+| **Client**: v6 egress through an exit | ✓ | ✓ | ✓ when the uplink has v6, else **fail-closed** |
+| **Client**: `/32`/`/128` exemptions | `ip route replace … [onlink]` | IP Helper route via the original gateway | `route -n add/change -host`, read back, re-pinned when the uplink moves ([below](#macos-client-fr-97-p1a)) |
+| **Client**: DNS steering | `resolvectl … ~.` | NRPT `.`-root rule | ✗ not yet (FR-97 P1c): `roomler status` says `DNS NOT steered` |
+| **Exit**: v4 egress + NAT | iptables MASQUERADE | WinNAT; not on Windows Home, which withholds the offer (#2077) | ✗ not yet (FR-97 P1b): the offer is withheld |
+| **Exit**: v6 egress + NAT | ip6tables MASQUERADE | ✗ → v6 **fail-closed** | ✗ |
+
+A device that cannot serve as an exit advertises nothing and says why, in
+`roomler status` and in the admin routes table (FR-97 P0b), rather than
+offering a `/0` that every client taking it would black-hole.
+
+### macOS client (FR-97 P1a)
+
+Until 0.4.132 a Mac had no exemption arm at all, and inherited one that
+reported every pin as done: the `/1`s then captured the control WebSocket,
+coturn and the exit's own endpoint (#2081). 0.4.132 made it refuse, so the exit
+was withheld. P1a gives it the real arm:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant G as route guard
+    participant T as SystemTun (macOS)
+    participant K as kernel routes
+    Note over T,K: bring-up: route -n get [-inet6] default → next hop + uplink
+    G->>T: add_host_exemption(server, coturn, exit endpoint)
+    T->>K: route -n get default (re-read: the Mac may have moved)
+    T->>K: route -n get <ip>
+    alt already a static host route through the uplink
+        T-->>G: Ok, nothing written
+    else a static host route through another next hop
+        T->>K: route -n change -host <ip> <gw>
+    else nothing of ours
+        T->>K: route -n add -host <ip> <gw>
+    end
+    T->>K: route -n get <ip> (read back)
+    alt static, host, through <gw> on the uplink
+        T-->>G: Ok — the gate may install the /1s
+    else anything else
+        T-->>G: Err(the device's cause) — WITHHOLD
+    end
+    loop every reconcile, at most every 3 s
+        G->>T: stale_host_exemptions(pinned)
+        T-->>G: pins no longer through the current uplink
+        G->>T: re-pin each, or DELETE it, forget it and withhold
+    end
+```
+
+| Step | Where | What it guards against |
+|---|---|---|
+| Capture the uplink per family, re-read before every pin | `tun.rs:3854`, `current_uplink` `tun.rs:5420`, `bsd_default_uplink` `tun.rs:332` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
+| Look first, then add or change | `add_host_exemption` `tun.rs:4742` | BSD `route` has no idempotent write; a re-write is a route-monitor event (#1856), and delete-then-add leaves a hole in which the endpoint falls into the `/1`s |
+| Read back before it counts | `bsd_exemption_holds` `tun.rs:384` | Only a **static** host route through the uplink's next hop is a pin. A clone of the default route (`WASCLONED`) shows the same gateway, then expires and is re-cloned from our own `/1` |
+| Re-check the pins | `stale_host_exemptions` `tun.rs:4838`, the gate `route_guard.rs:570` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
+| A pin that cannot follow is deleted before it is forgotten | `route_guard.rs:570` | An untracked host route outlives every teardown, and turns into a black hole at the next network change |
+| One WARN per cause, and the cause in `roomler status` | `note_exemption_failure` `route_guard.rs:370`, `exemption_withheld_reason` `route_guard.rs:382` | The gate retries every few seconds; 0.4.132 logged the same failure every ~5 s and reported a guess (`no original default route?`) |
+
+> ⚠️ **DNS is not steered on a Mac yet (P1c).** Egress goes through the exit,
+> but queries go to whatever resolver the Mac already uses. A LAN resolver is
+> on-link, so a `/1` never captures it. `roomler status` says `DNS NOT steered`.
+
+> 🔑 **Kill switch:** `ROOMLERD_EXIT_CLIENT_MACOS=0` refuses every exemption
+> again, as 0.4.132 did, so the exit is withheld with that reason. The Linux
+> and Windows arms do not read it.
+
+> ⚠️ **Linux and Windows pin through the default captured at bring-up and do
+> not re-read it** (`TunIo::stale_host_exemptions` keeps its empty default
+> there). On those hosts an uplink change leaves the pins on the old next hop
+> until the next restart; FR-97 tracks it.
 
 > **`onlink` gateways (Hetzner + many clouds).** When the host's original
 > default route is `onlink` (the gateway isn't in a connected subnet), the
@@ -269,7 +333,8 @@ depend on DNS.)
 ## Turning it off
 
 - **Per client:** remove `overlay_exit_node` from `config.toml` and restart the
-  agent (clean teardown reverts routes + DNS).
+  agent (clean teardown reverts routes + DNS). On a Mac,
+  `ROOMLERD_EXIT_CLIENT_MACOS=0` withholds the exit without touching the config.
 - **Stop offering:** set `overlay_exit_node_enabled = false` on the exit; the
   admin can also un-approve via `PUT …/exit-node { "enabled": false }` (clears
   `/0` from `approved_routes`).
