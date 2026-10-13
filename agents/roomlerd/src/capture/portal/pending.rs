@@ -41,16 +41,25 @@ const WAIT: Duration = Duration::from_secs(HANDSHAKE_DEADLINE.as_secs() + 5);
 /// second with no dialog at all, and must not flash "waiting" on the viewer.
 const TELL_AFTER: Duration = Duration::from_secs(2);
 
-/// The portal arm's open. An attended request (a dialog for the person at the
-/// screen) goes through the host's one-request broker. mutter
-/// (`mutter_capture`) asks nobody and opens in milliseconds, so it opens
-/// directly, and concurrent sessions never wait on each other for it.
+/// The host's one attended request, whichever arm asks for it: the configured
+/// `portal_capture` arm, or FR-93 P2d-3's automatic one. Only one of them runs
+/// in a given daemon (a capture key switches the automatic arm off), but one
+/// broker keeps "one dialog per host" true by construction.
+static BROKER: Broker<PortalCapture> = Broker::new();
+
+/// The configured portal arm's open: [`open_with`] as the keys say.
 pub fn open(target_fps: u32) -> anyhow::Result<PortalCapture> {
-    let opts = PortalOpen::from_env();
+    open_with(target_fps, PortalOpen::from_env())
+}
+
+/// A portal open. An attended request (a dialog for the person at the screen)
+/// goes through the host's one-request broker. mutter (`mutter_capture`) asks
+/// nobody and opens in milliseconds, so it opens directly, and concurrent
+/// sessions never wait on each other for it.
+pub fn open_with(target_fps: u32, opts: PortalOpen) -> anyhow::Result<PortalCapture> {
     if opts.mutter {
         return PortalCapture::open_with(target_fps, opts);
     }
-    static BROKER: Broker<PortalCapture> = Broker::new();
     BROKER
         .open(
             WAIT,

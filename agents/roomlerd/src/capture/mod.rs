@@ -550,8 +550,10 @@ impl CaptureUnavailableCode {
 }
 
 /// The `wayland_not_enabled` sentence, by install type: only a root daemon can
-/// read the scanout (DRM) or create a uinput device, and a per-user daemon on
-/// GNOME has mutter's own screencast on its session bus.
+/// read the scanout (DRM) or create a uinput device. A per-user daemon in its
+/// own Wayland session captures by itself (mutter on GNOME, else the portal,
+/// FR-93 P2), so it reads this only when the operator switched that off: the
+/// kill switch, or a capture key set.
 ///
 /// ⚠️ A hint goes on the wire as a JSON literal, unescaped
 /// (`capture_unavailable_payload`): no double quote, no backslash.
@@ -564,9 +566,11 @@ fn wayland_hint(root: bool) -> &'static str {
          still work."
     } else {
         "This computer is showing a Wayland desktop, and capturing it is switched off on this \
-         device. On GNOME, run roomler config set portal_capture true and roomler config set \
-         mutter_capture true, then roomler restart. On other desktops portal_capture alone asks \
-         the person at the screen once. Remote shell and file transfer still work."
+         device. On the host, run roomler config clear wayland_auto, and roomler config clear for \
+         each capture key that roomler config ls shows as set (portal_capture, mutter_capture, \
+         window_capture), then roomler restart. GNOME is then captured through its own \
+         screencast, which asks nobody, and other desktops ask the person at the screen once. \
+         Remote shell and file transfer still work."
     }
 }
 
@@ -634,20 +638,18 @@ enum OwnSession {
 
 /// FR-93 P2 (decision D1) — what the cascade may switch on by itself.
 ///
-/// ⚠️ **mutter only, and the portal stays opt-in.** D1 asked for "the portal
-/// elsewhere" too, and the lab showed why the attended path cannot go
-/// automatic as it stands (KDE, 2026-10-11):
-/// - The viewer's media watchdog re-creates a session that shows no frames
-///   for 10 s, and every new session opens its own portal request. The person
-///   at the screen gets a new "Share screen with" dialog every 10–20 s.
-/// - A late answer to a stale dialog starts a capture for a session that is
-///   already gone.
-/// - Each pending open parks a runtime worker for up to `HANDSHAKE_DEADLINE`.
+/// `Auto` tries mutter first (P2a: GNOME's own screencast, which asks nobody),
+/// and where mutter is absent the desktop portal (P2d-3: KDE and the rest),
+/// which asks the person at the screen once and then restores their answer.
 ///
-/// mutter asks nobody and opens in milliseconds, so none of this reaches it.
-/// The portal goes automatic once the attended flow exists: a "waiting for
-/// the person at the screen" notice the watchdog honours, one pending request
-/// per host, an open that parks no worker (FR-93 P2d).
+/// ⚠️ The portal waited for P2d. Run automatically before it (the FR-93 lab,
+/// KDE, 2026-10-11), it stacked a new "Share screen with" dialog every 10–20 s
+/// while the viewer's watchdog re-created its session, a late answer started a
+/// capture for a session already gone, and each pending open parked a runtime
+/// worker for up to `HANDSHAKE_DEADLINE`, until the daemon's watchdog killed
+/// it. P2d-1 made it one request per host on an open that parks no worker, and
+/// P2d-2 tells the viewer to wait for the person instead of re-creating the
+/// session (`linux-capture.md` §4.6, §4.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
     not(all(target_os = "linux", feature = "portal-capture")),
@@ -657,8 +659,8 @@ enum WaylandPlan {
     /// The cascade as it was before P2.
     AsConfigured,
     /// A per-user daemon in its own Wayland session, with no capture key set:
-    /// try mutter, whether or not the screen is locked. What a locked session
-    /// shows is mutter's to decide; this lab has not measured it.
+    /// try mutter, else the portal, whether or not the screen is locked. What
+    /// a locked session shows is the compositor's to decide.
     Auto,
 }
 
@@ -719,6 +721,10 @@ fn own_session_in(all: &[crate::keep_busy::logind::Session], uid: u32) -> OwnSes
 pub(crate) struct ArmFacts {
     /// [`wayland_plan`] said `Auto`, and mutter answered on this session's bus.
     pub auto_mutter: bool,
+    /// P2d-3 — [`wayland_plan`] said `Auto`, mutter did not answer, and a
+    /// desktop portal is on this session's bus, running or installed to start
+    /// on demand.
+    pub auto_portal: bool,
     /// `drm_capture`, in a build with the DRM backend.
     pub drm: bool,
     /// `portal_capture`, in a build with the portal backend.
@@ -734,16 +740,19 @@ pub(crate) struct ArmFacts {
 }
 
 /// FR-93 P2b — the arm a session opened now would try first, in
-/// [`open_with`]'s own order (keep the two together): the automatic mutter
-/// arm, then `drm_capture`, then `portal_capture` (on mutter's API with
-/// `mutter_capture`), then X11, which a Wayland desktop refuses. So nothing
-/// switched on there means nothing captures (`None`). A plan, not a promise:
-/// an arm that fails at session time falls through, and that session's
-/// `rc:video-info` names what served it.
+/// [`open_with`]'s own order (keep the two together): the automatic arm
+/// (mutter, else the portal, P2d-3), then `drm_capture`, then `portal_capture`
+/// (on mutter's API with `mutter_capture`), then X11, which a Wayland desktop
+/// refuses. So nothing switched on there means nothing captures (`None`). A
+/// plan, not a promise: an arm that fails at session time falls through, and
+/// that session's `rc:video-info` names what served it.
 #[cfg(target_os = "linux")]
 pub(crate) fn planned_arm(f: &ArmFacts) -> Option<CaptureArm> {
     if f.auto_mutter {
         return Some(CaptureArm::Mutter);
+    }
+    if f.auto_portal {
+        return Some(CaptureArm::Portal);
     }
     if f.drm {
         return Some(CaptureArm::Drm);
@@ -759,8 +768,9 @@ pub(crate) fn planned_arm(f: &ArmFacts) -> Option<CaptureArm> {
 }
 
 /// FR-93 P2b — gather [`ArmFacts`] the way [`open_with`] reads them. `sessions`
-/// is logind's list (read once by the caller); mutter is asked only when the
-/// plan is `Auto`, as the cascade asks it.
+/// is logind's list (read once by the caller); mutter, then the portal, are
+/// asked only when the plan is `Auto`, as the cascade asks them. The portal is
+/// asked without being started ([`portal::reachable`]): this runs every minute.
 #[cfg(target_os = "linux")]
 pub(crate) fn arm_facts(
     sessions: Option<&[crate::keep_busy::logind::Session]>,
@@ -779,15 +789,21 @@ pub(crate) fn arm_facts(
         || sessions.map_or(OwnSession::Other, |all| own_session_in(all, uid)),
     );
     #[cfg(feature = "portal-capture")]
-    let auto_mutter = plan == WaylandPlan::Auto && portal::mutter::available().is_ok();
+    let (auto_mutter, auto_portal) = if plan == WaylandPlan::Auto {
+        let mutter = portal::mutter::available().is_ok();
+        (mutter, !mutter && portal::reachable().is_ok())
+    } else {
+        (false, false)
+    };
     #[cfg(not(feature = "portal-capture"))]
-    let auto_mutter = false;
+    let (auto_mutter, auto_portal) = (false, false);
     #[cfg(feature = "drm-capture")]
     let drm = drm_backend::env_enabled();
     #[cfg(not(feature = "drm-capture"))]
     let drm = false;
     ArmFacts {
         auto_mutter,
+        auto_portal,
         drm,
         portal: cfg!(feature = "portal-capture") && tunnel_core::env::flag("PORTAL_CAPTURE", false),
         portal_via_mutter: tunnel_core::env::flag("MUTTER_CAPTURE", false),
@@ -802,8 +818,7 @@ pub(crate) fn arm_facts(
 enum AutoMutter {
     Opened(Box<dyn ScreenCapture>),
     /// mutter does not answer on this session's bus: not GNOME. Nothing was
-    /// switched on, so the cascade runs on unchanged, and a Wayland desktop
-    /// still reports `wayland_not_enabled`, whose hint names `portal_capture`.
+    /// switched on, so the automatic portal is tried next (P2d-3).
     NotGnome(String),
     /// mutter answered, and its screencast still failed. An arm that switched
     /// itself on failed, so the controller reads `backend_error` with this
@@ -841,6 +856,73 @@ fn open_auto_mutter(target_fps: u32) -> AutoMutter {
              set), and its screencast could not open: {e:#}"
         )),
     }
+}
+
+/// FR-93 P2d-3 — what the automatic portal arm came to. Either way the arm
+/// switched itself on, so a failure reads `backend_error` with its reason
+/// (P1c's rule), never "switch it on".
+#[cfg(all(target_os = "linux", feature = "portal-capture"))]
+enum AutoPortal {
+    Opened(Box<dyn ScreenCapture>),
+    /// No portal on this desktop can capture it, or the person at the screen
+    /// did not share it (refused, or nobody answered within the request's
+    /// deadline). The reason, short enough for the viewer's detail.
+    Failed(String),
+}
+
+/// How long the automatic portal arm waits for the portal to say whether it
+/// serves ScreenCast, before any dialog.
+#[cfg(all(target_os = "linux", feature = "portal-capture"))]
+const AUTO_PORTAL_DETECT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// FR-93 P2d-3 — the portal where mutter is absent: KDE, and every other
+/// desktop with an xdg-desktop-portal ScreenCast backend. It is ATTENDED. The
+/// first open shows the person at the screen a dialog and waits for them, as
+/// one request per host through the broker (P2d-1), while the viewer is told
+/// it is waiting (P2d-2). Their answer is kept as a restore token, so later
+/// sessions open with no dialog.
+#[cfg(all(target_os = "linux", feature = "portal-capture"))]
+fn open_auto_portal(target_fps: u32) -> AutoPortal {
+    use portal::backend::PortalOpen;
+    if let Some(why) = auto_portal_unusable(&portal::detect_within(AUTO_PORTAL_DETECT)) {
+        return AutoPortal::Failed(why);
+    }
+    // Input over the portal stays opt-in, as for mutter above: a WithInput
+    // grant is a separate dialog and a separate restore token.
+    let opts = PortalOpen {
+        mutter: false,
+        input: tunnel_core::env::flag("PORTAL_INPUT", false),
+        window: false,
+    };
+    match portal::pending::open_with(target_fps, opts) {
+        Ok(c) => {
+            tracing::warn!(
+                width = c.width(),
+                height = c.height(),
+                "capture: backend=portal, AUTOMATIC (FR-93 P2d-3: a per-user Wayland session with \
+                 no capture key set, and no mutter). ATTENDED: the person at the screen shared it, \
+                 now or earlier (the restore token). ROOMLERD_WAYLAND_AUTO=0, or any capture key, \
+                 switches it off"
+            );
+            AutoPortal::Opened(Box::new(c))
+        }
+        Err(e) => AutoPortal::Failed(format!(
+            "the desktop portal did not share the screen: {e:#}"
+        )),
+    }
+}
+
+/// Why the automatic portal arm raises no dialog on this desktop, or `None`
+/// when it may. Capture needs ScreenCast only; RemoteDesktop is input's. The
+/// status comes first, so the viewer's capped detail still names it.
+#[cfg(all(target_os = "linux", feature = "portal-capture"))]
+fn auto_portal_unusable(status: &portal::PortalStatus) -> Option<String> {
+    (!status.usable_for_capture()).then(|| {
+        format!(
+            "no desktop portal can capture this desktop ({status}): {}",
+            status.advice()
+        )
+    })
 }
 
 /// FR-93 — what to call "every arm failed" on Linux, as a pure function.
@@ -1482,11 +1564,12 @@ fn open_with(
     let mut wayland_arm_error: Option<String> = None;
 
     // FR-93 P2 (decision D1): a per-user daemon in its own Wayland session,
-    // with no capture key set, switches mutter on by itself: GNOME's own
-    // screencast, no dialog, the unattended peer of DRM. The portal stays
-    // opt-in (see `WaylandPlan`). Everything else (root, a key set, X11, nobody
-    // signed in, the kill switch) runs the cascade below as before. With no key
-    // set, the DRM and portal arms below are off anyway.
+    // with no capture key set, switches capture on by itself: mutter (GNOME's
+    // own screencast, no dialog, the unattended peer of DRM), else the desktop
+    // portal, which asks the person at the screen (P2d-3, see `WaylandPlan`).
+    // Everything else (root, a key set, X11, nobody signed in, the kill switch)
+    // runs the cascade below as before. With no key set, the DRM and portal
+    // arms below are off anyway.
     #[cfg(target_os = "linux")]
     #[allow(unused_variables)] // read only with portal-capture
     let plan = wayland_plan(
@@ -1501,11 +1584,20 @@ fn open_with(
     if plan == WaylandPlan::Auto {
         match open_auto_mutter(_target_fps) {
             AutoMutter::Opened(c) => return c,
-            AutoMutter::NotGnome(why) => tracing::info!(
-                %why,
-                "capture: no automatic arm on this desktop (FR-93 P2 is mutter only); the portal \
-                 stays opt-in (portal_capture)"
-            ),
+            AutoMutter::NotGnome(why) => {
+                tracing::info!(
+                    %why,
+                    "capture: no mutter on this desktop; trying the desktop portal, which asks \
+                     the person at the screen (FR-93 P2d-3)"
+                );
+                match open_auto_portal(_target_fps) {
+                    AutoPortal::Opened(c) => return c,
+                    AutoPortal::Failed(detail) => {
+                        tracing::warn!(%detail, "capture: the automatic portal arm failed (FR-93 P2d-3)");
+                        wayland_arm_error = Some(detail);
+                    }
+                }
+            }
             AutoMutter::Failed(detail) => {
                 tracing::warn!(%detail, "capture: the automatic mutter arm failed (FR-93 P2)");
                 wayland_arm_error = Some(detail);
@@ -2079,8 +2171,9 @@ mod wayland_reason_tests {
     }
 
     /// Each install type is told the keys it can actually use: only root can
-    /// read the scanout or create a uinput device, and a per-user daemon on
-    /// GNOME has mutter's screencast on its own session bus.
+    /// read the scanout or create a uinput device. A per-user daemon captures
+    /// by itself (FR-93 P2: mutter, else the portal), so it reads this only
+    /// when that was switched off, and is told how to give the choice back.
     #[test]
     fn the_hint_names_the_keys_this_install_can_use() {
         let root = wayland_hint(true);
@@ -2092,10 +2185,8 @@ mod wayland_reason_tests {
         assert!(!root.contains("portal_capture"), "{root}");
 
         let user = wayland_hint(false);
-        assert!(
-            user.contains("roomler config set portal_capture true"),
-            "{user}"
-        );
+        assert!(user.contains("roomler config clear wayland_auto"), "{user}");
+        assert!(user.contains("portal_capture"), "{user}");
         assert!(user.contains("mutter_capture"), "{user}");
         assert!(!user.contains("sudo"), "{user}");
         assert!(!user.contains("drm_capture"), "{user}");
@@ -2119,8 +2210,7 @@ mod wayland_auto_tests {
     }
 
     /// D1's per-user half: a Wayland session of its own and no key set. The
-    /// one automatic arm is mutter (see `WaylandPlan` for why the portal stays
-    /// opt-in).
+    /// automatic arm is mutter, else the portal (P2d-3, see `WaylandPlan`).
     #[test]
     fn a_per_user_daemon_in_its_own_wayland_session_goes_automatic() {
         assert_eq!(
@@ -2204,6 +2294,47 @@ mod wayland_auto_tests {
     }
 }
 
+/// FR-93 P2d-3 — the automatic portal raises a dialog only where a portal
+/// serves ScreenCast, and every other answer becomes a reason the viewer can
+/// read in full.
+#[cfg(all(test, target_os = "linux", feature = "portal-capture"))]
+mod auto_portal_tests {
+    use super::portal::PortalStatus;
+    use super::{CaptureUnavailable, CaptureUnavailableCode, auto_portal_unusable};
+
+    #[test]
+    fn a_portal_that_serves_screencast_is_tried_and_every_other_answer_is_a_reason() {
+        for usable in [
+            PortalStatus::Available {
+                remote_desktop: true,
+                version: Some(5),
+            },
+            // Capture needs no RemoteDesktop (wlroots has none).
+            PortalStatus::Available {
+                remote_desktop: false,
+                version: None,
+            },
+        ] {
+            assert_eq!(auto_portal_unusable(&usable), None, "{usable}");
+        }
+        for status in [
+            PortalStatus::NoScreenCast,
+            PortalStatus::PortalAbsent,
+            PortalStatus::NoSessionBus,
+            PortalStatus::Unknown("org.freedesktop.portal.Desktop did not answer within 5s".into()),
+        ] {
+            let why = auto_portal_unusable(&status).expect("a reason, and no dialog");
+            // What the viewer is shown is capped; the status must survive it.
+            let shown = CaptureUnavailable::new(CaptureUnavailableCode::BackendError, why);
+            assert!(
+                shown.detail.contains(&status.to_string()),
+                "{status}: {}",
+                shown.detail
+            );
+        }
+    }
+}
+
 /// FR-93 P2b — the desktop brief's `capture_arm` as a table, in the cascade's
 /// order. Pure, like the plan above: no test reads the environment or logind.
 #[cfg(all(test, target_os = "linux"))]
@@ -2253,6 +2384,37 @@ mod planned_arm_tests {
             ..built()
         };
         assert_eq!(planned_arm(&mutter_key_only), None);
+    }
+
+    /// P2d-3 — where mutter is absent the automatic arm is the portal, and it
+    /// comes before every configured arm, as in `open_with`. mutter, which asks
+    /// nobody, still comes first.
+    #[test]
+    fn the_automatic_portal_is_planned_where_mutter_is_absent() {
+        let auto_portal = ArmFacts {
+            auto_portal: true,
+            ..built()
+        };
+        assert_eq!(planned_arm(&auto_portal), Some(CaptureArm::Portal));
+        assert!(
+            CaptureArm::Portal.attended(),
+            "the one automatic arm that asks the person at the screen"
+        );
+        let both = ArmFacts {
+            auto_mutter: true,
+            ..auto_portal
+        };
+        assert_eq!(planned_arm(&both), Some(CaptureArm::Mutter), "mutter first");
+        let with_drm = ArmFacts {
+            drm: true,
+            x11_session: true,
+            ..auto_portal
+        };
+        assert_eq!(
+            planned_arm(&with_drm),
+            Some(CaptureArm::Portal),
+            "the automatic arm runs before the configured ones"
+        );
     }
 
     #[test]
