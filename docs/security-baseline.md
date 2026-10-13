@@ -233,6 +233,19 @@ attributable and lands in `exec_audit`/`ssh_audit` like any other.
 evicts the oldest, so an unthrottled caller could burst a legitimate caller's
 un-redeemed grant out of existence.
 
+**Remote-desktop session requests got the same ceiling in FR-101 P4a**
+(`crates/modules/remote/src/controller.rs`, `SESSION_REQUESTS_PER_MINUTE` = 60
+per (caller, device)). `rc:session.request` rides the controller's `/ws`, which the
+per-IP governor never sees. Without a ceiling, a signed-in caller could put a
+consent prompt in front of the person at a device as fast as the socket carries
+frames.
+
+- The check sits **after** the authz gate, so a caller without the right to ask is
+  refused `permission_denied` every time and never spends a slot.
+- A refusal is `rc:error` `rate_limited`, which the viewer does not retry.
+- No legitimate client comes near 60: the viewer's reconnect ladder asks about a
+  dozen times in its first minute.
+
 ### The SSH request route checks membership before the device lookup
 
 `agent_ssh::member_tenant`, mirroring `agent_exec`. Without it a non-member could
