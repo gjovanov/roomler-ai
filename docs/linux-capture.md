@@ -235,7 +235,7 @@ what would capture it. An exec sweep cannot answer "how many hosts are Wayland,
 and which arm serves each": a sweep reaches only the devices that are online.
 The server can, because every device says it in its hello.
 
-The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1152`),
+The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1164`),
 all strings, so a newer agent's word reaches an older server as a word:
 
 | field | values | from |
@@ -271,7 +271,7 @@ happened.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:31`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`signaling.rs:5384`). A changed brief (a login, a
+heartbeat only read that cache (`signaling.rs:5391`). A changed brief (a login, a
 logout, the greeter) re-announces the caps on the next heartbeat (`:1806`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.

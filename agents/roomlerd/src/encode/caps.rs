@@ -1688,6 +1688,13 @@ fn rpc_caps() -> Vec<String> {
     // that org's prepare and join are refused there either way.
     #[cfg(hive_host)]
     caps.push(RpcCap::HiveTeleport);
+    // FR-90 P2f-3a — and starts a fork of a session it holds a copy of: a
+    // start carrying `fork_of` takes the parent's last checkpoint under the
+    // fork's ids and launches `--resume <parent> --fork-session --session-id
+    // <fork>`. A property of the BUILD; a build before it would start the
+    // fork empty.
+    #[cfg(hive_host)]
+    caps.push(RpcCap::HiveFork);
     caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
 

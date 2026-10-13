@@ -3119,6 +3119,15 @@ pub enum ServerMsg {
         /// holds as replicated; absent, the device keeps P1's behaviour.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         lease: bool,
+        /// FR-90 P2f-3 — the session is a fork of this one: carried by every
+        /// start of the fork, its first (which the device takes from the
+        /// parent's copy and launches `--resume <parent> --fork-session`) and
+        /// every later one (whose checkpoints keep the parent's files the
+        /// fork resumed from). Sent only to a connection advertising
+        /// [`crate::models::RpcCap::HiveFork`]: a device before it would
+        /// start the fork empty.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fork_of: Option<crate::hive::HiveForkOf>,
     },
 
     /// FR-90 P2c-3 — hold a copy of a session: placement chose this device
@@ -4277,6 +4286,7 @@ mod tests {
             resume: false,
             replicated: false,
             lease: false,
+            fork_of: None,
         };
         let v = serde_json::to_value(&m).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
@@ -4333,6 +4343,7 @@ mod tests {
             resume: false,
             replicated: true,
             lease: true,
+            fork_of: None,
         };
         let v = serde_json::to_value(&leased).unwrap();
         assert_eq!(
@@ -4342,6 +4353,35 @@ mod tests {
         assert!(matches!(
             serde_json::from_value::<ServerMsg>(v).unwrap(),
             ServerMsg::HiveStart { lease: true, .. }
+        ));
+        // P2f-3 — a fork's start names what it was made from, and only then.
+        let parent = ObjectId::new();
+        let fork = ServerMsg::HiveStart {
+            session_id: sid,
+            harness: crate::hive::HARNESS_CLAUDE_CODE.into(),
+            harness_session: "0b9e3c7e-6a43-4a43-9d63-2d1b0d1c2f10".into(),
+            fence: 1,
+            folder: "/home/dev/src/app".into(),
+            user_id: uid,
+            user_email: "dev@example.com".into(),
+            caller: "Dev".into(),
+            resume: false,
+            replicated: false,
+            lease: false,
+            fork_of: Some(crate::hive::HiveForkOf {
+                session_id: parent,
+                harness_session: "9d1c2f10-6a43-4a43-9d63-2d1b0b9e3c7e".into(),
+            }),
+        };
+        let v = serde_json::to_value(&fork).unwrap();
+        assert_eq!(
+            v["fork_of"],
+            serde_json::json!({"session_id": parent.to_hex(),
+                               "harness_session": "9d1c2f10-6a43-4a43-9d63-2d1b0b9e3c7e"})
+        );
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(v).unwrap(),
+            ServerMsg::HiveStart { fork_of: Some(f), .. } if f.session_id == parent
         ));
     }
 
