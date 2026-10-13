@@ -350,6 +350,10 @@ export interface ExecPolicy {
   consent_mode: ConsentMode | null
   /** Empty = any shell the host supports. */
   shells: string[]
+  /** FR-94 P4 — Windows only: the account its SYSTEM service runs a command
+   *  as. Absent when saving = keep what the device has (the server never
+   *  resets it), which is why the dialog's closed default leaves it out. */
+  run_as?: 'system' | 'console_user'
 }
 
 /** Roomler SSH — whether a device accepts interactive sessions at all.
@@ -538,6 +542,9 @@ export type ExecDenyReason =
   // path; and a device's SYSTEM service asked for a command not pending for it.
   | 'system_required'
   | 'claim_refused'
+  // FR-94 P4 — the policy names the signed-in user, which only the device's
+  // SYSTEM service can run as, and this command cannot take that path.
+  | 'run_as_unavailable'
 
 /** One row of the Fleet-RPC attempt log. Every attempt lands here, allowed
  *  or denied — a refused exec is the interesting one. */
