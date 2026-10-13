@@ -720,8 +720,10 @@ export interface RcInputReach {
  *  re-created the session every 10 s, so the session the person finally
  *  answered for was rarely the one on screen.
  *
- *  `for` is `person_at_screen` today, typed as a string on purpose: a newer
- *  agent may wait for something else, and its `hint` still reads. */
+ *  `for` is `person_at_screen` (a dialog) or, from P5b, `screen_unlock`
+ *  (GNOME's lock screen, #2145; `mediaWaitingCopy` words each). It is typed
+ *  as a string on purpose: a newer agent may wait for something else, and its
+ *  `hint` still reads. */
 export interface RcMediaWaiting {
   for: string
   /** When the dialog gives up, on THIS browser's clock: the agent sends how
