@@ -23,7 +23,7 @@ set, switches mutter on by itself, or the portal where mutter is absent (§1.2).
 
 ## 1. The cascade
 
-`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:1382`) tries the
+`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:1388`) tries the
 backends in this order and returns the first that opens. On Linux the Windows
 arms (SystemContext, WGC) do not exist, so the order is:
 
@@ -54,10 +54,10 @@ A per-user daemon in its own Wayland session, with no capture key set, runs
 
 | Arm | Reads | Sees a locked screen / the greeter | Asks the person at the screen | Needs | Default | Gate |
 |---|---|---|---|---|---|---|
-| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:1658`) |
-| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **no** — mutter refuses to create *or restore* a screencast while locked | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off**; automatic in a per-user Wayland session with no key where mutter is absent (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:1697`) |
+| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:1664`) |
+| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **no** — mutter refuses to create *or restore* a screencast while locked | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off**; automatic in a per-user Wayland session with no key where mutter is absent (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:1703`) |
 | **mutter direct** (`portal/mutter.rs`) | the same kind of PipeWire stream, from `org.gnome.Mutter.ScreenCast` | no (a session API) | **no** | GNOME's mutter on the user's session bus; no portal backend required | **off**; automatic in a per-user GNOME Wayland session with no key (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` **and** `ROOMLERD_MUTTER_CAPTURE=1` (`portal/backend.rs:62`) |
-| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:1766`), after the Xwayland guard (`mod.rs:1739`) |
+| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:1772`), after the Xwayland guard (`mod.rs:1745`) |
 
 Two things about the order are deliberate and worth defending when the next
 backend arrives:
@@ -74,7 +74,7 @@ backend arrives:
   screen). The portal is **attended**: defaulting it on would leave an
   unattended host waiting on a consent dialog nobody will answer — a hang
   dressed up as a feature. Both arms therefore log **loudly** when the operator
-  asked for them and they fell through (`mod.rs:1674`, `mod.rs:1714`), because
+  asked for them and they fell through (`mod.rs:1680`, `mod.rs:1720`), because
   silently serving X11 instead would look like the feature simply not working.
   Since FR-93 that error also travels: it becomes the session's `detail`
   (§1.1). And since FR-93 P2d-3 a per-user daemon in its own Wayland session,
@@ -97,18 +97,18 @@ and a different false thing per install type. Measured on the FR-93 lab
 
 Two changes stop both:
 
-- 🔑 **The Xwayland guard** (`mod.rs:1739`). Before scrap opens, the daemon
+- 🔑 **The Xwayland guard** (`mod.rs:1745`). Before scrap opens, the daemon
   asks the X server named by its `DISPLAY` whether it is Xwayland
-  (`x_server_is_xwayland`, `mod.rs:1069`). There are two signals, the same two
+  (`x_server_is_xwayland`, `mod.rs:1075`). There are two signals, the same two
   keep busy reads (FR-92): the `XWAYLAND` extension, which Xwayland has carried
   since 23.1, and before that its RandR monitors, all named `XWAYLAND<n>`. If
   it is Xwayland, scrap is refused, and the session gets a reason instead of
   black. The answer comes from the server, never from `XDG_SESSION_TYPE`, so a
   real Xorg and the daemon's own Xvfb are captured exactly as before.
 - 🔑 **The seat, not the daemon's environment, decides "headless"**
-  (`linux_no_pixels_code`, `mod.rs:986`). When every arm has failed and the
+  (`linux_no_pixels_code`, `mod.rs:992`). When every arm has failed and the
   daemon has no display variables, logind is asked whether a graphical session
-  is showing (`seat_shows_wayland`, `mod.rs:1053`, through
+  is showing (`seat_shows_wayland`, `mod.rs:1059`, through
   `companion::graphical_session`). A Wayland session there means
   `wayland_not_enabled`. No session at all means `no_display`, and that is now
   true.
@@ -131,7 +131,7 @@ because only root can read the scanout or create a uinput device:
 A failed arm is never told to "switch it on". It is already on, and its own
 error is the useful sentence.
 
-⚠️ **The probe dials Unix sockets only** (`x_server_query`, `mod.rs:1144`).
+⚠️ **The probe dials Unix sockets only** (`x_server_query`, `mod.rs:1150`).
 `x11rb::connect` falls back to TCP `localhost:6000+N` when the socket is
 missing. Under WSL2's mirrored networking a localhost connect to a closed port
 hangs instead of being refused, and systemd's `/tmp` handling there had hidden
@@ -331,8 +331,8 @@ all strings, so a newer agent's word reaches an older server as a word:
 | `capture_arm` | `mutter` · `drm` · `portal` · `x11` · `none` | the arm a session opened **now** would try first |
 | `input_reach` | `full` · `xwayland_only` · `none` | the `rc:input-reach` verdict (`input/reach.rs:265`), with the portal's input route predicted for a portal or mutter arm with `portal_input` on. ⚠️ **It never starts an X server.** GNOME starts Xwayland **on demand** for any client that connects, so on a Wayland desktop the brief connects only to an Xwayland already running (found in `/proc`), and with none it reads "no X server". It is also read again only when another field changed. The per-session `rc:input-reach` stays the authority |
 
-`capture_arm` is `capture::planned_arm` (`capture/mod.rs:758`), a pure function
-that walks `open_with`'s own order (`:1290`). The two sit together in one file
+`capture_arm` is `capture::planned_arm` (`capture/mod.rs:764`), a pure function
+that walks `open_with`'s own order (`:1505`). The two sit together in one file
 because they must not drift:
 
 ```mermaid
@@ -493,7 +493,11 @@ roomler input path, and the oracle reads where the viewer draws it:
 
 The overlay sits a few pixels up and left of each target because the oracle
 reports the cursor canvas's top-left, and the arrow's hotspot is that far into
-the cropped image.
+the cropped image. KWin passes the same way: on the KDE system guest (Plasma
+6.7.5, virtio-gpu) the same build put the overlay at (0.299, 0.597) and
+(0.699, 0.597), with the same `planes=2 cursor_planes=1 atomic=true
+hotspot=true`. Not yet measured: a real GPU, where there is no hotspot property
+(the Asahi cell), and a pointer on a second monitor.
 
 ## 4. The portal arm (FR-45 P1–P4)
 
@@ -780,10 +784,10 @@ sequenceDiagram
 
 | | what | where |
 |---|---|---|
-| the open runs off the workers | `capture::open_default_async`: on Linux, `open_default` on the blocking pool. The pump stays droppable while it waits, and a capture that opens after its session is gone is dropped as it arrives. Elsewhere it stays inline | `capture/mod.rs:1402`, the eight pump call sites in `peer.rs` |
+| the open runs off the workers | `capture::open_default_async`: on Linux, `open_default` on the blocking pool. The pump stays droppable while it waits, and a capture that opens after its session is gone is dropped as it arrives. Elsewhere it stays inline | `capture/mod.rs:1408`, the eight pump call sites in `peer.rs` |
 | one request per host | `portal::pending::open_with`, which the configured and the automatic (P2d-3) arms share: a session that asks while a request is pending waits for **that** request, and an older waiter leaves (`Superseded`) | `portal/pending.rs:59`, `Broker::open` `:146` |
 | the newest waiter wins | the outcome goes to the session that asked last, which is the one the viewer shows now | `Request::wait` `:229` |
-| nobody there, nothing starts | a waiter is a blocking thread, not a session. A session's end aborts its pump (`AgentPeer::stop_serving`, `peer.rs:1520`), which detaches the open, so the capture its waiter takes is dropped as it arrives: the helper is killed and the screencast stops. An outcome that outlives its **last waiter** (each waits 5 s past the request's own deadline) is dropped in `Request::land`, the backstop | `capture/mod.rs:1402`, `Request::land` `:216` |
+| nobody there, nothing starts | a waiter is a blocking thread, not a session. A session's end aborts its pump (`AgentPeer::stop_serving`, `peer.rs:1520`), which detaches the open, so the capture its waiter takes is dropped as it arrives: the helper is killed and the screencast stops. An outcome that outlives its **last waiter** (each waits 5 s past the request's own deadline) is dropped in `Request::land`, the backstop | `capture/mod.rs:1408`, `Request::land` `:216` |
 | mutter is not brokered | `mutter_capture` asks nobody and opens in milliseconds, so concurrent sessions never wait on each other for it | `pending.rs:60` |
 
 **Measured** on the FR-93 lab's KDE guest: Plasma 6.7 on Fedora 44, 4 cores, a per-user install with
@@ -1105,11 +1109,12 @@ defect — the capture arms only expose it by being knobs.
 
 | File | Owns |
 |---|---|
-| `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default` (`:1382`), `open_default_async` (`:1402`) and the cascade (`open_with` `:1499`); the FR-80 failure classifier (`:1269`); FR-93's verdicts: `linux_no_pixels_code` (`:986`), `xwayland_verdict` (`:1035`), the Xwayland guard (`:1739`) and its socket-only probe (`x_server_query` `:1144`), the hints (`wayland_hint` `:560`, `wayland_not_enabled_detail` `:1020`); P2's automatic arm: `wayland_plan` (`:675`), `open_auto_mutter` (`:864`), and P2d-3's `open_auto_portal` (`:933`) with `auto_portal_unusable` (`:967`) and P4b's `auto_portal_input` (`:917`) |
-| `agents/roomlerd/src/desktop_brief.rs` | FR-93 P2b: the hello's `desktop` brief, its `desktop-brief` refresher (`start` `:31`) and the session a controller would see (`seen_session` `:80`); `planned_arm`, P4's `planned_input_route` and `arm_facts` live beside the cascade in `capture/mod.rs` (`:758`, `:785`, `:801`) |
+| `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default` (`:1388`), `open_default_async` (`:1408`) and the cascade (`open_with` `:1505`); the FR-80 failure classifier (`:1275`); FR-93's verdicts: `linux_no_pixels_code` (`:992`), `xwayland_verdict` (`:1041`), the Xwayland guard (`:1745`) and its socket-only probe (`x_server_query` `:1150`), the hints (`wayland_hint` `:566`, `wayland_not_enabled_detail` `:1026`); P2's automatic arm: `wayland_plan` (`:681`), `open_auto_mutter` (`:870`), and P2d-3's `open_auto_portal` (`:939`) with `auto_portal_unusable` (`:973`) and P4b's `auto_portal_input` (`:923`) |
+| `agents/roomlerd/src/desktop_brief.rs` | FR-93 P2b: the hello's `desktop` brief, its `desktop-brief` refresher (`start` `:31`) and the session a controller would see (`seen_session` `:80`); `planned_arm`, P4's `planned_input_route` and `arm_facts` live beside the cascade in `capture/mod.rs` (`:764`, `:791`, `:807`) |
 | `agents/roomlerd/src/capture/scrap_backend.rs` · `x11_damage.rs` | the X11 arm and its damage listener |
 | `agents/roomlerd/src/virtual_desktop.rs` | Xvfb + WM + startup apps for `ROOMLERD_VIRTUAL_DESKTOP=1` |
-| `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled` `:168`, `primary` `:304`) |
+| `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled` `:170`, `primary` `:527`); FR-93 P3c: the plane table with each plane's type (`read_planes` `:219`), the primary by type (`primary_plane` `:267`), the cursor caps (`enable_cursor_caps` `:297`) and the per-frame cursor read (`CursorReader` `:310`, `read_cursor_pixels` `:392`) |
+| `agents/roomlerd/src/capture/drm_cursor.rs` | FR-93 P3c: the published cursor (`publish` `:64`, `latest` `:71`) and the pure conversions (`straighten_and_crop` `:108`, `place` `:167`, `shape_id` `:181`, `pick_primary` `:208`) |
 | `agents/roomlerd/src/capture/portal/mod.rs` | `PortalStatus` and the detector (`detect` `:161`, P2d-3's bounded `detect_within` `:171`, `detect_in_session` `:318`); the brief's non-activating `reachable` (`:198`); `pub mod helper` (`:337`): the `portal-helper` subcommand, `spawn_streaming` (`:779`), `spawn_child` (`:905`) |
 | `agents/roomlerd/src/capture/portal/pending.rs` | FR-93 P2d: the host's one request (`BROKER` `:48`), which the configured arm (`open` `:51`) and the automatic one (`open_with` `:59`) share; the handoff (`Broker::open` `:146`, `Request::land` `:216`, `Request::wait` `:229`) |
 | `agents/roomlerd/src/companion.rs` | `graphical_session()` (`:615`) — the logind lookup the consent companion, the helper and FR-93's "is a Wayland desktop showing" all share |

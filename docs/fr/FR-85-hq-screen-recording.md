@@ -31,7 +31,7 @@ what it costs in installer size and ships with integration and e2e tests.
   `--disable-everything` plus hardware encoders only: static in `roomlerd.exe`, shared `libavcodec.so` in the .deb,
   dylibs in `roomlerd.app`. No decoders, demuxers, muxers, filters or swscale. **Linux arm64 has no FFmpeg at all**
   (openh264 + libvpx).
-- **The parts that do exist:** the capture cascade `capture::open_default` (`agents/roomlerd/src/capture/mod.rs:665`)
+- **The parts that do exist:** the capture cascade `capture::open_default` (`agents/roomlerd/src/capture/mod.rs:667`)
   and a synthetic source with a decodable 64-bit counter strip (`capture/synthetic_backend.rs:41`); `EncoderThread`
   (`encode/thread.rs:118`); the cells, denylist and probe cache; the child-process probe pattern (`encode/caps.rs`); the
   uid drop used by the portal helper (`capture/portal/mod.rs`); cpal loopback audio + audiopus Opus (`audio/`); the
