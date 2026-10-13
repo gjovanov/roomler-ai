@@ -50,6 +50,11 @@
 //! - Axis sign follows libinput: **positive is down/right**, matching the
 //!   browser's wheel delta directly. ⚠️ evdev `REL_WHEEL` is the opposite —
 //!   copying the uinput backend's inversion here would scroll backwards.
+//!   ⚠️ KDE's backend negates the vertical smooth axis on its way to KWin, so
+//!   [`for_backend`] negates it first there (FR-93 P4b).
+//! - ⚠️ **The portal's calls wait for their replies** (FR-93 P4b). The portal
+//!   handles each call on a worker thread, so unawaited calls can reach the
+//!   compositor out of order. [`Target::delivery`] has the measurement.
 
 use crate::input::hid_evdev::hid_to_evdev;
 use crate::input::{InputMsg, WheelMode, button_code};
@@ -306,6 +311,47 @@ enum Target {
     },
 }
 
+/// FR-93 P4b — how a `Notify*` call goes on the bus. This decides whether the
+/// calls reach the compositor in the order they were sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// Wait for each call's reply before sending the next. The reply is empty;
+    /// the wait is what keeps the order.
+    Awaited,
+    /// Write the call and go on (`NO_REPLY_EXPECTED`). Only for a receiver
+    /// that handles calls in the order they arrive.
+    Unawaited,
+}
+
+impl Target {
+    /// ⚠️ **The portal's calls are [`Delivery::Awaited`]: never "optimise"
+    /// them back to `call_noreply`.** xdg-desktop-portal runs every
+    /// RemoteDesktop method call on its own worker thread
+    /// (`HANDLE_METHOD_INVOCATIONS_IN_THREAD`), so two calls sent back to back
+    /// reach the backend in either order.
+    ///
+    /// Measured on KDE (Plasma 6.7) with unawaited calls: about 1 keystroke in
+    /// 15 had its release arrive before its press. KWin dropped the release,
+    /// because the key was not down, then took the press. The key stayed held
+    /// until that letter's next keystroke, and KWin dropped that press as a
+    /// repeat: typed text lost characters. A button's release overtaking its
+    /// press would hold a mouse button down on the host the same way.
+    ///
+    /// The frontend forwards each call to the backend BEFORE it replies, so
+    /// waiting for the reply keeps the order, for one bus round trip per call.
+    /// Measured on that host: 0.5 ms at the median, under 4 ms at p99. The
+    /// viewer sends a pointer move every 8 ms at most, so this keeps up.
+    ///
+    /// Mutter answers its own RemoteDesktop session on its main loop, in the
+    /// order the calls arrive, so there a reply would only add a round trip.
+    fn delivery(&self) -> Delivery {
+        match self {
+            Target::Portal { .. } => Delivery::Awaited,
+            Target::Mutter { .. } => Delivery::Unawaited,
+        }
+    }
+}
+
 /// Everything needed to execute [`PortalCall`]s against a live RemoteDesktop
 /// session. Built in `run_stream` once the stream is negotiated, handed to
 /// the stdin pump thread.
@@ -379,23 +425,8 @@ impl InputContext {
     /// how loud to be, and it deliberately keeps going: one refused event
     /// must not end input for the session.
     ///
-    /// ⚠️ **Every portal call WAITS for its reply** (FR-93 P4b). The reply is
-    /// empty and carries nothing, but waiting for it is what keeps the calls in
-    /// order. xdg-desktop-portal runs each RemoteDesktop method call on its own
-    /// worker thread (`HANDLE_METHOD_INVOCATIONS_IN_THREAD`), so two calls sent
-    /// back to back can reach the backend in either order.
-    ///
-    /// Measured on KDE with `call_noreply`: about 1 keystroke in 15 had its
-    /// release arrive before its press. KWin dropped the release, because the key
-    /// was not down, then took the press. The key stayed held until that
-    /// letter's next keystroke, and KWin dropped that press as a repeat, so typed
-    /// text lost characters. A button's release overtaking its press holds a
-    /// mouse button down on the host the same way.
-    ///
-    /// The frontend forwards the call to the backend BEFORE it replies, so
-    /// waiting for the reply orders the calls. The cost is one bus round trip
-    /// per call. Mutter's own session ([`Self::execute_mutter`]) dispatches on
-    /// its main loop, already in order, so it keeps `call_noreply`.
+    /// Every call goes out as [`Target::delivery`] says: the portal's wait for
+    /// their replies, which is what keeps them in order.
     fn execute(&self, call: PortalCall) -> Result<(), zbus::Error> {
         use std::collections::HashMap;
         let (sess, node_id) = match &self.target {
@@ -403,59 +434,59 @@ impl InputContext {
             Target::Mutter { stream } => return self.execute_mutter(call, stream),
         };
         let opts: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
-        let sent = match for_backend(call, self.quirks) {
-            PortalCall::MotionAbs { x, y } => self
-                .proxy
-                .call_method("NotifyPointerMotionAbsolute", &(sess, opts, node_id, x, y)),
-            PortalCall::Button { code, down } => self
-                .proxy
-                .call_method("NotifyPointerButton", &(sess, opts, code, u32::from(down))),
-            PortalCall::Axis { dx, dy } => self
-                .proxy
-                .call_method("NotifyPointerAxis", &(sess, opts, dx, dy)),
-            PortalCall::AxisDiscrete { axis, steps } => self
-                .proxy
-                .call_method("NotifyPointerAxisDiscrete", &(sess, opts, axis, steps)),
-            PortalCall::Keycode { code, down } => self.proxy.call_method(
-                "NotifyKeyboardKeycode",
-                &(sess, opts, code, u32::from(down)),
-            ),
-            PortalCall::Keysym { sym, down } => self
-                .proxy
-                .call_method("NotifyKeyboardKeysym", &(sess, opts, sym, u32::from(down))),
-        };
-        sent.map(drop)
+        match for_backend(call, self.quirks) {
+            PortalCall::MotionAbs { x, y } => {
+                self.send("NotifyPointerMotionAbsolute", &(sess, opts, node_id, x, y))
+            }
+            PortalCall::Button { code, down } => {
+                self.send("NotifyPointerButton", &(sess, opts, code, u32::from(down)))
+            }
+            PortalCall::Axis { dx, dy } => self.send("NotifyPointerAxis", &(sess, opts, dx, dy)),
+            PortalCall::AxisDiscrete { axis, steps } => {
+                self.send("NotifyPointerAxisDiscrete", &(sess, opts, axis, steps))
+            }
+            PortalCall::Keycode { code, down } => {
+                self.send("NotifyKeyboardKeycode", &(sess, opts, code, u32::from(down)))
+            }
+            PortalCall::Keysym { sym, down } => {
+                self.send("NotifyKeyboardKeysym", &(sess, opts, sym, u32::from(down)))
+            }
+        }
     }
 
     /// FR-93 P4 — [`Self::execute`] on mutter's own session.
-    ///
-    /// `call_noreply` here, because mutter keeps the calls in order on its own.
-    /// It answers its RemoteDesktop session on its main loop, so the calls are
-    /// handled in the order they were sent. Waiting for an empty reply would
-    /// add a round trip to every pointer event for nothing.
     fn execute_mutter(&self, call: PortalCall, stream: &str) -> Result<(), zbus::Error> {
         let Some(call) = mutter_call(call) else {
             return Ok(());
         };
         match call {
-            MutterCall::MotionAbs { x, y } => self
-                .proxy
-                .call_noreply("NotifyPointerMotionAbsolute", &(stream, x, y)),
-            MutterCall::Button { code, down } => self
-                .proxy
-                .call_noreply("NotifyPointerButton", &(code, down)),
-            MutterCall::Axis { dx, dy, flags } => self
-                .proxy
-                .call_noreply("NotifyPointerAxis", &(dx, dy, flags)),
-            MutterCall::AxisDiscrete { axis, steps } => self
-                .proxy
-                .call_noreply("NotifyPointerAxisDiscrete", &(axis, steps)),
-            MutterCall::Keycode { code, down } => self
-                .proxy
-                .call_noreply("NotifyKeyboardKeycode", &(code, down)),
-            MutterCall::Keysym { sym, down } => self
-                .proxy
-                .call_noreply("NotifyKeyboardKeysym", &(sym, down)),
+            MutterCall::MotionAbs { x, y } => {
+                self.send("NotifyPointerMotionAbsolute", &(stream, x, y))
+            }
+            MutterCall::Button { code, down } => self.send("NotifyPointerButton", &(code, down)),
+            MutterCall::Axis { dx, dy, flags } => {
+                self.send("NotifyPointerAxis", &(dx, dy, flags))
+            }
+            MutterCall::AxisDiscrete { axis, steps } => {
+                self.send("NotifyPointerAxisDiscrete", &(axis, steps))
+            }
+            MutterCall::Keycode { code, down } => {
+                self.send("NotifyKeyboardKeycode", &(code, down))
+            }
+            MutterCall::Keysym { sym, down } => self.send("NotifyKeyboardKeysym", &(sym, down)),
+        }
+    }
+
+    /// One `Notify*` call, delivered as [`Target::delivery`] says. A send error
+    /// (a dead session) comes back either way; an awaited call also returns a
+    /// refusal the receiver answers with.
+    fn send<B>(&self, method: &'static str, body: &B) -> Result<(), zbus::Error>
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType,
+    {
+        match self.target.delivery() {
+            Delivery::Awaited => self.proxy.call_method(method, body).map(drop),
+            Delivery::Unawaited => self.proxy.call_noreply(method, body),
         }
     }
 }
@@ -818,6 +849,26 @@ mod tests {
             ),
             PortalCall::Axis { dx: 4.0, dy: 120.0 },
             "every other backend keeps the portal's convention"
+        );
+    }
+
+    /// FR-93 P4b — the portal's calls wait for their replies, because only the
+    /// wait keeps them in order. xdg-desktop-portal handles each call on a
+    /// worker thread; unawaited, about 1 keystroke in 15 lost characters on KDE.
+    #[test]
+    fn portal_calls_wait_for_their_replies() {
+        let portal = Target::Portal {
+            session: zbus::zvariant::OwnedObjectPath::try_from(
+                "/org/freedesktop/portal/desktop/session/1_42/roomler",
+            )
+            .unwrap(),
+            node_id: 42,
+        };
+        assert_eq!(
+            portal.delivery(),
+            Delivery::Awaited,
+            "unawaited portal calls reach the compositor out of order: a key's release \
+             before its press drops typed characters (see Target::delivery)"
         );
     }
 
