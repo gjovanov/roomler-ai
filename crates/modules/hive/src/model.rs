@@ -192,6 +192,13 @@ pub struct AgentSession {
     /// still needs the start it was owed. Absent before P2e-6b.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moved: Option<MovedStart>,
+    /// FR-90 P2f-3 — the session this one was forked from. Every start of
+    /// it names that session ([`Self::fork_of`]), so a device starts it from
+    /// that conversation and its checkpoints keep that history beside its
+    /// own. Absent for every other session, and on every record before
+    /// P2f-3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ParentLink>,
 }
 
 /// FR-90 P2e-6b — where a moved start came from, by whom, and when.
@@ -200,6 +207,16 @@ pub struct MovedStart {
     pub from: SessionLocation,
     pub by: ObjectId,
     pub at: DateTime,
+}
+
+/// FR-90 P2f-3 — the session a fork was made from: its record, and its
+/// harness session, which the device resumes the fork's first launch from
+/// (`--resume <it> --fork-session`). Kept whole on the fork, so its starts
+/// never read the parent's record, which may be gone.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ParentLink {
+    pub session_id: ObjectId,
+    pub harness_session: String,
 }
 
 /// FR-90 P2e-3 — the last event of a fence a promotion superseded. BSON has
@@ -452,6 +469,18 @@ pub const MAX_DRIVERS: usize = 16;
 impl AgentSession {
     pub const COLLECTION: &'static str = "agent_sessions";
 
+    /// FR-90 P2f-3 — what every start of this session tells its device of
+    /// the session it was forked from: `rc:hive.start`'s `fork_of`. `None`
+    /// for a session that is no fork.
+    pub fn fork_of(&self) -> Option<roomler_ai_remote_control::hive::HiveForkOf> {
+        self.parent
+            .as_ref()
+            .map(|p| roomler_ai_remote_control::hive::HiveForkOf {
+                session_id: p.session_id,
+                harness_session: p.harness_session.clone(),
+            })
+    }
+
     /// Whether `user` drives this session: its owner, or one the owner named.
     /// ⚠️ Not enough to prompt it: the session must be live and the driver
     /// still able to read it ([`crate::access`]).
@@ -530,6 +559,9 @@ pub struct SessionView {
     /// P2e-3 — the promotion in flight. Absent: none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promotion: Option<PromotionView>,
+    /// FR-90 P2f-3 — the session this one was forked from, hex. Absent: none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
 }
 
 /// [`Promotion`] as the API answers it.
@@ -672,6 +704,7 @@ impl From<&AgentSession> for SessionView {
             origin: s.origin,
             replicaset: s.replicaset.as_ref().map(ReplicasetView::from),
             promotion: s.promotion.as_ref().map(PromotionView::from),
+            parent_session_id: s.parent.as_ref().map(|p| p.session_id.to_hex()),
         }
     }
 }
@@ -722,7 +755,8 @@ pub struct HiveAuditEvent {
     /// The acting user.
     pub user_id: ObjectId,
     /// Whom the action was about, when not the actor: the participant added,
-    /// changed or removed (P1c); the fact written (P1e).
+    /// changed or removed (P1c); the fact written (P1e). P2f-3 — for `fork`, the
+    /// session it forks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_id: Option<ObjectId>,
     /// The device a session event concerns, or a device-scope fact's device.
@@ -733,7 +767,8 @@ pub struct HiveAuditEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<ObjectId>,
     /// `start` | `stop` | `view` | `participant` | `brain` | `policy` (P2c-2a) |
-    /// `place` (P2c-2b).
+    /// `place` (P2c-2b) | `fork` (P2f-3: its `session_id` the fork, once it is
+    /// made).
     pub action: String,
     /// `sent` | `queued` | `refused`; for `participant`, the role given —
     /// `driver` | `reader` — or `removed`; for `brain`, `added` | `edited` |
@@ -847,6 +882,7 @@ mod tests {
             promotion: None,
             fences: Vec::new(),
             moved: None,
+            parent: None,
         };
         let v = serde_json::to_value(SessionView::from(&s)).unwrap();
         assert!(v["created_at"].is_string(), "{v}");
