@@ -1083,6 +1083,7 @@ pub(crate) async fn reconcile_on_connect(
                     lease,
                     // P2f-3 — a fork's every start says what it was made from.
                     fork_of: s.fork_of(),
+                    from_terminal: false,
                 };
                 match crate::routes::push_start(state, &s, device_id, msg) {
                     Ok(()) => {

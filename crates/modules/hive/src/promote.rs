@@ -1958,6 +1958,7 @@ async fn send_start(state: &HiveState, s: &AgentSession, from: &SessionLocation,
                 == Some(true),
         // P2f-3 — a fork's every start says what it was made from.
         fork_of: s.fork_of(),
+        from_terminal: false,
     };
     match crate::routes::push_start(state, s, device, msg) {
         Ok(()) => info!(session = %sid, device = %device, fence, "hive: the moved start was sent"),

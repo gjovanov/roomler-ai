@@ -37,9 +37,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bson::oid::ObjectId;
-use roomler_ai_remote_control::hive::{HiveAdoptRefusal, HiveRunState, HiveTurnStatus};
+use roomler_ai_remote_control::hive::{
+    HiveAdoptRefusal, HiveRefusal, HiveRunState, HiveTurnStatus,
+};
 use roomler_ai_remote_control::signaling::ClientMsg;
 use roomler_hive_node::TranscriptEvent;
+#[cfg(unix)]
+use roomler_hive_node::launch::history_path_in;
 use roomler_hive_node::stream_json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -53,10 +57,13 @@ use tunnel_core::localapi::hive_adopt::{self as proto, Reply, refusal};
 #[cfg(unix)]
 use tunnel_core::localapi::hive_adopt::{HookEvent, Request};
 
-use super::Supervisor;
+use super::{Answer, StartOrder, Supervisor};
 #[cfg(unix)]
 use crate::hive::lines::LineReader;
 use crate::hive::procs;
+use crate::hive::store::StoreHandle;
+#[cfg(unix)]
+use crate::hive::{importer, resume_note};
 
 /// The file beside `hosted.json` that keeps what this device mirrors.
 pub(super) const ADOPTED_FILE: &str = "adopted.json";
@@ -101,6 +108,29 @@ pub(crate) struct Adopted {
     /// Stopped from Roomler: nothing more is taken for it.
     #[serde(default)]
     pub stopped: bool,
+    /// FR-90 P2f-4a — the folder the terminal ran in, as its hook said at
+    /// the hello: where Claude Code keeps its history is named after it.
+    /// `None` for a session adopted before P2f-4a.
+    #[serde(default)]
+    pub folder: Option<String>,
+}
+
+/// FR-90 P2f-4a — an adopted session that ended here, as much of it as
+/// making it a managed one needs: whose terminal it was, by this device's own
+/// record (the account the kernel named at the hello), never the server's.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub(crate) struct EndedTerminal {
+    pub session: String,
+    pub harness_session: String,
+    pub account: String,
+    pub uid: u32,
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// Turns begun: a managed session counts on from them.
+    pub turns: u32,
+    /// Its mirroring was stopped from Roomler before its terminal ended.
+    #[serde(default)]
+    pub stopped: bool,
 }
 
 /// The turn in progress.
@@ -123,6 +153,11 @@ struct Doc {
     /// The records of adopted sessions that ended here, oldest first.
     #[serde(default)]
     ended: Vec<String>,
+    /// FR-90 P2f-4a — and whose terminal each was, for those that ended
+    /// since P2f-4a. A daemon before it does not read them, and drops them
+    /// the next time it writes the file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ended_terminals: Vec<EndedTerminal>,
 }
 
 /// The adopted sessions and the file that keeps them, `0600`, written whole.
@@ -132,6 +167,7 @@ pub(crate) struct AdoptedFile {
     agent: String,
     sessions: Vec<Adopted>,
     ended: Vec<String>,
+    ended_terminals: Vec<EndedTerminal>,
 }
 
 impl AdoptedFile {
@@ -139,9 +175,11 @@ impl AdoptedFile {
     /// cannot be read, belongs to another enrollment or is from a newer
     /// daemon mirrors nothing, and the next write replaces it.
     pub(crate) fn load(path: Option<PathBuf>, agent: &str) -> Self {
-        let (sessions, ended) = match path.as_ref().map(std::fs::read) {
+        let (sessions, ended, ended_terminals) = match path.as_ref().map(std::fs::read) {
             Some(Ok(bytes)) => match serde_json::from_slice::<Doc>(&bytes) {
-                Ok(doc) if doc.v <= VERSION && doc.agent == agent => (doc.sessions, doc.ended),
+                Ok(doc) if doc.v <= VERSION && doc.agent == agent => {
+                    (doc.sessions, doc.ended, doc.ended_terminals)
+                }
                 Ok(_) => Default::default(),
                 Err(e) => {
                     warn!(%e, "hive: the adopted sessions could not be read — none is kept");
@@ -155,6 +193,7 @@ impl AdoptedFile {
             agent: agent.to_string(),
             sessions,
             ended,
+            ended_terminals,
         }
     }
 
@@ -215,12 +254,53 @@ impl AdoptedFile {
         };
         let a = self.sessions.remove(i);
         self.ended.retain(|s| *s != a.session);
-        self.ended.push(a.session);
+        self.ended.push(a.session.clone());
         if self.ended.len() > MAX_ENDED {
             let over = self.ended.len() - MAX_ENDED;
             self.ended.drain(..over);
         }
+        // P2f-4a — and whose terminal it was, should its owner make it a
+        // managed one: bounded as the ids are.
+        self.ended_terminals.retain(|t| t.session != a.session);
+        self.ended_terminals.push(EndedTerminal {
+            session: a.session,
+            harness_session: a.harness_session,
+            account: a.account,
+            uid: a.uid,
+            folder: a.folder,
+            turns: a.turns,
+            stopped: a.stopped,
+        });
+        if self.ended_terminals.len() > MAX_ENDED {
+            let over = self.ended_terminals.len() - MAX_ENDED;
+            self.ended_terminals.drain(..over);
+        }
         self.save();
+    }
+
+    /// FR-90 P2f-4a — what this device kept of `session`, a terminal session
+    /// that ended here.
+    pub(super) fn ended_terminal(&self, session: &str) -> Option<&EndedTerminal> {
+        self.ended_terminals.iter().find(|t| t.session == session)
+    }
+
+    /// FR-90 P2f-4a — whether a terminal session runs here on `harness_session`
+    /// now, mirrored or stopped: a `claude --resume` of an ended one is
+    /// offered afresh, as a new record.
+    pub(super) fn terminal_runs(&self, harness_session: &str) -> bool {
+        self.get(harness_session).is_some()
+    }
+
+    /// FR-90 P2f-4a — `session` is a managed session now: no longer one of
+    /// the terminal sessions that ended here, so it is served as any session
+    /// is, on `hive_enabled`.
+    pub(super) fn made_managed(&mut self, session: &str) {
+        let before = (self.ended.len(), self.ended_terminals.len());
+        self.ended.retain(|s| s != session);
+        self.ended_terminals.retain(|t| t.session != session);
+        if before != (self.ended.len(), self.ended_terminals.len()) {
+            self.save();
+        }
     }
 
     fn save(&self) {
@@ -230,6 +310,7 @@ impl AdoptedFile {
             agent: self.agent.clone(),
             sessions: self.sessions.clone(),
             ended: self.ended.clone(),
+            ended_terminals: self.ended_terminals.clone(),
         };
         if let Err(e) = super::super::hosted::write_private_json(path, &doc) {
             warn!(file = %path.display(), %e, "hive: the adopted sessions were not saved");
@@ -239,6 +320,14 @@ impl AdoptedFile {
 
 /// What the server said to one offer.
 pub(crate) type OfferAnswer = Result<(ObjectId, u64), HiveAdoptRefusal>;
+
+/// FR-90 P2f-4a — a terminal's history, put in place for a session's first
+/// start as a managed one: what the launch tells the harness, and the turns
+/// the session counts on from.
+pub(super) struct Imported {
+    pub note: String,
+    pub turns: u32,
+}
 
 /// Milliseconds since the epoch.
 fn now_ms() -> u64 {
@@ -569,6 +658,7 @@ impl Supervisor {
             terminal_pid,
             terminal_started,
             stopped: false,
+            folder: Some(folder.to_string()),
         };
         // Two hooks of one session can race to offer it; the server answers
         // both with the same record, and the first one kept stands.
@@ -890,6 +980,149 @@ impl Supervisor {
         self.adopted_lock().was_adopted(&session.to_hex())
     }
 
+    /// FR-90 P2f-4a — a start that makes a terminal session this device
+    /// adopted a managed one ([`StartOrder::from_terminal`]), past every
+    /// start gate: its own gates, then, unless its history is its own
+    /// already, the terminal's history put in place as the account it ran as
+    /// ([`importer`]). `Ok(Some(_))` when it was: what the launch tells the
+    /// harness, and the turns it counts on from.
+    ///
+    /// | Gate | Why |
+    /// |---|---|
+    /// | no terminal runs it here, mirrored, stopped or resumed afresh | two harnesses on one history would both write it (spec §3d), and a history being written is copied cut short |
+    /// | it ended here since this device keeps whose terminal it was | the account is this device's record, the one the kernel named at the hello: a server that named another would pour that person's terminal into this owner's session |
+    /// | its mirroring was not stopped from Roomler | the terminal went on after the stop, and what it did then is not Roomler's to take |
+    /// | the start names the terminal's conversation | |
+    /// | the starter maps to the account it ran as, and that account is still the one with its uid | the history is in that account's home; a remapped starter must not carry it into another's |
+    ///
+    /// A refusal is said in words for the server; what the import ran into
+    /// names the account's own files, and stays in this device's log.
+    pub(super) async fn terminal_in_place(
+        &self,
+        order: &StartOrder,
+        account: &str,
+        folder: &Path,
+        store: &StoreHandle,
+    ) -> Result<Option<Imported>, Answer> {
+        #[cfg(windows)]
+        {
+            let _ = (order, account, folder, store);
+            Err(Answer::refused(
+                HiveRefusal::Other,
+                "nothing is adopted on Windows",
+            ))
+        }
+        #[cfg(unix)]
+        {
+            let sid = order.session_id.to_hex();
+            let (home, who) = self.home_and_who(account).map_err(|e| {
+                warn!(session = %order.session_id, %e, "hive: where the terminal's history goes is not known — its start is refused");
+                Answer::refused(
+                    HiveRefusal::LaunchFailed,
+                    "this device could not tell where the session goes (its log says why)",
+                )
+            })?;
+            let dest = super::copy_dest(order, &home, folder);
+            // Its history is its own once it was put in place: a re-sent
+            // start, or a restart before its answer, launches it as any.
+            // The daemon only looks at the entry, never reads it (P1d-2).
+            let history = history_path_in(&dest.config_dir, &order.harness_session);
+            if std::fs::symlink_metadata(history).is_ok() {
+                return Ok(None);
+            }
+            let (kept, runs, was) = {
+                let file = self.adopted_lock();
+                (
+                    file.ended_terminal(&sid).cloned(),
+                    file.by_session(&sid).is_some() || file.terminal_runs(&order.harness_session),
+                    file.was_adopted(&sid),
+                )
+            };
+            if runs {
+                return Err(Answer::refused(
+                    HiveRefusal::Other,
+                    "its terminal session still runs here: it is made a managed one once that \
+                     terminal session ends",
+                ));
+            }
+            let Some(t) = kept else {
+                return Err(Answer::refused(
+                    HiveRefusal::Other,
+                    if was {
+                        "it ended here before this device kept whose terminal it was"
+                    } else {
+                        "this device holds no terminal session of it that ended here"
+                    },
+                ));
+            };
+            if t.stopped {
+                return Err(Answer::refused(
+                    HiveRefusal::Other,
+                    "its mirroring was stopped from Roomler: what its terminal did after that is \
+                     not Roomler's to take",
+                ));
+            }
+            if t.harness_session != order.harness_session {
+                return Err(Answer::refused(
+                    HiveRefusal::Other,
+                    "the start names another conversation than its terminal's",
+                ));
+            }
+            if t.account != account {
+                return Err(Answer::refused(
+                    HiveRefusal::NoAccount,
+                    format!(
+                        "its terminal ran as {}, and hive_accounts maps you to {account}",
+                        t.account
+                    ),
+                ));
+            }
+            match crate::exec::session_account_ids(account) {
+                Ok((uid, _, _)) if uid == t.uid => {}
+                _ => {
+                    return Err(Answer::refused(
+                        HiveRefusal::NoAccount,
+                        format!("{account} is no longer the account whose terminal it was"),
+                    ));
+                }
+            }
+            let req = importer::Request {
+                v: importer::REQUEST_V,
+                harness_session: order.harness_session.clone(),
+                claude_dir: home.join(".claude"),
+                folder: t.folder.clone(),
+                config_dir: dest.config_dir.clone(),
+            };
+            let done = importer::import(&self.checkpoint_runner(), &who, &req)
+                .await
+                .map_err(|why| {
+                    warn!(session = %order.session_id, %why, "hive: the terminal's history was not put in place — its start is refused");
+                    Answer::refused(
+                        HiveRefusal::LaunchFailed,
+                        "this device could not put its terminal's history in place (its log says \
+                         why); Claude Code keeps it under ~/.claude/projects unless the terminal \
+                         set CLAUDE_CONFIG_DIR",
+                    )
+                })?;
+            info!(
+                session = %order.session_id, files = done.files, bytes = done.bytes,
+                skipped = done.skipped, turns = t.turns,
+                "hive: the terminal's history is in place, for the managed session it is made"
+            );
+            let open = super::last_open_call(store, &sid).await;
+            Ok(Some(Imported {
+                note: resume_note::compose_terminal(t.folder.as_deref(), folder, open.as_deref()),
+                turns: t.turns,
+            }))
+        }
+    }
+
+    /// FR-90 P2f-4a — `session` launched as a managed session: no longer one
+    /// of the terminal sessions that ended here.
+    pub(super) fn made_managed(&self, session: ObjectId) {
+        self.adopted_lock().made_managed(&session.to_hex());
+    }
+
     fn adopted_lock(&self) -> std::sync::MutexGuard<'_, AdoptedFile> {
         self.adopted.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -995,6 +1228,7 @@ mod tests {
             terminal_pid: None,
             terminal_started: None,
             stopped: false,
+            folder: None,
         });
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
@@ -1297,6 +1531,7 @@ mod tests {
             terminal_pid: None,
             terminal_started: None,
             stopped: false,
+            folder: None,
         };
         let first = ObjectId::new().to_hex();
         f.put(adopted("u0", &first));
@@ -1361,6 +1596,7 @@ mod tests {
             terminal_pid: Some(pid),
             terminal_started: Some("a process that ended".into()),
             stopped: true,
+            folder: None,
         });
         r.sup.adopt_sweep();
         assert!(r.sup.adopted_lock().get(UUID).is_none(), "forgotten");
@@ -1500,5 +1736,480 @@ mod tests {
         .await;
         assert!(r.sup.adopted_lock().get(UUID).is_none());
         assert!(r.sup.adopt_holds(sid));
+    }
+
+    // ─── P2f-4a — an ended terminal session made a managed one ───────────
+
+    use crate::hive::supervisor::tests::{next_state, order};
+
+    /// The terminal's folder, as `hello` says it.
+    const TERMINAL_FOLDER: &str = "/home/me/work";
+
+    /// A rig whose device adopts, maps the starter and this account's keys
+    /// to this account, and runs its children in this process.
+    async fn managing() -> (Rig, PathBuf) {
+        let me = me().expect("not root");
+        let r = rig_with(
+            true,
+            4,
+            |c| {
+                c.adopt = true;
+                for account in c.accounts.values_mut() {
+                    *account = me.clone();
+                }
+                c.accounts.insert("me@example.com".into(), me.clone());
+                // A starter whose account is another than the terminal's.
+                c.accounts
+                    .insert("someone@example.com".into(), "nobody-else".into());
+            },
+            |mut s| {
+                // The rig's root is under /tmp: git's discovery stops there.
+                s.checkpoint_runner = Some(crate::hive::checkpointer::Runner::InProcess {
+                    ceiling: PathBuf::from("/tmp"),
+                });
+                s
+            },
+        );
+        let sup = Arc::clone(&r.sup);
+        tokio::spawn(async move { sup.adopt_listen().await });
+        let socket = r.root.path().join("run").join(proto::SOCKET_NAME);
+        for _ in 0..200 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (r, socket)
+    }
+
+    /// A terminal session adopted, a turn of it mirrored, its tool call left
+    /// open: the hook's connection, still open, and the session's record.
+    async fn adopted(r: &mut Rig, socket: &Path) -> (Hook, ObjectId) {
+        let mut hook = Hook::connect(socket).await;
+        hook.ask(hello(HookEvent::SessionStart)).await;
+        let adopt_id = next_report(r, |m| match m {
+            ClientMsg::HiveAdopt {
+                adopt_id,
+                harness_session,
+                ..
+            } if harness_session == UUID => Some(adopt_id.clone()),
+            _ => None,
+        })
+        .await;
+        let sid = ObjectId::new();
+        r.sup.adopt_answered(&adopt_id, Ok((sid, 1)));
+        assert_eq!(hook.reply().await, Reply::ok(Some(0)));
+        let data = format!("{USER_PROMPT}\n{ASSISTANT_TOOL}\n");
+        hook.ask(Request::Lines {
+            from: 0,
+            data: data.clone(),
+            skipped: 0,
+        })
+        .await;
+        assert_eq!(hook.reply().await, Reply::ok(Some(data.len() as u64)));
+        (hook, sid)
+    }
+
+    /// Its terminal ends (`SessionEnd`).
+    async fn end(r: &mut Rig, hook: &mut Hook, sid: ObjectId) {
+        hook.ask(Request::End {
+            reason: Some("exit".into()),
+        })
+        .await;
+        assert!(hook.reply().await.ok);
+        next_report(r, |m| match m {
+            ClientMsg::HiveState {
+                session_id,
+                state: Some(HiveRunState::Ended),
+                ..
+            } if *session_id == sid => Some(()),
+            _ => None,
+        })
+        .await;
+    }
+
+    /// The terminal's own history, where Claude Code keeps it for
+    /// [`TERMINAL_FOLDER`] under the rig's home: its first line names the
+    /// session, and records the mode the terminal ran in.
+    fn terminal_history(r: &Rig) -> (PathBuf, String) {
+        let project = r
+            .root
+            .path()
+            .join("home")
+            .join(".claude")
+            .join("projects")
+            .join(importer::project_name(TERMINAL_FOLDER));
+        std::fs::create_dir_all(project.join(UUID).join("tool-results")).unwrap();
+        std::fs::write(
+            project.join(UUID).join("tool-results").join("t1.txt"),
+            "a long output\n",
+        )
+        .unwrap();
+        let text = format!(
+            "{{\"type\":\"permission-mode\",\"permissionMode\":\"bypassPermissions\",\
+             \"sessionId\":\"{UUID}\"}}\n{USER_PROMPT}\n{ASSISTANT_TOOL}\n"
+        );
+        let path = project.join(format!("{UUID}.jsonl"));
+        std::fs::write(&path, &text).unwrap();
+        (path, text)
+    }
+
+    /// The start the server sends for it.
+    fn made_managed(r: &Rig, sid: ObjectId) -> StartOrder {
+        StartOrder {
+            session_id: sid,
+            harness_session: UUID.into(),
+            from_terminal: true,
+            ..order(r)
+        }
+    }
+
+    /// The session's config directory on the rig's device.
+    fn config_of(r: &Rig, sid: ObjectId) -> PathBuf {
+        roomler_hive_node::launch::config_dir_in(&super::super::session_state_dir(
+            &r.root.path().join("home"),
+            &sid.to_hex(),
+        ))
+    }
+
+    /// P2f-4a — decision 11's half on the device: an ended terminal session
+    /// made a managed one resumes its terminal's own history, put in place
+    /// under the managed session's names as the account it ran as; it counts
+    /// on from the terminal's turns, is told where it ran, and is served as
+    /// any session from then on.
+    #[tokio::test]
+    async fn an_ended_terminal_session_is_made_a_managed_one_from_its_own_history() {
+        let Some(me) = me() else { return };
+        let (mut r, socket) = managing().await;
+        let (mut hook, sid) = adopted(&mut r, &socket).await;
+        end(&mut r, &mut hook, sid).await;
+        let (_, text) = terminal_history(&r);
+
+        let answer = r.sup.start(made_managed(&r, sid), true).await;
+        assert_eq!(answer, Answer::accepted(&me));
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        let config = config_of(&r, sid);
+        let project = config.join(format!("projects/hive-{UUID}"));
+        assert_eq!(
+            std::fs::read_to_string(project.join(format!("{UUID}.jsonl"))).unwrap(),
+            text,
+            "the terminal's history, byte for byte, under the managed session's names"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join(UUID).join("tool-results").join("t1.txt"))
+                .unwrap(),
+            "a long output\n"
+        );
+        let run = r.root.path().join("run").join(sid.to_hex());
+        let note = std::fs::read_to_string(run.join(resume_note::NOTE_FILE)).unwrap_or_default();
+        assert!(
+            note.starts_with("This session ran in a terminal on this device"),
+            "told it ran in a terminal: {note:?}"
+        );
+        assert!(
+            note.contains(&format!("Its earlier turns worked in {TERMINAL_FOLDER}.")),
+            "told where its turns worked: {note:?}"
+        );
+        assert!(
+            note.contains("`ls`"),
+            "the call its terminal left open: {note:?}"
+        );
+        assert!(!r.sup.adopt_holds(sid), "a managed session now");
+        assert!(r.sup.adopted_lock().ended_terminal(&sid.to_hex()).is_none());
+
+        // It counts on from the terminal's turn, from the terminal's history.
+        r.sup.prompt(sid, None, "recall".into()).unwrap();
+        let turn = next_report(&mut r, |m| match m {
+            ClientMsg::HiveTurn {
+                session_id,
+                turn,
+                status: Some(HiveTurnStatus::Ok),
+                ..
+            } if *session_id == sid => Some(*turn),
+            _ => None,
+        })
+        .await;
+        assert_eq!(turn, 2, "the terminal began turn 1");
+        let events = r.store.events(&sid.to_hex());
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TranscriptEvent::AssistantText { text } if text == "history: 4"
+            )),
+            "the harness read the terminal's three lines, then the prompt: {events:?}"
+        );
+        // Read once a turn of the launch ran, so the harness wrote it.
+        let argv: Vec<String> = std::fs::read_to_string(r.root.path().join("work").join(".argv"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            argv.windows(2).any(|w| w == ["--resume", UUID]),
+            "resumed: {argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["--permission-mode", "default"]),
+            "in the mode a Hive session runs in, whatever the terminal's: {argv:?}"
+        );
+        // A start re-sent at its fence finds it running: nothing is put in
+        // place again.
+        assert_eq!(
+            r.sup.start(made_managed(&r, sid), true).await,
+            Answer::accepted(&me)
+        );
+    }
+
+    /// P2f-4a — a terminal session is made a managed one only once its
+    /// terminal has ended, and never one whose mirroring was stopped from
+    /// Roomler: its terminal went on after the stop.
+    #[tokio::test]
+    async fn only_an_ended_terminal_session_whose_mirroring_went_on_is_made_managed() {
+        let Some(_) = me() else { return };
+        let (mut r, socket) = managing().await;
+        let (hook, sid) = adopted(&mut r, &socket).await;
+        terminal_history(&r);
+        let answer = r.sup.start(made_managed(&r, sid), true).await;
+        assert_eq!(
+            answer.refused,
+            Some(HiveRefusal::Other),
+            "refused while its terminal runs: {answer:?}"
+        );
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("still runs here"),
+            "refused while its terminal runs, in words: {answer:?}"
+        );
+        assert!(!r.sup.holds_live(sid), "nothing launched");
+
+        // Stopped from Roomler: its terminal runs on, and so the refusal.
+        r.sup.stop(sid, 1, "owner".into());
+        let answer = r.sup.start(made_managed(&r, sid), true).await;
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("still runs here"),
+            "refused while its stopped terminal runs on: {answer:?}"
+        );
+        // And once its terminal ended, for good.
+        drop(hook);
+        let mut last = Hook::connect(&socket).await;
+        last.ask(hello(HookEvent::SessionEnd)).await;
+        assert_eq!(
+            last.reply().await.refused.as_deref(),
+            Some(refusal::STOPPED)
+        );
+        let kept = r.sup.adopted_lock().ended_terminal(&sid.to_hex()).cloned();
+        assert!(kept.is_some_and(|t| t.stopped), "kept as stopped");
+        let answer = r.sup.start(made_managed(&r, sid), true).await;
+        assert_eq!(
+            answer.refused,
+            Some(HiveRefusal::Other),
+            "refused once its stopped terminal ended: {answer:?}"
+        );
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("mirroring was stopped from Roomler"),
+            "refused once its stopped terminal ended, in words: {answer:?}"
+        );
+        assert!(!r.sup.holds_live(sid), "nothing launched");
+        let config = config_of(&r, sid);
+        assert!(
+            !roomler_hive_node::launch::history_path_in(&config, UUID).exists(),
+            "and nothing put in place"
+        );
+    }
+
+    /// P2f-4a — whose terminal it was is this device's word: the account
+    /// the kernel named, the session it adopted, the conversation it ran.
+    #[tokio::test]
+    async fn whose_terminal_it_was_is_this_devices_record() {
+        let Some(me) = me() else { return };
+        let (mut r, socket) = managing().await;
+        let (mut hook, sid) = adopted(&mut r, &socket).await;
+        end(&mut r, &mut hook, sid).await;
+        terminal_history(&r);
+
+        // A starter mapped to another account: not the terminal's.
+        let other = StartOrder {
+            user_id: ObjectId::new(),
+            user_email: "someone@example.com".into(),
+            ..made_managed(&r, sid)
+        };
+        let answer = r.sup.start(other, true).await;
+        assert_eq!(
+            answer.refused,
+            Some(HiveRefusal::NoAccount),
+            "refused for another account: {answer:?}"
+        );
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains(&format!("its terminal ran as {me}")),
+            "refused for another account, in words: {answer:?}"
+        );
+        // Another conversation than the terminal's.
+        let answer = r
+            .sup
+            .start(
+                StartOrder {
+                    harness_session: "0b9e3c7e-6a43-4a43-9d63-2d1b0d1c2f10".into(),
+                    ..made_managed(&r, sid)
+                },
+                true,
+            )
+            .await;
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("another conversation"),
+            "refused for another conversation: {answer:?}"
+        );
+        // A session this device never adopted.
+        let answer = r.sup.start(made_managed(&r, ObjectId::new()), true).await;
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("holds no terminal session of it"),
+            "refused for a session never adopted: {answer:?}"
+        );
+        // One that ended before this device kept whose terminal it was.
+        let before = ObjectId::new();
+        r.sup.adopted_lock().ended.push(before.to_hex());
+        let answer = r.sup.start(made_managed(&r, before), true).await;
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("before this device kept whose terminal it was"),
+            "refused for one that ended before the build: {answer:?}"
+        );
+        // Never both a fork and a terminal's.
+        let answer = r
+            .sup
+            .start(
+                StartOrder {
+                    fork_of: Some(roomler_ai_remote_control::hive::HiveForkOf {
+                        session_id: ObjectId::new(),
+                        harness_session: "0b9e3c7e-6a43-4a43-9d63-2d1b0d1c2f10".into(),
+                    }),
+                    ..made_managed(&r, sid)
+                },
+                true,
+            )
+            .await;
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("never both"),
+            "refused for a fork and a terminal at once: {answer:?}"
+        );
+        assert!(!r.sup.holds_live(sid), "nothing launched");
+    }
+
+    /// P2f-4a — a terminal whose history is not where Claude Code keeps it
+    /// (a terminal that set `CLAUDE_CONFIG_DIR`) is refused in words, and
+    /// nothing launches.
+    #[tokio::test]
+    async fn a_terminal_history_not_found_is_said_and_nothing_launches() {
+        let Some(_) = me() else { return };
+        let (mut r, socket) = managing().await;
+        let (mut hook, sid) = adopted(&mut r, &socket).await;
+        end(&mut r, &mut hook, sid).await;
+        let answer = r.sup.start(made_managed(&r, sid), true).await;
+        assert_eq!(
+            answer.refused,
+            Some(HiveRefusal::LaunchFailed),
+            "refused when no history is found: {answer:?}"
+        );
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("CLAUDE_CONFIG_DIR"),
+            "refused when no history is found, in words: {answer:?}"
+        );
+        assert!(!r.sup.holds_live(sid), "nothing launched");
+        assert!(
+            r.sup.adopted_lock().ended_terminal(&sid.to_hex()).is_some(),
+            "still a terminal session that ended here, to make managed once it is found"
+        );
+    }
+
+    /// P2f-4a — the file keeps whose terminal each ended session was, as
+    /// bounded as the ids, reads a file from before it, and forgets one made
+    /// a managed session.
+    #[test]
+    fn the_adopted_file_keeps_whose_terminal_each_ended_session_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ADOPTED_FILE);
+        // A file from before P2f-4a: ids only.
+        let first = ObjectId::new().to_hex();
+        std::fs::write(
+            &path,
+            serde_json::json!({"v": 1, "agent": "agent-a", "sessions": [], "ended": [first]})
+                .to_string(),
+        )
+        .unwrap();
+        let mut f = AdoptedFile::load(Some(path.clone()), "agent-a");
+        assert!(f.was_adopted(&first));
+        assert!(
+            f.ended_terminal(&first).is_none(),
+            "whose it was is not known"
+        );
+        let second = ObjectId::new().to_hex();
+        f.put(Adopted {
+            harness_session: "u2".into(),
+            session: second.clone(),
+            fence: 1,
+            account: "alice".into(),
+            uid: 1000,
+            offset: 9,
+            turns: 3,
+            running: None,
+            terminal_pid: None,
+            terminal_started: None,
+            stopped: false,
+            folder: Some("/home/alice/x".into()),
+        });
+        f.retire("u2");
+        let kept = AdoptedFile::load(Some(path.clone()), "agent-a");
+        assert_eq!(
+            kept.ended_terminal(&second),
+            Some(&EndedTerminal {
+                session: second.clone(),
+                harness_session: "u2".into(),
+                account: "alice".into(),
+                uid: 1000,
+                folder: Some("/home/alice/x".into()),
+                turns: 3,
+                stopped: false,
+            })
+        );
+        let mut kept = kept;
+        kept.made_managed(&second);
+        let again = AdoptedFile::load(Some(path), "agent-a");
+        assert!(!again.was_adopted(&second), "a managed session now");
+        assert!(again.ended_terminal(&second).is_none());
+        assert!(again.was_adopted(&first), "the others kept");
     }
 }

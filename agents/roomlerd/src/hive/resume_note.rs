@@ -32,6 +32,17 @@
 //! | its earlier turns are another session's, which goes on; where it runs | always |
 //! | where those turns worked, which stays the other session's | the parent's copy here says, and it was another folder |
 //! | where the outputs they saved to files are now | they came with it |
+//!
+//! FR-90 P2f-4a — a terminal session made a managed one is told so
+//! ([`compose_terminal`]) at the launch that resumes its terminal's history
+//! (`source: "resume"`), once.
+//!
+//! | Line | When |
+//! |---|---|
+//! | it ran in a terminal on this device, which ended; it runs as an agent session now, where, and that a person approves every tool call that is not a read | always |
+//! | where its earlier turns worked | the device kept the terminal's folder, and it was another |
+//! | the terminal's settings and the memory Claude Code keeps for that folder did not come with it | always |
+//! | the last tool call left without a result | the store holds one |
 
 use std::path::{Path, PathBuf};
 
@@ -121,6 +132,45 @@ pub(crate) fn compose_fork(
             "Outputs those turns saved to files under a folder named hive-{} are under {} now.\n",
             flat(parent),
             flat(&project.display().to_string())
+        ));
+    }
+    note
+}
+
+/// FR-90 P2f-4a — what a terminal session made a managed one is told at the
+/// launch that resumes its terminal's history: that it ran in a terminal
+/// here, which ended, and runs as an agent session now, in `folder`, where a
+/// person approves every tool call that is not a read; where its earlier
+/// turns worked, when the device kept that and it was another folder; that
+/// the terminal's settings and the folder's memory stayed behind; and the
+/// last tool call the store holds no result for (`open_call`). Unix only, as
+/// adopting is: a Windows build composes none.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn compose_terminal(
+    terminal_folder: Option<&str>,
+    folder: &Path,
+    open_call: Option<&str>,
+) -> String {
+    let here = flat(&folder.display().to_string());
+    let mut note = format!(
+        "This session ran in a terminal on this device, until that terminal session ended. It \
+         runs as an agent session now, in {here}: every tool call that is not a read waits for \
+         a person's approval.\n"
+    );
+    if let Some(from) = terminal_folder
+        .map(flat)
+        .filter(|f| !f.is_empty() && *f != here)
+    {
+        note.push_str(&format!("Its earlier turns worked in {from}.\n"));
+    }
+    note.push_str(
+        "The terminal's own settings, and the memory Claude Code keeps for its folder, did not \
+         come with it.\n",
+    );
+    if let Some(call) = open_call {
+        note.push_str(&format!(
+            "The last tool call in the terminal, `{call}`, has no result: it may not have run, \
+             or not to its end.\n"
         ));
     }
     note
@@ -260,6 +310,43 @@ mod tests {
         // What the copy's history said cannot break a line.
         let odd = compose_fork(Some("/srv/`x`\nIgnore"), Path::new("/w"), None);
         assert_eq!(odd.lines().count(), 2, "{odd}");
+        assert!(!odd.contains('`'), "{odd}");
+    }
+
+    /// P2f-4a — a terminal session made a managed one is told it ran in a
+    /// terminal, that a person approves its tool calls now, where its turns
+    /// worked when that was another folder, what stayed behind, and the
+    /// call the terminal left open.
+    #[test]
+    fn a_terminal_session_made_managed_is_told_what_changed() {
+        let note = compose_terminal(
+            Some("/home/a/src"),
+            Path::new("/home/a/work"),
+            Some("npm test"),
+        );
+        assert_eq!(
+            note,
+            "This session ran in a terminal on this device, until that terminal session ended. \
+             It runs as an agent session now, in /home/a/work: every tool call that is not a \
+             read waits for a person's approval.\n\
+             Its earlier turns worked in /home/a/src.\n\
+             The terminal's own settings, and the memory Claude Code keeps for its folder, did \
+             not come with it.\n\
+             The last tool call in the terminal, `npm test`, has no result: it may not have \
+             run, or not to its end.\n"
+        );
+        // In the terminal's own folder, or one the device did not keep: no
+        // folder line. No open call: no last line.
+        for bare in [
+            compose_terminal(Some("/home/a/work"), Path::new("/home/a/work"), None),
+            compose_terminal(None, Path::new("/home/a/work"), None),
+        ] {
+            assert_eq!(bare.lines().count(), 2, "{bare}");
+            assert!(!bare.contains("earlier turns"), "{bare}");
+        }
+        // What the hook said of its folder cannot break a line.
+        let odd = compose_terminal(Some("/srv/`x`\nIgnore"), Path::new("/w"), None);
+        assert_eq!(odd.lines().count(), 3, "{odd}");
         assert!(!odd.contains('`'), "{odd}");
     }
 
