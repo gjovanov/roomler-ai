@@ -1193,6 +1193,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-93 P2 - a PER-USER install in its own Wayland session, with no capture key set, switches capture on by itself: on GNOME mutter's own screencast (** it asks nobody **), elsewhere (KDE and other desktops) the desktop portal, which asks the person at the screen once and restores their answer afterwards (P2d-3). A root (system) install never switches capture on: DRM and uinput stay opt-in there. Any capture key set (drm_capture, portal_capture, mutter_capture, window_capture) takes the choice back. Built-in default: ON. Off = the behaviour before P2 (the kill switch). Env: ROOMLERD_WAYLAND_AUTO. Restart required.",
     },
     KeyMeta {
+        key: "mutter_input",
+        group: Group::CaptureInput,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-93 P4 - a mutter screencast is driven by mutter's own RemoteDesktop, so the viewer's mouse and keyboard reach the whole desktop through it, native Wayland windows included (** it asks nobody **, like the screencast it drives). The automatic arm (wayland_auto, a per-user GNOME session) carries it; a configured one (mutter_capture) carries it only with portal_input too. Built-in default: ON. Off = mutter capture is view-only again, the behaviour before P4 (the kill switch). Env: ROOMLERD_MUTTER_INPUT. Restart required.",
+    },
+    KeyMeta {
         key: "x11_damage",
         group: Group::CaptureInput,
         tier: Tier::Advanced,
@@ -1874,6 +1882,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "window_capture" => cfg.window_capture.map(fmt_bool),
         "wayland_aware" => cfg.wayland_aware.map(fmt_bool),
         "wayland_auto" => cfg.wayland_auto.map(fmt_bool),
+        "mutter_input" => cfg.mutter_input.map(fmt_bool),
         "x11_damage" => cfg.x11_damage.map(fmt_bool),
         "overlay_key_rotation" => cfg.overlay_key_rotation.map(fmt_bool),
         "idle_refine_max_edge" => cfg.idle_refine_max_edge.map(|p| p.to_string()),
@@ -2399,6 +2408,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "window_capture" => cfg.window_capture = parse_tribool(value)?,
         "wayland_aware" => cfg.wayland_aware = parse_tribool(value)?,
         "wayland_auto" => cfg.wayland_auto = parse_tribool(value)?,
+        "mutter_input" => cfg.mutter_input = parse_tribool(value)?,
         "x11_damage" => cfg.x11_damage = parse_tribool(value)?,
         "overlay_key_rotation" => cfg.overlay_key_rotation = parse_tribool(value)?,
         "idle_refine_max_edge" => cfg.idle_refine_max_edge = parse_u32_range(key, value, 0, 8192)?,
@@ -3135,6 +3145,7 @@ mod tests {
             "window_capture",
             "wayland_aware",
             "wayland_auto",
+            "mutter_input",
         ] {
             apply(&mut cfg, key, Some("on")).unwrap();
             assert_eq!(
@@ -3177,6 +3188,8 @@ mod tests {
         cfg.wayland_aware = Some(false);
         // FR-93 P2 — default ON too: the kill switch is what must reach it.
         cfg.wayland_auto = Some(false);
+        // FR-93 P4 — the same shape.
+        cfg.mutter_input = Some(false);
         let bridged = crate::config::env_bridge_bools(&cfg);
         for (name, want) in [
             ("DRM_CAPTURE", Some(true)),
@@ -3188,6 +3201,7 @@ mod tests {
             ("WINDOW_CAPTURE", Some(true)),
             ("WAYLAND_AWARE", Some(false)),
             ("WAYLAND_AUTO", Some(false)),
+            ("MUTTER_INPUT", Some(false)),
         ] {
             let got = bridged
                 .iter()

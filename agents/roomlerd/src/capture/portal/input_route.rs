@@ -52,10 +52,14 @@ use std::sync::Mutex;
 use std::sync::mpsc::{SyncSender, TrySendError};
 
 use crate::input::InputMsg;
+use crate::input::reach::RouteKind;
 
 struct Route {
     tx: SyncSender<InputMsg>,
     generation: u64,
+    /// FR-93 P4 — the portal's RemoteDesktop session, or mutter's own: the
+    /// same seam, and `input::reach` says which one owns injection.
+    kind: RouteKind,
 }
 
 /// The live portal input helpers, oldest first. Empty ⇒ no portal route ⇒ the
@@ -67,10 +71,14 @@ static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// [`unregister`]. Never replaces an existing route — a concurrent second
 /// capture is added AFTER the first, and the first stays the active target
 /// until it unregisters.
-pub fn register(tx: SyncSender<InputMsg>) -> u64 {
+pub fn register(tx: SyncSender<InputMsg>, kind: RouteKind) -> u64 {
     let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let mut routes = ROUTES.lock().unwrap_or_else(|e| e.into_inner());
-    routes.push(Route { tx, generation });
+    routes.push(Route {
+        tx,
+        generation,
+        kind,
+    });
     generation
 }
 
@@ -82,11 +90,16 @@ pub fn unregister(generation: u64) {
     routes.retain(|r| r.generation != generation);
 }
 
-/// FR-93 — is a portal input route live right now? Asked once per session by
-/// `input::reach`: while one is, the portal session owns injection (see
-/// [`try_route`]), so the OS injector's reach no longer decides anything.
-pub fn is_active() -> bool {
-    !ROUTES.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+/// FR-93 — is an input route live right now, and whose? Asked once per session
+/// by `input::reach`: while one is, that RemoteDesktop session owns injection
+/// (see [`try_route`]), so the OS injector's reach no longer decides anything.
+/// The kind is the OLDEST route's, the one [`try_route`] targets.
+pub fn active() -> Option<RouteKind> {
+    ROUTES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .first()
+        .map(|r| r.kind)
 }
 
 /// Offer one event to the portal route.
@@ -140,17 +153,18 @@ mod tests {
     fn route_lifecycle_and_handoff() {
         // No route: the caller keeps the event.
         assert!(!try_route(&mv()));
+        assert_eq!(active(), None);
 
         // One viewer: events flow to it.
         let (tx_a, rx_a) = std::sync::mpsc::sync_channel(4);
-        let gen_a = register(tx_a);
+        let gen_a = register(tx_a, RouteKind::Portal);
         assert!(try_route(&mv()));
         assert!(matches!(rx_a.try_recv(), Ok(InputMsg::MouseMove { .. })));
 
         // A SECOND viewer joins. It must NOT steal the route: events keep
         // going to A (the oldest), and B receives nothing yet.
         let (tx_b, rx_b) = std::sync::mpsc::sync_channel(4);
-        let gen_b = register(tx_b);
+        let gen_b = register(tx_b, RouteKind::Mutter);
         assert!(try_route(&mv()));
         assert!(
             matches!(rx_a.try_recv(), Ok(InputMsg::MouseMove { .. })),
@@ -160,6 +174,8 @@ mod tests {
             rx_b.try_recv().is_err(),
             "a second concurrent viewer does not steal the route"
         );
+        // FR-93 P4 — the kind `input::reach` reports is the target's.
+        assert_eq!(active(), Some(RouteKind::Portal), "the oldest route's kind");
 
         // A (the owner) leaves. The route HANDS OFF to B automatically —
         // never a gap that would fall through to the do-nothing OS injector.
@@ -169,6 +185,7 @@ mod tests {
             matches!(rx_b.try_recv(), Ok(InputMsg::MouseMove { .. })),
             "teardown of the owner promotes the next-oldest, not None"
         );
+        assert_eq!(active(), Some(RouteKind::Mutter));
 
         // Full channel is still OWNED (dropped), never split to the OS backend.
         for _ in 0..8 {
@@ -186,5 +203,6 @@ mod tests {
         // Last viewer leaves: no route, caller falls back to the OS injector.
         unregister(gen_b);
         assert!(!try_route(&mv()));
+        assert_eq!(active(), None);
     }
 }

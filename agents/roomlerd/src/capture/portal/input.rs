@@ -198,16 +198,84 @@ pub fn plan(msg: &InputMsg, logical: (f64, f64), wheel: &mut WheelAccum) -> Vec<
     }
 }
 
+/// FR-93 P4 — `NotifyPointerAxis` flags on mutter's RemoteDesktop session:
+/// `1` finish, `2` wheel, `4` finger, `8` continuous. With no source flag
+/// mutter assumes a FINGER (a touchpad gesture, which a `FINISH` ends and
+/// kinetic scrolling follows); a viewer's wheel delta is a wheel.
+const MUTTER_AXIS_SOURCE_WHEEL: u32 = 1 << 1;
+
+/// FR-93 P4 — one call on mutter's own RemoteDesktop session, as data: the same
+/// events as [`PortalCall`] in mutter's shapes. The call is made ON the session
+/// object, so there is no session handle and no options; absolute motion names
+/// the screencast stream (by object path), and states are booleans.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MutterCall {
+    /// `NotifyPointerMotionAbsolute(stream, x, y)`: the stream's own
+    /// coordinates, which mutter maps onto the monitor it records.
+    MotionAbs { x: f64, y: f64 },
+    /// `NotifyPointerButton(i, b)`: a Linux `BTN_*`.
+    Button { code: i32, down: bool },
+    /// `NotifyPointerAxis(d, d, u)`.
+    Axis { dx: f64, dy: f64, flags: u32 },
+    /// `NotifyPointerAxisDiscrete(u, i)`: `axis` 0 = vertical, 1 = horizontal;
+    /// positive steps are down/right, as on the portal.
+    AxisDiscrete { axis: u32, steps: i32 },
+    /// `NotifyKeyboardKeycode(u, b)`: an evdev code, as on the portal.
+    Keycode { code: u32, down: bool },
+    /// `NotifyKeyboardKeysym(u, b)`.
+    Keysym { sym: u32, down: bool },
+}
+
+/// [`PortalCall`] → [`MutterCall`]. `None` only for a keycode that cannot be
+/// one (negative), which no HID usage maps to.
+pub fn mutter_call(call: PortalCall) -> Option<MutterCall> {
+    Some(match call {
+        PortalCall::MotionAbs { x, y } => MutterCall::MotionAbs { x, y },
+        PortalCall::Button { code, down } => MutterCall::Button { code, down },
+        PortalCall::Axis { dx, dy } => MutterCall::Axis {
+            dx,
+            dy,
+            flags: MUTTER_AXIS_SOURCE_WHEEL,
+        },
+        PortalCall::AxisDiscrete { axis, steps } => MutterCall::AxisDiscrete { axis, steps },
+        PortalCall::Keycode { code, down } => MutterCall::Keycode {
+            code: u32::try_from(code).ok()?,
+            down,
+        },
+        // `keysym_of` built it from a u32; the cast is the way back.
+        PortalCall::Keysym { sym, down } => MutterCall::Keysym {
+            sym: sym as u32,
+            down,
+        },
+    })
+}
+
 // ── the D-Bus half ──────────────────────────────────────────────────────
+
+/// Which RemoteDesktop session the calls go to.
+enum Target {
+    /// xdg-desktop-portal's (FR-45 P4): every call names the session handle
+    /// and the PipeWire node.
+    Portal {
+        session: zbus::zvariant::OwnedObjectPath,
+        /// The PipeWire node whose logical space `MotionAbs` coordinates are in.
+        node_id: u32,
+    },
+    /// mutter's own (FR-93 P4): the proxy IS the session.
+    Mutter {
+        /// The screencast stream's object path, which absolute motion names.
+        stream: String,
+    },
+}
 
 /// Everything needed to execute [`PortalCall`]s against a live RemoteDesktop
 /// session. Built in `run_stream` once the stream is negotiated, handed to
 /// the stdin pump thread.
 pub struct InputContext {
     proxy: zbus::blocking::Proxy<'static>,
-    session: zbus::zvariant::OwnedObjectPath,
-    /// The PipeWire node whose logical space `MotionAbs` coordinates are in.
-    node_id: u32,
+    target: Target,
+    /// The space `MotionAbs` coordinates are in: the portal stream's logical
+    /// size, or a mutter stream's own size.
     pub logical: (f64, f64),
 }
 
@@ -226,9 +294,35 @@ impl InputContext {
         )?;
         Ok(Self {
             proxy,
-            session,
-            node_id,
+            target: Target::Portal { session, node_id },
             logical,
+        })
+    }
+
+    /// FR-93 P4 — input on mutter's RemoteDesktop session.
+    ///
+    /// ⚠️ `conn` must be the connection that CREATED the session
+    /// ([`super::mutter::MutterSession::connection`]): mutter takes `Notify*`
+    /// calls only from that peer. `space` is the stream's own size, the
+    /// coordinates `NotifyPointerMotionAbsolute` takes (mutter divides by the
+    /// monitor's scale itself).
+    pub fn new_mutter(
+        conn: &zbus::blocking::Connection,
+        input: &super::mutter::MutterInput,
+        space: (f64, f64),
+    ) -> Result<Self, zbus::Error> {
+        let proxy = zbus::blocking::Proxy::new(
+            conn,
+            super::mutter::RD_BUS,
+            input.session.clone(),
+            super::mutter::RD_SESSION_IFACE,
+        )?;
+        Ok(Self {
+            proxy,
+            target: Target::Mutter {
+                stream: input.stream.as_str().to_string(),
+            },
+            logical: space,
         })
     }
 
@@ -244,13 +338,15 @@ impl InputContext {
     /// while still surfacing a send error (a dead session) to the pump.
     fn execute(&self, call: PortalCall) -> Result<(), zbus::Error> {
         use std::collections::HashMap;
+        let (sess, node_id) = match &self.target {
+            Target::Portal { session, node_id } => (session, *node_id),
+            Target::Mutter { stream } => return self.execute_mutter(call, stream),
+        };
         let opts: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
-        let sess = &self.session;
         match call {
-            PortalCall::MotionAbs { x, y } => self.proxy.call_noreply(
-                "NotifyPointerMotionAbsolute",
-                &(sess, opts, self.node_id, x, y),
-            ),
+            PortalCall::MotionAbs { x, y } => self
+                .proxy
+                .call_noreply("NotifyPointerMotionAbsolute", &(sess, opts, node_id, x, y)),
             PortalCall::Button { code, down } => self
                 .proxy
                 .call_noreply("NotifyPointerButton", &(sess, opts, code, u32::from(down))),
@@ -267,6 +363,34 @@ impl InputContext {
             PortalCall::Keysym { sym, down } => self
                 .proxy
                 .call_noreply("NotifyKeyboardKeysym", &(sess, opts, sym, u32::from(down))),
+        }
+    }
+
+    /// FR-93 P4 — [`Self::execute`] on mutter's own session. `call_noreply`
+    /// for the same reason as the portal's.
+    fn execute_mutter(&self, call: PortalCall, stream: &str) -> Result<(), zbus::Error> {
+        let Some(call) = mutter_call(call) else {
+            return Ok(());
+        };
+        match call {
+            MutterCall::MotionAbs { x, y } => self
+                .proxy
+                .call_noreply("NotifyPointerMotionAbsolute", &(stream, x, y)),
+            MutterCall::Button { code, down } => self
+                .proxy
+                .call_noreply("NotifyPointerButton", &(code, down)),
+            MutterCall::Axis { dx, dy, flags } => self
+                .proxy
+                .call_noreply("NotifyPointerAxis", &(dx, dy, flags)),
+            MutterCall::AxisDiscrete { axis, steps } => self
+                .proxy
+                .call_noreply("NotifyPointerAxisDiscrete", &(axis, steps)),
+            MutterCall::Keycode { code, down } => self
+                .proxy
+                .call_noreply("NotifyKeyboardKeycode", &(code, down)),
+            MutterCall::Keysym { sym, down } => self
+                .proxy
+                .call_noreply("NotifyKeyboardKeysym", &(sym, down)),
         }
     }
 }
@@ -510,6 +634,82 @@ mod tests {
             keysym_of('\u{A0}'),
             Some(0xA0),
             "NBSP resumes printable Latin-1"
+        );
+    }
+
+    /// FR-93 P4 — mutter's shapes for the same events: no session handle or
+    /// node id (the call is on the session, motion names the stream), boolean
+    /// states, evdev keycodes as `u`, and the keysym's bits unchanged.
+    #[test]
+    fn mutter_calls_carry_mutters_shapes() {
+        assert_eq!(
+            mutter_call(PortalCall::MotionAbs { x: 960.0, y: 270.0 }),
+            Some(MutterCall::MotionAbs { x: 960.0, y: 270.0 })
+        );
+        assert_eq!(
+            mutter_call(PortalCall::Button {
+                code: 0x110,
+                down: true
+            }),
+            Some(MutterCall::Button {
+                code: 0x110,
+                down: true
+            })
+        );
+        assert_eq!(
+            mutter_call(PortalCall::Keycode {
+                code: 30,
+                down: false
+            }),
+            Some(MutterCall::Keycode {
+                code: 30,
+                down: false
+            })
+        );
+        assert_eq!(
+            mutter_call(PortalCall::Keycode {
+                code: -1,
+                down: true
+            }),
+            None,
+            "no keycode is negative; one that would be is dropped, never wrapped"
+        );
+        let euro = keysym_of('€').unwrap() as i32;
+        assert_eq!(
+            mutter_call(PortalCall::Keysym {
+                sym: euro,
+                down: true
+            }),
+            Some(MutterCall::Keysym {
+                sym: 0x0100_20AC,
+                down: true
+            })
+        );
+        assert_eq!(
+            mutter_call(PortalCall::AxisDiscrete { axis: 0, steps: -2 }),
+            Some(MutterCall::AxisDiscrete { axis: 0, steps: -2 }),
+            "negative steps are up, as on the portal"
+        );
+    }
+
+    /// FR-93 P4 — a viewer's smooth wheel reaches mutter as a WHEEL, unscaled
+    /// and with its sign. With no source flag mutter takes it for a touchpad
+    /// finger, which waits for a finish and scrolls on kinetically after it.
+    #[test]
+    fn mutter_smooth_scroll_is_a_wheel() {
+        let calls = plan1(InputMsg::MouseWheel {
+            dx: 0.0,
+            dy: -53.0,
+            mode: WheelMode::Pixel,
+        });
+        let mutter: Vec<_> = calls.into_iter().filter_map(mutter_call).collect();
+        assert_eq!(
+            mutter,
+            vec![MutterCall::Axis {
+                dx: 0.0,
+                dy: -53.0,
+                flags: 2
+            }]
         );
     }
 

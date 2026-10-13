@@ -220,6 +220,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         window_capture: None,
         wayland_aware: None,
         wayland_auto: None,
+        mutter_input: None,
         x11_damage: None,
         overlay_key_rotation: None,
         idle_refine_max_edge: None,
