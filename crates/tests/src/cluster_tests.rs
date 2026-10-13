@@ -874,6 +874,7 @@ async fn derp_split_rehomes_toward_newest_registration() {
                 supports_overlay_echo: false,
                 supports_org_relay: false,
                 advertised_routes: vec![],
+                route_offer_withheld: None,
             })
             .await
             .unwrap();
@@ -1081,6 +1082,7 @@ async fn shutdown_releases_tunnel_and_derp_records() {
             supports_overlay_echo: false,
             supports_org_relay: false,
             advertised_routes: vec![],
+            route_offer_withheld: None,
         })
         .await
         .unwrap();

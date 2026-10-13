@@ -4289,6 +4289,14 @@ pub struct OverlayNode {
     /// `approved_routes`; toggling off removes it.
     #[serde(default)]
     pub is_exit_node: bool,
+    /// FR-97 P0b — why the device advertises no `/0` and no subnet route
+    /// although it was configured to: it found it cannot forward or NAT for the
+    /// overlay (a Mac; Windows Home, #2077). Sent on every join and refreshed
+    /// there, so it clears the moment the device can serve again. Shown beside
+    /// the route approval, where its absence used to make the node vanish from
+    /// the table with no word of why. `None` on an older device or row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_offer_withheld: Option<String>,
     pub status: AgentStatus,
     pub last_seen_at: DateTime,
     pub created_at: DateTime,

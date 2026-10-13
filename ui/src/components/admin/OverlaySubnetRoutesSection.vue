@@ -82,6 +82,14 @@
                 >
                   {{ n.online ? 'online' : 'offline' }}
                 </v-chip>
+                <v-chip
+                  v-if="n.os"
+                  size="x-small"
+                  variant="outlined"
+                  class="ml-1"
+                >
+                  {{ osLabel(n.os) }}
+                </v-chip>
               </div>
               <div class="text-caption text-medium-emphasis">{{ n.kind }}</div>
             </td>
@@ -111,7 +119,7 @@
             <td>
               <v-switch
                 :model-value="n.is_exit_node"
-                :disabled="!n.can_be_exit_node || exitSaving === n.id"
+                :disabled="(!n.can_be_exit_node && !n.is_exit_node) || exitSaving === n.id"
                 :loading="exitSaving === n.id"
                 color="warning"
                 density="compact"
@@ -120,7 +128,19 @@
                 @update:model-value="(v) => toggleExitNode(n, v)"
               />
               <div
-                v-if="!n.can_be_exit_node"
+                v-if="n.route_offer_withheld"
+                class="text-caption text-warning"
+              >
+                this device cannot serve routes: {{ n.route_offer_withheld }}
+              </div>
+              <div
+                v-else-if="n.is_exit_node && !n.can_be_exit_node"
+                class="text-caption text-medium-emphasis"
+              >
+                approved, but the device no longer offers it, so no client uses it
+              </div>
+              <div
+                v-else-if="!n.can_be_exit_node"
                 class="text-caption text-medium-emphasis"
               >
                 set overlay_exit_node_enabled in its config
@@ -177,14 +197,25 @@ function clearNodeFilter() {
 
 // Show nodes advertising subnet routes OR eligible to be an exit node (a pure
 // exit node advertises only 0.0.0.0/0, which the server filters out of
-// advertised_routes — so key off can_be_exit_node too).
+// advertised_routes — so key off can_be_exit_node too). FR-97 P0b — and a
+// node that withheld its offer (it advertises nothing, so it would otherwise
+// vanish with no word of why), and an approved exit whose device stopped
+// offering, so the approval can still be seen and switched off.
 const advertisingNodes = computed(() =>
   store.nodes.filter(
     (n) =>
-      (n.advertised_routes.length > 0 || n.can_be_exit_node) &&
+      (n.advertised_routes.length > 0 ||
+        n.can_be_exit_node ||
+        n.is_exit_node ||
+        !!n.route_offer_withheld) &&
       (!nodeFilter.value || n.id === nodeFilter.value),
   ),
 )
+
+// FR-97 P0b — the backing agent's OS, as the admin reads it.
+function osLabel(os: 'linux' | 'macos' | 'windows'): string {
+  return os === 'macos' ? 'macOS' : os === 'windows' ? 'Windows' : 'Linux'
+}
 
 function seedDraft() {
   for (const n of store.nodes) {

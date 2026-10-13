@@ -9,7 +9,7 @@
 //! instead of waiting for the next join.
 
 use roomler_ai_services::quota;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json,
@@ -17,7 +17,9 @@ use axum::{
 };
 use bson::{doc, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
-use roomler_ai_remote_control::models::{AgentStatus, DEFAULT_ROUTE_V4, NodeRef, OverlayNode};
+use roomler_ai_remote_control::models::{
+    AgentStatus, DEFAULT_ROUTE_V4, NodeRef, OsKind, OverlayNode,
+};
 use serde::{Deserialize, Serialize};
 
 use roomler_core::guards::require_permission;
@@ -56,10 +58,24 @@ pub struct OverlayNodeResponse {
     pub agent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tunnel_client_id: Option<String>,
+    /// FR-97 P0b — the backing agent's OS (`linux` | `macos` | `windows`), so
+    /// an admin approving an exit or a subnet router sees what the device is.
+    /// Display only: what a device can serve is what IT says
+    /// (`route_offer_withheld`), never inferred from its OS. `None` for a
+    /// tunnel client, or when the agent row could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os: Option<OsKind>,
+    /// FR-97 P0b — the device's own reason for offering no `/0` and no subnet
+    /// route although it was configured to (it cannot forward or NAT for the
+    /// overlay). Such a node advertises nothing, so without this it would not
+    /// appear among the routes at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_offer_withheld: Option<String>,
 }
 
 impl OverlayNodeResponse {
-    fn from_node(n: OverlayNode, will_rejoin: bool) -> Self {
+    fn from_node(n: OverlayNode, will_rejoin: bool, os: Option<OsKind>) -> Self {
+        let route_offer_withheld = n.route_offer_withheld.clone();
         let can_be_exit_node = n.advertised_routes.iter().any(|r| r == DEFAULT_ROUTE_V4);
         let (agent_id, tunnel_client_id) = match &n.node_ref {
             NodeRef::Agent { agent_id } => (Some(agent_id.to_hex()), None),
@@ -92,6 +108,8 @@ impl OverlayNodeResponse {
             is_exit_node: n.is_exit_node,
             can_be_exit_node,
             last_seen_at: n.last_seen_at.try_to_rfc3339_string().unwrap_or_default(),
+            os,
+            route_offer_withheld,
         }
     }
 }
@@ -102,10 +120,30 @@ impl From<OverlayNode> for OverlayNodeResponse {
     /// cascades from the device to its node, so a live node cannot outlive its
     /// backing agent / tunnel-client. Only the LIST endpoint resolves this for
     /// real, because pre-cascade fleets can still hold nodes whose device was
-    /// deleted before the release feature existed.
+    /// deleted before the release feature existed. No `os`: the handlers that
+    /// answer with ONE node use [`single_node_response`], which reads it.
     fn from(n: OverlayNode) -> Self {
-        Self::from_node(n, true)
+        Self::from_node(n, true, None)
     }
+}
+
+/// FR-97 P0b — a single-node response WITH its backing agent's OS. The admin
+/// UI replaces the row it acted on with this response, so a response without
+/// the OS would drop the row's OS chip on every toggle. Tenant-scoped read.
+async fn single_node_response(state: &NetworkState, n: OverlayNode) -> OverlayNodeResponse {
+    let os = match n.node_ref {
+        NodeRef::Agent { agent_id } => state
+            .fleet
+            .agents
+            .base
+            .find_one(doc! { "_id": agent_id, "tenant_id": n.tenant_id })
+            .await
+            .ok()
+            .flatten()
+            .map(|a| a.os),
+        NodeRef::TunnelClient { .. } => None,
+    };
+    OverlayNodeResponse::from_node(n, true, os)
 }
 
 /// Resolve `will_rejoin` for a batch of nodes in two queries: a node rejoins iff
@@ -114,7 +152,7 @@ async fn resolve_will_rejoin(
     state: &NetworkState,
     tenant_id: ObjectId,
     nodes: &[OverlayNode],
-) -> HashSet<ObjectId> {
+) -> (HashSet<ObjectId>, HashMap<ObjectId, OsKind>) {
     let mut agent_ids = Vec::new();
     let mut client_ids = Vec::new();
     for n in nodes {
@@ -124,6 +162,8 @@ async fn resolve_will_rejoin(
         }
     }
     let mut live = HashSet::new();
+    // FR-97 P0b — each live agent's OS, from the same query.
+    let mut os = HashMap::new();
     if !agent_ids.is_empty()
         && let Ok(rows) = state
             .fleet
@@ -135,7 +175,12 @@ async fn resolve_will_rejoin(
             )
             .await
     {
-        live.extend(rows.into_iter().filter_map(|a| a.id));
+        for a in rows {
+            if let Some(id) = a.id {
+                live.insert(id);
+                os.insert(id, a.os);
+            }
+        }
     }
     if !client_ids.is_empty()
         && let Ok(rows) = state
@@ -149,7 +194,7 @@ async fn resolve_will_rejoin(
     {
         live.extend(rows.into_iter().filter_map(|c| c.id));
     }
-    live
+    (live, os)
 }
 
 /// The id of whatever device backs this node — the key `resolve_will_rejoin`
@@ -186,12 +231,16 @@ pub async fn list_overlay_nodes(
         .overlay_nodes
         .list_active_in_network(tid, network_id)
         .await?;
-    let live_devices = resolve_will_rejoin(&state, tid, &nodes).await;
+    let (live_devices, os_by_agent) = resolve_will_rejoin(&state, tid, &nodes).await;
     let items: Vec<OverlayNodeResponse> = nodes
         .into_iter()
         .map(|n| {
             let will_rejoin = live_devices.contains(&backing_device_id(&n));
-            OverlayNodeResponse::from_node(n, will_rejoin)
+            let os = match n.node_ref {
+                NodeRef::Agent { agent_id } => os_by_agent.get(&agent_id).copied(),
+                NodeRef::TunnelClient { .. } => None,
+            };
+            OverlayNodeResponse::from_node(n, will_rejoin, os)
         })
         .collect();
     Ok(Json(serde_json::json!({ "items": items })))
@@ -299,7 +348,7 @@ pub async fn set_approved_routes(
         .await?;
     // Push the change to peers now, not on their next join.
     crate::overlay::refan_node(&state, &updated).await;
-    Ok(Json(updated.into()))
+    Ok(Json(single_node_response(&state, updated).await))
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,7 +422,7 @@ pub async fn set_exit_node(
 
     let updated = state.overlay_nodes.set_exit_node(nid, body.enabled).await?;
     crate::overlay::refan_node(&state, &updated).await;
-    Ok(Json(updated.into()))
+    Ok(Json(single_node_response(&state, updated).await))
 }
 
 #[derive(Debug, Serialize)]
