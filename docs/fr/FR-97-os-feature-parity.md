@@ -75,8 +75,9 @@ prevent, and the guard re-asserts it on every tick.
   `DesiredConfig` (`crates/remote_control/src/models.rs:1756-1785`), so no server push can set it; a local
   `sudo roomler config set` can, and so can an `exec` on the daemon's row. Once it lands, the control WS that the
   `exec` came in on is captured too, so the same channel cannot undo it.
-- `NetstackTun` inherits the same default, so `roomler status` reports `active` on a netstack node where nothing
-  is installed.
+- `NetstackTun` inherits the same default. It installs no OS routes, so it cannot wedge, but `roomler status`
+  reports the exit `active` although its userspace stack has no route off the overlay prefixes
+  (`netstack.rs:1176-1186`), so nothing reaches the exit (P0c).
 - This is a reading of the code path, not yet reproduced on a Mac. P0a reproduces it, red, on a throwaway VM first.
 
 **S2 — exit and subnet serving is offered where nothing NATs, and an approval outlives the offer.** ✔
@@ -240,12 +241,14 @@ They hide it only where the feature means nothing on that OS (Ctrl+Alt+Del on a 
 without its root daemon is macOS, and a later release closes the gap without a UI release. The device says what it
 can do.
 
-### 3.2 P0a — fail toward withhold
+### 3.2 P0a — fail toward withhold (#2081)
 
-`TunIo::add_host_exemption` defaults to `Err("no host-exemption surface on this platform")`. Every implementor
-without an OS route surface (macOS until P1a, `NetstackTun`, mocks) then withholds with a reason; the gate at
-`route_guard.rs:545-556` already does the rest. The in-memory test mock overrides it explicitly. The test that fails
-on master: a TUN with the default exemptions never reaches `split_default_installed = true`.
+`SystemTun` refuses an exemption wherever it has no arm: a `cfg(not(any(linux, windows)))` `add_host_exemption`
+returns `ErrorKind::Unsupported`, so on macOS the gate at `route_guard.rs:545-556` withholds and `roomler status`
+says why. The trait default stays `Ok(())`, now documented as safe only for a device that installs no OS routes
+(the in-memory mocks, netstack); changing it would move every mock and netstack for no safety gain. Netstack's untrue
+`active` belongs to P0c. The test that fails on master is
+`macos_kernel_tests::an_exemption_it_cannot_pin_is_refused_not_reported_pinned`, run on a real utun by CI's macOS job.
 
 ### 3.3 P0b — offer only what you serve, fan only what is offered
 
@@ -451,9 +454,9 @@ model on Windows, so the three agree on what the mode means.
 
 | Phase | What | Kill switch | Proven on | Size |
 |---|---|---|---|---|
-| **P0a** | Exemptions fail toward withhold (S1, #2081) | — (a safety fix) | unit test; a throwaway macOS VM, red on 0.4.131, then green | S |
+| **P0a** | `SystemTun` refuses an exemption it has no arm for, so a Mac withholds (S1, #2081) | — (a safety fix) | the macOS kernel test in CI, red on master; a throwaway macOS VM, red on 0.4.131, then green | S |
 | **P0b** | The NAT probe gates the offer; the server fans approved ∩ advertised; the Windows revert restores forwarding; an OS chip and the reason in the admin UI (S2, #2077) | device `ROOMLERD_ROUTE_OFFER_UNPROBED=1`; a server flag for the plain fan | Win11 Home and Pro, Linux, macOS cells | S–M |
-| **P0c** | Honest caps: `opus` only with a capture backend; the image-event cap only where watched; no clipboard cap on a root Linux daemon without a display; Ctrl+Alt+Del only where the host can send it; the wizard offered only where it installs the agent | — | a test per word, failing on master | S |
+| **P0c** | Honest caps: `opus` only with a capture backend; the image-event cap only where watched; no clipboard cap on a root Linux daemon without a display; Ctrl+Alt+Del only where the host can send it; the wizard offered only where it installs the agent; a netstack node's exit status never `active` | — | a test per word, failing on master | S |
 | **P0d** | Measure: the native architecture in the hello; a server count of capability words by OS and architecture | — | the server | S |
 | **P1a** | macOS exit client | `overlay_exit_node` unset; `ROOMLERD_EXIT_CLIENT_MACOS=0` | vmtest: a macOS client of a Linux exit | M |
 | **P1b** | macOS exit + subnet serving through pf (D1) | `ROOMLERD_PF_NAT=0` | vmtest: a macOS exit for Linux and Windows clients | M–L |
