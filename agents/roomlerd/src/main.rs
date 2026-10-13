@@ -1206,6 +1206,14 @@ async fn daemon_main() -> Result<()> {
         std::process::exit(roomlerd::hive::pack_main());
     }
 
+    // FR-90 P2f-4a — `roomlerd hive-import`: an ended terminal session's own
+    // history, put in place as the managed session it is made AS THE
+    // TERMINAL'S ACCOUNT. The request on stdin, one line to stdout.
+    #[cfg(hive_host)]
+    if roomlerd::hive::import_args() {
+        std::process::exit(roomlerd::hive::import_main());
+    }
+
     // FR-90 P1i — `roomlerd hive-prep …`: a Windows session's preparation,
     // which the daemon runs AS THE CONSOLE USER before the harness starts, as
     // the Unix wrapper runs as the account. None of the setup below is its.

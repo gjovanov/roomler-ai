@@ -84,6 +84,7 @@ mod child;
 pub mod framing;
 pub mod gates;
 mod hosted;
+mod importer;
 mod lines;
 mod materializer;
 mod packer;
@@ -98,6 +99,7 @@ pub mod view;
 mod workspace;
 
 pub use checkpointer::{CHECKPOINT_SUBCOMMAND, checkpoint_args, checkpoint_main};
+pub use importer::{IMPORT_SUBCOMMAND, import_args, import_main};
 pub use materializer::{MATERIALIZE_SUBCOMMAND, materialize_args, materialize_main};
 pub use packer::{PACK_SUBCOMMAND, pack_args, pack_main};
 pub use resume_note::{
