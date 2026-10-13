@@ -109,6 +109,10 @@ pub struct HiveState {
     pub prepare_acks: Arc<promote::PrepareAcks>,
     /// P2e-3 — how long each step of a promotion may take.
     pub promote_bounds: promote::Bounds,
+    /// P2f-2b — a teleport's prepare tells its target it may take the
+    /// workspace against what its clone holds (`hive.teleport_have_want`,
+    /// default off).
+    pub teleport_have_want: bool,
 }
 
 impl std::ops::Deref for HiveState {
@@ -154,6 +158,7 @@ impl Module for HiveState {
             replicaset: settings.hive.replicaset,
             prepare_acks: Arc::new(promote::PrepareAcks::new()),
             promote_bounds: promote::Bounds::of(&settings.hive),
+            teleport_have_want: settings.hive.teleport_have_want,
             chat: BoundChat::new(&core),
             fleet,
             core,
