@@ -878,7 +878,7 @@ async fn handle_overlay_relay_request(
     if !matches!(acl.mode, OverlayAclMode::Off) {
         let src = overlay_source_of(state, &self_node).await;
         // FR-97 P0b — the same offered set the netmap fans.
-        let routes = peer.approved_routes.clone();
+        let routes = peer.effective_routes();
         let access = evaluate_overlay(
             &acl.policies,
             &src,
@@ -2439,7 +2439,7 @@ fn shape_peer(
     // FR-97 P0b — the ACL grants from what the peer OFFERS, the same set
     // `to_netmap_peer` fans; a route visible only through an approval the
     // device withdrew must not make the peer visible either.
-    let routes = peer.approved_routes.clone();
+    let routes = peer.effective_routes();
     let access = evaluate_overlay(
         &acl.policies,
         src,
@@ -2554,7 +2554,7 @@ fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
         // tenant's overlay ACL is enforcing, only the subset THIS recipient
         // may install (see `shape_peer`). `to_netmap_peer` keeps the permissive
         // default so every legacy call site is unchanged.
-        routes: node.approved_routes.clone(),
+        routes: node.effective_routes(),
         // P3b-3 — expose the backing agent id (bridging overlay-node-id →
         // agents._id) so a controlling node can join this peer to a
         // daemon-originated tunnel flow and label it `ConnectionType::Tunnel`.
