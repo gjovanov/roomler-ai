@@ -434,6 +434,67 @@ XTest reaches Xwayland clients only, so DRM capture without uinput is a
 read-only session. The rest — the device-node scan, the 10-bit repack, the
 field numbers — is in the [FR-36 spec](fr/FR-36-wayland-capture.md).
 
+### 3.1 The cursor plane (FR-93 P3c)
+
+A compositor keeps the pointer on the CRTC's **cursor plane** wherever the
+hardware has one. mutter and KWin both do, in a virtio-gpu VM and on real GPUs.
+So the pointer is absent from every frame this arm reads off the primary plane,
+and before P3c the viewer showed the controller's initials badge in its place.
+From P3c the DRM worker also reads the cursor plane on every frame it grabs, and
+the cursor data channel carries it (`cursor:shape`, `cursor:pos`,
+`cursor:hide`), the wire Windows has always used:
+
+```mermaid
+sequenceDiagram
+    participant K as the kernel<br/>(the CRTC's cursor plane)
+    participant W as the DRM worker<br/>(drm_backend.rs)
+    participant S as drm_cursor::publish / latest
+    participant T as CursorTracker::poll<br/>(the cursor channel, 120 Hz)
+    participant V as the viewer
+    Note over W: at open: UNIVERSAL_PLANES, then ATOMIC,<br/>then CURSOR_PLANE_HOTSPOT; each plane's type
+    loop every frame a session pulls
+        W->>K: the primary plane, by its type: the frame
+        W->>K: the cursor plane on that CRTC: CRTC_X/Y, HOTSPOT_X/Y
+        W->>K: its ARGB buffer, on a new framebuffer or every 250 ms
+        W->>S: straight alpha, cropped, an id from pixels + hotspot
+    end
+    T->>S: the latest, while under 2 s old
+    T->>V: cursor:shape once per id, cursor:pos each tick
+```
+
+| | what | why |
+|---|---|---|
+| the caps | `DRM_CLIENT_CAP_ATOMIC`, then `CURSOR_PLANE_HOTSPOT` | `CRTC_X/Y` are atomic-only properties. On a paravirtual GPU (virtio-gpu, qxl, vmwgfx) the kernel then hides the cursor plane from an atomic client that does not also set the hotspot cap. Neither refusal is fatal: capture goes on, and the viewer keeps its badge |
+| the position | `CRTC_X/Y`, plus `HOTSPOT_X/Y` where the driver has them | real GPUs have no hotspot property, because their compositor already placed the buffer so the hotspot lands on the pointer. There the visible image's top-left stands in for it. Either way the viewer draws the crop's top-left exactly where the plane shows it |
+| the image | ARGB8888, premultiplied, straightened to the wire's straight alpha; cropped to the visible pixels | hardware cursor buffers are 64×64 or 256×256 whatever the image, so the crop keeps a `cursor:shape` small |
+| the id | a hash of the cropped pixels and the hotspot | the viewer caches a shape per id for the session and never replaces one, so the id must change whenever either does |
+| the primary plane | chosen by its `type` (P3b's half) | the first bound plane used to stand in, on the assumption that cursor and overlay planes are unbound. The cursor plane is bound wherever the pointer shows |
+| only this arm | mutter's and the portal's streams embed the pointer, and publish nothing here | a cursor from the channel there would draw a second pointer over the streamed one |
+
+⚠️ **The hardware cursor is the compositor's.** Where a compositor draws the
+pointer into the primary plane itself (a software cursor, or a GPU without a
+cursor plane), the cursor plane stays unbound and the pointer is already in the
+frame. The tracker then reports it hidden, and the viewer shows its badge, as
+before.
+
+**Kill switch**: `ROOMLERD_DRM_CURSOR=0` reads no cursor plane and sets none of
+the caps it needs.
+
+**Measured** on the lab's GNOME 50 system guest (Ubuntu 26.04, virtio-gpu,
+`drm_capture` + `uinput`), 2026-10-13, by the AC5 `cursor` plan of the viewer
+oracle. The person at the screen moves the pointer over QMP, outside every
+roomler input path, and the oracle reads where the viewer draws it:
+
+| | 0.4.132, the release | P3c (`1de8d54da`) | P3c, `ROOMLERD_DRM_CURSOR=0` |
+|---|---|---|---|
+| the pointer in the stream | no: it is on the cursor plane | no | no |
+| the viewer's overlay at the pointer (targets (0.30, 0.60) and (0.70, 0.60)) | none at either: **FAIL** | **(0.295, 0.592) and (0.695, 0.592): PASS** | none at either: **FAIL** |
+| the worker's log | — | `the cursor plane is read for the viewer planes=2 cursor_planes=1 atomic=true hotspot=true` | `the cursor plane is not read (ROOMLERD_DRM_CURSOR=0 …)` |
+
+The overlay sits a few pixels up and left of each target because the oracle
+reports the cursor canvas's top-left, and the arrow's hotspot is that far into
+the cropped image.
+
 ## 4. The portal arm (FR-45 P1–P4)
 
 ### 4.1 Why a helper process, and why it dlopens
