@@ -259,6 +259,38 @@ pub struct AgentPeer {
     rc_overlay: crate::rc_overlay::RcOverlay,
 }
 
+/// FR-16 L0 — the in-process latency harness's one seam into a session.
+///
+/// `AgentPeer::new` builds its own `SettingEngine`, so a test cannot hand it a
+/// virtual network. This hook runs on every new session's engine just before
+/// the API is built: `agents/roomlerd/tests/l4_latency.rs` uses it to put the
+/// agent on a webrtc-util `vnet` beside its controller, with a set delay,
+/// jitter and loss. Compiled only into the test-only `synthetic-frame-source`
+/// build; a production agent has no way to reach it.
+#[cfg(feature = "synthetic-frame-source")]
+pub mod l0 {
+    use std::sync::{Arc, Mutex};
+
+    use webrtc::api::setting_engine::SettingEngine;
+
+    pub type SettingEngineHook = Arc<dyn Fn(&mut SettingEngine) + Send + Sync>;
+
+    static HOOK: Mutex<Option<SettingEngineHook>> = Mutex::new(None);
+
+    /// Install the hook every new session runs on its `SettingEngine`, or
+    /// clear it with `None`.
+    pub fn set_setting_engine_hook(hook: Option<SettingEngineHook>) {
+        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+    }
+
+    pub(crate) fn apply(setting: &mut SettingEngine) {
+        let hook = HOOK.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(hook) = hook {
+            hook(setting);
+        }
+    }
+}
+
 /// One `rc:session.stats` sample: what this session actually did.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionTelemetry {
@@ -378,6 +410,11 @@ impl AgentPeer {
             let keep = rc_overlay.clone();
             setting.set_ip_filter(Box::new(move |ip| keep.keeps_local(ip)));
         }
+        // FR-16 L0 — the loopback harness routes this session's ICE through a
+        // webrtc-util vnet (a set delay, jitter and loss). Only the test-only
+        // `synthetic-frame-source` build carries the hook.
+        #[cfg(feature = "synthetic-frame-source")]
+        l0::apply(&mut setting);
         info!(
             session = %session_id,
             overlay_blocks = rc_overlay.v4_nets.len(),

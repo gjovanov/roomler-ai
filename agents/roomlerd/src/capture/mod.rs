@@ -1516,8 +1516,8 @@ fn open_with(
         if synthetic_env_enabled() {
             let cap = synthetic_backend::primary(_target_fps, _downscale);
             tracing::info!(
-                width = synthetic_backend::FRAME_W,
-                height = synthetic_backend::FRAME_H,
+                width = cap.width(),
+                height = cap.height(),
                 "capture: backend=synthetic (ROOMLERD_SYNTHETIC_FRAMES=1, CI / agent-e2e Pod)"
             );
             return Box::new(cap);
