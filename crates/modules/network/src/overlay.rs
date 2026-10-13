@@ -877,13 +877,15 @@ async fn handle_overlay_relay_request(
     let acl = load_acl(state, self_node.tenant_id).await;
     if !matches!(acl.mode, OverlayAclMode::Off) {
         let src = overlay_source_of(state, &self_node).await;
+        // FR-97 P0b — the same offered set the netmap fans.
+        let routes = peer.approved_routes.clone();
         let access = evaluate_overlay(
             &acl.policies,
             &src,
             OverlayPeerRef {
                 node_id: peer_node_id,
                 overlay_ip: &peer.overlay_ip,
-                approved_routes: &peer.approved_routes,
+                approved_routes: &routes,
             },
         );
         if !access.visible {
@@ -2434,22 +2436,26 @@ fn shape_peer(
     if matches!(acl.mode, OverlayAclMode::Off) {
         return Some(to_netmap_peer(peer, reachable));
     }
+    // FR-97 P0b — the ACL grants from what the peer OFFERS, the same set
+    // `to_netmap_peer` fans; a route visible only through an approval the
+    // device withdrew must not make the peer visible either.
+    let routes = peer.approved_routes.clone();
     let access = evaluate_overlay(
         &acl.policies,
         src,
         OverlayPeerRef {
             node_id: peer.id.unwrap_or_default(),
             overlay_ip: &peer.overlay_ip,
-            approved_routes: &peer.approved_routes,
+            approved_routes: &routes,
         },
     );
     if !acl.enforcing() {
         if !access.visible {
             debug!(source = %src.node_id, peer = %peer.name,
                 "overlay acl [warn]: would WITHHOLD peer");
-        } else if access.routes.len() != peer.approved_routes.len() {
+        } else if access.routes.len() != routes.len() {
             debug!(source = %src.node_id, peer = %peer.name,
-                granted = access.routes.len(), approved = peer.approved_routes.len(),
+                granted = access.routes.len(), approved = routes.len(),
                 "overlay acl [warn]: would narrow routes");
         }
         return Some(to_netmap_peer(peer, reachable));
@@ -2542,10 +2548,12 @@ fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
         // probers pick the engine echo over ICMP for capable peers.
         supports_overlay_echo: node.supports_overlay_echo,
         supports_org_relay: node.supports_org_relay,
-        // Only the admin-APPROVED routes reach peers — and, once the tenant's
-        // overlay ACL is enforcing, only the subset THIS recipient may install
-        // (see `shape_peer`). `to_netmap_peer` keeps the permissive default so
-        // every legacy call site is unchanged.
+        // Only routes the admin APPROVED and the device still ADVERTISES reach
+        // peers (FR-97 P0b, `OverlayNode::effective_routes`): an approval
+        // outlives a rejoin, so on its own it is not an offer. Once the
+        // tenant's overlay ACL is enforcing, only the subset THIS recipient
+        // may install (see `shape_peer`). `to_netmap_peer` keeps the permissive
+        // default so every legacy call site is unchanged.
         routes: node.approved_routes.clone(),
         // P3b-3 — expose the backing agent id (bridging overlay-node-id →
         // agents._id) so a controlling node can join this peer to a
@@ -2919,6 +2927,90 @@ mod tests {
         assert_eq!(peer.overlay_ip, "100.64.0.7");
         assert_eq!(peer.name, "corplap-3-wsl");
         assert_eq!(peer.wg_public_key, "cHVia2V5");
+    }
+
+    /// FR-97 P0b — an approval outlives a rejoin, so on its own it is not an
+    /// offer. A node that stopped advertising its `/0` (the operator turned
+    /// the exit off, or the device found it cannot NAT) stops being an exit in
+    /// its peers' netmaps at the next fan, while its other approved routes keep
+    /// flowing; the exit returns by itself when the offer does.
+    #[test]
+    fn only_approved_routes_the_node_still_advertises_reach_peers() {
+        let mut n = node("exit", "100.64.0.9");
+        n.is_exit_node = true;
+        n.approved_routes = vec!["10.1.0.0/24".into(), "0.0.0.0/0".into()];
+        n.advertised_routes = vec!["10.1.0.0/24".into()];
+        assert_eq!(
+            to_netmap_peer(&n, true).routes,
+            vec!["10.1.0.0/24".to_string()],
+            "a /0 the device no longer offers must not reach a single peer"
+        );
+
+        n.advertised_routes.push("0.0.0.0/0".into());
+        assert_eq!(
+            to_netmap_peer(&n, true).routes,
+            vec!["10.1.0.0/24".to_string(), "0.0.0.0/0".to_string()],
+            "the offer is back, and the stored approval with it"
+        );
+
+        n.approved_routes.clear();
+        assert!(
+            to_netmap_peer(&n, true).routes.is_empty(),
+            "an offer the admin never approved reaches no one either"
+        );
+    }
+
+    /// FR-97 P0b — under an enforcing ACL, a peer visible ONLY through a
+    /// subnet grant is withheld once the device stops offering that subnet. The
+    /// ACL grants from the same offered set the netmap fans; an approval the
+    /// device withdrew must not keep the gateway visible.
+    #[test]
+    fn an_enforcing_acl_grants_only_what_the_peer_still_offers() {
+        use roomler_ai_remote_control::models::{
+            OverlayRule, OverlaySelector, OverlayTarget, PortRange, ProtocolKind,
+        };
+        let now = bson::DateTime::now();
+        let acl = AclCtx {
+            mode: OverlayAclMode::Enforce,
+            policies: vec![OverlayPolicy {
+                id: None,
+                tenant_id: ObjectId::new(),
+                name: "the lab subnet".into(),
+                enabled: true,
+                sources: vec![OverlaySelector::AllNodes],
+                via: vec![OverlayTarget::AllNodes],
+                // Covers the subnet, NOT the router's own overlay address: the
+                // router is visible only through the route it carries.
+                destinations: vec![OverlayRule {
+                    cidr: "10.1.0.0/24".into(),
+                    port_range: PortRange {
+                        low: 1,
+                        high: u16::MAX,
+                    },
+                    proto: ProtocolKind::Any,
+                }],
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+            }],
+        };
+        let src = OverlaySource {
+            node_id: ObjectId::new(),
+            owner_user_id: None,
+            role_ids: vec![],
+        };
+        let mut router = node("router", "100.64.0.9");
+        router.approved_routes = vec!["10.1.0.0/24".into()];
+        router.advertised_routes = vec!["10.1.0.0/24".into()];
+        let shaped = shape_peer(&acl, &src, &router, None, true)
+            .expect("visible through the subnet it offers");
+        assert_eq!(shaped.routes, vec!["10.1.0.0/24".to_string()]);
+
+        router.advertised_routes.clear();
+        assert!(
+            shape_peer(&acl, &src, &router, None, true).is_none(),
+            "an approval the device no longer offers grants nothing"
+        );
     }
 
     /// Guards the join path against regressing to a blanket `true`: presence
