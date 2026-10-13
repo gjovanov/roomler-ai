@@ -26,6 +26,15 @@
 //! | `probe50` | +50 ms one way, L4 probes on | the probe round trip rises by ≥ 80 ms: it crosses the link in both directions |
 //! | `gate_lgcy` / `gate_slot` | an emulated 25 fps event-driven source behind each capture gate (FR-98 C1) | the slot-first gate's p50 is lower by ≥ a quarter period: the clock starts when a frame lands in the slot, so a frame the legacy gate holds there counts its wait |
 //! | `playout0` | no delay; the agent's `playout-delay` 0/0 switch on (FR-98 C6) | the extension is negotiated and on every video packet at 0/0, without costing frames. In every other cell (the switch off) the answer does not negotiate it at all, though the controller offers it as Chrome does |
+//! | `replay` | no delay; the transport as the daemon reads it (FR-101 P1a) | the controller's first SRTCP PLI, replayed into the live session a moment after a keyframe the agent cut on its own, cuts no keyframe: the replay window refuses it. In this cell and every other but `legacy`, the agent's ClientHello offers exactly the two ECDHE-AES-128-GCM suites |
+//! | `legacy` | no delay; both FR-101 switches back (`ROOMLERD_DTLS_LEGACY_SUITES=1`, `ROOMLERD_SRTP_REPLAY_WINDOW=0`), which is every session before P1a | the DTLS half's negative control: the ClientHello offers the CBC suites again. A replay is refused here too. With no window set, webrtc-srtp's session supplies its own 64, so replay protection was never off, before FR-101 or after |
+//! | `unguarded` | no delay; replay protection switched off outright through the setting engine, which no production setting does | the replay half's negative control: each replay cuts a keyframe, so a refusal in the other cells is the window's doing, not a blind instrument |
+//!
+//! The FR-101 cells read the wire itself. A tap on the link parses the DTLS
+//! hellos out of the cleartext handshake records, and keeps the
+//! controller's first SRTCP PLI exactly as it crossed, to deliver it to the
+//! agent again later. The agent answers the offer, so it is the DTLS client,
+//! as it is against a browser: its ClientHello is the one a browser sees.
 //!
 //! The two `probe` cells are L4 in process. A bench viewer sends
 //! `{"t":"probe","seq":N}` on the input DataChannel; the synthetic source
@@ -41,6 +50,7 @@
 #![cfg(all(feature = "openh264-encoder", feature = "synthetic-frame-source"))]
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -54,12 +64,14 @@ use roomlerd::capture::synthetic_backend::{self, clock, marker};
 use roomlerd::encode::EncoderPreference;
 use roomlerd::peer::{AgentPeer, l0};
 use roomlerd::rc_overlay::RcOverlay;
+use roomlerd::rc_transport::{self, Policy};
 use tokio::sync::{Mutex, mpsc};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+use webrtc::dtls::cipher_suite::CipherSuiteId;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -105,6 +117,16 @@ const PROBE_JITTER_MS: u64 = 34;
 /// ignored. A real cadence regression (half the rate) still fails it.
 const CLEAN_FPS_FLOOR: f64 = 0.75;
 
+/// FR-101 P1a's replay cells. A replay goes out this long after a keyframe
+/// the agent cut on its own, and a keyframe within `REPLAY_ANSWER` of it is
+/// the agent obeying it. Nothing else cuts one in that window: the encoder's
+/// own period is 60 frames (two seconds at 30 fps), and a clean link never
+/// makes the controller ask. The agent honours one PLI per 500 ms
+/// (`peer.rs` `MIN_KEYFRAME_GAP`), so the next replay waits until the answer
+/// window has closed.
+const REPLAY_AFTER_IDR: Duration = Duration::from_millis(300);
+const REPLAY_ANSWER: Duration = Duration::from_millis(600);
+
 /// One link condition.
 #[derive(Clone, Copy, Debug)]
 struct Cell {
@@ -124,6 +146,17 @@ struct Cell {
     /// FR-98 C6: force the agent's `playout-delay` 0/0 switch for this
     /// session (`None` reads the environment, which is off here).
     playout_zero: Option<bool>,
+    /// FR-101 P1a: force the agent's transport policy (`None` reads the
+    /// environment: the hardened default here).
+    transport: Option<Policy>,
+    /// FR-101 P1a: replay the controller's first SRTCP PLI into the agent,
+    /// a moment after each keyframe the agent cuts on its own.
+    replay_pli: bool,
+    /// Switch the session's SRTP and SRTCP replay protection off outright,
+    /// through the setting engine: the replay half's negative control. No
+    /// production setting does this, and none ever did. It takes effect
+    /// only where the policy sets no window (`transport` with 0).
+    replay_off: bool,
 }
 
 /// What the controller saw of the `playout-delay` extension.
@@ -139,6 +172,207 @@ struct PlayoutSeen {
     without: u64,
 }
 
+/// One ClientHello, as it crossed the link.
+#[derive(Debug, Clone)]
+struct Hello {
+    from: IpAddr,
+    version: u16,
+    suites: Vec<u16>,
+    /// The SRTP protection profiles its `use_srtp` extension offers.
+    srtp: Vec<u16>,
+}
+
+/// What the DTLS handshake offered and chose, read off the wire.
+#[derive(Debug, Default, Clone)]
+struct DtlsSeen {
+    /// Every ClientHello: the first, and the one that returns the server's
+    /// cookie.
+    client_hellos: Vec<Hello>,
+    /// The suite the ServerHello chose.
+    chose: Option<u16>,
+}
+
+impl DtlsSeen {
+    fn summary(&self) -> String {
+        let hex = |v: &[u16]| {
+            v.iter()
+                .map(|x| format!("{x:04x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        match self.client_hellos.first() {
+            Some(h) => format!(
+                "DTLS {:04x} offers [{}] srtp [{}], chose {}",
+                h.version,
+                hex(&h.suites),
+                hex(&h.srtp),
+                self.chose
+                    .map_or_else(|| "-".to_owned(), |s| format!("{s:04x}"))
+            ),
+            None => "no ClientHello seen".to_owned(),
+        }
+    }
+}
+
+/// The tap on the link (FR-101 P1a): the DTLS hellos, and the controller's
+/// first SRTCP PLI exactly as it crossed, kept to be delivered again.
+#[derive(Default)]
+struct Wire {
+    dtls: std::sync::Mutex<DtlsSeen>,
+    pli: std::sync::Mutex<Option<Box<dyn Chunk + Send + Sync>>>,
+}
+
+impl Wire {
+    fn observe(&self, c: &(dyn Chunk + Send + Sync), controller: IpAddr) {
+        // Both in: stop copying payloads, every video packet passes here.
+        if self.dtls.lock().unwrap().chose.is_some() && self.pli.lock().unwrap().is_some() {
+            return;
+        }
+        let data = c.user_data();
+        match data.first() {
+            // RFC 7983: a first byte in 20..=63 is DTLS.
+            Some(20..=63) => {
+                for (kind, body) in dtls_wire::handshakes(&data) {
+                    let mut seen = self.dtls.lock().unwrap();
+                    match kind {
+                        dtls_wire::CLIENT_HELLO => {
+                            if let Some((version, suites, srtp)) = dtls_wire::client_hello(body) {
+                                seen.client_hellos.push(Hello {
+                                    from: c.get_source_ip(),
+                                    version,
+                                    suites,
+                                    srtp,
+                                });
+                            }
+                        }
+                        dtls_wire::SERVER_HELLO => {
+                            seen.chose = seen.chose.or(dtls_wire::server_hello_suite(body));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // SRTCP keeps the first 8 bytes in the clear: V=2 with FMT 1,
+            // then PT 206, is a picture-loss indication.
+            Some(0x81) if data.get(1) == Some(&206) && c.get_source_ip() == controller => {
+                let mut pli = self.pli.lock().unwrap();
+                if pli.is_none() {
+                    *pli = Some(c.clone_to());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A copy of the captured PLI, to deliver again.
+    fn pli(&self) -> Option<Box<dyn Chunk + Send + Sync>> {
+        self.pli.lock().unwrap().as_ref().map(|c| c.clone_to())
+    }
+}
+
+/// The DTLS 1.2 hellos, parsed out of a datagram. Only what travels in the
+/// clear: handshake records in epoch 0 (RFC 6347 §4.1, §4.2.2).
+mod dtls_wire {
+    pub const CLIENT_HELLO: u8 = 1;
+    pub const SERVER_HELLO: u8 = 2;
+    const HANDSHAKE: u8 = 22;
+    /// RFC 5764 §4.1.1.
+    const USE_SRTP: u16 = 14;
+
+    struct Reader<'a>(&'a [u8]);
+
+    impl<'a> Reader<'a> {
+        fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+            if self.0.len() < n {
+                return None;
+            }
+            let (head, rest) = self.0.split_at(n);
+            self.0 = rest;
+            Some(head)
+        }
+        fn u8(&mut self) -> Option<u8> {
+            self.take(1).map(|b| b[0])
+        }
+        fn u16(&mut self) -> Option<u16> {
+            self.take(2).map(|b| u16::from_be_bytes([b[0], b[1]]))
+        }
+        fn u24(&mut self) -> Option<usize> {
+            self.take(3)
+                .map(|b| (usize::from(b[0]) << 16) | (usize::from(b[1]) << 8) | usize::from(b[2]))
+        }
+        fn vec8(&mut self) -> Option<&'a [u8]> {
+            let n = self.u8()?;
+            self.take(n.into())
+        }
+        fn vec16(&mut self) -> Option<&'a [u8]> {
+            let n = self.u16()?;
+            self.take(n.into())
+        }
+    }
+
+    fn u16s(b: &[u8]) -> Vec<u16> {
+        b.chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect()
+    }
+
+    /// The whole handshake messages in one datagram, as (type, body). A
+    /// fragment of a larger message is skipped: a hello fits in one record.
+    pub fn handshakes(datagram: &[u8]) -> Vec<(u8, &[u8])> {
+        let mut out = Vec::new();
+        let mut r = Reader(datagram);
+        // Record: type, version, epoch, 48-bit sequence, length.
+        while let (Some(kind), Some(_), Some(epoch), Some(_)) =
+            (r.u8(), r.u16(), r.u16(), r.take(6))
+        {
+            let Some(fragment) = r.vec16() else { break };
+            if kind != HANDSHAKE || epoch != 0 {
+                continue;
+            }
+            let mut h = Reader(fragment);
+            // Message: type, length, message_seq, fragment offset and length.
+            while let (Some(msg), Some(len), Some(_), Some(offset), Some(frag_len)) =
+                (h.u8(), h.u24(), h.u16(), h.u24(), h.u24())
+            {
+                let Some(body) = h.take(frag_len) else { break };
+                if offset == 0 && frag_len == len {
+                    out.push((msg, body));
+                }
+            }
+        }
+        out
+    }
+
+    /// What a ClientHello offers: its version, cipher suites and SRTP
+    /// protection profiles.
+    pub fn client_hello(body: &[u8]) -> Option<(u16, Vec<u16>, Vec<u16>)> {
+        let mut r = Reader(body);
+        let version = r.u16()?;
+        r.take(32)?; // random
+        r.vec8()?; // session id
+        r.vec8()?; // cookie, DTLS only
+        let suites = u16s(r.vec16()?);
+        r.vec8()?; // compression methods
+        let mut srtp = Vec::new();
+        let mut exts = Reader(r.vec16().unwrap_or_default());
+        while let (Some(kind), Some(data)) = (exts.u16(), exts.vec16()) {
+            if kind == USE_SRTP {
+                srtp = Reader(data).vec16().map(u16s).unwrap_or_default();
+            }
+        }
+        Some((version, suites, srtp))
+    }
+
+    /// The cipher suite a ServerHello chose.
+    pub fn server_hello_suite(body: &[u8]) -> Option<u16> {
+        let mut r = Reader(body);
+        r.u16()?; // version
+        r.take(32)?; // random
+        r.vec8()?; // session id
+        r.u16()
+    }
+}
+
 /// What one cell measured.
 #[derive(Debug, Default)]
 struct Run {
@@ -150,6 +384,10 @@ struct Run {
     idr: usize,
     window: Duration,
     playout: PlayoutSeen,
+    dtls: DtlsSeen,
+    /// Replayed PLIs, and how many of them a keyframe answered.
+    replays: usize,
+    replays_answered: usize,
 }
 
 /// The `p`-quantile of `samples`, NaN when empty.
@@ -339,17 +577,32 @@ impl XorShift {
     }
 }
 
-async fn vnet_pair(cell: &Cell) -> Result<(Arc<Net>, Arc<Net>, Arc<Mutex<Router>>)> {
+async fn vnet_pair(
+    cell: &Cell,
+    wire: &Arc<Wire>,
+) -> Result<(Arc<Net>, Arc<Net>, Arc<Mutex<Router>>)> {
     let wan = Arc::new(Mutex::new(Router::new(RouterConfig {
         cidr: "1.2.3.0/24".to_owned(),
         min_delay: cell.delay,
         max_jitter: cell.jitter,
         ..Default::default()
     })?));
+    // The tap first, so it sees a packet before a loss filter drops it.
+    {
+        let wire = Arc::clone(wire);
+        let controller: IpAddr = CONTROLLER_IP.parse()?;
+        wan.lock()
+            .await
+            .add_chunk_filter(Box::new(move |c: &(dyn Chunk + Send + Sync)| {
+                wire.observe(c, controller);
+                true
+            }))
+            .await;
+    }
     if cell.loss_permille > 0 {
         let permille = cell.loss_permille as u64;
         let rng = std::sync::Mutex::new(XorShift(0x9E37_79B9_7F4A_7C15));
-        let agent_ip: std::net::IpAddr = AGENT_IP.parse()?;
+        let agent_ip: IpAddr = AGENT_IP.parse()?;
         wan.lock()
             .await
             .add_chunk_filter(Box::new(move |c: &(dyn Chunk + Send + Sync)| {
@@ -420,10 +673,19 @@ async fn run_cell(cell: Cell) -> Result<Run> {
     synthetic_backend::set_test_gate(cell.gate);
     synthetic_backend::set_test_compositor(cell.compositor);
     roomlerd::rtp_playout::set_test_override(cell.playout_zero);
-    let (agent_net, controller_net, wan) = vnet_pair(&cell).await?;
+    rc_transport::set_test_override(cell.transport);
+    let wire = Arc::new(Wire::default());
+    let (agent_net, controller_net, wan) = vnet_pair(&cell, &wire).await?;
+    // The agent's end of the link, where a replayed packet is delivered.
+    let agent_nic = agent_net.get_nic()?;
+    let replay_off = cell.replay_off;
     l0::set_setting_engine_hook(Some(Arc::new(move |s: &mut SettingEngine| {
         s.set_vnet(Some(Arc::clone(&agent_net)));
         ice_timeouts(s);
+        if replay_off {
+            s.disable_srtp_replay_protection(true);
+            s.disable_srtcp_replay_protection(true);
+        }
     })));
 
     // A probe cell needs INPUT: the agent attaches its input handler, the
@@ -478,18 +740,19 @@ async fn run_cell(cell: Cell) -> Result<Run> {
 
     // Decoded frames: (decode-done instant, latency).
     let results: Arc<std::sync::Mutex<Vec<(Instant, Duration)>>> = Arc::default();
-    let idr_count = Arc::new(AtomicU64::new(0));
+    // When each IDR arrived.
+    let idr_at: Arc<std::sync::Mutex<Vec<Instant>>> = Arc::default();
     let playout: Arc<std::sync::Mutex<PlayoutSeen>> = Arc::default();
     {
         let results = Arc::clone(&results);
-        let idr_count = Arc::clone(&idr_count);
+        let idr_at = Arc::clone(&idr_at);
         let sent = Arc::clone(&sent);
         let probe_rtts = Arc::clone(&probe_rtts);
         let playout = Arc::clone(&playout);
         let pc_weak = Arc::downgrade(&pc);
         pc.on_track(Box::new(move |track, _, _| {
             let results = Arc::clone(&results);
-            let idr_count = Arc::clone(&idr_count);
+            let idr_at = Arc::clone(&idr_at);
             let sent = Arc::clone(&sent);
             let probe_rtts = Arc::clone(&probe_rtts);
             let playout = Arc::clone(&playout);
@@ -549,7 +812,7 @@ async fn run_cell(cell: Cell) -> Result<Run> {
                         let mut want_keyframe = skipped;
                         for au in aus {
                             if has_idr(&au) {
-                                idr_count.fetch_add(1, Ordering::Relaxed);
+                                idr_at.lock().unwrap().push(Instant::now());
                             }
                             let (seq, probe) = match decoder.decode(&au) {
                                 Ok(Some(pic)) => {
@@ -662,10 +925,50 @@ async fn run_cell(cell: Cell) -> Result<Run> {
         })
     });
 
+    // FR-101 P1a: deliver the controller's first PLI to the agent again,
+    // exactly as it crossed the link, REPLAY_AFTER_IDR after each keyframe
+    // the agent cut on its own. A replay accepted is a keyframe within
+    // REPLAY_ANSWER; a replay refused is nothing at all.
+    let injected: Arc<std::sync::Mutex<Vec<Instant>>> = Arc::default();
+    let replayer = cell.replay_pli.then(|| {
+        let wire = Arc::clone(&wire);
+        let idr_at = Arc::clone(&idr_at);
+        let results = Arc::clone(&results);
+        let injected = Arc::clone(&injected);
+        tokio::spawn(async move {
+            let mut last: Option<Instant> = None;
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let Some(first) = results.lock().unwrap().first().map(|r| r.0) else {
+                    continue;
+                };
+                let now = Instant::now();
+                // A keyframe past the warm-up that does not answer the last
+                // replay, and long enough ago.
+                let due = idr_at.lock().unwrap().iter().any(|&t| {
+                    t >= first + WARMUP
+                        && last.is_none_or(|l| t > l + REPLAY_ANSWER)
+                        && t + REPLAY_AFTER_IDR <= now
+                });
+                if !due {
+                    continue;
+                }
+                let Some(pli) = wire.pli() else { continue };
+                agent_nic.lock().await.on_inbound_chunk(pli).await;
+                let at = Instant::now();
+                injected.lock().unwrap().push(at);
+                last = Some(at);
+            }
+        })
+    });
+
     tokio::time::sleep(RUN).await;
 
     if let Some(prober) = prober {
         prober.abort();
+    }
+    if let Some(replayer) = replayer {
+        replayer.abort();
     }
     agent.close().await;
     let _ = pc.close().await;
@@ -674,6 +977,7 @@ async fn run_cell(cell: Cell) -> Result<Run> {
     synthetic_backend::set_test_gate(Duration::ZERO);
     synthetic_backend::set_test_compositor(None);
     roomlerd::rtp_playout::set_test_override(None);
+    rc_transport::set_test_override(None);
     let _ = wan.lock().await.stop().await;
 
     let samples = results.lock().unwrap().clone();
@@ -689,12 +993,20 @@ async fn run_cell(cell: Cell) -> Result<Run> {
         .filter(|(t, _)| *t >= from)
         .map(|(_, rtt)| rtt.as_secs_f64() * 1e3)
         .collect();
+    let idrs = idr_at.lock().unwrap().clone();
+    let injected = injected.lock().unwrap().clone();
     let mut run = Run {
         latencies_ms: kept.iter().map(|(_, l)| l.as_secs_f64() * 1e3).collect(),
         probe_ms,
         decoded: kept.len(),
-        idr: idr_count.load(Ordering::Relaxed) as usize,
+        idr: idrs.len(),
         playout: *playout.lock().unwrap(),
+        dtls: wire.dtls.lock().unwrap().clone(),
+        replays: injected.len(),
+        replays_answered: injected
+            .iter()
+            .filter(|&&i| idrs.iter().any(|&t| t > i && t <= i + REPLAY_ANSWER))
+            .count(),
         ..Default::default()
     };
     if let (Some(a), Some(b)) = (kept.first(), kept.last()) {
@@ -714,6 +1026,9 @@ const fn cell(name: &'static str, delay_ms: u64, loss_permille: u32, gate_ms: u6
         probe: false,
         compositor: None,
         playout_zero: None,
+        transport: None,
+        replay_pli: false,
+        replay_off: false,
     }
 }
 
@@ -779,12 +1094,35 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
     let gate_legacy = gate_cell("gate_lgcy", GateMode::Legacy);
     let gate_slot = gate_cell("gate_slot", GateMode::SlotFirst);
 
-    let mut runs = Vec::new();
     let playout0 = Cell {
         playout_zero: Some(true),
         ..cell("playout0", 0, 0, 0)
     };
-    for c in [
+    // FR-101 P1a: the transport as the daemon reads it, both of its switches
+    // back, and replay protection switched off outright.
+    let replay = Cell {
+        replay_pli: true,
+        ..cell("replay", 0, 0, 0)
+    };
+    let unhardened = Cell {
+        replay_pli: true,
+        transport: Some(Policy {
+            replay_window: 0,
+            gcm_only: false,
+        }),
+        ..cell("legacy", 0, 0, 0)
+    };
+    let unguarded = Cell {
+        replay_pli: true,
+        replay_off: true,
+        transport: Some(Policy {
+            replay_window: 0,
+            gcm_only: true,
+        }),
+        ..cell("unguarded", 0, 0, 0)
+    };
+
+    let cells = [
         clean,
         delay100,
         gate50,
@@ -794,11 +1132,59 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
         gate_legacy,
         gate_slot,
         playout0,
-    ] {
+        replay,
+        unhardened,
+        unguarded,
+    ];
+    let mut runs = Vec::new();
+    for c in cells {
         let run = rt.block_on(run_cell(c)).unwrap_or_else(|e| panic!("{e:#}"));
-        println!("{} | playout {:?}", run.line(&c), run.playout);
+        let replays = if c.replay_pli {
+            format!(
+                " | replays {}/{} answered | {}",
+                run.replays_answered,
+                run.replays,
+                run.dtls.summary()
+            )
+        } else {
+            String::new()
+        };
+        println!("{} | playout {:?}{replays}", run.line(&c), run.playout);
         runs.push(run);
     }
+
+    // FR-101 P1a, the DTLS half: in every cell but `legacy` the agent's
+    // ClientHello offers exactly the two ECDHE-AES-128-GCM suites, and the
+    // handshake settles on one of them. Read off the wire, so a reordered
+    // engine setup or a webrtc upgrade that drops the setting fails here.
+    let gcm: Vec<u16> = rc_transport::GCM_SUITES.iter().map(|&s| s as u16).collect();
+    let agent_ip: IpAddr = AGENT_IP.parse().unwrap();
+    for (c, run) in cells.iter().zip(&runs) {
+        if !c.transport.unwrap_or_default().gcm_only {
+            continue;
+        }
+        let d = &run.dtls;
+        assert!(
+            !d.client_hellos.is_empty(),
+            "{}: the tap saw no ClientHello: {}",
+            c.name,
+            d.summary()
+        );
+        for h in &d.client_hellos {
+            assert!(
+                h.from == agent_ip && h.suites == gcm && !h.srtp.is_empty(),
+                "{}: want the agent's ClientHello offering exactly {gcm:04x?} with use_srtp, saw {h:04x?}",
+                c.name
+            );
+        }
+        assert!(
+            d.chose.is_some_and(|s| gcm.contains(&s)),
+            "{}: the handshake settled on {:04x?}",
+            c.name,
+            d.chose
+        );
+    }
+
     let [
         clean_run,
         delay_run,
@@ -809,7 +1195,64 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
         legacy_run,
         slot_run,
         playout_run,
-    ] = <[Run; 9]>::try_from(runs).unwrap();
+        replay_run,
+        unhardened_run,
+        unguarded_run,
+    ] = <[Run; 12]>::try_from(runs).unwrap();
+
+    // FR-101 P1a, the SRTCP half (AC2). With replay protection switched off
+    // outright, the agent obeys a replayed PLI and cuts a keyframe each time:
+    // the instrument sees a replay accepted, so it can see one refused.
+    assert!(
+        unguarded_run.replays >= 2 && unguarded_run.replays_answered >= 2,
+        "unguarded: {} of {} replayed PLIs cut a keyframe, want ≥ 2 of ≥ 2: a replay that \
+         is accepted does not show, so a refused one proves nothing",
+        unguarded_run.replays_answered,
+        unguarded_run.replays
+    );
+    // The daemon's transport refuses it. So does the one every session had
+    // before P1a: with no window set, webrtc-srtp's session supplies 64 of
+    // its own (`Session::new`). FR-101's P0 evidence read the fallback in
+    // `Context::new`, which a session never reaches.
+    for (run, name) in [(&replay_run, "replay"), (&unhardened_run, "legacy")] {
+        assert!(
+            run.replays >= 2,
+            "{name}: only {} replays went out",
+            run.replays
+        );
+        assert_eq!(
+            run.replays_answered, 0,
+            "{name}: {} of {} replayed PLIs cut a keyframe through the replay window",
+            run.replays_answered, run.replays
+        );
+    }
+    // The DTLS half's negative control: with the switch back, the CBC suites
+    // are offered again, so what the tap reads is the wire.
+    let cbc = [
+        CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_256_Cbc_Sha as u16,
+        CipherSuiteId::Tls_Ecdhe_Rsa_With_Aes_256_Cbc_Sha as u16,
+    ];
+    assert!(
+        unhardened_run
+            .dtls
+            .client_hellos
+            .iter()
+            .any(|h| cbc.iter().all(|s| h.suites.contains(s))),
+        "legacy: the ClientHello does not offer the CBC suites {cbc:04x?}: {}",
+        unhardened_run.dtls.summary()
+    );
+    // Hardened or not, a session still flows.
+    for (run, name) in [
+        (&replay_run, "replay"),
+        (&unhardened_run, "legacy"),
+        (&unguarded_run, "unguarded"),
+    ] {
+        assert!(
+            run.fps() >= SOURCE_FPS * CLEAN_FPS_FLOOR,
+            "{name}: {:.1} fps decoded",
+            run.fps()
+        );
+    }
 
     // FR-98 C6. Off (the default), the agent does not even register the
     // extension, so an answer to an offer that carries it negotiates nothing

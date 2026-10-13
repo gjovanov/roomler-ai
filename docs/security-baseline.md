@@ -292,8 +292,26 @@ review like one. The root socket itself is unchanged. Kill switch:
 
 | Setting | Default now | Why | Switch back |
 |---|---|---|---|
-| SRTP + SRTCP replay window | 64 | webrtc-srtp 0.14 has **no** replay window unless one is set: an on-path attacker could replay a captured SRTCP PLI (forcing an IDR) or REMB (capping the rate) without decrypting anything | `ROOMLERD_SRTP_REPLAY_WINDOW=0` |
 | DTLS cipher suites | the two ECDHE-AES-128-GCM-SHA256 suites | webrtc-dtls' default list still offers ECDHE-AES-256-CBC-SHA; every supported browser negotiates GCM | `ROOMLERD_DTLS_LEGACY_SUITES=1` |
+| SRTP + SRTCP replay window | 64, **pinned**, not switched on | webrtc-srtp's `Session::new` already gives the remote context a 64-packet window when its config has none, so sessions refused replays before FR-101 too. Setting it explicitly keeps it 64 should a release change that default | none: `ROOMLERD_SRTP_REPLAY_WINDOW=N` sizes it, and `0` leaves the library's 64 |
+
+> [!NOTE]
+> **Corrected 2026-10-13: replay protection was never off.** FR-101's evidence said
+> webrtc-srtp 0.14 had no replay window unless one was set. That read the fallback in
+> `Context::new`, and a session never reaches it, because `Session::new` supplies a
+> window first. FR-16 L0's replay cells (`agents/roomlerd/tests/l4_latency.rs`) capture
+> the controller's SRTCP PLI on the link and deliver it to the agent again, into a live
+> session:
+>
+> | Cell | Result |
+> |---|---|
+> | this policy | refused |
+> | no window set, as before FR-101 | refused |
+> | protection disabled through the setting engine | obeyed: one keyframe per replay |
+>
+> The third cell is the negative control. No production setting disables the
+> protection, and none ever did. The same cells read the agent's real ClientHello off
+> the link: only `c02b c02f` by default, `c00a` and `c014` back with the switch.
 
 The suite list needs a setter upstream does not have. It is a one-field patch to the
 vendored webrtc crate (`SettingEngine::set_dtls_cipher_suites`, noted in the workspace

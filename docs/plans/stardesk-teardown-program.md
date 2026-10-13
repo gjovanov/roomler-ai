@@ -57,7 +57,7 @@ are master `c2e79221b`.
 | P13 | remote audio, mute host | WASAPI / Pulse, opt-in; silent on macOS; no host mute | partial: [FR-99](../fr/FR-99-privacy-mode.md) |
 | S1 | E2E, mutual authentication, "zero-knowledge" | ephemeral per-session ECDSA and mutual DTLS, but on master the fingerprints are bound to nothing the device can check: the hub rebuilds the offer around the raw SDP (`crates/modules/fleet/src/hub.rs` L1391, L1450). FR-52's open PR #1628 binds them for outsiders only | gap: [FR-100](../fr/FR-100-controller-identity.md) |
 | S2 | DTLS 1.2/1.3, AES-128, ECDHE with PFS | DTLS 1.2, ECDHE, SRTP AEAD-GCM including AES-256; CBC suites still offered | parity, harden: [FR-101](../fr/FR-101-rc-session-hygiene.md) |
-| S3 | replay protection | **the agent's SRTP/SRTCP replay protection is off** (webrtc-srtp 0.14 falls back to none) | gap: FR-101 |
+| S3 | replay protection | **on**: webrtc-srtp's `Session::new` gives every session a 64-packet SRTP/SRTCP window when none is set. This row first said "off", from the no-protection fallback in `Context::new`, which a session never reaches. FR-16 L0's replay cells corrected it on 2026-10-13: a replayed SRTCP PLI is refused even with no window set | **parity**; FR-101 P1a pins the window |
 | S4 | certificate pinning | deliberately absent so corporate TLS inspection works (`agents/roomlerd/Cargo.toml` L285–293) | by design; FR-100 gives the integrity pinning would |
 | S5 | Privacy Mode: black out the local display | nothing; `WDA_EXCLUDEFROMCAPTURE` already hides our own panels from capture | gap: FR-99 |
 | S6 | auto-lock after the session | none | gap: FR-99 |

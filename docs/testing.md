@@ -164,6 +164,18 @@ flowchart LR
 | `lossy` | +20 ms, 5 ms jitter, 3 % of media packets dropped | the session survives and keeps decoding; its numbers are printed |
 | `gate_lgcy` / `gate_slot` | no delay; the source emulates an event-driven backend (a 25 fps "compositor", frames landing ¾ of a period ahead of the legacy gate's cadence) behind each capture gate | the slot-first gate's p50 is lower by ≥ a quarter period ([FR-98](fr/FR-98-input-to-photon-budget.md) C1, AC3). The clock starts when a frame lands in the slot, so a frame the gate holds counts its wait |
 | `playout0` | no delay; the agent's `playout-delay` 0/0 switch on ([FR-98](fr/FR-98-input-to-photon-budget.md) C6) | the extension is negotiated and on every video packet at 0/0, without costing frames. Every other cell runs with the switch off, and its answer must not negotiate the extension at all, though the controller offers it the way Chrome does |
+| `replay` | no delay; the transport as the daemon reads it ([FR-101](fr/FR-101-rc-session-hygiene.md) P1a) | the controller's SRTCP PLI, delivered to the agent again a moment after a keyframe the agent cut on its own, cuts no keyframe: the replay window refuses it. In this cell and every other but `legacy`, the agent's ClientHello offers exactly `c02b c02f` |
+| `legacy` | no delay; both FR-101 switches back, which is every session before P1a | the ClientHello offers the CBC suites `c00a c014` again: **the DTLS negative control**. A replay is still refused, because webrtc-srtp's session sets its own 64-packet window when none is given |
+| `unguarded` | no delay; replay protection disabled through the setting engine, which no production setting does | each replay cuts a keyframe: **the replay negative control**. A refusal elsewhere is the window's doing |
+
+**The FR-101 cells read the link itself.** A chunk filter on the vnet router sees every
+datagram before a loss filter can drop it. It parses the DTLS hellos out of the
+cleartext epoch-0 handshake records (RFC 6347), and keeps the controller's first SRTCP
+PLI byte for byte: SRTCP leaves its first 8 bytes in the clear, so `0x81 0xCE` names it.
+The replay goes back in through the agent's NIC (`Nic::on_inbound_chunk`), on the same
+5-tuple, so ICE, the mux and the SRTCP session see a real retransmission of a real
+packet. The agent answers the offer, so it is the DTLS client, as it is against a
+browser.
 
 Run it locally (it prints one `L0 …` line per cell):
 

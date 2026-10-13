@@ -19,8 +19,9 @@ own, and each one is cheap:
    produces them.
 3. **Sessions that end.** There is no idle timeout and no maximum duration for remote desktop, and no
    per-caller rate limit on session requests.
-4. **The transport.** CBC suites are still offered, the agent's SRTP replay protection is off, and a
-   hand-edited `http://` server URL becomes plaintext signalling.
+4. **The transport.** CBC suites are still offered, and a hand-edited `http://` server URL becomes
+   plaintext signalling. (This item also said the agent's SRTP replay protection was off. It never
+   was: see the correction in §2.)
 
 ## 2. Evidence (master `c2e79221b`)
 
@@ -34,7 +35,7 @@ own, and each one is cheap:
 | `EndReason::IdleTimeout` exists with no producer | `models.rs` L3673 | Sessions run until someone ends them |
 | Exec has a per-(caller, device) rate limit; remote-desktop requests have none | `crates/modules/fleet/src/agent_exec.rs` L324–327 (`exec_rate_limiter`) | Only `tower_governor`'s 60/min/IP applies |
 | DTLS still offers CBC suites | webrtc-dtls 0.11 default suites include `TLS_ECDHE_{ECDSA,RSA}_WITH_AES_256_CBC_SHA` (registry `cipher_suite/mod.rs` L65–68) | Legacy suites on a path that only ever needs GCM |
-| **The agent's SRTP/SRTCP replay protection is off** | No window is set at `peer.rs` L369, so `dtls_transport/mod.rs` L189 passes no option, and webrtc-srtp 0.14 falls back to `srtp_no_replay_protection()` (registry `context/mod.rs` L131–141). The setter exists: `setting_engine/mod.rs` L287 | An on-path attacker can replay captured SRTCP (a PLI forces an IDR; a REMB caps the rate) without decrypting anything |
+| ~~The agent's SRTP/SRTCP replay protection is off~~ **Wrong, corrected 2026-10-13** | No window is set at `peer.rs` L369, so `dtls_transport/mod.rs` L189 passes no option. The fallback to `srtp_no_replay_protection()` is in `Context::new` (registry `context/mod.rs` L131–141), and a session never reaches it: **`Session::new` supplies `DEFAULT_SESSION_SRTP_REPLAY_PROTECTION_WINDOW` = 64 for the remote context whenever the config has no option** (registry `session/mod.rs` L21–22, L52–70) | None. Measured in FR-16 L0's `legacy` cell: a captured SRTCP PLI delivered to the agent again, with no window set, is refused (`srtcp ssrc=0 index=1: duplicated`). P1a's window pins the default rather than switching protection on |
 | Enrollment promotes `http://` to `https://`; the WS URL derivation does not | `crates/agent-core/src/enrollment.rs` L525–531 (loopback exempt); `crates/agent-core/src/config.rs` L3092 (`derive_ws_url` maps `http` → `ws`) | A config edited to `http://` signals in plaintext. The rule does not hold at every entry point |
 | coturn sets ports but no listening IP | `turnserver.conf` L9–10 | Whether TURN answers on IPv6 is unverified |
 
@@ -75,7 +76,7 @@ and the policy switch is useful either way.
 
 - **CBC out.** Configure the agent's DTLS cipher suites to the two ECDHE-GCM suites. Chrome has offered GCM
   for years, so nothing that connects today loses.
-- **Replay windows on.** `set_srtp_replay_protection_window(64)` and the SRTCP equivalent on the agent's
+- **Replay windows pinned** (they were already on, §2). `set_srtp_replay_protection_window(64)` and the SRTCP equivalent on the agent's
   `SettingEngine`.
 - **`https` at every entry point.** Apply enrollment's promotion (loopback exempt) in `derive_ws_url` and at
   config load, so `ws://` can only ever mean loopback.
@@ -85,8 +86,8 @@ and the policy switch is useful either way.
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| P0 | This spec and the claim. The red evidence: a DTLS ClientHello pcap with CBC suites; an SRTCP replay accepted in a unit test | docs only | this PR |
-| P1a | The transport: CBC out, the SRTP/SRTCP replay windows (`agents/roomlerd/src/rc_transport.rs`, the vendored `set_dtls_cipher_suites`) | `ROOMLERD_DTLS_LEGACY_SUITES=1`, `ROOMLERD_SRTP_REPLAY_WINDOW=0` | **built**: unit tests red/green on an SRTCP replay; the field pcap is owed |
+| P0 | This spec and the claim. The red evidence: a DTLS ClientHello pcap with CBC suites; an SRTCP replay accepted in a unit test | docs only | merged. ⚠️ Its "replay accepted" red was a bare `Context`, not a session; see §2 |
+| P1a | The transport: CBC out, the SRTP/SRTCP replay windows pinned (`agents/roomlerd/src/rc_transport.rs`, the vendored `set_dtls_cipher_suites`) | `ROOMLERD_DTLS_LEGACY_SUITES=1`; `ROOMLERD_SRTP_REPLAY_WINDOW` sizes the window, and no value turns it off | **shipped in 0.4.133.** FR-16 L0's `replay` / `legacy` / `unguarded` cells read both halves off the link in CI: DTLS red/green on the agent's real ClientHello, and replays refused on a live session. The window change is behaviour-neutral (§2). The field pcap is owed |
 | P1b | `https` at every entry point, and the IPv6 TURN check | an escape for plaintext labs | — **split from P1a** (see the note below) |
 | P2 | Policy switches and agent-side masking; viewer reasons | each setting defaults to today's behaviour (`on`) | — |
 | P3 | The audit producers | — | — |
@@ -105,8 +106,12 @@ and gives labs an explicit escape before the default flips.
 
 - [ ] **AC1 (red first):** a pcap of the deployed agent's DTLS ClientHello lists the CBC suites. After P1 it
   lists only ECDHE-GCM, and every fleet browser still connects.
-- [ ] **AC2:** a unit test replays an SRTCP packet into the agent's session. Accepted on today's
-  configuration (red), rejected after P1.
+- [ ] **AC2 (amended 2026-10-13):** a test replays an SRTCP packet into the agent's **live session**. It
+  is refused under P1's policy, and the test shows it can see a replay accepted: with protection
+  disabled through the setting engine, the replay is obeyed. *As first written, this criterion asked
+  for "accepted on today's configuration (red)". No such red exists: webrtc-srtp's `Session::new` had
+  always given sessions a 64-packet window (§2). The first red came from a bare `Context`, which no
+  session builds.*
 - [ ] **AC3:** a config with `server_url = "http://roomler.ai"` signals over `wss://` after P1, while
   `http://127.0.0.1` stays `ws://`.
 - [ ] **AC4:** a device with `rc_files = off` refuses file transfer, the viewer shows why, and the agent
@@ -141,7 +146,8 @@ and gives labs an explicit escape before the default flips.
 
 | # | Date | Cell | Result |
 |---|---|---|---|
-| — | — | — | — |
+| 1 | 2026-10-13 | **CI, not field.** FR-16 L0 on a vnet: the production `AgentPeer` answering a webrtc-rs controller, with a tap on the link (`agents/roomlerd/tests/l4_latency.rs`) | **DTLS, read from the agent's real ClientHello.** Hardened: version `fefd` (1.2), suites `c02b c02f`, SRTP profiles `0007 0008 0001 0002`, the server chose `c02b`. With `ROOMLERD_DTLS_LEGACY_SUITES=1`: `c02b c00a c02f c014`, the CBC pair back. Every default cell offers exactly the GCM pair. **SRTCP replay:** the controller's first PLI, captured on the link and delivered to the agent again about 300 ms after each keyframe it cut on its own, three times per cell. Refused with P1a's policy (0/3, 4 IDRs). Refused with no window set, as every session ran before P1a (0/3, 4 IDRs, `srtcp ssrc=0 index=1: duplicated` in the agent's log). Obeyed with protection disabled through the engine (3/3, 7 IDRs), the negative control. Windows dev box, unoptimised build |
+| 2 | 2026-10-13 | **The wrong turn** | P0's red for the replay half was a unit test on a bare `srtp::Context` built without options, which falls back to no protection. The agent never builds one: `Session::new` substitutes a 64-packet window first. So the agent was never open to SRTCP replay, and P1a's window is a pin. Found by building the instrument the AC asked for: the negative control expected to accept (window 0) refused. **Lesson: a red taken one layer below the product's real call path is not a red for the product** |
 
 ## 9. Related
 
