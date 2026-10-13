@@ -3201,8 +3201,8 @@ mod win_console {
             Ok(Some(t)) => t,
             Ok(None) => {
                 return ExecOutcome::failed(format!(
-                    "console session {session} has no user token (nobody has signed in since \
-                     boot); nothing to run as"
+                    "console session {session} has no user token (nobody is signed in at the \
+                     console); nothing to run as"
                 ));
             }
             Err(e) => {

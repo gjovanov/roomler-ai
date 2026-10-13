@@ -188,10 +188,65 @@ anchor. Anchoring again revokes the earlier one; so does
 removing the device. The service renews its credential under the same anchor
 well before its year runs out.
 
+```mermaid
+stateDiagram-v2
+  [*] --> Unanchored
+  Unanchored --> Anchored: roomlerd anchor create (elevated)
+  Anchored --> Anchored: renew, same anchor_id
+  Anchored --> Anchored: anchor create again, new anchor_id
+  Anchored --> Unanchored: DELETE exec-anchor
+  Anchored --> Removed: the device is removed
+  Removed --> Anchored: the same machine re-enrolls
+```
+
+| Event | The service's credential | Where a command goes |
+|---|---|---|
+| `roomlerd anchor create` | minted, carrying a new `anchor_id` | the service, once the device advertises `exec-system` (within about 75 s, no restart) |
+| renewal | minted again under the same `anchor_id` | unchanged |
+| `roomlerd anchor create` again | every earlier `anchor_id`'s credential refused (401) | the service holding the new anchor |
+| `DELETE …/exec-anchor` | refused (401) | the worker, or refused where the org requires SYSTEM |
+| `roomlerd anchor remove` on the device | the file is gone; the server's record stays | the worker once the device stops advertising `exec-system`, or refused where the org requires SYSTEM |
+| the device is removed | refused (401, "deleted") while the row is removed | nowhere: the device is gone |
+| the same machine re-enrolls | **accepted again** | the service, as before the removal |
+
+⚠️ **Removing a device suspends its anchor; it does not end it.** Re-enrolling
+the same machine (the same `machine_id`) revives the removed row in place
+(`AgentDao::rehydrate` clears `deleted_at` and nothing else), and the row's
+`exec_anchor` comes back with it. The anchor file is still on the disk, so its
+credential works again, with no elevated step. To end SYSTEM exec on a machine
+for good, un-anchor it, or run `roomlerd anchor remove` on it, **before**
+removing the device. An ephemeral enrollment is the exception: its row is
+deleted outright (FR-51), so nothing can come back. Ending the anchor at
+removal is #2133.
+
 **Routing needs both halves:** the server's record of the anchor, and the
 device's `exec-system` word. Either alone sends the command to the worker, as
 before. `rc.exec_via_service = false` on the server turns the SYSTEM path off
 everywhere; `ROOMLERD_EXEC_VIA_SERVICE=0` on a device withdraws its word.
+
+The whole decision, in the order the code takes it (`agent_exec.rs`
+`authorize`, then the dispatch; `exec_service.rs` `routes_via_service`). Every
+refusal is audited:
+
+```mermaid
+flowchart TD
+  R["a command: UI, CLI, bulk, or a device's rc:rpc.request"] --> G{"gates 1–3, and the originating device"}
+  G -- no --> D1["refused"]
+  G -- yes --> V{"via the service? Windows, anchored on the server,<br/>exec-system advertised on this pod, rc.exec_via_service on"}
+  V -- no --> Q{"Windows, and the org requires SYSTEM?"}
+  Q -- yes --> D2["refused: system_required"]
+  Q -- no --> C{"run_as = console_user?"}
+  C -- yes --> D3["refused: run_as_unavailable"]
+  C -- no --> W["the process holding the agent socket runs it<br/>(Windows: the worker, ran_as = worker)"]
+  V -- yes --> P["exec_pending row; rc:rpc.exec via_service to the worker"]
+  P --> K{"the person's exec_enabled, consent,<br/>then the anchor's exec_enabled"}
+  K -- no --> D4["refused on the device"]
+  K -- yes --> A{"run_as"}
+  A -- system --> S["SYSTEM in session 0, ran_as = system"]
+  A -- console_user --> T{"someone signed in at the console?"}
+  T -- yes --> U["that person's own token, ran_as = console_user"]
+  T -- no --> D5["refused: nobody is signed in"]
+```
 
 **Gate 4 has two halves on this path**, and both must say yes: the person's
 `exec_enabled` (the worker checks it before it rings, exactly as before) and the
@@ -212,9 +267,11 @@ Settings, `PUT /api/tenant/{tid}/exec-settings`), a Windows command that cannot
 take the SYSTEM path is refused as `system_required` instead of running as the
 signed-in user.
 
-Every `exec_audit` row that ran records `ran_as`: `system` through the service,
-`worker` otherwise. The result the caller gets carries the device's own
-`ran_as` beside it.
+Every `exec_audit` row that ran records the server's own routing decision as
+`ran_as`: `system` or `console_user` through the service, `worker` otherwise.
+That is what the audit view shows. The result the caller gets carries the
+device's claim instead, and only the service makes one: a worker's answer has
+no `ran_as`. The audit row is authoritative.
 
 There is no command blocklist. A blocklist on a root shell is false security
 and trivially bypassed; the real mitigations are the four gates, the audit

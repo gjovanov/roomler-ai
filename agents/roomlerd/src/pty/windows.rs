@@ -708,8 +708,8 @@ fn spawn_attached_as_console_user(
         Ok(Some(t)) => t,
         Ok(None) => {
             return Err(format!(
-                "console session {session} has no user token (nobody has signed in since boot); \
-                 there is no identity to open a shell as"
+                "console session {session} has no user token (nobody is signed in at the \
+                 console); there is no identity to open a shell as"
             ));
         }
         Err(e) => {
