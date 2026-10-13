@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use roomler_ai_remote_control::signaling::CloseReason;
@@ -485,6 +485,78 @@ pub fn spawn_dc_keepalive(dc: Arc<RTCDataChannel>) {
 /// the WebSocket sink. The CLI / agent owns sink-shaped state.
 pub type HalfCloseSink = std::sync::Arc<dyn Fn(u32) + Send + Sync>;
 
+/// Session-scoped cancellation for a WebRTC-DC carrier's live flows (#2129).
+///
+/// A `webrtc-dc-v1` session that ends while a flow is live cannot end that
+/// flow through the data plane alone: [`pump_dc_to_tcp`] waits on a mailbox
+/// whose only sender lives in the DC's `on_message` closure, which the flow's
+/// own `dc: Arc<RTCDataChannel>` keeps alive, and [`pump_tcp_to_dc`] waits on
+/// a `read` that an idle app never satisfies. So every teardown path must
+/// actively tell its live flows to stop. [`FlowCanceller::cancel`] resolves
+/// every [`FlowCancel::cancelled`] handed to [`run_flow`], which then stops
+/// both halves and returns — dropping this flow's DC reference so the peer's
+/// ICE/DTLS/SCTP sockets are freed once the peer itself is closed.
+///
+/// A mailbox close alone is NOT enough: it only half-closes (the demux's
+/// in-band `HALF_CLOSE_MAGIC` path ends [`pump_dc_to_tcp`] but leaves
+/// [`pump_tcp_to_dc`] waiting on an idle `read`), so cancellation drives both
+/// halves. Only an explicit [`cancel`](FlowCanceller::cancel) resolves it;
+/// dropping the canceller does not, so each teardown triggers it deliberately
+/// (the exit does it in `AgentTunnelPeer::close`, the client when its DC
+/// carrier drops).
+#[derive(Default)]
+pub struct FlowCanceller {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl FlowCanceller {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A handle for one flow to observe. Cheap; clone one per flow.
+    pub fn handle(&self) -> FlowCancel {
+        FlowCancel {
+            cancelled: Arc::clone(&self.cancelled),
+            notify: Arc::clone(&self.notify),
+        }
+    }
+
+    /// End every live flow of this session. Idempotent.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+}
+
+/// A flow's handle onto its session's [`FlowCanceller`]. [`run_flow`] selects
+/// on [`cancelled`](Self::cancelled) alongside its two pumps.
+#[derive(Clone)]
+pub struct FlowCancel {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl FlowCancel {
+    /// Resolves once this session is cancelled. Latches: a flow that checks
+    /// after the cancel still returns at once. The waiter is armed BEFORE the
+    /// flag is re-read, so a `cancel` that fires between the read and the
+    /// await is not missed (`Notify` stores no permit for `notify_waiters`) —
+    /// the same race-free shape as [`crate::driver`]'s `Carrier::drained`.
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.cancelled.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// Drive a single accepted forward to completion. Returns the
 /// terminating [`CloseReason`] which the caller plumbs into the
 /// `rc:tunnel.tcp.closed` audit message.
@@ -500,6 +572,12 @@ pub type HalfCloseSink = std::sync::Arc<dyn Fn(u32) + Send + Sync>;
 /// down its local TCP write half. (Previously this used an in-band
 /// `HALF_CLOSE_MAGIC = [0xFF]` sentinel multiplexed through the DC;
 /// T2.10 lifts that into the wire-level message.)
+///
+/// `cancel` is the session's [`FlowCancel`] (#2129): when the session ends
+/// with this flow still live, it resolves and both halves are stopped at
+/// once — the normal half-close path can only end one of them, so without
+/// this an idle app or target would pin the flow (and, on the exit, the DC's
+/// whole ICE/DTLS/SCTP socket set) forever.
 pub async fn run_flow(
     tcp: TcpStream,
     dc: Arc<RTCDataChannel>,
@@ -507,6 +585,7 @@ pub async fn run_flow(
     mut from_dc: mpsc::Receiver<Bytes>,
     on_local_eof: HalfCloseSink,
     stats: Arc<FlowStats>,
+    cancel: FlowCancel,
 ) -> CloseReason {
     // P3b-3: hold an `active_flows` gauge for this flow's pump lifetime
     // (no-op when not session-tracked). Drops on return AND on abort.
@@ -551,7 +630,7 @@ pub async fn run_flow(
     let resume_for_send = Arc::clone(&resume);
     let on_local_eof_for_send = Arc::clone(&on_local_eof);
     let stats_for_send = Arc::clone(&stats);
-    let tcp_to_dc = tokio::spawn(async move {
+    let mut tcp_to_dc = tokio::spawn(async move {
         pump_tcp_to_dc(
             read_half,
             dc_for_send,
@@ -565,12 +644,29 @@ pub async fn run_flow(
 
     // Spawn DC → TCP.
     let stats_for_recv = Arc::clone(&stats);
-    let dc_to_tcp = tokio::spawn(async move {
+    let mut dc_to_tcp = tokio::spawn(async move {
         pump_dc_to_tcp(write_half, &mut from_dc, flow_id, stats_for_recv).await
     });
 
-    let r1 = tcp_to_dc.await.unwrap_or(CloseReason::IoError);
-    let r2 = dc_to_tcp.await.unwrap_or(CloseReason::IoError);
+    // #2129 — race the two pumps against the session's cancellation. The
+    // pumps end themselves on EOF / error; cancellation is the path for a
+    // session that ends while this flow is live, where neither pump can end
+    // on its own (one waits on a mailbox its own DC pins, the other on an
+    // idle `read`). On cancel, abort both — dropping each pump's TcpStream
+    // half closes the local socket in BOTH directions, so the app/target
+    // sees EOF or RST with no CLOSE-WAIT left behind — and return, releasing
+    // this flow's DC reference.
+    let (r1, r2) = tokio::select! {
+        pair = async {
+            let r1 = (&mut tcp_to_dc).await.unwrap_or(CloseReason::IoError);
+            let r2 = (&mut dc_to_tcp).await.unwrap_or(CloseReason::IoError);
+            (r1, r2)
+        } => pair,
+        _ = cancel.cancelled() => (CloseReason::ServerTerminated, CloseReason::ServerTerminated),
+    };
+    // Cancelled → stop both halves now; finished → both are already no-ops.
+    tcp_to_dc.abort();
+    dc_to_tcp.abort();
 
     // Log the final tallies before the logger task is aborted, so
     // the operator gets a one-shot summary of the flow's lifetime
@@ -587,7 +683,10 @@ pub async fn run_flow(
     );
     logger_handle.abort();
 
-    if matches!(r1, CloseReason::Eof) && matches!(r2, CloseReason::Eof) {
+    if matches!(r1, CloseReason::ServerTerminated) {
+        // #2129 — the session ended out from under a live flow.
+        CloseReason::ServerTerminated
+    } else if matches!(r1, CloseReason::Eof) && matches!(r2, CloseReason::Eof) {
         CloseReason::Eof
     } else {
         CloseReason::IoError
@@ -1256,6 +1355,140 @@ mod tests {
 
         assert_eq!(received.len(), payload.len(), "received length mismatch");
         assert_eq!(received, payload, "received payload mismatch");
+    }
+
+    /// #2129 — a WebRTC-DC flow whose session ends mid-stream ends on BOTH
+    /// ends, even when the app and the target are idle. A live, idle TCP pair
+    /// sits on each side of a real flow; cancelling the session must make both
+    /// `run_flow` tasks return AND both local TCP endpoints see EOF/RST within
+    /// ~2 s — not hang forever on a mailbox that can never close
+    /// (`pump_dc_to_tcp`) or a `read` that never completes (`pump_tcp_to_dc`).
+    /// Run under a timeout so a regression fails red instead of hanging.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_flow_ends_on_both_ends_when_its_session_is_cancelled() {
+        let offerer = TunnelPeer::new(vec![]).await.unwrap();
+        let answerer = TunnelPeer::new(vec![]).await.unwrap();
+        let answerer_pc = answerer.peer_connection();
+        offerer.on_local_ice_candidate(move |c| {
+            let pc = Arc::clone(&answerer_pc);
+            Box::pin(async move {
+                if let Some(c) = c
+                    && let Ok(init) = c.to_json()
+                {
+                    let _ = pc.add_ice_candidate(init).await;
+                }
+            })
+        });
+        let offerer_pc = offerer.peer_connection();
+        answerer.on_local_ice_candidate(move |c| {
+            let pc = Arc::clone(&offerer_pc);
+            Box::pin(async move {
+                if let Some(c) = c
+                    && let Ok(init) = c.to_json()
+                {
+                    let _ = pc.add_ice_candidate(init).await;
+                }
+            })
+        });
+        let offer = offerer.create_offer().await.unwrap();
+        let answer = answerer.accept_offer(&offer.sdp).await.unwrap();
+        offerer.accept_answer(&answer.sdp).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), offerer.wait_pool_open())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), answerer.wait_pool_open())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A live, idle TCP pair on EACH end: `app` ↔ the client's local side,
+        // `target` ↔ the exit's dst side. The test holds `app`/`target`, so
+        // when `run_flow` drops its half the held end sees EOF/RST.
+        let client_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let mut app = tokio::net::TcpStream::connect(client_addr).await.unwrap();
+        let (client_tcp, _) = client_listener.accept().await.unwrap();
+
+        let exit_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let exit_addr = exit_listener.local_addr().unwrap();
+        let mut target = tokio::net::TcpStream::connect(exit_addr).await.unwrap();
+        let (exit_tcp, _) = exit_listener.accept().await.unwrap();
+
+        let flow_id = 1;
+        let client_demux = FlowDemux::install(offerer.dc(0).unwrap(), None).await;
+        let (client_from_dc, client_stats) = client_demux.register(flow_id).await;
+        let exit_demux = FlowDemux::install(answerer.dc(0).unwrap(), None).await;
+        let (exit_from_dc, exit_stats) = exit_demux.register(flow_id).await;
+
+        // One canceller per side — as the client carrier and the exit peer
+        // each own one.
+        let client_cancel = FlowCanceller::new();
+        let exit_cancel = FlowCanceller::new();
+        let noop: HalfCloseSink = Arc::new(|_fid: u32| {});
+
+        let mut client_flow = tokio::spawn(run_flow(
+            client_tcp,
+            offerer.dc(0).unwrap(),
+            flow_id,
+            client_from_dc,
+            noop.clone(),
+            client_stats,
+            client_cancel.handle(),
+        ));
+        let mut exit_flow = tokio::spawn(run_flow(
+            exit_tcp,
+            answerer.dc(0).unwrap(),
+            flow_id,
+            exit_from_dc,
+            noop,
+            exit_stats,
+            exit_cancel.handle(),
+        ));
+
+        // Idle: neither flow ends on its own.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !client_flow.is_finished(),
+            "client flow must not end while idle"
+        );
+        assert!(
+            !exit_flow.is_finished(),
+            "exit flow must not end while idle"
+        );
+
+        // End the session on both ends through the new mechanism.
+        client_cancel.cancel();
+        exit_cancel.cancel();
+
+        let (c_reason, e_reason, app_eof, tgt_eof) =
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let c = (&mut client_flow).await.unwrap();
+                let e = (&mut exit_flow).await.unwrap();
+                let mut b = [0u8; 1];
+                let app_eof = matches!(app.read(&mut b).await, Ok(0) | Err(_));
+                let tgt_eof = matches!(target.read(&mut b).await, Ok(0) | Err(_));
+                (c, e, app_eof, tgt_eof)
+            })
+            .await
+            .expect("both flows must end within 2 s of cancellation");
+
+        assert!(
+            matches!(c_reason, CloseReason::ServerTerminated),
+            "client flow reports the session teardown, got {c_reason:?}"
+        );
+        assert!(
+            matches!(e_reason, CloseReason::ServerTerminated),
+            "exit flow reports the session teardown, got {e_reason:?}"
+        );
+        assert!(
+            app_eof,
+            "the app must see EOF/RST on the client's local socket"
+        );
+        assert!(
+            tgt_eof,
+            "the target must see EOF/RST on the exit's dst socket"
+        );
     }
 
     /// Most basic FlowDemux smoke: install, register a flow_id,
