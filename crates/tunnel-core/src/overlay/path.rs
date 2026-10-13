@@ -395,6 +395,12 @@ struct PeerPath {
     /// on every `install_peers` walk by the runtime, the only party holding
     /// both the candidate and the snapshot ([`PathMonitor::on_lan_capture`]).
     lan_captured: bool,
+    /// #2089 — which direct tiers had a dialable candidate at the last
+    /// [`PathMonitor::decide`]. Display only: `decide` takes availability
+    /// fresh on every call, and this copy exists so [`PathMonitor::explain`]
+    /// can tell a tier that is merely unpenalised (eligible) from one that is
+    /// actually on the ballot. `None` until the first decision.
+    avail: Option<TierAvailability>,
 }
 
 fn tier_idx(tier: DirectTier) -> Option<usize> {
@@ -977,6 +983,7 @@ impl PathMonitor {
                     tier,
                     eligible,
                     blocked_by,
+                    available: p.and_then(|p| p.avail).map(|a| a.has(tier)),
                     base: base(tier),
                     q: tier_idx(tier)
                         .and_then(|i| p.map(|p| p.tiers[i].q.get()))
@@ -1026,6 +1033,10 @@ impl PathMonitor {
         now: Instant,
         demote_on: bool,
     ) -> PathAction {
+        // #2089 — kept for `explain` only; nothing below reads it back. A
+        // default entry reads the same zeros as an absent one, so creating it
+        // changes no decision.
+        self.peers.entry(*peer).or_default().avail = Some(avail);
         if let Incumbent::Direct(cur) = incumbent {
             // B2 — a live direct incumbent is kept UNLESS a sustained
             // margin-sized score deficit demotes it (voluntary MBB probe,
@@ -1377,6 +1388,12 @@ pub(crate) struct TierExplain {
     pub(crate) tier: DirectTier,
     pub(crate) eligible: bool,
     pub(crate) blocked_by: Option<BlockedBy>,
+    /// #2089 — did the tier have a dialable candidate at the last decision?
+    /// `decide` only considers a tier that is available AND eligible, and an
+    /// untried tier carries no penalty, so `eligible` alone reads "yes" for a
+    /// tier there is nothing to dial on. `None` before the first decision;
+    /// the relay tier is always available once known.
+    pub(crate) available: Option<bool>,
     pub(crate) base: f64,
     pub(crate) q: f64,
     pub(crate) penalty: f64,
@@ -1663,6 +1680,45 @@ mod tests {
             "the penalty must be reported, not just named"
         );
         assert!(e.relayed_instead_s.is_none(), "no peer window is open here");
+    }
+
+    /// #2089 — a tier with nothing to dial is UNAVAILABLE, and `explain` says
+    /// so. Before, it read only "eligible" (an untried tier has no penalty)
+    /// with the best score, while `decide` never considered it: a NATed
+    /// CORPLAP-3 showed `public yes 330` on a pair sitting on relay.
+    #[test]
+    fn explain_reports_a_tier_with_no_candidate_as_unavailable() {
+        let mut m = PathMonitor::default();
+        let a = oid(1);
+        let t0 = Instant::now();
+        assert!(
+            m.explain(&a, t0)
+                .tiers
+                .iter()
+                .all(|t| t.available.is_none()),
+            "before any decision the monitor does not know, and says so"
+        );
+
+        let behind_nat = TierAvailability {
+            lan: false,
+            public: false,
+            srflx: true,
+        };
+        let action = m.decide(&a, Incumbent::Relay, behind_nat, true, t0, false);
+        let e = m.explain(&a, t0);
+        let get = |tier| *e.tiers.iter().find(|t| t.tier == tier).unwrap();
+        let public = get(DirectTier::Public);
+        assert!(
+            public.eligible,
+            "untried, so unpenalised: the misleading half"
+        );
+        assert_eq!(public.available, Some(false), "and nothing to dial");
+        assert_eq!(get(DirectTier::Lan).available, Some(false));
+        assert_eq!(get(DirectTier::Srflx).available, Some(true));
+        assert_eq!(get(DirectTier::Relay).available, Some(true));
+        // The selector agrees with the new column: it never proposes public.
+        assert_ne!(action, PathAction::Probe(DirectTier::Public));
+        assert_ne!(action, PathAction::Install(DirectTier::Public));
     }
 
     /// FR-33 P2 — a LAN capture on THIS host refuses the LAN tier outright,

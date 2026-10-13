@@ -1879,6 +1879,7 @@ impl OverlayRuntime {
                                 tier: path::tier_label(t.tier).to_string(),
                                 eligible: t.eligible,
                                 blocked_by: t.blocked_by.map(|b| b.as_str().to_string()),
+                                available: t.available,
                                 base: t.base,
                                 q: t.q,
                                 penalty: t.penalty,

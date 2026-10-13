@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow, bail};
 use tunnel_core::localapi::{
     self, ConnectionType, DaemonMode, DeviceRowLite, FlowInfo, FlowKind, NodeStatus, PeerInfo,
-    RouteInfo, RouteState,
+    RouteInfo, RouteState, TierWhy,
 };
 
 use crate::names::{self, NamedPeer, Need, Resolution};
@@ -696,16 +696,10 @@ fn print_why(p: &PeerInfo) {
     println!();
     println!("  TIER      ELIGIBLE  SCORE   = BASE  + Q      - PENALTY   WHY NOT");
     for t in &w.tiers {
-        println!(
-            "  {:<9} {:<9} {:>6.1} = {:>5.0} {:>+7.1} {:>10.1}   {}",
-            t.tier,
-            if t.eligible { "yes" } else { "no" },
-            t.score,
-            t.base,
-            t.q,
-            t.penalty,
-            t.blocked_by.as_deref().unwrap_or("")
-        );
+        println!("{}", why_tier_row(t));
+    }
+    if w.tiers.iter().any(|t| t.available == Some(false)) {
+        println!("  (— = no dialable candidate for that tier: nothing to try, whatever its score)");
     }
     println!();
     // The hold-downs, spelled out. Each of these is a legitimate reason the
@@ -763,6 +757,30 @@ fn print_why(p: &PeerInfo) {
     {
         println!("  No hold-down is active: every tier is eligible.");
     }
+}
+
+/// One row of the `why` TIER table. #2089 — a tier with no dialable
+/// candidate reads `—`, not `yes`, and WHY NOT says so: an untried tier has
+/// no penalty, so "eligible" alone made a NATed peer's `public` row look like
+/// the best tier the selector was ignoring, when it was never on the ballot.
+fn why_tier_row(t: &TierWhy) -> String {
+    let unavailable = t.available == Some(false);
+    let eligible = if unavailable {
+        "—"
+    } else if t.eligible {
+        "yes"
+    } else {
+        "no"
+    };
+    let why_not = match (unavailable, t.blocked_by.as_deref()) {
+        (true, Some(b)) => format!("no candidate, {b}"),
+        (true, None) => "no candidate".to_string(),
+        (false, b) => b.unwrap_or("").to_string(),
+    };
+    format!(
+        "  {:<9} {:<9} {:>6.1} = {:>5.0} {:>+7.1} {:>10.1}   {}",
+        t.tier, eligible, t.score, t.base, t.q, t.penalty, why_not
+    )
 }
 
 /// `roomler flows` — active forwards / SOCKS5 listeners + throughput. Empty on
@@ -2898,6 +2916,46 @@ fn route_state_word(s: &RouteState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tier_row(tier: &str, eligible: bool, available: Option<bool>) -> TierWhy {
+        TierWhy {
+            tier: tier.into(),
+            eligible,
+            blocked_by: (!eligible).then(|| "penalty".to_string()),
+            available,
+            base: 330.0,
+            q: 0.0,
+            penalty: 0.0,
+            score: 330.0,
+            fails: 0,
+        }
+    }
+
+    /// #2089 — the row that misled on 2026-10-11: `public` behind NAT is
+    /// unpenalised (eligible) but has nothing to dial. It must not read `yes`.
+    #[test]
+    fn why_row_says_no_candidate_instead_of_yes() {
+        let row = why_tier_row(&tier_row("public", true, Some(false)));
+        assert!(row.contains("no candidate"), "{row}");
+        assert!(!row.contains(" yes "), "{row}");
+        // Both facts at once: no candidate AND a penalty.
+        let both = why_tier_row(&tier_row("srflx", false, Some(false)));
+        assert!(both.contains("no candidate, penalty"), "{both}");
+    }
+
+    /// An available tier, and a daemon that predates the field, render
+    /// exactly as before.
+    #[test]
+    fn why_row_is_unchanged_when_available_or_unknown() {
+        for available in [Some(true), None] {
+            let row = why_tier_row(&tier_row("public", true, available));
+            assert_eq!(
+                row, "  public    yes        330.0 =   330    +0.0        0.0   ",
+                "{available:?}"
+            );
+            assert!(why_tier_row(&tier_row("lan", false, available)).ends_with("   penalty"));
+        }
+    }
 
     /// FR-93's lab saw a per-user Fedora daemon print "service (SYSTEM)". The
     /// label follows the account the daemon reports, and an older daemon,
