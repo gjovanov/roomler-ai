@@ -76,6 +76,11 @@ pub(crate) struct Target {
     pub v: u32,
     /// The harness's session id (a UUID): the allowlist's names.
     pub harness_session: String,
+    /// FR-90 P2f-3a — for a fork, the harness session it was made from: its
+    /// allowlist is the fork's ([`checkpoint::allowlist_of`]). Absent for every
+    /// other session, so a target of a build before it reads the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_of: Option<String>,
     /// The session's `CLAUDE_CONFIG_DIR` on this device.
     pub config_dir: PathBuf,
     /// Every file of the checkpoint, in path order; each arrives whole, in
@@ -145,6 +150,8 @@ pub(crate) struct Dest {
     pub sid: String,
     /// The harness's session id (a UUID).
     pub harness_session: String,
+    /// P2f-3a — for a fork, the harness session it was made from.
+    pub fork_of: Option<String>,
     pub config_dir: PathBuf,
     pub folder: PathBuf,
     pub state_dir: PathBuf,
@@ -201,7 +208,8 @@ pub(crate) fn plan(
     if last.files.len() > MAX_FILES {
         return Err(format!("{} files", last.files.len()));
     }
-    let allow = checkpoint::allowlist(&dest.harness_session).map_err(|e| e.to_string())?;
+    let allow = checkpoint::allowlist_of(&dest.harness_session, dest.fork_of.as_deref())
+        .map_err(|e| e.to_string())?;
     let mut files = Vec::with_capacity(last.files.len());
     let mut file_chunks = Vec::with_capacity(last.files.len());
     for f in &last.files {
@@ -240,6 +248,7 @@ pub(crate) fn plan(
         Target {
             v: TARGET_V,
             harness_session: dest.harness_session.clone(),
+            fork_of: dest.fork_of.clone(),
             config_dir: dest.config_dir.clone(),
             files,
             workspace,
@@ -319,6 +328,51 @@ fn packs_of(
         }
     }
     Err("the chain does not reach a whole pack of the workspace".into())
+}
+
+/// FR-90 P2f-3a — the parent's `chain` (oldest first) as a fork's first start
+/// puts it in place: the parent's own files ([`checkpoint::allowlist`]), each
+/// moved from the parent's project directory to the fork's with its name
+/// kept. So the parent's history becomes `projects/hive-<fork>/<parent>.jsonl`,
+/// where `--resume <parent> --fork-session` finds it under the fork's pinned
+/// project name, and its tool results stay where the history it is copied
+/// into names them, relative to the project directory. `CLAUDE.md` stays
+/// where it is. Every checkpoint is moved alike, so each file's chunks still
+/// follow one another.
+///
+/// What the parent holds of a session further back (a fork's own parent) is
+/// left out: the parent's history holds those turns already. The workspace is
+/// the parent's, which the fork's [`Dest`] puts in place under the fork's id.
+pub(crate) fn forked(
+    chain: &[Checkpoint],
+    parent: &str,
+    fork: &str,
+) -> Result<Vec<Checkpoint>, String> {
+    let own = checkpoint::allowlist(parent).map_err(|e| e.to_string())?;
+    // The fork's names hold too, and are never the parent's.
+    checkpoint::allowlist_of(fork, Some(parent)).map_err(|e| e.to_string())?;
+    let (from, to) = (
+        format!("projects/hive-{parent}/"),
+        format!("projects/hive-{fork}/"),
+    );
+    Ok(chain
+        .iter()
+        .map(|cp| Checkpoint {
+            files: cp
+                .files
+                .iter()
+                .filter(|f| allowed(&f.path, &own))
+                .map(|f| checkpoint::FileSnap {
+                    path: f
+                        .path
+                        .strip_prefix(&from)
+                        .map_or_else(|| f.path.clone(), |rest| format!("{to}{rest}")),
+                    ..f.clone()
+                })
+                .collect(),
+            ..cp.clone()
+        })
+        .collect())
 }
 
 /// Where the daemon reads the blobs: the session's store; a map in tests.
@@ -804,7 +858,7 @@ fn read_array<const N: usize>(r: &mut impl Read, what: &str) -> Result<[u8; N], 
 /// name out of order or outside the allowlist, one this OS cannot hold
 /// ([`names_refusal`]), or a workspace that names something that is not git's.
 pub(crate) fn refusal(target: &Target, os: Os) -> Option<String> {
-    let allow = match checkpoint::allowlist(&target.harness_session) {
+    let allow = match checkpoint::allowlist_of(&target.harness_session, target.fork_of.as_deref()) {
         Ok(a) => a,
         Err(e) => return Some(e.to_string()),
     };
@@ -1082,7 +1136,8 @@ impl Drop for Staged {
 /// through a link, and no deeper than a checkpoint looks.
 fn remove_unlisted(target: &Target) -> Result<usize, String> {
     let listed: HashSet<&str> = target.files.iter().map(|e| e.path.as_str()).collect();
-    let allow = checkpoint::allowlist(&target.harness_session).map_err(|e| e.to_string())?;
+    let allow = checkpoint::allowlist_of(&target.harness_session, target.fork_of.as_deref())
+        .map_err(|e| e.to_string())?;
     let mut removed = 0;
     for entry in &allow {
         let full = place_of(&target.config_dir, &entry.rel);
@@ -1167,6 +1222,7 @@ mod tests {
         Dest {
             sid: SID.into(),
             harness_session: HID.into(),
+            fork_of: None,
             config_dir: config.to_path_buf(),
             folder: config.with_file_name("work"),
             state_dir: config.with_file_name("state"),
@@ -1226,18 +1282,18 @@ mod tests {
         write(src, &history(), b"{\"t\":1}\n");
         write(src, &memory("a.md"), b"# a\n");
         write(src, "CLAUDE.md", b"# rules\n");
-        let (cp, b) = take(src, HID, 1, 1, &Previous::none()).unwrap();
+        let (cp, b) = take(src, HID, None, 1, 1, &Previous::none()).unwrap();
         keep(cp, b, &mut chain);
         write(src, &history(), b"{\"t\":1}\n{\"t\":2}\n");
         write(src, &memory("b.md"), b"# b\n");
         write(src, "CLAUDE.md", b"# rules, rewritten\n");
         let prev = Previous::from_checkpoint(chain.last().unwrap());
-        let (cp, b) = take(src, HID, 2, 2, &prev).unwrap();
+        let (cp, b) = take(src, HID, None, 2, 2, &prev).unwrap();
         keep(cp, b, &mut chain);
         std::fs::remove_file(place_of(src, &memory("a.md"))).unwrap();
         write(src, &history(), b"{\"t\":1}\n{\"t\":2}\n{\"t\":3}\n");
         let prev = Previous::from_checkpoint(chain.last().unwrap());
-        let (cp, b) = take(src, HID, 3, 3, &prev).unwrap();
+        let (cp, b) = take(src, HID, None, 3, 3, &prev).unwrap();
         keep(cp, b, &mut chain);
         (chain, blobs)
     }
@@ -1286,6 +1342,112 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    /// P2f-3a — a parent's chain, moved under a fork's names and put in
+    /// place: the parent's history where `--resume <parent> --fork-session`
+    /// finds it under the fork's project, its tool results beside it, the
+    /// memory and `CLAUDE.md`; nothing of a session further back. The fork's
+    /// target is held to the fork's allowlist: the same files are refused
+    /// for a plain session.
+    #[tokio::test]
+    async fn a_parents_chain_is_put_in_place_under_the_forks_names() {
+        const FORK: &str = "5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b";
+        const GRANDPARENT: &str = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+        // The parent (`HID`), itself a fork of `GRANDPARENT`: two turns.
+        let src = tempfile::tempdir().unwrap();
+        let s = src.path();
+        let p = format!("projects/hive-{HID}");
+        write(s, &history(), b"{\"t\":1}\n");
+        write(s, &format!("{p}/{HID}/tool-results/t1.txt"), b"big output");
+        write(s, &memory("a.md"), b"# a\n");
+        write(s, "CLAUDE.md", b"# rules\n");
+        write(s, &format!("{p}/{GRANDPARENT}.jsonl"), b"further back\n");
+        let mut blobs = HashMap::new();
+        let (one, b) = take(s, HID, Some(GRANDPARENT), 1, 1, &Previous::none()).unwrap();
+        blobs.extend(b.into_iter().map(|blob| (Digest::of(&blob), blob)));
+        write(s, &history(), b"{\"t\":1}\n{\"t\":2}\n");
+        let prev = Previous::from_checkpoint(&one);
+        let (two, b) = take(s, HID, Some(GRANDPARENT), 2, 2, &prev).unwrap();
+        blobs.extend(b.into_iter().map(|blob| (Digest::of(&blob), blob)));
+        let chain = vec![one, two];
+        assert!(
+            chain[1].files.iter().any(|f| f.path.contains(GRANDPARENT)),
+            "the parent keeps its own parent's history"
+        );
+
+        let moved = forked(&chain, HID, FORK).unwrap();
+        let names: Vec<&str> = moved
+            .iter()
+            .flat_map(|c| &c.files)
+            .map(|f| f.path.as_str())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .all(|p| *p == "CLAUDE.md" || p.starts_with(&format!("projects/hive-{FORK}/"))),
+            "every file under the fork's project: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|p| p.contains(GRANDPARENT)),
+            "nothing of a session further back: {names:?}"
+        );
+        let dst = tempfile::tempdir().unwrap();
+        let config = dst.path().join("claude");
+        // An older copy's: the fork's allowlist ends up exactly the checkpoint's.
+        write(
+            &config,
+            &format!("projects/hive-{FORK}/{HID}/tool-results/old.txt"),
+            b"stale\n",
+        );
+        let fork = Dest {
+            sid: SID.into(),
+            harness_session: FORK.into(),
+            fork_of: Some(HID.into()),
+            config_dir: config.clone(),
+            folder: dst.path().join("work"),
+            state_dir: dst.path().join("state"),
+        };
+        let Ok((target, planned)) = plan(&moved, &fork, &[]) else {
+            panic!("the fork's target holds the parent's files");
+        };
+        let mut bytes = Vec::new();
+        assert!(
+            write_frames(&mut bytes, &target, &planned, &Blobs::Map(&blobs))
+                .await
+                .is_ok()
+        );
+        materialize_from(&mut bytes.as_slice(), Os::this(), &Git::on_path())
+            .expect("the parent's copy put in place under the fork's names");
+        let f = format!("projects/hive-{FORK}");
+        let placed: Vec<String> = files_under(&config).into_keys().collect();
+        assert_eq!(
+            placed,
+            [
+                "CLAUDE.md".to_string(),
+                format!("{f}/{HID}.jsonl"),
+                format!("{f}/{HID}/tool-results/t1.txt"),
+                format!("{f}/memory/a.md"),
+            ],
+            "exactly the checkpoint's files"
+        );
+        assert_eq!(
+            std::fs::read(roomler_hive_node::launch::parent_history_in(
+                &config, FORK, HID
+            ))
+            .unwrap(),
+            b"{\"t\":1}\n{\"t\":2}\n",
+            "the parent's history, whole, where the fork's first launch reads it"
+        );
+        let plain = Dest {
+            fork_of: None,
+            ..fork
+        };
+        let Err(e) = plan(&moved, &plain, &[]) else {
+            panic!("a plain session's target took a fork's files");
+        };
+        assert!(e.contains("not in the allowlist"), "{e}");
+        assert!(forked(&chain, HID, HID).is_err(), "no fork of itself");
     }
 
     /// Materialized again over an older copy, the allowlist ends up exactly the
@@ -1394,6 +1556,7 @@ mod tests {
         let target = |against: Vec<String>| Target {
             v: TARGET_V,
             harness_session: HID.into(),
+            fork_of: None,
             config_dir: PathBuf::from("/c"),
             files: Vec::new(),
             workspace: Some(Workspace {
@@ -1455,6 +1618,7 @@ mod tests {
         let target = |paths: &[String]| Target {
             v: TARGET_V,
             harness_session: HID.into(),
+            fork_of: None,
             config_dir: dir.clone(),
             files: paths
                 .iter()
@@ -1497,6 +1661,7 @@ mod tests {
             v: REQUEST_V,
             sid: SID.into(),
             harness_session: HID.into(),
+            fork_of: None,
             config_dir: root.join("claude"),
             folder: root.join("work"),
             state_dir: root.join("state"),
@@ -1628,6 +1793,7 @@ mod tests {
             v: REQUEST_V,
             sid: SID.into(),
             harness_session: HID.into(),
+            fork_of: None,
             config_dir: root.join("claude"),
             folder: work.clone(),
             state_dir: root.join("state"),
@@ -2035,7 +2201,7 @@ mod tests {
             .collect();
         write(src.path(), &history(), &big);
         let prev = Previous::from_checkpoint(chain.last().unwrap());
-        let (cp, b) = take(src.path(), HID, 4, 4, &prev).unwrap();
+        let (cp, b) = take(src.path(), HID, None, 4, 4, &prev).unwrap();
         for blob in b {
             blobs.insert(Digest::of(&blob), blob);
         }

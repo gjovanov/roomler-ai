@@ -46,8 +46,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::hive::{
-    HARNESS_CLAUDE_CODE, HiveApprovalStatus, HiveDrainRefusal, HiveManifestEntry, HiveRefusal,
-    HiveRunState, HiveTurnStatus, hive_limits, promote_limits,
+    HARNESS_CLAUDE_CODE, HiveApprovalStatus, HiveDrainRefusal, HiveForkOf, HiveManifestEntry,
+    HiveRefusal, HiveRunState, HiveTurnStatus, hive_limits, promote_limits,
 };
 use roomler_ai_remote_control::signaling::ClientMsg;
 use roomler_hive_node::checkpoint::Checkpoint;
@@ -55,7 +55,7 @@ use roomler_hive_node::checkpoint::Checkpoint;
 use roomler_hive_node::launch::unix_base_env;
 use roomler_hive_node::launch::{
     APPROVE_TOOL, DISALLOWED_TOOLS, LaunchSpec, PERMISSION_MODE, SettingsSpec, attributed_prompt,
-    config_dir_in, history_path_in, toolbelt_mcp_config, user_input_line,
+    config_dir_in, history_path_in, parent_history_in, toolbelt_mcp_config, user_input_line,
 };
 use roomler_hive_node::stream_json::{Limits, parse_line};
 use roomler_hive_node::{TranscriptEvent, approval_outcome};
@@ -243,6 +243,11 @@ pub struct StartOrder {
     /// (`rc:hive.lease`). A start that says so is that word for its own
     /// connection.
     pub lease: bool,
+    /// FR-90 P2f-3a — the session this one is a fork of, as every start of a
+    /// fork carries it: at its first start here, the parent's copy is what
+    /// it starts from ([`Supervisor::put_fork_in_place`]); for its life, its
+    /// checkpoints keep the parent's history beside its own.
+    pub fork_of: Option<HiveForkOf>,
 }
 
 /// FR-90 P1e — a session's core memory, as `rc:hive.memory` carries it.
@@ -1629,6 +1634,38 @@ impl Supervisor {
                 format!("unknown harness {:?}", order.harness),
             );
         }
+        // P2f-3a — a fork stays one: a start that does not say so takes what
+        // this device hosts of it at this fence, so its checkpoints never
+        // drop the parent's history.
+        let adopted;
+        let order = match self
+            .hosted_get(order.session_id)
+            .filter(|h| h.fence == order.fence && order.fork_of.is_none())
+            .and_then(|h| h.fork_of)
+        {
+            Some(fork_of) => {
+                adopted = StartOrder {
+                    fork_of: Some(fork_of),
+                    ..order.clone()
+                };
+                &adopted
+            }
+            None => order,
+        };
+        // P2f-3a — a fork names another session, by ids its names can hold.
+        if let Some(parent) = &order.fork_of
+            && (parent.session_id == order.session_id
+                || roomler_hive_node::checkpoint::allowlist_of(
+                    &order.harness_session,
+                    Some(&parent.harness_session),
+                )
+                .is_err())
+        {
+            return Answer::refused(
+                HiveRefusal::Other,
+                "a fork must be made from another session, named by its ids",
+            );
+        }
         // Idempotent on session + fence: the start may be a re-send of one
         // whose answer was lost.
         if let Some(account) = self.running(order.session_id, order.fence) {
@@ -1781,9 +1818,28 @@ impl Supervisor {
             }
             None => order,
         };
+        // P2f-3a — a fork: at its first start here, put in place from its
+        // parent's copy; and told it is one at each launch that starts it
+        // from the parent's history, until it has a history of its own.
+        let fork_note = match &order.fork_of {
+            Some(parent) => {
+                let first = moved.is_none()
+                    && self
+                        .hosted_get(order.session_id)
+                        .is_none_or(|h| h.fence != order.fence);
+                match self
+                    .fork_in_place(order, parent, &account, &folder, &store, first)
+                    .await
+                {
+                    Ok(note) => note,
+                    Err(refused) => return refused,
+                }
+            }
+            None => None,
+        };
         // P2e-7 — a session from another device is told it moved, once: the
         // note goes to the harness through its `SessionStart` hook.
-        let note = match &moved {
+        let moved_note = match &moved {
             Some(m) if self.moved_from_elsewhere(m) => {
                 let open = last_open_call(&store, &order.session_id.to_hex()).await;
                 let from = resume_note::Provenance {
@@ -1795,6 +1851,10 @@ impl Supervisor {
                 Some(resume_note::compose(&from, &folder, open.as_deref()))
             }
             _ => None,
+        };
+        let note = match (fork_note, moved_note) {
+            (Some(fork), Some(moved)) => Some(format!("{fork}{moved}")),
+            (fork, moved) => fork.or(moved),
         };
         match self.launch(
             order,
@@ -1859,18 +1919,7 @@ impl Supervisor {
         store: &StoreHandle,
     ) -> Result<(), String> {
         let sid = order.session_id.to_hex();
-        let mut chain: Vec<Checkpoint> = Vec::new();
-        for env in store.of_kind(&sid, "checkpoint", MAX_CHAIN).await? {
-            match TranscriptEvent::from_json(&env.event_json) {
-                Some(TranscriptEvent::Checkpoint(c)) => chain.push(c),
-                _ => {
-                    return Err(format!(
-                        "event {} is no checkpoint this build reads",
-                        env.seq
-                    ));
-                }
-            }
-        }
+        let chain = chain_of(store, &sid).await?;
         let Some(last) = chain.last() else {
             return Err("this device's copy holds no checkpoint".into());
         };
@@ -1880,22 +1929,124 @@ impl Supervisor {
         };
         let done =
             materializer::materialize(&self.checkpoint_runner(), who, &chain, dest, &blobs).await?;
-        if let Some(ws) = &last.workspace {
-            match &done.workspace {
-                Some(placed) if placed.tree == ws.tree => {}
-                Some(placed) => {
-                    return Err(format!(
-                        "the folder is at tree {}, the copy's is {}",
-                        placed.tree, ws.tree
-                    ));
-                }
-                None => return Err("the folder was not put in place".into()),
-            }
-        }
+        held_to_tree(last, &done)?;
         info!(
             session = %order.session_id, fence = order.fence, checkpoint = last.n,
             files = done.files, removed = done.removed,
             "hive: the moved session's copy is in place"
+        );
+        Ok(())
+    }
+
+    /// P2f-3a — a fork's state here before it launches. At its first start
+    /// here (`first`: it was not moved here, nor is it hosted here at this
+    /// fence), with nothing of it on this device yet, its folder is asked as
+    /// a teleport's is, and its parent's copy is put in place under its ids
+    /// ([`Self::put_fork_in_place`]). `Ok(Some(note))` when the launch starts
+    /// it from the parent's history: what it is told then. `Ok(None)` once it
+    /// has a history of its own.
+    async fn fork_in_place(
+        &self,
+        order: &StartOrder,
+        parent: &HiveForkOf,
+        account: &str,
+        folder: &Path,
+        store: &StoreHandle,
+        first: bool,
+    ) -> Result<Option<String>, Answer> {
+        let (who, dest) = self.copy_place(order, account, folder).map_err(|e| {
+            warn!(session = %order.session_id, %e, "hive: where the fork goes is not known — its start is refused");
+            Answer::refused(
+                HiveRefusal::LaunchFailed,
+                "this device could not tell where the fork goes (its log says why)",
+            )
+        })?;
+        // The daemon only looks at the entries, never reads them (P1d-2).
+        let here = |p: PathBuf| std::fs::symlink_metadata(p).is_ok();
+        if here(history_path_in(&dest.config_dir, &order.harness_session)) {
+            return Ok(None);
+        }
+        let from = parent_history_in(
+            &dest.config_dir,
+            &order.harness_session,
+            &parent.harness_session,
+        );
+        if first && !here(from) {
+            if let Some(refused) = self.folder_refusal(order, account, "fork").await {
+                return Err(refused);
+            }
+            self.put_fork_in_place(order, parent, &who, &dest, store)
+                .await
+                .map_err(|(r, detail)| Answer::refused(r, detail))?;
+        }
+        let project = dest
+            .config_dir
+            .join("projects")
+            .join(format!("hive-{}", order.harness_session));
+        let saved = here(project.join(&parent.harness_session).join("tool-results"))
+            .then_some((parent.harness_session.as_str(), project.as_path()));
+        let from = parent_folder(store, &parent.session_id.to_hex()).await;
+        Ok(Some(resume_note::compose_fork(
+            from.as_deref(),
+            folder,
+            saved,
+        )))
+    }
+
+    /// P2f-3a — a fork's first start here: the last checkpoint of the
+    /// session it is made from, as this device's copy holds it, put in place
+    /// AS THE ACCOUNT under the fork's ids ([`materializer::forked`]): the
+    /// parent's history, sub-agent transcripts and tool results under the
+    /// fork's project name, the memory and `CLAUDE.md`, and the folder
+    /// through the account's own git under the fork's refs. That checkpoint
+    /// is where the fork is made; the server's half sees to this device's
+    /// copy being current. Nothing to make it from is refused in words for
+    /// the server; a failure to put it in place is said in this device's log,
+    /// where what it names (the account's own files) stays.
+    async fn put_fork_in_place(
+        &self,
+        order: &StartOrder,
+        parent: &HiveForkOf,
+        who: &materializer::Who,
+        dest: &materializer::Dest,
+        store: &StoreHandle,
+    ) -> Result<(), (HiveRefusal, String)> {
+        let psid = parent.session_id.to_hex();
+        let failed = |why: String| {
+            warn!(session = %order.session_id, parent = %psid, %why, "hive: the fork's copy was not put in place — its start is refused");
+            (
+                HiveRefusal::LaunchFailed,
+                "this device could not put the fork's copy in place (its log says why)".to_string(),
+            )
+        };
+        let chain = chain_of(store, &psid).await.map_err(failed)?;
+        let Some(last) = chain.last() else {
+            return Err((
+                HiveRefusal::Other,
+                "this device holds no copy of the session the fork is made from".to_string(),
+            ));
+        };
+        let history = format!("projects/hive-{0}/{0}.jsonl", parent.harness_session);
+        if !last.files.iter().any(|f| f.path == history) {
+            return Err((
+                HiveRefusal::Other,
+                "the session the fork is made from has no conversation to fork yet".to_string(),
+            ));
+        }
+        let moved = materializer::forked(&chain, &parent.harness_session, &order.harness_session)
+            .map_err(failed)?;
+        let blobs = materializer::Blobs::Store {
+            store,
+            session: &psid,
+        };
+        let done = materializer::materialize(&self.checkpoint_runner(), who, &moved, dest, &blobs)
+            .await
+            .map_err(failed)?;
+        held_to_tree(last, &done).map_err(failed)?;
+        info!(
+            session = %order.session_id, fence = order.fence, parent = %psid,
+            checkpoint = last.n, turn = last.turn, files = done.files, removed = done.removed,
+            "hive: the fork's copy is in place, made from its parent's"
         );
         Ok(())
     }
@@ -2021,7 +2172,7 @@ impl Supervisor {
             // before anything moves: the moved start would refuse it after
             // the lease moved.
             if let Some(account) = answer.account.as_deref()
-                && let Some(refused) = self.folder_refusal(order, account).await
+                && let Some(refused) = self.folder_refusal(order, account, "teleport").await
             {
                 return refused;
             }
@@ -2042,8 +2193,14 @@ impl Supervisor {
     /// sibling folder for the person to make and teleport into instead, when
     /// it would be under `hive_roots`. Nothing is made for them. A folder that
     /// cannot be asked about is refused too, in words: the moved start would
-    /// ask the same git.
-    async fn folder_refusal(&self, order: &StartOrder, account: &str) -> Option<Answer> {
+    /// ask the same git. P2f-3a — and a fork's, at its first start: `what`
+    /// names which, for the person.
+    async fn folder_refusal(
+        &self,
+        order: &StartOrder,
+        account: &str,
+        what: &str,
+    ) -> Option<Answer> {
         // The gates passed: it resolves.
         let folder = gates::folder_for(&self.cfg, &order.folder).ok()?;
         let (who, dest) = match self.copy_place(order, account, &folder) {
@@ -2082,12 +2239,12 @@ impl Supervisor {
         });
         let detail = match sibling {
             Some(s) => format!(
-                "{why}; make a sibling, e.g. `git worktree add {}`, and teleport there",
+                "{why}; make a sibling, e.g. `git worktree add {}`, and {what} there",
                 s.display()
             ),
             None => why,
         };
-        info!(session = %order.session_id, folder = %dest.folder.display(), %detail, "hive: a teleport refused: its folder holds work of its own");
+        info!(session = %order.session_id, folder = %dest.folder.display(), %detail, "hive: a {what} refused: its folder holds work of its own");
         Some(Answer::refused(HiveRefusal::FolderDirty, detail))
     }
 
@@ -2988,6 +3145,10 @@ impl Supervisor {
             resume: false,
             replicated: h.replicated,
             lease: h.lease,
+            // P2f-3a — a fork resumes as one: its checkpoints keep its
+            // parent's history, and before its first prompt it still starts
+            // from it.
+            fork_of: h.fork_of,
         };
         let answer = self.start_locked(order, true).await;
         if answer.refused.is_some() {
@@ -3664,13 +3825,21 @@ impl Supervisor {
                     // a primary's join that found no record yet set it.
                     replicated: replicated.load(Ordering::SeqCst),
                     lease,
+                    fork_of: order.fork_of.clone(),
                 });
-                moved.map(|m| Resumed {
-                    turns: m.turns,
-                    cut: None,
-                    approvals: Vec::new(),
-                    history,
-                })
+                moved
+                    .map(|m| m.turns)
+                    // P2f-3a — a fork's first launch resumes its parent's
+                    // history: like a resumed process's, its first turn
+                    // reports no cost rather than one counted from the
+                    // parent's running total.
+                    .or(order.fork_of.as_ref().map(|_| 0))
+                    .map(|turns| Resumed {
+                        turns,
+                        cut: None,
+                        approvals: Vec::new(),
+                        history,
+                    })
             }
         };
         // Up and waiting for its first prompt.
@@ -3809,18 +3978,14 @@ impl Supervisor {
             mcp_config: Some(mcp_config),
             sidecar_base_url: sidecar.map(|port| format!("http://127.0.0.1:{port}/s/{sid}")),
             resume: order.resume,
+            fork_of: None,
             permission_prompt_tool: Some(APPROVE_TOOL.to_string()),
             permission_mode: Some(PERMISSION_MODE.to_string()),
             disallowed_tools: DISALLOWED_TOOLS.iter().map(|t| t.to_string()).collect(),
         };
         spec.validate()
             .map_err(|e| (HiveRefusal::LaunchFailed, e.to_string()))?;
-        // P1d-2 — the session's own history decides, for every launch (a
-        // resume, and a start the server re-sent after a crash): Claude Code
-        // refuses `--session-id` for an id whose history exists, and
-        // `--resume` for one without. The daemon only looks at the entry,
-        // never reads or follows it; the harness reads it as the account.
-        spec.resume = order.resume || std::fs::symlink_metadata(spec.history_path()).is_ok();
+        decide_history(&mut spec, order)?;
 
         let mut cmd = tokio::process::Command::new("/bin/sh");
         // P1e — the core memory, into the daemon's own directory; the wrapper
@@ -3874,6 +4039,7 @@ impl Supervisor {
                 owner,
                 env: unix_base_env(&home, account, Some(&path)),
                 harness_session: spec.session.clone(),
+                fork_of: order.fork_of.as_ref().map(|f| f.harness_session.clone()),
                 config_dir: spec.config_dir(),
                 folder: spec.folder.clone(),
                 state_dir: spec.state_dir.clone(),
@@ -3902,7 +4068,8 @@ impl Supervisor {
                 child,
                 token,
                 toolbelt,
-                history: spec.resume,
+                // P2f-3a — a fork's first launch resumes its parent's.
+                history: spec.resume || spec.fork_of.is_some(),
                 checkpoints,
             }),
             // The toolbelt goes with the failed start: dropping it removes
@@ -3988,13 +4155,14 @@ impl Supervisor {
             mcp_config: Some(mcp_config),
             sidecar_base_url: sidecar.map(|port| format!("http://127.0.0.1:{port}/s/{sid}")),
             resume: order.resume,
+            fork_of: None,
             permission_prompt_tool: Some(APPROVE_TOOL.to_string()),
             permission_mode: Some(PERMISSION_MODE.to_string()),
             disallowed_tools: DISALLOWED_TOOLS.iter().map(|t| t.to_string()).collect(),
         };
         spec.validate()
             .map_err(|e| (HiveRefusal::LaunchFailed, e.to_string()))?;
-        spec.resume = order.resume || std::fs::symlink_metadata(spec.history_path()).is_ok();
+        decide_history(&mut spec, order)?;
         let line = hive_win::harness_command_line(&spec.harness, &spec.args())
             .map_err(|e| (HiveRefusal::LaunchFailed, e))?;
         // P2e-7 — as on Unix; the directory's DACL hands it to the user.
@@ -4041,6 +4209,7 @@ impl Supervisor {
                 owner: None,
                 env: Vec::new(),
                 harness_session: spec.session.clone(),
+                fork_of: order.fork_of.as_ref().map(|f| f.harness_session.clone()),
                 config_dir: spec.config_dir(),
                 folder: spec.folder.clone(),
                 state_dir: spec.state_dir.clone(),
@@ -4051,7 +4220,8 @@ impl Supervisor {
                 child: hive_win::HarnessChild::new(child, job),
                 token,
                 toolbelt,
-                history: spec.resume,
+                // P2f-3a — a fork's first launch resumes its parent's.
+                history: spec.resume || spec.fork_of.is_some(),
                 checkpoints,
             }),
             Err(e) => {
@@ -4247,6 +4417,50 @@ async fn last_open_call(store: &StoreHandle, sid: &str) -> Option<String> {
     (!answered).then(|| resume_note::describe_call(&name, &input))
 }
 
+/// P2e-5 — the checkpoints of session `sid` this device's store holds,
+/// oldest first: what a copy of it is put in place from.
+async fn chain_of(store: &StoreHandle, sid: &str) -> Result<Vec<Checkpoint>, String> {
+    let mut chain = Vec::new();
+    for env in store.of_kind(sid, "checkpoint", MAX_CHAIN).await? {
+        match TranscriptEvent::from_json(&env.event_json) {
+            Some(TranscriptEvent::Checkpoint(c)) => chain.push(c),
+            _ => {
+                return Err(format!(
+                    "event {} is no checkpoint this build reads",
+                    env.seq
+                ));
+            }
+        }
+    }
+    Ok(chain)
+}
+
+/// P2e-5 — the folder a materialize put in place, held to `last`'s tree.
+fn held_to_tree(last: &Checkpoint, done: &materializer::Done) -> Result<(), String> {
+    let Some(ws) = &last.workspace else {
+        return Ok(());
+    };
+    match &done.workspace {
+        Some(placed) if placed.tree == ws.tree => Ok(()),
+        Some(placed) => Err(format!(
+            "the folder is at tree {}, the copy's is {}",
+            placed.tree, ws.tree
+        )),
+        None => Err("the folder was not put in place".into()),
+    }
+}
+
+/// P2f-3a — where the session a fork is made from last ran, as this device's
+/// copy of it says: the folder of its newest `system/init`. `None` when the
+/// copy holds none, or is not here.
+async fn parent_folder(store: &StoreHandle, sid: &str) -> Option<String> {
+    let init = store.last_of_kind(sid, "session_init").await.ok()??;
+    match TranscriptEvent::from_json(&init.event_json) {
+        Some(TranscriptEvent::SessionInit { cwd, .. }) => cwd.filter(|c| !c.is_empty()),
+        _ => None,
+    }
+}
+
 /// `dir/name`, whole: written to a temporary name created afresh at `0600`
 /// (never through a link, nor into a file an earlier run left there),
 /// handed to `owner` through the open file, then renamed into place — so it
@@ -4381,8 +4595,6 @@ fn harness_path(home: &Path) -> String {
     )
 }
 
-/// P2e-5 — a moved session's places under its account's `home`: where its
-/// harness runs from, which its copy is put in place at.
 /// FR-90 P2f-2d — where a teleport refused for its folder's own work could
 /// go instead: `<folder>-hive-<the session id's last 8 digits>`, beside it
 /// (design §6.3). The last digits, not the first: those are the id's
@@ -4394,16 +4606,52 @@ fn sibling_for(folder: &Path, session: ObjectId) -> Option<PathBuf> {
     Some(folder.with_file_name(format!("{name}-hive-{}", &hex[hex.len() - 8..])))
 }
 
+/// P2e-5 — a moved session's places under its account's `home`: where its
+/// harness runs from, which its copy is put in place at. P2f-3a — a fork's
+/// are its own, held to its allowlist.
 fn copy_dest(order: &StartOrder, home: &Path, folder: &Path) -> materializer::Dest {
     let sid = order.session_id.to_hex();
     let state_dir = session_state_dir(home, &sid);
     materializer::Dest {
         harness_session: order.harness_session.clone(),
+        fork_of: order.fork_of.as_ref().map(|f| f.harness_session.clone()),
         config_dir: config_dir_in(&state_dir),
         folder: folder.to_path_buf(),
         state_dir,
         sid,
     }
+}
+
+/// P1d-2 — what a launch resumes, decided for every launch (a resume, and a
+/// start the server re-sent after a crash) by the session's own history:
+/// Claude Code refuses `--session-id` for an id whose history exists, and
+/// `--resume` for one without. P2f-3a — a fork with no history of its own
+/// yet starts from its parent's, put in place under its project name at its
+/// first start (`--resume <parent> --fork-session --session-id`); one whose
+/// parent's history is not here either is refused, never started empty: the
+/// person asked for that conversation. The daemon only looks at the entries,
+/// never reads or follows them; the harness reads them as the account.
+fn decide_history(spec: &mut LaunchSpec, order: &StartOrder) -> Result<(), (HiveRefusal, String)> {
+    let own = std::fs::symlink_metadata(spec.history_path()).is_ok();
+    spec.resume = order.resume || own;
+    spec.fork_of = order
+        .fork_of
+        .as_ref()
+        .filter(|_| !own)
+        .map(|f| f.harness_session.clone());
+    // The parent's id is part of a path: held to a UUID before it is one.
+    spec.validate()
+        .map_err(|e| (HiveRefusal::LaunchFailed, e.to_string()))?;
+    if let Some(from) = spec.parent_history_path() {
+        spec.resume = false;
+        if std::fs::symlink_metadata(from).is_err() {
+            return Err((
+                HiveRefusal::LaunchFailed,
+                "the conversation this fork starts from is not on this device".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The turn in progress.
@@ -5555,17 +5803,29 @@ pub(crate) mod tests {
     /// does (measured): the response, the interrupted marker as a user
     /// message, a `result` that is an error. `DEAFME` reads its interrupt
     /// and holds on regardless, until the folder holds a `.release` file.
+    ///
+    /// P2f-3a — like Claude Code (2.1.296, probed) it takes `--resume <parent>
+    /// --fork-session --session-id <id>`: the parent's history, under this
+    /// session's pinned project name, becomes the start of `<id>`'s own at
+    /// its first prompt, and the parent's is left as it was. No parent
+    /// history there: "No conversation found".
     pub(crate) const FAKE_HARNESS: &str = r#"#!/bin/sh
 [ -f "$CLAUDE_CONFIG_DIR/CLAUDE.md" ] && cp "$CLAUDE_CONFIG_DIR/CLAUDE.md" "$PWD/.claude_md"
 [ -f "$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/memory/MEMORY.md" ] && cp "$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/memory/MEMORY.md" "$PWD/.memory_md"
 printf '%s\n' "$@" > "$PWD/.argv"
 echo $$ > "$PWD/.pid"
-mode=""; sid=""; prev=""
+mode=""; sid=""; prev=""; parent=""; fork=""
 for a in "$@"; do
   case "$prev" in --session-id|--resume) mode="$prev"; sid="$a" ;; esac
+  case "$prev" in --resume) parent="$a" ;; esac
+  case "$a" in --fork-session) fork=1 ;; esac
   prev="$a"
 done
 hist="$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/$sid.jsonl"
+from="$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/$parent.jsonl"
+if [ -n "$fork" ] && [ ! -e "$from" ]; then
+  echo "No conversation found with session ID: $parent" >&2; exit 1
+fi
 if [ "$mode" = "--session-id" ] && [ -e "$hist" ]; then
   echo "Error: Session ID $sid is already in use." >&2; exit 1
 fi
@@ -5581,6 +5841,9 @@ while IFS= read -r line; do
       echo '{"type":"control_response","response":{"subtype":"success"}}'
       continue ;;
   esac
+  if [ -n "$fork" ] && [ ! -e "$hist" ]; then
+    mkdir -p "${hist%/*}" && cp "$from" "$hist"
+  fi
   mkdir -p "${hist%/*}" && printf '%s\n' "$line" >> "$hist"
   case "$line" in
     *crash*) echo "boom" >&2; exit 3 ;;
@@ -5702,11 +5965,16 @@ done
     /// P1d-2 — the rig's daemon goes down the way systemd stops it: told
     /// first, then every harness stopped by the same signal a moment later.
     async fn go_down(r: &Rig, sid: ObjectId) {
+        go_down_in(r, sid, &r.root.path().join("work")).await;
+    }
+
+    /// [`go_down`], for a session whose folder is `folder`.
+    async fn go_down_in(r: &Rig, sid: ObjectId, folder: &Path) {
         r.sup.begin_shutdown();
         // A turn can be `running` before the harness ran a line: the prompt
         // waits in its stdin, and an approval goes through the daemon's own
         // toolbelt.
-        let pid_file = r.root.path().join("work").join(".pid");
+        let pid_file = folder.join(".pid");
         let deadline = Instant::now() + Duration::from_secs(10);
         let pid: i32 = loop {
             if let Some(pid) = std::fs::read_to_string(&pid_file)
@@ -5812,6 +6080,7 @@ done
             harness_started: None,
             replicated: false,
             lease: false,
+            fork_of: None,
         };
         f(&mut h);
         Hosted::load(r.root.path().join(HOSTED_FILE), TEST_AGENT).put(h);
@@ -5862,6 +6131,7 @@ done
             resume: false,
             replicated: false,
             lease: false,
+            fork_of: None,
         }
     }
 
@@ -7739,6 +8009,7 @@ done
             harness_started: Some("an earlier process".into()),
             replicated: false,
             lease: false,
+            fork_of: None,
         };
         reap_leftover(&h).await;
         h.harness_started = None;
@@ -9681,6 +9952,448 @@ done
         );
         r.sup.stop(sid, 2, "owner".into());
         until_ended(&mut r, sid).await;
+    }
+
+    /// P2f-3a — the harness id of the rig's forks.
+    const FORK_HID: &str = "5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b";
+
+    /// P2f-3a — [`moving_rig`], with a second folder under `hive_roots`,
+    /// `work2`, for a fork to run in beside its parent's `work`.
+    fn forking_rig(me: ObjectId) -> Rig {
+        use super::super::checkpointer::Runner;
+        rig_with(
+            true,
+            4,
+            |cfg| {
+                let work2 = cfg.roots[0].with_file_name("work2");
+                std::fs::create_dir_all(&work2).unwrap();
+                cfg.roots.push(work2);
+            },
+            |mut s| {
+                // The rig's root is under /tmp: git's discovery stops there.
+                s.checkpoint_runner = Some(Runner::InProcess {
+                    ceiling: PathBuf::from("/tmp"),
+                });
+                s.agent_id = Some(me);
+                s
+            },
+        )
+    }
+
+    /// P2f-3a — a fork of `parent` into `work2`, as the server starts it.
+    fn forked_from(r: &Rig, parent: &StartOrder) -> StartOrder {
+        StartOrder {
+            harness_session: FORK_HID.into(),
+            folder: r.root.path().join("work2").to_string_lossy().into(),
+            replicated: true,
+            fork_of: Some(HiveForkOf {
+                session_id: parent.session_id,
+                harness_session: parent.harness_session.clone(),
+            }),
+            ..order(r)
+        }
+    }
+
+    /// P2f-3a — `sid`'s checkpoints, as the store holds them.
+    fn chain_in(r: &Rig, sid: ObjectId) -> Vec<Checkpoint> {
+        r.store
+            .events(&sid.to_hex())
+            .into_iter()
+            .filter_map(|e| match e {
+                TranscriptEvent::Checkpoint(c) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// P2f-3a — the fake harness's argv in `folder` now.
+    fn argv_in(folder: &Path) -> Vec<String> {
+        std::fs::read_to_string(folder.join(".argv"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// P2f-3a — a fork's first start: the parent's last checkpoint, from this
+    /// device's copy, put in place under the fork's own ids, then a launch
+    /// that resumes the parent's conversation as a new one with the fork's
+    /// id. The fork remembers the parent's turns, counts its own from one,
+    /// is told it is a fork, and its own checkpoints keep the parent's
+    /// history beside its own; nothing of the parent changes. Once it has a
+    /// history of its own, it launches as any session does, and is told
+    /// nothing.
+    #[tokio::test]
+    async fn a_fork_starts_from_its_parents_copy_under_its_own_ids() {
+        let mut r = forking_rig(ObjectId::new());
+        let mut parent = order(&r);
+        parent.replicated = true;
+        let (psid, phid) = (parent.session_id, parent.harness_session.clone());
+        assert!(r.sup.start(parent.clone(), true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, psid).await.0, HiveRunState::Idle);
+        let home = r.root.path().join("home");
+        let pconfig = config_dir_in(&session_state_dir(&home, &psid.to_hex()));
+        let saved = pconfig.join(format!("projects/hive-{phid}/{phid}/tool-results/t1.txt"));
+        std::fs::create_dir_all(saved.parent().unwrap()).unwrap();
+        std::fs::write(&saved, "a long output\n").unwrap();
+        std::fs::write(
+            r.root.path().join("work").join("notes.md"),
+            "the parent's work\n",
+        )
+        .unwrap();
+        for text in ["hi", "again"] {
+            r.sup.prompt(psid, None, text.into()).unwrap();
+            assert_eq!(next_state(&mut r, psid).await.0, HiveRunState::Running);
+            assert_eq!(next_state(&mut r, psid).await.0, HiveRunState::Idle);
+        }
+        r.sup.stop(psid, 1, "owner".into());
+        until_ended(&mut r, psid).await;
+        let phistory = history_path_in(&pconfig, &phid);
+        let (parent_history, parent_chain) =
+            (std::fs::read(&phistory).unwrap(), chain_in(&r, psid));
+
+        let fork = forked_from(&r, &parent);
+        let fsid = fork.session_id;
+        assert_eq!(
+            r.sup.start(fork.clone(), true).await,
+            Answer::accepted("dev")
+        );
+        assert_eq!(next_state(&mut r, fsid).await.0, HiveRunState::Idle);
+        let fconfig = config_dir_in(&session_state_dir(&home, &fsid.to_hex()));
+        let fproject = fconfig.join(format!("projects/hive-{FORK_HID}"));
+        assert_eq!(
+            std::fs::read(fproject.join(format!("{phid}.jsonl"))).unwrap(),
+            parent_history,
+            "the parent's history, under the fork's project name"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fproject.join(format!("{phid}/tool-results/t1.txt"))).unwrap(),
+            "a long output\n"
+        );
+        let work2 = r.root.path().join("work2");
+        assert_eq!(
+            std::fs::read_to_string(work2.join("notes.md")).unwrap_or_default(),
+            "the parent's work\n",
+            "the parent's folder, in the fork's"
+        );
+        // Told it is a fork, through the hook its settings carry on a fork's
+        // launch as on a resume.
+        let run = r.root.path().join("run").join(fsid.to_hex());
+        let note = std::fs::read_to_string(run.join(resume_note::NOTE_FILE)).unwrap_or_default();
+        assert!(
+            note.starts_with("This session is a fork:"),
+            "told it is a fork: {note:?}"
+        );
+        assert!(
+            note.contains(&format!(
+                "Those turns worked in {}",
+                r.root.path().join("work").display()
+            )),
+            "{note:?}"
+        );
+        assert!(
+            note.contains(&format!(
+                "named hive-{phid} are under {} now",
+                fproject.display()
+            )),
+            "{note:?}"
+        );
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(run.join("settings.json")).unwrap())
+                .unwrap();
+        let matchers: Vec<&str> = settings["hooks"]["SessionStart"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|h| h["matcher"].as_str())
+            .collect();
+        assert_eq!(matchers, ["resume", "fork"], "{settings}");
+
+        r.sup.prompt(fsid, None, "recall".into()).unwrap();
+        let (turns, _, _) = reports_until(&mut r, fsid, HiveRunState::Idle).await;
+        assert_eq!(
+            turns.iter().map(|t| (t.turn, t.status)).collect::<Vec<_>>(),
+            [(1, HiveTurnStatus::Running), (1, HiveTurnStatus::Ok)],
+            "the fork counts its own turns"
+        );
+        let argv = argv_in(&work2);
+        assert!(
+            argv.windows(5).any(|w| w
+                == [
+                    "--resume",
+                    phid.as_str(),
+                    "--fork-session",
+                    "--session-id",
+                    FORK_HID
+                ]),
+            "{argv:?}"
+        );
+        assert!(
+            said(&r, fsid).contains(&"history: 3".to_string()),
+            "the parent's two prompts, then its own: {:?}",
+            said(&r, fsid)
+        );
+        let costs: Vec<Option<f64>> = r
+            .store
+            .events(&fsid.to_hex())
+            .into_iter()
+            .filter_map(|e| match e {
+                TranscriptEvent::Turn { cost_usd, .. } => Some(cost_usd),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            costs,
+            [None],
+            "its first turn claims no cost, as a resumed process's: the running total may \
+             have begun at its parent's"
+        );
+        assert!(notes(&r, fsid).contains(&note), "{:?}", notes(&r, fsid));
+        let fchain = chain_in(&r, fsid);
+        let last = fchain.last().expect("a checkpoint at the turn's end");
+        let paths: Vec<&str> = last.files.iter().map(|f| f.path.as_str()).collect();
+        for kept in [
+            format!("projects/hive-{FORK_HID}/{phid}.jsonl"),
+            format!("projects/hive-{FORK_HID}/{phid}/tool-results/t1.txt"),
+            format!("projects/hive-{FORK_HID}/{FORK_HID}.jsonl"),
+        ] {
+            assert!(paths.contains(&kept.as_str()), "{kept} in {paths:?}");
+        }
+        assert_eq!(
+            hosted_on_disk(&r)
+                .into_iter()
+                .find(|h| h.session == fsid.to_hex())
+                .and_then(|h| h.fork_of),
+            fork.fork_of,
+            "hosted as a fork"
+        );
+        assert_eq!(std::fs::read(&phistory).unwrap(), parent_history);
+        assert_eq!(
+            chain_in(&r, psid),
+            parent_chain,
+            "the parent's copy is as it was"
+        );
+        r.sup.stop(fsid, 1, "owner".into());
+        until_ended(&mut r, fsid).await;
+
+        // With a history of its own: a plain resume, and nothing to be told.
+        assert_eq!(
+            r.sup.start(at_fence(&fork, 2), true).await,
+            Answer::accepted("dev")
+        );
+        assert_eq!(next_state(&mut r, fsid).await.0, HiveRunState::Idle);
+        assert!(
+            !run.join(resume_note::NOTE_FILE).exists(),
+            "nothing to tell"
+        );
+        r.sup.prompt(fsid, None, "recall".into()).unwrap();
+        reports_until(&mut r, fsid, HiveRunState::Idle).await;
+        let argv = argv_in(&work2);
+        assert!(
+            argv.windows(2).any(|w| w == ["--resume", FORK_HID])
+                && !argv.iter().any(|a| a == "--fork-session" || *a == phid),
+            "{argv:?}"
+        );
+        assert!(
+            said(&r, fsid).contains(&"history: 4".to_string()),
+            "{:?}",
+            said(&r, fsid)
+        );
+        r.sup.stop(fsid, 2, "owner".into());
+        until_ended(&mut r, fsid).await;
+    }
+
+    /// P2f-3a — a fork's first start with nothing to make it from is
+    /// refused, in words, and launches nothing: no copy of the parent here;
+    /// a parent with no conversation yet; a fork of itself, by either id;
+    /// and a folder that holds work of its own, which keeps it.
+    #[tokio::test]
+    async fn a_fork_with_nothing_to_start_from_is_refused_and_launches_nothing() {
+        let mut r = forking_rig(ObjectId::new());
+        let work2 = r.root.path().join("work2");
+        let stranger = forked_from(&r, &order(&r));
+        assert_eq!(
+            r.sup.start(stranger.clone(), true).await,
+            Answer::refused(
+                HiveRefusal::Other,
+                "this device holds no copy of the session the fork is made from"
+            )
+        );
+        assert!(!r.sup.holds_live(stranger.session_id));
+        assert!(argv_in(&work2).is_empty(), "nothing launched");
+
+        // A copy whose checkpoint holds no conversation yet.
+        let mut quiet = order(&r);
+        quiet.replicated = true;
+        let qsid = quiet.session_id;
+        assert!(r.sup.start(quiet.clone(), true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, qsid).await.0, HiveRunState::Idle);
+        answered(drain(&r, qsid, 1)).await.expect("drained");
+        r.sup.stop(qsid, 1, "owner".into());
+        until_ended(&mut r, qsid).await;
+        let early = forked_from(&r, &quiet);
+        assert_eq!(
+            r.sup.start(early.clone(), true).await,
+            Answer::refused(
+                HiveRefusal::Other,
+                "the session the fork is made from has no conversation to fork yet"
+            )
+        );
+        assert!(!r.sup.holds_live(early.session_id));
+
+        const ITSELF: &str = "a fork must be made from another session, named by its ids";
+        let mut itself = forked_from(&r, &quiet);
+        itself.fork_of = Some(HiveForkOf {
+            session_id: itself.session_id,
+            harness_session: quiet.harness_session.clone(),
+        });
+        assert_eq!(
+            r.sup.start(itself, true).await,
+            Answer::refused(HiveRefusal::Other, ITSELF)
+        );
+        let mut same_harness = forked_from(&r, &quiet);
+        same_harness.harness_session = quiet.harness_session.clone();
+        assert_eq!(
+            r.sup.start(same_harness, true).await,
+            Answer::refused(HiveRefusal::Other, ITSELF)
+        );
+
+        // A folder holding the person's own work.
+        let parent = ran_twice(&mut r).await;
+        std::fs::write(work2.join("mine.txt"), "the person's own\n").unwrap();
+        let dirty = forked_from(&r, &parent);
+        let answer = r.sup.start(dirty.clone(), true).await;
+        assert_eq!(answer.refused, Some(HiveRefusal::FolderDirty), "{answer:?}");
+        assert!(!r.sup.holds_live(dirty.session_id));
+        assert_eq!(
+            std::fs::read_to_string(work2.join("mine.txt")).unwrap(),
+            "the person's own\n"
+        );
+        assert!(argv_in(&work2).is_empty(), "nothing launched");
+    }
+
+    /// P2f-3a — the argv in `folder` of a harness that names `id`, once it
+    /// has started. A fork's folder holds its parent's tree, and with it the
+    /// parent's harness's `.argv` and `.pid`.
+    async fn argv_naming(folder: &Path, id: &str) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let argv = argv_in(folder);
+            if argv.iter().any(|a| a == id) {
+                return argv;
+            }
+            assert!(Instant::now() < deadline, "the harness never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// P2f-3a — [`go_down`], the harness named by what the device hosts of
+    /// `sid`, not by its folder's `.pid`: a fork's folder holds its parent's.
+    async fn go_down_hosted(r: &Rig, sid: ObjectId) {
+        r.sup.begin_shutdown();
+        let pid = hosted_on_disk(r)
+            .into_iter()
+            .find(|h| h.session == sid.to_hex())
+            .and_then(|h| h.harness_pid)
+            .expect("the harness's pid, as hosted");
+        // SAFETY: a signal to the fake harness's own process group.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while r.sup.holds_live(sid) {
+            assert!(Instant::now() < deadline, "the session never let go");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// P2f-3a — a fork the device went down with before its first prompt
+    /// resumes as it was put in place: from its parent's history again, told
+    /// again, and nothing made again from the parent's copy, so it stays
+    /// where it was made. With its parent's history gone, it is not resumed:
+    /// never started empty.
+    #[tokio::test]
+    async fn a_fork_restarted_before_its_first_prompt_starts_from_its_parent_again() {
+        let mut r = forking_rig(ObjectId::new());
+        let parent = ran_twice(&mut r).await;
+        let fork = forked_from(&r, &parent);
+        let fsid = fork.session_id;
+        let work2 = r.root.path().join("work2");
+        assert_eq!(
+            r.sup.start(fork.clone(), true).await,
+            Answer::accepted("dev")
+        );
+        assert_eq!(next_state(&mut r, fsid).await.0, HiveRunState::Idle);
+        argv_naming(&work2, FORK_HID).await;
+        // What a copy made again would put back.
+        std::fs::remove_file(work2.join("notes.md")).unwrap();
+        let note = r
+            .root
+            .path()
+            .join("run")
+            .join(fsid.to_hex())
+            .join(resume_note::NOTE_FILE);
+
+        go_down_hosted(&r, fsid).await;
+        std::fs::remove_file(work2.join(".argv")).unwrap();
+        std::fs::remove_file(&note).unwrap();
+        restart(&mut r, |_| {});
+        let (_, manifest) = until_manifest(&mut r).await;
+        assert_eq!(manifest, [(fsid, 1)], "resumed as hosted");
+        let argv = argv_naming(&work2, FORK_HID).await;
+        assert!(
+            argv.windows(5).any(|w| w
+                == [
+                    "--resume",
+                    parent.harness_session.as_str(),
+                    "--fork-session",
+                    "--session-id",
+                    FORK_HID
+                ]),
+            "{argv:?}"
+        );
+        assert!(
+            std::fs::read_to_string(&note)
+                .unwrap_or_default()
+                .starts_with("This session is a fork:"),
+            "told again"
+        );
+        assert!(
+            !work2.join("notes.md").exists(),
+            "nothing made again from the parent's copy"
+        );
+
+        go_down_hosted(&r, fsid).await;
+        std::fs::remove_file(work2.join(".argv")).unwrap();
+        let home = r.root.path().join("home");
+        let fconfig = config_dir_in(&session_state_dir(&home, &fsid.to_hex()));
+        std::fs::remove_file(parent_history_in(
+            &fconfig,
+            FORK_HID,
+            &parent.harness_session,
+        ))
+        .unwrap();
+        restart(&mut r, |_| {});
+        let (seen, manifest) = until_manifest(&mut r).await;
+        assert!(manifest.is_empty(), "not resumed: {manifest:?}");
+        let why = seen
+            .into_iter()
+            .find_map(|m| match m {
+                ClientMsg::HiveState {
+                    session_id,
+                    state: Some(HiveRunState::Ended),
+                    detail,
+                    ..
+                } if session_id == fsid => detail,
+                _ => None,
+            })
+            .expect("reported ended");
+        assert!(
+            why.contains("the conversation this fork starts from is not on this device"),
+            "{why}"
+        );
+        assert!(argv_in(&work2).is_empty(), "nothing launched");
+        assert!(hosted_on_disk(&r).is_empty(), "forgotten");
     }
 
     /// P2e-6a — a ready prepare names where this device's copy of the session

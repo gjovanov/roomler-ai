@@ -37,6 +37,7 @@
 
 use std::path::{Path, PathBuf};
 
+use roomler_ai_remote_control::hive::HiveForkOf;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -97,6 +98,13 @@ pub(crate) struct HostedSession {
     /// on its own word as it always did.
     #[serde(default)]
     pub lease: bool,
+    /// FR-90 P2f-3a — the session this one is a fork of: its checkpoints keep
+    /// the parent's history beside its own, and until its own history exists
+    /// a launch starts from the parent's. Absent for every other session, and
+    /// in a file from before. ⚠️ A daemon before P2f-3a resumes a fork as a
+    /// plain session: one never prompted starts empty there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_of: Option<HiveForkOf>,
 }
 
 /// A turn in progress.
@@ -311,6 +319,7 @@ mod tests {
             harness_started: None,
             replicated: false,
             lease: false,
+            fork_of: None,
         }
     }
 
