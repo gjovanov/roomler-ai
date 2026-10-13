@@ -19,8 +19,8 @@
 //!   kernel reuses a framebuffer id for a new buffer once the old one is gone;
 //! - [`SAMPLE_ROWS`] rows spread down the picture hash the same as they did. A
 //!   compositor that flips twice between two reads (A → B → A) shows the same
-//!   buffer again with new pixels, and a change of any size crosses a sampled
-//!   row;
+//!   buffer again with new pixels, and the rows see any change that crosses
+//!   one of them;
 //! - the last frame delivered is younger than [`MAX_SKIP`]. A change that
 //!   crosses no sampled row waits at most that long: FR-29's bound for X11.
 //!
