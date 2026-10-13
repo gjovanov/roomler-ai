@@ -110,7 +110,7 @@ fn same_desktop(prev: &DesktopBrief, next: &DesktopBrief) -> bool {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::pick::seen_session;
-    use crate::capture::{CaptureArm, arm_facts, planned_arm};
+    use crate::capture::{CaptureArm, arm_facts, planned_arm, planned_input_route};
     use roomler_ai_remote_control::models::DesktopBrief;
 
     /// The brief now. `prev` (the last one) lends its input reach when nothing
@@ -124,9 +124,10 @@ mod linux {
             .as_deref()
             .and_then(|all| seen_session(all, root, uid));
         let kind = seen.map_or("none", |s| s.kind.as_str()).to_string();
-        let arm = planned_arm(&arm_facts(sessions.as_deref(), root, uid, kind == "x11"));
-        let portal_input = matches!(arm, Some(CaptureArm::Portal | CaptureArm::Mutter))
-            && tunnel_core::env::flag("PORTAL_INPUT", false);
+        let facts = arm_facts(sessions.as_deref(), root, uid, kind == "x11");
+        let arm = planned_arm(&facts);
+        // FR-93 P4 — the RemoteDesktop route that arm would open, if any.
+        let route = planned_input_route(&facts);
         let mut next = DesktopBrief {
             session: seen.map_or("none", |s| s.class.as_str()).to_string(),
             kind,
@@ -136,7 +137,7 @@ mod linux {
         };
         next.input_reach = match prev {
             Some(p) if super::same_desktop(p, &next) => p.input_reach.clone(),
-            _ => crate::input::reach::predicted(portal_input, next.kind == "wayland")
+            _ => crate::input::reach::predicted(route, next.kind == "wayland")
                 .reach
                 .wire()
                 .to_string(),

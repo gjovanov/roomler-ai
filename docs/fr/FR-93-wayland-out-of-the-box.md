@@ -422,6 +422,16 @@ once a session is allowed.
   may remove the keysym-not-in-keymap drop (FR-45 #1132).
 - uinput per-output mapping once §4.4 lists CRTCs; fractional scaling verified on `wlab-gnome` at 125 %/150 %.
 
+**As built (P4a, 2026-10-13): mutter's RemoteDesktop, over D-Bus.** The helper creates the RemoteDesktop session
+first and names it in the screencast's `remote-desktop-session-id`, so the session starts the screencast and
+takes the viewer's input: absolute motion addressed to the recorded stream, buttons, the wheel (flag 2, a wheel,
+since mutter assumes a touchpad finger otherwise) and evdev keycodes (`portal/input.rs` `MutterCall`;
+mechanics in [`linux-capture.md`](../linux-capture.md) §5.2). The automatic mutter arm carries it, kill switch
+`mutter_input`; a configured `mutter_capture` arm carries it only with `portal_input`. `ConnectToEIS` was not
+needed. The D-Bus `Notify*` calls reach native Wayland windows on GNOME 50, and gnome-remote-desktop's own move to
+libei leaves them in place. Not in P4a: the portal's input on KDE (still `portal_input`), layouts, and per-output
+mapping.
+
 ### 4.6 Session lifecycle (P5)
 
 The §4.1 watcher re-selects the arm, instead of today's error → backoff → reopen. Each cell must recover
@@ -483,6 +493,7 @@ bridge for text and images in the lab before deciding.
 | **P3** | DRM hardening (§4.4 b–f) | `ROOMLERD_DRM_CURSOR=0`, `ROOMLERD_DRM_IDLE_SKIP=0` | lab, Asahi | M |
 | **P3g** | tiled scanout via EGL import | `ROOMLERD_DRM_EGL=0` | the x86 cell (D3) | L |
 | **P4** | Mutter RemoteDesktop input, layouts, per-output mapping (§4.5) | `ROOMLERD_MUTTER_INPUT=0` | lab, WSL2 | M |
+| ↳ P4a | mutter's own RemoteDesktop drives the mutter screencast and takes the viewer's input; the route carries its kind, so `rc:input-reach` and the brief name it | `mutter_input` | ✅ lab (`3f9ad6464`), GNOME 50 per-user, no key, the AC4 oracle. **🔴 0.4.131:** the picture, and 0 events at the probe, all 7 input checks failed. **P4a:** all 7 passed: the three points exact, click, wheel down, "hello 123", Shift+a as "A"; the brief `input_reach=full`. `mutter_input = false` gives the view-only arm back | S |
 | **P5** | lifecycle (§4.6) | — | lab | M |
 | **P6** | consent and indicator (§4.7) | FR-27's switches | lab GNOME + KDE | M |
 | **P7** | clipboard (§4.8) | `ROOMLERD_SESSION_CLIPBOARD=0` | lab | M |
@@ -566,6 +577,9 @@ New cells run three times before they are trusted. An entry in `expected-failure
   the dialog answered by the harness).
 - [ ] **AC4** — input reaches a **native** Wayland client (the probe log): pointer within ±2 px at three points,
   click, scroll sign, typed ASCII, a held modifier — on GNOME (both install types) and KDE.
+  ⏳ GNOME per-user: ✅ in the lab on P4a (`3f9ad6464`), all 7 checks, 🔴 first on 0.4.131 (0 events). Owed: a
+  released build, and KDE per-user, whose only native path is the portal's input (`portal_input`, a grant at
+  the screen) or KWin's EIS grant (step log 26).
 - [ ] **AC5** — the remote cursor is visible in the viewer on DRM and mutter/portal sessions.
 - [ ] **AC6** — every refusal names its reason in the viewer; no black stream, no "headless" for a seat with a
   session. Each refusal row shown red on 0.4.124 first.
@@ -645,6 +659,7 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-12 | `wlab-kde` (4 cores) | 0.4.130, then P2d-1 `bbb065e` | P2d-1: one viewer, three sessions in ~60 s plus the viewer's watchdog, nobody answering; then an answer (`linux-capture.md` §4.6) | 🔴 0.4.130 ×2: 4 requests, 4 helpers alive at once, the third session never answered, then `watchdog-of-watchdog … forcing exit(2)`. ✅ P2d-1 ×2: 1 request, 1 helper, `NRestarts=0`. ✅ An answer while a session waits: the capture 1.6 s later, one request in all. ✅ An answer after the last session left: dropped. Step log 46 |
 | 2026-10-13 | `wlab-kde` (per-user, `portal_capture`) | 0.4.131, then master `b5871e47f`; prod's viewer `hosted-20261012-f07ba2c` | P2d-2: one viewer, nobody answers for 75 s, then the lab answers (`linux-capture.md` §4.7) | 🔴 0.4.131: 5 sessions (4 re-creates), the notice in 0 of 51 samples, the answer landed with no session live, and the picture came 48 s later from the restore token. ✅ P2d-2: 1 session, the notice in every sample until the answer, the capture about 2 s after the click in that session, 1 request. Step log 52 |
 | 2026-10-13 | `wlab-kde` (per-user, no capture key), `wlab-gnome` (per-user) | 0.4.131, then P2d-3 `ba6ab497f` | P2d-3: the flip (`linux-capture.md` §1.2) | 🔴 0.4.131: brief `capture_arm=none`; a session reads `wayland_not_enabled`, 0 requests, no dialog. ✅ P2d-3: brief `portal`; one dialog, the viewer told at +2 s, and after the lab's answer the picture in that session (`lit=81.7 %`, "desktop portal · allowed at the screen"); the next session on the restore token in 85 ms; with the screen locked, KDE's lock screen from the token, which survived; `wayland_auto = false`: `wayland_not_enabled` with the new hint; GNOME per-user: still mutter, `lit=90.0 %`, no portal request. Step log 53 |
+| 2026-10-13 | `wlab-gnome` (per-user, no key) | 0.4.131, then P4a `3f9ad6464` | P4a / AC4: the lab's input oracle (`measure/viewer-input.sh … points`) against the probe, a native GTK4 window (`linux-capture.md` §5.2) | 🔴 0.4.131: the picture, 0 events at the probe, all 7 input checks failed, brief `input_reach=none`. ✅ P4a: all 7 passed (three points exact, click, wheel down, "hello 123", Shift+a as "A"), brief `full`. ✅ `mutter_input = false`: view-only again, 0 events. A wrong turn, kept: the first kill-switch run wrote the key while 0.4.131 ran, and its shutdown save erased it (#2078). Step log 54 |
 
 ## 12. Related
 

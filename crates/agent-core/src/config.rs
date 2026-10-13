@@ -1020,6 +1020,18 @@ pub struct AgentConfig {
     /// required.
     #[serde(default)]
     pub wayland_auto: Option<bool>,
+    /// FR-93 P4 — a mutter screencast is driven by mutter's own RemoteDesktop,
+    /// which takes the viewer's mouse and keyboard (`ROOMLERD_MUTTER_INPUT`).
+    /// Built-in default: **ON**.
+    ///
+    /// It asks nobody, like the mutter screencast it drives, so it follows that
+    /// arm: the automatic one (`wayland_auto`, a per-user GNOME session) carries
+    /// input; a configured one (`mutter_capture`) carries it only with
+    /// `portal_input` too, input staying opt-in wherever the operator chose the
+    /// arm. `false` is the kill switch: mutter capture is view-only again, the
+    /// behaviour before P4. Restart required.
+    #[serde(default)]
+    pub mutter_input: Option<bool>,
     /// FR-29 — skip the XShm readback when XDAMAGE proves the screen is
     /// unchanged (`ROOMLERD_X11_DAMAGE`). Built-in default: ON; took a Linux
     /// host's idle capture from 45.8 % of a core to 2.8 %. Restart required.
@@ -2399,6 +2411,7 @@ pub fn test_fixture() -> AgentConfig {
         window_capture: None,
         wayland_aware: None,
         wayland_auto: None,
+        mutter_input: None,
         x11_damage: None,
         overlay_key_rotation: None,
         idle_refine_max_edge: None,
@@ -2561,7 +2574,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 86] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 87] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2598,6 +2611,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 86]
         ("WINDOW_CAPTURE", cfg.window_capture),
         ("WAYLAND_AWARE", cfg.wayland_aware),
         ("WAYLAND_AUTO", cfg.wayland_auto),
+        ("MUTTER_INPUT", cfg.mutter_input),
         ("X11_DAMAGE", cfg.x11_damage),
         ("OVERLAY_KEY_ROTATION", cfg.overlay_key_rotation),
         ("OVERLAY_QUIC", cfg.overlay_quic),

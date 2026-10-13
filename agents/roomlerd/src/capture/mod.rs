@@ -731,6 +731,11 @@ pub(crate) struct ArmFacts {
     pub portal: bool,
     /// `mutter_capture`: the portal arm runs on mutter's API instead.
     pub portal_via_mutter: bool,
+    /// `portal_input`: a portal (or configured mutter) arm carries input.
+    pub portal_input: bool,
+    /// FR-93 P4 — `mutter_input` (default on): a mutter arm's input rides
+    /// mutter's RemoteDesktop.
+    pub mutter_input: bool,
     /// The daemon captures its own Xvfb.
     pub virtual_desktop: bool,
     /// The session a controller would see is an X11 one.
@@ -767,6 +772,22 @@ pub(crate) fn planned_arm(f: &ArmFacts) -> Option<CaptureArm> {
     ((f.virtual_desktop || f.x11_session) && f.x11_built).then_some(CaptureArm::X11)
 }
 
+/// FR-93 P4 — the RemoteDesktop route a session opened now would register, in
+/// the arm's own terms: the automatic mutter arm carries mutter's input unless
+/// `mutter_input` is off; a configured mutter arm carries it with
+/// `portal_input` too; a portal arm (automatic or configured) carries the
+/// portal's with `portal_input`. `None`: the OS injector decides, as before.
+#[cfg(target_os = "linux")]
+pub(crate) fn planned_input_route(f: &ArmFacts) -> Option<crate::input::reach::RouteKind> {
+    use crate::input::reach::RouteKind;
+    match planned_arm(f)? {
+        CaptureArm::Mutter if f.auto_mutter => f.mutter_input.then_some(RouteKind::Mutter),
+        CaptureArm::Mutter => (f.portal_input && f.mutter_input).then_some(RouteKind::Mutter),
+        CaptureArm::Portal => f.portal_input.then_some(RouteKind::Portal),
+        CaptureArm::Drm | CaptureArm::X11 => None,
+    }
+}
+
 /// FR-93 P2b — gather [`ArmFacts`] the way [`open_with`] reads them. `sessions`
 /// is logind's list (read once by the caller); mutter, then the portal, are
 /// asked only when the plan is `Auto`, as the cascade asks them. The portal is
@@ -797,6 +818,10 @@ pub(crate) fn arm_facts(
     };
     #[cfg(not(feature = "portal-capture"))]
     let (auto_mutter, auto_portal) = (false, false);
+    #[cfg(feature = "portal-capture")]
+    let mutter_input = portal::mutter::input_enabled();
+    #[cfg(not(feature = "portal-capture"))]
+    let mutter_input = false;
     #[cfg(feature = "drm-capture")]
     let drm = drm_backend::env_enabled();
     #[cfg(not(feature = "drm-capture"))]
@@ -807,6 +832,8 @@ pub(crate) fn arm_facts(
         drm,
         portal: cfg!(feature = "portal-capture") && tunnel_core::env::flag("PORTAL_CAPTURE", false),
         portal_via_mutter: tunnel_core::env::flag("MUTTER_CAPTURE", false),
+        portal_input: tunnel_core::env::flag("PORTAL_INPUT", false),
+        mutter_input,
         virtual_desktop,
         x11_session,
         x11_built: cfg!(feature = "scrap-capture"),
@@ -833,11 +860,12 @@ fn open_auto_mutter(target_fps: u32) -> AutoMutter {
     if let Err(why) = portal::mutter::available() {
         return AutoMutter::NotGnome(why);
     }
-    // Input over the portal stays opt-in exactly as before: a WithInput grant
-    // is a separate dialog, and not yet field-proven to land (FR-45 P4).
+    // FR-93 P4 — mutter's own RemoteDesktop drives the screencast and takes the
+    // viewer's input. It asks nobody, like the screencast it drives, so it
+    // follows the arm: on unless `mutter_input = false`.
     let opts = PortalOpen {
         mutter: true,
-        input: tunnel_core::env::flag("PORTAL_INPUT", false),
+        input: portal::mutter::input_enabled(),
         window: false,
     };
     match PortalCapture::open_with(target_fps, opts) {
@@ -2288,7 +2316,10 @@ mod wayland_auto_tests {
             .iter()
             .map(|(k, _)| *k)
             .collect();
-        for key in super::CAPTURE_KEYS.iter().chain(["WAYLAND_AUTO"].iter()) {
+        for key in super::CAPTURE_KEYS
+            .iter()
+            .chain(["WAYLAND_AUTO", "MUTTER_INPUT"].iter())
+        {
             assert!(bridged.contains(key), "{key} is not in env_bridge_bools");
         }
     }
@@ -2414,6 +2445,84 @@ mod planned_arm_tests {
             planned_arm(&with_drm),
             Some(CaptureArm::Portal),
             "the automatic arm runs before the configured ones"
+        );
+    }
+
+    /// FR-93 P4 — the route a planned arm would open. The automatic mutter arm
+    /// carries mutter's input unless `mutter_input` is off; every other arm
+    /// keeps input opt-in (`portal_input`), as before P4.
+    #[test]
+    fn the_planned_input_route_follows_the_arm() {
+        use super::planned_input_route;
+        use crate::input::reach::RouteKind;
+        let auto = ArmFacts {
+            auto_mutter: true,
+            mutter_input: true,
+            ..built()
+        };
+        assert_eq!(planned_input_route(&auto), Some(RouteKind::Mutter));
+        let view_only = ArmFacts {
+            mutter_input: false,
+            ..auto
+        };
+        assert_eq!(planned_input_route(&view_only), None, "the kill switch");
+
+        let auto_portal = ArmFacts {
+            auto_portal: true,
+            mutter_input: true,
+            ..built()
+        };
+        assert_eq!(
+            planned_input_route(&auto_portal),
+            None,
+            "the portal's input is its own grant: still opt-in"
+        );
+        let auto_portal_input = ArmFacts {
+            portal_input: true,
+            ..auto_portal
+        };
+        assert_eq!(
+            planned_input_route(&auto_portal_input),
+            Some(RouteKind::Portal)
+        );
+
+        let configured_mutter = ArmFacts {
+            portal: true,
+            portal_via_mutter: true,
+            mutter_input: true,
+            ..built()
+        };
+        assert_eq!(
+            planned_input_route(&configured_mutter),
+            None,
+            "a configured arm keeps input opt-in"
+        );
+        let configured_mutter_input = ArmFacts {
+            portal_input: true,
+            ..configured_mutter
+        };
+        assert_eq!(
+            planned_input_route(&configured_mutter_input),
+            Some(RouteKind::Mutter)
+        );
+        assert_eq!(
+            planned_input_route(&ArmFacts {
+                mutter_input: false,
+                ..configured_mutter_input
+            }),
+            None
+        );
+
+        let drm = ArmFacts {
+            drm: true,
+            portal_input: true,
+            mutter_input: true,
+            ..built()
+        };
+        assert_eq!(
+            planned_input_route(&drm),
+            None,
+            "DRM's input is uinput's, not a route"
         );
     }
 
