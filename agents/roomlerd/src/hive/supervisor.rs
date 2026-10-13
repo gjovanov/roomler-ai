@@ -1909,6 +1909,22 @@ impl Supervisor {
         account: &str,
         folder: &Path,
     ) -> Result<(materializer::Who, materializer::Dest), String> {
+        let (home, who) = self.home_and_who(account)?;
+        Ok((who, copy_dest(order, &home, folder)))
+    }
+
+    /// P2f-2c — whom `account` runs as on this device, as a start resolves
+    /// it ([`Self::copy_place`]): what a pack for a member is made as once
+    /// the session does not run here.
+    #[cfg(unix)]
+    pub(super) fn who_for(&self, account: &str) -> Result<materializer::Who, String> {
+        self.home_and_who(account).map(|(_, who)| who)
+    }
+
+    /// The account's home, and whom it runs as, with that home's
+    /// environment.
+    #[cfg(unix)]
+    fn home_and_who(&self, account: &str) -> Result<(PathBuf, materializer::Who), String> {
         let (home, as_account) = match &self.launcher {
             Launcher::AsMappedAccount => (
                 crate::exec::account_home(account)?,
@@ -1918,13 +1934,11 @@ impl Supervisor {
             Launcher::AsDaemon { home } => (home.clone(), None),
         };
         let path = harness_path(&home);
-        Ok((
-            materializer::Who {
-                account: as_account,
-                env: unix_base_env(&home, account, Some(&path)),
-            },
-            copy_dest(order, &home, folder),
-        ))
+        let who = materializer::Who {
+            account: as_account,
+            env: unix_base_env(&home, account, Some(&path)),
+        };
+        Ok((home, who))
     }
 
     /// P2e-5 — on Windows, as the console user, whom `hive_accounts` must map
@@ -1945,6 +1959,18 @@ impl Supervisor {
             },
             copy_dest(order, &console.profile, folder),
         ))
+    }
+
+    /// P2f-2c — on Windows, as the console user `account` must map to: with
+    /// nobody signed in, there is nobody to make a pack as.
+    #[cfg(windows)]
+    pub(super) fn who_for(&self, account: &str) -> Result<materializer::Who, String> {
+        let console = crate::hive_win::console_user().map_err(|(_, e)| e)?;
+        crate::hive_win::check_mapping(account, &console).map_err(|(_, e)| e)?;
+        Ok(materializer::Who {
+            account: Some(account.to_string()),
+            env: Vec::new(),
+        })
     }
 
     /// P2e-6a — [`Self::prepare`]'s answer, and when ready, where this
@@ -3499,6 +3525,23 @@ impl Supervisor {
         // P2e-1 — dropped by the session's task once it has let go.
         let (gone_tx, gone) = watch::channel(());
         let workplace = Arc::new(checkpoints.workplace());
+        // P2f-2c — kept beyond this run: a member that asks for a whole pack
+        // once the session ended here is packed for from where it ran.
+        if let (Some(folder), Some(state_dir)) =
+            (workplace.folder.to_str(), workplace.state_dir.to_str())
+        {
+            let kept = roomler_hive_node::store::WorkplaceRecord {
+                account: account.to_string(),
+                folder: folder.to_string(),
+                state_dir: state_dir.to_string(),
+            };
+            let (store, sid) = (store.clone(), order.session_id.to_hex());
+            tokio::spawn(async move {
+                if let Err(e) = store.put_workplace(&sid, kept).await {
+                    warn!(session = %sid, %e, "hive: where the session runs could not be kept");
+                }
+            });
+        }
         self.live.lock().unwrap_or_else(|e| e.into_inner()).insert(
             order.session_id,
             Live {
@@ -5916,6 +5959,42 @@ done
         );
         assert!(
             matches!(&events[0], TranscriptEvent::UserMessage { author: Some(a), text } if a == "Dev" && text == "say hello")
+        );
+    }
+
+    /// P2f-2c — a launch keeps where the session is worked on: the account
+    /// it runs as, and the folder and state directory its checkpoints are
+    /// taken in. It outlives the run, so a member is still packed for once
+    /// the session ended here.
+    #[tokio::test]
+    async fn a_launch_keeps_where_the_session_is_worked_on() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert_eq!(r.sup.start(o, true).await, Answer::accepted("dev"));
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        let live = r.sup.workplace(sid).expect("it runs here");
+        let want = roomler_hive_node::store::WorkplaceRecord {
+            account: "dev".into(),
+            folder: live.folder.display().to_string(),
+            state_dir: live.state_dir.display().to_string(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let kept = r.store.workplace(&sid.to_hex()).await.unwrap();
+            if kept.is_some() || Instant::now() > deadline {
+                assert_eq!(kept.as_ref(), Some(&want), "kept at the launch");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+        assert!(r.sup.workplace(sid).is_none(), "it no longer runs here");
+        assert_eq!(
+            r.store.workplace(&sid.to_hex()).await.unwrap(),
+            Some(want),
+            "and outlives the run"
         );
     }
 

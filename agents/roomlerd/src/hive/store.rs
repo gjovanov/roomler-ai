@@ -29,7 +29,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc;
 
-use roomler_hive_node::store::{Membership, SearchHit, Store, StoreError, Substitute};
+use roomler_hive_node::store::{
+    Membership, SearchHit, Store, StoreError, Substitute, WorkplaceRecord,
+};
 use roomler_hive_node::{ChainTip, EventEnvelope, FenceEnd, TranscriptEvent};
 use tokio::sync::{broadcast, oneshot};
 use tracing::warn;
@@ -138,6 +140,22 @@ enum Member {
         session: String,
         commit: String,
         reply: Reply<Option<Substitute>>,
+    },
+    /// FR-90 P2f-2c — the whole packs kept only as substitutes.
+    StandIns {
+        session: String,
+        limit: usize,
+        reply: Reply<Vec<String>>,
+    },
+    /// FR-90 P2f-2c — where a session is worked on here.
+    PutWorkplace {
+        session: String,
+        workplace: WorkplaceRecord,
+        reply: Reply<()>,
+    },
+    Workplace {
+        session: String,
+        reply: Reply<Option<WorkplaceRecord>>,
     },
     Purge {
         session: String,
@@ -479,7 +497,6 @@ impl StoreHandle {
     }
 
     /// FR-90 P2f-2a — keep `sub` for `session`, its blobs kept first.
-    #[cfg_attr(not(all(test, unix)), allow(dead_code))] // P2f-2b's stream keeps them
     pub(crate) async fn put_substitute(
         &self,
         session: &str,
@@ -507,6 +524,46 @@ impl StoreHandle {
             reply,
         })
         .await
+    }
+
+    /// FR-90 P2f-2c — the commits of `session`'s whole packs kept here only
+    /// as substitutes, at most `limit`: what this copy cannot serve by blobs.
+    pub(crate) async fn stand_ins(
+        &self,
+        session: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, WriterError> {
+        let session = session.to_string();
+        self.ask(|reply| Member::StandIns {
+            session,
+            limit,
+            reply,
+        })
+        .await
+    }
+
+    /// FR-90 P2f-2c — keep where `session` is worked on here.
+    pub(crate) async fn put_workplace(
+        &self,
+        session: &str,
+        workplace: WorkplaceRecord,
+    ) -> Result<(), WriterError> {
+        let session = session.to_string();
+        self.ask(|reply| Member::PutWorkplace {
+            session,
+            workplace,
+            reply,
+        })
+        .await
+    }
+
+    /// FR-90 P2f-2c — where `session` was last worked on here.
+    pub(crate) async fn workplace(
+        &self,
+        session: &str,
+    ) -> Result<Option<WorkplaceRecord>, WriterError> {
+        let session = session.to_string();
+        self.ask(|reply| Member::Workplace { session, reply }).await
     }
 
     /// Purge `session` and keep its id; how many events were removed.
@@ -783,6 +840,23 @@ fn member(store: &mut Store, publish: &broadcast::Sender<Arc<EventEnvelope>>, cm
             reply,
         } => {
             let _ = reply.send(store.substitute(&session, &commit));
+        }
+        Member::StandIns {
+            session,
+            limit,
+            reply,
+        } => {
+            let _ = reply.send(store.stand_ins(&session, limit));
+        }
+        Member::PutWorkplace {
+            session,
+            workplace,
+            reply,
+        } => {
+            let _ = reply.send(store.put_workplace(&session, &workplace));
+        }
+        Member::Workplace { session, reply } => {
+            let _ = reply.send(store.workplace(&session));
         }
         Member::Purge { session, reply } => {
             let _ = reply.send(store.purge(&session));
