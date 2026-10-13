@@ -23,7 +23,7 @@ set, switches mutter on by itself, or the portal where mutter is absent (§1.2).
 
 ## 1. The cascade
 
-`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:1362`) tries the
+`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:1382`) tries the
 backends in this order and returns the first that opens. On Linux the Windows
 arms (SystemContext, WGC) do not exist, so the order is:
 
@@ -54,10 +54,10 @@ A per-user daemon in its own Wayland session, with no capture key set, runs
 
 | Arm | Reads | Sees a locked screen / the greeter | Asks the person at the screen | Needs | Default | Gate |
 |---|---|---|---|---|---|---|
-| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:1638`) |
-| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **no** — mutter refuses to create *or restore* a screencast while locked | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off**; automatic in a per-user Wayland session with no key where mutter is absent (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:1677`) |
+| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:1658`) |
+| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **no** — mutter refuses to create *or restore* a screencast while locked | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off**; automatic in a per-user Wayland session with no key where mutter is absent (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:1697`) |
 | **mutter direct** (`portal/mutter.rs`) | the same kind of PipeWire stream, from `org.gnome.Mutter.ScreenCast` | no (a session API) | **no** | GNOME's mutter on the user's session bus; no portal backend required | **off**; automatic in a per-user GNOME Wayland session with no key (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` **and** `ROOMLERD_MUTTER_CAPTURE=1` (`portal/backend.rs:62`) |
-| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:1746`), after the Xwayland guard (`mod.rs:1719`) |
+| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:1766`), after the Xwayland guard (`mod.rs:1739`) |
 
 Two things about the order are deliberate and worth defending when the next
 backend arrives:
@@ -74,7 +74,7 @@ backend arrives:
   screen). The portal is **attended**: defaulting it on would leave an
   unattended host waiting on a consent dialog nobody will answer — a hang
   dressed up as a feature. Both arms therefore log **loudly** when the operator
-  asked for them and they fell through (`mod.rs:1654`, `mod.rs:1694`), because
+  asked for them and they fell through (`mod.rs:1674`, `mod.rs:1714`), because
   silently serving X11 instead would look like the feature simply not working.
   Since FR-93 that error also travels: it becomes the session's `detail`
   (§1.1). And since FR-93 P2d-3 a per-user daemon in its own Wayland session,
@@ -97,18 +97,18 @@ and a different false thing per install type. Measured on the FR-93 lab
 
 Two changes stop both:
 
-- 🔑 **The Xwayland guard** (`mod.rs:1719`). Before scrap opens, the daemon
+- 🔑 **The Xwayland guard** (`mod.rs:1739`). Before scrap opens, the daemon
   asks the X server named by its `DISPLAY` whether it is Xwayland
-  (`x_server_is_xwayland`, `mod.rs:1049`). There are two signals, the same two
+  (`x_server_is_xwayland`, `mod.rs:1069`). There are two signals, the same two
   keep busy reads (FR-92): the `XWAYLAND` extension, which Xwayland has carried
   since 23.1, and before that its RandR monitors, all named `XWAYLAND<n>`. If
   it is Xwayland, scrap is refused, and the session gets a reason instead of
   black. The answer comes from the server, never from `XDG_SESSION_TYPE`, so a
   real Xorg and the daemon's own Xvfb are captured exactly as before.
 - 🔑 **The seat, not the daemon's environment, decides "headless"**
-  (`linux_no_pixels_code`, `mod.rs:966`). When every arm has failed and the
+  (`linux_no_pixels_code`, `mod.rs:986`). When every arm has failed and the
   daemon has no display variables, logind is asked whether a graphical session
-  is showing (`seat_shows_wayland`, `mod.rs:1033`, through
+  is showing (`seat_shows_wayland`, `mod.rs:1053`, through
   `companion::graphical_session`). A Wayland session there means
   `wayland_not_enabled`. No session at all means `no_display`, and that is now
   true.
@@ -131,7 +131,7 @@ because only root can read the scanout or create a uinput device:
 A failed arm is never told to "switch it on". It is already on, and its own
 error is the useful sentence.
 
-⚠️ **The probe dials Unix sockets only** (`x_server_query`, `mod.rs:1124`).
+⚠️ **The probe dials Unix sockets only** (`x_server_query`, `mod.rs:1144`).
 `x11rb::connect` falls back to TCP `localhost:6000+N` when the socket is
 missing. Under WSL2's mirrored networking a localhost connect to a closed port
 hangs instead of being refused, and systemd's `/tmp` handling there had hidden
@@ -193,9 +193,12 @@ flowchart TD
     MO -- no --> F["the cascade of §1, then backend_error<br/>with mutter's own reason"]
     M -- "no (not GNOME)" --> PD{"the portal serves ScreenCast?<br/>(detect_within, 5 s)"}
     PD -- no --> FP["the cascade of §1, then backend_error:<br/>the portal's status and what to install"]
-    PD -- yes --> PR["ONE request per host (§4.6);<br/>the viewer is told it waits (§4.7)"]
-    PR -- "shared now, or earlier (the restore token)" --> PO["portal, AUTOMATIC, ATTENDED"]
-    PR -- "refused, or nobody answered in 120 s" --> FR["the cascade of §1, then backend_error<br/>with the portal's own reason"]
+    PD -- yes --> PR["ONE request per host (§4.6), for remote control<br/>unless portal_input = false (P4b);<br/>the viewer is told it waits (§4.7)"]
+    PR -- "allowed now, or earlier (the restore token)" --> PO["portal, AUTOMATIC, ATTENDED,<br/>with the portal's input"]
+    PR -- "nobody answered in 120 s" --> FR["the cascade of §1, then backend_error<br/>with the portal's own reason"]
+    PR -- "remote control refused" --> PS["asked again, for the screen only:<br/>input never costs capture"]
+    PS -- shared --> PV["portal, AUTOMATIC, ATTENDED, view-only"]
+    PS -- "refused, or nobody answered" --> FR
 ```
 
 ⚠️ **The portal waited for P2d, although D1 asked for "the portal elsewhere" from
@@ -252,13 +255,46 @@ install, no capture key, no restore token), 2026-10-13:
 | `wayland_auto = false` | — | `wayland_not_enabled` again, now with the hint that names `roomler config clear wayland_auto`; no request, no dialog |
 | GNOME 50 per-user, the same build | — | mutter still first: "GNOME screencast · asks nobody", `lit=90.0 %`, no portal request |
 
-⚠️ **Input follows on GNOME, not on the portal.** From P4 the automatic mutter
-arm is driven by mutter's own RemoteDesktop, which takes the viewer's mouse and
-keyboard and reaches native Wayland windows (§5.2; kill switch `mutter_input`).
-Portal input stays opt-in (`portal_input`): it is a separate grant, with a
-restore token of its own. So a per-user KDE session shows its picture from P2d-3
-and still names its input reach (P1d), which is `none` unless KWin's
-input-emulation gate admits roomlerd.
+⚠️ **Input follows on both automatic arms.** From P4 the automatic mutter arm
+is driven by mutter's own RemoteDesktop, which takes the viewer's mouse and
+keyboard and asks nobody (§5.2; kill switch `mutter_input`). From P4b
+(operator, 2026-10-13) the automatic portal's one dialog asks for **remote
+control**, seeing and controlling, unless `portal_input = false`
+(`capture::auto_portal_input`). Nothing was granted there before, so the first
+dialog may as well ask for both. A configured `portal_capture` keeps input
+opt-in, because there a screen share may already be granted and would be asked
+again (§4.3).
+
+- **KDE's dialog** is titled *Remote Control* and names both privileges: *See
+  what's on the screen* and *Control input devices*. *Allow restoring* comes
+  ticked, and the answer is restored like a screen share's, from its own token
+  (`portal-restore-token-rd`).
+- **A person who refuses remote control is asked again, for the screen only**,
+  and a session they share runs view-only: input never costs capture (§4.3).
+  The refusal is not remembered, so the next session asks for remote control
+  again. `portal_input = false` makes the arm a screen share for good.
+
+**Measured** on the lab's KDE guest (Plasma 6.7 on Fedora 44, a per-user
+install, no capture key), 2026-10-13, by the AC4 oracle of §5.2 and a typing
+stress: 112 keystrokes, 40 of them the second of a doubled letter, typed at the
+oracle's 80 ms into the probe's focused text entry. The two candidates differ
+only in how the helper sends its calls (§4.3):
+
+| | calls unawaited (`fe0c3ae93`) | calls awaited (`9a8e20699`, then `64f00509f`) |
+|---|---|---|
+| the dialog | *Remote Control*: see the screen, control input devices | the same |
+| the next session | the restore token, no dialog | the same |
+| AC4 oracle: three pointer targets, a click, a wheel notch down, "hello 123", Shift+A | passed once, then typed `helo 123A` | **7/7, three times** |
+| typing stress, the entry's text | **41 of 452 characters wrong** over four runs (10, 17, 6, 8), KDE's input method on or off | **all 113 exact, four runs** |
+| one call, event to reply | not waited for | 0.5 ms median, under 4 ms at p99 |
+| the person denies remote control | — | KDE asks again, for the screen only; shared, the session runs view-only and its reach banner says to reconnect and allow remote control. The next session asks for remote control again |
+
+The two awaited builds differ only by a refactor (`Target::delivery`). The lab
+built each candidate before the branch was rebased onto master; the commits
+named carry the same diffs.
+
+The wheel notch went down only after the helper corrected KDE's negated smooth
+scroll (§4.3).
 
 ⚠️ **The recorder asks too.** `roomler record` opens the same cascade in its own
 process (FR-85), so on KDE the person at the console is asked once for their
@@ -293,10 +329,10 @@ all strings, so a newer agent's word reaches an older server as a word:
 | `type` | `wayland` · `x11` · `tty` · `none` | that session's type |
 | `desktop` | `gnome`, `KDE`, … (absent when logind names none) | logind's `Desktop` |
 | `capture_arm` | `mutter` · `drm` · `portal` · `x11` · `none` | the arm a session opened **now** would try first |
-| `input_reach` | `full` · `xwayland_only` · `none` | the `rc:input-reach` verdict (`input/reach.rs:260`), with the portal's input route predicted for a portal or mutter arm with `portal_input` on. ⚠️ **It never starts an X server.** GNOME starts Xwayland **on demand** for any client that connects, so on a Wayland desktop the brief connects only to an Xwayland already running (found in `/proc`), and with none it reads "no X server". It is also read again only when another field changed. The per-session `rc:input-reach` stays the authority |
+| `input_reach` | `full` · `xwayland_only` · `none` | the `rc:input-reach` verdict (`input/reach.rs:265`), with the portal's input route predicted for a portal or mutter arm with `portal_input` on. ⚠️ **It never starts an X server.** GNOME starts Xwayland **on demand** for any client that connects, so on a Wayland desktop the brief connects only to an Xwayland already running (found in `/proc`), and with none it reads "no X server". It is also read again only when another field changed. The per-session `rc:input-reach` stays the authority |
 
-`capture_arm` is `capture::planned_arm` (`capture/mod.rs:755`), a pure function
-that walks `open_with`'s own order (`:1270`). The two sit together in one file
+`capture_arm` is `capture::planned_arm` (`capture/mod.rs:758`), a pure function
+that walks `open_with`'s own order (`:1290`). The two sit together in one file
 because they must not drift:
 
 ```mermaid
@@ -468,9 +504,9 @@ Every portal method returns a `Request` path and answers later as a `Response`
 `:351`, `:376`): arming afterwards is a race the portal wins whenever it
 answers without asking anyone — exactly the restore-token case.
 
-The daemon side is `PortalCapture::open` (`portal/backend.rs:102`). It reads
+The daemon side is `PortalCapture::open` (`portal/backend.rs:106`). It reads
 the handshake under a **120 s deadline** (`HANDSHAKE_DEADLINE`,
-`backend.rs:368`) because a portal `Start` blocks until the dialog is answered
+`backend.rs:372`) because a portal `Start` blocks until the dialog is answered
 and `open_default` runs synchronously on a media-pump worker — an unanswered
 dialog fails the open with *"a consent dialog left unanswered, most likely"*
 and the cascade falls through, instead of parking that worker forever. Frames
@@ -506,10 +542,64 @@ helper's stdin (`portal/input_route.rs:113`), which the helper maps to
 stream's **logical** size, which differs from the pixel size under a HiDPI
 scale) and the axis calls (`portal/input.rs`).
 
-- ⚠️ `portal_input` defaults **OFF**: a `WithInput` session needs its own
-  consent grant and token, so defaulting it on would make every portal capture
-  — including one already granted and persisted — demand a fresh dialog, and
-  block or fall through if unanswered. Input must never cost capture.
+- ⚠️ On a **configured** portal arm `portal_input` defaults **OFF**: a
+  `WithInput` session needs its own consent grant and token, so defaulting it
+  on would make every portal capture — including one already granted and
+  persisted — demand a fresh dialog, and block or fall through if unanswered.
+  Input must never cost capture: a `WithInput` session that fails is retried
+  capture-only (`portal/mod.rs:502`). The **automatic** portal (§1.2) asks for
+  remote control unless `portal_input = false` (FR-93 P4b): nothing was granted
+  there before, so its first dialog may as well ask for both.
+- ⚠️⚠️ **Every call waits for its reply, and must keep doing so (FR-93 P4b).**
+  xdg-desktop-portal handles each portal method call on its own worker thread
+  (`HANDLE_METHOD_INVOCATIONS_IN_THREAD`, in its `xdp-context.c`), so two calls
+  sent back to back reach the backend in either order. FR-45's self-review had
+  made them fire-and-forget (`call_noreply`), for latency. On KDE that typed 41
+  of 452 characters wrong (§1.2): a key's release overtook its press, KWin
+  dropped the release because the key was not down, the key stayed held, and
+  the letter's next press was dropped as a repeat. A button's release overtaking
+  its press would hold a mouse button down the same way. The frontend forwards
+  each call to the backend before it replies, so waiting for the reply keeps the
+  order, for 0.5 ms a call at the median and under 4 ms at p99, against the
+  viewer's 8 ms floor between pointer moves (`Target::delivery`,
+  `portal/input.rs:348`; pinned by `portal_calls_wait_for_their_replies`).
+  Mutter's own RemoteDesktop (§5.2) answers on its main loop, in order, and
+  keeps fire-and-forget.
+
+  ```mermaid
+  sequenceDiagram
+      participant H as portal-helper
+      participant F as xdg-desktop-portal<br/>(a worker thread per call)
+      participant B as xdg-desktop-portal-kde
+      participant K as KWin
+      Note over H,K: unawaited, before P4b: "l" typed, press and release 0.05 ms apart
+      H->>F: NotifyKeyboardKeysym(l, pressed)
+      H->>F: NotifyKeyboardKeysym(l, released)
+      F->>B: released: its thread ran first
+      F->>B: pressed
+      B->>K: the release, for a key that is not down: dropped
+      B->>K: the press: "l" is now held until the next "l"
+      Note over H,K: awaited, P4b
+      H->>F: pressed
+      F->>B: pressed
+      F-->>H: reply
+      H->>F: released
+      F->>B: released
+      F-->>H: reply
+  ```
+
+- ⚠️ **KDE's backend negates the vertical smooth scroll** on its way to KWin
+  (`requestPointerAxis`: `wl_fixed_from_double(-y)`), while the portal's
+  convention, GNOME's backend, KDE's own horizontal axis and its discrete path
+  all keep positive = down. Measured on Plasma 6.7: a notch down reached the
+  probe as a notch up. Where KDE's backend owns its bus name
+  (`org.freedesktop.impl.portal.desktop.kde`), the helper negates first
+  (`for_backend`, `portal/input.rs:224`); kill switch
+  `ROOMLERD_PORTAL_KDE_SCROLL_FIX=0`.
+- `ROOMLERD_PORTAL_INPUT_TRACE=1` logs every event and every call the helper
+  made for it, on the wall clock, so a lab can line what was sent up against
+  what a window received. That is how the ordering fault above was found. Off by
+  default: a keystroke log does not belong in a journal.
 - ⚠️ **GNOME hides input behind a second switch in the same dialog.** The
   *Remote Desktop* dialog carries `Share`, a monitor picker, *Remember This
   Selection* — and an **Allow Remote Interaction** toggle that is **off by
@@ -583,7 +673,7 @@ time, and `CreateSession` timed out activating `…impl.portal.desktop.gnome`.
 ### 4.6 One request per host, and an open that holds no worker (FR-93 P2d)
 
 An attended open shows the person at the screen a dialog and waits for them for
-up to `HANDSHAKE_DEADLINE` (120 s, `portal/backend.rs:368`). The FR-93 lab ran
+up to `HANDSHAKE_DEADLINE` (120 s, `portal/backend.rs:372`). The FR-93 lab ran
 the portal automatically on KDE and measured what that did with nobody answering:
 
 - **A dialog storm.** The viewer's media watchdog re-creates a session that has
@@ -593,7 +683,7 @@ the portal automatically on KDE and measured what that did with nobody answering
   session already gone, with the sharing indicator on.
 - **A held worker, then a dead daemon.** The pumps called
   `capture::open_default` inline, so each unanswered dialog blocked one runtime
-  worker for the whole wait (`hs_rx.recv_timeout`, `backend.rs:166`). Four of
+  worker for the whole wait (`hs_rx.recv_timeout`, `backend.rs:170`). Four of
   them is every worker of a 4-core host. Measured on the released **0.4.130**
   (the KDE guest, 4 cores, `portal_capture` on, one viewer trying):
   - The viewer's watchdog re-created the session 4 times in 30 s, raising 4
@@ -629,10 +719,10 @@ sequenceDiagram
 
 | | what | where |
 |---|---|---|
-| the open runs off the workers | `capture::open_default_async`: on Linux, `open_default` on the blocking pool. The pump stays droppable while it waits, and a capture that opens after its session is gone is dropped as it arrives. Elsewhere it stays inline | `capture/mod.rs:1382`, the eight pump call sites in `peer.rs` |
+| the open runs off the workers | `capture::open_default_async`: on Linux, `open_default` on the blocking pool. The pump stays droppable while it waits, and a capture that opens after its session is gone is dropped as it arrives. Elsewhere it stays inline | `capture/mod.rs:1402`, the eight pump call sites in `peer.rs` |
 | one request per host | `portal::pending::open_with`, which the configured and the automatic (P2d-3) arms share: a session that asks while a request is pending waits for **that** request, and an older waiter leaves (`Superseded`) | `portal/pending.rs:59`, `Broker::open` `:146` |
 | the newest waiter wins | the outcome goes to the session that asked last, which is the one the viewer shows now | `Request::wait` `:229` |
-| nobody there, nothing starts | a waiter is a blocking thread, not a session. A session's end aborts its pump (`AgentPeer::stop_serving`, `peer.rs:1520`), which detaches the open, so the capture its waiter takes is dropped as it arrives: the helper is killed and the screencast stops. An outcome that outlives its **last waiter** (each waits 5 s past the request's own deadline) is dropped in `Request::land`, the backstop | `capture/mod.rs:1382`, `Request::land` `:216` |
+| nobody there, nothing starts | a waiter is a blocking thread, not a session. A session's end aborts its pump (`AgentPeer::stop_serving`, `peer.rs:1520`), which detaches the open, so the capture its waiter takes is dropped as it arrives: the helper is killed and the screencast stops. An outcome that outlives its **last waiter** (each waits 5 s past the request's own deadline) is dropped in `Request::land`, the backstop | `capture/mod.rs:1402`, `Request::land` `:216` |
 | mutter is not brokered | `mutter_capture` asks nobody and opens in milliseconds, so concurrent sessions never wait on each other for it | `pending.rs:60` |
 
 **Measured** on the FR-93 lab's KDE guest: Plasma 6.7 on Fedora 44, 4 cores, a per-user install with
@@ -824,7 +914,8 @@ sequenceDiagram
 |---|---|---|
 | the automatic mutter arm (§1.2) | **on**, unless `mutter_input = false` | it asks nobody, like the screencast it drives |
 | a configured `mutter_capture` | only with `portal_input` too, and `mutter_input` not false | the operator chose this arm, and input stays opt-in there, as on the portal |
-| the portal, automatic or configured | `portal_input` | a separate grant at the screen, with a restore token of its own |
+| the automatic portal (§1.2) | **on** (P4b), unless `portal_input = false` | its one dialog asks for remote control; a refusal is asked again for the screen only |
+| a configured `portal_capture` | `portal_input` | a separate grant at the screen, with a restore token of its own, so an already-granted screen share would be asked again |
 
 The viewer's events map onto mutter's calls as pure data
 (`input::MutterCall`, `portal/input.rs`), beside the portal's:
@@ -883,6 +974,7 @@ the candidate started (#2078). Written while the new build runs, the key holds.
 | mutter direct | `scw-m2-asahi` | `mutter node 82 on HDMI-1 (ScreenCast v4)` in 10 ms, no dialog; 85 bytes while idle, 904 MB once the pointer moved |
 | mutter direct | **WSL2 dev host** — the host the FR was opened for | headless mutter, no portal backend on the bus at all: `node 32 on Meta-0`, BGRx 1920×1080, 4.92 GB of frames, 2025/2025 sampled bytes non-zero, frame 2 ≠ frame 1. Through the **daemon's own cascade** (with the §5.1 session): `delivered=30 empty=0 … mean_ms=18.46`, and live remote-desktop sessions encoding with **`av1_nvenc` at `avg_encode_ms` 11.4 ms mean at native 1920×1080** (109 pump heartbeats over five sessions, the longest 2.2 min at 11.7 ms; 8.25 ms at the 1280×720 the slow-link profile had opened at earlier that day) against the host's 10.4 ms Xvfb baseline — the two halves FR-45 was opened to join, joined |
 | portal, automatic (FR-93 P2d-3) | `wlab-kde`: Plasma 6.7 on Fedora 44, a per-user install with no capture key | one dialog, answered by the lab's QMP click: the picture in the session that waited (`lit=81.7 %`); the restore token 85 ms after the next offer; KDE's lock screen from the token while locked (§1.2) |
+| portal, automatic, with input (FR-93 P4b) | the same guest | KDE's *Remote Control* dialog, approved: the AC4 oracle 7/7 twice, the typing stress's 113 characters exact in four runs (41 of 452 wrong before the calls waited, §4.3), a wheel notch down arriving down. Denied: KDE asked again for the screen only, and the session ran view-only with its picture (`lit=95.9 %`) and a reach banner naming the fix |
 | cascade order | a host with DRM **and** the portal | DRM alone → `backend=drm`; both flags → `backend=drm`; neither → no helper, no dialog |
 | dependency rule | x86_64 and aarch64 builds | `readelf -d`: **0** `DT_NEEDED` entries matching `pipewire`/`libspa`; a live run with the library bind-mounted away still completed the portal handshake |
 
@@ -893,15 +985,15 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 ## 7. Configuration
 
 Every key below is `restart required`; env wins over the config file. The
-keys are `crates/agent-core/src/config_surface.rs:1131-1194`, and they reach
-the daemon through the env bridge (`crates/agent-core/src/config.rs:2564`).
+keys are `crates/agent-core/src/config_surface.rs:1131-1202`, and they reach
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2585`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|
 | `drm_capture` | `ROOMLERD_DRM_CAPTURE` | off | the DRM/KMS arm (§3). Unattended; sees the greeter and a locked screen; no damage information |
 | `uinput` | `ROOMLERD_UINPUT` | off | inject through `/dev/uinput`, below the compositor — the input pair of `drm_capture` on Wayland. Host-global: it injects into whatever has focus, the greeter included |
 | `portal_capture` | `ROOMLERD_PORTAL_CAPTURE` | off | the portal arm (§4). **Attended**: a logged-in user and a consent dialog on first use; tried after DRM, before X11. A per-user daemon in its own Wayland session uses the portal by itself where mutter is absent (§1.2, P2d-3), so there this key only forces it (`true`) or keeps it off (`false`) |
-| `portal_input` | `ROOMLERD_PORTAL_INPUT` | off | input through the portal's RemoteDesktop, on the same session. Inert without `portal_capture`; and on GNOME the dialog's own *Allow Remote Interaction* switch must also be flipped. On a configured mutter arm (`mutter_capture`) it means mutter's own RemoteDesktop (§5.2) |
+| `portal_input` | `ROOMLERD_PORTAL_INPUT` | off for a configured arm; **on** for the automatic portal | input through the portal's RemoteDesktop, on the same session. A configured `portal_capture` takes input only with it `true`. The automatic portal (§1.2) asks for remote control unless it is `false` (FR-93 P4b). On GNOME the dialog's own *Allow Remote Interaction* switch must also be flipped. On a configured mutter arm (`mutter_capture`) it means mutter's own RemoteDesktop (§5.2) |
 | `mutter_input` | `ROOMLERD_MUTTER_INPUT` | **on** | FR-93 P4 (§5.2): a mutter screencast is driven by mutter's own RemoteDesktop, which takes the viewer's input. **It asks nobody**, like the screencast. The automatic arm carries it; a configured one only with `portal_input`. Off = mutter capture is view-only, the behaviour before P4 |
 | `mutter_capture` | `ROOMLERD_MUTTER_CAPTURE` | off | the mutter arm (§5), **inside** `portal_capture`. **Unattended, GNOME-only, no input** |
 | `window_capture` | `ROOMLERD_WINDOW_CAPTURE` | off | FR-56 P4: one application window instead of the monitor. Attended **by construction** — the portal answers with a window picker, and nothing agent-side can name a window (GNOME refuses `Introspect.GetWindows`) |
@@ -952,8 +1044,8 @@ defect — the capture arms only expose it by being knobs.
 
 | File | Owns |
 |---|---|
-| `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default` (`:1362`), `open_default_async` (`:1382`) and the cascade (`open_with` `:1479`); the FR-80 failure classifier (`:1249`); FR-93's verdicts: `linux_no_pixels_code` (`:966`), `xwayland_verdict` (`:1015`), the Xwayland guard (`:1719`) and its socket-only probe (`x_server_query` `:1124`), the hints (`wayland_hint` `:560`, `wayland_not_enabled_detail` `:1000`); P2's automatic arm: `wayland_plan` (`:675`), `open_auto_mutter` (`:858`), and P2d-3's `open_auto_portal` (`:913`) with `auto_portal_unusable` (`:947`) |
-| `agents/roomlerd/src/desktop_brief.rs` | FR-93 P2b: the hello's `desktop` brief, its `desktop-brief` refresher (`start` `:31`) and the session a controller would see (`seen_session` `:80`); `planned_arm`, P4's `planned_input_route` and `arm_facts` live beside the cascade in `capture/mod.rs` (`:755`, `:781`, `:796`) |
+| `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default` (`:1382`), `open_default_async` (`:1402`) and the cascade (`open_with` `:1499`); the FR-80 failure classifier (`:1269`); FR-93's verdicts: `linux_no_pixels_code` (`:986`), `xwayland_verdict` (`:1035`), the Xwayland guard (`:1739`) and its socket-only probe (`x_server_query` `:1144`), the hints (`wayland_hint` `:560`, `wayland_not_enabled_detail` `:1020`); P2's automatic arm: `wayland_plan` (`:675`), `open_auto_mutter` (`:864`), and P2d-3's `open_auto_portal` (`:933`) with `auto_portal_unusable` (`:967`) and P4b's `auto_portal_input` (`:917`) |
+| `agents/roomlerd/src/desktop_brief.rs` | FR-93 P2b: the hello's `desktop` brief, its `desktop-brief` refresher (`start` `:31`) and the session a controller would see (`seen_session` `:80`); `planned_arm`, P4's `planned_input_route` and `arm_facts` live beside the cascade in `capture/mod.rs` (`:758`, `:785`, `:801`) |
 | `agents/roomlerd/src/capture/scrap_backend.rs` · `x11_damage.rs` | the X11 arm and its damage listener |
 | `agents/roomlerd/src/virtual_desktop.rs` | Xvfb + WM + startup apps for `ROOMLERD_VIRTUAL_DESKTOP=1` |
 | `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled` `:168`, `primary` `:304`) |
@@ -964,6 +1056,6 @@ defect — the capture arms only expose it by being knobs.
 | `agents/roomlerd/src/capture/portal/mutter.rs` | the mutter broker (`open` `:251`, `RecordMonitor` `:322`, `PipeWireStreamAdded` `:337`); FR-93 P4's RemoteDesktop session (`remote_desktop_session` `:403`) and its kill switch (`input_enabled` `:197`) |
 | `agents/roomlerd/src/capture/portal/pipewire.rs` · `pod.rs` | `dlopen` (`:307`), `negotiate` (`:1015`), `stream` (`:1156`); the hand-written SPA PODs |
 | `agents/roomlerd/src/capture/portal/wire.rs` · `backend.rs` | the `RPWF` frame wire; `PortalCapture` (`open` `:102`, `HANDSHAKE_DEADLINE` `:368`) |
-| `agents/roomlerd/src/capture/portal/input.rs` · `input_route.rs` | FR-45 P4 and FR-93 P4: the helper's `Notify*` mapping (`plan` `:118`, mutter's `mutter_call` `:231`); the arbiter-side per-event route (`try_route` `:113`) and whose session it feeds (`active` `:97`) |
-| `crates/agent-core/src/config_surface.rs` | the keys in §7 and the descriptions `roomler config` prints (`:1131-1194`) |
+| `agents/roomlerd/src/capture/portal/input.rs` · `input_route.rs` | FR-45 P4 and FR-93 P4: the helper's `Notify*` mapping (`plan` `:123`, mutter's `mutter_call` `:274`); FR-93 P4b's KDE correction (`for_backend` `:224`) and the awaited portal calls (`Target::delivery` `:348`); the arbiter-side per-event route (`try_route` `:113`) and whose session it feeds (`active` `:97`) |
+| `crates/agent-core/src/config_surface.rs` | the keys in §7 and the descriptions `roomler config` prints (`:1131-1202`) |
 | `agents/roomlerd/src/main.rs` | `capture-smoke` (`:5499`, the portal line `:5526`); the virtual desktop (`:2598`) |

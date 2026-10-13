@@ -947,12 +947,19 @@ pub struct AgentConfig {
     #[serde(default)]
     pub portal_capture: Option<bool>,
     /// FR-45 P4 — inject input through the portal's RemoteDesktop interface,
-    /// riding the SAME session as `portal_capture` (`ROOMLERD_PORTAL_INPUT`).
-    /// Built-in default: **OFF** — an input session needs its own see+touch
-    /// consent grant, so enabling it turns every portal capture into one that
-    /// prompts (and blocks or falls through if unanswered), regressing capture
-    /// on hosts where capture-only works. On = the portal session can also be
-    /// controlled; inert unless `portal_capture` is on. Restart required.
+    /// riding the SAME session as the portal's capture (`ROOMLERD_PORTAL_INPUT`).
+    ///
+    /// Unset, it depends on who chose the portal arm (FR-93 P4b):
+    /// - the **automatic** portal (`wayland_auto`: a per-user session where
+    ///   mutter is absent, such as KDE) asks for remote control, seeing and
+    ///   controlling, in its one dialog. `false` keeps it a screen share.
+    /// - a **configured** `portal_capture` takes input only with this key
+    ///   `true`. An input session needs its own grant and restore token, so
+    ///   switching it on makes an already-granted screen share ask again.
+    ///
+    /// Either way, a person who refuses remote control is then asked for the
+    /// screen only: input never costs capture. On a configured mutter arm
+    /// (`mutter_capture`) it means mutter's own RemoteDesktop. Restart required.
     ///
     /// ⚠️ Measured 2026-09-01: on GNOME this key is NOT sufficient on its own. The
     /// consent dialog carries a SEPARATE "Allow Remote Interaction" switch
@@ -1012,7 +1019,8 @@ pub struct AgentConfig {
     ///
     /// The automatic arm is mutter's own screencast, which asks nobody (GNOME),
     /// and where mutter is absent the desktop portal, which asks the person at
-    /// the screen once and restores their answer afterwards (FR-93 P2d-3). A
+    /// the screen once and restores their answer afterwards (FR-93 P2d-3). It
+    /// asks for remote control, unless `portal_input` is `false` (P4b). A
     /// root (system) install never switches an arm on by itself: D1 keeps DRM
     /// and uinput opt-in there until a desktop companion ships for non-Debian
     /// hosts. Any capture key set, to anything, takes the choice back. `false`
