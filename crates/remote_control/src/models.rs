@@ -734,6 +734,20 @@ pub enum RpcCap {
     /// ignores `fork_of` and starts the fork EMPTY, a new conversation in
     /// the folder as it is. Equality-matched, locked by test.
     HiveFork,
+    /// FR-94 — a Windows device runs Fleet RPC as SYSTEM through its
+    /// session-0 service. An administrator anchored the device (the service
+    /// holds its own credential, in a file only SYSTEM and Administrators can
+    /// write), and the service answered the worker's health ring with that
+    /// anchor's device id and `exec_enabled`. The server then routes
+    /// `rc:rpc.exec` with `via_service`: the worker rings the service's
+    /// doorbell with the request id alone, and the service claims the
+    /// command from the server itself (FR-94 §5b).
+    ///
+    /// ⚠️ `exec` is its prefix and NOT the same promise: every agent since
+    /// Fleet RPC says `exec`, and a server that read SYSTEM out of it would
+    /// route commands to a doorbell nobody answers. Equality-matched, locked by
+    /// test.
+    ExecSystem,
 }
 
 impl RpcCap {
@@ -765,11 +779,12 @@ impl RpcCap {
             Self::HivePromote => "hive-promote",
             Self::HiveTeleport => "hive-teleport",
             Self::HiveFork => "hive-fork",
+            Self::ExecSystem => "exec-system",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 20] = [
+    pub const ALL: [RpcCap; 21] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -790,6 +805,7 @@ impl RpcCap {
         Self::HivePromote,
         Self::HiveTeleport,
         Self::HiveFork,
+        Self::ExecSystem,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -1442,6 +1458,12 @@ pub struct Agent {
     /// pre-feature row deserialises to [`ExecMode::Off`].
     #[serde(default)]
     pub exec_policy: ExecPolicy,
+    /// FR-94 — an administrator anchored this Windows device, so its SYSTEM
+    /// service holds a credential of its own (`POST /api/agent/anchor`). Who
+    /// and when. The credential itself is never stored. `None` on every
+    /// unanchored device and every pre-FR-94 row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_anchor: Option<ExecAnchor>,
     /// Roomler-SSH policy for this device (gate 3). Same shape and the same
     /// closed default as [`Self::exec_policy`] — every pre-feature row
     /// deserialises to [`SshMode::Off`].
@@ -3143,6 +3165,13 @@ pub struct ExecOutcome {
     pub duration_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// FR-94 — the account the command ran as, as the runner itself reports
+    /// it: `system` or `console_user` from a Windows device's SYSTEM
+    /// service. `None` from every worker, and from any agent before FR-94.
+    /// The audit's own `ran_as` is the server's routing decision. This is
+    /// the device's claim beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran_as: Option<String>,
 }
 
 /// Why an exec request was refused. `None` on the audit row means it ran.
@@ -3175,6 +3204,16 @@ pub enum ExecDenyReason {
     /// Gate 4 — the agent's own `exec_enabled` config key is false. Reported
     /// by the agent rather than decided server-side.
     AgentDisabled,
+    /// FR-94 — the org requires Windows commands to run as SYSTEM
+    /// (`exec_require_system`), and this Windows device does not offer
+    /// `exec-system`: no administrator anchored it, or its service is down.
+    /// Refused rather than run as the signed-in user.
+    SystemRequired,
+    /// FR-94 — a device's SYSTEM service tried to claim a command that is not
+    /// pending for it: unknown, already claimed, expired, or another
+    /// device's. Nothing ran. Recorded because a forged or replayed doorbell
+    /// is exactly what this refusal is for (FR-94 AC4).
+    ClaimRefused,
 }
 
 /// Why a roomler-SSH grant was refused. The twin of [`ExecDenyReason`]; kept
@@ -3359,6 +3398,16 @@ pub struct ExecAuditEvent {
     pub output_bytes: u64,
     #[serde(default)]
     pub truncated: bool,
+    /// FR-94 — the identity the server routed the command to:
+    /// - `system` (a Windows device's SYSTEM service);
+    /// - `console_user` (the same service, as the signed-in user);
+    /// - `worker` (the agent's own process, as before FR-94: root under
+    ///   systemd, the signed-in user on an attended Windows install).
+    ///
+    /// `None` on a refusal, and on every row written before FR-94. The
+    /// device's own report rides in the outcome beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran_as: Option<String>,
 }
 
 impl ExecAuditEvent {
@@ -3366,6 +3415,74 @@ impl ExecAuditEvent {
     /// Cap on the persisted output sample. Keeps a busy fleet's audit
     /// collection bounded while retaining enough to read at a glance.
     pub const SAMPLE_BYTES: usize = 4096;
+}
+
+/// FR-94 — the record that an administrator anchored a Windows device for
+/// SYSTEM exec ([`Agent::exec_anchor`]). It is what the admin UI shows as the
+/// device's exec identity. Re-anchoring overwrites it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ExecAnchor {
+    pub anchored_at: DateTime,
+    /// The administrator who issued the enrollment token used to anchor.
+    pub anchored_by: ObjectId,
+    /// Names this anchor in the service credential it minted. A credential
+    /// is accepted only while its `anchor_id` equals this one, so
+    /// re-anchoring (a new id) revokes every credential an earlier anchor
+    /// minted. One live anchor per device, as a WireGuard key has one live
+    /// node. Empty on a row that predates the field, which no credential
+    /// can match.
+    #[serde(default)]
+    pub anchor_id: String,
+}
+
+/// FR-94 — one Fleet RPC routed to a Windows device's SYSTEM service, from
+/// the dispatch that writes it to the result the service posts. The command
+/// lives HERE, not in the doorbell. The worker rings the service with the
+/// request id alone, and the service claims these fields from the server
+/// with its own credential, so nothing the signed-in user can write decides
+/// what SYSTEM runs (FR-94 §4). Shared through Mongo because a claim and a
+/// result can land on any pod, while the caller waits on the pod that holds
+/// the device's socket.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ExecPending {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub request_id: String,
+    pub tenant_id: ObjectId,
+    pub agent_id: ObjectId,
+    pub shell: String,
+    pub command: String,
+    pub timeout_ms: u64,
+    pub max_output_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The acting principal's display name, as `rc:rpc.exec` carries it.
+    pub caller: String,
+    /// `system` or `console_user` (FR-94 P4).
+    pub run_as: String,
+    /// [`ExecPending::PENDING`] → [`ExecPending::CLAIMED`] →
+    /// [`ExecPending::DONE`].
+    pub state: String,
+    pub created_at: DateTime,
+    /// A claim at or after this instant is refused. It is the caller's own
+    /// deadline: once nobody waits for the answer, nothing may run.
+    pub claim_by: DateTime,
+    /// The TTL monitor deletes the row after this. It is later than
+    /// `claim_by`, so a result that arrives late still finds its row.
+    pub expires_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ExecOutcome>,
+}
+
+impl ExecPending {
+    pub const COLLECTION: &'static str = "exec_pending";
+    pub const PENDING: &'static str = "pending";
+    pub const CLAIMED: &'static str = "claimed";
+    pub const DONE: &'static str = "done";
+    /// Withdrawn by the caller (`…/exec/{request_id}/cancel`) before a claim.
+    pub const CANCELLED: &'static str = "cancelled";
 }
 
 /// One roomler-SSH session REQUEST. Written on every attempt, granted or
@@ -4814,7 +4931,7 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 13] = [
+        const KNOWN: [(RpcCap, RpcCap); 14] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
@@ -4850,6 +4967,9 @@ mod tests {
             // FR-90 P2f-3a — nor "starts a fork from a copy". Locked by
             // `hive_fork_is_a_promise_of_its_own`.
             (RpcCap::Hive, RpcCap::HiveFork),
+            // FR-94 — "runs Fleet RPC" is not "runs it as SYSTEM through a
+            // service". Locked by `exec_does_not_imply_exec_system`.
+            (RpcCap::Exec, RpcCap::ExecSystem),
         ];
         for a in RpcCap::ALL {
             for b in RpcCap::ALL {
@@ -5009,6 +5129,29 @@ mod tests {
             ..Default::default()
         };
         assert!(both.has_rpc(RpcCap::Ssh) && both.has_rpc(RpcCap::SshConsent));
+    }
+
+    /// FR-94 — `exec` is a PREFIX of `exec-system`. Every agent since Fleet
+    /// RPC advertises `exec`, so a prefix matcher would route every command
+    /// to a SYSTEM-service doorbell that no agent before FR-94 can answer.
+    #[test]
+    fn exec_does_not_imply_exec_system() {
+        let exec_only = AgentCaps {
+            rpc: vec!["exec".into(), "originate".into()],
+            ..Default::default()
+        };
+        assert!(exec_only.has_rpc(RpcCap::Exec));
+        assert!(
+            !exec_only.has_rpc(RpcCap::ExecSystem),
+            "an agent before FR-94 must NOT read as able to run exec as SYSTEM"
+        );
+        let both = AgentCaps {
+            rpc: vec!["exec".into(), "exec-system".into()],
+            ..Default::default()
+        };
+        assert!(both.has_rpc(RpcCap::Exec) && both.has_rpc(RpcCap::ExecSystem));
+        assert_eq!(RpcCap::ExecSystem.wire(), "exec-system");
+        assert_eq!(RpcCap::from_wire("exec-system"), Some(RpcCap::ExecSystem));
     }
 
     /// FR-83 — every agent before the ack advertises `ssh` (and most

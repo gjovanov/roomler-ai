@@ -148,6 +148,9 @@ impl AgentDao {
             // Fleet RPC off on a new device — enabling it is a deliberate
             // admin act, never a side effect of enrollment.
             exec_policy: ExecPolicy::default(),
+            // FR-94 — and never anchored by enrolling: anchoring is its own
+            // elevated, admin-issued act (`POST /api/agent/anchor`).
+            exec_anchor: None,
             ssh_policy: SshPolicy::default(),
             peer_relay_policy: Default::default(),
             // Nothing requested until an operator asks for something

@@ -551,6 +551,16 @@ pub struct RcSettings {
     /// effective TTL (this one included) to a 60 s floor at read time.
     /// Env: `ROOMLER__RC__EPHEMERAL_DEFAULT_TTL_SECS`.
     pub ephemeral_default_ttl_secs: u64,
+    /// FR-94 — route Fleet RPC through a Windows device's SYSTEM service
+    /// (the doorbell → claim → result path) when the device advertises
+    /// `exec-system`. Default **true**: only a device that was anchored by an
+    /// administrator ever advertises that word, so this changes nothing for
+    /// any other device. `false` is the server's kill switch. Every command
+    /// then takes the worker path as before FR-94, and the org setting
+    /// `exec_require_system` refuses Windows commands instead of running
+    /// them as the worker. Env: `ROOMLER__RC__EXEC_VIA_SERVICE`.
+    #[serde(default = "default_true")]
+    pub exec_via_service: bool,
 }
 
 impl Default for RcSettings {
@@ -569,6 +579,7 @@ impl Default for RcSettings {
             ephemeral_reaper_enabled: false,
             ephemeral_reap_interval_secs: 60,
             ephemeral_default_ttl_secs: 900,
+            exec_via_service: true,
         }
     }
 }
@@ -1003,6 +1014,7 @@ impl Settings {
             .set_default("rc.ephemeral_reaper_enabled", false)?
             .set_default("rc.ephemeral_reap_interval_secs", 60)?
             .set_default("rc.ephemeral_default_ttl_secs", 900)?
+            .set_default("rc.exec_via_service", true)?
             .set_default("s3.enabled", false)?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?

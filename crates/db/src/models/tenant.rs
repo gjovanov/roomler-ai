@@ -118,6 +118,14 @@ pub struct TenantSettings {
     /// its own policy is enabled.
     #[serde(default)]
     pub remote_exec_enabled: bool,
+    /// FR-94 — refuse a Windows command rather than run it as the signed-in
+    /// user. With it on, a Windows device must offer `exec-system`: an
+    /// administrator anchored it, so its SYSTEM service runs the command.
+    /// Otherwise the request is refused as `SystemRequired`. `false` by
+    /// default and for every pre-FR-94 row: an unanchored device keeps
+    /// working as the worker, and reports so in the audit (`ran_as: worker`).
+    #[serde(default)]
+    pub exec_require_system: bool,
     /// Roomler SSH — the org-wide kill-switch (gate 1 of four), the twin of
     /// [`Self::remote_exec_enabled`] and deliberately a SEPARATE switch: an org
     /// that allows bounded diagnostic commands has not thereby allowed
@@ -189,6 +197,7 @@ impl Default for TenantSettings {
             magic_dns_domain: None,
             magic_dns_nameservers: Vec::new(),
             remote_exec_enabled: false,
+            exec_require_system: false,
             remote_ssh_enabled: false,
             ephemeral_keys_enabled: false,
             keep_busy_denied: false,

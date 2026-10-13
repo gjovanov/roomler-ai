@@ -119,6 +119,27 @@ impl TenantDao {
         self.base.find_by_id(tenant_id).await
     }
 
+    /// FR-94 — refuse Windows commands that could not run as SYSTEM, rather
+    /// than run them as the signed-in user. A separate field written only
+    /// when the caller says something about it (see the route), so a body
+    /// that names only the kill-switch leaves this alone.
+    pub async fn set_exec_require_system(
+        &self,
+        tenant_id: ObjectId,
+        required: bool,
+    ) -> DaoResult<Tenant> {
+        self.base
+            .update_by_id(
+                tenant_id,
+                doc! { "$set": {
+                    "settings.exec_require_system": required,
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await?;
+        self.base.find_by_id(tenant_id).await
+    }
+
     /// FR-92 — the org's keep-busy settings: the DENY (`false` = allowed, the
     /// default) and, since P8, the default pattern. Each field is written only when
     /// the caller SAID something about it: `None` leaves the stored value
