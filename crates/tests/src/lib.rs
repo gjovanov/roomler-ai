@@ -123,6 +123,8 @@ mod subscribe_tests;
 #[cfg(test)]
 mod tenant_archive_tests;
 #[cfg(test)]
+mod transfer_activity_tests;
+#[cfg(test)]
 mod tunnel_tests;
 #[cfg(test)]
 mod tutorial_tests;

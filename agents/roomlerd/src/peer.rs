@@ -19,7 +19,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use roomler_ai_remote_control::signaling::{ClientMsg, IceServer};
+use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, TransferDirection};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
@@ -9455,6 +9455,18 @@ fn attach_log_only(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
     }));
 }
 
+/// FR-101 P3 — count one clipboard transfer for the session's audit: how
+/// many and how many bytes, never what.
+#[cfg(feature = "clipboard")]
+fn tally_clipboard(session_id: bson::oid::ObjectId, dir: TransferDirection, bytes: usize) {
+    let counters = crate::session_telemetry::counters(session_id);
+    let tally = match dir {
+        TransferDirection::ToHost => &counters.clipboard_to_host,
+        TransferDirection::FromHost => &counters.clipboard_from_host,
+    };
+    tally.add(bytes as u64);
+}
+
 /// Wire the `clipboard` DC to the agent's OS clipboard. Parses
 /// inbound JSON as [`clipboard::ClipboardIncoming`] and dispatches:
 ///
@@ -9626,6 +9638,7 @@ fn attach_clipboard_handler(
                     match cb.write(text).await {
                         Ok(()) => {
                             info!(%session_id, bytes, "clipboard: wrote to host");
+                            tally_clipboard(session_id, TransferDirection::ToHost, bytes);
                             // v2 ack — only when the browser stamped an
                             // id (old UIs don't, and never see acks).
                             // The browser gates its deferred Ctrl+V
@@ -9675,6 +9688,7 @@ fn attach_clipboard_handler(
                             match cb.write(full_text).await {
                                 Ok(()) => {
                                     info!(%session_id, id=%id, bytes, chunks=seq + 1, "clipboard: wrote chunked payload to host");
+                                    tally_clipboard(session_id, TransferDirection::ToHost, bytes);
                                     // v2 ack, keyed by the chunk id the
                                     // browser already assigns. Old UIs
                                     // drop the unknown `t` silently.
@@ -9762,6 +9776,7 @@ fn attach_clipboard_handler(
                     match cb.read().await {
                         Ok(text) if !text.is_empty() => {
                             let bytes = text.len();
+                            tally_clipboard(session_id, TransferDirection::FromHost, bytes);
                             if bytes <= crate::clipboard::CHUNK_BYTES {
                                 // Single envelope — back-compat path for
                                 // browsers that don't yet handle
@@ -10117,6 +10132,9 @@ async fn finish_rich_write(
         }
         Err(reason) => Err(reason),
     };
+    if let Ok(bytes) = &result {
+        tally_clipboard(session_id, TransferDirection::ToHost, *bytes);
+    }
     let reply = match result {
         Ok(bytes) => serde_json::json!({
             "t": "clipboard:write-ack",
@@ -10160,6 +10178,11 @@ async fn send_clipboard_native(
     let html_bytes = payload.html.len();
     let text_bytes = payload.text.len();
     debug!(%session_id, %id, rtf_bytes, html_bytes, text_bytes, ?req_id, "clipboard: sending native");
+    tally_clipboard(
+        session_id,
+        TransferDirection::FromHost,
+        rtf_bytes + html_bytes + text_bytes,
+    );
     let begin = serde_json::json!({
         "t": "clipboard:native-begin",
         "id": id,
@@ -10226,6 +10249,11 @@ async fn send_clipboard_html(
     let html_bytes = payload.html.len();
     let text_bytes = payload.text.len();
     debug!(%session_id, %id, html_bytes, text_bytes, ?req_id, "clipboard: sending html");
+    tally_clipboard(
+        session_id,
+        TransferDirection::FromHost,
+        html_bytes + text_bytes,
+    );
     let begin = serde_json::json!({
         "t": "clipboard:html-begin",
         "id": id,
@@ -10277,6 +10305,7 @@ async fn send_clipboard_text_event(
     event_seq: u64,
 ) {
     let bytes = text.len();
+    tally_clipboard(session_id, TransferDirection::FromHost, bytes);
     if bytes <= crate::clipboard::CHUNK_BYTES {
         debug!(%session_id, bytes, "clipboard: pushing text change");
         let msg = serde_json::json!({
@@ -10335,6 +10364,7 @@ async fn send_clipboard_image(
     let id = format!("aimg-{}", IMG_TX_SEQ.fetch_add(1, Ordering::Relaxed));
     let bytes = img.png.len();
     debug!(%session_id, %id, w = img.w, h = img.h, bytes, ?req_id, "clipboard: sending image");
+    tally_clipboard(session_id, TransferDirection::FromHost, bytes);
     let begin = serde_json::json!({
         "t": "clipboard:img-begin",
         "id": id,
@@ -10568,6 +10598,15 @@ async fn handle_files_control(
         crate::files::FilesIncoming::End { id } => match handler.end(&id).await {
             Ok((path, bytes)) => {
                 info!(%session_id, %id, bytes, path = %path.display(), "files: complete");
+                // FR-101 P3 — the audit gets the name's hash, never the name.
+                crate::session_telemetry::counters(session_id).note_file(
+                    TransferDirection::ToHost,
+                    &path
+                        .file_name()
+                        .map(|n| n.to_string_lossy())
+                        .unwrap_or_default(),
+                    bytes,
+                );
                 let path_str = path.to_string_lossy();
                 send_files_json(
                     &dc,
@@ -10807,6 +10846,11 @@ fn spawn_outgoing_pump(
             %session_id, id = %offer.id, bytes_sent, path = %offer.path.display(),
             "files: outgoing complete"
         );
+        crate::session_telemetry::counters(session_id).note_file(
+            TransferDirection::FromHost,
+            &offer.name,
+            bytes_sent,
+        );
         handler.finish_outgoing(&offer.id).await;
         let _ = or_stopped(
             &offer.cancel,
@@ -10949,6 +10993,11 @@ fn spawn_outgoing_zip_pump(
             %session_id, id = %offer.id, total_bytes,
             path = %offer.path.display(),
             "files: outgoing zip complete"
+        );
+        crate::session_telemetry::counters(session_id).note_file(
+            TransferDirection::FromHost,
+            &offer.name,
+            total_bytes,
         );
         handler.finish_outgoing(&offer.id).await;
         let _ = or_stopped(

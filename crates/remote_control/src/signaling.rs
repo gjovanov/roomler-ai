@@ -414,6 +414,11 @@ pub enum ClientMsg {
         /// SVC go/no-go input.
         #[serde(default)]
         mixed_dial_seconds: u64,
+        /// FR-101 P3 — clipboard and file traffic, for the audit. Absent
+        /// when there was none, so older servers never see it, and an
+        /// older agent's sample parses with none.
+        #[serde(default, skip_serializing_if = "Transfers::is_empty")]
+        transfers: Transfers,
     },
 
     /// Multi-region DERP: request an EdDSA admission ticket for the regional
@@ -3737,6 +3742,78 @@ pub struct RelayRegionRtt {
     /// (UDP-blocked path or dead PoP).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtt_ms: Option<u32>,
+}
+
+/// FR-101 P3 — a session's clipboard and file traffic, as the device saw it,
+/// in [`ClientMsg::SessionStats`]. Counts, sizes and a hash of each file's
+/// name; never content, and never a name.
+///
+/// The clipboard tallies are cumulative for the session and only grow, so
+/// the server writes the difference from what it stored last: a lost sample
+/// costs nothing, and a repeated one adds nothing. `files` are the transfers
+/// that completed since the previous sample, each sent once.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct Transfers {
+    /// Writes the controller made to the host's clipboard.
+    #[serde(default, skip_serializing_if = "Tally::is_zero")]
+    pub clipboard_to_host: Tally,
+    /// Clipboard content the host sent the controller: reads it asked for,
+    /// and changes pushed to a subscribed viewer.
+    #[serde(default, skip_serializing_if = "Tally::is_zero")]
+    pub clipboard_from_host: Tally,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileNote>,
+}
+
+impl Transfers {
+    pub fn is_empty(&self) -> bool {
+        self.clipboard_to_host.is_zero()
+            && self.clipboard_from_host.is_zero()
+            && self.files.is_empty()
+    }
+}
+
+/// How many, and how many bytes.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tally {
+    pub count: u64,
+    pub bytes: u64,
+}
+
+impl Tally {
+    pub fn is_zero(&self) -> bool {
+        self.count == 0 && self.bytes == 0
+    }
+
+    /// What `self` adds to an earlier reading. A reading that went
+    /// backwards (a restarted counter) adds nothing.
+    pub fn since(&self, earlier: Tally) -> Tally {
+        Tally {
+            count: self.count.saturating_sub(earlier.count),
+            bytes: self.bytes.saturating_sub(earlier.bytes),
+        }
+    }
+}
+
+/// Which way a transfer went.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferDirection {
+    /// The controller sent it to the host.
+    ToHost,
+    /// The host sent it to the controller.
+    FromHost,
+}
+
+/// One completed file transfer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FileNote {
+    pub dir: TransferDirection,
+    /// SHA-256 of the file's name (its UTF-8 bytes), lowercase hex. Equal
+    /// names hash equally, so transfers of one file can be told apart from
+    /// many; the name itself never leaves the device.
+    pub name_sha256: String,
+    pub bytes: u64,
 }
 
 /// Loopback-TURN corp-relay descriptor (loopback-TURN Phase 2). Minted + served
@@ -8623,5 +8700,107 @@ mod tests {
             }
             other => panic!("expected caps to survive, got {other:?}"),
         }
+    }
+
+    /// FR-101 P3 — `transfers` is absent from a sample that moved nothing, so
+    /// an older server never sees the field; an older agent's sample, which
+    /// has none, parses with none; and the wire names are a compatibility
+    /// surface.
+    #[test]
+    fn session_stats_transfers_are_optional_both_ways_and_keep_their_names() {
+        let base = r#"{"t":"rc:session.stats","session_id":"a","bytes_sent":1,"bytes_recv":2,
+            "fps":30.0,"rtt_ms":4.0,"keyframe_requests":0,"input_events":0}"#;
+        match serde_json::from_str::<ClientMsg>(base).unwrap() {
+            ClientMsg::SessionStats { transfers, .. } => assert!(transfers.is_empty()),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let quiet = ClientMsg::SessionStats {
+            session_id: "a".into(),
+            bytes_sent: 1,
+            bytes_recv: 2,
+            fps: 30.0,
+            rtt_ms: 4.0,
+            keyframe_requests: 0,
+            input_events: 0,
+            shared_seconds: 0,
+            mixed_dial_seconds: 0,
+            transfers: Transfers::default(),
+        };
+        let s = serde_json::to_string(&quiet).unwrap();
+        assert!(!s.contains("transfers"), "{s}");
+
+        let busy = ClientMsg::SessionStats {
+            session_id: "a".into(),
+            bytes_sent: 1,
+            bytes_recv: 2,
+            fps: 30.0,
+            rtt_ms: 4.0,
+            keyframe_requests: 0,
+            input_events: 0,
+            shared_seconds: 0,
+            mixed_dial_seconds: 0,
+            transfers: Transfers {
+                clipboard_to_host: Tally {
+                    count: 2,
+                    bytes: 15,
+                },
+                clipboard_from_host: Tally::default(),
+                files: vec![FileNote {
+                    dir: TransferDirection::FromHost,
+                    name_sha256: "ab".repeat(32),
+                    bytes: 9,
+                }],
+            },
+        };
+        let v = serde_json::to_value(&busy).unwrap();
+        let t = &v["transfers"];
+        assert_eq!(
+            t["clipboard_to_host"],
+            serde_json::json!({"count": 2, "bytes": 15})
+        );
+        assert!(
+            t.get("clipboard_from_host").is_none(),
+            "a zero tally is left out: {t}"
+        );
+        assert_eq!(t["files"][0]["dir"], "from_host");
+        assert_eq!(t["files"][0]["bytes"], 9);
+        match serde_json::from_value::<ClientMsg>(v).unwrap() {
+            ClientMsg::SessionStats { transfers, .. } => {
+                assert_eq!(transfers.clipboard_to_host.count, 2);
+                assert_eq!(transfers.files.len(), 1);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// FR-101 P3 — the server keeps what a sample ADDS to the stored reading;
+    /// a reading that went backwards adds nothing rather than wrapping.
+    #[test]
+    fn a_tally_reports_only_what_a_later_reading_adds() {
+        let earlier = Tally {
+            count: 3,
+            bytes: 300,
+        };
+        assert_eq!(
+            Tally {
+                count: 5,
+                bytes: 450
+            }
+            .since(earlier),
+            Tally {
+                count: 2,
+                bytes: 150
+            }
+        );
+        assert_eq!(earlier.since(earlier), Tally::default());
+        assert_eq!(
+            Tally {
+                count: 1,
+                bytes: 10
+            }
+            .since(earlier),
+            Tally::default()
+        );
     }
 }

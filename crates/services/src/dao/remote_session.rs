@@ -4,6 +4,7 @@ use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{EndReason, RemoteSession, SessionPhase, SessionStats};
 use roomler_ai_remote_control::permissions::Permissions;
+use roomler_ai_remote_control::signaling::Tally;
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
 
@@ -140,6 +141,59 @@ impl RemoteSessionDao {
                 },
             )
             .await
+    }
+
+    /// FR-101 P3 — fold a session's cumulative clipboard tallies into its row
+    /// and return the readings stored before (zeros the first time), so the
+    /// caller keeps only what this sample adds. `$max` keeps the stored totals
+    /// monotonic: a sample that arrives late or twice adds nothing.
+    ///
+    /// Scoped to the reporting agent, and deliberately NOT to a live session:
+    /// the device's last sample arrives after the server ended the session,
+    /// and the transfers it carries happened. The totals sit in their own
+    /// `transfer_totals` field, which `mark_ended`'s whole-`stats` write
+    /// cannot reset. A reset would make the next sample count everything
+    /// again. `None` = no such session row for this agent (yet).
+    pub async fn fold_clipboard_totals(
+        &self,
+        session_id: ObjectId,
+        agent_id: ObjectId,
+        to_host: Tally,
+        from_host: Tally,
+    ) -> DaoResult<Option<(Tally, Tally)>> {
+        let n = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+        let before = self
+            .base
+            .collection()
+            .clone_with_type::<bson::Document>()
+            .find_one_and_update(
+                doc! { "_id": session_id, "agent_id": agent_id },
+                doc! { "$max": {
+                    "transfer_totals.clipboard_to_host.count": n(to_host.count),
+                    "transfer_totals.clipboard_to_host.bytes": n(to_host.bytes),
+                    "transfer_totals.clipboard_from_host.count": n(from_host.count),
+                    "transfer_totals.clipboard_from_host.bytes": n(from_host.bytes),
+                }},
+            )
+            .return_document(mongodb::options::ReturnDocument::Before)
+            .await?;
+        Ok(before.map(|row| {
+            let stored = |dir: &str| {
+                let t = row
+                    .get_document("transfer_totals")
+                    .and_then(|t| t.get_document(dir))
+                    .ok();
+                let read = |f: &str| {
+                    t.and_then(|t| t.get_i64(f).ok())
+                        .map_or(0, |v| u64::try_from(v).unwrap_or(0))
+                };
+                Tally {
+                    count: read("count"),
+                    bytes: read("bytes"),
+                }
+            };
+            (stored("clipboard_to_host"), stored("clipboard_from_host"))
+        }))
     }
 
     pub async fn mark_ended(

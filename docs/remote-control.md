@@ -15,7 +15,7 @@
 - One unified room model: a "remote control session" is just a special room kind, so it inherits auth, multi-tenancy, RBAC, presence, chat, recording, and notifications for free.
 - Prefer P2P via WebRTC when ICE allows; fall back to TURN over the existing COTURN cluster; never proxy raw input through the application server.
 - Multi-monitor, clipboard, file transfer, and a "view-only" guest mode out of the box.
-- Audit everything (session start/stop, input events optional, file transfers, clipboard direction).
+- Audit everything (session start/stop, input events optional, file transfers, clipboard direction). File transfers and clipboard direction are the device's report, kept in `transfer_activity` since FR-101 P3 (§11.3a).
 
 **Non-goals (v1)** — *historical; most of these have since shipped.* SYSTEM-context
 control (lock screen, UAC, pre-logon) landed as the Windows SystemContext service
@@ -555,6 +555,9 @@ pub struct RemoteAuditEvent {
 }
 ```
 
+*(The original sketch. The clipboard and file kinds were never written to `remote_audit`: they
+are the device's claims and live in `transfer_activity`, §11.3a.)*
+
 Indexes (typical):
 - `agents`: `{org_id:1, status:1}`, `{owner_user_id:1}`, `{machine_id:1}` unique per org
 - `remote_sessions`: `{agent_id:1, started_at:-1}`, `{controller_user_id:1, started_at:-1}`
@@ -873,6 +876,44 @@ media was handed to the GUI worker.
 If recording is enabled for the session, the controlled side gets a persistent banner (cannot be dismissed) and a red dot in the tray icon. Mirrors macOS's screen-recording indicator behavior; users have learned to look for it.
 
 **FR-85 builds this** ([recording.md](recording.md) §10). A remote recording is made and stored **on the controlled device**, and the controller downloads it on demand over the session's P2P channel. The server stores only the facts. `Permissions::RECORD` survives the hub only when the controller may record (the device's owner, an `ADMINISTRATOR`, or the role bit `RECORD_REMOTE_SCREEN`) **and** the device's owner has switched remote recording on. Each refusal is named in `rc:session.created` and in the audit. The device then asks the host again (a session consented on the host gets a fresh "record this screen" prompt), and the indicator above is up **before the first frame**. On Windows it is the daemon's badge, pinned open and relabelled "Recording"; elsewhere it is the companion's banner, with a **Stop recording** button that keeps the session. With no surface to show it, the recording is refused. **The red dot** is the companion's tray icon: it turns red while any recording runs, this device's own or a controller's, from the same 750 ms poll the banner rides ([recording.md](recording.md) §7). The microphone is never a remote option.
+
+### 11.3a What crossed the clipboard and file channels (FR-101 P3)
+
+Clipboard and files travel peer to peer on their own data channels, so the server never sees a
+transfer. What the org gets is the device's **account** of the traffic: how many transfers, how
+many bytes, which way, and for a file a SHA-256 of its name. It never gets content, and never a
+name. The hash still lets an auditor tell one file sent five times from five different files.
+
+```mermaid
+sequenceDiagram
+    participant V as Viewer (browser)
+    participant D as Device (roomlerd)
+    participant H as Hub (remote module)
+    participant DB as MongoDB
+    V->>D: clipboard write / file upload (P2P data channel)
+    D->>V: clipboard read or change / file download
+    Note over D: session_telemetry: clipboard tallies (cumulative),<br/>one note per completed file (name hashed at once)
+    D->>H: rc:session.stats { transfers } every 30 s,<br/>and once more as the session ends
+    H->>H: the session is this device's?<br/>clipboard needs CLIPBOARD, files need FILES
+    H->>DB: $max into remote_sessions.transfer_totals,<br/>returning the totals stored before
+    H->>DB: transfer_activity rows: the clipboard difference per direction,<br/>one row per file
+```
+
+| Rule | Why |
+|---|---|
+| **A claim, kept apart from the decision**: rows go to `transfer_activity`, never `remote_audit` | `remote_audit` holds what the server decided, here the `CLIPBOARD` / `FILES` grant. A transfer is something a host that may be compromised reports, so it is a claim, as in `recording_activity` and `ssh_activity`. The four clipboard and file `AuditKind`s are left unwritten |
+| **The session must be the reporting device's, and the grant must allow the traffic** | Otherwise a device could write about a session it does not hold, or claim traffic the session could not carry. The live session decides first; after it ends, its stored row decides |
+| **The clipboard tallies are cumulative; the server keeps the difference** | A lost sample costs nothing, and a repeated one adds nothing. The totals sit in `transfer_totals`, outside `stats`, which `mark_ended` rewrites whole: a reset would count everything again |
+| **A last sample as the session ends** (`rc:terminate`, or the host's Disconnect, sent before the terminate) | A session shorter than one 30 s sample would otherwise report nothing. It is skipped when the session's telemetry does not answer, because a sample of zeros could overwrite the live totals of a session the server has not ended yet |
+| **A name hash must be 64 lowercase hex digits** | Free text there would let a host store the very name the hash keeps out. At most 256 files are kept per sample |
+| **A renegotiated session keeps its readings** (a second offer for one session id builds a new peer) | The old peer's drop forgets its counters. The device carries the tallies and waiting notes over to the new peer, or its cumulative readings would restart below the server's stored totals and count nothing until they caught up |
+
+⚠️ **An empty result is not proof that nothing crossed.** A compromised host can stay silent. A
+session that dies with the control WS loses its last sample. A download stopped partway leaves no
+row, because a file row is written when the transfer completes.
+
+The trail is read at `GET /api/tenant/{tid}/transfer-activity/{agent_id}` under
+`VIEW_REMOTE_AUDIT`. Like the recording trail, it still resolves for a removed device.
 
 ### 11.4 The reality of misuse
 

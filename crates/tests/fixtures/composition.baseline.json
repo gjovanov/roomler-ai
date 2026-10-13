@@ -745,6 +745,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/tenant/{tenant_id}/transfer-activity/{agent_id}",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/tunnel-client",
       "methods": "GET,HEAD"
     },
@@ -2261,6 +2265,30 @@
             "key": {
               "owner_id": 1
             }
+          }
+        ]
+      },
+      {
+        "collection": "transfer_activity",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "session_id": 1,
+              "at": 1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
           }
         ]
       },
@@ -3847,6 +3875,30 @@
             "key": {
               "owner_id": 1
             }
+          }
+        ]
+      },
+      {
+        "collection": "transfer_activity",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "session_id": 1,
+              "at": 1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
           }
         ]
       },
