@@ -108,6 +108,9 @@ pub mod rc_local_turn;
 /// default off), and the ICE filters that keep it off.
 pub mod rc_overlay;
 pub mod rc_sessions;
+/// FR-101 P1 — a remote-desktop session's transport hardening: SRTP/SRTCP
+/// replay windows and GCM-only DTLS, each with its own switch back.
+pub mod rc_transport;
 #[cfg(feature = "recording")]
 pub mod recording;
 pub mod relay_probe;

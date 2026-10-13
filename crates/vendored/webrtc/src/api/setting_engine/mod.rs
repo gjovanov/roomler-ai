@@ -76,6 +76,10 @@ pub struct SettingEngine {
     pub(crate) udp_network: UDPNetwork,
     pub(crate) disable_media_engine_copy: bool,
     pub(crate) srtp_protection_profiles: Vec<SrtpProtectionProfile>,
+    /// roomler patch (FR-101): the DTLS cipher suites to offer and accept.
+    /// Empty keeps webrtc-dtls' own default list, which still carries the
+    /// AES-256-CBC-SHA suites.
+    pub(crate) dtls_cipher_suites: Vec<dtls::cipher_suite::CipherSuiteId>,
     pub(crate) receive_mtu: usize,
     pub(crate) mid_generator: Option<Arc<dyn Fn(isize) -> String + Send + Sync>>,
     pub(crate) enable_sender_rtx: bool,
@@ -125,6 +129,15 @@ impl SettingEngine {
     /// The default srtp protection profiles are provided by the function `defaultSrtpProtectionProfiles`
     pub fn set_srtp_protection_profiles(&mut self, profiles: Vec<SrtpProtectionProfile>) {
         self.srtp_protection_profiles = profiles
+    }
+
+    /// set_dtls_cipher_suites restricts the DTLS handshake to `suites`. Empty
+    /// (the default) keeps webrtc-dtls' own list.
+    ///
+    /// roomler patch (FR-101): upstream has no way to drop the CBC suites from
+    /// a peer connection's handshake.
+    pub fn set_dtls_cipher_suites(&mut self, suites: Vec<dtls::cipher_suite::CipherSuiteId>) {
+        self.dtls_cipher_suites = suites;
     }
 
     /// set_ice_timeouts sets the behavior around ICE Timeouts

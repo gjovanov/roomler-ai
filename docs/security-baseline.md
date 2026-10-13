@@ -287,6 +287,18 @@ new verb cannot reach it by default. Widening it is a security change and needs
 review like one. The root socket itself is unchanged. Kill switch:
 `ROOMLERD_PERSON_SOCKET=0`.
 
+**A remote-desktop session's media transport is hardened past webrtc-rs' defaults**
+(FR-101 P1, `agents/roomlerd/src/rc_transport.rs`, applied in `AgentPeer::new`):
+
+| Setting | Default now | Why | Switch back |
+|---|---|---|---|
+| SRTP + SRTCP replay window | 64 | webrtc-srtp 0.14 has **no** replay window unless one is set: an on-path attacker could replay a captured SRTCP PLI (forcing an IDR) or REMB (capping the rate) without decrypting anything | `ROOMLERD_SRTP_REPLAY_WINDOW=0` |
+| DTLS cipher suites | the two ECDHE-AES-128-GCM-SHA256 suites | webrtc-dtls' default list still offers ECDHE-AES-256-CBC-SHA; every supported browser negotiates GCM | `ROOMLERD_DTLS_LEGACY_SUITES=1` |
+
+The suite list needs a setter upstream does not have. It is a one-field patch to the
+vendored webrtc crate (`SettingEngine::set_dtls_cipher_suites`, noted in the workspace
+`Cargo.toml`). Tunnel and overlay peers build their own engines and are unchanged.
+
 ---
 
 ## 5 · Network-facing surfaces
