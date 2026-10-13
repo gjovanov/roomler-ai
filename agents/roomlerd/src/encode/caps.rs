@@ -851,6 +851,21 @@ fn input_permission_granted() -> bool {
     }
 }
 
+/// `AgentCaps.video`: properties of the video wire this build speaks.
+/// `chunk-framing` always (FR-17); `bench` only on a bench target (FR-16 L4:
+/// the synthetic source selected and `ROOMLERD_BENCH` on), so a viewer sends
+/// its probes only where a frame will answer them. The probe child inherits
+/// the environment, so it reads the same answer the daemon would.
+fn video_features() -> Vec<String> {
+    #[allow(unused_mut)]
+    let mut features = vec!["chunk-framing".to_string()];
+    #[cfg(feature = "synthetic-frame-source")]
+    if crate::capture::synthetic_backend::bench_active() {
+        features.push("bench".to_string());
+    }
+    features
+}
+
 /// `run_hw_probes = false` computes everything that needs no driver call —
 /// which is exactly the honest answer when the probe child did not come back.
 ///
@@ -1421,7 +1436,7 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         // receiver can reassemble without relying on the channel being
         // ordered. Advertised unconditionally: it is a property of the
         // code, not of the host or its hardware.
-        video: vec!["chunk-framing".to_string()],
+        video: video_features(),
         // Empty in the child's struct BY DESIGN; `detect()` fills it in the
         // daemon (`files_caps`). A test locks this.
         files: Vec::new(),
