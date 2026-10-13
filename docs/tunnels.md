@@ -477,6 +477,63 @@ bound — and must be reported as `pc_failed` no earlier than 20 s in),
 `the_reclaim_drops_a_parked_quic_peer_whose_connection_ended`
 (`agents/roomlerd/src/signaling.rs`).
 
+### ⚠️ A session that ends with a live flow ends that flow, both halves (#2129)
+
+The two #1754 sections free the per-session *peer* when a session ends. They do
+not free a *flow* still live at that moment — and that is the same leak again,
+one layer in. A `webrtc-dc-v1` session torn down mid-flow left the flow's
+[`run_flow`](../crates/tunnel-core/src/forward.rs) `forward.rs:581` hanging
+**forever** on both ends: `pump_dc_to_tcp` ends only when its mailbox closes,
+and the one sender lives in the DC's `on_message` closure that the flow's own
+`dc: Arc<RTCDataChannel>` keeps alive; `pump_tcp_to_dc` ends only on a `read`
+that an idle app never completes. So closing the peer could not actually free
+its sockets — the live flow's DC reference kept the whole ICE/DTLS/SCTP set
+bound. Field-measured client→exit on 0.4.133: **+13 UDP sockets per occurrence**
+on a many-interface exit (the closed peer's whole host-candidate set), still
+bound minutes later, with the dst socket left in **CLOSE-WAIT** and the app
+getting no EOF.
+
+**The rule: when a WebRTC-DC session ends, its live flows end — both halves,
+promptly.** A session-scoped cancellation —
+[`FlowCanceller`](../crates/tunnel-core/src/forward.rs) `forward.rs:508` →
+[`FlowCancel`] `forward.rs:536` — is handed to every `run_flow`, which `select`s
+it against its two pumps. When it fires both pumps are aborted: dropping each
+pump's `TcpStream` half closes the local socket in **both** directions (the app
+or the dst sees EOF/RST, no CLOSE-WAIT), and `run_flow` returns, releasing this
+flow's DC reference so the peer's sockets are freed once the peer is closed. The
+flow's `rc:tunnel.tcp.closed` reason is **`ServerTerminated`** — the session was
+torn down, which is neither a clean `Eof` nor a socket `IoError`.
+
+⚠️ **A mailbox close alone is not enough.** The demux's in-band
+`HALF_CLOSE_MAGIC` path ends only `pump_dc_to_tcp`; `pump_tcp_to_dc` stays parked
+on an idle `read`. Cancellation is what drives **both** halves — an idle app or a
+target holding a half-open connection would otherwise still pin the flow.
+
+Where it fires:
+
+| End | Trigger | Where |
+|---|---|---|
+| exit | `AgentTunnelPeer::close` — the one method every real teardown reaches: the `rc:tunnel.terminate` arm, the #1754 reap, and the WS-disconnect sweep (`close_all_tunnel_peers`) | [`peer.rs:347`](../agents/roomlerd/src/tunnel/peer.rs), the handle passed to the flow at [`acceptor.rs:186`](../agents/roomlerd/src/tunnel/acceptor.rs) |
+| client | the DC carrier being dropped (`kill_flow`, the session dying, a re-upgrade drain reaching zero, the standalone CLI's session end) — a `CancelOnDrop` in `Plane::Dc` fires it from `Drop` | [`driver.rs:486`](../crates/tunnel-core/src/driver.rs) · installed at `driver.rs:1266` |
+
+⚠️ **The exclusion is `close`, not the loop exit.** The cancel is tied to
+`AgentTunnelPeer::close`, so a peer that is **kept** — never closed, e.g. one
+preserved across a control-WS reattach (R3, `tunnel_peers_survive_reattach`) —
+keeps its live flows. Only a real teardown, which closes the peer, ends them.
+
+⚠️ **An FR-86 drain is unaffected.** A draining carrier is dropped only once its
+`active()` reaches 0 (§"Re-upgrade: probe → promote → drain"), so when its
+`CancelOnDrop` fires there is no live flow to cancel — make-before-break still
+never cuts an established connection.
+
+Locked by lib tests, each shown red with a one-line `// NC2129-*` negative
+control: `forward::tests::a_live_flow_ends_on_both_ends_when_its_session_is_cancelled`
+(a real two-peer DC flow, both ends idle, cancelled → both see EOF within 2 s),
+`driver::tests::dropping_a_dc_carrier_ends_its_live_connection` (the client
+carrier drop), and `tunnel::peer::tests::closing_the_peer_ends_its_live_flows`
+with its exclusion control `a_kept_peer_keeps_its_live_flows`
+(`agents/roomlerd/src/tunnel/peer.rs`).
+
 ### ⚠️ The exit never awaits a TURN allocation on its signaling loop (#1761)
 
 An exit agent serves every session of its org from **one** signaling loop
@@ -498,7 +555,7 @@ exit's own log:
 | Exit time (UTC) | Event |
 |---|---|
 | 18:32:39.9 · 18:33:00.2 · 18:33:20.5 · 18:33:40.8 | `agent QUIC peer ready` (QUIC-over-TURN) for four sessions — **exactly 20.3 s apart, strictly serial** |
-| 18:33:40.76 | `agent QUIC-over-DERP peer ready` for a session the client opened at **18:33:02** and abandoned at **18:33:32** — the quic-derp branch is synchronous and instant, and still answered 38 s late, past the client's 30 s `QUIC_READY_TIMEOUT` (`crates/tunnel-core/src/driver.rs:283`) |
+| 18:33:40.76 | `agent QUIC-over-DERP peer ready` for a session the client opened at **18:33:02** and abandoned at **18:33:32** — the quic-derp branch is synchronous and instant, and still answered 38 s late, past the client's 30 s `QUIC_READY_TIMEOUT` (`crates/tunnel-core/src/driver.rs:285`) |
 | 18:33:40.77–.80 | the WebRTC fallbacks' SDP answers, in the same burst, also late |
 | 18:32:09 | `torn down agent QUIC tunnel peers on ws disconnect count=4` — the exit's control WS had dropped mid-backlog, its keepalives unanswered |
 
@@ -595,12 +652,12 @@ established beside the first, promoted, the first drained.
 
 | Piece | What it is | Where |
 |---|---|---|
-| `establish_tunnel_session` | everything a session did up to (not including) its bind — hello/open, the transport handshake, the DC pool open or the QUIC connection authenticated, the dispatcher task, the keepalive, the #1754 terminate guard — returning `Establishment::Established(carrier)`, or the same `QuicSetupFailed` soft-fall the ladder always keyed on | [`driver.rs:916`](../crates/tunnel-core/src/driver.rs) |
-| `Carrier` | **one type for both transports** — they differ only in the plane they pump on, everything else (sink, session id, target, reply registry, the P7 backstop, the dispatcher, the guard) is the same object. `carry(tcp, peer_addr)` spawns exactly the per-connection task the accept loop used to; `active()` counts connections in flight; `dead()` is the accept loop's old exit arms (the dispatcher exited · the P7 backstop tripped · QUIC `conn.closed()`), sending the same `io_error` terminate the loops sent; **dropping it is the old end of the session function** — dispatcher aborted, peer closed, terminate sent | [`driver.rs:443`](../crates/tunnel-core/src/driver.rs) · `carry` `:571` · `dead` `:731` |
+| `establish_tunnel_session` | everything a session did up to (not including) its bind — hello/open, the transport handshake, the DC pool open or the QUIC connection authenticated, the dispatcher task, the keepalive, the #1754 terminate guard — returning `Establishment::Established(carrier)`, or the same `QuicSetupFailed` soft-fall the ladder always keyed on | [`driver.rs:955`](../crates/tunnel-core/src/driver.rs) |
+| `Carrier` | **one type for both transports** — they differ only in the plane they pump on, everything else (sink, session id, target, reply registry, the P7 backstop, the dispatcher, the guard) is the same object. `carry(tcp, peer_addr)` spawns exactly the per-connection task the accept loop used to; `active()` counts connections in flight; `dead()` is the accept loop's old exit arms (the dispatcher exited · the P7 backstop tripped · QUIC `conn.closed()`), sending the same `io_error` terminate the loops sent; **dropping it is the old end of the session function** — dispatcher aborted, peer closed, terminate sent | [`driver.rs:445`](../crates/tunnel-core/src/driver.rs) · `carry` `:606` · `dead` `:770` |
 | `FlowListener` | the flow's port: bound **once**, an accept task hands each connection to the current carrier — or **holds** it while there is none — under one lock, so "no carrier ⇒ hold" and "install ⇒ drain the hold" cannot interleave to strand one, and (#1816) the hand-off itself — `carry`, which counts the connection — runs under that lock too, so it cannot interleave with a promotion's swap | [`flow_listener.rs:90`](../crates/tunnel-core/src/flow_listener.rs) · `install` `:150` · `offer` `:197` |
 | `HoldPolicy` | the hold's bounds: at most **64** connections, each for at most **30 s**; past either bound the connection is **closed** (the client sees EOF), never refused | [`flow_listener.rs:67`](../crates/tunnel-core/src/flow_listener.rs) |
 | the daemon's flow | binds once when its supervisor starts (a failed bind retries on the same ladder a failed session did), runs the transport ladder to a carrier, installs it, waits for `dead()`, clears, backs off — the port bound throughout | [`client_mgr.rs:1198`](../agents/roomlerd/src/tunnel/client_mgr.rs) `run_flow_supervisor` · `:1360` `run_flow_cycle` |
-| the standalone CLI | `run_tunnel_session` composes establish + a private accept loop with a per-session bind, so `roomler forward` / `socks5` behave exactly as before | [`driver.rs:854`](../crates/tunnel-core/src/driver.rs) |
+| the standalone CLI | `run_tunnel_session` composes establish + a private accept loop with a per-session bind, so `roomler forward` / `socks5` behave exactly as before | [`driver.rs:893`](../crates/tunnel-core/src/driver.rs) |
 
 ```mermaid
 sequenceDiagram
@@ -641,7 +698,7 @@ open's 15 s and the ready's 30 s are caps a healthy exit cuts to 1–5 s) and is
 client timeout worth waiting out. Both are constants in P1, not config.
 
 ⚠️ **Nothing about #1754 moved.** The terminate guard is created at the same point
-([`driver.rs:1014`](../crates/tunnel-core/src/driver.rs), the moment the session id is
+([`driver.rs:1053`](../crates/tunnel-core/src/driver.rs), the moment the session id is
 known) and *moves into the carrier*, so an early `?`, a `QuicSetupFailed` soft-fall, the
 carrier's drop and the `kill_flow` abort all still tell the exit, and `kill_flow`'s
 synchronous fast path is unchanged. A killed flow drops its listener — the accept task is
@@ -715,12 +772,12 @@ The schedule (a pure [`ReupgradeBackoff`](../agents/roomlerd/src/tunnel/client_m
 | the probe gate | `auto` flow **and** kill switch on (`reupgrade_active`); a pinned transport never probes | [`client_mgr.rs:854`](../agents/roomlerd/src/tunnel/client_mgr.rs) · ranking `better_transports` `:874` |
 | the candidate | a background task that runs the restricted ladder — only transports **better** than the active one, best first — over the shared agent WS, into a throwaway `FlowLive` so a failed/aborted probe never touches the live route's demux | [`spawn_candidate` `:1070`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `establish_candidate` `:1107` · `CandidateGuard` `:1034` |
 | promotion | `listener.install(candidate)` (new connections → candidate, atomically) + `FlowLive.transport`/`session_id` updated + one info line; the old carrier becomes draining | [`run_flow_cycle` `:1360`](../agents/roomlerd/src/tunnel/client_mgr.rs) |
-| the drain | the old carrier keeps its established connections until `active()` hits 0 (or it dies), then is dropped → terminate → the exit frees its peer, and its demux entry is reaped — both from a guard, so an aborted reaper ends the same way | [`drain_carrier` `:997`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `DrainGuard` `:968` · `spawn_drain` `:1025` · [`Carrier::drained`](../crates/tunnel-core/src/driver.rs) `driver.rs:551` |
+| the drain | the old carrier keeps its established connections until `active()` hits 0 (or it dies), then is dropped → terminate → the exit frees its peer, and its demux entry is reaped — both from a guard, so an aborted reaper ends the same way | [`drain_carrier` `:997`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `DrainGuard` `:968` · `spawn_drain` `:1025` · [`Carrier::drained`](../crates/tunnel-core/src/driver.rs) `driver.rs:586` |
 
 ⚠️ **A draining connection is NEVER cut, and there is no maximum drain time.** An RDP
 session that lives for hours keeps its old carrier for hours. The old carrier is dropped
 only when its own `active()` reaches 0 — signalled by a `Notify` the RAII in-flight
-counter fires on the last decrement ([`Carrier::drained`], `driver.rs:551`), not by any
+counter fires on the last decrement ([`Carrier::drained`], `driver.rs:586`), not by any
 timer. Cutting it would defeat the whole point.
 
 ⚠️ **A draining carrier's end runs on every exit of its reaper — abort included**
