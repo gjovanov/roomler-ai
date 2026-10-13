@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 //! FR-90 P2f-1 — a session teleported for real, end to end: a real server,
-//! the primary in-process, and the target a process of its own (this test
-//! binary again, asked to be a device by [`device_process`], which an
-//! ordinary run passes at once). The target holds no copy of the session, and
-//! its owner never let it hold copies at all (`hive_replica` off): what lets
-//! it take the session is the teleport's prepare. Nothing is seeded on the
-//! record; the route starts the teleport, and each step after it is a
-//! device's own frame.
+//! and each device a process of its own (this test binary again, asked to be
+//! a device by [`device_process`], which an ordinary run passes at once). The
+//! target holds no copy of the session, and its owner never let it hold
+//! copies at all (`hive_replica` off): what lets it take the session is the
+//! teleport's prepare. Nothing is seeded on the record; the route starts the
+//! teleport, and each step after it is a device's own frame.
 //!
 //! | step | the devices | what the test reads |
 //! |---|---|---|
@@ -17,8 +16,18 @@
 //! | the moved start | B takes the session over from the copy it took, the history and the folder put in place, then `--resume` | the folder's file; B's resume note; a prompt answered by B's harness, which remembers A's two prompts |
 //! | the old primary | A is demoted, its harness stopped; it holds copies, so it stays a member | A's harness gone; A's row a member's |
 //!
+//! P2f-2b — the teleport twice, once for each [`Folder`]: a folder in no
+//! repository, the target's empty, the server's `teleport_have_want` off as
+//! it ships; and the person's own repository, the target's folder a clone of
+//! it from a remote as it were (`--no-local`), the server saying `have_want`.
+//! The target then asks the primary for the workspace's first pack against
+//! its clone's `HEAD`, and keeps the answer as a substitute: it holds none of
+//! the whole pack's own blobs, the folder comes whole all the same, and the
+//! clone's `HEAD` is still the person's.
+//!
 //! ⚠️ The stream rides `direct` on loopback: the tests build carries no
-//! overlay, as in the canary.
+//! overlay, as in the canary. ⚠️ A process holds one supervisor, so the two
+//! scenarios share this binary only because neither device runs in it.
 #![cfg(target_os = "linux")]
 
 use std::os::unix::fs::PermissionsExt;
@@ -92,21 +101,84 @@ const LONG: Duration = Duration::from_secs(90);
 /// device.
 const DEVICE_ENV: &str = "HIVE_TELEPORT_DEVICE";
 
+/// Where the session's folder is, on either device.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Folder {
+    /// In no repository: its checkpoints go to a shadow; the target's folder
+    /// is empty. The server's `teleport_have_want` is off, as it ships.
+    Plain,
+    /// P2f-2b — the person's own repository, with history; the target's
+    /// folder a clone of it. The server's `teleport_have_want` is on.
+    Clone,
+}
+
+/// The person's history in [`Folder::Clone`]: a file the clone holds, and
+/// big enough that a pack which carries it is told from one which does not.
+fn history() -> String {
+    (0..2_000u64)
+        .map(|i| {
+            let n = i.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17);
+            format!("pub const C{i}: u64 = {n:#018x};\n")
+        })
+        .collect()
+}
+
+/// `git` as the person runs it in `dir`: its output, trimmed.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .args([
+            "-c",
+            "user.name=Person",
+            "-c",
+            "user.email=person@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// A device's process: this binary again, from the config the scenario
 /// enrolled and saved in its directory, until its stdin closes. An ordinary
-/// run passes it at once.
+/// run passes it at once. With `RUST_LOG` set, it logs to its stderr, each
+/// line naming the device by its thread.
 #[test]
 fn device_process() {
     let Ok(dir) = std::env::var(DEVICE_ENV) else {
         return;
     };
     let dir = PathBuf::from(dir);
+    let name = format!(
+        "device-{}",
+        dir.file_name().unwrap_or_default().to_string_lossy()
+    );
+    if std::env::var("RUST_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .with_thread_names(true)
+            .try_init();
+    }
     let joined = std::thread::Builder::new()
-        .name("hive-teleport-device".into())
+        .name(name.clone())
         .stack_size(16 << 20)
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
+                .thread_name(name)
                 .build()
                 .unwrap();
             rt.block_on(async move {
@@ -140,17 +212,28 @@ fn device_process() {
 
 #[test]
 fn a_session_teleports_to_a_device_that_held_no_copy_and_runs_there_from_it() {
-    // Its own thread with a deep stack, and a current-thread runtime, as the
-    // canary: several servers' worth of tasks live in one body.
+    run(Folder::Plain);
+}
+
+/// P2f-2b — into a clone of the person's repository, taking only what the
+/// clone lacks.
+#[test]
+fn a_session_teleports_into_a_clone_taking_the_workspace_against_its_head() {
+    run(Folder::Clone);
+}
+
+/// The scenario on its own thread with a deep stack, and a current-thread
+/// runtime, as the canary: several servers' worth of tasks live in one body.
+fn run(folder: Folder) {
     let joined = std::thread::Builder::new()
-        .name("hive-teleport".into())
+        .name(format!("hive-teleport-{folder:?}"))
         .stack_size(16 << 20)
-        .spawn(|| {
+        .spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(scenario())
+                .block_on(scenario(folder))
         })
         .unwrap()
         .join();
@@ -290,10 +373,11 @@ fn alive(pid: &str) -> bool {
     Path::new("/proc").join(pid.trim()).exists()
 }
 
-async fn scenario() {
+async fn scenario(folder: Folder) {
     let app = TestApp::spawn_with_settings(|s| {
         s.modules.hive = true;
         s.hive.replicaset = true;
+        s.hive.teleport_have_want = folder == Folder::Clone;
         s.app.rate_limit_per_sec = 1_000;
         s.app.rate_limit_burst = 10_000;
     })
@@ -303,27 +387,30 @@ async fn scenario() {
     let owner = seeded.admin.access_token.clone();
     let dir = tempfile::tempdir().unwrap();
 
-    // ── A, the primary, in this process; B, the target, in its own ─────────
+    // ── A, the primary, and B, the target, each in a process of its own ────
     let a_dir = dir.path().join("a");
     let a_work = device_dir(&a_dir);
+    // The person's `HEAD`, where the folder is their repository.
+    let person_head = (folder == Folder::Clone).then(|| {
+        git(&a_work, &["init", "-q"]);
+        std::fs::write(a_work.join("lib.rs"), history()).unwrap();
+        git(&a_work, &["add", "-A"]);
+        git(&a_work, &["commit", "-q", "-m", "the person's history"]);
+        git(&a_work, &["rev-parse", "HEAD"])
+    });
     std::fs::write(a_work.join("notes.md"), WORK).unwrap();
     let mut a_cfg = enrol(&app, &seeded, "hive-teleport-a").await;
     runs(&mut a_cfg, &seeded, &a_dir, true);
-    roomlerd::hive::init_as_daemon(
-        &a_cfg,
-        &a_dir.join("hive.db"),
-        &a_dir.join("run"),
-        &a_dir.join("home"),
-    )
-    .expect("the test launcher");
     let a = a_cfg.agent_id.clone();
-    let (stop_a, stop_rx) = tokio::sync::watch::channel(false);
-    let a_task = spawn_device(a_cfg, stop_rx);
-    wait_online(&app, &seeded, &a).await;
+    let a_proc = device(&app, &seeded, &a_dir, &a_cfg).await;
 
     // B runs the owner's sessions, and holds no copies of any.
     let b_dir = dir.path().join("b");
     let b_work = device_dir(&b_dir);
+    if folder == Folder::Clone {
+        let from = a_work.display().to_string();
+        git(&b_dir, &["clone", "-q", "--no-local", &from, "roots/work"]);
+    }
     let mut b_cfg = enrol(&app, &seeded, "hive-teleport-b").await;
     runs(&mut b_cfg, &seeded, &b_dir, false);
     let b = b_cfg.agent_id.clone();
@@ -416,6 +503,18 @@ async fn scenario() {
         Some(WORK),
         "the folder came with the session"
     );
+    if let Some(head) = &person_head {
+        assert_eq!(
+            std::fs::read_to_string(b_work.join("lib.rs")).ok(),
+            Some(history()),
+            "the person's history, as the clone held it"
+        );
+        assert_eq!(
+            &git(&b_work, &["rev-parse", "HEAD"]),
+            head,
+            "the clone's HEAD is the person's still"
+        );
+    }
     let note = resume_note_of(&b_dir, &sid);
     assert!(
         note.contains("moved to this device by")
@@ -459,6 +558,48 @@ async fn scenario() {
     .await;
 
     stop(b_proc).await;
-    let _ = stop_a.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(10), a_task).await;
+    stop(a_proc).await;
+
+    // ── P2f-2b — what B took in place of the workspace's whole pack ────────
+    if let Some(head) = &person_head {
+        let store = roomler_hive_node::store::Store::open(&b_dir.join("hive.db"))
+            .expect("B's store, its process gone");
+        let whole = store
+            .of_kind(&sid, "checkpoint", 1_000)
+            .expect("B's copy of the chain")
+            .iter()
+            .find_map(
+                |e| match roomler_hive_node::TranscriptEvent::from_json(&e.event_json) {
+                    Some(roomler_hive_node::TranscriptEvent::Checkpoint(cp)) => cp
+                        .workspace
+                        .filter(|ws| ws.base.is_none() && !ws.pack.is_empty()),
+                    _ => None,
+                },
+            )
+            .expect("a checkpoint holding the workspace's pack whole");
+        let sub = store
+            .substitute(&sid, &whole.commit)
+            .unwrap()
+            .expect("B keeps a substitute for the whole pack");
+        assert_eq!(
+            sub.against,
+            vec![head.clone()],
+            "thin against the clone's HEAD"
+        );
+        for c in &whole.pack {
+            assert!(
+                !store.has_blob(&sid, &c.hash.0).unwrap(),
+                "B holds none of the whole pack's own blobs"
+            );
+        }
+        let len = |chunks: &[roomler_hive_node::checkpoint::Chunk]| -> u64 {
+            chunks.iter().map(|c| c.len).sum()
+        };
+        let (took, whole_len) = (len(&sub.chunks), len(&whole.pack));
+        eprintln!("hive_teleport: took {took} bytes of a {whole_len}-byte whole pack");
+        assert!(
+            took * 4 < whole_len,
+            "the clone's history did not come again: {took} of {whole_len}"
+        );
+    }
 }

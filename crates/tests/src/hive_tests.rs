@@ -4342,6 +4342,46 @@ async fn a_teleport_joins_its_target_then_moves_the_session_as_a_promotion() {
     );
 }
 
+/// FR-90 P2f-2b — a teleport's prepare tells its target it may take the
+/// workspace's first pack as one against what its folder's repository holds
+/// (`have_want`) only where the deployment turned that on
+/// (`hive.teleport_have_want`, default off: decision 16 is the operator's);
+/// a promotion's never does, its target holding a copy already. Off, the
+/// prepare carries no word of it, as an older server's.
+#[tokio::test]
+async fn only_a_teleports_prepare_says_have_and_want_and_only_once_turned_on() {
+    for on in [false, true] {
+        let app = TestApp::spawn_with_settings(|s| {
+            s.modules.hive = true;
+            s.hive.replicaset = true;
+            s.hive.promote_prepare_secs = 4;
+            s.hive.promote_join_secs = 6;
+            s.hive.promote_drain_secs = 4;
+            s.hive.promote_sync_secs = 4;
+            s.hive.teleport_have_want = on;
+            s.app.rate_limit_per_sec = 100;
+            s.app.rate_limit_burst = 1000;
+        })
+        .await;
+        let mut t = teleportable(&app, &format!("havewant{on}"), TELEPORT_TARGET).await;
+        let (body, prep) = teleport_answered(&app, &mut t, None, None).await;
+        assert_eq!(body["outcome"], "teleporting", "{body}");
+        assert_eq!(
+            (prep["teleport"].as_bool(), prep.get("have_want")),
+            (Some(true), on.then_some(&json!(true))),
+            "a teleport's prepare, turned on {on}: {prep}"
+        );
+        let mut p = promotable(&app, &format!("havewantpromote{on}"), 0, PROMOTES).await;
+        let (body, prep) = promote_answered(&app, &mut p, None).await;
+        assert_eq!(body["outcome"], "promoting", "{body}");
+        assert_eq!(
+            (prep.get("teleport"), prep.get("have_want")),
+            (None, None),
+            "a promotion's prepare, turned on {on}: {prep}"
+        );
+    }
+}
+
 /// FR-90 P2f-1 — a teleport is refused by the gate it failed, each in its
 /// own word: the route is not there with the replicaset off; a device that
 /// holds a copy already is promoted to, not teleported to; the target and the

@@ -310,6 +310,7 @@ async fn scenario() {
                 user_email: seeded.admin.email.clone(),
                 caller: "hivedrain Admin".into(),
                 teleport: false,
+                have_want: false,
             },
         )
         .expect("the prepare reaches the device");

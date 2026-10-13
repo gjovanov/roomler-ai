@@ -86,20 +86,28 @@ pub(crate) enum Ask {
 pub(crate) enum Answer {
     Holds {
         held: Vec<String>,
+        /// P2f-2b — the commit the folder's own repository's `HEAD` names:
+        /// one more have to offer, which a source holds when this clone is
+        /// behind its own.
+        head: Option<String>,
     },
     /// `pack` is thin against `against`, every one of them a commit the
     /// request named.
-    Pack {
-        against: Vec<String>,
-        pack: Vec<u8>,
-    },
+    Pack { against: Vec<String>, pack: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "answer", rename_all = "snake_case")]
 enum Header {
-    Holds { held: Vec<String> },
-    Pack { against: Vec<String>, len: u64 },
+    Holds {
+        held: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head: Option<String>,
+    },
+    Pack {
+        against: Vec<String>,
+        len: u64,
+    },
 }
 
 /// The child's work, as the account.
@@ -113,6 +121,7 @@ pub(crate) fn produce(req: &Request, git: &Git) -> Result<Answer, String> {
     match &req.ask {
         Ask::Holds { candidates } => Ok(Answer::Holds {
             held: workspace::holds(git, &req.folder, &req.state_dir, candidates)?,
+            head: workspace::head_of(git, &req.folder, &req.state_dir)?,
         }),
         Ask::Pack { commit, haves } => {
             let (pack, against) =
@@ -125,7 +134,10 @@ pub(crate) fn produce(req: &Request, git: &Git) -> Result<Answer, String> {
 /// The child's stdout: [`MAGIC`], the header, then the pack.
 pub(crate) fn write_frames(out: &mut impl Write, answer: &Answer) -> std::io::Result<()> {
     let header = match answer {
-        Answer::Holds { held } => Header::Holds { held: held.clone() },
+        Answer::Holds { held, head } => Header::Holds {
+            held: held.clone(),
+            head: head.clone(),
+        },
         Answer::Pack { against, pack } => Header::Pack {
             against: against.clone(),
             len: pack.len() as u64,
@@ -169,7 +181,7 @@ pub(crate) fn read_frames(bytes: &[u8]) -> Result<Answer, String> {
     let header: Header = serde_json::from_slice(take(header_len, "the header")?)
         .map_err(|e| format!("the header: {e}"))?;
     let answer = match header {
-        Header::Holds { held } => Answer::Holds { held },
+        Header::Holds { held, head } => Answer::Holds { held, head },
         Header::Pack { against, len } => {
             if len > workspace::MAX_PACK as u64 {
                 return Err(format!("a pack of {len} bytes"));
@@ -201,8 +213,14 @@ pub(crate) fn check(req: &Request, answer: &Answer) -> Result<(), String> {
         Ok(())
     }
     match (&req.ask, answer) {
-        (Ask::Holds { candidates }, Answer::Holds { held }) => {
-            named_once(held, candidates, "it holds")
+        (Ask::Holds { candidates }, Answer::Holds { held, head }) => {
+            named_once(held, candidates, "it holds")?;
+            match head {
+                Some(h) if !workspace::is_object_id(h) => {
+                    Err(format!("its HEAD, {h:?}, is not a commit id"))
+                }
+                _ => Ok(()),
+            }
         }
         (Ask::Pack { haves, .. }, Answer::Pack { against, pack }) => {
             named_once(against, haves, "a pack against")?;
@@ -220,16 +238,24 @@ pub(crate) fn check(req: &Request, answer: &Answer) -> Result<(), String> {
 
 // ─── the daemon's side ──────────────────────────────────────────────────────
 
+/// P2f-2b — where a session runs on this device, and as whom: what a `pack`
+/// is asked of while it runs here (the source's side of the stream's have
+/// and want). Kept from its launch.
+pub(crate) struct Workplace {
+    pub who: super::materializer::Who,
+    pub folder: PathBuf,
+    pub state_dir: PathBuf,
+}
+
 /// Ask `req` of the session's account on this device (`who`), through `run`:
-/// the child as the account, or in this process in tests. `runtime_dir` is
-/// the session's own, where the request goes; `owner` the account's ids, to
-/// hand it the request (Unix). The answer is held to the request.
-#[cfg_attr(not(all(test, unix)), allow(dead_code))] // P2f-2b's stream asks it
+/// the child as the account, fed the request on its stdin, or in this
+/// process in tests. The answer is held to the request.
+///
+/// ⚠️ On stdin, never a file (P2f-2b): a teleport's target asks before the
+/// session has a runtime directory here to put a request in.
 pub(crate) async fn ask(
     run: &Runner,
-    runtime_dir: &Path,
     who: &super::materializer::Who,
-    owner: Option<(u32, u32)>,
     req: &Request,
 ) -> Result<Answer, String> {
     match run {
@@ -247,14 +273,11 @@ pub(crate) async fn ask(
         #[cfg(all(test, unix))]
         Runner::Hangs => std::future::pending().await,
         Runner::Subprocess => {
-            let bytes = serde_json::to_vec(req).map_err(|e| e.to_string())?;
-            let path = super::checkpointer::write_private(runtime_dir, "pack.json", &bytes, owner)?;
             let exe = PathBuf::from(super::supervisor::own_exe()?);
             #[cfg(unix)]
             {
                 run_as(
                     &exe,
-                    &path,
                     req,
                     who.account.as_deref(),
                     who.env.clone(),
@@ -265,38 +288,32 @@ pub(crate) async fn ask(
             #[cfg(windows)]
             {
                 let account = who.account.clone().ok_or("no account to run as")?;
-                let req = req.clone();
-                tokio::task::spawn_blocking(move || {
-                    run_as_console_user(&exe, &path, &req, &account, PACK_TIMEOUT)
-                })
-                .await
-                .map_err(|e| format!("the pack's thread: {e}"))?
+                run_as_console_user(&exe, req, account, PACK_TIMEOUT).await
             }
         }
     }
 }
 
-/// The daemon's side on Unix: start `exe hive-pack <request_path>` as
-/// `account` (none in tests: as the daemon), with `env` and nothing of the
-/// daemon's own, and hold what it writes to `req`.
+/// The daemon's side on Unix: start `exe hive-pack` as `account` (none in
+/// tests: as the daemon), with `env` and nothing of the daemon's own, feed it
+/// `req` on stdin, and hold what it writes to `req`.
 #[cfg(unix)]
-#[cfg_attr(not(test), allow(dead_code))] // P2f-2b's stream asks it
 pub(crate) async fn run_as(
     exe: &Path,
-    request_path: &Path,
     req: &Request,
     account: Option<&str>,
     env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     timeout: Duration,
 ) -> Result<Answer, String> {
+    use super::child::Fed;
     use std::process::Stdio;
+    let bytes = serde_json::to_vec(req).map_err(|e| e.to_string())?;
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg(PACK_SUBCOMMAND)
-        .arg(request_path)
         .env_clear()
         .envs(env)
         .current_dir("/")
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -306,62 +323,81 @@ pub(crate) async fn run_as(
     if let Some(account) = account {
         crate::exec::apply_session_run_as(&mut cmd, account)?;
     }
-    let out = super::child::run_fed(
-        cmd,
-        PACK_SUBCOMMAND,
-        super::child::nothing,
-        timeout,
-        MAX_OUTPUT,
-    )
-    .await?;
+    let feed = |mut stdin: tokio::process::ChildStdin| async move {
+        // `stdin` is dropped at the end: the child's end of input.
+        match tokio::io::AsyncWriteExt::write_all(&mut stdin, &bytes).await {
+            Ok(()) => Fed::Done,
+            Err(_) => Fed::Closed,
+        }
+    };
+    let out = super::child::run_fed(cmd, PACK_SUBCOMMAND, feed, timeout, MAX_OUTPUT).await?;
     let answer = read_frames(&out)?;
     check(req, &answer)?;
     Ok(answer)
 }
 
-/// The daemon's side on Windows: start `exe hive-pack <request_path>` as the
-/// user signed in at the console, `account` naming them as `hive_accounts`
-/// does, and hold what it writes to `req`. Blocking: the caller runs it off
-/// the runtime's threads.
+/// The daemon's side on Windows: start `exe hive-pack` as the user signed in
+/// at the console, `account` naming them as `hive_accounts` does, feed it
+/// `req` through a thread that feeds its pipe, and hold what it writes to
+/// `req`.
 #[cfg(windows)]
-#[allow(dead_code)] // P2f-2b's stream asks it
-pub(crate) fn run_as_console_user(
+pub(crate) async fn run_as_console_user(
     exe: &Path,
-    request_path: &Path,
     req: &Request,
-    account: &str,
+    account: String,
     timeout: Duration,
 ) -> Result<Answer, String> {
-    use crate::hive_win;
-    let console = hive_win::console_user().map_err(|(_, e)| e)?;
-    hive_win::check_mapping(account, &console).map_err(|(_, e)| e)?;
-    let line = hive_win::pack_command_line(exe, request_path)?;
-    // SAFETY: `console` holds the token `spawn_as` borrows, across the call.
-    let out = unsafe { hive_win::run_checkpoint(console.spawn_as(), &line, timeout, MAX_OUTPUT) };
-    drop(console);
-    let answer = read_frames(&out?)?;
+    let bytes = serde_json::to_vec(req).map_err(|e| e.to_string())?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let exe = exe.to_path_buf();
+    let child = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        use crate::hive_win;
+        let console = hive_win::console_user().map_err(|(_, e)| e)?;
+        hive_win::check_mapping(&account, &console).map_err(|(_, e)| e)?;
+        let line = hive_win::pack_command_line(&exe)?;
+        // SAFETY: `console` holds the token `spawn_as` borrows, across the call.
+        let out = unsafe {
+            hive_win::run_fed(
+                console.spawn_as(),
+                &line,
+                Some(rx),
+                "the pack",
+                timeout,
+                MAX_OUTPUT,
+            )
+        };
+        drop(console);
+        out
+    });
+    // The whole request, then the child's end of input.
+    let _ = tx.send(bytes).await;
+    drop(tx);
+    let out = child
+        .await
+        .map_err(|e| format!("the pack's thread: {e}"))??;
+    let answer = read_frames(&out)?;
     check(req, &answer)?;
     Ok(answer)
 }
 
-/// This process's own request, when it was started as `roomlerd hive-pack
-/// <request>`.
-pub fn pack_args() -> Option<PathBuf> {
+/// Whether this process was started as `roomlerd hive-pack`, its request on
+/// stdin.
+pub fn pack_args() -> bool {
     let mut args = std::env::args_os().skip(1);
-    if args.next()? != PACK_SUBCOMMAND {
-        return None;
-    }
-    let request = args.next()?;
-    args.next().is_none().then(|| PathBuf::from(request))
+    args.next().is_some_and(|a| a == PACK_SUBCOMMAND) && args.next().is_none()
 }
 
-/// The child: read the request, answer it as whoever this process runs as
-/// (the session's account), write the answer to stdout. 0 on success; 1 with
-/// a word on stderr otherwise.
-pub fn pack_main(request: &Path) -> i32 {
+/// The child: read the request on stdin, answer it as whoever this process
+/// runs as (the session's account), write the answer to stdout. 0 on
+/// success; 1 with a word on stderr otherwise.
+pub fn pack_main() -> i32 {
     let run = || -> Result<(), String> {
-        let text =
-            std::fs::read(request).map_err(|e| format!("reading {}: {e}", request.display()))?;
+        let mut text = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(std::io::stdin().lock(), MAX_HEADER as u64 + 1),
+            &mut text,
+        )
+        .map_err(|e| format!("reading the request: {e}"))?;
         if text.len() > MAX_HEADER {
             return Err("the request is too large".into());
         }
@@ -391,15 +427,11 @@ mod tests {
     #[cfg(unix)]
     async fn run_child(
         exe: &Path,
-        request_path: &Path,
         req: &Request,
         env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
         timeout: Duration,
     ) -> Result<Answer, String> {
-        super::super::child::unbusy(|| {
-            super::run_as(exe, request_path, req, None, env.clone(), timeout)
-        })
-        .await
+        super::super::child::unbusy(|| super::run_as(exe, req, None, env.clone(), timeout)).await
     }
 
     /// `git` as a person runs it in `dir`.
@@ -476,6 +508,11 @@ mod tests {
         let answers = [
             Answer::Holds {
                 held: vec!["a".repeat(40)],
+                head: None,
+            },
+            Answer::Holds {
+                held: Vec::new(),
+                head: Some("c".repeat(40)),
             },
             Answer::Pack {
                 against: vec!["b".repeat(40)],
@@ -531,7 +568,7 @@ mod tests {
                 haves: vec![a.clone()],
             },
         );
-        let held = |held: Vec<String>| Answer::Holds { held };
+        let held = |held: Vec<String>| Answer::Holds { held, head: None };
         let packed = |against: Vec<String>, pack: Vec<u8>| Answer::Pack { against, pack };
         let refused = |r: Result<(), String>, word: &str| matches!(&r, Err(e) if e.contains(word));
         assert!(check(&holds, &held(vec![b.clone(), a.clone()])).is_ok());
@@ -543,6 +580,17 @@ mod tests {
         assert!(
             refused(check(&holds, &held(vec![a.clone(), a.clone()])), "twice"),
             "a commit named twice is refused"
+        );
+        // P2f-2b — the folder's own HEAD, when it names one, is a commit id;
+        // it is the folder's word, not one of the candidates.
+        let headed = |head: &str| Answer::Holds {
+            held: Vec::new(),
+            head: Some(head.to_string()),
+        };
+        assert!(check(&holds, &headed(&c)).is_ok());
+        assert!(
+            refused(check(&holds, &headed("HEAD")), "is not a commit id"),
+            "a HEAD that is no commit id is refused"
         );
         assert!(check(&pack, &packed(vec![a.clone()], pack_bytes())).is_ok());
         assert!(check(&pack, &packed(Vec::new(), pack_bytes())).is_ok());
@@ -591,10 +639,12 @@ mod tests {
             },
         );
         assert_eq!(
-            ask(&run, tmp.path(), &who, None, &asked).await.unwrap(),
+            ask(&run, &who, &asked).await.unwrap(),
             Answer::Holds {
-                held: vec![second.clone()]
-            }
+                held: vec![second.clone()],
+                head: Some(second.clone()),
+            },
+            "and the folder's own HEAD, one more have to offer"
         );
         let asked = request(
             &dir,
@@ -603,9 +653,7 @@ mod tests {
                 haves: vec![unknown, first.clone()],
             },
         );
-        let Answer::Pack { against, pack } =
-            ask(&run, tmp.path(), &who, None, &asked).await.unwrap()
-        else {
+        let Answer::Pack { against, pack } = ask(&run, &who, &asked).await.unwrap() else {
             panic!("a pack");
         };
         assert_eq!(against, vec![first]);
@@ -613,7 +661,7 @@ mod tests {
         assert_eq!(u32::from_be_bytes(pack[8..12].try_into().unwrap()), 3);
         let mut other = asked.clone();
         other.v = REQUEST_V + 1;
-        let got = ask(&run, tmp.path(), &who, None, &other).await;
+        let got = ask(&run, &who, &other).await;
         assert!(
             matches!(&got, Err(e) if e.contains("version")),
             "another version's request is refused: {got:?}"
@@ -645,12 +693,14 @@ mod tests {
         let good = frames_of(
             &Answer::Holds {
                 held: vec![held.clone()],
+                head: None,
             },
             "good.bin",
         );
         let lies = frames_of(
             &Answer::Holds {
                 held: vec!["b".repeat(40)],
+                head: None,
             },
             "lies.bin",
         );
@@ -660,30 +710,40 @@ mod tests {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
             p
         };
-        let request_path = tmp.path().join("pack.json");
         let path = vec![("PATH".into(), "/usr/bin:/bin".into())];
         let fast = Duration::from_secs(10);
 
+        // It answers only once its stdin held the request: the question is
+        // fed there, never left in a file.
         let answers = child(
             "good.sh",
-            &format!("[ \"$1\" = {PACK_SUBCOMMAND} ] && cat {}", good.display()),
+            &format!(
+                "[ \"$1\" = {PACK_SUBCOMMAND} ] && grep -q '\"holds\"' && cat {}",
+                good.display()
+            ),
         );
         assert_eq!(
-            run_child(&answers, &request_path, &req, path.clone(), fast)
-                .await
-                .unwrap(),
-            Answer::Holds { held: vec![held] }
+            run_child(&answers, &req, path.clone(), fast).await.unwrap(),
+            Answer::Holds {
+                held: vec![held],
+                head: None
+            },
+            "the request came on stdin"
         );
-        let lying = child("lies.sh", &format!("cat {}", lies.display()));
-        let got = run_child(&lying, &request_path, &req, path.clone(), fast).await;
+        let lying = child(
+            "lies.sh",
+            &format!("cat > /dev/null; cat {}", lies.display()),
+        );
+        let got = run_child(&lying, &req, path.clone(), fast).await;
         assert!(
             matches!(&got, Err(e) if e.contains("did not name")),
             "a child's answer is held to the request: {got:?}"
         );
-        let fails = child("fails.sh", "echo no such folder >&2; exit 3");
-        let e = run_child(&fails, &request_path, &req, path, fast)
-            .await
-            .unwrap_err();
+        let fails = child(
+            "fails.sh",
+            "cat > /dev/null; echo no such folder >&2; exit 3",
+        );
+        let e = run_child(&fails, &req, path, fast).await.unwrap_err();
         assert!(e.contains("no such folder"), "{e}");
     }
 }
