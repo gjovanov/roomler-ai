@@ -1,7 +1,10 @@
 # FR-16: Systematic remote-desktop quality benchmark
 
-Status: **proposed** (2026-08-27). Tracking issue: `FR-16` (#798). Sibling of FR-17
-(#799, the architectural fix); the measurement half of the FR-1 program.
+Status: **proposed** (2026-08-27); **amended 2026-10-13**, so that L0 (an in-process
+harness) and L4 (input-to-photon) come first ([§ Amendment](#amendment-2026-10-13--l0-and-l4-come-first)).
+Tracking issue: `FR-16` (#798). Sibling of FR-17 (#799, the architectural fix); the
+measurement half of the FR-1 program, and the instrument of the
+[StarDesk teardown program](../plans/stardesk-teardown-program.md).
 
 ## Goal
 
@@ -79,6 +82,104 @@ reacts to.
 One scalar score per cell, calibrated to the ladder above, so a matrix run produces a
 ranked table and a regression gate rather than a wall of numbers.
 
+## Amendment 2026-10-13 — L0 and L4 come first
+
+**Why.** StarDesk (GearUP, 2025) advertises "under 50 ms" remote-desktop latency. Roomler
+cannot say whether it beats, matches or loses to that: no layer above measures **input to
+photon**. Age starts at capture, so input coalescing, injection, the host compositor and the
+capture gate are invisible to it. Every perf FR of the
+[StarDesk teardown program](../plans/stardesk-teardown-program.md) needs a red-first number
+before its first change, so the order of this FR is inverted: **L0 and L4 first**, then
+L1–L3. Anchors are master `c2e79221b`.
+
+### L0 — an in-process harness that CI runs
+
+- **Agent side.** `AgentPeer::new` (`agents/roomlerd/src/peer.rs` L293) needs no API
+  server. Its answer comes from `handle_offer` (L1398), trickle goes through
+  `add_remote_candidate` (L1438), and teardown is `close()` (L1536); a dropped peer frees
+  nothing. One seam is added: a hook on the `SettingEngine` the constructor builds
+  (L369), so a test can call `set_vnet`
+  (`crates/vendored/webrtc/src/api/setting_engine/mod.rs` L248).
+- **Impairment through webrtc-util vnet,** not a UDP proxy. vnet gives a min delay, jitter,
+  per-chunk loss filters and a token bucket, inside one process, deterministically.
+- **Controller side.** A webrtc-rs peer, H.264 depacketized into `openh264::decoder` (already
+  wrapped in `agents/roomlerd/src/recording/decode.rs` L59–68). With no FFmpeg in CI, video
+  rides the RTP track (`write_sample`, `peer.rs` L2913). The data-channel cell waits for a
+  decoder binding, and the spec says so.
+- **One clock.** The synthetic source records `counter → Instant`; the decoded marker gives
+  the counter back. Latency is `now − t_capture` on the same clock.
+- **It runs in CI** the way `control_dc_record` already does: one more explicit
+  `cargo test -p roomlerd --features openh264-encoder,synthetic-frame-source --test l4_latency`
+  line next to `.github/workflows/ci.yml` L686–689. A test file nobody names runs in no lane.
+- **Cells** are small, because openh264 pegs a core above ~35 fps at 1080p: 640×360@30 and
+  1280×720@30. 1080p, 4K and high refresh are field cells.
+- **Assertions that can fail,** each with its negative control:
+  - a clean link gives capture→decode p50 < 25 ms and ≥ 0.9× the target fps;
+  - a 100 ms vnet delay gives p50 ≥ 100 ms, so the metric demonstrably sees the network;
+  - 2 % loss gives freezes (> 200 ms gaps) and more IDRs than the clean run;
+  - **a planted regression** (a 50 ms capture gate behind a test knob) moves p50 by ≥ 20 ms.
+    A benchmark that cannot be made to fail is not a gate.
+
+### The synthetic source grows up
+
+`agents/roomlerd/src/capture/synthetic_backend.rs` today paints 320×240 and clamps fps to
+1..60 (L57). In bench mode it gets:
+
+- **Size and rate:** parametric W×H up to 3840×2160, and 1–240 fps. The clamp lifts only in
+  bench mode.
+- **Deterministic scenes:** a rectangle crossing at N px/s, and scrolling text. Drag speed
+  becomes a controlled input instead of a human one, the problem this FR started from.
+- **A marker that survives compression:** luma-only 16×16 blocks (Y 16 / 235), a 12-bit
+  sequence number and a 4-bit CRC in a 2×8 grid, with an 8 px quiet margin. It survives
+  4:2:0, high QP and a 4× downscale. Today's 1-px counter strip does not.
+
+### L4 — input to photon in the real viewer
+
+- **The probe.** The viewer sends `{t:"probe", seq}` on the input data channel. The agent in
+  bench mode paints `seq` into the next synthetic frame. The decode worker reads the marker
+  from each decoded frame and records **paint − send on the browser's own clock**, so no
+  clock offset is needed.
+- **The sample** is taken from `frame.clone()` with `copyTo({rect})`, plane 0 only, so the
+  paint path is untouched. A GPU-backed frame reads back whole, about 1–2 ms at 1080p. So
+  the worker samples one frame in N, and only in bench mode.
+- **Gated at every entry point:**
+  - the agent's marker painter exists only in the synthetic source;
+  - `probe` is refused unless `ROOMLERD_BENCH=1` **and** the build has the feature;
+  - the viewer reads `roomler-rc-bench` only when the hello advertises `bench`;
+  - the worker samples only when its init says `bench: true`.
+- **Upload** goes through FR-22's path (`ui/src/composables/rcConnectTimingUpload.ts`,
+  target `rc.l4`, timing metadata only), so fleet runs are queryable in `agent_logs`.
+- **The host path.** `roomlerd probe-target` is a small topmost window that flips the marker
+  on **real OS input**. It is the only cell that includes injection and the host's own
+  compositor. Field-only.
+- **Nightly.** `rc-bench.spec.ts` runs in the pwrunner sidecar against the synthetic e2e
+  agent (`Dockerfile.agent-e2e`) and records the L4 trend.
+
+### The StarDesk comparison cell
+
+The same instrument is used on the operator's spare, non-fleet Windows box with an NVIDIA
+GPU, for both products, on the same host, client and network. It records:
+
+- click-to-photon from a 240 fps camera (±4 ms) or a HID-click + photodiode rig;
+- `nvidia-smi` encoder-session stats (sessions, average fps, average latency);
+- packet headers only;
+- what each product installs, and how its privacy mode, auto-lock, follow-display and mouse
+  auto-switch behave.
+
+It is black-box and clean-room: nothing is decompiled. ⚠️ **Results stay in the private
+docs repo.** [`docs/compare/README.md`](../compare/README.md) rule 3 is "We do not benchmark
+competitors". Engineering may use the numbers; the public pages never print them.
+
+### Phases (amended)
+
+| P | Scope | Kill switch | Status |
+|---|---|---|---|
+| L0 | The harness, the synthetic source, the CI line, the planted-regression control | test-only | — |
+| L4 | The probe, the worker sampler, the upload, `probe-target`, the nightly spec; baselines on a direct and a relay pair | `ROOMLERD_BENCH` unset; the build feature | — |
+| T | The StarDesk comparison cell on the spare box (private results) | — | — |
+| L1–L3 | As designed above | — | — |
+| D | Docs | — | — |
+
 ## Acceptance criteria
 
 - [ ] L1 runs on every fleet host through `roomler exec` and produces a per-host
@@ -91,6 +192,17 @@ ranked table and a regression gate rather than a wall of numbers.
 - [ ] Two consecutive runs of the same cell agree within a stated tolerance
       (repeatability, without which nothing can be A/B'd).
 - [ ] The FR-17 before/after is reported as a distribution from this harness.
+- [ ] **L0** runs in CI as a named `--test`. It is green on clean links, and **red** under
+      the planted 50 ms capture gate (the run that proves it can fail is linked).
+- [ ] **L4** puts a known-bad relay pair (CORPLAP-1 → neo16) and a known-good direct pair
+      (neo16 → MacBook) at opposite ends of the ladder. Two runs of one cell agree within
+      ±10 % at p50. On one cell, L4 agrees with a 240 fps camera within the viewer's
+      display latency.
+- [ ] The StarDesk comparison cell is recorded in the private docs repo, with method and
+      date, and never published (compare rule 3).
+- [ ] **Docs:** `docs/testing.md` gains the L0 harness and the L4 bench (a mermaid diagram
+      of the probe → marker → sample loop, how to run each, how to read `rc.l4` in
+      `agent_logs`), linked from `docs/README.md`.
 
 ## Out of scope
 
@@ -104,3 +216,4 @@ ranked table and a regression gate rather than a wall of numbers.
 | date | build | result |
 |---|---|---|
 | 2026-08-27 | 0.4.9 | Baseline field session above; FR filed. |
+| 2026-10-13 | — | Amended: L0 and L4 first, as the instrument of the StarDesk teardown program. Nothing built yet. |

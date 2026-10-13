@@ -12,6 +12,7 @@ single product. It is against the *stack* most people assemble.
 | **TeamViewer / AnyDesk** — commercial remote support | [vs-teamviewer.md](vs-teamviewer.md) |
 | **MeshCentral** — self-hosted remote management | [vs-meshcentral.md](vs-meshcentral.md) |
 | **NetBird** — open-source mesh with SSO | [vs-netbird.md](vs-netbird.md) |
+| **StarDesk** — a gaming-first remote desktop with native apps | [vs-stardesk.md](vs-stardesk.md) |
 
 ## The short version
 
