@@ -181,6 +181,10 @@ pub async fn handle_agent_socket(
         supports_exec,
     );
     state.rc_hub.set_agent_ssh_support(agent_id, supports_ssh);
+    // FR-94 — equality-matched: `exec` is its prefix (see the word's doc).
+    state
+        .rc_hub
+        .set_agent_exec_system_support(agent_id, caps.has_rpc(RpcCap::ExecSystem));
     state
         .rc_hub
         .set_agent_ssh_grant_ack(agent_id, acks_ssh_grants);
@@ -501,6 +505,11 @@ pub async fn handle_agent_socket(
                                             truncated,
                                             duration_ms,
                                             error,
+                                            // FR-94 — a worker's result says
+                                            // nothing about its identity; the
+                                            // audit's `ran_as` is the server's
+                                            // own routing decision.
+                                            ran_as: None,
                                         },
                                     );
                                     if !delivered {
@@ -644,6 +653,14 @@ pub async fn handle_agent_socket(
                                     state.rc_hub.set_agent_record_support(
                                         agent_id,
                                         crate::hub::RecordSupport::from_caps(caps),
+                                    );
+                                    // FR-94 — the SYSTEM service came up, was
+                                    // anchored, or went away while this worker
+                                    // stayed connected: route the next command
+                                    // by what the device says now.
+                                    state.rc_hub.set_agent_exec_system_support(
+                                        agent_id,
+                                        caps.has_rpc(RpcCap::ExecSystem),
                                     );
                                     // FR-92 — the owner re-allowed keep busy on
                                     // the device, so its word reappeared: hand it

@@ -77,6 +77,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/agent/anchor",
+      "methods": "POST"
+    },
+    {
       "path": "/api/agent/crash",
       "methods": "POST"
     },
@@ -106,6 +110,18 @@
     },
     {
       "path": "/api/agent/self/unenroll",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/agent/service/renew",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/agent/service/rpc/{request_id}/claim",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/agent/service/rpc/{request_id}/result",
       "methods": "POST"
     },
     {
@@ -319,6 +335,10 @@
     {
       "path": "/api/tenant/{tenant_id}/agent/{agent_id}/exec",
       "methods": "POST"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/agent/{agent_id}/exec-anchor",
+      "methods": "DELETE"
     },
     {
       "path": "/api/tenant/{tenant_id}/agent/{agent_id}/exec-policy",
@@ -1167,6 +1187,23 @@
               "at": 1
             },
             "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "exec_pending",
+        "indexes": [
+          {
+            "key": {
+              "request_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 0
           }
         ]
       },
@@ -2738,6 +2775,23 @@
               "at": 1
             },
             "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "exec_pending",
+        "indexes": [
+          {
+            "key": {
+              "request_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 0
           }
         ]
       },

@@ -2536,6 +2536,16 @@ pub enum ServerMsg {
         /// the fail-safe direction for a gate that grants root is "ask".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consent_mode: Option<crate::models::ConsentMode>,
+        /// FR-94 — run through the device's SYSTEM service, not in this
+        /// process. Sent only to a device advertising `exec-system`. The worker
+        /// still asks for consent (its person sees the prompt), then rings the
+        /// service's doorbell with `request_id` and nothing else. The service
+        /// claims the command from the server and runs it there, so the worker
+        /// never decides what SYSTEM runs. A worker that cannot reach the
+        /// service answers with an `RpcResult` error. It never falls back to
+        /// running the command itself, as an identity it was not asked for.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        via_service: bool,
     },
 
     /// Kill an in-flight [`Self::RpcExec`] and its whole process tree. The
@@ -7564,6 +7574,7 @@ mod tests {
             cwd: None,
             caller: "goran".into(),
             consent_mode: Some(crate::models::ConsentMode::Auto),
+            via_service: false,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:rpc.exec""#));
@@ -7571,6 +7582,12 @@ mod tests {
         // `cwd` omitted entirely when None — an older decoder must never see
         // a null it has to special-case.
         assert!(!s.contains("cwd"), "cwd must be omitted when None: {s}");
+        // FR-94 — `via_service` is omitted when false, so every frame to a
+        // worker-path device stays byte-for-byte what it was before.
+        assert!(
+            !s.contains("via_service"),
+            "via_service must be omitted when false: {s}"
+        );
         match serde_json::from_str::<ServerMsg>(&s).unwrap() {
             ServerMsg::RpcExec {
                 request_id,
@@ -7596,7 +7613,22 @@ mod tests {
         let bare = r#"{"t":"rc:rpc.exec","request_id":"r2","shell":"bash",
             "command":"id","timeout_ms":1000,"max_output_bytes":1024,"caller":"x"}"#;
         match serde_json::from_str::<ServerMsg>(bare).unwrap() {
-            ServerMsg::RpcExec { consent_mode, .. } => assert_eq!(consent_mode, None),
+            ServerMsg::RpcExec {
+                consent_mode,
+                via_service,
+                ..
+            } => {
+                assert_eq!(consent_mode, None);
+                // FR-94 — and an absent `via_service` is the worker path.
+                assert!(!via_service);
+            }
+            other => panic!("expected RpcExec, got {other:?}"),
+        }
+        let via = r#"{"t":"rc:rpc.exec","request_id":"r3","shell":"pwsh",
+            "command":"whoami","timeout_ms":1000,"max_output_bytes":1024,"caller":"x",
+            "via_service":true}"#;
+        match serde_json::from_str::<ServerMsg>(via).unwrap() {
+            ServerMsg::RpcExec { via_service, .. } => assert!(via_service),
             other => panic!("expected RpcExec, got {other:?}"),
         }
 

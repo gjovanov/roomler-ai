@@ -67,6 +67,8 @@ mod enroll_key_tests;
 #[cfg(test)]
 mod ephemeral_tests;
 #[cfg(test)]
+mod exec_service_tests;
+#[cfg(test)]
 mod hive_tests;
 #[cfg(test)]
 mod invite_tests;

@@ -965,6 +965,7 @@ mod tests {
             capabilities: AgentCaps::default(),
             access_policy: Default::default(),
             exec_policy: Default::default(),
+            exec_anchor: None,
             ssh_policy: Default::default(),
             peer_relay_policy: Default::default(),
             desired_config: Default::default(),

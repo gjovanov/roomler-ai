@@ -1,8 +1,10 @@
 # FR-94: Windows Fleet RPC runs as SYSTEM — a machine trust anchor, a doorbell, and an explicit `console_user`
 
-**Issue:** [#2035](https://github.com/gjovanov/roomler-ai/issues/2035) · **Status:** proposed 2026-10-12 — P0 (spec,
-the wording PR, the P0 measurements planned) · **Owner:** fleet (the pending store, the claim and result
-routes), the Windows agent (the service runner) · **Anchors:** master `d31e3c729` · **Builds on:**
+**Issue:** [#2035](https://github.com/gjovanov/roomler-ai/issues/2035) · **Status:** in progress — P0 done (spec
+#2036, wording #2039, measurements #2086); P1's server half and P2 built (§6); next the agent half (P1's
+`roomlerd anchor` + P3) · **Owner:** fleet (the anchor, the pending store, the claim and result
+routes), the Windows agent (the service runner) · **Anchors:** §2 master `d31e3c729`; §5 the FR-94
+server PR (rebased on `7d20cd817`) · **Builds on:**
 [Fleet RPC](../fleet-rpc.md), [roomler SSH account modes](../roomler-ssh.md),
 [FR-43](FR-43-macos-single-enrollment.md) (the supervised-daemon delegation model), #2021
 
@@ -92,16 +94,33 @@ sequenceDiagram
   participant S as server (any pod)
   participant W as worker (session 1, the user)
   participant V as service (session 0, SYSTEM)
-  A->>S: POST /agents/{id}/exec
-  S->>S: gates 1–3 (authorize); exec_pending {request_id, agent_id, cmd, run_as, expires_at}
-  S->>W: rc:rpc.request {request_id, via: service}
+  A->>S: POST /api/tenant/{tid}/agent/{id}/exec
+  S->>S: gates 1–3 (authorize); exec_pending {request_id, agent_id, command, run_as, state: pending, claim_by}
+  S->>W: rc:rpc.exec {request_id, …, via_service: true}
+  W->>W: consent, as today
   W->>V: doorbell {request_id} (local pipe, carries no authority)
-  V->>S: POST …/rpc/{request_id}/claim (service credential from the anchor)
-  S->>S: find_one_and_delete {request_id, agent_id = credential's device, expires_at > now}
+  V->>S: POST /api/agent/service/rpc/{request_id}/claim (the anchor's service credential)
+  S->>S: pending → claimed, iff agent_id = the credential's device and claim_by > now
   S-->>V: the command (single use)
   V->>V: gate 4 (exec_enabled from the anchor), run as SYSTEM or console_user, same bounds as exec.rs
-  V->>S: POST …/rpc/{request_id}/result (service credential)
+  V->>S: POST /api/agent/service/rpc/{request_id}/result (the same credential)
+  S->>S: claimed → done; this pod's waiter, or the caller's pod polling the row
   S->>A: 200 {outcome, ran_as}
+```
+
+The caller's pod resolves on whichever comes first: its own waiter (the worker's `rc:rpc.result`, or the
+result route on that pod) or the row turning `done` after a result posted to any other pod
+(`exec_service.rs` L418 `await_service_result`).
+
+```mermaid
+stateDiagram-v2
+  [*] --> pending: dispatch (run_via_service, agent_exec.rs L548)
+  pending --> claimed: the service's claim, inside the claim window
+  pending --> cancelled: the caller's cancel, or the worker's own answer (a declined prompt, an unanswered doorbell)
+  claimed --> done: the service posts the result
+  pending --> [*]: TTL after expires_at (nobody claimed it)
+  done --> [*]: TTL
+  cancelled --> [*]: TTL
 ```
 
 ### 5c. The pieces
@@ -115,22 +134,63 @@ sequenceDiagram
 
   Written **only by an elevated actor**:
   - the wizard's install, minted from the same fresh, admin-issued enrollment;
-  - or `roomlerd anchor --token <enrollment-token>`, run elevated. It re-enrolls the known machine, whose
-    row the unique `{tenant_id, machine_id}` index reuses.
+  - or `roomlerd anchor --token <enrollment-token> --device <agent_id>`, run elevated.
+
+  ⚠️ **The anchor names the device explicitly** (corrected from this spec's first draft, which had it
+  re-enroll "the known machine"). `machine_id` hashes the config path, and on an attended install that
+  path is in the enrolling user's profile, so an elevated administrator re-enrolling "this machine" would
+  mint a **different** row (§10 row 6 measured two rows for one machine). `POST /api/agent/anchor`
+  (`fleet/src/exec_service.rs` L121) therefore takes the device id, and checks:
+  - the token is a single-use enrollment token, and the org is not archived;
+  - the device is live in that org, and is Windows;
+  - the host name matches the device's, unless `force` (a host renamed since it enrolled).
+
+  Only then is the token burned, so a mistake does not cost one.
 
   ⚠️ **Never derived from the user's config.** The self-updater runs as SYSTEM but has only the
   user-writable token, so it cannot anchor a device. That would be the third attack in §4. An unanchored
   device keeps today's behaviour, and says so (§5c P5).
+
+  **One live anchor per device.** The service credential (`AgentServiceClaims`,
+  `crates/services/src/auth/mod.rs` L97) carries a required `anchor_id`, and the device row records it
+  (`exec_anchor`, `remote_control/src/models.rs` L3424: who anchored, when, and the id, never the
+  credential). A credential is accepted only while its `anchor_id` is the row's current one
+  (`fleet/src/auth_agent.rs` L185), so:
+  - anchoring again revokes every credential the earlier anchor minted;
+  - `DELETE /api/tenant/{tid}/agent/{id}/exec-anchor` (`MANAGE_AGENTS`, `exec_service.rs` L250) revokes
+    the service without removing the device;
+  - `POST /api/agent/service/renew` (L226) re-mints it under the **same** anchor. A lost response costs
+    nothing, and the one-year lifetime is a renewal interval, not the anchor's life.
 - **P2 — the pending store and the routes (fleet).**
-  - `exec_pending` holds `request_id` (unique), `agent_id`, the command, `run_as` and `expires_at`. It
-    has a TTL index, and the claim query checks `expires_at > now` itself, because the TTL monitor runs
-    only every ~60 s.
-  - The index set belongs to the fleet module, not `crates/db/src/indexes.rs`. Re-record the composition
-    baseline for the routes and the index plan.
-  - `POST …/rpc/{request_id}/claim` and `…/result` require `AgentService`.
-  - The claim is single-use (`find_one_and_delete`) and bound to the credential's device.
-  - The result resolves the pod-local waiter wherever the original call is waiting: through the ctrl bus
-    where Redis exists, or by the waiter polling the row.
+  - `exec_pending` (`models.rs` L3447) holds `request_id` (unique), the device, the command, `run_as`,
+    `state` (`pending` → `claimed` → `done`, or `cancelled`), `claim_by` and `expires_at`. A TTL index
+    on `expires_at` only keeps it small. The claim checks `claim_by > now` itself, because the TTL
+    monitor runs only every ~60 s.
+  - The index set belongs to the fleet module (`fleet/src/lib.rs` L499), not
+    `crates/db/src/indexes.rs`. Only `request_id` is indexed besides the TTL: the doorbell names the
+    request, and nothing lists a device's rows.
+  - `POST /api/agent/service/rpc/{request_id}/claim` and `…/result` take only `AgentService`
+    (`auth_agent.rs` L153).
+  - The claim (`exec_pending.rs` L45) is single-use and bound to the credential's device. Anything else
+    is a 404 plus a `claim_refused` audit row, the reasons not told apart.
+  - **The claim window** (`agent_exec.rs` L538): the consent window if a prompt comes first, then 10 s.
+    That is shorter than the result grace, so a command claimed at the last moment still gets its whole
+    `timeout_ms` before the caller gives up. (The first draft let a claim come up to the caller's
+    deadline, which would start commands nobody would hear the end of.)
+  - **The worker's own answer withdraws the row** (`exec_service.rs` L471). A declined prompt or an
+    unanswered doorbell comes back as `rc:rpc.result` and resolves the caller, so a late claim must not
+    then run what the caller was told did not run. If the service claimed first, the command **is**
+    running, and the caller waits for the service's result instead.
+  - The result resolves the caller's pod-local waiter when it lands on that pod, and otherwise the
+    caller's pod polls the row every 400 ms. That works with or without Redis, so no ctrl-bus fan-out
+    was needed.
+  - Routing (`exec_service.rs` L62) needs **both** halves: the server's anchor record and the device's
+    `exec-system` word. Either alone would route a command into a timeout.
+  - Server kill switch: `rc.exec_via_service` (`ROOMLER__RC__EXEC_VIA_SERVICE=false` ⇒ never routes via a
+    service; default on, inert until a device is anchored **and** advertises the word).
+  - The org's `exec_require_system` (decision 4; `TenantSettings`, default off): a Windows command that
+    cannot take the service path is refused as `system_required` (`agent_exec.rs` L341) rather than run
+    as the user. A `PUT …/exec-settings` that omits the field leaves it alone.
 - **P3 — the doorbell and the runner (agent).**
   - The service listens on a pipe that admits the worker's session. The doorbell carries no authority, so
     the pipe's ACL is about spam, not escalation.
@@ -154,9 +214,9 @@ sequenceDiagram
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| P0 | This spec, the issue and the registry row. The wording PR, so today's identity is said truthfully. The P0 measurements (§10) | docs only | this PR |
-| P1 | The machine trust anchor: `AgentService` tokens, the enrollment response's service credential, `roomlerd anchor` (elevated), the wizard writing it under a hardened dir | no anchor ⇒ today's behaviour | — |
-| P2 | Server: `exec_pending`, the claim and result routes, dispatch writing the row, the composition baseline | server flag `fleet.exec_via_service = false` ⇒ never routes via the service | — |
+| P0 | This spec, the issue and the registry row. The wording PR, so today's identity is said truthfully. The P0 measurements (§10) | docs only | ✅ #2036, #2039, #2086 |
+| P1 | The machine trust anchor. **Server:** `AgentService` credentials bound to an `anchor_id`, `POST /api/agent/anchor` (explicit device), renew, un-anchor. **Agent:** `roomlerd anchor` (elevated) writing the anchor under a hardened dir; the wizard doing the same | no anchor ⇒ today's behaviour | server half built (the FR-94 server PR); agent half next |
+| P2 | Server: `exec_pending`, the claim and result routes, dispatch writing the row, the claim window, the worker-answer withdrawal, `exec_require_system`, the composition baseline | `rc.exec_via_service = false` ⇒ never routes via the service | built (the FR-94 server PR) |
 | P3 | Agent: the service runner, the doorbell, the `exec-system` cap word | `ROOMLERD_EXEC_VIA_SERVICE=0` withdraws the cap word ⇒ the server never routes | — |
 | P4 | `console_user` for Fleet RPC: policy, UI, audit; the refusal text | the policy defaults to `system` | — |
 | P5 | `ran_as` everywhere, the device's identity in the UI, docs, field | — | — |
@@ -191,6 +251,10 @@ sequenceDiagram
   `docs/README.md`. CLAUDE.md's Fleet RPC line and the CLI and UI copy name the identity per mode.
 
 ## 8. Open decisions
+
+Decisions 1–4 were **taken as recommended** when the operator asked for the remaining items to be built
+(2026-10-13: "leaf roomler exec on win run as sys. do the remaining items"). The server half implements
+D1', the doorbell, and `exec_require_system` default off.
 
 1. **D1' over D2 and D3** (§5a). Recommended: D1', with D3 as the long-term direction in its own FR.
 2. **Doorbell, or a service long-poll?** A long-poll takes the worker out of the path entirely, at the
