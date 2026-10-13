@@ -302,7 +302,7 @@ impl Modules {
     /// deployment without `fleet` answers 503: an agent that dials a pod
     /// with no fleet module must learn it is not a credential problem.
     #[allow(unused_variables)]
-    pub fn agent_upgrade(
+    pub async fn agent_upgrade(
         &self,
         token: String,
         tid: Option<String>,
@@ -310,7 +310,8 @@ impl Modules {
     ) -> axum::response::Response {
         #[cfg(feature = "fleet")]
         if let Some(fleet) = &self.fleet {
-            return roomler_ai_mod_fleet::socket::ws_upgrade_agent(fleet.clone(), token, tid, ws);
+            return roomler_ai_mod_fleet::socket::ws_upgrade_agent(fleet.clone(), token, tid, ws)
+                .await;
         }
         module_unavailable("fleet")
     }

@@ -1,0 +1,476 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
+//! FR-103 — device credentials renew themselves, and a removal ends every
+//! token a device was ever given. The server's half:
+//! - a device buys a fresh agent token with the one it holds, idempotently,
+//!   and the old one keeps working until its own `exp` (no rotation in v1);
+//! - a token up to `RENEWAL_GRACE_SECS` past its `exp` still renews, on the
+//!   renew route only, so a device that slept through its anniversary
+//!   recovers by itself; an older one does not;
+//! - removing a device advances its `token_gen`, so after the same machine
+//!   re-enrolls and revives the row, every token minted before the removal
+//!   is refused, at the HTTP routes, the agent socket, DERP and the renew
+//!   route alike;
+//! - the same for a `roomler` tunnel client;
+//! - both kill switches; and the device list's "credential expires".
+
+use crate::fixtures::test_app::TestApp;
+use crate::tunnel_tests::wait_agent_online;
+use futures::SinkExt;
+use jsonwebtoken::{EncodingKey, Header};
+use serde_json::{Value, json};
+use std::time::Duration;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+
+/// Enroll a device with a fresh single-use token. Returns its id and agent
+/// token.
+async fn enroll(
+    app: &TestApp,
+    seeded: &crate::fixtures::seed::SeededTenant,
+    machine_id: &str,
+) -> (String, String) {
+    let et: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/enroll-token", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ej: Value = app
+        .client
+        .post(app.url("/api/agent/enroll"))
+        .json(&json!({
+            "enrollment_token": et["enrollment_token"].as_str().unwrap(),
+            "machine_id": machine_id,
+            "machine_name": machine_id,
+            "os": "linux",
+            "agent_version": "0.4.134",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (
+        ej["agent_id"].as_str().unwrap().to_string(),
+        ej["agent_token"].as_str().unwrap().to_string(),
+    )
+}
+
+async fn remove(app: &TestApp, seeded: &crate::fixtures::seed::SeededTenant, agent_id: &str) {
+    let resp = app
+        .auth_delete(
+            &format!("/api/tenant/{}/agent/{}", seeded.tenant_id, agent_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "remove the device");
+}
+
+async fn renew(app: &TestApp, token: &str) -> reqwest::Response {
+    app.auth_post("/api/agent/self/renew", token)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// An `AuthAgent` route: the device's own view of its org.
+async fn self_devices(app: &TestApp, token: &str) -> u16 {
+    app.auth_get("/api/agent/self/devices", token)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// The status an upgrade to `path` answers with this token: 101 when the
+/// socket is accepted, the HTTP status when it is refused.
+async fn upgrade_status(app: &TestApp, path: &str, token: &str) -> u16 {
+    let url = format!(
+        "ws://{}{path}?token={}&role=agent",
+        app.addr,
+        token
+            .replace('+', "%2B")
+            .replace('/', "%2F")
+            .replace('=', "%3D")
+    );
+    match connect_async(&url).await {
+        Ok(_) => 101,
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status().as_u16(),
+        Err(e) => panic!("{path} upgrade failed oddly: {e}"),
+    }
+}
+
+/// A token signed with the test server's own secret: what an old build, or
+/// the calendar, would have produced. `exp_offset` is relative to now;
+/// `generation` None leaves the claim out entirely (a pre-FR-103 token).
+fn forge_agent_token(
+    app: &TestApp,
+    agent_id: &str,
+    tenant_id: &str,
+    exp_offset_secs: i64,
+    generation: Option<u32>,
+) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let mut claims = json!({
+        "sub": agent_id,
+        "tenant_id": tenant_id,
+        "iat": now - 400 * 24 * 3600,
+        "exp": now + exp_offset_secs,
+        "iss": app.settings.jwt.issuer,
+        "token_type": "agent",
+    });
+    if let Some(g) = generation {
+        claims["gen"] = json!(g);
+    }
+    jsonwebtoken::encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(app.settings.jwt.secret.as_bytes()),
+    )
+    .unwrap()
+}
+
+/// A device renews its own token. The new one is accepted everywhere, and the
+/// old one keeps working until its own `exp`: renewal does not rotate, so a
+/// lost response costs nothing.
+#[tokio::test]
+async fn a_device_renews_its_own_token() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr103renew").await;
+    let (_agent_id, token) = enroll(&app, &seeded, "m-fr103-renew").await;
+    // A JWT is deterministic: minted in the same second with the same claims,
+    // the renewal would be byte-identical to the enrollment's token.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    let resp = renew(&app, &token).await;
+    assert_eq!(resp.status(), 200, "renew");
+    let body: Value = resp.json().await.unwrap();
+    let fresh = body["agent_token"].as_str().unwrap().to_string();
+    assert!(fresh != token, "a fresh token, minted in a later second");
+    let expires = chrono::DateTime::parse_from_rfc3339(body["expires_at"].as_str().unwrap())
+        .expect("expires_at is RFC 3339");
+    assert!(
+        expires > chrono::Utc::now() + chrono::Duration::days(300),
+        "about a year out: {expires}"
+    );
+
+    assert_eq!(self_devices(&app, &fresh).await, 200, "the new token works");
+    assert_eq!(upgrade_status(&app, "/ws", &fresh).await, 101);
+    assert_eq!(
+        self_devices(&app, &token).await,
+        200,
+        "and so does the old one"
+    );
+    // Renewing again, with either, is fine: idempotent.
+    assert_eq!(renew(&app, &token).await.status(), 200);
+    assert_eq!(renew(&app, &fresh).await.status(), 200);
+}
+
+/// A token up to `RENEWAL_GRACE_SECS` past its `exp` renews; every other
+/// route refuses it, and a token older than the grace does not renew.
+#[tokio::test]
+async fn an_expired_token_renews_within_the_grace_only() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr103grace").await;
+    let (agent_id, _) = enroll(&app, &seeded, "m-fr103-grace").await;
+    let tid = seeded.tenant_id.to_string();
+    let day = 24 * 3600;
+
+    let lapsed = forge_agent_token(&app, &agent_id, &tid, -30 * day, Some(0));
+    assert_eq!(
+        self_devices(&app, &lapsed).await,
+        401,
+        "expired everywhere else"
+    );
+    assert_eq!(upgrade_status(&app, "/ws", &lapsed).await, 401);
+    let resp = renew(&app, &lapsed).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "but within the grace on the renew route"
+    );
+    let fresh: Value = resp.json().await.unwrap();
+    assert_eq!(
+        self_devices(&app, fresh["agent_token"].as_str().unwrap()).await,
+        200
+    );
+
+    let too_old = forge_agent_token(&app, &agent_id, &tid, -91 * day, Some(0));
+    assert_eq!(renew(&app, &too_old).await.status(), 401, "past the grace");
+}
+
+/// Removing a device ends every token it held. The same machine enrolling
+/// again revives the row in place (the same id), and only a token minted
+/// after the removal is accepted, at every place an agent token is checked.
+/// Before FR-103 the revived row accepted the old token again.
+#[tokio::test]
+async fn a_removal_ends_every_earlier_token() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr103removal").await;
+    let (agent_id, old) = enroll(&app, &seeded, "m-fr103-removal").await;
+    assert_eq!(self_devices(&app, &old).await, 200);
+
+    remove(&app, &seeded, &agent_id).await;
+    let (again, new) = enroll(&app, &seeded, "m-fr103-removal").await;
+    assert_eq!(again, agent_id, "the same row is revived");
+
+    // The old token: refused at every site, the renew route included.
+    assert_eq!(
+        self_devices(&app, &old).await,
+        401,
+        "an AuthAgent route must refuse a token from before the removal"
+    );
+    assert_eq!(
+        upgrade_status(&app, "/ws", &old).await,
+        401,
+        "the agent socket"
+    );
+    assert_eq!(upgrade_status(&app, "/derp", &old).await, 401, "DERP");
+    assert_eq!(renew(&app, &old).await.status(), 401, "the renew route");
+
+    // The new one: accepted.
+    assert_eq!(self_devices(&app, &new).await, 200);
+    assert_eq!(upgrade_status(&app, "/ws", &new).await, 101);
+    assert_eq!(renew(&app, &new).await.status(), 200);
+}
+
+/// A token minted before FR-103 carries no `gen` claim. It must keep working
+/// on a device that was never removed, or deploying FR-103 would refuse the
+/// whole fleet.
+#[tokio::test]
+async fn a_token_from_before_fr103_still_works() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr103legacy").await;
+    let (agent_id, _) = enroll(&app, &seeded, "m-fr103-legacy").await;
+    let legacy = forge_agent_token(&app, &agent_id, &seeded.tenant_id.to_string(), 3600, None);
+    assert_eq!(self_devices(&app, &legacy).await, 200);
+    assert_eq!(upgrade_status(&app, "/ws", &legacy).await, 101);
+    assert_eq!(renew(&app, &legacy).await.status(), 200);
+}
+
+/// A quarantined or removed device cannot renew: the renew route checks the
+/// row exactly as `AuthAgent` does.
+#[tokio::test]
+async fn a_quarantined_or_removed_device_cannot_renew() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr103refuse").await;
+    let (agent_id, token) = enroll(&app, &seeded, "m-fr103-refuse").await;
+    let oid = bson::oid::ObjectId::parse_str(&agent_id).unwrap();
+    app.db
+        .collection::<bson::Document>("agents")
+        .update_one(
+            bson::doc! { "_id": oid },
+            bson::doc! { "$set": { "status": "quarantined" } },
+        )
+        .await
+        .unwrap();
+    assert_eq!(renew(&app, &token).await.status(), 401, "quarantined");
+    app.db
+        .collection::<bson::Document>("agents")
+        .update_one(
+            bson::doc! { "_id": oid },
+            bson::doc! { "$set": { "status": "offline" } },
+        )
+        .await
+        .unwrap();
+    assert_eq!(renew(&app, &token).await.status(), 200, "released");
+    remove(&app, &seeded, &agent_id).await;
+    assert_eq!(renew(&app, &token).await.status(), 401, "removed");
+}
+
+/// The kill switches: `rc.token_renewal = false` answers 404 on both renew
+/// routes; `rc.token_generation_check = false` accepts a pre-removal token
+/// again, which is the behaviour before FR-103.
+#[tokio::test]
+async fn the_kill_switches() {
+    let off = TestApp::spawn_with_settings(|s| s.rc.token_renewal = false).await;
+    let seeded = off.seed_tenant("fr103off").await;
+    let (_, token) = enroll(&off, &seeded, "m-fr103-off").await;
+    assert_eq!(renew(&off, &token).await.status(), 404);
+    assert_eq!(
+        off.auth_post("/api/tunnel-client/renew", &token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+
+    let lax = TestApp::spawn_with_settings(|s| s.rc.token_generation_check = false).await;
+    let seeded = lax.seed_tenant("fr103lax").await;
+    let (agent_id, old) = enroll(&lax, &seeded, "m-fr103-lax").await;
+    remove(&lax, &seeded, &agent_id).await;
+    let _ = enroll(&lax, &seeded, "m-fr103-lax").await;
+    assert_eq!(
+        self_devices(&lax, &old).await,
+        200,
+        "with the check off, a revived row accepts its old token as before"
+    );
+}
+
+/// The device list shows when the token a device connected with expires.
+#[tokio::test]
+async fn the_device_list_shows_when_a_credential_expires() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr103exp").await;
+    let (agent_id, token) = enroll(&app, &seeded, "m-fr103-exp").await;
+
+    let url = format!(
+        "ws://{}/ws?token={}&role=agent",
+        app.addr,
+        token
+            .replace('+', "%2B")
+            .replace('/', "%2F")
+            .replace('=', "%3D")
+    );
+    let (mut ws, _) = connect_async(&url).await.expect("agent ws");
+    ws.send(Message::Text(
+        json!({
+            "t": "rc:agent.hello",
+            "machine_name": "m-fr103-exp",
+            "os": "linux",
+            "agent_version": "0.4.134",
+            "displays": [],
+            "caps": {
+                "hw_encoders": [], "codecs": ["h264"], "has_input_permission": true,
+                "supports_clipboard": false, "supports_file_transfer": false,
+                "max_simultaneous_sessions": 1, "rpc": [],
+            },
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    wait_agent_online(&app, &seeded, &agent_id).await;
+
+    let mut expires = None;
+    for _ in 0..20 {
+        let row: Value = app
+            .auth_get(
+                &format!("/api/tenant/{}/agent/{}", seeded.tenant_id, agent_id),
+                &seeded.admin.access_token,
+            )
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(s) = row["token_expires_at"].as_str() {
+            expires = Some(s.to_string());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let expires = expires.expect("token_expires_at appears once the device connects");
+    let expires = chrono::DateTime::parse_from_rfc3339(&expires)
+        .or_else(|_| chrono::DateTime::parse_from_str(&expires, "%+"))
+        .expect("a timestamp");
+    assert!(expires > chrono::Utc::now() + chrono::Duration::days(300));
+}
+
+/// A `roomler` tunnel client renews its own token, and removing it ends every
+/// earlier token, as for an agent. The roster route now checks the row too.
+#[tokio::test]
+async fn a_tunnel_client_renews_and_a_removal_ends_its_tokens() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr103tunnel").await;
+
+    async fn enroll_client(
+        app: &TestApp,
+        seeded: &crate::fixtures::seed::SeededTenant,
+        machine_id: &str,
+    ) -> (String, String) {
+        let et: Value = app
+            .auth_post(
+                &format!(
+                    "/api/tenant/{}/tunnel-client/enroll-token",
+                    seeded.tenant_id
+                ),
+                &seeded.admin.access_token,
+            )
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let e: Value = app
+            .client
+            .post(app.url("/api/tunnel-client/enroll"))
+            .json(&json!({
+                "enrollment_token": et["enrollment_token"].as_str().unwrap(),
+                "machine_id": machine_id,
+                "machine_name": machine_id,
+                "os": "linux",
+                "client_version": "0.4.134",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        (
+            e["tunnel_client_id"].as_str().unwrap().to_string(),
+            e["tunnel_client_token"].as_str().unwrap().to_string(),
+        )
+    }
+    let roster = |token: String| {
+        let req = app.auth_get("/api/tunnel-client/agents", &token);
+        async move { req.send().await.unwrap().status().as_u16() }
+    };
+    let renew_client = |token: String| {
+        let req = app.auth_post("/api/tunnel-client/renew", &token);
+        async move { req.send().await.unwrap() }
+    };
+
+    let (client_id, old) = enroll_client(&app, &seeded, "m-fr103-cli").await;
+    let resp = renew_client(old.clone()).await;
+    assert_eq!(resp.status(), 200, "a client renews");
+    let fresh: Value = resp.json().await.unwrap();
+    assert_eq!(
+        roster(fresh["tunnel_client_token"].as_str().unwrap().to_string()).await,
+        200
+    );
+    assert_eq!(roster(old.clone()).await, 200, "no rotation");
+
+    let removed = app
+        .auth_delete(
+            &format!(
+                "/api/tenant/{}/tunnel-client/{}",
+                seeded.tenant_id, client_id
+            ),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(removed.status().is_success(), "remove the client");
+    assert_eq!(
+        roster(old.clone()).await,
+        401,
+        "the roster checks the row now"
+    );
+
+    let (again, new) = enroll_client(&app, &seeded, "m-fr103-cli").await;
+    assert_eq!(again, client_id, "the same row is revived");
+    assert_eq!(
+        roster(old.clone()).await,
+        401,
+        "a token from before the removal"
+    );
+    assert_eq!(renew_client(old).await.status(), 401);
+    assert_eq!(roster(new.clone()).await, 200);
+    assert_eq!(renew_client(new).await.status(), 200);
+}

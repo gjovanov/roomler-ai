@@ -109,6 +109,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/agent/self/renew",
+      "methods": "POST"
+    },
+    {
       "path": "/api/agent/self/unenroll",
       "methods": "POST"
     },
@@ -778,6 +782,10 @@
     },
     {
       "path": "/api/tunnel-client/enroll",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/tunnel-client/renew",
       "methods": "POST"
     },
     {

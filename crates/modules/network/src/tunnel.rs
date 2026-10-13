@@ -2017,6 +2017,7 @@ pub fn ws_upgrade_tunnel_client(
                 .unwrap();
         }
     };
+    let token_gen = claims.generation;
 
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
@@ -2058,6 +2059,21 @@ pub fn ws_upgrade_tunnel_client(
                 reason: "tunnel-client row was deleted or quarantined; re-enrol to revive".into(),
             };
             send_goodbye_and_close(socket, &revoked, 4003, "tunnel_client_deleted").await;
+            return;
+        }
+        // FR-103 — a token minted before this client was removed and
+        // re-enrolled. To the CLI that is a revoked credential: it stops and
+        // says to re-enroll, which is exactly the remedy.
+        if let Some(reason) = roomler_ai_mod_fleet::auth_agent::generation_refusal(
+            token_gen,
+            client.token_gen,
+            state.fleet.settings.rc.token_generation_check,
+        ) {
+            info!(%tunnel_client_id, reason, row_gen = client.token_gen, "tunnel-client token predates its removal; refusing WS with rc:tunnel.revoked");
+            let revoked = roomler_ai_remote_control::signaling::ServerMsg::TunnelRevoked {
+                reason: reason.into(),
+            };
+            send_goodbye_and_close(socket, &revoked, 4003, "tunnel_client_superseded").await;
             return;
         }
         handle_tunnel_client_socket(

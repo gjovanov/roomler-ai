@@ -225,7 +225,15 @@ pub async fn enroll_agent(
     let agent_id = agent
         .id
         .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
-    let agent_token = state.auth.issue_agent_token(agent_id, tid, None)?;
+    // FR-103 — at the row's CURRENT generation. A row revived after a removal
+    // has a higher one than before, so the token minted here is accepted and
+    // every token from before the removal is not.
+    let agent_token = state.auth.issue_agent_token(
+        agent_id,
+        tid,
+        agent.token_gen,
+        Some(state.settings.rc.agent_token_ttl_secs),
+    )?;
 
     Ok(Json(EnrollResponse {
         agent_id: agent_id.to_hex(),
@@ -347,12 +355,70 @@ async fn enroll_agent_ephemeral(
         "fr-51: ephemeral device enrolled"
     );
 
-    let agent_token = state.auth.issue_agent_token(agent_id, tid, None)?;
+    // FR-103 — at the row's generation. An ephemeral row is always new
+    // (never rehydrated), so that is 0; reading it keeps the rule in one place.
+    let agent_token = state.auth.issue_agent_token(
+        agent_id,
+        tid,
+        agent.token_gen,
+        Some(state.settings.rc.agent_token_ttl_secs),
+    )?;
     Ok(Json(EnrollResponse {
         agent_id: agent_id.to_hex(),
         tenant_id: tid.to_hex(),
         agent_token,
         ephemeral: true,
+    }))
+}
+
+/// FR-103 — what `POST /api/agent/self/renew` answers.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RenewedAgentToken {
+    /// A fresh agent token for the same device, at the row's generation.
+    pub agent_token: String,
+    /// When it expires, RFC 3339. The device renews again well before then.
+    pub expires_at: String,
+}
+
+/// POST /api/agent/self/renew — FR-103: a device buys a fresh agent token
+/// with the one it holds, so a device that keeps running never drops off on
+/// its enrollment anniversary.
+///
+/// The decision is `AuthAgent`'s, with one difference: the presented token
+/// may be up to `RENEWAL_GRACE_SECS` past its `exp`, so a device that slept
+/// through its anniversary updates (the release routes are unauthenticated),
+/// renews and reconnects by itself. A deleted or quarantined device, or a
+/// token from before a removal, is refused as everywhere.
+///
+/// Idempotent: the old token stays valid until its own `exp` (no rotation,
+/// FR-103 §6), so a lost response costs nothing and the device asks again.
+/// `rc.token_renewal = false` answers 404, and the device keeps its token.
+pub async fn self_renew(
+    State(state): State<FleetState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<RenewedAgentToken>, ApiError> {
+    if !state.settings.rc.token_renewal {
+        return Err(ApiError::NotFound(
+            "token renewal is switched off on this server".to_string(),
+        ));
+    }
+    let agent = crate::auth_agent::authenticate_for_renewal(&state, &headers).await?;
+    let ttl = state.settings.rc.agent_token_ttl_secs;
+    let agent_token = state.auth.issue_agent_token(
+        agent.agent_id,
+        agent.tenant_id,
+        agent.agent.token_gen,
+        Some(ttl),
+    )?;
+    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(ttl as i64)).to_rfc3339();
+    tracing::info!(
+        tenant_id = %agent.tenant_id, agent_id = %agent.agent_id,
+        token_gen = agent.agent.token_gen, %expires_at,
+        "fr-103: agent token renewed"
+    );
+    Ok(Json(RenewedAgentToken {
+        agent_token,
+        expires_at,
     }))
 }
 
@@ -492,6 +558,12 @@ pub struct AgentResponse {
     /// Plain strings, like every id and timestamp here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exec_anchor: Option<ExecAnchorView>,
+    /// FR-103 — when the agent token this device last connected with
+    /// expires, so a device nearing its anniversary can be found (and
+    /// re-enrolled, if it is too old to renew itself) before it drops.
+    /// Absent until the device connects once after FR-103.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_expires_at: Option<String>,
     /// Roomler-SSH gate 3 as stored, with the same replace-on-save warning as
     /// [`Self::exec_policy`] — and this is the one that makes `Option`
     /// load-bearing rather than tidy.
@@ -1505,6 +1577,7 @@ fn to_agent_response(
             anchored_at: fmt_dt(x.anchored_at),
             anchored_by: x.anchored_by.to_hex(),
         }),
+        token_expires_at: a.token_exp.map(fmt_dt),
         ssh_policy: configured_only(a.ssh_policy),
         remote_config,
         overlay_public_key,

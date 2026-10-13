@@ -138,6 +138,10 @@ impl AgentDao {
             // reach the machine, so there is nothing to record yet.
             ssh_host_pubkey: String::new(),
             agent_token_hash,
+            // FR-103 — a new row starts at generation 0; only a removal
+            // advances it.
+            token_gen: 0,
+            token_exp: None,
             status: AgentStatus::Offline,
             last_seen_at: now,
             last_presence: None,
@@ -947,8 +951,12 @@ impl AgentDao {
     /// ([`Self::rehydrate`]), and an anchor left here would revive with it.
     /// The service credential still on the machine's disk would then be
     /// accepted again, with no elevated step. Removing a device must do at
-    /// least what un-anchoring it does. `rehydrate` deliberately does not
-    /// touch the anchor: re-enrolling a LIVE device keeps it.
+    /// least what un-anchoring it does.
+    ///
+    /// FR-103: the same update advances `token_gen`, so every agent token
+    /// minted before the removal is refused from now on, including after a
+    /// revival: re-enrollment mints at the new generation. `rehydrate`
+    /// touches neither field, because re-enrolling a LIVE device keeps both.
     pub async fn soft_delete(&self, tenant_id: ObjectId, agent_id: ObjectId) -> DaoResult<bool> {
         self.base
             .update_one(
@@ -956,7 +964,20 @@ impl AgentDao {
                 doc! {
                     "$set": { "deleted_at": DateTime::now() },
                     "$unset": { "exec_anchor": "" },
+                    "$inc": { "token_gen": 1 },
                 },
+            )
+            .await
+    }
+
+    /// FR-103: record the `exp` (unix seconds) of the token a device just
+    /// connected with, for the device list's "credential expires". Best-effort
+    /// by design: the caller logs a failure and carries on.
+    pub async fn stamp_token_exp(&self, agent_id: ObjectId, exp_unix: i64) -> DaoResult<bool> {
+        self.base
+            .update_by_id(
+                agent_id,
+                doc! { "$set": { "token_exp": DateTime::from_millis(exp_unix.saturating_mul(1000)) } },
             )
             .await
     }
