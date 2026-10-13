@@ -2239,6 +2239,7 @@ impl Supervisor {
                 harness_started: None,
                 replicated: true,
                 lease: false,
+                fork_of: None,
             },
         );
     }

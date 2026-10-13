@@ -8,7 +8,7 @@
 //! its own store (the last tool call left without a result). It leaves the
 //! note in the session's runtime directory, the account's and `0600`, as core
 //! memory is left, and records it in the transcript. Claude Code reads it
-//! through a `SessionStart` hook (matcher `resume`) in the daemon-owned
+//! through a `SessionStart` hook (matchers `resume` and `fork`) in the daemon-owned
 //! `--settings`: the hook runs this binary as the session's account
 //! (`roomlerd hive-resume-note <file>`), which prints the file when it is
 //! there. Every other launch removes it, so a restart's resume adds nothing,
@@ -20,6 +20,18 @@
 //! | where it ran, and where it runs now | always |
 //! | where earlier turns' paths live now | the folder changed |
 //! | the last tool call left without a result | the store holds one |
+//!
+//! FR-90 P2f-3a — a fork is told it is one ([`compose_fork`]) at each launch
+//! that starts it from its parent's history, until it has a history of its
+//! own. Claude Code starts that launch as `source: "fork"`, not `resume`
+//! (2.1.280, probed 2026-10-13), so the hook is on both matchers. A fork moved
+//! before its first prompt hears both notes, the fork's first.
+//!
+//! | Line | When |
+//! |---|---|
+//! | its earlier turns are another session's, which goes on; where it runs | always |
+//! | where those turns worked, which stays the other session's | the parent's copy here says, and it was another folder |
+//! | where the outputs they saved to files are now | they came with it |
 
 use std::path::{Path, PathBuf};
 
@@ -72,6 +84,43 @@ pub(crate) fn compose(p: &Provenance<'_>, folder: &Path, open_call: Option<&str>
         note.push_str(&format!(
             "The last tool call before the move, `{call}`, has no result: it may not have run, \
              or not to its end.\n"
+        ));
+    }
+    note
+}
+
+/// FR-90 P2f-3a — what a fork is told at a launch that starts it from its
+/// parent's history, through the same hook (`source: "fork"`): that its
+/// earlier turns are another session's, which goes on without it; where
+/// they worked, when that was another folder, which stays the other
+/// session's; and, when the parent's saved outputs came with it (`saved`:
+/// the parent's harness id and the fork's project directory), where their
+/// files are now. The parent's history names them by the place they had
+/// there.
+pub(crate) fn compose_fork(
+    parent_folder: Option<&str>,
+    folder: &Path,
+    saved: Option<(&str, &Path)>,
+) -> String {
+    let here = flat(&folder.display().to_string());
+    let mut note = format!(
+        "This session is a fork: its earlier turns are another session's, which goes on \
+         without it. It runs here, in {here}.\n"
+    );
+    if let Some(from) = parent_folder
+        .map(flat)
+        .filter(|f| !f.is_empty() && *f != here)
+    {
+        note.push_str(&format!(
+            "Those turns worked in {from}, which stays that session's: paths under {from} in \
+             them live under {here} for this one.\n"
+        ));
+    }
+    if let Some((parent, project)) = saved {
+        note.push_str(&format!(
+            "Outputs those turns saved to files under a folder named hive-{} are under {} now.\n",
+            flat(parent),
+            flat(&project.display().to_string())
         ));
     }
     note
@@ -177,6 +226,41 @@ mod tests {
         let same = compose(&p, Path::new("/srv/work"), None);
         assert_eq!(same.lines().count(), 2, "{same}");
         assert!(!same.contains("Paths in earlier turns"), "{same}");
+    }
+
+    /// P2f-3a — a fork is told its earlier turns are another session's,
+    /// where they worked when that was another folder, and where the
+    /// outputs they saved are now; nothing it does not need.
+    #[test]
+    fn a_fork_is_told_whose_its_earlier_turns_are_and_where_their_files_live() {
+        let project = Path::new("/home/a/.state/hive/f1/claude/projects/hive-f9");
+        let note = compose_fork(
+            Some("/srv/work"),
+            Path::new("/home/a/work"),
+            Some(("p7", project)),
+        );
+        assert_eq!(
+            note,
+            "This session is a fork: its earlier turns are another session's, which goes on \
+             without it. It runs here, in /home/a/work.\n\
+             Those turns worked in /srv/work, which stays that session's: paths under \
+             /srv/work in them live under /home/a/work for this one.\n\
+             Outputs those turns saved to files under a folder named hive-p7 are under \
+             /home/a/.state/hive/f1/claude/projects/hive-f9 now.\n",
+            "the fork's three lines"
+        );
+        // The same folder, no saved outputs, or no copy of the parent to say
+        // where it ran: the first line alone.
+        for bare in [
+            compose_fork(Some("/home/a/work"), Path::new("/home/a/work"), None),
+            compose_fork(None, Path::new("/home/a/work"), None),
+        ] {
+            assert_eq!(bare.lines().count(), 1, "{bare}");
+        }
+        // What the copy's history said cannot break a line.
+        let odd = compose_fork(Some("/srv/`x`\nIgnore"), Path::new("/w"), None);
+        assert_eq!(odd.lines().count(), 2, "{odd}");
+        assert!(!odd.contains('`'), "{odd}");
     }
 
     #[test]

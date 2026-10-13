@@ -1826,6 +1826,8 @@ async fn send_start(state: &HiveState, s: &AgentSession, from: &SessionLocation,
                 .rc_hub
                 .agent_supports_hive_lease(device, s.tenant_id)
                 == Some(true),
+        // P2f-3b — a fork's record says what it was made from.
+        fork_of: None,
     };
     match state.fleet.rc_hub.push_hive(device, s.tenant_id, msg) {
         Ok(()) => info!(session = %sid, device = %device, fence, "hive: the moved start was sent"),

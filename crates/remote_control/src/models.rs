@@ -724,6 +724,16 @@ pub enum RpcCap {
     /// nothing at a join, so a server that read it out of `hive` would wait
     /// out a teleport's every bound. Equality-matched, locked by test.
     HiveTeleport,
+    /// FR-90 P2f-3a — `hive-fork`: the device starts a fork of a session it
+    /// holds a copy of. A start carrying `fork_of` takes the parent's last
+    /// checkpoint under the fork's ids and launches `--resume <parent>
+    /// --fork-session --session-id <fork>`, and the fork's checkpoints keep
+    /// the parent's history beside its own. A build property.
+    ///
+    /// ⚠️ `hive` is its prefix and NOT the same promise: a build before it
+    /// ignores `fork_of` and starts the fork EMPTY, a new conversation in
+    /// the folder as it is. Equality-matched, locked by test.
+    HiveFork,
 }
 
 impl RpcCap {
@@ -754,11 +764,12 @@ impl RpcCap {
             Self::HiveLease => "hive-lease",
             Self::HivePromote => "hive-promote",
             Self::HiveTeleport => "hive-teleport",
+            Self::HiveFork => "hive-fork",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 19] = [
+    pub const ALL: [RpcCap; 20] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -778,6 +789,7 @@ impl RpcCap {
         Self::HiveLease,
         Self::HivePromote,
         Self::HiveTeleport,
+        Self::HiveFork,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -4784,6 +4796,7 @@ mod tests {
         assert_eq!(RpcCap::HiveLease.wire(), "hive-lease");
         assert_eq!(RpcCap::HivePromote.wire(), "hive-promote");
         assert_eq!(RpcCap::HiveTeleport.wire(), "hive-teleport");
+        assert_eq!(RpcCap::HiveFork.wire(), "hive-fork");
     }
 
     /// Every prefix relationship between verbs is a KNOWN one.
@@ -4801,7 +4814,7 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 12] = [
+        const KNOWN: [(RpcCap, RpcCap); 13] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
@@ -4834,6 +4847,9 @@ mod tests {
             // FR-90 P2f-1a — nor "takes part in a teleport". Locked by
             // `hive_teleport_is_a_promise_of_its_own`.
             (RpcCap::Hive, RpcCap::HiveTeleport),
+            // FR-90 P2f-3a — nor "starts a fork from a copy". Locked by
+            // `hive_fork_is_a_promise_of_its_own`.
+            (RpcCap::Hive, RpcCap::HiveFork),
         ];
         for a in RpcCap::ALL {
             for b in RpcCap::ALL {
@@ -5242,6 +5258,26 @@ mod tests {
             Some(RpcCap::HiveTeleport)
         );
         assert!(RpcCap::from_wire("hive-teleports").is_none());
+    }
+
+    /// FR-90 P2f-3a — `hive-fork` is its own promise: a build before it would
+    /// start a fork empty, so a server that read it out of `hive`, or out of
+    /// `hive-teleport`, would hand a person a fresh conversation for a fork.
+    #[test]
+    fn hive_fork_is_a_promise_of_its_own() {
+        let teleports = AgentCaps {
+            rpc: vec!["hive".into(), "hive-teleport".into()],
+            ..Default::default()
+        };
+        assert!(!teleports.has_rpc(RpcCap::HiveFork));
+        let forks = AgentCaps {
+            rpc: vec!["hive".into(), "hive-fork".into()],
+            ..Default::default()
+        };
+        assert!(forks.has_rpc(RpcCap::HiveFork));
+        assert!(!forks.has_rpc(RpcCap::HiveTeleport));
+        assert_eq!(RpcCap::from_wire("hive-fork"), Some(RpcCap::HiveFork));
+        assert!(RpcCap::from_wire("hive-forks").is_none());
     }
 
     /// Forward compatibility: a NEWER agent may advertise verbs this build has

@@ -698,6 +698,18 @@ pub struct HiveCheckpointMark {
     pub hash: String,
 }
 
+/// FR-90 P2f-3 — the session a fork was made from, as every start of the
+/// fork carries it: its record's id, whose copy a device takes the fork from
+/// at the fork's first start, and its harness session, which that start
+/// resumes from (`--resume <it> --fork-session`) and whose history and tool
+/// results the fork's own checkpoints keep beside its own.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HiveForkOf {
+    #[serde(with = "crate::serde_helpers::oid_hex")]
+    pub session_id: bson::oid::ObjectId,
+    pub harness_session: String,
+}
+
 /// FR-90 P2c-3 — one session a device holds a copy of, in
 /// `rc:hive.replica.manifest`: where its copy ends. Numbers and hashes only.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
