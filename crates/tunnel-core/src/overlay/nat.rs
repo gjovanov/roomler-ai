@@ -481,7 +481,7 @@ async fn setup(
         for t in &forwarding {
             holds.hold(t);
         }
-        holds.ledger().store();
+        super::host_ledger::record_forwarding(holds.forwarding_guids());
     }
     if !fwd_ok {
         warn!(
@@ -569,29 +569,26 @@ fn restore_forwarding(identities: &[String]) {
     );
 }
 
-/// FR-97 P0b-2b — the boot (and pre-`process::exit`) purge: switch forwarding
-/// back off on every interface a previous run turned on and never released,
-/// as its ledger records them. Context-free, like the route purges beside it.
-/// No-op off Windows, and when the ledger is empty.
-pub fn purge_forwarding() {
+/// FR-97 P0b-2b — the forwarding half of [`super::host_ledger::purge`]:
+/// switch forwarding back off on every adapter (by GUID) the ledger says a
+/// run turned on and never released. No-op off Windows, and for an empty
+/// list.
+pub(crate) fn restore_forwarding_guids(guids: &[String]) {
     #[cfg(target_os = "windows")]
     {
-        let ledger = super::host_ledger::HostLedger::load();
-        if ledger.forwarding.is_empty() {
+        if guids.is_empty() {
             return;
         }
-        let ids: Vec<String> = ledger
-            .forwarding
-            .iter()
-            .map(|g| format!("guid:{g}"))
-            .collect();
+        let ids: Vec<String> = guids.iter().map(|g| format!("guid:{g}")).collect();
         warn!(
-            adapters = ?ledger.forwarding,
-            "overlay: a previous run left IPv4 forwarding on (unclean exit) — switching it back off"
+            adapters = ?guids,
+            "overlay: a router left IPv4 forwarding on (an exit that skipped its revert) — \
+             switching it back off"
         );
         restore_forwarding(&ids);
-        super::host_ledger::HostLedger::default().store();
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = guids;
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -709,7 +706,7 @@ impl Drop for SubnetRouterGuard {
                     .filter(|t| holds.release(&t.identity))
                     .map(|t| t.identity.clone())
                     .collect();
-                holds.ledger().store();
+                super::host_ledger::record_forwarding(holds.forwarding_guids());
                 ids
             };
             restore_forwarding(&restore);

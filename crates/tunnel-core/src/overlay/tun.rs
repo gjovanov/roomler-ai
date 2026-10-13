@@ -979,7 +979,7 @@ pub const IF_NAME: &str = "utun";
 /// `overlay`.
 #[cfg(feature = "overlay-l3")]
 pub use system::{
-    SystemTun, TunOptions, org_tun_guid, purge_split_default, purge_stale_peer_routes,
+    SystemTun, TunOptions, org_tun_guid, purge_pins, purge_split_default, purge_stale_peer_routes,
 };
 
 #[cfg(feature = "overlay-l3")]
@@ -4652,6 +4652,7 @@ mod system {
         /// that family's exit routing (v4 or v6) rather than wedging.
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         async fn add_host_exemption(&self, ip: std::net::IpAddr) -> std::io::Result<()> {
+            let res: std::io::Result<()> = async {
             match ip {
                 std::net::IpAddr::V4(v4) => {
                     let Some(gw) = self.orig_default.as_ref() else {
@@ -4735,6 +4736,41 @@ mod system {
                     }
                 }
             }
+            }
+            .await;
+            // FR-97 P0e — recorded the moment it is in, so no exit of the
+            // daemon, clean or not, can leave it behind unrecorded.
+            if res.is_ok() {
+                let rec =
+                    match ip {
+                        std::net::IpAddr::V4(_) => self.orig_default.as_ref().map(|g| {
+                            crate::overlay::host_ledger::PinRecord {
+                                ip,
+                                gateway: g.gateway.to_string(),
+                                interface: g.interface.clone(),
+                                #[cfg(target_os = "linux")]
+                                onlink: g.onlink,
+                                #[cfg(not(target_os = "linux"))]
+                                onlink: false,
+                            }
+                        }),
+                        std::net::IpAddr::V6(_) => self.orig_default_v6.as_ref().map(|g| {
+                            crate::overlay::host_ledger::PinRecord {
+                                ip,
+                                gateway: g.gateway.to_string(),
+                                interface: g.interface.clone(),
+                                #[cfg(target_os = "linux")]
+                                onlink: g.onlink,
+                                #[cfg(not(target_os = "linux"))]
+                                onlink: false,
+                            }
+                        }),
+                    };
+                if let Some(rec) = rec {
+                    crate::overlay::host_ledger::record_pin(rec);
+                }
+            }
+            res
         }
 
         /// FR-97 P1a — the macOS arm: a static host route through the CURRENT
@@ -4780,9 +4816,20 @@ mod system {
                     "no IPv4 default route through a gateway to pin it on"
                 }));
             };
+            // FR-97 P0e — a pin that holds is recorded, whether it was just
+            // written or a previous run's that this run now owns.
+            let record = |up: &super::BsdUplink| {
+                crate::overlay::host_ledger::record_pin(crate::overlay::host_ledger::PinRecord {
+                    ip,
+                    gateway: up.gateway_arg.clone(),
+                    interface: up.interface.clone(),
+                    onlink: false,
+                })
+            };
             let rows = bsd_table(v6).await;
             let pin = super::bsd_pin_row(&rows, ip);
             if super::bsd_pin_holds(pin, &uplink) {
+                record(&uplink);
                 return Ok(());
             }
             if pin.is_some() {
@@ -4800,6 +4847,7 @@ mod system {
             let rows = bsd_table(v6).await;
             let pin = super::bsd_pin_row(&rows, ip);
             if super::bsd_pin_holds(pin, &uplink) {
+                record(&uplink);
                 return Ok(());
             }
             let want = format!("{} on {}", uplink.gateway_arg, uplink.interface);
@@ -4820,6 +4868,7 @@ mod system {
             if pin.is_some_and(|row| row.netif != self.if_name) {
                 bsd_unpin(ip).await;
             }
+            crate::overlay::host_ledger::forget_pin(ip);
             Err(std::io::Error::other(why))
         }
 
@@ -4833,6 +4882,7 @@ mod system {
             if super::bsd_pin_row(&rows, ip).is_some_and(|row| row.netif != self.if_name) {
                 bsd_unpin(ip).await;
             }
+            crate::overlay::host_ledger::forget_pin(ip);
         }
 
         /// FR-97 P1a — every pin the table does not show through its family's
@@ -4887,69 +4937,74 @@ mod system {
         /// (`/32` v4 or `/128` v6). Best-effort.
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         async fn del_host_exemption(&self, ip: std::net::IpAddr) {
-            match ip {
-                std::net::IpAddr::V4(v4) => {
-                    let Some(gw) = self.orig_default.as_ref() else {
-                        return;
-                    };
-                    #[cfg(target_os = "linux")]
-                    {
-                        let mut args: Vec<String> = vec![
-                            "route".into(),
-                            "del".into(),
-                            format!("{v4}/32"),
-                            "via".into(),
-                            gw.gateway.to_string(),
-                            "dev".into(),
-                            gw.interface.clone(),
-                        ];
-                        if gw.onlink {
-                            args.push("onlink".into());
+            async {
+                match ip {
+                    std::net::IpAddr::V4(v4) => {
+                        let Some(gw) = self.orig_default.as_ref() else {
+                            return;
+                        };
+                        #[cfg(target_os = "linux")]
+                        {
+                            let mut args: Vec<String> = vec![
+                                "route".into(),
+                                "del".into(),
+                                format!("{v4}/32"),
+                                "via".into(),
+                                gw.gateway.to_string(),
+                                "dev".into(),
+                                gw.interface.clone(),
+                            ];
+                            if gw.onlink {
+                                args.push("onlink".into());
+                            }
+                            let _ = run_cmd("ip", args).await;
                         }
-                        let _ = run_cmd("ip", args).await;
-                    }
-                    #[cfg(target_os = "windows")]
-                    if let Ok(ifindex) = gw.interface.parse::<u32>() {
-                        winroute::del_gateway_route(
-                            ifindex,
-                            std::net::IpAddr::V4(v4),
-                            32,
-                            std::net::IpAddr::V4(gw.gateway),
-                        );
-                    }
-                }
-                std::net::IpAddr::V6(v6) => {
-                    let Some(gw) = self.orig_default_v6.as_ref() else {
-                        return;
-                    };
-                    #[cfg(target_os = "linux")]
-                    {
-                        let mut args: Vec<String> = vec![
-                            "-6".into(),
-                            "route".into(),
-                            "del".into(),
-                            format!("{v6}/128"),
-                            "via".into(),
-                            gw.gateway.to_string(),
-                            "dev".into(),
-                            gw.interface.clone(),
-                        ];
-                        if gw.onlink {
-                            args.push("onlink".into());
+                        #[cfg(target_os = "windows")]
+                        if let Ok(ifindex) = gw.interface.parse::<u32>() {
+                            winroute::del_gateway_route(
+                                ifindex,
+                                std::net::IpAddr::V4(v4),
+                                32,
+                                std::net::IpAddr::V4(gw.gateway),
+                            );
                         }
-                        let _ = run_cmd("ip", args).await;
                     }
-                    #[cfg(target_os = "windows")]
-                    if let Ok(ifindex) = gw.interface.parse::<u32>() {
-                        winroute::del_gateway_route(
-                            ifindex,
-                            std::net::IpAddr::V6(v6),
-                            128,
-                            std::net::IpAddr::V6(gw.gateway),
-                        );
+                    std::net::IpAddr::V6(v6) => {
+                        let Some(gw) = self.orig_default_v6.as_ref() else {
+                            return;
+                        };
+                        #[cfg(target_os = "linux")]
+                        {
+                            let mut args: Vec<String> = vec![
+                                "-6".into(),
+                                "route".into(),
+                                "del".into(),
+                                format!("{v6}/128"),
+                                "via".into(),
+                                gw.gateway.to_string(),
+                                "dev".into(),
+                                gw.interface.clone(),
+                            ];
+                            if gw.onlink {
+                                args.push("onlink".into());
+                            }
+                            let _ = run_cmd("ip", args).await;
+                        }
+                        #[cfg(target_os = "windows")]
+                        if let Ok(ifindex) = gw.interface.parse::<u32>() {
+                            winroute::del_gateway_route(
+                                ifindex,
+                                std::net::IpAddr::V6(v6),
+                                128,
+                                std::net::IpAddr::V6(gw.gateway),
+                            );
+                        }
                     }
                 }
             }
+            .await;
+            // FR-97 P0e — no longer ours to undo.
+            crate::overlay::host_ledger::forget_pin(ip);
         }
     }
 
@@ -5058,6 +5113,78 @@ mod system {
             count = stale.len(), routes = ?stale,
             "overlay: boot reconcile — dropped stale routes left by a previous generation \
              on a persisted TUN (their crypto-router entries are gone, so they black-hole)"
+        );
+    }
+
+    /// FR-97 P0e — remove the exit-client pins a run recorded and did not
+    /// remove (see [`crate::overlay::host_ledger::purge`], the one caller).
+    /// Synchronous and context-free like the purges above. Each arm removes a
+    /// route only while it still matches the record: Linux and Windows delete
+    /// the exact (address, next hop, interface) route, and macOS deletes only
+    /// an unscoped static host route the table shows through the recorded next
+    /// hop and interface (`route delete` keys on the destination alone).
+    pub fn purge_pins(pins: &[crate::overlay::host_ledger::PinRecord]) {
+        if pins.is_empty() {
+            return;
+        }
+        for p in pins {
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            let plen: u8 = if p.ip.is_ipv6() { 128 } else { 32 };
+            #[cfg(target_os = "linux")]
+            {
+                let mut args: Vec<String> = Vec::new();
+                if p.ip.is_ipv6() {
+                    args.push("-6".into());
+                }
+                args.extend([
+                    "route".into(),
+                    "del".into(),
+                    format!("{}/{plen}", p.ip),
+                    "via".into(),
+                    p.gateway.clone(),
+                    "dev".into(),
+                    p.interface.clone(),
+                ]);
+                if p.onlink {
+                    args.push("onlink".into());
+                }
+                let _ = std::process::Command::new("ip").args(&args).output();
+            }
+            #[cfg(target_os = "windows")]
+            if let (Ok(ifindex), Ok(gw)) = (
+                p.interface.parse::<u32>(),
+                p.gateway.parse::<std::net::IpAddr>(),
+            ) {
+                winroute::del_gateway_route(ifindex, p.ip, plen, gw);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let v6 = p.ip.is_ipv6();
+                let rows = std::process::Command::new("netstat")
+                    .args(["-rnW", "-f", if v6 { "inet6" } else { "inet" }])
+                    .output()
+                    .map(|o| super::parse_bsd_netstat(&String::from_utf8_lossy(&o.stdout)))
+                    .unwrap_or_default();
+                let recorded = super::bsd_addr(&p.gateway, v6).map(|gateway| super::BsdUplink {
+                    gateway,
+                    gateway_arg: p.gateway.clone(),
+                    interface: p.interface.clone(),
+                });
+                if recorded
+                    .is_some_and(|up| super::bsd_pin_holds(super::bsd_pin_row(&rows, p.ip), &up))
+                {
+                    let _ = std::process::Command::new("route")
+                        .args(["-n", "delete", bsd_family(v6), "-host", &p.ip.to_string()])
+                        .output();
+                }
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+            let _ = p;
+        }
+        tracing::info!(
+            count = pins.len(),
+            pins = ?pins.iter().map(|p| p.ip).collect::<Vec<_>>(),
+            "overlay: removed the exit-client pins an earlier run left in the routing table"
         );
     }
 
