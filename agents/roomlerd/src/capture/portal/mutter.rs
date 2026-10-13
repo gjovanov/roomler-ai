@@ -35,9 +35,22 @@
 //!   what FR-36's DRM backend does).
 //! - Its honest peer is therefore **FR-36's DRM/KMS backend** — the same
 //!   unattended bargain by a different mechanism — so it is gated the same
-//!   way: opt-in, default OFF, loud in the log when it engages.
+//!   way: opt-in on a root daemon, and loud in the log when it engages. The one
+//!   automatic case is FR-93 P2a's: a per-user daemon in its own GNOME
+//!   session with no capture key set, where it is the user's own session.
 //! - It is **GNOME-specific**. KDE and wlroots hosts keep the portal path;
 //!   nothing here implies an equivalent for them.
+//!
+//! ## Input (FR-93 P4)
+//!
+//! With `input`, [`open`] first creates an `org.gnome.Mutter.RemoteDesktop`
+//! session and names it in the screencast's `remote-desktop-session-id`. The
+//! screencast is then started BY that session, and the session takes the
+//! viewer's input: absolute motion addressed to the recorded stream, buttons,
+//! wheel and evdev keycodes ([`super::input::MutterCall`]). It asks nobody
+//! either, so it is the same bargain as the screencast. ⚠️ mutter accepts a
+//! session's `Notify*` calls only from the D-Bus peer that created it, so input
+//! rides [`MutterSession::connection`].
 //!
 //! ## The two rules that are easy to get wrong
 //!
@@ -61,6 +74,12 @@ const MUTTER_PATH: &str = "/org/gnome/Mutter/ScreenCast";
 const MUTTER_IFACE: &str = "org.gnome.Mutter.ScreenCast";
 const SESSION_IFACE: &str = "org.gnome.Mutter.ScreenCast.Session";
 const STREAM_IFACE: &str = "org.gnome.Mutter.ScreenCast.Stream";
+
+/// FR-93 P4 — mutter's RemoteDesktop, the input half of the same session.
+pub(crate) const RD_BUS: &str = "org.gnome.Mutter.RemoteDesktop";
+const RD_PATH: &str = "/org/gnome/Mutter/RemoteDesktop";
+const RD_IFACE: &str = "org.gnome.Mutter.RemoteDesktop";
+pub(crate) const RD_SESSION_IFACE: &str = "org.gnome.Mutter.RemoteDesktop.Session";
 
 /// `org.gnome.Mutter.DisplayConfig`, used only to learn a connector name.
 const DISPLAY_BUS: &str = "org.gnome.Mutter.DisplayConfig";
@@ -93,6 +112,11 @@ pub struct MutterReport {
     /// `org.gnome.Mutter.ScreenCast`'s `Version` property, when readable.
     pub version: Option<i32>,
     pub elapsed_ms: u64,
+    /// FR-93 P4 — a RemoteDesktop session drives this screencast, so input can
+    /// ride it. `serde(default)`: a report from an older helper reads as "no
+    /// input".
+    #[serde(default)]
+    pub input: bool,
 }
 
 /// Why a mutter screencast could not be opened.
@@ -132,14 +156,46 @@ impl MutterError {
 /// A live mutter screencast session.
 pub struct MutterSession {
     pub report: MutterReport,
+    /// FR-93 P4 — the RemoteDesktop session driving the screencast, when input
+    /// was asked for and mutter granted it.
+    pub input: Option<MutterInput>,
     /// ⚠️⚠️ **Holding this open is what keeps the session alive.** Mutter owns
     /// the session against the D-Bus connection that created it and tears it
     /// down when that connection goes — taking the PipeWire node with it. The
     /// portal has exactly this rule and P3b-ii was lost to it once already
     /// (`no target node available`, long after a handshake that looked
-    /// perfect). The underscore is deliberate: nothing reads it, and deleting
-    /// it "because it is unused" re-breaks capture.
-    _conn: zbus::blocking::Connection,
+    /// perfect). Nothing else should need it, and dropping it "because it is
+    /// unused" re-breaks capture.
+    conn: zbus::blocking::Connection,
+}
+
+impl MutterSession {
+    /// The connection that owns the session. ⚠️ Input MUST be sent on this
+    /// one: mutter accepts a RemoteDesktop session's `Notify*` calls only from
+    /// the peer that created it (`check_permission` compares the sender's
+    /// unique name), so a second connection would be refused every event.
+    pub fn connection(&self) -> &zbus::blocking::Connection {
+        &self.conn
+    }
+}
+
+/// FR-93 P4 — where input for a mutter screencast goes.
+#[derive(Debug, Clone)]
+pub struct MutterInput {
+    /// The `org.gnome.Mutter.RemoteDesktop.Session` object.
+    pub session: OwnedObjectPath,
+    /// The screencast stream the session's absolute motion is addressed to:
+    /// `NotifyPointerMotionAbsolute` names it, and mutter maps the stream's own
+    /// coordinates onto the monitor it records.
+    pub stream: OwnedObjectPath,
+}
+
+/// FR-93 P4 kill switch (`ROOMLERD_MUTTER_INPUT` / `mutter_input`), default
+/// ON: a mutter screencast that carries input is driven by mutter's
+/// RemoteDesktop, and the viewer's mouse and keyboard reach the whole desktop
+/// through it. `false` gives back P2a's view-only mutter arm.
+pub fn input_enabled() -> bool {
+    tunnel_core::env::flag("MUTTER_INPUT", true)
 }
 
 /// How long [`available`] waits. One property read; a wedged bus otherwise
@@ -184,18 +240,19 @@ pub fn available() -> Result<(), String> {
     }
 }
 
-/// Open a screencast on the first recordable monitor.
+/// Open a screencast on the first recordable monitor; with `input`, driven by
+/// a RemoteDesktop session that input can ride (FR-93 P4).
 ///
 /// ⚠️ **Runs on its own thread, and that is not optional** — `zbus`'s blocking
 /// API panics inside a tokio runtime, and this is reached from the
 /// `#[tokio::main]` helper. The same guard [`super::screencast::open`] carries,
 /// for the same reason, and P4's review caught exactly this hazard being
 /// reintroduced one call site over.
-pub fn open() -> Result<MutterSession, MutterError> {
+pub fn open(input: bool) -> Result<MutterSession, MutterError> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         // The receiver may already have timed out; nothing to do about that.
-        let _ = tx.send(open_blocking());
+        let _ = tx.send(open_blocking(input));
     });
     match rx.recv_timeout(OPEN_TIMEOUT) {
         Ok(r) => r,
@@ -209,7 +266,7 @@ pub fn open() -> Result<MutterSession, MutterError> {
     }
 }
 
-fn open_blocking() -> Result<MutterSession, MutterError> {
+fn open_blocking(input: bool) -> Result<MutterSession, MutterError> {
     let started = Instant::now();
     let conn = zbus::blocking::Connection::session()
         .map_err(|e| MutterError::failed(format!("session bus: {e}")))?;
@@ -229,8 +286,22 @@ fn open_blocking() -> Result<MutterSession, MutterError> {
 
     let connector = first_connector(&conn)?;
 
+    // ── 0. FR-93 P4: the RemoteDesktop session, first ───────────────────
+    //
+    // A screencast linked to a RemoteDesktop session (`remote-desktop-session-
+    // id` below) is started and stopped BY that session, which is what lets
+    // input address the stream it records. Absent when input was not asked.
+    let remote = if input {
+        Some(remote_desktop_session(&conn)?)
+    } else {
+        None
+    };
+
     // ── 1. CreateSession ────────────────────────────────────────────────
-    let opts: HashMap<&str, Value> = HashMap::new();
+    let mut opts: HashMap<&str, Value> = HashMap::new();
+    if let Some(rd) = &remote {
+        opts.insert("remote-desktop-session-id", Value::from(rd.id.as_str()));
+    }
     let session_path: OwnedObjectPath = screencast
         .call_method("CreateSession", &(opts,))
         .map_err(|e| MutterError::failed(format!("CreateSession: {e}")))?
@@ -267,9 +338,20 @@ fn open_blocking() -> Result<MutterSession, MutterError> {
         .map_err(|e| MutterError::failed(format!("subscribing to PipeWireStreamAdded: {e}")))?;
 
     // ── 4. Start ────────────────────────────────────────────────────────
-    session
-        .call_method("Start", &())
-        .map_err(|e| MutterError::failed(format!("Start: {e}")))?;
+    //
+    // A screencast driven by a RemoteDesktop session is started BY it: the
+    // session's `Start` starts the linked screencast first.
+    match &remote {
+        Some(rd) => rd
+            .proxy
+            .call_method("Start", &())
+            .map(|_| ())
+            .map_err(|e| MutterError::failed(format!("RemoteDesktop Start: {e}")))?,
+        None => session
+            .call_method("Start", &())
+            .map(|_| ())
+            .map_err(|e| MutterError::failed(format!("Start: {e}")))?,
+    }
 
     // ── 5. The node id ──────────────────────────────────────────────────
     // ⚠️ This blocks with no bound of its own — [`open`] wraps the whole
@@ -288,15 +370,53 @@ fn open_blocking() -> Result<MutterSession, MutterError> {
         }
     };
 
+    let input = remote.map(|rd| MutterInput {
+        session: rd.path,
+        stream: stream_path.clone(),
+    });
     Ok(MutterSession {
         report: MutterReport {
             node_id,
             connector,
             version,
             elapsed_ms: started.elapsed().as_millis() as u64,
+            input: input.is_some(),
         },
-        _conn: conn,
+        input,
+        conn,
     })
+}
+
+/// FR-93 P4 — a RemoteDesktop session, as the handshake needs it.
+struct RemoteSession {
+    proxy: zbus::blocking::Proxy<'static>,
+    path: OwnedObjectPath,
+    /// `SessionId`, which the screencast session names to be driven by it.
+    id: String,
+}
+
+/// FR-93 P4 — create a RemoteDesktop session and read its id.
+///
+/// ⚠️ It asks nobody, like the screencast: mutter's RemoteDesktop is the API
+/// gnome-remote-desktop itself is built on, open to the session's own bus. So
+/// it gets the same gating as mutter capture (`linux-capture.md` §5).
+fn remote_desktop_session(conn: &zbus::blocking::Connection) -> Result<RemoteSession, MutterError> {
+    let rd = zbus::blocking::Proxy::new(conn, RD_BUS, RD_PATH, RD_IFACE)
+        .map_err(|e| MutterError::failed(format!("RemoteDesktop proxy: {e}")))?;
+    let path: OwnedObjectPath = rd
+        .call_method("CreateSession", &())
+        .map_err(|e| MutterError::failed(format!("RemoteDesktop CreateSession: {e}")))?
+        .body()
+        .deserialize()
+        .map_err(|e| {
+            MutterError::failed(format!("RemoteDesktop CreateSession returned no path: {e}"))
+        })?;
+    let proxy = zbus::blocking::Proxy::new(conn, RD_BUS, path.clone(), RD_SESSION_IFACE)
+        .map_err(|e| MutterError::failed(format!("RemoteDesktop session proxy: {e}")))?;
+    let id = proxy
+        .get_property::<String>("SessionId")
+        .map_err(|e| MutterError::failed(format!("RemoteDesktop SessionId: {e}")))?;
+    Ok(RemoteSession { proxy, path, id })
 }
 
 /// The connector name of the first usable monitor, via
@@ -432,9 +552,19 @@ mod tests {
             connector: "Meta-0".into(),
             version: Some(4),
             elapsed_ms: 12,
+            input: true,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<MutterReport>(&json).unwrap(), r);
+    }
+
+    /// FR-93 P4 — a report from a helper that predates input reads as "no
+    /// input", never as a parse failure.
+    #[test]
+    fn a_report_without_input_reads_as_none() {
+        let old = r#"{"node_id":7,"connector":"Meta-0","version":4,"elapsed_ms":3}"#;
+        let r: MutterReport = serde_json::from_str(old).unwrap();
+        assert!(!r.input);
     }
 
     /// The error type crosses the same pipe, and `Unavailable` in particular

@@ -59,6 +59,11 @@ pub struct PortalOpen {
 
 impl PortalOpen {
     pub fn from_env() -> Self {
+        let mutter = tunnel_core::env::flag("MUTTER_CAPTURE", false);
+        let input = tunnel_core::env::flag("PORTAL_INPUT", false)
+            // FR-93 P4 — on the mutter arm, input rides mutter's RemoteDesktop,
+            // and `mutter_input = false` keeps it view-only there too.
+            && (!mutter || super::mutter::input_enabled());
         Self {
             // P4 — input rides the same portal session ONLY when the operator
             // opts in (`ROOMLERD_PORTAL_INPUT=1`). Default OFF, deliberately: a
@@ -70,13 +75,13 @@ impl PortalOpen {
             // where capture-only works, to buy an input path that has not yet
             // been field-proven to land. Off by default keeps capture
             // byte-for-byte P3c; a host that wants input turns it on.
-            input: tunnel_core::env::flag("PORTAL_INPUT", false),
+            input,
             // FR-45 P5 — take frames from mutter's own ScreenCast API instead
             // of the portal. ⚠️⚠️ UNATTENDED: it shows no consent dialog.
             // Default OFF and loud when it engages, exactly like FR-36's DRM
             // backend, which is its real peer — NOT the portal, whose whole
             // point is that it asks.
-            mutter: tunnel_core::env::flag("MUTTER_CAPTURE", false),
+            mutter,
             // FR-56 P4 — record one application window rather than the
             // desktop. ⚠️ Default OFF and it must stay that way: the portal
             // answers this by showing a WINDOW PICKER, so on an unattended
@@ -199,9 +204,21 @@ impl PortalCapture {
                         }
                     }
                 });
-                input_route_generation = Some(super::input_route::register(in_tx));
+                // FR-93 P4 — a mutter helper's input rides mutter's own
+                // RemoteDesktop session, the portal's rides the portal's.
+                let kind = if use_mutter {
+                    crate::input::reach::RouteKind::Mutter
+                } else {
+                    crate::input::reach::RouteKind::Portal
+                };
+                input_route_generation = Some(super::input_route::register(in_tx, kind));
                 tracing::info!(
-                    "portal capture: input routed through the portal RemoteDesktop session"
+                    "portal capture: input routed through {}",
+                    if use_mutter {
+                        "mutter's RemoteDesktop session (FR-93 P4)"
+                    } else {
+                        "the portal RemoteDesktop session"
+                    }
                 );
             }
         } else if want_input {

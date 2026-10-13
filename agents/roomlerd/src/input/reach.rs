@@ -93,12 +93,26 @@ pub(crate) enum Platform {
     MacOs { accessibility: bool },
 }
 
+/// Whose RemoteDesktop session a live input route feeds (FR-45 P4, FR-93 P4).
+/// While one is live it owns injection, whatever the OS injector would reach.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "portal-capture")),
+    allow(dead_code)
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteKind {
+    /// xdg-desktop-portal's RemoteDesktop, granted at the screen.
+    Portal,
+    /// mutter's own RemoteDesktop (GNOME), which asks nobody.
+    Mutter,
+}
+
 /// What the injector cascade would find, as data.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Facts {
     pub platform: Platform,
-    /// A live portal RemoteDesktop route: it then owns injection.
-    pub portal_route: bool,
+    /// A live RemoteDesktop route, and whose: it then owns injection.
+    pub route: Option<RouteKind>,
     /// `uinput` is switched on, and `/dev/uinput` opens.
     pub uinput_on: bool,
     pub uinput_ok: bool,
@@ -152,10 +166,14 @@ pub(crate) fn decide(f: &Facts) -> InputReach {
         }
         Platform::Linux => {}
     }
-    if f.portal_route {
+    if let Some(route) = f.route {
         return verdict(
             Reach::Full,
-            "the desktop portal's RemoteDesktop session".into(),
+            match route {
+                RouteKind::Portal => "the desktop portal's RemoteDesktop session",
+                RouteKind::Mutter => "mutter's own RemoteDesktop session (GNOME)",
+            }
+            .into(),
         );
     }
     if f.uinput_on && f.uinput_ok {
@@ -225,9 +243,9 @@ pub fn current() -> InputReach {
 }
 
 /// FR-93 P2b — the verdict a session opened now would get, for the desktop
-/// brief. The portal's input route registers only as a portal capture opens,
-/// so outside a session it is predicted: `portal_input` says the planned arm
-/// would open one (a portal or mutter arm with `portal_input` on).
+/// brief. An input route registers only as a capture opens, so outside a
+/// session it is predicted: `route` is the one the planned arm would open
+/// (`capture::planned_input_route`).
 ///
 /// ⚠️ `wayland_session`: there the X server is Xwayland, and GNOME starts it
 /// **on demand** when a client connects, so a read that connects can itself be
@@ -239,13 +257,13 @@ pub fn current() -> InputReach {
 /// x11 consent panel connects at start, `indicator/x11.rs`. A boot does not.
 /// This rule keeps the brief from adding to that.)
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn predicted(portal_input: bool, wayland_session: bool) -> InputReach {
+pub fn predicted(route: Option<RouteKind>, wayland_session: bool) -> InputReach {
     let mut facts = gather_with(if wayland_session {
         x_server_if_running
     } else {
         x_server
     });
-    facts.portal_route |= portal_input;
+    facts.route = facts.route.or(route);
     decide(&facts)
 }
 
@@ -265,9 +283,9 @@ fn gather_with(x: fn() -> XServer) -> Facts {
     let platform = Platform::Linux;
 
     #[cfg(all(target_os = "linux", feature = "portal-capture"))]
-    let portal_route = crate::capture::portal::input_route::is_active();
+    let route = crate::capture::portal::input_route::active();
     #[cfg(not(all(target_os = "linux", feature = "portal-capture")))]
-    let portal_route = false;
+    let route = None;
 
     #[cfg(all(target_os = "linux", feature = "uinput-input"))]
     let (uinput_on, uinput_ok) = {
@@ -279,7 +297,7 @@ fn gather_with(x: fn() -> XServer) -> Facts {
 
     Facts {
         platform,
-        portal_route,
+        route,
         uinput_on,
         uinput_ok,
         enigo_built: cfg!(feature = "enigo-input"),
@@ -607,7 +625,7 @@ mod tests {
     fn linux(x: XServer) -> Facts {
         Facts {
             platform: Platform::Linux,
-            portal_route: false,
+            route: None,
             uinput_on: false,
             uinput_ok: false,
             enigo_built: true,
@@ -688,10 +706,18 @@ mod tests {
             };
             assert_eq!(decide(&uinput).reach, Reach::Full, "{x:?}");
             let portal = Facts {
-                portal_route: true,
+                route: Some(RouteKind::Portal),
                 ..linux(x)
             };
             assert_eq!(decide(&portal).reach, Reach::Full, "{x:?}");
+            // FR-93 P4 — mutter's own RemoteDesktop owns injection the same way,
+            // and says whose it is.
+            let mutter = decide(&Facts {
+                route: Some(RouteKind::Mutter),
+                ..linux(x)
+            });
+            assert_eq!(mutter.reach, Reach::Full, "{x:?}");
+            assert!(mutter.reason.contains("mutter"), "{}", mutter.reason);
         }
     }
 

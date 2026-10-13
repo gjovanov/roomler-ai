@@ -454,7 +454,7 @@ pub mod helper {
         // silent fallback from "asks" to "does not ask" is precisely the kind
         // of thing that must never happen by accident.
         if use_mutter {
-            run_stream_mutter();
+            run_stream_mutter(with_input);
             return;
         }
         // The session shape is decided by what the portal OFFERS, not by
@@ -627,28 +627,62 @@ pub mod helper {
     }
 
     /// FR-45 P5, child side — the same streaming loop, but the node id comes
-    /// from `org.gnome.Mutter.ScreenCast` instead of the portal.
+    /// from `org.gnome.Mutter.ScreenCast` instead of the portal; with
+    /// `with_input`, driven by mutter's RemoteDesktop, which takes the viewer's
+    /// input on stdin (FR-93 P4).
     ///
     /// ⚠️⚠️ **No consent dialog is shown on this path.** See
     /// [`super::mutter`] for why that is acceptable and why it is NOT a portal
     /// variant. It exists for hosts where no portal backend can run at all —
     /// measured on WSL2, where `xdg-desktop-portal-gnome` exits immediately
     /// without a GNOME session while mutter itself works fine.
-    fn run_stream_mutter() {
-        eprintln!("portal-helper: opening an org.gnome.Mutter.ScreenCast session (UNATTENDED)");
-        let session = match super::mutter::open() {
+    fn run_stream_mutter(with_input: bool) {
+        eprintln!(
+            "portal-helper: opening an org.gnome.Mutter.ScreenCast session (UNATTENDED){}",
+            if with_input {
+                ", driven by its RemoteDesktop for input"
+            } else {
+                ""
+            }
+        );
+        // ⚠️ Input must never cost capture, the portal path's rule: a mutter
+        // whose RemoteDesktop refuses (a build without it, a session it will not
+        // create) still records, view-only. "Not GNOME" is not retried.
+        let session = match super::mutter::open(with_input) {
             Ok(s) => s,
+            Err(super::mutter::MutterError::Unavailable) => {
+                eprintln!("portal-helper: {}", super::mutter::MutterError::Unavailable);
+                std::process::exit(1);
+            }
+            Err(e) if with_input => {
+                eprintln!(
+                    "portal-helper: mutter's RemoteDesktop session failed ({e}) — retrying \
+                     capture-only"
+                );
+                match super::mutter::open(false) {
+                    Ok(s) => s,
+                    Err(e2) => {
+                        eprintln!("portal-helper: {e2}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("portal-helper: {e}");
                 std::process::exit(1);
             }
         };
         eprintln!(
-            "portal-helper: mutter node {} on {} (ScreenCast v{:?}, {} ms)",
+            "portal-helper: mutter node {} on {} (ScreenCast v{:?}, {} ms, input {})",
             session.report.node_id,
             session.report.connector,
             session.report.version,
-            session.report.elapsed_ms
+            session.report.elapsed_ms,
+            if session.report.input {
+                "via RemoteDesktop"
+            } else {
+                "none"
+            }
         );
 
         // 🔑 `PwSource::Session`, not a portal fd: mutter hands out a node id
@@ -670,13 +704,45 @@ pub mod helper {
             handle.format.width, handle.format.height, handle.format.video_format
         );
 
+        // FR-93 P4 — the input pump, as the portal path builds it: the context
+        // OFF the runtime thread (zbus's blocking API panics on one), on the
+        // session's own connection (mutter takes `Notify*` only from it). A
+        // mutter stream's coordinates are the stream's own size; mutter divides
+        // by the monitor's scale itself.
+        let mut input_ok = false;
+        if let Some(rd) = session.input.clone() {
+            let space = (
+                f64::from(handle.format.width),
+                f64::from(handle.format.height),
+            );
+            let conn = session.connection().clone();
+            let built = std::thread::spawn(move || {
+                super::input::InputContext::new_mutter(&conn, &rd, space)
+            })
+            .join();
+            match built {
+                Ok(Ok(ctx)) => {
+                    std::thread::spawn(move || super::input::run_pump(ctx, std::io::stdin()));
+                    input_ok = true;
+                    eprintln!(
+                        "portal-helper: mutter input pump ready ({}x{})",
+                        space.0, space.1
+                    );
+                }
+                Ok(Err(e)) => {
+                    eprintln!("portal-helper: mutter input context failed: {e} — capture only");
+                }
+                Err(_) => {
+                    eprintln!("portal-helper: mutter input context thread panicked — capture only");
+                }
+            }
+        }
+
         let started = StreamStarted {
             width: handle.format.width,
             height: handle.format.height,
             video_format: handle.format.video_format,
-            // Mutter's ScreenCast carries no input; its RemoteDesktop sibling
-            // is a separate interface and is not wired here.
-            input_ok: false,
+            input_ok,
             // `mutter::open` always asks for `cursor-mode` 1, embedded.
             cursor_embedded: true,
         };
@@ -716,21 +782,22 @@ pub mod helper {
         use_mutter: bool,
         window: bool,
     ) -> anyhow::Result<std::process::Child> {
-        let mut args: Vec<&str> = match (with_input, use_mutter) {
-            // ⚠️ No --input with --mutter: mutter's ScreenCast API carries no
-            // input, and its RemoteDesktop sibling is a separate interface not
-            // wired here. Asking for both would silently give capture only.
-            (_, true) => vec!["--stream", "--mutter"],
-            (true, false) => vec!["--stream", "--input"],
-            (false, false) => vec!["--stream"],
-        };
+        let mut args: Vec<&str> = vec!["--stream"];
+        if use_mutter {
+            args.push("--mutter");
+        }
+        // FR-93 P4 — `--input` with `--mutter` means mutter's RemoteDesktop,
+        // which drives the screencast it records.
+        if with_input {
+            args.push("--input");
+        }
         if window {
             args.push("--window");
         }
         // stdin is the input wire, piped exactly when input is wanted — a
         // helper that will never read it should see EOF, not a pipe nothing
         // writes to.
-        spawn_child(&args, with_input && !use_mutter).map_err(|e| match e {
+        spawn_child(&args, with_input).map_err(|e| match e {
             SpawnError::NoSession => {
                 anyhow::anyhow!("nobody is at this machine's screen — the portal is attended-only")
             }
