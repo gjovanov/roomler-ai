@@ -195,8 +195,8 @@ stateDiagram-v2
   Anchored --> Anchored: renew, same anchor_id
   Anchored --> Anchored: anchor create again, new anchor_id
   Anchored --> Unanchored: DELETE exec-anchor
-  Anchored --> Removed: the device is removed
-  Removed --> Anchored: the same machine re-enrolls
+  Anchored --> Removed: the device is removed (the anchor ends)
+  Removed --> Unanchored: the same machine re-enrolls
 ```
 
 | Event | The service's credential | Where a command goes |
@@ -206,18 +206,19 @@ stateDiagram-v2
 | `roomlerd anchor create` again | every earlier `anchor_id`'s credential refused (401) | the service holding the new anchor |
 | `DELETE …/exec-anchor` | refused (401) | the worker, or refused where the org requires SYSTEM |
 | `roomlerd anchor remove` on the device | the file is gone; the server's record stays | the worker once the device stops advertising `exec-system`, or refused where the org requires SYSTEM |
-| the device is removed | refused (401, "deleted") while the row is removed | nowhere: the device is gone |
-| the same machine re-enrolls | **accepted again** | the service, as before the removal |
+| the device is removed | ended: the removal clears the anchor (401, "deleted", meanwhile) | nowhere: the device is gone |
+| the same machine re-enrolls | **still refused** (401): the revived row has no anchor | the worker, until an administrator anchors it again |
 
-⚠️ **Removing a device suspends its anchor; it does not end it.** Re-enrolling
-the same machine (the same `machine_id`) revives the removed row in place
-(`AgentDao::rehydrate` clears `deleted_at` and nothing else), and the row's
-`exec_anchor` comes back with it. The anchor file is still on the disk, so its
-credential works again, with no elevated step. To end SYSTEM exec on a machine
-for good, un-anchor it, or run `roomlerd anchor remove` on it, **before**
-removing the device. An ephemeral enrollment is the exception: its row is
-deleted outright (FR-51), so nothing can come back. Ending the anchor at
-removal is #2133.
+⚠️ **Removing a device ends its anchor** (#2133). Re-enrolling the same machine
+(the same `machine_id`) revives the removed row in place (`AgentDao::rehydrate`),
+but not the anchor: `AgentDao::soft_delete` clears `exec_anchor` in the same
+update that tombstones the row. The anchor file still on the machine is then
+useless, since its credential names an anchor the server no longer records. The
+device's commands go to the worker until an administrator runs
+`roomlerd anchor create` again. Re-enrolling a device that was **never
+removed** (a re-run wizard, `roomlerd re-enroll`) keeps its anchor. An
+ephemeral enrollment's row is deleted outright (FR-51), so nothing of it can
+come back either.
 
 **Routing needs both halves:** the server's record of the anchor, and the
 device's `exec-system` word. Either alone sends the command to the worker, as
