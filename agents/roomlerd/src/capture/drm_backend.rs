@@ -17,12 +17,14 @@
 //! ## What this backend deliberately does NOT do
 //!
 //! - **No damage tracking.** DRM tells us nothing about which pixels changed,
-//!   and neither buffer identity nor a page flip is a proxy: X11 renders
-//!   in-place into a stable framebuffer (same handle, new content) while a
-//!   Wayland compositor flips between buffers every frame (new handle,
-//!   possibly identical content). So every frame is [`Damage::Unknown`] and
-//!   `frames_unchanged` stays 0 — the honest answers. This is why the backend
-//!   is **opt-in** rather than the Linux default; see [`env_enabled`].
+//!   so every frame it delivers is [`Damage::Unknown`]. What it can tell is
+//!   whether anything changed, on a Wayland seat only (FR-93 P3d,
+//!   `drm_idle.rs`): a Wayland compositor draws the next frame into another
+//!   buffer and flips, so the same buffer with the same sampled rows is the
+//!   same picture, and the worker skips that frame (`frames_unchanged` counts
+//!   the skips). X11 renders in place into a stable framebuffer (same buffer,
+//!   new content), which no buffer check can see, so there every frame is
+//!   read, as before. The backend stays **opt-in**; see [`env_enabled`].
 //! - **Primary CRTC only.** Multi-monitor is per-CRTC capture with origin and
 //!   scale mapping, deferred by the spec.
 //! - **No detiling.** Measured on Apple Silicon, the `apple-drm` plane
@@ -36,7 +38,10 @@ use anyhow::{Result, anyhow, bail};
 use drm::Device as BasicDevice;
 use drm::control::Device as ControlDevice;
 use std::fs::{File, OpenOptions};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -46,6 +51,7 @@ use drm::buffer::DrmFourcc;
 use drm::control::{crtc, framebuffer, plane, property};
 
 use super::drm_cursor::{self, CursorSnapshot, PlaneKind};
+use super::drm_idle::{self, IdleGate};
 use super::{CursorInfo, Damage, DownscalePolicy, Frame, PixelFormat, ScreenCapture};
 
 /// `/dev/dri/cardN` nodes to probe. The kernel numbers these from 0, but the
@@ -69,10 +75,11 @@ impl ControlDevice for Card {}
 
 /// An `mmap`ed dma-buf, unmapped on drop.
 ///
-/// Held across frames and keyed by framebuffer handle: re-exporting and
+/// Held across frames and keyed by the buffer ([`BufferId`]): re-exporting and
 /// re-mapping every frame measured 2.07 ms against 1.58 ms for a cached
 /// mapping at 1080p, and a compositor cycles through a small set of buffers,
-/// so the cache hits nearly always after the first few frames.
+/// so the cache hits nearly always after the first few frames. The export is
+/// cheap and runs every frame, to name the buffer; the mapping is what costs.
 struct Mapping {
     ptr: *mut libc::c_void,
     len: usize,
@@ -98,6 +105,38 @@ impl Drop for Mapping {
         }
     }
 }
+
+/// FR-93 P3f — the buffer on the primary plane: its framebuffer id and its
+/// dma-buf's inode.
+///
+/// The kernel reuses a framebuffer id for a new buffer once the old one is
+/// gone, so a cache keyed on the id alone could go on reading the old buffer's
+/// mapping: a frozen picture (FR-93 §2.3 #6). Every dma-buf has its own inode
+/// from Linux 5.3; before that they share one, which leaves the id to tell
+/// buffers apart, as before. `0` is a failed `fstat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BufferId {
+    fb: framebuffer::Handle,
+    inode: u64,
+}
+
+/// The cached mapping, and the buffer it maps.
+struct Cached {
+    id: BufferId,
+    mapping: Mapping,
+}
+
+/// Whether a mapping of `mapped` (its buffer and length) still maps buffer
+/// `id` at `len` bytes: the same framebuffer over the same buffer, the same
+/// size. The framebuffer id alone is not enough (P3f).
+fn maps(mapped: Option<(BufferId, usize)>, id: BufferId, len: usize) -> bool {
+    mapped == Some((id, len))
+}
+
+/// `DRM_CLOEXEC` for the PRIME export: the exported fd must not leak into a
+/// child the daemon spawns meanwhile (a helper, a `roomler exec` command),
+/// where it would hold the screen's buffer.
+const DRM_CLOEXEC: u32 = libc::O_CLOEXEC as u32;
 
 /// Something that can close a GEM handle — the [`Card`], or a test's recorder.
 trait CloseHandle {
@@ -163,10 +202,10 @@ fn distinct_handles(buffers: [Option<drm::buffer::Handle>; 4]) -> Vec<drm::buffe
 /// Runtime gate. **Default OFF** — deliberately the inverse of the usual
 /// "kill switch" shape, because switching every Linux host to this backend
 /// would silently undo FR-29: the X11 path tracks damage and idles at ~2.8 %
-/// of a core, whereas DRM has no damage information at all and would grab
-/// every frame forever. So a host opts IN (`ROOMLERD_DRM_CAPTURE=1`) — which
-/// is what a Wayland or headless host wants — and everything else keeps the
-/// existing cascade byte-for-byte.
+/// of a core, whereas DRM has no damage information at all and, on X11, would
+/// grab every frame forever (FR-93 P3d's idle skip is Wayland-only). So a host
+/// opts IN (`ROOMLERD_DRM_CAPTURE=1`) — which is what a Wayland or headless
+/// host wants — and everything else keeps the existing cascade byte-for-byte.
 pub fn env_enabled() -> bool {
     tunnel_core::env::flag("DRM_CAPTURE", false)
 }
@@ -286,6 +325,13 @@ fn primary_plane(
 /// the pointer, as before.
 fn cursor_enabled() -> bool {
     tunnel_core::env::flag("DRM_CURSOR", true)
+}
+
+/// FR-93 P3d — kill switch `ROOMLERD_DRM_IDLE_SKIP=0`: every frame is read,
+/// converted and encoded again, unchanged or not, as before P3d. The caller
+/// also needs the seat to show a Wayland session (see `drm_idle.rs`).
+pub fn idle_skip_enabled() -> bool {
+    tunnel_core::env::flag("DRM_IDLE_SKIP", true)
 }
 
 /// FR-93 P3c — the client caps the cursor plane needs, set after
@@ -494,8 +540,18 @@ fn repack_to_bgra(src: &[u8], width: u32, height: u32, pitch: u32, ten_bit: bool
 }
 
 enum WorkerReply {
-    Frame(Box<Option<Frame>>),
+    Grabbed(Grabbed),
     Failed(String),
+}
+
+/// What one grab came to.
+enum Grabbed {
+    /// A frame to deliver.
+    Frame(Box<Frame>),
+    /// FR-93 P3d — the same picture as the last frame delivered.
+    Unchanged,
+    /// Nothing is scanned out (a mode change, a blanked panel).
+    Nothing,
 }
 
 type FrameRequest = oneshot::Sender<WorkerReply>;
@@ -507,6 +563,8 @@ pub struct DrmCapture {
     height: u32,
     target_frame_period: Duration,
     last_frame_at: Option<Instant>,
+    /// FR-93 P3d — frames the worker skipped because nothing changed.
+    unchanged: Arc<AtomicU64>,
 }
 
 impl DrmCapture {
@@ -524,17 +582,22 @@ impl DrmCapture {
     /// framebuffer, or the scanout modifier is not linear — each of those
     /// produces a wrong picture rather than a slow one, and the caller's
     /// cascade has a working fallback.
-    pub fn primary(target_fps: u32, downscale: DownscalePolicy) -> Result<Self> {
+    ///
+    /// `idle_skip` (FR-93 P3d): skip a frame nothing changed in. Only for a
+    /// Wayland seat, and the caller decides that (see `drm_idle.rs`).
+    pub fn primary(target_fps: u32, downscale: DownscalePolicy, idle_skip: bool) -> Result<Self> {
         // Build the device on the worker thread so the fd and every mapping
         // stay on one thread for their whole life, and ack readiness back
         // synchronously so an init failure surfaces to the cascade here rather
         // than as a silently dead capturer.
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(u32, u32, String)>>();
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<FrameRequest>();
+        let unchanged = Arc::new(AtomicU64::new(0));
+        let worker_unchanged = Arc::clone(&unchanged);
 
         std::thread::Builder::new()
             .name("drm-capture".into())
-            .spawn(move || worker(ready_tx, cmd_rx, downscale))
+            .spawn(move || worker(ready_tx, cmd_rx, downscale, idle_skip, worker_unchanged))
             .map_err(|e| anyhow!("spawn drm-capture worker: {e}"))?;
 
         let (width, height, path) = ready_rx
@@ -552,6 +615,7 @@ impl DrmCapture {
             height,
             target_frame_period: Duration::from_micros(1_000_000 / target_fps.max(1) as u64),
             last_frame_at: None,
+            unchanged,
         })
     }
 }
@@ -562,6 +626,8 @@ fn worker(
     ready_tx: std_mpsc::Sender<Result<(u32, u32, String)>>,
     cmd_rx: std_mpsc::Receiver<FrameRequest>,
     downscale: DownscalePolicy,
+    idle_skip: bool,
+    unchanged: Arc<AtomicU64>,
 ) {
     let (card, path) = match open_display_node() {
         Ok(v) => v,
@@ -640,11 +706,29 @@ fn worker(
         return;
     }
 
-    let mut cached: Option<(drm::control::framebuffer::Handle, Mapping)> = None;
+    let mut cached: Option<Cached> = None;
+    // FR-93 P3d — the frame skip for an unchanged screen, Wayland seats only.
+    let mut gate = idle_skip.then(IdleGate::default);
+    info!(
+        "drm capture: {}",
+        if idle_skip {
+            "a frame nothing changed in is skipped (FR-93 P3d; ROOMLERD_DRM_IDLE_SKIP=0 reads every frame)"
+        } else {
+            "every frame is read (not a Wayland seat, or ROOMLERD_DRM_IDLE_SKIP=0)"
+        }
+    );
 
     while let Ok(reply_tx) = cmd_rx.recv() {
-        let reply = match grab(&card, &planes, &mut cached, downscale, cursor.as_mut()) {
-            Ok(f) => WorkerReply::Frame(Box::new(f)),
+        let reply = match grab(
+            &card,
+            &planes,
+            &mut cached,
+            downscale,
+            cursor.as_mut(),
+            gate.as_mut(),
+            &unchanged,
+        ) {
+            Ok(grabbed) => WorkerReply::Grabbed(grabbed),
             Err(e) => WorkerReply::Failed(format!("{e:#}")),
         };
         if reply_tx.send(reply).is_err() {
@@ -670,17 +754,23 @@ fn modifier_is_linear(info: &drm::control::framebuffer::PlanarInfo) -> bool {
 fn grab(
     card: &Card,
     planes: &[PlaneEntry],
-    cached: &mut Option<(drm::control::framebuffer::Handle, Mapping)>,
+    cached: &mut Option<Cached>,
     downscale: DownscalePolicy,
     cursor: Option<&mut CursorReader>,
-) -> Result<Option<Frame>> {
+    gate: Option<&mut IdleGate>,
+    unchanged: &AtomicU64,
+) -> Result<Grabbed> {
     let Some((fb, crtc)) = primary_plane(card, planes) else {
         // Nothing being scanned out right now (mode change, blanked panel).
         // Not an error: report "no frame" and let the pump retry.
         if cursor.is_some() {
             drm_cursor::publish(None);
         }
-        return Ok(None);
+        // FR-93 P3d — whatever is scanned out next is delivered.
+        if let Some(gate) = gate {
+            gate.forget();
+        }
+        return Ok(Grabbed::Nothing);
     };
     // FR-93 P3c — the pointer at this frame, for the cursor data channel. Read
     // before the primary's pixels, so a failure there cannot leave it stale;
@@ -712,14 +802,22 @@ fn grab(
     };
     let len = pitch as usize * height as usize;
 
+    // FR-93 P3f — the buffer itself, named by its dma-buf: exported on every
+    // frame (an ioctl and an fd), because the framebuffer id alone is reused
+    // for a new buffer once the old one is gone.
+    let handle = info.buffers()[0]
+        .ok_or_else(|| anyhow!("framebuffer has no GEM handle — CAP_SYS_ADMIN missing?"))?;
+    let prime = File::from(
+        card.buffer_to_prime_fd(handle, DRM_CLOEXEC)
+            .map_err(|e| anyhow!("PRIME export: {e}"))?,
+    );
+    let id = BufferId {
+        fb,
+        inode: prime.metadata().map_or(0, |m| m.ino()),
+    };
+
     // Re-map only when the compositor handed us a different buffer.
-    let needs_map = !matches!(cached, Some((h, m)) if *h == fb && m.len == len);
-    if needs_map {
-        let handle = info.buffers()[0]
-            .ok_or_else(|| anyhow!("framebuffer has no GEM handle — CAP_SYS_ADMIN missing?"))?;
-        let prime = card
-            .buffer_to_prime_fd(handle, 0)
-            .map_err(|e| anyhow!("PRIME export: {e}"))?;
+    if !maps(cached.as_ref().map(|c| (c.id, c.mapping.len)), id, len) {
         // SAFETY: a fresh private read-only mapping of the exported dma-buf,
         // sized from the framebuffer's own pitch × height.
         let ptr = unsafe {
@@ -738,12 +836,33 @@ fn grab(
                 std::io::Error::last_os_error()
             ));
         }
-        *cached = Some((fb, Mapping { ptr, len }));
+        *cached = Some(Cached {
+            id,
+            mapping: Mapping { ptr, len },
+        });
     }
+    // The mapping holds the dma-buf, which holds the buffer.
+    drop(prime);
 
-    let Some((_, mapping)) = cached.as_ref() else {
-        return Ok(None);
+    let Some(Cached { mapping, .. }) = cached.as_ref() else {
+        return Ok(Grabbed::Nothing);
     };
+
+    // FR-93 P3d — the same buffer, with the same sampled rows, within
+    // `MAX_SKIP` of the last frame delivered: nothing to send. Checked before
+    // any pixel is converted, which is the cost this skips.
+    let now = Instant::now();
+    let shown = gate.as_ref().map(|_| drm_idle::Shown {
+        fb: u32::from(fb),
+        buffer: id.inode,
+        rows: drm_idle::sample_rows(mapping.as_slice(), width as usize * 4, height, pitch),
+    });
+    if let (Some(gate), Some(shown)) = (gate.as_deref(), shown)
+        && gate.unchanged(shown, now)
+    {
+        unchanged.fetch_add(1, Ordering::Relaxed);
+        return Ok(Grabbed::Unchanged);
+    }
     // Decide the output size BEFORE touching pixels, so a downscaled frame is
     // produced in ONE pass instead of building a full-size intermediate and
     // filtering it afterwards. At 4K that is the difference between
@@ -767,8 +886,11 @@ fn grab(
             source: None,
         }
     };
+    if let (Some(gate), Some(shown)) = (gate, shown) {
+        gate.delivered(shown, now);
+    }
 
-    Ok(Some(Frame {
+    Ok(Grabbed::Frame(Box::new(Frame {
         width: scaled.width,
         height: scaled.height,
         stride: scaled.stride,
@@ -776,13 +898,13 @@ fn grab(
         data: scaled.data,
         monotonic_us: now_us(),
         monitor: 0,
-        // DRM reports nothing about which pixels changed, and neither buffer
-        // identity nor a page flip is a proxy for it. See the module docs.
+        // DRM reports nothing about WHICH pixels changed: a buffer check says
+        // only whether any did (P3d, above). See the module docs.
         damage: Damage::Unknown,
         // Pre-downscale dims, so the pump can still reason about the real
         // screen size; `None` when we delivered native.
         source: scaled.source,
-    }))
+    })))
 }
 
 /// A frame's pixels plus the geometry that describes them.
@@ -887,29 +1009,41 @@ fn now_us() -> u64 {
 #[async_trait::async_trait]
 impl ScreenCapture for DrmCapture {
     async fn next_frame(&mut self) -> Result<Option<Frame>> {
-        if let Some(last) = self.last_frame_at {
-            let elapsed = last.elapsed();
-            if elapsed < self.target_frame_period {
-                tokio::time::sleep(self.target_frame_period - elapsed).await;
-            }
-        }
-        let (res_tx, res_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(res_tx)
-            .map_err(|_| anyhow!("drm capture worker exited"))?;
-        let reply = res_rx
-            .await
-            .map_err(|_| anyhow!("drm capture worker dropped reply"))?;
-        self.last_frame_at = Some(Instant::now());
-        match reply {
-            WorkerReply::Frame(f) => {
-                if let Some(fr) = f.as_ref() {
-                    self.width = fr.width;
-                    self.height = fr.height;
+        let started = Instant::now();
+        loop {
+            if let Some(last) = self.last_frame_at {
+                let elapsed = last.elapsed();
+                if elapsed < self.target_frame_period {
+                    tokio::time::sleep(self.target_frame_period - elapsed).await;
                 }
-                Ok(*f)
             }
-            WorkerReply::Failed(e) => Err(anyhow!(e)),
+            let (res_tx, res_rx) = oneshot::channel();
+            self.cmd_tx
+                .send(res_tx)
+                .map_err(|_| anyhow!("drm capture worker exited"))?;
+            let reply = res_rx
+                .await
+                .map_err(|_| anyhow!("drm capture worker dropped reply"))?;
+            self.last_frame_at = Some(Instant::now());
+            match reply {
+                WorkerReply::Grabbed(Grabbed::Frame(frame)) => {
+                    self.width = frame.width;
+                    self.height = frame.height;
+                    return Ok(Some(*frame));
+                }
+                WorkerReply::Grabbed(Grabbed::Nothing) => return Ok(None),
+                // FR-93 P3d — a still screen is waited out at the frame rate,
+                // up to IDLE_WAIT, as the portal arm waits on its stream. The
+                // pump answers each "nothing this tick" with a keepalive
+                // re-encode of its last frame, so a "nothing" every frame
+                // period would cost more encodes than the frames it saved.
+                WorkerReply::Grabbed(Grabbed::Unchanged) => {
+                    if started.elapsed() >= drm_idle::IDLE_WAIT {
+                        return Ok(None);
+                    }
+                }
+                WorkerReply::Failed(e) => return Err(anyhow!(e)),
+            }
         }
     }
 
@@ -922,6 +1056,12 @@ impl ScreenCapture for DrmCapture {
 
     fn arm(&self) -> Option<super::CaptureArm> {
         Some(super::CaptureArm::Drm)
+    }
+
+    /// FR-93 P3d — the frames skipped because nothing changed, which the
+    /// pump's idle log carries beside its own count of empty polls.
+    fn frames_unchanged(&self) -> u64 {
+        self.unchanged.load(Ordering::Relaxed)
     }
 }
 
@@ -1064,6 +1204,44 @@ mod tests {
 
     fn handle(n: u32) -> drm::buffer::Handle {
         drm::control::from_u32(n).expect("a non-zero handle")
+    }
+
+    /// FR-93 P3f — the kernel reuses a framebuffer id for a new buffer once
+    /// the old one is gone, and a mapping keyed on the id alone went on
+    /// showing the old buffer.
+    #[test]
+    fn a_mapping_is_reused_only_for_the_same_buffer_at_the_same_size() {
+        let fb =
+            |n: u32| -> framebuffer::Handle { drm::control::from_u32(n).expect("a non-zero id") };
+        let a = BufferId {
+            fb: fb(31),
+            inode: 1001,
+        };
+        assert!(maps(Some((a, 4096)), a, 4096));
+        assert!(!maps(None, a, 4096), "nothing mapped yet");
+        assert!(
+            !maps(
+                Some((a, 4096)),
+                BufferId {
+                    fb: fb(31),
+                    inode: 1002
+                },
+                4096
+            ),
+            "the framebuffer id reused for a new buffer"
+        );
+        assert!(
+            !maps(
+                Some((a, 4096)),
+                BufferId {
+                    fb: fb(32),
+                    inode: 1001
+                },
+                4096
+            ),
+            "another framebuffer"
+        );
+        assert!(!maps(Some((a, 4096)), a, 8192), "a new size");
     }
 
     /// FR-93 AC9: every handle a GETFB2 hands back is closed, each buffer

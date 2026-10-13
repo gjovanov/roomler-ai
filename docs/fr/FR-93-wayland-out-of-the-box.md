@@ -402,7 +402,7 @@ once a session is allowed.
 | a | GETFB2 only when the plane's fb id changed; `close_buffer` every handle after export (kmsgrab's shape) | §2.3 #4 |
 | b | the plane's `type` = Primary; the card by `boot_vga`/seat0, not first-found | §2.3 #5 |
 | c | **the cursor plane**: set `DRM_CLIENT_CAP_ATOMIC` + `CURSOR_PLANE_HOTSPOT` (on virtio/qxl/vmwgfx the kernel hides the plane otherwise), read its ARGB fb + `CRTC_X/Y` + `HOTSPOT_X/Y`, ship it on the **existing cursor DC** (`cursor:pos`/`cursor:shape`, Windows-only today) — not a per-frame blend | §2.3 #7; RustDesk/Sunshine both read it |
-| d | idle cost, Wayland-only and measure-first: an unchanged primary fb id **and** an unchanged hash of sampled rows ⇒ unchanged; a forced refresh every 1 s (FR-29's bound) | the header's objection (`drm_backend.rs:17-25`) covers X11 front-buffer rendering (excluded) and "new handle, identical content" (a wasted encode, not a stale frame); the hash covers a double-buffered A→B→A |
+| d | idle cost, Wayland-only and measure-first: an unchanged primary fb id **and** an unchanged hash of sampled rows ⇒ unchanged; a forced refresh every 1 s (FR-29's bound) | the header's objection (`drm_backend.rs:19-27`) covers X11 front-buffer rendering (excluded) and "new handle, identical content" (a wasted encode, not a stale frame); the hash covers a double-buffered A→B→A |
 | e | refusals and "the display is off" reach the viewer through FR-80 | §2.3 #5 |
 | f | the mapping cache keyed on the dma-buf's identity, not the fb id | §2.3 #6 |
 | g | tiled scanout = FR-36 P2: EGL dma-buf import, `dlopen`ed (the PipeWire rule — no `DT_NEEDED`) | real x86 hardware only (D3) |
@@ -417,6 +417,18 @@ it to the cursor channel's tracker. Only the DRM arm publishes: mutter's and the
 The primary plane is now chosen by its `type`, which P3b listed, because a bound cursor plane would otherwise win on
 enumeration order. Not in P3c: P3b's card choice (`boot_vga`/seat0), multi-monitor, and a DRM recording's pointer
 (`capture::pointer` still reports none for DRM).
+
+**As built (P3d + P3f, 2026-10-13): an unchanged screen is skipped** (`capture/drm_idle.rs`, its I/O in
+`drm_backend.rs`; [`linux-capture.md`](../linux-capture.md) §3.2). Measured first: on 0.4.133 an idle GNOME desktop
+over DRM cost 57.9 % of a core, every frame read, converted and encoded at 30 fps. On a Wayland seat the worker now
+skips a frame when the primary plane shows the same framebuffer over the same buffer, 32 sampled rows hash the same,
+and the last delivered frame is under 1 s old (FR-29's bound). The buffer is named by its dma-buf's inode as well as
+its framebuffer id, and the mapping cache is keyed on both (P3f, §2.3 #6); the export now carries `DRM_CLOEXEC`.
+`next_frame` waits a still screen out for 250 ms before it says "no frame", the portal arm's `FRAME_WAIT`: the
+data-channel pumps answer every "no frame" with a keepalive re-encode of their last frame (every 60 ms at most), so a
+"no frame" each frame period would have spent on keepalives what the skip saves. The rule is Wayland-only, decided
+at open from the seat's session (`desktop_brief::seen_is_wayland`): an X server and the console draw in place, where
+no buffer check sees a change. Kill switch `ROOMLERD_DRM_IDLE_SKIP=0`.
 
 ### 4.5 Input (P4)
 
@@ -526,6 +538,7 @@ bridge for text and images in the lab before deciding.
 | ↳ P2c | the viewer names the arm and whether it asked (FR-45 AC8 option b) | — | lab, after a promote | S |
 | **P3** | DRM hardening (§4.4 b–f) | `ROOMLERD_DRM_CURSOR=0`, `ROOMLERD_DRM_IDLE_SKIP=0` | lab, Asahi | M |
 | ↳ P3c | the cursor plane: the DRM worker reads the CRTC's cursor plane (`ATOMIC` + `CURSOR_PLANE_HOTSPOT`; `CRTC_X/Y`, `HOTSPOT_X/Y`, the ARGB buffer), and the cursor data channel carries it (`linux-capture.md` §3.1). With it, P3b's half that P3c needs: the primary plane chosen by its type | `ROOMLERD_DRM_CURSOR=0` | ✅ lab (`dbf514a3f`; built before a rebase, the same changes), the GNOME 50 and Plasma 6.7.5 system installs with `drm_capture` + `uinput`, AC5's `cursor` plan. **🔴 0.4.132:** no overlay at either target. **P3c:** the overlay at both targets, on both compositors. `ROOMLERD_DRM_CURSOR=0` gives the badge back. Owed: a real GPU, with no hotspot property (Asahi) | S |
+| ↳ P3d | an unchanged frame skipped on a Wayland seat: the same framebuffer over the same buffer, the same 32 sampled rows, under 1 s since the last delivered frame; a still screen waited out for 250 ms, as the portal waits on its stream (`linux-capture.md` §3.2). With it P3f: the buffer named by its dma-buf's inode, and the mapping cache keyed on it | `ROOMLERD_DRM_IDLE_SKIP=0` | ✅ lab (`cac2d7c43`), the GNOME 50 system guest with `drm_capture` + `uinput`, an idle desktop on the viewer's default path. **🔴 0.4.133:** 57.9 % of a core. **P3d:** 5.5 % and 5.3 %; the probe's counter as fresh as AC1's (0.42–0.70 s old), the cursor overlay at both of AC5's targets, AC4's 8 checks. `ROOMLERD_DRM_IDLE_SKIP=0`: 64.3 % and 60.7 %. KWin (the Plasma 6.7.5 system guest) the same: 4.7 % and 4.7 %, against 46.1 % and 44.5 % with the kill switch | S |
 | **P3g** | tiled scanout via EGL import | `ROOMLERD_DRM_EGL=0` | the x86 cell (D3) | L |
 | **P4** | Mutter RemoteDesktop input, layouts, per-output mapping (§4.5) | `ROOMLERD_MUTTER_INPUT=0` | lab, WSL2 | M |
 | ↳ P4a | mutter's own RemoteDesktop drives the mutter screencast and takes the viewer's input; the route carries its kind, so `rc:input-reach` and the brief name it | `mutter_input` | ✅ lab (`3f9ad6464`), GNOME 50 per-user, no key, the AC4 oracle. **🔴 0.4.131:** the picture, and 0 events at the probe, all 7 input checks failed. **P4a:** all 7 passed: the three points exact, click, wheel down, "hello 123", Shift+a as "A"; the brief `input_reach=full`. `mutter_input = false` gives the view-only arm back | S |
@@ -636,13 +649,24 @@ New cells run three times before they are trusted. An entry in `expected-failure
 - [ ] **AC5** — the remote cursor is visible in the viewer on DRM and mutter/portal sessions.
   ⏳ DRM: ✅ in the lab on P3c (`dbf514a3f`), the GNOME 50 and Plasma 6.7.5 system installs. The person at the
   screen moved the pointer over QMP and the viewer's overlay followed it to both targets (AC5's `cursor` plan);
-  🔴 first on 0.4.132, with no overlay at either target and no arrow in the DRM stream. Owed: a released build, a
-  real GPU (Asahi), and the mutter and portal sessions, whose streams embed the pointer and have not been measured
-  by this plan.
+  🔴 first on 0.4.132, with no overlay at either target and no arrow in the DRM stream. ✅ **mutter and the
+  portal, on released builds** (step log 64): these streams draw the pointer into the frames, so the oracle counts
+  the arrow's pixels in the viewer's decoded picture at each target and in the box the pointer just left. GNOME
+  per-user on the released 0.4.132 (mutter): 40 and 46 dark pixels where the pointer is, 0 where it left. KDE
+  per-user on the released 0.4.133 (the automatic portal's RemoteDesktop session, restored from its token): 90 and
+  90, then 0. The same check read no arrow in the DRM stream on 0.4.132, so it can fail. Owed: DRM on a released
+  build (P3c is merged, not released). The real GPU is AC12's (Asahi passes AC5 there).
 - [ ] **AC6** — every refusal names its reason in the viewer; no black stream, no "headless" for a seat with a
   session. Each refusal row shown red on 0.4.124 first.
 - [ ] **AC7** — lifecycle (§4.6): each event recovers within 10 s or names its reason.
 - [ ] **AC8** — an idle DRM session's CPU, measured before and after, within 2× of FR-29's X11 figure.
+  ⏳ ✅ in the lab on P3d (`cac2d7c43`): the GNOME 50 system guest, an idle desktop on the viewer's default path,
+  every `roomlerd` process's CPU over two 60 s windows. **57.9 %** of a core on the released 0.4.133, **5.5 % and
+  5.3 %** with P3d, inside 2 × 3.4 % = 6.8 %; `ROOMLERD_DRM_IDLE_SKIP=0` gives 64.3 % and 60.7 % back. KWin, on the
+  Plasma 6.7.5 system guest: **4.7 % and 4.7 %**, against 46.1 % and 44.5 % with the kill switch. FR-29's 3.4 %
+  was taken on H.264 over the RTP track, which the lab cannot reproduce: its Chromium has no H.264, and the RTP
+  track carried no video there even with VP9. These numbers are on the VP9-444 data-channel pump, whose keepalives
+  P3d had to wait out (§4.4). Owed: a released build.
 - [x] **AC9** — the GEM handle count stays flat over a 30-minute DRM session (red on 0.4.124).
   ✅ 0.4.128, the GNOME system guest: `@create 51143 / @delete 51143` over 30 minutes, every minute with a
   changing picture. 🔴 first on 0.4.125, the same code: `124 / 0` in one session. Step log 31 on #1972.
@@ -723,6 +747,10 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-13 | `wlab-gnome` (per-user, no key) | 0.4.132, the release | AC1: the viewer decodes the probe's block code from the frame every 250 ms for 30 s; each counter is dated by the probe's own tick log, on mars's clock with the guest's offset measured over the lab's ssh | The first run decoded nothing: the probe window was blank. The guest lacked `python3-gi-cairo` (it predates that bake line), so every draw raised a TypeError while the tick log ran on, and its probe predated the startup guard that refuses to start without the package. ✅ With it installed (and the probe updated afterwards): 112 of 112 frames decoded, 112 distinct counters, the counter shown 0.42–0.68 s old (median 0.54 s), clock uncertainty ±0.43 s. Step log 61 |
 | 2026-10-13 | `wlab-gnome-sys`, `wlab-kde-sys` (system, `drm_capture` + `uinput`) | 0.4.132, then P3c `dbf514a3f` (built before a rebase, the same changes) | P3c / AC5: the person at the screen (QMP) moves the pointer to two targets, and the viewer oracle's `cursor` plan reads where the viewer draws it | 🔴 0.4.132 (GNOME): no overlay at either target, and no arrow in the DRM stream. ✅ P3c: the overlay at (0.295, 0.592) / (0.695, 0.592) on GNOME and at (0.299, 0.597) / (0.699, 0.597) on KWin, for targets (0.3, 0.6) / (0.7, 0.6). The worker logged `planes=2 cursor_planes=1 atomic=true hotspot=true` on both. ✅ `ROOMLERD_DRM_CURSOR=0`: no overlay again, and "the cursor plane is not read". Step log 62 |
 | 2026-10-13 | `wlab-kde` (per-user, no capture key) | 0.4.133, the release (the tarball by hand, #2046; gpg a good signature) | AC4: the lab's input oracle (`points`) on a released build with P4b | ✅ All 8 checks: the picture, three points exact, the click, the wheel notch down, "hello 123", Shift+a as "A". The automatic portal reopened its RemoteDesktop session from the restore token, KDE's scroll correction engaged, and the input went through the portal. AC4 ticked. Step log 63 |
+| 2026-10-13 | `wlab-gnome` (per-user), `wlab-kde` (per-user) | 0.4.132 and 0.4.133, the releases | AC5: the `cursor` plan on the mutter and portal arms, whose streams draw the pointer into the frames | ✅ the arrow in the decoded picture at both targets: GNOME (mutter) 40 and 46 dark pixels, KDE (the automatic portal's RemoteDesktop) 90 and 90, then 0 where the pointer left; no overlay of the viewer's own, none expected. Step log 64 |
+| 2026-10-13 | `wlab-gnome-sys` (system, `drm_capture` + `uinput`); `wlab-gnome` (per-user) | 0.4.133; 0.4.132, the releases | AC8 fail-first: an idle desktop, the probe stopped, one viewer session on the default path (the VP9-444 data-channel pump); every `roomlerd` process's CPU over two 60 s windows from `/proc` | 🔴 DRM: 57.9 % and 57.9 % of a core, 30 frames read and encoded a second, ~1.2 MB per 30. For comparison, mutter: 8.6 % and 8.8 %; mutter sent 3 frames, and the pump re-encoded its last frame ~4 times a second, on each 250 ms "no frame" (`FRAME_WAIT`). Wrong turns, kept: FR-29's configuration (H.264 over the RTP track) shows no picture in the lab's Chromium, which has no H.264, and the RTP track carried no video with VP9 either; and the harness's start marker first matched the source line Playwright quotes in its error report. Step log 65 |
+| 2026-10-13 | `wlab-gnome-sys` | P3d `cac2d7c43` | P3d / AC8: idle CPU as above; freshness with the probe ticking (`ac1-fresh`); AC5's `cursor` plan; AC4's `points`; then `ROOMLERD_DRM_IDLE_SKIP=0` | ✅ 5.5 % and 5.3 %: ~1 frame read and ~4 encoded a second, ~2 KB per 30, `idle_skip=true`. Fresh: 111 of 111 frames decoded, 109 distinct counters, 0.42–0.70 s old. The cursor overlay at both targets; AC4 8 of 8. Kill switch: 64.3 % and 60.7 %, `idle_skip=false`. Step log 65 |
+| 2026-10-13 | `wlab-kde-sys` (system, `drm_capture` + `uinput`) | P3d `cac2d7c43` | the same A/B on KWin (Plasma 6.7.5) | ✅ 4.7 % and 4.7 %, `idle_skip=true`; fresh: 111 of 111 decoded, 0.39–0.67 s old; the cursor overlay at (0.299, 0.597) and (0.699, 0.597); AC4 8 of 8. Kill switch: 46.1 % and 44.5 %, `idle_skip=false`. Step log 65 |
 
 ## 12. Related
 
