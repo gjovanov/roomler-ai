@@ -4,8 +4,9 @@
 //! a member puts it back together.
 //!
 //! At each turn's end the primary checkpoints its session: the five allowlisted
-//! paths of Claude Code's config directory ([`allowlist`]), and later in P2b the
-//! workspace. The daemon never reads a path the session's account controls, so
+//! paths of Claude Code's config directory ([`allowlist`]; a fork's eight,
+//! [`allowlist_of`]), and later in P2b the workspace. The daemon never reads a
+//! path the session's account controls, so
 //! [`take`] runs AS THE ACCOUNT, in `roomlerd hive-checkpoint` (P2b-3). What it
 //! produces is a [`Checkpoint`], recorded in the chain as a `checkpoint` event
 //! (so two members at the same `(seq, hash)` hold the same files), and the
@@ -25,7 +26,7 @@
 //!
 //! ⚠️ **An allowlist, never the directory.** The config directory's root holds a
 //! `peerToken` beside the harness's messaging socket and a `machineID` (§3b's
-//! probes). Nothing outside the five paths is ever opened.
+//! probes). Nothing outside the allowlist's paths is ever opened.
 //!
 //! ⚠️ **A link is never followed.** The allowlist holds Claude Code's own files;
 //! a link there to the account's `~/.ssh` would copy a key to every member. A
@@ -418,6 +419,52 @@ pub fn allowlist(harness_session: &str) -> Result<[AllowEntry; 5], CheckpointErr
     ])
 }
 
+/// FR-90 P2f-3a — the paths a checkpoint takes for a session forked from the
+/// session whose harness id is `fork_of`: its own five ([`allowlist`]), and
+/// three of its parent's under the FORK's project directory, their names
+/// kept:
+///
+/// - `projects/hive-<id>/<parent>.jsonl`, the history the fork's first launch
+///   resumes from (`--resume <parent> --fork-session`);
+/// - `projects/hive-<id>/<parent>/subagents/` and
+///   `projects/hive-<id>/<parent>/tool-results/`, which the history the fork
+///   writes still names: Claude Code copies neither (2.1.296, probed
+///   2026-10-10).
+///
+/// Kept for the fork's life, so a copy of it starts anywhere from its own
+/// chain, before its first prompt as after. The memory and `CLAUDE.md` are
+/// one path for both. The parent's files are written once, by the fork's
+/// first start, so [`growth_of`] takes each whole. `None` is [`allowlist`];
+/// a parent that is the session itself is refused, as a malformed id is.
+pub fn allowlist_of(
+    harness_session: &str,
+    fork_of: Option<&str>,
+) -> Result<Vec<AllowEntry>, CheckpointError> {
+    let mut entries = allowlist(harness_session)?.to_vec();
+    if let Some(parent) = fork_of {
+        let parent = harness_id(parent)?;
+        if parent == harness_session {
+            return Err(CheckpointError::BadSession(parent));
+        }
+        let project = format!("projects/hive-{harness_session}");
+        entries.extend([
+            AllowEntry {
+                rel: format!("{project}/{parent}.jsonl"),
+                is_dir: false,
+            },
+            AllowEntry {
+                rel: format!("{project}/{parent}/subagents"),
+                is_dir: true,
+            },
+            AllowEntry {
+                rel: format!("{project}/{parent}/tool-results"),
+                is_dir: true,
+            },
+        ]);
+    }
+    Ok(entries)
+}
+
 /// The id, in the lowercase hyphenated form Claude Code names files by.
 fn harness_id(harness_session: &str) -> Result<String, CheckpointError> {
     let parsed = uuid::Uuid::parse_str(harness_session)
@@ -572,19 +619,21 @@ fn split_lines(bytes: &[u8], max: usize) -> Vec<&[u8]> {
 }
 
 /// Take a checkpoint of `config_dir` for the session whose harness id is
-/// `harness_session`: number `n`, after turn `turn`, from where `prev` left
-/// each file. Returns the checkpoint and its new blobs.
+/// `harness_session` (P2f-3a: forked from `fork_of`'s): number `n`, after
+/// turn `turn`, from where `prev` left each file. Returns the checkpoint and
+/// its new blobs.
 ///
 /// Runs as whoever calls it, which for a session is its account (P2b-3), and
-/// opens nothing outside the [`allowlist`].
+/// opens nothing outside the allowlist ([`allowlist_of`]).
 pub fn take(
     config_dir: &Path,
     harness_session: &str,
+    fork_of: Option<&str>,
     n: u64,
     turn: u32,
     prev: &Previous,
 ) -> Result<(Checkpoint, Vec<Vec<u8>>), CheckpointError> {
-    let entries = allowlist(harness_session)?;
+    let entries = allowlist_of(harness_session, fork_of)?;
     let mut found: Vec<(String, std::path::PathBuf)> = Vec::new();
     let mut skipped = Vec::new();
     for entry in &entries {
@@ -877,6 +926,51 @@ mod tests {
         }
     }
 
+    /// The session a fork was made from (P2f-3a).
+    const PARENT: &str = "7d8e9fa0-b1c2-4d3e-8f40-5a6b7c8d9e0f";
+
+    /// P2f-3a — a fork's allowlist is its own five and three of its parent's,
+    /// under the FORK's project directory with their names kept; the memory
+    /// and `CLAUDE.md` are one path for both. A parent that is the session
+    /// itself, or no UUID, is refused.
+    #[test]
+    fn a_forks_allowlist_keeps_its_parents_history_beside_its_own() {
+        let own = allowlist(ID).unwrap().to_vec();
+        assert_eq!(allowlist_of(ID, None).unwrap(), own, "no parent: the five");
+        let forked = allowlist_of(ID, Some(PARENT)).unwrap();
+        assert_eq!(forked[..5], own[..], "its own five first");
+        let p = format!("projects/hive-{ID}");
+        let parents: Vec<(&str, bool)> = forked[5..]
+            .iter()
+            .map(|e| (e.rel.as_str(), e.is_dir))
+            .collect();
+        assert_eq!(
+            parents,
+            [
+                (format!("{p}/{PARENT}.jsonl").as_str(), false),
+                (format!("{p}/{PARENT}/subagents").as_str(), true),
+                (format!("{p}/{PARENT}/tool-results").as_str(), true),
+            ],
+            "the parent's three, under the fork's project"
+        );
+        for bad in [ID, "../etc", "", &PARENT.to_uppercase()] {
+            assert!(
+                matches!(
+                    allowlist_of(ID, Some(bad)),
+                    Err(CheckpointError::BadSession(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        // Written once, by the fork's first start: taken whole.
+        for rel in [
+            format!("{p}/{PARENT}.jsonl"),
+            format!("{p}/{PARENT}/subagents/agent-a1.jsonl"),
+        ] {
+            assert_eq!(growth_of(&rel, ID), Growth::Whole, "{rel}");
+        }
+    }
+
     #[test]
     fn the_history_and_a_subagents_transcript_are_appended_the_rest_whole() {
         let p = format!("projects/hive-{ID}");
@@ -1151,7 +1245,7 @@ mod tests {
         write(dir, "sessions/123.abc.key", b"{\"peerToken\":\"secret\"}");
         write(dir, &format!("{p}/other.jsonl"), b"another session\n");
 
-        let (one, blobs) = take(dir, ID, 1, 1, &Previous::none()).unwrap();
+        let (one, blobs) = take(dir, ID, None, 1, 1, &Previous::none()).unwrap();
         let listed: Vec<&str> = one.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(
             listed,
@@ -1174,7 +1268,7 @@ mod tests {
         let hist = dir.join(format!("{p}/{ID}.jsonl"));
         std::fs::write(&hist, b"{\"t\":1}\n{\"t\":2}\n").unwrap();
         std::fs::remove_file(dir.join(format!("{p}/{ID}/tool-results/t1.txt"))).unwrap();
-        let (two, blobs2) = take(dir, ID, 2, 2, &Previous::from_checkpoint(&one)).unwrap();
+        let (two, blobs2) = take(dir, ID, None, 2, 2, &Previous::from_checkpoint(&one)).unwrap();
         let history = two
             .files
             .iter()
@@ -1206,6 +1300,69 @@ mod tests {
         assert_eq!(claude, b"# rules\n");
     }
 
+    /// P2f-3a — a fork's checkpoint takes its own files and its parent's
+    /// three under its own project directory, the parent's whole; nothing
+    /// under the parent's own project directory, and nothing of a session
+    /// further back: a fork of a fork resumes its parent's history, which
+    /// holds those turns already.
+    #[test]
+    fn take_of_a_fork_keeps_its_parents_files_and_nothing_further_back() {
+        const GRANDPARENT: &str = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let p = format!("projects/hive-{ID}");
+        write(dir, &format!("{p}/{ID}.jsonl"), b"{\"t\":1}\n");
+        write(dir, &format!("{p}/{PARENT}.jsonl"), b"{\"p\":1}\n");
+        write(
+            dir,
+            &format!("{p}/{PARENT}/subagents/agent-a1.jsonl"),
+            b"{\"s\":1}\n",
+        );
+        write(
+            dir,
+            &format!("{p}/{PARENT}/tool-results/t1.txt"),
+            b"big output",
+        );
+        write(dir, "CLAUDE.md", b"# rules\n");
+        write(dir, &format!("{p}/{GRANDPARENT}.jsonl"), b"further back\n");
+        write(
+            dir,
+            &format!("projects/hive-{PARENT}/{PARENT}.jsonl"),
+            b"the parent's own place\n",
+        );
+
+        let (cp, blobs) = take(dir, ID, Some(PARENT), 1, 1, &Previous::none()).unwrap();
+        let listed: Vec<(&str, Growth)> = cp
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.growth))
+            .collect();
+        let mut want = vec![
+            ("CLAUDE.md".to_string(), Growth::Whole),
+            (format!("{p}/{ID}.jsonl"), Growth::Append),
+            (format!("{p}/{PARENT}.jsonl"), Growth::Whole),
+            (
+                format!("{p}/{PARENT}/subagents/agent-a1.jsonl"),
+                Growth::Whole,
+            ),
+            (format!("{p}/{PARENT}/tool-results/t1.txt"), Growth::Whole),
+        ];
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        let want: Vec<(&str, Growth)> = want.iter().map(|(p, g)| (p.as_str(), *g)).collect();
+        assert_eq!(listed, want, "its own files and its parent's three");
+        let all = blobs.concat();
+        let has = |needle: &[u8]| all.windows(needle.len()).any(|w| w == needle);
+        assert!(!has(b"further back") && !has(b"the parent's own place"));
+
+        // Without the parent, the same directory is a session's own five.
+        let (plain, _) = take(dir, ID, None, 1, 1, &Previous::none()).unwrap();
+        assert!(
+            plain.files.iter().all(|f| !f.path.contains(PARENT)),
+            "{:?}",
+            plain.files
+        );
+    }
+
     /// A link in the allowlist is listed as skipped and never followed, as a
     /// path or inside a directory.
     #[cfg(unix)]
@@ -1219,7 +1376,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(format!("{p}/memory"))).unwrap();
         std::os::unix::fs::symlink(&secret, dir.join(format!("{p}/memory/MEMORY.md"))).unwrap();
         std::os::unix::fs::symlink(&secret, dir.join("CLAUDE.md")).unwrap();
-        let (cp, blobs) = take(dir, ID, 1, 1, &Previous::none()).unwrap();
+        let (cp, blobs) = take(dir, ID, None, 1, 1, &Previous::none()).unwrap();
         assert!(cp.files.is_empty(), "{:?}", cp.files);
         assert!(blobs.is_empty());
         let skipped: Vec<(&str, &str)> = cp

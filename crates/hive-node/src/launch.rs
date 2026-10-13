@@ -48,6 +48,14 @@ pub struct LaunchSpec {
     /// Resume the existing transcript (`--resume`) rather than start one
     /// (`--session-id`).
     pub resume: bool,
+    /// FR-90 P2f-3a — on a fork's first launch only, the harness session it
+    /// was made from: the launch resumes that one's history, put in place
+    /// under this session's pinned project name, as a new conversation with
+    /// this session's id (`--resume <it> --fork-session --session-id
+    /// <session>`). Claude Code takes the id (2.1.296, probed 2026-10-10).
+    /// Once [`Self::history_path`] exists, the fork launches like any session,
+    /// with this unset.
+    pub fork_of: Option<String>,
     /// The MCP tool that answers permission prompts.
     pub permission_prompt_tool: Option<String>,
     /// The permission mode the harness starts in (`--permission-mode`).
@@ -100,6 +108,8 @@ pub fn toolbelt_mcp_config(command: &str, args: &[String], timeout_ms: u64) -> V
 pub enum LaunchError {
     #[error("session id {0:?} is not a UUID")]
     SessionId(String),
+    #[error("session {0:?} is named as the session it was forked from")]
+    ForkOfItself(String),
     #[error("{what} must be an absolute path, got {path}")]
     NotAbsolute { what: &'static str, path: PathBuf },
 }
@@ -118,6 +128,18 @@ pub fn history_path_in(config_dir: &Path, session: &str) -> PathBuf {
         .join("projects")
         .join(project_dir_name_of(session))
         .join(format!("{session}.jsonl"))
+}
+
+/// FR-90 P2f-3a — where a fork's first launch finds the history of `parent`,
+/// the session it was made from: under the FORK's pinned project name, with
+/// the parent's own file name, which `--resume <parent> --fork-session` reads
+/// there. ⚠️ Not [`history_path_in`] of the parent, which names the parent's
+/// own project directory.
+pub fn parent_history_in(config_dir: &Path, session: &str, parent: &str) -> PathBuf {
+    config_dir
+        .join("projects")
+        .join(project_dir_name_of(session))
+        .join(format!("{parent}.jsonl"))
 }
 
 fn project_dir_name_of(session: &str) -> String {
@@ -145,6 +167,14 @@ impl LaunchSpec {
         history_path_in(&self.config_dir(), &self.session)
     }
 
+    /// FR-90 P2f-3a — on a fork's first launch, the parent's history it
+    /// resumes ([`parent_history_in`]).
+    pub fn parent_history_path(&self) -> Option<PathBuf> {
+        self.fork_of
+            .as_deref()
+            .map(|parent| parent_history_in(&self.config_dir(), &self.session, parent))
+    }
+
     /// Where Claude Code keeps this session's auto-memory, under the pinned
     /// project name: its index `MEMORY.md` reaches the model as "user's
     /// auto-memory" with no settings change (2.1.293, probed 2026-10-08).
@@ -160,6 +190,14 @@ impl LaunchSpec {
     pub fn validate(&self) -> Result<(), LaunchError> {
         if uuid::Uuid::parse_str(&self.session).is_err() {
             return Err(LaunchError::SessionId(self.session.clone()));
+        }
+        if let Some(parent) = &self.fork_of {
+            if uuid::Uuid::parse_str(parent).is_err() {
+                return Err(LaunchError::SessionId(parent.clone()));
+            }
+            if parent.eq_ignore_ascii_case(&self.session) {
+                return Err(LaunchError::ForkOfItself(self.session.clone()));
+            }
         }
         for (what, path) in [
             ("harness", &self.harness),
@@ -193,15 +231,33 @@ impl LaunchSpec {
         .into_iter()
         .map(OsString::from)
         .collect();
-        a.push(
-            if self.resume {
-                "--resume"
-            } else {
-                "--session-id"
+        // P2f-3a — a fork's first launch: its parent's history, as a new
+        // conversation under this session's id. Never over a history of its
+        // own: `resume` wins.
+        match self.fork_of.as_deref().filter(|_| !self.resume) {
+            Some(parent) => {
+                for arg in [
+                    "--resume",
+                    parent,
+                    "--fork-session",
+                    "--session-id",
+                    self.session.as_str(),
+                ] {
+                    a.push(arg.into());
+                }
             }
-            .into(),
-        );
-        a.push(self.session.clone().into());
+            None => {
+                a.push(
+                    if self.resume {
+                        "--resume"
+                    } else {
+                        "--session-id"
+                    }
+                    .into(),
+                );
+                a.push(self.session.clone().into());
+            }
+        }
         a.push("--settings".into());
         a.push(self.settings.clone().into_os_string());
         if let Some(p) = &self.mcp_config {
@@ -343,8 +399,9 @@ pub struct SettingsSpec {
     pub sandbox_proxy: Option<SandboxProxy>,
     /// Paths the model's Read tool must not open, beyond the defaults.
     pub extra_read_denies: Vec<String>,
-    /// FR-90 P2e-7 — the command a `SessionStart` hook runs on a resume: it
-    /// prints the resume note when the daemon left one, and nothing else.
+    /// FR-90 P2e-7 — the command a `SessionStart` hook runs on a resume, and
+    /// (P2f-3a) on a fork's first launch: it prints the note when the daemon
+    /// left one, and nothing else.
     pub session_start_hook: Option<String>,
 }
 
@@ -371,15 +428,21 @@ impl SettingsSpec {
         if let Some(dir) = &self.auto_memory_directory {
             doc["autoMemoryDirectory"] = json!(dir.to_string_lossy());
         }
-        // P2e-7 — on a resume only (`source: "resume"`): a first start has
-        // nothing to be told, and a hook that prints nothing adds nothing.
+        // P2e-7 — on a resume (`source: "resume"`), and P2f-3a on a fork's
+        // first launch, which Claude Code starts as `source: "fork"`, not
+        // `resume` (2.1.280, probed 2026-10-13: a `resume` hook never fired
+        // there, and a `fork` one's output reached the model). A first start
+        // has nothing to be told, and a hook that prints nothing adds
+        // nothing. One entry per source: neither relies on the matcher being
+        // a pattern.
         if let Some(command) = &self.session_start_hook {
-            doc["hooks"] = json!({
-                "SessionStart": [{
-                    "matcher": "resume",
+            let entry = |source: &str| {
+                json!({
+                    "matcher": source,
                     "hooks": [{"type": "command", "command": command}],
-                }],
-            });
+                })
+            };
+            doc["hooks"] = json!({"SessionStart": [entry("resume"), entry("fork")]});
         }
         // A sandboxed command is auto-approved by default
         // (`autoAllowBashIfSandboxed`), whatever the permission mode — so a
@@ -417,6 +480,7 @@ mod tests {
             mcp_config: Some(root().join("mcp.json")),
             sidecar_base_url: Some("http://127.0.0.1:47000/s/6f1c".into()),
             resume,
+            fork_of: None,
             permission_prompt_tool: Some(APPROVE_TOOL.into()),
             permission_mode: Some(PERMISSION_MODE.into()),
             disallowed_tools: DISALLOWED_TOOLS.iter().map(|t| t.to_string()).collect(),
@@ -438,6 +502,64 @@ mod tests {
         let at = again.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(again[at + 1], spec(true).session);
         assert!(!again.contains(&"--session-id".to_string()));
+    }
+
+    /// P2f-3a — a fork's first launch resumes its parent's history as a new
+    /// conversation under the fork's own id; once the fork has a history of
+    /// its own, it resumes that, and the parent is never named again.
+    #[test]
+    fn a_forks_first_launch_resumes_its_parent_under_its_own_id() {
+        const PARENT: &str = "9d1c2f10-6a43-4a43-9d63-2d1b0b9e3c7e";
+        let mut first = spec(false);
+        first.fork_of = Some(PARENT.into());
+        assert_eq!(first.validate(), Ok(()));
+        assert_eq!(
+            first.parent_history_path(),
+            Some(
+                first
+                    .history_path()
+                    .with_file_name(format!("{PARENT}.jsonl"))
+            ),
+            "beside the fork's own, under the fork's project name"
+        );
+        assert_eq!(spec(false).parent_history_path(), None);
+        let a = strings(&first.args());
+        assert!(
+            a.windows(5).any(|w| w
+                == [
+                    "--resume",
+                    PARENT,
+                    "--fork-session",
+                    "--session-id",
+                    first.session.as_str()
+                ]),
+            "{a:?}"
+        );
+        assert_eq!(a.iter().filter(|x| *x == "--resume").count(), 1, "{a:?}");
+        // The fork's own history decides from then on.
+        let mut later = first.clone();
+        later.resume = true;
+        let a = strings(&later.args());
+        assert!(
+            a.windows(2)
+                .any(|w| w == ["--resume", later.session.as_str()]),
+            "{a:?}"
+        );
+        assert!(
+            !a.iter()
+                .any(|x| x == PARENT || x == "--fork-session" || x == "--session-id"),
+            "{a:?}"
+        );
+        // A fork of itself, or of something that is no id, never launches.
+        let mut itself = spec(false);
+        itself.fork_of = Some(itself.session.to_uppercase());
+        assert!(matches!(
+            itself.validate(),
+            Err(LaunchError::ForkOfItself(_))
+        ));
+        let mut bad = spec(false);
+        bad.fork_of = Some("../../etc".into());
+        assert!(matches!(bad.validate(), Err(LaunchError::SessionId(_))));
     }
 
     #[test]
@@ -619,15 +741,20 @@ mod tests {
             session_start_hook: Some("'/usr/bin/roomlerd' hive-resume-note '/run/n'".into()),
         }
         .to_json();
-        // P2e-7 — the resume note's hook: on a resume only.
+        // P2e-7 — the resume note's hook: on a resume, and (P2f-3a) on a
+        // fork's first launch, never on a first start.
         assert_eq!(
             doc["hooks"],
             json!({"SessionStart": [{
                 "matcher": "resume",
                 "hooks": [{"type": "command",
                            "command": "'/usr/bin/roomlerd' hive-resume-note '/run/n'"}],
+            }, {
+                "matcher": "fork",
+                "hooks": [{"type": "command",
+                           "command": "'/usr/bin/roomlerd' hive-resume-note '/run/n'"}],
             }]}),
-            "the hook runs on a resume only"
+            "the hook runs on a resume and a fork, never a first start"
         );
         assert_eq!(doc["apiKeyHelper"], "roomler hive token --session 6f1c");
         let deny = doc["permissions"]["deny"].as_array().unwrap();

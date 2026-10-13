@@ -1081,6 +1081,8 @@ pub(crate) async fn reconcile_on_connect(
                     resume: moved,
                     replicated,
                     lease,
+                    // P2f-3b — a fork's record says what it was made from.
+                    fork_of: None,
                 };
                 match state.fleet.rc_hub.push_hive(device_id, tenant_id, msg) {
                     Ok(()) => {

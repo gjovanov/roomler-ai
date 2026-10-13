@@ -425,11 +425,11 @@ async fn scenario() {
     let b_proc = device(&app, &seeded, &b_dir, &b_cfg).await;
     // P2f-1a — every build that runs agent sessions takes part in a
     // teleport, the device in this process and the one in its own alike.
+    // P2f-3a — and starts a fork.
     for (name, id) in [("A", &a), ("B", &b)] {
-        assert!(
-            advertises(&app, id, "hive-teleport").await,
-            "{name} advertises hive-teleport"
-        );
+        for verb in ["hive-teleport", "hive-fork"] {
+            assert!(advertises(&app, id, verb).await, "{name} advertises {verb}");
+        }
     }
 
     // ── The session on A, placed with B, and two prompts ───────────────────
