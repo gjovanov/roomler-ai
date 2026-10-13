@@ -28,6 +28,8 @@ pub mod x11_damage;
 pub mod drm_backend;
 #[cfg(all(target_os = "linux", feature = "drm-capture"))]
 pub mod drm_cursor;
+#[cfg(all(target_os = "linux", feature = "drm-capture"))]
+pub mod drm_idle;
 
 /// FR-45 P1 — desktop-portal availability. Detection only: whether ScreenCast
 /// exists at all, and why not. The capture path itself is P2/P3.
@@ -1666,11 +1668,17 @@ fn open_with(
     #[cfg(all(target_os = "linux", feature = "drm-capture"))]
     {
         if drm_backend::env_enabled() {
-            match drm_backend::DrmCapture::primary(_target_fps, _downscale) {
+            // FR-93 P3d — skip an unchanged frame on a Wayland seat only: an X
+            // server or the console draws into the buffer on screen in place,
+            // where no buffer check sees a change.
+            let idle_skip =
+                drm_backend::idle_skip_enabled() && crate::desktop_brief::seen_is_wayland();
+            match drm_backend::DrmCapture::primary(_target_fps, _downscale, idle_skip) {
                 Ok(c) => {
                     tracing::info!(
                         width = c.width(),
                         height = c.height(),
+                        idle_skip,
                         "capture: backend=drm (ROOMLERD_DRM_CAPTURE=1, scanout below the compositor)"
                     );
                     return Box::new(c);
