@@ -525,18 +525,20 @@ enum Work {
     Pack { commit: String, haves: Vec<String> },
 }
 
-/// P2f-2b — the `want_pack`s one stream may carry: one per commit, and at
-/// most this many. A member of this build asks once for each whole pack it
-/// takes, and a chain holds few; each want costs the source a read of the
-/// chain's checkpoints, and one for a pack of its own a run of the
-/// account's git.
-const MAX_WANTS: usize = 16;
+/// P2f-2b — what a source's hello offers of the have and want: whether it
+/// answers `want_pack`, and (P2f-2c) the whole packs it holds only a
+/// substitute for, whose blobs are not there to ask for.
+#[derive(Debug, Default)]
+struct PackOffer {
+    packs: bool,
+    stand_ins: Vec<String>,
+}
 
 /// P2d-3 — the member's frames, until it lets the connection go or sends
 /// what it may not. An `ack` must name the last event of a frame sent and
 /// not yet acked, by its hash; a `need` goes to the blob sender, and the
 /// next frame is read once it was taken. P2f-2b — so does a `want_pack`,
-/// held to the wire's rules and to [`MAX_WANTS`].
+/// held to the wire's rules and to [`wire::MAX_WANTS`].
 async fn read_member(
     mut recv: RecvStream,
     sent: &Mutex<Sent>,
@@ -580,7 +582,7 @@ async fn read_member(
             // P2f-2b — the pack against what the member's repository holds.
             MemberMsg::WantPack { commit, haves } => {
                 if wire::check_want_pack(&commit, &haves).is_err()
-                    || wanted.len() >= MAX_WANTS
+                    || wanted.len() >= wire::MAX_WANTS
                     || !wanted.insert(commit.clone())
                 {
                     return "bad_frame".to_string();
@@ -1344,6 +1346,14 @@ impl Supervisor {
                     _ => return "no_answer".to_string(),
                 };
             info!(grant = %d.grant_id, session = %d.session_id, source = %d.source_id, answer = ?answer, "hive stream: the source answered");
+            // P2f-2c — what the source says it stands in for is held to the
+            // wire's rules before anything is taken from it.
+            if let SourceMsg::Hello { stand_ins, .. } | SourceMsg::Diverged { stand_ins, .. } =
+                &answer
+                && wire::check_stand_ins(stand_ins).is_err()
+            {
+                return ended_by(&conn, "source", "source_closed", "bad_frame".to_string());
+            }
             let refused = matches!(answer, SourceMsg::Refused { .. });
             if let Some(s) = self
                 .streams
@@ -1369,11 +1379,20 @@ impl Supervisor {
             }
             // P2d-3b — a session over on the source is followed only until
             // the copy holds all of it: where the source's chain ends.
-            // P2f-2b — the source answers `want_pack`.
-            let packs = matches!(
-                answer,
-                SourceMsg::Hello { packs: true, .. } | SourceMsg::Diverged { packs: true, .. }
-            );
+            // P2f-2b — the source answers `want_pack`; P2f-2c — and the
+            // whole packs it holds only a substitute for, asked for so.
+            let offer = match &answer {
+                SourceMsg::Hello {
+                    packs, stand_ins, ..
+                }
+                | SourceMsg::Diverged {
+                    packs, stand_ins, ..
+                } => PackOffer {
+                    packs: *packs,
+                    stand_ins: stand_ins.clone(),
+                },
+                _ => PackOffer::default(),
+            };
             let until = match &answer {
                 SourceMsg::Hello {
                     tip, live: false, ..
@@ -1385,7 +1404,7 @@ impl Supervisor {
                 } => Some(tip.seq),
                 _ => None,
             };
-            self.follow_events(store, &conn, send, recv, d, &sid, until, packs)
+            self.follow_events(store, &conn, send, recv, d, &sid, until, &offer)
                 .await
         })
         .await;
@@ -1415,7 +1434,7 @@ impl Supervisor {
         d: &Dial,
         sid: &str,
         until: Option<u64>,
-        packs: bool,
+        offer: &PackOffer,
     ) -> String {
         let (moved, moves) = watch::channel(());
         let applying = async {
@@ -1453,7 +1472,7 @@ impl Supervisor {
                             &mut recv,
                             d.grant_id,
                             (d.session_id, sid),
-                            packs,
+                            offer,
                             meta,
                         )
                         .await
@@ -1493,7 +1512,7 @@ impl Supervisor {
         recv: &mut RecvStream,
         grant_id: ObjectId,
         (session, sid): (ObjectId, &str),
-        packs: bool,
+        offer: &PackOffer,
         meta: &EventMeta,
     ) -> Result<ChainTip, String> {
         // At most MAX_EVENT_BYTES (`check_events`), which the budget holds.
@@ -1517,7 +1536,7 @@ impl Supervisor {
             && ws.base.is_none()
             && !ws.pack.is_empty()
             && self
-                .stand_in(store, conn, send, grant_id, (session, sid), packs, ws)
+                .stand_in(store, conn, send, grant_id, (session, sid), offer, ws)
                 .await?
         {
             stood_in.extend(ws.pack.iter().map(|c| c.hash));
@@ -1630,10 +1649,13 @@ impl Supervisor {
     /// P2f-2b — whether a checkpoint's whole pack (`ws`) is stood in for: by
     /// a substitute this store keeps already, or by one the source makes now
     /// against what the folder this device will run the session in holds
-    /// (git's have and want). Asked only for a teleport this device was
-    /// prepared for with the server's `have_want`, of a source that answers
-    /// it (`packs`), and only while the whole pack's own blobs are not all
-    /// here. `Ok(false)`: its own blobs are asked for, as before.
+    /// (git's have and want). Asked only of a source that answers it
+    /// (`packs`), and only while the whole pack's own blobs are not all here:
+    /// for a teleport this device was prepared for with the server's
+    /// `have_want`, and (P2f-2c) for a whole pack the source holds only a
+    /// substitute for, whose blobs are not there to ask for, then with no
+    /// haves where this device has none to offer. `Ok(false)`: its own blobs
+    /// are asked for, as before.
     #[allow(clippy::too_many_arguments)]
     async fn stand_in(
         &self,
@@ -1642,7 +1664,7 @@ impl Supervisor {
         send: &mut SendStream,
         grant_id: ObjectId,
         (session, sid): (ObjectId, &str),
-        packs: bool,
+        offer: &PackOffer,
         ws: &WorkspaceSnap,
     ) -> Result<bool, String> {
         match store.substitute(sid, &ws.commit).await {
@@ -1653,12 +1675,14 @@ impl Supervisor {
                 return Err("store_error".to_string());
             }
         }
-        if !packs {
+        if !offer.packs {
             return Ok(false);
         }
-        let Some((order, account, folder)) = self.have_want_place(session) else {
+        let place = self.have_want_place(session);
+        let stood_in = offer.stand_ins.contains(&ws.commit);
+        if place.is_none() && !stood_in {
             return Ok(false);
-        };
+        }
         let mut whole_here = true;
         for c in &ws.pack {
             match store.has_blob(sid, c.hash.0).await {
@@ -1674,8 +1698,15 @@ impl Supervisor {
             // Every one of its blobs is here: nothing to stand in for.
             return Ok(false);
         }
-        let Some(haves) = self.haves_for(&order, &account, &folder, ws).await else {
-            return Ok(false);
+        let held = match &place {
+            Some((order, account, folder)) => self.haves_for(order, account, folder, ws).await,
+            None => None,
+        };
+        let haves = match held {
+            Some(haves) => haves,
+            // P2f-2c — a whole pack made again from the source's repository.
+            None if stood_in => Vec::new(),
+            None => return Ok(false),
         };
         let want = MemberMsg::WantPack {
             commit: ws.commit.clone(),
@@ -1714,6 +1745,7 @@ impl Supervisor {
                 let list: Vec<(Digest, u64)> = chunks.iter().map(|c| (c.hash, c.len)).collect();
                 self.fetch_list(store, conn, send, grant_id, sid, &list)
                     .await?;
+                let thin = against.len();
                 let sub = Substitute {
                     commit,
                     against,
@@ -1729,10 +1761,17 @@ impl Supervisor {
                         return Err("store_error".to_string());
                     }
                 }
-                info!(
-                    session = sid, commit = %ws.commit, against = haves.len(),
-                    "hive stream: the workspace came as a pack against this folder's repository"
-                );
+                if thin == 0 {
+                    info!(
+                        session = sid, commit = %ws.commit,
+                        "hive stream: the workspace's whole pack came, made again by the source"
+                    );
+                } else {
+                    info!(
+                        session = sid, commit = %ws.commit, against = thin,
+                        "hive stream: the workspace came as a pack against this folder's repository"
+                    );
+                }
                 Ok(true)
             }
             BlobMsg::NoPack { why, .. } => {
@@ -1794,10 +1833,14 @@ impl Supervisor {
 
     /// P2f-2b — the answer to a member's `want_pack`: the pack that brings
     /// `commit` into a repository holding `haves`, made as the session's
-    /// account from its own repository while it runs here, its chunks kept
-    /// as blobs of the session for the member to `need` as any blob. Only
-    /// for the commit of one of the session's whole packs. Anything else is
-    /// `no_pack`, in a word, and the member takes the whole pack.
+    /// account from its own repository, its chunks kept as blobs of the
+    /// session for the member to `need` as any blob. Only for the commit of
+    /// one of the session's whole packs. Anything else is `no_pack`, in a
+    /// word, and the member takes the whole pack. P2f-2c — a want with no
+    /// haves only for a whole pack this copy holds only a substitute for
+    /// (`held_whole` otherwise: its blobs are here to ask for); and made from
+    /// where the session runs here, or, when it does not run here now, from
+    /// where its last launch here kept it was worked on.
     async fn answer_want_pack(
         &self,
         store: &StoreHandle,
@@ -1818,8 +1861,22 @@ impl Supervisor {
                 return no("store_error");
             }
         }
-        let Some(place) = self.workplace(session) else {
-            return no("not_live");
+        if haves.is_empty() {
+            match store.stand_ins(sid, wire::MAX_WANTS).await {
+                Ok(stand_ins) if stand_ins.iter().any(|c| c == commit) => {}
+                Ok(_) => return no("held_whole"),
+                Err(e) => {
+                    warn!(session = sid, %e, "hive stream: the stand-ins could not be read for a want");
+                    return no("store_error");
+                }
+            }
+        }
+        let place = match self.workplace(session) {
+            Some(place) => place,
+            None => match self.kept_workplace(store, sid).await {
+                Some(place) => Arc::new(place),
+                None => return no("not_live"),
+            },
         };
         let req = packer::Request {
             v: packer::REQUEST_V,
@@ -1845,17 +1902,52 @@ impl Supervisor {
                 return no("store_error");
             }
         }
-        info!(
-            session = sid,
-            commit,
-            against = against.len(),
-            bytes = pack.len(),
-            "hive stream: a pack against the member's repository"
-        );
+        if against.is_empty() {
+            info!(
+                session = sid,
+                commit,
+                bytes = pack.len(),
+                "hive stream: a whole pack made again for the member"
+            );
+        } else {
+            info!(
+                session = sid,
+                commit,
+                against = against.len(),
+                bytes = pack.len(),
+                "hive stream: a pack against the member's repository"
+            );
+        }
         BlobMsg::Pack {
             commit: commit.to_string(),
             against,
             chunks,
+        }
+    }
+
+    /// P2f-2c — where a session that does not run here now was last worked
+    /// on, as its launch here kept it, and as whom: the account resolved as a
+    /// start resolves it, now. `None` when nothing was kept, or that account
+    /// cannot be run as now.
+    async fn kept_workplace(&self, store: &StoreHandle, sid: &str) -> Option<packer::Workplace> {
+        let kept = match store.workplace(sid).await {
+            Ok(Some(kept)) => kept,
+            Ok(None) => return None,
+            Err(e) => {
+                warn!(session = sid, %e, "hive stream: the store could not say where the session was worked on");
+                return None;
+            }
+        };
+        match self.who_for(&kept.account) {
+            Ok(who) => Some(packer::Workplace {
+                who,
+                folder: std::path::PathBuf::from(kept.folder),
+                state_dir: std::path::PathBuf::from(kept.state_dir),
+            }),
+            Err(e) => {
+                warn!(session = sid, %e, "hive stream: the account the session ran as cannot be run as now");
+                None
+            }
         }
     }
 
@@ -2500,6 +2592,7 @@ mod tests {
                 },
                 live: true,
                 packs: true,
+                stand_ins: Vec::new(),
             },
             "an empty copy is a prefix"
         );
@@ -2543,6 +2636,7 @@ mod tests {
                 },
                 live: true,
                 packs: true,
+                stand_ins: Vec::new(),
             },
             "over both allocations"
         );
@@ -2709,6 +2803,7 @@ mod tests {
                 },
                 live: true,
                 packs: true,
+                stand_ins: Vec::new(),
             },
             "over DERP"
         );
@@ -2900,6 +2995,7 @@ mod tests {
                 }),
                 live: true,
                 packs: true,
+                stand_ins: Vec::new(),
             },
             "past the newest checkpoint both hold"
         );
@@ -3770,6 +3866,7 @@ mod tests {
             tip: Mark::genesis(),
             live: true,
             packs: false,
+            stand_ins: Vec::new(),
         };
         write_frame(&mut send, &hello).await.unwrap();
         let mut env = EventEnvelope::next(&sid.to_hex(), None, 1, 0, &said("forged"));
@@ -3854,6 +3951,7 @@ mod tests {
             tip: Mark::genesis(),
             live: true,
             packs: false,
+            stand_ins: Vec::new(),
         };
         write_frame(&mut send, &hello).await.unwrap();
         let other = EventEnvelope::next(&s, None, 1, 0, &said("not where fence 1 ended"));
@@ -3896,6 +3994,7 @@ mod tests {
                 tip: Mark::genesis(),
                 live: true,
                 packs: false,
+                stand_ins: Vec::new(),
             };
             write_frame(&mut send, &hello).await.unwrap();
             send_by_hand(&mut send, std::slice::from_ref(&env)).await;
@@ -3948,6 +4047,7 @@ mod tests {
                 tip: None,
                 live: true,
                 packs: false,
+                stand_ins: Vec::new(),
             },
         )
         .await
@@ -3973,6 +4073,7 @@ mod tests {
             tip: Mark::genesis(),
             live: true,
             packs: false,
+            stand_ins: Vec::new(),
         };
         write_frame(&mut send, &hello).await.unwrap();
         let listing = SourceMsg::Events {
@@ -5100,6 +5201,7 @@ mod tests {
             tip: Mark::genesis(),
             live: true,
             packs: true,
+            stand_ins: Vec::new(),
         };
         write_frame(&mut send, &hello).await.unwrap();
         send_by_hand(&mut send, std::slice::from_ref(&env)).await;
@@ -5191,6 +5293,7 @@ mod tests {
                 tip: Mark::genesis(),
                 live: true,
                 packs: true,
+                stand_ins: Vec::new(),
             };
             write_frame(&mut send, &hello).await.unwrap();
             send_by_hand(&mut send, std::slice::from_ref(&env)).await;
@@ -5414,6 +5517,7 @@ mod tests {
                 tip: Mark::genesis(),
                 live: true,
                 packs: true,
+                stand_ins: Vec::new(),
             };
             write_frame(&mut send, &hello).await.unwrap();
             send_by_hand(&mut send, std::slice::from_ref(&env)).await;
@@ -5462,6 +5566,7 @@ mod tests {
             tip: Mark::genesis(),
             live: true,
             packs: true,
+            stand_ins: Vec::new(),
         };
         write_frame(&mut send, &hello).await.unwrap();
         send_by_hand(&mut send, std::slice::from_ref(&env)).await;
@@ -5475,7 +5580,7 @@ mod tests {
 
     /// P2f-2b — a member's `want_pack` is held to the wire's rules before a
     /// pack is made, and a stream carries one per commit, at most
-    /// [`MAX_WANTS`]: a want that names its commit among its haves, one for a
+    /// [`wire::MAX_WANTS`]: a want that names its commit among its haves, one for a
     /// commit asked already, and one past them end the stream `bad_frame`,
     /// unanswered. Each want before it is answered on a stream of its own.
     #[tokio::test]
@@ -5485,7 +5590,7 @@ mod tests {
             commit: commit.to_string(),
             haves: vec![have.to_string()],
         };
-        let many: Vec<MemberMsg> = (0..=MAX_WANTS)
+        let many: Vec<MemberMsg> = (0..=wire::MAX_WANTS)
             .map(|i| want(&format!("{i:040x}"), &h))
             .collect();
         let cases = [
@@ -5524,5 +5629,301 @@ mod tests {
             );
             conn.close(0u32.into(), b"done");
         }
+    }
+
+    // ─── P2f-2c: a whole pack a source holds only a substitute for ─────────
+
+    /// `src`'s copy of each of `sids`, as a teleport's target keeps one: the
+    /// first checkpoint of the person's repository at `<root>/src`, its whole
+    /// pack's own blobs NOT held, and a substitute for it against the
+    /// person's `HEAD`. The workspace, the whole pack's blobs, and the
+    /// substitute.
+    async fn standing_in(
+        src: &Rig,
+        sids: &[ObjectId],
+    ) -> (WorkspaceSnap, Vec<Vec<u8>>, Substitute) {
+        let root = src.root.path().to_path_buf();
+        let (head, snap, whole) = checkpointed_repo(&root, sids[0]);
+        let (pack, against) = crate::hive::workspace::pack_against(
+            &crate::hive::workspace::Git::under(&root),
+            &root.join("src"),
+            &root.join("src-state"),
+            &snap.commit,
+            std::slice::from_ref(&head),
+        )
+        .unwrap();
+        let (chunks, blobs) = chunk_bytes(&pack);
+        let sub = Substitute {
+            commit: snap.commit.clone(),
+            against,
+            chunks,
+        };
+        for &sid in sids {
+            let s = sid.to_hex();
+            let cp = Checkpoint {
+                n: 1,
+                turn: 1,
+                files: Vec::new(),
+                skipped: Vec::new(),
+                workspace: Some(snap.clone()),
+            };
+            put(src, sid, 1, TranscriptEvent::Checkpoint(cp));
+            for b in &blobs {
+                src.store.put_blob(&s, b.clone()).await.unwrap();
+            }
+            src.store.put_substitute(&s, sub.clone()).await.unwrap();
+            src.sup.host_for_tests(sid);
+        }
+        (snap, whole, sub)
+    }
+
+    /// `src`'s answer to a want of `commit` with no haves, on a stream of
+    /// `sid` dialed by hand: the hello it said, and the answer.
+    async fn wanted_whole(
+        src: &Rig,
+        sid: ObjectId,
+        commit: &str,
+    ) -> (SourceMsg, BlobMsg, QuicConnection, SendStream) {
+        let g = grant(sid, HiveStreamPath::Direct);
+        let (_peer, conn, mut send, mut recv) = dial_by_hand(ready_of(src, g, true).await).await;
+        write_frame(&mut send, &empty_hello(sid)).await.unwrap();
+        let hello: SourceMsg = read_frame(&mut recv).await.unwrap();
+        let want = MemberMsg::WantPack {
+            commit: commit.to_string(),
+            haves: Vec::new(),
+        };
+        write_frame(&mut send, &want).await.unwrap();
+        let mut uni = conn.accept_uni().await.expect("an answer");
+        let answer: BlobMsg = read_frame(&mut uni).await.unwrap();
+        (hello, answer, conn, send)
+    }
+
+    /// P2f-2c — a source that holds a whole pack only as a substitute says
+    /// so in its hello, and answers a want with no haves with that pack made
+    /// again from its repository: whole, as many objects as the checkpoint's
+    /// own pack, its chunks served as any blob. A want with no haves for a
+    /// whole pack held by its own blobs is answered `held_whole`: those are
+    /// there to ask for.
+    #[tokio::test]
+    async fn a_source_makes_again_the_whole_pack_it_holds_only_a_substitute_for() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let src = packing_rig(false);
+        let root = src.root.path().to_path_buf();
+        let stood = ObjectId::new();
+        let (snap, whole, _sub) = standing_in(&src, &[stood]).await;
+        src.sup.workplace_for_tests(
+            stood,
+            packer::Workplace {
+                who: crate::hive::materializer::Who {
+                    account: None,
+                    env: Vec::new(),
+                },
+                folder: root.join("src"),
+                state_dir: root.join("src-state"),
+            },
+        );
+        let (hello, answer, conn, mut send) = wanted_whole(&src, stood, &snap.commit).await;
+        assert!(
+            matches!(&hello, SourceMsg::Hello { stand_ins, .. } if *stand_ins == [snap.commit.clone()]),
+            "it says what it stands in for: {hello:?}"
+        );
+        let BlobMsg::Pack {
+            commit,
+            against,
+            chunks,
+        } = answer
+        else {
+            panic!("a pack: {answer:?}");
+        };
+        assert_eq!(
+            (commit.as_str(), against.len()),
+            (snap.commit.as_str(), 0),
+            "whole, against nothing"
+        );
+        let need = MemberMsg::Need {
+            blobs: chunks.iter().map(|c| c.hash).collect(),
+        };
+        write_frame(&mut send, &need).await.unwrap();
+        let mut pack = Vec::new();
+        for c in &chunks {
+            let mut uni = conn
+                .accept_uni()
+                .await
+                .expect("each of the pack's chunks, served as any blob");
+            let BlobMsg::Blob { hash, len } = read_frame::<BlobMsg>(&mut uni).await.unwrap() else {
+                panic!("a blob");
+            };
+            let mut bytes = vec![0u8; len as usize];
+            uni.read_exact(&mut bytes).await.unwrap();
+            assert_eq!((hash, Digest::of(&bytes)), (c.hash, c.hash));
+            pack.extend(bytes);
+        }
+        let objects = |p: &[u8]| u32::from_be_bytes(p[8..12].try_into().unwrap());
+        assert!(pack.starts_with(b"PACK"));
+        assert_eq!(
+            objects(&pack),
+            objects(&whole.concat()),
+            "as many objects as the checkpoint's own whole pack"
+        );
+        conn.close(0u32.into(), b"done");
+
+        // The same whole pack, held by its own blobs.
+        let held = ObjectId::new();
+        for b in &whole {
+            src.store.put_blob(&held.to_hex(), b.clone()).await.unwrap();
+        }
+        let cp = Checkpoint {
+            n: 1,
+            turn: 1,
+            files: Vec::new(),
+            skipped: Vec::new(),
+            workspace: Some(snap.clone()),
+        };
+        put(&src, held, 1, TranscriptEvent::Checkpoint(cp));
+        src.sup.host_for_tests(held);
+        let (hello, answer, conn, _send) = wanted_whole(&src, held, &snap.commit).await;
+        assert!(
+            matches!(&hello, SourceMsg::Hello { stand_ins, .. } if stand_ins.is_empty()),
+            "{hello:?}"
+        );
+        assert_eq!(
+            answer,
+            BlobMsg::NoPack {
+                commit: snap.commit.clone(),
+                why: "held_whole".into()
+            }
+        );
+        conn.close(0u32.into(), b"done");
+    }
+
+    /// P2f-2c — a session that does not run on its source is packed for from
+    /// where its last launch there kept it was worked on, as its account; one
+    /// with nothing kept is answered `not_live`.
+    #[tokio::test]
+    async fn a_source_packs_from_where_a_session_no_longer_running_was_worked_on() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let src = packing_rig(false);
+        let root = src.root.path().to_path_buf();
+        let (kept, lost) = (ObjectId::new(), ObjectId::new());
+        let (snap, _whole, _sub) = standing_in(&src, &[kept, lost]).await;
+        let workplace = roomler_hive_node::store::WorkplaceRecord {
+            account: "dev".into(),
+            folder: root.join("src").display().to_string(),
+            state_dir: root.join("src-state").display().to_string(),
+        };
+        src.store
+            .put_workplace(&kept.to_hex(), workplace)
+            .await
+            .unwrap();
+        let (_hello, answer, conn, _send) = wanted_whole(&src, kept, &snap.commit).await;
+        assert!(
+            matches!(&answer, BlobMsg::Pack { against, .. } if against.is_empty()),
+            "from where it was kept: {answer:?}"
+        );
+        conn.close(0u32.into(), b"done");
+        let (_hello, answer, conn, _send) = wanted_whole(&src, lost, &snap.commit).await;
+        assert_eq!(
+            answer,
+            BlobMsg::NoPack {
+                commit: snap.commit.clone(),
+                why: "not_live".into()
+            },
+            "nothing kept"
+        );
+        conn.close(0u32.into(), b"done");
+    }
+
+    /// P2f-2c — a member asks a whole pack its source holds only a
+    /// substitute for by a want with no haves, where it has none to offer;
+    /// takes the pack the source makes again as any blobs, keeps it as a
+    /// substitute against nothing, and applies the checkpoint. A source
+    /// whose hello lists a stand-in that is no commit id is let go
+    /// `bad_frame`, nothing taken from it.
+    #[tokio::test]
+    async fn a_member_asks_for_the_whole_pack_its_source_stands_in_for() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        // A member that holds copies: its owner's offer is what lets it follow.
+        let mut mem = packing_rig(true);
+        let root = mem.root.path().to_path_buf();
+        let sid = ObjectId::new();
+        let s = sid.to_hex();
+        let (_head, snap, whole) = checkpointed_repo(&root, sid);
+        mem.store.join(&s, "owner", 1).await.unwrap();
+        let env = workspace_event(sid, &snap);
+        let (_peer, _grant_id, conn, mut send, mut recv) = source_by_hand(&mem, sid).await;
+        let hello = SourceMsg::Hello {
+            v: wire::STREAM_V,
+            tip: Mark::genesis(),
+            live: true,
+            packs: true,
+            stand_ins: vec![snap.commit.clone()],
+        };
+        write_frame(&mut send, &hello).await.unwrap();
+        send_by_hand(&mut send, std::slice::from_ref(&env)).await;
+        let want: MemberMsg = read_frame(&mut recv).await.unwrap();
+        assert_eq!(
+            want,
+            MemberMsg::WantPack {
+                commit: snap.commit.clone(),
+                haves: Vec::new(),
+            },
+            "a want with no haves: it has none to offer"
+        );
+        // Any pack of the commit does: the checkpoint's own bytes here.
+        let (chunks, blobs) = chunk_bytes(&whole.concat());
+        let mut uni = conn.open_uni().await.unwrap();
+        let answer = BlobMsg::Pack {
+            commit: snap.commit.clone(),
+            against: Vec::new(),
+            chunks: chunks.clone(),
+        };
+        write_frame(&mut uni, &answer).await.unwrap();
+        let _ = uni.finish();
+        let need: MemberMsg = read_frame(&mut recv).await.unwrap();
+        assert_eq!(
+            need,
+            MemberMsg::Need {
+                blobs: chunks.iter().map(|c| c.hash).collect()
+            }
+        );
+        let named: Vec<(Digest, Vec<u8>)> = chunks.iter().map(|c| c.hash).zip(blobs).collect();
+        serve_by_hand(&conn, &named).await;
+        let ack: MemberMsg = read_frame(&mut recv).await.unwrap();
+        assert!(
+            matches!(ack, MemberMsg::Ack { seq: 1, .. }),
+            "applied: {ack:?}"
+        );
+        assert_eq!(
+            mem.store.substitute(&s, &snap.commit).await.unwrap(),
+            Some(Substitute {
+                commit: snap.commit.clone(),
+                against: Vec::new(),
+                chunks,
+            }),
+            "kept, against nothing"
+        );
+
+        let other = ObjectId::new();
+        mem.store.join(&other.to_hex(), "owner", 1).await.unwrap();
+        let (_peer, grant_id, _conn, mut send, _recv) = source_by_hand(&mem, other).await;
+        let hello = SourceMsg::Hello {
+            v: wire::STREAM_V,
+            tip: Mark::genesis(),
+            live: true,
+            packs: true,
+            stand_ins: vec!["HEAD".into()],
+        };
+        write_frame(&mut send, &hello).await.unwrap();
+        assert_eq!(
+            close_of(&mut mem, grant_id).await.as_deref(),
+            Some("bad_frame"),
+            "a stand-in that is no commit id"
+        );
     }
 }

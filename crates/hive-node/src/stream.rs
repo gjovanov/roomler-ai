@@ -17,7 +17,7 @@
 //! | `events {events: [{seq, fence, ts_ms, prev_hash, len}]}`, then each event's JSON, `len` bytes | source | envelopes in `seq` order (P2d-3): from where the opening exchange left the member, then the live tail as it is appended |
 //! | `need {blobs}` | member | the blobs the next event names that it does not hold, by hash |
 //! | `ack {seq, hash}` | member | applied and on disk: the events up to `seq`, and every blob they name |
-//! | `want_pack {commit, haves}` | member | P2f-2b, in place of `need` for a checkpoint's whole pack, and only to a source whose hello said `packs`: the pack that brings `commit` into a repository holding `haves` |
+//! | `want_pack {commit, haves}` | member | P2f-2b, in place of `need` for a checkpoint's whole pack, and only to a source whose hello said `packs`: the pack that brings `commit` into a repository holding `haves`. P2f-2c — no haves: the whole pack made again, for one the source's hello lists among its `stand_ins` (the whole packs it holds only a substitute for) |
 //!
 //! On a stream of its own, one per blob the member asked for:
 //!
@@ -84,6 +84,12 @@ pub const MAX_WANT_HAVES: usize = 16;
 /// P2f-2b — the most chunks a `pack` answer lists: a pack of the largest a
 /// checkpoint carries (512 MiB), in chunks of [`CHUNK_MAX`].
 pub const MAX_PACK_CHUNKS: usize = 512 * 1024 * 1024 / CHUNK_MAX + 1;
+/// P2f-2b — the `want_pack`s one stream carries: one per commit, and at most
+/// this many. A member asks once for each whole pack it takes, and a chain
+/// holds few; each want costs the source a read of the chain's checkpoints,
+/// and one for a pack of its own a run of the account's git. P2f-2c — as
+/// many stand-ins as a source's hello lists.
+pub const MAX_WANTS: usize = 16;
 
 /// A point in a session's chain: an event's `seq`, and its hash as
 /// lowercase hex. Seq 0 is before the first event, at [`GENESIS`].
@@ -155,6 +161,13 @@ pub enum SourceMsg {
         /// does not: a member asks it for a whole pack's blobs.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         packs: bool,
+        /// P2f-2c — the commits of the chain's whole packs it holds only a
+        /// substitute for, at most [`MAX_WANTS`]: it cannot serve their
+        /// blobs, and a member asks `want_pack` for them instead, with no
+        /// haves where it holds none. Absent (an older source, or none) =
+        /// every whole pack's blobs are there.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        stand_ins: Vec<String>,
     },
     /// The member's tip is not in the source's chain: `at` is the newest
     /// checkpoint both hold (genesis, if none), past which the member sets
@@ -170,6 +183,9 @@ pub enum SourceMsg {
         /// P2f-2b — as in `hello`.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         packs: bool,
+        /// P2f-2c — as in `hello`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        stand_ins: Vec<String>,
     },
     /// The source cannot serve this stream.
     Refused { reason: String },
@@ -326,14 +342,16 @@ fn is_commit_id(s: &str) -> bool {
 }
 
 /// P2f-2b — a `want_pack`'s names: a commit id each, at most
-/// [`MAX_WANT_HAVES`] haves, the commit not among them.
+/// [`MAX_WANT_HAVES`] haves, the commit not among them. P2f-2c — none is a
+/// want for a whole pack, made again from the source's repository: what a
+/// member asks for a pack the source holds only a substitute for.
 pub fn check_want_pack(commit: &str, haves: &[String]) -> Result<(), FrameError> {
     if !is_commit_id(commit) {
         return Err(FrameError::Pack(format!("{commit:?} is not a commit id")));
     }
-    if haves.is_empty() || haves.len() > MAX_WANT_HAVES {
+    if haves.len() > MAX_WANT_HAVES {
         return Err(FrameError::Pack(format!(
-            "{} haves: one at least, {MAX_WANT_HAVES} at most",
+            "{} haves: {MAX_WANT_HAVES} at most",
             haves.len()
         )));
     }
@@ -341,6 +359,23 @@ pub fn check_want_pack(commit: &str, haves: &[String]) -> Result<(), FrameError>
         Some(h) => Err(FrameError::Pack(format!("{h:?} is not a have"))),
         None => Ok(()),
     }
+}
+
+/// P2f-2c — a source's stand-ins, as its hello lists them: a commit id each,
+/// each once, at most [`MAX_WANTS`].
+pub fn check_stand_ins(stand_ins: &[String]) -> Result<(), FrameError> {
+    if stand_ins.len() > MAX_WANTS {
+        return Err(FrameError::Pack(format!(
+            "{} stand-ins: {MAX_WANTS} at most",
+            stand_ins.len()
+        )));
+    }
+    for (i, c) in stand_ins.iter().enumerate() {
+        if !is_commit_id(c) || stand_ins[..i].contains(c) {
+            return Err(FrameError::Pack(format!("{c:?} is not a stand-in")));
+        }
+    }
+    Ok(())
 }
 
 /// P2f-2b — a `pack` answer held to the `want_pack` it answers: the same
@@ -464,12 +499,15 @@ pub fn answer_hello(store: &Store, hello: &MemberMsg, live: bool) -> Result<Sour
         });
     };
     let own = Mark::of(own.seq, &own.hash);
+    // P2f-2c — what it cannot serve by blobs, so a member asks for it.
+    let stand_ins = store.stand_ins(session, MAX_WANTS)?;
     if holds(store, session, tip)? {
         return Ok(SourceMsg::Hello {
             v: STREAM_V,
             tip: own,
             live,
             packs: true,
+            stand_ins,
         });
     }
     // Newest first, as the member listed them; at most as many as it may.
@@ -485,6 +523,7 @@ pub fn answer_hello(store: &Store, hello: &MemberMsg, live: bool) -> Result<Sour
         tip: Some(own),
         live,
         packs: true,
+        stand_ins,
     })
 }
 
@@ -553,6 +592,7 @@ mod tests {
             tip: Some(Mark::genesis()),
             live: false,
             packs: false,
+            stand_ins: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(&a).unwrap(),
@@ -563,6 +603,7 @@ mod tests {
             tip: Mark::genesis(),
             live: true,
             packs: false,
+            stand_ins: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(&h).unwrap(),
@@ -585,6 +626,7 @@ mod tests {
                 tip: None,
                 live: true,
                 packs: false,
+                stand_ins: Vec::new(),
             }
         );
         assert_eq!(
@@ -632,6 +674,7 @@ mod tests {
                     tip: own.clone(),
                     live: true,
                     packs: true,
+                    stand_ins: Vec::new(),
                 }
             );
         }
@@ -644,6 +687,7 @@ mod tests {
                 tip: own,
                 live: false,
                 packs: true,
+                stand_ins: Vec::new(),
             }
         );
     }
@@ -677,6 +721,7 @@ mod tests {
                 tip: own.clone(),
                 live: true,
                 packs: true,
+                stand_ins: Vec::new(),
             },
             "the newest checkpoint both hold, and where the source's chain ends"
         );
@@ -687,6 +732,7 @@ mod tests {
                 tip: own.clone(),
                 live: false,
                 packs: true,
+                stand_ins: Vec::new(),
             },
             "none both hold"
         );
@@ -701,6 +747,7 @@ mod tests {
                 tip: own,
                 live: true,
                 packs: true,
+                stand_ins: Vec::new(),
             },
             "a tip past the source's own end is not in its chain"
         );
@@ -750,6 +797,55 @@ mod tests {
             SourceMsg::Refused {
                 reason: "not_held".into()
             }
+        );
+    }
+
+    /// P2f-2c — a source's `hello` and its `diverged` list the whole packs it
+    /// holds only a substitute for, so a member asks for them by `want_pack`.
+    #[test]
+    fn a_sources_answer_lists_its_stand_ins() {
+        use crate::checkpoint::{Checkpoint, RepoKind, WorkspaceSnap, chunk_bytes};
+        use crate::store::Substitute;
+        let mut store = Store::open_in_memory().unwrap();
+        let c = "c".repeat(40);
+        let cp = Checkpoint {
+            n: 1,
+            turn: 1,
+            files: Vec::new(),
+            skipped: Vec::new(),
+            workspace: Some(WorkspaceSnap {
+                repo: RepoKind::Own,
+                prefix: String::new(),
+                tree: "e".repeat(40),
+                commit: c.clone(),
+                base: None,
+                head: None,
+                pack: chunk_bytes(b"the whole pack").0,
+            }),
+        };
+        let env = EventEnvelope::next("s", None, 1, 0, &TranscriptEvent::Checkpoint(cp));
+        store.append(&env).unwrap();
+        store.put_blob("s", b"stood in").unwrap();
+        let sub = Substitute {
+            commit: c.clone(),
+            against: Vec::new(),
+            chunks: chunk_bytes(b"stood in").0,
+        };
+        store.put_substitute("s", &sub).unwrap();
+        let own = mark_at(&store, 1);
+        let answer = answer_hello(&store, &hello(own, vec![]), true).unwrap();
+        assert!(
+            matches!(&answer, SourceMsg::Hello { stand_ins, .. } if *stand_ins == [c.clone()]),
+            "{answer:?}"
+        );
+        let foreign = Mark {
+            seq: 1,
+            hash: "ee".repeat(32),
+        };
+        let answer = answer_hello(&store, &hello(foreign, vec![]), true).unwrap();
+        assert!(
+            matches!(&answer, SourceMsg::Diverged { stand_ins, .. } if *stand_ins == [c.clone()]),
+            "{answer:?}"
         );
     }
 
@@ -975,22 +1071,86 @@ mod tests {
                     serde_json::json!({"t": "hello", "v": 1, "tip": zero})
                 )
                 .unwrap(),
-                SourceMsg::Hello { packs: false, .. }
+                SourceMsg::Hello { packs: false, ref stand_ins, .. } if stand_ins.is_empty()
             ),
-            "an older source answers no want_pack"
+            "an older source answers no want_pack, and stands in for nothing"
+        );
+        // P2f-2c — the whole packs a source holds only a substitute for, said
+        // when there are any, and absent otherwise.
+        let standing = SourceMsg::Hello {
+            v: STREAM_V,
+            tip: Mark::genesis(),
+            live: true,
+            packs: true,
+            stand_ins: vec![c.clone()],
+        };
+        assert_eq!(
+            serde_json::to_value(&standing).unwrap(),
+            serde_json::json!({"t": "hello", "v": 1, "tip": zero, "live": true, "packs": true,
+                               "stand_ins": [c]})
+        );
+        let none = SourceMsg::Diverged {
+            at: Mark::genesis(),
+            tip: None,
+            live: true,
+            packs: true,
+            stand_ins: Vec::new(),
+        };
+        assert!(
+            serde_json::to_value(&none)
+                .unwrap()
+                .get("stand_ins")
+                .is_none()
         );
     }
 
-    /// P2f-2b — a want names commit ids, at least one have and at most
-    /// [`MAX_WANT_HAVES`], never the commit itself; a pack answers that want
-    /// alone, thin against its haves only, in chunks that follow one another.
+    /// P2f-2c — a source's stand-ins are commit ids, each once, at most
+    /// [`MAX_WANTS`].
+    #[test]
+    fn a_sources_stand_ins_are_commit_ids_each_once() {
+        let (c, h) = ("c".repeat(40), "a".repeat(40));
+        assert!(check_stand_ins(&[]).is_ok());
+        assert!(check_stand_ins(&[c.clone(), h.clone()]).is_ok());
+        let many: Vec<String> = (0..=MAX_WANTS).map(|i| format!("{i:040x}")).collect();
+        assert!(check_stand_ins(&many[..MAX_WANTS]).is_ok());
+        for (case, list) in [
+            ("not an id", vec!["HEAD".to_string()]),
+            ("twice", vec![c.clone(), c.clone()]),
+            ("past MAX_WANTS", many),
+        ] {
+            assert!(
+                matches!(check_stand_ins(&list), Err(FrameError::Pack(_))),
+                "{case}"
+            );
+        }
+    }
+
+    /// P2f-2b — a want names commit ids, at most [`MAX_WANT_HAVES`] haves,
+    /// never the commit itself (P2f-2c: none, for a whole pack); a pack
+    /// answers that want alone, thin against its haves only, in chunks that
+    /// follow one another.
     #[test]
     fn a_want_and_its_pack_are_held_to_each_other() {
         let (c, h, x) = ("c".repeat(40), "a".repeat(40), "b".repeat(40));
         assert!(check_want_pack(&c, std::slice::from_ref(&h)).is_ok());
+        assert!(check_want_pack(&c, &[]).is_ok(), "a whole pack's want");
+        assert!(
+            check_pack(
+                &c,
+                &[],
+                &c,
+                &[],
+                &[Chunk {
+                    offset: 0,
+                    len: 4,
+                    hash: Digest::of(b"x"),
+                }]
+            )
+            .is_ok(),
+            "and its pack, against nothing"
+        );
         for (commit, haves) in [
             ("HEAD".to_string(), vec![h.clone()]),
-            (c.clone(), vec![]),
             (c.clone(), vec![c.clone()]),
             (c.clone(), vec!["--all".to_string()]),
             (c.clone(), vec![h.clone(); MAX_WANT_HAVES + 1]),
