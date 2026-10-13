@@ -688,6 +688,21 @@ jobs:
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test control_dc_record
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test export
 
+      - name: L0 latency harness (FR-16) — capture → decode on one clock, over a vnet
+        # FR-16 L0. The production AgentPeer and media pump on the synthetic
+        # source and openh264, a webrtc-rs controller decoding the RTP track,
+        # both on a webrtc-util vnet: a clean link, +100 ms, a planted 50 ms
+        # capture-stage hold, and a lossy link. The hold is the negative
+        # control: a harness that cannot see it gates nothing.
+        # ⚠️ Named explicitly for the same reason as the step above: a
+        # `tests/*.rs` file nobody names runs in no lane, and the synthetic
+        # source's own unit tests (the marker, its CRC) compile only with
+        # `synthetic-frame-source`, which no `--lib` step elsewhere enables.
+        # Same features as the recorder step, so it reuses that build.
+        run: |
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib capture::synthetic_backend
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test l4_latency -- --nocapture
+
       - name: Linux recorder identity (FR-85) — as root, the drop and the thread's filesystem identity
         # FR-85 P1e-unix. A root daemon launches the recorder as the person
         # signed in at the screen, and does its own work in their folder with

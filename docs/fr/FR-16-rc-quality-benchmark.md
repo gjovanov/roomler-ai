@@ -174,7 +174,7 @@ competitors". Engineering may use the numbers; the public pages never print them
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| L0 | The harness, the synthetic source, the CI line, the planted-regression control | test-only | — |
+| L0 | The harness, the synthetic source, the CI line, the planted-regression control | test-only | **built**: `agents/roomlerd/tests/l4_latency.rs` + the marker and clock in `capture/synthetic_backend.rs` + the `peer::l0` seam; local runs in the field log |
 | L4 | The probe, the worker sampler, the upload, `probe-target`, the nightly spec; baselines on a direct and a relay pair | `ROOMLERD_BENCH` unset; the build feature | — |
 | T | The StarDesk comparison cell on the spare box (private results) | — | — |
 | L1–L3 | As designed above | — | — |
@@ -217,3 +217,5 @@ competitors". Engineering may use the numbers; the public pages never print them
 |---|---|---|
 | 2026-08-27 | 0.4.9 | Baseline field session above; FR filed. |
 | 2026-10-13 | — | Amended: L0 and L4 first, as the instrument of the StarDesk teardown program. Nothing built yet. |
+| 2026-10-13 | L0, unoptimised build, neo16 (Windows) | **First run, green:** `clean` 30.2 fps decoded, p50 10.2 ms, p95 14.8 ms, 0 freezes · `delay100` p50 122.3 ms (+112) · `gate50` p50 63.3 ms (+53); the hold also halves the frame rate to 15.1, because it sits in the capture loop · `lossy` 25.2 fps, p50 46.6 ms, p95 62.1 ms, **3 freezes, 7 IDRs** against clean's 4. So loss is visible as freezes and keyframes even with NACK repair on. |
+| 2026-10-13 | L0, the same build | **Negative control, red:** `gate50` with its hold set to 0 failed `gate50: p50 rose by 0.4 ms, want ≥ 20` (exit 101); restored. A repeat of `clean` read p50 10.2 ms again. |
