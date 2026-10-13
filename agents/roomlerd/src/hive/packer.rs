@@ -79,6 +79,9 @@ pub(crate) enum Ask {
     Holds { candidates: Vec<String> },
     /// The pack that brings `commit` into a repository holding `haves`.
     Pack { commit: String, haves: Vec<String> },
+    /// FR-90 P2f-2d — whether the folder may take session `sid`'s copy, as
+    /// a moved start would hold it to: asked at a teleport's prepare.
+    Clean { sid: String },
 }
 
 /// The account's answer.
@@ -94,6 +97,9 @@ pub(crate) enum Answer {
     /// `pack` is thin against `against`, every one of them a commit the
     /// request named.
     Pack { against: Vec<String>, pack: Vec<u8> },
+    /// P2f-2d — `None`: the copy may go there. `Some`: the folder holds
+    /// work of its own, and why.
+    Clean { dirty: Option<String> },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -107,6 +113,10 @@ enum Header {
     Pack {
         against: Vec<String>,
         len: u64,
+    },
+    Clean {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dirty: Option<String>,
     },
 }
 
@@ -128,6 +138,15 @@ pub(crate) fn produce(req: &Request, git: &Git) -> Result<Answer, String> {
                 workspace::pack_against(git, &req.folder, &req.state_dir, commit, haves)?;
             Ok(Answer::Pack { against, pack })
         }
+        Ask::Clean { sid } => {
+            // The session's id names a ref and an index file: hex, nothing else.
+            if sid.len() != 24 || !sid.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                return Err(format!("{sid:?} is not a session id"));
+            }
+            Ok(Answer::Clean {
+                dirty: workspace::takes_a_copy(git, &req.folder, &req.state_dir, sid)?,
+            })
+        }
     }
 }
 
@@ -141,6 +160,9 @@ pub(crate) fn write_frames(out: &mut impl Write, answer: &Answer) -> std::io::Re
         Answer::Pack { against, pack } => Header::Pack {
             against: against.clone(),
             len: pack.len() as u64,
+        },
+        Answer::Clean { dirty } => Header::Clean {
+            dirty: dirty.clone(),
         },
     };
     let header = serde_json::to_vec(&header).map_err(std::io::Error::other)?;
@@ -191,6 +213,7 @@ pub(crate) fn read_frames(bytes: &[u8]) -> Result<Answer, String> {
                 pack: take(len as usize, "the pack")?.to_vec(),
             }
         }
+        Header::Clean { dirty } => Answer::Clean { dirty },
     };
     if at != bytes.len() {
         return Err(format!("{} bytes after the answer", bytes.len() - at));
@@ -232,6 +255,7 @@ pub(crate) fn check(req: &Request, answer: &Answer) -> Result<(), String> {
             }
             Ok(())
         }
+        (Ask::Clean { .. }, Answer::Clean { .. }) => Ok(()),
         _ => Err("an answer to another question".into()),
     }
 }
@@ -518,6 +542,10 @@ mod tests {
                 against: vec!["b".repeat(40)],
                 pack: pack_bytes(),
             },
+            Answer::Clean { dirty: None },
+            Answer::Clean {
+                dirty: Some("the folder holds work of its own".into()),
+            },
         ];
         for answer in answers {
             let mut bytes = Vec::new();
@@ -609,6 +637,26 @@ mod tests {
             refused(check(&pack, &held(vec![a])), "another question"),
             "an answer to another question is refused"
         );
+        // P2f-2d — the folder's word on taking a copy answers that question
+        // alone.
+        let clean = request(
+            dir,
+            Ask::Clean {
+                sid: "6acd9709a3dd4cf606f6c38c".into(),
+            },
+        );
+        assert!(check(&clean, &Answer::Clean { dirty: None }).is_ok());
+        assert!(
+            refused(check(&clean, &held(Vec::new())), "another question"),
+            "a holds answer to the clean question is refused"
+        );
+        assert!(
+            refused(
+                check(&holds, &Answer::Clean { dirty: None }),
+                "another question"
+            ),
+            "and a clean answer to another question"
+        );
     }
 
     /// Asked in this process, through the same frames and checks: which
@@ -659,6 +707,34 @@ mod tests {
         assert_eq!(against, vec![first]);
         // The second commit, its tree and `b.txt`: `a.txt` is the first one's.
         assert_eq!(u32::from_be_bytes(pack[8..12].try_into().unwrap()), 3);
+        // P2f-2d — whether the folder may take a teleport's copy: clean,
+        // it may; with a change, it may not, in words; and a session id that
+        // is no id is refused before any git sees it.
+        let clean = request(
+            &dir,
+            Ask::Clean {
+                sid: "6acd9709a3dd4cf606f6c38c".into(),
+            },
+        );
+        assert_eq!(
+            ask(&run, &who, &clean).await.unwrap(),
+            Answer::Clean { dirty: None },
+            "a clean clone"
+        );
+        std::fs::write(dir.join("a.txt"), "changed\n").unwrap();
+        assert!(
+            matches!(
+                ask(&run, &who, &clean).await.unwrap(),
+                Answer::Clean { dirty: Some(_) }
+            ),
+            "a change of its own"
+        );
+        let bad = request(&dir, Ask::Clean { sid: "../x".into() });
+        let got = ask(&run, &who, &bad).await;
+        assert!(
+            matches!(&got, Err(e) if e.contains("is not a session id")),
+            "a session id that is no id is refused: {got:?}"
+        );
         let mut other = asked.clone();
         other.v = REQUEST_V + 1;
         let got = ask(&run, &who, &other).await;
