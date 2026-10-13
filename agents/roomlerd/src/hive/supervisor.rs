@@ -10084,11 +10084,11 @@ done
             note.starts_with("This session is a fork:"),
             "told it is a fork: {note:?}"
         );
+        // The parent's folder as the device resolved it: on macOS `/tmp` is
+        // a link to `/private/tmp` (CI's macOS lane, the first run).
+        let work = std::fs::canonicalize(r.root.path().join("work")).unwrap();
         assert!(
-            note.contains(&format!(
-                "Those turns worked in {}",
-                r.root.path().join("work").display()
-            )),
+            note.contains(&format!("Those turns worked in {}", work.display())),
             "{note:?}"
         );
         assert!(
