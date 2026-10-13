@@ -118,6 +118,7 @@ pub(crate) fn device_refusal_message(word: &str) -> &'static str {
             "the account the device would run you as may use sudo without a password, which \
              would give the agent root (hive_allow_passwordless_sudo)"
         }
+        "folder_dirty" => "the folder on the device holds work of its own",
         _ => "the device refused the session",
     }
 }
