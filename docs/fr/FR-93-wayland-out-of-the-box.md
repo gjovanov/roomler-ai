@@ -407,6 +407,17 @@ once a session is allowed.
 | f | the mapping cache keyed on the dma-buf's identity, not the fb id | §2.3 #6 |
 | g | tiled scanout = FR-36 P2: EGL dma-buf import, `dlopen`ed (the PipeWire rule — no `DT_NEEDED`) | real x86 hardware only (D3) |
 
+**As built (P3c, 2026-10-13): the cursor plane** (`capture/drm_cursor.rs`, its I/O in `drm_backend.rs`;
+[`linux-capture.md`](../linux-capture.md) §3.1). The worker sets `ATOMIC` and then `CURSOR_PLANE_HOTSPOT` after
+`UNIVERSAL_PLANES`, neither of them fatal, and reads each plane's `type` once. On every frame it grabs it reads the
+cursor plane bound to the captured CRTC: `CRTC_X/Y`, `HOTSPOT_X/Y` where the driver has them, and the ARGB buffer,
+again on a new framebuffer and every 250 ms. It straightens the premultiplied pixels, crops them to the visible
+image, ids the shape by a hash of the pixels and the hotspot (the viewer never replaces a cached id), and publishes
+it to the cursor channel's tracker. Only the DRM arm publishes: mutter's and the portal's streams embed the pointer.
+The primary plane is now chosen by its `type`, which P3b listed, because a bound cursor plane would otherwise win on
+enumeration order. Not in P3c: P3b's card choice (`boot_vga`/seat0), multi-monitor, and a DRM recording's pointer
+(`capture::pointer` still reports none for DRM).
+
 ### 4.5 Input (P4)
 
 - **Mutter RemoteDesktop** in the helper, paired with the mutter ScreenCast session through
@@ -514,6 +525,7 @@ bridge for text and images in the lab before deciding.
 | ↳ P2b | the hello's `desktop` object, and the server's count of Wayland hosts and the arm serving each (AC13) | additive wire | lab, then the fleet | S |
 | ↳ P2c | the viewer names the arm and whether it asked (FR-45 AC8 option b) | — | lab, after a promote | S |
 | **P3** | DRM hardening (§4.4 b–f) | `ROOMLERD_DRM_CURSOR=0`, `ROOMLERD_DRM_IDLE_SKIP=0` | lab, Asahi | M |
+| ↳ P3c | the cursor plane: the DRM worker reads the CRTC's cursor plane (`ATOMIC` + `CURSOR_PLANE_HOTSPOT`; `CRTC_X/Y`, `HOTSPOT_X/Y`, the ARGB buffer), and the cursor data channel carries it (`linux-capture.md` §3.1). With it, P3b's half that P3c needs: the primary plane chosen by its type | `ROOMLERD_DRM_CURSOR=0` | ✅ lab (`dbf514a3f`; built before a rebase, the same changes), the GNOME 50 and Plasma 6.7.5 system installs with `drm_capture` + `uinput`, AC5's `cursor` plan. **🔴 0.4.132:** no overlay at either target. **P3c:** the overlay at both targets, on both compositors. `ROOMLERD_DRM_CURSOR=0` gives the badge back. Owed: a real GPU, with no hotspot property (Asahi) | S |
 | **P3g** | tiled scanout via EGL import | `ROOMLERD_DRM_EGL=0` | the x86 cell (D3) | L |
 | **P4** | Mutter RemoteDesktop input, layouts, per-output mapping (§4.5) | `ROOMLERD_MUTTER_INPUT=0` | lab, WSL2 | M |
 | ↳ P4a | mutter's own RemoteDesktop drives the mutter screencast and takes the viewer's input; the route carries its kind, so `rc:input-reach` and the brief name it | `mutter_input` | ✅ lab (`3f9ad6464`), GNOME 50 per-user, no key, the AC4 oracle. **🔴 0.4.131:** the picture, and 0 events at the probe, all 7 input checks failed. **P4a:** all 7 passed: the three points exact, click, wheel down, "hello 123", Shift+a as "A"; the brief `input_reach=full`. `mutter_input = false` gives the view-only arm back | S |
@@ -620,6 +632,11 @@ New cells run three times before they are trusted. An entry in `expected-failure
   first on the release (0 events through KWin's gate, `remote-control.md`), and on P4b's first candidate
   (`helo 123A`, calls unawaited). Owed: KDE per-user on a released build (P4b rides the release after 0.4.132).
 - [ ] **AC5** — the remote cursor is visible in the viewer on DRM and mutter/portal sessions.
+  ⏳ DRM: ✅ in the lab on P3c (`dbf514a3f`), the GNOME 50 and Plasma 6.7.5 system installs. The person at the
+  screen moved the pointer over QMP and the viewer's overlay followed it to both targets (AC5's `cursor` plan);
+  🔴 first on 0.4.132, with no overlay at either target and no arrow in the DRM stream. Owed: a released build, a
+  real GPU (Asahi), and the mutter and portal sessions, whose streams embed the pointer and have not been measured
+  by this plan.
 - [ ] **AC6** — every refusal names its reason in the viewer; no black stream, no "headless" for a seat with a
   session. Each refusal row shown red on 0.4.124 first.
 - [ ] **AC7** — lifecycle (§4.6): each event recovers within 10 s or names its reason.
@@ -702,6 +719,7 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-13 | `wlab-kde` (per-user, no capture key) | P4b: `fe0c3ae93` (calls unawaited), then `9a8e20699` and `64f00509f` (calls awaited) | P4b / AC4: KDE's *Remote Control* dialog; the AC4 oracle; a typing stress (112 keystrokes, 40 of them the second of a doubled letter, 80 ms apart) into the probe's focused text entry; the helper's input trace lined up against the probe's log on the guest's clock (`linux-capture.md` §1.2, §4.3) | 🔴 unawaited: the oracle passed once, then typed `helo 123A`; the stress got 10, 17, 6 and 8 of 113 characters wrong, with KDE's input method (plasma-keyboard) on or off. The trace showed every call sent, and the window missing a key's release, then a lone release at that letter's next keystroke: a release that overtook its press. xdg-desktop-portal runs each call on a worker thread (`HANDLE_METHOD_INVOCATIONS_IN_THREAD`). ✅ awaited: the oracle 7/7 three times, the stress exact four times, 0.5 ms a call at the median. ✅ The wheel notch down arrives down. ✅ A denial: KDE asked again for the screen only; the session ran view-only with its picture and a reach banner naming the fix. Wrong turn, kept: plasma-keyboard's keyboard grab looked guilty (every key round-trips through it) and was not. Step log 59 |
 | 2026-10-13 | `wlab-gnome` (per-user), `wlab-gnome-sys`, `wlab-kde` (per-user) | 0.4.132, the release | the release in the lab: each guest's update path, then AC4 on GNOME per-user, a session to the no-key system guest, and the automatic portal on KDE | GNOME per-user: the 0.4.131 updater verified the `.asc`, then could not install a `.deb` as uid 1000 (no pkexec, no passwordless sudo; FR-96 P1's root helper starts with 0.4.132), so the verified package went in by hand; ✅ the AC4 oracle 7/7 on the released build. GNOME system: ✅ its own updater, `SucceededVerified`, the live daemon on 0.4.132 within seconds; a session refuses with `wayland_not_enabled` and the admin's fix. KDE per-user (a tarball install, #2046), by hand after gpg reported a good signature: ✅ the screen share restored from its token, the picture at +4 s, no dialog, view-only, since P4b is not in 0.4.132. Step log 60 |
 | 2026-10-13 | `wlab-gnome` (per-user, no key) | 0.4.132, the release | AC1: the viewer decodes the probe's block code from the frame every 250 ms for 30 s; each counter is dated by the probe's own tick log, on mars's clock with the guest's offset measured over the lab's ssh | The first run decoded nothing: the probe window was blank. The guest lacked `python3-gi-cairo` (it predates that bake line), so every draw raised a TypeError while the tick log ran on, and its probe predated the startup guard that refuses to start without the package. ✅ With it installed (and the probe updated afterwards): 112 of 112 frames decoded, 112 distinct counters, the counter shown 0.42–0.68 s old (median 0.54 s), clock uncertainty ±0.43 s. Step log 61 |
+| 2026-10-13 | `wlab-gnome-sys`, `wlab-kde-sys` (system, `drm_capture` + `uinput`) | 0.4.132, then P3c `dbf514a3f` (built before a rebase, the same changes) | P3c / AC5: the person at the screen (QMP) moves the pointer to two targets, and the viewer oracle's `cursor` plan reads where the viewer draws it | 🔴 0.4.132 (GNOME): no overlay at either target, and no arrow in the DRM stream. ✅ P3c: the overlay at (0.295, 0.592) / (0.695, 0.592) on GNOME and at (0.299, 0.597) / (0.699, 0.597) on KWin, for targets (0.3, 0.6) / (0.7, 0.6). The worker logged `planes=2 cursor_planes=1 atomic=true hotspot=true` on both. ✅ `ROOMLERD_DRM_CURSOR=0`: no overlay again, and "the cursor plane is not read". Step log 62 |
 
 ## 12. Related
 

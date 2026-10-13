@@ -43,8 +43,10 @@ use tokio::sync::oneshot;
 use tracing::info;
 
 use drm::buffer::DrmFourcc;
+use drm::control::{crtc, framebuffer, plane, property};
 
-use super::{Damage, DownscalePolicy, Frame, PixelFormat, ScreenCapture};
+use super::drm_cursor::{self, CursorSnapshot, PlaneKind};
+use super::{CursorInfo, Damage, DownscalePolicy, Frame, PixelFormat, ScreenCapture};
 
 /// `/dev/dri/cardN` nodes to probe. The kernel numbers these from 0, but the
 /// numbering is NOT stable across kernel upgrades — on the Asahi field host the
@@ -197,31 +199,252 @@ fn open_display_node() -> Result<(Card, String)> {
     )
 }
 
-/// The live scanout framebuffer on the primary plane, if there is one.
+/// One plane's `type`, and the cursor properties this backend reads. Looked up
+/// once at open: neither a plane's type nor its property ids change.
+struct PlaneEntry {
+    handle: plane::Handle,
+    kind: Option<PlaneKind>,
+    crtc_x: Option<property::Handle>,
+    crtc_y: Option<property::Handle>,
+    hotspot_x: Option<property::Handle>,
+    hotspot_y: Option<property::Handle>,
+}
+
+/// Every plane the device shows this fd, with its type and property ids.
+///
+/// ⚠️ Read AFTER the client caps are set: `UNIVERSAL_PLANES` decides whether
+/// the primary plane is listed at all, `ATOMIC` whether `CRTC_X/Y` exist, and
+/// on a paravirtual GPU `CURSOR_PLANE_HOTSPOT` whether an atomic client sees
+/// the cursor plane.
+fn read_planes(card: &Card) -> Vec<PlaneEntry> {
+    let Ok(handles) = card.plane_handles() else {
+        return Vec::new();
+    };
+    handles
+        .into_iter()
+        .map(|handle| {
+            let mut entry = PlaneEntry {
+                handle,
+                kind: None,
+                crtc_x: None,
+                crtc_y: None,
+                hotspot_x: None,
+                hotspot_y: None,
+            };
+            if let Ok(props) = card.get_properties(handle) {
+                for (prop, raw) in props.iter() {
+                    let Ok(info) = card.get_property(*prop) else {
+                        continue;
+                    };
+                    match info.name().to_bytes() {
+                        b"type" => entry.kind = PlaneKind::from_raw(*raw),
+                        b"CRTC_X" => entry.crtc_x = Some(*prop),
+                        b"CRTC_Y" => entry.crtc_y = Some(*prop),
+                        b"HOTSPOT_X" => entry.hotspot_x = Some(*prop),
+                        b"HOTSPOT_Y" => entry.hotspot_y = Some(*prop),
+                        _ => {}
+                    }
+                }
+            }
+            entry
+        })
+        .collect()
+}
+
+/// The live scanout framebuffer on the primary plane, and the CRTC it is on.
 ///
 /// ⚠️ `plane_handles()` returns ONLY overlay planes until
 /// `DRM_CLIENT_CAP_UNIVERSAL_PLANES` is set — without it the primary plane is
 /// invisible and this returns `None` on a perfectly healthy display. That is a
 /// silent empty result, not an error, which is why the cap is set once at open
 /// and asserted here by comment rather than discovered again later.
-fn primary_plane_fb(card: &Card) -> Option<drm::control::framebuffer::Handle> {
-    let planes = card.plane_handles().ok()?;
-    let mut fallback = None;
-    for ph in planes {
-        let Ok(info) = card.get_plane(ph) else {
-            continue;
+///
+/// FR-93 P3 — chosen by the plane's `type` ([`drm_cursor::pick_primary`]).
+/// The first bound plane used to stand in for it, on the assumption that
+/// cursor and overlay planes are unbound; the cursor plane is bound wherever
+/// the pointer shows, and an overlay whenever a compositor scans a video out
+/// directly.
+fn primary_plane(
+    card: &Card,
+    planes: &[PlaneEntry],
+) -> Option<(framebuffer::Handle, crtc::Handle)> {
+    let bound: Vec<_> = planes
+        .iter()
+        .map(|entry| {
+            let live = card
+                .get_plane(entry.handle)
+                .ok()
+                .and_then(|info| Some((info.framebuffer()?, info.crtc()?)));
+            (entry.kind, live)
+        })
+        .collect();
+    drm_cursor::pick_primary(&bound)
+}
+
+/// FR-93 P3c — kill switch `ROOMLERD_DRM_CURSOR=0`: no cursor-plane read, and
+/// none of the client caps it needs. The viewer then shows its own badge for
+/// the pointer, as before.
+fn cursor_enabled() -> bool {
+    tunnel_core::env::flag("DRM_CURSOR", true)
+}
+
+/// FR-93 P3c — the client caps the cursor plane needs, set after
+/// `UNIVERSAL_PLANES`. `ATOMIC` exposes `CRTC_X/Y`, which are atomic-only
+/// properties. On a paravirtual GPU an atomic client then sees the cursor plane
+/// only with `CURSOR_PLANE_HOTSPOT` as well: the kernel hides it otherwise.
+/// Neither refusal is fatal. Capture works without them, and the pointer stays
+/// the viewer's own badge, as it was before P3c.
+fn enable_cursor_caps(card: &Card) -> (bool, bool) {
+    let atomic = card
+        .set_client_capability(drm::ClientCapability::Atomic, true)
+        .is_ok();
+    let hotspot = atomic
+        && card
+            .set_client_capability(drm::ClientCapability::CursorPlaneHotspot, true)
+            .is_ok();
+    (atomic, hotspot)
+}
+
+/// FR-93 P3c — reads the cursor plane on the captured CRTC, once per frame.
+#[derive(Default)]
+struct CursorReader {
+    /// The framebuffer last read, and when.
+    fb: Option<framebuffer::Handle>,
+    read_at: Option<Instant>,
+    pixels: Option<drm_cursor::CursorPixels>,
+    /// The shape last built for the wire, by its id.
+    shape: Option<(u64, std::sync::Arc<CursorInfo>)>,
+    /// One warning per worker for a buffer this cannot read, not one a frame.
+    warned: bool,
+}
+
+impl CursorReader {
+    /// The cursor on `crtc` now, or `None` when no cursor plane is bound there
+    /// with a framebuffer (a hidden pointer, a pointer on another CRTC, or a
+    /// compositor drawing it into the primary plane, where it is already in
+    /// the frame).
+    fn read(
+        &mut self,
+        card: &Card,
+        planes: &[PlaneEntry],
+        crtc: crtc::Handle,
+    ) -> Option<CursorSnapshot> {
+        let (entry, fb) = planes
+            .iter()
+            .filter(|e| e.kind == Some(PlaneKind::Cursor))
+            .find_map(|e| {
+                let info = card.get_plane(e.handle).ok()?;
+                (info.crtc() == Some(crtc)).then_some(())?;
+                Some((e, info.framebuffer()?))
+            })?;
+        let props = card.get_properties(entry.handle).ok()?;
+        let value = |want: Option<property::Handle>| -> Option<i32> {
+            let want = want?;
+            props
+                .iter()
+                .find(|(prop, _)| **prop == want)
+                .map(|(_, raw)| drm_cursor::signed(*raw))
         };
-        let (Some(_crtc), Some(fb)) = (info.crtc(), info.framebuffer()) else {
-            continue;
-        };
-        // A plane bound to a CRTC and holding a framebuffer is live scanout.
-        // Prefer the first such plane; cursor/overlay planes are normally
-        // unbound (`crtc=None`) so this resolves to the primary in practice.
-        if fallback.is_none() {
-            fallback = Some(fb);
+        let at = (value(entry.crtc_x)?, value(entry.crtc_y)?);
+        let hotspot = value(entry.hotspot_x).zip(value(entry.hotspot_y));
+
+        let now = Instant::now();
+        let stale = self
+            .read_at
+            .is_none_or(|t| now.duration_since(t) >= drm_cursor::SHAPE_REREAD);
+        if self.fb != Some(fb) || stale {
+            self.pixels = match read_cursor_pixels(card, fb) {
+                Ok(pixels) => pixels,
+                Err(e) => {
+                    if !self.warned {
+                        self.warned = true;
+                        tracing::warn!(error = %format!("{e:#}"), "drm cursor: the cursor plane's buffer cannot be read; the viewer keeps its own pointer");
+                    }
+                    None
+                }
+            };
+            self.fb = Some(fb);
+            self.read_at = Some(now);
         }
+        let pixels = self.pixels.as_ref()?;
+        let ((x, y), in_crop) = drm_cursor::place(at, hotspot, pixels);
+        let id = drm_cursor::shape_id(pixels, in_crop);
+        let shape = match &self.shape {
+            Some((sid, shape)) if *sid == id => shape.clone(),
+            _ => {
+                let shape = std::sync::Arc::new(drm_cursor::shape_info(pixels, in_crop));
+                self.shape = Some((id, shape.clone()));
+                shape
+            }
+        };
+        Some(CursorSnapshot {
+            x,
+            y,
+            shape_id: id,
+            shape,
+            at: now,
+        })
     }
-    fallback
+}
+
+/// The cursor plane's buffer, straightened and cropped. `Ok(None)` for one
+/// with nothing visible in it.
+fn read_cursor_pixels(
+    card: &Card,
+    fb: framebuffer::Handle,
+) -> Result<Option<drm_cursor::CursorPixels>> {
+    let info = card
+        .get_planar_framebuffer(fb)
+        .map_err(|e| anyhow!("drmModeGetFB2 on the cursor plane: {e}"))?;
+    let _handles = FbHandles::new(card, info.buffers());
+    if info.pixel_format() != DrmFourcc::Argb8888 {
+        bail!(
+            "cursor plane format {:?}, not ARGB8888",
+            info.pixel_format()
+        );
+    }
+    if !modifier_is_linear(&info) {
+        bail!("cursor plane modifier {:?} is not linear", info.modifier());
+    }
+    let (width, height) = info.size();
+    // Hardware cursors are 64×64 to 512×512; anything else is not a cursor
+    // this should be copying every 250 ms.
+    if width == 0 || height == 0 || width > 512 || height > 512 {
+        bail!("cursor plane is {width}×{height}");
+    }
+    let pitch = info.pitches()[0];
+    let len = pitch as usize * height as usize;
+    let handle =
+        info.buffers()[0].ok_or_else(|| anyhow!("the cursor framebuffer has no GEM handle"))?;
+    let prime = card
+        .buffer_to_prime_fd(handle, 0)
+        .map_err(|e| anyhow!("PRIME export of the cursor buffer: {e}"))?;
+    // SAFETY: a fresh private read-only mapping of the exported dma-buf, sized
+    // from the framebuffer's own pitch × height, unmapped when `mapping` drops
+    // at the end of this function.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            prime.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        bail!(
+            "mmap of the cursor dma-buf failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mapping = Mapping { ptr, len };
+    Ok(drm_cursor::straighten_and_crop(
+        mapping.as_slice(),
+        width,
+        height,
+        pitch,
+    ))
 }
 
 /// Repack one scanout framebuffer into tightly-packed BGRA.
@@ -357,9 +580,34 @@ fn worker(
         return;
     }
 
+    // FR-93 P3c — the cursor plane's caps, before the plane table: they decide
+    // what it lists.
+    let (atomic, hotspot) = if cursor_enabled() {
+        enable_cursor_caps(&card)
+    } else {
+        (false, false)
+    };
+    let planes = read_planes(&card);
+    let mut cursor = atomic.then(CursorReader::default);
+    info!(
+        planes = planes.len(),
+        cursor_planes = planes
+            .iter()
+            .filter(|p| p.kind == Some(PlaneKind::Cursor))
+            .count(),
+        atomic,
+        hotspot,
+        "drm capture: the cursor plane is {}",
+        if cursor.is_some() {
+            "read for the viewer"
+        } else {
+            "not read (ROOMLERD_DRM_CURSOR=0, or the driver refused DRM_CLIENT_CAP_ATOMIC)"
+        }
+    );
+
     // Resolve the geometry once so the caller gets a real size, and so an
     // unusable modifier is refused at open rather than per frame.
-    let Some(fb) = primary_plane_fb(&card) else {
+    let Some((fb, _crtc)) = primary_plane(&card, &planes) else {
         let _ = ready_tx.send(Err(anyhow!(
             "no plane is bound to a CRTC with a live framebuffer — is anything being scanned out? \
              (a blanked screen stops scanout, which is why screen blanking must be disabled)"
@@ -395,7 +643,7 @@ fn worker(
     let mut cached: Option<(drm::control::framebuffer::Handle, Mapping)> = None;
 
     while let Ok(reply_tx) = cmd_rx.recv() {
-        let reply = match grab(&card, &mut cached, downscale) {
+        let reply = match grab(&card, &planes, &mut cached, downscale, cursor.as_mut()) {
             Ok(f) => WorkerReply::Frame(Box::new(f)),
             Err(e) => WorkerReply::Failed(format!("{e:#}")),
         };
@@ -403,6 +651,10 @@ fn worker(
             // Caller went away mid-frame; keep serving the next one.
             continue;
         }
+    }
+    // The capturer is gone: no pointer to show until another one opens.
+    if cursor.is_some() {
+        drm_cursor::publish(None);
     }
 }
 
@@ -417,14 +669,25 @@ fn modifier_is_linear(info: &drm::control::framebuffer::PlanarInfo) -> bool {
 
 fn grab(
     card: &Card,
+    planes: &[PlaneEntry],
     cached: &mut Option<(drm::control::framebuffer::Handle, Mapping)>,
     downscale: DownscalePolicy,
+    cursor: Option<&mut CursorReader>,
 ) -> Result<Option<Frame>> {
-    let Some(fb) = primary_plane_fb(card) else {
+    let Some((fb, crtc)) = primary_plane(card, planes) else {
         // Nothing being scanned out right now (mode change, blanked panel).
         // Not an error: report "no frame" and let the pump retry.
+        if cursor.is_some() {
+            drm_cursor::publish(None);
+        }
         return Ok(None);
     };
+    // FR-93 P3c — the pointer at this frame, for the cursor data channel. Read
+    // before the primary's pixels, so a failure there cannot leave it stale;
+    // its own failures only ever hide the pointer.
+    if let Some(reader) = cursor {
+        drm_cursor::publish(reader.read(card, planes, crtc));
+    }
     let info = card
         .get_planar_framebuffer(fb)
         .map_err(|e| anyhow!("drmModeGetFB2: {e}"))?;
