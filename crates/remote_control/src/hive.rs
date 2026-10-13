@@ -183,6 +183,12 @@ pub enum HiveRefusal {
     /// account's groups from the directory, so no group a session drops can
     /// stop it, and the session would have root.
     PasswordlessSudo,
+    /// FR-90 P2f-2d — a teleport's folder holds work of its own: a repository
+    /// whose folder is neither what its `HEAD` holds nor what this session
+    /// last left there, or a folder in no repository that holds files. The
+    /// copy would be refused there only after the lease moved; the detail
+    /// names a sibling folder the session could go to instead.
+    FolderDirty,
     /// A word this build does not know.
     Other,
 }
@@ -199,12 +205,13 @@ impl HiveRefusal {
             Self::LaunchFailed => "launch_failed",
             Self::AtCapacity => "at_capacity",
             Self::PasswordlessSudo => "passwordless_sudo",
+            Self::FolderDirty => "folder_dirty",
             Self::Other => "other",
         }
     }
 
     /// Every word this build knows.
-    pub const ALL: [HiveRefusal; 9] = [
+    pub const ALL: [HiveRefusal; 10] = [
         Self::HiveDisabled,
         Self::NoAccount,
         Self::NoConsoleUser,
@@ -213,6 +220,7 @@ impl HiveRefusal {
         Self::LaunchFailed,
         Self::AtCapacity,
         Self::PasswordlessSudo,
+        Self::FolderDirty,
         Self::Other,
     ];
 }
@@ -1038,6 +1046,7 @@ mod tests {
                 "launch_failed",
                 "at_capacity",
                 "passwordless_sudo",
+                "folder_dirty",
                 "other",
             ]
         );

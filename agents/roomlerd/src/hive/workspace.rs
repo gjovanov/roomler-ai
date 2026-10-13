@@ -888,6 +888,51 @@ pub(crate) struct Current {
 /// session's primary before: moving back); or already `tree`. Anything else
 /// is the person's own work, and is refused.
 pub(crate) fn judge(git: &Git, place: &Place, sid: &str, tree: &str) -> Result<Current, String> {
+    match judged(git, place, sid, tree)? {
+        (current, true) => Ok(current),
+        (_, false) => Err(WORK_OF_ITS_OWN.into()),
+    }
+}
+
+/// What [`judge`] refuses a folder for.
+const WORK_OF_ITS_OWN: &str =
+    "the folder holds work of its own, neither its HEAD's nor this session's";
+
+/// FR-90 P2f-2d — whether a teleport's copy may be put into `folder`, asked
+/// at its prepare, before anything moves: what [`judge`] holds the folder to
+/// at the move, with no checkpoint in hand yet. `None`: it may (missing,
+/// empty, exactly what its repository's `HEAD` holds, or what session `sid`
+/// last left there). `Some(why)`: work of its own. A folder in no
+/// repository and with no shadow of the session is read as a directory, and
+/// nothing is made for it: empty, it may; holding files, it may not.
+pub(crate) fn takes_a_copy(
+    git: &Git,
+    folder: &Path,
+    state_dir: &Path,
+    sid: &str,
+) -> Result<Option<String>, String> {
+    if existing_repo(git, folder, state_dir)?.is_none() {
+        return match std::fs::read_dir(folder) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{}: {e}", folder.display())),
+            Ok(mut entries) => Ok(entries
+                .next()
+                .map(|_| "it holds files, and is in no repository".to_string())),
+        };
+    }
+    let place = place_for(git, folder, state_dir)?;
+    let empty = empty_tree(git, &place)?;
+    Ok(match judged(git, &place, sid, &empty)? {
+        (_, true) => None,
+        (_, false) => Some(
+            "it is neither what its HEAD holds nor what this session last left there".to_string(),
+        ),
+    })
+}
+
+/// The folder's current state, and whether [`judge`] lets a materialize
+/// replace it with `tree`.
+fn judged(git: &Git, place: &Place, sid: &str, tree: &str) -> Result<(Current, bool), String> {
     let empty = empty_tree(git, place)?;
     let index = place.repo.git_dir.join(format!("hive-{sid}.index"));
     let now = if place.missing {
@@ -898,7 +943,7 @@ pub(crate) fn judge(git: &Git, place: &Place, sid: &str, tree: &str) -> Result<C
     };
     let current = Current { tree: now, index };
     if current.tree == empty || current.tree == tree {
-        return Ok(current);
+        return Ok((current, true));
     }
     let rev = |spec: String| {
         run(
@@ -920,13 +965,12 @@ pub(crate) fn judge(git: &Git, place: &Place, sid: &str, tree: &str) -> Result<C
             format!("HEAD:{}", place.repo.prefix.trim_end_matches('/'))
         };
         if rev(at_head).as_deref() == Some(current.tree.as_str()) {
-            return Ok(current);
+            return Ok((current, true));
         }
     }
-    if rev(format!("refs/hive/{sid}/head^{{tree}}")).as_deref() == Some(current.tree.as_str()) {
-        return Ok(current);
-    }
-    Err("the folder holds work of its own, neither its HEAD's nor this session's".into())
+    let ours =
+        rev(format!("refs/hive/{sid}/head^{{tree}}")).as_deref() == Some(current.tree.as_str());
+    Ok((current, ours))
 }
 
 /// Move the folder from what it holds (`from`) to `tree` with git's own
@@ -1799,6 +1843,64 @@ mod tests {
         assert!(err.contains("is not a commit id"), "{err}");
         let err = pack_against(&git, dir, state.path(), &"2".repeat(40), &[]).unwrap_err();
         assert!(err.contains("holds no commit"), "{err}");
+    }
+
+    /// P2f-2d — a teleport's folder may take the copy when it is missing,
+    /// empty, a clean clone (exactly what its `HEAD` holds, ignored files
+    /// aside), or what this session last left there; not when it holds work
+    /// of its own: a change, an untracked file, or, in no repository, any
+    /// file. Asking makes nothing for a folder in no repository.
+    #[test]
+    fn a_folder_takes_a_copy_only_when_it_holds_no_work_of_its_own() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let sid = "6acd9709a3dd4cf606f6c38c";
+        let tmp = repo_with_a_commit();
+        let dir = tmp.path();
+        let state = tempfile::tempdir().unwrap();
+        let git = Git::on_path();
+        let takes = |d: &Path| takes_a_copy(&git, d, state.path(), sid).unwrap();
+        assert_eq!(takes(dir), None, "a clean clone");
+        write(dir, "secret.env", "ignored\n");
+        assert_eq!(takes(dir), None, "an ignored file is no work of its own");
+        write(dir, "a.txt", "one, changed\n");
+        assert!(
+            takes(dir).is_some_and(|w| w.contains("neither what its HEAD holds")),
+            "a change"
+        );
+        write(dir, "a.txt", "one\n");
+        write(dir, "new.txt", "the person's\n");
+        assert!(takes(dir).is_some(), "an untracked file");
+        std::fs::remove_file(dir.join("new.txt")).unwrap();
+        assert_eq!(takes(dir), None, "clean again");
+        // What this session last left in it: a member that ran it here.
+        write(dir, "a.txt", "the session's\n");
+        assert!(matches!(
+            checkpoint(&git, dir, state.path(), sid, 1, 1, None),
+            Outcome::Taken { .. }
+        ));
+        assert_eq!(takes(dir), None, "what this session last left there");
+        write(dir, "a.txt", "and then the person's\n");
+        assert!(takes(dir).is_some(), "past it");
+
+        let root = tempfile::tempdir().unwrap();
+        let under = Git::under(root.path());
+        let plain_state = root.path().join("plain-state");
+        let plain = |d: &Path| takes_a_copy(&under, d, &plain_state, sid).unwrap();
+        assert_eq!(plain(&root.path().join("missing")), None, "missing");
+        let empty = root.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(plain(&empty), None, "empty");
+        assert!(!plain_state.exists(), "no shadow made for asking");
+        let files = root.path().join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        write(&files, "theirs.txt", "someone's own\n");
+        assert!(
+            plain(&files).is_some_and(|w| w.contains("no repository")),
+            "files in no repository"
+        );
+        assert!(!plain_state.exists(), "nor for a folder that holds files");
     }
 
     /// P2b-4b — a folder inside a repository takes back only its own subtree;

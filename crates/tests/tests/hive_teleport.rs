@@ -25,6 +25,10 @@
 //! the whole pack's own blobs, the folder comes whole all the same, and the
 //! clone's `HEAD` is still the person's.
 //!
+//! P2f-2d — into the clone, first with the person's own file in it: B's
+//! prepare refuses `folder_dirty` before anything moves, naming a sibling for
+//! the person to make; the file gone, the teleport goes ahead.
+//!
 //! P2f-2c — then, into the clone, B's process is stopped, its store read, and
 //! started again: it resumes the session on the server's word, its store
 //! keeping where it runs it. A third device C joins after the move. B, the
@@ -463,6 +467,43 @@ async fn scenario(folder: Folder) {
     let a_pid =
         std::fs::read_to_string(a_dir.join("home").join("harness.pid")).expect("A's harness ran");
     assert!(alive(&a_pid), "A's harness runs the session");
+
+    // ── P2f-2d — into a clone holding the person's own work: refused at the
+    // prepare, before anything moves, a sibling named for them to make ─────
+    if folder == Folder::Clone {
+        std::fs::write(b_work.join("theirs.txt"), "the person's own work\n").unwrap();
+        let resp = app
+            .auth_post(
+                &format!("/api/tenant/{tid}/hive/session/{sid}/teleport"),
+                &owner,
+            )
+            .json(&json!({ "device_id": b, "folder": b_work }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let refused: Value = resp.json().await.unwrap();
+        assert_eq!(
+            (refused["outcome"].as_str(), refused["reason"].as_str()),
+            (Some("refused"), Some("folder_dirty")),
+            "{refused}"
+        );
+        // The room's words, escaped for Markdown.
+        let said = refused["message"]
+            .as_str()
+            .unwrap_or_default()
+            .replace('\\', "");
+        assert!(
+            said.contains("holds work of its own")
+                && said.contains("git worktree add")
+                && said.contains("work-hive-"),
+            "a sibling named: {refused}"
+        );
+        let s = session(&app, &seeded, &sid).await;
+        assert_eq!(s["device_id"], a.as_str(), "nothing moved: {s}");
+        assert!(member(&s, &b).is_none(), "B took nothing: {s}");
+        std::fs::remove_file(b_work.join("theirs.txt")).unwrap();
+    }
 
     // ── The teleport: prepared, joined, caught up, drained, synced, moved ──
     let began = Instant::now();

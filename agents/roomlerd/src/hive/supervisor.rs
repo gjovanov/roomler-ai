@@ -2017,6 +2017,14 @@ impl Supervisor {
     ) -> Answer {
         let answer = self.prepare_as(order, is_primary, true).await;
         if answer.refused.is_none() {
+            // P2f-2d — a folder that holds work of its own is refused now,
+            // before anything moves: the moved start would refuse it after
+            // the lease moved.
+            if let Some(account) = answer.account.as_deref()
+                && let Some(refused) = self.folder_refusal(order, account).await
+            {
+                return refused;
+            }
             // P2f-2b — the account and folder the gates just passed, as the
             // start resolves them, kept for the copy's have and want.
             let place = answer
@@ -2027,6 +2035,60 @@ impl Supervisor {
             self.admit_teleport(order, place);
         }
         answer
+    }
+
+    /// P2f-2d — a teleport's folder asked, as the account, whether the copy
+    /// may be put there: `None` when it may; else the refusal, which names a
+    /// sibling folder for the person to make and teleport into instead, when
+    /// it would be under `hive_roots`. Nothing is made for them. A folder that
+    /// cannot be asked about is refused too, in words: the moved start would
+    /// ask the same git.
+    async fn folder_refusal(&self, order: &StartOrder, account: &str) -> Option<Answer> {
+        // The gates passed: it resolves.
+        let folder = gates::folder_for(&self.cfg, &order.folder).ok()?;
+        let (who, dest) = match self.copy_place(order, account, &folder) {
+            Ok(place) => place,
+            Err(e) => {
+                return Some(Answer::refused(
+                    HiveRefusal::Other,
+                    format!("the folder could not be asked about: {e}"),
+                ));
+            }
+        };
+        let req = super::packer::Request {
+            v: super::packer::REQUEST_V,
+            folder: dest.folder.clone(),
+            state_dir: dest.state_dir.clone(),
+            ask: super::packer::Ask::Clean {
+                sid: order.session_id.to_hex(),
+            },
+        };
+        let why = match super::packer::ask(&self.checkpoint_runner(), &who, &req).await {
+            Ok(super::packer::Answer::Clean { dirty: None }) => return None,
+            Ok(super::packer::Answer::Clean { dirty: Some(why) }) => why,
+            Ok(_) => "an answer to another question".to_string(),
+            Err(e) => {
+                return Some(Answer::refused(
+                    HiveRefusal::Other,
+                    format!("the folder could not be read as the account: {e}"),
+                ));
+            }
+        };
+        // A folder must be there to pass the gates, so the sibling is named
+        // for the person to make: allowed once made when its parent is.
+        let sibling = sibling_for(&dest.folder, order.session_id).filter(|s| {
+            s.parent()
+                .is_some_and(|p| gates::folder_for(&self.cfg, &p.display().to_string()).is_ok())
+        });
+        let detail = match sibling {
+            Some(s) => format!(
+                "{why}; make a sibling, e.g. `git worktree add {}`, and teleport there",
+                s.display()
+            ),
+            None => why,
+        };
+        info!(session = %order.session_id, folder = %dest.folder.display(), %detail, "hive: a teleport refused: its folder holds work of its own");
+        Some(Answer::refused(HiveRefusal::FolderDirty, detail))
     }
 
     /// [`Self::prepare`], and for a teleport ([`Self::prepare_teleport`])
@@ -4321,6 +4383,17 @@ fn harness_path(home: &Path) -> String {
 
 /// P2e-5 — a moved session's places under its account's `home`: where its
 /// harness runs from, which its copy is put in place at.
+/// FR-90 P2f-2d — where a teleport refused for its folder's own work could
+/// go instead: `<folder>-hive-<the session id's last 8 digits>`, beside it
+/// (design §6.3). The last digits, not the first: those are the id's
+/// timestamp, the same for sessions made in the same second. `None` for a
+/// folder with no name of its own.
+fn sibling_for(folder: &Path, session: ObjectId) -> Option<PathBuf> {
+    let name = folder.file_name()?.to_str()?;
+    let hex = session.to_hex();
+    Some(folder.with_file_name(format!("{name}-hive-{}", &hex[hex.len() - 8..])))
+}
+
 fn copy_dest(order: &StartOrder, home: &Path, folder: &Path) -> materializer::Dest {
     let sid = order.session_id.to_hex();
     let state_dir = session_state_dir(home, &sid);
@@ -9851,6 +9924,107 @@ done
             );
             assert!(!r.sup.reports_copies(), "and nothing to tell");
         }
+    }
+
+    /// FR-90 P2f-2d — a teleport's prepare asks its folder, as the account,
+    /// whether the copy may go there, before anything moves. A clean clone
+    /// may. One that holds work of its own is refused `folder_dirty`, the
+    /// detail naming a sibling folder under `hive_roots` it could go to
+    /// instead (none, for a folder whose sibling is outside them), and the
+    /// refused prepare admits nothing.
+    #[tokio::test]
+    async fn a_teleports_prepare_refuses_a_folder_holding_work_of_its_own() {
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args([
+                    "-c",
+                    "user.name=Person",
+                    "-c",
+                    "user.email=person@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output();
+            matches!(out, Ok(o) if o.status.success())
+        };
+        let r = moving_rig(ObjectId::new(), 1);
+        let work = r.root.path().join("work");
+        if !git(&work, &["--version"]) {
+            return eprintln!("no git here");
+        }
+        let app = work.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("a.txt"), "one\n").unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["add", "-A"],
+            &["commit", "-q", "-m", "first"],
+        ] {
+            assert!(git(&app, args), "{args:?}");
+        }
+        let mut o = at_fence(&order(&r), 2);
+        o.folder = app.display().to_string();
+        assert_eq!(
+            r.sup.prepare_teleport(&o, true, false).await,
+            Answer::accepted("dev"),
+            "a clean clone"
+        );
+        std::fs::write(app.join("theirs.txt"), "the person's own\n").unwrap();
+        let mut dirty = o.clone();
+        dirty.session_id = ObjectId::new();
+        let answer = r.sup.prepare_teleport(&dirty, true, false).await;
+        assert_eq!(answer.refused, Some(HiveRefusal::FolderDirty), "{answer:?}");
+        // Beside it, named for the session's id's last eight digits.
+        let hex = dirty.session_id.to_hex();
+        let sibling = work.join(format!("app-hive-{}", &hex[16..]));
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("neither what its HEAD holds")
+                    && d.contains(&sibling.display().to_string())),
+            "the sibling named: {answer:?}"
+        );
+        assert!(
+            !r.sup.teleport_admitted(dirty.session_id, 1),
+            "a refused prepare admits nothing"
+        );
+        // The root itself: its sibling is outside `hive_roots`, so none is
+        // named.
+        std::fs::write(work.join("theirs.txt"), "the person's own\n").unwrap();
+        let mut rooted = o.clone();
+        rooted.session_id = ObjectId::new();
+        rooted.folder = work.display().to_string();
+        let answer = r.sup.prepare_teleport(&rooted, true, false).await;
+        assert_eq!(answer.refused, Some(HiveRefusal::FolderDirty), "{answer:?}");
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .is_some_and(|d| !d.contains("-hive-")),
+            "no sibling outside hive_roots: {answer:?}"
+        );
+        // A folder that cannot be asked about is refused too, in words: the
+        // moved start would ask the same git.
+        std::fs::write(work.join("a-file"), "not a folder\n").unwrap();
+        let mut unreadable = o.clone();
+        unreadable.session_id = ObjectId::new();
+        unreadable.folder = work.join("a-file").display().to_string();
+        let answer = r.sup.prepare_teleport(&unreadable, true, false).await;
+        assert_eq!(
+            answer.refused,
+            Some(HiveRefusal::Other),
+            "a folder that cannot be read is refused: {answer:?}"
+        );
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("could not be read as the account")),
+            "{answer:?}"
+        );
     }
 
     /// FR-90 P2f-2b — a teleport's prepare keeps where the session will run
