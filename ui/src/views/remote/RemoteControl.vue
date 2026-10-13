@@ -428,9 +428,11 @@
       </v-dialog>
       <!-- rc.199 — clipboard send / get: frequent connected-session
            actions, kept on the toolbar (not the Settings panel) at
-           every viewport. Relocated here from the retired Row 2. -->
+           every viewport. Relocated here from the retired Row 2.
+           Absent when the grant has no CLIPBOARD: the channel they need
+           was closed at `rc:session.created` (dropClipboardChannel). -->
       <v-btn
-        v-if="rc.phase.value === 'connected'"
+        v-if="rc.phase.value === 'connected' && rc.clipboardGranted.value"
         icon
         variant="text"
         size="small"
@@ -445,7 +447,7 @@
         <v-icon>mdi-content-paste</v-icon>
       </v-btn>
       <v-btn
-        v-if="rc.phase.value === 'connected'"
+        v-if="rc.phase.value === 'connected' && rc.clipboardGranted.value"
         icon
         variant="text"
         size="small"
@@ -1724,8 +1726,11 @@
           <!-- Clipboard auto-sync (v2). Live-effective (not gated on
                sessionLive) — the composable subscribes/unsubscribes on
                flip. Old agents: local→remote still auto-pushes; the
-               remote→local half needs the events cap (tooltip says so). -->
+               remote→local half needs the events cap (tooltip says so).
+               Absent when the grant has no CLIPBOARD: there is no
+               channel for it to sync over (dropClipboardChannel). -->
           <v-btn
+            v-if="rc.clipboardGranted.value"
             block
             variant="tonal"
             :color="clipboardAutoSyncOn ? 'primary' : undefined"

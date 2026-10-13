@@ -3664,6 +3664,44 @@ export const CLIPBOARD_SYNC_POLL_MS = 2000
 /** Throttle between consecutive localÃ¢ÂÂremote sync attempts. */
 const CLIPBOARD_SYNC_MIN_INTERVAL_MS = 300
 
+/** Whether a session's EFFECTIVE grant (`rc:session.created.permissions`)
+ *  lets clipboard content cross, in either direction. Exact tokens: a newer
+ *  bit that merely contains the name is not CLIPBOARD. A grant the server did
+ *  not report (pre-P3) is the request, which always asks for CLIPBOARD — the
+ *  rule `inputGranted` follows for INPUT. */
+export function grantAllowsClipboard(permissions: unknown): boolean {
+  return (
+    typeof permissions !== 'string' ||
+    permissions.split('|').some((p) => p.trim() === 'CLIPBOARD')
+  )
+}
+
+/** Close and forget the `clipboard` channel of a session whose grant does not
+ *  allow it — FR-52's outsider gets `VIEW | INPUT` by default.
+ *
+ *  The channels are made in `connect()`, BEFORE the session request goes out,
+ *  so this one exists before anyone knows the grant; but `rc:session.created`
+ *  lands before the offer is even created, so it is dropped before it is ever
+ *  negotiated. Every path that moves clipboard content needs it OPEN — the
+ *  auto-sync that reads this machine's clipboard while the tab has focus, the
+ *  subscription through which the device writes to it, the toolbar's
+ *  send/get — so none of them can run. Before this, a session the device
+ *  refused clipboard to still READ the controller's clipboard and sent every
+ *  change to the device, which answered each with an error.
+ *
+ *  Returns whether a channel was dropped. */
+export function dropClipboardChannel(channels: Record<string, RTCDataChannel>): boolean {
+  const ch = channels.clipboard
+  if (!ch) return false
+  delete channels.clipboard
+  try {
+    ch.close()
+  } catch {
+    /* already closing */
+  }
+  return true
+}
+
 /** Canonicalize text for HASHING (CRLF / lone CR Ã¢ÂÂ LF). Never applied
  *  to outbound wire text Ã¢ÂÂ see [`sendClipboardWriteOverDc`]. Both
  *  sides of the echo gate hash this canonical form; the agent's
@@ -5101,6 +5139,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>, opts?: { external?: 
   // `rc:session.created.permissions`. `true` until a server says otherwise
   // (pre-P3 servers omit the field = as-requested). Reset on each connect.
   const inputGranted = ref(true)
+  // The same, for CLIPBOARD: `false` = the channel was dropped
+  // (`dropClipboardChannel`) and the view hides its clipboard controls.
+  const clipboardGranted = ref(true)
   // FR-85 P3c — RECORD survives the hub only when this controller may record
   // AND the device's owner opted in. `recordRefused` is the server's reason
   // when it did not (`controller_not_allowed`, `device_not_opted_in`), so the
@@ -7848,6 +7889,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>, opts?: { external?: 
           '[rc] session is VIEW-EFFECTIVE: another session already holds input on this host',
         )
       }
+      clipboardGranted.value = grantAllowsClipboard(perms)
+      if (!clipboardGranted.value && dropClipboardChannel(channels)) {
+        console.info('[rc] no CLIPBOARD in the grant: the clipboard channel is closed')
+      }
       markConnect('session_created')
       // FR-34 — a fresh attempt starts un-locked-known; the agent tells us
       // via rc:consent.pending if the host is locked.
@@ -8494,6 +8539,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>, opts?: { external?: 
     // one that followed it.
     mediaEverFlowed = false
     inputGranted.value = true // until rc:session.created reports otherwise
+    clipboardGranted.value = true // likewise
     // FR-85 P3c — a recording is granted per session, never carried over.
     recordGranted.value = false
     recordRefused.value = null
@@ -12533,6 +12579,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>, opts?: { external?: 
     hasMedia,
     inputChannelOpen,
     inputGranted,
+    clipboardGranted,
     recordGranted,
     recordRefused,
     recording,
