@@ -1,8 +1,9 @@
 # FR-94: Windows Fleet RPC runs as SYSTEM — a machine trust anchor, a doorbell, and an explicit `console_user`
 
-**Issue:** [#2035](https://github.com/gjovanov/roomler-ai/issues/2035) · **Status:** in progress — P0 done (spec
-#2036, wording #2039, measurements #2086); P1–P5 built (§6: #2099, #2105, the P4 PR); next the field cells
-(§10) · **Owner:** fleet (the anchor, the pending store, the claim and result routes), the Windows agent
+**Issue:** [#2035](https://github.com/gjovanov/roomler-ai/issues/2035) · **Status:** done. P0 (spec #2036,
+wording #2039, measurements #2086) and P1–P5 (§6: #2099, #2105, #2110) shipped: server
+`hosted-20261013-c6bcdb2`, agent 0.4.133. AC1–AC8 field-verified on 0.4.133 (§7, §10 rows 7–20). Follow-ups
+#2133 and #2134 · **Owner:** fleet (the anchor, the pending store, the claim and result routes), the Windows agent
 (the service runner) · **Anchors:** §2 master `d31e3c729`; §5 #2099 (`077778aa0`) · **Builds on:**
 [Fleet RPC](../fleet-rpc.md), [roomler SSH account modes](../roomler-ssh.md),
 [FR-43](FR-43-macos-single-enrollment.md) (the supervised-daemon delegation model), #2021
@@ -214,22 +215,27 @@ stateDiagram-v2
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | This spec, the issue and the registry row. The wording PR, so today's identity is said truthfully. The P0 measurements (§10) | docs only | ✅ #2036, #2039, #2086 |
-| P1 | The machine trust anchor. **Server:** `AgentService` credentials bound to an `anchor_id`, `POST /api/agent/anchor` (explicit device), renew, un-anchor. **Agent:** `roomlerd anchor` (elevated) writing the anchor under a hardened dir; the wizard doing the same | no anchor ⇒ today's behaviour | built: server #2099, `roomlerd anchor` #2105 (the wizard writing it: not yet) |
-| P2 | Server: `exec_pending`, the claim and result routes, dispatch writing the row, the claim window, the worker-answer withdrawal, `exec_require_system`, the composition baseline | `rc.exec_via_service = false` ⇒ never routes via the service | built #2099 |
-| P3 | Agent: the service runner, the doorbell, the `exec-system` cap word | `ROOMLERD_EXEC_VIA_SERVICE=0` withdraws the cap word ⇒ the server never routes | built #2105 |
-| P4 | `console_user` for Fleet RPC: policy, UI, audit; the refusal text | the policy defaults to `system`; absent in a PUT keeps it | built: the device #2105, the policy + UI the P4 PR |
-| P5 | `ran_as` everywhere, the device's identity in the UI, docs, field | — | built #2105 + the P4 PR; field owed (§10) |
+| P1 | The machine trust anchor. **Server:** `AgentService` credentials bound to an `anchor_id`, `POST /api/agent/anchor` (explicit device), renew, un-anchor. **Agent:** `roomlerd anchor` (elevated) writing the anchor under a hardened dir; the wizard doing the same | no anchor ⇒ today's behaviour | ✅ server #2099, `roomlerd anchor` #2105; field rows 8, 11, 15, 19. The wizard writing the anchor was **not built**: devices are anchored with `roomlerd anchor` (§9) |
+| P2 | Server: `exec_pending`, the claim and result routes, dispatch writing the row, the claim window, the worker-answer withdrawal, `exec_require_system`, the composition baseline | `rc.exec_via_service = false` ⇒ never routes via the service | ✅ #2099; field rows 9, 17–19 |
+| P3 | Agent: the service runner, the doorbell, the `exec-system` cap word | `ROOMLERD_EXEC_VIA_SERVICE=0` withdraws the cap word ⇒ the server never routes | ✅ #2105, in 0.4.133; field rows 8, 12, 15 |
+| P4 | `console_user` for Fleet RPC: policy, UI, audit; the refusal text | the policy defaults to `system`; absent in a PUT keeps it | ✅ the device #2105, the policy + UI #2110; field rows 10, 13, 20; the refusal's wording #2135 (0.4.135) |
+| P5 | `ran_as` everywhere, the device's identity in the UI, docs, field | — | ✅ #2105 + #2110 + #2135; field rows 7–20 |
 
 ## 7. Acceptance criteria
 
-- [ ] **AC1:** on an anchored attended Windows device with an admin signed in, `roomler exec <dev> -- whoami`
+- [x] **AC1:** on an anchored attended Windows device with an admin signed in, `roomler exec <dev> -- whoami`
   runs as `NT AUTHORITY\SYSTEM` in session 0, at System integrity. The negative control comes first: the
   same device unanchored runs as the signed-in user, session 1, High.
-- [ ] **AC2:** the same on an attended install with a **standard** user signed in, if P0 (a) shows such an
+  *(§10 rows 7–8, 0.4.133 on prod: `VMTEST-WIN\vmtest session=1 High` unanchored, then
+  `NT AUTHORITY\SYSTEM session=0 System` anchored.)*
+- [x] **AC2:** the same on an attended install with a **standard** user signed in, if P0 (a) shows such an
   install runs at all.
-- [ ] **AC3:** a SystemContext-mode device runs exec as SYSTEM through the service too, so the identity is
+  *(It does, once that user enrolls: rows 4–5. Rows 14–15: `VMTEST-WIN\stduser session=1 Medium`
+  unanchored, then `NT AUTHORITY\SYSTEM session=0 System` anchored.)*
+- [x] **AC3:** a SystemContext-mode device runs exec as SYSTEM through the service too, so the identity is
   the same on every install type.
-- [ ] **AC4 (the invariant, on a standard-user vmtest VM):**
+  *(Row 12: `SYSTEM session=1` through the worker, then `SYSTEM session=0` through the service.)*
+- [x] **AC4 (the invariant, on a standard-user vmtest VM):**
   - (i) a user process ringing the doorbell with a forged or stale request id runs nothing, and the
     refusal is audited;
   - (ii) pointing the user's `%APPDATA%` config at another server or token changes nothing the service
@@ -237,17 +243,58 @@ stateDiagram-v2
   - (iii) a genuine request for **another** device, the tester's own tenant included, is refused at the
     claim;
   - (iv) no SYSTEM output reaches any local process.
-- [ ] **AC5:** a claim is single-use, bound to its device, and expires no later than the exec deadline. A
+
+  *(i) row 17 on the standard user's device (row 9 for an admin's process): no run, audited
+  `claim_refused`. (ii) row 18: the user's config pointed at another server with another token; the
+  service still claimed at roomler.ai with the anchor's credential, and the next command ran as SYSTEM.
+  (iii) `exec_runs_through_the_service_and_the_claim_is_single_use` (`crates/tests/src/exec_service_tests.rs`):
+  another anchored device's service **in the same org** gets a 404 for a genuine pending request, and the
+  refusal is audited `claim_refused`. The control is that this device's own service then claims the same id.
+  The claim matches the request id against the credential's own device and org, so another org's
+  credential is refused the same way. (iv) The doorbell's reply holds `claimed` and `error` only, never
+  output (`the_doorbell_wire_is_locked`, `agents/roomlerd/src/exec_service.rs`). Every field reply in
+  rows 9, 17 and 18 had that shape. The output goes from the service to the server.)*
+- [x] **AC5:** a claim is single-use, bound to its device, and expires no later than the exec deadline. A
   claim and a result that land on the **other** pod still complete (an integration test with two servers,
   then prod).
-- [ ] **AC6:** with `console_user`, an exec runs as the signed-in user through the service, on an attended
+  *(Tests, `crates/tests/src/exec_service_tests.rs`:*
+  - *`exec_runs_through_the_service_and_the_claim_is_single_use`: a second claim is a 404; another
+    device's service gets a 404; the claim window is consent + 10 s, not the caller's deadline.*
+  - *`a_withdrawn_or_expired_command_cannot_be_claimed`: a withdrawn row and a row past `claim_by` are
+    404s.*
+  - *`a_claim_and_result_on_the_other_pod_still_reach_the_caller`: two servers;
+    `delivered_here=false`; the caller resolves through the shared row.*
+
+  *Prod: row 19. Three commands dispatched on the org's pod were claimed and answered on the other pod,
+  and every caller resolved within the row poll. Rows 9, 17 and 18 are the field's 404s for ids pending
+  nowhere.)*
+- [x] **AC6:** with `console_user`, an exec runs as the signed-in user through the service, on an attended
   install and in SystemContext mode, audited `run_as = console_user`. With nobody signed in it is refused,
   naming why.
-- [ ] **AC7:** every `exec_audit` row records `ran_as`. The admin UI shows each Windows device's exec
+  *(Attended: row 10, `VMTEST-WIN\vmtest session=1 Medium`. SystemContext: row 20, the same identity,
+  although that worker is SYSTEM. Nobody signed in: row 13, refused before anything ran, with the reason.
+  The wording fix (#2135) ships with 0.4.135; 0.4.134 was cut before it merged.)*
+- [x] **AC7:** every `exec_audit` row records `ran_as`. The admin UI shows each Windows device's exec
   identity. An unanchored device keeps working and reports `worker`.
-- [ ] **AC8:** docs updated with mermaid diagrams (`docs/fleet-rpc.md`: the anchor, the
+  *(Row 16 for the UI, on prod. `ran_as` is in every audited run of rows 7–20:*
+  - *`worker` unanchored: rows 7, 11, 12, 14 and 20;*
+  - *`system`: rows 8, 12, 15, 18, 19 and 20;*
+  - *`console_user`: rows 10 and 20.*
+
+  *A refused claim records none, because nothing ran. The audit records the server's routing decision.
+  The HTTP result carries only the device's claim, and a worker makes none (row 20,
+  `docs/fleet-rpc.md`).)*
+- [x] **AC8:** docs updated with mermaid diagrams (`docs/fleet-rpc.md`: the anchor, the
   doorbell → claim → run → result sequence, the identity per install type) and linked from
   `docs/README.md`. CLAUDE.md's Fleet RPC line and the CLI and UI copy name the identity per mode.
+  *(`docs/fleet-rpc.md` § Privilege holds:*
+  - *the identity per install type (a table);*
+  - *the SYSTEM path's sequence diagram (#2105);*
+  - *the anchor's lifecycle as a state diagram, with what each event does to the credential;*
+  - *the whole routing decision as a flowchart (#2135).*
+
+  *The row is in `docs/README.md`. CLAUDE.md's Fleet RPC line, the `roomler exec` help and the policy
+  dialog name the identity per mode (#2105, #2110; the dialog's text is in row 16).)*
 
 ## 8. Open decisions
 
@@ -277,6 +324,11 @@ D1', the doorbell, and `exec_require_system` default off.
 - Hardware-bound anchors (TPM).
 - Changing the four gates or the audit model.
 - Platforms other than Windows.
+- **The wizard writing the anchor** (the second half of P1, not built). Re-running the unified wizard
+  elevated could anchor the device in the same step. Until then an administrator runs
+  `roomlerd anchor create` on it (`docs/fleet-rpc.md` § Anchoring a device), as every cell in §10 did.
+- **SSH through the service** (decision 5). Roomler SSH's `daemon` mode is still the worker. It is its
+  own FR.
 
 ## 10. P0 measurements (planned) and the field-verification log
 
@@ -300,6 +352,26 @@ Field-verification log:
 | 4 | **(a): a signed-in user without their own enrollment** | the same guest; a local **standard** account (Users only) made the autologon user, then a reboot | The supervisor spawned the worker with `elevated=false` (no linked admin token). It exited with **code 1 within ~0.5 s, every time**, backing off from 2 s to 60 s (ten failures logged). Run by hand as that user, its error was: "no config found at `C:\Users\<user>\AppData\Roaming\roomler\roomler\config\config.toml`. Run `roomlerd enroll` first." On an attended install the device belongs to the user who enrolled. **Any** other user, admin or not, gets a crash-looping worker and an offline device until they enroll |
 | 5 | **(a): the standard user, enrolled** | the same guest, after a per-user enrollment with a standard token (`FreshPrimary`) | The next respawn ran (`elevated=false`), and the device came online (`server connected`). **Exec ran as the standard user, in session 1, at Medium integrity**: no admin rights. **The overlay is down**: `WintunCreateAdapter failed` (attempts 2–4), then `TUN bring-up failed; aborting runtime`, although a lease had arrived (`self_v4` assigned). `overlay_mode` stays `tun` (no netstack fallback), and no Wintun adapter exists. **Self-update:** `--check-only` works ("Up to date (current: 0.4.131, latest: agent-v0.4.131)"). The install step was **not exercised**, because no newer release existed. By the code (master `700822c2b`), a perMachine update goes `spawn_installer_inner` (`updater.rs` L1739, L1758) → `spawn_installer_as_flavour` (L1823) → `spawn_installer_for_flavour_with_properties` (L1950) → `spawn_msiexec_elevated` (L1978; defined L2346, `ShellExecuteExW` verb `runas`). For a Medium-integrity standard user that is a UAC **credentials** prompt that nobody can answer unattended, and the function returns an error when it is declined or there is no session to show it (L2341) |
 | 6 | **(a): one machine, two device rows** | the same guest | The admin's ephemeral enrollment (`machine_id` `6dc61705…`) and the standard user's (`4be009b4…`) are **two device rows with different `machine_id`s** for one physical machine. Whether the per-user derivation or the ephemeral flag makes the difference was not isolated. Both rows were deleted afterwards |
+| 7 | **AC1 RED: attended, NOT anchored** | vmtest `win11/installer/attended`, 0.4.133, 2026-10-13 15:31Z, prod `hosted-20261013-c6bcdb2` | The device (0.4.133) advertised no `exec-system`, and the server recorded no anchor. With the four gates open (`exec_enabled` set as the person, in session 1), an exec of the identity probe through `POST …/agent/{id}/exec` printed `VMTEST-WIN\vmtest session=1 integrity=High`, the #2021 behaviour. Audit `ran_as=worker` |
+| 8 | **AC1 GREEN: the same device, anchored** | the same guest, 15:32Z | `roomlerd anchor create --server https://roomler.ai --token <file> --device <id> --force` from the guest's elevated session (`--force`: vmtest names its devices apart from the host). The token was read from a file deleted before the call, and removed on mars too. `anchor status` showed the device, server, org, `exec: on` and the credential's expiry, never the credential. **Within 75 s, with no restart**, the device advertised `exec-system` and the row recorded the anchor. The same probe then printed **`NT AUTHORITY\SYSTEM session=0 integrity=System`**, with `ran_as=system` from the device and in the audit |
+| 9 | **AC4 (i): a forged ring** | the same guest, 15:33Z | A user process in session 1 (an interactive task as `vmtest`, not the worker) opened the doorbell with read + write-data access and rang with a made-up request id. Its answer: `{"claimed":false,"error":"the server has no such command pending for this device"}`. Nothing ran. The server audited `source=service-claim denied=claim_refused`, with no command and no user |
+| 10 | **AC6: `console_user`** | the same guest, 15:33Z | With the policy at `run_as: console_user`, the same probe printed `VMTEST-WIN\vmtest session=1 integrity=Medium`: the person's own token through the service, not the worker's elevated one (row 7). `ran_as=console_user` from the device and in the audit. The policy was set back to `system` after |
+| 11 | **Revocation** | the same guest, 15:34Z | `DELETE …/exec-anchor` answered `was_anchored: true`. The device still advertised `exec-system` (its anchor file stayed), yet the next command went to the worker (`vmtest`, session 1, High, `ran_as=worker`), **because routing needs both halves**. The service's next ring was refused: "this device's SYSTEM service credential is no longer accepted (re-anchored or un-anchored); anchor it again" |
+| 12 | **AC3: SystemContext, red → green** | vmtest `win11/installer/system`, 0.4.133, 15:43Z | **Unanchored:** the probe printed `NT AUTHORITY\SYSTEM session=1 integrity=System`. The worker is SYSTEM in the console session, so `ran_as=worker`. **Anchored** the same way as row 8: `exec-system` advertised within 75 s, and the probe printed **`NT AUTHORITY\SYSTEM session=0 integrity=System`**, `ran_as=system`. SystemContext and attended installs now run a command as the same identity in the same session |
+| 13 | **AC6: `console_user` with nobody signed in** | the same SystemContext guest, 15:46Z | Policy `console_user`, then `logoff` of the person's session. The console became session 2 with no user, and the device stayed online and anchored (a SystemContext worker runs at the sign-in screen). The command was **refused before anything ran**: "console session 2 has no user token (nobody has signed in since boot); nothing to run as". It did not fall back to SYSTEM. ("Since boot" is wrong after a sign-out. #2135 changes it to "nobody is signed in at the console", in `exec.rs`'s `win_console` and in the SSH twin in `pty/windows.rs`. It ships with 0.4.135.) An attended install with nobody signed in has no worker, so it is offline (row 3), and the question does not arise |
+| 14 | **AC2 RED: a STANDARD user's attended device** | vmtest `win11/installer/attended` plus #2086's standard-user steps, 0.4.133, 20:23Z | A local standard account (`stduser`) was made the autologon user, the guest was rebooted, and the account enrolled its own device (`FreshPrimary`, a per-user config). The enrollment ran at Medium integrity, and the token file was read once and deleted. **Unanchored:** the probe printed `VMTEST-WIN\stduser session=1 integrity=Medium`, no admin rights at all (#2086 row 5), `ran_as=worker` |
+| 15 | **AC2 GREEN: the same device, anchored** | the same guest, 20:25Z | Anchored from the `vmtest` admin's elevated session (`--device` naming `stduser`'s row: §5c P1). Within 75 s **the standard user's Medium-integrity worker advertised `exec-system`**. The probe printed **`NT AUTHORITY\SYSTEM session=0 integrity=System`**, `ran_as=system`. The device type FR-94 was mainly for now has admin rights for diagnosis |
+| 16 | **AC7: the admin UI, on prod** | a private Playwright run on mars as the vmtest admin, prod `hosted-20261013-c6bcdb2`, 20:28Z | On the anchored device of row 15, the execution policy dialog read "Anchored 10/13/2026: commands run as SYSTEM through this device's service", with **Un-anchor** shown. Settings showed the "Windows: require SYSTEM" switch. The API listed the device with `exec_anchor` present. Every row above recorded `ran_as` (`worker`, `system`, `console_user`) |
+| 17 | **AC4 (i) on a STANDARD user's device** | a fresh vmtest `win11/installer/attended` guest; `stduser` signed in and enrolled as in row 14, then anchored from the admin's elevated session as in row 15; 0.4.133, 20:46Z | `stduser`'s own process (session 1, Medium integrity, not the worker) opened the doorbell and rang with a made-up request id. The answer was `{"claimed":false,"error":"the server has no such command pending for this device"}`. Nothing ran. The server audited `source=service-claim denied=claim_refused` at 20:46:26Z, with no command and no user. Row 9 is the same refusal for an admin's process |
+| 18 | **AC4 (ii): the user rewrites their own config** | the same guest, 20:46Z | As `stduser`, their per-user `config.toml` was rewritten: `server_url` `https://roomler.ai` → `https://attacker.invalid`, and `agent_token` replaced. A second forged ring got the same answer, and the server audited a second `claim_refused` at 20:46:36Z. So the service had claimed **at roomler.ai, with the anchor's own credential**: a claim sent to the user's server would have failed to connect, and the server would have audited nothing. Three seconds later the server's own command still ran as **`NT AUTHORITY\SYSTEM session=0 integrity=System`**, `ran_as=system` (20:46:39Z). Nothing the user wrote changed what the service did |
+| 19 | **AC5 in prod: claim and result on the OTHER pod** | a fresh vmtest `win11/installer/attended` guest, 0.4.133; prod `hosted-20261013-c6bcdb2`, two pods; 21:10Z | **Why it needed staging.** In steady state every leg reaches the org's pod: the service adds `?tid=` to its calls, and the front proxy pins the org's REST calls and sockets on the same key. Rows 8–18 were all served by one pod, and the other pod logged nothing for those devices. **The staging.** This device was anchored at a **loopback origin**, `http://127.0.0.1:18080` (the anchor accepts loopback for tests). An SSH remote forward carried it to a `kubectl port-forward` of the pod that did **not** hold the org. **The run.** Three commands went through the public front proxy. Each dispatch, and the caller waiting on it, was on the org's pod (A). Each claim and result was on the other (B), where no caller waits (`delivered_here=false`). Pod A's caller resolved **0.22 s, 0.33 s and 0.31 s** after each result landed on B, within the 400 ms row poll. Every command ran as `NT AUTHORITY\SYSTEM session=0`, `ran_as=system`. Pod B's log shows the three claims (HTTP 200, "SYSTEM service claimed a command") and the three results (200); pod A's shows the three `exec` calls (200, 1.2–1.6 s) |
+| 20 | **AC6: `console_user` on SystemContext, the person signed in** | a fresh vmtest `win11/installer/system` guest, 0.4.133, 21:11–21:12Z | AC3 again first. Unanchored: `NT AUTHORITY\SYSTEM session=1 integrity=System`, audited `ran_as=worker`. The HTTP result carried no `ran_as`, because only the service makes that claim; the audit's value is the server's decision. Anchored: `NT AUTHORITY\SYSTEM session=0 integrity=System`, `ran_as=system`. Then the policy was set to `run_as: console_user` while `vmtest` was signed in at the console (session 1, Active). The command ran as **`VMTEST-WIN\vmtest session=1 integrity=Medium`**, audited `ran_as=console_user`. A SystemContext worker is SYSTEM, so this identity can only have come from the service's `WTSQueryUserToken`. The policy was set back to `system` |
+
+Cleanup after the cells: the org's `remote_exec_enabled` was set back to `false` after each cell, every device row the cells made was deleted, and every VM was destroyed by name. Row 19's tunnel and port-forward ended with its script.
+
+**Found during the field verification.**
+- **Removing a device suspends its anchor.** Re-enrolling the same machine revives the row in place, `exec_anchor` included, so its old service credential works again. The anchor's return is by the code. The row's revival was seen: the standard account's device came back under the **same agent id** after each removal (rows 5, 14 and 17). `machine_id` hashes the host name, OS, architecture and config path, and the cloned guests share the host name, so one account got one id on each. Documented in `docs/fleet-rpc.md` § Anchoring a device. The fix (end the anchor at removal) is #2133.
+- **The agent token expires a year after enrollment, and nothing renews it.** This predates FR-94 and is outside it; the service credential FR-94 added does renew itself. Filed as #2134.
 
 ## 11. Related
 
