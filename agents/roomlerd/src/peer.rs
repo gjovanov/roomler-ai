@@ -4997,9 +4997,10 @@ const MEDIA_WAITING_HINT_UNLOCK: &str = "This computer's screen is locked. GNOME
      uinput can show and unlock a locked screen.";
 
 /// FR-93 P2d-2 — the hook a pump hands its capture open
-/// ([`crate::capture::open_default_async`]): if the open parks on a request for
-/// the person at the screen, tell the controller, retrying until the control
-/// channel takes it. `ROOMLERD_MEDIA_WAITING=0` turns the notice off.
+/// ([`crate::capture::open_default_async`]): if the open parks on the person at
+/// the screen (a portal dialog, or P5b's locked screen), tell the controller,
+/// retrying until the control channel takes it. `ROOMLERD_MEDIA_WAITING=0`
+/// turns the notice off.
 ///
 /// The hook fires on the blocking pool, so it holds the runtime's handle
 /// rather than relying on a context that thread may not have entered.
@@ -5027,14 +5028,14 @@ fn media_waiting_hook(
             "capture: waiting for the person at the screen (a portal dialog, or an unlock); telling the controller"
         );
         runtime.spawn(async move {
-            // Bounded by the dialog's own deadline too: past it, the notice
+            // Bounded by the wait's own deadline too: past it, the notice
             // would describe a wait that is already over.
             let deadline = DEADLINE.min(wait.gives_up_in);
             if !send_control_notice(&control_dc, &payload, RETRY_EVERY, deadline, SEND_BUDGET).await
             {
                 warn!(
                     %session_id,
-                    "media-waiting notice never reached the controller before the dialog's deadline"
+                    "media-waiting notice never reached the controller within its deadline"
                 );
             }
         });

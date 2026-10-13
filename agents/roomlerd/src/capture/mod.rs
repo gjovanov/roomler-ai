@@ -1802,9 +1802,10 @@ impl Drop for SetOnDrop {
     }
 }
 
-/// FR-93 P2d-2 — the portal broker's word that the open on this thread has
-/// parked on a request for the person at the screen. Fires that open's hook,
-/// once. A thread with no hook (the recorder, a probe, a test) does nothing.
+/// FR-93 P2d-2 — the word that the open on this thread has parked on the
+/// person at the screen: the portal broker's request, or (P5b) GNOME's lock
+/// screen. Fires that open's hook, once. A thread with no hook (the recorder,
+/// a probe, a test) does nothing.
 #[cfg(target_os = "linux")]
 #[cfg_attr(not(feature = "portal-capture"), allow(dead_code))]
 pub(crate) fn tell_open_waiting(wait: OpenWait) {
