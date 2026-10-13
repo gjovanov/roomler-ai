@@ -622,15 +622,17 @@ New cells run three times before they are trusted. An entry in `expected-failure
   automatic portal (P2d-3) asked once, the harness answered, and the picture came in the session that waited
   (step log 53); on the release 0.4.132 the restore token brought the picture back in 4 s with no dialog
   (step log 60).
-- [ ] **AC4** — input reaches a **native** Wayland client (the probe log): pointer within ±2 px at three points,
+- [x] **AC4** — input reaches a **native** Wayland client (the probe log): pointer within ±2 px at three points,
   click, scroll sign, typed ASCII, a held modifier — on GNOME (both install types) and KDE.
-  ⏳ System installs, with `drm_capture` + `uinput` (FR-36's arms, opt-in there by D1): ✅ GNOME, `points` 8/8
+  ✅ **Complete on released builds for every install** (step log 63). KDE per-user on the released 0.4.133: all 8
+  checks, the input through the RemoteDesktop session the automatic portal reopened from its restore token. The
+  earlier cells, below, cover the rest. System installs, with `drm_capture` + `uinput` (FR-36's arms, opt-in there by D1): ✅ GNOME, `points` 8/8
   on 0.4.125 and again on the release 0.4.128 (step logs 16, 31); ✅ KDE, 8/8 on the release 0.4.126 (step log
   23). GNOME per-user: ✅ in the lab on P4a (`3f9ad6464`), all 7 checks, 🔴 first on 0.4.131 (0 events), and ✅
   again on the released 0.4.132, all 7 checks (step log 60). KDE per-user: ✅ in the lab on P4b (`9a8e20699`,
   then `64f00509f`), all 7 checks three times, through the remote control the automatic portal asks for; 🔴
   first on the release (0 events through KWin's gate, `remote-control.md`), and on P4b's first candidate
-  (`helo 123A`, calls unawaited). Owed: KDE per-user on a released build (P4b rides the release after 0.4.132).
+  (`helo 123A`, calls unawaited); ✅ on the released 0.4.133 (step log 63).
 - [ ] **AC5** — the remote cursor is visible in the viewer on DRM and mutter/portal sessions.
   ⏳ DRM: ✅ in the lab on P3c (`dbf514a3f`), the GNOME 50 and Plasma 6.7.5 system installs. The person at the
   screen moved the pointer over QMP and the viewer's overlay followed it to both targets (AC5's `cursor` plan);
@@ -720,6 +722,7 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-13 | `wlab-gnome` (per-user), `wlab-gnome-sys`, `wlab-kde` (per-user) | 0.4.132, the release | the release in the lab: each guest's update path, then AC4 on GNOME per-user, a session to the no-key system guest, and the automatic portal on KDE | GNOME per-user: the 0.4.131 updater verified the `.asc`, then could not install a `.deb` as uid 1000 (no pkexec, no passwordless sudo; FR-96 P1's root helper starts with 0.4.132), so the verified package went in by hand; ✅ the AC4 oracle 7/7 on the released build. GNOME system: ✅ its own updater, `SucceededVerified`, the live daemon on 0.4.132 within seconds; a session refuses with `wayland_not_enabled` and the admin's fix. KDE per-user (a tarball install, #2046), by hand after gpg reported a good signature: ✅ the screen share restored from its token, the picture at +4 s, no dialog, view-only, since P4b is not in 0.4.132. Step log 60 |
 | 2026-10-13 | `wlab-gnome` (per-user, no key) | 0.4.132, the release | AC1: the viewer decodes the probe's block code from the frame every 250 ms for 30 s; each counter is dated by the probe's own tick log, on mars's clock with the guest's offset measured over the lab's ssh | The first run decoded nothing: the probe window was blank. The guest lacked `python3-gi-cairo` (it predates that bake line), so every draw raised a TypeError while the tick log ran on, and its probe predated the startup guard that refuses to start without the package. ✅ With it installed (and the probe updated afterwards): 112 of 112 frames decoded, 112 distinct counters, the counter shown 0.42–0.68 s old (median 0.54 s), clock uncertainty ±0.43 s. Step log 61 |
 | 2026-10-13 | `wlab-gnome-sys`, `wlab-kde-sys` (system, `drm_capture` + `uinput`) | 0.4.132, then P3c `dbf514a3f` (built before a rebase, the same changes) | P3c / AC5: the person at the screen (QMP) moves the pointer to two targets, and the viewer oracle's `cursor` plan reads where the viewer draws it | 🔴 0.4.132 (GNOME): no overlay at either target, and no arrow in the DRM stream. ✅ P3c: the overlay at (0.295, 0.592) / (0.695, 0.592) on GNOME and at (0.299, 0.597) / (0.699, 0.597) on KWin, for targets (0.3, 0.6) / (0.7, 0.6). The worker logged `planes=2 cursor_planes=1 atomic=true hotspot=true` on both. ✅ `ROOMLERD_DRM_CURSOR=0`: no overlay again, and "the cursor plane is not read". Step log 62 |
+| 2026-10-13 | `wlab-kde` (per-user, no capture key) | 0.4.133, the release (the tarball by hand, #2046; gpg a good signature) | AC4: the lab's input oracle (`points`) on a released build with P4b | ✅ All 8 checks: the picture, three points exact, the click, the wheel notch down, "hello 123", Shift+a as "A". The automatic portal reopened its RemoteDesktop session from the restore token, KDE's scroll correction engaged, and the input went through the portal. AC4 ticked. Step log 63 |
 
 ## 12. Related
 
