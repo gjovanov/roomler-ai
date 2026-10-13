@@ -47,7 +47,7 @@ the field is still on the old segment, silently, at the next update:
 |---|---|---|
 | `OLD_APP = "roomler-agent"` | `crates/agent-core/src/appdirs.rs:40` | a pre-rename host's enrolled `config.toml` is orphaned — the device drops off the mesh and re-enrolls as a stranger |
 | `LEGACY_SERVICE_NAME = "RoomlerAgentService"` | `agents/roomlerd/src/win_service/mod.rs:63` | the takeover install cannot find the running service to retire; two services, or none |
-| `LEGACY_TASK_NAME = "RoomlerAgent"` | `agents/roomlerd/src/service.rs:153` | the pre-rename scheduled task survives forever → two daemons |
+| `LEGACY_TASK_NAME = "RoomlerAgent"` | `agents/roomlerd/src/service.rs:164` | the pre-rename scheduled task survives forever → two daemons |
 | legacy log prefix `roomler-agent.log` | `crates/agent-core/src/logging.rs:245,312,440`; `agents/roomlerd/src/logs_fetch.rs:56` | `rc:logs-fetch` returns "no log file" on an upgraded host that has not rolled yet |
 | `LEGACY_INSTALL_FOLDER_NAME = "roomler-agent"` | `agents/roomlerd/src/updater.rs:369` | the vacated install dir is never swept |
 | `%h/.config/roomler-agent` in `ReadWritePaths` | `agents/roomlerd/packaging/linux/roomler.service:44` | systemd denies the daemon its own legacy tree mid-migration |
