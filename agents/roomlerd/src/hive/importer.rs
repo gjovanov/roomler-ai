@@ -377,7 +377,7 @@ pub(crate) async fn import(
             }
             #[cfg(windows)]
             {
-                let _ = who;
+                let _ = (who, req);
                 Err("nothing is adopted on Windows".into())
             }
         }

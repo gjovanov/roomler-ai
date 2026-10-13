@@ -143,7 +143,9 @@ pub(crate) fn compose_fork(
 /// person approves every tool call that is not a read; where its earlier
 /// turns worked, when the device kept that and it was another folder; that
 /// the terminal's settings and the folder's memory stayed behind; and the
-/// last tool call the store holds no result for (`open_call`).
+/// last tool call the store holds no result for (`open_call`). Unix only, as
+/// adopting is: a Windows build composes none.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn compose_terminal(
     terminal_folder: Option<&str>,
     folder: &Path,
