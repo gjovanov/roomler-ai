@@ -104,6 +104,9 @@ pub mod person_socket;
 pub mod pgp_verify;
 pub mod post_install;
 pub mod preflight;
+/// FR-99 P1b — privacy mode: the owner's gate, the `privacy-*` words, and the
+/// session's `privacy` channel that puts the overlay's curtain up.
+pub mod privacy;
 /// FR-16 L4 — `roomlerd probe-target`: a corner window whose marker changes
 /// on real pointer moves, so a bench viewer times input to photon on a
 /// release build. The layout is pure and tested everywhere; the window is

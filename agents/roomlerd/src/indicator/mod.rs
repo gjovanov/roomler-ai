@@ -232,6 +232,23 @@ impl ViewerIndicator {
         }
     }
 
+    /// FR-99 — put `session_id`'s privacy curtain up (`on`) or take it down.
+    /// `true` only when the curtain is UP and out of every capture path; the
+    /// overlay checks the affinity after setting it rather than trusting the
+    /// call. Blocks until the overlay has answered (at most about two
+    /// seconds), so callers stay off the runtime's threads. A session the
+    /// overlay does not carry gets no curtain, and its end
+    /// ([`Self::hide_session`]) always takes the curtain down.
+    pub fn set_privacy(
+        &self,
+        session_id: bson::oid::ObjectId,
+        on: bool,
+        controller_name: &str,
+    ) -> bool {
+        self.inner
+            .set_privacy(&session_id.to_hex(), on, controller_name)
+    }
+
     /// Announce that a session has ended. When the last session drops,
     /// the overlay is hidden.
     ///
@@ -392,6 +409,11 @@ impl Inner {
     fn hide(&self, _session_id: String) {}
     /// No native banner outside Windows: the companion's is the surface.
     fn set_recording(&self, _session_id: &str, _recording: bool) -> bool {
+        false
+    }
+    /// FR-99 — no curtain outside Windows: macOS has no public way to keep
+    /// a window out of capture, and X11 / Wayland are out of scope.
+    fn set_privacy(&self, _session_id: &str, _on: bool, _controller_name: &str) -> bool {
         false
     }
     /// `false` here is what routes the caller to the companion — never a

@@ -280,6 +280,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // FR-92 — on by default (operator decision 2026-10-10); the owner
         // turns it off.
         keep_busy_enabled: true,
+        // FR-99 — off until the device's owner allows it.
+        privacy_mode_allowed: false,
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,

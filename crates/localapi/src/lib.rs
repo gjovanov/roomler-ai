@@ -2799,6 +2799,18 @@ where
                             .into(),
                     }
                 }
+                // FR-99 — and whether a controller may cover this console's
+                // screen: it is the console person who would sit in front of
+                // the curtain. Equality.
+                Ok(Request::ConfigSet { key, .. })
+                    if key == "privacy_mode_allowed" && !peer.is_console_user() =>
+                {
+                    Response::Error {
+                        message: "only the person at this device's console can change \
+                              whether privacy mode is allowed here"
+                            .into(),
+                    }
+                }
                 Ok(Request::ConfigSet { key, value }) => {
                     state.config_set(&key, value.as_deref()).await
                 }

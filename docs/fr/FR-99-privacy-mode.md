@@ -54,6 +54,31 @@ session:
 screen, UAC, Ctrl+Alt+Del), the person sees that screen, which shows no user content, and SystemContext
 keeps streaming it. Documented, not fought.
 
+**As built, P1b (2026-10-14).** The curtain lives in the overlay that already draws the "being viewed" border,
+badge and consent panel (`agents/roomlerd/src/indicator/win.rs`), on its pump thread:
+
+- **One window over the whole virtual desktop**, not one per monitor, with the notice painted centred on each
+  monitor. One window keeps a single z-order to defend and a single affinity to verify. Monitors are
+  enumerated without the paint DC, whose clip would shrink them to the update region and move the text on a
+  partial repaint. It refits on `WM_DISPLAYCHANGE` and on the slow timer.
+- **The capture exclusion is set before the window is shown and read back after.** A curtain the capture
+  could see would hide the desktop from the controller too, so an affinity that does not read back
+  `WDA_EXCLUDEFROMCAPTURE` destroys the window and the request is refused (`no_curtain`).
+- **Z-order:** every fourth pump tick (≈ 0.5 s) the curtain re-takes the top, then the border, the badge and
+  the consent panel go back above it. The badge's Disconnect is the person's way out while only the curtain
+  is up, and a consent question must never sit behind it. This replaces the `WM_WINDOWPOSCHANGING` idea:
+  another application raising itself sends the curtain no message at all.
+- `set_privacy` waits up to 2 s for the pump to say the curtain is up, and treats no answer as no curtain. A
+  session's end (`hide_session`) always takes its curtain down, whatever its channel managed to say first.
+- **The notice** says who is connected, that privacy mode is on, and, while there is no input block, how to
+  end the session: "move the pointer to the top edge of the screen and choose Disconnect". P2 changes the
+  last line to decision 4's "Press Ctrl+Alt+Del to take this computer back". English only for now.
+
+⚠️ **The curtain hides the screen; it does not stop a person at the keyboard.** It must be click-through, or
+the controller's injected clicks would land on it, so the person's own mouse passes through too. The shell
+draws the Start menu, notifications and Alt+Tab's thumbnails above every topmost window, so those show over
+it. Blocking local input is P2.
+
 ### 3b. Blocking local input, without hooks
 
 FR-92's ban rules out `SetWindowsHookEx`. The block uses **`BlockInput(TRUE)`** instead (Microsoft Learn,
@@ -132,13 +157,43 @@ words, and no viewer asks.
   words (P1b) and before a viewer asks for `PRIVACY` (P1c): an older server cannot parse a request carrying
   the name, and an older agent fails the whole frame. The delegate crossing (`DelegateFrame::SessionParams`,
   service → worker) is the same wire inside one install, so P1b keeps both ends on one version or strips the
-  bit at the crossing.
+  bit at the crossing. *(P1b: moot. That delegation is macOS-only (FR-43), and a Mac never advertises the
+  privacy words, so the hub never sends it `PRIVACY`.)*
 
 Tests: `privacy_is_granted_only_off_break_glass_on_a_serving_device`,
 `privacy_support_reads_the_rpc_words_by_equality` and `the_hub_strips_privacy_before_the_agent_can_see_it`
 (`hub.rs`); `privacy_available_does_not_imply_privacy_mode` (`models.rs`); the storage-rule tests in
 `permissions.rs`; and `crates/tests/src/privacy_gate_tests.rs`, four cells through real servers, each reading
 the raw `rc:request` the agent received.
+
+**As built, P1b (the device's half, 2026-10-14).**
+
+| Piece | Where | What it does |
+|---|---|---|
+| `privacy_mode_allowed` | `crates/agent-core/src/config.rs`, `config_surface.rs` | The owner's switch, default off, live. Absent from `DesiredConfig` (named in `the_device_owned_refusals_are_not_pushable`, which also refuses any `privacy_*` key). Over the LocalAPI only the console person may set it (`crates/localapi/src/lib.rs`), as for keep busy: it is their screen |
+| The words | `agents/roomlerd/src/privacy.rs` (`current_words`), appended in `signaling::stub_caps` | `privacy-available` where a curtain is possible here (Windows 10 2004+, i.e. build ≥ 19041, in a build whose overlay came up); `privacy-mode` only while the owner allows it too. Never in the memoized `detect()`, for the record words' reason; the heartbeat re-announces a change, so an OFF stops the next grant at the hub |
+| The consent line | `signaling.rs`, the remote-control prompt's `detail` | "They may also cover this screen while they work." on every surface, and only when the grant holds `PRIVACY` and this device could act on it |
+| The `privacy` channel | `privacy.rs` (`attach`, `attach_refusing`), routed in `peer.rs` beside `record` | Controller → `rc:privacy.set {id, on}` / `rc:privacy.status {id}`; device → `rc:privacy.state {id, on, reason?}` |
+| `curtain-smoke` | `roomlerd curtain-smoke [--seconds N]` | Puts a curtain up through the production overlay and prints `possible=… up=…`: the field check that needs no server and no viewer |
+
+The device decides again at every "on", in its own words:
+
+| # | Gate | Refusal |
+|---|---|---|
+| 1 | The session's grant holds `PRIVACY` (when the channel opens) | `not_granted` |
+| 2 | The owner's `privacy_mode_allowed`, read now (survives a compromised server) | `disabled_on_device` |
+| 3 | A curtain is possible here | `unavailable` |
+| 4 | The overlay put it up, verified out of capture | `no_curtain` |
+
+Turning it off is never refused. The curtain also comes down when the session ends (the channel closes, or the
+overlay drops the session) and when the owner switches the gate off, which the viewer is told unasked
+(`disabled_on_device`).
+
+Tests: `privacy::tests` (the gates, on/off, the owner's OFF, the end, the words, the consent line, the wire),
+also run on the Windows build where a curtain can be possible; `tests/privacy_dc.rs`, the production handlers
+over a loopback PeerConnection pair with a recorder for the overlay (named in CI's recorder step); and CI's
+Windows clippy job now compiles `viewer-indicator`, which no PR lane had built. **Negative control:** with
+gate 2 disabled, `the_owner_gate_refuses_before_the_overlay_is_asked` fails.
 
 ### 3d. Other platforms
 
@@ -177,7 +232,7 @@ says muting the host silences the client too. The FR ships only the honest versi
 | P0 | This spec and the claim. The feasibility probes: `BlockInput` (the four questions in §3b), loopback under mute, the macOS lock mechanism | docs only | spec merged. **`BlockInput` and the curtain probed on vmtest 2026-10-13 and 14** (§3b's answers): high integrity needed, only the blocking thread injects (mouse, keys and the wheel alike), Ctrl+Alt+Del lifts the block, and the curtain stays out of both DXGI and WGC capture. Still owed: EDR, loopback under mute, the macOS lock |
 | P1 | The curtain + the permission bit + the device opt-in + audit (Windows), in three steps below | `privacy_mode_allowed=false` (default) | P1a built |
 | P1a | The server's gate: the bit, the two `rpc` words, the hub's strip with its reasons, break-glass excluded, the storage rule (§3c as built) | none needed: nothing advertises the words yet | **built** (this PR): unit + `privacy_gate_tests` green locally; the negative control (strip disabled) fails them |
-| P1b | The agent: `privacy_mode_allowed`, the words, the consent line, the curtain, the `privacy` channel, and the device's own refusal | `privacy_mode_allowed=false` | — |
+| P1b | The agent: `privacy_mode_allowed`, the words, the consent line, the curtain, the `privacy` channel, and the device's own refusal (§3a and §3c as built) | `privacy_mode_allowed=false` | **built**: Linux unit + `privacy_dc` 6/6, Windows clippy and units with `viewer-indicator`; NC fails as it should. The field check (`curtain-smoke` on vmtest) is owed |
 | P1c | The viewer: the toggle, the refusal reasons, asking for `PRIVACY` only once P1a is deployed | the toggle | — |
 | P2 | The input block, if P0 cleared it | `privacy_input_block=false` | — |
 | P3 | Lock on end (Windows, Linux, macOS) | `lock_on_end=never` | — |

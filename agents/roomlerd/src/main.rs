@@ -263,6 +263,18 @@ enum Command {
         #[arg(long, default_value_t = 600)]
         seconds: u64,
     },
+    /// FR-99 P1b — put a privacy curtain up through the production overlay
+    /// for `--seconds`, and report whether it went up out of capture
+    /// (`possible=… up=…`). A field check that needs no server and no viewer:
+    /// a screenshot of the host shows the curtain while a session's stream
+    /// shows the desktop under it. Run it in the signed-in desktop session.
+    /// Windows 10 2004 or later; exits non-zero when no curtain went up.
+    #[command(name = "curtain-smoke")]
+    CurtainSmoke {
+        /// How long the curtain stays up.
+        #[arg(long, default_value_t = 30)]
+        seconds: u64,
+    },
     /// (internal, macOS and Linux) The body of the `com.roomler.update`
     /// LaunchDaemon and of the Linux `roomler-update.service` (FR-96): consume
     /// the wake file, then check → download → verify → install as root,
@@ -1585,6 +1597,15 @@ async fn daemon_main() -> Result<()> {
             }
         }
         Command::ProbeTarget { seconds } => roomlerd::probe_target::run(seconds),
+        Command::CurtainSmoke { seconds } => {
+            if !roomlerd::privacy::curtain_smoke(seconds)? {
+                anyhow::bail!(
+                    "no curtain went up: privacy mode needs Windows 10 2004 or later, a build \
+                     with the overlay, and the signed-in desktop session"
+                );
+            }
+            Ok(())
+        }
         Command::EncoderSmoke {
             encoder,
             codec,
@@ -3971,6 +3992,9 @@ async fn run_cmd(
     // local `ConfigSet` re-seeds them; the server cannot reach them).
     #[cfg(feature = "recording")]
     roomlerd::recording::remote::adopt(&cfg);
+    // FR-99 P1b — the owner's privacy gate, live from here on (a local
+    // `ConfigSet` re-seeds it; the server cannot reach it).
+    roomlerd::privacy::set_device_allowed(cfg.privacy_mode_allowed);
     // FR-92 — the keep-busy engine: restores a keep-busy the signed-in
     // person left on (it waits for an unlocked session before touching the
     // pointer), and answers `rc:keep-busy.*` from any viewer. Started here,
