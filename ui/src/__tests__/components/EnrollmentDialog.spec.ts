@@ -137,7 +137,13 @@ describe('EnrollmentDialog — the anchor box (FR-104)', () => {
     expect(w.emitted('update:anchor')).toEqual([[true]])
     // The box and the command follow the token the parent hands over.
     expect(anchorCommand()).toBeUndefined()
-    await w.setProps({ token: 'tok-456', anchor: true })
+    // ⚠️ Cast, as KeepBusyMenu.spec.ts's `setDefaultPattern` does: the hosted
+    // image type-checks `.vue` through env.d.ts's shim (oven/bun has no
+    // `node`), where these REAL props fail the excess-property check, and
+    // that failed every hosted build after #2174. Vitest exercises them.
+    await w.setProps({ token: 'tok-456', anchor: true } as unknown as Parameters<
+      typeof w.setProps
+    >[0])
     await flushPromises()
     expect(box()!.checked).toBe(true)
     expect(anchorCommand()!.textContent).toContain('--token tok-456')

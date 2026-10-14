@@ -161,7 +161,7 @@ async fn project_session(sessions: &Collection<RemoteSession>, ev: &RemoteAuditE
             .map(|_| ()),
         AuditKind::ConsentDenied => end_session(sessions, ev, EndReason::UserDenied).await,
         AuditKind::ConsentTimedOut => end_session(sessions, ev, EndReason::ConsentTimeout).await,
-        AuditKind::SessionEnded { reason } => end_session(sessions, ev, *reason).await,
+        AuditKind::SessionEnded { reason, .. } => end_session(sessions, ev, *reason).await,
         AuditKind::PermissionsChanged { permissions } => sessions
             .update_one(
                 doc! { "_id": ev.session_id },

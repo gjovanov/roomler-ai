@@ -187,6 +187,8 @@ test.describe('vmtest viewer input (named agent)', () => {
   test.setTimeout(4 * 60 * 1000)
 
   test(`the viewer's input reaches the host (${PLAN})`, async ({ page, context }) => {
+    // Analytics must never count a test session (FR-102).
+    await context.route('https://purestat.ai/**', (r) => r.abort())
     // Cookie-only sessions (#680/#690): log in through the context so the
     // HttpOnly cookie lands in this context's jar — see vmtest-remote.spec.ts.
     const loginResp = await context.request.post(`${API_URL}/api/auth/login`, {

@@ -4478,6 +4478,13 @@ pub enum AuditKind {
     SessionStarted,
     SessionEnded {
         reason: EndReason,
+        /// FR-101 P4b — which limit ended it, when one did: `max_duration`
+        /// (the org's maximum session length). The reason is
+        /// `IdleTimeout` either way, a variant every reader already knows; this
+        /// says which limit it was. A field rather than a new reason or
+        /// variant, so a pod on an older build can still read the row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<String>,
     },
     // FR-101 P3 — the four clipboard and file kinds below are never written.
     // A transfer is something the DEVICE reports (the payload never crosses

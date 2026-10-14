@@ -60,12 +60,13 @@
             </td>
             <td class="text-no-wrap">
               <v-chip
-                v-if="e.account_mode"
+                v-if="asChip(e)"
                 size="x-small"
-                :color="accountColor(e.account_mode)"
+                :color="asChip(e)?.color"
+                :title="asChip(e)?.title"
                 variant="tonal"
               >
-                {{ accountLabel(e.account_mode) }}
+                {{ asChip(e)?.label }}
               </v-chip>
               <span v-else class="text-medium-emphasis">—</span>
             </td>
@@ -89,6 +90,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useAgentStore, type SshAuditEntry } from '@/stores/agents'
+import { sshAsChip, type SshAsChip } from '@/utils/sshIdentity'
 
 const props = defineProps<{
   tenantId: string
@@ -123,12 +125,6 @@ const DENY_LABEL: Record<string, string> = {
   claim_refused: 'service claim refused',
 }
 
-const ACCOUNT_LABEL: Record<string, string> = {
-  console_user: 'signed-in user',
-  daemon: 'SYSTEM / root',
-  named: 'named account',
-}
-
 const deviceNames = computed(() => {
   const m: Record<string, string> = {}
   for (const a of agentStore.agents) m[a.id] = a.name
@@ -145,7 +141,13 @@ function deviceName(id: string): string {
   return deviceNames.value[id] ?? id.slice(0, 8)
 }
 
+/** FR-105 — a device's SYSTEM service claiming a grant that is not pending
+ *  for it (a forged ring) is recorded with no person behind it: the server
+ *  writes the all-zero id, which would otherwise render as "00000000". */
+const NO_USER = '000000000000000000000000'
+
 function userName(id: string): string {
+  if (id === NO_USER) return "device's service"
   return userNames.value[id] ?? id.slice(0, 8)
 }
 
@@ -153,13 +155,13 @@ function denyLabel(e: SshAuditEntry): string {
   return (e.denied && DENY_LABEL[e.denied]) || e.denied || 'denied'
 }
 
-function accountLabel(mode: string): string {
-  return ACCOUNT_LABEL[mode] ?? mode
-}
-
-/** Root is worth a second's attention in a list of otherwise ordinary rows. */
-function accountColor(mode: string): string | undefined {
-  return mode === 'daemon' ? 'warning' : undefined
+/** FR-105 — the account the session ran as, from what the grant asked for AND
+ *  where the server sent it. `daemon` on the agent's own process is not
+ *  "SYSTEM / root" everywhere: on an attended Windows install it is the
+ *  signed-in user. SYSTEM-level identities keep the warning colour: they are
+ *  worth a second's attention in a list of otherwise ordinary rows. */
+function asChip(e: SshAuditEntry): SshAsChip | null {
+  return sshAsChip(e.account_mode, e.ran_as)
 }
 
 function fmtWhen(at: string): string {

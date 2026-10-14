@@ -214,6 +214,7 @@ something on the host is eating its own DNS.
 | `active` on one read, `DOWN` on another, same host | **two runtimes' resolvers**, the dead one holding the port (fixed 0.4.71) | two `resolver up` for one address in one daemon lifetime |
 | bound and healthy-looking, answers nothing | the survivor served the **dead session's** name map (fixed 0.4.71) | port owned by `roomlerd`, every name NXDOMAIN |
 | dead for hours, port demonstrably free | a failed bind was **never retried** (fixed 0.4.73) | a `bind failed` with no later `resolver up` |
+| **Windows**: nothing on `<overlay ip>:53`, status still `active`, every lookup fails at once. Under an exit, *every* name on the host fails, not just the zone | the resolver **exited** on `WSAECONNRESET` (10054) while the steer stayed ([#2213](https://github.com/gjovanov/roomler-ai/issues/2213), fixed after 0.4.135). Windows reports an ICMP port-unreachable for a reply sent to a closed client port on the NEXT receive. The Windows DNS client closes ports routinely: it gives up on a slow answer and retries from a new one. | `magicdns: recv failed; resolver exiting … (os error 10054)`. Since the fix, such errors are served through (`receive reported an earlier datagram`), and a truly failed socket is rebound (`recv failed; rebinding the resolver`) |
 
 🔑 **The line that tells a reconnect from a process restart**: a healthy cycle
 logs `OS split-DNS reverted` ≈25 s *before* the next `resolver up`. A failure

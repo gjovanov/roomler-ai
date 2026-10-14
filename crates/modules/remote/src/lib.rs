@@ -161,6 +161,12 @@ impl Module for RemoteState {
                 "/tenant/{tenant_id}/rc-session-policy",
                 get(session_policy::get_policy).put(session_policy::set_policy),
             )
+            // FR-101 P4b — the org's session limits (the maximum length):
+            // GET for any member, PUT with MANAGE_TENANT.
+            .route(
+                "/tenant/{tenant_id}/rc-session-limits",
+                get(session_policy::get_limits).put(session_policy::set_limits),
+            )
             .nest("/turn", turn)
             .nest("/relay", relay)
             .with_state(self.clone())

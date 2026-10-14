@@ -450,6 +450,11 @@ ignores the message. The viewer then shows a closable warning on any session
 that has input: *"Your mouse and keyboard do not reach this device's desktop."*,
 followed by the agent's reason, which names the key that would fix it.
 
+On Linux the notice belongs to FR-93's P1, so P1's kill switch
+(`wayland_aware = false`) sends none and asks no X server, as the agent did
+before FR-93 (P1a, [`linux-capture.md`](linux-capture.md) §1.1). macOS and
+Windows are always told: the switch is a Linux key.
+
 ### 6.1a Keep busy — a second input source (FR-92)
 
 A controller with input can leave the host's pointer moving in a pattern so the

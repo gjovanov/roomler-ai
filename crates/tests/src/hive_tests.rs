@@ -3602,7 +3602,6 @@ async fn a_move_away_from_an_unreachable_primary_refuses_what_it_cannot_trust() 
         .await
         .expect("the word back: nothing moved");
     wait_stored(&app, &sid, "ended", |s| !s.contains_key("promotion")).await;
-    let audit: Vec<(String, String)> = promote_audit(&app, &sid).await;
     let want: Vec<(String, String)> = [
         ("refused", "primary_unsupported"),
         ("sent", ""),
@@ -3613,6 +3612,14 @@ async fn a_move_away_from_an_unreachable_primary_refuses_what_it_cannot_trust() 
     .iter()
     .map(|(o, r)| (o.to_string(), r.to_string()))
     .collect();
+    // The promotion's end and its audit row are two writes: wait for the
+    // row, the operation's LAST one (#2065), never the record alone.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut audit = promote_audit(&app, &sid).await;
+    while audit.len() < want.len() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        audit = promote_audit(&app, &sid).await;
+    }
     assert_eq!(audit, want);
 }
 
@@ -11458,7 +11465,7 @@ async fn a_purge_no_tombstone_names_is_never_sent() {
         at: now,
     };
     assert!(
-        dao.tombstone(t, owner, s, &mark, &[ObjectId::new()])
+        dao.tombstone(t, owner, s, &mark, &[ObjectId::new()], false)
             .await
             .unwrap()
             .is_none(),
@@ -11489,7 +11496,7 @@ async fn a_purge_no_tombstone_names_is_never_sent() {
         .await
         .unwrap();
     assert!(
-        dao.tombstone(t, owner, s, &mark, &[a])
+        dao.tombstone(t, owner, s, &mark, &[a], false)
             .await
             .unwrap()
             .is_none(),
@@ -11499,8 +11506,17 @@ async fn a_purge_no_tombstone_names_is_never_sent() {
         .update_one(doc! { "_id": s }, doc! { "$unset": { "promotion": "" } })
         .await
         .unwrap();
+    // P2g-3a — retention's tombstone is only of a session that is over: this
+    // one runs.
+    assert!(
+        dao.tombstone(t, owner, s, &mark, &[a], true)
+            .await
+            .unwrap()
+            .is_none(),
+        "retention never tombstones a live session"
+    );
     let before = dao
-        .tombstone(t, owner, s, &mark, &[a])
+        .tombstone(t, owner, s, &mark, &[a], false)
         .await
         .unwrap()
         .expect("over every device it names");
@@ -11515,4 +11531,143 @@ async fn a_purge_no_tombstone_names_is_never_sent() {
             .unwrap(),
         mark.purge_id
     );
+}
+
+// ─── P2g-3a — retention, the server's sweep ───────────────────────────────
+
+/// [`replicaset_app`], with retention swept every second.
+async fn retention_app() -> TestApp {
+    TestApp::spawn_with_settings(|s| {
+        s.modules.hive = true;
+        s.hive.replicaset = true;
+        s.hive.retention_sweep_secs = 1;
+        s.app.rate_limit_per_sec = 100;
+        s.app.rate_limit_burst = 1000;
+    })
+    .await
+}
+
+/// The stored session as if it had ended `days` ago.
+async fn ended_days_ago(app: &TestApp, sid: &str, days: i64) {
+    let then =
+        bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - days * 86_400_000);
+    app.db
+        .collection::<Document>("agent_sessions")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(sid).unwrap() },
+            doc! { "$set": { "status": "ended", "end_reason": "exited", "ended_at": then } },
+        )
+        .await
+        .unwrap();
+}
+
+/// The `rc:hive.purge` frames a device hears within `within`, by session.
+async fn purges_heard(ws: &mut AgentWs, within: Duration) -> Vec<Value> {
+    let mut out = Vec::new();
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(100), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&text)
+                    && v["t"] == "rc:hive.purge"
+                {
+                    out.push(v);
+                }
+            }
+            Ok(Some(Ok(_))) | Err(_) => {}
+            Ok(Some(Err(_))) | Ok(None) => break,
+        }
+    }
+    out
+}
+
+/// FR-90 P2g-3a — retention purges a session over for longer than its
+/// organization keeps (the default, 90 days), from every device that held
+/// it, as its owner's purge would: `reason: retention`, audited. A session
+/// that ended within the days is kept, and so is a live one however old.
+#[tokio::test]
+async fn retention_purges_a_session_over_for_longer_than_its_org_keeps() {
+    let app = retention_app().await;
+    let mut p = purgeable(&app, "retention-old", &[]).await;
+    let (tid, admin) = (p.tid.clone(), p.admin.clone());
+    let old = p.sid.clone();
+    let recent = started_frame(&app, &tid, &admin, &mut p.a, "/srv/retention-recent")
+        .await
+        .0["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let live = started_frame(&app, &tid, &admin, &mut p.a, "/srv/retention-live")
+        .await
+        .0["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ended_days_ago(&app, &old, 100).await;
+    ended_days_ago(&app, &recent, 10).await;
+    // A live session started long ago: its age is no end.
+    let long_ago =
+        bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - 200 * 86_400_000);
+    app.db
+        .collection::<Document>("agent_sessions")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&live).unwrap() },
+            doc! { "$set": { "created_at": long_ago, "updated_at": long_ago } },
+        )
+        .await
+        .unwrap();
+
+    let heard = purges_heard(&mut p.a.ws, Duration::from_secs(4)).await;
+    let named: Vec<&str> = heard
+        .iter()
+        .filter_map(|f| f["session_id"].as_str())
+        .collect();
+    assert!(
+        named.contains(&old.as_str()),
+        "the session past its retention is purged: {heard:?}"
+    );
+    assert!(
+        !named.contains(&recent.as_str()) && !named.contains(&live.as_str()),
+        "a session within its days, and a live one, are kept: {heard:?}"
+    );
+    let (code, v) = read_purge(&app, &tid, &admin, &old).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["reason"], "retention", "{v}");
+    assert_eq!(get_session(&app, &tid, &admin, &old).await.0, 404);
+    for kept in [&recent, &live] {
+        assert_eq!(get_session(&app, &tid, &admin, kept).await.0, 200, "{kept}");
+    }
+    assert_eq!(
+        purge_audit(&app, &old).await,
+        vec![("issued".to_string(), Some("retention".to_string()))]
+    );
+    let purge = v["id"].as_str().unwrap().to_string();
+    purge_ack(&mut p.a.ws, &purge, &old, "done", "done").await;
+    wait_purge(&app, &tid, &admin, &old, "complete", |v| {
+        v["done_at"].is_string()
+    })
+    .await;
+    wait_record_gone(&app, &old, "the tombstone goes").await;
+}
+
+/// FR-90 P2g-3a — an organization whose policy keeps its sessions for ever
+/// (`retention_days = 0`) is never swept, however long ago they ended.
+#[tokio::test]
+async fn an_org_that_keeps_its_sessions_for_ever_is_never_swept() {
+    let app = retention_app().await;
+    let mut p = purgeable(&app, "retention-never", &[]).await;
+    let (tid, admin, sid) = (p.tid.clone(), p.admin.clone(), p.sid.clone());
+    let mut policy = policy_min(1, 1);
+    policy["retention_days"] = json!(0);
+    let (code, body) = put_policy(&app, &tid, &admin, &policy).await;
+    assert_eq!(code, 200, "{body}");
+    ended_days_ago(&app, &sid, 1000).await;
+    assert!(
+        purges_heard(&mut p.a.ws, Duration::from_secs(3))
+            .await
+            .is_empty(),
+        "nothing is purged"
+    );
+    assert_eq!(get_session(&app, &tid, &admin, &sid).await.0, 200);
+    assert!(purge_audit(&app, &sid).await.is_empty());
 }
