@@ -2,8 +2,9 @@
 
 How the project learns what a post, an article or an issue produced — visits, sign-ups,
 orgs, devices, usage, revenue — **joined by the campaign key and never by a person**. This
-page covers what FR-102 has shipped so far: the taxonomy (P1b), the exclusion set (P1c) and
-the daily digest (P1d). Spec: [`docs/fr/FR-102-growth-observability.md`](fr/FR-102-growth-observability.md)
+page covers what FR-102 has shipped so far: the taxonomy (P1b), the exclusion set (P1c), the
+daily digest (P1d) and the account funnel, cohorts and org views (P2). Spec:
+[`docs/fr/FR-102-growth-observability.md`](fr/FR-102-growth-observability.md)
 (#2127). It also places the existing `/observability` page, which no doc described before.
 
 ## Two planes, one key
@@ -206,6 +207,112 @@ gate as `/admin/stats`. The SPA's `/observability/growth` (the Digest view) pick
 lists recent digests, recomputes without sending, and shows every section as cards; a
 `not_measured` cell is a muted chip, never a 0, and every string is rendered as text.
 
+## The account funnel (P2)
+
+The funnel runs across days, not within a visit (that is purestat's, PS4): sign-up →
+org created → activated → first value → paid. **Acquisition belongs to the user**
+(the owner's `signup_attribution`, normalised through the taxonomy), **value belongs to
+the org**. Each step is a subset of the one before, and every windowed step carries
+`pending` and `settled`, FR-88's semantics: a sign-up whose window is still open and has
+no event yet is **pending**, not a failure, and `settled = signups − pending` is the only
+denominator a rate may use.
+
+```mermaid
+flowchart LR
+  S["Sign-up<br/>users.created_at"] -->|"org owned by that user<br/>≤ 7 d"| O["Org created"]
+  O -->|"a device enrolled<br/>≤ 7 d from org<br/>(tombstones count)"| A["Activated"]
+  A -->|"an RC session ≥ 30 s, a call ≥ 2,<br/>a tunnel flow or an SSH session<br/>≤ 14 d from org"| V["First value"]
+  V -->|"first paid invoice > 0<br/>(billing_events, P4)"| P["Paid"]
+  classDef nm fill:transparent,stroke-dasharray:4 4
+  class P nm
+```
+
+- **First value is one definition, in `crates/api/src/growth/value.rs`** — a remote-desktop
+  session that reached Active and lasted ≥ 30 s (`remote`), a call with ≥ 2 participants
+  (`conference`), a tunnel flow (`network`), or an SSH session (`network`). The digest's
+  "active orgs", the nightly fold, the funnel, the cohorts and the north star all read it,
+  so no two can disagree. An `exec` run is recorded on the org-day but is **not** value —
+  it is an operator's diagnostic, not the product working for a user.
+- **A step whose module is unmounted answers `null`, with the module named** (spec principle
+  4). Without `fleet` the server cannot see devices, so `activated` — and, sequentially,
+  `first_value` — are `null`; without a value module, `first_value` is. Never `0`.
+- **Time to value**: median and p75, each with its `n`, for sign-up → first device and
+  sign-up → first value.
+- **North star (D2): weekly active orgs (WAO)** — the orgs with a value event in the ISO
+  week, internal excluded.
+
+### `growth_org_daily` and its nightly job
+
+One row per org per UTC day with any activity, `_id = "{tenant}:{yyyy-mm-dd}"`, written whole
+by a singleton nightly host job (`crates/api/src/growth/org_daily.rs`). It exists because
+four of its sources (`tunnel_audit`, `ssh_audit`, `exec_audit`, `ws_sessions`) expire at 90
+days while retention needs a year: the row **outlives the audit rows it was folded from**, so
+a cohort chart longer than 90 days still sees tunnel and SSH use.
+
+```mermaid
+flowchart LR
+  subgraph src["Sources (while they live)"]
+    RS["remote_sessions"]
+    CS["call_sessions"]
+    TA["tunnel_audit · ssh_audit · exec_audit"]
+    SE["stats_events · stats_machine_1d · ws_sessions"]
+  end
+  src --> J["nightly fold<br/>singleton: Redis claim per UTC day<br/>recompute last 3 closed days"]
+  J -->|"replace-then-prune per day"| ODD[("growth_org_daily<br/>25-month TTL")]
+  ODD --> F["funnel · cohorts · orgs · timeline"]
+```
+
+- **Singleton per UTC day** through the DB-name-scoped Redis `NX` claim the stats rollup
+  uses; without Redis a pod runs it locally, once a day.
+- **The last 3 closed days are recomputed every run** (a session open at midnight, a late
+  audit row); **today is never written** — an open day would read as a quiet one. The fold is
+  a derivation of durable rows, so recomputing it is idempotent.
+- **Replace-then-prune per day**: each row is upserted on its `_id`, then the day's rows of
+  orgs that no longer have activity are deleted, so a reader never meets an empty day.
+- **The exclusion set is applied at read time, never in the fold** — every org's row is
+  written, and every view filters — which is what makes `include_internal=true` the same
+  code path as the default.
+- **Bounded backfill.** `POST …/org-daily/backfill?since=&until=` fills a closed range in
+  31-day chunks, never before `today − 25 months` and never today; the first run on an empty
+  collection fills the sources' 730-day horizon once. Nothing here is unbounded.
+- Fields: `rc_sessions`, `rc_session_minutes`, `rc_controllers`, `calls`,
+  `call_participant_minutes`, `tunnel_flows`, `ssh_sessions`, `exec_runs`, `devices_online`,
+  `members_active`, `value` (bool) and `value_kinds`. **Deleted with the org** by
+  `roomler_core::growth::purge_tenant` (which also takes the `growth_daily` rows whose `dims`
+  carry the tenant) — aggregates may outlive rows, rows never outlive their owner.
+
+### Cohorts and the org views
+
+- **Cohorts** (`GET …/cohorts?unit=week`): orgs by creation ISO week × weeks since (W0..W12),
+  active = ≥ 1 value event in that week, W1/W4/W12 highlighted. A cell past the current week
+  is `null`; `closed_through` says how many weeks have fully closed, so the open cells read
+  as provisional.
+- **Orgs** (`GET …/orgs`): per org — created, the owner's channel and campaign key (never the
+  address), devices (live/enrolled, tombstones counted), the last value day, the active weeks
+  of the last 12, plan and billing status, and an `at_risk` flag: active in ≥ 3 of the 4 weeks
+  before the last 2, and none in those last 2 — an org that had a habit and lost it.
+- **Timeline** (`GET …/org/{tenant_id}/timeline`): one org's milestones — the owner's sign-up
+  (attribution, never the address), org created, members as they joined, the first device
+  (+ OS), the first value event and its kinds, a weekly activity strip, and the plan/invoice
+  history as far as data allows (`not_measured` until P4).
+
+### P2 routes
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/admin/growth/funnel?since&until&by&include_internal` | the funnel, time to value, and a per-dimension breakdown (`by` = `source` · `medium` · `campaign` · `content` · `channel` · `self_reported` · `landing_path`) |
+| GET | `/api/admin/growth/cohorts?unit=week&since` | weekly cohorts W0..W12, and the WAO series |
+| GET | `/api/admin/growth/orgs?limit&include_internal` | the per-org table |
+| GET | `/api/admin/growth/org/{tenant_id}/timeline` | one org's milestones |
+| POST | `/api/admin/growth/org-daily/backfill?since&until` | recompute a closed range of `growth_org_daily` |
+
+All platform-admin only, **404** otherwise and when `growth.enabled = false` — the same gate
+as the digest. The SPA's `/observability/growth` gains **Overview** (WAO trend, the funnel
+with counts — a percentage only at n ≥ 30 —, time to value, coverage from the digest's
+headline), **Orgs** (the table, with the timeline in a drawer) and **Cohorts** (the heatmap),
+beside the existing **Digest** tab. Every attacker-chosen string (UTM values, org names) is
+rendered as text, never `v-html`.
+
 ## The `/observability` page as a whole
 
 | Tab / surface | What it shows | Route family |
@@ -215,7 +322,7 @@ lists recent digests, recomputes without sending, and shows every section as car
 | Orgs, machines, calls, users | platform-wide inventories and series | `/api/admin/stats/{orgs,machines,calls,users}` |
 | Usage | per-user minutes and bytes across every org | `/api/admin/stats/usage*` |
 | Attribution (FR-88) | sign-ups by campaign key and how many activated | `/api/admin/stats/attribution` |
-| **Growth** (FR-102) | the daily digest | `/api/admin/growth/*` |
+| **Growth** (FR-102) | the daily digest (P1d) and the account funnel, cohorts and org views (P2) | `/api/admin/growth/*` |
 
 ## Field verification
 

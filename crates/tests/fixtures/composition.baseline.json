@@ -1,6 +1,10 @@
 {
   "routes": [
     {
+      "path": "/api/admin/growth/cohorts",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/admin/growth/digest",
       "methods": "GET,HEAD"
     },
@@ -19,6 +23,22 @@
     {
       "path": "/api/admin/growth/exclusions",
       "methods": "GET,HEAD,PUT"
+    },
+    {
+      "path": "/api/admin/growth/funnel",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/admin/growth/org-daily/backfill",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/admin/growth/org/{tenant_id}/timeline",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/admin/growth/orgs",
+      "methods": "GET,HEAD"
     },
     {
       "path": "/api/admin/newsletter/issues",
@@ -1311,6 +1331,28 @@
               "id": 1
             },
             "unique": true
+          }
+        ]
+      },
+      {
+        "collection": "growth_org_daily",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "day": 1
+            }
+          },
+          {
+            "key": {
+              "day": 1
+            }
+          },
+          {
+            "key": {
+              "day_start": 1
+            },
+            "expireAfterSeconds": 64800000
           }
         ]
       },
@@ -2988,6 +3030,28 @@
               "id": 1
             },
             "unique": true
+          }
+        ]
+      },
+      {
+        "collection": "growth_org_daily",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "day": 1
+            }
+          },
+          {
+            "key": {
+              "day": 1
+            }
+          },
+          {
+            "key": {
+              "day_start": 1
+            },
+            "expireAfterSeconds": 64800000
           }
         ]
       },

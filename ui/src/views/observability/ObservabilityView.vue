@@ -10,6 +10,16 @@
         </p>
       </div>
       <v-spacer />
+      <v-btn
+        v-if="isPlatformAdmin"
+        variant="tonal"
+        size="small"
+        class="mr-2"
+        append-icon="mdi-arrow-right"
+        :to="{ name: 'observability-growth' }"
+      >
+        Growth
+      </v-btn>
       <range-picker v-if="isPlatformAdmin" v-model="range" />
     </div>
 

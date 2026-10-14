@@ -422,6 +422,11 @@ impl AppState {
         // and mailed once (the `growth_digests._id` insert decides which pod).
         // No-op unless `growth.digest_enabled` (default OFF).
         crate::growth::digest::spawn_digest_loop(state.clone());
+        // FR-102 P2 — the nightly `growth_org_daily` fold: once per UTC day
+        // per cluster (a Redis claim keyed by the day), the last three
+        // closed days are recomputed; an empty collection is first filled
+        // over the sources' horizon. No-op unless `growth.enabled`.
+        crate::growth::org_daily::spawn_org_daily_loop(state.clone());
 
         // FR-69 P5a — the inverse edges (D6). Each mounted module registers
         // its hooks (since P7a that includes the network steps of the agent

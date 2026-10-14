@@ -130,6 +130,20 @@ impl ExclusionSet {
     }
 }
 
+/// P2 — everything the growth collections hold about one org, removed:
+/// its `growth_org_daily` rows and the `growth_daily` rows whose dims carry
+/// it (spec principle 7: aggregates may outlive rows; rows never outlive
+/// their owner). This is the ONE call a tenant deletion makes for growth;
+/// it is idempotent, and it is deliberately NOT part of the archive cascade
+/// — an archived org keeps everything it knows so that `unarchive` restores
+/// a working org, and its activity history is part of that.
+pub async fn purge_tenant(
+    core: &Core,
+    tenant_id: ObjectId,
+) -> DaoResult<roomler_ai_services::dao::growth::PurgedCounts> {
+    GrowthDao::new(&core.db).purge_tenant(tenant_id).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

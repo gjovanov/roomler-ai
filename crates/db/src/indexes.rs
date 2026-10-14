@@ -431,6 +431,21 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
         )],
     ));
 
+    // P2 — one row per org per UTC day with any activity, `_id` =
+    // `"{tenant}:{yyyy-mm-dd}"` (spec §3d). Read per org (the timeline, the
+    // first/last value day) and per day range (the funnel, cohorts, WAO —
+    // `day` is `YYYY-MM-DD`, which sorts as a date). Kept 25 months from the
+    // day itself; it outlives the 90-day audit rows it was computed from.
+    // Deleted with the org by `GrowthDao::purge_tenant`.
+    sets.push(set(
+        "growth_org_daily",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "day": 1 }),
+            index(bson::doc! { "day": 1 }),
+            index_ttl(bson::doc! { "day_start": 1 }, 25 * 30 * 24 * 60 * 60),
+        ],
+    ));
+
     // Hourly rollups (90 d) and daily rollups (730 d). The rollup task
     // whole-bucket-replaces via $merge on _id, so these are also upserts.
     for (coll, ttl_days) in [
