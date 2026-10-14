@@ -122,6 +122,19 @@ pub struct RcSessionPolicy {
     pub audio: RcFeaturePolicy,
 }
 
+/// FR-101 P4b — how long a remote-desktop session in this org may last.
+/// Nothing set (every row older than the field) is no limit, the behaviour
+/// from before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RcSessionLimits {
+    /// A session ends this many seconds after it started (went live), with
+    /// `EndReason::IdleTimeout`. `None` = no maximum. The route accepts one
+    /// minute to one day; a smaller stored value still works (the tests use
+    /// one), so the hub reads whatever is here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_secs: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Plan {
@@ -249,6 +262,13 @@ pub struct TenantSettings {
     /// session in the org is told its effect), settable with MANAGE_TENANT.
     #[serde(default)]
     pub rc_session: RcSessionPolicy,
+
+    /// FR-101 P4b — how long a remote-desktop session in this org may last.
+    /// No limit by default and for every pre-feature row (operator decision
+    /// 2, 2026-10-14: off for existing tenants). Readable by any member,
+    /// settable with MANAGE_TENANT.
+    #[serde(default)]
+    pub rc_limits: RcSessionLimits,
 }
 
 impl Default for TenantSettings {
@@ -268,6 +288,7 @@ impl Default for TenantSettings {
             keep_busy_default_pattern: None,
             plan_enforcement: PlanEnforcement::default(),
             rc_session: RcSessionPolicy::default(),
+            rc_limits: RcSessionLimits::default(),
         }
     }
 }
@@ -501,5 +522,25 @@ mod rc_session_tests {
         assert_eq!(back.clipboard, RcFeaturePolicy::Off);
         assert_eq!(back.files, RcFeaturePolicy::Ask);
         assert_eq!(back.audio, RcFeaturePolicy::On);
+    }
+
+    /// FR-101 P4b — a tenant document from before the limits has none: no
+    /// maximum, exactly today's behaviour. A set limit round-trips, and an
+    /// unset one is left off the document rather than stored as `null`.
+    #[test]
+    fn a_pre_feature_tenant_has_no_session_limit() {
+        let s: TenantSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(s.rc_limits, RcSessionLimits::default());
+        assert_eq!(s.rc_limits.max_secs, None);
+        let set = RcSessionLimits {
+            max_secs: Some(7200),
+        };
+        let v = serde_json::to_value(set).unwrap();
+        assert_eq!(v, serde_json::json!({"max_secs": 7200}));
+        assert_eq!(serde_json::from_value::<RcSessionLimits>(v).unwrap(), set);
+        assert_eq!(
+            serde_json::to_value(RcSessionLimits::default()).unwrap(),
+            serde_json::json!({})
+        );
     }
 }

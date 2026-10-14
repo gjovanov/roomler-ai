@@ -115,6 +115,7 @@ pub async fn handle_controller_frame(state: &RemoteState, frame: ControllerFrame
         authz.may_record,
         authz.rc_overlay,
         authz.session_policy,
+        authz.max_duration,
         frame.dialed_tid,
         frame.conn_established_ms,
         frame.connection_id,
@@ -146,6 +147,8 @@ pub async fn dispatch_controller_rc(
     rc_overlay: bool,
     // FR-101 P2 — the org's session policy (resolved by the same gate).
     session_policy: OrgPolicy,
+    // FR-101 P4b — the org's maximum session length (the same gate).
+    max_duration: Option<std::time::Duration>,
     // PR-1 rehome direction inputs: the affinity key this conn DIALED
     // with (None = key-less legacy/racy dial) and when it established.
     dialed_tid: Option<&str>,
@@ -173,6 +176,7 @@ pub async fn dispatch_controller_rc(
         may_record,
         rc_overlay,
         session_policy,
+        max_duration,
     };
     // …and so does the cross-pod relay, for the same reason.
     let relay_tenant_name = tenant_name;
@@ -222,6 +226,7 @@ pub async fn dispatch_controller_rc(
                     may_record,
                     rc_overlay,
                     session_policy,
+                    max_duration,
                     &frame_val,
                 )
                 .await
@@ -341,6 +346,7 @@ pub async fn dispatch_controller_rc(
                         may_record,
                         rc_overlay,
                         session_policy,
+                        max_duration,
                         &frame_val,
                     )
                     .await
@@ -413,6 +419,11 @@ pub struct SessionAuthz {
     /// paths and when the row could not be read, so a database blip refuses
     /// the features instead of granting them on a guess.
     pub session_policy: OrgPolicy,
+    /// FR-101 P4b — the org's maximum session length, from the same tenant
+    /// row; every controller is bound by it. `None` when unset, on the
+    /// early-out paths, and when the row could not be read: no limit, the
+    /// behaviour from before it, rather than ending sessions on a guess.
+    pub max_duration: Option<std::time::Duration>,
 }
 
 impl SessionAuthz {
@@ -425,6 +436,7 @@ impl SessionAuthz {
             may_record: false,
             rc_overlay: false,
             session_policy: OrgPolicy::Unavailable,
+            max_duration: None,
         }
     }
     fn allow_with_input(
@@ -442,11 +454,17 @@ impl SessionAuthz {
             may_record: false,
             rc_overlay,
             session_policy,
+            max_duration: None,
         }
     }
     /// FR-85 P3 — set whether this allowed controller may record.
     fn recording(mut self, may_record: bool) -> Self {
         self.may_record = may_record;
+        self
+    }
+    /// FR-101 P4b — set the org's maximum session length.
+    fn limited(mut self, max_duration: Option<std::time::Duration>) -> Self {
+        self.max_duration = max_duration;
         self
     }
 }
@@ -519,6 +537,11 @@ pub async fn resolve_session_authz(
         Some(t) => OrgPolicy::Read(crate::session_policy::wire(&t.settings.rc_session)),
         None => OrgPolicy::Unavailable,
     };
+    // FR-101 P4b — and its maximum session length, if it set one.
+    let max_duration = tenant
+        .as_ref()
+        .and_then(|t| t.settings.rc_limits.max_secs)
+        .map(|secs| std::time::Duration::from_secs(u64::from(secs)));
     let tenant_name = tenant.map(|t| t.name);
 
     // Controlling your OWN device is always allowed. Whether it also
@@ -542,7 +565,8 @@ pub async fn resolve_session_authz(
             rc_overlay,
             session_policy,
         )
-        .recording(true));
+        .recording(true)
+        .limited(max_duration));
     }
 
     // The effective mode for an allowed non-owner controller (attended default).
@@ -570,6 +594,8 @@ pub async fn resolve_session_authz(
                 // FR-101 P2 — the org's policy binds break-glass too; its
                 // `Auto` keeps no `ask` feature, since nobody was asked.
                 session_policy,
+                // FR-101 P4b — and so does its maximum session length.
+                max_duration,
             });
         }
         return Ok(SessionAuthz::allow_with_input(
@@ -579,7 +605,8 @@ pub async fn resolve_session_authz(
             rc_overlay,
             session_policy,
         )
-        .recording(true));
+        .recording(true)
+        .limited(max_duration));
     }
     if !permissions::has(perms, permissions::REMOTE_CONTROL) {
         return Err("you don't have permission to control others' devices".to_string());
@@ -598,7 +625,8 @@ pub async fn resolve_session_authz(
             rc_overlay,
             session_policy,
         )
-        .recording(may_record));
+        .recording(may_record)
+        .limited(max_duration));
     }
     if policy.allowed_user_ids.contains(&controller_user_id) {
         return Ok(SessionAuthz::allow_with_input(
@@ -608,7 +636,8 @@ pub async fn resolve_session_authz(
             rc_overlay,
             session_policy,
         )
-        .recording(may_record));
+        .recording(may_record)
+        .limited(max_duration));
     }
     let role_ids = state
         .tenants
@@ -623,7 +652,8 @@ pub async fn resolve_session_authz(
             rc_overlay,
             session_policy,
         )
-        .recording(may_record));
+        .recording(may_record)
+        .limited(max_duration));
     }
     Err("you're not on this device's control allowlist".to_string())
 }
