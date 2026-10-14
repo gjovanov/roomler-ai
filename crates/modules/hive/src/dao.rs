@@ -11,7 +11,7 @@
 
 use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
-use roomler_ai_remote_control::hive::{HiveApprovalStatus, HiveRunState};
+use roomler_ai_remote_control::hive::{HiveApprovalStatus, HiveJoinRefusal, HiveRunState};
 use roomler_ai_services::dao::base::{
     BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams,
 };
@@ -1079,6 +1079,38 @@ impl AgentSessionDao {
                     } },
                 },
                 update,
+            )
+            .await
+    }
+
+    /// FR-90 P2g-3c — the member `device_id` purged its copy on its own
+    /// clock: refused `purged`, as a join it answered so is, and its tip
+    /// forgotten. Never the primary's row, never one placement is letting go
+    /// (`leaving`) nor one refused already, and never a tombstone's. `false`
+    /// = no such member.
+    pub async fn member_purged(&self, id: ObjectId, device_id: ObjectId) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "purged": Bson::Null,
+                    "replicaset.members": { "$elemMatch": {
+                        "device_id": device_id,
+                        "role": { "$ne": MemberRole::Primary.as_str() },
+                        "state": { "$in": [
+                            MemberState::Joined.as_str(),
+                            MemberState::Pending.as_str(),
+                        ] },
+                    } },
+                },
+                doc! {
+                    "$set": {
+                        "replicaset.members.$.state": MemberState::Refused.as_str(),
+                        "replicaset.members.$.refusal": HiveJoinRefusal::Purged.as_str(),
+                        "replicaset.members.$.answered_at": DateTime::now(),
+                    },
+                    "$unset": { "replicaset.members.$.tip": "" },
+                },
             )
             .await
     }
