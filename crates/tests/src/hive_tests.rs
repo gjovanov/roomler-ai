@@ -11671,3 +11671,47 @@ async fn an_org_that_keeps_its_sessions_for_ever_is_never_swept() {
     assert_eq!(get_session(&app, &tid, &admin, &sid).await.0, 200);
     assert!(purge_audit(&app, &sid).await.is_empty());
 }
+
+// ─── P2g-3b — a purge reaches its device on any pod ─────────────────────────
+
+/// [`replicaset_app`]'s settings, for two pods sharing one database and Redis
+/// ([`TestApp::spawn_pair`]).
+fn replicaset_settings(s: &mut roomler_ai_config::Settings) {
+    s.modules.hive = true;
+    s.hive.replicaset = true;
+    s.app.rate_limit_per_sec = 100;
+    s.app.rate_limit_burst = 1000;
+}
+
+/// FR-90 P2g-3b — a purge issued on one pod reaches a device whose socket is
+/// on the other. The owner's DELETE, like the retention sweep, runs on
+/// whichever pod it lands on, and the pod that holds the device's socket
+/// pushes it there. Before, the device heard it only at its next connection.
+#[tokio::test]
+async fn a_purge_issued_on_one_pod_reaches_a_device_on_the_other() {
+    let (app1, app2) = TestApp::spawn_pair(replicaset_settings).await;
+    if app1.state.redis_pubsub.is_none() || app2.state.redis_pubsub.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    // The device's socket, and its session, are on pod 1.
+    let mut p = purgeable(&app1, "purge-xpod", &[]).await;
+    let (tid, admin, sid) = (p.tid.clone(), p.admin.clone(), p.sid.clone());
+    // The owner's DELETE lands on pod 2, which holds no socket of it.
+    let (code, body) = delete_session(&app2, &tid, &admin, &sid).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["outcome"], "purging", "{body}");
+    let purge = body["purge"]["id"].as_str().unwrap().to_string();
+    let told = read_until(&mut p.a.ws, "rc:hive.purge")
+        .await
+        .expect("the purge reaches the device on the other pod");
+    assert_eq!(told["purge_id"], purge, "{told}");
+    assert_eq!(told["session_id"], sid, "{told}");
+    // Its answer lands where its socket is, and completes the purge.
+    purge_ack(&mut p.a.ws, &purge, &sid, "done", "done").await;
+    wait_purge(&app2, &tid, &admin, &sid, "complete", |v| {
+        v["done_at"].is_string()
+    })
+    .await;
+    wait_record_gone(&app1, &sid, "the tombstone goes").await;
+}
