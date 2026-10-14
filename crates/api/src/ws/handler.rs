@@ -40,7 +40,7 @@ pub async fn ws_upgrade(
         // `/ws` route and this role gate; a role whose module is not mounted
         // is refused with 503 rather than silently dropped.
         Some("agent") => match params.token {
-            Some(t) => state.modules.agent_upgrade(t, params.tid, ws),
+            Some(t) => state.modules.agent_upgrade(t, params.tid, ws).await,
             None => unauthorized("agent role requires ?token="),
         },
         Some("tunnel-client") => match params.token {

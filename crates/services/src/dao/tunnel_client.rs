@@ -44,6 +44,8 @@ impl TunnelClientDao {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            // FR-103 — only a removal advances it.
+            token_gen: 0,
         };
         let id = self.base.insert_one(&client).await?;
         self.base.find_by_id(id).await
@@ -289,11 +291,17 @@ impl TunnelClientDao {
     /// once: a repeat on a tombstone matches nothing and reports `false`
     /// rather than re-stamping it. The route 404s a repeat `DELETE` before
     /// reaching here (#1829).
+    /// FR-103: the same update advances `token_gen`, so every tunnel-client
+    /// token minted before the removal is refused, including after the same
+    /// laptop re-enrolls and revives the row (as `AgentDao::soft_delete`).
     pub async fn soft_delete(&self, tenant_id: ObjectId, client_id: ObjectId) -> DaoResult<bool> {
         self.base
             .update_one(
                 Self::live_row(tenant_id, client_id),
-                doc! { "$set": { "deleted_at": DateTime::now() } },
+                doc! {
+                    "$set": { "deleted_at": DateTime::now() },
+                    "$inc": { "token_gen": 1 },
+                },
             )
             .await
     }

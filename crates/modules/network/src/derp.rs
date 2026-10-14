@@ -396,6 +396,18 @@ pub async fn derp_upgrade(
                     .body("Unauthorized (derp)".into())
                     .unwrap();
             }
+            // FR-103 — a token minted before the device was removed.
+            if let Some(reason) = roomler_ai_mod_fleet::auth_agent::generation_refusal(
+                claims.generation,
+                agent.token_gen,
+                state.fleet.settings.rc.token_generation_check,
+            ) {
+                info!(%agent_id, %tenant_id, reason, row_gen = agent.token_gen, "derp: REFUSED before upgrade");
+                return Response::builder()
+                    .status(401)
+                    .body("Unauthorized (derp)".into())
+                    .unwrap();
+            }
         }
         Err(e) => {
             // Fail closed. This does NOT make DERP newly dependent on Mongo:

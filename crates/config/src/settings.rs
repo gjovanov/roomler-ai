@@ -561,6 +561,29 @@ pub struct RcSettings {
     /// them as the worker. Env: `ROOMLER__RC__EXEC_VIA_SERVICE`.
     #[serde(default = "default_true")]
     pub exec_via_service: bool,
+    /// FR-103 — serve `POST /api/agent/self/renew` and
+    /// `POST /api/tunnel-client/renew`. Default **true**. `false` is the
+    /// kill switch: both answer 404, and a device keeps the token it has,
+    /// exactly as before FR-103. Env: `ROOMLER__RC__TOKEN_RENEWAL`.
+    #[serde(default = "default_true")]
+    pub token_renewal: bool,
+    /// FR-103 — refuse an agent or tunnel-client token whose `gen` claim is
+    /// not the row's `token_gen`, i.e. one minted before the device was
+    /// removed. Default **true**. Every row never removed is at 0, as is every
+    /// pre-FR-103 token, so this refuses nothing else. `false` is the kill
+    /// switch if it ever does. Env: `ROOMLER__RC__TOKEN_GENERATION_CHECK`.
+    #[serde(default = "default_true")]
+    pub token_generation_check: bool,
+    /// FR-103 — the lifetime of a freshly minted agent or tunnel-client
+    /// token, in seconds. Default one year. A test knob: the integration lane
+    /// and a throwaway stack shorten it to prove expiry and the renewal grace.
+    /// Never shortened on prod. Env: `ROOMLER__RC__AGENT_TOKEN_TTL_SECS`.
+    #[serde(default = "default_agent_token_ttl_secs")]
+    pub agent_token_ttl_secs: u64,
+}
+
+fn default_agent_token_ttl_secs() -> u64 {
+    365 * 24 * 60 * 60
 }
 
 impl Default for RcSettings {
@@ -580,6 +603,9 @@ impl Default for RcSettings {
             ephemeral_reap_interval_secs: 60,
             ephemeral_default_ttl_secs: 900,
             exec_via_service: true,
+            token_renewal: true,
+            token_generation_check: true,
+            agent_token_ttl_secs: default_agent_token_ttl_secs(),
         }
     }
 }
@@ -1015,6 +1041,9 @@ impl Settings {
             .set_default("rc.ephemeral_reap_interval_secs", 60)?
             .set_default("rc.ephemeral_default_ttl_secs", 900)?
             .set_default("rc.exec_via_service", true)?
+            .set_default("rc.token_renewal", true)?
+            .set_default("rc.token_generation_check", true)?
+            .set_default("rc.agent_token_ttl_secs", 365 * 24 * 60 * 60)?
             .set_default("s3.enabled", false)?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?

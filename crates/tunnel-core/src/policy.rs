@@ -957,6 +957,8 @@ mod tests {
             keep_busy: None,
             ssh_host_pubkey: String::new(),
             agent_token_hash: String::new(),
+            token_gen: 0,
+            token_exp: None,
             status,
             last_seen_at: DateTime::now(),
             last_presence: None,

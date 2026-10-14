@@ -80,6 +80,24 @@ fn refusal_reason_parts(deleted: bool, status: AgentStatus) -> Option<&'static s
     }
 }
 
+/// FR-103: the single definition of "this token predates the device's
+/// removal". `Some(reason)` refuses. A removal bumps the row's `token_gen`
+/// (`AgentDao::soft_delete`, `TunnelClientDao::soft_delete`), and enrollment
+/// and renewal mint at the current value, so a token whose `gen` is not the
+/// row's was minted before a removal. Shared with the socket, DERP and the
+/// tunnel-client paths, as [`refusal_reason`] is.
+///
+/// Every row that was never removed is at 0, and so is every pre-FR-103 token
+/// (no `gen` claim), so before any removal this refuses nothing. `enforced`
+/// is `rc.token_generation_check`, the kill switch.
+///
+/// Callers check [`refusal_reason`] FIRST, so a removed device still hears
+/// that it was deleted (its typed goodbye) rather than this.
+pub fn generation_refusal(claims_gen: u32, row_gen: u32, enforced: bool) -> Option<&'static str> {
+    (enforced && claims_gen != row_gen)
+        .then_some("this credential was issued before the device was removed; re-enroll it")
+}
+
 /// The bearer token from an `Authorization` header, or `None` if it is
 /// missing, empty or a different scheme.
 ///
@@ -124,8 +142,44 @@ pub async fn authenticate(
         .verify_agent_token(token)
         .map_err(|e| ApiError::Unauthorized(e.to_string()))?;
 
-    let (agent_id, tenant_id, agent) =
-        accepted_agent(fleet, &claims.sub, &claims.tenant_id).await?;
+    let (agent_id, tenant_id, agent) = accepted_agent(
+        fleet,
+        &claims.sub,
+        &claims.tenant_id,
+        Some(claims.generation),
+    )
+    .await?;
+    Ok(AuthAgent {
+        agent_id,
+        tenant_id,
+        agent,
+    })
+}
+
+/// FR-103: [`authenticate`] for `POST /api/agent/self/renew` ONLY. The token
+/// may be up to `RENEWAL_GRACE_SECS` past its `exp`
+/// (`AuthService::verify_agent_token_for_renewal`), so a device that slept
+/// through its anniversary can buy a fresh one. Everything else is the same
+/// decision: audience, the row (deleted or quarantined refuses), and the
+/// generation. An expired token therefore renews only for a device that is
+/// still one we accept.
+pub async fn authenticate_for_renewal(
+    fleet: &FleetState,
+    headers: &axum::http::HeaderMap,
+) -> Result<AuthAgent, ApiError> {
+    let token = bearer_token(headers)
+        .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
+    let claims = fleet
+        .auth
+        .verify_agent_token_for_renewal(token)
+        .map_err(|e| ApiError::Unauthorized(e.to_string()))?;
+    let (agent_id, tenant_id, agent) = accepted_agent(
+        fleet,
+        &claims.sub,
+        &claims.tenant_id,
+        Some(claims.generation),
+    )
+    .await?;
     Ok(AuthAgent {
         agent_id,
         tenant_id,
@@ -160,8 +214,10 @@ pub async fn authenticate_service(
         .auth
         .verify_agent_service_token(token)
         .map_err(|e| ApiError::Unauthorized(e.to_string()))?;
+    // No generation: a removal ends this credential through its anchor
+    // (#2133, `soft_delete` clears `exec_anchor`), checked just below.
     let (agent_id, tenant_id, agent) =
-        accepted_agent(fleet, &claims.sub, &claims.tenant_id).await?;
+        accepted_agent(fleet, &claims.sub, &claims.tenant_id, None).await?;
     if !anchor_is_current(&agent, &claims.anchor_id) {
         tracing::info!(%agent_id, %tenant_id, "refusing service-authed request: anchor superseded");
         // 401: this credential is dead for good, and the service must hear
@@ -196,12 +252,14 @@ fn anchor_matches(current: Option<&str>, presented: &str) -> bool {
 }
 
 /// The row check both credentials share: the ids in the claims, the row
-/// they name, and [`refusal_reason`]. One definition of "this device may
-/// still act", whichever credential is asking.
+/// they name, [`refusal_reason`], and for an agent token (`gen` is `Some`)
+/// [`generation_refusal`]. One definition of "this device may still act",
+/// whichever credential is asking.
 async fn accepted_agent(
     fleet: &FleetState,
     sub: &str,
     tenant: &str,
+    generation: Option<u32>,
 ) -> Result<(ObjectId, ObjectId, Agent), ApiError> {
     let agent_id = ObjectId::parse_str(sub)
         .map_err(|_| ApiError::Unauthorized("invalid agent_id in claims".to_string()))?;
@@ -241,6 +299,17 @@ async fn accepted_agent(
         tracing::info!(%agent_id, %tenant_id, reason, "refusing agent-authed request");
         // 401, not 403: the credential itself is no longer accepted, and
         // that is what the device needs to hear.
+        return Err(ApiError::Unauthorized(reason.to_string()));
+    }
+
+    // FR-103 — after the row check, so a removed device hears "deleted".
+    if let Some(reason) = generation.and_then(|g| {
+        generation_refusal(g, agent.token_gen, fleet.settings.rc.token_generation_check)
+    }) {
+        tracing::info!(
+            %agent_id, %tenant_id, reason, row_gen = agent.token_gen,
+            "refusing agent-authed request: token predates the device's removal"
+        );
         return Err(ApiError::Unauthorized(reason.to_string()));
     }
 
@@ -314,6 +383,24 @@ mod tests {
         assert!(!anchor_matches(Some("a2"), "a1"), "re-anchored");
         assert!(!anchor_matches(None, "a1"), "un-anchored");
         assert!(!anchor_matches(Some(""), ""), "an empty id matches nothing");
+    }
+
+    /// FR-103: a token from before the device's removal is refused. Before
+    /// any removal everything is at 0 and passes, a pre-FR-103 token
+    /// included. The kill switch passes everything.
+    #[test]
+    fn only_a_token_of_the_rows_generation_is_accepted() {
+        assert_eq!(generation_refusal(0, 0, true), None, "never removed");
+        assert_eq!(generation_refusal(1, 1, true), None, "minted after it");
+        assert!(
+            generation_refusal(0, 1, true).is_some(),
+            "minted before the removal"
+        );
+        assert!(
+            generation_refusal(2, 1, true).is_some(),
+            "a generation the row never had"
+        );
+        assert_eq!(generation_refusal(0, 1, false), None, "the kill switch");
     }
 
     #[test]

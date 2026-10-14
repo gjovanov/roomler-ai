@@ -162,9 +162,15 @@ pub async fn enroll_tunnel_client(
     let client_id = client
         .id
         .ok_or_else(|| ApiError::Internal("tunnel client missing _id".to_string()))?;
-    let tunnel_client_token = state
-        .auth
-        .issue_tunnel_client_token(client_id, tid, admin_uid, None)?;
+    // FR-103 — at the row's CURRENT generation, so a client revived after a
+    // removal gets a token that is accepted, and its old ones are not.
+    let tunnel_client_token = state.auth.issue_tunnel_client_token(
+        client_id,
+        tid,
+        admin_uid,
+        client.token_gen,
+        Some(state.fleet.settings.rc.agent_token_ttl_secs),
+    )?;
 
     Ok(Json(TunnelEnrollResponse {
         tunnel_client_id: client_id.to_hex(),
@@ -203,8 +209,12 @@ pub async fn list_tenant_agents(
         .auth
         .verify_tunnel_client_token(token)
         .map_err(|_| ApiError::Unauthorized("invalid tunnel-client token".to_string()))?;
-    let tid = ObjectId::parse_str(&claims.tenant_id)
-        .map_err(|_| ApiError::BadRequest("invalid tenant_id claim".to_string()))?;
+    // FR-103 — the row is the revocation list here too. This route used to
+    // trust a valid signature alone, so a removed or quarantined client kept
+    // reading the org's roster for the rest of its token's year.
+    let client =
+        accepted_tunnel_client(&state, &claims.sub, &claims.tenant_id, claims.generation).await?;
+    let tid = client.tenant_id;
 
     // Tenants have tens of agents; one large page covers them.
     let params = PaginationParams {
@@ -228,6 +238,111 @@ pub async fn list_tenant_agents(
         })
         .collect();
     Ok(Json(agents))
+}
+
+/// FR-103 — the tunnel-client twin of fleet's `accepted_agent`: the row the
+/// claims name, refused if it is deleted or quarantined (the same rule the
+/// tunnel-client socket applies at connect) or if the token predates the
+/// client's removal (`generation_refusal`). A lookup FAILURE is a 500, never
+/// a 401: a database wobble must not tell a healthy client its credential is
+/// dead. `NotFound` is the authoritative "no such client".
+async fn accepted_tunnel_client(
+    state: &NetworkState,
+    sub: &str,
+    tenant: &str,
+    generation: u32,
+) -> Result<roomler_ai_remote_control::models::TunnelClient, ApiError> {
+    let client_id = ObjectId::parse_str(sub)
+        .map_err(|_| ApiError::Unauthorized("invalid tunnel-client id in claims".to_string()))?;
+    let tenant_id = ObjectId::parse_str(tenant)
+        .map_err(|_| ApiError::Unauthorized("invalid tenant_id in claims".to_string()))?;
+    let client = state
+        .tunnel_clients
+        .find_any_in_tenant(tenant_id, client_id)
+        .await
+        .map_err(|e| match e {
+            roomler_ai_services::dao::base::DaoError::NotFound => {
+                ApiError::Unauthorized("no such tunnel client".to_string())
+            }
+            other => ApiError::Internal(format!("tunnel-client lookup: {other}")),
+        })?;
+    if client.deleted_at.is_some()
+        || matches!(
+            client.status,
+            roomler_ai_remote_control::models::AgentStatus::Quarantined
+        )
+    {
+        return Err(ApiError::Unauthorized(
+            "tunnel client has been deleted or quarantined".to_string(),
+        ));
+    }
+    if let Some(reason) = roomler_ai_mod_fleet::auth_agent::generation_refusal(
+        generation,
+        client.token_gen,
+        state.fleet.settings.rc.token_generation_check,
+    ) {
+        return Err(ApiError::Unauthorized(reason.to_string()));
+    }
+    Ok(client)
+}
+
+/// FR-103 — what `POST /api/tunnel-client/renew` answers.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RenewedTunnelClientToken {
+    pub tunnel_client_token: String,
+    /// RFC 3339.
+    pub expires_at: String,
+}
+
+/// POST /api/tunnel-client/renew — FR-103: a `roomler` client buys a fresh
+/// token with the one it holds, up to `RENEWAL_GRACE_SECS` past its `exp`.
+/// The row is checked as on every tunnel-client route, and the new token keeps
+/// the same owner. Idempotent; `rc.token_renewal = false` answers 404.
+pub async fn renew_tunnel_client(
+    State(state): State<NetworkState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<RenewedTunnelClientToken>, ApiError> {
+    if !state.fleet.settings.rc.token_renewal {
+        return Err(ApiError::NotFound(
+            "token renewal is switched off on this server".to_string(),
+        ));
+    }
+    let token = bearer_token(&headers)
+        .ok_or_else(|| ApiError::Unauthorized("missing tunnel-client bearer token".to_string()))?;
+    let claims = state
+        .auth
+        .verify_tunnel_client_token_for_renewal(token)
+        .map_err(|e| ApiError::Unauthorized(e.to_string()))?;
+    let owner = ObjectId::parse_str(&claims.owner_user_id)
+        .map_err(|_| ApiError::Unauthorized("invalid owner in claims".to_string()))?;
+    let client =
+        accepted_tunnel_client(&state, &claims.sub, &claims.tenant_id, claims.generation).await?;
+    let client_id = client
+        .id
+        .ok_or_else(|| ApiError::Internal("tunnel client missing _id".to_string()))?;
+    let ttl = state.fleet.settings.rc.agent_token_ttl_secs;
+    let tunnel_client_token = state.auth.issue_tunnel_client_token(
+        client_id,
+        client.tenant_id,
+        owner,
+        client.token_gen,
+        Some(ttl),
+    )?;
+    let expires_at = bson::DateTime::from_millis(
+        bson::DateTime::now()
+            .timestamp_millis()
+            .saturating_add((ttl as i64).saturating_mul(1000)),
+    )
+    .try_to_rfc3339_string()
+    .unwrap_or_default();
+    tracing::info!(
+        tenant_id = %client.tenant_id, %client_id, token_gen = client.token_gen, %expires_at,
+        "fr-103: tunnel-client token renewed"
+    );
+    Ok(Json(RenewedTunnelClientToken {
+        tunnel_client_token,
+        expires_at,
+    }))
 }
 
 /// Extract the `Bearer <token>` value from the `Authorization` header.

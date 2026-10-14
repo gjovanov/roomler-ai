@@ -124,6 +124,10 @@ mod stats_tests;
 mod subscribe_tests;
 #[cfg(test)]
 mod tenant_archive_tests;
+/// FR-103 — device credentials renew themselves, and a removal ends every
+/// earlier token (agents and tunnel clients alike).
+#[cfg(test)]
+mod token_renewal_tests;
 #[cfg(test)]
 mod transfer_activity_tests;
 #[cfg(test)]

@@ -1286,7 +1286,7 @@ mod tests {
 /// The `/ws?role=agent` upgrade (FR-69 P7b, from the host): verify the agent
 /// JWT, the affinity key and the row, say why on refusal, then run the loop.
 /// The host keeps the `/ws` route and the role gate and hands the token here.
-pub fn ws_upgrade_agent(
+pub async fn ws_upgrade_agent(
     state: FleetState,
     token: String,
     tid: Option<String>,
@@ -1329,24 +1329,55 @@ pub fn ws_upgrade_agent(
         }
     };
 
+    // Verify the agent still exists and isn't quarantined/deleted before we
+    // pump any signalling. One Mongo read per connect is cheap and gives us a
+    // clean revocation story without needing a token blacklist.
+    //
+    // FR-103 — read BEFORE the upgrade, so a token minted before the device
+    // was removed (`generation_refusal`) is answered with the same plain 401
+    // as an expired one, which the daemon already treats as "auth rejected".
+    // Only a LIVE row is judged here: a deleted or quarantined one still
+    // upgrades and hears its typed goodbye below, and a failed read falls
+    // through to the same read inside the upgrade, as before. So this can
+    // only ADD a refusal, never lose one.
+    let pre_read = state
+        .agents
+        .find_any_in_tenant(tenant_id, agent_id)
+        .await
+        .ok();
+    if let Some(row) = &pre_read
+        && crate::auth_agent::refusal_reason(row).is_none()
+        && let Some(reason) = crate::auth_agent::generation_refusal(
+            claims.generation,
+            row.token_gen,
+            state.settings.rc.token_generation_check,
+        )
+    {
+        info!(%agent_id, reason, row_gen = row.token_gen, "refusing agent WS: token predates the device's removal");
+        return Response::builder()
+            .status(401)
+            .body("Unauthorized (agent)".into())
+            .unwrap();
+    }
+    let token_exp = claims.exp;
+
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
         .on_upgrade(move |socket| async move {
-            // Verify the agent still exists and isn't quarantined/deleted before
-            // we pump any signalling. One Mongo read per connect is cheap and
-            // gives us a clean revocation story without needing a token blacklist.
-            //
             // ANY, not live (#1821): the tombstone is what this read is FOR.
             // A removed device must reach the `refusal_reason` arm below and
             // get the typed `rc:goodbye AgentDeleted` it exits 7 on; a bare
             // `NotFound` here drops the socket with no frame, and the daemon
             // reads that as a network fault and reconnects forever.
-            let agent = match state.agents.find_any_in_tenant(tenant_id, agent_id).await {
-                Ok(a) => a,
-                Err(e) => {
-                    warn!(%agent_id, %e, "agent lookup failed on WS connect");
-                    return;
-                }
+            let agent = match pre_read {
+                Some(a) => a,
+                None => match state.agents.find_any_in_tenant(tenant_id, agent_id).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!(%agent_id, %e, "agent lookup failed on WS connect");
+                        return;
+                    }
+                },
             };
             // One definition of "this agent may still act", shared with the
             // HTTP ingest routes' `AuthAgent` extractor. This path is the
@@ -1372,6 +1403,12 @@ pub fn ws_upgrade_agent(
                 };
                 send_goodbye_and_close(socket, &goodbye, 4003, "agent_deleted").await;
                 return;
+            }
+            // FR-103 — what the device list shows as "the credential expires".
+            // Best-effort, like the hello write: a failure loses a date, never
+            // the connection.
+            if let Err(e) = state.agents.stamp_token_exp(agent_id, token_exp).await {
+                warn!(%agent_id, %e, "agent token_exp stamp failed");
             }
             // FR-69 P5c — the socket is the fleet module's; the host keeps
             // the upgrade and the role gate (D7), the module runs the loop.
