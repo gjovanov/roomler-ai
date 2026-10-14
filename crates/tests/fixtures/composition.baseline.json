@@ -129,6 +129,14 @@
       "methods": "POST"
     },
     {
+      "path": "/api/agent/service/ssh-host-key",
+      "methods": "PUT"
+    },
+    {
+      "path": "/api/agent/service/ssh/{grant_id}/claim",
+      "methods": "POST"
+    },
+    {
       "path": "/api/auth/activate",
       "methods": "POST"
     },
@@ -1874,6 +1882,23 @@
         ]
       },
       {
+        "collection": "ssh_pending",
+        "indexes": [
+          {
+            "key": {
+              "grant_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
         "collection": "stats_call",
         "indexes": [
           {
@@ -3480,6 +3505,23 @@
               "at": 1
             },
             "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "ssh_pending",
+        "indexes": [
+          {
+            "key": {
+              "grant_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 0
           }
         ]
       },
