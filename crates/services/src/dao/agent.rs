@@ -157,6 +157,9 @@ impl AgentDao {
             exec_anchor: None,
             // FR-105 — published by the device's SYSTEM service, never here.
             ssh_service: None,
+            // FR-104 — stamped by the enroll route once the row exists
+            // (`record_enrollment`).
+            enrolled_with_jti: None,
             ssh_policy: SshPolicy::default(),
             peer_relay_policy: Default::default(),
             // Nothing requested until an operator asks for something
@@ -236,6 +239,15 @@ impl AgentDao {
             )
             .await?;
         self.base.find_by_id(agent_id).await
+    }
+
+    /// FR-104 — record which enrollment token enrolled (or revived) this row.
+    /// An `anchor: true` token may anchor exactly this device afterwards; a
+    /// later enrollment with another token moves the binding to that one.
+    pub async fn record_enrollment(&self, agent_id: ObjectId, jti: &str) -> DaoResult<bool> {
+        self.base
+            .update_by_id(agent_id, doc! { "$set": { "enrolled_with_jti": jti } })
+            .await
     }
 
     pub async fn list_for_tenant(
