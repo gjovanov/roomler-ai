@@ -722,8 +722,9 @@ export interface RcInputReach {
  *
  *  `for` is `person_at_screen` (a dialog), from P5b `screen_unlock` (GNOME's
  *  lock screen, #2145), from P3e `display_wake` (a display switched off, DRM),
- *  or from P5f `session_away` (a user switch); `mediaWaitingCopy` words each. It is typed as a string on purpose: a
- *  newer agent may wait for something else, and its `hint` still reads. */
+ *  or from P5f `session_away` (a user switch); `mediaWaitingCopy` words each.
+ *  It is typed as a string on purpose: a newer agent may wait for something
+ *  else, and its `hint` still reads. */
 export interface RcMediaWaiting {
   for: string
   /** When the dialog gives up, on THIS browser's clock: the agent sends how

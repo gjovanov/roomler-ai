@@ -5158,7 +5158,7 @@ fn media_waiting_hook(
             %session_id,
             gives_up_in_s = wait.gives_up_in.as_secs(),
             why = ?wait.why,
-            "capture: waiting on the host (a portal dialog, an unlock, a display waking); telling the controller"
+            "capture: waiting on the host (a portal dialog, an unlock, a display waking, a user switch); telling the controller"
         );
         runtime.spawn(async move {
             // Bounded by the wait's own deadline too: past it, the notice

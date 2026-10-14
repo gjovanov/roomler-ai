@@ -42,13 +42,14 @@ pub struct PortalCapture {
     /// FR-93 P2 — frames from mutter's own ScreenCast, not the portal: the
     /// arm the controller is told about.
     mutter: bool,
-    /// FR-93 P5f — set while this user's display session is not the one on
-    /// its seat (a user switch, the login screen), as [`watch_session`] last
-    /// read it. `None` where nothing watches: a root daemon, or
+    /// FR-93 P5f — whether this user's display session is the one on its
+    /// seat (a user switch, the login screen), as [`watch_session`] last read
+    /// it. `None` where nothing watches: a root daemon, or
     /// `ROOMLERD_SESSION_WATCH=0`.
-    away: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Stops the watcher with the capture.
-    watch_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    watch: Option<std::sync::Arc<SessionWatch>>,
+    /// When the last frame arrived: proof the compositor draws this session,
+    /// newer than the watch's read on the way back (see [`away_now`]).
+    last_frame: Option<std::time::Instant>,
 }
 
 /// What one portal session is opened with. [`PortalOpen::from_env`] is the
@@ -242,10 +243,7 @@ impl PortalCapture {
         // FR-93 P5f — a per-user install captures only its own user's session,
         // which the compositor stops drawing while another session holds the
         // seat. Watched, so the controller can be told why the picture stopped.
-        let (away, watch_stop) = match watch_session() {
-            Some((away, stop)) => (Some(away), Some(stop)),
-            None => (None, None),
-        };
+        let watch = watch_session();
 
         Ok(Self {
             child,
@@ -255,8 +253,8 @@ impl PortalCapture {
             input_route_generation,
             cursor_embedded: started.cursor_embedded,
             mutter: use_mutter,
-            away,
-            watch_stop,
+            watch,
+            last_frame: None,
         })
     }
 
@@ -279,8 +277,8 @@ impl Drop for PortalCapture {
         if let Some(generation) = self.input_route_generation.take() {
             super::input_route::unregister(generation);
         }
-        if let Some(stop) = &self.watch_stop {
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(watch) = &self.watch {
+            watch.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -298,23 +296,18 @@ fn session_watch_enabled() -> bool {
 }
 
 /// FR-93 P5f — a watcher of this user's display session, for a per-user
-/// daemon: the flag reads `true` while logind says the session is not the
+/// daemon: its read says "away" while logind says the session is not the
 /// active one on its seat, and the thread ends when `stop` is set. `None` for
 /// a root daemon, whose captures are not one user's, or with the kill switch.
-fn watch_session() -> Option<(
-    std::sync::Arc<std::sync::atomic::AtomicBool>,
-    std::sync::Arc<std::sync::atomic::AtomicBool>,
-)> {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+fn watch_session() -> Option<std::sync::Arc<SessionWatch>> {
+    use std::sync::atomic::Ordering;
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
     if uid == 0 || !session_watch_enabled() {
         return None;
     }
-    let away = Arc::new(AtomicBool::new(false));
-    let stop = Arc::new(AtomicBool::new(false));
-    let (thread_away, thread_stop) = (Arc::clone(&away), Arc::clone(&stop));
+    let watch = std::sync::Arc::new(SessionWatch::new());
+    let thread_watch = std::sync::Arc::clone(&watch);
     let spawned = std::thread::Builder::new()
         .name("session-watch".into())
         .spawn(move || {
@@ -322,7 +315,8 @@ fn watch_session() -> Option<(
                 return;
             };
             let mut was_away = false;
-            while !thread_stop.load(Ordering::Relaxed) {
+            while !thread_watch.stop.load(Ordering::Relaxed) {
+                let began = std::time::Instant::now();
                 let now_away = session_away(&seat_sessions(&conn, uid));
                 if now_away != was_away {
                     tracing::info!(
@@ -332,11 +326,67 @@ fn watch_session() -> Option<(
                     );
                     was_away = now_away;
                 }
-                thread_away.store(now_away, Ordering::Relaxed);
+                thread_watch.record(now_away, began);
                 std::thread::sleep(SESSION_POLL);
             }
         });
-    spawned.ok().map(|_| (away, stop))
+    spawned.ok().map(|_| watch)
+}
+
+/// FR-93 P5f — what the session watch last read, shared by its thread and
+/// the capture, and the capture's word to stop it.
+struct SessionWatch {
+    /// The last read: [`SessionWatch::AWAY`] for "away", and below it when
+    /// the read began, in µs since `base`. One word, so an answer is never
+    /// read with another answer's time.
+    read: std::sync::atomic::AtomicU64,
+    base: std::time::Instant,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+impl SessionWatch {
+    /// The top bit of [`SessionWatch::read`].
+    const AWAY: u64 = 1 << 63;
+
+    /// Nothing read yet: not away.
+    fn new() -> Self {
+        Self {
+            read: std::sync::atomic::AtomicU64::new(0),
+            base: std::time::Instant::now(),
+            stop: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// A read's answer, with the time it began.
+    fn record(&self, away: bool, began: std::time::Instant) {
+        use std::sync::atomic::Ordering;
+        let at = began.saturating_duration_since(self.base).as_micros() as u64 & !Self::AWAY;
+        let flag = if away { Self::AWAY } else { 0 };
+        self.read.store(at | flag, Ordering::Relaxed);
+    }
+
+    /// The last read: away or not, and when it began.
+    fn last(&self) -> (bool, std::time::Instant) {
+        use std::sync::atomic::Ordering;
+        let read = self.read.load(Ordering::Relaxed);
+        (
+            read & Self::AWAY != 0,
+            self.base + std::time::Duration::from_micros(read & !Self::AWAY),
+        )
+    }
+}
+
+/// FR-93 P5f — the newer evidence wins. logind's "away" counts only when its
+/// read began after the last frame: a frame proves the compositor draws this
+/// session, and on the way back the frames come before the next read. Without
+/// this, a still desktop's first empty tick after the return told the
+/// controller "away" again, once, after its picture had come back.
+fn away_now(
+    away: bool,
+    read_began: std::time::Instant,
+    last_frame: Option<std::time::Instant>,
+) -> bool {
+    away && last_frame.is_none_or(|frame| read_began > frame)
 }
 
 /// FR-93 P5f — away when this user has a graphical session on a seat and none
@@ -392,7 +442,8 @@ fn seat_sessions(conn: &zbus::blocking::Connection, uid: u32) -> Vec<SeatSession
 
 #[cfg(test)]
 mod session_away_tests {
-    use super::{SeatSession, session_away};
+    use super::{SeatSession, SessionWatch, away_now, session_away};
+    use std::time::{Duration, Instant};
 
     const fn s(graphical: bool, active: bool) -> SeatSession {
         SeatSession { graphical, active }
@@ -421,6 +472,38 @@ mod session_away_tests {
             session_away(&[s(false, true), s(true, false)]),
             "the tty is the active one, the desktop is not"
         );
+    }
+
+    /// P5f — the newer evidence wins: a frame after the read that said "away"
+    /// means the session came back before the watch read it again, so only a
+    /// read newer than the last frame counts.
+    #[test]
+    fn a_frame_newer_than_the_read_means_the_session_is_back() {
+        let read = Instant::now();
+        let later = read + Duration::from_millis(400);
+        assert!(away_now(true, read, None), "away, and no frame yet");
+        assert!(
+            away_now(true, later, Some(read)),
+            "a read newer than the frame"
+        );
+        assert!(
+            !away_now(true, read, Some(later)),
+            "a frame after the read: back"
+        );
+        assert!(!away_now(false, later, Some(read)), "not away");
+    }
+
+    /// P5f — the watch's one word keeps an answer with its own time.
+    #[test]
+    fn the_watch_keeps_each_answer_with_its_time() {
+        let watch = SessionWatch::new();
+        assert!(!watch.last().0, "nothing read yet: not away");
+        let began = watch.base + Duration::from_millis(1500);
+        watch.record(true, began);
+        assert_eq!(watch.last(), (true, began));
+        let back = began + Duration::from_secs(1);
+        watch.record(false, back);
+        assert_eq!(watch.last(), (false, back));
     }
 }
 
@@ -480,7 +563,11 @@ impl ScreenCapture for PortalCapture {
         // each other.
         let rx = &self.rx;
         match tokio::task::block_in_place(|| rx.recv_timeout(FRAME_WAIT)) {
-            Ok(f) => Ok(Some(f)),
+            Ok(f) => {
+                // FR-93 P5f — proof the compositor draws this session.
+                self.last_frame = Some(std::time::Instant::now());
+                Ok(Some(f))
+            }
             // No frame inside the window is not an error: a still screen
             // legitimately produces nothing, and `Ok(None)` is the pump's
             // "nothing this tick".
@@ -518,10 +605,8 @@ impl ScreenCapture for PortalCapture {
     /// FR-93 P5f — this user's session is away from its seat: the pumps tell
     /// the controller, and keep no keepalive while it lasts.
     fn waits_for(&self) -> Option<crate::capture::WaitFor> {
-        self.away
-            .as_ref()
-            .filter(|away| away.load(std::sync::atomic::Ordering::Relaxed))
-            .map(|_| crate::capture::WaitFor::SessionAway)
+        let (away, read_began) = self.watch.as_ref()?.last();
+        away_now(away, read_began, self.last_frame).then_some(crate::capture::WaitFor::SessionAway)
     }
 }
 
