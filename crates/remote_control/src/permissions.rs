@@ -19,6 +19,15 @@ bitflags::bitflags! {
         const FILES      = 0b0000_0000_0000_1000;
         const AUDIO      = 0b0000_0000_0001_0000;
         const RECORD     = 0b0000_0000_0010_0000;
+        /// FR-99 — the session may turn privacy mode on: a curtain covers the
+        /// device's screen for the person in front of it, while the
+        /// controller still sees the desktop.
+        ///
+        /// ⚠️ The hub grants it ONLY to an agent advertising `privacy-mode`
+        /// (`RpcCap::PrivacyMode`), and never under break-glass. This wire
+        /// is names-only, so an agent that predates the name fails the whole
+        /// frame that carries it.
+        const PRIVACY    = 0b0000_0000_0100_0000;
     }
 }
 
@@ -65,6 +74,15 @@ bitflags::bitflags! {
 /// in explicitly with [`deserialize_stored`] — do that for any new stored
 /// `Permissions`, top-level or nested, and leave this impl as the wire rule.
 ///
+/// **Unknown names in storage are dropped, not refused (FR-99).** A stored
+/// row outlives the binary that wrote it: once a newer server stores a name
+/// this build has never heard of (`PRIVACY`, first), a rollback to this
+/// build must still read the session list. So the storage rule drops the
+/// unknown name, the fail-safe direction, exactly as it truncates unknown
+/// bits. The wire rule still refuses it: a typo on `rc:*` must fail loudly.
+/// This only protects a rollback to a build that HAS it, which is why it
+/// landed in the release that added the first new name, ahead of any writer.
+///
 /// **Why only the read side changed, both times.** Every reader in the field
 /// expects the name form on the wire, and both shapes already exist on disk.
 /// "Symmetrising" the writer to `u16` would strand every name-shaped row and
@@ -88,8 +106,9 @@ impl<'de> Deserialize<'de> for Permissions {
 /// read as human-readable under the raw driver cursor and refused the `Int32`
 /// the raw driver insert had written (#1630). A field-level opt-in is the one
 /// signal independent of where in the document the field sits. Unknown bits
-/// are truncated — the fail-safe direction; an unknown NAME is still an error,
-/// exactly as on the wire.
+/// are truncated and unknown NAMES dropped — the fail-safe direction, so a
+/// row a newer server wrote still reads after a rollback (FR-99; see the
+/// type docs). The wire rule keeps refusing an unknown name.
 ///
 /// ⚠️ Only for types that never arrive over the `rc:*` JSON wire: a struct
 /// carrying this attribute accepts `"permissions": 3` from JSON too.
@@ -118,6 +137,10 @@ impl serde::de::Visitor<'_> for NamesOrBits {
         }
     }
     fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Permissions, E> {
+        if self.accept_bits {
+            // Storage: a name from a newer writer is dropped (FR-99).
+            return Ok(parse_stored_names(s));
+        }
         parse_wire_names(s).ok_or_else(|| E::custom(format!("unknown permission in {s:?}")))
     }
     fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Permissions, E> {
@@ -156,6 +179,16 @@ fn parse_wire_names(s: &str) -> Option<Permissions> {
     Some(out)
 }
 
+/// The storage counterpart of [`parse_wire_names`]: the same form, but a
+/// name this build does not know is DROPPED rather than refused — a row a
+/// newer server wrote must not make this one fail to read it (FR-99).
+/// Dropping grants less, never more.
+fn parse_stored_names(s: &str) -> Permissions {
+    s.split('|')
+        .filter_map(|part| Permissions::from_name(part.trim()))
+        .fold(Permissions::empty(), |acc, p| acc | p)
+}
+
 impl Default for Permissions {
     fn default() -> Self {
         Self::VIEW | Self::INPUT | Self::CLIPBOARD
@@ -168,7 +201,9 @@ impl Permissions {
     }
 
     pub fn requires_consent_prompt(self) -> bool {
-        self.intersects(Self::INPUT | Self::FILES | Self::AUDIO | Self::RECORD)
+        // FR-99 — PRIVACY too: covering someone's screen is never a
+        // watch-only grant, even beside VIEW alone.
+        self.intersects(Self::INPUT | Self::FILES | Self::AUDIO | Self::RECORD | Self::PRIVACY)
     }
 
     /// The pipe-separated name form (`"VIEW | INPUT"`) — byte-identical to what
@@ -337,12 +372,51 @@ mod tests {
         );
     }
 
-    /// An unrecognised name is an error, not a silent partial grant.
+    /// On the WIRE an unrecognised name is an error, not a silent partial
+    /// grant. In STORAGE it is dropped (FR-99): the row was written by a newer
+    /// server, and this build must still read it after a rollback.
     #[test]
-    fn an_unknown_permission_name_is_refused() {
+    fn an_unknown_permission_name_is_refused_on_the_wire_and_dropped_in_storage() {
         assert!(serde_json::from_str::<Permissions>("\"VIEW | NOPE\"").is_err());
         let bytes = bson::to_vec(&bson::doc! { "permissions": "VIEW | NOPE" }).unwrap();
-        assert!(bson::from_slice::<StoredPerms>(&bytes).is_err());
+        let back: StoredPerms = bson::from_slice(&bytes).expect("storage drops the unknown name");
+        assert_eq!(back.permissions, Permissions::VIEW);
+    }
+
+    /// FR-99 — PRIVACY has its own name and bit, and is never a watch-only
+    /// grant.
+    #[test]
+    fn privacy_is_its_own_permission_and_always_prompts() {
+        assert_eq!(Permissions::PRIVACY.bits(), 0b0100_0000);
+        assert_eq!(
+            serde_json::to_string(&(Permissions::VIEW | Permissions::PRIVACY)).unwrap(),
+            "\"VIEW | PRIVACY\""
+        );
+        let p: Permissions = serde_json::from_str("\"VIEW | INPUT | PRIVACY\"").unwrap();
+        assert!(p.contains(Permissions::PRIVACY));
+        assert!((Permissions::VIEW | Permissions::PRIVACY).requires_consent_prompt());
+        assert!(!Permissions::VIEW.requires_consent_prompt());
+        // Not part of the legacy default grant: nothing asks for it by accident.
+        assert!(!Permissions::default().contains(Permissions::PRIVACY));
+    }
+
+    /// FR-99 — the rollback case, through the driver's real raw pair: a row a
+    /// newer server wrote with a name this build does not know (here a
+    /// stand-in, since PRIVACY is known to this build) reads back with the
+    /// rest of its grant, under the tagged-enum opt-in and on a plain field.
+    #[test]
+    fn a_name_from_a_newer_server_does_not_break_reading_its_row() {
+        let row: Row<TaggedStored> =
+            bson::from_slice(&tagged_row("VIEW | PRIVACY | FROM_THE_FUTURE".into()))
+                .expect("a newer writer's row reads");
+        let TaggedStored::Requested { permissions } = row.event;
+        assert_eq!(permissions, Permissions::VIEW | Permissions::PRIVACY);
+        let bytes = bson::to_vec(&bson::doc! { "permissions": "FROM_THE_FUTURE | INPUT" }).unwrap();
+        let back: StoredPerms = bson::from_slice(&bytes).unwrap();
+        assert_eq!(back.permissions, Permissions::INPUT);
+        let empty = bson::to_vec(&bson::doc! { "permissions": "" }).unwrap();
+        let back: StoredPerms = bson::from_slice(&empty).unwrap();
+        assert_eq!(back.permissions, Permissions::empty());
     }
 
     // ── #1630: the gate is blind under serde's Content buffering ───────────
@@ -440,9 +514,10 @@ mod tests {
         assert_eq!(permissions, Permissions::VIEW | Permissions::INPUT);
     }
 
-    /// Same strictness as the wire on names, fail-safe on bits.
+    /// Fail-safe on bits and, since FR-99, on names: an unknown one is
+    /// dropped, never granted, and never fails the row.
     #[test]
-    fn deserialize_stored_truncates_unknown_bits_and_refuses_unknown_names() {
+    fn deserialize_stored_drops_unknown_bits_and_unknown_names() {
         let row: Row<TaggedStored> =
             bson::from_slice(&tagged_row(bson::Bson::Int32(0x4001))).unwrap();
         let TaggedStored::Requested { permissions } = row.event;
@@ -451,7 +526,20 @@ mod tests {
             Permissions::VIEW,
             "an unknown bit is dropped, never granted"
         );
-        assert!(bson::from_slice::<Row<TaggedStored>>(&tagged_row("VIEW | NOPE".into())).is_err());
+        let row: Row<TaggedStored> = bson::from_slice(&tagged_row("VIEW | NOPE".into())).unwrap();
+        let TaggedStored::Requested { permissions } = row.event;
+        assert_eq!(
+            permissions,
+            Permissions::VIEW,
+            "an unknown name is dropped too"
+        );
+        // …while the wire rule, under the same tagged shape, still refuses it.
+        assert!(
+            serde_json::from_str::<Row<TaggedWire>>(
+                r#"{"event":{"kind":"requested","permissions":"VIEW | NOPE"}}"#
+            )
+            .is_err()
+        );
     }
 
     /// And the wire rule is untouched by any of it: names read, numbers do

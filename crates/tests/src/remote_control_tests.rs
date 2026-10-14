@@ -1128,6 +1128,7 @@ async fn session_audit_reads_back_rows_the_audit_sink_wrote() {
             controller_name: "audit1630 Admin".into(),
             permissions: Permissions::VIEW | Permissions::INPUT | Permissions::CLIPBOARD,
             record_stripped: None,
+            privacy_stripped: None,
         },
     );
     sink.record(

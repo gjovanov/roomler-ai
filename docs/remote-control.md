@@ -926,6 +926,7 @@ A remote-control feature is the most-abused capability in any product. Mitigatio
 - **No keystroke logging** in audit — only event counts. The controlled user's passwords typed during a session must not be persisted.
 - **Tray icon cannot be hidden** by config; if you want covert monitoring, this is the wrong product.
 - **Break-glass never records** (FR-85). An `ADMINISTRATOR` who skips consent with an `override_reason` is never granted `RECORD`, whatever their mask says: nobody at the machine agreed to the session, so a recording of it would be covert.
+- **Break-glass never covers the screen** (FR-99, decision 1). The same session is never granted `PRIVACY` either (`privacy_refused` `break_glass`): it is the one session nobody at the device was asked about, and a curtain would hide it from the only person in a position to object. The hub reads break-glass from the authz gate's `override_reason`, which the cross-pod relay carries, so an owner pod applies the rule too.
 - **No prompt-bombing** (FR-101 P4a). A caller may send one device at most 60 session requests a minute, checked after the authz gate, so a caller who may not ask is refused by identity first. Past the ceiling the answer is `rc:error` `rate_limited`, which the viewer does not retry. Each request can put a consent prompt in front of the person at the device, and the control WS is outside the per-IP HTTP governor.
 
 ### 11.5 The host's Disconnect (FR-27 P10)

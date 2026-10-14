@@ -26,7 +26,8 @@ use roomler_ai_remote_control::consent::{
 };
 use roomler_ai_remote_control::error::{Error, Result};
 use roomler_ai_remote_control::models::{
-    AgentCaps, AuditKind, ConsentMode, EndReason, ExecOutcome, OsKind, RecordCap, SessionPhase,
+    AgentCaps, AuditKind, ConsentMode, EndReason, ExecOutcome, OsKind, RecordCap, RpcCap,
+    SessionPhase,
 };
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::session::{ClientTx, LiveSession};
@@ -141,6 +142,12 @@ pub struct ConnectedAgent {
     /// OFF and a rollback alike. Anything but [`RecordSupport::Serves`] ⇒
     /// `create_session` strips `Permissions::RECORD`.
     pub record_support: RecordSupport,
+    /// FR-99 — what the agent says about privacy mode in `AgentCaps.rpc`.
+    /// Per CONNECTION, like [`Self::record_support`]: the stored row outlives
+    /// an owner's OFF and a rollback alike, and a rolled-back agent that never
+    /// knew the `PRIVACY` name would fail the whole `rc:request` carrying it.
+    /// Anything but [`PrivacySupport::Serves`] ⇒ `create_session` strips it.
+    pub privacy_support: PrivacySupport,
     /// FR-92 — the agent advertises `keep-busy` in `AgentCaps.input`: it
     /// parses `rc:agent.keep_busy_policy`. Per CONNECTION; a pre-FR-92 agent
     /// would log every policy frame as an unknown `rc:*` at WARN.
@@ -266,6 +273,76 @@ pub fn record_grant(
     if device != RecordSupport::Serves {
         return (
             permissions - Permissions::RECORD,
+            Some("device_not_opted_in"),
+        );
+    }
+    (permissions, None)
+}
+
+/// FR-99 — what a device says about privacy mode, from its `rpc` words.
+/// [`RecordSupport`]'s shape, for its reason: "the owner has not allowed it"
+/// is worth a sentence in the viewer, "this device cannot do it" is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrivacySupport {
+    /// No curtain is possible here: an agent that predates privacy mode, a
+    /// platform with no way to keep a window out of capture (macOS,
+    /// Wayland), or a build without it. ⚠️ Such an agent may not even know
+    /// the `PRIVACY` name, so it must never be sent one.
+    #[default]
+    None,
+    /// A curtain is possible, but the device's owner has not allowed privacy
+    /// mode (`privacy-available` without `privacy-mode`).
+    NotOptedIn,
+    /// The owner allowed it, and the agent serves it (`privacy-mode`).
+    Serves,
+}
+
+impl PrivacySupport {
+    /// Equality-matched through [`AgentCaps::has_rpc`]. `privacy-mode` wins
+    /// over `privacy-available`: an agent that says both serves it.
+    pub fn from_caps(caps: &AgentCaps) -> Self {
+        if caps.has_rpc(RpcCap::PrivacyMode) {
+            Self::Serves
+        } else if caps.has_rpc(RpcCap::PrivacyAvailable) {
+            Self::NotOptedIn
+        } else {
+            Self::None
+        }
+    }
+}
+
+/// FR-99 — the PRIVACY part of a grant, [`record_grant`]'s shape: kept only
+/// for a session that is not break-glass, on an agent that serves privacy
+/// mode; otherwise stripped, with the reason (for the audit and the viewer).
+/// A grant without PRIVACY passes untouched.
+///
+/// ⚠️ Break-glass never covers the screen (FR-99 decision 1, 2026-10-14). It
+/// is the one session nobody at the device was asked about, audited and
+/// mailed to the owner — and a curtain would hide it from the only person in
+/// a position to object. The same rule as RECORD.
+///
+/// A device that cannot curtain at all is named FIRST, as in
+/// [`record_grant`]: there is nothing there to allow or refuse.
+pub fn privacy_grant(
+    permissions: Permissions,
+    break_glass: bool,
+    device: PrivacySupport,
+) -> (Permissions, Option<&'static str>) {
+    if !permissions.contains(Permissions::PRIVACY) {
+        return (permissions, None);
+    }
+    if device == PrivacySupport::None {
+        return (
+            permissions - Permissions::PRIVACY,
+            Some("device_cannot_curtain"),
+        );
+    }
+    if break_glass {
+        return (permissions - Permissions::PRIVACY, Some("break_glass"));
+    }
+    if device != PrivacySupport::Serves {
+        return (
+            permissions - Permissions::PRIVACY,
             Some("device_not_opted_in"),
         );
     }
@@ -491,6 +568,9 @@ impl Hub {
             // FR-85 P3 — set by `set_agent_record_support` right after
             // registration; `None` (RECORD stripped) until it is.
             record_support: RecordSupport::None,
+            // FR-99 — set by `set_agent_privacy_support`; `None` (PRIVACY
+            // stripped, never sent) until it is.
+            privacy_support: PrivacySupport::None,
             // FR-92 — set by `set_agent_keep_busy_support`; `false` = no
             // policy frame is ever pushed to this connection.
             supports_keep_busy: false,
@@ -1012,9 +1092,15 @@ impl Hub {
                     .as_ref()
                     .map(|tx| ptr_eq(tx, &controller_tx) && !tx.is_closed())
                     .unwrap_or(false);
-            is_dup.then(|| (s.id, s.permissions, s.record_refused))
+            is_dup.then(|| (s.id, s.permissions, s.record_refused, s.privacy_refused))
         });
-        if let Some((existing_id, existing_perms, existing_record_refused)) = existing {
+        if let Some((
+            existing_id,
+            existing_perms,
+            existing_record_refused,
+            existing_privacy_refused,
+        )) = existing
+        {
             info!(
                 "coalescing duplicate rc:session.request from controller {} to agent {} onto live \
                  session {} (same connection; no second consent prompt)",
@@ -1035,11 +1121,13 @@ impl Hub {
                 // FR-85 P3 — the SAME grant, so the same reason: a retry
                 // must not read as "RECORD was never asked for".
                 record_refused: existing_record_refused.map(str::to_string),
+                // FR-99 — and the same for PRIVACY.
+                privacy_refused: existing_privacy_refused.map(str::to_string),
             });
             return Ok(existing_id);
         }
 
-        let (agent_org, agent_arbitrates, agent_records) = {
+        let (agent_org, agent_arbitrates, agent_records, agent_privacy) = {
             let mut agent = self
                 .inner
                 .agents
@@ -1049,7 +1137,12 @@ impl Hub {
                 return Err(Error::AgentBusy);
             }
             agent.active_sessions += 1;
-            (agent.tenant_id, agent.input_arbiter, agent.record_support)
+            (
+                agent.tenant_id,
+                agent.input_arbiter,
+                agent.record_support,
+                agent.privacy_support,
+            )
         };
 
         // Multi-user P3 back-compat — the FILES bit becomes agent-ENFORCED in
@@ -1101,6 +1194,17 @@ impl Hub {
         // the reason travels in the audit and to the viewer — never silently.
         let (permissions, record_refused) = record_grant(permissions, may_record, agent_records);
 
+        // FR-99 — PRIVACY survives only on an agent that serves privacy mode
+        // (its owner opted in, so it advertises `privacy-mode`) and never
+        // under break-glass. The authz gate sets `override_reason` for a
+        // validated ADMINISTRATOR force and only then, so it IS the
+        // break-glass signal here — on this pod and on an owner pod the
+        // frame was relayed to alike, since the relay carries it. Anything
+        // else is stripped BEFORE `rc:request` is built: an agent that does
+        // not know the name would fail the whole frame.
+        let (permissions, privacy_refused) =
+            privacy_grant(permissions, override_reason.is_some(), agent_privacy);
+
         let session_id = ObjectId::new();
         let (mut live, waiter) = LiveSession::new(
             session_id,
@@ -1120,6 +1224,8 @@ impl Hub {
         live.consent_mode = consent_mode;
         // FR-85 P3 — kept for a duplicate request coalesced onto this session.
         live.record_refused = record_refused;
+        // FR-99 — likewise.
+        live.privacy_refused = privacy_refused;
         // Multi-region relay: freeze the session's region NOW — a load-aware
         // pick over the agent's home + its RTT-ordered prefs — so Ready/
         // Offer/Answer all issue from the same PoP regardless of mid-setup
@@ -1148,6 +1254,7 @@ impl Hub {
             agent_id,
             permissions: Some(permissions),
             record_refused: record_refused.map(str::to_string),
+            privacy_refused: privacy_refused.map(str::to_string),
         });
 
         // Per-mode consent window: modes with an owner-side (email/push) leg get
@@ -1218,6 +1325,7 @@ impl Hub {
                 controller_name: controller_name.clone(),
                 permissions,
                 record_stripped: record_refused.map(str::to_string),
+                privacy_stripped: privacy_refused.map(str::to_string),
             },
         );
         self.audit(session_id, agent_id, agent_org, AuditKind::ConsentPrompted);
@@ -1768,6 +1876,14 @@ impl Hub {
     pub fn set_agent_record_support(&self, agent_id: ObjectId, support: RecordSupport) {
         if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
             entry.record_support = support;
+        }
+    }
+
+    /// FR-99 — record what the agent says about privacy mode (its hello's,
+    /// or a heartbeat's, `AgentCaps.rpc`; see [`PrivacySupport::from_caps`]).
+    pub fn set_agent_privacy_support(&self, agent_id: ObjectId, support: PrivacySupport) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.privacy_support = support;
         }
     }
 
@@ -3677,6 +3793,170 @@ mod tests {
                 other => panic!("expected SessionCreated, got {other:?}"),
             }
         }
+    }
+
+    /// FR-99 — PRIVACY is kept only off break-glass, on a device that serves
+    /// it. Each refusal is named, a device that cannot curtain first.
+    #[test]
+    fn privacy_is_granted_only_off_break_glass_on_a_serving_device() {
+        use PrivacySupport::{None as NoCurtain, NotOptedIn, Serves};
+        let want = Permissions::VIEW | Permissions::INPUT | Permissions::PRIVACY;
+        let rest = Permissions::VIEW | Permissions::INPUT;
+        assert_eq!(privacy_grant(want, false, Serves), (want, None));
+        assert_eq!(
+            privacy_grant(want, true, Serves),
+            (rest, Some("break_glass"))
+        );
+        assert_eq!(
+            privacy_grant(want, false, NotOptedIn),
+            (rest, Some("device_not_opted_in"))
+        );
+        // Both refusals: break-glass is named, as the controller's is for
+        // RECORD.
+        assert_eq!(
+            privacy_grant(want, true, NotOptedIn),
+            (rest, Some("break_glass"))
+        );
+        for break_glass in [true, false] {
+            assert_eq!(
+                privacy_grant(want, break_glass, NoCurtain),
+                (rest, Some("device_cannot_curtain"))
+            );
+        }
+        // A grant that never asked passes untouched, with no reason.
+        assert_eq!(
+            privacy_grant(Permissions::default(), true, NoCurtain),
+            (Permissions::default(), None)
+        );
+        // It strips PRIVACY alone — RECORD's own gate decides RECORD.
+        let both = want | Permissions::RECORD;
+        assert_eq!(
+            privacy_grant(both, true, Serves),
+            (rest | Permissions::RECORD, Some("break_glass"))
+        );
+    }
+
+    /// FR-99 — the `rpc` words, read by equality: `privacy-available` alone
+    /// is a curtain its owner has not allowed; `privacy-mode` serves; nothing,
+    /// a near miss, or a word from the future is no curtain at all.
+    #[test]
+    fn privacy_support_reads_the_rpc_words_by_equality() {
+        let caps = |words: &[&str]| AgentCaps {
+            rpc: words.iter().map(|w| w.to_string()).collect(),
+            ..Default::default()
+        };
+        assert_eq!(PrivacySupport::from_caps(&caps(&[])), PrivacySupport::None);
+        assert_eq!(
+            PrivacySupport::from_caps(&caps(&["exec", "privacy-available"])),
+            PrivacySupport::NotOptedIn
+        );
+        assert_eq!(
+            PrivacySupport::from_caps(&caps(&["privacy-available", "privacy-mode"])),
+            PrivacySupport::Serves
+        );
+        assert_eq!(
+            PrivacySupport::from_caps(&caps(&["privacy-mode"])),
+            PrivacySupport::Serves
+        );
+        for near_miss in ["privacy", "privacy-mode-2", "privacy-modes", "PRIVACY-MODE"] {
+            assert_eq!(
+                PrivacySupport::from_caps(&caps(&[near_miss])),
+                PrivacySupport::None,
+                "{near_miss}"
+            );
+        }
+    }
+
+    /// FR-99 — end to end through `create_session_full`, reading what the
+    /// AGENT is sent as well as what the viewer is told. An agent that does
+    /// not serve privacy mode must never see the name: on the names-only wire
+    /// an agent that predates it would fail the whole `rc:request`.
+    #[tokio::test]
+    async fn the_hub_strips_privacy_before_the_agent_can_see_it() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Windows,
+            8,
+            true,
+            false,
+        );
+        let mut ask = |hub: &Hub, override_reason: Option<&str>| {
+            let (tx, mut rx) = mpsc::channel(8);
+            hub.create_session_full(
+                agent_id,
+                ObjectId::new(),
+                "ctl".into(),
+                tx,
+                Permissions::VIEW | Permissions::INPUT | Permissions::PRIVACY,
+                Vec::new(),
+                None,
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                override_reason.map(str::to_string),
+                None,
+                false, // rc_overlay
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+            let (granted, why) = match rx.try_recv().unwrap() {
+                ServerMsg::SessionCreated {
+                    permissions,
+                    privacy_refused,
+                    ..
+                } => (permissions.unwrap(), privacy_refused),
+                other => panic!("expected SessionCreated, got {other:?}"),
+            };
+            let sent = loop {
+                match agent_rx.try_recv().unwrap() {
+                    ServerMsg::Request { permissions, .. } => break permissions,
+                    _ => continue,
+                }
+            };
+            assert_eq!(sent, granted, "the agent is sent the viewer's grant");
+            (granted, why)
+        };
+
+        // Nothing advertised: an agent that may not know the name at all.
+        let (p, why) = ask(&hub, None);
+        assert!(!p.contains(Permissions::PRIVACY));
+        assert!(
+            p.contains(Permissions::VIEW | Permissions::INPUT),
+            "the rest survives"
+        );
+        assert_eq!(why.as_deref(), Some("device_cannot_curtain"));
+
+        hub.set_agent_privacy_support(agent_id, PrivacySupport::NotOptedIn);
+        let (p, why) = ask(&hub, None);
+        assert!(!p.contains(Permissions::PRIVACY));
+        assert_eq!(why.as_deref(), Some("device_not_opted_in"));
+
+        hub.set_agent_privacy_support(agent_id, PrivacySupport::Serves);
+        let (p, why) = ask(&hub, None);
+        assert!(
+            p.contains(Permissions::PRIVACY),
+            "a serving device, no break-glass"
+        );
+        assert_eq!(why, None);
+
+        // Break-glass on a serving device: still never.
+        let (p, why) = ask(&hub, Some("server room fire"));
+        assert!(!p.contains(Permissions::PRIVACY));
+        assert_eq!(why.as_deref(), Some("break_glass"));
+
+        // The owner switches it off while connected (the agent re-announces
+        // `privacy-available` alone): the next grant drops it.
+        hub.set_agent_privacy_support(agent_id, PrivacySupport::NotOptedIn);
+        let (p, why) = ask(&hub, None);
+        assert!(!p.contains(Permissions::PRIVACY));
+        assert_eq!(why.as_deref(), Some("device_not_opted_in"));
     }
 
     /// Multi-user P3 — ONE INPUT holder per agent: a second concurrent
