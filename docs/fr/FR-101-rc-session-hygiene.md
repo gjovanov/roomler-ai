@@ -156,14 +156,19 @@ and gives labs an explicit escape before the default flips.
   the audit rows (with a mermaid diagram of where they are written), the timeouts and the transport
   settings. Linked from `docs/README.md`.
 
-## 6. Open decisions
+## 6. Decisions
+
+**All three were decided by the operator on 2026-10-14, as recommended.** Each entry keeps what was
+weighed.
 
 1. **Clipboard auto-sync's default.** Recommended: keep it **on** for existing users, add the policy switch,
    and show the state in the viewer. Turning it off changes a daily workflow, which is a product decision.
+   **Decided: as recommended.** The default stays on; P2 adds the switch, and the viewer shows the state.
 2. **Idle timeout defaults.** Recommended: off for existing tenants, a 30-minute recommendation shown on the
-   tenant settings page.
+   tenant settings page. **Decided: as recommended.**
 3. **File-name privacy in audit.** Recommended: a hash, not the name. The audit records that a transfer
-   happened, not what the file was called.
+   happened, not what the file was called. **Decided: as recommended**, and P3 built it that way
+   (`name_sha256`).
 
 ## 7. Out of scope
 

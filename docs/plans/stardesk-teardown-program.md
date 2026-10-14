@@ -201,12 +201,17 @@ teardown are not lost.
 
 ## 5. Decisions the operator owns
 
-1. **Merge FR-52** (#1197, #1563, #1628). FR-100 builds on its binding.
-2. **Clipboard auto-sync's default** (FR-101).
+*Decided by the operator on 2026-10-14, as recommended: 1, 2, 5 and 6. Each FR's §6 has the detail.*
+
+1. **Merge FR-52** (#1197, #1563, #1628). FR-100 builds on its binding. **Decided: land FR-52 first.**
+2. **Clipboard auto-sync's default** (FR-101). **Decided: stays on**; P2 adds the policy switch, and the
+   viewer shows the state.
 3. **The virtual-display driver:** bundle the signed upstream driver unmodified, or attest our own.
 4. **webrtc-rs 0.20:** only if the 0.12 data-channel ceiling cannot carry 4K144.
-5. **Privacy mode under break-glass,** and the person's way out (FR-99).
-6. **When `peer_auth` moves from audit to enforce,** and the unattended default (FR-100).
+5. **Privacy mode under break-glass,** and the person's way out (FR-99). **Decided:** never under
+   break-glass. Ctrl+Alt+Del is the way out of the input block, and the curtain says so.
+6. **When `peer_auth` moves from audit to enforce,** and the unattended default (FR-100). **Decided:** per
+   device, by its owner, after AC4. An unattended device denies an unknown controller.
 7. **The spare box:** an NVIDIA GPU, ideally a ≥ 120 Hz panel, an isolated network, a client device, the
    GearUP account.
 8. **The high-refresh default.**
