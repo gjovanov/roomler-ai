@@ -50,6 +50,7 @@
 
 pub mod agent_socket;
 pub mod attribution;
+pub mod campaign;
 pub mod capabilities;
 pub mod cluster;
 pub mod composition;
@@ -57,6 +58,7 @@ pub mod cookies;
 pub mod error;
 pub mod extractors;
 pub mod graph;
+pub mod growth;
 pub mod guards;
 pub mod hooks;
 pub mod job;

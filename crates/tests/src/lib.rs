@@ -68,6 +68,10 @@ mod enroll_key_tests;
 mod ephemeral_tests;
 #[cfg(test)]
 mod exec_service_tests;
+/// FR-102 — growth observability: the campaign taxonomy at ingress (AC5),
+/// the exclusion list and the set every growth number applies (AC4).
+#[cfg(test)]
+mod growth_tests;
 #[cfg(test)]
 mod hive_tests;
 #[cfg(test)]

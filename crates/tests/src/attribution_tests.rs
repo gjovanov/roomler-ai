@@ -85,8 +85,11 @@ async fn register_and_login(
 }
 
 fn assert_clean(surface: &str, text: &str) {
+    // FR-102 normalises `source`/`medium` to lowercase at ingress, so the
+    // stored value of those two is the lowercase form — a leak of either
+    // spelling is a leak.
     assert!(
-        !text.contains(PLANTED),
+        !text.contains(PLANTED) && !text.contains(&PLANTED.to_ascii_lowercase()),
         "{surface} leaked the planted attribution value: {text}"
     );
     assert!(
@@ -237,15 +240,16 @@ async fn the_attribution_reaches_no_user_facing_response() {
         }),
     )
     .await;
-    // Stored — the test would otherwise pass by not storing anything.
+    // Stored — the test would otherwise pass by not storing anything. The
+    // source is the TAXONOMY's spelling (FR-102: lowercased at ingress); the
+    // campaign is kept as sent.
     let doc = user_doc(&app, "hidden@test.io").await;
+    let stored = doc.get_document("signup_attribution").unwrap();
     assert_eq!(
-        doc.get_document("signup_attribution")
-            .unwrap()
-            .get_str("source")
-            .unwrap(),
-        PLANTED
+        stored.get_str("source").unwrap(),
+        PLANTED.to_ascii_lowercase()
     );
+    assert_eq!(stored.get_str("campaign").unwrap(), PLANTED);
 
     let tenants: Vec<Value> = app
         .auth_get("/api/tenant", &access)

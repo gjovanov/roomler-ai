@@ -177,6 +177,8 @@ before the search runs, so `q` cannot probe them.
 | GET | `/api/admin/stats/relay/current` · `/relay/history` | Relay (TURN/DERP) load, live + series |
 | GET | `/api/admin/stats/orgs` · `/users` · `/machines` · `/calls` | Platform-wide inventories |
 | GET | `/api/admin/stats/usage` · `/usage/{user_id}` | Per-user usage across every org |
+| GET | `/api/admin/stats/attribution` | FR-88: sign-ups by campaign key and how many activated — counts only |
+| GET/PUT | `/api/admin/growth/exclusions` | FR-102 P1c: the orgs and people no growth number counts — the implicit set (platform admins, the orgs they own) marked beside the explicit rows; PUT replaces the explicit list (`{kind: tenant\|user, id, reason}`). 404 also when `growth.enabled = false` |
 | POST | `/api/admin/overlay-block/reclaim` | Reclaim quarantined overlay address blocks (dry-run by default) |
 | POST/GET | `/api/admin/newsletter/issues` | FR-58: create draft / list issues |
 | PUT/GET | `/api/admin/newsletter/issues/{slug}` | Edit while draft (409 after) / read back |

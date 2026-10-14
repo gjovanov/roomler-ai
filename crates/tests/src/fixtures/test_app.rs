@@ -485,6 +485,9 @@ fn test_settings() -> Settings {
         // exercise the real write path; platform_admins is set per-test
         // via `spawn_with_settings`.
         stats: roomler_ai_config::StatsSettings::default(),
+        // FR-102 — the growth routes on, the digest OFF (the shipped
+        // default); a digest test drives the job directly.
+        growth: roomler_ai_config::GrowthSettings::default(),
         // FR-20 P5 - no prices configured, which is what a test deployment
         // (and any deployment without the toml) actually looks like. Every
         // cost therefore reads "not priced" rather than 0.00.

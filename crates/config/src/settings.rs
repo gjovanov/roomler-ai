@@ -36,6 +36,11 @@ pub struct Settings {
     pub releases: ReleasesSettings,
     pub overlay: OverlaySettings,
     pub stats: StatsSettings,
+    /// FR-102 — growth observability: the exclusion list and the taxonomy's
+    /// routes (P1), the daily digest (P1d). Absent ⇒ the routes serve and the
+    /// digest is OFF.
+    #[serde(default)]
+    pub growth: GrowthSettings,
     /// FR-20 P5 — unit costs for the metered resources. Deliberately
     /// **not** `Default`: absent means *not priced*, never zero.
     #[serde(default)]
@@ -443,6 +448,99 @@ impl Default for StatsSettings {
             platform_admins: None,
             geoip_mmdb: None,
         }
+    }
+}
+
+/// FR-102 — `[growth]`, env `ROOMLER__GROWTH__*`: the growth-observability
+/// surface under `/api/admin/growth/*` (platform admins only, like
+/// `/admin/stats`), and the daily digest job (`docs/growth-observability.md`).
+#[derive(Debug, Deserialize, Clone)]
+pub struct GrowthSettings {
+    /// Gate for the `/api/admin/growth/*` routes. Default **on**: it gates
+    /// only platform-admin views and a read is cheap. `false` answers 404
+    /// on every one of them — the P2 kill switch.
+    /// Env: `ROOMLER__GROWTH__ENABLED`.
+    #[serde(default = "growth_default_on")]
+    pub enabled: bool,
+    /// The daily digest job (P1d). Default **off**, so a self-hosted server
+    /// never starts mailing its admins a report they did not ask for; the
+    /// hosted configuration turns it on. Env: `ROOMLER__GROWTH__DIGEST_ENABLED`.
+    #[serde(default)]
+    pub digest_enabled: bool,
+    /// The UTC hour (0–23) after which the PREVIOUS UTC day's digest is
+    /// computed and sent. 6 by default: purestat closes a session 30 min
+    /// after its last event, so by 06:00 the day is complete on both planes.
+    /// A value past 23 reads as 6. Env: `ROOMLER__GROWTH__DIGEST_HOUR_UTC`.
+    #[serde(default = "growth_default_digest_hour")]
+    pub digest_hour_utc: u8,
+    /// Comma-separated recipient addresses. Empty — the default — mails the
+    /// platform admins at their proven `users.email`.
+    /// Env: `ROOMLER__GROWTH__DIGEST_TO`.
+    ///
+    /// ⚠️ `String`, not `Vec<String>`, for the reason on
+    /// [`JwtSettings::previous_secrets`]: an env var cannot become a sequence.
+    #[serde(default)]
+    pub digest_to: String,
+    /// purestat's base URL, for the web sections of the digest (the v1 query
+    /// at `{purestat_url}/api/v1/query`). Env: `ROOMLER__GROWTH__PURESTAT_URL`.
+    #[serde(default = "growth_default_purestat_url")]
+    pub purestat_url: String,
+    /// A purestat API key scoped to the site (`X-API-Key`). Empty — the
+    /// default — leaves the website, blog and campaign sections "not
+    /// measured", never 0. Never logged. Env: `ROOMLER__GROWTH__PURESTAT_API_KEY`.
+    #[serde(default)]
+    pub purestat_api_key: String,
+}
+
+fn growth_default_on() -> bool {
+    true
+}
+
+fn growth_default_digest_hour() -> u8 {
+    6
+}
+
+fn growth_default_purestat_url() -> String {
+    "https://purestat.ai".to_string()
+}
+
+impl Default for GrowthSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            digest_enabled: false,
+            digest_hour_utc: growth_default_digest_hour(),
+            digest_to: String::new(),
+            purestat_url: growth_default_purestat_url(),
+            purestat_api_key: String::new(),
+        }
+    }
+}
+
+impl GrowthSettings {
+    /// `digest_to` as a list: split on commas, trimmed, empties dropped.
+    pub fn digest_recipients(&self) -> Vec<String> {
+        self.digest_to
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// `digest_hour_utc` clamped to a real hour — a misconfigured 25 must
+    /// not become "never".
+    pub fn digest_hour(&self) -> u8 {
+        if self.digest_hour_utc <= 23 {
+            self.digest_hour_utc
+        } else {
+            growth_default_digest_hour()
+        }
+    }
+
+    /// Whether the web sections can be measured at all.
+    pub fn purestat_configured(&self) -> bool {
+        !self.purestat_api_key.trim().is_empty()
     }
 }
 
@@ -1251,6 +1349,38 @@ mod hive_settings_tests {
         assert!(!absent.teleport_have_want, "a file without the key");
         let on: HiveSettings = toml::from_str("teleport_have_want = true").unwrap();
         assert!(on.teleport_have_want);
+    }
+}
+
+#[cfg(test)]
+mod growth_settings_tests {
+    use super::GrowthSettings;
+
+    /// FR-102 — the digest ships OFF, both where the settings are built whole
+    /// and where a file leaves every key out; the routes ship ON; the
+    /// recipient list and the hour read the way the hosted config writes them.
+    #[test]
+    fn the_digest_is_off_and_the_routes_are_on_by_default() {
+        let d = GrowthSettings::default();
+        assert!(d.enabled);
+        assert!(!d.digest_enabled);
+        assert_eq!(d.digest_hour(), 6);
+        assert!(d.digest_recipients().is_empty());
+        assert!(!d.purestat_configured());
+        assert_eq!(d.purestat_url, "https://purestat.ai");
+        let absent: GrowthSettings = toml::from_str("").expect("every key defaults");
+        assert!(!absent.digest_enabled);
+        assert!(absent.enabled);
+        let set: GrowthSettings = toml::from_str(
+            "digest_enabled = true\ndigest_hour_utc = 7\ndigest_to = \" a@x.test, ,b@x.test \"\npurestat_api_key = \"k\"",
+        )
+        .unwrap();
+        assert!(set.digest_enabled);
+        assert_eq!(set.digest_hour(), 7);
+        assert_eq!(set.digest_recipients(), vec!["a@x.test", "b@x.test"]);
+        assert!(set.purestat_configured());
+        let late: GrowthSettings = toml::from_str("digest_hour_utc = 25").unwrap();
+        assert_eq!(late.digest_hour(), 6, "out of range reads as the default");
     }
 }
 
