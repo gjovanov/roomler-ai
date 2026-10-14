@@ -304,9 +304,17 @@ Compatibility, both directions, is what the shape is built around:
   release is current, and a daemon from before `--install-method` existed refuses an argument it
   does not know — which would have failed every scripted install until the next agent release.
   `ROOMLER_INSTALL_METHOD` / `ROOMLER_INSTALL_SCOPE` are the flag's fallbacks
-  (`roomler_node_core::enrollment::resolve_install`: flag, then env, then `manual` / `unknown`;
-  a misspelling is refused before the single-use token is spent); an older daemon ignores them.
-  `install.sh` passes them through `env` so they survive `sudo`.
+  (`roomler_node_core::enrollment::resolve_install`: flag, then env, then `manual` / `unknown`);
+  an older daemon ignores them. `install.sh` passes them through `env` so they survive `sudo`;
+  `install.ps1` removes them after the enroll, since an `irm | iex` run shares the caller's
+  process.
+- ⚠️ **A spelling the daemon does not know is refused from the FLAG and clamped from the ENV.**
+  A flag is the operator's own command line, so a typo is refused before the single-use token
+  is spent. The variables come from the scripts, which are compiled into the *server*
+  (`include_str!`) and roll with a promote, while the daemon they install comes from the agent
+  release channel — a script can know a spelling before the daemon does, and refusing it would
+  fail every scripted enrollment until the next agent release. So an unknown env value enrolls
+  as `other` / `unknown` with a warning, the same clamp the server applies.
 
 The row is shown on the device (`GET …/agent/{id}` → `install`), which is what a field check
 reads (AC9).
