@@ -480,7 +480,12 @@ impl CarrierPlane {
             // rebuilds the whole plane — that must not be invisible).
             let mut last_stun_drop_log: Option<Instant> = None;
             loop {
-                let (n, src) = match sock.recv_from(&mut buf).await {
+                // #2220 — read on past the errors about an EARLIER datagram:
+                // Windows reports a peer's ICMP port-unreachable as 10054 on
+                // the next receive, and ending here on it left this socket
+                // bound, advertised and unread until a watchdog rebuilt the
+                // whole plane (107 s in the field).
+                let (n, src) = match super::udp_recv::recv_from(&sock, &mut buf).await {
                     Ok(v) => v,
                     Err(e) => {
                         // PR-B1 tripwire — a dead recv loop leaves the socket
@@ -2550,5 +2555,39 @@ mod tests {
             (None, None) => {} // no usable LAN interface (CI container)
             _ => panic!("one caller bound while the other didn't"),
         }
+    }
+
+    /// #2220 — the field case, on loopback. The plane's socket sends to ports
+    /// nothing listens on, and Windows reports each ICMP port-unreachable as
+    /// `WSAECONNRESET` on the NEXT receive. The loop used to END on the first,
+    /// leaving the socket bound, advertised and unread (107 s in the field,
+    /// until a watchdog rebuilt the whole plane). It must read what arrives
+    /// after them. Linux never reports the ICMP on an unconnected socket, so
+    /// this passes there either way; Windows is where it discriminates.
+    #[tokio::test]
+    async fn port_unreachables_do_not_end_the_plane_loop() {
+        let plane = CarrierPlane::new();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let local = sock.local_addr().unwrap();
+        let task = plane.adopt_socket(sock.clone());
+        let mut stun = plane.take_stun_events().unwrap();
+        for _ in 0..3 {
+            let gone = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let closed = gone.local_addr().unwrap();
+            drop(gone);
+            sock.send_to(b"to nobody", closed).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let ext = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ping = crate::transport::stun::encode_binding_request([4u8; 12]);
+        ext.send_to(&ping, local).await.unwrap();
+        let got = timeout(Duration::from_secs(5), stun.recv())
+            .await
+            .expect("the plane loop must still read after the port-unreachables")
+            .expect("sink open");
+        assert_eq!(got.packet, ping.to_vec());
+        assert!(!task.is_finished(), "the plane loop must still be running");
+        task.abort();
     }
 }

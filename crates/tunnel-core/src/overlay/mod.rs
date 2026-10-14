@@ -76,6 +76,10 @@ pub mod runtime;
 #[cfg(feature = "overlay-netstack")]
 pub mod split_tun;
 pub mod tun;
+/// #2213 / #2220 — reading a UDP socket past the errors Windows reports about
+/// an EARLIER datagram (an ICMP port-unreachable, as 10054), for every loop
+/// that serves a real OS socket.
+pub(crate) mod udp_recv;
 /// Multi-org P2c — one shared OS TUN carrying N per-org runtimes behind
 /// per-org [`tun::TunIo`] facades with dst-based longest-prefix demux.
 pub(crate) mod warm_relay;

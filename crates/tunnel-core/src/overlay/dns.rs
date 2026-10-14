@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use super::router::derive_overlay_v6;
+use super::udp_recv::recv_error_is_transient;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -148,26 +149,13 @@ async fn bind_until_up(
     }
 }
 
-/// #2213 — a `recv_from` error that reports an EARLIER datagram, not the
-/// socket. Windows reports an ICMP port-unreachable, drawn by a reply we sent
-/// to a port the DNS client had already closed (it gives up on a slow answer
-/// and retries from a new one), as `WSAECONNRESET` (10054) on the NEXT
-/// receive. A datagram larger than the buffer comes back as `WSAEMSGSIZE`
-/// (10040). Neither says anything about the resolver. Field, 2026-10-14: both
-/// Windows exit clients' resolvers exited on 10054 within ten seconds of the
-/// exit's "." steer pointing every query at them.
-fn recv_error_is_transient(e: &std::io::Error) -> bool {
-    use std::io::ErrorKind;
-    matches!(
-        e.kind(),
-        ErrorKind::ConnectionReset
-            | ErrorKind::ConnectionRefused
-            | ErrorKind::Interrupted
-            | ErrorKind::WouldBlock
-    ) || e.raw_os_error() == Some(10040)
-}
-
 /// Answer queries on `sock` until it fails for a reason that IS about it.
+///
+/// #2213 — a reply to a port the DNS client had already closed (it gives up
+/// on a slow answer and retries from a new one) draws an ICMP port-unreachable,
+/// which Windows reports on the NEXT receive ([`recv_error_is_transient`]).
+/// Field, 2026-10-14: both Windows exit clients' resolvers exited on it within
+/// ten seconds of the exit's "." steer pointing every query at them.
 async fn serve(cfg: &DnsConfig, sock: Arc<UdpSocket>) {
     let mut buf = [0u8; 1500];
     loop {
@@ -1052,24 +1040,6 @@ mod tests {
         };
         let resp = build_response(&query_for("devbox", 1), &cfg).await.unwrap();
         assert_eq!(&resp[resp.len() - 4..], &[100, 64, 0, 9]);
-    }
-
-    /// #2213 — the receive errors that are about an earlier datagram, not
-    /// the socket: Windows' ICMP-driven 10054, an oversized datagram's 10040.
-    #[test]
-    fn errors_about_an_earlier_datagram_are_not_fatal() {
-        use std::io::{Error, ErrorKind};
-        for kind in [ErrorKind::ConnectionReset, ErrorKind::ConnectionRefused] {
-            assert!(recv_error_is_transient(&Error::from(kind)), "{kind:?}");
-        }
-        assert!(recv_error_is_transient(&Error::from_raw_os_error(10040)));
-        for kind in [
-            ErrorKind::InvalidInput,
-            ErrorKind::NotConnected,
-            ErrorKind::Other,
-        ] {
-            assert!(!recv_error_is_transient(&Error::from(kind)), "{kind:?}");
-        }
     }
 
     /// #2213 — the field case. Clients ask and close their port before the
