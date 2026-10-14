@@ -746,6 +746,26 @@ export function agentIsWaiting(waiting: RcMediaWaiting | null, nowMs: number): b
   return waiting !== null && nowMs < waiting.deadlineMs + RC_MEDIA_WAITING_GRACE_MS
 }
 
+/** FR-93 P5f — how long after a notice arrives a frame the watchdog counts may
+ *  still have come in before it: one stats poll (`STATS_POLL_MS`) and its
+ *  latency, on the RTP path. */
+export const RC_MEDIA_WAITING_SETTLE_MS = 1_000
+
+/** FR-93 P5f — does a watchdog tick that saw media advance end the agent's
+ *  wait? Only when the interval it counted (since `intervalFromMs`) began a
+ *  settle time after the notice arrived. The agent's last frames travel on the
+ *  video channel and its notice on the control one, so a frame sent just
+ *  before the notice can be counted just after it. Measured on the FR-93 lab:
+ *  that frame cleared the notice, and the watchdog re-created the session
+ *  10 s later. Pure so the rule is testable. */
+export function advanceEndsWait(
+  advanced: boolean,
+  intervalFromMs: number,
+  waitingSinceMs: number,
+): boolean {
+  return advanced && intervalFromMs >= waitingSinceMs + RC_MEDIA_WAITING_SETTLE_MS
+}
+
 /** FR-93 P5b — the waiting overlay's words, by what the agent waits for. */
 export interface RcMediaWaitingCopy {
   /** The overlay's headline. */
@@ -4253,7 +4273,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     if (watchdogTimer !== null) return
     stallTicks = 0
     lastMediaProgress = { rtpBytes: statsPrevBytes, vp9Frames: 0, hevcFrames: 0 }
+    // FR-93 P5f — when the interval this tick counts began (see advanceEndsWait).
+    let tickFromMs = Date.now()
     watchdogTimer = setInterval(() => {
+      const intervalFromMs = tickFromMs
+      tickFromMs = Date.now()
       if (phase.value !== 'connected') return
       const cur = {
         rtpBytes: statsPrevBytes,
@@ -4277,8 +4301,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         deadAirStreak.value = 0
         reconnectAttempt.value = 0
       }
-      // FR-93 P2d-2 — the first frame ends any wait the agent announced.
-      if (advanced && mediaWaiting.value !== null) mediaWaiting.value = null
+      // FR-93 P2d-2 — the first frame ends any wait the agent announced. P5f —
+      // the first frame after the notice: one counted with it may predate it.
+      if (
+        mediaWaiting.value !== null
+        && advanceEndsWait(advanced, intervalFromMs, mediaWaitingSinceMs)
+      ) mediaWaiting.value = null
       // FR-93 — an agent that said it cannot capture is believed: no probe,
       // no re-create, the reason stays on the screen. P2d-2 — and so is one
       // that said it waits for the person at the screen, until the dialog's
@@ -4392,6 +4420,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  wait ended without an answer, and that message says why), and on every
    *  new connect. */
   const mediaWaiting = ref<RcMediaWaiting | null>(null)
+  /** FR-93 P5f — when the latest notice arrived, on this browser's clock: only
+   *  a frame after it ends the wait (`advanceEndsWait`). */
+  let mediaWaitingSinceMs = 0
   /** FR-80 — the WebCodecs config string the active DataChannel decoder was
    *  built with (`avc1.640034`, `av01.0.13M.08`, …). The pill's honest label
    *  until `rc:video-info` names the agent's real encoder. */
@@ -8985,6 +9016,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           deadlineMs: Date.now() + parsed.waitsMs,
           hint: parsed.hint,
         }
+        mediaWaitingSinceMs = Date.now()
         console.info(
           `[rc] the host is waiting for the person at the screen (${parsed.for}), up to ${Math.round(parsed.waitsMs / 1000)} s`,
         )
