@@ -21,7 +21,13 @@ fn spawn_agent_signaling(
     cfg: AgentConfig,
     stop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_agent_signaling_as(signaling::OrgCtx::primary(), cfg, stop_rx)
+    spawn_agent_signaling_as(
+        signaling::OrgCtx::primary(roomlerd::token_slot::TokenSlot::new(
+            cfg.agent_token.clone(),
+        )),
+        cfg,
+        stop_rx,
+    )
 }
 
 /// Multi-org P1 — like [`spawn_agent_signaling`] but with an explicit
@@ -42,6 +48,29 @@ fn spawn_agent_signaling_as(
 async fn run_agent_signaling_as(
     ctx: signaling::OrgCtx,
     cfg: AgentConfig,
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    run_agent_signaling_on(ctx, cfg, None, stop_rx).await
+}
+
+/// FR-103 — like [`spawn_agent_signaling_as`], with the loop's config file
+/// at `config_path`, as `run_cmd` has it: a renewal saves there, and the 401
+/// recovery reads a re-enrolled token from it.
+pub(crate) fn spawn_agent_signaling_on(
+    ctx: signaling::OrgCtx,
+    cfg: AgentConfig,
+    config_path: std::path::PathBuf,
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let _ = run_agent_signaling_on(ctx, cfg, Some(config_path), stop_rx).await;
+    })
+}
+
+async fn run_agent_signaling_on(
+    ctx: signaling::OrgCtx,
+    cfg: AgentConfig,
+    config_path: Option<std::path::PathBuf>,
     stop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -78,7 +107,7 @@ async fn run_agent_signaling_as(
         // which is exactly what `main.rs` does. See agent_exec_tests for
         // the failure hardcoding `false` produced.
         roomlerd::remote_config::RemoteConfigServices::new(
-            std::path::PathBuf::from("unused-in-tests.toml"),
+            config_path.unwrap_or_else(|| std::path::PathBuf::from("unused-in-tests.toml")),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             exec_enabled,
             remote_config_enabled,
@@ -95,7 +124,7 @@ async fn run_agent_signaling_as(
 /// Helper: issue an enrollment token via the admin REST route, then run the
 /// agent's own `enrollment::enroll()` to get back an `AgentConfig` pointed
 /// at the test server.
-async fn enrol_via_agent_lib(
+pub(crate) async fn enrol_via_agent_lib(
     app: &TestApp,
     seeded: &crate::fixtures::seed::SeededTenant,
     machine_id: &str,
@@ -252,7 +281,10 @@ async fn same_machine_enrolls_into_two_tenants_and_both_connect() {
     let prim_task = spawn_agent_signaling(cfg.clone(), stop_rx.clone());
     let org_cfg = cfg.for_org(&cfg.orgs[0]);
     let org_task = spawn_agent_signaling_as(
-        signaling::OrgCtx::secondary(&cfg.orgs[0].label),
+        signaling::OrgCtx::secondary(
+            &cfg.orgs[0].label,
+            roomlerd::token_slot::TokenSlot::new(org_cfg.agent_token.clone()),
+        ),
         org_cfg.clone(),
         stop_rx,
     );
@@ -313,7 +345,14 @@ async fn a_refused_secondary_org_ends_on_a_typed_goodbye_naming_the_ways_out() {
     let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let ended = tokio::time::timeout(
         Duration::from_secs(30),
-        run_agent_signaling_as(signaling::OrgCtx::secondary("demo"), org_cfg, stop_rx),
+        run_agent_signaling_as(
+            signaling::OrgCtx::secondary(
+                "demo",
+                roomlerd::token_slot::TokenSlot::new(org_cfg.agent_token.clone()),
+            ),
+            org_cfg,
+            stop_rx,
+        ),
     )
     .await
     .expect("a refused org's loop must end, not keep reconnecting");
@@ -781,7 +820,10 @@ async fn join_org_pushes_a_live_device_into_a_second_organization() {
         spawn_org: Box::new(move |org| {
             let base = roomlerd::config::load(&spawn_path).expect("reload");
             spawn_agent_signaling_as(
-                signaling::OrgCtx::secondary(&org.label),
+                signaling::OrgCtx::secondary(
+                    &org.label,
+                    roomlerd::token_slot::TokenSlot::new(org.agent_token.clone()),
+                ),
                 base.for_org(&org),
                 spawn_rx.clone(),
             );

@@ -350,6 +350,9 @@ pub struct OrgRuntime {
     /// it is re-seeded whenever a row is, which is also when the config that
     /// decides it was last read.
     pub overlay_mode: &'static str,
+    /// FR-103 — the enrollment's LIVE token slot (shared with its loop), so
+    /// `OrgStatus.token_expires_at` moves the moment a renewal lands.
+    pub token: crate::token_slot::TokenSlot,
 }
 
 /// Shared registry of [`OrgRuntime`] rows (primary first).
@@ -686,6 +689,9 @@ impl LocalApiState for DaemonState {
                                         .and_then(|t| t.clone()),
                                     updates_ignored: o.updates_ignored.load(Ordering::Relaxed),
                                     overlay_mode: o.overlay_mode.to_string(),
+                                    token_expires_at: crate::token_renewal::expires_at(
+                                        &o.token.get(),
+                                    ),
                                 })
                                 .collect()
                         })
@@ -2138,7 +2144,7 @@ mod tests {
             Arc::new(Mutex::new(vec![crate::self_view::OrgHttp {
                 label: "primary".into(),
                 server_url: "https://example.invalid".into(),
-                agent_token: "tok".into(),
+                token: crate::token_slot::TokenSlot::new("tok"),
                 primary: true,
                 enabled: true,
             }]));

@@ -192,6 +192,10 @@ fn shared_carrier_plane()
 /// `main`, so a missing one here means a misconfiguration).
 pub async fn maybe_start(
     cfg: &AgentConfig,
+    // FR-103 — this enrollment's LIVE token. The DERP dialer below outlives
+    // the connection that built it (the runtime persists across reconnects),
+    // so it reads this per dial rather than keeping a copy.
+    token: crate::token_slot::TokenSlot,
     outbound: mpsc::Sender<ClientMsg>,
     peer_view: watch::Sender<OverlayView>,
     derp_ticket_slot: crate::relay_probe::DerpTicketSlot,
@@ -348,12 +352,11 @@ pub async fn maybe_start(
     // OUT over TCP/TLS-443), and returns the mux. Default-ON since rc.203.
     let derp_factory: Option<DerpMuxFactory> = if tunnel_core::overlay::direct::derp_enabled() {
         let ws_url = cfg.ws_url();
-        let token = cfg.agent_token.clone();
         let tenant = cfg.tenant_id.clone();
         let pubkey = keypair.public.to_bytes();
         Some(Box::new(move || {
             let (mux, outbound_rx) = tunnel_core::transport::derp::DerpMux::new(pubkey);
-            crate::derp::spawn(&ws_url, &token, &tenant, &mux, outbound_rx);
+            crate::derp::spawn(&ws_url, token.clone(), &tenant, &mux, outbound_rx);
             // R4 — expose this tenant's central mux to the tunnel plane
             // (the quic-derp-v1 flavor multiplexes over it).
             register_derp_tunnel_mux(&tenant, &mux);

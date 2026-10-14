@@ -2207,6 +2207,16 @@ fn print_status(s: &NodeStatus) {
             "disconnected"
         }
     );
+    // FR-103 — the primary enrollment's credential. Printed only when the
+    // daemon reports it, so an older daemon's output is unchanged.
+    if let Some(exp) = s
+        .orgs
+        .iter()
+        .find(|o| o.primary)
+        .and_then(|o| o.token_expires_at)
+    {
+        println!("  credential  {}", credential_expiry(exp, unix_now()));
+    }
     print_orgs(&s.orgs);
     // P5/S4 — exit-node routing (only when this node is configured as a client).
     // S3b — when active, also report whether global IPv6 rides the exit or is
@@ -2514,6 +2524,40 @@ fn print_status(s: &NodeStatus) {
     }
 }
 
+/// FR-103 — an agent token's expiry as `roomler status` says it: relative,
+/// because "in 172 days" is the fact an operator acts on and needs no
+/// calendar. A device renews its own token well before this, so an expiry
+/// that keeps approaching is the thing to notice.
+fn credential_expiry(expires_at: i64, now_unix: i64) -> String {
+    const DAY: i64 = 86_400;
+    let plural = |n: i64| if n == 1 { "" } else { "s" };
+    if expires_at > now_unix {
+        let days = (expires_at - now_unix) / DAY;
+        if days == 0 {
+            "expires within a day".to_string()
+        } else {
+            format!("expires in {days} day{}", plural(days))
+        }
+    } else {
+        // The server renews a token up to 90 days past its expiry
+        // (`RENEWAL_GRACE_SECS`); past that, only a re-enrollment helps.
+        let days = (now_unix - expires_at) / DAY;
+        let next = if days < 90 {
+            format!("renewable for {} more day{}", 90 - days, plural(90 - days))
+        } else {
+            "re-enroll this device".to_string()
+        };
+        format!("EXPIRED {days} day{} ago ({next})", plural(days))
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// FR-49 — the per-enrollment block in `roomler status`.
 ///
 /// `NodeStatus.orgs` has been on the wire since multi-org P1 and was rendered
@@ -2545,6 +2589,12 @@ fn print_orgs(orgs: &[tunnel_core::localapi::OrgStatus]) {
         println!("    {:<14} {conn}, {overlay}{primary}", o.label);
         if let Some(err) = &o.terminal_error {
             println!("                   stopped: {err}");
+        }
+        if let Some(exp) = o.token_expires_at {
+            println!(
+                "                   credential {}",
+                credential_expiry(exp, unix_now())
+            );
         }
     }
     // The line that closes the gap this FR is about: enabled + connected +
@@ -3077,6 +3127,7 @@ mod tests {
             terminal_error: None,
             updates_ignored: 0,
             overlay_mode: overlay_mode.into(),
+            token_expires_at: None,
         }
     }
 
@@ -3084,6 +3135,24 @@ mod tests {
     /// identically. Before this, an overlay-off org produced no section at all
     /// in `roomler peers`, which is exactly what an org whose peers happen to
     /// be offline produces.
+    /// FR-103 — the credential line is relative, and an expired token says
+    /// so loudly, with the grace the server still gives it.
+    #[test]
+    fn a_credential_expiry_reads_in_days() {
+        let day = 86_400;
+        assert_eq!(credential_expiry(172 * day + 5, 0), "expires in 172 days");
+        assert_eq!(credential_expiry(day, 0), "expires in 1 day");
+        assert_eq!(credential_expiry(60, 0), "expires within a day");
+        assert_eq!(
+            credential_expiry(0, 3 * day),
+            "EXPIRED 3 days ago (renewable for 87 more days)"
+        );
+        assert_eq!(
+            credential_expiry(0, 90 * day),
+            "EXPIRED 90 days ago (re-enroll this device)"
+        );
+    }
+
     #[test]
     fn only_an_enabled_overlay_off_org_with_no_peers_is_dark() {
         let orgs = vec![

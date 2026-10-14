@@ -48,3 +48,5 @@ pub mod recording_dir;
 /// `crate::tcc`, so existing call sites are unchanged.
 #[cfg(target_os = "macos")]
 pub mod tcc;
+/// FR-103 — one enrollment's live agent token, read at the moment of use.
+pub mod token_slot;

@@ -104,8 +104,15 @@ stateDiagram-v2
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | This spec, the issue (#2134 retitled) and the registry row | docs only | this PR |
-| P1 | Server: both renew routes and the grace verifier; `token_gen`, its check at five sites, the removal bump in both DAOs; `token_exp` stamping and the DTO; the TTL knob; tests. Every `Agent { … }` literal gains the fields (`dao/agent.rs` L153, `tunnel-core/src/policy.rs` L968) | `rc.token_renewal`, `rc.token_generation_check` | — |
-| P2 | Agent: `TokenSlot` through every consumer; the renew check (its horizon overridable by `ROOMLERD_TOKEN_RENEW_BEFORE_DAYS`, the field knob for AC1); persist; renew-on-401; `OrgStatus`; the `cmd_re_enroll` fix | `ROOMLERD_TOKEN_RENEWAL=0` | — |
+| P1 | Server: both renew routes and the grace verifier; `token_gen`, its check at five sites, the removal bump in both DAOs; `token_exp` stamping and the DTO; the TTL knob; tests. Every `Agent { … }` literal gains the fields (`dao/agent.rs` L153, `tunnel-core/src/policy.rs` L968) | `rc.token_renewal`, `rc.token_generation_check` | #2158 |
+| P2 | Agent: `TokenSlot` through every consumer; the renew check (its horizon overridable by `ROOMLERD_TOKEN_RENEW_BEFORE_DAYS`, the field knob for AC1); persist; renew-on-401; `OrgStatus`; the `cmd_re_enroll` fix | `ROOMLERD_TOKEN_RENEWAL=0` | in review |
+
+P2 as built (`agents/roomlerd/src/token_renewal.rs`):
+- **When "due".** By default, with 180 days left or at half the token's lifetime, whichever comes first. A 365-day token renews at 185 days old. A token minted short by `rc.agent_token_ttl_secs` renews at half-life rather than on every look. `ROOMLERD_TOKEN_RENEW_BEFORE_DAYS` is an *exact* override. Under the default rule a horizon above the lifetime would be capped at half-life and change nothing, so the override is what makes AC1's fresh token due at once (and at every look after: a testing knob).
+- **When it looks.** After every connect the server accepted, and on the schedule that look returns: at most 12 h, at least 1 min, and 1 h after a failure that may pass. The first look waits for a connect, so a device that cannot reach its server asks it nothing. A random 0–60 s delay spreads a fleet that reconnected at once.
+- **On a 401.** First a newer token in the config file (matched by server, tenant *and* device id), then a renewal, which the grace covers. Either earns one prompt retry. A refusal straight after a recovery waits out the normal ladder, so a server that renews a token its socket then refuses cannot spin the loop.
+- **Saving.** A compare-and-swap under the daemon's config lock (`RemoteConfigServices::persist_agent_token`). A file already holding a different token for the device was re-enrolled meanwhile, and that token wins. A save that fails still puts the renewed token in use: nothing is rotated, so the file's token stays valid, and the daemon keeps working until a restart reads the file again.
+- **One slot per enrollment** (`roomler-node-core::token_slot`), minted once in `run_cmd` and shared by the loop, its LocalAPI status row, its device-list HTTP identity, the DERP dialer (read per dial: the overlay runtime outlives the connection that built it), and, for the primary, the log and crash uploaders.
 | P3 | Tunnel CLI renewal; atomic `0600` save | — | — |
 | P4 | UI chip; docs (§5 AC7); field | — | — |
 

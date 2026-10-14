@@ -82,8 +82,10 @@ pub struct OrgHttp {
     /// `primary`, or the `[[orgs]]` label.
     pub label: String,
     pub server_url: String,
-    /// ⚠️ Secret. Redacted from `Debug`, never logged.
-    pub agent_token: String,
+    /// ⚠️ Secret. Redacted from `Debug`, never logged. FR-103: the
+    /// enrollment's LIVE slot, shared with its signalling loop and read per
+    /// request, so a renewed token is the one the next request carries.
+    pub token: crate::token_slot::TokenSlot,
     pub primary: bool,
     /// A disabled (or invalid) `[[orgs]]` entry has no loop; the device list
     /// for it is refused as `org_disabled` rather than asked with a token
@@ -92,25 +94,26 @@ pub struct OrgHttp {
 }
 
 impl OrgHttp {
-    /// The primary enrollment — the config's scalar identity.
-    pub fn primary(cfg: &AgentConfig) -> Self {
+    /// The primary enrollment — the config's scalar identity — with its
+    /// loop's token slot.
+    pub fn primary(cfg: &AgentConfig, token: crate::token_slot::TokenSlot) -> Self {
         Self {
             label: PRIMARY_ORG_LABEL.to_string(),
             server_url: cfg.server_url.clone(),
-            agent_token: cfg.agent_token.clone(),
+            token,
             primary: true,
             enabled: true,
         }
     }
 
-    /// A secondary `[[orgs]]` enrollment. `runnable` is false for an entry
-    /// the daemon refused to start (a duplicate or malformed label), which
-    /// is treated like a disabled one.
-    pub fn secondary(org: &OrgEntry, runnable: bool) -> Self {
+    /// A secondary `[[orgs]]` enrollment, with its loop's token slot.
+    /// `runnable` is false for an entry the daemon refused to start (a
+    /// duplicate or malformed label), which is treated like a disabled one.
+    pub fn secondary(org: &OrgEntry, runnable: bool, token: crate::token_slot::TokenSlot) -> Self {
         Self {
             label: org.label.clone(),
             server_url: org.server_url.clone(),
-            agent_token: org.agent_token.clone(),
+            token,
             primary: false,
             enabled: org.enabled && runnable,
         }
@@ -122,7 +125,7 @@ impl std::fmt::Debug for OrgHttp {
         f.debug_struct("OrgHttp")
             .field("label", &self.label)
             .field("server_url", &self.server_url)
-            .field("agent_token", &"<redacted>")
+            .field("token", &"<redacted>")
             .field("primary", &self.primary)
             .field("enabled", &self.enabled)
             .finish()
@@ -439,7 +442,7 @@ impl SelfView {
         let url = format!("{base}{path}");
         let resp = http
             .get(&url)
-            .bearer_auth(&org.agent_token)
+            .bearer_auth(org.token.get())
             .query(params)
             .send()
             .await
@@ -991,7 +994,7 @@ mod tests {
         let row = OrgHttp {
             label: "acme".into(),
             server_url: "https://acme.invalid".into(),
-            agent_token: "eyJ-super-secret".into(),
+            token: crate::token_slot::TokenSlot::new("eyJ-super-secret"),
             primary: false,
             enabled: true,
         };
@@ -1094,21 +1097,21 @@ mod tests {
             OrgHttp {
                 label: PRIMARY_ORG_LABEL.into(),
                 server_url: format!("{url}/"),
-                agent_token: "tok-primary".into(),
+                token: crate::token_slot::TokenSlot::new("tok-primary"),
                 primary: true,
                 enabled: true,
             },
             OrgHttp {
                 label: "acme".into(),
                 server_url: url.to_string(),
-                agent_token: "tok-acme".into(),
+                token: crate::token_slot::TokenSlot::new("tok-acme"),
                 primary: false,
                 enabled: true,
             },
             OrgHttp {
                 label: "parked".into(),
                 server_url: url.to_string(),
-                agent_token: "tok-parked".into(),
+                token: crate::token_slot::TokenSlot::new("tok-parked"),
                 primary: false,
                 enabled: false,
             },

@@ -215,15 +215,15 @@ fn strip_outer_quotes(s: &str) -> String {
 }
 
 /// Configuration captured AFTER the agent config is loaded. Held by
-/// the uploader task for the life of the process; if the agent JWT
-/// rolls, the task should be restarted (currently a process restart
-/// is required — rotation is rare).
+/// the uploader task for the life of the process.
 #[derive(Debug, Clone)]
 pub struct UploadConfig {
     pub server_url: String,
     pub tenant_id: String,
     pub agent_id: String,
-    pub agent_jwt: String,
+    /// FR-103 — the enrollment's LIVE token, read per batch, so a renewal
+    /// reaches the uploader without a restart.
+    pub agent_jwt: crate::token_slot::TokenSlot,
     pub agent_version: String,
     pub host_id_hash: String,
     pub source: LogSource,
@@ -288,7 +288,7 @@ pub async fn run_uploader(mut rx: mpsc::Receiver<LogLine>, config: UploadConfig)
 
         let send = client
             .post(&url)
-            .bearer_auth(&config.agent_jwt)
+            .bearer_auth(config.agent_jwt.get())
             .json(&payload)
             .send()
             .await;

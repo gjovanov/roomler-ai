@@ -98,32 +98,47 @@ fn derp_url_from_ws(ws_url: &str) -> String {
     }
 }
 
+/// The central `/derp` URL for one dial. S6 — `tid` = tenant-affinity key for
+/// the front LB. DERP relays are pod-local, so both mesh peers must land on
+/// the SAME pod; hashing every /derp socket by tenant guarantees it. Pre-S6
+/// servers ignore the param.
+fn central_url(derp_base: &str, token: &str, tenant_id: &str) -> String {
+    format!(
+        "{derp_base}?token={}&role=agent&tid={}",
+        crate::signaling::urlencode(token),
+        crate::signaling::urlencode(tenant_id)
+    )
+}
+
+/// FR-103 — the central URL, built per ATTEMPT from the live token: the WS
+/// owner outlives the connection that spawned it, and a URL fixed at spawn
+/// would keep dialling with a token renewed since.
+fn central_url_per_attempt(
+    ws_url: &str,
+    token: crate::token_slot::TokenSlot,
+    tenant_id: &str,
+) -> Box<dyn Fn() -> Option<String> + Send> {
+    let (base, tenant_id) = (derp_url_from_ws(ws_url), tenant_id.to_string());
+    Box::new(move || Some(central_url(&base, &token.get(), &tenant_id)))
+}
+
 /// Spawn the persistent `/derp` WS owner for this overlay connection. `ws_url`
-/// is the control WS URL (`cfg.ws_url()`); `agent_token` authenticates exactly
-/// like the control WS (`role=agent`). Holds a `Weak` to `mux` and owns
-/// `outbound_rx`, so it exits when the runtime tears the mux down.
+/// is the control WS URL (`cfg.ws_url()`); the enrollment's agent token
+/// authenticates exactly like the control WS (`role=agent`). Holds a `Weak` to
+/// `mux` and owns `outbound_rx`, so it exits when the runtime tears the mux
+/// down.
 pub fn spawn(
     ws_url: &str,
-    agent_token: &str,
+    token: crate::token_slot::TokenSlot,
     tenant_id: &str,
     mux: &Arc<DerpMux>,
     outbound_rx: mpsc::Receiver<tunnel_core::transport::derp::OutboundFrame>,
 ) {
-    // S6 — `tid` = tenant-affinity key for the front LB. DERP relays are
-    // pod-local, so both mesh peers must land on the SAME pod; hashing
-    // every /derp socket by tenant guarantees it. Pre-S6 servers ignore
-    // the param.
-    let full_url = format!(
-        "{}?token={}&role=agent&tid={}",
-        derp_url_from_ws(ws_url),
-        crate::signaling::urlencode(agent_token),
-        crate::signaling::urlencode(tenant_id)
-    );
     let reg_frame = mux.registration_frame();
     let weak = Arc::downgrade(mux);
     tokio::spawn(run(
         "central".to_string(),
-        Box::new(move || Some(full_url.clone())),
+        central_url_per_attempt(ws_url, token, tenant_id),
         reg_frame,
         weak,
         outbound_rx,
@@ -380,5 +395,22 @@ mod tests {
         );
         // Non-/ws override: swap the last path segment.
         assert_eq!(derp_url_from_ws("wss://host/control"), "wss://host/derp");
+    }
+
+    /// FR-103 — a token renewed after the owner was spawned is the one its
+    /// next dial carries.
+    #[test]
+    fn each_dial_carries_the_token_in_use_now() {
+        let slot = crate::token_slot::TokenSlot::new("first");
+        let url = central_url_per_attempt("wss://host/ws", slot.clone(), "t1");
+        assert_eq!(
+            url().as_deref(),
+            Some("wss://host/derp?token=first&role=agent&tid=t1")
+        );
+        slot.set("renewed".into());
+        assert_eq!(
+            url().as_deref(),
+            Some("wss://host/derp?token=renewed&role=agent&tid=t1")
+        );
     }
 }

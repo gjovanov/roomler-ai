@@ -435,6 +435,12 @@ pub struct OrgStatus {
     /// it is the identical trap to an absent age reading as 0 ms.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub overlay_mode: String,
+    /// FR-103 — when the agent token this enrollment uses now expires (unix
+    /// seconds), read from the token itself, so it moves when the daemon
+    /// renews it. Absent = a daemon older than FR-103, or a token with no
+    /// readable expiry: "not reported", never "does not expire".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_expires_at: Option<i64>,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -5983,6 +5989,7 @@ mod tests {
             terminal_error: None,
             updates_ignored: 0,
             overlay_mode: String::new(),
+            token_expires_at: None,
         };
         assert_eq!(
             serde_json::to_string(&row).unwrap(),
