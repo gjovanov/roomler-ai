@@ -43,6 +43,17 @@ export type AgentStatusValue = 'online' | 'offline' | 'unenrolled' | 'quarantine
  *  (`prompt` — attended). Replaces the legacy `require_consent` bool. */
 export type ConsentMode = 'auto' | 'prompt' | 'email' | 'push' | 'prompt_then_email'
 
+/** FR-101 P2 — one sensitive session feature, as an org allows it. Mirrors the
+ *  Rust `RcFeaturePolicy` (lowercase on the wire). */
+export type RcFeaturePolicy = 'on' | 'ask' | 'off'
+
+/** FR-101 P2 — the org's remote-session policy (`GET/PUT …/rc-session-policy`). */
+export interface RcSessionPolicy {
+  clipboard: RcFeaturePolicy
+  files: RcFeaturePolicy
+  audio: RcFeaturePolicy
+}
+
 export interface AccessPolicy {
   consent_mode: ConsentMode | null
   /** FR-27 — apply `consent_mode` to the device's OWNER too.
@@ -1303,6 +1314,39 @@ export const useAgentStore = defineStore('agents', () => {
     )
   }
 
+  // ── FR-101 P2 — the org's session policy (clipboard, files, audio) ──
+  //
+  // Each `on` | `ask` | `off`. The hub strips what the policy refuses and
+  // names why, and the device enforces it again; this is the admin card's
+  // read and write.
+
+  /** `null` until fetched, and for a member who may not manage org
+   *  settings — the "not an admin ≠ a value" rule of the switches above. */
+  const orgRcSessionPolicy = ref<RcSessionPolicy | null>(null)
+
+  async function fetchOrgRcSessionPolicy(tenantId: string) {
+    if (!(await mayReadOrgSettings(tenantId))) {
+      orgRcSessionPolicy.value = null
+      return
+    }
+    try {
+      orgRcSessionPolicy.value = await api.get<RcSessionPolicy>(
+        `/tenant/${tenantId}/rc-session-policy`,
+      )
+    } catch {
+      orgRcSessionPolicy.value = null
+    }
+  }
+
+  /** Set one or more features (MANAGE_TENANT server-side). The route leaves
+   *  a feature the body does not name alone, and answers with all three. */
+  async function setOrgRcSessionPolicy(tenantId: string, patch: Partial<RcSessionPolicy>) {
+    orgRcSessionPolicy.value = await api.put<RcSessionPolicy>(
+      `/tenant/${tenantId}/rc-session-policy`,
+      patch,
+    )
+  }
+
   // ── FR-51 — ephemeral enrollment keys ────────────────────────────
   //
   // A reusable credential that mints self-removing devices (CI runners,
@@ -1540,6 +1584,9 @@ export const useAgentStore = defineStore('agents', () => {
     setOrgKeepBusyDefaultPattern,
     fetchKeepBusyDefaultPattern,
     fetchKeepBusyHistory,
+    orgRcSessionPolicy,
+    fetchOrgRcSessionPolicy,
+    setOrgRcSessionPolicy,
     orgEphemeralKeysEnabled,
     fetchOrgEphemeralKeysEnabled,
     setOrgEphemeralKeysEnabled,
