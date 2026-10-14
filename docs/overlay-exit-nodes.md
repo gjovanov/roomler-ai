@@ -310,6 +310,10 @@ flowchart LR
 | The post-exit purge runs only in a process that held the single-instance lock | `main.rs` `DAEMON_RAN`, set in `run_cmd` after `instance_lock::acquire` | On macOS a second `roomlerd run` returns through `main`; purging there would strip the **running** daemon's routes |
 | The Linux and macOS ledgers are believed only from a root-owned directory and file that nobody else may write | `host_ledger::store` (Unix) | Root acts on the ledger at boot |
 | Both halves go through one in-process ledger | `host_ledger::LEDGER` | The forwarding records and the pin records never overwrite each other |
+| (N12) Every ~3 s the client re-reads each family's uplink, adopts one that moved, and re-pins every pin the table does not show through it | `stale_host_exemptions` (each OS arm), pure decision `tun::stale_pins` | Wi-Fi to Ethernet, or a new network, under an active exit. A pin through the old next hop, or one an interface took with it when it went down, black-holes the endpoint it was pinned for |
+| On Windows the uplink is read from a FIB snapshot, not `GetBestRoute2` | `winroute::exemption_view` | The exit's `/1`s out-match any default toward the unspecified address. The snapshot ranks routes as the OS does (longest prefix covering it, then route plus interface metric, connected interfaces only), with our adapters left out |
+| A Windows re-pin removes the old route once the new one is in | `add_host_exemption` (Windows) via `host_ledger::pin_record` | Windows keys a route by (interface, prefix, next hop), so the old pin would stay beside the new one and could still win the lookup. Linux's `ip route replace` supersedes it in one step |
+| A delete removes the route as it was installed | `del_host_exemption` via `host_ledger::pin_record` | A pin still on an uplink the host has left must come out too |
 
 ## Platform support
 
@@ -317,7 +321,7 @@ flowchart LR
 |---|---|---|---|
 | **Client**: v4 egress through an exit | ✓ | ✓ | ✓ (FR-97 P1a) |
 | **Client**: v6 egress through an exit | ✓ | ✓ | ✓ when the uplink has v6, else **fail-closed** |
-| **Client**: `/32`/`/128` exemptions | `ip route replace … [onlink]` | IP Helper route via the original gateway | `route -n add/change -host`, read back, re-pinned when the uplink moves ([below](#macos-client-fr-97-p1a)) |
+| **Client**: `/32`/`/128` exemptions | `ip route replace … [onlink]`, re-pinned when the uplink moves (FR-97 P0e) | IP Helper route via the uplink's gateway, re-pinned when the uplink moves (FR-97 P0e) | `route -n add/change -host`, read back, re-pinned when the uplink moves ([below](#macos-client-fr-97-p1a)) |
 | **Client**: DNS steering | `resolvectl … ~.` | NRPT `.`-root rule | ✗ not yet (FR-97 P1c): `roomler status` says `DNS NOT steered` |
 | **Exit**: v4 egress + NAT | iptables MASQUERADE | WinNAT; not on Windows Home, which withholds the offer (#2077) | ✗ not yet (FR-97 P1b): the offer is withheld |
 | **Exit**: v6 egress + NAT | ip6tables MASQUERADE | ✗ → v6 **fail-closed** | ✗ |

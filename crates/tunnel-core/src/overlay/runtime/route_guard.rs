@@ -353,8 +353,10 @@ pub(super) fn note_withheld(state: &mut ExitRoutingState, selector: &str, reason
 /// FR-97 P1a — how often, at most, the pinned exemptions are re-checked
 /// against the uplink ([`TunIo::stale_host_exemptions`]). The sweep reconciles
 /// every few seconds and every carrier event reconciles too; a re-check costs
-/// a route lookup per pin on macOS, so a burst of carrier events at startup
-/// must not multiply it. A moved uplink is still noticed within a sweep.
+/// a table read per family (a `netstat` on macOS, an `ip route show` on Linux,
+/// an in-memory FIB snapshot on Windows), so a burst of carrier events at
+/// startup must not multiply it. A moved uplink is still noticed within a
+/// sweep.
 pub(super) const EXEMPTION_RECHECK_EVERY: Duration = Duration::from_secs(3);
 
 /// FR-97 P1a — is a re-check of the pinned exemptions due? Pure.
@@ -568,8 +570,10 @@ impl OverlayRuntime {
         state.pinned_exit = Some(exit_id);
 
         // FR-97 P1a — a pin holds only while the uplink it was made through
-        // does. A device that re-reads its uplink (macOS) names the pins that
-        // no longer hold; each is re-pinned through the current one, and one
+        // does. A device that re-reads its uplink (macOS since P1a, Linux and
+        // Windows since P0e) names the pins that no longer hold, through the
+        // old uplink or gone from the table; each is re-pinned through the
+        // current one, and one
         // that cannot be is DELETED before it is forgotten. A host route left
         // on a next hop that no longer answers black-holes the very endpoint
         // it was pinned for, the coordination server included, and once

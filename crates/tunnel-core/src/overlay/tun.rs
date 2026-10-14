@@ -182,8 +182,9 @@ pub trait TunIo: Send + Sync {
     /// endpoint it was pinned for, the coordination server among them.
     ///
     /// Default: none. Right for the devices that install no OS routes (mocks,
-    /// netstack), and the current state of the Linux and Windows arms, which
-    /// pin through the default captured at bring-up and never re-read it.
+    /// netstack). Every `SystemTun` arm overrides it: macOS since P1a, Linux
+    /// and Windows since FR-97 P0e (N12), which re-read the uplink the same
+    /// way instead of pinning through the one captured at bring-up forever.
     async fn stale_host_exemptions(&self, _pinned: &[std::net::IpAddr]) -> Vec<std::net::IpAddr> {
         Vec::new()
     }
@@ -416,6 +417,65 @@ pub(crate) fn bsd_pin_holds(row: Option<&BsdTableRow>, uplink: &BsdUplink) -> bo
     })
 }
 
+/// FR-97 P0e (N12) — an uplink as the Linux and Windows pin code compares it:
+/// the interface (Linux `dev`, Windows ifIndex) and the next hop.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UplinkKey {
+    pub(crate) interface: String,
+    pub(crate) gateway: std::net::IpAddr,
+}
+
+/// FR-97 P0e (N12) — the Linux and Windows sweep of the pins, as a pure
+/// decision; the macOS arm of `stale_host_exemptions` makes the same one from
+/// its routing table. `held` is the uplink the pins were made through; `now`
+/// the one the table shows at this moment, `None` when it shows no usable one
+/// (the held one then stands: a network in transit is no reason to touch the
+/// pins); `host_routes` every gateway host route in the table. Returns the
+/// uplink to adopt, when it moved, and every pin the table does not show
+/// through the uplink in force: through the old one after a network change,
+/// or gone (an interface that went down takes its routes with it).
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+pub(crate) fn stale_pins(
+    pins: &[std::net::IpAddr],
+    held: Option<&UplinkKey>,
+    now: Option<&UplinkKey>,
+    host_routes: &[(std::net::IpAddr, UplinkKey)],
+) -> (Option<UplinkKey>, Vec<std::net::IpAddr>) {
+    let adopt = now.filter(|n| held != Some(*n)).cloned();
+    let in_force = now.or(held);
+    let stale = pins
+        .iter()
+        .copied()
+        .filter(|ip| {
+            !in_force.is_some_and(|u| host_routes.iter().any(|(d, via)| d == ip && via == u))
+        })
+        .collect();
+    (adopt, stale)
+}
+
+/// FR-97 P0e (N12) — the gateway host routes in `ip -4|-6 route show`: the
+/// lines whose destination is a bare address (iproute2 prints a `/32` or a
+/// `/128` without its length) and that carry a `via` and a `dev`. Pure.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn parse_linux_host_routes(output: &str) -> Vec<(std::net::IpAddr, UplinkKey)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            let dest: std::net::IpAddr = toks.first()?.parse().ok()?;
+            let after = |key: &str| {
+                toks.iter()
+                    .position(|t| *t == key)
+                    .and_then(|i| toks.get(i + 1).copied())
+            };
+            let gateway: std::net::IpAddr = after("via")?.parse().ok()?;
+            let interface = after("dev")?.to_string();
+            Some((dest, UplinkKey { interface, gateway }))
+        })
+        .collect()
+}
+
 /// Is the route a `route -n get` for `dest/plen` matched EXACTLY our route on
 /// `if_name` — same destination, same prefix length, same interface?
 ///
@@ -484,6 +544,111 @@ fn mask_plen(mask: std::net::IpAddr) -> Option<u8> {
         }
     };
     (ones == total).then_some(ones as u8)
+}
+
+#[cfg(test)]
+mod uplink_pin_tests {
+    use super::{UplinkKey, parse_linux_host_routes, stale_pins};
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn via(interface: &str, gateway: &str) -> UplinkKey {
+        UplinkKey {
+            interface: interface.into(),
+            gateway: ip(gateway),
+        }
+    }
+
+    /// The table as `ip -4 route show` prints it on a client under an exit:
+    /// the physical default, our `/1`s, two pins and an on-link LAN route.
+    const LINUX_V4: &str = "\
+default via 192.168.1.1 dev wlan0 proto dhcp src 192.168.1.5 metric 600
+0.0.0.0/1 dev roomler scope link
+94.130.141.98 via 192.168.1.1 dev wlan0
+5.9.157.226 via 192.168.1.1 dev wlan0 onlink
+128.0.0.0/1 dev roomler scope link
+192.168.1.0/24 dev wlan0 proto kernel scope link src 192.168.1.5 metric 600
+";
+
+    #[test]
+    fn host_routes_are_the_bare_addresses_with_a_next_hop() {
+        assert_eq!(
+            parse_linux_host_routes(LINUX_V4),
+            vec![
+                (ip("94.130.141.98"), via("wlan0", "192.168.1.1")),
+                (ip("5.9.157.226"), via("wlan0", "192.168.1.1")),
+            ]
+        );
+        let v6 = "2a01:4f8::1 via fe80::1 dev eth0 metric 1024 pref medium\n\
+                  default via fe80::1 dev eth0 proto ra metric 100 pref medium\n";
+        assert_eq!(
+            parse_linux_host_routes(v6),
+            vec![(ip("2a01:4f8::1"), via("eth0", "fe80::1"))]
+        );
+    }
+
+    #[test]
+    fn pins_through_the_uplink_in_force_hold() {
+        let pins = [ip("94.130.141.98"), ip("5.9.157.226")];
+        let wifi = via("wlan0", "192.168.1.1");
+        let routes = parse_linux_host_routes(LINUX_V4);
+        assert_eq!(
+            stale_pins(&pins, Some(&wifi), Some(&wifi), &routes),
+            (None, vec![])
+        );
+    }
+
+    /// N12 — Wi-Fi to Ethernet under an active exit: every pin still goes
+    /// through the old next hop, so every pin is stale and the new uplink is
+    /// adopted for the re-pin.
+    #[test]
+    fn a_moved_uplink_makes_every_pin_through_the_old_one_stale() {
+        let pins = [ip("94.130.141.98"), ip("5.9.157.226")];
+        let wifi = via("wlan0", "192.168.1.1");
+        let eth = via("eth0", "10.0.0.1");
+        let routes = parse_linux_host_routes(LINUX_V4);
+        assert_eq!(
+            stale_pins(&pins, Some(&wifi), Some(&eth), &routes),
+            (Some(eth), pins.to_vec())
+        );
+    }
+
+    /// The same network back after a drop: the uplink did not move, but the
+    /// interface took its routes with it when it went down.
+    #[test]
+    fn a_pin_gone_from_the_table_is_stale_on_the_same_uplink() {
+        let pins = [ip("94.130.141.98"), ip("203.0.113.9")];
+        let wifi = via("wlan0", "192.168.1.1");
+        let routes = parse_linux_host_routes(LINUX_V4);
+        assert_eq!(
+            stale_pins(&pins, Some(&wifi), Some(&wifi), &routes),
+            (None, vec![ip("203.0.113.9")])
+        );
+    }
+
+    /// No usable default at this moment (a network in transit): nothing is
+    /// adopted, and the pins are judged against the held uplink.
+    #[test]
+    fn no_uplink_now_keeps_the_held_one() {
+        let pins = [ip("94.130.141.98")];
+        let wifi = via("wlan0", "192.168.1.1");
+        let routes = parse_linux_host_routes(LINUX_V4);
+        assert_eq!(
+            stale_pins(&pins, Some(&wifi), None, &routes),
+            (None, vec![])
+        );
+        assert_eq!(
+            stale_pins(&pins, Some(&wifi), None, &[]),
+            (None, pins.to_vec())
+        );
+        assert_eq!(
+            stale_pins(&pins, None, None, &routes),
+            (None, pins.to_vec())
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1918,6 +2083,94 @@ mod system {
             }
         }
 
+        /// FR-97 P0e (N12) — one FIB snapshot of a family, as an exit
+        /// client's pins see it: the uplink, `(ifIndex, gateway)`, and every
+        /// gateway host route, `(dest, ifIndex, gateway)`.
+        ///
+        /// The uplink is the route the OS would carry a default-bound packet
+        /// over if none of OUR adapters' routes existed: the longest prefix
+        /// covering the unspecified address, then the lowest route plus
+        /// interface metric (how Windows ranks), on a connected interface.
+        /// That is what [`best_route`] answers at bring-up, before our
+        /// adapter has a route; once an exit's `/1`s are in they out-match
+        /// any default toward the unspecified address, so it can no longer
+        /// say. `None` for the uplink when the best such route is on-link,
+        /// as there.
+        #[allow(clippy::type_complexity)]
+        pub fn exemption_view(
+            v6: bool,
+        ) -> Option<(Option<(u32, IpAddr)>, Vec<(IpAddr, u32, IpAddr)>)> {
+            let family = if v6 { AF_INET6 } else { AF_INET };
+            let host_plen: u8 = if v6 { 128 } else { 32 };
+            let mut best: Option<(u8, u64, u32, Option<IpAddr>)> = None;
+            let mut hosts = Vec::new();
+            // SAFETY: GetIpForwardTable2 allocates a snapshot we iterate then
+            // free — the same idiom as `evict_competing_v4`.
+            unsafe {
+                let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+                if GetIpForwardTable2(family, &mut table) != NO_ERROR || table.is_null() {
+                    return None;
+                }
+                let n = (*table).NumEntries as usize;
+                let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+                for r in rows {
+                    let Some(dest) = ip_of(&r.DestinationPrefix.Prefix) else {
+                        continue;
+                    };
+                    let gw = ip_of(&r.NextHop).filter(|g| !g.is_unspecified());
+                    let plen = r.DestinationPrefix.PrefixLength;
+                    if plen == host_plen {
+                        if let Some(gw) = gw {
+                            hosts.push((dest, r.InterfaceIndex, gw));
+                        }
+                        continue;
+                    }
+                    if !dest.is_unspecified() || is_ours_or_roomler(r.InterfaceLuid.Value) {
+                        continue;
+                    }
+                    let Some((if_metric, connected)) = iface_metric(r.InterfaceLuid.Value, family)
+                    else {
+                        continue;
+                    };
+                    if !connected {
+                        continue;
+                    }
+                    let cost = u64::from(r.Metric) + u64::from(if_metric);
+                    let better =
+                        best.is_none_or(|(bp, bc, _, _)| plen > bp || (plen == bp && cost < bc));
+                    if better {
+                        best = Some((plen, cost, r.InterfaceIndex, gw));
+                    }
+                }
+                FreeMibTable(table as *const core::ffi::c_void);
+            }
+            let uplink = best.and_then(|(_, _, ifindex, gw)| gw.map(|g| (ifindex, g)));
+            Some((uplink, hosts))
+        }
+
+        /// One of this process's adapters, or any adapter named like ours.
+        /// Never an uplink, whatever the sibling-exempt switch says.
+        fn is_ours_or_roomler(luid: u64) -> bool {
+            super::own_adapters::is_own_luid(luid)
+                || alias_for_luid(luid).is_some_and(|a| super::is_roomler_adapter_name(&a))
+        }
+
+        /// An interface's metric for `family`, and whether it is connected.
+        fn iface_metric(luid: u64, family: u16) -> Option<(u32, bool)> {
+            use windows_sys::Win32::NetworkManagement::IpHelper::{
+                GetIpInterfaceEntry, InitializeIpInterfaceEntry, MIB_IPINTERFACE_ROW,
+            };
+            // SAFETY: Initialize fills valid defaults; Get fills the row for
+            // (family, luid).
+            unsafe {
+                let mut row: MIB_IPINTERFACE_ROW = std::mem::zeroed();
+                InitializeIpInterfaceEntry(&mut row);
+                row.Family = family;
+                row.InterfaceLuid = NET_LUID_LH { Value: luid };
+                (GetIpInterfaceEntry(&mut row) == NO_ERROR).then_some((row.Metric, row.Connected))
+            }
+        }
+
         /// N3 — a gateway-routed row keyed by interface INDEX (what
         /// `OrigDefaultRoute` carries): the host-exemption shape. Unlike
         /// [`make_row`] the next-hop is a REAL gateway, and the interface is
@@ -2291,15 +2544,21 @@ mod system {
         /// exit-node carrier-endpoint exemption `/32`s via the real uplink (see
         /// [`TunIo::add_host_exemption`]). `None` when discovery failed — the
         /// split-tunnel check (S4) then surfaces a WARN rather than wedging.
+        ///
+        /// FR-97 P0e (N12) — no longer final: [`TunIo::stale_host_exemptions`]
+        /// re-reads it on every sweep and adopts an uplink that moved, so the
+        /// pins follow the host to another network as they do on macOS. A
+        /// family with no usable default at the moment keeps the one it had.
         #[cfg(any(target_os = "linux", target_os = "windows"))]
-        orig_default: Option<OrigDefaultRoute>,
+        orig_default: std::sync::Mutex<Option<OrigDefaultRoute>>,
         /// P5/S3b — the host's ORIGINAL IPv6 default route (gateway + interface),
         /// captured at bring-up. Pins v6 `/128` carrier exemptions (the
         /// coordination server's AAAA) so the WS control channel stays direct
         /// while global v6 routes through the exit. `None` when the host has no v6
         /// default (v4-only uplink) — v6 egress then stays fail-closed.
+        /// Re-read like `orig_default` (N12).
         #[cfg(any(target_os = "linux", target_os = "windows"))]
-        orig_default_v6: Option<OrigDefaultRoute6>,
+        orig_default_v6: std::sync::Mutex<Option<OrigDefaultRoute6>>,
         /// FR-97 P1a — the macOS twin of `orig_default` / `orig_default_v6`:
         /// the uplink each family's exemptions are pinned through. Captured
         /// at bring-up like them, but re-read before every pin and by
@@ -3931,9 +4190,9 @@ mod system {
                 #[cfg(windows)]
                 connected_v4: connected_v4_block,
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
-                orig_default,
+                orig_default: std::sync::Mutex::new(orig_default),
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
-                orig_default_v6,
+                orig_default_v6: std::sync::Mutex::new(orig_default_v6),
                 #[cfg(target_os = "macos")]
                 uplinks,
                 #[cfg(windows)]
@@ -4356,11 +4615,7 @@ mod system {
                 // the #388 listing race) installs nothing this wave and
                 // retries on the next.
                 let safe = non_overlay_v4_addrs(&self.if_name).is_some_and(|addrs| {
-                    super::floor_safe(
-                        &addrs,
-                        self.orig_default.as_ref().map(|r| r.gateway),
-                        (net, plen),
-                    )
+                    super::floor_safe(&addrs, self.uplink_v4().map(|r| r.gateway), (net, plen))
                 });
                 // Log the DECISION only on a flip — the wave re-runs this
                 // every 2–30 s, per block (a shared multi-org device carries
@@ -4652,125 +4907,29 @@ mod system {
         /// that family's exit routing (v4 or v6) rather than wedging.
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         async fn add_host_exemption(&self, ip: std::net::IpAddr) -> std::io::Result<()> {
-            let res: std::io::Result<()> = async {
-            match ip {
-                std::net::IpAddr::V4(v4) => {
-                    let Some(gw) = self.orig_default.as_ref() else {
-                        return Err(std::io::Error::other(
-                            "no original IPv4 default route captured; cannot exempt carrier endpoint",
-                        ));
-                    };
-                    #[cfg(target_os = "linux")]
-                    {
-                        let mut args: Vec<String> = vec![
-                            "route".into(),
-                            "replace".into(),
-                            format!("{v4}/32"),
-                            "via".into(),
-                            gw.gateway.to_string(),
-                            "dev".into(),
-                            gw.interface.clone(),
-                        ];
-                        // Carry `onlink` when the original default did, or the
-                        // kernel rejects a `via`-gateway not on a connected subnet
-                        // ("Nexthop has invalid gateway") — see OrigDefaultRoute.
-                        if gw.onlink {
-                            args.push("onlink".into());
-                        }
-                        run_cmd("ip", args).await
-                    }
-                    #[cfg(target_os = "windows")]
-                    {
-                        // N3 — typed IP Helper (idempotent by numeric
-                        // AlreadyExists); `gw.interface` is the ORIGINAL
-                        // uplink's ifIndex, captured at bring-up.
-                        let ifindex: u32 = gw.interface.parse().map_err(|_| {
-                            std::io::Error::other("orig default route ifindex not numeric")
-                        })?;
-                        winroute::add_gateway_route(
-                            ifindex,
-                            std::net::IpAddr::V4(v4),
-                            32,
-                            std::net::IpAddr::V4(gw.gateway),
-                            1,
-                        )
-                    }
-                }
-                // P5/S3b — the IPv6 `/128` counterpart, via the original v6 gateway.
-                std::net::IpAddr::V6(v6) => {
-                    let Some(gw) = self.orig_default_v6.as_ref() else {
-                        return Err(std::io::Error::other(
-                            "no original IPv6 default route captured; cannot exempt v6 carrier endpoint",
-                        ));
-                    };
-                    #[cfg(target_os = "linux")]
-                    {
-                        let mut args: Vec<String> = vec![
-                            "-6".into(),
-                            "route".into(),
-                            "replace".into(),
-                            format!("{v6}/128"),
-                            "via".into(),
-                            gw.gateway.to_string(),
-                            "dev".into(),
-                            gw.interface.clone(),
-                        ];
-                        if gw.onlink {
-                            args.push("onlink".into());
-                        }
-                        run_cmd("ip", args).await
-                    }
-                    #[cfg(target_os = "windows")]
-                    {
-                        // N3 — typed v6 twin of the v4 exemption above.
-                        let ifindex: u32 = gw.interface.parse().map_err(|_| {
-                            std::io::Error::other("orig v6 default route ifindex not numeric")
-                        })?;
-                        winroute::add_gateway_route(
-                            ifindex,
-                            std::net::IpAddr::V6(v6),
-                            128,
-                            std::net::IpAddr::V6(gw.gateway),
-                            1,
-                        )
-                    }
-                }
+            let Some(pin) = self.pin_through_uplink(ip) else {
+                return Err(std::io::Error::other(if ip.is_ipv6() {
+                    "no original IPv6 default route captured; cannot exempt v6 carrier endpoint"
+                } else {
+                    "no original IPv4 default route captured; cannot exempt carrier endpoint"
+                }));
+            };
+            install_pin_route(&pin).await?;
+            // FR-97 P0e (N12) — a pin this run made through another uplink
+            // comes out once the new one is in. Linux's `replace` has already
+            // superseded it (one route per prefix), but Windows keys a route
+            // by (interface, prefix, next hop), so the old one would stay
+            // beside the new and could still win the lookup.
+            #[cfg(target_os = "windows")]
+            if let Some(prev) = crate::overlay::host_ledger::pin_record(ip)
+                && prev != pin
+            {
+                remove_pin_route(&prev).await;
             }
-            }
-            .await;
             // FR-97 P0e — recorded the moment it is in, so no exit of the
             // daemon, clean or not, can leave it behind unrecorded.
-            if res.is_ok() {
-                let rec =
-                    match ip {
-                        std::net::IpAddr::V4(_) => self.orig_default.as_ref().map(|g| {
-                            crate::overlay::host_ledger::PinRecord {
-                                ip,
-                                gateway: g.gateway.to_string(),
-                                interface: g.interface.clone(),
-                                #[cfg(target_os = "linux")]
-                                onlink: g.onlink,
-                                #[cfg(not(target_os = "linux"))]
-                                onlink: false,
-                            }
-                        }),
-                        std::net::IpAddr::V6(_) => self.orig_default_v6.as_ref().map(|g| {
-                            crate::overlay::host_ledger::PinRecord {
-                                ip,
-                                gateway: g.gateway.to_string(),
-                                interface: g.interface.clone(),
-                                #[cfg(target_os = "linux")]
-                                onlink: g.onlink,
-                                #[cfg(not(target_os = "linux"))]
-                                onlink: false,
-                            }
-                        }),
-                    };
-                if let Some(rec) = rec {
-                    crate::overlay::host_ledger::record_pin(rec);
-                }
-            }
-            res
+            crate::overlay::host_ledger::record_pin(pin);
+            Ok(())
         }
 
         /// FR-97 P1a — the macOS arm: a static host route through the CURRENT
@@ -4934,78 +5093,290 @@ mod system {
         }
 
         /// Remove a host exemption installed by [`Self::add_host_exemption`]
-        /// (`/32` v4 or `/128` v6). Best-effort.
+        /// (`/32` v4 or `/128` v6). Best-effort. FR-97 P0e — the route as
+        /// it was installed, from the record, so a pin still on an uplink the
+        /// host has left comes out too; the uplink in force only for a pin
+        /// with no record.
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         async fn del_host_exemption(&self, ip: std::net::IpAddr) {
-            async {
-                match ip {
-                    std::net::IpAddr::V4(v4) => {
-                        let Some(gw) = self.orig_default.as_ref() else {
-                            return;
-                        };
-                        #[cfg(target_os = "linux")]
-                        {
-                            let mut args: Vec<String> = vec![
-                                "route".into(),
-                                "del".into(),
-                                format!("{v4}/32"),
-                                "via".into(),
-                                gw.gateway.to_string(),
-                                "dev".into(),
-                                gw.interface.clone(),
-                            ];
-                            if gw.onlink {
-                                args.push("onlink".into());
-                            }
-                            let _ = run_cmd("ip", args).await;
-                        }
-                        #[cfg(target_os = "windows")]
-                        if let Ok(ifindex) = gw.interface.parse::<u32>() {
-                            winroute::del_gateway_route(
-                                ifindex,
-                                std::net::IpAddr::V4(v4),
-                                32,
-                                std::net::IpAddr::V4(gw.gateway),
-                            );
-                        }
+            if let Some(pin) =
+                crate::overlay::host_ledger::pin_record(ip).or_else(|| self.pin_through_uplink(ip))
+            {
+                remove_pin_route(&pin).await;
+            }
+            crate::overlay::host_ledger::forget_pin(ip);
+        }
+
+        /// FR-97 P0e (N12) — every pin the table does not show through its
+        /// family's CURRENT uplink: the Linux and Windows twin of the macOS
+        /// sweep. Re-reads each family's uplink and adopts one that moved,
+        /// so the re-pin that follows goes through it; one table read per
+        /// family, and an unreadable table changes nothing.
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        async fn stale_host_exemptions(
+            &self,
+            pinned: &[std::net::IpAddr],
+        ) -> Vec<std::net::IpAddr> {
+            let mut stale = Vec::new();
+            for v6 in [false, true] {
+                let family: Vec<std::net::IpAddr> = pinned
+                    .iter()
+                    .copied()
+                    .filter(|ip| ip.is_ipv6() == v6)
+                    .collect();
+                if family.is_empty() {
+                    continue;
+                }
+                let if_name = self.if_name.clone();
+                let Some(table) =
+                    tokio::task::spawn_blocking(move || exemption_table(v6, &if_name))
+                        .await
+                        .ok()
+                        .flatten()
+                else {
+                    continue;
+                };
+                stale.extend(self.sweep_family(v6, &family, table));
+            }
+            stale
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    impl SystemTun {
+        /// The v4 uplink exemptions pin through right now.
+        fn uplink_v4(&self) -> Option<OrigDefaultRoute> {
+            self.orig_default
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+
+        /// The v6 uplink exemptions pin through right now.
+        fn uplink_v6(&self) -> Option<OrigDefaultRoute6> {
+            self.orig_default_v6
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+
+        /// The pin `ip` would get through its family's uplink in force.
+        fn pin_through_uplink(
+            &self,
+            ip: std::net::IpAddr,
+        ) -> Option<crate::overlay::host_ledger::PinRecord> {
+            let (gateway, interface, onlink) = if ip.is_ipv6() {
+                let up = self.uplink_v6()?;
+                #[cfg(target_os = "linux")]
+                let onlink = up.onlink;
+                #[cfg(not(target_os = "linux"))]
+                let onlink = false;
+                (up.gateway.to_string(), up.interface, onlink)
+            } else {
+                let up = self.uplink_v4()?;
+                #[cfg(target_os = "linux")]
+                let onlink = up.onlink;
+                #[cfg(not(target_os = "linux"))]
+                let onlink = false;
+                (up.gateway.to_string(), up.interface, onlink)
+            };
+            Some(crate::overlay::host_ledger::PinRecord {
+                ip,
+                gateway,
+                interface,
+                onlink,
+            })
+        }
+
+        /// FR-97 P0e (N12) — one family's sweep: adopt the uplink the table
+        /// shows when it moved (logged), and name the pins that do not hold.
+        fn sweep_family(
+            &self,
+            v6: bool,
+            pins: &[std::net::IpAddr],
+            table: ExemptionTable,
+        ) -> Vec<std::net::IpAddr> {
+            let ExemptionTable { now, hosts } = table;
+            let held = if v6 {
+                self.uplink_v6().map(|r| r.key())
+            } else {
+                self.uplink_v4().map(|r| r.key())
+            };
+            let now_key = now.as_ref().map(SeenUplink::key);
+            let (adopt, stale) = super::stale_pins(pins, held.as_ref(), now_key.as_ref(), &hosts);
+            if let (Some(to), Some(seen)) = (adopt, now) {
+                tracing::info!(
+                    family = if v6 { "v6" } else { "v4" },
+                    was = ?held.map(|k| format!("{} on {}", k.gateway, k.interface)),
+                    gateway = %to.gateway,
+                    interface = %to.interface,
+                    "overlay exit-node: carrier exemptions now pin through this uplink"
+                );
+                match seen {
+                    SeenUplink::V4(r) => {
+                        *self.orig_default.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)
                     }
-                    std::net::IpAddr::V6(v6) => {
-                        let Some(gw) = self.orig_default_v6.as_ref() else {
-                            return;
-                        };
-                        #[cfg(target_os = "linux")]
-                        {
-                            let mut args: Vec<String> = vec![
-                                "-6".into(),
-                                "route".into(),
-                                "del".into(),
-                                format!("{v6}/128"),
-                                "via".into(),
-                                gw.gateway.to_string(),
-                                "dev".into(),
-                                gw.interface.clone(),
-                            ];
-                            if gw.onlink {
-                                args.push("onlink".into());
-                            }
-                            let _ = run_cmd("ip", args).await;
-                        }
-                        #[cfg(target_os = "windows")]
-                        if let Ok(ifindex) = gw.interface.parse::<u32>() {
-                            winroute::del_gateway_route(
-                                ifindex,
-                                std::net::IpAddr::V6(v6),
-                                128,
-                                std::net::IpAddr::V6(gw.gateway),
-                            );
-                        }
+                    SeenUplink::V6(r) => {
+                        *self
+                            .orig_default_v6
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some(r)
                     }
                 }
             }
-            .await;
-            // FR-97 P0e — no longer ours to undo.
-            crate::overlay::host_ledger::forget_pin(ip);
+            stale
         }
+    }
+
+    /// FR-97 P0e (N12) — one family's routing table as the sweep reads it:
+    /// the uplink it shows now (`None`: no usable one at the moment), and
+    /// every gateway host route in it.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    struct ExemptionTable {
+        now: Option<SeenUplink>,
+        hosts: Vec<(std::net::IpAddr, super::UplinkKey)>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    enum SeenUplink {
+        V4(OrigDefaultRoute),
+        V6(OrigDefaultRoute6),
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    impl SeenUplink {
+        fn key(&self) -> super::UplinkKey {
+            match self {
+                SeenUplink::V4(r) => r.key(),
+                SeenUplink::V6(r) => r.key(),
+            }
+        }
+    }
+
+    /// FR-97 P0e (N12) — read one family's table: `ip -4|-6 route show` (the
+    /// main table, where the default and our pins live), parsed for both.
+    #[cfg(target_os = "linux")]
+    fn exemption_table(v6: bool, overlay_if: &str) -> Option<ExemptionTable> {
+        let out = std::process::Command::new("ip")
+            .args([if v6 { "-6" } else { "-4" }, "route", "show"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let now = if v6 {
+            parse_linux_default_route_v6(&text, overlay_if).map(SeenUplink::V6)
+        } else {
+            parse_linux_default_route(&text, overlay_if).map(SeenUplink::V4)
+        };
+        Some(ExemptionTable {
+            now,
+            hosts: super::parse_linux_host_routes(&text),
+        })
+    }
+
+    /// FR-97 P0e (N12) — read one family's FIB ([`winroute::exemption_view`]).
+    #[cfg(target_os = "windows")]
+    fn exemption_table(v6: bool, _overlay_if: &str) -> Option<ExemptionTable> {
+        let (uplink, hosts) = winroute::exemption_view(v6)?;
+        let hosts: Vec<(std::net::IpAddr, super::UplinkKey)> = hosts
+            .into_iter()
+            .map(|(dest, ifindex, gateway)| {
+                (
+                    dest,
+                    super::UplinkKey {
+                        interface: ifindex.to_string(),
+                        gateway,
+                    },
+                )
+            })
+            .collect();
+        let now = match uplink {
+            Some((ifindex, std::net::IpAddr::V6(gateway))) if v6 => {
+                Some(SeenUplink::V6(OrigDefaultRoute6 {
+                    gateway,
+                    interface: ifindex.to_string(),
+                }))
+            }
+            Some((ifindex, std::net::IpAddr::V4(gateway))) if !v6 => {
+                Some(SeenUplink::V4(OrigDefaultRoute {
+                    gateway,
+                    interface: ifindex.to_string(),
+                }))
+            }
+            _ => None,
+        };
+        Some(ExemptionTable { now, hosts })
+    }
+
+    /// FR-97 P0e — install `pin` (Linux `ip route replace`, Windows a typed
+    /// IP Helper row, idempotent by AlreadyExists).
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    async fn install_pin_route(
+        pin: &crate::overlay::host_ledger::PinRecord,
+    ) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            run_cmd("ip", linux_pin_args("replace", pin)).await
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let (ifindex, gateway) = windows_pin_route(pin).ok_or_else(|| {
+                std::io::Error::other("the uplink's ifIndex or next hop is not an address")
+            })?;
+            winroute::add_gateway_route(ifindex, pin.ip, pin_plen(pin.ip), gateway, 1)
+        }
+    }
+
+    /// FR-97 P0e — remove `pin`, exactly as it was installed. Best-effort.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    async fn remove_pin_route(pin: &crate::overlay::host_ledger::PinRecord) {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = run_cmd("ip", linux_pin_args("del", pin)).await;
+        }
+        #[cfg(target_os = "windows")]
+        if let Some((ifindex, gateway)) = windows_pin_route(pin) {
+            winroute::del_gateway_route(ifindex, pin.ip, pin_plen(pin.ip), gateway);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn pin_plen(ip: std::net::IpAddr) -> u8 {
+        if ip.is_ipv6() { 128 } else { 32 }
+    }
+
+    /// `ip [-6] route <verb> <ip>/<plen> via <gw> dev <if> [onlink]`. Carry
+    /// `onlink` when the default did, or the kernel rejects a `via` gateway
+    /// that is not on a connected subnet ("Nexthop has invalid gateway").
+    #[cfg(target_os = "linux")]
+    fn linux_pin_args(verb: &str, pin: &crate::overlay::host_ledger::PinRecord) -> Vec<String> {
+        let mut args: Vec<String> = Vec::new();
+        if pin.ip.is_ipv6() {
+            args.push("-6".into());
+        }
+        args.extend([
+            "route".into(),
+            verb.into(),
+            format!("{}/{}", pin.ip, pin_plen(pin.ip)),
+            "via".into(),
+            pin.gateway.clone(),
+            "dev".into(),
+            pin.interface.clone(),
+        ]);
+        if pin.onlink {
+            args.push("onlink".into());
+        }
+        args
+    }
+
+    /// A Windows pin's (ifIndex, next hop), as recorded.
+    #[cfg(target_os = "windows")]
+    fn windows_pin_route(
+        pin: &crate::overlay::host_ledger::PinRecord,
+    ) -> Option<(u32, std::net::IpAddr)> {
+        Some((pin.interface.parse().ok()?, pin.gateway.parse().ok()?))
     }
 
     /// Does an interface listing mention `ip`?
@@ -5128,34 +5499,15 @@ mod system {
             return;
         }
         for p in pins {
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            let plen: u8 = if p.ip.is_ipv6() { 128 } else { 32 };
             #[cfg(target_os = "linux")]
             {
-                let mut args: Vec<String> = Vec::new();
-                if p.ip.is_ipv6() {
-                    args.push("-6".into());
-                }
-                args.extend([
-                    "route".into(),
-                    "del".into(),
-                    format!("{}/{plen}", p.ip),
-                    "via".into(),
-                    p.gateway.clone(),
-                    "dev".into(),
-                    p.interface.clone(),
-                ]);
-                if p.onlink {
-                    args.push("onlink".into());
-                }
-                let _ = std::process::Command::new("ip").args(&args).output();
+                let _ = std::process::Command::new("ip")
+                    .args(linux_pin_args("del", p))
+                    .output();
             }
             #[cfg(target_os = "windows")]
-            if let (Ok(ifindex), Ok(gw)) = (
-                p.interface.parse::<u32>(),
-                p.gateway.parse::<std::net::IpAddr>(),
-            ) {
-                winroute::del_gateway_route(ifindex, p.ip, plen, gw);
+            if let Some((ifindex, gw)) = windows_pin_route(p) {
+                winroute::del_gateway_route(ifindex, p.ip, pin_plen(p.ip), gw);
             }
             #[cfg(target_os = "macos")]
             {
@@ -5594,7 +5946,7 @@ mod system {
     /// [`SystemTun::up`]; used to pin exit-node exemption `/32`s via the real
     /// uplink. `interface` is the Linux `dev` name / the Windows interface index.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct OrigDefaultRoute {
         gateway: Ipv4Addr,
         interface: String,
@@ -5605,6 +5957,17 @@ mod system {
         /// field-test). Linux-only concept; Windows `netsh` resolves the next-hop.
         #[cfg(target_os = "linux")]
         onlink: bool,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    impl OrigDefaultRoute {
+        /// FR-97 P0e (N12) — what the sweep compares: interface + next hop.
+        fn key(&self) -> super::UplinkKey {
+            super::UplinkKey {
+                interface: self.interface.clone(),
+                gateway: std::net::IpAddr::V4(self.gateway),
+            }
+        }
     }
 
     /// Query the OS for the active IPv4 default route, picking the lowest-metric
@@ -5696,7 +6059,7 @@ mod system {
     /// exemptions. `gateway` is frequently a link-local (`fe80::`) next-hop, which
     /// is fine — the `interface` disambiguates it.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct OrigDefaultRoute6 {
         gateway: Ipv6Addr,
         interface: String,
@@ -5705,6 +6068,17 @@ mod system {
         /// exemptions via it need the flag too. Linux-only.
         #[cfg(target_os = "linux")]
         onlink: bool,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    impl OrigDefaultRoute6 {
+        /// FR-97 P0e (N12) — what the sweep compares: interface + next hop.
+        fn key(&self) -> super::UplinkKey {
+            super::UplinkKey {
+                interface: self.interface.clone(),
+                gateway: std::net::IpAddr::V6(self.gateway),
+            }
+        }
     }
 
     /// Query the OS for the active IPv6 default route (lowest-metric). `None` on
