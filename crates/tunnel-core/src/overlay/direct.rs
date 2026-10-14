@@ -23,7 +23,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::{UdpSocket, lookup_host};
+use tokio::net::UdpSocket;
 
 /// `ROOMLERD_OVERLAY_DIRECT` (the older `ROOMLER_NODE_OVERLAY_DIRECT` still
 /// honoured — see [`crate::env::node_env`]) — default **ON**. Set
@@ -1096,51 +1096,6 @@ pub async fn gather_srflx(
     out
 }
 
-/// Phase B — resolve the FIRST usable STUN server from the netmap's `stun_urls`
-/// to a concrete v4 `SocketAddr`. An IP-literal URL is parsed synchronously
-/// ([`parse_stun_url`], no DNS); a hostname URL (the fleet's
-/// `stun:coturn.roomler.ai:3478`) is resolved via DNS and the first IPv4 answer
-/// taken (v4-only, CC7). Tries each URL in order; `None` if none resolve to an
-/// IPv4 endpoint. Any single reachable STUN worker suffices — srflx doesn't need
-/// the coturn worker-pinning that the relay hairpin does.
-/// FR-48 — how long a resolved STUN/TURN vantage stays cached.
-///
-/// The three `resolve_stun_*` fns below run on the periodic carrier/srflx probe
-/// cycle and used to resolve their `stun:` hostnames FRESH on every pass. Each
-/// `lookup_host` is a blocking `getaddrinfo` dispatched to tokio's blocking
-/// pool, and glibc keeps the nameserver socket in *that thread's* `_res` state
-/// — so spread across the pool's threads the resolver sockets accumulate for
-/// the life of the process. Field-traced on 0.4.42 with bpftrace
-/// (`__socket ← __res_context_send ← getaddrinfo ← to_socket_addrs`): a settled
-/// overlay node grew **~+6.5 UDP sockets/hour** with no remote-control traffic
-/// at all, on every host in the fleet. Region endpoints change on a timescale
-/// of days, so a short TTL removes essentially all of those lookups while still
-/// following a real DNS change within one TTL.
-const STUN_DNS_TTL: Duration = Duration::from_secs(300);
-
-/// #2187 — the longest a STUN/TURN name lookup may hold its caller. The
-/// carrier plane resolves these inline on the overlay loop, and with an exit's
-/// DNS steer in force a dead exit made each lookup wait out the OS resolver's
-/// whole retry schedule. Field, a Windows exit client: two lookups, 48 s of
-/// stalled loop (`handler ran long … stage="rebuild_direct_plane"
-/// ms=48176`), with every re-pin and carrier sweep queued behind it. The
-/// lookup itself keeps running on tokio's blocking pool; only the WAIT is
-/// bounded.
-const STUN_DNS_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// #2187 — when a fresh lookup fails, the last good answer is served and
-/// trusted for this much longer. Coturn's addresses change on a timescale of
-/// days, so through a DNS outage a known vantage beats none. Failing again
-/// at every pass would otherwise cost each pass a full [`STUN_DNS_TIMEOUT`].
-/// A name that never resolved has nothing to serve and is retried on every
-/// pass, as before.
-const STUN_DNS_STALE_GRACE: Duration = Duration::from_secs(60);
-
-/// `host:port` → (trusted until, the addresses it resolved to).
-type StunDnsCache =
-    std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<SocketAddr>)>>;
-static STUN_DNS_CACHE: std::sync::OnceLock<StunDnsCache> = std::sync::OnceLock::new();
-
 /// The `host:port` a `stun:`/`turn:` URL resolves through — scheme stripped,
 /// `?transport=` / `#frag` removed.
 ///
@@ -1157,54 +1112,26 @@ fn stun_hostport(url: &str) -> &str {
     s.split(['?', '#']).next().unwrap_or(s)
 }
 
-/// `lookup_host` behind a [`STUN_DNS_TTL`] cache. Returns an empty vec when
-/// resolution fails, matching the old `if let Ok(..)` call sites.
+/// A STUN/TURN name through [`crate::ctl_dns`]. Two rules come with it:
+/// - FR-48: within its TTL a name is not looked up again. A settled node used to
+///   grow ~6.5 UDP sockets/hour, because each `getaddrinfo` pins its resolver
+///   socket to a blocking-pool thread for the life of the process.
+/// - #2187: a remembered name never waits on a resolver that has stopped
+///   answering. These run on the overlay loop, and a dead exit DNS once held it
+///   for 48 s on a direct-plane rebuild.
 ///
-/// ⚠️ Only **successful, non-empty** results are cached: a DNS failure must be
-/// retried on the next probe pass, not remembered for the whole TTL — a node
-/// that lost DNS for one pass would otherwise stay vantage-less for 5 minutes.
-/// #2187 — the wait is bounded by [`STUN_DNS_TIMEOUT`], and a failure falls
-/// back to the last good answer for [`STUN_DNS_STALE_GRACE`].
+/// Empty = no answer, matching the old `if let Ok(..)` call sites.
 async fn lookup_host_cached(hostport: &str) -> Vec<SocketAddr> {
-    let cache = STUN_DNS_CACHE.get_or_init(StunDnsCache::default);
-    let now = std::time::Instant::now();
-    // Scoped so the guard is dropped before the await below. An entry past its
-    // time is kept as the fallback.
-    let (hit, stale) = cache
-        .lock()
-        .ok()
-        .and_then(|map| map.get(hostport).cloned())
-        .map_or((None, None), |(until, addrs)| {
-            if now < until {
-                (Some(addrs), None)
-            } else {
-                (None, Some(addrs))
-            }
-        });
-    if let Some(addrs) = hit {
-        return addrs;
-    }
-    let fresh: Vec<SocketAddr> =
-        match tokio::time::timeout(STUN_DNS_TIMEOUT, lookup_host(hostport)).await {
-            Ok(Ok(it)) => it.collect(),
-            Ok(Err(_)) | Err(_) => Vec::new(),
-        };
-    let (keep, trust) = if !fresh.is_empty() {
-        (fresh, STUN_DNS_TTL)
-    } else if let Some(stale) = stale {
-        (stale, STUN_DNS_STALE_GRACE)
-    } else {
-        return Vec::new();
-    };
-    if let Ok(mut map) = cache.lock() {
-        map.insert(
-            hostport.to_string(),
-            (std::time::Instant::now() + trust, keep.clone()),
-        );
-    }
-    keep
+    crate::ctl_dns::resolve(hostport).await
 }
 
+/// Phase B — resolve the FIRST usable STUN server from the netmap's `stun_urls`
+/// to a concrete v4 `SocketAddr`. An IP-literal URL is parsed synchronously
+/// ([`parse_stun_url`], no DNS); a hostname URL (the fleet's
+/// `stun:coturn.roomler.ai:3478`) is resolved via DNS and the first IPv4 answer
+/// taken (v4-only, CC7). Tries each URL in order; `None` if none resolve to an
+/// IPv4 endpoint. Any single reachable STUN worker suffices — srflx doesn't need
+/// the coturn worker-pinning that the relay hairpin does.
 pub async fn resolve_stun_server(stun_urls: &[String], exclude: &[Ipv4Addr]) -> Option<SocketAddr> {
     // Never STUN a coturn worker that is one of THIS host's own IPs: on the
     // fleet the coturn workers ARE the hosts (buildhost `.74`, fleet-host-1 `.221`, fleet-host-2
@@ -2468,56 +2395,6 @@ mod tests {
                 "hostport for {url:?}"
             );
         }
-    }
-
-    /// The cache must NOT remember a failed lookup: a node that loses DNS for
-    /// one probe pass would otherwise stay vantage-less for a whole TTL.
-    #[tokio::test]
-    async fn a_failed_lookup_is_not_cached() {
-        // `.invalid` is reserved by RFC 2606 and never resolves.
-        let host = "fr48-cache-test.invalid:3478";
-        assert!(lookup_host_cached(host).await.is_empty());
-        let cached_anything = STUN_DNS_CACHE
-            .get()
-            .and_then(|c| c.lock().ok().map(|m| m.contains_key(host)))
-            .unwrap_or(false);
-        assert!(
-            !cached_anything,
-            "a failed resolution must not be inserted into the cache"
-        );
-    }
-
-    /// #2187 — a vantage that resolved once outlives a DNS outage. With the
-    /// fresh lookup failing, the last good answer is served, and it is
-    /// trusted for the grace window only, not for a whole TTL.
-    #[tokio::test]
-    async fn a_stale_vantage_is_served_through_a_dns_outage() {
-        // `.invalid` never resolves: the outage.
-        let host = "fr2187-stale-test.invalid:3478";
-        let good: SocketAddr = "203.0.113.9:3478".parse().unwrap();
-        let cache = STUN_DNS_CACHE.get_or_init(StunDnsCache::default);
-        // Resolved once; its time has just run out.
-        cache
-            .lock()
-            .unwrap()
-            .insert(host.to_string(), (std::time::Instant::now(), vec![good]));
-
-        assert_eq!(
-            lookup_host_cached(host).await,
-            vec![good],
-            "the last good answer, not nothing"
-        );
-        let until = cache
-            .lock()
-            .unwrap()
-            .get(host)
-            .map(|(until, _)| *until)
-            .expect("still cached");
-        let left = until.saturating_duration_since(std::time::Instant::now());
-        assert!(
-            left > Duration::ZERO && left <= STUN_DNS_STALE_GRACE,
-            "trusted for the grace window, not a whole TTL: {left:?}"
-        );
     }
 
     /// Minimal STUN Binding Success carrying an XOR-MAPPED-ADDRESS (IPv4), so
