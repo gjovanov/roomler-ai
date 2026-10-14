@@ -152,7 +152,8 @@ pub struct ConnectedAgent {
     /// FR-101 P2 — the agent advertises `session-policy` in `AgentCaps.rpc`:
     /// its prompt names the features the policy says to `ask` about. Per
     /// CONNECTION, like [`Self::privacy_support`]; `false` ⇒ an `ask` feature
-    /// is stripped (`device_cannot_ask`), since an older prompt never names it.
+    /// is stripped (`device_cannot_ask`): an older agent's prompt shows raw
+    /// permission names at most, never audio, and it checks no policy.
     pub asks_features: bool,
     /// FR-92 — the agent advertises `keep-busy` in `AgentCaps.input`: it
     /// parses `rc:agent.keep_busy_policy`. Per CONNECTION; a pre-FR-92 agent

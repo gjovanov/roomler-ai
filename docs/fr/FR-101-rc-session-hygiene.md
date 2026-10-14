@@ -55,6 +55,43 @@ own, and each one is cheap:
 Whether clipboard auto-sync should default to **off** is the operator's call (§6). It changes everyday UX,
 and the policy switch is useful either way.
 
+*As built, P2a: the org's half, on the server.*
+
+| Piece | Where |
+|---|---|
+| The setting: `TenantSettings.rc_session { clipboard, files, audio }`, each `on` (the default, and every row older than the field), `ask` or `off`. A stored value this build does not know, or one that is not a string at all, reads as `off` and never fails the tenant document | `crates/db/src/models/tenant.rs:116` (`RcSessionPolicy`) |
+| `GET /api/tenant/{tenant_id}/rc-session-policy` for any member; `PUT` with `MANAGE_TENANT`. The `PUT` is partial: a feature the body does not name keeps its value, and each named one is its own dotted `$set` (`crates/services/src/dao/tenant.rs:176`), so two admins cannot lose each other's change. Values are read strictly (`maybe` is a 400, not a silent `off`), and an unknown key is refused | `crates/modules/remote/src/session_policy.rs:85`, `:104` |
+| The authz gate reads the policy from the tenant row it already loads. A row it could not read is `OrgPolicy::Unavailable` (`crates/modules/fleet/src/hub.rs:369`), never "unrestricted" | `crates/modules/remote/src/controller.rs:518` |
+| The hub strips what the policy refuses before `rc:request` is built, after the legacy-grant `FILES` grandfathering. It names each refusal in `rc:session.created` (`features_refused`, feature → reason) and in the session's `session_requested` audit row (`features_stripped`). It forwards the policy to the agent in `rc:request.session_policy`, absent when it restricts nothing, so an org that sets nothing sends the same frame as before | `crates/modules/fleet/src/hub.rs:415` (`feature_grant`), called at `:1354` |
+| The cross-pod relay carries it to the owner pod's hub | `crates/modules/remote/src/relay.rs:447`, `:464` |
+
+**What `ask` means.** A feature set to `ask` survives only a session that the person at the device
+approves, on a prompt that names the feature. That is the `prompt` consent mode, on an agent that
+advertises `session-policy` (P2b). Every other session goes without it:
+
+| Reason | When |
+|---|---|
+| `org_policy_off` | The org set `off`. It binds every controller: the device's owner, an ADMINISTRATOR and break-glass alike |
+| `needs_consent` | The org set `ask`, and nobody at the device is asked: `auto` (an unattended device, the owner's own session without `prompt_owner`, break-glass), `email` and `push`, and `prompt_then_email`, whose approval may come from the owner's mail instead of the person there. Named before `device_cannot_ask`, because updating the device would not lift it |
+| `device_cannot_ask` | The org set `ask` and the session prompts the person at the device, but the agent does not advertise `session-policy`. Such an agent grants whatever reaches it: its prompt shows the raw permission names at most (the Windows panel's `Permissions:` line; audio, which is no permission, not at all), and it holds no policy to check the grant against, so `ask` would mean `on`. **Every agent before P2b**, so until then `ask` behaves as `off`, with this reason |
+| `policy_unavailable` | The org's row could not be read. The session goes ahead, as it did before the feature when that read failed, but without the features asked for: a database blip must not hand over what an org switched off |
+
+- ⚠️ Audio is the request's `audio_enabled` flag, which is what the agent adds its track on. The
+  `AUDIO` permission bit is read by nothing; the hub clears it along with the flag.
+- The strip takes effect on every deployed agent, because the agent already enforces the grant it is
+  sent: it refuses the `files` channel without `FILES` (`agents/roomlerd/src/peer.rs:1176`) and
+  clipboard traffic without `CLIPBOARD` (`agents/roomlerd/src/peer.rs:9724`), and adds no audio track
+  without `audio_enabled`. Until P2c the viewer does not explain the refusal.
+- ⚠️ **Mid-roll.** An absent `session_policy` in the relay body comes from an origin pod older than
+  the feature and reads as unrestricted: that pod applied no policy and would have granted the
+  features itself, and an older owner pod ignores the field just as surely. A mixed pair of pods
+  cannot promise the policy in either direction for the length of a roll; failing closed on absent
+  would only take clipboard and files from every cross-pod session during each roll. A value that
+  is present but unreadable fails closed.
+- A change applies to sessions that start after it; a live session keeps the grant it was created
+  with. The server has no mid-session permission change today, and each watcher is a session of its
+  own through the same path, so session creation is the one entry point P2a has to gate.
+
 ### 3b. Write the audit that is already defined
 
 *As first written:*
@@ -111,7 +148,10 @@ still reports. Detail, with the diagram: [`remote-control.md`](../remote-control
 | P0 | This spec and the claim. The red evidence: a DTLS ClientHello pcap with CBC suites; an SRTCP replay accepted in a unit test | docs only | merged. ⚠️ Its "replay accepted" red was a bare `Context`, not a session; see §2 |
 | P1a | The transport: CBC out, the SRTP/SRTCP replay windows pinned (`agents/roomlerd/src/rc_transport.rs`, the vendored `set_dtls_cipher_suites`) | `ROOMLERD_DTLS_LEGACY_SUITES=1`; `ROOMLERD_SRTP_REPLAY_WINDOW` sizes the window, and no value turns it off | **shipped in 0.4.133.** FR-16 L0's `replay` / `legacy` / `unguarded` cells read both halves off the link in CI: DTLS red/green on the agent's real ClientHello, and replays refused on a live session. The window change is behaviour-neutral (§2). The field pcap is owed |
 | P1b | `https` at every entry point, and the IPv6 TURN check | an escape for plaintext labs | — **split from P1a** (see the note below) |
-| P2 | Policy switches and agent-side masking; viewer reasons | each setting defaults to today's behaviour (`on`) | — |
+| P2 | Policy switches and agent-side masking; viewer reasons | each setting defaults to today's behaviour (`on`) | split into P2a–P2c below |
+| P2a | The org's switch (§3a as built): `TenantSettings.rc_session`, the `rc-session-policy` route, the hub's strip with a reason per feature in `rc:session.created` and the audit row, the policy forwarded to the agent and carried by the cross-pod relay | each feature defaults to `on`: an org that sets nothing sees no change, and its agents get the same `rc:request` as before | **this PR**: unit tests in db, remote_control, fleet and remote (the remote module joins CI's unit-test step: it was in no lane); `rc_session_policy_tests`, five cells reading both the viewer's answer and the agent's frame, a cross-pod one included. Negative controls: with the hub's strip removed, four of the five fail and the route cell passes; with the relay dropping the policy, only the cross-pod cell fails |
+| P2b | The device's own switch (device-owned, never pushable, so it survives a compromised server) and the agent's masking at every entry point; `session-policy` advertised, and the prompt names each `ask` feature in words | `on` | builds on FR-99 P1b's prompt line (#2191) |
+| P2c | The viewer reads `features_refused` and greys each control with its reason; the org settings card | — | — |
 | P3 | The audit producers: clipboard and file traffic as the device's claim, in `transfer_activity` (§3b as built), read at `GET …/transfer-activity/{agent_id}` | none: an older agent sends nothing, and an older server ignores the field | **merged** #2138 `919b44d3f`: wire tests, agent unit tests, and `transfer_activity_tests` (kept for the granted session, dropped without `CLIPBOARD` / `FILES`, for another device or without a valid name hash; a repeated tally adds nothing). **Field-verified 2026-10-14** (AC5, field log row 3): red on agent 0.4.134, green on 0.4.135, the first release that carries it |
 | P4 | Idle timeout, max duration, the request rate limit | each off by default | P4a below; the timeouts remain |
 | P4a | The request ceiling: 60 `rc:session.request` a minute per (caller, device), after the authz gate (`crates/modules/remote/src/controller.rs`, `SESSION_REQUESTS_PER_MINUTE`); refusals answer `rc:error` `rate_limited` | none. **On, not off as first written:** the ceiling sits where no legitimate client reaches it (the reconnect ladder asks about a dozen times in its first minute), and a ceiling that ships off protects nothing. Changing it is a reviewed change to the constant | **merged** #2142 `216813e7a`: `rc_request_ceiling_tests` (the owner passes 60 and is refused on the 61st; another device is untouched; a member without the right gets `permission_denied` all 61 times). Negative controls: with the ceiling at 0 it fails on request 61; moved ahead of the authz gate it fails on the identity-first assertion |

@@ -593,6 +593,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/tenant/{tenant_id}/rc-session-policy",
+      "methods": "GET,HEAD,PUT"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/recording-activity/{agent_id}",
       "methods": "GET,HEAD"
     },

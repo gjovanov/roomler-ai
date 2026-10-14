@@ -809,8 +809,10 @@ pub enum RpcCap {
     /// approves.
     ///
     /// ⚠️ The hub keeps an `ask` feature only for a connection advertising
-    /// this. An agent without it would grant the feature on a prompt that
-    /// never mentioned it, and "ask" would mean "on".
+    /// this. An older agent grants whatever reaches it: its prompt shows the
+    /// raw permission names at most (audio, which is no permission, not at
+    /// all), and it holds no policy to check the grant against, so "ask"
+    /// would mean "on".
     SessionPolicy,
 }
 

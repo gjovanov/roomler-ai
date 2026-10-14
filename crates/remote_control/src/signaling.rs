@@ -2215,8 +2215,9 @@ pub enum ServerMsg {
         /// `clipboard`, `files` and `audio`; reasons are `org_policy_off`
         /// (the organization switched it off), `needs_consent` (the policy
         /// says to ask, and nobody at the device is asked under this
-        /// session's consent mode) and `device_cannot_ask` (it would be asked,
-        /// but the device's agent cannot name the feature on its prompt).
+        /// session's consent mode), `device_cannot_ask` (it would be asked,
+        /// but the device's agent predates `session-policy`) and
+        /// `policy_unavailable` (the org's policy could not be read).
         /// A viewer shows the reason rather than a control that silently
         /// fails. Additive: absent = nothing refused; a key or reason this
         /// viewer does not know still reads as "not granted".
