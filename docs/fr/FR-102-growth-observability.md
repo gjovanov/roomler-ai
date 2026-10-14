@@ -1,8 +1,9 @@
 # FR-102: Growth observability — from a post to a paying org, joined by the campaign and never by the person
 
 **Issue:** [#2127](https://github.com/gjovanov/roomler-ai/issues/2127) · **Status:** in progress — claimed
-2026-10-13 (#2128); P1a merged (#2143), not yet promoted; purestat PS0a + PS1 live as v0.1.8 since
-2026-10-13 23:36Z, AC2 field-verified; P1b–c and P1d in progress · **Owner:** web / public site + saas + fleet (install) + purestat · **Anchors:** master `106bd2704`,
+2026-10-13 (#2128); P1a live (promoted with `hosted-20261014-fbc8f22`), AC1 field-verified; purestat PS0a +
+PS1 live as v0.1.8 since 2026-10-13 23:36Z, AC2 field-verified; P1b–c (#2172) and P1d (#2175) merged with
+their production config (roomler-ai-deploy#29), waiting for a promote · **Owner:** web / public site + saas + fleet (install) + purestat · **Anchors:** master `106bd2704`,
 [purestat](https://github.com/gjovanov/purestat) `9e04332` · **Builds on:**
 [FR-88](FR-88-promotion-attribution-and-site-video.md) (attribution, the activation view),
 [FR-91](FR-91-scheduled-blog-publishing.md) (the blog lane; P3, the organic carry),
@@ -536,10 +537,10 @@ hosted only). §7's retention list grows, and `docs/data-model.md`'s stale TTLs 
 | P | What | Kill switch | Status |
 |---|---|---|---|
 | P0 | claim: issue, this spec, the ledger row; a private annex with the 2026-10-13 baseline | docs only | **merged** #2128 `9b5c41b4b` |
-| P1 | §3c on our side: the hosted-only loader, the exclusion list, the taxonomy and its normalisation, the coverage figure | `ANALYTICS = null`; an empty exclusion list | P1a (the loader) **merged** #2143 `05b2bd2bd`, not yet promoted; the rest in progress |
+| P1 | §3c on our side: the hosted-only loader, the exclusion list, the taxonomy and its normalisation, the coverage figure | `ANALYTICS = null`; an empty exclusion list | P1a (the loader) **live** via `hosted-20261014-fbc8f22`; P1b–c (taxonomy, exclusions) **merged** #2172 `1a70f3bb8`; the coverage figure lands with the digest's headline |
 | PS0a | §3n PS0, the code, in purestat | per item | **live** 2026-10-13 23:36Z: purestat v0.1.8 (gjovanov/purestat#13, build fix #14; purestat-deploy#9) |
 | PS0b | §3n PS0, the infrastructure, in purestat-deploy | — | — |
-| P1d | §3l: the daily digest (the job, `growth_digests`, the email, the JSON routes, the Digest view); every section not yet built says which phase brings it | `ROOMLER__GROWTH__DIGEST_ENABLED=false` (the default) | — |
+| P1d | §3l: the daily digest (the job, `growth_digests`, the email, the JSON routes, the Digest view); every section not yet built says which phase brings it | `ROOMLER__GROWTH__DIGEST_ENABLED=false` (the default) | **merged** #2175 `33c634bd1`; enabled in production config with its purestat key (roomler-ai-deploy#29 `46f9f31eb`); live at the next promote |
 | P2 | §3d: definitions, `growth_org_daily`, the funnel/cohorts/orgs/timeline endpoints, the Growth page (Overview, Orgs, Cohorts) | `ROOMLER__GROWTH__ENABLED=false` (the routes answer 404) | — |
 | P3 | §3e 1–4 and 6: issuance record, fetch counters, the enroll's `install` (server, agent, scripts, wizard), the Install panel | counters off by config; the agent sends `install` only when it is set | — |
 | P3b | §3e 5: the wizard's opt-in diagnostics, after D4 | the checkbox; `ROOMLER__GROWTH__SETUP_DIAGNOSTICS=false` | — |
@@ -562,9 +563,12 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1 (P1):** a self-hosted build served on a host outside `ANALYTICS.hosts`, and one on `localhost`,
+- [x] **AC1 (P1):** a self-hosted build served on a host outside `ANALYTICS.hosts`, and one on `localhost`,
   makes no request to purestat.ai from the SPA, a docs page, a blog post or `/links/` (network log of all
   four). Production loads the tracker (control). Shown failing on today's build first.
+  *(Local red/green 2026-10-13; production control 2026-10-14 on `hosted-20261014-fbc8f22`: one tracker
+  request per page on `/`, `/login`, `/docs/`, `/blog/`, `/links/`, every one aborted. §8. ⚠️ The blog lane
+  still serves the old direct tag until the promotion pipeline rebuilds it with the current generator.)*
 - [x] **AC2 (PS0):** purestat ingest refuses an event whose page host is outside the site's allowed hostnames,
   and one from `localhost`; an event from `roomler.ai` is stored (control). Shown failing on v0.1.6 first.
   *(Field, production: v0.1.6 stored a `localhost` probe (23:34Z); v0.1.8 dropped one (23:36Z) and a
@@ -673,6 +677,8 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
 | 2026-10-14 | purestat v0.1.6 | before PS0a: every purestat site's domain and `allowed_hostnames` against the hostnames its events carried in 30 days (read-only) | the default allowlist (the domain plus `www.`) covers every legitimate hostname of all five sites, and `allowed_hostnames` is empty everywhere, so PS0a drops only loopback, private hosts and other domains. The same query found sites whose derived ClickHouse ids coincide (detail in the private annex): the read-side allowlist keeps them apart without moving a row |
 | 2026-10-13 | master + P1a (#2143), a local static build served on `localhost` and as `https://roomler.ai` (a local TLS server); Playwright with every purestat request aborted before it left the box | AC1, local half | master's build attempts 1 purestat request per page on the SPA, the homepage, a docs page, a post and `/links/`; P1a's build attempts 0 on all five on `localhost`. As `https://roomler.ai`, it attempts 0 under Playwright's real `navigator.webdriver` and 1 per page with it spoofed false, so each of the three conditions holds in a real browser. The production control waits for the promote |
 | 2026-10-13/14 | purestat v0.1.6 → v0.1.8 (production; purestat-deploy#9, rolled 23:36Z) | AC2: probes posted to production ingest, then read back from ClickHouse | **red** on v0.1.6: a `pageview` with page address `http://localhost:5173/…` was stored (23:34Z). **green** on v0.1.8: the same probe answered 202 and stored nothing (23:36Z), as did one from `https://fork.example.net/…` (00:08Z); the control, a `pageview` on `https://roomler.ai/fr102-ps0a-positive-control`, was stored (00:08Z). Also on v0.1.8: `/api/health` 200, `/api/oauth/google` 404, `POST /api/v1/query` without a key 401. The backend image passed the integration suite against itself before the roll (44/44). Between the roll and the control, ingest saw no real traffic (the host nginx logged only an AhrefsBot hit before the roll and the probes), so the quiet half hour was traffic, not a fault |
+| 2026-10-14 | production `hosted-20261014-fbc8f22` (P1a promoted by another session's 00:28Z promote) | AC1, the production control: Playwright on `https://roomler.ai`, every purestat request aborted before it left, `navigator.webdriver` spoofed false, then left true | **green**: with webdriver false, 1 tracker request per page on `/`, `/login`, `/docs/`, `/blog/` and `/links/`; with webdriver true, 0 on `/`, `/login`, `/docs/` and `/links/`. ⚠️ `/blog/` still made 1: the blog lane (release `20261013T144949Z`) was built before P1a by the promotion pipeline's copy of the generator and serves the old direct tag, so it lacks the WebDriver exclusion until it is rebuilt. The served SPA carries no purestat tag, and docs pages carry the loader with `data-hosts="roomler.ai,www.roomler.ai"` |
+| 2026-10-14 | purestat v0.1.8, production | the purestat key for roomler2: minted with only its hash stored, tested, and sealed (roomler-ai-deploy#29) | a `POST /api/v1/query` for 2026-10-13 with the key: 200, **44 visitors / 241 pageviews**, scoped to `roomler.ai` + `www.roomler.ai` (the same day on the v0.1.6 dashboard path counted loopback and engagement rows too). A first key, whose seal failed, was revoked. The secret unsealed in the cluster at the expected length; the digest's switch is on in `roomler2-config` and takes effect at the next promote |
 
 ## 9. Related
 
