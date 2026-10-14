@@ -282,6 +282,10 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         keep_busy_enabled: true,
         // FR-99 — off until the device's owner allows it.
         privacy_mode_allowed: false,
+        // FR-101 P2b — no floor of the device's own until its owner sets one.
+        rc_clipboard: Default::default(),
+        rc_files: Default::default(),
+        rc_audio: Default::default(),
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,

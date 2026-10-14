@@ -155,6 +155,11 @@ pub struct ConnectedAgent {
     /// is stripped (`device_cannot_ask`): an older agent's prompt shows raw
     /// permission names at most, never audio, and it checks no policy.
     pub asks_features: bool,
+    /// FR-101 P2b — the device owner's own floor (`AgentCaps.session_policy`),
+    /// so a feature the device will refuse is stripped here with
+    /// `device_policy_off` and the viewer is told why. Informative: the agent
+    /// enforces it whatever this says. Per CONNECTION; `None` = no floor.
+    pub device_session_policy: Option<SessionPolicy>,
     /// FR-92 — the agent advertises `keep-busy` in `AgentCaps.input`: it
     /// parses `rc:agent.keep_busy_policy`. Per CONNECTION; a pre-FR-92 agent
     /// would log every policy frame as an unknown `rc:*` at WARN.
@@ -404,8 +409,12 @@ impl OrgPolicy {
 /// what the agent adds its track on (it reads no bit), so the unused AUDIO bit
 /// goes with it. A feature the controller did not ask for is never named.
 ///
-/// - `off` strips it, `org_policy_off`, for every controller: the owner, an
-///   ADMINISTRATOR and break-glass alike.
+/// P2b — the device owner's floor (`device`, from its caps) combines with the
+/// org's policy, the stricter winning, exactly as the agent combines them.
+///
+/// - `off` strips it for every controller: the owner, an ADMINISTRATOR and
+///   break-glass alike. `org_policy_off` when the org said so (even if the
+///   device did too), else `device_policy_off`.
 /// - `ask` keeps it only under [`ConsentMode::Prompt`], the one mode in which
 ///   the person at the device is who approves, and only on an agent whose
 ///   prompt names the feature (`session-policy`). Otherwise it is stripped:
@@ -421,16 +430,20 @@ pub fn feature_grant(
     permissions: Permissions,
     audio_enabled: bool,
     policy: OrgPolicy,
+    device: Option<SessionPolicy>,
     consent_mode: ConsentMode,
     agent_asks: bool,
 ) -> (Permissions, bool, FeatureRefusals) {
+    let device = device.unwrap_or_default();
     let verdict = |pick: fn(&SessionPolicy) -> FeaturePolicy| -> Option<&'static str> {
         let OrgPolicy::Read(read) = policy else {
             return Some("policy_unavailable");
         };
-        match pick(&read) {
+        let (org_p, device_p) = (pick(&read), pick(&device));
+        match org_p.stricter(device_p) {
             FeaturePolicy::On => None,
-            FeaturePolicy::Off => Some("org_policy_off"),
+            FeaturePolicy::Off if org_p == FeaturePolicy::Off => Some("org_policy_off"),
+            FeaturePolicy::Off => Some("device_policy_off"),
             FeaturePolicy::Ask if consent_mode != ConsentMode::Prompt => Some("needs_consent"),
             FeaturePolicy::Ask if !agent_asks => Some("device_cannot_ask"),
             FeaturePolicy::Ask => None,
@@ -697,6 +710,8 @@ impl Hub {
             // FR-101 P2 — set by `set_agent_asks_features`; `false` (an `ask`
             // feature stripped) until it is.
             asks_features: false,
+            // FR-101 P2b — set by `set_agent_device_session_policy`.
+            device_session_policy: None,
             // FR-92 — set by `set_agent_keep_busy_support`; `false` = no
             // policy frame is ever pushed to this connection.
             supports_keep_busy: false,
@@ -1273,7 +1288,7 @@ impl Hub {
             return Ok(existing_id);
         }
 
-        let (agent_org, agent_arbitrates, agent_records, agent_privacy, agent_asks) = {
+        let (agent_org, agent_arbitrates, agent_records, agent_privacy, agent_asks, agent_floor) = {
             let mut agent = self
                 .inner
                 .agents
@@ -1289,6 +1304,7 @@ impl Hub {
                 agent.record_support,
                 agent.privacy_support,
                 agent.asks_features,
+                agent.device_session_policy,
             )
         };
 
@@ -1358,11 +1374,13 @@ impl Hub {
         // a legacy grant's implied FILES is refused like an explicit one;
         // before `rc:request` is built, so the agent and the viewer see the
         // same grant. A break-glass session reaches here as `Auto`, so it
-        // never keeps an `ask` feature.
+        // never keeps an `ask` feature. P2b — with the device owner's floor
+        // from its caps, so what the device will refuse is named here too.
         let (permissions, audio_enabled, features_refused) = feature_grant(
             permissions,
             audio_enabled,
             session_policy,
+            agent_floor,
             consent_mode,
             agent_asks,
         );
@@ -2070,6 +2088,18 @@ impl Hub {
     pub fn set_agent_asks_features(&self, agent_id: ObjectId, asks: bool) {
         if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
             entry.asks_features = asks;
+        }
+    }
+
+    /// FR-101 P2b — record the device owner's floor (its hello's, or a
+    /// heartbeat's, `AgentCaps.session_policy`).
+    pub fn set_agent_device_session_policy(
+        &self,
+        agent_id: ObjectId,
+        policy: Option<SessionPolicy>,
+    ) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.device_session_policy = policy;
         }
     }
 
@@ -4216,6 +4246,8 @@ mod tests {
     #[test]
     fn feature_grant_follows_the_org_policy() {
         use FeaturePolicy::{Ask, Off, On};
+        // The org's half alone: no floor from the device.
+        let feature_grant = |p, a, o, m, asks| super::feature_grant(p, a, o, None, m, asks);
         let all =
             Permissions::VIEW | Permissions::INPUT | Permissions::CLIPBOARD | Permissions::FILES;
         let base = Permissions::VIEW | Permissions::INPUT;
@@ -4305,6 +4337,96 @@ mod tests {
             true,
         );
         assert_eq!((p, audio), (base, false));
+        assert!(why.is_empty());
+    }
+
+    /// FR-101 P2b — the device owner's floor, from its caps, combines with
+    /// the org's policy (the stricter wins) and is named as the device's.
+    #[test]
+    fn feature_grant_follows_the_device_floor() {
+        use FeaturePolicy::{Ask, Off, On};
+        let all =
+            Permissions::VIEW | Permissions::INPUT | Permissions::CLIPBOARD | Permissions::FILES;
+        let base = Permissions::VIEW | Permissions::INPUT;
+        let floor = |c, f, a| {
+            Some(SessionPolicy {
+                clipboard: c,
+                files: f,
+                audio: a,
+            })
+        };
+
+        // The device's `off`, under an org that set nothing.
+        let (p, audio, why) = feature_grant(
+            all,
+            true,
+            policy(On, On, On),
+            floor(On, Off, Off),
+            ConsentMode::Prompt,
+            true,
+        );
+        assert_eq!((p, audio), (base | Permissions::CLIPBOARD, false));
+        assert_eq!(why.get("files"), Some(&"device_policy_off"));
+        assert_eq!(why.get("audio"), Some(&"device_policy_off"));
+        assert_eq!(why.get("clipboard"), None);
+
+        // Both say `off`: the org's is the one named.
+        let (_, _, why) = feature_grant(
+            all,
+            false,
+            policy(On, Off, On),
+            floor(On, Off, On),
+            ConsentMode::Prompt,
+            true,
+        );
+        assert_eq!(why.get("files"), Some(&"org_policy_off"));
+
+        // The device's `ask` follows the org's `ask` rule: kept on a prompt an
+        // agent can name it on, `needs_consent` where nobody is asked.
+        let (p, _, why) = feature_grant(
+            all,
+            false,
+            policy(On, On, On),
+            floor(Ask, On, On),
+            ConsentMode::Prompt,
+            true,
+        );
+        assert_eq!(p, all);
+        assert!(why.is_empty());
+        let (p, _, why) = feature_grant(
+            all,
+            false,
+            policy(On, On, On),
+            floor(Ask, On, On),
+            ConsentMode::Auto,
+            true,
+        );
+        assert_eq!(p, all - Permissions::CLIPBOARD);
+        assert_eq!(why.get("clipboard"), Some(&"needs_consent"));
+
+        // The org's `off` beats the device's `ask`, and the device's `off`
+        // beats the org's `ask`.
+        let (_, _, why) = feature_grant(
+            all,
+            false,
+            policy(Off, Ask, On),
+            floor(Ask, Off, On),
+            ConsentMode::Prompt,
+            true,
+        );
+        assert_eq!(why.get("clipboard"), Some(&"org_policy_off"));
+        assert_eq!(why.get("files"), Some(&"device_policy_off"));
+
+        // No floor reported is no floor.
+        let (p, audio, why) = feature_grant(
+            all,
+            true,
+            policy(On, On, On),
+            None,
+            ConsentMode::Auto,
+            false,
+        );
+        assert_eq!((p, audio), (all, true));
         assert!(why.is_empty());
     }
 
@@ -4497,6 +4619,26 @@ mod tests {
         assert_eq!(refused, None);
         assert!(audio);
         assert_eq!(sent_policy, None);
+
+        // P2b — the device reports its own floor: what it will refuse is
+        // stripped here too, named as the device's, under an org that set
+        // nothing.
+        hub.set_agent_device_session_policy(
+            agent_id,
+            Some(SessionPolicy {
+                files: Off,
+                ..SessionPolicy::default()
+            }),
+        );
+        let (tx, mut rx) = mpsc::channel(8);
+        let (granted, refused, sent, audio, _) = ask(&hub, tx, &mut rx, all, policy(On, On, On));
+        assert!(!granted.contains(Permissions::FILES));
+        assert_eq!(sent, granted);
+        assert!(audio, "the floor did not touch audio");
+        assert_eq!(
+            refused.expect("named").get("files").map(String::as_str),
+            Some("device_policy_off")
+        );
     }
 
     /// Multi-user P3 — ONE INPUT holder per agent: a second concurrent

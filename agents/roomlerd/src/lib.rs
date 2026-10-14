@@ -136,6 +136,9 @@ pub mod rtp_playout;
 /// asked of the server with the org's agent token.
 pub mod self_view;
 pub mod service;
+/// FR-101 P2b — the session policy for clipboard, files and audio, the
+/// device's half: the owner's floor, and the masking every grant goes through.
+pub mod session_policy;
 pub mod session_telemetry;
 pub mod signaling;
 /// Roomler SSH — the in-daemon SSH surface served on this node's overlay

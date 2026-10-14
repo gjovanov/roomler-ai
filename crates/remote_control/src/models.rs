@@ -325,6 +325,14 @@ pub struct AgentCaps {
     /// heartbeat when it changes. `None` off Linux and from older agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop: Option<DesktopBrief>,
+    /// FR-101 P2b — the device's OWN session policy (its owner's `rc_clipboard`,
+    /// `rc_files`, `rc_audio`), so the hub can strip what this device will
+    /// refuse and say why (`device_policy_off`) instead of the viewer finding
+    /// out at the channel. Informative only: the agent enforces its policy
+    /// whatever the server does. `None` when the device restricts nothing, and
+    /// from every agent before P2b. Live, re-announced on the heartbeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_policy: Option<SessionPolicy>,
 }
 
 /// FR-77 — one encoder (codec × backend) and the chroma formats it produced
@@ -1151,6 +1159,18 @@ pub struct SessionPolicy {
     pub files: FeaturePolicy,
     #[serde(default)]
     pub audio: FeaturePolicy,
+}
+
+impl FeaturePolicy {
+    /// The stricter of two: `off` beats `ask` beats `on`. How an org's policy
+    /// and a device's floor combine, on the hub and on the agent alike.
+    pub fn stricter(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Off, _) | (_, Self::Off) => Self::Off,
+            (Self::Ask, _) | (_, Self::Ask) => Self::Ask,
+            (Self::On, Self::On) => Self::On,
+        }
+    }
 }
 
 impl SessionPolicy {
@@ -5360,6 +5380,56 @@ mod tests {
         assert_eq!(RpcCap::SessionPolicy.wire(), "session-policy");
     }
 
+    /// FR-101 P2b — how an org's policy and a device's floor combine, on
+    /// both ends: `off` beats `ask` beats `on`, in either order.
+    #[test]
+    fn the_stricter_feature_policy_wins_in_either_order() {
+        use FeaturePolicy::{Ask, Off, On};
+        for (a, b, want) in [
+            (On, On, On),
+            (On, Ask, Ask),
+            (Ask, On, Ask),
+            (Ask, Ask, Ask),
+            (On, Off, Off),
+            (Off, On, Off),
+            (Ask, Off, Off),
+            (Off, Ask, Off),
+            (Off, Off, Off),
+        ] {
+            assert_eq!(a.stricter(b), want, "{a:?} {b:?}");
+        }
+    }
+
+    /// FR-101 P2b — the device's floor in its caps: absent when it restricts
+    /// nothing (and from every older agent), a policy otherwise; an older
+    /// server's caps blob without it reads as no floor.
+    #[test]
+    fn agent_caps_session_policy_is_additive() {
+        let none = serde_json::to_value(AgentCaps::default()).unwrap();
+        assert!(none.get("session_policy").is_none(), "{none}");
+        let caps = AgentCaps {
+            session_policy: Some(SessionPolicy {
+                files: FeaturePolicy::Off,
+                ..SessionPolicy::default()
+            }),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&caps).unwrap();
+        assert_eq!(
+            v["session_policy"],
+            serde_json::json!({"clipboard": "on", "files": "off", "audio": "on"})
+        );
+        let back: AgentCaps = serde_json::from_value(v).unwrap();
+        assert_eq!(back.session_policy, caps.session_policy);
+        let old: AgentCaps = serde_json::from_value(serde_json::json!({
+            "hw_encoders": [], "codecs": [], "has_input_permission": true,
+            "supports_clipboard": true, "supports_file_transfer": true,
+            "max_simultaneous_sessions": 1,
+        }))
+        .unwrap();
+        assert_eq!(old.session_policy, None);
+    }
+
     /// FR-99 — the two privacy words are different promises, and neither is
     /// a prefix of the other. `privacy-available` says a curtain is POSSIBLE;
     /// only `privacy-mode` says the owner allowed it. A matcher that read
@@ -6718,6 +6788,12 @@ mod tests {
             // FR-99 — whether a controller may cover this screen: a server
             // that could set it could curtain any device it controls.
             "privacy_mode_allowed",
+            // FR-101 P2b — the device's own floor for clipboard, files and
+            // audio. A server that could set them could switch back on what
+            // the owner switched off; the org's policy is the server's half.
+            "rc_clipboard",
+            "rc_files",
+            "rc_audio",
         ] {
             assert!(
                 !keys.contains(&forbidden),

@@ -1359,6 +1359,8 @@ async fn connect_once(
     // FR-99 P1b — and the privacy words it carried, read off the hello itself
     // so a switch flipped since `stub_caps` ran is still news on the next beat.
     let mut last_announced_privacy = privacy_words_in(&hello_caps.rpc);
+    // FR-101 P2b — and the owner's session-policy floor it carried, likewise.
+    let mut last_announced_session_policy = hello_caps.session_policy;
     let hello = ClientMsg::AgentHello {
         machine_name: cfg.machine_name.clone(),
         os: detect_os(),
@@ -1919,6 +1921,9 @@ async fn connect_once(
                     .into_iter()
                     .map(|w| w.wire().to_string())
                     .collect();
+                // FR-101 P2b — the owner's floor is live too: a new `off` must
+                // reach the hub's strip (and its reason) within a beat.
+                let session_policy_now = crate::session_policy::caps_policy();
                 let caps = if caps_now == last_announced_permissions
                     && record_now == last_announced_record
                     && keep_busy_now == last_announced_keep_busy
@@ -1926,6 +1931,7 @@ async fn connect_once(
                     && exec_system_now == last_announced_exec_system
                     && ssh_system_now == last_announced_ssh_system
                     && privacy_now == last_announced_privacy
+                    && session_policy_now == last_announced_session_policy
                 {
                     None
                 } else {
@@ -1936,6 +1942,7 @@ async fn connect_once(
                     last_announced_exec_system = exec_system_now;
                     last_announced_ssh_system = ssh_system_now;
                     last_announced_privacy = privacy_now;
+                    last_announced_session_policy = session_policy_now;
                     // Our own caps AS THE HELLO BUILT THEM — the server replaces
                     // its stored blob with this, so anything the hello carried
                     // (`multi_org` `tun`, `record`) must be here too — with the
@@ -2762,11 +2769,9 @@ async fn handle_server_msg(
             input_mode,
             tenant_name,
             rc_overlay,
-            // FR-101 P2 — read from P2b on. This build advertises no
-            // `session-policy`, so the hub has already taken out of
-            // `permissions` and `audio_enabled` everything the org's policy
-            // refuses, `ask` included.
-            session_policy: _,
+            // FR-101 P2b — the org's policy; applied below with the device's
+            // own floor, once the consent mode is resolved.
+            session_policy,
         } => {
             // #1882 — the device's overlay decision, resolved HERE, by the
             // daemon: it is the process whose overlay knows the blocks, and a
@@ -2918,6 +2923,37 @@ async fn handle_server_msg(
             // `Auto`, inverting the gate-4 property exec and SSH are built on.
             let effective_mode =
                 crate::consent::strictest_of(directed_mode, consent_broker.mode(), host_window);
+            // FR-101 P2b — the session policy, the org's (on the request) and
+            // the device owner's floor, applied to the grant BEFORE anything
+            // below reads it: the stash the channels enforce, the worker's
+            // params, the prompt. The stricter wins, and `ask` survives only a
+            // prompt the person here answers, which then names it. The hub has
+            // stripped what the org refuses already; this is the half that
+            // holds when it did not.
+            let masked = crate::session_policy::mask(
+                permissions,
+                audio_enabled,
+                session_policy,
+                crate::session_policy::device_policy(),
+                crate::session_policy::person_asked(
+                    consent_mode,
+                    matches!(effective_mode, crate::consent::Mode::Prompt { .. }),
+                ),
+            );
+            if !masked.refused.is_empty() || !masked.ask.is_empty() {
+                info!(
+                    %session_id,
+                    refused = ?masked.refused,
+                    ask = ?masked.ask,
+                    "session policy applied to the grant"
+                );
+            }
+            let permissions = masked.permissions;
+            let audio_negotiated = masked.audio_enabled && audio_negotiated;
+            pending_permissions.insert(session_id, permissions);
+            pending_audio.insert(session_id, audio_negotiated);
+            let features_line =
+                crate::session_policy::consent_line(&masked.ask).unwrap_or_default();
             // FR-85 P3b — a recording's prompt follows the session's own: a
             // session consented ON THE HOST asks the host again (same window)
             // before it may record; an auto-granted one does not ask, its
@@ -3024,6 +3060,14 @@ async fn handle_server_msg(
                 )
                 .unwrap_or_default()
                 .to_string();
+                // FR-101 P2b — and the features the person is asked about, by
+                // name: approving the session is what grants them. One line
+                // each; the native panel's detail box holds two.
+                let privacy_line = [privacy_line.as_str(), features_line.as_str()]
+                    .into_iter()
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 let native = indicator.show_prompt(crate::indicator::PromptView {
                     session_hex: session_hex.clone(),
                     title: "Remote control request".into(),
@@ -5764,6 +5808,13 @@ fn stub_caps(multi_org_tun: bool) -> AgentCaps {
             .into_iter()
             .map(|w| w.wire().to_string()),
     );
+    // FR-101 P2b — this build enforces the session policy (it masks every
+    // grant by the org's policy and its owner's floor, and its prompt names
+    // what it asks about), so the hub may keep an `ask` feature for it. And
+    // the floor itself, when it restricts anything, so the hub can say why it
+    // strips what this device will refuse. Live: the heartbeat re-announces it.
+    caps.rpc.push(RpcCap::SessionPolicy.wire().to_string());
+    caps.session_policy = crate::session_policy::caps_policy();
     caps
 }
 

@@ -2811,6 +2811,18 @@ where
                             .into(),
                     }
                 }
+                // FR-101 P2b — and what a remote session may take from this
+                // console: its clipboard, its files, its audio. Equality.
+                Ok(Request::ConfigSet { key, .. })
+                    if matches!(key.as_str(), "rc_clipboard" | "rc_files" | "rc_audio")
+                        && !peer.is_console_user() =>
+                {
+                    Response::Error {
+                        message: "only the person at this device's console can change what \
+                              a remote session may use here (clipboard, files, audio)"
+                            .into(),
+                    }
+                }
                 Ok(Request::ConfigSet { key, value }) => {
                     state.config_set(&key, value.as_deref()).await
                 }
