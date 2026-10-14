@@ -855,7 +855,9 @@ where
                         "--start-transport requires --daemon (it is a daemon re-upgrade test lever)"
                     );
                 }
-                let cfg = config::load(cli.config).context("loading tunnel config")?;
+                let mut cfg = config::load(cli.config.clone()).context("loading tunnel config")?;
+                // FR-103 — renew a token that is due before dialling with it.
+                crate::credential::renew_if_due(&mut cfg, cli.config.as_deref()).await;
                 forward::run(cfg, &agent, local, &remote, transport.into()).await
             }
         }
@@ -871,7 +873,9 @@ where
                 )?;
                 localclient::create_socks5(&node, local, transport.as_word()).await
             } else {
-                let cfg = config::load(cli.config).context("loading tunnel config")?;
+                let mut cfg = config::load(cli.config.clone()).context("loading tunnel config")?;
+                // FR-103 — renew a token that is due before dialling with it.
+                crate::credential::renew_if_due(&mut cfg, cli.config.as_deref()).await;
                 let transport = transport.into();
                 match agent {
                     Some(agent) => forward::run_socks5(cfg, &agent, local, transport).await,

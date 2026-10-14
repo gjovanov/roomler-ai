@@ -17,6 +17,9 @@
 /// duplicated crates the daemon already contains.
 pub mod cli;
 pub mod config;
+/// FR-103 — the tunnel client renews its own token, and the renewal rule
+/// `roomlerd` shares.
+pub mod credential;
 pub mod forward;
 /// FR-90 P1j-3 — `roomler hive adopt | unadopt | hook`.
 pub mod hive_hooks;
