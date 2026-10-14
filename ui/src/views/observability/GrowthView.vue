@@ -142,7 +142,11 @@ function wide(key: string | number): boolean {
 }
 
 function statusColor(s: DigestStatus): string {
-  return s === 'sent' ? 'success' : s === 'failed' ? 'error' : s === 'computing' ? 'warning' : 'grey'
+  if (s === 'sent') return 'success'
+  if (s === 'failed') return 'error'
+  if (s === 'computing') return 'warning'
+  if (s === 'preview') return 'info'
+  return 'grey'
 }
 
 async function load() {

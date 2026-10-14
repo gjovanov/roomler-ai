@@ -808,39 +808,184 @@ async fn two_concurrent_runs_store_once_and_send_once() {
     assert_eq!(mailer.count(), 3);
 }
 
-/// The manual run never mails with `send=false`, mails once with
-/// `send=true`, and never a day already `sent`.
+/// The manual run never mails with `send=false` (the day ends `preview`,
+/// not a status the scheduler respects), mails once with `send=true`, and
+/// never a day already `sent` — which it refreshes in place, with or
+/// without a mailer, `send` or not.
 #[tokio::test]
 async fn the_manual_run_mails_only_when_asked_and_never_a_sent_day() {
     let s = seed().await;
     let mailer = Recording::default();
+    let store = DigestStore::new(&s.app.db);
     let d2 = day().pred_opt().unwrap();
+    let k2 = digest::day_str(d2);
     let r = digest::run_manual(&s.app.state, d2, false, Some(&mailer), DateTime::now())
         .await
         .unwrap();
-    assert_eq!(r.status, DigestStatus::Stored);
+    assert!(r.claimed);
+    assert_eq!(r.status, DigestStatus::Preview);
     assert_eq!(r.send_attempts, 0);
     assert_eq!(mailer.count(), 0);
+    assert_eq!(
+        store.get(&k2).await.unwrap().unwrap().status,
+        DigestStatus::Preview
+    );
     let r = digest::run_manual(&s.app.state, d2, true, Some(&mailer), DateTime::now())
         .await
         .unwrap();
+    assert!(r.claimed, "a preview is re-claimed by a delivering run");
     assert_eq!(r.status, DigestStatus::Sent);
     assert_eq!(mailer.count(), 1);
     let r = digest::run_manual(&s.app.state, d2, true, Some(&mailer), DateTime::now())
         .await
         .unwrap();
+    assert!(!r.claimed, "a sent day is refreshed in place");
     assert_eq!(r.status, DigestStatus::Sent, "a sent day stays sent");
     assert_eq!(mailer.count(), 1, "and is not sent again");
-    // No mailer at all: stored, and a sent day still stays sent.
+    // (c) `send=false` on a sent day: in place, still sent, nothing mailed.
+    let before = store.get(&k2).await.unwrap().unwrap();
+    let r = digest::run_manual(&s.app.state, d2, false, Some(&mailer), DateTime::now())
+        .await
+        .unwrap();
+    assert!(!r.claimed);
+    assert_eq!(r.status, DigestStatus::Sent);
+    assert_eq!(mailer.count(), 1);
+    let after = store.get(&k2).await.unwrap().unwrap();
+    assert_eq!(after.status, DigestStatus::Sent);
+    assert_eq!(
+        after.sent_at, before.sent_at,
+        "the send record is untouched"
+    );
+    assert!(
+        after.computed_at >= before.computed_at,
+        "the sections were refreshed"
+    );
+    // No mailer at all: a sent day still stays sent; a fresh day with
+    // nobody to mail ends `stored`, and a preview of a stored day keeps it.
     let r = digest::run_manual(&s.app.state, d2, true, None, DateTime::now())
         .await
         .unwrap();
     assert_eq!(r.status, DigestStatus::Sent);
     let d3 = d2.pred_opt().unwrap();
+    let k3 = digest::day_str(d3);
     let r = digest::run_manual(&s.app.state, d3, true, None, DateTime::now())
         .await
         .unwrap();
+    assert!(r.claimed);
     assert_eq!(r.status, DigestStatus::Stored);
+    let r = digest::run_manual(&s.app.state, d3, false, Some(&mailer), DateTime::now())
+        .await
+        .unwrap();
+    assert!(
+        !r.claimed,
+        "a stored day is refreshed in place by a preview"
+    );
+    assert_eq!(r.status, DigestStatus::Stored);
+    assert_eq!(mailer.count(), 1);
+    // ...but a delivering run re-claims it: it was never mailed.
+    let r = digest::run_manual(&s.app.state, d3, true, Some(&mailer), DateTime::now())
+        .await
+        .unwrap();
+    assert!(r.claimed);
+    assert_eq!(r.status, DigestStatus::Sent);
+    assert_eq!(mailer.count(), 2);
+    // A fresh `computing` claim refuses a manual run, either way.
+    s.app
+        .db
+        .collection::<Document>("growth_digests")
+        .update_one(
+            doc! { "_id": &k3 },
+            doc! { "$set": { "status": "computing", "claimed_at": DateTime::now() } },
+        )
+        .await
+        .unwrap();
+    for send in [false, true] {
+        let e = digest::run_manual(&s.app.state, d3, send, Some(&mailer), DateTime::now())
+            .await
+            .unwrap_err();
+        assert_eq!(e, digest::RunError::Busy, "send={send}");
+    }
+    assert_eq!(mailer.count(), 2);
+    assert_eq!(
+        store.get(&k3).await.unwrap().unwrap().status,
+        DigestStatus::Computing
+    );
+}
+
+/// (a) A preview before the scheduled run never cancels the email: the
+/// scheduler re-claims the `preview` day and sends exactly once.
+#[tokio::test]
+async fn a_preview_never_cancels_the_scheduled_email() {
+    let s = seed().await;
+    let mailer = Recording::default();
+    let store = DigestStore::new(&s.app.db);
+    let r = digest::run_manual(&s.app.state, day(), false, Some(&mailer), DateTime::now())
+        .await
+        .unwrap();
+    assert_eq!(r.status, DigestStatus::Preview);
+    assert_eq!(mailer.count(), 0);
+    assert_eq!(
+        store.get(DAY).await.unwrap().unwrap().status,
+        DigestStatus::Preview
+    );
+
+    let r = digest::run_scheduled(&s.app.state, day(), Some(&mailer), DateTime::now())
+        .await
+        .unwrap();
+    assert!(r.claimed, "the scheduler claims a previewed day");
+    assert_eq!(r.attempts, 2);
+    assert_eq!(r.status, DigestStatus::Sent);
+    assert_eq!(r.sent, 1);
+    assert_eq!(mailer.count(), 1);
+    let stored = store.get(DAY).await.unwrap().unwrap();
+    assert_eq!(stored.status, DigestStatus::Sent);
+    assert!(stored.sent_at.is_some());
+
+    let again = digest::run_scheduled(&s.app.state, day(), Some(&mailer), DateTime::now())
+        .await
+        .unwrap();
+    assert!(!again.claimed);
+    assert_eq!(again.status, DigestStatus::Sent);
+    assert_eq!(mailer.count(), 1, "exactly once");
+}
+
+/// (b) A manual `send=true` racing the scheduled run of the same day: the
+/// two go through one claim, so exactly one of them mails.
+#[tokio::test]
+async fn a_manual_send_racing_the_scheduler_mails_once() {
+    let s = seed().await;
+    let mailer = Recording::default();
+    let store = DigestStore::new(&s.app.db);
+    let now = DateTime::now();
+    let (manual, scheduled) = tokio::join!(
+        digest::run_manual(&s.app.state, day(), true, Some(&mailer), now),
+        digest::run_scheduled(&s.app.state, day(), Some(&mailer), now),
+    );
+    let manual_claimed = match &manual {
+        Ok(r) => r.claimed,
+        Err(digest::RunError::Busy) => false,
+        Err(e) => panic!("manual run failed: {e}"),
+    };
+    let scheduled = scheduled.unwrap();
+    assert_ne!(
+        manual_claimed, scheduled.claimed,
+        "exactly one of the two held the day: {manual:?} {scheduled:?}"
+    );
+    assert_eq!(mailer.count(), 1, "one send across both runs");
+    let stored = store.get(DAY).await.unwrap().unwrap();
+    assert_eq!(stored.status, DigestStatus::Sent);
+    assert_eq!(stored.attempts, 1);
+
+    // After the race, both paths leave a sent day alone.
+    let r = digest::run_manual(&s.app.state, day(), true, Some(&mailer), DateTime::now())
+        .await
+        .unwrap();
+    assert!(!r.claimed);
+    let r = digest::run_scheduled(&s.app.state, day(), Some(&mailer), DateTime::now())
+        .await
+        .unwrap();
+    assert!(!r.claimed);
+    assert_eq!(mailer.count(), 1);
 }
 
 /// The routes: 404 for a non-admin, the JSON shape with RFC 3339 dates and
@@ -930,7 +1075,10 @@ async fn the_routes_answer_the_admin_and_hide_from_everyone_else() {
     assert_eq!(r.status().as_u16(), 200);
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["day"], DAY);
-    assert_eq!(body["status"], "stored");
+    assert_eq!(
+        body["status"], "preview",
+        "send=false ends preview, never stored"
+    );
     assert_eq!(body["recipients"], 1);
     assert_eq!(body["excluded"], json!({ "users": 2, "tenants": 2 }));
     assert!(body["claimed_at"].as_str().unwrap().ends_with('Z'));
@@ -983,9 +1131,40 @@ async fn the_routes_answer_the_admin_and_hide_from_everyone_else() {
     let rows = list["digests"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["day"], DAY);
-    assert_eq!(rows[0]["status"], "stored");
+    assert_eq!(rows[0]["status"], "preview");
     assert_eq!(fig(&rows[0]["headline"]["signups"]), (2, 3, 4));
     assert!(rows[0].get("sections").is_none());
+
+    // A run in progress on some pod: the route answers 409, and touches
+    // nothing.
+    s.app
+        .db
+        .collection::<Document>("growth_digests")
+        .update_one(
+            doc! { "_id": DAY },
+            doc! { "$set": { "status": "computing", "claimed_at": DateTime::now() } },
+        )
+        .await
+        .unwrap();
+    let r = s
+        .app
+        .auth_post(
+            &format!("/api/admin/growth/digest/run?day={DAY}&send=true"),
+            &s.admin_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 409);
+    assert_eq!(
+        DigestStore::new(&s.app.db)
+            .get(DAY)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DigestStatus::Computing
+    );
 
     let _ = s.admin_id;
 }

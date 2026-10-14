@@ -142,13 +142,25 @@ sequenceDiagram
   than 30 minutes (a pod that died mid-run), is re-claimed with a compare-and-set on exactly
   the status and `claimed_at` the reader saw, so two re-claimers cannot both win. A `sent` day
   is **never sent again**.
-- Status ends `sent` (mailed to at least one recipient), `stored` (no recipients, or no mail
-  service — the digest still exists) or `failed` (+ `error`; retried by the next tick).
 - The scheduler ticks every 10 minutes; once the clock passes `today 00:00 +
   digest_hour_utc` it ensures **yesterday** exists. It never backfills older days — the run
   route does that on purpose.
-- `POST …/digest/run?day=&send=false` recomputes and overwrites a closed day's sections and
-  mails only with `send=true` **and** a day not already `sent`.
+- **Every run holds the day through the same claim**, the scheduler's and the admin's manual
+  `POST …/digest/run?day=&send=` alike — that is what keeps them from colliding:
+
+| `status` | Meaning | Scheduler | Manual `send=false` | Manual `send=true` |
+|---|---|---|---|---|
+| `computing` (fresh) | a run is in progress on some pod | leaves it | **409** | **409** |
+| `computing` (stale, > 30 min) | a pod died mid-run | re-claims | re-claims | re-claims |
+| `failed` | the compute or every send failed (`error`) | re-claims | re-claims | re-claims |
+| `preview` | a manual `send=false` result — **not final** | re-claims (so a look at a day never cancels its email) | re-claims | re-claims |
+| `stored` | a delivering run found nobody to mail (no recipients, or no mail service) | done | refreshed **in place**, stays `stored` | re-claims (it was never mailed) |
+| `sent` | mailed to at least one recipient — **final** | done | refreshed in place, stays `sent` | refreshed in place, **never re-sent** |
+
+  A claimed manual `send=false` run ends `preview`; a claimed `send=true` run delivers and
+  ends `sent` / `failed` / `stored` exactly as the scheduler's would. An in-place refresh
+  rewrites the sections and never touches the status, so a manual run cannot turn a mailed
+  day back into one the scheduler would mail again.
   `GET …/digest/preview?day=&include_internal=` computes live, stores nothing, mails nothing.
 
 ### Delivery and what the digest never carries
@@ -186,7 +198,7 @@ key once one is minted for `roomler.ai`); a mail backend must be configured
 | GET/PUT | `/api/admin/growth/exclusions` | the exclusion set (P1c) |
 | GET | `/api/admin/growth/digest?day=` | a stored day; the latest when omitted |
 | GET | `/api/admin/growth/digests?since=&limit=` | the list: day, status, times, headline |
-| POST | `/api/admin/growth/digest/run?day=&send=false` | recompute a closed day; mail only when asked and not already sent |
+| POST | `/api/admin/growth/digest/run?day=&send=false` | recompute a closed day through the claim; mail only when asked and not already sent; 409 while a run of that day is in progress |
 | GET | `/api/admin/growth/digest/preview?day=&include_internal=` | compute live, store nothing |
 
 All platform-admin only (`ROOMLER__STATS__PLATFORM_ADMINS`), **404** otherwise — the same

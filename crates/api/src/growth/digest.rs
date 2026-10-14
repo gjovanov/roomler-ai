@@ -48,7 +48,9 @@ use roomler_ai_services::{
     EmailService,
     dao::{
         base::DaoError,
-        growth_digest::{ClaimOutcome, DigestDoc, DigestStatus, DigestStore, ExcludedCounts},
+        growth_digest::{
+            ClaimMode, ClaimOutcome, DigestDoc, DigestStatus, DigestStore, ExcludedCounts,
+        },
     },
 };
 use roomler_core::{campaign, growth::ExclusionSet};
@@ -1734,12 +1736,69 @@ pub struct RunReport {
     pub sent: usize,
 }
 
-enum Mode {
-    Scheduled,
-    Manual { send: bool, was_sent: bool },
+/// Why a manual run did not run.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunError {
+    /// A fresh `computing` claim: a run of this day is in progress on some
+    /// pod. The route answers 409; the caller tries again later.
+    Busy,
+    Failed(DigestError),
 }
 
-/// The scheduled path: claim-first, then compute, store and deliver.
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => f.write_str("a run of this day is in progress"),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RunError {}
+
+impl From<DigestError> for RunError {
+    fn from(e: DigestError) -> Self {
+        Self::Failed(e)
+    }
+}
+
+impl From<DaoError> for RunError {
+    fn from(e: DaoError) -> Self {
+        Self::Failed(e.into())
+    }
+}
+
+impl From<RunError> for ApiError {
+    fn from(e: RunError) -> Self {
+        match e {
+            RunError::Busy => ApiError::Conflict("a run of this day is in progress".into()),
+            RunError::Failed(e) => e.into(),
+        }
+    }
+}
+
+/// How a run holds the day: through the claim (`claimed`), or in place on
+/// a terminal day whose status it must not touch (`prior` says which).
+struct Hold {
+    mode: ClaimMode,
+    claimed: bool,
+    prior: Option<DigestStatus>,
+}
+
+fn not_run(day: String, status: DigestStatus) -> RunReport {
+    RunReport {
+        day,
+        claimed: false,
+        status,
+        attempts: 0,
+        recipients: 0,
+        send_attempts: 0,
+        sent: 0,
+    }
+}
+
+/// The scheduled path: claim-first, then compute, store and deliver. A
+/// finished day (`sent`, `stored`) and a fresh claim are left alone.
 pub async fn run_scheduled(
     state: &AppState,
     day: NaiveDate,
@@ -1748,60 +1807,70 @@ pub async fn run_scheduled(
 ) -> Result<RunReport, DigestError> {
     let store = DigestStore::new(&state.db);
     let key = day_str(day);
-    let attempts = match store.claim(&key, now, STALE_CLAIM_SECS).await? {
-        ClaimOutcome::Claimed { attempts } => attempts,
-        ClaimOutcome::Busy => {
-            return Ok(RunReport {
-                day: key,
-                claimed: false,
-                status: DigestStatus::Computing,
-                attempts: 0,
-                recipients: 0,
-                send_attempts: 0,
-                sent: 0,
-            });
-        }
-        ClaimOutcome::Done(status) => {
-            return Ok(RunReport {
-                day: key,
-                claimed: false,
-                status,
-                attempts: 0,
-                recipients: 0,
-                send_attempts: 0,
-                sent: 0,
-            });
+    let attempts = match store
+        .claim(&key, now, STALE_CLAIM_SECS, ClaimMode::Scheduled)
+        .await?
+    {
+        ClaimOutcome::Claimed { attempts, .. } => attempts,
+        ClaimOutcome::Busy => return Ok(not_run(key, DigestStatus::Computing)),
+        ClaimOutcome::Done(status) | ClaimOutcome::InPlace(status) => {
+            return Ok(not_run(key, status));
         }
     };
-    finish(state, &store, day, attempts, Mode::Scheduled, mailer, now).await
+    let hold = Hold {
+        mode: ClaimMode::Scheduled,
+        claimed: true,
+        prior: None,
+    };
+    finish(state, &store, day, attempts, hold, mailer, now).await
 }
 
 /// The manual path (`POST …/digest/run`): recompute and overwrite the
-/// day's sections; mail only when `send` AND the day is not already
-/// `sent`. A day that was `sent` stays `sent`.
+/// day's sections, through the SAME claim the scheduler uses.
+///
+/// * `send=false` — a day the scheduler still owes ends `preview`, which
+///   the scheduler re-claims like `failed`: a look at a day never cancels
+///   its email. A `sent` or `stored` day is refreshed in place and keeps
+///   its status.
+/// * `send=true` — the day is claimed as the scheduler would claim it (a
+///   `stored` day was never mailed and is re-claimed too), so the two can
+///   never both mail it. A `sent` day is refreshed in place and never
+///   re-sent.
+/// * A fresh `computing` claim refuses the run ([`RunError::Busy`], 409).
 pub async fn run_manual(
     state: &AppState,
     day: NaiveDate,
     send: bool,
     mailer: Option<&dyn DigestMailer>,
     now: DateTime,
-) -> Result<RunReport, DigestError> {
+) -> Result<RunReport, RunError> {
     let store = DigestStore::new(&state.db);
     let key = day_str(day);
-    let existing = store.ensure_row(&key, now).await?;
-    finish(
-        state,
-        &store,
-        day,
-        existing.attempts,
-        Mode::Manual {
-            send,
-            was_sent: existing.status == DigestStatus::Sent,
-        },
-        mailer,
-        now,
-    )
-    .await
+    let mode = if send {
+        ClaimMode::ManualSend
+    } else {
+        ClaimMode::ManualPreview
+    };
+    let (attempts, hold) = match store.claim(&key, now, STALE_CLAIM_SECS, mode).await? {
+        ClaimOutcome::Claimed { attempts, prior } => (
+            attempts,
+            Hold {
+                mode,
+                claimed: true,
+                prior,
+            },
+        ),
+        ClaimOutcome::Busy => return Err(RunError::Busy),
+        ClaimOutcome::InPlace(status) | ClaimOutcome::Done(status) => (
+            0,
+            Hold {
+                mode,
+                claimed: false,
+                prior: Some(status),
+            },
+        ),
+    };
+    Ok(finish(state, &store, day, attempts, hold, mailer, now).await?)
 }
 
 async fn finish(
@@ -1809,7 +1878,7 @@ async fn finish(
     store: &DigestStore,
     day: NaiveDate,
     attempts: u32,
-    mode: Mode,
+    hold: Hold,
     mailer: Option<&dyn DigestMailer>,
     now: DateTime,
 ) -> Result<RunReport, DigestError> {
@@ -1818,9 +1887,14 @@ async fn finish(
     let sections = match compute(state, day, &set, now).await {
         Ok(s) => s,
         Err(e) => {
-            store
-                .set_status(&key, DigestStatus::Failed, None, Some(e.to_string()))
-                .await?;
+            // Only a held day may be marked failed: an in-place refresh of
+            // a `sent` day that fails must not hand that day back to the
+            // scheduler, which would mail it again.
+            if hold.claimed {
+                store
+                    .set_status(&key, DigestStatus::Failed, None, Some(e.to_string()))
+                    .await?;
+            }
             return Err(e);
         }
     };
@@ -1840,21 +1914,32 @@ async fn finish(
         )
         .await?;
 
-    let (deliver, keep_sent) = match mode {
-        Mode::Scheduled => (true, false),
-        Mode::Manual { send, was_sent } => (send && !was_sent, was_sent),
-    };
+    // What this run may do now:
+    //  * scheduled, or a manual send, holding the claim: deliver, then
+    //    `sent` / `failed` / `stored`;
+    //  * a manual preview holding the claim: `preview` — the status the
+    //    scheduler re-claims, so a look at a day never cancels its mail;
+    //  * in place (a `sent` day; a `stored` one for a preview): the sections
+    //    are refreshed and the status is not touched.
+    let deliver = hold.claimed && matches!(hold.mode, ClaimMode::Scheduled | ClaimMode::ManualSend);
     let mut report = RunReport {
         day: key.clone(),
-        claimed: true,
-        status: DigestStatus::Stored,
+        claimed: hold.claimed,
+        status: hold.prior.unwrap_or(DigestStatus::Stored),
         attempts,
         recipients: recipients.len(),
         send_attempts: 0,
         sent: 0,
     };
-    match (deliver, mailer, recipients.is_empty()) {
-        (true, Some(mailer), false) => {
+    match (hold.claimed, deliver, mailer, recipients.is_empty()) {
+        (false, _, _, _) => {}
+        (true, false, _, _) => {
+            store
+                .set_status(&key, DigestStatus::Preview, None, None)
+                .await?;
+            report.status = DigestStatus::Preview;
+        }
+        (true, true, Some(mailer), false) => {
             let doc = DigestDoc {
                 day: key.clone(),
                 status: DigestStatus::Computing,
@@ -1904,14 +1989,13 @@ async fn finish(
                 report.status = DigestStatus::Failed;
             }
         }
-        _ => {
-            let status = if keep_sent {
-                DigestStatus::Sent
-            } else {
-                DigestStatus::Stored
-            };
-            store.set_status(&key, status, None, None).await?;
-            report.status = status;
+        (true, true, _, _) => {
+            // Delivering, with nobody to deliver to (no recipients, or no
+            // mail service): the digest exists, and the day is done.
+            store
+                .set_status(&key, DigestStatus::Stored, None, None)
+                .await?;
+            report.status = DigestStatus::Stored;
         }
     }
     info!(
