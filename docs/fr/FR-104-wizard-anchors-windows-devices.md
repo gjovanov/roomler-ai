@@ -1,6 +1,6 @@
 # FR-104: The wizard anchors a Windows device — SYSTEM exec set up at install, with one token and the administrator's prompt
 
-**Issue:** [#2147](https://github.com/gjovanov/roomler-ai/issues/2147) · **Status:** proposed 2026-10-14 (spec and claim) · **Owner:**
+**Issue:** [#2147](https://github.com/gjovanov/roomler-ai/issues/2147) · **Status:** **closed 2026-10-14**: all five criteria field-verified on the released 0.4.135 wizard (§8) · **Owner:**
 fleet (the anchor route, enrollment tokens), the wizard (`agents/roomler-setup`, `crates/roomler-setup-core`),
 the admin UI · **Anchors:** master `05b2bd2bd` · **Builds on:** FR-94 (the anchor; its P1 second half,
 "the wizard writing the anchor", was not built), FR-84 (the wizard)
