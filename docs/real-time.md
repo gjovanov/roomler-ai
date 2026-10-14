@@ -186,6 +186,13 @@ where **both** sides are UDP-blocked:
 - Agents keep one outbound WSS control link: WS ping every 25 s,
   `rc:agent.heartbeat` every 30 s, exponential reconnect capped at 60 s; a 401 on
   upgrade is fatal (re-enroll).
+  - The ladder restarts at 1 s when a connection that sent its hello lived ≥ 30 s
+    and then dropped (#2221). Before that, a successful reconnect kept the
+    ladder where the outage left it, so the next ordinary drop waited out the
+    PREVIOUS outage's step (8 s in the field after a pod roll; up to 60 s).
+  - A server that accepts and drops at once still climbs the ladder. That 30 s
+    bar is what keeps a flapping server from drawing a fleet-wide reconnect
+    every second.
 - Agents also enforce **receive-liveness**: no inbound frame for 80 s ⇒ reconnect —
   this heals half-open sockets that TLS-inspecting middleboxes keep artificially
   alive.
