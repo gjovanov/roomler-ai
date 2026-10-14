@@ -511,6 +511,38 @@ describe('useAgentStore', () => {
     expect(s.orgKeepBusyDefaultPattern).toBeNull()
   })
 
+  it('FR-101 P2: the org session policy is read and set on its own route, one feature at a time', async () => {
+    mockApi.get.mockResolvedValueOnce({ clipboard: 'on', files: 'off', audio: 'on' })
+    asOwner()
+    const s = useAgentStore()
+    await s.fetchOrgRcSessionPolicy(TENANT_ID)
+    expect(mockApi.get.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/rc-session-policy`)
+    expect(s.orgRcSessionPolicy).toEqual({ clipboard: 'on', files: 'off', audio: 'on' })
+
+    // A change names only its feature: the route leaves the others alone.
+    mockApi.put.mockResolvedValueOnce({ clipboard: 'ask', files: 'off', audio: 'on' })
+    await s.setOrgRcSessionPolicy(TENANT_ID, { clipboard: 'ask' })
+    expect(mockApi.put.mock.calls.at(-1)).toEqual([
+      `/tenant/${TENANT_ID}/rc-session-policy`,
+      { clipboard: 'ask' },
+    ])
+    expect(s.orgRcSessionPolicy).toEqual({ clipboard: 'ask', files: 'off', audio: 'on' })
+  })
+
+  it('FR-101 P2: a member who cannot manage org settings reads no policy and sends nothing', async () => {
+    asMemberWithoutManageTenant()
+    const s = useAgentStore()
+    const before = mockApi.get.mock.calls.length
+    await s.fetchOrgRcSessionPolicy(TENANT_ID)
+    expect(s.orgRcSessionPolicy).toBeNull()
+    expect(mockApi.get.mock.calls.length).toBe(before)
+    // A refused read leaves it unknown too.
+    asOwner()
+    mockApi.get.mockRejectedValueOnce(new Error('403 forbidden'))
+    await s.fetchOrgRcSessionPolicy(TENANT_ID)
+    expect(s.orgRcSessionPolicy).toBeNull()
+  })
+
   it("FR-92 P8: a viewer's read of the default is ungated and never throws — circle for anything but a known word", async () => {
     // A plain member: the route is readable by any member, so no gate.
     asMemberWithoutManageTenant()
@@ -611,6 +643,39 @@ describe('useAgentStore', () => {
     const s = useAgentStore()
     await s.fetchOrgEphemeralKeysEnabled(TENANT_ID)
     expect(s.orgEphemeralKeysEnabled).toBeNull()
+  })
+
+  it('FR-101 P4b: the maximum session length is read and set on its own route; null is no limit', async () => {
+    mockApi.get.mockResolvedValueOnce({ max_secs: null })
+    asOwner()
+    const s = useAgentStore()
+    expect(s.orgRcMaxSessionSecs).toBeUndefined()
+    await s.fetchOrgRcSessionLimits(TENANT_ID)
+    expect(mockApi.get.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/rc-session-limits`)
+    expect(s.orgRcMaxSessionSecs).toBeNull()
+
+    mockApi.put.mockResolvedValueOnce({ max_secs: 7200 })
+    await s.setOrgRcMaxSessionSecs(TENANT_ID, 7200)
+    expect(mockApi.put.mock.calls.at(-1)).toEqual([
+      `/tenant/${TENANT_ID}/rc-session-limits`,
+      { max_secs: 7200 },
+    ])
+    expect(s.orgRcMaxSessionSecs).toBe(7200)
+
+    // Clearing sends null, never an absent field.
+    mockApi.put.mockResolvedValueOnce({ max_secs: null })
+    await s.setOrgRcMaxSessionSecs(TENANT_ID, null)
+    expect(mockApi.put.mock.calls.at(-1)![1]).toEqual({ max_secs: null })
+    expect(s.orgRcMaxSessionSecs).toBeNull()
+  })
+
+  it('FR-101 P4b: a member who cannot manage org settings reads no limit and sends nothing', async () => {
+    asMemberWithoutManageTenant()
+    const s = useAgentStore()
+    const before = mockApi.get.mock.calls.length
+    await s.fetchOrgRcSessionLimits(TENANT_ID)
+    expect(s.orgRcMaxSessionSecs).toBeUndefined()
+    expect(mockApi.get.mock.calls.length).toBe(before)
   })
 
   it('mintEnrollKey POSTs the enroll-key path and hands back the one-time key', async () => {

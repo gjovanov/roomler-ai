@@ -73,6 +73,11 @@ mod exec_service_tests;
 /// the no-address rule, and the purestat client against a fake server.
 #[cfg(test)]
 mod growth_digest_tests;
+/// FR-102 P2 — the account funnel with pending/settled (AC6),
+/// `growth_org_daily` surviving the audit TTL and dying with the org
+/// (AC8), the weekly cohorts and the org views.
+#[cfg(test)]
+mod growth_funnel_tests;
 /// FR-102 — growth observability: the campaign taxonomy at ingress (AC5),
 /// the exclusion list and the set every growth number applies (AC4).
 #[cfg(test)]
@@ -120,6 +125,8 @@ mod privacy_gate_tests;
 mod rate_limit_tests;
 #[cfg(test)]
 mod rc_request_ceiling_tests;
+#[cfg(test)]
+mod rc_session_limits_tests;
 #[cfg(test)]
 mod rc_session_policy_tests;
 #[cfg(test)]

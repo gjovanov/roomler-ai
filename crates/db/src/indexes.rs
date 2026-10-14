@@ -431,6 +431,22 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
         )],
     ));
 
+    // P2 — one row per org per UTC day with any activity, `_id` =
+    // `"{tenant}:{yyyy-mm-dd}"` (spec §3d). Read per org (the timeline, the
+    // first/last value day) and per day range (the funnel, cohorts, WAO —
+    // `day` is `YYYY-MM-DD`, which sorts as a date). Kept 25 months from the
+    // day itself; it outlives the 90-day audit rows it was computed from.
+    // `GrowthDao::purge_tenant` takes an org's rows with it, but no org
+    // hard-delete path exists yet, so the TTL is what bounds it for now.
+    sets.push(set(
+        "growth_org_daily",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "day": 1 }),
+            index(bson::doc! { "day": 1 }),
+            index_ttl(bson::doc! { "day_start": 1 }, 25 * 30 * 24 * 60 * 60),
+        ],
+    ));
+
     // P3 — the frozen daily totals: one row per `(source, metric, dims, day)`
     // with `_id` the four joined (the upsert's own key). The digest reads one
     // `(source, metric)` over a day range, which is this index. No TTL

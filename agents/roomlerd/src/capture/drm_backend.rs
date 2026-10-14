@@ -740,6 +740,10 @@ fn worker(
     // This look only reads the geometry; its handles close before the loop
     // (and on every early return below, with the guard).
     let open_handles = FbHandles::new(&card, info.buffers());
+    if let Some(why) = unreadable(info.buffers()) {
+        let _ = ready_tx.send(Err(anyhow!(why)));
+        return;
+    }
     if !modifier_is_linear(&info) {
         let _ = ready_tx.send(Err(anyhow!(
             "scanout modifier {:?} is not linear — detiling is FR-36 P2 and is not implemented; \
@@ -805,6 +809,23 @@ fn modifier_is_linear(info: &drm::control::framebuffer::PlanarInfo) -> bool {
         None => true,
         Some(m) => u64::from(m) == 0,
     }
+}
+
+/// FR-93 P3h — why this process cannot read the scanout, when it cannot.
+///
+/// GETFB2 answers a caller without `CAP_SYS_ADMIN` with the geometry and NO
+/// buffer handle: the kernel zeroes it rather than failing. So a daemon that is
+/// not root opened DRM capture without complaint and then failed every frame
+/// in [`grab`]. The session died and re-created itself, and the viewer was
+/// never told why (the FR-93 lab's GNOME per-user guest with `drm_capture` set,
+/// on 0.4.135 and every release before). Refused at open, the reason reaches
+/// the viewer as the arm's own error, inside FR-80's 200-character cap (a
+/// longer first draft lost its fix, at the end, to that cap).
+fn unreadable(buffers: [Option<drm::buffer::Handle>; 4]) -> Option<&'static str> {
+    buffers[0].is_none().then_some(
+        "reading the scanout needs CAP_SYS_ADMIN (root), which this daemon lacks: on a per-user \
+         install run roomler config clear drm_capture",
+    )
 }
 
 fn grab(
@@ -1362,5 +1383,21 @@ mod tests {
         let rec = Recorder(Default::default());
         drop(FbHandles::new(&rec, [None; 4]));
         assert!(rec.0.borrow().is_empty());
+    }
+
+    /// FR-93 P3h — what GETFB2 gives a daemon without CAP_SYS_ADMIN: the
+    /// geometry and no handle. Refused at open with the fix in words, never a
+    /// failure on every frame. A buffer with its handle is read as before.
+    #[test]
+    fn a_scanout_without_its_handle_is_refused_at_open() {
+        let why = unreadable([None; 4]).expect("refused");
+        assert!(why.contains("CAP_SYS_ADMIN"), "{why}");
+        assert!(why.contains("roomler config clear drm_capture"), "{why}");
+        assert_eq!(unreadable([Some(handle(7)), None, None, None]), None);
+        // What the viewer is shown, the cascade's prefix included, fits FR-80's
+        // cap whole: the fix is at the end, where a cap cuts first.
+        let shown = format!("drm_capture is on, but DRM capture could not open: {why}");
+        let max = crate::capture::CaptureUnavailable::DETAIL_MAX;
+        assert!(shown.chars().count() <= max, "{shown}");
     }
 }

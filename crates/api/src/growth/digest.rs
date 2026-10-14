@@ -69,8 +69,9 @@ pub const LOOP_INTERVAL_SECS: u64 = 10 * 60;
 /// rolling restart does not race its own predecessor's claim.
 pub const FIRST_TICK_DELAY_SECS: u64 = 2 * 60;
 /// A remote-desktop session is a VALUE event once it reached Active and
-/// lasted this long (spec §3d).
-pub const VALUE_SESSION_SECS: i64 = 30;
+/// lasted this long (spec §3d). The definition lives in `value.rs` with its
+/// three siblings (P2); re-exported so the path stays.
+pub use super::value::VALUE_SESSION_SECS;
 /// Sign-ups listed individually; past this they are aggregated by source.
 pub const MAX_LISTED_SIGNUPS: usize = 20;
 pub const TOP_ORGS: usize = 10;
@@ -80,7 +81,7 @@ pub const TOP_BLOG_POSTS: usize = 20;
 pub const SMALL_N: i64 = 30;
 /// A ceiling on the rows one source query loads — far above this
 /// deployment's volume; a bound, not a page.
-const MAX_ROWS: i64 = 200_000;
+pub(crate) const MAX_ROWS: i64 = 200_000;
 
 // ── Errors ───────────────────────────────────────────────────────────────
 
@@ -246,7 +247,7 @@ pub fn overlap_ms(start: i64, end: i64, lo: i64, hi: i64) -> i64 {
     (end.min(hi) - start.max(lo)).max(0)
 }
 
-fn minutes(ms: i64) -> f64 {
+pub(crate) fn minutes(ms: i64) -> f64 {
     (ms as f64 / 60_000.0 * 10.0).round() / 10.0
 }
 
@@ -325,9 +326,39 @@ impl<T> From<Result<T, PurestatError>> for Measured<T> {
     fn from(r: Result<T, PurestatError>) -> Self {
         match r {
             Ok(v) => Measured::Value(v),
-            Err(e) => Measured::NotMeasured(NotMeasured::now(e.to_string())),
+            Err(e) => Measured::NotMeasured(NotMeasured::now(match unknown_goal(&e) {
+                Some(goal) => format!("{goal} is not defined on the purestat site"),
+                None => e.to_string(),
+            })),
         }
     }
+}
+
+/// The goal a purestat 400 names as undefined (`unknown goal: "signup"`),
+/// when that is what the error is. A site with no goal definitions is a
+/// configuration gap on the web plane, not an outage: the sections that
+/// need the goal say which one, and the ones that do not still measure.
+pub fn unknown_goal(e: &PurestatError) -> Option<String> {
+    let PurestatError::Status(400, msg) = e else {
+        return None;
+    };
+    let lower = msg.to_ascii_lowercase();
+    let idx = lower.find("unknown goal")?;
+    let rest = &msg[idx + "unknown goal".len()..];
+    let quoted = rest
+        .split('"')
+        .nth(1)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some(quoted.unwrap_or_else(|| {
+        let bare = rest.trim_start_matches(':').trim();
+        if bare.is_empty() {
+            "the goal".to_string()
+        } else {
+            bare.to_string()
+        }
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,7 +383,8 @@ pub struct ActiveOrgs {
     pub day: i64,
     pub d7: i64,
     pub d28: i64,
-    /// Which value events were visible: `remote`, `conference`, or both.
+    /// Which value modules were mounted: `remote`, `conference`, `network`
+    /// (P2 — the same four events `growth_org_daily` folds).
     pub basis: Vec<String>,
 }
 
@@ -556,7 +588,9 @@ pub struct CampaignRow {
     pub campaign: String,
     pub visitors: i64,
     pub pageviews: i64,
-    pub goals: CampaignGoals,
+    /// Goal conversions — `not_measured` when the purestat site has no
+    /// definition for a goal (the row's visitors are still real).
+    pub goals: Measured<CampaignGoals>,
     /// Roomler's own sign-ups of the day with the same key.
     pub signups: i64,
 }
@@ -564,6 +598,11 @@ pub struct CampaignRow {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Campaigns {
     pub rows: Vec<CampaignRow>,
+    /// Why no row carries conversions: a goal the purestat site does not
+    /// define (2026-10-14: the site had no goals at all, and the whole
+    /// section read "not measured" for one missing definition).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversions: Option<NotMeasured>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -683,23 +722,21 @@ pub fn end_reason_class(reason: &str) -> &'static str {
 
 // ── Reading the sources ──────────────────────────────────────────────────
 
-fn mounted(state: &AppState, id: &str) -> bool {
-    state.modules.mounted().contains(&id)
-}
+use super::mounted;
 
-fn excluded_ids(set: &HashSet<ObjectId>) -> Vec<ObjectId> {
+pub(crate) fn excluded_ids(set: &HashSet<ObjectId>) -> Vec<ObjectId> {
     set.iter().copied().collect()
 }
 
-fn dt_ms(d: &Document, key: &str) -> Option<i64> {
+pub(crate) fn dt_ms(d: &Document, key: &str) -> Option<i64> {
     d.get_datetime(key).ok().map(|t| t.timestamp_millis())
 }
 
-fn str_of(d: &Document, key: &str) -> Option<String> {
+pub(crate) fn str_of(d: &Document, key: &str) -> Option<String> {
     d.get_str(key).ok().map(str::to_string)
 }
 
-fn i64_of(d: &Document, key: &str) -> i64 {
+pub(crate) fn i64_of(d: &Document, key: &str) -> i64 {
     match d.get(key) {
         Some(Bson::Int32(v)) => i64::from(*v),
         Some(Bson::Int64(v)) => *v,
@@ -708,7 +745,7 @@ fn i64_of(d: &Document, key: &str) -> i64 {
     }
 }
 
-async fn find_docs(
+pub(crate) async fn find_docs(
     state: &AppState,
     coll: &str,
     filter: Document,
@@ -726,7 +763,7 @@ async fn find_docs(
     Ok(rows)
 }
 
-async fn aggregate(
+pub(crate) async fn aggregate(
     state: &AppState,
     coll: &str,
     pipeline: Vec<Document>,
@@ -774,6 +811,27 @@ impl Purestat {
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// [`Self::rows`], retried ONCE without goals when the server answers
+    /// that a goal is not defined (a 400 naming it): the breakdown's
+    /// visitors are still real, and the missing goal comes back beside
+    /// them so the section can say which conversions are not measured.
+    async fn rows_or_without_goals(
+        &mut self,
+        q: &Query,
+    ) -> Result<(Vec<Row>, Option<String>), PurestatError> {
+        match self.rows(q).await {
+            Ok(rows) => Ok((rows, None)),
+            Err(e) => match unknown_goal(&e) {
+                Some(goal) if !q.goals.is_empty() => {
+                    let mut without = q.clone();
+                    without.goals.clear();
+                    Ok((self.rows(&without).await?, Some(goal)))
+                }
+                _ => Err(e),
+            },
         }
     }
 }
@@ -1104,7 +1162,7 @@ async fn read_remote_usage(
             let (lo, hi) = w.range(span);
             ms[i] += overlap_ms(s, e, lo, hi);
         }
-        if e - s >= VALUE_SESSION_SECS * 1000 {
+        if super::value::rc_session_is_value(s, e) {
             value.add(w, s, tenant);
         }
         let (lo, hi) = w.range(Span::Day);
@@ -1165,7 +1223,7 @@ async fn read_calls(
                 secs[i] += ps;
             }
         }
-        if i64_of(d, "peak_participants") >= 2 {
+        if super::value::call_is_value(i64_of(d, "peak_participants")) {
             value.add(w, s, tenant);
         }
     }
@@ -1180,6 +1238,38 @@ async fn read_calls(
         },
         value,
     })
+}
+
+/// P2 — the network pillar's value events in the 28-day window: tunnel
+/// flows accepted and SSH grants issued (`value.rs`), from audit rows that
+/// still exist at 28 days. With them, the digest's "active orgs" is the
+/// same set `growth_org_daily` marks `value`.
+async fn read_network_value(
+    state: &AppState,
+    w: &Windows,
+    set: &ExclusionSet,
+) -> Result<ValueOrgs, DigestError> {
+    let mut value = ValueOrgs::default();
+    let nin = excluded_ids(&set.tenants);
+    for (coll, mut filter) in [
+        (
+            "tunnel_audit",
+            super::value::tunnel_flow_filter(w.between(Span::D28)),
+        ),
+        (
+            "ssh_audit",
+            super::value::ssh_session_filter(w.between(Span::D28)),
+        ),
+    ] {
+        filter.insert("tenant_id", doc! { "$nin": &nin });
+        let docs = find_docs(state, coll, filter, doc! { "tenant_id": 1, "at": 1 }).await?;
+        for d in &docs {
+            if let (Some(t), Ok(tenant)) = (dt_ms(d, "at"), d.get_object_id("tenant_id")) {
+                value.add(w, t, tenant);
+            }
+        }
+    }
+    Ok(value)
 }
 
 async fn org_names(
@@ -1575,61 +1665,69 @@ async fn campaigns_section(
     signups: &[SignupRow],
 ) -> Result<Campaigns, PurestatError> {
     let (day, _, _) = w.dates();
-    let rows = ps
-        .rows(&Query::day(
+    // A goal the site does not define costs the conversions, not the
+    // section: the query is retried without goals and the row's `goals`
+    // read "not measured" with the goal's name.
+    let (rows, missing_goal) = ps
+        .rows_or_without_goals(&Query::day(
             &day,
             &["utm_source", "utm_medium", "utm_campaign"],
             &["visitors", "pageviews"],
             &CAMPAIGN_GOALS,
         ))
         .await?;
-    let mut by: BTreeMap<(String, String, String), CampaignRow> = BTreeMap::new();
+    let conversions = missing_goal
+        .map(|goal| NotMeasured::now(format!("{goal} is not defined on the purestat site")));
+    #[derive(Default)]
+    struct Tally {
+        visitors: i64,
+        pageviews: i64,
+        goals: CampaignGoals,
+        signups: i64,
+    }
+    let mut by: BTreeMap<(String, String, String), Tally> = BTreeMap::new();
     for r in &rows {
         let Some(source) = r.dim("utm_source") else {
             continue;
         };
         let key = campaign_key(source, r.dim("utm_medium"), r.dim("utm_campaign"));
-        let row = by.entry(key.clone()).or_insert_with(|| CampaignRow {
-            source: key.0.clone(),
-            medium: key.1.clone(),
-            campaign: key.2.clone(),
-            visitors: 0,
-            pageviews: 0,
-            goals: CampaignGoals::default(),
-            signups: 0,
-        });
-        row.visitors += r.count("visitors");
-        row.pageviews += r.count("pageviews");
-        row.goals.signup += r.goal("signup");
-        row.goals.subscribe += r.goal("subscribe");
-        row.goals.install_copy += r.goal("install-copy");
-        row.goals.github_outbound += r.goal("github-outbound");
+        let t = by.entry(key).or_default();
+        t.visitors += r.count("visitors");
+        t.pageviews += r.count("pageviews");
+        t.goals.signup += r.goal("signup");
+        t.goals.subscribe += r.goal("subscribe");
+        t.goals.install_copy += r.goal("install-copy");
+        t.goals.github_outbound += r.goal("github-outbound");
     }
     for s in signups {
         let Some(source) = s.source.as_deref() else {
             continue;
         };
         let key = campaign_key(source, s.medium.as_deref(), s.campaign.as_deref());
-        by.entry(key.clone())
-            .or_insert_with(|| CampaignRow {
-                source: key.0.clone(),
-                medium: key.1.clone(),
-                campaign: key.2.clone(),
-                visitors: 0,
-                pageviews: 0,
-                goals: CampaignGoals::default(),
-                signups: 0,
-            })
-            .signups += 1;
+        by.entry(key).or_default().signups += 1;
     }
-    let mut rows: Vec<CampaignRow> = by.into_values().collect();
+    let mut rows: Vec<CampaignRow> = by
+        .into_iter()
+        .map(|((source, medium, campaign), t)| CampaignRow {
+            source,
+            medium,
+            campaign,
+            visitors: t.visitors,
+            pageviews: t.pageviews,
+            goals: match &conversions {
+                Some(n) => Measured::NotMeasured(n.clone()),
+                None => Measured::Value(t.goals),
+            },
+            signups: t.signups,
+        })
+        .collect();
     rows.sort_by(|a, b| {
         b.visitors
             .cmp(&a.visitors)
             .then_with(|| b.signups.cmp(&a.signups))
             .then_with(|| a.source.cmp(&b.source))
     });
-    Ok(Campaigns { rows })
+    Ok(Campaigns { rows, conversions })
 }
 
 async fn coverage_section(
@@ -1699,9 +1797,18 @@ pub async fn compute(
     } else {
         None
     };
+    // P2 — the network pillar's value events, so "active orgs" here is the
+    // set `growth_org_daily` marks `value` (one definition, `value.rs`).
+    let network = if mounted(state, "network") {
+        Some(read_network_value(state, &w, set).await?)
+    } else {
+        None
+    };
 
-    let active_orgs = match (&remote, &calls) {
-        (None, None) => Measured::unmounted("remote and conference"),
+    let active_orgs = match (&remote, &calls, &network) {
+        (None, None, None) => {
+            Measured::NotMeasured(NotMeasured::now(super::value::unmounted_reason(&[])))
+        }
         _ => {
             let mut v = ValueOrgs::default();
             let mut basis = Vec::new();
@@ -1712,6 +1819,10 @@ pub async fn compute(
             if let Some(c) = &calls {
                 v.union(&c.value);
                 basis.push("conference".to_string());
+            }
+            if let Some(n) = &network {
+                v.union(n);
+                basis.push("network".to_string());
             }
             Measured::Value(ActiveOrgs {
                 day: v.day.len() as i64,
@@ -2418,6 +2529,46 @@ mod tests {
         assert_eq!(end_reason_class("error"), "failure");
         assert_eq!(end_reason_class("agent_disconnect"), "failure");
         assert_eq!(end_reason_class("something_new"), "other");
+    }
+
+    /// P2 — a purestat 400 naming an undefined goal is a configuration gap
+    /// the sections name; any other error reads as before.
+    #[test]
+    fn an_unknown_goal_is_named_and_everything_else_is_not() {
+        let e = PurestatError::Status(400, "unknown goal: \"signup\"".into());
+        assert_eq!(unknown_goal(&e).as_deref(), Some("signup"));
+        let m: Measured<i64> = Err::<i64, _>(e).into();
+        assert_eq!(
+            m,
+            Measured::NotMeasured(NotMeasured::now(
+                "signup is not defined on the purestat site"
+            ))
+        );
+        assert_eq!(
+            unknown_goal(&PurestatError::Status(
+                400,
+                "Unknown goal: subscribe".into()
+            ))
+            .as_deref(),
+            Some("subscribe")
+        );
+        assert_eq!(
+            unknown_goal(&PurestatError::Status(400, "unknown goal".into())).as_deref(),
+            Some("the goal")
+        );
+        for other in [
+            PurestatError::Status(400, "unknown dimension".into()),
+            PurestatError::Status(500, "unknown goal: \"x\"".into()),
+            PurestatError::Unauthorized,
+            PurestatError::Timeout,
+        ] {
+            assert_eq!(unknown_goal(&other), None, "{other:?}");
+            let m: Measured<i64> = Err::<i64, _>(other.clone()).into();
+            assert_eq!(
+                m,
+                Measured::NotMeasured(NotMeasured::now(other.to_string()))
+            );
+        }
     }
 
     #[test]

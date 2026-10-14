@@ -145,6 +145,13 @@ pub fn wire_rc_relay(state: &RemoteState) {
                 // FR-101 P2 — the org's session policy, read by the ORIGIN
                 // pod's gate. See `session_policy_from_relay` for absent.
                 let session_policy = session_policy_from_relay(body.get("session_policy"));
+                // FR-101 P4b — the org's maximum session length, in seconds.
+                // Absent (an older origin pod) is no limit, what that pod
+                // would have applied itself.
+                let max_duration = body
+                    .get("max_secs")
+                    .and_then(|v| v.as_u64())
+                    .map(std::time::Duration::from_secs);
                 let frame: ClientMsg = serde_json::from_value(
                     body.get("frame")
                         .cloned()
@@ -204,6 +211,7 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     may_record,
                     rc_overlay,
                     session_policy,
+                    max_duration,
                 };
                 match state.fleet.rc_hub.dispatch(&ctx, frame) {
                     Ok(()) => Ok(serde_json::json!({ "dispatched": true })),
@@ -347,6 +355,9 @@ pub async fn relay_rc_frame(
     // owner pod's hub applies it; without this a cross-pod session would
     // skip the org's switches.
     session_policy: OrgPolicy,
+    // FR-101 P4b — the org's maximum session length; the owner pod's hub
+    // arms it when the session goes live.
+    max_duration: Option<std::time::Duration>,
     raw_frame: &serde_json::Value,
 ) -> Result<Option<(String, String)>, ()> {
     let Some(bus) = state.cluster_bus.clone() else {
@@ -367,6 +378,7 @@ pub async fn relay_rc_frame(
         "may_record": may_record,
         "rc_overlay": rc_overlay,
         "session_policy": session_policy_to_relay(session_policy),
+        "max_secs": max_duration.map(|d| d.as_secs()),
         "frame": raw_frame,
     });
     match bus.request(owner_pod, "rc.cmd", body).await {

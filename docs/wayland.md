@@ -108,6 +108,9 @@ Two messages carry it (`useRemoteControl.ts`, `mediaWaitingCopy`).
 |---|---|---|---|
 | `rc:media-unavailable` | `wayland_not_enabled` | a Wayland desktop that no arm may capture; the hint names the keys **this install** can use | per-user: `portal_capture` (+ `mutter_capture` on GNOME) if the automatic arm is off; system: `drm_capture` + `uinput` |
 | `rc:media-unavailable` | `backend_error` | an arm that was on, or that switched itself on, failed; the detail is its own error | read the detail: it names the arm and the cause |
+| `rc:media-unavailable` | `backend_error`: *"…the person at the screen declined the request"* (the release after 0.4.135; before it, *"…exited before announcing a stream"*) | the person at the screen said no to remote control and then to a screen share | ask them; the next session asks again |
+| `rc:media-unavailable` | `backend_error`: *"…the portal ended the request on its own…"* (the same release) | the portal refused without a dialog: its backend for this desktop is stopped or missing | restart the backend the detail names, then `xdg-desktop-portal` (`systemctl --user restart …`) |
+| `rc:media-unavailable` | `backend_error`: *"…reading the scanout needs CAP_SYS_ADMIN (root)…"* (the same release; before it, the session re-created itself with no reason) | `drm_capture` is set on a per-user install, which cannot read the scanout | `roomler config clear drm_capture`: the desktop's own screencast takes over |
 | `rc:media-waiting` | `person_at_screen` | the desktop portal is asking the person at the screen to share it (or to allow remote control) | someone at the computer answers; the viewer waits for the dialog's deadline instead of reconnecting |
 | `rc:media-waiting` | `screen_unlock` | GNOME's screen is locked, and GNOME shares no locked screen | unlock it at the computer; the picture comes back by itself |
 | `rc:media-waiting` | `display_wake` | the display is off, so DRM has no scanout to read | move the viewer's mouse, or any input at the computer |
@@ -154,7 +157,7 @@ ones that decide this page:
 | Key | Env | Default | Effect |
 |---|---|---|---|
 | `wayland_auto` | `ROOMLERD_WAYLAND_AUTO` | **on** | a per-user daemon in its own Wayland session switches capture on by itself; off = everything opt-in, as before FR-93 P2 |
-| `wayland_aware` | `ROOMLERD_WAYLAND_AWARE` | **on** | a Wayland desktop no arm may capture says `wayland_not_enabled`; off = the behaviour before FR-93 |
+| `wayland_aware` | `ROOMLERD_WAYLAND_AWARE` | **on** | a Wayland desktop no arm may capture says `wayland_not_enabled`; off = the behaviour before FR-93, with no input-reach warning either (P1a) |
 | `drm_capture`, `uinput` | `ROOMLERD_DRM_CAPTURE`, `ROOMLERD_UINPUT` | off | the system arms (§1) |
 | `portal_capture`, `mutter_capture` | `ROOMLERD_PORTAL_CAPTURE`, `ROOMLERD_MUTTER_CAPTURE` | off | the per-user arms, explicitly; any capture key hands the choice back to the operator |
 | — | `ROOMLERD_MEDIA_WAITING` | on | the `rc:media-waiting` notices (§4); off = the viewer is told nothing and reconnects as before |

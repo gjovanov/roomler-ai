@@ -561,7 +561,8 @@ async fn every_section_counts_the_seeded_day_exactly() {
     assert_eq!(fig(&j["headline"]["active_orgs"]), (2, 2, 2));
     assert_eq!(
         j["headline"]["active_orgs"]["basis"],
-        json!(["remote", "conference"])
+        json!(["remote", "conference", "network"]),
+        "P2 — network's tunnel/SSH flows are value events too"
     );
     assert_eq!(
         not_measured(&j["headline"]["coverage"]),

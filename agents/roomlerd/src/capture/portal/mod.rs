@@ -429,6 +429,28 @@ pub mod helper {
     /// detection result by a helper built from another revision.
     const STREAM_MARKER: &str = "ROOMLER_PORTAL_STREAM:";
 
+    /// FR-93 P2d-4 — marks the line a streaming helper writes when it fails
+    /// before its stream starts: why, as a JSON string, in the words the
+    /// viewer is shown. Before it, the helper only logged the reason and
+    /// exited, and the parent could say no more than "the portal helper exited
+    /// before announcing a stream". Measured on the FR-93 lab's KDE guest on
+    /// 0.4.135, where the person at the screen had declined both dialogs.
+    /// [`STREAM_MARKER`] is not a prefix of it (`:` against `_`), so neither is
+    /// ever read as the other. A parent from before it skips the line as noise.
+    const STREAM_FAILED_MARKER: &str = "ROOMLER_PORTAL_STREAM_FAILED:";
+
+    /// Child side: say why on stdout for the parent, log it, and exit `1`.
+    fn fail_stream(why: impl std::fmt::Display) -> ! {
+        let why = why.to_string();
+        eprintln!("portal-helper: {why}");
+        if let Ok(j) = serde_json::to_string(&why) {
+            println!("{STREAM_FAILED_MARKER}{j}");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
+        std::process::exit(1);
+    }
+
     /// FR-93 P5b — the streaming helper's exit status when the compositor
     /// closed its session (GNOME, at a screen lock). Distinct from `1`, a
     /// failure, so the journal tells the two apart; the parent reopens either.
@@ -662,27 +684,19 @@ pub mod helper {
                 eprintln!("portal-helper: the input session failed ({e}) — retrying capture-only");
                 match super::screencast::open(SessionKind::CaptureOnly, source) {
                     Ok(s) => s,
-                    Err(e2) => {
-                        eprintln!("portal-helper: {e2}");
-                        std::process::exit(1);
-                    }
+                    Err(e2) => fail_stream(e2),
                 }
             }
-            Err(e) => {
-                eprintln!("portal-helper: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => fail_stream(e),
         };
         // `take`, not destructure: the session must stay WHOLE — its D-Bus
         // connection keeps the portal session (and so the PipeWire node and
         // the input grant) alive, and the input context still needs it.
         let Some(fd) = session.pipewire_fd.take() else {
-            eprintln!("portal-helper: the portal gave no PipeWire fd");
-            std::process::exit(1);
+            fail_stream("the portal gave no PipeWire fd");
         };
         let Some(first) = session.report.streams.first() else {
-            eprintln!("portal-helper: the portal gave no stream to attach to");
-            std::process::exit(1);
+            fail_stream("the portal gave no stream to attach to");
         };
         let node_id = first.node_id;
         let advertised = (first.width, first.height);
@@ -693,10 +707,7 @@ pub mod helper {
             DEFAULT_MAX_FPS,
         ) {
             Ok(h) => h,
-            Err(e) => {
-                eprintln!("portal-helper: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => fail_stream(e),
         };
         eprintln!(
             "portal-helper: streaming {}x{} (spa format {})",
@@ -807,8 +818,7 @@ pub mod helper {
         let session = match super::mutter::open(with_input) {
             Ok(s) => s,
             Err(super::mutter::MutterError::Unavailable) => {
-                eprintln!("portal-helper: {}", super::mutter::MutterError::Unavailable);
-                std::process::exit(1);
+                fail_stream(super::mutter::MutterError::Unavailable)
             }
             Err(e) if with_input => {
                 eprintln!(
@@ -817,16 +827,10 @@ pub mod helper {
                 );
                 match super::mutter::open(false) {
                     Ok(s) => s,
-                    Err(e2) => {
-                        eprintln!("portal-helper: {e2}");
-                        std::process::exit(1);
-                    }
+                    Err(e2) => fail_stream(e2),
                 }
             }
-            Err(e) => {
-                eprintln!("portal-helper: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => fail_stream(e),
         };
         eprintln!(
             "portal-helper: mutter node {} on {} (ScreenCast v{:?}, {} ms, input {})",
@@ -850,10 +854,7 @@ pub mod helper {
             DEFAULT_MAX_FPS,
         ) {
             Ok(h) => h,
-            Err(e) => {
-                eprintln!("portal-helper: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => fail_stream(e),
         };
         eprintln!(
             "portal-helper: streaming {}x{} (spa format {})",
@@ -987,6 +988,12 @@ pub mod helper {
             }
             if let Some(json) = line.trim().strip_prefix(STREAM_MARKER) {
                 return Ok(serde_json::from_str(json)?);
+            }
+            // FR-93 P2d-4 — the helper's own reason, e.g. that the person at
+            // the screen declined.
+            if let Some(json) = line.trim().strip_prefix(STREAM_FAILED_MARKER) {
+                let why: String = serde_json::from_str(json).unwrap_or_else(|_| json.to_string());
+                anyhow::bail!("{why}");
             }
         }
         anyhow::bail!("the portal helper never announced a stream")
@@ -1329,6 +1336,25 @@ pub mod helper {
             assert_eq!(parse_marked(""), None);
             assert_eq!(parse_marked("portal is fine, honest\n"), None);
             assert_eq!(parse_marked(&format!("{MARKER}not json")), None);
+        }
+
+        /// FR-93 P2d-4 — a streaming helper that failed before its stream says
+        /// why, and the parent hands that reason on. Before it the parent saw
+        /// only an exit, which is still what a helper that says nothing reads as.
+        #[test]
+        fn a_helper_that_failed_says_why() {
+            let why = "the person at the screen declined the request";
+            let failed = format!(
+                "{STREAM_FAILED_MARKER}{}\n",
+                serde_json::to_string(why).unwrap()
+            );
+            let mut r = std::io::Cursor::new(format!("portal-helper noise\n{failed}"));
+            assert_eq!(read_stream_handshake(&mut r).unwrap_err().to_string(), why);
+            // Neither marker is read as the other.
+            assert!(!STREAM_FAILED_MARKER.starts_with(STREAM_MARKER));
+            let mut silent = std::io::Cursor::new(String::new());
+            let e = read_stream_handshake(&mut silent).unwrap_err().to_string();
+            assert!(e.contains("exited before announcing a stream"), "{e}");
         }
 
         /// #1719 run B: only a root daemon drops privilege; a per-user daemon

@@ -43,6 +43,17 @@ export type AgentStatusValue = 'online' | 'offline' | 'unenrolled' | 'quarantine
  *  (`prompt` — attended). Replaces the legacy `require_consent` bool. */
 export type ConsentMode = 'auto' | 'prompt' | 'email' | 'push' | 'prompt_then_email'
 
+/** FR-101 P2 — one sensitive session feature, as an org allows it. Mirrors the
+ *  Rust `RcFeaturePolicy` (lowercase on the wire). */
+export type RcFeaturePolicy = 'on' | 'ask' | 'off'
+
+/** FR-101 P2 — the org's remote-session policy (`GET/PUT …/rc-session-policy`). */
+export interface RcSessionPolicy {
+  clipboard: RcFeaturePolicy
+  files: RcFeaturePolicy
+  audio: RcFeaturePolicy
+}
+
 export interface AccessPolicy {
   consent_mode: ConsentMode | null
   /** FR-27 — apply `consent_mode` to the device's OWNER too.
@@ -653,6 +664,12 @@ export interface SshAuditEntry {
   /** The refusal in the words the caller was given, straight from the server
    *  so the UI never has to keep its own copy of the enum's meanings. */
   denied_message?: string | null
+  /** FR-105 — where the server sent the grant: `system` (a Windows device's
+   *  SYSTEM service, as SYSTEM), `console_user` (the same service, as the
+   *  signed-in user) or `worker` (the agent's own process, whose identity
+   *  depends on the install). Absent on a refusal and on rows from before
+   *  FR-105. Read with `account_mode` through `sshAsChip`. */
+  ran_as?: string | null
 }
 
 /** What a device REPORTED doing inside an SSH session (P8).
@@ -1297,6 +1314,39 @@ export const useAgentStore = defineStore('agents', () => {
     )
   }
 
+  // ── FR-101 P2 — the org's session policy (clipboard, files, audio) ──
+  //
+  // Each `on` | `ask` | `off`. The hub strips what the policy refuses and
+  // names why, and the device enforces it again; this is the admin card's
+  // read and write.
+
+  /** `null` until fetched, and for a member who may not manage org
+   *  settings — the "not an admin ≠ a value" rule of the switches above. */
+  const orgRcSessionPolicy = ref<RcSessionPolicy | null>(null)
+
+  async function fetchOrgRcSessionPolicy(tenantId: string) {
+    if (!(await mayReadOrgSettings(tenantId))) {
+      orgRcSessionPolicy.value = null
+      return
+    }
+    try {
+      orgRcSessionPolicy.value = await api.get<RcSessionPolicy>(
+        `/tenant/${tenantId}/rc-session-policy`,
+      )
+    } catch {
+      orgRcSessionPolicy.value = null
+    }
+  }
+
+  /** Set one or more features (MANAGE_TENANT server-side). The route leaves
+   *  a feature the body does not name alone, and answers with all three. */
+  async function setOrgRcSessionPolicy(tenantId: string, patch: Partial<RcSessionPolicy>) {
+    orgRcSessionPolicy.value = await api.put<RcSessionPolicy>(
+      `/tenant/${tenantId}/rc-session-policy`,
+      patch,
+    )
+  }
+
   // ── FR-51 — ephemeral enrollment keys ────────────────────────────
   //
   // A reusable credential that mints self-removing devices (CI runners,
@@ -1331,6 +1381,40 @@ export const useAgentStore = defineStore('agents', () => {
       { ephemeral_keys_enabled: enabled },
     )
     orgEphemeralKeysEnabled.value = resp.ephemeral_keys_enabled
+  }
+
+  // ── FR-101 P4b — the org's session limits ──────────────────────────
+  //
+  // The maximum length of a remote-desktop session, in seconds; the hub ends
+  // a session that reaches it. `null` = no limit.
+
+  /** `undefined` until fetched, and for a member who may not manage org
+   *  settings; `null` = no limit. */
+  const orgRcMaxSessionSecs = ref<number | null | undefined>(undefined)
+
+  async function fetchOrgRcSessionLimits(tenantId: string) {
+    if (!(await mayReadOrgSettings(tenantId))) {
+      orgRcMaxSessionSecs.value = undefined
+      return
+    }
+    try {
+      const resp = await api.get<{ max_secs: number | null }>(
+        `/tenant/${tenantId}/rc-session-limits`,
+      )
+      orgRcMaxSessionSecs.value = resp.max_secs ?? null
+    } catch {
+      orgRcMaxSessionSecs.value = undefined
+    }
+  }
+
+  /** Set the maximum length (`null` clears it). MANAGE_TENANT server-side;
+   *  applies to sessions that go live after the change. */
+  async function setOrgRcMaxSessionSecs(tenantId: string, maxSecs: number | null) {
+    const resp = await api.put<{ max_secs: number | null }>(
+      `/tenant/${tenantId}/rc-session-limits`,
+      { max_secs: maxSecs },
+    )
+    orgRcMaxSessionSecs.value = resp.max_secs ?? null
   }
 
   /** List the org's keys (secrets are never in the list — mint-once only). */
@@ -1534,9 +1618,15 @@ export const useAgentStore = defineStore('agents', () => {
     setOrgKeepBusyDefaultPattern,
     fetchKeepBusyDefaultPattern,
     fetchKeepBusyHistory,
+    orgRcSessionPolicy,
+    fetchOrgRcSessionPolicy,
+    setOrgRcSessionPolicy,
     orgEphemeralKeysEnabled,
     fetchOrgEphemeralKeysEnabled,
     setOrgEphemeralKeysEnabled,
+    orgRcMaxSessionSecs,
+    fetchOrgRcSessionLimits,
+    setOrgRcMaxSessionSecs,
     listEnrollKeys,
     mintEnrollKey,
     revokeEnrollKey,

@@ -72,9 +72,10 @@ pub fn parse_upstream(s: &str) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, 53))
 }
 
-/// Serve until the socket errors (or the task is dropped). Best-effort about the
-/// bind (it needs `:53` privileges + the address on the NIC) — but it RETRIES
-/// rather than giving up, so a transient holder cannot cost the whole process.
+/// Serve until the task is aborted (the runtime's teardown). Best-effort about
+/// the bind (it needs `:53` privileges + the address on the NIC) — but it RETRIES
+/// rather than giving up, so a transient holder cannot cost the whole process,
+/// and a socket that fails for good is rebound rather than abandoned (#2213).
 ///
 /// FR-72 P2. The bind used to log once and return, which made one momentary
 /// conflict permanent: the resolver stayed off for the daemon's entire lifetime,
@@ -91,52 +92,93 @@ pub fn parse_upstream(s: &str) -> Option<SocketAddr> {
 /// Both orgs, five hours dead — while a probe minutes later bound the same
 /// address on the first try. Nothing was holding it any more; nothing asked.
 pub async fn run(cfg: DnsConfig, bound: tokio::sync::watch::Sender<bool>) {
-    let sock = {
-        let mut attempt: u32 = 0;
-        loop {
-            match UdpSocket::bind(cfg.bind).await {
-                Ok(s) => break Arc::new(s),
-                Err(e) => {
-                    // WARN once, then DEBUG: a permanently-held port (a real DNS
-                    // server on the host) must not write a WARN every 30 s
-                    // forever, but the first failure is worth seeing.
-                    if attempt == 0 {
-                        // Report not-bound so the runtime withholds the OS steer.
-                        // Steering at a resolver that never bound blackholes the
-                        // magic domain host-wide (NRPT is registry-global).
-                        let _ = bound.send(false);
-                        warn!(bind = %cfg.bind, %e, "magicdns: bind failed; retrying");
-                    } else {
-                        debug!(bind = %cfg.bind, %e, attempt, "magicdns: bind still failing");
-                    }
-                    // Retry FOREVER, capped at 60 s. A squatter that goes away —
-                    // the case actually measured — then heals itself, and the
-                    // cost of being wrong is one timer per minute. The task is
-                    // aborted by the runtime teardown, so this cannot outlive it.
-                    let backoff = Duration::from_secs(2u64.saturating_pow(attempt.min(5)).min(60));
-                    attempt = attempt.saturating_add(1);
-                    tokio::time::sleep(backoff).await;
+    loop {
+        let sock = bind_until_up(&cfg, &bound).await;
+        // P5 S4b — tell the runtime the resolver is actually listening, so it
+        // only steers the "." catch-all at this address when there IS a live
+        // resolver. Steering "." at a dead :53 would blackhole ALL DNS (worse
+        // than the leak we're closing), so the exit-DNS steer is gated on this.
+        //
+        // ⚠️ This can now fire LATE — after the runtime's initial wait gave up.
+        // The runtime therefore keeps watching it and installs the steer when it
+        // flips, instead of reading it once. A `watch` (not a `oneshot`) is what
+        // makes the late arrival observable at all.
+        let _ = bound.send(true);
+        info!(bind = %cfg.bind, domain = %cfg.magic_domain, "magicdns: resolver up");
+        serve(&cfg, sock).await;
+        // #2213 — never just exit. The runtime keeps the OS steer for the
+        // whole session (it only ever reacts to a LATE bind), so a resolver
+        // that returned left the steer pointing at nothing: the magic domain
+        // blackholed host-wide, and under an exit's "." steer, every name.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Bind `cfg.bind`, retrying until it works.
+async fn bind_until_up(
+    cfg: &DnsConfig,
+    bound: &tokio::sync::watch::Sender<bool>,
+) -> Arc<UdpSocket> {
+    let mut attempt: u32 = 0;
+    loop {
+        match UdpSocket::bind(cfg.bind).await {
+            Ok(s) => return Arc::new(s),
+            Err(e) => {
+                // WARN once, then DEBUG: a permanently-held port (a real DNS
+                // server on the host) must not write a WARN every 30 s
+                // forever, but the first failure is worth seeing.
+                if attempt == 0 {
+                    // Report not-bound so the runtime withholds the OS steer.
+                    // Steering at a resolver that never bound blackholes the
+                    // magic domain host-wide (NRPT is registry-global).
+                    let _ = bound.send(false);
+                    warn!(bind = %cfg.bind, %e, "magicdns: bind failed; retrying");
+                } else {
+                    debug!(bind = %cfg.bind, %e, attempt, "magicdns: bind still failing");
                 }
+                // Retry FOREVER, capped at 60 s. A squatter that goes away —
+                // the case actually measured — then heals itself, and the
+                // cost of being wrong is one timer per minute. The task is
+                // aborted by the runtime teardown, so this cannot outlive it.
+                let backoff = Duration::from_secs(2u64.saturating_pow(attempt.min(5)).min(60));
+                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(backoff).await;
             }
         }
-    };
-    // P5 S4b — tell the runtime the resolver is actually listening, so it only
-    // steers the "." catch-all at this address when there IS a live resolver.
-    // Steering "." at a dead :53 would blackhole ALL DNS (worse than the leak
-    // we're closing), so the exit-DNS steer is gated on this.
-    //
-    // ⚠️ This can now fire LATE — after the runtime's initial wait gave up. The
-    // runtime therefore keeps watching it and installs the steer when it flips,
-    // instead of reading it once. A `watch` (not a `oneshot`) is what makes the
-    // late arrival observable at all.
-    let _ = bound.send(true);
-    info!(bind = %cfg.bind, domain = %cfg.magic_domain, "magicdns: resolver up");
+    }
+}
+
+/// #2213 — a `recv_from` error that reports an EARLIER datagram, not the
+/// socket. Windows reports an ICMP port-unreachable, drawn by a reply we sent
+/// to a port the DNS client had already closed (it gives up on a slow answer
+/// and retries from a new one), as `WSAECONNRESET` (10054) on the NEXT
+/// receive. A datagram larger than the buffer comes back as `WSAEMSGSIZE`
+/// (10040). Neither says anything about the resolver. Field, 2026-10-14: both
+/// Windows exit clients' resolvers exited on 10054 within ten seconds of the
+/// exit's "." steer pointing every query at them.
+fn recv_error_is_transient(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        e.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+    ) || e.raw_os_error() == Some(10040)
+}
+
+/// Answer queries on `sock` until it fails for a reason that IS about it.
+async fn serve(cfg: &DnsConfig, sock: Arc<UdpSocket>) {
     let mut buf = [0u8; 1500];
     loop {
         let (n, from) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
+            Err(e) if recv_error_is_transient(&e) => {
+                debug!(%e, "magicdns: receive reported an earlier datagram; serving on");
+                continue;
+            }
             Err(e) => {
-                warn!(%e, "magicdns: recv failed; resolver exiting");
+                warn!(%e, "magicdns: recv failed; rebinding the resolver");
                 return;
             }
         };
@@ -1010,6 +1052,71 @@ mod tests {
         };
         let resp = build_response(&query_for("devbox", 1), &cfg).await.unwrap();
         assert_eq!(&resp[resp.len() - 4..], &[100, 64, 0, 9]);
+    }
+
+    /// #2213 — the receive errors that are about an earlier datagram, not
+    /// the socket: Windows' ICMP-driven 10054, an oversized datagram's 10040.
+    #[test]
+    fn errors_about_an_earlier_datagram_are_not_fatal() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::ConnectionReset, ErrorKind::ConnectionRefused] {
+            assert!(recv_error_is_transient(&Error::from(kind)), "{kind:?}");
+        }
+        assert!(recv_error_is_transient(&Error::from_raw_os_error(10040)));
+        for kind in [
+            ErrorKind::InvalidInput,
+            ErrorKind::NotConnected,
+            ErrorKind::Other,
+        ] {
+            assert!(!recv_error_is_transient(&Error::from(kind)), "{kind:?}");
+        }
+    }
+
+    /// #2213 — the field case. Clients ask and close their port before the
+    /// answer lands (the Windows DNS client giving up on a slow reply); each
+    /// reply draws an ICMP port-unreachable, which Windows reports on the NEXT
+    /// receive as `WSAECONNRESET` (10054). The resolver must still answer the
+    /// client after them. Linux never reports that on an unconnected socket,
+    /// so this passes there either way; Windows is where it discriminates.
+    #[tokio::test]
+    async fn replies_to_closed_ports_do_not_kill_the_resolver() {
+        let port = {
+            let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let cfg = DnsConfig {
+            bind: format!("127.0.0.1:{port}").parse().unwrap(),
+            magic_domain: "myorg.roomler.net".into(),
+            upstream: "127.0.0.1:0".parse().unwrap(),
+            names: Arc::new(RwLock::new(HashMap::new())),
+            answer_aaaa: true,
+        };
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let resolver = tokio::spawn(run(cfg, tx));
+        rx.changed().await.unwrap();
+        assert!(*rx.borrow_and_update(), "the resolver should bind");
+
+        let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let probe = query_for(&format!("{PROBE_LABEL}.myorg.roomler.net"), 1);
+        for _ in 0..3 {
+            // Blocking socket, no await between send and close: on this
+            // current-thread runtime the resolver cannot answer before the
+            // port is gone.
+            let gone = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            gone.send_to(&probe, server).unwrap();
+            drop(gone);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&probe, server).await.unwrap();
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buf))
+            .await
+            .expect("the resolver must still answer after replies to closed ports")
+            .unwrap();
+        assert!(n > 0);
+        resolver.abort();
     }
 
     /// FR-72 — the resolver OWNS its port for as long as its task lives, and

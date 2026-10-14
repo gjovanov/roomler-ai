@@ -109,6 +109,15 @@ advertises `session-policy` (P2b). Every other session goes without it:
 - The agent's consent reply carries no grant, so the hub learns the floor only from the caps. A server
   older than P2b ignores the field and grants what the device then refuses at the channel.
 
+*As built, P2c: the viewer.*
+
+| Piece | Where |
+|---|---|
+| `rc:session.created.features_refused` read into a map: string values only, and a key or reason this build does not know is kept, so a newer server's refusal still greys its control. Each reason in words, naming whose decision it was (the organization's, the device owner's, the person at the device not being asked, an agent too old to ask, a policy that could not be read) | `ui/src/composables/useSessionFeatures.ts:43`, `:53` |
+| The controls: the clipboard send and get buttons and clipboard auto-sync, file upload and browse, and drag-and-drop onto the screen or the files drawer, each disabled with the reason as its title. A drop or click that still reaches a refused feature says why instead of starting. The audio toggle's title gives the reason during a session. One snackbar at the session's start names what is off | `ui/src/views/remote/RemoteControl.vue:2077` |
+| Clipboard auto-sync stands down in both directions for a session whose clipboard was refused, rather than pushing into a channel the agent refuses | `ui/src/composables/useRemoteControl.ts:4856` |
+| The org settings card, "Remote session features": a select per feature (`on` / ask the person at the device / `off`) through P2a's route. The read is gated like the other org switches; a change names only its feature | `ui/src/components/admin/SettingsSection.vue:213`; `ui/src/stores/agents.ts:1321` |
+
 ### 3b. Write the audit that is already defined
 
 *As first written:*
@@ -148,6 +157,25 @@ still reports. Detail, with the diagram: [`remote-control.md`](../remote-control
 - **A per-(caller, device) rate limit** on session requests, checked **after** the identity gates (as exec
   does), so a refusal names who was refused.
 
+*As built, P4b-1: the maximum session length.* The two limits are built apart because different parties
+can see them. A session's length is known to the hub, which saw it go live, so the hub enforces it for
+every agent and viewer already deployed. Idleness ("no input and no damage") is seen only by the agent;
+that is P4b-2.
+
+| Piece | Where |
+|---|---|
+| The setting: `TenantSettings.rc_limits.max_secs`, `None` (the default, and every row older than the field) for no limit. Operator decision 2: off for existing tenants | `crates/db/src/models/tenant.rs:129` |
+| `GET /api/tenant/{tenant_id}/rc-session-limits` for any member; `PUT` with `MANAGE_TENANT`, one minute to one day, or `null` to clear (an absent field is refused, as is an unknown key). The DAO `$set`s or `$unset`s the one field | `crates/modules/remote/src/session_policy.rs:192`, `:210`; `crates/services/src/dao/tenant.rs:175` |
+| The authz gate reads it from the tenant row it already loads, and binds every controller with it, break-glass included. A row it could not read means no limit (the behaviour from before), never sessions ended on a guess. The relay carries it as `max_secs` to the owner pod; absent from an older origin pod reads as no limit | `crates/modules/remote/src/controller.rs:541`; `crates/modules/remote/src/relay.rs:151` |
+| The hub arms a timer when the session goes **live** (the agent's answer), not when it was requested, because consent can take minutes. The session record's limit is *taken* then, so a renegotiation never arms a second timer. At the limit the hub ends the session as `EndReason::IdleTimeout` and names the limit `max_duration` on `rc:terminate` (`limit`) to both ends and in the `session_ended` audit row (`limit`). These are fields, not a new reason or audit kind: an older agent, viewer or pod reads them as the reason it already knows | `crates/modules/fleet/src/hub.rs:1847`, `:1902` (`terminate_with_limit`) |
+| The viewer says "The session reached your organization's maximum length" (`friendlyEndReason`). `idle_timeout` is not a reason it retries, so it never reconnects around the limit; connecting again is a new session under a new timer. The org settings page gains "Remote session limits" | `ui/src/composables/useRemoteControl.ts:599`; `ui/src/components/admin/SettingsSection.vue:257` |
+
+- The timer lives with the session on the pod that holds it. A pod that goes away takes its sessions,
+  and their timers, with it.
+- Not built: a per-device maximum. The org's binds every session in the org; a device floor for the
+  limits comes with P4b-2, beside the idle timeout, where the device's `AccessPolicy` already stores
+  `auto_terminate_idle_minutes`.
+
 ### 3d. The transport
 
 - **CBC out.** Configure the agent's DTLS cipher suites to the two ECDHE-GCM suites. Chrome has offered GCM
@@ -166,12 +194,14 @@ still reports. Detail, with the diagram: [`remote-control.md`](../remote-control
 | P1a | The transport: CBC out, the SRTP/SRTCP replay windows pinned (`agents/roomlerd/src/rc_transport.rs`, the vendored `set_dtls_cipher_suites`) | `ROOMLERD_DTLS_LEGACY_SUITES=1`; `ROOMLERD_SRTP_REPLAY_WINDOW` sizes the window, and no value turns it off | **shipped in 0.4.133.** FR-16 L0's `replay` / `legacy` / `unguarded` cells read both halves off the link in CI: DTLS red/green on the agent's real ClientHello, and replays refused on a live session. The window change is behaviour-neutral (§2). The field pcap is owed |
 | P1b | `https` at every entry point, and the IPv6 TURN check | an escape for plaintext labs | — **split from P1a** (see the note below) |
 | P2 | Policy switches and agent-side masking; viewer reasons | each setting defaults to today's behaviour (`on`) | split into P2a–P2c below |
-| P2a | The org's switch (§3a as built): `TenantSettings.rc_session`, the `rc-session-policy` route, the hub's strip with a reason per feature in `rc:session.created` and the audit row, the policy forwarded to the agent and carried by the cross-pod relay | each feature defaults to `on`: an org that sets nothing sees no change, and its agents get the same `rc:request` as before | **#2198**: unit tests in db, remote_control, fleet and remote (the remote module joins CI's unit-test step: it was in no lane); `rc_session_policy_tests`, five cells reading both the viewer's answer and the agent's frame, a cross-pod one included. Negative controls: with the hub's strip removed, four of the five fail and the route cell passes; with the relay dropping the policy, only the cross-pod cell fails |
-| P2b | The device's own switch (device-owned, never pushable, so it survives a compromised server) and the agent's masking at every entry point; `session-policy` advertised, and the prompt names each `ask` feature in words (§3a as built) | `on` | **#2203**: `session_policy` unit tests (8) and the hub's `feature_grant_follows_the_device_floor`; two more `rc_session_policy_tests` cells (the floor named as the device's, a heartbeat moving it both ways). Negative controls: with the agent ignoring the floor, its four floor tests fail (AC4's core among them); with the hub ignoring it, the two new cells and two hub tests fail while the P2a cells pass |
-| P2c | The viewer reads `features_refused` and greys each control with its reason; the org settings card | — | — |
+| P2a | The org's switch (§3a as built): `TenantSettings.rc_session`, the `rc-session-policy` route, the hub's strip with a reason per feature in `rc:session.created` and the audit row, the policy forwarded to the agent and carried by the cross-pod relay | each feature defaults to `on`: an org that sets nothing sees no change, and its agents get the same `rc:request` as before | **merged** #2198 (`6ccf92e20`): unit tests in db, remote_control, fleet and remote (the remote module joins CI's unit-test step: it was in no lane); `rc_session_policy_tests`, five cells reading both the viewer's answer and the agent's frame, a cross-pod one included. Negative controls: with the hub's strip removed, four of the five fail and the route cell passes; with the relay dropping the policy, only the cross-pod cell fails |
+| P2b | The device's own switch (device-owned, never pushable, so it survives a compromised server) and the agent's masking at every entry point; `session-policy` advertised, and the prompt names each `ask` feature in words (§3a as built) | `on` | **merged** #2203 (`8b08f332b`): `session_policy` unit tests (8) and the hub's `feature_grant_follows_the_device_floor`; two more `rc_session_policy_tests` cells (the floor named as the device's, a heartbeat moving it both ways). Negative controls: with the agent ignoring the floor, its four floor tests fail (AC4's core among them); with the hub ignoring it, the two new cells and two hub tests fail while the P2a cells pass |
+| P2c | The viewer reads `features_refused` and greys each control with its reason; the org settings card (§3a as built) | — | **#2206**: `useSessionFeatures.spec.ts` (parsing, every reason's words, the summary) and two store cases; the whole vitest suite (1990) and `vue-tsc` pass. The Dockerfile's `ui-builder` stage fails only on master's known `EnrollmentDialog.spec.ts` error (#2205) |
 | P3 | The audit producers: clipboard and file traffic as the device's claim, in `transfer_activity` (§3b as built), read at `GET …/transfer-activity/{agent_id}` | none: an older agent sends nothing, and an older server ignores the field | **merged** #2138 `919b44d3f`: wire tests, agent unit tests, and `transfer_activity_tests` (kept for the granted session, dropped without `CLIPBOARD` / `FILES`, for another device or without a valid name hash; a repeated tally adds nothing). **Field-verified 2026-10-14** (AC5, field log row 3): red on agent 0.4.134, green on 0.4.135, the first release that carries it |
-| P4 | Idle timeout, max duration, the request rate limit | each off by default | P4a below; the timeouts remain |
+| P4 | Idle timeout, max duration, the request rate limit | each off by default | P4a and P4b-1 below; the idle timeout remains (P4b-2) |
 | P4a | The request ceiling: 60 `rc:session.request` a minute per (caller, device), after the authz gate (`crates/modules/remote/src/controller.rs`, `SESSION_REQUESTS_PER_MINUTE`); refusals answer `rc:error` `rate_limited` | none. **On, not off as first written:** the ceiling sits where no legitimate client reaches it (the reconnect ladder asks about a dozen times in its first minute), and a ceiling that ships off protects nothing. Changing it is a reviewed change to the constant | **merged** #2142 `216813e7a`: `rc_request_ceiling_tests` (the owner passes 60 and is refused on the 61st; another device is untouched; a member without the right gets `permission_denied` all 61 times). Negative controls: with the ceiling at 0 it fails on request 61; moved ahead of the authz gate it fails on the identity-first assertion |
+| P4b-1 | The maximum session length (§3c as built): the org's setting and route, the hub's timer from the moment the session went live, `rc:terminate` and the `session_ended` audit row naming `max_duration`, the viewer's sentence, the settings card | none needed: nothing is limited until an org sets a limit (operator decision 2) | #2211: the hub's `a_session_ends_at_the_orgs_maximum_length`, `rc_session_limits_tests` (the route's rules; a live session ended at a 2 s limit, both ends told and the audit row naming it, against an org with no limit that goes on), and the store and viewer tests. Negative control: with the timer never armed, both timer tests fail and the route cell passes |
+| P4b-2 | The idle timeout: no input and no damage on screen for N minutes, measured on the agent (only it sees both); the org's setting with the device's floor (`AccessPolicy.auto_terminate_idle_minutes`, stored today, read by nothing); a cap word so a viewer knows the device enforces it | off by default | — |
 | P5 | Docs and the field table | — | — |
 
 ⚠️ **Why P1b was split from P1a (2026-10-13).** Replay windows and GCM-only DTLS

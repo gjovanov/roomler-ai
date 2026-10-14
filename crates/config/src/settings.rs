@@ -128,6 +128,14 @@ pub struct HiveSettings {
     /// (measured: 5.2 s, two checkpoints 13 ms apart).
     #[serde(default = "hive_default_fork_copy_secs")]
     pub fork_copy_secs: u64,
+    /// FR-90 P2g-3 — how often the server purges the sessions an
+    /// organization's `retention_days` no longer keeps
+    /// (`ROOMLER__HIVE__RETENTION_SWEEP_SECS`): one pod a cycle, by a claim
+    /// in the database. `0` is no sweep; with `replicaset` off there is none
+    /// either. An organization's `retention_days = 0` keeps its sessions for
+    /// ever whatever this says.
+    #[serde(default = "hive_default_retention_sweep_secs")]
+    pub retention_sweep_secs: u64,
 }
 
 fn hive_default_promote_prepare_secs() -> u64 {
@@ -161,8 +169,13 @@ impl Default for HiveSettings {
             promote_join_secs: hive_default_promote_join_secs(),
             teleport_have_want: false,
             fork_copy_secs: hive_default_fork_copy_secs(),
+            retention_sweep_secs: hive_default_retention_sweep_secs(),
         }
     }
+}
+
+fn hive_default_retention_sweep_secs() -> u64 {
+    3600
 }
 
 /// #1731 — `[diag]`, env `ROOMLER__DIAG__*`: the stall watchdog.

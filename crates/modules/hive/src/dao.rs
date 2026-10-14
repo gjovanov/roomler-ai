@@ -1366,6 +1366,7 @@ impl AgentSessionDao {
         id: ObjectId,
         mark: &PurgedMark,
         devices: &[ObjectId],
+        only_ended: bool,
     ) -> DaoResult<Option<AgentSession>> {
         let now = DateTime::now();
         let ids: Vec<Bson> = devices.iter().map(|d| Bson::ObjectId(*d)).collect();
@@ -1384,11 +1385,7 @@ impl AgentSessionDao {
                 "detail", "refusal", "drivers", "location.account",
             ] },
         ];
-        Ok(self
-            .base
-            .collection()
-            .find_one_and_update(
-                doc! {
+        let mut filter = doc! {
                     "_id": id,
                     "tenant_id": tenant_id,
                     "owner_id": owner_id,
@@ -1421,11 +1418,57 @@ impl AgentSessionDao {
                             },
                         ] },
                     ],
-                },
-                pipeline,
-            )
+        };
+        // P2g-3 — a retention purge only of a session that is over: one made
+        // a managed session again after it was read is not tombstoned.
+        if only_ended {
+            filter.insert(
+                "status",
+                statuses(&[
+                    SessionStatus::Ended,
+                    SessionStatus::Refused,
+                    SessionStatus::Lost,
+                ]),
+            );
+        }
+        Ok(self
+            .base
+            .collection()
+            .find_one_and_update(filter, pipeline)
             .return_document(mongodb::options::ReturnDocument::Before)
             .await?)
+    }
+
+    /// FR-90 P2g-3a — the sessions of `tenant_id` that are over and ended
+    /// before `cutoff` (one with no `ended_at`, last updated before it), no
+    /// tombstone among them: what retention purges. The oldest first, at
+    /// most `limit`.
+    pub async fn past_retention(
+        &self,
+        tenant_id: ObjectId,
+        cutoff: DateTime,
+        limit: i64,
+    ) -> DaoResult<Vec<AgentSession>> {
+        let mut cursor = self
+            .base
+            .collection()
+            .find(doc! {
+                "tenant_id": tenant_id,
+                "purged": Bson::Null,
+                "status": statuses(&crate::retention::OVER),
+                "$or": [
+                    { "ended_at": { "$lt": cutoff } },
+                    { "ended_at": Bson::Null, "updated_at": { "$lt": cutoff } },
+                ],
+            })
+            .sort(doc! { "ended_at": 1 })
+            .limit(limit)
+            .await?;
+        let mut out = Vec::new();
+        while cursor.advance().await? {
+            out.push(cursor.deserialize_current()?);
+        }
+        Ok(out)
     }
 
     /// FR-90 P2g-2 — the purge `purge_id` is complete: the tombstone that
