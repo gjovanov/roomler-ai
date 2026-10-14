@@ -1462,6 +1462,23 @@ pub struct AgentConfig {
     /// LocalAPI only by the person at the console, whose screen it covers.
     #[serde(default)]
     pub privacy_mode_allowed: bool,
+    /// FR-101 P2b — this device's own floor for the clipboard in a remote
+    /// session: `on` (the default), `ask` (only on a session the person here
+    /// approves, on a prompt that names it) or `off`. The stricter of this and
+    /// the org's policy wins, and the agent masks the grant at every session
+    /// start whatever the server sent. Read LIVE: the next session follows,
+    /// and the hub is told on the next heartbeat, so a viewer can say why.
+    ///
+    /// ⚠️ Device-owned: structurally absent from `DesiredConfig`, so no server
+    /// can switch back on what the owner switched off.
+    #[serde(default)]
+    pub rc_clipboard: roomler_ai_remote_control::models::FeaturePolicy,
+    /// FR-101 P2b — the same floor for file transfer.
+    #[serde(default)]
+    pub rc_files: roomler_ai_remote_control::models::FeaturePolicy,
+    /// FR-101 P2b — the same floor for this computer's audio.
+    #[serde(default)]
+    pub rc_audio: roomler_ai_remote_control::models::FeaturePolicy,
     /// B2 — score-driven demotion of degraded-but-live direct carriers
     /// (`ROOMLERD_OVERLAY_DEMOTE`): `off` | `shadow` (compute +
     /// count, never act — the built-in default) | `on` (voluntary MBB
@@ -2491,6 +2508,9 @@ pub fn test_fixture() -> AgentConfig {
         record_remote_audio: false,
         keep_busy_enabled: true,
         privacy_mode_allowed: false,
+        rc_clipboard: Default::default(),
+        rc_files: Default::default(),
+        rc_audio: Default::default(),
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,

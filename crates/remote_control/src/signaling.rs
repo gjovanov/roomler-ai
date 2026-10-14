@@ -2213,7 +2213,8 @@ pub enum ServerMsg {
         /// FR-101 P2 — the session features the policy took out of what was
         /// asked for, each with why: `{"files": "org_policy_off"}`. Keys are
         /// `clipboard`, `files` and `audio`; reasons are `org_policy_off`
-        /// (the organization switched it off), `needs_consent` (the policy
+        /// (the organization switched it off), `device_policy_off` (P2b: the
+        /// device's owner did, `AgentCaps.session_policy`), `needs_consent` (the policy
         /// says to ask, and nobody at the device is asked under this
         /// session's consent mode), `device_cannot_ask` (it would be asked,
         /// but the device's agent predates `session-policy`) and
