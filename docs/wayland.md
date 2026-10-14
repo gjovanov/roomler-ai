@@ -135,7 +135,8 @@ viewer shows meanwhile). A system install sees the seat, whoever is on it.
 
 Every row above was measured on the FR-93 lab: persistent GNOME 50 and Plasma
 6.7.5 guests, per-user and system installs, driven from outside the guest so
-the harness, not the product, plays the person at the screen (the spec's §3.2).
+the harness, not the product, plays the person at the screen (the spec's §3.2;
+how to run it: [`vmtest.md`](vmtest.md#the-wayland-lab-fr-93)).
 Release builds were checked against their published digest and signature. The
 arm-by-arm field record is [`linux-capture.md`](linux-capture.md) §6, and every
 run, including the wrong turns, is in the spec's field-verification log.

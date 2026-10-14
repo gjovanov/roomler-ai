@@ -287,6 +287,8 @@ test.describe('vmtest remote-desktop check (named agent)', () => {
   test.setTimeout(5 * 60 * 1000)
 
   test('named throwaway agent streams decoded, advancing frames', async ({ page, context }) => {
+    // Analytics must never count a test session (FR-102).
+    await context.route('https://purestat.ai/**', (r) => r.abort())
     // Sessions are COOKIE-ONLY since #680/#690 — seeding localStorage
     // access/refresh tokens does NOTHING and the SPA shows the login form.
     // Log in through the context's request API so the HttpOnly session cookie
