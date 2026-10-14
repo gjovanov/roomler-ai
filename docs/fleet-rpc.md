@@ -164,11 +164,20 @@ to a local pipe. What each attempt to get around that meets:
 From an **elevated** prompt on the device:
 
 ```
-roomlerd anchor create --server https://roomler.ai --token <enrollment-token> --device <device id>
+roomlerd anchor create --server https://roomler.ai --token <enrollment-token> --device <device id> [--ssh system]
 roomlerd anchor status            # what is anchored (never the credential)
 roomlerd anchor exec on|off       # the anchor's half of gate 4
+roomlerd anchor ssh off|console_user|system   # FR-105: roomler SSH through this service too
 roomlerd anchor remove            # this machine stops offering SYSTEM exec
 ```
+
+- **The anchor's SSH ceiling** (FR-105, from 0.4.136) is **off** by default, so
+  no anchor gains SYSTEM SSH by updating. `system` lets roomler SSH sessions run
+  through the same service as SYSTEM (session 0) or as the signed-in user;
+  `console_user` allows only the latter. `anchor status` then prints the
+  service's own SSH host key fingerprint. How the session gets there, and why
+  nothing the signed-in user writes can widen it:
+  [`roomler-ssh.md`](roomler-ssh.md) § Through the device's SYSTEM service.
 
 - The device is **named**, not derived: on an attended install the enrollment
   belongs to the user who made it, and `machine_id` hashes that user's config
