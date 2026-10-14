@@ -343,6 +343,13 @@
           prepend-icon="mdi-chart-timeline-variant-shimmer"
           :title="$t('nav.observability')"
         />
+        <!-- FR-102 — the growth digest, same allowlist, same 404. -->
+        <v-list-item
+          v-if="isPlatformAdmin"
+          to="/observability/growth"
+          prepend-icon="mdi-sprout"
+          :title="$t('nav.growth')"
+        />
 
         <!-- ── Administration section ───────────────────────────── -->
         <v-divider class="my-1" />
