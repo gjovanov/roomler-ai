@@ -309,6 +309,25 @@ org's engine attaches to:
   still advertises on its OWN control WS after its OWN join (the server's
   join-clears-srflx ordering holds per org).
 
+⚠️ **A plane socket's receive loop reads on past errors about an EARLIER
+datagram** (#2220). Windows reports an ICMP port-unreachable for a datagram
+the socket sent as `WSAECONNRESET` (10054) on the NEXT receive. Such datagrams
+are ordinary: one to a peer whose daemon restarted onto another port, to a
+stale endpoint, or a disco ping to a LAN candidate that is another host on
+this LAN.
+
+Before #2220 the loop ended on that error, and the socket stayed bound and
+advertised with nothing reading it. Its direct paths sat on DERP until
+something rebuilt the whole plane: 107 s in the field, via the srflx watchdog,
+and never at all for a socket the keepalive doesn't ride. Defender Firewall's
+default inbound rules drop that ICMP, which is why it took a host with the
+firewall open to show it.
+
+`crates/tunnel-core/src/overlay/udp_recv.rs` is the one classification,
+shared with the per-device demux (`wg.rs`) and the MagicDNS resolver (#2213).
+Only real OS sockets use it: a relay carrier reports a CLOSED session as
+`ConnectionReset`, and reading on past that would spin.
+
 Default ON since rc.339 (after the 4-host field soak: winhost-a + fleet-host-2 +
 fleet-host-1 + buildhost, both flags, 08-08→08-10). Explicit `overlay_shared_carrier =
 false` is the kill switch: per-runtime binds, byte-identical to the
