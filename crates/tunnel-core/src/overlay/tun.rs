@@ -1146,6 +1146,8 @@ pub const IF_NAME: &str = "utun";
 pub use system::{
     SystemTun, TunOptions, org_tun_guid, purge_pins, purge_split_default, purge_stale_peer_routes,
 };
+#[cfg(feature = "overlay-l3")]
+pub(crate) use system::{is_own_ifref, uplink_beneath};
 
 #[cfg(feature = "overlay-l3")]
 mod system {
@@ -2150,9 +2152,21 @@ mod system {
 
         /// One of this process's adapters, or any adapter named like ours.
         /// Never an uplink, whatever the sibling-exempt switch says.
-        fn is_ours_or_roomler(luid: u64) -> bool {
+        pub(super) fn is_ours_or_roomler(luid: u64) -> bool {
             super::own_adapters::is_own_luid(luid)
                 || alias_for_luid(luid).is_some_and(|a| super::is_roomler_adapter_name(&a))
+        }
+
+        /// FR-97 N14 — the LUID of interface `ifindex`: netstate names an
+        /// interface by its index.
+        pub(super) fn luid_of_index(ifindex: u32) -> Option<u64> {
+            use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceIndexToLuid;
+            // SAFETY: an out-param the call fills on NO_ERROR; the union's
+            // `Value` view is the whole 64 bits.
+            unsafe {
+                let mut luid = NET_LUID_LH { Value: 0 };
+                (ConvertInterfaceIndexToLuid(ifindex, &mut luid) == NO_ERROR).then_some(luid.Value)
+            }
         }
 
         /// An interface's metric for `family`, and whether it is connected.
@@ -3263,6 +3277,14 @@ mod system {
                     .lock()
                     .map(|g| g.values().any(|v| v.luid == luid))
                     .unwrap_or(false)
+        }
+
+        /// FR-97 N14 — is `name` one of our own live adapters? Off Windows
+        /// the registry key is the device name netstate's lookup reports
+        /// (`roomler0`, or the kernel-assigned `utunN`).
+        #[cfg(not(windows))]
+        pub(super) fn is_own_name(name: &str) -> bool {
+            OWN.lock().map(|g| g.contains_key(name)).unwrap_or(false)
         }
 
         #[cfg(test)]
@@ -5532,6 +5554,67 @@ mod system {
             "overlay: boot reconcile — dropped stale routes left by a previous generation \
              on a persisted TUN (their crypto-router entries are gone, so they black-hole)"
         );
+    }
+
+    /// FR-97 N14 — is `ifref` one of this process's live adapters? `ifref` is
+    /// in netstate's identity space: the interface index on Windows (where any
+    /// adapter NAMED like ours counts too, as for the pins), the device name
+    /// elsewhere.
+    pub(crate) fn is_own_ifref(ifref: &str) -> bool {
+        #[cfg(windows)]
+        {
+            ifref
+                .parse::<u32>()
+                .ok()
+                .and_then(winroute::luid_of_index)
+                .is_some_and(winroute::is_ours_or_roomler)
+        }
+        #[cfg(not(windows))]
+        {
+            own_adapters::is_own_name(ifref)
+        }
+    }
+
+    /// FR-97 N14 — the default route BENEATH our adapters, as `(ifref,
+    /// gateway)` in netstate's identity space: the uplink the exit's carrier
+    /// pins go through, read by the code that pins them (Windows: the FIB
+    /// view; Linux: the main table's best `/0`; macOS: `route -n get default`,
+    /// which answers with the `/0` itself while our `/1`s are in — a lookup of
+    /// a far address answers with a `/1`, tart 2026-10-14). Our adapters
+    /// never hold a `/0`. `None` when there is no such route right now.
+    pub(crate) fn uplink_beneath(v6: bool) -> Option<(String, Option<std::net::IpAddr>)> {
+        #[cfg(windows)]
+        {
+            let (uplink, _) = winroute::exemption_view(v6)?;
+            uplink.map(|(ifindex, gateway)| (ifindex.to_string(), Some(gateway)))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let out = std::process::Command::new("ip")
+                .args([if v6 { "-6" } else { "-4" }, "route", "show", "default"])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&out.stdout);
+            if v6 {
+                parse_linux_default_route_v6(&text, IF_NAME)
+                    .map(|r| (r.interface, Some(std::net::IpAddr::V6(r.gateway))))
+            } else {
+                parse_linux_default_route(&text, IF_NAME)
+                    .map(|r| (r.interface, Some(std::net::IpAddr::V4(r.gateway))))
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            discover_bsd_uplink(v6, "").map(|u| (u.interface, Some(u.gateway)))
+        }
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        {
+            let _ = v6;
+            None
+        }
     }
 
     /// FR-97 P0e — remove the exit-client pins a run recorded and did not

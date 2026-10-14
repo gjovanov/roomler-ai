@@ -177,6 +177,17 @@ pub struct NetSnapshot {
     pub ifaces: BTreeMap<String, IfaceSnap>,
     pub default_v4: Option<DefaultRoute>,
     pub default_v6: Option<DefaultRoute>,
+    /// FR-97 N14 — per family, the uplink BENEATH our own adapter: the route
+    /// the exit's carrier pins go through. It differs from the default only
+    /// while the lookup lands on one of our adapters, which is what an exit's
+    /// split-default `/1`s make every far lookup do. Without it, an uplink
+    /// move under an active exit (a NIC down, Wi-Fi to Ethernet, a metric
+    /// change) read as `default_moved=false`, no Major consumer ran, and the
+    /// control WS sat dead until its keepalive's second strike: 56 s on the
+    /// field's Linux client. Otherwise a copy of the default, so a host with
+    /// no exit sees exactly what it saw before.
+    pub uplink_v4: Option<DefaultRoute>,
+    pub uplink_v6: Option<DefaultRoute>,
     /// FR-33 — captured LAN prefixes, empty when none (or the probe is off).
     pub lan_captures: Vec<LanCapture>,
 }
@@ -225,8 +236,12 @@ pub(crate) fn diff(
     saw_addr: bool,
     saw_iface: bool,
 ) -> Option<NetDelta> {
-    let default_route_moved =
-        prev.default_v4 != next.default_v4 || prev.default_v6 != next.default_v6;
+    // FR-97 N14 — the uplink beneath an active exit moving is the network
+    // moving, though the lookup still answers with our own TUN.
+    let default_route_moved = prev.default_v4 != next.default_v4
+        || prev.default_v6 != next.default_v6
+        || prev.uplink_v4 != next.uplink_v4
+        || prev.uplink_v6 != next.uplink_v6;
     // FR-33 — a capture appearing or clearing is MATERIAL (it decides whether
     // the LAN tier can ever work) but keys no socket, so it never lifts the
     // severity on its own; it is named in the summary either way, which is
@@ -272,8 +287,21 @@ pub(crate) fn diff(
     } else {
         String::new()
     };
+    // Named only while it differs from the default (an exit is active), so a
+    // host without one logs exactly what it logged before.
+    let uplink_note = if next.uplink_v4 == next.default_v4 {
+        String::new()
+    } else {
+        format!(
+            " uplink={}",
+            next.uplink_v4
+                .as_ref()
+                .map(|d| d.ifref.as_str())
+                .unwrap_or("-")
+        )
+    };
     let summary = format!(
-        "default_moved={default_route_moved} v4_default={} addrs +{added}/-{removed} ifaces={} (was {}, addrs {}→{}){capture_note}",
+        "default_moved={default_route_moved} v4_default={}{uplink_note} addrs +{added}/-{removed} ifaces={} (was {}, addrs {}→{}){capture_note}",
         next.default_v4
             .as_ref()
             .map(|d| d.ifref.as_str())
@@ -541,12 +569,35 @@ pub fn sample_snapshot() -> NetSnapshot {
     } else {
         Vec::new()
     };
+    let default_v4 = default_route(false);
+    let default_v6 = default_route(true);
     NetSnapshot {
         ifaces,
-        default_v4: default_route(false),
-        default_v6: default_route(true),
+        uplink_v4: uplink_beneath_own(default_v4.as_ref(), false),
+        uplink_v6: uplink_beneath_own(default_v6.as_ref(), true),
+        default_v4,
+        default_v6,
         lan_captures,
     }
+}
+
+/// FR-97 N14 — the route beneath our own adapter when the default lookup
+/// lands on one ([`NetSnapshot::uplink_v4`]), else the default itself. Read
+/// by the code the exemption pins use (`tun::uplink_beneath`), so the
+/// network monitor and the pins agree on what the uplink is.
+/// `ROOMLERD_OVERLAY_NETMON_UPLINK=0` puts netstate back to the lookup alone.
+fn uplink_beneath_own(default: Option<&DefaultRoute>, v6: bool) -> Option<DefaultRoute> {
+    #[cfg(feature = "overlay-l3")]
+    if let Some(d) = default
+        && crate::env::flag("OVERLAY_NETMON_UPLINK", true)
+        && super::tun::is_own_ifref(&d.ifref)
+    {
+        return super::tun::uplink_beneath(v6)
+            .map(|(ifref, gateway)| DefaultRoute { ifref, gateway });
+    }
+    #[cfg(not(feature = "overlay-l3"))]
+    let _ = v6;
+    default.cloned()
 }
 
 /// FR-33 — one route lookup per LAN v4 address: does a packet to a neighbour
@@ -1178,15 +1229,80 @@ mod tests {
                 },
             );
         }
+        let default_v4 = default_if.map(|i| DefaultRoute {
+            ifref: i.to_string(),
+            gateway: Some("192.168.68.1".parse().unwrap()),
+        });
         NetSnapshot {
             ifaces: m,
-            default_v4: default_if.map(|i| DefaultRoute {
-                ifref: i.to_string(),
-                gateway: Some("192.168.68.1".parse().unwrap()),
-            }),
+            uplink_v4: default_v4.clone(),
+            default_v4,
             default_v6: None,
+            uplink_v6: None,
             lan_captures: vec![],
         }
+    }
+
+    /// `snap` with an exit active: the lookup lands on our TUN, and the
+    /// uplink beneath it is `uplink_if` via `gateway`.
+    fn under_exit(ifaces: &[(&str, &[&str])], uplink_if: &str, gateway: &str) -> NetSnapshot {
+        let mut s = snap(ifaces, Some("roomler0"));
+        s.uplink_v4 = Some(DefaultRoute {
+            ifref: uplink_if.to_string(),
+            gateway: Some(gateway.parse().unwrap()),
+        });
+        s
+    }
+
+    /// FR-97 N14 — the field case: an exit is active, the client's uplink
+    /// moves to its second NIC, and nothing else netstate models changes (the
+    /// downed NIC keeps its address; the lookup answers with our TUN before
+    /// and after). That has to be a Major, or the control WS probe and the
+    /// carrier revalidation never run. The exit coming up over an unchanged
+    /// uplink stays exactly the Major it always was, and a host with no exit
+    /// logs nothing new.
+    #[test]
+    fn an_uplink_move_beneath_an_active_exit_is_a_major() {
+        let nics: &[(&str, &[&str])] = &[("eth0", &["172.31.10.2"]), ("eth1", &["172.31.11.2"])];
+        let on_eth0 = under_exit(nics, "eth0", "172.31.10.1");
+        let on_eth1 = under_exit(nics, "eth1", "172.31.11.1");
+
+        let d = diff(&on_eth0, &on_eth1, false, true).expect("the uplink moved");
+        assert_eq!(d.severity, Severity::Major);
+        assert!(d.default_route_moved);
+        assert!(
+            d.summary.contains("v4_default=roomler0 uplink=eth1"),
+            "the log names the uplink beneath the TUN: {}",
+            d.summary
+        );
+        assert!(
+            diff(&on_eth1, &on_eth1.clone(), false, false).is_none(),
+            "an exit holding still is no change"
+        );
+
+        // The exit coming up over the same uplink: the default moves to our
+        // TUN while the uplink beneath it does not — one Major, as before.
+        let mut plain = snap(nics, Some("eth0"));
+        plain.uplink_v4 = on_eth0.uplink_v4.clone();
+        plain.default_v4 = on_eth0.uplink_v4.clone();
+        let d = diff(&plain, &on_eth0, false, false).expect("the exit came up");
+        assert_eq!(d.severity, Severity::Major);
+
+        // No exit: the uplink is the default, and the summary says nothing new.
+        let d = diff(&plain, &snap(nics, Some("eth1")), false, false).expect("default moved");
+        assert!(!d.summary.contains("uplink="), "{}", d.summary);
+    }
+
+    /// FR-97 N14 — off our own adapter the uplink IS the default: no table
+    /// read, nothing that could make a host without an exit see a move.
+    #[test]
+    fn the_uplink_is_the_default_unless_the_lookup_lands_on_our_adapter() {
+        let d = DefaultRoute {
+            ifref: "203".into(),
+            gateway: Some("192.168.68.1".parse().unwrap()),
+        };
+        assert_eq!(uplink_beneath_own(Some(&d), false), Some(d.clone()));
+        assert_eq!(uplink_beneath_own(None, true), None);
     }
 
     /// FR-33 — a capture appearing or clearing is a material delta on its
