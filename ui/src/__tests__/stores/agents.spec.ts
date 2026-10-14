@@ -511,6 +511,38 @@ describe('useAgentStore', () => {
     expect(s.orgKeepBusyDefaultPattern).toBeNull()
   })
 
+  it('FR-101 P2: the org session policy is read and set on its own route, one feature at a time', async () => {
+    mockApi.get.mockResolvedValueOnce({ clipboard: 'on', files: 'off', audio: 'on' })
+    asOwner()
+    const s = useAgentStore()
+    await s.fetchOrgRcSessionPolicy(TENANT_ID)
+    expect(mockApi.get.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/rc-session-policy`)
+    expect(s.orgRcSessionPolicy).toEqual({ clipboard: 'on', files: 'off', audio: 'on' })
+
+    // A change names only its feature: the route leaves the others alone.
+    mockApi.put.mockResolvedValueOnce({ clipboard: 'ask', files: 'off', audio: 'on' })
+    await s.setOrgRcSessionPolicy(TENANT_ID, { clipboard: 'ask' })
+    expect(mockApi.put.mock.calls.at(-1)).toEqual([
+      `/tenant/${TENANT_ID}/rc-session-policy`,
+      { clipboard: 'ask' },
+    ])
+    expect(s.orgRcSessionPolicy).toEqual({ clipboard: 'ask', files: 'off', audio: 'on' })
+  })
+
+  it('FR-101 P2: a member who cannot manage org settings reads no policy and sends nothing', async () => {
+    asMemberWithoutManageTenant()
+    const s = useAgentStore()
+    const before = mockApi.get.mock.calls.length
+    await s.fetchOrgRcSessionPolicy(TENANT_ID)
+    expect(s.orgRcSessionPolicy).toBeNull()
+    expect(mockApi.get.mock.calls.length).toBe(before)
+    // A refused read leaves it unknown too.
+    asOwner()
+    mockApi.get.mockRejectedValueOnce(new Error('403 forbidden'))
+    await s.fetchOrgRcSessionPolicy(TENANT_ID)
+    expect(s.orgRcSessionPolicy).toBeNull()
+  })
+
   it("FR-92 P8: a viewer's read of the default is ungated and never throws — circle for anything but a known word", async () => {
     // A plain member: the route is readable by any member, so no gate.
     asMemberWithoutManageTenant()
