@@ -143,15 +143,19 @@ TypeScript read **one shared test-vector file**, so the two sides cannot drift.
   and answer, the policy table, the threat model including what it does not defeat, and the pin
   commands. `docs/security-baseline.md` gains the control. Linked from `docs/README.md`.
 
-## 6. Open decisions
+## 6. Decisions
+
+**All four were decided by the operator on 2026-10-14, as recommended.** Each entry keeps what was
+weighed.
 
 1. **FR-52 first, or extract its primitive?** FR-52's P1–P4 sit on open PRs (#1197, #1563, #1628).
-   Recommended: land FR-52, then generalise its check here.
+   Recommended: land FR-52, then generalise its check here. **Decided: land FR-52 first.**
 2. **When to flip enforce.** Recommended: per device, by the owner, after AC4. Never fleet-wide by default.
+   **Decided: as recommended.**
 3. **The unattended default for an unknown controller.** Recommended: `deny` under enforce. An unattended
-   device that cannot ask anyone should not let a new key in.
+   device that cannot ask anyone should not let a new key in. **Decided: `deny`.**
 4. **Break-glass.** May an ADMINISTRATOR break-glass session pass an unknown key under enforce? Recommended:
-   the owner's floor decides, as `strictest_of` does for consent.
+   the owner's floor decides, as `strictest_of` does for consent. **Decided: as recommended.**
 
 ## 7. Threat model, in one table
 
