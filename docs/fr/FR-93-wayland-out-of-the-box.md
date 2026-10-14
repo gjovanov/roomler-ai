@@ -7,8 +7,8 @@ promoted. P2d is decided (operator, 2026-10-12): the portal waits for it. P2d-1,
 **0.4.131**; P2d-2, the viewer half, is lab-verified on prod's viewer (2026-10-13). P2d-3, the flip (the portal
 automatic where mutter is absent), shipped in **0.4.132** with P2d-2's agent half and P4a; P4b in **0.4.133**; P3c
 in **0.4.134** (2026-10-13). P3d, P5a, P5b (#2145), P3e and P5c are in **0.4.135** (tagged 2026-10-14 from
-`bb6ea90ee`); P5d, P5e (#2183), P5f (#2192) and P5g (#2194) merged after it. Ticked: AC1–AC5,
-AC8, AC9, AC13, AC14. The operator approved the
+`bb6ea90ee`); P5d, P5e (#2183), P5f (#2192) and P5g (#2194) merged after it, and P1a (the kill switch covers
+the input-reach warning, AC11) is lab-verified. Ticked: AC1–AC5, AC8, AC9, AC13, AC14. The operator approved the
 plan and P0 (the
 lab on zeus, enrolled in the vmtest org: D2, D8). **D1 is decided: split.** Per-user installs go auto, system installs
 stay opt-in until a non-Debian companion ships. D3 waits for P3 · **Owner:** remote desktop (agent + viewer), vmtest (`roomler-ai-deploy`) ·
@@ -319,7 +319,8 @@ between worktrees or inside one. Every capture/input knob flip forces a fresh ca
 - **The Xwayland guard**: on a Wayland session scrap refuses an X server that advertises the `XWAYLAND`
   extension. Never a black stream. The daemon's own Xvfb is unaffected.
 - **Input reach** on the hello: `input_reach: full | xwayland_only | none` plus a reason; `NoopInjector` ⇒
-  `none`. The viewer renders the view-only notice `remote-control.md:371` already promises.
+  `none`. The viewer renders the view-only notice `remote-control.md:371` already promises. P1's kill switch
+  covers this notice too: it sends none and asks no X server for it (P1a, AC11).
 - `supports_clipboard` becomes a runtime answer.
 - `capture-smoke` and `input-smoke` register the config bridge; `NoopCapture` waits are bounded.
 
@@ -622,6 +623,7 @@ bridge for text and images in the lab before deciding.
 |---|---|---|---|---|
 | **P0** | the lab (§3.2), #1719 finished, the 0.4.124 baseline recorded red | — | lab, vmtest, Asahi | M |
 | **P1** | honest failure (§4.2), #1945, the GEM-handle fix (§4.4a), `capture-smoke` reads config | `ROOMLERD_WAYLAND_AWARE=0` | lab, vmtest `default` cells | S–M |
+| ↳ P1a | P1's kill switch covers the input-reach notice (AC11): on Linux, `wayland_aware = false` sends no `rc:input-reach` and asks no X server for it (`input::reach::told`, `linux-capture.md` §1.1), as the agent did before FR-93. The lab's lifecycle specs sample the warning's words | `wayland_aware` | ✅ lab (`4d5890105`), GNOME 50 per-user, both kill switches. **🔴 0.4.135:** the old black XShm picture under the warning (59 of 60 samples). The candidate: the same picture, no warning (0 of 58). `mutter_input = false` alone still warns (59 of 59), and with no switch mutter is unchanged | S |
 | **P2** | the auto-cascade (§4.3) + the wire (§4.9) | `ROOMLERD_WAYLAND_AUTO=0`; explicit keys | lab ×2, vmtest, Asahi | M |
 | ↳ P2a | the per-user automatic arm, **mutter** (D1), and `rc:video-info` `capture_arm` + `attended` | `wayland_auto`; any capture key | lab: GNOME per-user red/green, KDE per-user unchanged, GNOME system unchanged | S |
 | ↳ P2d | the attended portal flow, then the portal goes automatic (D1's "elsewhere") | `wayland_auto`; any capture key | lab: KDE per-user, first use with nobody at the screen | M |
@@ -813,6 +815,19 @@ New cells run three times before they are trusted. An entry in `expected-failure
   system and per-user — proven with QMP and a screenshot.
 - [ ] **AC11** — X11 hosts unchanged (FR-29's idle numbers), Windows and macOS unchanged; the kill switch
   restores 0.4.124's behaviour exactly.
+  ⏳ **The kill switch, in the lab** (P1a, step log 76). On the released 0.4.135, both switches gave the lab's
+  0.4.125 baseline: `backend=scrap` on Xwayland, black, no reason. But the viewer also showed the input-reach
+  warning that P1 added in 0.4.127 (59 of 60 samples), which 0.4.124 never sent, and the switch still asked
+  the X server for it. On P1a's candidate the picture is the same and there is no warning (0 of 58).
+  **Windows and macOS, in the code:**
+  - The pumps' wait hold (P3e, P5f) engages only when a capture backend reports a wait. Only the Linux DRM and
+    portal backends do; the trait's default is `None` (`capture/mod.rs:393`).
+  - The reach verdict is `full` on Windows, so a session there is told nothing. On macOS the warning comes only
+    while Accessibility is not granted. That is P1's own, deliberate: before it, such a session looked
+    interactive and did nothing.
+  - `rc:video-info`'s `capture_arm` is absent from Windows and macOS agents, so the viewer names no arm there.
+
+  Owed: FR-29's idle numbers on an X11 host, and a Windows and a macOS session on a release that carries P1a.
 - [ ] **AC12** — Asahi (real scanout) passes AC1/AC4/AC5/AC7 on the released build.
 - [x] **AC13** — the server reports how many Linux hosts are Wayland and which arm serves each.
   ✅ Prod (`hosted-20261012-d31e3c7`) reports the vmtest org's overview from hellos sent by released
@@ -909,6 +924,7 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-14 | `wlab-gnome` (per-user, mutter) | P5f `b7d33af1e` (the release's plan), then P5g `8ef858771` and `2156850a5` | AC7 / P5g: the viewer connecting while GDM's login screen held the seat (`LC_PRE=switch-user`, the dark-open spec); then GNOME's own *Switch User* (`lock-switch`: Super+L, then the login screen), the switch back to the lock screen, and the unlock | 🔴 `b7d33af1e`: `wayland_not_enabled` 22 ms into the open (the plan saw no active Wayland session, and the Xwayland guard answered), no picture in the 40 s after the switch back; `capture-smoke` on the configured mutter arm: refused in 13 ms by the helper's attended-only rule. ✅ P5g: `session_away` at connect, held 45 s, a picture 1.6 s after the switch back (both builds); through *Switch User*: `session_away`, the unlock notice 1.1 s after the switch back, a picture 1.2 s after the unlock |
 | 2026-10-14 | `wlab-gnome` (per-user, mutter); `wlab-gnome-sys` (system, `drm_capture` + `uinput`) | **0.4.135, the release** (its `.deb`, sha256 + signature checked, `dpkg -V` clean) | AC7 and AC8 on a release: the lock, a resolution change, a user switch, a logout and login (per-user); GNOME's idle blank with a running session and with one opened during it, and AC8's idle cost (system) | ✅ the lock: the notice 1.2 s after it, the desktop 1.8 s after the unlock. ✅ a resolution change: 1024×768 4.2 s after the switch, 1280×800 4.6 s after the switch back. 🔴 the user switch: the last frame, no reason (P5f/P5g unreleased); the oracle first read this PASS from frames still in flight during GDM's 2 s hand-over, and now requires the counter moving at the window's end. ✅ the logout and login: *Reconnecting* 1.4 s in, a picture 5.1 s after the login; the unit wanted by `graphical-session.target` and `default.target` (P5a). ✅ an open during the blank: the notice at once, a picture 1.1 s after the viewer's mouse. ⚠️ a running session through the blank: the notice lost to the race (#2192), the viewer re-created the session, and its open told it 10.8 s after the blank. ✅ AC8: **6.3 % and 6.3 %** of a core idle (no session: 0.2 %) |
 | 2026-10-14 | `wlab-kde` (Plasma 6.7.5 per-user, reverted to `stock-0.4.128`) | **0.4.135, the release**, by the served installer (Fedora's tarball path), no key | AC7 on a release, KDE: the automatic portal's first use, then a lock, a resolution change, and KDE's own logout and login | ✅ the brief planned `capture_arm=portal input_reach=full`; KDE's *Remote Control* dialog (see the screen, control input, "allow restoring" ticked), approved over QMP: the viewer said the person was being asked, then had the picture when they allowed it; the token `portal-restore-token-rd`. ✅ the lock: a new picture (the lock screen) 1.5 s in, 0.9 s after the unlock. ✅ a resolution change: 1024×768 1.1 s after the switch, 1280×800 1.2 s after the switch back. ✅ KDE's logout and login: *Reconnecting* 3.4 s in, a picture 11.7 s after the login |
+| 2026-10-14 | `wlab-gnome` (per-user, GNOME 50) | **0.4.135, the release**, then P1a `4d5890105`; the release put back after (its checksum checked) | AC11 / P1a: both kill switches (`ROOMLERD_WAYLAND_AWARE=0`, `ROOMLERD_WAYLAND_AUTO=0`) through a user-unit drop-in; the dark-open spec, which samples the reach warning's words; then `ROOMLERD_MUTTER_INPUT=0` alone (the positive control), then no switch | 🔴 0.4.135: `capture: backend=scrap` on Xwayland, lit 0 % for 30 s, no reason (the lab's 0.4.125 baseline), and the warning *"Your mouse and keyboard do not reach this device's desktop. This is a Wayland desktop whose Xwayland sends XTest through the EI portal…"* in 59 of 60 samples, with the journal's `telling the controller … reach="none"`. ✅ P1a: the same black XShm picture, the warning in 0 of 58 samples, no `rc:input-reach` in the journal. ✅ `mutter_input = false` alone: mutter, AUTOMATIC, lit 95.6–96.8 %, the warning in 59 of 59, so the notice still comes where input reaches nothing. ✅ no switch: mutter, lit 95.5–96.8 %, no warning |
 
 ## 12. Related
 

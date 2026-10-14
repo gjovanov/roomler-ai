@@ -149,7 +149,21 @@ there.
 
 **Kill switch**: `wayland_aware` / `ROOMLERD_WAYLAND_AWARE=0` (default on)
 gives back the behaviour before FR-93 unchanged. The X server is not even
-asked.
+asked, and no session is told its input reach (`rc:input-reach`,
+[`remote-control.md`](remote-control.md) §6.1), which P1 added with the guard
+(`input/reach.rs:255`). Only the hello's brief (§1.3) still reads an Xwayland
+that is already running: it is the fleet's count, not the session's behaviour.
+
+⚠️ **Until P1a the switch left that warning on.** Measured on the FR-93 lab's
+GNOME 50 per-user guest. The first two rows have `wayland_aware` and
+`wayland_auto` both `false`:
+
+| | 0.4.135, the release | P1a (`4d5890105`) |
+|---|---|---|
+| the capture | `backend=scrap` on Xwayland, black (lit 0 %), no reason: the lab's 0.4.125 baseline | the same |
+| the viewer's input-reach warning | shown in 59 of 60 samples: *"…a Wayland desktop whose Xwayland sends XTest through the EI portal…"* | shown in 0 of 58; no `rc:input-reach` in the journal |
+| `mutter_input = false` alone (the positive control) | — | mutter, lit 96 %, and the warning in 59 of 59: it still comes where input reaches nothing |
+| no switch | mutter, AUTOMATIC, lit 95–97 % | the same, no warning |
 
 CI proves the half it can run, against Xvfb in the X11 lane (`ci.yml`, the
 "against a real X server" step):
@@ -329,7 +343,7 @@ all strings, so a newer agent's word reaches an older server as a word:
 | `type` | `wayland` · `x11` · `tty` · `none` | that session's type |
 | `desktop` | `gnome`, `KDE`, … (absent when logind names none) | logind's `Desktop` |
 | `capture_arm` | `mutter` · `drm` · `portal` · `x11` · `none` | the arm a session opened **now** would try first |
-| `input_reach` | `full` · `xwayland_only` · `none` | the `rc:input-reach` verdict (`input/reach.rs:265`), with the portal's input route predicted for a portal or mutter arm with `portal_input` on. ⚠️ **It never starts an X server.** GNOME starts Xwayland **on demand** for any client that connects, so on a Wayland desktop the brief connects only to an Xwayland already running (found in `/proc`), and with none it reads "no X server". It is also read again only when another field changed. The per-session `rc:input-reach` stays the authority |
+| `input_reach` | `full` · `xwayland_only` · `none` | the `rc:input-reach` verdict (`input/reach.rs:285`), with the portal's input route predicted for a portal or mutter arm with `portal_input` on. ⚠️ **It never starts an X server.** GNOME starts Xwayland **on demand** for any client that connects, so on a Wayland desktop the brief connects only to an Xwayland already running (found in `/proc`), and with none it reads "no X server". It is also read again only when another field changed. The per-session `rc:input-reach` stays the authority |
 
 `capture_arm` is `capture::planned_arm` (`capture/mod.rs:789`), a pure function
 that walks `open_with`'s own order (`:1505`). The two sit together in one file
@@ -1456,7 +1470,7 @@ the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/co
 | `mutter_input` | `ROOMLERD_MUTTER_INPUT` | **on** | FR-93 P4 (§5.2): a mutter screencast is driven by mutter's own RemoteDesktop, which takes the viewer's input. **It asks nobody**, like the screencast. The automatic arm carries it; a configured one only with `portal_input`. Off = mutter capture is view-only, the behaviour before P4 |
 | `mutter_capture` | `ROOMLERD_MUTTER_CAPTURE` | off | the mutter arm (§5), **inside** `portal_capture`. **Unattended, GNOME-only, no input** |
 | `window_capture` | `ROOMLERD_WINDOW_CAPTURE` | off | FR-56 P4: one application window instead of the monitor. Attended **by construction** — the portal answers with a window picker, and nothing agent-side can name a window (GNOME refuses `Introspect.GetWindows`) |
-| `wayland_aware` | `ROOMLERD_WAYLAND_AWARE` | **on** | FR-93 P1 (§1.1): a Wayland desktop that no arm may capture reports `wayland_not_enabled`, never black and never "headless". Switches no capture on. Off = the behaviour before FR-93, unchanged |
+| `wayland_aware` | `ROOMLERD_WAYLAND_AWARE` | **on** | FR-93 P1 (§1.1): a Wayland desktop that no arm may capture reports `wayland_not_enabled`, never black and never "headless". Switches no capture on. Off = the behaviour before FR-93, unchanged: no Xwayland probe, and no session told its input reach (P1a) |
 | `wayland_auto` | `ROOMLERD_WAYLAND_AUTO` | **on** | FR-93 P2 (§1.2): a **per-user** daemon in its own Wayland session, with no capture key set, switches capture on by itself: mutter on GNOME (it asks nobody), else the desktop portal (it asks the person at the screen once, P2d-3). Never on a root daemon. Off = the behaviour before P2 |
 | — | `ROOMLERD_VIRTUAL_DESKTOP` (+ `_RESOLUTION`, `_WM`, `_STARTUP`) | off | the daemon's own Xvfb (§2). Turn it **off** when testing the portal arms on a host that has it, or the X11 fallback quietly serves the session in the portal's place |
 | `virtual_desktop_apps` | — | — | the FR-56 launch allowlist — for a virtual desktop **or** a logged-in X11/Xwayland session; [`remote-apps.md`](remote-apps.md) §7 |
