@@ -764,6 +764,16 @@ pub enum RpcCap {
     /// route commands to a doorbell nobody answers. Equality-matched, locked by
     /// test.
     ExecSystem,
+    /// FR-105 — a Windows device serves roomler SSH from its session-0
+    /// SYSTEM service: the anchor allows it (its `ssh` ceiling is not `off`),
+    /// and the service answered the worker's health ring. The server then
+    /// routes a grant with `via_service`: the service claims it, and the
+    /// caller dials the service's port and pins the service's host key.
+    ///
+    /// ⚠️ `ssh` is its prefix and NOT the same promise: `ssh` says "the
+    /// worker runs an SSH server", which on an attended install is the
+    /// signed-in user. Equality-matched, locked by test.
+    SshSystem,
 }
 
 impl RpcCap {
@@ -797,11 +807,12 @@ impl RpcCap {
             Self::HiveFork => "hive-fork",
             Self::HiveManage => "hive-manage",
             Self::ExecSystem => "exec-system",
+            Self::SshSystem => "ssh-system",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 22] = [
+    pub const ALL: [RpcCap; 23] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -824,6 +835,7 @@ impl RpcCap {
         Self::HiveFork,
         Self::HiveManage,
         Self::ExecSystem,
+        Self::SshSystem,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -1527,6 +1539,10 @@ pub struct Agent {
     /// unanchored device and every pre-FR-94 row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exec_anchor: Option<ExecAnchor>,
+    /// FR-105 — the SSH endpoint this device's SYSTEM service published, if
+    /// any. Only routes while it names the CURRENT `exec_anchor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_service: Option<SshServiceEndpoint>,
     /// Roomler-SSH policy for this device (gate 3). Same shape and the same
     /// closed default as [`Self::exec_policy`] — every pre-feature row
     /// deserialises to [`SshMode::Off`].
@@ -1742,6 +1758,12 @@ pub mod ssh_limits {
     pub const MAX_CONCURRENT_PER_AGENT: usize = 8;
     /// Grants per minute per (caller, device) pair.
     pub const RATE_LIMIT_PER_MINUTE: u32 = 20;
+    /// FR-105 — the overlay port a Windows device's SYSTEM service answers
+    /// SSH on. The worker intercepts it beside its own (2222) and splices it,
+    /// still encrypted, into the service's pipe. One fixed port rather than a
+    /// device setting, because the server, not the device, tells the caller
+    /// where to dial, and it can only say what it knows.
+    pub const SERVICE_PORT: u16 = 2223;
 
     /// Clamp a caller-supplied session budget into range, substituting the
     /// ceiling for `None`/0.
@@ -1789,6 +1811,54 @@ pub enum SshAccountMode {
     ConsoleUser,
     /// A named local account (Unix only; requires the P5 privilege drop).
     Named,
+}
+
+/// FR-105 — how far an anchored Windows device's SYSTEM service will go with
+/// roomler SSH. Set on the device, elevated (`roomlerd anchor ssh <…>`), in
+/// the anchor file only SYSTEM and Administrators can write, and published by
+/// the service with its own credential. Default `off`: an exec anchor never
+/// silently gains SYSTEM SSH.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SshServiceCeiling {
+    /// The service serves no SSH; grants go to the worker as before.
+    #[default]
+    Off,
+    /// Sessions as the signed-in user only (`console_user`).
+    ConsoleUser,
+    /// SYSTEM in session 0 (`daemon`) as well as the signed-in user.
+    System,
+}
+
+impl SshServiceCeiling {
+    /// Does this ceiling allow a session as `mode`? A named account is never
+    /// the service's (Unix only, and outside FR-105).
+    pub fn permits(self, mode: SshAccountMode) -> bool {
+        matches!(
+            (self, mode),
+            (
+                Self::System,
+                SshAccountMode::Daemon | SshAccountMode::ConsoleUser
+            ) | (Self::ConsoleUser, SshAccountMode::ConsoleUser)
+        )
+    }
+}
+
+/// FR-105 — what a Windows device's SYSTEM service published about its own
+/// SSH endpoint (`PUT /api/agent/service/ssh-host-key`, with the service's
+/// credential, never the worker's).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SshServiceEndpoint {
+    /// The OpenSSH public half of the SERVICE's host key, which a caller
+    /// dialling the service port pins. The worker's own key is a different
+    /// one, in a file the signed-in user can write; it never stands in.
+    pub host_pubkey: String,
+    pub ceiling: SshServiceCeiling,
+    /// The anchor the publishing credential named. A re-anchor or an
+    /// un-anchor makes this record stale without anyone deleting it: routing
+    /// requires it to name the device's CURRENT anchor.
+    pub anchor_id: String,
+    pub published_at: DateTime,
 }
 
 /// Device config an operator has requested, for the agent to reconcile
@@ -3336,6 +3406,11 @@ pub enum SshDenyReason {
     /// device has NOT confirmed, and "dial here" is the answer that produced
     /// `Permission denied (publickey)` in #1597.
     GrantUnconfirmed,
+    /// FR-105 — a device's SYSTEM service tried to claim a grant that is not
+    /// pending for it: unknown, claimed already, withdrawn, past its window,
+    /// or another device's. Not told apart, so a forged ring learns nothing.
+    /// Audited with no user: the device's service asked, not a person.
+    ClaimRefused,
 }
 
 impl SshDenyReason {
@@ -3379,6 +3454,10 @@ impl SshDenyReason {
                 "the device did not confirm the grant within 10 s — its connection to \
                  the server may be slow or stale; try again, or check it with \
                  `roomler exec`"
+            }
+            Self::ClaimRefused => {
+                "the device's SYSTEM service claimed a grant that was not pending for \
+                 it (unknown, already claimed, withdrawn, expired or another device's)"
             }
         }
     }
@@ -3608,10 +3687,58 @@ pub struct SshAuditEvent {
     /// Refusal reason; `None` = a grant was issued.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denied: Option<SshDenyReason>,
+    /// FR-105 — the server's decision about WHO serves the session: `system`
+    /// or `console_user` (the device's SYSTEM service), or `worker` (the
+    /// device's console-session process, which on an attended Windows
+    /// install is the signed-in user). Absent on refusal and on every row
+    /// written before FR-105.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran_as: Option<String>,
 }
 
 impl SshAuditEvent {
     pub const COLLECTION: &'static str = "ssh_audit";
+}
+
+/// FR-105 — an SSH grant routed to a Windows device's SYSTEM service, between
+/// the decision that writes it and the service's claim. The service PULLS the
+/// grant with its own credential; the worker, which the signed-in user
+/// controls, only ever relays its id.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SshPending {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub grant_id: String,
+    pub tenant_id: ObjectId,
+    pub agent_id: ObjectId,
+    /// The caller's ephemeral OpenSSH public key.
+    pub public_key: String,
+    /// The acting principal's display name, as `rc:ssh.grant` carries it.
+    pub caller: String,
+    /// `daemon` (SYSTEM) or `console_user`.
+    pub account_mode: String,
+    pub expires_at_ms: u64,
+    pub session_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_mode: Option<ConsentMode>,
+    /// [`SshPending::PENDING`] → [`SshPending::CLAIMED`], or
+    /// [`SshPending::CANCELLED`] when the caller stopped waiting first.
+    pub state: String,
+    pub created_at: DateTime,
+    /// A claim at or after this instant is refused: the caller has stopped
+    /// waiting, and a grant nobody will dial must not be redeemable.
+    pub claim_by: DateTime,
+    /// The TTL monitor deletes the row after this.
+    pub expires_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<DateTime>,
+}
+
+impl SshPending {
+    pub const COLLECTION: &'static str = "ssh_pending";
+    pub const PENDING: &'static str = "pending";
+    pub const CLAIMED: &'static str = "claimed";
+    pub const CANCELLED: &'static str = "cancelled";
 }
 
 /// A desired-config write, granted or refused (`docs/remote-config.md`).
@@ -5113,7 +5240,7 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 15] = [
+        const KNOWN: [(RpcCap, RpcCap); 16] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
@@ -5155,6 +5282,9 @@ mod tests {
             // FR-94 — "runs Fleet RPC" is not "runs it as SYSTEM through a
             // service". Locked by `exec_does_not_imply_exec_system`.
             (RpcCap::Exec, RpcCap::ExecSystem),
+            // FR-105 — "runs an SSH server" is not "serves SSH from the
+            // SYSTEM service". Locked by `ssh_does_not_imply_ssh_system`.
+            (RpcCap::Ssh, RpcCap::SshSystem),
         ];
         for a in RpcCap::ALL {
             for b in RpcCap::ALL {
@@ -5369,6 +5499,49 @@ mod tests {
         assert!(both.has_rpc(RpcCap::Exec) && both.has_rpc(RpcCap::ExecSystem));
         assert_eq!(RpcCap::ExecSystem.wire(), "exec-system");
         assert_eq!(RpcCap::from_wire("exec-system"), Some(RpcCap::ExecSystem));
+    }
+
+    /// FR-105 — the anchor's SSH ceiling: `system` allows SYSTEM and the
+    /// signed-in user, `console_user` only the user, `off` nothing; a named
+    /// account is never the service's.
+    #[test]
+    fn the_ssh_ceiling_permits_only_what_it_names() {
+        use SshAccountMode::{ConsoleUser, Daemon, Named};
+        let c = SshServiceCeiling::System;
+        assert!(c.permits(Daemon) && c.permits(ConsoleUser) && !c.permits(Named));
+        let c = SshServiceCeiling::ConsoleUser;
+        assert!(!c.permits(Daemon) && c.permits(ConsoleUser) && !c.permits(Named));
+        let c = SshServiceCeiling::Off;
+        assert!(!c.permits(Daemon) && !c.permits(ConsoleUser) && !c.permits(Named));
+        assert_eq!(SshServiceCeiling::default(), SshServiceCeiling::Off);
+        assert_eq!(
+            serde_json::to_string(&SshServiceCeiling::ConsoleUser).unwrap(),
+            r#""console_user""#
+        );
+    }
+
+    /// FR-105 — every SSH-capable agent advertises `ssh`, and on an attended
+    /// Windows install that server is the signed-in user. A prefix matcher
+    /// would route grants to a SYSTEM service that does not exist, and hand
+    /// the caller a host key nothing on the device holds.
+    #[test]
+    fn ssh_does_not_imply_ssh_system() {
+        let ssh_only = AgentCaps {
+            rpc: vec!["ssh".into(), "ssh-consent".into(), "ssh-grant-ack".into()],
+            ..Default::default()
+        };
+        assert!(ssh_only.has_rpc(RpcCap::Ssh));
+        assert!(
+            !ssh_only.has_rpc(RpcCap::SshSystem),
+            "an agent before FR-105 must NOT read as serving SSH as SYSTEM"
+        );
+        let both = AgentCaps {
+            rpc: vec!["ssh".into(), "ssh-system".into()],
+            ..Default::default()
+        };
+        assert!(both.has_rpc(RpcCap::Ssh) && both.has_rpc(RpcCap::SshSystem));
+        assert_eq!(RpcCap::SshSystem.wire(), "ssh-system");
+        assert_eq!(RpcCap::from_wire("ssh-system"), Some(RpcCap::SshSystem));
     }
 
     /// FR-83 — every agent before the ack advertises `ssh` (and most

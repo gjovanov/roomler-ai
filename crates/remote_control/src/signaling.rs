@@ -2604,6 +2604,15 @@ pub enum ServerMsg {
         /// Absent ⇒ the agent prompts, the fail-safe direction.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consent_mode: Option<crate::models::ConsentMode>,
+        /// FR-105 — this grant is for the device's SYSTEM service, not the
+        /// worker. The worker must NOT record it (its own server would then
+        /// accept the key as the signed-in user); it rings the service with
+        /// `grant_id` alone, and the service claims the grant from the server
+        /// with its own credential. Sent only to a device advertising
+        /// `ssh-system`; absent (false) on every other grant, so the frame
+        /// is byte-for-byte what older agents parse.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        via_service: bool,
     },
 
     /// Answer to a device-originated [`ClientMsg::SshRequest`] — the

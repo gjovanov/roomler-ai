@@ -621,6 +621,8 @@ export type SshDenyReason =
   | 'grant_expired_on_arrival'
   | 'grant_refused'
   | 'grant_unconfirmed'
+  // FR-105 — a SYSTEM service's claim of a grant not pending for it.
+  | 'claim_refused'
 
 /** One SSH grant DECISION.
  *

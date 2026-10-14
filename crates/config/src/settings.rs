@@ -561,6 +561,16 @@ pub struct RcSettings {
     /// them as the worker. Env: `ROOMLER__RC__EXEC_VIA_SERVICE`.
     #[serde(default = "default_true")]
     pub exec_via_service: bool,
+    /// FR-105 — route roomler SSH grants through a Windows device's SYSTEM
+    /// service (port 2223, the service's host key, the claim) when the device
+    /// advertises `ssh-system` and its service published an endpoint under its
+    /// current anchor. Default **true**: nothing advertises that word unless
+    /// an administrator raised the anchor's `ssh` ceiling on the device, so
+    /// this changes nothing for any other device. `false` is the server's kill
+    /// switch: every grant goes to the worker as before FR-105.
+    /// Env: `ROOMLER__RC__SSH_VIA_SERVICE`.
+    #[serde(default = "default_true")]
+    pub ssh_via_service: bool,
     /// FR-103 — serve `POST /api/agent/self/renew` and
     /// `POST /api/tunnel-client/renew`. Default **true**. `false` is the
     /// kill switch: both answer 404, and a device keeps the token it has,
@@ -603,6 +613,7 @@ impl Default for RcSettings {
             ephemeral_reap_interval_secs: 60,
             ephemeral_default_ttl_secs: 900,
             exec_via_service: true,
+            ssh_via_service: true,
             token_renewal: true,
             token_generation_check: true,
             agent_token_ttl_secs: default_agent_token_ttl_secs(),
@@ -1041,6 +1052,7 @@ impl Settings {
             .set_default("rc.ephemeral_reap_interval_secs", 60)?
             .set_default("rc.ephemeral_default_ttl_secs", 900)?
             .set_default("rc.exec_via_service", true)?
+            .set_default("rc.ssh_via_service", true)?
             .set_default("rc.token_renewal", true)?
             .set_default("rc.token_generation_check", true)?
             .set_default("rc.agent_token_ttl_secs", 365 * 24 * 60 * 60)?

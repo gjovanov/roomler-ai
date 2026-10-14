@@ -39,7 +39,8 @@ use roomler_ai_services::dao::{
     key_rotation_audit::KeyRotationAuditDao, overlay_network::OverlayNetworkDao,
     overlay_node::OverlayNodeDao, overlay_policy::OverlayPolicyDao,
     peer_relay_audit::PeerRelayAuditDao, ssh_activity::SshActivityDao, ssh_audit::SshAuditDao,
-    tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao, tunnel_policy::TunnelPolicyDao,
+    ssh_pending::SshPendingDao, tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
+    tunnel_policy::TunnelPolicyDao,
 };
 use roomler_core::{
     Capabilities, Core, Hooks, Module, TenantCtx, WsRegistration, rate_limit::RateLimiter,
@@ -151,6 +152,10 @@ pub struct NetworkState {
     /// them. Pod-local like the Hub's exec waiters: the push only succeeds
     /// when the target's socket is here, and its ack arrives on that socket.
     pub ssh_grant_acks: Arc<ssh_grant_acks::SshGrantAcks>,
+    /// FR-105 — grants routed to a Windows device's SYSTEM service, waiting
+    /// for its claim. Shared (Mongo), unlike the acks: the claim can land on
+    /// any pod, and the caller waiting on another one reads it here.
+    pub ssh_pending: Arc<SshPendingDao>,
     /// FR-19 — per-(requesting node, relay node) mint ceiling
     /// (`peer_relay_limits::MINT_RATE_LIMIT_PER_MINUTE`), checked by the mint
     /// in [`overlay`] AFTER the identity gates so a refusal is attributable.
@@ -294,6 +299,7 @@ impl Module for NetworkState {
             peer_relay_audit: Arc::new(PeerRelayAuditDao::new(db)),
             ssh_rate_limiter: Arc::new(RateLimiter::new()),
             ssh_grant_acks: Arc::new(ssh_grant_acks::SshGrantAcks::new()),
+            ssh_pending: Arc::new(SshPendingDao::new(db)),
             relay_rate_limiter: Arc::new(RateLimiter::new()),
             key_rotation_rate_limiter: Arc::new(RateLimiter::new()),
             fleet,
@@ -522,6 +528,19 @@ impl Module for NetworkState {
             );
         // Public: enrollment (no user JWT; auth is in-handler — the
         // TunnelClient bearer token — so it rides the no-middleware router).
+        // FR-105 — a Windows device's SYSTEM service, with its OWN credential
+        // (auth in-handler, the service token): it publishes its SSH endpoint
+        // and claims the grants routed to it. Beside fleet's
+        // `/agent/service/rpc/*`, which it mirrors.
+        let agent_service_ssh = Router::new()
+            .route(
+                "/service/ssh-host-key",
+                put(routes::agent_ssh::publish_service_endpoint),
+            )
+            .route(
+                "/service/ssh/{grant_id}/claim",
+                post(routes::agent_ssh::claim_service_grant),
+            );
         let public_tunnel = Router::new()
             .route("/enroll", post(routes::tunnel::enroll_tunnel_client))
             .route("/agents", get(routes::tunnel::list_tenant_agents))
@@ -551,6 +570,7 @@ impl Module for NetworkState {
             .nest("/tenant/{tenant_id}/ssh-activity", ssh_activity)
             .nest("/tenant/{tenant_id}/ssh-settings", ssh_settings)
             .nest("/tunnel-client", public_tunnel)
+            .nest("/agent", agent_service_ssh)
             // The block registry is GLOBAL, so reclaiming from it is a
             // platform operation, not a tenant one. Dry-run by default.
             .route(
@@ -795,6 +815,19 @@ impl Module for NetworkState {
                 collection: "tunnel_audit",
                 pre_ops: Vec::new(),
                 indexes: vec![index(bson::doc! { "user_id": 1, "at": -1 })],
+            },
+            // FR-105 — SSH grants waiting for a Windows device's SYSTEM
+            // service, as `exec_pending` holds its commands. `grant_id` is
+            // unique: the claim, the cancel and the waiter's poll each address
+            // ONE row by it. The TTL only keeps the collection small; a stale
+            // claim is refused by the claim's own `claim_by` filter.
+            IndexSet {
+                collection: "ssh_pending",
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index_unique(bson::doc! { "grant_id": 1 }),
+                    index_ttl(bson::doc! { "expires_at": 1 }, 0),
+                ],
             },
         ]
     }

@@ -117,6 +117,11 @@ pub struct ConnectedAgent {
     /// [`Self::supports_ssh_grant_ack`]: a rollback must not leave the server
     /// routing commands to a doorbell the running agent cannot ring.
     pub supports_exec_system: bool,
+    /// FR-105 — the agent advertises `ssh-system`: its anchor allows SSH (the
+    /// `ssh` ceiling is not `off`) and its SYSTEM service answered the
+    /// worker's health ring. Per connection and re-announced, exactly as
+    /// [`Self::supports_exec_system`].
+    pub supports_ssh_system: bool,
     /// Roomler SSH — the agent advertises `AgentCaps.rpc` containing `ssh`,
     /// i.e. it was built with the `ssh-server` feature and will record an
     /// `rc:ssh.grant`. Same rationale as [`Self::supports_exec`]: pushing a
@@ -477,6 +482,8 @@ impl Hub {
             // FR-94 — set right after registration, like `supports_ssh`; an
             // agent whose word is never recorded takes the worker path.
             supports_exec_system: false,
+            // FR-105 — the same: an unrecorded word takes the worker path.
+            supports_ssh_system: false,
             supports_ssh: false,
             // Same setter, same reasoning: `false` = answered without waiting,
             // exactly as before FR-83.
@@ -1723,6 +1730,24 @@ impl Hub {
             .agents
             .get(&agent_id)
             .map(|a| a.supports_exec_system)
+    }
+
+    /// FR-105 — record whether this connection serves SSH from its SYSTEM
+    /// service (`ssh-system`). As [`Self::set_agent_exec_system_support`].
+    pub fn set_agent_ssh_system_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_ssh_system = supports;
+        }
+    }
+
+    /// FR-105 — does the agent, connected to THIS pod, serve SSH from its
+    /// SYSTEM service? `None` = not connected here: a grant reaches only an
+    /// agent on this pod anyway.
+    pub fn agent_supports_ssh_system(&self, agent_id: ObjectId) -> Option<bool> {
+        self.inner
+            .agents
+            .get(&agent_id)
+            .map(|a| a.supports_ssh_system)
     }
 
     /// FR-83 — record whether this connection acknowledges grants

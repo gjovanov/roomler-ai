@@ -120,6 +120,7 @@ const DENY_LABEL: Record<string, string> = {
   grant_expired_on_arrival: 'grant expired (clock skew?)',
   grant_refused: 'device refused grant',
   grant_unconfirmed: 'device did not confirm',
+  claim_refused: 'service claim refused',
 }
 
 const ACCOUNT_LABEL: Record<string, string> = {
