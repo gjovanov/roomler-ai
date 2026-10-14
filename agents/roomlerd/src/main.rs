@@ -1097,7 +1097,12 @@ fn main() -> Result<()> {
     std::thread::Builder::new()
         .name("roomlerd-main".into())
         .spawn(move || {
-            if let Err(e) = rt.block_on(daemon_main()) {
+            let res = rt.block_on(daemon_main());
+            // FR-97 P0e — drop the runtime (cancelling every task, as the
+            // non-AppKit `main` does) before purging, so nothing re-pins.
+            drop(rt);
+            purge_after_daemon();
+            if let Err(e) = res {
                 tracing::error!(error = %format!("{e:#}"), "daemon exited with an error");
                 std::process::exit(1);
             }
@@ -1136,6 +1141,8 @@ fn main() -> Result<()> {
         .build()
         .expect("Failed building the Runtime")
         .block_on(daemon_main());
+    // FR-97 P0e — the runtime is gone (dropped with the statement above).
+    purge_after_daemon();
     if res.is_ok() {
         // Diverges when a restart was requested; otherwise a no-op.
         exit_for_requested_restart();
@@ -1732,6 +1739,26 @@ async fn daemon_main() -> Result<()> {
 /// arm of [`daemon_main`] when `run_cmd` came back from the graceful shutdown
 /// a `RestartDaemon` started; read by `main` only after the runtime is gone.
 static REQUESTED_RESTART_EXIT: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+
+/// FR-97 P0e — set when this process ran the daemon (`roomlerd run`, past
+/// its single-instance lock), so [`purge_after_daemon`] runs only then: every
+/// other subcommand (`enroll`, `status`, `self-update --check-only`), and a
+/// `run` that found the lock held, may share the host with a RUNNING daemon,
+/// whose routes are not ours to purge.
+static DAEMON_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// FR-97 P0e — the daemon is gone: purge what it leaves in the host (the exit
+/// `/1`s, the DNS steer, and the host ledger: a Windows router's forwarding
+/// and every exit-client pin). Only a requested restart did this before, so a
+/// plain stop (SIGTERM, an SCM stop, `launchctl bootout`) left the pins
+/// through the physical uplink behind (field, 0.4.134), and a host moved to
+/// another network then started with its server address black-holed. Called
+/// once the runtime is dropped, so no overlay task can re-pin behind it.
+fn purge_after_daemon() {
+    if DAEMON_RAN.load(std::sync::atomic::Ordering::SeqCst) {
+        roomlerd::purge_exit_routes();
+    }
+}
 
 /// FR-84 D3 — leave for the supervisor to relaunch us, if a restart was
 /// requested; otherwise return and let `main` end the process as it always
@@ -2952,6 +2979,12 @@ async fn run_cmd(
                 return already_running_exit().map(|()| None);
             }
         };
+    // FR-97 P0e — from here this process IS the daemon, so what it leaves in
+    // the host is its own to purge once the runtime is gone
+    // (`purge_after_daemon`). Never before the lock: on macOS a second
+    // `run` returns through `main` (no `process::exit` there), and would
+    // otherwise purge the RUNNING daemon's exit routes and pins.
+    DAEMON_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
     // Up to 0.4.126 a tarball install left /usr and the unit directories
     // another account's (tarball_owner.rs). A host that is already damaged
     // updates through its OLD updater, which never looks at a directory, so

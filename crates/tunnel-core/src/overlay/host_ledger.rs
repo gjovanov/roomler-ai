@@ -21,9 +21,21 @@
 //!   (`store`), so the boot purge can restore what a crashed run turned on.
 //!   Only stable identities are written (an adapter GUID): an ifIndex can
 //!   name a different interface after a reboot.
+//!
+//! FR-97 P0e (N13) — the exit client's carrier-endpoint pins live here too.
+//! A pin is a host route through the PHYSICAL uplink, so it does not die with
+//! the TUN the way the `/1`s do, and no shutdown path tore exit routing down:
+//! field, a tart Mac on 0.4.134, a clean stop left the coordination server's
+//! `/32` in the table. Harmless on the same network; after the next network
+//! change it points at a next hop that no longer answers, the restarted
+//! daemon's control WebSocket cannot reach the server, and the overlay
+//! runtime that would re-pin never starts. Every pin is recorded when it is
+//! made and forgotten when it is removed, and [`purge`] removes what is left
+//! at boot (before the overlay runs) and after every exit of the daemon.
 
 #[cfg(any(windows, test))]
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -135,25 +147,110 @@ impl ForwardingHolds {
     /// The persisted half: the GUID-identified interfaces we turned on and
     /// still hold. An `if:` identity is not written: after a reboot that
     /// index can belong to a different interface.
-    pub(crate) fn ledger(&self) -> HostLedger {
-        HostLedger {
-            forwarding: self
-                .by_identity
-                .iter()
-                .filter(|(id, h)| h.restore && id.starts_with("guid:"))
-                .map(|(id, _)| id.trim_start_matches("guid:").to_string())
-                .collect(),
-        }
+    pub(crate) fn forwarding_guids(&self) -> Vec<String> {
+        self.by_identity
+            .iter()
+            .filter(|(id, h)| h.restore && id.starts_with("guid:"))
+            .map(|(id, _)| id.trim_start_matches("guid:").to_string())
+            .collect()
     }
 }
 
-/// FR-97 P0b-2b — what the boot purge must undo after an unclean exit.
+/// FR-97 P0e — one exit-client pin as its OS arm installed it: a host route
+/// for `ip` through `gateway` on `interface` (Linux `dev`, Windows ifIndex,
+/// macOS netif). `gateway` is kept as the OS tool takes it, so a macOS
+/// link-local next hop keeps its `%zone`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinRecord {
+    pub ip: std::net::IpAddr,
+    pub gateway: String,
+    pub interface: String,
+    /// Linux: the pin carries `onlink`, as its default route did.
+    #[serde(default)]
+    pub onlink: bool,
+}
+
+/// What this daemon changed on the host and has not yet undone; persisted,
+/// what the boot purge must undo.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostLedger {
-    /// Windows adapter GUIDs (`{…}`) whose IPv4 forwarding this daemon turned
-    /// on and had not yet turned off.
+    /// FR-97 P0b-2b — Windows adapter GUIDs (`{…}`) whose IPv4 forwarding
+    /// this daemon turned on and had not yet turned off.
     #[serde(default)]
     pub forwarding: Vec<String>,
+    /// FR-97 P0e — exit-client pins this daemon installed and had not yet
+    /// removed. One per address.
+    #[serde(default)]
+    pub pins: Vec<PinRecord>,
+}
+
+impl HostLedger {
+    pub fn is_empty(&self) -> bool {
+        self.forwarding.is_empty() && self.pins.is_empty()
+    }
+
+    /// Record `pin`, replacing any earlier record for the same address.
+    #[cfg(any(feature = "overlay-l3", test))]
+    pub(crate) fn upsert_pin(&mut self, pin: PinRecord) {
+        self.pins.retain(|p| p.ip != pin.ip);
+        self.pins.push(pin);
+    }
+
+    #[cfg(any(feature = "overlay-l3", test))]
+    pub(crate) fn remove_pin(&mut self, ip: std::net::IpAddr) {
+        self.pins.retain(|p| p.ip != ip);
+    }
+}
+
+/// This process's ledger, the one writer of the persisted one. Both halves go
+/// through it, so the forwarding records and the pin records never overwrite
+/// each other.
+static LEDGER: Mutex<HostLedger> = Mutex::new(HostLedger {
+    forwarding: Vec::new(),
+    pins: Vec::new(),
+});
+
+#[cfg(any(windows, feature = "overlay-l3"))]
+fn with_ledger(f: impl FnOnce(&mut HostLedger)) {
+    let mut ledger = LEDGER.lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut ledger);
+    ledger.store();
+}
+
+/// FR-97 P0b-2b — the forwarding half now held (replaces the earlier list).
+#[cfg(windows)]
+pub(crate) fn record_forwarding(guids: Vec<String>) {
+    with_ledger(|l| l.forwarding = guids);
+}
+
+/// FR-97 P0e — a pin is in: record it before anything can kill the daemon.
+#[cfg(feature = "overlay-l3")]
+pub(crate) fn record_pin(pin: PinRecord) {
+    with_ledger(|l| l.upsert_pin(pin));
+}
+
+/// FR-97 P0e — a pin is out.
+#[cfg(feature = "overlay-l3")]
+pub(crate) fn forget_pin(ip: std::net::IpAddr) {
+    with_ledger(|l| l.remove_pin(ip));
+}
+
+/// FR-97 P0b-2b / P0e — undo what the persisted ledger records, then clear
+/// it: the forwarding a Windows router turned on, and every exit-client pin. Run
+/// at boot, before the overlay can install anything, and after every exit of
+/// the daemon (`roomlerd::purge_exit_routes`). Context-free and synchronous;
+/// a no-op when the ledger is empty. Each OS arm checks that a route still
+/// looks like our pin before it removes it.
+pub fn purge() {
+    let on_disk = HostLedger::load();
+    if on_disk.is_empty() {
+        return;
+    }
+    super::nat::restore_forwarding_guids(&on_disk.forwarding);
+    #[cfg(feature = "overlay-l3")]
+    super::tun::purge_pins(&on_disk.pins);
+    *LEDGER.lock().unwrap_or_else(|e| e.into_inner()) = HostLedger::default();
+    HostLedger::default().store();
 }
 
 impl HostLedger {
@@ -165,10 +262,10 @@ impl HostLedger {
     }
 
     /// Write the ledger; an empty ledger is removed. Best-effort: a daemon
-    /// that cannot write it keeps working, and only loses the crash-time
-    /// restore.
+    /// that cannot write it (not root, a read-only system) keeps working, and
+    /// only loses the crash-time undo.
     pub fn store(&self) {
-        if self.forwarding.is_empty() {
+        if self.is_empty() {
             store::remove();
             return;
         }
@@ -180,7 +277,8 @@ impl HostLedger {
 
 /// Where the ledger lives: one place per machine, because one daemon per
 /// machine owns this state (`docs/multi-org.md`) and the boot purge runs
-/// before any config is read.
+/// before any config is read. The daemon acts on what it says as SYSTEM or
+/// root, so only that identity may be able to write it.
 ///
 /// On Windows that is the registry, `HKLM\SOFTWARE\Roomler\Overlay`, never a
 /// file under `%ProgramData%`: any account may create a file there, and the
@@ -197,7 +295,7 @@ mod store {
 
     const SUBKEY: &str = r"SOFTWARE\Roomler\Overlay";
     const VALUE: &str = "HostLedger";
-    /// A ledger is a few GUIDs; anything near this is not one.
+    /// A ledger is a few GUIDs and pins; anything near this is not one.
     const MAX_BYTES: u32 = 256 * 1024;
 
     fn wide(s: &str) -> Vec<u16> {
@@ -297,8 +395,74 @@ mod store {
     }
 }
 
-/// Nothing on this OS writes the ledger yet.
-#[cfg(not(windows))]
+/// On Linux and macOS, a file in a directory only root may create:
+/// `/var/lib/roomler` or `/var/db/roomler`. It is believed only while both
+/// the directory and the file are root's and nobody else may write them (a
+/// directory someone loosened, or a symlink, is not this daemon's record).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod store {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::path::{Path, PathBuf};
+
+    #[cfg(target_os = "linux")]
+    const DIR: &str = "/var/lib/roomler";
+    #[cfg(target_os = "macos")]
+    const DIR: &str = "/var/db/roomler";
+    const FILE: &str = "overlay-host-ledger.json";
+    /// A ledger is a few pins; anything near this is not one.
+    const MAX_BYTES: u64 = 256 * 1024;
+
+    fn path() -> PathBuf {
+        Path::new(DIR).join(FILE)
+    }
+
+    /// Root's, and writable by nobody else.
+    pub(super) fn root_private(uid: u32, mode: u32) -> bool {
+        uid == 0 && mode & 0o022 == 0
+    }
+
+    pub(super) fn read() -> Option<Vec<u8>> {
+        let dir = std::fs::symlink_metadata(DIR).ok()?;
+        if !dir.is_dir() || !root_private(dir.uid(), dir.mode()) {
+            return None;
+        }
+        // Only root can swap the file in that directory, so a check by
+        // name holds for the read that follows it.
+        let file = std::fs::symlink_metadata(path()).ok()?;
+        if !file.is_file() || !root_private(file.uid(), file.mode()) || file.len() > MAX_BYTES {
+            return None;
+        }
+        std::fs::read(path()).ok()
+    }
+
+    pub(super) fn write(body: &str) {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(DIR);
+        // A fresh 0600 file whatever the umask, so `read` believes it.
+        let tmp = Path::new(DIR).join(format!("{FILE}.tmp"));
+        let _ = std::fs::remove_file(&tmp);
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(body.as_bytes()));
+        if written.is_ok() {
+            let _ = std::fs::rename(&tmp, path());
+        }
+    }
+
+    pub(super) fn remove() {
+        let _ = std::fs::remove_file(path());
+    }
+}
+
+/// Nothing on this OS writes the ledger.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod store {
     pub(super) fn read() -> Option<Vec<u8>> {
         None
@@ -376,9 +540,9 @@ mod tests {
         holds.hold(&target(GUID_A, "Disabled"));
         holds.hold(&target(GUID_B, "Enabled"));
         holds.hold(&parse_forwarding_report("FWD - 9 Disabled").pop().unwrap());
-        assert_eq!(holds.ledger().forwarding, vec![GUID_A.to_string()]);
+        assert_eq!(holds.forwarding_guids(), vec![GUID_A.to_string()]);
         holds.release(&format!("guid:{GUID_A}"));
-        assert!(holds.ledger().forwarding.is_empty());
+        assert!(holds.forwarding_guids().is_empty());
     }
 
     #[test]
@@ -402,14 +566,72 @@ mod tests {
         assert_eq!(t.identity, "if:5");
     }
 
+    fn pin(ip: &str, gw: &str) -> PinRecord {
+        PinRecord {
+            ip: ip.parse().unwrap(),
+            gateway: gw.into(),
+            interface: "en0".into(),
+            onlink: false,
+        }
+    }
+
     #[test]
     fn the_ledger_round_trips_and_tolerates_a_missing_field() {
         let l = HostLedger {
             forwarding: vec![GUID_A.into()],
+            pins: vec![
+                pin("94.130.141.98", "192.168.64.1"),
+                pin("2a01:4f8::1", "fe80::1%en0"),
+            ],
         };
         let back: HostLedger = serde_json::from_slice(&serde_json::to_vec(&l).unwrap()).unwrap();
         assert_eq!(back, l);
         let empty: HostLedger = serde_json::from_str("{}").unwrap();
-        assert!(empty.forwarding.is_empty());
+        assert!(empty.is_empty());
+        // A ledger written by P0b-2b, before pins existed, still reads.
+        let old: HostLedger =
+            serde_json::from_str(&format!("{{\"forwarding\":[\"{GUID_A}\"]}}")).unwrap();
+        assert_eq!(old.forwarding, vec![GUID_A.to_string()]);
+        assert!(old.pins.is_empty());
+    }
+
+    /// FR-97 P0e — one record per address: a re-pin through a new uplink
+    /// replaces the old record, so the purge targets the route that exists.
+    #[test]
+    fn a_pin_is_recorded_once_per_address_and_forgotten() {
+        let mut l = HostLedger::default();
+        l.upsert_pin(pin("94.130.141.98", "192.168.64.1"));
+        l.upsert_pin(pin("5.9.157.226", "192.168.64.1"));
+        l.upsert_pin(pin("94.130.141.98", "10.0.0.1"));
+        assert_eq!(l.pins.len(), 2);
+        assert!(
+            l.pins
+                .iter()
+                .any(|p| p.ip.to_string() == "94.130.141.98" && p.gateway == "10.0.0.1"),
+            "the newer record wins: {:?}",
+            l.pins
+        );
+        l.remove_pin("94.130.141.98".parse().unwrap());
+        assert_eq!(l.pins.len(), 1);
+        assert!(!l.is_empty());
+        l.remove_pin("5.9.157.226".parse().unwrap());
+        assert!(l.is_empty(), "an empty ledger is removed on store");
+    }
+
+    /// Root acts on the ledger at boot, so it is believed only from a
+    /// directory and a file that are root's and nobody else may write.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn only_a_root_private_ledger_is_believed() {
+        use super::store::root_private;
+        assert!(
+            root_private(0, 0o040755),
+            "the directory as write() makes it"
+        );
+        assert!(root_private(0, 0o100600), "the file as write() makes it");
+        assert!(!root_private(0, 0o040775), "group-writable");
+        assert!(!root_private(0, 0o041777), "world-writable, even sticky");
+        assert!(!root_private(0, 0o100666), "a file made under umask 0");
+        assert!(!root_private(1000, 0o100600), "another account's file");
     }
 }
