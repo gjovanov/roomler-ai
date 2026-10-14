@@ -307,8 +307,10 @@
         size="small"
         class="mr-1"
         :loading="clipboardBusy"
+        :disabled="!!clipboardRefusal"
         aria-label="Send my clipboard to the remote host"
-        title="Send my clipboard → remote"
+        :title="clipboardRefusal ?? 'Send my clipboard → remote'"
+        data-testid="rc-clipboard-send"
         @click="onSendClipboard"
       >
         <v-icon>mdi-content-paste</v-icon>
@@ -320,8 +322,10 @@
         size="small"
         class="mr-1"
         :loading="clipboardBusy"
+        :disabled="!!clipboardRefusal"
         aria-label="Get the remote host's clipboard"
-        title="Get remote clipboard → me"
+        :title="clipboardRefusal ?? 'Get remote clipboard → me'"
+        data-testid="rc-clipboard-get"
         @click="onGetClipboard"
       >
         <v-icon>mdi-content-copy</v-icon>
@@ -1495,8 +1499,10 @@
             :prepend-icon="
               clipboardAutoSyncOn ? 'mdi-clipboard-flow' : 'mdi-clipboard-off-outline'
             "
-            :title="clipboardAutoSyncTooltip"
+            :disabled="!!clipboardRefusal"
+            :title="clipboardRefusal ?? clipboardAutoSyncTooltip"
             class="mb-2"
+            data-testid="rc-clipboard-autosync"
             @click="toggleClipboardAutoSync"
           >
             Clipboard auto-sync — {{ clipboardAutoSyncOn ? 'ON' : 'OFF' }}
@@ -1542,7 +1548,10 @@
               variant="tonal"
               prepend-icon="mdi-upload"
               :loading="uploadBusy"
+              :disabled="!!filesRefusal"
+              :title="filesRefusal ?? undefined"
               class="mb-2"
+              data-testid="rc-files-upload"
               @click="fileInput?.click()"
             >
               Upload file → remote
@@ -1551,15 +1560,17 @@
               block
               variant="tonal"
               prepend-icon="mdi-folder-open"
-              :disabled="!agentSupportsBrowse"
+              :disabled="!agentSupportsBrowse || !!filesRefusal"
               :title="
-                agentSupportsBrowse
+                filesRefusal ??
+                (agentSupportsBrowse
                   ? 'Browse remote files (download)'
                   : isLegacyFileDc
                     ? 'Browse needs agent 0.3.0+ — upgrade host agent'
-                    : 'Browse disabled by host config'
+                    : 'Browse disabled by host config')
               "
               class="mb-2"
+              data-testid="rc-files-browse"
               @click="filesDrawer = true; settingsOpen = false"
             >
               Browse remote files
@@ -1992,6 +2003,7 @@ import {
   type RemoteRecordingItem,
 } from '@/composables/useRemoteRecording'
 import { describePrivacyReason, showsPrivacyRefusal } from '@/composables/usePrivacyMode'
+import { featureRefusal, summarizeRefusals } from '@/composables/useSessionFeatures'
 import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
 import KeepBusyMenu from '@/components/remote/KeepBusyMenu.vue'
@@ -2016,7 +2028,7 @@ const hideDeviceName = useHideDeviceName(() => `${authStore.user?.id ?? 'anon'}:
 // flips when the load lands.
 const rc = useRemoteControl(agent)
 const { t } = useI18n()
-const { showSuccess, showError } = useSnackbar()
+const { showSuccess, showError, showSnackbar } = useSnackbar()
 // rc.199 — Vuetify viewport helper; drives the Settings dialog's
 // fullscreen-on-phone behaviour so one panel serves every viewport.
 const { mobile } = useDisplay()
@@ -2059,6 +2071,20 @@ watch(
     }
   },
 )
+// FR-101 P2c — what the session policy took out of this session, per control:
+// the reason in words, or null when the feature is there. Each greyed control
+// carries its own reason in its title.
+const filesRefusal = computed(() => featureRefusal(rc.featuresRefused.value, 'files'))
+const clipboardRefusal = computed(() => featureRefusal(rc.featuresRefused.value, 'clipboard'))
+const audioRefusal = computed(() => featureRefusal(rc.featuresRefused.value, 'audio'))
+// Said once as the session starts, so nobody has to find out by clicking.
+watch(
+  () => rc.featuresRefused.value,
+  (refused) => {
+    const summary = summarizeRefusals(refused)
+    if (summary) showSnackbar(summary, 'info', 8000)
+  },
+)
 // FR-85 P3b-3 — a deliberate Disconnect ends a recording first: to the device
 // a hang-up and the reconnect ladder's retry look the same, and a retry is
 // what it keeps a recording running for.
@@ -2092,6 +2118,11 @@ async function onDownloadRecording(it: RemoteRecordingItem) {
 // success/failure. Fire-and-forget — the agent doesn't ack writes.
 async function onSendClipboard() {
   if (clipboardBusy.value) return
+  // FR-101 P2c — the session policy took the clipboard out of this session.
+  if (clipboardRefusal.value) {
+    showError(clipboardRefusal.value)
+    return
+  }
   clipboardBusy.value = true
   try {
     const ok = await rc.sendClipboardToAgent()
@@ -2111,6 +2142,11 @@ async function onSendClipboard() {
 // anchors the `navigator.clipboard.write*` user-gesture permission.
 async function onGetClipboard() {
   if (clipboardBusy.value) return
+  // FR-101 P2c — likewise.
+  if (clipboardRefusal.value) {
+    showError(clipboardRefusal.value)
+    return
+  }
   clipboardBusy.value = true
   try {
     const content = await rc.getAgentClipboardRich()
@@ -2231,6 +2267,12 @@ function onStageDragLeave(ev: DragEvent) {
 async function onStageDrop(ev: DragEvent) {
   isDragOver.value = false
   if (!ev.dataTransfer) return
+  // FR-101 P2c — the session policy took file transfer out of this session:
+  // say why, rather than starting an upload the device refuses.
+  if (filesRefusal.value) {
+    showError(filesRefusal.value)
+    return
+  }
   // Iterate `items` (NOT `files`) so we can use `webkitGetAsEntry()`
   // to detect + recursively walk dropped folders. File-DC v2.1
   // (0.3.0+): folder uploads extend `files:begin` with a `rel_path`
@@ -2598,6 +2640,11 @@ function onDrawerDragLeave(ev: DragEvent) {
 async function onDrawerDrop(ev: DragEvent) {
   isDrawerDragOver.value = false
   if (!ev.dataTransfer) return
+  // FR-101 P2c — likewise.
+  if (filesRefusal.value) {
+    showError(filesRefusal.value)
+    return
+  }
   // Mirror the viewer's onStageDrop logic (files + walked folders),
   // but route through `uploadMany` with the drawer's current dir as
   // the dest_path option.
@@ -2804,6 +2851,9 @@ const agentSupportsAudio = computed<boolean>(() => {
   return (agentAudioCaps.value ?? []).includes('opus')
 })
 const audioTooltip = computed<string>(() => {
+  // FR-101 P2c — the session policy took audio out of this session, whatever
+  // the toggle says.
+  if (sessionLive.value && audioRefusal.value) return audioRefusal.value
   if (!agentSupportsAudio.value) {
     return 'This agent does not advertise audio support (needs an agent built with the audio feature) — receive-audio unavailable'
   }
