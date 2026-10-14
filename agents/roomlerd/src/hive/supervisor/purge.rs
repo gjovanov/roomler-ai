@@ -49,7 +49,10 @@ impl Supervisor {
         }
     }
 
-    async fn purge_parts(
+    /// Purge `session` here, every part, and how each went: the order the
+    /// module's table names. P2g-3d — the device's own clock runs it too
+    /// ([`super::retain`]), under the start lock, with no purge id.
+    pub(super) async fn purge_parts(
         self: &Arc<Self>,
         session: ObjectId,
     ) -> (HivePurgePart, HivePurgePart, Option<String>) {

@@ -22,15 +22,16 @@
 //! membership and raises the floor in one transaction, and the tips read the
 //! chain's end. The stream (P2d-3) applies what a source sends, an event
 //! held already taken as held (`apply_unless_held`), and keeps the blobs a
-//! member asks for. The purge (P2g) and an archive replica's search (P2i)
-//! come next.
+//! member asks for. The purge (P2g-1) goes through it, and so does the
+//! device's own clock (P2g-3d): what keeps each copy, the contact, and the
+//! copies the clock purged. An archive replica's search (P2i) comes next.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc;
 
 use roomler_hive_node::store::{
-    Membership, SearchHit, Store, StoreError, Substitute, WorkplaceRecord,
+    Membership, RetainWord, SearchHit, Store, StoreError, Substitute, WorkplaceRecord,
 };
 use roomler_hive_node::{ChainTip, EventEnvelope, FenceEnd, TranscriptEvent};
 use tokio::sync::{broadcast, oneshot};
@@ -176,6 +177,43 @@ enum Member {
     ClearPurgeDebt {
         session: String,
         reply: Reply<()>,
+    },
+    /// FR-90 P2g-3d — the device's own clock.
+    PutRetain {
+        session: String,
+        days: u32,
+        ended_ms: Option<i64>,
+        reply: Reply<()>,
+    },
+    Retains {
+        reply: Reply<Vec<RetainWord>>,
+    },
+    DropRetain {
+        session: String,
+        reply: Reply<()>,
+    },
+    Contact {
+        reply: Reply<Option<i64>>,
+    },
+    SetContact {
+        at_ms: i64,
+        reply: Reply<()>,
+    },
+    HeldSessions {
+        reply: Reply<Vec<String>>,
+    },
+    NoteCopyPurge {
+        session: String,
+        at_ms: i64,
+        reply: Reply<()>,
+    },
+    TakeCopyPurgeReports {
+        limit: usize,
+        max: u32,
+        reply: Reply<Vec<(String, i64)>>,
+    },
+    HasCopyPurgeReports {
+        reply: Reply<bool>,
     },
     Search {
         query: String,
@@ -612,6 +650,81 @@ impl StoreHandle {
             .await
     }
 
+    /// FR-90 P2g-3d — keep what the server says keeps `session`'s copy.
+    pub(crate) async fn put_retain(
+        &self,
+        session: &str,
+        days: u32,
+        ended_ms: Option<i64>,
+    ) -> Result<(), WriterError> {
+        let session = session.to_string();
+        self.ask(|reply| Member::PutRetain {
+            session,
+            days,
+            ended_ms,
+            reply,
+        })
+        .await
+    }
+
+    /// FR-90 P2g-3d — every word kept.
+    pub(crate) async fn retains(&self) -> Result<Vec<RetainWord>, WriterError> {
+        self.ask(|reply| Member::Retains { reply }).await
+    }
+
+    /// FR-90 P2g-3d — forget `session`'s word.
+    pub(crate) async fn drop_retain(&self, session: &str) -> Result<(), WriterError> {
+        let session = session.to_string();
+        self.ask(|reply| Member::DropRetain { session, reply })
+            .await
+    }
+
+    /// FR-90 P2g-3d — when this device was last connected, by its clock.
+    pub(crate) async fn contact(&self) -> Result<Option<i64>, WriterError> {
+        self.ask(|reply| Member::Contact { reply }).await
+    }
+
+    /// FR-90 P2g-3d — the device is connected now.
+    pub(crate) async fn set_contact(&self, at_ms: i64) -> Result<(), WriterError> {
+        self.ask(|reply| Member::SetContact { at_ms, reply }).await
+    }
+
+    /// FR-90 P2g-3d — every session this store holds anything of.
+    pub(crate) async fn held_sessions(&self) -> Result<Vec<String>, WriterError> {
+        self.ask(|reply| Member::HeldSessions { reply }).await
+    }
+
+    /// FR-90 P2g-3d — the device's own clock purged `session`'s copy.
+    pub(crate) async fn note_copy_purge(
+        &self,
+        session: &str,
+        at_ms: i64,
+    ) -> Result<(), WriterError> {
+        let session = session.to_string();
+        self.ask(|reply| Member::NoteCopyPurge {
+            session,
+            at_ms,
+            reply,
+        })
+        .await
+    }
+
+    /// FR-90 P2g-3d — the copies its clock purged that a manifest names now.
+    pub(crate) async fn take_copy_purge_reports(
+        &self,
+        limit: usize,
+        max: u32,
+    ) -> Result<Vec<(String, i64)>, WriterError> {
+        self.ask(|reply| Member::TakeCopyPurgeReports { limit, max, reply })
+            .await
+    }
+
+    /// FR-90 P2g-3d — whether such a copy is still to be named.
+    pub(crate) async fn has_copy_purge_reports(&self) -> Result<bool, WriterError> {
+        self.ask(|reply| Member::HasCopyPurgeReports { reply })
+            .await
+    }
+
     /// Full-text search over the sessions named, best first. An empty list
     /// finds nothing, never everything: a viewer's grant names what it may
     /// read, and only those are searched.
@@ -906,6 +1019,42 @@ fn member(store: &mut Store, publish: &broadcast::Sender<Arc<EventEnvelope>>, cm
         }
         Member::ClearPurgeDebt { session, reply } => {
             let _ = reply.send(store.clear_purge_debt(&session));
+        }
+        Member::PutRetain {
+            session,
+            days,
+            ended_ms,
+            reply,
+        } => {
+            let _ = reply.send(store.put_retain(&session, days, ended_ms));
+        }
+        Member::Retains { reply } => {
+            let _ = reply.send(store.retains());
+        }
+        Member::DropRetain { session, reply } => {
+            let _ = reply.send(store.drop_retain(&session));
+        }
+        Member::Contact { reply } => {
+            let _ = reply.send(store.contact());
+        }
+        Member::SetContact { at_ms, reply } => {
+            let _ = reply.send(store.set_contact(at_ms));
+        }
+        Member::HeldSessions { reply } => {
+            let _ = reply.send(store.held_sessions());
+        }
+        Member::NoteCopyPurge {
+            session,
+            at_ms,
+            reply,
+        } => {
+            let _ = reply.send(store.note_copy_purge(&session, at_ms));
+        }
+        Member::TakeCopyPurgeReports { limit, max, reply } => {
+            let _ = reply.send(store.take_copy_purge_reports(limit, max));
+        }
+        Member::HasCopyPurgeReports { reply } => {
+            let _ = reply.send(store.has_copy_purge_reports());
         }
         Member::Search {
             query,
