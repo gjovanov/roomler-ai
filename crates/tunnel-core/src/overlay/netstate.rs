@@ -225,6 +225,12 @@ pub struct NetDelta {
     pub addrs_removed: usize,
     pub saw_addr_signal: bool,
     pub saw_iface_signal: bool,
+    /// FR-97 N14 — the only movement was our own exit's capture coming or
+    /// going: the lookup moved onto or off our adapter while the uplink beneath
+    /// it stayed put, and no address was lost. Still a Major, as it always was,
+    /// but one that must not spend the flap cooldown a real move after it
+    /// needs ([`major_demoted`]).
+    pub own_capture_only: bool,
     pub summary: String,
 }
 
@@ -238,10 +244,9 @@ pub(crate) fn diff(
 ) -> Option<NetDelta> {
     // FR-97 N14 — the uplink beneath an active exit moving is the network
     // moving, though the lookup still answers with our own TUN.
-    let default_route_moved = prev.default_v4 != next.default_v4
-        || prev.default_v6 != next.default_v6
-        || prev.uplink_v4 != next.uplink_v4
-        || prev.uplink_v6 != next.uplink_v6;
+    let uplink_moved = prev.uplink_v4 != next.uplink_v4 || prev.uplink_v6 != next.uplink_v6;
+    let default_route_moved =
+        prev.default_v4 != next.default_v4 || prev.default_v6 != next.default_v6 || uplink_moved;
     // FR-33 — a capture appearing or clearing is MATERIAL (it decides whether
     // the LAN tier can ever work) but keys no socket, so it never lifts the
     // severity on its own; it is named in the summary either way, which is
@@ -319,7 +324,27 @@ pub(crate) fn diff(
         addrs_removed: removed,
         saw_addr_signal: saw_addr,
         saw_iface_signal: saw_iface,
+        own_capture_only: default_route_moved && !uplink_moved && removed == 0,
         summary,
+    })
+}
+
+/// FR-97 N14 — does the flap cooldown demote this Major? Our own exit's
+/// capture coming or going is damped by ANY recent Major, so an exit whose
+/// carrier flaps cannot fire the heavy lanes every few seconds. Any other
+/// Major is damped only by a recent Major that was not one. Before this, the
+/// exit's own activation spent the window: on the field's Linux client an
+/// uplink move 13 s later was demoted, and the control WS waited 59 s for its
+/// keepalive instead of being probed at once.
+fn major_demoted(
+    own_capture_only: bool,
+    since_any: Option<Duration>,
+    since_network: Option<Duration>,
+) -> bool {
+    major_cooldown_active(if own_capture_only {
+        since_any
+    } else {
+        since_network
     })
 }
 
@@ -446,6 +471,8 @@ async fn monitor(
 ) {
     let quiet = debounce();
     let mut last_major_pub: Option<tokio::time::Instant> = None;
+    // FR-97 N14 — the last Major that was not our own exit's capture.
+    let mut last_network_major_pub: Option<tokio::time::Instant> = None;
     loop {
         let Some((first, _detail)) = raw_rx.recv().await else {
             warn!(
@@ -481,7 +508,11 @@ async fn monitor(
                 // the wake-up flowing; only the heavy lanes are spared.
                 if delta.material
                     && delta.severity == Severity::Major
-                    && major_cooldown_active(last_major_pub.map(|t| t.elapsed()))
+                    && major_demoted(
+                        delta.own_capture_only,
+                        last_major_pub.map(|t| t.elapsed()),
+                        last_network_major_pub.map(|t| t.elapsed()),
+                    )
                 {
                     delta.severity = Severity::Minor;
                     delta.summary = format!("{} [major demoted: flap cooldown]", delta.summary);
@@ -493,7 +524,11 @@ async fn monitor(
                     "netstate: network changed"
                 );
                 if delta.material && delta.severity == Severity::Major {
-                    last_major_pub = Some(tokio::time::Instant::now());
+                    let now = tokio::time::Instant::now();
+                    last_major_pub = Some(now);
+                    if !delta.own_capture_only {
+                        last_network_major_pub = Some(now);
+                    }
                     stamp_major();
                 }
                 let _ = snap_tx.send(next.clone());
@@ -514,6 +549,7 @@ async fn monitor(
                     addrs_removed: 0,
                     saw_addr_signal: saw_addr,
                     saw_iface_signal: saw_iface,
+                    own_capture_only: false,
                     summary: format!("route churn, no snapshot delta ({} signals)", absorbed + 1),
                 });
             }
@@ -1303,6 +1339,67 @@ mod tests {
         };
         assert_eq!(uplink_beneath_own(Some(&d), false), Some(d.clone()));
         assert_eq!(uplink_beneath_own(None, true), None);
+    }
+
+    /// FR-97 N14 — our own exit coming or going stays a Major, but it does
+    /// not spend the cooldown a real move after it needs. An exit whose
+    /// carrier flaps is still damped.
+    #[test]
+    fn our_exits_capture_does_not_spend_the_cooldown_a_real_move_needs() {
+        let s = |n| Some(Duration::from_secs(n));
+        // The field case: the exit came up 13 s before the uplink moved.
+        assert!(
+            !major_demoted(false, s(13), None),
+            "the real move publishes"
+        );
+        // A real move 30 s after another real move is damped, as ever.
+        assert!(major_demoted(false, s(30), s(30)));
+        // The exit's own capture flapping is damped by any recent Major.
+        assert!(major_demoted(true, s(13), None));
+        assert!(major_demoted(true, s(40), s(40)));
+        // The first Major of either kind publishes.
+        assert!(!major_demoted(true, None, None));
+        assert!(!major_demoted(false, None, None));
+    }
+
+    /// FR-97 N14 — a delta says whether the only thing that moved was our
+    /// own exit's capture.
+    #[test]
+    fn a_delta_says_whether_only_our_exits_capture_moved() {
+        let nics: &[(&str, &[&str])] = &[("eth0", &["172.31.10.2"]), ("eth1", &["172.31.11.2"])];
+        let on_eth0 = under_exit(nics, "eth0", "172.31.10.1");
+        let mut plain = snap(nics, Some("eth0"));
+        plain.default_v4 = on_eth0.uplink_v4.clone();
+        plain.uplink_v4 = on_eth0.uplink_v4.clone();
+
+        let up = diff(&plain, &on_eth0, false, false).expect("the exit came up");
+        assert!(up.own_capture_only && up.severity == Severity::Major);
+        let down = diff(&on_eth0, &plain, false, false).expect("the exit went");
+        assert!(down.own_capture_only);
+
+        let on_eth1 = under_exit(nics, "eth1", "172.31.11.1");
+        assert!(
+            !diff(&on_eth0, &on_eth1, false, true)
+                .unwrap()
+                .own_capture_only,
+            "the uplink moving beneath the exit is the network moving"
+        );
+        assert!(
+            !diff(
+                &snap(nics, Some("eth0")),
+                &snap(nics, Some("eth1")),
+                false,
+                false
+            )
+            .unwrap()
+            .own_capture_only,
+            "a default move on a host without an exit"
+        );
+        let lost = under_exit(&[("eth1", &["172.31.11.2"])], "eth0", "172.31.10.1");
+        assert!(
+            !diff(&plain, &lost, true, false).unwrap().own_capture_only,
+            "the exit coming up while an address goes"
+        );
     }
 
     /// FR-33 — a capture appearing or clearing is a material delta on its
