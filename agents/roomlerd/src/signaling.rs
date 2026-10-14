@@ -3473,8 +3473,12 @@ async fn handle_server_msg(
         // was the ONLY signal for both of those real bugs, which dropped data
         // silently otherwise. Mid-session it means something; here it does not.
         // Distinguish by what follows: a teardown line, or nothing.
-        ServerMsg::Terminate { session_id, reason } => {
-            info!(%session_id, ?reason, "session terminated by server");
+        ServerMsg::Terminate {
+            session_id,
+            reason,
+            limit,
+        } => {
+            info!(%session_id, ?reason, ?limit, "session terminated by server");
             // A consent prompt still standing for this session was already
             // withdrawn above, ahead of the delegation gate (#1632) — this arm
             // does not run on a delegated session, and the prompt is ours

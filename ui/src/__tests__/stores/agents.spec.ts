@@ -613,6 +613,39 @@ describe('useAgentStore', () => {
     expect(s.orgEphemeralKeysEnabled).toBeNull()
   })
 
+  it('FR-101 P4b: the maximum session length is read and set on its own route; null is no limit', async () => {
+    mockApi.get.mockResolvedValueOnce({ max_secs: null })
+    asOwner()
+    const s = useAgentStore()
+    expect(s.orgRcMaxSessionSecs).toBeUndefined()
+    await s.fetchOrgRcSessionLimits(TENANT_ID)
+    expect(mockApi.get.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/rc-session-limits`)
+    expect(s.orgRcMaxSessionSecs).toBeNull()
+
+    mockApi.put.mockResolvedValueOnce({ max_secs: 7200 })
+    await s.setOrgRcMaxSessionSecs(TENANT_ID, 7200)
+    expect(mockApi.put.mock.calls.at(-1)).toEqual([
+      `/tenant/${TENANT_ID}/rc-session-limits`,
+      { max_secs: 7200 },
+    ])
+    expect(s.orgRcMaxSessionSecs).toBe(7200)
+
+    // Clearing sends null, never an absent field.
+    mockApi.put.mockResolvedValueOnce({ max_secs: null })
+    await s.setOrgRcMaxSessionSecs(TENANT_ID, null)
+    expect(mockApi.put.mock.calls.at(-1)![1]).toEqual({ max_secs: null })
+    expect(s.orgRcMaxSessionSecs).toBeNull()
+  })
+
+  it('FR-101 P4b: a member who cannot manage org settings reads no limit and sends nothing', async () => {
+    asMemberWithoutManageTenant()
+    const s = useAgentStore()
+    const before = mockApi.get.mock.calls.length
+    await s.fetchOrgRcSessionLimits(TENANT_ID)
+    expect(s.orgRcMaxSessionSecs).toBeUndefined()
+    expect(mockApi.get.mock.calls.length).toBe(before)
+  })
+
   it('mintEnrollKey POSTs the enroll-key path and hands back the one-time key', async () => {
     mockApi.post.mockResolvedValueOnce({
       key: 'jwt.shown.once',
