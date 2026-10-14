@@ -37,9 +37,45 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     hive_host();
+    windows_main_stack();
 
     #[cfg(windows)]
     windows_version_info::embed();
+}
+
+/// The main thread's stack on Windows: 8 MiB, what Linux gives it.
+///
+/// Windows reserves for the main thread whatever the PE header says — 1 MiB
+/// by the MSVC linker's default — and `main` polls `daemon_main` right on that
+/// thread (`block_on`). In a DEBUG build that one poll frame was already close
+/// to 1 MiB: the state machine of a function with forty-odd command arms keeps
+/// a slot for every temporary of every arm, and the clap parse runs on top of
+/// it. FR-102 P3's two `enroll` flags tipped it over, and every invocation —
+/// `--version` included — died with "thread 'main' has overflowed its stack"
+/// before printing a byte (measured: the future itself is ~12 KB, and the same
+/// parse outside the runtime succeeds). Only the FR-85 recorder lane noticed,
+/// because it is the one CI job that runs the debug binary on Windows.
+///
+/// A release build's frames are far smaller, but the same creep there would
+/// take every Windows device down at service start, so the headroom applies to
+/// both. It is a reserve, not a commit — pages are committed only as the stack
+/// grows. Threads created with an explicit size (std's, tokio's) are
+/// unaffected; any thread the OS creates at the image default gets the same
+/// reserve. Keyed on the TARGET, like [`hive_host`]: a build script runs on the
+/// host. `-bin=roomlerd` scopes it to this one binary, as the version resource
+/// below is.
+fn windows_main_stack() {
+    const STACK_BYTES: u64 = 8 * 1024 * 1024;
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+        Ok("msvc") => println!("cargo:rustc-link-arg-bin=roomlerd=/STACK:{STACK_BYTES}"),
+        Ok("gnu") | Ok("gnullvm") => {
+            println!("cargo:rustc-link-arg-bin=roomlerd=-Wl,--stack,{STACK_BYTES}")
+        }
+        _ => {}
+    }
 }
 
 /// FR-90 P1h — `cfg(hive_host)`: this build hosts agent sessions. That is the
