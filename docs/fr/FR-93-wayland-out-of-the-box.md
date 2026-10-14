@@ -651,7 +651,7 @@ bridge for text and images in the lab before deciding.
 | **P8** | leftovers: FR-45 AC8 + P5b, FR-56 AC7/AC9/AC10, FR-92 AC9, FR-85's Wayland rows | each FR's own | lab, WSL2 | S each |
 | **P9** | docs: a new `docs/wayland.md` (the support matrix — desktop × install × session state × capability, attended vs unattended), `docs/linux-capture.md` refreshed, the lab runbook in `docs/vmtest.md`, a `docs/README.md` row, `README.Debian` | — | — | S |
 | ↳ P9a | `docs/wayland.md`: the support matrix (desktop × install → picture, input, cursor, who is asked, the lock screen, the release each cell was verified on), the session states with their measured recoveries, the viewer's reasons and what to do, choosing an install; its `docs/README.md` row and index node; the `linux-capture.md` row naming §3.1–3.3, §4.8 and §5.3–5.6 | — | ✅ written from the measured record (every number cites a lab run) | S |
-| ↳ P9b | the lifecycle oracle (`lc-run2.sh`, `lc-verdict.py`, `lc-said.py`, `lc-timeline.py`, `guest-lock.sh`, today in a working directory on the lab host) committed to the deploy repo's `vmtest/lab`, then the runbook in `docs/vmtest.md` | — | owed | S |
+| ↳ P9b | the lifecycle oracle, the idle-cost sampler and the guest lock, out of a working directory on the lab host and into roomler-ai-deploy's `vmtest/lab` (`lifecycle/run.sh` + `body.sh`, `verdict.py`, `said.py`, `timeline.py`, `dims.py`; `measure/idle-cost.sh`; `guest-lock.sh`; roomler-ai-deploy#30); their viewer specs into `ui/e2e`, each aborting `purestat.ai` (as `vmtest-remote.spec.ts` now does too); the runbook in `docs/vmtest.md` | — | ✅ lab: the ported oracle, run from a clean checkout of its branch, passed a lock and an unlock on 0.4.135 (the notice 1.6 s after the lock, the desktop 2.4 s after the unlock), sharing its lock directory with the old copy | S |
 | ↳ P9c | `README.Debian`: what a stock Wayland install does, and the two system keys | — | owed | S |
 
 Each phase ships in an agent release (next `0.4.125`; the `ship-it` skill owns the mechanics) and is
@@ -825,7 +825,8 @@ New cells run three times before they are trusted. An entry in `expected-failure
 - [ ] **AC14** — Docs: `docs/wayland.md`, `docs/linux-capture.md` refreshed with anchors re-verified, the lab
   runbook, and the `docs/README.md` index row.
   ⏳ `docs/wayland.md`, its index row and node, and the `linux-capture.md` row (P9a); `linux-capture.md`'s anchors
-  re-verified by name with each phase through P5g. Owed: the lab runbook (P9b) and `README.Debian` (P9c).
+  re-verified by name with each phase through P5g. The lab runbook: `docs/vmtest.md` §*The Wayland lab*, and the
+  tooling it documents in roomler-ai-deploy's `vmtest/lab` (P9b). Owed: `README.Debian` (P9c).
 
 ## 8. Open decisions (operator)
 
