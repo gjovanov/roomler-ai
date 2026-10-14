@@ -75,6 +75,12 @@ pub struct EnrollmentClaims {
     pub iss: String,
     pub token_type: TokenType,
     pub jti: String, // unique id — caller may persist for single-use checks
+    /// FR-104 — the admin minted this token to also ANCHOR the device it
+    /// enrolls: `POST /api/agent/anchor` accepts it a second time, for that
+    /// one device, once. Absent from every older token (and from every token
+    /// minted without it), which parses as `false`: one use, as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub anchor: bool,
 }
 
 /// Claims carried by a remote-control agent token (aud = agent).
@@ -407,6 +413,18 @@ impl AuthService {
         tenant_id: ObjectId,
         ttl_secs: u64,
     ) -> Result<(String, String), AuthError> {
+        self.issue_enrollment_token_with(admin_user_id, tenant_id, ttl_secs, false)
+    }
+
+    /// [`Self::issue_enrollment_token`], with FR-104's `anchor` claim: the
+    /// token may also anchor the device it enrolls ([`EnrollmentClaims::anchor`]).
+    pub fn issue_enrollment_token_with(
+        &self,
+        admin_user_id: ObjectId,
+        tenant_id: ObjectId,
+        ttl_secs: u64,
+        anchor: bool,
+    ) -> Result<(String, String), AuthError> {
         let now = Utc::now();
         let jti = uuid_v4_hex();
         let claims = EnrollmentClaims {
@@ -417,6 +435,7 @@ impl AuthService {
             iss: self.jwt_settings.issuer.clone(),
             token_type: TokenType::Enrollment,
             jti: jti.clone(),
+            anchor,
         };
         let token = encode(&self.header(), &claims, &self.signing.encoding)
             .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
@@ -452,6 +471,8 @@ impl AuthService {
             iss: self.jwt_settings.issuer.clone(),
             token_type: TokenType::EphemeralEnrollment,
             jti: jti.to_string(),
+            // A reusable key never anchors: anchoring is a deliberate act.
+            anchor: false,
         };
         encode(&self.header(), &claims, &self.signing.encoding)
             .map_err(|e| AuthError::InvalidToken(e.to_string()))
@@ -792,6 +813,32 @@ mod tests {
     /// stand in for each other, in either direction, and no other verifier
     /// accepts the service credential. On an attended install the agent token
     /// sits in the user's writable config, so a crossing either way would let
+    /// FR-104 — the `anchor` claim is carried only when asked for, and a
+    /// token without it (every older one) reads as `false`.
+    #[test]
+    fn an_enrollment_token_carries_anchor_only_when_asked() {
+        use base64::Engine as _;
+        let s = svc();
+        let (admin, tenant) = (ObjectId::new(), ObjectId::new());
+
+        let (anchoring, jti) = s
+            .issue_enrollment_token_with(admin, tenant, 600, true)
+            .unwrap();
+        let claims = s.verify_enrollment_token(&anchoring).unwrap();
+        assert!(claims.anchor);
+        assert_eq!(claims.jti, jti);
+
+        let (plain, _) = s.issue_enrollment_token(admin, tenant, 600).unwrap();
+        assert!(!s.verify_enrollment_token(&plain).unwrap().anchor);
+        // Not even written into a plain token's payload: byte-for-byte the
+        // tokens minted before FR-104.
+        let payload = plain.split('.').nth(1).unwrap();
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .unwrap();
+        assert!(!String::from_utf8(json).unwrap().contains("anchor"));
+    }
+
     /// that user tell SYSTEM what to run.
     #[test]
     fn agent_service_token_audiences() {

@@ -169,9 +169,20 @@ pub async fn anchor(
         )));
     }
 
+    // FR-104 — a token minted with `anchor: true` that ENROLLED this very
+    // device may anchor it too: a second use, under its own key, so it
+    // happens once. Any other token, and this one for any other device, is
+    // the single use it always was (its enrollment already spent it).
+    let second_use =
+        claims.anchor && agent.enrolled_with_jti.as_deref() == Some(claims.jti.as_str());
+    let use_key = if second_use {
+        format!("{}:anchor", claims.jti)
+    } else {
+        claims.jti.clone()
+    };
     state
         .used_tokens
-        .claim(&claims.jti, "agent-anchor")
+        .claim(&use_key, "agent-anchor")
         .await
         .map_err(|e| match e {
             roomler_ai_services::dao::base::DaoError::Validation(_) => {
@@ -203,6 +214,7 @@ pub async fn anchor(
         .map_err(|e| ApiError::Internal(format!("anchor record: {e}")))?;
     info!(
         agent = %agent_id, tenant = %tid, admin = %admin_uid,
+        with_enrolling_token = second_use,
         "fleet-rpc: device anchored for SYSTEM exec"
     );
     Ok(Json(AnchorResponse {

@@ -1543,6 +1543,13 @@ pub struct Agent {
     /// any. Only routes while it names the CURRENT `exec_anchor`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_service: Option<SshServiceEndpoint>,
+    /// FR-104 — the `jti` of the enrollment token that last enrolled or
+    /// revived this row. A token minted with `anchor: true` may also anchor
+    /// the device it enrolled, once: this is how the anchor route knows which
+    /// device that is. An id, never the token. `None` on every row enrolled
+    /// before FR-104, and on an ephemeral one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrolled_with_jti: Option<String>,
     /// Roomler-SSH policy for this device (gate 3). Same shape and the same
     /// closed default as [`Self::exec_policy`] — every pre-feature row
     /// deserialises to [`SshMode::Off`].
