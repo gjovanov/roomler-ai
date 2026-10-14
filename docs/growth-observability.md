@@ -277,9 +277,13 @@ flowchart LR
   collection fills the sources' 730-day horizon once. Nothing here is unbounded.
 - Fields: `rc_sessions`, `rc_session_minutes`, `rc_controllers`, `calls`,
   `call_participant_minutes`, `tunnel_flows`, `ssh_sessions`, `exec_runs`, `devices_online`,
-  `members_active`, `value` (bool) and `value_kinds`. **Deleted with the org** by
-  `roomler_core::growth::purge_tenant` (which also takes the `growth_daily` rows whose `dims`
-  carry the tenant) — aggregates may outlive rows, rows never outlive their owner.
+  `members_active`, `value` (bool) and `value_kinds`. `roomler_core::growth::purge_tenant` is
+  the one call an org deletion must make to take these rows (and the `growth_daily` rows whose
+  `dims` carry the tenant) with it — aggregates may outlive rows, rows never outlive their
+  owner. ⚠️ There is **no org hard-delete path today** (orgs are only archived, and reversibly),
+  so nothing calls it yet and the **25-month TTL** is what bounds the collection for now;
+  `purge_tenant` is the seam a deletion path will call when one lands, and it is deliberately
+  kept out of the archive cascade (an archived org keeps everything it knows for `unarchive`).
 
 ### Cohorts and the org views
 

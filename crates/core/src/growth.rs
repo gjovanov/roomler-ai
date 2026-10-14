@@ -133,10 +133,15 @@ impl ExclusionSet {
 /// P2 — everything the growth collections hold about one org, removed:
 /// its `growth_org_daily` rows and the `growth_daily` rows whose dims carry
 /// it (spec principle 7: aggregates may outlive rows; rows never outlive
-/// their owner). This is the ONE call a tenant deletion makes for growth;
-/// it is idempotent, and it is deliberately NOT part of the archive cascade
-/// — an archived org keeps everything it knows so that `unarchive` restores
-/// a working org, and its activity history is part of that.
+/// their owner). This is the ONE call an org deletion must make for growth.
+///
+/// ⚠️ There is no org hard-delete path today — orgs are only archived, and
+/// reversibly (`crates/api/src/routes/tenant.rs`), so nothing in production
+/// calls this yet and the 25-month TTL is what bounds the collection. It is
+/// deliberately NOT wired into the archive cascade: an archived org keeps
+/// everything it knows so that `unarchive` restores a working org, and its
+/// activity history is part of that. When a real deletion path lands, it
+/// calls this.
 pub async fn purge_tenant(
     core: &Core,
     tenant_id: ObjectId,
