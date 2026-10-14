@@ -790,6 +790,23 @@
         {{ asSentence(rc.inputReach.value.reason) }}
       </v-alert>
 
+      <!-- FR-101 P4b-2b — the device's idle limit is about to end this session
+           (`rc:idle`): no input from here and no change on its screen for a
+           while. Any input sent from here withdraws it at once; the device
+           withdraws it too when its screen comes alive. -->
+      <v-alert
+        v-if="idleLeft !== null && rc.phase.value === 'connected'"
+        type="warning"
+        variant="tonal"
+        density="comfortable"
+        class="ma-4"
+        data-testid="rc-idle-warning"
+      >
+        <strong>No activity for a while.</strong>
+        This session ends in {{ idleLeft }} s. Move the mouse or press a key over the remote
+        screen to keep it.
+      </v-alert>
+
       <div v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed'" class="empty-state">
         <!-- FR-27 P10 - the person at the device ended the session. Said in
              so many words, and the viewer stays put: reconnecting from here is
@@ -1980,6 +1997,7 @@ import {
   codecLabelFromDecoderConfig,
   captureArmLabel,
   mediaWaitingCopy,
+  idleSecondsLeft,
 } from '@/composables/useRemoteControl'
 import {
   PICKER_CHROMAS,
@@ -3963,6 +3981,30 @@ const mediaWaitingEnds = computed(() => {
   const w = rc.mediaWaiting.value
   return w ? new Date(w.deadlineMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''
 })
+// FR-101 P4b-2b — the device's idle countdown. Unlike the overlay above, a
+// warning of a minute at most reads as seconds, so it gets a ticker, running
+// only while a warning stands.
+const idleNowMs = ref(Date.now())
+let idleTicker: ReturnType<typeof setInterval> | null = null
+watch(
+  () => rc.idleEndsAt.value,
+  (at) => {
+    if (at !== null && idleTicker === null) {
+      idleNowMs.value = Date.now()
+      idleTicker = setInterval(() => {
+        idleNowMs.value = Date.now()
+      }, 500)
+    } else if (at === null && idleTicker !== null) {
+      clearInterval(idleTicker)
+      idleTicker = null
+    }
+  },
+  { immediate: true },
+)
+onBeforeUnmount(() => {
+  if (idleTicker !== null) clearInterval(idleTicker)
+})
+const idleLeft = computed(() => idleSecondsLeft(rc.idleEndsAt.value, idleNowMs.value))
 // S3 — human wording for the sub-connected health states.
 const degradedLabel = computed(() => {
   // FR-80 — when the host has told us it cannot capture, say THAT instead of

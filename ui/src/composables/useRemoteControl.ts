@@ -624,6 +624,16 @@ export function friendlyEndReason(reason: unknown, limit?: unknown): string | nu
   }
 }
 
+/**
+ * FR-101 P4b-2b — whole seconds left on the device's idle countdown, rounded
+ * up so the banner never reads 0 while the session still stands; never below
+ * zero. `null` when no warning stands. Pure so the rounding is testable.
+ */
+export function idleSecondsLeft(endsAt: number | null, nowMs: number): number | null {
+  if (endsAt === null) return null
+  return Math.max(0, Math.ceil((endsAt - nowMs) / 1000))
+}
+
 /** Degraded classification Ã¢ÂÂ pure so the priority order is testable. */
 export function classifyDegraded(inp: {
   pcState: string | null
@@ -1163,6 +1173,9 @@ export type RcControlInbound =
   | { kind: 'media_unavailable'; reason: RcMediaUnavailable }
   | { kind: 'media_waiting'; for: string; waitsMs: number; hint: string }
   | { kind: 'input_reach'; reach: RcInputReach }
+  /** FR-101 P4b-2b — the device's idle limit: the session ends in `endsInMs`
+   *  unless someone acts; `null` withdraws the warning. */
+  | { kind: 'idle'; endsInMs: number | null }
   | { kind: 'control_state'; state: RcControlState }
   | { kind: 'logs_fetch_reply'; reply: RcLogsFetchReply }
   | { kind: 'logs_fetch_start'; id: string | null; path?: string; totalLines?: number; truncated?: boolean }
@@ -1273,6 +1286,18 @@ export function parseControlInbound(data: unknown): RcControlInbound {
       waitsMs: obj.waits_ms,
       hint: typeof obj.hint === 'string' ? obj.hint : '',
     }
+  }
+  // FR-101 P4b-2b — the device's idle limit is about to end the session:
+  // `ends_in_ms` is a duration, turned into a deadline by the caller at
+  // receipt on this browser's clock (as `rc:media-waiting` is). `null`
+  // withdraws the warning: there was activity. Anything else is no message.
+  if (obj.t === 'rc:idle') {
+    const ms = obj.ends_in_ms
+    if (ms === null) return { kind: 'idle', endsInMs: null }
+    if (typeof ms === 'number' && Number.isFinite(ms) && ms >= 0) {
+      return { kind: 'idle', endsInMs: ms }
+    }
+    return null
   }
   // FR-93 P1 — the session's input will not reach the whole desktop. An
   // unknown `reach` is kept, like an unknown FR-80 code: its reason still reads.
@@ -4435,6 +4460,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   /** FR-93 P1 — set when the agent says this session's input will not reach
    *  the whole desktop; cleared on every new connect, like `mediaUnavailable`. */
   const inputReach = ref<RcInputReach | null>(null)
+  /** FR-101 P4b-2b — when the device's idle limit will end this session, on
+   *  this browser's clock (`rc:idle`), or `null` with no warning standing.
+   *  Cleared by the device's own withdrawal, by any input sent from here, and
+   *  on every new connect. */
+  const idleEndsAt = ref<number | null>(null)
   /** FR-93 P2d-2 — set while the agent says its capture waits for the person
    *  at the screen. Cleared by the first frame, by `rc:media-unavailable` (the
    *  wait ended without an answer, and that message says why), and on every
@@ -5751,6 +5781,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     if (!inputGranted.value) return
     const ch = channels.input
     if (!ch || ch.readyState !== 'open') return
+    // FR-101 P4b-2b — this input is activity: the device withdraws its idle
+    // warning on its next look, and the countdown goes now, not seconds later.
+    if (idleEndsAt.value !== null) idleEndsAt.value = null
     try {
       ch.send(JSON.stringify(msg))
     } catch {
@@ -7936,6 +7969,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     mediaUnavailable.value = null
     mediaWaiting.value = null
     inputReach.value = null
+    idleEndsAt.value = null
     dcDecoderCodec.value = null
     remoteLayout.value = null
     localClipboardBridge.value = null
@@ -9077,6 +9111,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         deadAirStreak.value = 0
         reconnectAttempt.value = 0
         notice.value = null
+      } else if (parsed?.kind === 'idle') {
+        // FR-101 P4b-2b — the device's idle limit: a countdown on this
+        // browser's clock, or its withdrawal (there was activity).
+        idleEndsAt.value = parsed.endsInMs === null ? null : Date.now() + parsed.endsInMs
       } else if (parsed?.kind === 'input_reach') {
         // FR-93 P1 — the mouse and keyboard will not reach the whole desktop.
         // Said on screen, because the alternative was input that went nowhere
@@ -11603,6 +11641,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     mediaUnavailable,
     mediaWaiting,
     inputReach,
+    // FR-101 P4b-2b — the device's idle countdown (epoch ms, or null).
+    idleEndsAt,
     dcDecoderCodec,
     // P6 — multi-user: arbiter state, ghost cursors, floor control.
     controlState,
