@@ -214,6 +214,12 @@ pub struct SessionParams {
     /// reads as the default — off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rc_overlay: Option<crate::rc_overlay::RcOverlay>,
+    /// FR-101 P4b-2 — the session's idle limit in seconds (`Request.idle_secs`).
+    /// The worker keeps it: it owns the peer, the input and the screen the
+    /// limit is measured on. `None` (no limit, or a daemon older than the
+    /// field) never ends a session as idle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u32>,
 }
 
 /// FR-85 P1e-mac — what a delegated session's `record` channel needs, carried
@@ -1736,6 +1742,7 @@ mod routing_tests {
         assert!(delegable_outbound(&ClientMsg::Terminate {
             session_id: oid(),
             reason: EndReason::HostDisconnect,
+            limit: None,
         }));
 
         // Consent is the interesting refusal: FR-27 put the decision in the
@@ -1755,6 +1762,7 @@ mod routing_tests {
         let k = msg_kind(&ClientMsg::Terminate {
             session_id: oid(),
             reason: EndReason::AgentHangup,
+            limit: None,
         });
         assert!(!k.is_empty() && k != "?", "got {k}");
     }
@@ -1870,6 +1878,7 @@ mod params_tests {
             asking_org: None,
             record: None,
             rc_overlay: None,
+            idle_secs: None,
         };
         let wire = serde_json::to_string(&DelegateFrame::SessionParams(Box::new(params)))
             .expect("serialises");
@@ -1909,6 +1918,7 @@ mod params_tests {
             asking_org: None,
             record: None,
             rc_overlay: None,
+            idle_secs: None,
         };
         let track = serde_json::to_string(&p).unwrap();
         p.transport = Some("data-channel-h264".into());
@@ -1933,6 +1943,7 @@ mod params_tests {
             asking_org: None,
             record: None,
             rc_overlay: None,
+            idle_secs: None,
         }
     }
 
@@ -2071,6 +2082,7 @@ mod params_tests {
             !host.records_session_of(&ClientMsg::Terminate {
                 session_id: recorded,
                 reason: roomler_ai_remote_control::models::EndReason::AgentHangup,
+                limit: None,
             }),
             "only RecordingActivity rides this admission"
         );
@@ -2193,6 +2205,7 @@ mod params_tests {
         host.relay_upstream(ClientMsg::Terminate {
             session_id: recorded,
             reason: roomler_ai_remote_control::models::EndReason::AgentHangup,
+            limit: None,
         });
         assert!(
             matches!(ws_rx.try_recv(), Ok(ClientMsg::Terminate { .. })),
