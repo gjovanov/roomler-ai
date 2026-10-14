@@ -774,6 +774,26 @@ pub enum RpcCap {
     /// worker runs an SSH server", which on an attended install is the
     /// signed-in user. Equality-matched, locked by test.
     SshSystem,
+    /// FR-99 — the device serves privacy mode: it understands the `PRIVACY`
+    /// permission, can cover the local screen with a curtain the capture
+    /// does not see, and its owner allowed it (`privacy_mode_allowed`,
+    /// device-owned, default off, never pushable). Advertised only then, like
+    /// [`Self::HiveAdopt`].
+    ///
+    /// ⚠️ The hub sends `PRIVACY` ONLY to a connection advertising this. The
+    /// `rc:*` wire carries `Permissions` as names, and an agent that does not
+    /// know a name fails the WHOLE `rc:request` — so a stray `PRIVACY` would
+    /// not merely be ignored, it would break the session.
+    PrivacyMode,
+    /// FR-99 — a curtain is possible on this host, whether or not its owner
+    /// allows it. Capability, never permission: it lets the hub tell "the
+    /// owner has not switched privacy mode on" (`device_not_opted_in`) from
+    /// "this device cannot do it at all", so a viewer explains the first and
+    /// offers nothing for the second — FR-85's `available` lesson.
+    ///
+    /// ⚠️ It never earns a `PRIVACY` grant: an agent advertising it alone
+    /// knows the name but must not be asked to serve it.
+    PrivacyAvailable,
 }
 
 impl RpcCap {
@@ -808,11 +828,13 @@ impl RpcCap {
             Self::HiveManage => "hive-manage",
             Self::ExecSystem => "exec-system",
             Self::SshSystem => "ssh-system",
+            Self::PrivacyMode => "privacy-mode",
+            Self::PrivacyAvailable => "privacy-available",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 23] = [
+    pub const ALL: [RpcCap; 25] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -836,6 +858,8 @@ impl RpcCap {
         Self::HiveManage,
         Self::ExecSystem,
         Self::SshSystem,
+        Self::PrivacyMode,
+        Self::PrivacyAvailable,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -4152,6 +4176,13 @@ pub enum AuditKind {
         /// still read the row mid-rollout.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         record_stripped: Option<String>,
+        /// FR-99 — why `PRIVACY` was stripped from the requested grant
+        /// (`device_cannot_curtain` / `break_glass` / `device_not_opted_in`);
+        /// `None` = not requested, or granted. The server's decision, beside
+        /// `record_stripped` and for the same reason a field: an older pod
+        /// reads the row mid-rollout.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        privacy_stripped: Option<String>,
     },
     ConsentPrompted,
     ConsentGranted,
@@ -5230,6 +5261,39 @@ mod tests {
         assert_eq!(RpcCap::HiveTeleport.wire(), "hive-teleport");
         assert_eq!(RpcCap::HiveFork.wire(), "hive-fork");
         assert_eq!(RpcCap::HiveManage.wire(), "hive-manage");
+        assert_eq!(RpcCap::PrivacyMode.wire(), "privacy-mode");
+        assert_eq!(RpcCap::PrivacyAvailable.wire(), "privacy-available");
+    }
+
+    /// FR-99 — the two privacy words are different promises, and neither is
+    /// a prefix of the other. `privacy-available` says a curtain is POSSIBLE;
+    /// only `privacy-mode` says the owner allowed it. A matcher that read
+    /// either word as both would hand `PRIVACY` to a device whose owner said
+    /// no — and a word from a newer agent must stay ignored.
+    #[test]
+    fn privacy_available_does_not_imply_privacy_mode() {
+        let possible = AgentCaps {
+            rpc: vec!["privacy-available".into()],
+            ..Default::default()
+        };
+        assert!(possible.has_rpc(RpcCap::PrivacyAvailable));
+        assert!(!possible.has_rpc(RpcCap::PrivacyMode));
+        let serving = AgentCaps {
+            rpc: vec!["privacy-mode".into()],
+            ..Default::default()
+        };
+        assert!(serving.has_rpc(RpcCap::PrivacyMode));
+        assert!(!serving.has_rpc(RpcCap::PrivacyAvailable));
+        let near_misses = AgentCaps {
+            rpc: vec![
+                "privacy".into(),
+                "privacy-mode-2".into(),
+                "Privacy-Mode".into(),
+            ],
+            ..Default::default()
+        };
+        assert!(!near_misses.has_rpc(RpcCap::PrivacyMode));
+        assert!(!near_misses.has_rpc(RpcCap::PrivacyAvailable));
     }
 
     /// Every prefix relationship between verbs is a KNOWN one.
@@ -6593,6 +6657,15 @@ mod tests {
                 controller_name: "op".into(),
                 permissions: Permissions::default(),
                 record_stripped: None,
+                privacy_stripped: None,
+            },
+            // FR-99 — the new bit takes the same raw path.
+            AuditKind::SessionRequested {
+                controller_user_id: ObjectId::new(),
+                controller_name: "op".into(),
+                permissions: Permissions::VIEW | Permissions::INPUT | Permissions::PRIVACY,
+                record_stripped: Some("device_not_opted_in".into()),
+                privacy_stripped: None,
             },
             AuditKind::PermissionsChanged {
                 permissions: Permissions::VIEW,

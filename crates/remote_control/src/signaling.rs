@@ -2174,6 +2174,15 @@ pub enum ServerMsg {
         /// just hiding a button. Additive: absent = not requested, or granted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         record_refused: Option<String>,
+        /// FR-99 — why `PRIVACY` was taken out of the requested grant, when
+        /// it was: `device_cannot_curtain` (no curtain is possible on the
+        /// device — the viewer offers no privacy control), `break_glass` (a
+        /// break-glass session never covers the screen of the person it
+        /// skipped asking) or `device_not_opted_in` (the device's owner has
+        /// not allowed privacy mode). Additive: absent = not requested, or
+        /// granted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        privacy_refused: Option<String>,
     },
 
     /// Sent to the agent when a controller asks for control. The agent prompts
@@ -5909,6 +5918,7 @@ mod tests {
             agent_id,
             permissions: None,
             record_refused: None,
+            privacy_refused: None,
         };
         let s = serde_json::to_string(&created).unwrap();
         assert!(

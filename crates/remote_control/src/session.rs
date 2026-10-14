@@ -93,6 +93,11 @@ pub struct LiveSession {
     /// session (#1045) is answered with the same reason: the effective grant
     /// it repeats lacks RECORD, and a bare `None` would read as "never asked".
     pub record_refused: Option<&'static str>,
+
+    /// FR-99 — why `Permissions::PRIVACY` was stripped from this grant
+    /// (`device_cannot_curtain`, `break_glass`, `device_not_opted_in`). Kept
+    /// for a coalesced duplicate request, exactly as [`Self::record_refused`].
+    pub privacy_refused: Option<&'static str>,
 }
 
 impl LiveSession {
@@ -127,6 +132,7 @@ impl LiveSession {
             offer_seen: false,
             pending_request: None,
             record_refused: None,
+            privacy_refused: None,
         };
         (s, waiter)
     }
