@@ -173,6 +173,9 @@ pub async fn handle_agent_socket(
     // `hive` is its prefix too: a build before it would start the
     // conversation afresh.
     let makes_hive_managed = caps.has_rpc(RpcCap::HiveManage);
+    // FR-90 P2g-2 — and purges a session on `rc:hive.purge`. `hive` is its
+    // prefix too: a build before it does not know the frame.
+    let purges_hive = caps.has_rpc(RpcCap::HivePurge);
     // FR-92 — it parses the org's keep-busy policy. Equality, never a prefix.
     let supports_keep_busy = advertises_keep_busy(&caps);
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
@@ -237,6 +240,9 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_hive_manage_support(agent_id, makes_hive_managed);
+    state
+        .rc_hub
+        .set_agent_hive_purge_support(agent_id, purges_hive);
     let pump_socket_tx = socket_tx.clone();
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
 

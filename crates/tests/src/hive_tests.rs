@@ -10783,3 +10783,736 @@ async fn each_moved_start_names_every_folder_the_session_ran_in_before() {
         "the move undone left no earlier place"
     );
 }
+
+// ─── P2g-2 — a purge, the server's half ─────────────────────────────────────
+
+/// What a build that purges advertises, holding copies.
+const PURGES: &[&str] = &[
+    "exec",
+    "hive",
+    "hive-replica",
+    "hive-stream",
+    "hive-lease",
+    "hive-purge",
+];
+/// A build before P2g-1: it holds copies, and does not know a purge.
+const KEEPS: &[&str] = &["exec", "hive", "hive-replica", "hive-stream", "hive-lease"];
+
+/// A session running on `a` (which purges), whose members took their copies.
+struct Purgeable {
+    tid: String,
+    admin: String,
+    admin_id: String,
+    sid: String,
+    a: Device,
+    members: Vec<Device>,
+    seeded: SeededTenant,
+}
+
+/// [`Purgeable`], with a member per entry of `member_caps`, each advertising
+/// those caps.
+async fn purgeable(app: &TestApp, tag: &str, member_caps: &[&[&str]]) -> Purgeable {
+    let seeded = app.seed_tenant(tag).await;
+    on_pro(app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let min = 1 + u32::try_from(member_caps.len()).unwrap();
+    let (code, p) = put_policy(app, &tid, &admin, &policy_min(min, 0)).await;
+    assert_eq!(code, 200, "{p}");
+    let mut a = device(app, &seeded, &format!("mach-{tag}-a"), PURGES).await;
+    let mut members = Vec::new();
+    for (i, caps) in member_caps.iter().enumerate() {
+        members.push(device(app, &seeded, &format!("mach-{tag}-m{i}"), caps).await);
+    }
+    let (s, frame) = started_frame(app, &tid, &admin, &mut a, &format!("/srv/{tag}")).await;
+    // Absent when false, as every start before P2c-3a.
+    assert_eq!(
+        frame["replicated"].as_bool().unwrap_or(false),
+        !members.is_empty(),
+        "{frame}"
+    );
+    let sid = s["id"].as_str().unwrap().to_string();
+    for m in &mut members {
+        read_until(&mut m.ws, "rc:hive.replica.join")
+            .await
+            .expect("the member's join");
+        send(
+            &mut m.ws,
+            json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1}),
+        )
+        .await;
+        let id = m.agent_id.clone();
+        wait_member(app, &tid, &admin, &sid, &id, "joined", |m| {
+            m["state"] == "joined"
+        })
+        .await;
+    }
+    Purgeable {
+        tid,
+        admin,
+        admin_id: seeded.admin.id.clone(),
+        sid,
+        a,
+        members,
+        seeded,
+    }
+}
+
+/// `DELETE …/hive/session/{sid}` as `token`.
+async fn delete_session(app: &TestApp, tid: &str, token: &str, sid: &str) -> (u16, Value) {
+    let resp = app
+        .auth_delete(&format!("/api/tenant/{tid}/hive/session/{sid}"), token)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// `GET …/hive/session/{sid}/purge` as `token`.
+async fn read_purge(app: &TestApp, tid: &str, token: &str, sid: &str) -> (u16, Value) {
+    let resp = app
+        .auth_get(
+            &format!("/api/tenant/{tid}/hive/session/{sid}/purge"),
+            token,
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// Poll the owner's view of the purge of `sid` until `pred` holds.
+async fn wait_purge(
+    app: &TestApp,
+    tid: &str,
+    token: &str,
+    sid: &str,
+    what: &str,
+    pred: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (code, v) = read_purge(app, tid, token, sid).await;
+        assert_eq!(code, 200, "{v}");
+        if pred(&v) {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "{what}: {v}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The entry of `device` in a purge's view.
+fn entry_of(purge: &Value, device: &str) -> Value {
+    purge["devices"]
+        .as_array()
+        .and_then(|d| d.iter().find(|e| e["device_id"] == device).cloned())
+        .unwrap_or(Value::Null)
+}
+
+/// The stored session, when there is one.
+async fn record_of(app: &TestApp, sid: &str) -> Option<Document> {
+    app.db
+        .collection::<Document>("agent_sessions")
+        .find_one(doc! { "_id": ObjectId::parse_str(sid).unwrap() })
+        .await
+        .unwrap()
+}
+
+/// Poll until the stored session is gone.
+async fn wait_record_gone(app: &TestApp, sid: &str, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while record_of(app, sid).await.is_some() {
+        assert!(Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Answer a purge, as a device.
+async fn purge_ack(ws: &mut AgentWs, purge: &str, sid: &str, store: &str, account: &str) {
+    send(
+        ws,
+        json!({"t": "rc:hive.purge_ack", "purge_id": purge, "session_id": sid,
+               "store": store, "account": account}),
+    )
+    .await;
+}
+
+/// The first `rc:hive.*` frame a device hears.
+async fn first_hive_frame(ws: &mut AgentWs) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(100), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&text)
+                    && v["t"].as_str().is_some_and(|t| t.starts_with("rc:hive."))
+                {
+                    return v;
+                }
+            }
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(_))) | Ok(None) => break,
+        }
+    }
+    panic!("no rc:hive.* frame arrived");
+}
+
+/// The server's `purge` decisions about `sid`, oldest first: (outcome, reason).
+async fn purge_audit(app: &TestApp, sid: &str) -> Vec<(String, Option<String>)> {
+    let mut cur = app
+        .db
+        .collection::<Document>("hive_audit")
+        .find(doc! { "session_id": ObjectId::parse_str(sid).unwrap(), "action": "purge" })
+        .sort(doc! { "at": 1 })
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    while let Some(row) = cur.next().await {
+        let row = row.unwrap();
+        out.push((
+            row.get_str("outcome").unwrap().to_string(),
+            row.get_str("reason").ok().map(str::to_string),
+        ));
+    }
+    out
+}
+
+/// FR-90 P2g-2 — AC11: a purge issued while a member is offline is applied
+/// and acknowledged when that member connects. The primary, online, is told
+/// at once; the session and its room are gone for its owner the moment the
+/// purge is issued; the member, back, hears its purge before anything else;
+/// once both have answered the purge is complete, its tombstone gone, and
+/// asking again answers with that purge.
+#[tokio::test]
+async fn a_purge_issued_while_a_member_is_offline_is_applied_when_it_connects() {
+    let app = replicaset_app().await;
+    let mut p = purgeable(&app, "purge-ac11", &[PURGES]).await;
+    let (tid, admin, sid) = (p.tid.clone(), p.admin.clone(), p.sid.clone());
+    let (_, view) = get_session(&app, &tid, &admin, &sid).await;
+    let room = view["room_id"].as_str().expect("its room").to_string();
+    let mut b = p.members.remove(0);
+    drop(b.ws);
+    wait_offline(&app, &p.seeded, &b.agent_id).await;
+
+    let (code, body) = delete_session(&app, &tid, &admin, &sid).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["outcome"], "purging", "{body}");
+    let purge = body["purge"]["id"].as_str().unwrap().to_string();
+    assert_eq!(body["purge"]["session_id"], sid, "{body}");
+    assert_eq!(entry_of(&body["purge"], &p.a.agent_id)["state"], "pending");
+    assert_eq!(entry_of(&body["purge"], &b.agent_id)["state"], "pending");
+
+    // The primary, online, is told at once.
+    let told = read_until(&mut p.a.ws, "rc:hive.purge")
+        .await
+        .expect("the primary's purge");
+    assert_eq!(told["purge_id"], purge, "{told}");
+    assert_eq!(told["session_id"], sid, "{told}");
+
+    // Gone for its owner at once: the session, its listing, its room.
+    assert_eq!(get_session(&app, &tid, &admin, &sid).await.0, 404);
+    let list: Value = app
+        .auth_get(&format!("/api/tenant/{tid}/hive/session"), &admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == sid),
+        "its listing: {list}"
+    );
+    let (code, _) = room_messages(&app, &tid, &admin, &room).await;
+    assert_eq!(code, 404, "the session's room went with it");
+    let tomb = record_of(&app, &sid).await.expect("the tombstone");
+    assert_eq!(
+        tomb.get_document("purged")
+            .unwrap()
+            .get_object_id("purge_id")
+            .unwrap()
+            .to_hex(),
+        purge,
+        "{tomb}"
+    );
+    assert_eq!(tomb.get_str("status").unwrap(), "ended");
+    assert_eq!(tomb.get_str("end_reason").unwrap(), "purged");
+    assert_eq!(tomb.get_str("title").unwrap(), "", "its name of the work");
+    assert!(!tomb.contains_key("room_id"), "{tomb}");
+
+    // The primary answers: its part is done, and the purge waits on the
+    // member.
+    purge_ack(&mut p.a.ws, &purge, &sid, "done", "done").await;
+    let v = wait_purge(&app, &tid, &admin, &sid, "the primary's part", |v| {
+        entry_of(v, &p.a.agent_id)["state"] == "done"
+    })
+    .await;
+    assert!(v.get("done_at").is_none(), "the member is pending: {v}");
+    assert_eq!(entry_of(&v, &b.agent_id)["state"], "pending", "{v}");
+    assert!(record_of(&app, &sid).await.is_some(), "the tombstone waits");
+    // A replay of the primary's answer lands on nothing: an answer is its
+    // socket's own device's, never the member's still pending.
+    purge_ack(&mut p.a.ws, &purge, &sid, "done", "done").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (_, v) = read_purge(&app, &tid, &admin, &sid).await;
+    assert_eq!(
+        entry_of(&v, &b.agent_id)["state"],
+        "pending",
+        "the primary's replay is not the member's answer: {v}"
+    );
+
+    // The member connects: its purge is the first thing it hears of Hive.
+    b.ws = connect(&app, &b.token, &b.machine, PURGES).await;
+    let first = first_hive_frame(&mut b.ws).await;
+    assert_eq!(first["t"], "rc:hive.purge", "{first}");
+    assert_eq!(first["purge_id"], purge, "{first}");
+    purge_ack(&mut b.ws, &purge, &sid, "done", "not_there").await;
+    let v = wait_purge(&app, &tid, &admin, &sid, "complete", |v| {
+        v["done_at"].is_string()
+    })
+    .await;
+    assert_eq!(entry_of(&v, &b.agent_id)["account"], "not_there", "{v}");
+    wait_record_gone(&app, &sid, "the tombstone goes with the purge's completion").await;
+    assert_eq!(
+        purge_audit(&app, &sid).await,
+        vec![("issued".to_string(), None), ("complete".to_string(), None)]
+    );
+
+    // Asking again answers with that purge.
+    let (code, again) = delete_session(&app, &tid, &admin, &sid).await;
+    assert_eq!(code, 200, "{again}");
+    assert_eq!(
+        (again["outcome"].as_str(), again["purge"]["id"].as_str()),
+        (Some("purged"), Some(purge.as_str())),
+        "{again}"
+    );
+}
+
+/// FR-90 P2g-2 — a part that failed stays pending, in the device's own
+/// words, and the purge is sent again at the device's next connection; once
+/// it answers both parts closed, the purge completes.
+#[tokio::test]
+async fn a_part_that_failed_stays_pending_and_is_sent_again() {
+    let app = replicaset_app().await;
+    let mut p = purgeable(&app, "purge-again", &[]).await;
+    let (tid, admin, sid) = (p.tid.clone(), p.admin.clone(), p.sid.clone());
+    let (code, body) = delete_session(&app, &tid, &admin, &sid).await;
+    assert_eq!(code, 200, "{body}");
+    let purge = body["purge"]["id"].as_str().unwrap().to_string();
+    read_until(&mut p.a.ws, "rc:hive.purge")
+        .await
+        .expect("the device's purge");
+    send(
+        &mut p.a.ws,
+        json!({"t": "rc:hive.purge_ack", "purge_id": purge, "session_id": sid,
+               "store": "done", "account": "failed",
+               "detail": "nobody is signed in\n\u{1b}[2J at the device"}),
+    )
+    .await;
+    let v = wait_purge(&app, &tid, &admin, &sid, "the failed part", |v| {
+        entry_of(v, &p.a.agent_id)["account"] == "failed"
+    })
+    .await;
+    let e = entry_of(&v, &p.a.agent_id);
+    assert_eq!(e["state"], "pending", "{v}");
+    assert_eq!(e["store"], "done", "{v}");
+    assert_eq!(
+        e["detail"], "nobody is signed in  [2J at the device",
+        "the device's words, on one line: {v}"
+    );
+    assert!(v.get("done_at").is_none(), "{v}");
+
+    // Its next connection hears the purge again.
+    drop(p.a.ws);
+    wait_offline(&app, &p.seeded, &p.a.agent_id).await;
+    p.a.ws = connect(&app, &p.a.token, &p.a.machine, PURGES).await;
+    let again = read_until(&mut p.a.ws, "rc:hive.purge")
+        .await
+        .expect("the purge again");
+    assert_eq!(again["purge_id"], purge, "{again}");
+    purge_ack(&mut p.a.ws, &purge, &sid, "not_there", "done").await;
+    wait_purge(&app, &tid, &admin, &sid, "complete", |v| {
+        v["done_at"].is_string()
+    })
+    .await;
+    wait_record_gone(&app, &sid, "the tombstone goes").await;
+}
+
+/// FR-90 P2g-2 — a member of a build before P2g-1 is never sent a frame it
+/// does not know: its part waits, its entry saying why, and its first
+/// connection as a build that purges hears the purge. A removed device can
+/// never be asked: its part is closed at once.
+#[tokio::test]
+async fn a_build_before_purges_waits_and_a_removed_device_is_closed() {
+    let app = replicaset_app().await;
+    let mut p = purgeable(&app, "purge-old", &[KEEPS, PURGES]).await;
+    let (tid, admin, sid) = (p.tid.clone(), p.admin.clone(), p.sid.clone());
+    let gone = p.members.pop().unwrap();
+    let mut old = p.members.pop().unwrap();
+    let resp = app
+        .auth_delete(
+            &format!("/api/tenant/{tid}/agent/{}", gone.agent_id),
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "remove: {:?}", resp.status());
+
+    let (code, body) = delete_session(&app, &tid, &admin, &sid).await;
+    assert_eq!(code, 200, "{body}");
+    let purge = body["purge"]["id"].as_str().unwrap().to_string();
+    let e = entry_of(&body["purge"], &gone.agent_id);
+    assert_eq!(
+        (e["state"].as_str(), e["closed"].as_str()),
+        (Some("closed"), Some("device_removed")),
+        "{body}"
+    );
+    let e = entry_of(&body["purge"], &old.agent_id);
+    assert_eq!(
+        (e["state"].as_str(), e["detail"].as_str()),
+        (Some("pending"), Some("device_unsupported")),
+        "{body}"
+    );
+    assert!(
+        !device_hears(&mut old.ws, "rc:hive.purge", Duration::from_millis(500)).await,
+        "a build that does not know the frame is sent none"
+    );
+    read_until(&mut p.a.ws, "rc:hive.purge")
+        .await
+        .expect("the primary's purge");
+    purge_ack(&mut p.a.ws, &purge, &sid, "done", "done").await;
+    let v = wait_purge(&app, &tid, &admin, &sid, "the primary's part", |v| {
+        entry_of(v, &p.a.agent_id)["state"] == "done"
+    })
+    .await;
+    assert!(v.get("done_at").is_none(), "the old build waits: {v}");
+
+    // It updates: its first connection that purges hears the purge.
+    drop(old.ws);
+    wait_offline(&app, &p.seeded, &old.agent_id).await;
+    old.ws = connect(&app, &old.token, &old.machine, PURGES).await;
+    let told = read_until(&mut old.ws, "rc:hive.purge")
+        .await
+        .expect("the updated build's purge");
+    assert_eq!(told["purge_id"], purge, "{told}");
+    purge_ack(&mut old.ws, &purge, &sid, "done", "done").await;
+    wait_purge(&app, &tid, &admin, &sid, "complete", |v| {
+        v["done_at"].is_string()
+    })
+    .await;
+    wait_record_gone(&app, &sid, "the tombstone goes").await;
+}
+
+/// FR-90 P2g-2 — the purge is its owner's alone, with `HIVE_RUN` (decision
+/// 12), only with the replicaset's switch on, and never while a promotion
+/// moves the session: a move would leave a copy the purge could not name.
+/// Each refusal is a 200 carrying the reason, audited, and changes nothing.
+#[tokio::test]
+async fn a_purge_is_its_owners_with_hive_run_and_never_during_a_move() {
+    // The switch off: the route is not there, for a session of the caller's
+    // own too.
+    let off = hive_app().await;
+    let seeded = off.seed_tenant("purge-off").await;
+    let mut dev = device(&off, &seeded, "mach-purge-off", PURGES).await;
+    let (tid, token) = (seeded.tenant_id.clone(), seeded.admin.access_token.clone());
+    let own = started_session(&off, &tid, &token, &mut dev).await;
+    let (code, _) = delete_session(&off, &tid, &token, &own).await;
+    assert_eq!(code, 404, "the switch is off");
+    assert!(
+        !device_hears(&mut dev.ws, "rc:hive.purge", Duration::from_millis(300)).await,
+        "nothing reached the device"
+    );
+    assert_eq!(get_session(&off, &tid, &token, &own).await.0, 200);
+
+    let app = replicaset_app().await;
+    let mut p = purgeable(&app, "purge-gates", &[]).await;
+    let (tid, admin, sid) = (p.tid.clone(), p.admin.clone(), p.sid.clone());
+    // Anyone else: a 404, like a bogus id.
+    let (code, _) = delete_session(&app, &tid, &p.seeded.member.access_token, &sid).await;
+    assert_eq!(code, 404, "another member's purge");
+    assert_eq!(
+        read_purge(&app, &tid, &admin, &sid).await.0,
+        404,
+        "a live session has no purge"
+    );
+
+    // A promotion in flight.
+    let s_oid = ObjectId::parse_str(&sid).unwrap();
+    let now = bson::DateTime::now();
+    let promotion = doc! {
+        "id": ObjectId::new(),
+        "to": ObjectId::new(),
+        "to_name": "venus",
+        "to_role": "owner",
+        "folder": "/srv",
+        "from": { "device_id": ObjectId::parse_str(&p.a.agent_id).unwrap(), "folder": "/srv" },
+        "from_fence": 1_i64,
+        "by": ObjectId::parse_str(&p.admin_id).unwrap(),
+        "state": "preparing",
+        "started_at": now,
+        "deadline": bson::DateTime::from_millis(now.timestamp_millis() + 600_000),
+    };
+    app.db
+        .collection::<Document>("agent_sessions")
+        .update_one(
+            doc! { "_id": s_oid },
+            doc! { "$set": { "promotion": promotion } },
+        )
+        .await
+        .unwrap();
+    let (code, body) = delete_session(&app, &tid, &admin, &sid).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        (body["outcome"].as_str(), body["reason"].as_str()),
+        (Some("refused"), Some("in_progress")),
+        "{body}"
+    );
+    assert!(
+        !device_hears(&mut p.a.ws, "rc:hive.purge", Duration::from_millis(300)).await,
+        "nothing reached the device"
+    );
+    assert!(
+        !record_of(&app, &sid).await.unwrap().contains_key("purged"),
+        "the session is untouched"
+    );
+
+    // A plain member's own session: no HIVE_RUN.
+    let member = ObjectId::parse_str(&p.seeded.member.id).unwrap();
+    let mine = ObjectId::new();
+    app.db
+        .collection::<Document>("agent_sessions")
+        .insert_one(doc! {
+            "_id": mine,
+            "tenant_id": ObjectId::parse_str(&tid).unwrap(),
+            "owner_id": member,
+            "title": "mine",
+            "harness": { "id": "claude-code", "session": "u" },
+            "location": { "device_id": ObjectId::parse_str(&p.a.agent_id).unwrap(), "folder": "/srv" },
+            "status": "ended",
+            "fence": 1_i64,
+            "created_at": now,
+            "updated_at": now,
+        })
+        .await
+        .unwrap();
+    let (code, body) =
+        delete_session(&app, &tid, &p.seeded.member.access_token, &mine.to_hex()).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        (body["outcome"].as_str(), body["reason"].as_str()),
+        (Some("refused"), Some("no_permission")),
+        "{body}"
+    );
+    assert!(
+        !record_of(&app, &mine.to_hex())
+            .await
+            .unwrap()
+            .contains_key("purged"),
+        "the session is untouched"
+    );
+    assert_eq!(
+        purge_audit(&app, &sid).await,
+        vec![("refused".to_string(), Some("in_progress".to_string()))]
+    );
+    assert_eq!(
+        purge_audit(&app, &mine.to_hex()).await,
+        vec![("refused".to_string(), Some("no_permission".to_string()))]
+    );
+}
+
+/// FR-90 P2g-2 — a purged session is read by nobody, its owner included:
+/// not its view, not its participants, not a fork of it; the purge is its
+/// owner's to read, and asking again answers with it.
+#[tokio::test]
+async fn a_purged_session_is_read_by_nobody() {
+    let app = replicaset_app().await;
+    let mut p = purgeable(&app, "purge-unread", &[]).await;
+    let (tid, admin, sid) = (p.tid.clone(), p.admin.clone(), p.sid.clone());
+    let member = p.seeded.member.access_token.clone();
+    let resp = app
+        .auth_put(
+            &format!(
+                "/api/tenant/{tid}/hive/session/{sid}/participant/{}",
+                p.seeded.member.id
+            ),
+            &admin,
+        )
+        .json(&json!({ "role": "reader" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "reader: {:?}", resp.status());
+    assert_eq!(get_session(&app, &tid, &member, &sid).await.0, 200);
+
+    let (code, body) = delete_session(&app, &tid, &admin, &sid).await;
+    assert_eq!(code, 200, "{body}");
+    let purge = body["purge"]["id"].as_str().unwrap().to_string();
+    read_until(&mut p.a.ws, "rc:hive.purge")
+        .await
+        .expect("the device's purge");
+    for (who, token) in [("its owner", &admin), ("its reader", &member)] {
+        assert_eq!(get_session(&app, &tid, token, &sid).await.0, 404, "{who}");
+        let resp = app
+            .auth_get(
+                &format!("/api/tenant/{tid}/hive/session/{sid}/participant"),
+                token,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 404, "{who}: its participants");
+    }
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{tid}/hive/session/{sid}/fork"),
+            &admin,
+        )
+        .json(&json!({ "device_id": p.a.agent_id, "folder": "/srv/elsewhere" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404, "a fork of it");
+    // Nor a viewer's grant, to its owner either: it would stream from a
+    // device the purge has not reached yet.
+    let mut ws = user_ws(&app, &admin).await;
+    user_send(&mut ws, "hive:view.open", json!({"session_id": sid})).await;
+    let refused = user_read(&mut ws, "hive:view.refused")
+        .await
+        .expect("the view refused");
+    assert_eq!(refused["reason"], "not_found", "{refused}");
+
+    // The purge is its owner's to read; a reader asking hears nothing.
+    let (code, v) = read_purge(&app, &tid, &admin, &sid).await;
+    assert_eq!((code, v["id"].as_str()), (200, Some(purge.as_str())), "{v}");
+    assert_eq!(read_purge(&app, &tid, &member, &sid).await.0, 404);
+    let (code, again) = delete_session(&app, &tid, &admin, &sid).await;
+    assert_eq!(code, 200, "{again}");
+    assert_eq!(
+        (again["outcome"].as_str(), again["purge"]["id"].as_str()),
+        (Some("purging"), Some(purge.as_str())),
+        "the same purge, not a second one: {again}"
+    );
+    assert_eq!(
+        app.db
+            .collection::<Document>("hive_purges")
+            .count_documents(doc! { "session_id": ObjectId::parse_str(&sid).unwrap() })
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+/// FR-90 P2g-2 — a purge is sent only while its session's tombstone names
+/// it: one whose tombstone never landed (a lost race, a crash between the two
+/// writes) reaches no device, and the session is still its owner's. And the
+/// tombstone itself is made only over the devices its purge reaches: a
+/// record naming another one is no tombstone.
+#[tokio::test]
+async fn a_purge_no_tombstone_names_is_never_sent() {
+    use roomler_ai_mod_hive::{dao::AgentSessionDao, model::PurgedMark};
+
+    let app = replicaset_app().await;
+    let mut p = purgeable(&app, "purge-orphan", &[]).await;
+    let (tid, admin, sid) = (p.tid.clone(), p.admin.clone(), p.sid.clone());
+    let (t, s, a, owner) = (
+        ObjectId::parse_str(&tid).unwrap(),
+        ObjectId::parse_str(&sid).unwrap(),
+        ObjectId::parse_str(&p.a.agent_id).unwrap(),
+        ObjectId::parse_str(&p.admin_id).unwrap(),
+    );
+    let now = bson::DateTime::now();
+    app.db
+        .collection::<Document>("hive_purges")
+        .insert_one(doc! {
+            "_id": ObjectId::new(),
+            "tenant_id": t,
+            "session_id": s,
+            "owner_id": owner,
+            "by": owner,
+            "reason": "owner",
+            "devices": [{ "device_id": a, "state": "pending" }],
+            "at": now,
+        })
+        .await
+        .unwrap();
+    drop(p.a.ws);
+    wait_offline(&app, &p.seeded, &p.a.agent_id).await;
+    p.a.ws = connect(&app, &p.a.token, &p.a.machine, PURGES).await;
+    assert!(
+        !device_hears(&mut p.a.ws, "rc:hive.purge", Duration::from_millis(1500)).await,
+        "a purge no tombstone names reaches no device"
+    );
+    assert_eq!(get_session(&app, &tid, &admin, &sid).await.0, 200);
+
+    let dao = AgentSessionDao::new(&app.db);
+    let mark = PurgedMark {
+        purge_id: ObjectId::new(),
+        by: owner,
+        at: now,
+    };
+    assert!(
+        dao.tombstone(t, owner, s, &mark, &[ObjectId::new()])
+            .await
+            .unwrap()
+            .is_none(),
+        "the record names a device the purge does not reach"
+    );
+    assert!(!record_of(&app, &sid).await.unwrap().contains_key("purged"));
+    // Nor while a promotion is in flight: one begun after the purge read the
+    // record would move the session to a device the purge may not name.
+    let sessions = app.db.collection::<Document>("agent_sessions");
+    let promotion = doc! {
+        "id": ObjectId::new(),
+        "to": a,
+        "to_name": "",
+        "to_role": "owner",
+        "folder": "/srv",
+        "from": { "device_id": a, "folder": "/srv" },
+        "from_fence": 1_i64,
+        "by": owner,
+        "state": "preparing",
+        "started_at": now,
+        "deadline": bson::DateTime::from_millis(now.timestamp_millis() + 600_000),
+    };
+    sessions
+        .update_one(
+            doc! { "_id": s },
+            doc! { "$set": { "promotion": promotion } },
+        )
+        .await
+        .unwrap();
+    assert!(
+        dao.tombstone(t, owner, s, &mark, &[a])
+            .await
+            .unwrap()
+            .is_none(),
+        "a promotion in flight"
+    );
+    sessions
+        .update_one(doc! { "_id": s }, doc! { "$unset": { "promotion": "" } })
+        .await
+        .unwrap();
+    let before = dao
+        .tombstone(t, owner, s, &mark, &[a])
+        .await
+        .unwrap()
+        .expect("over every device it names");
+    assert!(before.purged.is_none(), "the record as it stood before");
+    assert_eq!(
+        record_of(&app, &sid)
+            .await
+            .unwrap()
+            .get_document("purged")
+            .unwrap()
+            .get_object_id("purge_id")
+            .unwrap(),
+        mark.purge_id
+    );
+}

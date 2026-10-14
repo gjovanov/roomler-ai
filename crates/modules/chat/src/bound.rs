@@ -96,6 +96,25 @@ impl BoundChat {
         self.rooms.leave(tenant_id, room_id, user).await
     }
 
+    /// FR-90 P2g-2 — delete a room bound to `module`, with everything chat
+    /// holds in it (its messages, reactions, members and files), as chat's
+    /// own delete does. `Ok(false)` = no such room any more, or one not bound
+    /// to `module`: a module deletes its own rooms and nobody else's.
+    pub async fn delete_bound_room(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        module: &str,
+    ) -> DaoResult<bool> {
+        match self.bound_room(tenant_id, room_id, module).await {
+            Ok(_) => {}
+            Err(DaoError::NotFound) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        self.rooms.cascade_delete(tenant_id, room_id).await?;
+        Ok(true)
+    }
+
     /// FR-90 P1c — who is in `room_id`, as user ids.
     pub async fn member_ids(&self, room_id: ObjectId) -> DaoResult<Vec<ObjectId>> {
         self.rooms.find_member_user_ids(room_id).await

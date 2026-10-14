@@ -144,7 +144,8 @@ pub struct AgentSession {
     /// How it ended (or will end, once `stopping` completes): `stopped`,
     /// `exited`, `member_removed`, `device_removed`, `tenant_archived`,
     /// `never_answered`, `device_unsupported`, `not_on_device` (P1b: its
-    /// device reconnected without it — a restart, or an end it never told).
+    /// device reconnected without it — a restart, or an end it never told),
+    /// `purged` (P2g-2: the record is a purge's tombstone).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_reason: Option<String>,
     /// The device's last few words about it (a refusal's or an exit's), capped.
@@ -213,6 +214,21 @@ pub struct AgentSession {
     /// P2f-5.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_map: Vec<PathMove>,
+    /// FR-90 P2g-2 — the record is a purge's tombstone: its owner deleted
+    /// it, and every read a person makes leaves it out. It stays until every
+    /// device that held the session answered the purge it names, then goes.
+    /// Absent on every other record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purged: Option<PurgedMark>,
+}
+
+/// FR-90 P2g-2 — the purge a tombstoned record is waiting on, who issued it
+/// and when.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PurgedMark {
+    pub purge_id: ObjectId,
+    pub by: ObjectId,
+    pub at: DateTime,
 }
 
 /// FR-90 P2f-4b — the asking to make an adopted session a managed one, as
@@ -870,12 +886,13 @@ pub struct HiveAuditEvent {
     pub session_id: Option<ObjectId>,
     /// `start` | `stop` | `view` | `participant` | `brain` | `policy` (P2c-2a) |
     /// `place` (P2c-2b) | `fork` (P2f-3: its `session_id` the fork, once it is
-    /// made).
+    /// made) | `purge` (P2g-2).
     pub action: String,
     /// `sent` | `queued` | `refused`; for `participant`, the role given —
     /// `driver` | `reader` — or `removed`; for `brain`, `added` | `edited` |
     /// `archived` | `refused`; for `policy`, `set` | `refused`; for `place`,
-    /// `placed`, or `short` with why ([`crate::placement::Short`]).
+    /// `placed`, or `short` with why ([`crate::placement::Short`]); for
+    /// `purge`, `issued` | `refused` | `complete`.
     pub outcome: String,
     /// Why, for `refused` and `short` — the server's own reason word.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -885,6 +902,192 @@ pub struct HiveAuditEvent {
 
 impl HiveAuditEvent {
     pub const COLLECTION: &'static str = "hive_audit";
+}
+
+/// FR-90 P2g-2 — one device's part of a purge.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PurgeEntryState {
+    /// Not answered, or answered with a part that failed: sent again on
+    /// each of the device's connections.
+    Pending,
+    /// Both parts done or not there, in the device's own words.
+    Done,
+    /// Closed by the server with no answer: `reason` says why nothing more
+    /// can, or need, be asked of the device.
+    Closed,
+}
+
+impl PurgeEntryState {
+    /// The spelling in the database and the API. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Done => "done",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+/// FR-90 P2g-2 — why the server closed a device's part of a purge without
+/// asking it.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PurgeClosed {
+    /// The device was removed: its credentials are revoked, so it can never
+    /// be asked. Its disk keeps what it held (spec §3b).
+    DeviceRemoved,
+    /// By its own word it holds nothing: it refused the session's join as
+    /// a secondary organization's enrollment, or because it had purged the
+    /// session already. A secondary connection ignores every Hive frame,
+    /// a purge included, so waiting on it would never end.
+    HoldsNothing,
+}
+
+impl PurgeClosed {
+    /// The spelling in the database and the API. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeviceRemoved => "device_removed",
+            Self::HoldsNothing => "holds_nothing",
+        }
+    }
+}
+
+/// FR-90 P2g-2 — one device a purge reaches, and what it said.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PurgeEntry {
+    pub device_id: ObjectId,
+    pub state: PurgeEntryState,
+    /// Its words for each part, from its last answer
+    /// ([`roomler_ai_remote_control::hive::HivePurgePart::as_str`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Why a part failed, in the device's words, capped; or the server's
+    /// own word for why it could not be sent (`device_unsupported`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<DateTime>,
+    /// For `closed`: why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<PurgeClosed>,
+}
+
+impl PurgeEntry {
+    pub fn pending(device_id: ObjectId) -> Self {
+        Self {
+            device_id,
+            state: PurgeEntryState::Pending,
+            store: None,
+            account: None,
+            detail: None,
+            answered_at: None,
+            closed: None,
+        }
+    }
+
+    pub fn closed(device_id: ObjectId, why: PurgeClosed) -> Self {
+        Self {
+            state: PurgeEntryState::Closed,
+            closed: Some(why),
+            ..Self::pending(device_id)
+        }
+    }
+}
+
+/// FR-90 P2g-2 — a purge (`hive_purges`): the tombstone of a deleted
+/// session, kept until every device that held it has answered (design
+/// §4.4). Ids, words and times only: nothing of what the session was about.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HivePurge {
+    #[serde(rename = "_id")]
+    pub id: ObjectId,
+    pub tenant_id: ObjectId,
+    pub session_id: ObjectId,
+    /// The session's owner: who may read the purge.
+    pub owner_id: ObjectId,
+    /// Who issued it.
+    pub by: ObjectId,
+    /// `owner` (P2g-2); retention and a device's removal or leaving are
+    /// P2g-3's and P2g-4's.
+    pub reason: String,
+    /// The session's room, deleted with the purge; kept so its completion
+    /// can delete it again should that first delete have failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<ObjectId>,
+    pub devices: Vec<PurgeEntry>,
+    pub at: DateTime,
+    /// When the last device's part closed. A completed purge is kept 90
+    /// days, like the audit; one still pending is kept until it completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_at: Option<DateTime>,
+}
+
+impl HivePurge {
+    pub const COLLECTION: &'static str = "hive_purges";
+
+    /// Whether no device's part is still pending.
+    pub fn complete(&self) -> bool {
+        self.devices
+            .iter()
+            .all(|d| d.state != PurgeEntryState::Pending)
+    }
+}
+
+/// [`HivePurge`] as the API answers it: ids as hex, times as RFC 3339.
+#[derive(Serialize, Debug, Clone)]
+pub struct PurgeView {
+    pub id: String,
+    pub session_id: String,
+    pub reason: String,
+    pub at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done_at: Option<String>,
+    pub devices: Vec<PurgeEntryView>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct PurgeEntryView {
+    pub device_id: String,
+    pub state: PurgeEntryState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed: Option<PurgeClosed>,
+}
+
+impl From<&HivePurge> for PurgeView {
+    fn from(p: &HivePurge) -> Self {
+        Self {
+            id: p.id.to_hex(),
+            session_id: p.session_id.to_hex(),
+            reason: p.reason.clone(),
+            at: rfc3339(p.at),
+            done_at: p.done_at.map(rfc3339),
+            devices: p
+                .devices
+                .iter()
+                .map(|d| PurgeEntryView {
+                    device_id: d.device_id.to_hex(),
+                    state: d.state,
+                    store: d.store.clone(),
+                    account: d.account.clone(),
+                    detail: d.detail.clone(),
+                    answered_at: d.answered_at.map(rfc3339),
+                    closed: d.closed,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -987,6 +1190,7 @@ mod tests {
             parent: None,
             from_terminal: None,
             path_map: Vec::new(),
+            purged: None,
         }
     }
 
@@ -1094,6 +1298,7 @@ mod tests {
             parent: None,
             from_terminal: None,
             path_map: Vec::new(),
+            purged: None,
         };
         let v = serde_json::to_value(SessionView::from(&s)).unwrap();
         assert!(v["created_at"].is_string(), "{v}");
@@ -1316,6 +1521,86 @@ mod tests {
         );
         let v = serde_json::to_value(SessionView::from(&s)).unwrap();
         assert_eq!(v["promotion"]["fork"], true, "{v}");
+    }
+
+    /// FR-90 P2g-2 — a purge's words are locked and are what serde stores; a
+    /// record before P2g-2 holds no tombstone and stores none; a purge is
+    /// complete only once no device's part is pending; an entry stores no
+    /// word it does not have; and the view renders times as strings.
+    #[test]
+    fn a_purge_is_complete_only_once_no_devices_part_is_pending() {
+        let states = [
+            PurgeEntryState::Pending,
+            PurgeEntryState::Done,
+            PurgeEntryState::Closed,
+        ];
+        assert_eq!(
+            states.map(PurgeEntryState::as_str),
+            ["pending", "done", "closed"]
+        );
+        for s in states {
+            assert_eq!(
+                bson::to_bson(&s).unwrap(),
+                bson::Bson::String(s.as_str().into())
+            );
+        }
+        let closed = [PurgeClosed::DeviceRemoved, PurgeClosed::HoldsNothing];
+        assert_eq!(
+            closed.map(PurgeClosed::as_str),
+            ["device_removed", "holds_nothing"]
+        );
+        for c in closed {
+            assert_eq!(
+                bson::to_bson(&c).unwrap(),
+                bson::Bson::String(c.as_str().into())
+            );
+        }
+        assert!(
+            !bson::to_document(&bare_session())
+                .unwrap()
+                .contains_key("purged"),
+            "a record that is no tombstone stores none"
+        );
+
+        let (a, b) = (ObjectId::new(), ObjectId::new());
+        let mut p = HivePurge {
+            id: ObjectId::new(),
+            tenant_id: ObjectId::new(),
+            session_id: ObjectId::new(),
+            owner_id: ObjectId::new(),
+            by: ObjectId::new(),
+            reason: "owner".into(),
+            room_id: None,
+            devices: vec![
+                PurgeEntry::pending(a),
+                PurgeEntry::closed(b, PurgeClosed::DeviceRemoved),
+            ],
+            at: DateTime::now(),
+            done_at: None,
+        };
+        assert!(!p.complete(), "a's part is pending");
+        let stored = bson::to_document(&p).unwrap();
+        let first = stored.get_array("devices").unwrap()[0]
+            .as_document()
+            .unwrap()
+            .clone();
+        for word in ["store", "account", "detail", "answered_at", "closed"] {
+            assert!(!first.contains_key(word), "{word}: {first}");
+        }
+        let back: HivePurge = bson::from_document(stored).unwrap();
+        assert_eq!(back.devices, p.devices);
+
+        p.devices[0].state = PurgeEntryState::Done;
+        p.devices[0].store = Some("done".into());
+        p.devices[0].account = Some("not_there".into());
+        assert!(p.complete(), "done and closed: nothing pending");
+        let v = serde_json::to_value(PurgeView::from(&p)).unwrap();
+        assert!(v["at"].is_string(), "{v}");
+        assert!(v.get("done_at").is_none(), "{v}");
+        assert_eq!(v["devices"][0]["state"], "done", "{v}");
+        assert_eq!(v["devices"][0]["account"], "not_there", "{v}");
+        assert_eq!(v["devices"][1]["closed"], "device_removed", "{v}");
+        assert_eq!(v["devices"][1]["device_id"], b.to_hex(), "{v}");
     }
 
     /// FR-90 P2c-3 — the member words are locked, and a member placed before

@@ -18,8 +18,8 @@ use roomler_ai_services::dao::base::{
 
 use crate::model::{
     AgentApproval, AgentSession, FromTerminal, HiveAuditEvent, MemberState, MemberTip, MovedStart,
-    PathMove, Promotion, PromotionState, ReplicaMember, Replicaset, SessionLocation, SessionOrigin,
-    SessionStatus,
+    PathMove, Promotion, PromotionState, PurgedMark, ReplicaMember, Replicaset, SessionLocation,
+    SessionOrigin, SessionStatus,
 };
 use crate::placement::MemberRole;
 
@@ -63,7 +63,8 @@ impl AgentSessionDao {
 
     /// One session, only if `owner_id` started it — anyone else's id is
     /// `NotFound`, the answer a bogus id gets, so a session's existence does
-    /// not leak to other members.
+    /// not leak to other members. P2g-2 — a purge's tombstone is `NotFound`
+    /// too, its owner's included: the session is deleted.
     pub async fn find_owned(
         &self,
         tenant_id: ObjectId,
@@ -71,12 +72,27 @@ impl AgentSessionDao {
         id: ObjectId,
     ) -> DaoResult<AgentSession> {
         self.base
-            .find_one(doc! { "_id": id, "tenant_id": tenant_id, "owner_id": owner_id })
+            .find_one(doc! {
+                "_id": id, "tenant_id": tenant_id, "owner_id": owner_id, "purged": Bson::Null,
+            })
             .await?
             .ok_or(roomler_ai_services::dao::base::DaoError::NotFound)
     }
 
-    /// The caller's own sessions, newest first.
+    /// FR-90 P2g-2 — [`Self::find_owned`], a purge's tombstone included: what
+    /// the purge routes read, to answer a purge already issued.
+    pub async fn find_owned_any(
+        &self,
+        tenant_id: ObjectId,
+        owner_id: ObjectId,
+        id: ObjectId,
+    ) -> DaoResult<Option<AgentSession>> {
+        self.base
+            .find_one(doc! { "_id": id, "tenant_id": tenant_id, "owner_id": owner_id })
+            .await
+    }
+
+    /// The caller's own sessions, newest first. Never a purge's tombstone.
     pub async fn list_owned(
         &self,
         tenant_id: ObjectId,
@@ -85,7 +101,7 @@ impl AgentSessionDao {
     ) -> DaoResult<PaginatedResult<AgentSession>> {
         self.base
             .find_paginated(
-                doc! { "tenant_id": tenant_id, "owner_id": owner_id },
+                doc! { "tenant_id": tenant_id, "owner_id": owner_id, "purged": Bson::Null },
                 Some(doc! { "created_at": -1 }),
                 params,
             )
@@ -98,14 +114,14 @@ impl AgentSessionDao {
 
     /// One session of `tenant_id`, whoever started it — for a route that then
     /// decides who may see it ([`crate::access`]). Another org's id is
-    /// `NotFound`.
+    /// `NotFound`, and so is a purge's tombstone (P2g-2).
     pub async fn find_in_tenant(
         &self,
         tenant_id: ObjectId,
         id: ObjectId,
     ) -> DaoResult<AgentSession> {
         self.base
-            .find_one(doc! { "_id": id, "tenant_id": tenant_id })
+            .find_one(doc! { "_id": id, "tenant_id": tenant_id, "purged": Bson::Null })
             .await?
             .ok_or(DaoError::NotFound)
     }
@@ -122,7 +138,9 @@ impl AgentSessionDao {
         user: ObjectId,
         drives: bool,
     ) -> DaoResult<bool> {
-        let mut filter = doc! { "_id": id, "tenant_id": tenant_id, "owner_id": owner_id };
+        let mut filter = doc! {
+            "_id": id, "tenant_id": tenant_id, "owner_id": owner_id, "purged": Bson::Null,
+        };
         let update = if drives {
             filter.insert(
                 format!("drivers.{}", crate::model::MAX_DRIVERS - 1),
@@ -379,6 +397,9 @@ impl AgentSessionDao {
                     "origin": SessionOrigin::Adopted.as_str(),
                     "status": SessionStatus::Ended.as_str(),
                     "fence": fence,
+                    // P2g-2 — a purge's tombstone is ended too, and is never
+                    // a session again.
+                    "purged": Bson::Null,
                 },
                 doc! {
                     "$set": set,
@@ -1208,7 +1229,7 @@ impl AgentSessionDao {
         let r = bson::to_bson(replicaset)?;
         self.base
             .update_one(
-                doc! { "_id": id, "replicaset": Bson::Null },
+                doc! { "_id": id, "replicaset": Bson::Null, "purged": Bson::Null },
                 doc! { "$set": { "replicaset": r } },
             )
             .await
@@ -1237,7 +1258,13 @@ impl AgentSessionDao {
         let m = bson::to_bson(member)?;
         self.base
             .update_one(
-                doc! { "_id": id, "replicaset.members.device_id": { "$ne": member.device_id } },
+                doc! {
+                    "_id": id,
+                    "replicaset.members.device_id": { "$ne": member.device_id },
+                    // P2g-2 — a placement that read the session before its
+                    // purge adds no device the purge does not reach.
+                    "purged": Bson::Null,
+                },
                 doc! { "$push": { "replicaset.members": m } },
             )
             .await
@@ -1313,7 +1340,111 @@ impl AgentSessionDao {
             }
             None => doc! { "$set": set, "$unset": { "replicaset.short": "" } },
         };
-        self.base.update_one(doc! { "_id": id }, update).await
+        self.base
+            .update_one(doc! { "_id": id, "purged": Bson::Null }, update)
+            .await
+    }
+
+    /// FR-90 P2g-2 — the session becomes a purge's tombstone, in one
+    /// compare-and-set: only a session `owner_id` started that is no
+    /// tombstone already, with no promotion in flight (one past its deadline
+    /// goes with it), and that names no device outside `devices`, the ones
+    /// the purge reaches ([`crate::purge::devices_of`]): a placement that
+    /// added a member after the purge read the record makes this fail. It is
+    /// ended, `purged`, at its own end if it had one; the names it held of
+    /// the work (its title, its folders, where it ran before, its room) go at
+    /// once, ahead of the record itself. The record as it stood before;
+    /// `None` = one of those no longer holds.
+    ///
+    /// ⚠️ The replicaset is KEPT: a placement that read the session before
+    /// the purge would otherwise write a partial replicaset into the
+    /// tombstone, which then no longer reads as a session.
+    pub async fn tombstone(
+        &self,
+        tenant_id: ObjectId,
+        owner_id: ObjectId,
+        id: ObjectId,
+        mark: &PurgedMark,
+        devices: &[ObjectId],
+    ) -> DaoResult<Option<AgentSession>> {
+        let now = DateTime::now();
+        let ids: Vec<Bson> = devices.iter().map(|d| Bson::ObjectId(*d)).collect();
+        let pipeline = vec![
+            doc! { "$set": {
+                "purged": { "$literal": bson::to_bson(mark)? },
+                "status": SessionStatus::Ended.as_str(),
+                "end_reason": "purged",
+                "ended_at": { "$ifNull": ["$ended_at", now] },
+                "title": "",
+                "location.folder": "",
+                "updated_at": now,
+            } },
+            doc! { "$unset": [
+                "path_map", "moved", "from_terminal", "promotion", "room_id", "last_turn",
+                "detail", "refusal", "drivers", "location.account",
+            ] },
+        ];
+        Ok(self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! {
+                    "_id": id,
+                    "tenant_id": tenant_id,
+                    "owner_id": owner_id,
+                    "purged": Bson::Null,
+                    // Every device the record names is one the purge reaches.
+                    "location.device_id": { "$in": ids.clone() },
+                    "replicaset.members": { "$not": { "$elemMatch": {
+                        "device_id": { "$nin": ids.clone() },
+                    } } },
+                    "path_map": { "$not": { "$elemMatch": { "$or": [
+                        { "from.device_id": { "$nin": ids.clone() } },
+                        { "to.device_id": { "$nin": ids.clone() } },
+                    ] } } },
+                    "$and": [
+                        { "$or": [
+                            { "moved": Bson::Null },
+                            { "moved.from.device_id": { "$in": ids.clone() } },
+                        ] },
+                        { "$or": [
+                            { "from_terminal": Bson::Null },
+                            { "from_terminal.device_id": { "$in": ids.clone() } },
+                        ] },
+                        // None in flight; one past its deadline goes with it.
+                        { "$or": [
+                            { "promotion": Bson::Null },
+                            {
+                                "promotion.deadline": { "$lt": now },
+                                "promotion.to": { "$in": ids.clone() },
+                                "promotion.from.device_id": { "$in": ids },
+                            },
+                        ] },
+                    ],
+                },
+                pipeline,
+            )
+            .return_document(mongodb::options::ReturnDocument::Before)
+            .await?)
+    }
+
+    /// FR-90 P2g-2 — the purge `purge_id` is complete: the tombstone that
+    /// names it goes. `false` = none does (deleted already).
+    pub async fn delete_tombstone(&self, id: ObjectId, purge_id: ObjectId) -> DaoResult<bool> {
+        Ok(self
+            .base
+            .hard_delete(doc! { "_id": id, "purged.purge_id": purge_id })
+            .await?
+            > 0)
+    }
+
+    /// FR-90 P2g-2 — how many sessions were forked from `id` and are not
+    /// purged: each holds its conversation up to its fork, which a purge of
+    /// `id` leaves them (spec §3b, Fork).
+    pub async fn forks_of(&self, tenant_id: ObjectId, id: ObjectId) -> DaoResult<u64> {
+        self.base
+            .count(doc! { "tenant_id": tenant_id, "parent.session_id": id, "purged": Bson::Null })
+            .await
     }
 }
 
@@ -1392,6 +1523,13 @@ impl AgentApprovalDao {
             )
             .return_document(mongodb::options::ReturnDocument::After)
             .await?)
+    }
+
+    /// FR-90 P2g-2 — the session was purged: its approvals go with it.
+    pub async fn delete_for_session(&self, session_id: ObjectId) -> DaoResult<u64> {
+        self.base
+            .hard_delete(doc! { "session_id": session_id })
+            .await
     }
 
     /// The session is over: every approval still open in it is withdrawn,
