@@ -113,8 +113,8 @@ P2 as built (`agents/roomlerd/src/token_renewal.rs`):
 - **On a 401.** First a newer token in the config file (matched by server, tenant *and* device id), then a renewal, which the grace covers. Either earns one prompt retry. A refusal straight after a recovery waits out the normal ladder, so a server that renews a token its socket then refuses cannot spin the loop.
 - **Saving.** A compare-and-swap under the daemon's config lock (`RemoteConfigServices::persist_agent_token`). A file already holding a different token for the device was re-enrolled meanwhile, and that token wins. A save that fails still puts the renewed token in use: nothing is rotated, so the file's token stays valid, and the daemon keeps working until a restart reads the file again.
 - **One slot per enrollment** (`roomler-node-core::token_slot`), minted once in `run_cmd` and shared by the loop, its LocalAPI status row, its device-list HTTP identity, the DERP dialer (read per dial: the overlay runtime outlives the connection that built it), and, for the primary, the log and crash uploaders.
-| P3 | Tunnel CLI renewal (before `forward` and `socks5` dial; the due rule moved to `roomler_cli::credential::renew_at`, which `roomlerd` now calls); atomic `0600` save, compare-and-swap for a renewal | — | in review |
-| P4 | UI chip; docs (§5 AC7); field | — | — |
+| P3 | Tunnel CLI renewal (before `forward` and `socks5` dial; the due rule moved to `roomler_cli::credential::renew_at`, which `roomlerd` now calls); atomic `0600` save, compare-and-swap for a renewal | — | merged (#2167) |
+| P4 | UI chip; docs (§5 AC7); field | — | docs + chip in review; field with the 0.4.135 candidate |
 
 Rollout:
 1. The server first. It is inert until an agent renews: every existing token and row is at generation 0.

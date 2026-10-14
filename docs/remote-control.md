@@ -691,7 +691,7 @@ export function useRemoteControl(sessionId: string) {
 |---|---|---|---|
 | User JWT | `aud=user` | 30 min, refresh 30 d | httpOnly cookie (existing) |
 | Enrollment token | `aud=enroll`, `org_id`, `single_use=true` | 10 min | shown once in UI, copied to agent CLI |
-| Agent token | `aud=agent`, `agent_id`, `org_id` | 1 year, rotates on use | argon2-hashed in `agents`, raw in agent's OS keychain |
+| Agent token | `aud=agent`, `sub` = agent id, `tenant_id`, `gen` | 1 year; **renewed by the device** 180 days early, never rotated (FR-103) | the daemon's `config.toml`; the server keeps no copy, only the row's `token_gen` and the `exp` it last saw ([`device-credentials.md`](device-credentials.md)) |
 | Session token | `aud=session`, `session_id`, perms[] | session duration | in-memory both sides |
 | TURN creds | HMAC-SHA1 over coturn shared secret | 10 min | not stored |
 

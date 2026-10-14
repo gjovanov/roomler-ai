@@ -270,6 +270,10 @@ export interface Agent {
   /** Back-compat: `presence === 'online'`. */
   is_online: boolean
   last_seen_at: string
+  /** FR-103 — when the agent token the device last connected with expires
+   *  (RFC 3339). Absent until the device connects to a server with FR-103,
+   *  and on older API bodies: "not reported", never "does not expire". */
+  token_expires_at?: string | null
   access_policy: AccessPolicy
   /** Subnet-router CIDRs this agent advertises for the mesh subnet-router
    *  (Phase 2). Managed via the Subnet-routes dialog; the `roomler`

@@ -257,6 +257,21 @@ whether that org had `remote_ssh_enabled`.
 
 ## 4 · The device plane
 
+**A device's credentials renew themselves, and a removal ends every one it held**
+(FR-103, [`device-credentials.md`](device-credentials.md)). An agent or tunnel-client
+token lives a year. The device renews it 180 days early, and a device off across its
+expiry renews within a 90-day grace that only the renew routes honour; every other
+route enforces `exp`.
+- Renewal does not rotate: the old token stays valid until its own `exp`, so a lost
+  answer, or a copy that missed the change, cannot cut a device off.
+- What ends a credential is **removal**, not the calendar. Each token carries its
+  row's `token_gen`, removing the device increments it in the same atomic update
+  that tombstones the row, and all five verification sites compare the two.
+  Re-enrolling the same machine revives the row, but never its old tokens.
+- ⚠️ The deleted/quarantined check stays FIRST at each site, so a removed device is
+  still told it was removed (and stops), rather than seeing a bare 401 it would
+  retry forever.
+
 **A WG public key cannot be claimed by two live nodes in a network** —
 `overlay_nodes::wg_key_taken_by_other`, checked in `ws::overlay` join,
 **fail-closed**.
