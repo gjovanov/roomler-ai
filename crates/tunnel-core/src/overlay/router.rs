@@ -370,6 +370,18 @@ impl Router {
         self.v6_exit
     }
 
+    /// The subnet routes `pubkey` holds right now — what [`set_subnets`]
+    /// last left for it (`remove`/a re-install may have cleared them).
+    ///
+    /// [`set_subnets`]: Self::set_subnets
+    pub fn subnets_of(&self, pubkey: &[u8; 32]) -> Vec<Cidr> {
+        self.subnets
+            .iter()
+            .filter(|(_, pk)| pk == pubkey)
+            .map(|(c, _)| *c)
+            .collect()
+    }
+
     /// Drop EVERY route owned by `pubkey` — its `/32` host route(s) AND its
     /// subnet routes. `true` if anything was removed.
     ///

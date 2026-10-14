@@ -285,6 +285,16 @@ pub(super) fn exit_peer_allowed_ips(exit: &NetmapPeer) -> Vec<crate::overlay::ro
     cidrs
 }
 
+/// FR-97 — does a peer's current allowed-IPs set lack either v4
+/// split-default half? Pure.
+pub(super) fn split_default_missing(current: &[crate::overlay::router::Cidr]) -> bool {
+    SPLIT_DEFAULT_V4.iter().any(|half| {
+        // unwrap: both are valid /1 CIDR literals (const-correct, covered by tests).
+        let half = crate::overlay::router::Cidr::parse(half).unwrap();
+        !current.contains(&half)
+    })
+}
+
 /// P5 — is the chosen exit peer ready to carry this node's default egress?
 /// `Ok((id, np, pubkey))` when it is present in the netmap, admin-APPROVED
 /// (`peer_is_approved_exit`), AND has a live carrier; else `Err(reason)` — the
@@ -659,6 +669,20 @@ impl OverlayRuntime {
             state.active_peer = Some(exit_id);
             state.withheld_reason = None;
             info!(peer = %exit_id, exit = %selector, "overlay exit-node: v4 default egress now routes through the exit peer");
+        } else if split_default_missing(&wg.peer_subnets(&exit_pubkey)) {
+            // FR-97 — a re-install of the exit peer (a carrier rebuilt, a
+            // netmap update) runs the generic `install_subnets`, which REPLACES
+            // its allowed-IPs with its real subnets: the `/1` halves are gone
+            // while `split_default_installed` still says they are in. The OS
+            // `/1`s keep routing into the TUN, every packet finds no peer, and
+            // all v4 egress is black-holed until a restart. Field (tart Mac
+            // exit clients, 0.4.134 and a candidate): twice, each right after
+            // `dropped advertised default route(s) … peer=<the exit>`, with
+            // `roomler status` still saying `active`. Re-asserted on every
+            // reconcile, as `v6_exit` is below (MAJOR-3).
+            let allowed = exit_peer_allowed_ips(&exit_np);
+            warn_subnet_conflicts(exit_id, &wg.set_peer_subnets(exit_pubkey, &allowed));
+            warn!(peer = %exit_id, exit = %selector, "overlay exit-node: a re-install of the exit peer had dropped its split-default — re-asserted (v4 egress was black-holed since)");
         }
 
         // S3b — global IPv6 egress, INDEPENDENT of v4 and re-asserted every

@@ -8059,6 +8059,37 @@ mod tests {
         assert_eq!(strs.len(), 3);
     }
 
+    /// FR-97 — the field black-hole, in the crypto-router: the exit
+    /// reconcile sets the split-default as the exit peer's allowed-IPs once,
+    /// then a re-install of that peer runs the generic `install_subnets`,
+    /// which REPLACES them with its real subnets. The reconcile must see the
+    /// `/1`s gone (and re-assert them), or every v4 packet the OS routes into
+    /// the TUN finds no peer while the state still says "installed".
+    #[test]
+    fn a_reinstall_that_drops_the_exit_split_default_is_seen() {
+        use crate::overlay::router::{Cidr, Router};
+        let exit = [7u8; 32];
+        let real = vec![Cidr::parse("192.168.5.0/24").unwrap()];
+        let mut allowed = real.clone();
+        allowed.extend(SPLIT_DEFAULT_V4.iter().map(|c| Cidr::parse(c).unwrap()));
+        let mut r = Router::new();
+        r.set_subnets(exit, &allowed);
+        assert!(!split_default_missing(&r.subnets_of(&exit)));
+        // The generic peer install: its real subnets, the /0 filtered out.
+        r.set_subnets(exit, &real);
+        assert!(
+            split_default_missing(&r.subnets_of(&exit)),
+            "a re-install that replaced the allowed-IPs must read as missing"
+        );
+        // Half of it is no better than none.
+        r.set_subnets(exit, &[allowed[0], allowed[1]]);
+        assert!(split_default_missing(&r.subnets_of(&exit)));
+        // Re-asserted: whole again; another peer's routes never count.
+        r.set_subnets(exit, &allowed);
+        assert!(!split_default_missing(&r.subnets_of(&exit)));
+        assert!(split_default_missing(&r.subnets_of(&[8u8; 32])));
+    }
+
     #[test]
     fn exit_readiness_reports_distinct_split_tunnel_reasons() {
         let id = exit_oid(0x21);
@@ -8274,6 +8305,68 @@ mod tests {
             self.log(format!("recheck {}", pinned.len()));
             std::mem::take(&mut *self.stale.lock().unwrap())
         }
+    }
+
+    /// FR-97 — the field black-hole, end to end. The reconcile installs the
+    /// exit; then the exit peer is re-installed the way a carrier rebuild or
+    /// a netmap update does it (the generic `install_subnets`, which logs
+    /// "dropped advertised default route(s)" and REPLACES the peer's
+    /// allowed-IPs). The next reconcile must put the split-default back into
+    /// the crypto-router: it did not, and every v4 packet the OS routed into
+    /// the TUN found no peer until a restart (tart Mac exit clients, twice).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reinstalled_exit_peer_gets_its_split_default_back() {
+        use crate::overlay::router::Cidr;
+        let kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let tun = ExemptionTun::new();
+        let tf: TunFactory = {
+            let m = tun.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let id = exit_oid(0x32);
+        let server: IpAddr = "203.0.113.7".parse().unwrap();
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280)
+            .with_exit_node(Some(id.to_hex()), vec![server]);
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let dev: Arc<dyn TunIo> = tun.clone();
+        let pk = [7u8; 32];
+        let mut peers = HashMap::new();
+        peers.insert(id, exit_np(id, "exit-a", vec!["0.0.0.0/0".into()]));
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            id,
+            Installed::base(
+                pk,
+                Ipv4Addr::new(100, 64, 0, 1),
+                DirectTier::Lan,
+                Instant::now(),
+            ),
+        );
+        let mut st = ExitRoutingState::default();
+
+        rt.reconcile_exit_routing(&mut wg, &dev, &by_node, &peers, &mut st)
+            .await;
+        assert!(st.split_default_installed);
+        assert!(!split_default_missing(&wg.peer_subnets(&pk)), "installed");
+
+        // The re-install, as the runtime runs it for this peer.
+        rt.install_subnets(&mut wg, &dev, id, pk, &[Cidr::parse("0.0.0.0/0").unwrap()])
+            .await;
+        assert!(
+            split_default_missing(&wg.peer_subnets(&pk)),
+            "the field state: the re-install replaced the allowed-IPs"
+        );
+        assert!(st.split_default_installed, "…while the state still says in");
+
+        rt.reconcile_exit_routing(&mut wg, &dev, &by_node, &peers, &mut st)
+            .await;
+        assert!(
+            !split_default_missing(&wg.peer_subnets(&pk)),
+            "the next reconcile must put the split-default back: {:?}",
+            wg.peer_subnets(&pk)
+        );
+        assert!(st.split_default_installed);
     }
 
     /// FR-97 P1a — the uplink moves under an active exit (Wi-Fi ↔ Ethernet).
