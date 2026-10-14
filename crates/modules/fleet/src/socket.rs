@@ -189,6 +189,10 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_exec_system_support(agent_id, caps.has_rpc(RpcCap::ExecSystem));
+    // FR-105 — equality-matched too: `ssh` is its prefix.
+    state
+        .rc_hub
+        .set_agent_ssh_system_support(agent_id, caps.has_rpc(RpcCap::SshSystem));
     state
         .rc_hub
         .set_agent_ssh_grant_ack(agent_id, acks_ssh_grants);
@@ -668,6 +672,12 @@ pub async fn handle_agent_socket(
                                     state.rc_hub.set_agent_exec_system_support(
                                         agent_id,
                                         caps.has_rpc(RpcCap::ExecSystem),
+                                    );
+                                    // FR-105 — and its SSH word, for the
+                                    // same reason.
+                                    state.rc_hub.set_agent_ssh_system_support(
+                                        agent_id,
+                                        caps.has_rpc(RpcCap::SshSystem),
                                     );
                                     // FR-92 — the owner re-allowed keep busy on
                                     // the device, so its word reappeared: hand it

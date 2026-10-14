@@ -155,6 +155,8 @@ impl AgentDao {
             // FR-94 — and never anchored by enrolling: anchoring is its own
             // elevated, admin-issued act (`POST /api/agent/anchor`).
             exec_anchor: None,
+            // FR-105 — published by the device's SYSTEM service, never here.
+            ssh_service: None,
             ssh_policy: SshPolicy::default(),
             peer_relay_policy: Default::default(),
             // Nothing requested until an operator asks for something
@@ -937,6 +939,24 @@ impl AgentDao {
                 Self::live_row(tenant_id, agent_id),
                 doc! { "$set": { "tags": tags.to_vec() } },
             )
+            .await
+    }
+
+    /// FR-105 — record what this device's SYSTEM service published about its
+    /// SSH endpoint. Written only while the row is LIVE and still carries the
+    /// anchor the publishing credential named, so a publish racing a
+    /// re-anchor, an un-anchor or a removal writes nothing (`false`).
+    pub async fn publish_ssh_service(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        endpoint: &roomler_ai_remote_control::models::SshServiceEndpoint,
+    ) -> DaoResult<bool> {
+        let mut filter = Self::live_row(tenant_id, agent_id);
+        filter.insert("exec_anchor.anchor_id", endpoint.anchor_id.as_str());
+        let endpoint = bson::to_bson(endpoint)?;
+        self.base
+            .update_one(filter, doc! { "$set": { "ssh_service": endpoint } })
             .await
     }
 
