@@ -29,10 +29,14 @@
 //! locks this; do not relax it.
 
 pub mod auth;
+/// Node env-var reads: `ROOMLERD_*`, then the older `ROOMLER_NODE_*`.
+/// #2187 — the daemon's own control-plane names, resolved so that no caller
+/// ever waits on a resolver that has stopped answering for a name it has
+/// resolved before.
+pub mod ctl_dns;
 /// Tunnel-client session driver — the shared flow vocabulary (P3b-1); the session
 /// orchestration + the `TunnelSignaling` seam fold in at P3b-2.
 pub mod driver;
-/// Node env-var reads: `ROOMLERD_*`, then the older `ROOMLER_NODE_*`.
 pub mod env;
 pub mod evidence;
 /// FR-86 P1 — the flow-owned listener: one loopback port bound for the life of

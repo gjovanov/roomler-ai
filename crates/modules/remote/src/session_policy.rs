@@ -19,7 +19,7 @@ use axum::{
     extract::{Path, State},
 };
 use bson::oid::ObjectId;
-use roomler_ai_db::models::{RcFeaturePolicy, RcSessionPolicy, role::permissions};
+use roomler_ai_db::models::{RcFeaturePolicy, RcSessionLimits, RcSessionPolicy, role::permissions};
 use roomler_ai_remote_control::models::{FeaturePolicy, SessionPolicy};
 use roomler_core::{ApiError, extractors::auth::AuthUser, guards::require_permission};
 use serde::Deserialize;
@@ -166,10 +166,26 @@ pub async fn set_policy(
 /// whatever is there); the range is for people, not for the timer.
 pub const MAX_SECS_RANGE: std::ops::RangeInclusive<u32> = 60..=86_400;
 
+/// P4b-2 — the same range for the idle limit, for the same reason: the agent
+/// enforces whatever reaches it.
+pub const IDLE_SECS_RANGE: std::ops::RangeInclusive<u32> = 60..=86_400;
+
 /// What the limits route answers: every limit, `null` when unset.
 #[derive(Debug, serde::Serialize, Deserialize, PartialEq, Eq)]
 pub struct RcSessionLimitsDto {
     pub max_secs: Option<u32>,
+    /// P4b-2 — the org's idle limit. Enforced by the device, so only by
+    /// devices that advertise `idle-timeout`; an older agent ignores it.
+    pub idle_secs: Option<u32>,
+}
+
+impl From<RcSessionLimits> for RcSessionLimitsDto {
+    fn from(l: RcSessionLimits) -> Self {
+        Self {
+            max_secs: l.max_secs,
+            idle_secs: l.idle_secs,
+        }
+    }
 }
 
 /// The `PUT` body. An ABSENT field leaves the limit alone; `null` clears it.
@@ -179,6 +195,27 @@ pub struct RcSessionLimitsDto {
 pub struct RcSessionLimitsUpdate {
     #[serde(default, deserialize_with = "present")]
     pub max_secs: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "present")]
+    pub idle_secs: Option<Option<u32>>,
+}
+
+/// A limit in the body, checked against its range. `null` (clear) always
+/// passes.
+fn check_limit(
+    name: &str,
+    value: Option<Option<u32>>,
+    range: &std::ops::RangeInclusive<u32>,
+) -> Result<(), ApiError> {
+    if let Some(Some(secs)) = value
+        && !range.contains(&secs)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "Invalid {name}: {} to {} seconds, or null for no limit",
+            range.start(),
+            range.end()
+        )));
+    }
+    Ok(())
 }
 
 /// `Some(inner)` whenever the field is PRESENT, `null` included: serde's own
@@ -199,9 +236,7 @@ pub async fn get_limits(
         return Err(ApiError::NotAMember);
     }
     let tenant = state.tenants.base.find_by_id(tid).await?;
-    Ok(Json(RcSessionLimitsDto {
-        max_secs: tenant.settings.rc_limits.max_secs,
-    }))
+    Ok(Json(tenant.settings.rc_limits.into()))
 }
 
 /// `PUT /api/tenant/{tenant_id}/rc-session-limits` — `MANAGE_TENANT`. A new
@@ -222,22 +257,17 @@ pub async fn set_limits(
         "MANAGE_TENANT",
     )
     .await?;
-    let Some(max_secs) = body.max_secs else {
-        return Err(ApiError::BadRequest("Nothing to set: max_secs".into()));
-    };
-    if let Some(secs) = max_secs
-        && !MAX_SECS_RANGE.contains(&secs)
-    {
-        return Err(ApiError::BadRequest(format!(
-            "Invalid max_secs: {} to {} seconds, or null for no limit",
-            MAX_SECS_RANGE.start(),
-            MAX_SECS_RANGE.end()
-        )));
+    if body.max_secs.is_none() && body.idle_secs.is_none() {
+        return Err(ApiError::BadRequest(
+            "Nothing to set: max_secs, idle_secs".into(),
+        ));
     }
+    check_limit("max_secs", body.max_secs, &MAX_SECS_RANGE)?;
+    check_limit("idle_secs", body.idle_secs, &IDLE_SECS_RANGE)?;
     let before = state.tenants.base.find_by_id(tid).await?.settings.rc_limits;
     let after = state
         .tenants
-        .set_rc_session_max_secs(tid, max_secs)
+        .set_rc_session_limits(tid, body.max_secs, body.idle_secs)
         .await?
         .settings
         .rc_limits;
@@ -247,9 +277,7 @@ pub async fn set_limits(
             "rc session limits changed"
         );
     }
-    Ok(Json(RcSessionLimitsDto {
-        max_secs: after.max_secs,
-    }))
+    Ok(Json(after.into()))
 }
 
 #[cfg(test)]
@@ -268,10 +296,23 @@ mod tests {
         let set: RcSessionLimitsUpdate =
             serde_json::from_value(serde_json::json!({ "max_secs": 3600 })).unwrap();
         assert_eq!(set.max_secs, Some(Some(3600)));
+        assert_eq!(
+            set.idle_secs, None,
+            "a body naming one limit leaves the other"
+        );
+        // P4b-2 — the idle limit reads the same way, on its own.
+        let idle: RcSessionLimitsUpdate =
+            serde_json::from_value(serde_json::json!({ "idle_secs": 900 })).unwrap();
+        assert_eq!((idle.max_secs, idle.idle_secs), (None, Some(Some(900))));
+        let idle_clear: RcSessionLimitsUpdate =
+            serde_json::from_value(serde_json::json!({ "idle_secs": null })).unwrap();
+        assert_eq!(idle_clear.idle_secs, Some(None));
         for bad in [
             serde_json::json!({ "max_secs": -1 }),
             serde_json::json!({ "max_secs": "1h" }),
             serde_json::json!({ "max_sec": 60 }),
+            serde_json::json!({ "idle_secs": "15m" }),
+            serde_json::json!({ "idle": 900 }),
         ] {
             assert!(
                 serde_json::from_value::<RcSessionLimitsUpdate>(bad.clone()).is_err(),
@@ -280,6 +321,10 @@ mod tests {
         }
         assert!(MAX_SECS_RANGE.contains(&60) && MAX_SECS_RANGE.contains(&86_400));
         assert!(!MAX_SECS_RANGE.contains(&59) && !MAX_SECS_RANGE.contains(&86_401));
+        assert!(check_limit("idle_secs", Some(Some(59)), &IDLE_SECS_RANGE).is_err());
+        assert!(check_limit("idle_secs", Some(Some(60)), &IDLE_SECS_RANGE).is_ok());
+        assert!(check_limit("idle_secs", Some(None), &IDLE_SECS_RANGE).is_ok());
+        assert!(check_limit("idle_secs", None, &IDLE_SECS_RANGE).is_ok());
     }
 
     /// Every stored value maps to the same wire value, field by field.

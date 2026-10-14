@@ -604,6 +604,12 @@ export function friendlyEndReason(reason: unknown, limit?: unknown): string | nu
   if (reason === 'idle_timeout' && limit === 'max_duration') {
     return "The session reached your organization's maximum length. Connect again to start a new one."
   }
+  // P4b-2 — the device ended it after its idle limit: no input and no
+  // change on the screen for that long. Whoever reads this was most likely
+  // away, so it says what happened rather than staying silent.
+  if (reason === 'idle_timeout' && limit === 'idle') {
+    return 'The session ended after a period with no activity. Connect again to start a new one.'
+  }
   switch (reason) {
     case 'user_denied':
       return 'Someone at that device declined the request.'

@@ -152,6 +152,13 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     .get("max_secs")
                     .and_then(|v| v.as_u64())
                     .map(std::time::Duration::from_secs);
+                // P4b-2 — the idle limit, in seconds, resolved by the same
+                // gate. Absent (an older origin pod) is no idle limit, what
+                // that pod would have applied itself.
+                let idle_secs = body
+                    .get("idle_secs")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|s| u32::try_from(s).ok());
                 let frame: ClientMsg = serde_json::from_value(
                     body.get("frame")
                         .cloned()
@@ -212,6 +219,7 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     rc_overlay,
                     session_policy,
                     max_duration,
+                    idle_secs,
                 };
                 match state.fleet.rc_hub.dispatch(&ctx, frame) {
                     Ok(()) => Ok(serde_json::json!({ "dispatched": true })),
@@ -358,6 +366,8 @@ pub async fn relay_rc_frame(
     // FR-101 P4b — the org's maximum session length; the owner pod's hub
     // arms it when the session goes live.
     max_duration: Option<std::time::Duration>,
+    // P4b-2 — the idle limit; the owner pod's hub sends it to the agent.
+    idle_secs: Option<u32>,
     raw_frame: &serde_json::Value,
 ) -> Result<Option<(String, String)>, ()> {
     let Some(bus) = state.cluster_bus.clone() else {
@@ -379,6 +389,7 @@ pub async fn relay_rc_frame(
         "rc_overlay": rc_overlay,
         "session_policy": session_policy_to_relay(session_policy),
         "max_secs": max_duration.map(|d| d.as_secs()),
+        "idle_secs": idle_secs,
         "frame": raw_frame,
     });
     match bus.request(owner_pod, "rc.cmd", body).await {

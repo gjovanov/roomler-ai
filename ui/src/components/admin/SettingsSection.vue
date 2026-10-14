@@ -321,6 +321,30 @@
         <v-alert v-if="maxSessionError" type="error" variant="tonal" density="compact" class="mt-3">
           {{ maxSessionError }}
         </v-alert>
+        <!-- FR-101 P4b-2 — the idle limit. The DEVICE keeps it (only it sees
+             both the input and the screen), so devices too old to advertise
+             it ignore it; a device's own setting may shorten it. -->
+        <v-select
+          :model-value="agentStore.orgRcIdleSecs === undefined ? null : agentStore.orgRcIdleSecs ?? 0"
+          :items="idleOptions()"
+          label="End a session after no activity for"
+          :loading="savingIdle"
+          :disabled="savingIdle || agentStore.orgRcIdleSecs === undefined"
+          density="compact"
+          hide-details
+          class="mt-4"
+          style="max-width: 320px"
+          data-testid="org-rc-idle"
+          @update:model-value="onIdle"
+        />
+        <div class="text-caption text-medium-emphasis mt-1">
+          No input from the person controlling it and no change on the screen for this long. They
+          are warned shortly before the end. The device keeps this limit, so a device whose agent
+          predates it does not. No limit by default.
+        </div>
+        <v-alert v-if="idleError" type="error" variant="tonal" density="compact" class="mt-3">
+          {{ idleError }}
+        </v-alert>
       </v-card-text>
     </v-card>
 
@@ -502,6 +526,38 @@ async function onMaxSession(secs: number | null) {
     maxSessionError.value = (e as Error).message
   } finally {
     savingMaxSession.value = false
+  }
+}
+
+// FR-101 P4b-2 — the idle limit, the same way: `0` is "no limit".
+const idleItems: { title: string; value: number }[] = [
+  { title: 'No limit', value: 0 },
+  { title: '5 minutes', value: 5 * 60 },
+  { title: '15 minutes', value: 15 * 60 },
+  { title: '30 minutes', value: 30 * 60 },
+  { title: '1 hour', value: 60 * 60 },
+  { title: '2 hours', value: 2 * 60 * 60 },
+]
+function idleOptions(): { title: string; value: number }[] {
+  const cur = agentStore.orgRcIdleSecs
+  if (typeof cur === 'number' && cur > 0 && !idleItems.some((i) => i.value === cur)) {
+    return [...idleItems, { title: `${Math.round(cur / 60)} minutes`, value: cur }]
+  }
+  return idleItems
+}
+const savingIdle = ref(false)
+const idleError = ref<string | null>(null)
+
+async function onIdle(secs: number | null) {
+  if (secs === null) return
+  savingIdle.value = true
+  idleError.value = null
+  try {
+    await agentStore.setOrgRcIdleSecs(props.tenantId, secs === 0 ? null : secs)
+  } catch (e) {
+    idleError.value = (e as Error).message
+  } finally {
+    savingIdle.value = false
   }
 }
 

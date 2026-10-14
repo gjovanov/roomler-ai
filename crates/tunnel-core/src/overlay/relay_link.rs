@@ -46,7 +46,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bson::oid::ObjectId;
-use tokio::net::lookup_host;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -2262,13 +2261,17 @@ fn turn_host_port(ice: &[IceServer]) -> Option<(String, u16)> {
 /// failing the allocation.
 async fn pick_worker(pair_key: &str, ice: &[IceServer]) -> Option<IpAddr> {
     let (host, port) = turn_host_port(ice)?;
-    let ips: Vec<IpAddr> = match lookup_host((host.as_str(), port)).await {
-        Ok(addrs) => addrs.map(|s| s.ip()).collect(),
-        Err(e) => {
-            warn!(%host, %e, "overlay relay: coturn DNS resolve failed; not pinning a worker");
-            return None;
-        }
-    };
+    // #2187 — through `ctl_dns`, so a dead exit DNS never stalls a relay pick
+    // for a coturn host that resolved before.
+    let ips: Vec<IpAddr> = crate::ctl_dns::resolve(&crate::ctl_dns::hostport(&host, port))
+        .await
+        .into_iter()
+        .map(|s| s.ip())
+        .collect();
+    if ips.is_empty() {
+        warn!(%host, "overlay relay: coturn DNS resolve failed; not pinning a worker");
+        return None;
+    }
     let pick = pick_worker_fnv1a(pair_key, ips);
     if let Some(ip) = pick {
         debug!(%host, worker = %ip, "overlay relay: deterministic worker picked");

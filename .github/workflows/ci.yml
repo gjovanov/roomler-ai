@@ -929,14 +929,22 @@ jobs:
         # (no XWAYLAND extension) is still known by its monitors — shown with
         # a client-defined XWAYLAND0 monitor, since only the fallback can see
         # it. Both `x11-real:` lines are grepped.
+        #
+        # FR-93 P6a — the native consent panel (FR-27), against the same Xvfb:
+        # a prompt that is dismissed leaves the screen, as a second client sees
+        # it. Its unmap was never flushed, and on the FR-93 lab's GNOME 50 the
+        # panel stayed up after the person at the screen had approved. This
+        # Xvfb has no font packages, so the panel's `fixed` fallback is tested
+        # too.
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends xvfb xauth
-          xvfb-run -a env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input --lib -- capture::pointer keep_busy::host_x11 capture::xwayland_probe_tests --nocapture --test-threads=1 | tee /tmp/x11-tests.log
+          xvfb-run -a env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11 --lib -- capture::pointer keep_busy::host_x11 capture::xwayland_probe_tests indicator::x11 --nocapture --test-threads=1 | tee /tmp/x11-tests.log
           grep -q "x11-real: XTest motion reset the idle counter" /tmp/x11-tests.log
           grep -q "x11-real: ran with idle" /tmp/x11-tests.log
           grep -q "x11-real: Xvfb does not advertise XWAYLAND" /tmp/x11-tests.log
           grep -q "x11-real: an XWAYLAND monitor reads as Xwayland" /tmp/x11-tests.log
+          grep -q "x11-real: a dismissed prompt left the screen" /tmp/x11-tests.log
 
   rust:
     # The name the five lanes above shared when they were one job. It builds

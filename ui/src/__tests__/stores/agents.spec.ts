@@ -669,6 +669,32 @@ describe('useAgentStore', () => {
     expect(s.orgRcMaxSessionSecs).toBeNull()
   })
 
+  it('FR-101 P4b-2: the idle limit rides the same route, naming only itself', async () => {
+    // A server from before P4b-2 sends no idle field: no idle limit.
+    mockApi.get.mockResolvedValueOnce({ max_secs: 3600 })
+    asOwner()
+    const s = useAgentStore()
+    expect(s.orgRcIdleSecs).toBeUndefined()
+    await s.fetchOrgRcSessionLimits(TENANT_ID)
+    expect(s.orgRcIdleSecs).toBeNull()
+    expect(s.orgRcMaxSessionSecs).toBe(3600)
+
+    mockApi.put.mockResolvedValueOnce({ max_secs: 3600, idle_secs: 900 })
+    await s.setOrgRcIdleSecs(TENANT_ID, 900)
+    // The body names the idle limit alone, so the maximum length stays.
+    expect(mockApi.put.mock.calls.at(-1)).toEqual([
+      `/tenant/${TENANT_ID}/rc-session-limits`,
+      { idle_secs: 900 },
+    ])
+    expect(s.orgRcIdleSecs).toBe(900)
+    expect(s.orgRcMaxSessionSecs).toBe(3600)
+
+    mockApi.put.mockResolvedValueOnce({ max_secs: 3600, idle_secs: null })
+    await s.setOrgRcIdleSecs(TENANT_ID, null)
+    expect(mockApi.put.mock.calls.at(-1)![1]).toEqual({ idle_secs: null })
+    expect(s.orgRcIdleSecs).toBeNull()
+  })
+
   it('FR-101 P4b: a member who cannot manage org settings reads no limit and sends nothing', async () => {
     asMemberWithoutManageTenant()
     const s = useAgentStore()

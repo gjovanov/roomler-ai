@@ -108,6 +108,11 @@ pub struct LiveSession {
     /// the session goes live and TAKEN then, so a renegotiation cannot arm a
     /// second. `None` = no limit (or already armed).
     pub max_duration: Option<std::time::Duration>,
+
+    /// FR-101 P4b-2 — the idle limit the viewer was told (`SessionCreated.
+    /// idle_secs`): set only when the device keeps it. Kept for a coalesced
+    /// duplicate request, exactly as [`Self::record_refused`].
+    pub idle_secs: Option<u32>,
 }
 
 impl LiveSession {
@@ -145,6 +150,7 @@ impl LiveSession {
             privacy_refused: None,
             features_refused: Default::default(),
             max_duration: None,
+            idle_secs: None,
         };
         (s, waiter)
     }

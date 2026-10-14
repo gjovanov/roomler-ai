@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-use bson::{DateTime, doc, oid::ObjectId};
+use bson::{DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_db::models::{
     Plan, RcFeaturePolicy, Role, Tenant, TenantMember, TenantSettings, role,
@@ -169,24 +169,38 @@ impl TenantDao {
         self.base.find_by_id(tenant_id).await
     }
 
-    /// FR-101 P4b — set or clear the org's maximum session length. `None`
-    /// removes the field (no limit), rather than storing a `null` that an
-    /// older build would also have to read. The route validates the range.
-    pub async fn set_rc_session_max_secs(
+    /// FR-101 P4b — set or clear the org's session limits: the maximum length
+    /// and (P4b-2) the idle limit. For each, the outer `None` leaves it as it
+    /// is, `Some(None)` removes the field (no limit) rather than storing a
+    /// `null` an older build would also have to read, and `Some(Some(secs))`
+    /// sets it. Each is its own dotted path, so two admins changing different
+    /// limits cannot lose each other's change. The route validates the range.
+    pub async fn set_rc_session_limits(
         &self,
         tenant_id: ObjectId,
-        max_secs: Option<u32>,
+        max_secs: Option<Option<u32>>,
+        idle_secs: Option<Option<u32>>,
     ) -> DaoResult<Tenant> {
-        let update = match max_secs {
-            Some(secs) => doc! { "$set": {
-                "settings.rc_limits.max_secs": i64::from(secs),
-                "updated_at": DateTime::now(),
-            } },
-            None => doc! {
-                "$unset": { "settings.rc_limits.max_secs": "" },
-                "$set": { "updated_at": DateTime::now() },
-            },
-        };
+        let mut set = doc! { "updated_at": DateTime::now() };
+        let mut unset = Document::new();
+        for (path, value) in [
+            ("settings.rc_limits.max_secs", max_secs),
+            ("settings.rc_limits.idle_secs", idle_secs),
+        ] {
+            match value {
+                Some(Some(secs)) => {
+                    set.insert(path, i64::from(secs));
+                }
+                Some(None) => {
+                    unset.insert(path, "");
+                }
+                None => {}
+            }
+        }
+        let mut update = doc! { "$set": set };
+        if !unset.is_empty() {
+            update.insert("$unset", unset);
+        }
         self.base.update_by_id(tenant_id, update).await?;
         self.base.find_by_id(tenant_id).await
     }

@@ -215,6 +215,11 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_device_session_policy(agent_id, caps.session_policy);
+    // FR-101 P4b-2 — whether it keeps an idle limit, so the viewer is told
+    // one only where the device enforces it. Equality-matched.
+    state
+        .rc_hub
+        .set_agent_enforces_idle(agent_id, caps.has_rpc(RpcCap::IdleTimeout));
     state
         .rc_hub
         .set_agent_keep_busy_support(agent_id, supports_keep_busy);
@@ -438,6 +443,7 @@ pub async fn handle_agent_socket(
         rc_overlay: false,
         session_policy: crate::hub::OrgPolicy::Unavailable,
         max_duration: None,
+        idle_secs: None,
     };
 
     // Phase A-1 — server-side receive-liveness, symmetric to the agent's
@@ -708,6 +714,11 @@ pub async fn handle_agent_socket(
                                     state.rc_hub.set_agent_device_session_policy(
                                         agent_id,
                                         caps.session_policy,
+                                    );
+                                    // FR-101 P4b-2 — and its idle word.
+                                    state.rc_hub.set_agent_enforces_idle(
+                                        agent_id,
+                                        caps.has_rpc(RpcCap::IdleTimeout),
                                     );
                                     // FR-94 — the SYSTEM service came up, was
                                     // anchored, or went away while this worker

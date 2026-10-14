@@ -119,6 +119,28 @@ Two messages carry it (`useRemoteControl.ts`, `mediaWaitingCopy`).
 An older viewer shows an unknown `for` under the dialog's title, with the
 agent's hint below it, so a newer agent's words still read.
 
+### 4.1 What the person at the screen sees (FR-93 AC10)
+
+A device with `auto_grant_session = false` asks before every session. The
+prompt surfaces are FR-27's chain ([`remote-control.md`](remote-control.md)
+§11.2, "Prompt surfaces"). Measured on the FR-93 lab, on 0.4.135:
+
+| | the prompt | while viewed |
+|---|---|---|
+| GNOME, per-user | the daemon's own panel, through Xwayland. Until P6a (the release after 0.4.135) it stayed on screen after the answer | GNOME's screen-sharing pill in the top bar; the companion's banner if it runs |
+| KDE, per-user | the same panel, through KWin's Xwayland | KDE's tray indicator; the companion's banner if it runs |
+| GNOME, system | the companion's window | the companion's *Being viewed by …* banner, with **Disconnect** (a centred window: Wayland lets no client place itself) |
+| KDE, system | **none**: Fedora has no companion package, and the viewer waits | **nothing** with DRM capture, which reads below the compositor |
+
+A per-user daemon whose own panel cannot open (no Xwayland) starts the
+companion for the prompt from P6b, through the user's own systemd manager. On
+0.4.135 that launch waited on polkit and failed after 25 s.
+
+⚠️ **GNOME's own Stop does not end a session** on 0.4.135. Pressing the square
+in the screen-sharing pill closes mutter's screencast, and a per-user install
+opens a new one half a second later. Use the companion's **Disconnect**, or end
+the session from the viewer.
+
 ## 5. Choosing an install
 
 | | per-user | system + `drm_capture` + `uinput` |

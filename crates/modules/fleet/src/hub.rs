@@ -160,6 +160,12 @@ pub struct ConnectedAgent {
     /// `device_policy_off` and the viewer is told why. Informative: the agent
     /// enforces it whatever this says. Per CONNECTION; `None` = no floor.
     pub device_session_policy: Option<SessionPolicy>,
+    /// FR-101 P4b-2 — the agent advertises `idle-timeout` in `AgentCaps.rpc`:
+    /// it ends a session that sits idle past `Request.idle_secs`. Per
+    /// CONNECTION, like [`Self::asks_features`]; `false` ⇒ the idle limit
+    /// still rides the request (an older agent ignores it) but the viewer is
+    /// not told one, since nothing would keep it.
+    pub enforces_idle: bool,
     /// FR-92 — the agent advertises `keep-busy` in `AgentCaps.input`: it
     /// parses `rc:agent.keep_busy_policy`. Per CONNECTION; a pre-FR-92 agent
     /// would log every policy frame as an unknown `rc:*` at WARN.
@@ -485,6 +491,23 @@ pub fn refusals_wire(refused: &FeatureRefusals) -> Option<BTreeMap<String, Strin
     })
 }
 
+/// FR-101 P4b-2 — the limit a `ClientMsg::Terminate` may name: `idle`, and
+/// only from the AGENT ending a session as `IdleTimeout`. Only the device
+/// measures idleness; a controller claiming it, or the agent pairing it with
+/// another reason, names nothing, and the session ends on its reason alone.
+/// A `&'static str` so the hub's own vocabulary is what reaches the viewer
+/// and the audit, never a string off the wire.
+pub fn device_end_limit(
+    role: Role,
+    reason: EndReason,
+    claimed: Option<&str>,
+) -> Option<&'static str> {
+    match (role, reason, claimed) {
+        (Role::Agent, EndReason::IdleTimeout, Some("idle")) => Some("idle"),
+        _ => None,
+    }
+}
+
 pub struct ConnectedController {
     pub user_id: ObjectId,
     pub tx: ClientTx,
@@ -712,6 +735,9 @@ impl Hub {
             asks_features: false,
             // FR-101 P2b — set by `set_agent_device_session_policy`.
             device_session_policy: None,
+            // FR-101 P4b-2 — set by `set_agent_enforces_idle`; `false` (no
+            // idle limit promised to a viewer) until it is.
+            enforces_idle: false,
             // FR-92 — set by `set_agent_keep_busy_support`; `false` = no
             // policy frame is ever pushed to this connection.
             supports_keep_busy: false,
@@ -1147,6 +1173,7 @@ impl Hub {
             false,
             OrgPolicy::Read(SessionPolicy::default()),
             None,
+            None,
         )
     }
 
@@ -1183,6 +1210,10 @@ impl Hub {
         // FR-101 P4b — the org's maximum session length, armed when the
         // session goes live. `None` = no limit.
         max_duration: Option<std::time::Duration>,
+        // FR-101 P4b-2 — the idle limit, in seconds: the shorter of the org's
+        // and the device's own, resolved by the authz gate. The device keeps
+        // it; `None` = no idle limit.
+        idle_secs: Option<u32>,
     ) -> Result<ObjectId> {
         // rc.185 — self-heal the fast connect→disconnect race. A controller
         // that connects then drops before teardown completes can leave an
@@ -1253,6 +1284,7 @@ impl Hub {
                     s.record_refused,
                     s.privacy_refused,
                     s.features_refused.clone(),
+                    s.idle_secs,
                 )
             })
         });
@@ -1262,6 +1294,7 @@ impl Hub {
             existing_record_refused,
             existing_privacy_refused,
             existing_features_refused,
+            existing_idle_secs,
         )) = existing
         {
             info!(
@@ -1288,11 +1321,21 @@ impl Hub {
                 privacy_refused: existing_privacy_refused.map(str::to_string),
                 // FR-101 P2 — and for the features the policy refused.
                 features_refused: refusals_wire(&existing_features_refused),
+                // FR-101 P4b-2 — and the idle limit it runs under.
+                idle_secs: existing_idle_secs,
             });
             return Ok(existing_id);
         }
 
-        let (agent_org, agent_arbitrates, agent_records, agent_privacy, agent_asks, agent_floor) = {
+        let (
+            agent_org,
+            agent_arbitrates,
+            agent_records,
+            agent_privacy,
+            agent_asks,
+            agent_floor,
+            agent_enforces_idle,
+        ) = {
             let mut agent = self
                 .inner
                 .agents
@@ -1309,6 +1352,7 @@ impl Hub {
                 agent.privacy_support,
                 agent.asks_features,
                 agent.device_session_policy,
+                agent.enforces_idle,
             )
         };
 
@@ -1422,6 +1466,11 @@ impl Hub {
         live.features_refused = features_refused.clone();
         // FR-101 P4b — armed when the session goes live (`forward_answer`).
         live.max_duration = max_duration;
+        // FR-101 P4b-2 — the idle limit is the DEVICE's to keep, so the
+        // viewer is told one only where the agent advertises it: a limit an
+        // older agent ignores would be a promise nothing keeps.
+        let idle_told = idle_secs.filter(|_| agent_enforces_idle);
+        live.idle_secs = idle_told;
         // Multi-region relay: freeze the session's region NOW — a load-aware
         // pick over the agent's home + its RTT-ordered prefs — so Ready/
         // Offer/Answer all issue from the same PoP regardless of mid-setup
@@ -1452,6 +1501,7 @@ impl Hub {
             record_refused: record_refused.map(str::to_string),
             privacy_refused: privacy_refused.map(str::to_string),
             features_refused: refusals_wire(&features_refused),
+            idle_secs: idle_told,
         });
 
         // Per-mode consent window: modes with an owner-side (email/push) leg get
@@ -1505,6 +1555,9 @@ impl Hub {
             // features on its prompt and enforces the rest. Left off the
             // frame when it restricts nothing, as before the field.
             session_policy: session_policy.for_agent(),
+            // FR-101 P4b-2 — the idle limit, to every agent: one that keeps it
+            // measures and ends the session; an older one ignores the field.
+            idle_secs,
         };
         // Keep the Request while consent is pending so `register_agent` can
         // re-push it if the agent's control WS flaps before `rc:consent`
@@ -1528,6 +1581,8 @@ impl Hub {
                 record_stripped: record_refused.map(str::to_string),
                 privacy_stripped: privacy_refused.map(str::to_string),
                 features_stripped: refusals_wire(&features_refused),
+                idle_secs,
+                idle_enforced: idle_secs.map(|_| agent_enforces_idle),
             },
         );
         self.audit(session_id, agent_id, agent_org, AuditKind::ConsentPrompted);
@@ -2134,6 +2189,14 @@ impl Hub {
     pub fn set_agent_asks_features(&self, agent_id: ObjectId, asks: bool) {
         if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
             entry.asks_features = asks;
+        }
+    }
+
+    /// FR-101 P4b-2 — record whether the agent keeps an idle limit (its
+    /// hello's, or a heartbeat's, `AgentCaps.rpc` has `idle-timeout`).
+    pub fn set_agent_enforces_idle(&self, agent_id: ObjectId, enforces: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.enforces_idle = enforces;
         }
     }
 
@@ -3102,6 +3165,11 @@ pub struct DispatchCtx {
     /// row; the relay carries it too. `None` = no limit. Ignored for
     /// non-request messages and agent-role dispatch.
     pub max_duration: Option<std::time::Duration>,
+    /// FR-101 P4b-2 — the idle limit in seconds: the shorter of the org's
+    /// (the same tenant row) and the device's own (`AccessPolicy`). The relay
+    /// carries it too. `None` = none. Ignored for non-request messages and
+    /// agent-role dispatch.
+    pub idle_secs: Option<u32>,
 }
 
 impl Hub {
@@ -3192,6 +3260,7 @@ impl Hub {
                     ctx.may_record,
                     ctx.session_policy,
                     ctx.max_duration,
+                    ctx.idle_secs,
                 )?;
                 Ok(())
             }
@@ -3247,7 +3316,14 @@ impl Hub {
                 self.check_session_party(ctx, session_id)?;
                 self.forward_ice(role, session_id, candidate)
             }
-            (role, ClientMsg::Terminate { session_id, reason }) => {
+            (
+                role,
+                ClientMsg::Terminate {
+                    session_id,
+                    reason,
+                    limit,
+                },
+            ) => {
                 // FR-27 P10 — `HostDisconnect` is a claim only the DEVICE can
                 // make ("the person at this screen ended it"): it is what the
                 // viewer shows as such and does not auto-reconnect from, and
@@ -3259,11 +3335,16 @@ impl Hub {
                     (Role::Controller, EndReason::HostDisconnect) => EndReason::ControllerHangup,
                     (_, r) => r,
                 };
+                // FR-101 P4b-2 — and the idle limit is the device's claim too:
+                // only it measures idleness, so `limit: "idle"` is named on the
+                // way out only from the agent and only with `IdleTimeout`. A
+                // controller's word, or any other spelling, names no limit.
+                let limit = device_end_limit(role, reason, limit.as_deref());
                 // Terminate stays IDEMPOTENT on an already-gone session (the
                 // agent's overlay-badge disconnect and teardown races rely on
                 // it) — only a live session enforces the party check.
                 match self.check_session_party(ctx, session_id) {
-                    Ok(()) => self.terminate(session_id, reason),
+                    Ok(()) => self.terminate_with_limit(session_id, reason, limit),
                     Err(Error::SessionNotFound(_)) => Ok(()),
                     Err(e) => Err(e),
                 }
@@ -3712,6 +3793,7 @@ mod tests {
                 false,
                 OrgPolicy::Read(SessionPolicy::default()),
                 max,
+                None,
             )
             .unwrap()
         };
@@ -3747,6 +3829,156 @@ mod tests {
             None
         );
         assert!(hub.inner.sessions.contains_key(&sid));
+    }
+
+    /// FR-101 P4b-2 — the idle limit rides `rc:request` to every agent, but a
+    /// viewer is told it only where the device keeps it (`idle-timeout`). And
+    /// when the device ends a session as idle, both ends hear which limit did.
+    #[tokio::test]
+    async fn the_device_ends_an_idle_session_and_both_ends_hear_why() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            true,
+            false,
+        );
+        let open = |hub: &Hub, tx: ClientTx, idle: Option<u32>| {
+            hub.create_session_full(
+                agent_id,
+                ObjectId::new(),
+                "ctl".into(),
+                tx,
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+                false,
+                None,
+                None,
+                false,
+                OrgPolicy::Read(SessionPolicy::default()),
+                None,
+                idle,
+            )
+            .unwrap()
+        };
+        let told_viewer = |m: ServerMsg| match m {
+            ServerMsg::SessionCreated { idle_secs, .. } => idle_secs,
+            other => panic!("expected rc:session.created, got {other:?}"),
+        };
+        let told_agent = |m: ServerMsg| match m {
+            ServerMsg::Request { idle_secs, .. } => idle_secs,
+            other => panic!("expected rc:request, got {other:?}"),
+        };
+
+        // An agent that does not advertise `idle-timeout`: the limit rides
+        // the request (it may be newer than its caps say, and an older one
+        // ignores the field), and the viewer is promised nothing.
+        let (tx, mut ctl_rx) = mpsc::channel(16);
+        let sid = open(&hub, tx, Some(120));
+        assert_eq!(told_viewer(ctl_rx.recv().await.unwrap()), None);
+        assert_eq!(told_agent(agent_rx.recv().await.unwrap()), Some(120));
+        hub.terminate(sid, EndReason::ControllerHangup).unwrap();
+        let _ = next_terminate(&mut agent_rx, Duration::from_secs(1)).await;
+
+        // One that does: the viewer is told, and the device's end names it.
+        hub.set_agent_enforces_idle(agent_id, true);
+        let (tx, mut ctl_rx) = mpsc::channel(16);
+        let sid = open(&hub, tx, Some(120));
+        assert_eq!(told_viewer(ctl_rx.recv().await.unwrap()), Some(120));
+        assert_eq!(told_agent(agent_rx.recv().await.unwrap()), Some(120));
+        hub.deliver_consent(sid, true, None).unwrap();
+        // The grant moves the session on asynchronously: `rc:ready` says it did.
+        assert!(matches!(
+            ctl_rx.recv().await.unwrap(),
+            ServerMsg::Ready { .. }
+        ));
+        hub.forward_offer(sid, "v=0".into()).unwrap();
+        hub.forward_answer(sid, "v=0".into()).unwrap();
+        let device = DispatchCtx {
+            role: Role::Agent,
+            user_id: None,
+            agent_id: Some(agent_id),
+            controller_name: None,
+            controller_tx: None,
+            consent_mode: ConsentMode::Prompt,
+            override_reason: None,
+            input_mode: None,
+            tenant_name: None,
+            may_record: false,
+            rc_overlay: false,
+            session_policy: OrgPolicy::Unavailable,
+            max_duration: None,
+            idle_secs: None,
+        };
+        hub.dispatch(
+            &device,
+            ClientMsg::Terminate {
+                session_id: sid,
+                reason: EndReason::IdleTimeout,
+                limit: Some("idle".into()),
+            },
+        )
+        .unwrap();
+        let idle = Some((EndReason::IdleTimeout, Some("idle".to_string())));
+        assert_eq!(
+            next_terminate(&mut ctl_rx, Duration::from_secs(1)).await,
+            idle,
+            "the controller is told the device's idle limit ended it"
+        );
+        assert_eq!(
+            next_terminate(&mut agent_rx, Duration::from_secs(1)).await,
+            idle,
+            "and the agent hears it echoed"
+        );
+        assert!(!hub.inner.sessions.contains_key(&sid));
+
+        // No session to the same device sneaks a limit onto a request that
+        // carries none.
+        let (tx, mut ctl_rx) = mpsc::channel(16);
+        let _sid = open(&hub, tx, None);
+        assert_eq!(told_viewer(ctl_rx.recv().await.unwrap()), None);
+        assert_eq!(told_agent(agent_rx.recv().await.unwrap()), None);
+    }
+
+    /// FR-101 P4b-2 — only the device names the idle limit, and only with
+    /// the reason it belongs to; the hub's own vocabulary is what goes out.
+    #[test]
+    fn only_the_device_names_the_idle_limit() {
+        use EndReason::{AgentHangup, IdleTimeout};
+        assert_eq!(
+            device_end_limit(Role::Agent, IdleTimeout, Some("idle")),
+            Some("idle")
+        );
+        assert_eq!(
+            device_end_limit(Role::Controller, IdleTimeout, Some("idle")),
+            None,
+            "a controller does not measure idleness"
+        );
+        assert_eq!(
+            device_end_limit(Role::Agent, AgentHangup, Some("idle")),
+            None
+        );
+        assert_eq!(
+            device_end_limit(Role::Agent, IdleTimeout, Some("max_duration")),
+            None,
+            "the maximum length is the hub's to name, not the device's"
+        );
+        assert_eq!(
+            device_end_limit(Role::Agent, IdleTimeout, Some("IDLE")),
+            None
+        );
+        assert_eq!(device_end_limit(Role::Agent, IdleTimeout, None), None);
     }
 
     /// P3 security — `dispatch` refuses session verbs from a connection
@@ -3803,6 +4035,7 @@ mod tests {
             rc_overlay: false,
             session_policy: OrgPolicy::Read(SessionPolicy::default()),
             max_duration: None,
+            idle_secs: None,
         };
         let stranger = ctx_for(Role::Controller, Some(ObjectId::new()), None);
         let owner_ctx = ctx_for(Role::Controller, Some(owner), None);
@@ -3814,6 +4047,7 @@ mod tests {
             ClientMsg::Terminate {
                 session_id: sid,
                 reason: EndReason::ControllerHangup,
+                limit: None,
             },
             ClientMsg::SdpOffer {
                 session_id: sid,
@@ -3876,6 +4110,7 @@ mod tests {
             ClientMsg::Terminate {
                 session_id: sid,
                 reason: EndReason::ControllerHangup,
+                limit: None,
             },
         )
         .unwrap();
@@ -3884,6 +4119,7 @@ mod tests {
             ClientMsg::Terminate {
                 session_id: sid,
                 reason: EndReason::ControllerHangup,
+                limit: None,
             },
         )
         .unwrap();
@@ -3892,6 +4128,7 @@ mod tests {
             ClientMsg::Terminate {
                 session_id: sid,
                 reason: EndReason::ControllerHangup,
+                limit: None,
             },
         )
         .unwrap();
@@ -3963,6 +4200,7 @@ mod tests {
             rc_overlay: false,
             session_policy: OrgPolicy::Read(SessionPolicy::default()),
             max_duration: None,
+            idle_secs: None,
         };
         let device = ctx_for(Role::Agent, None, Some(agent_id));
         let viewer = ctx_for(Role::Controller, Some(owner), None);
@@ -3974,6 +4212,7 @@ mod tests {
             ClientMsg::Terminate {
                 session_id: sid,
                 reason: EndReason::HostDisconnect,
+                limit: None,
             },
         )
         .unwrap();
@@ -3986,6 +4225,7 @@ mod tests {
             ClientMsg::Terminate {
                 session_id: sid,
                 reason: EndReason::HostDisconnect,
+                limit: None,
             },
         )
         .unwrap();
@@ -4106,6 +4346,7 @@ mod tests {
                 may_record,
                 OrgPolicy::Read(SessionPolicy::default()),
                 None,
+                None,
             )
             .unwrap();
             match rx.try_recv().unwrap() {
@@ -4208,6 +4449,7 @@ mod tests {
                 None,
                 true,
                 OrgPolicy::Read(SessionPolicy::default()),
+                None,
                 None,
             )
             .unwrap()
@@ -4340,6 +4582,7 @@ mod tests {
                 None,
                 false,
                 OrgPolicy::Read(SessionPolicy::default()),
+                None,
                 None,
             )
             .unwrap();
@@ -4665,6 +4908,7 @@ mod tests {
                 false,
                 org,
                 None,
+                None,
             )
             .unwrap();
             let (granted, refused) = match rx.try_recv().unwrap() {
@@ -4738,6 +4982,7 @@ mod tests {
             None,
             false,
             org,
+            None,
             None,
         )
         .unwrap();
@@ -5306,6 +5551,7 @@ mod tests {
                 false,
                 OrgPolicy::Read(SessionPolicy::default()),
                 None,
+                None,
             )
             .unwrap();
 
@@ -5821,6 +6067,77 @@ mod tests {
             true,
         );
         assert_eq!(hub.agent_supports_hive_purge_on(agent_id, &tx), None);
+    }
+
+    /// FR-90 P2g-3b — fleet's `hive_purge` control event, as every pod
+    /// applies it: pushed to each connection it names that this hub holds, of
+    /// the envelope's tenant; nothing for another tenant's, and nothing past
+    /// the envelope's cap.
+    #[tokio::test]
+    async fn a_hive_purge_from_another_pod_reaches_only_its_tenants_connection() {
+        let hub = test_hub().await;
+        let tenant = ObjectId::new();
+        let (agent_id, other) = (ObjectId::new(), ObjectId::new());
+        let (_tx, _cancel, mut rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+        let (_tx2, _cancel2, mut other_rx) = hub.register_agent(
+            other,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+        for a in [agent_id, other] {
+            hub.set_agent_hive_support(a, true);
+            hub.set_agent_hive_purge_support(a, true);
+        }
+        let (purge, session) = (ObjectId::new(), ObjectId::new());
+        let envelope = |tid: ObjectId, agents: &[ObjectId]| {
+            serde_json::json!({
+                "class": "rc",
+                "evt": "hive_purge",
+                "tenant_id": tid.to_hex(),
+                "purge_id": purge.to_hex(),
+                "session_id": session.to_hex(),
+                "agent_ids": agents.iter().map(|a| a.to_hex()).collect::<Vec<_>>(),
+            })
+        };
+
+        crate::ctrl::apply_rc_ctrl(&hub, &envelope(ObjectId::new(), &[agent_id]));
+        assert!(
+            rx.try_recv().is_err(),
+            "another tenant's envelope pushes nothing"
+        );
+
+        crate::ctrl::apply_rc_ctrl(&hub, &envelope(tenant, &[other, agent_id]));
+        match rx.try_recv() {
+            Ok(ServerMsg::HivePurge {
+                purge_id,
+                session_id,
+            }) => assert_eq!((purge_id, session_id), (purge, session)),
+            got => panic!("the purge reached its connection: {got:?}"),
+        }
+        assert!(
+            other_rx.try_recv().is_err(),
+            "another tenant's connection the envelope names hears nothing"
+        );
+
+        let mut many = vec![ObjectId::new(); crate::ctrl::MAX_HIVE_PURGE_AGENTS];
+        many.push(agent_id);
+        crate::ctrl::apply_rc_ctrl(&hub, &envelope(tenant, &many));
+        assert!(
+            rx.try_recv().is_err(),
+            "an id past the envelope's cap is not applied"
+        );
     }
 
     // ─── Fleet RPC broker ────────────────────────────────────────────

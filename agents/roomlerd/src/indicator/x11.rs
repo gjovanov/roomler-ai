@@ -339,6 +339,13 @@ fn run<C: Connection + Send + 'static>(
             }
             (None, true) => {
                 conn.unmap_window(win)?;
+                // FR-93 P6a — flushed here, because nothing after it flushes:
+                // the only other flush is the repaint below, and with no prompt
+                // there is none. Unflushed, the unmap sat in x11rb's buffer and
+                // the panel stayed on screen, frozen on its last countdown,
+                // after the person had answered it (the FR-93 lab's GNOME 50,
+                // through Xwayland).
+                conn.flush()?;
                 mapped = false;
             }
             _ => {}
@@ -471,6 +478,65 @@ fn paint<C: Connection>(
 #[cfg(test)]
 mod tests {
     use super::display_is_our_own_virtual_desktop;
+
+    /// FR-93 P6a — against a REAL X server (the Xvfb lane sets
+    /// `ROOMLERD_TEST_X11=1`, which makes a missing server a failure): a
+    /// prompt that is answered or dismissed leaves the screen. Its unmap was
+    /// never flushed, so on the FR-93 lab's GNOME 50 the panel stayed up,
+    /// frozen, after the person at the screen had approved.
+    #[test]
+    fn a_dismissed_prompt_leaves_the_screen() {
+        use super::{H, Inner, W};
+        use std::time::{Duration, Instant};
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::{ConnectionExt as _, MapState};
+
+        if std::env::var("ROOMLERD_TEST_X11").as_deref() != Ok("1") {
+            eprintln!("ROOMLERD_TEST_X11 unset — skipping (the Xvfb lane sets it)");
+            return;
+        }
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let panel = Inner::new(tx).expect("the panel opens on the lane's X server");
+        // A second client, as a compositor sees it: the panel is the root's
+        // override-redirect child of its own size.
+        let (conn, screen) = x11rb::connect(None).expect("a second X connection");
+        let root = conn.setup().roots[screen].root;
+        let panel_state = || -> Option<MapState> {
+            let tree = conn.query_tree(root).ok()?.reply().ok()?;
+            tree.children.into_iter().find_map(|w| {
+                let a = conn.get_window_attributes(w).ok()?.reply().ok()?;
+                let g = conn.get_geometry(w).ok()?.reply().ok()?;
+                (a.override_redirect && g.width == W && g.height == H).then_some(a.map_state)
+            })
+        };
+        let settle = |want: MapState| -> bool {
+            let until = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < until {
+                if panel_state() == Some(want) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        };
+        assert!(panel.prompt(crate::indicator::PromptView {
+            session_hex: "6acf953f1b6883945abe0e3e".into(),
+            title: "Remote control request".into(),
+            lead: "the lane is requesting to control this device.".into(),
+            detail: String::new(),
+            permissions: "VIEW".into(),
+            org: String::new(),
+            expires_at: Instant::now() + Duration::from_secs(300),
+        }));
+        assert!(settle(MapState::VIEWABLE), "the prompt never appeared");
+        panel.dismiss("6acf953f1b6883945abe0e3e");
+        assert!(
+            settle(MapState::UNMAPPED),
+            "the prompt stayed on screen after it was dismissed: {:?}",
+            panel_state()
+        );
+        println!("x11-real: a dismissed prompt left the screen");
+    }
 
     // RETIRED-NAME-ANCHOR(16): the legacy env spelling under test, on purpose
     // — see the anchor on `display_is_our_own_virtual_desktop`.

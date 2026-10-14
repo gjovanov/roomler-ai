@@ -124,6 +124,8 @@ mod privacy_gate_tests;
 #[cfg(test)]
 mod rate_limit_tests;
 #[cfg(test)]
+mod rc_idle_limit_tests;
+#[cfg(test)]
 mod rc_request_ceiling_tests;
 #[cfg(test)]
 mod rc_session_limits_tests;

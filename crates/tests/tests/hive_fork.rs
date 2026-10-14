@@ -397,6 +397,15 @@ async fn scenario() {
         .unwrap()
         .to_string();
 
+    // The fork's gate reads what the devices report on their own time: the
+    // turn's stub and the checkpoint A took at its end. The viewer saw the
+    // turn end before either reached the server, so wait for both (the
+    // #2065 lesson: wait for the operation's last write).
+    until_stored(&app, &sid, "the turn's stub and A's checkpoint", |s| {
+        s.get_document("last_turn").is_ok() && stored_checkpoint(s, &a).is_some()
+    })
+    .await;
+
     // ── The fork, on B: from B's own copy, under the fork's ids ────────────
     let b_fork = b_dir.join("roots").join("fork");
     std::fs::create_dir_all(&b_fork).unwrap();
@@ -546,6 +555,47 @@ async fn scenario() {
     stop(c_proc).await;
     stop(b_proc).await;
     stop(a_proc).await;
+}
+
+/// The stored session `sid`, once `pred` holds of it, within [`LONG`].
+async fn until_stored(
+    app: &TestApp,
+    sid: &str,
+    what: &str,
+    pred: impl Fn(&bson::Document) -> bool,
+) -> bson::Document {
+    let id = bson::oid::ObjectId::parse_str(sid).unwrap();
+    let deadline = Instant::now() + LONG;
+    loop {
+        let s = app
+            .db
+            .collection::<bson::Document>("agent_sessions")
+            .find_one(bson::doc! { "_id": id })
+            .await
+            .unwrap()
+            .expect("the session's record");
+        if pred(&s) {
+            return s;
+        }
+        assert!(Instant::now() < deadline, "{what}: {s}");
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The checkpoint the stored session's member row of `device` names.
+fn stored_checkpoint(s: &bson::Document, device: &str) -> Option<i64> {
+    let id = bson::oid::ObjectId::parse_str(device).ok()?;
+    s.get_document("replicaset")
+        .ok()?
+        .get_array("members")
+        .ok()?
+        .iter()
+        .filter_map(|m| m.as_document())
+        .find(|m| m.get_object_id("device_id").ok() == Some(id))?
+        .get_document("tip")
+        .ok()?
+        .get_i64("checkpoint_seq")
+        .ok()
 }
 
 /// The fork of `parent` made on `device`, once there is one, within [`LONG`].

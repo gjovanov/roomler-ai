@@ -17,7 +17,7 @@ use roomler_ai_remote_control::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::config::AgentConfig;
@@ -137,6 +137,58 @@ fn host_disconnect_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
     ClientMsg::Terminate {
         session_id,
         reason: EndReason::HostDisconnect,
+        limit: None,
+    }
+}
+
+/// FR-101 P4b-2 — the one message the idle limit puts on the wire: the reason
+/// every server already knows, and the limit a newer one names to the viewer
+/// and the audit (an older server ignores `limit` and ends the session as
+/// `IdleTimeout` all the same).
+fn idle_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
+    ClientMsg::Terminate {
+        session_id,
+        reason: EndReason::IdleTimeout,
+        limit: Some("idle".to_string()),
+    }
+}
+
+/// FR-101 P4b-2 — why the DEVICE is ending a session: the person at it
+/// pressed Disconnect (FR-27 P10), or the session sat idle past its limit
+/// (`session_idle`). Both end it the same way, saying so first and closing
+/// after the grace, under their own reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceEnd {
+    HostDisconnect,
+    Idle,
+}
+
+impl DeviceEnd {
+    fn terminate(self, session_id: bson::oid::ObjectId) -> ClientMsg {
+        match self {
+            Self::HostDisconnect => host_disconnect_terminate(session_id),
+            Self::Idle => idle_terminate(session_id),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::HostDisconnect => "host_disconnect",
+            Self::Idle => "idle_timeout",
+        }
+    }
+}
+
+/// The next session the device ends, from either channel. Both `recv`s are
+/// cancel-safe, so losing the outer `select!` drops no hand-back.
+async fn device_end(
+    kill_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
+    idle_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
+) -> Option<(bson::oid::ObjectId, DeviceEnd)> {
+    tokio::select! {
+        Some(sid) = kill_rx.recv() => Some((sid, DeviceEnd::HostDisconnect)),
+        Some(sid) = idle_rx.recv() => Some((sid, DeviceEnd::Idle)),
+        else => None,
     }
 }
 
@@ -179,14 +231,16 @@ pub(crate) const COMPANION_START_BUDGET: Duration = Duration::from_secs(3);
 /// What `rc:request` resolves for a session and `rc:sdp.offer` consumes:
 /// P6's controller display name and the device policy's input mode, FR-27's
 /// asking org (the "Being viewed by" banner is raised at peer-build time, not
-/// request time), FR-85 P3b's record-channel context, and #1882's overlay
-/// decision.
+/// request time), FR-85 P3b's record-channel context, #1882's overlay
+/// decision, and FR-101 P4b-2's idle limit in seconds (armed once the session
+/// is live).
 type SessionMeta = (
     String,
     Option<roomler_ai_remote_control::models::InputMode>,
     Option<String>,
     Option<RecordMeta>,
     crate::rc_overlay::RcOverlay,
+    Option<u32>,
 );
 
 /// FR-85 P3b — what a session's `record` channel needs, resolved when the
@@ -688,6 +742,14 @@ pub async fn run(
         mpsc::channel::<crate::tunnel::quic_setup::QuicSetupOutcome>(
             crate::tunnel::quic_setup::QUIC_SETUP_OUTCOME_CAP,
         );
+    // FR-101 P4b-2 — where a live session's idle watcher hands the session
+    // back when its limit is reached. Same shape as the reap channel: per ORG
+    // loop (a secondary org's session must be ended by the loop that holds
+    // it), the receiver borrowed into every connection, and this sender held
+    // for the loop's life so the receiver never closes and never busy-spins
+    // the `select!`. A hand-back during a reconnect gap is drained by the next
+    // connection, whose maps no longer hold the session: nothing to end.
+    let (idle_tx, mut idle_rx) = mpsc::channel::<bson::oid::ObjectId>(16);
     // rc.307 (B) — multi-region DERP admission-ticket cache, hoisted from
     // connect_once scope: the PERSISTENT overlay runtime's regional-DERP
     // factory captures this slot ONCE, so a per-connection slot went stale
@@ -807,6 +869,8 @@ pub async fn run(
             &mut tunnel_reap_rx,
             &quic_setup_tx,
             &mut quic_setup_rx,
+            &idle_tx,
+            &mut idle_rx,
         )
         .await;
         if !matches!(attempt, Err(ConnectError::AuthRejected)) {
@@ -1252,6 +1316,11 @@ async fn connect_once(
     // drains. Both borrowed from `run` so they span reconnects.
     quic_setup_tx: &crate::tunnel::quic_setup::QuicSetupSender,
     quic_setup_rx: &mut crate::tunnel::quic_setup::QuicSetupReceiver,
+    // FR-101 P4b-2 — the idle-limit channel: the sender each live session's
+    // watcher gets a clone of, and the receiver the device-end arm drains
+    // beside `kill_rx`. Both borrowed from `run` so they span reconnects.
+    idle_tx: &mpsc::Sender<bson::oid::ObjectId>,
+    idle_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
 ) -> Result<(), ConnectError> {
     // S6 — `tid` is the tenant-affinity key the server-front LB hashes
     // on, co-locating this agent's WS with its tenant's controllers on
@@ -1278,8 +1347,11 @@ async fn connect_once(
     // sit here indefinitely, never giving the outer backoff loop a
     // chance to fire. The timeout becomes another `Transient` so the
     // backoff handles it like any other connection failure.
+    // #2187 — the server's address comes from `ctl_dns`: a name resolved
+    // before never waits on a resolver that has stopped answering (an exit
+    // whose DNS died kept a dropped control WS from ever reconnecting).
     let (mut ws, response) =
-        match tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(&url)).await {
+        match tokio::time::timeout(WS_CONNECT_TIMEOUT, crate::ws_connect::connect(&url)).await {
             Ok(Ok(pair)) => pair,
             Ok(Err(e)) => {
                 if let tokio_tungstenite::tungstenite::Error::Http(ref resp) = e
@@ -2061,9 +2133,18 @@ async fn connect_once(
                 indicator.hide_prompt(&session_hex);
                 watchdog::tick(ctx.pump);
             }
-            Some(sid) = kill_rx.recv() => {
+            Some((sid, end)) = device_end(kill_rx, idle_rx) => {
+                // FR-101 P4b-2 — a hand-back from an idle watcher races the
+                // session's own end; one this connection no longer holds has
+                // nothing left to end (a disconnect closed every peer).
+                if end == DeviceEnd::Idle && !peers.contains_key(&sid) {
+                    debug!(session_id = %sid, "idle limit reached for a session no longer held — nothing to end");
+                    continue;
+                }
                 // Viewee clicked "Disconnect" in the on-screen overlay: the
-                // Windows badge, or the companion banner over LocalAPI.
+                // Windows badge, or the companion banner over LocalAPI. Or
+                // (P4b-2) the session sat idle past its limit: the same end,
+                // said the same way, under its own reason.
                 //
                 // FR-27 P10 — SAY it first, then close. The hub forwards the
                 // Terminate to the controller before it echoes it back here
@@ -2075,10 +2156,19 @@ async fn connect_once(
                 // is why the audit used to say `controller_hangup` (the P10
                 // field log). The peer closes after a short grace, in a task
                 // of its own, so this loop is never held.
-                info!(session_id = %sid, "viewee requested disconnect via overlay badge");
+                match end {
+                    DeviceEnd::HostDisconnect => {
+                        info!(session_id = %sid, "viewee requested disconnect via overlay badge")
+                    }
+                    DeviceEnd::Idle => {
+                        info!(session_id = %sid, "idle limit reached — ending the session")
+                    }
+                }
                 // FR-85 P3b-3 — the person at the device sent the controller
                 // away: a recording of this session STOPS now, rather than
-                // wait for the controller to come back (a drop does wait).
+                // wait for the controller to come back (a drop does wait). An
+                // idle end is final in the same way: the viewer does not
+                // reconnect from it.
                 #[cfg(feature = "recording")]
                 crate::recording::remote::host_ended(sid);
                 // Control ends at the click, not after the grace: no input,
@@ -2101,29 +2191,41 @@ async fn connect_once(
                 let grace = match reply_for_session(
                     &mut ws,
                     delegated_out.as_ref(),
-                    &host_disconnect_terminate(sid),
+                    &end.terminate(sid),
                 )
                 .await
                 {
                     Ok(()) => host_disconnect_grace(),
                     Err(e) => {
                         warn!(
-                            session_id = %sid, %e,
+                            session_id = %sid, %e, reason = end.label(),
                             "host disconnect: could not tell the server — closing the peer now"
                         );
                         Duration::ZERO
                     }
                 };
-                info!(
-                    session_id = %sid,
-                    reason = "host_disconnect",
-                    grace_ms = grace.as_millis() as u64,
-                    "host disconnect: told the server; the peer closes after the grace"
-                );
+                // The FR-27 field logs key on the host-disconnect line as it
+                // reads; the idle end says its own.
+                let grace_ms = grace.as_millis() as u64;
+                match end {
+                    DeviceEnd::HostDisconnect => info!(
+                        session_id = %sid,
+                        reason = end.label(),
+                        grace_ms,
+                        "host disconnect: told the server; the peer closes after the grace"
+                    ),
+                    DeviceEnd::Idle => info!(
+                        session_id = %sid,
+                        reason = end.label(),
+                        grace_ms,
+                        "idle limit: told the server; the peer closes after the grace"
+                    ),
+                }
                 if let Some(peer) = peer {
+                    let label = end.label();
                     tokio::spawn(async move {
                         tokio::time::sleep(grace).await;
-                        close_within_budget(peer.close(), sid, "host_disconnect").await;
+                        close_within_budget(peer.close(), sid, label).await;
                     });
                 }
                 crate::gpu_clock::on_sessions_changed(peers.len());
@@ -2281,6 +2383,11 @@ async fn connect_once(
                                         p.asking_org,
                                         record,
                                         p.rc_overlay.unwrap_or_default(),
+                                        // FR-101 P4b-2 — the idle limit is
+                                        // this worker's to keep: it owns the
+                                        // peer, the input and the screen. An
+                                        // older daemon sends none.
+                                        p.idle_secs,
                                     ),
                                 );
                                 info!(session_id = %sid, "delegation: session params received");
@@ -2316,6 +2423,7 @@ async fn connect_once(
                     tunnel_reap_tx,
                     &mut pending_quic_setups,
                     quic_setup_tx,
+                    idle_tx,
                     encoder_preference,
                     &indicator,
                     &consent_broker,
@@ -2376,6 +2484,7 @@ async fn connect_once(
                                 tunnel_reap_tx,
                                 &mut pending_quic_setups,
                                 quic_setup_tx,
+                                idle_tx,
                                 encoder_preference,
                                 &indicator,
                                 &consent_broker,
@@ -2683,6 +2792,10 @@ async fn handle_server_msg(
     // per-org channel their tasks report on.
     pending_quic_setups: &mut crate::tunnel::quic_setup::PendingQuicSetups,
     quic_setup_tx: &crate::tunnel::quic_setup::QuicSetupSender,
+    // FR-101 P4b-2 — handed (cloned) to every live session with an idle
+    // limit, so its watcher can hand the session back to this org loop's
+    // `idle_rx` arm to be ended.
+    idle_tx: &mpsc::Sender<bson::oid::ObjectId>,
     encoder_preference: crate::encode::EncoderPreference,
     indicator: &ViewerIndicator,
     consent_broker: &crate::consent::ConsentBroker,
@@ -2772,6 +2885,8 @@ async fn handle_server_msg(
             // FR-101 P2b — the org's policy; applied below with the device's
             // own floor, once the consent mode is resolved.
             session_policy,
+            // FR-101 P4b-2 — the idle limit, kept here once the session is live.
+            idle_secs,
         } => {
             // #1882 — the device's overlay decision, resolved HERE, by the
             // daemon: it is the process whose overlay knows the blocks, and a
@@ -2856,6 +2971,8 @@ async fn handle_server_msg(
                     asking_org.clone(),
                     None,
                     rc_overlay.clone(),
+                    // FR-101 P4b-2 — `None` from an older server: no limit.
+                    idle_secs,
                 ),
             );
             info!(
@@ -3005,6 +3122,8 @@ async fn handle_server_msg(
                                 .map(|w| u64::try_from(w.as_millis()).unwrap_or(u64::MAX)),
                         }),
                         rc_overlay: Some(rc_overlay.clone()),
+                        // FR-101 P4b-2 — the worker keeps the idle limit.
+                        idle_secs,
                     }),
                 ));
                 if !sent {
@@ -3289,8 +3408,9 @@ async fn handle_server_msg(
             // anonymous label + the agent-default (free) mode.
             // #1882 — and the overlay decision; missing means off, with this
             // process's own overlay blocks.
+            // FR-101 P4b-2 — and the idle limit; missing means none.
             #[cfg_attr(not(feature = "recording"), allow(unused_variables))]
-            let (controller_name, input_mode, asking_org, record_meta, rc_overlay) =
+            let (controller_name, input_mode, asking_org, record_meta, rc_overlay, idle_secs) =
                 pending_session_meta.remove(&session_id).unwrap_or_else(|| {
                     (
                         "Controller".to_string(),
@@ -3298,6 +3418,7 @@ async fn handle_server_msg(
                         None,
                         None,
                         crate::rc_overlay::RcOverlay::resolve(false),
+                        None,
                     )
                 });
             // FR-27 follow-up — capture what the "Being viewed by" banner needs
@@ -3344,6 +3465,7 @@ async fn handle_server_msg(
                         &ClientMsg::Terminate {
                             session_id,
                             reason: EndReason::Error,
+                            limit: None,
                         },
                     )
                     .await;
@@ -3395,6 +3517,7 @@ async fn handle_server_msg(
                         &ClientMsg::Terminate {
                             session_id,
                             reason: EndReason::Error,
+                            limit: None,
                         },
                     )
                     .await;
@@ -3432,6 +3555,22 @@ async fn handle_server_msg(
                 indicator.hide_session(session_id.to_hex());
                 close_within_budget(peer.close(), session_id, "answer_send_failed").await;
                 return Err(ConnectError::Transient(e.context("sending answer")));
+            }
+            // FR-101 P4b-2 — the session is live: its idle limit runs from
+            // here, not from the request (consent can take minutes). The
+            // watcher stops with the peer; at the limit it hands the session
+            // to this loop's `idle_rx`, which ends it as the host's
+            // Disconnect does. A re-offer for the session builds a new peer
+            // and arms a new watcher; the old one stopped with the old peer.
+            if let Some(secs) = idle_secs.filter(|s| *s > 0) {
+                let (session_end, control) = peer.idle_handles();
+                crate::session_idle::arm(
+                    session_id,
+                    Duration::from_secs(u64::from(secs)),
+                    session_end,
+                    control,
+                    idle_tx.clone(),
+                );
             }
             peers.insert(session_id, peer);
             // 2026-07-27 — first live session engages the GPU-clock pin
@@ -5819,6 +5958,9 @@ fn stub_caps(multi_org_tun: bool) -> AgentCaps {
     // strips what this device will refuse. Live: the heartbeat re-announces it.
     caps.rpc.push(RpcCap::SessionPolicy.wire().to_string());
     caps.session_policy = crate::session_policy::caps_policy();
+    // FR-101 P4b-2 — and it keeps an idle limit (`session_idle`), so the hub
+    // may tell the viewer the limit this session runs under.
+    caps.rpc.push(RpcCap::IdleTimeout.wire().to_string());
     caps
 }
 
@@ -5901,12 +6043,53 @@ mod tests {
         assert!(json.contains(r#""t":"rc:terminate""#), "{json}");
         assert!(json.contains(r#""reason":"host_disconnect""#), "{json}");
         match msg {
-            ClientMsg::Terminate { session_id, reason } => {
+            ClientMsg::Terminate {
+                session_id,
+                reason,
+                limit,
+            } => {
                 assert_eq!(session_id, sid);
                 assert_eq!(reason, EndReason::HostDisconnect);
+                assert_eq!(limit, None, "a host disconnect is no limit");
             }
             other => panic!("wrong message: {other:?}"),
         }
+    }
+
+    /// FR-101 P4b-2 — the idle end on the wire: `idle_timeout`, the reason
+    /// every server knows, naming `limit: "idle"`, which the hub honours from
+    /// the agent. The host's Disconnect is untouched by it.
+    #[test]
+    fn an_idle_end_terminates_as_idle_timeout_naming_the_limit() {
+        let sid = bson::oid::ObjectId::new();
+        let json = serde_json::to_string(&DeviceEnd::Idle.terminate(sid)).unwrap();
+        assert!(json.contains(r#""t":"rc:terminate""#), "{json}");
+        assert!(json.contains(r#""reason":"idle_timeout""#), "{json}");
+        assert!(json.contains(r#""limit":"idle""#), "{json}");
+        let json = serde_json::to_string(&DeviceEnd::HostDisconnect.terminate(sid)).unwrap();
+        assert!(json.contains(r#""reason":"host_disconnect""#), "{json}");
+        assert!(!json.contains("limit"), "{json}");
+        assert_eq!(DeviceEnd::Idle.label(), "idle_timeout");
+        assert_eq!(DeviceEnd::HostDisconnect.label(), "host_disconnect");
+    }
+
+    /// FR-101 P4b-2 — either channel ends a session, each under its own
+    /// reason: the overlay's Disconnect and an idle watcher's hand-back.
+    #[tokio::test]
+    async fn either_channel_ends_a_session() {
+        let (kill_tx, mut kill_rx) = mpsc::channel(1);
+        let (idle_tx, mut idle_rx) = mpsc::channel(1);
+        let (a, b) = (bson::oid::ObjectId::new(), bson::oid::ObjectId::new());
+        idle_tx.send(a).await.unwrap();
+        assert_eq!(
+            device_end(&mut kill_rx, &mut idle_rx).await,
+            Some((a, DeviceEnd::Idle))
+        );
+        kill_tx.send(b).await.unwrap();
+        assert_eq!(
+            device_end(&mut kill_rx, &mut idle_rx).await,
+            Some((b, DeviceEnd::HostDisconnect))
+        );
     }
 
     /// The grace is a field knob with a kill switch (`0`), never longer than

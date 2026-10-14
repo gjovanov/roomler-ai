@@ -1386,35 +1386,57 @@ export const useAgentStore = defineStore('agents', () => {
   // ── FR-101 P4b — the org's session limits ──────────────────────────
   //
   // The maximum length of a remote-desktop session, in seconds; the hub ends
-  // a session that reaches it. `null` = no limit.
+  // a session that reaches it. P4b-2: and how long one may sit idle (no input
+  // and no change on the screen), which the device ends. `null` = no limit.
 
   /** `undefined` until fetched, and for a member who may not manage org
    *  settings; `null` = no limit. */
   const orgRcMaxSessionSecs = ref<number | null | undefined>(undefined)
+  /** P4b-2 — the idle limit, in seconds; the same states. */
+  const orgRcIdleSecs = ref<number | null | undefined>(undefined)
+
+  type RcSessionLimitsResp = { max_secs: number | null; idle_secs?: number | null }
+  function applyRcSessionLimits(resp: RcSessionLimitsResp) {
+    orgRcMaxSessionSecs.value = resp.max_secs ?? null
+    // A server from before P4b-2 does not send the field: no idle limit.
+    orgRcIdleSecs.value = resp.idle_secs ?? null
+  }
 
   async function fetchOrgRcSessionLimits(tenantId: string) {
     if (!(await mayReadOrgSettings(tenantId))) {
       orgRcMaxSessionSecs.value = undefined
+      orgRcIdleSecs.value = undefined
       return
     }
     try {
-      const resp = await api.get<{ max_secs: number | null }>(
-        `/tenant/${tenantId}/rc-session-limits`,
+      applyRcSessionLimits(
+        await api.get<RcSessionLimitsResp>(`/tenant/${tenantId}/rc-session-limits`),
       )
-      orgRcMaxSessionSecs.value = resp.max_secs ?? null
     } catch {
       orgRcMaxSessionSecs.value = undefined
+      orgRcIdleSecs.value = undefined
     }
   }
 
   /** Set the maximum length (`null` clears it). MANAGE_TENANT server-side;
    *  applies to sessions that go live after the change. */
   async function setOrgRcMaxSessionSecs(tenantId: string, maxSecs: number | null) {
-    const resp = await api.put<{ max_secs: number | null }>(
-      `/tenant/${tenantId}/rc-session-limits`,
-      { max_secs: maxSecs },
+    applyRcSessionLimits(
+      await api.put<RcSessionLimitsResp>(`/tenant/${tenantId}/rc-session-limits`, {
+        max_secs: maxSecs,
+      }),
     )
-    orgRcMaxSessionSecs.value = resp.max_secs ?? null
+  }
+
+  /** P4b-2 — set the idle limit (`null` clears it). The body names only this
+   *  limit, so the maximum length is left as it is. Kept by devices that
+   *  advertise `idle-timeout`; applies to sessions requested after it. */
+  async function setOrgRcIdleSecs(tenantId: string, idleSecs: number | null) {
+    applyRcSessionLimits(
+      await api.put<RcSessionLimitsResp>(`/tenant/${tenantId}/rc-session-limits`, {
+        idle_secs: idleSecs,
+      }),
+    )
   }
 
   /** List the org's keys (secrets are never in the list — mint-once only). */
@@ -1625,8 +1647,10 @@ export const useAgentStore = defineStore('agents', () => {
     fetchOrgEphemeralKeysEnabled,
     setOrgEphemeralKeysEnabled,
     orgRcMaxSessionSecs,
+    orgRcIdleSecs,
     fetchOrgRcSessionLimits,
     setOrgRcMaxSessionSecs,
+    setOrgRcIdleSecs,
     listEnrollKeys,
     mintEnrollKey,
     revokeEnrollKey,

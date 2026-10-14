@@ -46,7 +46,7 @@ it.
 - **No encryption at rest.** JWTs are HS256 with a shared secret
   (`crates/services/src/auth/mod.rs:148-143`); the only asymmetric key signs DERP tickets
   (`crates/remote_control/src/derp_ticket.rs:91,116`); tenant cloud-storage credentials have a
-  plaintext schema (`crates/db/src/models/tenant.rs:273-220`). The vault brings its own keys.
+  plaintext schema (`crates/db/src/models/tenant.rs:294-220`). The vault brings its own keys.
 - **The primitives exist.** One spawn-as-user path (`agents/roomlerd/src/exec.rs:436,491`); the
   daemon's own PTY (`agents/roomlerd/src/pty/unix.rs:106-184`, ConPTY in
   `agents/roomlerd/src/pty/windows.rs:180-240`); the tmux model (`agents/roomlerd/src/apps/linux.rs:389-433`);
@@ -57,11 +57,11 @@ it.
 - **The gaps are measured, not guessed.** `RunAs` sets no working directory and only `TERM`
   (`agents/roomlerd/src/pty/unix.rs:148`); on Windows it reaches only the console user and will not
   ask for credentials (`agents/roomlerd/src/exec.rs:503-508`); a root daemon's LocalAPI socket is
-  `0600`, so a non-root process can't reach it (`crates/localapi/src/lib.rs:2898-2886`); tunnel SOCKS5
+  `0600`, so a non-root process can't reach it (`crates/localapi/src/lib.rs:2910-2886`); tunnel SOCKS5
   has no authentication (`crates/tunnel-core/src/socks5.rs:3`) and a daemon-originated flow is
   attributed to the device owner (`crates/tunnel-core/src/policy.rs:29-51`); `SplitTun` intercepts one
   port and SSH is its only caller (`crates/tunnel-core/src/overlay/split_tun.rs:92-126`); fleet exec
-  always runs as SYSTEM/root (`agents/roomlerd/src/signaling.rs:4086`).
+  always runs as SYSTEM/root (`agents/roomlerd/src/signaling.rs:4134`).
 - **Chat needs four changes.** `AuthorType::Bot` exists and nothing writes it — the DAO hard-codes
   `User` (`crates/services/src/dao/message.rs:76-78`); rooms have no type or binding
   (`crates/db/src/models/room.rs:62-126`); the message list isn't virtualized
@@ -92,7 +92,7 @@ and its user-level half is `roomlerd hive-host`, re-exec'd as the mapped user li
 (`agents/roomlerd/src/main.rs:203`) — no second binary. Wire frames are `rc:hive.*`, `rc:vault.*`,
 `rc:knowhow.*` owned through `namespace()` (`crates/remote_control/src/signaling.rs:1496`); new
 `RpcCap` verbs `hive`, `hive-view` (P0d-2), `hive-replica`, `vault`, `knowhow-scan`, equality-matched
-(`crates/remote_control/src/models.rs:532,697`).
+(`crates/remote_control/src/models.rs:540,697`).
 
 **In the release builds from P1h-2.** The Linux (x86_64 and arm64) and macOS builds in
 `.github/workflows/release-agent.yml` carry the `hive` feature; Windows follows with its sessions
@@ -333,8 +333,8 @@ flowchart TD
 
 | Rule | Why | Where |
 |---|---|---|
-| A device holds copies only while its OWN `hive_replica` is on. It advertises `hive-replica` only then, as `hive-adopt` is advertised (`agents/roomlerd/src/encode/caps.rs:1635`), and refuses a join otherwise. `hive_archive` (it offers itself as an archive replica) and `hive_store_quota_mib` are device keys too. None is pushable, and each joins the lock test's list | the gate that survives a compromised server. The code keeps every Hive key out of `DesiredConfig` (`crates/remote_control/src/models.rs:6220`); §3g's "can ever be pushed" is the design's allowance, not the code's | `crates/agent-core/src/config.rs:374` |
-| Candidates are the session owner's own devices and the archive replicas an `ADMINISTRATOR` designated, nothing else. "The owner's own" means `enrolled_by` and `owner_user_id` both name the owner | `owner_user_id` is reassignable with `MANAGE_AGENTS` alone, and `enrolled_by` is set once, at enrollment (`crates/services/src/dao/agent.rs:99`, `:1009`): a device manager who hands someone a device must not receive that person's sessions on it | `crates/remote_control/src/models.rs:1427`, `:1431` |
+| A device holds copies only while its OWN `hive_replica` is on. It advertises `hive-replica` only then, as `hive-adopt` is advertised (`agents/roomlerd/src/encode/caps.rs:1638`), and refuses a join otherwise. `hive_archive` (it offers itself as an archive replica) and `hive_store_quota_mib` are device keys too. None is pushable, and each joins the lock test's list | the gate that survives a compromised server. The code keeps every Hive key out of `DesiredConfig` (`crates/remote_control/src/models.rs:6297`); §3g's "can ever be pushed" is the design's allowance, not the code's | `crates/agent-core/src/config.rs:374` |
+| Candidates are the session owner's own devices and the archive replicas an `ADMINISTRATOR` designated, nothing else. "The owner's own" means `enrolled_by` and `owner_user_id` both name the owner | `owner_user_id` is reassignable with `MANAGE_AGENTS` alone, and `enrolled_by` is set once, at enrollment (`crates/services/src/dao/agent.rs:99`, `:1009`): a device manager who hands someone a device must not receive that person's sessions on it | `crates/remote_control/src/models.rs:1447`, `:1451` |
 | A restricted tag only ever takes a device out. When no device left may hold a restricted session, the session has fewer copies than `min`, and its room says why | tags are free-form `MANAGE_AGENTS` labels (`crates/modules/fleet/src/agent.rs:1097`); as a filter they cannot widen where a copy goes. Decision 2 names prod ROLES, which are P3's, so until then the session's primary device is what carries the tag | `models.rs:1144` |
 | A device that no longer qualifies (a tag taken off, its owner changed, its `hive_replica` off) gets a purge for what it may no longer hold | the rules run again when a device's tags or owner change: fleet calls a new `FleetLifecycle::agent_updated` hook (`crates/core/src/hooks.rs:109`) from its update route, as it calls `agent_renamed` there (`agent.rs:1000`) | |
 | Never an ephemeral device (FR-51), never a secondary org's enrollment | an ephemeral row is hard-deleted, and could never acknowledge a purge; Hive frames count only on the primary enrollment (`agents/roomlerd/src/hive/view.rs:244`) | `models.rs:1165` |
@@ -750,7 +750,13 @@ longer than its organization's `retention_days`: the same purge as its owner's, 
 retention`. Only a session that is over is swept, counted from its end; a live one renews by its
 own activity. The tombstone's compare-and-set requires the session still over, so one made a
 managed session again after the sweep read it is kept. This reaches every device that comes back;
-the device's own clock, for one that never does, is P2g-3b.
+the device's own clock, for one that never does, is P2g-3c.
+
+⚠️ **As built (P2g-3b): a purge reaches its device on any pod.** A purge is issued on the pod its
+owner's `DELETE`, or the retention sweep, ran on, and a device whose socket was on another pod heard
+of it only at its next connection. The devices the issuing pod holds no socket of are now published
+on the cluster's control channel, as consent verdicts and admin kicks are, and the pod that holds
+each one's socket pushes the purge there, with the hub's own tenant and `hive-purge` checks.
 
 **What stops two primaries.**
 
@@ -1048,7 +1054,7 @@ Such a build runs no session and sends no manifest, so a Windows device that upd
 or a build made without `hive` does the same. The reconcile of a connection the hub records without
 `hive` now ends those sessions as an empty manifest would, before it reads what is pending, and it
 reads only its own registration: a connection a newer one displaced, or one already gone, decides
-nothing (`crates/modules/hive/src/agent_socket.rs:982`, `crates/modules/fleet/src/hub.rs:2130`
+nothing (`crates/modules/hive/src/agent_socket.rs:982`, `crates/modules/fleet/src/hub.rs:2206`
 `agent_supports_hive_on`).
 
 **Updates and restarts (P1d).** Today a session's harness is the daemon's child: an update, a crash
@@ -1434,7 +1440,7 @@ Running a session is remote code execution on a device, so it gets exec's and SS
 Cedar `role:assume` permit, default deny; per-(user, device) limits after the identity gates; and the
 device's own `hive_enabled`, `hive_accounts` and `hive_roots`, of which only `hive_enabled` (and
 `hive_replica`) can ever be pushed, and only to devices that opted into remote config
-(`crates/remote_control/src/models.rs:1867,5655`).
+(`crates/remote_control/src/models.rs:1887,5655`).
 
 **P1g, the org gate, as built.** The module switch (`[modules] hive`) is all or nothing for a
 server, so it has a second dial: `hive.tenants` (`ROOMLER__HIVE__TENANTS`), the organizations
@@ -1636,7 +1642,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P2f-5 | the path map across several moves (`docs/hive.md` §12): every lease move pushes `{fence, from, to, at}` onto the record's `path_map` in the same compare-and-set (no account kept), a move back pulls its move's entry by fence; `rc:hive.move` gains `earlier` (the map's `from` places, oldest first, one per folder, the newest 16; absent when empty, so an older server's frame and an older device's reading are unchanged) and names the lease move's own time on a re-sent start; the device's resume note names every earlier folder but its own, a list of one byte for byte as before; integration (a move into another folder, a second, a refused third moved back), a re-sent move an hour late, unit tests on both sides; 11 NCs | `hive.replicaset = false` | **merged** #2162 `7b01df91f` |
 | P2g-1 | a purge, the devices' half (`docs/hive.md` §12): `rc:hive.purge {purge_id, session_id}` answered `rc:hive.purge_ack` per part (`store`, `account`: `done` · `not_there` · `failed` with `detail`, decoded leniently so an unknown word is `failed`), `RpcCap::HivePurge` (`hive-purge`, equality-matched); under the start lock, a run of it stopped first; the daemon's copy (`Store::purge`, its id kept, so a join, start or event for it is refused), its runtime directory, hosted and adopted entries and in-memory state; the workplace moved into `purge_debts` in the store purge's own transaction, and the account's part (`roomlerd hive-purge`, as the account, held to `$HOME/.roomler/hive/<sid>` exactly) from that debt: the state directory, `refs/hive/<sid>/*` and the checkpoints' index, never the work tree, nothing through a link; device tests (a live session purged whole, never here, an account part failed then done, an adopted terminal never made managed) and the child's own; 14 NCs | no server sends a purge until P2g-2 | **merged** #2178 `73bacf163` |
 | P2g-2 | a purge, the server's half (`docs/hive.md` §12): `DELETE …/session/{sid}` for its owner holding `HIVE_RUN` (decision 12; 404 for anyone else, and with `hive.replicaset` off), refused `no_permission`, or `in_progress` while a promotion is in flight, as a 200 and audited; a purge (`hive_purges`) naming every device the record names (where it runs, every member whatever its state, where it ran before, a promotion's two ends), a removed device's part closed `device_removed` and a member that refused as a secondary organization's enrollment or as purged already closed `holds_nothing`; the purge written first, then the record made its tombstone in one compare-and-set that asserts the record names no other device (`purged`, `ended`, its title and folders gone; read by nobody, a viewer's grant included); its room, core memory snapshot and approvals deleted at once; `rc:hive.purge` pushed to a connection advertising `hive-purge` and sent first at each connection while the device's part is pending, never for a purge no tombstone names; `purge_ack` applied to the socket's own device's entry, a failed part pending with the device's words; complete once no part is pending, the tombstone then deleted and the purge kept 90 days; `GET …/session/{sid}/purge` for its owner; AC11's shape against fake devices, and between real devices (`hive_purge.rs`: the member offline, the primary answering 5 ms after the `DELETE`, each store keeping only the id); 21 NCs | `hive.replicaset = false` (the route answers 404, and issued purges wait) | **merged** #2197 `0d6009d7d` |
-| P2g-3a | retention, the server's sweep (`docs/hive.md` §12): every `hive.retention_sweep_secs` (default 3600), one pod (a claim in `locks`, the startup lease's pattern, held half a period) purges each session over (`ended` · `refused` · `lost`) for longer than its organization's `retention_days` (its policy's, else the default 90; `0` keeps for ever), counted from `ended_at` (else `updated_at`), at most 100 an organization a pass: the same purge as its owner's, `reason: retention`, `by` its owner, audited `issued` with the reason; the tombstone's compare-and-set requires the session still over, so one made managed again meanwhile is kept; a live session is never swept | `hive.retention_sweep_secs = 0`, or `hive.replicaset = false` (no sweep); an organization's `retention_days = 0` | **in review** |
+| P2g-3a | retention, the server's sweep (`docs/hive.md` §12): every `hive.retention_sweep_secs` (default 3600), one pod (a claim in `locks`, the startup lease's pattern, held half a period) purges each session over (`ended` · `refused` · `lost`) for longer than its organization's `retention_days` (its policy's, else the default 90; `0` keeps for ever), counted from `ended_at` (else `updated_at`), at most 100 an organization a pass: the same purge as its owner's, `reason: retention`, `by` its owner, audited `issued` with the reason; the tombstone's compare-and-set requires the session still over, so one made managed again meanwhile is kept; a live session is never swept | `hive.retention_sweep_secs = 0`, or `hive.replicaset = false` (no sweep); an organization's `retention_days = 0` | **merged** #2209 `47dc6d91b` |
+| P2g-3b | a purge reaches its device on any pod (`docs/hive.md` §12): the devices the pod that issued a purge (the owner's `DELETE`, or the retention sweep) holds no socket of are published on the cluster's control channel, one envelope a purge (fleet's `hive_purge`: tenant, purge, session, the devices), and every pod pushes it to the sockets it holds, through the hub's tenant and `hive-purge` checks, at most 1024 devices an envelope; without Redis there is one pod, and nothing changes; integration on two pods sharing one database and Redis (the `DELETE` on the pod without the device's socket: the device hears it, answers, and the purge completes) | `hive.replicaset = false` (no purge is issued) | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -1955,7 +1962,7 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       restricted tag (`prod` by default) replicates only to devices carrying it too (decision 2's
       interim reading).
     - *`hive_replica` and `hive_archive`:* device-owned and never pushable, like every Hive key
-      today (`crates/remote_control/src/models.rs:6220`).
+      today (`crates/remote_control/src/models.rs:6297`).
     - *Promote, teleport, fork and purge:* the session owner's, with `HIVE_RUN`. There is no
       `HIVE_ADMIN` bit yet.
     - *The server relays the QUIC fingerprint it could replace:* accepted for P2, since the server

@@ -116,6 +116,7 @@ pub async fn handle_controller_frame(state: &RemoteState, frame: ControllerFrame
         authz.rc_overlay,
         authz.session_policy,
         authz.max_duration,
+        authz.idle_secs,
         frame.dialed_tid,
         frame.conn_established_ms,
         frame.connection_id,
@@ -149,6 +150,8 @@ pub async fn dispatch_controller_rc(
     session_policy: OrgPolicy,
     // FR-101 P4b — the org's maximum session length (the same gate).
     max_duration: Option<std::time::Duration>,
+    // P4b-2 — the idle limit, org's and device's (the same gate).
+    idle_secs: Option<u32>,
     // PR-1 rehome direction inputs: the affinity key this conn DIALED
     // with (None = key-less legacy/racy dial) and when it established.
     dialed_tid: Option<&str>,
@@ -177,6 +180,7 @@ pub async fn dispatch_controller_rc(
         rc_overlay,
         session_policy,
         max_duration,
+        idle_secs,
     };
     // …and so does the cross-pod relay, for the same reason.
     let relay_tenant_name = tenant_name;
@@ -227,6 +231,7 @@ pub async fn dispatch_controller_rc(
                     rc_overlay,
                     session_policy,
                     max_duration,
+                    idle_secs,
                     &frame_val,
                 )
                 .await
@@ -347,6 +352,7 @@ pub async fn dispatch_controller_rc(
                         rc_overlay,
                         session_policy,
                         max_duration,
+                        idle_secs,
                         &frame_val,
                     )
                     .await
@@ -424,6 +430,12 @@ pub struct SessionAuthz {
     /// early-out paths, and when the row could not be read: no limit, the
     /// behaviour from before it, rather than ending sessions on a guess.
     pub max_duration: Option<std::time::Duration>,
+    /// FR-101 P4b-2 — the idle limit in seconds: the shorter of the org's
+    /// (the same tenant row) and the device's own
+    /// (`AccessPolicy::auto_terminate_idle_minutes`). The device keeps it.
+    /// `None` when neither sets one and on the early-out paths; an unreadable
+    /// tenant row leaves the device's own, never a guess at the org's.
+    pub idle_secs: Option<u32>,
 }
 
 impl SessionAuthz {
@@ -437,6 +449,7 @@ impl SessionAuthz {
             rc_overlay: false,
             session_policy: OrgPolicy::Unavailable,
             max_duration: None,
+            idle_secs: None,
         }
     }
     fn allow_with_input(
@@ -455,6 +468,7 @@ impl SessionAuthz {
             rc_overlay,
             session_policy,
             max_duration: None,
+            idle_secs: None,
         }
     }
     /// FR-85 P3 — set whether this allowed controller may record.
@@ -462,9 +476,15 @@ impl SessionAuthz {
         self.may_record = may_record;
         self
     }
-    /// FR-101 P4b — set the org's maximum session length.
-    fn limited(mut self, max_duration: Option<std::time::Duration>) -> Self {
+    /// FR-101 P4b — set the org's maximum session length and (P4b-2) the
+    /// idle limit.
+    fn limited(
+        mut self,
+        max_duration: Option<std::time::Duration>,
+        idle_secs: Option<u32>,
+    ) -> Self {
         self.max_duration = max_duration;
+        self.idle_secs = idle_secs;
         self
     }
 }
@@ -542,6 +562,13 @@ pub async fn resolve_session_authz(
         .as_ref()
         .and_then(|t| t.settings.rc_limits.max_secs)
         .map(|secs| std::time::Duration::from_secs(u64::from(secs)));
+    // P4b-2 — and its idle limit, held to the device's own when that one is
+    // shorter: a device may tighten its org's limit, never loosen it. A row
+    // we could not see leaves the device's own, never a guess at the org's.
+    let idle_secs = roomler_ai_remote_control::models::stricter_idle_limit(
+        tenant.as_ref().and_then(|t| t.settings.rc_limits.idle_secs),
+        agent.access_policy.idle_limit_secs(),
+    );
     let tenant_name = tenant.map(|t| t.name);
 
     // Controlling your OWN device is always allowed. Whether it also
@@ -566,7 +593,7 @@ pub async fn resolve_session_authz(
             session_policy,
         )
         .recording(true)
-        .limited(max_duration));
+        .limited(max_duration, idle_secs));
     }
 
     // The effective mode for an allowed non-owner controller (attended default).
@@ -596,6 +623,9 @@ pub async fn resolve_session_authz(
                 session_policy,
                 // FR-101 P4b — and so does its maximum session length.
                 max_duration,
+                // P4b-2 — and the idle limit: an unattended forced session
+                // left open is the forgotten session the limit exists for.
+                idle_secs,
             });
         }
         return Ok(SessionAuthz::allow_with_input(
@@ -606,7 +636,7 @@ pub async fn resolve_session_authz(
             session_policy,
         )
         .recording(true)
-        .limited(max_duration));
+        .limited(max_duration, idle_secs));
     }
     if !permissions::has(perms, permissions::REMOTE_CONTROL) {
         return Err("you don't have permission to control others' devices".to_string());
@@ -626,7 +656,7 @@ pub async fn resolve_session_authz(
             session_policy,
         )
         .recording(may_record)
-        .limited(max_duration));
+        .limited(max_duration, idle_secs));
     }
     if policy.allowed_user_ids.contains(&controller_user_id) {
         return Ok(SessionAuthz::allow_with_input(
@@ -637,7 +667,7 @@ pub async fn resolve_session_authz(
             session_policy,
         )
         .recording(may_record)
-        .limited(max_duration));
+        .limited(max_duration, idle_secs));
     }
     let role_ids = state
         .tenants
@@ -653,7 +683,7 @@ pub async fn resolve_session_authz(
             session_policy,
         )
         .recording(may_record)
-        .limited(max_duration));
+        .limited(max_duration, idle_secs));
     }
     Err("you're not on this device's control allowlist".to_string())
 }

@@ -466,22 +466,27 @@ fn console_user_uid() -> Result<u32> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 async fn ensure_running_inner() -> Result<EnsureOutcome> {
-    const BIN: &str = "roomler-desktop";
-
     let Some(path) = linux_companion_path() else {
         // Until FR-27's packaging phase there is no Linux companion at all,
         // and after it there still won't be on a headless server — which is
         // the correct state for a machine with no screen, not a fault.
         return Ok(EnsureOutcome::Unsupported);
     };
-    if pgrep_running(BIN) {
-        return Ok(EnsureOutcome::AlreadyRunning);
-    }
 
     // A root systemd daemon has no display of its own. Find the graphical
     // session's owner and its bus/display, then spawn as that user.
     let sess = graphical_session().context("finding a graphical login session")?;
-    let out = systemd_run_command(&sess, &path, &[], false)
+    // FR-93 P6b — THAT user's companion (`pgrep -u`: another user's on a
+    // shared machine is not this person's), started through the manager this
+    // daemon may use. A per-user daemon has its own user manager; the system
+    // manager would ask polkit for a password nobody is there to type. The
+    // shape `launch_once` already has.
+    if companion_running_for_uid(sess.uid) {
+        return Ok(EnsureOutcome::AlreadyRunning);
+    }
+    // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+    let user_manager = unsafe { libc::geteuid() } != 0;
+    let out = systemd_run_command(&sess, &path, &[], user_manager)
         .output()
         .context("spawning systemd-run")?;
     if !out.status.success() {
@@ -687,10 +692,11 @@ pub(crate) fn graphical_session_matching(
     anyhow::bail!("no active graphical session — nobody is at this machine's screen")
 }
 
-/// Is a process with this exact name running? `pgrep -x` is available on both
-/// macOS and Linux, and an exact-name match cannot be fooled by a command line
-/// that merely mentions the binary.
-#[cfg(unix)]
+/// Is a process with this exact name running? An exact-name match (`pgrep -x`)
+/// cannot be fooled by a command line that merely mentions the binary. macOS
+/// only: Linux asks for the session user's own (`companion_running_for_uid`,
+/// FR-93 P6b).
+#[cfg(target_os = "macos")]
 fn pgrep_running(name: &str) -> bool {
     std::process::Command::new("pgrep")
         .args(["-x", name])

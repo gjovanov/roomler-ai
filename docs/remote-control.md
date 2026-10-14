@@ -815,6 +815,23 @@ device auto-grant is a device-owner decision the server cannot make for it.
 3. **CLI** — `roomlerd consent --list` / `--approve`, which works everywhere.
 4. **none** — reported as `no_prompt_surface`, not as a deny.
 
+⚠️ **The X11 panel's unmap must be flushed** (FR-93 P6a). x11rb buffers
+requests, and the panel's loop flushed only when it repainted, which it stops
+doing once the prompt is gone. Until P6a an answered prompt therefore stayed on
+screen, frozen on its countdown, with live-looking buttons: the decision was
+recorded and the session ran beneath it. Measured on GNOME 50 and Plasma 6.7,
+both through Xwayland; a real X server buffers the same way. The Xvfb lane now
+proves that a dismissed prompt leaves the screen, as a second client sees it.
+
+⚠️ **The companion starts through the manager this daemon may use** (FR-93
+P6b). A root daemon starts a system transient unit as the session's user
+(`--uid=`). A per-user daemon starts it from its own user manager
+(`systemd-run --user`). Before P6b a per-user daemon also asked the system
+manager, which waited on polkit and failed after 25 s (*"Failed to start
+transient service unit: Connection timed out"*), so a per-user host whose
+native panel could not open had no prompt at all. "Already running" now means
+the session user's own companion (`pgrep -u`), not anyone's.
+
 ⚠️ The `.pending` marker is written in ALL cases, because it is also what
 `roomlerd consent --list` reads. `ConsentRequest.surface` is what stops the
 companion from popping a second panel over a native one.
@@ -941,7 +958,9 @@ Windows badge's **Disconnect** (§18.3) or the companion banner's
 (`docs/desktop-companion.md` §12). Every one of those surfaces reaches the
 same arm of the agent's signalling loop (`kill_rx`, `agents/roomlerd/src/signaling.rs`),
 and that arm's job is to make the ending **final and attributed**: the viewer
-is told who ended it and does not come back on its own.
+is told who ended it and does not come back on its own. Since FR-101 P4b-2 the
+same arm also ends a session that sat idle past its limit (`idle_rx`, §11.6),
+the same way and under its own reason (`DeviceEnd`).
 
 ```mermaid
 sequenceDiagram
@@ -1019,6 +1038,69 @@ viewer reconnects as before — degraded, never broken, and locked by
 `pre_p10_end_reason_rejects_host_disconnect_so_old_servers_drop_the_frame`.
 A pre-P10 **viewer** treats the unknown reason as terminal (the retry list is
 an allowlist) and simply shows no notice. The full matrix is in the FR-27 spec.
+
+### 11.6 Sessions that end: the maximum length and the idle limit (FR-101 P4b)
+
+An org can bound how long a session lasts, and how long it may sit idle. Both
+are off by default. Both end the session as `idle_timeout`, the `EndReason`
+every reader already knows, and name the limit in an additive `limit` field
+on `rc:terminate` and in the `session_ended` audit row. An older agent, viewer
+or pod reads the reason it knows and ignores the field.
+
+The two limits are kept by different parties, because they see different
+things:
+
+| | Maximum length (P4b-1) | Idle limit (P4b-2) |
+|---|---|---|
+| Set by | the org (`rc_limits.max_secs`) | the org (`rc_limits.idle_secs`), shortened by the device's own `AccessPolicy.auto_terminate_idle_minutes` (the shorter wins) |
+| Route | `GET`/`PUT /api/tenant/{tid}/rc-session-limits`, a minute to a day, `null` clears | the same route and range; a body naming one limit leaves the other alone |
+| Kept by | the **hub**, from the moment the session goes live | the **device**: only it sees both the controller's input (peer to peer) and the screen |
+| Who it binds | every agent and viewer already deployed | agents that advertise `idle-timeout`; the viewer is told the limit (`rc:session.created.idle_secs`) only for those |
+| `limit` | `max_duration` | `idle`, honoured from the agent only, and only with `idle_timeout` |
+
+```mermaid
+sequenceDiagram
+    participant V as viewer (browser)
+    participant S as hub (server)
+    participant A as roomlerd
+    V->>S: rc:session.request
+    Note over S: authz gate: idle = shorter of the org's and the device's
+    S->>A: rc:request idle_secs (every agent)
+    S->>V: rc:session.created idle_secs (only if the agent advertises idle-timeout)
+    Note over A: session live: the idle clock starts
+    loop no input and no significant screen change
+        A->>A: tick (an eighth of the limit, between 0.25 s and 5 s)
+    end
+    A->>V: rc:idle ends_in_ms (control channel, a fifth of the limit before the end)
+    Note over A: limit reached: the device-end arm, as for the host's Disconnect
+    A->>A: peer.stop_serving()
+    A->>S: rc:terminate idle_timeout, limit=idle
+    S->>V: rc:terminate idle_timeout, limit=idle
+    Note over S: audit: session_ended limit=idle
+    Note over V: "The session ended after a period with no activity."
+    Note over A: grace, then peer.close()
+```
+
+What counts as activity:
+
+| Kind | Counts | Does not count |
+|---|---|---|
+| **Controller** (`session_telemetry`) | any input it sent, even when the lock screen suppresses it, and in a view-only session; the clipboard either way; file transfer, including a download's progress | the viewer's own automatic traffic: stats, keyframe requests, pings |
+| **Screen** (`session_idle::ScreenActivity`) | change spread over at least 6 cells of a 32 × 18 grid (about 1 %) within 30 s: a scroll, a video, a line of typing, a window moved | the same few cells repainting forever: a clock (even with seconds), a blinking caret, a tray icon |
+
+The screen leg samples each captured frame on the grid's lattice at most
+once a second per screen (about 9k pixel reads), and costs nothing while no
+live session has an idle limit.
+
+⚠️ **The screen is one per process, not one per session.** On a host with two
+monitors, one session's activity keeps another's alive, and a host whose
+screen never stops changing (a video wall) never idles out. Both err toward
+keeping a session someone may be using; the maximum length is their bound.
+
+⚠️ **A limit sent is not a limit kept.** An agent older than P4b-2 ignores
+`idle_secs`. The `session_requested` audit row records `idle_secs` and
+`idle_enforced`, so a limit the org set that a device could not keep shows
+up there.
 
 ## 12. Performance targets & budget
 

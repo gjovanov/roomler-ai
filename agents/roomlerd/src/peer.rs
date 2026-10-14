@@ -261,6 +261,10 @@ pub struct AgentPeer {
     /// [`Self::add_remote_candidate`] and [`Self::handle_offer`]; the local
     /// half is already in the `SettingEngine`.
     rc_overlay: crate::rc_overlay::RcOverlay,
+    /// FR-101 P4b-2 — the control channel, once the viewer opens it: the same
+    /// stash the lock-state emitter writes through, kept here for the idle
+    /// limit's warning ([`Self::idle_handles`]).
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
 }
 
 /// FR-16 L0 — the in-process latency harness's one seam into a session.
@@ -876,6 +880,7 @@ impl AgentPeer {
                             .send(ClientMsg::Terminate {
                                 session_id,
                                 reason: roomler_ai_remote_control::models::EndReason::Error,
+                                limit: None,
                             })
                             .await;
                     }
@@ -1016,6 +1021,7 @@ impl AgentPeer {
                                 .send(ClientMsg::Terminate {
                                     session_id,
                                     reason: roomler_ai_remote_control::models::EndReason::Error,
+                                    limit: None,
                                 })
                                 .await
                             {
@@ -1414,7 +1420,19 @@ impl AgentPeer {
                 session_end
             },
             rc_overlay,
+            control_dc,
         })
+    }
+
+    /// FR-101 P4b-2 — what the idle limit needs from this session: the token
+    /// that fires when it ends, and the control channel its warning rides.
+    pub(crate) fn idle_handles(
+        &self,
+    ) -> (
+        tokio_util::sync::CancellationToken,
+        crate::session_idle::ControlStash,
+    ) {
+        (self.session_end.clone(), self.control_dc.clone())
     }
 
     /// FR-85 P3b — give this session's `record` channel what it needs. Call
@@ -2514,6 +2532,9 @@ async fn media_pump(
                 capture_wait.on_frame();
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
+                // FR-101 P4b-2 — a real capture, never a keepalive: the idle limit's
+                // screen leg (free unless a live session has a limit).
+                crate::session_idle::note_frame(&arc);
                 arc
             }
             Ok(None) => {
@@ -3947,6 +3968,9 @@ async fn media_pump_vp9_444_dc(
                 capture_wait.on_frame();
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
+                // FR-101 P4b-2 — a real capture, never a keepalive: the idle limit's
+                // screen leg (free unless a live session has a limit).
+                crate::session_idle::note_frame(&arc);
                 // Motion continues — the settle gate counts the episode.
                 settle_kf.note_real_frame();
                 arc
@@ -6968,6 +6992,9 @@ async fn media_pump_ffmpeg_dc(
             Ok(Some(f)) => {
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
+                // FR-101 P4b-2 — a real capture, never a keepalive: the idle limit's
+                // screen leg (free unless a live session has a limit).
+                crate::session_idle::note_frame(&arc);
                 last_capture_at = std::time::Instant::now();
                 capture_wait.on_frame();
                 frames_captured += 1;
@@ -8639,6 +8666,9 @@ fn attach_input_handler(
                     return;
                 }
             };
+            // FR-101 P4b-2 — the controller is here, whether or not what it
+            // sent is injected (the lock below may suppress it).
+            crate::session_telemetry::counters(session_id).note_input_seen();
             // M3 Z-path: drop input early when the host is locked.
             // The browser's auto-reconnect ladder will keep the peer
             // alive across short lock screens; the operator just
@@ -9709,6 +9739,12 @@ fn attach_log_only(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
     let label = dc.label().to_string();
     dc.on_message(Box::new(move |msg| {
         debug!(%session_id, %label, bytes = msg.data.len(), "DC msg (unhandled)");
+        // FR-101 P4b-2 — a view-only session's input channel lands here: what
+        // it sends is never injected, but the person sending it is present,
+        // and the idle limit must not end their session under them.
+        if label == "input" {
+            crate::session_telemetry::counters(session_id).note_input_seen();
+        }
         Box::pin(async {})
     }));
 }
@@ -10735,6 +10771,10 @@ pub fn attach_files_handler(
         let dc = dc_for_handler.clone();
         let handler = handler.clone();
         Box::pin(async move {
+            // FR-101 P4b-2 — every message the controller sends here (an
+            // upload's chunks, a request to browse or download) is activity
+            // for the session's idle limit.
+            crate::session_telemetry::counters(session_id).note_transfer();
             if msg.is_string {
                 handle_files_control(dc, handler, session_id, &msg.data).await;
             } else {
@@ -11073,7 +11113,7 @@ fn spawn_outgoing_pump(
             return;
         }
 
-        let bytes_sent = match pump_outgoing_file(&dc, &handler, &offer).await {
+        let bytes_sent = match pump_outgoing_file(&dc, &handler, &offer, session_id).await {
             Ok(n) => n,
             Err(e) => {
                 handler.finish_outgoing(&offer.id).await;
@@ -11328,11 +11368,14 @@ async fn zip_pump_loop<S: DownloadSink>(
 /// off when the SCTP send buffer is over 4 MiB to avoid OOMing on
 /// large files. Every await races the offer's stop token (#1730), so
 /// a cancel or the session's end stops it wherever it waits. Returns
-/// the total bytes sent on clean stream exit.
+/// the total bytes sent on clean stream exit. `session_id` is whose transfer
+/// it is: each progress report is activity for the session's idle limit
+/// (FR-101 P4b-2), so a long download is never ended as idle.
 async fn pump_outgoing_file<S: DownloadSink>(
     dc: &S,
     handler: &crate::files::FilesHandler,
     offer: &crate::files::OutgoingOffer,
+    session_id: bson::oid::ObjectId,
 ) -> anyhow::Result<u64> {
     use tokio::io::AsyncReadExt;
     const CHUNK: usize = 64 * 1024;
@@ -11365,6 +11408,7 @@ async fn pump_outgoing_file<S: DownloadSink>(
         // Progress reports every 256 KiB
         if total - last_progress >= 256 * 1024 {
             last_progress = total;
+            crate::session_telemetry::counters(session_id).note_transfer();
             or_stopped(
                 stop,
                 dc.send_json(&crate::files::FilesOutgoing::Progress {
@@ -13218,7 +13262,9 @@ mod download_stop_tests {
             parked: parked.clone(),
         };
         let h = handler.clone();
-        let pump = tokio::spawn(async move { pump_outgoing_file(&sink, &h, &offer).await });
+        let pump = tokio::spawn(async move {
+            pump_outgoing_file(&sink, &h, &offer, bson::oid::ObjectId::new()).await
+        });
         tokio::time::timeout(Duration::from_secs(5), parked.notified())
             .await
             .expect("the pump reached its send");
@@ -13244,7 +13290,9 @@ mod download_stop_tests {
             parked: parked.clone(),
         };
         let h = handler.clone();
-        let pump = tokio::spawn(async move { pump_outgoing_file(&sink, &h, &offer).await });
+        let pump = tokio::spawn(async move {
+            pump_outgoing_file(&sink, &h, &offer, bson::oid::ObjectId::new()).await
+        });
         tokio::time::timeout(Duration::from_secs(5), parked.notified())
             .await
             .expect("the pump reached the send buffer");
@@ -13292,7 +13340,7 @@ mod download_stop_tests {
             .expect("begin_outgoing");
         let got = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Collect { bytes: got.clone() };
-        let sent = pump_outgoing_file(&sink, &handler, &offer)
+        let sent = pump_outgoing_file(&sink, &handler, &offer, bson::oid::ObjectId::new())
             .await
             .expect("the download completes");
         let want = std::fs::read(&path).expect("read the file back");

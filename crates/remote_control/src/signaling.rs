@@ -1245,6 +1245,14 @@ pub enum ClientMsg {
         #[serde(with = "oid_hex")]
         session_id: ObjectId,
         reason: EndReason,
+        /// FR-101 P4b-2 — the limit that ended it, from the DEVICE: `idle`
+        /// (with `IdleTimeout`) when the agent ended a session that sat idle
+        /// past its `Request.idle_secs`. The hub honours it only from the
+        /// agent and only with that reason, and names it on the
+        /// `rc:terminate` it sends both ends. Absent otherwise; an older
+        /// server ignores it and still ends the session as `IdleTimeout`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<String>,
     },
 
     /// Liveness ping (cheap; the WS handler also has its own ping/pong).
@@ -2118,6 +2126,7 @@ mod namespace_tests {
             ClientMsg::Terminate {
                 session_id: ObjectId::new(),
                 reason: EndReason::AdminTerminated,
+                limit: None,
             },
             ClientMsg::OverlayLeave {},
             ClientMsg::TunnelTerminate {
@@ -2224,6 +2233,14 @@ pub enum ServerMsg {
         /// viewer does not know still reads as "not granted".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         features_refused: Option<std::collections::BTreeMap<String, String>>,
+        /// FR-101 P4b-2 — the idle limit this session runs under, in seconds:
+        /// it ends after this long with no input from its controller and no
+        /// significant change on the screen. Present only when the device
+        /// enforces it (its agent advertises `idle-timeout`), so a viewer
+        /// never promises a limit an older agent ignores. Absent = no idle
+        /// limit, or none this device can keep.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idle_secs: Option<u32>,
     },
 
     /// Sent to the agent when a controller asks for control. The agent prompts
@@ -2334,6 +2351,17 @@ pub enum ServerMsg {
         /// nothing) = unrestricted; older agents ignore the field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_policy: Option<crate::models::SessionPolicy>,
+        /// FR-101 P4b-2 — end the session after this many seconds with no
+        /// input from its controller and no significant change on the screen.
+        /// The stricter of the org's idle limit and the device's
+        /// `AccessPolicy::auto_terminate_idle_minutes`. Only the agent sees
+        /// both halves of "idle", so it measures and ends the session itself
+        /// (`ClientMsg::Terminate` with `IdleTimeout` and `limit: "idle"`).
+        /// `None` (an older server, or no limit) = never idle out; an older
+        /// agent ignores the field, which is why the hub tells a viewer the
+        /// limit only for one that advertises `idle-timeout`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idle_secs: Option<u32>,
     },
 
     /// Server forwards SDP offer from controller → agent.
@@ -2389,10 +2417,10 @@ pub enum ServerMsg {
         session_id: ObjectId,
         reason: EndReason,
         /// FR-101 P4b — which limit ended the session, when one did:
-        /// `max_duration` (the org's maximum session length), with `reason`
-        /// `IdleTimeout`, the variant every reader already knows. Lets a
-        /// viewer say "it reached the maximum length" rather than "idle".
-        /// Absent otherwise; older readers ignore it.
+        /// `max_duration` (the org's maximum session length, ended by the
+        /// hub) or `idle` (P4b-2: the idle limit, ended by the device), with
+        /// `reason` `IdleTimeout`, the variant every reader already knows.
+        /// Lets a viewer say which. Absent otherwise; older readers ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<String>,
     },
@@ -6046,6 +6074,7 @@ mod tests {
             record_refused: None,
             privacy_refused: None,
             features_refused: None,
+            idle_secs: None,
         };
         let s = serde_json::to_string(&created).unwrap();
         assert!(
@@ -6156,6 +6185,7 @@ mod tests {
             tenant_name: None,
             rc_overlay,
             session_policy: None,
+            idle_secs: None,
         };
         let off = serde_json::to_string(&req(false)).unwrap();
         assert!(
@@ -6200,6 +6230,7 @@ mod tests {
             tenant_name: None,
             rc_overlay: false,
             session_policy,
+            idle_secs: None,
         };
         let none = serde_json::to_string(&req(None)).unwrap();
         assert!(!none.contains("session_policy"), "{none}");
@@ -6241,6 +6272,7 @@ mod tests {
             record_refused: None,
             privacy_refused: None,
             features_refused,
+            idle_secs: None,
         };
         let none = serde_json::to_string(&mk(None)).unwrap();
         assert!(!none.contains("features_refused"), "{none}");
@@ -6261,6 +6293,85 @@ mod tests {
                 features_refused, ..
             } => assert_eq!(features_refused, Some(refused)),
             _ => panic!("expected SessionCreated"),
+        }
+    }
+
+    /// FR-101 P4b-2 — the idle limit on the wire. `idle_secs` on
+    /// `rc:request` and `rc:session.created` is skipped when absent and
+    /// round-trips when set; `limit` on an agent's `rc:terminate`
+    /// round-trips, and a frame from a sender older than the fields reads as
+    /// no limit, so neither direction breaks across a rollout.
+    #[test]
+    fn the_idle_limit_fields_are_additive() {
+        let sid = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+        let req = |idle_secs| ServerMsg::Request {
+            session_id: sid,
+            controller_user_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
+            controller_name: "Alice".into(),
+            permissions: Permissions::VIEW,
+            consent_timeout_secs: 30,
+            browser_caps: vec![],
+            preferred_transport: None,
+            chroma_pref: None,
+            chunk_framing: None,
+            audio_enabled: false,
+            consent_mode: None,
+            host_prompt_timeout_secs: None,
+            input_mode: None,
+            tenant_name: None,
+            rc_overlay: false,
+            session_policy: None,
+            idle_secs,
+        };
+        let none = serde_json::to_string(&req(None)).unwrap();
+        assert!(!none.contains("idle_secs"), "{none}");
+        let some = serde_json::to_string(&req(Some(900))).unwrap();
+        assert!(some.contains(r#""idle_secs":900"#), "{some}");
+        match serde_json::from_str::<ServerMsg>(&some).unwrap() {
+            ServerMsg::Request { idle_secs, .. } => assert_eq!(idle_secs, Some(900)),
+            _ => panic!("expected Request"),
+        }
+
+        let created = |idle_secs| ServerMsg::SessionCreated {
+            session_id: sid,
+            agent_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
+            permissions: None,
+            record_refused: None,
+            privacy_refused: None,
+            features_refused: None,
+            idle_secs,
+        };
+        let none = serde_json::to_string(&created(None)).unwrap();
+        assert!(!none.contains("idle_secs"), "{none}");
+        match serde_json::from_str::<ServerMsg>(
+            &serde_json::to_string(&created(Some(300))).unwrap(),
+        )
+        .unwrap()
+        {
+            ServerMsg::SessionCreated { idle_secs, .. } => assert_eq!(idle_secs, Some(300)),
+            _ => panic!("expected SessionCreated"),
+        }
+
+        // An agent's terminate naming the limit, and one from before the field.
+        let up = serde_json::to_string(&ClientMsg::Terminate {
+            session_id: sid,
+            reason: EndReason::IdleTimeout,
+            limit: Some("idle".into()),
+        })
+        .unwrap();
+        assert!(up.contains(r#""reason":"idle_timeout""#), "{up}");
+        assert!(up.contains(r#""limit":"idle""#), "{up}");
+        match serde_json::from_str::<ClientMsg>(&up).unwrap() {
+            ClientMsg::Terminate { limit, .. } => assert_eq!(limit.as_deref(), Some("idle")),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let older = r#"{"t":"rc:terminate","session_id":"507f1f77bcf86cd799439011","reason":"idle_timeout"}"#;
+        match serde_json::from_str::<ClientMsg>(older).unwrap() {
+            ClientMsg::Terminate { reason, limit, .. } => {
+                assert_eq!(reason, EndReason::IdleTimeout);
+                assert_eq!(limit, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 
@@ -6614,14 +6725,21 @@ mod tests {
         let up = ClientMsg::Terminate {
             session_id: sid,
             reason: EndReason::HostDisconnect,
+            limit: None,
         };
         let s = serde_json::to_string(&up).unwrap();
         assert!(s.contains(r#""t":"rc:terminate""#), "{s}");
         assert!(s.contains(r#""reason":"host_disconnect""#), "{s}");
+        assert!(!s.contains("limit"), "no limit is skipped: {s}");
         match serde_json::from_str::<ClientMsg>(&s).unwrap() {
-            ClientMsg::Terminate { session_id, reason } => {
+            ClientMsg::Terminate {
+                session_id,
+                reason,
+                limit,
+            } => {
                 assert_eq!(session_id, sid);
                 assert_eq!(reason, EndReason::HostDisconnect);
+                assert_eq!(limit, None);
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -6673,6 +6791,7 @@ mod tests {
             serde_json::to_value(ClientMsg::Terminate {
                 session_id: ObjectId::new(),
                 reason,
+                limit: None,
             })
             .unwrap()["reason"]
                 .clone()

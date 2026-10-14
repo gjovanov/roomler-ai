@@ -719,12 +719,21 @@ pub(crate) async fn carry_out(
     // The owner's own purge needs no word; another names why.
     let why = (p.reason != PurgeReason::Owner.as_str()).then_some(p.reason.as_str());
     audit(state, p, user, "issued", why).await;
+    let mut elsewhere = Vec::new();
     for d in p
         .devices
         .iter()
         .filter(|d| d.state == PurgeEntryState::Pending)
     {
-        send(state, p, d.device_id).await;
+        if send(state, p, d.device_id).await == Sent::NotHere {
+            elsewhere.push(d.device_id);
+        }
+    }
+    // P2g-3b — a device whose socket is on another pod: the pod that holds
+    // it pushes the purge there. One that is online nowhere is told at its
+    // next connection, as before.
+    if !elsewhere.is_empty() {
+        tell_other_pods(state, p, &elsewhere).await;
     }
     if p.complete() {
         finish(state, p.id).await;
@@ -757,26 +766,64 @@ async fn drop_room(state: &HiveState, tenant_id: ObjectId, room: ObjectId) {
     }
 }
 
+/// What [`send`] did with a device's purge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    /// Pushed to the device's connection on this pod.
+    Here,
+    /// Its connection on this pod does not purge: its entry says so.
+    Unsupported,
+    /// The device is not connected to this pod.
+    NotHere,
+}
+
 /// Send `device` its purge, when this server can: a connection that does not
 /// purge gets nothing, and its entry says so.
-async fn send(state: &HiveState, p: &HivePurge, device: ObjectId) {
+async fn send(state: &HiveState, p: &HivePurge, device: ObjectId) -> Sent {
     let msg = ServerMsg::HivePurge {
         purge_id: p.id,
         session_id: p.session_id,
     };
     match state.fleet.rc_hub.push_hive_purge(device, p.tenant_id, msg) {
         Ok(()) => {
-            info!(purge = %p.id, session = %p.session_id, device = %device, "hive: purge sent")
+            info!(purge = %p.id, session = %p.session_id, device = %device, "hive: purge sent");
+            Sent::Here
         }
         Err(HubError::ExecUnsupported(_)) => {
             debug!(purge = %p.id, device = %device, "hive: the device's agent does not purge — it waits for one that does");
             if let Err(e) = state.purges.note(p.id, device, UNSUPPORTED).await {
                 warn!(purge = %p.id, %e, "hive: a purge's undeliverable entry was not noted");
             }
+            Sent::Unsupported
         }
-        // Not connected here: told on its next connection.
-        Err(e) => debug!(purge = %p.id, device = %device, %e, "hive: purge not sent now"),
+        // Not connected here: on another pod, or told on its next connection.
+        Err(e) => {
+            debug!(purge = %p.id, device = %device, %e, "hive: purge not sent from this pod");
+            Sent::NotHere
+        }
     }
+}
+
+/// P2g-3b — `devices` are not connected to this pod: publish the purge on the
+/// cluster's control channel, and the pod that holds each one's socket pushes
+/// it there (fleet's `hive_purge`, `ctrl.rs`). Sent only once its tombstone
+/// names it, as every delivery is ([`delivered`]): this runs right after the
+/// purge took. No Redis, one pod: nothing to publish to, and the device is
+/// told at its next connection.
+async fn tell_other_pods(state: &HiveState, p: &HivePurge, devices: &[ObjectId]) {
+    let agent_ids: Vec<String> = devices.iter().map(|d| d.to_hex()).collect();
+    roomler_ai_mod_fleet::ctrl::publish_rc_ctrl(
+        &state.core,
+        "hive_purge",
+        serde_json::json!({
+            "tenant_id": p.tenant_id.to_hex(),
+            "purge_id": p.id.to_hex(),
+            "session_id": p.session_id.to_hex(),
+            "agent_ids": agent_ids,
+        }),
+    )
+    .await;
+    debug!(purge = %p.id, devices = devices.len(), "hive: purge published for the devices on other pods");
 }
 
 /// Which of `purges` may be sent: each while its session's tombstone names
@@ -837,7 +884,8 @@ pub(crate) async fn reconcile_purges(
     };
     for p in &pending {
         if purges {
-            send(state, p, device_id).await;
+            // On this connection, so here or nowhere.
+            let _ = send(state, p, device_id).await;
         } else if let Err(e) = state.purges.note(p.id, device_id, UNSUPPORTED).await {
             warn!(purge = %p.id, %e, "hive: a purge's undeliverable entry was not noted");
         }
