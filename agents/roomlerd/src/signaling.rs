@@ -17,7 +17,7 @@ use roomler_ai_remote_control::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::config::AgentConfig;
@@ -1278,8 +1278,11 @@ async fn connect_once(
     // sit here indefinitely, never giving the outer backoff loop a
     // chance to fire. The timeout becomes another `Transient` so the
     // backoff handles it like any other connection failure.
+    // #2187 — the server's address comes from `ctl_dns`: a name resolved
+    // before never waits on a resolver that has stopped answering (an exit
+    // whose DNS died kept a dropped control WS from ever reconnecting).
     let (mut ws, response) =
-        match tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(&url)).await {
+        match tokio::time::timeout(WS_CONNECT_TIMEOUT, crate::ws_connect::connect(&url)).await {
             Ok(Ok(pair)) => pair,
             Ok(Err(e)) => {
                 if let tokio_tungstenite::tungstenite::Error::Http(ref resp) = e
