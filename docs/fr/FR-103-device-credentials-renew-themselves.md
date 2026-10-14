@@ -155,6 +155,7 @@ Rollout:
 
 | # | Cell | Host | Result |
 |---|---|---|---|
+| 1 | AC1 RED: the released agent (0.4.134), an attended per-Machine install enrolled by a standard user, the knob `ROOMLERD_TOKEN_RENEW_BEFORE_DAYS=400` set as a Machine env var, then a reboot | vmtest Win11 guest | 2026-10-14 02:06–02:16Z: the device list's `token_expires_at` stayed `2027-10-14T00:24:54Z` (the enrollment's) for 5 min after the device came back, and neither prod pod logged an `fr-103: agent token renewed` line for it in 6 h. As expected: 0.4.134 has no renewal. |
 
 ## 9. Related
 
