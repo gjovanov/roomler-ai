@@ -1476,6 +1476,21 @@ pub struct Agent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ssh_host_pubkey: String,
     pub agent_token_hash: String,
+    /// FR-103: the token generation. An agent token is accepted only while
+    /// its `gen` claim equals this. Removing the device bumps it
+    /// (`AgentDao::soft_delete`), so every token minted before the removal
+    /// is refused, even after the same machine re-enrolls and revives this
+    /// row. Enrollment and renewal mint at the current value. 0 on every row
+    /// that was never removed, which is also what every pre-FR-103 token
+    /// carries.
+    #[serde(default)]
+    pub token_gen: u32,
+    /// FR-103: the `exp` of the agent token this device last connected with,
+    /// stamped at each socket connect. What the device list shows as "the
+    /// credential expires", so a device nearing its anniversary can be found
+    /// before it drops. `None` on rows that have not connected since FR-103.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_exp: Option<DateTime>,
     pub status: AgentStatus,
     pub last_seen_at: DateTime,
     /// P4 — the presence value (`online`/`stale`/`offline`) most recently
@@ -2273,6 +2288,9 @@ pub struct TunnelClient {
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub deleted_at: Option<DateTime>,
+    /// FR-103: the token generation, as for [`Agent::token_gen`].
+    #[serde(default)]
+    pub token_gen: u32,
 }
 
 impl TunnelClient {

@@ -86,7 +86,22 @@ pub struct AgentClaims {
     pub exp: i64,
     pub iss: String,
     pub token_type: TokenType,
+    /// FR-103: the device row's token generation when this token was minted.
+    /// Removing a device bumps the row's generation, so every token minted
+    /// before the removal is refused, even after the same machine re-enrolls
+    /// and revives the row. Every token minted before FR-103 has none: 0,
+    /// which matches every row that was never removed.
+    #[serde(default, rename = "gen")]
+    pub generation: u32,
 }
+
+/// FR-103: how long past its `exp` an agent or tunnel-client token may still
+/// buy a fresh one, on the renew routes ONLY. A device that slept through its
+/// anniversary updates (the release routes are unauthenticated), renews and
+/// reconnects without hands on the machine. Long enough for a laptop left in
+/// a drawer over a holiday quarter, short enough that a year-old stolen token
+/// stays dead. Every other route enforces `exp` as before.
+pub const RENEWAL_GRACE_SECS: i64 = 90 * 24 * 60 * 60;
 
 /// FR-94 — claims carried by a Windows device's SYSTEM-service credential.
 /// The agent token's shape plus `anchor_id`, which names the anchor that
@@ -120,6 +135,9 @@ pub struct TunnelClientClaims {
     pub exp: i64,
     pub iss: String,
     pub token_type: TokenType,
+    /// FR-103: the client row's token generation, as for [`AgentClaims::generation`].
+    #[serde(default, rename = "gen")]
+    pub generation: u32,
 }
 
 /// Claims carried by a tunnel-enrollment token. Mirrors
@@ -457,12 +475,15 @@ impl AuthService {
         }
     }
 
-    /// Mint a long-lived agent token (default TTL from settings.refresh_token_ttl_secs
-    /// unless `override_ttl_secs` is provided).
+    /// Mint a long-lived agent token at the device row's token generation
+    /// `gen` (FR-103). The TTL is one year unless `override_ttl_secs` is
+    /// given; the server passes `rc.agent_token_ttl_secs`. A device renews its
+    /// token well before then (`POST /api/agent/self/renew`).
     pub fn issue_agent_token(
         &self,
         agent_id: ObjectId,
         tenant_id: ObjectId,
+        generation: u32,
         override_ttl_secs: Option<u64>,
     ) -> Result<String, AuthError> {
         let now = Utc::now();
@@ -474,6 +495,7 @@ impl AuthService {
             exp: (now + Duration::seconds(ttl as i64)).timestamp(),
             iss: self.jwt_settings.issuer.clone(),
             token_type: TokenType::Agent,
+            generation,
         };
         encode(&self.header(), &claims, &self.signing.encoding)
             .map_err(|e| AuthError::InvalidToken(e.to_string()))
@@ -485,6 +507,38 @@ impl AuthService {
             return Err(AuthError::InvalidToken("Not an agent token".to_string()));
         }
         Ok(claims)
+    }
+
+    /// FR-103: verify an agent token for the renew route ONLY. The signature,
+    /// issuer and audience are checked as everywhere, but `exp` may lie up to
+    /// [`RENEWAL_GRACE_SECS`] in the past, so a device that slept through its
+    /// anniversary can still buy a fresh token. Every other route uses
+    /// [`Self::verify_agent_token`], which enforces `exp`.
+    pub fn verify_agent_token_for_renewal(&self, token: &str) -> Result<AgentClaims, AuthError> {
+        let claims = self.decode_any::<AgentClaims>(token, &self.renewal_validation())?;
+        if claims.token_type != TokenType::Agent {
+            return Err(AuthError::InvalidToken("Not an agent token".to_string()));
+        }
+        Self::within_renewal_grace(claims.exp, Utc::now().timestamp())?;
+        Ok(claims)
+    }
+
+    /// The validation for the renew routes: [`Self::validation`] without the
+    /// `exp` check, which [`Self::within_renewal_grace`] replaces with a
+    /// bounded one.
+    fn renewal_validation(&self) -> Validation {
+        let mut validation = self.validation();
+        validation.validate_exp = false;
+        validation
+    }
+
+    /// A token renews while `exp` is in the future or at most
+    /// [`RENEWAL_GRACE_SECS`] in the past. Split out for the tests.
+    fn within_renewal_grace(exp: i64, now: i64) -> Result<(), AuthError> {
+        if exp + RENEWAL_GRACE_SECS < now {
+            return Err(AuthError::TokenExpired);
+        }
+        Ok(())
     }
 
     /// FR-94 — mint the credential of a device's SYSTEM service: `sub` = the
@@ -568,13 +622,15 @@ impl AuthService {
         Ok(claims)
     }
 
-    /// Mint a long-lived tunnel-client token (default TTL 1 year, override
-    /// via `override_ttl_secs`). Mirrors [`issue_agent_token`].
+    /// Mint a long-lived tunnel-client token at the client row's token
+    /// generation `gen` (FR-103). Default TTL one year, override via
+    /// `override_ttl_secs`. Mirrors [`Self::issue_agent_token`].
     pub fn issue_tunnel_client_token(
         &self,
         tunnel_client_id: ObjectId,
         tenant_id: ObjectId,
         owner_user_id: ObjectId,
+        generation: u32,
         override_ttl_secs: Option<u64>,
     ) -> Result<String, AuthError> {
         let now = Utc::now();
@@ -587,9 +643,27 @@ impl AuthService {
             exp: (now + Duration::seconds(ttl as i64)).timestamp(),
             iss: self.jwt_settings.issuer.clone(),
             token_type: TokenType::TunnelClient,
+            generation,
         };
         encode(&self.header(), &claims, &self.signing.encoding)
             .map_err(|e| AuthError::InvalidToken(e.to_string()))
+    }
+
+    /// FR-103: [`Self::verify_tunnel_client_token`] for the renew route ONLY,
+    /// with the same bounded grace past `exp` as
+    /// [`Self::verify_agent_token_for_renewal`].
+    pub fn verify_tunnel_client_token_for_renewal(
+        &self,
+        token: &str,
+    ) -> Result<TunnelClientClaims, AuthError> {
+        let claims = self.decode_any::<TunnelClientClaims>(token, &self.renewal_validation())?;
+        if claims.token_type != TokenType::TunnelClient {
+            return Err(AuthError::InvalidToken(
+                "Not a tunnel-client token".to_string(),
+            ));
+        }
+        Self::within_renewal_grace(claims.exp, Utc::now().timestamp())?;
+        Ok(claims)
     }
 
     pub fn verify_tunnel_client_token(&self, token: &str) -> Result<TunnelClientClaims, AuthError> {
@@ -637,7 +711,9 @@ mod tests {
         let s = svc();
         let agent_id = ObjectId::new();
         let tenant_id = ObjectId::new();
-        let token = s.issue_agent_token(agent_id, tenant_id, Some(60)).unwrap();
+        let token = s
+            .issue_agent_token(agent_id, tenant_id, 0, Some(60))
+            .unwrap();
         let claims = s.verify_agent_token(&token).unwrap();
         assert_eq!(claims.sub, agent_id.to_hex());
         assert_eq!(claims.tenant_id, tenant_id.to_hex());
@@ -671,7 +747,7 @@ mod tests {
         let s = svc();
         let agent_id = ObjectId::new();
         let tenant = ObjectId::new();
-        let token = s.issue_agent_token(agent_id, tenant, Some(60)).unwrap();
+        let token = s.issue_agent_token(agent_id, tenant, 0, Some(60)).unwrap();
         let err = s.verify_enrollment_token(&token).unwrap_err();
         matches!(err, AuthError::InvalidToken(_));
     }
@@ -707,7 +783,7 @@ mod tests {
         // And _any refuses every other audience — an agent token here would
         // mean any enrolled device could mint sibling devices.
         let agent_token = s
-            .issue_agent_token(ObjectId::new(), tenant, Some(60))
+            .issue_agent_token(ObjectId::new(), tenant, 0, Some(60))
             .unwrap();
         assert!(s.verify_enrollment_token_any(&agent_token).is_err());
     }
@@ -742,7 +818,7 @@ mod tests {
 
         // And the agent token, the one the user can read, is not a service
         // credential.
-        let agent_token = s.issue_agent_token(agent, tenant, Some(60)).unwrap();
+        let agent_token = s.issue_agent_token(agent, tenant, 0, Some(60)).unwrap();
         assert!(s.verify_agent_service_token(&agent_token).is_err());
         let (enroll, _) = s
             .issue_enrollment_token(ObjectId::new(), tenant, 600)
@@ -776,7 +852,7 @@ mod tests {
         let tid = ObjectId::new();
         let uid = ObjectId::new();
         let token = s
-            .issue_tunnel_client_token(cid, tid, uid, Some(60))
+            .issue_tunnel_client_token(cid, tid, uid, 0, Some(60))
             .unwrap();
         let claims = s.verify_tunnel_client_token(&token).unwrap();
         assert_eq!(claims.sub, cid.to_hex());
@@ -833,7 +909,7 @@ mod tests {
     fn tunnel_client_verify_rejects_agent_token() {
         let s = svc();
         let t = s
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), Some(60))
+            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
         let err = s.verify_tunnel_client_token(&t).unwrap_err();
         assert!(matches!(err, AuthError::InvalidToken(_)));
@@ -884,7 +960,7 @@ mod tests {
     fn tunnel_enrollment_verify_rejects_agent_token() {
         let s = svc();
         let t = s
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), Some(60))
+            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
         let err = s.verify_tunnel_enrollment_token(&t).unwrap_err();
         assert!(matches!(err, AuthError::InvalidToken(_)));
@@ -904,7 +980,13 @@ mod tests {
     fn tunnel_enrollment_verify_rejects_tunnel_client_token() {
         let s = svc();
         let t = s
-            .issue_tunnel_client_token(ObjectId::new(), ObjectId::new(), ObjectId::new(), Some(60))
+            .issue_tunnel_client_token(
+                ObjectId::new(),
+                ObjectId::new(),
+                ObjectId::new(),
+                0,
+                Some(60),
+            )
             .unwrap();
         let err = s.verify_tunnel_enrollment_token(&t).unwrap_err();
         assert!(matches!(err, AuthError::InvalidToken(_)));
@@ -916,7 +998,13 @@ mod tests {
     fn agent_verify_rejects_tunnel_client_token() {
         let s = svc();
         let t = s
-            .issue_tunnel_client_token(ObjectId::new(), ObjectId::new(), ObjectId::new(), Some(60))
+            .issue_tunnel_client_token(
+                ObjectId::new(),
+                ObjectId::new(),
+                ObjectId::new(),
+                0,
+                Some(60),
+            )
             .unwrap();
         let err = s.verify_agent_token(&t).unwrap_err();
         assert!(matches!(err, AuthError::InvalidToken(_)));
@@ -936,7 +1024,13 @@ mod tests {
     fn access_verify_rejects_tunnel_client_token() {
         let s = svc();
         let t = s
-            .issue_tunnel_client_token(ObjectId::new(), ObjectId::new(), ObjectId::new(), Some(60))
+            .issue_tunnel_client_token(
+                ObjectId::new(),
+                ObjectId::new(),
+                ObjectId::new(),
+                0,
+                Some(60),
+            )
             .unwrap();
         let err = s.verify_access_token(&t).unwrap_err();
         assert!(matches!(err, AuthError::InvalidToken(_)));
@@ -958,6 +1052,7 @@ mod tests {
             exp: (Utc::now() + Duration::seconds(60)).timestamp(),
             iss: "roomler-ai-test".to_string(),
             token_type: TokenType::Agent,
+            generation: 0,
         };
         // `Header::default()` is exactly what every pre-rotation mint used.
         let legacy = encode(&Header::default(), &claims, &a.signing.encoding).unwrap();
@@ -991,7 +1086,7 @@ mod tests {
         let a = svc_with(SECRET_A, "");
         let b = svc_with(SECRET_B, "");
         let t = a
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), Some(60))
+            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
         let kid = jsonwebtoken::decode_header(&t).unwrap().kid.expect("kid");
 
@@ -1016,7 +1111,7 @@ mod tests {
     fn rotation_keeps_tokens_minted_under_the_previous_secret() {
         let old = svc_with(SECRET_A, "");
         let old_token = old
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), Some(60))
+            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
 
         // The flag day, for contrast: swap the secret and carry nothing over.
@@ -1033,7 +1128,7 @@ mod tests {
 
         // …and it signs with the NEW key, not the retired one.
         let fresh = rotated
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), Some(60))
+            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
         assert_eq!(
             jsonwebtoken::decode_header(&fresh).unwrap().kid.unwrap(),
@@ -1053,7 +1148,7 @@ mod tests {
     fn a_forged_kid_buys_nothing() {
         let s = svc_with(SECRET_A, "");
         let foreign = svc_with(SECRET_B, "")
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), Some(60))
+            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
 
         // Signed with B, but re-labelled to name A's key.
@@ -1115,12 +1210,99 @@ mod tests {
             exp: (Utc::now() - Duration::seconds(3600)).timestamp(),
             iss: "roomler-ai-test".to_string(),
             token_type: TokenType::Agent,
+            generation: 0,
         };
         let expired = encode(&s.header(), &claims, &s.signing.encoding).unwrap();
         assert!(matches!(
             s.verify_agent_token(&expired),
             Err(AuthError::TokenExpired)
         ));
+    }
+
+    /// FR-103: the renew route's verifier takes a token up to
+    /// `RENEWAL_GRACE_SECS` past its `exp`, and nothing older. Every other
+    /// route keeps refusing an expired token outright.
+    #[test]
+    fn an_expired_token_renews_within_the_grace_and_not_after() {
+        let s = svc_with(SECRET_A, SECRET_B);
+        let mint = |exp_offset: i64| {
+            let claims = AgentClaims {
+                sub: ObjectId::new().to_hex(),
+                tenant_id: ObjectId::new().to_hex(),
+                iat: Utc::now().timestamp() - 400 * 24 * 3600,
+                exp: Utc::now().timestamp() + exp_offset,
+                iss: "roomler-ai-test".to_string(),
+                token_type: TokenType::Agent,
+                generation: 3,
+            };
+            encode(&s.header(), &claims, &s.signing.encoding).unwrap()
+        };
+        let day = 24 * 3600;
+
+        let lapsed = mint(-30 * day);
+        assert!(
+            matches!(s.verify_agent_token(&lapsed), Err(AuthError::TokenExpired)),
+            "an ordinary route still refuses it"
+        );
+        let renewed = s.verify_agent_token_for_renewal(&lapsed).unwrap();
+        assert_eq!(
+            renewed.generation, 3,
+            "the generation survives the round trip"
+        );
+
+        let fresh = mint(30 * day);
+        assert!(s.verify_agent_token_for_renewal(&fresh).is_ok());
+
+        let too_old = mint(-RENEWAL_GRACE_SECS - day);
+        assert!(matches!(
+            s.verify_agent_token_for_renewal(&too_old),
+            Err(AuthError::TokenExpired)
+        ));
+
+        // The renewal verifier is still an AGENT verifier: no other audience.
+        let tunnel = s
+            .issue_tunnel_client_token(
+                ObjectId::new(),
+                ObjectId::new(),
+                ObjectId::new(),
+                0,
+                Some(60),
+            )
+            .unwrap();
+        assert!(s.verify_agent_token_for_renewal(&tunnel).is_err());
+        assert!(s.verify_tunnel_client_token_for_renewal(&tunnel).is_ok());
+    }
+
+    /// FR-103: every agent and tunnel-client token minted before FR-103 has
+    /// no `gen` claim. It must parse as generation 0, which equals every row
+    /// that was never removed, or deploying FR-103 would refuse the whole
+    /// fleet.
+    #[test]
+    fn a_token_minted_before_fr103_has_generation_zero() {
+        #[derive(Serialize)]
+        struct PreFr103 {
+            sub: String,
+            tenant_id: String,
+            iat: i64,
+            exp: i64,
+            iss: String,
+            token_type: TokenType,
+        }
+        let s = svc_with(SECRET_A, SECRET_B);
+        let legacy = encode(
+            &s.header(),
+            &PreFr103 {
+                sub: ObjectId::new().to_hex(),
+                tenant_id: ObjectId::new().to_hex(),
+                iat: Utc::now().timestamp(),
+                exp: Utc::now().timestamp() + 60,
+                iss: "roomler-ai-test".to_string(),
+                token_type: TokenType::Agent,
+            },
+            &s.signing.encoding,
+        )
+        .unwrap();
+        assert_eq!(s.verify_agent_token(&legacy).unwrap().generation, 0);
     }
 
     /// `alg: none` is the oldest JWT forgery there is. `jsonwebtoken` refuses

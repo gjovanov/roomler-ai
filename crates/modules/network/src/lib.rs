@@ -524,7 +524,10 @@ impl Module for NetworkState {
         // TunnelClient bearer token — so it rides the no-middleware router).
         let public_tunnel = Router::new()
             .route("/enroll", post(routes::tunnel::enroll_tunnel_client))
-            .route("/agents", get(routes::tunnel::list_tenant_agents));
+            .route("/agents", get(routes::tunnel::list_tenant_agents))
+            // FR-103 — a client renews its own token (a bounded grace past
+            // `exp`, the row checked).
+            .route("/renew", post(routes::tunnel::renew_tunnel_client));
 
         // The unified device listing is NOT here. It joins fleet's agents
         // with this module's tunnel clients and overlay nodes, and P7b put

@@ -361,6 +361,9 @@ impl Module for FleetState {
             .route("/installer/{flavour}", get(agent_release::installer_proxy))
             .route("/crash", post(agent_crash::ingest))
             .route("/self/unenroll", post(agent::self_unenroll))
+            // FR-103 — a device renews its own agent token (a bounded grace
+            // past `exp`, the row checked like `AuthAgent`).
+            .route("/self/renew", post(agent::self_renew))
             // FR-94 — a Windows device's SYSTEM service. The anchor takes an
             // admin-issued enrollment token, and the claim and the result take
             // the service's OWN credential (`AuthAgentService`), never the
