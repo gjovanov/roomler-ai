@@ -19,6 +19,8 @@ use crate::config::AgentConfig;
 /// served install scripts set these rather than passing the flags, so an
 /// agent from before P3 — which has no such flag and would refuse it —
 /// still enrolls from a post-P3 script; it simply ignores the variables.
+/// For the same reason a value in them that this build does not know is
+/// clamped, never refused ([`resolve_install`]).
 pub const INSTALL_METHOD_ENV: &str = "ROOMLER_INSTALL_METHOD";
 pub const INSTALL_SCOPE_ENV: &str = "ROOMLER_INSTALL_SCOPE";
 
@@ -67,9 +69,21 @@ pub struct EnrollInputs<'a> {
 /// CLI flags first, the environment second, and `manual` when neither
 /// says: a person typed the command. The scope defaults to `unknown`.
 ///
-/// A value outside the vocabulary is an ERROR here, not a clamp: the caller
-/// is the operator's own command line (or a script we wrote), and a typo
-/// should be seen at the prompt rather than stored as `other` forever.
+/// A value outside the vocabulary is judged by where it came from:
+///
+/// - from a **flag** it is an ERROR — the operator's own command line, and a
+///   typo should be seen at the prompt, before the single-use token is
+///   spent, rather than stored as `other` forever;
+/// - from the **environment** it is CLAMPED (`other` / `unknown`) with a
+///   warning, never refused. The variables are set by the served scripts,
+///   which are compiled into the SERVER (`include_str!` in
+///   `setup_release.rs`) and roll with a promote, while the daemon they
+///   install comes from the agent release channel: a script can learn a
+///   spelling before the daemon it installs does, and refusing it would
+///   fail every scripted enrollment until the next agent release. The trace
+///   is a measurement; it never costs a device its enrollment — the server
+///   clamps the same way ([`InstallInfo::clamped`]).
+///
 /// Spellings: [`InstallMethod::ALL`] and [`InstallScope::ALL`].
 pub fn resolve_install(cli_method: Option<&str>, cli_scope: Option<&str>) -> Result<InstallInfo> {
     let env = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
@@ -89,21 +103,40 @@ pub fn resolve_install_from(
     env_method: Option<&str>,
     env_scope: Option<&str>,
 ) -> Result<InstallInfo> {
-    /// The raw value and where it came from, CLI first.
+    /// The raw value, where it came from, and whether that was the flag —
+    /// CLI first.
     fn source<'a>(
         flag: &'static str,
         env_key: &'static str,
         cli: Option<&'a str>,
         env: Option<&'a str>,
-    ) -> Option<(&'a str, &'static str)> {
-        cli.map(|v| (v.trim(), flag))
-            .or_else(|| env.map(|v| (v.trim(), env_key)))
+    ) -> Option<(&'a str, &'static str, bool)> {
+        cli.map(|v| (v.trim(), flag, true))
+            .or_else(|| env.map(|v| (v.trim(), env_key, false)))
     }
-    fn refuse(what: &str, raw: &str, origin: &str, allowed: &[&str]) -> anyhow::Error {
-        anyhow::anyhow!(
-            "invalid install {what} {raw:?} from {origin}: expected one of {}",
-            allowed.join(", ")
-        )
+    /// A spelling outside the vocabulary: refused from a flag, clamped to
+    /// `fallback` (with a warning) from the environment.
+    fn unknown_spelling<T>(
+        what: &str,
+        raw: &str,
+        origin: &str,
+        from_flag: bool,
+        allowed: &[&str],
+        fallback: T,
+        fallback_wire: &str,
+    ) -> Result<T> {
+        if from_flag {
+            bail!(
+                "invalid install {what} {raw:?} from {origin}: expected one of {}",
+                allowed.join(", ")
+            );
+        }
+        tracing::warn!(
+            value = raw,
+            origin,
+            "install {what} not known to this build; enrolling with {fallback_wire:?}"
+        );
+        Ok(fallback)
     }
 
     let method = match source(
@@ -113,17 +146,39 @@ pub fn resolve_install_from(
         env_method,
     ) {
         None => InstallMethod::Manual,
-        Some((raw, origin)) => InstallMethod::parse(raw).ok_or_else(|| {
-            let allowed: Vec<&str> = InstallMethod::ALL.iter().map(|m| m.wire()).collect();
-            refuse("method", raw, origin, &allowed)
-        })?,
+        Some((raw, origin, from_flag)) => match InstallMethod::parse(raw) {
+            Some(m) => m,
+            None => {
+                let allowed: Vec<&str> = InstallMethod::ALL.iter().map(|m| m.wire()).collect();
+                unknown_spelling(
+                    "method",
+                    raw,
+                    origin,
+                    from_flag,
+                    &allowed,
+                    InstallMethod::Other,
+                    InstallMethod::Other.wire(),
+                )?
+            }
+        },
     };
     let scope = match source("--install-scope", INSTALL_SCOPE_ENV, cli_scope, env_scope) {
         None => InstallScope::Unknown,
-        Some((raw, origin)) => InstallScope::parse(raw).ok_or_else(|| {
-            let allowed: Vec<&str> = InstallScope::ALL.iter().map(|s| s.wire()).collect();
-            refuse("scope", raw, origin, &allowed)
-        })?,
+        Some((raw, origin, from_flag)) => match InstallScope::parse(raw) {
+            Some(s) => s,
+            None => {
+                let allowed: Vec<&str> = InstallScope::ALL.iter().map(|s| s.wire()).collect();
+                unknown_spelling(
+                    "scope",
+                    raw,
+                    origin,
+                    from_flag,
+                    &allowed,
+                    InstallScope::Unknown,
+                    InstallScope::Unknown.wire(),
+                )?
+            }
+        },
     };
     Ok(InstallInfo::new(method, scope))
 }
@@ -819,16 +874,11 @@ mod tests {
             r(Some("container"), Some("system"), None, None).unwrap(),
             ("container".to_string(), "system".to_string())
         );
-        // A value outside the vocabulary is refused at the prompt, whichever
-        // way it arrived, and the message names the origin.
+        // A value outside the vocabulary from a FLAG is refused at the
+        // prompt, and the message names the flag and the spellings.
         let e = r(Some("Snap"), None, None, None).unwrap_err().to_string();
         assert!(
-            e.contains("--install-method") && e.contains("\"Snap\""),
-            "{e}"
-        );
-        let e = r(None, None, Some("script"), None).unwrap_err().to_string();
-        assert!(
-            e.contains(INSTALL_METHOD_ENV) && e.contains("script-sh"),
+            e.contains("--install-method") && e.contains("\"Snap\"") && e.contains("script-sh"),
             "{e}"
         );
         let e = r(None, Some("user"), None, None).unwrap_err().to_string();
@@ -836,6 +886,22 @@ mod tests {
             e.contains("--install-scope") && e.contains("per-user"),
             "{e}"
         );
+        // From the ENVIRONMENT it is clamped, never refused: the served
+        // scripts set the variables and roll with the server, so a script
+        // can know a spelling the daemon it installs does not — that must
+        // still enroll.
+        assert_eq!(
+            r(None, None, Some("script-brew"), Some("fleet-wide")).unwrap(),
+            ("other".to_string(), "unknown".to_string())
+        );
+        assert_eq!(
+            r(None, None, Some("script"), Some("system")).unwrap(),
+            ("other".to_string(), "system".to_string()),
+            "each half is clamped on its own"
+        );
+        // A flag still wins over the env for its half — and a bad flag is
+        // refused even when the env beside it is fine.
+        assert!(r(Some("Snap"), None, Some("script-sh"), None).is_err());
         // `unknown` is a server-side value, but a caller may spell it out.
         assert_eq!(r(Some("unknown"), None, None, None).unwrap().0, "unknown");
     }

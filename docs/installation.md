@@ -67,11 +67,14 @@ ROOMLER_INSTALL_METHOD=container ROOMLER_INSTALL_SCOPE=system roomlerd enroll �
 
 `--install-method` ∈ `wizard` `script-sh` `script-ps1` `msi` `deb` `pkg` `manual`
 `container` `other`; `--install-scope` ∈ `system` `per-user` `attended` `unknown`.
-The flag beats the env var; a misspelling is refused at the prompt, before the
-single-use token is spent. ⚠️ The served scripts set the **environment**, never
-the flag: a script installs whatever release is current, and a daemon from
-before the flag existed would refuse an argument it does not know. A `re-enroll`
-sends nothing and leaves the row's recorded install alone.
+The flag beats the env var. A misspelled **flag** is refused at the prompt,
+before the single-use token is spent; an unknown **env** value enrolls as
+`other` / `unknown` with a warning, because the variables usually come from a
+script that can be newer than the daemon it installs. ⚠️ The served scripts set
+the **environment**, never the flag: a script installs whatever release is
+current, and a daemon from before the flag existed would refuse an argument it
+does not know. A `re-enroll` sends nothing and leaves the row's recorded install
+alone.
 
 ### "The host must be re-enrolled" — when to believe it
 

@@ -275,8 +275,16 @@ function Install-Daemon {
     $env:ROOMLER_INSTALL_SCOPE = 'system'
     if ($Role -eq 'daemon-user') { $env:ROOMLER_INSTALL_SCOPE = 'per-user' }
     if ($Role -eq 'daemon-machine') { $env:ROOMLER_INSTALL_SCOPE = 'attended' }
-    & $daemon @enrollArgs
-    if ($LASTEXITCODE -ne 0) { throw "enrollment failed (exit $LASTEXITCODE)" }
+    try {
+        & $daemon @enrollArgs
+        $enrollExit = $LASTEXITCODE
+    } finally {
+        # $env: is process-wide, and an `irm | iex` run shares the caller's
+        # process: left set, a later hand-typed enroll in the same window
+        # would be recorded as this script's.
+        Remove-Item Env:ROOMLER_INSTALL_METHOD, Env:ROOMLER_INSTALL_SCOPE -ErrorAction SilentlyContinue
+    }
+    if ($enrollExit -ne 0) { throw "enrollment failed (exit $enrollExit)" }
 
     # Kick the autostart so the daemon picks up the fresh config now
     # rather than at the next logon / service cycle. Best-effort.
