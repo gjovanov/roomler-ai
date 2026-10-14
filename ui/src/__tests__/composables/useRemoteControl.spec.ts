@@ -71,8 +71,10 @@ import {
   nextStallTicks,
   isDeadAir,
   agentIsWaiting,
+  advanceEndsWait,
   mediaWaitingCopy,
   RC_MEDIA_WAITING_GRACE_MS,
+  RC_MEDIA_WAITING_SETTLE_MS,
   classifyDegraded,
   RC_REHOME_MAX_REDIALS,
   rehomeRetryDecision,
@@ -4121,6 +4123,18 @@ describe('FR-93: an agent that says it cannot capture is believed', () => {
     expect(agentIsWaiting(w, 1_000_000 + RC_MEDIA_WAITING_GRACE_MS)).toBe(false)
   })
 
+  // FR-93 P5f — the agent's last frame travels on the video channel and its
+  // notice on the control one, so a tick that counted frames from before the
+  // notice (plus one stats poll) must not end the wait. Measured on the lab:
+  // it did, and the watchdog re-created the session 10 s later.
+  it('only media counted after the notice settles ends a wait', () => {
+    const since = 10_000
+    expect(advanceEndsWait(true, 9_500, since)).toBe(false)
+    expect(advanceEndsWait(true, since + RC_MEDIA_WAITING_SETTLE_MS - 1, since)).toBe(false)
+    expect(advanceEndsWait(true, since + RC_MEDIA_WAITING_SETTLE_MS, since)).toBe(true)
+    expect(advanceEndsWait(false, since + 5_000, since)).toBe(false)
+  })
+
   // FR-93 P5b — the overlay says what the host waits for. GNOME's lock screen
   // (#2145) ends no request, so it shows no "if nobody answers" deadline; an
   // unknown `for` from a newer agent reads as the dialog it most likely is.
@@ -4139,6 +4153,11 @@ describe('FR-93: an agent that says it cannot capture is believed', () => {
     expect(dark.title).toMatch(/display is asleep/)
     expect(dark.status).toBe('waiting for the display to wake')
     expect(dark.showsDeadline).toBe(false)
+    // FR-93 P5f — this user's session in the background (a user switch).
+    const away = mediaWaitingCopy('session_away')
+    expect(away.title).toMatch(/another session/)
+    expect(away.status).toBe("waiting for this user's session to be on screen")
+    expect(away.showsDeadline).toBe(false)
   })
 
   it('a frameless two minutes inside a wait neither probes nor re-creates the session', () => {

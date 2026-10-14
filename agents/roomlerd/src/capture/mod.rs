@@ -1961,6 +1961,11 @@ pub enum WaitFor {
     /// idle blank), so DRM has no scanout to read. Input wakes it, the
     /// viewer's too where it reaches the host.
     DisplayWake,
+    /// FR-93 P5f — bring this user's session back on screen: the seat shows
+    /// the login screen or another user's session (a user switch), and a
+    /// per-user install captures only its own user's session, which its
+    /// compositor stops drawing while it is in the background.
+    SessionAway,
 }
 
 /// What a pump hands [`open_default_async`]: called at most once, if and when
