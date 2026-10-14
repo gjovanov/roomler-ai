@@ -23,6 +23,8 @@ import {
   notMeasuredLabel,
   figureLabel,
   humanKey,
+  rateIfEnough,
+  SMALL_N,
 } from '@/stores/growth'
 import { api } from '@/api/client'
 
@@ -48,6 +50,15 @@ describe('growth helpers', () => {
     )
     expect(figureLabel({ day: 2, d7: 9, d28: 31 })).toBe('2 (7d 9 · 28d 31)')
     expect(humanKey('orgs_devices')).toBe('Orgs devices')
+  })
+
+  it('shows a rate only once the settled denominator reaches the n-floor', () => {
+    // P2 — below SMALL_N the UI shows counts and hides the percentage.
+    expect(rateIfEnough(5, SMALL_N - 1)).toBeNull()
+    expect(rateIfEnough(0, 0)).toBeNull()
+    expect(rateIfEnough(15, 30)).toBe(50)
+    expect(rateIfEnough(1, 300)).toBe(0.3)
+    expect(SMALL_N).toBe(30)
   })
 })
 
@@ -89,6 +100,25 @@ describe('useGrowthStore', () => {
     await store.fetchPreview('2026-10-13', true)
     expect(mockApi.get).toHaveBeenCalledWith(
       '/admin/growth/digest/preview?day=2026-10-13&include_internal=true',
+    )
+  })
+
+  it('fetches the funnel, cohorts, orgs and a timeline at the P2 routes', async () => {
+    const store = useGrowthStore()
+    mockApi.get.mockResolvedValue({})
+    await store.fetchFunnel()
+    expect(mockApi.get).toHaveBeenCalledWith('/admin/growth/funnel')
+    await store.fetchFunnel({ by: 'source', includeInternal: true })
+    expect(mockApi.get).toHaveBeenCalledWith(
+      '/admin/growth/funnel?by=source&include_internal=true',
+    )
+    await store.fetchCohorts()
+    expect(mockApi.get).toHaveBeenCalledWith('/admin/growth/cohorts?unit=week')
+    await store.fetchOrgs(50)
+    expect(mockApi.get).toHaveBeenCalledWith('/admin/growth/orgs?limit=50')
+    await store.fetchTimeline('69a1dbbad2000f26adc875ce')
+    expect(mockApi.get).toHaveBeenCalledWith(
+      '/admin/growth/org/69a1dbbad2000f26adc875ce/timeline',
     )
   })
 })

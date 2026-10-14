@@ -183,8 +183,9 @@ async fn fleet_enrollments(
 }
 
 /// RFC 3339, `YYYY-MM-DD` (midnight UTC) or unix seconds; anything else is
-/// a 400 naming the parameter.
-fn parse_instant(raw: &str, param: &str) -> Result<DateTime, ApiError> {
+/// a 400 naming the parameter. Shared with the growth funnel (FR-102 P2),
+/// whose window is the same three forms.
+pub(crate) fn parse_instant(raw: &str, param: &str) -> Result<DateTime, ApiError> {
     let raw = raw.trim();
     let bad = || {
         ApiError::BadRequest(format!(
