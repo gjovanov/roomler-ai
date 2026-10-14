@@ -286,6 +286,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         rc_clipboard: Default::default(),
         rc_files: Default::default(),
         rc_audio: Default::default(),
+        // FR-101 P1b — TLS to the server; a lab says otherwise on the device.
+        allow_plaintext_server: false,
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,
@@ -541,43 +543,18 @@ pub fn preserve_operator_config(fresh: AgentConfig, existing: AgentConfig) -> Ag
 /// TLS there just breaks the enroll POST with a `wrong version number` SSL error.
 /// A remote host (the production case) is still upgraded.
 fn normalize_server_url(raw: &str) -> String {
-    let trimmed = raw.trim_end_matches('/');
-    if let Some(rest) = trimmed.strip_prefix("http://") {
-        if is_loopback_authority(rest) {
-            return trimmed.to_string();
-        }
+    // FR-101 P1b — the same rule every reader of a server URL applies now
+    // (`roomler_ai_remote_control::server_url`), which reads the URL as
+    // reqwest will: `HTTP:roomler.ai` is plaintext too. No plaintext escape
+    // at enrollment: the token must travel over TLS.
+    let secured = roomler_ai_remote_control::server_url::secure(raw, false);
+    if secured.promoted {
         tracing::warn!(
-            original = trimmed,
+            original = raw,
             "upgrading http:// to https:// — enrollment tokens must travel over TLS"
         );
-        return format!("https://{rest}");
     }
-    trimmed.to_string()
-}
-
-/// Is the `host[:port][/path]` authority a loopback host? Handles
-/// `127.0.0.1:41003`, `localhost`, `[::1]:8080`, and any `127.0.0.0/8` /
-/// IPv6-loopback literal.
-fn is_loopback_authority(after_scheme: &str) -> bool {
-    // Drop any path, then the port. Bracketed IPv6 keeps its `:`s until the
-    // brackets are stripped, so split the path first, then rsplit the port only
-    // when the last segment can't be part of an unbracketed host.
-    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
-    let host = if let Some(inner) = authority.strip_prefix('[') {
-        // `[::1]:8080` → `::1`
-        inner.split(']').next().unwrap_or(inner)
-    } else if let Some((h, _port)) = authority.rsplit_once(':') {
-        // Only treat the tail as a port if the head still looks like a host
-        // (an unbracketed IPv6 has multiple `:` — leave it whole for the parse).
-        if h.contains(':') { authority } else { h }
-    } else {
-        authority
-    };
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false)
+    secured.url.trim_end_matches('/').to_string()
 }
 
 fn detect_os() -> OsKind {
@@ -609,6 +586,11 @@ mod tests {
         assert_eq!(
             normalize_server_url("http://10.0.0.5:3000"),
             "https://10.0.0.5:3000"
+        );
+        // FR-101 P1b — spelled as reqwest would still dial it in plaintext.
+        assert_eq!(
+            normalize_server_url(" HTTP:roomler.ai/ "),
+            "https://roomler.ai"
         );
     }
 

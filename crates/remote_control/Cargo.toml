@@ -42,3 +42,5 @@ server = ["dep:mongodb"]
 
 [dev-dependencies]
 tokio-test.workspace = true
+# FR-101 P1b: `server_url`'s tests read each URL the way its dialler does.
+url = "2"

@@ -2823,6 +2823,17 @@ where
                             .into(),
                     }
                 }
+                // FR-101 P1b — and whether this device may reach its server
+                // without TLS. Equality, like the arm above.
+                Ok(Request::ConfigSet { key, .. })
+                    if key == "allow_plaintext_server" && !peer.is_console_user() =>
+                {
+                    Response::Error {
+                        message: "only the person at this device's console can let it reach \
+                              its server without TLS"
+                            .into(),
+                    }
+                }
                 Ok(Request::ConfigSet { key, value }) => {
                     state.config_set(&key, value.as_deref()).await
                 }
@@ -6858,6 +6869,43 @@ mod tests {
             let r = ask(
                 me,
                 r#"{"t":"config_set","d":{"key":"files_dir","value":"~\\Desktop"}}"#,
+            )
+            .await;
+            assert!(!is_console_refusal(&r), "{r:?}");
+        }
+    }
+
+    /// FR-101 P1b — whether this device may reach its server without TLS is
+    /// the console person's call: an unidentified peer is refused, set AND
+    /// clear, while the console user reaches the state. The match is on the
+    /// exact key.
+    #[tokio::test]
+    async fn only_the_console_user_lets_the_device_skip_tls() {
+        for line in [
+            r#"{"t":"config_set","d":{"key":"allow_plaintext_server","value":"true"}}"#,
+            r#"{"t":"config_set","d":{"key":"allow_plaintext_server"}}"#,
+        ] {
+            let r = ask(ClientPeer::UNKNOWN, line).await;
+            assert!(
+                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("without TLS")),
+                "{line} → {r:?}"
+            );
+        }
+        let r = ask(
+            ClientPeer::UNKNOWN,
+            r#"{"t":"config_set","d":{"key":"allow_plaintext_server_x","value":"true"}}"#,
+        )
+        .await;
+        assert!(!is_console_refusal(&r), "{r:?}");
+        let me = ClientPeer {
+            session_id: console_session_id(),
+            uid: own_uid(),
+            system_account: None,
+        };
+        if me.is_console_user() {
+            let r = ask(
+                me,
+                r#"{"t":"config_set","d":{"key":"allow_plaintext_server","value":"true"}}"#,
             )
             .await;
             assert!(!is_console_refusal(&r), "{r:?}");
