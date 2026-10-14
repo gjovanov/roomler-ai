@@ -2,8 +2,8 @@
 
 **Issue:** [#2127](https://github.com/gjovanov/roomler-ai/issues/2127) · **Status:** in progress — claimed
 2026-10-13 (#2128); P1a live (promoted with `hosted-20261014-fbc8f22`), AC1 field-verified; purestat PS0a +
-PS1 live as v0.1.8 since 2026-10-13 23:36Z, AC2 field-verified; P1b–c (#2172) and P1d (#2175) merged with
-their production config (roomler-ai-deploy#29), waiting for a promote · **Owner:** web / public site + saas + fleet (install) + purestat · **Anchors:** master `106bd2704`,
+PS1 live as v0.1.8 since 2026-10-13 23:36Z, AC2 field-verified; P1b–c (#2172) and the daily digest P1d
+(#2175) live since 2026-10-14 07:33Z (`hosted-20261014-cc63c4d`), AC23 field-verified · **Owner:** web / public site + saas + fleet (install) + purestat · **Anchors:** master `106bd2704`,
 [purestat](https://github.com/gjovanov/purestat) `9e04332` · **Builds on:**
 [FR-88](FR-88-promotion-attribution-and-site-video.md) (attribution, the activation view),
 [FR-91](FR-91-scheduled-blog-publishing.md) (the blog lane; P3, the organic carry),
@@ -540,7 +540,7 @@ hosted only). §7's retention list grows, and `docs/data-model.md`'s stale TTLs 
 | P1 | §3c on our side: the hosted-only loader, the exclusion list, the taxonomy and its normalisation, the coverage figure | `ANALYTICS = null`; an empty exclusion list | P1a (the loader) **live** via `hosted-20261014-fbc8f22`; P1b–c (taxonomy, exclusions) **merged** #2172 `1a70f3bb8`; the coverage figure lands with the digest's headline |
 | PS0a | §3n PS0, the code, in purestat | per item | **live** 2026-10-13 23:36Z: purestat v0.1.8 (gjovanov/purestat#13, build fix #14; purestat-deploy#9) |
 | PS0b | §3n PS0, the infrastructure, in purestat-deploy | — | — |
-| P1d | §3l: the daily digest (the job, `growth_digests`, the email, the JSON routes, the Digest view); every section not yet built says which phase brings it | `ROOMLER__GROWTH__DIGEST_ENABLED=false` (the default) | **merged** #2175 `33c634bd1`; enabled in production config with its purestat key (roomler-ai-deploy#29 `46f9f31eb`); live at the next promote |
+| P1d | §3l: the daily digest (the job, `growth_digests`, the email, the JSON routes, the Digest view); every section not yet built says which phase brings it | `ROOMLER__GROWTH__DIGEST_ENABLED=false` (the default) | **live** since 2026-10-14 07:33Z (`hosted-20261014-cc63c4d`, with roomler-ai-deploy#29's config and purestat key); the first digest (2026-10-13) was mailed at 07:35Z |
 | P2 | §3d: definitions, `growth_org_daily`, the funnel/cohorts/orgs/timeline endpoints, the Growth page (Overview, Orgs, Cohorts) | `ROOMLER__GROWTH__ENABLED=false` (the routes answer 404) | — |
 | P3 | §3e 1–4 and 6: issuance record, fetch counters, the enroll's `install` (server, agent, scripts, wizard), the Install panel | counters off by config; the agent sends `install` only when it is set | — |
 | P3b | §3e 5: the wizard's opt-in diagnostics, after D4 | the checkbox; `ROOMLER__GROWTH__SETUP_DIAGNOSTICS=false` | — |
@@ -619,11 +619,14 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
 - [ ] **AC22 (docs):** `docs/growth-observability.md` with mermaid diagrams (the two planes, the install
   trace, the funnel definitions) and the `/observability` page as a whole, linked from `docs/README.md`;
   `docs/data-model.md`'s TTLs corrected.
-- [ ] **AC23 (P1d):** with two pods racing, the digest of a closed day is stored once and mailed once
+- [x] **AC23 (P1d):** with two pods racing, the digest of a closed day is stored once and mailed once
   (integration test: two concurrent runs, one insert, one send). Its sign-up, org, device, session and
   newsletter counts equal a hand count from Mongo for the same day (field log). Without a purestat key,
   the website, blog and campaign sections read "not measured", never 0 (control). Neither the stored JSON
   nor the email carries an email address, a person's name or an IP (test).
+  *(CI: the integration suite on #2175. Field, production 2026-10-14: the 2026-10-13 digest was stored and
+  mailed once, `attempts: 1`, with both pods running; its counts equal the hand counts; its stored
+  sections carry no `@`. §8.)*
 
 ## 6. Open decisions (defaults in bold)
 
@@ -679,6 +682,7 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
 | 2026-10-13/14 | purestat v0.1.6 → v0.1.8 (production; purestat-deploy#9, rolled 23:36Z) | AC2: probes posted to production ingest, then read back from ClickHouse | **red** on v0.1.6: a `pageview` with page address `http://localhost:5173/…` was stored (23:34Z). **green** on v0.1.8: the same probe answered 202 and stored nothing (23:36Z), as did one from `https://fork.example.net/…` (00:08Z); the control, a `pageview` on `https://roomler.ai/fr102-ps0a-positive-control`, was stored (00:08Z). Also on v0.1.8: `/api/health` 200, `/api/oauth/google` 404, `POST /api/v1/query` without a key 401. The backend image passed the integration suite against itself before the roll (44/44). Between the roll and the control, ingest saw no real traffic (the host nginx logged only an AhrefsBot hit before the roll and the probes), so the quiet half hour was traffic, not a fault |
 | 2026-10-14 | production `hosted-20261014-fbc8f22` (P1a promoted by another session's 00:28Z promote) | AC1, the production control: Playwright on `https://roomler.ai`, every purestat request aborted before it left, `navigator.webdriver` spoofed false, then left true | **green**: with webdriver false, 1 tracker request per page on `/`, `/login`, `/docs/`, `/blog/` and `/links/`; with webdriver true, 0 on `/`, `/login`, `/docs/` and `/links/`. ⚠️ `/blog/` still made 1: the blog lane (release `20261013T144949Z`) was built before P1a by the promotion pipeline's copy of the generator and serves the old direct tag, so it lacks the WebDriver exclusion until it is rebuilt. The served SPA carries no purestat tag, and docs pages carry the loader with `data-hosts="roomler.ai,www.roomler.ai"` |
 | 2026-10-14 | purestat v0.1.8, production | the purestat key for roomler2: minted with only its hash stored, tested, and sealed (roomler-ai-deploy#29) | a `POST /api/v1/query` for 2026-10-13 with the key: 200, **44 visitors / 241 pageviews**, scoped to `roomler.ai` + `www.roomler.ai` (the same day on the v0.1.6 dashboard path counted loopback and engagement rows too). A first key, whose seal failed, was revoked. The secret unsealed in the cluster at the expected length; the digest's switch is on in `roomler2-config` and takes effect at the next promote |
+| 2026-10-14 | production `hosted-20261014-cc63c4d` (another session's 07:23Z promote; the digest config was already merged) | AC23 + the digest's first day: `growth_digests`, read-only Mongo hand counts for 2026-10-13, and the roll's own health | **green**. The pods started 07:33Z and the 2026-10-13 digest was computed and mailed at 07:35:24Z: `status: sent`, `attempts: 1`, `recipients: 2`, one row with both pods running. Digest against hand count: sign-ups 0 = 0, orgs 0 = 0, devices 1 = 1, remote-desktop sessions started 94 = 94, newsletter 0/0/0 = 0/0/0. It excluded 2 users and 6 orgs, and the stored sections contain no `@`. The website section came from purestat (44 visitors, 77 visits, 241 pageviews) and the blog section listed posts with read times. ⚠️ **Campaigns read "not measured: HTTP 400 unknown goal signup"**: the roomler.ai purestat site had no goals at all, so FR-88's four goals had never had definitions to count against. The four (`signup`, `subscribe`, `install-copy`, `github-outbound`, `custom_event`) were created the same morning, and the next digest carries campaign conversions. Fleet after the roll: 32 agents online (29 before), both pods 0 restarts |
 
 ## 9. Related
 
