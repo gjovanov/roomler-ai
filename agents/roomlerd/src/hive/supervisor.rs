@@ -3087,7 +3087,11 @@ impl Supervisor {
             // copies or runs a replicated session: no other has one to tell.
             if me.reports_copies() {
                 let sessions = me.replica_manifest().await;
-                let _ = tx.try_send(ClientMsg::HiveReplicaManifest { sessions });
+                let _ = tx.try_send(ClientMsg::HiveReplicaManifest {
+                    sessions,
+                    // P2g-3c — what this device's own clock purged: P2g-3d.
+                    purged: Vec::new(),
+                });
             }
             // P2d-3b — then each copy it holds asks for its stream, once the
             // server has heard where each one ends. Only while its owner lets

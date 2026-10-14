@@ -12,6 +12,7 @@
 //! | the primary connects | the primary's join it has still to answer `joined` is sent again ([`reconcile_joins`]) |
 //! | `rc:hive.replica.join_ack` | the member is `joined`, or `refused` with the device's word ([`on_join_ack`]) |
 //! | `rc:hive.replica.tip`, and each entry of `rc:hive.replica.manifest` | the member's tip is kept ([`on_tip`]) |
+//! | P2g-3c — a copy `rc:hive.replica.manifest` says the device's own clock purged | that member's row is refused `purged` ([`on_copy_purged`]) |
 //!
 //! ⚠️ A member's join is pushed only to a connection advertising
 //! `hive-replica`: the device answers it, and its owner lets it hold copies.
@@ -28,8 +29,8 @@
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_remote_control::{
     hive::{
-        HiveFenceMark, HiveJoinRefusal, HiveReplicaManifestEntry, HiveReplicaRole, is_hash_hex,
-        replica_limits,
+        HiveCopyPurged, HiveFenceMark, HiveJoinRefusal, HiveReplicaManifestEntry, HiveReplicaRole,
+        is_hash_hex, replica_limits, retain_limits,
     },
     signaling::ServerMsg,
 };
@@ -341,19 +342,51 @@ pub(crate) async fn on_tip(state: &HiveState, device_id: ObjectId, tip: HiveRepl
 }
 
 /// `rc:hive.replica.manifest` — every session the device holds a copy of,
-/// each tip kept as [`on_tip`] keeps one. An oversized list is no device's,
-/// and changes nothing.
+/// each tip kept as [`on_tip`] keeps one; and (P2g-3c) each copy the
+/// device's own clock purged, which it no longer holds ([`on_copy_purged`]).
+/// An oversized list is no device's, and changes nothing.
 pub(crate) async fn on_manifest(
     state: &HiveState,
     device_id: ObjectId,
     sessions: Vec<HiveReplicaManifestEntry>,
+    purged: Vec<HiveCopyPurged>,
 ) {
-    if sessions.len() > replica_limits::MAX_REPLICA_MANIFEST {
-        warn!(device = %device_id, entries = sessions.len(), "hive: an oversized replica manifest — ignored");
+    if sessions.len() > replica_limits::MAX_REPLICA_MANIFEST
+        || purged.len() > retain_limits::MAX_COPY_PURGED
+    {
+        warn!(
+            device = %device_id, entries = sessions.len(), purged = purged.len(),
+            "hive: an oversized replica manifest — ignored"
+        );
         return;
     }
     for tip in sessions {
         on_tip(state, device_id, tip).await;
+    }
+    for p in purged {
+        on_copy_purged(state, device_id, p).await;
+    }
+}
+
+/// FR-90 P2g-3c — the device purged its copy of a session on its own clock:
+/// its member row, while the replicaset counts on it, is refused `purged`, as
+/// a join it answered so would be. Placement no longer counts the copy, and
+/// the session's purge closes that part at once ([`crate::purge::holds_nothing`]).
+/// The primary's row is left alone: what a primary's own run left is its
+/// hosted manifest's to say (P1b).
+async fn on_copy_purged(state: &HiveState, device_id: ObjectId, p: HiveCopyPurged) {
+    match state.sessions.member_purged(p.session_id, device_id).await {
+        Ok(true) => info!(
+            session = %p.session_id, device = %device_id, at_ms = p.at_ms,
+            "hive: a member's own clock purged its copy — it is no longer counted"
+        ),
+        Ok(false) => debug!(
+            session = %p.session_id, device = %device_id,
+            "hive: a copy purged on a device's own clock that no replicaset counts on"
+        ),
+        Err(e) => {
+            warn!(session = %p.session_id, %e, "hive: a copy purged on a device's own clock was not recorded")
+        }
     }
 }
 

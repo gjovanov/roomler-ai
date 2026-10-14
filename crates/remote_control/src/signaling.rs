@@ -881,6 +881,14 @@ pub enum ClientMsg {
     HiveReplicaManifest {
         #[serde(default)]
         sessions: Vec<crate::hive::HiveReplicaManifestEntry>,
+        /// FR-90 P2g-3c — copies this device purged on its own clock (the
+        /// retention word, [`crate::hive::HiveRetainWord`]), each named on
+        /// its next [`crate::hive::retain_limits::COPY_PURGED_REPORTS`]
+        /// manifests, at most [`crate::hive::retain_limits::MAX_COPY_PURGED`].
+        /// Absent when empty, so every other manifest is the frame it was,
+        /// and a server before it ignores the field.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        purged: Vec<crate::hive::HiveCopyPurged>,
     },
 
     /// FR-90 P2d — a member asks for a stream of a session it holds a copy
@@ -1051,6 +1059,23 @@ pub enum ClientMsg {
         /// re-clamped on receipt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+    },
+
+    /// FR-90 P2g-3c — what keeps each copy this device holds: the sessions
+    /// it asks about, answered [`ServerMsg::HiveRetain`] on the same
+    /// connection. Asked at each connection, right after the device takes a
+    /// session up, and once a day while it stays connected
+    /// ([`crate::hive::retain_limits::RETAIN_ASK_EVERY_SECS`]). A server
+    /// before it ignores it, and the device then keeps what it holds, as
+    /// before.
+    ///
+    /// ⚠️ Ids only, at most
+    /// [`crate::hive::retain_limits::MAX_RETAIN_ASK`]: a longer ask is no
+    /// device's, and is answered with nothing.
+    #[serde(rename = "rc:hive.retain_ask")]
+    HiveRetainAsk {
+        #[serde(default, with = "vec_oid_hex")]
+        sessions: Vec<ObjectId>,
     },
 
     /// FR-90 P0d-2 — the device's answer to [`ServerMsg::HiveViewGrant`]:
@@ -1857,6 +1882,7 @@ impl ClientMsg {
             ClientMsg::HivePrepareAck { .. } => "rc:hive.prepare_ack",
             ClientMsg::HiveDrained { .. } => "rc:hive.drained",
             ClientMsg::HivePurgeAck { .. } => "rc:hive.purge_ack",
+            ClientMsg::HiveRetainAsk { .. } => "rc:hive.retain_ask",
             ClientMsg::HiveViewGrantAck { .. } => "rc:hive.view.grant_ack",
             ClientMsg::HiveViewAnswer { .. } => "rc:hive.view.answer",
             ClientMsg::HiveViewIce { .. } => "rc:hive.view.ice",
@@ -1964,6 +1990,7 @@ impl ClientMsg {
             | ClientMsg::HivePrepareAck { .. }
             | ClientMsg::HiveDrained { .. }
             | ClientMsg::HivePurgeAck { .. }
+            | ClientMsg::HiveRetainAsk { .. }
             | ClientMsg::HiveViewGrantAck { .. }
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
@@ -2007,6 +2034,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:hive.prepare_ack", Owner::Hive),
     ("rc:hive.drained", Owner::Hive),
     ("rc:hive.purge_ack", Owner::Hive),
+    ("rc:hive.retain_ask", Owner::Hive),
     ("rc:hive.view.grant_ack", Owner::Hive),
     ("rc:hive.view.answer", Owner::Hive),
     ("rc:hive.view.ice", Owner::Hive),
@@ -3471,6 +3499,20 @@ pub enum ServerMsg {
         purge_id: ObjectId,
         #[serde(with = "oid_hex")]
         session_id: ObjectId,
+    },
+
+    /// FR-90 P2g-3c — the answer to [`ClientMsg::HiveRetainAsk`], on the
+    /// connection that asked: for each session asked about whose record names
+    /// this device, what keeps its copy ([`crate::hive::HiveRetainWord`]).
+    /// A session it says nothing of keeps the device's last word, or none: a
+    /// server's silence never deletes. Only a build that asks receives it, so
+    /// no capability word gates it.
+    ///
+    /// ⚠️ Numbers only, and the field set is locked by test.
+    #[serde(rename = "rc:hive.retain")]
+    HiveRetain {
+        #[serde(default)]
+        words: Vec<crate::hive::HiveRetainWord>,
     },
 
     /// FR-90 P2e-3 — a promotion's first step, to the member the session
@@ -4980,6 +5022,7 @@ mod tests {
                 hash,
                 checkpoint: None,
             }],
+            purged: Vec::new(),
         };
         let v = serde_json::to_value(&manifest).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
@@ -5001,9 +5044,74 @@ mod tests {
         assert!(matches!(
             serde_json::from_value::<ClientMsg>(serde_json::json!({"t": "rc:hive.replica.manifest"}))
                 .unwrap(),
-            ClientMsg::HiveReplicaManifest { ref sessions } if sessions.is_empty()
+            ClientMsg::HiveReplicaManifest { ref sessions, ref purged }
+                if sessions.is_empty() && purged.is_empty()
         ));
         assert_eq!(manifest.namespace(), Owner::Hive);
+
+        // P2g-3c — a copy its own clock purged: an id and a time, nothing else.
+        let purged = ClientMsg::HiveReplicaManifest {
+            sessions: Vec::new(),
+            purged: vec![crate::hive::HiveCopyPurged {
+                session_id: sid,
+                at_ms: 1_700_000_000_000,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&purged).unwrap(),
+            serde_json::json!({"t": "rc:hive.replica.manifest", "sessions": [],
+                               "purged": [{"session_id": sid.to_hex(), "at_ms": 1_700_000_000_000_i64}]})
+        );
+    }
+
+    /// FR-90 P2g-3c — the retention word's ask and answer: ids, days and an
+    /// end, the field sets locked. A live session's word names no end, absent
+    /// rather than null, and an answer with no words is still an answer.
+    #[test]
+    fn hive_retain_frames_wire_shape_is_locked() {
+        use crate::hive::HiveRetainWord;
+
+        let (live, over) = (ObjectId::new(), ObjectId::new());
+        let ask = ClientMsg::HiveRetainAsk {
+            sessions: vec![live, over],
+        };
+        assert_eq!(
+            serde_json::to_value(&ask).unwrap(),
+            serde_json::json!({"t": "rc:hive.retain_ask",
+                               "sessions": [live.to_hex(), over.to_hex()]})
+        );
+        assert_eq!(ask.namespace(), Owner::Hive);
+        assert!(matches!(
+            serde_json::from_value::<ClientMsg>(serde_json::json!({"t": "rc:hive.retain_ask"}))
+                .unwrap(),
+            ClientMsg::HiveRetainAsk { ref sessions } if sessions.is_empty()
+        ));
+
+        let answer = ServerMsg::HiveRetain {
+            words: vec![
+                HiveRetainWord {
+                    session_id: live,
+                    days: 90,
+                    ended_at_ms: None,
+                },
+                HiveRetainWord {
+                    session_id: over,
+                    days: 0,
+                    ended_at_ms: Some(1_700_000_000_000),
+                },
+            ],
+        };
+        assert_eq!(
+            serde_json::to_value(&answer).unwrap(),
+            serde_json::json!({"t": "rc:hive.retain", "words": [
+                {"session_id": live.to_hex(), "days": 90},
+                {"session_id": over.to_hex(), "days": 0, "ended_at_ms": 1_700_000_000_000_i64},
+            ]})
+        );
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(serde_json::json!({"t": "rc:hive.retain"})).unwrap(),
+            ServerMsg::HiveRetain { ref words } if words.is_empty()
+        ));
     }
 
     /// FR-90 P1e — the core-memory frame's field set is locked: who, which

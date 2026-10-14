@@ -56,8 +56,9 @@ use dashmap::DashMap;
 use roomler_ai_remote_control::{
     error::Error as HubError,
     hive::{
-        HiveCopyTip, HiveDrainRefusal, HiveJoinRefusal, HiveManifestEntry, HivePurgePart,
-        HiveRefusal, HiveReplicaManifestEntry, HiveRunState, HiveTurnStatus, hive_limits,
+        HiveCopyPurged, HiveCopyTip, HiveDrainRefusal, HiveJoinRefusal, HiveManifestEntry,
+        HivePurgePart, HiveRefusal, HiveReplicaManifestEntry, HiveRunState, HiveTurnStatus,
+        hive_limits,
     },
     signaling::{ClientMsg, ServerMsg},
 };
@@ -116,8 +117,15 @@ enum Report {
     /// P2c-3 — where a member's copy ends (`rc:hive.replica.tip`).
     Tip(HiveReplicaManifestEntry),
     /// P2c-3 — every session the device holds a copy of
-    /// (`rc:hive.replica.manifest`).
-    ReplicaManifest(Vec<HiveReplicaManifestEntry>),
+    /// (`rc:hive.replica.manifest`), and (P2g-3c) each copy its own clock
+    /// purged.
+    ReplicaManifest {
+        sessions: Vec<HiveReplicaManifestEntry>,
+        purged: Vec<HiveCopyPurged>,
+    },
+    /// P2g-3c — what keeps each copy the device holds, asked on this
+    /// connection (`rc:hive.retain_ask`).
+    RetainAsk(Vec<ObjectId>),
     /// P2e-3 — a member's answer to a promotion's prepare
     /// (`rc:hive.prepare_ack`).
     PrepareAck {
@@ -284,7 +292,10 @@ impl AgentMsgHandler for HiveAgentSocket {
                 hash,
                 checkpoint,
             }),
-            ClientMsg::HiveReplicaManifest { sessions } => Report::ReplicaManifest(sessions),
+            ClientMsg::HiveReplicaManifest { sessions, purged } => {
+                Report::ReplicaManifest { sessions, purged }
+            }
+            ClientMsg::HiveRetainAsk { sessions } => Report::RetainAsk(sessions),
             // P2e-3 — applied only to the promotion waiting on THIS device,
             // at the fence it named: the record is the gate.
             ClientMsg::HivePrepareAck {
@@ -696,8 +707,11 @@ async fn apply_reports(
                     .await
             }
             Report::Tip(tip) => crate::replica::on_tip(state, device_id, tip).await,
-            Report::ReplicaManifest(sessions) => {
-                crate::replica::on_manifest(state, device_id, sessions).await
+            Report::ReplicaManifest { sessions, purged } => {
+                crate::replica::on_manifest(state, device_id, sessions, purged).await
+            }
+            Report::RetainAsk(sessions) => {
+                crate::retention::answer(state, tenant_id, device_id, sessions, &conn).await
             }
             Report::PrepareAck {
                 session_id,

@@ -11715,3 +11715,214 @@ async fn a_purge_issued_on_one_pod_reaches_a_device_on_the_other() {
     .await;
     wait_record_gone(&app1, &sid, "the tombstone goes").await;
 }
+
+// ─── P2g-3c — the retention word, the server's half ─────────────────────────
+
+/// Ask what keeps each of `sessions`' copies, as a device: the server's
+/// answer, `None` when none came within [`HOLD`].
+async fn ask_retain(ws: &mut AgentWs, sessions: &[&str]) -> Option<Value> {
+    send(ws, json!({"t": "rc:hive.retain_ask", "sessions": sessions})).await;
+    let deadline = Instant::now() + HOLD;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(100), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&text)
+                    && v["t"] == "rc:hive.retain"
+                {
+                    return Some(v);
+                }
+            }
+            Ok(Some(Ok(_))) | Err(_) => {}
+            Ok(Some(Err(_))) | Ok(None) => break,
+        }
+    }
+    None
+}
+
+/// An answer's words.
+fn words_of(answer: &Value) -> Vec<Value> {
+    answer["words"].as_array().cloned().unwrap_or_default()
+}
+
+/// The stored member row of `device`.
+fn member_row(s: &Document, device: &str) -> Document {
+    let id = ObjectId::parse_str(device).unwrap();
+    s.get_document("replicaset")
+        .unwrap()
+        .get_array("members")
+        .unwrap()
+        .iter()
+        .filter_map(|r| r.as_document())
+        .find(|r| r.get_object_id("device_id").ok() == Some(id))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// FR-90 P2g-3c — a device that asks what keeps its copies hears, for each
+/// session whose record names it, its organization's days and, once the
+/// session is over, its end, as the sweep counts them. A device the record
+/// does not name, another organization's session, one that does not exist
+/// and a tombstone have no word; an oversized ask is answered with nothing.
+#[tokio::test]
+async fn a_device_that_asks_hears_what_keeps_each_copy_its_record_gives_it() {
+    let app = replicaset_app().await;
+    let mut p = purgeable(&app, "retain-word", &[PURGES]).await;
+    let (tid, admin, sid) = (p.tid.clone(), p.admin.clone(), p.sid.clone());
+    let other = purgeable(&app, "retain-word-other", &[]).await;
+    let mut m = p.members.remove(0);
+    let nobody = ObjectId::new().to_hex();
+
+    // A member of a live session: the default days, no end.
+    let answer = ask_retain(&mut m.ws, &[&sid, &other.sid, &nobody])
+        .await
+        .expect("an answer");
+    assert_eq!(
+        words_of(&answer),
+        vec![json!({"session_id": sid, "days": 90})],
+        "a live session's word names no end, and there is none of another org's or of none: {answer}"
+    );
+    // Its primary: the same word.
+    let answer = ask_retain(&mut p.a.ws, &[&sid]).await.expect("an answer");
+    assert_eq!(
+        words_of(&answer),
+        vec![json!({"session_id": sid, "days": 90})]
+    );
+    // A device of the org the record does not name: answered, with nothing.
+    let mut outsider = device(&app, &p.seeded, "mach-retain-word-out", PURGES).await;
+    let answer = ask_retain(&mut outsider.ws, &[&sid])
+        .await
+        .expect("an answer");
+    assert!(
+        words_of(&answer).is_empty(),
+        "a device the record does not name hears no word: {answer}"
+    );
+
+    // The organization's own days.
+    let mut policy = policy_min(2, 1);
+    policy["retention_days"] = json!(30);
+    let (code, body) = put_policy(&app, &tid, &admin, &policy).await;
+    assert_eq!(code, 200, "{body}");
+    let answer = ask_retain(&mut m.ws, &[&sid]).await.expect("an answer");
+    assert_eq!(
+        words_of(&answer),
+        vec![json!({"session_id": sid, "days": 30})],
+        "the organization's days: {answer}"
+    );
+
+    // Over: its end, as the sweep counts it.
+    ended_days_ago(&app, &sid, 2).await;
+    let ended = record_of(&app, &sid)
+        .await
+        .unwrap()
+        .get_datetime("ended_at")
+        .unwrap()
+        .timestamp_millis();
+    let answer = ask_retain(&mut m.ws, &[&sid]).await.expect("an answer");
+    assert_eq!(
+        words_of(&answer),
+        vec![json!({"session_id": sid, "days": 30, "ended_at_ms": ended})],
+        "a session that is over names its end: {answer}"
+    );
+
+    // Too many to be any device's: no answer at all.
+    let many: Vec<String> = (0..=roomler_ai_remote_control::hive::retain_limits::MAX_RETAIN_ASK)
+        .map(|_| ObjectId::new().to_hex())
+        .collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    assert!(
+        ask_retain(&mut m.ws, &many).await.is_none(),
+        "an oversized ask is answered with nothing"
+    );
+
+    // Purged: its purge is its word.
+    let (code, body) = delete_session(&app, &tid, &admin, &sid).await;
+    assert_eq!(code, 200, "{body}");
+    let answer = ask_retain(&mut m.ws, &[&sid]).await.expect("an answer");
+    assert!(
+        words_of(&answer).is_empty(),
+        "a purged session has no word: {answer}"
+    );
+}
+
+/// FR-90 P2g-3c — with the replicaset's switch off, an ask is answered with
+/// nothing, and every device keeps its last word.
+#[tokio::test]
+async fn the_retention_word_is_not_answered_with_the_switch_off() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("retain-off").await;
+    let mut dev = device(&app, &seeded, "mach-retain-off", PURGES).await;
+    let nobody = ObjectId::new().to_hex();
+    assert!(
+        ask_retain(&mut dev.ws, &[&nobody]).await.is_none(),
+        "nothing is answered with the switch off"
+    );
+}
+
+/// FR-90 P2g-3c — a member's manifest that says its own clock purged its
+/// copy: its row is refused `purged` and its tip forgotten, as a join it
+/// answered so would be, so placement no longer counts on it and the
+/// session's purge closes its part at once. The primary's own row is left
+/// alone, and so is the record when a device it does not name says so.
+#[tokio::test]
+async fn a_copy_its_members_own_clock_purged_is_no_longer_counted() {
+    let app = replicaset_app().await;
+    let mut p = purgeable(&app, "retain-purged", &[PURGES]).await;
+    let (tid, admin, sid) = (p.tid.clone(), p.admin.clone(), p.sid.clone());
+    let mut m = p.members.remove(0);
+    let at = bson::DateTime::now().timestamp_millis();
+    let manifest = |sid: &str| {
+        json!({"t": "rc:hive.replica.manifest", "sessions": [],
+               "purged": [{"session_id": sid, "at_ms": at}]})
+    };
+    send(&mut m.ws, tip_at(&sid, 1, 3, "ab")).await;
+    wait_stored(&app, &sid, "the member's tip", |s| {
+        member_row(s, &m.agent_id).contains_key("tip")
+    })
+    .await;
+
+    // The primary saying so of its own session, and a device the record
+    // does not name: neither changes the members. A connection's reports are
+    // applied in order, so once its ask is answered the manifest before it
+    // was read.
+    let before = stored(&app, &sid).await;
+    let mut outsider = device(&app, &p.seeded, "mach-retain-purged-out", PURGES).await;
+    for ws in [&mut p.a.ws, &mut outsider.ws] {
+        send(ws, manifest(&sid)).await;
+        ask_retain(ws, &[&sid])
+            .await
+            .expect("its reports were read");
+    }
+    let members = |s: &Document| {
+        s.get_document("replicaset")
+            .unwrap()
+            .get_array("members")
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        members(&stored(&app, &sid).await),
+        members(&before),
+        "the primary's own row, and a device the record does not name"
+    );
+
+    // The member saying so: refused `purged`, its tip forgotten.
+    send(&mut m.ws, manifest(&sid)).await;
+    let s = wait_stored(&app, &sid, "the member refused purged", |s| {
+        stored_member(s, &m.agent_id).1 == "refused"
+    })
+    .await;
+    let row = member_row(&s, &m.agent_id);
+    assert_eq!(row.get_str("refusal").unwrap(), "purged", "{row}");
+    assert!(!row.contains_key("tip"), "its tip forgotten: {row}");
+
+    // The session's purge closes its part at once: by its own word it holds
+    // nothing.
+    let (code, body) = delete_session(&app, &tid, &admin, &sid).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        entry_of(&body["purge"], &m.agent_id)["state"],
+        "closed",
+        "{body}"
+    );
+    assert_eq!(entry_of(&body["purge"], &p.a.agent_id)["state"], "pending");
+}

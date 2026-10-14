@@ -2524,6 +2524,39 @@ impl Hub {
         })
     }
 
+    /// FR-90 P2g-3c — push `msg` on `tx`, this agent's own connection, as the
+    /// answer to what that connection asked (`rc:hive.retain`): only while it
+    /// is the current one, of `tenant_id`, and runs Hive. As
+    /// [`Self::push_hive_lease_on`], never through the slot, so an answer
+    /// does not move to a newer connection.
+    pub fn push_hive_on(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        tx: &ClientTx,
+        msg: ServerMsg,
+    ) -> Result<()> {
+        {
+            let entry = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+            if entry.tenant_id != tenant_id || !ptr_eq(&entry.tx, tx) {
+                return Err(Error::AgentOffline(agent_id.to_hex()));
+            }
+            if !entry.supports_hive {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
+        }
+        tx.try_send(msg).map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => Error::SendFailed,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                Error::AgentOffline(agent_id.to_hex())
+            }
+        })
+    }
+
     /// FR-90 P2e-3 — record whether this connection takes part in a
     /// promotion (`hive-promote`), right after registration.
     pub fn set_agent_hive_promote_support(&self, agent_id: ObjectId, supports: bool) {
@@ -6137,6 +6170,62 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "an id past the envelope's cap is not applied"
+        );
+    }
+
+    /// FR-90 P2g-3c — an answer goes on the connection that asked, while it
+    /// is the current one, of its tenant, running Hive: never another
+    /// tenant's, never a build without Hive, never a newer connection's.
+    #[tokio::test]
+    async fn an_answer_goes_only_on_the_connection_that_asked() {
+        let hub = test_hub().await;
+        let (agent_id, tenant) = (ObjectId::new(), ObjectId::new());
+        let (tx, _cancel, mut rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+        let answer = || ServerMsg::HiveRetain { words: Vec::new() };
+        let err = hub
+            .push_hive_on(agent_id, tenant, &tx, answer())
+            .expect_err("a build without Hive");
+        assert!(matches!(err, Error::ExecUnsupported(_)), "got {err:?}");
+        hub.set_agent_hive_support(agent_id, true);
+        let err = hub
+            .push_hive_on(agent_id, ObjectId::new(), &tx, answer())
+            .expect_err("another tenant's");
+        assert!(matches!(err, Error::AgentOffline(_)), "got {err:?}");
+        assert!(rx.try_recv().is_err(), "nothing reached it");
+        hub.push_hive_on(agent_id, tenant, &tx, answer())
+            .expect("its own connection");
+        assert!(
+            matches!(rx.try_recv(), Ok(ServerMsg::HiveRetain { .. })),
+            "the answer reached the connection that asked"
+        );
+
+        // A newer connection holds the slot: the old one is answered nothing,
+        // and nothing moves to the new one.
+        let (_tx2, _cancel2, mut rx2) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+        hub.set_agent_hive_support(agent_id, true);
+        assert!(
+            hub.push_hive_on(agent_id, tenant, &tx, answer()).is_err(),
+            "a connection a newer one displaced is answered nothing"
+        );
+        assert!(
+            rx2.try_recv().is_err(),
+            "an answer to the old connection never reaches the new one"
         );
     }
 
