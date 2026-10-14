@@ -15,6 +15,7 @@
 use bson::oid::ObjectId;
 use dashmap::DashMap;
 use parking_lot::Mutex;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{info, warn};
@@ -26,8 +27,8 @@ use roomler_ai_remote_control::consent::{
 };
 use roomler_ai_remote_control::error::{Error, Result};
 use roomler_ai_remote_control::models::{
-    AgentCaps, AuditKind, ConsentMode, EndReason, ExecOutcome, OsKind, RecordCap, RpcCap,
-    SessionPhase,
+    AgentCaps, AuditKind, ConsentMode, EndReason, ExecOutcome, FeaturePolicy, OsKind, RecordCap,
+    RpcCap, SessionPhase, SessionPolicy,
 };
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::session::{ClientTx, LiveSession};
@@ -148,6 +149,11 @@ pub struct ConnectedAgent {
     /// knew the `PRIVACY` name would fail the whole `rc:request` carrying it.
     /// Anything but [`PrivacySupport::Serves`] ⇒ `create_session` strips it.
     pub privacy_support: PrivacySupport,
+    /// FR-101 P2 — the agent advertises `session-policy` in `AgentCaps.rpc`:
+    /// its prompt names the features the policy says to `ask` about. Per
+    /// CONNECTION, like [`Self::privacy_support`]; `false` ⇒ an `ask` feature
+    /// is stripped (`device_cannot_ask`), since an older prompt never names it.
+    pub asks_features: bool,
     /// FR-92 — the agent advertises `keep-busy` in `AgentCaps.input`: it
     /// parses `rc:agent.keep_busy_policy`. Per CONNECTION; a pre-FR-92 agent
     /// would log every policy frame as an unknown `rc:*` at WARN.
@@ -347,6 +353,117 @@ pub fn privacy_grant(
         );
     }
     (permissions, None)
+}
+
+/// FR-101 P2 — why a session feature was refused, keyed by the feature's wire
+/// name (`clipboard`, `files`, `audio`). Empty = nothing refused.
+pub type FeatureRefusals = BTreeMap<&'static str, &'static str>;
+
+/// FR-101 P2 — the org's session policy, as the authz gate could read it.
+///
+/// An enum rather than an `Option` on purpose: on the agent's wire an absent
+/// `session_policy` means "unrestricted", and the opposite sense here behind
+/// the same `None` is the kind of thing a later reader "simplifies".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrgPolicy {
+    /// Read from the tenant row: all `on` for an org that set nothing.
+    Read(SessionPolicy),
+    /// The tenant row could not be read (a database error, or no row). The
+    /// session goes ahead, as it did before the feature, but every feature
+    /// asked for is refused (`policy_unavailable`) rather than granted on a
+    /// guess: a blip must not hand over what an org switched off.
+    Unavailable,
+}
+
+impl OrgPolicy {
+    /// What the agent is told in `ServerMsg::Request::session_policy`: the
+    /// org's policy when it restricts anything, nothing when it does not,
+    /// and all `off` when it could not be read (the hub refused every
+    /// feature, and the agent should hold the same line).
+    pub fn for_agent(self) -> Option<SessionPolicy> {
+        match self {
+            Self::Read(p) => (!p.is_unrestricted()).then_some(p),
+            Self::Unavailable => Some(SessionPolicy {
+                clipboard: FeaturePolicy::Off,
+                files: FeaturePolicy::Off,
+                audio: FeaturePolicy::Off,
+            }),
+        }
+    }
+}
+
+/// FR-101 P2 — the clipboard, files and audio part of a grant under the org's
+/// session policy: [`record_grant`]'s shape, for three features at once.
+/// CLIPBOARD and FILES are permission bits. Audio is `audio_enabled`, which is
+/// what the agent adds its track on (it reads no bit), so the unused AUDIO bit
+/// goes with it. A feature the controller did not ask for is never named.
+///
+/// - `off` strips it, `org_policy_off`, for every controller: the owner, an
+///   ADMINISTRATOR and break-glass alike.
+/// - `ask` keeps it only under [`ConsentMode::Prompt`], the one mode in which
+///   the person at the device is who approves, and only on an agent whose
+///   prompt names the feature (`session-policy`). Otherwise it is stripped:
+///   `needs_consent` when nobody there is asked (`auto`, which covers the
+///   owner's own session without `prompt_owner` and break-glass; `email` and
+///   `push`; `prompt_then_email`, whose approval may come from the owner's
+///   mail instead), else `device_cannot_ask`.
+///
+/// `needs_consent` is named first: it holds whatever the agent's version, so
+/// updating the device would not lift it. A policy that could not be read
+/// refuses every feature asked for, `policy_unavailable`.
+pub fn feature_grant(
+    permissions: Permissions,
+    audio_enabled: bool,
+    policy: OrgPolicy,
+    consent_mode: ConsentMode,
+    agent_asks: bool,
+) -> (Permissions, bool, FeatureRefusals) {
+    let verdict = |pick: fn(&SessionPolicy) -> FeaturePolicy| -> Option<&'static str> {
+        let OrgPolicy::Read(read) = policy else {
+            return Some("policy_unavailable");
+        };
+        match pick(&read) {
+            FeaturePolicy::On => None,
+            FeaturePolicy::Off => Some("org_policy_off"),
+            FeaturePolicy::Ask if consent_mode != ConsentMode::Prompt => Some("needs_consent"),
+            FeaturePolicy::Ask if !agent_asks => Some("device_cannot_ask"),
+            FeaturePolicy::Ask => None,
+        }
+    };
+    let mut permissions = permissions;
+    let mut audio_enabled = audio_enabled;
+    let mut refused = FeatureRefusals::new();
+    if permissions.contains(Permissions::CLIPBOARD)
+        && let Some(why) = verdict(|p| p.clipboard)
+    {
+        permissions -= Permissions::CLIPBOARD;
+        refused.insert("clipboard", why);
+    }
+    if permissions.contains(Permissions::FILES)
+        && let Some(why) = verdict(|p| p.files)
+    {
+        permissions -= Permissions::FILES;
+        refused.insert("files", why);
+    }
+    if (audio_enabled || permissions.contains(Permissions::AUDIO))
+        && let Some(why) = verdict(|p| p.audio)
+    {
+        audio_enabled = false;
+        permissions -= Permissions::AUDIO;
+        refused.insert("audio", why);
+    }
+    (permissions, audio_enabled, refused)
+}
+
+/// FR-101 P2 — [`FeatureRefusals`] for the wire and the audit: `None` when
+/// nothing was refused, so the field stays off both.
+pub fn refusals_wire(refused: &FeatureRefusals) -> Option<BTreeMap<String, String>> {
+    (!refused.is_empty()).then(|| {
+        refused
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    })
 }
 
 pub struct ConnectedController {
@@ -571,6 +688,9 @@ impl Hub {
             // FR-99 — set by `set_agent_privacy_support`; `None` (PRIVACY
             // stripped, never sent) until it is.
             privacy_support: PrivacySupport::None,
+            // FR-101 P2 — set by `set_agent_asks_features`; `false` (an `ask`
+            // feature stripped) until it is.
+            asks_features: false,
             // FR-92 — set by `set_agent_keep_busy_support`; `false` = no
             // policy frame is ever pushed to this connection.
             supports_keep_busy: false,
@@ -980,6 +1100,9 @@ impl Hub {
         // FR-85 P3 — a caller that does not say may NOT record: RECORD is
         // stripped (the safe default for every path but the authz-gated one).
         // #1882 — nor may its session use the overlay: off is the default.
+        // FR-101 P2 — and no org policy is known here, so nothing is
+        // restricted by one: only tests take this path; production sessions
+        // come through `dispatch`, whose context the authz gate filled.
         self.create_session_full(
             agent_id,
             controller_user_id,
@@ -998,6 +1121,7 @@ impl Hub {
             input_mode,
             tenant_name,
             false,
+            OrgPolicy::Read(SessionPolicy::default()),
         )
     }
 
@@ -1029,6 +1153,8 @@ impl Hub {
         // consent prompt. See `ServerMsg::Request::tenant_name`.
         tenant_name: Option<String>,
         may_record: bool,
+        // FR-101 P2 — the org's session policy, read by the authz gate.
+        session_policy: OrgPolicy,
     ) -> Result<ObjectId> {
         // rc.185 — self-heal the fast connect→disconnect race. A controller
         // that connects then drops before teardown completes can leave an
@@ -1092,13 +1218,22 @@ impl Hub {
                     .as_ref()
                     .map(|tx| ptr_eq(tx, &controller_tx) && !tx.is_closed())
                     .unwrap_or(false);
-            is_dup.then(|| (s.id, s.permissions, s.record_refused, s.privacy_refused))
+            is_dup.then(|| {
+                (
+                    s.id,
+                    s.permissions,
+                    s.record_refused,
+                    s.privacy_refused,
+                    s.features_refused.clone(),
+                )
+            })
         });
         if let Some((
             existing_id,
             existing_perms,
             existing_record_refused,
             existing_privacy_refused,
+            existing_features_refused,
         )) = existing
         {
             info!(
@@ -1123,11 +1258,13 @@ impl Hub {
                 record_refused: existing_record_refused.map(str::to_string),
                 // FR-99 — and the same for PRIVACY.
                 privacy_refused: existing_privacy_refused.map(str::to_string),
+                // FR-101 P2 — and for the features the policy refused.
+                features_refused: refusals_wire(&existing_features_refused),
             });
             return Ok(existing_id);
         }
 
-        let (agent_org, agent_arbitrates, agent_records, agent_privacy) = {
+        let (agent_org, agent_arbitrates, agent_records, agent_privacy, agent_asks) = {
             let mut agent = self
                 .inner
                 .agents
@@ -1142,6 +1279,7 @@ impl Hub {
                 agent.input_arbiter,
                 agent.record_support,
                 agent.privacy_support,
+                agent.asks_features,
             )
         };
 
@@ -1205,6 +1343,29 @@ impl Hub {
         let (permissions, privacy_refused) =
             privacy_grant(permissions, override_reason.is_some(), agent_privacy);
 
+        // FR-101 P2 — clipboard, files and audio under the org's policy:
+        // `off` is stripped for every controller, and `ask` survives only a
+        // host prompt that names it. After the FILES grandfathering above, so
+        // a legacy grant's implied FILES is refused like an explicit one;
+        // before `rc:request` is built, so the agent and the viewer see the
+        // same grant. A break-glass session reaches here as `Auto`, so it
+        // never keeps an `ask` feature.
+        let (permissions, audio_enabled, features_refused) = feature_grant(
+            permissions,
+            audio_enabled,
+            session_policy,
+            consent_mode,
+            agent_asks,
+        );
+        if !features_refused.is_empty() {
+            info!(
+                agent = %agent_id.to_hex(),
+                controller = %controller_user_id.to_hex(),
+                refused = ?features_refused,
+                "rc:session.request — session features refused by policy"
+            );
+        }
+
         let session_id = ObjectId::new();
         let (mut live, waiter) = LiveSession::new(
             session_id,
@@ -1226,6 +1387,8 @@ impl Hub {
         live.record_refused = record_refused;
         // FR-99 — likewise.
         live.privacy_refused = privacy_refused;
+        // FR-101 P2 — likewise.
+        live.features_refused = features_refused.clone();
         // Multi-region relay: freeze the session's region NOW — a load-aware
         // pick over the agent's home + its RTT-ordered prefs — so Ready/
         // Offer/Answer all issue from the same PoP regardless of mid-setup
@@ -1255,6 +1418,7 @@ impl Hub {
             permissions: Some(permissions),
             record_refused: record_refused.map(str::to_string),
             privacy_refused: privacy_refused.map(str::to_string),
+            features_refused: refusals_wire(&features_refused),
         });
 
         // Per-mode consent window: modes with an owner-side (email/push) leg get
@@ -1304,6 +1468,10 @@ impl Hub {
             tenant_name,
             // #1882 — may this session's ICE use the overlay (default off).
             rc_overlay,
+            // FR-101 P2 — the org's policy, for an agent that names `ask`
+            // features on its prompt and enforces the rest. Left off the
+            // frame when it restricts nothing, as before the field.
+            session_policy: session_policy.for_agent(),
         };
         // Keep the Request while consent is pending so `register_agent` can
         // re-push it if the agent's control WS flaps before `rc:consent`
@@ -1326,6 +1494,7 @@ impl Hub {
                 permissions,
                 record_stripped: record_refused.map(str::to_string),
                 privacy_stripped: privacy_refused.map(str::to_string),
+                features_stripped: refusals_wire(&features_refused),
             },
         );
         self.audit(session_id, agent_id, agent_org, AuditKind::ConsentPrompted);
@@ -1884,6 +2053,14 @@ impl Hub {
     pub fn set_agent_privacy_support(&self, agent_id: ObjectId, support: PrivacySupport) {
         if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
             entry.privacy_support = support;
+        }
+    }
+
+    /// FR-101 P2 — record whether the agent's prompt names `ask` features
+    /// (its hello's, or a heartbeat's, `AgentCaps.rpc` has `session-policy`).
+    pub fn set_agent_asks_features(&self, agent_id: ObjectId, asks: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.asks_features = asks;
         }
     }
 
@@ -2783,6 +2960,13 @@ pub struct DispatchCtx {
     /// `local_relay` TURN when it is `false`. Ignored for non-request messages
     /// and agent-role dispatch.
     pub rc_overlay: bool,
+    /// FR-101 P2 — the org's session policy for clipboard, files and audio,
+    /// read by the API WS layer's authz gate from the tenant row it already
+    /// loads. `create_session` strips what it refuses (see [`feature_grant`])
+    /// and forwards it to the agent. ⚠️ The cross-pod relay carries it too,
+    /// or a session that lands on the other pod would skip the policy.
+    /// Ignored for non-request messages and agent-role dispatch.
+    pub session_policy: OrgPolicy,
 }
 
 impl Hub {
@@ -2871,6 +3055,7 @@ impl Hub {
                     ctx.input_mode,
                     ctx.tenant_name.clone(),
                     ctx.may_record,
+                    ctx.session_policy,
                 )?;
                 Ok(())
             }
@@ -3376,6 +3561,7 @@ mod tests {
             tenant_name: None,
             may_record: false,
             rc_overlay: false,
+            session_policy: OrgPolicy::Read(SessionPolicy::default()),
         };
         let stranger = ctx_for(Role::Controller, Some(ObjectId::new()), None);
         let owner_ctx = ctx_for(Role::Controller, Some(owner), None);
@@ -3532,6 +3718,7 @@ mod tests {
             tenant_name: None,
             may_record: false,
             rc_overlay: false,
+            session_policy: OrgPolicy::Read(SessionPolicy::default()),
         };
         let device = ctx_for(Role::Agent, None, Some(agent_id));
         let viewer = ctx_for(Role::Controller, Some(owner), None);
@@ -3673,6 +3860,7 @@ mod tests {
                 None,
                 None,
                 may_record,
+                OrgPolicy::Read(SessionPolicy::default()),
             )
             .unwrap();
             match rx.try_recv().unwrap() {
@@ -3774,6 +3962,7 @@ mod tests {
                 None,
                 None,
                 true,
+                OrgPolicy::Read(SessionPolicy::default()),
             )
             .unwrap()
         };
@@ -3904,6 +4093,7 @@ mod tests {
                 None,
                 None,
                 false,
+                OrgPolicy::Read(SessionPolicy::default()),
             )
             .unwrap();
             let (granted, why) = match rx.try_recv().unwrap() {
@@ -3957,6 +4147,301 @@ mod tests {
         let (p, why) = ask(&hub, None);
         assert!(!p.contains(Permissions::PRIVACY));
         assert_eq!(why.as_deref(), Some("device_not_opted_in"));
+    }
+
+    fn policy(clipboard: FeaturePolicy, files: FeaturePolicy, audio: FeaturePolicy) -> OrgPolicy {
+        OrgPolicy::Read(SessionPolicy {
+            clipboard,
+            files,
+            audio,
+        })
+    }
+
+    /// FR-101 P2 — the pure decision, every value and every consent mode.
+    #[test]
+    fn feature_grant_follows_the_org_policy() {
+        use FeaturePolicy::{Ask, Off, On};
+        let all =
+            Permissions::VIEW | Permissions::INPUT | Permissions::CLIPBOARD | Permissions::FILES;
+        let base = Permissions::VIEW | Permissions::INPUT;
+
+        // Unrestricted: everything asked for is kept, nothing named.
+        let (p, audio, why) =
+            feature_grant(all, true, policy(On, On, On), ConsentMode::Auto, false);
+        assert_eq!((p, audio), (all, true));
+        assert!(why.is_empty());
+
+        // `off` strips for every consent mode, and names only what was asked.
+        for mode in [
+            ConsentMode::Auto,
+            ConsentMode::Prompt,
+            ConsentMode::Email,
+            ConsentMode::Push,
+            ConsentMode::PromptThenEmail,
+        ] {
+            let (p, audio, why) = feature_grant(all, true, policy(On, Off, Off), mode, true);
+            assert_eq!(p, base | Permissions::CLIPBOARD, "{mode:?}");
+            assert!(!audio, "{mode:?}");
+            assert_eq!(why.get("files"), Some(&"org_policy_off"), "{mode:?}");
+            assert_eq!(why.get("audio"), Some(&"org_policy_off"), "{mode:?}");
+            assert_eq!(why.get("clipboard"), None, "{mode:?}");
+        }
+        let (p, audio, why) = feature_grant(
+            base,
+            false,
+            policy(Off, Off, Off),
+            ConsentMode::Prompt,
+            true,
+        );
+        assert_eq!((p, audio), (base, false));
+        assert!(why.is_empty(), "nothing asked for, nothing named: {why:?}");
+
+        // `ask` survives only a prompt the device's agent can name it on.
+        let (p, _, why) =
+            feature_grant(all, false, policy(Ask, Ask, On), ConsentMode::Prompt, true);
+        assert_eq!(p, all);
+        assert!(why.is_empty());
+        let (p, _, why) =
+            feature_grant(all, false, policy(Ask, Ask, On), ConsentMode::Prompt, false);
+        assert_eq!(p, base);
+        assert_eq!(why.get("clipboard"), Some(&"device_cannot_ask"));
+        assert_eq!(why.get("files"), Some(&"device_cannot_ask"));
+        // Every other mode asks nobody at the device, whatever the agent can
+        // do — and that reason is named first.
+        for mode in [
+            ConsentMode::Auto,
+            ConsentMode::Email,
+            ConsentMode::Push,
+            ConsentMode::PromptThenEmail,
+        ] {
+            for asks in [true, false] {
+                let (p, audio, why) = feature_grant(all, true, policy(Ask, On, Ask), mode, asks);
+                assert_eq!(p, base | Permissions::FILES, "{mode:?} {asks}");
+                assert!(!audio, "{mode:?} {asks}");
+                assert_eq!(why.get("clipboard"), Some(&"needs_consent"), "{mode:?}");
+                assert_eq!(why.get("audio"), Some(&"needs_consent"), "{mode:?}");
+            }
+        }
+
+        // Audio is the flag, and the unused AUDIO bit goes with it.
+        let (p, audio, why) = feature_grant(
+            base | Permissions::AUDIO,
+            false,
+            policy(On, On, Off),
+            ConsentMode::Prompt,
+            true,
+        );
+        assert_eq!((p, audio), (base, false));
+        assert_eq!(why.get("audio"), Some(&"org_policy_off"));
+
+        // A policy nobody could read refuses every feature asked for, and
+        // nothing else.
+        let (p, audio, why) =
+            feature_grant(all, true, OrgPolicy::Unavailable, ConsentMode::Prompt, true);
+        assert_eq!((p, audio), (base, false));
+        for f in ["clipboard", "files", "audio"] {
+            assert_eq!(why.get(f), Some(&"policy_unavailable"), "{f}");
+        }
+        let (p, audio, why) = feature_grant(
+            base,
+            false,
+            OrgPolicy::Unavailable,
+            ConsentMode::Prompt,
+            true,
+        );
+        assert_eq!((p, audio), (base, false));
+        assert!(why.is_empty());
+    }
+
+    /// FR-101 P2 — what the agent is told: nothing for an unrestricted
+    /// policy (the frame as before the field), the policy otherwise, and all
+    /// `off` when it could not be read.
+    #[test]
+    fn the_agent_is_told_the_policy_only_when_it_restricts() {
+        use FeaturePolicy::{Ask, Off, On};
+        assert_eq!(policy(On, On, On).for_agent(), None);
+        let p = SessionPolicy {
+            clipboard: Ask,
+            files: Off,
+            audio: On,
+        };
+        assert_eq!(OrgPolicy::Read(p).for_agent(), Some(p));
+        assert_eq!(
+            OrgPolicy::Unavailable.for_agent(),
+            Some(SessionPolicy {
+                clipboard: Off,
+                files: Off,
+                audio: Off,
+            })
+        );
+    }
+
+    /// FR-101 P2 — end to end through `create_session_full`: the viewer's
+    /// reasons, the agent's grant and flag, and a duplicate request that
+    /// repeats them.
+    #[tokio::test]
+    async fn the_hub_applies_the_org_policy_to_both_ends() {
+        use FeaturePolicy::{Ask, Off, On};
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Windows,
+            8,
+            true,
+            false,
+        );
+        type Told = (
+            Permissions,
+            Option<BTreeMap<String, String>>,
+            Permissions,
+            bool,
+            Option<SessionPolicy>,
+        );
+        let mut ask = |hub: &Hub,
+                       tx: ClientTx,
+                       rx: &mut mpsc::Receiver<ServerMsg>,
+                       wants: Permissions,
+                       org: OrgPolicy|
+         -> Told {
+            hub.create_session_full(
+                agent_id,
+                ObjectId::new(),
+                "ctl".into(),
+                tx,
+                wants,
+                Vec::new(),
+                None,
+                None,
+                None,
+                true, // audio_enabled
+                ConsentMode::Prompt,
+                None,
+                None,
+                false, // rc_overlay
+                None,
+                None,
+                false,
+                org,
+            )
+            .unwrap();
+            let (granted, refused) = match rx.try_recv().unwrap() {
+                ServerMsg::SessionCreated {
+                    permissions,
+                    features_refused,
+                    ..
+                } => (permissions.unwrap(), features_refused),
+                other => panic!("expected SessionCreated, got {other:?}"),
+            };
+            let (sent, audio, sent_policy) = loop {
+                match agent_rx.try_recv().unwrap() {
+                    ServerMsg::Request {
+                        permissions,
+                        audio_enabled,
+                        session_policy,
+                        ..
+                    } => break (permissions, audio_enabled, session_policy),
+                    _ => continue,
+                }
+            };
+            (granted, refused, sent, audio, sent_policy)
+        };
+        let all =
+            Permissions::VIEW | Permissions::INPUT | Permissions::CLIPBOARD | Permissions::FILES;
+        let org = policy(Ask, Off, Off);
+
+        // An agent that cannot ask: `ask` and `off` both go, each named.
+        let (tx, mut rx) = mpsc::channel(8);
+        let first_tx = tx.clone();
+        let (granted, refused, sent, audio, sent_policy) = ask(&hub, tx, &mut rx, all, org);
+        assert_eq!(granted, Permissions::VIEW | Permissions::INPUT);
+        assert_eq!(sent, granted, "the agent is sent the viewer's grant");
+        assert!(!audio, "no audio track is asked of the agent");
+        let named = refused.expect("named");
+        assert_eq!(
+            named.get("clipboard").map(String::as_str),
+            Some("device_cannot_ask")
+        );
+        assert_eq!(
+            named.get("files").map(String::as_str),
+            Some("org_policy_off")
+        );
+        assert_eq!(
+            named.get("audio").map(String::as_str),
+            Some("org_policy_off")
+        );
+        let OrgPolicy::Read(org_read) = org else {
+            unreachable!()
+        };
+        assert_eq!(sent_policy, Some(org_read), "the agent is told the policy");
+
+        // The same request again on the same connection is coalesced onto
+        // that session (no second prompt), and repeats the same reasons.
+        hub.create_session_full(
+            agent_id,
+            ObjectId::new(),
+            "ctl".into(),
+            first_tx,
+            all,
+            Vec::new(),
+            None,
+            None,
+            None,
+            true,
+            ConsentMode::Prompt,
+            None,
+            None,
+            false,
+            None,
+            None,
+            false,
+            org,
+        )
+        .unwrap();
+        match rx.try_recv().unwrap() {
+            ServerMsg::SessionCreated {
+                features_refused, ..
+            } => assert_eq!(features_refused.as_ref(), Some(&named)),
+            other => panic!("expected the coalesced SessionCreated, got {other:?}"),
+        }
+
+        // An agent whose prompt names `ask` features keeps the clipboard.
+        hub.set_agent_asks_features(agent_id, true);
+        let (tx, mut rx) = mpsc::channel(8);
+        let (granted, refused, sent, _, _) = ask(&hub, tx, &mut rx, all, org);
+        assert_eq!(
+            granted,
+            Permissions::VIEW | Permissions::INPUT | Permissions::CLIPBOARD
+        );
+        assert_eq!(sent, granted);
+        let refused = refused.expect("files and audio still named");
+        assert_eq!(refused.get("clipboard"), None);
+
+        // The legacy grant's implied FILES is refused like an explicit one.
+        let (tx, mut rx) = mpsc::channel(8);
+        let (granted, refused, _, _, _) = ask(
+            &hub,
+            tx,
+            &mut rx,
+            Permissions::default(),
+            policy(On, Off, On),
+        );
+        assert!(!granted.contains(Permissions::FILES));
+        assert_eq!(
+            refused.expect("named").get("files").map(String::as_str),
+            Some("org_policy_off")
+        );
+
+        // An unrestricted org: the frame carries no policy at all.
+        let (tx, mut rx) = mpsc::channel(8);
+        let (granted, refused, _, audio, sent_policy) =
+            ask(&hub, tx, &mut rx, all, policy(On, On, On));
+        assert_eq!(granted, all);
+        assert_eq!(refused, None);
+        assert!(audio);
+        assert_eq!(sent_policy, None);
     }
 
     /// Multi-user P3 — ONE INPUT holder per agent: a second concurrent
@@ -4458,6 +4943,7 @@ mod tests {
                 None,
                 None, // tenant_name
                 false,
+                OrgPolicy::Read(SessionPolicy::default()),
             )
             .unwrap();
 

@@ -10,7 +10,7 @@
 //! "not ours".
 
 use bson::oid::ObjectId;
-use roomler_ai_mod_fleet::hub::DispatchCtx;
+use roomler_ai_mod_fleet::hub::{DispatchCtx, OrgPolicy};
 use roomler_ai_mod_fleet::nudge::{note_agent_offline_evidence, spawn_agent_nudge};
 use roomler_ai_remote_control::{
     models::ConsentMode,
@@ -114,6 +114,7 @@ pub async fn handle_controller_frame(state: &RemoteState, frame: ControllerFrame
         authz.tenant_name,
         authz.may_record,
         authz.rc_overlay,
+        authz.session_policy,
         frame.dialed_tid,
         frame.conn_established_ms,
         frame.connection_id,
@@ -143,6 +144,8 @@ pub async fn dispatch_controller_rc(
     // #1882 — may the session use the overlay (the device's policy, resolved
     // by the same gate)?
     rc_overlay: bool,
+    // FR-101 P2 — the org's session policy (resolved by the same gate).
+    session_policy: OrgPolicy,
     // PR-1 rehome direction inputs: the affinity key this conn DIALED
     // with (None = key-less legacy/racy dial) and when it established.
     dialed_tid: Option<&str>,
@@ -169,6 +172,7 @@ pub async fn dispatch_controller_rc(
         tenant_name: tenant_name.clone(),
         may_record,
         rc_overlay,
+        session_policy,
     };
     // …and so does the cross-pod relay, for the same reason.
     let relay_tenant_name = tenant_name;
@@ -217,6 +221,7 @@ pub async fn dispatch_controller_rc(
                     &relay_tenant_name,
                     may_record,
                     rc_overlay,
+                    session_policy,
                     &frame_val,
                 )
                 .await
@@ -335,6 +340,7 @@ pub async fn dispatch_controller_rc(
                         &relay_tenant_name,
                         may_record,
                         rc_overlay,
+                        session_policy,
                         &frame_val,
                     )
                     .await
@@ -400,6 +406,13 @@ pub struct SessionAuthz {
     /// DEVICE's setting and rides every allowed outcome; `false` on the
     /// early-out paths, which never build a session.
     pub rc_overlay: bool,
+    /// FR-101 P2 — the org's session policy for clipboard, files and audio,
+    /// from the tenant row this gate already reads. It binds every
+    /// controller, the owner and break-glass included (the hub decides what
+    /// `ask` means for each). [`OrgPolicy::Unavailable`] on the early-out
+    /// paths and when the row could not be read, so a database blip refuses
+    /// the features instead of granting them on a guess.
+    pub session_policy: OrgPolicy,
 }
 
 impl SessionAuthz {
@@ -411,6 +424,7 @@ impl SessionAuthz {
             tenant_name: None,
             may_record: false,
             rc_overlay: false,
+            session_policy: OrgPolicy::Unavailable,
         }
     }
     fn allow_with_input(
@@ -418,6 +432,7 @@ impl SessionAuthz {
         input_mode: Option<roomler_ai_remote_control::models::InputMode>,
         tenant_name: Option<String>,
         rc_overlay: bool,
+        session_policy: OrgPolicy,
     ) -> Self {
         Self {
             mode,
@@ -426,6 +441,7 @@ impl SessionAuthz {
             tenant_name,
             may_record: false,
             rc_overlay,
+            session_policy,
         }
     }
     /// FR-85 P3 — set whether this allowed controller may record.
@@ -497,6 +513,12 @@ pub async fn resolve_session_authz(
     if tenant.as_ref().is_some_and(|t| t.is_archived) {
         return Err("this organization is archived; new sessions are blocked".to_string());
     }
+    // FR-101 P2 — the org's session policy, from the same read. A row we
+    // could not see refuses the features rather than guessing they are on.
+    let session_policy = match tenant.as_ref() {
+        Some(t) => OrgPolicy::Read(crate::session_policy::wire(&t.settings.rc_session)),
+        None => OrgPolicy::Unavailable,
+    };
     let tenant_name = tenant.map(|t| t.name);
 
     // Controlling your OWN device is always allowed. Whether it also
@@ -518,6 +540,7 @@ pub async fn resolve_session_authz(
             input_mode,
             tenant_name,
             rc_overlay,
+            session_policy,
         )
         .recording(true));
     }
@@ -544,6 +567,9 @@ pub async fn resolve_session_authz(
                 // consent was skipped, so recording would be covert.
                 may_record: false,
                 rc_overlay,
+                // FR-101 P2 — the org's policy binds break-glass too; its
+                // `Auto` keeps no `ask` feature, since nobody was asked.
+                session_policy,
             });
         }
         return Ok(SessionAuthz::allow_with_input(
@@ -551,6 +577,7 @@ pub async fn resolve_session_authz(
             input_mode,
             tenant_name.clone(),
             rc_overlay,
+            session_policy,
         )
         .recording(true));
     }
@@ -569,6 +596,7 @@ pub async fn resolve_session_authz(
             input_mode,
             tenant_name.clone(),
             rc_overlay,
+            session_policy,
         )
         .recording(may_record));
     }
@@ -578,6 +606,7 @@ pub async fn resolve_session_authz(
             input_mode,
             tenant_name.clone(),
             rc_overlay,
+            session_policy,
         )
         .recording(may_record));
     }
@@ -592,6 +621,7 @@ pub async fn resolve_session_authz(
             input_mode,
             tenant_name.clone(),
             rc_overlay,
+            session_policy,
         )
         .recording(may_record));
     }

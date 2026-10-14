@@ -65,6 +65,63 @@ pub enum PlanEnforcement {
     Enforce,
 }
 
+/// FR-101 P2 — one remote-session feature (clipboard, files, audio), as an org
+/// allows it. Stored lowercase.
+///
+/// ⚠️ A value this build does not know reads as [`Self::Off`], never as an
+/// error: an unknown string would otherwise fail the WHOLE tenant document
+/// after a rollback from a server that wrote it, and the strict direction is
+/// the one a security policy may fail in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RcFeaturePolicy {
+    /// Allowed, subject to the session's grant.
+    #[default]
+    On,
+    /// Allowed only on a session the person at the device approves, on a
+    /// prompt that names the feature. Refused on any other: an auto-granting
+    /// device, the owner's own session without `prompt_owner`, break-glass,
+    /// and an approval by the owner's email or push rather than by the
+    /// person there.
+    Ask,
+    /// Never.
+    Off,
+}
+
+impl<'de> Deserialize<'de> for RcFeaturePolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Any BSON type, not only a string: a number or a null in a
+        // hand-edited row must not fail the document either.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Text(String),
+            Other(serde::de::IgnoredAny),
+        }
+        Ok(match Raw::deserialize(d)? {
+            Raw::Text(s) if s == "on" => Self::On,
+            Raw::Text(s) if s == "ask" => Self::Ask,
+            // "off", anything a newer server may have written, and anything
+            // that is not a string at all.
+            _ => Self::Off,
+        })
+    }
+}
+
+/// FR-101 P2 — the org's remote-desktop session policy: per feature, whether
+/// a session in this org may carry it. Every field defaults to `on`, so a
+/// tenant document from before the feature behaves exactly as it always did.
+/// The hub strips what it refuses (naming why); the device enforces it too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RcSessionPolicy {
+    #[serde(default)]
+    pub clipboard: RcFeaturePolicy,
+    #[serde(default)]
+    pub files: RcFeaturePolicy,
+    #[serde(default)]
+    pub audio: RcFeaturePolicy,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Plan {
@@ -185,6 +242,13 @@ pub struct TenantSettings {
     /// the device cap.
     #[serde(default)]
     pub plan_enforcement: PlanEnforcement,
+
+    /// FR-101 P2 — which sensitive features a remote-desktop session in this
+    /// org may carry (clipboard, files, audio: `on | ask | off`). All `on` by
+    /// default and for every pre-feature row. Readable by any member (every
+    /// session in the org is told its effect), settable with MANAGE_TENANT.
+    #[serde(default)]
+    pub rc_session: RcSessionPolicy,
 }
 
 impl Default for TenantSettings {
@@ -203,6 +267,7 @@ impl Default for TenantSettings {
             keep_busy_denied: false,
             keep_busy_default_pattern: None,
             plan_enforcement: PlanEnforcement::default(),
+            rc_session: RcSessionPolicy::default(),
         }
     }
 }
@@ -357,5 +422,84 @@ impl Plan {
             Plan::Business => 1600,
             Plan::Enterprise => 1600,
         }
+    }
+}
+
+#[cfg(test)]
+mod rc_session_tests {
+    use super::*;
+
+    /// FR-101 P2 — a tenant document from before the feature has no
+    /// `rc_session`: everything stays `on`, exactly today's behaviour.
+    #[test]
+    fn a_pre_feature_tenant_allows_every_session_feature() {
+        let s: TenantSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(s.rc_session, RcSessionPolicy::default());
+        assert_eq!(s.rc_session.clipboard, RcFeaturePolicy::On);
+        assert_eq!(s.rc_session.files, RcFeaturePolicy::On);
+        assert_eq!(s.rc_session.audio, RcFeaturePolicy::On);
+    }
+
+    #[test]
+    fn the_three_values_round_trip_lowercase() {
+        let p = RcSessionPolicy {
+            clipboard: RcFeaturePolicy::Ask,
+            files: RcFeaturePolicy::Off,
+            audio: RcFeaturePolicy::On,
+        };
+        let v = serde_json::to_value(p).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"clipboard":"ask","files":"off","audio":"on"})
+        );
+        let back: RcSessionPolicy = serde_json::from_value(v).unwrap();
+        assert_eq!(back, p);
+    }
+
+    /// A value a newer server wrote reads as `off`: the whole tenant document
+    /// must still load after a rollback, and the strict direction is the only
+    /// one a security policy may fail in.
+    #[test]
+    fn an_unknown_value_reads_as_off_and_never_fails_the_document() {
+        let s: TenantSettings = serde_json::from_value(serde_json::json!({
+            "rc_session": {"clipboard": "on_with_banner", "files": "ask"}
+        }))
+        .unwrap();
+        assert_eq!(s.rc_session.clipboard, RcFeaturePolicy::Off);
+        assert_eq!(s.rc_session.files, RcFeaturePolicy::Ask);
+        assert_eq!(s.rc_session.audio, RcFeaturePolicy::On);
+    }
+
+    /// Not even a string: a number, a null, an object. Each reads as `off`,
+    /// and the document still loads.
+    #[test]
+    fn a_value_of_the_wrong_type_reads_as_off_too() {
+        let s: TenantSettings = serde_json::from_value(serde_json::json!({
+            "rc_session": {"clipboard": 3, "files": null, "audio": {"x": 1}}
+        }))
+        .unwrap();
+        assert_eq!(s.rc_session.clipboard, RcFeaturePolicy::Off);
+        assert_eq!(s.rc_session.files, RcFeaturePolicy::Off);
+        assert_eq!(s.rc_session.audio, RcFeaturePolicy::Off);
+    }
+
+    /// The driver's own path, BSON both ways: what `$set` writes is what the
+    /// typed cursor reads, and a hand-edited Int32 still loads.
+    #[test]
+    fn the_policy_round_trips_through_bson() {
+        let p = RcSessionPolicy {
+            clipboard: RcFeaturePolicy::Off,
+            files: RcFeaturePolicy::Ask,
+            audio: RcFeaturePolicy::On,
+        };
+        let raw = bson::to_raw_document_buf(&p).unwrap();
+        let back: RcSessionPolicy = bson::from_slice(raw.as_bytes()).unwrap();
+        assert_eq!(back, p);
+        let edited = bson::doc! { "clipboard": 1_i32, "files": "ask" };
+        let raw = bson::to_raw_document_buf(&edited).unwrap();
+        let back: RcSessionPolicy = bson::from_slice(raw.as_bytes()).unwrap();
+        assert_eq!(back.clipboard, RcFeaturePolicy::Off);
+        assert_eq!(back.files, RcFeaturePolicy::Ask);
+        assert_eq!(back.audio, RcFeaturePolicy::On);
     }
 }

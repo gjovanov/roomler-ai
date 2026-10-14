@@ -203,6 +203,11 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_privacy_support(agent_id, crate::hub::PrivacySupport::from_caps(&caps));
+    // FR-101 P2 — whether its prompt names the features a policy says to ask
+    // about. Equality-matched through `has_rpc`.
+    state
+        .rc_hub
+        .set_agent_asks_features(agent_id, caps.has_rpc(RpcCap::SessionPolicy));
     state
         .rc_hub
         .set_agent_keep_busy_support(agent_id, supports_keep_busy);
@@ -421,6 +426,7 @@ pub async fn handle_agent_socket(
         tenant_name: None,
         may_record: false,
         rc_overlay: false,
+        session_policy: crate::hub::OrgPolicy::Unavailable,
     };
 
     // Phase A-1 — server-side receive-liveness, symmetric to the agent's
@@ -678,6 +684,13 @@ pub async fn handle_agent_socket(
                                     state.rc_hub.set_agent_privacy_support(
                                         agent_id,
                                         crate::hub::PrivacySupport::from_caps(caps),
+                                    );
+                                    // FR-101 P2 — and whether its prompt names
+                                    // `ask` features, for an agent that updated
+                                    // its words without reconnecting.
+                                    state.rc_hub.set_agent_asks_features(
+                                        agent_id,
+                                        caps.has_rpc(RpcCap::SessionPolicy),
                                     );
                                     // FR-94 — the SYSTEM service came up, was
                                     // anchored, or went away while this worker

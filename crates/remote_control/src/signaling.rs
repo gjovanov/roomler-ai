@@ -2210,6 +2210,18 @@ pub enum ServerMsg {
         /// granted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         privacy_refused: Option<String>,
+        /// FR-101 P2 — the session features the policy took out of what was
+        /// asked for, each with why: `{"files": "org_policy_off"}`. Keys are
+        /// `clipboard`, `files` and `audio`; reasons are `org_policy_off`
+        /// (the organization switched it off), `needs_consent` (the policy
+        /// says to ask, and nobody at the device is asked under this
+        /// session's consent mode) and `device_cannot_ask` (it would be asked,
+        /// but the device's agent cannot name the feature on its prompt).
+        /// A viewer shows the reason rather than a control that silently
+        /// fails. Additive: absent = nothing refused; a key or reason this
+        /// viewer does not know still reads as "not granted".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        features_refused: Option<std::collections::BTreeMap<String, String>>,
     },
 
     /// Sent to the agent when a controller asks for control. The agent prompts
@@ -2311,6 +2323,15 @@ pub enum ServerMsg {
         /// so the default costs nothing on the wire.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         rc_overlay: bool,
+        /// FR-101 P2 — the org's session policy for clipboard, files and
+        /// audio. The hub has already taken out of `permissions` (and
+        /// `audio_enabled`) what the policy refuses here; an agent that
+        /// advertises `session-policy` names the `ask` features on its prompt
+        /// and enforces the rest again, which is what survives a hub that was
+        /// bypassed. `None` (an older server, or an org that restricts
+        /// nothing) = unrestricted; older agents ignore the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_policy: Option<crate::models::SessionPolicy>,
     },
 
     /// Server forwards SDP offer from controller → agent.
@@ -6015,6 +6036,7 @@ mod tests {
             permissions: None,
             record_refused: None,
             privacy_refused: None,
+            features_refused: None,
         };
         let s = serde_json::to_string(&created).unwrap();
         assert!(
@@ -6124,6 +6146,7 @@ mod tests {
             input_mode: None,
             tenant_name: None,
             rc_overlay,
+            session_policy: None,
         };
         let off = serde_json::to_string(&req(false)).unwrap();
         assert!(
@@ -6141,6 +6164,94 @@ mod tests {
         match serde_json::from_str::<ServerMsg>(&on).unwrap() {
             ServerMsg::Request { rc_overlay, .. } => assert!(rc_overlay),
             _ => panic!("expected Request"),
+        }
+    }
+
+    /// FR-101 P2 — `session_policy` on `rc:request`: absent (an older server,
+    /// an org that restricts nothing) is skipped and reads as no policy; a
+    /// policy round-trips in lowercase; a value from a newer server reads as
+    /// `off` without failing the frame, so the session still starts.
+    #[test]
+    fn request_session_policy_is_additive_and_reads_unknown_values_as_off() {
+        use crate::models::{FeaturePolicy, SessionPolicy};
+        let req = |session_policy| ServerMsg::Request {
+            session_id: ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap(),
+            controller_user_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
+            controller_name: "Alice".into(),
+            permissions: Permissions::VIEW,
+            consent_timeout_secs: 30,
+            browser_caps: vec![],
+            preferred_transport: None,
+            chroma_pref: None,
+            chunk_framing: None,
+            audio_enabled: false,
+            consent_mode: None,
+            host_prompt_timeout_secs: None,
+            input_mode: None,
+            tenant_name: None,
+            rc_overlay: false,
+            session_policy,
+        };
+        let none = serde_json::to_string(&req(None)).unwrap();
+        assert!(!none.contains("session_policy"), "{none}");
+        match serde_json::from_str::<ServerMsg>(&none).unwrap() {
+            ServerMsg::Request { session_policy, .. } => assert_eq!(session_policy, None),
+            _ => panic!("expected Request"),
+        }
+        let p = SessionPolicy {
+            clipboard: FeaturePolicy::Ask,
+            files: FeaturePolicy::Off,
+            audio: FeaturePolicy::On,
+        };
+        let some = serde_json::to_string(&req(Some(p))).unwrap();
+        assert!(
+            some.contains(r#""session_policy":{"clipboard":"ask","files":"off","audio":"on"}"#),
+            "{some}"
+        );
+        match serde_json::from_str::<ServerMsg>(&some).unwrap() {
+            ServerMsg::Request { session_policy, .. } => assert_eq!(session_policy, Some(p)),
+            _ => panic!("expected Request"),
+        }
+        let newer = some.replace(r#""clipboard":"ask""#, r#""clipboard":"ask_twice""#);
+        match serde_json::from_str::<ServerMsg>(&newer).unwrap() {
+            ServerMsg::Request { session_policy, .. } => {
+                assert_eq!(session_policy.unwrap().clipboard, FeaturePolicy::Off)
+            }
+            _ => panic!("expected Request"),
+        }
+    }
+
+    /// FR-101 P2 — `features_refused` on `rc:session.created`: skipped when
+    /// nothing was refused, a map of feature → reason when something was.
+    #[test]
+    fn session_created_features_refused_is_additive() {
+        let mk = |features_refused| ServerMsg::SessionCreated {
+            session_id: ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap(),
+            agent_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
+            permissions: Some(Permissions::VIEW),
+            record_refused: None,
+            privacy_refused: None,
+            features_refused,
+        };
+        let none = serde_json::to_string(&mk(None)).unwrap();
+        assert!(!none.contains("features_refused"), "{none}");
+        let refused: std::collections::BTreeMap<String, String> = [
+            ("audio".to_string(), "needs_consent".to_string()),
+            ("files".to_string(), "org_policy_off".to_string()),
+        ]
+        .into();
+        let some = serde_json::to_string(&mk(Some(refused.clone()))).unwrap();
+        assert!(
+            some.contains(
+                r#""features_refused":{"audio":"needs_consent","files":"org_policy_off"}"#
+            ),
+            "{some}"
+        );
+        match serde_json::from_str::<ServerMsg>(&some).unwrap() {
+            ServerMsg::SessionCreated {
+                features_refused, ..
+            } => assert_eq!(features_refused, Some(refused)),
+            _ => panic!("expected SessionCreated"),
         }
     }
 
