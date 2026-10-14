@@ -401,20 +401,34 @@ pub struct OrgCtx {
     /// `rc:agent.update` pushes ignored on this org's WS because it is not
     /// the primary. Surfaced in the LocalAPI `OrgStatus`.
     pub updates_ignored: Arc<std::sync::atomic::AtomicU32>,
+    /// FR-103 — this enrollment's LIVE agent token. The socket, the DERP
+    /// dialer, the device-list requests and the uploaders read it at the
+    /// moment of use, so a renewal, or a token re-enrolled on disk, reaches
+    /// all of them on their next use without a restart.
+    pub token: crate::token_slot::TokenSlot,
+    /// FR-103 — the renewal knobs. [`crate::token_renewal::Settings::default`]
+    /// unless `run_cmd` read the environment's ([`Self::with_renewal`]).
+    pub renewal: crate::token_renewal::Settings,
+    /// FR-103 — rung once the server has ACCEPTED the token on a connect:
+    /// the renewal task looks after every connect.
+    renewal_connected: Arc<tokio::sync::Notify>,
 }
 
 impl OrgCtx {
-    pub fn primary() -> Self {
+    pub fn primary(token: crate::token_slot::TokenSlot) -> Self {
         Self {
             label: crate::config::PRIMARY_ORG_LABEL.to_string(),
             is_primary: true,
             pump: "signaling",
             down_since_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             updates_ignored: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            token,
+            renewal: Default::default(),
+            renewal_connected: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    pub fn secondary(label: &str) -> Self {
+    pub fn secondary(label: &str, token: crate::token_slot::TokenSlot) -> Self {
         Self {
             label: label.to_string(),
             is_primary: false,
@@ -423,7 +437,17 @@ impl OrgCtx {
             pump: Box::leak(format!("signaling:{label}").into_boxed_str()),
             down_since_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             updates_ignored: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            token,
+            renewal: Default::default(),
+            renewal_connected: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// FR-103 — replace the renewal knobs (`run_cmd` passes the
+    /// environment's; a test passes its own).
+    pub fn with_renewal(mut self, renewal: crate::token_renewal::Settings) -> Self {
+        self.renewal = renewal;
+        self
     }
 
     fn note_ws_down(&self) {
@@ -567,6 +591,16 @@ impl ConnectedGuard {
 impl Drop for ConnectedGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Aborts a task when dropped: ties a helper task (FR-103's renewal) to the
+/// loop that owns it, on every return path.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -722,13 +756,31 @@ pub async fn run(
     // Slowness-cycle treadmill (see [`WS_SLOWNESS_TREADMILL_CAP`]): spans
     // reconnects so "the fresh connection ALSO went slow" is countable.
     let mut slowness_cycles: u32 = 0;
+    // FR-103 — this enrollment's token renewal, for exactly as long as this
+    // loop runs: a secondary org's loop that stops takes its task with it.
+    let renewal = crate::token_renewal::Enrollment {
+        label: ctx.label.clone(),
+        server_url: cfg.server_url.clone(),
+        tenant_id: cfg.tenant_id.clone(),
+        agent_id: cfg.agent_id.clone(),
+        token: ctx.token.clone(),
+    };
+    let _renewal_task = AbortOnDrop(tokio::spawn(crate::token_renewal::run(
+        renewal.clone(),
+        remote_cfg.clone(),
+        ctx.renewal,
+        ctx.renewal_connected.clone(),
+    )));
+    // FR-103 — the previous attempt was a recovery's prompt retry (see the
+    // `AuthRejected` arm): a second refusal in a row waits out the ladder.
+    let mut recovered_last = false;
     loop {
         if *shutdown.borrow() {
             info!("shutdown signalled; exiting signaling loop");
             return Ok(());
         }
 
-        match connect_once(
+        let attempt = connect_once(
             &ctx,
             &cfg,
             &remote_cfg,
@@ -750,8 +802,11 @@ pub async fn run(
             &quic_setup_tx,
             &mut quic_setup_rx,
         )
-        .await
-        {
+        .await;
+        if !matches!(attempt, Err(ConnectError::AuthRejected)) {
+            recovered_last = false;
+        }
+        match attempt {
             Ok(()) => {
                 info!("signaling connection closed cleanly, reconnecting");
                 backoff = Duration::from_secs(1);
@@ -770,6 +825,26 @@ pub async fn run(
                 }
             }
             Err(ConnectError::AuthRejected) => {
+                // FR-103 — before the ladder: a newer token in the config file
+                // (re-enrolled while this ran), else a renewal, which the
+                // server grants up to 90 days past expiry. Either puts a
+                // different token in use, worth ONE prompt retry; a refusal
+                // right after a recovery waits out the ladder, so a server
+                // that renews a token its socket then refuses cannot spin
+                // this loop.
+                if !recovered_last
+                    && crate::token_renewal::recover(&renewal, &remote_cfg, ctx.renewal).await
+                {
+                    recovered_last = true;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() { return Ok(()); }
+                        },
+                    }
+                    continue;
+                }
+                recovered_last = false;
                 auth_failures = auth_failures.saturating_add(1);
                 let auth_backoff = auth_backoff_for(auth_failures);
                 warn!(
@@ -786,8 +861,9 @@ pub async fn run(
                 if auth_failures == 3 && ctx.is_primary {
                     let msg = "Roomler agent: re-enrollment required.\n\n\
                               The server is rejecting this agent's token. \
-                              Either the token expired (default 1 year) or an \
-                              admin revoked it. Run:\n\n\
+                              Either the device was removed or re-enrolled \
+                              elsewhere, or its token expired and could not \
+                              be renewed. Run:\n\n\
                               \troomlerd re-enroll --token <new-jwt>\n\n\
                               with a fresh enrollment JWT from the admin UI \
                               to restore service.";
@@ -1175,10 +1251,12 @@ async fn connect_once(
     // on, co-locating this agent's WS with its tenant's controllers on
     // one pod (the rc-hub is pod-local). Server validates it against
     // the JWT's tenant claim; pre-S6 servers just ignore the param.
+    // FR-103 — the token as of THIS connect, never the startup copy.
+    let token = ctx.token.get();
     let url = format!(
         "{}?token={}&role=agent&tid={}",
         cfg.ws_url(),
-        urlencode(&cfg.agent_token),
+        urlencode(&token),
         urlencode(&cfg.tenant_id)
     );
     // Log the endpoint WITHOUT the token: the URL carries the long-lived agent
@@ -1231,7 +1309,9 @@ async fn connect_once(
     // Fleet RPC — teach the redactor THIS org's agent token before any exec
     // can run. Registered per-org (the registry is process-wide) so a command
     // asked for by org A can never leak org B's token in its output.
-    crate::exec::register_secret(&cfg.agent_token);
+    crate::exec::register_secret(&token);
+    // FR-103 — the server accepted this token: the renewal task looks now.
+    ctx.renewal_connected.notify_one();
 
     // Say hello.
     let mut hello_caps = stub_caps(cfg.overlay_multi_org);
@@ -1365,6 +1445,7 @@ async fn connect_once(
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
     let mut overlay_evt_tx = crate::overlay::maybe_start(
         cfg,
+        ctx.token.clone(),
         outbound_tx.clone(),
         overlay_view_tx.clone(),
         derp_ticket_slot.clone(),
@@ -1567,6 +1648,7 @@ async fn connect_once(
                     );
                     overlay_evt_tx = crate::overlay::maybe_start(
                         cfg,
+                        ctx.token.clone(),
                         outbound_tx.clone(),
                         overlay_view_tx.clone(),
                         derp_ticket_slot.clone(),

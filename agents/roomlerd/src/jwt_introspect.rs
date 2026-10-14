@@ -31,6 +31,10 @@ pub struct JwtView {
     pub audience: Option<String>,
     /// `exp` claim as Unix seconds. None when missing or non-numeric.
     pub expires_at_unix: Option<i64>,
+    /// `iat` claim as Unix seconds. None when missing or non-numeric. FR-103
+    /// reads it to learn a token's whole lifetime, so a short-lived token is
+    /// renewed at half-life rather than only inside the long horizon.
+    pub issued_at_unix: Option<i64>,
     /// `sub` claim. None when missing.
     pub subject: Option<String>,
     /// `jti` claim. None when missing.
@@ -73,6 +77,7 @@ pub fn parse_unverified(token: &str) -> Result<JwtView, IntrospectError> {
         issuer: claims.iss,
         audience: claims.aud.and_then(audience_first),
         expires_at_unix: claims.exp,
+        issued_at_unix: claims.iat,
         subject: claims.sub,
         jti: claims.jti,
     })
@@ -99,6 +104,8 @@ struct RawClaims {
     aud: Option<serde_json::Value>,
     #[serde(default)]
     exp: Option<i64>,
+    #[serde(default)]
+    iat: Option<i64>,
     #[serde(default)]
     sub: Option<String>,
     #[serde(default)]

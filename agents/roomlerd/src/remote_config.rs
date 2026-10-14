@@ -243,6 +243,119 @@ impl RemoteConfigServices {
         .await
         .unwrap_or_else(|e| Err(format!("key rotation task join: {e}")))
     }
+
+    /// FR-103 — save a renewed agent token for ONE enrollment, under the
+    /// daemon-wide write lock, through the same atomic `config::save` as
+    /// [`Self::rotate_overlay_key`].
+    ///
+    /// The enrollment is found by its identity, `(server_url, tenant_id)`, in
+    /// the scalar primary or an `[[orgs]]` entry, wherever it is NOW: an
+    /// `org promote` since this process started moves it between the two.
+    ///
+    /// The write is a compare-and-swap on the token that was renewed. A file
+    /// that already holds a DIFFERENT token for this device was re-enrolled
+    /// while the renewal was in flight, and that newer token wins
+    /// ([`TokenWrite::Superseded`]). A file naming ANOTHER device for this
+    /// enrollment is refused with nothing written: the renewed token belongs
+    /// to this one, and saving it there would pair one device's token with
+    /// another's id.
+    pub async fn persist_agent_token(
+        &self,
+        server_url: &str,
+        tenant_id: &str,
+        agent_id: &str,
+        renewed_from: &str,
+        new_token: String,
+    ) -> Result<TokenWrite, String> {
+        let _guard = self.lock.lock().await;
+        let path = self.path.clone();
+        let (server_url, tenant_id) = (server_url.to_string(), tenant_id.to_string());
+        let (agent_id, renewed_from) = (agent_id.to_string(), renewed_from.to_string());
+
+        tokio::task::spawn_blocking(move || {
+            let mut cfg =
+                crate::config::load(&path).map_err(|e| format!("loading config: {e:#}"))?;
+            let (token, stored_id) = if cfg.is_primary_identity(&server_url, &tenant_id) {
+                (&mut cfg.agent_token, &cfg.agent_id)
+            } else {
+                let org = cfg
+                    .find_org_by_identity_mut(&server_url, &tenant_id)
+                    .ok_or_else(|| format!("no enrollment for tenant {tenant_id} in the config"))?;
+                (&mut org.agent_token, &org.agent_id)
+            };
+            if *stored_id != agent_id {
+                return Err(format!(
+                    "the config now holds another device ({stored_id}) for tenant {tenant_id}"
+                ));
+            }
+            if *token != renewed_from {
+                return Ok(TokenWrite::Superseded(token.clone()));
+            }
+            *token = new_token;
+            crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
+            Ok(TokenWrite::Saved)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("token save task join: {e}")))
+    }
+
+    /// FR-103 — the agent token the config file holds for this device's
+    /// enrollment, found as [`Self::persist_agent_token`] finds it. `None`
+    /// when the file cannot be read, has no such enrollment, or now names
+    /// another device for it.
+    ///
+    /// Read under the write lock so it never sees a save half-applied.
+    pub async fn stored_agent_token(
+        &self,
+        server_url: &str,
+        tenant_id: &str,
+        agent_id: &str,
+    ) -> Option<String> {
+        let _guard = self.lock.lock().await;
+        let path = self.path.clone();
+        let (server_url, tenant_id) = (server_url.to_string(), tenant_id.to_string());
+        let agent_id = agent_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let mut cfg = match crate::config::load(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(error = %format!("{e:#}"), "token: config unreadable");
+                    return None;
+                }
+            };
+            let (token, stored_id) = if cfg.is_primary_identity(&server_url, &tenant_id) {
+                (cfg.agent_token, cfg.agent_id)
+            } else {
+                let org = cfg.find_org_by_identity_mut(&server_url, &tenant_id)?;
+                (std::mem::take(&mut org.agent_token), org.agent_id.clone())
+            };
+            (stored_id == agent_id).then_some(token)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
+
+/// FR-103 — what [`RemoteConfigServices::persist_agent_token`] did.
+#[derive(PartialEq, Eq)]
+pub enum TokenWrite {
+    /// The renewed token is on disk.
+    Saved,
+    /// The file already held this newer token for the device; nothing was
+    /// written.
+    Superseded(String),
+}
+
+/// Hand-written so that logging an outcome can never print a token.
+impl std::fmt::Debug for TokenWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Saved => f.write_str("Saved"),
+            Self::Superseded(_) => f.write_str("Superseded(<redacted>)"),
+        }
+    }
 }
 
 #[cfg(test)]

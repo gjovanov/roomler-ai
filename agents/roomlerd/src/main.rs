@@ -3507,9 +3507,21 @@ async fn run_cmd(
     // share the same instance). Rejects are logged + surfaced via the
     // LocalAPI OrgStatus; they never stop the daemon or the healthy orgs.
     let org_partition = cfg.partition_runnable_orgs();
+    // FR-103 — each enrollment's LIVE agent token, minted ONCE like its
+    // `OrgCtx`: the loop, its status row, its HTTP identity and (for the
+    // primary) the uploaders all share the one slot, so a renewal reaches
+    // every one of them. The renewal knobs are read from the environment once.
+    let token_renewal = roomlerd::token_renewal::Settings::from_env();
+    let primary_token = roomlerd::token_slot::TokenSlot::new(cfg.agent_token.clone());
     let org_ctxs: Vec<signaling::OrgCtx> = org_partition
         .iter()
-        .map(|(org, _)| signaling::OrgCtx::secondary(&org.label))
+        .map(|(org, _)| {
+            signaling::OrgCtx::secondary(
+                &org.label,
+                roomlerd::token_slot::TokenSlot::new(org.agent_token.clone()),
+            )
+            .with_renewal(token_renewal)
+        })
         .collect();
 
     let wd = watchdog::Watchdog::new();
@@ -3562,10 +3574,11 @@ async fn run_cmd(
     // worst-case disk in the still-offline case.
     let crash_drain_task = tokio::spawn({
         let cfg = cfg.clone();
+        let token = primary_token.clone();
         let mut shutdown = shutdown_rx.clone();
         async move {
             // Initial drain (formerly the only call site).
-            crash_uploader::drain_and_upload(&cfg).await;
+            crash_uploader::drain_and_upload(&cfg, &token).await;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 crash_uploader::CRASH_DRAIN_INTERVAL_SECS,
             ));
@@ -3574,7 +3587,7 @@ async fn run_cmd(
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        crash_uploader::drain_and_upload(&cfg).await;
+                        crash_uploader::drain_and_upload(&cfg, &token).await;
                     }
                     _ = shutdown.changed() => {
                         if *shutdown.borrow() {
@@ -3604,7 +3617,7 @@ async fn run_cmd(
             server_url: cfg.server_url.clone(),
             tenant_id: cfg.tenant_id.clone(),
             agent_id: cfg.agent_id.clone(),
-            agent_jwt: cfg.agent_token.clone(),
+            agent_jwt: primary_token.clone(),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             host_id_hash: host_hash,
             source: roomlerd::logs_upload::LogSource::Agent,
@@ -3731,7 +3744,7 @@ async fn run_cmd(
     // registry `NodeStatus.orgs` reads. Secondary handles (connected flag /
     // terminal-error slot / OrgCtx) are minted here so the registry rows and
     // the spawned supervisors share the SAME instances.
-    let primary_ctx = signaling::OrgCtx::primary();
+    let primary_ctx = signaling::OrgCtx::primary(primary_token.clone()).with_renewal(token_renewal);
     let mut org_spawns: Vec<OrgSpawn> = Vec::new();
     // Multi-org — every secondary org.s live overlay view, so `peers` can
     // report all orgs (the receivers used to be dropped on the floor).
@@ -3748,6 +3761,7 @@ async fn run_cmd(
             terminal_error: std::sync::Arc::new(std::sync::Mutex::new(None)),
             updates_ignored: primary_ctx.updates_ignored.clone(),
             overlay_mode: cfg.primary_overlay_mode().wire(),
+            token: primary_ctx.token.clone(),
         }];
         for ((org, problem), org_ctx) in org_partition.iter().zip(org_ctxs.iter()) {
             let org_ctx = org_ctx.clone();
@@ -3764,6 +3778,7 @@ async fn run_cmd(
                 terminal_error: terminal.clone(),
                 updates_ignored: org_ctx.updates_ignored.clone(),
                 overlay_mode: org.overlay_mode.wire(),
+                token: org_ctx.token.clone(),
             });
             if org.enabled && problem.is_none() {
                 org_spawns.push((org.clone(), org_ctx, connected, terminal));
@@ -3785,11 +3800,15 @@ async fn run_cmd(
     // registry above, so the list is asked with exactly the credential the
     // org's WS loop runs on; an entry the daemon refused to run is disabled.
     let org_http: roomlerd::self_view::OrgHttpRegistry = {
-        let mut rows = vec![roomlerd::self_view::OrgHttp::primary(&cfg)];
-        for (org, problem) in org_partition.iter() {
+        let mut rows = vec![roomlerd::self_view::OrgHttp::primary(
+            &cfg,
+            primary_ctx.token.clone(),
+        )];
+        for ((org, problem), org_ctx) in org_partition.iter().zip(org_ctxs.iter()) {
             rows.push(roomlerd::self_view::OrgHttp::secondary(
                 org,
                 problem.is_none(),
+                org_ctx.token.clone(),
             ));
         }
         std::sync::Arc::new(std::sync::Mutex::new(rows))
@@ -4187,7 +4206,13 @@ async fn run_cmd(
                         }
                     });
                 }
-                let org_ctx = signaling::OrgCtx::secondary(&org.label);
+                // FR-103 — a fresh slot for the joined (or re-spawned) org,
+                // shared by the rows below and its loop.
+                let org_ctx = signaling::OrgCtx::secondary(
+                    &org.label,
+                    roomlerd::token_slot::TokenSlot::new(org.agent_token.clone()),
+                )
+                .with_renewal(token_renewal);
                 let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let terminal = std::sync::Arc::new(std::sync::Mutex::new(None));
                 // Surface it in `roomler status` / the LocalAPI immediately,
@@ -4205,13 +4230,14 @@ async fn run_cmd(
                         terminal_error: terminal.clone(),
                         updates_ignored: org_ctx.updates_ignored.clone(),
                         overlay_mode: org.overlay_mode.wire(),
+                        token: org_ctx.token.clone(),
                     });
                 }
                 // FR-84 D5b — and its HTTP identity, replacing any row for
                 // the same label (a re-spawn must not keep the old token).
                 roomlerd::self_view::upsert(
                     &org_http_for_join,
-                    roomlerd::self_view::OrgHttp::secondary(&org, true),
+                    roomlerd::self_view::OrgHttp::secondary(&org, true, org_ctx.token.clone()),
                 );
                 // The per-org config is synthesized from the CURRENT on-disk
                 // config, so operator knobs (including `overlay_multi_org`)

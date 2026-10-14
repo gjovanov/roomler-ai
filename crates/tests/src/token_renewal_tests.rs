@@ -13,6 +13,11 @@
 //!   route alike;
 //! - the same for a `roomler` tunnel client;
 //! - both kill switches; and the device list's "credential expires".
+//!
+//! And the device's half (P2), the real `roomlerd` code against this server:
+//! a due token is renewed and saved before use; a device that was off across
+//! its expiry renews inside the grace and comes back by itself; a token
+//! re-enrolled on disk is taken up without a restart.
 
 use crate::fixtures::test_app::TestApp;
 use crate::tunnel_tests::wait_agent_online;
@@ -473,4 +478,192 @@ async fn a_tunnel_client_renews_and_a_removal_ends_its_tokens() {
     assert_eq!(renew_client(old).await.status(), 401);
     assert_eq!(roster(new.clone()).await, 200);
     assert_eq!(renew_client(new).await.status(), 200);
+}
+
+// ---------------------------------------------------------------------------
+// FR-103 P2 — the DEVICE's half: the real `roomlerd` renewal code against
+// this server.
+// ---------------------------------------------------------------------------
+
+const DAY: i64 = 24 * 3600;
+
+/// These tests poll; the in-process agent shares 127.0.0.1 and the default
+/// limiter's one bucket with them.
+async fn polling_app() -> TestApp {
+    TestApp::spawn_with_settings(|s| {
+        s.app.rate_limit_per_sec = 1_000;
+        s.app.rate_limit_burst = 10_000;
+    })
+    .await
+}
+
+/// Poll the device row until it reads online. Tolerant of a read that fails:
+/// that is "not yet".
+async fn wait_online(app: &TestApp, seeded: &crate::fixtures::seed::SeededTenant, agent_id: &str) {
+    for _ in 0..120 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let row: Value = match app
+            .auth_get(
+                &format!("/api/tenant/{}/agent/{}", seeded.tenant_id, agent_id),
+                &seeded.admin.access_token,
+            )
+            .send()
+            .await
+        {
+            Ok(resp) => resp.json().await.unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        };
+        if row["status"].as_str() == Some("online") {
+            return;
+        }
+    }
+    panic!("agent {agent_id} never came online");
+}
+
+fn config_services(path: &std::path::Path) -> roomlerd::remote_config::RemoteConfigServices {
+    roomlerd::remote_config::RemoteConfigServices::new(
+        path.to_path_buf(),
+        std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        false,
+        false,
+    )
+}
+
+/// A device renews once its token is due, saves the new one before using it,
+/// and the old one keeps working (no rotation). A fresh year-long token is
+/// not due, and nothing is asked.
+#[tokio::test]
+async fn a_device_renews_before_its_token_expires() {
+    use roomlerd::token_renewal::{self, Settings};
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr103due").await;
+    let cfg = crate::agent_tests::enrol_via_agent_lib(&app, &seeded, "m-fr103-due", "due").await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    roomlerd::config::save(&path, &cfg).unwrap();
+    let services = config_services(&path);
+    let enrollment = token_renewal::Enrollment {
+        label: "primary".into(),
+        server_url: cfg.server_url.clone(),
+        tenant_id: cfg.tenant_id.clone(),
+        agent_id: cfg.agent_id.clone(),
+        token: roomlerd::token_slot::TokenSlot::new(cfg.agent_token.clone()),
+    };
+    let now = chrono::Utc::now().timestamp();
+
+    let look = token_renewal::check_once(&enrollment, &services, Settings::default(), now).await;
+    assert!(
+        enrollment.token.get() == cfg.agent_token,
+        "a fresh token is not due"
+    );
+    assert_eq!(
+        look,
+        token_renewal::Look {
+            next: Settings::default().interval,
+            failed: false
+        }
+    );
+
+    // A token minted in the same second as the enrollment's is byte-identical.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let due_now = Settings {
+        horizon: Some(Duration::from_secs(400 * 86_400)),
+        ..Settings::default()
+    };
+    token_renewal::check_once(&enrollment, &services, due_now, now).await;
+    let renewed = enrollment.token.get();
+    assert!(renewed != cfg.agent_token, "renewed once due");
+    assert!(
+        roomlerd::config::load(&path).unwrap().agent_token == renewed,
+        "saved before it was used"
+    );
+    assert_eq!(self_devices(&app, &renewed).await, 200);
+    assert_eq!(
+        self_devices(&app, &cfg.agent_token).await,
+        200,
+        "no rotation: the old token keeps working"
+    );
+}
+
+/// The case FR-103 exists for: a device that was off across its token's
+/// expiry is refused at the socket, renews inside the server's grace, saves
+/// the new token, and comes back online with no hands on the machine. Before
+/// P2 it backed off for good and asked for a re-enrollment.
+#[tokio::test]
+async fn a_lapsed_device_renews_in_the_grace_and_comes_back() {
+    let app = polling_app().await;
+    let seeded = app.seed_tenant("fr103lapsed").await;
+    let mut cfg =
+        crate::agent_tests::enrol_via_agent_lib(&app, &seeded, "m-fr103-lapsed", "lapsed").await;
+    let lapsed = forge_agent_token(&app, &cfg.agent_id, &cfg.tenant_id, -30 * DAY, Some(0));
+    assert_eq!(
+        upgrade_status(&app, "/ws", &lapsed).await,
+        401,
+        "refused as it is"
+    );
+    cfg.agent_token = lapsed.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    roomlerd::config::save(&path, &cfg).unwrap();
+
+    let slot = roomlerd::token_slot::TokenSlot::new(lapsed.clone());
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let task = crate::agent_tests::spawn_agent_signaling_on(
+        roomlerd::signaling::OrgCtx::primary(slot.clone()),
+        cfg.clone(),
+        path.clone(),
+        stop_rx,
+    );
+    wait_online(&app, &seeded, &cfg.agent_id).await;
+
+    let in_use = slot.get();
+    assert!(in_use != lapsed, "a renewed token is in use");
+    assert!(
+        roomlerd::config::load(&path).unwrap().agent_token == in_use,
+        "and it is the one on disk"
+    );
+    assert_eq!(self_devices(&app, &in_use).await, 200);
+    let _ = stop_tx.send(true);
+    task.abort();
+}
+
+/// A device removed and enrolled again (`roomlerd re-enroll`) while its
+/// daemon kept running: the running token is now refused (the removal
+/// advanced the generation), and the daemon switches to the token the
+/// re-enrollment wrote to its config file, without a restart.
+#[tokio::test]
+async fn a_token_re_enrolled_on_disk_is_used_without_a_restart() {
+    let app = polling_app().await;
+    let seeded = app.seed_tenant("fr103reenrolled").await;
+    let first =
+        crate::agent_tests::enrol_via_agent_lib(&app, &seeded, "m-fr103-again", "again").await;
+    remove(&app, &seeded, &first.agent_id).await;
+    let again =
+        crate::agent_tests::enrol_via_agent_lib(&app, &seeded, "m-fr103-again", "again").await;
+    assert_eq!(again.agent_id, first.agent_id, "the same row is revived");
+    assert_eq!(
+        upgrade_status(&app, "/ws", &first.agent_token).await,
+        401,
+        "the token from before the removal is refused"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    roomlerd::config::save(&path, &again).unwrap();
+
+    // The daemon still runs on the token it started with.
+    let slot = roomlerd::token_slot::TokenSlot::new(first.agent_token.clone());
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let task = crate::agent_tests::spawn_agent_signaling_on(
+        roomlerd::signaling::OrgCtx::primary(slot.clone()),
+        first.clone(),
+        path,
+        stop_rx,
+    );
+    wait_online(&app, &seeded, &first.agent_id).await;
+    assert!(
+        slot.get() == again.agent_token,
+        "the re-enrolled token, adopted from the file"
+    );
+    let _ = stop_tx.send(true);
+    task.abort();
 }
