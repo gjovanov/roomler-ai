@@ -137,10 +137,24 @@ impl<'de> Deserialize<'de> for AttributionInput {
 /// fields get their own rule: a referrer keeps only a bare host (lower-cased,
 /// an optional `:port`), a landing path keeps only the path part and must
 /// start with a single `/`.
+///
+/// FR-102 P1b — `source` and `medium` then go through the campaign
+/// taxonomy (`campaign::normalize_source` / `normalize_medium`): lowercase,
+/// then the aliases (`YouTub` → `youtube`, `Twitter` → `x`), so the stored
+/// key is the one the reports and purestat group by. An unknown value is
+/// kept verbatim (lowercased), never dropped — it is reported under `other`.
 pub fn sanitize(input: AttributionInput) -> Option<SignupAttribution> {
     let attr = SignupAttribution {
-        source: input.source.as_deref().and_then(clean_value),
-        medium: input.medium.as_deref().and_then(clean_value),
+        source: input
+            .source
+            .as_deref()
+            .and_then(clean_value)
+            .map(|v| crate::campaign::normalize_source(&v)),
+        medium: input
+            .medium
+            .as_deref()
+            .and_then(clean_value)
+            .map(|v| crate::campaign::normalize_medium(&v)),
         campaign: input.campaign.as_deref().and_then(clean_value),
         content: input.content.as_deref().and_then(clean_value),
         term: input.term.as_deref().and_then(clean_value),
@@ -511,17 +525,53 @@ mod tests {
     #[test]
     fn unknown_keys_and_non_string_values_are_ignored() {
         let got = sanitize(input(json!({
-            "source": "yt",
+            "source": "tiktok",
             "bogus": "x",
             "medium": 5,
             "campaign": null,
             "content": ["a"],
         })))
         .unwrap();
-        assert_eq!(got.source.as_deref(), Some("yt"));
+        assert_eq!(got.source.as_deref(), Some("tiktok"));
         assert_eq!(got.medium, None);
         assert_eq!(got.campaign, None);
         assert_eq!(got.content, None);
+    }
+
+    /// FR-102 AC5 — the taxonomy is applied at ingress: the field's
+    /// `YouTub` and `Video` store as `youtube` / `video`, an alias stores as
+    /// its canonical, and an unknown source is stored verbatim (lowercased)
+    /// rather than dropped. Only `source` and `medium` are normalised: a
+    /// campaign slug is the operator's own and is kept as sent.
+    #[test]
+    fn source_and_medium_are_normalised_through_the_taxonomy() {
+        let got = sanitize(input(json!({
+            "source": "YouTub",
+            "medium": "Video",
+            "campaign": "20261019-Slug",
+            "content": "Desc-Top",
+        })))
+        .unwrap();
+        assert_eq!(got.source.as_deref(), Some("youtube"));
+        assert_eq!(got.medium.as_deref(), Some("video"));
+        assert_eq!(got.campaign.as_deref(), Some("20261019-Slug"));
+        assert_eq!(got.content.as_deref(), Some("Desc-Top"));
+
+        let alias = sanitize(input(json!({ "source": " Twitter ", "medium": "POST" }))).unwrap();
+        assert_eq!(alias.source.as_deref(), Some("x"));
+        assert_eq!(alias.medium.as_deref(), Some("post"));
+
+        let unknown = sanitize(input(json!({ "source": "Mastodon" }))).unwrap();
+        assert_eq!(unknown.source.as_deref(), Some("mastodon"));
+
+        // The OAuth query path goes through the same function.
+        let q: HashMap<String, String> = [("utm_source", "YouTub"), ("utm_medium", "Video")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let via_query = sanitize(AttributionInput::from_query(&q)).unwrap();
+        assert_eq!(via_query.source.as_deref(), Some("youtube"));
+        assert_eq!(via_query.medium.as_deref(), Some("video"));
     }
 
     #[test]

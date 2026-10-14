@@ -55,6 +55,7 @@ erDiagram
 | `stripe_events` | Stripe webhook dedupe/audit |
 | `consent_requests` | Remote-session owner-consent capability tokens |
 | `used_tokens` | Single-use JWT `jti` burn list (1 h TTL) |
+| `growth_exclusions` | FR-102 P1c: the platform admin's explicit exclusion list — `{kind: tenant\|user, id, reason, by, at}`, unique `(kind, id)`. The implicit exclusions (every platform admin, every org an excluded user owns) have no row; `roomler_core::growth::ExclusionSet` folds both into the one set every growth number applies ([growth-observability.md](growth-observability.md)). No TTL |
 
 ## Fleet: agents, remote desktop, tunnels, overlay
 

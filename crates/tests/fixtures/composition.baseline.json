@@ -1,6 +1,10 @@
 {
   "routes": [
     {
+      "path": "/api/admin/growth/exclusions",
+      "methods": "GET,HEAD,PUT"
+    },
+    {
       "path": "/api/admin/newsletter/issues",
       "methods": "GET,HEAD,POST"
     },
@@ -1252,6 +1256,18 @@
               "external_source.provider": 1,
               "external_source.external_id": 1
             }
+          }
+        ]
+      },
+      {
+        "collection": "growth_exclusions",
+        "indexes": [
+          {
+            "key": {
+              "kind": 1,
+              "id": 1
+            },
+            "unique": true
           }
         ]
       },
@@ -2864,6 +2880,18 @@
               "external_source.provider": 1,
               "external_source.external_id": 1
             }
+          }
+        ]
+      },
+      {
+        "collection": "growth_exclusions",
+        "indexes": [
+          {
+            "key": {
+              "kind": 1,
+              "id": 1
+            },
+            "unique": true
           }
         ]
       },
