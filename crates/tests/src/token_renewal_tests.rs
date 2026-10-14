@@ -384,6 +384,47 @@ async fn the_device_list_shows_when_a_credential_expires() {
     assert!(expires > chrono::Utc::now() + chrono::Duration::days(300));
 }
 
+/// The device list follows a renewal at once. A device keeps its socket after
+/// renewing and presents the new token only at its next connect, which on a
+/// live socket can be weeks away, so the renewal itself records the expiry.
+#[tokio::test]
+async fn a_renewal_shows_in_the_device_list_without_a_reconnect() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr103stamp").await;
+    let (agent_id, token) = enroll(&app, &seeded, "m-fr103-stamp").await;
+
+    let resp = renew(&app, &token).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let parse = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .or_else(|_| chrono::DateTime::parse_from_str(s, "%+"))
+            .expect("a timestamp")
+    };
+    let renewed = parse(body["expires_at"].as_str().unwrap());
+
+    let row: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/agent/{}", seeded.tenant_id, agent_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let shown = parse(
+        row["token_expires_at"]
+            .as_str()
+            .expect("the renewal is on the record before any connect"),
+    );
+    assert!(
+        (shown - renewed).num_seconds().abs() <= 1,
+        "the list shows {shown}, the renewal said {renewed}"
+    );
+}
+
 /// A `roomler` tunnel client renews its own token, and removing it ends every
 /// earlier token, as for an agent. The roster route now checks the row too.
 #[tokio::test]
