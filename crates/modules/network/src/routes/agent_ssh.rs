@@ -76,7 +76,8 @@ use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
     models::{
         Agent, ConsentMode, OsKind, RpcCap, SshAccountMode, SshActivityEvent, SshActivityKind,
-        SshAuditEvent, SshDenyReason, SshGates, SshGrantSpec, SshMode, SshPolicy, ssh_limits,
+        SshAuditEvent, SshDenyReason, SshGates, SshGrantSpec, SshMode, SshPending, SshPolicy,
+        SshServiceCeiling, SshServiceEndpoint, ssh_limits,
     },
     signaling::ServerMsg,
 };
@@ -283,6 +284,12 @@ struct Granted {
     /// `None` = a pre-FR-83 agent, answered without waiting. Logged, so the
     /// ack bound can be tuned against what the field actually measures.
     confirmed_after_ms: Option<u64>,
+    /// Where the caller dials: the worker's port, or (FR-105) the SYSTEM
+    /// service's.
+    port: u16,
+    /// FR-105 — who serves the session: `system` / `console_user` (the
+    /// device's SYSTEM service) or `worker`. Recorded in `ssh_audit`.
+    ran_as: &'static str,
 }
 
 /// Gate, mint, push, answer. The ONE path a session request takes, whether it
@@ -311,16 +318,17 @@ pub async fn dispatch(
             info!(
                 agent = %agent_id, caller = %caller.display, grant_id = %g.grant_id,
                 account_mode = ?g.account_mode, session_secs = g.session_secs,
-                confirmed_after_ms = ?g.confirmed_after_ms,
+                confirmed_after_ms = ?g.confirmed_after_ms, ran_as = g.ran_as,
                 "ssh: grant issued"
             );
             SshResponseBody {
                 address: Some(g.address),
-                // The port the device intercepts is agent-side config, and the
-                // server does not carry it. The built-in default is what an
-                // unconfigured device serves; a device that moved its port
-                // tells its own users.
-                port: Some(DEFAULT_SSH_PORT),
+                // The worker's port is agent-side config, and the server does
+                // not carry it: the built-in default is what an unconfigured
+                // device serves, and a device that moved its port tells its
+                // own users. FR-105's service port is fixed, and the server
+                // picks it, because the worker cannot route by inspection.
+                port: Some(g.port),
                 name: g.name,
                 grant_id: Some(g.grant_id),
                 host_pubkey: g.host_pubkey,
@@ -401,6 +409,10 @@ async fn decide(
         account,
         consent_mode,
     } = spec;
+    // FR-105 — who serves this grant: the device's SYSTEM service, or its
+    // worker (on an attended Windows install, the signed-in user).
+    let via_service = routes_ssh_via_service(state, agent, account_mode);
+    let consent_mode = Some(effective_wire_consent(consent_mode));
     let msg = ServerMsg::SshGrant {
         grant_id: grant_id.clone(),
         public_key: public_key.to_string(),
@@ -409,13 +421,54 @@ async fn decide(
         account,
         expires_at_ms,
         session_secs,
-        consent_mode: Some(effective_wire_consent(consent_mode)),
+        consent_mode,
+        via_service,
     };
+
+    // FR-105 — the service PULLS the grant with its own credential, so it is
+    // written down before the worker hears its id. The claim window is the
+    // caller's own wait: once nobody waits, nothing may claim it.
+    if via_service {
+        let now = bson::DateTime::now();
+        let at = |offset_secs: u64| {
+            bson::DateTime::from_millis(
+                now.timestamp_millis()
+                    .saturating_add((offset_secs * 1000) as i64),
+            )
+        };
+        let row = SshPending {
+            id: None,
+            grant_id: grant_id.clone(),
+            tenant_id,
+            agent_id,
+            public_key: public_key.to_string(),
+            caller: caller.display.clone(),
+            account_mode: account_mode_wire(account_mode).to_string(),
+            expires_at_ms,
+            session_secs,
+            consent_mode,
+            state: SshPending::PENDING.to_string(),
+            created_at: now,
+            claim_by: at(ssh_limits::GRANT_ACK_TIMEOUT_SECS),
+            expires_at: at(ssh_limits::GRANT_TTL_SECS * 2),
+            claimed_at: None,
+        };
+        if let Err(e) = state.ssh_pending.insert(&row).await {
+            // Never a quiet fall back to the worker: that would run the
+            // session as a different identity than the policy granted.
+            warn!(agent = %agent_id, %grant_id, %e, "ssh: could not record a grant for the SYSTEM service");
+            return Err(SshDenyReason::GrantUnconfirmed);
+        }
+    }
 
     // FR-83 — park on the target's answer BEFORE the push: an ack that beats
     // this function back here must find somewhere to land. Dropping the guard
     // (any early return below) deregisters it.
-    let pending_ack = state.ssh_grant_acks.expect(&grant_id, agent_id);
+    let pending_ack = if via_service {
+        state.ssh_grant_acks.expect_via_service(&grant_id, agent_id)
+    } else {
+        state.ssh_grant_acks.expect(&grant_id, agent_id)
+    };
     let pushed_at = std::time::Instant::now();
     let acks = match state.fleet.rc_hub.push_ssh_grant(agent_id, tenant_id, msg) {
         Ok(acks) => acks,
@@ -423,6 +476,9 @@ async fn decide(
         // honour it", and the caller needs that difference: one is wait and
         // retry, the other is upgrade the agent.
         Err(e) => {
+            if via_service {
+                withdraw_service_grant(state, &grant_id, tenant_id).await;
+            }
             return Err(match e {
                 roomler_ai_remote_control::error::Error::ExecUnsupported(_) => {
                     SshDenyReason::Unsupported
@@ -438,7 +494,51 @@ async fn decide(
     // dials first and is refused `Permission denied (publickey)` by a device
     // that is behaving correctly. A pre-FR-83 agent never answers, and is
     // answered exactly as before rather than made to wait out the bound.
-    let confirmed_after_ms = if acks {
+    //
+    // FR-105 — a via-service grant always waits, and only for the SERVICE:
+    // its claim (on this pod, or read from the shared row) is the ack, and
+    // the worker can only refuse.
+    let confirmed_after_ms = if via_service {
+        let bound = std::time::Duration::from_secs(ssh_limits::GRANT_ACK_TIMEOUT_SECS);
+        let rows = state.ssh_pending.clone();
+        let polled = grant_id.clone();
+        let outcome = pending_ack
+            .wait_or_claimed(bound, SERVICE_CLAIM_POLL, || {
+                let (rows, polled) = (rows.clone(), polled.clone());
+                async move { rows.is_claimed(&polled).await.unwrap_or(false) }
+            })
+            .await;
+        match outcome {
+            AckOutcome::Recorded => Some(pushed_at.elapsed().as_millis() as u64),
+            AckOutcome::Refused(refusal) => {
+                // Withdrawn, so a claim racing the worker's refusal cannot
+                // take what the caller is about to be told was refused.
+                withdraw_service_grant(state, &grant_id, tenant_id).await;
+                warn!(
+                    agent = %agent_id, caller = %caller.display, %grant_id, ?refusal,
+                    "ssh: the device refused a grant for its SYSTEM service"
+                );
+                return Err(refusal.deny_reason());
+            }
+            AckOutcome::Unconfirmed => {
+                // The claim may have won the race against the bound: a row
+                // that cannot be withdrawn because it was claimed IS a grant
+                // the service holds.
+                match state.ssh_pending.cancel(&grant_id, tenant_id).await {
+                    Ok(false)
+                        if state
+                            .ssh_pending
+                            .is_claimed(&grant_id)
+                            .await
+                            .unwrap_or(false) =>
+                    {
+                        Some(pushed_at.elapsed().as_millis() as u64)
+                    }
+                    _ => return Err(SshDenyReason::GrantUnconfirmed),
+                }
+            }
+        }
+    } else if acks {
         let bound = std::time::Duration::from_secs(ssh_limits::GRANT_ACK_TIMEOUT_SECS);
         match pending_ack.wait(bound).await {
             AckOutcome::Recorded => Some(pushed_at.elapsed().as_millis() as u64),
@@ -459,20 +559,88 @@ async fn decide(
         None
     };
 
-    Ok(Granted {
-        grant_id,
-        address: node.overlay_ip.clone(),
-        name: (!node.name.is_empty()).then(|| node.name.clone()),
+    // FR-105 — the service's own key for its own port. `routes_ssh_via_service`
+    // required a published one, so this is never empty there. The worker's
+    // key (what its last hello said) never stands in for it.
+    let host_pubkey = if via_service {
+        agent.ssh_service.as_ref().map(|s| s.host_pubkey.clone())
+    } else {
         // From the AGENT ROW, i.e. what the device said on its last hello —
         // not from anything the caller supplied. Empty stays `None` rather
         // than an empty string so a client cannot accidentally "verify"
         // against nothing.
-        host_pubkey: (!agent.ssh_host_pubkey.is_empty()).then(|| agent.ssh_host_pubkey.clone()),
+        (!agent.ssh_host_pubkey.is_empty()).then(|| agent.ssh_host_pubkey.clone())
+    };
+    Ok(Granted {
+        grant_id,
+        address: node.overlay_ip.clone(),
+        name: (!node.name.is_empty()).then(|| node.name.clone()),
+        host_pubkey,
         expires_at_ms,
         account_mode,
         session_secs,
         confirmed_after_ms,
+        port: if via_service {
+            ssh_limits::SERVICE_PORT
+        } else {
+            DEFAULT_SSH_PORT
+        },
+        ran_as: ran_as(via_service, account_mode),
     })
+}
+
+/// FR-105 — how often a caller waiting on a via-service grant re-reads the
+/// shared row, in case the service's claim landed on another pod.
+const SERVICE_CLAIM_POLL: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// FR-105 — does a grant for `agent`, as `mode`, go to the device's SYSTEM
+/// service? All of:
+/// - the server's kill switch (`rc.ssh_via_service`);
+/// - a Windows device, anchored by an administrator;
+/// - an endpoint its service published under THAT anchor (a re-anchor, an
+///   un-anchor or a removal leaves the record stale, so no cleanup is needed),
+///   with a host key, and a ceiling that permits `mode`;
+/// - the device, connected to this pod, advertising `ssh-system`.
+///
+/// Both halves, as for exec: the server's record (the anchor, and what the
+/// service published with its OWN credential) and the device's live word (the
+/// service is up and answering the worker). A worker that lies about the word
+/// gains nothing: the caller pins a key only the real service holds.
+pub fn routes_ssh_via_service(state: &NetworkState, agent: &Agent, mode: SshAccountMode) -> bool {
+    let Some(anchor) = agent
+        .exec_anchor
+        .as_ref()
+        .filter(|a| !a.anchor_id.is_empty())
+    else {
+        return false;
+    };
+    state.fleet.settings.rc.ssh_via_service
+        && matches!(agent.os, OsKind::Windows)
+        && agent.ssh_service.as_ref().is_some_and(|s| {
+            s.anchor_id == anchor.anchor_id && !s.host_pubkey.is_empty() && s.ceiling.permits(mode)
+        })
+        && agent
+            .id
+            .is_some_and(|id| state.fleet.rc_hub.agent_supports_ssh_system(id) == Some(true))
+}
+
+/// FR-105 — what `ssh_audit.ran_as` records: the server's decision about who
+/// serves the session.
+fn ran_as(via_service: bool, mode: SshAccountMode) -> &'static str {
+    match (via_service, mode) {
+        (true, SshAccountMode::Daemon) => "system",
+        (true, _) => "console_user",
+        (false, _) => "worker",
+    }
+}
+
+/// FR-105 — the caller stopped waiting for the service (a failed push, a
+/// refusal): withdraw the row so no late claim can take the grant. A failure
+/// is logged and survivable: `claim_by` still bounds how late a claim can be.
+async fn withdraw_service_grant(state: &NetworkState, grant_id: &str, tenant_id: ObjectId) {
+    if let Err(e) = state.ssh_pending.cancel(grant_id, tenant_id).await {
+        warn!(%grant_id, %e, "ssh: could not withdraw a grant for the SYSTEM service");
+    }
 }
 
 /// Persist the decision. Best-effort by design: the audit write must never
@@ -525,6 +693,7 @@ fn audit_event(
         session_secs: granted.map(|g| g.session_secs),
         at: bson::DateTime::now(),
         denied: outcome.as_ref().err().copied(),
+        ran_as: granted.map(|g| g.ran_as.to_string()),
     }
 }
 
@@ -891,6 +1060,157 @@ fn consent_mode_would_be_ignored(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// FR-105 — the device's SYSTEM service
+// ────────────────────────────────────────────────────────────────────────────
+
+/// `PUT /api/agent/service/ssh-host-key` — what the service says about its
+/// own SSH endpoint.
+#[derive(Debug, Deserialize)]
+pub struct ServiceSshEndpointBody {
+    /// The OpenSSH public half of the SERVICE's host key (`ssh-ed25519 …`).
+    pub host_pubkey: String,
+    /// The anchor's `ssh` ceiling, as the service read it from the anchor
+    /// file only SYSTEM and Administrators can write.
+    pub ceiling: SshServiceCeiling,
+}
+
+/// The service publishes its SSH endpoint, with its OWN credential: the
+/// worker, which the signed-in user controls, cannot. Bound to the anchor the
+/// credential names, so a re-anchor or an un-anchor retires it.
+pub async fn publish_service_endpoint(
+    State(state): State<NetworkState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ServiceSshEndpointBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let svc =
+        roomler_ai_mod_fleet::auth_agent::authenticate_service(&state.fleet, &headers).await?;
+    let host_pubkey = body.host_pubkey.trim();
+    if !is_supported_public_key(host_pubkey) {
+        return Err(ApiError::BadRequest(
+            "host_pubkey must be an OpenSSH ssh-ed25519 public key".to_string(),
+        ));
+    }
+    // `authenticate_service` proved the credential names the CURRENT anchor.
+    let anchor_id = svc
+        .agent
+        .exec_anchor
+        .as_ref()
+        .map(|a| a.anchor_id.clone())
+        .unwrap_or_default();
+    let endpoint = SshServiceEndpoint {
+        host_pubkey: host_pubkey.to_string(),
+        ceiling: body.ceiling,
+        anchor_id,
+        published_at: bson::DateTime::now(),
+    };
+    match state
+        .fleet
+        .agents
+        .publish_ssh_service(svc.tenant_id, svc.agent_id, &endpoint)
+        .await
+    {
+        Ok(true) => {
+            info!(
+                agent = %svc.agent_id, ceiling = ?endpoint.ceiling,
+                "ssh: the SYSTEM service published its endpoint"
+            );
+            Ok(Json(serde_json::json!({ "ok": true })))
+        }
+        // It raced a re-anchor, an un-anchor or a removal: this credential's
+        // anchor is gone, which the service must hear as "anchor again".
+        Ok(false) => Err(ApiError::Unauthorized(
+            "this device's SYSTEM service was re-anchored or un-anchored; anchor it again"
+                .to_string(),
+        )),
+        Err(e) => Err(ApiError::Internal(format!("ssh service endpoint: {e}"))),
+    }
+}
+
+/// What a claim hands the SYSTEM service: the grant, from the server.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaimedSshGrant {
+    pub grant_id: String,
+    /// The caller's ephemeral OpenSSH public key.
+    pub public_key: String,
+    pub caller: String,
+    /// `daemon` (SYSTEM) or `console_user`.
+    pub account_mode: String,
+    pub expires_at_ms: u64,
+    pub session_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_mode: Option<ConsentMode>,
+}
+
+/// `POST /api/agent/service/ssh/{grant_id}/claim`, with the service's own
+/// credential. Single use, this device's only, inside the caller's wait. The
+/// claim IS the grant's acknowledgement: a caller waiting on this pod is told
+/// to dial at once, and one waiting on another pod reads it from the row.
+///
+/// Anything else is a 404 and an audit row (`claim_refused`) with no user:
+/// unknown, claimed already, withdrawn, expired, another device's. The
+/// reasons are not told apart, so a forged ring learns nothing.
+pub async fn claim_service_grant(
+    State(state): State<NetworkState>,
+    headers: axum::http::HeaderMap,
+    Path(grant_id): Path<String>,
+) -> Result<Json<ClaimedSshGrant>, ApiError> {
+    let svc =
+        roomler_ai_mod_fleet::auth_agent::authenticate_service(&state.fleet, &headers).await?;
+    match state
+        .ssh_pending
+        .claim(&grant_id, svc.agent_id, svc.tenant_id)
+        .await
+    {
+        Ok(Some(row)) => {
+            let delivered_here = state.ssh_grant_acks.deliver_claim(&grant_id, svc.agent_id);
+            info!(
+                agent = %svc.agent_id, %grant_id, account_mode = %row.account_mode, delivered_here,
+                "ssh: the SYSTEM service claimed a grant"
+            );
+            Ok(Json(ClaimedSshGrant {
+                grant_id: row.grant_id,
+                public_key: row.public_key,
+                caller: row.caller,
+                account_mode: row.account_mode,
+                expires_at_ms: row.expires_at_ms,
+                session_secs: row.session_secs,
+                consent_mode: row.consent_mode,
+            }))
+        }
+        Ok(None) => {
+            warn!(
+                agent = %svc.agent_id, %grant_id,
+                "ssh: the SYSTEM service claimed a grant that is not pending for it"
+            );
+            let audit = SshAuditEvent {
+                id: None,
+                tenant_id: svc.tenant_id,
+                agent_id: svc.agent_id,
+                // No person asked for this: the device's service did.
+                user_id: ObjectId::from_bytes([0; 12]),
+                origin_agent_id: None,
+                // The id that was rung, for whoever investigates a forgery.
+                grant_id: Some(grant_id),
+                source: "service-claim".to_string(),
+                caller: String::new(),
+                account_mode: None,
+                session_secs: None,
+                at: bson::DateTime::now(),
+                denied: Some(SshDenyReason::ClaimRefused),
+                ran_as: None,
+            };
+            if let Err(e) = state.ssh_audit.record(audit).await {
+                warn!(agent = %svc.agent_id, %e, "ssh: audit write failed");
+            }
+            Err(ApiError::NotFound(
+                "no such grant is pending for this device".to_string(),
+            ))
+        }
+        Err(e) => Err(ApiError::Internal(format!("ssh claim: {e}"))),
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Audit read side
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -921,6 +1241,9 @@ pub struct SshAuditRow {
     /// would make a reviewer map enum variants back to meanings by hand.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub denied_message: Option<String>,
+    /// FR-105 — `system` / `console_user` (the SYSTEM service) or `worker`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ran_as: Option<String>,
 }
 
 impl From<SshAuditEvent> for SshAuditRow {
@@ -939,6 +1262,7 @@ impl From<SshAuditEvent> for SshAuditRow {
             at: e.at.try_to_rfc3339_string().unwrap_or_default(),
             denied: e.denied,
             denied_message: e.denied.map(|d| d.message().to_string()),
+            ran_as: e.ran_as,
         }
     }
 }
@@ -1168,6 +1492,8 @@ mod audit_tests {
             account_mode: SshAccountMode::ConsoleUser,
             session_secs: 900,
             confirmed_after_ms: Some(42),
+            port: DEFAULT_SSH_PORT,
+            ran_as: "worker",
         }
     }
 
@@ -1258,6 +1584,7 @@ mod audit_tests {
             SshDenyReason::GrantExpiredOnArrival,
             SshDenyReason::GrantRefused,
             SshDenyReason::GrantUnconfirmed,
+            SshDenyReason::ClaimRefused,
         ] {
             let e = audit_event(
                 ObjectId::new(),
@@ -1498,6 +1825,7 @@ mod tests {
             SshDenyReason::GrantExpiredOnArrival,
             SshDenyReason::GrantRefused,
             SshDenyReason::GrantUnconfirmed,
+            SshDenyReason::ClaimRefused,
         ] {
             let m = r.message();
             assert!(!m.is_empty(), "{r:?} has no message");
