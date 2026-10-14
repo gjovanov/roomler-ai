@@ -425,6 +425,18 @@ sequenceDiagram
   on a host you can only reach over its default route.
 - **Windows exits are v4-only** (no WinNAT v6): clients get v4 egress and v6
   fail-closed.
+- **A re-install of the exit peer used to black-hole v4 egress** (fixed in
+  FR-97). The reconcile writes the split-default `/1`s into the exit peer's
+  WireGuard allowed-IPs once; a later re-install of that peer (a carrier
+  rebuilt, a netmap update) runs the generic `install_subnets`, which
+  *replaces* its allowed-IPs with its real subnets. The `/1`s were gone while
+  `split_default_installed` still read true, so the OS `/1`s kept routing
+  into the TUN and every packet found no peer, with `roomler status` still
+  saying `active`, until a restart. The signature in the log is
+  `dropped advertised default route(s) … peer=<the exit>` right before egress
+  dies. The reconcile now re-asserts the split-default every time it finds it
+  missing (`route_guard::split_default_missing`), as it always did for the v6
+  half (`set_v6_exit`), and says so in a WARN.
 - **Consent** is currently auto-granted on the agent (see the remote-control
   known issues); an exit node forwards for any approved client in its tenant.
 - **Approval requires a re-join.** After the admin toggle, the exit node's
