@@ -436,9 +436,48 @@ pub mod helper {
 
     /// FR-93 P5c — the exit status when the compositor ended the stream but
     /// not the session: mutter ends a monitor's recording when that monitor's
-    /// configuration changes (a resolution change, a hotplug). The parent
-    /// reopens, which records the monitor anew.
+    /// configuration changes (a resolution change, a hotplug), and (P5d) a
+    /// compositor that restarts (KWin, after a crash) takes every stream with
+    /// it. The parent reopens, which records the monitor anew.
     const EXIT_STREAM_ENDED: i32 = 4;
+
+    /// The helper's frame loop, both arms: frames to stdout until the parent
+    /// closes the pipe (the normal end, quietly) or, FR-93 P5c/P5d, the
+    /// stream's source is gone. Frames alone cannot tell that apart from an
+    /// idle desktop, which sends none either but stays STREAMING, so the
+    /// stream's state is read between frames; once it has been outside
+    /// STREAMING for [`SOURCE_GONE_AFTER`], `gone` is said and the capture ends
+    /// with [`EXIT_STREAM_ENDED`].
+    fn write_frames(handle: &super::pipewire::StreamHandle, gone: &str) {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let mut not_streaming_since = None;
+        loop {
+            match handle
+                .frames
+                .recv_timeout(std::time::Duration::from_millis(500))
+            {
+                Ok((h, bytes)) => {
+                    // A write failure means the parent closed the pipe — the
+                    // normal way this process ends. Return quietly rather
+                    // than logging a shutdown as an error.
+                    if out.write_all(&h.encode()).is_err() || out.write_all(&bytes).is_err() {
+                        return;
+                    }
+                    if out.flush().is_err() {
+                        return;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+            let state = handle.state.load(std::sync::atomic::Ordering::Relaxed);
+            if source_gone(state, &mut not_streaming_since, std::time::Instant::now()) {
+                eprintln!("{gone}");
+                std::process::exit(EXIT_STREAM_ENDED);
+            }
+        }
+    }
 
     /// FR-93 P5c — how long a stream may sit outside `STREAMING` before its
     /// source counts as gone. A renegotiation pauses it for milliseconds; a
@@ -680,19 +719,15 @@ pub mod helper {
             std::process::exit(1);
         }
 
-        // From here on stdout carries nothing but frames.
-        let mut out = std::io::stdout().lock();
-        while let Ok((h, bytes)) = handle.frames.recv() {
-            // A write failure means the parent closed the pipe — the normal
-            // way this process ends. Exit quietly rather than logging a
-            // shutdown as an error.
-            if out.write_all(&h.encode()).is_err() || out.write_all(&bytes).is_err() {
-                break;
-            }
-            if out.flush().is_err() {
-                break;
-            }
-        }
+        // From here on stdout carries nothing but frames. FR-93 P5d — a
+        // compositor that restarts (KWin, after a crash) takes the portal's
+        // stream with it and leaves ours paused, with no error: measured on
+        // Plasma 6.7, the viewer kept the last frame for good.
+        write_frames(
+            &handle,
+            "portal-helper: the portal's stream ended (its compositor restarted, or ended the \
+             screen cast); ending the capture",
+        );
     }
 
     /// FR-45 P5, child side — the same streaming loop, but the node id comes
@@ -843,40 +878,15 @@ pub mod helper {
 
         // ⚠️ `session` must stay alive for the whole loop — mutter tears the
         // session down with the D-Bus connection inside it, taking the node.
-        let mut out = std::io::stdout().lock();
         // FR-93 P5c — mutter ends a monitor's recording when that monitor's
         // configuration changes, and leaves both sessions open: no `Closed`,
-        // no error, the stream paused for good. Waiting on frames alone would
-        // wait forever (an idle desktop sends none either, but stays
-        // STREAMING), so the stream's state is read between frames, and a
-        // stream that has left STREAMING for good ends the capture: the
-        // reopen records the monitor at its new size.
-        let mut not_streaming_since = None;
-        loop {
-            match handle
-                .frames
-                .recv_timeout(std::time::Duration::from_millis(500))
-            {
-                Ok((h, bytes)) => {
-                    if out.write_all(&h.encode()).is_err() || out.write_all(&bytes).is_err() {
-                        break;
-                    }
-                    if out.flush().is_err() {
-                        break;
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            let state = handle.state.load(std::sync::atomic::Ordering::Relaxed);
-            if source_gone(state, &mut not_streaming_since, std::time::Instant::now()) {
-                eprintln!(
-                    "portal-helper: mutter ended the stream (it ends a monitor's recording when the \
-                     monitor's configuration changes); ending the capture"
-                );
-                std::process::exit(EXIT_STREAM_ENDED);
-            }
-        }
+        // no error, the stream paused for good. The reopen records the
+        // monitor at its new size.
+        write_frames(
+            &handle,
+            "portal-helper: mutter ended the stream (it ends a monitor's recording when the \
+             monitor's configuration changes); ending the capture",
+        );
         drop(session);
     }
 
