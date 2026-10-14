@@ -2747,6 +2747,11 @@ async fn handle_server_msg(
             input_mode,
             tenant_name,
             rc_overlay,
+            // FR-101 P2 — read from P2b on. This build advertises no
+            // `session-policy`, so the hub has already taken out of
+            // `permissions` and `audio_enabled` everything the org's policy
+            // refuses, `ask` included.
+            session_policy: _,
         } => {
             // #1882 — the device's overlay decision, resolved HERE, by the
             // daemon: it is the process whose overlay knows the blocks, and a

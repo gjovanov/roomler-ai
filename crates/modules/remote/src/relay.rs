@@ -37,8 +37,8 @@ use std::time::{Duration, Instant};
 
 use bson::oid::ObjectId;
 use dashmap::DashMap;
-use roomler_ai_mod_fleet::hub::DispatchCtx;
-use roomler_ai_remote_control::models::{ConsentMode, InputMode};
+use roomler_ai_mod_fleet::hub::{DispatchCtx, OrgPolicy};
+use roomler_ai_remote_control::models::{ConsentMode, InputMode, SessionPolicy};
 use roomler_ai_remote_control::signaling::{ClientMsg, Role};
 use tracing::{debug, info, warn};
 
@@ -142,6 +142,9 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     .get("rc_overlay")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // FR-101 P2 — the org's session policy, read by the ORIGIN
+                // pod's gate. See `session_policy_from_relay` for absent.
+                let session_policy = session_policy_from_relay(body.get("session_policy"));
                 let frame: ClientMsg = serde_json::from_value(
                     body.get("frame")
                         .cloned()
@@ -200,6 +203,7 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     tenant_name,
                     may_record,
                     rc_overlay,
+                    session_policy,
                 };
                 match state.fleet.rc_hub.dispatch(&ctx, frame) {
                     Ok(()) => Ok(serde_json::json!({ "dispatched": true })),
@@ -339,6 +343,10 @@ pub async fn relay_rc_frame(
     may_record: bool,
     // #1882 — resolved by the same gate; the owner pod reads absent as off.
     rc_overlay: bool,
+    // FR-101 P2 — the org's session policy, read by the same gate. ⚠️ The
+    // owner pod's hub applies it; without this a cross-pod session would
+    // skip the org's switches.
+    session_policy: OrgPolicy,
     raw_frame: &serde_json::Value,
 ) -> Result<Option<(String, String)>, ()> {
     let Some(bus) = state.cluster_bus.clone() else {
@@ -358,6 +366,7 @@ pub async fn relay_rc_frame(
         "tenant_name": tenant_name,
         "may_record": may_record,
         "rc_overlay": rc_overlay,
+        "session_policy": session_policy_to_relay(session_policy),
         "frame": raw_frame,
     });
     match bus.request(owner_pod, "rc.cmd", body).await {
@@ -432,3 +441,90 @@ pub fn forward_conn_closed(state: &RemoteState, conn: &str) {
 
 /// conn id -> owner pods hosting proxied rc sessions for it.
 pub type RemoteRcConns = DashMap<String, HashSet<String>>;
+
+/// FR-101 P2 — the gate's [`OrgPolicy`] in the relay body: the policy as an
+/// object, or `"unavailable"` when the origin pod could not read it.
+fn session_policy_to_relay(policy: OrgPolicy) -> serde_json::Value {
+    match policy {
+        OrgPolicy::Read(p) => serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
+        OrgPolicy::Unavailable => serde_json::Value::from("unavailable"),
+    }
+}
+
+/// FR-101 P2 — the owner pod's reading of the relay body's `session_policy`.
+///
+/// ⚠️ ABSENT reads as unrestricted, unlike `may_record`'s absent-is-false:
+/// it comes from an origin pod older than the feature, which applied no
+/// policy and would have granted these features itself. Mid-roll, a pair of
+/// pods on different builds cannot promise the policy in either direction
+/// (an older OWNER pod ignores the field just as surely), and failing closed
+/// here would take clipboard and files from every cross-pod session during
+/// each roll, of orgs that set nothing. Anything present but unreadable is
+/// our own pod's garbage and fails closed.
+fn session_policy_from_relay(v: Option<&serde_json::Value>) -> OrgPolicy {
+    match v {
+        None | Some(serde_json::Value::Null) => OrgPolicy::Read(SessionPolicy::default()),
+        Some(v @ serde_json::Value::Object(_)) => serde_json::from_value(v.clone())
+            .map(OrgPolicy::Read)
+            .unwrap_or(OrgPolicy::Unavailable),
+        Some(_) => OrgPolicy::Unavailable,
+    }
+}
+
+#[cfg(test)]
+mod session_policy_relay_tests {
+    use super::*;
+    use roomler_ai_remote_control::models::FeaturePolicy;
+
+    /// The origin pod's reading reaches the owner pod unchanged, both ways.
+    #[test]
+    fn the_policy_crosses_the_relay_as_read() {
+        let p = SessionPolicy {
+            clipboard: FeaturePolicy::Ask,
+            files: FeaturePolicy::Off,
+            audio: FeaturePolicy::On,
+        };
+        for policy in [
+            OrgPolicy::Read(p),
+            OrgPolicy::Read(SessionPolicy::default()),
+            OrgPolicy::Unavailable,
+        ] {
+            let body = serde_json::json!({ "session_policy": session_policy_to_relay(policy) });
+            assert_eq!(
+                session_policy_from_relay(body.get("session_policy")),
+                policy
+            );
+        }
+    }
+
+    /// An older origin pod sends no field: what it would have done itself.
+    #[test]
+    fn an_absent_policy_from_an_older_pod_is_unrestricted() {
+        let body = serde_json::json!({ "may_record": false });
+        assert_eq!(
+            session_policy_from_relay(body.get("session_policy")),
+            OrgPolicy::Read(SessionPolicy::default())
+        );
+    }
+
+    /// Present but unreadable fails closed: a number, or a string other than
+    /// `unavailable`. Inside an object, a value of the wrong type refuses that
+    /// one feature, as `FeaturePolicy` reads it everywhere.
+    #[test]
+    fn a_present_but_unreadable_policy_refuses() {
+        for bad in [serde_json::json!(7), serde_json::json!("on")] {
+            assert_eq!(
+                session_policy_from_relay(Some(&bad)),
+                OrgPolicy::Unavailable,
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            session_policy_from_relay(Some(&serde_json::json!({ "files": 3 }))),
+            OrgPolicy::Read(SessionPolicy {
+                files: FeaturePolicy::Off,
+                ..SessionPolicy::default()
+            })
+        );
+    }
+}
