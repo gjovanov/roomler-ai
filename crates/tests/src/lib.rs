@@ -110,6 +110,8 @@ mod peer_relay_tests;
 #[cfg(test)]
 mod plan_limit_tests;
 #[cfg(test)]
+mod privacy_gate_tests;
+#[cfg(test)]
 mod rate_limit_tests;
 #[cfg(test)]
 mod rc_request_ceiling_tests;

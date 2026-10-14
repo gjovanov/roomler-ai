@@ -109,6 +109,37 @@ It holds on **both** capture paths: SystemContext's DXGI duplication (row 1) and
 - **No new `EndReason`.** An older server drops a frame carrying an unknown one (the FR-27 P10 lesson).
   Privacy mode ending does not end the session.
 
+**As built, P1a (the server's gate, 2026-10-14).** Nothing reaches a device yet: no agent advertises the
+words, and no viewer asks.
+
+| Piece | Where | What it does |
+|---|---|---|
+| `Permissions::PRIVACY` | `crates/remote_control/src/permissions.rs` | Bit `0b0100_0000`. It is in `requires_consent_prompt`, never in the default grant |
+| `privacy-mode`, `privacy-available` | `RpcCap::PrivacyMode`, `RpcCap::PrivacyAvailable` (`crates/remote_control/src/models.rs`) | `privacy-mode`: the owner allowed it and the agent serves it. `privacy-available`: a curtain is possible, but the owner has not allowed it, so the viewer can explain rather than offer nothing (FR-85's `available` lesson). Equality-matched; neither is a prefix of the other |
+| `PrivacySupport` | `crates/modules/fleet/src/hub.rs` | `None` / `NotOptedIn` / `Serves`, read from those words per CONNECTION at the hello and on every caps re-announcement (`socket.rs`), so an owner's OFF stops the next grant without a reconnect |
+| `privacy_grant` | `hub.rs`, in `create_session_full` right after `record_grant` | Strips `PRIVACY` before `rc:request` is built. Reasons, first match wins: `device_cannot_curtain`, `break_glass`, `device_not_opted_in` |
+| The reason, twice | `SessionCreated.privacy_refused` (`signaling.rs`), `SessionRequested.privacy_stripped` (the audit) | A strip is never silent. Both are additive fields, so an older viewer and an older pod read past them |
+
+- **Break-glass is the authz gate's `override_reason`.** The gate sets it only for a validated ADMINISTRATOR
+  force. The hub ignores the wire's own field, and the cross-pod relay carries the gate's, so an owner pod
+  applies decision 1 as well.
+- **Stored grants tolerate a name they do not know.** `deserialize_stored` (and the raw-bson path) drops an
+  unknown name instead of refusing the row, the fail-safe direction it already took for unknown bits. A
+  session row holding `PRIVACY` must still read after a rollback. That protects only a rollback to a build
+  that has the rule, which is why it ships here, before anything can write the name. The `rc:*` wire still
+  refuses an unknown name.
+- **The order of deployment is load-bearing.** P1a must be on every pod before an agent advertises the
+  words (P1b) and before a viewer asks for `PRIVACY` (P1c): an older server cannot parse a request carrying
+  the name, and an older agent fails the whole frame. The delegate crossing (`DelegateFrame::SessionParams`,
+  service → worker) is the same wire inside one install, so P1b keeps both ends on one version or strips the
+  bit at the crossing.
+
+Tests: `privacy_is_granted_only_off_break_glass_on_a_serving_device`,
+`privacy_support_reads_the_rpc_words_by_equality` and `the_hub_strips_privacy_before_the_agent_can_see_it`
+(`hub.rs`); `privacy_available_does_not_imply_privacy_mode` (`models.rs`); the storage-rule tests in
+`permissions.rs`; and `crates/tests/src/privacy_gate_tests.rs`, four cells through real servers, each reading
+the raw `rc:request` the agent received.
+
 ### 3d. Other platforms
 
 - **macOS:** out. Since macOS 15 there is **no public API** that keeps a window out of screen capture. Apple
@@ -144,7 +175,10 @@ says muting the host silences the client too. The FR ships only the honest versi
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | This spec and the claim. The feasibility probes: `BlockInput` (the four questions in §3b), loopback under mute, the macOS lock mechanism | docs only | spec merged. **`BlockInput` and the curtain probed on vmtest 2026-10-13 and 14** (§3b's answers): high integrity needed, only the blocking thread injects (mouse, keys and the wheel alike), Ctrl+Alt+Del lifts the block, and the curtain stays out of both DXGI and WGC capture. Still owed: EDR, loopback under mute, the macOS lock |
-| P1 | The curtain + the permission bit + the device opt-in + audit (Windows) | `privacy_mode_allowed=false` (default) | — |
+| P1 | The curtain + the permission bit + the device opt-in + audit (Windows), in three steps below | `privacy_mode_allowed=false` (default) | P1a built |
+| P1a | The server's gate: the bit, the two `rpc` words, the hub's strip with its reasons, break-glass excluded, the storage rule (§3c as built) | none needed: nothing advertises the words yet | **built** (this PR): unit + `privacy_gate_tests` green locally; the negative control (strip disabled) fails them |
+| P1b | The agent: `privacy_mode_allowed`, the words, the consent line, the curtain, the `privacy` channel, and the device's own refusal | `privacy_mode_allowed=false` | — |
+| P1c | The viewer: the toggle, the refusal reasons, asking for `PRIVACY` only once P1a is deployed | the toggle | — |
 | P2 | The input block, if P0 cleared it | `privacy_input_block=false` | — |
 | P3 | Lock on end (Windows, Linux, macOS) | `lock_on_end=never` | — |
 | P4 | Host mute | the toggle | — |

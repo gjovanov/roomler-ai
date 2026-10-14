@@ -197,6 +197,12 @@ pub async fn handle_agent_socket(
         .rc_hub
         .set_agent_ssh_grant_ack(agent_id, acks_ssh_grants);
     state.rc_hub.set_agent_record_support(agent_id, records);
+    // FR-99 — whether the agent serves privacy mode (`privacy-mode`, only
+    // while its owner allows it) or could (`privacy-available`).
+    // Equality-matched through `has_rpc`.
+    state
+        .rc_hub
+        .set_agent_privacy_support(agent_id, crate::hub::PrivacySupport::from_caps(&caps));
     state
         .rc_hub
         .set_agent_keep_busy_support(agent_id, supports_keep_busy);
@@ -664,6 +670,14 @@ pub async fn handle_agent_socket(
                                     state.rc_hub.set_agent_record_support(
                                         agent_id,
                                         crate::hub::RecordSupport::from_caps(caps),
+                                    );
+                                    // FR-99 — the owner switches privacy mode
+                                    // on or off while connected: the same
+                                    // reasoning, and an OFF must stop the
+                                    // next grant at once.
+                                    state.rc_hub.set_agent_privacy_support(
+                                        agent_id,
+                                        crate::hub::PrivacySupport::from_caps(caps),
                                     );
                                     // FR-94 — the SYSTEM service came up, was
                                     // anchored, or went away while this worker

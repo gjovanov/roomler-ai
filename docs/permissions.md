@@ -302,6 +302,7 @@ The catalogue splits powers that look adjacent, and each split was paid for:
 | `REMOTE_CONTROL` | `RECORD_REMOTE_SCREEN` | watching a screen ends with the session; a recording is a copy that outlives it (FR-85) |
 | `EXEC_DEVICE` / `SSH_DEVICE` | `HIVE_RUN` | running a command yourself is not handing a model a shell on the box to run its own — and a session runs as the device-mapped account, not SYSTEM/root, so neither power contains the other (FR-90) |
 | `ADMINISTRATOR` under break-glass | recording | break-glass skips the host's consent, so a recording made under it would be covert — the hub strips `RECORD` whatever the mask says |
+| `ADMINISTRATOR` under break-glass | privacy mode | the same session never covers the device's screen: a curtain would hide it from the one person who could object — the hub strips the session's `PRIVACY` bit (FR-99) |
 | any bit below `ADMINISTRATOR` | `MANAGE_TENANT` | configuring the org is the owner's job — nothing in `DEFAULT_ADMIN` reaches it, only the bypass does |
 
 And the escalation rule that ties them together: **you cannot grant a permission
