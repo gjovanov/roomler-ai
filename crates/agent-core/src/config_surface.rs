@@ -1671,6 +1671,16 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-92 - let a remote controller turn on keep busy: mouse patterns that keep this computer active (no screensaver, idle lock or Away) until switched off, paused whenever someone uses the computer (default on). Off also stops it. While it runs it keeps the computer awake, whatever power_policy says. Device-only: never pushable through remote config.",
     },
     KeyMeta {
+        key: "privacy_mode_allowed",
+        group: Group::RemoteDesktop,
+        tier: Tier::Standard,
+        // LIVE: read at every "on", and OFF takes a curtain that is up down;
+        // the capability follows on the next heartbeat.
+        live: true,
+        kind: "bool",
+        description: "FR-99 - let a remote controller turn on privacy mode during a session: a curtain covers this screen for the person in front of it, with a notice saying who is connected, while the controller still sees the desktop (default off). Windows 10 2004 and later. The curtain hides the screen; it does not stop someone at this keyboard. Off also takes a curtain that is up down. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
+    },
+    KeyMeta {
         key: "forward_acl",
         group: Group::Tunnels,
         tier: Tier::Standard,
@@ -1947,6 +1957,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "record_remote_enabled" => Some(fmt_bool(cfg.record_remote_enabled)),
         "record_remote_audio" => Some(fmt_bool(cfg.record_remote_audio)),
         "keep_busy_enabled" => Some(fmt_bool(cfg.keep_busy_enabled)),
+        "privacy_mode_allowed" => Some(fmt_bool(cfg.privacy_mode_allowed)),
         "forward_acl" => serde_json::to_string(&cfg.forward_acl).ok(),
         "virtual_desktop_apps" => serde_json::to_string(&cfg.virtual_desktop_apps).ok(),
         _ => None,
@@ -1996,6 +2007,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // FR-92 — cleared means the default, which is ON (operator decision
         // 2026-10-10); the owner turns it off by setting it false.
         "keep_busy_enabled" => cfg.keep_busy_enabled = parse_bool_or(value, true)?,
+        "privacy_mode_allowed" => cfg.privacy_mode_allowed = parse_bool_or(value, false)?,
         "macos_supervise_gui_worker" => {
             cfg.macos_supervise_gui_worker = parse_bool_or(value, false)?
         }
@@ -2799,6 +2811,7 @@ mod tests {
             "record_remote_enabled",
             "record_remote_audio",
             "keep_busy_enabled",
+            "privacy_mode_allowed",
         ]
         .into_iter()
         .map(String::from)

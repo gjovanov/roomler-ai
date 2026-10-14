@@ -6632,6 +6632,9 @@ mod tests {
             "hive_replica",
             "hive_archive",
             "hive_store_quota",
+            // FR-99 — whether a controller may cover this screen: a server
+            // that could set it could curtain any device it controls.
+            "privacy_mode_allowed",
         ] {
             assert!(
                 !keys.contains(&forbidden),
@@ -6642,6 +6645,12 @@ mod tests {
         assert!(
             !keys.iter().any(|k| k.contains("restart")),
             "remote configuration never restarts a daemon (docs/remote-config.md §7b): {keys:?}"
+        );
+        // FR-99 — no privacy key at all: whatever privacy mode grows next
+        // (the input block, the lock on end), it is the device's.
+        assert!(
+            !keys.iter().any(|k| k.starts_with("privacy_")),
+            "privacy mode is configured on the device only: {keys:?}"
         );
 
         // And the receiving side ignores it rather than erroring, which is the
