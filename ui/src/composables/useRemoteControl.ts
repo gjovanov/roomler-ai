@@ -597,7 +597,13 @@ export function friendlyRcError(code: unknown, serverMessage: unknown): string {
  * Returns `null` for a nominal end (hangups, idle timeouts) so the caller can
  * stay silent - an alert on a normal disconnect is noise.
  */
-export function friendlyEndReason(reason: unknown): string | null {
+export function friendlyEndReason(reason: unknown, limit?: unknown): string | null {
+  // FR-101 P4b — a limit the organization set ended it (`rc:terminate`'s
+  // `limit`). Said as such: "idle" would be the wrong story for someone who
+  // was working the whole time.
+  if (reason === 'idle_timeout' && limit === 'max_duration') {
+    return "The session reached your organization's maximum length. Connect again to start a new one."
+  }
   switch (reason) {
     case 'user_denied':
       return 'Someone at that device declined the request.'
@@ -7582,7 +7588,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // FR-27 - a non-nominal end gets a sentence, not the enum name. The
         // mapping returns null for every nominal reason, so the set of
         // reasons that surface is the set that has something to say.
-        const friendly = friendlyEndReason(msg.reason)
+        const friendly = friendlyEndReason(msg.reason, msg.limit)
         if (friendly) error.value = friendly
       }
       teardown()

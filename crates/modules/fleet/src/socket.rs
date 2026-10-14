@@ -437,6 +437,7 @@ pub async fn handle_agent_socket(
         may_record: false,
         rc_overlay: false,
         session_policy: crate::hub::OrgPolicy::Unavailable,
+        max_duration: None,
     };
 
     // Phase A-1 — server-side receive-liveness, symmetric to the agent's

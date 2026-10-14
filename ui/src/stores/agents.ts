@@ -1383,6 +1383,40 @@ export const useAgentStore = defineStore('agents', () => {
     orgEphemeralKeysEnabled.value = resp.ephemeral_keys_enabled
   }
 
+  // ── FR-101 P4b — the org's session limits ──────────────────────────
+  //
+  // The maximum length of a remote-desktop session, in seconds; the hub ends
+  // a session that reaches it. `null` = no limit.
+
+  /** `undefined` until fetched, and for a member who may not manage org
+   *  settings; `null` = no limit. */
+  const orgRcMaxSessionSecs = ref<number | null | undefined>(undefined)
+
+  async function fetchOrgRcSessionLimits(tenantId: string) {
+    if (!(await mayReadOrgSettings(tenantId))) {
+      orgRcMaxSessionSecs.value = undefined
+      return
+    }
+    try {
+      const resp = await api.get<{ max_secs: number | null }>(
+        `/tenant/${tenantId}/rc-session-limits`,
+      )
+      orgRcMaxSessionSecs.value = resp.max_secs ?? null
+    } catch {
+      orgRcMaxSessionSecs.value = undefined
+    }
+  }
+
+  /** Set the maximum length (`null` clears it). MANAGE_TENANT server-side;
+   *  applies to sessions that go live after the change. */
+  async function setOrgRcMaxSessionSecs(tenantId: string, maxSecs: number | null) {
+    const resp = await api.put<{ max_secs: number | null }>(
+      `/tenant/${tenantId}/rc-session-limits`,
+      { max_secs: maxSecs },
+    )
+    orgRcMaxSessionSecs.value = resp.max_secs ?? null
+  }
+
   /** List the org's keys (secrets are never in the list — mint-once only). */
   async function listEnrollKeys(tenantId: string): Promise<EnrollmentKeyRow[]> {
     const resp = await api.get<{ items: EnrollmentKeyRow[] }>(
@@ -1590,6 +1624,9 @@ export const useAgentStore = defineStore('agents', () => {
     orgEphemeralKeysEnabled,
     fetchOrgEphemeralKeysEnabled,
     setOrgEphemeralKeysEnabled,
+    orgRcMaxSessionSecs,
+    fetchOrgRcSessionLimits,
+    setOrgRcMaxSessionSecs,
     listEnrollKeys,
     mintEnrollKey,
     revokeEnrollKey,

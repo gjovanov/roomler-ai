@@ -3942,6 +3942,14 @@ describe('FR-27: friendlyEndReason', () => {
     expect(friendlyEndReason(undefined)).toBeNull()
     expect(friendlyEndReason('some_future_reason')).toBeNull()
   })
+
+  it("FR-101 P4b: names the org's maximum length when that is the limit that ended it", () => {
+    expect(friendlyEndReason('idle_timeout', 'max_duration')).toMatch(/maximum length/)
+    // The limit only explains an `idle_timeout`; anything else is unchanged.
+    expect(friendlyEndReason('idle_timeout', undefined)).toBeNull()
+    expect(friendlyEndReason('idle_timeout', 'some_future_limit')).toBeNull()
+    expect(friendlyEndReason('controller_hangup', 'max_duration')).toBeNull()
+  })
 })
 
 // FR-27 P10 - the host's Disconnect. The `rc:terminate` handler takes one

@@ -103,6 +103,11 @@ pub struct LiveSession {
     /// feature → reason (`files` → `org_policy_off`). Kept for a coalesced
     /// duplicate request, exactly as [`Self::record_refused`]. Empty = none.
     pub features_refused: std::collections::BTreeMap<&'static str, &'static str>,
+
+    /// FR-101 P4b — the org's maximum session length, armed as a timer when
+    /// the session goes live and TAKEN then, so a renegotiation cannot arm a
+    /// second. `None` = no limit (or already armed).
+    pub max_duration: Option<std::time::Duration>,
 }
 
 impl LiveSession {
@@ -139,6 +144,7 @@ impl LiveSession {
             record_refused: None,
             privacy_refused: None,
             features_refused: Default::default(),
+            max_duration: None,
         };
         (s, waiter)
     }

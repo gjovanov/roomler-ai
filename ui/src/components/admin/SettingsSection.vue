@@ -293,6 +293,37 @@
       </v-card-text>
     </v-card>
 
+    <!-- FR-101 P4b — how long a remote-desktop session in this org may last.
+         The hub ends a session that reaches it (the viewer is told which limit
+         it was). Off for existing organizations (operator decision). -->
+    <v-card data-testid="org-rc-limits-card">
+      <v-card-title class="d-flex align-center">
+        <v-icon icon="mdi-timer-sand" color="primary" class="mr-2" />
+        Remote session limits
+      </v-card-title>
+      <v-card-text>
+        <v-select
+          :model-value="agentStore.orgRcMaxSessionSecs === undefined ? null : agentStore.orgRcMaxSessionSecs ?? 0"
+          :items="maxSessionOptions()"
+          label="Maximum session length"
+          :loading="savingMaxSession"
+          :disabled="savingMaxSession || agentStore.orgRcMaxSessionSecs === undefined"
+          density="compact"
+          hide-details
+          style="max-width: 320px"
+          data-testid="org-rc-max-session"
+          @update:model-value="onMaxSession"
+        />
+        <div class="text-caption text-medium-emphasis mt-1">
+          A session ends this long after it started, and the person controlling it is told why.
+          No limit by default. A change applies to sessions that start after it.
+        </div>
+        <v-alert v-if="maxSessionError" type="error" variant="tonal" density="compact" class="mt-3">
+          {{ maxSessionError }}
+        </v-alert>
+      </v-card-text>
+    </v-card>
+
     <!-- The exec/SSH audit + activity sections moved to /tenant/{id}/audit
          (2026-08-26) — history review is its own nav destination now. -->
   </div>
@@ -438,7 +469,44 @@ async function onToggleKeys(v: boolean | null) {
   }
 }
 
+// FR-101 P4b — the maximum session length. `0` in the select is "no limit"
+// (sent as `null`); the stored value is seconds.
+const maxSessionItems: { title: string; value: number }[] = [
+  { title: 'No limit', value: 0 },
+  { title: '30 minutes', value: 30 * 60 },
+  { title: '1 hour', value: 60 * 60 },
+  { title: '2 hours', value: 2 * 60 * 60 },
+  { title: '4 hours', value: 4 * 60 * 60 },
+  { title: '8 hours', value: 8 * 60 * 60 },
+  { title: '24 hours', value: 24 * 60 * 60 },
+]
+/** The presets, plus the stored value when it is none of them (set through
+ *  the API), so the select never shows blank for a limit that is in force. */
+function maxSessionOptions(): { title: string; value: number }[] {
+  const cur = agentStore.orgRcMaxSessionSecs
+  if (typeof cur === 'number' && cur > 0 && !maxSessionItems.some((i) => i.value === cur)) {
+    return [...maxSessionItems, { title: `${Math.round(cur / 60)} minutes`, value: cur }]
+  }
+  return maxSessionItems
+}
+const savingMaxSession = ref(false)
+const maxSessionError = ref<string | null>(null)
+
+async function onMaxSession(secs: number | null) {
+  if (secs === null) return
+  savingMaxSession.value = true
+  maxSessionError.value = null
+  try {
+    await agentStore.setOrgRcMaxSessionSecs(props.tenantId, secs === 0 ? null : secs)
+  } catch (e) {
+    maxSessionError.value = (e as Error).message
+  } finally {
+    savingMaxSession.value = false
+  }
+}
+
 onMounted(() => {
+  void agentStore.fetchOrgRcSessionLimits(props.tenantId)
   void agentStore.fetchOrgExecEnabled(props.tenantId)
   void agentStore.fetchOrgSshEnabled(props.tenantId)
   void agentStore.fetchOrgKeepBusyDenied(props.tenantId)

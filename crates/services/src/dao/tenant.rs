@@ -169,6 +169,28 @@ impl TenantDao {
         self.base.find_by_id(tenant_id).await
     }
 
+    /// FR-101 P4b — set or clear the org's maximum session length. `None`
+    /// removes the field (no limit), rather than storing a `null` that an
+    /// older build would also have to read. The route validates the range.
+    pub async fn set_rc_session_max_secs(
+        &self,
+        tenant_id: ObjectId,
+        max_secs: Option<u32>,
+    ) -> DaoResult<Tenant> {
+        let update = match max_secs {
+            Some(secs) => doc! { "$set": {
+                "settings.rc_limits.max_secs": i64::from(secs),
+                "updated_at": DateTime::now(),
+            } },
+            None => doc! {
+                "$unset": { "settings.rc_limits.max_secs": "" },
+                "$set": { "updated_at": DateTime::now() },
+            },
+        };
+        self.base.update_by_id(tenant_id, update).await?;
+        self.base.find_by_id(tenant_id).await
+    }
+
     /// FR-101 P2 — set features of the org's remote-desktop session policy.
     /// Only the `Some` ones are written, each as its own dotted `$set`, so two
     /// admins changing different features cannot lose each other's change,
