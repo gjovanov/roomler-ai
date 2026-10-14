@@ -1119,10 +1119,10 @@ async fn enroll_cmd(
     enrollment_token: String,
     machine_name: String,
 ) -> Result<()> {
-    let enroll_url = format!(
-        "{}/api/tunnel-client/enroll",
-        server_url.trim_end_matches('/')
-    );
+    // FR-101 P1b — the enrollment token travels over TLS, as the agent's does:
+    // a remote `http://` URL is posted to, and saved, as `https://`.
+    let server_url = config::enrollment_server_url(&server_url);
+    let enroll_url = format!("{server_url}/api/tunnel-client/enroll");
     let body = serde_json::json!({
         "enrollment_token": enrollment_token,
         "machine_name": machine_name,
@@ -1155,6 +1155,7 @@ async fn enroll_cmd(
         server_url,
         tunnel_client_token: parsed.tunnel_client_token,
         machine_name,
+        allow_plaintext_server: false,
     };
     let path = config::save(&cfg, cfg_path.as_deref()).context("saving tunnel config")?;
     println!("Enrolled. Config written to {}", path.display());

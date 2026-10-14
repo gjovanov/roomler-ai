@@ -1479,6 +1479,18 @@ pub struct AgentConfig {
     /// FR-101 P2b — the same floor for this computer's audio.
     #[serde(default)]
     pub rc_audio: roomler_ai_remote_control::models::FeaturePolicy,
+    /// FR-101 P1b — keep a plaintext `server_url` (and every `[[orgs]]`
+    /// entry's) as written. Without it a loaded `http://` URL to a remote
+    /// host is read as `https://` (`roomler_ai_remote_control::server_url`),
+    /// so the control socket, the token renewal, the updater and the uploads
+    /// all go over TLS. For a lab whose server serves no TLS. Loopback needs
+    /// no escape: it is never promoted.
+    ///
+    /// ⚠️ Device-owned: structurally absent from `DesiredConfig`, and set over
+    /// the LocalAPI only from the console. A server that could set it could
+    /// talk a device down to plaintext.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_plaintext_server: bool,
     /// B2 — score-driven demotion of degraded-but-live direct carriers
     /// (`ROOMLERD_OVERLAY_DEMOTE`): `off` | `shadow` (compute +
     /// count, never act — the built-in default) | `on` (voluntary MBB
@@ -2208,6 +2220,36 @@ impl AgentConfig {
         }
         derive_ws_url(&self.server_url)
     }
+
+    /// FR-101 P1b — read every URL to a server over TLS: this enrollment's
+    /// `server_url` and `ws_url`, and each `[[orgs]]` entry's. A plaintext URL
+    /// to a remote host becomes its TLS twin (`roomler_ai_remote_control::
+    /// server_url::secure`); loopback stays, and so does everything when the
+    /// owner set [`Self::allow_plaintext_server`]. Applied by [`try_load`], the
+    /// one parse every reader of the config goes through, so no consumer can
+    /// dial the URL as written. Returns what changed, as (field, was) pairs.
+    pub fn secure_server_urls(&mut self) -> Vec<(String, String)> {
+        use roomler_ai_remote_control::server_url::secure;
+        let allow = self.allow_plaintext_server;
+        let mut changed = Vec::new();
+        let mut one = |field: String, url: &mut String| {
+            let s = secure(url, allow);
+            if s.promoted {
+                changed.push((field, std::mem::replace(url, s.url)));
+            }
+        };
+        one("server_url".into(), &mut self.server_url);
+        if let Some(ws) = self.ws_url.as_mut() {
+            one("ws_url".into(), ws);
+        }
+        for (i, org) in self.orgs.iter_mut().enumerate() {
+            one(format!("orgs[{i}].server_url"), &mut org.server_url);
+            if let Some(ws) = org.ws_url.as_mut() {
+                one(format!("orgs[{i}].ws_url"), ws);
+            }
+        }
+        changed
+    }
 }
 
 /// Mark the start of a fresh run. Sets `last_run_unhealthy=true`
@@ -2511,6 +2553,7 @@ pub fn test_fixture() -> AgentConfig {
         rc_clipboard: Default::default(),
         rc_files: Default::default(),
         rc_audio: Default::default(),
+        allow_plaintext_server: false,
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,
@@ -3037,8 +3080,20 @@ fn try_load(path: &PathBuf) -> Result<AgentConfig> {
             raw.len()
         );
     }
-    let cfg: AgentConfig =
+    let mut cfg: AgentConfig =
         toml::from_str(&raw).with_context(|| format!("parsing config at {}", path.display()))?;
+    // FR-101 P1b — TLS to the server whatever the file says, unless its owner
+    // kept plaintext (`allow_plaintext_server`). Here, because every reader
+    // parses through this function: the daemon, the probe, the recovery.
+    for (field, was) in cfg.secure_server_urls() {
+        tracing::warn!(
+            path = %path.display(),
+            field = %field,
+            was = %was,
+            "a plaintext server URL in the config is read as TLS; set \
+             allow_plaintext_server = true to keep plaintext (a lab without TLS)"
+        );
+    }
     Ok(cfg)
 }
 
@@ -3299,6 +3354,70 @@ machine_name = "devbox"
             derive_ws_url("http://localhost:3000"),
             "ws://localhost:3000/ws"
         );
+    }
+
+    /// Write `toml` as a config file and load it the way every reader does.
+    fn load_toml(toml: &str) -> AgentConfig {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).expect("write config");
+        load(&path).expect("config loads")
+    }
+
+    /// FR-101 AC3, on the load path: a config holding `http://roomler.ai`
+    /// signals over `wss://`, while `http://127.0.0.1` stays `ws://`.
+    #[test]
+    fn a_plaintext_server_url_is_read_as_tls_and_loopback_is_not() {
+        let remote = load_toml(&minimal_toml().replace(
+            "server_url = \"https://roomler.ai\"",
+            "server_url = \"http://roomler.ai\"",
+        ));
+        assert_eq!(remote.server_url, "https://roomler.ai");
+        assert_eq!(remote.ws_url(), "wss://roomler.ai/ws");
+
+        let local = load_toml(&minimal_toml().replace(
+            "server_url = \"https://roomler.ai\"",
+            "server_url = \"http://127.0.0.1:3000\"",
+        ));
+        assert_eq!(local.server_url, "http://127.0.0.1:3000");
+        assert_eq!(local.ws_url(), "ws://127.0.0.1:3000/ws");
+    }
+
+    /// The owner's escape keeps plaintext as written; an explicit `ws_url` and
+    /// every `[[orgs]]` entry are read over TLS like the primary.
+    #[test]
+    fn every_server_url_is_secured_unless_the_owner_kept_plaintext() {
+        let toml = minimal_toml().replace(
+            "server_url = \"https://roomler.ai\"",
+            "server_url = \"http://roomler.ai\"\nws_url = \"ws://roomler.ai/ws\"",
+        ) + r#"
+[[orgs]]
+label = "other"
+server_url = "HTTP://other.example"
+agent_token = "tok2"
+agent_id = "aid2"
+tenant_id = "tid2"
+"#;
+        let cfg = load_toml(&toml);
+        assert_eq!(cfg.server_url, "https://roomler.ai");
+        assert_eq!(cfg.ws_url(), "wss://roomler.ai/ws");
+        assert_eq!(cfg.orgs[0].server_url, "https://other.example");
+        assert_eq!(cfg.orgs[0].ws_url(), "wss://other.example/ws");
+
+        let lab = load_toml(&format!("allow_plaintext_server = true\n{toml}"));
+        assert_eq!(lab.server_url, "http://roomler.ai");
+        assert_eq!(lab.ws_url(), "ws://roomler.ai/ws");
+        assert_eq!(lab.orgs[0].server_url, "HTTP://other.example");
+    }
+
+    /// The escape is the owner's alone: absent from a file it reads as off,
+    /// and off never reaches the file.
+    #[test]
+    fn the_plaintext_escape_is_off_unless_written() {
+        let cfg: AgentConfig = toml::from_str(&minimal_toml()).expect("parses");
+        assert!(!cfg.allow_plaintext_server);
+        let written = toml::to_string_pretty(&cfg).expect("serialises");
+        assert!(!written.contains("allow_plaintext_server"), "{written}");
     }
 
     #[test]

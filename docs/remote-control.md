@@ -700,6 +700,17 @@ export function useRemoteControl(sessionId: string) {
 | Session token | `aud=session`, `session_id`, perms[] | session duration | in-memory both sides |
 | TURN creds | HMAC-SHA1 over coturn shared secret | 10 min | not stored |
 
+**Every credential above reaches the server over TLS** (FR-101 P1b). The device dials
+the URL in its config, and a plaintext one that is not loopback is read as
+`https://` / `wss://` wherever it enters:
+- enrollment, which always did this;
+- every load of the config: `server_url`, `ws_url`, and each `[[orgs]]` entry's;
+- the tunnel CLI's enrollment and config.
+
+The rule is one function, `crates/remote_control/src/server_url.rs`.
+[security-baseline.md](security-baseline.md) §4 has the entry-point table and the lab
+escape, `allow_plaintext_server`, which the device owns.
+
 ### 11.2 Consent
 
 Five modes, set per device (`AccessPolicy.consent_mode`, admin-set, default

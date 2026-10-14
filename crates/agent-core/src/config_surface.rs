@@ -1707,6 +1707,15 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-101 - this device's own rule for sending this computer's audio in a remote session: on (default) | ask | off, as rc_clipboard. Device-only: never pushable through remote config.",
     },
     KeyMeta {
+        key: "allow_plaintext_server",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        // Read with the config at start: the server URLs are dialled from it.
+        live: false,
+        kind: "bool",
+        description: "FR-101 - keep a plaintext http:// server URL as written (default off: a remote http:// URL is used as https://, so signalling, token renewal, updates and uploads go over TLS). Only for a lab whose server serves no TLS; loopback never needs it. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
+    },
+    KeyMeta {
         key: "forward_acl",
         group: Group::Tunnels,
         tier: Tier::Standard,
@@ -1987,6 +1996,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "rc_clipboard" => Some(fmt_feature_policy(cfg.rc_clipboard)),
         "rc_files" => Some(fmt_feature_policy(cfg.rc_files)),
         "rc_audio" => Some(fmt_feature_policy(cfg.rc_audio)),
+        "allow_plaintext_server" => Some(fmt_bool(cfg.allow_plaintext_server)),
         "forward_acl" => serde_json::to_string(&cfg.forward_acl).ok(),
         "virtual_desktop_apps" => serde_json::to_string(&cfg.virtual_desktop_apps).ok(),
         _ => None,
@@ -2043,6 +2053,8 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "rc_clipboard" => cfg.rc_clipboard = parse_feature_policy("rc_clipboard", value)?,
         "rc_files" => cfg.rc_files = parse_feature_policy("rc_files", value)?,
         "rc_audio" => cfg.rc_audio = parse_feature_policy("rc_audio", value)?,
+        // FR-101 P1b — cleared means the default: TLS.
+        "allow_plaintext_server" => cfg.allow_plaintext_server = parse_bool_or(value, false)?,
         "macos_supervise_gui_worker" => {
             cfg.macos_supervise_gui_worker = parse_bool_or(value, false)?
         }
