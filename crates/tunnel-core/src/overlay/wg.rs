@@ -1995,6 +1995,12 @@ impl WgDevice {
         self.send.0.read().unwrap().router.v6_exit()
     }
 
+    /// The subnet routes a peer holds right now — lets the exit reconcile see
+    /// that a re-install replaced the split-default it set (FR-97).
+    pub fn peer_subnets(&self, peer_public: &[u8; 32]) -> Vec<super::router::Cidr> {
+        self.send.0.read().unwrap().router.subnets_of(peer_public)
+    }
+
     /// Number of installed peers.
     pub fn peer_count(&self) -> usize {
         self.peers.len()
