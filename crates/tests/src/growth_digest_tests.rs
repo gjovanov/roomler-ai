@@ -151,15 +151,64 @@ async fn insert_member(app: &TestApp, tenant: ObjectId, user: ObjectId) {
     .await;
 }
 
-async fn insert_agent(app: &TestApp, tenant: ObjectId, os: &str, created: DateTime) {
-    insert(
+/// `install_method`: `Some` writes a P3 `install` block; `None` is a row
+/// from before the install trace (no block at all), which must read as
+/// `unknown`.
+async fn insert_agent(
+    app: &TestApp,
+    tenant: ObjectId,
+    os: &str,
+    created: DateTime,
+    install_method: Option<&str>,
+) {
+    let mut d = doc! {
+        "tenant_id": tenant, "owner_user_id": ObjectId::new(), "name": "box",
+        "machine_id": format!("m-{}", ObjectId::new()), "os": os,
+        "agent_version": "0.4.130", "status": "offline",
+        "created_at": created, "updated_at": created, "deleted_at": Bson::Null,
+    };
+    if let Some(m) = install_method {
+        d.insert("install", doc! { "method": m, "scope": "system" });
+    }
+    insert(app, "agents", d).await;
+}
+
+/// A row whose `_id` is a STRING (the jti, the daily counter's fact) —
+/// `insert` above would replace it with a fresh ObjectId.
+async fn insert_string_id(app: &TestApp, coll: &str, d: Document) {
+    app.db
+        .collection::<Document>(coll)
+        .insert_one(d)
+        .await
+        .unwrap_or_else(|e| panic!("insert into {coll}: {e}"));
+}
+
+/// P3 — an `enroll_token_issued` row: minted at `issued`, redeemed or not.
+async fn insert_token(app: &TestApp, tenant: ObjectId, issued: DateTime, redeemed: bool) {
+    insert_string_id(
         app,
-        "agents",
+        "enroll_token_issued",
         doc! {
-            "tenant_id": tenant, "owner_user_id": ObjectId::new(), "name": "box",
-            "machine_id": format!("m-{}", ObjectId::new()), "os": os,
-            "agent_version": "0.4.130", "status": "offline",
-            "created_at": created, "updated_at": created, "deleted_at": Bson::Null,
+            "_id": format!("jti-{}", ObjectId::new()),
+            "tenant_id": tenant, "issued_by": ObjectId::new(), "issued_at": issued,
+            "kind": "standard",
+            "redeemed_at": if redeemed { Bson::DateTime(issued) } else { Bson::Null },
+            "agent_id": if redeemed { Bson::ObjectId(ObjectId::new()) } else { Bson::Null },
+        },
+    )
+    .await;
+}
+
+/// P3 — a `growth_daily` counter row, as the fleet module writes them.
+async fn insert_fetch(app: &TestApp, day: &str, asset: &str, client: &str, os: &str, value: i64) {
+    let dims = doc! { "asset": asset, "client": client, "os": os };
+    let id = format!("install:fetch:asset={asset},client={client},os={os}:{day}");
+    insert_string_id(
+        app,
+        "growth_daily",
+        doc! {
+            "_id": id, "day": day, "source": "install", "metric": "fetch",
+            "dims": dims, "value": value,
         },
     )
     .await;
@@ -323,11 +372,46 @@ async fn seed() -> Seeded {
     insert_member(&app, org_a, b).await;
     insert_member(&app, org_x, x).await;
 
-    // Devices (tombstones count as enrolled; X is excluded).
-    insert_agent(&app, org_a, "linux", at(0, 11, 0, 0)).await;
-    insert_agent(&app, org_a, "windows", at(0, 12, 0, 0)).await;
-    insert_agent(&app, org_c, "macos", at(-1, 13, 0, 0)).await;
-    insert_agent(&app, org_x, "linux", at(0, 14, 0, 0)).await;
+    // Devices (tombstones count as enrolled; X is excluded). P3: two say how
+    // they were installed, C's row predates the install trace.
+    insert_agent(&app, org_a, "linux", at(0, 11, 0, 0), Some("script-sh")).await;
+    insert_agent(&app, org_a, "windows", at(0, 12, 0, 0), Some("wizard")).await;
+    insert_agent(&app, org_c, "macos", at(-1, 13, 0, 0), None).await;
+    insert_agent(&app, org_x, "linux", at(0, 14, 0, 0), Some("wizard")).await;
+
+    // P3 — enrollment tokens: three minted in A that day (two redeemed), one
+    // the day before (unredeemed), one in the excluded X, one out of window.
+    insert_token(&app, org_a, at(0, 10, 0, 0), true).await;
+    insert_token(&app, org_a, at(0, 10, 30, 0), true).await;
+    insert_token(&app, org_a, at(0, 11, 0, 0), false).await;
+    insert_token(&app, org_a, at(-1, 9, 0, 0), false).await;
+    insert_token(&app, org_x, at(0, 9, 0, 0), true).await;
+    insert_token(&app, org_a, at(-40, 9, 0, 0), true).await;
+
+    // P3 — fetch counters: install.sh by curl that day, 3 days before and 20
+    // days before; the wizard's MSI that day; and a row of another source
+    // that the install section must not read.
+    insert_fetch(&app, DAY, "install.sh", "script-sh", "unknown", 5).await;
+    insert_fetch(&app, "2026-09-28", "install.sh", "script-sh", "unknown", 2).await;
+    insert_fetch(&app, "2026-09-11", "install.sh", "script-sh", "unknown", 1).await;
+    insert_fetch(&app, DAY, "installer-permachine", "wizard", "windows", 1).await;
+    insert_string_id(
+        &app,
+        "growth_daily",
+        doc! {
+            "_id": "web:pageview::2026-10-01", "day": DAY, "source": "web",
+            "metric": "pageview", "dims": {}, "value": 999_i64,
+        },
+    )
+    .await;
+    // And a malformed install row (an ObjectId `_id`, no `dims`): it must
+    // cost its own count and nothing else — never the whole digest.
+    insert(
+        &app,
+        "growth_daily",
+        doc! { "day": DAY, "source": "install", "metric": "fetch", "value": 7_i64 },
+    )
+    .await;
 
     // Remote sessions: s1 30 min; s2 spans midnight; s3 12 s; s4 excluded;
     // s5 never started (consent timed out) and ended that day.
@@ -514,9 +598,10 @@ async fn every_section_counts_the_seeded_day_exactly() {
         json!([{ "key": "linux", "count": 1 }, { "key": "windows", "count": 1 }])
     );
     assert_eq!(fig(&j["orgs_devices"]["orgs_first_device"]), (1, 2, 2));
+    // P3 — the day's devices by install method (X's wizard row is excluded).
     assert_eq!(
-        not_measured(&j["orgs_devices"]["by_install_method"]).map(|n| n.1),
-        Some(Some("P3"))
+        j["orgs_devices"]["by_install_method"],
+        json!([{ "key": "script-sh", "count": 1 }, { "key": "wizard", "count": 1 }])
     );
 
     // Usage: a session spanning midnight counts only its overlap.
@@ -609,8 +694,35 @@ async fn every_section_counts_the_seeded_day_exactly() {
         json!([{ "key": "0.4.130", "count": 1 }])
     );
 
+    // P3 — the install trace. Tokens: issued in the window, minus X's; of
+    // those, the redeemed ones. Fetches summed into the windows from the
+    // daily rows, the other source untouched. Enrollments by (method, OS),
+    // C's pre-P3 row reading as `unknown`.
+    assert_eq!(fig(&j["install"]["tokens"]["issued"]), (3, 4, 4));
+    assert_eq!(fig(&j["install"]["tokens"]["redeemed"]), (2, 2, 2));
+    assert_eq!(
+        j["install"]["fetches"],
+        json!([
+            { "asset": "install.sh", "client": "script-sh", "os": "unknown",
+              "fetches": { "day": 5, "d7": 7, "d28": 8 } },
+            { "asset": "installer-permachine", "client": "wizard", "os": "windows",
+              "fetches": { "day": 1, "d7": 1, "d28": 1 } },
+        ])
+    );
+    assert_eq!(
+        j["install"]["enrollments_by_method"],
+        json!([
+            { "method": "script-sh", "os": "linux", "enrolled": { "day": 1, "d7": 1, "d28": 1 } },
+            { "method": "unknown", "os": "macos", "enrolled": { "day": 0, "d7": 1, "d28": 1 } },
+            { "method": "wizard", "os": "windows", "enrolled": { "day": 1, "d7": 1, "d28": 1 } },
+        ])
+    );
+    assert_eq!(
+        not_measured(&j["install"]["wizard_steps"]).map(|n| n.1),
+        Some(Some("P3b"))
+    );
+
     // Not built yet.
-    assert_eq!(not_measured(&j["install"]).map(|n| n.1), Some(Some("P3")));
     assert_eq!(not_measured(&j["social"]).map(|n| n.1), Some(Some("P8")));
     assert_eq!(not_measured(&j["search"]).map(|n| n.1), Some(Some("P7")));
 

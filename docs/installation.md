@@ -43,7 +43,7 @@ sequenceDiagram
     I->>S: GET /api/agent/installer/{flavour}
     Note over I,S: artifact streams through roomler.ai —<br/>corporate AV allow-lists trust the origin
     I->>I: sha256 verify → install → register autostart
-    I->>S: POST /api/agent/enroll {enrollment_token, machine_id, …}
+    I->>S: POST /api/agent/enroll {enrollment_token, machine_id, …, install: {method, scope}}
     S-->>I: {agent_id, tenant_id, agent_token} → written to config.toml
     D->>S: /ws?role=agent — the machine appears in Devices
 ```
@@ -51,6 +51,27 @@ sequenceDiagram
 `machine_id` is a stable hardware hash and `(tenant_id, machine_id)` is unique —
 re-running an installer on a known machine reuses its identity instead of
 duplicating it.
+
+**The enroll says how it was installed** (FR-102 P3, the install trace in
+[growth-observability.md](growth-observability.md)): the device row records
+`install {method, scope}`, shown on the device (`GET …/agent/{id}`) and counted
+in the daily digest. The wizard says `wizard`; the served scripts say
+`script-sh` / `script-ps1`; a hand-typed `roomlerd enroll` says `manual`. If you
+script installs yourself, say what you are:
+
+```bash
+roomlerd enroll --server … --token … --name … --install-method deb --install-scope system
+# or, equivalently, for a daemon of any version (an older one ignores the variables):
+ROOMLER_INSTALL_METHOD=container ROOMLER_INSTALL_SCOPE=system roomlerd enroll …
+```
+
+`--install-method` ∈ `wizard` `script-sh` `script-ps1` `msi` `deb` `pkg` `manual`
+`container` `other`; `--install-scope` ∈ `system` `per-user` `attended` `unknown`.
+The flag beats the env var; a misspelling is refused at the prompt, before the
+single-use token is spent. ⚠️ The served scripts set the **environment**, never
+the flag: a script installs whatever release is current, and a daemon from
+before the flag existed would refuse an argument it does not know. A `re-enroll`
+sends nothing and leaves the row's recorded install alone.
 
 ### "The host must be re-enrolled" — when to believe it
 
