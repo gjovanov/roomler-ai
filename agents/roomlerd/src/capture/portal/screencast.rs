@@ -237,7 +237,17 @@ impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OpenError::Cancelled => write!(f, "the person at the screen declined the request"),
-            OpenError::Ended => write!(f, "the portal ended the request"),
+            // FR-93 P2d-4 — these words now reach the viewer, inside FR-80's
+            // 200-character cap. Measured on the FR-93 lab's KDE guest with its
+            // portal backend stopped: the frontend still offered ScreenCast,
+            // and ended every request at once, with no dialog. Both are user
+            // services (`systemctl --user restart …`).
+            OpenError::Ended => write!(
+                f,
+                "the portal ended the request on its own: its backend \
+                 (xdg-desktop-portal-kde, -gnome) may be stopped; restart it, then \
+                 xdg-desktop-portal"
+            ),
             OpenError::Failed(why) => write!(f, "{why}"),
         }
     }
@@ -974,6 +984,19 @@ mod tests {
     fn cancelled_reads_as_a_person_not_a_fault() {
         assert!(OpenError::Cancelled.to_string().contains("declined"));
         assert_ne!(OpenError::Cancelled, OpenError::Ended);
+    }
+
+    /// FR-93 P2d-4 — a request the portal ended itself reaches the viewer, so
+    /// it says what to check rather than only that it ended.
+    #[test]
+    fn an_ended_request_says_what_to_check() {
+        let why = OpenError::Ended.to_string();
+        assert!(why.contains("restart it, then xdg-desktop-portal"), "{why}");
+        assert!(!why.contains("declined"), "{why}");
+        // Whole inside FR-80's cap, with the prefix the cascade puts on it.
+        let shown = format!("the desktop portal did not share the screen: {why}");
+        let max = crate::capture::CaptureUnavailable::DETAIL_MAX;
+        assert!(shown.chars().count() <= max, "{shown}");
     }
 
     /// A report serialised WITHOUT `input_granted` (an older helper) must
