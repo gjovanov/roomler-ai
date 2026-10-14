@@ -42,6 +42,7 @@ async fn enrol(app: &TestApp, slug: &str) -> (AgentConfig, String) {
         enrollment_token: et["enrollment_token"].as_str().unwrap(),
         machine_id: &format!("mach-{slug}"),
         machine_name: "Crash test",
+        install: None,
     })
     .await
     .expect("enrol");

@@ -17,6 +17,171 @@ pub enum OsKind {
     Windows,
 }
 
+/// FR-102 P3 — how a device was installed, as the enroll request says it
+/// (`docs/growth-observability.md`, the install trace). Shared by both ends
+/// of `POST /api/agent/enroll`: the agent builds one, the server clamps it
+/// ([`InstallInfo::clamped`]) and stores it once on the agent row.
+///
+/// Strings on the wire and on the row, not the enums below: a value this
+/// build has never heard of must be **clamped to `other`**, never refused —
+/// an older server meeting a newer agent's spelling has to keep enrolling
+/// it, and an older row must keep reading. [`InstallMethod`] and
+/// [`InstallScope`] are the vocabulary both sides validate against.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct InstallInfo {
+    /// One of [`InstallMethod`]'s spellings.
+    pub method: String,
+    /// One of [`InstallScope`]'s spellings; absent reads as `unknown`.
+    #[serde(default)]
+    pub scope: String,
+    /// Reserved for P3b (the wizard's opt-in diagnostics run id). Carried
+    /// only when a client sets it; the server keeps at most a short opaque
+    /// token here, never anything it could parse as a person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+}
+
+/// The ceiling on a `run` id the server keeps (P3b mints 32 hex chars).
+pub const INSTALL_RUN_MAX_LEN: usize = 64;
+
+impl InstallInfo {
+    pub fn new(method: InstallMethod, scope: InstallScope) -> Self {
+        Self {
+            method: method.wire().to_string(),
+            scope: scope.wire().to_string(),
+            run: None,
+        }
+    }
+
+    /// What the server stores for an enroll that did not say: an agent from
+    /// before P3, or a caller that left the field out.
+    pub fn unknown() -> Self {
+        Self::new(InstallMethod::Unknown, InstallScope::Unknown)
+    }
+
+    /// The server's view of a client's claim: a method outside the
+    /// vocabulary is `other`, a scope outside it is `unknown`, and a `run`
+    /// that is not a short opaque token is dropped. Never an error — the
+    /// enroll must succeed whatever the install trace says.
+    pub fn clamped(&self) -> Self {
+        let method = InstallMethod::parse(self.method.trim()).unwrap_or(InstallMethod::Other);
+        let scope = InstallScope::parse(self.scope.trim()).unwrap_or(InstallScope::Unknown);
+        let run = self
+            .run
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| {
+                !r.is_empty()
+                    && r.len() <= INSTALL_RUN_MAX_LEN
+                    && r.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
+            .map(str::to_string);
+        Self {
+            method: method.wire().to_string(),
+            scope: scope.wire().to_string(),
+            run,
+        }
+    }
+}
+
+/// How the daemon got onto the machine. The wire spelling is the stored
+/// spelling and a digest's grouping key, so it is locked by a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InstallMethod {
+    /// The `roomler-setup` wizard, in-process.
+    Wizard,
+    /// The served `install.sh`.
+    ScriptSh,
+    /// The served `install.ps1`.
+    ScriptPs1,
+    /// An MSI run by hand.
+    Msi,
+    /// A `.deb` installed by hand.
+    Deb,
+    /// A macOS `.pkg` installed by hand.
+    Pkg,
+    /// A hand-typed `roomlerd enroll` (the default when nothing says
+    /// otherwise), or the companion's enroll form.
+    Manual,
+    /// A container image's entrypoint.
+    Container,
+    /// A spelling this build does not know — the server's clamp.
+    Other,
+    /// The enroll did not say: an agent from before P3. Server-assigned;
+    /// a client never needs to send it.
+    Unknown,
+}
+
+impl InstallMethod {
+    /// Every variant, for the vocabulary tests and the CLI's help text.
+    pub const ALL: [InstallMethod; 10] = [
+        InstallMethod::Wizard,
+        InstallMethod::ScriptSh,
+        InstallMethod::ScriptPs1,
+        InstallMethod::Msi,
+        InstallMethod::Deb,
+        InstallMethod::Pkg,
+        InstallMethod::Manual,
+        InstallMethod::Container,
+        InstallMethod::Other,
+        InstallMethod::Unknown,
+    ];
+
+    pub fn wire(self) -> &'static str {
+        match self {
+            InstallMethod::Wizard => "wizard",
+            InstallMethod::ScriptSh => "script-sh",
+            InstallMethod::ScriptPs1 => "script-ps1",
+            InstallMethod::Msi => "msi",
+            InstallMethod::Deb => "deb",
+            InstallMethod::Pkg => "pkg",
+            InstallMethod::Manual => "manual",
+            InstallMethod::Container => "container",
+            InstallMethod::Other => "other",
+            InstallMethod::Unknown => "unknown",
+        }
+    }
+
+    /// Exact, case-sensitive: `script-sh` is a spelling, `Script-SH` is not.
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.wire() == raw)
+    }
+}
+
+/// What the install runs as. `attended` is the Windows perMachine service
+/// without SystemContext (the wizard's "Daemon — machine" role): a service,
+/// but one that works only beside a signed-in session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InstallScope {
+    System,
+    PerUser,
+    Attended,
+    Unknown,
+}
+
+impl InstallScope {
+    pub const ALL: [InstallScope; 4] = [
+        InstallScope::System,
+        InstallScope::PerUser,
+        InstallScope::Attended,
+        InstallScope::Unknown,
+    ];
+
+    pub fn wire(self) -> &'static str {
+        match self {
+            InstallScope::System => "system",
+            InstallScope::PerUser => "per-user",
+            InstallScope::Attended => "attended",
+            InstallScope::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.wire() == raw)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
@@ -1681,6 +1846,15 @@ pub struct Agent {
     /// before FR-104, and on an ephemeral one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enrolled_with_jti: Option<String>,
+    /// FR-102 P3 — how this device was installed, as its enroll said
+    /// (`{method, scope, run}`, the spellings of [`InstallMethod`] and
+    /// [`InstallScope`]). Written at every enrollment that creates the row
+    /// (`{method: "unknown"}` when the request did not say — an agent from
+    /// before P3) and refreshed by a re-enrollment only when that request
+    /// says. `None` = the row was created before P3; the digest reads both
+    /// `None` and `unknown` as *unknown*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<InstallInfo>,
     /// Roomler-SSH policy for this device (gate 3). Same shape and the same
     /// closed default as [`Self::exec_policy`] — every pre-feature row
     /// deserialises to [`SshMode::Off`].
@@ -5213,6 +5387,113 @@ mod tests {
         let a: Agent = bson::from_document(doc).expect("pre-FR-51 row must deserialise");
         assert!(!a.ephemeral, "an old row must never read as ephemeral");
         assert_eq!(a.ephemeral_ttl_secs, None);
+        // FR-102 P3 — and a row from before the install trace reads as
+        // "never said", which the digest counts as unknown.
+        assert_eq!(a.install, None);
+    }
+
+    /// FR-102 P3 — the install vocabulary is a stored spelling and a digest
+    /// grouping key: renaming one would split every existing row's count
+    /// from every new one's. Locked, and matched by equality only.
+    #[test]
+    fn install_vocabulary_spellings_are_locked() {
+        let methods: Vec<&str> = InstallMethod::ALL.iter().map(|m| m.wire()).collect();
+        assert_eq!(
+            methods,
+            [
+                "wizard",
+                "script-sh",
+                "script-ps1",
+                "msi",
+                "deb",
+                "pkg",
+                "manual",
+                "container",
+                "other",
+                "unknown"
+            ]
+        );
+        let scopes: Vec<&str> = InstallScope::ALL.iter().map(|s| s.wire()).collect();
+        assert_eq!(scopes, ["system", "per-user", "attended", "unknown"]);
+        for m in InstallMethod::ALL {
+            assert_eq!(InstallMethod::parse(m.wire()), Some(m));
+        }
+        for s in InstallScope::ALL {
+            assert_eq!(InstallScope::parse(s.wire()), Some(s));
+        }
+        // Equality, never a prefix or a case fold: `script` is not a method
+        // and `Wizard` is not the wizard.
+        assert_eq!(InstallMethod::parse("script"), None);
+        assert_eq!(InstallMethod::parse("script-sh2"), None);
+        assert_eq!(InstallMethod::parse("Wizard"), None);
+        assert_eq!(InstallMethod::parse(""), None);
+        assert_eq!(InstallScope::parse("user"), None);
+        assert_eq!(InstallScope::parse("System"), None);
+    }
+
+    /// The server's clamp: a spelling from the future is `other`, a scope it
+    /// does not know is `unknown`, a `run` that is not a short opaque token
+    /// is dropped, and a known value passes through untouched. The enroll
+    /// never fails on any of it.
+    #[test]
+    fn install_info_clamps_instead_of_refusing() {
+        let known = InstallInfo {
+            method: "script-ps1".into(),
+            scope: "system".into(),
+            run: Some("0123456789abcdef0123456789abcdef".into()),
+        };
+        assert_eq!(known.clamped(), known);
+
+        let future = InstallInfo {
+            method: "snap".into(),
+            scope: "fleet-wide".into(),
+            run: Some(
+                "not a token: has spaces and is far too long to be a run id, even if it tried"
+                    .into(),
+            ),
+        };
+        assert_eq!(
+            future.clamped(),
+            InstallInfo {
+                method: "other".into(),
+                scope: "unknown".into(),
+                run: None,
+            }
+        );
+        // Whitespace is not a spelling either way, and an empty `run` is none.
+        let padded = InstallInfo {
+            method: " wizard ".into(),
+            scope: "".into(),
+            run: Some("   ".into()),
+        };
+        assert_eq!(
+            padded.clamped(),
+            InstallInfo {
+                method: "wizard".into(),
+                scope: "unknown".into(),
+                run: None,
+            }
+        );
+        assert_eq!(
+            InstallInfo::unknown(),
+            InstallInfo {
+                method: "unknown".into(),
+                scope: "unknown".into(),
+                run: None,
+            }
+        );
+        // On the wire, `scope` may be absent and `run` is omitted when unset.
+        let wire: InstallInfo = serde_json::from_str(r#"{"method":"deb"}"#).unwrap();
+        assert_eq!(wire.scope, "");
+        assert_eq!(wire.clamped().scope, "unknown");
+        assert_eq!(
+            serde_json::to_string(&InstallInfo::new(
+                InstallMethod::Manual,
+                InstallScope::Unknown
+            ))
+            .unwrap(),
+            r#"{"method":"manual","scope":"unknown"}"#
+        );
     }
 
     /// FR-19 — the `relay-server` verb: spelling locked (a rename silently

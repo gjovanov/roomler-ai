@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use bson::{DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecPolicy, OsKind,
-    PeerRelayPolicy, RpcCap, SshPolicy,
+    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecPolicy,
+    InstallInfo, OsKind, PeerRelayPolicy, RpcCap, SshPolicy,
 };
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
@@ -42,6 +42,9 @@ impl AgentDao {
         }
     }
 
+    /// `install` is the enroll request's claim, already clamped by the route
+    /// (FR-102 P3); `None` = the request did not say, stored as `unknown` so
+    /// a row this code created can be told from one that predates it.
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,
@@ -52,6 +55,7 @@ impl AgentDao {
         os: OsKind,
         agent_version: String,
         agent_token_hash: String,
+        install: Option<InstallInfo>,
     ) -> DaoResult<Agent> {
         let agent = Self::new_row(
             tenant_id,
@@ -61,6 +65,7 @@ impl AgentDao {
             os,
             agent_version,
             agent_token_hash,
+            install,
         );
         let id = self.base.insert_one(&agent).await?;
         self.base.find_by_id(id).await
@@ -83,6 +88,7 @@ impl AgentDao {
         agent_version: String,
         key_id: ObjectId,
         ttl_secs: Option<u64>,
+        install: Option<InstallInfo>,
     ) -> DaoResult<Agent> {
         let mut agent = Self::new_row(
             tenant_id,
@@ -92,6 +98,7 @@ impl AgentDao {
             os,
             agent_version,
             String::new(),
+            install,
         );
         agent.ephemeral = true;
         agent.ephemeral_ttl_secs = ttl_secs;
@@ -102,6 +109,7 @@ impl AgentDao {
 
     /// The one place a fresh device row is shaped — both `create` paths call
     /// it, so a new `Agent` field is decided here exactly once.
+    #[allow(clippy::too_many_arguments)]
     fn new_row(
         tenant_id: ObjectId,
         owner_user_id: ObjectId,
@@ -110,6 +118,7 @@ impl AgentDao {
         os: OsKind,
         agent_version: String,
         agent_token_hash: String,
+        install: Option<InstallInfo>,
     ) -> Agent {
         let now = DateTime::now();
         Agent {
@@ -160,6 +169,10 @@ impl AgentDao {
             // FR-104 — stamped by the enroll route once the row exists
             // (`record_enrollment`).
             enrolled_with_jti: None,
+            // FR-102 P3 — the request's claim, or `unknown` when it made none.
+            // Always `Some` on a row this code creates: `None` is reserved
+            // for rows that predate the install trace.
+            install: Some(install.unwrap_or_else(InstallInfo::unknown)),
             ssh_policy: SshPolicy::default(),
             peer_relay_policy: Default::default(),
             // Nothing requested until an operator asks for something
@@ -208,26 +221,34 @@ impl AgentDao {
     /// reported names keep flowing for never-renamed devices, but a re-enroll
     /// must not silently revert an admin rename (it used to — the rename
     /// route existed while every re-enroll clobbered its effect).
+    ///
+    /// `install` (FR-102 P3) is refreshed only when the re-enrolling request
+    /// SAID how it was installed: a re-enroll by an agent from before P3, or
+    /// a `roomlerd re-enroll` (which sends nothing), must not downgrade a
+    /// known method to `unknown`.
     pub async fn rehydrate(
         &self,
         agent_id: ObjectId,
         name: &str,
         os: OsKind,
         agent_version: &str,
+        install: Option<&InstallInfo>,
     ) -> DaoResult<Agent> {
         let os_bson = bson::to_bson(&os).unwrap_or(bson::Bson::Null);
+        let mut set = doc! {
+            "os": os_bson,
+            "agent_version": agent_version,
+            "updated_at": DateTime::now(),
+            "deleted_at": bson::Bson::Null,
+        };
+        if let Some(install) = install {
+            set.insert(
+                "install",
+                bson::to_bson(install).unwrap_or(bson::Bson::Null),
+            );
+        }
         self.base
-            .update_by_id(
-                agent_id,
-                doc! {
-                    "$set": {
-                        "os": os_bson,
-                        "agent_version": agent_version,
-                        "updated_at": DateTime::now(),
-                        "deleted_at": bson::Bson::Null,
-                    }
-                },
-            )
+            .update_by_id(agent_id, doc! { "$set": set })
             .await?;
         // Second, FILTERED update for the name half — update_by_id can't
         // carry the extra predicate. Matching zero docs (admin-renamed row)

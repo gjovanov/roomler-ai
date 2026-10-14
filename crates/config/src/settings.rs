@@ -490,6 +490,14 @@ pub struct GrowthSettings {
     /// measured", never 0. Never logged. Env: `ROOMLER__GROWTH__PURESTAT_API_KEY`.
     #[serde(default)]
     pub purestat_api_key: String,
+    /// P3 — count installer, latest-release and install-script fetches by
+    /// client class into `growth_daily` (`docs/growth-observability.md`, the
+    /// install trace). Default **on**: the counters are this server's own
+    /// (a self-hosted server keeps them and sends them nowhere), carry no
+    /// User-Agent and no IP, and never count the updater. `false` is the
+    /// kill switch. Env: `ROOMLER__GROWTH__INSTALL_COUNTERS`.
+    #[serde(default = "growth_default_on")]
+    pub install_counters: bool,
 }
 
 fn growth_default_on() -> bool {
@@ -513,6 +521,7 @@ impl Default for GrowthSettings {
             digest_to: String::new(),
             purestat_url: growth_default_purestat_url(),
             purestat_api_key: String::new(),
+            install_counters: true,
         }
     }
 }
@@ -1371,6 +1380,11 @@ mod growth_settings_tests {
         let absent: GrowthSettings = toml::from_str("").expect("every key defaults");
         assert!(!absent.digest_enabled);
         assert!(absent.enabled);
+        // P3 — the fetch counters are on unless switched off; the switch
+        // reads from a file as it does from the env.
+        assert!(d.install_counters && absent.install_counters);
+        let off: GrowthSettings = toml::from_str("install_counters = false").unwrap();
+        assert!(!off.install_counters);
         let set: GrowthSettings = toml::from_str(
             "digest_enabled = true\ndigest_hour_utc = 7\ndigest_to = \" a@x.test, ,b@x.test \"\npurestat_api_key = \"k\"",
         )

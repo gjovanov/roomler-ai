@@ -53,6 +53,7 @@ async fn enrol(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -> AgentC
         enrollment_token: et["enrollment_token"].as_str().unwrap(),
         machine_id,
         machine_name: "Relay test host",
+        install: None,
     })
     .await
     .expect("agent enrollment")

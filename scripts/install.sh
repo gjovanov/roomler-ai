@@ -462,7 +462,10 @@ install_macos_privileged_half() {
         # leave the operator hunting for a config key afterwards.
         # (`overlay_enabled` stays default-off everywhere else — unchanged.)
         say "enrolling the privileged half as '$NAME-daemon' (second single-use token, overlay on)"
-        sudo "$daemon_bin" --config "$MACOS_DAEMON_CONFIG" \
+        # The install trace rides the environment (see `install_trace`): a
+        # root LaunchDaemon is the `system` scope.
+        # shellcheck disable=SC2046
+        sudo $(install_trace system) "$daemon_bin" --config "$MACOS_DAEMON_CONFIG" \
             enroll --server "$SERVER" --token "$DAEMON_TOKEN" --name "$NAME-daemon" --overlay
     fi
 
@@ -488,30 +491,49 @@ macos_permissions_notice() {
     say "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
 }
 
+# FR-102 — the install trace: tell the server HOW this install happened, so
+# the device row carries `install: {method: script-sh, scope: …}`. Through the
+# ENVIRONMENT, never the `--install-method` flag: this script installs whatever
+# release is current, and a daemon from before that flag existed refuses an
+# argument it does not know — the enrollment would fail on every host until
+# the next agent release. An older daemon simply ignores the variables. `env`
+# carries the pair across `sudo`, which may strip `VAR=value` words from the
+# command line depending on the sudoers policy.
+install_trace() {
+    echo "env ROOMLER_INSTALL_METHOD=script-sh ROOMLER_INSTALL_SCOPE=$1"
+}
+
 enroll_daemon() {
     daemon_bin="$1"
     # --system enrolls as root into the machine-global path the system unit
     # runs with; the per-user flow keeps the caller's own profile.
     if [ "$SYSTEM" = 1 ]; then
-        enroll_pre="sudo $daemon_bin --config $SYSTEM_CONFIG"
+        enroll_sudo="sudo"
+        enroll_bin="$daemon_bin --config $SYSTEM_CONFIG"
+        enroll_trace="$(install_trace system)"
     elif [ "$OS" = Darwin ] && [ "$(id -u)" = 0 ]; then
         # See `as_console_user`: the LaunchAgent runs as the console user and
         # reads that user's config, so the enroll has to write it AS them.
         # Running it as root here is what silently broke the whole install.
-        enroll_pre="sudo -H -u $CONSOLE_USER $daemon_bin"
+        enroll_sudo="sudo -H -u $CONSOLE_USER"
+        enroll_bin="$daemon_bin"
+        enroll_trace="$(install_trace per-user)"
     else
-        enroll_pre="$daemon_bin"
+        enroll_sudo=""
+        enroll_bin="$daemon_bin"
+        enroll_trace="$(install_trace per-user)"
     fi
     if [ "$NO_ENROLL" = 1 ] || [ -z "$TOKEN" ]; then
         [ "$NO_ENROLL" = 1 ] || warn "no --token given — skipping enrollment"
-        say "enroll later with: $enroll_pre enroll --server $SERVER --token <agent-enrollment-jwt> --name \"$NAME\""
+        say "enroll later with: $enroll_sudo $enroll_bin enroll --server $SERVER --token <agent-enrollment-jwt> --name \"$NAME\""
         return 0
     fi
     say "enrolling this machine as '$NAME' against $SERVER (token is single-use, never echoed)"
-    # Unquoted on purpose: $enroll_pre is a word list we built ourselves
-    # (sudo + binary + --config + path), none of which contain whitespace.
+    # Unquoted on purpose: these are word lists we built ourselves (sudo,
+    # env + two VAR=value words, binary + --config + path), none of which
+    # contain whitespace.
     # shellcheck disable=SC2086
-    $enroll_pre enroll --server "$SERVER" --token "$TOKEN" --name "$NAME"
+    $enroll_sudo $enroll_trace $enroll_bin enroll --server "$SERVER" --token "$TOKEN" --name "$NAME"
 }
 
 # ─── tunnel role ────────────────────────────────────────────────────────────

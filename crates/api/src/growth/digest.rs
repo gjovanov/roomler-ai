@@ -48,6 +48,7 @@ use roomler_ai_services::{
     EmailService,
     dao::{
         base::DaoError,
+        growth::GrowthDao,
         growth_digest::{
             ClaimMode, ClaimOutcome, DigestDoc, DigestStatus, DigestStore, ExcludedCounts,
         },
@@ -417,7 +418,52 @@ pub struct OrgsDevices {
     pub devices_by_os: Measured<Vec<KeyCount>>,
     /// Orgs whose FIRST device was enrolled in the window.
     pub orgs_first_device: Measured<Figure>,
-    pub by_install_method: NotMeasured,
+    /// The day's devices by `install.method` (P3); a row from before the
+    /// install trace, or an agent that did not say, is `unknown`.
+    pub by_install_method: Measured<Vec<KeyCount>>,
+}
+
+/// P3 — fetches of one asset by one client class on one OS, as the fleet
+/// module counted them into `growth_daily` (`install_trace`). Approximate by
+/// construction: a class is read off a User-Agent, and a self-hoster who
+/// downloads our build to enroll elsewhere fetches like anyone else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchRow {
+    pub asset: String,
+    pub client: String,
+    pub os: String,
+    pub fetches: Figure,
+}
+
+/// P3 — standard enrollment tokens minted in the window, and how many of
+/// those were redeemed (by `enroll_token_issued`). Exclusions apply by the
+/// token's tenant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tokens {
+    pub issued: Figure,
+    /// Of the tokens issued in the window, the ones an enroll redeemed.
+    pub redeemed: Figure,
+}
+
+/// P3 — devices enrolled in the window by install method and OS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MethodRow {
+    pub method: String,
+    pub os: String,
+    pub enrolled: Figure,
+}
+
+/// P3 — the install trace (spec §3e item 6): fetches by client class,
+/// tokens issued → redeemed, enrollments by method and OS. The fetch rows
+/// carry no tenant, so the exclusion set cannot apply to them; the other
+/// two exclude by tenant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Install {
+    pub fetches: Measured<Vec<FetchRow>>,
+    pub tokens: Measured<Tokens>,
+    pub enrollments_by_method: Measured<Vec<MethodRow>>,
+    /// The wizard's step diagnostics are opt-in and not built yet (P3b).
+    pub wizard_steps: NotMeasured,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -618,7 +664,7 @@ pub struct Sections {
     pub newsletter: Measured<Newsletter>,
     pub revenue: Revenue,
     pub quality: Quality,
-    pub install: NotMeasured,
+    pub install: Install,
     pub social: NotMeasured,
     pub search: NotMeasured,
 }
@@ -834,6 +880,20 @@ struct DeviceFacts {
     enrolled: Figure,
     by_os: Vec<KeyCount>,
     first_device: Figure,
+    /// P3 — the day's devices by install method.
+    by_method: Vec<KeyCount>,
+    /// P3 — every window, by (method, OS).
+    by_method_os: Vec<MethodRow>,
+}
+
+/// P3 — the method a device row says it was installed by: `unknown` for a
+/// row from before the install trace and for an agent that did not say.
+fn install_method_of(d: &Document) -> String {
+    d.get_document("install")
+        .ok()
+        .and_then(|i| str_of(i, "method"))
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 async fn read_devices(
@@ -848,17 +908,39 @@ async fn read_devices(
         state,
         "agents",
         doc! { "created_at": w.between(Span::D28), "tenant_id": { "$nin": &nin } },
-        doc! { "created_at": 1, "os": 1 },
+        doc! { "created_at": 1, "os": 1, "install.method": 1 },
     )
     .await?;
     let mut by_os: BTreeMap<String, i64> = BTreeMap::new();
+    let mut by_method: BTreeMap<String, i64> = BTreeMap::new();
+    let mut by_method_os: BTreeMap<(String, String), Vec<i64>> = BTreeMap::new();
     for d in &docs {
-        if dt_ms(d, "created_at").is_some_and(|t| w.contains(Span::Day, t)) {
-            *by_os
-                .entry(str_of(d, "os").unwrap_or_else(|| "unknown".into()))
-                .or_insert(0) += 1;
+        let Some(t) = dt_ms(d, "created_at") else {
+            continue;
+        };
+        let os = str_of(d, "os").unwrap_or_else(|| "unknown".into());
+        let method = install_method_of(d);
+        if w.contains(Span::Day, t) {
+            *by_os.entry(os.clone()).or_insert(0) += 1;
+            *by_method.entry(method.clone()).or_insert(0) += 1;
         }
+        by_method_os.entry((method, os)).or_default().push(t);
     }
+    let mut by_method_os: Vec<MethodRow> = by_method_os
+        .into_iter()
+        .map(|((method, os), times)| MethodRow {
+            method,
+            os,
+            enrolled: w.count(times),
+        })
+        .collect();
+    by_method_os.sort_by(|a, b| {
+        b.enrolled
+            .d28
+            .cmp(&a.enrolled.d28)
+            .then_with(|| a.method.cmp(&b.method))
+            .then_with(|| a.os.cmp(&b.os))
+    });
     let firsts = aggregate(
         state,
         "agents",
@@ -873,7 +955,87 @@ async fn read_devices(
         enrolled: w.count(docs.iter().filter_map(|d| dt_ms(d, "created_at"))),
         by_os: key_counts(by_os),
         first_device: w.count(firsts.iter().filter_map(|d| dt_ms(d, "first"))),
+        by_method: key_counts(by_method),
+        by_method_os,
     })
+}
+
+/// P3 — standard enrollment tokens issued in the 28-day window (by
+/// `enroll_token_issued`), and which of them were redeemed. A token's
+/// tenant is what the exclusion set filters on.
+async fn read_tokens(
+    state: &AppState,
+    w: &Windows,
+    set: &ExclusionSet,
+) -> Result<Tokens, DigestError> {
+    let docs = find_docs(
+        state,
+        roomler_ai_services::dao::enroll_token_issued::ENROLL_TOKEN_ISSUED,
+        doc! {
+            "issued_at": w.between(Span::D28),
+            "tenant_id": { "$nin": excluded_ids(&set.tenants) },
+        },
+        doc! { "issued_at": 1, "redeemed_at": 1 },
+    )
+    .await?;
+    let issued: Vec<i64> = docs.iter().filter_map(|d| dt_ms(d, "issued_at")).collect();
+    let redeemed: Vec<i64> = docs
+        .iter()
+        .filter(|d| d.get_datetime("redeemed_at").is_ok())
+        .filter_map(|d| dt_ms(d, "issued_at"))
+        .collect();
+    Ok(Tokens {
+        issued: w.count(issued),
+        redeemed: w.count(redeemed),
+    })
+}
+
+/// P3 — the fetch counters of the 28-day window, as `growth_daily` holds
+/// them (`install:fetch:{asset, client, os}` per day), summed into the three
+/// windows. A row's day is a `YYYY-MM-DD` string, so the windows are string
+/// comparisons against the dates the windows start on.
+async fn read_fetches(state: &AppState, w: &Windows) -> Result<Vec<FetchRow>, DigestError> {
+    let (day, d7, d28) = w.dates();
+    let rows = GrowthDao::new(&state.db)
+        .read_daily(
+            roomler_ai_services::dao::growth::INSTALL_SOURCE,
+            roomler_ai_services::dao::growth::INSTALL_FETCH_METRIC,
+            &d28,
+            &day,
+        )
+        .await?;
+    let mut by: BTreeMap<(String, String, String), Figure> = BTreeMap::new();
+    for r in rows {
+        let dim = |k: &str| r.dims.get(k).cloned().unwrap_or_else(|| "unknown".into());
+        let f = by
+            .entry((dim("asset"), dim("client"), dim("os")))
+            .or_default();
+        if r.day == day {
+            f.day += r.value;
+        }
+        if r.day >= d7 {
+            f.d7 += r.value;
+        }
+        f.d28 += r.value;
+    }
+    let mut out: Vec<FetchRow> = by
+        .into_iter()
+        .map(|((asset, client, os), fetches)| FetchRow {
+            asset,
+            client,
+            os,
+            fetches,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.fetches
+            .d28
+            .cmp(&a.fetches.d28)
+            .then_with(|| a.asset.cmp(&b.asset))
+            .then_with(|| a.client.cmp(&b.client))
+            .then_with(|| a.os.cmp(&b.os))
+    });
+    Ok(out)
 }
 
 /// Per-span tenant sets with a value event.
@@ -1510,6 +1672,23 @@ pub async fn compute(
     } else {
         None
     };
+    // P3 — the install trace is fleet's: the counters, the token ledger and
+    // the enroll's claim all come from that module, so without it every
+    // part reads "not mounted" rather than 0.
+    let install = match &devices {
+        Some(d) => Install {
+            fetches: Measured::Value(read_fetches(state, &w).await?),
+            tokens: Measured::Value(read_tokens(state, &w, set).await?),
+            enrollments_by_method: Measured::Value(d.by_method_os.clone()),
+            wizard_steps: NotMeasured::later("wizard steps reached (opt-in runs)", "P3b"),
+        },
+        None => Install {
+            fetches: Measured::unmounted("fleet"),
+            tokens: Measured::unmounted("fleet"),
+            enrollments_by_method: Measured::unmounted("fleet"),
+            wizard_steps: NotMeasured::later("wizard steps reached (opt-in runs)", "P3b"),
+        },
+    };
     let remote = if mounted(state, "remote") {
         Some(read_remote_usage(state, &w, set, now_ms).await?)
     } else {
@@ -1627,7 +1806,10 @@ pub async fn compute(
                 .as_ref()
                 .map(|d| Measured::Value(d.first_device))
                 .unwrap_or_else(|| Measured::unmounted("fleet")),
-            by_install_method: NotMeasured::later("devices by install method", "P3"),
+            by_install_method: devices
+                .as_ref()
+                .map(|d| Measured::Value(d.by_method.clone()))
+                .unwrap_or_else(|| Measured::unmounted("fleet")),
         },
         usage: Usage {
             remote: remote
@@ -1647,7 +1829,7 @@ pub async fn compute(
         newsletter,
         revenue,
         quality,
-        install: NotMeasured::later("fetches by client class, tokens issued → redeemed", "P3"),
+        install,
         social: NotMeasured::later("each platform's own numbers per post", "P8"),
         search: NotMeasured::later("clicks, impressions, top queries and pages", "P7"),
     })

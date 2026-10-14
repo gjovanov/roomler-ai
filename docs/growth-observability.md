@@ -2,9 +2,10 @@
 
 How the project learns what a post, an article or an issue produced — visits, sign-ups,
 orgs, devices, usage, revenue — **joined by the campaign key and never by a person**. This
-page covers what FR-102 has shipped so far: the taxonomy (P1b), the exclusion set (P1c) and
-the daily digest (P1d). Spec: [`docs/fr/FR-102-growth-observability.md`](fr/FR-102-growth-observability.md)
-(#2127). It also places the existing `/observability` page, which no doc described before.
+page covers what FR-102 has shipped so far: the taxonomy (P1b), the exclusion set (P1c), the
+daily digest (P1d) and the install trace (P3). Spec:
+[`docs/fr/FR-102-growth-observability.md`](fr/FR-102-growth-observability.md) (#2127). It also
+places the existing `/observability` page, which no doc described before.
 
 ## Two planes, one key
 
@@ -107,7 +108,7 @@ this server, not reachable, or not built yet is `{"not_measured": "<reason>",
 |---|---|---|---|
 | `headline` | sign-ups, orgs created, devices enrolled, active orgs (a value event: a remote session that reached Active and lasted ≥ 30 s, or a call with ≥ 2 participants), coverage (`{purestat_signup_goals, server_signups}`; a ratio only at n ≥ 30) | all of the below | P1d; coverage with a purestat key |
 | `signups` | provider, campaign key, landing path, referrer host, self-reported — **never the address, username or name**; at most 20 rows, else aggregated by source | `users` | P1d |
-| `orgs_devices` | orgs created; devices enrolled by OS (tombstones count); orgs that enrolled their **first** device | `tenants`, `agents` | P1d; by install method P3 |
+| `orgs_devices` | orgs created; devices enrolled by OS (tombstones count); orgs that enrolled their **first** device; the day's devices by install method | `tenants`, `agents` | P1d; by install method P3 |
 | `usage` | remote-desktop sessions started and session-minutes (each session's overlap with the window — a session spanning midnight counts only its part), calls and participant-minutes, active orgs, the top 10 orgs by remote-desktop minutes | `remote_sessions`, `call_sessions` | P1d |
 | `website` | visitors, visits, pageviews; the day's visitors by organic channel; top 10 referrers and paths | purestat | with a key |
 | `blog` | per post viewed that day: visitors, pageviews, reads, median read time (top 20); top sources | purestat | with a key |
@@ -115,7 +116,8 @@ this server, not reachable, or not built yet is `{"not_measured": "<reason>",
 | `newsletter` | new, confirmed and unsubscribed subscribers, by source; each issue sent that day with its counts | `subscribers`, `newsletter_issues` | P1d; delivery P5 |
 | `revenue` | orgs by plan × subscription status; the list-price MRR, **labelled `estimate: true`** (the same formula as the cost view, `routes/cost.rs::mrr_estimate_cents`) | `tenants`, `tenant_members` | P1d; billed P4 |
 | `quality` | sessions ended by `end_reason`, classed hang-up · refusal · failure; agent crashes by version | `remote_sessions`, `agent_crashes` | P1d |
-| `install` · `social` · `search` | — | — | P3 · P8 · P7 |
+| `install` | tokens issued → redeemed; fetches by `(asset, client class, OS)`; enrollments by `(method, OS)`; wizard steps not measured until P3b — [the install trace](#the-install-trace-p3) | `enroll_token_issued`, `growth_daily`, `agents.install` | P3 |
+| `social` · `search` | — | — | P8 · P7 |
 
 A module that is not mounted (`[modules] remote = false`, a reduced profile) makes its part
 `not_measured: "<module> module not mounted"`; the rest of the digest still completes. The
@@ -186,6 +188,7 @@ sequenceDiagram
 | `growth.digest_to` | `ROOMLER__GROWTH__DIGEST_TO` | empty | comma-separated recipients; empty ⇒ the platform admins |
 | `growth.purestat_url` | `ROOMLER__GROWTH__PURESTAT_URL` | `https://purestat.ai` | the v1 query endpoint's base |
 | `growth.purestat_api_key` | `ROOMLER__GROWTH__PURESTAT_API_KEY` | empty | a site-scoped key (`X-API-Key`); empty ⇒ website, blog, campaigns and coverage read "not measured" |
+| `growth.install_counters` | `ROOMLER__GROWTH__INSTALL_COUNTERS` | `true` | the install trace's fetch counters (P3); `false` writes none. The token ledger and the enroll's `install` have no switch — they are ids on rows that exist anyway |
 
 The hosted deployment turns the digest on with `ROOMLER__GROWTH__DIGEST_ENABLED=true` (and a
 key once one is minted for `roomler.ai`); a mail backend must be configured
@@ -205,6 +208,117 @@ All platform-admin only (`ROOMLER__STATS__PLATFORM_ADMINS`), **404** otherwise �
 gate as `/admin/stats`. The SPA's `/observability/growth` (the Digest view) picks a day,
 lists recent digests, recomputes without sending, and shows every section as cards; a
 `not_measured` cell is a muted chip, never a 0, and every string is rendered as text.
+
+## The install trace (P3)
+
+How a device gets from a minted token to a first session — each step recorded where it
+already had to happen, joined by ids and counts, never by a person. The fleet module owns
+every write (`crates/modules/fleet/src/install_trace.rs`, `agent.rs`); the digest reads.
+
+```mermaid
+sequenceDiagram
+    participant A as Admin (SPA)
+    participant S as roomler server
+    participant H as Host being installed
+    A->>S: POST …/agent/enroll-token
+    S->>S: enroll_token_issued {_id: jti, tenant_id, issued_by, issued_at}
+    H->>S: GET install.sh · install.ps1 · installer/{flavour} · latest-release · setup/{platform}
+    Note over H,S: UA: curl · PowerShell · roomler-setup · a browser — never roomlerd/
+    S->>S: growth_daily install:fetch {asset, client, os} += 1 — no UA, no IP
+    H->>S: POST /api/agent/enroll {…, install: {method, scope}}
+    S->>S: agents.install · enroll_token_issued.redeemed_at + agent_id
+    H->>S: WS hello → presence online (first online)
+    A->>S: first remote-desktop session → remote_sessions
+```
+
+| Step | Record | Written by | Kept |
+|---|---|---|---|
+| token minted | `enroll_token_issued {_id: jti, tenant_id, issued_by, issued_at, kind: standard, redeemed_at: null, agent_id: null}` — the jti, **never the token** | `POST …/agent/enroll-token` (`agent.rs::issue_enrollment_token`), best-effort | 90 d |
+| fetch | `growth_daily {source: install, metric: fetch, dims: {asset, client, os}, day, value}` | the installer proxy, `/api/agent/latest-release`, `/api/setup/latest-release`, `/api/setup/install.sh`, `/api/setup/install.ps1`, `/api/setup/{platform}` (`install_trace::count_fetch`, spawned, best-effort) | indefinitely |
+| enroll | `agents.install {method, scope, run?}`; `enroll_token_issued.redeemed_at`, `.agent_id` (an upsert from the token's claims, so a token minted before the ledger is on record too) | `POST /api/agent/enroll` | with the row; 90 d |
+| first online · first session | already there: `stats_events` (presence), `remote_sessions` | — | — |
+
+### Fetches by client class
+
+The class comes from the **User-Agent and nothing else about the request**
+(`install_trace::classify_user_agent`, a pure function with the real UAs as its tests):
+
+| Class | User-Agent | Who |
+|---|---|---|
+| `wizard` | `roomler-setup/<ver>` | the wizard resolving and downloading its MSI |
+| `script-sh` | `curl/…`, `Wget/…` | `install.sh`, or a person at a terminal |
+| `script-ps1` | anything carrying `PowerShell` — Windows PowerShell 5.1 and pwsh 7 both send `Mozilla/5.0 (…) …PowerShell/…`, so this is decided **before** the browser rule | `install.ps1`, `irm … | iex`, or a person at a prompt |
+| `browser` | any other `Mozilla/…` | a person on the site (the wizard download button) |
+| `other` | everything else, a missing header included | — |
+
+The `os` dimension is what the asset itself implies (an MSI, `install.ps1` and the Windows wizard
+archive are `windows`; the macOS and Linux archives name theirs), else the UA's hint; a `curl`
+fetch of `install.sh` is honestly `unknown`.
+
+> ⚠️ **The updater is never counted.** `roomlerd/<ver>` is the daemon's own update check, and by
+> default it asks `roomler.ai` from self-hosted devices as well
+> (`agents/roomlerd/src/updater.rs`, `DEFAULT_PROXY_URL`). Counting it would be exactly the
+> self-host telemetry the product promises not to collect (`LICENSING.md`,
+> [business-model.md](business-model.md) §6). The rule covers every identity the daemon and the
+> CLI present — `roomlerd/`, `roomlerd-*/`, the pre-rename `roomler-agent/`, `roomler-cli/`,
+> `roomler-token-renewal/` — as `UaClass::Updater`, whose counted value is `None`: a fetch with
+> it writes nothing. Locked by a test per spelling.
+
+- **Never a User-Agent, never an IP.** A row is three enum-like dimensions and a count; the
+  integration test scans every row for the UAs it sent and the loopback address.
+- The write is **spawned and best-effort**: an install script is served at wire speed whatever
+  the database is doing. `ROOMLER__GROWTH__INSTALL_COUNTERS=false` switches the counters off.
+- A fetch is a **lower bound on intent, not an install**: a self-hoster who downloads our build
+  to enroll elsewhere fetches like anyone else, and only requests that reach this server count.
+
+### The enroll says how
+
+`POST /api/agent/enroll` gained `install: {method, scope, run?}` — additive, `#[serde(default)]`,
+clamped server-side (`InstallInfo::clamped`: an unknown `method` is `other`, an unknown `scope`
+`unknown`, a `run` that is not a short opaque token dropped) and **never a refusal**. The
+vocabulary lives in `crates/remote_control/src/models.rs` (`InstallMethod`, `InstallScope`),
+shared by both ends and locked by a test:
+
+| Who enrolls | `method` | `scope` |
+|---|---|---|
+| the wizard, in-process | `wizard` | its role: `daemon-system` → `system`, `daemon-user` → `per-user`, `daemon-machine` → `attended` (a service without SystemContext, usable only beside a signed-in session) |
+| `install.sh` | `script-sh` | `system` with `--system` and for the macOS root half; `per-user` otherwise |
+| `install.ps1` | `script-ps1` | as the wizard's roles |
+| `roomlerd enroll` by hand | `manual`, or `--install-method` / `ROOMLER_INSTALL_METHOD` | `unknown`, or `--install-scope` / `ROOMLER_INSTALL_SCOPE` |
+| the companion's enroll form | `manual` | `unknown` |
+| the k8s e2e agent image | `container` (its StatefulSet sets the env) | `system` |
+| `roomlerd re-enroll`, a pushed org join, the companion's token refresh | nothing is sent; the row **keeps** what it has | |
+| an agent from before P3 | recorded as `unknown` on a new row; a known row keeps its record | `unknown` |
+
+Compatibility, both directions, is what the shape is built around:
+
+- **A new agent against an old server**: the agent omits `install` when it has nothing to say,
+  and the server's `EnrollRequest` carries no `deny_unknown_fields` (a comment there says it
+  never may), so a pre-P3 server ignores the field. The agent-side test asserts the body without
+  `install` is byte-for-byte the pre-P3 five-field shape.
+- **An old agent against the new server**: no field ⇒ `install: {method: unknown}` on a new row,
+  no change on a re-enrolled one. The device row's `install` is `None` only on rows created
+  before P3; the digest reads both as `unknown`.
+- ⚠️ **The served scripts set the environment, never the flag.** A script installs whatever
+  release is current, and a daemon from before `--install-method` existed refuses an argument it
+  does not know — which would have failed every scripted install until the next agent release.
+  `ROOMLER_INSTALL_METHOD` / `ROOMLER_INSTALL_SCOPE` are the flag's fallbacks
+  (`roomler_node_core::enrollment::resolve_install`: flag, then env, then `manual` / `unknown`;
+  a misspelling is refused before the single-use token is spent); an older daemon ignores them.
+  `install.sh` passes them through `env` so they survive `sudo`.
+
+The row is shown on the device (`GET …/agent/{id}` → `install`), which is what a field check
+reads (AC9).
+
+### In the digest
+
+`install` is a section of its own: `tokens {issued, redeemed}` (tokens issued in the window,
+and how many of those an enroll spent; a redeemed share only at n ≥ 30), `fetches
+[{asset, client, os, fetches}]`, `enrollments_by_method [{method, os, enrolled}]`, and
+`wizard_steps` not measured until P3b. `orgs_devices.by_install_method` lists the day's devices
+by method. Exclusions apply to tokens by the token's tenant and to enrollments by the device's
+tenant; the fetch rows carry no tenant and cannot be filtered. All of it is "not mounted"
+without the `fleet` module, never 0.
 
 ## The `/observability` page as a whole
 

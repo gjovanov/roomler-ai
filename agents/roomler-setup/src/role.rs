@@ -54,6 +54,28 @@ impl Role {
         }
     }
 
+    /// FR-102 P3 — what the daemon this role installs runs as, for the
+    /// enroll's install trace (`install.scope`):
+    ///
+    /// - `daemon-system` → `system`: the perMachine MSI with SystemContext,
+    ///   a LocalSystem service that works pre-logon and on the lock screen;
+    /// - `daemon-user` → `per-user`: the perUser MSI, a Scheduled Task under
+    ///   the installing user;
+    /// - `daemon-machine` → `attended`: the plain perMachine MSI — a service
+    ///   too, but one whose capture and input work only beside a signed-in
+    ///   session (that is what "Daemon — machine (attended)" means on the
+    ///   role card);
+    /// - `tunnel-client` → `None`: no daemon is enrolled.
+    pub fn install_scope(&self) -> Option<roomlerd::enrollment::InstallScope> {
+        use roomlerd::enrollment::InstallScope;
+        match self {
+            Role::DaemonSystem => Some(InstallScope::System),
+            Role::DaemonUser => Some(InstallScope::PerUser),
+            Role::DaemonMachine => Some(InstallScope::Attended),
+            Role::TunnelClient => None,
+        }
+    }
+
     /// Parse the kebab-case string persisted in `WizardState.role`
     /// back into a typed `Role`. Unknown / stale values return `None`
     /// so the SPA re-prompts the picker on resume instead of failing.
@@ -96,6 +118,39 @@ mod tests {
         assert_eq!(Role::DaemonUser.msi_flavour(), Some("peruser"));
         assert_eq!(Role::DaemonMachine.msi_flavour(), Some("permachine"));
         assert_eq!(Role::TunnelClient.msi_flavour(), None);
+    }
+
+    /// FR-102 P3 — the documented role → scope mapping, on the wire
+    /// spellings the server stores. `daemon-machine` is `attended`, never
+    /// `system`: it has no SystemContext and cannot be reached pre-logon.
+    #[test]
+    fn install_scope_mapping() {
+        use roomlerd::enrollment::InstallScope;
+        assert_eq!(
+            Role::DaemonSystem.install_scope(),
+            Some(InstallScope::System)
+        );
+        assert_eq!(
+            Role::DaemonUser.install_scope(),
+            Some(InstallScope::PerUser)
+        );
+        assert_eq!(
+            Role::DaemonMachine.install_scope(),
+            Some(InstallScope::Attended)
+        );
+        assert_eq!(Role::TunnelClient.install_scope(), None);
+        assert_eq!(
+            Role::DaemonSystem.install_scope().map(|s| s.wire()),
+            Some("system")
+        );
+        assert_eq!(
+            Role::DaemonUser.install_scope().map(|s| s.wire()),
+            Some("per-user")
+        );
+        assert_eq!(
+            Role::DaemonMachine.install_scope().map(|s| s.wire()),
+            Some("attended")
+        );
     }
 
     #[test]

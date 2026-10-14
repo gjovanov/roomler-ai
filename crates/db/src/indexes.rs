@@ -431,6 +431,15 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
         )],
     ));
 
+    // P3 — the frozen daily totals: one row per `(source, metric, dims, day)`
+    // with `_id` the four joined (the upsert's own key). The digest reads one
+    // `(source, metric)` over a day range, which is this index. No TTL
+    // (spec §3o: kept indefinitely — they carry no person).
+    sets.push(set(
+        "growth_daily",
+        vec![index(bson::doc! { "source": 1, "metric": 1, "day": 1 })],
+    ));
+
     // Hourly rollups (90 d) and daily rollups (730 d). The rollup task
     // whole-bucket-replaces via $merge on _id, so these are also upserts.
     for (coll, ttl_days) in [
