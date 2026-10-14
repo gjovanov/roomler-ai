@@ -1202,6 +1202,23 @@
         ]
       },
       {
+        "collection": "enroll_token_issued",
+        "indexes": [
+          {
+            "key": {
+              "issued_at": 1,
+              "tenant_id": 1
+            }
+          },
+          {
+            "key": {
+              "issued_at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
         "collection": "enrollment_key_uses",
         "indexes": [
           {
@@ -1311,6 +1328,18 @@
             "key": {
               "external_source.provider": 1,
               "external_source.external_id": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "growth_daily",
+        "indexes": [
+          {
+            "key": {
+              "source": 1,
+              "metric": 1,
+              "day": 1
             }
           }
         ]
@@ -2901,6 +2930,23 @@
         ]
       },
       {
+        "collection": "enroll_token_issued",
+        "indexes": [
+          {
+            "key": {
+              "issued_at": 1,
+              "tenant_id": 1
+            }
+          },
+          {
+            "key": {
+              "issued_at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
         "collection": "enrollment_key_uses",
         "indexes": [
           {
@@ -3010,6 +3056,18 @@
             "key": {
               "external_source.provider": 1,
               "external_source.external_id": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "growth_daily",
+        "indexes": [
+          {
+            "key": {
+              "source": 1,
+              "metric": 1,
+              "day": 1
             }
           }
         ]

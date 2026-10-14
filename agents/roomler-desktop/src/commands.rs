@@ -432,6 +432,12 @@ pub async fn cmd_enroll(
         enrollment_token: &trimmed_token,
         machine_id: &machine_id,
         machine_name: &trimmed_name,
+        // FR-102 P3 — a person pasted a token into the companion's form: the
+        // package got here some other way, and this enroll is by hand.
+        install: Some(enrollment::InstallInfo::new(
+            enrollment::InstallMethod::Manual,
+            enrollment::InstallScope::Unknown,
+        )),
     })
     .await
     .map_err(|e| format!("Enrollment failed: {e:#}"))?;
@@ -462,6 +468,9 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
         enrollment_token: &trimmed,
         machine_id: &existing.machine_id,
         machine_name: &existing.machine_name,
+        // A token refresh says nothing about how the binary got here; the
+        // server keeps the row's recorded install.
+        install: None,
     })
     .await
     .map_err(|e| format!("Re-enrollment failed: {e:#}"))?;

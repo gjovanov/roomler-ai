@@ -149,6 +149,7 @@ pub(crate) async fn enrol_via_agent_lib(
         enrollment_token: et["enrollment_token"].as_str().unwrap(),
         machine_id,
         machine_name,
+        install: None,
     })
     .await
     .expect("agent enrollment")
@@ -380,6 +381,7 @@ async fn agent_library_rejects_bogus_enrollment_token() {
         enrollment_token: "not-a-jwt",
         machine_id: "mach-bogus",
         machine_name: "bogus",
+        install: None,
     })
     .await
     .expect_err("bogus token must fail");

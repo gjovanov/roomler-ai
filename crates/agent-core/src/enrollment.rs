@@ -9,9 +9,20 @@
 
 use anyhow::{Context, Result, bail};
 use roomler_ai_remote_control::models::OsKind;
+pub use roomler_ai_remote_control::models::{InstallInfo, InstallMethod, InstallScope};
 use serde::{Deserialize, Serialize};
 
 use crate::config::AgentConfig;
+
+/// Env fallbacks for the install trace (FR-102 P3): what `roomlerd enroll`
+/// reads when `--install-method` / `--install-scope` are not passed. The
+/// served install scripts set these rather than passing the flags, so an
+/// agent from before P3 — which has no such flag and would refuse it —
+/// still enrolls from a post-P3 script; it simply ignores the variables.
+/// For the same reason a value in them that this build does not know is
+/// clamped, never refused ([`resolve_install`]).
+pub const INSTALL_METHOD_ENV: &str = "ROOMLER_INSTALL_METHOD";
+pub const INSTALL_SCOPE_ENV: &str = "ROOMLER_INSTALL_SCOPE";
 
 #[derive(Debug, Serialize)]
 struct EnrollRequest<'a> {
@@ -20,6 +31,13 @@ struct EnrollRequest<'a> {
     machine_name: &'a str,
     os: OsKind,
     agent_version: &'a str,
+    /// FR-102 P3 — additive, and OMITTED when unset: a server from before
+    /// P3 then sees exactly the body it always saw. (It would ignore an
+    /// unknown field anyway — the server's `EnrollRequest` carries no
+    /// `deny_unknown_fields` — but the shape on the wire should not change
+    /// for a caller that has nothing to say.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    install: Option<&'a InstallInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +56,131 @@ pub struct EnrollInputs<'a> {
     pub enrollment_token: &'a str,
     pub machine_id: &'a str,
     pub machine_name: &'a str,
+    /// FR-102 P3 — how this install happened, when the caller knows: the
+    /// wizard says `wizard`, the scripts say which script, a hand-typed
+    /// `roomlerd enroll` says `manual` ([`resolve_install`]). `None` sends
+    /// nothing, which the server records as `unknown` on a new row and
+    /// leaves alone on a re-enrolled one — the right answer for every
+    /// re-enroll path, which knows nothing about how the binary got there.
+    pub install: Option<InstallInfo>,
+}
+
+/// FR-102 P3 — what `roomlerd enroll` sends as its install trace, from the
+/// CLI flags first, the environment second, and `manual` when neither
+/// says: a person typed the command. The scope defaults to `unknown`.
+///
+/// A value outside the vocabulary is judged by where it came from:
+///
+/// - from a **flag** it is an ERROR — the operator's own command line, and a
+///   typo should be seen at the prompt, before the single-use token is
+///   spent, rather than stored as `other` forever;
+/// - from the **environment** it is CLAMPED (`other` / `unknown`) with a
+///   warning, never refused. The variables are set by the served scripts,
+///   which are compiled into the SERVER (`include_str!` in
+///   `setup_release.rs`) and roll with a promote, while the daemon they
+///   install comes from the agent release channel: a script can learn a
+///   spelling before the daemon it installs does, and refusing it would
+///   fail every scripted enrollment until the next agent release. The trace
+///   is a measurement; it never costs a device its enrollment — the server
+///   clamps the same way ([`InstallInfo::clamped`]).
+///
+/// Spellings: [`InstallMethod::ALL`] and [`InstallScope::ALL`].
+pub fn resolve_install(cli_method: Option<&str>, cli_scope: Option<&str>) -> Result<InstallInfo> {
+    let env = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+    resolve_install_from(
+        cli_method,
+        cli_scope,
+        env(INSTALL_METHOD_ENV).as_deref(),
+        env(INSTALL_SCOPE_ENV).as_deref(),
+    )
+}
+
+/// [`resolve_install`] with the environment passed in, so the precedence is
+/// testable without touching the process environment.
+pub fn resolve_install_from(
+    cli_method: Option<&str>,
+    cli_scope: Option<&str>,
+    env_method: Option<&str>,
+    env_scope: Option<&str>,
+) -> Result<InstallInfo> {
+    /// The raw value, where it came from, and whether that was the flag —
+    /// CLI first.
+    fn source<'a>(
+        flag: &'static str,
+        env_key: &'static str,
+        cli: Option<&'a str>,
+        env: Option<&'a str>,
+    ) -> Option<(&'a str, &'static str, bool)> {
+        cli.map(|v| (v.trim(), flag, true))
+            .or_else(|| env.map(|v| (v.trim(), env_key, false)))
+    }
+    /// A spelling outside the vocabulary: refused from a flag, clamped to
+    /// `fallback` (with a warning) from the environment.
+    fn unknown_spelling<T>(
+        what: &str,
+        raw: &str,
+        origin: &str,
+        from_flag: bool,
+        allowed: &[&str],
+        fallback: T,
+        fallback_wire: &str,
+    ) -> Result<T> {
+        if from_flag {
+            bail!(
+                "invalid install {what} {raw:?} from {origin}: expected one of {}",
+                allowed.join(", ")
+            );
+        }
+        tracing::warn!(
+            value = raw,
+            origin,
+            "install {what} not known to this build; enrolling with {fallback_wire:?}"
+        );
+        Ok(fallback)
+    }
+
+    let method = match source(
+        "--install-method",
+        INSTALL_METHOD_ENV,
+        cli_method,
+        env_method,
+    ) {
+        None => InstallMethod::Manual,
+        Some((raw, origin, from_flag)) => match InstallMethod::parse(raw) {
+            Some(m) => m,
+            None => {
+                let allowed: Vec<&str> = InstallMethod::ALL.iter().map(|m| m.wire()).collect();
+                unknown_spelling(
+                    "method",
+                    raw,
+                    origin,
+                    from_flag,
+                    &allowed,
+                    InstallMethod::Other,
+                    InstallMethod::Other.wire(),
+                )?
+            }
+        },
+    };
+    let scope = match source("--install-scope", INSTALL_SCOPE_ENV, cli_scope, env_scope) {
+        None => InstallScope::Unknown,
+        Some((raw, origin, from_flag)) => match InstallScope::parse(raw) {
+            Some(s) => s,
+            None => {
+                let allowed: Vec<&str> = InstallScope::ALL.iter().map(|s| s.wire()).collect();
+                unknown_spelling(
+                    "scope",
+                    raw,
+                    origin,
+                    from_flag,
+                    &allowed,
+                    InstallScope::Unknown,
+                    InstallScope::Unknown.wire(),
+                )?
+            }
+        },
+    };
+    Ok(InstallInfo::new(method, scope))
 }
 
 pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
@@ -53,7 +196,12 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
     let os = detect_os();
     let agent_version = env!("CARGO_PKG_VERSION");
 
-    tracing::info!(%url, os = ?os, "posting enrollment");
+    tracing::info!(
+        %url, os = ?os,
+        install_method = inputs.install.as_ref().map(|i| i.method.as_str()),
+        install_scope = inputs.install.as_ref().map(|i| i.scope.as_str()),
+        "posting enrollment"
+    );
 
     let resp = reqwest::Client::new()
         .post(&url)
@@ -63,6 +211,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
             machine_name: inputs.machine_name,
             os,
             agent_version,
+            install: inputs.install.as_ref(),
         })
         .send()
         .await
@@ -637,6 +786,106 @@ mod tests {
         // accidentally rewrite these.
         assert_eq!(normalize_server_url("roomler.ai"), "roomler.ai");
         assert_eq!(normalize_server_url("file:///tmp/foo"), "file:///tmp/foo");
+    }
+
+    // ---- FR-102 P3: the install trace on the wire ----------------------
+
+    fn request<'a>(install: Option<&'a InstallInfo>) -> EnrollRequest<'a> {
+        EnrollRequest {
+            enrollment_token: "t",
+            machine_id: "m",
+            machine_name: "n",
+            os: OsKind::Linux,
+            agent_version: "0.4.136",
+            install,
+        }
+    }
+
+    /// Without an install trace the body is byte-for-byte the pre-P3 shape
+    /// — the five fields, nothing else — so a server from before P3 sees
+    /// exactly what it always saw; with one, `install` rides along.
+    #[test]
+    fn the_request_omits_install_when_unset_and_carries_it_when_set() {
+        let old = serde_json::to_value(request(None)).unwrap();
+        assert_eq!(
+            old,
+            serde_json::json!({
+                "enrollment_token": "t",
+                "machine_id": "m",
+                "machine_name": "n",
+                "os": "linux",
+                "agent_version": "0.4.136",
+            })
+        );
+        assert!(old.get("install").is_none());
+
+        let info = InstallInfo::new(InstallMethod::ScriptSh, InstallScope::System);
+        let new = serde_json::to_value(request(Some(&info))).unwrap();
+        assert_eq!(
+            new["install"],
+            serde_json::json!({ "method": "script-sh", "scope": "system" })
+        );
+        assert!(
+            new["install"].get("run").is_none(),
+            "run is omitted until P3b sets it"
+        );
+        assert_eq!(new.as_object().unwrap().len(), 6);
+    }
+
+    /// CLI over env over the default: a hand-typed enroll is `manual` with
+    /// an `unknown` scope; the scripts speak through the env; a flag wins.
+    #[test]
+    fn install_resolution_prefers_cli_then_env_then_manual() {
+        let r = |c: Option<&str>, s: Option<&str>, em: Option<&str>, es: Option<&str>| {
+            resolve_install_from(c, s, em, es).map(|i| (i.method, i.scope))
+        };
+        assert_eq!(
+            r(None, None, None, None).unwrap(),
+            ("manual".to_string(), "unknown".to_string())
+        );
+        assert_eq!(
+            r(None, None, Some("script-sh"), Some("per-user")).unwrap(),
+            ("script-sh".to_string(), "per-user".to_string())
+        );
+        assert_eq!(
+            r(Some("msi"), None, Some("script-ps1"), Some("system")).unwrap(),
+            ("msi".to_string(), "system".to_string()),
+            "a flag beats the env for its own half only"
+        );
+        assert_eq!(
+            r(Some("container"), Some("system"), None, None).unwrap(),
+            ("container".to_string(), "system".to_string())
+        );
+        // A value outside the vocabulary from a FLAG is refused at the
+        // prompt, and the message names the flag and the spellings.
+        let e = r(Some("Snap"), None, None, None).unwrap_err().to_string();
+        assert!(
+            e.contains("--install-method") && e.contains("\"Snap\"") && e.contains("script-sh"),
+            "{e}"
+        );
+        let e = r(None, Some("user"), None, None).unwrap_err().to_string();
+        assert!(
+            e.contains("--install-scope") && e.contains("per-user"),
+            "{e}"
+        );
+        // From the ENVIRONMENT it is clamped, never refused: the served
+        // scripts set the variables and roll with the server, so a script
+        // can know a spelling the daemon it installs does not — that must
+        // still enroll.
+        assert_eq!(
+            r(None, None, Some("script-brew"), Some("fleet-wide")).unwrap(),
+            ("other".to_string(), "unknown".to_string())
+        );
+        assert_eq!(
+            r(None, None, Some("script"), Some("system")).unwrap(),
+            ("other".to_string(), "system".to_string()),
+            "each half is clamped on its own"
+        );
+        // A flag still wins over the env for its half — and a bad flag is
+        // refused even when the env beside it is fine.
+        assert!(r(Some("Snap"), None, Some("script-sh"), None).is_err());
+        // `unknown` is a server-side value, but a caller may spell it out.
+        assert_eq!(r(Some("unknown"), None, None, None).unwrap().0, "unknown");
     }
 
     /// rc.204 — a re-enroll over an existing config preserves every

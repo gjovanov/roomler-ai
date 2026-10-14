@@ -67,6 +67,12 @@ spec:
             # AutoGrant consent — no operator-prompt in CI.
             - name: ROOMLERD_AUTO_GRANT_SESSION
               value: "1"
+            # FR-102 — the install trace: these devices are a container
+            # image's entrypoint enrolling itself (an older image ignores it).
+            - name: ROOMLER_INSTALL_METHOD
+              value: container
+            - name: ROOMLER_INSTALL_SCOPE
+              value: system
           volumeMounts:
             - name: config
               mountPath: /etc/roomler

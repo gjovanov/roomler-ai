@@ -304,6 +304,7 @@ pub async fn enrol(app: &TestApp, seeded: &SeededTenant, machine: &str) -> Agent
         enrollment_token: et["enrollment_token"].as_str().unwrap(),
         machine_id: machine,
         machine_name: machine,
+        install: None,
     })
     .await
     .expect("agent enrollment")

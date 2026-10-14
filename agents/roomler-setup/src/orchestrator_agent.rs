@@ -485,11 +485,20 @@ async fn run_install_inner(
         );
     }
     let machine_id = roomlerd::machine::derive_machine_id(&config_path);
+    // FR-102 P3 — the wizard says so itself, in-process: `wizard`, with the
+    // scope its role installs (`Role::install_scope`). A daemon role always
+    // has one; the `None` arm is the tunnel role, which never reaches here.
+    let install = roomlerd::enrollment::InstallInfo::new(
+        roomlerd::enrollment::InstallMethod::Wizard,
+        role.install_scope()
+            .unwrap_or(roomlerd::enrollment::InstallScope::Unknown),
+    );
     let inputs = roomlerd::enrollment::EnrollInputs {
         server_url: &server,
         enrollment_token: &token,
         machine_id: &machine_id,
         machine_name: &device_name,
+        install: Some(install),
     };
     let mut cfg = roomlerd::enrollment::enroll(inputs)
         .await

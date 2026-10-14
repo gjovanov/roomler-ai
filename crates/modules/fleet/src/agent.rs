@@ -12,7 +12,7 @@ use axum::{
 };
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
-use roomler_ai_remote_control::models::{AccessPolicy, AgentStatus, OsKind};
+use roomler_ai_remote_control::models::{AccessPolicy, AgentStatus, InstallInfo, OsKind};
 use roomler_ai_services::dao::base::PaginationParams;
 use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
@@ -111,6 +111,17 @@ pub async fn issue_enrollment_token(
         state
             .auth
             .issue_enrollment_token_with(auth.user_id, tid, ENROLLMENT_TTL_SECS, anchor)?;
+    // FR-102 P3 — the issuance on record (the jti, never the token), so the
+    // digest can say how many tokens were minted and how many enrolled.
+    // Best-effort: a ledger that could not answer must not cost the admin
+    // the token they asked for; the enroll's upsert fills the row in later.
+    if let Err(e) = state
+        .enroll_tokens
+        .record_issued(&jti, tid, auth.user_id, DateTime::now())
+        .await
+    {
+        tracing::warn!(tenant = %tid, %jti, error = %e, "fr-102: could not record the issued enrollment token");
+    }
     if anchor {
         // The admin's choice, on the record: whoever holds this token can
         // anchor the device it enrolls, and so speak for its SYSTEM service.
@@ -128,6 +139,10 @@ pub async fn issue_enrollment_token(
     }))
 }
 
+/// The enroll body. ⚠️ No `deny_unknown_fields`, and none may ever be added:
+/// an agent newer than this server sends fields it has never heard of, and
+/// an older server must keep enrolling it (FR-102 P3 relies on exactly that
+/// in the other direction too — a pre-P3 server ignores `install`).
 #[derive(Debug, Deserialize)]
 pub struct EnrollRequest {
     pub enrollment_token: String,
@@ -135,6 +150,11 @@ pub struct EnrollRequest {
     pub machine_name: String,
     pub os: OsKind,
     pub agent_version: String,
+    /// FR-102 P3 — how the device was installed (`{method, scope, run}`).
+    /// Additive: absent on every agent from before P3, which records as
+    /// `unknown`. Clamped, never refused ([`InstallInfo::clamped`]).
+    #[serde(default)]
+    pub install: Option<InstallInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -247,13 +267,24 @@ pub async fn enroll_agent(
             ),
         })?;
 
+    // FR-102 P3 — the request's install claim, clamped to the vocabulary. A
+    // known row keeps what it has unless this request says (a re-enroll by
+    // an older agent must not downgrade it); a new row records `unknown`
+    // when nothing was said.
+    let install = body.install.as_ref().map(InstallInfo::clamped);
     let agent = match existing {
         Some(a) => {
             let id =
                 a.id.ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
             state
                 .agents
-                .rehydrate(id, &body.machine_name, body.os, &body.agent_version)
+                .rehydrate(
+                    id,
+                    &body.machine_name,
+                    body.os,
+                    &body.agent_version,
+                    install.as_ref(),
+                )
                 .await?
         }
         None => {
@@ -267,6 +298,7 @@ pub async fn enroll_agent(
                     body.os,
                     body.agent_version,
                     String::new(), // agent_token_hash unused in JWT-only scheme
+                    install,
                 )
                 .await?
         }
@@ -280,6 +312,23 @@ pub async fn enroll_agent(
     // costs only that second use (the anchor then needs a fresh token).
     if let Err(e) = state.agents.record_enrollment(agent_id, &claims.jti).await {
         tracing::warn!(agent = %agent_id, error = %e, "enroll: could not record the enrolling token");
+    }
+    // FR-102 P3 — the redemption, on the issuance row (an upsert from the
+    // claims, so a token minted before the ledger existed is on record too).
+    // Best-effort like the line above: the count must never refuse an enroll.
+    if let Err(e) = state
+        .enroll_tokens
+        .mark_redeemed(
+            &claims.jti,
+            tid,
+            admin_uid,
+            DateTime::from_millis(claims.iat.saturating_mul(1000)),
+            agent_id,
+            DateTime::now(),
+        )
+        .await
+    {
+        tracing::warn!(agent = %agent_id, error = %e, "fr-102: could not record the token redemption");
     }
     // FR-103 — at the row's CURRENT generation. A row revived after a removal
     // has a higher one than before, so the token minted here is accepted and
@@ -367,6 +416,8 @@ async fn enroll_agent_ephemeral(
         .id
         .ok_or_else(|| ApiError::Internal("enrollment key missing _id".to_string()))?;
 
+    // FR-102 P3 — the same install claim as the standard path records.
+    let install = body.install.as_ref().map(InstallInfo::clamped);
     let agent = match state
         .agents
         .create_ephemeral(
@@ -378,6 +429,7 @@ async fn enroll_agent_ephemeral(
             body.agent_version,
             key_id,
             key.ephemeral_ttl_secs,
+            install,
         )
         .await
     {
@@ -633,6 +685,11 @@ pub struct AgentResponse {
     /// Absent until the device connects once after FR-103.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_expires_at: Option<String>,
+    /// FR-102 P3 — how the device was installed, as its enroll said
+    /// (`{method, scope}`; `method: "unknown"` for an agent from before P3).
+    /// Absent on a row created before the install trace existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install: Option<InstallInfo>,
     /// Roomler-SSH gate 3 as stored, with the same replace-on-save warning as
     /// [`Self::exec_policy`] — and this is the one that makes `Option`
     /// load-bearing rather than tidy.
@@ -1647,6 +1704,7 @@ fn to_agent_response(
             anchored_by: x.anchored_by.to_hex(),
         }),
         token_expires_at: a.token_exp.map(fmt_dt),
+        install: a.install,
         ssh_policy: configured_only(a.ssh_policy),
         remote_config,
         overlay_public_key,

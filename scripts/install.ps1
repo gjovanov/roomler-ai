@@ -263,8 +263,28 @@ function Install-Daemon {
     # S1b: machine-global is the SystemContext flavour's config source only
     # (see the $mgFlag comment above).
     if ($Role -eq 'daemon-system') { $enrollArgs += '--machine-global' }
-    & $daemon @enrollArgs
-    if ($LASTEXITCODE -ne 0) { throw "enrollment failed (exit $LASTEXITCODE)" }
+    # FR-102 -- the install trace: tell the server HOW this install happened
+    # (the device row's install.method / install.scope). Through the
+    # ENVIRONMENT, never the --install-method flag: this script installs
+    # whatever release is current, and a daemon from before that flag existed
+    # refuses an argument it does not know. An older daemon ignores the vars.
+    # Scope follows the role: daemon-system = system (LocalSystem service),
+    # daemon-user = per-user (Scheduled Task), daemon-machine = attended (a
+    # service without SystemContext, usable only beside a signed-in session).
+    $env:ROOMLER_INSTALL_METHOD = 'script-ps1'
+    $env:ROOMLER_INSTALL_SCOPE = 'system'
+    if ($Role -eq 'daemon-user') { $env:ROOMLER_INSTALL_SCOPE = 'per-user' }
+    if ($Role -eq 'daemon-machine') { $env:ROOMLER_INSTALL_SCOPE = 'attended' }
+    try {
+        & $daemon @enrollArgs
+        $enrollExit = $LASTEXITCODE
+    } finally {
+        # $env: is process-wide, and an `irm | iex` run shares the caller's
+        # process: left set, a later hand-typed enroll in the same window
+        # would be recorded as this script's.
+        Remove-Item Env:ROOMLER_INSTALL_METHOD, Env:ROOMLER_INSTALL_SCOPE -ErrorAction SilentlyContinue
+    }
+    if ($enrollExit -ne 0) { throw "enrollment failed (exit $enrollExit)" }
 
     # Kick the autostart so the daemon picks up the fresh config now
     # rather than at the next logon / service cycle. Best-effort.

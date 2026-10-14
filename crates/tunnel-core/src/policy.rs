@@ -970,6 +970,7 @@ mod tests {
             exec_anchor: None,
             ssh_service: None,
             enrolled_with_jti: None,
+            install: None,
             ssh_policy: Default::default(),
             peer_relay_policy: Default::default(),
             desired_config: Default::default(),

@@ -6,6 +6,7 @@ pub mod agent_log;
 pub mod base;
 pub mod config_audit;
 pub mod consent_request;
+pub mod enroll_token_issued;
 pub mod enrollment_key;
 pub mod exec_audit;
 pub mod exec_pending;
