@@ -80,6 +80,13 @@ import {
 } from './rcBench'
 import { useSnackbar } from './useSnackbar'
 import { useRemoteRecording, type RecordChannel } from './useRemoteRecording'
+import {
+  grantHoldsPrivacy,
+  openPrivacyChannel,
+  usePrivacyMode,
+  withPrivacyAsked,
+  type PrivacyChannel,
+} from './usePrivacyMode'
 import { keepBusySetMessage, parseKeepBusyState, type KeepBusyRequest, type KeepBusyState } from './keepBusy'
 
 /**
@@ -4834,6 +4841,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   const recordGranted = ref(false)
   const recordRefused = ref<string | null>(null)
   const recording = useRemoteRecording()
+  // FR-99 P1c — PRIVACY survives the hub only on a device that serves privacy
+  // mode (its owner allowed it), and never under break-glass. `privacyRefused`
+  // is the server's reason when it did not. Asked for only when the device
+  // serves it (`withPrivacyAsked`). Reset on each connect.
+  const privacyGranted = ref(false)
+  const privacyRefused = ref<string | null>(null)
+  const privacy = usePrivacyMode()
 
   // Pending clipboard:read requests. Keyed by `req_id` so interleaved
   // reads can resolve independently. The agent echoes the req_id back
@@ -7403,6 +7417,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // opened only now (see `openRecordChannel` for why never in connect()).
       const recordChannel = openRecordChannel(pc, channels, perms)
       if (recordChannel) recording.attach(recordChannel as unknown as RecordChannel)
+      // FR-99 P1c — the same for privacy mode: the grant, the server's reason
+      // when it stripped the bit, and the channel only on a grant holding it.
+      privacyGranted.value = grantHoldsPrivacy(perms)
+      privacyRefused.value = typeof msg.privacy_refused === 'string' ? msg.privacy_refused : null
+      const privacyChannel = openPrivacyChannel(pc, channels, perms)
+      if (privacyChannel) privacy.attach(privacyChannel as unknown as PrivacyChannel)
       if (!inputGranted.value) {
         console.info(
           '[rc] session is VIEW-EFFECTIVE: another session already holds input on this host',
@@ -7970,6 +7990,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // FR-85 P3c — a recording is granted per session, never carried over.
     recordGranted.value = false
     recordRefused.value = null
+    // FR-99 P1c — and so is privacy mode; the last session's channel is gone.
+    privacyGranted.value = false
+    privacyRefused.value = null
+    privacy.detach()
     // P6 — fresh session, fresh multi-user state.
     controlState.value = null
     peerCursors.value = {}
@@ -9455,10 +9479,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // browser would like to use; the agent honours it only if its
     // own AgentCaps.transports contains the same entry, otherwise
     // falls back to the legacy WebRTC video track silently.
+    // FR-99 P1c — PRIVACY is asked for only when THIS device serves it: the
+    // page's agent, and only if it is the one being asked (a device switch
+    // can race the request).
+    const askedCaps = agent?.value?.id === agentId ? agent.value.capabilities : undefined
     const requestPayload: Record<string, unknown> = {
       t: 'rc:session.request',
       agent_id: agentId,
-      permissions,
+      permissions: withPrivacyAsked(permissions, askedCaps),
       browser_caps: browserCaps,
     }
     // loopback-TURN corp-relay (Phase 2): forward the probed descriptor so the
@@ -11503,6 +11531,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     recordGranted,
     recordRefused,
     recording,
+    privacyGranted,
+    privacyRefused,
+    privacy,
     stats,
     quality,
     setQuality,
