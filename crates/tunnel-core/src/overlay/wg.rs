@@ -2499,7 +2499,8 @@ pub(crate) fn authenticate_init_with(
 /// sends from the same address we send to), processing it with that peer's
 /// `Tunn` and replying over the same socket. One loop serves all direct peers,
 /// so N same-subnet peers share one socket without racing. Exits when the
-/// socket errors (device gone / dropped).
+/// socket itself errors (device gone / dropped); an error about an earlier
+/// datagram is read past (#2220).
 #[allow(clippy::too_many_arguments)] // C1 — plus the disco responder identity
 async fn run_direct_demux(
     sock: Arc<UdpSocket>,
@@ -2523,7 +2524,10 @@ async fn run_direct_demux(
     // (local to this loop task: no lock needed, one map per interface socket).
     let mut recent_unknown: HashMap<SocketAddr, Instant> = HashMap::new();
     loop {
-        let (n, src) = match sock.recv_from(&mut buf).await {
+        // #2220 — read on past the errors about an EARLIER datagram (Windows
+        // reports a peer's ICMP port-unreachable as 10054 on the next
+        // receive), as the carrier plane's loop does.
+        let (n, src) = match super::udp_recv::recv_from(&sock, &mut buf).await {
             Ok(v) => v,
             Err(e) => {
                 // PR-B1 tripwire — a dead recv loop leaves the socket bound +
@@ -4505,5 +4509,36 @@ mod tests {
             .expect("the fresh loop reads after retire + re-ensure")
             .expect("sink open");
         assert_eq!(got.packet, ping2.to_vec());
+    }
+
+    /// #2220 — the per-device demux loop (the plane off) reads on past the
+    /// port-unreachables Windows reports as `WSAECONNRESET` on the NEXT
+    /// receive, as the plane's loop does. It used to END on the first,
+    /// leaving the socket bound and unread. Linux never reports the ICMP on an
+    /// unconnected socket, so this passes there either way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn port_unreachables_do_not_end_the_direct_demux() {
+        let kp = WgKeypair::generate();
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let local = sock.local_addr().unwrap();
+        let (mut dev, _rx) = WgDevice::new(kp.secret.clone());
+        dev.ensure_direct_demux(sock.clone());
+        let mut stun_events = dev.take_stun_events().unwrap();
+        for _ in 0..3 {
+            let gone = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let closed = gone.local_addr().unwrap();
+            drop(gone);
+            sock.send_to(b"to nobody", closed).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let ext = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ping = crate::transport::stun::encode_binding_request([3u8; 12]);
+        ext.send_to(&ping, local).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), stun_events.recv())
+            .await
+            .expect("the demux loop must still read after the port-unreachables")
+            .expect("sink open");
+        assert_eq!(got.packet, ping.to_vec());
     }
 }
