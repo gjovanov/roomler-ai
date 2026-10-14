@@ -84,8 +84,20 @@ pub fn load(path: Option<PathBuf>) -> Result<TunnelConfig> {
     Ok(cfg)
 }
 
+/// Is the config coming from `ROOMLER_TUNNEL_SERVER` + `ROOMLER_TUNNEL_TOKEN`
+/// rather than a file? Then [`load`] never reads one, and nothing may be
+/// saved to one on its behalf.
+pub fn from_environment() -> bool {
+    std::env::var("ROOMLER_TUNNEL_SERVER").is_ok() && std::env::var("ROOMLER_TUNNEL_TOKEN").is_ok()
+}
+
 /// Persist `cfg` to `path` (or the default). Creates the parent
 /// directory if absent. Idempotent overwrite.
+///
+/// FR-103 — atomic and private: a crash mid-write leaves the previous file,
+/// never a torn one holding half a credential, and the file is owner-only
+/// (`0600` on Unix; on Windows the per-user profile directory's ACL). It
+/// holds a long-lived token.
 pub fn save(cfg: &TunnelConfig, path: Option<&Path>) -> Result<PathBuf> {
     let target = match path {
         Some(p) => p.to_path_buf(),
@@ -96,9 +108,66 @@ pub fn save(cfg: &TunnelConfig, path: Option<&Path>) -> Result<PathBuf> {
             .with_context(|| format!("creating tunnel config dir {}", parent.display()))?;
     }
     let serialised = toml::to_string_pretty(cfg).context("serialising tunnel config")?;
-    std::fs::write(&target, serialised)
+    write_private_atomic(&target, serialised.as_bytes())
         .with_context(|| format!("writing tunnel config {}", target.display()))?;
     Ok(target)
+}
+
+/// FR-103 — save a renewed token, compare-and-swap: only while the file still
+/// holds `renewed_from`. A file holding a different token was re-enrolled
+/// meanwhile (`roomler enroll`), and its token wins: nothing is written and
+/// an error says why. Every other field is kept as the FILE has it.
+pub fn save_renewed_token(
+    cfg: &TunnelConfig,
+    renewed_from: &str,
+    path: Option<&Path>,
+) -> Result<()> {
+    let target = match path {
+        Some(p) => p.to_path_buf(),
+        None => default_config_path()?,
+    };
+    let current = std::fs::read_to_string(&target)
+        .with_context(|| format!("reading tunnel config {}", target.display()))?;
+    let mut on_disk: TunnelConfig = toml::from_str(&current)
+        .with_context(|| format!("parsing tunnel config {}", target.display()))?;
+    if on_disk.tunnel_client_token != renewed_from {
+        bail!(
+            "{} was re-enrolled while the token was being renewed; keeping its token",
+            target.display()
+        );
+    }
+    on_disk.tunnel_client_token = cfg.tunnel_client_token.clone();
+    save(&on_disk, Some(&target)).map(|_| ())
+}
+
+/// Write `bytes` to `target` through an owner-only temp file beside it,
+/// synced, then renamed over the target.
+fn write_private_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let tmp = {
+        let mut name = target.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".tmp-{}", std::process::id()));
+        target.with_file_name(name)
+    };
+    // A leftover from a crashed run of the same pid would fail `create_new`.
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let written = (|| -> std::io::Result<()> {
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    })();
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, target)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 /// Convert `server_url` into the WS URL the agent dials. Honours
@@ -121,6 +190,61 @@ pub fn derive_ws_url(server_url: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg(token: &str) -> TunnelConfig {
+        TunnelConfig {
+            server_url: "https://example.invalid".to_string(),
+            tunnel_client_token: token.to_string(),
+            machine_name: "box".to_string(),
+        }
+    }
+
+    /// FR-103 — the save leaves no temp file behind and, on Unix, an
+    /// owner-only file: it holds a long-lived token.
+    #[test]
+    fn save_is_atomic_and_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        save(&cfg("tok-1"), Some(&path)).unwrap();
+        save(&cfg("tok-2"), Some(&path)).unwrap();
+        assert_eq!(
+            load(Some(path.clone())).unwrap().tunnel_client_token,
+            "tok-2"
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 1, "no temp file left behind: {left:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "owner-only, got {mode:o}");
+        }
+    }
+
+    /// FR-103 — a renewed token is saved only over the token it renewed: a
+    /// file re-enrolled meanwhile keeps its own, and every other field stays
+    /// as the file has it.
+    #[test]
+    fn a_renewed_token_never_overwrites_a_re_enrollment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut on_disk = cfg("old");
+        on_disk.machine_name = "named-on-disk".to_string();
+        save(&on_disk, Some(&path)).unwrap();
+
+        save_renewed_token(&cfg("renewed"), "old", Some(&path)).unwrap();
+        let after = load(Some(path.clone())).unwrap();
+        assert_eq!(after.tunnel_client_token, "renewed");
+        assert_eq!(after.machine_name, "named-on-disk");
+
+        save(&cfg("re-enrolled"), Some(&path)).unwrap();
+        let err = save_renewed_token(&cfg("renewed-again"), "renewed", Some(&path)).unwrap_err();
+        assert!(err.to_string().contains("re-enrolled"), "{err:#}");
+        assert_eq!(load(Some(path)).unwrap().tunnel_client_token, "re-enrolled");
+    }
 
     #[test]
     fn derive_ws_url_https_becomes_wss() {
