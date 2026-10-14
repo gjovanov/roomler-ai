@@ -7,8 +7,8 @@ promoted. P2d is decided (operator, 2026-10-12): the portal waits for it. P2d-1,
 **0.4.131**; P2d-2, the viewer half, is lab-verified on prod's viewer (2026-10-13). P2d-3, the flip (the portal
 automatic where mutter is absent), shipped in **0.4.132** with P2d-2's agent half and P4a; P4b in **0.4.133**; P3c
 in **0.4.134** (2026-10-13). P3d, P5a, P5b (#2145), P3e and P5c are in **0.4.135** (tagged 2026-10-14 from
-`bb6ea90ee`); P5d, P5e (#2183) and P5f (#2192) merged after it; P5g is in review. Ticked: AC1–AC5,
-AC9, AC13. The operator approved the
+`bb6ea90ee`); P5d, P5e (#2183), P5f (#2192) and P5g (#2194) merged after it. Ticked: AC1–AC5,
+AC8, AC9, AC13. The operator approved the
 plan and P0 (the
 lab on zeus, enrolled in the vmtest org: D2, D8). **D1 is decided: split.** Per-user installs go auto, system installs
 stay opt-in until a non-Debian companion ships. D3 waits for P3 · **Owner:** remote desktop (agent + viewer), vmtest (`roomler-ai-deploy`) ·
@@ -650,6 +650,9 @@ bridge for text and images in the lab before deciding.
 | **P7** | clipboard (§4.8) | `ROOMLERD_SESSION_CLIPBOARD=0` | lab | M |
 | **P8** | leftovers: FR-45 AC8 + P5b, FR-56 AC7/AC9/AC10, FR-92 AC9, FR-85's Wayland rows | each FR's own | lab, WSL2 | S each |
 | **P9** | docs: a new `docs/wayland.md` (the support matrix — desktop × install × session state × capability, attended vs unattended), `docs/linux-capture.md` refreshed, the lab runbook in `docs/vmtest.md`, a `docs/README.md` row, `README.Debian` | — | — | S |
+| ↳ P9a | `docs/wayland.md`: the support matrix (desktop × install → picture, input, cursor, who is asked, the lock screen, the release each cell was verified on), the session states with their measured recoveries, the viewer's reasons and what to do, choosing an install; its `docs/README.md` row and index node; the `linux-capture.md` row naming §3.1–3.3, §4.8 and §5.3–5.6 | — | ✅ written from the measured record (every number cites a lab run) | S |
+| ↳ P9b | the lifecycle oracle (`lc-run2.sh`, `lc-verdict.py`, `lc-said.py`, `lc-timeline.py`, `guest-lock.sh`, today in a working directory on the lab host) committed to the deploy repo's `vmtest/lab`, then the runbook in `docs/vmtest.md` | — | owed | S |
+| ↳ P9c | `README.Debian`: what a stock Wayland install does, and the two system keys | — | owed | S |
 
 Each phase ships in an agent release (next `0.4.125`; the `ship-it` skill owns the mechanics) and is
 field-verified before the next one depends on it.
@@ -782,16 +785,23 @@ New cells run three times before they are trusted. An entry in `expected-failure
   with no reason, fixed in the lab by P5f (the notice 3.9–4.3 s after the switch, a new frame 0.4–0.5 s after the
   switch back). ✅ A session opened during a switch read a false `wayland_not_enabled` and never recovered, fixed in
   the lab by P5g (`session_away` at connect, a picture 1.6 s after the switch back; through GNOME's *Switch User*,
-  the unlock notice in turn and a picture 1.2 s after the unlock). Owed: suspend (the lab guests have suspend-to-RAM
-  off), and a released build (0.4.135 carries P3d–P5c).
-- [ ] **AC8** — an idle DRM session's CPU, measured before and after, within 2× of FR-29's X11 figure.
-  ⏳ ✅ in the lab on P3d (`cac2d7c43`): the GNOME 50 system guest, an idle desktop on the viewer's default path,
+  the unlock notice in turn and a picture 1.2 s after the unlock). **On the released 0.4.135** (2026-10-14), the
+  per-user GNOME guest passes the lock (the notice 1.2 s after it, the desktop 1.8 s after the unlock), a resolution
+  change (the new size 4.2 s and 4.6 s after each switch) and a logout and login (*Reconnecting* 1.4 s into the
+  logout, a picture 5.1 s after the login); its user switch froze with no reason (P5f and P5g are unreleased). On the
+  system guest, a session opened during GNOME's idle blank was told at once and had a picture 1.1 s after the
+  viewer's mouse; a running session's notice was lost once to the race P5f fixed (#2192): the viewer re-created the
+  session, whose open told it 10.8 s after the blank. Owed: suspend (the lab guests have suspend-to-RAM off), KDE on a
+  release, and a release carrying P5d–P5g.
+- [x] **AC8** — an idle DRM session's CPU, measured before and after, within 2× of FR-29's X11 figure.
+  ✅ in the lab on P3d (`cac2d7c43`): the GNOME 50 system guest, an idle desktop on the viewer's default path,
   every `roomlerd` process's CPU over two 60 s windows. **57.9 %** of a core on the released 0.4.133, **5.5 % and
   5.3 %** with P3d, inside 2 × 3.4 % = 6.8 %; `ROOMLERD_DRM_IDLE_SKIP=0` gives 64.3 % and 60.7 % back. KWin, on the
   Plasma 6.7.5 system guest: **4.7 % and 4.7 %**, against 46.1 % and 44.5 % with the kill switch. FR-29's 3.4 %
   was taken on H.264 over the RTP track, which the lab cannot reproduce: its Chromium has no H.264, and the RTP
   track carried no video there even with VP9. These numbers are on the VP9-444 data-channel pump, whose keepalives
-  P3d had to wait out (§4.4). Owed: a released build.
+  P3d had to wait out (§4.4). ✅ **On the released 0.4.135** (2026-10-14), the same guest and path: **6.3 % and
+  6.3 %** of a core, inside 6.8 %; the daemon with no session 0.2 %.
 - [x] **AC9** — the GEM handle count stays flat over a 30-minute DRM session (red on 0.4.124).
   ✅ 0.4.128, the GNOME system guest: `@create 51143 / @delete 51143` over 30 minutes, every minute with a
   changing picture. 🔴 first on 0.4.125, the same code: `124 / 0` in one session. Step log 31 on #1972.
@@ -814,6 +824,8 @@ New cells run three times before they are trusted. An entry in `expected-failure
   covers it. P2b, #2028; step log 43 on #1972.
 - [ ] **AC14** — Docs: `docs/wayland.md`, `docs/linux-capture.md` refreshed with anchors re-verified, the lab
   runbook, and the `docs/README.md` index row.
+  ⏳ `docs/wayland.md`, its index row and node, and the `linux-capture.md` row (P9a); `linux-capture.md`'s anchors
+  re-verified by name with each phase through P5g. Owed: the lab runbook (P9b) and `README.Debian` (P9c).
 
 ## 8. Open decisions (operator)
 
@@ -889,6 +901,7 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-14 | `wlab-gnome` (per-user, mutter); `wlab-gnome-sys` (system, DRM) | P5e `b61a86760`; 0.4.134, the release | AC7 fail-first: a user switch, GDM's login screen for 40 s (`switch-user`), then `loginctl activate` back | 🔴 mutter: the owner's last frame for the whole switch, no reason; a new frame 0.7 s after the switch back. ✅ DRM: the login screen in 3.3 s, back in 0.4 s |
 | 2026-10-14 | `wlab-gnome` (per-user, mutter) | P5f `b7d33af1e`, `3c5ed08d2`, then `a93932156` | AC7 / P5f: the same switch, with the probe ticking and on a still desktop; the kill switch; the viewer leaving during the switch | `b7d33af1e`: the notice 0.5 s after the last frame, a new frame 0.4 s after the switch back; a still desktop's return told "away" a second time; `ROOMLERD_SESSION_WATCH=0` froze as before. 🔴 `3c5ed08d2`: a keepalive counted after the notice cleared it, the viewer re-created the session 10 s in, and the reconnects followed a held pump that had outlived its session (a portal helper still running 63 s after the viewer left). ✅ `a93932156`: one notice, 4.3 s after the switch (3.9 s on a still desktop), held; a new frame 0.5 s (0.4 s) after the switch back; a viewer leaving during the switch left no helper at 5 s or 20 s, and the next viewer was live in 1.6 s |
 | 2026-10-14 | `wlab-gnome` (per-user, mutter) | P5f `b7d33af1e` (the release's plan), then P5g `8ef858771` and `2156850a5` | AC7 / P5g: the viewer connecting while GDM's login screen held the seat (`LC_PRE=switch-user`, the dark-open spec); then GNOME's own *Switch User* (`lock-switch`: Super+L, then the login screen), the switch back to the lock screen, and the unlock | 🔴 `b7d33af1e`: `wayland_not_enabled` 22 ms into the open (the plan saw no active Wayland session, and the Xwayland guard answered), no picture in the 40 s after the switch back; `capture-smoke` on the configured mutter arm: refused in 13 ms by the helper's attended-only rule. ✅ P5g: `session_away` at connect, held 45 s, a picture 1.6 s after the switch back (both builds); through *Switch User*: `session_away`, the unlock notice 1.1 s after the switch back, a picture 1.2 s after the unlock |
+| 2026-10-14 | `wlab-gnome` (per-user, mutter); `wlab-gnome-sys` (system, `drm_capture` + `uinput`) | **0.4.135, the release** (its `.deb`, sha256 + signature checked, `dpkg -V` clean) | AC7 and AC8 on a release: the lock, a resolution change, a user switch, a logout and login (per-user); GNOME's idle blank with a running session and with one opened during it, and AC8's idle cost (system) | ✅ the lock: the notice 1.2 s after it, the desktop 1.8 s after the unlock. ✅ a resolution change: 1024×768 4.2 s after the switch, 1280×800 4.6 s after the switch back. 🔴 the user switch: the last frame, no reason (P5f/P5g unreleased); the oracle first read this PASS from frames still in flight during GDM's 2 s hand-over, and now requires the counter moving at the window's end. ✅ the logout and login: *Reconnecting* 1.4 s in, a picture 5.1 s after the login; the unit wanted by `graphical-session.target` and `default.target` (P5a). ✅ an open during the blank: the notice at once, a picture 1.1 s after the viewer's mouse. ⚠️ a running session through the blank: the notice lost to the race (#2192), the viewer re-created the session, and its open told it 10.8 s after the blank. ✅ AC8: **6.3 % and 6.3 %** of a core idle (no session: 0.2 %) |
 
 ## 12. Related
 
