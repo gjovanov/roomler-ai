@@ -195,6 +195,26 @@ over a loopback PeerConnection pair with a recorder for the overlay (named in CI
 Windows clippy job now compiles `viewer-indicator`, which no PR lane had built. **Negative control:** with
 gate 2 disabled, `the_owner_gate_refuses_before_the_overlay_is_asked` fails.
 
+**As built, P1c (the viewer, 2026-10-14).** `ui/src/composables/usePrivacyMode.ts`, wired in
+`useRemoteControl.ts` and drawn in `RemoteControl.vue`.
+
+- **`PRIVACY` is asked for only when the device serves it** (`privacy-mode` in its caps, by equality;
+  `privacy-available` earns nothing). Unlike RECORD, which every viewer asks for, a granted `PRIVACY` puts
+  "may cover this screen" on the person's consent prompt, and a server before P1a cannot parse the name.
+  The page's agent is read only when it is the one being asked, because a device switch can race the
+  request.
+- **The channel** opens from `rc:session.created`, only on a grant holding `PRIVACY`, for the reason
+  `openRecordChannel` does. The toggle shows ON only when the device says so, keeps a refusal with its
+  reason, shows the curtain coming down unasked (the owner's OFF, `disabled_on_device`), and reads a closed
+  channel as the session ending the curtain.
+- **The toolbar:** a toggle on a grant holding `PRIVACY`; a disabled control whose title gives the server's
+  strip reason (`device_not_opted_in`, `break_glass`, or a code from a newer server); nothing at all where
+  no curtain could ever be (`device_cannot_curtain`). A refusal or an unasked take-down is also said in a
+  snackbar, because the icon alone changes too quietly.
+
+Tests: `ui/src/__tests__/composables/usePrivacyMode.spec.ts` (11, through a fake channel); the whole vitest
+suite and `vue-tsc` green.
+
 ### 3d. Other platforms
 
 - **macOS:** out. Since macOS 15 there is **no public API** that keeps a window out of screen capture. Apple
@@ -230,10 +250,10 @@ says muting the host silences the client too. The FR ships only the honest versi
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | This spec and the claim. The feasibility probes: `BlockInput` (the four questions in §3b), loopback under mute, the macOS lock mechanism | docs only | spec merged. **`BlockInput` and the curtain probed on vmtest 2026-10-13 and 14** (§3b's answers): high integrity needed, only the blocking thread injects (mouse, keys and the wheel alike), Ctrl+Alt+Del lifts the block, and the curtain stays out of both DXGI and WGC capture. Still owed: EDR, loopback under mute, the macOS lock |
-| P1 | The curtain + the permission bit + the device opt-in + audit (Windows), in three steps below | `privacy_mode_allowed=false` (default) | P1a built |
-| P1a | The server's gate: the bit, the two `rpc` words, the hub's strip with its reasons, break-glass excluded, the storage rule (§3c as built) | none needed: nothing advertises the words yet | **built** (this PR): unit + `privacy_gate_tests` green locally; the negative control (strip disabled) fails them |
-| P1b | The agent: `privacy_mode_allowed`, the words, the consent line, the curtain, the `privacy` channel, and the device's own refusal (§3a and §3c as built) | `privacy_mode_allowed=false` | **built**: Linux unit + `privacy_dc` 6/6, Windows clippy and units with `viewer-indicator`; NC fails as it should. The field check (`curtain-smoke` on vmtest) is owed |
-| P1c | The viewer: the toggle, the refusal reasons, asking for `PRIVACY` only once P1a is deployed | the toggle | — |
+| P1 | The curtain + the permission bit + the device opt-in + audit (Windows), in three steps below | `privacy_mode_allowed=false` (default) | P1a and P1b merged; P1c in review |
+| P1a | The server's gate: the bit, the two `rpc` words, the hub's strip with its reasons, break-glass excluded, the storage rule (§3c as built) | none needed: nothing advertises the words yet | **merged** #2186 (`2a1e939de`): unit + `privacy_gate_tests`; the negative control (strip disabled) fails them |
+| P1b | The agent: `privacy_mode_allowed`, the words, the consent line, the curtain, the `privacy` channel, and the device's own refusal (§3a and §3c as built) | `privacy_mode_allowed=false` | **merged** #2191 (`c4df7ecde`): Linux unit + `privacy_dc` 6/6, Windows clippy and units with `viewer-indicator`; NC fails as it should. **Field-verified** with `curtain-smoke` under both capture paths (§8 rows 7 and 8) |
+| P1c | The viewer: the toggle, the refusal reasons, asking for `PRIVACY` only from a device that serves it (§3c as built) | the toggle | **#2199**: `usePrivacyMode.spec.ts` (11), the vitest suite and `vue-tsc`. The end-to-end field cell (AC1: the toggle reaching a curtain through the channel) needs P1c deployed and an agent release carrying P1b |
 | P2 | The input block, if P0 cleared it | `privacy_input_block=false` | — |
 | P3 | Lock on end (Windows, Linux, macOS) | `lock_on_end=never` | — |
 | P4 | Host mute | the toggle | — |
@@ -307,6 +327,8 @@ weighed.
 | 4 | 2026-10-13 | The same, then `virsh send-key` Ctrl+Alt+Del and Esc during the block | **The way out.** At Ctrl+Alt+Del the input desktop switched (`GetCursorPos` read 0,0). After Esc the person's next move landed (1279,799) while the probe still believed it was blocking. Its `BlockInput(FALSE)` then returned FALSE. The OS lifted the block and told no one |
 | 5 | 2026-10-14 | A fresh guest, **attended**: the person signed in, so the agent captured through WGC (its log reads `wgc: capture session closed` at the viewer's disconnect). Agent 0.4.134, the same curtain probe, the production viewer from a LAN neighbour | **The curtain stays out of WGC capture too.** Without the affinity, the host's screenshot and the stream both showed the curtain. With it (`True`, affinity `0x11`), the host's screenshot showed the curtain, and the stream, sampled 11 s into the curtain's 30 s, showed the companion's Welcome window under it |
 | 6 | 2026-10-14 | The same guest, no viewer. A focused window, elevated, blocks and injects from its UI thread: the keys O W N and one wheel notch. The person types over `virsh send-key`: P Q during the block, R S after it | **Keys and the wheel behave like the mouse.** Control (no block): the window received `ownpqrs` and the notch (120). Under the block (`BlockInput(TRUE) = True`), it held `own` and the notch at the unblock, so the person's P Q, typed about 3 s into the 13 s block, were dropped. R S, typed about 3 s after the unblock, arrived: `ownrs` |
+| 7 | 2026-10-14 | **P1b's production overlay, SystemContext (DXGI) capture.** A vmtest Win11 guest whose installed agent (0.4.134) streamed to the production viewer from a LAN neighbour. `roomlerd curtain-smoke`, built from #2191 (sha256 `c35811fb…`), ran as the signed-in person | **The curtain is up for the person and out of the capture.** Before: the host's screenshot and the stream both showed the desktop. During, 11 s in: the host's screenshot showed the curtain and its notice, with the red border kept above it; the stream showed the desktop under it (the companion, and the console that ran the smoke). After: the desktop again. The guest's log: `privacy: curtain up, out of capture` at 08:05:42Z (the affinity read back), `curtain down` 40 s later; `curtain-smoke: possible=true up=true` |
+| 8 | 2026-10-14 | The same check on an **attended** guest, so the agent captured through WGC | **The same, under WGC.** The host's screenshot showed the curtain, and the stream (VP9 4:4:4 on a direct path) showed the desktop under it: the companion, the console, the taskbar. `curtain up, out of capture` at 10:55:36Z, down 40 s later |
 
 Attended runs happen on the operator's spare box, never on a machine someone is using.
 

@@ -530,6 +530,36 @@
           <v-icon>mdi-record-circle-outline</v-icon>
         </v-btn>
       </span>
+      <!-- FR-99 P1c — privacy mode. A toggle on a grant that holds PRIVACY:
+           the device puts the curtain up after its own gates and says why
+           when it does not. A disabled control explains the server's strip
+           reason; nothing shows where no curtain could ever be. -->
+      <v-btn
+        v-if="rc.phase.value === 'connected' && rc.privacyGranted.value"
+        icon
+        variant="text"
+        size="small"
+        class="mr-1"
+        :color="rc.privacy.on.value ? 'primary' : undefined"
+        :loading="rc.privacy.pending.value"
+        :disabled="!rc.privacy.ready.value"
+        :aria-pressed="rc.privacy.on.value"
+        :aria-label="rc.privacy.on.value ? 'Uncover the device screen' : 'Cover the device screen'"
+        :title="privacyTitle"
+        data-testid="rc-privacy-btn"
+        @click="rc.privacy.set(!rc.privacy.on.value)"
+      >
+        <v-icon>{{ rc.privacy.on.value ? 'mdi-eye-off' : 'mdi-eye-off-outline' }}</v-icon>
+      </v-btn>
+      <span
+        v-else-if="rc.phase.value === 'connected' && showsPrivacyRefusal(rc.privacyRefused.value)"
+        :title="`Privacy mode unavailable: ${describePrivacyReason(rc.privacyRefused.value)}`"
+        data-testid="rc-privacy-refused"
+      >
+        <v-btn icon variant="text" size="small" class="mr-1" disabled aria-label="Privacy mode unavailable">
+          <v-icon>mdi-eye-off-outline</v-icon>
+        </v-btn>
+      </span>
       <!-- Transfers chip — in-progress uploads/downloads popover.
            Conditionally rendered so it never clutters the toolbar. -->
       <v-menu
@@ -1961,6 +1991,7 @@ import {
   showsRecordRefusal,
   type RemoteRecordingItem,
 } from '@/composables/useRemoteRecording'
+import { describePrivacyReason, showsPrivacyRefusal } from '@/composables/usePrivacyMode'
 import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
 import KeepBusyMenu from '@/components/remote/KeepBusyMenu.vue'
@@ -2007,6 +2038,27 @@ const recRunning = computed(() => rec.state.value === 'recording')
 watch(rec.audioUnavailable, (why) => {
   if (why) recAudio.value = false
 })
+// FR-99 P1c — privacy mode. The control's title says what it does and, after a
+// refusal, why it was refused; the device's word decides whether it shows on.
+const privacyTitle = computed(() => {
+  if (rc.privacy.on.value) {
+    return 'Privacy mode is on: the person at the device sees a notice instead of the screen. Click to turn it off.'
+  }
+  const why = describePrivacyReason(rc.privacy.reason.value)
+  return why
+    ? `Privacy mode is off: ${why}`
+    : "Privacy mode: cover the device's screen while you work"
+})
+// A refusal, or the curtain coming down unasked (the owner switched privacy
+// mode off), is said out loud: the icon alone changes too quietly.
+watch(
+  () => [rc.privacy.reason.value, rc.privacy.on.value] as const,
+  ([why, on]) => {
+    if (why && !on && why !== 'session_ended') {
+      showError(`Privacy mode: ${describePrivacyReason(why)}`)
+    }
+  },
+)
 // FR-85 P3b-3 — a deliberate Disconnect ends a recording first: to the device
 // a hang-up and the reconnect ladder's retry look the same, and a retry is
 // what it keeps a recording running for.
