@@ -700,6 +700,9 @@ export interface EnrollmentToken {
   enrollment_token: string
   expires_in: number
   jti: string
+  /** FR-104 — the token may also anchor the Windows device it enrolls, once.
+   *  Absent from a server older than FR-104, which reads as "it may not". */
+  anchor?: boolean
 }
 
 /** FR-51 — one ephemeral enrollment key, as listed (no secret here). */
@@ -862,8 +865,16 @@ export const useAgentStore = defineStore('agents', () => {
     return agents.value[idx]!
   }
 
-  async function issueEnrollmentToken(tenantId: string): Promise<EnrollmentToken> {
-    return api.post<EnrollmentToken>(`/tenant/${tenantId}/agent/enroll-token`)
+  async function issueEnrollmentToken(
+    tenantId: string,
+    opts: { anchor?: boolean } = {},
+  ): Promise<EnrollmentToken> {
+    const url = `/tenant/${tenantId}/agent/enroll-token`
+    // FR-104 — a body only when asked: the plain token stays the body-less
+    // request every server version answers.
+    return opts.anchor
+      ? api.post<EnrollmentToken>(url, { anchor: true })
+      : api.post<EnrollmentToken>(url)
   }
 
   async function rename(tenantId: string, agentId: string, name: string) {

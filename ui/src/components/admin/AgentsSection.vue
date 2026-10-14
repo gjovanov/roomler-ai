@@ -1057,7 +1057,9 @@
     :expires-in="enrollToken?.expires_in ?? null"
     :loading="enrollLoading"
     :error="enrollError"
+    :anchor="enrollToken?.anchor === true"
     @update:model-value="(v: boolean) => { if (!v) closeEnrollDialog() }"
+    @update:anchor="reissueEnrollToken"
   />
 
   <!-- Tunnel-client enrollment (folded from /network/tunnel-clients) -->
@@ -2345,13 +2347,24 @@ watch(
   { immediate: true },
 )
 
+// Bound as a click handler, so it takes no argument: Vue would pass the event.
 async function openEnrollDialog() {
   enrollDialogOpen.value = true
+  await mintEnrollToken(false)
+}
+
+/** FR-104 — the dialog's "also anchor" box: a new token, with or without the
+ *  anchor claim. The one shown before stays valid until its own expiry. */
+function reissueEnrollToken(anchor: boolean) {
+  void mintEnrollToken(anchor)
+}
+
+async function mintEnrollToken(anchor: boolean) {
   enrollLoading.value = true
   enrollToken.value = null
   enrollError.value = null
   try {
-    enrollToken.value = await agentStore.issueEnrollmentToken(props.tenantId)
+    enrollToken.value = await agentStore.issueEnrollmentToken(props.tenantId, { anchor })
   } catch (e) {
     enrollError.value = (e as Error).message
   } finally {
