@@ -307,7 +307,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | piece | where |
 |---|---|
 | capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:597`, `:628`, `:642`, test `:4645`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:1610-1614` |
-| wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:2179`, `:629`; owner `network` (`:1588`, `modular-monolith.md`) |
+| wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:2207`, `:629`; owner `network` (`:1613`, `modular-monolith.md`) |
 | models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:1659`, `:1685`, `:1710`, `:1741`, `:3186`, `:5694`, `:5709` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
 | reconcile-on-connect | `crates/modules/fleet/src/socket.rs:202-193`, `:250-272` |

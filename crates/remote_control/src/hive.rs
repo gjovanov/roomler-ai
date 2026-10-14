@@ -735,6 +735,60 @@ pub struct HiveReplicaManifestEntry {
     pub checkpoint: Option<HiveCheckpointMark>,
 }
 
+/// FR-90 P2g-3c — what keeps a device's copy of a session, as
+/// `rc:hive.retain` says it: the organization's `retention_days`, and the
+/// session's end once it is over. The device's own clock does the rest. The
+/// copy of a session that is over goes `days` after its end, online or not,
+/// when the server's retention sweep would purge it. The copy of a live one
+/// goes `days` after the device last heard from the server, so a device that
+/// misses a purge by staying offline keeps it no longer than that (design
+/// §4.4).
+///
+/// ⚠️ Days and an end, never an instant. An instant for a live session would
+/// have to be renewed for as long as the session lives, and a server that
+/// stopped renewing it (a bug, the switch off) would have every member delete
+/// every live session's copy. A device that hears nothing keeps what it holds.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HiveRetainWord {
+    #[serde(with = "crate::serde_helpers::oid_hex")]
+    pub session_id: bson::oid::ObjectId,
+    /// The organization's `retention_days`; `0` keeps the session for ever.
+    pub days: u32,
+    /// When the session ended, in ms since the epoch, as the sweep counts it
+    /// (its `ended_at`, else its last update): only once it is over
+    /// (`ended`, `refused`, `lost`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<i64>,
+}
+
+/// FR-90 P2g-3c — a copy the device purged on its own clock, as its
+/// `rc:hive.replica.manifest` says so: the session, and when, by the device's
+/// clock. The server stops counting it as a copy held there.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HiveCopyPurged {
+    #[serde(with = "crate::serde_helpers::oid_hex")]
+    pub session_id: bson::oid::ObjectId,
+    pub at_ms: i64,
+}
+
+/// FR-90 P2g-3c — bounds on the retention word's frames
+/// (`rc:hive.retain_ask` · `rc:hive.retain`) and on what a manifest says the
+/// device's own clock purged, read by both ends.
+pub mod retain_limits {
+    /// Sessions one `rc:hive.retain_ask` may name: as many as a replica
+    /// manifest carries. A longer ask is no device's, and is answered with
+    /// nothing.
+    pub const MAX_RETAIN_ASK: usize = super::replica_limits::MAX_REPLICA_MANIFEST;
+    /// Copies purged on the device's own clock one manifest may name.
+    pub const MAX_COPY_PURGED: usize = 1024;
+    /// How often a device that stays connected asks again: a policy changed
+    /// meanwhile, or a session that ended, reaches it within a day.
+    pub const RETAIN_ASK_EVERY_SECS: u64 = 24 * 60 * 60;
+    /// How many manifests name a copy the device purged on its own clock:
+    /// one could be lost with the connection it went on.
+    pub const COPY_PURGED_REPORTS: u32 = 3;
+}
+
 /// FR-90 P2d — bounds on the replica stream's frames
 /// (`rc:hive.replica.want` · `grant` · `ready` · `dial` · `candidate` ·
 /// `refused` · `close`), read by both ends.
