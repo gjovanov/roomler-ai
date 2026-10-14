@@ -455,7 +455,9 @@ impl StatsDao {
     }
 }
 
-fn is_dup_key(e: &mongodb::error::Error) -> bool {
+/// E11000 — the concurrent-first-insert signal every claim-first writer in
+/// this crate reads (the stats upserts here, FR-102's digest claim).
+pub(crate) fn is_dup_key(e: &mongodb::error::Error) -> bool {
     match &*e.kind {
         mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(we)) => {
             we.code == 11000

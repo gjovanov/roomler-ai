@@ -11,6 +11,7 @@ pub mod exec_audit;
 pub mod exec_pending;
 pub mod file;
 pub mod growth;
+pub mod growth_digest;
 pub mod invite;
 pub mod keep_busy_event;
 pub mod key_rotation_audit;

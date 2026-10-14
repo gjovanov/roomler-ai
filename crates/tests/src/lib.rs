@@ -68,6 +68,11 @@ mod enroll_key_tests;
 mod ephemeral_tests;
 #[cfg(test)]
 mod exec_service_tests;
+/// FR-102 P1d — the daily digest: every section's exact numbers on a seeded
+/// day, the once-only claim under two concurrent runs (AC23), the routes,
+/// the no-address rule, and the purestat client against a fake server.
+#[cfg(test)]
+mod growth_digest_tests;
 /// FR-102 — growth observability: the campaign taxonomy at ingress (AC5),
 /// the exclusion list and the set every growth number applies (AC4).
 #[cfg(test)]

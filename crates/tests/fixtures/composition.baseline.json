@@ -1,6 +1,22 @@
 {
   "routes": [
     {
+      "path": "/api/admin/growth/digest",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/admin/growth/digest/preview",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/admin/growth/digest/run",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/admin/growth/digests",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/admin/growth/exclusions",
       "methods": "GET,HEAD,PUT"
     },
@@ -1256,6 +1272,17 @@
               "external_source.provider": 1,
               "external_source.external_id": 1
             }
+          }
+        ]
+      },
+      {
+        "collection": "growth_digests",
+        "indexes": [
+          {
+            "key": {
+              "computed_at": 1
+            },
+            "expireAfterSeconds": 64800000
           }
         ]
       },
@@ -2880,6 +2907,17 @@
               "external_source.provider": 1,
               "external_source.external_id": 1
             }
+          }
+        ]
+      },
+      {
+        "collection": "growth_digests",
+        "indexes": [
+          {
+            "key": {
+              "computed_at": 1
+            },
+            "expireAfterSeconds": 64800000
           }
         ]
       },
