@@ -374,6 +374,18 @@
             >
               {{ rowStatusLabel(item) }}
             </v-chip>
+            <!-- FR-103 — only when the device's credential needs someone. -->
+            <v-chip
+              v-if="item.kind === 'agent' && agentFor(item) && credentialChip(agentFor(item)!.token_expires_at)"
+              size="x-small"
+              variant="tonal"
+              class="mt-1"
+              prepend-icon="mdi-key-alert"
+              :color="credentialChip(agentFor(item)!.token_expires_at)!.color"
+              :title="credentialChip(agentFor(item)!.token_expires_at)!.tooltip"
+            >
+              {{ credentialChip(agentFor(item)!.token_expires_at)!.text }}
+            </v-chip>
             <v-chip
               v-if="item.kind === 'agent' && agentFor(item) && remoteConfigChip(agentFor(item)!)"
               size="x-small"
@@ -1517,6 +1529,7 @@ import {
 } from '@/stores/agents'
 import { codecChips, permissionWarnings } from './agentCodecChips'
 import { keepBusyBriefTitle } from '@/composables/keepBusy'
+import { credentialChip } from '@/utils/credentialExpiry'
 import AgentCrashesDialog from './AgentCrashesDialog.vue'
 import AgentLogsDialog from './AgentLogsDialog.vue'
 import DeviceConsoleDialog from './DeviceConsoleDialog.vue'
