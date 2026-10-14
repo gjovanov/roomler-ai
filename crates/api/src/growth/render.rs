@@ -189,9 +189,84 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
         Measured::Value(_) => {}
         Measured::NotMeasured(n) => out.push(Line("By OS".into(), not_measured(n))),
     }
+    match &s.orgs_devices.by_install_method {
+        Measured::Value(rows) if !rows.is_empty() => out.push(Table(
+            vec!["Install method".into(), "Enrolled".into()],
+            rows.iter()
+                .map(|k| vec![k.key.clone(), k.count.to_string()])
+                .collect(),
+        )),
+        Measured::Value(_) => {}
+        Measured::NotMeasured(n) => out.push(Line("By install method".into(), not_measured(n))),
+    }
+
+    out.push(Heading("Install".into()));
+    match &s.install.tokens {
+        Measured::Value(t) => {
+            out.push(Line("Enrollment tokens issued".into(), fig(&t.issued)));
+            out.push(Line("… of which redeemed".into(), fig(&t.redeemed)));
+            if let Some(p) = pct_if_enough(t.redeemed.d28, t.issued.d28) {
+                out.push(Line("Redeemed share (28d)".into(), format!("{p:.1} %")));
+            }
+        }
+        Measured::NotMeasured(n) => out.push(Line("Enrollment tokens".into(), not_measured(n))),
+    }
+    match &s.install.enrollments_by_method {
+        Measured::Value(rows) if !rows.is_empty() => out.push(Table(
+            vec![
+                "Method".into(),
+                "OS".into(),
+                "Enrolled (day · 7d · 28d)".into(),
+            ],
+            rows.iter()
+                .map(|r| {
+                    vec![
+                        r.method.clone(),
+                        r.os.clone(),
+                        format!(
+                            "{} · {} · {}",
+                            r.enrolled.day, r.enrolled.d7, r.enrolled.d28
+                        ),
+                    ]
+                })
+                .collect(),
+        )),
+        Measured::Value(_) => out.push(Note("No device enrolled in the last 28 days.".into())),
+        Measured::NotMeasured(n) => out.push(Line("Enrollments by method".into(), not_measured(n))),
+    }
+    match &s.install.fetches {
+        Measured::Value(rows) if !rows.is_empty() => out.push(Table(
+            vec![
+                "Asset".into(),
+                "Client".into(),
+                "OS".into(),
+                "Fetches (day · 7d · 28d)".into(),
+            ],
+            rows.iter()
+                .map(|r| {
+                    vec![
+                        r.asset.clone(),
+                        r.client.clone(),
+                        r.os.clone(),
+                        format!("{} · {} · {}", r.fetches.day, r.fetches.d7, r.fetches.d28),
+                    ]
+                })
+                .collect(),
+        )),
+        Measured::Value(_) => out.push(Note(
+            "No installer or script fetched in the last 28 days.".into(),
+        )),
+        Measured::NotMeasured(n) => out.push(Line("Fetches".into(), not_measured(n))),
+    }
+    out.push(Note(
+        "Fetches are counted by client class from the User-Agent (wizard, script-sh, script-ps1, \
+         browser, other) and never include the daemon's own update checks; a fetch is a lower \
+         bound on intent, not an install."
+            .into(),
+    ));
     out.push(Line(
-        "By install method".into(),
-        not_measured(&s.orgs_devices.by_install_method),
+        "Wizard steps".into(),
+        not_measured(&s.install.wizard_steps),
     ));
 
     out.push(Heading("Usage".into()));
@@ -483,7 +558,6 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
     }
 
     out.push(Heading("Not yet measured".into()));
-    out.push(Line("Install".into(), not_measured(&s.install)));
     out.push(Line("Social reach".into(), not_measured(&s.social)));
     out.push(Line("Search".into(), not_measured(&s.search)));
 
@@ -582,8 +656,8 @@ pub fn render_text(doc: &DigestDoc, s: &Sections) -> String {
 mod tests {
     use super::*;
     use crate::growth::digest::{
-        ActiveOrgs, Headline, KeyCount, MrrEstimate, OrgsDevices, Quality, Revenue, SignupRow,
-        Signups, TopOrg, Usage,
+        ActiveOrgs, FetchRow, Headline, Install, KeyCount, MethodRow, MrrEstimate, OrgsDevices,
+        Quality, Revenue, SignupRow, Signups, Tokens, TopOrg, Usage,
     };
     use roomler_ai_services::dao::growth_digest::{DigestStatus, ExcludedCounts};
 
@@ -650,7 +724,10 @@ mod tests {
                     count: 3,
                 }]),
                 orgs_first_device: Measured::Value(f(1, 2, 5)),
-                by_install_method: NotMeasured::later("devices by install method", "P3"),
+                by_install_method: Measured::Value(vec![KeyCount {
+                    key: "script-sh".into(),
+                    count: 3,
+                }]),
             },
             usage: Usage {
                 remote: Measured::unmounted("remote"),
@@ -680,7 +757,24 @@ mod tests {
                 remote: Measured::unmounted("remote"),
                 crashes: Measured::unmounted("fleet"),
             },
-            install: NotMeasured::later("install", "P3"),
+            install: Install {
+                fetches: Measured::Value(vec![FetchRow {
+                    asset: "install.sh".into(),
+                    client: "script-sh".into(),
+                    os: "unknown".into(),
+                    fetches: f(4, 10, 30),
+                }]),
+                tokens: Measured::Value(Tokens {
+                    issued: f(3, 12, 40),
+                    redeemed: f(2, 9, 30),
+                }),
+                enrollments_by_method: Measured::Value(vec![MethodRow {
+                    method: "script-sh".into(),
+                    os: "linux".into(),
+                    enrolled: f(3, 7, 20),
+                }]),
+                wizard_steps: NotMeasured::later("wizard steps reached (opt-in runs)", "P3b"),
+            },
             social: NotMeasured::later("social", "P8"),
             search: NotMeasured::later("search", "P7"),
         };
@@ -703,8 +797,17 @@ mod tests {
         let text = render_text(&doc, &s);
         assert!(text.contains("Website"));
         assert!(text.contains("not measured — purestat key not configured"));
-        assert!(text.contains("not measured — arrives with P3 (devices by install method)"));
+        assert!(
+            text.contains("not measured — arrives with P3b (wizard steps reached (opt-in runs))")
+        );
         assert!(text.contains("not measured — remote module not mounted"));
+        // P3 — the install trace renders as numbers, with the ratio only
+        // once its n clears the floor (40 issued ≥ 30).
+        assert!(text.contains("Enrollment tokens issued: 3 (7d 12 · 28d 40)"));
+        assert!(text.contains("Redeemed share (28d): 75.0 %"));
+        assert!(text.contains("script-sh | linux | 3 · 7 · 20"));
+        assert!(text.contains("install.sh | script-sh | unknown | 4 · 10 · 30"));
+        assert!(text.contains("never include the daemon's own update checks"));
         assert!(text.contains("Remote-desktop minutes: not measured"));
         // The figure carries its context, and the footer its exclusions.
         assert!(text.contains("Sign-ups: 2 (7d 9 · 28d 31)"));

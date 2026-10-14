@@ -263,6 +263,18 @@ function Install-Daemon {
     # S1b: machine-global is the SystemContext flavour's config source only
     # (see the $mgFlag comment above).
     if ($Role -eq 'daemon-system') { $enrollArgs += '--machine-global' }
+    # FR-102 -- the install trace: tell the server HOW this install happened
+    # (the device row's install.method / install.scope). Through the
+    # ENVIRONMENT, never the --install-method flag: this script installs
+    # whatever release is current, and a daemon from before that flag existed
+    # refuses an argument it does not know. An older daemon ignores the vars.
+    # Scope follows the role: daemon-system = system (LocalSystem service),
+    # daemon-user = per-user (Scheduled Task), daemon-machine = attended (a
+    # service without SystemContext, usable only beside a signed-in session).
+    $env:ROOMLER_INSTALL_METHOD = 'script-ps1'
+    $env:ROOMLER_INSTALL_SCOPE = 'system'
+    if ($Role -eq 'daemon-user') { $env:ROOMLER_INSTALL_SCOPE = 'per-user' }
+    if ($Role -eq 'daemon-machine') { $env:ROOMLER_INSTALL_SCOPE = 'attended' }
     & $daemon @enrollArgs
     if ($LASTEXITCODE -ne 0) { throw "enrollment failed (exit $LASTEXITCODE)" }
 

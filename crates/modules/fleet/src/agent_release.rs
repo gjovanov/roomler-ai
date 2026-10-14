@@ -29,7 +29,7 @@ use axum::{
     Json,
     body::Body,
     extract::{Path, Query, State},
-    http::{HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::Response,
 };
 use serde::{Deserialize, Serialize};
@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use roomler_core::ApiError;
 
-use crate::{FleetState, releases};
+use crate::{FleetState, install_trace, releases};
 
 /// Subset of GitHub's release JSON the agent actually consults. We
 /// don't need authors, body, html_url, or hundreds of bytes of CI
@@ -80,7 +80,11 @@ pub struct AgentRelease {
 /// just a URL swap.
 pub async fn latest_release(
     State(state): State<FleetState>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<AgentRelease>>, ApiError> {
+    // FR-102 P3 — counted before the upstream read, so an outage at GitHub
+    // hides no demand; the updater's own checks are never counted.
+    install_trace::count_fetch(&state, &headers, install_trace::asset::AGENT_LATEST_RELEASE);
     let releases = releases::cached(&state).await?;
     Ok(Json(filter_component_releases(releases, "agent-v")))
 }
@@ -246,8 +250,15 @@ pub async fn installer_proxy(
     State(state): State<FleetState>,
     Path(flavour): Path<String>,
     Query(params): Query<InstallerQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let normalised = normalise_flavour(&flavour)?;
+    // FR-102 P3 — one fetch of this flavour by this client class.
+    install_trace::count_fetch(
+        &state,
+        &headers,
+        &install_trace::asset::installer(normalised),
+    );
     let releases = releases::cached(&state).await?;
     let release = pick_release(&releases, &params.version).ok_or_else(|| {
         ApiError::NotFound(format!("no release matching version={}", params.version))
