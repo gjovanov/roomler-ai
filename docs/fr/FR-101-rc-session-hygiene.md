@@ -277,7 +277,7 @@ limit and ends the session itself. The hub's part is to tell it the limit and to
 | P4b-1 | The maximum session length (§3c as built): the org's setting and route, the hub's timer from the moment the session went live, `rc:terminate` and the `session_ended` audit row naming `max_duration`, the viewer's sentence, the settings card | none needed: nothing is limited until an org sets a limit (operator decision 2) | **merged** #2211 (`8f2f15dbd`): the hub's `a_session_ends_at_the_orgs_maximum_length`, `rc_session_limits_tests` (the route's rules; a live session ended at a 2 s limit, both ends told and the audit row naming it, against an org with no limit that goes on), and the store and viewer tests. Negative control: with the timer never armed, both timer tests fail and the route cell passes |
 | P4b-2a | The idle timeout (§3c as built): the org's `idle_secs` on the limits route, the device's `AccessPolicy.auto_terminate_idle_minutes` (the shorter wins), the agent's measure (controller activity, and screen change judged on a sampled grid so a clock never counts), its warning on the control channel, its end as `idle_timeout` naming `limit: "idle"` through the host-Disconnect path, and the `idle-timeout` cap word, without which the viewer is told no limit | off by default | **merged** #2219 (`c6413a90e`): the agent's clock and grid tests; the hub's idle-limit tests; `rc_idle_limit_tests`, where a real agent ends a 2 s session itself; and new `rc_session_limits_tests` cells. Negative controls: with the watcher never armed, the real-agent cell fails; with the hub never naming `idle`, the hub tests and the gate cell fail; with a one-cell threshold, the clock test fails. CI ran again on the branch merged with master before the squash |
 | P4b-2b | The viewer's countdown for `rc:idle` (§3c as built), withdrawn by any input from here, and the device row's control for its own idle limit | — | **merged** #2230 (`831ebcfb5`): the `rc:idle` parser (a countdown, its withdrawal, nothing malformed) and `idleSecondsLeft`; the full vitest suite (2006) and `vue-tsc` pass |
-| P5 | Docs and the field table | — | — |
+| P5 | Docs and the field table | — | **#2235**: `remote-control.md` §11.3b (the policy switches, with the request's sequence and the reasons), and `security-baseline.md` §3–§4 (the floor no server can lift, the session limits, and a diagram of where each FR-101 audit row is written); both rows in `docs/README.md`. The transport (§4), the transfer audit (§11.3a) and the limits (§11.6) were documented with their phases. Both new diagrams render with mermaid-cli |
 
 ⚠️ **Why P1b was split from P1a (2026-10-13).** Replay windows and GCM-only DTLS
 cannot cost a device its connection. Forcing `wss://` can. A config that still holds a
@@ -328,9 +328,14 @@ and gives labs an explicit escape before the default flips.
   569 passed). The owner is refused `rate_limited` on request 61 of 60, another device is untouched,
   and a member without the right gets `permission_denied` all 61 times, never `rate_limited`.
 - [ ] **AC8:** TURN over IPv6 is answered, or `listening-ip` is fixed and then answered.
-- [ ] **AC9:** **Docs:** `docs/security-baseline.md` and `docs/remote-control.md` describe the policy switches,
+- [x] **AC9:** **Docs:** `docs/security-baseline.md` and `docs/remote-control.md` describe the policy switches,
   the audit rows (with a mermaid diagram of where they are written), the timeouts and the transport
-  settings. Linked from `docs/README.md`.
+  settings. Linked from `docs/README.md`. **Done** (#2235, P5):
+  - the policy switches: `remote-control.md` §11.3b, and the floor in `security-baseline.md` §4;
+  - the audit rows: §4's diagram of who writes each row, plus the sequences in §11.3a, §11.3b and §11.6;
+  - the timeouts: §11.6, and `security-baseline.md` §3;
+  - the transport: `security-baseline.md` §4's tables, and §11.1;
+  - both rows in `docs/README.md`.
 
 ## 6. Decisions
 

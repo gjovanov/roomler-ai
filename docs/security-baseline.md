@@ -246,6 +246,15 @@ frames.
 - No legitimate client comes near 60: the viewer's reconnect ladder asks about a
   dozen times in its first minute.
 
+**A session can be bounded in length and in idleness** (FR-101 P4b,
+[remote-control.md](remote-control.md) §11.6). Both limits are off by default and
+set per org. The hub keeps the maximum length from the moment a session goes live.
+The idle limit is kept by the device, the only party that sees both the
+controller's input and the screen, and a device's own `auto_terminate_idle_minutes`
+can only shorten the org's. Both end the session as `idle_timeout` and name the
+limit (`max_duration` or `idle`) in `rc:terminate` and in the `session_ended` audit
+row. The hub honours `idle` from the agent only.
+
 ### The SSH request route checks membership before the device lookup
 
 `agent_ssh::member_tenant`, mirroring `agent_exec`. Without it a non-member could
@@ -379,6 +388,38 @@ enters: a remote `http://` is read as `https://`, and `ws://` as `wss://`.
   attempt over about eight hours. Production's port 80 answers everything with a 301, and
   a WebSocket client does not follow it. No deployed device could have been connected
   over plaintext, so the rule can only bring such a device back.
+
+**Clipboard, files and audio follow a policy, and the device's own floor survives a
+compromised server** (FR-101 P2, [remote-control.md](remote-control.md) §11.3b). An org
+(`rc-session-policy`) and each device's owner (`rc_clipboard`, `rc_files`, `rc_audio`) can
+each switch a feature to `on`, `ask` or `off`, and the stricter wins.
+- The device's floor can be set over the LocalAPI only from the console, and it is
+  absent from `DesiredConfig`, so no server can switch on what the owner switched off.
+  The agent masks the grant itself, whatever the hub sends: a request carrying `FILES`
+  with no policy, as from a bypassed hub, loses `FILES` on a device set to `off`.
+- The hub strips the refused bits before the request and names each refusal:
+  `features_refused` to the viewer, `features_stripped` in the `session_requested`
+  audit row. The viewer can therefore say whose decision it was.
+- `ask` holds only for a session the person at the device approves on a prompt that
+  names the feature. Every other path drops the feature (`needs_consent`).
+- A tenant row the gate could not read withholds the features (`policy_unavailable`).
+  A database blip must not hand over what an org switched off.
+
+The audit rows FR-101 writes, and who writes each one:
+
+```mermaid
+flowchart LR
+    subgraph hub["hub (the server's decisions)"]
+        REQ["session_requested:<br/>features_stripped, idle_secs"]
+        END["session_ended:<br/>reason, limit (max_duration / idle)"]
+    end
+    subgraph dev["roomlerd (the device's claims)"]
+        TR["clipboard + file tallies<br/>on rc:session.stats"]
+    end
+    REQ --> RA[("remote_audit")]
+    END --> RA
+    TR -->|"kept only for a granted session"| TA[("transfer_activity")]
+```
 
 **Clipboard and file traffic is audited as the device's claim** (FR-101 P3,
 `crates/modules/remote/src/agent_socket.rs`, [remote-control.md](remote-control.md) §11.3a).
