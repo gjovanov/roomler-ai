@@ -32,6 +32,7 @@ pub mod role;
 pub mod room;
 pub mod ssh_activity;
 pub mod ssh_audit;
+pub mod ssh_pending;
 pub mod stats;
 pub mod subscriber;
 pub mod tenant;

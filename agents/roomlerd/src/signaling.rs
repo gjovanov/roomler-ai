@@ -4250,11 +4250,24 @@ async fn handle_server_msg(
             expires_at_ms,
             session_secs,
             consent_mode,
+            via_service,
         } => {
             #[cfg(feature = "ssh-server")]
             {
                 use roomler_ai_remote_control::models::SshGrantRefusal;
-                let refused = if !agent_cfg.ssh_enabled {
+                let refused = if via_service {
+                    // FR-105 — a grant for this device's SYSTEM service must
+                    // never land in the worker's table, where the worker's
+                    // own server would honour it as the signed-in user. This
+                    // build has no ring to the service yet (FR-105 P3) and
+                    // never advertises `ssh-system`, so a server that sent
+                    // one anyway is answered with a refusal.
+                    warn!(
+                        %grant_id, %caller,
+                        "rc:ssh.grant refused — it is for the SYSTEM service, which this build cannot reach"
+                    );
+                    Some(SshGrantRefusal::Other)
+                } else if !agent_cfg.ssh_enabled {
                     warn!(
                         %grant_id, %caller,
                         "rc:ssh.grant refused — ssh_enabled is off on this device"
@@ -4297,6 +4310,7 @@ async fn handle_server_msg(
                     consent_mode,
                     expires_at_ms,
                     session_secs,
+                    via_service,
                 );
                 warn!(
                     %grant_id, %caller,
