@@ -1029,6 +1029,30 @@ pub enum ClientMsg {
         detail: Option<String>,
     },
 
+    /// FR-90 P2g — the device's answer to a [`ServerMsg::HivePurge`], per
+    /// part: its own copy (`store`), and what the session's account held of
+    /// it (`account`). A part `failed` stays pending with `detail`, and the
+    /// purge comes again.
+    ///
+    /// ⚠️ Metadata only, and the field set is locked by test. Each part is
+    /// decoded leniently ([`crate::hive::HivePurgePart`]): an unknown word,
+    /// or none, is `failed`, never `done`.
+    #[serde(rename = "rc:hive.purge_ack")]
+    HivePurgeAck {
+        #[serde(with = "oid_hex")]
+        purge_id: ObjectId,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        #[serde(deserialize_with = "crate::hive::purge_part_lenient")]
+        store: crate::hive::HivePurgePart,
+        #[serde(deserialize_with = "crate::hive::purge_part_lenient")]
+        account: crate::hive::HivePurgePart,
+        /// Why a part failed, in a few words. Capped by the device,
+        /// re-clamped on receipt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
     /// FR-90 P0d-2 — the device's answer to [`ServerMsg::HiveViewGrant`]:
     /// whether it will serve this viewer. The server tells the browser to
     /// dial only after an answer without `refused` (FR-83).
@@ -1824,6 +1848,7 @@ impl ClientMsg {
             ClientMsg::HiveReplicaClose { .. } => "rc:hive.replica.close",
             ClientMsg::HivePrepareAck { .. } => "rc:hive.prepare_ack",
             ClientMsg::HiveDrained { .. } => "rc:hive.drained",
+            ClientMsg::HivePurgeAck { .. } => "rc:hive.purge_ack",
             ClientMsg::HiveViewGrantAck { .. } => "rc:hive.view.grant_ack",
             ClientMsg::HiveViewAnswer { .. } => "rc:hive.view.answer",
             ClientMsg::HiveViewIce { .. } => "rc:hive.view.ice",
@@ -1930,6 +1955,7 @@ impl ClientMsg {
             | ClientMsg::HiveReplicaClose { .. }
             | ClientMsg::HivePrepareAck { .. }
             | ClientMsg::HiveDrained { .. }
+            | ClientMsg::HivePurgeAck { .. }
             | ClientMsg::HiveViewGrantAck { .. }
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
@@ -1972,6 +1998,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:hive.replica.close", Owner::Hive),
     ("rc:hive.prepare_ack", Owner::Hive),
     ("rc:hive.drained", Owner::Hive),
+    ("rc:hive.purge_ack", Owner::Hive),
     ("rc:hive.view.grant_ack", Owner::Hive),
     ("rc:hive.view.answer", Owner::Hive),
     ("rc:hive.view.ice", Owner::Hive),
@@ -3364,6 +3391,28 @@ pub enum ServerMsg {
         /// a session held elsewhere), `promoted` (it moved to another device).
         #[serde(default)]
         reason: String,
+    },
+
+    /// FR-90 P2g — purge the session from this device: a run of it here
+    /// stops first; then the daemon's own copy goes (its events, index,
+    /// tips, blobs and membership, its runtime directory, what the device
+    /// hosts and adopts of it), and, as the session's account, its state
+    /// directory and the refs and index its checkpoints left in the folder's
+    /// repository: never the person's working tree. What is deleted is this
+    /// device's own record of the session, never this frame's word. The
+    /// device keeps the session's id and refuses any join, start or event for
+    /// it afterwards. Answered [`ClientMsg::HivePurgeAck`], per part;
+    /// idempotent by `purge_id`, so a re-send after a failed part retries it.
+    /// Pushed only to a connection advertising
+    /// [`crate::models::RpcCap::HivePurge`].
+    ///
+    /// ⚠️ Metadata only, and the field set is locked by test.
+    #[serde(rename = "rc:hive.purge")]
+    HivePurge {
+        #[serde(with = "oid_hex")]
+        purge_id: ObjectId,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
     },
 
     /// FR-90 P2e-3 — a promotion's first step, to the member the session
@@ -5183,6 +5232,53 @@ mod tests {
         assert!(matches!(
             serde_json::from_value::<ServerMsg>(v).unwrap(),
             ServerMsg::HiveMove { earlier, .. } if earlier.len() == 1
+        ));
+    }
+
+    /// FR-90 P2g — the purge and its acknowledgement: ids and words only, the
+    /// field sets locked; a part's unknown word, or none, is `failed`, so a
+    /// newer device's answer never completes a purge it did not do.
+    #[test]
+    fn hive_purge_frames_wire_shape_is_locked() {
+        use crate::hive::HivePurgePart;
+
+        let (purge, sid) = (ObjectId::new(), ObjectId::new());
+        let order = ServerMsg::HivePurge {
+            purge_id: purge,
+            session_id: sid,
+        };
+        assert_eq!(
+            serde_json::to_value(&order).unwrap(),
+            serde_json::json!({"t": "rc:hive.purge", "purge_id": purge.to_hex(),
+                               "session_id": sid.to_hex()})
+        );
+        let ack = ClientMsg::HivePurgeAck {
+            purge_id: purge,
+            session_id: sid,
+            store: HivePurgePart::Done,
+            account: HivePurgePart::Failed,
+            detail: Some("the account is not signed in".into()),
+        };
+        let v = serde_json::to_value(&ack).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"t": "rc:hive.purge_ack", "purge_id": purge.to_hex(),
+                               "session_id": sid.to_hex(), "store": "done",
+                               "account": "failed",
+                               "detail": "the account is not signed in"})
+        );
+        assert_eq!(ack.namespace(), Owner::Hive);
+        // A word this build does not know, or none at all: failed.
+        let newer = serde_json::json!({"t": "rc:hive.purge_ack", "purge_id": purge.to_hex(),
+                                       "session_id": sid.to_hex(), "store": "shredded",
+                                       "account": null});
+        assert!(matches!(
+            serde_json::from_value::<ClientMsg>(newer).unwrap(),
+            ClientMsg::HivePurgeAck {
+                store: HivePurgePart::Failed,
+                account: HivePurgePart::Failed,
+                ..
+            }
         ));
     }
 
