@@ -175,6 +175,12 @@
           <p><strong>Issuer:</strong> <span id="token-issuer">–</span></p>
           <p><strong>Token type:</strong> <span id="token-type">–</span></p>
           <p><strong>Expires:</strong> <span id="token-expiry">–</span></p>
+          <p id="token-anchor-yes" hidden><strong>Also anchors this device for SYSTEM
+            exec.</strong> After enrolling, Windows asks for administrator approval a second
+            time, so commands from the dashboard can run as SYSTEM here.</p>
+          <p id="token-anchor-no" class="muted" hidden>This token could also anchor the
+            device for SYSTEM exec, but this install type has no SYSTEM service; it is
+            only used to enroll.</p>
         </div>
         <div id="token-warn-audience" class="warning" hidden>
           This is not a tunnel-enrollment token (token type is
@@ -272,6 +278,14 @@
       <div id="done-path-note" class="info" hidden>
         The <code>roomler</code> CLI is on your PATH after you open a new
         shell. If it isn't found, run it directly via the path above.
+      </div>
+
+      <div id="done-anchor-note" class="warning" hidden>
+        <strong>Not anchored for SYSTEM exec.</strong>
+        <p id="done-anchor-reason"></p>
+        <p>The install itself is complete. To anchor this device later, run this from an
+        elevated shell, with a fresh enrollment token from the dashboard:</p>
+        <pre class="code" id="done-anchor-command"></pre>
       </div>
 
       <div id="done-systemcontext-note" class="info" hidden>
