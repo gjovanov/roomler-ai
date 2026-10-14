@@ -8,7 +8,7 @@ promoted. P2d is decided (operator, 2026-10-12): the portal waits for it. P2d-1,
 automatic where mutter is absent), shipped in **0.4.132** with P2d-2's agent half and P4a; P4b in **0.4.133**; P3c
 in **0.4.134** (2026-10-13). P3d, P5a, P5b (#2145), P3e and P5c are in **0.4.135** (tagged 2026-10-14 from
 `bb6ea90ee`); P5d, P5e (#2183), P5f (#2192) and P5g (#2194) merged after it. Ticked: AC1–AC5,
-AC8, AC9, AC13. The operator approved the
+AC8, AC9, AC13, AC14. The operator approved the
 plan and P0 (the
 lab on zeus, enrolled in the vmtest org: D2, D8). **D1 is decided: split.** Per-user installs go auto, system installs
 stay opt-in until a non-Debian companion ships. D3 waits for P3 · **Owner:** remote desktop (agent + viewer), vmtest (`roomler-ai-deploy`) ·
@@ -652,7 +652,7 @@ bridge for text and images in the lab before deciding.
 | **P9** | docs: a new `docs/wayland.md` (the support matrix — desktop × install × session state × capability, attended vs unattended), `docs/linux-capture.md` refreshed, the lab runbook in `docs/vmtest.md`, a `docs/README.md` row, `README.Debian` | — | — | S |
 | ↳ P9a | `docs/wayland.md`: the support matrix (desktop × install → picture, input, cursor, who is asked, the lock screen, the release each cell was verified on), the session states with their measured recoveries, the viewer's reasons and what to do, choosing an install; its `docs/README.md` row and index node; the `linux-capture.md` row naming §3.1–3.3, §4.8 and §5.3–5.6 | — | ✅ written from the measured record (every number cites a lab run) | S |
 | ↳ P9b | the lifecycle oracle, the idle-cost sampler and the guest lock, out of a working directory on the lab host and into roomler-ai-deploy's `vmtest/lab` (`lifecycle/run.sh` + `body.sh`, `verdict.py`, `said.py`, `timeline.py`, `dims.py`; `measure/idle-cost.sh`; `guest-lock.sh`; roomler-ai-deploy#30); their viewer specs into `ui/e2e`, each aborting `purestat.ai` (as `vmtest-remote.spec.ts` now does too); the runbook in `docs/vmtest.md` | — | ✅ lab: the ported oracle, run from a clean checkout of its branch, passed a lock and an unlock on 0.4.135 (the notice 1.6 s after the lock, the desktop 2.4 s after the unlock), sharing its lock directory with the old copy | S |
-| ↳ P9c | `README.Debian`: what a stock Wayland install does, and the two system keys | — | owed | S |
+| ↳ P9c | `README.Debian`: what a stock Wayland install does, and the two system keys | — | ✅ its stale "Wayland note" (capture X11-only, "the agent will fail at session start") replaced: the user unit captures GNOME (0.4.130, input 0.4.132) and KDE (0.4.132, input 0.4.133) by itself; the system unit with `drm_capture` + `uinput`, and the viewer's words until then; the unit table's capture row and the smoke test's X11-only note corrected | S |
 
 Each phase ships in an agent release (next `0.4.125`; the `ship-it` skill owns the mechanics) and is
 field-verified before the next one depends on it.
@@ -822,11 +822,12 @@ New cells run three times before they are trusted. An entry in `expected-failure
 
   Fleet-wide, the same pipeline backs `admin_orgs`; `stats_tests::desktops_are_counted_by_type_and_arm_per_org_and_fleet_wide`
   covers it. P2b, #2028; step log 43 on #1972.
-- [ ] **AC14** — Docs: `docs/wayland.md`, `docs/linux-capture.md` refreshed with anchors re-verified, the lab
+- [x] **AC14** — Docs: `docs/wayland.md`, `docs/linux-capture.md` refreshed with anchors re-verified, the lab
   runbook, and the `docs/README.md` index row.
-  ⏳ `docs/wayland.md`, its index row and node, and the `linux-capture.md` row (P9a); `linux-capture.md`'s anchors
+  ✅ `docs/wayland.md`, its index row and node, and the `linux-capture.md` row (P9a); `linux-capture.md`'s anchors
   re-verified by name with each phase through P5g. The lab runbook: `docs/vmtest.md` §*The Wayland lab*, and the
-  tooling it documents in roomler-ai-deploy's `vmtest/lab` (P9b). Owed: `README.Debian` (P9c).
+  tooling it documents in roomler-ai-deploy's `vmtest/lab` (P9b). ✅ With P9c's `README.Debian`, every docs item P9
+  named is on master.
 
 ## 8. Open decisions (operator)
 

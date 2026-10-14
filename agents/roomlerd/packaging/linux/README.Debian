@@ -14,7 +14,7 @@ twice and they fight over the same identity.
 
                             | roomler.service | roomlerd.service
   --------------------------+-----------------+------------------
-  screen capture + input    | yes             | no  (needs your X session)
+  screen capture + input    | yes             | opt-in (drm_capture + uinput)
   overlay mesh (roomler0)   | no              | yes (TUN needs CAP_NET_ADMIN)
   unattended self-update    | no              | yes (installing a .deb needs root)
   starts before login       | no              | yes
@@ -31,8 +31,8 @@ Desktop host (systemd --user)
                   --token <paste-enrollment-jwt> \
                   --name "$(hostname)"
 
-  # 3. Optional smoke test — needs an active X11 session; a tty login
-  #    won't capture anything.
+  # 3. Optional smoke test — needs an active graphical session (X11, or
+  #    Wayland since 0.4.130); a tty login won't capture anything.
   RUST_LOG=roomlerd=debug,webrtc=info roomlerd run
 
   systemctl --user daemon-reload
@@ -83,11 +83,31 @@ ROOMLERD_OVERLAY_NETSTACK_SOCKS=<port> for the userspace netstack
 instead: outbound mesh access through a loopback SOCKS5 proxy, no TUN and no
 routes — but other nodes cannot reach services on this host.
 
-Wayland note
-------------
+Wayland
+-------
 
-The current capture backend (scrap) is X11-only. Under Wayland the agent
-will fail at session start. Either log in to an X11 session, or wait for
-the PipeWire portal backend (see docs/remote-control.md).
+Under the user unit, a Wayland session captures itself:
+
+  GNOME   mutter's own screencast, from 0.4.130 (input from 0.4.132). It
+          asks nobody. While the screen is locked GNOME shares nothing, and
+          the viewer says to unlock it at the computer.
+  KDE     the desktop portal, from 0.4.132 (input from 0.4.133). It asks
+  others  the person at the screen once (KDE's "Remote Control" dialog),
+          then remembers the answer.
+
+The system unit captures a desktop, Wayland or X11, only once both of these
+keys are set. They read the screen below the desktop and inject input into
+whatever has focus, the login screen included, so nothing sets them for you:
+
+  sudo roomler config set drm_capture true
+  sudo roomler config set uinput true
+  sudo systemctl restart roomlerd.service
+
+Until then the viewer says "capturing it is switched off on this device" and
+names these two commands. It never shows a black screen or calls a desktop
+host headless.
+
+What each desktop, install and session state gives, and every message the
+viewer can show: docs/wayland.md in the roomler-ai repository.
 
 -- Goran Jovanov <goran.jovanov@gmail.com>  2026
