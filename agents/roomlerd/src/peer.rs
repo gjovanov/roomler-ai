@@ -4980,6 +4980,8 @@ fn media_waiting_payload(wait: crate::capture::OpenWait) -> String {
         WaitFor::Unlock => ("screen_unlock", MEDIA_WAITING_HINT_UNLOCK),
         // FR-93 P3e — a display the compositor switched off (DRM).
         WaitFor::DisplayWake => ("display_wake", MEDIA_WAITING_HINT_WAKE),
+        // FR-93 P5f — this user's session in the background (a user switch).
+        WaitFor::SessionAway => ("session_away", MEDIA_WAITING_HINT_AWAY),
     };
     format!(
         r#"{{"t":"rc:media-waiting","for":"{for_}","waits_ms":{},"hint":"{hint}"}}"#,
@@ -5029,6 +5031,17 @@ const MEDIA_WAITING_HINT_UNLOCK: &str = "This computer's screen is locked. GNOME
 const MEDIA_WAITING_HINT_WAKE: &str = "This computer's display is off: it went to sleep. Moving the \
      mouse or pressing a key wakes it, from this viewer when it controls the computer, or at the \
      computer itself; the picture comes back by itself.";
+
+/// FR-93 P5f — the hint while this user's session is in the background. A
+/// per-user install shares only its own user's session, and it is switched
+/// back at the computer.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+const MEDIA_WAITING_HINT_AWAY: &str = "This computer is showing the login screen or another user's \
+     session. This install shares only its own user's session, so the picture comes back by itself \
+     when that session is on screen again.";
 
 /// FR-93 P2d-2 kill switch `ROOMLERD_MEDIA_WAITING=0`: no `rc:media-waiting`
 /// is sent, and the viewer behaves as before P2d-2. P3e's pumps then keep
@@ -11849,6 +11862,11 @@ mod codec_cap_tests {
         assert_eq!(f, "display_wake");
         assert!(hint.contains("display is off"), "{hint}");
         assert!(hint.contains("wakes it"), "{hint}");
+        // FR-93 P5f — this user's session in the background.
+        let (f, hint, _) = read(WaitFor::SessionAway);
+        assert_eq!(f, "session_away");
+        assert!(hint.contains("another user's"), "{hint}");
+        assert!(hint.contains("comes back by itself"), "{hint}");
     }
 
     /// FR-93 P3e — a capture waiting on its host is told once per wait, told

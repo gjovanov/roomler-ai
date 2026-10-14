@@ -4139,6 +4139,11 @@ describe('FR-93: an agent that says it cannot capture is believed', () => {
     expect(dark.title).toMatch(/display is asleep/)
     expect(dark.status).toBe('waiting for the display to wake')
     expect(dark.showsDeadline).toBe(false)
+    // FR-93 P5f — this user's session in the background (a user switch).
+    const away = mediaWaitingCopy('session_away')
+    expect(away.title).toMatch(/another session/)
+    expect(away.status).toBe("waiting for this user's session to be on screen")
+    expect(away.showsDeadline).toBe(false)
   })
 
   it('a frameless two minutes inside a wait neither probes nor re-creates the session', () => {
