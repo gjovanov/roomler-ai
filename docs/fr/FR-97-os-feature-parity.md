@@ -107,8 +107,8 @@ prevent, and the guard re-asserts it on every tick.
 | N3 | Exit node, serving v4 | 🟡 WinNAT; Home ❌ | ✅ iptables | ❌ | Silent no-op (`nat.rs:353-355`); Home: #2077 | P0b, P1b, P4e |
 | N4 | Exit node, serving v6 | ⛔ WinNAT has no v6 (`nat.rs:245-251`) | ✅ ip6tables | ❌ | — | P1b; Windows: D1 |
 | N5 | Subnet router, serving | 🟡 WinNAT; Home ❌ | ✅ | ❌ | Same no-op; routes still advertised and approvable | P0b, P1b |
-| N6 | MagicDNS OS steer | ✅ NRPT | 🟡 systemd-resolved only (`dns.rs:408-429`) | ❌ (`dns.rs:432-434`) | A TUN-mode Mac resolves names only with the opt-in hosts ladder | P1c, P3h |
-| N7 | Exit DNS steer (no leak) | ✅ NRPT `.` | 🟡 resolved only | ❌ (`dns.rs:588-590`) | Reported honestly as `DNS NOT steered` | P1c, P3h |
+| N6 | MagicDNS OS steer | ✅ NRPT | 🟡 systemd-resolved only (`dns.rs:408-429`) | 🟡 P1c (code; field owed) | A TUN-mode Mac resolves names only with the opt-in hosts ladder. *P1c:* a temporary SCDynamicStore supplemental resolver per utun | P1c, P3h |
+| N7 | Exit DNS steer (no leak) | ✅ NRPT `.` | 🟡 resolved only | 🟡 P1c (code; field owed) | Reported honestly as `DNS NOT steered`. *P1c:* a temporary catch-all key (`SupplementalMatchDomains = [""]`) | P1c, P3h |
 | N8 | Host firewall admits the daemon's inbound UDP | ✅ Defender rule + WFP (`winfw.rs`, `wfp.rs`) | ❌ firewalld / ufw / nft untouched | ❌ ALF untouched | Effect on carriers unmeasured | P3i (evidence first) |
 | N9 | LAN-direct egress pin; own-route repair | ✅ `IP_UNICAST_IF` (`direct.rs:466-507`), `lan_repair.rs` | ❌ | ❌ | The field case was Windows + AnyConnect | §7 (evidence first) |
 | N10 | Per-org TUN (multi-org) | ✅ | ✅ | ❓ | One utun per org in code (`agents/roomlerd/src/overlay.rs:303-316`), never run on a Mac; `roomler org join` still warns it is unsupported (`org_join.rs:561-566`, stale) | P1d |
@@ -377,6 +377,15 @@ crash-safe by construction (unverified; P1c's first task). The fallback for the 
 (honoured by the system resolver, not by `dig`), purged at boot. Keep the existing bound-resolver gate
 (`runtime.rs:2372-2392`): never steer at a `:53` that did not bind.
 
+*Done first, 2026-10-14, on throwaway tart VMs with `scutil` only, before any code (§8):* a temporary key's holder
+SIGKILLed → the key is gone within 1–4 s (two keys in one session: both); the same key without the flag survives its
+writer. With an unreachable resolver as the oracle, a zone key routes exactly its names, and **`[""]` is the
+catch-all** (resolver #1 for every name, a more specific zone still wins). The "service-level override"
+(`OverridePrimary`) did nothing, so it is not used, and with it no routing side effect is possible. No
+`/etc/resolver` fallback is needed. Built that way: one store session per process, owned by a thread (`mod scdns`,
+`dns.rs`), every key added temporary; two `macos_kernel_tests` run it on CI's Mac as root, one of them a regression
+test of the SIGKILL property itself.
+
 ### 3.7 P2 — macOS remote desktop
 
 - **P2a, system audio through ScreenCaptureKit** (`SCStreamConfiguration.capturesAudio`, macOS 13+; the agent's floor
@@ -628,3 +637,4 @@ one depends on it.
 | 2026-10-13 | the same VM, by hand | `route -n add/change/delete -host` on the server's address | 🔴 **P1a as merged (#2122) would refuse in the field.** After `route -n add -host` (rc 0) `netstat -rnW` listed the pin (`UGHS en0`) while `route -n get` still answered with the clone; `route -n change` (rc 0) left the pin unchanged; `route -n delete -host` removed exactly the pin. #2122 read pins back by lookup, so it would refuse every pin for the server and leave each in the table untracked. #2125 reads them from the table, before any release carried #2122 |
 | 2026-10-13 | promote `hosted-20261013-b180d92` | throwaway Linux exits in the vmtest org, without and with iptables | 🟢 **#2108 on prod.** The admin row of the device without iptables reads `os: linux`, `can_be_exit_node: false` and `route_offer_withheld: "iptables cannot use the nat table … so this host cannot forward or NAT for its peers"`, verbatim from the device; the one with iptables reads `os: linux`, offered, approved |
 | 2026-10-13 | released 0.4.134 | a throwaway tart Mac, root daemon, client of the iptables exit; `overlay_exit_node_enabled` also set | 🟢 **AC4, all but DNS.** `active, v6 on, DNS NOT steered`; `0/1` and `128.0/1` on utun4; the server's route a STATIC host route through `192.168.64.1` on en0, and the table pin `UGHS en0`; egress the exit's public address; health 200 through t+110 s. A stale pin staged by hand (delete, then add via `127.0.0.1` on lo0) read back through the uplink 2 s later. After `kill -9`, launchd restarted the daemon and it resumed with the same pins. 🔴 **Two findings.** (a) At t+100 s the exit peer's carrier was rebuilt (a TURN allocation to a relay that was not pinned went out bound to the physical uplink), and egress, and DNS with it (the golden pins a public resolver), stayed down for at least 20 s, until the `kill -9` restart; not yet attributed. (b) The clean stop removed the `/1`s (they die with the TUN) but left the server's pin in the table: N13 holds for clean stops too |
+| 2026-10-14 | — (P1c's first task, before the code) | three throwaway tart VMs from the vmtest golden; `scutil` only, as root | 🟢 **The steer design holds.** A temporary DNS key held by a `scutil` session: SIGKILL the holder and the key is gone (`No such key`) within 1–4 s, both keys of a two-key session within 1–3 s; a key written without the flag survives its writer. With an unreachable resolver (192.0.2.53) as the oracle: the catch-all (`SupplementalMatchDomains = [""]`) made it resolver #1 and `www.apple.com` stopped resolving, then came back after the SIGKILL; a zone key for `apple.com` failed `www.apple.com` while `www.google.com` still resolved, with no search-list entry under `NoSearch = 1`. `OverridePrimary` on a service changed neither the resolver nor the default route. One dead end: a packet-capture oracle missed most lookups, and the outcome oracle replaced it |

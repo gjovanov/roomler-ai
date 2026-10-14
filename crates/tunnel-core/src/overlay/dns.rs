@@ -340,9 +340,10 @@ const DNS_IF_NAME: &str = "roomler0";
 /// OS on that host (the resolver still runs).
 pub struct DnsOsGuard {
     magic_domain: String,
-    /// The Linux link this guard configured (owned so Drop reverts exactly
-    /// what setup touched — never a sibling org's link). Unused on Windows.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// The Linux link (or, FR-97 P1c, the macOS utun) this guard configured
+    /// (owned so Drop reverts exactly what setup touched — never a sibling
+    /// org's link). Unused on Windows.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     link: String,
     active: bool,
 }
@@ -428,7 +429,22 @@ async fn setup_os(resolver_ip: Ipv4Addr, magic_domain: &str, link: &str) -> bool
     a && b
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+/// FR-97 P1c — a supplemental resolver for `<domain>` at our resolver, on the
+/// SCDynamicStore (see [`scdns`]). Per utun, so sibling orgs' zones coexist.
+#[cfg(target_os = "macos")]
+async fn setup_os(resolver_ip: Ipv4Addr, magic_domain: &str, link: &str) -> bool {
+    if !scdns::enabled() {
+        return false;
+    }
+    scdns::set(
+        scdns::split_key(link),
+        vec![resolver_ip.to_string()],
+        vec![magic_domain.to_string()],
+    )
+    .await
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 async fn setup_os(_resolver_ip: Ipv4Addr, _magic_domain: &str, _link: &str) -> bool {
     false
 }
@@ -461,6 +477,8 @@ impl Drop for DnsOsGuard {
                 .args(["revert", &self.link])
                 .output();
         }
+        #[cfg(target_os = "macos")]
+        scdns::remove(&scdns::split_key(&self.link));
         info!(domain = %self.magic_domain, "magicdns: OS split-DNS reverted");
     }
 }
@@ -584,7 +602,24 @@ pub async fn steer_default_dns(target: Ipv4Addr, magic_domain: Option<&str>) -> 
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+/// FR-97 P1c — the catch-all: `SupplementalMatchDomains = [""]` makes our
+/// key resolver #1 for every name, while the MagicDNS zone (more specific)
+/// keeps its own. Field, a tart Mac: pointed at an unreachable address it
+/// stopped `www.apple.com` resolving, and withdrawn it restored it.
+#[cfg(target_os = "macos")]
+pub async fn steer_default_dns(target: Ipv4Addr, _magic_domain: Option<&str>) -> bool {
+    if !scdns::enabled() {
+        return false;
+    }
+    scdns::set(
+        scdns::EXIT_KEY.to_string(),
+        vec![target.to_string()],
+        vec![String::new()],
+    )
+    .await
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 pub async fn steer_default_dns(_target: Ipv4Addr, _magic_domain: Option<&str>) -> bool {
     false
 }
@@ -629,7 +664,15 @@ pub async fn unsteer_default_dns(magic_domain: Option<&str>) -> bool {
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+/// FR-97 P1c — withdraw the catch-all; the MagicDNS zone stays.
+#[cfg(target_os = "macos")]
+pub async fn unsteer_default_dns(_magic_domain: Option<&str>) -> bool {
+    tokio::task::spawn_blocking(|| scdns::remove(scdns::EXIT_KEY))
+        .await
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 pub async fn unsteer_default_dns(_magic_domain: Option<&str>) -> bool {
     false
 }
@@ -663,6 +706,182 @@ pub fn purge_exit_dns() {
         let _ = std::process::Command::new("resolvectl")
             .args(["revert", DNS_IF_NAME])
             .output();
+    }
+    // macOS (FR-97 P1c): nothing to purge. Every key is a TEMPORARY value of
+    // this process's session, so configd removes it when the process ends,
+    // whatever the exit — and a new process starts with none of ours.
+}
+
+/// FR-97 P1c — macOS DNS through the SCDynamicStore, the way a VPN client
+/// publishes it: a `State:/Network/Service/<ours>/DNS` dictionary that
+/// configd merges into the system resolver configuration (`scutil --dns`).
+///
+/// Every key is added as a TEMPORARY value of one session this process holds
+/// for its whole life, so configd removes them when the process ends, however
+/// it ends. Measured on a tart Mac before any of this was written: the holder
+/// of a key SIGKILLed, the key gone within 1–3 s (two keys in one session,
+/// both); a key written without the temporary flag survived its writer. So a
+/// crash cannot leave this host's DNS pointed at a resolver that died with it.
+///
+/// Measured on the same VM, with an unreachable resolver as the oracle:
+/// - `SupplementalMatchDomains = [<zone>]` sends exactly that zone's names to
+///   its servers (`www.apple.com` failed, `www.google.com` still resolved);
+/// - `[""]` sends EVERY name there (it becomes resolver #1), while a more
+///   specific zone keeps its own servers;
+/// - `SupplementalMatchDomainsNoSearch = 1` keeps the zone out of the search
+///   list, as `~zone` does on Linux.
+///
+/// `ROOMLERD_MACOS_DNS_STEER=0` turns all of it off (`roomler status` then
+/// says `DNS NOT steered`, as before).
+#[cfg(target_os = "macos")]
+mod scdns {
+    use std::sync::{OnceLock, mpsc};
+    use std::time::Duration;
+
+    use core_foundation::array::CFArray;
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+    use system_configuration::dynamic_store::{SCDynamicStore, SCDynamicStoreBuilder};
+
+    /// The exit node's catch-all. One per host: one daemon, one exit.
+    pub(super) const EXIT_KEY: &str = "State:/Network/Service/roomler-exit-dns/DNS";
+
+    /// MagicDNS for one overlay adapter (`utunN`), so sibling orgs' zones
+    /// coexist. Only alphanumerics reach the key.
+    pub(super) fn split_key(link: &str) -> String {
+        let link: String = link.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        format!("State:/Network/Service/roomler-dns-{link}/DNS")
+    }
+
+    pub(super) fn enabled() -> bool {
+        crate::env::flag("MACOS_DNS_STEER", true)
+    }
+
+    enum Op {
+        Set {
+            key: String,
+            servers: Vec<String>,
+            domains: Vec<String>,
+            done: mpsc::Sender<bool>,
+        },
+        Remove {
+            key: String,
+            done: mpsc::Sender<bool>,
+        },
+    }
+
+    /// The one session, owned by a thread for the rest of the process (an
+    /// `SCDynamicStore` is not `Send`). `None` when it cannot be opened.
+    fn keeper() -> Option<&'static mpsc::Sender<Op>> {
+        static KEEPER: OnceLock<Option<mpsc::Sender<Op>>> = OnceLock::new();
+        KEEPER
+            .get_or_init(|| {
+                let (tx, rx) = mpsc::channel::<Op>();
+                let (ready, opened) = mpsc::channel::<bool>();
+                std::thread::Builder::new()
+                    .name("roomler-scdns".into())
+                    .spawn(move || {
+                        let Some(store) = SCDynamicStoreBuilder::new("roomlerd").build() else {
+                            let _ = ready.send(false);
+                            return;
+                        };
+                        let _ = ready.send(true);
+                        for op in rx {
+                            match op {
+                                Op::Set {
+                                    key,
+                                    servers,
+                                    domains,
+                                    done,
+                                } => {
+                                    let _ =
+                                        done.send(add_temporary(&store, &key, &servers, &domains));
+                                }
+                                Op::Remove { key, done } => {
+                                    let _ = done.send(store.remove(key.as_str()));
+                                }
+                            }
+                        }
+                    })
+                    .ok()?;
+                opened.recv().ok().filter(|ok| *ok).map(|_| tx)
+            })
+            .as_ref()
+    }
+
+    fn add_temporary(
+        store: &SCDynamicStore,
+        key: &str,
+        servers: &[String],
+        domains: &[String],
+    ) -> bool {
+        let strings = |v: &[String]| -> CFArray<CFString> {
+            CFArray::from_CFTypes(&v.iter().map(|s| CFString::new(s)).collect::<Vec<_>>())
+        };
+        let dict: CFDictionary<CFType, CFType> = CFDictionary::from_CFType_pairs(&[
+            (
+                CFString::new("ServerAddresses").as_CFType(),
+                strings(servers).as_CFType(),
+            ),
+            (
+                CFString::new("SupplementalMatchDomains").as_CFType(),
+                strings(domains).as_CFType(),
+            ),
+            (
+                CFString::new("SupplementalMatchDomainsNoSearch").as_CFType(),
+                CFNumber::from(1).as_CFType(),
+            ),
+        ]);
+        // An ADD refuses a key that exists, so a re-steer replaces ours.
+        store.remove(key);
+        let key = CFString::new(key);
+        // SAFETY: a live session and two live CF objects; configd copies them.
+        unsafe {
+            system_configuration_sys::dynamic_store::SCDynamicStoreAddTemporaryValue(
+                store.as_concrete_TypeRef(),
+                key.as_concrete_TypeRef(),
+                dict.as_concrete_TypeRef() as _,
+            ) != 0
+        }
+    }
+
+    /// Publish `key`; `false` when the session is unavailable or configd
+    /// refused it (not root, say).
+    pub(super) async fn set(key: String, servers: Vec<String>, domains: Vec<String>) -> bool {
+        tokio::task::spawn_blocking(move || {
+            let Some(keeper) = keeper() else {
+                return false;
+            };
+            let (done, answer) = mpsc::channel();
+            keeper
+                .send(Op::Set {
+                    key,
+                    servers,
+                    domains,
+                    done,
+                })
+                .is_ok()
+                && answer.recv_timeout(Duration::from_secs(5)).unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Withdraw `key`. Synchronous, for a `Drop`.
+    pub(super) fn remove(key: &str) -> bool {
+        let Some(keeper) = keeper() else {
+            return false;
+        };
+        let (done, answer) = mpsc::channel();
+        keeper
+            .send(Op::Remove {
+                key: key.to_string(),
+                done,
+            })
+            .is_ok()
+            && answer.recv_timeout(Duration::from_secs(5)).unwrap_or(false)
     }
 }
 
@@ -869,5 +1088,144 @@ mod tests {
              frees — otherwise one momentary conflict is permanent"
         );
         loser.abort();
+    }
+}
+
+/// FR-97 P1c — on a real Mac, as root: CI's `macos_kernel_tests` step runs
+/// these under `sudo` with `ROOMLER_TUN_KERNEL_TEST=1`.
+#[cfg(all(test, target_os = "macos"))]
+mod macos_kernel_tests {
+    use super::scdns;
+    use std::io::Write as _;
+
+    fn scutil_dns() -> String {
+        let out = std::process::Command::new("scutil")
+            .arg("--dns")
+            .output()
+            .expect("scutil --dns");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// `nameserver[0]` of resolver #1 in the main (unscoped) configuration.
+    fn first_resolver(dns: &str) -> Option<String> {
+        dns.lines()
+            .skip_while(|l| !l.starts_with("resolver #1"))
+            .find(|l| l.trim_start().starts_with("nameserver[0]"))
+            .and_then(|l| l.split(':').nth(1))
+            .map(|s| s.trim().to_string())
+    }
+
+    /// configd applies a change within a few seconds (1–4 s measured).
+    async fn within_10s(pred: impl Fn(&str) -> bool) -> bool {
+        for _ in 0..100 {
+            if pred(&scutil_dns()) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    fn kernel_test() -> bool {
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return false;
+        }
+        true
+    }
+
+    /// A split zone and the catch-all reach the system resolver
+    /// configuration, the zone stays out of the search list, and each comes
+    /// out again when it is withdrawn.
+    #[tokio::test]
+    async fn the_split_zone_and_the_catch_all_reach_the_resolver_configuration() {
+        if !kernel_test() {
+            return;
+        }
+        let zone = "roomler-p1c-ci.example";
+        let key = scdns::split_key("utun-ci");
+        assert!(
+            scdns::set(key.clone(), vec!["192.0.2.53".into()], vec![zone.into()]).await,
+            "configd refused the zone"
+        );
+        assert!(
+            within_10s(|d| d.contains(zone) && d.contains("192.0.2.53")).await,
+            "the zone never reached the resolver configuration:\n{}",
+            scutil_dns()
+        );
+        assert!(
+            !scutil_dns()
+                .lines()
+                .any(|l| l.contains("search domain") && l.contains(zone)),
+            "NoSearch ignored: the zone is in the search list"
+        );
+        assert!(scdns::remove(&key));
+        assert!(
+            within_10s(|d| !d.contains(zone)).await,
+            "the zone stayed after it was withdrawn:\n{}",
+            scutil_dns()
+        );
+
+        assert!(
+            scdns::set(
+                scdns::EXIT_KEY.into(),
+                vec!["192.0.2.54".into()],
+                vec![String::new()]
+            )
+            .await,
+            "configd refused the catch-all"
+        );
+        assert!(
+            within_10s(|d| first_resolver(d).as_deref() == Some("192.0.2.54")).await,
+            "the catch-all is not resolver #1:\n{}",
+            scutil_dns()
+        );
+        assert!(scdns::remove(scdns::EXIT_KEY));
+        assert!(
+            within_10s(|d| first_resolver(d).as_deref() != Some("192.0.2.54")).await,
+            "the catch-all stayed after it was withdrawn"
+        );
+    }
+
+    /// The property P1c stands on: configd drops a TEMPORARY key when the
+    /// process holding its session dies by SIGKILL. `scutil` plays the
+    /// daemon (`add … temporary`), so this guards macOS itself — the day it
+    /// stops holding, a crashed daemon would leave the host's DNS on a dead
+    /// resolver, and this is where that should show first.
+    #[tokio::test]
+    async fn a_killed_holder_takes_its_temporary_keys_with_it() {
+        if !kernel_test() {
+            return;
+        }
+        let zone = "roomler-p1c-kill.example";
+        let mut holder = std::process::Command::new("scutil")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("scutil");
+        {
+            let stdin = holder.stdin.as_mut().expect("stdin");
+            write!(
+                stdin,
+                "d.init\nd.add ServerAddresses * 192.0.2.55\n\
+                 d.add SupplementalMatchDomains * {zone}\n\
+                 add State:/Network/Service/roomler-p1c-kill/DNS temporary\n"
+            )
+            .expect("write");
+            stdin.flush().expect("flush");
+        }
+        assert!(
+            within_10s(|d| d.contains(zone)).await,
+            "the holder's key never appeared:\n{}",
+            scutil_dns()
+        );
+        holder.kill().expect("SIGKILL");
+        let _ = holder.wait();
+        assert!(
+            within_10s(|d| !d.contains(zone)).await,
+            "a SIGKILLed session's TEMPORARY key survived:\n{}",
+            scutil_dns()
+        );
     }
 }
