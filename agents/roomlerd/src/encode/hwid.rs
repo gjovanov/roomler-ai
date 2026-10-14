@@ -41,7 +41,11 @@ pub(crate) fn fingerprint() -> Option<String> {
 /// FR-99 — the Windows build number (`CurrentBuildNumber`, e.g. `19041` for
 /// 10 2004), read from the same key the fingerprint reads. `None` when it
 /// cannot be read, which callers treat as "too old for the feature".
-#[cfg(target_os = "windows")]
+///
+/// Gated on the overlay feature because the privacy curtain is its only
+/// caller: in a Windows build without it the function is dead, and CI's
+/// `-D warnings` lanes say so.
+#[cfg(all(target_os = "windows", feature = "viewer-indicator"))]
 pub(crate) fn windows_build() -> Option<u32> {
     win::build_number()
 }
@@ -189,6 +193,7 @@ mod win {
             .then(|| u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
     }
 
+    #[cfg(feature = "viewer-indicator")]
     pub(super) fn build_number() -> Option<u32> {
         let k = open(HKEY_LOCAL_MACHINE, NT_VERSION)?;
         string_value(&k, "CurrentBuildNumber")?.trim().parse().ok()
