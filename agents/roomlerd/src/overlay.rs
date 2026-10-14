@@ -445,7 +445,6 @@ pub async fn maybe_start(
 async fn resolve_server_ips(server_url: &str) -> Vec<std::net::IpAddr> {
     use std::collections::HashSet;
     use std::net::IpAddr;
-    use std::time::Duration;
 
     // Host out of `scheme://host[:port][/path]` (server_url is never a v6 literal).
     let authority = server_url
@@ -463,34 +462,28 @@ async fn resolve_server_ips(server_url: &str) -> Vec<std::net::IpAddr> {
     if host.is_empty() {
         return Vec::new();
     }
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::lookup_host((host, 443u16)),
-    )
-    .await
-    {
-        Ok(Ok(addrs)) => {
-            let ips: Vec<IpAddr> = addrs
-                .map(|s| s.ip())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            info!(
-                %host,
-                count = ips.len(),
-                "overlay exit-node: resolved coordination-server IPs for carrier exemption"
-            );
-            ips
-        }
-        Ok(Err(e)) => {
-            warn!(%host, %e, "overlay exit-node: coordination-server DNS resolve failed; exit routing withholds until exemptions are known");
-            Vec::new()
-        }
-        Err(_) => {
-            warn!(%host, "overlay exit-node: coordination-server DNS resolve timed out; exit routing withholds");
-            Vec::new()
-        }
+    // #2187 — through `ctl_dns`: the control WS resolves the server the same
+    // way, so the exemption pins and the connection agree on the addresses, and
+    // a name resolved before never waits on a dead resolver. A first lookup is
+    // bounded at `ctl_dns::FIRST_LOOKUP_BOUND` (5 s, as before).
+    let ips: Vec<IpAddr> =
+        tunnel_core::ctl_dns::resolve(&tunnel_core::ctl_dns::hostport(host, 443))
+            .await
+            .into_iter()
+            .map(|s| s.ip())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+    if ips.is_empty() {
+        warn!(%host, "overlay exit-node: coordination-server DNS resolve failed; exit routing withholds until exemptions are known");
+        return ips;
     }
+    info!(
+        %host,
+        count = ips.len(),
+        "overlay exit-node: resolved coordination-server IPs for carrier exemption"
+    );
+    ips
 }
 
 /// This org's loopback SOCKS5 port for **netstack mode**. `None` (the
