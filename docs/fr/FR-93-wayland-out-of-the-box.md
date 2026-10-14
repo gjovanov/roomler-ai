@@ -7,11 +7,11 @@ promoted. P2d is decided (operator, 2026-10-12): the portal waits for it. P2d-1,
 **0.4.131**; P2d-2, the viewer half, is lab-verified on prod's viewer (2026-10-13). P2d-3, the flip (the portal
 automatic where mutter is absent), shipped in **0.4.132** with P2d-2's agent half and P4a; P4b in **0.4.133**; P3c
 in **0.4.134** (2026-10-13). P3d, P5a, P5b (#2145), P3e and P5c are in **0.4.135** (tagged 2026-10-14 from
-`bb6ea90ee`); P5d, P5e (#2183), P5f (#2192), P5g (#2194) and P1a (#2210, the kill switch covers the
-input-reach warning, AC11) merged after it, and so did P3h and P2d-4 (#2218, AC6's three refusals with no
-reason) and P6a + P6b (#2223, AC10's prompt). P6c (the desktop's own stop control ends the session) is
-lab-verified.
-Ticked: AC1–AC5, AC8, AC9, AC13, AC14. The operator approved the
+`bb6ea90ee`). P5d, P5e (#2183), P5f (#2192), P5g (#2194), P1a (#2210, the kill switch covers the input-reach
+warning, AC11), P3h and P2d-4 (#2218, AC6's three refusals with no reason) are in **0.4.136** (released
+2026-10-14 from `c329429fd`), field-verified on it (step log 80). P6a + P6b (#2223, AC10's prompt) and P6c (#2233,
+the desktop's own stop control ends the session) merged after it.
+Ticked: AC1–AC6, AC8, AC9, AC13, AC14. The operator approved the
 plan and P0 (the
 lab on zeus, enrolled in the vmtest org: D2, D8). **D1 is decided: split.** Per-user installs go auto, system installs
 stay opt-in until a non-Debian companion ships. D3 waits for P3 · **Owner:** remote desktop (agent + viewer), vmtest (`roomler-ai-deploy`) ·
@@ -791,8 +791,21 @@ New cells run three times before they are trusted. An entry in `expected-failure
   per-user on the released 0.4.133 (the automatic portal's RemoteDesktop session, restored from its token): 90 and
   90, then 0. The same check read no arrow in the DRM stream on 0.4.132, so it can fail. The real GPU is AC12's
   (Asahi passes AC5 there).
-- [ ] **AC6** — every refusal names its reason in the viewer; no black stream, no "headless" for a seat with a
+- [x] **AC6** — every refusal names its reason in the viewer; no black stream, no "headless" for a seat with a
   session. Each refusal row shown red on 0.4.124 first.
+  ✅ **Every row named on a released build** (step log 80): the rows below on 0.4.135, and the four that waited
+  for P2d-4, P3h, P5f and P5g on **0.4.136**. These are per-user GNOME with the release's `.deb`, and per-user
+  KDE with the release's own binary:
+  - the person at the screen declines both dialogs: *"…the desktop portal did not share the screen: the person
+    at the screen declined the request"*;
+  - KDE's portal backend masked: *"…the portal ended the request on its own: its backend
+    (xdg-desktop-portal-kde, -gnome) may be stopped; restart it, then xdg-desktop-portal"*;
+  - a per-user daemon with `drm_capture` set: *"…reading the scanout needs CAP_SYS_ADMIN (root), which this
+    daemon lacks: on a per-user install run roomler config clear drm_capture"*, held for the whole session, with
+    no re-create loop;
+  - a user switch: *"This computer is showing another session…"* 4.3 s after it.
+
+  R1 and R8 named their reasons again on 0.4.136, and the system rows R2 and R7 on 0.4.135.
   ⏳ **The sweep** (step log 77). Every arm was switched by a unit drop-in's environment, never by editing a config.
   The reds are the lab's stock snapshots, 0.4.125 (GNOME) and 0.4.126 (KDE). P1 first shipped in 0.4.127, and
   nothing in between changed how a refusal is classified, so these run 0.4.124's code. They were recorded in step
@@ -817,8 +830,7 @@ New cells run three times before they are trusted. An entry in `expected-failure
     after 3 attempts"* → ✅ P3h, *"…reading the scanout needs CAP_SYS_ADMIN (root)… run roomler config clear
     drm_capture"*.
 
-  A user switch is P5f and P5g, unreleased (red on 0.4.135, step log 74). Owed: the release that carries P2d-4,
-  P3h, P5f and P5g, with those rows run on it.
+  A user switch is P5f and P5g: red on 0.4.135 (step log 74), and named on 0.4.136 (above).
 - [ ] **AC7** — lifecycle (§4.6): each event recovers within 10 s or names its reason.
   ⏳ Measured first on the releases (step log 66, §4.6): DRM passes every event but the idle blank (the last
   frame, no reason); mutter freezes at a lock for good (#2145), and its daemon did not come back after a logout and
@@ -848,7 +860,16 @@ New cells run three times before they are trusted. An entry in `expected-failure
   (the viewer said so while it was up), then every row from the restore token: the lock streams the lock screen (a
   new picture 1.5 s in, 0.9 s after the unlock), a resolution change renegotiates in place (the new size 1.1 s and
   1.2 s after each switch), and KDE's own logout and login (*Reconnecting* 3.4 s in, a picture 11.7 s after the
-  login). Owed: suspend (the lab guests have suspend-to-RAM off), and a release carrying P5d–P5g.
+  login). **On the released 0.4.136** (step log 80):
+  - per-user GNOME:
+    - a user switch: the notice 4.3 s after it, live 0.4 s after the switch back (P5f);
+    - a session opened during a switch: `session_away` at connect, a picture 2.1 s after the switch back (P5g);
+    - GNOME's own *Switch User*: the unlock notice 1.4 s in, live after the unlock (P5g);
+    - a still desktop: a picture from the first sample (P5e);
+    - GNOME's shell crash and the login: a picture 3.4 s after the login (P5e);
+  - per-user KDE: a KWin crash, a new picture 4.2 s after it, restored from the token (P5d).
+
+  Owed: suspend (the lab guests have suspend-to-RAM off).
 - [x] **AC8** — an idle DRM session's CPU, measured before and after, within 2× of FR-29's X11 figure.
   ✅ in the lab on P3d (`cac2d7c43`): the GNOME 50 system guest, an idle desktop on the viewer's default path,
   every `roomlerd` process's CPU over two 60 s windows. **57.9 %** of a core on the released 0.4.133, **5.5 % and
@@ -906,7 +927,11 @@ New cells run three times before they are trusted. An entry in `expected-failure
     interactive and did nothing.
   - `rc:video-info`'s `capture_arm` is absent from Windows and macOS agents, so the viewer names no arm there.
 
-  Owed: FR-29's idle numbers on an X11 host, and a Windows and a macOS session on a release that carries P1a.
+  ✅ **The kill switch on the released 0.4.136** (step log 80; per-user GNOME, `ROOMLERD_WAYLAND_AUTO=0` and
+  `ROOMLERD_WAYLAND_AWARE=0` through a unit drop-in): `backend=scrap`, black, no reason, as 0.4.124, and no
+  input-reach warning (0 of 50 samples, where 0.4.135 sent one in 59 of 60).
+
+  Owed: FR-29's idle numbers on an X11 host, and a Windows and a macOS session on 0.4.136, which carries P1a.
 - [ ] **AC12** — Asahi (real scanout) passes AC1/AC4/AC5/AC7 on the released build.
 - [x] **AC13** — the server reports how many Linux hosts are Wayland and which arm serves each.
   ✅ Prod (`hosted-20261012-d31e3c7`) reports the vmtest org's overview from hellos sent by released
@@ -1013,6 +1038,8 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-14 | `wlab-kde` (per-user, the automatic portal) | P6a + P6b `428efdc83` (master's P5d frame loop); the guest's binary put back after | AC10 observation: End in KDE's screen-sharing tray menu (the tray icon, then *End*) during a session | 🔴 End at 22:01:11Z; at 22:01:14Z a new portal capture (`capture: backend=portal, AUTOMATIC`) restored from the token with no dialog, and the pump's heartbeats kept counting frames. On 0.4.135, before P5d, End froze the viewer instead. P6c |
 | 2026-10-14 | `wlab-gnome` (per-user, mutter, consent off) | P6c `3cf441886` (the release's binary kept aside and put back after, its checksum checked) | P6c: the lifecycle oracle (no probe window), `gnome-stop:40`, then `lock:30 unlock:30` | ✅ Stop clicked at 22:43:11Z. At 22:43:12 the helper logged *"mutter closed the session: the person at the screen stopped the share with the desktop's own control"*, and the pump *"ending the session as their Disconnect does, the capture not reopened"*. The kill arm told the server `host_disconnect` 0.1 ms later, and the server's echo came back `HostDisconnect`. The viewer dropped (`disconnected`) 1.1 s after the click, with no new picture and no reconnect in the next 40 s. The guest's screen 5 s after: no screen-sharing pill. ✅ The lock (P5b unchanged): *"mutter closed the session: the screen is locked"*, exit 3, a rebuild, and *"waiting for the unlock"*. The unlock notice reached the viewer 1.6 s after the lock; 1.8 s after the unlock the capture reopened and the notice cleared, with the session kept |
 | 2026-10-14 | `wlab-kde` (per-user, the automatic portal) | P6c `3cf441886` (the guest's own binary kept aside and put back after, its checksum checked) | P6c: the lifecycle oracle, `kde-end:40` with no probe window, then `kwin-crash:40` without the probe and again with it | ✅ End clicked at 22:48:02Z (the tray icon, then *End*). At 22:48:04 the helper logged *"the desktop portal closed the session: the person at the screen stopped the share with the desktop's own control"*, then came the pump's P6c line, `host_disconnect` 0.5 ms later, and the server's echo `HostDisconnect`. The viewer dropped 2.2 s after the click, with no new picture and no reconnect in the next 40 s. The guest's screen 5 s after: KDE's screen-sharing tray icon gone (the red run's shot during a share has it). ✅ A KWin crash (`kill -9 kwin_wayland`) is still P5d's: no portal `Closed` was logged, the helper exited 4 (the stream ended), the reopen restored from the token 0.6 s later, and the session was kept. With the probe, the oracle's verdict was PASS, a new picture **4.2 s** after the crash (P5d's own measurement: 4.0 s). Without the probe it read FAIL, because it cannot call a still desktop's picture new; the journal shows the same reopen |
+| 2026-10-14 | `wlab-gnome` (per-user, mutter) | **0.4.136, the release** (its `.deb`, sha256 and signature checked, `dpkg -V` clean; left installed) | AC6, AC7 and AC11 on a release: a user switch; a session opened during one (`LC_PRE=switch-user`); GNOME's *Switch User*; a still desktop (no probe); the shell crash and the login; the kill switch (a unit drop-in); AC6's per-user rows R1, R8 and R9 | ✅ The switch: the notice 4.3 s after it, live 0.4 s after the switch back. ✅ A session opened during a switch: `session_away` at connect, a picture 2.1 s after the switch back. The oracle's FAIL there times the pre-event's window from before the viewer existed. ✅ *Switch User*: the unlock notice 1.4 s in, live after the unlock. ✅ A still desktop: a picture from the first sample. ✅ The shell crash: *Reconnecting* at +1.0 s, a picture 3.4 s after the login. ✅ The kill switch: `backend=scrap`, black, and 0 of 50 samples with a reach warning. ✅ R1: `wayland_not_enabled` and its hint. R8: the picture and the input warning. R9: *"…reading the scanout needs CAP_SYS_ADMIN (root)…"* for the whole session, with no re-create loop (0.4.135 re-created the session 3 times). R2 and R7 (`wlab-gnome-sys`, on its 0.4.135) unchanged |
+| 2026-10-14 | `wlab-kde` (per-user, the automatic portal) | **0.4.136, the release's own binary** (from its tarball, sha256 and signature checked) swapped in; the guest's own binary (another session's) put back after, its checksum checked | AC6 / P2d-4: the restore tokens set aside, the person at the screen declines KDE's *Remote Control* dialog and then closes the screen-only picker; then KDE's portal backend masked. AC7 / P5d: a KWin crash, with the probe | ✅ Declined: *"…the desktop portal did not share the screen: the person at the screen declined the request"* 25 s into the session. The journal: the input session declined, a retry capture-only, declined again. ✅ Masked: *"…the portal ended the request on its own: its backend (xdg-desktop-portal-kde, -gnome) may be stopped; restart it, then xdg-desktop-portal"*. ✅ The KWin crash: a new picture 4.2 s after it, restored from the token. ⚠️ The first crash run overlapped the refusal rows' viewers, each of which holds its session for about 200 s. It never got a picture, and it was re-run alone |
 
 ## 12. Related
 
