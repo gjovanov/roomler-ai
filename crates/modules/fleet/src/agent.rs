@@ -410,7 +410,20 @@ pub async fn self_renew(
         agent.agent.token_gen,
         Some(ttl),
     )?;
-    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(ttl as i64)).to_rfc3339();
+    let expires = chrono::Utc::now() + chrono::Duration::seconds(ttl as i64);
+    let expires_at = expires.to_rfc3339();
+    // The device list's "credential expires" follows the renewal now, not the
+    // next connect: the device keeps its socket and presents this token only
+    // when it reconnects, which can be weeks away. That connect stamps what it
+    // actually presents, so a device that lost this answer is corrected there.
+    // Best-effort, like the connect's stamp.
+    if let Err(e) = state
+        .agents
+        .stamp_token_exp(agent.agent_id, expires.timestamp())
+        .await
+    {
+        tracing::warn!(agent_id = %agent.agent_id, %e, "fr-103: could not record the renewed expiry");
+    }
     tracing::info!(
         tenant_id = %agent.tenant_id, agent_id = %agent.agent_id,
         token_gen = agent.agent.token_gen, %expires_at,
