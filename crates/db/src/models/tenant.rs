@@ -122,9 +122,9 @@ pub struct RcSessionPolicy {
     pub audio: RcFeaturePolicy,
 }
 
-/// FR-101 P4b — how long a remote-desktop session in this org may last.
-/// Nothing set (every row older than the field) is no limit, the behaviour
-/// from before it.
+/// FR-101 P4b — how long a remote-desktop session in this org may last, and
+/// how long it may sit idle. Nothing set (every row older than the fields) is
+/// no limit, the behaviour from before them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RcSessionLimits {
     /// A session ends this many seconds after it started (went live), with
@@ -133,6 +133,14 @@ pub struct RcSessionLimits {
     /// one), so the hub reads whatever is here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_secs: Option<u32>,
+    /// P4b-2 — a session ends after this many seconds with no input from its
+    /// controller and no significant change on the screen, with
+    /// `EndReason::IdleTimeout`. `None` = no idle limit. Measured and enforced
+    /// by the AGENT, the one party that sees both; the device's own
+    /// `AccessPolicy::auto_terminate_idle_minutes` may set a shorter one. The
+    /// same range and the same leniency as [`Self::max_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -532,8 +540,10 @@ mod rc_session_tests {
         let s: TenantSettings = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(s.rc_limits, RcSessionLimits::default());
         assert_eq!(s.rc_limits.max_secs, None);
+        assert_eq!(s.rc_limits.idle_secs, None);
         let set = RcSessionLimits {
             max_secs: Some(7200),
+            idle_secs: None,
         };
         let v = serde_json::to_value(set).unwrap();
         assert_eq!(v, serde_json::json!({"max_secs": 7200}));
@@ -541,6 +551,26 @@ mod rc_session_tests {
         assert_eq!(
             serde_json::to_value(RcSessionLimits::default()).unwrap(),
             serde_json::json!({})
+        );
+    }
+
+    /// P4b-2 — a row written before the idle limit existed (one carrying only
+    /// `max_secs`) has no idle limit, and the two limits stay independent.
+    #[test]
+    fn the_idle_limit_is_its_own_field() {
+        let old: RcSessionLimits =
+            serde_json::from_value(serde_json::json!({"max_secs": 3600})).unwrap();
+        assert_eq!(old.max_secs, Some(3600));
+        assert_eq!(old.idle_secs, None);
+        let idle_only = RcSessionLimits {
+            max_secs: None,
+            idle_secs: Some(900),
+        };
+        let v = serde_json::to_value(idle_only).unwrap();
+        assert_eq!(v, serde_json::json!({"idle_secs": 900}));
+        assert_eq!(
+            serde_json::from_value::<RcSessionLimits>(v).unwrap(),
+            idle_only
         );
     }
 }
