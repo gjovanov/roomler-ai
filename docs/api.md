@@ -179,6 +179,9 @@ before the search runs, so `q` cannot probe them.
 | GET | `/api/admin/stats/usage` · `/usage/{user_id}` | Per-user usage across every org |
 | GET | `/api/admin/stats/attribution` | FR-88: sign-ups by campaign key and how many activated — counts only |
 | GET/PUT | `/api/admin/growth/exclusions` | FR-102 P1c: the orgs and people no growth number counts — the implicit set (platform admins, the orgs they own) marked beside the explicit rows; PUT replaces the explicit list (`{kind: tenant\|user, id, reason}`). 404 also when `growth.enabled = false` |
+| GET | `/api/admin/growth/digest?day=` · `/digests?since=&limit=` | FR-102 P1d: a stored daily digest (the latest when `day` is omitted; dates as RFC 3339 strings), and the list with each day's status and headline ([growth-observability.md](growth-observability.md)) |
+| POST | `/api/admin/growth/digest/run?day=&send=false` | Recompute and overwrite a closed day's sections, through the same claim the scheduler uses (409 while a run of that day is in progress); `send=false` ends `preview`, which the scheduler still claims; mails only with `send=true` AND a day not already `sent` |
+| GET | `/api/admin/growth/digest/preview?day=&include_internal=` | Compute a day live — stores nothing, mails nothing; `include_internal=true` is the raw totals with the exclusion set empty |
 | POST | `/api/admin/overlay-block/reclaim` | Reclaim quarantined overlay address blocks (dry-run by default) |
 | POST/GET | `/api/admin/newsletter/issues` | FR-58: create draft / list issues |
 | PUT/GET | `/api/admin/newsletter/issues/{slug}` | Edit while draft (409 after) / read back |

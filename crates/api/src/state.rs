@@ -417,6 +417,11 @@ impl AppState {
         // singleton per cycle via the same DB-name-scoped claim pattern.
         // No-op task when `stats.enabled=false`.
         crate::stats_rollup::spawn_stats_rollup(state.clone());
+        // FR-102 P1d — the daily growth digest: once the clock passes
+        // `growth.digest_hour_utc`, yesterday's digest is computed, stored
+        // and mailed once (the `growth_digests._id` insert decides which pod).
+        // No-op unless `growth.digest_enabled` (default OFF).
+        crate::growth::digest::spawn_digest_loop(state.clone());
 
         // FR-69 P5a — the inverse edges (D6). Each mounted module registers
         // its hooks (since P7a that includes the network steps of the agent

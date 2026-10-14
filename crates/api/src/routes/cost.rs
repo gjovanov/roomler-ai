@@ -61,6 +61,14 @@ fn cost_of(meter: &str, total: f64, c: &RelayCosts) -> Option<f64> {
     }
 }
 
+/// The list-price MRR ESTIMATE for one org: `Plan::price_monthly_cents` ×
+/// seats. The one formula — the cost view and FR-102's digest both read
+/// it, so neither can drift into "billed" by accident. It ignores
+/// discounts, annual terms, trials and proration (see the module docs).
+pub(crate) fn mrr_estimate_cents(plan: &Plan, seats: f64) -> f64 {
+    f64::from(plan.price_monthly_cents()) * seats
+}
+
 fn f64_of(v: &serde_json::Value, k: &str) -> f64 {
     v.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0)
 }
@@ -171,7 +179,7 @@ pub async fn admin_cost(
             serde_json::from_value(t.get("plan").cloned().unwrap_or(serde_json::Value::Null))
                 .unwrap_or(Plan::Free);
         let seats_n = seats.get(&id).copied().unwrap_or(0.0);
-        let mrr_cents = plan.price_monthly_cents() as f64 * seats_n;
+        let mrr_cents = mrr_estimate_cents(&plan, seats_n);
         // Cost is measured over `range` while MRR is monthly, so subtracting
         // them here would be wrong for every range but 30d. The margin is left
         // to the caller, which knows what it asked for — and `window_secs`
