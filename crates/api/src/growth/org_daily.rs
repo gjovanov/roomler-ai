@@ -62,6 +62,10 @@ pub const BACKFILL_HORIZON_DAYS: i64 = 730;
 /// Days per chunk of a backfill — one set of source reads each.
 pub const CHUNK_DAYS: i64 = 31;
 
+/// The horizon must fit the retention, or the first fill would write days the
+/// TTL immediately reaps. A compile-time invariant, not a runtime assert.
+const _: () = assert!(BACKFILL_HORIZON_DAYS <= RETENTION_DAYS);
+
 const DAY_MS: i64 = 86_400_000;
 
 fn day_start_ms(day: NaiveDate) -> i64 {
@@ -709,7 +713,6 @@ mod tests {
             from,
             d("2026-10-14") - chrono::Duration::days(RETENTION_DAYS)
         );
-        assert!(BACKFILL_HORIZON_DAYS <= RETENTION_DAYS);
     }
 
     #[test]
