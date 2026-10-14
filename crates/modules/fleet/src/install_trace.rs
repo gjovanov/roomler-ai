@@ -16,9 +16,10 @@
 //! devices as well (`agents/roomlerd/src/updater.rs`, `DEFAULT_PROXY_URL`).
 //! Counting it would be exactly the self-host telemetry the product promises
 //! not to collect (`LICENSING.md`, `docs/business-model.md` §6). So is every
-//! other identity the daemon and the CLI present (`roomlerd-*`,
-//! `roomler-agent/`, `roomler-cli/`): [`UaClass::Updater`], whose
-//! [`UaClass::counted`] is `None`, and a fetch with it writes nothing.
+//! other identity of our own — `roomlerd-*`, `roomler-cli/`, the pre-rename
+//! updater's spelling, any product token of ours that is not the wizard:
+//! [`UaClass::Updater`], whose [`UaClass::counted`] is `None`, and a fetch
+//! with it writes nothing.
 //!
 //! The write is spawned and best-effort: an install script must be served
 //! at wire speed whatever the database is doing, and a lost increment is a
@@ -97,27 +98,25 @@ impl UaClass {
     }
 }
 
-/// Identities the daemon and the CLI present, by prefix. `roomlerd`
-/// un-slashed on purpose: it covers `roomlerd/`, `roomlerd-exec-service/`,
-/// `roomlerd-anchor/`, `roomlerd-localapi/`, `roomlerd-ssh-service/`,
-/// `roomlerd-crash-reporter/` — every subsystem, present and future, that
-/// starts with the daemon's name. `roomler-agent/` is the pre-rename
-/// updater, still in the field.
-const NEVER_COUNTED_PREFIXES: [&str; 4] = [
-    "roomlerd",
-    "roomler-agent/",
-    "roomler-cli/",
-    "roomler-token-renewal/",
-];
+/// The one product token that is counted. Every OTHER product token of ours
+/// — `roomlerd/`, `roomlerd-exec-service/`, `roomlerd-anchor/`,
+/// `roomlerd-localapi/`, `roomlerd-ssh-service/`, `roomlerd-crash-reporter/`,
+/// `roomler-cli/`, `roomler-token-renewal/`, the updater's pre-rename
+/// spelling, and whatever a later release adds — is the product's own
+/// machinery and is never counted. Decided by the common prefix, not by a
+/// list, so a new identity of ours is excluded before anyone remembers to
+/// name it here.
+const WIZARD_PREFIX: &str = "roomler-setup/";
+const OWN_PREFIX: &str = "roomler";
 
 /// Pure: the class of a User-Agent value (`None` = no header).
 pub fn classify_user_agent(ua: Option<&str>) -> UaClass {
     let ua = ua.map(str::trim).unwrap_or("");
-    if NEVER_COUNTED_PREFIXES.iter().any(|p| ua.starts_with(p)) {
-        return UaClass::Updater;
-    }
-    if ua.starts_with("roomler-setup/") {
+    if ua.starts_with(WIZARD_PREFIX) {
         return UaClass::Wizard;
+    }
+    if ua.starts_with(OWN_PREFIX) {
+        return UaClass::Updater;
     }
     let lower = ua.to_ascii_lowercase();
     if lower.starts_with("curl/") || lower.starts_with("wget/") {
@@ -248,14 +247,15 @@ mod tests {
     }
 
     /// The rule the product promises: the daemon's own fetches — the updater
-    /// first of all, in its current and its pre-rename spelling, and every
-    /// subsystem that shares the name — and the CLI's, are never counted.
+    /// first of all, every subsystem that shares its name, and any product
+    /// token of ours that is not the wizard (the pre-rename updater's
+    /// spelling and a future identity alike) — and the CLI's, are never
+    /// counted.
     #[test]
     fn the_updater_and_every_daemon_identity_are_never_counted() {
         for ua in [
             "roomlerd/0.4.135",
             "roomlerd/0.3.0-rc.480",
-            "roomler-agent/0.3.0-rc.200",
             "roomlerd-exec-service/0.4.135",
             "roomlerd-anchor/0.4.135",
             "roomlerd-localapi/0.4.135",
@@ -263,6 +263,7 @@ mod tests {
             "roomlerd-crash-reporter/0.4.135",
             "roomler-cli/0.4.135",
             "roomler-token-renewal/0.4.135",
+            "roomler-something-from-a-later-release/0.5.0",
         ] {
             assert_eq!(classify_user_agent(Some(ua)), UaClass::Updater, "{ua}");
             assert_eq!(UaClass::Updater.counted(), None);
