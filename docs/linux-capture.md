@@ -54,10 +54,10 @@ A per-user daemon in its own Wayland session, with no capture key set, runs
 
 | Arm | Reads | Sees a locked screen / the greeter | Asks the person at the screen | Needs | Default | Gate |
 |---|---|---|---|---|---|---|
-| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:2263`) |
-| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **no** — mutter refuses to create *or restore* a screencast while locked | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off**; automatic in a per-user Wayland session with no key where mutter is absent (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:2341`) |
-| **mutter direct** (`portal/mutter.rs`) | the same kind of PipeWire stream, from `org.gnome.Mutter.ScreenCast` | no (a session API) | **no** | GNOME's mutter on the user's session bus; no portal backend required | **off**; automatic in a per-user GNOME Wayland session with no key (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` **and** `ROOMLERD_MUTTER_CAPTURE=1` (`portal/backend.rs:62`) |
-| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:2410`), after the Xwayland guard (`mod.rs:2383`) |
+| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:2268`) |
+| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **no** — mutter refuses to create *or restore* a screencast while locked | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off**; automatic in a per-user Wayland session with no key where mutter is absent (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:2346`) |
+| **mutter direct** (`portal/mutter.rs`) | the same kind of PipeWire stream, from `org.gnome.Mutter.ScreenCast` | no (a session API) | **no** | GNOME's mutter on the user's session bus; no portal backend required | **off**; automatic in a per-user GNOME Wayland session with no key (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` **and** `ROOMLERD_MUTTER_CAPTURE=1` (`portal/backend.rs:70`) |
+| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:2415`), after the Xwayland guard (`mod.rs:2388`) |
 
 Two things about the order are deliberate and worth defending when the next
 backend arrives:
@@ -74,7 +74,7 @@ backend arrives:
   screen). The portal is **attended**: defaulting it on would leave an
   unattended host waiting on a consent dialog nobody will answer — a hang
   dressed up as a feature. Both arms therefore log **loudly** when the operator
-  asked for them and they fell through (`mod.rs:2318`, `mod.rs:2358`), because
+  asked for them and they fell through (`mod.rs:2323`, `mod.rs:2363`), because
   silently serving X11 instead would look like the feature simply not working.
   Since FR-93 that error also travels: it becomes the session's `detail`
   (§1.1). And since FR-93 P2d-3 a per-user daemon in its own Wayland session,
@@ -97,7 +97,7 @@ and a different false thing per install type. Measured on the FR-93 lab
 
 Two changes stop both:
 
-- 🔑 **The Xwayland guard** (`mod.rs:2383`). Before scrap opens, the daemon
+- 🔑 **The Xwayland guard** (`mod.rs:2388`). Before scrap opens, the daemon
   asks the X server named by its `DISPLAY` whether it is Xwayland
   (`x_server_is_xwayland`, `mod.rs:1569`). There are two signals, the same two
   keep busy reads (FR-92): the `XWAYLAND` extension, which Xwayland has carried
@@ -719,9 +719,9 @@ Every portal method returns a `Request` path and answers later as a `Response`
 `:351`, `:376`): arming afterwards is a race the portal wins whenever it
 answers without asking anyone — exactly the restore-token case.
 
-The daemon side is `PortalCapture::open` (`portal/backend.rs:106`). It reads
+The daemon side is `PortalCapture::open` (`portal/backend.rs:114`). It reads
 the handshake under a **120 s deadline** (`HANDSHAKE_DEADLINE`,
-`backend.rs:372`) because a portal `Start` blocks until the dialog is answered
+`backend.rs:623`) because a portal `Start` blocks until the dialog is answered
 and `open_default` runs synchronously on a media-pump worker — an unanswered
 dialog fails the open with *"a consent dialog left unanswered, most likely"*
 and the cascade falls through, instead of parking that worker forever. Frames
@@ -860,7 +860,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`main.rs:5685`): `capture-smoke: portal=<status>
+line an operator can act on (`main.rs:5693`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -888,7 +888,7 @@ time, and `CreateSession` timed out activating `…impl.portal.desktop.gnome`.
 ### 4.6 One request per host, and an open that holds no worker (FR-93 P2d)
 
 An attended open shows the person at the screen a dialog and waits for them for
-up to `HANDSHAKE_DEADLINE` (120 s, `portal/backend.rs:372`). The FR-93 lab ran
+up to `HANDSHAKE_DEADLINE` (120 s, `portal/backend.rs:623`). The FR-93 lab ran
 the portal automatically on KDE and measured what that did with nobody answering:
 
 - **A dialog storm.** The viewer's media watchdog re-creates a session that has
@@ -898,7 +898,7 @@ the portal automatically on KDE and measured what that did with nobody answering
   session already gone, with the sharing indicator on.
 - **A held worker, then a dead daemon.** The pumps called
   `capture::open_default` inline, so each unanswered dialog blocked one runtime
-  worker for the whole wait (`hs_rx.recv_timeout`, `backend.rs:170`). Four of
+  worker for the whole wait (`hs_rx.recv_timeout`, `backend.rs:178`). Four of
   them is every worker of a 4-core host. Measured on the released **0.4.130**
   (the KDE guest, 4 cores, `portal_capture` on, one viewer trying):
   - The viewer's watchdog re-created the session 4 times in 30 s, raising 4
@@ -987,9 +987,9 @@ sequenceDiagram
 |---|---|---|
 | the hook | `capture::open_default_async` takes an `OnOpenWait`, held for the open's blocking thread by `ParkHook`, which clears it on drop, so a pooled thread never carries one into the next open, not even after a panic | `capture/mod.rs` (`ParkHook`, `tell_open_waiting`) |
 | when it fires | a waiter still parked `TELL_AFTER` (2 s) in fires it once, with the **request's** start, so a session that joins a pending request is told that dialog's deadline, not one counted from its own join | `portal/pending.rs` (`Request::wait`, `TELL_AFTER`) |
-| the message | `rc:media-waiting {"for":"person_at_screen","waits_ms":N,"hint":…}`, retried until the control channel takes it, and never past the dialog's own deadline. A duration, not a time of day, so the viewer reads it on its own clock. From P5b `for` says what is waited for, and the hint follows it: the dialog for the screen, the dialog for remote control (P4b's automatic portal, "or to share just their screen"), `screen_unlock`, GNOME's lock screen (§5.3), or (P3e) `display_wake`, a display switched off (§3.3), which a running capture also sends | `peer.rs` (`media_waiting_payload`, `media_waiting_hook`, P3e's `CaptureWait`) |
+| the message | `rc:media-waiting {"for":"person_at_screen","waits_ms":N,"hint":…}`, retried until the control channel takes it, and never past the dialog's own deadline. A duration, not a time of day, so the viewer reads it on its own clock. From P5b `for` says what is waited for, and the hint follows it: the dialog for the screen, the dialog for remote control (P4b's automatic portal, "or to share just their screen"), `screen_unlock`, GNOME's lock screen (§5.3), (P3e) `display_wake`, a display switched off (§3.3), or (P5f) `session_away`, this user's session in the background (§5.6). A running capture sends the last two, after holding its keepalives for a 2 s quiet spell | `peer.rs` (`media_waiting_payload`, `media_waiting_hook`, P3e's `CaptureWait`) |
 | the viewer | the deadline is set at receipt. Until it passes, plus a 10 s grace (`RC_MEDIA_WAITING_GRACE_MS`), the watchdog counts no stall and re-creates nothing. A session that ends while waiting is not dead air | `useRemoteControl.ts` (`agentIsWaiting`, the watchdog tick, `isDeadAir`) |
-| what clears it | the first frame; `rc:media-unavailable` (the wait ended without an answer, and that message says why); a new connect | the same |
+| what clears it | the first frame after the notice: from P5f, only media the watchdog counted from 1 s after the notice arrived (`advanceEndsWait`, `RC_MEDIA_WAITING_SETTLE_MS`), because a frame sent just before the notice on the video channel can be counted just after it; `rc:media-unavailable` (the wait ended without an answer, and that message says why); a new connect | the same |
 | kill switch | `ROOMLERD_MEDIA_WAITING=0` sends nothing, and the viewer behaves as before P2d-2. An older viewer ignores the message (an unknown `t`) | `peer.rs` |
 
 **Measured** on the FR-93 lab's KDE guest, set up as in §4.6 (`portal_capture`
@@ -1308,6 +1308,79 @@ KDE's portal was measured on a still desktop too and showed a picture 0.5 s in
 already (KWin sends more than one frame), so there P5e only sends the first
 frame sooner.
 
+### 5.6 A user switch (FR-93 P5f)
+
+A per-user install captures its own user's session, and nothing else. When
+another session takes the seat (*Switch User*, which puts up the login screen,
+or a second user's desktop), mutter stops drawing the session it left. Nothing
+ends: both of its sessions stay open, and the stream stays *streaming*, so
+§5.4's check sees nothing wrong. Frames just stop, and before P5f the viewer
+kept the owner's last frame for the whole switch with nothing said (measured
+below). The DRM arm reads whatever the seat shows, so a system install followed
+the switch to the login screen (3.3 s) and back (0.4 s) on its own.
+
+There is nothing to reopen, since the picture comes back once the session is
+on screen again. What was missing is the reason, and that is what P5f adds.
+
+```mermaid
+sequenceDiagram
+    participant L as logind
+    participant W as session-watch
+    participant M as mutter
+    participant P as the pump
+    participant V as the viewer
+    Note over M: Switch User: the login screen takes the seat
+    M--xP: no frames (the stream stays streaming)
+    W->>L: this user's seat sessions: Type, Active (every second)
+    L-->>W: wayland, not active
+    P->>P: empty frames, the capture waits for SessionAway: keepalives held
+    Note over P: 2 s with nothing sent (the viewer counted the last frame)
+    P->>V: rc:media-waiting for "session_away" (once)
+    Note over M: the user's session is on screen again
+    W->>L: Type, Active
+    L-->>W: wayland, active
+    M->>P: frames
+    P->>V: frames (the notice clears)
+```
+
+| | what | why |
+|---|---|---|
+| the signal | logind, once a second, on the capture's own `session-watch` thread: this user's sessions on a seat (`ListSessions`), and each one's `Type` and `Active` | the stream cannot tell: it stays *streaming*, and a still desktop sends no frames either |
+| away | at least one graphical session (`wayland` or `x11`) of this user on a seat, and none of them active | a user with none (logged out, a session with no seat, logind not answering) is not away: the capture goes on as before, and a logout is P5a's to recover |
+| the newer evidence | logind's answer is kept with the time its read began, in one word, and "away" counts only when that read began after the capture's last frame | a frame proves the compositor draws this session. On the way back the frames come before the next read, and a still desktop's first empty tick would otherwise tell the controller "away" again just after its picture came back (measured: the notice went, came back, went) |
+| the notice | `rc:media-waiting` with `for: "session_away"`. The pump holds its keepalives from the first empty frame while away, and tells the controller once it has sent nothing for 2 s (`QUIET_BEFORE_TELL`) | the viewer ends a wait at the first watchdog tick (one a second) that counted a frame, and the notice travels on the control channel while the last frames travel on the video one. Told at once, a keepalive sent just before the notice was counted just after it and cleared it, and the viewer re-created the session 10 s later (measured). The same spell guards P3e's `display_wake` |
+| the hold yields | while it holds, the pump yields to the runtime on every empty tick | mutter's frame wait blocks in place and never yields, so a held pump could not be aborted: a viewer that left during the switch left its pump running, the screencast up (GNOME's sharing indicator with it) and the shared pipeline registered, and each reconnect joined that pipeline as a follower of a pump that sent nothing (measured) |
+| the return | nothing reopens: the session's next frame clears the notice, or, on a still desktop, the keepalive the pump sends again once the session is back | mutter draws the session again by itself, and its stream never ended |
+| per-user only | a root daemon has no watcher | its captures are not one user's: the DRM arm reads whatever the seat shows, the login screen included |
+| both PipeWire arms | the watcher is in `PortalCapture`, which the mutter arm and the desktop portal share | only the mutter arm has been measured through a user switch (§6) |
+
+The viewer words the notice by `for` (`mediaWaitingCopy`): *This computer is
+showing another session*, waiting for this user's session to be on screen,
+with no deadline, since nothing ends. An older viewer shows the hint under its
+dialog title.
+
+**Measured** with the lifecycle oracle on the lab's GNOME 50 per-user guest
+(2026-10-14): GDM's login screen for 40 s, then the switch back, with the
+viewer sampled every 500 ms.
+
+| | the switch | the switch back |
+|---|---|---|
+| the P5e build | the owner's last frame for the whole 40 s, nothing said | a new frame 0.7 s after |
+| P5f (`a93932156`), the lab's probe ticking | GDM took the seat 2.7 s after the switch was asked for; the notice 4.3 s after it (told once, 2.0 s after the watch read "away"), held for the whole switch | a new frame 0.5 s after, the notice gone 1.1 s after |
+| the same, a still desktop | the notice at +3.9 s, held | a new frame at +0.4 s, the notice gone at +0.9 s |
+| `ROOMLERD_SESSION_WATCH=0` | the last frame, nothing said, as before | a new frame 0.3 s after |
+
+The quiet spell, the viewer's settle and the hold that yields were found by the
+lab. A build that told at once (`3c5ed08d2`) lost its notice to a keepalive sent
+just before it, and the viewer re-created the session 10 s into the switch. The
+held pump outlived that session, and each reconnect joined its pipeline as a
+follower and got no picture. The first build (`b7d33af1e`) had told at once too,
+and passed the same switch only on the timing of the viewer's tick. With the
+viewer leaving during the switch (the oracle's plan ending while away),
+`3c5ed08d2` still had a portal helper running 47 s and 63 s later, the
+screencast up. `a93932156` had none at 5 s or at 20 s, and the next viewer owned
+a new pipeline and had a live picture in 1.6 s.
+
 ## 6. Where each arm has been proven
 
 | Arm | Host | What was measured |
@@ -1324,6 +1397,7 @@ frame sooner.
 | every arm, a resolution change (FR-93 AC7) | the three guests above | 1280×800 → 1024×768 → 1280×800, the viewer's stream size logged: DRM followed in 1.1 s and 1.2 s, KDE's portal in 1.1 s and 1.6 s, mutter in 4.4 s and 4.5 s with P5c (before it, frozen at the first switch for good, §5.4) |
 | the portal, a KWin crash (FR-93 P5d) | `wlab-kde`, the automatic portal | `kill -9 kwin_wayland` (its wrapper restarts KWin): `the portal's stream ended`, the reopen restored from the token without a dialog, a new picture 4.0 s after the crash. Before P5d, frozen for good, no reason (§4.8) |
 | mutter, a still desktop and a shell crash (FR-93 P5e) | `wlab-gnome`, the lab's probe stopped | a session on a still desktop: the first picture 0.6 s in (before P5e: none until the viewer's mouse moved). GNOME's shell crash then the login: the daemon back with the session (P5a) and a picture 9.6 s after the login (before P5e: none at all) (§5.5) |
+| mutter, a user switch (FR-93 P5f) | `wlab-gnome`, a per-user install | GDM's login screen for 40 s: the notice 3.9–4.3 s after the switch, held for the whole switch; a new frame 0.4–0.5 s after the switch back. A viewer that left during the switch left no helper behind (before the hold yielded, one was still running 63 s later). The P5e build kept the last frame for the whole switch with no reason (§5.6). The DRM arm (`wlab-gnome-sys`, 0.4.134) follows the switch on its own: the login screen in 3.3 s, back in 0.4 s |
 | cascade order | a host with DRM **and** the portal | DRM alone → `backend=drm`; both flags → `backend=drm`; neither → no helper, no dialog |
 | dependency rule | x86_64 and aarch64 builds | `readelf -d`: **0** `DT_NEEDED` entries matching `pipewire`/`libspa`; a live run with the library bind-mounted away still completed the portal handshake |
 
@@ -1343,6 +1417,7 @@ the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/co
 | — | `ROOMLERD_DRM_CURSOR` | **on** | FR-93 P3c (§3.1): the DRM arm reads the cursor plane for the cursor channel. Off = the viewer's own badge for the pointer, as before P3c |
 | — | `ROOMLERD_DRM_IDLE_SKIP` | **on** | FR-93 P3d (§3.2): on a Wayland seat the DRM arm skips a frame nothing changed in. Off = every frame read, converted and encoded, as before P3d |
 | — | `ROOMLERD_DRM_WAKE_WAIT` | **on** | FR-93 P3e (§3.3): a display switched off is told to the controller (`display_wake`) and waited out, by a running session and by an open. Off = the last frame kept alive with no reason, and an open during the blank falls through the cascade, as before P3e |
+| — | `ROOMLERD_SESSION_WATCH` | **on** | FR-93 P5f (§5.6): a per-user capture on the PipeWire arms tells the controller when its user's session is in the background (`session_away`): a user switch, or the login screen. Off = the last frame kept alive with no reason, as before P5f |
 | `uinput` | `ROOMLERD_UINPUT` | off | inject through `/dev/uinput`, below the compositor — the input pair of `drm_capture` on Wayland. Host-global: it injects into whatever has focus, the greeter included |
 | `portal_capture` | `ROOMLERD_PORTAL_CAPTURE` | off | the portal arm (§4). **Attended**: a logged-in user and a consent dialog on first use; tried after DRM, before X11. A per-user daemon in its own Wayland session uses the portal by itself where mutter is absent (§1.2, P2d-3), so there this key only forces it (`true`) or keeps it off (`false`) |
 | `portal_input` | `ROOMLERD_PORTAL_INPUT` | off for a configured arm; **on** for the automatic portal | input through the portal's RemoteDesktop, on the same session. A configured `portal_capture` takes input only with it `true`. The automatic portal (§1.2) asks for remote control unless it is `false` (FR-93 P4b). On GNOME the dialog's own *Allow Remote Interaction* switch must also be flipped. On a configured mutter arm (`mutter_capture`) it means mutter's own RemoteDesktop (§5.2) |
@@ -1396,7 +1471,7 @@ defect — the capture arms only expose it by being knobs.
 
 | File | Owns |
 |---|---|
-| `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default` (`:1882`), `open_default_async` (`:1902`) and the cascade (`open_with` `:2106`); the FR-80 failure classifier (`:1769`); FR-93's verdicts: `linux_no_pixels_code` (`:1486`), `xwayland_verdict` (`:1535`), the Xwayland guard (`:2383`) and its socket-only probe (`x_server_query` `:1644`), the hints (`wayland_hint` `:582`, `wayland_not_enabled_detail` `:1520`); P2's automatic arm: `wayland_plan` (`:697`), `open_auto_mutter` (`:1335`), and P2d-3's `open_auto_portal` (`:1433`) with `auto_portal_unusable` (`:1467`) and P4b's `auto_portal_input` (`:1417`); P3d's Wayland-only idle skip, decided at the DRM open (`:2269`); P5b's and P3e's wait through a state of the host (`open_through_wait` `:1026`, the states `HostWait` `:933`, `GNOME_LOCK` `:951` and `DISPLAY_OFF` `:963`, bounded by `HOST_WAIT_MAX` `:895` and retried by `HOST_WAIT_RETRY` `:914`), a running capture's own wait (`ScreenCapture::waits_for` `:393`), what a parked open waits for (`OpenWait` `:1940`, `WaitFor` `:1952`) the session behind it (`open_has_session` `:2014`; nothing else waits) and how it learns that session left (`open_abandoned` `:2028`) |
+| `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default` (`:1882`), `open_default_async` (`:1902`) and the cascade (`open_with` `:2111`); the FR-80 failure classifier (`:1769`); FR-93's verdicts: `linux_no_pixels_code` (`:1486`), `xwayland_verdict` (`:1535`), the Xwayland guard (`:2388`) and its socket-only probe (`x_server_query` `:1644`), the hints (`wayland_hint` `:582`, `wayland_not_enabled_detail` `:1520`); P2's automatic arm: `wayland_plan` (`:697`), `open_auto_mutter` (`:1335`), and P2d-3's `open_auto_portal` (`:1433`) with `auto_portal_unusable` (`:1467`) and P4b's `auto_portal_input` (`:1417`); P3d's Wayland-only idle skip, decided at the DRM open (`:2274`); P5b's and P3e's wait through a state of the host (`open_through_wait` `:1026`, the states `HostWait` `:933`, `GNOME_LOCK` `:951` and `DISPLAY_OFF` `:963`, bounded by `HOST_WAIT_MAX` `:895` and retried by `HOST_WAIT_RETRY` `:914`), a running capture's own wait (`ScreenCapture::waits_for` `:393`), what a parked open waits for (`OpenWait` `:1940`, `WaitFor` `:1952`) the session behind it (`open_has_session` `:2019`; nothing else waits) and how it learns that session left (`open_abandoned` `:2033`) |
 | `agents/roomlerd/src/desktop_brief.rs` | FR-93 P2b: the hello's `desktop` brief, its `desktop-brief` refresher (`start` `:47`) and the session a controller would see (`seen_session` `:96`); P3d's `seen_is_wayland` (`:34`); `planned_arm`, P4's `planned_input_route` and `arm_facts` live beside the cascade in `capture/mod.rs` (`:780`, `:807`, `:823`) |
 | `agents/roomlerd/src/capture/scrap_backend.rs` · `x11_damage.rs` | the X11 arm and its damage listener |
 | `agents/roomlerd/src/virtual_desktop.rs` | Xvfb + WM + startup apps for `ROOMLERD_VIRTUAL_DESKTOP=1` |
@@ -1409,7 +1484,8 @@ defect — the capture arms only expose it by being knobs.
 | `agents/roomlerd/src/capture/portal/screencast.rs` | the portal handshake (`open` `:264`), `SessionKind`, the `TokenStore` (`:532`) |
 | `agents/roomlerd/src/capture/portal/mutter.rs` | the mutter broker (`open` `:333`, `RecordMonitor` `:404`, `PipeWireStreamAdded` `:419`); FR-93 P4's RemoteDesktop session (`remote_desktop_session` `:486`) and its kill switch (`input_enabled` `:279`); FR-93 P5b: the session's end (`MutterSession::on_closed` `:191`) and GNOME's lock screen (`GnomeLockScreen` `:245`, `is_up` `:253`) |
 | `agents/roomlerd/src/capture/portal/pipewire.rs` · `pod.rs` | `dlopen` (`:307`), `negotiate` (`:1024`), `stream` (`:1174`); FR-93 P5c: the stream's state for its caller (`StreamHandle::state` `:1161`, written by `on_state_changed` `:708`); FR-93 P5e: the frame that settled the format, kept for the caller (`StreamHandle::first` `:1165`); the hand-written SPA PODs |
-| `agents/roomlerd/src/capture/portal/wire.rs` · `backend.rs` | the `RPWF` frame wire; `PortalCapture` (`open` `:102`, `HANDSHAKE_DEADLINE` `:368`) |
+| `agents/roomlerd/src/capture/portal/wire.rs` · `backend.rs` | the `RPWF` frame wire; `PortalCapture` (`open` `:114`, `HANDSHAKE_DEADLINE` `:623`); FR-93 P5f: a per-user capture's watch on its user's session (`watch_session` `:302`, `SESSION_POLL` `:290`), what reads as away (`session_away` `:396`) from logind's answer (`seat_sessions` `:412`), the answer kept with its time (`SessionWatch` `:338`) and outweighed by a newer frame (`away_now` `:384`, the frame's time `:568`), reported by `waits_for` (`:607`), and its kill switch (`session_watch_enabled` `:294`) |
+| `agents/roomlerd/src/peer.rs` | the notice (`media_waiting_payload` `:4991`, `media_waiting_hook` `:5188`); FR-93 P3e/P5f: a running capture's wait in the pumps (`CaptureWait` `:5087`), told after a quiet spell (`QUIET_BEFORE_TELL` `:5108`), and the hold that yields so the pump stays abortable (`:2505`, `:3939`, `:6996`) |
 | `agents/roomlerd/src/capture/portal/input.rs` · `input_route.rs` | FR-45 P4 and FR-93 P4: the helper's `Notify*` mapping (`plan` `:123`, mutter's `mutter_call` `:274`); FR-93 P4b's KDE correction (`for_backend` `:224`) and the awaited portal calls (`Target::delivery` `:348`); the arbiter-side per-event route (`try_route` `:113`) and whose session it feeds (`active` `:97`) |
 | `crates/agent-core/src/config_surface.rs` | the keys in §7 and the descriptions `roomler config` prints (`:1131-1202`) |
-| `agents/roomlerd/src/main.rs` | `capture-smoke` (`capture_smoke_cmd` `:5658`, the portal line `:5685`); the virtual desktop (`maybe_start_virtual_desktop` `:2726`) |
+| `agents/roomlerd/src/main.rs` | `capture-smoke` (`capture_smoke_cmd` `:5666`, the portal line `:5693`); the virtual desktop (`maybe_start_virtual_desktop` `:2734`) |
