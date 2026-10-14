@@ -205,6 +205,14 @@ pub struct AgentSession {
     /// managed, as where the session began. Absent for every other session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_terminal: Option<FromTerminal>,
+    /// FR-90 P2f-5 — every lease move, oldest first: where the session ran
+    /// before and where it ran from the new fence. Old turns keep the paths
+    /// they had, and a moved start is told where they live now
+    /// ([`crate::promote::before_start`]). A move back takes its move's entry
+    /// out: no run started there. Empty for a session never moved since
+    /// P2f-5.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_map: Vec<PathMove>,
 }
 
 /// FR-90 P2f-4b — the asking to make an adopted session a managed one, as
@@ -240,6 +248,17 @@ pub struct FromTerminal {
 pub struct MovedStart {
     pub from: SessionLocation,
     pub by: ObjectId,
+    pub at: DateTime,
+}
+
+/// FR-90 P2f-5 — one lease move, as the path map keeps it: the fence it
+/// started, the place before and the place after (each with no account, which
+/// the device names only at its answer), and when.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PathMove {
+    pub fence: i64,
+    pub from: SessionLocation,
+    pub to: SessionLocation,
     pub at: DateTime,
 }
 
@@ -967,6 +986,7 @@ mod tests {
             moved: None,
             parent: None,
             from_terminal: None,
+            path_map: Vec::new(),
         }
     }
 
@@ -1073,6 +1093,7 @@ mod tests {
             moved: None,
             parent: None,
             from_terminal: None,
+            path_map: Vec::new(),
         };
         let v = serde_json::to_value(SessionView::from(&s)).unwrap();
         assert!(v["created_at"].is_string(), "{v}");
