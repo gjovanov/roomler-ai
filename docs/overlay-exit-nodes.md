@@ -447,6 +447,17 @@ sequenceDiagram
   dies. The reconcile now re-asserts the split-default every time it finds it
   missing (`route_guard::split_default_missing`), as it always did for the v6
   half (`set_v6_exit`), and says so in a WARN.
+- **The daemon's own name lookups follow the exit's DNS steer too.** When the
+  exit's DNS stops answering, every lookup waits out the OS resolver's whole
+  retry schedule. The carrier plane resolves its STUN names inline on the
+  overlay loop, so a network change on such a client stalled the loop for 48 s
+  (`handler ran long … stage="rebuild_direct_plane" ms=48176`, then
+  `no resolvable STUN server`). Every re-pin and carrier sweep waited behind
+  it ([#2187](https://github.com/gjovanov/roomler-ai/issues/2187)). The wait
+  for a STUN name is now bounded at 5 s (`STUN_DNS_TIMEOUT`). A name that
+  resolved before keeps serving its last good answer through the outage,
+  trusted 60 s at a time (`STUN_DNS_STALE_GRACE`). The lookups still go
+  through the steer; only the stall is gone.
 - **Consent** is currently auto-granted on the agent (see the remote-control
   known issues); an exit node forwards for any approved client in its tenant.
 - **Approval requires a re-join.** After the admin toggle, the exit node's
