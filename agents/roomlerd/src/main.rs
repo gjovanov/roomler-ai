@@ -2959,6 +2959,11 @@ async fn run_cmd(
     // healthy host. After the lock, so one daemon does it.
     #[cfg(target_os = "linux")]
     roomlerd::tarball_owner::repair_at_start();
+    // FR-93 P5 (#2144) — a per-user unit enabled before it was wanted by the
+    // graphical session is enabled again, so the next login starts it: it stops
+    // with the session (`PartOf=`), and a user manager that outlives a logout
+    // never reaches `default.target` twice. Per-user only, on its own thread.
+    roomlerd::service::repair_session_wants_at_start();
     let mut cfg = config::load(config_path).context("loading config")?;
 
     // FR-84 D3 — who will relaunch this process if it exits, decided once,
