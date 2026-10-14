@@ -916,6 +916,7 @@ mod tests {
             moved: None,
             parent: None,
             from_terminal: None,
+            path_map: Vec::new(),
         };
         assert_eq!(
             moved_note(&s, &p, "Alice"),

@@ -648,6 +648,7 @@ mod tests {
             moved: None,
             parent: None,
             from_terminal: None,
+            path_map: Vec::new(),
         }
     }
 

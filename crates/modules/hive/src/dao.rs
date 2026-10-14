@@ -18,7 +18,8 @@ use roomler_ai_services::dao::base::{
 
 use crate::model::{
     AgentApproval, AgentSession, FromTerminal, HiveAuditEvent, MemberState, MemberTip, MovedStart,
-    Promotion, PromotionState, ReplicaMember, Replicaset, SessionOrigin, SessionStatus,
+    PathMove, Promotion, PromotionState, ReplicaMember, Replicaset, SessionLocation, SessionOrigin,
+    SessionStatus,
 };
 use crate::placement::MemberRole;
 
@@ -741,11 +742,27 @@ impl AgentSessionDao {
             return Ok(false);
         };
         let (to, from) = (p.to, p.from.device_id);
+        let now = DateTime::now();
         // P2e-6b — the member's start comes from where the session ran.
         let moved = bson::to_bson(&MovedStart {
             from: p.from.clone(),
             by: p.by,
-            at: DateTime::now(),
+            at: now,
+        })?;
+        // P2f-5 — and the path map keeps it, with where it runs from here.
+        let path = bson::to_bson(&PathMove {
+            fence: p.from_fence + 1,
+            from: SessionLocation {
+                account: None,
+                ..p.from.clone()
+            },
+            to: SessionLocation {
+                device_id: to,
+                device_name: p.to_name.clone(),
+                folder: p.folder.clone(),
+                account: None,
+            },
+            at: now,
         })?;
         let opts = mongodb::options::UpdateOptions::builder()
             .array_filters(vec![
@@ -793,10 +810,10 @@ impl AgentSessionDao {
                         "promotion.state": PromotionState::Moving.as_str(),
                         "promotion.deadline": deadline,
                         "moved": moved,
-                        "updated_at": DateTime::now(),
+                        "updated_at": now,
                     },
                     // The fence it supersedes ends at the drained tip.
-                    "$push": { "fences": mark },
+                    "$push": { "fences": mark, "path_map": path },
                     "$unset": {
                         "accepted_at": "",
                         "location.account": "",
@@ -886,6 +903,9 @@ impl AgentSessionDao {
                         "updated_at": DateTime::now(),
                     },
                     "$push": { "fences": mark },
+                    // P2f-5 — the move it undoes started no run there: its
+                    // entry comes out, by its fence.
+                    "$pull": { "path_map": { "fence": p.from_fence + 1 } },
                     "$unset": {
                         "promotion": "",
                         "location.account": "",

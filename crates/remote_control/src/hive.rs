@@ -710,6 +710,15 @@ pub struct HiveForkOf {
     pub harness_session: String,
 }
 
+/// FR-90 P2f-5 — a place a session ran before, as `rc:hive.move` names it:
+/// the device's name and the folder, as the record holds them. Its old turns
+/// keep the paths they had there.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HivePlace {
+    pub device_name: String,
+    pub folder: String,
+}
+
 /// FR-90 P2c-3 — one session a device holds a copy of, in
 /// `rc:hive.replica.manifest`: where its copy ends. Numbers and hashes only.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -939,6 +948,11 @@ pub mod promote_limits {
     /// ⚠️ The server's wait for the target's copy (`hive.promote_join_secs`)
     /// must stay under it, or a join re-sent late is refused `not_prepared`.
     pub const TELEPORT_ADMISSION_SECS: u64 = 30 * 60;
+
+    /// FR-90 P2f-5 — the most earlier places one `rc:hive.move` names, the
+    /// newest, one per folder. The record's path map is bounded by the fence
+    /// marks' bound; this bounds the frame.
+    pub const MAX_EARLIER_PLACES: usize = 16;
 }
 
 /// FR-90 P2e-3 — why a primary did not drain a session, carried in
