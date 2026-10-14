@@ -82,6 +82,7 @@ import {
   friendlyRcError,
   nextDirPath,
   parseControlInbound,
+  idleSecondsLeft,
   layoutSetWireMessage,
   parseAppsListReply,
   parseAppsActionReply,
@@ -2012,6 +2013,35 @@ describe('parseControlInbound', () => {
       reach: { reach: 'some_future_value', reason: '' },
     })
     expect(parseControlInbound('{"t":"rc:input-reach"}')).toBeNull()
+  })
+
+  // FR-101 P4b-2b — the agent's wire shape (session_idle.rs `notice_json`,
+  // locked there): a duration in ms, or null to withdraw.
+  it('parses rc:idle: a countdown, its withdrawal, and nothing else', () => {
+    expect(parseControlInbound('{"t":"rc:idle","ends_in_ms":60000}')).toEqual({
+      kind: 'idle',
+      endsInMs: 60000,
+    })
+    expect(parseControlInbound('{"t":"rc:idle","ends_in_ms":null}')).toEqual({
+      kind: 'idle',
+      endsInMs: null,
+    })
+    for (const bad of [
+      '{"t":"rc:idle"}',
+      '{"t":"rc:idle","ends_in_ms":-5}',
+      '{"t":"rc:idle","ends_in_ms":"60s"}',
+    ]) {
+      expect(parseControlInbound(bad), bad).toBeNull()
+    }
+  })
+
+  it('FR-101 P4b-2b: counts the idle warning down in whole seconds, rounded up, never below zero', () => {
+    expect(idleSecondsLeft(null, 1000)).toBeNull()
+    expect(idleSecondsLeft(61_000, 1000)).toBe(60)
+    expect(idleSecondsLeft(60_500, 1000)).toBe(60)
+    expect(idleSecondsLeft(1_001, 1000)).toBe(1)
+    expect(idleSecondsLeft(1000, 1000)).toBe(0)
+    expect(idleSecondsLeft(500, 1000)).toBe(0)
   })
 
   // FR-93 P2d-2 — the agent's wire shape (peer.rs `media_waiting_payload`,

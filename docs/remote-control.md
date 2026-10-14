@@ -1063,7 +1063,7 @@ things:
 
 | | Maximum length (P4b-1) | Idle limit (P4b-2) |
 |---|---|---|
-| Set by | the org (`rc_limits.max_secs`) | the org (`rc_limits.idle_secs`), shortened by the device's own `AccessPolicy.auto_terminate_idle_minutes` (the shorter wins) |
+| Set by | the org (`rc_limits.max_secs`), on the org settings page | the org (`rc_limits.idle_secs`), on the same page, shortened by the device's own `AccessPolicy.auto_terminate_idle_minutes` ("Idle limit" on its row in the device list; the shorter wins) |
 | Route | `GET`/`PUT /api/tenant/{tid}/rc-session-limits`, a minute to a day, `null` clears | the same route and range; a body naming one limit leaves the other alone |
 | Kept by | the **hub**, from the moment the session goes live | the **device**: only it sees both the controller's input (peer to peer) and the screen |
 | Who it binds | every agent and viewer already deployed | agents that advertise `idle-timeout`; the viewer is told the limit (`rc:session.created.idle_secs`) only for those |
@@ -1083,6 +1083,7 @@ sequenceDiagram
         A->>A: tick (an eighth of the limit, between 0.25 s and 5 s)
     end
     A->>V: rc:idle ends_in_ms (control channel, a fifth of the limit before the end)
+    Note over V: countdown banner; any input sent from here withdraws it
     Note over A: limit reached: the device-end arm, as for the host's Disconnect
     A->>A: peer.stop_serving()
     A->>S: rc:terminate idle_timeout, limit=idle

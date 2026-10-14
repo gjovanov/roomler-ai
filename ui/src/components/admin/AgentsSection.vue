@@ -512,6 +512,21 @@
                 :aria-label="`Input mode for ${item.name}`"
                 @update:model-value="(m) => onInputModeChange(agentFor(item)!, m as 'free' | 'exclusive')"
               />
+              <!-- FR-101 P4b-2b — this device's own idle limit. The shorter of
+                   it and the organization's applies, so it can tighten the
+                   org's but never loosen it; the device keeps it. -->
+              <v-select
+                :model-value="agentFor(item)!.access_policy.auto_terminate_idle_minutes ?? 0"
+                :items="idleMinuteItems(agentFor(item)!.access_policy.auto_terminate_idle_minutes)"
+                density="compact"
+                variant="plain"
+                hide-details
+                :disabled="consentBusy === item.id"
+                class="consent-select"
+                :title="IDLE_LIMIT_HINT"
+                :aria-label="`Idle limit for ${item.name}`"
+                @update:model-value="(m) => onIdleMinutesChange(agentFor(item)!, m as number)"
+              />
               <!-- #1882 — may a session to this device ride the mesh? Off by
                    default: the agent keeps overlay addresses out of its ICE. -->
               <v-checkbox
@@ -795,6 +810,21 @@
               class="mb-2"
               :aria-label="`Input mode for ${a.name}`"
               @update:model-value="(m) => onInputModeChange(a, m as 'free' | 'exclusive')"
+            />
+            <!-- FR-101 P4b-2b — see the desktop table: this device's own idle
+                 limit, which can only shorten the organization's. -->
+            <v-select
+              :model-value="a.access_policy.auto_terminate_idle_minutes ?? 0"
+              :items="idleMinuteItems(a.access_policy.auto_terminate_idle_minutes)"
+              label="Idle limit"
+              density="compact"
+              variant="outlined"
+              hide-details
+              :disabled="consentBusy === a.id"
+              class="mb-2"
+              :title="IDLE_LIMIT_HINT"
+              :aria-label="`Idle limit for ${a.name}`"
+              @update:model-value="(m) => onIdleMinutesChange(a, m as number)"
             />
             <!-- #1882 — see the desktop table: off by default. -->
             <v-checkbox
@@ -1950,6 +1980,45 @@ async function onInputModeChange(a: Agent, mode: 'free' | 'exclusive') {
     await agentStore.updateAccessPolicy(props.tenantId, a.id, {
       ...a.access_policy,
       input_mode: mode,
+    })
+  } catch (e) {
+    agentStore.error = (e as Error).message
+  } finally {
+    consentBusy.value = null
+  }
+}
+
+// FR-101 P4b-2b — this device's own idle limit, in minutes
+// (`AccessPolicy.auto_terminate_idle_minutes`). `0` in the select is "none of
+// its own" (stored as null), so the organization's limit alone applies.
+const IDLE_MINUTE_PRESETS = [5, 15, 30, 60, 120]
+/** The presets, plus a stored value that is none of them (set through the
+ *  API), so the select never shows blank for a limit that is in force. */
+function idleMinuteItems(current: number | null | undefined): { title: string; value: number }[] {
+  const minutes = [...IDLE_MINUTE_PRESETS]
+  if (typeof current === 'number' && current > 0 && !minutes.includes(current)) {
+    minutes.push(current)
+    minutes.sort((a, b) => a - b)
+  }
+  return [
+    { title: 'Idle: org limit only', value: 0 },
+    ...minutes.map((m) => ({ title: `Idle: ${m} min`, value: m })),
+  ]
+}
+const IDLE_LIMIT_HINT =
+  'End a remote-desktop session to this device after this long with no input and no ' +
+  'change on its screen. The shorter of this and the organization’s limit applies, so it ' +
+  'can only tighten the org’s. The device keeps it: an agent that predates it does not. ' +
+  'Applies to the next session.'
+
+async function onIdleMinutesChange(a: Agent, minutes: number) {
+  const next = minutes > 0 ? minutes : null
+  if ((a.access_policy.auto_terminate_idle_minutes ?? null) === next) return
+  consentBusy.value = a.id
+  try {
+    await agentStore.updateAccessPolicy(props.tenantId, a.id, {
+      ...a.access_policy,
+      auto_terminate_idle_minutes: next,
     })
   } catch (e) {
     agentStore.error = (e as Error).message
