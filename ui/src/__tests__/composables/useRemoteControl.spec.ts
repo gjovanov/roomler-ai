@@ -4134,6 +4134,11 @@ describe('FR-93: an agent that says it cannot capture is believed', () => {
     expect(dialog.status).toBe('waiting for the person at the screen')
     expect(dialog.showsDeadline).toBe(true)
     expect(mediaWaitingCopy('something_newer')).toEqual(dialog)
+    // FR-93 P3e — a display switched off: it wakes to input, nothing ends.
+    const dark = mediaWaitingCopy('display_wake')
+    expect(dark.title).toMatch(/display is asleep/)
+    expect(dark.status).toBe('waiting for the display to wake')
+    expect(dark.showsDeadline).toBe(false)
   })
 
   it('a frameless two minutes inside a wait neither probes nor re-creates the session', () => {

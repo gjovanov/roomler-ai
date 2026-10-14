@@ -2405,6 +2405,8 @@ async fn media_pump(
     // a NAL-free heartbeat tied to the wallclock.
     const IDLE_KEEPALIVE: Duration = Duration::from_millis(1_000);
     let mut last_capture_at = std::time::Instant::now();
+    // FR-93 P3e — a capture waiting on its host (a display switched off).
+    let mut capture_wait = CaptureWait::default();
 
     // Observability: count frames in/out and bytes written, log every 30
     // encoded frames (~once per second at 30fps). Without this a silent
@@ -2481,12 +2483,19 @@ async fn media_pump(
                     capture_time_us.saturating_add(capture_started.elapsed().as_micros() as u64);
                 frames_captured += 1;
                 last_capture_at = std::time::Instant::now();
+                capture_wait.on_frame();
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
                 arc
             }
             Ok(None) => {
                 frames_empty += 1;
+                // FR-93 P3e — the display is off: the controller is told, and
+                // no keepalive re-encodes the last frame (a decoded frame
+                // would clear the viewer's notice).
+                if capture_wait.hold(capturer.waits_for(), session_id, &control_dc) {
+                    continue;
+                }
                 // Log every ~5s worth of empty polls so an idle desktop is
                 // visible without flooding. DXGI only fires on screen change,
                 // so this can spike briefly then settle.
@@ -3438,6 +3447,8 @@ async fn media_pump_vp9_444_dc(
     let mut encoder_dims: Option<(u32, u32)> = None;
     let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
+    // FR-93 P3e — a capture waiting on its host (a display switched off).
+    let mut capture_wait = CaptureWait::default();
     // rc.187 stale-frame fix, burst-gated 2026-07-27 (see
     // rate_profile::SettleKeyframeGate): the first idle keepalive after a
     // MOTION BURST settles forces a keyframe so a viewer that dropped frames
@@ -3889,10 +3900,14 @@ async fn media_pump_vp9_444_dc(
             continue;
         }
 
-        let frame: std::sync::Arc<crate::capture::Frame> = match capturer.next_frame().await {
+        // A local first, so `capturer`'s borrow ends before the idle arm asks
+        // it what it waits for (FR-93 P3e).
+        let next_frame = capturer.next_frame().await;
+        let frame: std::sync::Arc<crate::capture::Frame> = match next_frame {
             Ok(Some(f)) => {
                 frames_captured += 1;
                 last_capture_at = std::time::Instant::now();
+                capture_wait.on_frame();
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
                 // Motion continues — the settle gate counts the episode.
@@ -3900,6 +3915,12 @@ async fn media_pump_vp9_444_dc(
                 arc
             }
             Ok(None) => {
+                // FR-93 P3e — the display is off: the controller is told, and
+                // no keepalive re-encodes the last frame (a decoded frame
+                // would clear the viewer's notice).
+                if capture_wait.hold(capturer.waits_for(), session_id, &control_dc) {
+                    continue;
+                }
                 if last_capture_at.elapsed() >= IDLE_KEEPALIVE {
                     if let Some(ref f) = last_good_frame {
                         last_capture_at = std::time::Instant::now();
@@ -4957,6 +4978,8 @@ fn media_waiting_payload(wait: crate::capture::OpenWait) -> String {
         WaitFor::Dialog { control: false } => ("person_at_screen", MEDIA_WAITING_HINT),
         WaitFor::Dialog { control: true } => ("person_at_screen", MEDIA_WAITING_HINT_CONTROL),
         WaitFor::Unlock => ("screen_unlock", MEDIA_WAITING_HINT_UNLOCK),
+        // FR-93 P3e — a display the compositor switched off (DRM).
+        WaitFor::DisplayWake => ("display_wake", MEDIA_WAITING_HINT_WAKE),
     };
     format!(
         r#"{{"t":"rc:media-waiting","for":"{for_}","waits_ms":{},"hint":"{hint}"}}"#,
@@ -4996,11 +5019,108 @@ const MEDIA_WAITING_HINT_UNLOCK: &str = "This computer's screen is locked. GNOME
      at the computer; the picture comes back by itself. A system install with drm_capture and \
      uinput can show and unlock a locked screen.";
 
+/// FR-93 P3e — the hint while the display is off (DRM, a system install).
+/// Input wakes it: the viewer's reaches the host through `uinput`, which the
+/// compositor counts as the person at the screen.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+const MEDIA_WAITING_HINT_WAKE: &str = "This computer's display is off: it went to sleep. Moving the \
+     mouse or pressing a key wakes it, from this viewer when it controls the computer, or at the \
+     computer itself; the picture comes back by itself.";
+
+/// FR-93 P2d-2 kill switch `ROOMLERD_MEDIA_WAITING=0`: no `rc:media-waiting`
+/// is sent, and the viewer behaves as before P2d-2. P3e's pumps then keep
+/// their keepalives through a dark display too, as before P3e: with nothing
+/// said, a viewer that saw no frames would re-create its session every ~10 s.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn media_waiting_enabled() -> bool {
+    tunnel_core::env::flag("MEDIA_WAITING", true)
+}
+
+/// FR-93 P3e — a running capture that waits on its host (a display switched
+/// off). The controller is told once per wait, and again before the last
+/// telling runs out, so the notice outlives a blank of any length; while it
+/// waits the pump sends no keepalive, because the viewer clears its notice at
+/// the first decoded frame and a keepalive would be one.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+#[derive(Default)]
+struct CaptureWait {
+    told: Option<(crate::capture::WaitFor, std::time::Instant)>,
+}
+
+impl CaptureWait {
+    /// How long the controller is told the wait may last. Nothing ends a
+    /// blank on its own, so the viewer shows no deadline for one; it only
+    /// holds its watchdog until then.
+    const TOLD_FOR: Duration = Duration::from_secs(60 * 60);
+    /// A wait still going is told again this often.
+    const RETELL: Duration = Duration::from_secs(30 * 60);
+
+    /// After a "no frame": `None` when the capture waits for nothing (the
+    /// pump goes on as before, keepalive and all); else what it waits for,
+    /// and whether the controller is to be told now.
+    fn on_empty(
+        &mut self,
+        waits: Option<crate::capture::WaitFor>,
+        now: std::time::Instant,
+    ) -> Option<(crate::capture::WaitFor, bool)> {
+        let Some(why) = waits else {
+            self.told = None;
+            return None;
+        };
+        let fresh = matches!(
+            self.told,
+            Some((w, at)) if w == why && now.saturating_duration_since(at) < Self::RETELL
+        );
+        if !fresh {
+            self.told = Some((why, now));
+        }
+        Some((why, !fresh))
+    }
+
+    /// A frame: whatever the capture waited for is over.
+    fn on_frame(&mut self) {
+        self.told = None;
+    }
+
+    /// The pumps' half: on a "no frame", `true` when the capture waits on its
+    /// host and the controller has been told (now or earlier), so no
+    /// keepalive goes out.
+    fn hold(
+        &mut self,
+        waits: Option<crate::capture::WaitFor>,
+        session_id: bson::oid::ObjectId,
+        control_dc: &Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    ) -> bool {
+        if !media_waiting_enabled() {
+            return false;
+        }
+        let Some((why, tell)) = self.on_empty(waits, std::time::Instant::now()) else {
+            return false;
+        };
+        if tell {
+            media_waiting_hook(session_id, control_dc.clone())(crate::capture::OpenWait {
+                gives_up_in: Self::TOLD_FOR,
+                why,
+            });
+        }
+        true
+    }
+}
+
 /// FR-93 P2d-2 — the hook a pump hands its capture open
 /// ([`crate::capture::open_default_async`]): if the open parks on the person at
-/// the screen (a portal dialog, or P5b's locked screen), tell the controller,
-/// retrying until the control channel takes it. `ROOMLERD_MEDIA_WAITING=0`
-/// turns the notice off.
+/// the screen (a portal dialog, P5b's locked screen, P3e's dark display), tell
+/// the controller, retrying until the control channel takes it.
+/// `ROOMLERD_MEDIA_WAITING=0` turns the notice off.
 ///
 /// The hook fires on the blocking pool, so it holds the runtime's handle
 /// rather than relying on a context that thread may not have entered.
@@ -5012,7 +5132,7 @@ fn media_waiting_hook(
     session_id: bson::oid::ObjectId,
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
 ) -> crate::capture::OnOpenWait {
-    if !tunnel_core::env::flag("MEDIA_WAITING", true) {
+    if !media_waiting_enabled() {
         return Box::new(|_| {});
     }
     let runtime = tokio::runtime::Handle::current();
@@ -5025,7 +5145,7 @@ fn media_waiting_hook(
             %session_id,
             gives_up_in_s = wait.gives_up_in.as_secs(),
             why = ?wait.why,
-            "capture: waiting for the person at the screen (a portal dialog, or an unlock); telling the controller"
+            "capture: waiting on the host (a portal dialog, an unlock, a display waking); telling the controller"
         );
         runtime.spawn(async move {
             // Bounded by the wait's own deadline too: past it, the notice
@@ -5542,6 +5662,8 @@ async fn media_pump_ffmpeg_dc(
     // timeBeginPeriod(1) landed but didn't move fps).
     let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
+    // FR-93 P3e — a capture waiting on its host (a display switched off).
+    let mut capture_wait = CaptureWait::default();
     // rc.187 stale-frame fix, burst-gated 2026-07-27 (see
     // rate_profile::SettleKeyframeGate): the FIRST idle keepalive after a
     // MOTION BURST settles forces a keyframe so a viewer that dropped frames
@@ -6760,6 +6882,7 @@ async fn media_pump_ffmpeg_dc(
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
                 last_capture_at = std::time::Instant::now();
+                capture_wait.on_frame();
                 frames_captured += 1;
                 is_real_frame = true;
                 // Motion continues — the settle gate counts the episode.
@@ -6801,6 +6924,12 @@ async fn media_pump_ffmpeg_dc(
                 // Once idle ≥ IDLE_KEEPALIVE, re-encode the last good frame so
                 // the browser decoder doesn't pause.
                 frames_empty += 1;
+                // FR-93 P3e — the display is off: the controller is told, and
+                // no keepalive re-encodes the last frame (a decoded frame
+                // would clear the viewer's notice).
+                if capture_wait.hold(capturer.waits_for(), session_id, &control_dc) {
+                    continue;
+                }
                 if last_capture_at.elapsed() >= IDLE_KEEPALIVE
                     && let Some(ref f) = last_good_frame
                 {
@@ -11715,6 +11844,55 @@ mod codec_cap_tests {
         assert_eq!(f, "screen_unlock");
         assert!(hint.contains("is locked"), "{hint}");
         assert!(hint.contains("unlocked at the computer"), "{hint}");
+        // FR-93 P3e — a display switched off, which input wakes.
+        let (f, hint, _) = read(WaitFor::DisplayWake);
+        assert_eq!(f, "display_wake");
+        assert!(hint.contains("display is off"), "{hint}");
+        assert!(hint.contains("wakes it"), "{hint}");
+    }
+
+    /// FR-93 P3e — a capture waiting on its host is told once per wait, told
+    /// again before the viewer's deadline runs out, and a frame (or a "no
+    /// frame" that waits for nothing) ends the wait, so the next blank is
+    /// told afresh.
+    #[test]
+    fn a_dark_display_is_told_once_and_again_before_the_notice_runs_out() {
+        use super::CaptureWait;
+        use crate::capture::WaitFor::DisplayWake;
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut w = CaptureWait::default();
+        assert_eq!(
+            w.on_empty(None, t0),
+            None,
+            "an idle screen keeps its keepalives"
+        );
+        assert_eq!(w.on_empty(Some(DisplayWake), t0), Some((DisplayWake, true)));
+        assert_eq!(
+            w.on_empty(Some(DisplayWake), t0 + s(1)),
+            Some((DisplayWake, false)),
+            "told once"
+        );
+        assert!(CaptureWait::RETELL < CaptureWait::TOLD_FOR);
+        let later = t0 + CaptureWait::RETELL;
+        assert_eq!(
+            w.on_empty(Some(DisplayWake), later),
+            Some((DisplayWake, true)),
+            "told again before the viewer's deadline"
+        );
+        w.on_frame();
+        assert_eq!(
+            w.on_empty(Some(DisplayWake), later + s(1)),
+            Some((DisplayWake, true)),
+            "a blank after a frame is told afresh"
+        );
+        assert_eq!(w.on_empty(None, later + s(2)), None);
+        assert_eq!(
+            w.on_empty(Some(DisplayWake), later + s(3)),
+            Some((DisplayWake, true)),
+            "and after a no-frame that waited for nothing"
+        );
     }
 
     #[test]

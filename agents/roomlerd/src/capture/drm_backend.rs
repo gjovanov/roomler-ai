@@ -52,7 +52,7 @@ use drm::control::{crtc, framebuffer, plane, property};
 
 use super::drm_cursor::{self, CursorSnapshot, PlaneKind};
 use super::drm_idle::{self, IdleGate};
-use super::{CursorInfo, Damage, DownscalePolicy, Frame, PixelFormat, ScreenCapture};
+use super::{CursorInfo, Damage, DownscalePolicy, Frame, PixelFormat, ScreenCapture, WaitFor};
 
 /// `/dev/dri/cardN` nodes to probe. The kernel numbers these from 0, but the
 /// numbering is NOT stable across kernel upgrades — on the Asahi field host the
@@ -334,6 +334,48 @@ pub fn idle_skip_enabled() -> bool {
     tunnel_core::env::flag("DRM_IDLE_SKIP", true)
 }
 
+/// FR-93 P3e — kill switch `ROOMLERD_DRM_WAKE_WAIT=0`: a display the
+/// compositor switched off reads as it did before P3e. A running session
+/// keeps its last frame alive with no reason given, and an open during the
+/// blank falls through the cascade.
+pub fn wake_wait_enabled() -> bool {
+    tunnel_core::env::flag("DRM_WAKE_WAIT", true)
+}
+
+/// How often a capture whose display is off looks again: no frame period's
+/// worth of ioctls while nothing can change, and a wake seen within a quarter
+/// of a second.
+const DARK_POLL: Duration = Duration::from_millis(250);
+
+/// FR-93 P3e — whether the display is off: a monitor is connected, and no
+/// CRTC drives a mode. Measured on GNOME 50 (2026-10-14): its idle blank
+/// switches the CRTC off (`enable=0 active=0`, every plane `fb=0`), and the
+/// connector stays `connected` with `dpms=Off`. A host with no monitor
+/// connected has no display to wake, so it reads `false` and the cascade goes
+/// on as before. `None` when the device cannot be read.
+fn display_off(card: &Card) -> Option<bool> {
+    let res = card.resource_handles().ok()?;
+    let connected = res.connectors().iter().any(|&c| {
+        card.get_connector(c, false)
+            .is_ok_and(|info| info.state() == drm::control::connector::State::Connected)
+    });
+    if !connected {
+        return Some(false);
+    }
+    let driven = res
+        .crtcs()
+        .iter()
+        .any(|&c| card.get_crtc(c).is_ok_and(|info| info.mode().is_some()));
+    Some(!driven)
+}
+
+/// FR-93 P3e — [`display_off`] on the display node, for an open that waits
+/// for the display to wake. A fresh fd each time: it is asked once a second.
+pub fn display_is_off() -> Option<bool> {
+    let (card, _) = open_display_node().ok()?;
+    display_off(&card)
+}
+
 /// FR-93 P3c — the client caps the cursor plane needs, set after
 /// `UNIVERSAL_PLANES`. `ATOMIC` exposes `CRTC_X/Y`, which are atomic-only
 /// properties. On a paravirtual GPU an atomic client then sees the cursor plane
@@ -552,6 +594,9 @@ enum Grabbed {
     Unchanged,
     /// Nothing is scanned out (a mode change, a blanked panel).
     Nothing,
+    /// FR-93 P3e — nothing is scanned out because the display is off: a
+    /// monitor is connected, and no CRTC drives a mode ([`display_off`]).
+    Dark,
 }
 
 type FrameRequest = oneshot::Sender<WorkerReply>;
@@ -565,6 +610,8 @@ pub struct DrmCapture {
     last_frame_at: Option<Instant>,
     /// FR-93 P3d — frames the worker skipped because nothing changed.
     unchanged: Arc<AtomicU64>,
+    /// FR-93 P3e — the last grab found the display off.
+    dark: bool,
 }
 
 impl DrmCapture {
@@ -616,6 +663,7 @@ impl DrmCapture {
             target_frame_period: Duration::from_micros(1_000_000 / target_fps.max(1) as u64),
             last_frame_at: None,
             unchanged,
+            dark: false,
         })
     }
 }
@@ -709,6 +757,8 @@ fn worker(
     let mut cached: Option<Cached> = None;
     // FR-93 P3d — the frame skip for an unchanged screen, Wayland seats only.
     let mut gate = idle_skip.then(IdleGate::default);
+    // FR-93 P3e — an empty scanout is told apart: a display switched off.
+    let dark_check = wake_wait_enabled();
     info!(
         "drm capture: {}",
         if idle_skip {
@@ -728,6 +778,12 @@ fn worker(
             gate.as_mut(),
             &unchanged,
         ) {
+            // FR-93 P3e — nothing scanned out because the display is off, not
+            // a passing modeset: the controller is told, and nothing
+            // re-encodes the last frame.
+            Ok(Grabbed::Nothing) if dark_check && display_off(&card) == Some(true) => {
+                WorkerReply::Grabbed(Grabbed::Dark)
+            }
             Ok(grabbed) => WorkerReply::Grabbed(grabbed),
             Err(e) => WorkerReply::Failed(format!("{e:#}")),
         };
@@ -762,7 +818,8 @@ fn grab(
 ) -> Result<Grabbed> {
     let Some((fb, crtc)) = primary_plane(card, planes) else {
         // Nothing being scanned out right now (mode change, blanked panel).
-        // Not an error: report "no frame" and let the pump retry.
+        // Not an error: report "no frame" and let the pump retry. FR-93 P3e:
+        // the worker tells a display switched off apart.
         if cursor.is_some() {
             drm_cursor::publish(None);
         }
@@ -1025,6 +1082,10 @@ impl ScreenCapture for DrmCapture {
                 .await
                 .map_err(|_| anyhow!("drm capture worker dropped reply"))?;
             self.last_frame_at = Some(Instant::now());
+            if !matches!(reply, WorkerReply::Grabbed(Grabbed::Dark)) && self.dark {
+                self.dark = false;
+                info!("drm capture: the display is on again (FR-93 P3e)");
+            }
             match reply {
                 WorkerReply::Grabbed(Grabbed::Frame(frame)) => {
                     self.width = frame.width;
@@ -1041,6 +1102,20 @@ impl ScreenCapture for DrmCapture {
                     if started.elapsed() >= drm_idle::IDLE_WAIT {
                         return Ok(None);
                     }
+                }
+                // FR-93 P3e — the display is off. Nothing changes until it
+                // wakes, so look again a quarter of a second on rather than
+                // every frame period, and say "no frame": the pump reads
+                // `waits_for`, tells the controller, and keeps no keepalive.
+                WorkerReply::Grabbed(Grabbed::Dark) => {
+                    if !self.dark {
+                        self.dark = true;
+                        info!(
+                            "drm capture: the display is off; waiting for it to wake (FR-93 P3e)"
+                        );
+                    }
+                    tokio::time::sleep(DARK_POLL).await;
+                    return Ok(None);
                 }
                 WorkerReply::Failed(e) => return Err(anyhow!(e)),
             }
@@ -1060,6 +1135,11 @@ impl ScreenCapture for DrmCapture {
 
     /// FR-93 P3d — the frames skipped because nothing changed, which the
     /// pump's idle log carries beside its own count of empty polls.
+    /// FR-93 P3e — a display switched off waits for its wake.
+    fn waits_for(&self) -> Option<WaitFor> {
+        self.dark.then_some(WaitFor::DisplayWake)
+    }
+
     fn frames_unchanged(&self) -> u64 {
         self.unchanged.load(Ordering::Relaxed)
     }

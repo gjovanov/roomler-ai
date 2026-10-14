@@ -384,6 +384,16 @@ pub trait ScreenCapture: Send {
         0
     }
 
+    /// FR-93 P3e — what a running capture that delivers nothing is waiting
+    /// for, when it knows: a DRM scanout whose display was switched off waits
+    /// for it to wake. Asked by the pumps after a "no frame": they tell the
+    /// controller once, and send no keepalive while it lasts, because the
+    /// viewer clears its notice at the first decoded frame and a keepalive
+    /// would be one. `None` from every backend that cannot tell.
+    fn waits_for(&self) -> Option<WaitFor> {
+        None
+    }
+
     /// FR-80 — why this backend will never produce a frame, when it knows.
     /// `None` from every real backend: a capturer that yields frames has no
     /// reason to give, and the pumps read this exactly once at open to tell
@@ -872,26 +882,36 @@ enum AutoMutter {
     Failed(String),
 }
 
-/// FR-93 P5b (#2145) — how long an open waits for GNOME's screen to be
-/// unlocked, before it gives up and says so.
+/// FR-93 P5b (#2145) / P3e — how long an open waits through a state of the
+/// host (a locked screen, a display that is off) before it gives up and says
+/// so.
 #[cfg_attr(
-    not(all(target_os = "linux", feature = "portal-capture")),
+    not(all(
+        target_os = "linux",
+        any(feature = "portal-capture", feature = "drm-capture")
+    )),
     allow(dead_code)
 )]
-const UNLOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-/// How often the lock screen is asked whether it is still up.
+const HOST_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// How often the host is asked whether the state still holds.
 #[cfg_attr(
-    not(all(target_os = "linux", feature = "portal-capture")),
+    not(all(
+        target_os = "linux",
+        any(feature = "portal-capture", feature = "drm-capture")
+    )),
     allow(dead_code)
 )]
-const UNLOCK_POLL: std::time::Duration = std::time::Duration::from_secs(1);
-/// The open is tried again at least this often while GNOME still says
-/// locked, in case its lock state and mutter's refusal ever disagree.
+const HOST_WAIT_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+/// The open is tried again at least this often while the host still reads
+/// the state, in case its reading and the open's refusal ever disagree.
 #[cfg_attr(
-    not(all(target_os = "linux", feature = "portal-capture")),
+    not(all(
+        target_os = "linux",
+        any(feature = "portal-capture", feature = "drm-capture")
+    )),
     allow(dead_code)
 )]
-const UNLOCK_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+const HOST_WAIT_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 /// mutter's words for "refused while the screen is locked", on both its
 /// ScreenCast and its RemoteDesktop `CreateSession`.
 #[cfg_attr(
@@ -900,27 +920,113 @@ const UNLOCK_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 )]
 const MUTTER_INHIBITED: &str = "Session creation inhibited";
 
-/// FR-93 P5b (#2145) — an open that GNOME's lock screen refuses waits for the
-/// unlock instead of failing.
-///
-/// GNOME closes every remote-desktop and screen-cast session when its screen
-/// locks, and refuses new ones (`Session creation inhibited`) until it is
-/// unlocked. So after a lock the pump's reopen lands here, and so does a
-/// session that starts while the screen is locked. A failure while the lock
-/// screen is up (`locked` says so, or mutter's refusal names it) is waited
-/// out: `tell` once (the controller reads why), then `locked` every
-/// [`UNLOCK_POLL`] until it lifts, and the open again, at least every
-/// [`UNLOCK_RETRY`]. Any other failure is returned at once. The wait ends when
-/// the session that asked has gone (`abandoned`), or after [`UNLOCK_WAIT`].
-///
-/// Every effect is passed in, so the rule tests without GNOME.
+/// FR-93 P5b / P3e — a state of the host that an open waits through instead
+/// of failing, and how the wait reads.
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        any(feature = "portal-capture", feature = "drm-capture")
+    )),
+    allow(dead_code)
+)]
+struct HostWait {
+    /// An open's error that names the state even where the host's own
+    /// reading disagrees: mutter's `inhibited` while GNOME reads unlocked.
+    named_by: fn(&str) -> bool,
+    /// The error once the wait gave up, from its bound in minutes and the
+    /// last open's error.
+    gave_up: fn(u64, &str) -> String,
+    /// The error when the session that waited has ended.
+    ended: &'static str,
+}
+
+/// P5b (#2145) — GNOME's lock screen. GNOME closes every remote-desktop and
+/// screen-cast session when its screen locks, and refuses new ones
+/// (`Session creation inhibited`) until it is unlocked.
 #[cfg_attr(
     not(all(target_os = "linux", feature = "portal-capture")),
     allow(dead_code)
 )]
-fn open_through_lock<T>(
+const GNOME_LOCK: HostWait = HostWait {
+    named_by: names_mutter_inhibited,
+    gave_up: gave_up_locked,
+    ended: "the session that waited for the unlock has ended",
+};
+
+/// P3e — a display the compositor switched off (GNOME's idle blank): no CRTC
+/// drives a mode, so no plane holds a framebuffer for DRM to read.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "drm-capture")),
+    allow(dead_code)
+)]
+const DISPLAY_OFF: HostWait = HostWait {
+    named_by: names_nothing,
+    gave_up: gave_up_dark,
+    ended: "the session that waited for the display to wake has ended",
+};
+
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "portal-capture")),
+    allow(dead_code)
+)]
+fn names_mutter_inhibited(err: &str) -> bool {
+    err.contains(MUTTER_INHIBITED)
+}
+
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "drm-capture")),
+    allow(dead_code)
+)]
+fn names_nothing(_err: &str) -> bool {
+    false
+}
+
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "portal-capture")),
+    allow(dead_code)
+)]
+fn gave_up_locked(minutes: u64, err: &str) -> String {
+    format!(
+        "the screen stayed locked for {minutes} minutes, and GNOME shares no locked screen: {err}"
+    )
+}
+
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "drm-capture")),
+    allow(dead_code)
+)]
+fn gave_up_dark(minutes: u64, err: &str) -> String {
+    format!("the display stayed off for {minutes} minutes: {err}")
+}
+
+/// FR-93 P5b (#2145) / P3e — an open the host refuses for a while waits for
+/// it instead of failing.
+///
+/// GNOME closes every remote-desktop and screen-cast session when its screen
+/// locks, and refuses new ones until it is unlocked; a compositor that
+/// switched its display off leaves DRM no scanout to open. So after a lock or
+/// a blank the pump's reopen lands here, and so does a session that starts
+/// while the state holds. A failure while the host reads the state (`holds`
+/// says so, or the error names it, [`HostWait::named_by`]) is waited out:
+/// `tell` once (the controller reads why), then `holds` every
+/// [`HOST_WAIT_POLL`] until it lifts, and the open again, at least every
+/// [`HOST_WAIT_RETRY`]. Any other failure is returned at once. The wait ends
+/// when the session that asked has gone (`abandoned`), or after
+/// [`HOST_WAIT_MAX`].
+///
+/// Every effect is passed in, so the rule tests without GNOME or a display.
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        any(feature = "portal-capture", feature = "drm-capture")
+    )),
+    allow(dead_code)
+)]
+fn open_through_wait<T>(
+    wait: HostWait,
     mut open: impl FnMut() -> Result<T, String>,
-    mut locked: impl FnMut() -> Option<bool>,
+    mut holds: impl FnMut() -> Option<bool>,
     abandoned: impl Fn() -> bool,
     mut tell: impl FnMut(std::time::Duration),
     mut sleep: impl FnMut(std::time::Duration),
@@ -933,31 +1039,29 @@ fn open_through_lock<T>(
             Ok(t) => return Ok(t),
             Err(e) => e,
         };
-        let was_locked = locked() == Some(true);
-        if !was_locked && !err.contains(MUTTER_INHIBITED) {
+        let was_held = holds() == Some(true);
+        if !was_held && !(wait.named_by)(&err) {
             return Err(err);
         }
         let waited = now().saturating_duration_since(started);
-        if waited >= UNLOCK_WAIT {
-            return Err(format!(
-                "the screen stayed locked for {} minutes, and GNOME shares no locked screen: {err}",
-                UNLOCK_WAIT.as_secs() / 60
-            ));
+        if waited >= HOST_WAIT_MAX {
+            return Err((wait.gave_up)(HOST_WAIT_MAX.as_secs() / 60, &err));
         }
         if !told {
-            tell(UNLOCK_WAIT - waited);
+            tell(HOST_WAIT_MAX - waited);
             told = true;
         }
-        // Early only on the lock lifting: a refusal while GNOME already read
-        // unlocked (or could not be asked) waits the whole UNLOCK_RETRY, so
-        // a disagreement costs one helper every 30 s, not one a second.
-        let retry_at = now() + UNLOCK_RETRY;
+        // Early only on the state lifting: a refusal while the host already
+        // read it lifted (or could not be asked) waits the whole
+        // HOST_WAIT_RETRY, so a disagreement costs one open every 30 s, not
+        // one a second (a mutter open is a helper process).
+        let retry_at = now() + HOST_WAIT_RETRY;
         loop {
             if abandoned() {
-                return Err("the session that waited for the unlock has ended".into());
+                return Err(wait.ended.into());
             }
-            sleep(UNLOCK_POLL);
-            if (was_locked && locked() == Some(false)) || now() >= retry_at {
+            sleep(HOST_WAIT_POLL);
+            if (was_held && holds() == Some(false)) || now() >= retry_at {
                 break;
             }
         }
@@ -965,8 +1069,11 @@ fn open_through_lock<T>(
 }
 
 #[cfg(test)]
-mod lock_wait_tests {
-    use super::{MUTTER_INHIBITED, UNLOCK_RETRY, UNLOCK_WAIT, open_through_lock};
+mod host_wait_tests {
+    use super::{
+        DISPLAY_OFF, GNOME_LOCK, HOST_WAIT_MAX, HOST_WAIT_RETRY, MUTTER_INHIBITED,
+        open_through_wait,
+    };
     use std::cell::{Cell, RefCell};
     use std::time::{Duration, Instant};
 
@@ -979,7 +1086,8 @@ mod lock_wait_tests {
     #[test]
     fn an_open_that_works_is_not_delayed() {
         let told = RefCell::new(Vec::new());
-        let r = open_through_lock(
+        let r = open_through_wait(
+            GNOME_LOCK,
             || Ok(7),
             || panic!("the lock screen is asked only after a failure"),
             || false,
@@ -999,7 +1107,8 @@ mod lock_wait_tests {
         let unlocked_at = t0 + Duration::from_secs(5);
         let opens = Cell::new(0);
         let told = RefCell::new(Vec::new());
-        let r = open_through_lock(
+        let r = open_through_wait(
+            GNOME_LOCK,
             || {
                 opens.set(opens.get() + 1);
                 if now.get() < unlocked_at {
@@ -1017,7 +1126,7 @@ mod lock_wait_tests {
         assert_eq!(r, Ok(42));
         assert_eq!(
             *told.borrow(),
-            [UNLOCK_WAIT],
+            [HOST_WAIT_MAX],
             "told once, for the whole wait"
         );
         assert_eq!(opens.get(), 2, "refused, then open right after the unlock");
@@ -1031,7 +1140,8 @@ mod lock_wait_tests {
     fn any_other_failure_is_returned_at_once() {
         let told = RefCell::new(Vec::new());
         let opens = Cell::new(0);
-        let r: Result<u32, String> = open_through_lock(
+        let r: Result<u32, String> = open_through_wait(
+            GNOME_LOCK,
             || {
                 opens.set(opens.get() + 1);
                 Err("mutter did not complete the screencast handshake within 10s".into())
@@ -1048,14 +1158,15 @@ mod lock_wait_tests {
     }
 
     /// mutter refuses while GNOME reads unlocked: wait, but retry only every
-    /// UNLOCK_RETRY, never every poll (each open is a helper process).
+    /// HOST_WAIT_RETRY, never every poll (each open is a helper process).
     #[test]
     fn a_refusal_gnome_does_not_explain_is_retried_slowly() {
         let t0 = Instant::now();
         let now = Cell::new(t0);
         let lifts_at = t0 + Duration::from_secs(40);
         let opens = Cell::new(0u32);
-        let r = open_through_lock(
+        let r = open_through_wait(
+            GNOME_LOCK,
             || {
                 opens.set(opens.get() + 1);
                 if now.get() < lifts_at {
@@ -1071,7 +1182,7 @@ mod lock_wait_tests {
             || now.get(),
         );
         assert_eq!(r, Ok(1));
-        let most = 2 + 40 / UNLOCK_RETRY.as_secs();
+        let most = 2 + 40 / HOST_WAIT_RETRY.as_secs();
         assert!(
             u64::from(opens.get()) <= most,
             "{} opens in 40 s",
@@ -1085,7 +1196,8 @@ mod lock_wait_tests {
         let t0 = Instant::now();
         let now = Cell::new(t0);
         let opens = Cell::new(0);
-        let r: Result<u32, String> = open_through_lock(
+        let r: Result<u32, String> = open_through_wait(
+            GNOME_LOCK,
             || {
                 opens.set(opens.get() + 1);
                 Err(refused())
@@ -1104,7 +1216,8 @@ mod lock_wait_tests {
     fn a_screen_locked_past_the_bound_gives_up_and_says_so() {
         let t0 = Instant::now();
         let now = Cell::new(t0);
-        let r: Result<u32, String> = open_through_lock(
+        let r: Result<u32, String> = open_through_wait(
+            GNOME_LOCK,
             || Err(refused()),
             || Some(true),
             || false,
@@ -1114,7 +1227,107 @@ mod lock_wait_tests {
         );
         let e = r.unwrap_err();
         assert!(e.contains("stayed locked"), "{e}");
-        assert!(now.get() - t0 >= UNLOCK_WAIT);
+        assert!(now.get() - t0 >= HOST_WAIT_MAX);
+    }
+
+    fn no_scanout() -> String {
+        "no plane is bound to a CRTC with a live framebuffer — is anything being scanned out?"
+            .into()
+    }
+
+    /// P3e — the display is off at the open: told once, the open again as it
+    /// wakes, within a poll.
+    #[test]
+    fn a_dark_display_is_waited_out_and_the_controller_told_once() {
+        let t0 = Instant::now();
+        let now = Cell::new(t0);
+        let wakes_at = t0 + Duration::from_secs(7);
+        let opens = Cell::new(0u32);
+        let told = RefCell::new(Vec::new());
+        let r = open_through_wait(
+            DISPLAY_OFF,
+            || {
+                opens.set(opens.get() + 1);
+                if now.get() < wakes_at {
+                    Err(no_scanout())
+                } else {
+                    Ok(5)
+                }
+            },
+            || Some(now.get() < wakes_at),
+            || false,
+            |d| told.borrow_mut().push(d),
+            |d| now.set(now.get() + d),
+            || now.get(),
+        );
+        assert_eq!(r, Ok(5));
+        assert_eq!(*told.borrow(), [HOST_WAIT_MAX], "told once");
+        assert_eq!(opens.get(), 2, "refused, then open right after the wake");
+        assert!(
+            now.get() - t0 <= Duration::from_secs(8),
+            "within a poll of the wake"
+        );
+    }
+
+    /// P3e — a DRM failure on a lit display is not a wait: it falls through
+    /// to the cascade at once, as before. No error text can stand in for the
+    /// display's own state (`DISPLAY_OFF` names nothing).
+    #[test]
+    fn a_drm_failure_on_a_lit_display_is_returned_at_once() {
+        for lit in [Some(false), None] {
+            let opens = Cell::new(0u32);
+            let r: Result<u32, String> = open_through_wait(
+                DISPLAY_OFF,
+                || {
+                    opens.set(opens.get() + 1);
+                    Err(no_scanout())
+                },
+                || lit,
+                || false,
+                |_| panic!("not told"),
+                |_| panic!("no wait"),
+                Instant::now,
+            );
+            assert!(r.unwrap_err().contains("no plane"), "{lit:?}");
+            assert_eq!(opens.get(), 1, "{lit:?}");
+        }
+    }
+
+    #[test]
+    fn a_display_off_past_the_bound_gives_up_in_its_own_words() {
+        let t0 = Instant::now();
+        let now = Cell::new(t0);
+        let r: Result<u32, String> = open_through_wait(
+            DISPLAY_OFF,
+            || Err(no_scanout()),
+            || Some(true),
+            || false,
+            |_| {},
+            |d| now.set(now.get() + d),
+            || now.get(),
+        );
+        let e = r.unwrap_err();
+        assert!(e.contains("the display stayed off for 60 minutes"), "{e}");
+        assert!(!e.contains("locked"), "{e}");
+    }
+
+    #[test]
+    fn a_dark_wait_whose_session_ended_says_what_it_waited_for() {
+        let t0 = Instant::now();
+        let now = Cell::new(t0);
+        let r: Result<u32, String> = open_through_wait(
+            DISPLAY_OFF,
+            || Err(no_scanout()),
+            || Some(true),
+            || now.get() >= t0 + Duration::from_secs(2),
+            |_| {},
+            |d| now.set(now.get() + d),
+            || now.get(),
+        );
+        assert_eq!(
+            r.unwrap_err(),
+            "the session that waited for the display to wake has ended"
+        );
     }
 }
 
@@ -1139,7 +1352,8 @@ fn open_auto_mutter(target_fps: u32) -> AutoMutter {
     // deaf to their own stop, so they fail at once with mutter's refusal.
     let opened = if open_has_session() {
         let mut lock = portal::mutter::GnomeLockScreen::default();
-        open_through_lock(
+        open_through_wait(
+            GNOME_LOCK,
             open,
             || lock.is_up(),
             open_abandoned,
@@ -1732,7 +1946,8 @@ pub struct OpenWait {
     pub why: WaitFor,
 }
 
-/// FR-93 P5b — what an open waits for the person at the screen to do.
+/// FR-93 P5b — what an open (or, P3e, a running capture) waits for someone
+/// to do at the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitFor {
     /// Answer the desktop portal's dialog: share the screen, or, when
@@ -1742,6 +1957,10 @@ pub enum WaitFor {
     /// Unlock the screen: GNOME refuses every screen cast while it is locked,
     /// and closes the ones it has (#2145).
     Unlock,
+    /// FR-93 P3e — wake the display: the compositor switched it off (GNOME's
+    /// idle blank), so DRM has no scanout to read. Input wakes it, the
+    /// viewer's too where it reaches the host.
+    DisplayWake,
 }
 
 /// What a pump hands [`open_default_async`]: called at most once, if and when
@@ -1788,7 +2007,10 @@ impl Drop for ParkHook {
 /// controller to tell and an end to stop at. The recorder, capture-smoke and
 /// the probes open on threads it never marked.
 #[cfg(target_os = "linux")]
-#[cfg_attr(not(feature = "portal-capture"), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "portal-capture", feature = "drm-capture")),
+    allow(dead_code)
+)]
 pub(crate) fn open_has_session() -> bool {
     PARK_ABANDONED.with(|a| a.borrow().is_some())
 }
@@ -1799,7 +2021,10 @@ pub(crate) fn open_has_session() -> bool {
 /// A thread with no open behind it (the recorder, a probe, a test) reads
 /// `false`.
 #[cfg(target_os = "linux")]
-#[cfg_attr(not(feature = "portal-capture"), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "portal-capture", feature = "drm-capture")),
+    allow(dead_code)
+)]
 pub(crate) fn open_abandoned() -> bool {
     PARK_ABANDONED.with(|a| {
         a.borrow()
@@ -1854,7 +2079,10 @@ mod park_tests {
 /// screen. Fires that open's hook, once. A thread with no hook (the recorder,
 /// a probe, a test) does nothing.
 #[cfg(target_os = "linux")]
-#[cfg_attr(not(feature = "portal-capture"), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "portal-capture", feature = "drm-capture")),
+    allow(dead_code)
+)]
 pub(crate) fn tell_open_waiting(wait: OpenWait) {
     if let Some(hook) = PARK_HOOK.with(|h| h.borrow_mut().take()) {
         hook(wait);
@@ -2040,7 +2268,38 @@ fn open_with(
             // where no buffer check sees a change.
             let idle_skip =
                 drm_backend::idle_skip_enabled() && crate::desktop_brief::seen_is_wayland();
-            match drm_backend::DrmCapture::primary(_target_fps, _downscale, idle_skip) {
+            let open = || {
+                drm_backend::DrmCapture::primary(_target_fps, _downscale, idle_skip)
+                    .map_err(|e| format!("{e:#}"))
+            };
+            // FR-93 P3e — a display the compositor switched off has no scanout
+            // to open. A session waits for it to wake, its controller told why,
+            // rather than falling through to arms that cannot serve this host
+            // either. The recorder and capture-smoke fail at once, as before.
+            let opened = if drm_backend::wake_wait_enabled() && open_has_session() {
+                open_through_wait(
+                    DISPLAY_OFF,
+                    open,
+                    drm_backend::display_is_off,
+                    open_abandoned,
+                    |gives_up_in| {
+                        tracing::info!(
+                            waits_s = gives_up_in.as_secs(),
+                            "capture: the display is off, so DRM has no scanout to read; waiting \
+                             for it to wake, the controller told why (FR-93 P3e)"
+                        );
+                        tell_open_waiting(OpenWait {
+                            gives_up_in,
+                            why: WaitFor::DisplayWake,
+                        });
+                    },
+                    std::thread::sleep,
+                    std::time::Instant::now,
+                )
+            } else {
+                open()
+            };
+            match opened {
                 Ok(c) => {
                     tracing::info!(
                         width = c.width(),
@@ -2055,11 +2314,11 @@ fn open_with(
                     // so silently serving them X11 would look like the feature
                     // simply not working.
                     tracing::warn!(
-                        error = %format!("{e:#}"),
+                        error = %e,
                         "ROOMLERD_DRM_CAPTURE=1 but DRM capture could not open — falling through to the standard cascade"
                     );
                     wayland_arm_error = Some(format!(
-                        "drm_capture is on, but DRM capture could not open: {e:#}"
+                        "drm_capture is on, but DRM capture could not open: {e}"
                     ));
                 }
             }
