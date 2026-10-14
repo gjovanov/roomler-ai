@@ -5204,6 +5204,8 @@ fn media_waiting_hook(
             why = ?wait.why,
             "capture: waiting on the host (a portal dialog, an unlock, a display waking, a user switch); telling the controller"
         );
+        // FR-93 P5g — one open can wait twice (the switch, then the unlock).
+        let control_dc = control_dc.clone();
         runtime.spawn(async move {
             // Bounded by the wait's own deadline too: past it, the notice
             // would describe a wait that is already over.

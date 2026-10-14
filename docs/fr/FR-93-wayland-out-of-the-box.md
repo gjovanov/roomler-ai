@@ -7,7 +7,7 @@ promoted. P2d is decided (operator, 2026-10-12): the portal waits for it. P2d-1,
 **0.4.131**; P2d-2, the viewer half, is lab-verified on prod's viewer (2026-10-13). P2d-3, the flip (the portal
 automatic where mutter is absent), shipped in **0.4.132** with P2d-2's agent half and P4a; P4b in **0.4.133**; P3c
 in **0.4.134** (2026-10-13). P3d, P5a, P5b (#2145), P3e and P5c are in **0.4.135** (tagged 2026-10-14 from
-`bb6ea90ee`); P5d and P5e merged after it (#2183); P5f is in review. Ticked: AC1–AC5,
+`bb6ea90ee`); P5d, P5e (#2183) and P5f (#2192) merged after it; P5g is in review. Ticked: AC1–AC5,
 AC9, AC13. The operator approved the
 plan and P0 (the
 lab on zeus, enrolled in the vmtest org: D2, D8). **D1 is decided: split.** Per-user installs go auto, system installs
@@ -578,6 +578,15 @@ pump tells only after 2 s with nothing sent, and the viewer counts only media af
 could not be aborted, so a viewer that left during the switch left the screencast running; the hold now yields
 ([`linux-capture.md`](../linux-capture.md) §5.6).
 
+**As built (P5g, 2026-10-14): a session opened during a user switch waits for it.** Measured first: a viewer that
+connected while the login screen held the seat read `wayland_not_enabled`, which is false on an install that captures by
+itself, and got no picture after the switch back either. The plan counted only an active Wayland session as the
+daemon's own, and the helper refuses a session in the background at once. logind's `State` now tells a session in the
+background (`online`, not active) from a logout (`closing`); the plan still goes automatic for it, and the open waits
+for the session to be on screen again, the controller told `session_away`. GNOME's own *Switch User* locks first, so
+the same open then waits for the unlock and says so: an open's hook now fires once per wait
+([`linux-capture.md`](../linux-capture.md) §5.6).
+
 ### 4.7 Consent and the indicator (P6 — with FR-27's owner)
 
 - Field-run the companion's consent window and banner on GNOME 50 and Plasma 6.6: QMP answers, and
@@ -636,6 +645,7 @@ bridge for text and images in the lab before deciding.
 | ↳ P5d | the portal arm ends a stream whose compositor restarted: both arms share P5c's frame loop and its stream-state check, and the portal's reopen restores from its token (`linux-capture.md` §4.8) | — (it acts only on a stream that already stopped) | ✅ lab (`91f736404`), Plasma 6.7.5 per-user, the automatic portal. **🔴 before** (the P3e build, whose portal loop is the release's): a KWin crash froze the last frame for good, no reason. **P5d:** `the portal's stream ended`, the reopen restored without a dialog, a new picture 4.0 s after the crash; a resolution change there and back still renegotiates in place (1.3 s each way, no reopen) | S |
 | ↳ P5e | a still desktop shows at once: the PipeWire consumer keeps the frame that settled the format, and the frame loop sends it first (`linux-capture.md` §5.5) | — | ✅ lab (`b61a86760`), GNOME 50 per-user, mutter, the lab's ticking probe stopped. **🔴 before** (the P5c build): a session on a still desktop had no picture for 10 s, until the viewer's mouse moved; after GNOME's shell crash and the login, no picture at all. **P5e:** the first picture 0.6 s into the session; after the shell crash and the login, a picture 9.6 s after the login (most of it the viewer's reconnect backoff). KDE's portal on a still desktop, before P5e: a picture 0.5 s in (KWin sends more than one frame) | S |
 | ↳ P5f | a user switch names its reason: a per-user capture watches its user's sessions in logind (`session-watch`, 1 s), and the pumps tell the controller `session_away` after a 2 s quiet spell, holding their keepalives. A frame newer than logind's read means the session is back; the hold yields, so the pump ends with its session; the viewer ends a wait only on media counted after the notice settles (`linux-capture.md` §5.6) | `ROOMLERD_SESSION_WATCH=0` | ✅ lab (`a93932156`), GNOME 50 per-user, mutter, GDM's login screen for 40 s. **🔴 before** (the P5e build): the owner's last frame for the whole switch, no reason. **P5f:** the notice 4.3 s after the switch (3.9 s on a still desktop), held for the whole switch; a new frame 0.4–0.5 s after the switch back. A viewer leaving during the switch left no helper behind (🔴 `3c5ed08d2`, before the hold yielded: one still running 63 s later). `ROOMLERD_SESSION_WATCH=0` gives the frozen frame back | S |
+| ↳ P5g | a session opened during a user switch waits for it: logind's `State` tells a session in the background from a logout, the plan goes automatic for it (`OwnSession::Away`), and the open waits for the session to be on screen again before either arm (`wait_while_away`), the controller told `session_away`; an open's hook fires once per wait, so the unlock that GNOME's *Switch User* adds is told too (`linux-capture.md` §5.6) | `wayland_auto` (the automatic plan); the wait engages only where both arms would refuse | ✅ lab (`2156850a5`), GNOME 50 per-user, the viewer connecting while GDM's login screen held the seat. **🔴 before** (`b7d33af1e`, the release's plan): `wayland_not_enabled`, and no picture after the switch back. **P5g:** `session_away` at connect, held 45 s, a picture 1.6 s after the switch back; GNOME's *Switch User* (a lock, then the login screen): `session_away`, then the unlock notice 1.1 s after the switch back, then a picture 1.2 s after the unlock | S |
 | **P6** | consent and indicator (§4.7) | FR-27's switches | lab GNOME + KDE | M |
 | **P7** | clipboard (§4.8) | `ROOMLERD_SESSION_CLIPBOARD=0` | lab | M |
 | **P8** | leftovers: FR-45 AC8 + P5b, FR-56 AC7/AC9/AC10, FR-92 AC9, FR-85's Wayland rows | each FR's own | lab, WSL2 | S each |
@@ -770,8 +780,10 @@ New cells run three times before they are trusted. An entry in `expected-failure
   after the login the daemon comes back (P5a) with a picture 9.6 s later (P5e: before it, none at all). ✅ A user
   switch: the DRM arm follows the seat (the login screen in 3.3 s, back in 0.4 s); mutter kept the owner's last frame
   with no reason, fixed in the lab by P5f (the notice 3.9–4.3 s after the switch, a new frame 0.4–0.5 s after the
-  switch back). Owed: a session opened during a switch, suspend (the lab guests have suspend-to-RAM off), and a
-  released build (0.4.135 carries P3d–P5c).
+  switch back). ✅ A session opened during a switch read a false `wayland_not_enabled` and never recovered, fixed in
+  the lab by P5g (`session_away` at connect, a picture 1.6 s after the switch back; through GNOME's *Switch User*,
+  the unlock notice in turn and a picture 1.2 s after the unlock). Owed: suspend (the lab guests have suspend-to-RAM
+  off), and a released build (0.4.135 carries P3d–P5c).
 - [ ] **AC8** — an idle DRM session's CPU, measured before and after, within 2× of FR-29's X11 figure.
   ⏳ ✅ in the lab on P3d (`cac2d7c43`): the GNOME 50 system guest, an idle desktop on the viewer's default path,
   every `roomlerd` process's CPU over two 60 s windows. **57.9 %** of a core on the released 0.4.133, **5.5 % and
@@ -876,6 +888,7 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-14 | `wlab-gnome` (per-user, mutter), the lab's probe stopped; `wlab-kde` | P5c `304cff554`, then P5e `b61a86760`; P5d on KDE | AC7: a session on a still desktop; GNOME's shell crash (`kill -9 gnome-shell`) and the login | 🔴 mutter on a still desktop: no picture for 10 s, until the viewer's mouse moved; after the shell crash and the login, the daemon back (P5a) but no picture at all. ✅ P5e: the first picture 0.6 s in; after the crash and the login, a picture 9.6 s after the login. KDE on a still desktop (P5d): a picture 0.5 s in. A P5e KWin-crash re-run on KDE was voided by a lab collision with another session's run on the same guest (the guest reverted under it); P5d's own KWin evidence stands |
 | 2026-10-14 | `wlab-gnome` (per-user, mutter); `wlab-gnome-sys` (system, DRM) | P5e `b61a86760`; 0.4.134, the release | AC7 fail-first: a user switch, GDM's login screen for 40 s (`switch-user`), then `loginctl activate` back | 🔴 mutter: the owner's last frame for the whole switch, no reason; a new frame 0.7 s after the switch back. ✅ DRM: the login screen in 3.3 s, back in 0.4 s |
 | 2026-10-14 | `wlab-gnome` (per-user, mutter) | P5f `b7d33af1e`, `3c5ed08d2`, then `a93932156` | AC7 / P5f: the same switch, with the probe ticking and on a still desktop; the kill switch; the viewer leaving during the switch | `b7d33af1e`: the notice 0.5 s after the last frame, a new frame 0.4 s after the switch back; a still desktop's return told "away" a second time; `ROOMLERD_SESSION_WATCH=0` froze as before. 🔴 `3c5ed08d2`: a keepalive counted after the notice cleared it, the viewer re-created the session 10 s in, and the reconnects followed a held pump that had outlived its session (a portal helper still running 63 s after the viewer left). ✅ `a93932156`: one notice, 4.3 s after the switch (3.9 s on a still desktop), held; a new frame 0.5 s (0.4 s) after the switch back; a viewer leaving during the switch left no helper at 5 s or 20 s, and the next viewer was live in 1.6 s |
+| 2026-10-14 | `wlab-gnome` (per-user, mutter) | P5f `b7d33af1e` (the release's plan), then P5g `8ef858771` and `2156850a5` | AC7 / P5g: the viewer connecting while GDM's login screen held the seat (`LC_PRE=switch-user`, the dark-open spec); then GNOME's own *Switch User* (`lock-switch`: Super+L, then the login screen), the switch back to the lock screen, and the unlock | 🔴 `b7d33af1e`: `wayland_not_enabled` 22 ms into the open (the plan saw no active Wayland session, and the Xwayland guard answered), no picture in the 40 s after the switch back; `capture-smoke` on the configured mutter arm: refused in 13 ms by the helper's attended-only rule. ✅ P5g: `session_away` at connect, held 45 s, a picture 1.6 s after the switch back (both builds); through *Switch User*: `session_away`, the unlock notice 1.1 s after the switch back, a picture 1.2 s after the unlock |
 
 ## 12. Related
 
