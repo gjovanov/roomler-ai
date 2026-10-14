@@ -46,7 +46,7 @@ it.
 - **No encryption at rest.** JWTs are HS256 with a shared secret
   (`crates/services/src/auth/mod.rs:148-143`); the only asymmetric key signs DERP tickets
   (`crates/remote_control/src/derp_ticket.rs:91,116`); tenant cloud-storage credentials have a
-  plaintext schema (`crates/db/src/models/tenant.rs:273-220`). The vault brings its own keys.
+  plaintext schema (`crates/db/src/models/tenant.rs:294-220`). The vault brings its own keys.
 - **The primitives exist.** One spawn-as-user path (`agents/roomlerd/src/exec.rs:436,491`); the
   daemon's own PTY (`agents/roomlerd/src/pty/unix.rs:106-184`, ConPTY in
   `agents/roomlerd/src/pty/windows.rs:180-240`); the tmux model (`agents/roomlerd/src/apps/linux.rs:389-433`);
@@ -61,7 +61,7 @@ it.
   has no authentication (`crates/tunnel-core/src/socks5.rs:3`) and a daemon-originated flow is
   attributed to the device owner (`crates/tunnel-core/src/policy.rs:29-51`); `SplitTun` intercepts one
   port and SSH is its only caller (`crates/tunnel-core/src/overlay/split_tun.rs:92-126`); fleet exec
-  always runs as SYSTEM/root (`agents/roomlerd/src/signaling.rs:4130`).
+  always runs as SYSTEM/root (`agents/roomlerd/src/signaling.rs:4134`).
 - **Chat needs four changes.** `AuthorType::Bot` exists and nothing writes it — the DAO hard-codes
   `User` (`crates/services/src/dao/message.rs:76-78`); rooms have no type or binding
   (`crates/db/src/models/room.rs:62-126`); the message list isn't virtualized
@@ -333,7 +333,7 @@ flowchart TD
 
 | Rule | Why | Where |
 |---|---|---|
-| A device holds copies only while its OWN `hive_replica` is on. It advertises `hive-replica` only then, as `hive-adopt` is advertised (`agents/roomlerd/src/encode/caps.rs:1638`), and refuses a join otherwise. `hive_archive` (it offers itself as an archive replica) and `hive_store_quota_mib` are device keys too. None is pushable, and each joins the lock test's list | the gate that survives a compromised server. The code keeps every Hive key out of `DesiredConfig` (`crates/remote_control/src/models.rs:6290`); §3g's "can ever be pushed" is the design's allowance, not the code's | `crates/agent-core/src/config.rs:374` |
+| A device holds copies only while its OWN `hive_replica` is on. It advertises `hive-replica` only then, as `hive-adopt` is advertised (`agents/roomlerd/src/encode/caps.rs:1638`), and refuses a join otherwise. `hive_archive` (it offers itself as an archive replica) and `hive_store_quota_mib` are device keys too. None is pushable, and each joins the lock test's list | the gate that survives a compromised server. The code keeps every Hive key out of `DesiredConfig` (`crates/remote_control/src/models.rs:6297`); §3g's "can ever be pushed" is the design's allowance, not the code's | `crates/agent-core/src/config.rs:374` |
 | Candidates are the session owner's own devices and the archive replicas an `ADMINISTRATOR` designated, nothing else. "The owner's own" means `enrolled_by` and `owner_user_id` both name the owner | `owner_user_id` is reassignable with `MANAGE_AGENTS` alone, and `enrolled_by` is set once, at enrollment (`crates/services/src/dao/agent.rs:99`, `:1009`): a device manager who hands someone a device must not receive that person's sessions on it | `crates/remote_control/src/models.rs:1447`, `:1451` |
 | A restricted tag only ever takes a device out. When no device left may hold a restricted session, the session has fewer copies than `min`, and its room says why | tags are free-form `MANAGE_AGENTS` labels (`crates/modules/fleet/src/agent.rs:1097`); as a filter they cannot widen where a copy goes. Decision 2 names prod ROLES, which are P3's, so until then the session's primary device is what carries the tag | `models.rs:1144` |
 | A device that no longer qualifies (a tag taken off, its owner changed, its `hive_replica` off) gets a purge for what it may no longer hold | the rules run again when a device's tags or owner change: fleet calls a new `FleetLifecycle::agent_updated` hook (`crates/core/src/hooks.rs:109`) from its update route, as it calls `agent_renamed` there (`agent.rs:1000`) | |
@@ -1054,7 +1054,7 @@ Such a build runs no session and sends no manifest, so a Windows device that upd
 or a build made without `hive` does the same. The reconcile of a connection the hub records without
 `hive` now ends those sessions as an empty manifest would, before it reads what is pending, and it
 reads only its own registration: a connection a newer one displaced, or one already gone, decides
-nothing (`crates/modules/hive/src/agent_socket.rs:982`, `crates/modules/fleet/src/hub.rs:2160`
+nothing (`crates/modules/hive/src/agent_socket.rs:982`, `crates/modules/fleet/src/hub.rs:2206`
 `agent_supports_hive_on`).
 
 **Updates and restarts (P1d).** Today a session's harness is the daemon's child: an update, a crash
@@ -1962,7 +1962,7 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       restricted tag (`prod` by default) replicates only to devices carrying it too (decision 2's
       interim reading).
     - *`hive_replica` and `hive_archive`:* device-owned and never pushable, like every Hive key
-      today (`crates/remote_control/src/models.rs:6290`).
+      today (`crates/remote_control/src/models.rs:6297`).
     - *Promote, teleport, fork and purge:* the session owner's, with `HIVE_RUN`. There is no
       `HIVE_ADMIN` bit yet.
     - *The server relays the QUIC fingerprint it could replace:* accepted for P2, since the server
