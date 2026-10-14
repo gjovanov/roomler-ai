@@ -28,6 +28,51 @@ pub struct TunnelConfig {
     /// `machine_name`; populated by `enroll --name`.
     #[serde(default)]
     pub machine_name: String,
+
+    /// FR-101 P1b — keep a plaintext `server_url` as written. Without it a
+    /// remote `http://` URL is read as `https://`
+    /// (`roomler_ai_remote_control::server_url`), so the token renewal, the
+    /// self-update and the tunnel's socket all go over TLS. For a lab whose
+    /// server serves no TLS; loopback is never promoted. The environment form
+    /// is `ROOMLER_TUNNEL_ALLOW_PLAINTEXT=1`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_plaintext_server: bool,
+}
+
+impl TunnelConfig {
+    /// FR-101 P1b — read `server_url` over TLS unless the owner kept
+    /// plaintext; say so when it changed. Called by [`load`] on both of its
+    /// paths, the file and the environment.
+    fn secure_server_url(&mut self) {
+        let s = roomler_ai_remote_control::server_url::secure(
+            &self.server_url,
+            self.allow_plaintext_server,
+        );
+        if s.promoted {
+            tracing::warn!(
+                was = %self.server_url,
+                now = %s.url,
+                "a plaintext server URL is read as TLS; set allow_plaintext_server = true \
+                 (or ROOMLER_TUNNEL_ALLOW_PLAINTEXT=1) to keep plaintext"
+            );
+            self.server_url = s.url;
+        }
+    }
+}
+
+/// FR-101 P1b — the server URL an enrollment posts its token to and saves:
+/// a remote `http://` is `https://`, as the agent's enrollment does, so the
+/// token travels over TLS; loopback is left alone, and there is no plaintext
+/// escape. Shared by `roomler enroll` and the setup wizard's tunnel role.
+pub fn enrollment_server_url(raw: &str) -> String {
+    let secured = roomler_ai_remote_control::server_url::secure(raw, false);
+    if secured.promoted {
+        tracing::warn!(
+            original = %raw,
+            "upgrading http:// to https:// — enrollment tokens must travel over TLS"
+        );
+    }
+    secured.url.trim_end_matches('/').to_string()
 }
 
 // RETIRED-NAME-ANCHOR(4): ProjectDirs segment holding the ENROLLED credential on
@@ -54,11 +99,15 @@ pub fn load(path: Option<PathBuf>) -> Result<TunnelConfig> {
         std::env::var("ROOMLER_TUNNEL_SERVER"),
         std::env::var("ROOMLER_TUNNEL_TOKEN"),
     ) {
-        return Ok(TunnelConfig {
+        let mut cfg = TunnelConfig {
             server_url: server,
             tunnel_client_token: token,
             machine_name: std::env::var("ROOMLER_TUNNEL_NAME").unwrap_or_default(),
-        });
+            allow_plaintext_server: std::env::var("ROOMLER_TUNNEL_ALLOW_PLAINTEXT")
+                .is_ok_and(|v| v == "1"),
+        };
+        cfg.secure_server_url();
+        return Ok(cfg);
     }
 
     let resolved = match path {
@@ -73,8 +122,9 @@ pub fn load(path: Option<PathBuf>) -> Result<TunnelConfig> {
     }
     let s = std::fs::read_to_string(&resolved)
         .with_context(|| format!("reading tunnel config {}", resolved.display()))?;
-    let cfg: TunnelConfig = toml::from_str(&s)
+    let mut cfg: TunnelConfig = toml::from_str(&s)
         .with_context(|| format!("parsing tunnel config {}", resolved.display()))?;
+    cfg.secure_server_url();
     if cfg.tunnel_client_token.is_empty() {
         bail!(
             "tunnel-client config at {} has empty tunnel_client_token. Re-run `roomler enroll`.",
@@ -196,6 +246,7 @@ mod tests {
             server_url: "https://example.invalid".to_string(),
             tunnel_client_token: token.to_string(),
             machine_name: "box".to_string(),
+            allow_plaintext_server: false,
         }
     }
 
@@ -291,12 +342,68 @@ mod tests {
             server_url: "https://test.example".to_string(),
             tunnel_client_token: "test-jwt".to_string(),
             machine_name: "test-laptop".to_string(),
+            allow_plaintext_server: false,
         };
         save(&cfg, Some(&path)).unwrap();
         let loaded = load(Some(path)).unwrap();
         assert_eq!(loaded.server_url, cfg.server_url);
         assert_eq!(loaded.tunnel_client_token, cfg.tunnel_client_token);
         assert_eq!(loaded.machine_name, cfg.machine_name);
+    }
+
+    /// FR-101 P1b — a saved plaintext URL to a remote host is read as TLS,
+    /// so the tunnel dials `wss://`; loopback stays as written, and so does
+    /// everything under the owner's escape. Tested through a file: a test
+    /// that set `ROOMLER_TUNNEL_*` would race every other test here.
+    #[test]
+    fn a_plaintext_server_url_is_read_as_tls_unless_loopback_or_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let load_with = |name: &str, server: &str, allow: bool| {
+            let path = tmp.path().join(format!("{name}.toml"));
+            let cfg = TunnelConfig {
+                server_url: server.to_string(),
+                tunnel_client_token: "jwt".to_string(),
+                machine_name: String::new(),
+                allow_plaintext_server: allow,
+            };
+            save(&cfg, Some(&path)).unwrap();
+            load(Some(path)).unwrap()
+        };
+        let remote = load_with("remote", "http://roomler.ai", false);
+        assert_eq!(remote.server_url, "https://roomler.ai");
+        assert_eq!(
+            derive_ws_url(&remote.server_url).unwrap(),
+            "wss://roomler.ai/ws"
+        );
+        let local = load_with("local", "http://127.0.0.1:3000", false);
+        assert_eq!(
+            derive_ws_url(&local.server_url).unwrap(),
+            "ws://127.0.0.1:3000/ws"
+        );
+        let lab = load_with("lab", "http://lab.example:3000", true);
+        assert_eq!(lab.server_url, "http://lab.example:3000");
+    }
+
+    /// FR-101 P1b — `roomler enroll` and the wizard's tunnel role post the
+    /// token over TLS, whatever the owner's escape says; loopback stays.
+    #[test]
+    fn an_enrollment_posts_its_token_over_tls() {
+        assert_eq!(
+            enrollment_server_url("http://roomler.ai/"),
+            "https://roomler.ai"
+        );
+        assert_eq!(
+            enrollment_server_url("HTTP:roomler.ai"),
+            "https://roomler.ai"
+        );
+        assert_eq!(
+            enrollment_server_url("https://roomler.ai/"),
+            "https://roomler.ai"
+        );
+        assert_eq!(
+            enrollment_server_url("http://127.0.0.1:3000/"),
+            "http://127.0.0.1:3000"
+        );
     }
 
     #[test]
@@ -307,6 +414,7 @@ mod tests {
             server_url: "https://test.example".to_string(),
             tunnel_client_token: String::new(),
             machine_name: String::new(),
+            allow_plaintext_server: false,
         };
         save(&cfg, Some(&path)).unwrap();
         let err = load(Some(path)).unwrap_err();

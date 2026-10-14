@@ -231,6 +231,9 @@ async fn run_install_inner(
 
     check_cancel()?;
     emit(on_event, ProgressEvent::EnrollStarted);
+    // FR-101 P1b — the token travels over TLS, as `roomler enroll` sends it:
+    // a remote `http://` is posted to, and saved, as `https://`.
+    let server = roomler_cli::config::enrollment_server_url(&server);
     // The wizard's own crate version is the closest stand-in for the
     // CLI's wire-reported "client_version" — by build-time both
     // crates share workspace.version so the value is consistent.
@@ -291,6 +294,7 @@ fn write_config(result: &EnrollResult, override_path: Option<&Path>) -> anyhow::
         server_url: result.server_url.clone(),
         tunnel_client_token: result.tunnel_client_token.clone(),
         machine_name: result.machine_name.clone(),
+        allow_plaintext_server: false,
     };
     let path =
         roomler_cli::config::save(&cfg, override_path).context("writing tunnel config.toml")?;

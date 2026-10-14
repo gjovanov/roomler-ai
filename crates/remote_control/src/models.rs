@@ -6882,6 +6882,9 @@ mod tests {
             "rc_clipboard",
             "rc_files",
             "rc_audio",
+            // FR-101 P1b — keeping a plaintext server URL. A server that
+            // could set it could talk a device down to plaintext.
+            "allow_plaintext_server",
         ] {
             assert!(
                 !keys.contains(&forbidden),

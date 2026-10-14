@@ -156,6 +156,11 @@ is the next step, not part of the same form.
 > neither the cause nor the fix. `http://localhost:8080` is exempt and works, so
 > enrolling *this* machine needs nothing extra; every other machine needs
 > [a real hostname with TLS](#putting-it-behind-a-real-hostname).
+> Editing the address in a device's `config.toml` back to `http://` does not get
+> around this. Every load of the config reads a remote `http://` as `https://`
+> (FR-101 P1b, [security-baseline.md](security-baseline.md) §4). A lab that
+> knowingly runs without TLS sets `allow_plaintext_server = true` in that
+> device's config, which is the device owner's decision and never the server's.
 
 Mint an enrollment token in the web app (**Devices → Enroll device**), then on
 the machine you want to reach:

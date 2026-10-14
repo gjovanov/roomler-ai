@@ -345,6 +345,41 @@ The suite list needs a setter upstream does not have. It is a one-field patch to
 vendored webrtc crate (`SettingEngine::set_dtls_cipher_suites`, noted in the workspace
 `Cargo.toml`). Tunnel and overlay peers build their own engines and are unchanged.
 
+**A device reaches its server over TLS, whatever its config says** (FR-101 P1b,
+`crates/remote_control/src/server_url.rs`). Enrollment always rewrote `http://` to
+`https://`. But a `server_url` that reached a config some other way, by a hand edit or an
+enrollment from before the rule, was dialled as written. That meant a plaintext control
+WebSocket, and plaintext HTTP for the token renewal, the updater and the uploads, with
+the device's credential on every request. Now one rule holds wherever a server URL
+enters: a remote `http://` is read as `https://`, and `ws://` as `wss://`.
+
+| Entry point | A remote plaintext URL | Before |
+|---|---|---|
+| The agent's enrollment: `roomlerd enroll` and `re-enroll`, the wizard's agent role, the desktop companion | promoted | promoted, but only when spelled `http://` in lower case |
+| Every load of the agent's config: `server_url`, `ws_url`, and each `[[orgs]]` entry's | promoted, with a warning naming the field | dialled as written |
+| `roomler enroll`, the wizard's tunnel role | promoted | **the tunnel enrollment token was posted in plaintext** |
+| The tunnel CLI's config, from the file or `ROOMLER_TUNNEL_SERVER` | promoted | dialled as written |
+| `roomlerd anchor create` (FR-104) | refused, unchanged: the claim's answer is the command SYSTEM runs | refused |
+
+- **Loopback is exempt** (`localhost`, `127.0.0.0/8`, `::1`). It has no off-host path to
+  defend, and dev, test and CI servers run plaintext there.
+- ⚠️ **The guard reads a URL the way its dialler does.** reqwest parses by the WHATWG
+  rules, which accept `HTTP:roomler.ai`, `http:\\roomler.ai`, surrounding whitespace and
+  a tab inside the scheme. They also put the host after the authority's last `@`, so
+  `http://localhost:80@evil.example` dials `evil.example`. A guard stricter than its
+  dialler is a guard with a hole. A unit test therefore parses every spelling with the
+  real `url` crate and checks that the two agree.
+- **The escape belongs to the device.** A lab whose server has no TLS sets
+  `allow_plaintext_server = true` in the device's own `config.toml`. The LocalAPI accepts
+  that key only from the console, and it is structurally absent from `DesiredConfig`, so
+  a compromised server cannot talk a fleet down to plaintext. The tunnel CLI reads the
+  same key, or `ROOMLER_TUNNEL_ALLOW_PLAINTEXT=1` on its environment path. There is no
+  escape at enrollment: a token always travels over TLS.
+- **Counted before the default changed.** The ingress logged no plaintext agent `/ws`
+  attempt over about eight hours. Production's port 80 answers everything with a 301, and
+  a WebSocket client does not follow it. No deployed device could have been connected
+  over plaintext, so the rule can only bring such a device back.
+
 **Clipboard and file traffic is audited as the device's claim** (FR-101 P3,
 `crates/modules/remote/src/agent_socket.rs`, [remote-control.md](remote-control.md) §11.3a).
 The payload travels peer to peer, so the server cannot observe a transfer. The device reports

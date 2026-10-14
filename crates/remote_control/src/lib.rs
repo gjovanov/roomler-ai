@@ -40,6 +40,8 @@ pub mod hive;
 pub mod models;
 pub mod permissions;
 pub mod serde_helpers;
+/// FR-101 P1b — how an agent or the CLI reaches its server: over TLS.
+pub mod server_url;
 pub mod session;
 pub mod signaling;
 pub mod turn_creds;

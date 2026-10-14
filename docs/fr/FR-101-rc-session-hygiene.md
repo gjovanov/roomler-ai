@@ -211,7 +211,51 @@ limit and ends the session itself. The hub's part is to tell it the limit and to
   `SettingEngine`.
 - **`https` at every entry point.** Apply enrollment's promotion (loopback exempt) in `derive_ws_url` and at
   config load, so `ws://` can only ever mean loopback.
+
+  **As built (P1b).** One rule, `roomler_ai_remote_control::server_url::secure`
+  ([`server_url.rs:47`](../../crates/remote_control/src/server_url.rs#L47)). A remote `http://` becomes
+  `https://` and `ws://` becomes `wss://`; loopback is exempt
+  ([`is_loopback_authority`, `:83`](../../crates/remote_control/src/server_url.rs#L83)). It runs where a
+  URL to the server enters, not in `derive_ws_url`: that only maps a URL that is already secured, and the
+  same URL also feeds the token renewal, the updater and the uploads, which never pass through it.
+
+  | Entry point | Where | Before P1b |
+  |---|---|---|
+  | The agent's enrollment: `roomlerd enroll` / `re-enroll`, the wizard's agent role, the desktop companion | [`enrollment.rs:545`](../../crates/agent-core/src/enrollment.rs#L545) | promoted, but only a lower-case `http://` |
+  | Every load of the agent config: `server_url`, `ws_url`, each `[[orgs]]` entry's | [`config.rs:3088`](../../crates/agent-core/src/config.rs#L3088) → [`secure_server_urls`, `:2231`](../../crates/agent-core/src/config.rs#L2231) | dialled as written |
+  | `roomler enroll` and the wizard's tunnel role | [`roomler-cli/src/config.rs:67`](../../agents/roomler-cli/src/config.rs#L67), called at [`cli.rs:1124`](../../agents/roomler-cli/src/cli.rs#L1124) and [`orchestrator_tunnel.rs:236`](../../agents/roomler-setup/src/orchestrator_tunnel.rs#L236) | the tunnel token was posted as written |
+  | The tunnel CLI's config, from the file or `ROOMLER_TUNNEL_SERVER` | [`roomler-cli/src/config.rs:46`](../../agents/roomler-cli/src/config.rs#L46) | dialled as written |
+  | `roomlerd anchor create` (FR-104) | `exec_service::origin_ok` | refuses plaintext already; unchanged |
+
+  - ⚠️ **The guard reads a URL the way its dialler does.** reqwest parses by the WHATWG rules, which
+    accept `HTTP:roomler.ai`, `http:\\roomler.ai`, surrounding whitespace and a tab inside the scheme, and
+    find the host after the authority's last `@` (`http://localhost:80@evil.example` dials
+    `evil.example`). The first cut matched `split_once("://")` and would have passed all of those through
+    as plaintext. `the_guard_reads_a_url_as_its_dialler_does` now parses 21 plaintext spellings and 10
+    loopback ones with the real `url` crate and requires the two readings to agree. A loopback spelled
+    some way the guard does not read (`0x7f.1`, `2130706433`, `%6c…`) is promoted, so every doubt falls
+    on the side of TLS.
+  - **The escape is the device's:** `allow_plaintext_server = true` in its `config.toml`. It sits in the
+    Access group of the config surface and needs a restart. The LocalAPI takes it from the console only,
+    and it is in the never-pushable list beside `remote_config_enabled`, so a compromised server cannot
+    talk a device down to plaintext. The tunnel CLI reads the same key, or `ROOMLER_TUNNEL_ALLOW_PLAINTEXT=1`
+    on its environment path, where it has no file. There is no escape at enrollment: a token always
+    travels over TLS.
+  - **Counted first, as the split required.** The ingress logged no plaintext agent `/ws` attempt over
+    about 8 h (the only one was the probe itself). Production's port 80 answers everything with a 301,
+    which a WebSocket client does not follow. No deployed device could be connected over plaintext, so
+    the rule can only bring such a device back.
+  - ⚠️ The daemon's next save writes the promoted URL back to the file, so a lab that sets the escape
+    later also writes its `http://` URL again. A downgrade to a daemon older than P1b erases
+    `allow_plaintext_server` on its first save (#2078), so after updating again, set the escape once more.
+  - The agent-e2e harness's `ROOMLER_E2E_SERVER=http://roomler2` was promoted at enrollment before P1b
+    too (the rule dates from 2026-04-30, the harness from 2026-05-25). P1b changes nothing for it.
 - **TURN over IPv6** gets a field check. If coturn does not answer on v6, add `listening-ip` for it.
+  *Checked 2026-10-14, with P1b:* none of the coturn hosts the server hands out publishes an AAAA record
+  (`coturn`, `coturn-1`, `coturn-us-east` and `coturn-eu-north`, all under `roomler.ai`; `roomler.ai`
+  itself has none either). So no client reaches TURN over IPv6 today, whatever `listening-ip` says. An
+  IPv6-only client reaches it over IPv4 through its network's NAT64/DNS64. Publishing AAAA records, and
+  only then the `listening-ip` check, is an ops decision. It stays with AC8.
 
 ## 4. Phases
 
@@ -219,7 +263,7 @@ limit and ends the session itself. The hub's part is to tell it the limit and to
 |---|---|---|---|
 | P0 | This spec and the claim. The red evidence: a DTLS ClientHello pcap with CBC suites; an SRTCP replay accepted in a unit test | docs only | merged. ⚠️ Its "replay accepted" red was a bare `Context`, not a session; see §2 |
 | P1a | The transport: CBC out, the SRTP/SRTCP replay windows pinned (`agents/roomlerd/src/rc_transport.rs`, the vendored `set_dtls_cipher_suites`) | `ROOMLERD_DTLS_LEGACY_SUITES=1`; `ROOMLERD_SRTP_REPLAY_WINDOW` sizes the window, and no value turns it off | **shipped in 0.4.133.** FR-16 L0's `replay` / `legacy` / `unguarded` cells read both halves off the link in CI: DTLS red/green on the agent's real ClientHello, and replays refused on a live session. The window change is behaviour-neutral (§2). The field pcap is owed |
-| P1b | `https` at every entry point, and the IPv6 TURN check | an escape for plaintext labs | — **split from P1a** (see the note below) |
+| P1b | `https` at every entry point (§3d as built). The IPv6 TURN check is a field check of coturn with no code, so it stays with AC8 | `allow_plaintext_server = true` on the device; `ROOMLER_TUNNEL_ALLOW_PLAINTEXT=1` on the tunnel CLI's environment path | **#2226**, split from P1a (see the note below). Tests: `server_url` (the dialler-agreement test with 21 plaintext and 10 loopback spellings); the agent config's load, each `[[orgs]]` entry and the escape; enrollment; the tunnel CLI's load and enrollment; the never-pushable list. Negative controls: each of the guard's four readings removed (whitespace, the slashes, userinfo, the authority's end) fails the dialler test; the load call removed fails both config tests; the tunnel CLI's load and enrollment each fail their own. AC3's field red/green is owed after a release |
 | P2 | Policy switches and agent-side masking; viewer reasons | each setting defaults to today's behaviour (`on`) | split into P2a–P2c below |
 | P2a | The org's switch (§3a as built): `TenantSettings.rc_session`, the `rc-session-policy` route, the hub's strip with a reason per feature in `rc:session.created` and the audit row, the policy forwarded to the agent and carried by the cross-pod relay | each feature defaults to `on`: an org that sets nothing sees no change, and its agents get the same `rc:request` as before | **merged** #2198 (`6ccf92e20`): unit tests in db, remote_control, fleet and remote (the remote module joins CI's unit-test step: it was in no lane); `rc_session_policy_tests`, five cells reading both the viewer's answer and the agent's frame, a cross-pod one included. Negative controls: with the hub's strip removed, four of the five fail and the route cell passes; with the relay dropping the policy, only the cross-pod cell fails |
 | P2b | The device's own switch (device-owned, never pushable, so it survives a compromised server) and the agent's masking at every entry point; `session-policy` advertised, and the prompt names each `ask` feature in words (§3a as built) | `on` | **merged** #2203 (`8b08f332b`): `session_policy` unit tests (8) and the hub's `feature_grant_follows_the_device_floor`; two more `rc_session_policy_tests` cells (the floor named as the device's, a heartbeat moving it both ways). Negative controls: with the agent ignoring the floor, its four floor tests fail (AC4's core among them); with the hub ignoring it, the two new cells and two hub tests fail while the P2a cells pass |
