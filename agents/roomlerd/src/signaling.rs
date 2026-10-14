@@ -5,7 +5,8 @@
 //! Handles the full rc:* handshake and owns a map of per-session
 //! [`AgentPeer`] values that back each live WebRTC PeerConnection.
 //!
-//! Reconnect strategy: exponential backoff capped at 60 s. Fatal auth errors
+//! Reconnect strategy: exponential backoff capped at 60 s, restarted at 1 s by
+//! a connection that lived (#2221). Fatal auth errors
 //! (HTTP 401 on upgrade) exit the loop so the user can re-enroll.
 
 use anyhow::{Context, Result};
@@ -425,6 +426,24 @@ const RESUME_SKEW_MIN: Duration = Duration::from_secs(120);
 /// at the next periodic check".
 const UPDATE_RECHECK_AFTER_DOWN: Duration = Duration::from_secs(3600);
 
+/// #2221 — a connection that sent its hello and then ran this long proves the
+/// path, so the outage that ends it retries from 1 s instead of from wherever
+/// the LAST outage left the ladder. The bar is the session's life, not the
+/// handshake: a server that accepts and drops at once must still climb the
+/// ladder, or a fleet would reconnect to it every second.
+const LADDER_PROVEN_AFTER: Duration = Duration::from_secs(30);
+
+/// #2221 — the reconnect ladder after a transient drop. `started_outage`: the
+/// attempt that just ended had sent its hello (see [`OrgCtx::note_ws_down`]);
+/// `lasted`: how long that attempt ran.
+fn ladder_after_drop(backoff: Duration, started_outage: bool, lasted: Duration) -> Duration {
+    if started_outage && lasted >= LADDER_PROVEN_AFTER {
+        Duration::from_secs(1)
+    } else {
+        backoff
+    }
+}
+
 /// Multi-org P1 — per-enrollment context for one supervised signaling loop.
 /// `run_cmd` builds one per enabled enrollment (the config's scalar primary
 /// + each `[[orgs]]` entry) and spawns one [`run`] per context.
@@ -504,18 +523,23 @@ impl OrgCtx {
         self
     }
 
-    fn note_ws_down(&self) {
+    /// Stamp the start of an outage. `true` when this failure STARTED one: the
+    /// attempt before it had sent its hello (which clears the stamp), or no
+    /// attempt had failed yet (#2221).
+    fn note_ws_down(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         // Only the FIRST failure of an outage stamps (CAS from 0).
-        let _ = self.down_since_ms.compare_exchange(
-            0,
-            now,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.down_since_ms
+            .compare_exchange(
+                0,
+                now,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
     }
 
     fn note_ws_up_and_maybe_recheck_update(&self) {
@@ -848,6 +872,9 @@ pub async fn run(
             return Ok(());
         }
 
+        // #2221 — how long this attempt runs decides whether its drop
+        // restarts the ladder (see `ladder_after_drop`).
+        let attempt_started = std::time::Instant::now();
         let attempt = connect_once(
             &ctx,
             &cfg,
@@ -1109,7 +1136,12 @@ pub async fn run(
             Err(ConnectError::Transient(e)) => {
                 // A5 — first failure of this outage stamps the clock the
                 // reconnect-recovery update check keys off.
-                ctx.note_ws_down();
+                let started_outage = ctx.note_ws_down();
+                // #2221 — a session that lived ends with a 1 s first retry.
+                // The ladder used to survive a successful reconnect, so every
+                // later drop waited out the PREVIOUS outage's step (8 s in the
+                // field after a pod roll; up to 60 s).
+                backoff = ladder_after_drop(backoff, started_outage, attempt_started.elapsed());
                 // rc.58: log the full `source()` chain alongside the
                 // top-level Display — `tokio_tungstenite::Error`'s top
                 // message is just "ws connect" / "ws read" without the
@@ -6010,6 +6042,47 @@ pub(crate) fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2221 — a dropped session that lived restarts the reconnect ladder. A
+    /// quick drop, or a failure inside an outage, keeps climbing it.
+    #[test]
+    fn a_session_that_lived_restarts_the_ladder() {
+        let climbed = Duration::from_secs(8);
+        assert_eq!(
+            ladder_after_drop(climbed, true, LADDER_PROVEN_AFTER),
+            Duration::from_secs(1),
+            "a session past the bar starts its outage at 1 s"
+        );
+        assert_eq!(
+            ladder_after_drop(
+                climbed,
+                true,
+                LADDER_PROVEN_AFTER - Duration::from_millis(1)
+            ),
+            climbed,
+            "a server that accepts and drops at once must not reset the ladder"
+        );
+        assert_eq!(
+            ladder_after_drop(climbed, false, LADDER_PROVEN_AFTER + Duration::from_secs(1)),
+            climbed,
+            "an attempt that never sent its hello keeps climbing, however long it hung"
+        );
+    }
+
+    /// #2221 — `note_ws_down` says whether a failure STARTED an outage: the
+    /// first failure after a hello does, every later one in that outage does
+    /// not.
+    #[test]
+    fn only_the_first_failure_after_a_hello_starts_an_outage() {
+        let ctx = OrgCtx::primary(crate::token_slot::TokenSlot::new("t"));
+        assert!(ctx.note_ws_down(), "the first failure starts an outage");
+        assert!(!ctx.note_ws_down(), "the next one is inside it");
+        ctx.note_ws_up_and_maybe_recheck_update();
+        assert!(
+            ctx.note_ws_down(),
+            "after a hello, the next failure starts a new one"
+        );
+    }
 
     /// FR-90 P2c-3 — a secondary org's caps lose the replica words, by
     /// equality: `hive` and every other `hive-*` word stays. P2d: and
