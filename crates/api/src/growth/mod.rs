@@ -11,19 +11,37 @@
 //!
 //! * [`exclusions`] — P1c: the explicit exclusion list and the implicit one
 //!   it folds into (`roomler_core::growth::ExclusionSet`).
+//! * [`digest`] — P1d: the daily digest's sections, the once-only claim,
+//!   the delivery and the scheduler; [`purestat`] its one read of the web
+//!   plane; [`render`] its email bodies; [`routes`] its four routes.
 
+pub mod digest;
 pub mod exclusions;
+pub mod purestat;
+pub mod render;
+pub mod routes;
 
-use axum::{Router, routing::get};
+use axum::{
+    Router,
+    routing::{get, post},
+};
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 
 /// The `/api/admin/growth` router, mounted by `build_router`.
 pub fn admin_routes() -> Router<AppState> {
-    Router::new().route(
-        "/exclusions",
-        get(exclusions::get_exclusions).put(exclusions::put_exclusions),
-    )
+    Router::new()
+        .route(
+            "/exclusions",
+            get(exclusions::get_exclusions).put(exclusions::put_exclusions),
+        )
+        // P1d — the digest: a stored day, the list, a recompute (mails only
+        // with `send=true` and never a `sent` day), and a live preview that
+        // stores and mails nothing (`include_internal=true` = raw totals).
+        .route("/digest", get(routes::get_digest))
+        .route("/digests", get(routes::list_digests))
+        .route("/digest/run", post(routes::run_digest))
+        .route("/digest/preview", get(routes::preview_digest))
 }
 
 /// The gate every growth handler passes first: a platform admin, on a

@@ -43,7 +43,7 @@ erDiagram
 | `messages` | Chat. Thread via `thread_id`, pins, embeds; text index on `content`. `author_type` `user` (default) · `bot` · `webhook` · `system`; a non-user author carries its own `author_display` (FR-90: `Claude · <device>`), which is read **only** when `author_type` is not `user` — a person cannot rename themselves through it. Optional `binding` (FR-90: a turn's stub, edited in place when the turn ends) |
 | `reactions` | Unicode + custom-emoji reactions, keyed by `message_id` |
 | `recordings` | Call recordings; storage provider `S3`/`MinIO`/`Local` |
-| `call_sessions` | Call lifecycle rows (90 d TTL on `started_at`) |
+| `call_sessions` | Call lifecycle rows (**730 d** TTL on `started_at` — the conference module's index set, not 90 d) |
 | `call_chat_messages` | In-call chat (no secondary indexes) |
 | `files` | Versioned uploads; uploader, room linkage |
 | `invites` | Shareable/email/batch invites; unique `code` |
@@ -56,6 +56,7 @@ erDiagram
 | `consent_requests` | Remote-session owner-consent capability tokens |
 | `used_tokens` | Single-use JWT `jti` burn list (1 h TTL) |
 | `growth_exclusions` | FR-102 P1c: the platform admin's explicit exclusion list — `{kind: tenant\|user, id, reason, by, at}`, unique `(kind, id)`. The implicit exclusions (every platform admin, every org an excluded user owns) have no row; `roomler_core::growth::ExclusionSet` folds both into the one set every growth number applies ([growth-observability.md](growth-observability.md)). No TTL |
+| `growth_digests` | FR-102 P1d: one daily digest per closed UTC day, `_id = "YYYY-MM-DD"` — `status` (`computing` → `sent` · `stored` · `failed`), `claimed_at`, `computed_at`, `sent_at`, `attempts`, `error`, `recipients` (a **count**, never the addresses), `excluded {users, tenants}`, `sections` (the typed sections, serialised whole). The unique `_id` is the once-only claim: the insert decides which pod computes and mails. **25-month TTL** on `computed_at` |
 
 ## Fleet: agents, remote desktop, tunnels, overlay
 
@@ -95,7 +96,7 @@ erDiagram
 | Collection | Purpose · key fields / indexes |
 |---|---|
 | `agents` | One row per enrolled machine: name, os, version, caps (codecs/transports/rpc), exec policy, status. **Unique `(tenant_id, machine_id)`** — re-enrollment reuses the row. FR-40 adds three records of different trust: `overlay_identity` (the public key + epoch the device last **joined** with, server-verified, stamped on every join), `key_rotation` (the standing order, with `public_key_before`) and `key_rotation_report` (the device's **claim**; a later refusal never overwrites a `rotated` claim for the same order) — see [overlay-key-rotation.md](overlay-key-rotation.md) |
-| `remote_sessions` | Remote-desktop sessions: agent, controller user, state machine, stats. FR-101 P3: `transfer_totals`, the last cumulative clipboard tallies the device reported. These sit outside `stats` so that `mark_ended`'s whole-`stats` write cannot reset them; a reset would count everything again. 90 d TTL |
+| `remote_sessions` | Remote-desktop sessions: agent, controller user, state machine, stats. FR-101 P3: `transfer_totals`, the last cumulative clipboard tallies the device reported. These sit outside `stats` so that `mark_ended`'s whole-`stats` write cannot reset them; a reset would count everything again. **No TTL** — the remote module's index set carries none, so controller sessions outlive the 90-day audit rows (the usage view's `watchers_complete` flag exists for that reason) |
 | `remote_audit` | Per-session audit events (connect, consent, input, terminate). 90 d TTL |
 | `recording_activity` | FR-85: what a device **claims** about remote recordings (prompt outcome, started, stopped, refused, downloaded), with name, bytes, duration and reason, never content. Kept only for a session of that device whose grant held `RECORD`; the decision itself is in `remote_audit`. `(tenant_id, agent_id, at desc)`, `(session_id, at)`. 90 d TTL |
 | `transfer_activity` | FR-101 P3: the clipboard and file traffic a device **claims** for a remote session. Two kinds of row: a clipboard row per direction per 30 s sample (`count`, `bytes`), and a file row per completed file (`bytes`, `name_sha256`). Never content, never a file name. Kept only for a session of that device, clipboard rows only under `CLIPBOARD`, file rows only under `FILES`; a name hash that is not 64 lowercase hex digits is dropped. `(tenant_id, agent_id, at desc)`, `(session_id, at)`. 90 d TTL |
@@ -130,8 +131,8 @@ Raw event streams with short TTLs, rolled up hourly/daily by an in-server task
 | `stats_relay` · `stats_machine` · `stats_mesh` · `stats_events` · `stats_call` · `stats_call_user` | 7 d | Raw series: relay load (by region), per-machine, mesh edges, platform events, calls, per-user call usage |
 | `stats_relay_1h` · `stats_machine_1h` · `stats_call_1h` · `stats_call_user_1h` | 90 d | Hourly rollups |
 | `stats_relay_1d` · `stats_machine_1d` · `stats_call_1d` · `stats_call_user_1d` | 730 d | Daily rollups |
-| `page_views` | 7 d | SPA route-change beacons (paths normalized server-side) |
-| `ws_sessions` | 7 d | WebSocket session bookkeeping |
+| `page_views` | 90 d | SPA route-change beacons (paths normalized server-side) |
+| `ws_sessions` | 90 d | WebSocket session bookkeeping |
 
 ## Index & retention summary
 
@@ -139,7 +140,7 @@ Raw event streams with short TTLs, rolled up hourly/daily by an in-server task
 |---|---|
 | Unique identity | `users.email`, `users.username`, `tenants.slug`, `(tenant_id, user_id)` membership, `(tenant_id, machine_id)` on `agents` **and** `overlay_nodes`, `(tenant_id, network_id, overlay_ip)`, partial-unique live `overlay_nodes.name`, `overlay_blocks.slot`, sparse-unique `rooms.meeting_code` |
 | Full-text search | `messages.content` · `rooms.{name,purpose,tags}` · `users.{display_name,username}` · `agent_logs.lines.msg` |
-| TTL retention | 90 d: `remote_sessions`, `remote_audit`, `recording_activity`, `transfer_activity`, `tunnel_audit`, `exec_audit`, `key_rotation_audit`, `hive_audit`, `agent_approvals`, `agent_crashes`, `call_sessions`, hourly rollups · 7 d: `agent_logs`, raw stats, `page_views`, `ws_sessions` · 730 d: daily rollups · 1 d: `hive_session_memory` · 1 h: `used_tokens` · on-expiry: `activation_codes`, `background_tasks` · **never** (permanent, by decision): `keep_busy_events` (FR-92 P7, operator 2026-10-11), `agent_sessions` |
+| TTL retention | 90 d: `remote_audit`, `recording_activity`, `transfer_activity`, `tunnel_audit`, `exec_audit`, `key_rotation_audit`, `hive_audit`, `agent_approvals`, `agent_crashes`, `page_views`, `ws_sessions`, hourly rollups · 7 d: `agent_logs`, raw stats · 730 d: `call_sessions`, daily rollups · 25 months: `growth_digests` · 1 d: `hive_session_memory` · 1 h: `used_tokens` · on-expiry: `activation_codes`, `background_tasks` · **never** (permanent, by decision): `keep_busy_events` (FR-92 P7, operator 2026-10-11), `agent_sessions`, `remote_sessions`, `growth_exclusions` |
 
 Two patterns worth knowing when touching this layer:
 

@@ -140,6 +140,13 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/observability/ObservabilityView.vue'),
       },
       {
+        // FR-102 P1d — the growth digest (platform operators; the server
+        // 404s everyone else, so the client gate is a courtesy).
+        path: 'observability/growth',
+        name: 'observability-growth',
+        component: () => import('@/views/observability/GrowthView.vue'),
+      },
+      {
         path: 'profile/:userId',
         name: 'profile',
         component: () => import('@/views/profile/ProfileView.vue'),

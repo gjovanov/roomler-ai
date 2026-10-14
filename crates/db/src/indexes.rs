@@ -418,6 +418,19 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
         vec![index_unique(bson::doc! { "kind": 1, "id": 1 })],
     ));
 
+    // P1d — one digest per closed UTC day, `_id` the day: the unique `_id`
+    // is the once-only claim (the insert decides which pod computes and
+    // sends). Kept 25 months (spec §3l) from the day it was computed; a row
+    // that never computed (a claim that died) has no `computed_at` and is
+    // re-claimed by the job, not reaped.
+    sets.push(set(
+        "growth_digests",
+        vec![index_ttl(
+            bson::doc! { "computed_at": 1 },
+            25 * 30 * 24 * 60 * 60,
+        )],
+    ));
+
     // Hourly rollups (90 d) and daily rollups (730 d). The rollup task
     // whole-bucket-replaces via $merge on _id, so these are also upserts.
     for (coll, ttl_days) in [
