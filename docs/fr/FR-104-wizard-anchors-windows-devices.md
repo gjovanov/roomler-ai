@@ -89,7 +89,7 @@ sequenceDiagram
 | P0 | This spec, the issue and the registry row | docs only | this PR |
 | P1 | Server: the `anchor` claim, `enrolled_with_jti`, the second-purpose claim; tests | tokens carry `anchor` only when asked | — |
 | P2 | Admin UI checkbox and copy | — | — |
-| P3 | Wizard: `spawn_elevated`, the anchor step, progress, Done note | the step runs only for an `anchor: true` token | — |
+| P3 | Wizard: `spawn_elevated`, the anchor step, progress, Done note | the step runs only for an `anchor: true` token | in review |
 | P4 | Docs; field | — | — |
 
 ## 5. Acceptance criteria

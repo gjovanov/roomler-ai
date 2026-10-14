@@ -186,6 +186,11 @@ pub struct TokenValidation {
     /// the POST. `None` for daemon roles / no role: daemon tokens are
     /// not gated client-side, same as the legacy agent wizard.
     pub audience_matches: Option<bool>,
+    /// FR-104 — the token may also anchor the device it enrolls. `Some(true)`
+    /// = it will, for this role (a Windows machine-wide install: the wizard
+    /// then asks for a second administrator prompt); `Some(false)` = it could,
+    /// but this role has no SYSTEM service to anchor; `None` = a plain token.
+    pub will_anchor: Option<bool>,
 }
 
 /// Introspect a JWT WITHOUT verifying the signature (the wizard has
@@ -208,9 +213,12 @@ pub fn cmd_validate_token(token: String, role: Option<Role>) -> Result<TokenVali
         Some(Role::TunnelClient) => Some(token_type.as_deref() == Some("tunnel_enrollment")),
         _ => None,
     };
+    let will_anchor = wizard_shared::token_peek::parse_anchor_claim(&token)
+        .then(|| role.is_some_and(crate::orchestrator_agent::role_anchors));
     Ok(TokenValidation {
         appears_expired: is_likely_expired(&view, now),
         audience_matches,
+        will_anchor,
         issuer: view.issuer,
         audience: view.audience,
         token_type,
@@ -273,6 +281,12 @@ pub struct DoneReport {
     /// placed, `Some(false)` best-effort failure / no server asset,
     /// `None` for the tunnel role + non-Windows.
     pub desktop_installed: Option<bool>,
+    /// FR-104 — the device was anchored for SYSTEM exec in this install:
+    /// `Some(true)` anchored, `Some(false)` the step ran and did not (the
+    /// administrator prompt was declined, or the anchor failed; the Done
+    /// page then shows the manual command), `None` it did not apply (a plain
+    /// token, a per-user or tunnel install, non-Windows).
+    pub anchored: Option<bool>,
 }
 
 /// Drive the full install pipeline end-to-end for the picked role:
@@ -439,6 +453,7 @@ mod tests {
             shortcut_created: Some(false),
             cli_included: None,
             desktop_installed: None,
+            anchored: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(
@@ -476,9 +491,12 @@ mod tests {
             appears_expired: false,
             token_type: Some("tunnel_enrollment".to_string()),
             audience_matches: Some(true),
+            will_anchor: Some(true),
         };
         let json = serde_json::to_string(&v).unwrap();
         assert!(json.contains("audienceMatches"), "{json}");
+        // FR-104 — the SPA reads `willAnchor`.
+        assert!(json.contains(r#""willAnchor":true"#), "{json}");
         assert!(json.contains("expiresAtUnix"), "{json}");
         assert!(json.contains("appearsExpired"), "{json}");
         assert!(
