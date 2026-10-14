@@ -481,7 +481,11 @@ async fn cohorts_count_active_orgs_by_week_since_creation() {
         org(&app, ObjectId::new(), "o2", early).await,
         org(&app, ObjectId::new(), "o3", late).await,
     );
-    // o1 active in creation week (W0) and 4 weeks later; o2 in W0 only; o3 in W0.
+    // Value days land ON a creation day (W0) or exactly 28 days later (W4):
+    // adding 28 days keeps the weekday, so the week offset is exact
+    // whatever today's weekday is. Seeded by a direct insert (a serialised
+    // struct, never a hand-built doc!) — grouping is not needed, and
+    // `replace_day`'s real path is already exercised by the AC8 test.
     let value_day = |tenant: ObjectId, days: i64| {
         let d = ago(days);
         let day = org_daily::day_str_of(org_daily::parse_day_of(d));
@@ -511,14 +515,15 @@ async fn cohorts_count_active_orgs_by_week_since_creation() {
             computed_at: DateTime::now(),
         }
     };
-    let dao = GrowthDao::new(&app.db);
     for row in [
-        value_day(o1, 55),
-        value_day(o1, 55 - 28),
-        value_day(o2, 54),
-        value_day(o3, 27),
+        value_day(o1, 56), // o1 W0 (its creation day)
+        value_day(o1, 28), // o1 W4 (exactly 4 weeks later)
+        value_day(o2, 56), // o2 W0
+        value_day(o3, 28), // o3 W0 (its own creation day)
     ] {
-        dao.replace_day(&row.day.clone(), std::slice::from_ref(&row))
+        app.db
+            .collection::<Document>("growth_org_daily")
+            .insert_one(bson::to_document(&row).unwrap())
             .await
             .unwrap();
     }
