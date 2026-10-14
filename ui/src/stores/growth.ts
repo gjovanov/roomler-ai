@@ -282,6 +282,12 @@ export interface Coverage {
   n_floor: number
 }
 
+export interface Rates {
+  signup_per_visitor: Rate | null
+  activation: Rate | null
+  first_value: Rate | null
+}
+
 export interface CampaignRow {
   key: CampaignKey
   /** The taxonomy's group of the source: canonical, or `other`. */
@@ -292,13 +298,10 @@ export interface CampaignRow {
   activated: StepCounts | null
   first_value: StepCounts | null
   paid: NotMeasured
-  reach: NotMeasured
+  /** P8 — each platform's own numbers for the key's posts in the range. */
+  reach: Measured<PlatformReach[]>
   coverage: Measured<Coverage>
-  rates: {
-    signup_per_visitor: Rate | null
-    activation: Rate | null
-    first_value: Rate | null
-  }
+  rates: Rates
 }
 
 export interface CampaignTotals {
@@ -343,6 +346,151 @@ export interface CampaignsReport {
   totals: CampaignTotals
   rows: CampaignRow[]
   pulls: PullSummary
+}
+
+// ── P8: the Channels table and the ingest keys ─────────────────────────
+// Wire shapes mirror crates/api/src/growth/{channels,keys}.rs. Metric names
+// are the platforms' own (raw) — a metric is only ever compared with itself.
+
+/** A platform's own numbers at one snapshot age, summed over its posts. */
+export interface ReachAt {
+  snapshot: string
+  posts: number
+  metrics: Record<string, number>
+}
+
+export interface PlatformReach {
+  platform: string
+  posts: number
+  at: ReachAt[]
+}
+
+export interface SnapshotOut {
+  snapshot: string
+  taken_at: string
+  metrics: Record<string, number>
+}
+
+/** A cost per unit; `cents` only from n = 30. */
+export interface CostRate {
+  n: number
+  cents?: number
+}
+
+export interface Spend {
+  cost_cents: number
+  posts_with_cost: number
+  per_visitor: CostRate | null
+  per_signup: CostRate
+}
+
+export interface PostRow {
+  platform: string
+  platform_id: string
+  account: string
+  format: string
+  url: string
+  published_at: string
+  key: CampaignKey
+  cost_cents?: number
+  snapshots: SnapshotOut[]
+  reach: Measured<SnapshotOut>
+  web: Measured<WebCells>
+  signups: number
+  org_created: StepCounts
+  activated: StepCounts | null
+  first_value: StepCounts | null
+  paid: NotMeasured
+  rates: Rates
+  spend?: Spend
+}
+
+export interface PlatformSummary {
+  posts: number
+  reach: Measured<ReachAt[]>
+  /** Σ over the posts' distinct keys — an upper bound on unique visitors. */
+  web: Measured<WebCells>
+  signups: number
+  org_created: StepCounts
+  activated: StepCounts | null
+  first_value: StepCounts | null
+  paid: NotMeasured
+  rates: Rates
+  spend?: Spend
+}
+
+export interface PlatformRow {
+  platform: string
+  retired: boolean
+  summary: Measured<PlatformSummary>
+  posts: PostRow[]
+}
+
+export interface ChannelsReport {
+  enabled: boolean
+  since: string
+  until: string
+  include_internal: boolean
+  excluded: ExcludedCounts
+  n_floor: number
+  ingest_mounted: boolean
+  web_not_measured?: NotMeasured
+  conversions?: NotMeasured
+  web_truncated: boolean
+  account_truncated: boolean
+  posts_truncated: boolean
+  value_basis: string[]
+  not_measured?: Record<string, string>
+  platforms: PlatformRow[]
+}
+
+export interface GrowthKeyRow {
+  id: string
+  kind: 'ingest'
+  label: string
+  /** The key's first characters — to recognise it, never to use it. */
+  prefix: string
+  created_by: string
+  created_at: string
+  last_used_at?: string
+  revoked_at?: string
+  live: boolean
+}
+
+export interface KeysResponse {
+  enabled: boolean
+  ingest_mounted: boolean
+  keys: GrowthKeyRow[]
+}
+
+/** The mint answer: the only place the key itself ever appears. */
+export interface MintedKey extends GrowthKeyRow {
+  key: string
+}
+
+/** Cents as a two-decimal amount in the account's currency. */
+export function centsLabel(cents: number): string {
+  return (cents / 100).toFixed(2)
+}
+
+/** `impressions 3000 · clicks 80` — the first `max` metrics of an age,
+ *  raw names, as text. */
+export function metricsLabel(metrics: Record<string, number>, max = 3): string {
+  const parts = Object.entries(metrics)
+    .slice(0, max)
+    .map(([k, v]) => `${k} ${Number.isInteger(v) ? v : v.toFixed(1)}`)
+  const more = Object.keys(metrics).length - parts.length
+  return more > 0 ? `${parts.join(' · ')} · +${more}` : parts.join(' · ')
+}
+
+/** The oldest age a reach has — the platform's latest word. */
+export function latestReach(at: ReachAt[]): ReachAt | null {
+  return at.length ? at[at.length - 1] : null
+}
+
+/** Only an http(s) URL is ever rendered as a link. */
+export function safeHref(url: string): string | null {
+  return /^https?:\/\//i.test(url) ? url : null
 }
 
 /** `linkedin / post / 20261019-x` — the key at its depth, absent fields
@@ -490,6 +638,32 @@ export const useGrowthStore = defineStore('growth', () => {
     return api.get<CampaignsReport>(`/admin/growth/campaigns${qs ? `?${qs}` : ''}`)
   }
 
+  /** P8 — the Channels table: posts published in the range, per platform. */
+  async function fetchChannels(
+    opts: { since?: string; until?: string; includeInternal?: boolean } = {},
+  ): Promise<ChannelsReport> {
+    const q = new URLSearchParams()
+    if (opts.since) q.set('since', opts.since)
+    if (opts.until) q.set('until', opts.until)
+    if (opts.includeInternal) q.set('include_internal', 'true')
+    const qs = q.toString()
+    return api.get<ChannelsReport>(`/admin/growth/channels${qs ? `?${qs}` : ''}`)
+  }
+
+  /** P8 — the growth machine keys (never the key or its hash). */
+  async function fetchKeys(): Promise<KeysResponse> {
+    return api.get<KeysResponse>('/admin/growth/keys')
+  }
+
+  /** P8 — mint an ingest key; the answer is the only place it appears. */
+  async function mintKey(label: string): Promise<MintedKey> {
+    return api.post<MintedKey>('/admin/growth/keys', { kind: 'ingest', label })
+  }
+
+  async function revokeKey(id: string): Promise<void> {
+    await api.delete(`/admin/growth/keys/${encodeURIComponent(id)}`)
+  }
+
   return {
     digests,
     error,
@@ -502,5 +676,9 @@ export const useGrowthStore = defineStore('growth', () => {
     fetchOrgs,
     fetchTimeline,
     fetchCampaigns,
+    fetchChannels,
+    fetchKeys,
+    mintKey,
+    revokeKey,
   }
 })

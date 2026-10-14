@@ -27,6 +27,10 @@ import {
   SMALL_N,
   campaignKeyLabel,
   rateLabel,
+  centsLabel,
+  metricsLabel,
+  latestReach,
+  safeHref,
 } from '@/stores/growth'
 import { api } from '@/api/client'
 
@@ -75,6 +79,27 @@ describe('growth helpers', () => {
     expect(rateLabel(undefined)).toBeNull()
     expect(rateLabel({ n: 55, value: 0.018 })).toBe('1.8%')
     expect(rateLabel({ n: 30, value: 0 })).toBe('0%')
+  })
+
+  it('labels reach with raw metric names and links only http(s) URLs', () => {
+    // P8 — a platform's own metric names, verbatim; the oldest age is the latest word.
+    expect(metricsLabel({ impressions: 3000, clicks: 80 })).toBe('impressions 3000 · clicks 80')
+    expect(metricsLabel({ a: 1, b: 2, c: 3, d: 4 }, 2)).toBe('a 1 · b 2 · +2')
+    expect(metricsLabel({ averageViewPercentage: 41.54 })).toBe('averageViewPercentage 41.5')
+    expect(latestReach([])).toBeNull()
+    expect(
+      latestReach([
+        { snapshot: 'T+1d', posts: 1, metrics: {} },
+        { snapshot: 'T+7d', posts: 1, metrics: {} },
+      ])?.snapshot,
+    ).toBe('T+7d')
+    expect(centsLabel(5000)).toBe('50.00')
+    expect(centsLabel(9091)).toBe('90.91')
+    expect(safeHref('https://www.linkedin.com/feed/update/1/')).toBe(
+      'https://www.linkedin.com/feed/update/1/',
+    )
+    expect(safeHref('javascript:alert(1)')).toBeNull()
+    expect(safeHref('//evil.example')).toBeNull()
   })
 
   it('shows a rate only once the settled denominator reaches the n-floor', () => {
@@ -161,5 +186,28 @@ describe('useGrowthStore', () => {
     expect(mockApi.get).toHaveBeenCalledWith(
       '/admin/growth/campaigns?since=2026-10-01&until=2026-10-13&by=content&include_internal=true',
     )
+  })
+
+  it('fetches channels and manages ingest keys at the P8 routes', async () => {
+    const store = useGrowthStore()
+    mockApi.get.mockResolvedValue({ keys: [] })
+    mockApi.post.mockResolvedValue({ id: 'k1', key: 'rgi_x' })
+    mockApi.delete.mockResolvedValue(undefined)
+    await store.fetchChannels()
+    expect(mockApi.get).toHaveBeenCalledWith('/admin/growth/channels')
+    await store.fetchChannels({ since: '2026-10-01', until: '2026-10-13', includeInternal: true })
+    expect(mockApi.get).toHaveBeenCalledWith(
+      '/admin/growth/channels?since=2026-10-01&until=2026-10-13&include_internal=true',
+    )
+    await store.fetchKeys()
+    expect(mockApi.get).toHaveBeenCalledWith('/admin/growth/keys')
+    const minted = await store.mintKey('promotion pipeline')
+    expect(mockApi.post).toHaveBeenCalledWith('/admin/growth/keys', {
+      kind: 'ingest',
+      label: 'promotion pipeline',
+    })
+    expect(minted.key).toBe('rgi_x')
+    await store.revokeKey('69a1dbbad2000f26adc875ce')
+    expect(mockApi.delete).toHaveBeenCalledWith('/admin/growth/keys/69a1dbbad2000f26adc875ce')
   })
 })

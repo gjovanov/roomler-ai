@@ -220,9 +220,22 @@
               </v-chip>
             </td>
             <td>
-              <v-chip size="x-small" variant="tonal" color="grey" :title="r.reach.not_measured">
-                {{ notMeasuredLabel(r.reach) }}
-              </v-chip>
+              <v-chip
+                v-if="isNotMeasured(r.reach)"
+                size="x-small"
+                variant="tonal"
+                color="grey"
+                :title="r.reach.not_measured"
+              >not measured</v-chip>
+              <template v-else>
+                <div v-for="pr in r.reach" :key="pr.platform" class="text-caption">
+                  {{ pr.platform }} · {{ pr.posts }} post{{ pr.posts === 1 ? '' : 's' }}
+                  <template v-if="latestReach(pr.at)">
+                    · {{ latestReach(pr.at)?.snapshot }}: {{ metricsLabel(latestReach(pr.at)?.metrics ?? {}) }}
+                  </template>
+                  <template v-else> · no snapshot yet</template>
+                </div>
+              </template>
             </td>
             <td class="text-right">
               <v-chip
@@ -250,6 +263,8 @@ import { computed, onMounted, ref } from 'vue'
 import {
   useGrowthStore,
   isNotMeasured,
+  latestReach,
+  metricsLabel,
   notMeasuredLabel,
   rateLabel,
   type CampaignRow,

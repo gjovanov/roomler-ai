@@ -52,6 +52,7 @@ use roomler_ai_services::{
         growth_digest::{
             ClaimMode, ClaimOutcome, DigestDoc, DigestStatus, DigestStore, ExcludedCounts,
         },
+        growth_social::{GROWTH_POST_SNAPSHOTS, GROWTH_POSTS, SNAPSHOTS},
     },
 };
 use roomler_core::{campaign, growth::ExclusionSet};
@@ -77,6 +78,9 @@ pub const MAX_LISTED_SIGNUPS: usize = 20;
 pub const TOP_ORGS: usize = 10;
 pub const TOP_WEB_ROWS: usize = 10;
 pub const TOP_BLOG_POSTS: usize = 20;
+/// P8 — the most of the day's social snapshots listed (by platform, then
+/// age); a bound for the mail, not a page.
+pub const TOP_SOCIAL_SNAPSHOTS: usize = 20;
 /// Below this n a rate is not shown — counts only (spec principle 5).
 pub const SMALL_N: i64 = 30;
 /// A ceiling on the rows one source query loads — far above this
@@ -671,6 +675,35 @@ pub struct Quality {
     pub crashes: Measured<Crashes>,
 }
 
+/// P8 — the posts one platform published in the windows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocialPlatform {
+    pub platform: String,
+    pub posts: Figure,
+}
+
+/// P8 — one snapshot taken on the day: the platform's own numbers, raw
+/// metric names, for the post its campaign names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SocialSnapshot {
+    pub platform: String,
+    pub platform_id: String,
+    /// `T+1d` · `T+7d` · `T+28d`.
+    pub snapshot: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign: Option<String>,
+    pub metrics: BTreeMap<String, f64>,
+}
+
+/// P8 — social reach (spec §3l): posts published per platform, and the
+/// snapshots the pipeline took on the day.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Social {
+    pub posts_by_platform: Vec<SocialPlatform>,
+    /// At most [`TOP_SOCIAL_SNAPSHOTS`].
+    pub snapshots: Vec<SocialSnapshot>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sections {
     pub headline: Headline,
@@ -684,7 +717,9 @@ pub struct Sections {
     pub revenue: Revenue,
     pub quality: Quality,
     pub install: Install,
-    pub social: NotMeasured,
+    /// P8 — each platform's own numbers, as the promotion pipeline pushed
+    /// them; `not_measured` when nothing was pushed in the 28-day window.
+    pub social: Measured<Social>,
     pub search: NotMeasured,
 }
 
@@ -1499,6 +1534,118 @@ async fn crashes_section(
     })
 }
 
+/// P8 — the posts published per platform in the 28-day window, and the
+/// snapshots taken on the day (their post's campaign beside them). Nothing
+/// pushed in the window is `not_measured` — the pipeline being quiet and the
+/// pipeline not running look the same from here, so neither is a 0.
+async fn social_section(state: &AppState, w: &Windows) -> Result<Measured<Social>, DigestError> {
+    let posts = find_docs(
+        state,
+        GROWTH_POSTS,
+        doc! { "published_at": w.between(Span::D28) },
+        doc! { "platform": 1, "published_at": 1 },
+    )
+    .await?;
+    let snaps = find_docs(
+        state,
+        GROWTH_POST_SNAPSHOTS,
+        doc! { "taken_at": w.between(Span::Day) },
+        doc! { "platform": 1, "platform_id": 1, "snapshot": 1, "metrics": 1 },
+    )
+    .await?;
+    if posts.is_empty() && snaps.is_empty() {
+        return Ok(Measured::NotMeasured(NotMeasured::now(
+            if mounted(state, "saas") {
+                "no posts pushed in the last 28 days"
+            } else {
+                "saas module not mounted (the ingest routes run there)"
+            },
+        )));
+    }
+    let mut by: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    for d in &posts {
+        if let (Some(p), Some(t)) = (str_of(d, "platform"), dt_ms(d, "published_at")) {
+            by.entry(p).or_default().push(t);
+        }
+    }
+    let mut posts_by_platform: Vec<SocialPlatform> = by
+        .into_iter()
+        .map(|(platform, times)| SocialPlatform {
+            platform,
+            posts: w.count(times),
+        })
+        .collect();
+    posts_by_platform.sort_by(|a, b| {
+        b.posts
+            .d28
+            .cmp(&a.posts.d28)
+            .then_with(|| a.platform.cmp(&b.platform))
+    });
+    let mut snapshots: Vec<SocialSnapshot> = snaps
+        .iter()
+        .filter_map(|d| {
+            let metrics = d
+                .get_document("metrics")
+                .ok()?
+                .iter()
+                .filter_map(|(k, v)| v.as_f64().map(|v| (k.clone(), v)))
+                .collect();
+            Some(SocialSnapshot {
+                platform: str_of(d, "platform")?,
+                platform_id: str_of(d, "platform_id")?,
+                snapshot: str_of(d, "snapshot")?,
+                campaign: None,
+                metrics,
+            })
+        })
+        .collect();
+    let rank = |s: &str| SNAPSHOTS.iter().position(|x| *x == s).unwrap_or(usize::MAX);
+    snapshots.sort_by(|a, b| {
+        a.platform
+            .cmp(&b.platform)
+            .then_with(|| rank(&a.snapshot).cmp(&rank(&b.snapshot)))
+            .then_with(|| a.platform_id.cmp(&b.platform_id))
+    });
+    snapshots.truncate(TOP_SOCIAL_SNAPSHOTS);
+    // The campaign of each listed snapshot's post — which post it is, in the
+    // operator's own words (the platform id is opaque).
+    if !snapshots.is_empty() {
+        let or: Vec<Document> = snapshots
+            .iter()
+            .map(|s| doc! { "platform": &s.platform, "platform_id": &s.platform_id })
+            .collect();
+        let keyed = find_docs(
+            state,
+            GROWTH_POSTS,
+            doc! { "$or": or },
+            doc! { "platform": 1, "platform_id": 1, "key.campaign": 1 },
+        )
+        .await?;
+        let campaigns: HashMap<(String, String), String> = keyed
+            .iter()
+            .filter_map(|d| {
+                let campaign = d
+                    .get_document("key")
+                    .ok()
+                    .and_then(|k| str_of(k, "campaign"))?;
+                Some((
+                    (str_of(d, "platform")?, str_of(d, "platform_id")?),
+                    campaign,
+                ))
+            })
+            .collect();
+        for s in &mut snapshots {
+            s.campaign = campaigns
+                .get(&(s.platform.clone(), s.platform_id.clone()))
+                .cloned();
+        }
+    }
+    Ok(Measured::Value(Social {
+        posts_by_platform,
+        snapshots,
+    }))
+}
+
 // ── The web plane ────────────────────────────────────────────────────────
 
 const WEB_TOTALS: [&str; 3] = ["visitors", "visits", "pageviews"];
@@ -1849,6 +1996,8 @@ pub async fn compute(
         Measured::unmounted("saas")
     };
     let revenue = revenue_section(state, set).await?;
+    // P8 — core-level collections, read whether or not `saas` is mounted.
+    let social = social_section(state, &w).await?;
     let quality = Quality {
         remote: match &remote {
             Some(_) => Measured::Value(remote_quality(state, &w, set).await?),
@@ -1921,7 +2070,7 @@ pub async fn compute(
         revenue,
         quality,
         install,
-        social: NotMeasured::later("each platform's own numbers per post", "P8"),
+        social,
         search: NotMeasured::later("clicks, impressions, top queries and pages", "P7"),
     })
 }

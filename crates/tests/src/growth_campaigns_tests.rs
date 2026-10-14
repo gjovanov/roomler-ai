@@ -43,11 +43,11 @@ use crate::fixtures::test_app::TestApp;
 
 // ── A fake purestat ─────────────────────────────────────────────────────
 
-type Seen = Arc<Mutex<Vec<(Option<String>, Value)>>>;
+pub(crate) type Seen = Arc<Mutex<Vec<(Option<String>, Value)>>>;
 
 #[derive(Clone, Default)]
-struct Fake {
-    seen: Seen,
+pub(crate) struct Fake {
+    pub(crate) seen: Seen,
 }
 
 /// The fake's whole site, at the finest grain the contract allows: four
@@ -177,7 +177,7 @@ async fn fake_query(
     }
 }
 
-async fn fake_purestat() -> (String, Fake) {
+pub(crate) async fn fake_purestat() -> (String, Fake) {
     let fake = Fake::default();
     let router = Router::new()
         .route("/api/v1/query", post(fake_query))
@@ -190,16 +190,16 @@ async fn fake_purestat() -> (String, Fake) {
 
 // ── Days and seeds ──────────────────────────────────────────────────────
 
-fn today() -> NaiveDate {
+pub(crate) fn today() -> NaiveDate {
     org_daily::parse_day_of(DateTime::now())
 }
 
-fn ds(day: NaiveDate) -> String {
+pub(crate) fn ds(day: NaiveDate) -> String {
     org_daily::day_str_of(day)
 }
 
 /// `day` at `h:00` UTC.
-fn at_day(day: NaiveDate, h: u32) -> DateTime {
+pub(crate) fn at_day(day: NaiveDate, h: u32) -> DateTime {
     DateTime::from_millis(
         day.and_hms_opt(h, 0, 0)
             .unwrap()
@@ -267,7 +267,7 @@ async fn device(app: &TestApp, tenant: ObjectId, created: DateTime) {
 
 /// A platform-admin app pointed at `purestat` with `key`; `tweak` adjusts
 /// the rest. The admin and their org exist (and are excluded implicitly).
-async fn admin_app(
+pub(crate) async fn admin_app(
     purestat: &str,
     key: &str,
     tweak: impl FnOnce(&mut roomler_ai_config::Settings),
@@ -297,7 +297,7 @@ async fn admin_app(
 /// x/post/c9 (no web row), youtube/video/20261019-SSH/Desc-Top, and one
 /// organic. Stored as ingress stores them: source and medium normalised,
 /// campaign and content as sent.
-async fn seed_signups(app: &TestApp) -> NaiveDate {
+pub(crate) async fn seed_signups(app: &TestApp) -> NaiveDate {
     let y = today() - chrono::Duration::days(1);
     let li = ObjectId::new();
     user(
@@ -330,7 +330,7 @@ async fn seed_signups(app: &TestApp) -> NaiveDate {
     y
 }
 
-async fn get_json(app: &TestApp, path: &str, token: &str) -> (u16, Value) {
+pub(crate) async fn get_json(app: &TestApp, path: &str, token: &str) -> (u16, Value) {
     let r = app.auth_get(path, token).send().await.unwrap();
     let status = r.status().as_u16();
     let text = r.text().await.unwrap();
@@ -340,7 +340,7 @@ async fn get_json(app: &TestApp, path: &str, token: &str) -> (u16, Value) {
     )
 }
 
-fn row<'a>(j: &'a Value, source: &str, campaign: Option<&str>) -> &'a Value {
+pub(crate) fn row<'a>(j: &'a Value, source: &str, campaign: Option<&str>) -> &'a Value {
     j["rows"]
         .as_array()
         .unwrap()
@@ -368,7 +368,7 @@ async fn daily_value(app: &TestApp, day: &str, metric: &str, dims: Document) -> 
         .and_then(|d| d.get_i64("value").ok())
 }
 
-async fn count(app: &TestApp, coll: &str, filter: Document) -> u64 {
+pub(crate) async fn count(app: &TestApp, coll: &str, filter: Document) -> u64 {
     app.db
         .collection::<Document>(coll)
         .count_documents(filter)
@@ -690,7 +690,11 @@ async fn the_campaigns_view_joins_both_planes_by_the_normalised_key() {
     );
     assert_eq!(li["rates"]["signup_per_visitor"]["n"], 55);
     assert_eq!(li["paid"]["arrives_with"], "P4");
-    assert_eq!(li["reach"]["arrives_with"], "P8");
+    // P8 — no post was pushed with this key: reach not measured, never 0.
+    assert_eq!(
+        li["reach"]["not_measured"],
+        "no post pushed with this key in the range"
+    );
     assert_eq!(li["group"], "linkedin");
     // A key purestat never saw: a measured zero, not "not measured".
     let x = row(&j, "x", Some("c9"));

@@ -467,6 +467,37 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
         vec![index(bson::doc! { "source": 1, "day": 1 })],
     ));
 
+    // P8 — machine keys for the growth surface (D12): only a hash and a
+    // display prefix, never the key. The hash is what a request is looked
+    // up by, so it is unique (two keys colliding is a 2^-192 event, and the
+    // index makes it a refused insert rather than an ambiguous lookup).
+    sets.push(set(
+        "growth_keys",
+        vec![
+            index_unique(bson::doc! { "hash": 1 }),
+            index(bson::doc! { "kind": 1, "created_at": -1 }),
+        ],
+    ));
+
+    // P8 — social reach as the promotion pipeline pushes it: a post is
+    // `(platform, platform_id)` and a snapshot `(platform, platform_id,
+    // snapshot)`. The unique pairs ARE the idempotency (AC18: a snapshot
+    // pushed twice is stored once); the views read posts by publish time.
+    // No TTL — aggregates about our own content, no person (spec §3p).
+    sets.push(set(
+        "growth_posts",
+        vec![
+            index_unique(bson::doc! { "platform": 1, "platform_id": 1 }),
+            index(bson::doc! { "published_at": 1 }),
+        ],
+    ));
+    sets.push(set(
+        "growth_post_snapshots",
+        vec![index_unique(
+            bson::doc! { "platform": 1, "platform_id": 1, "snapshot": 1 },
+        )],
+    ));
+
     // Hourly rollups (90 d) and daily rollups (730 d). The rollup task
     // whole-bucket-replaces via $merge on _id, so these are also upserts.
     for (coll, ttl_days) in [
