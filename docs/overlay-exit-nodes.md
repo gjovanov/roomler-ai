@@ -194,6 +194,32 @@ The mechanism reuses what's already there — **zero new wire or model fields**:
   do **not** need to demote the physical link.
 - **Windows**: a `.`-root NRPT rule tagged `roomler-exit-dns` (idempotent
   pre-add clear; the tag scopes purges so we never clobber foreign NRPT rules).
+- **macOS** (FR-97 P1c): a dictionary in the SCDynamicStore,
+  `State:/Network/Service/roomler-exit-dns/DNS`, with
+  `SupplementalMatchDomains = [""]`. The empty match domain makes it resolver
+  #1 for every name, while the MagicDNS zone (its own key, below) keeps its
+  names. Every key is a **temporary** value of one session the daemon holds
+  for its whole life, so configd removes them when the process ends, however
+  it ends: nothing for a boot purge to find. `ROOMLERD_MACOS_DNS_STEER=0`
+  turns it off.
+
+```mermaid
+flowchart LR
+    D["roomlerd: one SCDynamicStore session<br/>(a thread owns it; keys added TEMPORARY)"]
+    D --> Z["State:/Network/Service/roomler-dns-utunN/DNS<br/>Supplemental [magic domain] → self_v4<br/>NoSearch = 1"]
+    D --> X["State:/Network/Service/roomler-exit-dns/DNS<br/>Supplemental [&quot;&quot;] → target"]
+    Z --> C["configd → scutil --dns"]
+    X --> C
+    K["crash / kill -9"] -.->|"session gone: configd drops<br/>both keys in 1–3 s (measured)"| C
+```
+
+| Measured on a tart Mac before the code (an unreachable resolver as the oracle) | Result |
+|---|---|
+| a zone key, `SupplementalMatchDomains = [apple.com]` | `www.apple.com` stopped resolving, `www.google.com` still resolved; no search-list entry with `NoSearch = 1` |
+| a catch-all key, `[""]` | became resolver #1; `www.apple.com` stopped resolving |
+| the holding process SIGKILLed (one key, then two in one session) | each key gone within 1–4 s; resolution back |
+| the same key written WITHOUT the temporary flag | survived its writer |
+| a service with `OverridePrimary` (the other VPN-client shape) | no effect on the resolver, and none on the default route either |
 
 Steering is gated on the local resolver having **actually bound** its socket —
 we never point `"."` at a dead `:53` (which would black-hole all DNS). Status
