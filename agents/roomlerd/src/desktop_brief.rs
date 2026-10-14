@@ -210,6 +210,7 @@ mod tests {
             display: None,
             kind: kind.into(),
             desktop: None,
+            state: String::new(),
         }
     }
 

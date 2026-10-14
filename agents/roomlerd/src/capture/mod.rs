@@ -654,7 +654,13 @@ fn capture_keys_set() -> bool {
 enum OwnSession {
     /// Signed in to an active Wayland session.
     Wayland,
-    /// Anything else: X11, only a tty, nobody signed in, no logind to ask.
+    /// FR-93 P5g — signed in to a Wayland session its seat is not showing: a
+    /// user switch, or the login screen put in front of it. It comes back on
+    /// its own, so the automatic arm is planned all the same, and an open
+    /// waits for it ([`wait_while_away`]).
+    Away,
+    /// Anything else: X11, only a tty, nobody signed in (a session that is
+    /// closing is a logout), no logind to ask.
     Other,
 }
 
@@ -706,14 +712,15 @@ fn wayland_plan(
         return WaylandPlan::AsConfigured;
     }
     match session() {
-        OwnSession::Wayland => WaylandPlan::Auto,
+        OwnSession::Wayland | OwnSession::Away => WaylandPlan::Auto,
         OwnSession::Other => WaylandPlan::AsConfigured,
     }
 }
 
-/// This daemon's user's active Wayland session, from logind. A user can have
-/// several sessions (an SSH login beside the desktop); only an active
-/// graphical one of class `user` counts, never a greeter.
+/// This daemon's user's Wayland session, from logind. A user can have several
+/// sessions (an SSH login beside the desktop); only a graphical one of class
+/// `user` counts, never a greeter: an active one, else (FR-93 P5g) one in the
+/// background.
 #[cfg(target_os = "linux")]
 fn own_session() -> OwnSession {
     // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
@@ -727,11 +734,13 @@ fn own_session() -> OwnSession {
 /// (the desktop brief) does not run loginctl twice.
 #[cfg(target_os = "linux")]
 fn own_session_in(all: &[crate::keep_busy::logind::Session], uid: u32) -> OwnSession {
-    if all
+    let mut mine = all
         .iter()
-        .any(|s| s.uid == uid && s.is_user() && s.active && s.kind == "wayland")
-    {
+        .filter(|s| s.uid == uid && s.is_user() && s.kind == "wayland");
+    if mine.clone().any(|s| s.active) {
         OwnSession::Wayland
+    } else if mine.any(|s| s.in_background()) {
+        OwnSession::Away
     } else {
         OwnSession::Other
     }
@@ -966,6 +975,22 @@ const DISPLAY_OFF: HostWait = HostWait {
     ended: "the session that waited for the display to wake has ended",
 };
 
+/// P5g — this user's Wayland session in the background: a user switch, or
+/// the login screen put in front of it. The compositor draws no background
+/// session, and the helper refuses to open one ("nobody is at this machine's
+/// screen", its attended-only rule), so an open waits for the session to be
+/// on screen again. Read from logind, never from an error: the same refusal
+/// is a logout's.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "portal-capture")),
+    allow(dead_code)
+)]
+const SESSION_AWAY: HostWait = HostWait {
+    named_by: names_nothing,
+    gave_up: gave_up_away,
+    ended: "the session that waited for this user's session to be on screen has ended",
+};
+
 #[cfg_attr(
     not(all(target_os = "linux", feature = "portal-capture")),
     allow(dead_code)
@@ -975,7 +1000,10 @@ fn names_mutter_inhibited(err: &str) -> bool {
 }
 
 #[cfg_attr(
-    not(all(target_os = "linux", feature = "drm-capture")),
+    not(all(
+        target_os = "linux",
+        any(feature = "portal-capture", feature = "drm-capture")
+    )),
     allow(dead_code)
 )]
 fn names_nothing(_err: &str) -> bool {
@@ -998,6 +1026,14 @@ fn gave_up_locked(minutes: u64, err: &str) -> String {
 )]
 fn gave_up_dark(minutes: u64, err: &str) -> String {
     format!("the display stayed off for {minutes} minutes: {err}")
+}
+
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "portal-capture")),
+    allow(dead_code)
+)]
+fn gave_up_away(minutes: u64, err: &str) -> String {
+    format!("this user's session stayed in the background for {minutes} minutes: {err}")
 }
 
 /// FR-93 P5b (#2145) / P3e — an open the host refuses for a while waits for
@@ -1068,11 +1104,49 @@ fn open_through_wait<T>(
     }
 }
 
+/// FR-93 P5g — an open that finds this user's Wayland session in the
+/// background waits for it to be on screen again, the controller told why,
+/// before either automatic arm is tried. The arms come after it, so a session
+/// locked as well (GNOME's *Switch User* locks first) is P5b's to wait out
+/// and tell once it is back. `away` is asked every [`HOST_WAIT_POLL`]; the
+/// wait ends as P5b's does: the session that asked left, or [`HOST_WAIT_MAX`].
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "portal-capture")),
+    allow(dead_code)
+)]
+fn wait_while_away(
+    away: impl Fn() -> bool,
+    abandoned: impl Fn() -> bool,
+    tell: impl FnMut(std::time::Duration),
+    sleep: impl FnMut(std::time::Duration),
+    now: impl Fn() -> std::time::Instant,
+) -> Result<(), String> {
+    open_through_wait(
+        SESSION_AWAY,
+        || {
+            if away() {
+                Err(
+                    "this user's session is in the background: a user switch, or the login screen \
+                     in front of it"
+                        .into(),
+                )
+            } else {
+                Ok(())
+            }
+        },
+        || Some(away()),
+        abandoned,
+        tell,
+        sleep,
+        now,
+    )
+}
+
 #[cfg(test)]
 mod host_wait_tests {
     use super::{
         DISPLAY_OFF, GNOME_LOCK, HOST_WAIT_MAX, HOST_WAIT_RETRY, MUTTER_INHIBITED,
-        open_through_wait,
+        open_through_wait, wait_while_away,
     };
     use std::cell::{Cell, RefCell};
     use std::time::{Duration, Instant};
@@ -1328,6 +1402,74 @@ mod host_wait_tests {
             r.unwrap_err(),
             "the session that waited for the display to wake has ended"
         );
+    }
+
+    /// FR-93 P5g — a session that is on screen costs one logind read: no
+    /// notice, no sleep.
+    #[test]
+    fn an_open_while_the_session_is_on_screen_is_not_delayed() {
+        let told = RefCell::new(Vec::new());
+        let r = wait_while_away(
+            || false,
+            || false,
+            |d| told.borrow_mut().push(d),
+            |_| panic!("no wait"),
+            Instant::now,
+        );
+        assert_eq!(r, Ok(()));
+        assert!(told.borrow().is_empty());
+    }
+
+    /// P5g — away (a user switch): told once, logind asked every poll, done
+    /// within a poll of the session's return.
+    #[test]
+    fn a_session_in_the_background_is_waited_for_and_the_controller_told_once() {
+        let t0 = Instant::now();
+        let now = Cell::new(t0);
+        let back_at = t0 + Duration::from_secs(40);
+        let told = RefCell::new(Vec::new());
+        let r = wait_while_away(
+            || now.get() < back_at,
+            || false,
+            |d| told.borrow_mut().push(d),
+            |d| now.set(now.get() + d),
+            || now.get(),
+        );
+        assert_eq!(r, Ok(()));
+        assert_eq!(*told.borrow(), [HOST_WAIT_MAX], "told once");
+        assert!(
+            now.get() - back_at <= Duration::from_secs(1),
+            "within a poll of the return, not the 30 s retry"
+        );
+    }
+
+    /// P5g — the session that asked left, or an hour passed: each ends the
+    /// wait in its own words.
+    #[test]
+    fn a_wait_for_the_session_ends_with_the_session_or_the_bound() {
+        let t0 = Instant::now();
+        let now = Cell::new(t0);
+        let r = wait_while_away(
+            || true,
+            || now.get() >= t0 + Duration::from_secs(3),
+            |_| {},
+            |d| now.set(now.get() + d),
+            || now.get(),
+        );
+        assert_eq!(
+            r.unwrap_err(),
+            "the session that waited for this user's session to be on screen has ended"
+        );
+        let now = Cell::new(t0);
+        let e = wait_while_away(
+            || true,
+            || false,
+            |_| {},
+            |d| now.set(now.get() + d),
+            || now.get(),
+        )
+        .unwrap_err();
+        assert!(e.contains("stayed in the background for 60 minutes"), "{e}");
     }
 }
 
@@ -1968,9 +2110,11 @@ pub enum WaitFor {
     SessionAway,
 }
 
-/// What a pump hands [`open_default_async`]: called at most once, if and when
-/// its open parks on a request for the person at the screen.
-pub type OnOpenWait = Box<dyn FnOnce(OpenWait) + Send + 'static>;
+/// What a pump hands [`open_default_async`]: called if and when its open
+/// parks on the host, once per wait. FR-93 P5g — an open can wait twice: for
+/// this user's session to come back, then (GNOME's *Switch User* locks first)
+/// for the unlock, and the controller is told each.
+pub type OnOpenWait = Box<dyn Fn(OpenWait) + Send + 'static>;
 
 #[cfg(target_os = "linux")]
 thread_local! {
@@ -2080,18 +2224,21 @@ mod park_tests {
 }
 
 /// FR-93 P2d-2 — the word that the open on this thread has parked on the
-/// person at the screen: the portal broker's request, or (P5b) GNOME's lock
-/// screen. Fires that open's hook, once. A thread with no hook (the recorder,
-/// a probe, a test) does nothing.
+/// host: the portal broker's request for the person at the screen, (P5b)
+/// GNOME's lock screen, (P3e) a display switched off, or (P5g) this user's
+/// session in the background. Fires that open's hook; each wait tells once.
+/// A thread with no hook (the recorder, a probe, a test) does nothing.
 #[cfg(target_os = "linux")]
 #[cfg_attr(
     not(any(feature = "portal-capture", feature = "drm-capture")),
     allow(dead_code)
 )]
 pub(crate) fn tell_open_waiting(wait: OpenWait) {
-    if let Some(hook) = PARK_HOOK.with(|h| h.borrow_mut().take()) {
-        hook(wait);
-    }
+    PARK_HOOK.with(|h| {
+        if let Some(hook) = h.borrow().as_ref() {
+            hook(wait);
+        }
+    });
 }
 
 /// FR-85 P1d — the recorder's capturer: native resolution, and the pointer
@@ -2242,26 +2389,58 @@ fn open_with(
     );
     #[cfg(all(target_os = "linux", feature = "portal-capture"))]
     if plan == WaylandPlan::Auto {
-        match open_auto_mutter(_target_fps) {
-            AutoMutter::Opened(c) => return c,
-            AutoMutter::NotGnome(why) => {
-                tracing::info!(
-                    %why,
-                    "capture: no mutter on this desktop; trying the desktop portal, which asks \
-                     the person at the screen (FR-93 P2d-3)"
-                );
-                match open_auto_portal(_target_fps) {
-                    AutoPortal::Opened(c) => return c,
-                    AutoPortal::Failed(detail) => {
-                        tracing::warn!(%detail, "capture: the automatic portal arm failed (FR-93 P2d-3)");
-                        wayland_arm_error = Some(detail);
-                    }
-                }
-            }
-            AutoMutter::Failed(detail) => {
-                tracing::warn!(%detail, "capture: the automatic mutter arm failed (FR-93 P2)");
+        // FR-93 P5g — this user's session in the background (a user switch,
+        // the login screen) is waited for, the controller told why, before
+        // either arm is tried: both would refuse it. Only by an open with a
+        // session behind it, as P5b's wait.
+        let back = if open_has_session() && own_session() == OwnSession::Away {
+            wait_while_away(
+                || own_session() == OwnSession::Away,
+                open_abandoned,
+                |gives_up_in| {
+                    tracing::info!(
+                        waits_s = gives_up_in.as_secs(),
+                        "capture: this user's session is in the background (a user switch, the \
+                         login screen); waiting for it to be on screen again, the controller \
+                         told why (FR-93 P5g)"
+                    );
+                    tell_open_waiting(OpenWait {
+                        gives_up_in,
+                        why: WaitFor::SessionAway,
+                    });
+                },
+                std::thread::sleep,
+                std::time::Instant::now,
+            )
+        } else {
+            Ok(())
+        };
+        match back {
+            Err(detail) => {
+                tracing::warn!(%detail, "capture: this user's session did not come back (FR-93 P5g)");
                 wayland_arm_error = Some(detail);
             }
+            Ok(()) => match open_auto_mutter(_target_fps) {
+                AutoMutter::Opened(c) => return c,
+                AutoMutter::NotGnome(why) => {
+                    tracing::info!(
+                        %why,
+                        "capture: no mutter on this desktop; trying the desktop portal, which \
+                         asks the person at the screen (FR-93 P2d-3)"
+                    );
+                    match open_auto_portal(_target_fps) {
+                        AutoPortal::Opened(c) => return c,
+                        AutoPortal::Failed(detail) => {
+                            tracing::warn!(%detail, "capture: the automatic portal arm failed (FR-93 P2d-3)");
+                            wayland_arm_error = Some(detail);
+                        }
+                    }
+                }
+                AutoMutter::Failed(detail) => {
+                    tracing::warn!(%detail, "capture: the automatic mutter arm failed (FR-93 P2)");
+                    wayland_arm_error = Some(detail);
+                }
+            },
         }
     }
 
@@ -2974,6 +3153,18 @@ mod wayland_auto_tests {
         );
     }
 
+    /// FR-93 P5g — a Wayland session in the background (a user switch) is
+    /// still this daemon's own: the arm is planned, and its open waits for
+    /// the session. Before P5g it fell to the X11 arm, whose Xwayland guard
+    /// said capture was not switched on.
+    #[test]
+    fn a_session_in_the_background_is_still_automatic() {
+        assert_eq!(
+            wayland_plan(true, true, false, false, false, session(OwnSession::Away)),
+            WaylandPlan::Auto
+        );
+    }
+
     /// "Any capture key takes the choice back" holds only if every key in the
     /// list reaches `node_env` from the config. A name that is not bridged
     /// would be a `roomler config set` that the cascade never sees, and auto
@@ -3221,7 +3412,7 @@ mod planned_arm_tests {
     }
 
     #[test]
-    fn own_session_in_counts_only_this_users_active_wayland_desktop() {
+    fn own_session_in_counts_only_this_users_wayland_desktop() {
         let s = |uid: u32, class: &str, active: bool, kind: &str| Session {
             id: "1".into(),
             uid,
@@ -3231,6 +3422,7 @@ mod planned_arm_tests {
             display: None,
             kind: kind.into(),
             desktop: None,
+            state: if active { "active" } else { "" }.into(),
         };
         let mine = [s(1000, "user", true, "wayland")];
         assert_eq!(own_session_in(&mine, 1000), OwnSession::Wayland);
@@ -3241,6 +3433,35 @@ mod planned_arm_tests {
         assert_eq!(own_session_in(&idle, 1000), OwnSession::Other);
         let x11 = [s(1000, "user", true, "x11")];
         assert_eq!(own_session_in(&x11, 1000), OwnSession::Other);
+        // FR-93 P5g — signed in while the seat shows another session.
+        let background = |uid| Session {
+            state: "online".into(),
+            ..s(uid, "user", false, "wayland")
+        };
+        assert_eq!(
+            own_session_in(&[background(1000)], 1000),
+            OwnSession::Away,
+            "a user switch"
+        );
+        assert_eq!(
+            own_session_in(&[background(1001)], 1000),
+            OwnSession::Other,
+            "another user's"
+        );
+        let closing = Session {
+            state: "closing".into(),
+            ..s(1000, "user", false, "wayland")
+        };
+        assert_eq!(
+            own_session_in(&[closing], 1000),
+            OwnSession::Other,
+            "a logout that left processes behind"
+        );
+        assert_eq!(
+            own_session_in(&[background(1000), s(1000, "user", true, "wayland")], 1000),
+            OwnSession::Wayland,
+            "one of them on screen"
+        );
     }
 }
 
