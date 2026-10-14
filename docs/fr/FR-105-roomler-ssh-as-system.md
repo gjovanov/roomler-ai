@@ -1,6 +1,6 @@
 # FR-105: Roomler SSH runs as SYSTEM through the device's service — the SSH transport terminates in session 0
 
-**Issue:** [#2148](https://github.com/gjovanov/roomler-ai/issues/2148) · **Status:** P0–P3 built; field-verified 2026-10-14 on the 0.4.136 candidate (§8); P4 UI and docs · **Owner:**
+**Issue:** [#2148](https://github.com/gjovanov/roomler-ai/issues/2148) · **Status:** **closed 2026-10-14**: all six criteria field-verified, on the 0.4.136 candidate and again on the released 0.4.136 (§8 rows 1–16) · **Owner:**
 network (grants, the routing, the audit), fleet (the anchor credential), the Windows agent (the service's
 SSH endpoint, the worker's splice) · **Anchors:** master `05b2bd2bd` · **Builds on:** FR-94 (decision 5:
 "route SSH sessions through the service as a follow-up FR"), roomler SSH (`docs/roomler-ssh.md`), FR-83
@@ -177,6 +177,7 @@ P2 and P3 as built (`agents/roomlerd/src/ssh_service.rs`, `exec_service.rs`, `ss
 | 13 | GREEN: the candidate, `anchor create --ssh system` in one step | the same | `daemon` → SYSTEM, **session 0**, `ran_as = system`; `console_user` → `FR105SYS\vmtest`, session 1, Medium, `ran_as = console_user` |
 | 14 | AC2: nobody signed in (`logoff`; the console is session 2, no user) | the same | `console_user` → refused, naming why: "console session 2 has no user token (nobody is signed in at the console); nothing to run as"; `daemon` → SYSTEM, session 0 |
 | 15 | Consent through the relay: policy `prompt`, nobody signed in | the same | "waiting up to 30s for approval at the device…", then "nobody approved this session at the device within 30s", and the same words on the worker path (`ssh = off`, `ran_as = worker`) |
+| 16 | **The released 0.4.136**, 22:08Z, after publication. The target is a fresh guest, attended, installed from the served script, `anchor create --ssh system`; the caller is the vmtest Ubuntu lane cell on 0.4.136 | vmtest Win11, attended, and prod `hosted-20261014-b4e2263` | `ssh-system` advertised. `daemon` → `NT AUTHORITY\SYSTEM`, session 0, System, `ran_as = system`; `console_user` → the signed-in user, session 1, Medium, `ran_as = console_user` |
 
 **Wrong turn, recorded.** At 12:12:17Z another session's vmtest Win11 clone revived the attended guest's device row and replaced its connection. Every clone is `VMTEST-WIN`, and `machine_id` hashes the host name with the config path. That cell's cleanup then deleted the row. Row 11's first run had finished; its next two failed ("no device named …"). The SystemContext guest was renamed before it enrolled, and the vmtest lane is gaining a unique name per clone.
 
