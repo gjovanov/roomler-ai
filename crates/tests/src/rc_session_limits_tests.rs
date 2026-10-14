@@ -28,6 +28,17 @@ fn urlencode(s: &str) -> String {
 
 /// Enroll a device owned by the seeded admin and connect it to `app`.
 async fn connect_agent(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -> (String, Ws) {
+    connect_agent_rpc(app, seeded, machine_id, &[]).await
+}
+
+/// [`connect_agent`], advertising `rpc` verbs in its caps (P4b-2:
+/// `idle-timeout`, the agent that keeps an idle limit).
+async fn connect_agent_rpc(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    machine_id: &str,
+    rpc: &[&str],
+) -> (String, Ws) {
     let et: Value = app
         .auth_post(
             &format!("/api/tenant/{}/agent/enroll-token", seeded.tenant_id),
@@ -72,7 +83,7 @@ async fn connect_agent(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -
         "caps": {
             "hw_encoders": [], "codecs": ["h264"], "has_input_permission": true,
             "supports_clipboard": true, "supports_file_transfer": true,
-            "max_simultaneous_sessions": 4, "input": ["arbiter"],
+            "max_simultaneous_sessions": 4, "input": ["arbiter"], "rpc": rpc,
         },
     });
     ws.send(Message::Text(hello.to_string().into()))
@@ -208,7 +219,7 @@ async fn the_limits_route_reads_for_members_and_writes_for_admins() {
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
         resp.json::<Value>().await.unwrap(),
-        json!({ "max_secs": null })
+        json!({ "max_secs": null, "idle_secs": null })
     );
 
     let resp = put(member.clone(), json!({ "max_secs": 3600 })).await;
@@ -218,12 +229,23 @@ async fn the_limits_route_reads_for_members_and_writes_for_admins() {
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
         resp.json::<Value>().await.unwrap(),
-        json!({ "max_secs": 3600 })
+        json!({ "max_secs": 3600, "idle_secs": null })
     );
     let resp = get(member.clone()).await;
     assert_eq!(
         resp.json::<Value>().await.unwrap(),
-        json!({ "max_secs": 3600 })
+        json!({ "max_secs": 3600, "idle_secs": null })
+    );
+
+    // P4b-2 — the idle limit on the same route. A body naming one limit
+    // leaves the other as it is.
+    let resp = put(member.clone(), json!({ "idle_secs": 900 })).await;
+    assert_eq!(resp.status().as_u16(), 403);
+    let resp = put(admin.clone(), json!({ "idle_secs": 900 })).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({ "max_secs": 3600, "idle_secs": 900 })
     );
 
     for bad in [
@@ -231,6 +253,9 @@ async fn the_limits_route_reads_for_members_and_writes_for_admins() {
         json!({ "max_secs": 86_401 }),
         json!({}),
         json!({ "max_sec": 60 }),
+        json!({ "idle_secs": 59 }),
+        json!({ "idle_secs": 86_401 }),
+        json!({ "idle_secs": "15m" }),
     ] {
         let resp = put(admin.clone(), bad.clone()).await;
         assert!(resp.status().is_client_error(), "{bad}: {}", resp.status());
@@ -240,7 +265,13 @@ async fn the_limits_route_reads_for_members_and_writes_for_admins() {
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
         resp.json::<Value>().await.unwrap(),
-        json!({ "max_secs": null })
+        json!({ "max_secs": null, "idle_secs": 900 })
+    );
+    let resp = put(admin.clone(), json!({ "idle_secs": null })).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({ "max_secs": null, "idle_secs": null })
     );
 }
 
@@ -317,4 +348,178 @@ async fn a_live_session_ends_at_the_orgs_maximum_length() {
             .is_none(),
         "a session in an org with no limit must not end"
     );
+}
+
+/// Ask for a session and stop there: the controller's `rc:session.created`
+/// and the agent's `rc:request`, as each end saw them.
+async fn request_session(
+    app: &TestApp,
+    token: &str,
+    agent_id: &str,
+    agent: &mut Ws,
+) -> (Ws, Value, Value) {
+    let url = format!("ws://{}/ws?token={}", app.addr, urlencode(token));
+    let (mut ctl, _) = connect_async(&url).await.expect("controller ws");
+    let _ = tokio::time::timeout(Duration::from_millis(200), ctl.next()).await;
+    ctl.send(Message::Text(
+        json!({
+            "t": "rc:session.request",
+            "agent_id": agent_id,
+            "permissions": "VIEW | INPUT",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let created = next_of(&mut ctl, "rc:session.created", Duration::from_secs(5))
+        .await
+        .expect("rc:session.created");
+    let request = next_of(agent, "rc:request", Duration::from_secs(5))
+        .await
+        .expect("the agent's rc:request");
+    (ctl, created, request)
+}
+
+/// One audit event of a session, by kind, once it lands.
+async fn audit_event(app: &TestApp, seeded: &SeededTenant, sid: &str, kind: &str) -> Option<Value> {
+    let url = app.url(&format!(
+        "/api/tenant/{}/session/{}/audit",
+        seeded.tenant_id, sid
+    ));
+    for _ in 0..40 {
+        let resp = app
+            .client
+            .get(&url)
+            .bearer_auth(&seeded.admin.access_token)
+            .send()
+            .await
+            .unwrap();
+        if resp.status().is_success() {
+            let body: Value = resp.json().await.unwrap();
+            let ev = body["items"].as_array().and_then(|items| {
+                items
+                    .iter()
+                    .find(|i| i["event"]["kind"] == kind)
+                    .map(|i| i["event"].clone())
+            });
+            if ev.is_some() {
+                return ev;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    None
+}
+
+/// FR-101 P4b-2 — what the idle limit reaches, through the real authz gate
+/// and hub. The agent is sent the org's limit, held to the device's own when
+/// that is shorter (`AccessPolicy.auto_terminate_idle_minutes`). The viewer is
+/// told it only by a device that keeps it (`idle-timeout`), and the request's
+/// audit row says whether it was kept. And only the device names the limit
+/// when a session ends: a controller saying `idle` names nothing.
+#[tokio::test]
+async fn the_idle_limit_reaches_the_device_and_only_a_keeping_device_tells_the_viewer() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr101p4b2gate").await;
+    let admin = seeded.admin.access_token.clone();
+    let resp = app
+        .client
+        .put(app.url(&format!(
+            "/api/tenant/{}/rc-session-limits",
+            seeded.tenant_id
+        )))
+        .bearer_auth(&admin)
+        .json(&json!({ "idle_secs": 900 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // A device whose agent does not advertise `idle-timeout`: the limit rides
+    // its request (it ignores it), the viewer hears none, the audit says so.
+    let (old_agent, mut old_ws) = connect_agent(&app, &seeded, "mach-fr101-idle-old").await;
+    let (_ctl, created, request) = request_session(&app, &admin, &old_agent, &mut old_ws).await;
+    assert_eq!(request["idle_secs"], 900, "{request}");
+    assert!(created["idle_secs"].is_null(), "{created}");
+    let sid = created["session_id"].as_str().unwrap().to_string();
+    let requested = audit_event(&app, &seeded, &sid, "session_requested")
+        .await
+        .expect("a session_requested audit row");
+    assert_eq!(requested["idle_secs"], 900, "{requested}");
+    assert_eq!(requested["idle_enforced"], false, "{requested}");
+
+    // A device that keeps it, with a shorter limit of its own: five minutes.
+    let (new_agent, mut new_ws) =
+        connect_agent_rpc(&app, &seeded, "mach-fr101-idle-new", &["idle-timeout"]).await;
+    let resp = app
+        .client
+        .put(app.url(&format!(
+            "/api/tenant/{}/agent/{}",
+            seeded.tenant_id, new_agent
+        )))
+        .bearer_auth(&admin)
+        .json(&json!({ "access_policy": { "auto_terminate_idle_minutes": 5 } }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let (_ctl, created, request) = request_session(&app, &admin, &new_agent, &mut new_ws).await;
+    assert_eq!(
+        request["idle_secs"], 300,
+        "the shorter limit wins: {request}"
+    );
+    assert_eq!(
+        created["idle_secs"], 300,
+        "and the viewer is told it: {created}"
+    );
+
+    // A controller cannot end a session in the device's name: its `idle`
+    // reaches the agent naming no limit.
+    let (mut ctl, sid) = go_live(&app, &admin, &new_agent, &mut new_ws).await;
+    ctl.send(Message::Text(
+        json!({
+            "t": "rc:terminate",
+            "session_id": sid,
+            "reason": "idle_timeout",
+            "limit": "idle",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let told = next_of(&mut new_ws, "rc:terminate", Duration::from_secs(5))
+        .await
+        .expect("the agent hears the controller's terminate");
+    assert_eq!(told["session_id"], sid.as_str());
+    assert!(
+        told["limit"].is_null(),
+        "a controller names no limit: {told}"
+    );
+
+    // The device can: its `idle` reaches the controller and the audit.
+    let (mut ctl, sid) = go_live(&app, &admin, &new_agent, &mut new_ws).await;
+    new_ws
+        .send(Message::Text(
+            json!({
+                "t": "rc:terminate",
+                "session_id": sid,
+                "reason": "idle_timeout",
+                "limit": "idle",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let told = next_of(&mut ctl, "rc:terminate", Duration::from_secs(5))
+        .await
+        .expect("the controller hears the device end it");
+    assert_eq!(told["reason"], "idle_timeout", "{told}");
+    assert_eq!(told["limit"], "idle", "{told}");
+    let ended = audit_event(&app, &seeded, &sid, "session_ended")
+        .await
+        .expect("a session_ended audit row");
+    assert_eq!(ended["limit"], "idle", "{ended}");
 }

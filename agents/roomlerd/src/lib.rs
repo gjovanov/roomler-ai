@@ -136,6 +136,10 @@ pub mod rtp_playout;
 /// asked of the server with the org's agent token.
 pub mod self_view;
 pub mod service;
+/// FR-101 P4b-2 — the idle limit, kept by the device: no input from the
+/// controller and no significant change on the screen for `idle_secs` ends
+/// the session.
+pub mod session_idle;
 /// FR-101 P2b — the session policy for clipboard, files and audio, the
 /// device's half: the owner's floor, and the masking every grant goes through.
 pub mod session_policy;
@@ -195,6 +199,9 @@ pub mod win_timer;
 /// processes with (a recording, an agent session).
 #[cfg(target_os = "windows")]
 pub mod win_token;
+/// #2187 — the control WS and DERP dial the server's remembered address
+/// (`tunnel_core::ctl_dns`), so a dead exit DNS can never keep them offline.
+pub mod ws_connect;
 
 /// P5 exit-node crash-safety (A2) — synchronously purge any leftover
 /// split-default routes from the overlay NIC. Called at agent startup (the

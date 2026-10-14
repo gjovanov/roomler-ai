@@ -3950,6 +3950,13 @@ describe('FR-27: friendlyEndReason', () => {
     expect(friendlyEndReason('idle_timeout', 'some_future_limit')).toBeNull()
     expect(friendlyEndReason('controller_hangup', 'max_duration')).toBeNull()
   })
+
+  it('FR-101 P4b-2: says the session ended for want of activity when the idle limit ended it', () => {
+    expect(friendlyEndReason('idle_timeout', 'idle')).toMatch(/no activity/)
+    // Not the maximum length's words, and only with the reason it belongs to.
+    expect(friendlyEndReason('idle_timeout', 'idle')).not.toMatch(/maximum length/)
+    expect(friendlyEndReason('host_disconnect', 'idle')).toBeNull()
+  })
 })
 
 // FR-27 P10 - the host's Disconnect. The `rc:terminate` handler takes one

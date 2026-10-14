@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::relay_probe::DerpTicketSlot;
@@ -217,7 +217,8 @@ async fn run(
             backoff = (backoff * 2).min(DERP_BACKOFF_MAX);
             continue;
         };
-        match tokio::time::timeout(DERP_CONNECT_TIMEOUT, connect_async(&url)).await {
+        // #2187 — the relay's address comes from `ctl_dns`, as the control WS's does.
+        match tokio::time::timeout(DERP_CONNECT_TIMEOUT, crate::ws_connect::connect(&url)).await {
             Ok(Ok((ws, _))) => {
                 backoff = Duration::from_secs(1);
                 // FR-18 — bound the KERNEL's send buffer too. Shedding stale

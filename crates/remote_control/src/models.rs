@@ -987,6 +987,15 @@ pub enum RpcCap {
     /// all), and it holds no policy to check the grant against, so "ask"
     /// would mean "on".
     SessionPolicy,
+    /// FR-101 P4b-2 — the agent keeps an idle limit: it ends a session that
+    /// sat past `Request.idle_secs` with no input from its controller and no
+    /// significant change on the screen, as `IdleTimeout` with
+    /// `limit: "idle"`, and warns the viewer on the control channel first.
+    ///
+    /// The hub sends the limit to every agent (an older one ignores it), but
+    /// tells a viewer the limit (`SessionCreated.idle_secs`) only for a
+    /// connection advertising this: a limit nothing keeps is no limit.
+    IdleTimeout,
 }
 
 impl RpcCap {
@@ -1025,11 +1034,12 @@ impl RpcCap {
             Self::PrivacyMode => "privacy-mode",
             Self::PrivacyAvailable => "privacy-available",
             Self::SessionPolicy => "session-policy",
+            Self::IdleTimeout => "idle-timeout",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 27] = [
+    pub const ALL: [RpcCap; 28] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1057,6 +1067,7 @@ impl RpcCap {
         Self::PrivacyMode,
         Self::PrivacyAvailable,
         Self::SessionPolicy,
+        Self::IdleTimeout,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -1207,6 +1218,13 @@ pub struct AccessPolicy {
     pub allowed_role_ids: Vec<ObjectId>,
     #[serde(default)]
     pub allowed_user_ids: Vec<ObjectId>,
+    /// FR-101 P4b-2 — this device's own idle limit, in minutes: a session
+    /// ends after this long with no input from its controller and no
+    /// significant change on the screen. Combined with the org's
+    /// (`TenantSettings.rc_limits.idle_secs`), the SHORTER wins, so a device
+    /// can tighten its org's limit but never loosen it. `None` or `0` = no
+    /// limit of its own. Stored since the first access policy and read by
+    /// nothing until P4b-2. See [`Self::idle_limit_secs`].
     pub auto_terminate_idle_minutes: Option<u32>,
     /// P6 — multi-user input arbitration mode. `None` = the system default
     /// ([`InputMode::Free`] — free-for-all with agent-side fencing). Old rows
@@ -1230,10 +1248,34 @@ pub struct AccessPolicy {
     pub rc_overlay: Option<bool>,
 }
 
+/// FR-101 P4b-2 — the longest idle limit anything sets: a day, the same
+/// ceiling as the org's route.
+pub const IDLE_LIMIT_MAX_SECS: u32 = 86_400;
+
+/// FR-101 P4b-2 — the org's idle limit and the device's, combined: the
+/// SHORTER one, or whichever is set. `None` = no idle limit at all.
+pub fn stricter_idle_limit(org_secs: Option<u32>, device_secs: Option<u32>) -> Option<u32> {
+    match (org_secs, device_secs) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 impl AccessPolicy {
     /// #1882 — [`Self::rc_overlay`] resolved: off unless explicitly on.
     pub fn rc_overlay_allowed(&self) -> bool {
         self.rc_overlay.unwrap_or(false)
+    }
+
+    /// FR-101 P4b-2 — [`Self::auto_terminate_idle_minutes`] as seconds. `0`
+    /// reads as no limit, the way RDP spells "never", rather than as a
+    /// session that ends the moment it starts; anything past a day is held to
+    /// [`IDLE_LIMIT_MAX_SECS`].
+    pub fn idle_limit_secs(&self) -> Option<u32> {
+        match self.auto_terminate_idle_minutes {
+            None | Some(0) => None,
+            Some(m) => Some(m.saturating_mul(60).min(IDLE_LIMIT_MAX_SECS)),
+        }
     }
 
     /// Effective consent mode for a NON-owner controller: the per-device mode,
@@ -4470,6 +4512,16 @@ pub enum AuditKind {
         /// refused. The server's decision, a field for the same rollout reason.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         features_stripped: Option<std::collections::BTreeMap<String, String>>,
+        /// FR-101 P4b-2 — the idle limit sent to the device, in seconds (the
+        /// shorter of the org's and the device's own). `None` = no idle limit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idle_secs: Option<u32>,
+        /// FR-101 P4b-2 — with `idle_secs`: whether the device keeps it (its
+        /// agent advertises `idle-timeout`). `Some(false)` is a limit the org
+        /// set that this session does not run under, which is worth seeing in
+        /// an audit. `None` = no limit to keep.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idle_enforced: Option<bool>,
     },
     ConsentPrompted,
     ConsentGranted,
@@ -5666,6 +5718,35 @@ mod tests {
         assert_eq!(RpcCap::PrivacyMode.wire(), "privacy-mode");
         assert_eq!(RpcCap::PrivacyAvailable.wire(), "privacy-available");
         assert_eq!(RpcCap::SessionPolicy.wire(), "session-policy");
+        assert_eq!(RpcCap::IdleTimeout.wire(), "idle-timeout");
+    }
+
+    /// FR-101 P4b-2 — the device's idle setting as a limit: unset and `0`
+    /// are no limit (0 = "never", as RDP spells it), minutes become seconds,
+    /// and anything past a day is held to a day.
+    #[test]
+    fn the_devices_idle_minutes_read_as_a_limit() {
+        let with = |m: Option<u32>| AccessPolicy {
+            auto_terminate_idle_minutes: m,
+            ..Default::default()
+        };
+        assert_eq!(with(None).idle_limit_secs(), None);
+        assert_eq!(with(Some(0)).idle_limit_secs(), None);
+        assert_eq!(with(Some(1)).idle_limit_secs(), Some(60));
+        assert_eq!(with(Some(30)).idle_limit_secs(), Some(1800));
+        assert_eq!(with(Some(1440)).idle_limit_secs(), Some(86_400));
+        assert_eq!(with(Some(u32::MAX)).idle_limit_secs(), Some(86_400));
+    }
+
+    /// FR-101 P4b-2 — the org's idle limit and the device's combine to the
+    /// SHORTER, and either alone stands.
+    #[test]
+    fn the_shorter_idle_limit_wins() {
+        assert_eq!(stricter_idle_limit(None, None), None);
+        assert_eq!(stricter_idle_limit(Some(900), None), Some(900));
+        assert_eq!(stricter_idle_limit(None, Some(300)), Some(300));
+        assert_eq!(stricter_idle_limit(Some(900), Some(300)), Some(300));
+        assert_eq!(stricter_idle_limit(Some(300), Some(900)), Some(300));
     }
 
     /// FR-101 P2b — how an org's policy and a device's floor combine, on
@@ -7150,6 +7231,8 @@ mod tests {
                 record_stripped: None,
                 privacy_stripped: None,
                 features_stripped: None,
+                idle_secs: None,
+                idle_enforced: None,
             },
             // FR-99 — the new bit takes the same raw path.
             AuditKind::SessionRequested {
@@ -7162,6 +7245,9 @@ mod tests {
                 features_stripped: Some(
                     [("files".to_string(), "org_policy_off".to_string())].into(),
                 ),
+                // FR-101 P4b-2 — and an idle limit the device does not keep.
+                idle_secs: Some(900),
+                idle_enforced: Some(false),
             },
             AuditKind::PermissionsChanged {
                 permissions: Permissions::VIEW,
