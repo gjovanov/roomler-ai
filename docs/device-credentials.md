@@ -119,7 +119,7 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 
 - **`roomler status`** prints `credential  expires in N days` for the primary enrollment, and one line per enrollment on a multi-org device. It is read from the token in use, so it moves the moment a renewal lands. An expired token says how much grace is left.
 - **The dashboard** stays quiet for a healthy device. A device within 60 days of expiry gets an amber "credential expires in N d" chip in its Status cell (it is not renewing: an agent too old, or a refused renewal). An expired one gets a red chip that says whether the grace still covers it.
-- **The device row** records the `exp` of the token it last connected with (`token_exp`), and the API returns it as `token_expires_at`.
+- **The device row** records the `exp` of the newest token the device holds (`token_exp`), and the API returns it as `token_expires_at`. A renewal records it at once: the device keeps its socket and presents the new token only when it reconnects, which can be weeks away. Every connect then records the token actually presented, so a device that lost a renewal's answer is corrected at its next connect (`agent.rs` `self_renew`, `socket.rs` at the upgrade).
 
 ## 7. Related
 
