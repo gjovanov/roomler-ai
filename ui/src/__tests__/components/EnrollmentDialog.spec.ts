@@ -93,3 +93,76 @@ describe('EnrollmentDialog — install-copy (FR-88)', () => {
     w.unmount()
   })
 })
+
+// FR-104 — "Also let administrators run commands as SYSTEM on this device".
+describe('EnrollmentDialog — the anchor box (FR-104)', () => {
+  async function mountWith(props: Record<string, unknown>) {
+    // The Windows tab is the one that carries the box; the default tab
+    // follows the visitor's platform, which on a Linux runner is not it.
+    vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+    )
+    const w = mount(EnrollmentDialog, {
+      props: {
+        modelValue: true,
+        kind: 'agent',
+        token: 'tok-123',
+        expiresIn: 600,
+        loading: false,
+        error: null,
+        ...props,
+      },
+      global: { plugins: [vuetify], stubs: { VDialog: { template: '<div><slot /></div>' } } },
+      attachTo: document.body,
+    })
+    await flushPromises()
+    return w
+  }
+  const box = () =>
+    document.body.querySelector('[data-test="enroll-anchor"] input') as HTMLInputElement | null
+  const anchorCommand = () =>
+    [...document.body.querySelectorAll('pre')].find((p) =>
+      p.textContent!.includes('roomlerd anchor create'),
+    )
+
+  afterEach(() => vi.restoreAllMocks())
+
+  it('asks for a new token when ticked, and shows what the token carries', async () => {
+    const w = await mountWith({ anchor: false })
+    expect(box()).not.toBeNull()
+    expect(box()!.checked).toBe(false)
+    expect(anchorCommand()).toBeUndefined()
+    box()!.click()
+    await flushPromises()
+    expect(w.emitted('update:anchor')).toEqual([[true]])
+    // The box and the command follow the token the parent hands over.
+    expect(anchorCommand()).toBeUndefined()
+    await w.setProps({ token: 'tok-456', anchor: true })
+    await flushPromises()
+    expect(box()!.checked).toBe(true)
+    expect(anchorCommand()!.textContent).toContain('--token tok-456')
+    w.unmount()
+  })
+
+  it('an anchoring token shows the anchor command with the same token', async () => {
+    const w = await mountWith({ anchor: true })
+    expect(box()!.checked).toBe(true)
+    expect(anchorCommand()!.textContent).toContain('--token tok-123')
+    box()!.click()
+    await flushPromises()
+    expect(w.emitted('update:anchor')).toEqual([[false]])
+    w.unmount()
+  })
+
+  it('is not offered for a per-user install or a tunnel client', async () => {
+    const w = await mountWith({ anchor: false })
+    buttons('This user only')[0]!.click()
+    await flushPromises()
+    expect(box()).toBeNull()
+    w.unmount()
+    document.body.innerHTML = ''
+    const t = await mountWith({ kind: 'tunnel', anchor: false })
+    expect(box()).toBeNull()
+    t.unmount()
+  })
+})

@@ -62,17 +62,28 @@ const PS_ROLE: Record<DaemonScope, string> = {
   user: 'daemon-user',
 }
 
+/** Where the anchor command wants the device's id, which exists only once
+ *  the device has enrolled. Not a valid PowerShell word on purpose: pasted
+ *  unchanged, the command fails instead of anchoring something else. */
+export const DEVICE_ID_PLACEHOLDER = '<device-id>'
+
 /**
  * Build the per-OS command matrix for one enrollment kind. `token` may
  * be null while the token is still being issued — the placeholder keeps
  * the layout stable and nothing secret renders. `scope` only applies to
  * the agent kind (the tunnel CLI is always per-user).
+ *
+ * `anchor` (FR-104): the token may also anchor the Windows device it
+ * enrolls. A machine-wide Windows install then gets a fourth block, the
+ * elevated `roomlerd anchor create` with the same token, for the script
+ * and manual paths; Roomler Setup runs it itself.
  */
 export function enrollCommands(
   kind: EnrollKind,
   origin: string,
   token: string | null,
   scope: DaemonScope = 'system',
+  anchor = false,
 ): OsCommands[] {
   const base = origin.replace(/\/+$/, '')
   const tok = token || TOKEN_PLACEHOLDER
@@ -137,6 +148,16 @@ export function enrollCommands(
           label: 'Already installed? Enroll manually',
           command: `${manualBin} enroll --server ${base} --token ${tok} --name "$env:COMPUTERNAME"${psMg}`,
         },
+        // FR-104 — only a machine-wide install has a SYSTEM service to anchor.
+        ...(kind === 'agent' && machineWide && anchor
+          ? [
+              {
+                id: 'agent-windows-anchor',
+                label: `Then anchor it, from the same Administrator PowerShell (replace ${DEVICE_ID_PLACEHOLDER} with the id on the device's page)`,
+                command: `roomlerd anchor create --server ${base} --token ${tok} --device ${DEVICE_ID_PLACEHOLDER}`,
+              },
+            ]
+          : []),
       ],
     },
     {
