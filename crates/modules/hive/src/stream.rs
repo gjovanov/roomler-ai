@@ -284,10 +284,14 @@ async fn on_want(
             state, tenant_id, member, session_id, fence, path, reason, None,
         )
     };
-    // Not there, another org's, and not a member's answer alike: the answer
-    // says nothing about a session the device cannot hold.
+    // Not there, another org's, not a member's, and purged (P2g-2) answer
+    // alike: the answer says nothing about a session the device cannot hold.
     let s = match state.sessions.find(session_id).await {
-        Ok(Some(s)) if s.tenant_id == tenant_id && joined_member(&s, member) => s,
+        Ok(Some(s))
+            if s.tenant_id == tenant_id && s.purged.is_none() && joined_member(&s, member) =>
+        {
+            s
+        }
         Ok(_) => return no(HiveStreamRefusal::NotAMember),
         Err(e) => {
             warn!(session = %session_id, %e, "hive: a want could not read its session");

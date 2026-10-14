@@ -563,6 +563,7 @@ pub(crate) async fn begin(
         parent,
         from_terminal: None,
         path_map: Vec::new(),
+        purged: None,
     };
     // The record BEFORE the push: the device's answer, however fast, must
     // find the session it is about.

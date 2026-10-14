@@ -57,7 +57,7 @@ created and last changed it, when.
 | Each fact has a kind, rendered beside it as `- (warning) …`: `preference`, `convention` (the default), `path`, `gotcha`, `decision` or `warning` | the model can tell a warning from a preference | [`brain.rs:92`](../crates/modules/hive/src/brain.rs#L92) |
 | An edit names the version it read, and a fact changed or archived since is not overwritten: `409`, "read it again" | two people editing one fact | [`brain.rs:543`](../crates/modules/hive/src/brain.rs#L543) |
 | Archiving takes a fact out of every future snapshot and out of its budget, and keeps it as a record | | [`brain.rs:592`](../crates/modules/hive/src/brain.rs#L592) |
-| Any member reads the org's facts and any live device's; someone else's user memory answers 404, as a bogus id does | | [`brain.rs:1072`](../crates/modules/hive/src/brain.rs#L1072) `readable_fact` |
+| Any member reads the org's facts and any live device's; someone else's user memory answers 404, as a bogus id does | | [`brain.rs:1078`](../crates/modules/hive/src/brain.rs#L1078) `readable_fact` |
 | A removed member's or device's facts stay as records, and are never rendered | no session starts as that person, or runs on that device, again | |
 
 ---
@@ -168,7 +168,7 @@ a start.
 
 | Rule | Why | Where |
 |---|---|---|
-| `rc:hive.memory` goes immediately before `rc:hive.start`, and before that start's re-send when the device reconnects, on the same socket, only to a device that advertises `hive-memory` | `rc:hive.start` stays metadata only, its field set locked, and one socket keeps the order | [`routes.rs:568`](../crates/modules/hive/src/routes.rs#L568), [`agent_socket.rs:1102`](../crates/modules/hive/src/agent_socket.rs#L1102) |
+| `rc:hive.memory` goes immediately before `rc:hive.start`, and before that start's re-send when the device reconnects, on the same socket, only to a device that advertises `hive-memory` | `rc:hive.start` stays metadata only, its field set locked, and one socket keeps the order | [`routes.rs:569`](../crates/modules/hive/src/routes.rs#L569), [`agent_socket.rs:1133`](../crates/modules/hive/src/agent_socket.rs#L1133) |
 | The device takes the frame only on its primary enrollment, drops a document over 32 KiB, keeps at most 64 waiting, each for 10 minutes, by (session, fence), and uses each once, for that start's launch | a snapshot is sent right before its start, so anything older or more is waiting for nothing | [`supervisor.rs:1389`](../agents/roomlerd/src/hive/supervisor.rs#L1389) |
 | ⚠️ `hive_core_memory`, a device key, is **off by default** and never pushable. Off, the frame arrives but no file is written, not even the daemon's own copy, and the transcript says so: "This start came with the organization's core memory (brain revision 1); this device shows none to its sessions (hive_core_memory is off)." | the gate that survives a compromised server, like `hive_accounts` (decision 9, §5 below) | [`supervisor.rs:3839`](../agents/roomlerd/src/hive/supervisor.rs#L3839), [`:4643`](../agents/roomlerd/src/hive/supervisor.rs#L4643) |
 | On, the daemon writes the files into its own runtime directory, `<runtime>/<session>/memory/` (`0755`, root's). Each is created afresh at `0600`, handed to the account through the open file, then renamed into place, and a document the snapshot does not carry is removed | the daemon never writes into a tree the account owns. No other local account reads a session's memory, whose `CLAUDE.md` carries the starter's own facts, and a file an earlier run left can never be copied for this one | [`supervisor.rs:4482`](../agents/roomlerd/src/hive/supervisor.rs#L4482) `write_memory` |
@@ -275,8 +275,8 @@ The whole run cost $0.24 in model calls.
 | Piece | Where |
 |---|---|
 | facts, budgets, revisions, snapshots, the routes | [`crates/modules/hive/src/brain.rs`](../crates/modules/hive/src/brain.rs): `reserve` `:376`, `recount` `:451`, `bump_rev` `:503`, `snapshot` `:641`, `may_write` `:785` |
-| the indexes: facts by instance, one counter per instance, snapshots with a one-day TTL | [`crates/modules/hive/src/lib.rs:289`](../crates/modules/hive/src/lib.rs#L289) |
-| the snapshot at a start, and its re-send | [`routes.rs:487`](../crates/modules/hive/src/routes.rs#L487), [`agent_socket.rs:1102`](../crates/modules/hive/src/agent_socket.rs#L1102) |
+| the indexes: facts by instance, one counter per instance, snapshots with a one-day TTL | [`crates/modules/hive/src/lib.rs:296`](../crates/modules/hive/src/lib.rs#L296) |
+| the snapshot at a start, and its re-send | [`routes.rs:487`](../crates/modules/hive/src/routes.rs#L487), [`agent_socket.rs:1133`](../crates/modules/hive/src/agent_socket.rs#L1133) |
 | the frame | `ServerMsg::HiveMemory` in [`signaling.rs:3491`](../crates/remote_control/src/signaling.rs#L3491); `MAX_CORE_MEMORY_BYTES` in [`hive.rs:63`](../crates/remote_control/src/hive.rs#L63); `RpcCap::HiveMemory` (`hive-memory`), matched by equality |
 | the device | [`supervisor.rs`](../agents/roomlerd/src/hive/supervisor.rs): `receive_memory` `:710`, the launch `:1751`, `write_memory` `:2273`, `memory_note` `:2348`; the copy in `WRAPPER` `:93` and, on Windows, [`hive_win.rs:677`](../agents/roomlerd/src/hive_win.rs#L677) `prep` |
 | the device's key | `hive_core_memory` in [`config.rs:446`](../crates/agent-core/src/config.rs#L446) |

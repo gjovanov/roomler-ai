@@ -62,6 +62,7 @@ pub mod participants;
 pub mod placement;
 pub mod policy;
 pub mod promote;
+pub mod purge;
 pub mod replica;
 pub mod room;
 pub mod routes;
@@ -118,6 +119,9 @@ pub struct HiveState {
     /// P2f-3 — how long a fork waits for its device's copy to reach the
     /// session's last checkpoint (`hive.fork_copy_secs`).
     pub fork_copy: std::time::Duration,
+    /// P2g-2 — the purges of deleted sessions, kept until every device that
+    /// held one has answered.
+    pub purges: Arc<purge::PurgeDao>,
 }
 
 impl std::ops::Deref for HiveState {
@@ -165,6 +169,7 @@ impl Module for HiveState {
             promote_bounds: promote::Bounds::of(&settings.hive),
             teleport_have_want: settings.hive.teleport_have_want,
             fork_copy: std::time::Duration::from_secs(settings.hive.fork_copy_secs),
+            purges: Arc::new(purge::PurgeDao::new(db)),
             chat: BoundChat::new(&core),
             fleet,
             core,
@@ -195,7 +200,9 @@ impl Module for HiveState {
     fn routes(&self) -> Router {
         let session = Router::new()
             .route("/", get(routes::list).post(routes::start))
-            .route("/{session_id}", get(routes::get_one))
+            // P2g-2 — its owner deletes it from every device that held it.
+            .route("/{session_id}", get(routes::get_one).delete(purge::purge))
+            .route("/{session_id}/purge", get(purge::get_purge))
             .route("/{session_id}/stop", post(routes::stop))
             // P2e-3 — its owner moves it to a member of its replicaset.
             .route("/{session_id}/promote", post(promote::promote))
@@ -311,6 +318,19 @@ impl Module for HiveState {
                     bson::doc! { "created_at": 1 },
                     brain::SessionMemory::TTL_SECS,
                 )],
+            },
+            // P2g-2 — the purges: what a device that connects has still to
+            // answer, the owner's read of one, and a completed one's 90
+            // days. A purge still pending has no `done_at`, so it never
+            // expires.
+            IndexSet {
+                collection: model::HivePurge::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index(bson::doc! { "tenant_id": 1, "devices.device_id": 1, "done_at": 1 }),
+                    index(bson::doc! { "tenant_id": 1, "session_id": 1, "owner_id": 1 }),
+                    index_ttl(bson::doc! { "done_at": 1 }, 90 * 24 * 60 * 60),
+                ],
             },
         ]
     }
