@@ -88,6 +88,7 @@ import {
   type PrivacyChannel,
 } from './usePrivacyMode'
 import { keepBusySetMessage, parseKeepBusyState, type KeepBusyRequest, type KeepBusyState } from './keepBusy'
+import { parseFeaturesRefused } from './useSessionFeatures'
 
 /**
  * Backoff ladder for the auto-reconnect path. The first three steps
@@ -596,7 +597,13 @@ export function friendlyRcError(code: unknown, serverMessage: unknown): string {
  * Returns `null` for a nominal end (hangups, idle timeouts) so the caller can
  * stay silent - an alert on a normal disconnect is noise.
  */
-export function friendlyEndReason(reason: unknown): string | null {
+export function friendlyEndReason(reason: unknown, limit?: unknown): string | null {
+  // FR-101 P4b — a limit the organization set ended it (`rc:terminate`'s
+  // `limit`). Said as such: "idle" would be the wrong story for someone who
+  // was working the whole time.
+  if (reason === 'idle_timeout' && limit === 'max_duration') {
+    return "The session reached your organization's maximum length. Connect again to start a new one."
+  }
   switch (reason) {
     case 'user_denied':
       return 'Someone at that device declined the request.'
@@ -4848,6 +4855,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   const privacyGranted = ref(false)
   const privacyRefused = ref<string | null>(null)
   const privacy = usePrivacyMode()
+  // FR-101 P2c — the features the session policy took out of this session
+  // (`rc:session.created.features_refused`: clipboard, files, audio → the
+  // reason), so each control can say why instead of failing on a click, and
+  // clipboard auto-sync stands down. Reset on each connect.
+  const featuresRefused = ref<Record<string, string>>({})
 
   // Pending clipboard:read requests. Keyed by `req_id` so interleaved
   // reads can resolve independently. The agent echoes the req_id back
@@ -5129,6 +5141,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
 
   function applyRemoteClipboard(content: RemoteClipContent) {
     if (!clipboardAutoSyncEnabled.value) return
+    // FR-101 P2c — the session policy took the clipboard out of this session.
+    if (featuresRefused.value.clipboard) return
     if (!globalThis.document.hasFocus()) {
       pendingRemoteApply = content // latest wins
       return
@@ -5318,6 +5332,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   ): Promise<void> {
     if (!clipboardAutoSyncEnabled.value || clipboardSyncBlocked.value) return
     if (phase.value !== 'connected') return
+    // FR-101 P2c — the agent would refuse every push: the session policy took
+    // the clipboard out of this session.
+    if (featuresRefused.value.clipboard) return
     const ch = channels.clipboard
     if (!ch || ch.readyState !== 'open') return
     if (!globalThis.document.hasFocus()) return
@@ -7421,6 +7438,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // when it stripped the bit, and the channel only on a grant holding it.
       privacyGranted.value = grantHoldsPrivacy(perms)
       privacyRefused.value = typeof msg.privacy_refused === 'string' ? msg.privacy_refused : null
+      // FR-101 P2c — and what the session policy refused, each with why.
+      featuresRefused.value = parseFeaturesRefused(msg.features_refused)
       const privacyChannel = openPrivacyChannel(pc, channels, perms)
       if (privacyChannel) privacy.attach(privacyChannel as unknown as PrivacyChannel)
       if (!inputGranted.value) {
@@ -7569,7 +7588,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // FR-27 - a non-nominal end gets a sentence, not the enum name. The
         // mapping returns null for every nominal reason, so the set of
         // reasons that surface is the set that has something to say.
-        const friendly = friendlyEndReason(msg.reason)
+        const friendly = friendlyEndReason(msg.reason, msg.limit)
         if (friendly) error.value = friendly
       }
       teardown()
@@ -7994,6 +8013,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     privacyGranted.value = false
     privacyRefused.value = null
     privacy.detach()
+    // FR-101 P2c — each session is told its own refusals.
+    featuresRefused.value = {}
     // P6 — fresh session, fresh multi-user state.
     controlState.value = null
     peerCursors.value = {}
@@ -11534,6 +11555,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     privacyGranted,
     privacyRefused,
     privacy,
+    featuresRefused,
     stats,
     quality,
     setQuality,

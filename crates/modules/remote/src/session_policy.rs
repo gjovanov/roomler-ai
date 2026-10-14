@@ -159,9 +159,128 @@ pub async fn set_policy(
     Ok(Json(after))
 }
 
+// ── FR-101 P4b — the session limits ─────────────────────────────────────────
+
+/// The shortest and longest maximum session length an admin may set: a
+/// minute, and a day. A stored value outside it still works (the hub reads
+/// whatever is there); the range is for people, not for the timer.
+pub const MAX_SECS_RANGE: std::ops::RangeInclusive<u32> = 60..=86_400;
+
+/// What the limits route answers: every limit, `null` when unset.
+#[derive(Debug, serde::Serialize, Deserialize, PartialEq, Eq)]
+pub struct RcSessionLimitsDto {
+    pub max_secs: Option<u32>,
+}
+
+/// The `PUT` body. An ABSENT field leaves the limit alone; `null` clears it.
+/// Unknown keys are refused, as on the policy route.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RcSessionLimitsUpdate {
+    #[serde(default, deserialize_with = "present")]
+    pub max_secs: Option<Option<u32>>,
+}
+
+/// `Some(inner)` whenever the field is PRESENT, `null` included: serde's own
+/// `Option` would fold a `null` into the absent case.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<u32>>, D::Error> {
+    Option::<u32>::deserialize(d).map(Some)
+}
+
+/// `GET /api/tenant/{tenant_id}/rc-session-limits` — any member, like the
+/// policy: a session in the org is ended by it, so its members may know it.
+pub async fn get_limits(
+    State(state): State<RemoteState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<RcSessionLimitsDto>, ApiError> {
+    let tid = tenant_of(&tenant_id)?;
+    if !state.tenants.is_member(tid, auth.user_id).await? {
+        return Err(ApiError::NotAMember);
+    }
+    let tenant = state.tenants.base.find_by_id(tid).await?;
+    Ok(Json(RcSessionLimitsDto {
+        max_secs: tenant.settings.rc_limits.max_secs,
+    }))
+}
+
+/// `PUT /api/tenant/{tenant_id}/rc-session-limits` — `MANAGE_TENANT`. A new
+/// limit applies to sessions that go live after it; a live session keeps the
+/// one it started with.
+pub async fn set_limits(
+    State(state): State<RemoteState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<RcSessionLimitsUpdate>,
+) -> Result<Json<RcSessionLimitsDto>, ApiError> {
+    let tid = tenant_of(&tenant_id)?;
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_TENANT,
+        "MANAGE_TENANT",
+    )
+    .await?;
+    let Some(max_secs) = body.max_secs else {
+        return Err(ApiError::BadRequest("Nothing to set: max_secs".into()));
+    };
+    if let Some(secs) = max_secs
+        && !MAX_SECS_RANGE.contains(&secs)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "Invalid max_secs: {} to {} seconds, or null for no limit",
+            MAX_SECS_RANGE.start(),
+            MAX_SECS_RANGE.end()
+        )));
+    }
+    let before = state.tenants.base.find_by_id(tid).await?.settings.rc_limits;
+    let after = state
+        .tenants
+        .set_rc_session_max_secs(tid, max_secs)
+        .await?
+        .settings
+        .rc_limits;
+    if before != after {
+        warn!(
+            tenant = %tenant_id, admin = %auth.user_id, ?before, ?after,
+            "rc session limits changed"
+        );
+    }
+    Ok(Json(RcSessionLimitsDto {
+        max_secs: after.max_secs,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-101 P4b — the limits body: absent is "leave it", `null` is
+    /// "clear it", a number sets it; anything else fails the body.
+    #[test]
+    fn the_limits_body_tells_absent_from_null() {
+        let absent: RcSessionLimitsUpdate = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(absent.max_secs, None);
+        let clear: RcSessionLimitsUpdate =
+            serde_json::from_value(serde_json::json!({ "max_secs": null })).unwrap();
+        assert_eq!(clear.max_secs, Some(None));
+        let set: RcSessionLimitsUpdate =
+            serde_json::from_value(serde_json::json!({ "max_secs": 3600 })).unwrap();
+        assert_eq!(set.max_secs, Some(Some(3600)));
+        for bad in [
+            serde_json::json!({ "max_secs": -1 }),
+            serde_json::json!({ "max_secs": "1h" }),
+            serde_json::json!({ "max_sec": 60 }),
+        ] {
+            assert!(
+                serde_json::from_value::<RcSessionLimitsUpdate>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(MAX_SECS_RANGE.contains(&60) && MAX_SECS_RANGE.contains(&86_400));
+        assert!(!MAX_SECS_RANGE.contains(&59) && !MAX_SECS_RANGE.contains(&86_401));
+    }
 
     /// Every stored value maps to the same wire value, field by field.
     #[test]

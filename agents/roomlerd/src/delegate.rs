@@ -1710,6 +1710,7 @@ mod routing_tests {
         assert!(delegable_inbound(&ServerMsg::Terminate {
             session_id: oid(),
             reason: EndReason::ControllerHangup,
+            limit: None,
         }));
 
         // The device's authority must never cross the boundary. A sample, not

@@ -66,11 +66,27 @@
           on Windows — the agent refuses it here, so every session was failing at connect
           time. Pick an account and save to fix it.
         </v-alert>
-        <div v-if="isWindows" class="text-caption text-medium-emphasis mb-4">
-          <strong>The signed-in user</strong> is the least surprising choice on
-          a workstation. <strong>The daemon account</strong> means
-          <strong>SYSTEM</strong> on Windows and <strong>root</strong> under
-          systemd — choosing it grants root on this device.
+        <div
+          v-if="isWindows && servedBySystem"
+          class="text-caption text-medium-emphasis mb-4"
+          data-test="ssh-identity-service"
+        >
+          This device serves SSH through its <strong>SYSTEM service</strong>.
+          <strong>The signed-in user</strong> is whoever is at its console, and a
+          session is refused while nobody is; it is the least surprising choice on
+          a workstation. <strong>The daemon account</strong> is
+          <strong>SYSTEM</strong>: choosing it grants full control of this device.
+        </div>
+        <div
+          v-else-if="isWindows"
+          class="text-caption text-medium-emphasis mb-4"
+          data-test="ssh-identity-agent"
+        >
+          <strong>The daemon account</strong> is the agent's own: <strong>SYSTEM</strong>
+          on a service install, but <strong>the signed-in user</strong> on an attended
+          one. <strong>The signed-in user</strong> works on a service install; an
+          attended install serves it only through the device's SYSTEM service, which
+          an administrator turns on there with <code>roomlerd anchor ssh system</code>.
         </div>
         <div v-else class="text-caption text-medium-emphasis mb-4">
           <strong>A named account</strong> is the least surprising choice here.
@@ -167,6 +183,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useAgentStore, type Agent, type SshPolicy } from '@/stores/agents'
+import { servesSshAsSystem } from '@/utils/sshIdentity'
 
 const props = defineProps<{
   modelValue: boolean
@@ -197,6 +214,12 @@ const orgDisabled = computed(() => agentStore.orgSshEnabled === false)
  *  surfaces at CONNECT time with "name a local account instead" — at a shell
  *  prompt, about a field that lives in this dialog. */
 const isWindows = computed(() => agent.value?.os === 'windows')
+
+/** FR-105 — does this device serve SSH through its SYSTEM service now? Then
+ *  both Windows identities are definite: SYSTEM, and the person at the
+ *  console. Without it, `daemon` is whatever the agent runs as, which on an
+ *  attended install is the signed-in user, not SYSTEM. */
+const servedBySystem = computed(() => servesSshAsSystem(agent.value?.capabilities?.rpc))
 
 /** A closed default, so a dialog opened on a device with no policy row can
  *  only ever be saved MORE permissive by an explicit click. On Windows that is
@@ -243,7 +266,14 @@ const accountOptions = computed(() => [
   ...(isWindows.value
     ? [{ title: 'The signed-in user at the device', value: 'console_user' }]
     : []),
-  { title: 'The daemon account (SYSTEM / root)', value: 'daemon' },
+  {
+    title: !isWindows.value
+      ? 'The daemon account (root)'
+      : servedBySystem.value
+        ? 'The daemon account (SYSTEM)'
+        : "The daemon account (the agent's own)",
+    value: 'daemon',
+  },
   { title: 'A named Unix account…', value: 'named' },
 ])
 

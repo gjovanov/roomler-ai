@@ -313,8 +313,9 @@ console-session **worker** (FR-94 §2). That is SYSTEM in SystemContext mode. On
 an **attended** install, perMachine or not, the worker runs as the signed-in user,
 so `console_user` is refused there with that reason rather than quietly handed a
 different shell. The worker's `daemon` mode already opens shells as that user.
-FR-105 moves SYSTEM sessions into the device's SYSTEM service, where
-`console_user` works on attended installs too. `named:<account>` stays refused
+FR-105 serves sessions from the device's SYSTEM service once an administrator
+turns that on, and there `console_user` works on attended installs too
+(§ Through the device's SYSTEM service). `named:<account>` stays refused
 on Windows for the same reason `exec` refuses it — becoming an arbitrary local
 user needs that user's credentials.
 
@@ -323,15 +324,15 @@ user needs that user's credentials.
 The device's `SshPolicy.account_mode` decides, and the agent maps it through
 `RunAs`:
 
-| Mode | Unix | Windows |
-|---|---|---|
-| `daemon` (default) | root | **the console-session worker's identity**: SYSTEM in SystemContext mode, the **signed-in user** on an attended install (FR-94 §2) |
-| `named` | **drops to that account** | refused — becoming an arbitrary user needs that user's credentials |
-| `console_user` | refused — no console session token exists | **runs as the signed-in user** (`WTSQueryUserToken` + `CreateProcessAsUserW`) where the worker is SYSTEM (SystemContext mode); refused on an attended install, where the worker cannot ask for that token, and refused if nobody is signed in |
+| Mode | Unix | Windows, the agent's own process (the worker) | Windows, through the SYSTEM service (FR-105) |
+|---|---|---|---|
+| `daemon` (default) | root | **the worker's identity**: SYSTEM in session 1 in SystemContext mode, the **signed-in user** on an attended install (FR-94 §2) | **SYSTEM, session 0**, on every install type |
+| `named` | **drops to that account** | refused — becoming an arbitrary user needs that user's credentials | refused, the same |
+| `console_user` | refused — no console session token exists | **runs as the signed-in user** (`WTSQueryUserToken` + `CreateProcessAsUserW`) where the worker is SYSTEM (SystemContext mode); refused on an attended install, where the worker cannot ask for that token, and refused if nobody is signed in | **the signed-in user**, on every install type; refused, naming why, while nobody is signed in |
 
-FR-105 (in progress) routes an anchored Windows device's sessions through its
-SYSTEM service instead, so `daemon` is SYSTEM in session 0 and `console_user`
-works on every install type, as Fleet RPC's identity did with FR-94.
+Which Windows column applies is the server's decision per grant, recorded in
+`ssh_audit` as `ran_as` (`worker`, `system`, `console_user`): see
+§ Through the device's SYSTEM service.
 
 **Both paths obey this, and it took a fix to make that true.** A grant carries
 the policy's `account_mode`. A key-list session has no policy behind it, so it
@@ -369,7 +370,8 @@ runs sessions as the **daemon's own identity**: root under systemd, and on
 Windows the console-session worker's (SYSTEM in SystemContext mode, the
 signed-in user on an attended install). That is the same identity Fleet RPC had
 before FR-94. Listing a key in `ssh_authorized_keys` grants that identity to its
-holder unless the policy says otherwise.
+holder unless the policy says otherwise. Key-list sessions never reach the
+device's SYSTEM service: its port refuses them (FR-105).
 
 ### The device's own ceiling — `ssh_max_privilege` (M5)
 
@@ -401,6 +403,117 @@ one you needed it for. Every SSH-enabled device that has not chosen says so in
 its start-up log. `named:<account>` is not accepted as a value — a ceiling has
 to be an ordering, and "is `named:svc-backup` above or below `console_user`?"
 has no answer.
+
+### Through the device's SYSTEM service (FR-105)
+
+On an attended Windows install the agent's own process, the worker, *is* the
+signed-in user. SSH there could never be SYSTEM, and `console_user` was refused.
+FR-105 serves such sessions from the device's **SYSTEM service** (the one FR-94
+gave Fleet RPC) once an administrator turns that on. The rule is FR-94's:
+**nothing the signed-in user can write decides what SYSTEM runs.** The worker
+still carries the bytes, but only ciphertext: the SSH transport ends in the
+service.
+
+**Turning it on**, elevated, on the device (from 0.4.136):
+
+```
+roomlerd anchor create --server https://roomler.ai --token <enrollment-token> --device <device id> --ssh system
+roomlerd anchor ssh off|console_user|system   # an anchor that exists
+roomlerd anchor status                        # "ssh: ON, …" and the service's host-key fingerprint
+```
+
+The ceiling belongs to the anchor (`%ProgramData%\roomler\roomler\exec-service\anchor.json`,
+SYSTEM and Administrators only) and defaults to **off**, so every FR-94 anchor
+reads as off and no device gains SYSTEM SSH by updating. `system` permits
+`daemon` and `console_user` grants; `console_user` permits only that one. A
+grant outside the ceiling takes the worker path, exactly as before: that is a
+routing decision, not a refusal.
+
+**How a grant gets there.** The server sends a grant to the service only when
+both halves agree (`routes_ssh_via_service`,
+`crates/modules/network/src/routes/agent_ssh.rs`):
+- its own record: a Windows device, anchored, whose service published an
+  endpoint (`PUT /api/agent/service/ssh-host-key`, with the service's own
+  credential) under **this** anchor, with a ceiling that permits the mode;
+- the device's live word `ssh-system`, which the worker advertises while the
+  service answers its health ring with a ceiling above off and the person's
+  `ssh_enabled` is on. It is matched by equality: `ssh` is its prefix.
+
+```mermaid
+sequenceDiagram
+  participant C as caller (roomler ssh)
+  participant S as server
+  participant W as worker (signed-in user)
+  participant V as SYSTEM service
+  C->>S: POST …/agent/{id}/ssh
+  S->>S: both halves agree, so an ssh_pending row (claimable for 10 s)
+  S->>W: rc:ssh.grant {grant_id, via_service: true}
+  W->>V: doorbell ring: SshGrant {grant_id}
+  V->>S: POST /api/agent/service/ssh/{grant_id}/claim (service credential)
+  S-->>V: the grant: caller key, account, expiry
+  Note over S: the claim IS the acknowledgement, on any pod
+  S-->>C: dial the overlay address on port 2223, pin the SERVICE's host key
+  C->>W: TCP to port 2223 (intercepted by SplitTun, no socket bound)
+  W->>V: the SSH pipe: Data frames, ciphertext only
+  V-->>C: authenticated by the grant key; a shell as SYSTEM (session 0) or the console user
+```
+
+- **The pipe** is `\\.\pipe\roomler-ssh-service`: the doorbell's DACL, created
+  first-instance only, at most 8 sessions, and the worker refuses one SYSTEM
+  does not own. Frames are a kind byte, a big-endian `u32` length and a payload:
+  `Hello`, `Data` (≤ 64 KiB), `Eof`, and `Ask`/`Answer` (≤ 4 KiB of JSON) for
+  consent. Anything oversized, unknown or malformed ends the connection.
+- **The grant is pulled, never relayed.** The worker pushes nothing to the
+  service but a grant id; the service claims the grant from the server with
+  its own credential (single use, this device only, inside the caller's wait),
+  and holds it in its own table. A refused claim answers 404 and writes an
+  `ssh_audit` row `claim_refused` with no person behind it.
+- **Consent stays the person's.** The service asks over the pipe, and the worker
+  answers with the same prompt chain its own sessions use. On the field run an
+  unanswered prompt read the same on both paths.
+- **Either half can refuse.** The worker refuses a via-service grant when its
+  person's `ssh_enabled` is off, when `ssh_max_privilege = console_user` meets a
+  `daemon` grant (M5 above), or when `ROOMLERD_SSH_VIA_SERVICE=0` is set.
+
+What the signed-in user controls, and why none of it widens port 2223:
+
+| The user can change | On the SYSTEM service's port |
+|---|---|
+| `ssh_authorized_keys` and `ssh_account_mode` in their config | the service's server has **no key list**. A key the user lists opens port 2222 as that user, and port 2223 answers `Permission denied` |
+| the doorbell (a forged `SshGrant` ring) | the service claims with its own credential; the server refuses an id that is not pending for this device and audits it |
+| the worker's host key (re-minted and republished) | a via-service grant returns the key the **service** published with its own credential; the worker's key pins only the worker path |
+| `forward_acl` | `direct-tcpip` is refused on the service's port in v1 |
+| the `ssh-system` word (a worker that lies) | the server also needs the endpoint the service published under the current anchor, and the caller pins a key only the real service holds |
+
+**Revocation.** `roomlerd anchor ssh off` (the device withdraws `ssh-system`
+within about 30 s), un-anchoring (`DELETE …/agent/{id}/exec-anchor`, immediate:
+the server's half alone suffices), a re-anchor or a removal (the published
+endpoint names the old anchor). Each sends grants back to the worker, and the
+audit says `worker`.
+
+**Kill switches:** the server's `rc.ssh_via_service = false`; the device's
+`ROOMLERD_SSH_VIA_SERVICE=0` (the worker drops the word and stops intercepting
+2223); the anchor's `ssh = off`, the default.
+
+**`roomler proxy` needs nothing new.** It carries bytes for stock `ssh` to the
+port in your ssh config, for key-list sessions, and only the worker's port
+(2222) honours a key list. `roomler ssh` dials whatever port the grant names.
+
+**The audit and the UI.** `ssh_audit.ran_as` records the server's decision. The
+admin UI's *As* chip reads it together with the grant's `account_mode`, so an
+attended device's `daemon` session through the worker is never shown as SYSTEM.
+The SSH policy dialog says which identity each choice means on that device,
+from whether it advertises `ssh-system`.
+
+⚠️ **Not in v1:** the service owning the overlay socket and the WireGuard key
+(D3). On an attended install with nobody signed in there is no worker, so the
+device is offline. A SystemContext install keeps its worker at the logon screen;
+there `daemon` still works through the service, and `console_user` is refused,
+naming why.
+
+Field-verified on the 0.4.136 candidate, attended and SystemContext, including
+the claim landing on the other prod pod:
+`docs/fr/FR-105-roomler-ssh-as-system.md` §8.
 
 ## 4. Authorization, and the gap P3 closes
 

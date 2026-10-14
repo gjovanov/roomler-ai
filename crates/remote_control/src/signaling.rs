@@ -2388,6 +2388,13 @@ pub enum ServerMsg {
         #[serde(with = "oid_hex")]
         session_id: ObjectId,
         reason: EndReason,
+        /// FR-101 P4b — which limit ended the session, when one did:
+        /// `max_duration` (the org's maximum session length), with `reason`
+        /// `IdleTimeout`, the variant every reader already knows. Lets a
+        /// viewer say "it reached the maximum length" rather than "idle".
+        /// Absent otherwise; older readers ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<String>,
     },
 
     /// Reply to `Ping`.
@@ -6622,6 +6629,7 @@ mod tests {
         let down = ServerMsg::Terminate {
             session_id: sid,
             reason: EndReason::HostDisconnect,
+            limit: None,
         };
         let s = serde_json::to_string(&down).unwrap();
         assert!(s.contains(r#""reason":"host_disconnect""#), "{s}");

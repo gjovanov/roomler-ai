@@ -1146,6 +1146,7 @@ impl Hub {
             tenant_name,
             false,
             OrgPolicy::Read(SessionPolicy::default()),
+            None,
         )
     }
 
@@ -1179,6 +1180,9 @@ impl Hub {
         may_record: bool,
         // FR-101 P2 — the org's session policy, read by the authz gate.
         session_policy: OrgPolicy,
+        // FR-101 P4b — the org's maximum session length, armed when the
+        // session goes live. `None` = no limit.
+        max_duration: Option<std::time::Duration>,
     ) -> Result<ObjectId> {
         // rc.185 — self-heal the fast connect→disconnect race. A controller
         // that connects then drops before teardown completes can leave an
@@ -1416,6 +1420,8 @@ impl Hub {
         live.privacy_refused = privacy_refused;
         // FR-101 P2 — likewise.
         live.features_refused = features_refused.clone();
+        // FR-101 P4b — armed when the session goes live (`forward_answer`).
+        live.max_duration = max_duration;
         // Multi-region relay: freeze the session's region NOW — a load-aware
         // pick over the agent's home + its RTT-ordered prefs — so Ready/
         // Offer/Answer all issue from the same PoP regardless of mid-setup
@@ -1829,9 +1835,30 @@ impl Hub {
         // Once the answer is in flight, mark the session active.
         // (The peers may still be doing ICE, but signaling is done from our POV.)
         self.with_session(session_id, |s| s.transition(SessionPhase::Active))?;
-        let (sid, aid, oid) =
-            self.with_session(session_id, |s| Ok((s.id, s.agent_id, s.tenant_id)))?;
+        let (sid, aid, oid, max_duration) = self.with_session(session_id, |s| {
+            Ok((s.id, s.agent_id, s.tenant_id, s.max_duration.take()))
+        })?;
         self.audit(sid, aid, oid, AuditKind::SessionStarted);
+        // FR-101 P4b — the org's maximum length runs from here, the moment the
+        // session went live, not from the request: consent can take minutes.
+        // Taken above, so a renegotiation never arms a second timer. A session
+        // that ended first is simply gone when it fires (`terminate` is
+        // idempotent, and a session id is never reused).
+        if let Some(limit) = max_duration {
+            let hub = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(limit).await;
+                if hub.inner.sessions.contains_key(&sid) {
+                    info!(
+                        session = %sid.to_hex(),
+                        limit_secs = limit.as_secs(),
+                        "rc session reached the org's maximum length — ending it"
+                    );
+                    let _ =
+                        hub.terminate_with_limit(sid, EndReason::IdleTimeout, Some("max_duration"));
+                }
+            });
+        }
         Ok(())
     }
 
@@ -1866,6 +1893,18 @@ impl Hub {
     // ─── termination ─────────────────────────────────────────────────
 
     pub fn terminate(&self, session_id: ObjectId, reason: EndReason) -> Result<()> {
+        self.terminate_with_limit(session_id, reason, None)
+    }
+
+    /// FR-101 P4b — [`Self::terminate`], naming the limit that ended the
+    /// session (`max_duration`) on `rc:terminate` and in the audit row, so a
+    /// viewer and a reader of the audit can tell it from idleness.
+    pub fn terminate_with_limit(
+        &self,
+        session_id: ObjectId,
+        reason: EndReason,
+        limit: Option<&'static str>,
+    ) -> Result<()> {
         let Some((_, arc)) = self.inner.sessions.remove(&session_id) else {
             return Ok(()); // already gone, idempotent
         };
@@ -1883,7 +1922,11 @@ impl Hub {
         }
 
         // Notify both sides (best-effort; either may be gone).
-        let msg = ServerMsg::Terminate { session_id, reason };
+        let msg = ServerMsg::Terminate {
+            session_id,
+            reason,
+            limit: limit.map(str::to_string),
+        };
         if let Some(tx) = controller_tx {
             let _ = tx.try_send(msg.clone());
         }
@@ -1895,7 +1938,10 @@ impl Hub {
             session_id,
             agent_id,
             tenant_id,
-            AuditKind::SessionEnded { reason },
+            AuditKind::SessionEnded {
+                reason,
+                limit: limit.map(str::to_string),
+            },
         );
         Ok(())
     }
@@ -3052,6 +3098,10 @@ pub struct DispatchCtx {
     /// or a session that lands on the other pod would skip the policy.
     /// Ignored for non-request messages and agent-role dispatch.
     pub session_policy: OrgPolicy,
+    /// FR-101 P4b — the org's maximum session length, from the same tenant
+    /// row; the relay carries it too. `None` = no limit. Ignored for
+    /// non-request messages and agent-role dispatch.
+    pub max_duration: Option<std::time::Duration>,
 }
 
 impl Hub {
@@ -3141,6 +3191,7 @@ impl Hub {
                     ctx.tenant_name.clone(),
                     ctx.may_record,
                     ctx.session_policy,
+                    ctx.max_duration,
                 )?;
                 Ok(())
             }
@@ -3334,7 +3385,7 @@ mod tests {
         while let Ok(m) = ctl_a_rx.try_recv() {
             if matches!(
                 m,
-                ServerMsg::Terminate { session_id, reason: EndReason::AgentDisconnect }
+                ServerMsg::Terminate { session_id, reason: EndReason::AgentDisconnect, .. }
                     if session_id == sid_a
             ) {
                 a_ctl_terminated = true;
@@ -3540,7 +3591,7 @@ mod tests {
         tokio::time::sleep(NEGOTIATING_TIMEOUT + Duration::from_secs(1)).await;
         let m = ctl_rx.recv().await.unwrap();
         assert!(
-            matches!(m, ServerMsg::Terminate { session_id, reason: EndReason::Error } if session_id == sid),
+            matches!(m, ServerMsg::Terminate { session_id, reason: EndReason::Error, .. } if session_id == sid),
             "offerless Negotiating session must be reaped with the retryable Error reason"
         );
     }
@@ -3592,6 +3643,110 @@ mod tests {
             ctl_rx.try_recv().is_err(),
             "session with an offer must not be reaped at the deadline"
         );
+    }
+
+    /// FR-101 P4b — drive a session to live: consent, offer, answer.
+    async fn go_live(
+        hub: &Hub,
+        sid: ObjectId,
+        ctl_rx: &mut mpsc::Receiver<ServerMsg>,
+        agent_rx: &mut mpsc::Receiver<ServerMsg>,
+    ) {
+        let _created = ctl_rx.recv().await.unwrap();
+        hub.deliver_consent(sid, true, None).unwrap();
+        let _ready = ctl_rx.recv().await.unwrap();
+        let _req = agent_rx.recv().await.unwrap();
+        hub.forward_offer(sid, "v=0".into()).unwrap();
+        hub.forward_answer(sid, "v=0".into()).unwrap();
+    }
+
+    /// FR-101 P4b — the next `rc:terminate` on a channel, within `within`.
+    async fn next_terminate(
+        rx: &mut mpsc::Receiver<ServerMsg>,
+        within: Duration,
+    ) -> Option<(EndReason, Option<String>)> {
+        let deadline = tokio::time::Instant::now() + within;
+        while let Ok(Some(m)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if let ServerMsg::Terminate { reason, limit, .. } = m {
+                return Some((reason, limit));
+            }
+        }
+        None
+    }
+
+    /// FR-101 P4b — the org's maximum session length runs from the moment the
+    /// session went live, and ends it as `IdleTimeout` with `limit:
+    /// max_duration`, at both ends. Not before its time; and a session with
+    /// no limit is untouched.
+    #[tokio::test]
+    async fn a_session_ends_at_the_orgs_maximum_length() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            true,
+            false,
+        );
+        let open = |hub: &Hub, tx: ClientTx, max: Option<Duration>| {
+            hub.create_session_full(
+                agent_id,
+                ObjectId::new(),
+                "ctl".into(),
+                tx,
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+                false,
+                None,
+                None,
+                false,
+                OrgPolicy::Read(SessionPolicy::default()),
+                max,
+            )
+            .unwrap()
+        };
+
+        let (tx, mut ctl_rx) = mpsc::channel(16);
+        let sid = open(&hub, tx, Some(Duration::from_millis(400)));
+        go_live(&hub, sid, &mut ctl_rx, &mut agent_rx).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            hub.inner.sessions.contains_key(&sid),
+            "ended before its maximum length"
+        );
+        let told = next_terminate(&mut ctl_rx, Duration::from_secs(3)).await;
+        assert_eq!(
+            told,
+            Some((EndReason::IdleTimeout, Some("max_duration".to_string()))),
+            "the controller is told which limit ended it"
+        );
+        let told = next_terminate(&mut agent_rx, Duration::from_secs(1)).await;
+        assert_eq!(
+            told,
+            Some((EndReason::IdleTimeout, Some("max_duration".to_string()))),
+            "and so is the agent"
+        );
+        assert!(!hub.inner.sessions.contains_key(&sid));
+
+        // The control: no limit, the session lives on.
+        let (tx, mut ctl_rx) = mpsc::channel(16);
+        let sid = open(&hub, tx, None);
+        go_live(&hub, sid, &mut ctl_rx, &mut agent_rx).await;
+        assert_eq!(
+            next_terminate(&mut ctl_rx, Duration::from_millis(800)).await,
+            None
+        );
+        assert!(hub.inner.sessions.contains_key(&sid));
     }
 
     /// P3 security — `dispatch` refuses session verbs from a connection
@@ -3647,6 +3802,7 @@ mod tests {
             may_record: false,
             rc_overlay: false,
             session_policy: OrgPolicy::Read(SessionPolicy::default()),
+            max_duration: None,
         };
         let stranger = ctx_for(Role::Controller, Some(ObjectId::new()), None);
         let owner_ctx = ctx_for(Role::Controller, Some(owner), None);
@@ -3751,7 +3907,9 @@ mod tests {
         async fn ended_as(ctl_rx: &mut mpsc::Receiver<ServerMsg>, sid: ObjectId) -> EndReason {
             loop {
                 match ctl_rx.recv().await.expect("the controller hears the end") {
-                    ServerMsg::Terminate { session_id, reason } if session_id == sid => {
+                    ServerMsg::Terminate {
+                        session_id, reason, ..
+                    } if session_id == sid => {
                         return reason;
                     }
                     _ => continue,
@@ -3804,6 +3962,7 @@ mod tests {
             may_record: false,
             rc_overlay: false,
             session_policy: OrgPolicy::Read(SessionPolicy::default()),
+            max_duration: None,
         };
         let device = ctx_for(Role::Agent, None, Some(agent_id));
         let viewer = ctx_for(Role::Controller, Some(owner), None);
@@ -3946,6 +4105,7 @@ mod tests {
                 None,
                 may_record,
                 OrgPolicy::Read(SessionPolicy::default()),
+                None,
             )
             .unwrap();
             match rx.try_recv().unwrap() {
@@ -4048,6 +4208,7 @@ mod tests {
                 None,
                 true,
                 OrgPolicy::Read(SessionPolicy::default()),
+                None,
             )
             .unwrap()
         };
@@ -4179,6 +4340,7 @@ mod tests {
                 None,
                 false,
                 OrgPolicy::Read(SessionPolicy::default()),
+                None,
             )
             .unwrap();
             let (granted, why) = match rx.try_recv().unwrap() {
@@ -4502,6 +4664,7 @@ mod tests {
                 None,
                 false,
                 org,
+                None,
             )
             .unwrap();
             let (granted, refused) = match rx.try_recv().unwrap() {
@@ -4575,6 +4738,7 @@ mod tests {
             None,
             false,
             org,
+            None,
         )
         .unwrap();
         match rx.try_recv().unwrap() {
@@ -5141,6 +5305,7 @@ mod tests {
                 None, // tenant_name
                 false,
                 OrgPolicy::Read(SessionPolicy::default()),
+                None,
             )
             .unwrap();
 
