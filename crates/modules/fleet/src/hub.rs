@@ -5823,6 +5823,77 @@ mod tests {
         assert_eq!(hub.agent_supports_hive_purge_on(agent_id, &tx), None);
     }
 
+    /// FR-90 P2g-3b — fleet's `hive_purge` control event, as every pod
+    /// applies it: pushed to each connection it names that this hub holds, of
+    /// the envelope's tenant; nothing for another tenant's, and nothing past
+    /// the envelope's cap.
+    #[tokio::test]
+    async fn a_hive_purge_from_another_pod_reaches_only_its_tenants_connection() {
+        let hub = test_hub().await;
+        let tenant = ObjectId::new();
+        let (agent_id, other) = (ObjectId::new(), ObjectId::new());
+        let (_tx, _cancel, mut rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+        let (_tx2, _cancel2, mut other_rx) = hub.register_agent(
+            other,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+        for a in [agent_id, other] {
+            hub.set_agent_hive_support(a, true);
+            hub.set_agent_hive_purge_support(a, true);
+        }
+        let (purge, session) = (ObjectId::new(), ObjectId::new());
+        let envelope = |tid: ObjectId, agents: &[ObjectId]| {
+            serde_json::json!({
+                "class": "rc",
+                "evt": "hive_purge",
+                "tenant_id": tid.to_hex(),
+                "purge_id": purge.to_hex(),
+                "session_id": session.to_hex(),
+                "agent_ids": agents.iter().map(|a| a.to_hex()).collect::<Vec<_>>(),
+            })
+        };
+
+        crate::ctrl::apply_rc_ctrl(&hub, &envelope(ObjectId::new(), &[agent_id]));
+        assert!(
+            rx.try_recv().is_err(),
+            "another tenant's envelope pushes nothing"
+        );
+
+        crate::ctrl::apply_rc_ctrl(&hub, &envelope(tenant, &[other, agent_id]));
+        match rx.try_recv() {
+            Ok(ServerMsg::HivePurge {
+                purge_id,
+                session_id,
+            }) => assert_eq!((purge_id, session_id), (purge, session)),
+            got => panic!("the purge reached its connection: {got:?}"),
+        }
+        assert!(
+            other_rx.try_recv().is_err(),
+            "another tenant's connection the envelope names hears nothing"
+        );
+
+        let mut many = vec![ObjectId::new(); crate::ctrl::MAX_HIVE_PURGE_AGENTS];
+        many.push(agent_id);
+        crate::ctrl::apply_rc_ctrl(&hub, &envelope(tenant, &many));
+        assert!(
+            rx.try_recv().is_err(),
+            "an id past the envelope's cap is not applied"
+        );
+    }
+
     // ─── Fleet RPC broker ────────────────────────────────────────────
 
     fn exec_msg(request_id: &str) -> ServerMsg {
