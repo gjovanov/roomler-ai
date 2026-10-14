@@ -67,6 +67,184 @@ export interface DigestPreview {
   sections: Record<string, unknown>
 }
 
+// ── P2: the account funnel, cohorts and the org views ───────────────────
+// Wire shapes mirror crates/api/src/growth/{funnel,cohorts,orgs}.rs. The
+// n-floor rule (SMALL_N = 30) lives in `rateIfEnough`: below its settled
+// denominator a step shows counts, never a percentage.
+
+/** A windowed step: `settled = signups − pending` is the rate denominator. */
+export interface StepCounts {
+  count: number
+  pending: number
+  settled: number
+}
+
+export interface FunnelSteps {
+  signup: number
+  org_created: StepCounts
+  /** `null` without `fleet` — "cannot see devices", never 0. */
+  activated: StepCounts | null
+  first_value: StepCounts | null
+  paid: NotMeasured
+}
+
+export interface Percentiles {
+  median_h: number | null
+  p75_h: number | null
+  n: number
+}
+
+export interface TimeToValue {
+  first_device: Percentiles | null
+  first_value: Percentiles | null
+}
+
+export interface FunnelBucket {
+  key: string | null
+  signups: number
+  org_created: StepCounts
+  activated: StepCounts | null
+  first_value: StepCounts | null
+}
+
+export interface FunnelWindows {
+  org_days: number
+  activation_days: number
+  value_days: number
+}
+
+export type FunnelDimension =
+  | 'source'
+  | 'medium'
+  | 'campaign'
+  | 'content'
+  | 'channel'
+  | 'self_reported'
+  | 'landing_path'
+
+export interface FunnelReport {
+  enabled: boolean
+  since: string
+  until: string
+  include_internal: boolean
+  excluded: ExcludedCounts
+  windows: FunnelWindows
+  truncated: boolean
+  value_basis: string[]
+  not_measured: Record<string, string>
+  steps: FunnelSteps
+  time_to_value: TimeToValue
+  by: FunnelDimension | null
+  buckets: FunnelBucket[]
+}
+
+export interface CohortRow {
+  week: string
+  start: string
+  size: number
+  /** `active[k]` = orgs active in W+k; `null` until that week has started. */
+  active: (number | null)[]
+  closed_through: number
+}
+
+export interface WaoWeek {
+  week: string
+  start: string
+  active_orgs: number
+  partial: boolean
+}
+
+export interface CohortsReport {
+  enabled: boolean
+  unit: string
+  since: string
+  include_internal: boolean
+  excluded: ExcludedCounts
+  weeks_since: number
+  highlight: number[]
+  value_basis: string[]
+  not_measured?: string
+  cohorts: CohortRow[] | null
+  wao: WaoWeek[] | null
+  org_daily: { first_day: string | null; last_day: string | null }
+}
+
+export interface Acquisition {
+  channel: string
+  source?: string
+  medium?: string
+  campaign?: string
+  content?: string
+  self_reported?: string
+  landing_path?: string
+  referrer_host?: string
+}
+
+export interface OrgRow {
+  tenant_id: string
+  name: string
+  slug: string
+  created: string
+  archived: boolean
+  plan: string
+  billing_status?: string
+  owner: Acquisition | null
+  devices: { enrolled: number; live: number } | null
+  last_value_day: string | null
+  weeks: boolean[]
+  active_weeks: number
+  at_risk: boolean
+}
+
+export interface OrgsReport {
+  enabled: boolean
+  include_internal: boolean
+  excluded: ExcludedCounts
+  limit: number
+  truncated: boolean
+  value_basis: string[]
+  not_measured?: string
+  weeks: string[]
+  orgs: OrgRow[]
+}
+
+export interface TimelineEvent {
+  at: string
+  kind: string
+  attribution?: Acquisition
+  owner?: boolean
+  os?: string
+  value_kinds?: string[]
+}
+
+export interface OrgTimeline {
+  enabled: boolean
+  tenant_id: string
+  name: string
+  slug: string
+  created: string
+  archived: boolean
+  plan: string
+  billing_status?: string
+  members: number
+  devices: { enrolled: number; live: number } | null
+  events: TimelineEvent[]
+  value_basis: string[]
+  not_measured?: string
+  weeks: { week: string; start: string; active: boolean }[]
+  totals: Record<string, unknown> | null
+}
+
+/** The n-floor (spec principle 5): a rate only once its denominator reaches
+ *  30 — below it the UI shows counts and hides the percentage. */
+export const SMALL_N = 30
+
+/** `count / settled` as a percentage to 0.1, or `null` below the n-floor. */
+export function rateIfEnough(count: number, settled: number): number | null {
+  if (settled < SMALL_N) return null
+  return Math.round((count / settled) * 1000) / 10
+}
+
 export function isNotMeasured(v: unknown): v is NotMeasured {
   return (
     typeof v === 'object' &&
@@ -141,5 +319,49 @@ export const useGrowthStore = defineStore('growth', () => {
     return api.get<DigestPreview>(`/admin/growth/digest/preview?${q}`)
   }
 
-  return { digests, error, fetchDigests, fetchDigest, runDigest, fetchPreview }
+  /** The account funnel; `by` adds a per-dimension breakdown. */
+  async function fetchFunnel(
+    opts: { since?: string; until?: string; by?: FunnelDimension; includeInternal?: boolean } = {},
+  ): Promise<FunnelReport> {
+    const q = new URLSearchParams()
+    if (opts.since) q.set('since', opts.since)
+    if (opts.until) q.set('until', opts.until)
+    if (opts.by) q.set('by', opts.by)
+    if (opts.includeInternal) q.set('include_internal', 'true')
+    const qs = q.toString()
+    return api.get<FunnelReport>(`/admin/growth/funnel${qs ? `?${qs}` : ''}`)
+  }
+
+  /** Weekly cohorts and the north-star WAO series. */
+  async function fetchCohorts(since?: string): Promise<CohortsReport> {
+    const q = new URLSearchParams({ unit: 'week' })
+    if (since) q.set('since', since)
+    return api.get<CohortsReport>(`/admin/growth/cohorts?${q}`)
+  }
+
+  /** The per-org table. */
+  async function fetchOrgs(limit?: number): Promise<OrgsReport> {
+    const q = new URLSearchParams()
+    if (limit) q.set('limit', String(limit))
+    const qs = q.toString()
+    return api.get<OrgsReport>(`/admin/growth/orgs${qs ? `?${qs}` : ''}`)
+  }
+
+  /** One org's milestones from sign-up to its last value day. */
+  async function fetchTimeline(tenantId: string): Promise<OrgTimeline> {
+    return api.get<OrgTimeline>(`/admin/growth/org/${encodeURIComponent(tenantId)}/timeline`)
+  }
+
+  return {
+    digests,
+    error,
+    fetchDigests,
+    fetchDigest,
+    runDigest,
+    fetchPreview,
+    fetchFunnel,
+    fetchCohorts,
+    fetchOrgs,
+    fetchTimeline,
+  }
 })

@@ -14,12 +14,23 @@
 //! * [`digest`] — P1d: the daily digest's sections, the once-only claim,
 //!   the delivery and the scheduler; [`purestat`] its one read of the web
 //!   plane; [`render`] its email bodies; [`routes`] its four routes.
+//! * [`value`] — P2: the four value-event definitions every view shares.
+//! * [`org_daily`] — P2: `growth_org_daily`, the nightly fold and the
+//!   bounded backfill.
+//! * [`funnel`], [`cohorts`], [`orgs`] — P2: the account funnel with time
+//!   to value, the weekly cohorts with the north star (WAO), the org list
+//!   and one org's timeline.
 
+pub mod cohorts;
 pub mod digest;
 pub mod exclusions;
+pub mod funnel;
+pub mod org_daily;
+pub mod orgs;
 pub mod purestat;
 pub mod render;
 pub mod routes;
+pub mod value;
 
 use axum::{
     Router,
@@ -27,6 +38,10 @@ use axum::{
 };
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+
+/// The one error type of the growth surface: the digest's, which every
+/// later phase reuses rather than minting a twin.
+pub use digest::DigestError as GrowthError;
 
 /// The `/api/admin/growth` router, mounted by `build_router`.
 pub fn admin_routes() -> Router<AppState> {
@@ -42,6 +57,21 @@ pub fn admin_routes() -> Router<AppState> {
         .route("/digests", get(routes::list_digests))
         .route("/digest/run", post(routes::run_digest))
         .route("/digest/preview", get(routes::preview_digest))
+        // P2 — the account funnel (with time to value), the weekly cohorts
+        // (with WAO), the org list, one org's timeline, and the bounded
+        // backfill of `growth_org_daily`.
+        .route("/funnel", get(funnel::get_funnel))
+        .route("/cohorts", get(cohorts::get_cohorts))
+        .route("/orgs", get(orgs::list_orgs))
+        .route("/org/{tenant_id}/timeline", get(orgs::org_timeline))
+        .route("/org-daily/backfill", post(org_daily::backfill_route))
+}
+
+/// Whether a module is mounted on this pod — the gate every growth read of
+/// a module's collection passes, so an absent module reads as "cannot
+/// see", never as "none".
+pub(crate) fn mounted(state: &AppState, id: &str) -> bool {
+    state.modules.mounted().contains(&id)
 }
 
 /// The gate every growth handler passes first: a platform admin, on a
