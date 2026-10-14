@@ -2491,6 +2491,24 @@ export async function isVp9_444DecodeSupported(): Promise<boolean> {
   }
 }
 
+/** #2231 — the same probe for VP9 profile 0 (`vp09.00.10.08`, 4:2:0, 8-bit),
+ *  the string the worker configures when the session runs at 4:2:0. Firefox's
+ *  WebCodecs decodes profile 0 but not profile 1, so this is what lets it
+ *  take the VP9 DataChannel instead of the RTP track. Exported for tests. */
+export async function isVp9_420DecodeSupported(): Promise<boolean> {
+  const g = globalThis as unknown as {
+    VideoDecoder?: { isConfigSupported?: (cfg: { codec: string }) => Promise<{ supported?: boolean }> }
+  }
+  const isConfigSupported = g.VideoDecoder?.isConfigSupported
+  if (typeof isConfigSupported !== 'function') return false
+  try {
+    const res = await isConfigSupported({ codec: 'vp09.00.10.08' })
+    return res?.supported === true
+  } catch {
+    return false
+  }
+}
+
 /** rc.78 Ã¢ÂÂ feature-detect HEVC decode via WebCodecs. rc.94 Ã¢ÂÂ probes
  *  `hev1.1.6.L153.B0` (Main profile, Level **5.1**), matching the
  *  worker's `DEFAULT_HEVC_CODEC`. MUST stay in sync with the worker:
@@ -2848,6 +2866,7 @@ const probeHevcHw = memoProbe(isHevcHwDecodeSupported)
 const probeHevcDec = memoProbe(isHevcDecodeSupported)
 const probeVp9Hw = memoProbe(isVp9HwDecodeSupported)
 const probeVp9_444 = memoProbe(isVp9_444DecodeSupported)
+const probeVp9_420 = memoProbe(isVp9_420DecodeSupported)
 const probeH264Hw = memoProbe(isH264HwDecodeSupported)
 const probeH264Dc = memoProbe(isH264DcDecodeSupported)
 const probeAv1Dec = memoProbe(isAv1DecodeSupported)
@@ -2876,6 +2895,11 @@ export interface AutoTransportInputs {
   viewerHevcDecodable: boolean
   viewerVp9Hw: boolean
   viewerVp9Decodable: boolean
+  /** #2231 — WebCodecs decodes VP9 profile 0 (`vp09.00.10.08`, 4:2:0).
+   *  `viewerVp9Decodable` is the profile-1 probe; Firefox decodes profile 0
+   *  only, and without this the VP9 DataChannel was never offered to it.
+   *  Optional: absent reads as "not known", which changes nothing. */
+  viewerVp9_420Decodable?: boolean
   viewerH264Hw: boolean
   /** The viewer's Priority dial. Only `sharper` changes the outcome, and
    *  only on the libvpx SW rung — see the chroma note on `pickAutoTransport`.
@@ -3053,6 +3077,17 @@ export function pickAutoTransport(inputs: AutoTransportInputs): {
       transport: 'data-channel-vp9-444',
       chromaOverride: 'yuv420',
       reason: 'VP9 4:2:0: SW encode on agent (capped Ã¢ÂÂ¤1920) Ã¢ÂÂ no HWÃÂHW codec pair available',
+    }
+  }
+  // #2231 — a browser that decodes VP9 profile 0 but not profile 1 (Firefox's
+  // WebCodecs) still takes the VP9 DataChannel, at 4:2:0. Without this rung
+  // it fell to the RTP track below, where the agent may offer only H.264,
+  // which a Firefox without OpenH264 cannot decode at all.
+  if (hasVp9Dc && inputs.viewerVp9_420Decodable === true) {
+    return {
+      transport: 'data-channel-vp9-444',
+      chromaOverride: 'yuv420',
+      reason: 'VP9 4:2:0: SW encode on agent - this browser decodes VP9 profile 0 only',
     }
   }
   return { transport: null, chromaOverride: null, reason: 'webrtc H.264 fallback' }
@@ -9239,7 +9274,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // agent's advertised encoders with this browser's MediaCapabilities
       // and pick the best pair; explicit user picks skip this entirely.
       const caps = agent?.value?.capabilities
-      const [av1Hw, hevcHw, hevcDec, vp9Hw, vp9Dec, h264Hw, h264Codec, hevcRext, h264High444] = await Promise.all([
+      const [av1Hw, hevcHw, hevcDec, vp9Hw, vp9Dec, h264Hw, h264Codec, hevcRext, h264High444, vp9Dec420] = await Promise.all([
         probeAv1Hw(),
         probeHevcHw(),
         probeHevcDec(),
@@ -9249,6 +9284,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         probeH264Dc(),
         probeHevcRext(),
         probeH264High444(),
+        probeVp9_420(),
       ])
       vp9_444Supported.value = vp9Dec
       hevcSupported.value = hevcDec
@@ -9280,7 +9316,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         viewerHevcDecodable: hevcDec,
         viewerVp9Hw: vp9Hw && !failedDcTransports.has('data-channel-vp9-444'),
         viewerVp9Decodable: vp9Dec && !failedDcTransports.has('data-channel-vp9-444'),
-        // P2 Ã¢ÂÂ H.264-DC needs both the HW-smooth verdict AND an accepted
+        // #2231 — profile 0 alone (Firefox) still takes the VP9 DataChannel at 4:2:0.
+        viewerVp9_420Decodable: vp9Dec420 && !failedDcTransports.has('data-channel-vp9-444'),
+        // P2Ã¢ÂÂ H.264-DC needs both the HW-smooth verdict AND an accepted
         // Annex-B avc1 config (the worker configures with the latter).
         viewerH264Hw: h264Hw && h264Codec !== null
           && !failedDcTransports.has('data-channel-h264'),
@@ -9387,13 +9425,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     } else if (videoTransport.value === 'data-channel-vp9-444') {
       const supported = vp9_444Supported.value || (await probeVp9_444())
       vp9_444Supported.value = supported
-      if (supported && !failedDcTransports.has('data-channel-vp9-444')) {
+      // #2231 — profile 0 only (Firefox): the DataChannel still runs, at 4:2:0.
+      const profile0Only = !supported && (await probeVp9_420())
+      if ((supported || profile0Only) && !failedDcTransports.has('data-channel-vp9-444')) {
         preferredTransport = 'data-channel-vp9-444'
         viewerDecodeHw.value = await isVp9HwDecodeSupported()
         // FR-77 — chroma "Auto" on an explicit VP9 pick follows the Priority
         // dial (it used to send nothing, which the agent reads as profile 1);
-        // a remembered profile-1 decode failure pins 4:2:0.
-        if (vp9_444Remembered) {
+        // a remembered profile-1 decode failure pins 4:2:0, and so does a
+        // browser that decodes only profile 0.
+        if (vp9_444Remembered || profile0Only) {
           chromaOverride = 'yuv420'
         } else if (vp9Chroma.value === 'auto') {
           chromaOverride = resolveChroma('auto', priority.value, true)
@@ -9456,8 +9497,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           }
         }
       } else {
-        const vp9Ok = vp9_444Supported.value || (await probeVp9_444())
-        vp9_444Supported.value = vp9Ok
+        const profile1 = vp9_444Supported.value || (await probeVp9_444())
+        vp9_444Supported.value = profile1
+        // #2231 — this fallback always runs at 4:2:0, so profile 0 is enough.
+        const vp9Ok = profile1 || (await probeVp9_420())
         const fallback = vp9Ok && !failedDcTransports.has('data-channel-vp9-444')
         if (fallback) {
           console.info(
