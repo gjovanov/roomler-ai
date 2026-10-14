@@ -25,15 +25,24 @@ use serde_json::{Value, json};
 
 use crate::fixtures::test_app::TestApp;
 
-const DAY_MS: i64 = 86_400_000;
-
-fn ago(days: i64) -> DateTime {
-    DateTime::from_millis(DateTime::now().timestamp_millis() - days * DAY_MS)
+/// Hour `h` (UTC) of the day `days_ago` days before today — anchored to the
+/// UTC calendar, so every seeded event lands on a KNOWN day whatever the wall
+/// clock is when the test runs. (A "+h hours from now − N days" helper put
+/// every event on the next UTC day once CI ran past 14:00Z, and a single-day
+/// fold found nothing.)
+fn at(days_ago: i64, h: u32) -> DateTime {
+    let day = org_daily::parse_day_of(DateTime::now()) - chrono::Duration::days(days_ago);
+    DateTime::from_millis(
+        day.and_hms_opt(h, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis(),
+    )
 }
 
-/// `days` ago, at `h:00`, so a session can span a midnight deterministically.
-fn ago_at(days: i64, h: i64) -> DateTime {
-    DateTime::from_millis(DateTime::now().timestamp_millis() - days * DAY_MS + h * 3_600_000)
+/// Noon of that day: "some time that day" where the hour does not matter.
+fn ago(days: i64) -> DateTime {
+    at(days, 12)
 }
 
 async fn insert(app: &TestApp, coll: &str, mut d: Document) -> ObjectId {
@@ -173,8 +182,8 @@ async fn admin_app(fleet: bool) -> (TestApp, ObjectId, String) {
         .generate_tokens(admin_id, "padmin@test.io", "padmin")
         .unwrap()
         .access_token;
-    user(&app, admin_id, "padmin@test.io", ago(1), None).await;
-    org(&app, admin_id, "admin-org", ago(1)).await;
+    user(&app, admin_id, "padmin@test.io", at(1, 10), None).await;
+    org(&app, admin_id, "admin-org", at(1, 11)).await;
     (app, admin_id, token)
 }
 
@@ -192,35 +201,23 @@ async fn the_funnel_counts_each_step_with_pending_and_settled() {
         &app,
         a,
         "a@test.io",
-        ago(40),
+        at(40, 10),
         Some(doc! { "source": "YouTub", "medium": "video" }),
     )
     .await;
-    let org_a = org(&app, a, "org-a", ago_at(40, 1)).await;
-    device(&app, org_a, ago(39), true).await;
-    rc_session(
-        &app,
-        org_a,
-        ago_at(38, 10),
-        ago_at(38, 10).checked_add_min(10),
-    )
-    .await;
+    let org_a = org(&app, a, "org-a", at(40, 11)).await;
+    device(&app, org_a, at(39, 10), true).await;
+    rc_session(&app, org_a, at(38, 10), at(38, 10).checked_add_min(10)).await;
     // A short session the same day is not value; a call with 2 is.
-    rc_session(
-        &app,
-        org_a,
-        ago_at(38, 12),
-        ago_at(38, 12).checked_add_min(0),
-    )
-    .await;
-    call(&app, org_a, ago_at(38, 13), 2).await;
-    tunnel_flow(&app, org_a, ago_at(38, 14)).await;
-    ssh_grant(&app, org_a, ago_at(38, 15)).await;
+    rc_session(&app, org_a, at(38, 12), at(38, 12).checked_add_min(0)).await;
+    call(&app, org_a, at(38, 13), 2).await;
+    tunnel_flow(&app, org_a, at(38, 14)).await;
+    ssh_grant(&app, org_a, at(38, 15)).await;
 
     // B: org, no device. Activated cold, value cold. Settled.
     let b = ObjectId::new();
-    user(&app, b, "b@test.io", ago(40), None).await;
-    org(&app, b, "org-b", ago(39)).await;
+    user(&app, b, "b@test.io", at(40, 10), None).await;
+    org(&app, b, "org-b", at(39, 10)).await;
 
     // C: org, device, NO value event. Activated reached, value cold. Settled.
     let c = ObjectId::new();
@@ -228,12 +225,12 @@ async fn the_funnel_counts_each_step_with_pending_and_settled() {
         &app,
         c,
         "c@test.io",
-        ago(40),
+        at(40, 10),
         Some(doc! { "source": "linkedin" }),
     )
     .await;
-    let org_c = org(&app, c, "org-c", ago(39)).await;
-    device(&app, org_c, ago(38), false).await;
+    let org_c = org(&app, c, "org-c", at(39, 10)).await;
+    device(&app, org_c, at(38, 10), false).await;
 
     // D: signed up 2 days ago, no org yet. Org pending.
     let d = ObjectId::new();
@@ -241,7 +238,7 @@ async fn the_funnel_counts_each_step_with_pending_and_settled() {
         &app,
         d,
         "d@test.io",
-        ago(2),
+        at(2, 10),
         Some(doc! { "source": "youtube" }),
     )
     .await;
@@ -252,19 +249,13 @@ async fn the_funnel_counts_each_step_with_pending_and_settled() {
         &app,
         x,
         "x@test.io",
-        ago(40),
+        at(40, 10),
         Some(doc! { "source": "youtube" }),
     )
     .await;
-    let org_x = org(&app, x, "org-x", ago(39)).await;
-    device(&app, org_x, ago(38), false).await;
-    rc_session(
-        &app,
-        org_x,
-        ago_at(37, 10),
-        ago_at(37, 10).checked_add_min(10),
-    )
-    .await;
+    let org_x = org(&app, x, "org-x", at(39, 10)).await;
+    device(&app, org_x, at(38, 10), false).await;
+    rc_session(&app, org_x, at(37, 10), at(37, 10).checked_add_min(10)).await;
     let r = app
         .auth_put("/api/admin/growth/exclusions", &token)
         .json(&json!({ "exclusions": [ { "kind": "user", "id": x.to_hex(), "reason": "field tester" } ] }))
@@ -277,8 +268,8 @@ async fn the_funnel_counts_each_step_with_pending_and_settled() {
     // from it). Over the whole seeded span.
     let rep = org_daily::recompute_range(
         &app.state,
-        org_daily::parse_day_of(ago(41)),
-        org_daily::parse_day_of(ago(1)),
+        org_daily::parse_day_of(at(41, 0)),
+        org_daily::parse_day_of(at(1, 0)),
         DateTime::now(),
     )
     .await
@@ -289,7 +280,7 @@ async fn the_funnel_counts_each_step_with_pending_and_settled() {
         .auth_get(
             &format!(
                 "/api/admin/growth/funnel?since={}&by=source",
-                ago(60).timestamp_millis() / 1000
+                at(60, 0).timestamp_millis() / 1000
             ),
             &token,
         )
@@ -355,17 +346,17 @@ async fn unmounted_steps_are_null_with_the_module_named() {
         &app,
         a,
         "a@test.io",
-        ago(40),
+        at(40, 10),
         Some(doc! { "source": "youtube" }),
     )
     .await;
-    org(&app, a, "org-a", ago(39)).await;
+    org(&app, a, "org-a", at(39, 10)).await;
 
     let j: Value = app
         .auth_get(
             &format!(
                 "/api/admin/growth/funnel?since={}",
-                ago(60).timestamp_millis() / 1000
+                at(60, 0).timestamp_millis() / 1000
             ),
             &token,
         )
@@ -391,7 +382,10 @@ async fn unmounted_steps_are_null_with_the_module_named() {
             .unwrap()
             .contains("fleet")
     );
-    assert_eq!(j["value_basis"], json!([]), "no value module without fleet");
+    // `conference` does not depend on `fleet`, so calls stay a value module
+    // without it and the basis says so; `first_value` is still null above
+    // because activation (a device) precedes value and devices are unseen.
+    assert_eq!(j["value_basis"], json!(["conference"]));
 }
 
 /// AC8 — a day's tunnel and SSH use is folded into `growth_org_daily`, and
@@ -401,15 +395,15 @@ async fn unmounted_steps_are_null_with_the_module_named() {
 async fn org_daily_outlives_the_audit_rows_and_dies_with_the_org() {
     let (app, _admin, _token) = admin_app(true).await;
     let a = ObjectId::new();
-    user(&app, a, "a@test.io", ago(100), None).await;
-    let org_a = org(&app, a, "org-a", ago(100)).await;
+    user(&app, a, "a@test.io", at(100, 9), None).await;
+    let org_a = org(&app, a, "org-a", at(100, 9)).await;
     // A day 100 days ago — past every audit TTL — with a tunnel flow and an
-    // SSH grant, and nothing else.
-    tunnel_flow(&app, org_a, ago_at(100, 10)).await;
-    tunnel_flow(&app, org_a, ago_at(100, 11)).await;
-    ssh_grant(&app, org_a, ago_at(100, 12)).await;
+    // SSH grant, and nothing else. All three on that one UTC day.
+    tunnel_flow(&app, org_a, at(100, 10)).await;
+    tunnel_flow(&app, org_a, at(100, 11)).await;
+    ssh_grant(&app, org_a, at(100, 12)).await;
 
-    let day = org_daily::parse_day_of(ago(100));
+    let day = org_daily::parse_day_of(at(100, 0));
     org_daily::recompute_range(&app.state, day, day, DateTime::now())
         .await
         .unwrap();
@@ -474,8 +468,8 @@ async fn org_daily_outlives_the_audit_rows_and_dies_with_the_org() {
 async fn cohorts_count_active_orgs_by_week_since_creation() {
     let (app, _admin, token) = admin_app(true).await;
     // Two orgs created ~8 weeks ago (same cohort week), one ~4 weeks ago.
-    let early = ago(56);
-    let late = ago(28);
+    let early = at(56, 12);
+    let late = at(28, 12);
     let (o1, o2, o3) = (
         org(&app, ObjectId::new(), "o1", early).await,
         org(&app, ObjectId::new(), "o2", early).await,
@@ -563,20 +557,14 @@ async fn the_org_views_carry_the_channel_and_milestones() {
         &app,
         a,
         "a@test.io",
-        ago(40),
+        at(40, 10),
         Some(doc! { "source": "linkedin", "medium": "post", "referrer_host": "linkedin.com" }),
     )
     .await;
-    let org_a = org(&app, a, "org-a", ago_at(39, 1)).await;
-    device(&app, org_a, ago(38), false).await;
-    rc_session(
-        &app,
-        org_a,
-        ago_at(37, 10),
-        ago_at(37, 10).checked_add_min(10),
-    )
-    .await;
-    let day = org_daily::parse_day_of(ago(37));
+    let org_a = org(&app, a, "org-a", at(39, 11)).await;
+    device(&app, org_a, at(38, 10), false).await;
+    rc_session(&app, org_a, at(37, 10), at(37, 10).checked_add_min(10)).await;
+    let day = org_daily::parse_day_of(at(37, 0));
     org_daily::recompute_range(&app.state, day, day, DateTime::now())
         .await
         .unwrap();
