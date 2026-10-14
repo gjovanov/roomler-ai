@@ -4504,15 +4504,17 @@ async fn handle_server_msg(
             moved_by: _,
             moved_by_name,
             moved_at_ms,
+            earlier,
         } => {
             info!(
                 session = %session_id, fence, from = %from_device_name,
-                by = %moved_by_name, "the session moves to this device"
+                by = %moved_by_name, earlier = earlier.len(), "the session moves to this device"
             );
             // P2e-7 — where it came from and who moved it, for the resume
-            // note. A build without Hive keeps none of it.
+            // note; P2f-5 — and every place before. A build without Hive keeps
+            // none of it.
             #[cfg(not(hive_host))]
-            let _ = (&from_folder, moved_at_ms);
+            let _ = (&from_folder, moved_at_ms, &earlier);
             #[cfg(hive_host)]
             crate::hive::handle_move(
                 crate::hive::Moved {
@@ -4524,6 +4526,7 @@ async fn handle_server_msg(
                     from_folder,
                     moved_by_name,
                     moved_at_ms,
+                    earlier,
                 },
                 ctx.is_primary,
             );

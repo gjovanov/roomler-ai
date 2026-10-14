@@ -47,7 +47,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::hive::{
     HARNESS_CLAUDE_CODE, HiveApprovalStatus, HiveDrainRefusal, HiveForkOf, HiveManifestEntry,
-    HiveRefusal, HiveRunState, HiveTurnStatus, hive_limits, promote_limits,
+    HivePlace, HiveRefusal, HiveRunState, HiveTurnStatus, hive_limits, promote_limits,
 };
 use roomler_ai_remote_control::signaling::ClientMsg;
 use roomler_hive_node::checkpoint::Checkpoint;
@@ -286,6 +286,9 @@ pub struct Moved {
     pub from_folder: String,
     pub moved_by_name: String,
     pub moved_at_ms: u64,
+    /// FR-90 P2f-5 — every place it ran before, oldest first, as the record's
+    /// path map names them: the note says where earlier turns' paths live now.
+    pub earlier: Vec<HivePlace>,
 }
 
 /// The device's answer to a start.
@@ -1886,6 +1889,7 @@ impl Supervisor {
                     at_ms: m.moved_at_ms,
                     from_device: &m.from_device_name,
                     from_folder: &m.from_folder,
+                    earlier: &m.earlier,
                 };
                 Some(resume_note::compose(&from, &folder, open.as_deref()))
             }
@@ -9747,6 +9751,11 @@ done
         let sid = o.session_id;
         as_another_device(&r, sid);
 
+        // P2f-5 — it ran on venus before mars: the move names both places.
+        let place = |device: &str, folder: &str| HivePlace {
+            device_name: device.into(),
+            folder: folder.into(),
+        };
         r.sup.receive_move(Moved {
             session_id: sid,
             fence: 2,
@@ -9756,6 +9765,7 @@ done
             from_folder: "/srv/work".into(),
             moved_by_name: "Alice".into(),
             moved_at_ms: 1_791_813_720_000,
+            earlier: vec![place("venus", "/home/a/work"), place("mars", "/srv/work")],
         });
         assert_eq!(
             r.sup.start(moved_start(&o), true).await,
@@ -9783,6 +9793,12 @@ done
                  It ran on mars, in /srv/work."
             ),
             "the resume note is left for the hook: {note:?}"
+        );
+        assert!(
+            note.contains(
+                "Paths in earlier turns under /home/a/work and /srv/work now live under "
+            ),
+            "every folder its earlier turns worked in: {note:?}"
         );
         let settings: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(run.join("settings.json")).unwrap())
@@ -9886,6 +9902,7 @@ done
             from_folder: "/srv/work".into(),
             moved_by_name: "Alice".into(),
             moved_at_ms: 1_791_813_720_000,
+            earlier: Vec::new(),
         });
         // P2e-7 — a note an earlier move left here.
         let left = r
@@ -9955,6 +9972,7 @@ done
             from_folder: "/srv/work".into(),
             moved_by_name: "Alice".into(),
             moved_at_ms: 1_791_813_720_000,
+            earlier: Vec::new(),
         });
         assert_eq!(
             r.sup.start(moved_start(&plain), true).await,
@@ -9976,6 +9994,7 @@ done
             from_folder: "/srv/work".into(),
             moved_by_name: "Alice".into(),
             moved_at_ms: 1_791_813_720_000,
+            earlier: Vec::new(),
         });
         assert_eq!(
             r.sup.start(moved_start(&o), true).await,
@@ -10011,6 +10030,7 @@ done
             from_folder: "/srv/work".into(),
             moved_by_name: "Alice".into(),
             moved_at_ms: 1_791_813_720_000,
+            earlier: Vec::new(),
         });
         assert_eq!(
             r.sup.start(moved_start(&o), true).await,

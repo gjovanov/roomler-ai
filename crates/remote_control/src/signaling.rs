@@ -3442,6 +3442,14 @@ pub enum ServerMsg {
         moved_by_name: String,
         /// When the lease moved, as the server's clock read it (Unix ms).
         moved_at_ms: u64,
+        /// FR-90 P2f-5 — every place it ran before this start, oldest first,
+        /// one per folder, the newest
+        /// [`crate::hive::promote_limits::MAX_EARLIER_PLACES`]: the record's
+        /// path map, the `from_*` place last. Old turns keep the paths they
+        /// had there. Absent from a server before P2f-5, and for a session
+        /// with no move it recorded.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        earlier: Vec<crate::hive::HivePlace>,
     },
 
     /// FR-90 P1e — a session's core memory, rendered from the org's brain at
@@ -5118,8 +5126,10 @@ mod tests {
             moved_by: uid,
             moved_by_name: "Alice".into(),
             moved_at_ms: 1_760_000_000_000,
+            earlier: Vec::new(),
         };
         let v = serde_json::to_value(&mv).unwrap();
+        // P2f-5 — no earlier place: the frame every earlier server sent.
         assert_eq!(
             v,
             serde_json::json!({
@@ -5127,7 +5137,8 @@ mod tests {
                 "from_device_id": from.to_hex(), "from_device_name": "mars",
                 "from_folder": "/srv/app", "moved_by": uid.to_hex(),
                 "moved_by_name": "Alice", "moved_at_ms": 1_760_000_000_000_u64
-            })
+            }),
+            "no earlier place: the frame every earlier server sent"
         );
         assert!(matches!(
             serde_json::from_value::<ServerMsg>(v).unwrap(),
@@ -5136,6 +5147,24 @@ mod tests {
                 fence: 2,
                 ..
             }
+        ));
+        // P2f-5 — and the places before it, names and folders only.
+        let mut many = mv.clone();
+        if let ServerMsg::HiveMove { earlier, .. } = &mut many {
+            earlier.push(crate::hive::HivePlace {
+                device_name: "laptop".into(),
+                folder: "C:\\dev\\app".into(),
+            });
+        }
+        let v = serde_json::to_value(&many).unwrap();
+        assert_eq!(
+            v["earlier"],
+            serde_json::json!([{"device_name": "laptop", "folder": "C:\\dev\\app"}]),
+            "{v}"
+        );
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(v).unwrap(),
+            ServerMsg::HiveMove { earlier, .. } if earlier.len() == 1
         ));
     }
 

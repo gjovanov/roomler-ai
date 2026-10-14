@@ -45,8 +45,10 @@ use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
     error::Error as HubError,
     hive::{
-        HiveCopyTip, HiveDrainRefusal, HiveRefusal, HiveReplicaRole, hive_limits, is_hash_hex,
-        promote_limits::UNREACHABLE_SECS, replica_limits,
+        HiveCopyTip, HiveDrainRefusal, HivePlace, HiveRefusal, HiveReplicaRole, hive_limits,
+        is_hash_hex,
+        promote_limits::{MAX_EARLIER_PLACES, UNREACHABLE_SECS},
+        replica_limits,
     },
     models::{Agent, RpcCap},
     signaling::ServerMsg,
@@ -1869,6 +1871,22 @@ fn send_member_joins(state: &HiveState, s: &AgentSession) {
     }
 }
 
+/// FR-90 P2f-5 — the places `s` ran before, as `rc:hive.move` names them:
+/// its path map's, oldest first, one per folder (where it last ran in each),
+/// the newest [`MAX_EARLIER_PLACES`].
+pub(crate) fn earlier_places(s: &AgentSession) -> Vec<HivePlace> {
+    let mut places: Vec<HivePlace> = Vec::new();
+    for m in &s.path_map {
+        places.retain(|p| p.folder != m.from.folder);
+        places.push(HivePlace {
+            device_name: m.from.device_name.clone(),
+            folder: m.from.folder.clone(),
+        });
+    }
+    let older = places.len().saturating_sub(MAX_EARLIER_PLACES);
+    places.split_off(older)
+}
+
 /// What the device about to run `s` at its fence hears first: its join as
 /// the primary, while it is owed one (its floor rises before it writes), and
 /// the record's `rc:hive.move`. For a start at a fence past the first: a
@@ -1892,6 +1910,13 @@ pub(crate) async fn before_start(
     if owed {
         crate::replica::push_join(state, s, device, HiveReplicaRole::Primary);
     }
+    // P2f-5 — when the lease moved, as the record keeps it: a start re-sent
+    // at a later connection names the move, not the re-send.
+    let at = s
+        .moved
+        .as_ref()
+        .filter(|m| m.from.device_id == from.device_id)
+        .map_or_else(DateTime::now, |m| m.at);
     let mv = ServerMsg::HiveMove {
         session_id: sid,
         fence,
@@ -1901,7 +1926,8 @@ pub(crate) async fn before_start(
         from_folder: from.folder.clone(),
         moved_by: by,
         moved_by_name: display_name(state, by).await,
-        moved_at_ms: u64::try_from(DateTime::now().timestamp_millis()).unwrap_or_default(),
+        moved_at_ms: u64::try_from(at.timestamp_millis()).unwrap_or_default(),
+        earlier: earlier_places(s),
     };
     if let Err(e) = state
         .fleet
@@ -2107,7 +2133,63 @@ async fn display_name(state: &HiveState, user: ObjectId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{HarnessRef, MemberTip, ReplicaMember, Replicaset};
+    use crate::model::{HarnessRef, MemberTip, PathMove, ReplicaMember, Replicaset};
+
+    /// FR-90 P2f-5 — the places a moved start names: the path map's, oldest
+    /// first, one per folder (where it last ran in each), the newest
+    /// [`MAX_EARLIER_PLACES`]; none for a session never moved since P2f-5.
+    #[test]
+    fn a_moved_start_names_each_earlier_folder_once_oldest_first() {
+        let (mut s, _) = syncing(None, None);
+        assert!(
+            earlier_places(&s).is_empty(),
+            "never moved: no earlier place"
+        );
+        let at = DateTime::now();
+        let place = |name: &str, folder: &str| SessionLocation {
+            device_id: ObjectId::new(),
+            device_name: name.into(),
+            folder: folder.into(),
+            account: None,
+        };
+        let step = |fence, from, to| PathMove {
+            fence,
+            from,
+            to,
+            at,
+        };
+        s.path_map = vec![
+            step(2, place("a", "/a"), place("b", "/b")),
+            // On another device, in a folder it once ran in.
+            step(3, place("b", "/b"), place("c", "/a")),
+            step(4, place("c", "/a"), place("d", "/d")),
+        ];
+        let named: Vec<(String, String)> = earlier_places(&s)
+            .into_iter()
+            .map(|p| (p.device_name, p.folder))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("b".to_string(), "/b".to_string()),
+                ("c".into(), "/a".into())
+            ],
+            "each folder once, where it last ran"
+        );
+        s.path_map = (0..40)
+            .map(|i| step(i + 2, place("x", &format!("/f{i}")), place("y", "/y")))
+            .collect();
+        let kept = earlier_places(&s);
+        assert_eq!(kept.len(), MAX_EARLIER_PLACES);
+        assert_eq!(
+            (
+                kept[0].folder.as_str(),
+                kept[MAX_EARLIER_PLACES - 1].folder.as_str()
+            ),
+            ("/f24", "/f39"),
+            "the newest, oldest first"
+        );
+    }
 
     #[test]
     fn every_refusal_has_its_own_word() {
@@ -2213,6 +2295,7 @@ mod tests {
             moved: None,
             parent: None,
             from_terminal: None,
+            path_map: Vec::new(),
         };
         (s, p)
     }

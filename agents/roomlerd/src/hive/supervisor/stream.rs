@@ -4391,6 +4391,7 @@ mod tests {
             from_folder: "/srv/work".into(),
             moved_by_name: "Alice".into(),
             moved_at_ms: 1_791_813_720_000,
+            earlier: Vec::new(),
         });
         mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
         mem.sup.follow_joined(sid, 1);

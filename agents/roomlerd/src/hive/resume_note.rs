@@ -18,7 +18,7 @@
 //! |---|---|
 //! | who moved the session, and when | always |
 //! | where it ran, and where it runs now | always |
-//! | where earlier turns' paths live now | the folder changed |
+//! | where earlier turns' paths live now: every earlier folder the move names (P2f-5), not only the last | one of them is not this one |
 //! | the last tool call left without a result | the store holds one |
 //!
 //! FR-90 P2f-3a — a fork is told it is one ([`compose_fork`]) at each launch
@@ -46,6 +46,8 @@
 
 use std::path::{Path, PathBuf};
 
+use roomler_ai_remote_control::hive::{HivePlace, promote_limits::MAX_EARLIER_PLACES};
+
 /// `roomlerd hive-resume-note <file>`: the hook's printer.
 pub const RESUME_NOTE_SUBCOMMAND: &str = "hive-resume-note";
 /// The note's file, in the session's runtime directory.
@@ -60,10 +62,15 @@ pub(crate) struct Provenance<'a> {
     pub at_ms: u64,
     pub from_device: &'a str,
     pub from_folder: &'a str,
+    /// FR-90 P2f-5 — every place it ran before, oldest first: the record's
+    /// path map, which a server before P2f-5 never sends.
+    pub earlier: &'a [HivePlace],
 }
 
 /// The note, one fact a line. `folder` is where the session runs here;
 /// `open_call` names the last tool call the store holds no result for.
+/// P2f-5 — earlier turns' paths are named for every folder they worked in,
+/// oldest first, the newest [`MAX_EARLIER_PLACES`] of them.
 pub(crate) fn compose(p: &Provenance<'_>, folder: &Path, open_call: Option<&str>) -> String {
     let at = i64::try_from(p.at_ms)
         .ok()
@@ -86,9 +93,22 @@ pub(crate) fn compose(p: &Provenance<'_>, folder: &Path, open_call: Option<&str>
     note.push_str(&format!(
         "It ran on {device}, in {from}. It runs here now, in {here}.\n"
     ));
-    if from != here {
+    // P2f-5 — and before that device, where the path map says it ran.
+    let newest = p.earlier.len().saturating_sub(MAX_EARLIER_PLACES);
+    let mut folders: Vec<String> = Vec::new();
+    for f in p.earlier[newest..]
+        .iter()
+        .map(|e| flat(&e.folder))
+        .chain(std::iter::once(from))
+    {
+        if !f.is_empty() && f != here && !folders.contains(&f) {
+            folders.push(f);
+        }
+    }
+    if !folders.is_empty() {
         note.push_str(&format!(
-            "Paths in earlier turns under {from} now live under {here}.\n"
+            "Paths in earlier turns under {} now live under {here}.\n",
+            in_words(&folders)
         ));
     }
     if let Some(call) = open_call {
@@ -200,6 +220,15 @@ fn flat(s: &str) -> String {
     }
 }
 
+/// `a`, `a and b`, `a, b and c`.
+fn in_words(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
 /// The hook's command line: this binary, run by Claude Code as the session's
 /// account, printing `note`. `None` when a path cannot be quoted for the
 /// hook's shell.
@@ -262,6 +291,7 @@ mod tests {
             at_ms: moved_at(),
             from_device: "mars",
             from_folder: "/srv/work",
+            earlier: &[],
         };
         let note = compose(&p, Path::new("/home/a/work"), Some("cargo test -p x"));
         assert_eq!(
@@ -276,6 +306,66 @@ mod tests {
         let same = compose(&p, Path::new("/srv/work"), None);
         assert_eq!(same.lines().count(), 2, "{same}");
         assert!(!same.contains("Paths in earlier turns"), "{same}");
+    }
+
+    /// P2f-5 — after several moves, the note names every folder earlier turns
+    /// worked in, oldest first and each once, not only the last device's:
+    /// that device's note, still in the history, said they live where it ran.
+    #[test]
+    fn after_several_moves_the_note_names_every_earlier_folder() {
+        let place = |device: &str, folder: &str| HivePlace {
+            device_name: device.into(),
+            folder: folder.into(),
+        };
+        let earlier = [
+            place("laptop", "C:\\dev\\work"),
+            place("venus", "/home/a/work"),
+            place("mars", "/srv/work"),
+        ];
+        let p = Provenance {
+            by: "Alice",
+            at_ms: moved_at(),
+            from_device: "mars",
+            from_folder: "/srv/work",
+            earlier: &earlier,
+        };
+        let note = compose(&p, Path::new("/opt/work"), None);
+        assert_eq!(
+            note.lines().nth(2),
+            Some(
+                "Paths in earlier turns under C:\\dev\\work, /home/a/work and /srv/work now \
+                 live under /opt/work."
+            ),
+            "{note}"
+        );
+        // Back where it once ran: that folder is this one, never an earlier.
+        let back = compose(&p, Path::new("/home/a/work"), None);
+        assert_eq!(
+            back.lines().nth(2),
+            Some(
+                "Paths in earlier turns under C:\\dev\\work and /srv/work now live under /home/a/work."
+            ),
+            "back where it once ran: {back}"
+        );
+        // A server before P2f-5 names no earlier place: the note it always was.
+        let old = Provenance { earlier: &[], ..p };
+        assert_eq!(
+            compose(&old, Path::new("/opt/work"), None).lines().nth(2),
+            Some("Paths in earlier turns under /srv/work now live under /opt/work."),
+        );
+        // At most the newest MAX_EARLIER_PLACES of a list no server sends.
+        let many: Vec<HivePlace> = (0..40).map(|i| place("d", &format!("/f{i}"))).collect();
+        let long = Provenance {
+            earlier: &many,
+            ..old
+        };
+        let line = compose(&long, Path::new("/opt/work"), None)
+            .lines()
+            .nth(2)
+            .map(str::to_string)
+            .unwrap();
+        assert!(!line.contains("/f23") && line.contains("/f24"), "{line}");
+        assert_eq!(line.matches("/f").count(), MAX_EARLIER_PLACES, "{line}");
     }
 
     /// P2f-3a — a fork is told its earlier turns are another session's,
@@ -357,6 +447,7 @@ mod tests {
             at_ms: moved_at(),
             from_device: "",
             from_folder: "/srv/`x`",
+            earlier: &[],
         };
         let note = compose(&p, Path::new("/srv/`x`"), None);
         assert_eq!(note.lines().count(), 2, "one fact a line: {note}");

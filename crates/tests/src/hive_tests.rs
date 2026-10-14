@@ -2631,6 +2631,33 @@ async fn a_promotion_moves_the_lease_once_the_members_copy_holds_the_drained_tip
         (1, 5, hash("ab").as_str()),
         "the drained tip"
     );
+    // P2f-5 — the path map keeps the move: where it ran, where it runs now.
+    let path = s.get_array("path_map").expect("the move in the path map");
+    assert_eq!(path.len(), 1, "{path:?}");
+    let step = path[0].as_document().unwrap();
+    let place = |end: &str| {
+        let p = step.get_document(end).unwrap();
+        (
+            p.get_object_id("device_id").unwrap().to_hex(),
+            p.get_str("folder").unwrap().to_string(),
+        )
+    };
+    assert_eq!(
+        (step.get_i64("fence").unwrap(), place("from"), place("to")),
+        (
+            2,
+            (m.a.agent_id.clone(), "/srv/promote".to_string()),
+            (m.b.agent_id.clone(), "/srv/promote".to_string()),
+        ),
+        "{step}"
+    );
+    // P2f-5 — and the move named every place the session ran before, from
+    // that map: here, only the one.
+    assert_eq!(
+        mv["earlier"],
+        json!([{"device_name": mv["from_device_name"], "folder": "/srv/promote"}]),
+        "every place it ran before: {mv}"
+    );
     let role = |d: &str| stored_member(&s, d);
     assert_eq!(role(&m.b.agent_id), ("primary".into(), "pending".into()));
     assert_eq!(role(&m.a.agent_id), ("owner".into(), "pending".into()));
@@ -3170,6 +3197,17 @@ async fn a_member_back_before_it_answered_hears_the_join_the_move_and_the_start_
     let sid = m.sid.clone();
     moved(&app, &mut m).await;
     m.b.ws.close(None).await.unwrap();
+    // P2f-5 — as if it came back an hour after the lease moved.
+    let hour_ago =
+        bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - 3_600_000);
+    app.db
+        .collection::<Document>("agent_sessions")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&sid).unwrap() },
+            doc! { "$set": { "moved.at": hour_ago } },
+        )
+        .await
+        .unwrap();
     let mut ws = connect(&app, &m.b.token, &m.b.machine, PROMOTES).await;
     let again = frames_until(
         &mut ws,
@@ -3183,6 +3221,17 @@ async fn a_member_back_before_it_answered_hears_the_join_the_move_and_the_start_
     );
     assert_eq!(again[0]["role"], "primary");
     assert_eq!(again[1]["from_device_id"], m.a.agent_id.as_str());
+    // P2f-5 — the move it names is the lease's, an hour ago, not the
+    // re-send's; and every place it ran before comes again.
+    assert_eq!(
+        (
+            again[1]["moved_at_ms"].as_i64(),
+            again[1]["earlier"][0]["folder"].as_str()
+        ),
+        (Some(hour_ago.timestamp_millis()), Some("/srv/promoteagain")),
+        "the lease move's time, not the re-send's: {}",
+        again[1]
+    );
     assert_eq!(
         (again[2]["fence"].as_u64(), again[2]["resume"].as_bool()),
         (Some(2), Some(true)),
@@ -10543,5 +10592,194 @@ async fn a_device_back_as_an_older_build_leaves_the_adopted_session_it_was() {
     assert!(
         !device_hears(&mut ws, "rc:hive.start", Duration::from_millis(300)).await,
         "nothing a build before it would start afresh"
+    );
+}
+
+// ─── P2f-5 — the path map across several moves ─────────────────────────────
+
+/// FR-90 P2f-5 — `m`'s session moved from `primary`, at `fence`, to `target`
+/// in `folder`: the target ready, the primary drained at `(seq, fill)` and the
+/// target's copy there. What the target hears: its join, the move, the start.
+#[allow(clippy::too_many_arguments)]
+async fn moved_into(
+    app: &TestApp,
+    (tid, admin, sid): (&str, &str, &str),
+    primary: &mut Device,
+    target: &mut Device,
+    fence: u64,
+    folder: &str,
+    (seq, fill): (u64, &str),
+) -> Vec<Value> {
+    let to = target.agent_id.clone();
+    let caller = post_promote(app, tid, admin, sid, &to, Some(folder));
+    let ready = async {
+        let prep = read_until(&mut target.ws, "rc:hive.prepare")
+            .await
+            .expect("the target is asked to prepare");
+        send(
+            &mut target.ws,
+            json!({"t": "rc:hive.prepare_ack", "session_id": sid, "fence": prep["fence"],
+                   "account": "dev"}),
+        )
+        .await;
+    };
+    let ((code, body), ()) = tokio::join!(caller, ready);
+    assert_eq!(
+        (code, body["outcome"].as_str()),
+        (200, Some("promoting")),
+        "{body}"
+    );
+    read_until(&mut primary.ws, "rc:hive.drain")
+        .await
+        .expect("the primary is told to drain");
+    send(
+        &mut primary.ws,
+        json!({"t": "rc:hive.drained", "session_id": sid, "fence": fence, "seq": seq,
+               "hash": hash(fill)}),
+    )
+    .await;
+    send(&mut target.ws, tip_at(sid, fence, seq, fill)).await;
+    frames_until(
+        &mut target.ws,
+        &["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"],
+    )
+    .await
+}
+
+/// The record's path map: each move's fence, and the folders before and
+/// after it.
+fn path_of(s: &Document) -> Vec<(i64, String, String)> {
+    let folder = |e: &Document, end: &str| {
+        e.get_document(end)
+            .ok()
+            .and_then(|p| p.get_str("folder").ok())
+            .unwrap_or("")
+            .to_string()
+    };
+    s.get_array("path_map")
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.as_document())
+                .map(|e| {
+                    (
+                        e.get_i64("fence").unwrap_or(0),
+                        folder(e, "from"),
+                        folder(e, "to"),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// FR-90 P2f-5 — each lease move goes into the record's path map, and each
+/// moved start names every place the session ran before, oldest first, one
+/// per folder: its old turns keep the paths they had there, and the note
+/// says where they live now. A move back takes out the entry of the move it
+/// undoes, which started no run.
+#[tokio::test]
+async fn each_moved_start_names_every_folder_the_session_ran_in_before() {
+    let app = promote_app().await;
+    let mut m = promotable(&app, "pathmap", 0, PROMOTES).await;
+    let (tid, admin, sid) = (m.tid.clone(), m.admin.clone(), m.sid.clone());
+    let ids = (tid.as_str(), admin.as_str(), sid.as_str());
+    let a_id = m.a.agent_id.clone();
+    let path = |p: &[(i64, &str, &str)]| -> Vec<(i64, String, String)> {
+        p.iter()
+            .map(|(f, a, b)| (*f, a.to_string(), b.to_string()))
+            .collect()
+    };
+
+    // A to B, into B's own folder.
+    let to_b = moved_into(
+        &app,
+        ids,
+        &mut m.a,
+        &mut m.b,
+        1,
+        "/srv/pathmap-b",
+        (5, "ab"),
+    )
+    .await;
+    let a_name = move_of(&to_b)["from_device_name"].clone();
+    assert_eq!(
+        move_of(&to_b)["earlier"],
+        json!([{"device_name": a_name, "folder": "/srv/pathmap"}]),
+        "{to_b:?}"
+    );
+    frames_until(&mut m.a.ws, &["rc:hive.demote", "rc:hive.replica.join"]).await;
+    send(
+        &mut m.a.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 2}),
+    )
+    .await;
+    send(
+        &mut m.b.ws,
+        json!({"t": "rc:hive.start_ack", "session_id": sid, "fence": 2, "account": "dev"}),
+    )
+    .await;
+    send(
+        &mut m.b.ws,
+        json!({"t": "rc:hive.state", "session_id": sid, "fence": 2, "state": "idle"}),
+    )
+    .await;
+    wait_stored(&app, &sid, "running on B, A a member again", |s| {
+        !s.contains_key("promotion")
+            && s.get_str("status") == Ok("idle")
+            && stored_member(s, &a_id).1 == "joined"
+    })
+    .await;
+
+    // B to A, into a third folder: both earlier folders, oldest first.
+    let to_a = moved_into(
+        &app,
+        ids,
+        &mut m.b,
+        &mut m.a,
+        2,
+        "/srv/pathmap-c",
+        (7, "cd"),
+    )
+    .await;
+    let b_name = move_of(&to_a)["from_device_name"].clone();
+    assert_eq!(
+        move_of(&to_a)["earlier"],
+        json!([
+            {"device_name": a_name, "folder": "/srv/pathmap"},
+            {"device_name": b_name, "folder": "/srv/pathmap-b"},
+        ]),
+        "every folder its earlier turns worked in"
+    );
+    assert_eq!(
+        path_of(&stored(&app, &sid).await),
+        path(&[
+            (2, "/srv/pathmap", "/srv/pathmap-b"),
+            (3, "/srv/pathmap-b", "/srv/pathmap-c"),
+        ]),
+        "each move in the path map"
+    );
+
+    // A refuses its moved start: the lease moves back to B, and the map is as
+    // it was before the move it undid.
+    send(
+        &mut m.a.ws,
+        json!({"t": "rc:hive.start_ack", "session_id": sid, "fence": 3,
+               "refused": "launch_failed"}),
+    )
+    .await;
+    let back = frames_until(
+        &mut m.b.ws,
+        &["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"],
+    )
+    .await;
+    assert_eq!(
+        path_of(&stored(&app, &sid).await),
+        path(&[(2, "/srv/pathmap", "/srv/pathmap-b")]),
+        "a move back takes its move's entry out"
+    );
+    assert_eq!(
+        move_of(&back)["earlier"],
+        json!([{"device_name": a_name, "folder": "/srv/pathmap"}]),
+        "the move undone left no earlier place"
     );
 }
