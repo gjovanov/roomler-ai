@@ -246,6 +246,48 @@ bash vmtest/vmtest.sh destroy --all        # only when no other run is live
 The private `vmtest` skill wraps these as one command from the dev box and
 carries the per-host details.
 
+## The Wayland lab (FR-93)
+
+vmtest's cells are thrown away. FR-93's lab keeps its guests, so a measurement
+can be repeated on the same machine before and after a change. The guests are
+`wlab-*` on zeus: GNOME 50 and Plasma 6.7.5, each as a per-user and a system
+install. Their tooling lives beside the cells, in roomler-ai-deploy's
+`vmtest/lab/` (its README has the details), and the viewer specs it drives are
+here: `ui/e2e/vmtest-lifecycle*.spec.ts` and `vmtest-idle-hold*.spec.ts`. What
+the lab has proven is on [wayland.md](wayland.md).
+
+```mermaid
+flowchart LR
+    H["the harness on mars<br/>(lifecycle/run.sh)"] -- "QMP keys and pointer, ssh:<br/>lock, logout, switch user, blank…" --> G["a wlab guest<br/>(roomlerd under test)"]
+    H -- "starts, then stops" --> V["the viewer: Playwright in a container<br/>(ui/e2e/vmtest-lifecycle.spec.ts)"]
+    V -- "a remote-desktop session<br/>through roomler.ai" --> G
+    H -- "events.jsonl: what happened, when" --> J["verdict.py"]
+    V -- "samples.jsonl: what the viewer showed,<br/>every 500 ms" --> J
+    J --> R["each event: recovered, or named<br/>its reason, within 10 s?"]
+```
+
+| Tool (`vmtest/lab/`) | Measures | FR-93 |
+|---|---|---|
+| `lab.sh` | bakes, snapshots and reverts a guest; installs stock; plays the person at the screen from outside the guest (QMP keys and pointer, a password typed at a lock screen, `shot`) | P0 |
+| `guest-lock.sh` | one run per guest across sessions: every runner takes the guest first, and exits naming the holder | — |
+| `measure/viewer-input.sh` | input reaching a native client, and the cursor overlay | AC4, AC5 |
+| `lifecycle/run.sh` | a session held through lock, display blank, resolution change, user switch, logout, compositor crash | AC7 |
+| `measure/idle-cost.sh` | an idle session's CPU, every `roomlerd` process over two 60 s windows | AC8 |
+
+Rules that each cost a run:
+- **Take the guest first.** Two sessions once swapped and reverted one guest
+  four seconds apart, and both runs were void.
+- **A released build means the release's own package**, with its digest and
+  signature checked and `dpkg -V` clean, not a candidate built from the same
+  commit.
+- **A run started with `LC_PRE`** (a session opened during an event) reads
+  FAIL for that event by construction: the viewer did not exist yet. Read
+  `said.py` for when it connected and what it said.
+- **"Live" needs the probe's counter moving at the window's end.** GDM takes
+  2 s to hand the seat over, and frames still in flight made a frozen user
+  switch read as live.
+- **Shut a guest off when idle.** A running one holds 6 GiB of zeus.
+
 ## Related
 
 - [ephemeral-nodes.md](ephemeral-nodes.md) — the enrollment and reaping
