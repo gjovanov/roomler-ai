@@ -1132,27 +1132,34 @@ fn open_auto_mutter(target_fps: u32) -> AutoMutter {
         input: portal::mutter::input_enabled(),
         window: false,
     };
+    let mut open = || PortalCapture::open_with(target_fps, opts).map_err(|e| format!("{e:#}"));
     // FR-93 P5b (#2145) — a locked screen is waited out, with the controller
-    // told why, instead of failing the open.
-    let mut lock = portal::mutter::GnomeLockScreen::default();
-    let opened = open_through_lock(
-        || PortalCapture::open_with(target_fps, opts).map_err(|e| format!("{e:#}")),
-        || lock.is_up(),
-        open_abandoned,
-        |gives_up_in| {
-            tracing::info!(
-                waits_s = gives_up_in.as_secs(),
-                "capture: GNOME's screen is locked, and GNOME shares no locked screen; waiting for \
-                 the unlock, the controller told why (FR-93 P5b)"
-            );
-            tell_open_waiting(OpenWait {
-                gives_up_in,
-                why: WaitFor::Unlock,
-            });
-        },
-        std::thread::sleep,
-        std::time::Instant::now,
-    );
+    // told why, instead of failing the open. Only by an open with a session
+    // behind it: the recorder and capture-smoke would sit out the whole hour,
+    // deaf to their own stop, so they fail at once with mutter's refusal.
+    let opened = if open_has_session() {
+        let mut lock = portal::mutter::GnomeLockScreen::default();
+        open_through_lock(
+            open,
+            || lock.is_up(),
+            open_abandoned,
+            |gives_up_in| {
+                tracing::info!(
+                    waits_s = gives_up_in.as_secs(),
+                    "capture: GNOME's screen is locked, and GNOME shares no locked screen; \
+                     waiting for the unlock, the controller told why (FR-93 P5b)"
+                );
+                tell_open_waiting(OpenWait {
+                    gives_up_in,
+                    why: WaitFor::Unlock,
+                });
+            },
+            std::thread::sleep,
+            std::time::Instant::now,
+        )
+    } else {
+        open()
+    };
     match opened {
         Ok(c) => {
             tracing::warn!(
@@ -1775,6 +1782,17 @@ impl Drop for ParkHook {
     }
 }
 
+/// FR-93 P5b — whether a session's pump is behind the open on this thread:
+/// [`open_default_async`] marks every one it runs. Only such an open waits
+/// through a state of the host (a locked screen), because only it has a
+/// controller to tell and an end to stop at. The recorder, capture-smoke and
+/// the probes open on threads it never marked.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(feature = "portal-capture"), allow(dead_code))]
+pub(crate) fn open_has_session() -> bool {
+    PARK_ABANDONED.with(|a| a.borrow().is_some())
+}
+
 /// FR-93 P5b — whether nobody waits for the open on this thread any more: its
 /// session ended while it waited. A wait that can last as long as a locked
 /// screen asks this, so a session that left stops costing a thread and a poll.
@@ -1799,6 +1817,35 @@ struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
 impl Drop for SetOnDrop {
     fn drop(&mut self) {
         self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod park_tests {
+    use super::{ParkHook, SetOnDrop, open_abandoned, open_has_session};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    /// P5b — only an open a session's pump marked may wait through a host
+    /// state; the recorder's and capture-smoke's threads are never marked, and
+    /// a pooled thread forgets the mark with the hook.
+    #[test]
+    fn only_a_marked_open_has_a_session_behind_it() {
+        assert!(
+            !open_has_session(),
+            "an unmarked thread: the recorder, capture-smoke"
+        );
+        assert!(!open_abandoned());
+        let flag = Arc::new(AtomicBool::new(false));
+        {
+            let _hook = ParkHook::install(Box::new(|_| {}), Arc::clone(&flag));
+            assert!(open_has_session());
+            assert!(!open_abandoned(), "its session is still there");
+            drop(SetOnDrop(Arc::clone(&flag)));
+            assert!(open_abandoned(), "the pump dropped the open");
+        }
+        assert!(!open_has_session(), "cleared with the hook");
+        assert!(!open_abandoned());
     }
 }
 
