@@ -187,8 +187,12 @@ async fn probe() -> Result<(), String> {
 /// Can this host forward and NAT for the overlay? `Err` says why not.
 #[cfg(target_os = "windows")]
 async fn probe() -> Result<(), String> {
-    // `setup` creates a WinNAT instance. Windows Home has the `winnat` service
-    // but not the class that manages it: `New-NetNat` answers `Invalid class`.
+    // `setup` creates a WinNAT instance. The class that manages WinNAT comes
+    // with the Hyper-V feature, not with the edition: Windows Home cannot
+    // install Hyper-V (`Invalid class`), and Pro or Enterprise without it
+    // answer `Not found` too. FR-97 field, a Windows 11 Enterprise eval VM:
+    // absent with Hyper-V and Containers off, still absent with Containers
+    // on, present once Hyper-V was enabled.
     probe_cmd(&[
         "powershell",
         "-NoProfile",
@@ -200,8 +204,9 @@ async fn probe() -> Result<(), String> {
     .await
     .map_err(|e| {
         format!(
-            "WinNAT is not available on this edition of Windows ({e}); Windows Home cannot be \
-             an exit node or a subnet router"
+            "WinNAT is not available ({e}): Windows provides it with the Hyper-V feature, \
+             which Windows Home cannot install and Pro or Enterprise leave off by default, \
+             so this device cannot be an exit node or a subnet router"
         )
     })
 }
@@ -499,12 +504,8 @@ async fn setup(
     // always did (and an upgrade finds its own NAT rather than orphaning one);
     // later blocks are suffixed by index.
     let mut ok = true;
-    for (i, cidr) in overlay_cidrs.iter().enumerate() {
-        let name = if i == 0 {
-            NAT_NAME.to_string()
-        } else {
-            format!("{NAT_NAME}-{i}")
-        };
+    let names = nat_names(overlay_cidrs.len());
+    for (cidr, name) in overlay_cidrs.iter().zip(&names) {
         // FR-97 P0b-2b — `-ErrorAction Stop` and the message on stderr, so
         // `run` logs WHY WinNAT refused (an overlapping prefix from Docker
         // or WSL, a missing class) rather than a bare failure.
@@ -523,14 +524,70 @@ async fn setup(
         ])
         .await;
     }
+    // FR-97 P0b-2c — recorded, so the boot purge removes them after a crash.
+    // Every name of ours, created now or found from an earlier run: only an
+    // instance with OUR name is ever removed, never the one Docker or WSL
+    // made for the same prefix.
+    super::host_ledger::record_nat(&names);
     (ok, forwarding)
+}
+
+/// The WinNAT instance names for `blocks` overlay blocks: the historical
+/// unsuffixed name first, later blocks suffixed by index (FR-47 P5e).
+#[cfg(target_os = "windows")]
+fn nat_names(blocks: usize) -> Vec<String> {
+    (0..blocks.max(1))
+        .map(|i| {
+            if i == 0 {
+                NAT_NAME.to_string()
+            } else {
+                format!("{NAT_NAME}-{i}")
+            }
+        })
+        .collect()
+}
+
+/// FR-97 P0b-2c — the WinNAT half of [`super::host_ledger::purge`]: remove
+/// the instances a router of ours left (by name, and only names like ours).
+/// No-op off Windows, and for an empty list.
+pub(crate) fn remove_nat_instances(names: &[String]) {
+    #[cfg(target_os = "windows")]
+    {
+        let names: Vec<String> = names
+            .iter()
+            .filter(|n| super::host_ledger::is_nat_name(n))
+            .map(|n| format!("'{n}'"))
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        warn!(
+            instances = ?names,
+            "overlay: a router left its WinNAT instance (an exit that skipped its revert) — \
+             removing it"
+        );
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "foreach ($n in @({})) {{ Remove-NetNat -Name $n -Confirm:$false \
+                     -ErrorAction SilentlyContinue }}",
+                    names.join(",")
+                ),
+            ])
+            .output();
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = names;
 }
 
 /// FR-97 P0b-2b — switch IPv4 forwarding back off on the given interfaces:
 /// GUID identities through their adapter, `if:` ones by index. Synchronous,
-/// because `Drop` and the boot purge both call it with no runtime.
+/// because `Drop` and the boot purge both call it with no runtime. Also the
+/// adapter bring-up's (P0b-2c), for an adapter that came up forwarding.
 #[cfg(target_os = "windows")]
-fn restore_forwarding(identities: &[String]) {
+pub(crate) fn restore_forwarding(identities: &[String]) {
     let guids: Vec<String> = identities
         .iter()
         .filter_map(|id| id.strip_prefix("guid:"))
@@ -677,12 +734,8 @@ impl Drop for SubnetRouterGuard {
             // FR-47 P5e — remove one instance per block, matching `setup`'s
             // naming (first unsuffixed, later ones `-1`, `-2`, …). Removing an
             // absent NAT is a no-op, so a partial setup still reverts.
-            for i in 0..self.overlay_cidrs.len().max(1) {
-                let name = if i == 0 {
-                    NAT_NAME.to_string()
-                } else {
-                    format!("{NAT_NAME}-{i}")
-                };
+            let names = nat_names(self.overlay_cidrs.len());
+            for name in &names {
                 let _ = std::process::Command::new("powershell")
                     .args([
                         "-NoProfile",
@@ -694,6 +747,8 @@ impl Drop for SubnetRouterGuard {
                     ])
                     .output();
             }
+            // FR-97 P0b-2c — gone, so the boot purge has none to remove.
+            super::host_ledger::forget_nat(&names);
             // FR-97 P0b-2b — then forwarding: this router's holds go, and the
             // last holder of an interface we turned on switches it back off
             // (#2077, defect 2). The ledger follows, so a crash after this

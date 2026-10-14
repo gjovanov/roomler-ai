@@ -2246,6 +2246,26 @@ mod system {
             set_iface_metric_family(luid, AF_INET6, metric)
         }
 
+        /// FR-97 P0b-2c — is IPv4 forwarding on for `luid`? Read-only.
+        pub fn forwarding_enabled_v4(luid: u64) -> std::io::Result<bool> {
+            use windows_sys::Win32::NetworkManagement::IpHelper::{
+                GetIpInterfaceEntry, InitializeIpInterfaceEntry, MIB_IPINTERFACE_ROW,
+            };
+            // SAFETY: Initialize fills valid defaults; Get fills the row for
+            // (AF_INET, luid).
+            unsafe {
+                let mut row: MIB_IPINTERFACE_ROW = std::mem::zeroed();
+                InitializeIpInterfaceEntry(&mut row);
+                row.Family = AF_INET;
+                row.InterfaceLuid = NET_LUID_LH { Value: luid };
+                let rc = GetIpInterfaceEntry(&mut row);
+                if rc != NO_ERROR {
+                    return Err(std::io::Error::from_raw_os_error(rc as i32));
+                }
+                Ok(row.ForwardingEnabled)
+            }
+        }
+
         fn set_iface_metric_family(luid: u64, family: u16, metric: u32) -> std::io::Result<()> {
             use windows_sys::Win32::NetworkManagement::IpHelper::{
                 GetIpInterfaceEntry, InitializeIpInterfaceEntry, MIB_IPINTERFACE_ROW,
@@ -4031,6 +4051,33 @@ mod system {
                     && let Err(e) = winroute::set_iface_metric_v6(dev.tun_luid(), m)
                 {
                     tracing::warn!(%e, metric = m, "overlay: IPv6 interface metric pin failed; keeping the automatic metric");
+                }
+                // FR-97 P0b-2c — our adapter starts NOT forwarding; a subnet
+                // router or exit turns it on when it serves, and its revert
+                // turns it off. A run that ended without that revert (a crash,
+                // a kill) leaves it on, and the boot purge cannot reach it:
+                // the adapter goes with the process, and Windows re-applies
+                // the setting when it is created again (field, the P0b-2b
+                // candidate on Windows 11: Enabled after `taskkill /F`). Off
+                // through the router's own revert, which writes the setting
+                // Windows keeps for the adapter.
+                match winroute::forwarding_enabled_v4(dev.tun_luid()) {
+                    Ok(true) => {
+                        let (ifindex, guid) = winroute::identity(dev.tun_luid());
+                        let id = if ifindex != 0 {
+                            format!("if:{ifindex}")
+                        } else {
+                            format!("guid:{guid}")
+                        };
+                        crate::overlay::nat::restore_forwarding(&[id]);
+                        tracing::warn!(
+                            ifindex,
+                            "overlay: our adapter came up forwarding (a run that ended \
+                             without its router's revert) — switched it off"
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(e) => tracing::debug!(%e, "overlay: adapter forwarding state unreadable"),
                 }
             }
 
