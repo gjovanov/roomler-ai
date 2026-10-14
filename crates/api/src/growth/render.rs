@@ -569,8 +569,51 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
         Measured::NotMeasured(n) => out.push(Line("Agent crashes".into(), not_measured(n))),
     }
 
+    out.push(Heading("Social reach".into()));
+    match &s.social {
+        Measured::Value(soc) => {
+            if !soc.posts_by_platform.is_empty() {
+                out.push(Table(
+                    vec!["Platform".into(), "Posts published".into()],
+                    soc.posts_by_platform
+                        .iter()
+                        .map(|p| vec![p.platform.clone(), fig(&p.posts)])
+                        .collect(),
+                ));
+            }
+            if !soc.snapshots.is_empty() {
+                out.push(Table(
+                    vec![
+                        "Platform".into(),
+                        "Campaign".into(),
+                        "Age".into(),
+                        "The platform's own numbers".into(),
+                    ],
+                    soc.snapshots
+                        .iter()
+                        .map(|sn| {
+                            vec![
+                                sn.platform.clone(),
+                                sn.campaign
+                                    .clone()
+                                    .unwrap_or_else(|| sn.platform_id.clone()),
+                                sn.snapshot.clone(),
+                                sn.metrics
+                                    .iter()
+                                    .take(4)
+                                    .map(|(k, v)| format!("{k} {v}"))
+                                    .collect::<Vec<_>>()
+                                    .join(" · "),
+                            ]
+                        })
+                        .collect(),
+                ));
+            }
+        }
+        Measured::NotMeasured(n) => out.push(Line("Social reach".into(), not_measured(n))),
+    }
+
     out.push(Heading("Not yet measured".into()));
-    out.push(Line("Social reach".into(), not_measured(&s.social)));
     out.push(Line("Search".into(), not_measured(&s.search)));
 
     out.push(Note(format!(
@@ -669,7 +712,8 @@ mod tests {
     use super::*;
     use crate::growth::digest::{
         ActiveOrgs, FetchRow, Headline, Install, KeyCount, MethodRow, MrrEstimate, OrgsDevices,
-        Quality, Revenue, SignupRow, Signups, Tokens, TopOrg, Usage,
+        Quality, Revenue, SignupRow, Signups, Social, SocialPlatform, SocialSnapshot, Tokens,
+        TopOrg, Usage,
     };
     use roomler_ai_services::dao::growth_digest::{DigestStatus, ExcludedCounts};
 
@@ -787,7 +831,24 @@ mod tests {
                 }]),
                 wizard_steps: NotMeasured::later("wizard steps reached (opt-in runs)", "P3b"),
             },
-            social: NotMeasured::later("social", "P8"),
+            social: Measured::Value(Social {
+                posts_by_platform: vec![SocialPlatform {
+                    platform: "linkedin".into(),
+                    posts: f(1, 2, 5),
+                }],
+                snapshots: vec![SocialSnapshot {
+                    platform: "linkedin".into(),
+                    platform_id: "urn:li:share:7".into(),
+                    snapshot: "T+7d".into(),
+                    campaign: Some("<i>c7</i>".into()),
+                    metrics: [
+                        ("clicks".to_string(), 80.0),
+                        ("impressions".to_string(), 3000.0),
+                    ]
+                    .into_iter()
+                    .collect(),
+                }],
+            }),
             search: NotMeasured::later("search", "P7"),
         };
         (doc, s)
@@ -826,6 +887,15 @@ mod tests {
         assert!(text.contains("Excluded from every number above: 1 users and 3 orgs"));
         assert!(text.contains("no personal addresses"));
         assert!(text.contains("MRR (ESTIMATE): 16.00"));
+        // P8 — social reach: posts per platform, and the day's snapshots in
+        // the platform's own metric names.
+        assert!(text.contains("== Social reach =="));
+        assert!(text.contains("linkedin | 1 (7d 2 · 28d 5)"), "{text}");
+        assert!(
+            text.contains("T+7d | clicks 80 · impressions 3000"),
+            "{text}"
+        );
+        assert!(text.contains("not measured — arrives with P7"));
         assert_eq!(subject("2026-10-13"), "Roomler daily digest — 2026-10-13");
     }
 
@@ -836,6 +906,10 @@ mod tests {
         assert!(!html.contains("<script>"), "{html}");
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt; Org"));
         assert!(html.contains("&lt;b&gt;c1&lt;/b&gt;"));
+        assert!(
+            html.contains("&lt;i&gt;c7&lt;/i&gt;"),
+            "a pushed campaign is text"
+        );
         assert!(html.contains("<h3"));
         assert!(!html.contains('@'), "no address anywhere in a digest");
     }

@@ -25,12 +25,18 @@
 //!   live for the range beside the funnel's account plane, joined by the
 //!   normalised campaign key. (The daily purestat PULL is the `saas`
 //!   module's — it talks to the outside world for the hosted business.)
+//! * [`channels`], [`keys`] — P8: the Channels table (each platform's own
+//!   reach as the promotion pipeline pushed it, then what each post's key
+//!   brought, and spend) and the machine keys that open the `saas` module's
+//!   ingest routes.
 
 pub mod campaigns;
+pub mod channels;
 pub mod cohorts;
 pub mod digest;
 pub mod exclusions;
 pub mod funnel;
+pub mod keys;
 pub mod org_daily;
 pub mod orgs;
 pub mod render;
@@ -44,7 +50,7 @@ pub use roomler_ai_services::purestat;
 
 use axum::{
     Router,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
@@ -78,6 +84,13 @@ pub fn admin_routes() -> Router<AppState> {
         // P6 — the Campaigns table: per normalised key, purestat's web
         // plane (live, for the exact range) beside the account funnel.
         .route("/campaigns", get(campaigns::get_campaigns))
+        // P8 — the Channels table (each platform's own reach, then what the
+        // posts' keys brought, and spend) and the growth machine keys (D12:
+        // only a hash stored; an `ingest` key opens the `saas` module's
+        // `/admin/growth/ingest/*` routes and nothing else).
+        .route("/channels", get(channels::get_channels))
+        .route("/keys", get(keys::list_keys).post(keys::mint_key))
+        .route("/keys/{key_id}", delete(keys::revoke_key))
 }
 
 /// Whether a module is mounted on this pod — the gate every growth read of
