@@ -215,12 +215,13 @@ pub fn purge_exit_routes() {
         // rule pointing at a dead resolver would blackhole ALL DNS until removed —
         // this boot/pre-exit purge is the load-bearing cleanup for it.
         tunnel_core::overlay::dns::purge_exit_dns();
-        // FR-97 P0b-2b — and the IPv4 forwarding a Windows subnet router or
-        // exit turned on: its own revert runs in `Drop`, which these exits
-        // skip, so a crashed router would otherwise keep forwarding between
-        // the host's adapters until someone noticed (#2077, defect 2). Read
-        // from the ledger the router keeps; a no-op when it is empty.
-        tunnel_core::overlay::nat::purge_forwarding();
+        // FR-97 P0b-2b / P0e — and what the host ledger records: the IPv4
+        // forwarding a Windows router turned on (its revert runs in `Drop`,
+        // which these exits skip, #2077 defect 2), and every exit-client pin
+        // (host routes through the PHYSICAL uplink, which outlive the TUN; a
+        // leftover pin on the server's address blocks the next start's
+        // control WS after a network change). A no-op when it is empty.
+        tunnel_core::overlay::host_ledger::purge();
     }
 }
 

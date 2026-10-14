@@ -208,8 +208,11 @@ context-free purges — `overlay::tun::purge_split_default()` and
 `roomlerd::purge_exit_routes()` and called:
 
 - at **startup** (a boot-reconciler that heals a stale `/1` *before* the runtime
-  reinstalls anything, regardless of `overlay_enabled`), and
-- immediately **before every `process::exit`** on the hard-exit paths.
+  reinstalls anything, regardless of `overlay_enabled`),
+- immediately **before every `process::exit`** on the hard-exit paths, and
+- (FR-97 P0e) **after every exit of the daemon**, clean ones included, once the
+  runtime is dropped (`purge_after_daemon` in `main.rs`): see
+  [exit-client pins](#exit-client-pins-fr-97-p0e) below.
 
 Why it matters most on Windows: a Wintun adapter **persists by name** across a
 crash, so a leftover `0.0.0.0/1 → roomler` would black-hole all egress to a dead
@@ -233,14 +236,14 @@ flowchart LR
     DROP["Drop: Remove-NetNat,<br/>release each hold"] --> LAST{"last holder, and<br/>it was Disabled?"}
     LAST -- yes --> OFF["Set-NetIPInterface<br/>-Forwarding Disabled"]
     LAST -- no --> KEEP["leave it: another org's<br/>router still needs it,<br/>or it was never ours"]
-    CRASH["crash / kill / process::exit"] -.-> PURGE["purge_exit_routes():<br/>nat::purge_forwarding()<br/>reads the ledger"] --> OFF
+    CRASH["crash / kill / process::exit"] -.-> PURGE["purge_exit_routes():<br/>host_ledger::purge()<br/>reads the ledger"] --> OFF
 ```
 
 | Rule | Where | Why |
 |---|---|---|
 | The setup script reports each interface's adapter GUID and the forwarding state it **found** | `nat.rs` Windows `setup` | Only what we turned on is ours to turn off |
 | Holds are refcounted per interface, and the **first** holder's observation decides | `host_ledger::ForwardingHolds` | Two orgs' routers can share one egress adapter; the second sees `Enabled` because the first enabled it |
-| Only GUID identities are recorded | `ForwardingHolds::ledger` | An ifIndex can name a different interface after a reboot |
+| Only GUID identities are recorded | `ForwardingHolds::forwarding_guids` | An ifIndex can name a different interface after a reboot |
 | The ledger lives in `HKLM\SOFTWARE`, never a file under `%ProgramData%` | `host_ledger::store` | Any account may create a file in `%ProgramData%`, and SYSTEM acts on the ledger at boot: a planted one would choose the adapter SYSTEM switches forwarding off on. Only SYSTEM and Administrators may write below `HKLM\SOFTWARE` |
 | GUIDs are validated strictly before going back into PowerShell | `host_ledger::is_guid` | The ledger is read back at boot |
 | `New-NetNat` failures carry WinNAT's own message to the log | `nat.rs` Windows `setup` | `-ErrorAction SilentlyContinue` used to hide why a NAT never appeared (an overlapping Docker/WSL prefix) |
@@ -248,6 +251,39 @@ flowchart LR
 > ⚠️ Linux is deliberately unchanged: the revert there leaves `ip_forward` on.
 > That sysctl is host-global and routinely shared with Docker and Kubernetes,
 > so switching it off on the way out could break them.
+
+### Exit-client pins (FR-97 P0e)
+
+A client's carrier-endpoint exemptions (the coordination server, coturn, the
+exit's own endpoint) are `/32` and `/128` host routes through the **physical**
+uplink. Unlike the `/1`s they do not die with the TUN, and until P0e nothing
+recorded which host routes were ours. A tart Mac on 0.4.134 showed that even a
+**clean** stop left the server's pin in the table (N13). Harmless on the same
+network. After a network change it points at a next hop that no longer answers:
+the restarted daemon's control WebSocket cannot reach the server, and the
+overlay runtime that would re-pin never starts.
+
+```mermaid
+flowchart LR
+    ADD["add_host_exemption:<br/>pin in (Linux/Windows: the write<br/>succeeded; macOS: the TABLE shows it)"] --> REC["host_ledger::record_pin<br/>(ip, next hop, interface)"]
+    DEL["del_host_exemption"] --> FORGET["host_ledger::forget_pin"]
+    REC --> STORE[("ledger<br/>Windows: HKLM\SOFTWARE\Roomler\Overlay<br/>Linux: /var/lib/roomler/<br/>macOS: /var/db/roomler/")]
+    FORGET --> STORE
+    BOOT["boot, before the overlay"] --> PURGE["host_ledger::purge()"]
+    EXIT["every exit of roomlerd run<br/>(after the runtime is dropped)<br/>+ every process::exit path"] --> PURGE
+    STORE --> PURGE
+    PURGE --> PINS["tun::purge_pins: remove each pin<br/>that STILL matches its record"]
+    PURGE --> FWD["nat::restore_forwarding_guids"]
+```
+
+| Rule | Where | Why |
+|---|---|---|
+| A pin is recorded the moment it is in, and forgotten when it is removed | `tun.rs` `add_host_exemption` / `del_host_exemption`, each OS arm | No exit, clean or not, can leave an unrecorded pin |
+| One record per address; a re-pin through a new uplink replaces it | `HostLedger::upsert_pin` | The purge must target the route that exists |
+| The purge removes a route only while it still matches the record | `tun::purge_pins` | Linux and Windows delete the exact (address, next hop, interface) route. macOS deletes only an unscoped static host route the table shows through the recorded next hop and interface, because `route delete` keys on the destination alone |
+| The post-exit purge runs only in a process that held the single-instance lock | `main.rs` `DAEMON_RAN`, set in `run_cmd` after `instance_lock::acquire` | On macOS a second `roomlerd run` returns through `main`; purging there would strip the **running** daemon's routes |
+| The Linux and macOS ledgers are believed only from a root-owned directory and file that nobody else may write | `host_ledger::store` (Unix) | Root acts on the ledger at boot |
+| Both halves go through one in-process ledger | `host_ledger::LEDGER` | The forwarding records and the pin records never overwrite each other |
 
 ## Platform support
 
