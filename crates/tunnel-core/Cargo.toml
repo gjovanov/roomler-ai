@@ -177,6 +177,14 @@ features = [
     "Win32_System_Registry",                            # RegOpenKeyExW/RegEnumValueW — read the firewall rule store (winfw, #1698)
 ]
 
+# FR-97 P1c — macOS DNS steering through the SCDynamicStore
+# (`overlay::dns::scdns`). The versions reqwest already resolves on macOS
+# (system-configuration 0.7 on core-foundation 0.9): no new crate.
+[target.'cfg(target_os = "macos")'.dependencies]
+system-configuration = "0.7"
+system-configuration-sys = "0.6"
+core-foundation = "0.9"
+
 [features]
 # Userspace WireGuard L3 overlay (Phase 2+). Off by default.
 overlay = ["dep:boringtun", "dep:base64", "dep:if-addrs", "dep:blake2", "dep:subtle"]
