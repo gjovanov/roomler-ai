@@ -1132,7 +1132,7 @@ fn open_auto_mutter(target_fps: u32) -> AutoMutter {
         input: portal::mutter::input_enabled(),
         window: false,
     };
-    let mut open = || PortalCapture::open_with(target_fps, opts).map_err(|e| format!("{e:#}"));
+    let open = || PortalCapture::open_with(target_fps, opts).map_err(|e| format!("{e:#}"));
     // FR-93 P5b (#2145) — a locked screen is waited out, with the controller
     // told why, instead of failing the open. Only by an open with a session
     // behind it: the recorder and capture-smoke would sit out the whole hour,
