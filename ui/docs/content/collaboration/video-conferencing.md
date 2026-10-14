@@ -40,8 +40,9 @@ feature is which. The rest of the product does not work this way.
 
 ## Browser support
 
-Calls work in current Chromium browsers, Firefox and Safari. (The
-**remote-desktop viewer** is the Chromium-only part — not calls.)
+Calls work in current Chromium browsers, Firefox and Safari. So does the
+**remote-desktop viewer**, where Chromium browsers are the recommendation (they
+have had the most testing) and Safari and Firefox work too.
 
 ## Self-hosting: the one thing that catches people
 
