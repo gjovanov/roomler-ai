@@ -3,8 +3,8 @@
  * and skipped without the vmtest env. ONE viewer session to the named agent,
  * held while the harness drives lifecycle events from outside the guest (QMP keys, loginctl, gdbus) and dates
  * each one. Every 500 ms this logs what a person at the viewer would see: whether the session says connected,
- * a checksum and the lit share of the picture (64×40), the "cannot capture" overlay's words, and any
- * reconnect / waiting status line. `[lc] ready` tells the harness the picture is up; the harness ends the hold
+ * a checksum and the lit share of the picture (64×40), the "cannot capture" overlay's words, any
+ * reconnect / waiting status line, and the input-reach warning's words. `[lc] ready` tells the harness the picture is up; the harness ends the hold
  * by touching /work/lc-stop. The verdict lines this log up against the harness's event log.
  */
 import * as fs from 'node:fs'
@@ -213,6 +213,7 @@ test.describe('vmtest lifecycle (named agent)', () => {
     console.log(`[lc] ready ${JSON.stringify({ wall: Date.now() / 1000 })}`)
 
     const overlay = page.locator('.no-media-overlay').first()
+    const reachBanner = page.getByTestId('rc-input-reach').first()
     const end = Date.now() + HOLD_S * 1000
     while (Date.now() < end && !fs.existsSync('/work/lc-stop')) {
       if (fs.existsSync('/work/lc-move')) {
@@ -232,7 +233,11 @@ test.describe('vmtest lifecycle (named agent)', () => {
         : ''
       const body = ((await page.locator('body').innerText().catch(() => '')) || '').replace(/\s+/g, ' ')
       const status = (body.match(STATUS)?.[0] || '').slice(0, 160)
-      console.log(`[lc] ${JSON.stringify({ wall: Date.now() / 1000, connected, sum: p.sum, lit: p.lit, g: p.g, counter: pr.counter, w: pr.w, h: pr.h, overlay: ov, status })}`)
+      // FR-93 P1a — the input-reach warning, if the viewer shows one (AC11's kill switch shows none).
+      const reach = (await reachBanner.isVisible().catch(() => false))
+        ? ((await reachBanner.innerText().catch(() => '')) || '').replace(/\s+/g, ' ').slice(0, 160)
+        : ''
+      console.log(`[lc] ${JSON.stringify({ wall: Date.now() / 1000, connected, sum: p.sum, lit: p.lit, g: p.g, counter: pr.counter, w: pr.w, h: pr.h, overlay: ov, status, reach })}`)
       await page.waitForTimeout(500)
     }
     console.log(`[lc] done ${JSON.stringify({ wall: Date.now() / 1000 })}`)

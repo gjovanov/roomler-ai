@@ -14,7 +14,8 @@
 //! So each session is told what its input will reach (`rc:input-reach` over
 //! the control channel, only when that is less than everything), decided from
 //! the same facts `input::open_default`'s cascade decides from. The decision is
-//! pure ([`decide`]) so its table is testable; [`current`] gathers the facts.
+//! pure ([`decide`]) so its table is testable; [`told`] gathers the facts,
+//! unless P1's kill switch is off on Linux, which tells nothing (P1a).
 
 /// How far a controller's input reaches on this desktop. Additive on the
 /// wire: an older viewer ignores the message.
@@ -241,10 +242,29 @@ pub(crate) fn decide(f: &Facts) -> InputReach {
     }
 }
 
-/// The verdict for a session starting now. Call it AFTER capture opened: a
-/// portal capture registers its input route as it opens.
-pub fn current() -> InputReach {
-    decide(&gather())
+/// What a session starting now is told: its verdict, or `None` for nothing at
+/// all. Call it AFTER capture opened: a portal capture registers its input
+/// route as it opens.
+///
+/// FR-93 P1a: on Linux this notice is part of P1, so P1's kill switch
+/// (`wayland_aware = false`) tells nothing, as the agent did before FR-93.
+/// Before P1a it still did: the FR-93 lab's GNOME guest on 0.4.135, with the
+/// switch off, streamed the old black XShm picture under a warning that
+/// 0.4.124 never sent (AC11: the kill switch restores the old behaviour
+/// exactly). The switch is a Linux key, so macOS and Windows are always told.
+pub fn told() -> Option<InputReach> {
+    #[cfg(target_os = "linux")]
+    let aware = crate::capture::wayland_aware();
+    #[cfg(not(target_os = "linux"))]
+    let aware = true;
+    told_with(aware, gather)
+}
+
+/// [`told`] with P1's switch and the facts given. Off gathers nothing, so the
+/// X server is not even asked, just as the capture's own Xwayland guard does
+/// not ask it.
+fn told_with(aware: bool, facts: impl FnOnce() -> Facts) -> Option<InputReach> {
+    aware.then(|| decide(&facts()))
 }
 
 /// FR-93 P2b — the verdict a session opened now would get, for the desktop
@@ -702,6 +722,16 @@ mod tests {
         let r = decide(&linux(XServer::Absent));
         assert_eq!(r.reach, Reach::None);
         assert!(r.reason.contains("uinput"), "{}", r.reason);
+    }
+
+    /// FR-93 P1a (AC11): P1's kill switch gives back the agent before FR-93,
+    /// which told no session its reach. Nothing is gathered, so the X server
+    /// is not even asked. With the switch on, the same desktop is told.
+    #[test]
+    fn the_kill_switch_tells_nothing_and_asks_nobody() {
+        assert_eq!(told_with(false, || panic!("facts gathered")), None);
+        let gnome = told_with(true, || linux(XServer::XwaylandEi(EiRoute::Portal)));
+        assert_eq!(gnome.map(|r| r.reach), Some(Reach::None));
     }
 
     #[test]

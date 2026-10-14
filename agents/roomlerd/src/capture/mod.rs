@@ -613,9 +613,9 @@ fn running_as_root() -> bool {
 /// FR-93 P1 kill switch (`ROOMLERD_WAYLAND_AWARE` / `wayland_aware`), default
 /// ON. It enables no capture; it only stops a Wayland desktop with nothing
 /// switched on from reading as "headless" or streaming black. `false` gives
-/// back 0.4.125's behaviour byte for byte.
+/// back 0.4.125's behaviour byte for byte, input reach included (P1a).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn wayland_aware() -> bool {
+pub(crate) fn wayland_aware() -> bool {
     tunnel_core::env::flag("WAYLAND_AWARE", true)
 }
 
