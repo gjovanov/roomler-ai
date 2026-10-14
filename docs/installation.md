@@ -173,6 +173,17 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   from starting on any host that never ran the pre-rename agent, wherever the
   sandbox applies. CI starts a unit with these sandbox lines on a fresh runner
   (`ci.yml`, "The Linux user unit's sandbox").
+- ⚠️ **The unit stops with the graphical session, and the session starts it
+  again** (`PartOf=` plus `WantedBy=graphical-session.target`, FR-93 P5,
+  #2144). Until then only `default.target` wanted it, so wherever the user's
+  systemd manager outlived a logout — a lingering user (the headless recipe in
+  `README.Debian`), an SSH login still open — the daemon stopped at the logout
+  and the next login never started it: the device stayed offline until a reboot
+  (measured on the FR-93 lab's GNOME 50 per-user guest, 0.4.132). A daemon
+  enabled before the fix enables itself again once at start
+  (`service.rs`, `repair_session_wants_at_start`; kill switch
+  `ROOMLERD_UNIT_REPAIR=0`), through `systemctl --user enable`: the sandbox
+  leaves `~/.config/systemd/user` read-only to the daemon itself.
 - ⚠️ **Until #1997 the per-user daemon could not start wherever the sandbox
   applies**, Fedora among them: it restarted every 5 s with `acquiring
   single-instance lock` … `Read-only file system`, because `%t` was not

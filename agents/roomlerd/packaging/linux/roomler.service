@@ -95,4 +95,10 @@ ReadWritePaths=-%h/.local/state/roomler
 ReadWritePaths=-%h/Downloads
 
 [Install]
-WantedBy=default.target
+# Both targets (#2144). `PartOf=` above stops the daemon with the graphical
+# session, so the session target has to START it again too: a user manager that
+# outlives a logout (a lingering user, an SSH login still open) reached
+# `default.target` long ago, and with `default.target` alone the daemon stayed
+# down after the next login until a reboot. A daemon enabled before this line
+# re-enables itself once at start (`service.rs`, `repair_session_wants`).
+WantedBy=default.target graphical-session.target
