@@ -75,6 +75,24 @@
               >
                 {{ os.note }}
               </v-alert>
+              <!-- FR-104 — the box shows what the token CARRIES (the server's
+                   answer), never a wish: ticking it mints a new token. -->
+              <template v-if="os.os === 'windows' && anchorOffered">
+                <v-checkbox
+                  :model-value="anchor === true"
+                  density="compact"
+                  hide-details
+                  label="Also let administrators run commands as SYSTEM on this device"
+                  data-test="enroll-anchor"
+                  @update:model-value="$emit('update:anchor', $event === true)"
+                />
+                <p class="text-caption text-medium-emphasis mb-3">
+                  The token can then also anchor the device it enrolls, once. Roomler Setup
+                  does that itself after a second administrator prompt; after the script or a
+                  manual install, run the anchor command below. Give this token only to the
+                  person installing it as an administrator.
+                </p>
+              </template>
               <div v-for="block in os.blocks" :key="block.id" class="mb-3">
                 <p class="text-body-2 font-weight-medium mb-1">{{ block.label }}</p>
                 <template v-if="block.isDownload">
@@ -135,9 +153,15 @@ const props = defineProps<{
   expiresIn: number | null
   loading: boolean
   error: string | null
+  /** FR-104 — the shown token may also anchor the device it enrolls. */
+  anchor?: boolean
 }>()
 
-defineEmits<{ (e: 'update:modelValue', v: boolean): void }>()
+defineEmits<{
+  (e: 'update:modelValue', v: boolean): void
+  /** FR-104 — mint a new token with (or without) the anchor claim. */
+  (e: 'update:anchor', v: boolean): void
+}>()
 
 // Default the OS tab to the visitor's own platform — they're usually
 // enrolling the machine in front of them or one like it.
@@ -160,8 +184,17 @@ const SCOPE_HINTS: Record<DaemonScope, string> = {
 }
 const scopeHint = computed(() => SCOPE_HINTS[scope.value])
 
+// FR-104 — only a machine-wide Windows install has a SYSTEM service to anchor.
+const anchorOffered = computed(() => props.kind === 'agent' && scope.value !== 'user')
+
 const commands = computed(() =>
-  enrollCommands(props.kind, window.location.origin, props.token, scope.value),
+  enrollCommands(
+    props.kind,
+    window.location.origin,
+    props.token,
+    scope.value,
+    props.anchor === true,
+  ),
 )
 
 const copiedId = ref<string | null>(null)

@@ -44,7 +44,7 @@ credential never passes through a process the signed-in user controls.
 
 ### 3b. The admin UI
 
-`ui/src/components/admin/EnrollmentDialog.vue` (the scope toggle at L47–62) gets a checkbox, for the Windows Background and Attended scopes: "Also let administrators run commands as SYSTEM on this device". It explains that:
+`ui/src/components/enroll/EnrollmentDialog.vue` (the scope toggle at L47–62) gets a checkbox, for the Windows Background and Attended scopes: "Also let administrators run commands as SYSTEM on this device". It explains that:
 - the wizard will show a second administrator prompt;
 - the token should go only to the person installing it as an administrator.
 
@@ -88,7 +88,7 @@ sequenceDiagram
 |---|---|---|---|
 | P0 | This spec, the issue and the registry row | docs only | this PR |
 | P1 | Server: the `anchor` claim, `enrolled_with_jti`, the second-purpose claim; tests | tokens carry `anchor` only when asked | in review |
-| P2 | Admin UI checkbox and copy | — | — |
+| P2 | Admin UI checkbox and copy. The box sits on the Windows tab for the two machine-wide scopes and shows what the token CARRIES (the server's `anchor`), never a wish: ticking it mints a new token (`AgentsSection.vue` `reissueEnrollToken`). An anchoring token adds a fourth Windows block, the elevated `roomlerd anchor create` with the same token, for the script and manual paths (`enrollCommands.ts`). The request carries a body only when asked, so the plain token stays the body-less request every server answers | — | #2174, merged once the wizard with P3 was released (`setup-v0.4.135`): before that the copy would have promised a wizard step the released wizard did not have |
 | P3 | Wizard: `spawn_elevated`, the anchor step, progress, Done note | the step runs only for an `anchor: true` token | in review |
 | P4 | Docs; field | — | — |
 

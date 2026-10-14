@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 import { describe, it, expect } from 'vitest'
-import { enrollCommands } from '@/utils/enrollCommands'
+import { DEVICE_ID_PLACEHOLDER, enrollCommands, type OsCommands } from '@/utils/enrollCommands'
 
 /**
  * Locks the enrollment command templates to the shipped installer
@@ -171,5 +171,55 @@ describe('enrollCommands', () => {
   it('normalises a trailing slash off the origin', () => {
     const [windows] = enrollCommands('agent', `${ORIGIN}/`, TOKEN)
     expect(windows!.blocks[0]!.command).not.toContain('.test//api')
+  })
+})
+
+/**
+ * FR-104 — a token that may also anchor the device it enrolls. The anchor
+ * command is offered where there is a SYSTEM service to anchor: a
+ * machine-wide Windows install, nowhere else.
+ */
+describe('enrollCommands — the anchor command (FR-104)', () => {
+  const ORIGIN = 'https://example.roomler.test'
+  const TOKEN = 'eyJTOKEN'
+  const anchorBlock = (os: OsCommands) =>
+    os.blocks.find((b) => b.id === 'agent-windows-anchor')
+
+  it('adds the elevated anchor command, with the same token, for both machine-wide scopes', () => {
+    for (const scope of ['system', 'machine'] as const) {
+      const [windows] = enrollCommands('agent', ORIGIN, TOKEN, scope, true)
+      const block = anchorBlock(windows!)
+      expect(block, scope).toBeDefined()
+      expect(windows!.blocks.at(-1)).toBe(block)
+      expect(block!.command).toBe(
+        `roomlerd anchor create --server ${ORIGIN} --token ${TOKEN} --device ${DEVICE_ID_PLACEHOLDER}`,
+      )
+    }
+  })
+
+  it('offers it nowhere else', () => {
+    // Not asked for.
+    for (const os of enrollCommands('agent', ORIGIN, TOKEN, 'system')) {
+      expect(anchorBlock(os)).toBeUndefined()
+    }
+    // A per-user install has no SYSTEM service; Linux and macOS daemons
+    // already run as root; a tunnel client is no device to anchor.
+    for (const os of enrollCommands('agent', ORIGIN, TOKEN, 'user', true)) {
+      expect(anchorBlock(os)).toBeUndefined()
+    }
+    for (const os of enrollCommands('agent', ORIGIN, TOKEN, 'system', true).slice(1)) {
+      expect(anchorBlock(os)).toBeUndefined()
+      expect(os.blocks).toHaveLength(3)
+    }
+    for (const os of enrollCommands('tunnel', ORIGIN, TOKEN, 'system', true)) {
+      expect(anchorBlock(os)).toBeUndefined()
+    }
+  })
+
+  it('leaves the device id to fill in, as no device exists before the enrollment', () => {
+    const [windows] = enrollCommands('agent', ORIGIN, null, 'system', true)
+    const block = anchorBlock(windows!)!
+    expect(block.command).toContain('--token <token>')
+    expect(block.label).toContain(DEVICE_ID_PLACEHOLDER)
   })
 })
