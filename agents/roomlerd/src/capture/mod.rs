@@ -1831,7 +1831,7 @@ pub struct CaptureUnavailable {
 impl CaptureUnavailable {
     /// The cap keeps one backend's verbose error from dominating a control
     /// message the viewer renders inline. Truncates on a char boundary.
-    const DETAIL_MAX: usize = 200;
+    pub(crate) const DETAIL_MAX: usize = 200;
 
     pub fn new(code: CaptureUnavailableCode, detail: impl Into<String>) -> Self {
         let detail: String = detail.into();
