@@ -5287,7 +5287,7 @@ async fn send_control_notice(
 /// FR-80's notice, and an older viewer ignores the message.
 ///
 /// The verdict probes the X server and reads `/proc`, so it runs on the
-/// blocking pool, never on the pump.
+/// blocking pool. `None` is P1's kill switch, which tells nothing (P1a).
 #[cfg_attr(
     not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
     allow(dead_code)
@@ -5297,7 +5297,7 @@ fn spawn_input_reach_notice(
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
 ) {
     tokio::spawn(async move {
-        let Ok(reach) = tokio::task::spawn_blocking(crate::input::reach::current).await else {
+        let Ok(Some(reach)) = tokio::task::spawn_blocking(crate::input::reach::told).await else {
             return;
         };
         if reach.reach == crate::input::reach::Reach::Full {

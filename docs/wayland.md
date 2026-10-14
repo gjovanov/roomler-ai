@@ -154,7 +154,7 @@ ones that decide this page:
 | Key | Env | Default | Effect |
 |---|---|---|---|
 | `wayland_auto` | `ROOMLERD_WAYLAND_AUTO` | **on** | a per-user daemon in its own Wayland session switches capture on by itself; off = everything opt-in, as before FR-93 P2 |
-| `wayland_aware` | `ROOMLERD_WAYLAND_AWARE` | **on** | a Wayland desktop no arm may capture says `wayland_not_enabled`; off = the behaviour before FR-93 |
+| `wayland_aware` | `ROOMLERD_WAYLAND_AWARE` | **on** | a Wayland desktop no arm may capture says `wayland_not_enabled`; off = the behaviour before FR-93, with no input-reach warning either (P1a) |
 | `drm_capture`, `uinput` | `ROOMLERD_DRM_CAPTURE`, `ROOMLERD_UINPUT` | off | the system arms (§1) |
 | `portal_capture`, `mutter_capture` | `ROOMLERD_PORTAL_CAPTURE`, `ROOMLERD_MUTTER_CAPTURE` | off | the per-user arms, explicitly; any capture key hands the choice back to the operator |
 | — | `ROOMLERD_MEDIA_WAITING` | on | the `rc:media-waiting` notices (§4); off = the viewer is told nothing and reconnects as before |
