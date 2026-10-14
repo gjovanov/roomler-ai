@@ -110,6 +110,36 @@ pub fn medium_group(normalised: &str) -> &'static str {
         .unwrap_or(OTHER)
 }
 
+/// P8 — the social platforms the promotion pipeline pushes posts and metric
+/// snapshots for (spec §3j), in report order. `instagram` is retired and
+/// kept for history, as it is among the [`SOURCES`].
+pub const PLATFORMS: [&str; 6] = [
+    "youtube",
+    "x",
+    "linkedin",
+    "facebook",
+    "tiktok",
+    "instagram",
+];
+
+/// The platforms no longer posted to: their history stays readable, and the
+/// Channels view lists them only when they have data.
+pub const RETIRED_PLATFORMS: [&str; 1] = ["instagram"];
+
+/// A platform name as the pipeline spells it, through the source aliases
+/// (`Twitter` → `x`, `yt` → `youtube`); `None` unless it is one of
+/// [`PLATFORMS`] — an unknown platform is refused at ingest, never stored
+/// under a name nothing reads.
+pub fn normalize_platform(raw: &str) -> Option<&'static str> {
+    let v = normalize_source(raw);
+    PLATFORMS.iter().copied().find(|p| *p == v)
+}
+
+/// Whether a (normalised) platform is retired.
+pub fn platform_retired(platform: &str) -> bool {
+    RETIRED_PLATFORMS.contains(&platform)
+}
+
 /// `utm_campaign`: trimmed and lowercased. The taxonomy's ids are
 /// `yyyymmdd-slug`, lowercase by construction, so a capital letter is a
 /// typo of the same post, not a different one.
@@ -593,6 +623,28 @@ mod tests {
             CampaignKey::normalized(Some(raw.0), Some(raw.1), Some(raw.2), Some(raw.3));
         assert!(from_signup.is_some());
         assert_eq!(from_signup, from_purestat);
+    }
+
+    /// P8 — the pipeline's platform names, through the aliases; anything
+    /// else is refused (`None`), and every platform is a source of the
+    /// taxonomy (a post's link carries it as `utm_source`).
+    #[test]
+    fn platforms_normalise_through_the_aliases_and_nothing_else_passes() {
+        assert_eq!(normalize_platform("Twitter"), Some("x"));
+        assert_eq!(normalize_platform(" YT "), Some("youtube"));
+        assert_eq!(normalize_platform("LinkedIn"), Some("linkedin"));
+        assert_eq!(normalize_platform("fb"), Some("facebook"));
+        assert_eq!(normalize_platform("TikTok"), Some("tiktok"));
+        assert_eq!(normalize_platform("ig"), Some("instagram"));
+        for unknown in ["mastodon", "reddit", "newsletter", "", "x.com"] {
+            assert_eq!(normalize_platform(unknown), None, "{unknown}");
+        }
+        for p in PLATFORMS {
+            assert_eq!(normalize_platform(p), Some(p));
+            assert!(SOURCES.contains(&p), "{p} is not a taxonomy source");
+        }
+        assert!(platform_retired("instagram"));
+        assert!(!platform_retired("youtube"));
     }
 
     #[test]

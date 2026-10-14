@@ -23,6 +23,7 @@
       <v-tabs v-model="tab" density="compact" class="mb-3">
         <v-tab value="overview">Overview</v-tab>
         <v-tab value="campaigns">Campaigns</v-tab>
+        <v-tab value="channels">Channels</v-tab>
         <v-tab value="orgs">Orgs</v-tab>
         <v-tab value="cohorts">Cohorts</v-tab>
         <v-tab value="digest">Digest</v-tab>
@@ -160,6 +161,11 @@
         <!-- Lazily rendered: the component loads its own range on first open. -->
         <v-window-item value="campaigns">
           <growth-campaigns />
+        </v-window-item>
+
+        <!-- ── Channels (P8) ─────────────────────────────────────────── -->
+        <v-window-item value="channels">
+          <growth-channels />
         </v-window-item>
 
         <!-- ── Orgs ──────────────────────────────────────────────────── -->
@@ -416,6 +422,7 @@ import {
   rateIfEnough,
 } from '@/stores/growth'
 import GrowthCampaigns from '@/components/growth/GrowthCampaigns.vue'
+import GrowthChannels from '@/components/growth/GrowthChannels.vue'
 import GrowthNode from '@/components/growth/GrowthNode.vue'
 import GrowthNotMeasured from '@/components/growth/GrowthNotMeasured.vue'
 import GrowthPercentiles from '@/components/growth/GrowthPercentiles.vue'

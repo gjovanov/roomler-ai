@@ -3,8 +3,9 @@
 How the project learns what a post, an article or an issue produced — visits, sign-ups,
 orgs, devices, usage, revenue — **joined by the campaign key and never by a person**. This
 page covers what FR-102 has shipped so far: the taxonomy (P1b), the exclusion set (P1c), the
-daily digest (P1d), the account funnel, cohorts and org views (P2), the install trace (P3), and
-the web plane — the purestat puller and the Campaigns table (P6).
+daily digest (P1d), the account funnel, cohorts and org views (P2), the install trace (P3), the
+web plane — the purestat puller and the Campaigns table (P6) — and social reach: the ingest
+routes the promotion pipeline pushes to, and the Channels table (P8).
 Spec: [`docs/fr/FR-102-growth-observability.md`](fr/FR-102-growth-observability.md) (#2127). It
 also places the existing `/observability` page, which no doc described before.
 
@@ -118,7 +119,8 @@ this server, not reachable, or not built yet is `{"not_measured": "<reason>",
 | `revenue` | orgs by plan × subscription status; the list-price MRR, **labelled `estimate: true`** (the same formula as the cost view, `routes/cost.rs::mrr_estimate_cents`) | `tenants`, `tenant_members` | P1d; billed P4 |
 | `quality` | sessions ended by `end_reason`, classed hang-up · refusal · failure; agent crashes by version | `remote_sessions`, `agent_crashes` | P1d |
 | `install` | tokens issued → redeemed; fetches by `(asset, client class, OS)`; enrollments by `(method, OS)`; wizard steps not measured until P3b — [the install trace](#the-install-trace-p3) | `enroll_token_issued`, `growth_daily`, `agents.install` | P3 |
-| `social` · `search` | — | — | P8 · P7 |
+| `social` | posts published per platform `{day, d7, d28}`; the snapshots taken that day (at most 20), each with its post's campaign and the platform's own metric names — `not_measured` when nothing was pushed in 28 days | `growth_posts`, `growth_post_snapshots` | P8 |
+| `search` | — | — | P7 |
 
 A module that is not mounted (`[modules] remote = false`, a reduced profile) makes its part
 `not_measured: "<module> module not mounted"`; the rest of the digest still completes. The
@@ -473,22 +475,22 @@ flowchart LR
 
 ### The key both planes meet on
 
-`roomler_core::campaign::CampaignKey` ([`campaign.rs:198`](../crates/core/src/campaign.rs))
+`roomler_core::campaign::CampaignKey` ([`campaign.rs:228`](../crates/core/src/campaign.rs))
 is `(source, medium, campaign, content)`, and `CampaignKey::normalized`
-([`campaign.rs:212`](../crates/core/src/campaign.rs)) is the ONE spelling: each value cleaned
+([`campaign.rs:242`](../crates/core/src/campaign.rs)) is the ONE spelling: each value cleaned
 exactly as a sign-up's is at ingress (`attribution::clean_value` — trimmed, printable ASCII
 only, clamped to 64), then source and medium through the taxonomy and campaign and content
 lowercased. A purestat row (`utm_source=YouTub&utm_campaign=20261019-Slug`) and a sign-up
 stored by `attribution::sanitize` from the same link meet on one key — a unit test asserts it.
 A row with no source is organic traffic, not a key.
 
-`KeyDepth` ([`campaign.rs:134`](../crates/core/src/campaign.rs)) is how deep a breakdown
+`KeyDepth` ([`campaign.rs:164`](../crates/core/src/campaign.rs)) is how deep a breakdown
 goes: `source` → `medium` → `campaign` → `content`, each one UTM dimension more.
 
 ### The puller — `saas`, hosted-only
 
 [`crates/modules/saas/src/purestat_pull.rs`](../crates/modules/saas/src/purestat_pull.rs),
-spawned from the module's `init` ([`lib.rs:92`](../crates/modules/saas/src/lib.rs)). No
+spawned from the module's `init` ([`lib.rs:96`](../crates/modules/saas/src/lib.rs)). No
 self-host profile compiles `saas`, and without `ROOMLER__GROWTH__PURESTAT_API_KEY` (or with
 `growth.enabled = false`) it starts nothing and logs that once.
 
@@ -542,7 +544,7 @@ each row's `dims.by` naming its breakdown:
 ### The Campaigns table
 
 `GET /api/admin/growth/campaigns?since&until&by&include_internal`
-([`campaigns.rs:502`](../crates/api/src/growth/campaigns.rs)) — platform admins only, **404**
+([`campaigns.rs:586`](../crates/api/src/growth/campaigns.rs)) — platform admins only, **404**
 otherwise and when `growth.enabled = false`, like every growth route.
 
 | Parameter | Values | Default |
@@ -561,7 +563,7 @@ otherwise and when `growth.enabled = false`, like every growth route.
   tallies with, grouped by `CampaignKey::normalized` of the owner's `signup_attribution`; the
   exclusion set applies. A unit test asserts a grouping agrees with the funnel's own
   breakdown.
-- **Joined in code by the key** ([`join`, campaigns.rs:341](../crates/api/src/growth/campaigns.rs)):
+- **Joined in code by the key** ([`join`, campaigns.rs:391](../crates/api/src/growth/campaigns.rs)):
   a key on one plane only is still a row — a **measured zero** on the other when that plane
   answered. Sorted by visitors, then sign-ups; at most 500 rows (`rows_truncated` says so).
 
@@ -588,6 +590,159 @@ depth, include-internal, the totals, the pull state, and the table — a `not_me
 a muted chip with its reason on hover, a rate appears only with its n ≥ 30, and every UTM
 value is rendered as text, never `v-html`.
 
+## Social reach: the ingest routes and the Channels table (P8)
+
+What a post on YouTube, X, LinkedIn, Facebook or TikTok produced beyond its own likes. The
+private promotion pipeline already records each platform's numbers; it **pushes** them here
+(D11 — the collector runs where its credentials live and needs nothing to be reachable), and
+the Channels table puts them beside what the post's campaign key brought.
+
+```mermaid
+flowchart LR
+  subgraph pipe["Promotion pipeline (private)"]
+    C["collector<br/>posts · T+1d/7d/28d snapshots"]
+  end
+  subgraph saas["saas module — hosted only"]
+    G{"ingest key gate<br/>404 unless live"}
+    I["POST …/ingest/posts<br/>POST …/ingest/snapshots"]
+  end
+  subgraph core["core collections"]
+    P[("growth_posts<br/>unique (platform, platform_id)")]
+    S[("growth_post_snapshots<br/>unique (…, snapshot)")]
+    K[("growth_keys<br/>hash + prefix only")]
+  end
+  subgraph host["host — crates/api/src/growth"]
+    CH["GET …/growth/channels"]
+    CA["GET …/growth/campaigns<br/>(reach column)"]
+  end
+  C -->|"Authorization: Bearer rgi_…"| G
+  G -->|"SHA-256 lookup"| K
+  G --> I
+  I --> P
+  I --> S
+  P --> CH
+  S --> CH
+  P --> CA
+  S --> CA
+```
+
+### The ingest key (D12)
+
+A platform admin mints it on `/observability/growth` → **Channels** → *Ingest keys*, or with
+`POST /api/admin/growth/keys` `{"kind": "ingest", "label": "…"}`
+([`keys.rs:140`](../crates/api/src/growth/keys.rs)). The answer carries the key **once**:
+`rgi_` and 32 random characters of nanoid's URL-safe alphabet (192 bits). The server stores
+only `hex(SHA-256(key))` and a display prefix (`rgi_AbCd1234`) in `growth_keys`
+([`growth_key.rs:97`](../crates/services/src/dao/growth_key.rs)); the list
+(`GET /api/admin/growth/keys`) shows the prefix, the label, who minted it, when it was last
+used and whether it is revoked — never the key or its hash. `DELETE …/keys/{key_id}` revokes
+(a timestamp, so the row stays as the record); at most 10 live keys of a kind.
+
+An ingest key opens the two ingest routes and **nothing else** — not a growth view, not any
+other route. ⚠️ Every way of not holding a live one is the same **empty 404** a path that does
+not exist answers ([`require_ingest_key`, growth_ingest.rs:467](../crates/modules/saas/src/growth_ingest.rs)),
+decided in a gate that runs before the body is read and before the method is matched: no
+`Authorization` header, a malformed key, an unknown one, a revoked one, a user's JWT,
+`growth.enabled = false`, and a server without the `saas` module. Never 401 or 403 (AC18). A
+database error during the lookup is a 503, so a Mongo blip never tells the pipeline its key
+was revoked.
+
+### The API, for the pipeline
+
+| Route | Body | Idempotent on | Answers |
+|---|---|---|---|
+| `POST /api/admin/growth/ingest/posts` | `platform`, `platform_id`, `account`, `format`, `url`, `published_at`, `utm_source`, `utm_medium`?, `utm_campaign`, `utm_content`?, `cost_cents`? | `(platform, platform_id)` — a re-push replaces the mutable fields | `201 {"status": "created"}` · `200 "updated"` · `200 "unchanged"` |
+| `POST /api/admin/growth/ingest/snapshots` | `platform`, `platform_id`, `snapshot` (`T+1d` · `T+7d` · `T+28d`), `taken_at`, `metrics` `{raw name: number}` | `(platform, platform_id, snapshot)` — **written once**: the first push's numbers stay | `201 "created"` · `200 "duplicate"` (nothing changed) |
+
+```bash
+KEY=rgi_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX   # from the mint answer; obviously fake here
+
+curl -sS -X POST https://roomler.ai/api/admin/growth/ingest/posts \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"platform": "linkedin", "platform_id": "urn:li:share:7123456789",
+       "account": "roomler-ai", "format": "post",
+       "url": "https://www.linkedin.com/feed/update/urn:li:share:7123456789/",
+       "published_at": "2026-10-19T09:00:00Z",
+       "utm_source": "linkedin", "utm_medium": "post",
+       "utm_campaign": "20261019-ssh-without-port-forwar", "cost_cents": 0}'
+# {"status":"created","platform":"linkedin","platform_id":"urn:li:share:7123456789"}
+
+curl -sS -X POST https://roomler.ai/api/admin/growth/ingest/snapshots \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"platform": "linkedin", "platform_id": "urn:li:share:7123456789",
+       "snapshot": "T+7d", "taken_at": "2026-10-26T09:05:00Z",
+       "metrics": {"impressionCount": 3120, "clickCount": 81, "likeCount": 44}}'
+# {"status":"created","platform":"linkedin","platform_id":"urn:li:share:7123456789","snapshot":"T+7d"}
+```
+
+**Push the post before its snapshots** — a snapshot for a post never pushed is refused
+(`unknown_post`). The routes sit inside the per-IP governor (1 request a second, bursts of
+60), which a daily push is far below.
+
+| Field | Rule ([`validate_post` / `validate_snapshot`](../crates/modules/saas/src/growth_ingest.rs)) |
+|---|---|
+| `platform` | `youtube` · `x` · `linkedin` · `facebook` · `tiktok`, and `instagram` (retired, kept for history) — through the taxonomy's aliases (`Twitter` → `x`, `yt` → `youtube`); anything else is `unknown_platform` |
+| `platform_id` | 1–128 of `[A-Za-z0-9:_.-]` (a LinkedIn URN, a video id, a status id) |
+| `account` | 1–64 of `[A-Za-z0-9_.@-]` — our own handle, never a person's |
+| `format` | 1–32 of `[a-z0-9-]` (lowercased): `video`, `post`, `short`, … |
+| `url` | `http(s)://` with a host, at most 512 characters, no whitespace |
+| `published_at`, `taken_at` | RFC 3339; not before 2020, not more than a day (`taken_at`: an hour) ahead |
+| `utm_*` | the post's link; `utm_source` and `utm_campaign` required; normalised by `CampaignKey::normalized` — the cleaning a sign-up's attribution gets at ingress — so the post meets its visits and sign-ups on one spelling |
+| `cost_cents` | optional whole number 0–10,000,000 in the account's currency (an X post with a link is billed per post) |
+| `metrics` | 1–50 entries; names 1–64 of `[A-Za-z0-9_.:-]`, **kept verbatim** (a metric is only comparable to itself); values finite numbers, \|v\| ≤ 10¹⁵ |
+| anything else | refused — the shape is closed |
+
+Refusals are `422 {"error": "<code>", "message": "…"}` and store nothing:
+
+| `error` | When |
+|---|---|
+| `post_text_refused` | **any** field whose name looks like copy — `caption`, `text`, `title`, `body`, `description`, `message`, `content`, `postText`, `alt_text`, `hashtags`, … ([`TEXT_WORDS`, growth_ingest.rs:90](../crates/modules/saas/src/growth_ingest.rs)) — whatever its value, even `null`. The ingest stores ids, URLs, numbers and the key, **never content** (AC18) |
+| `unknown_platform` | a platform outside the list (AC18) |
+| `unknown_field` · `missing_field` · `invalid_field` | the closed shape |
+| `invalid_platform_id` · `invalid_account` · `invalid_format` · `invalid_url` · `invalid_published_at` · `invalid_taken_at` · `invalid_key` · `invalid_cost` | a field outside its rule |
+| `unknown_snapshot` · `invalid_metrics` · `metric_not_numeric` | a snapshot outside its rule |
+| `unknown_post` | a snapshot before its post |
+
+A body that is not JSON is `400 invalid_json`; one over 16 KiB is `413`. Each push is logged at
+`info` with the key's display prefix, never the key.
+
+### The Channels table
+
+`GET /api/admin/growth/channels?since&until&include_internal`
+([`channels.rs:583`](../crates/api/src/growth/channels.rs)) — platform admins only, 404
+otherwise and when `growth.enabled = false`. The range is UTC days, both inclusive (the
+Campaigns table's rules); a post is in it when it was **published** in it.
+
+| Level | Cells |
+|---|---|
+| **platform** (every one of the five; `instagram` only when it has data) | `posts`; **reach per snapshot age** — each age's raw metrics summed over the posts that have that snapshot, with their count, so a three-day-old post is never added to a month-old one ([`reach_at`, channels.rs:257](../crates/api/src/growth/channels.rs)); visitors and sign-ups → activated → first value summed over the posts' **distinct** keys (an upper bound on unique visitors); `paid` (P4); spend |
+| **post** | its account, format, URL, publish time, key; every snapshot, and the oldest as `reach`; visitors (purestat, live, at the post's own depth — `content` when its link carried one, else `campaign`), sign-ups → activated → first value by the key; spend |
+| **spend** | `cost_cents` summed over the posts that declared one; `per_visitor` and `per_signup` as `{n, cents}` over those posts' visitors and sign-ups, `cents` only from n = 30 ([`cost_rate`, channels.rs:321](../crates/api/src/growth/channels.rs)) |
+
+Three cells, as everywhere: a platform with no post pushed in the range is
+`{"not_measured": "no posts pushed for this platform in the range"}` (and says when the ingest
+routes are not mounted on the server at all); a post without a snapshot has reach
+`not_measured: "no snapshot pushed yet"`; a purestat outage makes the web cells — and the cost
+per visitor — `not_measured`, while the reach and the account plane stand.
+
+The **Campaigns table's `reach` column** reads the same posts: per key at its depth, per
+platform, the posts with that key and their snapshots summed per age
+([`reach_by_key`, channels.rs:286](../crates/api/src/growth/channels.rs)); a key no post was
+pushed with is `not_measured`.
+
+| Collection | Shape | Kept |
+|---|---|---|
+| `growth_keys` | `{kind, label, prefix, hash, created_by, created_at, revoked_at, last_used_at}` — unique `hash` | until deleted by hand; revoked rows stay as the record |
+| `growth_posts` | `{platform, platform_id, account, format, url, published_at, key {source, medium, campaign, content}, cost_cents, created_at, updated_at}` — unique `(platform, platform_id)` | indefinitely (our own content, no person) |
+| `growth_post_snapshots` | `{platform, platform_id, snapshot, taken_at, metrics {raw: number}, received_at}` — unique `(platform, platform_id, snapshot)` | indefinitely |
+
+All three are core-level, like `growth_daily`: the `saas` module writes them through the core
+DAO and the host reads them — so a server that stops mounting `saas` still shows what was
+pushed (and says that nothing new arrives). The SPA's `/observability/growth` gains a
+**Channels** tab ([`GrowthChannels.vue`](../ui/src/components/growth/GrowthChannels.vue)):
+platform cards with their posts, and the ingest-key list with mint (the key shown once) and
+revoke. Every pushed string is rendered as text; a URL becomes a link only when it is http(s).
+
 ## The `/observability` page as a whole
 
 | Tab / surface | What it shows | Route family |
@@ -597,7 +752,7 @@ value is rendered as text, never `v-html`.
 | Orgs, machines, calls, users | platform-wide inventories and series | `/api/admin/stats/{orgs,machines,calls,users}` |
 | Usage | per-user minutes and bytes across every org | `/api/admin/stats/usage*` |
 | Attribution (FR-88) | sign-ups by campaign key and how many activated | `/api/admin/stats/attribution` |
-| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), and the Campaigns table (P6) | `/api/admin/growth/*` |
+| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), and the Channels table with the ingest keys (P8) | `/api/admin/growth/*` |
 
 ## Field verification
 
@@ -609,3 +764,8 @@ The Campaigns table's visitors for a closed day are to equal purestat's own numb
 same filter, and read "not measured" with the key revoked (AC16 — a production check after the
 roll); the integration suite covers the same two halves against a fake purestat
 (`crates/tests/src/growth_campaigns_tests.rs`).
+
+The ingest is to be shown on production to store a snapshot pushed twice once, to refuse an
+unknown platform and a body carrying post text, and to answer 404 to a wrong key (AC18); the
+integration suite asserts each, plus the revoked key, the JWT, the kill switch and the
+unmounted module (`crates/tests/src/growth_channels_tests.rs`).

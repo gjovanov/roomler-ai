@@ -74,6 +74,11 @@ mod exec_service_tests;
 /// key reads `not_measured`, AC16's control; unmounted modules named).
 #[cfg(test)]
 mod growth_campaigns_tests;
+/// FR-102 P8 — the ingest key and routes (AC18: a snapshot pushed twice is
+/// stored once; an unknown platform and post text are refused; a wrong key
+/// is a 404), and the Channels table's join with the reach column it fills.
+#[cfg(test)]
+mod growth_channels_tests;
 /// FR-102 P1d — the daily digest: every section's exact numbers on a seeded
 /// day, the once-only claim under two concurrent runs (AC23), the routes,
 /// the no-address rule, and the purestat client against a fake server.

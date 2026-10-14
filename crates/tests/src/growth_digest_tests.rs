@@ -723,8 +723,12 @@ async fn every_section_counts_the_seeded_day_exactly() {
         Some(Some("P3b"))
     );
 
+    // P8 — built, but nothing was pushed: not measured, never 0.
+    assert_eq!(
+        not_measured(&j["social"]),
+        Some(("no posts pushed in the last 28 days", None))
+    );
     // Not built yet.
-    assert_eq!(not_measured(&j["social"]).map(|n| n.1), Some(Some("P8")));
     assert_eq!(not_measured(&j["search"]).map(|n| n.1), Some(Some("P7")));
 
     // Nothing about a person.

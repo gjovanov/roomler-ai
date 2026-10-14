@@ -372,6 +372,15 @@ sequenceDiagram
   "not measured".
 - **Spend.** An optional `cost_cents` per post (an X post with a link is billed per post) gives cost per
   visitor and per sign-up.
+  *(P8 as built: the posts and snapshots are core-level collections (`growth_posts`,
+  `growth_post_snapshots`) written by `saas`'s ingest routes through the core DAO, so the host's views keep
+  showing what was pushed on a server that stops mounting `saas`. The ingest key (`growth_keys`, kind
+  `ingest`, `rgi_…`) is stored as a SHA-256 and a display prefix; every way of not holding a live one is the
+  empty 404 of an absent path, decided before the body is read. The body's shape is closed: a field whose
+  name looks like copy is `post_text_refused`, any other stranger `unknown_field`. A snapshot is written
+  once (the first push's numbers stay); a snapshot for a post never pushed is refused. A platform's reach
+  is summed per snapshot age, never across ages. Detail and the pushers' API:
+  [growth-observability.md](../growth-observability.md).)*
 
 ### 3k. Content and search (P7, engagement after PS3)
 
@@ -520,6 +529,9 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 | `growth_exclusions` | core | `{kind: tenant\|user, id, reason, by, at}` | until removed | platform admins |
 | `growth_alerts` | core | `{rule, fired_at, detail, cleared_at}` | 90 days | the host's alert job |
 | `growth_digests` | core | `_id = "yyyy-mm-dd"`, `{status, computed_at, sent_at, recipients, sections}` | 25 months | the host's digest job |
+| `growth_keys` | core | `{kind: ingest, label, prefix, hash, created_by, created_at, revoked_at, last_used_at}` — the key's SHA-256 and a display prefix, never the key (D12, P8) | until deleted; revoked rows stay | platform admins (host routes) |
+| `growth_posts` | core | `{platform, platform_id, account, format, url, published_at, key, cost_cents}`, unique `(platform, platform_id)`; no post text (P8) | indefinitely (our own content) | `saas`'s ingest route |
+| `growth_post_snapshots` | core | `{platform, platform_id, snapshot: T+1d\|T+7d\|T+28d, taken_at, metrics {raw: number}}`, unique `(platform, platform_id, snapshot)`, written once (P8) | indefinitely | `saas`'s ingest route |
 | `growth_pulls` | core | `_id = "<source>:<day>"`, `{source, day, status: ok\|failed, pulled_at, attempted_at, attempts, rows, error, missing_goal, truncated}` — whether a puller's day exists, so "not pulled" and "failed" are never read as 0 (P6) | indefinitely, like the rows it describes | the pullers (`saas`'s purestat puller from P6) |
 | `billing_events` | `saas` | §3g | with the org | the Stripe webhook |
 | `enroll_token_issued` | `fleet` | `_id = jti`, §3e | 90 days | token issuance, the enroll |
@@ -541,7 +553,7 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 | invoices and plan changes | `billing_events` | with the org (Stripe is the record) | the org | §2.12 |
 | session ratings | `session_feedback` | 25 months | the user | new §2.18 |
 | delivery status | `newsletter_sends` | as FR-58 | the subscriber | newsletter section |
-| social, search, GitHub | `growth_daily` | indefinitely | — (aggregates about our own content) | — |
+| social, search, GitHub | `growth_daily`; social posts and their metric snapshots in `growth_posts` / `growth_post_snapshots` (P8: ids, URLs, numbers and the campaign key — never post text) | indefinitely | — (aggregates about our own content) | — |
 | daily digests | `growth_digests`; the platform admins' mailboxes | 25 months | — (org names, never a person) | new §2.18 |
 
 The privacy policy (`ui/src/views/legal/PrivacyPolicyView.vue`) gains §2.18, product analytics (purpose:
@@ -567,7 +579,7 @@ hosted only). §7's retention list grows, and `docs/data-model.md`'s stale TTLs 
 | P6 | §3i: the purestat puller, the Campaigns table with coverage | no key ⇒ "not measured" | PR #2229 — the puller (`saas`), `growth_pulls`, `GET …/growth/campaigns`, the Campaigns tab |
 | PS3 | §3n PS3 in purestat | a tracker attribute | — |
 | P7 | §3k: the Search Console, Bing and GitHub pullers, the Content table | no credential ⇒ "not measured" | — |
-| P8 | §3j: the ingest routes, the Channels table, spend | no ingest key ⇒ 404 | — |
+| P8 | §3j: the ingest routes, the Channels table, spend | no ingest key ⇒ 404 | PR #2237 — the ingest key, `…/ingest/{posts,snapshots}` (`saas`), `growth_posts` / `growth_post_snapshots`, `GET …/growth/channels`, the Campaigns reach column, the Channels tab |
 | P9 | §3f: session outcomes, the frozen time-to-first-frame, crashes per version, the session carrier, the rating | `ROOMLER__GROWTH__FEEDBACK=false` hides the prompt | — |
 | P10 | §3l: the read key, the weekly roll-up, alerts | `ROOMLER__GROWTH__ALERTS=false` | — |
 | PS2, PS4–PS7 | §3n in purestat | per feature | — |
