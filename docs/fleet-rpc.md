@@ -190,6 +190,56 @@ roomlerd anchor remove            # this machine stops offering SYSTEM exec
   which device it is anchored for, and offers the `exec-system` capability on
   that connection only. No restart is needed either way.
 
+#### The wizard anchors, with the token it installs with (FR-104)
+
+Roomler Setup anchors a machine-wide install (**Daemon — system** or **Daemon —
+machine**) itself, so nobody needs to open an elevated prompt afterwards:
+
+- **The token says so.** In the enrollment dialog, on the Windows tab for a
+  machine-wide scope, an administrator ticks *Also let administrators run
+  commands as SYSTEM on this device*. The server mints the token with an
+  `anchor` claim (`POST …/agent/enroll-token {"anchor": true}`,
+  `MANAGE_AGENTS`) and logs that choice with the token's `jti`.
+- **One token, two uses, one device.** Enrolling records the token's `jti` on the
+  device row (`enrolled_with_jti`). `POST /api/agent/anchor` then accepts an
+  `anchor` token a second time, for exactly that device, once: it claims
+  `"{jti}:anchor"` in `used_tokens` (`exec_service.rs` anchor route). Any other
+  device, and a second anchor, is refused. A token without the claim is single
+  use across both purposes, as before.
+- **The wizard never holds the service's credential.** After the enrollment it
+  runs `roomlerd anchor create --server … --token <the same token> --device
+  <the id it just enrolled> --force` in an **elevated child**
+  (`updater::spawn_elevated`, a second administrator prompt). That child posts,
+  receives and writes the credential, as an administrator running it by hand
+  would. `--force` because the wizard enrolled this very host a moment before.
+- **A declined prompt or a failure leaves the install complete** and unanchored.
+  The Done page names why and carries the command to anchor later.
+- **The script and manual paths** take the same token. The dialog then shows the
+  anchor command to run from the same Administrator PowerShell.
+
+```mermaid
+sequenceDiagram
+  participant A as admin (dashboard)
+  participant W as wizard (Medium)
+  participant E as roomlerd anchor (elevated child)
+  participant S as server
+  A->>S: enroll-token {anchor: true}
+  S-->>A: token (claims anchor = true)
+  A->>W: the token
+  W->>S: POST /api/agent/enroll (claims jti)
+  S-->>W: agent id, agent token (row.enrolled_with_jti = jti)
+  W->>E: second administrator prompt, then anchor create --token --device
+  E->>S: POST /api/agent/anchor (claims "jti:anchor", this device only)
+  S-->>E: the service's credential
+  E->>E: write anchor.json (SYSTEM + Administrators)
+```
+
+⚠️ **Whoever holds an anchor-capable token can anchor the device it enrolls,**
+and so speak for that device's SYSTEM service (fake "ran as SYSTEM" results, on
+that one device). That is FR-94's delegation for every enrollment token, made
+narrower. The dialog says to give such a token only to the person installing as
+an administrator; for a managed fleet, IT installs the Background service.
+
 **One live anchor per device.** The service's credential carries the anchor's
 id, and the server accepts it only while that is the device row's current
 anchor. Anchoring again revokes the earlier one; so does

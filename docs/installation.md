@@ -132,6 +132,14 @@ Details worth knowing:
 - **The wizard ships with every agent release** (FR-84 S1): `agent-v<V>` also
   publishes `setup-v<V>` at the same commit, so `/api/setup/*` serves a wizard as
   new as the daemon it installs.
+- **The wizard can anchor the device for SYSTEM exec** (FR-104, from 0.4.135) when
+  its token was minted with *Also let administrators run commands as SYSTEM on this
+  device* (the admin UI's enrollment dialog, Windows, a machine-wide scope). The
+  Token step says it will; after enrolling, the wizard asks for a **second
+  administrator prompt** and runs `roomlerd anchor create` with the same token. A
+  declined prompt leaves the install complete and unanchored, and the Done page
+  carries the command to anchor later. Details: [`fleet-rpc.md`](./fleet-rpc.md)
+  § Anchoring a device.
 - Daemon installs also place **`roomler-desktop`** (tray companion: status,
   tunnels pane, consent prompts) and **`roomler.exe`** — a small shim that
   re-execs `roomlerd cli`, so CLI and daemon can never version-skew.

@@ -324,9 +324,10 @@ D1', the doorbell, and `exec_require_system` default off.
 - Hardware-bound anchors (TPM).
 - Changing the four gates or the audit model.
 - Platforms other than Windows.
-- **The wizard writing the anchor** (the second half of P1, not built). Re-running the unified wizard
-  elevated could anchor the device in the same step. Until then an administrator runs
-  `roomlerd anchor create` on it (`docs/fleet-rpc.md` § Anchoring a device), as every cell in §10 did.
+- **The wizard writing the anchor** (the second half of P1, not built here). Built by **FR-104**
+  (`docs/fr/FR-104-wizard-anchors-windows-devices.md`, from 0.4.135): an enrollment token minted with
+  an `anchor` claim lets the wizard's elevated child anchor the device that token enrolled, once
+  (`docs/fleet-rpc.md` § Anchoring a device). Every cell in §10 anchored with `roomlerd anchor create`.
 - **SSH through the service** (decision 5). Roomler SSH's `daemon` mode is still the worker. It is its
   own FR.
 
