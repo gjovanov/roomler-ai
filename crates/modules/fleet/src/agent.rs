@@ -60,6 +60,30 @@ pub struct EnrollmentTokenRequest {
     pub anchor: bool,
 }
 
+impl EnrollmentTokenRequest {
+    /// Read the body leniently. Before FR-104 this route read no body at all,
+    /// so every shape an admin's script may post was accepted: nothing,
+    /// `curl -d ''` (form-encoded, empty), a JSON content type with an empty
+    /// body. They still are, because only a non-empty JSON body is parsed —
+    /// axum's `Option<Json<_>>` would answer the last two 415 and 400.
+    fn from_body(headers: &axum::http::HeaderMap, body: &[u8]) -> Result<Self, ApiError> {
+        let json = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .map(|essence| {
+                let essence = essence.trim().to_ascii_lowercase();
+                essence == "application/json" || essence.ends_with("+json")
+            })
+            .unwrap_or(false);
+        if !json || body.iter().all(u8::is_ascii_whitespace) {
+            return Ok(Self::default());
+        }
+        serde_json::from_slice(body)
+            .map_err(|e| ApiError::BadRequest(format!("Invalid request body: {e}")))
+    }
+}
+
 /// POST /api/tenant/{tenant_id}/agent/enroll-token — admin issues an enrollment
 /// token that a new agent binary exchanges (once, within 10 min) for a
 /// long-lived agent token.
@@ -67,7 +91,8 @@ pub async fn issue_enrollment_token(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    body: Option<Json<EnrollmentTokenRequest>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
 ) -> Result<Json<EnrollmentTokenResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -81,7 +106,7 @@ pub async fn issue_enrollment_token(
     )
     .await?;
 
-    let anchor = body.map(|Json(b)| b.anchor).unwrap_or(false);
+    let anchor = EnrollmentTokenRequest::from_body(&headers, &body)?.anchor;
     let (token, jti) =
         state
             .auth
@@ -2037,5 +2062,69 @@ mod fr2_downgrade_guard_tests {
         // "downgrade" about what it cannot compare.
         assert!(pin_downgrade("agent-vNEXT", "0.4.1").is_none());
         assert!(pin_downgrade("agent-v0.4.0", "custom-build").is_none());
+    }
+}
+
+#[cfg(test)]
+mod enrollment_token_request_tests {
+    use super::EnrollmentTokenRequest;
+    use axum::http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
+
+    fn read(content_type: Option<&'static str>, body: &str) -> Option<bool> {
+        let mut headers = HeaderMap::new();
+        if let Some(ct) = content_type {
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+        }
+        EnrollmentTokenRequest::from_body(&headers, body.as_bytes())
+            .ok()
+            .map(|r| r.anchor)
+    }
+
+    /// Every shape a script could post before FR-104 still mints the plain
+    /// token — axum's `Option<Json<_>>` refused the middle three.
+    #[test]
+    fn what_the_route_accepted_before_still_mints_a_plain_token() {
+        assert_eq!(read(None, ""), Some(false), "no body");
+        assert_eq!(
+            read(Some("application/x-www-form-urlencoded"), ""),
+            Some(false),
+            "curl -d ''"
+        );
+        assert_eq!(
+            read(Some("application/json"), ""),
+            Some(false),
+            "JSON, empty"
+        );
+        assert_eq!(
+            read(Some("application/json"), " \n"),
+            Some(false),
+            "JSON, blank"
+        );
+        assert_eq!(
+            read(Some("text/plain"), "{\"anchor\":true}"),
+            Some(false),
+            "a body that is not declared JSON is ignored, as before"
+        );
+    }
+
+    #[test]
+    fn only_a_json_body_asks_for_an_anchor() {
+        assert_eq!(
+            read(Some("application/json"), r#"{"anchor":true}"#),
+            Some(true)
+        );
+        assert_eq!(
+            read(
+                Some("Application/JSON; charset=utf-8"),
+                r#"{"anchor":true}"#
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            read(Some("application/json"), r#"{"anchor":false}"#),
+            Some(false)
+        );
+        assert_eq!(read(Some("application/json"), "{}"), Some(false));
+        assert_eq!(read(Some("application/json"), "{not json"), None, "a 400");
     }
 }
