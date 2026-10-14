@@ -653,6 +653,12 @@ export interface SshAuditEntry {
   /** The refusal in the words the caller was given, straight from the server
    *  so the UI never has to keep its own copy of the enum's meanings. */
   denied_message?: string | null
+  /** FR-105 — where the server sent the grant: `system` (a Windows device's
+   *  SYSTEM service, as SYSTEM), `console_user` (the same service, as the
+   *  signed-in user) or `worker` (the agent's own process, whose identity
+   *  depends on the install). Absent on a refusal and on rows from before
+   *  FR-105. Read with `account_mode` through `sshAsChip`. */
+  ran_as?: string | null
 }
 
 /** What a device REPORTED doing inside an SSH session (P8).
