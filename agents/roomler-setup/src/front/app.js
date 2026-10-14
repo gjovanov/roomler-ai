@@ -58,6 +58,7 @@ const state = {
                        // only — deliberately NOT in the persisted
                        // WizardState, so a relaunch re-derives it from the
                        // role instead of replaying a stale click.
+  anchorSkipReason: null, // FR-104: why the anchor step did not anchor
 };
 
 // Checklist rows keyed by event type — replay + live events render
@@ -473,6 +474,9 @@ function renderToken() {
     view.tokenType ?? view.audience ?? "(none)";
   document.getElementById("token-expiry").textContent =
     view.expiresAtUnix ? formatExpiry(view.expiresAtUnix) : "(no exp)";
+  // FR-104 — say up front that a second administrator prompt is coming.
+  document.getElementById("token-anchor-yes").hidden = view.willAnchor !== true;
+  document.getElementById("token-anchor-no").hidden = view.willAnchor !== false;
 
   // Tunnel role gates Continue on the token-type match; daemon roles
   // are not gated client-side (audienceMatches is null for them).
@@ -518,6 +522,9 @@ const STEP_LABELS = {
   IntegrationDone: "PATH integration finished",
   EnrollStarted: "Enrolling with Roomler",
   EnrollOk: "Enrolled",
+  AnchorStarted: "Anchoring for SYSTEM exec (administrator prompt)",
+  AnchorOk: "Anchored for SYSTEM exec",
+  AnchorSkipped: "Not anchored",
   Done: "Done",
   Error: "Error",
   SystemContextError: "SystemContext step failed",
@@ -664,6 +671,11 @@ function handleProgress(event, live) {
     state.msiSpawned = true;
   }
 
+  // FR-104 — kept for the Done page's note.
+  if (type === "AnchorSkipped") {
+    state.anchorSkipReason = data.reason ?? null;
+  }
+
   if (type === "SystemContextError") {
     const stageLabel = {
       env_var_write: "Writing the service env-var failed",
@@ -727,9 +739,9 @@ function renderInstall() {
 function checklistClass(event) {
   const t = event.type;
   if (t === "Error" || t === "SystemContextError") return "error";
-  if (t === "PreflightWarning") return "warning";
+  if (t === "PreflightWarning" || t === "AnchorSkipped") return "warning";
   if (
-    t === "Done" || t === "EnrollOk" || t === "MsiCompleted" ||
+    t === "Done" || t === "EnrollOk" || t === "AnchorOk" || t === "MsiCompleted" ||
     t === "ExtractDone" || t === "IntegrationDone" ||
     t === "DownloadVerified" || t === "PreflightOk" || t === "AssetResolved"
   ) {
@@ -752,6 +764,7 @@ function checklistLabel(event) {
   if (t === "IntegrationDone")
     return `Integration: PATH ${d.pathUpdated ? "updated" : "unchanged"}; shortcut ${d.shortcutCreated ? "created" : "skipped"}`;
   if (t === "EnrollOk") return `Enrolled (${d.principalKind} ${d.principalId})`;
+  if (t === "AnchorSkipped") return `Not anchored: ${d.reason}`;
   if (t === "Error") return `Error at ${d.step}: ${d.message}`;
   if (t === "SystemContextError") {
     const stageLabel = {
@@ -795,8 +808,22 @@ function renderDone() {
     lead = "The Roomler daemon is installed and enrolled.";
     if (cliIncluded) lead += " The roomler CLI came with it (managed by the daemon's updater).";
     if (desktopInstalled) lead += " The roomler-desktop app is installed alongside it.";
+    if (done.anchored === true) lead += " It is anchored: commands can run as SYSTEM here.";
   }
   document.getElementById("done-lead").textContent = lead;
+
+  // FR-104 — the anchor step ran and did not anchor: the manual command,
+  // with a placeholder where a fresh token goes (the one pasted here is
+  // spent, and is never shown again).
+  const anchorFailed = !isTunnel && done.anchored === false;
+  document.getElementById("done-anchor-note").hidden = !anchorFailed;
+  if (anchorFailed) {
+    document.getElementById("done-anchor-reason").textContent = state.anchorSkipReason ?? "";
+    const server = (state.server || "https://roomler.ai").replace(/\/+$/, "");
+    document.getElementById("done-anchor-command").textContent =
+      `roomlerd anchor create --server ${server} --token <fresh token> ` +
+      `--device ${done.principalId ?? "<device id>"}`;
+  }
 
   document.getElementById("done-principal-label").textContent =
     isTunnel ? "Tunnel client ID" : "Agent ID";

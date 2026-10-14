@@ -273,6 +273,8 @@ async fn run_install_inner(
         // roomler-desktop is a daemon-role companion; the tunnel role
         // doesn't place it.
         desktop_installed: None,
+        // FR-104 — a tunnel client has no SYSTEM service to anchor.
+        anchored: None,
     })
 }
 
