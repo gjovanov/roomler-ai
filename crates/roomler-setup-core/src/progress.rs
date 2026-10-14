@@ -126,6 +126,19 @@ pub enum ProgressEvent {
         tenant_id: String,
     },
 
+    /// FR-104 — the elevated `roomlerd anchor create` started: the token may
+    /// also anchor the device it just enrolled, and Windows shows a second
+    /// administrator prompt for it.
+    AnchorStarted,
+    /// FR-104 — the device is anchored: commands can run as SYSTEM through
+    /// its service.
+    AnchorOk,
+    /// FR-104 — the anchor step did not anchor the device. Never fatal: the
+    /// install is complete and enrolled, and the Done page carries the manual
+    /// command. `reason` is for the operator and never carries the token.
+    #[serde(rename_all = "camelCase")]
+    AnchorSkipped { reason: String },
+
     /// Whole install finished. SPA transitions to the Done step.
     Done,
 
@@ -287,6 +300,28 @@ mod tests {
         assert!(
             json.contains(r#""hint":"rerun restart-service""#),
             "got {json}"
+        );
+    }
+
+    /// FR-104 — the anchor step's events, as the SPA reads them.
+    #[test]
+    fn anchor_events_serialise_with_their_reason() {
+        let started = serde_json::to_string(&ProgressEvent::AnchorStarted).unwrap();
+        assert!(
+            started.contains(r#""type":"AnchorStarted""#),
+            "got {started}"
+        );
+        let skipped = serde_json::to_string(&ProgressEvent::AnchorSkipped {
+            reason: "the administrator prompt was declined".to_string(),
+        })
+        .unwrap();
+        assert!(
+            skipped.contains(r#""type":"AnchorSkipped""#),
+            "got {skipped}"
+        );
+        assert!(
+            skipped.contains(r#""reason":"the administrator prompt was declined""#),
+            "got {skipped}"
         );
     }
 

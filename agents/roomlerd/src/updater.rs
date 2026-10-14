@@ -2344,6 +2344,22 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
 /// cycle).
 #[cfg(target_os = "windows")]
 pub fn spawn_msiexec_elevated(argv: &[String]) -> Result<u32> {
+    spawn_elevated("msiexec.exe", argv)
+        .map_err(|e| e.context("elevated msiexec — install not started"))
+}
+
+/// FR-104 — [`spawn_msiexec_elevated`] for any program: `ShellExecuteExW`
+/// with the `runas` verb, so Windows shows its administrator prompt, and the
+/// PID of the elevated process. The setup wizard runs `roomlerd anchor
+/// create` this way after it enrolls a machine-wide install: the anchor's
+/// POST, and the SYSTEM service's credential it returns, must stay inside an
+/// elevated process (FR-94 §4).
+///
+/// ⚠️ Arguments are joined with spaces; one that contains a space is quoted.
+/// An argument containing a `"` is not escaped, so none may (paths, origins,
+/// ids and JWTs never do).
+#[cfg(target_os = "windows")]
+pub fn spawn_elevated(file: &str, argv: &[String]) -> Result<u32> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
     use windows_sys::Win32::System::Threading::GetProcessId;
@@ -2360,7 +2376,7 @@ pub fn spawn_msiexec_elevated(argv: &[String]) -> Result<u32> {
             .chain(std::iter::once(0))
             .collect()
     }
-    // msiexec expects the args concatenated as a single string with
+    // ShellExecuteExW takes the args concatenated as a single string with
     // spaces between. Paths are quoted to survive any embedded spaces
     // in the temp-dir / installer name. Other args are bare.
     let parameters = argv
@@ -2375,7 +2391,7 @@ pub fn spawn_msiexec_elevated(argv: &[String]) -> Result<u32> {
         .collect::<Vec<_>>()
         .join(" ");
     let verb_w = to_wide("runas");
-    let file_w = to_wide("msiexec.exe");
+    let file_w = to_wide(file);
     let params_w = to_wide(&parameters);
 
     // SAFETY: SHELLEXECUTEINFOW is a plain POD struct; zero-init is
@@ -2401,7 +2417,7 @@ pub fn spawn_msiexec_elevated(argv: &[String]) -> Result<u32> {
         // errors (file not found, etc.) surface as "elevation
         // failed (err N)" — operator can paste into the issue.
         if err == 1223 {
-            bail!("UAC consent declined — install not started");
+            bail!("the administrator prompt was declined (UAC)");
         }
         bail!("ShellExecuteExW(runas) failed (err {err})");
     }
@@ -2420,7 +2436,7 @@ pub fn spawn_msiexec_elevated(argv: &[String]) -> Result<u32> {
     let pid = unsafe { GetProcessId(sei.hProcess) };
     unsafe { CloseHandle(sei.hProcess) };
     if pid == 0 {
-        bail!("GetProcessId on elevated msiexec returned 0");
+        bail!("GetProcessId on the elevated {file} returned 0");
     }
     Ok(pid)
 }

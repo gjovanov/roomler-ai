@@ -518,6 +518,13 @@ async fn run_install_inner(
     // install; the operator can always grab it later.
     let desktop_installed = place_desktop_companion(wfx, on_event).await;
 
+    // --- Step 7b': anchor the device for SYSTEM exec (FR-104) -----------
+    // Only for a token the admin minted to anchor, on a machine-wide install
+    // (the only flavours with a SYSTEM service). Best-effort, like the
+    // companion step: a declined prompt or a failure leaves an enrolled
+    // install, and the Done page carries the manual command.
+    let anchored = anchor_device(role, wfx, &server, &token, &agent_id, on_event).await;
+
     // --- Step 7c: start a per-user daemon now (FR-84 D6) -----------------
     // The perUser MSI registers the Scheduled Task for the NEXT logon only,
     // so until now a wizard install ran nothing — and nothing could open the
@@ -553,7 +560,109 @@ async fn run_install_inner(
         shortcut_created: None,
         cli_included,
         desktop_installed,
+        anchored,
     })
+}
+
+/// FR-104 — does an install of `role` have a SYSTEM service an anchor is
+/// for? The two machine-wide Windows roles; a per-user install has none.
+pub fn role_anchors(role: Role) -> bool {
+    cfg!(target_os = "windows") && matches!(role, Role::DaemonSystem | Role::DaemonMachine)
+}
+
+/// How long the elevated anchor step may take, the administrator prompt
+/// included: a person has to answer it.
+#[cfg(target_os = "windows")]
+const ANCHOR_BUDGET: Duration = Duration::from_secs(5 * 60);
+
+/// FR-104 — anchor the device this install just enrolled, when its token
+/// allows it, by running `roomlerd anchor create` ELEVATED: a second
+/// administrator prompt. The anchor's POST, and the SYSTEM service's
+/// credential it returns, stay inside that elevated process (FR-94 §4); the
+/// wizard runs at Medium integrity and never holds the credential.
+///
+/// `--force` because the wizard enrolled this very host a moment ago by id,
+/// under a name the operator may have changed from the host name.
+///
+/// ⚠️ The token travels on the elevated child's command line. That exposes it
+/// only to the installing administrator's own processes for the child's few
+/// seconds, the same processes that can already read the wizard holding it.
+/// It is never logged, emitted or shown.
+///
+/// `None` = not applicable (a plain token, a per-user role); `Some(true)` =
+/// anchored; `Some(false)` = attempted and not.
+#[cfg(target_os = "windows")]
+async fn anchor_device(
+    role: Role,
+    flavour: WindowsInstallFlavour,
+    server: &str,
+    token: &str,
+    agent_id: &str,
+    on_event: &Channel<ProgressEvent>,
+) -> Option<bool> {
+    if !role_anchors(role) || !wizard_shared::token_peek::parse_anchor_claim(token) {
+        return None;
+    }
+    let skipped = |reason: String| {
+        tracing::warn!(%reason, "FR-104: the device was not anchored");
+        emit(on_event, ProgressEvent::AnchorSkipped { reason });
+        Some(false)
+    };
+    let Some(dir) =
+        roomlerd::updater::install_dir_with_name(flavour, roomlerd::updater::INSTALL_FOLDER_NAME)
+    else {
+        return skipped("the install folder could not be found".to_string());
+    };
+    let exe = dir.join("roomlerd.exe");
+    if !exe.exists() {
+        return skipped(format!("{} is missing", exe.display()));
+    }
+    emit(on_event, ProgressEvent::AnchorStarted);
+    let argv: Vec<String> = [
+        "anchor",
+        "create",
+        "--server",
+        server.trim().trim_end_matches('/'),
+        "--token",
+        token,
+        "--device",
+        agent_id,
+        "--force",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let pid = match roomlerd::updater::spawn_elevated(&exe.display().to_string(), &argv) {
+        Ok(pid) => pid,
+        Err(e) => return skipped(format!("{e:#}")),
+    };
+    let runner = match MsiRunner::attach(pid) {
+        Ok(r) => r,
+        Err(e) => return skipped(format!("could not follow the anchor step: {e}")),
+    };
+    match runner.wait_for_exit(ANCHOR_BUDGET).await {
+        Ok(MsiExitDecoded::Success) => {
+            emit(on_event, ProgressEvent::AnchorOk);
+            Some(true)
+        }
+        Ok(other) => skipped(format!(
+            "roomlerd anchor create did not succeed ({other:?})"
+        )),
+        Err(e) => skipped(format!("waiting for the anchor step: {e}")),
+    }
+}
+
+/// FR-104 — the daemon roles exist only on Windows.
+#[cfg(not(target_os = "windows"))]
+async fn anchor_device(
+    _role: Role,
+    _flavour: WindowsInstallFlavour,
+    _server: &str,
+    _token: &str,
+    _agent_id: &str,
+    _on_event: &Channel<ProgressEvent>,
+) -> Option<bool> {
+    None
 }
 
 /// Fetch + place the `roomler-desktop` GUI companion beside the daemon

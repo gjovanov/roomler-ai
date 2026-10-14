@@ -34,10 +34,40 @@ pub fn parse_token_type(token: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// FR-104 — did the admin mint this enrollment token to also ANCHOR the
+/// device it enrolls (`"anchor": true`)? `false` for every failure path and
+/// for every token minted without it. A UX pre-check like
+/// [`parse_token_type`]: the server decides whether the second use is
+/// allowed, for exactly the device this token enrolled.
+pub fn parse_anchor_claim(token: &str) -> bool {
+    use base64::Engine;
+    let Some(payload_b64) = token.split('.').nth(1) else {
+        return false;
+    };
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|v| v.get("anchor").and_then(|a| a.as_bool()))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::Engine;
+
+    /// FR-104 — the anchor claim reads `true` only when the token says so.
+    #[test]
+    fn parses_the_anchor_claim() {
+        let anchoring = fake_jwt(r#"{"token_type":"enrollment","anchor":true}"#);
+        assert!(parse_anchor_claim(&anchoring));
+        let plain = fake_jwt(r#"{"token_type":"enrollment"}"#);
+        assert!(!parse_anchor_claim(&plain));
+        let odd = fake_jwt(r#"{"anchor":"yes"}"#);
+        assert!(!parse_anchor_claim(&odd));
+        assert!(!parse_anchor_claim("not-a-jwt"));
+    }
 
     /// Build an unsigned test JWT with the given JSON payload — the
     /// header + signature segments are irrelevant to the peek.
