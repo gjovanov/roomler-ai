@@ -136,6 +136,10 @@ pub mod rtp_playout;
 /// asked of the server with the org's agent token.
 pub mod self_view;
 pub mod service;
+/// FR-101 P4b-2 — the idle limit, kept by the device: no input from the
+/// controller and no significant change on the screen for `idle_secs` ends
+/// the session.
+pub mod session_idle;
 /// FR-101 P2b — the session policy for clipboard, files and audio, the
 /// device's half: the owner's floor, and the masking every grant goes through.
 pub mod session_policy;

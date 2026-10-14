@@ -1130,6 +1130,8 @@ async fn session_audit_reads_back_rows_the_audit_sink_wrote() {
             record_stripped: None,
             privacy_stripped: None,
             features_stripped: None,
+            idle_secs: None,
+            idle_enforced: None,
         },
     );
     sink.record(

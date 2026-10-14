@@ -61,6 +61,11 @@ pub struct SessionCounters {
     pub keyframe_requests: AtomicU32,
     /// Input events accepted for injection (post-suppression).
     pub input_events: AtomicU64,
+    /// FR-101 P4b-2 — every input event the controller SENT, suppressed or
+    /// not: someone typing at a locked host, or moving the pointer in a
+    /// view-only session, is present even though nothing was injected. What
+    /// the idle limit reads; `input_events` stays what the stats report.
+    pub input_seen: AtomicU64,
     /// P8 Phase 4 — cumulative seconds the owner's shared pipeline
     /// served ≥1 follower (bumped by the pump heartbeats; counted on
     /// the OWNER session, whose pump runs the pipeline).
@@ -75,6 +80,11 @@ pub struct SessionCounters {
     /// FR-101 P3 — files completed since the last sample. A name is hashed
     /// the moment it is noted, so no name is ever held here.
     file_notes: std::sync::Mutex<Vec<FileNote>>,
+    /// FR-101 P4b-2 — file-transfer activity: a message on the files channel
+    /// from the controller, or a download's progress report. Read only as
+    /// "did it move" by the idle limit (`session_idle`), so a transfer that
+    /// runs for longer than the limit is never ended as idle.
+    pub transfer_activity: AtomicU64,
 }
 
 impl SessionCounters {
@@ -139,6 +149,29 @@ impl SessionCounters {
     pub fn note_input(&self) {
         self.input_events.fetch_add(1, Ordering::Relaxed);
     }
+    /// FR-101 P4b-2 — see [`Self::input_seen`].
+    pub fn note_input_seen(&self) {
+        self.input_seen.fetch_add(1, Ordering::Relaxed);
+    }
+    /// FR-101 P4b-2 — see [`Self::transfer_activity`].
+    pub fn note_transfer(&self) {
+        self.transfer_activity.fetch_add(1, Ordering::Relaxed);
+    }
+    /// FR-101 P4b-2 — what the controller has done in this session, as one
+    /// comparable value: input sent, clipboard both ways, file transfer.
+    /// The idle limit only asks whether it CHANGED since its last look; the
+    /// numbers mean nothing on their own.
+    pub fn activity(&self) -> ControllerActivity {
+        ControllerActivity {
+            input: self.input_seen.load(Ordering::Relaxed),
+            clipboard: self
+                .clipboard_to_host
+                .read()
+                .count
+                .wrapping_add(self.clipboard_from_host.read().count),
+            transfers: self.transfer_activity.load(Ordering::Relaxed),
+        }
+    }
     /// One shared heartbeat window: `secs` of shared pipeline time,
     /// `mixed` when the viewers' dials differed during it.
     pub fn note_shared_window(&self, secs: u64, mixed: bool) {
@@ -147,6 +180,15 @@ impl SessionCounters {
             self.mixed_dial_seconds.fetch_add(secs, Ordering::Relaxed);
         }
     }
+}
+
+/// FR-101 P4b-2 — [`SessionCounters::activity`]: a snapshot the idle limit
+/// compares with the previous one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ControllerActivity {
+    pub input: u64,
+    pub clipboard: u64,
+    pub transfers: u64,
 }
 
 fn registry() -> &'static DashMap<ObjectId, Arc<SessionCounters>> {
@@ -168,6 +210,13 @@ pub fn counters(session_id: ObjectId) -> Arc<SessionCounters> {
 /// a long-lived agent doesn't accumulate one entry per session forever.
 pub fn forget(session_id: ObjectId) {
     registry().remove(&session_id);
+}
+
+/// FR-101 P4b-2 — a session's counters if it has any, WITHOUT creating them:
+/// the idle limit reads on its own timer, and a read that created an entry
+/// after the peer's drop forgot it would leak one per session.
+pub fn peek(session_id: ObjectId) -> Option<Arc<SessionCounters>> {
+    registry().get(&session_id).map(|e| e.value().clone())
 }
 
 #[cfg(test)]
