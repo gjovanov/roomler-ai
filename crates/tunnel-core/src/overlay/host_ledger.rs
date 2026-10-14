@@ -235,6 +235,22 @@ pub(crate) fn forget_pin(ip: std::net::IpAddr) {
     with_ledger(|l| l.remove_pin(ip));
 }
 
+/// FR-97 P0e (N12) — how this process installed its pin for `ip`, if it holds
+/// one: the route to remove, even after the uplink it went through moved.
+#[cfg(all(
+    feature = "overlay-l3",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn pin_record(ip: std::net::IpAddr) -> Option<PinRecord> {
+    LEDGER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pins
+        .iter()
+        .find(|p| p.ip == ip)
+        .cloned()
+}
+
 /// FR-97 P0b-2b / P0e — undo what the persisted ledger records, then clear
 /// it: the forwarding a Windows router turned on, and every exit-client pin. Run
 /// at boot, before the overlay can install anything, and after every exit of
