@@ -1724,6 +1724,9 @@ fn rpc_caps() -> Vec<String> {
     // that runs sessions.
     #[cfg(hive_host)]
     caps.push(RpcCap::HivePurge);
+    // ⚠️ FR-99's `privacy-*` words are NOT here: this list is memoized at boot
+    // (`detect()`), and those follow the owner's live gate and the overlay
+    // coming up. `signaling::stub_caps` adds them at every announcement.
     caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
 

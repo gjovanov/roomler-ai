@@ -35,26 +35,29 @@ use std::time::Instant;
 
 use bson::oid::ObjectId;
 
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    BOOL, COLORREF, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
-    DT_VCENTER, DeleteObject, DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect,
-    FrameRect, GetStockObject, HBRUSH, HDC, HGDIOBJ, InvalidateRect, NULL_PEN, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DT_VCENTER, DeleteObject, DrawTextW, Ellipse, EndPaint, EnumDisplayMonitors, FW_BOLD,
+    FW_NORMAL, FillRect, FrameRect, GetStockObject, HBRUSH, HDC, HGDIOBJ, HMONITOR, InvalidateRect,
+    NULL_PEN, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-    HMENU, HTCAPTION, HWND_TOPMOST, IDC_ARROW, KillTimer, LWA_COLORKEY, LoadCursorW, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SendMessageW,
-    SetLayeredWindowAttributes, SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_DESTROY,
-    WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCLBUTTONDOWN, WM_PAINT, WM_TIMER,
-    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics,
+    GetWindowDisplayAffinity, GetWindowLongPtrW, GetWindowRect, HMENU, HTCAPTION, HWND_TOPMOST,
+    IDC_ARROW, KillTimer, LWA_ALPHA, LWA_COLORKEY, LoadCursorW, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_SHOWWINDOW, SendMessageW, SetLayeredWindowAttributes, SetTimer,
+    SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_EXITSIZEMOVE,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCLBUTTONDOWN, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::w;
 
@@ -174,7 +177,34 @@ struct State {
     /// approves the wrong thing. A second request while one is up waits for
     /// the first to resolve, and its own 30 s window is what bounds the wait.
     prompt: Option<super::PromptView>,
+    /// FR-99 — the sessions with privacy mode ON: `session hex → controller
+    /// display name`. While any is, the curtain covers every monitor.
+    privacy: HashMap<String, String>,
+    /// FR-99 — the pump's last word on the curtain: `Some(true)` up and
+    /// verified out of capture, `Some(false)` it could not be (creation or
+    /// the capture exclusion failed), `None` down or not decided yet.
+    curtain: Option<bool>,
 }
+
+// ── FR-99: the privacy curtain ─────────────────────────────────────────────
+//
+// One window over the whole virtual desktop, so every monitor is covered,
+// with the notice painted centred on each monitor. Layered and click-through
+// (`WS_EX_TRANSPARENT`): the controller's injected clicks must reach the
+// application beneath it, which also means it HIDES the screen and does not
+// stop a person at the keyboard (P2 is the input block). Kept out of every
+// capture path by `WDA_EXCLUDEFROMCAPTURE`, set before the window is shown and
+// read back afterwards: a curtain the capture could see would hide the desktop
+// from the controller too, so an affinity that does not read back is a refusal.
+
+/// How long `set_privacy` waits for the pump to put the curtain up and answer.
+const CURTAIN_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Every this many pump ticks (120 ms each) the curtain re-takes the top of
+/// the z-order, refits the virtual desktop, and puts the person's own controls
+/// back above it.
+const CURTAIN_RAISE_EVERY: u32 = 4;
+/// Slate (0x1E293B). COLORREF is 0x00BBGGRR.
+const CURTAIN_RGB: u32 = 0x003B291E;
 
 #[derive(Clone)]
 pub(super) struct Inner {
@@ -214,6 +244,13 @@ struct PumpState {
     /// the panel eight times a second to redraw the same number is flicker for
     /// nothing, so the countdown only invalidates when the digit changes.
     consent_secs_shown: u64,
+    // FR-99 — the privacy curtain. Created when the first session turns
+    // privacy on and destroyed when the last turns it off; null otherwise.
+    hinstance: HMODULE,
+    curtain_hwnd: HWND,
+    /// The virtual desktop the curtain was last fitted to.
+    curtain_rect: RECT,
+    curtain_ticks: u32,
 }
 
 impl Inner {
@@ -290,8 +327,61 @@ impl Inner {
             let mut s = self.state.lock().unwrap();
             s.sessions.remove(&session_id);
             s.recording.remove(&session_id);
+            // FR-99 — a session's end always takes its curtain down, whatever
+            // its privacy channel managed to say first.
+            s.privacy.remove(&session_id);
         }
         self.post_redraw();
+    }
+
+    /// FR-99 — turn `session_id`'s privacy curtain on or off. `true` only when
+    /// the curtain is UP and verified out of capture. Off answers `false`.
+    ///
+    /// Blocks until the pump has answered (at most [`CURTAIN_ANSWER_WAIT`]):
+    /// the window, its layering and its capture exclusion are the pump
+    /// thread's to create, and the caller must not be told "up" before they
+    /// exist. No answer in time counts as no curtain.
+    pub(super) fn set_privacy(&self, session_id: &str, on: bool, controller_name: &str) -> bool {
+        if !on {
+            self.state.lock().unwrap().privacy.remove(session_id);
+            self.post_redraw();
+            return false;
+        }
+        {
+            let mut s = self.state.lock().unwrap();
+            // No curtain for a session the overlay does not carry: its end
+            // would never reach `hide`, and nothing would take it down.
+            if !s.sessions.contains_key(session_id) {
+                return false;
+            }
+            // A fresh decision when no curtain is up or pending; one already
+            // up covers this session too.
+            if s.privacy.is_empty() {
+                s.curtain = None;
+            }
+            s.privacy
+                .insert(session_id.to_string(), controller_name.to_string());
+        }
+        if self.hwnd.lock().unwrap().is_none() {
+            self.state.lock().unwrap().privacy.remove(session_id);
+            return false;
+        }
+        self.post_redraw();
+        let deadline = Instant::now() + CURTAIN_ANSWER_WAIT;
+        loop {
+            let answer = self.state.lock().unwrap().curtain;
+            match answer {
+                Some(true) => return true,
+                Some(false) => break,
+                None if Instant::now() >= deadline => break,
+                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        // Refused, or no answer in time: take this session back out, so
+        // nothing claims or keeps a curtain that may not be there.
+        self.state.lock().unwrap().privacy.remove(session_id);
+        self.post_redraw();
+        false
     }
 
     /// FR-85 P3 — mark a session as recording (or not). `true` when the badge
@@ -451,6 +541,30 @@ fn run_pump(
             }
         }
 
+        // FR-99 — the privacy curtain's class. No background brush: WM_PAINT
+        // fills every pixel, so erasing first would only flicker. A failure
+        // here costs privacy mode alone (every "on" then answers `no_curtain`),
+        // never the overlay that tells the person they are being watched.
+        let curtain_wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(curtain_wnd_proc),
+            hInstance: hinstance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hbrBackground: HBRUSH::default(),
+            lpszClassName: CURTAIN_CLASS,
+            ..Default::default()
+        };
+        if RegisterClassExW(&curtain_wc) == 0 {
+            let err = windows::Win32::Foundation::GetLastError();
+            if err.0 != 1410 {
+                tracing::warn!(
+                    ?err,
+                    "privacy: RegisterClassExW(curtain) failed; no curtain"
+                );
+            }
+        }
+
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
 
@@ -537,6 +651,10 @@ fn run_pump(
             consent_tx,
             consent_visible: false,
             consent_secs_shown: u64::MAX,
+            hinstance,
+            curtain_hwnd: HWND::default(),
+            curtain_rect: RECT::default(),
+            curtain_ticks: 0,
         });
         let pump_ptr_val = Box::into_raw(pump) as isize;
         SetWindowLongPtrW(border_hwnd, GWLP_USERDATA, pump_ptr_val);
@@ -556,6 +674,10 @@ fn run_pump(
 
         // Clean up.
         let _ = KillTimer(border_hwnd, TIMER_ID);
+        // FR-99 — a curtain still up goes with the pump.
+        if pump_ptr_val != 0 {
+            destroy_curtain(pump_ptr_val as *mut PumpState);
+        }
         let _ = DestroyWindow(consent_hwnd);
         let _ = DestroyWindow(badge_hwnd);
         let _ = DestroyWindow(border_hwnd);
@@ -889,6 +1011,310 @@ unsafe fn paint_consent(hwnd: HWND) {
 }
 
 // ---------------------------------------------------------------------------
+// FR-99 — the privacy curtain.
+
+const CURTAIN_CLASS: windows::core::PCWSTR = w!("RoomlerPrivacyCurtainWClass");
+
+/// The whole virtual desktop: every monitor, in physical pixels.
+unsafe fn virtual_screen() -> RECT {
+    unsafe {
+        let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        RECT {
+            left: x,
+            top: y,
+            right: x + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            bottom: y + GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        }
+    }
+}
+
+/// Create the curtain over the virtual desktop. Its capture exclusion is set
+/// BEFORE it is shown, so no captured frame ever holds it, and read back
+/// after: on a build that does not know `WDA_EXCLUDEFROMCAPTURE`, or when the
+/// call fails, the capture would see the curtain and the controller would
+/// lose the desktop. `Err` destroys whatever was made.
+unsafe fn create_curtain(p: *mut PumpState) -> Result<HWND> {
+    unsafe {
+        let r = virtual_screen();
+        let hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            CURTAIN_CLASS,
+            w!("Roomler privacy curtain"),
+            WS_POPUP,
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            HWND::default(),
+            HMENU::default(),
+            (*p).hinstance,
+            None,
+        )
+        .context("CreateWindowExW(curtain)")?;
+        // A layered window stays invisible until it is given attributes.
+        if let Err(e) = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA) {
+            let _ = DestroyWindow(hwnd);
+            return Err(anyhow!("SetLayeredWindowAttributes(curtain): {e}"));
+        }
+        let set = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        let mut got = 0u32;
+        let read = GetWindowDisplayAffinity(hwnd, &mut got);
+        if set.is_err() || read.is_err() || got != WDA_EXCLUDEFROMCAPTURE.0 {
+            let _ = DestroyWindow(hwnd);
+            return Err(anyhow!(
+                "the curtain's capture exclusion did not hold (set: {set:?}, read: {read:?}, \
+                 affinity: {got:#x})"
+            ));
+        }
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, p as isize);
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        Ok(hwnd)
+    }
+}
+
+/// Take the curtain down, if it is up, and clear the pump's answer.
+unsafe fn destroy_curtain(p: *mut PumpState) {
+    unsafe {
+        if !(*p).curtain_hwnd.is_invalid() {
+            let _ = DestroyWindow((*p).curtain_hwnd);
+            (*p).curtain_hwnd = HWND::default();
+            tracing::info!("privacy: curtain down");
+        }
+        (*p).shared.lock().unwrap().curtain = None;
+    }
+}
+
+/// Refit the curtain when the virtual desktop changed (a monitor plugged in,
+/// a resolution change).
+unsafe fn fit_curtain(p: *mut PumpState) {
+    unsafe {
+        let r = virtual_screen();
+        let c = (*p).curtain_rect;
+        if (r.left, r.top, r.right, r.bottom) != (c.left, c.top, c.right, c.bottom) {
+            let _ = SetWindowPos(
+                (*p).curtain_hwnd,
+                HWND_TOPMOST,
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                SWP_NOACTIVATE,
+            );
+            (*p).curtain_rect = r;
+            let _ = InvalidateRect((*p).curtain_hwnd, None, true);
+        }
+    }
+}
+
+/// The curtain on top of every other topmost window, then the person's own
+/// controls back above it: the badge's Disconnect is their way out while the
+/// curtain is up, and a consent question must never sit behind it.
+unsafe fn raise_curtain_chain(p: *mut PumpState, border: HWND) {
+    unsafe {
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+        let _ = SetWindowPos((*p).curtain_hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        let _ = SetWindowPos(border, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        if (*p).badge_visible {
+            let _ = SetWindowPos((*p).badge_hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        }
+        if (*p).consent_visible {
+            let _ = SetWindowPos((*p).consent_hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        }
+    }
+}
+
+/// Bring the curtain in line with `State.privacy`: up while any session has
+/// privacy on, down otherwise, and the answer recorded for `set_privacy`.
+/// Idempotent; the redraw message and the timer both call it. `repaint` when
+/// the names on it may have changed.
+unsafe fn sync_curtain(p: *mut PumpState, border: HWND, repaint: bool) {
+    unsafe {
+        let (want, answer) = {
+            let s = (*p).shared.lock().unwrap();
+            (!s.privacy.is_empty(), s.curtain)
+        };
+        let up = !(*p).curtain_hwnd.is_invalid();
+        if want && !up {
+            // Refused already: the requester takes its session back out.
+            if answer == Some(false) {
+                return;
+            }
+            let ok = match create_curtain(p) {
+                Ok(h) => {
+                    (*p).curtain_hwnd = h;
+                    (*p).curtain_rect = virtual_screen();
+                    (*p).curtain_ticks = 0;
+                    raise_curtain_chain(p, border);
+                    tracing::info!("privacy: curtain up, out of capture");
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "privacy: no curtain");
+                    false
+                }
+            };
+            (*p).shared.lock().unwrap().curtain = Some(ok);
+        } else if !want && up {
+            destroy_curtain(p);
+        } else if want && up {
+            (*p).curtain_ticks = (*p).curtain_ticks.wrapping_add(1);
+            if (*p).curtain_ticks.is_multiple_of(CURTAIN_RAISE_EVERY) {
+                fit_curtain(p);
+                raise_curtain_chain(p, border);
+            }
+            if repaint {
+                let _ = InvalidateRect((*p).curtain_hwnd, None, true);
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn curtain_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_PAINT => {
+                paint_curtain(hwnd);
+                LRESULT(0)
+            }
+            // WM_PAINT fills every pixel; erasing first would only flicker.
+            WM_ERASEBKGND => LRESULT(1),
+            WM_DISPLAYCHANGE => {
+                let p = pump_ptr(hwnd);
+                if !p.is_null() {
+                    fit_curtain(p);
+                }
+                LRESULT(0)
+            }
+            // ⚠️ No WM_DESTROY arm: the border's posts the pump's quit, and
+            // the curtain is destroyed every time privacy mode goes off.
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+/// Collects each monitor's rectangle, in virtual-desktop coordinates.
+unsafe extern "system" fn collect_monitor(
+    _monitor: HMONITOR,
+    _hdc: HDC,
+    rect: *mut RECT,
+    data: LPARAM,
+) -> BOOL {
+    unsafe {
+        let monitors = &mut *(data.0 as *mut Vec<RECT>);
+        monitors.push(*rect);
+        TRUE
+    }
+}
+
+/// The curtain: slate everywhere, and the notice centred on every monitor.
+/// Monitors are enumerated WITHOUT the paint DC, whose clip would shrink each
+/// rectangle to the update region and move the text on a partial repaint.
+unsafe fn paint_curtain(hwnd: HWND) {
+    unsafe {
+        let mut ps = PAINTSTRUCT::default();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        if hdc.is_invalid() {
+            return;
+        }
+        let mut client = RECT::default();
+        let _ = GetClientRect(hwnd, &mut client);
+        let bg = CreateSolidBrush(COLORREF(CURTAIN_RGB));
+        FillRect(hdc, &client, bg);
+        let _ = DeleteObject(HGDIOBJ(bg.0));
+
+        let p = pump_ptr(hwnd);
+        let by = if p.is_null() {
+            String::new()
+        } else {
+            let s = (*p).shared.lock().unwrap();
+            let mut names: Vec<&str> = s.privacy.values().map(String::as_str).collect();
+            names.sort_unstable();
+            names.dedup();
+            names.join(", ")
+        };
+
+        let mut monitors: Vec<RECT> = Vec::new();
+        let _ = EnumDisplayMonitors(
+            HDC::default(),
+            None,
+            Some(collect_monitor),
+            LPARAM(&mut monitors as *mut Vec<RECT> as isize),
+        );
+        let mut origin = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut origin);
+        for m in monitors {
+            let r = RECT {
+                left: m.left - origin.left,
+                top: m.top - origin.top,
+                right: m.right - origin.left,
+                bottom: m.bottom - origin.top,
+            };
+            paint_notice(hdc, r, &by);
+        }
+        let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+/// One monitor's notice, centred in `r` (window coordinates).
+unsafe fn paint_notice(hdc: HDC, r: RECT, by: &str) {
+    unsafe {
+        let mid = (r.top + r.bottom) / 2;
+        let row = |top: i32, height: i32| RECT {
+            left: r.left + 40,
+            top,
+            right: r.right - 40,
+            bottom: top + height,
+        };
+        let centred = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
+        draw_text(
+            hdc,
+            "This computer is being used remotely",
+            row(mid - 96, 48),
+            -36,
+            FW_BOLD.0 as i32,
+            TEXT_RGB,
+            centred,
+        );
+        if !by.is_empty() {
+            draw_text(
+                hdc,
+                &format!("by {by}"),
+                row(mid - 42, 34),
+                -24,
+                FW_NORMAL.0 as i32,
+                TEXT_RGB,
+                centred,
+            );
+        }
+        draw_text(
+            hdc,
+            "Privacy mode is on: the screen is hidden while they work.",
+            row(mid + 10, 28),
+            -18,
+            FW_NORMAL.0 as i32,
+            LABEL_RGB,
+            centred,
+        );
+        draw_text(
+            hdc,
+            "To end the session, move the pointer to the top edge of the screen and choose \
+             Disconnect.",
+            row(mid + 42, 28),
+            -18,
+            FW_NORMAL.0 as i32,
+            LABEL_RGB,
+            centred,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Border window proc: paints the thin frame + drives the reveal timer.
 
 unsafe extern "system" fn border_wnd_proc(
@@ -909,6 +1335,9 @@ unsafe extern "system" fn border_wnd_proc(
                 // a session, so gating it on the latter would hide it exactly
                 // when it is needed.
                 sync_consent(p);
+                // FR-99 — the curtain follows `State.privacy`, and the names on
+                // it may have changed.
+                sync_curtain(p, hwnd, true);
                 if has_session(p) {
                     let _ = SetWindowPos(
                         hwnd,
@@ -941,6 +1370,9 @@ unsafe extern "system" fn border_wnd_proc(
                 // FR-27 — keep the panel's countdown honest. Cheap: it
                 // repaints only when the whole second changes.
                 tick_consent_countdown(p);
+                // FR-99 — before the early returns below: a curtain is kept on
+                // top and fitted to the desktop while anything records too.
+                sync_curtain(p, hwnd, false);
                 if !has_session(p) {
                     if (*p).badge_visible {
                         hide_badge(p);

@@ -688,6 +688,16 @@ jobs:
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test control_dc_record
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test export
 
+      - name: The privacy channel (FR-99 P1b) — the production handler over a loopback pair
+        # The `privacy` DataChannel's handlers as `peer.rs` routes them, with a
+        # recorder standing in for the overlay: each gate refuses by name
+        # before the overlay is asked, on/off/status, the owner's OFF taking a
+        # curtain down unasked, and the session's end doing the same.
+        # ⚠️ Named explicitly: a `tests/*.rs` file nobody names runs in no
+        # lane. It needs no feature; it is built with the step above's so it
+        # reuses that build instead of compiling the agent a third time.
+        run: cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test privacy_dc
+
       - name: L0 latency harness (FR-16) — capture → decode on one clock, over a vnet
         # FR-16 L0. The production AgentPeer and media pump on the synthetic
         # source and openh264, a webrtc-rs controller decoding the RTP track,
@@ -1222,6 +1232,18 @@ jobs:
         # as a mapping, and then this whole file fails to parse.
         run: |
           cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive -- hive:: hive_win win_service::supervisor win_service::tests
+
+      # FR-99 P1b — the overlay behind `viewer-indicator`: the "being viewed"
+      # border and badge, the native consent panel, and the privacy curtain
+      # (its capture exclusion set before it shows and read back after). It
+      # is `#[cfg(windows)]` AND behind that feature, so no PR lane compiled
+      # it: a mistake there surfaced at TAG time. `privacy::` runs too, because
+      # only this build has a curtain that can be possible.
+      - name: The overlay and the privacy curtain — clippy + unit tests (FR-99 P1b)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy -p roomlerd --lib --features viewer-indicator -- -D warnings
+          cargo test -p roomlerd --lib --features viewer-indicator -- privacy:: indicator::
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.

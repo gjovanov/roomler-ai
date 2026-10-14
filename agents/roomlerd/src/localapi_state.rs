@@ -1176,6 +1176,11 @@ impl LocalApiState for DaemonState {
                 // keep-busy in progress and refuses a new one, and the cap
                 // word follows on the next heartbeat.
                 crate::keep_busy::set_device_enabled(cfg.keep_busy_enabled);
+                // FR-99 P1b — and privacy mode's: off takes every curtain that
+                // is up down (the viewer is told why), and `privacy-mode`
+                // leaves the caps on the next heartbeat. The console gate on
+                // the key has already run.
+                crate::privacy::set_device_allowed(cfg.privacy_mode_allowed);
                 // The surface says per key whether that re-seed made the
                 // change live (FR-84 D2) — log the same truth the client
                 // shows, never a blanket "on restart".

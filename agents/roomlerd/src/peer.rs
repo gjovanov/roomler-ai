@@ -241,6 +241,10 @@ pub struct AgentPeer {
     /// is answered, so it is in place before any channel can open.
     #[cfg(feature = "recording")]
     record_ctx: Arc<std::sync::OnceLock<crate::recording::remote::SessionCtx>>,
+    /// FR-99 P1b — what this session's `privacy` DataChannel needs (who is
+    /// connected, and the overlay that draws the curtain). Set once by
+    /// [`Self::set_privacy_ctx`] before the offer is answered.
+    privacy_ctx: Arc<std::sync::OnceLock<crate::privacy::PrivacyCtx>>,
     /// Fires when this session ends: [`Self::close`] or the drop, whichever
     /// comes first. The DataChannel handlers that hold something past their
     /// channel (the cursor poller, the clipboard watch, an upload's open
@@ -1081,6 +1085,9 @@ impl AgentPeer {
             Arc::new(std::sync::OnceLock::new());
         #[cfg(feature = "recording")]
         let record_ctx_for_callback = record_ctx.clone();
+        let privacy_ctx: Arc<std::sync::OnceLock<crate::privacy::PrivacyCtx>> =
+            Arc::new(std::sync::OnceLock::new());
+        let privacy_ctx_for_callback = privacy_ctx.clone();
         let session_end_for_callback = session_end.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
@@ -1098,6 +1105,7 @@ impl AgentPeer {
             let lock_state_rx_for_input = lock_state_rx_for_dc.clone();
             #[cfg(feature = "recording")]
             let record_ctx = record_ctx_for_callback.clone();
+            let privacy_ctx = privacy_ctx_for_callback.clone();
             let session_end = session_end_for_callback.clone();
             Box::pin(async move {
                 use roomler_ai_remote_control::permissions::Permissions;
@@ -1191,6 +1199,18 @@ impl AgentPeer {
                         None => {
                             crate::recording::remote::attach_refusing(dc, session_id, "unavailable")
                         }
+                    },
+                    // FR-99 P1b — the same attach-time gate for PRIVACY: the
+                    // hub grants it only to a device that advertises
+                    // `privacy-mode`, and a grant without it gets a channel
+                    // that refuses, never one that draws a curtain. The owner's
+                    // own gate is read again at every "on" (`privacy.rs`).
+                    "privacy" if !permissions.contains(Permissions::PRIVACY) => {
+                        crate::privacy::attach_refusing(dc, session_id, "not_granted")
+                    }
+                    "privacy" => match privacy_ctx.get() {
+                        Some(ctx) => crate::privacy::attach(dc, ctx.clone()),
+                        None => crate::privacy::attach_refusing(dc, session_id, "unavailable"),
                     },
                     "video-bytes" => {
                         // Phase Y.3 stash. The media pump (when caps
@@ -1388,6 +1408,7 @@ impl AgentPeer {
             viewer_report: viewer_report.clone(),
             #[cfg(feature = "recording")]
             record_ctx,
+            privacy_ctx,
             session_end: {
                 construction_guard.disarm();
                 session_end
@@ -1402,6 +1423,13 @@ impl AgentPeer {
     #[cfg(feature = "recording")]
     pub fn set_record_ctx(&self, ctx: crate::recording::remote::SessionCtx) {
         let _ = self.record_ctx.set(ctx);
+    }
+
+    /// FR-99 P1b — give this session's `privacy` channel what it needs. Call
+    /// before [`Self::handle_offer`]; a channel that opens without it refuses
+    /// every request as `unavailable`.
+    pub fn set_privacy_ctx(&self, ctx: crate::privacy::PrivacyCtx) {
+        let _ = self.privacy_ctx.set(ctx);
     }
 
     /// Wave 2 — a telemetry sample for `rc:session.stats`.
