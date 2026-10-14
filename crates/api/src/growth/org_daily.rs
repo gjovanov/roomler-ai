@@ -115,6 +115,7 @@ fn slot(fold: &mut Fold, tenant: ObjectId, day: NaiveDate) -> &mut Accum {
 /// minutes on every day it overlaps (a session spanning midnight is
 /// split), its count, controller and value on the day it STARTED. `ended`
 /// is `None` for a session still open (clamped at `now`).
+#[allow(clippy::too_many_arguments)]
 pub fn fold_rc_session(
     fold: &mut Fold,
     from: NaiveDate,
