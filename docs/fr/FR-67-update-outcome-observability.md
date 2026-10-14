@@ -44,7 +44,7 @@ nothing being waited *for*: the install finished before the watcher existed. The
 **2. The cgroup teardown then removes any chance of finishing.** Both packaged
 units ship with no `KillMode` (`packaging/linux/roomlerd.service`,
 `roomler.service`) ⇒ systemd's default `control-group`. `spawn_watcher` launches
-the watcher as a plain child (`updater.rs:2547`) on the reasoning that it "is
+the watcher as a plain child (`updater.rs:2563`) on the reasoning that it "is
 reparented to init and runs to completion on its own" — but reparenting to PID 1
 does not leave the cgroup. `docs/fr/FR-36-wayland-capture.md:371` already recorded
 this exact lesson for a different subsystem.

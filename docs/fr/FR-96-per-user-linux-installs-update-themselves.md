@@ -76,9 +76,9 @@ sequenceDiagram
 | download and verify: size floor, digest, the pinned release key | reused | `download_asset` `:1269-1432`, PGP `:1358-1393` |
 | the install-storm cooldown (root's own marker) | reused | `recent_update_attempt` / `record_update_attempt` `:424-457`, `STARTUP_UPDATE_COOLDOWN` `:71` |
 | the install, as root | reused | `linux_install_candidates(0, …)` `:2009-2023`; `install_tarball_linux(0, …)` `:2075-2198` |
-| the opt-out, `/etc/roomler/disable-auto-update` | reused | the helper's `OPT_OUT` `:3364-3371` (shared by macOS and Linux) |
-| the wake file: content ignored, never followed through a symlink | generalised | `MACOS_UPDATE_TRIGGER` `:3001`, `LINUX_UPDATE_TRIGGER` `:3006`, `queue_update_check` / `queue_update_check_at` `:3099-3118` (was `macos_queue_update_check`) |
-| `roomlerd update-helper` on Linux | new (P1) | the `Command::UpdateHelper` arm, macOS and Linux (`main.rs:1556-1571`) |
+| the opt-out, `/etc/roomler/disable-auto-update` | reused | the helper's `OPT_OUT` `:3380-3387` (shared by macOS and Linux) |
+| the wake file: content ignored, never followed through a symlink | generalised | `MACOS_UPDATE_TRIGGER` `:3017`, `LINUX_UPDATE_TRIGGER` `:3022`, `queue_update_check` / `queue_update_check_at` `:3115-3134` (was `macos_queue_update_check`) |
+| `roomlerd update-helper` on Linux | new (P1) | the `Command::UpdateHelper` arm, macOS and Linux (`main.rs:1563-1578`) |
 | `roomler-update.{service,timer,path}` | new (P1) | shipped in the `.deb` (`agents/roomlerd/Cargo.toml` assets `:848-887`) and the tarball (`scripts/stage-linux-tarball.sh:55-58`, `TARBALL_INSTALL_IF_ABSENT` `updater.rs:2052-2062`) |
 | the download's private staging dir (mkdtemp, 0755, `O_EXCL` write) — the security review's finding 1 | new | `stage_dir` / `write_installer` / `discard_staging` (`updater.rs`) |
 | the run-spacing gate — launchd's `ThrottleInterval` twin, the security review's finding 2 | new | `UPDATE_HELPER_MIN_GAP` / `helper_gate_wait` / `stamp_helper_gate` (`updater.rs`) |
@@ -101,9 +101,9 @@ pinned by `watchdog.rs:932-960`), so the units ship disabled.
 
 ### 3.2 The per-user daemon wakes the helper instead of installing (P2a, as built)
 
-`run_periodic` forks once, at the daemon's start (`updater.rs:2776-2810`). macOS takes `forward_triggers` (the
-shared successor of `macos_forward_triggers`, `:3130-3212`) as before. Linux asks a pure
-`decide_update_owner(euid, kill switch, enable link)` (`:3071-3089`):
+`run_periodic` forks once, at the daemon's start (`updater.rs:2792-2826`). macOS takes `forward_triggers` (the
+shared successor of `macos_forward_triggers`, `:3146-3228`) as before. Linux asks a pure
+`decide_update_owner(euid, kill switch, enable link)` (`:3087-3105`):
 
 | daemon | `ROOMLERD_UPDATE_HELPER` | helper enabled | owner |
 |---|---|---|---|
@@ -114,7 +114,7 @@ shared successor of `macos_forward_triggers`, `:3130-3212`) as before. Linux ask
 | per-user | unset / on | **yes** | **the helper**: forward each push to the wake file, install nothing, run no periodic check |
 
 - **"Enabled"** is the `.wants` link `systemctl enable` (or `enable --runtime`) leaves for either unit, under
-  `/etc` or `/run` (`UPDATE_HELPER_ENABLE_LINKS`, `:3025-3030`), FOLLOWED: a link left dangling by a removed
+  `/etc` or `/run` (`UPDATE_HELPER_ENABLE_LINKS`, `:3041-3046`), FOLLOWED: a link left dangling by a removed
   package is not an enabled helper. A file check, not `systemctl is-enabled` — no bus, no child, and it reads the
   same inside the per-user unit's sandbox.
 - ⚠️ **On doubt, in-process.** A wrong "helper" answer freezes the host (it forwards wakes nobody hears — #2046
@@ -166,7 +166,7 @@ After a successful install, the helper asks every per-user daemon on the host to
   old release, the downgrade class `artifact_version` closed on Windows. The macOS rule carries over as-is.
 - **Install for a system install.** That host has one owner already.
 - **Restart a daemon mid-session.**
-- **Run as non-root.** It refuses, as macOS's helper does (`updater.rs:3280-3287`).
+- **Run as non-root.** It refuses, as macOS's helper does (`updater.rs:3296-3303`).
 - **Stage a download at a fixed or shared name** (security review, finding 1). `/tmp` is sticky but a
   *subdirectory* of it is not, so the old fixed `/tmp/roomlerd-update/<asset>` let any local user own the
   directory, wait for root's verified `.deb` to land, and `rename` an attacker package over it in the window
@@ -192,7 +192,7 @@ After a successful install, the helper asks every per-user daemon on the host to
 | **P1** | `roomlerd update-helper` on Linux, and the three units in the `.deb` and the tarball | the opt-out marker; the units disabled | the lab: the KDE per-user (tarball) and GNOME per-user (`.deb`) guests, red first on the release | M |
 | **P2a** | the per-user daemon wakes the helper instead of installing (§3.2), and its unit may write the wake file | `ROOMLERD_UPDATE_HELPER=0` | the lab: the KDE per-user guest, a real push → the helper's install (§8) | S |
 | **P2b** | the daemon onto the new binary after an install (§3.3, D1, D2) | `ROOMLERD_UPDATE_HELPER=0` | the lab, with a live session across the install | M |
-| **P3** | the installers: `install.sh` enables the units for a per-user install; a non-root `roomler self-update` wakes the helper (it bails today, `main.rs:4951-4981`) | — | the lab, a fresh install of each format | S |
+| **P3** | the installers: `install.sh` enables the units for a per-user install; a non-root `roomler self-update` wakes the helper (it bails today, `main.rs:5015-5045`) | — | the lab, a fresh install of each format | S |
 | **P4** | docs: `docs/linux-self-update.md` (status, the ladder claim, the helper), `docs/installation.md` (a Linux row beside the macOS three-unit table, `:297-301`, and `:497`), `README.Debian`, the `docs/README.md` index row | — | — | S |
 
 Each phase ships in an agent release (the `ship-it` skill owns the mechanics) and is field-verified before the
