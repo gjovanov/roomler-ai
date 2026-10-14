@@ -46,8 +46,8 @@ use roomler_ai_remote_control::{audit::AuditSink, models::AgentStatus};
 use roomler_ai_services::dao::{
     agent::AgentDao, agent_crash::AgentCrashDao, agent_log::AgentLogDao,
     config_audit::ConfigAuditDao, consent_request::ConsentRequestDao,
-    enrollment_key::EnrollmentKeyDao, exec_audit::ExecAuditDao, exec_pending::ExecPendingDao,
-    keep_busy_event::KeepBusyEventDao,
+    enroll_token_issued::EnrollTokenIssuedDao, enrollment_key::EnrollmentKeyDao,
+    exec_audit::ExecAuditDao, exec_pending::ExecPendingDao, keep_busy_event::KeepBusyEventDao,
 };
 use roomler_core::{Capabilities, Core, Module, TenantCtx, rate_limit::RateLimiter};
 use tokio::sync::mpsc;
@@ -65,6 +65,7 @@ pub mod ctrl;
 pub mod enroll_key;
 pub mod exec_service;
 pub mod hub;
+pub mod install_trace;
 pub mod keep_busy;
 pub mod nudge;
 pub mod presence;
@@ -85,6 +86,10 @@ pub struct FleetState {
     pub agents: Arc<AgentDao>,
     /// FR-51 P2 — reusable ephemeral enrollment keys + their per-use audit.
     pub enrollment_keys: Arc<EnrollmentKeyDao>,
+    /// FR-102 P3 — one row per standard enrollment token minted, by jti,
+    /// marked when it is redeemed: "tokens issued → redeemed" in the digest.
+    /// An id ledger; the token itself is never stored.
+    pub enroll_tokens: Arc<EnrollTokenIssuedDao>,
     pub agent_crashes: Arc<AgentCrashDao>,
     pub agent_logs: Arc<AgentLogDao>,
     /// Phase 4 — owner-side consent requests (email/push approve-link tokens).
@@ -199,6 +204,7 @@ impl Module for FleetState {
         let state = Self {
             agents,
             enrollment_keys,
+            enroll_tokens: Arc::new(EnrollTokenIssuedDao::new(db)),
             agent_crashes: Arc::new(AgentCrashDao::new(db)),
             agent_logs: Arc::new(AgentLogDao::new(db)),
             consent_requests,
@@ -430,9 +436,10 @@ impl Module for FleetState {
             .with_state(self.clone())
     }
 
-    /// The ten collections this module owns. The first eight specs are the
+    /// The eleven collections this module owns. The first eight specs are the
     /// ones the db crate's plan held before P5a, unchanged; `keep_busy_events`
-    /// (FR-92 P7) and `exec_pending` (FR-94) were born here.
+    /// (FR-92 P7), `exec_pending` (FR-94) and `enroll_token_issued` (FR-102
+    /// P3) were born here.
     fn indexes(&self) -> Vec<IndexSet> {
         vec![
             IndexSet {
@@ -479,6 +486,21 @@ impl Module for FleetState {
                 indexes: vec![
                     index(bson::doc! { "tenant_id": 1, "key_id": 1, "created_at": -1 }),
                     index_ttl(bson::doc! { "created_at": 1 }, 90 * 24 * 60 * 60),
+                ],
+            },
+            // FR-102 P3 — one row per standard enrollment token minted, `_id`
+            // the jti, marked at redemption. The digest reads a day range
+            // over `issued_at` with an exclusion filter on `tenant_id`; 90
+            // days like the other enrollment trails (spec §3p).
+            IndexSet {
+                collection: roomler_ai_services::dao::enroll_token_issued::ENROLL_TOKEN_ISSUED,
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index(bson::doc! { "issued_at": 1, "tenant_id": 1 }),
+                    index_ttl(
+                        bson::doc! { "issued_at": 1 },
+                        roomler_ai_services::dao::enroll_token_issued::ENROLL_TOKEN_ISSUED_TTL_SECS,
+                    ),
                 ],
             },
             IndexSet {

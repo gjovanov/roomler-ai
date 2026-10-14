@@ -103,6 +103,7 @@ async fn enrol(
         enrollment_token: et["enrollment_token"].as_str().unwrap(),
         machine_id,
         machine_name: "Exec test host",
+        install: None,
     })
     .await
     .expect("agent enrollment")

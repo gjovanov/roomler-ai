@@ -114,6 +114,18 @@ enum Command {
         /// something privileged enough to bring up a TUN.
         #[arg(long)]
         overlay: bool,
+        /// FR-102 — how this daemon was installed, for the server's install
+        /// trace: one of `wizard`, `script-sh`, `script-ps1`, `msi`, `deb`,
+        /// `pkg`, `manual`, `container`, `other`. Falls back to the
+        /// `ROOMLER_INSTALL_METHOD` env var (what the served install scripts
+        /// set), then to `manual` — a person typed this command.
+        #[arg(long, value_name = "METHOD")]
+        install_method: Option<String>,
+        /// FR-102 — what the install runs as: `system`, `per-user`,
+        /// `attended` or `unknown`. Falls back to `ROOMLER_INSTALL_SCOPE`,
+        /// then to `unknown`.
+        #[arg(long, value_name = "SCOPE")]
+        install_scope: Option<String>,
     },
     /// Refresh this machine's agent token using a fresh enrollment JWT.
     /// Preserves `server_url` and `machine_name` from the existing
@@ -1451,6 +1463,8 @@ async fn daemon_main() -> Result<()> {
             replace,
             ephemeral,
             overlay,
+            install_method,
+            install_scope,
         } => {
             enroll_cmd(
                 &config_path,
@@ -1463,6 +1477,8 @@ async fn daemon_main() -> Result<()> {
                     replace,
                     ephemeral,
                     overlay,
+                    install_method: install_method.as_deref(),
+                    install_scope: install_scope.as_deref(),
                 },
             )
             .await
@@ -2235,6 +2251,10 @@ struct EnrollOptions<'a> {
     /// server's response (not this flag) decides what the CONFIG records.
     ephemeral: bool,
     overlay: bool,
+    /// FR-102 P3 — the install trace, flag-first; `None` falls back to the
+    /// env, then to `manual` / `unknown` (`enrollment::resolve_install`).
+    install_method: Option<&'a str>,
+    install_scope: Option<&'a str>,
 }
 
 async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
@@ -2247,7 +2267,12 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         replace,
         ephemeral,
         overlay,
+        install_method,
+        install_scope,
     } = opts;
+    // FR-102 P3 — resolved FIRST: a typo in the flag or the env must be
+    // seen before the single-use token is spent, not after.
+    let install = enrollment::resolve_install(install_method, install_scope)?;
     // rc.52: --machine-global retargets the write to
     // RETIRED-NAME-ANCHOR: the PRE-RENAME machine-global tree. `machine_global_dir()`
     // still resolves
@@ -2326,6 +2351,7 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         enrollment_token,
         machine_id: &machine_id,
         machine_name,
+        install: Some(install),
     })
     .await
     .context("enrollment failed")?;
@@ -2585,6 +2611,9 @@ async fn re_enroll_cmd(
         enrollment_token,
         machine_id: &machine_id,
         machine_name: &existing.machine_name,
+        // FR-102 P3 — a token refresh knows nothing about how the binary
+        // got here; sending nothing leaves the row's recorded install alone.
+        install: None,
     })
     .await
     .context("re-enrollment failed")?;

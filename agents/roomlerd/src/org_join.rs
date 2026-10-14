@@ -122,6 +122,10 @@ pub async fn join_org(
         enrollment_token,
         machine_id: &cfg.machine_id,
         machine_name: &cfg.machine_name,
+        // FR-102 P3 — a pushed join is a second org for a device that is
+        // already installed; the binary's own install trace is not known
+        // here, and the new row records `unknown` honestly.
+        install: None,
     })
     .await
     .context("exchanging the pushed enrollment token")?;

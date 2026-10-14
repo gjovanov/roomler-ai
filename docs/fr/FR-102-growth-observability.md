@@ -252,6 +252,14 @@ sequenceDiagram
    `system`, `per-user`, `attended`, `unknown`. The served scripts pass `--install-method`, the wizard sets
    it in-process (`agents/roomler-setup/src/orchestrator_agent.rs:488-494`), and a hand-typed
    `roomlerd enroll` is `manual`. Stored once on the agent row as `install`.
+   *(P3 as built: the scripts set `ROOMLER_INSTALL_METHOD` / `ROOMLER_INSTALL_SCOPE`, the flag's env
+   fallbacks, rather than the flag itself — a served script installs whatever release is current, and a
+   daemon from before the flag existed would refuse an argument it does not know, failing every scripted
+   install until the next agent release; an older daemon ignores the variables. The scope follows what
+   the script installs: `system` for `--system` and the macOS root half, `per-user` otherwise;
+   `install.ps1` maps `daemon-system` → `system`, `daemon-user` → `per-user`, `daemon-machine` →
+   `attended`, and the wizard maps its roles the same way. A re-enroll sends nothing and the row keeps
+   its recorded install.)*
 4. **First online** is `min(stats_events.ts)` with `presence = online` per agent. **First session** comes
    from `remote_sessions`.
 5. **Wizard diagnostics are opt-in** (D4, P3b). A checkbox on the Welcome page, **unticked by default**,

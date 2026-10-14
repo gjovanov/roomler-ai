@@ -20,10 +20,17 @@
 //!   yet (orgs are only archived, reversibly), so until one does the TTL
 //!   is what bounds the collection.
 //!
+//! * [`GROWTH_DAILY`] — the frozen daily totals (P3 onward): one row per
+//!   `(source, metric, dims, day)`, `_id` the four joined, `value` the
+//!   count. Written by whichever module owns the fact
+//!   ([`GrowthDao::bump_daily`] — fleet's fetch counters today), read by the
+//!   digest. A row carries dimensions and a number, never a person, a
+//!   User-Agent or an address.
+//!
 //! Stateless over `core.db`, so a caller re-creates it (`GrowthDao::new`)
 //! rather than threading a handle through `Core` (FR-69 rule 5).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
 use futures::TryStreamExt;
@@ -34,14 +41,47 @@ use super::base::DaoResult;
 
 pub const GROWTH_EXCLUSIONS: &str = "growth_exclusions";
 pub const GROWTH_ORG_DAILY: &str = "growth_org_daily";
-/// The frozen daily totals (spec §3o; written from P3 on). Named here only
-/// so a tenant purge can take its `dims.tenant` rows with the org.
+/// The frozen daily totals (spec §3o): written by P3's install trace and
+/// read by the digest; a tenant purge also takes an org's `dims.tenant`
+/// rows from here.
 pub const GROWTH_DAILY: &str = "growth_daily";
+
+/// P3 — the install trace's `(source, metric)`: written by the `fleet`
+/// module's fetch counters, read by the host's digest. Named here, in the
+/// crate both can see, because `fleet` is an optional dependency of the host
+/// and the digest must read the rows whether or not that module is compiled.
+pub const INSTALL_SOURCE: &str = "install";
+pub const INSTALL_FETCH_METRIC: &str = "fetch";
 
 /// The most org-days one read loads — far above this deployment's volume
 /// (every org active every day for 25 months is ~10 rows a day); a bound,
 /// not a page.
 pub const MAX_ORG_DAY_ROWS: i64 = 500_000;
+
+/// One `growth_daily` row as stored. `dims` is a flat map of short
+/// strings; `day` is the UTC day `YYYY-MM-DD`, a string so a range read is a
+/// plain string comparison.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GrowthDaily {
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub day: String,
+    pub source: String,
+    pub metric: String,
+    #[serde(default)]
+    pub dims: BTreeMap<String, String>,
+    #[serde(default)]
+    pub value: i64,
+}
+
+/// The `_id` of a daily row: `<source>:<metric>:<k=v,k=v>:<day>`, the
+/// dimensions in key order so two writers of the same fact share one row.
+/// A dimension VALUE is a short enum spelling by construction (a client
+/// class, an asset name, an OS), never free text.
+pub fn daily_id(source: &str, metric: &str, dims: &BTreeMap<String, String>, day: &str) -> String {
+    let dims: Vec<String> = dims.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    format!("{source}:{metric}:{}:{day}", dims.join(","))
+}
 
 /// One org's activity on one UTC day (spec §3d). Every counter is what
 /// happened THAT day: sessions and calls are counted on the day they
@@ -151,6 +191,79 @@ impl GrowthDao {
 
     fn exclusions(&self) -> Collection<GrowthExclusion> {
         self.db.collection::<GrowthExclusion>(GROWTH_EXCLUSIONS)
+    }
+
+    /// Add `by` to the `(source, metric, dims, day)` counter, creating the
+    /// row on first sight. One upsert, atomic per row, so N pods counting
+    /// the same fact never lose an increment to each other.
+    pub async fn bump_daily(
+        &self,
+        day: &str,
+        source: &str,
+        metric: &str,
+        dims: &BTreeMap<String, String>,
+        by: i64,
+    ) -> DaoResult<()> {
+        let id = daily_id(source, metric, dims, day);
+        let dims_doc: Document = dims
+            .iter()
+            .map(|(k, v)| (k.clone(), bson::Bson::String(v.clone())))
+            .collect();
+        self.db
+            .collection::<Document>(GROWTH_DAILY)
+            .update_one(
+                doc! { "_id": id },
+                doc! {
+                    "$inc": { "value": by },
+                    "$setOnInsert": {
+                        "day": day,
+                        "source": source,
+                        "metric": metric,
+                        "dims": dims_doc,
+                    },
+                },
+            )
+            .upsert(true)
+            .await?;
+        Ok(())
+    }
+
+    /// Every row of one `(source, metric)` with `from <= day <= to`
+    /// (inclusive, `YYYY-MM-DD` strings).
+    ///
+    /// Lenient per row: a row that does not have this shape (a hand-written
+    /// one, an older writer's) is skipped with a warning and costs its own
+    /// count, never the whole digest — one bad row must not take the daily
+    /// mail down.
+    pub async fn read_daily(
+        &self,
+        source: &str,
+        metric: &str,
+        from: &str,
+        to: &str,
+    ) -> DaoResult<Vec<GrowthDaily>> {
+        let docs: Vec<Document> = self
+            .db
+            .collection::<Document>(GROWTH_DAILY)
+            .find(doc! {
+                "source": source,
+                "metric": metric,
+                "day": { "$gte": from, "$lte": to },
+            })
+            .await?
+            .try_collect()
+            .await?;
+        let mut rows = Vec::with_capacity(docs.len());
+        for d in docs {
+            match bson::from_document::<GrowthDaily>(d) {
+                Ok(row) => rows.push(row),
+                Err(e) => tracing::warn!(
+                    source, metric, error = %e,
+                    "growth_daily: skipping a row that does not have the daily shape"
+                ),
+            }
+        }
+        Ok(rows)
     }
 
     /// Every explicit row, tenants first, then by id — a stable order for
@@ -402,6 +515,32 @@ mod tests {
         assert_eq!(back.kind, row.kind);
         assert_eq!(back.id, row.id);
         assert_eq!(back.reason, row.reason);
+    }
+
+    /// The daily row's `_id` is the fact itself, dimensions in key order:
+    /// two writers that disagree only on insertion order share one row.
+    #[test]
+    fn the_daily_id_is_canonical_over_dimension_order() {
+        let mut a = BTreeMap::new();
+        a.insert("os".to_string(), "windows".to_string());
+        a.insert("asset".to_string(), "install.ps1".to_string());
+        a.insert("client".to_string(), "script-ps1".to_string());
+        let mut b = BTreeMap::new();
+        b.insert("client".to_string(), "script-ps1".to_string());
+        b.insert("asset".to_string(), "install.ps1".to_string());
+        b.insert("os".to_string(), "windows".to_string());
+        assert_eq!(
+            daily_id("install", "fetch", &a, "2026-10-14"),
+            "install:fetch:asset=install.ps1,client=script-ps1,os=windows:2026-10-14"
+        );
+        assert_eq!(
+            daily_id("install", "fetch", &a, "2026-10-14"),
+            daily_id("install", "fetch", &b, "2026-10-14")
+        );
+        assert_eq!(
+            daily_id("x", "y", &BTreeMap::new(), "2026-01-01"),
+            "x:y::2026-01-01"
+        );
     }
 
     /// P2 — an org-day round-trips as a struct with the composite `_id`,
