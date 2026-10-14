@@ -50,8 +50,9 @@ use tracing::{debug, info, warn};
 use crate::remote_config::{RemoteConfigServices, TokenWrite};
 use crate::token_slot::TokenSlot;
 
-/// Renew once a token has less than this many days left.
-pub const DEFAULT_HORIZON_DAYS: u64 = 180;
+/// Renew once a token has less than this many days left: the tunnel client's
+/// constant, so the two can never drift apart.
+pub use roomler_cli::credential::DEFAULT_HORIZON_DAYS;
 /// How often a connected enrollment looks again.
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 /// After an attempt that failed for a reason that may pass (the server
@@ -128,20 +129,9 @@ pub fn due(token: &str, now_unix: i64, horizon: Option<Duration>) -> Due {
     let Some(expires_at) = view.expires_at_unix else {
         return Due::Unknown;
     };
-    let secs = |d: Duration| i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
-    let threshold = match horizon {
-        Some(exact) => secs(exact),
-        None => {
-            let default = secs(Duration::from_secs(DEFAULT_HORIZON_DAYS * 86_400));
-            match view.issued_at_unix {
-                Some(issued_at) if expires_at > issued_at => {
-                    default.min((expires_at - issued_at) / 2)
-                }
-                _ => default,
-            }
-        }
-    };
-    let renew_at = expires_at.saturating_sub(threshold);
+    // The ONE rule, shared with the tunnel client, so the daemon and the
+    // client never disagree about when a credential is due.
+    let renew_at = roomler_cli::credential::renew_at(expires_at, view.issued_at_unix, horizon);
     if now_unix >= renew_at {
         Due::Now { expires_at }
     } else {
