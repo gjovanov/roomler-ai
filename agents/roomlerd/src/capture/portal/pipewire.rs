@@ -1159,6 +1159,10 @@ pub struct StreamHandle {
     /// FR-93 P5c — the stream's `pw_stream_state` as its loop last reported
     /// it ([`PW_STREAM_STATE_STREAMING`] while frames can flow).
     pub state: Arc<std::sync::atomic::AtomicI32>,
+    /// FR-93 P5e — the frame that settled the format, for the caller to send
+    /// first. On a still desktop it can be the only one for a long while: the
+    /// compositors send frames on damage.
+    pub first: Option<(super::wire::FrameHeader, Vec<u8>)>,
 }
 
 /// Open a stream and keep it running, delivering frames until dropped.
@@ -1198,7 +1202,7 @@ pub fn stream(source: PwSource, node_id: u32, max_fps: u32) -> Result<StreamHand
     let deadline = std::time::Instant::now() + NEGOTIATE_TIMEOUT;
     let first = loop {
         match frames.recv_timeout(std::time::Duration::from_millis(200)) {
-            Ok((h, _bytes)) => break h,
+            Ok(frame) => break frame,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if let Ok(Some(e)) = err_rx.try_recv() {
                     return Err(e);
@@ -1218,19 +1222,24 @@ pub fn stream(source: PwSource, node_id: u32, max_fps: u32) -> Result<StreamHand
         }
     };
 
-    // That first frame is consumed to learn the format. Dropping one frame
-    // once is cheaper than any machinery to put it back, and the caller gets
-    // every frame after it.
+    // FR-93 P5e — that first frame settles the format, and is then handed to
+    // the caller too. It used to be dropped, on the belief that frames would
+    // keep coming. They don't: mutter and KWin send a frame when something on
+    // screen changes, so on a still desktop the first one can be the only one
+    // for minutes. Measured on GNOME 50: a session started on a still desktop
+    // showed nothing until the viewer's mouse moved.
+    let (video_format, width, height) = (first.0.video_format, first.0.width, first.0.height);
     Ok(StreamHandle {
         format: NegotiatedFormat {
-            video_format: first.video_format,
-            width: first.width,
-            height: first.height,
+            video_format,
+            width,
+            height,
             fps_num: 0,
             fps_denom: 1,
         },
         frames,
         state,
+        first: Some(first),
     })
 }
 
