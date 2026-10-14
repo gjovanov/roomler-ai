@@ -211,6 +211,10 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_asks_features(agent_id, caps.has_rpc(RpcCap::SessionPolicy));
+    // FR-101 P2b — and the device owner's own floor, so the hub can name it.
+    state
+        .rc_hub
+        .set_agent_device_session_policy(agent_id, caps.session_policy);
     state
         .rc_hub
         .set_agent_keep_busy_support(agent_id, supports_keep_busy);
@@ -697,6 +701,12 @@ pub async fn handle_agent_socket(
                                     state.rc_hub.set_agent_asks_features(
                                         agent_id,
                                         caps.has_rpc(RpcCap::SessionPolicy),
+                                    );
+                                    // FR-101 P2b — and its floor: a new
+                                    // `off` reaches the next grant at once.
+                                    state.rc_hub.set_agent_device_session_policy(
+                                        agent_id,
+                                        caps.session_policy,
                                     );
                                     // FR-94 — the SYSTEM service came up, was
                                     // anchored, or went away while this worker

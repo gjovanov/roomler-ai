@@ -1681,6 +1681,32 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-99 - let a remote controller turn on privacy mode during a session: a curtain covers this screen for the person in front of it, with a notice saying who is connected, while the controller still sees the desktop (default off). Windows 10 2004 and later. The curtain hides the screen; it does not stop someone at this keyboard. Off also takes a curtain that is up down. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
     },
     KeyMeta {
+        key: "rc_clipboard",
+        group: Group::RemoteDesktop,
+        tier: Tier::Standard,
+        // LIVE: read at every session start; the hub hears it on the next
+        // heartbeat.
+        live: true,
+        kind: "string",
+        description: "FR-101 - this device's own rule for the clipboard in a remote session: on (default) | ask (only when the person here approves the session, on a prompt that names it) | off. The stricter of this and the organization's policy wins, and the device applies it whatever the server sends. Device-only: never pushable through remote config.",
+    },
+    KeyMeta {
+        key: "rc_files",
+        group: Group::RemoteDesktop,
+        tier: Tier::Standard,
+        live: true,
+        kind: "string",
+        description: "FR-101 - this device's own rule for file transfer in a remote session: on (default) | ask | off, as rc_clipboard. Device-only: never pushable through remote config.",
+    },
+    KeyMeta {
+        key: "rc_audio",
+        group: Group::RemoteDesktop,
+        tier: Tier::Standard,
+        live: true,
+        kind: "string",
+        description: "FR-101 - this device's own rule for sending this computer's audio in a remote session: on (default) | ask | off, as rc_clipboard. Device-only: never pushable through remote config.",
+    },
+    KeyMeta {
         key: "forward_acl",
         group: Group::Tunnels,
         tier: Tier::Standard,
@@ -1958,6 +1984,9 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "record_remote_audio" => Some(fmt_bool(cfg.record_remote_audio)),
         "keep_busy_enabled" => Some(fmt_bool(cfg.keep_busy_enabled)),
         "privacy_mode_allowed" => Some(fmt_bool(cfg.privacy_mode_allowed)),
+        "rc_clipboard" => Some(fmt_feature_policy(cfg.rc_clipboard)),
+        "rc_files" => Some(fmt_feature_policy(cfg.rc_files)),
+        "rc_audio" => Some(fmt_feature_policy(cfg.rc_audio)),
         "forward_acl" => serde_json::to_string(&cfg.forward_acl).ok(),
         "virtual_desktop_apps" => serde_json::to_string(&cfg.virtual_desktop_apps).ok(),
         _ => None,
@@ -2008,6 +2037,12 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // 2026-10-10); the owner turns it off by setting it false.
         "keep_busy_enabled" => cfg.keep_busy_enabled = parse_bool_or(value, true)?,
         "privacy_mode_allowed" => cfg.privacy_mode_allowed = parse_bool_or(value, false)?,
+        // FR-101 P2b — cleared means the default, `on`; a value is read
+        // strictly here, where a typo is made, rather than becoming `off`
+        // silently the way an unknown value in the file reads.
+        "rc_clipboard" => cfg.rc_clipboard = parse_feature_policy("rc_clipboard", value)?,
+        "rc_files" => cfg.rc_files = parse_feature_policy("rc_files", value)?,
+        "rc_audio" => cfg.rc_audio = parse_feature_policy("rc_audio", value)?,
         "macos_supervise_gui_worker" => {
             cfg.macos_supervise_gui_worker = parse_bool_or(value, false)?
         }
@@ -2714,6 +2749,38 @@ fn parse_bool_or(v: Option<&str>, default: bool) -> Result<bool, String> {
     }
 }
 
+/// FR-101 P2b — how an `rc_*` key prints: the word the file and the wire use.
+fn fmt_feature_policy(p: roomler_ai_remote_control::models::FeaturePolicy) -> String {
+    use roomler_ai_remote_control::models::FeaturePolicy;
+    match p {
+        FeaturePolicy::On => "on",
+        FeaturePolicy::Ask => "ask",
+        FeaturePolicy::Off => "off",
+    }
+    .to_string()
+}
+
+/// FR-101 P2b — an `rc_*` key as a person sets it: `on`, `ask` or `off`, in
+/// any case; cleared is `on`, the default. Anything else is refused, where
+/// the file's reader would have read it as `off` without a word.
+fn parse_feature_policy(
+    key: &str,
+    v: Option<&str>,
+) -> Result<roomler_ai_remote_control::models::FeaturePolicy, String> {
+    use roomler_ai_remote_control::models::FeaturePolicy;
+    match v
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("on") => Ok(FeaturePolicy::On),
+        Some("ask") => Ok(FeaturePolicy::Ask),
+        Some("off") => Ok(FeaturePolicy::Off),
+        Some(_) => Err(format!("{key} must be on | ask | off")),
+    }
+}
+
 /// Tri-state keys: `None`/empty = unset (built-in default applies).
 fn parse_tribool(v: Option<&str>) -> Result<Option<bool>, String> {
     match v.map(str::trim).filter(|s| !s.is_empty()) {
@@ -2812,6 +2879,9 @@ mod tests {
             "record_remote_audio",
             "keep_busy_enabled",
             "privacy_mode_allowed",
+            "rc_clipboard",
+            "rc_files",
+            "rc_audio",
         ]
         .into_iter()
         .map(String::from)

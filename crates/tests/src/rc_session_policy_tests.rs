@@ -11,6 +11,10 @@
 //!   prompt names it (`session-policy`): `needs_consent` when nobody at the
 //!   device is asked, `device_cannot_ask` when the agent cannot name it.
 //!
+//! P2b adds the device's own floor: an agent announcing `session-policy` and
+//! its owner's `rc_*` values in its caps, which the hub combines with the
+//! org's policy (the stricter wins) and names `device_policy_off`.
+//!
 //! Every cell reads BOTH ends: what the viewer is told (`rc:session.created`)
 //! and the frame the AGENT received, because the agent is what acts on the
 //! grant. Each refusal has its positive control: a strip that fired for every
@@ -57,6 +61,16 @@ async fn connect_agent(
     machine_id: &str,
     rpc: &[&str],
 ) -> (String, Ws) {
+    connect_agent_caps(app, seeded, machine_id, caps(rpc)).await
+}
+
+/// [`connect_agent`] with the hello carrying `caps` as given.
+async fn connect_agent_caps(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    machine_id: &str,
+    caps: Value,
+) -> (String, Ws) {
     let et: Value = app
         .auth_post(
             &format!("/api/tenant/{}/agent/enroll-token", seeded.tenant_id),
@@ -101,7 +115,7 @@ async fn connect_agent(
             "index": 0, "name": "x", "width_px": 800, "height_px": 600,
             "scale": 1.0, "primary": true,
         }],
-        "caps": caps(rpc),
+        "caps": caps,
     });
     ws.send(Message::Text(hello.to_string().into()))
         .await
@@ -567,5 +581,140 @@ async fn a_cross_pod_session_carries_the_policy() {
         !a.agent_has("FILES"),
         "the owner pod must apply the policy the origin pod read: {}",
         a.agent_saw
+    );
+}
+
+// ── P2b — the device's own floor ────────────────────────────────────────────
+
+/// Caps as a P2b agent announces them: `session-policy` always, the owner's
+/// floor (`AgentCaps.session_policy`) only when it restricts anything.
+fn caps_with_floor(floor: Option<Value>) -> Value {
+    let mut c = caps(&["session-policy"]);
+    if let Some(f) = floor {
+        c["session_policy"] = f;
+    }
+    c
+}
+
+/// `rc:agent.heartbeat` re-announcing the caps with `floor`.
+async fn heartbeat(ws: &mut Ws, floor: Option<Value>) {
+    let hb = json!({
+        "t": "rc:agent.heartbeat", "rss_mb": 0, "cpu_pct": 0.0, "active_sessions": 0,
+        "caps": caps_with_floor(floor),
+    });
+    ws.send(Message::Text(hb.to_string().into())).await.unwrap();
+}
+
+/// P2b — a device whose owner switched files and audio off says so in its
+/// hello, and the hub strips them at once, naming them as the device's
+/// (`device_policy_off`), so the viewer can say why instead of finding out at
+/// the channel. An org that set nothing; the device's own owner asking.
+#[tokio::test]
+async fn a_device_floor_is_named_as_the_devices() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr101p2bfloor").await;
+    let (plain, mut plain_ws) =
+        connect_agent_caps(&app, &seeded, "mach-fr101-nofloor", caps_with_floor(None)).await;
+    let (floored, mut floored_ws) = connect_agent_caps(
+        &app,
+        &seeded,
+        "mach-fr101-floor",
+        caps_with_floor(Some(
+            json!({"clipboard": "on", "files": "off", "audio": "off"}),
+        )),
+    )
+    .await;
+    let owner = &seeded.admin.access_token;
+
+    // The control: the same kind of agent without a floor keeps everything.
+    let a = ask(&app, owner, &plain, &mut plain_ws, None).await;
+    assert!(
+        a.viewer_has("FILES") && a.agent_has("FILES"),
+        "{}",
+        a.granted
+    );
+    assert!(a.refused.is_null(), "{}", a.refused);
+    drop(a);
+
+    let a = ask(&app, owner, &floored, &mut floored_ws, None).await;
+    assert!(!a.viewer_has("FILES"), "{}", a.granted);
+    assert!(!a.agent_has("FILES"), "{}", a.agent_saw);
+    assert!(
+        a.viewer_has("CLIPBOARD"),
+        "the rest survives: {}",
+        a.granted
+    );
+    assert!(!a.agent_audio(), "{}", a.agent_saw);
+    assert_eq!(a.why("files"), Some("device_policy_off"));
+    assert_eq!(a.why("audio"), Some("device_policy_off"));
+    drop(a);
+
+    // The org switching files off as well: the org's `off` is the one named.
+    let resp = set_policy(&app, &seeded, json!({"files": "off"})).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let a = ask(&app, owner, &floored, &mut floored_ws, None).await;
+    assert_eq!(a.why("files"), Some("org_policy_off"));
+    assert_eq!(a.why("audio"), Some("device_policy_off"));
+}
+
+/// Ask until the answer's reason for `feature` is `want`, for up to ~4 s: the
+/// heartbeat and the request travel on two sockets.
+async fn ask_until_why(
+    app: &TestApp,
+    token: &str,
+    agent_id: &str,
+    agent: &mut Ws,
+    feature: &str,
+    want: Option<&str>,
+) -> Option<String> {
+    let mut last = None;
+    for _ in 0..8 {
+        let a = ask(app, token, agent_id, agent, None).await;
+        let why = a.why(feature).map(str::to_string);
+        if why.as_deref() == want {
+            return why;
+        }
+        last = why;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    last
+}
+
+/// The owner changes the floor while the device stays connected: the agent
+/// re-announces its caps on the heartbeat, and the hub follows both ways
+/// without a reconnect.
+#[tokio::test]
+async fn a_heartbeat_moves_the_device_floor() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr101p2bhb").await;
+    let (agent, mut agent_ws) =
+        connect_agent_caps(&app, &seeded, "mach-fr101-floorhb", caps_with_floor(None)).await;
+    let owner = &seeded.admin.access_token;
+
+    let a = ask(&app, owner, &agent, &mut agent_ws, None).await;
+    assert_eq!(a.why("files"), None);
+    drop(a);
+
+    heartbeat(&mut agent_ws, Some(json!({"files": "off"}))).await;
+    assert_eq!(
+        ask_until_why(
+            &app,
+            owner,
+            &agent,
+            &mut agent_ws,
+            "files",
+            Some("device_policy_off")
+        )
+        .await
+        .as_deref(),
+        Some("device_policy_off"),
+        "a floor announced in a heartbeat must reach the hub"
+    );
+
+    heartbeat(&mut agent_ws, None).await;
+    assert_eq!(
+        ask_until_why(&app, owner, &agent, &mut agent_ws, "files", None).await,
+        None,
+        "a floor lifted in a heartbeat must reach the hub too"
     );
 }

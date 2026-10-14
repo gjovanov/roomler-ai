@@ -3995,6 +3995,8 @@ async fn run_cmd(
     // FR-99 P1b — the owner's privacy gate, live from here on (a local
     // `ConfigSet` re-seeds it; the server cannot reach it).
     roomlerd::privacy::set_device_allowed(cfg.privacy_mode_allowed);
+    // FR-101 P2b — the owner's session-policy floor, likewise device-only.
+    roomlerd::session_policy::set_device_policy(roomlerd::session_policy::from_config(&cfg));
     // FR-92 — the keep-busy engine: restores a keep-busy the signed-in
     // person left on (it waits for an unlocked session before touching the
     // pointer), and answers `rc:keep-busy.*` from any viewer. Started here,

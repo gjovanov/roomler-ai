@@ -92,6 +92,23 @@ advertises `session-policy` (P2b). Every other session goes without it:
   with. The server has no mid-session permission change today, and each watcher is a session of its
   own through the same path, so session creation is the one entry point P2a has to gate.
 
+*As built, P2b: the device's half.*
+
+| Piece | Where |
+|---|---|
+| The owner's floor: `rc_clipboard`, `rc_files`, `rc_audio`, each `on` (default), `ask` or `off`. Live, read strictly when set (`maybe` is refused, where the file's reader would read it as `off`), and absent from `DesiredConfig`, so no server can switch back on what the owner switched off. Over the LocalAPI only the person at the console may set them (root counts on Unix): they govern that person's clipboard, files and audio | `crates/agent-core/src/config.rs:1475`, `config_surface.rs`; `crates/localapi/src/lib.rs:2817` |
+| The masking: the org's policy (from `rc:request`) and the floor, the stricter winning (`FeaturePolicy::stricter`, `crates/remote_control/src/models.rs:1167`, shared with the hub). `off` takes the feature out; `ask` survives only when the person here will approve the session on a prompt this agent raises (`person_asked`: never under `email`, `push` or `prompt_then_email`). Applied the moment the consent mode resolves and before anything reads the grant: the stash the channels enforce, the worker's params, the prompt | `agents/roomlerd/src/session_policy.rs:128` (`mask`), `:102`; applied at `agents/roomlerd/src/signaling.rs:2918` |
+| The prompt names each `ask` feature in words ("Approving also allows clipboard, file transfer and audio."), on its own line under privacy mode's, inside the native panel's two-line detail | `session_policy.rs:183` |
+| `session-policy` in the caps, and the floor itself (`AgentCaps.session_policy`, `models.rs:335`, only when it restricts anything), re-announced on the heartbeat when the owner changes it | `signaling.rs:5743`, `:1914` |
+| The hub reads the floor from the caps and strips what the device will refuse, naming it `device_policy_off`; when both say `off`, the org's is the one named | `crates/modules/fleet/src/hub.rs:424` (`feature_grant`), `socket.rs:214` |
+
+- **The bypassed hub (AC4's device half).** The device holds its floor whatever the server sends. A
+  request carrying `FILES` with no policy at all is masked to no `FILES` when the floor says `off`
+  (`the_device_floor_holds_when_the_server_sends_no_policy`), and the channels then refuse as they
+  already do. When the hub is honest, the viewer is told `device_policy_off` before it asks; P2c shows it.
+- The agent's consent reply carries no grant, so the hub learns the floor only from the caps. A server
+  older than P2b ignores the field and grants what the device then refuses at the channel.
+
 ### 3b. Write the audit that is already defined
 
 *As first written:*
@@ -150,7 +167,7 @@ still reports. Detail, with the diagram: [`remote-control.md`](../remote-control
 | P1b | `https` at every entry point, and the IPv6 TURN check | an escape for plaintext labs | — **split from P1a** (see the note below) |
 | P2 | Policy switches and agent-side masking; viewer reasons | each setting defaults to today's behaviour (`on`) | split into P2a–P2c below |
 | P2a | The org's switch (§3a as built): `TenantSettings.rc_session`, the `rc-session-policy` route, the hub's strip with a reason per feature in `rc:session.created` and the audit row, the policy forwarded to the agent and carried by the cross-pod relay | each feature defaults to `on`: an org that sets nothing sees no change, and its agents get the same `rc:request` as before | **#2198**: unit tests in db, remote_control, fleet and remote (the remote module joins CI's unit-test step: it was in no lane); `rc_session_policy_tests`, five cells reading both the viewer's answer and the agent's frame, a cross-pod one included. Negative controls: with the hub's strip removed, four of the five fail and the route cell passes; with the relay dropping the policy, only the cross-pod cell fails |
-| P2b | The device's own switch (device-owned, never pushable, so it survives a compromised server) and the agent's masking at every entry point; `session-policy` advertised, and the prompt names each `ask` feature in words | `on` | builds on FR-99 P1b's prompt line (#2191) |
+| P2b | The device's own switch (device-owned, never pushable, so it survives a compromised server) and the agent's masking at every entry point; `session-policy` advertised, and the prompt names each `ask` feature in words (§3a as built) | `on` | **this PR**: `session_policy` unit tests (8) and the hub's `feature_grant_follows_the_device_floor`; two more `rc_session_policy_tests` cells (the floor named as the device's, a heartbeat moving it both ways). Negative controls: with the agent ignoring the floor, its four floor tests fail (AC4's core among them); with the hub ignoring it, the two new cells and two hub tests fail while the P2a cells pass |
 | P2c | The viewer reads `features_refused` and greys each control with its reason; the org settings card | — | — |
 | P3 | The audit producers: clipboard and file traffic as the device's claim, in `transfer_activity` (§3b as built), read at `GET …/transfer-activity/{agent_id}` | none: an older agent sends nothing, and an older server ignores the field | **merged** #2138 `919b44d3f`: wire tests, agent unit tests, and `transfer_activity_tests` (kept for the granted session, dropped without `CLIPBOARD` / `FILES`, for another device or without a valid name hash; a repeated tally adds nothing). **Field-verified 2026-10-14** (AC5, field log row 3): red on agent 0.4.134, green on 0.4.135, the first release that carries it |
 | P4 | Idle timeout, max duration, the request rate limit | each off by default | P4a below; the timeouts remain |

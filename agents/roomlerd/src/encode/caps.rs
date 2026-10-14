@@ -1478,6 +1478,9 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         // no business in the probe child. `stub_caps` fills it from the
         // daemon's own refresher at every announcement.
         desktop: None,
+        // FR-101 P2b — `None` HERE for the same reason: the owner's floor is
+        // live config, and `stub_caps` fills it at every announcement.
+        session_policy: None,
     }
 }
 
