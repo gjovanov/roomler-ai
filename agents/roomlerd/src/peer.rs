@@ -363,6 +363,10 @@ impl AgentPeer {
         // `crate::rc_overlay`). Off, the default, keeps every overlay address
         // out of this session's ICE.
         rc_overlay: crate::rc_overlay::RcOverlay,
+        // FR-93 P6c — the daemon's session registry: the media pump ends this
+        // session through it, as the person's Disconnect does, when they stop
+        // the share with the desktop's own control.
+        rc_sessions: crate::rc_sessions::RcSessionRegistry,
     ) -> Result<Self> {
         let mut engine = MediaEngine::default();
         engine
@@ -1402,6 +1406,7 @@ impl AgentPeer {
             encoded_dims,
             viewer_report.clone(),
             priority,
+            rc_sessions,
         ));
 
         Ok(Self {
@@ -2079,6 +2084,9 @@ async fn media_pump(
     // DC pump this session routes to. Like `viewer_report`, only the DC pumps
     // consume it (relay resolution cap), so the signalling-only build parks it.
     priority: Arc<std::sync::atomic::AtomicU8>,
+    // FR-93 P6c — where a pump ends its session when the person at the screen
+    // stops the share (`end_stopped_at_screen`).
+    rc_sessions: crate::rc_sessions::RcSessionRegistry,
 ) {
     // `pc` is consumed only by the VP9-444 DC pump's per-session transport
     // detection (feature-gated); keep the signalling-only / non-vp9 build
@@ -2155,6 +2163,7 @@ async fn media_pump(
                     priority,
                     false,
                     chunk_framing,
+                    rc_sessions,
                 )
                 .await;
             }
@@ -2198,6 +2207,7 @@ async fn media_pump(
                     // only by the VP9-444 transport).
                     matches!(chroma_pref.as_deref(), Some("yuv444")),
                     chunk_framing,
+                    rc_sessions,
                 )
                 .await;
             }
@@ -2238,6 +2248,7 @@ async fn media_pump(
                     priority,
                     matches!(chroma_pref.as_deref(), Some("yuv444")),
                     chunk_framing,
+                    rc_sessions,
                 )
                 .await;
             }
@@ -2316,6 +2327,7 @@ async fn media_pump(
                         priority,
                         wants_444,
                         chunk_framing,
+                        rc_sessions,
                     )
                     .await;
                 }
@@ -2342,6 +2354,7 @@ async fn media_pump(
                 viewer_report,
                 priority,
                 chunk_framing,
+                rc_sessions,
             )
             .await;
         }
@@ -2603,6 +2616,14 @@ async fn media_pump(
                 // failures) — a PERSISTENT denial (DDA app limit with N
                 // concurrent sessions) must not re-run the open cascade
                 // twice a second forever.
+                //
+                // FR-93 P6c — except the person at the screen stopping the
+                // share with the desktop's own control: the session ends as
+                // their Disconnect would, and the capture is never reopened
+                // behind their back.
+                if capture::stopped_at_screen(&e) {
+                    match end_stopped_at_screen(session_id, &rc_sessions, None).await {}
+                }
                 warn!(%session_id, %e, "capture error — rebuilding capturer");
                 tokio::time::sleep(reopen_backoff.delay()).await;
                 capturer = capture::open_default_async(
@@ -3263,6 +3284,8 @@ async fn run_ffmpeg_dc_session(
     // than read from a global: it is a per-SESSION property, and a
     // shared pipeline can serve viewers that disagree.
     chunk_framing: bool,
+    // FR-93 P6c — see `media_pump`.
+    rc_sessions: crate::rc_sessions::RcSessionRegistry,
 ) {
     // P7 — chroma-discriminated hard-profile label (HEVC only; every other
     // codec ignores the flag).
@@ -3312,6 +3335,7 @@ async fn run_ffmpeg_dc_session(
             priority,
             chroma444,
             chunk_framing,
+            rc_sessions,
         )
         .await;
     }
@@ -3342,6 +3366,8 @@ async fn run_vp9_444_dc_session(
     // than read from a global: it is a per-SESSION property, and a
     // shared pipeline can serve viewers that disagree.
     chunk_framing: bool,
+    // FR-93 P6c — see `media_pump`.
+    rc_sessions: crate::rc_sessions::RcSessionRegistry,
 ) {
     loop {
         let sink = crate::media_share::FollowerSink {
@@ -3389,6 +3415,7 @@ async fn run_vp9_444_dc_session(
             viewer_report,
             priority,
             chunk_framing,
+            rc_sessions,
         )
         .await;
     }
@@ -3444,6 +3471,8 @@ async fn media_pump_vp9_444_dc(
     // than read from a global: it is a per-SESSION property, and a
     // shared pipeline can serve viewers that disagree.
     chunk_framing: bool,
+    // FR-93 P6c — see `media_pump`.
+    rc_sessions: crate::rc_sessions::RcSessionRegistry,
 ) {
     // See `media_pump`: tracks lock-state transitions so we can
     // request a keyframe on the lock/unlock boundary.
@@ -4028,6 +4057,11 @@ async fn media_pump_vp9_444_dc(
                 }
             }
             Err(e) => {
+                // FR-93 P6c — the track pump's rule: stopped at the screen
+                // ends the session (this pipeline's followers first).
+                if capture::stopped_at_screen(&e) {
+                    match end_stopped_at_screen(session_id, &rc_sessions, Some(&pipeline)).await {}
+                }
                 // P3 — bounded backoff, same rationale as the track pump.
                 warn!(%session_id, %e, "VP9-444 capture error — rebuilding capturer");
                 tokio::time::sleep(reopen_backoff.delay()).await;
@@ -5303,6 +5337,67 @@ async fn send_control_notice(
     false
 }
 
+/// FR-93 P6c — how long an owner whose capture was stopped at the screen waits
+/// for its followers' sessions to end before ending its own.
+const FOLLOWERS_GONE_WAIT: Duration = Duration::from_secs(2);
+
+/// FR-93 P6c — the person at the screen stopped the share with the desktop's
+/// own control: Stop on GNOME's screen-sharing indicator, End on KDE's. Every
+/// session watching through this capture ends the way their Disconnect ends
+/// one (FR-27 P10's kill path): the controller reads that the person at the
+/// device ended it and does not reconnect, and a recording stops. Before this
+/// the pump reopened the capture, which made the desktop's control a no-op:
+/// GNOME's Stop was undone 0.5 s later by a new unattended screencast, KDE's
+/// End by the token's restore 3 s later.
+///
+/// A shared pipeline's followers go first. Had the owner gone first, they
+/// would detach, re-dispatch, and one of them would reopen the capture the
+/// person had just stopped. A Disconnect that cannot be queued yet (no entry,
+/// a full queue) is asked again every second.
+///
+/// Never returns, and never reopens: the session's teardown aborts the pump,
+/// whose task this is.
+async fn end_stopped_at_screen(
+    session_id: bson::oid::ObjectId,
+    rc_sessions: &crate::rc_sessions::RcSessionRegistry,
+    pipeline: Option<&crate::media_share::Pipeline>,
+) -> std::convert::Infallible {
+    let followers = pipeline.map(|p| p.follower_sessions()).unwrap_or_default();
+    warn!(
+        %session_id,
+        followers = followers.len(),
+        "capture: the person at the screen stopped the share with the desktop's own control; \
+         ending the session as their Disconnect does, the capture not reopened (FR-93 P6c)"
+    );
+    if let Some(p) = pipeline {
+        for f in &followers {
+            if !rc_sessions.disconnect(f) {
+                warn!(%session_id, follower = %f, "capture stopped at the screen: a follower's session could not be ended");
+            }
+        }
+        let until = std::time::Instant::now() + FOLLOWERS_GONE_WAIT;
+        while p.follower_count() > 0 && std::time::Instant::now() < until {
+            p.beat();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    let mut asks = 0u32;
+    let mut ended = false;
+    loop {
+        if !ended {
+            ended = rc_sessions.disconnect(&session_id);
+            if !ended && asks.is_multiple_of(30) {
+                warn!(%session_id, asks, "capture stopped at the screen: the session's Disconnect could not be queued yet");
+            }
+            asks += 1;
+        }
+        if let Some(p) = pipeline {
+            p.beat();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 /// FR-93 P1 — tell the controller, once, when this session's input will NOT
 /// reach the whole desktop (`rc:input-reach`). An injector that reaches
 /// nothing does not fail (XTest into Xwayland succeeds and moves nobody's
@@ -5522,6 +5617,8 @@ async fn media_pump_ffmpeg_dc(
     // than read from a global: it is a per-SESSION property, and a
     // shared pipeline can serve viewers that disagree.
     chunk_framing: bool,
+    // FR-93 P6c — see `media_pump`.
+    rc_sessions: crate::rc_sessions::RcSessionRegistry,
 ) {
     use crate::encode::VideoEncoder;
 
@@ -7183,6 +7280,12 @@ async fn media_pump_ffmpeg_dc(
                 // busy-spun the loop at full speed logging once per
                 // iteration, and never recovered. Reopen like the other
                 // pumps, under the same bounded backoff.
+                //
+                // FR-93 P6c — the track pump's rule: stopped at the screen
+                // ends the session (this pipeline's followers first).
+                if capture::stopped_at_screen(&e) {
+                    match end_stopped_at_screen(session_id, &rc_sessions, Some(&pipeline)).await {}
+                }
                 tracing::warn!(%session_id, codec_label, %e, "FFmpeg DC pump: capture error — rebuilding capturer");
                 tokio::time::sleep(reopen_backoff.delay()).await;
                 capturer = capture::open_default_async(
@@ -13346,5 +13449,110 @@ mod download_stop_tests {
         let want = std::fs::read(&path).expect("read the file back");
         assert_eq!(sent, want.len() as u64);
         assert!(*got.lock().unwrap() == want, "the bytes arrived intact");
+    }
+}
+
+#[cfg(test)]
+mod stopped_at_screen_tests {
+    use super::*;
+    use crate::rc_sessions::RcSessionRegistry;
+    use bson::oid::ObjectId;
+
+    fn listed(reg: &RcSessionRegistry, session: ObjectId, kill: crate::rc_sessions::KillSender) {
+        reg.insert(
+            session,
+            "viewer".into(),
+            "view|input".into(),
+            "org".into(),
+            kill,
+        );
+    }
+
+    /// FR-93 P6c — a pump whose capture the person at the screen stopped ends
+    /// its session through the registry, on the kill channel their Disconnect
+    /// takes, asks once, and never returns: nothing reopens the capture.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_at_the_screen_ends_the_session_once_and_never_returns() {
+        let reg = RcSessionRegistry::new();
+        let sid = ObjectId::new();
+        let (kill, mut killed) = tokio::sync::mpsc::channel(4);
+        listed(&reg, sid, kill);
+        let held = tokio::time::timeout(
+            Duration::from_secs(30),
+            end_stopped_at_screen(sid, &reg, None),
+        )
+        .await;
+        assert!(
+            held.is_err(),
+            "it held until the teardown, which here never comes"
+        );
+        assert_eq!(
+            killed.try_recv().ok(),
+            Some(sid),
+            "the session's Disconnect"
+        );
+        assert!(killed.try_recv().is_err(), "asked once, not every second");
+    }
+
+    /// P6c — a session not listed yet (its banner entry comes once the peer is
+    /// up) is asked again every second until it is.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_not_listed_yet_is_asked_again_until_it_is() {
+        let reg = RcSessionRegistry::new();
+        let sid = ObjectId::new();
+        let (kill, mut killed) = tokio::sync::mpsc::channel(4);
+        let pump = tokio::spawn({
+            let reg = reg.clone();
+            async move { end_stopped_at_screen(sid, &reg, None).await }
+        });
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(killed.try_recv().is_err(), "nothing to end yet");
+        listed(&reg, sid, kill);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(killed.try_recv().ok(), Some(sid));
+        pump.abort();
+    }
+
+    /// P6c — an owner ends its followers' sessions first, and its own only once
+    /// they have left: gone first, it would close the pipeline, and a follower
+    /// re-dispatching would reopen the capture the person had just stopped.
+    // The pipeline registry's test guard is held across awaits on purpose, as
+    // in `media_share`'s own tests: it serializes whole tests.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(start_paused = true)]
+    async fn an_owner_ends_its_followers_before_itself() {
+        let _serial = crate::media_share::test_serial();
+        let key = crate::media_share::PipelineKey::FfmpegDc("TEST-P6C-OWNER");
+        let (owner, follower) = (ObjectId::new(), ObjectId::new());
+        let pipeline = crate::media_share::Pipeline::register(key, owner);
+        let sink = crate::media_share::FollowerSink {
+            session_id: follower,
+            video_bytes_dc: Arc::new(tokio::sync::Mutex::new(None)),
+            control_dc: Arc::new(tokio::sync::Mutex::new(None)),
+            keyframe_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            target_resolution: Arc::new(std::sync::Mutex::new(TargetResolution::Native)),
+            quality_state: Arc::new(std::sync::atomic::AtomicU8::new(2)),
+            viewer_report: Arc::new(crate::encode::viewer_rate::ViewerFeedback::new()),
+            priority: Arc::new(std::sync::atomic::AtomicU8::new(1)),
+            capture_native_dims: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            encoded_dims: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            chunk_framing: false,
+        };
+        let guard = crate::media_share::try_join(key, sink, 60).expect("the follower joins");
+        let reg = RcSessionRegistry::new();
+        let (kill, mut killed) = tokio::sync::mpsc::channel(8);
+        listed(&reg, owner, kill.clone());
+        listed(&reg, follower, kill);
+        tokio::select! {
+            _ = end_stopped_at_screen(owner, &reg, Some(&pipeline)) => unreachable!("it never returns"),
+            () = async {
+                assert_eq!(killed.recv().await, Some(follower), "the follower first");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert!(killed.try_recv().is_err(), "the owner waits while its follower is still on");
+                // The follower's own teardown aborts its task, which drops its guard.
+                drop(guard);
+                assert_eq!(killed.recv().await, Some(owner), "then the owner");
+            } => {}
+        }
     }
 }

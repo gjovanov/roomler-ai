@@ -50,7 +50,7 @@
     "session": {
       "endedByHost": {
         "title": "The person at the device ended the session.",
-        "body": "They clicked Disconnect on their screen, so this viewer stays disconnected. Reconnect asks them again, as any new session does.",
+        "body": "They ended it from their screen (Disconnect, or their desktop's own Stop for screen sharing), so this viewer stays disconnected. Reconnect asks them again, as any new session does.",
         "reconnect": "Reconnect"
       }
     }

@@ -25,7 +25,7 @@ The rest of the design follows from taking that sentence seriously.
 
 Everything is P2P over the session's existing `control` data channel — no
 server change, and the server never sees a window title. `peer.rs` routes three
-envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:8452`),
+envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:8555`),
 runs it on `spawn_blocking` because every backend shells out or calls FFI, and
 sends the returned reply back on the same channel. The request/reply shape and
 the id correlation are `rc:logs-fetch`'s.
@@ -312,7 +312,7 @@ server outlives both), it is `ssh`-attachable from a real login
 
 Streaming **one application window** instead of the monitor reuses FR-45's
 whole portal pipeline with a single change: `SelectSources(types = WINDOW)`
-(`SOURCE_WINDOW`, `agents/roomlerd/src/capture/portal/screencast.rs:93`) behind
+(`SOURCE_WINDOW`, `agents/roomlerd/src/capture/portal/screencast.rs:95`) behind
 `ROOMLERD_WINDOW_CAPTURE` (`agents/roomlerd/src/capture/portal/backend.rs:77`,
 config key `window_capture`, `crates/agent-core/src/config.rs:802`). It is
 **attended by construction**: the portal answers by showing the person at the
@@ -413,7 +413,7 @@ must never write the device's config as a side effect of being run.
 | `agents/roomlerd/src/apps/linux.rs` | `Target` (`:56`), `LinuxWm::cmd` and the privilege drop (`:102`), `on_path` (`:209`) and `HELPERS` (`:228`), `coverage` (`:254`), `list` (`:274`), `focus` (`:337`), `launch` (`:368`), `discover` (`:480`) and its test seam `discover_with` (`:497`), `refused` (`:579`), `Probe` (`:589`) and `probe` (`:605`), `find_xauthority` (`:648`) |
 | `agents/roomlerd/src/apps/windows.rs` | `EnumWindows` (`:49`), `coverage` (`:88`), `list` (`:100`), `focus` (`:120`), `launch` (`:149`) |
 | `agents/roomlerd/src/encode/caps.rs` | `apps_caps` / `apps_caps_for` (`:1487`, `:1493`), assigned by `with_config_lists` (`:655`) from `detect` (`:624`) beside `rpc` and `files` (`files_caps` / `files_caps_for`, `:1532`, `:1539`); `CACHED_CAPS` (`:37`) — why the hello is a snapshot; `cached_or_probed` (`:667`) — why the child's struct must carry no `apps` |
-| `agents/roomlerd/src/peer.rs` | the control-DC arm (`:8452`) |
+| `agents/roomlerd/src/peer.rs` | the control-DC arm (`:8555`) |
 | `agents/roomlerd/src/companion.rs` | `graphical_session` (`:457`) |
 | `agents/roomlerd/src/main.rs` | `apps-probe` (`:4696`) — reads the device config through `read_if_present`, never `load` |
 | `crates/remote_control/src/models.rs` | `AgentCaps.apps` and its known values (`:203`) |

@@ -272,6 +272,43 @@ impl GnomeLockScreen {
     }
 }
 
+/// FR-93 P6c — whether mutter refuses new sessions now. GNOME inhibits remote
+/// access while its screen is locked, and the refusal reads `Session creation
+/// inhibited` (the one P5b waits through). mutter counts the inhibition BEFORE
+/// it closes the sessions it ends, so a probe sent after a session's `Closed`
+/// reads the lock that closed it, with no race to lose. Anything else that
+/// closes a session leaves new ones allowed: the person at the screen pressing
+/// Stop on GNOME's screen-sharing indicator. `None` where nothing could tell:
+/// no session bus, or mutter does not answer.
+///
+/// The probe session is never started, and mutter raises its indicator from a
+/// session's `Start`, so nothing appears on screen. It is stopped at once, and
+/// dies with this connection in any case.
+pub fn creation_inhibited() -> Option<bool> {
+    let conn = zbus::blocking::Connection::session().ok()?;
+    let screencast =
+        zbus::blocking::Proxy::new(&conn, MUTTER_BUS, MUTTER_PATH, MUTTER_IFACE).ok()?;
+    match screencast.call_method("CreateSession", &(HashMap::<&str, Value>::new(),)) {
+        Ok(reply) => {
+            if let Ok(path) = reply.body().deserialize::<OwnedObjectPath>()
+                && let Ok(probe) =
+                    zbus::blocking::Proxy::new(&conn, MUTTER_BUS, &path, SESSION_IFACE)
+            {
+                let _ = probe.call_method("Stop", &());
+            }
+            Some(false)
+        }
+        Err(e) => refusal_is_inhibition(&e.to_string()),
+    }
+}
+
+/// [`creation_inhibited`]'s reading of a refused probe: the lock's own words,
+/// or nothing known.
+fn refusal_is_inhibition(err: &str) -> Option<bool> {
+    err.contains(crate::capture::MUTTER_INHIBITED)
+        .then_some(true)
+}
+
 /// FR-93 P4 kill switch (`ROOMLERD_MUTTER_INPUT` / `mutter_input`), default
 /// ON: a mutter screencast that carries input is driven by mutter's
 /// RemoteDesktop, and the viewer's mouse and keyboard reach the whole desktop
@@ -624,6 +661,23 @@ mod tests {
         assert!(
             msg.contains("headless"),
             "the message should name the fix a headless host needs: {msg}"
+        );
+    }
+
+    /// FR-93 P6c — only the lock's own refusal reads as the lock. Any other
+    /// refusal (a bus error, mutter gone) knows nothing, so it can never be
+    /// taken for the person at the screen.
+    #[test]
+    fn only_the_inhibition_refusal_reads_as_the_lock() {
+        assert_eq!(
+            refusal_is_inhibition(
+                "org.freedesktop.DBus.Error.AccessDenied: Session creation inhibited"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            refusal_is_inhibition("org.freedesktop.DBus.Error.ServiceUnknown: no such name"),
+            None
         );
     }
 

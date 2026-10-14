@@ -2110,6 +2110,28 @@ pub enum WaitFor {
     SessionAway,
 }
 
+/// FR-93 P6c — a capture error that means the person at the screen stopped
+/// the share with the desktop's own control: Stop on GNOME's screen-sharing
+/// indicator, End on KDE's. A pump that reads it ends its session as the
+/// person's Disconnect does (FR-27 P10) and never reopens the capture:
+/// reopening is what made the control a no-op (measured on 0.4.135: GNOME's
+/// Stop undone 0.5 s later, KDE's End by the token's restore 3 s later).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoppedAtScreen;
+
+impl std::fmt::Display for StoppedAtScreen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the person at the screen stopped the share with the desktop's own control")
+    }
+}
+
+impl std::error::Error for StoppedAtScreen {}
+
+/// Whether a capture error is [`StoppedAtScreen`], under any context.
+pub fn stopped_at_screen(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<StoppedAtScreen>().is_some()
+}
+
 /// What a pump hands [`open_default_async`]: called if and when its open
 /// parks on the host, once per wait. FR-93 P5g — an open can wait twice: for
 /// this user's session to come back, then (GNOME's *Switch User* locks first)
@@ -2726,6 +2748,18 @@ mod synthetic_env_tests {
 #[cfg(test)]
 mod frame_tests {
     use super::*;
+
+    /// FR-93 P6c — the pumps find the person's Stop under any context a
+    /// caller added on the way up, and no other capture error reads as it.
+    #[test]
+    fn a_stop_at_the_screen_is_found_under_any_context() {
+        let e = anyhow::Error::new(StoppedAtScreen).context("the pump's open");
+        assert!(stopped_at_screen(&e));
+        assert!(stopped_at_screen(&anyhow::Error::new(StoppedAtScreen)));
+        assert!(!stopped_at_screen(&anyhow::anyhow!(
+            "the portal helper stopped producing frames"
+        )));
+    }
 
     // P8a — damage re-projection through a downscale (moved here with
     // scale_damage in Phase B).

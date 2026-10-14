@@ -282,6 +282,20 @@ impl Pipeline {
         self.inner.lock().unwrap().followers.len()
     }
 
+    /// FR-93 P6c — the sessions following this pipeline. An owner whose
+    /// capture was stopped at the screen ends them before itself: had it gone
+    /// first, they would detach, re-dispatch, and open the capture the person
+    /// had just stopped.
+    pub fn follower_sessions(&self) -> Vec<bson::oid::ObjectId> {
+        self.inner
+            .lock()
+            .unwrap()
+            .followers
+            .iter()
+            .map(|f| f.sink.session_id)
+            .collect()
+    }
+
     /// Any viewer (follower atomics + the join flag) wants an IDR. Consumes
     /// the requests, mirroring `keyframe_requested.swap(false)`.
     pub fn take_keyframe_requested(&self) -> bool {
@@ -833,6 +847,18 @@ fn ratio_qualifies(lo: u32, hi: u32, ratio: u32) -> bool {
     hi >= lo.max(1).saturating_mul(ratio)
 }
 
+/// The registry (and its `pipeline_count()` spill-budget input) is
+/// process-global, and cargo runs tests concurrently — a sibling test's live
+/// pipeline would flip the budget gate mid-test. Every registry-touching test
+/// holds this, in this module and elsewhere in the crate (FR-93 P6c's
+/// `peer.rs` test builds a pipeline too). `unwrap_or_else(into_inner)`
+/// un-poisons after a failed test so the rest still report their own results.
+#[cfg(test)]
+pub(crate) fn test_serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 #[cfg(test)]
 // The SERIAL guard is deliberately held across awaits: it serializes whole
 // tests against the process-global registry, and every await inside is a
@@ -842,15 +868,7 @@ mod tests {
     use super::*;
     use bson::oid::ObjectId;
 
-    /// The registry (and its `pipeline_count()` spill-budget input) is
-    /// process-global, and cargo runs tests concurrently — a sibling test's
-    /// live pipeline would flip the budget gate mid-test. Serialize every
-    /// registry-touching test. `unwrap_or_else(into_inner)` un-poisons after
-    /// a failed test so the rest still report their own results.
-    static SERIAL: Mutex<()> = Mutex::new(());
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        SERIAL.lock().unwrap_or_else(|p| p.into_inner())
-    }
+    use super::test_serial as serial;
 
     fn sink(session: ObjectId) -> FollowerSink {
         FollowerSink {
@@ -891,6 +909,25 @@ mod tests {
         assert_eq!(guard.detached().await, DetachReason::PipelineClosed);
         // Registry slot is free again.
         assert!(registry().lock().unwrap().get(&key).is_none());
+    }
+
+    /// FR-93 P6c — the owner names its followers' sessions, and a follower
+    /// that left is no longer named.
+    #[tokio::test]
+    async fn the_owner_names_its_followers_sessions() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-P6C-NAMES");
+        let owner = Pipeline::register(key, ObjectId::new());
+        let (a, b) = (ObjectId::new(), ObjectId::new());
+        let ga = try_join(key, sink(a), 60).expect("join a");
+        let _gb = try_join(key, sink(b), 60).expect("join b");
+        let mut named = owner.follower_sessions();
+        named.sort();
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(named, want);
+        drop(ga);
+        assert_eq!(owner.follower_sessions(), vec![b]);
     }
 
     /// rc.443 — a joiner finding the owner's beat stale evicts the corpse
