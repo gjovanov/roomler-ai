@@ -456,6 +456,17 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
         vec![index(bson::doc! { "source": 1, "metric": 1, "day": 1 })],
     ));
 
+    // P6 — one pull-status row per `(source, UTC day)` a puller attempted,
+    // `_id = "<source>:<day>"` (the upsert's own key): whether the day was
+    // pulled, when, and what the newest attempt met. It is how a reader of
+    // `growth_daily` tells "not pulled" (no row) or "failed" from a pulled
+    // zero. Read per source over a day range. No TTL, like the rows it
+    // describes.
+    sets.push(set(
+        "growth_pulls",
+        vec![index(bson::doc! { "source": 1, "day": 1 })],
+    ));
+
     // Hourly rollups (90 d) and daily rollups (730 d). The rollup task
     // whole-bucket-replaces via $merge on _id, so these are also upserts.
     for (coll, ttl_days) in [

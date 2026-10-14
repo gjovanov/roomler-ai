@@ -2,8 +2,11 @@
 // Copyright (C) 2026 G ROX EOOD
 //! FR-102 P1d — the purestat v1 query client (`POST {purestat_url}/api/v1/query`).
 //!
-//! The anonymous plane's one read. The contract is purestat PS1's
-//! (`gjovanov/purestat#13`, live as v0.1.8):
+//! The anonymous plane's one read. It lives here, below both the host and
+//! the `saas` module (P6): the host's digest and Campaigns view query it
+//! live, and `saas`'s daily puller freezes its breakdowns into
+//! `growth_daily` — one client, one set of rules, for every caller. The
+//! contract is purestat PS1's (`gjovanov/purestat#13`, live as v0.1.8):
 //!
 //! ```text
 //! POST /api/v1/query          X-API-Key: <key>
@@ -51,6 +54,18 @@ impl Filter {
         Self {
             dimension: dimension.into(),
             operator: "starts_with".into(),
+            value: value.into(),
+        }
+    }
+
+    /// An exact match. ⚠️ purestat compares literally and case-sensitively,
+    /// so a filter on a UTM value matches the spelling the link carried, not
+    /// the taxonomy's — a caller that joins by the normalised key breaks
+    /// down by the dimension and normalises the rows instead.
+    pub fn is(dimension: &str, value: &str) -> Self {
+        Self {
+            dimension: dimension.into(),
+            operator: "is".into(),
             value: value.into(),
         }
     }
@@ -162,6 +177,13 @@ pub struct Response {
     pub meta: Meta,
 }
 
+/// Every page of one query, and whether [`MAX_PAGES`] cut it short.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Paged {
+    pub rows: Vec<Row>,
+    pub truncated: bool,
+}
+
 /// Why a query gave no rows. `Display` is the short reason the digest
 /// stores; none of them carries the key or the body.
 #[derive(Debug, Clone, PartialEq)]
@@ -203,6 +225,34 @@ impl PurestatError {
             Self::NotConfigured | Self::Unauthorized | Self::Timeout | Self::Transport(_)
         )
     }
+}
+
+/// The goal a purestat 400 names as undefined (`unknown goal: "signup"`),
+/// when that is what the error is. A site with no goal definitions is a
+/// configuration gap on the web plane, not an outage: a caller retries the
+/// breakdown without goals (its visitors are still real) and says which
+/// conversions are not measured.
+pub fn unknown_goal(e: &PurestatError) -> Option<String> {
+    let PurestatError::Status(400, msg) = e else {
+        return None;
+    };
+    let lower = msg.to_ascii_lowercase();
+    let idx = lower.find("unknown goal")?;
+    let rest = &msg[idx + "unknown goal".len()..];
+    let quoted = rest
+        .split('"')
+        .nth(1)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some(quoted.unwrap_or_else(|| {
+        let bare = rest.trim_start_matches(':').trim();
+        if bare.is_empty() {
+            "the goal".to_string()
+        } else {
+            bare.to_string()
+        }
+    }))
 }
 
 #[derive(Clone)]
@@ -248,20 +298,54 @@ impl PurestatClient {
     /// Run one query, following `has_more` up to [`MAX_PAGES`]. The rows of
     /// every page, in order.
     pub async fn query(&self, query: &Query) -> Result<Vec<Row>, PurestatError> {
+        Ok(self.query_paged(query).await?.rows)
+    }
+
+    /// [`Self::query_paged`], retried ONCE without goals when the server
+    /// answers that a goal is not defined (a 400 naming it): the breakdown's
+    /// visitors are still real, and the missing goal comes back beside them
+    /// so the caller can say which conversions are not measured.
+    pub async fn query_or_without_goals(
+        &self,
+        query: &Query,
+    ) -> Result<(Paged, Option<String>), PurestatError> {
+        match self.query_paged(query).await {
+            Ok(paged) => Ok((paged, None)),
+            Err(e) => match unknown_goal(&e) {
+                Some(goal) if !query.goals.is_empty() => {
+                    let mut without = query.clone();
+                    without.goals.clear();
+                    Ok((self.query_paged(&without).await?, Some(goal)))
+                }
+                _ => Err(e),
+            },
+        }
+    }
+
+    /// [`Self::query`], saying whether the page bound cut the answer short:
+    /// `truncated` is true when the last page followed still had `has_more`.
+    /// A view that shows the rows says so rather than presenting a partial
+    /// breakdown as the whole one.
+    pub async fn query_paged(&self, query: &Query) -> Result<Paged, PurestatError> {
         let mut rows = Vec::new();
         let mut page = query.clone();
         page.limit = PAGE_LIMIT;
         page.offset = 0;
-        for _ in 0..MAX_PAGES {
+        let mut truncated = false;
+        for i in 0..MAX_PAGES {
             let resp = self.one_page(&page).await?;
             let n = resp.rows.len() as u32;
             rows.extend(resp.rows);
             if !resp.meta.has_more || n == 0 {
                 break;
             }
+            if i + 1 == MAX_PAGES {
+                truncated = true;
+                break;
+            }
             page.offset += n;
         }
-        Ok(rows)
+        Ok(Paged { rows, truncated })
     }
 
     async fn one_page(&self, query: &Query) -> Result<Response, PurestatError> {
@@ -331,6 +415,16 @@ mod tests {
                 "limit": 100,
                 "offset": 0,
             })
+        );
+    }
+
+    #[test]
+    fn an_exact_filter_is_the_contracts_is_operator() {
+        let q = Query::range("2026-10-01", "2026-10-13", &[], &["visitors"], &[])
+            .filter(Filter::is("utm_source", "linkedin"));
+        assert_eq!(
+            serde_json::to_value(&q).unwrap()["filters"],
+            serde_json::json!([{"dimension": "utm_source", "operator": "is", "value": "linkedin"}])
         );
     }
 

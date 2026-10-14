@@ -3,7 +3,8 @@
 How the project learns what a post, an article or an issue produced — visits, sign-ups,
 orgs, devices, usage, revenue — **joined by the campaign key and never by a person**. This
 page covers what FR-102 has shipped so far: the taxonomy (P1b), the exclusion set (P1c), the
-daily digest (P1d), the account funnel, cohorts and org views (P2) and the install trace (P3).
+daily digest (P1d), the account funnel, cohorts and org views (P2), the install trace (P3), and
+the web plane — the purestat puller and the Campaigns table (P6).
 Spec: [`docs/fr/FR-102-growth-observability.md`](fr/FR-102-growth-observability.md) (#2127). It
 also places the existing `/observability` page, which no doc described before.
 
@@ -123,8 +124,9 @@ A module that is not mounted (`[modules] remote = false`, a reduced profile) mak
 `not_measured: "<module> module not mounted"`; the rest of the digest still completes. The
 same holds for purestat: a 401, a timeout or an unreachable host costs the web sections —
 with the reason stored — and nothing else. The client
-([`purestat.rs`](../crates/api/src/growth/purestat.rs)) has a 15-second timeout, pages
-`has_more` up to 1,000 rows, and never logs the key.
+([`purestat.rs`](../crates/services/src/purestat.rs), in `roomler-ai-services` since P6 so
+the `saas` puller shares it) has a 15-second timeout, pages `has_more` up to 1,000 rows (and
+says when that bound cut an answer), and never logs the key.
 
 ### Once, with two pods
 
@@ -187,7 +189,7 @@ sequenceDiagram
 | `growth.digest_hour_utc` | `ROOMLER__GROWTH__DIGEST_HOUR_UTC` | `6` | the UTC hour after which yesterday's digest is due (purestat closes a session 30 min after its last event) |
 | `growth.digest_to` | `ROOMLER__GROWTH__DIGEST_TO` | empty | comma-separated recipients; empty ⇒ the platform admins |
 | `growth.purestat_url` | `ROOMLER__GROWTH__PURESTAT_URL` | `https://purestat.ai` | the v1 query endpoint's base |
-| `growth.purestat_api_key` | `ROOMLER__GROWTH__PURESTAT_API_KEY` | empty | a site-scoped key (`X-API-Key`); empty ⇒ website, blog, campaigns and coverage read "not measured" |
+| `growth.purestat_api_key` | `ROOMLER__GROWTH__PURESTAT_API_KEY` | empty | a site-scoped key (`X-API-Key`); empty ⇒ website, blog, campaigns and coverage read "not measured", the Campaigns table's web cells too, and the `saas` puller (P6) pulls nothing and says so once at boot |
 | `growth.install_counters` | `ROOMLER__GROWTH__INSTALL_COUNTERS` | `true` | the install trace's fetch counters (P3); `false` writes none. The token ledger and the enroll's `install` have no switch — they are ids on rows that exist anyway |
 
 The hosted deployment turns the digest on with `ROOMLER__GROWTH__DIGEST_ENABLED=true` (and a
@@ -439,6 +441,153 @@ by method. Exclusions apply to tokens by the token's tenant and to enrollments b
 tenant; the fetch rows carry no tenant and cannot be filtered. All of it is "not mounted"
 without the `fleet` module, never 0.
 
+## The web plane: the purestat puller and the Campaigns table (P6)
+
+purestat is the anonymous plane — visits, pages, goals, no person. P6 reads it in two ways,
+for two different questions, and never answers one with the other:
+
+| Question | Read | Why that way |
+|---|---|---|
+| What did campaign X bring between two dates? | **live** — one purestat query for the exact range, by the Campaigns table | unique visitors do not add across days: a sum of daily rows counts a returning visitor once per day |
+| What did the web plane hold on day D, long after purestat's 2-year TTL? | **frozen** — the `saas` puller's `growth_daily` rows (`source: purestat`) | a frozen day is what history says; it is never rewritten |
+
+```mermaid
+flowchart LR
+  subgraph saas["saas module — hosted only"]
+    P["purestat puller<br/>hourly tick · Redis NX claim"]
+  end
+  subgraph host["host — crates/api/src/growth"]
+    C["GET /api/admin/growth/campaigns"]
+    F["funnel::read + group_by<br/>(the account plane)"]
+  end
+  PS[("purestat<br/>POST /api/v1/query")]
+  P -->|"site · utm_* · path<br/>per closed day"| PS
+  P -->|"$set, write-then-prune"| GD[("growth_daily<br/>source: purestat")]
+  P -->|"ok · failed · error"| GP[("growth_pulls<br/>_id = purestat:day")]
+  C -->|"breakdown at the key depth<br/>for the exact range"| PS
+  C --> F
+  F --> J["joined in code<br/>by the normalised key"]
+  PS --> J
+  GP -->|"pull summary"| C
+```
+
+### The key both planes meet on
+
+`roomler_core::campaign::CampaignKey` ([`campaign.rs:198`](../crates/core/src/campaign.rs))
+is `(source, medium, campaign, content)`, and `CampaignKey::normalized`
+([`campaign.rs:212`](../crates/core/src/campaign.rs)) is the ONE spelling: each value cleaned
+exactly as a sign-up's is at ingress (`attribution::clean_value` — trimmed, printable ASCII
+only, clamped to 64), then source and medium through the taxonomy and campaign and content
+lowercased. A purestat row (`utm_source=YouTub&utm_campaign=20261019-Slug`) and a sign-up
+stored by `attribution::sanitize` from the same link meet on one key — a unit test asserts it.
+A row with no source is organic traffic, not a key.
+
+`KeyDepth` ([`campaign.rs:134`](../crates/core/src/campaign.rs)) is how deep a breakdown
+goes: `source` → `medium` → `campaign` → `content`, each one UTM dimension more.
+
+### The puller — `saas`, hosted-only
+
+[`crates/modules/saas/src/purestat_pull.rs`](../crates/modules/saas/src/purestat_pull.rs),
+spawned from the module's `init` ([`lib.rs:92`](../crates/modules/saas/src/lib.rs)). No
+self-host profile compiles `saas`, and without `ROOMLER__GROWTH__PURESTAT_API_KEY` (or with
+`growth.enabled = false`) it starts nothing and logs that once.
+
+| Rule | Value | Where |
+|---|---|---|
+| **The horizon** | the last 7 closed UTC days; today is never pulled | `FREEZE_DAYS` ([`purestat_pull.rs:76`](../crates/modules/saas/src/purestat_pull.rs)) |
+| **Frozen** | a day older than the horizon is never pulled again and never rewritten — pulled or not | `due_days` ([`purestat_pull.rs:123`](../crates/modules/saas/src/purestat_pull.rs)) |
+| **A cycle** | starts at 01:00 UTC (purestat closes a visit 30 min after its last event); every day of the horizon is re-pulled once per cycle, which is what catches a late event | `CYCLE_HOUR_UTC` |
+| **A failure** | the day stays due, so the next hourly tick retries; after a fatal error (no key, 401, timeout, unreachable) the run stops asking and records the same reason for every day it owed | `run_once` ([`purestat_pull.rs:309`](../crates/modules/saas/src/purestat_pull.rs)) |
+| **Once across pods** | a DB-name-scoped Redis `NX` claim per tick (`roomler:growth-purestat-pull:<db>`), as the stats rollup and the reapers; without Redis the pod runs locally | `spawn_puller` ([`purestat_pull.rs:370`](../crates/modules/saas/src/purestat_pull.rs)) |
+| **Idempotent** | each row is `$set` on its own `_id` — a day pulled twice holds one copy; an unchanged row is not written; a row of the pulled metrics the pull no longer carries is deleted (write-then-prune, never an empty day) | `GrowthDao::replace_daily` ([`growth.rs:425`](../crates/services/src/dao/growth.rs)) |
+
+A day is three purestat queries ([`pull_day`](../crates/modules/saas/src/purestat_pull.rs)),
+each row's `dims.by` naming its breakdown:
+
+| `dims.by` | other dims | metrics (`growth_daily.metric`) |
+|---|---|---|
+| `site` | — | `visitors` `visits` `pageviews` `reads` `goal.signup` `goal.subscribe` `goal.install-copy` `goal.github-outbound` |
+| `campaign` | the normalised key: `source`, and `medium` / `campaign` / `content` when present | the same |
+| `path` | `path` (trimmed, control characters dropped, ≤ 200 characters, must start with `/`) | `visitors` `pageviews` `reads` |
+
+- **Spellings fold.** Raw rows that normalise to one key are **summed** (`YouTub` and
+  `youtube`) — an upper bound on unique visitors, since a visitor who arrived by both
+  spellings counts twice. purestat's own number for the key is the live table's. Since
+  purestat v0.1.9 its v1 query answers `utm_source` / `utm_medium` already normalised (and
+  counts their spellings as one, uniquely); our normalisation is a fixed point on its output,
+  so both sides stay right against either version, and a fold is now mostly a campaign or
+  content written in two cases.
+- **A zero is not stored.** On a day whose `growth_pulls` row is `ok`, a missing row IS a
+  measured zero; on a day with no pull row, or a `failed` one, it is "not pulled" (principle 4).
+- **A goal the site does not define** costs the conversions, not the day: the breakdowns are
+  retried without goals, `growth_pulls.missing_goal` names it, and the goal rows an earlier
+  pull stored are left as they were.
+- `reads` (pageviews visible ≥ 30 s) is the engagement purestat's v1 contract carries; it has
+  **no engaged-visitor metric**, so the spec's "engaged visitors" are `reads` here.
+- The `_id` is escaped ([`daily_id`, growth.rs:103](../crates/services/src/dao/growth.rs)):
+  `%` `,` `=` `:` inside a value are percent-encoded, so a crafted UTM value cannot forge
+  another row's id. P3's ids, which contain none of them, are unchanged.
+
+**`growth_pulls`** — one row per `(source, day)` attempted, `_id = "purestat:YYYY-MM-DD"`
+([`GrowthPull`, growth.rs:177](../crates/services/src/dao/growth.rs)):
+
+| Field | Meaning |
+|---|---|
+| `status` | `ok` once a pull of the day succeeded — its rows ARE the day's rows; `failed` while none has. A later failed attempt **never** turns an `ok` day `failed` (one pipeline update decides it from the stored row) |
+| `pulled_at` · `attempted_at` · `attempts` | the last success, the newest attempt, how many |
+| `rows` | the `growth_daily` rows the last good pull left |
+| `error` | what the newest attempt met (`purestat unreachable: unauthorized (401)`), never a credential; `null` when it succeeded |
+| `missing_goal` · `truncated` | a goal the site did not define; a breakdown cut at the client's 1,000-row bound |
+
+### The Campaigns table
+
+`GET /api/admin/growth/campaigns?since&until&by&include_internal`
+([`campaigns.rs:502`](../crates/api/src/growth/campaigns.rs)) — platform admins only, **404**
+otherwise and when `growth.enabled = false`, like every growth route.
+
+| Parameter | Values | Default |
+|---|---|---|
+| `since`, `until` | UTC days `YYYY-MM-DD`, **both inclusive**; `until` never after today; at most 366 days (purestat's own bound) | the 28 closed days ending yesterday |
+| `by` | `source` · `medium` · `campaign` · `content` — the key depth | `campaign` |
+| `include_internal` | `true` = the raw totals, exclusion set empty | `false` |
+
+- **The web plane is live.** One purestat breakdown by exactly the depth's UTM dimensions
+  over exactly the range, plus one totals query with no dimension — so a row's `visitors` is
+  purestat's own number for that key and range (AC16), unless `spellings > 1` says several raw
+  spellings were summed into it (from purestat v0.1.9 on, only a campaign or content written
+  in two cases can still do that: source and medium arrive normalised).
+- **The account plane is P2's** — `funnel::read` and `funnel::group_by`
+  ([`funnel.rs:409`](../crates/api/src/growth/funnel.rs)), the same `outcome` the funnel
+  tallies with, grouped by `CampaignKey::normalized` of the owner's `signup_attribution`; the
+  exclusion set applies. A unit test asserts a grouping agrees with the funnel's own
+  breakdown.
+- **Joined in code by the key** ([`join`, campaigns.rs:341](../crates/api/src/growth/campaigns.rs)):
+  a key on one plane only is still a row — a **measured zero** on the other when that plane
+  answered. Sorted by visitors, then sign-ups; at most 500 rows (`rows_truncated` says so).
+
+| Cell | What | Not measured when |
+|---|---|---|
+| `web.visitors` `visits` `pageviews` `reads` | purestat over the range | no key, 401, timeout, unreachable — **every** web cell then carries the reason, never 0 (`web_not_measured` at the top) |
+| `web.goals` | `signup` `subscribe` `install_copy` `github_outbound`, as unique visitors | a goal the site does not define (`conversions` names it) |
+| `web.spellings` | raw purestat rows folded into the key; 0 for a key purestat saw no visit of | — |
+| `signups` · `org_created` · `activated` · `first_value` | the funnel's steps with `pending` / `settled` | `activated` / `first_value` are `null` without `fleet` (or a value module), and `not_measured` names it |
+| `paid` | — | always, until P4 (`arrives_with: "P4"`) |
+| `reach` | — | always, until P8 (`arrives_with: "P8"`) |
+| `coverage` | purestat `signup` goals ÷ the server's sign-ups for the key; `ratio` only at n ≥ 30 | the web plane or the goal is not measured |
+| `rates` | `signup_per_visitor` (n = visitors), `activation`, `first_value` (n = settled), each `{n, value}` with `value` only at n ≥ 30 | the side it rests on is not measured (`null`) |
+
+`totals` carries the range's unique visitors (all traffic, keyed or not), the sign-ups and
+those with a key, and the overall coverage. `pulls` summarises `growth_pulls` over the range —
+`days`, `pulled`, `failed`, `not_pulled`, the newest error — and says `saas module not
+mounted (the puller runs there)` when it is; the live table does not read the frozen rows,
+but its reader can see whether they exist.
+
+The SPA's `/observability/growth` gains a **Campaigns** tab
+([`GrowthCampaigns.vue`](../ui/src/components/growth/GrowthCampaigns.vue)): the range, the
+depth, include-internal, the totals, the pull state, and the table — a `not_measured` cell is
+a muted chip with its reason on hover, a rate appears only with its n ≥ 30, and every UTM
+value is rendered as text, never `v-html`.
+
 ## The `/observability` page as a whole
 
 | Tab / surface | What it shows | Route family |
@@ -448,10 +597,15 @@ without the `fleet` module, never 0.
 | Orgs, machines, calls, users | platform-wide inventories and series | `/api/admin/stats/{orgs,machines,calls,users}` |
 | Usage | per-user minutes and bytes across every org | `/api/admin/stats/usage*` |
 | Attribution (FR-88) | sign-ups by campaign key and how many activated | `/api/admin/stats/attribution` |
-| **Growth** (FR-102) | the daily digest (P1d) and the account funnel, cohorts and org views (P2) | `/api/admin/growth/*` |
+| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), and the Campaigns table (P6) | `/api/admin/growth/*` |
 
 ## Field verification
 
 The digest's counts for a closed day are to be checked against a hand count from Mongo on
 production (AC23); the log of that check lives in the FR's spec. Until a purestat key exists
 for `roomler.ai`, the web sections read "not measured" by design.
+
+The Campaigns table's visitors for a closed day are to equal purestat's own number for the
+same filter, and read "not measured" with the key revoked (AC16 — a production check after the
+roll); the integration suite covers the same two halves against a fake purestat
+(`crates/tests/src/growth_campaigns_tests.rs`).
