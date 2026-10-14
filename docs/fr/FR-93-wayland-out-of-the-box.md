@@ -6,7 +6,7 @@ desktop brief and the server's count, #2028) and P2c (#2020) shipped in **0.4.13
 promoted. P2d is decided (operator, 2026-10-12): the portal waits for it. P2d-1, the agent half, shipped in
 **0.4.131**; P2d-2, the viewer half, is lab-verified on prod's viewer (2026-10-13). P2d-3, the flip (the portal
 automatic where mutter is absent), shipped in **0.4.132** with P2d-2's agent half and P4a; P4b in **0.4.133**; P3c
-in **0.4.134** (2026-10-13). P3d, P5a and P5b (#2145) are merged and wait for a release; P3e is in review. Ticked: AC1–AC5,
+in **0.4.134** (2026-10-13). P3d, P5a, P5b (#2145) and P3e are merged and wait for a release; P5c is in review. Ticked: AC1–AC5,
 AC9, AC13. The operator approved the
 plan and P0 (the
 lab on zeus, enrolled in the vmtest org: D2, D8). **D1 is decided: split.** Per-user installs go auto, system installs
@@ -539,6 +539,21 @@ automatic mutter open then waits out the lock (`open_through_wait` with `GNOME_L
 The viewer titles the notice by `for`, and shows no "if nobody answers" deadline for a lock
 ([`linux-capture.md`](../linux-capture.md) §5.3).
 
+**As built (P5c, 2026-10-14): mutter's capture records the monitor again after its mode changes.** Measured first:
+a resolution change froze the mutter arm on its last frame for good, with nothing said, even after the mode went
+back. Mutter ends a monitor's recording when that monitor's configuration changes. Its ScreenCast Stream object and
+PipeWire node vanish, both sessions stay open, and no `Closed` is sent, so P5b's watcher never fires; our stream
+just goes from *streaming* to *paused*. The PipeWire consumer now exposes its stream state, and the mutter helper
+ends the capture once its stream has been outside *streaming* for 2 s (exit status 4): the reopen records the monitor
+at its new size. The DRM scanout and KDE's portal follow the same change in about a second on their own
+([`linux-capture.md`](../linux-capture.md) §5.4).
+
+**Measured (2026-10-14): KDE's logout and login is #2144.** The oracle's `loginctl terminate-session` is not a logout
+on Plasma 6, where KWin and plasma run as user services that outlive the session scope. With KDE's own logout
+(`org.kde.Shutdown.logout`) on a lingering user, the released 0.4.133 stopped with the session and never started
+again. P5a's unit file and start-time repair bring it back: *Reconnecting* during the logout, and a new picture
+11.9 s after the login (step log 70).
+
 ### 4.7 Consent and the indicator (P6 — with FR-27's owner)
 
 - Field-run the companion's consent window and banner on GNOME 50 and Plasma 6.6: QMP answers, and
@@ -591,8 +606,9 @@ bridge for text and images in the lab before deciding.
 | ↳ P4a | mutter's own RemoteDesktop drives the mutter screencast and takes the viewer's input; the route carries its kind, so `rc:input-reach` and the brief name it | `mutter_input` | ✅ lab (`3f9ad6464`), GNOME 50 per-user, no key, the AC4 oracle. **🔴 0.4.131:** the picture, and 0 events at the probe, all 7 input checks failed. **P4a:** all 7 passed: the three points exact, click, wheel down, "hello 123", Shift+a as "A"; the brief `input_reach=full`. `mutter_input = false` gives the view-only arm back | S |
 | ↳ P4b | the automatic portal asks for remote control (`linux-capture.md` §1.2); KDE's negated smooth scroll corrected; every portal input call waits for its reply, which keeps the calls in order (§4.3) | `portal_input = false`; `ROOMLERD_PORTAL_KDE_SCROLL_FIX=0` | ✅ lab (`9a8e20699`, then `64f00509f`), KDE per-user, no key: KDE's *Remote Control* dialog; the AC4 oracle 7/7, three runs; a typing stress's 113 characters exact, four runs. **🔴 the first candidate (`fe0c3ae93`, calls unawaited):** the oracle typed `helo 123A`, and the stress got 41 of 452 characters wrong. A denial: KDE asked again for the screen only, the session ran view-only, and its reach banner named reconnecting to allow remote control | S |
 | **P5** | lifecycle (§4.6) | — | lab | M |
-| ↳ P5a | the per-user unit is wanted by `graphical-session.target` as well as `default.target`, and a daemon enabled before that enables itself again once at start (#2144) | `ROOMLERD_UNIT_REPAIR=0` | ✅ lab (`91017d9e4`), GNOME 50 per-user, a lingering user. **🔴 0.4.132:** after a logout and a login the daemon never came back (step log 66). **P5a:** the new unit file laid down as an upgrade does, then the candidate's start repaired the enablement (one log line; a restart repaired nothing more); the logout read *reconnecting* within 1.4 s, and after the login the daemon started with the session and the viewer had a new picture 4.9 s after the final Enter | S |
+| ↳ P5a | the per-user unit is wanted by `graphical-session.target` as well as `default.target`, and a daemon enabled before that enables itself again once at start (#2144) | `ROOMLERD_UNIT_REPAIR=0` | ✅ lab (`91017d9e4`), GNOME 50 per-user, a lingering user. **🔴 0.4.132:** after a logout and a login the daemon never came back (step log 66). **P5a:** the new unit file laid down as an upgrade does, then the candidate's start repaired the enablement (one log line; a restart repaired nothing more); the logout read *reconnecting* within 1.4 s, and after the login the daemon started with the session and the viewer had a new picture 4.9 s after the final Enter. **KDE** (Plasma 6.7.5 per-user, a lingering user, KDE's own logout; step log 70): 🔴 0.4.133 never started again after the login; with P5a, *Reconnecting* +3.6 s into the logout and a new picture 11.9 s after the login | S |
 | ↳ P5b | a GNOME screen lock waited out: the helper ends on mutter's `Closed`, the reopen waits for the unlock with the controller told why (`rc:media-waiting`, `screen_unlock`); `OpenWait` names what it waits for (the dialog's hint names remote control, P4b's follow-up); the viewer words the notice by it (#2145) | — (the wait engages only where the open already failed); `ROOMLERD_MEDIA_WAITING=0` silences the notice | ✅ lab (`f48b66615`: the branch's production code; later commits reword log lines and comments), GNOME 50 per-user, mutter. **🔴 0.4.132:** frozen at the first lock for good, no reason (step log 66). **P5b:** lock → the notice within 1.6 s; unlock → the desktop live 2.8 s after the Enter; GNOME's idle blank (which locks) → the notice within 0.5 s; wake → the notice held (still locked); unlock → live in 2.2 s. The journal: `mutter closed the session` → the rebuild → `GNOME's screen is locked … waiting for the unlock` → the screencast back ~2 s after the unlock | S |
+| ↳ P5c | mutter's capture records the monitor again after its mode changes: the PipeWire consumer exposes its stream state, and the mutter helper ends the capture once the stream has been outside *streaming* for 2 s, so the reopen records the monitor at its new size (`linux-capture.md` §5.4) | — (it acts only on a stream that already stopped) | ✅ lab (`304cff554`), GNOME 50 per-user, mutter, the lifecycle oracle through 1280×800 → 1024×768 → 1280×800 with the stream size logged. **🔴 before** (the P5b build, whose frame loop is the release's): the stream stayed 1280×800 and froze at the first switch for good, no reason; mutter's Stream object and node gone, both sessions open. **P5c:** `mutter ended the stream`, a new node, 1024×768 4.4 s after the switch and 1280×800 4.5 s after the switch back, live both times | S |
 | **P6** | consent and indicator (§4.7) | FR-27's switches | lab GNOME + KDE | M |
 | **P7** | clipboard (§4.8) | `ROOMLERD_SESSION_CLIPBOARD=0` | lab | M |
 | **P8** | leftovers: FR-45 AC8 + P5b, FR-56 AC7/AC9/AC10, FR-92 AC9, FR-85's Wayland rows | each FR's own | lab, WSL2 | S each |
@@ -718,8 +734,12 @@ New cells run three times before they are trusted. An entry in `expected-failure
   no reason). ✅ #2144 fixed in the lab by P5a (the daemon back, a picture 4.9 s after the login). ✅ #2145 fixed in
   the lab by P5b (the unlock notice within 1.6 s of a lock, the desktop live 2.2–2.8 s after the unlock). ✅ The DRM
   blank fixed in the lab by P3e (the notice 0.0 s after the screen went dark, a picture 1.0 s after the viewer's
-  mouse woke it; a session opened during the blank told at once, and live after the wake). Owed: the portal's logout
-  and login, user switch, resolution change, suspend, a compositor crash, and a released build.
+  mouse woke it; a session opened during the blank told at once, and live after the wake). ✅ The portal's logout and
+  login is #2144 (the oracle's `terminate-session` was no KDE logout), fixed in the lab by P5a on KDE too
+  (*Reconnecting* +3.6 s, a picture 11.9 s after the login; step log 70). ✅ A resolution change: the DRM scanout
+  and KDE's portal follow it in 1.1–1.6 s; mutter froze for good, fixed in the lab by P5c (the new size 4.4–4.5 s
+  after each switch). Owed: user switch, suspend (the lab guests have suspend-to-RAM off), a compositor crash, and
+  a released build.
 - [ ] **AC8** — an idle DRM session's CPU, measured before and after, within 2× of FR-29's X11 figure.
   ⏳ ✅ in the lab on P3d (`cac2d7c43`): the GNOME 50 system guest, an idle desktop on the viewer's default path,
   every `roomlerd` process's CPU over two 60 s windows. **57.9 %** of a core on the released 0.4.133, **5.5 % and
@@ -818,6 +838,8 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-13 | `wlab-gnome` (per-user, mutter) | P5b `f48b66615` | #2145: the lifecycle oracle through lock, unlock, GNOME's idle blank, wake, unlock | ✅ every event named its reason or came back within 10 s: the lock notice at +1.6 s and +0.5 s, the desktop live at +2.8 s and +2.2 s after each unlock. 🔴 0.4.132: frozen for good (step log 66) |
 | 2026-10-14 | `wlab-gnome-sys` (system, `drm_capture` + `uinput`) | 0.4.134, the release | P3e fail-first: what GNOME's idle blank does to KMS. The connector's sysfs, the atomic state in debugfs and a root `capture-smoke` through DRM, before the blank, during it and after a wake | the blank switches the CRTC off (`enable=0 active=0`, both planes `fb=0`), the connector stays `connected` with `dpms=Off`, and the screen measures 0.07 % lit; `capture-smoke` fails the DRM open (`no plane is bound…`), then scrap: `backend_error`. After the wake: `enable=1 active=1`, new framebuffers, 15 frames |
 | 2026-10-14 | `wlab-gnome-sys` (as above) | 0.4.134, then P3e `39a238b3e` | P3e / AC7: the lifecycle oracle through GNOME's idle blank, a wake by the viewer's own mouse and the unlock, for a session running through the blank and for one opened during it | 🔴 0.4.134: running, the last frame with no reason; opened during the blank, `backend_error` and no picture through the wake and the unlock. ✅ P3e: running, the notice at +0.0 s, a picture +1.0 s after the viewer's mouse, the unlock +1.2 s; opened during the blank, the notice at once, the first frame +1.5 s after the mouse, live +2.0 s after the unlock |
+| 2026-10-14 | `wlab-kde` (per-user, portal, a lingering user) | 0.4.133, the release; then P5a's unit file + the P3e candidate `39a238b3e` | AC7: KDE's own logout (`org.kde.Shutdown.logout`) and a login at the greeter, the user manager's units read over ssh, then the lifecycle oracle | 🔴 0.4.133: plasma, KWin and `graphical-session.target` stop and come back, `roomler.service` stops and **never starts again**. ✅ P5a: the start's one repair, *Reconnecting* +3.6 s into the logout, a new picture 11.9 s after the login. The step-66 reading (the last frame, ~30 s of black) was the oracle's `terminate-session`, which Plasma's user services outlive. Step log 70 |
+| 2026-10-14 | `wlab-gnome-sys` (DRM), `wlab-kde` (portal), `wlab-gnome` (mutter) | P3e `39a238b3e`; P3e; P5b `f48b66615`, then P5c `304cff554` | AC7: a resolution change, 1280×800 → 1024×768 → 1280×800 through each compositor's own display configuration, the viewer's stream size logged every 500 ms | ✅ DRM followed in 1.1 s and 1.2 s; ✅ KDE's portal in 1.1 s and 1.6 s. 🔴 mutter froze at the first switch for good, no reason: mutter's Stream object and node gone, both sessions open, our stream paused. ✅ P5c: 4.4 s and 4.5 s, live both times |
 
 ## 12. Related
 

@@ -434,6 +434,70 @@ pub mod helper {
     /// failure, so the journal tells the two apart; the parent reopens either.
     const EXIT_SESSION_CLOSED: i32 = 3;
 
+    /// FR-93 P5c — the exit status when the compositor ended the stream but
+    /// not the session: mutter ends a monitor's recording when that monitor's
+    /// configuration changes (a resolution change, a hotplug). The parent
+    /// reopens, which records the monitor anew.
+    const EXIT_STREAM_ENDED: i32 = 4;
+
+    /// FR-93 P5c — how long a stream may sit outside `STREAMING` before its
+    /// source counts as gone. A renegotiation pauses it for milliseconds; a
+    /// source that vanished leaves it paused for good.
+    const SOURCE_GONE_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// FR-93 P5c — whether a stream's source is gone: it has been outside
+    /// `STREAMING` for [`SOURCE_GONE_AFTER`], counted from `since`, which this
+    /// keeps (cleared by any return to `STREAMING`).
+    fn source_gone(
+        state: i32,
+        since: &mut Option<std::time::Instant>,
+        now: std::time::Instant,
+    ) -> bool {
+        if state == super::pipewire::PW_STREAM_STATE_STREAMING {
+            *since = None;
+            return false;
+        }
+        let at = *since.get_or_insert(now);
+        now.saturating_duration_since(at) >= SOURCE_GONE_AFTER
+    }
+
+    #[cfg(test)]
+    mod source_gone_tests {
+        use super::{SOURCE_GONE_AFTER, source_gone};
+        use crate::capture::portal::pipewire::PW_STREAM_STATE_STREAMING;
+        use std::time::{Duration, Instant};
+
+        const PAUSED: i32 = 2;
+
+        /// P5c — a pause as short as a renegotiation is not an end; one that
+        /// lasts SOURCE_GONE_AFTER is, and streaming again starts the count over.
+        #[test]
+        fn only_a_lasting_pause_ends_the_stream() {
+            let t0 = Instant::now();
+            let mut since = None;
+            assert!(!source_gone(PW_STREAM_STATE_STREAMING, &mut since, t0));
+            assert!(!source_gone(PAUSED, &mut since, t0));
+            assert!(!source_gone(
+                PAUSED,
+                &mut since,
+                t0 + Duration::from_millis(1900)
+            ));
+            assert!(!source_gone(
+                PW_STREAM_STATE_STREAMING,
+                &mut since,
+                t0 + Duration::from_secs(2)
+            ));
+            assert!(since.is_none(), "streaming again starts the count over");
+            let t1 = t0 + Duration::from_secs(3);
+            assert!(!source_gone(PAUSED, &mut since, t1));
+            assert!(source_gone(PAUSED, &mut since, t1 + SOURCE_GONE_AFTER));
+            assert!(
+                source_gone(0, &mut since, t1 + SOURCE_GONE_AFTER),
+                "unconnected too"
+            );
+        }
+    }
+
     /// P3c-ii, child side — open a session, then write frames on stdout until
     /// the parent goes away.
     ///
@@ -768,7 +832,7 @@ pub mod helper {
         // error: the loop below would wait for frames forever and the viewer
         // keep the last one. End the capture instead. The daemon's pump reopens
         // it, and the reopen waits for the unlock with the controller told why
-        // (`capture::open_through_lock`).
+        // (`capture::open_through_wait`).
         session.on_closed(|| {
             eprintln!(
                 "portal-helper: mutter closed the session (GNOME closes every screen cast when its \
@@ -780,12 +844,37 @@ pub mod helper {
         // ⚠️ `session` must stay alive for the whole loop — mutter tears the
         // session down with the D-Bus connection inside it, taking the node.
         let mut out = std::io::stdout().lock();
-        while let Ok((h, bytes)) = handle.frames.recv() {
-            if out.write_all(&h.encode()).is_err() || out.write_all(&bytes).is_err() {
-                break;
+        // FR-93 P5c — mutter ends a monitor's recording when that monitor's
+        // configuration changes, and leaves both sessions open: no `Closed`,
+        // no error, the stream paused for good. Waiting on frames alone would
+        // wait forever (an idle desktop sends none either, but stays
+        // STREAMING), so the stream's state is read between frames, and a
+        // stream that has left STREAMING for good ends the capture: the
+        // reopen records the monitor at its new size.
+        let mut not_streaming_since = None;
+        loop {
+            match handle
+                .frames
+                .recv_timeout(std::time::Duration::from_millis(500))
+            {
+                Ok((h, bytes)) => {
+                    if out.write_all(&h.encode()).is_err() || out.write_all(&bytes).is_err() {
+                        break;
+                    }
+                    if out.flush().is_err() {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            if out.flush().is_err() {
-                break;
+            let state = handle.state.load(std::sync::atomic::Ordering::Relaxed);
+            if source_gone(state, &mut not_streaming_since, std::time::Instant::now()) {
+                eprintln!(
+                    "portal-helper: mutter ended the stream (it ends a monitor's recording when the \
+                     monitor's configuration changes); ending the capture"
+                );
+                std::process::exit(EXIT_STREAM_ENDED);
             }
         }
         drop(session);
