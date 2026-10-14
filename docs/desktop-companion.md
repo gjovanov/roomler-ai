@@ -39,7 +39,7 @@ flowchart LR
 ```
 
 ⚠️ The LocalAPI is the trust boundary. On Windows its SDDL grants **SYSTEM, Administrators
-and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:1740`): any person
+and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:1746`): any person
 logged in at the machine can call it, a sandboxed low-integrity process cannot. Everything
 below that lets the companion *change* something is therefore something any interactive user
 can do — which is why the device-side rules (the `files_dir` SYSTEM rule, the visibility rule
@@ -296,7 +296,7 @@ sequenceDiagram
 
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
-  (`exit_for_requested_restart`, `agents/roomlerd/src/main.rs:1514`).
+  (`exit_for_requested_restart`, `agents/roomlerd/src/main.rs:1522`).
 - ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
   daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
   systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's

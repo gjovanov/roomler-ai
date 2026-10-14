@@ -165,6 +165,18 @@ enum Member {
         session: String,
         reply: Reply<bool>,
     },
+    Holds {
+        session: String,
+        reply: Reply<bool>,
+    },
+    PurgeDebt {
+        session: String,
+        reply: Reply<Option<WorkplaceRecord>>,
+    },
+    ClearPurgeDebt {
+        session: String,
+        reply: Reply<()>,
+    },
     Search {
         query: String,
         sessions: Vec<String>,
@@ -578,6 +590,28 @@ impl StoreHandle {
         self.ask(|reply| Member::IsPurged { session, reply }).await
     }
 
+    /// FR-90 P2g-1 — whether this store holds anything of `session`.
+    pub(crate) async fn holds(&self, session: &str) -> Result<bool, WriterError> {
+        let session = session.to_string();
+        self.ask(|reply| Member::Holds { session, reply }).await
+    }
+
+    /// FR-90 P2g-1 — what the account still holds of a purged `session`.
+    pub(crate) async fn purge_debt(
+        &self,
+        session: &str,
+    ) -> Result<Option<WorkplaceRecord>, WriterError> {
+        let session = session.to_string();
+        self.ask(|reply| Member::PurgeDebt { session, reply }).await
+    }
+
+    /// FR-90 P2g-1 — the account's part of `session`'s purge is done.
+    pub(crate) async fn clear_purge_debt(&self, session: &str) -> Result<(), WriterError> {
+        let session = session.to_string();
+        self.ask(|reply| Member::ClearPurgeDebt { session, reply })
+            .await
+    }
+
     /// Full-text search over the sessions named, best first. An empty list
     /// finds nothing, never everything: a viewer's grant names what it may
     /// read, and only those are searched.
@@ -863,6 +897,15 @@ fn member(store: &mut Store, publish: &broadcast::Sender<Arc<EventEnvelope>>, cm
         }
         Member::IsPurged { session, reply } => {
             let _ = reply.send(store.is_purged(&session));
+        }
+        Member::Holds { session, reply } => {
+            let _ = reply.send(store.holds(&session));
+        }
+        Member::PurgeDebt { session, reply } => {
+            let _ = reply.send(store.purge_debt(&session));
+        }
+        Member::ClearPurgeDebt { session, reply } => {
+            let _ = reply.send(store.clear_purge_debt(&session));
         }
         Member::Search {
             query,

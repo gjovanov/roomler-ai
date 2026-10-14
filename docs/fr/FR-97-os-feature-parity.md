@@ -75,7 +75,7 @@ prevent, and the guard re-asserts it on every tick.
 - A restart does not heal it: `purge_split_default` runs at boot, then the runtime re-installs from the persisted
   `overlay_exit_node`.
 - Reach: a Mac running the opt-in root daemon whose operator sets `overlay_exit_node`. The key is not in
-  `DesiredConfig` (`crates/remote_control/src/models.rs:1768-1797`), so no server push can set it; a local
+  `DesiredConfig` (`crates/remote_control/src/models.rs:1832-1878`), so no server push can set it; a local
   `sudo roomler config set` can, and so can an `exec` on the daemon's row. Once it lands, the control WS that the
   `exec` came in on is captured too, so the same channel cannot undo it.
 - `NetstackTun` inherits the same default. It installs no OS routes, so it cannot wedge, but `roomler status`

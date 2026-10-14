@@ -466,6 +466,7 @@ enum Launcher {
 /// P1j — terminal sessions adopted on this device.
 mod adopt;
 mod follow;
+mod purge;
 mod replica;
 mod stream;
 
@@ -1174,6 +1175,33 @@ pub fn handle_stop(session_id: ObjectId, fence: u64, reason: String, is_primary:
     }
 }
 
+/// FR-90 P2g-1 — `rc:hive.purge`: the session purged from this device
+/// ([`Supervisor::purge`]), under the start lock, so no start of it races the
+/// purge, and answered with `rc:hive.purge_ack` on `tx`, the connection it came
+/// on. The primary enrollment's only, like every Hive frame.
+pub fn handle_purge(
+    purge_id: ObjectId,
+    session_id: ObjectId,
+    is_primary: bool,
+    tx: mpsc::Sender<ClientMsg>,
+) {
+    if !is_primary {
+        warn!(session = %session_id, "hive: rc:hive.purge ignored — not the primary enrollment");
+        return;
+    }
+    let Some(sup) = global() else {
+        debug!(session = %session_id, "hive: rc:hive.purge with no supervisor");
+        return;
+    };
+    tokio::spawn(async move {
+        let ack = {
+            let _serial = sup.start_lock.lock().await;
+            sup.purge(purge_id, session_id).await
+        };
+        let _ = tx.send(ack).await;
+    });
+}
+
 /// FR-90 P2e-2 — `rc:hive.lease`: the server's word, on `tx`, the connection
 /// it came on, that this device holds `session_id` at `fence`
 /// ([`Supervisor::take_lease`]). The primary enrollment's only, like every
@@ -1653,6 +1681,27 @@ impl Supervisor {
                 HiveRefusal::Other,
                 format!("unknown harness {:?}", order.harness),
             );
+        }
+        // P2g-1 — a session purged here never comes back: removal is final.
+        // Read under the start lock, which a purge holds for all its steps.
+        if let Ok(store) = &self.store {
+            match store.is_purged(&order.session_id.to_hex()).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Answer::refused(
+                        HiveRefusal::Other,
+                        "this session was purged from this device",
+                    );
+                }
+                Err(e) => {
+                    return Answer::refused(
+                        HiveRefusal::Other,
+                        format!(
+                            "this device's store could not say whether the session was purged: {e}"
+                        ),
+                    );
+                }
+            }
         }
         // P2f-3a — a fork stays one: a start that does not say so takes what
         // this device hosts of it at this fence, so its checkpoints never
@@ -9737,6 +9786,147 @@ done
                 _ => None,
             })
             .collect()
+    }
+
+    /// FR-90 P2g-1 — `r.sup`'s purge of `sid`, under the start lock as the
+    /// frame's handler takes it: its store and account parts and the detail.
+    async fn purged(
+        r: &Rig,
+        sid: ObjectId,
+    ) -> (
+        roomler_ai_remote_control::hive::HivePurgePart,
+        roomler_ai_remote_control::hive::HivePurgePart,
+        Option<String>,
+    ) {
+        let purge = ObjectId::new();
+        let ack = {
+            let _serial = r.sup.start_lock.lock().await;
+            r.sup.purge(purge, sid).await
+        };
+        match ack {
+            ClientMsg::HivePurgeAck {
+                purge_id,
+                session_id,
+                store,
+                account,
+                detail,
+            } => {
+                assert_eq!((purge_id, session_id), (purge, sid));
+                (store, account, detail)
+            }
+            other => panic!("not a purge's answer: {other:?}"),
+        }
+    }
+
+    /// FR-90 P2g-1 — a session that runs here, purged: its run stops first;
+    /// then the daemon's copy, its runtime directory and what the device
+    /// hosts of it go, and, as its account, its state directory. Done, done.
+    /// Its id stays: a purge again finds it done and nothing of the
+    /// account's, and a start of it is refused.
+    #[tokio::test]
+    async fn a_session_running_here_is_purged_whole_and_never_comes_back() {
+        use roomler_ai_remote_control::hive::HivePurgePart::{Done, NotThere};
+        let me = ObjectId::new();
+        let mut r = moving_rig(me, 4);
+        let mut o = order(&r);
+        o.replicated = true;
+        let sid = o.session_id;
+        assert!(r.sup.start(o.clone(), true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        r.sup.prompt(sid, None, "hi".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        let hex = sid.to_hex();
+        let state_dir = r
+            .root
+            .path()
+            .join("home")
+            .join(".roomler")
+            .join("hive")
+            .join(&hex);
+        let run_dir = r.root.path().join("run").join(&hex);
+        assert!(state_dir.is_dir() && run_dir.is_dir());
+        assert!(r.store.holds(&hex).await.unwrap());
+        assert!(r.sup.holds_live(sid));
+
+        // What went first, each by itself; the answer last.
+        let answer = purged(&r, sid).await;
+        assert!(!r.sup.holds_live(sid), "its run stopped first");
+        assert!(!r.store.holds(&hex).await.unwrap(), "nothing of it is held");
+        assert!(r.store.is_purged(&hex).await.unwrap(), "its id is kept");
+        assert!(!run_dir.exists(), "its runtime directory went");
+        assert!(!state_dir.exists(), "its account's state directory went");
+        assert_eq!(r.store.purge_debt(&hex).await.unwrap(), None, "settled");
+        assert_eq!(answer, (Done, Done, None));
+
+        assert_eq!(
+            purged(&r, sid).await,
+            (Done, NotThere, None),
+            "again: done, and nothing of the account's"
+        );
+        let answer = r.sup.start(o, true).await;
+        assert!(
+            answer.refused == Some(HiveRefusal::Other)
+                && answer
+                    .detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("purged")),
+            "a purged session is never started: {answer:?}"
+        );
+    }
+
+    /// FR-90 P2g-1 — a session this device never held: not there, twice.
+    #[tokio::test]
+    async fn a_session_never_here_is_purged_as_not_there() {
+        use roomler_ai_remote_control::hive::HivePurgePart::NotThere;
+        let r = rig(true, 4);
+        assert_eq!(
+            purged(&r, ObjectId::new()).await,
+            (NotThere, NotThere, None)
+        );
+    }
+
+    /// FR-90 P2g-1 — the account's part failed (its state directory is a
+    /// link, which is left as it is): the store's part is done, the account's
+    /// says why and its debt is kept. Delivered again once the link is gone,
+    /// only the account's part is done again, and settled.
+    #[tokio::test]
+    async fn an_account_part_that_failed_is_done_at_the_next_delivery() {
+        use roomler_ai_remote_control::hive::HivePurgePart::{Done, Failed};
+        let me = ObjectId::new();
+        let mut r = moving_rig(me, 4);
+        let o = ran_twice(&mut r).await;
+        let (sid, hex) = (o.session_id, o.session_id.to_hex());
+        let state_dir = r
+            .root
+            .path()
+            .join("home")
+            .join(".roomler")
+            .join("hive")
+            .join(&hex);
+        let elsewhere = r.root.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep"), "x").unwrap();
+        std::fs::remove_dir_all(&state_dir).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &state_dir).unwrap();
+
+        let (store, account, detail) = purged(&r, sid).await;
+        assert_eq!((store, account), (Done, Failed), "{detail:?}");
+        assert!(
+            detail.as_deref().is_some_and(|d| d.contains("link")),
+            "{detail:?}"
+        );
+        assert!(
+            r.store.purge_debt(&hex).await.unwrap().is_some(),
+            "kept for the next delivery"
+        );
+        assert!(elsewhere.join("keep").exists(), "nothing through the link");
+
+        std::fs::remove_file(&state_dir).unwrap();
+        std::fs::create_dir_all(state_dir.join("claude")).unwrap();
+        assert_eq!(purged(&r, sid).await, (Done, Done, None));
+        assert!(!state_dir.exists());
+        assert_eq!(r.store.purge_debt(&hex).await.unwrap(), None, "settled");
     }
 
     /// P2e-5 — a start the record moved here from another device takes the

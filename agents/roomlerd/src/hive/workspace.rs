@@ -1105,6 +1105,65 @@ fn empty_tree(git: &Git, place: &Place) -> Result<String, String> {
 
 /// `git`, run in `folder` against `repo` (and `index`), with nothing of the
 /// caller's git environment, no hook, no fsmonitor and no automatic gc.
+/// FR-90 P2g-1 — what the purged session `sid`'s checkpoints left in
+/// `folder`'s own repository, deleted as the account: each ref under
+/// `refs/hive/<sid>/`, through `update-ref`, and the checkpoints' own index
+/// with its lock in the git directory. The objects they wrote stay,
+/// unreachable, for the person's own gc; the person's branches, index and
+/// work tree are never touched. Nothing for a folder that is gone or in no
+/// repository: a shadow lives in the session's state directory. Answers
+/// `(refs deleted, index files removed)`.
+pub(crate) fn forget(git: &Git, folder: &Path, sid: &str) -> Result<(usize, usize), String> {
+    if sid.len() != 24
+        || !sid
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(format!("{sid:?} is not a session id"));
+    }
+    if !folder.is_dir() {
+        return Ok((0, 0));
+    }
+    let Some(repo) = own_repo(git, folder)? else {
+        return Ok((0, 0));
+    };
+    let prefix = format!("refs/hive/{sid}/");
+    let listed = run(
+        cmd(git, folder, Some(&repo), None).args([
+            "for-each-ref",
+            "--format=%(refname)",
+            prefix.as_str(),
+        ]),
+        "for-each-ref",
+    )?;
+    let mut refs = 0;
+    for name in listed.lines().filter(|l| !l.is_empty()) {
+        // The pattern already holds it there; held again, as a ref named by
+        // a repository the person owns.
+        if !name.starts_with(&prefix) || name.contains("..") {
+            return Err(format!("git listed {name:?} under {prefix}"));
+        }
+        run(
+            cmd(git, folder, Some(&repo), None).args(["update-ref", "-d", name]),
+            "update-ref -d",
+        )?;
+        refs += 1;
+    }
+    let mut files = 0;
+    for name in [
+        format!("hive-{sid}.index"),
+        format!("hive-{sid}.index.lock"),
+    ] {
+        let path = repo.git_dir.join(&name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => files += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("removing {}: {e}", path.display())),
+        }
+    }
+    Ok((refs, files))
+}
+
 fn cmd(git: &Git, folder: &Path, repo: Option<&Repo>, index: Option<&Path>) -> Command {
     let mut c = Command::new(&git.program);
     c.current_dir(folder);

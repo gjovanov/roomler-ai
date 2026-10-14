@@ -4486,6 +4486,21 @@ async fn handle_server_msg(
             }
         }
 
+        // FR-90 P2g-1 — the session purged from this device, its own copy and
+        // what its account holds of it, answered per part on this connection.
+        ServerMsg::HivePurge {
+            purge_id,
+            session_id,
+        } => {
+            #[cfg(hive_host)]
+            crate::hive::handle_purge(purge_id, session_id, ctx.is_primary, outbound_tx.clone());
+            #[cfg(not(hive_host))]
+            {
+                let _ = purge_id;
+                debug!(session = %session_id, "rc:hive.purge ignored — this build does not run agent sessions");
+            }
+        }
+
         // FR-90 P2e-2 — the server's word, on THIS connection, that this
         // device holds the session at that fence: a leased run calls the model
         // again, and a leased session it hosted launches.

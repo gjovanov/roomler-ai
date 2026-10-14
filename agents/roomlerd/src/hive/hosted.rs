@@ -239,14 +239,16 @@ impl Hosted {
 
     /// FR-90 P2e-1 — forget `session` while its record is at `fence` or an
     /// older one: what a run removes is its own, and a newer run's record is
-    /// never an older run's to take.
-    pub(crate) fn remove_upto(&mut self, session: &str, fence: u64) {
+    /// never an older run's to take. Whether anything went (P2g-1).
+    pub(crate) fn remove_upto(&mut self, session: &str, fence: u64) -> bool {
         let before = self.sessions.len();
         self.sessions
             .retain(|e| !(e.session == session && e.fence <= fence));
-        if self.sessions.len() != before {
+        let removed = self.sessions.len() != before;
+        if removed {
             self.save();
         }
+        removed
     }
 
     /// A failure is logged and nothing else: the session runs on, and only
