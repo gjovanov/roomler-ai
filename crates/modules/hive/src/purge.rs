@@ -425,18 +425,51 @@ async fn entries_for(state: &HiveState, s: &AgentSession) -> Result<Vec<PurgeEnt
 }
 
 /// What issuing a purge came to.
-enum Issued {
+pub(crate) enum Issued {
     /// It took: the purge, and the record as it stood before.
     Took(Box<HivePurge>, Box<AgentSession>),
     /// Another asking purged it first.
     Already,
     Refused(PurgeDenyReason),
+    /// P2g-3 — a retention purge of a session that runs again: kept.
+    Live,
+}
+
+/// Why a purge was issued, as the purge and its audit name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PurgeReason {
+    /// Its owner deleted the session (P2g-2).
+    Owner,
+    /// Its organization's `retention_days` no longer keep it (P2g-3,
+    /// [`crate::retention`]).
+    Retention,
+}
+
+impl PurgeReason {
+    /// The spelling on the purge and in the audit. Locked by test.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Retention => "retention",
+        }
+    }
+
+    /// Retention purges only a session that is over: a live one renews by
+    /// its own activity, and is its owner's to purge.
+    const fn only_ended(self) -> bool {
+        matches!(self, Self::Retention)
+    }
 }
 
 /// Write the purge, then make the record its tombstone; should the record
 /// change between its read and the tombstone, the purge goes and is made
 /// again from the record as it is now.
-async fn issue(state: &HiveState, mut s: AgentSession, by: ObjectId) -> Result<Issued, ApiError> {
+pub(crate) async fn issue(
+    state: &HiveState,
+    mut s: AgentSession,
+    by: ObjectId,
+    why: PurgeReason,
+) -> Result<Issued, ApiError> {
     let sid =
         s.id.ok_or_else(|| ApiError::Internal("a session record without an id".into()))?;
     for _ in 0..ISSUE_ATTEMPTS {
@@ -449,7 +482,7 @@ async fn issue(state: &HiveState, mut s: AgentSession, by: ObjectId) -> Result<I
             session_id: sid,
             owner_id: s.owner_id,
             by,
-            reason: "owner".to_string(),
+            reason: why.as_str().to_string(),
             room_id: s.room_id,
             devices: entries,
             at,
@@ -463,7 +496,7 @@ async fn issue(state: &HiveState, mut s: AgentSession, by: ObjectId) -> Result<I
         };
         let took = state
             .sessions
-            .tombstone(s.tenant_id, s.owner_id, sid, &mark, &ids)
+            .tombstone(s.tenant_id, s.owner_id, sid, &mark, &ids, why.only_ended())
             .await;
         match took {
             Ok(Some(before)) => return Ok(Issued::Took(Box::new(p), Box::new(before))),
@@ -487,6 +520,11 @@ async fn issue(state: &HiveState, mut s: AgentSession, by: ObjectId) -> Result<I
                     .is_some_and(|p| p.in_flight(DateTime::now())) =>
             {
                 return Ok(Issued::Refused(PurgeDenyReason::InProgress));
+            }
+            // P2g-3 — it runs again (made a managed one meanwhile): retention
+            // keeps it.
+            Ok(now) if why.only_ended() && !now.status.is_terminal() => {
+                return Ok(Issued::Live);
             }
             Ok(now) => s = now,
             Err(DaoError::NotFound) => return Ok(Issued::Already),
@@ -620,33 +658,18 @@ pub async fn purge(
         return Ok(refuse(&state, &s, auth.user_id, PurgeDenyReason::InProgress).await);
     }
     let read = s.clone();
-    let (p, before) = match issue(&state, s, auth.user_id).await? {
+    let (p, before) = match issue(&state, s, auth.user_id, PurgeReason::Owner).await? {
         Issued::Took(p, before) => (*p, *before),
         Issued::Refused(reason) => return Ok(refuse(&state, &read, auth.user_id, reason).await),
-        Issued::Already => {
+        // A purge of its owner's is never of an ended session only.
+        Issued::Already | Issued::Live => {
             return match purge_of(&state, tid, auth.user_id, sid).await? {
                 Some(p) => Ok(Json(PurgeResponse::of(&p, 0))),
                 None => Err(DaoError::NotFound.into()),
             };
         }
     };
-    info!(
-        tenant = %tid, session = %sid, purge = %p.id, user = %auth.user_id,
-        devices = p.devices.len(), "hive: a session purged — its devices are told"
-    );
-    // What the server holds of it goes now: nothing on a device needs it.
-    drop_server_side(&state, &before).await;
-    audit(&state, &p, auth.user_id, "issued", None).await;
-    for d in p
-        .devices
-        .iter()
-        .filter(|d| d.state == PurgeEntryState::Pending)
-    {
-        send(&state, &p, d.device_id).await;
-    }
-    if p.complete() {
-        finish(&state, p.id).await;
-    }
+    carry_out(&state, &p, &before, auth.user_id).await;
     let forks = match state.sessions.forks_of(tid, sid).await {
         Ok(n) => n,
         Err(e) => {
@@ -675,6 +698,36 @@ pub async fn get_purge(
     match purge_of(&state, tid, auth.user_id, sid).await? {
         Some(p) => Ok(Json(PurgeView::from(&p))),
         None => Err(DaoError::NotFound.into()),
+    }
+}
+
+/// What follows a purge that took, whoever issued it: the server's own data
+/// of the session, the audit, each device told, and the purge's completion
+/// should no device's part be pending.
+pub(crate) async fn carry_out(
+    state: &HiveState,
+    p: &HivePurge,
+    before: &AgentSession,
+    user: ObjectId,
+) {
+    info!(
+        tenant = %p.tenant_id, session = %p.session_id, purge = %p.id, user = %user,
+        reason = %p.reason, devices = p.devices.len(), "hive: a session purged — its devices are told"
+    );
+    // What the server holds of it goes now: nothing on a device needs it.
+    drop_server_side(state, before).await;
+    // The owner's own purge needs no word; another names why.
+    let why = (p.reason != PurgeReason::Owner.as_str()).then_some(p.reason.as_str());
+    audit(state, p, user, "issued", why).await;
+    for d in p
+        .devices
+        .iter()
+        .filter(|d| d.state == PurgeEntryState::Pending)
+    {
+        send(state, p, d.device_id).await;
+    }
+    if p.complete() {
+        finish(state, p.id).await;
     }
 }
 

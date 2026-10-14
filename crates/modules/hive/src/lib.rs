@@ -64,6 +64,7 @@ pub mod policy;
 pub mod promote;
 pub mod purge;
 pub mod replica;
+pub mod retention;
 pub mod room;
 pub mod routes;
 pub mod scope;
@@ -122,6 +123,9 @@ pub struct HiveState {
     /// P2g-2 — the purges of deleted sessions, kept until every device that
     /// held one has answered.
     pub purges: Arc<purge::PurgeDao>,
+    /// P2g-3a — how often retention sweeps (`hive.retention_sweep_secs`;
+    /// zero = no sweep).
+    pub retention_sweep: std::time::Duration,
 }
 
 impl std::ops::Deref for HiveState {
@@ -170,6 +174,7 @@ impl Module for HiveState {
             teleport_have_want: settings.hive.teleport_have_want,
             fork_copy: std::time::Duration::from_secs(settings.hive.fork_copy_secs),
             purges: Arc::new(purge::PurgeDao::new(db)),
+            retention_sweep: std::time::Duration::from_secs(settings.hive.retention_sweep_secs),
             chat: BoundChat::new(&core),
             fleet,
             core,
@@ -185,6 +190,8 @@ impl Module for HiveState {
                 lifecycle: Some(socket),
             },
         );
+        // P2g-3a — what retention no longer keeps, purged: one pod a cycle.
+        retention::spawn(state.clone());
         Ok(state)
     }
 
