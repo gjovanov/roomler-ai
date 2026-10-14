@@ -45,6 +45,19 @@ pub struct EnrollmentTokenResponse {
     pub enrollment_token: String,
     pub expires_in: u64,
     pub jti: String,
+    /// FR-104 — the token may also anchor the device it enrolls.
+    pub anchor: bool,
+}
+
+/// Optional body for `POST …/agent/enroll-token`. The dashboard (and every
+/// older client) posts none, which mints the plain single-use token.
+#[derive(Debug, Default, Deserialize)]
+pub struct EnrollmentTokenRequest {
+    /// FR-104 — let this token also anchor the Windows device it enrolls for
+    /// SYSTEM exec: the wizard's elevated `roomlerd anchor create`, with the
+    /// same pasted token. Default off.
+    #[serde(default)]
+    pub anchor: bool,
 }
 
 /// POST /api/tenant/{tenant_id}/agent/enroll-token — admin issues an enrollment
@@ -54,6 +67,7 @@ pub async fn issue_enrollment_token(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
+    body: Option<Json<EnrollmentTokenRequest>>,
 ) -> Result<Json<EnrollmentTokenResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -67,14 +81,25 @@ pub async fn issue_enrollment_token(
     )
     .await?;
 
-    let (token, jti) = state
-        .auth
-        .issue_enrollment_token(auth.user_id, tid, ENROLLMENT_TTL_SECS)?;
+    let anchor = body.map(|Json(b)| b.anchor).unwrap_or(false);
+    let (token, jti) =
+        state
+            .auth
+            .issue_enrollment_token_with(auth.user_id, tid, ENROLLMENT_TTL_SECS, anchor)?;
+    if anchor {
+        // The admin's choice, on the record: whoever holds this token can
+        // anchor the device it enrolls, and so speak for its SYSTEM service.
+        tracing::info!(
+            tenant = %tid, admin = %auth.user_id, %jti,
+            "fleet-rpc: enrollment token minted that may also anchor the device it enrolls"
+        );
+    }
 
     Ok(Json(EnrollmentTokenResponse {
         enrollment_token: token,
         expires_in: ENROLLMENT_TTL_SECS,
         jti,
+        anchor,
     }))
 }
 
@@ -225,6 +250,12 @@ pub async fn enroll_agent(
     let agent_id = agent
         .id
         .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+    // FR-104 — which token enrolled this device, so an `anchor: true` token
+    // can anchor exactly this one afterwards. Best-effort: a failure here
+    // costs only that second use (the anchor then needs a fresh token).
+    if let Err(e) = state.agents.record_enrollment(agent_id, &claims.jti).await {
+        tracing::warn!(agent = %agent_id, error = %e, "enroll: could not record the enrolling token");
+    }
     // FR-103 — at the row's CURRENT generation. A row revived after a removal
     // has a higher one than before, so the token minted here is accepted and
     // every token from before the removal is not.

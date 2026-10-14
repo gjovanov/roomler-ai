@@ -44,11 +44,23 @@ async fn enroll_os(
     machine_name: &str,
     os: &str,
 ) -> (String, String) {
+    let token = enrollment_token(app, seeded).await;
+    enroll_with(app, &token, machine_id, machine_name, os).await
+}
+
+/// Enroll with a given enrollment token: the wizard's first step.
+async fn enroll_with(
+    app: &TestApp,
+    token: &str,
+    machine_id: &str,
+    machine_name: &str,
+    os: &str,
+) -> (String, String) {
     let ej: Value = app
         .client
         .post(app.url("/api/agent/enroll"))
         .json(&json!({
-            "enrollment_token": enrollment_token(app, seeded).await,
+            "enrollment_token": token,
             "machine_id": machine_id,
             "machine_name": machine_name,
             "os": os,
@@ -64,6 +76,27 @@ async fn enroll_os(
         ej["agent_id"].as_str().unwrap().to_string(),
         ej["agent_token"].as_str().unwrap().to_string(),
     )
+}
+
+/// FR-104 — a token the admin minted to also anchor the device it enrolls.
+async fn anchoring_enrollment_token(
+    app: &TestApp,
+    seeded: &crate::fixtures::seed::SeededTenant,
+) -> String {
+    let et: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/enroll-token", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .json(&json!({ "anchor": true }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(et["anchor"], json!(true), "minted to anchor");
+    et["enrollment_token"].as_str().unwrap().to_string()
 }
 
 /// A fresh single-use enrollment token from the org's admin.
@@ -1001,4 +1034,115 @@ async fn run_as_is_windows_only_and_survives_a_put_that_omits_it() {
     .await
     .unwrap();
     assert_eq!(back["run_as"], json!("system"));
+}
+
+// ---------------------------------------------------------------------------
+// FR-104 — one pasted token both enrolls a Windows device and anchors it.
+// ---------------------------------------------------------------------------
+
+/// The wizard's two steps on one token: a token minted with `anchor: true`
+/// enrolls a device, then anchors THAT device, once. Before FR-104 the
+/// enrollment spent it and the anchor was refused as a replay.
+#[tokio::test]
+async fn an_anchoring_token_anchors_the_device_it_enrolled_once() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr104once").await;
+    let token = anchoring_enrollment_token(&app, &seeded).await;
+    let (agent_id, _) = enroll_with(&app, &token, "m-fr104-once", "HOST-ONCE", "windows").await;
+
+    let body = json!({
+        "enrollment_token": token,
+        "agent_id": agent_id,
+        "host_name": "HOST-ONCE",
+    });
+    let first = anchor_req(&app, body.clone()).await;
+    assert_eq!(
+        first.status(),
+        200,
+        "the token anchors the device it enrolled"
+    );
+    let anchored: Value = first.json().await.unwrap();
+    assert_eq!(anchored["agent_id"], json!(agent_id));
+    assert!(
+        anchored["service_token"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty())
+    );
+
+    assert_eq!(anchor_req(&app, body).await.status(), 401, "but only once");
+}
+
+/// The second use is bound to the device the token enrolled: it anchors no
+/// other device, not even one in the same org, and that refusal does not
+/// spend it for its own device.
+#[tokio::test]
+async fn an_anchoring_token_anchors_no_other_device() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr104other").await;
+    let token = anchoring_enrollment_token(&app, &seeded).await;
+    let (own, _) = enroll_with(&app, &token, "m-fr104-own", "HOST-OWN", "windows").await;
+    let (other, _) = enroll_windows(&app, &seeded, "m-fr104-other", "HOST-OTHER").await;
+
+    let refused = anchor_req(
+        &app,
+        json!({ "enrollment_token": token, "agent_id": other, "host_name": "HOST-OTHER" }),
+    )
+    .await;
+    assert_eq!(refused.status(), 401, "another device: already used");
+
+    let own_anchor = anchor_req(
+        &app,
+        json!({ "enrollment_token": token, "agent_id": own, "host_name": "HOST-OWN" }),
+    )
+    .await;
+    assert_eq!(own_anchor.status(), 200, "its own device still anchors");
+}
+
+/// A plain token is what it always was: one use across enrolling and
+/// anchoring. And the dashboard's request with no body mints a plain one.
+#[tokio::test]
+async fn a_plain_token_is_still_one_use_across_enroll_and_anchor() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr104plain").await;
+    let et: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/enroll-token", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(et["anchor"], json!(false), "no body: a plain token");
+    let token = et["enrollment_token"].as_str().unwrap().to_string();
+    let (agent_id, _) = enroll_with(&app, &token, "m-fr104-plain", "HOST-PLAIN", "windows").await;
+
+    let replay = anchor_req(
+        &app,
+        json!({ "enrollment_token": token, "agent_id": agent_id, "host_name": "HOST-PLAIN" }),
+    )
+    .await;
+    assert_eq!(replay.status(), 401, "spent by the enrollment");
+    // A fresh plain token anchors it, as before FR-104.
+    anchor(&app, &seeded, &agent_id, "HOST-PLAIN").await;
+}
+
+/// Asking for an anchoring token takes the same permission as any enrollment
+/// token: a member without MANAGE_AGENTS gets none, with or without the flag.
+#[tokio::test]
+async fn an_anchoring_token_needs_manage_agents() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr104perm").await;
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/enroll-token", seeded.tenant_id),
+            &seeded.member.access_token,
+        )
+        .json(&json!({ "anchor": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
 }
