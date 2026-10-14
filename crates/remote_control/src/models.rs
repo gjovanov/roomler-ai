@@ -803,6 +803,17 @@ pub enum RpcCap {
     /// ⚠️ It never earns a `PRIVACY` grant: an agent advertising it alone
     /// knows the name but must not be asked to serve it.
     PrivacyAvailable,
+    /// FR-101 P2 — the agent enforces the session policy: it masks a grant
+    /// by `Request.session_policy`, and its host prompt names every feature
+    /// the policy says to `ask` about, granting it only when the person there
+    /// approves.
+    ///
+    /// ⚠️ The hub keeps an `ask` feature only for a connection advertising
+    /// this. An older agent grants whatever reaches it: its prompt shows the
+    /// raw permission names at most (audio, which is no permission, not at
+    /// all), and it holds no policy to check the grant against, so "ask"
+    /// would mean "on".
+    SessionPolicy,
 }
 
 impl RpcCap {
@@ -840,11 +851,12 @@ impl RpcCap {
             Self::SshSystem => "ssh-system",
             Self::PrivacyMode => "privacy-mode",
             Self::PrivacyAvailable => "privacy-available",
+            Self::SessionPolicy => "session-policy",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 26] = [
+    pub const ALL: [RpcCap; 27] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -871,6 +883,7 @@ impl RpcCap {
         Self::SshSystem,
         Self::PrivacyMode,
         Self::PrivacyAvailable,
+        Self::SessionPolicy,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -1082,6 +1095,69 @@ pub enum InputMode {
     #[default]
     Free,
     Exclusive,
+}
+
+/// FR-101 P2 — one sensitive session feature (clipboard, files, audio), as a
+/// policy allows it. The wire twin of the org setting
+/// (`roomler_ai_db::models::RcFeaturePolicy`): this crate stays a leaf the
+/// agent links, so it cannot name the db type, and the two read the same.
+///
+/// ⚠️ A value this build does not know reads as [`Self::Off`], never as an
+/// error: a restriction from a newer server is still a restriction, and an
+/// unknown string must not fail the whole `rc:request`.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FeaturePolicy {
+    /// Allowed, subject to the session's grant.
+    #[default]
+    On,
+    /// Allowed only on a session the person at the device approves, on a
+    /// host prompt that names the feature (an agent advertising
+    /// [`RpcCap::SessionPolicy`]). Under any other consent mode nobody there
+    /// is asked, so the session goes without it.
+    Ask,
+    /// Never.
+    Off,
+}
+
+impl<'de> Deserialize<'de> for FeaturePolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Any JSON type, not only a string, for the same reason.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Text(String),
+            Other(serde::de::IgnoredAny),
+        }
+        Ok(match Raw::deserialize(d)? {
+            Raw::Text(s) if s == "on" => Self::On,
+            Raw::Text(s) if s == "ask" => Self::Ask,
+            // "off", anything a newer server may send, and anything that is
+            // not a string at all.
+            _ => Self::Off,
+        })
+    }
+}
+
+/// FR-101 P2 — the session policy for clipboard, files and audio. P2a sends
+/// the ORG's in `ServerMsg::Request::session_policy`, so an agent can name
+/// the `ask` features on its prompt and enforce the rest even where the hub
+/// was bypassed. Every field defaults to `on`: absent means unrestricted.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionPolicy {
+    #[serde(default)]
+    pub clipboard: FeaturePolicy,
+    #[serde(default)]
+    pub files: FeaturePolicy,
+    #[serde(default)]
+    pub audio: FeaturePolicy,
+}
+
+impl SessionPolicy {
+    /// Nothing restricted: the policy every org had before the feature.
+    pub fn is_unrestricted(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -4194,6 +4270,12 @@ pub enum AuditKind {
         /// reads the row mid-rollout.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         privacy_stripped: Option<String>,
+        /// FR-101 P2 — the session features the policy took out of the
+        /// request, each with why (`{"files": "org_policy_off"}`; the reasons
+        /// of `ServerMsg::SessionCreated::features_refused`). `None` = nothing
+        /// refused. The server's decision, a field for the same rollout reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        features_stripped: Option<std::collections::BTreeMap<String, String>>,
     },
     ConsentPrompted,
     ConsentGranted,
@@ -5275,6 +5357,7 @@ mod tests {
         assert_eq!(RpcCap::HivePurge.wire(), "hive-purge");
         assert_eq!(RpcCap::PrivacyMode.wire(), "privacy-mode");
         assert_eq!(RpcCap::PrivacyAvailable.wire(), "privacy-available");
+        assert_eq!(RpcCap::SessionPolicy.wire(), "session-policy");
     }
 
     /// FR-99 — the two privacy words are different promises, and neither is
@@ -6702,6 +6785,7 @@ mod tests {
                 permissions: Permissions::default(),
                 record_stripped: None,
                 privacy_stripped: None,
+                features_stripped: None,
             },
             // FR-99 — the new bit takes the same raw path.
             AuditKind::SessionRequested {
@@ -6710,6 +6794,10 @@ mod tests {
                 permissions: Permissions::VIEW | Permissions::INPUT | Permissions::PRIVACY,
                 record_stripped: Some("device_not_opted_in".into()),
                 privacy_stripped: None,
+                // FR-101 P2 — and a row naming what the policy refused.
+                features_stripped: Some(
+                    [("files".to_string(), "org_policy_off".to_string())].into(),
+                ),
             },
             AuditKind::PermissionsChanged {
                 permissions: Permissions::VIEW,

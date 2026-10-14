@@ -45,6 +45,7 @@ pub mod agent_socket;
 pub mod controller;
 pub mod relay;
 pub mod routes;
+pub mod session_policy;
 
 /// The module's state: the core, the fleet module it is built on, and what
 /// remote owns.
@@ -154,6 +155,12 @@ impl Module for RemoteState {
             .nest("/tenant/{tenant_id}/session", session)
             .nest("/tenant/{tenant_id}/recording-activity", recording)
             .nest("/tenant/{tenant_id}/transfer-activity", transfers)
+            // FR-101 P2a — the org's session policy (clipboard, files, audio):
+            // GET for any member, PUT with MANAGE_TENANT.
+            .route(
+                "/tenant/{tenant_id}/rc-session-policy",
+                get(session_policy::get_policy).put(session_policy::set_policy),
+            )
             .nest("/turn", turn)
             .nest("/relay", relay)
             .with_state(self.clone())

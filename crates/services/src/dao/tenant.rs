@@ -2,7 +2,9 @@
 // Copyright (C) 2026 G ROX EOOD
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
-use roomler_ai_db::models::{Plan, Role, Tenant, TenantMember, TenantSettings, role};
+use roomler_ai_db::models::{
+    Plan, RcFeaturePolicy, Role, Tenant, TenantMember, TenantSettings, role,
+};
 
 use super::base::{BaseDao, DaoError, DaoResult};
 
@@ -160,6 +162,29 @@ impl TenantDao {
             // A stored `null` deserialises to `None` like an absent field,
             // so clearing writes null rather than needing a second operator.
             set.insert("settings.keep_busy_default_pattern", pattern);
+        }
+        self.base
+            .update_by_id(tenant_id, doc! { "$set": set })
+            .await?;
+        self.base.find_by_id(tenant_id).await
+    }
+
+    /// FR-101 P2 — set features of the org's remote-desktop session policy.
+    /// Only the `Some` ones are written, each as its own dotted `$set`, so two
+    /// admins changing different features cannot lose each other's change,
+    /// and a feature nobody named keeps its value. The route validates.
+    pub async fn set_rc_session_policy(
+        &self,
+        tenant_id: ObjectId,
+        clipboard: Option<RcFeaturePolicy>,
+        files: Option<RcFeaturePolicy>,
+        audio: Option<RcFeaturePolicy>,
+    ) -> DaoResult<Tenant> {
+        let mut set = doc! { "updated_at": DateTime::now() };
+        for (field, value) in [("clipboard", clipboard), ("files", files), ("audio", audio)] {
+            if let Some(v) = value {
+                set.insert(format!("settings.rc_session.{field}"), bson::to_bson(&v)?);
+            }
         }
         self.base
             .update_by_id(tenant_id, doc! { "$set": set })

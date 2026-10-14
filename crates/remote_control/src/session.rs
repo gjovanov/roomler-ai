@@ -98,6 +98,11 @@ pub struct LiveSession {
     /// (`device_cannot_curtain`, `break_glass`, `device_not_opted_in`). Kept
     /// for a coalesced duplicate request, exactly as [`Self::record_refused`].
     pub privacy_refused: Option<&'static str>,
+
+    /// FR-101 P2 — the session features the policy took out of this grant,
+    /// feature → reason (`files` → `org_policy_off`). Kept for a coalesced
+    /// duplicate request, exactly as [`Self::record_refused`]. Empty = none.
+    pub features_refused: std::collections::BTreeMap<&'static str, &'static str>,
 }
 
 impl LiveSession {
@@ -133,6 +138,7 @@ impl LiveSession {
             pending_request: None,
             record_refused: None,
             privacy_refused: None,
+            features_refused: Default::default(),
         };
         (s, waiter)
     }
