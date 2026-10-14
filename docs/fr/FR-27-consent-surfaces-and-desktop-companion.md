@@ -375,7 +375,12 @@ Ticked only where a run is recorded in the field log below.
       and a following click triggered Disconnect (no `accept_first_mouse`); **#1852
       fixed that (#1854, agent 0.4.118, carried by 0.4.119)** — one click on
       0.4.119, 2026-10-08 (the log below). The Windows reveal-on-hover badge and
-      the Linux X11 panel are still untested.)
+      the Linux X11 panel are still untested.) *(2026-10-14, FR-93 P6: the Linux
+      X11 consent PROMPT was field-run on GNOME 50 and Plasma 6.7, through
+      Xwayland, on 0.4.135. It showed and took the click, then stayed on screen
+      after it, frozen: its unmap was never flushed; fixed in FR-93 P6a. The
+      banner half of this criterion is the companion's, and still untested on
+      X11.)*
 - [x] `roomler-desktop` shows exactly one tray icon, with a menu — **Windows**,
       measured 2 → 1 against the 0.4.15 build. macOS/Linux untested.
 - [ ] macOS "Check for updates" and "Apply update" both work from the companion.

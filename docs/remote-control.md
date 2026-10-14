@@ -815,6 +815,23 @@ device auto-grant is a device-owner decision the server cannot make for it.
 3. **CLI** — `roomlerd consent --list` / `--approve`, which works everywhere.
 4. **none** — reported as `no_prompt_surface`, not as a deny.
 
+⚠️ **The X11 panel's unmap must be flushed** (FR-93 P6a). x11rb buffers
+requests, and the panel's loop flushed only when it repainted, which it stops
+doing once the prompt is gone. Until P6a an answered prompt therefore stayed on
+screen, frozen on its countdown, with live-looking buttons: the decision was
+recorded and the session ran beneath it. Measured on GNOME 50 and Plasma 6.7,
+both through Xwayland; a real X server buffers the same way. The Xvfb lane now
+proves that a dismissed prompt leaves the screen, as a second client sees it.
+
+⚠️ **The companion starts through the manager this daemon may use** (FR-93
+P6b). A root daemon starts a system transient unit as the session's user
+(`--uid=`). A per-user daemon starts it from its own user manager
+(`systemd-run --user`). Before P6b a per-user daemon also asked the system
+manager, which waited on polkit and failed after 25 s (*"Failed to start
+transient service unit: Connection timed out"*), so a per-user host whose
+native panel could not open had no prompt at all. "Already running" now means
+the session user's own companion (`pgrep -u`), not anyone's.
+
 ⚠️ The `.pending` marker is written in ALL cases, because it is also what
 `roomlerd consent --list` reads. `ConsentRequest.surface` is what stops the
 companion from popping a second panel over a native one.
