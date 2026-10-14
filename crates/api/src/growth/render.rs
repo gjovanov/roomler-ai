@@ -19,7 +19,7 @@
 
 use roomler_ai_services::{dao::growth_digest::DigestDoc, newsletter::escape_html};
 
-use super::digest::{Figure, FigureF, Measured, NotMeasured, SMALL_N, Sections};
+use super::digest::{CampaignGoals, Figure, FigureF, Measured, NotMeasured, SMALL_N, Sections};
 
 /// `Roomler daily digest — YYYY-MM-DD`.
 pub fn subject(day: &str) -> String {
@@ -325,37 +325,49 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
         Measured::Value(c) if c.rows.is_empty() => out.push(Note(
             "No campaign traffic or campaign sign-up that day.".into(),
         )),
-        Measured::Value(c) => out.push(Table(
-            vec![
-                "Source".into(),
-                "Medium".into(),
-                "Campaign".into(),
-                "Visitors".into(),
-                "Pageviews".into(),
-                "Goal: signup".into(),
-                "Goal: subscribe".into(),
-                "Goal: install-copy".into(),
-                "Goal: github".into(),
-                "Server sign-ups".into(),
-            ],
-            c.rows
-                .iter()
-                .map(|r| {
-                    vec![
-                        r.source.clone(),
-                        r.medium.clone(),
-                        r.campaign.clone(),
-                        r.visitors.to_string(),
-                        r.pageviews.to_string(),
-                        r.goals.signup.to_string(),
-                        r.goals.subscribe.to_string(),
-                        r.goals.install_copy.to_string(),
-                        r.goals.github_outbound.to_string(),
-                        r.signups.to_string(),
-                    ]
-                })
-                .collect(),
-        )),
+        Measured::Value(c) => {
+            // P2 — a goal the site does not define: the visitors are real,
+            // the conversion columns are not measured, and the note says
+            // which goal (never a 0).
+            if let Some(n) = &c.conversions {
+                out.push(Note(format!("Goal conversions: {}", not_measured(n))));
+            }
+            let goal = |m: &Measured<CampaignGoals>, pick: fn(&CampaignGoals) -> i64| match m {
+                Measured::Value(g) => pick(g).to_string(),
+                Measured::NotMeasured(_) => "—".to_string(),
+            };
+            out.push(Table(
+                vec![
+                    "Source".into(),
+                    "Medium".into(),
+                    "Campaign".into(),
+                    "Visitors".into(),
+                    "Pageviews".into(),
+                    "Goal: signup".into(),
+                    "Goal: subscribe".into(),
+                    "Goal: install-copy".into(),
+                    "Goal: github".into(),
+                    "Server sign-ups".into(),
+                ],
+                c.rows
+                    .iter()
+                    .map(|r| {
+                        vec![
+                            r.source.clone(),
+                            r.medium.clone(),
+                            r.campaign.clone(),
+                            r.visitors.to_string(),
+                            r.pageviews.to_string(),
+                            goal(&r.goals, |g| g.signup),
+                            goal(&r.goals, |g| g.subscribe),
+                            goal(&r.goals, |g| g.install_copy),
+                            goal(&r.goals, |g| g.github_outbound),
+                            r.signups.to_string(),
+                        ]
+                    })
+                    .collect(),
+            ));
+        }
         Measured::NotMeasured(n) => out.push(Note(not_measured(n))),
     }
 
