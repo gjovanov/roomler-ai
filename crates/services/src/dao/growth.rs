@@ -14,8 +14,11 @@
 //!   (`crates/api/src/growth/org_daily.rs`), read by the funnel, the
 //!   cohorts and the org views. It exists because four of its sources
 //!   expire at 90 days and retention needs a year: a row here outlives
-//!   the audit rows it was computed from. Kept 25 months; deleted with
-//!   the org ([`GrowthDao::purge_tenant`]).
+//!   the audit rows it was computed from. Bounded by a 25-month TTL;
+//!   [`GrowthDao::purge_tenant`] is the one call an org deletion must make
+//!   to take an org's rows with it, though no org hard-delete path exists
+//!   yet (orgs are only archived, reversibly), so until one does the TTL
+//!   is what bounds the collection.
 //!
 //! Stateless over `core.db`, so a caller re-creates it (`GrowthDao::new`)
 //! rather than threading a handle through `Core` (FR-69 rule 5).
@@ -334,7 +337,11 @@ impl GrowthDao {
     /// Everything the growth collections hold about one org: its
     /// `growth_org_daily` rows, and the `growth_daily` rows whose `dims`
     /// carry the tenant (spec principle 7 — rows never outlive their
-    /// owner). Idempotent; a second call deletes nothing.
+    /// owner). This is the one call an org deletion must make for growth;
+    /// no org hard-delete path exists yet (orgs are only archived,
+    /// reversibly), so for now it has no production caller and the 25-month
+    /// TTL is what bounds `growth_org_daily`. Idempotent; a second call
+    /// deletes nothing.
     pub async fn purge_tenant(&self, tenant_id: ObjectId) -> DaoResult<PurgedCounts> {
         let org_days = self
             .org_day_docs()

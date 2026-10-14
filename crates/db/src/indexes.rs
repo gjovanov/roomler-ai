@@ -436,7 +436,8 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
     // first/last value day) and per day range (the funnel, cohorts, WAO —
     // `day` is `YYYY-MM-DD`, which sorts as a date). Kept 25 months from the
     // day itself; it outlives the 90-day audit rows it was computed from.
-    // Deleted with the org by `GrowthDao::purge_tenant`.
+    // `GrowthDao::purge_tenant` takes an org's rows with it, but no org
+    // hard-delete path exists yet, so the TTL is what bounds it for now.
     sets.push(set(
         "growth_org_daily",
         vec![
