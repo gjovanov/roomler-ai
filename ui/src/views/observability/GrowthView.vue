@@ -22,6 +22,7 @@
     <template v-else>
       <v-tabs v-model="tab" density="compact" class="mb-3">
         <v-tab value="overview">Overview</v-tab>
+        <v-tab value="campaigns">Campaigns</v-tab>
         <v-tab value="orgs">Orgs</v-tab>
         <v-tab value="cohorts">Cohorts</v-tab>
         <v-tab value="digest">Digest</v-tab>
@@ -153,6 +154,12 @@
               </template>
             </v-card-text>
           </v-card>
+        </v-window-item>
+
+        <!-- ── Campaigns (P6) ────────────────────────────────────────── -->
+        <!-- Lazily rendered: the component loads its own range on first open. -->
+        <v-window-item value="campaigns">
+          <growth-campaigns />
         </v-window-item>
 
         <!-- ── Orgs ──────────────────────────────────────────────────── -->
@@ -408,6 +415,7 @@ import {
   type Percentiles,
   rateIfEnough,
 } from '@/stores/growth'
+import GrowthCampaigns from '@/components/growth/GrowthCampaigns.vue'
 import GrowthNode from '@/components/growth/GrowthNode.vue'
 import GrowthNotMeasured from '@/components/growth/GrowthNotMeasured.vue'
 import GrowthPercentiles from '@/components/growth/GrowthPercentiles.vue'

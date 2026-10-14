@@ -235,6 +235,131 @@ export interface OrgTimeline {
   totals: Record<string, unknown> | null
 }
 
+// ── P6: the Campaigns table ─────────────────────────────────────────────
+// Wire shapes mirror crates/api/src/growth/campaigns.rs. Every key field is
+// client-chosen text (anyone can craft a UTM link): render it as text,
+// never as markup.
+
+/** How deep the key goes: each depth adds one UTM field. */
+export type KeyDepth = 'source' | 'medium' | 'campaign' | 'content'
+
+/** The normalised key; a field below the depth (or absent) is `null`. */
+export interface CampaignKey {
+  source: string
+  medium: string | null
+  campaign: string | null
+  content: string | null
+}
+
+export interface CampaignGoals {
+  signup: number
+  subscribe: number
+  install_copy: number
+  github_outbound: number
+}
+
+export interface WebCells {
+  visitors: number
+  visits: number
+  pageviews: number
+  /** Pageviews visible ≥ 30 s (purestat's `reads`). */
+  reads: number
+  goals: Measured<CampaignGoals>
+  /** purestat rows folded into the key; above 1 the counts are sums. */
+  spellings: number
+}
+
+/** A rate and its n; `value` only from the n-floor up. */
+export interface Rate {
+  n: number
+  value?: number
+}
+
+export interface Coverage {
+  purestat_signup_goals: number
+  server_signups: number
+  ratio?: number
+  n_floor: number
+}
+
+export interface CampaignRow {
+  key: CampaignKey
+  /** The taxonomy's group of the source: canonical, or `other`. */
+  group: string
+  web: Measured<WebCells>
+  signups: number
+  org_created: StepCounts
+  activated: StepCounts | null
+  first_value: StepCounts | null
+  paid: NotMeasured
+  reach: NotMeasured
+  coverage: Measured<Coverage>
+  rates: {
+    signup_per_visitor: Rate | null
+    activation: Rate | null
+    first_value: Rate | null
+  }
+}
+
+export interface CampaignTotals {
+  /** One purestat query with no dimension: unique over the range. */
+  web: Measured<WebCells>
+  signups: number
+  keyed_signups: number
+  coverage: Measured<Coverage>
+}
+
+/** The daily puller's state over the range (`growth_pulls`). */
+export interface PullSummary {
+  source: string
+  days: number
+  pulled: number
+  failed: number
+  not_pulled: number
+  freeze_days: number
+  last_pulled_at?: string
+  last_error?: string
+  not_measured?: string
+}
+
+export interface CampaignsReport {
+  enabled: boolean
+  since: string
+  until: string
+  by: KeyDepth
+  include_internal: boolean
+  excluded: ExcludedCounts
+  windows: FunnelWindows
+  n_floor: number
+  /** Why every web cell is not measured (no key, 401, timeout…). */
+  web_not_measured?: NotMeasured
+  /** Why no web cell carries conversions (a goal the site lacks). */
+  conversions?: NotMeasured
+  web_truncated: boolean
+  account_truncated: boolean
+  rows_truncated: boolean
+  value_basis: string[]
+  not_measured?: Record<string, string>
+  totals: CampaignTotals
+  rows: CampaignRow[]
+  pulls: PullSummary
+}
+
+/** `linkedin / post / 20261019-x` — the key at its depth, absent fields
+ *  left out. Plain text: the caller interpolates it, never `v-html`. */
+export function campaignKeyLabel(k: CampaignKey): string {
+  return [k.source, k.medium, k.campaign, k.content]
+    .filter((v): v is string => typeof v === 'string' && v.length > 0)
+    .join(' / ')
+}
+
+/** A server-side rate as `12.3%`; `null` below the n-floor (the server
+ *  leaves `value` out) or when the rate does not exist. */
+export function rateLabel(r: Rate | null | undefined): string | null {
+  if (!r || typeof r.value !== 'number') return null
+  return `${Math.round(r.value * 1000) / 10}%`
+}
+
 /** The n-floor (spec principle 5): a rate only once its denominator reaches
  *  30 — below it the UI shows counts and hides the percentage. */
 export const SMALL_N = 30
@@ -352,6 +477,19 @@ export const useGrowthStore = defineStore('growth', () => {
     return api.get<OrgTimeline>(`/admin/growth/org/${encodeURIComponent(tenantId)}/timeline`)
   }
 
+  /** P6 — the Campaigns table: days are `YYYY-MM-DD`, both inclusive. */
+  async function fetchCampaigns(
+    opts: { since?: string; until?: string; by?: KeyDepth; includeInternal?: boolean } = {},
+  ): Promise<CampaignsReport> {
+    const q = new URLSearchParams()
+    if (opts.since) q.set('since', opts.since)
+    if (opts.until) q.set('until', opts.until)
+    if (opts.by) q.set('by', opts.by)
+    if (opts.includeInternal) q.set('include_internal', 'true')
+    const qs = q.toString()
+    return api.get<CampaignsReport>(`/admin/growth/campaigns${qs ? `?${qs}` : ''}`)
+  }
+
   return {
     digests,
     error,
@@ -363,5 +501,6 @@ export const useGrowthStore = defineStore('growth', () => {
     fetchCohorts,
     fetchOrgs,
     fetchTimeline,
+    fetchCampaigns,
   }
 })

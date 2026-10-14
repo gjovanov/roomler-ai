@@ -13,24 +13,34 @@
 //!   it folds into (`roomler_core::growth::ExclusionSet`).
 //! * [`digest`] — P1d: the daily digest's sections, the once-only claim,
 //!   the delivery and the scheduler; [`purestat`] its one read of the web
-//!   plane; [`render`] its email bodies; [`routes`] its four routes.
+//!   plane (in `roomler-ai-services` since P6, re-exported here); [`render`]
+//!   its email bodies; [`routes`] its four routes.
 //! * [`value`] — P2: the four value-event definitions every view shares.
 //! * [`org_daily`] — P2: `growth_org_daily`, the nightly fold and the
 //!   bounded backfill.
 //! * [`funnel`], [`cohorts`], [`orgs`] — P2: the account funnel with time
 //!   to value, the weekly cohorts with the north star (WAO), the org list
 //!   and one org's timeline.
+//! * [`campaigns`] — P6: the Campaigns table, purestat's web plane queried
+//!   live for the range beside the funnel's account plane, joined by the
+//!   normalised campaign key. (The daily purestat PULL is the `saas`
+//!   module's — it talks to the outside world for the hosted business.)
 
+pub mod campaigns;
 pub mod cohorts;
 pub mod digest;
 pub mod exclusions;
 pub mod funnel;
 pub mod org_daily;
 pub mod orgs;
-pub mod purestat;
 pub mod render;
 pub mod routes;
 pub mod value;
+
+/// The purestat v1 client lives in `roomler-ai-services` since P6 — below
+/// the host AND the `saas` module, whose daily puller uses it too.
+/// Re-exported so `growth::purestat::…` keeps naming it.
+pub use roomler_ai_services::purestat;
 
 use axum::{
     Router,
@@ -65,6 +75,9 @@ pub fn admin_routes() -> Router<AppState> {
         .route("/orgs", get(orgs::list_orgs))
         .route("/org/{tenant_id}/timeline", get(orgs::org_timeline))
         .route("/org-daily/backfill", post(org_daily::backfill_route))
+        // P6 — the Campaigns table: per normalised key, purestat's web
+        // plane (live, for the exact range) beside the account funnel.
+        .route("/campaigns", get(campaigns::get_campaigns))
 }
 
 /// Whether a module is mounted on this pod — the gate every growth read of
