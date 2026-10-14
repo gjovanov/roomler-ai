@@ -78,7 +78,7 @@ sequenceDiagram
 | the install, as root | reused | `linux_install_candidates(0, …)` `:2009-2023`; `install_tarball_linux(0, …)` `:2075-2198` |
 | the opt-out, `/etc/roomler/disable-auto-update` | reused | the helper's `OPT_OUT` `:3380-3387` (shared by macOS and Linux) |
 | the wake file: content ignored, never followed through a symlink | generalised | `MACOS_UPDATE_TRIGGER` `:3017`, `LINUX_UPDATE_TRIGGER` `:3022`, `queue_update_check` / `queue_update_check_at` `:3115-3134` (was `macos_queue_update_check`) |
-| `roomlerd update-helper` on Linux | new (P1) | the `Command::UpdateHelper` arm, macOS and Linux (`main.rs:1563-1578`) |
+| `roomlerd update-helper` on Linux | new (P1) | the `Command::UpdateHelper` arm, macOS and Linux (`main.rs:1604-1619`) |
 | `roomler-update.{service,timer,path}` | new (P1) | shipped in the `.deb` (`agents/roomlerd/Cargo.toml` assets `:848-887`) and the tarball (`scripts/stage-linux-tarball.sh:55-58`, `TARBALL_INSTALL_IF_ABSENT` `updater.rs:2052-2062`) |
 | the download's private staging dir (mkdtemp, 0755, `O_EXCL` write) — the security review's finding 1 | new | `stage_dir` / `write_installer` / `discard_staging` (`updater.rs`) |
 | the run-spacing gate — launchd's `ThrottleInterval` twin, the security review's finding 2 | new | `UPDATE_HELPER_MIN_GAP` / `helper_gate_wait` / `stamp_helper_gate` (`updater.rs`) |
@@ -127,9 +127,9 @@ shared successor of `macos_forward_triggers`, `:3146-3228`) as before. Linux ask
   `EROFS`. P2a adds `ReadWritePaths=-/var/tmp` (only the directory can be granted: a `ReadWritePaths` entry binds
   what exists when the sandbox is built, and the helper deletes the wake file each run). A daemon whose unit
   predates P2a logs the failure and names the cure; the push then waits for the helper's 6 h timer. CI guards
-  the grant in both sandbox cells. The system-unit cell (`ci.yml:791-816`) has the sandboxed unit write
+  the grant in both sandbox cells. The system-unit cell (`ci.yml:804-829`) has the sandboxed unit write
   `/var/tmp`, and a negative control (the same sandbox without the grant) must come back read-only. The
-  user-manager cell (Fedora's configuration, `ci.yml:870-874`) requires a read-write `/var/tmp` mount in the
+  user-manager cell (Fedora's configuration, `ci.yml:883-887`) requires a read-write `/var/tmp` mount in the
   daemon's namespace. Both directions were measured on systemd 255 before landing (§8).
 - **Decided at the start.** Enabling or disabling the helper takes effect at the daemon's next start — `install.sh`
   (P3) must refresh `roomler.service`, then `systemctl --user daemon-reload` and restart the per-user daemon after
@@ -192,7 +192,7 @@ After a successful install, the helper asks every per-user daemon on the host to
 | **P1** | `roomlerd update-helper` on Linux, and the three units in the `.deb` and the tarball | the opt-out marker; the units disabled | the lab: the KDE per-user (tarball) and GNOME per-user (`.deb`) guests, red first on the release | M |
 | **P2a** | the per-user daemon wakes the helper instead of installing (§3.2), and its unit may write the wake file | `ROOMLERD_UPDATE_HELPER=0` | the lab: the KDE per-user guest, a real push → the helper's install (§8) | S |
 | **P2b** | the daemon onto the new binary after an install (§3.3, D1, D2) | `ROOMLERD_UPDATE_HELPER=0` | the lab, with a live session across the install | M |
-| **P3** | the installers: `install.sh` enables the units for a per-user install; a non-root `roomler self-update` wakes the helper (it bails today, `main.rs:5015-5045`) | — | the lab, a fresh install of each format | S |
+| **P3** | the installers: `install.sh` enables the units for a per-user install; a non-root `roomler self-update` wakes the helper (it bails today, `main.rs:5070-5100`) | — | the lab, a fresh install of each format | S |
 | **P4** | docs: `docs/linux-self-update.md` (status, the ladder claim, the helper), `docs/installation.md` (a Linux row beside the macOS three-unit table, `:297-301`, and `:497`), `README.Debian`, the `docs/README.md` index row | — | — | S |
 
 Each phase ships in an agent release (the `ship-it` skill owns the mechanics) and is field-verified before the
