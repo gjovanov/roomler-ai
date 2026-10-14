@@ -325,7 +325,9 @@ pub fn spawn_device(
         let exec_enabled = cfg.exec_enabled;
         let remote_config_enabled = cfg.remote_config_enabled;
         let _ = signaling::run(
-            signaling::OrgCtx::primary(),
+            signaling::OrgCtx::primary(roomlerd::token_slot::TokenSlot::new(
+                cfg.agent_token.clone(),
+            )),
             roomlerd::delegate::Delegation::Off,
             cfg,
             EncoderPreference::Software,

@@ -457,7 +457,7 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
     let path = active_config_path(is_scm)?;
     let machine_global = is_machine_global(&path);
     let existing = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-    let cfg = enrollment::enroll(EnrollInputs {
+    let fresh = enrollment::enroll(EnrollInputs {
         server_url: &existing.server_url,
         enrollment_token: &trimmed,
         machine_id: &existing.machine_id,
@@ -465,7 +465,22 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
     })
     .await
     .map_err(|e| format!("Re-enrollment failed: {e:#}"))?;
-    config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
+    // As `roomlerd re-enroll`: a token for another org is an ADD, which is
+    // the Enroll flow's job, not a refresh of this one.
+    if fresh.tenant_id != existing.tenant_id {
+        return Err(
+            "That enrollment token belongs to a different organization. Use Enroll to add \
+             this device to another organization."
+                .to_string(),
+        );
+    }
+    // FR-103 — fold the fresh identity into the EXISTING config, as
+    // `roomlerd re-enroll` does. Saving the fresh, default-everything config
+    // wholesale dropped every operator setting and every `[[orgs]]`
+    // enrollment on the machine.
+    let (merged, _outcome) = enrollment::apply_enrollment(Some(existing), fresh, None, false)
+        .map_err(|e| format!("Re-enrollment failed: {e:#}"))?;
+    config::save(&path, &merged).map_err(|e| explain_save_error(e, &path, machine_global))?;
     Ok(status_report())
 }
 

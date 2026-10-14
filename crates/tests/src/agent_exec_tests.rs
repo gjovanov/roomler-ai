@@ -45,7 +45,9 @@ fn spawn_agent(
         let exec_enabled = cfg.exec_enabled;
         let remote_config_enabled = cfg.remote_config_enabled;
         let _ = signaling::run(
-            signaling::OrgCtx::primary(),
+            signaling::OrgCtx::primary(roomlerd::token_slot::TokenSlot::new(
+                cfg.agent_token.clone(),
+            )),
             // FR-43 P2b — no GUI-worker delegation in tests: `Off` is not a
             // stub but the real production value on every platform except a
             // macOS daemon supervising a worker, or the worker it supervises.

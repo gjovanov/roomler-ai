@@ -77,7 +77,11 @@ const INTER_REQUEST_DELAY: Duration = Duration::from_millis(1100);
 /// any IO / network / parse failure logs `warn!` and continues with
 /// the next sidecar so a single poisoned file doesn't block the
 /// fleet. Returns when the queue is empty.
-pub async fn drain_and_upload(cfg: &AgentConfig) {
+///
+/// FR-103 — `token` is the primary enrollment's LIVE slot, read once per
+/// drain: this task runs for the life of the process, and the token it
+/// started with may since have been renewed.
+pub async fn drain_and_upload(cfg: &AgentConfig, token: &crate::token_slot::TokenSlot) {
     let ledger = verdicts_path();
     let settled = ledger.as_deref().map(load_settled).unwrap_or_default();
     let pending = without_settled(crash_recorder::pending_all(), &settled);
@@ -98,6 +102,7 @@ pub async fn drain_and_upload(cfg: &AgentConfig) {
         }
     };
     let url = format!("{}/api/agent/crash", cfg.server_url.trim_end_matches('/'));
+    let agent_token = token.get();
 
     let mut ok_count = 0u32;
     let mut keep_count = 0u32;
@@ -111,7 +116,7 @@ pub async fn drain_and_upload(cfg: &AgentConfig) {
             tokio::time::sleep(INTER_REQUEST_DELAY).await;
         }
         first = false;
-        match upload_one(&client, &url, &cfg.agent_token, &payload).await {
+        match upload_one(&client, &url, &agent_token, &payload).await {
             UploadOutcome::Accepted => {
                 tracing::info!(file = %path.display(), "crash_uploader: uploaded + deleted");
                 settle(&path, ledger.as_deref(), "uploaded", |p| {
