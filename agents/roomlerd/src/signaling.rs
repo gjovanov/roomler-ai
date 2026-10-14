@@ -1326,6 +1326,12 @@ async fn connect_once(
     // when that changes (an anchor written or removed while connected).
     let mut last_announced_exec_system = crate::exec_service::advertised_for(&cfg.agent_id);
     crate::exec_service::apply_word(&mut hello_caps.rpc, last_announced_exec_system);
+    // FR-105 — `ssh-system` the same way: the service serves SSH for exactly
+    // this device, and the person's `ssh_enabled` has this worker carry its
+    // port.
+    let mut last_announced_ssh_system =
+        crate::ssh_service::advertised_for(&cfg.agent_id, cfg.ssh_enabled);
+    crate::ssh_service::apply_word(&mut hello_caps.rpc, last_announced_ssh_system);
     // FR-85 P1e-mac — a supervised Mac's hello already knows what its attached
     // worker can record. Saying the root daemon's own list (nothing) would
     // strip RECORD for the 30 s until the first heartbeat corrects it, after
@@ -1451,8 +1457,10 @@ async fn connect_once(
         derp_ticket_slot.clone(),
         crate::ssh::SessionServices {
             power_activity: Some(crate::power::shared_activity().clone()),
-            consent: consent_broker.clone(),
-            indicator: indicator.clone(),
+            asker: crate::ssh::Asker::Here {
+                broker: consent_broker.clone(),
+                indicator: indicator.clone(),
+            },
             activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
         },
     )
@@ -1654,8 +1662,10 @@ async fn connect_once(
                         derp_ticket_slot.clone(),
                         crate::ssh::SessionServices {
                             power_activity: Some(crate::power::shared_activity().clone()),
-            consent: consent_broker.clone(),
-                            indicator: indicator.clone(),
+                            asker: crate::ssh::Asker::Here {
+                                broker: consent_broker.clone(),
+                                indicator: indicator.clone(),
+                            },
                             activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
                         },
                     )
@@ -1892,11 +1902,14 @@ async fn connect_once(
                 let keep_busy_now = crate::keep_busy::advertised();
                 let desktop_now = crate::desktop_brief::current();
                 let exec_system_now = crate::exec_service::advertised_for(&cfg.agent_id);
+                let ssh_system_now =
+                    crate::ssh_service::advertised_for(&cfg.agent_id, cfg.ssh_enabled);
                 let caps = if caps_now == last_announced_permissions
                     && record_now == last_announced_record
                     && keep_busy_now == last_announced_keep_busy
                     && desktop_now == last_announced_desktop
                     && exec_system_now == last_announced_exec_system
+                    && ssh_system_now == last_announced_ssh_system
                 {
                     None
                 } else {
@@ -1905,6 +1918,7 @@ async fn connect_once(
                     last_announced_keep_busy = keep_busy_now;
                     last_announced_desktop = desktop_now;
                     last_announced_exec_system = exec_system_now;
+                    last_announced_ssh_system = ssh_system_now;
                     // Our own caps AS THE HELLO BUILT THEM — the server replaces
                     // its stored blob with this, so anything the hello carried
                     // (`multi_org` `tun`, `record`) must be here too — with the
@@ -1916,6 +1930,7 @@ async fn connect_once(
                         strip_replica_verbs(&mut c.rpc);
                     }
                     crate::exec_service::apply_word(&mut c.rpc, exec_system_now);
+                    crate::ssh_service::apply_word(&mut c.rpc, ssh_system_now);
                     c.record = record_now;
                     if let Some((perms, has_input)) = caps_now {
                         c.permissions = Some(perms);
@@ -4335,21 +4350,80 @@ async fn handle_server_msg(
             via_service,
         } => {
             #[cfg(feature = "ssh-server")]
-            {
+            if via_service {
+                // FR-105 — a grant for this device's SYSTEM service never
+                // lands in the worker's table, where the worker's own server
+                // would honour it as the signed-in user. The service claims
+                // it with its own credential, and that claim is the server's
+                // acknowledgement; the worker only rings, and can refuse.
                 use roomler_ai_remote_control::models::SshGrantRefusal;
-                let refused = if via_service {
-                    // FR-105 — a grant for this device's SYSTEM service must
-                    // never land in the worker's table, where the worker's
-                    // own server would honour it as the signed-in user. This
-                    // build has no ring to the service yet (FR-105 P3) and
-                    // never advertises `ssh-system`, so a server that sent
-                    // one anyway is answered with a refusal.
-                    warn!(
-                        %grant_id, %caller,
-                        "rc:ssh.grant refused — it is for the SYSTEM service, which this build cannot reach"
-                    );
-                    Some(SshGrantRefusal::Other)
-                } else if !agent_cfg.ssh_enabled {
+                let refusal = if !agent_cfg.ssh_enabled {
+                    // The person's half: their worker carries the port.
+                    Some((
+                        SshGrantRefusal::SshDisabled,
+                        "ssh_enabled is off on this device",
+                    ))
+                } else if crate::ssh_service::disabled() {
+                    Some((
+                        SshGrantRefusal::Other,
+                        "SSH through the SYSTEM service is switched off on this device",
+                    ))
+                } else if account_mode == "daemon"
+                    && agent_cfg.ssh_max_privilege.as_deref() == Some("console_user")
+                {
+                    // The person's own ceiling (M5), honoured as a refusal on
+                    // this path too.
+                    Some((
+                        SshGrantRefusal::Other,
+                        "ssh_max_privilege refuses sessions as SYSTEM on this device",
+                    ))
+                } else {
+                    None
+                };
+                if let Some((refused, why)) = refusal {
+                    warn!(%grant_id, %caller, why, "rc:ssh.grant for the SYSTEM service refused");
+                    let _ = outbound_tx
+                        .send(ClientMsg::SshGrantAck {
+                            grant_id,
+                            refused: Some(refused),
+                        })
+                        .await;
+                } else {
+                    // Off this loop: the service's claim is an HTTPS round trip.
+                    let tx = outbound_tx.clone();
+                    tokio::spawn(async move {
+                        match crate::exec_service::ring_ssh(&grant_id).await {
+                            Ok(()) => info!(
+                                %grant_id, %caller,
+                                "rc:ssh.grant handed to the SYSTEM service"
+                            ),
+                            Err(e) => {
+                                warn!(
+                                    %grant_id, %caller, %e,
+                                    "rc:ssh.grant refused — the SYSTEM service did not take it"
+                                );
+                                let _ = tx
+                                    .send(ClientMsg::SshGrantAck {
+                                        grant_id,
+                                        refused: Some(SshGrantRefusal::Other),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+                // The service pulled what it needs from the server; nothing
+                // here is the worker's to hold.
+                let _ = (
+                    public_key,
+                    account,
+                    consent_mode,
+                    expires_at_ms,
+                    session_secs,
+                );
+            } else {
+                use roomler_ai_remote_control::models::SshGrantRefusal;
+                let refused = if !agent_cfg.ssh_enabled {
                     warn!(
                         %grant_id, %caller,
                         "rc:ssh.grant refused — ssh_enabled is off on this device"

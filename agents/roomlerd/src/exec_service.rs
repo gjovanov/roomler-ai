@@ -125,6 +125,17 @@ pub struct Anchor {
     /// RFC 3339.
     #[serde(default)]
     pub anchored_at: String,
+    /// FR-105 — how far roomler SSH through this service may go, the
+    /// machine administrator's (`roomlerd anchor ssh <…>`). Default off: an
+    /// anchor made for exec never silently serves SYSTEM SSH, and an anchor
+    /// file older than FR-105 reads as off.
+    #[serde(default)]
+    pub ssh: roomler_ai_remote_control::models::SshServiceCeiling,
+    /// Keys a newer build wrote, kept so that this build's save (a renewal,
+    /// `anchor exec`) never erases them: the #2078 shape, a clean save that
+    /// drops what it does not know.
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Never prints the credential: an anchor goes into logs and error messages.
@@ -139,6 +150,10 @@ impl std::fmt::Debug for Anchor {
             .field("service_token", &"[redacted]")
             .field("exec_enabled", &self.exec_enabled)
             .field("anchored_at", &self.anchored_at)
+            .field("ssh", &self.ssh)
+            // Names only: a newer build's value is not this build's to judge
+            // safe to print.
+            .field("extra", &self.extra.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -175,6 +190,9 @@ pub enum DoorbellRequest {
     Ring { request_id: String },
     /// Kill this command, if the service is running it.
     Cancel { request_id: String },
+    /// FR-105 — claim this SSH grant from the server and hold it for the
+    /// service's own SSH endpoint (`ssh_service`).
+    SshGrant { grant_id: String },
 }
 
 /// The service's answer.
@@ -191,6 +209,11 @@ pub enum DoorbellReply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         problem: Option<String>,
         version: String,
+        /// FR-105 — the anchor's SSH ceiling, when this service serves SSH
+        /// (its pipe is up). Absent from a service that does not, including
+        /// every one older than FR-105.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh: Option<roomler_ai_remote_control::models::SshServiceCeiling>,
     },
     /// `claimed: true` = the service holds the command now, and the server
     /// hears the result from it. Anything else names why nothing runs.
@@ -401,6 +424,38 @@ pub fn advertised_for(agent_id: &str) -> bool {
     anchored_agent().is_some_and(|a| a == agent_id)
 }
 
+/// FR-105 — the SSH ceiling the service last said it serves (its health
+/// reply's `ssh`): `None` = no SSH pipe, no anchor, or a service older than
+/// FR-105.
+static SERVICE_SSH: std::sync::RwLock<
+    Option<roomler_ai_remote_control::models::SshServiceCeiling>,
+> = std::sync::RwLock::new(None);
+
+/// Only the Windows health watch sets it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn set_service_ssh(ssh: Option<roomler_ai_remote_control::models::SshServiceCeiling>) {
+    let mut g = match SERVICE_SSH.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if *g != ssh {
+        tracing::info!(?ssh, "ssh-service: the SYSTEM service's SSH changed");
+        *g = ssh;
+    }
+}
+
+/// FR-105 — does this device's SYSTEM service serve SSH for `agent_id`: anchored
+/// for exactly that device, its SSH pipe up, and a ceiling above off? The
+/// worker's half of `ssh-system` (`ssh_service::advertised_for`).
+pub fn ssh_served_for(agent_id: &str) -> bool {
+    let ssh = match SERVICE_SSH.read() {
+        Ok(g) => *g,
+        Err(poisoned) => *poisoned.into_inner(),
+    };
+    anchored_agent().is_some_and(|a| a == agent_id)
+        && ssh.is_some_and(|c| c != roomler_ai_remote_control::models::SshServiceCeiling::Off)
+}
+
 /// Put `exec-system` in `rpc`, or take it out, by equality: `exec` is a
 /// prefix of it and stays either way.
 pub fn apply_word(rpc: &mut Vec<String>, on: bool) {
@@ -422,28 +477,33 @@ pub fn spawn_health_watch() {
     #[cfg(windows)]
     tokio::spawn(async {
         loop {
-            let agent = match win::ask(&DoorbellRequest::Health, std::time::Duration::from_secs(3))
-                .await
+            let (agent, ssh) = match win::ask(
+                &DoorbellRequest::Health,
+                std::time::Duration::from_secs(3),
+            )
+            .await
             {
                 Ok(DoorbellReply::Health {
                     anchored: true,
                     agent_id,
                     problem: None,
+                    ssh,
                     ..
-                }) => agent_id,
+                }) => (agent_id, ssh),
                 Ok(DoorbellReply::Health {
                     problem: Some(p), ..
                 }) => {
                     tracing::warn!(problem = %p, "exec-service: the SYSTEM service's anchor is not used");
-                    None
+                    (None, None)
                 }
-                Ok(_) => None,
+                Ok(_) => (None, None),
                 Err(e) => {
                     tracing::debug!(%e, "exec-service: no answer from the SYSTEM service");
-                    None
+                    (None, None)
                 }
             };
             set_anchored_agent(agent);
+            set_service_ssh(ssh);
             tokio::time::sleep(HEALTH_EVERY).await;
         }
     });
@@ -475,6 +535,35 @@ pub async fn ring(request_id: &str) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         Err("only a Windows device runs commands through a SYSTEM service".into())
+    }
+}
+
+/// FR-105 — hand an SSH grant to the service: it claims the grant from the
+/// server with its own credential, and that claim is the server's
+/// acknowledgement. `Err` names why the service did not take it, for the
+/// worker to answer the server with a refusal.
+pub async fn ring_ssh(grant_id: &str) -> Result<(), String> {
+    if !valid_object_id(grant_id) {
+        return Err("a malformed grant id".into());
+    }
+    #[cfg(windows)]
+    {
+        let req = DoorbellRequest::SshGrant {
+            grant_id: grant_id.to_string(),
+        };
+        // Past the service's own claim timeout, and inside the server's
+        // window for the claim (10 s from the push).
+        match win::ask(&req, std::time::Duration::from_secs(10)).await? {
+            DoorbellReply::Rang { claimed: true, .. } => Ok(()),
+            DoorbellReply::Rang { error, .. } => Err(error
+                .unwrap_or_else(|| "the SYSTEM service did not take the SSH grant".to_string())),
+            DoorbellReply::Refused { error } => Err(error),
+            other => Err(format!("the SYSTEM service answered {other:?}")),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err("only a Windows device serves SSH through a SYSTEM service".into())
     }
 }
 
@@ -527,6 +616,46 @@ pub fn load_anchor() -> Result<Option<Anchor>, String> {
 #[cfg(not(windows))]
 pub fn load_anchor() -> Result<Option<Anchor>, String> {
     Ok(None)
+}
+
+/// FR-105 — `…\exec-service\ssh_host_ed25519_key`: the SYSTEM service's own
+/// SSH host key, beside the anchor and as private.
+#[cfg(windows)]
+pub fn host_key_path() -> std::path::PathBuf {
+    anchor_dir().join(HOST_KEY_FILE)
+}
+
+#[cfg(windows)]
+const HOST_KEY_FILE: &str = "ssh_host_ed25519_key";
+
+/// FR-105 — the SSH pipe is made with the doorbell's DACL and opened with its
+/// owner check.
+#[cfg(all(windows, feature = "ssh-server"))]
+pub(crate) use win::{open_system_pipe, pipe_instance};
+
+/// FR-105 — the service's host key (OpenSSH PEM), if there is one this process
+/// may trust: the same owner and DACL rules as the anchor.
+#[cfg(windows)]
+pub fn load_host_key() -> Result<Option<String>, String> {
+    win::read_private(
+        &anchor_dir(),
+        &host_key_path(),
+        "the SSH host key",
+        16 * 1024,
+    )
+}
+
+/// FR-105 — the host key, made now if there is none. Only an anchored device's
+/// directory ever holds one: the caller has the anchor already.
+#[cfg(all(windows, feature = "ssh-server"))]
+pub fn ensure_host_key() -> Result<String, String> {
+    if let Some(pem) = load_host_key()? {
+        return Ok(pem);
+    }
+    let pem = crate::ssh::generate_host_key().map_err(|e| format!("making a host key: {e}"))?;
+    win::write_private(HOST_KEY_FILE, pem.as_bytes())?;
+    tracing::info!("ssh-service: made the SYSTEM service's SSH host key");
+    Ok(pem)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -626,6 +755,11 @@ mod svc {
 
     pub async fn run() {
         tokio::spawn(renew_loop());
+        // FR-105 — the SSH pipe and the endpoint publisher, beside the
+        // doorbell. They serve nothing until an administrator turns the
+        // anchor's `ssh` on.
+        #[cfg(feature = "ssh-server")]
+        tokio::spawn(crate::ssh_service::svc::run());
         let limiter = Arc::new(Mutex::new(RingLimiter::default()));
         loop {
             if let Err(e) = super::win::serve(Arc::clone(&limiter)).await {
@@ -653,6 +787,7 @@ mod svc {
                 info!(%request_id, found, "exec-service: cancel");
                 DoorbellReply::Cancelled { found }
             }
+            DoorbellRequest::SshGrant { grant_id } => ssh_grant(grant_id, limiter).await,
         }
     }
 
@@ -661,10 +796,11 @@ mod svc {
         match load_anchor() {
             Ok(Some(a)) => DoorbellReply::Health {
                 anchored: true,
-                agent_id: Some(a.agent_id),
+                agent_id: Some(a.agent_id.clone()),
                 exec_enabled: a.exec_enabled,
                 problem: None,
                 version,
+                ssh: crate::ssh_service::served_ceiling(&a),
             },
             Ok(None) => DoorbellReply::Health {
                 anchored: false,
@@ -672,6 +808,7 @@ mod svc {
                 exec_enabled: false,
                 problem: None,
                 version,
+                ssh: None,
             },
             Err(e) => DoorbellReply::Health {
                 anchored: false,
@@ -679,7 +816,51 @@ mod svc {
                 exec_enabled: false,
                 problem: Some(e),
                 version,
+                ssh: None,
             },
+        }
+    }
+
+    /// FR-105 — claim an SSH grant for the service's own endpoint. Rate
+    /// limited with the rings: a claim costs the server a call and, refused,
+    /// an audit row.
+    async fn ssh_grant(grant_id: String, limiter: Arc<Mutex<RingLimiter>>) -> DoorbellReply {
+        if !valid_object_id(&grant_id) {
+            return DoorbellReply::Refused {
+                error: "a malformed grant id".into(),
+            };
+        }
+        if !limiter.lock().await.allow(std::time::Instant::now()) {
+            warn!(%grant_id, "ssh-service: grant refused, too many rings");
+            return refused("the SYSTEM service is refusing rings for a moment: too many");
+        }
+        let anchor = match load_anchor() {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                return refused("this device is not anchored (`roomlerd anchor create`, elevated)");
+            }
+            Err(e) => {
+                error!(%e, "ssh-service: the anchor cannot be trusted");
+                return refused(format!("this device's anchor cannot be trusted: {e}"));
+            }
+        };
+        #[cfg(feature = "ssh-server")]
+        {
+            match crate::ssh_service::claim_grant(&anchor, &grant_id).await {
+                Ok(()) => DoorbellReply::Rang {
+                    claimed: true,
+                    error: None,
+                },
+                Err(e) => {
+                    warn!(%grant_id, %e, "ssh-service: grant not claimed");
+                    refused(e)
+                }
+            }
+        }
+        #[cfg(not(feature = "ssh-server"))]
+        {
+            let _ = anchor;
+            refused("this build of roomlerd serves no SSH")
         }
     }
 
@@ -957,13 +1138,36 @@ pub enum AnchorAction {
         device: String,
         force: bool,
         exec_enabled: bool,
+        /// FR-105 — the SSH ceiling to anchor with. `None` keeps the one
+        /// the replaced anchor of the SAME device had, and is off otherwise.
+        ssh: Option<roomler_ai_remote_control::models::SshServiceCeiling>,
     },
     /// Show the anchor (never its credential).
     Status,
     /// Turn the anchor's gate 4 on or off.
     Exec { on: bool },
+    /// FR-105 — how far roomler SSH through the SYSTEM service may go.
+    Ssh {
+        ceiling: roomler_ai_remote_control::models::SshServiceCeiling,
+    },
     /// Delete the anchor from this machine.
     Remove,
+}
+
+/// FR-105 — the CLI's spelling of a ceiling (`off`, `console_user`,
+/// `system`), the wire's.
+pub fn parse_ssh_ceiling(
+    word: &str,
+) -> Result<roomler_ai_remote_control::models::SshServiceCeiling, String> {
+    use roomler_ai_remote_control::models::SshServiceCeiling;
+    match word.trim() {
+        "off" => Ok(SshServiceCeiling::Off),
+        "console_user" => Ok(SshServiceCeiling::ConsoleUser),
+        "system" => Ok(SshServiceCeiling::System),
+        other => Err(format!(
+            "{other:?} is not one of off | console_user | system"
+        )),
+    }
 }
 
 /// `roomlerd anchor …`. Every action but `status` needs an elevated prompt;
@@ -1215,6 +1419,24 @@ mod win {
     }
 
     pub fn load_anchor(dir: &Path, path: &Path) -> Result<Option<Anchor>, String> {
+        let Some(text) = read_private(dir, path, "the anchor file", 64 * 1024)? else {
+            return Ok(None);
+        };
+        let anchor: Anchor =
+            serde_json::from_str(&text).map_err(|e| format!("the anchor file: {e}"))?;
+        anchor.validate()?;
+        Ok(Some(anchor))
+    }
+
+    /// Read `path`, a file in the anchor's directory `dir`, if both are
+    /// private: owned by SYSTEM or Administrators and writable by nobody
+    /// else. `Ok(None)` = not there. `what` names it in errors.
+    pub(crate) fn read_private(
+        dir: &Path,
+        path: &Path,
+        what: &str,
+        max_len: u64,
+    ) -> Result<Option<String>, String> {
         if let Some(link) = roomler_node_core::recording_dir::link_component(path) {
             return Err(format!("{} is a link", link.display()));
         }
@@ -1252,22 +1474,19 @@ mod win {
         if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(format!("{} is not a plain file", path.display()));
         }
-        if meta.len() > 64 * 1024 {
-            return Err("the anchor file is too large to be one".into());
+        if meta.len() > max_len {
+            return Err(format!("{what} is too large to be one"));
         }
         // Checked on the handle the content is read from, not by name: a name
         // can be swapped between a check and a read; an open file cannot.
-        check_private(file.as_raw_handle() as HANDLE, "the anchor file")?;
+        check_private(file.as_raw_handle() as HANDLE, what)?;
         use std::io::Read as _;
         let mut text = String::new();
-        let mut bounded = (&file).take(64 * 1024);
+        let mut bounded = (&file).take(max_len);
         bounded
             .read_to_string(&mut text)
-            .map_err(|e| format!("reading the anchor: {e}"))?;
-        let anchor: Anchor =
-            serde_json::from_str(&text).map_err(|e| format!("the anchor file: {e}"))?;
-        anchor.validate()?;
-        Ok(Some(anchor))
+            .map_err(|e| format!("reading {what}: {e}"))?;
+        Ok(Some(text))
     }
 
     /// Make the anchor's directory private, or take over the plain directory
@@ -1326,12 +1545,21 @@ mod win {
     /// given the file's own DACL before it takes the name.
     pub fn store_anchor(anchor: &Anchor) -> Result<(), String> {
         anchor.validate()?;
+        let text = serde_json::to_string_pretty(anchor).map_err(|e| e.to_string())?;
+        write_private("anchor.json", text.as_bytes())
+    }
+
+    /// Write `bytes` as `name` in the anchor's directory, made private first,
+    /// through a temporary file given the file's own DACL before it takes the
+    /// name. The directory's inherited DACL already admits only SYSTEM and
+    /// Administrators, so not even the temporary file is ever readable by
+    /// anyone else (FR-105's host key is a private key).
+    pub(crate) fn write_private(name: &str, bytes: &[u8]) -> Result<(), String> {
         let dir = super::anchor_dir();
         private_dir(&dir)?;
-        let path = super::anchor_path();
-        let tmp = dir.join(format!("anchor.json.{}.tmp", std::process::id()));
-        let text = serde_json::to_string_pretty(anchor).map_err(|e| e.to_string())?;
-        std::fs::write(&tmp, text.as_bytes()).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        let path = dir.join(name);
+        let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
         let sd = Sddl::new(FILE_SDDL).map_err(|e| e.to_string())?;
         let name = wide(&tmp);
         // SAFETY: a NUL-terminated path; the descriptor lives in `sd`.
@@ -1423,7 +1651,18 @@ mod win {
     /// identification level (the service never acts as the worker), and
     /// refuse it unless SYSTEM owns it. `Ok(None)` = every instance is busy.
     fn open_doorbell() -> Result<Option<NamedPipeClient>, String> {
-        let name = wide(Path::new(super::PIPE_NAME));
+        open_system_pipe(super::PIPE_NAME, "doorbell")
+    }
+
+    /// Open one of the SYSTEM service's pipes (`what` names it in errors) the
+    /// way [`open_doorbell`] opens the doorbell: the access its DACL grants,
+    /// identification level, and SYSTEM must own it, so a pipe a user squatted
+    /// is refused. FR-105's SSH pipe is opened the same way.
+    pub(crate) fn open_system_pipe(
+        pipe: &str,
+        what: &str,
+    ) -> Result<Option<NamedPipeClient>, String> {
+        let name = wide(Path::new(pipe));
         // SAFETY: a NUL-terminated name; the handle goes to tokio or is
         // closed.
         let handle = unsafe {
@@ -1442,18 +1681,17 @@ mod win {
             if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) {
                 return Ok(None);
             }
-            return Err(format!("no SYSTEM service doorbell: {e}"));
+            return Err(format!("no SYSTEM service {what}: {e}"));
         }
         match pipe_owned_by_system(handle) {
             Ok(true) => {}
             Ok(false) => {
                 // SAFETY: ours, closed once.
                 unsafe { CloseHandle(handle) };
-                return Err(
-                    "the doorbell pipe is not owned by SYSTEM: refusing it (another process \
+                return Err(format!(
+                    "the {what} pipe is not owned by SYSTEM: refusing it (another process \
                      created it first?)"
-                        .into(),
-                );
+                ));
             }
             Err(e) => {
                 // SAFETY: ours, closed once.
@@ -1467,7 +1705,7 @@ mod win {
             Err(e) => {
                 // SAFETY: tokio did not take it; closed once.
                 unsafe { CloseHandle(handle) };
-                Err(format!("the doorbell: {e}"))
+                Err(format!("the {what}: {e}"))
             }
         }
     }
@@ -1489,6 +1727,15 @@ mod win {
     }
 
     fn server_instance(first: bool) -> std::io::Result<NamedPipeServer> {
+        pipe_instance(super::PIPE_NAME, first)
+    }
+
+    /// One server instance of a SYSTEM service pipe, with the doorbell's
+    /// DACL ([`PIPE_SDDL`]): SYSTEM owns it, Administrators and interactive
+    /// users may read and write data, and nobody else may add an instance.
+    /// `first` refuses a name something else already holds. FR-105's SSH pipe
+    /// is made the same way.
+    pub(crate) fn pipe_instance(name: &str, first: bool) -> std::io::Result<NamedPipeServer> {
         let mut sd = Sddl::new(PIPE_SDDL)?;
         // SAFETY: the attributes live in `sd` until the call returns; the
         // system copies the descriptor into the instance.
@@ -1496,7 +1743,7 @@ mod win {
             ServerOptions::new()
                 .first_pipe_instance(first)
                 .reject_remote_clients(true)
-                .create_with_security_attributes_raw(super::PIPE_NAME, sd.attributes().cast())
+                .create_with_security_attributes_raw(name, sd.attributes().cast())
         }
     }
 
@@ -1529,6 +1776,16 @@ mod win {
         }
     }
 
+    /// A ceiling as `anchor status` and `anchor ssh` say it.
+    fn ssh_words(ceiling: roomler_ai_remote_control::models::SshServiceCeiling) -> &'static str {
+        use roomler_ai_remote_control::models::SshServiceCeiling;
+        match ceiling {
+            SshServiceCeiling::Off => "OFF",
+            SshServiceCeiling::ConsoleUser => "ON, as the signed-in user only",
+            SshServiceCeiling::System => "ON, as SYSTEM or the signed-in user",
+        }
+    }
+
     fn require_elevated() -> anyhow::Result<()> {
         if !process_is_elevated() {
             anyhow::bail!(
@@ -1547,8 +1804,32 @@ mod win {
                 device,
                 force,
                 exec_enabled,
-            } => create(&server, &token, &device, force, exec_enabled).await,
+                ssh,
+            } => create(&server, &token, &device, force, exec_enabled, ssh).await,
             AnchorAction::Status => status(),
+            AnchorAction::Ssh { ceiling } => {
+                require_elevated()?;
+                let mut anchor = load_anchor(&super::anchor_dir(), &super::anchor_path())
+                    .map_err(anyhow::Error::msg)?
+                    .ok_or_else(|| anyhow::anyhow!("this device is not anchored"))?;
+                anchor.ssh = ceiling;
+                // The key before the ceiling: a service that reads the new
+                // ceiling must find a key to publish with it.
+                #[cfg(feature = "ssh-server")]
+                if ceiling != roomler_ai_remote_control::models::SshServiceCeiling::Off {
+                    super::ensure_host_key().map_err(anyhow::Error::msg)?;
+                }
+                store_anchor(&anchor).map_err(anyhow::Error::msg)?;
+                println!(
+                    "SSH through the SYSTEM service is now {} on this device.\n\
+                     The service publishes it to the server within a minute; nothing needs \
+                     a restart.",
+                    ssh_words(ceiling)
+                );
+                #[cfg(not(feature = "ssh-server"))]
+                println!("Note: this build of roomlerd serves no SSH, so nothing uses it yet.");
+                Ok(())
+            }
             AnchorAction::Exec { on } => {
                 require_elevated()?;
                 let mut anchor = load_anchor(&super::anchor_dir(), &super::anchor_path())
@@ -1589,6 +1870,7 @@ mod win {
         device: &str,
         force: bool,
         exec_enabled: bool,
+        ssh: Option<roomler_ai_remote_control::models::SshServiceCeiling>,
     ) -> anyhow::Result<()> {
         require_elevated()?;
         let server = super::origin_ok(server).map_err(anyhow::Error::msg)?;
@@ -1631,6 +1913,20 @@ mod win {
         let replaced = load_anchor(&super::anchor_dir(), &super::anchor_path())
             .ok()
             .flatten();
+        // FR-105 — an administrator re-anchoring the SAME device (a fresh
+        // credential, a re-run wizard) keeps the SSH ceiling an administrator
+        // chose for it; any other device starts off.
+        let ssh = ssh.unwrap_or_else(|| {
+            replaced
+                .as_ref()
+                .filter(|old| old.agent_id == anchored.agent_id)
+                .map(|old| old.ssh)
+                .unwrap_or_default()
+        });
+        #[cfg(feature = "ssh-server")]
+        if ssh != roomler_ai_remote_control::models::SshServiceCeiling::Off {
+            super::ensure_host_key().map_err(anyhow::Error::msg)?;
+        }
         let anchor = Anchor {
             version: super::ANCHOR_VERSION,
             server: server.clone(),
@@ -1640,6 +1936,8 @@ mod win {
             service_token: anchored.service_token,
             exec_enabled,
             anchored_at: chrono::Utc::now().to_rfc3339(),
+            ssh,
+            extra: Default::default(),
         };
         store_anchor(&anchor).map_err(anyhow::Error::msg)?;
         if let Some(old) = replaced {
@@ -1672,15 +1970,23 @@ mod win {
                     .unwrap_or_else(|| "unknown".into());
                 println!(
                     "Anchored: device {} ({})\n  server:      {}\n  org:         {}\n  \
-                     exec:        {}\n  anchored at: {}\n  credential:  renews itself; \
-                     current one expires {expires}",
+                     exec:        {}\n  ssh:         {}\n  anchored at: {}\n  credential:  \
+                     renews itself; current one expires {expires}",
                     a.device_name,
                     a.agent_id,
                     a.server,
                     a.tenant_id,
                     if a.exec_enabled { "on" } else { "off" },
+                    ssh_words(a.ssh),
                     a.anchored_at,
                 );
+                // FR-105 — the key a caller pins on the service's port.
+                #[cfg(feature = "ssh-server")]
+                if let Ok(Some(pem)) = super::load_host_key()
+                    && let Some(fp) = crate::ssh_service::fingerprint_of(&pem)
+                {
+                    println!("  ssh host key: {fp}");
+                }
                 Ok(())
             }
             Ok(None) => {
@@ -1752,6 +2058,8 @@ mod tests {
             service_token: "test-only-service-credential-not-a-jwt".into(),
             exec_enabled: true,
             anchored_at: "2026-10-13T12:00:00Z".into(),
+            ssh: Default::default(),
+            extra: Default::default(),
         }
     }
 

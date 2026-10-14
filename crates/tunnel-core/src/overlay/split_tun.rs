@@ -83,20 +83,23 @@ const OUTBOUND_QUEUE: usize = 1024;
 /// IPv4 protocol number for TCP.
 const IPPROTO_TCP: u8 = 6;
 
-/// A [`TunIo`] that diverts one TCP port on `self_ip` into an in-process
+/// A [`TunIo`] that diverts a few TCP ports on `self_ip` into an in-process
 /// [`Netstack`] and passes everything else through to `inner`.
 ///
-/// Build it with [`SplitTun::wrap`]; accept the diverted connections with
-/// [`SplitTun::listen`].
+/// Build it with [`SplitTun::wrap`] (one port) or [`SplitTun::wrap_ports`];
+/// accept the diverted connections with [`SplitTun::listen`] or
+/// [`SplitTun::listen_on`].
 pub struct SplitTun {
     /// The real device (OS TUN, or a netstack in OS-free mode).
     inner: Arc<dyn TunIo>,
-    /// The userspace stack that terminates the intercepted port.
+    /// The userspace stack that terminates the intercepted ports.
     ns: Arc<Netstack>,
     /// This node's overlay address — the only destination we intercept for.
     self_ip: Ipv4Addr,
-    /// The intercepted TCP port.
-    port: u16,
+    /// The intercepted TCP ports; the first is [`SplitTun::listen`]'s. A
+    /// handful at most (FR-105: roomler SSH's 2222 and the Windows SYSTEM
+    /// service's 2223), so a scan beats a set.
+    ports: Vec<u16>,
     /// Merged outbound queue fed by both pumps.
     out_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     /// Pump join handles, aborted on drop.
@@ -124,6 +127,21 @@ impl SplitTun {
         mtu: u16,
         port: u16,
     ) -> Arc<Self> {
+        Self::wrap_ports(inner, self_ip, prefix, mtu, &[port])
+    }
+
+    /// [`SplitTun::wrap`] for several ports at once, served by the one
+    /// in-process stack. The first is [`SplitTun::listen`]'s; every port is
+    /// [`SplitTun::listen_on`]'s.
+    pub fn wrap_ports(
+        inner: Arc<dyn TunIo>,
+        self_ip: Ipv4Addr,
+        prefix: u8,
+        mtu: u16,
+        ports: &[u16],
+    ) -> Arc<Self> {
+        assert!(!ports.is_empty(), "split-tun: nothing to intercept");
+        let ports = ports.to_vec();
         let ns = Arc::new(Netstack::start(self_ip, prefix, mtu));
         let (out_tx, out_rx) = mpsc::channel(OUTBOUND_QUEUE);
 
@@ -166,7 +184,7 @@ impl SplitTun {
         });
 
         info!(
-            %self_ip, port,
+            %self_ip, ?ports,
             "split-tun: intercepting overlay TCP — the service answers in-process, no OS socket"
         );
 
@@ -174,7 +192,7 @@ impl SplitTun {
             inner,
             ns,
             self_ip,
-            port,
+            ports,
             out_rx: Mutex::new(out_rx),
             pumps: [pump_a, pump_b],
             intercepted: AtomicU64::new(0),
@@ -187,7 +205,19 @@ impl SplitTun {
     /// address of the calling node — which is the caller's *authenticated*
     /// identity, since nothing reaches this stack without clearing WireGuard.
     pub async fn listen(&self) -> std::io::Result<NsListener> {
-        self.ns.handle.listen(self.port).await
+        self.ns.handle.listen(self.ports[0]).await
+    }
+
+    /// Accept connections to `port`, one of the intercepted ports. Any other
+    /// port is refused: nothing would ever reach a listener on it.
+    pub async fn listen_on(&self, port: u16) -> std::io::Result<NsListener> {
+        if !self.ports.contains(&port) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("split-tun: port {port} is not intercepted"),
+            ));
+        }
+        self.ns.handle.listen(port).await
     }
 
     /// The netstack handle, for callers that need to originate as well as
@@ -211,47 +241,52 @@ impl Drop for SplitTun {
     }
 }
 
-/// Does this packet belong to the intercepted service?
-///
-/// True only for a complete, unfragmented IPv4/TCP packet addressed to
-/// `self_ip:port`. Everything else — v6, other protocols, other destinations,
-/// non-initial fragments, truncated or malformed headers — is passed to the OS,
-/// which is both the safe default and the correct one.
+/// Does this packet belong to the service on `port`? The tests' view of
+/// [`tcp_dport_to`].
+#[cfg(test)]
+fn is_intercepted(pkt: &[u8], self_ip: Ipv4Addr, port: u16) -> bool {
+    tcp_dport_to(pkt, self_ip) == Some(port)
+}
+
+/// The TCP destination port of a packet that may belong to an intercepted
+/// service: a complete, unfragmented IPv4/TCP packet addressed to `self_ip`.
+/// Everything else — v6, other protocols, other destinations, non-initial
+/// fragments, truncated or malformed headers — is `None`, and is passed to
+/// the OS, which is both the safe default and the correct one.
 ///
 /// This parses attacker-influenced bytes (a peer that cleared WireGuard is
 /// authenticated, not trusted), so every field access is bounds-checked and the
-/// function is total: it returns `false` rather than panicking on any input.
-fn is_intercepted(pkt: &[u8], self_ip: Ipv4Addr, port: u16) -> bool {
+/// function is total: it returns `None` rather than panicking on any input.
+fn tcp_dport_to(pkt: &[u8], self_ip: Ipv4Addr) -> Option<u16> {
     // IPv4 fixed header is 20 bytes.
     if pkt.len() < 20 {
-        return false;
+        return None;
     }
     // Version must be 4. (IPv6 overlay traffic is never intercepted: the
     // service is reached over the v4 overlay address today.)
     if pkt[0] >> 4 != 4 {
-        return false;
+        return None;
     }
     if pkt[9] != IPPROTO_TCP {
-        return false;
+        return None;
     }
     // Only the first fragment carries the TCP header; later ones must go to the
     // OS so it can reassemble. Overlay MTU makes this vanishingly rare for TCP.
     let frag_offset = u16::from_be_bytes([pkt[6] & 0x1f, pkt[7]]);
     if frag_offset != 0 {
-        return false;
+        return None;
     }
     let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
     if dst != self_ip {
-        return false;
+        return None;
     }
     // IHL is in 32-bit words and must be at least 5; the TCP destination port
     // sits at bytes 2..4 of the TCP header.
     let ihl = usize::from(pkt[0] & 0x0f) * 4;
     if ihl < 20 || pkt.len() < ihl + 4 {
-        return false;
+        return None;
     }
-    let dport = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
-    dport == port
+    Some(u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]))
 }
 
 #[async_trait]
@@ -266,11 +301,11 @@ impl TunIo for SplitTun {
     }
 
     async fn write_packet(&self, packet: &[u8]) -> std::io::Result<()> {
-        if is_intercepted(packet, self.self_ip, self.port) {
+        if let Some(port) = tcp_dport_to(packet, self.self_ip).filter(|p| self.ports.contains(p)) {
             self.intercepted.fetch_add(1, Ordering::Relaxed);
             if !self.announced.swap(true, Ordering::Relaxed) {
                 info!(
-                    self_ip = %self.self_ip, port = self.port,
+                    self_ip = %self.self_ip, port,
                     "split-tun: first intercepted connection — serving it in-process"
                 );
             }
@@ -506,6 +541,36 @@ mod tests {
             seen.try_recv().expect("the OS device receives it"),
             passthru
         );
+    }
+
+    /// FR-105 — two services on one stack: roomler SSH's port and the Windows
+    /// SYSTEM service's. Each is diverted, a third port is not, and only an
+    /// intercepted port can be listened on.
+    #[tokio::test]
+    async fn diverts_every_listed_port_and_only_those() {
+        const SERVICE: u16 = 2223;
+        let (mock, mut seen) = mock_os_tun();
+        let split = SplitTun::wrap_ports(mock, SELF_IP, 10, 1280, &[PORT, SERVICE]);
+
+        for port in [PORT, SERVICE] {
+            split
+                .write_packet(&ipv4_tcp(SELF_IP, port, IPPROTO_TCP, 5, 0))
+                .await
+                .unwrap();
+        }
+        assert_eq!(split.intercepted(), 2);
+        assert!(seen.try_recv().is_err(), "neither reached the OS device");
+
+        let passthru = ipv4_tcp(SELF_IP, 2224, IPPROTO_TCP, 5, 0);
+        split.write_packet(&passthru).await.unwrap();
+        assert_eq!(split.intercepted(), 2);
+        assert_eq!(seen.try_recv().unwrap(), passthru);
+
+        assert!(split.listen_on(SERVICE).await.is_ok());
+        assert!(matches!(
+            split.listen_on(2224).await,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput
+        ));
     }
 
     /// End-to-end over a real WireGuard pair: peer A dials peer B's overlay

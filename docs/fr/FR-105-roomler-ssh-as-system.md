@@ -103,7 +103,10 @@ flowchart LR
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | This spec, the issue and the registry row. Docs truth first: `roomler-ssh.md`'s identity table and the P4b ConPTY paragraph; the stale `pty/windows.rs` L846 test comment. vmtest RED: SSH identity on attended (the user), SystemContext (SYSTEM in session 1), `console_user` refused on attended | docs only | spec #2149; docs truth the P0 PR; vmtest RED owed |
-| P1 | Server: `ssh_pending`, the claim route, the claim-as-ack resolver; the host-key route; `routes_ssh_via_service`; port and key per grant; `ssh_audit.ran_as`; the composition baseline | `rc.ssh_via_service = false` | in review |
+| P1 | Server: `ssh_pending`, the claim route, the claim-as-ack resolver; the host-key route; `routes_ssh_via_service`; port and key per grant; `ssh_audit.ran_as`; the composition baseline | `rc.ssh_via_service = false` | merged (#2166) |
+| P2 | Service: the anchor's `ssh` ceiling and `roomlerd anchor ssh`; the service host key and its publication; the SSH pipe server; russh over the pipe with its own grant table; daemon → SYSTEM, console_user; key-list and `direct-tcpip` refused | the anchor's `ssh = off` (default) | in review, one PR with P3: neither half can be field-tested without the other |
+| P3 | Worker: the `ssh-system` word (from the service's health reply); 2223 → the pipe; the via-service grant ring; the consent frames | `ROOMLERD_SSH_VIA_SERVICE=0` | in review, with P2 |
+| P4 | UI (`ran_as` in the SSH audit, the device's SSH identity); docs; field | — | — |
 
 P1 as built (`crates/modules/network/src/routes/agent_ssh.rs`):
 - **The service publishes its ceiling with its key.** `PUT /api/agent/service/ssh-host-key {host_pubkey, ceiling}`, with the service credential, stores `Agent.ssh_service {host_pubkey, ceiling, anchor_id, published_at}`. The write is filtered on the row still carrying that anchor, so a publish racing a re-anchor writes nothing (401).
@@ -112,9 +115,18 @@ P1 as built (`crates/modules/network/src/routes/agent_ssh.rs`):
 - **The claim window is the caller's wait** (`GRANT_ACK_TIMEOUT_SECS`). After the bound, the row is withdrawn; if it cannot be withdrawn because the claim won the race, that counts as confirmed. A refusal from the worker, or a failed push, withdraws it too. A refused claim is a 404 and an `ssh_audit` row `claim_refused` with no user.
 - **Deferred:** refusing `console_user` up front on Windows with no service path. A SystemContext worker runs as SYSTEM and *can* serve it, and the server cannot yet tell that worker from an attended one; the device still refuses it, through the grant ack.
 - A P1-era agent binds `via_service` and refuses such a grant (`Other`). It never advertises `ssh-system`, so no server sends it one.
-| P2 | Service: the anchor's `ssh` ceiling and `roomlerd anchor ssh`; the service host key and its publication; the SSH pipe server; russh over the pipe with its own grant table; daemon → SYSTEM, console_user; key-list and `direct-tcpip` refused | the anchor's `ssh = off` (default) | — |
-| P3 | Worker: the `ssh-system` word (from the service's health reply); 2223 → the pipe; the via-service grant ring; the consent frames | `ROOMLERD_SSH_VIA_SERVICE=0` | — |
-| P4 | UI (`ran_as` in the SSH audit, the device's SSH identity); docs; field | — | — |
+
+P2 and P3 as built (`agents/roomlerd/src/ssh_service.rs`, `exec_service.rs`, `ssh.rs`):
+- **The ceiling is the anchor's.** `Anchor.ssh` (serde default `off`, so every FR-94 anchor reads as off), set elevated with `roomlerd anchor ssh <off|console_user|system>` or `anchor create --ssh`. Re-anchoring the SAME device keeps it; any other device starts off. `Anchor.extra` keeps keys a newer build wrote, so this build's save (a renewal, `anchor exec`) never erases them.
+- **The host key** is `ssh_host_ed25519_key` beside the anchor, written and read with the anchor's rules (private directory, file DACL set before the rename, owner and DACL checked on the handle read from). The service or `anchor ssh` makes it when missing.
+- **The publisher** compares every 60 s and puts `{host_pubkey, ceiling}` when the anchor, the ceiling or the key changed, or after 6 h. A failure waits 5 min. Without an anchor it publishes nothing: the server's record names the anchor it came under.
+- **The SSH pipe** `\\.\pipe\roomler-ssh-service` has the doorbell's DACL, is created first-instance-only, and serves at most 8 sessions. The worker opens it with the doorbell's SYSTEM-owner check.
+- **Frames**: a kind byte, a big-endian `u32` length, the payload. `Hello{peer}` (the worker's claim, logged only), `Data` (≤ 64 KiB, ciphertext), `Eof`, `Ask{id, sentinel, caller, what, timeout_secs}`, `Answer{id, granted, reason}` (≤ 4 KiB, JSON). Oversized, unknown or malformed frames end the connection unread.
+- **The service's server** (`sshd::Ctx::for_service`, built per connection from the anchor as it stands then): no key list, forwards refused (`forward_refusal`, and an allowlist that is off besides), and the ceiling applied after the grant resolves, refusing rather than downgrading (`within_service_ceiling`).
+- **Consent**: `ssh::Asker` is `Here` (the broker and the panel) or `Worker(ConsentRelay)`. The service asks through the relay; the worker answers with the same `ask_here` its own sessions use, and validates the sentinel as a grant id first, since it becomes a file name. Reasons reach the caller's terminal stripped of control characters and capped.
+- **The grant**: the worker refuses a via-service grant when `ssh_enabled` is off, the kill switch is set, or `ssh_max_privilege = console_user` meets a `daemon` grant. Otherwise it rings `DoorbellRequest::SshGrant` off the read loop; the service claims with its own credential (8 s, inside the server's 10 s window) and records the grant in its own table. A failed ring is answered to the server as a refusal.
+- **The word**: the doorbell's health reply carries `ssh` (the ceiling while the SSH pipe is up). The worker advertises `ssh-system` when the service serves SSH for exactly this device, above off, `ssh_enabled` is on and the kill switch is unset, and re-announces on the heartbeat when that changes.
+- **The port**: `SplitTun::wrap_ports` intercepts 2223 beside the node's own SSH port, unless the kill switch is set or `ssh_port` is 2223. Each connection is carried to the pipe and never served by the worker.
 
 ## 5. Acceptance criteria
 
