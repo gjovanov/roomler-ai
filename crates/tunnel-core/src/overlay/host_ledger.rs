@@ -182,11 +182,17 @@ pub struct HostLedger {
     /// removed. One per address.
     #[serde(default)]
     pub pins: Vec<PinRecord>,
+    /// FR-97 P0b-2c — the WinNAT instances a Windows router created and had
+    /// not yet removed, by name ([`is_nat_name`]). A crash used to leave one
+    /// behind (field, both 0.4.134 and the P0b-2b candidate), and on client
+    /// Windows it can stand in the way of Docker's or WSL's own NAT.
+    #[serde(default)]
+    pub nat: Vec<String>,
 }
 
 impl HostLedger {
     pub fn is_empty(&self) -> bool {
-        self.forwarding.is_empty() && self.pins.is_empty()
+        self.forwarding.is_empty() && self.pins.is_empty() && self.nat.is_empty()
     }
 
     /// Record `pin`, replacing any earlier record for the same address.
@@ -208,7 +214,40 @@ impl HostLedger {
 static LEDGER: Mutex<HostLedger> = Mutex::new(HostLedger {
     forwarding: Vec::new(),
     pins: Vec::new(),
+    nat: Vec::new(),
 });
+
+/// FR-97 P0b-2c — a WinNAT instance name a router of ours creates:
+/// `roomler-overlay`, or `roomler-overlay-<n>` for a later block. Strict,
+/// because the name goes back into a PowerShell command, and only an
+/// instance named like ours is ever removed.
+pub fn is_nat_name(s: &str) -> bool {
+    match s.strip_prefix("roomler-overlay") {
+        Some("") => true,
+        Some(rest) => rest.strip_prefix('-').is_some_and(|n| {
+            !n.is_empty() && n.len() <= 3 && n.chars().all(|c| c.is_ascii_digit())
+        }),
+        None => false,
+    }
+}
+
+/// FR-97 P0b-2c — a router's WinNAT instances are in.
+#[cfg(windows)]
+pub(crate) fn record_nat(names: &[String]) {
+    with_ledger(|l| {
+        for n in names {
+            if is_nat_name(n) && !l.nat.contains(n) {
+                l.nat.push(n.clone());
+            }
+        }
+    });
+}
+
+/// FR-97 P0b-2c — a router's WinNAT instances are out.
+#[cfg(windows)]
+pub(crate) fn forget_nat(names: &[String]) {
+    with_ledger(|l| l.nat.retain(|n| !names.contains(n)));
+}
 
 #[cfg(any(windows, feature = "overlay-l3"))]
 fn with_ledger(f: impl FnOnce(&mut HostLedger)) {
@@ -252,16 +291,17 @@ pub(crate) fn pin_record(ip: std::net::IpAddr) -> Option<PinRecord> {
 }
 
 /// FR-97 P0b-2b / P0e — undo what the persisted ledger records, then clear
-/// it: the forwarding a Windows router turned on, and every exit-client pin. Run
-/// at boot, before the overlay can install anything, and after every exit of
-/// the daemon (`roomlerd::purge_exit_routes`). Context-free and synchronous;
-/// a no-op when the ledger is empty. Each OS arm checks that a route still
-/// looks like our pin before it removes it.
+/// it: the WinNAT instances and the forwarding a Windows router left, and
+/// every exit-client pin. Run at boot, before the overlay can install
+/// anything, and after every exit of the daemon (`roomlerd::purge_exit_routes`).
+/// Context-free and synchronous; a no-op when the ledger is empty. Each OS arm
+/// checks that a route still looks like our pin before it removes it.
 pub fn purge() {
     let on_disk = HostLedger::load();
     if on_disk.is_empty() {
         return;
     }
+    super::nat::remove_nat_instances(&on_disk.nat);
     super::nat::restore_forwarding_guids(&on_disk.forwarding);
     #[cfg(feature = "overlay-l3")]
     super::tun::purge_pins(&on_disk.pins);
@@ -599,16 +639,46 @@ mod tests {
                 pin("94.130.141.98", "192.168.64.1"),
                 pin("2a01:4f8::1", "fe80::1%en0"),
             ],
+            nat: vec!["roomler-overlay".into()],
         };
         let back: HostLedger = serde_json::from_slice(&serde_json::to_vec(&l).unwrap()).unwrap();
         assert_eq!(back, l);
         let empty: HostLedger = serde_json::from_str("{}").unwrap();
         assert!(empty.is_empty());
-        // A ledger written by P0b-2b, before pins existed, still reads.
+        // A ledger written by P0b-2b, before pins and NAT names existed,
+        // still reads.
         let old: HostLedger =
             serde_json::from_str(&format!("{{\"forwarding\":[\"{GUID_A}\"]}}")).unwrap();
         assert_eq!(old.forwarding, vec![GUID_A.to_string()]);
-        assert!(old.pins.is_empty());
+        assert!(old.pins.is_empty() && old.nat.is_empty());
+        // A NAT name alone keeps the ledger (and its purge) alive.
+        let nat_only = HostLedger {
+            nat: vec!["roomler-overlay".into()],
+            ..HostLedger::default()
+        };
+        assert!(!nat_only.is_empty());
+    }
+
+    /// FR-97 P0b-2c — only an instance named like ours is ever removed, and
+    /// the name goes back into PowerShell, so the check is strict.
+    #[test]
+    fn only_our_nat_names_are_nat_names() {
+        for good in ["roomler-overlay", "roomler-overlay-1", "roomler-overlay-12"] {
+            assert!(is_nat_name(good), "{good}");
+        }
+        for bad in [
+            "",
+            "roomler",
+            "roomler-overlay-",
+            "roomler-overlay-a",
+            "roomler-overlay-1;Remove-Item",
+            "roomler-overlay-1234",
+            "DockerNAT",
+            "roomler-overlay2",
+            "x-roomler-overlay",
+        ] {
+            assert!(!is_nat_name(bad), "{bad:?}");
+        }
     }
 
     /// FR-97 P0e — one record per address: a re-pin through a new uplink
