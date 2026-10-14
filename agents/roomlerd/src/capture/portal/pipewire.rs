@@ -485,6 +485,8 @@ struct SpaHook([usize; 6]);
 const PW_DIRECTION_INPUT: c_int = 0;
 const PW_STREAM_FLAG_AUTOCONNECT: u32 = 1 << 0;
 const PW_STREAM_FLAG_MAP_BUFFERS: u32 = 1 << 2;
+/// `enum pw_stream_state` — frames flow only while `STREAMING`.
+pub const PW_STREAM_STATE_STREAMING: i32 = 3;
 /// `enum spa_param_type` — the *negotiated* format (not `EnumFormat`).
 const SPA_PARAM_FORMAT: u32 = 4;
 
@@ -670,6 +672,10 @@ struct Shared {
     /// a timeout can say whether nothing came at all or several came and none
     /// fixated — different problems with different fixes.
     rejected: u32,
+    /// FR-93 P5c — the stream's state as the loop last reported it, for a
+    /// streaming caller: a stream whose source vanished goes to paused and
+    /// reports no error.
+    state: Option<Arc<std::sync::atomic::AtomicI32>>,
 }
 
 impl Shared {
@@ -706,6 +712,9 @@ unsafe extern "C" fn on_state_changed(
     error: *const c_char,
 ) {
     guard(data, |shared| {
+        if let Some(cell) = &shared.state {
+            cell.store(state, std::sync::atomic::Ordering::Relaxed);
+        }
         // -1 is PW_STREAM_STATE_ERROR. Anything else is progress, and the
         // format arrives via param_changed rather than here.
         if state == -1 {
@@ -1020,7 +1029,7 @@ pub fn negotiate(
 ) -> Result<(NegotiatedFormat, Option<FrameReport>), PwError> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let r = negotiate_blocking(source, node_id, max_fps, want_frames, None);
+        let r = negotiate_blocking(source, node_id, max_fps, want_frames, None, None);
         // The receiver may already have timed out; nothing to do about that.
         let _ = tx.send(r);
     });
@@ -1037,6 +1046,7 @@ fn negotiate_blocking(
     max_fps: u32,
     want_frames: u32,
     frame_tx: Option<std::sync::mpsc::SyncSender<(super::wire::FrameHeader, Vec<u8>)>>,
+    state: Option<Arc<std::sync::atomic::AtomicI32>>,
 ) -> Result<(NegotiatedFormat, Option<FrameReport>), PwError> {
     let lib = Lib::load()?;
     let conn = Connection::open(lib.clone(), source)?;
@@ -1066,6 +1076,7 @@ fn negotiate_blocking(
         dropped: 0,
         outcome: None,
         rejected: 0,
+        state,
     });
     shared.stream = Some(stream);
     let events = Box::new(PwStreamEvents {
@@ -1145,6 +1156,9 @@ pub struct StreamHandle {
     /// ⚠️ Bounded and lossy by design — see the `try_send` in `on_process`.
     /// A closed channel means the PipeWire loop stopped.
     pub frames: std::sync::mpsc::Receiver<(super::wire::FrameHeader, Vec<u8>)>,
+    /// FR-93 P5c — the stream's `pw_stream_state` as its loop last reported
+    /// it ([`PW_STREAM_STATE_STREAMING`] while frames can flow).
+    pub state: Arc<std::sync::atomic::AtomicI32>,
 }
 
 /// Open a stream and keep it running, delivering frames until dropped.
@@ -1158,11 +1172,22 @@ pub fn stream(source: PwSource, node_id: u32, max_fps: u32) -> Result<StreamHand
     // enough that what arrives is always nearly current.
     let (frame_tx, frames) = std::sync::mpsc::sync_channel(2);
     let (err_tx, err_rx) = std::sync::mpsc::channel();
+    // FR-93 P5c — the stream's state, for a caller that must tell a stream
+    // whose source vanished (paused, no error) from an idle one.
+    let state = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let loop_state = Arc::clone(&state);
 
     std::thread::spawn(move || {
         // u32::MAX so the loop never satisfies its finish condition and runs
         // until the process ends.
-        let r = negotiate_blocking(source, node_id, max_fps, u32::MAX, Some(frame_tx));
+        let r = negotiate_blocking(
+            source,
+            node_id,
+            max_fps,
+            u32::MAX,
+            Some(frame_tx),
+            Some(loop_state),
+        );
         // Only reached once the loop has ended, which for a stream is a fault.
         let _ = err_tx.send(r.err());
     });
@@ -1205,6 +1230,7 @@ pub fn stream(source: PwSource, node_id: u32, max_fps: u32) -> Result<StreamHand
             fps_denom: 1,
         },
         frames,
+        state,
     })
 }
 
