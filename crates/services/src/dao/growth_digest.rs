@@ -4,10 +4,22 @@
 //!
 //! The once-only story (spec §3l, AC23) is the unique `_id`: a run first
 //! INSERTS `{_id: "YYYY-MM-DD", status: computing}`, and the pod that loses
-//! the insert stops. A `failed` day, or a `computing` one whose claim is
-//! older than the staleness cutoff (a pod died mid-run), is re-claimed with a
-//! compare-and-set on exactly the status and `claimed_at` the reader saw — so
-//! two re-claimers cannot both win. A `sent` day is never claimed again.
+//! the insert stops. A `failed` or `preview` day, or a `computing` one whose
+//! claim is older than the staleness cutoff (a pod died mid-run), is
+//! re-claimed with a compare-and-set on exactly the status and `claimed_at`
+//! the reader saw — so two re-claimers cannot both win. A `sent` day is never
+//! claimed again.
+//!
+//! Every run — the scheduler's and the admin's manual one — holds a day
+//! through [`DigestStore::claim`], in one of three [`ClaimMode`]s. That is
+//! what keeps the two from colliding: a manual run that does not deliver
+//! ends `preview`, a status the scheduler re-claims like `failed`, so looking
+//! at a day never cancels its email; a manual run that delivers claims the
+//! day exactly as the scheduler would, so the two cannot both mail it; and a
+//! fresh `computing` claim refuses every other run (the route answers 409).
+//! A terminal day (`sent`; `stored` for a preview) is recomputed IN PLACE —
+//! its sections refreshed, its status never touched — so a manual run can
+//! never turn a mailed day back into one the scheduler would mail again.
 //!
 //! The sections are stored as a BSON document the host serialises from its
 //! typed `Sections` (never a hand-built `doc!{}`: a field added later must
@@ -31,12 +43,17 @@ pub const DIGEST_VERSION: u32 = 1;
 pub enum DigestStatus {
     /// Claimed; the compute (and the send) is in flight — or died.
     Computing,
-    /// Computed and mailed to at least one recipient.
+    /// Computed and mailed to at least one recipient. Final.
     Sent,
-    /// Computed; nothing to mail (no recipients, or no mail service).
+    /// Computed by a delivering run; nothing to mail (no recipients, or no
+    /// mail service). Final for the scheduler.
     Stored,
     /// The compute or every send failed; `error` says why. Retried.
     Failed,
+    /// Computed by a manual run that did not deliver (`send=false`). NOT
+    /// final: the scheduler re-claims it like `failed`, so a preview never
+    /// cancels the day's email.
+    Preview,
 }
 
 impl DigestStatus {
@@ -46,6 +63,7 @@ impl DigestStatus {
             DigestStatus::Sent => "sent",
             DigestStatus::Stored => "stored",
             DigestStatus::Failed => "failed",
+            DigestStatus::Preview => "preview",
         }
     }
 }
@@ -81,15 +99,38 @@ pub struct DigestDoc {
     pub sections: Option<Document>,
 }
 
+/// Who is asking for the day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimMode {
+    /// The scheduler: a finished day (`sent`, `stored`) is done.
+    Scheduled,
+    /// `POST …/run?send=false`: recompute without delivering. A `sent` or
+    /// `stored` day is refreshed in place; anything else is claimed and
+    /// ends `preview`.
+    ManualPreview,
+    /// `POST …/run?send=true`: recompute and deliver. A `sent` day is
+    /// refreshed in place and never re-sent; a `stored` day (never mailed)
+    /// is claimed like a `failed` one.
+    ManualSend,
+}
+
 /// What a claim attempt found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimOutcome {
-    /// This caller owns the day now; `attempts` counts this one.
-    Claimed { attempts: u32 },
-    /// Another pod is computing it (a fresh claim), or won the re-claim.
+    /// This caller owns the day now; `attempts` counts this one; `prior`
+    /// is the status it took the day from (`None` for a fresh insert).
+    Claimed {
+        attempts: u32,
+        prior: Option<DigestStatus>,
+    },
+    /// A fresh `computing` claim: a run of this day is in progress on some
+    /// pod (the manual route answers 409), or another re-claimer won.
     Busy,
-    /// The day is finished (`sent` or `stored`); never re-run by the job.
+    /// The scheduler's answer for a finished day: nothing to do.
     Done(DigestStatus),
+    /// A manual run's answer for a terminal day: recompute the sections in
+    /// place, and leave the status alone.
+    InPlace(DigestStatus),
 }
 
 pub struct DigestStore {
@@ -109,14 +150,23 @@ impl DigestStore {
         self.db.collection::<Document>(GROWTH_DIGESTS)
     }
 
-    /// Claim `day` for a scheduled run: insert-first, then the two
-    /// re-claim CASes. `stale_secs` is the age past which a `computing`
+    /// Claim `day` for a run in `mode`: insert-first, then the compare-and-
+    /// set re-claims. `stale_secs` is the age past which a `computing`
     /// claim is presumed dead.
+    ///
+    /// | existing | scheduled | manual preview | manual send |
+    /// |---|---|---|---|
+    /// | none | claimed | claimed | claimed |
+    /// | `computing`, fresh | busy | busy | busy |
+    /// | `computing`, stale · `failed` · `preview` | re-claimed | re-claimed | re-claimed |
+    /// | `stored` | done | in place | re-claimed |
+    /// | `sent` | done | in place | in place |
     pub async fn claim(
         &self,
         day: &str,
         now: DateTime,
         stale_secs: i64,
+        mode: ClaimMode,
     ) -> DaoResult<ClaimOutcome> {
         let fresh = DigestDoc {
             day: day.to_string(),
@@ -132,7 +182,12 @@ impl DigestStore {
             sections: None,
         };
         match self.coll().insert_one(&fresh).await {
-            Ok(_) => return Ok(ClaimOutcome::Claimed { attempts: 1 }),
+            Ok(_) => {
+                return Ok(ClaimOutcome::Claimed {
+                    attempts: 1,
+                    prior: None,
+                });
+            }
             Err(e) if super::stats::is_dup_key(&e) => {}
             Err(e) => return Err(e.into()),
         }
@@ -142,12 +197,23 @@ impl DigestStore {
             return Ok(ClaimOutcome::Busy);
         };
         let cutoff = DateTime::from_millis(now.timestamp_millis() - stale_secs * 1000);
-        let filter = match existing.status {
-            DigestStatus::Sent | DigestStatus::Stored => {
-                return Ok(ClaimOutcome::Done(existing.status));
+        let filter = match (existing.status, mode) {
+            (DigestStatus::Sent, ClaimMode::Scheduled) => {
+                return Ok(ClaimOutcome::Done(DigestStatus::Sent));
             }
-            DigestStatus::Failed => doc! { "_id": day, "status": "failed" },
-            DigestStatus::Computing => {
+            (DigestStatus::Sent, _) => return Ok(ClaimOutcome::InPlace(DigestStatus::Sent)),
+            (DigestStatus::Stored, ClaimMode::Scheduled) => {
+                return Ok(ClaimOutcome::Done(DigestStatus::Stored));
+            }
+            (DigestStatus::Stored, ClaimMode::ManualPreview) => {
+                return Ok(ClaimOutcome::InPlace(DigestStatus::Stored));
+            }
+            (DigestStatus::Stored, ClaimMode::ManualSend) => {
+                doc! { "_id": day, "status": "stored" }
+            }
+            (DigestStatus::Failed, _) => doc! { "_id": day, "status": "failed" },
+            (DigestStatus::Preview, _) => doc! { "_id": day, "status": "preview" },
+            (DigestStatus::Computing, _) => {
                 if existing.claimed_at >= cutoff {
                     return Ok(ClaimOutcome::Busy);
                 }
@@ -172,33 +238,10 @@ impl DigestStore {
             // re-claimed day (caught by the AC23 test).
             Some(d) => ClaimOutcome::Claimed {
                 attempts: int_of(&d, "attempts").max(0) as u32,
+                prior: Some(existing.status),
             },
             None => ClaimOutcome::Busy,
         })
-    }
-
-    /// The manual run's row: the day's row as it is, or a fresh `computing`
-    /// one (`$setOnInsert`, so an existing row — `sent` included — keeps
-    /// its status until the run decides).
-    pub async fn ensure_row(&self, day: &str, now: DateTime) -> DaoResult<DigestDoc> {
-        let found = self
-            .docs()
-            .find_one_and_update(
-                doc! { "_id": day },
-                doc! { "$setOnInsert": {
-                    "status": "computing",
-                    "version": DIGEST_VERSION,
-                    "claimed_at": now,
-                    "attempts": 0,
-                    "recipients": 0,
-                    "excluded": { "users": 0, "tenants": 0 },
-                } },
-            )
-            .upsert(true)
-            .return_document(mongodb::options::ReturnDocument::After)
-            .await?;
-        let doc = found.ok_or(super::base::DaoError::NotFound)?;
-        Ok(bson::from_document(doc)?)
     }
 
     /// Store a computed day's sections (overwriting any earlier ones).
@@ -339,6 +382,7 @@ mod tests {
             (DigestStatus::Sent, "sent"),
             (DigestStatus::Stored, "stored"),
             (DigestStatus::Failed, "failed"),
+            (DigestStatus::Preview, "preview"),
         ] {
             assert_eq!(s.as_str(), w);
             assert_eq!(serde_json::to_string(&s).unwrap(), format!("\"{w}\""));

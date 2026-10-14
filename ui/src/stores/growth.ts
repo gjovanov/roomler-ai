@@ -29,7 +29,8 @@ export interface ExcludedCounts {
   tenants: number
 }
 
-export type DigestStatus = 'computing' | 'sent' | 'stored' | 'failed'
+/** `preview` = a manual `send=false` result the scheduler will still claim. */
+export type DigestStatus = 'computing' | 'sent' | 'stored' | 'failed' | 'preview'
 
 export interface Digest {
   day: string
