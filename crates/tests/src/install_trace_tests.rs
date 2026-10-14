@@ -320,13 +320,16 @@ async fn fetches_count_by_client_class_and_never_the_updater() {
         .await
         .unwrap();
     get("/api/setup/install.sh", None).await.unwrap();
-    // The updater, in its current and its pre-rename spelling: never.
+    // The updater, and any other identity of ours: never.
     get("/api/setup/install.sh", Some("roomlerd/0.4.135"))
         .await
         .unwrap();
-    get("/api/setup/install.ps1", Some("roomler-agent/0.3.0-rc.400"))
-        .await
-        .unwrap();
+    get(
+        "/api/setup/install.ps1",
+        Some("roomler-token-renewal/0.4.135"),
+    )
+    .await
+    .unwrap();
     // The manifest route counts BEFORE its upstream read, so this would be
     // on record already if the updater were counted; the request itself is
     // not awaited (a cold cache may take its full timeout to fail).

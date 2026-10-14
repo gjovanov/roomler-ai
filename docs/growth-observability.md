@@ -259,10 +259,11 @@ fetch of `install.sh` is honestly `unknown`.
 > default it asks `roomler.ai` from self-hosted devices as well
 > (`agents/roomlerd/src/updater.rs`, `DEFAULT_PROXY_URL`). Counting it would be exactly the
 > self-host telemetry the product promises not to collect (`LICENSING.md`,
-> [business-model.md](business-model.md) §6). The rule covers every identity the daemon and the
-> CLI present — `roomlerd/`, `roomlerd-*/`, the pre-rename `roomler-agent/`, `roomler-cli/`,
-> `roomler-token-renewal/` — as `UaClass::Updater`, whose counted value is `None`: a fetch with
-> it writes nothing. Locked by a test per spelling.
+> [business-model.md](business-model.md) §6). The rule covers every product token of ours that
+> is not the wizard — `roomlerd/`, `roomlerd-*/`, `roomler-cli/`, `roomler-token-renewal/`, the
+> updater's pre-rename spelling, whatever a later release adds — decided by the common prefix,
+> as `UaClass::Updater`, whose counted value is `None`: a fetch with it writes nothing. Locked
+> by a test per known spelling, plus one for an identity that does not exist yet.
 
 - **Never a User-Agent, never an IP.** A row is three enum-like dimensions and a count; the
   integration test scans every row for the UAs it sent and the loopback address.
