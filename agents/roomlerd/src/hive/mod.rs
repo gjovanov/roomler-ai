@@ -89,6 +89,7 @@ mod lines;
 mod materializer;
 mod packer;
 mod procs;
+mod purger;
 mod resume_note;
 mod sidecar;
 mod store;
@@ -102,6 +103,7 @@ pub use checkpointer::{CHECKPOINT_SUBCOMMAND, checkpoint_args, checkpoint_main};
 pub use importer::{IMPORT_SUBCOMMAND, import_args, import_main};
 pub use materializer::{MATERIALIZE_SUBCOMMAND, materialize_args, materialize_main};
 pub use packer::{PACK_SUBCOMMAND, pack_args, pack_main};
+pub use purger::{PURGE_SUBCOMMAND, purge_args, purge_main};
 pub use resume_note::{
     NOTE_FILE as RESUME_NOTE_FILE, RESUME_NOTE_SUBCOMMAND, note_args, note_main,
 };
@@ -110,7 +112,7 @@ pub use supervisor::init_as_daemon;
 pub use supervisor::{
     Author, CoreMemory, Moved, StartOrder, Supervisor, adopt_enabled, archive_enabled,
     begin_shutdown, begin_update, end_update, global, handle_adopt_ack, handle_demote,
-    handle_drain, handle_lease, handle_memory, handle_move, handle_prepare,
+    handle_drain, handle_lease, handle_memory, handle_move, handle_prepare, handle_purge,
     handle_replica_candidate, handle_replica_close, handle_replica_dial, handle_replica_grant,
     handle_replica_join, handle_replica_refused, handle_start, handle_stop, init, on_connected,
     replica_enabled, stream_enabled, turns_running, update_wait, wind_down,

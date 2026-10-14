@@ -149,6 +149,13 @@ const P2F_TABLES: &str = "CREATE TABLE IF NOT EXISTS substitutes (
                  folder    TEXT    NOT NULL,
                  state_dir TEXT    NOT NULL,
                  kept_ms   INTEGER NOT NULL
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS purge_debts (
+                 session   TEXT    PRIMARY KEY,
+                 account   TEXT    NOT NULL,
+                 folder    TEXT    NOT NULL,
+                 state_dir TEXT    NOT NULL,
+                 since_ms  INTEGER NOT NULL
              ) WITHOUT ROWID;";
 
 /// FR-90 P2f-2a — a pack kept in place of a checkpoint's own whole pack: the
@@ -1259,6 +1266,15 @@ impl Store {
             "DELETE FROM substitutes WHERE session = ?1",
             params![session],
         )?;
+        // FR-90 P2g-1 — what the account holds of the session outlives the
+        // store's copy: where it was worked on becomes a debt, in this same
+        // transaction, until the account's part is done ([`Self::purge_debt`]).
+        tx.execute(
+            "INSERT INTO purge_debts (session, account, folder, state_dir, since_ms)
+             SELECT session, account, folder, state_dir, ?2 FROM workplaces WHERE session = ?1
+             ON CONFLICT(session) DO NOTHING",
+            params![session, now_ms()],
+        )?;
         tx.execute(
             "DELETE FROM workplaces WHERE session = ?1",
             params![session],
@@ -1276,6 +1292,53 @@ impl Store {
         )?;
         tx.commit()?;
         Ok((n + set_aside) as u64)
+    }
+
+    /// FR-90 P2g-1 — whether this store holds anything of `session`: its
+    /// events, a set-aside tail, a tip or a floor, a membership, a substitute,
+    /// a blob reference, or where it was worked on.
+    pub fn holds(&self, session: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE session = ?1)
+                 OR EXISTS(SELECT 1 FROM divergent WHERE session = ?1)
+                 OR EXISTS(SELECT 1 FROM tips WHERE session = ?1)
+                 OR EXISTS(SELECT 1 FROM floors WHERE session = ?1)
+                 OR EXISTS(SELECT 1 FROM memberships WHERE session = ?1)
+                 OR EXISTS(SELECT 1 FROM substitutes WHERE session = ?1)
+                 OR EXISTS(SELECT 1 FROM blob_refs WHERE session = ?1)
+                 OR EXISTS(SELECT 1 FROM workplaces WHERE session = ?1)",
+            params![session],
+            |r| r.get::<_, bool>(0),
+        )?)
+    }
+
+    /// FR-90 P2g-1 — what the account still holds of a purged `session`:
+    /// where it was worked on, kept from its workplace by [`Self::purge`]
+    /// until the account's part is done.
+    pub fn purge_debt(&self, session: &str) -> Result<Option<WorkplaceRecord>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT account, folder, state_dir FROM purge_debts WHERE session = ?1",
+                params![session],
+                |r| {
+                    Ok(WorkplaceRecord {
+                        account: r.get(0)?,
+                        folder: r.get(1)?,
+                        state_dir: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// FR-90 P2g-1 — the account's part of `session`'s purge is done.
+    pub fn clear_purge_debt(&mut self, session: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM purge_debts WHERE session = ?1",
+            params![session],
+        )?;
+        Ok(())
     }
 
     /// FR-90 P2a: whether `session` was purged here.
@@ -2035,8 +2098,11 @@ mod tests {
         );
         assert_eq!(s.workplace("s2").unwrap(), None);
 
+        assert!(s.holds("s1").unwrap() && !s.holds("s9").unwrap());
+        assert_eq!(s.purge_debt("s1").unwrap(), None, "no purge yet: no debt");
         s.purge("s1").unwrap();
         assert_eq!(s.workplace("s1").unwrap(), None, "the purge takes it");
+        assert!(!s.holds("s1").unwrap(), "nothing of it is held");
         assert!(
             s.stand_ins("s1", crate::stream::MAX_WANTS)
                 .unwrap()
@@ -2046,6 +2112,18 @@ mod tests {
             s.put_workplace("s1", &w),
             Err(StoreError::Purged { .. })
         ));
+        // P2g-1 — and where it was worked on outlives it, as the account's
+        // debt, until the account's part is done; a purge again keeps it.
+        let later = WorkplaceRecord {
+            folder: "/srv/elsewhere".into(),
+            ..w.clone()
+        };
+        assert_eq!(s.purge_debt("s1").unwrap(), Some(later.clone()));
+        s.purge("s1").unwrap();
+        assert_eq!(s.purge_debt("s1").unwrap(), Some(later), "kept");
+        s.clear_purge_debt("s1").unwrap();
+        assert_eq!(s.purge_debt("s1").unwrap(), None, "settled");
+        assert_eq!(s.purge_debt("s2").unwrap(), None, "never worked on here");
     }
 
     #[test]

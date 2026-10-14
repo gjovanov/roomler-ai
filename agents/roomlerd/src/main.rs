@@ -1221,6 +1221,14 @@ async fn daemon_main() -> Result<()> {
         std::process::exit(roomlerd::hive::import_main());
     }
 
+    // FR-90 P2g-1 — `roomlerd hive-purge`: what a purged session's account
+    // holds of it (its state directory, its checkpoints' refs and index),
+    // deleted AS THE ACCOUNT. The request on stdin, one line to stdout.
+    #[cfg(hive_host)]
+    if roomlerd::hive::purge_args() {
+        std::process::exit(roomlerd::hive::purge_main());
+    }
+
     // FR-90 P1i — `roomlerd hive-prep …`: a Windows session's preparation,
     // which the daemon runs AS THE CONSOLE USER before the harness starts, as
     // the Unix wrapper runs as the account. None of the setup below is its.

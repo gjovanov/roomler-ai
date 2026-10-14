@@ -1073,6 +1073,16 @@ pub fn pack_command_line(exe: &Path) -> Result<String, String> {
     ))
 }
 
+/// FR-90 P2g-1 — the command line that runs `roomlerd hive-purge`, which
+/// reads its request on stdin, fed as [`run_fed`] feeds a pack.
+pub fn purge_command_line(exe: &Path) -> Result<String, String> {
+    Ok(format!(
+        "{} {}",
+        program(exe)?,
+        crate::hive::PURGE_SUBCOMMAND
+    ))
+}
+
 // ─── FR-90 P2b-4a: a materialize, fed as the console user ───────────────────
 
 /// The command line that runs `roomlerd hive-materialize`, which reads its
