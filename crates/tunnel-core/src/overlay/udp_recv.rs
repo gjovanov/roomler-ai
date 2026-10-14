@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Reading a UDP socket past the errors that are about an earlier datagram.
 //!
 //! On Windows, an unconnected UDP socket reports an ICMP port-unreachable
