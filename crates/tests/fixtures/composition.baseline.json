@@ -1,6 +1,10 @@
 {
   "routes": [
     {
+      "path": "/api/admin/growth/campaigns",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/admin/growth/cohorts",
       "methods": "GET,HEAD"
     },
@@ -1386,6 +1390,17 @@
               "day_start": 1
             },
             "expireAfterSeconds": 64800000
+          }
+        ]
+      },
+      {
+        "collection": "growth_pulls",
+        "indexes": [
+          {
+            "key": {
+              "source": 1,
+              "day": 1
+            }
           }
         ]
       },
@@ -3114,6 +3129,17 @@
               "day_start": 1
             },
             "expireAfterSeconds": 64800000
+          }
+        ]
+      },
+      {
+        "collection": "growth_pulls",
+        "indexes": [
+          {
+            "key": {
+              "source": 1,
+              "day": 1
+            }
           }
         ]
       },

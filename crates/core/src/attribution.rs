@@ -182,7 +182,12 @@ fn is_printable_ascii(c: char) -> bool {
 /// stripped: stripping `vidéo` to `vido` manufactures a campaign key that
 /// looks right and matches nothing the operator ever wrote. The keys are the
 /// operator's own slugs; anything else is not worth guessing at.
-fn clean_value(raw: &str) -> Option<String> {
+///
+/// FR-102 P6 — public because the campaign key the web plane's rows join by
+/// (`campaign::CampaignKey::normalized`) must be cleaned exactly as a
+/// sign-up's was at ingress, or a key purestat saw would never meet the
+/// sign-up that carried it.
+pub fn clean_value(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || !trimmed.chars().all(is_printable_ascii) {
         return None;

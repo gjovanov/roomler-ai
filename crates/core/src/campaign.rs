@@ -21,10 +21,15 @@
 //!   referrer host (spec §3b): search, AI assistants, social, community,
 //!   code, self (`roomler.ai` is navigation, never a source), direct.
 //!
+//! * [`CampaignKey`] / [`KeyDepth`] (P6) — the key itself, normalised the
+//!   way a sign-up's was at ingress, so a row of purestat's breakdown and a
+//!   sign-up meet on the same spelling; and how deep a breakdown goes
+//!   (`source` → `medium` → `campaign` → `content`).
+//!
 //! The private promotion pipeline's link linter checks against a pinned copy
 //! of the same table; a change here is a change there.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// `utm_source`: the platform, never the account. `instagram` is retired
 /// and kept for history.
@@ -103,6 +108,139 @@ pub fn medium_group(normalised: &str) -> &'static str {
         .copied()
         .find(|m| *m == normalised)
         .unwrap_or(OTHER)
+}
+
+/// `utm_campaign`: trimmed and lowercased. The taxonomy's ids are
+/// `yyyymmdd-slug`, lowercase by construction, so a capital letter is a
+/// typo of the same post, not a different one.
+pub fn normalize_campaign(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+
+/// `utm_content`: trimmed and lowercased (`[a-z0-9-]` by the taxonomy).
+pub fn normalize_content(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+
+// ── The key (P6) ─────────────────────────────────────────────────────────
+
+/// How deep a breakdown by the campaign key goes: each level is the one
+/// above plus one more UTM field. A row at a depth is purestat's breakdown
+/// by exactly those dimensions, so its unique visitors are purestat's own
+/// number for that key — never a sum of the finer rows below it, which
+/// would count a visitor once per row they appear in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyDepth {
+    Source,
+    Medium,
+    Campaign,
+    Content,
+}
+
+/// The four UTM dimensions of the key, in key order (purestat's names).
+pub const UTM_DIMENSIONS: [&str; 4] = ["utm_source", "utm_medium", "utm_campaign", "utm_content"];
+
+impl KeyDepth {
+    pub const ALL: [KeyDepth; 4] = [
+        KeyDepth::Source,
+        KeyDepth::Medium,
+        KeyDepth::Campaign,
+        KeyDepth::Content,
+    ];
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "source" => Some(KeyDepth::Source),
+            "medium" => Some(KeyDepth::Medium),
+            "campaign" => Some(KeyDepth::Campaign),
+            "content" => Some(KeyDepth::Content),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyDepth::Source => "source",
+            KeyDepth::Medium => "medium",
+            KeyDepth::Campaign => "campaign",
+            KeyDepth::Content => "content",
+        }
+    }
+
+    /// How many of the four fields the key keeps at this depth.
+    pub fn fields(self) -> usize {
+        match self {
+            KeyDepth::Source => 1,
+            KeyDepth::Medium => 2,
+            KeyDepth::Campaign => 3,
+            KeyDepth::Content => 4,
+        }
+    }
+
+    /// purestat's dimensions for a breakdown at this depth, in key order.
+    pub fn utm_dimensions(self) -> &'static [&'static str] {
+        &UTM_DIMENSIONS[..self.fields()]
+    }
+}
+
+/// The campaign key `(source, medium, campaign, content)` both planes are
+/// joined by (spec §3a) — the ONE spelling a purestat row and a sign-up meet
+/// on. [`CampaignKey::normalized`] applies exactly what ingress applies to a
+/// sign-up (`attribution::sanitize`): each value trimmed, refused unless
+/// printable ASCII, clamped to 64; the source and medium then through the
+/// taxonomy (`YouTub` → `youtube`), the campaign and content lowercased. A
+/// key without a source is no key: the visit or sign-up is organic.
+///
+/// ⚠️ Every field is client-chosen text (anyone can craft a link): a
+/// reader renders it as TEXT, never as markup.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CampaignKey {
+    pub source: String,
+    #[serde(default)]
+    pub medium: Option<String>,
+    #[serde(default)]
+    pub campaign: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
+impl CampaignKey {
+    /// The normalised key of four raw values; `None` when no source
+    /// survives the cleaning. A field that does not survive is `None` too —
+    /// the same field a sign-up with that value would have stored as absent.
+    pub fn normalized(
+        source: Option<&str>,
+        medium: Option<&str>,
+        campaign: Option<&str>,
+        content: Option<&str>,
+    ) -> Option<Self> {
+        let clean = |v: Option<&str>| v.and_then(crate::attribution::clean_value);
+        let source = clean(source).map(|v| normalize_source(&v))?;
+        Some(Self {
+            source,
+            medium: clean(medium).map(|v| normalize_medium(&v)),
+            campaign: clean(campaign).map(|v| normalize_campaign(&v)),
+            content: clean(content).map(|v| normalize_content(&v)),
+        })
+    }
+
+    /// The key cut to a depth: the fields below it are `None`, so every key
+    /// that agrees down to the depth folds into one.
+    pub fn at_depth(&self, depth: KeyDepth) -> Self {
+        let n = depth.fields();
+        Self {
+            source: self.source.clone(),
+            medium: if n >= 2 { self.medium.clone() } else { None },
+            campaign: if n >= 3 { self.campaign.clone() } else { None },
+            content: if n >= 4 { self.content.clone() } else { None },
+        }
+    }
+
+    /// The taxonomy's group of the source: canonical, or [`OTHER`].
+    pub fn group(&self) -> &'static str {
+        source_group(&self.source)
+    }
 }
 
 /// Where a visit came from, by its referrer host (spec §3b).
@@ -380,6 +518,118 @@ mod tests {
         assert_eq!(channel_for_referrer_host(None), Direct);
         assert_eq!(channel_for_referrer_host(Some("")), Direct);
         assert_eq!(channel_for_referrer_host(Some("   ")), Direct);
+    }
+
+    /// P6 — the key both planes join by: the taxonomy for source and
+    /// medium, lowercase for campaign and content, and the ingress cleaning
+    /// (a value that would not survive a sign-up's sanitising is absent).
+    #[test]
+    fn the_key_normalises_like_a_sign_up_at_ingress() {
+        let k = CampaignKey::normalized(
+            Some(" YouTub "),
+            Some("Video"),
+            Some(" 20261019-SSH-Slug "),
+            Some("Desc-Top"),
+        )
+        .unwrap();
+        assert_eq!(
+            k,
+            CampaignKey {
+                source: "youtube".into(),
+                medium: Some("video".into()),
+                campaign: Some("20261019-ssh-slug".into()),
+                content: Some("desc-top".into()),
+            }
+        );
+        assert_eq!(k.group(), "youtube");
+        // No source, or one the cleaning refuses: no key at all.
+        assert_eq!(
+            CampaignKey::normalized(None, Some("post"), None, None),
+            None
+        );
+        assert_eq!(CampaignKey::normalized(Some("   "), None, None, None), None);
+        assert_eq!(
+            CampaignKey::normalized(Some("yöutube"), None, None, None),
+            None
+        );
+        // A field the cleaning refuses is absent, as a sign-up stores it.
+        let k = CampaignKey::normalized(Some("Mastodon"), Some("vidéo"), Some(""), None).unwrap();
+        assert_eq!(k.group(), OTHER);
+        assert_eq!(
+            (
+                k.source.as_str(),
+                k.medium.as_deref(),
+                k.campaign.as_deref()
+            ),
+            ("mastodon", None, None)
+        );
+        // Clamped to the attribution ceiling, as at ingress.
+        let long = "c".repeat(200);
+        let k = CampaignKey::normalized(Some("x"), None, Some(&long), None).unwrap();
+        assert_eq!(k.campaign.unwrap().len(), 64);
+    }
+
+    /// The same raw link, through the sign-up's sanitising on one side and
+    /// the key's normalisation on the other, is ONE key — the join's whole
+    /// premise.
+    #[test]
+    fn a_stored_sign_up_and_a_raw_purestat_row_meet_on_one_key() {
+        let raw = ("YouTub", "Video", "20261019-Slug", "Desc-Top");
+        let stored = crate::attribution::sanitize(crate::attribution::AttributionInput {
+            source: Some(raw.0.into()),
+            medium: Some(raw.1.into()),
+            campaign: Some(raw.2.into()),
+            content: Some(raw.3.into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let from_signup = CampaignKey::normalized(
+            stored.source.as_deref(),
+            stored.medium.as_deref(),
+            stored.campaign.as_deref(),
+            stored.content.as_deref(),
+        );
+        let from_purestat =
+            CampaignKey::normalized(Some(raw.0), Some(raw.1), Some(raw.2), Some(raw.3));
+        assert!(from_signup.is_some());
+        assert_eq!(from_signup, from_purestat);
+    }
+
+    #[test]
+    fn a_depth_cuts_the_key_and_names_its_dimensions() {
+        let k =
+            CampaignKey::normalized(Some("linkedin"), Some("post"), Some("c1"), Some("a")).unwrap();
+        assert_eq!(k.at_depth(KeyDepth::Content), k);
+        let c = k.at_depth(KeyDepth::Campaign);
+        assert_eq!(
+            (c.campaign.as_deref(), c.content.as_deref()),
+            (Some("c1"), None)
+        );
+        let m = k.at_depth(KeyDepth::Medium);
+        assert_eq!(
+            (m.medium.as_deref(), m.campaign.as_deref()),
+            (Some("post"), None)
+        );
+        let s = k.at_depth(KeyDepth::Source);
+        assert_eq!((s.source.as_str(), s.medium.as_deref()), ("linkedin", None));
+        assert_eq!(KeyDepth::Source.utm_dimensions(), &["utm_source"]);
+        assert_eq!(
+            KeyDepth::Content.utm_dimensions(),
+            &["utm_source", "utm_medium", "utm_campaign", "utm_content"]
+        );
+        for d in KeyDepth::ALL {
+            assert_eq!(KeyDepth::parse(d.as_str()), Some(d));
+            assert_eq!(
+                serde_json::to_string(&d).unwrap(),
+                format!("\"{}\"", d.as_str())
+            );
+        }
+        assert_eq!(KeyDepth::parse("channel"), None);
+        // On the wire an absent field is an explicit null.
+        assert_eq!(
+            serde_json::to_value(&s).unwrap(),
+            serde_json::json!({"source": "linkedin", "medium": null, "campaign": null, "content": null})
+        );
     }
 
     #[test]

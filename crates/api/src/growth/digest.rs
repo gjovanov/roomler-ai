@@ -334,32 +334,12 @@ impl<T> From<Result<T, PurestatError>> for Measured<T> {
     }
 }
 
-/// The goal a purestat 400 names as undefined (`unknown goal: "signup"`),
-/// when that is what the error is. A site with no goal definitions is a
-/// configuration gap on the web plane, not an outage: the sections that
-/// need the goal say which one, and the ones that do not still measure.
-pub fn unknown_goal(e: &PurestatError) -> Option<String> {
-    let PurestatError::Status(400, msg) = e else {
-        return None;
-    };
-    let lower = msg.to_ascii_lowercase();
-    let idx = lower.find("unknown goal")?;
-    let rest = &msg[idx + "unknown goal".len()..];
-    let quoted = rest
-        .split('"')
-        .nth(1)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    Some(quoted.unwrap_or_else(|| {
-        let bare = rest.trim_start_matches(':').trim();
-        if bare.is_empty() {
-            "the goal".to_string()
-        } else {
-            bare.to_string()
-        }
-    }))
-}
+/// The goal a purestat 400 names as undefined (`unknown goal: "signup"`).
+/// A site with no goal definitions is a configuration gap on the web plane,
+/// not an outage: the sections that need the goal say which one, and the
+/// ones that do not still measure. Defined beside the client since P6 (the
+/// `saas` puller reads it too); re-exported so the path stays.
+pub use roomler_ai_services::purestat::unknown_goal;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyCount {

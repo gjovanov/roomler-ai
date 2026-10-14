@@ -4,7 +4,9 @@
 //!
 //! Stripe billing (plans, checkout, the customer portal, the webhook), the
 //! public updates list and the newsletter sending program (FR-39 / FR-58),
-//! and the platform-admin plan-compliance view (FR-32). Everything here
+//! the platform-admin plan-compliance view (FR-32), and FR-102's purestat
+//! puller (P6, [`purestat_pull`] — the web plane frozen daily into the core
+//! `growth_daily` collection, through the core DAO). Everything here
 //! exists because roomler.ai is a hosted product; a self-hosted deployment
 //! runs without it, which is why it is an **add-on feature** on the host
 //! rather than part of any profile.
@@ -43,6 +45,7 @@ use roomler_core::{Capabilities, Core, Module, TenantCtx};
 pub mod newsletter;
 pub mod newsletter_send;
 pub mod plan_compliance;
+pub mod purestat_pull;
 pub mod stripe;
 pub mod subscribe;
 
@@ -82,6 +85,11 @@ impl Module for SaasState {
 
     async fn init(core: Core, _settings: &Settings, _deps: ()) -> anyhow::Result<Self> {
         let db = &core.db;
+        // FR-102 P6 — the daily purestat puller (hosted-only: this module).
+        // Spawns nothing without `growth.enabled` and a purestat key; one
+        // pod per tick through a Redis claim, like the fleet and network
+        // modules' sweepers spawned from their own init.
+        purestat_pull::spawn_puller(core.clone());
         Ok(Self {
             subscribers: Arc::new(SubscriberDao::new(db)),
             newsletter_issues: Arc::new(NewsletterIssueDao::new(db)),

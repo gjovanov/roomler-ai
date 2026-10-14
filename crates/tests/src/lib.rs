@@ -68,6 +68,12 @@ mod enroll_key_tests;
 mod ephemeral_tests;
 #[cfg(test)]
 mod exec_service_tests;
+/// FR-102 P6 — the purestat puller (seven closed days frozen once, a frozen
+/// day never rewritten, a failed pull recorded rather than read as 0) and
+/// the Campaigns table (both planes joined by the normalised key; a revoked
+/// key reads `not_measured`, AC16's control; unmounted modules named).
+#[cfg(test)]
+mod growth_campaigns_tests;
 /// FR-102 P1d — the daily digest: every section's exact numbers on a seeded
 /// day, the once-only claim under two concurrent runs (AC23), the routes,
 /// the no-address rule, and the purestat client against a fake server.

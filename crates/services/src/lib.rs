@@ -9,6 +9,7 @@ pub mod export;
 pub mod giphy;
 pub mod newsletter;
 pub mod oauth;
+pub mod purestat;
 pub mod push;
 pub mod quota;
 pub mod stripe;

@@ -25,6 +25,8 @@ import {
   humanKey,
   rateIfEnough,
   SMALL_N,
+  campaignKeyLabel,
+  rateLabel,
 } from '@/stores/growth'
 import { api } from '@/api/client'
 
@@ -50,6 +52,29 @@ describe('growth helpers', () => {
     )
     expect(figureLabel({ day: 2, d7: 9, d28: 31 })).toBe('2 (7d 9 · 28d 31)')
     expect(humanKey('orgs_devices')).toBe('Orgs devices')
+  })
+
+  it('labels a campaign key by its present fields, as plain text', () => {
+    // P6 — a key cut to its depth has null fields; they are left out.
+    expect(
+      campaignKeyLabel({ source: 'linkedin', medium: 'post', campaign: '20261019-x', content: null }),
+    ).toBe('linkedin / post / 20261019-x')
+    expect(campaignKeyLabel({ source: 'youtube', medium: null, campaign: null, content: null })).toBe(
+      'youtube',
+    )
+    // A value is never interpreted: markup stays text in the label.
+    expect(
+      campaignKeyLabel({ source: '<b>x</b>', medium: null, campaign: null, content: null }),
+    ).toBe('<b>x</b>')
+  })
+
+  it('shows a server rate only when it carries a value (n ≥ 30)', () => {
+    // P6 — below the n-floor the server leaves `value` out.
+    expect(rateLabel({ n: 29 })).toBeNull()
+    expect(rateLabel(null)).toBeNull()
+    expect(rateLabel(undefined)).toBeNull()
+    expect(rateLabel({ n: 55, value: 0.018 })).toBe('1.8%')
+    expect(rateLabel({ n: 30, value: 0 })).toBe('0%')
   })
 
   it('shows a rate only once the settled denominator reaches the n-floor', () => {
@@ -119,6 +144,22 @@ describe('useGrowthStore', () => {
     await store.fetchTimeline('69a1dbbad2000f26adc875ce')
     expect(mockApi.get).toHaveBeenCalledWith(
       '/admin/growth/org/69a1dbbad2000f26adc875ce/timeline',
+    )
+  })
+
+  it('fetches the campaigns table at the P6 route with its range and depth', async () => {
+    const store = useGrowthStore()
+    mockApi.get.mockResolvedValue({})
+    await store.fetchCampaigns()
+    expect(mockApi.get).toHaveBeenCalledWith('/admin/growth/campaigns')
+    await store.fetchCampaigns({
+      since: '2026-10-01',
+      until: '2026-10-13',
+      by: 'content',
+      includeInternal: true,
+    })
+    expect(mockApi.get).toHaveBeenCalledWith(
+      '/admin/growth/campaigns?since=2026-10-01&until=2026-10-13&by=content&include_internal=true',
     )
   })
 })
