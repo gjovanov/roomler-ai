@@ -720,10 +720,10 @@ export interface RcInputReach {
  *  re-created the session every 10 s, so the session the person finally
  *  answered for was rarely the one on screen.
  *
- *  `for` is `person_at_screen` (a dialog) or, from P5b, `screen_unlock`
- *  (GNOME's lock screen, #2145; `mediaWaitingCopy` words each). It is typed
- *  as a string on purpose: a newer agent may wait for something else, and its
- *  `hint` still reads. */
+ *  `for` is `person_at_screen` (a dialog), from P5b `screen_unlock` (GNOME's
+ *  lock screen, #2145), or from P3e `display_wake` (a display switched off,
+ *  DRM); `mediaWaitingCopy` words each. It is typed as a string on purpose: a
+ *  newer agent may wait for something else, and its `hint` still reads. */
 export interface RcMediaWaiting {
   for: string
   /** When the dialog gives up, on THIS browser's clock: the agent sends how
@@ -765,6 +765,15 @@ export function mediaWaitingCopy(waitingFor: string): RcMediaWaitingCopy {
     return {
       title: "Waiting for this computer's screen to be unlocked.",
       status: 'waiting for the screen to be unlocked',
+      showsDeadline: false,
+    }
+  }
+  // FR-93 P3e — the display went to sleep. Input wakes it, this viewer's
+  // too when it controls the computer, and nothing ends on its own.
+  if (waitingFor === 'display_wake') {
+    return {
+      title: "This computer's display is asleep.",
+      status: 'waiting for the display to wake',
       showsDeadline: false,
     }
   }

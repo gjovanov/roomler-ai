@@ -6,7 +6,7 @@ desktop brief and the server's count, #2028) and P2c (#2020) shipped in **0.4.13
 promoted. P2d is decided (operator, 2026-10-12): the portal waits for it. P2d-1, the agent half, shipped in
 **0.4.131**; P2d-2, the viewer half, is lab-verified on prod's viewer (2026-10-13). P2d-3, the flip (the portal
 automatic where mutter is absent), shipped in **0.4.132** with P2d-2's agent half and P4a; P4b in **0.4.133**; P3c
-in **0.4.134** (2026-10-13). P3d and P5a are merged and wait for a release; P5b (#2145) is in review. Ticked: AC1–AC5,
+in **0.4.134** (2026-10-13). P3d, P5a and P5b (#2145) are merged and wait for a release; P3e is in review. Ticked: AC1–AC5,
 AC9, AC13. The operator approved the
 plan and P0 (the
 lab on zeus, enrolled in the vmtest org: D2, D8). **D1 is decided: split.** Per-user installs go auto, system installs
@@ -432,6 +432,20 @@ data-channel pumps answer every "no frame" with a keepalive re-encode of their l
 at open from the seat's session (`desktop_brief::seen_is_wayland`): an X server and the console draw in place, where
 no buffer check sees a change. Kill switch `ROOMLERD_DRM_IDLE_SKIP=0`.
 
+**As built (P3e, 2026-10-14): a display switched off is waited out, and said** (`capture/drm_backend.rs`,
+the pumps in `peer.rs`; [`linux-capture.md`](../linux-capture.md) §3.3). Measured first on the released 0.4.134:
+GNOME's idle blank switches the CRTC off (`enable=0 active=0`, every plane `fb=0`) and leaves the connector
+`connected` with `dpms=Off`. Two failures followed:
+- a running session's grab found no plane and said "no frame", and the pumps' keepalives kept the last frame on
+  screen with no reason;
+- a session that opened during the blank failed the DRM open and read `backend_error`.
+
+The worker now tells a dark display from a passing modeset: no plane bound, a connected connector, and no CRTC
+driving a mode. The pumps tell the controller through `rc:media-waiting` (`for: "display_wake"`), again every
+30 minutes while it lasts, and send no keepalive meanwhile. An open during the blank waits for the wake, through P5b's
+wait generalised (`open_through_wait` with `DISPLAY_OFF`). Row e's refusals stay FR-80's. A dark display is a wait,
+not a refusal, so it takes P2d-2's message instead. Kill switch `ROOMLERD_DRM_WAKE_WAIT=0`.
+
 ### 4.5 Input (P4)
 
 - **Mutter RemoteDesktop** in the helper, paired with the mutter ScreenCast session through
@@ -515,7 +529,7 @@ that line enables itself again once at start, through `systemctl --user enable` 
 session when its screen locks, and refuses new ones until the unlock: asked directly, `CreateSession` answered
 `Session creation inhibited`. A PipeWire consumer whose source vanished goes `idle`, never `error`. The helper now
 ends the capture on the driving session's `Closed` signal (exit status 3), and the pump's rebuild reopens. The
-automatic mutter open then waits out the lock (`open_through_lock`):
+automatic mutter open then waits out the lock (`open_through_wait` with `GNOME_LOCK`, as P3e generalised it):
 - the controller is told once, through `rc:media-waiting` (`for: "screen_unlock"`), with a hint saying where the
   screen gets unlocked;
 - GNOME's lock screen is polled every second, and the open is tried again as it lifts (every 30 s if GNOME and
@@ -571,6 +585,7 @@ bridge for text and images in the lab before deciding.
 | **P3** | DRM hardening (§4.4 b–f) | `ROOMLERD_DRM_CURSOR=0`, `ROOMLERD_DRM_IDLE_SKIP=0` | lab, Asahi | M |
 | ↳ P3c | the cursor plane: the DRM worker reads the CRTC's cursor plane (`ATOMIC` + `CURSOR_PLANE_HOTSPOT`; `CRTC_X/Y`, `HOTSPOT_X/Y`, the ARGB buffer), and the cursor data channel carries it (`linux-capture.md` §3.1). With it, P3b's half that P3c needs: the primary plane chosen by its type | `ROOMLERD_DRM_CURSOR=0` | ✅ lab (`dbf514a3f`; built before a rebase, the same changes), the GNOME 50 and Plasma 6.7.5 system installs with `drm_capture` + `uinput`, AC5's `cursor` plan. **🔴 0.4.132:** no overlay at either target. **P3c:** the overlay at both targets, on both compositors. `ROOMLERD_DRM_CURSOR=0` gives the badge back. Owed: a real GPU, with no hotspot property (Asahi) | S |
 | ↳ P3d | an unchanged frame skipped on a Wayland seat: the same framebuffer over the same buffer, the same 32 sampled rows, under 1 s since the last delivered frame; a still screen waited out for 250 ms, as the portal waits on its stream (`linux-capture.md` §3.2). With it P3f: the buffer named by its dma-buf's inode, and the mapping cache keyed on it | `ROOMLERD_DRM_IDLE_SKIP=0` | ✅ lab (`cac2d7c43`), the GNOME 50 system guest with `drm_capture` + `uinput`, an idle desktop on the viewer's default path. **🔴 0.4.133:** 57.9 % of a core. **P3d:** 5.5 % and 5.3 %; the probe's counter as fresh as AC1's (0.42–0.70 s old), the cursor overlay at both of AC5's targets, AC4's 8 checks. `ROOMLERD_DRM_IDLE_SKIP=0`: 64.3 % and 60.7 %. KWin (the Plasma 6.7.5 system guest) the same: 4.7 % and 4.7 %, against 46.1 % and 44.5 % with the kill switch | S |
+| ↳ P3e | a display switched off (§4.4 e): the worker tells it from a passing modeset (no plane bound, a connected connector, no CRTC driving a mode); the pumps tell the controller (`rc:media-waiting`, `display_wake`) and send no keepalive while it lasts; an open during the blank waits for the wake (`linux-capture.md` §3.3) | `ROOMLERD_DRM_WAKE_WAIT=0` | ✅ lab (`39a238b3e`), the GNOME 50 system install with `drm_capture` + `uinput`, the lifecycle oracle, every wake the viewer's mouse. **🔴 0.4.134:** a running session kept its last frame with no reason; a session opened during the blank read `backend_error` and showed no picture through the wake and the unlock. **P3e:** the notice 0.0 s after the screen went dark; a new picture 1.0 s after the viewer's mouse; opened during the blank: the notice at once, the first frame 1.5 s after the mouse, the desktop live 2.0 s after the unlock | S |
 | **P3g** | tiled scanout via EGL import | `ROOMLERD_DRM_EGL=0` | the x86 cell (D3) | L |
 | **P4** | Mutter RemoteDesktop input, layouts, per-output mapping (§4.5) | `ROOMLERD_MUTTER_INPUT=0` | lab, WSL2 | M |
 | ↳ P4a | mutter's own RemoteDesktop drives the mutter screencast and takes the viewer's input; the route carries its kind, so `rc:input-reach` and the brief name it | `mutter_input` | ✅ lab (`3f9ad6464`), GNOME 50 per-user, no key, the AC4 oracle. **🔴 0.4.131:** the picture, and 0 events at the probe, all 7 input checks failed. **P4a:** all 7 passed: the three points exact, click, wheel down, "hello 123", Shift+a as "A"; the brief `input_reach=full`. `mutter_input = false` gives the view-only arm back | S |
@@ -701,9 +716,10 @@ New cells run three times before they are trusted. An entry in `expected-failure
   frame, no reason); mutter freezes at a lock for good (#2145), and its daemon did not come back after a logout and
   a login (#2144); the portal passes lock and unlock, but not logout and login (the last frame, then ~30 s of black,
   no reason). ✅ #2144 fixed in the lab by P5a (the daemon back, a picture 4.9 s after the login). ✅ #2145 fixed in
-  the lab by P5b (the unlock notice within 1.6 s of a lock, the desktop live 2.2–2.8 s after the unlock). Owed: the
-  DRM blank (P3e), the portal's logout and login, user switch, resolution change, suspend, a compositor crash, and
-  a released build.
+  the lab by P5b (the unlock notice within 1.6 s of a lock, the desktop live 2.2–2.8 s after the unlock). ✅ The DRM
+  blank fixed in the lab by P3e (the notice 0.0 s after the screen went dark, a picture 1.0 s after the viewer's
+  mouse woke it; a session opened during the blank told at once, and live after the wake). Owed: the portal's logout
+  and login, user switch, resolution change, suspend, a compositor crash, and a released build.
 - [ ] **AC8** — an idle DRM session's CPU, measured before and after, within 2× of FR-29's X11 figure.
   ⏳ ✅ in the lab on P3d (`cac2d7c43`): the GNOME 50 system guest, an idle desktop on the viewer's default path,
   every `roomlerd` process's CPU over two 60 s windows. **57.9 %** of a core on the released 0.4.133, **5.5 % and
@@ -800,6 +816,8 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-13 | `wlab-gnome` (per-user, a lingering user) | P5a `91017d9e4` | #2144: the new unit file laid down as an upgrade does, the candidate started, then a logout and a login | ✅ the start logged its one repair and both `.wants` links stood; a restart repaired nothing more; the logout read *reconnecting* within 1.4 s; after the login the daemon started with the session (2 s after the Enter) and the viewer had a new picture 4.9 s after it. 🔴 0.4.132: the daemon never came back (step log 66) |
 | 2026-10-13 | `wlab-gnome-sys` (system, `drm_capture` + `uinput`) | 0.4.134, the release (sha256 = the release's digest, gpg a good signature) | AC5 on a released build: AC5's `cursor` plan | ✅ the overlay at (0.295, 0.592) and (0.695, 0.592); `cursor_planes=1 atomic=true hotspot=true`. AC5 ticked. Step log 67 |
 | 2026-10-13 | `wlab-gnome` (per-user, mutter) | P5b `f48b66615` | #2145: the lifecycle oracle through lock, unlock, GNOME's idle blank, wake, unlock | ✅ every event named its reason or came back within 10 s: the lock notice at +1.6 s and +0.5 s, the desktop live at +2.8 s and +2.2 s after each unlock. 🔴 0.4.132: frozen for good (step log 66) |
+| 2026-10-14 | `wlab-gnome-sys` (system, `drm_capture` + `uinput`) | 0.4.134, the release | P3e fail-first: what GNOME's idle blank does to KMS. The connector's sysfs, the atomic state in debugfs and a root `capture-smoke` through DRM, before the blank, during it and after a wake | the blank switches the CRTC off (`enable=0 active=0`, both planes `fb=0`), the connector stays `connected` with `dpms=Off`, and the screen measures 0.07 % lit; `capture-smoke` fails the DRM open (`no plane is bound…`), then scrap: `backend_error`. After the wake: `enable=1 active=1`, new framebuffers, 15 frames |
+| 2026-10-14 | `wlab-gnome-sys` (as above) | 0.4.134, then P3e `39a238b3e` | P3e / AC7: the lifecycle oracle through GNOME's idle blank, a wake by the viewer's own mouse and the unlock, for a session running through the blank and for one opened during it | 🔴 0.4.134: running, the last frame with no reason; opened during the blank, `backend_error` and no picture through the wake and the unlock. ✅ P3e: running, the notice at +0.0 s, a picture +1.0 s after the viewer's mouse, the unlock +1.2 s; opened during the blank, the notice at once, the first frame +1.5 s after the mouse, live +2.0 s after the unlock |
 
 ## 12. Related
 
