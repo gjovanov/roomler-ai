@@ -1129,6 +1129,45 @@ async fn a_plain_token_is_still_one_use_across_enroll_and_anchor() {
     anchor(&app, &seeded, &agent_id, "HOST-PLAIN").await;
 }
 
+/// The route read no body before FR-104, so an admin's script may post an
+/// empty form (`curl -d ''`) or an empty JSON body. Both still mint a plain
+/// token — the strict `Option<Json<_>>` answered them 415 and 400.
+#[tokio::test]
+async fn the_body_less_call_shapes_scripts_use_still_mint_a_plain_token() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr104shapes").await;
+    for (content_type, body) in [
+        ("application/x-www-form-urlencoded", ""),
+        ("application/json", ""),
+        ("text/plain", r#"{"anchor":true}"#),
+    ] {
+        let resp = app
+            .auth_post(
+                &format!("/api/tenant/{}/agent/enroll-token", seeded.tenant_id),
+                &seeded.admin.access_token,
+            )
+            .header("content-type", content_type)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{content_type} with {body:?}");
+        let et: Value = resp.json().await.unwrap();
+        assert_eq!(et["anchor"], json!(false), "{content_type}: a plain token");
+    }
+    let bad = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/enroll-token", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .header("content-type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400, "a JSON body that is not JSON");
+}
+
 /// Asking for an anchoring token takes the same permission as any enrollment
 /// token: a member without MANAGE_AGENTS gets none, with or without the flag.
 #[tokio::test]
