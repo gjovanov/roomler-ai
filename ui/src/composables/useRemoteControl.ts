@@ -720,8 +720,10 @@ export interface RcInputReach {
  *  re-created the session every 10 s, so the session the person finally
  *  answered for was rarely the one on screen.
  *
- *  `for` is `person_at_screen` today, typed as a string on purpose: a newer
- *  agent may wait for something else, and its `hint` still reads. */
+ *  `for` is `person_at_screen` (a dialog) or, from P5b, `screen_unlock`
+ *  (GNOME's lock screen, #2145; `mediaWaitingCopy` words each). It is typed
+ *  as a string on purpose: a newer agent may wait for something else, and its
+ *  `hint` still reads. */
 export interface RcMediaWaiting {
   for: string
   /** When the dialog gives up, on THIS browser's clock: the agent sends how
@@ -741,6 +743,36 @@ export const RC_MEDIA_WAITING_GRACE_MS = 10_000
  *  screen? Pure so the watchdog's rule is testable. */
 export function agentIsWaiting(waiting: RcMediaWaiting | null, nowMs: number): boolean {
   return waiting !== null && nowMs < waiting.deadlineMs + RC_MEDIA_WAITING_GRACE_MS
+}
+
+/** FR-93 P5b — the waiting overlay's words, by what the agent waits for. */
+export interface RcMediaWaitingCopy {
+  /** The overlay's headline. */
+  title: string
+  /** The status chip's words after "connected · ". */
+  status: string
+  /** Whether the deadline reads as a request that ends ("If nobody answers…"). */
+  showsDeadline: boolean
+}
+
+/** FR-93 P5b — `screen_unlock` is GNOME's lock screen (#2145): a per-user
+ *  install sees nothing past it, the picture comes back by itself after the
+ *  unlock, and no request ends, so there is no "if nobody answers". Anything
+ *  else, a `for` from a newer agent included, reads as the person at the
+ *  screen being asked (P2d-2); the agent's hint says the rest. */
+export function mediaWaitingCopy(waitingFor: string): RcMediaWaitingCopy {
+  if (waitingFor === 'screen_unlock') {
+    return {
+      title: "Waiting for this computer's screen to be unlocked.",
+      status: 'waiting for the screen to be unlocked',
+      showsDeadline: false,
+    }
+  }
+  return {
+    title: 'Waiting for the person at the screen to share it.',
+    status: 'waiting for the person at the screen',
+    showsDeadline: true,
+  }
 }
 
 export interface RcVideoInfo {

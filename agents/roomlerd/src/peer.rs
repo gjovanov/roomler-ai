@@ -4950,8 +4950,16 @@ fn spawn_capture_unavailable_notice(
     allow(dead_code)
 )]
 fn media_waiting_payload(wait: crate::capture::OpenWait) -> String {
+    use crate::capture::WaitFor;
+    // FR-93 P5b — `for` names what the open waits for: the viewer titles the
+    // notice by it, and an older viewer shows any `for` with the hint.
+    let (for_, hint) = match wait.why {
+        WaitFor::Dialog { control: false } => ("person_at_screen", MEDIA_WAITING_HINT),
+        WaitFor::Dialog { control: true } => ("person_at_screen", MEDIA_WAITING_HINT_CONTROL),
+        WaitFor::Unlock => ("screen_unlock", MEDIA_WAITING_HINT_UNLOCK),
+    };
     format!(
-        r#"{{"t":"rc:media-waiting","for":"person_at_screen","waits_ms":{},"hint":"{MEDIA_WAITING_HINT}"}}"#,
+        r#"{{"t":"rc:media-waiting","for":"{for_}","waits_ms":{},"hint":"{hint}"}}"#,
         wait.gives_up_in.as_millis(),
     )
 }
@@ -4965,10 +4973,34 @@ fn media_waiting_payload(wait: crate::capture::OpenWait) -> String {
 const MEDIA_WAITING_HINT: &str = "The person at this computer is being asked to share their screen. \
      The picture starts as soon as they choose to share it.";
 
+/// FR-93 P5b — the hint when the dialog asks for remote control (P4b's
+/// automatic portal). A refusal there is asked again for the screen only, in
+/// the same wait, so the sentence names both.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+const MEDIA_WAITING_HINT_CONTROL: &str = "The person at this computer is being asked to allow \
+     remote control (or to share just their screen). The picture starts as soon as they allow it.";
+
+/// FR-93 P5b (#2145) — the hint while GNOME's screen is locked. True to what
+/// can be done: GNOME shares no locked screen with a per-user install and takes
+/// no remote input there, so it is unlocked at the computer; a system install
+/// with `drm_capture` + `uinput` shows the lock screen and can unlock it.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+const MEDIA_WAITING_HINT_UNLOCK: &str = "This computer's screen is locked. GNOME shares no locked \
+     screen with this per-user install and takes no remote input there, so it has to be unlocked \
+     at the computer; the picture comes back by itself. A system install with drm_capture and \
+     uinput can show and unlock a locked screen.";
+
 /// FR-93 P2d-2 — the hook a pump hands its capture open
-/// ([`crate::capture::open_default_async`]): if the open parks on a request for
-/// the person at the screen, tell the controller, retrying until the control
-/// channel takes it. `ROOMLERD_MEDIA_WAITING=0` turns the notice off.
+/// ([`crate::capture::open_default_async`]): if the open parks on the person at
+/// the screen (a portal dialog, or P5b's locked screen), tell the controller,
+/// retrying until the control channel takes it. `ROOMLERD_MEDIA_WAITING=0`
+/// turns the notice off.
 ///
 /// The hook fires on the blocking pool, so it holds the runtime's handle
 /// rather than relying on a context that thread may not have entered.
@@ -4992,17 +5024,18 @@ fn media_waiting_hook(
         info!(
             %session_id,
             gives_up_in_s = wait.gives_up_in.as_secs(),
-            "capture: waiting for the person at the screen to answer the portal dialog; telling the controller"
+            why = ?wait.why,
+            "capture: waiting for the person at the screen (a portal dialog, or an unlock); telling the controller"
         );
         runtime.spawn(async move {
-            // Bounded by the dialog's own deadline too: past it, the notice
+            // Bounded by the wait's own deadline too: past it, the notice
             // would describe a wait that is already over.
             let deadline = DEADLINE.min(wait.gives_up_in);
             if !send_control_notice(&control_dc, &payload, RETRY_EVERY, deadline, SEND_BUDGET).await
             {
                 warn!(
                     %session_id,
-                    "media-waiting notice never reached the controller before the dialog's deadline"
+                    "media-waiting notice never reached the controller within its deadline"
                 );
             }
         });
@@ -11638,6 +11671,7 @@ mod codec_cap_tests {
     fn media_waiting_payload_wire_shape() {
         let payload = super::media_waiting_payload(crate::capture::OpenWait {
             gives_up_in: std::time::Duration::from_millis(117_250),
+            why: crate::capture::WaitFor::Dialog { control: false },
         });
         let v: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
         assert_eq!(v["t"], "rc:media-waiting", "{payload}");
@@ -11647,6 +11681,40 @@ mod codec_cap_tests {
             v["hint"].as_str().is_some_and(|h| !h.is_empty()),
             "{payload}"
         );
+    }
+
+    /// FR-93 P5b — each wait reads as what it is: the dialog for the screen,
+    /// the dialog for remote control (P4b, which still asks for the screen
+    /// alone after a refusal), and GNOME's lock screen (#2145), which says
+    /// where the screen gets unlocked. Every one is valid JSON: the hints are
+    /// literals with nothing to escape.
+    #[test]
+    fn media_waiting_names_what_it_waits_for() {
+        use crate::capture::{OpenWait, WaitFor};
+        let read = |why| {
+            let payload = super::media_waiting_payload(OpenWait {
+                gives_up_in: std::time::Duration::from_secs(3600),
+                why,
+            });
+            let v: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+            (
+                v["for"].as_str().unwrap_or_default().to_string(),
+                v["hint"].as_str().unwrap_or_default().to_string(),
+                v["waits_ms"].as_u64(),
+            )
+        };
+        let (f, hint, ms) = read(WaitFor::Dialog { control: false });
+        assert_eq!(f, "person_at_screen");
+        assert!(hint.contains("share their screen"), "{hint}");
+        assert_eq!(ms, Some(3_600_000));
+        let (f, hint, _) = read(WaitFor::Dialog { control: true });
+        assert_eq!(f, "person_at_screen");
+        assert!(hint.contains("allow remote control"), "{hint}");
+        assert!(hint.contains("just their screen"), "{hint}");
+        let (f, hint, _) = read(WaitFor::Unlock);
+        assert_eq!(f, "screen_unlock");
+        assert!(hint.contains("is locked"), "{hint}");
+        assert!(hint.contains("unlocked at the computer"), "{hint}");
     }
 
     #[test]

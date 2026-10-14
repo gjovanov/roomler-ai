@@ -66,11 +66,15 @@ pub fn open_with(target_fps: u32, opts: PortalOpen) -> anyhow::Result<PortalCapt
             TELL_AFTER,
             move || PortalCapture::open_with(target_fps, opts).map_err(|e| format!("{e:#}")),
             // P2d-2 — still parked: tell this open's pump (and so the
-            // controller) until when the dialog can still be answered.
-            |started| {
+            // controller) until when the dialog can still be answered, and
+            // (P5b) whether it asks for remote control or the screen only.
+            move |started| {
                 crate::capture::tell_open_waiting(crate::capture::OpenWait {
                     gives_up_in: (started + HANDSHAKE_DEADLINE)
                         .saturating_duration_since(Instant::now()),
+                    why: crate::capture::WaitFor::Dialog {
+                        control: opts.input,
+                    },
                 })
             },
         )

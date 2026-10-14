@@ -429,6 +429,11 @@ pub mod helper {
     /// detection result by a helper built from another revision.
     const STREAM_MARKER: &str = "ROOMLER_PORTAL_STREAM:";
 
+    /// FR-93 P5b — the streaming helper's exit status when the compositor
+    /// closed its session (GNOME, at a screen lock). Distinct from `1`, a
+    /// failure, so the journal tells the two apart; the parent reopens either.
+    const EXIT_SESSION_CLOSED: i32 = 3;
+
     /// P3c-ii, child side — open a session, then write frames on stdout until
     /// the parent goes away.
     ///
@@ -757,6 +762,20 @@ pub mod helper {
         if std::io::stdout().flush().is_err() {
             std::process::exit(1);
         }
+
+        // FR-93 P5b (#2145) — GNOME closes every remote desktop and screen cast
+        // when its screen locks, and the stream then goes idle, not to an
+        // error: the loop below would wait for frames forever and the viewer
+        // keep the last one. End the capture instead. The daemon's pump reopens
+        // it, and the reopen waits for the unlock with the controller told why
+        // (`capture::open_through_lock`).
+        session.on_closed(|| {
+            eprintln!(
+                "portal-helper: mutter closed the session (GNOME closes every screen cast when its \
+                 screen locks); ending the capture"
+            );
+            std::process::exit(EXIT_SESSION_CLOSED);
+        });
 
         // ⚠️ `session` must stay alive for the whole loop — mutter tears the
         // session down with the D-Bus connection inside it, taking the node.
