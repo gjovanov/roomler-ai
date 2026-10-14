@@ -4,6 +4,7 @@ pub mod cluster;
 pub mod compose;
 pub mod core_state;
 pub mod extractors;
+pub mod growth;
 pub mod logging;
 pub mod middleware;
 pub mod routes;
@@ -331,6 +332,11 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/push", push_routes)
         .nest("/notification", notification_routes)
         .nest("/admin/stats", admin_stats_routes)
+        // FR-102 — growth observability: the exclusion list (P1c) and, from
+        // P1d, the daily digest. A composition view over core and whichever
+        // modules are mounted, so the host's, next to `/admin/stats`; the
+        // same platform-admin gate, plus `growth.enabled`.
+        .nest("/admin/growth", growth::admin_routes())
         // `/stripe/*`, `/admin/newsletter/*`, `/admin/plan-compliance`,
         // `/user/newsletter` and `/subscribe*` are the `saas` module's
         // (FR-69 P2), merged in by `state.modules.mount` below.

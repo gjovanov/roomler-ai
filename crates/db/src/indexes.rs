@@ -405,6 +405,19 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
     // `remote_sessions` and `tunnel_audit` are the `remote` (P6) and
     // `network` (P7a) modules' now.
 
+    // ── Growth observability (FR-102) ─────────────────────────────────────
+    // Core-level like `stats_*` (spec §3o): written by the host's growth
+    // routes and jobs, read by every growth number.
+
+    // P1c — the platform admin's explicit exclusion list: one row per
+    // `(kind, id)`, so the same org cannot be listed twice with two reasons.
+    // The implicit exclusions (platform admins and the orgs they own) have
+    // no row — `roomler_core::growth::ExclusionSet` folds both in.
+    sets.push(set(
+        "growth_exclusions",
+        vec![index_unique(bson::doc! { "kind": 1, "id": 1 })],
+    ));
+
     // Hourly rollups (90 d) and daily rollups (730 d). The rollup task
     // whole-bucket-replaces via $merge on _id, so these are also upserts.
     for (coll, ttl_days) in [
