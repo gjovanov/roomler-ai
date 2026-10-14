@@ -147,6 +147,11 @@ pub mod ssh;
 /// overlay to serve on, but an answer to a request WE sent arrives on the
 /// plain control WS and must be deliverable in every build.
 pub mod ssh_origin;
+/// FR-105 — roomler SSH through a Windows device's SYSTEM service: the framed
+/// SSH pipe between the worker and the service, the service's grant claim and
+/// endpoint publisher, and the worker's word. Compiled everywhere; off
+/// Windows it advertises nothing.
+pub mod ssh_service;
 pub mod subnet_detect;
 /// FR-84 D3 — which supervisor will relaunch this process, decided from
 /// evidence the supervisor left; the only gate on `RestartDaemon`. Pure and

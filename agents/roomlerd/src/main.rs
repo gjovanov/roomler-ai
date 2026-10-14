@@ -775,6 +775,11 @@ enum AnchorCmd {
         /// (`roomlerd anchor exec on` later).
         #[arg(long)]
         no_exec: bool,
+        /// FR-105 — roomler SSH through the SYSTEM service: `off`,
+        /// `console_user` or `system`. Unset keeps what this device's
+        /// previous anchor said, and is off for a first anchor.
+        #[arg(long, value_parser = ["off", "console_user", "system"])]
+        ssh: Option<String>,
     },
     /// Show this machine's anchor (never its credential).
     Status,
@@ -782,6 +787,13 @@ enum AnchorCmd {
     Exec {
         #[arg(value_parser = ["on", "off"])]
         state: String,
+    },
+    /// FR-105 — how far roomler SSH through the SYSTEM service may go:
+    /// `off` (the default), `console_user` (sessions as the signed-in user
+    /// only) or `system` (SYSTEM as well).
+    Ssh {
+        #[arg(value_parser = ["off", "console_user", "system"])]
+        ceiling: String,
     },
     /// Remove the anchor from this machine.
     Remove,
@@ -1459,26 +1471,35 @@ async fn daemon_main() -> Result<()> {
             re_enroll_cmd(&config_path, &token, org.as_deref()).await
         }
         Command::Anchor { action } => {
-            use roomlerd::exec_service::AnchorAction;
-            roomlerd::exec_service::anchor_cli(match action {
+            use roomlerd::exec_service::{AnchorAction, parse_ssh_ceiling};
+            let action = match action {
                 AnchorCmd::Create {
                     server,
                     token,
                     device,
                     force,
                     no_exec,
+                    ssh,
                 } => AnchorAction::Create {
                     server,
                     token,
                     device,
                     force,
                     exec_enabled: !no_exec,
+                    ssh: ssh
+                        .as_deref()
+                        .map(parse_ssh_ceiling)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
                 },
                 AnchorCmd::Status => AnchorAction::Status,
                 AnchorCmd::Exec { state } => AnchorAction::Exec { on: state == "on" },
+                AnchorCmd::Ssh { ceiling } => AnchorAction::Ssh {
+                    ceiling: parse_ssh_ceiling(&ceiling).map_err(anyhow::Error::msg)?,
+                },
                 AnchorCmd::Remove => AnchorAction::Remove,
-            })
-            .await
+            };
+            roomlerd::exec_service::anchor_cli(action).await
         }
         Command::Org { action } => org_cmd(&config_path, action),
         Command::Run {

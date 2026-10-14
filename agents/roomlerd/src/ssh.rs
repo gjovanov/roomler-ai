@@ -72,7 +72,7 @@ use tracing::{debug, warn};
 /// Process services a session depends on, threaded EXPLICITLY from the daemon
 /// into the SSH server instead of discovered through process globals.
 ///
-/// The broker is non-optional on purpose. "No broker ⇒ deny" used to be a doc
+/// The asker is non-optional on purpose. "No broker ⇒ deny" used to be a doc
 /// comment on a `static` (`consent::shared()`), and a doc comment is not a
 /// property the compiler holds anyone to — a server that can be constructed at
 /// all now provably has someone to ask. The struct exists (rather than a bare
@@ -93,17 +93,8 @@ pub struct SessionServices {
     /// by the P8 [`ActivitySink`] which REPORTS what a session did. Two
     /// different meanings under one name is a trap.
     pub power_activity: Option<crate::power::ActivityCounter>,
-    /// The operator-consent broker — the same instance the tray and the
-    /// LocalAPI decide through, so an SSH prompt resolves from any of them.
-    pub consent: crate::consent::ConsentBroker,
-    /// FR-27 — the native prompt surface, threaded here for the same reason
-    /// the broker is: an SSH server is built inside the overlay's TUN
-    /// factory, far from `signaling::run`, and "the prompt reached no screen"
-    /// must not be a state a server can be constructed into. Field-measured
-    /// 2026-08-29 on NEO16: with only the companion path an SSH prompt from
-    /// mars timed out on a desktop whose native panel had just served three
-    /// exec prompts in a row.
-    pub indicator: crate::indicator::ViewerIndicator,
+    /// Who asks the person at the device before a session runs anything.
+    pub asker: Asker,
     /// Where P8 activity reports go: this WS session's outbound queue.
     ///
     /// Scoped to the connection on purpose — a report belongs to the org
@@ -112,6 +103,36 @@ pub struct SessionServices {
     /// builds a new sink; reports that raced the teardown are dropped, which
     /// is the right trade for a log line that must never block a session.
     pub activity: Option<ActivitySink>,
+}
+
+/// Who asks the person at the device before a session runs anything.
+///
+/// FR-105 — a session the SYSTEM service serves runs in session 0, where no
+/// panel reaches anyone. The person is at the console, where the worker that
+/// carried the connection runs, so the service asks THAT worker over the SSH
+/// pipe, and the worker asks exactly as it does for a session of its own. A
+/// worker that answers "yes" itself lets through only a session the server
+/// already granted (FR-94's position on consent).
+#[derive(Clone)]
+pub enum Asker {
+    /// This process asks.
+    Here {
+        /// The operator-consent broker — the same instance the tray and the
+        /// LocalAPI decide through, so an SSH prompt resolves from any of
+        /// them.
+        broker: crate::consent::ConsentBroker,
+        /// FR-27 — the native prompt surface, threaded here for the same
+        /// reason the broker is: an SSH server is built inside the overlay's
+        /// TUN factory, far from `signaling::run`, and "the prompt reached no
+        /// screen" must not be a state a server can be constructed into.
+        /// Field-measured 2026-08-29 on NEO16: with only the companion path an
+        /// SSH prompt from mars timed out on a desktop whose native panel had
+        /// just served three exec prompts in a row.
+        indicator: crate::indicator::ViewerIndicator,
+    },
+    /// FR-105 — the worker on the other end of this connection asks: the
+    /// SYSTEM service's server, one relay per connection.
+    Worker(crate::ssh_service::ConsentRelay),
 }
 
 /// Fire-and-forget reporter for [`SshActivityKind`] events (P8).
@@ -199,6 +220,25 @@ pub fn maybe_intercept(
         return inner;
     }
     let port = cfg.effective_ssh_port();
+    // FR-105 — on Windows, the SYSTEM service's port too: carried to the
+    // service's pipe, never served here. Not when the kill switch is set, nor
+    // when this node's own port is configured onto it.
+    #[cfg(all(windows, feature = "ssh-server"))]
+    let service = {
+        use roomler_ai_remote_control::models::ssh_limits::SERVICE_PORT;
+        if crate::ssh_service::disabled() {
+            None
+        } else if port == SERVICE_PORT {
+            warn!(
+                port,
+                "ssh: ssh_port is the SYSTEM service's port — SSH through the service is off \
+                 on this device"
+            );
+            None
+        } else {
+            Some((SERVICE_PORT, services.clone()))
+        }
+    };
     // Resolve what we serve ONCE, here, rather than per connection: parsing the
     // host key and the authorized-key list is where an operator's typo shows
     // up, and it should surface at start-up in the daemon log, not as a silent
@@ -212,7 +252,33 @@ pub fn maybe_intercept(
         // overlay IP) and the Linux boxes (sshd on `0.0.0.0:22`).
         warn_if_os_listener(ip, port);
 
-        let split = SplitTun::wrap(dev, ip, crate::overlay::netmask_to_prefix(nm), mtu, port);
+        #[cfg(all(windows, feature = "ssh-server"))]
+        let ports: Vec<u16> = match &service {
+            Some((service_port, _)) => vec![port, *service_port],
+            None => vec![port],
+        };
+        #[cfg(not(all(windows, feature = "ssh-server")))]
+        let ports = [port];
+        let split =
+            SplitTun::wrap_ports(dev, ip, crate::overlay::netmask_to_prefix(nm), mtu, &ports);
+
+        #[cfg(all(windows, feature = "ssh-server"))]
+        if let Some((service_port, services)) = service.clone() {
+            let weak = Arc::downgrade(&split);
+            tokio::spawn(async move {
+                let listener = {
+                    let Some(dev) = weak.upgrade() else { return };
+                    match dev.listen_on(service_port).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            warn!(%e, port = service_port, "ssh: could not listen on the SYSTEM service's overlay port");
+                            return;
+                        }
+                    }
+                };
+                carry_loop(listener, service_port, services).await;
+            });
+        }
 
         // The accept loop must NOT hold a strong reference: `SplitTun` owns the
         // netstack, whose poll loop exits when the last handle drops. Upgrade
@@ -253,6 +319,37 @@ pub fn maybe_intercept(
         );
     }
     inner
+}
+
+/// FR-105 — carry each connection to the SYSTEM service's port to the
+/// service, until the netstack goes away. Nothing is served here: the worker
+/// holds no key for these sessions.
+#[cfg(all(windows, feature = "ssh-server"))]
+async fn carry_loop(
+    mut listener: tunnel_core::overlay::netstack::NsListener,
+    port: u16,
+    services: SessionServices,
+) {
+    use tracing::info;
+
+    info!(
+        port,
+        "ssh: carrying the SYSTEM service's overlay port to its pipe"
+    );
+    while let Some(stream) = listener.accept().await {
+        let peer = stream.peer_addr();
+        let services = services.clone();
+        tokio::spawn(async move {
+            match crate::ssh_service::carry(stream, peer, services).await {
+                Ok(()) => info!(%peer, "ssh: a SYSTEM service session closed"),
+                Err(e) => warn!(%peer, %e, "ssh: a SYSTEM service session ended"),
+            }
+        });
+    }
+    info!(
+        port,
+        "ssh: the SYSTEM service's port is no longer carried (session ended)"
+    );
 }
 
 /// Serve intercepted connections until the netstack goes away.
@@ -415,6 +512,10 @@ pub fn stored_host_key_is_usable(_cfg: &crate::config::AgentConfig) -> bool {
     true
 }
 
+/// FR-105 — how a worker answers the question its SYSTEM service relays.
+#[cfg(all(windows, feature = "ssh-server"))]
+pub(crate) use sshd::ask_here;
+
 #[cfg(feature = "ssh-server")]
 pub fn generate_host_key() -> anyhow::Result<String> {
     use russh::keys::ssh_key::LineEnding;
@@ -437,7 +538,7 @@ mod sshd {
     use russh::{Channel, ChannelId};
     use tracing::{info, warn};
 
-    use super::ActivitySink;
+    use super::{ActivitySink, Asker};
 
     /// Everything a session needs, resolved once when the overlay device is
     /// built rather than per connection.
@@ -494,6 +595,14 @@ mod sshd {
         /// buffered path with its 1 MiB ceiling and 300 s limit, exactly as
         /// before FR-89.
         pub exec_streaming: bool,
+        /// FR-105 — the anchor's `ssh` ceiling, on the SYSTEM service's
+        /// server; `None` on the worker's. The machine administrator's, in a
+        /// file only SYSTEM and Administrators can write.
+        pub service_ceiling: Option<roomler_ai_remote_control::models::SshServiceCeiling>,
+        /// FR-105 — refuse every `direct-tcpip` forward, with this reason, on
+        /// the SYSTEM service's server: the allowlist that would gate one
+        /// there is the signed-in user's to edit.
+        pub forward_refusal: Option<&'static str>,
     }
 
     /// Process-wide ceiling on live `direct-tcpip` channels. Generous enough
@@ -600,6 +709,67 @@ mod sshd {
                 forward_acl: cfg.forward_acl.clone(),
                 forwards: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FORWARDS)),
                 exec_streaming: cfg.ssh_exec_streaming,
+                service_ceiling: None,
+                forward_refusal: None,
+            }))
+        }
+
+        /// FR-105 — the SYSTEM service's server, built per connection: its
+        /// own host key, the anchor's ceiling, and nothing from any config
+        /// the signed-in user can write. No key list (that list is the user's
+        /// to edit, so a key in it would be SYSTEM for the asking), and no
+        /// forwards (their allowlist is the user's too). `services.asker` is
+        /// that connection's worker ([`super::Asker::Worker`]). `None` when
+        /// the key does not parse.
+        pub fn for_service(
+            host_key_pem: &str,
+            ceiling: roomler_ai_remote_control::models::SshServiceCeiling,
+            services: super::SessionServices,
+        ) -> Option<Arc<Self>> {
+            let host_key = match ssh_key::PrivateKey::from_openssh(host_key_pem) {
+                Ok(k) => k,
+                Err(e) => {
+                    warn!(%e, "ssh-service: the service's host key is unreadable — not serving SSH");
+                    return None;
+                }
+            };
+            let fingerprint = host_key
+                .public_key()
+                .fingerprint(ssh_key::HashAlg::Sha256)
+                .to_string();
+            let config = russh::server::Config {
+                // The worker's values: an abandoned session ends after ten
+                // minutes of silence, and guessing is slowed.
+                inactivity_timeout: Some(Duration::from_secs(600)),
+                auth_rejection_time: Duration::from_secs(2),
+                auth_rejection_time_initial: Some(Duration::from_secs(0)),
+                keys: vec![host_key],
+                ..Default::default()
+            };
+            info!(%fingerprint, ?ceiling, "ssh-service: serving a connection");
+            Some(Arc::new(Self {
+                config: Arc::new(config),
+                authorized: Vec::new(),
+                key_list_run_as: Err("keys in ssh_authorized_keys are not accepted on the \
+                                      SYSTEM service's port: that list is the signed-in \
+                                      user's to edit"
+                    .to_string()),
+                // The anchor's ceiling decides instead (`service_ceiling`).
+                deny_daemon_grants: false,
+                services,
+                // Off as well as refused below, so no path to a forward
+                // exists here even past `forward_refusal`.
+                forward_acl: crate::tunnel::acl::AgentForwardAcl {
+                    enabled: false,
+                    allowlist: Vec::new(),
+                },
+                forwards: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FORWARDS)),
+                exec_streaming: true,
+                service_ceiling: Some(ceiling),
+                forward_refusal: Some(
+                    "port forwarding is not served through the SYSTEM service: the allowlist \
+                     that would gate it is the signed-in user's to edit",
+                ),
             }))
         }
     }
@@ -743,6 +913,40 @@ mod sshd {
                 grant_id: None,
             }
         }
+
+        /// FR-105 — hold a resolved grant to the anchor's `ssh` ceiling, on
+        /// the SYSTEM service's server. It REFUSES, never downgrades (the M5
+        /// rule): a caller who asked for SYSTEM and quietly got the signed-in
+        /// user would read the device's answer as their command's. The server
+        /// routes only grants the published ceiling permits, so this bites
+        /// only when an administrator lowered it since.
+        pub(super) fn within_service_ceiling(
+            mut self,
+            ceiling: roomler_ai_remote_control::models::SshServiceCeiling,
+        ) -> Self {
+            use roomler_ai_remote_control::models::{SshAccountMode, SshServiceCeiling};
+            if let Ok(run_as) = &self.run_as {
+                let mode = match run_as {
+                    crate::exec::RunAs::Daemon => Some(SshAccountMode::Daemon),
+                    crate::exec::RunAs::ConsoleUser => Some(SshAccountMode::ConsoleUser),
+                    crate::exec::RunAs::Named(_) => None,
+                };
+                if !mode.is_some_and(|m| ceiling.permits(m)) {
+                    let allowed = match ceiling {
+                        SshServiceCeiling::Off => "not at all",
+                        SshServiceCeiling::ConsoleUser => "only as the signed-in user",
+                        SshServiceCeiling::System => "as SYSTEM or the signed-in user",
+                    };
+                    self.run_as = Err(format!(
+                        "this device's administrator allows SSH through its SYSTEM service \
+                         {allowed} (`roomlerd anchor ssh`), and this session asked to run as \
+                         {}",
+                        run_as.label()
+                    ));
+                }
+            }
+            self
+        }
     }
 
     /// Parse the device-owned `ssh_account_mode` into a [`RunAs`].
@@ -808,6 +1012,9 @@ mod sshd {
         /// the handler is the event they all share, so the guard rides along
         /// with it and cannot be leaked.
         _awake: Option<crate::power::ActivityGuard>,
+        /// Who asks the person before anything runs: this process, or
+        /// (FR-105) the worker that carried this connection.
+        asker: Asker,
     }
 
     impl Handler {
@@ -818,6 +1025,7 @@ mod sshd {
                 .power_activity
                 .as_ref()
                 .map(crate::power::ActivityGuard::new);
+            let asker = ctx.services.asker.clone();
             Self {
                 ctx,
                 peer,
@@ -828,6 +1036,7 @@ mod sshd {
                 pty_handle: None,
                 exec_aborts: std::collections::HashMap::new(),
                 _awake: awake,
+                asker,
             }
         }
 
@@ -967,13 +1176,11 @@ mod sshd {
             let handle = session.handle();
             let caller = policy.caller.clone();
             let consent = policy.consent_sentinel.clone();
-            let broker = self.ctx.services.consent.clone();
-            let indicator = self.ctx.services.indicator.clone();
+            let asker = self.asker.clone();
 
             if let Some(sentinel) = consent
                 && let Err(why) = await_consent(
-                    &broker,
-                    &indicator,
+                    &asker,
                     &handle,
                     channel,
                     &caller,
@@ -1158,13 +1365,11 @@ mod sshd {
             let handle = session.handle();
             let caller = policy.caller.clone();
             let consent = policy.consent_sentinel.clone();
-            let broker = self.ctx.services.consent.clone();
-            let indicator = self.ctx.services.indicator.clone();
+            let asker = self.asker.clone();
 
             if let Some(sentinel) = consent
                 && let Err(why) = await_consent(
-                    &broker,
-                    &indicator,
+                    &asker,
                     &handle,
                     channel,
                     &caller,
@@ -1299,11 +1504,17 @@ mod sshd {
                 // Resolving HERE — not lazily at each request — is the P5
                 // design: one place turns a grant into what a session may do,
                 // and the request handlers can only read the result.
-                self.policy = Some(ResolvedSessionPolicy::from_grant(
+                let mut policy = ResolvedSessionPolicy::from_grant(
                     grant,
                     self.peer,
                     self.ctx.deny_daemon_grants,
-                ));
+                );
+                // FR-105 — on the SYSTEM service's server, the anchor's
+                // ceiling as well.
+                if let Some(ceiling) = self.ctx.service_ceiling {
+                    policy = policy.within_service_ceiling(ceiling);
+                }
+                self.policy = Some(policy);
                 self.report(SshActivityKind::SessionOpen, None, None, true);
                 return Ok(Auth::Accept);
             }
@@ -1394,7 +1605,12 @@ mod sshd {
             };
             let caller = policy.caller.clone();
 
-            if let Err(why) = forward_allowed(&self.ctx.forward_acl, &host, port) {
+            // FR-105 — no forward at all on the SYSTEM service's server.
+            let verdict = match self.ctx.forward_refusal {
+                Some(why) => Err(why.to_string()),
+                None => forward_allowed(&self.ctx.forward_acl, &host, port),
+            };
+            if let Err(why) = verdict {
                 // `ssh` renders this as "administratively prohibited", which
                 // tells the caller it was a policy decision and not a dead
                 // destination. The *reason* stays here, next to the operator
@@ -1511,8 +1727,7 @@ mod sshd {
             };
             let caller = policy.caller.clone();
             let consent = policy.consent_sentinel.clone();
-            let broker = self.ctx.services.consent.clone();
-            let indicator = self.ctx.services.indicator.clone();
+            let asker = self.asker.clone();
             // Captured here, where the policy is still borrowed, and reported
             // from inside the task once the exit code exists.
             let activity = self
@@ -1541,8 +1756,7 @@ mod sshd {
                 caller,
                 run_as,
                 consent,
-                broker,
-                indicator,
+                asker,
                 activity,
                 stdin,
                 abort,
@@ -1801,9 +2015,10 @@ mod sshd {
     /// caller like a 30-second hang, which is the same "a bare failure cannot
     /// explain itself" problem that shapes every other refusal here.
     ///
-    /// The broker arrives through [`super::SessionServices`], so "nobody can
-    /// be asked" is no longer a reachable state — a server that exists was
-    /// handed one at construction. (It used to be a process global whose
+    /// Who asks arrives with the handler ([`Asker`]): the broker through
+    /// [`super::SessionServices`], or (FR-105) the worker's relay. Either way
+    /// "nobody can be asked" is not a reachable state — a server that exists
+    /// was handed one at construction. (It used to be a process global whose
     /// absence this function had to treat as a denial.)
     ///
     /// `what` names the activity being approved ("open an interactive shell",
@@ -1811,8 +2026,7 @@ mod sshd {
     /// deciding, not just in the daemon log: "grant SSH" and "give this account
     /// a root shell on my machine right now" are not the same question.
     async fn await_consent(
-        broker: &crate::consent::ConsentBroker,
-        indicator: &crate::indicator::ViewerIndicator,
+        asker: &Asker,
         handle: &russh::server::Handle,
         channel: ChannelId,
         caller: &str,
@@ -1831,7 +2045,39 @@ mod sshd {
                 .into_bytes(),
             )
             .await;
+        match asker {
+            Asker::Here { broker, indicator } => {
+                ask_here(broker, indicator, caller, sentinel, what, timeout).await
+            }
+            Asker::Worker(relay) => {
+                let verdict = relay.ask(sentinel, caller, what, timeout).await;
+                match &verdict {
+                    Ok(()) => info!(
+                        %caller, %sentinel,
+                        "ssh-service: the person at the device approved the session"
+                    ),
+                    Err(why) => warn!(
+                        %caller, %sentinel, %why,
+                        "ssh-service: the person at the device did not approve the session"
+                    ),
+                }
+                verdict
+            }
+        }
+    }
 
+    /// Ask the person at this device from THIS process: the native panel,
+    /// the desktop companion, the CLI sentinel. `Err` is what the caller's
+    /// terminal is told. FR-105 — also how a worker answers the question its
+    /// SYSTEM service relays.
+    pub(crate) async fn ask_here(
+        broker: &crate::consent::ConsentBroker,
+        indicator: &crate::indicator::ViewerIndicator,
+        caller: &str,
+        sentinel: &str,
+        what: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
         // FR-27 — the same surface chain as a screen-control or exec prompt:
         // the daemon's own panel first, the desktop companion (started if it
         // is not running) second, the CLI sentinel always. SSH used to write
@@ -1939,8 +2185,8 @@ mod sshd {
         run_as: crate::exec::RunAs,
         /// The consent sentinel to prompt on; `None` = no prompt.
         consent: Option<String>,
-        broker: crate::consent::ConsentBroker,
-        indicator: crate::indicator::ViewerIndicator,
+        /// Who asks the person (FR-105: this process, or the worker).
+        asker: Asker,
         /// The P8 sink and the grant to attribute the report to.
         activity: Option<(ActivitySink, Option<String>)>,
         stdin: crate::exec::StdinFeed,
@@ -1993,8 +2239,7 @@ mod sshd {
             caller,
             run_as,
             consent,
-            broker,
-            indicator,
+            asker,
             activity,
             stdin,
             abort,
@@ -2007,8 +2252,7 @@ mod sshd {
         // would surface as a connection that rejects them for no stated reason.
         if let Some(sentinel) = consent
             && let Err(why) = await_consent(
-                &broker,
-                &indicator,
+                &asker,
                 &handle,
                 channel,
                 &caller,
@@ -2248,6 +2492,42 @@ async fn serve_conn(stream: tunnel_core::overlay::netstack::NsTcpStream, ctx: Se
             Err(e) => info!(%peer, %e, "ssh: session ended"),
         },
         Err(e) => warn!(%peer, %e, "ssh: handshake failed"),
+    }
+}
+
+/// FR-105 — serve one SSH connection for the SYSTEM service, over `stream`
+/// (the service's end of the SSH pipe, after the framing): the service's own
+/// host key, the anchor's ceiling, and the person asked through `relay`, the
+/// worker that carried the connection. Returns when the session ends.
+///
+/// Nothing is held awake and nothing is reported from here: the service has
+/// no power keeper and no control socket (activity reports from the service
+/// are a later phase).
+#[cfg(feature = "ssh-server")]
+pub async fn serve_for_service<S>(
+    stream: S,
+    peer: std::net::SocketAddr,
+    host_key_pem: &str,
+    ceiling: roomler_ai_remote_control::models::SshServiceCeiling,
+    relay: crate::ssh_service::ConsentRelay,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let services = SessionServices {
+        power_activity: None,
+        asker: Asker::Worker(relay),
+        activity: None,
+    };
+    let Some(ctx) = sshd::Ctx::for_service(host_key_pem, ceiling, services) else {
+        return;
+    };
+    let handler = sshd::Handler::new(ctx.clone(), peer);
+    match russh::server::run_stream(ctx.config.clone(), stream, handler).await {
+        Ok(session) => match session.await {
+            Ok(()) => tracing::info!(%peer, "ssh-service: session closed"),
+            Err(e) => tracing::info!(%peer, %e, "ssh-service: session ended"),
+        },
+        Err(e) => warn!(%peer, %e, "ssh-service: handshake failed"),
     }
 }
 
@@ -2593,12 +2873,23 @@ mod tests {
             // FR-55 — tests hold nothing awake. `None` is the real production
             // value anywhere no power keeper exists, not a stub.
             power_activity: None,
-            consent: crate::consent::ConsentBroker::new(crate::consent::Mode::AutoGrant, dir)
-                .expect("a temp sentinel dir"),
-            indicator: crate::indicator::ViewerIndicator::disabled(),
+            asker: super::Asker::Here {
+                broker: crate::consent::ConsentBroker::new(crate::consent::Mode::AutoGrant, dir)
+                    .expect("a temp sentinel dir"),
+                indicator: crate::indicator::ViewerIndicator::disabled(),
+            },
             // Reporting off in tests unless a case opts in — the default a
             // device ships with.
             activity: None,
+        }
+    }
+
+    /// The broker a test's services ask through, so the test can play the
+    /// operator.
+    fn broker_of(services: &super::SessionServices) -> crate::consent::ConsentBroker {
+        match &services.asker {
+            super::Asker::Here { broker, .. } => broker.clone(),
+            super::Asker::Worker(_) => panic!("a worker's server asks here"),
         }
     }
 
@@ -2611,7 +2902,7 @@ mod tests {
         cfg: &crate::config::AgentConfig,
     ) -> (std::net::SocketAddr, crate::consent::ConsentBroker) {
         let services = test_services();
-        let broker = services.consent.clone();
+        let broker = broker_of(&services);
         let ctx = super::sshd::Ctx::build(cfg, services).expect("a usable host key");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4049,5 +4340,180 @@ mod tests {
         for _ in 0..2 {
             sink.report(None, "c", SshActivityKind::Shell, None, None, true);
         }
+    }
+
+    // ── FR-105 — the SYSTEM service's server, through the framed pipe ──────
+
+    /// The questions the worker was asked, in order.
+    type Asks = Arc<std::sync::Mutex<Vec<crate::ssh_service::ConsentAsk>>>;
+
+    /// One connection to the SYSTEM service's port, carried the way a device
+    /// carries it: the returned stream is the caller's connection, the worker
+    /// splices it into the "pipe", and the service serves it with its own
+    /// host key under `ceiling`. The worker answers every question with
+    /// `granted` and `reason`.
+    fn through_the_service(
+        ceiling: roomler_ai_remote_control::models::SshServiceCeiling,
+        granted: bool,
+        reason: Option<&'static str>,
+    ) -> (tokio::io::DuplexStream, Asks) {
+        let pem = super::generate_host_key().unwrap();
+        let (service_pipe, worker_pipe) = tokio::io::duplex(256 * 1024);
+        tokio::spawn(crate::ssh_service::serve_framed(
+            service_pipe,
+            move |stream, peer, relay| async move {
+                super::serve_for_service(stream, peer, &pem, ceiling, relay).await;
+            },
+        ));
+        let (caller, carried) = tokio::io::duplex(256 * 1024);
+        let asks: Asks = Default::default();
+        let seen = Arc::clone(&asks);
+        tokio::spawn(crate::ssh_service::splice_framed(
+            carried,
+            worker_pipe,
+            "100.64.0.9:41000".parse().unwrap(),
+            move |ask: crate::ssh_service::ConsentAsk| {
+                seen.lock().unwrap().push(ask.clone());
+                async move {
+                    crate::ssh_service::ConsentAnswer {
+                        id: ask.id,
+                        granted,
+                        reason: reason.map(String::from),
+                    }
+                }
+            },
+        ));
+        (caller, asks)
+    }
+
+    /// Handshake and authenticate over `stream`; `Err` = refused.
+    async fn connect_over(
+        stream: tokio::io::DuplexStream,
+        key: PrivateKey,
+    ) -> Result<russh::client::Handle<TestClient>, ()> {
+        let config = Arc::new(russh::client::Config::default());
+        let mut session = russh::client::connect_stream(config, stream, TestClient)
+            .await
+            .expect("ssh handshake");
+        let hash = session.best_supported_rsa_hash().await.unwrap().flatten();
+        let res = session
+            .authenticate_publickey(
+                "roomler",
+                russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+            )
+            .await
+            .expect("auth exchange");
+        if res.success() { Ok(session) } else { Err(()) }
+    }
+
+    /// Run `cmd` on a new channel: (stdout, stderr, exit status).
+    async fn exec_over(
+        session: &russh::client::Handle<TestClient>,
+        cmd: &str,
+    ) -> (String, String, Option<u32>) {
+        let mut channel = session.channel_open_session().await.unwrap();
+        channel.exec(true, cmd).await.unwrap();
+        let (mut out, mut err, mut exit) = (Vec::new(), Vec::new(), None);
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { ref data } => out.extend_from_slice(data),
+                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => err.extend_from_slice(data),
+                russh::ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                _ => {}
+            }
+        }
+        (
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+            exit,
+        )
+    }
+
+    /// FR-105 — a granted session on the SYSTEM service's port runs once the
+    /// person says yes, asked through the worker that carried the
+    /// connection, about exactly this grant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_service_session_runs_once_the_worker_says_the_person_approved() {
+        use roomler_ai_remote_control::models::{ConsentMode, SshServiceCeiling};
+        let _lock = grant_test().await;
+        let _slot = exec_slot().await;
+        let (key, line) = client_key(80);
+        let grant_id = grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
+        let (caller, asks) = through_the_service(SshServiceCeiling::System, true, None);
+        let session = connect_over(caller, key)
+            .await
+            .expect("the grant admits its key");
+        let (out, err, exit) = exec_over(&session, "echo through-the-service").await;
+        assert!(
+            out.contains("through-the-service"),
+            "stdout {out:?}, stderr {err:?}"
+        );
+        assert_eq!(exit, Some(0));
+        let asks = asks.lock().unwrap().clone();
+        assert_eq!(asks.len(), 1, "asked once: {asks:?}");
+        assert_eq!(asks[0].sentinel, grant_id);
+        assert_eq!(asks[0].what, "run a command");
+        assert!(asks[0].caller.contains("alice@example.com"), "{asks:?}");
+    }
+
+    /// FR-105 — the person's no reaches the caller in words, and nothing runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_service_session_the_person_refuses_runs_nothing() {
+        use roomler_ai_remote_control::models::{ConsentMode, SshServiceCeiling};
+        let _lock = grant_test().await;
+        let _slot = exec_slot().await;
+        let (key, line) = client_key(81);
+        grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
+        let (caller, asks) =
+            through_the_service(SshServiceCeiling::System, false, Some("not today"));
+        let session = connect_over(caller, key).await.expect("admitted");
+        let (out, err, exit) = exec_over(&session, "echo should-not-run").await;
+        assert!(!out.contains("should-not-run"), "it ran: {out:?}");
+        assert!(err.contains("not today"), "stderr {err:?}");
+        assert_eq!(exit, Some(1));
+        assert_eq!(asks.lock().unwrap().len(), 1);
+    }
+
+    /// FR-105 — the anchor's ceiling refuses what it does not permit, before
+    /// anyone is asked: a SYSTEM session under a ceiling of `console_user`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_anchor_ceiling_refuses_a_system_session_before_asking() {
+        use roomler_ai_remote_control::models::{ConsentMode, SshServiceCeiling};
+        let _lock = grant_test().await;
+        let _slot = exec_slot().await;
+        let (key, line) = client_key(82);
+        // `daemon`, the account mode `grant_for_with_consent` asks for.
+        grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
+        let (caller, asks) = through_the_service(SshServiceCeiling::ConsoleUser, true, None);
+        let session = connect_over(caller, key).await.expect("admitted");
+        let (out, err, exit) = exec_over(&session, "echo should-not-run").await;
+        assert!(!out.contains("should-not-run"), "it ran: {out:?}");
+        assert!(err.contains("only as the signed-in user"), "stderr {err:?}");
+        assert_eq!(exit, Some(1));
+        assert!(asks.lock().unwrap().is_empty(), "nobody is asked");
+    }
+
+    /// FR-105 — nothing the signed-in user can write opens the service's
+    /// port: a key with no grant is refused (the service has no key list),
+    /// and a granted session cannot open a forward (no allowlist either).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_service_port_takes_no_unlisted_key_and_opens_no_forward() {
+        use roomler_ai_remote_control::models::SshServiceCeiling;
+        let _lock = grant_test().await;
+        let (key, _) = client_key(83);
+        let (caller, _) = through_the_service(SshServiceCeiling::System, true, None);
+        assert!(
+            connect_over(caller, key).await.is_err(),
+            "no grant, no session"
+        );
+
+        let (key, line) = client_key(84);
+        grant_for(&line, 30_000).unwrap();
+        let (caller, _) = through_the_service(SshServiceCeiling::System, true, None);
+        let session = connect_over(caller, key).await.expect("admitted");
+        let opened = session
+            .channel_open_direct_tcpip("127.0.0.1", 22, "127.0.0.1", 5555)
+            .await;
+        assert!(opened.is_err(), "a forward through the SYSTEM service");
     }
 }
