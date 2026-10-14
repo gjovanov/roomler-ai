@@ -42,6 +42,14 @@ pub struct PortalCapture {
     /// FR-93 P2 — frames from mutter's own ScreenCast, not the portal: the
     /// arm the controller is told about.
     mutter: bool,
+    /// FR-93 P5f — whether this user's display session is the one on its
+    /// seat (a user switch, the login screen), as [`watch_session`] last read
+    /// it. `None` where nothing watches: a root daemon, or
+    /// `ROOMLERD_SESSION_WATCH=0`.
+    watch: Option<std::sync::Arc<SessionWatch>>,
+    /// When the last frame arrived: proof the compositor draws this session,
+    /// newer than the watch's read on the way back (see [`away_now`]).
+    last_frame: Option<std::time::Instant>,
 }
 
 /// What one portal session is opened with. [`PortalOpen::from_env`] is the
@@ -232,6 +240,11 @@ impl PortalCapture {
             );
         }
 
+        // FR-93 P5f — a per-user install captures only its own user's session,
+        // which the compositor stops drawing while another session holds the
+        // seat. Watched, so the controller can be told why the picture stopped.
+        let watch = watch_session();
+
         Ok(Self {
             child,
             rx,
@@ -240,6 +253,8 @@ impl PortalCapture {
             input_route_generation,
             cursor_embedded: started.cursor_embedded,
             mutter: use_mutter,
+            watch,
+            last_frame: None,
         })
     }
 
@@ -262,8 +277,233 @@ impl Drop for PortalCapture {
         if let Some(generation) = self.input_route_generation.take() {
             super::input_route::unregister(generation);
         }
+        if let Some(watch) = &self.watch {
+            watch.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// FR-93 P5f — how often the user's display session is asked whether it is
+/// on its seat: a D-Bus property read, no process.
+const SESSION_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// FR-93 P5f kill switch `ROOMLERD_SESSION_WATCH=0`: no watcher, and a
+/// session switched away reads as it did before, its last frame kept alive.
+fn session_watch_enabled() -> bool {
+    tunnel_core::env::flag("SESSION_WATCH", true)
+}
+
+/// FR-93 P5f — a watcher of this user's display session, for a per-user
+/// daemon: its read says "away" while logind says the session is not the
+/// active one on its seat, and the thread ends when `stop` is set. `None` for
+/// a root daemon, whose captures are not one user's, or with the kill switch.
+fn watch_session() -> Option<std::sync::Arc<SessionWatch>> {
+    use std::sync::atomic::Ordering;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    if uid == 0 || !session_watch_enabled() {
+        return None;
+    }
+    let watch = std::sync::Arc::new(SessionWatch::new());
+    let thread_watch = std::sync::Arc::clone(&watch);
+    let spawned = std::thread::Builder::new()
+        .name("session-watch".into())
+        .spawn(move || {
+            let Ok(conn) = zbus::blocking::Connection::system() else {
+                return;
+            };
+            let mut was_away = false;
+            while !thread_watch.stop.load(Ordering::Relaxed) {
+                let began = std::time::Instant::now();
+                let now_away = session_away(&seat_sessions(&conn, uid));
+                if now_away != was_away {
+                    tracing::info!(
+                        away = now_away,
+                        "capture: this user's session is {} its seat (FR-93 P5f)",
+                        if now_away { "away from" } else { "back on" }
+                    );
+                    was_away = now_away;
+                }
+                thread_watch.record(now_away, began);
+                std::thread::sleep(SESSION_POLL);
+            }
+        });
+    spawned.ok().map(|_| watch)
+}
+
+/// FR-93 P5f — what the session watch last read, shared by its thread and
+/// the capture, and the capture's word to stop it.
+struct SessionWatch {
+    /// The last read: [`SessionWatch::AWAY`] for "away", and below it when
+    /// the read began, in µs since `base`. One word, so an answer is never
+    /// read with another answer's time.
+    read: std::sync::atomic::AtomicU64,
+    base: std::time::Instant,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+impl SessionWatch {
+    /// The top bit of [`SessionWatch::read`].
+    const AWAY: u64 = 1 << 63;
+
+    /// Nothing read yet: not away.
+    fn new() -> Self {
+        Self {
+            read: std::sync::atomic::AtomicU64::new(0),
+            base: std::time::Instant::now(),
+            stop: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// A read's answer, with the time it began.
+    fn record(&self, away: bool, began: std::time::Instant) {
+        use std::sync::atomic::Ordering;
+        let at = began.saturating_duration_since(self.base).as_micros() as u64 & !Self::AWAY;
+        let flag = if away { Self::AWAY } else { 0 };
+        self.read.store(at | flag, Ordering::Relaxed);
+    }
+
+    /// The last read: away or not, and when it began.
+    fn last(&self) -> (bool, std::time::Instant) {
+        use std::sync::atomic::Ordering;
+        let read = self.read.load(Ordering::Relaxed);
+        (
+            read & Self::AWAY != 0,
+            self.base + std::time::Duration::from_micros(read & !Self::AWAY),
+        )
+    }
+}
+
+/// FR-93 P5f — the newer evidence wins. logind's "away" counts only when its
+/// read began after the last frame: a frame proves the compositor draws this
+/// session, and on the way back the frames come before the next read. Without
+/// this, a still desktop's first empty tick after the return told the
+/// controller "away" again, once, after its picture had come back.
+fn away_now(
+    away: bool,
+    read_began: std::time::Instant,
+    last_frame: Option<std::time::Instant>,
+) -> bool {
+    away && last_frame.is_none_or(|frame| read_began > frame)
+}
+
+/// FR-93 P5f — away when this user has a graphical session on a seat and none
+/// of them is the active one there. No graphical seat session (logged out,
+/// or logind could not be asked) is not "away": the capture goes on as before,
+/// and the session's own end is another path's to report.
+fn session_away(sessions: &[SeatSession]) -> bool {
+    let mut graphical = sessions.iter().filter(|s| s.graphical).peekable();
+    graphical.peek().is_some() && graphical.all(|s| !s.active)
+}
+
+/// One of this user's sessions on a seat, as logind reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SeatSession {
+    /// `Type` is `wayland` or `x11`.
+    graphical: bool,
+    /// `Active`: the session is the one its seat shows.
+    active: bool,
+}
+
+/// FR-93 P5f — this user's sessions on a seat (`ListSessions`, then each
+/// one's `Type` and `Active`). Empty when logind cannot be asked.
+fn seat_sessions(conn: &zbus::blocking::Connection, uid: u32) -> Vec<SeatSession> {
+    use zbus::blocking::Proxy;
+    use zbus::zvariant::OwnedObjectPath;
+    const LOGIND: &str = "org.freedesktop.login1";
+    let Ok(manager) = Proxy::new(
+        conn,
+        LOGIND,
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(all) = manager
+        .call::<_, _, Vec<(String, u32, String, String, OwnedObjectPath)>>("ListSessions", &())
+    else {
+        return Vec::new();
+    };
+    all.iter()
+        .filter(|(_id, owner, _name, seat, _path)| *owner == uid && !seat.is_empty())
+        .filter_map(|(_id, _owner, _name, _seat, path)| {
+            let session = Proxy::new(conn, LOGIND, path, "org.freedesktop.login1.Session").ok()?;
+            let kind = session.get_property::<String>("Type").ok()?;
+            let active = session.get_property::<bool>("Active").ok()?;
+            Some(SeatSession {
+                graphical: kind == "wayland" || kind == "x11",
+                active,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod session_away_tests {
+    use super::{SeatSession, SessionWatch, away_now, session_away};
+    use std::time::{Duration, Instant};
+
+    const fn s(graphical: bool, active: bool) -> SeatSession {
+        SeatSession { graphical, active }
+    }
+
+    /// P5f — away only when this user's graphical seat session exists and is
+    /// not the one on screen; a user with none is not away (logged out, or
+    /// logind silent), and a tty login on the seat does not count.
+    #[test]
+    fn away_means_a_graphical_session_that_is_not_on_screen() {
+        assert!(!session_away(&[]), "no seat session: not away");
+        assert!(!session_away(&[s(true, true)]), "on screen");
+        assert!(
+            session_away(&[s(true, false)]),
+            "a user switch, the greeter"
+        );
+        assert!(
+            !session_away(&[s(false, false)]),
+            "a tty only: no picture to lose"
+        );
+        assert!(
+            !session_away(&[s(true, false), s(true, true)]),
+            "one of them on screen"
+        );
+        assert!(
+            session_away(&[s(false, true), s(true, false)]),
+            "the tty is the active one, the desktop is not"
+        );
+    }
+
+    /// P5f — the newer evidence wins: a frame after the read that said "away"
+    /// means the session came back before the watch read it again, so only a
+    /// read newer than the last frame counts.
+    #[test]
+    fn a_frame_newer_than_the_read_means_the_session_is_back() {
+        let read = Instant::now();
+        let later = read + Duration::from_millis(400);
+        assert!(away_now(true, read, None), "away, and no frame yet");
+        assert!(
+            away_now(true, later, Some(read)),
+            "a read newer than the frame"
+        );
+        assert!(
+            !away_now(true, read, Some(later)),
+            "a frame after the read: back"
+        );
+        assert!(!away_now(false, later, Some(read)), "not away");
+    }
+
+    /// P5f — the watch's one word keeps an answer with its own time.
+    #[test]
+    fn the_watch_keeps_each_answer_with_its_time() {
+        let watch = SessionWatch::new();
+        assert!(!watch.last().0, "nothing read yet: not away");
+        let began = watch.base + Duration::from_millis(1500);
+        watch.record(true, began);
+        assert_eq!(watch.last(), (true, began));
+        let back = began + Duration::from_secs(1);
+        watch.record(false, back);
+        assert_eq!(watch.last(), (false, back));
     }
 }
 
@@ -323,7 +563,11 @@ impl ScreenCapture for PortalCapture {
         // each other.
         let rx = &self.rx;
         match tokio::task::block_in_place(|| rx.recv_timeout(FRAME_WAIT)) {
-            Ok(f) => Ok(Some(f)),
+            Ok(f) => {
+                // FR-93 P5f — proof the compositor draws this session.
+                self.last_frame = Some(std::time::Instant::now());
+                Ok(Some(f))
+            }
             // No frame inside the window is not an error: a still screen
             // legitimately produces nothing, and `Ok(None)` is the pump's
             // "nothing this tick".
@@ -356,6 +600,13 @@ impl ScreenCapture for PortalCapture {
         } else {
             crate::capture::CaptureArm::Portal
         })
+    }
+
+    /// FR-93 P5f — this user's session is away from its seat: the pumps tell
+    /// the controller, and keep no keepalive while it lasts.
+    fn waits_for(&self) -> Option<crate::capture::WaitFor> {
+        let (away, read_began) = self.watch.as_ref()?.last();
+        away_now(away, read_began, self.last_frame).then_some(crate::capture::WaitFor::SessionAway)
     }
 }
 

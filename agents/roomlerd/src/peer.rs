@@ -241,6 +241,10 @@ pub struct AgentPeer {
     /// is answered, so it is in place before any channel can open.
     #[cfg(feature = "recording")]
     record_ctx: Arc<std::sync::OnceLock<crate::recording::remote::SessionCtx>>,
+    /// FR-99 P1b — what this session's `privacy` DataChannel needs (who is
+    /// connected, and the overlay that draws the curtain). Set once by
+    /// [`Self::set_privacy_ctx`] before the offer is answered.
+    privacy_ctx: Arc<std::sync::OnceLock<crate::privacy::PrivacyCtx>>,
     /// Fires when this session ends: [`Self::close`] or the drop, whichever
     /// comes first. The DataChannel handlers that hold something past their
     /// channel (the cursor poller, the clipboard watch, an upload's open
@@ -1081,6 +1085,9 @@ impl AgentPeer {
             Arc::new(std::sync::OnceLock::new());
         #[cfg(feature = "recording")]
         let record_ctx_for_callback = record_ctx.clone();
+        let privacy_ctx: Arc<std::sync::OnceLock<crate::privacy::PrivacyCtx>> =
+            Arc::new(std::sync::OnceLock::new());
+        let privacy_ctx_for_callback = privacy_ctx.clone();
         let session_end_for_callback = session_end.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
@@ -1098,6 +1105,7 @@ impl AgentPeer {
             let lock_state_rx_for_input = lock_state_rx_for_dc.clone();
             #[cfg(feature = "recording")]
             let record_ctx = record_ctx_for_callback.clone();
+            let privacy_ctx = privacy_ctx_for_callback.clone();
             let session_end = session_end_for_callback.clone();
             Box::pin(async move {
                 use roomler_ai_remote_control::permissions::Permissions;
@@ -1191,6 +1199,18 @@ impl AgentPeer {
                         None => {
                             crate::recording::remote::attach_refusing(dc, session_id, "unavailable")
                         }
+                    },
+                    // FR-99 P1b — the same attach-time gate for PRIVACY: the
+                    // hub grants it only to a device that advertises
+                    // `privacy-mode`, and a grant without it gets a channel
+                    // that refuses, never one that draws a curtain. The owner's
+                    // own gate is read again at every "on" (`privacy.rs`).
+                    "privacy" if !permissions.contains(Permissions::PRIVACY) => {
+                        crate::privacy::attach_refusing(dc, session_id, "not_granted")
+                    }
+                    "privacy" => match privacy_ctx.get() {
+                        Some(ctx) => crate::privacy::attach(dc, ctx.clone()),
+                        None => crate::privacy::attach_refusing(dc, session_id, "unavailable"),
                     },
                     "video-bytes" => {
                         // Phase Y.3 stash. The media pump (when caps
@@ -1388,6 +1408,7 @@ impl AgentPeer {
             viewer_report: viewer_report.clone(),
             #[cfg(feature = "recording")]
             record_ctx,
+            privacy_ctx,
             session_end: {
                 construction_guard.disarm();
                 session_end
@@ -1402,6 +1423,13 @@ impl AgentPeer {
     #[cfg(feature = "recording")]
     pub fn set_record_ctx(&self, ctx: crate::recording::remote::SessionCtx) {
         let _ = self.record_ctx.set(ctx);
+    }
+
+    /// FR-99 P1b — give this session's `privacy` channel what it needs. Call
+    /// before [`Self::handle_offer`]; a channel that opens without it refuses
+    /// every request as `unavailable`.
+    pub fn set_privacy_ctx(&self, ctx: crate::privacy::PrivacyCtx) {
+        let _ = self.privacy_ctx.set(ctx);
     }
 
     /// Wave 2 — a telemetry sample for `rc:session.stats`.
@@ -2490,10 +2518,19 @@ async fn media_pump(
             }
             Ok(None) => {
                 frames_empty += 1;
-                // FR-93 P3e — the display is off: the controller is told, and
-                // no keepalive re-encodes the last frame (a decoded frame
-                // would clear the viewer's notice).
+                // FR-93 P3e — the display is off (P5f: this user's session is
+                // in the background): the controller is told, and no keepalive
+                // re-encodes the last frame (a decoded frame would clear the
+                // viewer's notice).
                 if capture_wait.hold(capturer.waits_for(), session_id, &control_dc) {
+                    // P5f — and the pump stays abortable. Mutter's frame wait
+                    // blocks in place and never yields, so without this the
+                    // loop never reached an await that yields: a viewer that
+                    // left during the wait left its pump running, holding
+                    // the screencast (GNOME's sharing indicator up) and the
+                    // shared pipeline, which took each new viewer on as a
+                    // follower of a pump that sent nothing.
+                    tokio::task::yield_now().await;
                     continue;
                 }
                 // Log every ~5s worth of empty polls so an idle desktop is
@@ -3915,10 +3952,19 @@ async fn media_pump_vp9_444_dc(
                 arc
             }
             Ok(None) => {
-                // FR-93 P3e — the display is off: the controller is told, and
-                // no keepalive re-encodes the last frame (a decoded frame
-                // would clear the viewer's notice).
+                // FR-93 P3e — the display is off (P5f: this user's session is
+                // in the background): the controller is told, and no keepalive
+                // re-encodes the last frame (a decoded frame would clear the
+                // viewer's notice).
                 if capture_wait.hold(capturer.waits_for(), session_id, &control_dc) {
+                    // P5f — and the pump stays abortable. Mutter's frame wait
+                    // blocks in place and never yields, so without this the
+                    // loop never reached an await that yields: a viewer that
+                    // left during the wait left its pump running, holding
+                    // the screencast (GNOME's sharing indicator up) and the
+                    // shared pipeline, which took each new viewer on as a
+                    // follower of a pump that sent nothing.
+                    tokio::task::yield_now().await;
                     continue;
                 }
                 if last_capture_at.elapsed() >= IDLE_KEEPALIVE {
@@ -4980,6 +5026,8 @@ fn media_waiting_payload(wait: crate::capture::OpenWait) -> String {
         WaitFor::Unlock => ("screen_unlock", MEDIA_WAITING_HINT_UNLOCK),
         // FR-93 P3e — a display the compositor switched off (DRM).
         WaitFor::DisplayWake => ("display_wake", MEDIA_WAITING_HINT_WAKE),
+        // FR-93 P5f — this user's session in the background (a user switch).
+        WaitFor::SessionAway => ("session_away", MEDIA_WAITING_HINT_AWAY),
     };
     format!(
         r#"{{"t":"rc:media-waiting","for":"{for_}","waits_ms":{},"hint":"{hint}"}}"#,
@@ -5030,6 +5078,17 @@ const MEDIA_WAITING_HINT_WAKE: &str = "This computer's display is off: it went t
      mouse or pressing a key wakes it, from this viewer when it controls the computer, or at the \
      computer itself; the picture comes back by itself.";
 
+/// FR-93 P5f — the hint while this user's session is in the background. A
+/// per-user install shares only its own user's session, and it is switched
+/// back at the computer.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+const MEDIA_WAITING_HINT_AWAY: &str = "This computer is showing the login screen or another user's \
+     session. This install shares only its own user's session, so the picture comes back by itself \
+     when that session is on screen again.";
+
 /// FR-93 P2d-2 kill switch `ROOMLERD_MEDIA_WAITING=0`: no `rc:media-waiting`
 /// is sent, and the viewer behaves as before P2d-2. P3e's pumps then keep
 /// their keepalives through a dark display too, as before P3e: with nothing
@@ -5043,10 +5102,11 @@ fn media_waiting_enabled() -> bool {
 }
 
 /// FR-93 P3e — a running capture that waits on its host (a display switched
-/// off). The controller is told once per wait, and again before the last
-/// telling runs out, so the notice outlives a blank of any length; while it
-/// waits the pump sends no keepalive, because the viewer clears its notice at
-/// the first decoded frame and a keepalive would be one.
+/// off; P5f: this user's session in the background). The controller is told
+/// once per wait, and again before the last telling runs out, so the notice
+/// outlives a wait of any length; while it waits the pump sends no keepalive,
+/// because the viewer clears its notice at the first decoded frame and a
+/// keepalive would be one.
 #[cfg_attr(
     not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
     allow(dead_code)
@@ -5054,6 +5114,9 @@ fn media_waiting_enabled() -> bool {
 #[derive(Default)]
 struct CaptureWait {
     told: Option<(crate::capture::WaitFor, std::time::Instant)>,
+    /// FR-93 P5f — a wait not told yet: what for, and since when the pump
+    /// has held, sending nothing.
+    quiet: Option<(crate::capture::WaitFor, std::time::Instant)>,
 }
 
 impl CaptureWait {
@@ -5063,6 +5126,14 @@ impl CaptureWait {
     const TOLD_FOR: Duration = Duration::from_secs(60 * 60);
     /// A wait still going is told again this often.
     const RETELL: Duration = Duration::from_secs(30 * 60);
+    /// FR-93 P5f — how long the pump holds, sending nothing, before it tells
+    /// the controller. The viewer ends a wait at its first watchdog tick (one
+    /// a second) that counted a frame, and the notice travels on the control
+    /// channel while the last frames travel on the video one, so a keepalive
+    /// sent just before the notice could be counted just after it. Measured
+    /// on the lab's GNOME guest: the notice cleared that way, and with the
+    /// keepalives held the viewer re-created the session 10 s later.
+    const QUIET_BEFORE_TELL: Duration = Duration::from_secs(2);
 
     /// After a "no frame": `None` when the capture waits for nothing (the
     /// pump goes on as before, keepalive and all); else what it waits for,
@@ -5074,26 +5145,40 @@ impl CaptureWait {
     ) -> Option<(crate::capture::WaitFor, bool)> {
         let Some(why) = waits else {
             self.told = None;
+            self.quiet = None;
             return None;
         };
         let fresh = matches!(
             self.told,
             Some((w, at)) if w == why && now.saturating_duration_since(at) < Self::RETELL
         );
-        if !fresh {
-            self.told = Some((why, now));
+        if fresh {
+            return Some((why, false));
         }
-        Some((why, !fresh))
+        let since = match self.quiet {
+            Some((w, since)) if w == why => since,
+            _ => {
+                self.quiet = Some((why, now));
+                now
+            }
+        };
+        if now.saturating_duration_since(since) < Self::QUIET_BEFORE_TELL {
+            return Some((why, false));
+        }
+        self.quiet = None;
+        self.told = Some((why, now));
+        Some((why, true))
     }
 
     /// A frame: whatever the capture waited for is over.
     fn on_frame(&mut self) {
         self.told = None;
+        self.quiet = None;
     }
 
     /// The pumps' half: on a "no frame", `true` when the capture waits on its
-    /// host and the controller has been told (now or earlier), so no
-    /// keepalive goes out.
+    /// host (told now, earlier, or once the pump has been quiet for
+    /// [`Self::QUIET_BEFORE_TELL`]), so no keepalive goes out.
     fn hold(
         &mut self,
         waits: Option<crate::capture::WaitFor>,
@@ -5145,8 +5230,10 @@ fn media_waiting_hook(
             %session_id,
             gives_up_in_s = wait.gives_up_in.as_secs(),
             why = ?wait.why,
-            "capture: waiting on the host (a portal dialog, an unlock, a display waking); telling the controller"
+            "capture: waiting on the host (a portal dialog, an unlock, a display waking, a user switch); telling the controller"
         );
+        // FR-93 P5g — one open can wait twice (the switch, then the unlock).
+        let control_dc = control_dc.clone();
         runtime.spawn(async move {
             // Bounded by the wait's own deadline too: past it, the notice
             // would describe a wait that is already over.
@@ -6924,10 +7011,19 @@ async fn media_pump_ffmpeg_dc(
                 // Once idle ≥ IDLE_KEEPALIVE, re-encode the last good frame so
                 // the browser decoder doesn't pause.
                 frames_empty += 1;
-                // FR-93 P3e — the display is off: the controller is told, and
-                // no keepalive re-encodes the last frame (a decoded frame
-                // would clear the viewer's notice).
+                // FR-93 P3e — the display is off (P5f: this user's session is
+                // in the background): the controller is told, and no keepalive
+                // re-encodes the last frame (a decoded frame would clear the
+                // viewer's notice).
                 if capture_wait.hold(capturer.waits_for(), session_id, &control_dc) {
+                    // P5f — and the pump stays abortable. Mutter's frame wait
+                    // blocks in place and never yields, so without this the
+                    // loop never reached an await that yields: a viewer that
+                    // left during the wait left its pump running, holding
+                    // the screencast (GNOME's sharing indicator up) and the
+                    // shared pipeline, which took each new viewer on as a
+                    // follower of a pump that sent nothing.
+                    tokio::task::yield_now().await;
                     continue;
                 }
                 if last_capture_at.elapsed() >= IDLE_KEEPALIVE
@@ -11849,12 +11945,17 @@ mod codec_cap_tests {
         assert_eq!(f, "display_wake");
         assert!(hint.contains("display is off"), "{hint}");
         assert!(hint.contains("wakes it"), "{hint}");
+        // FR-93 P5f — this user's session in the background.
+        let (f, hint, _) = read(WaitFor::SessionAway);
+        assert_eq!(f, "session_away");
+        assert!(hint.contains("another user's"), "{hint}");
+        assert!(hint.contains("comes back by itself"), "{hint}");
     }
 
     /// FR-93 P3e — a capture waiting on its host is told once per wait, told
     /// again before the viewer's deadline runs out, and a frame (or a "no
     /// frame" that waits for nothing) ends the wait, so the next blank is
-    /// told afresh.
+    /// told afresh. P5f — each telling comes after a quiet spell.
     #[test]
     fn a_dark_display_is_told_once_and_again_before_the_notice_runs_out() {
         use super::CaptureWait;
@@ -11862,36 +11963,101 @@ mod codec_cap_tests {
         use std::time::{Duration, Instant};
         let t0 = Instant::now();
         let s = Duration::from_secs;
+        let q = CaptureWait::QUIET_BEFORE_TELL;
         let mut w = CaptureWait::default();
         assert_eq!(
             w.on_empty(None, t0),
             None,
             "an idle screen keeps its keepalives"
         );
-        assert_eq!(w.on_empty(Some(DisplayWake), t0), Some((DisplayWake, true)));
         assert_eq!(
-            w.on_empty(Some(DisplayWake), t0 + s(1)),
+            w.on_empty(Some(DisplayWake), t0),
+            Some((DisplayWake, false)),
+            "held at once, not told yet"
+        );
+        assert_eq!(
+            w.on_empty(Some(DisplayWake), t0 + q),
+            Some((DisplayWake, true))
+        );
+        assert_eq!(
+            w.on_empty(Some(DisplayWake), t0 + q + s(1)),
             Some((DisplayWake, false)),
             "told once"
         );
-        assert!(CaptureWait::RETELL < CaptureWait::TOLD_FOR);
-        let later = t0 + CaptureWait::RETELL;
+        assert!(CaptureWait::RETELL + q < CaptureWait::TOLD_FOR);
+        let later = t0 + q + CaptureWait::RETELL;
         assert_eq!(
             w.on_empty(Some(DisplayWake), later),
+            Some((DisplayWake, false))
+        );
+        assert_eq!(
+            w.on_empty(Some(DisplayWake), later + q),
             Some((DisplayWake, true)),
             "told again before the viewer's deadline"
         );
         w.on_frame();
+        let after = later + q + s(1);
         assert_eq!(
-            w.on_empty(Some(DisplayWake), later + s(1)),
+            w.on_empty(Some(DisplayWake), after),
+            Some((DisplayWake, false))
+        );
+        assert_eq!(
+            w.on_empty(Some(DisplayWake), after + q),
             Some((DisplayWake, true)),
             "a blank after a frame is told afresh"
         );
-        assert_eq!(w.on_empty(None, later + s(2)), None);
+        assert_eq!(w.on_empty(None, after + q + s(1)), None);
+        let again = after + q + s(2);
         assert_eq!(
-            w.on_empty(Some(DisplayWake), later + s(3)),
+            w.on_empty(Some(DisplayWake), again),
+            Some((DisplayWake, false))
+        );
+        assert_eq!(
+            w.on_empty(Some(DisplayWake), again + q),
             Some((DisplayWake, true)),
             "and after a no-frame that waited for nothing"
+        );
+    }
+
+    /// FR-93 P5f — the pump holds at once and tells only after a quiet spell,
+    /// so the frames it sent before the wait are counted by the viewer before
+    /// the notice arrives. A frame inside the spell means the wait is over,
+    /// and the next one starts its own spell.
+    #[test]
+    fn a_wait_is_told_only_after_a_quiet_spell() {
+        use super::CaptureWait;
+        use crate::capture::WaitFor::{DisplayWake, SessionAway};
+        use std::time::Instant;
+        let t0 = Instant::now();
+        let q = CaptureWait::QUIET_BEFORE_TELL;
+        let mut w = CaptureWait::default();
+        assert_eq!(
+            w.on_empty(Some(SessionAway), t0),
+            Some((SessionAway, false))
+        );
+        assert_eq!(
+            w.on_empty(Some(SessionAway), t0 + q / 2),
+            Some((SessionAway, false)),
+            "held, not told"
+        );
+        w.on_frame();
+        assert_eq!(
+            w.on_empty(Some(SessionAway), t0 + q),
+            Some((SessionAway, false)),
+            "a frame started the spell again"
+        );
+        assert_eq!(
+            w.on_empty(Some(SessionAway), t0 + q + q / 2),
+            Some((SessionAway, false))
+        );
+        assert_eq!(
+            w.on_empty(Some(DisplayWake), t0 + q + q),
+            Some((DisplayWake, false)),
+            "another wait starts its own spell"
+        );
+        assert_eq!(
+            w.on_empty(Some(DisplayWake), t0 + q * 3),
+            Some((DisplayWake, true))
         );
     }
 

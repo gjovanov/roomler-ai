@@ -708,7 +708,13 @@ pub async fn run(
     let (consent_tx, mut consent_rx) = mpsc::channel::<(String, bool)>(4);
     let indicator =
         match ViewerIndicator::new(kill_tx.clone(), rc_sessions.clone(), consent_tx.clone()) {
-            Ok(v) => v,
+            Ok(v) => {
+                // FR-99 — the overlay that draws a privacy curtain is running,
+                // so the device may say a curtain is possible here.
+                #[cfg(all(target_os = "windows", feature = "viewer-indicator"))]
+                crate::privacy::set_overlay_up(true);
+                v
+            }
             Err(e) => {
                 warn!(%e, "viewer-indicator init failed; continuing without overlay");
                 // FR-27 — an overlay that could not start must NOT also cost the
@@ -1350,6 +1356,9 @@ async fn connect_once(
     // FR-93 P2b — and the desktop brief it carried, so a login, a logout or
     // the greeter reaches the server within a beat.
     let mut last_announced_desktop = hello_caps.desktop.clone();
+    // FR-99 P1b — and the privacy words it carried, read off the hello itself
+    // so a switch flipped since `stub_caps` ran is still news on the next beat.
+    let mut last_announced_privacy = privacy_words_in(&hello_caps.rpc);
     let hello = ClientMsg::AgentHello {
         machine_name: cfg.machine_name.clone(),
         os: detect_os(),
@@ -1904,12 +1913,19 @@ async fn connect_once(
                 let exec_system_now = crate::exec_service::advertised_for(&cfg.agent_id);
                 let ssh_system_now =
                     crate::ssh_service::advertised_for(&cfg.agent_id, cfg.ssh_enabled);
+                // FR-99 P1b — the owner's privacy switch is live: an OFF must
+                // stop the hub granting PRIVACY within a beat.
+                let privacy_now: Vec<String> = crate::privacy::current_words()
+                    .into_iter()
+                    .map(|w| w.wire().to_string())
+                    .collect();
                 let caps = if caps_now == last_announced_permissions
                     && record_now == last_announced_record
                     && keep_busy_now == last_announced_keep_busy
                     && desktop_now == last_announced_desktop
                     && exec_system_now == last_announced_exec_system
                     && ssh_system_now == last_announced_ssh_system
+                    && privacy_now == last_announced_privacy
                 {
                     None
                 } else {
@@ -1919,6 +1935,7 @@ async fn connect_once(
                     last_announced_desktop = desktop_now;
                     last_announced_exec_system = exec_system_now;
                     last_announced_ssh_system = ssh_system_now;
+                    last_announced_privacy = privacy_now;
                     // Our own caps AS THE HELLO BUILT THEM — the server replaces
                     // its stored blob with this, so anything the hello carried
                     // (`multi_org` `tun`, `record`) must be here too — with the
@@ -2991,11 +3008,22 @@ async fn handle_server_msg(
                 // Wayland (neither exposes `wlr-layer-shell` to arbitrary
                 // clients), or in a build without the per-OS feature — and
                 // `show_prompt` says which by returning false.
+                //
+                // FR-99 — a grant that may cover the screen says so, on every
+                // surface, in the line the person reads before deciding; and
+                // only when this device would act on it.
+                let privacy_line = crate::privacy::consent_line(
+                    permissions,
+                    crate::privacy::device_allowed(),
+                    crate::privacy::curtain_possible(),
+                )
+                .unwrap_or_default()
+                .to_string();
                 let native = indicator.show_prompt(crate::indicator::PromptView {
                     session_hex: session_hex.clone(),
                     title: "Remote control request".into(),
                     lead: format!("{controller_name} is requesting to control this device."),
-                    detail: String::new(),
+                    detail: privacy_line.clone(),
                     permissions: permissions.wire_names(),
                     org: asking_org.clone().unwrap_or_default(),
                     expires_at: std::time::Instant::now() + host_window,
@@ -3004,7 +3032,7 @@ async fn handle_server_msg(
                     kind: crate::consent::PromptKind::RemoteControl,
                     asked_by: &controller_name,
                     permissions: permissions.wire_names(),
-                    detail: String::new(),
+                    detail: privacy_line,
                     // The marker is written EITHER WAY — it is the
                     // machine-readable record that a decision is outstanding,
                     // and `roomlerd consent --list` must show a
@@ -3296,6 +3324,16 @@ async fn handle_server_msg(
                     companion: crate::recording::remote::Companion::System,
                 });
             }
+
+            // FR-99 P1b — the `privacy` channel's context, BEFORE the answer
+            // for the same reason. The curtain is THIS process's overlay: the
+            // one in the console session, whose screen it covers.
+            peer.set_privacy_ctx(crate::privacy::PrivacyCtx {
+                session_id,
+                controller_name: banner_name.clone(),
+                host: std::sync::Arc::new(indicator.clone()),
+                possible: crate::privacy::curtain_possible,
+            });
 
             let answer_sdp = match peer.handle_offer(sdp).await {
                 Ok(s) => s,
@@ -4560,6 +4598,21 @@ async fn handle_server_msg(
             }
         }
 
+        // FR-90 P2g-1 — the session purged from this device, its own copy and
+        // what its account holds of it, answered per part on this connection.
+        ServerMsg::HivePurge {
+            purge_id,
+            session_id,
+        } => {
+            #[cfg(hive_host)]
+            crate::hive::handle_purge(purge_id, session_id, ctx.is_primary, outbound_tx.clone());
+            #[cfg(not(hive_host))]
+            {
+                let _ = purge_id;
+                debug!(session = %session_id, "rc:hive.purge ignored — this build does not run agent sessions");
+            }
+        }
+
         // FR-90 P2e-2 — the server's word, on THIS connection, that this
         // device holds the session at that fence: a leased run calls the model
         // again, and a leased session it hosted launches.
@@ -5697,7 +5750,25 @@ fn stub_caps(multi_org_tun: bool) -> AgentCaps {
     // refresher's cache (never logind on this path). Live, like the words
     // above: the heartbeat re-announces when it changes.
     caps.desktop = crate::desktop_brief::current();
+    // FR-99 P1b — `privacy-available` where a curtain is possible here, and
+    // `privacy-mode` only while the owner allows it too. Live like the record
+    // words: the owner's switch moves the second, and the overlay coming up
+    // after `detect()` ran moves both. The heartbeat re-announces a change.
+    caps.rpc.extend(
+        crate::privacy::current_words()
+            .into_iter()
+            .map(|w| w.wire().to_string()),
+    );
     caps
+}
+
+/// FR-99 P1b — the `privacy-*` words in an `rpc` list, in order: what the
+/// heartbeat compares to decide whether the owner's switch is news.
+fn privacy_words_in(rpc: &[String]) -> Vec<String> {
+    rpc.iter()
+        .filter(|w| *w == RpcCap::PrivacyMode.wire() || *w == RpcCap::PrivacyAvailable.wire())
+        .cloned()
+        .collect()
 }
 
 /// FR-90 P2c-3 — take the replica words out of a secondary org's caps: a

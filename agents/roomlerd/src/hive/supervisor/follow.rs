@@ -172,6 +172,13 @@ pub(crate) struct Follows {
 }
 
 impl Follows {
+    /// FR-90 P2g-1 — `session` was purged here: no ask, follow or wait for
+    /// it is kept, and none is queued.
+    pub(super) fn forget(&mut self, session: ObjectId) {
+        self.map.remove(&session);
+        self.queue.retain(|s| *s != session);
+    }
+
     /// Sessions asked for or followed now: what the slots count.
     fn active(&self) -> usize {
         self.map

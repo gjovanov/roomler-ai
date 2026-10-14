@@ -1006,9 +1006,91 @@ where
     ))
 }
 
+/// FR-90 P2g — how one part of a purge went on a device, as its
+/// `rc:hive.purge_ack` says it: the daemon's own copy (`store`), or what the
+/// session's account holds of it (`account`). Each word has its own fix, so
+/// none is folded into another: a part `failed` stays pending at the server,
+/// its reason with it, and the purge is sent again.
+///
+/// ⚠️ Decoded LENIENTLY ([`purge_part_lenient`]): an unknown word is
+/// [`Self::Failed`]. It must never read as done: a purge would be complete
+/// on a word this server does not know, and the copy kept.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HivePurgePart {
+    /// Deleted, now or by an earlier delivery of the same purge.
+    Done,
+    /// The device held nothing of it there.
+    NotThere,
+    /// It could not be deleted; why is the acknowledgement's `detail`.
+    Failed,
+}
+
+impl HivePurgePart {
+    /// The spelling on the wire and in the audit. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::NotThere => "not_there",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Every word this build knows.
+    pub const ALL: [HivePurgePart; 3] = [Self::Done, Self::NotThere, Self::Failed];
+
+    /// Whether the part needs nothing more from the device.
+    pub const fn closed(self) -> bool {
+        !matches!(self, Self::Failed)
+    }
+}
+
+/// Lenient decoder for a purge part: a word this build does not know, or no
+/// word at all, is [`HivePurgePart::Failed`].
+pub(crate) fn purge_part_lenient<'de, D>(de: D) -> Result<HivePurgePart, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let serde_json::Value::String(word) = serde_json::Value::deserialize(de)? else {
+        return Ok(HivePurgePart::Failed);
+    };
+    Ok(HivePurgePart::deserialize(
+        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(word.as_str()),
+    )
+    .unwrap_or(HivePurgePart::Failed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WIRE LOCK — FR-90 P2g: the purge's part words; a word a newer device
+    /// sends, or none, is `failed`, never `done`: a purge must not read as
+    /// complete on a word this build does not know.
+    #[test]
+    fn purge_part_words_are_locked_and_an_unknown_one_is_failed() {
+        let words: Vec<&str> = HivePurgePart::ALL.iter().map(|p| p.as_str()).collect();
+        assert_eq!(words, ["done", "not_there", "failed"]);
+        for p in HivePurgePart::ALL {
+            assert_eq!(
+                serde_json::to_value(p).unwrap(),
+                serde_json::Value::String(p.as_str().into())
+            );
+        }
+        #[derive(Deserialize)]
+        struct A {
+            #[serde(deserialize_with = "purge_part_lenient")]
+            store: HivePurgePart,
+        }
+        let a = |j: &str| serde_json::from_str::<A>(j).unwrap().store;
+        assert_eq!(a(r#"{"store":"done"}"#), HivePurgePart::Done);
+        assert_eq!(a(r#"{"store":"not_there"}"#), HivePurgePart::NotThere);
+        assert_eq!(a(r#"{"store":"vanished"}"#), HivePurgePart::Failed);
+        assert_eq!(a(r#"{"store":7}"#), HivePurgePart::Failed);
+        assert_eq!(a(r#"{"store":null}"#), HivePurgePart::Failed);
+        assert!(HivePurgePart::Done.closed() && HivePurgePart::NotThere.closed());
+        assert!(!HivePurgePart::Failed.closed());
+    }
 
     /// WIRE LOCK — the approval words, and a newer device's word is unnamed,
     /// never an error that drops the frame.

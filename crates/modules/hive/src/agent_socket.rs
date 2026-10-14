@@ -331,6 +331,16 @@ impl AgentMsgHandler for HiveAgentSocket {
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
             | ClientMsg::HiveViewClosed { .. }) => Report::View(view),
+            // P2g-1 — the devices answer a purge; this server sends none yet
+            // (its half is P2g-2), so an answer has no purge to settle.
+            ClientMsg::HivePurgeAck {
+                purge_id,
+                session_id,
+                ..
+            } => {
+                debug!(agent_id = %ctx.agent_id, purge = %purge_id, session = %session_id, "hive: a purge answer, with no purge outstanding — dropped");
+                return None;
+            }
             other => return Some(other),
         };
         let tx = self.conns.get(&ctx.conn_id).map(|e| e.value().clone());

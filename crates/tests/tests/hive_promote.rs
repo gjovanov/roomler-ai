@@ -426,9 +426,10 @@ async fn scenario() {
     // P2f-1a — every build that runs agent sessions takes part in a
     // teleport, the device in this process and the one in its own alike.
     // P2f-3a — and starts a fork. P2f-4a — and, on Unix, where terminals
-    // are adopted, makes an ended one a managed session.
+    // are adopted, makes an ended one a managed session. P2g-1 — and purges
+    // a session, answering per part.
     for (name, id) in [("A", &a), ("B", &b)] {
-        for verb in ["hive-teleport", "hive-fork", "hive-manage"] {
+        for verb in ["hive-teleport", "hive-fork", "hive-manage", "hive-purge"] {
             assert!(advertises(&app, id, verb).await, "{name} advertises {verb}");
         }
     }

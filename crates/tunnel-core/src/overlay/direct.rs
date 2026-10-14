@@ -1118,6 +1118,25 @@ pub async fn gather_srflx(
 /// following a real DNS change within one TTL.
 const STUN_DNS_TTL: Duration = Duration::from_secs(300);
 
+/// #2187 — the longest a STUN/TURN name lookup may hold its caller. The
+/// carrier plane resolves these inline on the overlay loop, and with an exit's
+/// DNS steer in force a dead exit made each lookup wait out the OS resolver's
+/// whole retry schedule. Field, a Windows exit client: two lookups, 48 s of
+/// stalled loop (`handler ran long … stage="rebuild_direct_plane"
+/// ms=48176`), with every re-pin and carrier sweep queued behind it. The
+/// lookup itself keeps running on tokio's blocking pool; only the WAIT is
+/// bounded.
+const STUN_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// #2187 — when a fresh lookup fails, the last good answer is served and
+/// trusted for this much longer. Coturn's addresses change on a timescale of
+/// days, so through a DNS outage a known vantage beats none. Failing again
+/// at every pass would otherwise cost each pass a full [`STUN_DNS_TIMEOUT`].
+/// A name that never resolved has nothing to serve and is retried on every
+/// pass, as before.
+const STUN_DNS_STALE_GRACE: Duration = Duration::from_secs(60);
+
+/// `host:port` → (trusted until, the addresses it resolved to).
 type StunDnsCache =
     std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<SocketAddr>)>>;
 static STUN_DNS_CACHE: std::sync::OnceLock<StunDnsCache> = std::sync::OnceLock::new();
@@ -1144,32 +1163,46 @@ fn stun_hostport(url: &str) -> &str {
 /// ⚠️ Only **successful, non-empty** results are cached: a DNS failure must be
 /// retried on the next probe pass, not remembered for the whole TTL — a node
 /// that lost DNS for one pass would otherwise stay vantage-less for 5 minutes.
+/// #2187 — the wait is bounded by [`STUN_DNS_TIMEOUT`], and a failure falls
+/// back to the last good answer for [`STUN_DNS_STALE_GRACE`].
 async fn lookup_host_cached(hostport: &str) -> Vec<SocketAddr> {
     let cache = STUN_DNS_CACHE.get_or_init(StunDnsCache::default);
-    // Scoped so the guard is dropped before the await below.
-    let hit = {
-        cache.lock().ok().and_then(|map| {
-            map.get(hostport)
-                .filter(|(at, _)| at.elapsed() < STUN_DNS_TTL)
-                .map(|(_, addrs)| addrs.clone())
-        })
-    };
+    let now = std::time::Instant::now();
+    // Scoped so the guard is dropped before the await below. An entry past its
+    // time is kept as the fallback.
+    let (hit, stale) = cache
+        .lock()
+        .ok()
+        .and_then(|map| map.get(hostport).cloned())
+        .map_or((None, None), |(until, addrs)| {
+            if now < until {
+                (Some(addrs), None)
+            } else {
+                (None, Some(addrs))
+            }
+        });
     if let Some(addrs) = hit {
         return addrs;
     }
-    let addrs: Vec<SocketAddr> = match lookup_host(hostport).await {
-        Ok(it) => it.collect(),
-        Err(_) => return Vec::new(),
+    let fresh: Vec<SocketAddr> =
+        match tokio::time::timeout(STUN_DNS_TIMEOUT, lookup_host(hostport)).await {
+            Ok(Ok(it)) => it.collect(),
+            Ok(Err(_)) | Err(_) => Vec::new(),
+        };
+    let (keep, trust) = if !fresh.is_empty() {
+        (fresh, STUN_DNS_TTL)
+    } else if let Some(stale) = stale {
+        (stale, STUN_DNS_STALE_GRACE)
+    } else {
+        return Vec::new();
     };
-    if !addrs.is_empty()
-        && let Ok(mut map) = cache.lock()
-    {
+    if let Ok(mut map) = cache.lock() {
         map.insert(
             hostport.to_string(),
-            (std::time::Instant::now(), addrs.clone()),
+            (std::time::Instant::now() + trust, keep.clone()),
         );
     }
-    addrs
+    keep
 }
 
 pub async fn resolve_stun_server(stun_urls: &[String], exclude: &[Ipv4Addr]) -> Option<SocketAddr> {
@@ -2451,6 +2484,39 @@ mod tests {
         assert!(
             !cached_anything,
             "a failed resolution must not be inserted into the cache"
+        );
+    }
+
+    /// #2187 — a vantage that resolved once outlives a DNS outage. With the
+    /// fresh lookup failing, the last good answer is served, and it is
+    /// trusted for the grace window only, not for a whole TTL.
+    #[tokio::test]
+    async fn a_stale_vantage_is_served_through_a_dns_outage() {
+        // `.invalid` never resolves: the outage.
+        let host = "fr2187-stale-test.invalid:3478";
+        let good: SocketAddr = "203.0.113.9:3478".parse().unwrap();
+        let cache = STUN_DNS_CACHE.get_or_init(StunDnsCache::default);
+        // Resolved once; its time has just run out.
+        cache
+            .lock()
+            .unwrap()
+            .insert(host.to_string(), (std::time::Instant::now(), vec![good]));
+
+        assert_eq!(
+            lookup_host_cached(host).await,
+            vec![good],
+            "the last good answer, not nothing"
+        );
+        let until = cache
+            .lock()
+            .unwrap()
+            .get(host)
+            .map(|(until, _)| *until)
+            .expect("still cached");
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            left > Duration::ZERO && left <= STUN_DNS_STALE_GRACE,
+            "trusted for the grace window, not a whole TTL: {left:?}"
         );
     }
 

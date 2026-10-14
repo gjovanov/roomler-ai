@@ -324,6 +324,42 @@ flowchart LR
 | On Windows the uplink is read from a FIB snapshot, not `GetBestRoute2` | `winroute::exemption_view` | The exit's `/1`s out-match any default toward the unspecified address. The snapshot ranks routes as the OS does (longest prefix covering it, then route plus interface metric, connected interfaces only), with our adapters left out |
 | A Windows re-pin removes the old route once the new one is in | `add_host_exemption` (Windows) via `host_ledger::pin_record` | Windows keys a route by (interface, prefix, next hop), so the old pin would stay beside the new one and could still win the lookup. Linux's `ip route replace` supersedes it in one step |
 | A delete removes the route as it was installed | `del_host_exemption` via `host_ledger::pin_record` | A pin still on an uplink the host has left must come out too |
+| (N14) While an exit is active, the network monitor also reads the uplink **beneath** it, and a move there is a Major | `netstate::uplink_beneath_own` via `tun::uplink_beneath`; off: `ROOMLERD_OVERLAY_NETMON_UPLINK=0` | netstate reads "the default" by looking up a far address, and the `/1`s answer that with our own TUN. So a network change under the exit was a Minor, and no control-WS probe or carrier revalidation ran. On the field's Linux client the old WS died with `eth0`, and only the keepalive's second strike found it, 56 s in |
+| (N14) Our own exit coming or going is still a Major, but it does not spend the flap cooldown | `netstate::major_demoted`; the delta's `own_capture_only` | The lookup moving onto or off our adapter, with the uplink beneath unchanged and no address lost, moves no socket. As an ordinary Major it opened the 120 s window, and the field's uplink move 13 s later was demoted to Minor, `uplink=eth1` and all. Now a Major like that is damped only by a recent Major of its own kind (so a flapping exit still cannot storm), and its activation no longer swallows a real move |
+
+N14 in one picture. The pins already followed the uplink (N12); the network
+monitor did not, so nothing told the control WebSocket that its socket had gone:
+
+```mermaid
+sequenceDiagram
+    participant OS as OS routing table
+    participant N as netstate
+    participant S as signaling (control WS)
+    participant O as overlay runtime
+    OS-->>N: route / link burst (a NIC down, Wi-Fi to Ethernet)
+    N->>N: lookup of a far address → our TUN (the /1s), unchanged
+    N->>N: N14 — on our adapter, so also read the /0 beneath it<br/>(Windows FIB view · Linux main table · macOS route -n get default)
+    alt the uplink beneath moved
+        N-->>S: Major → probe the control WS now (5 s verdict, then reconnect)
+        N-->>O: Major → drop stale path evidence, revalidate every carrier
+    else nothing moved beneath
+        N-->>O: Minor → route wave only
+    end
+```
+
+⚠️ macOS needs no table walk. `route -n get default` answers with the `/0` itself
+while our `/1`s are in, whereas a lookup of a far address answers with a `/1`.
+Measured on a tart VM with `/1`s on another interface, 2026-10-14. P1a's uplink
+re-read relies on the same behaviour.
+
+AC17 field cells (released 0.4.134, then a P0e candidate; FR-97 §8):
+
+| Cell | 0.4.134 | P0e |
+|---|---|---|
+| Linux: `eth0` down, default via `eth1` | `active` with **no pins at all** for 75 s, then withheld for good (`Nexthop has invalid gateway`) | re-pinned through `eth1` in **5 s**; `active` throughout |
+| Windows: the uplink NIC disabled | withheld for good (`Element not found`), pinning through the adapter it captured at bring-up | re-pinned through the other NIC in **3 s**; `active` throughout |
+| `kill -9`, then the uplink moves with the old NIC still up, then a start | Linux: two pins left through `eth0`. Windows: the server's pin left through the old NIC | none left (the boot purge); every pin through the new uplink |
+| The control WS across the Linux switch | dead until the keepalive, **56 s** | the same 56 s before N14 |
 
 ## Platform support
 
@@ -447,6 +483,17 @@ sequenceDiagram
   dies. The reconcile now re-asserts the split-default every time it finds it
   missing (`route_guard::split_default_missing`), as it always did for the v6
   half (`set_v6_exit`), and says so in a WARN.
+- **The daemon's own name lookups follow the exit's DNS steer too.** When the
+  exit's DNS stops answering, every lookup waits out the OS resolver's whole
+  retry schedule. The carrier plane resolves its STUN names inline on the
+  overlay loop, so a network change on such a client stalled the loop for 48 s
+  (`handler ran long … stage="rebuild_direct_plane" ms=48176`, then
+  `no resolvable STUN server`). Every re-pin and carrier sweep waited behind
+  it ([#2187](https://github.com/gjovanov/roomler-ai/issues/2187)). The wait
+  for a STUN name is now bounded at 5 s (`STUN_DNS_TIMEOUT`). A name that
+  resolved before keeps serving its last good answer through the outage,
+  trusted 60 s at a time (`STUN_DNS_STALE_GRACE`). The lookups still go
+  through the steer; only the stall is gone.
 - **Consent** is currently auto-granted on the agent (see the remote-control
   known issues); an exit node forwards for any approved client in its tenant.
 - **Approval requires a re-join.** After the admin toggle, the exit node's

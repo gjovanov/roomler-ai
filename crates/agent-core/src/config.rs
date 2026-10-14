@@ -1449,6 +1449,19 @@ pub struct AgentConfig {
     /// idle sleep.
     #[serde(default = "default_true")]
     pub keep_busy_enabled: bool,
+    /// FR-99 — let a remote controller cover this screen with a privacy
+    /// curtain during a session: the person in front of it sees a notice, the
+    /// controller still sees the desktop. Default OFF. The agent advertises
+    /// `privacy-mode` only while this is on, so the server never grants
+    /// `Permissions::PRIVACY` for a device whose owner did not opt in — and the
+    /// agent re-reads it at every "on" all the same. Read LIVE: off also takes
+    /// a curtain that is up down.
+    ///
+    /// ⚠️ Device-owned: structurally absent from `DesiredConfig` (the
+    /// `privacy_` twin of the `record_` prefix test), and set over the
+    /// LocalAPI only by the person at the console, whose screen it covers.
+    #[serde(default)]
+    pub privacy_mode_allowed: bool,
     /// B2 — score-driven demotion of degraded-but-live direct carriers
     /// (`ROOMLERD_OVERLAY_DEMOTE`): `off` | `shadow` (compute +
     /// count, never act — the built-in default) | `on` (voluntary MBB
@@ -2477,6 +2490,7 @@ pub fn test_fixture() -> AgentConfig {
         record_remote_enabled: false,
         record_remote_audio: false,
         keep_busy_enabled: true,
+        privacy_mode_allowed: false,
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,

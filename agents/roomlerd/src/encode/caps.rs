@@ -1718,6 +1718,15 @@ fn rpc_caps() -> Vec<String> {
     // device's start gates still decide, `hive_enabled` first.
     #[cfg(all(hive_host, unix))]
     caps.push(RpcCap::HiveManage);
+    // FR-90 P2g-1 — and purges a session on `rc:hive.purge`, answering per
+    // part: its own copy, then as the session's account its state directory
+    // and its checkpoints' refs. A property of the BUILD, on every platform
+    // that runs sessions.
+    #[cfg(hive_host)]
+    caps.push(RpcCap::HivePurge);
+    // ⚠️ FR-99's `privacy-*` words are NOT here: this list is memoized at boot
+    // (`detect()`), and those follow the owner's live gate and the overlay
+    // coming up. `signaling::stub_caps` adds them at every announcement.
     caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
 

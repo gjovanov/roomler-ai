@@ -303,6 +303,21 @@ impl AdoptedFile {
         }
     }
 
+    /// FR-90 P2g-1 — `session` was purged here: no longer among the ended
+    /// terminal sessions, which nothing makes managed now. A terminal that
+    /// still runs it stays held, stopped (`adopt_stop`), so its later hooks
+    /// offer it no more. Whether anything of it was kept.
+    pub(super) fn purged(&mut self, session: &str) -> bool {
+        let before = (self.ended.len(), self.ended_terminals.len());
+        self.ended.retain(|s| s != session);
+        self.ended_terminals.retain(|t| t.session != session);
+        let changed = before != (self.ended.len(), self.ended_terminals.len());
+        if changed {
+            self.save();
+        }
+        changed
+    }
+
     fn save(&self) {
         let Some(path) = &self.path else { return };
         let doc = Doc {
@@ -935,6 +950,15 @@ impl Supervisor {
             Some("mirroring stopped; the terminal session goes on".into()),
         );
         true
+    }
+
+    /// FR-90 P2g-1 — `session` is purged here: a terminal that mirrors it is
+    /// mirrored no more (the terminal goes on), and what was kept of its
+    /// ended terminal goes. Whether it was adopted here at all.
+    pub(crate) fn adopt_purge(&self, session: ObjectId) -> bool {
+        let mirrored = self.adopt_stop(session, u64::MAX);
+        let kept = self.adopted_lock().purged(&session.to_hex());
+        mirrored || kept
     }
 
     /// The terminals that closed without a word (killed, a reboot of their
@@ -1870,6 +1894,50 @@ mod tests {
             &r.root.path().join("home"),
             &sid.to_hex(),
         ))
+    }
+
+    /// FR-90 P2g-1 — an ended terminal session, purged: its mirror goes, and
+    /// so does what this device kept of its terminal, so a start that would
+    /// make it a managed one is refused. The terminal's own history is the
+    /// person's, and stays as it was.
+    #[tokio::test]
+    async fn a_purged_terminal_session_is_never_made_managed() {
+        use roomler_ai_remote_control::hive::HivePurgePart;
+        if me().is_none() {
+            return;
+        }
+        let (mut r, socket) = managing().await;
+        let (mut hook, sid) = adopted(&mut r, &socket).await;
+        end(&mut r, &mut hook, sid).await;
+        let (history, text) = terminal_history(&r);
+        assert!(r.sup.adopted_lock().ended_terminal(&sid.to_hex()).is_some());
+
+        let ack = {
+            let _serial = r.sup.start_lock.lock().await;
+            r.sup.purge(ObjectId::new(), sid).await
+        };
+        assert!(
+            matches!(
+                ack,
+                ClientMsg::HivePurgeAck {
+                    store: HivePurgePart::Done,
+                    account: HivePurgePart::NotThere,
+                    ..
+                }
+            ),
+            "{ack:?}"
+        );
+        assert!(
+            r.sup.adopted_lock().ended_terminal(&sid.to_hex()).is_none(),
+            "what was kept of its terminal went"
+        );
+        let answer = r.sup.start(made_managed(&r, sid), true).await;
+        assert!(answer.refused.is_some(), "never made managed: {answer:?}");
+        assert_eq!(
+            std::fs::read_to_string(&history).unwrap(),
+            text,
+            "the terminal's own history is the person's"
+        );
     }
 
     /// P2f-4a — decision 11's half on the device: an ended terminal session

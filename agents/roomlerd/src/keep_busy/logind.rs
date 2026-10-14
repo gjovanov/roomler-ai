@@ -20,7 +20,7 @@ use std::process::Command;
 
 /// The properties [`show`] asks for — and nothing else, so a systemd that
 /// adds one changes nothing here.
-const PROPS: [&str; 8] = [
+const PROPS: [&str; 9] = [
     "Id",
     "User",
     "Class",
@@ -29,6 +29,7 @@ const PROPS: [&str; 8] = [
     "Display",
     "Type",
     "Desktop",
+    "State",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,12 +47,23 @@ pub struct Session {
     /// FR-93 P2b — the session's desktop as logind names it (`gnome`, `KDE`,
     /// `gdm-greeter`, …); empty becomes `None`.
     pub desktop: Option<String>,
+    /// FR-93 P5g — `active` (signed in and on screen), `online` (signed in,
+    /// in the background) or `closing` (logged out, processes left behind).
+    /// Empty when logind did not say.
+    pub state: String,
 }
 
 impl Session {
     /// A person's session — never the display manager's greeter.
     pub fn is_user(&self) -> bool {
         self.class == "user"
+    }
+
+    /// FR-93 P5g — signed in, while its seat shows another session: a user
+    /// switch, or the login screen put in front of it. Never a session that
+    /// is closing, whose user logged out and left processes behind.
+    pub fn in_background(&self) -> bool {
+        !self.active && self.state == "online"
     }
 }
 
@@ -73,6 +85,7 @@ pub fn parse_show(text: &str) -> Option<Session> {
         display: field("Display").map(str::to_string),
         kind: field("Type").unwrap_or_default().to_string(),
         desktop: field("Desktop").map(str::to_string),
+        state: field("State").unwrap_or_default().to_string(),
     })
 }
 
@@ -186,6 +199,7 @@ mod tests {
                 display: Some(":0".into()),
                 kind: "x11".into(),
                 desktop: None,
+                state: String::new(),
             }
         );
         assert!(s.is_user());
@@ -201,6 +215,26 @@ mod tests {
         assert_eq!(gnome.desktop.as_deref(), Some("gnome"));
         let nameless = parse_show(&format!("{GNOME_X11}Desktop=\n")).unwrap();
         assert_eq!(nameless.desktop, None);
+    }
+
+    /// FR-93 P5g — a session in the background is signed in and not on
+    /// screen; one that is closing (logged out, processes left behind) never
+    /// is, and neither is the one on screen.
+    #[test]
+    fn a_background_session_is_online_and_not_active() {
+        let away = GNOME_X11.replace("Active=yes", "Active=no");
+        let switched = parse_show(&format!("{away}State=online\n")).unwrap();
+        assert_eq!(switched.state, "online");
+        assert!(switched.in_background(), "a user switch");
+        let closing = parse_show(&format!("{away}State=closing\n")).unwrap();
+        assert!(!closing.in_background(), "logged out, processes left");
+        let on_screen = parse_show(&format!("{GNOME_X11}State=active\n")).unwrap();
+        assert!(!on_screen.in_background(), "on screen");
+        let unsaid = parse_show(&away).unwrap();
+        assert!(
+            !unsaid.in_background(),
+            "no State: not known to be signed in"
+        );
     }
 
     /// `LockedHint=yesterday` is not `yes`, and a key that merely starts
@@ -233,6 +267,7 @@ mod tests {
             display: Some(":1".into()),
             kind: "x11".into(),
             desktop: Some("gdm-greeter".into()),
+            state: "active".into(),
         };
         let all = vec![greeter.clone(), user.clone()];
         assert_eq!(pick(&all, Some(":0.0")), Some(&user));
