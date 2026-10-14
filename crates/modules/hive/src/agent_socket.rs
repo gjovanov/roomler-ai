@@ -56,8 +56,8 @@ use dashmap::DashMap;
 use roomler_ai_remote_control::{
     error::Error as HubError,
     hive::{
-        HiveCopyTip, HiveDrainRefusal, HiveJoinRefusal, HiveManifestEntry, HiveRefusal,
-        HiveReplicaManifestEntry, HiveRunState, HiveTurnStatus, hive_limits,
+        HiveCopyTip, HiveDrainRefusal, HiveJoinRefusal, HiveManifestEntry, HivePurgePart,
+        HiveRefusal, HiveReplicaManifestEntry, HiveRunState, HiveTurnStatus, hive_limits,
     },
     signaling::{ClientMsg, ServerMsg},
 };
@@ -135,6 +135,14 @@ enum Report {
         seq: Option<u64>,
         hash: Option<String>,
         refused: Option<HiveDrainRefusal>,
+        detail: Option<String>,
+    },
+    /// P2g-2 — a device's answer to a purge (`rc:hive.purge_ack`).
+    PurgeAck {
+        purge_id: ObjectId,
+        session_id: ObjectId,
+        store: HivePurgePart,
+        account: HivePurgePart,
         detail: Option<String>,
     },
     /// P2d — a stream frame (`rc:hive.replica.want` · `ready` ·
@@ -331,16 +339,21 @@ impl AgentMsgHandler for HiveAgentSocket {
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
             | ClientMsg::HiveViewClosed { .. }) => Report::View(view),
-            // P2g-1 — the devices answer a purge; this server sends none yet
-            // (its half is P2g-2), so an answer has no purge to settle.
+            // P2g-2 — applied only to THIS device's entry of the purge: the
+            // socket names the device, never the frame.
             ClientMsg::HivePurgeAck {
                 purge_id,
                 session_id,
-                ..
-            } => {
-                debug!(agent_id = %ctx.agent_id, purge = %purge_id, session = %session_id, "hive: a purge answer, with no purge outstanding — dropped");
-                return None;
-            }
+                store,
+                account,
+                detail,
+            } => Report::PurgeAck {
+                purge_id,
+                session_id,
+                store,
+                account,
+                detail,
+            },
             other => return Some(other),
         };
         let tx = self.conns.get(&ctx.conn_id).map(|e| e.value().clone());
@@ -374,6 +387,12 @@ impl AgentSocketLifecycle for HiveAgentSocket {
         let conn = ctx.tx.clone();
         tokio::spawn(async move {
             if state.scope.serves(tenant_id) {
+                // P2g-2 — what it must purge goes FIRST, before anything else
+                // it is sent; with the replicaset's switch off, issued purges
+                // wait.
+                if state.replicaset {
+                    crate::purge::reconcile_purges(&state, tenant_id, device_id, &conn).await;
+                }
                 reconcile_on_connect(&state, tenant_id, device_id, &conn).await;
                 // P2c-4 — with the replicaset's switch off, no replica frame
                 // goes at all, for sessions placed while it was on as well: a
@@ -702,6 +721,18 @@ async fn apply_reports(
             } => {
                 crate::promote::on_drained(
                     state, device_id, session_id, fence, seq, hash, refused, detail,
+                )
+                .await
+            }
+            Report::PurgeAck {
+                purge_id,
+                session_id,
+                store,
+                account,
+                detail,
+            } => {
+                crate::purge::on_ack(
+                    state, tenant_id, device_id, purge_id, session_id, store, account, detail,
                 )
                 .await
             }

@@ -478,7 +478,7 @@
     },
     {
       "path": "/api/tenant/{tenant_id}/hive/session/{session_id}",
-      "methods": "GET,HEAD"
+      "methods": "DELETE,GET,HEAD"
     },
     {
       "path": "/api/tenant/{tenant_id}/hive/session/{session_id}/fork",
@@ -499,6 +499,10 @@
     {
       "path": "/api/tenant/{tenant_id}/hive/session/{session_id}/promote",
       "methods": "POST"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/hive/session/{session_id}/purge",
+      "methods": "GET,HEAD"
     },
     {
       "path": "/api/tenant/{tenant_id}/hive/session/{session_id}/stop",
@@ -1337,6 +1341,31 @@
               "tenant_id": 1
             },
             "unique": true
+          }
+        ]
+      },
+      {
+        "collection": "hive_purges",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "devices.device_id": 1,
+              "done_at": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "session_id": 1,
+              "owner_id": 1
+            }
+          },
+          {
+            "key": {
+              "done_at": 1
+            },
+            "expireAfterSeconds": 7776000
           }
         ]
       },
@@ -2989,6 +3018,31 @@
               "tenant_id": 1
             },
             "unique": true
+          }
+        ]
+      },
+      {
+        "collection": "hive_purges",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "devices.device_id": 1,
+              "done_at": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "session_id": 1,
+              "owner_id": 1
+            }
+          },
+          {
+            "key": {
+              "done_at": 1
+            },
+            "expireAfterSeconds": 7776000
           }
         ]
       },

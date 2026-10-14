@@ -19,6 +19,11 @@
 //! ⚠️ P1j — an ADOPTED session has no drivers at all, its owner included:
 //! it runs in a terminal, which holds the harness, so nothing typed here could
 //! reach it. Its owner reads it and names readers; the rest of the table holds.
+//!
+//! ⚠️ P2g-2 — a PURGED session is read by nobody, its owner included: it is
+//! deleted, and its tombstone waits only for its devices to answer. A viewer
+//! grant to it would stream the transcript from a device the purge has not
+//! reached yet.
 
 use bson::oid::ObjectId;
 
@@ -31,6 +36,9 @@ use crate::model::{AgentSession, SessionOrigin};
 /// out of their own session. A session from before rooms (P0b/P0c) is its
 /// owner's alone.
 pub(crate) async fn may_read(state: &HiveState, s: &AgentSession, user: ObjectId) -> bool {
+    if s.purged.is_some() {
+        return false;
+    }
     if !matches!(state.tenants.is_member(s.tenant_id, user).await, Ok(true)) {
         return false;
     }

@@ -676,6 +676,12 @@ impl BrainDao {
     pub async fn snapshot_of(&self, session: ObjectId) -> DaoResult<Option<SessionMemory>> {
         self.memory.find_one(doc! { "_id": session }).await
     }
+
+    /// FR-90 P2g-2 — the session was purged: its snapshot goes with it,
+    /// ahead of its day.
+    pub async fn drop_snapshot(&self, session: ObjectId) -> DaoResult<bool> {
+        Ok(self.memory.hard_delete(doc! { "_id": session }).await? > 0)
+    }
 }
 
 // ─── Routes: `/api/tenant/{tenant_id}/hive/brain` ───────────────────────
