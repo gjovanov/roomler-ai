@@ -170,10 +170,19 @@ impl BillingEventDao {
     /// the webhook and the backfill meet on it; anything else is inserted,
     /// its `event_id` the uniqueness. Either way a second sighting is
     /// [`Recorded::Duplicate`] and changes nothing.
+    ///
+    /// ⚠️ The row's own `_id` stays in the `$setOnInsert` (valid on an
+    /// upsert: it applies only when the row is inserted, so an existing
+    /// row raises no immutable-field error). Every kind's `_id` then comes
+    /// from ONE generator — this process's `ObjectId::new()`, monotonic in
+    /// arrival order — rather than mongod minting the paid invoice's. Rows
+    /// carry Stripe's `ts` in SECONDS, and Stripe sends a subscription's
+    /// `created` and its first `invoice.paid` within one second, so
+    /// same-second rows are ordered by `_id` ([`Self::list`]); with two
+    /// generators that order was a coin flip between their random bytes.
     pub async fn record(&self, row: &BillingEvent) -> DaoResult<Recorded> {
         if row.kind == BillingKind::InvoicePaid {
-            let mut set = bson::to_document(row)?;
-            set.remove("_id");
+            let set = bson::to_document(row)?;
             let r = self
                 .db
                 .collection::<Document>(BILLING_EVENTS)
@@ -212,7 +221,12 @@ impl BillingEventDao {
             .db
             .collection::<Document>(BILLING_EVENTS)
             .find(doc! { "tenant_id": tenant_filter })
-            .sort(doc! { "ts": 1 })
+            // A total order: `ts` is Stripe's seconds, so same-second rows
+            // (a subscription's `created` and its first paid invoice) fall
+            // to `_id` — arrival order, see [`Self::record`]. The MRR and
+            // movement folds must read the same order every time, or a
+            // recompute could differ from a frozen month.
+            .sort(doc! { "ts": 1, "_id": 1 })
             .limit(MAX_ROWS)
             .await?
             .try_collect()
