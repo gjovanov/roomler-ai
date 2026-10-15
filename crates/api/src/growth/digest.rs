@@ -606,12 +606,67 @@ pub struct IssueCountsOut {
     pub stale: i64,
 }
 
+/// P5 — what SendGrid's signed Event Webhook reported for one issue's
+/// messages so far.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueDelivery {
+    pub delivered: i64,
+    /// Every bounce, hard and blocked.
+    pub bounced: i64,
+    /// Hard bounces — each suppressed its address.
+    pub hard_bounced: i64,
+    pub dropped: i64,
+    /// Spam reports — each suppressed its address.
+    pub complaints: i64,
+}
+
+impl From<roomler_ai_services::dao::newsletter_send::DeliveryCounts> for IssueDelivery {
+    fn from(c: roomler_ai_services::dao::newsletter_send::DeliveryCounts) -> Self {
+        Self {
+            delivered: c.delivered,
+            bounced: c.bounced,
+            hard_bounced: c.hard_bounced,
+            dropped: c.dropped,
+            complaints: c.complaints,
+        }
+    }
+}
+
+/// A stored issue row from before P5 had no delivery: not recorded.
+fn delivery_unrecorded() -> Measured<IssueDelivery> {
+    Measured::NotMeasured(NotMeasured::now(super::newsletter::SENT_UNRECORDED))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IssueRow {
     pub slug: String,
     pub subject: String,
     pub sent_at: String,
     pub counts: IssueCountsOut,
+    /// P5 — the issue's delivery so far (the webhook's events), or why it
+    /// is not measured.
+    #[serde(default = "delivery_unrecorded")]
+    pub delivery: Measured<IssueDelivery>,
+    /// P5 — subscribers whose current unsubscription came through this
+    /// issue's own link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsubscribed_via: Option<i64>,
+    /// P5 — the `utm_campaign` its links carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign: Option<String>,
+}
+
+/// P5 — SendGrid's events in the windows, each by the event's own time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryFigures {
+    pub delivered: Figure,
+    pub bounced: Figure,
+    pub hard_bounced: Figure,
+    pub dropped: Figure,
+    /// Spam reports.
+    pub complaints: Figure,
+    /// Addresses suppressed (a hard bounce or a spam report).
+    pub suppressed: Figure,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -619,9 +674,15 @@ pub struct Newsletter {
     pub new: Figure,
     pub confirmed: Figure,
     pub unsubscribed: Figure,
+    /// P5 — of the unsubscribes, those through an issue's own link
+    /// (`subscribers.unsubscribed_via`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsubscribed_via_issue: Option<Figure>,
     pub by_source: Vec<SourceRow>,
     pub issues: Vec<IssueRow>,
-    pub delivery: NotMeasured,
+    /// P5 — SendGrid's events in the windows; `not_measured` while this
+    /// server does not verify the Event Webhook.
+    pub delivery: Measured<DeliveryFigures>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1312,6 +1373,48 @@ async fn org_names(
         .collect())
 }
 
+/// P5 — SendGrid's events in the 28-day window, by each event's own time
+/// (`newsletter_sends.delivery`), and the addresses suppressed in it.
+async fn delivery_figures(
+    state: &AppState,
+    w: &Windows,
+    suppressed: Vec<i64>,
+) -> Result<DeliveryFigures, DigestError> {
+    let rows = find_docs(
+        state,
+        "newsletter_sends",
+        doc! { "$or": [
+            { "delivery.delivered_at": w.between(Span::D28) },
+            { "delivery.bounced_at": w.between(Span::D28) },
+            { "delivery.dropped_at": w.between(Span::D28) },
+            { "delivery.spam_reported_at": w.between(Span::D28) },
+        ] },
+        doc! { "delivery": 1 },
+    )
+    .await?;
+    let (mut delivered, mut bounced, mut hard, mut dropped, mut complaints) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for d in rows.iter().filter_map(|r| r.get_document("delivery").ok()) {
+        delivered.extend(dt_ms(d, "delivered_at"));
+        dropped.extend(dt_ms(d, "dropped_at"));
+        complaints.extend(dt_ms(d, "spam_reported_at"));
+        if let Some(t) = dt_ms(d, "bounced_at") {
+            bounced.push(t);
+            if str_of(d, "bounce_type").as_deref() == Some("bounce") {
+                hard.push(t);
+            }
+        }
+    }
+    Ok(DeliveryFigures {
+        delivered: w.count(delivered),
+        bounced: w.count(bounced),
+        hard_bounced: w.count(hard),
+        dropped: w.count(dropped),
+        complaints: w.count(complaints),
+        suppressed: w.count(suppressed),
+    })
+}
+
 async fn newsletter_section(state: &AppState, w: &Windows) -> Result<Newsletter, DigestError> {
     let subs = find_docs(
         state,
@@ -1320,13 +1423,24 @@ async fn newsletter_section(state: &AppState, w: &Windows) -> Result<Newsletter,
             { "created_at": w.between(Span::D28) },
             { "confirmed_at": w.between(Span::D28) },
             { "unsubscribed_at": w.between(Span::D28) },
+            { "suppressed_at": w.between(Span::D28) },
         ] },
-        doc! { "source": 1, "created_at": 1, "confirmed_at": 1, "unsubscribed_at": 1 },
+        doc! {
+            "source": 1, "created_at": 1, "confirmed_at": 1, "unsubscribed_at": 1,
+            "unsubscribed_via": 1, "suppressed_at": 1,
+        },
     )
     .await?;
     let mut by_source: BTreeMap<String, SourceRow> = BTreeMap::new();
     let (mut new, mut confirmed, mut unsubscribed) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut via_issue, mut suppressed) = (Vec::new(), Vec::new());
     for d in &subs {
+        suppressed.extend(dt_ms(d, "suppressed_at"));
+        if let Some(t) = dt_ms(d, "unsubscribed_at")
+            && str_of(d, "unsubscribed_via").is_some()
+        {
+            via_issue.push(t);
+        }
         let source = str_of(d, "source").unwrap_or_else(|| "(none)".into());
         let row = by_source
             .entry(source.clone())
@@ -1359,12 +1473,37 @@ async fn newsletter_section(state: &AppState, w: &Windows) -> Result<Newsletter,
         state,
         "newsletter_issues",
         doc! { "sent_at": w.between(Span::Day) },
-        doc! { "slug": 1, "subject": 1, "sent_at": 1, "counts": 1 },
+        doc! {
+            "slug": 1, "subject": 1, "sent_at": 1, "counts": 1, "status": 1,
+            "campaign": 1, "delivery_events": 1,
+        },
     )
     .await?;
-    let issues = issues
-        .iter()
+    // P5 — each issue's delivery so far and its unsubscribes, by the same
+    // reads (and the same three cells) as the per-issue table.
+    let webhook = super::newsletter::webhook_on(state);
+    let facts: Vec<(Document, Option<super::newsletter::IssueFacts>)> = issues
+        .into_iter()
         .map(|d| {
+            let f = super::newsletter::issue_facts_of(&d);
+            (d, f)
+        })
+        .collect();
+    let ids: Vec<ObjectId> = facts
+        .iter()
+        .filter_map(|(_, f)| f.as_ref().map(|f| f.id))
+        .collect();
+    let slugs: Vec<String> = facts
+        .iter()
+        .filter_map(|(_, f)| f.as_ref().map(|f| f.slug.clone()))
+        .collect();
+    let delivery = roomler_ai_services::dao::newsletter_send::NewsletterSendDao::new(&state.db)
+        .delivery_counts(&ids)
+        .await?;
+    let via = super::newsletter::unsubscribed_via(state, &slugs).await?;
+    let issues = facts
+        .iter()
+        .map(|(d, f)| {
             let c = d.get_document("counts").ok();
             let n = |k: &str| c.map(|c| i64_of(c, k)).unwrap_or(0);
             IssueRow {
@@ -1382,6 +1521,19 @@ async fn newsletter_section(state: &AppState, w: &Windows) -> Result<Newsletter,
                     suppressed: n("suppressed"),
                     stale: n("stale"),
                 },
+                delivery: match f {
+                    Some(f) => match super::newsletter::delivery_cell(
+                        webhook,
+                        f,
+                        delivery.get(&f.id).copied(),
+                    ) {
+                        Measured::Value(c) => Measured::Value(c.into()),
+                        Measured::NotMeasured(n) => Measured::NotMeasured(n),
+                    },
+                    None => delivery_unrecorded(),
+                },
+                unsubscribed_via: f.as_ref().map(|f| via.get(&f.slug).copied().unwrap_or(0)),
+                campaign: f.as_ref().and_then(|f| f.campaign.clone()),
             }
         })
         .collect();
@@ -1390,13 +1542,19 @@ async fn newsletter_section(state: &AppState, w: &Windows) -> Result<Newsletter,
         .filter(|r| r.new + r.confirmed + r.unsubscribed > 0)
         .collect();
     by_source.sort_by(|a, b| b.new.cmp(&a.new).then_with(|| a.source.cmp(&b.source)));
+    let delivery = if webhook {
+        Measured::Value(delivery_figures(state, w, suppressed).await?)
+    } else {
+        Measured::NotMeasured(NotMeasured::now(super::newsletter::WEBHOOK_OFF))
+    };
     Ok(Newsletter {
         new: w.count(new),
         confirmed: w.count(confirmed),
         unsubscribed: w.count(unsubscribed),
+        unsubscribed_via_issue: Some(w.count(via_issue)),
         by_source,
         issues,
-        delivery: NotMeasured::later("delivery, bounces and complaints", "P5"),
+        delivery,
     })
 }
 

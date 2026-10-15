@@ -53,6 +53,10 @@
       "methods": "DELETE"
     },
     {
+      "path": "/api/admin/growth/newsletter",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/admin/growth/org-daily/backfill",
       "methods": "POST"
     },
@@ -306,6 +310,10 @@
     },
     {
       "path": "/api/releases/refresh",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/sendgrid/webhook",
       "methods": "POST"
     },
     {

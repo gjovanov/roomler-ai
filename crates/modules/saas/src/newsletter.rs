@@ -26,7 +26,9 @@ use serde::{Deserialize, Serialize};
 
 use roomler_ai_db::models::{IssueCounts, IssueStatus, NewsletterIssue};
 use roomler_ai_services::email::SendOptions;
-use roomler_ai_services::newsletter::{clean_header_text, render_issue_html, substitute_recipient};
+use roomler_ai_services::newsletter::{
+    LinkTags, clean_header_text, render_issue_html, site_hosts, substitute_recipient,
+};
 
 use roomler_core::guards::require_platform_admin;
 use roomler_core::{ApiError, extractors::auth::AuthUser};
@@ -35,6 +37,8 @@ use crate::SaasState;
 
 /// Storage guard for the markdown body. An issue is an email, not a book.
 const MAX_BODY_MD_BYTES: usize = 256 * 1024;
+/// FR-102 P5 — the most addresses a test issue's audience may name.
+pub const MAX_TEST_AUDIENCE: usize = 20;
 
 // ── Wire shapes ─────────────────────────────────────────────────────────
 
@@ -51,6 +55,11 @@ pub struct IssueBody {
     pub cta_text: Option<String>,
     #[serde(default)]
     pub cta_url: Option<String>,
+    /// FR-102 P5 — a TEST issue's audience (at most [`MAX_TEST_AUDIENCE`]
+    /// addresses): the send then goes only to the confirmed subscribers
+    /// among them. Fixed with the draft, so no resume can widen it.
+    #[serde(default)]
+    pub audience: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +82,9 @@ pub struct IssueView {
     pub hero_alt: Option<String>,
     pub cta_text: Option<String>,
     pub cta_url: Option<String>,
+    /// FR-102 P5 — a test issue's audience; absent for a list issue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audience: Option<Vec<String>>,
     pub status: IssueStatus,
     pub created_at: String,
     pub updated_at: String,
@@ -104,6 +116,7 @@ fn view(i: NewsletterIssue) -> IssueView {
         hero_alt: i.hero_alt,
         cta_text: i.cta_text,
         cta_url: i.cta_url,
+        audience: i.audience,
         status: i.status,
         created_at: rfc3339(i.created_at),
         updated_at: rfc3339(i.updated_at),
@@ -114,7 +127,7 @@ fn view(i: NewsletterIssue) -> IssueView {
 
 // ── Validation ──────────────────────────────────────────────────────────
 
-fn valid_slug(s: &str) -> bool {
+pub(crate) fn valid_slug(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.chars()
@@ -139,6 +152,35 @@ struct CleanIssueBody {
     hero_alt: Option<String>,
     cta_text: Option<String>,
     cta_url: Option<String>,
+    audience: Option<Vec<String>>,
+}
+
+/// FR-102 P5 — a test audience, normalised (the subscriber store's own
+/// spelling), de-duplicated and bounded: 1 to [`MAX_TEST_AUDIENCE`]
+/// plausible addresses, or a refusal — never a silently empty list, which
+/// would read as "no restriction".
+fn clean_audience(raw: Option<Vec<String>>) -> Result<Option<Vec<String>>, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for a in &raw {
+        let a = roomler_ai_db::models::Subscriber::normalize_email(a);
+        if a.is_empty() || a.len() > 254 || !a.contains('@') || a.chars().any(char::is_whitespace) {
+            return Err(ApiError::Validation(
+                "audience must list plausible addresses".into(),
+            ));
+        }
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    if out.is_empty() || out.len() > MAX_TEST_AUDIENCE {
+        return Err(ApiError::Validation(format!(
+            "a test audience names 1 to {MAX_TEST_AUDIENCE} addresses"
+        )));
+    }
+    Ok(Some(out))
 }
 
 fn clean_issue_body(b: IssueBody) -> Result<CleanIssueBody, ApiError> {
@@ -175,6 +217,7 @@ fn clean_issue_body(b: IssueBody) -> Result<CleanIssueBody, ApiError> {
         hero_alt: b.hero_alt.map(|s| clean_header_text(&s, 200)),
         cta_text: b.cta_text.map(|s| clean_header_text(&s, 64)),
         cta_url: b.cta_url,
+        audience: clean_audience(b.audience)?,
     })
 }
 
@@ -205,9 +248,56 @@ pub(crate) fn unsubscribe_headers(unsubscribe_url: &str) -> Vec<(String, String)
     ]
 }
 
-pub(crate) fn unsubscribe_url(state: &SaasState, token: &str) -> String {
-    let base = state.settings.app.frontend_url.trim_end_matches('/');
-    format!("{base}/api/subscribe/unsubscribe/{token}")
+pub(crate) fn unsubscribe_url(state: &SaasState, token: &str, issue: Option<&str>) -> String {
+    unsubscribe_link(&state.settings.app.frontend_url, token, issue)
+}
+
+/// The unsubscribe link: the recipient's own token (the one per-recipient
+/// thing in the email) and, FR-102 P5, `i=<slug>` — the issue it came in,
+/// the same for every recipient of that issue — so the click can be
+/// counted against the issue (`subscribers.unsubscribed_via`).
+pub(crate) fn unsubscribe_link(frontend_url: &str, token: &str, issue: Option<&str>) -> String {
+    let base = frontend_url.trim_end_matches('/');
+    match issue {
+        // Slugs are `[a-z0-9-]`, so the value needs no encoding.
+        Some(slug) => format!("{base}/api/subscribe/unsubscribe/{token}?i={slug}"),
+        None => format!("{base}/api/subscribe/unsubscribe/{token}"),
+    }
+}
+
+/// FR-102 P5 (D5) — the tags an issue's links carry, or `None` with
+/// `newsletter.link_tags` off. The same for the preview, the test-send and
+/// the fan-out, so the preview stays THE sent artifact.
+pub(crate) fn link_tags(state: &SaasState, slug: &str) -> Option<LinkTags> {
+    state
+        .settings
+        .newsletter
+        .link_tags
+        .then(|| LinkTags::for_issue(slug, site_hosts(&state.settings.app.frontend_url)))
+}
+
+/// What one recipient's message is: the issue rendered ONCE (with its
+/// tags), this recipient's unsubscribe link substituted — the only
+/// per-recipient part (AC15) — and the send options: the one-click
+/// headers (the same link), the newsletter From, tracking switched off
+/// (D6), and, for a real send, the issue as the SendGrid custom arg the
+/// Event Webhook matches events by (the same for every recipient).
+pub(crate) fn compose(
+    rendered: &str,
+    unsubscribe: &str,
+    issue_arg: Option<&str>,
+    from: Option<(String, String)>,
+) -> (String, SendOptions) {
+    let html = substitute_recipient(rendered, unsubscribe);
+    let opts = SendOptions {
+        headers: unsubscribe_headers(unsubscribe),
+        from,
+        custom_args: issue_arg
+            .map(|slug| vec![(crate::sendgrid::ISSUE_ARG.to_string(), slug.to_string())])
+            .unwrap_or_default(),
+        no_tracking: true,
+    };
+    (html, opts)
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────
@@ -235,6 +325,7 @@ pub async fn create(
         hero_alt: clean.hero_alt,
         cta_text: clean.cta_text,
         cta_url: clean.cta_url,
+        audience: clean.audience,
         status: IssueStatus::Draft,
         claimed_by: None,
         claimed_at: None,
@@ -242,6 +333,9 @@ pub async fn create(
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
         sent_at: None,
+        // Stamped by the fan-out when it starts (FR-102 P5).
+        campaign: None,
+        delivery_events: false,
     };
     // Two concurrent creates on one slug: the unique index arbitrates and the
     // loser's DuplicateKey maps to 409.
@@ -279,6 +373,15 @@ pub async fn update(
             None => {
                 unset.insert(key, "");
             }
+        }
+    }
+    // FR-102 P5 — the test audience, the same explicit set-or-unset.
+    match &clean.audience {
+        Some(a) => {
+            set.insert("audience", a.clone());
+        }
+        None => {
+            unset.insert("audience", "");
         }
     }
     let matched = if unset.is_empty() {
@@ -363,9 +466,10 @@ pub async fn preview(
         .get_by_slug(&slug)
         .await?
         .ok_or_else(|| ApiError::NotFound("no such issue".into()))?;
+    let tags = link_tags(&state, &issue.slug);
     let html = substitute_recipient(
-        &render_issue_html(&issue),
-        &unsubscribe_url(&state, "preview-sample-token"),
+        &render_issue_html(&issue, tags.as_ref()),
+        &unsubscribe_url(&state, "preview-sample-token", Some(&issue.slug)),
     );
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -419,12 +523,17 @@ pub async fn test_send(
         return Err(ApiError::Validation("not a plausible address".into()));
     }
 
-    let unsub = unsubscribe_url(&state, "test-send-sample-token");
-    let html = substitute_recipient(&render_issue_html(&issue), &unsub);
-    let opts = SendOptions {
-        headers: unsubscribe_headers(&unsub),
-        from: newsletter_from(&state),
-    };
+    // The real send's bytes and options — except the custom arg the Event
+    // Webhook matches by: a test-send has no ledger row, so its events must
+    // not land on a real recipient's.
+    let tags = link_tags(&state, &issue.slug);
+    let unsub = unsubscribe_url(&state, "test-send-sample-token", Some(&issue.slug));
+    let (html, opts) = compose(
+        &render_issue_html(&issue, tags.as_ref()),
+        &unsub,
+        None,
+        newsletter_from(&state),
+    );
     mailer
         .send_ext(&to, &issue.subject, &html, &opts)
         .await
@@ -634,4 +743,49 @@ pub async fn user_set(
         .set_account_subscription(&user.email, body.subscribed)
         .await?;
     Ok(Json(NewsletterPref { subscribed }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FR-102 P5 — a test audience is normalised to the store's spelling,
+    /// de-duplicated, and bounded; an empty or oversized list is refused
+    /// rather than read as "no restriction".
+    #[test]
+    fn a_test_audience_is_normalised_and_bounded() {
+        assert_eq!(clean_audience(None).unwrap(), None);
+        assert_eq!(
+            clean_audience(Some(vec![
+                " Me@Example.COM ".into(),
+                "me@example.com".into(),
+                "bounce@example.net".into(),
+            ]))
+            .unwrap(),
+            Some(vec![
+                "me@example.com".to_string(),
+                "bounce@example.net".to_string()
+            ])
+        );
+        assert!(clean_audience(Some(vec![])).is_err());
+        assert!(clean_audience(Some(vec!["not an address".into()])).is_err());
+        assert!(clean_audience(Some(vec!["".into()])).is_err());
+        let many: Vec<String> = (0..=MAX_TEST_AUDIENCE)
+            .map(|i| format!("a{i}@example.com"))
+            .collect();
+        assert!(clean_audience(Some(many)).is_err());
+    }
+
+    /// The unsubscribe link names the issue only when there is one.
+    #[test]
+    fn the_unsubscribe_link_names_the_issue() {
+        assert_eq!(
+            unsubscribe_link("https://roomler.ai/", "tok", Some("oct")),
+            "https://roomler.ai/api/subscribe/unsubscribe/tok?i=oct"
+        );
+        assert_eq!(
+            unsubscribe_link("https://roomler.ai", "tok", None),
+            "https://roomler.ai/api/subscribe/unsubscribe/tok"
+        );
+    }
 }

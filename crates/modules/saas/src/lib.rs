@@ -9,7 +9,9 @@
 //! `growth_daily` collection, through the core DAO) and the promotion
 //! pipeline's ingest routes (P8, [`growth_ingest`] — posts and metric
 //! snapshots into the core `growth_posts` / `growth_post_snapshots`,
-//! behind a hashed ingest key). Everything here
+//! behind a hashed ingest key), and the newsletter's delivery side (P5,
+//! [`sendgrid`] — SendGrid's signed Event Webhook onto the send ledger, the
+//! per-issue link tags and unsubscribes). Everything here
 //! exists because roomler.ai is a hosted product; a self-hosted deployment
 //! runs without it, which is why it is an **add-on feature** on the host
 //! rather than part of any profile.
@@ -50,6 +52,7 @@ pub mod newsletter;
 pub mod newsletter_send;
 pub mod plan_compliance;
 pub mod purestat_pull;
+pub mod sendgrid;
 pub mod stripe;
 pub mod subscribe;
 
@@ -65,6 +68,9 @@ pub struct SaasState {
     /// FR-58 — the per-recipient delivery ledger; its unique index is the
     /// send program's at-most-once invariant.
     pub newsletter_sends: Arc<NewsletterSendDao>,
+    /// FR-102 P5 — SendGrid's Event Webhook key, parsed once; `None` turns
+    /// the webhook off (every request is the empty 404).
+    pub sendgrid_events: Option<Arc<sendgrid::EventVerifier>>,
 }
 
 impl std::ops::Deref for SaasState {
@@ -87,17 +93,25 @@ impl Module for SaasState {
 
     type Deps = ();
 
-    async fn init(core: Core, _settings: &Settings, _deps: ()) -> anyhow::Result<Self> {
+    async fn init(core: Core, settings: &Settings, _deps: ()) -> anyhow::Result<Self> {
         let db = &core.db;
         // FR-102 P6 — the daily purestat puller (hosted-only: this module).
         // Spawns nothing without `growth.enabled` and a purestat key; one
         // pod per tick through a Redis claim, like the fleet and network
         // modules' sweepers spawned from their own init.
         purestat_pull::spawn_puller(core.clone());
+        // FR-102 P5 (D6) — SendGrid's account-level open/click tracking,
+        // read once and warned about loudly if on. Spawned, bounded, never
+        // blocks the boot; nothing without a SendGrid key.
+        sendgrid::spawn_tracking_check(&core);
+        let sendgrid_events =
+            sendgrid::verifier_from_settings(&settings.newsletter.event_webhook_public_key)
+                .map(Arc::new);
         Ok(Self {
             subscribers: Arc::new(SubscriberDao::new(db)),
             newsletter_issues: Arc::new(NewsletterIssueDao::new(db)),
             newsletter_sends: Arc::new(NewsletterSendDao::new(db)),
+            sendgrid_events,
             core,
         })
     }
@@ -201,9 +215,19 @@ impl Module for SaasState {
     /// S5 — the Stripe webhook, OUTSIDE the governor: it is signature-
     /// authenticated, and retry bursts from Stripe's fixed IPs would trip the
     /// per-IP limiter and mark the endpoint failing on their dashboard.
+    ///
+    /// FR-102 P5 — SendGrid's Event Webhook, for the same reasons: signed
+    /// (ECDSA, verified before the body is parsed), and SendGrid posts a
+    /// batch every 30 s from a handful of addresses. Its own body bound (a
+    /// batch is at most 768 KB).
     fn unlimited_routes(&self) -> Router {
         Router::new()
             .route("/api/stripe/webhook", post(stripe::webhook))
+            .route(
+                "/api/sendgrid/webhook",
+                post(sendgrid::webhook)
+                    .route_layer(DefaultBodyLimit::max(sendgrid::MAX_BODY_BYTES)),
+            )
             .with_state(self.clone())
     }
 

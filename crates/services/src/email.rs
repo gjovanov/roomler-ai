@@ -57,6 +57,18 @@ pub struct SendOptions {
     /// campaign mail carries the newsletter identity without touching the
     /// transactional From that activation/invite mail depends on.
     pub from: Option<(String, String)>,
+    /// FR-102 P5 — SendGrid `custom_args`: carried into the Event Webhook's
+    /// events for this message, and NOT into the message a recipient
+    /// receives. The newsletter passes one, the issue's slug — the same for
+    /// every recipient. Ignored by the SMTP backend.
+    pub custom_args: Vec<(String, String)>,
+    /// FR-102 P5 (D6) — switch SendGrid's open, click, subscription and
+    /// Google Analytics tracking OFF for this message, whatever the account
+    /// settings say: open tracking is a per-recipient pixel, click tracking
+    /// rewrites every link into a per-recipient one, and Google Analytics
+    /// tracking rewrites the issue's own UTM tags. Ignored by SMTP (which
+    /// tracks nothing).
+    pub no_tracking: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +81,73 @@ struct SendGridRequest {
     /// Omitted entirely when empty — the v3 API rejects an empty object here.
     #[serde(skip_serializing_if = "Option::is_none")]
     headers: Option<BTreeMap<String, String>>,
+    /// FR-102 P5 — omitted when empty, like `headers`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    custom_args: Option<BTreeMap<String, String>>,
+    /// FR-102 P5 — every tracking switch, explicitly off; omitted unless
+    /// asked, so transactional mail is byte-for-byte what it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tracking_settings: Option<TrackingOff>,
+}
+
+/// SendGrid v3 `tracking_settings`, every one of them `enable: false`.
+#[derive(Debug, Serialize)]
+struct TrackingOff {
+    click_tracking: ClickTrackingOff,
+    open_tracking: Switch,
+    subscription_tracking: Switch,
+    ganalytics: Switch,
+}
+
+#[derive(Debug, Serialize)]
+struct ClickTrackingOff {
+    enable: bool,
+    enable_text: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct Switch {
+    enable: bool,
+}
+
+impl TrackingOff {
+    fn new() -> Self {
+        Self {
+            click_tracking: ClickTrackingOff {
+                enable: false,
+                enable_text: false,
+            },
+            open_tracking: Switch { enable: false },
+            subscription_tracking: Switch { enable: false },
+            ganalytics: Switch { enable: false },
+        }
+    }
+}
+
+/// FR-102 P5 — SendGrid's ACCOUNT-level open and click tracking, as read
+/// back at startup. The newsletter turns both off per message anyway; this
+/// is the check that the account does not track the rest of the mail (and
+/// that nobody turned it on expecting newsletter numbers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TrackingReport {
+    pub open: bool,
+    pub click: bool,
+}
+
+/// `GET /v3/tracking_settings/open` answers `{"enabled": bool}`;
+/// `GET /v3/tracking_settings/click` answers `{"enabled": bool,
+/// "enable_text": bool}`. A missing field reads as ON — the check exists to
+/// warn, and an answer it cannot read must not read as reassurance.
+pub fn tracking_report(open: &serde_json::Value, click: &serde_json::Value) -> TrackingReport {
+    let on = |v: &serde_json::Value, k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(true);
+    TrackingReport {
+        open: on(open, "enabled"),
+        click: on(click, "enabled")
+            || click
+                .get("enable_text")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -216,7 +295,56 @@ impl EmailService {
             } else {
                 Some(opts.headers.iter().cloned().collect())
             },
+            custom_args: if opts.custom_args.is_empty() {
+                None
+            } else {
+                Some(opts.custom_args.iter().cloned().collect())
+            },
+            tracking_settings: opts.no_tracking.then(TrackingOff::new),
         }
+    }
+
+    /// Whether this service sends through SendGrid (the only backend with
+    /// account tracking settings and an Event Webhook).
+    pub fn is_sendgrid(&self) -> bool {
+        matches!(self.backend, EmailBackend::SendGrid { .. })
+    }
+
+    /// FR-102 P5 — read SendGrid's account-level open and click tracking
+    /// (`GET /v3/tracking_settings/{open,click}`). `None` on the SMTP
+    /// backend. Each request is bounded at 10 s; an error is the HTTP
+    /// status (a key without the `tracking_settings.read` scope answers
+    /// 403), never the key.
+    pub async fn tracking_settings(&self) -> Option<Result<TrackingReport, String>> {
+        let EmailBackend::SendGrid { client, api_key } = &self.backend else {
+            return None;
+        };
+        let get = |path: &'static str| {
+            let client = client.clone();
+            let api_key = api_key.clone();
+            async move {
+                let resp = client
+                    .get(format!(
+                        "https://api.sendgrid.com/v3/tracking_settings/{path}"
+                    ))
+                    .bearer_auth(api_key)
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await
+                    .map_err(|e| format!("{path}: {}", e.without_url()))?;
+                let status = resp.status();
+                if !status.is_success() {
+                    return Err(format!("{path}: HTTP {}", status.as_u16()));
+                }
+                resp.json::<serde_json::Value>()
+                    .await
+                    .map_err(|e| format!("{path}: unreadable answer ({})", e.without_url()))
+            }
+        };
+        Some(match (get("open").await, get("click").await) {
+            (Ok(open), Ok(click)) => Ok(tracking_report(&open, &click)),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        })
     }
 
     /// The exact RFC 5322 message an SMTP send submits — split out for the
@@ -562,8 +690,67 @@ mod tests {
             json.get("headers").is_none(),
             "no options ⇒ no `headers` key at all (the v3 API rejects an empty object)"
         );
+        // FR-102 P5 — transactional mail carries neither key: its request
+        // body is what it was before the newsletter grew options.
+        assert!(json.get("custom_args").is_none());
+        assert!(json.get("tracking_settings").is_none());
         assert_eq!(json["from"]["email"], "noreply@test.local");
         assert_eq!(json["from"]["name"], "Test");
+    }
+
+    /// FR-102 P5 — the newsletter's two additions: the issue as a custom
+    /// arg (the Event Webhook's correlation key, the same for every
+    /// recipient) and every tracking switch explicitly off (D6).
+    #[test]
+    fn sendgrid_request_carries_custom_args_and_turns_every_tracking_switch_off() {
+        let svc = EmailService::from_settings(&settings("sg.key", None, None)).unwrap();
+        let opts = SendOptions {
+            custom_args: vec![("nl_issue".to_string(), "october-notes".to_string())],
+            no_tracking: true,
+            ..Default::default()
+        };
+        let req = svc.sendgrid_request("to@example.com", "Subj", "<p>hi</p>", &opts);
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["custom_args"]["nl_issue"], "october-notes");
+        let t = &json["tracking_settings"];
+        assert_eq!(t["open_tracking"]["enable"], false);
+        assert_eq!(t["click_tracking"]["enable"], false);
+        assert_eq!(t["click_tracking"]["enable_text"], false);
+        assert_eq!(t["subscription_tracking"]["enable"], false);
+        assert_eq!(t["ganalytics"]["enable"], false);
+        assert!(
+            json["personalizations"][0].get("custom_args").is_none(),
+            "the arg is the send's, not a per-recipient one"
+        );
+    }
+
+    /// FR-102 P5 — the startup check's reading of SendGrid's answers. An
+    /// answer it cannot read is ON: the check warns, and a malformed body
+    /// must not read as reassurance.
+    #[test]
+    fn the_tracking_report_reads_off_only_when_sendgrid_says_off() {
+        use serde_json::json;
+        assert_eq!(
+            tracking_report(
+                &json!({ "enabled": false }),
+                &json!({ "enabled": false, "enable_text": false })
+            ),
+            TrackingReport {
+                open: false,
+                click: false
+            }
+        );
+        assert!(tracking_report(&json!({ "enabled": true }), &json!({ "enabled": false })).open);
+        assert!(
+            tracking_report(
+                &json!({ "enabled": false }),
+                &json!({ "enabled": false, "enable_text": true })
+            )
+            .click,
+            "click tracking of plain-text links is click tracking"
+        );
+        let unreadable = tracking_report(&json!({}), &json!([]));
+        assert!(unreadable.open && unreadable.click);
     }
 
     #[test]
@@ -572,6 +759,7 @@ mod tests {
         let opts = SendOptions {
             headers: unsub_headers(),
             from: Some(("news@test.local".to_string(), "Field Notes".to_string())),
+            ..Default::default()
         };
         let req = svc.sendgrid_request("to@example.com", "Subj", "<p>hi</p>", &opts);
         let json = serde_json::to_value(&req).unwrap();
@@ -594,6 +782,7 @@ mod tests {
         let opts = SendOptions {
             headers: unsub_headers(),
             from: Some(("news@test.local".to_string(), "Field Notes".to_string())),
+            ..Default::default()
         };
         let msg = svc
             .smtp_message("to@example.com", "Subj", "<p>hi</p>", &opts)
@@ -618,7 +807,7 @@ mod tests {
             EmailService::from_settings(&settings("", Some("mailpit.local"), Some(1025))).unwrap();
         let opts = SendOptions {
             headers: vec![("Bad Name:".to_string(), "v".to_string())],
-            from: None,
+            ..Default::default()
         };
         assert!(svc.smtp_message("to@example.com", "S", "b", &opts).is_err());
     }
