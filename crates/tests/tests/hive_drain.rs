@@ -360,6 +360,8 @@ async fn scenario() {
             refusal: None,
             answered_at: None,
             tip: None,
+            purging: None,
+            forking: None,
         }],
         short: None,
         placed_at: bson::DateTime::now(),

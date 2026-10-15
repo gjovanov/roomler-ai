@@ -411,6 +411,8 @@ pub async fn place_new(
                 refusal: None,
                 answered_at: None,
                 tip: None,
+                purging: None,
+                forking: None,
             })
             .collect(),
         short: p.short.map(|s| s.as_str().to_string()),
@@ -476,10 +478,18 @@ async fn replace_one(
         .agents
         .list_replica_candidates(s.tenant_id, s.owner_id, &policy.archive_devices)
         .await?;
+    // P2g-4b — a member whose purge is under way is on its way out: placement
+    // neither counts it nor chooses its device again (removal is final there).
+    let purging: Vec<ObjectId> = current
+        .members
+        .iter()
+        .filter(|m| m.purging.is_some())
+        .map(|m| m.device_id)
+        .collect();
     let devices: Vec<DeviceFacts> = rows
         .iter()
         .filter_map(DeviceFacts::of)
-        .filter(|d| Some(d.id) != gone)
+        .filter(|d| Some(d.id) != gone && !purging.contains(&d.id))
         .collect();
     // P2f-1 — the target of a teleport in flight is the teleport's: placement
     // neither counts it nor lets it go. One left from a teleport that is over
@@ -538,6 +548,8 @@ async fn replace_one(
                     refusal: None,
                     answered_at: None,
                     tip: None,
+                    purging: None,
+                    forking: None,
                 };
                 state.sessions.add_member(sid, &m).await?
             }
@@ -603,6 +615,18 @@ async fn replace_one(
         }
         .write(state)
         .await;
+    }
+    // P2g-4b — each member that leaves, purged once min holds without it,
+    // as the session stands after this placement. Best effort: a failed read
+    // leaves it for the next tip, and never fails the placement.
+    match state.sessions.with_leaving(sid).await {
+        Ok(Some(now)) => {
+            crate::purge::settle_leaving(state, &now, gone).await;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(session = %sid, %e, "hive: the members that leave were not read — the next tip settles them")
+        }
     }
     Ok(moved)
 }

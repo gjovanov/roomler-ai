@@ -5690,15 +5690,14 @@ const TAKES_A_COPY_TO_FORK: &[&str] = &[
 /// [`forkable`], its primary handing copies over and its first turn kept;
 /// and `c`, the owner's third device, which holds no copy of it.
 async fn joinable(app: &TestApp, tag: &str) -> (Moving, Device) {
+    joinable_with(app, tag, TAKES_A_COPY_TO_FORK).await
+}
+
+/// [`joinable`], `c` advertising `c_caps`.
+async fn joinable_with(app: &TestApp, tag: &str, c_caps: &[&str]) -> (Moving, Device) {
     let mut m = forkable_with(app, tag, FORKS_AND_COPIES, FORKS).await;
     kept_a_turn(app, &mut m, 5).await;
-    let c = device(
-        app,
-        &m.seeded,
-        &format!("mach-{tag}-c"),
-        TAKES_A_COPY_TO_FORK,
-    )
-    .await;
+    let c = device(app, &m.seeded, &format!("mach-{tag}-c"), c_caps).await;
     (m, c)
 }
 
@@ -12105,4 +12104,725 @@ async fn a_removal_on_one_pod_reaches_a_device_on_the_other() {
     read_until(&mut m.ws, "rc:hive.purge_all")
         .await
         .expect("the purge reaches the device on the other pod");
+}
+
+// ─── P2g-4b — a member that leaves is purged once min holds without it ──────
+
+/// A live session on `a`, which carries the policy's restricted tag `prod`,
+/// with `min` 2: `m`, tagged, took its copy and said where it ends; `n`
+/// carries no tag yet. Every device purges.
+struct Leaving {
+    tid: String,
+    admin: String,
+    sid: String,
+    seeded: SeededTenant,
+    a: Device,
+    m: Device,
+    n: Device,
+}
+
+/// [`Leaving`], its machines named after `tag`.
+async fn leaving(app: &TestApp, tag: &str) -> Leaving {
+    let seeded = app.seed_tenant(tag).await;
+    on_pro(app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let (code, p) = put_policy(app, &tid, &admin, &policy_min(2, 0)).await;
+    assert_eq!(code, 200, "{p}");
+    let mut a = device(app, &seeded, &format!("mach-{tag}-a"), PURGES).await;
+    set_device(app, &a.agent_id, doc! { "tags": ["prod"] }).await;
+    let mut m = device(app, &seeded, &format!("mach-{tag}-m"), PURGES).await;
+    set_device(app, &m.agent_id, doc! { "tags": ["prod"] }).await;
+    let n = device(app, &seeded, &format!("mach-{tag}-n"), PURGES).await;
+    let (s, _) = started_frame(app, &tid, &admin, &mut a, &format!("/srv/{tag}")).await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    took_copy(app, &tid, &admin, &sid, &mut m).await;
+    Leaving {
+        tid,
+        admin,
+        sid,
+        seeded,
+        a,
+        m,
+        n,
+    }
+}
+
+/// `d` answers its join of `sid` and says where its copy ends.
+async fn took_copy(app: &TestApp, tid: &str, admin: &str, sid: &str, d: &mut Device) {
+    read_until(&mut d.ws, "rc:hive.replica.join")
+        .await
+        .expect("its join");
+    answer_join(app, tid, admin, sid, d).await;
+    send(&mut d.ws, tip_at(sid, 1, 3, "ab")).await;
+    let id = d.agent_id.clone();
+    wait_stored(app, sid, "its tip", |s| {
+        member_row(s, &id).contains_key("tip")
+    })
+    .await;
+}
+
+/// `d` answers its join of `sid`, `joined`.
+async fn answer_join(app: &TestApp, tid: &str, admin: &str, sid: &str, d: &mut Device) {
+    send(
+        &mut d.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1}),
+    )
+    .await;
+    wait_member(app, tid, admin, sid, &d.agent_id, "joined", |m| {
+        m["state"] == "joined"
+    })
+    .await;
+}
+
+/// The purge `device`'s row of `sid` names, when it names one.
+async fn purging_of(app: &TestApp, sid: &str, device: &str) -> Option<String> {
+    member_row(&stored(app, sid).await, device)
+        .get_object_id("purging")
+        .ok()
+        .map(|o| o.to_hex())
+}
+
+/// Every purge of `sid` the server keeps, oldest first.
+async fn purges_of(app: &TestApp, sid: &str) -> Vec<Document> {
+    let mut cur = app
+        .db
+        .collection::<Document>("hive_purges")
+        .find(doc! { "session_id": ObjectId::parse_str(sid).unwrap() })
+        .sort(doc! { "at": 1 })
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    while let Some(p) = cur.next().await {
+        out.push(p.unwrap());
+    }
+    out
+}
+
+/// FR-90 P2g-4b — a member a smaller policy lets go, while the copies
+/// elsewhere are enough, is purged at once: its copy alone, the session left
+/// as it is, no tombstone. Once it answers, its row goes. The member that
+/// stays and the primary hear nothing, and the owner's read of the session's
+/// purge is not this one.
+#[tokio::test]
+async fn a_member_a_smaller_policy_lets_go_is_purged_at_once() {
+    let app = replicaset_app().await;
+    let mut p = purgeable(&app, "leave-now", &[PURGES, PURGES]).await;
+    let (tid, admin, sid) = (p.tid.clone(), p.admin.clone(), p.sid.clone());
+    for m in &mut p.members {
+        send(&mut m.ws, tip_at(&sid, 1, 3, "ab")).await;
+    }
+    for m in &p.members {
+        let id = m.agent_id.clone();
+        wait_stored(&app, &sid, "each member's tip", |s| {
+            member_row(s, &id).contains_key("tip")
+        })
+        .await;
+    }
+
+    // A smaller policy: placement keeps one member and lets the other go.
+    let (code, body) = put_policy(&app, &tid, &admin, &policy_min(2, 1)).await;
+    assert_eq!(code, 200, "{body}");
+    let s = stored(&app, &sid).await;
+    let i = p
+        .members
+        .iter()
+        .position(|m| stored_member(&s, &m.agent_id).1 == "leaving")
+        .expect("one member leaves");
+    let mut gone = p.members.remove(i);
+    let mut kept = p.members.remove(0);
+    assert_eq!(stored_member(&s, &kept.agent_id).1, "joined", "{s}");
+
+    // Min holds without it: its purge goes at once, and only to it.
+    let told = read_until(&mut gone.ws, "rc:hive.purge")
+        .await
+        .expect("the member that leaves hears its purge");
+    assert_eq!(told["session_id"], sid, "{told}");
+    let purge = told["purge_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        purging_of(&app, &sid, &gone.agent_id).await.as_deref(),
+        Some(purge.as_str()),
+        "its row names the purge"
+    );
+    for (who, ws) in [
+        ("the member that stays", &mut kept.ws),
+        ("the primary", &mut p.a.ws),
+    ] {
+        assert!(
+            !device_hears(ws, "rc:hive.purge", Duration::from_millis(500)).await,
+            "{who} hears no purge"
+        );
+    }
+    let all = purges_of(&app, &sid).await;
+    assert_eq!(all.len(), 1, "{all:?}");
+    assert_eq!(
+        (
+            all[0].get_str("reason").ok(),
+            all[0].get_object_id("member").ok().map(|o| o.to_hex())
+        ),
+        (Some("leaving"), Some(gone.agent_id.clone())),
+        "a purge of that member alone: {all:?}"
+    );
+    let rec = record_of(&app, &sid).await.expect("the session stays");
+    assert!(!rec.contains_key("purged"), "no tombstone: {rec}");
+    assert_eq!(get_session(&app, &tid, &admin, &sid).await.0, 200);
+
+    // It answers: the purge completes, and its row goes.
+    purge_ack(&mut gone.ws, &purge, &sid, "done", "not_there").await;
+    wait_stored(&app, &sid, "its row goes once the purge completes", |s| {
+        member_row(s, &gone.agent_id).is_empty()
+    })
+    .await;
+    assert_eq!(
+        stored_member(&stored(&app, &sid).await, &kept.agent_id).1,
+        "joined"
+    );
+    assert_eq!(
+        read_purge(&app, &tid, &admin, &sid).await.0,
+        404,
+        "the owner's read is the session's own purge, and there is none"
+    );
+    assert_eq!(
+        purge_audit(&app, &sid).await,
+        vec![
+            ("issued".to_string(), Some("leaving".to_string())),
+            ("complete".to_string(), Some("leaving".to_string())),
+        ]
+    );
+}
+
+/// FR-90 P2g-4b — make-before-break: a member that leaves keeps its copy
+/// while the copies elsewhere fall short, and a device that took its place
+/// counts only once it has said where its copy ends. Then its purge goes.
+#[tokio::test]
+async fn a_member_that_leaves_keeps_its_copy_until_min_holds_without_it() {
+    let app = replicaset_app().await;
+    let mut l = leaving(&app, "leave-wait").await;
+    let (tid, admin, sid) = (l.tid.clone(), l.admin.clone(), l.sid.clone());
+
+    // Its tag taken off: it leaves, and min does not hold without it.
+    tag(&app, &tid, &admin, &l.m.agent_id, &[]).await;
+    assert_eq!(
+        stored_member(&stored(&app, &sid).await, &l.m.agent_id).1,
+        "leaving"
+    );
+    assert!(
+        !device_hears(&mut l.m.ws, "rc:hive.purge", Duration::from_millis(500)).await,
+        "min does not hold without it: it keeps its copy"
+    );
+    assert_eq!(purging_of(&app, &sid, &l.m.agent_id).await, None);
+
+    // Another takes its place, and joins, but has said nothing yet: the
+    // primary's own tip looks again, and finds it is not yet a copy.
+    tag(&app, &tid, &admin, &l.n.agent_id, &["prod"]).await;
+    read_until(&mut l.n.ws, "rc:hive.replica.join")
+        .await
+        .expect("n's join");
+    answer_join(&app, &tid, &admin, &sid, &mut l.n).await;
+    send(&mut l.a.ws, tip_at(&sid, 1, 3, "ab")).await;
+    let a_id = l.a.agent_id.clone();
+    wait_stored(&app, &sid, "the primary's tip", |s| {
+        member_row(s, &a_id).contains_key("tip")
+    })
+    .await;
+    assert!(
+        !device_hears(&mut l.m.ws, "rc:hive.purge", Duration::from_millis(500)).await,
+        "a copy that has said nothing is not yet one"
+    );
+
+    // It says where its copy ends: min holds, and m's purge goes.
+    send(&mut l.n.ws, tip_at(&sid, 1, 3, "ab")).await;
+    let told = read_until(&mut l.m.ws, "rc:hive.purge")
+        .await
+        .expect("m's purge, now that n holds a copy");
+    assert_eq!(told["session_id"], sid, "{told}");
+    assert!(
+        !device_hears(&mut l.n.ws, "rc:hive.purge", Duration::from_millis(300)).await,
+        "n hears none"
+    );
+}
+
+/// FR-90 P2g-4b — a member taken back before its purge goes is a member
+/// again, as before: nothing of it is purged.
+#[tokio::test]
+async fn a_member_taken_back_before_its_purge_goes_is_never_purged() {
+    let app = replicaset_app().await;
+    let mut l = leaving(&app, "leave-back").await;
+    let (tid, admin, sid) = (l.tid.clone(), l.admin.clone(), l.sid.clone());
+    tag(&app, &tid, &admin, &l.m.agent_id, &[]).await;
+    assert_eq!(
+        stored_member(&stored(&app, &sid).await, &l.m.agent_id).1,
+        "leaving"
+    );
+    tag(&app, &tid, &admin, &l.m.agent_id, &["prod"]).await;
+    assert_eq!(
+        stored_member(&stored(&app, &sid).await, &l.m.agent_id).1,
+        "pending",
+        "taken back before its purge went"
+    );
+    read_until(&mut l.m.ws, "rc:hive.replica.join")
+        .await
+        .expect("its join again");
+    answer_join(&app, &tid, &admin, &sid, &mut l.m).await;
+    send(&mut l.m.ws, tip_at(&sid, 1, 4, "cd")).await;
+    assert!(
+        !device_hears(&mut l.m.ws, "rc:hive.purge", Duration::from_millis(500)).await,
+        "a member taken back is never purged"
+    );
+    assert!(purges_of(&app, &sid).await.is_empty());
+}
+
+/// FR-90 P2g-4b — once a member's purge went, placement never takes it back
+/// nor chooses its device again: removal is final there, so a join would be
+/// refused for ever. Offline when its purge went, it hears it at its next
+/// connection, answers, and its row goes.
+#[tokio::test]
+async fn a_member_whose_purge_went_is_never_taken_back_and_hears_it_later() {
+    let app = replicaset_app().await;
+    let mut l = leaving(&app, "leave-gone").await;
+    let (tid, admin, sid) = (l.tid.clone(), l.admin.clone(), l.sid.clone());
+    let o = device(&app, &l.seeded, "mach-leave-gone-o", PURGES).await;
+
+    // Let go, and offline: n takes its place and holds a copy, so m's purge
+    // goes, to nobody yet.
+    tag(&app, &tid, &admin, &l.m.agent_id, &[]).await;
+    drop(l.m.ws);
+    wait_offline(&app, &l.seeded, &l.m.agent_id).await;
+    tag(&app, &tid, &admin, &l.n.agent_id, &["prod"]).await;
+    took_copy(&app, &tid, &admin, &sid, &mut l.n).await;
+    let purge = {
+        let id = l.m.agent_id.clone();
+        wait_stored(&app, &sid, "its row names its purge", |s| {
+            member_row(s, &id).contains_key("purging")
+        })
+        .await;
+        purging_of(&app, &sid, &id).await.unwrap()
+    };
+
+    // A placement that read the member before its purge took cannot take it
+    // back after: the take-back holds only while no purge names the row.
+    let took_back = roomler_ai_mod_hive::dao::AgentSessionDao::new(&app.db)
+        .rejoin(
+            ObjectId::parse_str(&sid).unwrap(),
+            ObjectId::parse_str(&l.m.agent_id).unwrap(),
+            "owner",
+        )
+        .await
+        .unwrap();
+    assert!(
+        !took_back,
+        "a placement that read it before its purge cannot take it back"
+    );
+
+    // Tagged again: never taken back.
+    tag(&app, &tid, &admin, &l.m.agent_id, &["prod"]).await;
+    assert_eq!(
+        stored_member(&stored(&app, &sid).await, &l.m.agent_id).1,
+        "leaving",
+        "a member whose purge went is never taken back"
+    );
+    // n let go too, and o tagged: o takes the place, never m.
+    tag(&app, &tid, &admin, &l.n.agent_id, &[]).await;
+    tag(&app, &tid, &admin, &o.agent_id, &["prod"]).await;
+    let s = stored(&app, &sid).await;
+    assert_eq!(
+        stored_member(&s, &o.agent_id).1,
+        "pending",
+        "o takes the place: a member whose purge went is never chosen: {s}"
+    );
+    assert_eq!(stored_member(&s, &l.m.agent_id).1, "leaving", "{s}");
+
+    // m connects: it hears its purge, answers, and its row goes.
+    l.m.ws = connect(&app, &l.m.token, &l.m.machine, PURGES).await;
+    let told = arrives(&mut l.m.ws, "rc:hive.purge", Duration::from_secs(5))
+        .await
+        .expect("m hears its purge at its next connection");
+    assert_eq!(told["purge_id"], purge, "{told}");
+    purge_ack(&mut l.m.ws, &purge, &sid, "done", "not_there").await;
+    let id = l.m.agent_id.clone();
+    wait_stored(&app, &sid, "its row goes", |s| {
+        member_row(s, &id).is_empty()
+    })
+    .await;
+}
+
+/// FR-90 P2g-4b — the owner's read of a session that is gone answers its
+/// own purge, never a leaving member's, even one that completed after it.
+#[tokio::test]
+async fn the_owners_read_of_a_gone_session_is_its_own_purge() {
+    let app = replicaset_app().await;
+    let mut l = leaving(&app, "leave-read").await;
+    let (tid, admin, sid) = (l.tid.clone(), l.admin.clone(), l.sid.clone());
+    tag(&app, &tid, &admin, &l.m.agent_id, &[]).await;
+    drop(l.m.ws);
+    wait_offline(&app, &l.seeded, &l.m.agent_id).await;
+    tag(&app, &tid, &admin, &l.n.agent_id, &["prod"]).await;
+    took_copy(&app, &tid, &admin, &sid, &mut l.n).await;
+    let leave = {
+        let id = l.m.agent_id.clone();
+        wait_stored(&app, &sid, "m's purge went", |s| {
+            member_row(s, &id).contains_key("purging")
+        })
+        .await;
+        purging_of(&app, &sid, &id).await.unwrap()
+    };
+
+    // The owner purges the session; a and n answer it.
+    let (code, body) = delete_session(&app, &tid, &admin, &sid).await;
+    assert_eq!(code, 200, "{body}");
+    let owner = body["purge"]["id"].as_str().unwrap().to_string();
+    for d in [&mut l.a, &mut l.n] {
+        read_until(&mut d.ws, "rc:hive.purge")
+            .await
+            .expect("the session's purge");
+        purge_ack(&mut d.ws, &owner, &sid, "done", "done").await;
+    }
+
+    // m answers the session's purge first, then its own: the session's
+    // completes first, and the member's after it.
+    l.m.ws = connect(&app, &l.m.token, &l.m.machine, PURGES).await;
+    purge_ack(&mut l.m.ws, &owner, &sid, "done", "done").await;
+    wait_record_gone(&app, &sid, "the session's purge completes").await;
+    purge_ack(&mut l.m.ws, &leave, &sid, "done", "done").await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while purges_of(&app, &sid)
+        .await
+        .iter()
+        .any(|p| !p.contains_key("done_at"))
+    {
+        assert!(Instant::now() < deadline, "the member's purge completes");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (code, v) = read_purge(&app, &tid, &admin, &sid).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(
+        v["id"], owner,
+        "the owner's read is the session's own purge, never a member's: {v}"
+    );
+}
+
+/// FR-90 P2g-4b — with the replicaset's switch off, a member that leaves is
+/// purged by nothing: a tip that would make min hold changes nothing.
+#[tokio::test]
+async fn a_member_that_leaves_is_purged_by_nothing_with_the_switch_off() {
+    let app = replicaset_app().await;
+    let mut l = leaving(&app, "leave-off").await;
+    let (tid, admin, sid) = (l.tid.clone(), l.admin.clone(), l.sid.clone());
+    tag(&app, &tid, &admin, &l.m.agent_id, &[]).await;
+    tag(&app, &tid, &admin, &l.n.agent_id, &["prod"]).await;
+    read_until(&mut l.n.ws, "rc:hive.replica.join")
+        .await
+        .expect("n's join");
+    answer_join(&app, &tid, &admin, &sid, &mut l.n).await;
+
+    // The switch goes off; n says where its copy ends there.
+    let off = switch_off(&app).await;
+    drop(l.n.ws);
+    wait_offline(&app, &l.seeded, &l.n.agent_id).await;
+    let mut n = connect(&off, &l.n.token, &l.n.machine, PURGES).await;
+    send(&mut n, tip_at(&sid, 1, 3, "ab")).await;
+    let id = l.n.agent_id.clone();
+    wait_stored(&off, &sid, "n's tip lands", |s| {
+        member_row(s, &id).contains_key("tip")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        purges_of(&off, &sid).await.is_empty(),
+        "nothing is purged with the switch off"
+    );
+    assert!(
+        !device_hears(&mut l.m.ws, "rc:hive.purge", Duration::from_millis(300)).await,
+        "m hears nothing"
+    );
+}
+
+/// A device that holds no copies but takes a teleport's copy, starts forks
+/// and purges: a fork onto it takes a copy first, and that copy is purged
+/// once it may go.
+const TAKES_A_COPY_TO_FORK_AND_PURGES: &[&str] = &[
+    "exec",
+    "hive",
+    "hive-stream",
+    "hive-lease",
+    "hive-promote",
+    "hive-teleport",
+    "hive-fork",
+    "hive-purge",
+];
+
+/// [`TAKES_A_COPY_TO_FORK_AND_PURGES`] without `hive-fork`: a build that
+/// takes a teleport's copy and purges, and starts no fork.
+const TAKES_A_COPY_AND_PURGES: &[&str] = &[
+    "exec",
+    "hive",
+    "hive-stream",
+    "hive-lease",
+    "hive-promote",
+    "hive-teleport",
+    "hive-purge",
+];
+
+/// `m`'s session forked onto `c`, which takes its copy as a teleport's
+/// target and catches up to the primary's tip; with `catch_up` false, `c`
+/// says nothing yet, and only the primary has said where its copy ends.
+async fn fork_joined(app: &TestApp, m: &mut Moving, c: &mut Device, folder: &str, catch_up: bool) {
+    let sid = m.sid.clone();
+    let (body, _) = fork_join_prepared(app, m, c, folder, None).await;
+    assert_eq!(body["outcome"], "joining", "{body}");
+    join_answered(c, &sid, "teleport").await;
+    join_answered(&mut m.a, &sid, "primary").await;
+    send(&mut m.a.ws, tip_at(&sid, 1, 9, "ab")).await;
+    let a = m.a.agent_id.clone();
+    wait_stored(app, &sid, "the primary's tip", |s| {
+        member_row(s, &a)
+            .get_document("tip")
+            .is_ok_and(|t| t.get_i64("seq") == Ok(9))
+    })
+    .await;
+    if catch_up {
+        send(&mut c.ws, tip_at(&sid, 1, 9, "ab")).await;
+    }
+}
+
+/// FR-90 P2g-4b — a fork onto a device with no copy (P2f-3c) is made from
+/// the copy that device takes. The device is let go as the move ends, its
+/// row naming the fork, and keeps that copy while the fork's start is out:
+/// though the session holds its `min` copies without it, tips land
+/// meanwhile, and the server stops waiting for the answer (putting a copy in
+/// place can take long). Once the device answers, however late, the copy
+/// goes as any leaving member's.
+#[tokio::test]
+async fn a_member_a_fork_is_made_from_keeps_its_copy_until_the_forks_start_is_answered() {
+    let app = fork_app().await;
+    let (mut m, mut c) = joinable_with(&app, "forkhold", TAKES_A_COPY_TO_FORK_AND_PURGES).await;
+    let sid = m.sid.clone();
+    fork_joined(&app, &mut m, &mut c, "/srv/forkhold-c", true).await;
+    let start = read_until(&mut c.ws, "rc:hive.start")
+        .await
+        .expect("the fork's start, once the copy caught up");
+    let fsid = start["session_id"].as_str().unwrap().to_string();
+
+    // Let go as the move ended, its row naming the fork. The primary and b
+    // hold the session, so min holds without it: its copy stays anyway,
+    // through the tip that caught it up and the next one.
+    let s = wait_stored(&app, &sid, "the fork's move ends", |s| {
+        !s.contains_key("promotion")
+    })
+    .await;
+    assert_eq!(
+        stored_member(&s, &c.agent_id),
+        ("teleport".into(), "leaving".into())
+    );
+    assert_eq!(
+        member_row(&s, &c.agent_id)
+            .get_object_id("forking")
+            .ok()
+            .map(|o| o.to_hex()),
+        Some(fsid.clone()),
+        "its row names the fork: {s}"
+    );
+    send(&mut m.b.ws, tip_with_checkpoint(&sid, 9, 5)).await;
+    let b = m.b.agent_id.clone();
+    wait_stored(&app, &sid, "b's next tip", |s| {
+        member_row(s, &b)
+            .get_document("tip")
+            .is_ok_and(|t| t.get_i64("seq") == Ok(9))
+    })
+    .await;
+    assert!(
+        !device_hears(&mut c.ws, "rc:hive.purge", Duration::from_millis(500)).await,
+        "its copy stays while the fork's start is out"
+    );
+    assert!(purges_of(&app, &sid).await.is_empty(), "no purge is issued");
+    // A purge that read the row before the fork was named cannot take it.
+    let took = roomler_ai_mod_hive::dao::AgentSessionDao::new(&app.db)
+        .mark_purging(
+            ObjectId::parse_str(&sid).unwrap(),
+            ObjectId::parse_str(&c.agent_id).unwrap(),
+            ObjectId::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !took,
+        "a row naming a fork is taken by no purge that read it without one"
+    );
+
+    // The server stops waiting for the answer and says the fork was made:
+    // the copy stays for the answer still to come.
+    wait_note(&app, &m, "forked the session into **Fork of forkhold**").await;
+    assert!(
+        !device_hears(&mut c.ws, "rc:hive.purge", Duration::from_millis(300)).await,
+        "its copy stays while the answer may yet come"
+    );
+
+    // The device answers the start: the copy goes as any leaving member's.
+    send(
+        &mut c.ws,
+        json!({"t": "rc:hive.start_ack", "session_id": fsid, "fence": 1, "account": "dev"}),
+    )
+    .await;
+    let told = read_until(&mut c.ws, "rc:hive.purge")
+        .await
+        .expect("once the fork's start is answered, the copy it was made from is purged");
+    assert_eq!(told["session_id"], sid, "{told}");
+    let purge = told["purge_id"].as_str().unwrap().to_string();
+    purge_ack(&mut c.ws, &purge, &sid, "done", "not_there").await;
+    let c_id = c.agent_id.clone();
+    wait_stored(&app, &sid, "its row goes once the purge completes", |s| {
+        member_row(s, &c_id).is_empty()
+    })
+    .await;
+    assert!(
+        stored(&app, &fsid)
+            .await
+            .get_datetime("accepted_at")
+            .is_ok(),
+        "the fork runs on"
+    );
+}
+
+/// FR-90 P2g-4b — a fork whose start cannot reach its device (back, once
+/// its copy caught up, as a build that starts no fork) is not made, and the
+/// copy it was to be made from goes then, not at the session's next tip.
+#[tokio::test]
+async fn a_member_a_fork_is_never_started_on_lets_its_copy_go() {
+    let app = fork_app().await;
+    let (mut m, mut c) = joinable_with(&app, "forknever", TAKES_A_COPY_TO_FORK_AND_PURGES).await;
+    let sid = m.sid.clone();
+    fork_joined(&app, &mut m, &mut c, "/srv/forknever-c", false).await;
+
+    // Back as a build that starts no fork, where its copy catches up.
+    let (token, machine, c_id) = (c.token.clone(), c.machine.clone(), c.agent_id.clone());
+    drop(c.ws);
+    wait_offline(&app, &m.seeded, &c_id).await;
+    let mut ws = connect(&app, &token, &machine, TAKES_A_COPY_AND_PURGES).await;
+    send(&mut ws, tip_at(&sid, 1, 9, "ab")).await;
+
+    // The fork's start could not go: the fork is lost, and the copy goes.
+    let told = read_until(&mut ws, "rc:hive.purge")
+        .await
+        .expect("the copy no fork will be made from is purged");
+    assert_eq!(told["session_id"], sid, "{told}");
+    let forks = forks_of(&app, &sid).await;
+    assert_eq!(forks.len(), 1, "{forks:?}");
+    assert_eq!(forks[0].get_str("status").ok(), Some("lost"), "{forks:?}");
+    assert_eq!(
+        purging_of(&app, &sid, &c_id).await.as_deref(),
+        told["purge_id"].as_str(),
+        "its row names the purge"
+    );
+}
+
+/// `device`'s row of `sid` names `fork` as the fork made from its copy.
+async fn name_fork(app: &TestApp, sid: &str, device: &str, fork: ObjectId) {
+    let r = app
+        .db
+        .collection::<Document>("agent_sessions")
+        .update_one(
+            doc! {
+                "_id": ObjectId::parse_str(sid).unwrap(),
+                "replicaset.members.device_id": ObjectId::parse_str(device).unwrap(),
+            },
+            doc! { "$set": { "replicaset.members.$.forking": fork } },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.modified_count, 1, "the row names the fork");
+}
+
+/// FR-90 P2g-4b — a fork whose record was never made (the server stopped
+/// between the move's end and the fork's record) holds the copy it was to be
+/// made from for a start's redelivery window, and no longer: once that has
+/// passed, the session's next tip lets the member go.
+#[tokio::test]
+async fn a_fork_never_made_holds_its_copy_only_for_a_starts_redelivery_window() {
+    let app = replicaset_app().await;
+    let mut l = leaving(&app, "forkunmade").await;
+    let (tid, admin, sid) = (l.tid.clone(), l.admin.clone(), l.sid.clone());
+    tag(&app, &tid, &admin, &l.m.agent_id, &[]).await;
+    assert_eq!(
+        stored_member(&stored(&app, &sid).await, &l.m.agent_id).1,
+        "leaving"
+    );
+    name_fork(&app, &sid, &l.m.agent_id, ObjectId::new()).await;
+
+    // Another takes its place and says where its copy ends: min holds
+    // without m, which keeps its copy for a fork that may yet be made.
+    tag(&app, &tid, &admin, &l.n.agent_id, &["prod"]).await;
+    read_until(&mut l.n.ws, "rc:hive.replica.join")
+        .await
+        .expect("n's join");
+    answer_join(&app, &tid, &admin, &sid, &mut l.n).await;
+    send(&mut l.n.ws, tip_at(&sid, 1, 3, "ab")).await;
+    let n_id = l.n.agent_id.clone();
+    wait_stored(&app, &sid, "n's tip", |s| {
+        member_row(s, &n_id).contains_key("tip")
+    })
+    .await;
+    assert!(
+        !device_hears(&mut l.m.ws, "rc:hive.purge", Duration::from_millis(500)).await,
+        "a fork that may yet be made keeps the copy"
+    );
+    assert!(purges_of(&app, &sid).await.is_empty(), "no purge is issued");
+
+    // Named a redelivery window ago, it never will be: the next tip lets m go.
+    let secs = u32::try_from(
+        bson::DateTime::now().timestamp_millis() / 1000
+            - hive_limits::START_REDELIVERY_WINDOW_SECS
+            - 60,
+    )
+    .unwrap();
+    let mut old = ObjectId::new().bytes();
+    old[..4].copy_from_slice(&secs.to_be_bytes());
+    name_fork(&app, &sid, &l.m.agent_id, ObjectId::from_bytes(old)).await;
+    send(&mut l.a.ws, tip_at(&sid, 1, 4, "ac")).await;
+    let told = read_until(&mut l.m.ws, "rc:hive.purge")
+        .await
+        .expect("past the window, the copy goes");
+    assert_eq!(told["session_id"], sid, "{told}");
+}
+
+/// FR-90 P2g-4b — a device a fork is being made from, removed while the
+/// fork's start is out, is let go at once: its removal ends every session
+/// on it first, the fork among them, so nothing holds its copy (it was told
+/// to purge everything, P2g-4a). Its row goes, its part of the purge closed
+/// `device_removed`.
+#[tokio::test]
+async fn a_member_a_fork_is_made_from_that_is_removed_is_let_go_at_once() {
+    let app = fork_app().await;
+    let (mut m, mut c) = joinable_with(&app, "forkgone", TAKES_A_COPY_TO_FORK_AND_PURGES).await;
+    let (tid, admin, sid) = (m.tid.clone(), m.admin.clone(), m.sid.clone());
+    fork_joined(&app, &mut m, &mut c, "/srv/forkgone-c", true).await;
+    read_until(&mut c.ws, "rc:hive.start")
+        .await
+        .expect("the fork's start, once the copy caught up");
+    let c_id = c.agent_id.clone();
+    wait_stored(&app, &sid, "its row names the fork", |s| {
+        member_row(s, &c_id).contains_key("forking")
+    })
+    .await;
+
+    remove_device(&app, &tid, &admin, &c_id).await;
+    wait_stored(&app, &sid, "the removed device's row goes", |s| {
+        member_row(s, &c_id).is_empty()
+    })
+    .await;
+    let all = purges_of(&app, &sid).await;
+    assert_eq!(all.len(), 1, "{all:?}");
+    let part = all[0].get_array("devices").unwrap()[0]
+        .as_document()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (
+            all[0].get_str("reason").ok(),
+            part.get_str("state").ok(),
+            part.get_str("closed").ok()
+        ),
+        (Some("leaving"), Some("closed"), Some("device_removed")),
+        "{all:?}"
+    );
 }

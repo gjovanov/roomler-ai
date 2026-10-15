@@ -76,8 +76,9 @@ use crate::HiveState;
 use crate::agent_socket::clamp_words;
 use crate::model::{
     AgentSession, HiveAuditEvent, HivePurge, MemberState, PurgeClosed, PurgeEntry, PurgeEntryState,
-    PurgeView, PurgedMark,
+    PurgeView, PurgedMark, SessionStatus,
 };
+use crate::placement::MemberRole;
 use crate::routes::{member_tenant, parse_oid};
 
 /// The server's word on an entry it could not send its purge to: the
@@ -119,7 +120,8 @@ impl PurgeDao {
             > 0)
     }
 
-    /// The owner's latest completed purge of a session whose record is gone.
+    /// The owner's latest completed purge of a session whose record is gone:
+    /// of the whole session, never a leaving member's (P2g-4b).
     pub async fn completed_of(
         &self,
         tenant_id: ObjectId,
@@ -134,6 +136,9 @@ impl PurgeDao {
                     "session_id": session_id,
                     "owner_id": owner_id,
                     "done_at": { "$type": "date" },
+                    // P2g-4b — the session's own purge, never a leaving
+                    // member's: absent on every whole-session purge.
+                    "member": Bson::Null,
                 },
                 Some(doc! { "done_at": -1 }),
             )
@@ -487,6 +492,9 @@ pub(crate) enum PurgeReason {
     /// Its organization's `retention_days` no longer keep it (P2g-3,
     /// [`crate::retention`]).
     Retention,
+    /// P2g-4b — a member that leaves, once `min` holds without it: its copy
+    /// alone ([`settle_leaving`]).
+    Leaving,
 }
 
 impl PurgeReason {
@@ -495,6 +503,7 @@ impl PurgeReason {
         match self {
             Self::Owner => "owner",
             Self::Retention => "retention",
+            Self::Leaving => "leaving",
         }
     }
 
@@ -531,6 +540,7 @@ pub(crate) async fn issue(
             devices: entries,
             at,
             done_at: None,
+            member: None,
         };
         state.purges.insert(&p).await?;
         let mark = PurgedMark {
@@ -871,27 +881,41 @@ async fn tell_other_pods(state: &HiveState, p: &HivePurge, devices: &[ObjectId])
 }
 
 /// Which of `purges` may be sent: each while its session's tombstone names
-/// it, or once the record is gone. One no tombstone names never took.
+/// it, or once the record is gone. One no tombstone names never took. P2g-4b
+/// — a leaving member's while its row names it: one placement took the
+/// member back before it was named never took either.
 async fn delivered(
     state: &HiveState,
     tenant_id: ObjectId,
     purges: Vec<HivePurge>,
 ) -> DaoResult<Vec<HivePurge>> {
     let ids: Vec<ObjectId> = purges.iter().map(|p| p.session_id).collect();
-    let named: HashMap<ObjectId, Option<ObjectId>> = state
+    let records: HashMap<ObjectId, AgentSession> = state
         .sessions
         .find_many_in_tenant(tenant_id, &ids)
         .await?
         .into_iter()
-        .filter_map(|s| Some((s.id?, s.purged.map(|m| m.purge_id))))
+        .filter_map(|s| Some((s.id?, s)))
         .collect();
     Ok(purges
         .into_iter()
-        .filter(|p| match named.get(&p.session_id) {
-            Some(mark) => *mark == Some(p.id),
-            None => true,
+        .filter(|p| match (records.get(&p.session_id), p.member) {
+            (None, _) => true,
+            (Some(s), None) => s.purged.as_ref().map(|m| m.purge_id) == Some(p.id),
+            // P2g-4b — a leaving member's: while its row names this purge,
+            // or once the whole session is being purged.
+            (Some(s), Some(device)) => s.purged.is_some() || names_purge(s, device, p.id),
         })
         .collect())
+}
+
+/// FR-90 P2g-4b — whether `s`'s row of `device` names the purge `purge_id`.
+fn names_purge(s: &AgentSession, device: ObjectId, purge_id: ObjectId) -> bool {
+    s.replicaset.as_ref().is_some_and(|r| {
+        r.members
+            .iter()
+            .any(|m| m.device_id == device && m.purging == Some(purge_id))
+    })
 }
 
 /// A device connected: every purge still waiting on it, first, before
@@ -1022,9 +1046,231 @@ pub(crate) async fn device_removed(
     Ok(())
 }
 
+/// FR-90 P2g-4b — whether `s` holds its `min` copies without `device`: its
+/// primary, while the session is live, and each member that took its copy
+/// and has said where it ends (`joined`, with a tip). A member that leaves
+/// is never one of them.
+pub(crate) fn holds_without(s: &AgentSession, device: ObjectId) -> bool {
+    let Some(r) = s.replicaset.as_ref() else {
+        return false;
+    };
+    let primary = s.location.device_id;
+    let members = r
+        .members
+        .iter()
+        .filter(|m| {
+            m.device_id != device
+                && m.device_id != primary
+                && m.role != MemberRole::Primary.as_str()
+                && m.state == MemberState::Joined
+                && m.tip.is_some()
+        })
+        .count();
+    let live = SessionStatus::LIVE.contains(&s.status) && primary != device;
+    members + usize::from(live) >= usize::try_from(r.min).unwrap_or(usize::MAX)
+}
+
+/// FR-90 P2g-4b — each member of `s` that leaves, purged once `min` holds
+/// without it: its copy alone, which makes no tombstone and leaves the
+/// session as it is. Make-before-break: never while the copies elsewhere
+/// fall short, never one placement took back, never one a fork is being
+/// made from while that fork may still need it, and with the replicaset's
+/// switch off, a promotion in flight, or the session over or purged, none.
+/// `gone` is a device being removed: its part closes at once (P2g-4a told
+/// it to purge everything). How many purges took.
+pub(crate) async fn settle_leaving(
+    state: &HiveState,
+    s: &AgentSession,
+    gone: Option<ObjectId>,
+) -> usize {
+    let (Some(sid), Some(r)) = (s.id, s.replicaset.as_ref()) else {
+        return 0;
+    };
+    if !state.replicaset
+        || s.purged.is_some()
+        || !SessionStatus::LIVE.contains(&s.status)
+        || s.promotion
+            .as_ref()
+            .is_some_and(|p| p.in_flight(DateTime::now()))
+    {
+        return 0;
+    }
+    let leaving: Vec<(ObjectId, Option<ObjectId>)> = r
+        .members
+        .iter()
+        .filter(|m| {
+            m.state == MemberState::Leaving
+                && m.purging.is_none()
+                && m.role != MemberRole::Primary.as_str()
+        })
+        .map(|m| (m.device_id, m.forking))
+        .collect();
+    let mut took = 0;
+    for (device, forking) in leaving {
+        // A fork is being made from its copy (P2f-3c): the fork's first start
+        // puts it in place from that copy, so it stays while that start is
+        // out. (A device being removed has every session on it ended first,
+        // the fork among them: `hooks::agent_removed`.)
+        if let Some(fork) = forking
+            && fork_needs_copy(state, fork).await
+        {
+            continue;
+        }
+        if !holds_without(s, device) {
+            continue;
+        }
+        let removed = Some(device) == gone;
+        match issue_leaving(state, s, sid, device, removed, forking).await {
+            Ok(true) => took += 1,
+            Ok(false) => {}
+            Err(e) => {
+                warn!(session = %sid, device = %device, %e, "hive: a leaving member's purge was not issued — the next tip or placement tries again")
+            }
+        }
+    }
+    took
+}
+
+/// One leaving member's purge: written first, then named on its row in one
+/// compare-and-set, as a session's purge is written ahead of its tombstone
+/// (P2g-2), so one whose row never took (placement took the member back,
+/// another purge took it, or a fork is now being made from its copy) is
+/// deleted and never sent. `forking` = the fork its row names, as read.
+/// `true` = it took.
+async fn issue_leaving(
+    state: &HiveState,
+    s: &AgentSession,
+    sid: ObjectId,
+    device: ObjectId,
+    removed: bool,
+    forking: Option<ObjectId>,
+) -> DaoResult<bool> {
+    let entry = if removed {
+        PurgeEntry::closed(device, PurgeClosed::DeviceRemoved)
+    } else {
+        match state
+            .fleet
+            .agents
+            .find_live_in_tenant(s.tenant_id, device)
+            .await
+        {
+            Err(DaoError::NotFound) => PurgeEntry::closed(device, PurgeClosed::DeviceRemoved),
+            Err(e) => return Err(e),
+            Ok(_) if holds_nothing(s, device) => {
+                PurgeEntry::closed(device, PurgeClosed::HoldsNothing)
+            }
+            Ok(_) => PurgeEntry::pending(device),
+        }
+    };
+    let p = HivePurge {
+        id: ObjectId::new(),
+        tenant_id: s.tenant_id,
+        session_id: sid,
+        owner_id: s.owner_id,
+        by: s.owner_id,
+        reason: PurgeReason::Leaving.as_str().to_string(),
+        room_id: None,
+        devices: vec![entry],
+        at: DateTime::now(),
+        done_at: None,
+        member: Some(device),
+    };
+    state.purges.insert(&p).await?;
+    match state
+        .sessions
+        .mark_purging(sid, device, p.id, forking)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            unissue(state, p.id).await;
+            return Ok(false);
+        }
+        Err(e) => {
+            unissue(state, p.id).await;
+            return Err(e);
+        }
+    }
+    info!(
+        session = %sid, device = %device, purge = %p.id,
+        "hive: a member that leaves is purged — min holds without it"
+    );
+    audit(
+        state,
+        &p,
+        p.by,
+        "issued",
+        Some(PurgeReason::Leaving.as_str()),
+    )
+    .await;
+    if p.complete() {
+        finish(state, p.id).await;
+    } else if send(state, &p, device).await == Sent::NotHere {
+        tell_other_pods(state, &p, &[device]).await;
+    }
+    Ok(true)
+}
+
+/// FR-90 P2g-4b — each member of `session` that leaves, purged once it may
+/// go: looked at when a member's tip lands, which may make `min` hold, and
+/// when a fork made from a leaving member's copy has had its first start
+/// answered, or the server is done trying to make it.
+pub(crate) async fn settle_session(state: &HiveState, session: ObjectId) {
+    if !state.replicaset {
+        return;
+    }
+    match state.sessions.with_leaving(session).await {
+        Ok(Some(s)) => {
+            settle_leaving(state, &s, None).await;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            debug!(session = %session, %e, "hive: a session's leaving members were not read — the next tip tries again")
+        }
+    }
+}
+
+/// FR-90 P2g-4b — whether the fork `fork`, made from a leaving member's copy
+/// (P2f-3c), may still need that copy: its first start is still out (not
+/// answered, and no run of it reported, since the copy is put in place
+/// before the launch), or its record is still to be made, which it is
+/// moments after its move ends (one not made within a start's redelivery
+/// window never will be). Unread, it may: a copy is never purged on a guess.
+async fn fork_needs_copy(state: &HiveState, fork: ObjectId) -> bool {
+    match state.sessions.find(fork).await {
+        Ok(Some(f)) => first_start_out(&f),
+        Ok(None) => may_yet_be_made(fork, DateTime::now()),
+        Err(e) => {
+            debug!(fork = %fork, %e, "hive: a fork's record was not read — the copy it is made from is kept");
+            true
+        }
+    }
+}
+
+/// A fork's first start, not yet answered and no run of it reported: the
+/// device has yet to put it in place from the copy. A purged fork is made
+/// nowhere, and a later start is made from the fork's own copy.
+fn first_start_out(f: &AgentSession) -> bool {
+    f.status == SessionStatus::Starting
+        && f.accepted_at.is_none()
+        && f.fence <= 1
+        && f.purged.is_none()
+}
+
+/// A fork with no record yet, `fork` its id as the move's end named it: the
+/// record is made moments after, and one not made within a start's
+/// redelivery window never will be.
+fn may_yet_be_made(fork: ObjectId, now: DateTime) -> bool {
+    let age_ms = now
+        .timestamp_millis()
+        .saturating_sub(fork.timestamp().timestamp_millis());
+    age_ms < hive_limits::START_REDELIVERY_WINDOW_SECS * 1000
+}
+
 /// The purge completes once no device's part is pending, and only once:
 /// the tombstone goes, the room is deleted again (should its first delete
-/// have failed), and the audit says so.
+/// have failed), and the audit says so. P2g-4b — a leaving member's: its row
+/// goes instead, and the session stays as it is.
 async fn finish(state: &HiveState, purge_id: ObjectId) {
     let p = match state.purges.complete(purge_id).await {
         Ok(Some(p)) => p,
@@ -1033,6 +1279,29 @@ async fn finish(state: &HiveState, purge_id: ObjectId) {
             return warn!(purge = %purge_id, %e, "hive: a purge's completion was not recorded");
         }
     };
+    // P2g-4b — a leaving member's: its row goes, and the session stays.
+    if let Some(device) = p.member {
+        match state
+            .sessions
+            .drop_purged_member(p.session_id, device, p.id)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                warn!(purge = %p.id, session = %p.session_id, device = %device, %e, "hive: a completed leaving purge's member row was not dropped")
+            }
+        }
+        audit(
+            state,
+            &p,
+            p.by,
+            "complete",
+            Some(PurgeReason::Leaving.as_str()),
+        )
+        .await;
+        info!(purge = %p.id, session = %p.session_id, device = %device, "hive: a leaving member's purge is complete");
+        return;
+    }
     match state.sessions.delete_tombstone(p.session_id, p.id).await {
         Ok(_) => {}
         Err(e) => {
@@ -1071,6 +1340,8 @@ mod tests {
             refusal: refusal.map(str::to_string),
             answered_at: None,
             tip: None,
+            purging: None,
+            forking: None,
         }
     }
 
@@ -1266,6 +1537,7 @@ mod tests {
             devices: vec![PurgeEntry::pending(ObjectId::new())],
             at: DateTime::now(),
             done_at: None,
+            member: None,
         };
         let v = serde_json::to_value(PurgeResponse::of(&p, 0)).unwrap();
         assert_eq!(v["outcome"], "purging", "{v}");
@@ -1288,5 +1560,132 @@ mod tests {
         assert_eq!(v["outcome"], "refused", "{v}");
         assert_eq!(v["reason"], "in_progress", "{v}");
         assert!(v.get("purge").is_none(), "{v}");
+    }
+
+    /// FR-90 P2g-4b — `min` holds without a member only on the copies
+    /// elsewhere: the primary of a live session, and each member that took
+    /// its copy and said where it ends. Never the member itself, one that
+    /// has said nothing, one that leaves, nor the primary of a session that
+    /// is over.
+    #[test]
+    fn min_holds_without_a_member_only_on_the_copies_elsewhere() {
+        use crate::model::MemberTip;
+        let [a, b, c, d]: [ObjectId; 4] = std::array::from_fn(|_| ObjectId::new());
+        let tipped = |device, state| ReplicaMember {
+            tip: Some(MemberTip {
+                fence: 3,
+                seq: 9,
+                hash: "0".repeat(64),
+                checkpoint_seq: Some(9),
+                checkpoint_hash: None,
+                at: DateTime::now(),
+            }),
+            ..member(device, state, None)
+        };
+        let mut s = session(a);
+        s.replicaset = Some(Replicaset {
+            policy_revision: 1,
+            min: 2,
+            max: 3,
+            restricted_tags: Vec::new(),
+            members: vec![
+                ReplicaMember {
+                    role: MemberRole::Primary.as_str().into(),
+                    ..tipped(a, MemberState::Joined)
+                },
+                tipped(b, MemberState::Joined),
+                member(c, MemberState::Joined, None),
+                tipped(d, MemberState::Leaving),
+            ],
+            short: None,
+            placed_at: DateTime::now(),
+        });
+        assert!(holds_without(&s, d), "the primary and b: two");
+        assert!(
+            !holds_without(&s, b),
+            "without b: the primary alone, c has said nothing and d leaves"
+        );
+        s.status = SessionStatus::Ended;
+        assert!(
+            !holds_without(&s, d),
+            "the primary of a session that is over is not counted"
+        );
+        s.status = SessionStatus::Idle;
+        s.replicaset.as_mut().unwrap().min = 3;
+        assert!(!holds_without(&s, d), "min 3: d is still needed");
+        s.replicaset.as_mut().unwrap().min = 0;
+        assert!(holds_without(&s, b), "min 0: always");
+    }
+
+    /// FR-90 P2g-4b — a fork made from a leaving member's copy needs that
+    /// copy while its first start is out: unanswered, no run of it reported,
+    /// at its first fence, no tombstone. One whose record is not made yet
+    /// needs it for a start's redelivery window from the fork's id, and no
+    /// longer.
+    #[test]
+    fn a_fork_needs_its_copy_only_while_its_first_start_is_out() {
+        let out = AgentSession {
+            status: SessionStatus::Starting,
+            fence: 1,
+            accepted_at: None,
+            ..session(ObjectId::new())
+        };
+        assert!(first_start_out(&out), "unanswered, at its first fence");
+        let answered = AgentSession {
+            accepted_at: Some(DateTime::now()),
+            ..out.clone()
+        };
+        assert!(
+            !first_start_out(&answered),
+            "answered: the copy is in place"
+        );
+        let ran = AgentSession {
+            status: SessionStatus::Idle,
+            ..out.clone()
+        };
+        assert!(
+            !first_start_out(&ran),
+            "a run reported: the copy is in place"
+        );
+        let lost = AgentSession {
+            status: SessionStatus::Lost,
+            ..out.clone()
+        };
+        assert!(!first_start_out(&lost), "a start never to be answered");
+        let moved = AgentSession {
+            fence: 2,
+            ..out.clone()
+        };
+        assert!(
+            !first_start_out(&moved),
+            "a later start is made from the fork's own copy"
+        );
+        let purged = AgentSession {
+            purged: Some(PurgedMark {
+                purge_id: ObjectId::new(),
+                by: ObjectId::new(),
+                at: DateTime::now(),
+            }),
+            ..out
+        };
+        assert!(!first_start_out(&purged), "a purged fork is made nowhere");
+
+        let now = DateTime::now();
+        let named_ago = |ms: i64| {
+            let secs = u32::try_from((now.timestamp_millis() - ms) / 1000).unwrap();
+            let mut b = ObjectId::new().bytes();
+            b[..4].copy_from_slice(&secs.to_be_bytes());
+            ObjectId::from_bytes(b)
+        };
+        let window = hive_limits::START_REDELIVERY_WINDOW_SECS * 1000;
+        assert!(may_yet_be_made(named_ago(0), now), "named just now");
+        assert!(
+            may_yet_be_made(named_ago(window - 5_000), now),
+            "still within the window"
+        );
+        assert!(
+            !may_yet_be_made(named_ago(window + 1_000), now),
+            "past the window it never will be"
+        );
     }
 }

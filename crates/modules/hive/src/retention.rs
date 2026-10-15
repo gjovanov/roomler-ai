@@ -288,6 +288,7 @@ mod tests {
         );
         assert_eq!(PurgeReason::Retention.as_str(), "retention");
         assert_eq!(PurgeReason::Owner.as_str(), "owner");
+        assert_eq!(PurgeReason::Leaving.as_str(), "leaving");
         let every = [
             SessionStatus::Starting,
             SessionStatus::Idle,
