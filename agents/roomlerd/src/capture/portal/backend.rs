@@ -572,8 +572,13 @@ impl ScreenCapture for PortalCapture {
             // legitimately produces nothing, and `Ok(None)` is the pump's
             // "nothing this tick".
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            // FR-93 P6c — why the helper ended is in its exit status, which
+            // follows its stdout closing within moments.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err(anyhow!("the portal helper stopped producing frames"))
+                let child = &mut self.child;
+                let code = tokio::task::block_in_place(|| reap(child, HELPER_EXIT_WAIT))
+                    .and_then(|s| s.code());
+                Err(helper_ended(code, screen_stop_enabled()))
             }
         }
     }
@@ -607,6 +612,47 @@ impl ScreenCapture for PortalCapture {
     fn waits_for(&self) -> Option<crate::capture::WaitFor> {
         let (away, read_began) = self.watch.as_ref()?.last();
         away_now(away, read_began, self.last_frame).then_some(crate::capture::WaitFor::SessionAway)
+    }
+}
+
+/// FR-93 P6c kill switch `ROOMLERD_SCREEN_STOP=0`: a share stopped at the
+/// screen is reopened, as before P6c.
+fn screen_stop_enabled() -> bool {
+    tunnel_core::env::flag("SCREEN_STOP", true)
+}
+
+/// How long a pump waits for a helper whose stdout closed to exit.
+const HELPER_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// FR-93 P6c — the helper's exit status once its stdout has closed: the pipe
+/// closes as the process exits, so the status follows within moments. Bounded,
+/// so a helper that closed its stdout and lingers cannot hold the pump.
+fn reap(
+    child: &mut std::process::Child,
+    within: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let until = std::time::Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// FR-93 P6c — what a pump reads when the helper stopped. The person's Stop
+/// is typed, and the pump ends the session; any other end is the error it
+/// always was, and the pump reopens. The status goes in for the journal.
+fn helper_ended(code: Option<i32>, honour_stop: bool) -> anyhow::Error {
+    match code {
+        Some(c) if c == super::helper::EXIT_STOPPED_AT_SCREEN && honour_stop => {
+            anyhow::Error::new(crate::capture::StoppedAtScreen)
+        }
+        Some(c) => anyhow!("the portal helper stopped producing frames (exit status {c})"),
+        None => anyhow!("the portal helper stopped producing frames"),
     }
 }
 
@@ -684,5 +730,43 @@ mod tests {
         assert!(pixel_format_of(ty::VIDEO_FORMAT_BGRA).is_ok());
         let e = pixel_format_of(99).unwrap_err().to_string();
         assert!(e.contains("not in our offer"), "{e}");
+    }
+
+    /// FR-93 P6c — only the person's Stop is typed, so only it ends the
+    /// session, and `ROOMLERD_SCREEN_STOP=0` makes it the plain error that
+    /// reopens. Every other end keeps the error it was, with its status.
+    #[test]
+    fn only_the_stop_at_the_screen_is_typed_and_the_switch_turns_it_off() {
+        let stop = super::super::helper::EXIT_STOPPED_AT_SCREEN;
+        let typed = |e: anyhow::Error| crate::capture::stopped_at_screen(&e);
+        assert!(typed(helper_ended(Some(stop), true)));
+        assert!(!typed(helper_ended(Some(stop), false)));
+        for code in [Some(0), Some(1), Some(3), Some(4), None] {
+            assert!(!typed(helper_ended(code, true)), "{code:?}");
+        }
+        let e = helper_ended(Some(3), true).to_string();
+        assert!(e.contains("exit status 3"), "{e}");
+    }
+
+    /// P6c — a real child's status is read once it has exited, and a child
+    /// still running is not waited on past the bound.
+    #[test]
+    fn a_helper_s_status_is_reaped_within_the_bound() {
+        let mut done = std::process::Command::new("sh")
+            .args(["-c", "exit 5"])
+            .spawn()
+            .unwrap();
+        let status = reap(&mut done, std::time::Duration::from_secs(5));
+        assert_eq!(status.and_then(|s| s.code()), Some(5));
+
+        let mut running = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        assert!(reap(&mut running, std::time::Duration::from_millis(100)).is_none());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+        let _ = running.kill();
+        let _ = running.wait();
     }
 }

@@ -74,6 +74,8 @@ use zbus::zvariant::{OwnedValue, Value};
 use super::{PORTAL_BUS, PORTAL_PATH, REMOTE_DESKTOP_IFACE, SCREENCAST_IFACE};
 
 const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
+/// FR-93 P6c — the session object, whose `Closed` says the portal ended it.
+const SESSION_IFACE: &str = "org.freedesktop.portal.Session";
 
 /// `SelectSources.types` — monitors only.
 ///
@@ -479,7 +481,8 @@ fn open_blocking(kind: SessionKind, source: SourceKind) -> Result<Session, OpenE
             pipewire: super::pipewire::PipeWireStatus::NotAttempted,
         },
         pipewire_fd,
-        input_session: input_granted.then(|| sess_path.into()),
+        input_session: input_granted.then(|| sess_path.clone().into()),
+        path: sess_path.into(),
         conn,
     })
 }
@@ -500,6 +503,9 @@ pub struct Session {
     /// were granted. What [`super::input::InputContext`] addresses `Notify*`
     /// calls at.
     pub input_session: Option<zbus::zvariant::OwnedObjectPath>,
+    /// FR-93 P6c — the session's object path, always: [`Self::on_closed`]
+    /// watches it.
+    path: zbus::zvariant::OwnedObjectPath,
     /// ⚠️⚠️ **Holding this open is what keeps the PipeWire node alive.**
     ///
     /// A portal session is owned by the D-Bus connection that created it. Drop
@@ -520,6 +526,50 @@ impl Session {
     /// RemoteDesktop proxy over this — same connection, same session.
     pub fn connection(&self) -> &zbus::blocking::Connection {
         &self.conn
+    }
+
+    /// FR-93 P6c — `on_closed` runs, once, when the portal closes this
+    /// session: the person at the screen ended it with the desktop's own
+    /// control (KDE's End in its screen-sharing indicator), or the compositor
+    /// closed it (GNOME, at a screen lock). On its own thread, on this
+    /// session's own connection: the portal sends `Closed` to the session's
+    /// owner only, so a second connection would never hear it. A watcher that
+    /// cannot subscribe says so and watches nothing, which leaves the capture
+    /// to end with its stream, as before.
+    pub fn on_closed(&self, on_closed: impl FnOnce() + Send + 'static) {
+        let path = self.path.clone();
+        let conn = self.conn.clone();
+        let spawned = std::thread::Builder::new()
+            .name("portal-closed".into())
+            .spawn(move || {
+                let proxy =
+                    match zbus::blocking::Proxy::new(&conn, PORTAL_BUS, &path, SESSION_IFACE) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!(
+                                "portal-helper: could not watch the portal session for Closed \
+                                 ({e}); a share ended at the screen ends with its stream"
+                            );
+                            return;
+                        }
+                    };
+                let mut closed = match proxy.receive_signal("Closed") {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!(
+                            "portal-helper: could not subscribe to the portal session's Closed \
+                             ({e}); a share ended at the screen ends with its stream"
+                        );
+                        return;
+                    }
+                };
+                if closed.next().is_some() {
+                    on_closed();
+                }
+            });
+        if let Err(e) = spawned {
+            eprintln!("portal-helper: no thread to watch the portal session for Closed ({e})");
+        }
     }
 }
 

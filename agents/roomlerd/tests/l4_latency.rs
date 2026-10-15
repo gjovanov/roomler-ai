@@ -716,6 +716,7 @@ async fn run_cell(cell: Cell) -> Result<Run> {
         "l0-harness".into(),
         None,
         RcOverlay::default(),
+        roomlerd::rc_sessions::RcSessionRegistry::new(),
     )
     .await
     .context("AgentPeer::new")?;

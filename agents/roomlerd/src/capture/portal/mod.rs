@@ -463,6 +463,142 @@ pub mod helper {
     /// it. The parent reopens, which records the monitor anew.
     const EXIT_STREAM_ENDED: i32 = 4;
 
+    /// FR-93 P6c — the exit status when the person at the screen stopped the
+    /// share with the desktop's own control: Stop on GNOME's screen-sharing
+    /// indicator, End on KDE's. The parent does NOT reopen: it ends the
+    /// remote-control session as the person's Disconnect does. Reopening is
+    /// what made the control a no-op (measured on 0.4.135: GNOME's Stop undone
+    /// 0.5 s later by a new unattended screencast).
+    pub(crate) const EXIT_STOPPED_AT_SCREEN: i32 = 5;
+
+    /// FR-93 P6c — who closed the session a streaming helper records, as far
+    /// as the helper can tell once it is closed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ClosedBy {
+        /// The screen locked (GNOME closes every screen cast at its lock). The
+        /// parent reopens, and the reopen waits for the unlock (P5b).
+        Lock,
+        /// The person at the screen, with the desktop's own control.
+        Person,
+        /// The compositor restarted (KWin after a crash, P5d): the parent
+        /// reopens, which restores the session from its token.
+        Restart,
+        /// Nothing could tell. The parent reopens, the rule before P6c, so a
+        /// doubt never ends anyone's session.
+        Unknown,
+    }
+
+    impl ClosedBy {
+        fn exit_code(self) -> i32 {
+            match self {
+                ClosedBy::Person => EXIT_STOPPED_AT_SCREEN,
+                ClosedBy::Restart => EXIT_STREAM_ENDED,
+                ClosedBy::Lock | ClosedBy::Unknown => EXIT_SESSION_CLOSED,
+            }
+        }
+
+        fn reads(self) -> &'static str {
+            match self {
+                ClosedBy::Lock => "the screen is locked",
+                ClosedBy::Person => {
+                    "the person at the screen stopped the share with the desktop's own control"
+                }
+                ClosedBy::Restart => "its compositor restarted",
+                ClosedBy::Unknown => "nothing could tell why",
+            }
+        }
+    }
+
+    /// FR-93 P6c — mutter closed its own session. Only its refusal of a new
+    /// one tells GNOME's lock from the person's Stop
+    /// ([`super::mutter::creation_inhibited`]), and a probe that could not ask
+    /// is a doubt.
+    fn closed_mutter(inhibited: Option<bool>) -> ClosedBy {
+        match inhibited {
+            Some(true) => ClosedBy::Lock,
+            Some(false) => ClosedBy::Person,
+            None => ClosedBy::Unknown,
+        }
+    }
+
+    /// FR-93 P6c — the desktop portal closed its session. Where mutter answers
+    /// (GNOME's portal) its probe decides, as on mutter's own arm. Elsewhere
+    /// (KDE): a compositor that restarted, else the lock as the desktop says
+    /// it; only a screen positively read as unlocked is the person.
+    ///
+    /// ⚠️ KDE's portal also closes a session whose last stream the compositor
+    /// ended, such as a monitor unplugged while shared, and that reads as the
+    /// person here. Nothing on the bus tells the two apart.
+    fn closed_portal(
+        mutter_inhibited: Option<bool>,
+        compositor_restarted: bool,
+        locked: Option<bool>,
+    ) -> ClosedBy {
+        if mutter_inhibited.is_some() {
+            return closed_mutter(mutter_inhibited);
+        }
+        if compositor_restarted {
+            return ClosedBy::Restart;
+        }
+        match locked {
+            Some(true) => ClosedBy::Lock,
+            Some(false) => ClosedBy::Person,
+            None => ClosedBy::Unknown,
+        }
+    }
+
+    /// Say who closed the session, and end the helper with the status that
+    /// tells the parent what to do.
+    fn end_closed(arm: &str, by: ClosedBy) -> ! {
+        eprintln!(
+            "portal-helper: {arm} closed the session: {}; ending the capture",
+            by.reads()
+        );
+        std::process::exit(by.exit_code());
+    }
+
+    /// FR-93 P6c — KWin's well-known name, whose owner changes when KWin
+    /// restarts: its wrapper restarts it after a crash (P5d).
+    const KWIN_BUS: &str = "org.kde.KWin";
+
+    /// How long a closed portal session waits before asking who closed it, so
+    /// a compositor that crashed has left the bus by then.
+    const CLOSED_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// The unique name that owns `name` on the session bus, or `None`.
+    fn name_owner(conn: &zbus::blocking::Connection, name: &str) -> Option<String> {
+        let reply = conn
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "GetNameOwner",
+                &(name,),
+            )
+            .ok()?;
+        reply.body().deserialize::<String>().ok()
+    }
+
+    /// FR-93 P6c — whether the screen is locked, as KDE (and every desktop
+    /// that follows its API) says over `org.freedesktop.ScreenSaver`. `None`
+    /// where nothing answers.
+    fn screensaver_active(conn: &zbus::blocking::Connection) -> Option<bool> {
+        ["/org/freedesktop/ScreenSaver", "/ScreenSaver"]
+            .into_iter()
+            .find_map(|path| {
+                let reply = conn
+                    .call_method(
+                        Some("org.freedesktop.ScreenSaver"),
+                        path,
+                        Some("org.freedesktop.ScreenSaver"),
+                        "GetActive",
+                        &(),
+                    )
+                    .ok()?;
+                reply.body().deserialize::<bool>().ok()
+            })
+    }
+
     /// The helper's frame loop, both arms: frames to `out` (stdout) until the
     /// parent closes the pipe (the normal end, quietly) or, FR-93 P5c/P5d, the
     /// stream's source is gone. Frames alone cannot tell that apart from an
@@ -607,6 +743,61 @@ pub mod helper {
             want.extend([2u8; 4]);
             assert_eq!(out, want, "the first frame, then the stream's");
             assert!(handle.first.is_none(), "written once");
+        }
+    }
+
+    #[cfg(test)]
+    mod closed_tests {
+        use super::{
+            ClosedBy, EXIT_SESSION_CLOSED, EXIT_STOPPED_AT_SCREEN, EXIT_STREAM_ENDED,
+            closed_mutter, closed_portal,
+        };
+
+        /// FR-93 P6c — mutter's refusal of a new session is the lock; a new
+        /// session allowed is the person's Stop; a probe that could not ask
+        /// is a doubt, which reopens as before P6c.
+        #[test]
+        fn mutter_tells_the_lock_from_the_person_by_its_refusal() {
+            assert_eq!(closed_mutter(Some(true)), ClosedBy::Lock);
+            assert_eq!(closed_mutter(Some(false)), ClosedBy::Person);
+            assert_eq!(closed_mutter(None), ClosedBy::Unknown);
+        }
+
+        /// P6c — the portal's close: mutter's probe first wherever it answers
+        /// (GNOME's portal), whatever the other readings say; then a
+        /// restarted compositor; then only an unlocked screen, positively
+        /// read, is the person.
+        #[test]
+        fn the_portal_ends_the_session_only_on_an_unlocked_screen() {
+            assert_eq!(closed_portal(Some(true), true, Some(false)), ClosedBy::Lock);
+            assert_eq!(closed_portal(Some(false), false, None), ClosedBy::Person);
+            assert_eq!(closed_portal(None, true, Some(false)), ClosedBy::Restart);
+            assert_eq!(closed_portal(None, false, Some(true)), ClosedBy::Lock);
+            assert_eq!(closed_portal(None, false, Some(false)), ClosedBy::Person);
+            assert_eq!(closed_portal(None, false, None), ClosedBy::Unknown);
+        }
+
+        /// P6c — only the person's close stops the reopen. The parent reads
+        /// these numbers, so each verdict keeps the status it had before.
+        #[test]
+        fn only_the_person_exits_with_the_status_that_ends_the_session() {
+            assert_eq!(ClosedBy::Person.exit_code(), EXIT_STOPPED_AT_SCREEN);
+            assert_eq!(ClosedBy::Restart.exit_code(), EXIT_STREAM_ENDED);
+            assert_eq!(ClosedBy::Lock.exit_code(), EXIT_SESSION_CLOSED);
+            assert_eq!(ClosedBy::Unknown.exit_code(), EXIT_SESSION_CLOSED);
+            let all = [
+                EXIT_SESSION_CLOSED,
+                EXIT_STREAM_ENDED,
+                EXIT_STOPPED_AT_SCREEN,
+            ];
+            assert!(
+                !all.contains(&0) && !all.contains(&1),
+                "neither the normal end nor a failure"
+            );
+            assert_eq!(
+                all.iter().collect::<std::collections::HashSet<_>>().len(),
+                3
+            );
         }
     }
 
@@ -781,6 +972,36 @@ pub mod helper {
             std::process::exit(1);
         }
 
+        // FR-93 P6c — the portal closes the session when the person at the
+        // screen ends the share with the desktop's own control (KDE's End),
+        // and the stream then ends with it: before this the reopen restored
+        // the session from its token 3 s later, undoing the End. Whose close
+        // it was is asked once it happened; KWin's bus owner, read now, is
+        // what tells a crashed compositor apart (P5d's reopen). Read OFF this
+        // thread, which is the runtime's: zbus's blocking API panics on it
+        // (the input context's rule above).
+        let kwin = {
+            let conn = session.connection().clone();
+            std::thread::spawn(move || name_owner(&conn, KWIN_BUS))
+                .join()
+                .ok()
+                .flatten()
+        };
+        session.on_closed(move || {
+            std::thread::sleep(CLOSED_SETTLE);
+            let conn = zbus::blocking::Connection::session().ok();
+            let restarted =
+                kwin.is_some() && conn.as_ref().and_then(|c| name_owner(c, KWIN_BUS)) != kwin;
+            end_closed(
+                "the desktop portal",
+                closed_portal(
+                    super::mutter::creation_inhibited(),
+                    restarted,
+                    conn.as_ref().and_then(screensaver_active),
+                ),
+            )
+        });
+
         // From here on stdout carries nothing but frames. FR-93 P5d — a
         // compositor that restarts (KWin, after a crash) takes the portal's
         // stream with it and leaves ours paused, with no error: measured on
@@ -921,12 +1142,14 @@ pub mod helper {
         // keep the last one. End the capture instead. The daemon's pump reopens
         // it, and the reopen waits for the unlock with the controller told why
         // (`capture::open_through_wait`).
+        //
+        // FR-93 P6c — Stop on GNOME's screen-sharing indicator closes it too,
+        // and the reopen undid it 0.5 s later. mutter's refusal of a new
+        // session tells the lock from the person, whose Stop ends the
+        // remote-control session instead (`EXIT_STOPPED_AT_SCREEN`).
         session.on_closed(|| {
-            eprintln!(
-                "portal-helper: mutter closed the session (GNOME closes every screen cast when its \
-                 screen locks); ending the capture"
-            );
-            std::process::exit(EXIT_SESSION_CLOSED);
+            let inhibited = super::mutter::creation_inhibited();
+            end_closed("mutter", closed_mutter(inhibited))
         });
 
         // ⚠️ `session` must stay alive for the whole loop — mutter tears the

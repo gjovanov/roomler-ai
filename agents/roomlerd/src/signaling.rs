@@ -3485,6 +3485,10 @@ async fn handle_server_msg(
                     .to_string()
                 }),
                 rc_overlay,
+                // FR-93 P6c — where the media pump ends this session when the
+                // person at the screen stops the share with the desktop's own
+                // control: the same kill path as their Disconnect.
+                indicator.sessions().clone(),
             )
             .await
             {

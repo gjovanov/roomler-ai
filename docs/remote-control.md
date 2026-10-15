@@ -230,7 +230,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 | How the overlay gets in | Filter (off) | Where |
 |---|---|---|
-| A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:379` |
+| A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:383` |
 | An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:406`, `crates/modules/fleet/src/hub.rs:1455` |
 | A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1410`, `peer.rs:1449`, `peer.rs:1378` |
 
@@ -1070,6 +1070,18 @@ that kept the peer serving would hand the controller up to a second more of
 the machine its owner had just taken back, so the arm stops serving first and
 only the connection waits for the viewer to hear why.
 
+**A stop at the screen takes the same arm** (FR-93 P6c). On a Linux desktop
+the person at the screen can stop a screen share with the desktop's own
+control: **Stop** on GNOME's screen-sharing pill, **End** in the menu of KDE's
+screen-sharing tray icon. Before P6c the daemon reopened the capture behind
+them, half a second later on GNOME. Now the media pump that lost its capture to
+such a stop asks the session registry for the session's Disconnect
+(`RcSessionRegistry::disconnect`, the companion banner's own path), the
+followers of a shared pipeline first, and never reopens. The wire says
+`host_disconnect`, the viewer is told who ended it, and a recording stops. How
+the daemon tells a stop from a lock or a compositor crash is in
+[`linux-capture.md`](linux-capture.md) §5.7.
+
 Ordinary drops are untouched: `agent_disconnect` and `error` still
 re-create the session, as do a failed peer and a control channel that closes
 mid-session (the S3 ladder in `useRemoteControl.ts`, `scheduleReconnect`).
@@ -1575,7 +1587,7 @@ system guest, idle 60 s after each of three 2-minute DRM sessions, with gdb's
 | session 3 | 303 MB | 256 MB | 290 MB | **9.2 MB** | 32 |
 | one `malloc_trim(0)` | **89 MB** | **42 MB** | 290 MB | 9.2 MB | 32 |
 
-So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1579`) asks for a trim, and
+So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1584`) asks for a trim, and
 `agents/roomlerd/src/mem_trim.rs:33` runs `malloc_trim(0)` once, on a short-lived
 `mem-trim` thread, **5 s after the last session ended**. The delay lets the
 encoder thread finish freeing (`encode/thread.rs:257` joins it), and sessions
