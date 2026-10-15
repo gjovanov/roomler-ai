@@ -247,6 +247,91 @@ impl Drop for PowerKeeper {
     }
 }
 
+/// What the display assertions are called in `pmset -g assertions`.
+#[cfg(target_os = "macos")]
+const DISPLAY_REASON: &str = "roomler: a remote viewer is watching this screen";
+
+/// macOS — the screen a remote viewer is watching has to be ON.
+///
+/// A sleeping display composites nothing, so a `CGDisplayStream` opened on it
+/// delivers no frame at all: the session connects, the capture opens, no
+/// encoder is ever built, and the viewer gives up and reconnects — in a loop.
+/// Field-hit 2026-10-15 on a MacBook whose display had idled off
+/// (`system_profiler SPDisplaysDataType`: `Display Asleep: Yes`) while the
+/// machine itself stayed up.
+///
+/// The keeper above cannot fix that and should not: it holds
+/// `PreventUserIdleSystemSleep`, which keeps the MACHINE reachable and lets the
+/// display go dark on purpose. An SSH session or an `exec` has no business
+/// lighting the screen. Only capture needs the pixels, so only capture takes
+/// this — held by the capture worker, for exactly as long as it captures.
+///
+/// Two assertions, for two jobs:
+/// * `IOPMAssertionDeclareUserActivity` (`caffeinate -u`) — the user is
+///   active, so power the display on NOW if it is off.
+/// * `PreventUserIdleDisplaySleep` (`caffeinate -d`) — keep it on while the
+///   capture lives. A view-only session injects no input to count as activity,
+///   so without this it would go dark again at the display-sleep timeout.
+///
+/// Both are released on drop, and powerd drops both itself when the process
+/// dies, so neither can outlive the capture that took it.
+///
+/// ⚠️ Waking the display unlocks nothing: a locked Mac wakes to its lock
+/// screen, and that is what the viewer sees.
+/// ⚠️ A closed lid with no external display cannot be woken by any assertion
+/// (the module note above).
+#[cfg(target_os = "macos")]
+pub struct DisplayAwake {
+    activity: Option<imp::Handle>,
+    hold: Option<imp::Handle>,
+    was_asleep: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl DisplayAwake {
+    pub fn acquire() -> Self {
+        let was_asleep = imp::display_asleep();
+        let activity = imp::declare_user_activity(DISPLAY_REASON)
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "power: could not wake the display for a viewer"),
+            )
+            .ok();
+        let hold = imp::acquire_typed(imp::DISPLAY_ASSERTION_TYPE, DISPLAY_REASON)
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "power: could not keep the display on for a viewer"),
+            )
+            .ok();
+        tracing::info!(
+            was_asleep,
+            woke = activity.is_some(),
+            held = hold.is_some(),
+            "power: a viewer is watching — the display stays on while they do"
+        );
+        Self {
+            activity,
+            hold,
+            was_asleep,
+        }
+    }
+
+    /// Whether the main display was asleep when the viewer arrived.
+    pub fn was_asleep(&self) -> bool {
+        self.was_asleep
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for DisplayAwake {
+    fn drop(&mut self) {
+        for h in [self.hold.take(), self.activity.take()]
+            .into_iter()
+            .flatten()
+        {
+            imp::release(h);
+        }
+    }
+}
+
 /// Run the keeper for the process lifetime.
 ///
 /// `sessions` reports whether any rc session is live; it is polled rather than
@@ -312,6 +397,15 @@ mod imp {
     /// not because it is known to be better.
     const ASSERTION_TYPE: &str = "PreventUserIdleSystemSleep";
 
+    /// `kIOPMAssertionTypePreventUserIdleDisplaySleep` — what `caffeinate -d`
+    /// takes. It implies the system stays up as well.
+    pub const DISPLAY_ASSERTION_TYPE: &str = "PreventUserIdleDisplaySleep";
+    /// `kIOPMUserActiveLocal`: the user is at the machine, so the display
+    /// powers on. Not `kIOPMUserActiveRemote`, which by its header keeps
+    /// components at the power level of a user who is NOT in front of the
+    /// screen — and a remote viewer needs exactly the screen.
+    const USER_ACTIVE_LOCAL: u32 = 0;
+
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         fn CFStringCreateWithBytes(
@@ -333,12 +427,26 @@ mod imp {
             assertion_id: *mut u32,
         ) -> i32;
         fn IOPMAssertionRelease(assertion_id: u32) -> i32;
+        /// What `caffeinate -u` calls: declares the user active, which powers
+        /// the display on if it is off. Any process may call it.
+        fn IOPMAssertionDeclareUserActivity(
+            assertion_name: CFStringRef,
+            user_type: u32,
+            assertion_id: *mut u32,
+        ) -> i32;
         /// Returns `kIOPSTimeRemainingUnlimited` (-2.0) on mains power,
         /// `kIOPSTimeRemainingUnknown` (-1.0) while it is still working it out,
         /// and a positive number of seconds on battery. One call, a plain
         /// `f64` return, and no CoreFoundation objects to own — which is why
         /// it is used here rather than `IOPSCopyPowerSourcesInfo`.
         fn IOPSGetTimeRemainingEstimate() -> f64;
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGMainDisplayID() -> u32;
+        /// `boolean_t` — an `int`.
+        fn CGDisplayIsAsleep(display: u32) -> i32;
     }
 
     /// Wrap a Rust `&str` as a CFString. Caller owns the result.
@@ -357,7 +465,14 @@ mod imp {
     }
 
     pub fn acquire(reason: &str) -> std::io::Result<Handle> {
-        let ty = cfstr(super::ASSERTION_TYPE_OVERRIDE.unwrap_or(ASSERTION_TYPE));
+        acquire_typed(
+            super::ASSERTION_TYPE_OVERRIDE.unwrap_or(ASSERTION_TYPE),
+            reason,
+        )
+    }
+
+    pub fn acquire_typed(ty: &str, reason: &str) -> std::io::Result<Handle> {
+        let ty = cfstr(ty);
         let name = cfstr(reason);
         if ty.is_null() || name.is_null() {
             // SAFETY: CFRelease tolerates only non-null; guarded.
@@ -396,6 +511,35 @@ mod imp {
         unsafe {
             IOPMAssertionRelease(h.0);
         }
+    }
+
+    /// Wake the display, as `caffeinate -u` does. The returned assertion
+    /// postpones display sleep until it is released (or powerd times it out
+    /// at the display-sleep setting — releasing a timed-out id is harmless).
+    pub fn declare_user_activity(reason: &str) -> std::io::Result<Handle> {
+        let name = cfstr(reason);
+        if name.is_null() {
+            return Err(std::io::Error::other("could not build a CFString"));
+        }
+        let mut id: u32 = 0;
+        // SAFETY: `name` is a valid, non-null CFString for the call and `id` a
+        // valid out-pointer.
+        let rc = unsafe { IOPMAssertionDeclareUserActivity(name, USER_ACTIVE_LOCAL, &mut id) };
+        // SAFETY: we own `name`; IOKit copies what it keeps.
+        unsafe { CFRelease(name) };
+        if rc == 0 {
+            Ok(Handle(id))
+        } else {
+            Err(std::io::Error::other(format!(
+                "IOPMAssertionDeclareUserActivity failed: {rc}"
+            )))
+        }
+    }
+
+    pub fn display_asleep() -> bool {
+        // SAFETY: neither call takes a pointer; the id is one CoreGraphics
+        // just returned.
+        unsafe { CGDisplayIsAsleep(CGMainDisplayID()) != 0 }
     }
 
     pub fn on_ac() -> Option<bool> {

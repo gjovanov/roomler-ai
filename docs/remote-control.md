@@ -320,6 +320,36 @@ frames (`scrap_backend::primary` preflights and warns for that shape);
 current macOS fails the open outright, which is what reaches the classifier
 here.
 
+⚠️ **A sleeping macOS display streams nothing, and fails nothing either.** The
+stream opens, `capture: backend=scrap` logs, and then no frame ever arrives:
+no encoder is built, and the viewer gives up after its no-picture window and
+reconnects, in a loop. Field-hit 2026-10-15 on a MacBook whose display had idled
+off while the machine stayed up (FR-55's keeper holds
+`PreventUserIdleSystemSleep`, which keeps the **machine** reachable and lets the
+display sleep, on purpose). The capture worker now takes
+`power::DisplayAwake` for its whole life
+(`agents/roomlerd/src/capture/scrap_backend.rs:138`,
+`agents/roomlerd/src/power.rs:284`): `IOPMAssertionDeclareUserActivity` wakes
+the display (`caffeinate -u`), and `PreventUserIdleDisplaySleep` keeps it on,
+so a view-only session, which injects no input to count as activity, does not
+go dark at the display-sleep timeout. Only capture takes it: an SSH session or
+an `exec` must not light the screen. The two log lines that show it working:
+`power: a viewer is watching — the display stays on while they do`
+(`was_asleep=true`), then `capture: the first frame after waking the display`.
+A locked Mac wakes to its lock screen, which is what the viewer sees.
+
+⚠️ **A `CGDisplayStream` is released only after it reports `Stopped`.**
+`CGDisplayStreamStop` is asynchronous, and upstream scrap released the stream
+on the next line. A frame delivery CoreGraphics had already queued then ran
+against the freed stream: `EXC_BAD_ACCESS` in SkyLight's
+`_CGYDisplayStreamFrameAvailable`, on the `quadrupleslap.scrap` queue, right
+after a session ended. Each crash took the GUI worker down and lengthened the
+supervisor's restart backoff while the next viewer waited. The vendored fork's
+`Drop` (`crates/vendored/scrap/src/quartz/capturer.rs:106`) now hands the
+stream to a latch. It is released only once `Stopped` has arrived, from a
+thread of its own, behind a barrier on the queue. A `Stopped` that never comes
+leaks one stream instead.
+
 ### 5.2 Encoder selection
 
 Picked at agent startup, redetected on GPU change:

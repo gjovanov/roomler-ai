@@ -16,6 +16,13 @@
 # pointer in the frame. DXGI's first output need not be the primary monitor,
 # and an X11 monitor is a rectangle of the root window.
 #
+# The quartz `Capturer`'s `Drop` releases the stream only after CoreGraphics
+# reports `Stopped` (upstream left it as a TODO). `CGDisplayStreamStop` is
+# asynchronous, and releasing on the next line let an already-queued frame
+# delivery run against the freed stream: a SIGSEGV in SkyLight's
+# `_CGYDisplayStreamFrameAvailable` after every session. Field-hit on a
+# MacBook, 2026-10-15.
+#
 #   scripts/revendor-scrap.sh [version]           rebuild the vendored tree from
 #                                                 upstream + patch (use on a bump)
 #   scripts/revendor-scrap.sh --check [version]   verify tree == upstream+patch
