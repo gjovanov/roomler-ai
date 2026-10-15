@@ -15,7 +15,8 @@
 > | P1c | the viewer: the toggle, the refusal reasons | shipped |
 > | P1d | the device's account: every curtain up, down (and why) and refused, in `privacy_activity`, including the curtain a killed process could not report | merged; the agent half ships in the next agent release |
 > | P2 | blocking the person's keyboard and mouse (`BlockInput`, Ctrl+Alt+Del to take the computer back) | not built |
-> | P3 | lock the computer when the session ends | not built |
+> | P3a | lock the computer when the last session ends: the device's own `lock_on_end` (Windows, Linux) | merged; ships with the next agent release |
+> | P3b | an admin asking a device's sessions for a stricter lock | not built |
 > | P4 | mute the host | not built |
 
 While a privacy-mode session runs, **the person at the computer sees a notice instead of the
@@ -160,6 +161,52 @@ sequenceDiagram
 - The trail is read at `GET /api/tenant/{tid}/privacy-activity/{agent_id}` under
   `VIEW_REMOTE_AUDIT`, newest first. A removed device's trail still resolves. Rows expire after
   90 days, like the audit beside them.
+
+## Locking when the session ends
+
+A remote admin who unlocks a computer to work on it should not leave it unlocked behind them. On agent
+0.4.137 that is exactly what happened (spec §8 row 12). `lock_on_end` is the owner's answer, set at the
+console:
+
+```
+roomler config set lock_on_end auto      # never (default) | auto | always
+```
+
+| `lock_on_end` | When the last remote session ends |
+|---|---|
+| `never` | the screen is left as it is |
+| `auto` | locked if the session **began** on a locked screen, or with nobody at the computer (no input for 5 minutes on Windows; logind's idle hint on Linux) |
+| `always` | locked |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant V as Viewer
+    participant A as roomlerd (the worker)
+    participant OS as Windows / logind
+    V->>A: the session goes live
+    A->>OS: auto: is the screen locked? anyone at it?
+    Note over A: the decision is kept for this session<br/>(a re-offer keeps the first one)
+    V->>A: the session ends (hangup, Disconnect, a limit, a dropped connection)
+    A->>A: another session still live? then wait for the last one
+    A->>OS: LockWorkStation() / loginctl lock-session
+```
+
+- **The decision is taken at the session's start**, because that is what `auto` restores
+  ([`lock_on_end.rs`](../agents/roomlerd/src/lock_on_end.rs)). Changing the key mid-session affects the
+  next session, not the one already live.
+- **Only the last session's end locks.** Locking under a second controller who is still working would be a
+  fault. A session whose answer never reached the viewer has no say.
+- **Windows** locks with `LockWorkStation()` from the process that runs the session. On a service install
+  that process is SYSTEM in the console session, and the spec's P0 measured the call locking from there
+  (§8 row 11). **Linux** locks seat0's active session with `loginctl lock-session`. **macOS** has no
+  mechanism yet: an end that should lock logs that it could not.
+- The key is the device's own. It is set over the LocalAPI only by the person at the console, whose screen
+  it locks, and no server can push it. An admin's request for a stricter lock is P3b.
+- ⚠️ **`auto` restores what was found at the start.** A person who unlocked the computer during the session
+  signs in again after it. Telling their input from the controller's would need the input hooks FR-92 bans.
+- ⚠️ **On a per-user install, `always` cannot be undone remotely.** That worker cannot reach the secure
+  desktop, so the next session sees a padlock until someone signs in at the computer.
 
 ## Platforms
 
