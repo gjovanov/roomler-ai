@@ -250,8 +250,13 @@ export type RcDegradedReason =
  * terminal. Consent-loop note: a retry against a Prompt-mode org
  * device re-prompts its owner ONCE Ã¢ÂÂ an unanswered prompt ends in
  * `consent_timeout`, which is terminal, so the loop self-limits.
+ *
+ * #2251 - one `error` is final: `limit: 'no_common_codec'`, the device finding
+ * no codec in common with this browser's offer. Asking again would send the
+ * same offer into the same refusal, so it is said, never retried.
  */
-export function isRetryableTerminateReason(reason: unknown): boolean {
+export function isRetryableTerminateReason(reason: unknown, limit?: unknown): boolean {
+  if (limit === 'no_common_codec') return false
   return reason === 'agent_disconnect' || reason === 'error'
 }
 
@@ -609,6 +614,12 @@ export function friendlyEndReason(reason: unknown, limit?: unknown): string | nu
   // away, so it says what happened rather than staying silent.
   if (reason === 'idle_timeout' && limit === 'idle') {
     return 'The session ended after a period with no activity. Connect again to start a new one.'
+  }
+  // #2251 - the device sends its picture on the WebRTC track in a codec this
+  // browser did not offer, so no retry can work. Said once, with what would
+  // help, where the viewer used to retry without a word.
+  if (reason === 'error' && limit === 'no_common_codec') {
+    return "This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."
   }
   switch (reason) {
     case 'user_denied':
@@ -7649,7 +7660,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // auto-re-create the session instead of dumping the operator
       // to a dead viewer. Deliberate endings stay terminal.
       if (
-        isRetryableTerminateReason(msg.reason)
+        isRetryableTerminateReason(msg.reason, msg.limit)
         && lastConnectArgs
         && phase.value !== 'idle'
         && phase.value !== 'closed'

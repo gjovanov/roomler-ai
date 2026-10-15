@@ -1246,6 +1246,59 @@ keeping a session someone may be using; the maximum length is their bound.
 `idle_enforced`, so a limit the org set that a device could not keep shows
 up there.
 
+### 11.7 A session the device cannot answer: `no_common_codec` (#2251)
+
+On the WebRTC track (the RTP transport, no DataChannel) the track **is** the
+picture: it sends the encoder's codec, and the browser must have offered it. A
+browser that decodes none of the codecs the RTP track sends offers VP8, VP9 and
+AV1 while the track sends H.264 (`pick_best_codec`'s fallback when nothing
+intersects), HEVC or AV1. That is mainly a Firefox without its OpenH264 plugin:
+Playwright and CI builds, a plugin disabled by policy, an offline install.
+`create_answer` then fails ("RTPSender created with no codecs").
+
+Until #2251 that ended the session as a bare `error`, which the viewer retries:
+the same offer met the same failure again, and nobody was told why. Now the
+agent refuses before it builds a peer, and the session ends once, with a reason.
+
+```mermaid
+sequenceDiagram
+    participant V as viewer (browser)
+    participant S as hub (server)
+    participant A as roomlerd
+    V->>S: rc:session.request browser_caps=[vp8, vp9, av1]
+    S->>A: rc:request
+    Note over A: pick_best_codec: nothing in common, so H.264
+    A->>S: consent granted
+    S->>V: rc:ready
+    V->>S: rc:sdp.offer (m=video: VP8, VP9, AV1)
+    S->>A: rc:sdp.offer
+    Note over A: the RTP track sends H.264 and the offer has none: refuse before AgentPeer::new
+    A->>S: rc:terminate error, limit=no_common_codec
+    S->>V: rc:terminate error, limit=no_common_codec
+    Note over S: audit: session_ended reason=error, limit=no_common_codec
+    Note over V: says why, and does not retry
+```
+
+| | |
+|---|---|
+| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:12167`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:12145`). An offer with no `m=video` is answered without the track |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:3499`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:12176`) |
+| Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
+| Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:512`), on both ends' `rc:terminate` and in the `session_ended` audit row |
+| Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:258`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:605`) |
+| Tests | the predicate on recorded offers (`codec_cap_tests` in `peer.rs`); the field's own offer, which `create_answer` fails on, is the one it refuses (`agents/roomlerd/tests/dc_track_codec.rs`); who may name the code (`only_the_device_names_no_common_codec`, `hub.rs:4074`); the real agent through a real server, with an H.264 offer as the control (`crates/tests/src/rc_no_common_codec_tests.rs:147`) |
+
+⚠️ **The consent prompt has already been answered** by the time the offer
+arrives, so the person at the device approved a session that then cannot start.
+The viewer could refuse before it asks, from its own `browser_caps` and the
+device's codecs, but only with a second copy of `pick_best_codec` in the
+browser. The agent's check stays the authority either way, because an older
+viewer will still ask.
+
+⚠️ **Both halves are needed.** A server without #2251 drops the code and sends
+the bare `error`, which the viewer retries as before. An agent without it fails
+`create_answer`, as before.
+
 ## 12. Performance targets & budget
 
 | Stage | Target (LAN) | Target (WAN, RTT 30 ms) |

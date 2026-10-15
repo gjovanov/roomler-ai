@@ -20,7 +20,7 @@ use anyhow::{Context, Result, anyhow};
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::signaling::ClientMsg;
 use roomlerd::encode::EncoderPreference;
-use roomlerd::peer::{AgentPeer, rtp_track_codec};
+use roomlerd::peer::{AgentPeer, rtp_track_codec, rtp_track_unanswerable};
 use roomlerd::rc_overlay::RcOverlay;
 use tokio::sync::mpsc;
 use webrtc::api::APIBuilder;
@@ -121,9 +121,19 @@ async fn a_dc_session_answers_an_offer_without_h264() -> Result<()> {
 }
 
 /// The failure this fixes, kept: an H.264 track cannot answer the same offer.
+/// #2251 — and on the RTP transport, where the track cannot move to VP8, it is
+/// exactly the offer the agent now refuses before building a peer.
 #[tokio::test]
 async fn the_h264_track_cannot_answer_that_offer() -> Result<()> {
     let offer = vp8_only_offer().await?;
+    assert!(
+        rtp_track_unanswerable("h264", None, &offer),
+        "the RTP transport refuses the offer its H.264 track cannot answer"
+    );
+    assert!(
+        !rtp_track_unanswerable("h264", Some(TRANSPORT), &offer),
+        "the DataChannel transport answers it with the VP8 placeholder"
+    );
     let (agent, _rx) = agent("h264".into()).await?;
     let answer = agent.handle_offer(offer).await;
     agent.close().await;
