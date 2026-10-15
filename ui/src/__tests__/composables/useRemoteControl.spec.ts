@@ -4314,6 +4314,11 @@ describe('FR-93: an agent that says it cannot capture is believed', () => {
     expect(away.title).toMatch(/another session/)
     expect(away.status).toBe("waiting for this user's session to be on screen")
     expect(away.showsDeadline).toBe(false)
+    // FR-93 P5h — the computer going to sleep: it comes back when it wakes.
+    const asleep = mediaWaitingCopy('host_sleep')
+    expect(asleep.title).toMatch(/going to sleep/)
+    expect(asleep.status).toBe('the computer is asleep')
+    expect(asleep.showsDeadline).toBe(false)
   })
 
   it('a frameless two minutes inside a wait neither probes nor re-creates the session', () => {

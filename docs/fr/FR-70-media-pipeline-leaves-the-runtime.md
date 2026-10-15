@@ -109,7 +109,7 @@ HUD does not render the two new `HopWindow`s yet.
 
 Anchors verified against master `b4d12871`.
 
-**What the pump is today.** `media_pump_ffmpeg_dc` (`agents/roomlerd/src/peer.rs:4579–7347`,
+**What the pump is today.** `media_pump_ffmpeg_dc` (`agents/roomlerd/src/peer.rs:4585–7347`,
 27 await points) runs on a tokio worker and does everything in one loop: the
 budget gate and rate applies (`:5763`, `:6639`, `:6677`, `:6740`, `:6991`), pacing
 (`:5799`), capture (`:5813`, already a handoff to capture's own thread), the
@@ -526,7 +526,7 @@ thread behind a command channel (`encode::thread`: `encode`, `set_bitrate`,
 `request_keyframe`, `adopt_rebuilt`, `rebuild_spec{,_at_dims}`, `rate_stats`,
 `with`), and a replacement is built on that thread while the current one keeps
 producing. What did **not** move is the deciding. `media_pump_ffmpeg_dc`
-(`agents/roomlerd/src/peer.rs:4698–7775`) still computes, inside the frame path:
+(`agents/roomlerd/src/peer.rs:4704–7775`) still computes, inside the frame path:
 
 | what it decides | where | reads |
 |---|---|---|
