@@ -111,6 +111,16 @@ ACLs, and overlay internals under their feature flags. `roomlerd`'s Hive
 supervisor tests (`--features hive -- hive::`) run twice: on Linux in the agent job, and on macOS
 in the macOS job (FR-90 P1h-1), which before it never compiled the supervisor for a Mac.
 
+> [!WARNING]
+> **A log assertion in a binary of parallel tests needs two dispatchers** (FR-90 P2i-1). With
+> only one registered, `tracing` caches a callsite's interest from the default of whichever
+> thread reaches it first. A parallel test's thread, with no subscriber, caches `never`, and a
+> capture set on the test's own thread then never sees that line. Keep a second dispatcher
+> registered for the capture's life (a `NoSubscriber` will do), so every callsite asks per
+> event; and assert a line the capture must see before one it must not, since a capture that
+> sees nothing passes every absence check. The pattern: `Logs::capture` in
+> [`tests.rs:746`](../agents/roomlerd/src/hive/view/tests.rs#L746).
+
 ## CI & special lanes
 
 | Lane | What it does |

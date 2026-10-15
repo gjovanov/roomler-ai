@@ -120,6 +120,6 @@ pub use supervisor::{
 };
 pub use toolbelt::{relay, relay_args};
 pub use view::{
-    ViewGrant, handle_view_close, handle_view_grant, handle_view_ice, handle_view_offer,
-    handle_view_renew,
+    SearchGrant, ViewGrant, handle_search_grant, handle_view_close, handle_view_grant,
+    handle_view_ice, handle_view_offer, handle_view_renew,
 };

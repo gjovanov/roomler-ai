@@ -942,6 +942,15 @@ pub enum RpcCap {
     /// so a build without it is sent nothing and keeps what it held, as one
     /// offline at its removal does. Equality-matched, locked by test.
     HivePurgeAll,
+    /// FR-90 P2i-1 — `hive-search`: the device answers full-text search over
+    /// the copies it holds, for the sessions a `rc:hive.search.grant` names,
+    /// to that grant's viewer peer. Only while it offers itself as an
+    /// archive replica (`hive-archive`), whose copies it serves.
+    ///
+    /// ⚠️ `hive` is its prefix and NOT the same promise: a build before it
+    /// drops the grant, and a viewer would wait for an answer that never
+    /// comes. Equality-matched, locked by test.
+    HiveSearch,
     /// FR-94 — a Windows device runs Fleet RPC as SYSTEM through its
     /// session-0 service. An administrator anchored the device (the service
     /// holds its own credential, in a file only SYSTEM and Administrators can
@@ -1040,6 +1049,7 @@ impl RpcCap {
             Self::HiveManage => "hive-manage",
             Self::HivePurge => "hive-purge",
             Self::HivePurgeAll => "hive-purge-all",
+            Self::HiveSearch => "hive-search",
             Self::ExecSystem => "exec-system",
             Self::SshSystem => "ssh-system",
             Self::PrivacyMode => "privacy-mode",
@@ -1050,7 +1060,7 @@ impl RpcCap {
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 29] = [
+    pub const ALL: [RpcCap; 30] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1074,6 +1084,7 @@ impl RpcCap {
         Self::HiveManage,
         Self::HivePurge,
         Self::HivePurgeAll,
+        Self::HiveSearch,
         Self::ExecSystem,
         Self::SshSystem,
         Self::PrivacyMode,
@@ -5833,6 +5844,7 @@ mod tests {
         assert_eq!(RpcCap::HiveManage.wire(), "hive-manage");
         assert_eq!(RpcCap::HivePurge.wire(), "hive-purge");
         assert_eq!(RpcCap::HivePurgeAll.wire(), "hive-purge-all");
+        assert_eq!(RpcCap::HiveSearch.wire(), "hive-search");
         assert_eq!(RpcCap::PrivacyMode.wire(), "privacy-mode");
         assert_eq!(RpcCap::PrivacyAvailable.wire(), "privacy-available");
         assert_eq!(RpcCap::SessionPolicy.wire(), "session-policy");
@@ -5963,7 +5975,7 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 19] = [
+        const KNOWN: [(RpcCap, RpcCap); 20] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
@@ -6010,6 +6022,9 @@ mod tests {
             // `hive_purge_all_is_a_promise_of_its_own`.
             (RpcCap::Hive, RpcCap::HivePurgeAll),
             (RpcCap::HivePurge, RpcCap::HivePurgeAll),
+            // FR-90 P2i-1 — nor "answers a search over its copies". Locked by
+            // `hive_search_is_a_promise_of_its_own`.
+            (RpcCap::Hive, RpcCap::HiveSearch),
             // FR-94 — "runs Fleet RPC" is not "runs it as SYSTEM through a
             // service". Locked by `exec_does_not_imply_exec_system`.
             (RpcCap::Exec, RpcCap::ExecSystem),
@@ -6674,6 +6689,27 @@ mod tests {
             Some(RpcCap::HivePurgeAll)
         );
         assert!(RpcCap::from_wire("hive-purge-alls").is_none());
+    }
+
+    /// FR-90 P2i-1 — `hive-search` is its own promise: a device that holds
+    /// copies, an archive replica among them, but predates it drops
+    /// `rc:hive.search.grant`, so a server that read it out of `hive`,
+    /// `hive-replica` or `hive-archive` would leave a searcher waiting.
+    #[test]
+    fn hive_search_is_a_promise_of_its_own() {
+        let archive_before = AgentCaps {
+            rpc: vec!["hive".into(), "hive-replica".into(), "hive-archive".into()],
+            ..Default::default()
+        };
+        assert!(!archive_before.has_rpc(RpcCap::HiveSearch));
+        let searches = AgentCaps {
+            rpc: vec!["hive-archive".into(), "hive-search".into()],
+            ..Default::default()
+        };
+        assert!(searches.has_rpc(RpcCap::HiveSearch));
+        assert!(!searches.has_rpc(RpcCap::Hive));
+        assert_eq!(RpcCap::from_wire("hive-search"), Some(RpcCap::HiveSearch));
+        assert!(RpcCap::from_wire("hive-searches").is_none());
     }
 
     /// Forward compatibility: a NEWER agent may advertise verbs this build has
