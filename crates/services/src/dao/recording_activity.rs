@@ -39,7 +39,9 @@ impl RecordingActivityDao {
         self.base.insert_one(&event).await
     }
 
-    /// "What was recorded on this machine?" Newest first.
+    /// "What was recorded on this machine?" Newest first, `_id` breaking a
+    /// tie in one millisecond (the hub records each claim as it arrives, so
+    /// `_id` order is arrival order).
     pub async fn list_for_agent(
         &self,
         tenant_id: ObjectId,
@@ -49,7 +51,7 @@ impl RecordingActivityDao {
         self.base
             .find_paginated(
                 doc! { "tenant_id": tenant_id, "agent_id": agent_id },
-                Some(doc! { "at": -1 }),
+                Some(doc! { "at": -1, "_id": -1 }),
                 params,
             )
             .await
