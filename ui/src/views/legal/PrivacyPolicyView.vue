@@ -130,6 +130,18 @@
             payment card details on our servers. We may store your Stripe customer ID, subscription plan details,
             billing email, and transaction history for account management and invoicing purposes.
           </p>
+          <p class="text-body-1 legal-muted mb-4">
+            For a workspace with a paid subscription we keep a record of what Stripe reports about it: the
+            subscription being created, changed, cancelled or reaching the end of its trial, and each invoice
+            paid or failed — with the plan, the number of seats, the amount billed and its currency, the billing
+            period, and Stripe's identifiers for the invoice and the subscription. It names the workspace, never a
+            card, an address or a person. We use it for one purpose: to know what the service earns — billed
+            revenue, renewals, cancellations — and what serving each workspace costs against it. We also count,
+            per workspace and per day, how often it reaches one of its plan's limits (for example the number of
+            members or devices), to see which workspaces outgrow their plan. Both are kept for as long as the
+            workspace exists and are deleted with it; monthly revenue totals, which name no workspace, are kept.
+            The legal basis is our legitimate interest in running the service as a business (Art. 6(1)(f) GDPR).
+          </p>
 
           <h3 class="text-h6 font-weight-bold mb-2">2.13 Notifications and Email</h3>
           <p class="text-body-1 legal-muted mb-4">
@@ -318,6 +330,7 @@
             <li class="mb-1">Enrollment tokens and similar one-time credentials expire within minutes to hours.</li>
             <li class="mb-1">Product-update subscriptions are kept until you unsubscribe. After that we retain only the fact that the address opted out, so it cannot be re-added silently; ask us and we will erase that too.</li>
             <li class="mb-1">The record of which issues were sent to an address — with the delivery status our email provider reported (delivered, bounced, dropped, reported as spam) and, if you unsubscribed through an issue's link, which issue — is kept with that subscription record and erased with it on request.</li>
+            <li class="mb-1">A workspace's billing events (what Stripe reported about its subscription and invoices) and its daily count of plan-limit hits are kept for as long as the workspace exists and deleted with it; monthly revenue totals, which name no workspace, are kept.</li>
           </ul>
           <p class="text-body-1 legal-muted">
             These deletions are enforced by the database itself rather than by a manual process. When you delete

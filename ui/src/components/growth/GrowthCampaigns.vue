@@ -130,7 +130,7 @@
             <th class="text-right">Orgs</th>
             <th class="text-right">Activated</th>
             <th class="text-right">First value</th>
-            <th class="text-left">Paid</th>
+            <th class="text-right" title="the org's first invoice paid above 0 — no window: paid so far">Paid</th>
             <th class="text-left">Reach</th>
             <th class="text-right">Coverage</th>
           </tr>
@@ -214,10 +214,20 @@
                 :title="report.not_measured?.first_value"
               >not measured</v-chip>
             </td>
-            <td>
-              <v-chip size="x-small" variant="tonal" color="grey" :title="r.paid.not_measured">
-                {{ notMeasuredLabel(r.paid) }}
-              </v-chip>
+            <td class="text-right">
+              <template v-if="r.paid">
+                {{ r.paid.count }}
+                <div class="text-caption text-medium-emphasis">
+                  {{ stepNote(r.paid, r.rates.paid) }}
+                </div>
+              </template>
+              <v-chip
+                v-else
+                size="x-small"
+                variant="tonal"
+                color="grey"
+                :title="report.not_measured?.paid"
+              >not measured</v-chip>
             </td>
             <td>
               <v-chip
@@ -265,7 +275,6 @@ import {
   isNotMeasured,
   latestReach,
   metricsLabel,
-  notMeasuredLabel,
   rateLabel,
   type CampaignRow,
   type CampaignsReport,

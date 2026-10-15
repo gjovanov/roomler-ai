@@ -40,6 +40,24 @@ pub enum Limit {
 }
 
 impl Limit {
+    /// The wire spelling (FR-102 P4: the `limit` dimension of a counted
+    /// collision). Exhaustive, so a new limit is named before it compiles.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Limit::MaxDevices => "max_devices",
+            Limit::MaxTunnelClients => "max_tunnel_clients",
+            Limit::MaxMembers => "max_members",
+            Limit::MaxChannels => "max_channels",
+            Limit::StorageBytes => "storage_bytes",
+            Limit::VideoMaxParticipants => "video_max_participants",
+            Limit::MaxConcurrentSessions => "max_concurrent_sessions",
+            Limit::ExitNodes => "exit_nodes",
+            Limit::MagicDns => "magic_dns",
+            Limit::Recordings => "recordings",
+            Limit::CloudIntegrations => "cloud_integrations",
+        }
+    }
+
     /// Was this limit already enforced before FR-32?
     ///
     /// ⚠ **Load-bearing.** `PlanEnforcement` exists to stage *new* enforcement
@@ -203,20 +221,55 @@ fn check_inner(
     used: u64,
     delta: u64,
 ) -> Result<(), QuotaDenial> {
+    evaluate(plan, mode, limit, used, delta).into_result()
+}
+
+/// FR-102 P4 — the whole verdict of one check: the collision, when the
+/// limit was hit (whether or not it refuses — `warn` mode lets it through),
+/// and whether it refuses. `roomler_core::quota` counts the collision per
+/// org; [`check`] and its siblings keep answering only the refusal.
+#[derive(Debug, Clone)]
+pub struct Verdict {
+    /// The limit was exceeded (the warn line was written for it).
+    pub collision: Option<QuotaDenial>,
+    /// The collision refuses the operation.
+    pub enforced: bool,
+}
+
+impl Verdict {
+    fn pass() -> Self {
+        Self {
+            collision: None,
+            enforced: false,
+        }
+    }
+
+    /// `Err` only when the collision refuses.
+    pub fn into_result(self) -> Result<(), QuotaDenial> {
+        match (self.collision, self.enforced) {
+            (Some(denial), true) => Err(denial),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// [`check_delta`]'s decision, with the collision visible even when it does
+/// not refuse. The warn line is written here, once per collision.
+pub fn evaluate(plan: Plan, mode: PlanEnforcement, limit: Limit, used: u64, delta: u64) -> Verdict {
     // `Off` means no check runs — but never for a limit that was already
     // enforced before FR-32, which the mode was never meant to reach.
     if matches!(mode, PlanEnforcement::Off) && !limit.is_established() {
-        return Ok(());
+        return Verdict::pass();
     }
 
     let limits = plan.limits();
     let (Some(max), noun) = limit.describe(&limits) else {
-        return Ok(()); // uncapped for this plan
+        return Verdict::pass(); // uncapped for this plan
     };
 
     // Saturating, so a pathological delta cannot wrap into "fits".
     if used.saturating_add(delta) <= max {
-        return Ok(());
+        return Verdict::pass();
     }
 
     // An established limit ignores the mode entirely — see `is_established`.
@@ -242,7 +295,10 @@ fn check_inner(
         "plan limit exceeded"
     );
 
-    if enforcing { Err(denial) } else { Ok(()) }
+    Verdict {
+        collision: Some(denial),
+        enforced: enforcing,
+    }
 }
 
 /// Gate a boolean plan feature.
@@ -510,5 +566,52 @@ mod tests {
         );
         // ...but a real cap on the same field still bites.
         assert!(check(Plan::Free, PlanEnforcement::Enforce, Limit::MaxMembers, 10).is_err());
+    }
+
+    /// FR-102 P4 — the verdict shows a collision in `warn` mode too (the
+    /// upgrade-intent signal must not depend on enforcement), refuses only
+    /// when enforcing, and is empty under the cap or with checks `off`.
+    #[test]
+    fn a_collision_is_visible_whether_or_not_it_refuses() {
+        let warn = evaluate(Plan::Free, PlanEnforcement::Warn, Limit::MaxMembers, 10, 1);
+        assert!(warn.collision.is_some());
+        assert!(!warn.enforced);
+        assert!(warn.into_result().is_ok(), "warn lets it through");
+
+        let enforce = evaluate(
+            Plan::Free,
+            PlanEnforcement::Enforce,
+            Limit::MaxMembers,
+            10,
+            1,
+        );
+        assert!(enforce.collision.is_some() && enforce.enforced);
+        assert!(enforce.into_result().is_err());
+
+        let under = evaluate(
+            Plan::Free,
+            PlanEnforcement::Enforce,
+            Limit::MaxMembers,
+            9,
+            1,
+        );
+        assert!(under.collision.is_none());
+
+        let off = evaluate(Plan::Free, PlanEnforcement::Off, Limit::MaxMembers, 99, 1);
+        assert!(off.collision.is_none(), "off runs no check, counts nothing");
+
+        // An established limit ignores the mode: off still collides, and refuses.
+        let devices = evaluate(Plan::Free, PlanEnforcement::Off, Limit::MaxDevices, 3, 1);
+        assert!(devices.collision.is_some() && devices.enforced);
+    }
+
+    /// The `limit` dimension's spellings are stored keys.
+    #[test]
+    fn limit_spellings_are_locked() {
+        assert_eq!(Limit::MaxMembers.as_str(), "max_members");
+        assert_eq!(Limit::MaxDevices.as_str(), "max_devices");
+        assert_eq!(Limit::StorageBytes.as_str(), "storage_bytes");
+        assert_eq!(Limit::MagicDns.as_str(), "magic_dns");
+        assert_eq!(Limit::CloudIntegrations.as_str(), "cloud_integrations");
     }
 }
