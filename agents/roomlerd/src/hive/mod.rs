@@ -114,8 +114,8 @@ pub use supervisor::{
     begin_shutdown, begin_update, end_update, global, handle_adopt_ack, handle_demote,
     handle_drain, handle_lease, handle_memory, handle_move, handle_prepare, handle_purge,
     handle_replica_candidate, handle_replica_close, handle_replica_dial, handle_replica_grant,
-    handle_replica_join, handle_replica_refused, handle_start, handle_stop, init, on_connected,
-    replica_enabled, stream_enabled, turns_running, update_wait, wind_down,
+    handle_replica_join, handle_replica_refused, handle_retain, handle_start, handle_stop, init,
+    on_connected, replica_enabled, stream_enabled, turns_running, update_wait, wind_down,
 };
 pub use toolbelt::{relay, relay_args};
 pub use view::{

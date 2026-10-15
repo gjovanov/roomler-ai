@@ -468,6 +468,7 @@ mod adopt;
 mod follow;
 mod purge;
 mod replica;
+mod retain;
 mod stream;
 
 pub struct Supervisor {
@@ -750,6 +751,10 @@ pub fn init(cfg: &AgentConfig) {
     sup.agent_id = ObjectId::parse_str(&cfg.agent_id).ok();
     let sup = Arc::new(sup);
     let _ = SUPERVISOR.set(Arc::clone(&sup));
+    // P2g-3d — the device's own clock, for the copies its store keeps.
+    if sup.store.is_ok() {
+        sup.spawn_retention_clock();
+    }
     // P1j — the adopt socket, only while the device's owner allows it; with
     // adopting off, a socket a predecessor left behind is taken away.
     if sup.cfg.adopt {
@@ -1021,6 +1026,10 @@ pub fn init_as_daemon(
     SUPERVISOR
         .set(Arc::clone(&sup))
         .map_err(|_| "a supervisor is already set up in this process".to_string())?;
+    // P2g-3d — the device's own clock, as the daemon's own init starts it.
+    if sup.store.is_ok() {
+        sup.spawn_retention_clock();
+    }
     // FR-90 P2f-4 — and the adopt socket, as the daemon's own init opens it:
     // a test device adopts a terminal session through the real hook client.
     if sup.cfg.adopt {
@@ -1200,6 +1209,25 @@ pub fn handle_purge(
         };
         let _ = tx.send(ack).await;
     });
+}
+
+/// FR-90 P2g-3d — `rc:hive.retain`: what keeps each copy this device asked
+/// about, kept for the sessions it holds, and the device's own clock run at
+/// once ([`Supervisor::retain_heard`]). The primary enrollment's only, like
+/// every Hive frame.
+pub fn handle_retain(
+    words: Vec<roomler_ai_remote_control::hive::HiveRetainWord>,
+    is_primary: bool,
+) {
+    if !is_primary {
+        warn!("hive: rc:hive.retain ignored — not the primary enrollment");
+        return;
+    }
+    let Some(sup) = global() else {
+        debug!("hive: rc:hive.retain with no supervisor");
+        return;
+    };
+    tokio::spawn(async move { sup.retain_heard(words).await });
 }
 
 /// FR-90 P2e-2 — `rc:hive.lease`: the server's word, on `tx`, the connection
@@ -1636,8 +1664,16 @@ impl Supervisor {
     }
 
     pub(crate) async fn start(self: &Arc<Self>, order: StartOrder, is_primary: bool) -> Answer {
-        let _serial = self.start_lock.lock().await;
-        self.start_locked(order, is_primary).await
+        let session = order.session_id;
+        let answer = {
+            let _serial = self.start_lock.lock().await;
+            self.start_locked(order, is_primary).await
+        };
+        // P2g-3d — a session this device runs now: what keeps its copy.
+        if answer.refused.is_none() && is_primary {
+            self.ask_retain(vec![session]);
+        }
+        answer
     }
 
     /// [`Self::start`], under `start_lock`.
@@ -3085,14 +3121,14 @@ impl Supervisor {
             // P2c-3 — and every copy it holds, with its tip, once the
             // resumed sessions are among them. Only from a device that holds
             // copies or runs a replicated session: no other has one to tell.
-            if me.reports_copies() {
-                let sessions = me.replica_manifest().await;
-                let _ = tx.try_send(ClientMsg::HiveReplicaManifest {
-                    sessions,
-                    // P2g-3c — what this device's own clock purged: P2g-3d.
-                    purged: Vec::new(),
-                });
+            // P2g-3d — and each copy its own clock purged, whatever it holds
+            // now: the server stops counting that copy.
+            if let Some(manifest) = me.replica_manifest_frame().await {
+                let _ = tx.try_send(manifest);
             }
+            // P2g-3d — then what keeps each session it holds: the server's
+            // word, which the device's own clock counts from.
+            me.ask_retain_all().await;
             // P2d-3b — then each copy it holds asks for its stream, once the
             // server has heard where each one ends. Only while its owner lets
             // it hold copies at all; P2f-1b — else only the copies of the

@@ -32,6 +32,12 @@
 //! P2a, which the updater's crash-loop rollback can put back on a device at
 //! any time, opens the file, serves the events it holds and never looks at
 //! them. A new column on `events` would cost it every transcript.
+//!
+//! FR-90 P2g-3d adds the device's own clock, in tables of its own as well:
+//! what keeps each copy, as the server last said it ([`Store::put_retain`]);
+//! when the device was last connected ([`Store::set_contact`]); and the
+//! copies the clock purged, which its next manifests name
+//! ([`Store::note_copy_purge`]).
 
 use std::path::Path;
 
@@ -157,6 +163,38 @@ const P2F_TABLES: &str = "CREATE TABLE IF NOT EXISTS substitutes (
                  state_dir TEXT    NOT NULL,
                  since_ms  INTEGER NOT NULL
              ) WITHOUT ROWID;";
+
+/// FR-90 P2g-3d: the device's own clock. What keeps each copy, as the server
+/// last said it (`retains`); when the device was last connected (`contact`,
+/// one row); and the copies the clock purged that its next manifests name
+/// (`copy_purges`). New and made only when missing, like P2a's tables, so
+/// `user_version` stays 1.
+const P2G_TABLES: &str = "CREATE TABLE IF NOT EXISTS retains (
+                 session  TEXT    PRIMARY KEY,
+                 days     INTEGER NOT NULL,
+                 ended_ms INTEGER,
+                 said_ms  INTEGER NOT NULL
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS contact (
+                 id    INTEGER PRIMARY KEY CHECK (id = 1),
+                 at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS copy_purges (
+                 session TEXT    PRIMARY KEY,
+                 at_ms   INTEGER NOT NULL,
+                 reports INTEGER NOT NULL
+             ) WITHOUT ROWID;";
+
+/// FR-90 P2g-3d — what keeps this device's copy of a session, as the server
+/// last said it (`rc:hive.retain`): the organization's days (`0` keeps it for
+/// ever), the session's end once it is over, and when it was said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainWord {
+    pub session: String,
+    pub days: u32,
+    pub ended_ms: Option<i64>,
+    pub said_ms: i64,
+}
 
 /// FR-90 P2f-2a — a pack kept in place of a checkpoint's own whole pack: the
 /// one that brings `commit` into a repository holding every commit of
@@ -323,6 +361,7 @@ impl Store {
         conn.execute_batch(P2C_TABLES)?;
         conn.execute_batch(P2E_TABLES)?;
         conn.execute_batch(P2F_TABLES)?;
+        conn.execute_batch(P2G_TABLES)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn })
     }
@@ -1285,6 +1324,8 @@ impl Store {
             params![session],
         )?;
         tx.execute("DELETE FROM blob_refs WHERE session = ?1", params![session])?;
+        // FR-90 P2g-3d — the word that kept the copy goes with it.
+        tx.execute("DELETE FROM retains WHERE session = ?1", params![session])?;
         // The first purge's time is kept; a repeated one changes nothing.
         tx.execute(
             "INSERT INTO purged (session, purged_ms) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
@@ -1384,6 +1425,144 @@ impl Store {
             ));
         }
         Ok(out)
+    }
+
+    /// FR-90 P2g-3d — every session this store holds anything of, as
+    /// [`Self::holds`] reads it: what the device asks the server's word for.
+    /// A purged session holds nothing.
+    pub fn held_sessions(&self) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session FROM events
+             UNION SELECT session FROM divergent
+             UNION SELECT session FROM tips
+             UNION SELECT session FROM floors
+             UNION SELECT session FROM memberships
+             UNION SELECT session FROM substitutes
+             UNION SELECT session FROM blob_refs
+             UNION SELECT session FROM workplaces
+             ORDER BY 1",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// FR-90 P2g-3d — keep what the server says keeps `session`'s copy, said
+    /// now, over any word before it. None for a purged session: it holds
+    /// nothing to keep.
+    pub fn put_retain(
+        &mut self,
+        session: &str,
+        days: u32,
+        ended_ms: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        if !Self::purged_in(&tx, session)? {
+            tx.execute(
+                "INSERT INTO retains (session, days, ended_ms, said_ms) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(session) DO UPDATE SET
+                     days = excluded.days, ended_ms = excluded.ended_ms, said_ms = excluded.said_ms",
+                params![session, i64::from(days), ended_ms, now_ms()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// FR-90 P2g-3d — every word kept.
+    pub fn retains(&self) -> Result<Vec<RetainWord>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session, days, ended_ms, said_ms FROM retains ORDER BY session")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(RetainWord {
+                session: r.get(0)?,
+                days: u32::try_from(r.get::<_, i64>(1)?).unwrap_or(u32::MAX),
+                ended_ms: r.get(2)?,
+                said_ms: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// FR-90 P2g-3d — forget `session`'s word: a session this device no
+    /// longer holds anything of.
+    pub fn drop_retain(&mut self, session: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM retains WHERE session = ?1", params![session])?;
+        Ok(())
+    }
+
+    /// FR-90 P2g-3d — when this device was last connected, by its own clock.
+    pub fn contact(&self) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT at_ms FROM contact WHERE id = 1", [], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// FR-90 P2g-3d — the device is connected now (`at_ms`, its own clock).
+    pub fn set_contact(&mut self, at_ms: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO contact (id, at_ms) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET at_ms = excluded.at_ms",
+            params![at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// FR-90 P2g-3d — the device's own clock purged its copy of `session` at
+    /// `at_ms`: its next manifests name it ([`Self::take_copy_purge_reports`]).
+    /// The first time is kept.
+    pub fn note_copy_purge(&mut self, session: &str, at_ms: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO copy_purges (session, at_ms, reports) VALUES (?1, ?2, 0)
+             ON CONFLICT(session) DO NOTHING",
+            params![session, at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// FR-90 P2g-3d — the copies the device's own clock purged that a manifest
+    /// is to name, oldest first, at most `limit`, each with when. Each one
+    /// taken counts one report, and one that has now been named in `max`
+    /// manifests is forgotten.
+    pub fn take_copy_purge_reports(
+        &mut self,
+        limit: usize,
+        max: u32,
+    ) -> Result<Vec<(String, i64)>, StoreError> {
+        let tx = self.conn.transaction()?;
+        let taken: Vec<(String, i64)> = {
+            let mut stmt = tx.prepare(
+                "SELECT session, at_ms FROM copy_purges ORDER BY at_ms, session LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (session, _) in &taken {
+            tx.execute(
+                "UPDATE copy_purges SET reports = reports + 1 WHERE session = ?1",
+                params![session],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM copy_purges WHERE reports >= ?1",
+            params![i64::from(max)],
+        )?;
+        tx.commit()?;
+        Ok(taken)
+    }
+
+    /// FR-90 P2g-3d — whether a copy the device's own clock purged is still to
+    /// be named in a manifest.
+    pub fn has_copy_purge_reports(&self) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM copy_purges)", [], |r| {
+                r.get::<_, bool>(0)
+            })?)
     }
 }
 
@@ -1937,6 +2116,82 @@ mod tests {
             )
             .unwrap();
         assert_eq!(again, when);
+    }
+
+    /// FR-90 P2g-3d — a word is kept per session, the newest over the one
+    /// before, never for a purged session, and goes with its purge. The
+    /// device's contact is one row, and the held sessions are every one the
+    /// store holds anything of, none purged.
+    #[test]
+    fn a_word_is_kept_per_held_session_and_goes_with_its_purge() {
+        let mut s = Store::open_in_memory().unwrap();
+        assert!(s.retains().unwrap().is_empty());
+        s.put_retain("s1", 90, None).unwrap();
+        s.put_retain("s1", 30, Some(5_000)).unwrap();
+        s.put_retain("s2", 0, None).unwrap();
+        let words = s.retains().unwrap();
+        assert_eq!(
+            words
+                .iter()
+                .map(|w| (w.session.as_str(), w.days, w.ended_ms))
+                .collect::<Vec<_>>(),
+            [("s1", 30, Some(5_000)), ("s2", 0, None)],
+            "the newest word over the one before"
+        );
+        assert!(words.iter().all(|w| w.said_ms > 1_700_000_000_000));
+        s.purge("s1").unwrap();
+        assert_eq!(s.retains().unwrap().len(), 1, "the purge took its word");
+        s.put_retain("s1", 90, None).unwrap();
+        assert_eq!(s.retains().unwrap().len(), 1, "a purged session keeps none");
+        s.drop_retain("s2").unwrap();
+        assert!(s.retains().unwrap().is_empty());
+
+        assert_eq!(s.contact().unwrap(), None);
+        s.set_contact(1_000).unwrap();
+        s.set_contact(2_000).unwrap();
+        assert_eq!(s.contact().unwrap(), Some(2_000));
+
+        append_all(&mut s, "s3", 1, &["one"]);
+        s.join("s4", "owner", 1, &[]).unwrap();
+        assert_eq!(s.held_sessions().unwrap(), ["s3", "s4"], "s1 is purged");
+    }
+
+    /// FR-90 P2g-3d — a copy the device's clock purged is named in at most
+    /// `max` manifests, oldest first and `limit` at a time, its first time
+    /// kept, then forgotten.
+    #[test]
+    fn a_copy_purged_on_the_clock_is_named_in_its_next_manifests() {
+        let mut s = Store::open_in_memory().unwrap();
+        assert!(!s.has_copy_purge_reports().unwrap());
+        s.note_copy_purge("b", 20).unwrap();
+        s.note_copy_purge("a", 10).unwrap();
+        s.note_copy_purge("a", 99).unwrap();
+        assert!(s.has_copy_purge_reports().unwrap());
+        let named = |v: &[(&str, i64)]| -> Vec<(String, i64)> {
+            v.iter().map(|(s, t)| (s.to_string(), *t)).collect()
+        };
+        assert_eq!(
+            s.take_copy_purge_reports(1, 3).unwrap(),
+            named(&[("a", 10)]),
+            "the oldest first, at its first time"
+        );
+        assert_eq!(
+            s.take_copy_purge_reports(8, 3).unwrap(),
+            named(&[("a", 10), ("b", 20)])
+        );
+        assert_eq!(
+            s.take_copy_purge_reports(8, 3).unwrap(),
+            named(&[("a", 10), ("b", 20)])
+        );
+        assert_eq!(
+            s.take_copy_purge_reports(8, 3).unwrap(),
+            named(&[("b", 20)]),
+            "a has been named in three manifests"
+        );
+        assert!(
+            !s.has_copy_purge_reports().unwrap(),
+            "each named in three manifests, then forgotten"
+        );
     }
 
     /// FR-90 P2f-2a — a substitute is kept only once its blobs are, replaces
