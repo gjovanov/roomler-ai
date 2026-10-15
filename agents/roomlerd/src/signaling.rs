@@ -4841,6 +4841,18 @@ async fn handle_server_msg(
             }
         }
 
+        // FR-90 P2g-3d — what keeps each copy this device asked about: the
+        // device's own clock counts from it.
+        ServerMsg::HiveRetain { words } => {
+            #[cfg(hive_host)]
+            crate::hive::handle_retain(words, ctx.is_primary);
+            #[cfg(not(hive_host))]
+            debug!(
+                words = words.len(),
+                "rc:hive.retain ignored — this build does not run agent sessions"
+            );
+        }
+
         // FR-90 P2e-2 — the server's word, on THIS connection, that this
         // device holds the session at that fence: a leased run calls the model
         // again, and a leased session it hosted launches.

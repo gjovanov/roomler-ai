@@ -266,6 +266,11 @@ impl Supervisor {
             refused = answer.0.map(HiveJoinRefusal::as_str), detail = answer.1.as_deref(),
             "hive: a join answered"
         );
+        // P2g-3d — a copy this device holds now, or a session it runs that
+        // has members now: what keeps it.
+        if answer.0.is_none() {
+            self.ask_retain(vec![session]);
+        }
         answer
     }
 
