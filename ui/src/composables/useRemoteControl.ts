@@ -2900,6 +2900,11 @@ export interface AutoTransportInputs {
    *  only, and without this the VP9 DataChannel was never offered to it.
    *  Optional: absent reads as "not known", which changes nothing. */
   viewerVp9_420Decodable?: boolean
+  /** #2231 — this browser can decode the RTP track's universal fallback,
+   *  H.264: its receiver caps list H.264, or list nothing at all (which the
+   *  agent reads as H.264). Optional: absent reads as "yes", the old
+   *  assumption, so the profile-0 rung below stays off. */
+  viewerRtpH264?: boolean
   viewerH264Hw: boolean
   /** The viewer's Priority dial. Only `sharper` changes the outcome, and
    *  only on the libvpx SW rung — see the chroma note on `pickAutoTransport`.
@@ -3080,10 +3085,12 @@ export function pickAutoTransport(inputs: AutoTransportInputs): {
     }
   }
   // #2231 — a browser that decodes VP9 profile 0 but not profile 1 (Firefox's
-  // WebCodecs) still takes the VP9 DataChannel, at 4:2:0. Without this rung
-  // it fell to the RTP track below, where the agent may offer only H.264,
-  // which a Firefox without OpenH264 cannot decode at all.
-  if (hasVp9Dc && inputs.viewerVp9_420Decodable === true) {
+  // WebCodecs) takes the VP9 DataChannel at 4:2:0 when the RTP track below
+  // cannot work for it: no H.264 to decode (a Firefox without OpenH264), so an
+  // agent that offers the track only as H.264 has no codec in common with it.
+  // A browser that does decode H.264 keeps the track it has always used: this
+  // rung rescues the broken case and moves no working one.
+  if (hasVp9Dc && inputs.viewerVp9_420Decodable === true && inputs.viewerRtpH264 === false) {
     return {
       transport: 'data-channel-vp9-444',
       chromaOverride: 'yuv420',
@@ -9316,8 +9323,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         viewerHevcDecodable: hevcDec,
         viewerVp9Hw: vp9Hw && !failedDcTransports.has('data-channel-vp9-444'),
         viewerVp9Decodable: vp9Dec && !failedDcTransports.has('data-channel-vp9-444'),
-        // #2231 — profile 0 alone (Firefox) still takes the VP9 DataChannel at 4:2:0.
+        // #2231 — profile 0 alone (Firefox) takes the VP9 DataChannel at 4:2:0
+        // when the RTP track has no H.264 for it.
         viewerVp9_420Decodable: vp9Dec420 && !failedDcTransports.has('data-channel-vp9-444'),
+        viewerRtpH264: allBrowserCaps.length === 0 || allBrowserCaps.includes('h264'),
         // P2Ã¢ÂÂ H.264-DC needs both the HW-smooth verdict AND an accepted
         // Annex-B avc1 config (the worker configures with the latter).
         viewerH264Hw: h264Hw && h264Codec !== null

@@ -2666,13 +2666,14 @@ describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
   // #2231 — Firefox's WebCodecs decodes VP9 profile 0, not profile 1. Before
   // the profile-0 rung it fell to the RTP track, where an agent offering only
   // H.264 left a Firefox without OpenH264 with no codec in common.
-  it('a browser that decodes VP9 profile 0 only takes the VP9 DataChannel at 4:2:0 (#2231)', () => {
+  it('a browser with VP9 profile 0 only and no H.264 takes the VP9 DataChannel at 4:2:0 (#2231)', () => {
     const r = pickAutoTransport(
       base({
         agentTransports: ['data-channel-vp9-444'],
         agentHwEncoders: ['libvpx-vp9-444-sw'],
         viewerVp9Decodable: false,
         viewerVp9_420Decodable: true,
+        viewerRtpH264: false,
       }),
     )
     expect(r.transport).toBe('data-channel-vp9-444')
@@ -2686,6 +2687,7 @@ describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
           agentTransports: ['data-channel-vp9-444'],
           viewerVp9Decodable: false,
           viewerVp9_420Decodable: true,
+          viewerRtpH264: false,
           ...over,
         }),
       )
@@ -2694,12 +2696,32 @@ describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
     }
   })
 
+  // A profile-0-only browser that decodes H.264 (Safari, a Firefox with
+  // OpenH264) keeps the RTP track it has always used: the rung rescues the
+  // broken case and moves no working one.
+  it('a profile-0-only browser that decodes H.264 keeps the RTP track (#2231)', () => {
+    for (const viewerRtpH264 of [true, undefined]) {
+      const r = pickAutoTransport(
+        base({
+          agentTransports: ['data-channel-vp9-444'],
+          viewerVp9Decodable: false,
+          viewerVp9_420Decodable: true,
+          viewerRtpH264,
+        }),
+      )
+      expect(r.transport).toBeNull()
+    }
+  })
+
   it('an absent profile-0 probe changes nothing, and nor does an agent without the VP9 DataChannel (#2231)', () => {
     expect(
-      pickAutoTransport(base({ agentTransports: ['data-channel-vp9-444'] })).transport,
+      pickAutoTransport(base({ agentTransports: ['data-channel-vp9-444'], viewerRtpH264: false }))
+        .transport,
     ).toBeNull()
     expect(
-      pickAutoTransport(base({ agentTransports: [], viewerVp9_420Decodable: true })).transport,
+      pickAutoTransport(
+        base({ agentTransports: [], viewerVp9_420Decodable: true, viewerRtpH264: false }),
+      ).transport,
     ).toBeNull()
   })
 
