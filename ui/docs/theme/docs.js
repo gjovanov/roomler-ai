@@ -196,12 +196,36 @@
     for (var k = 0; k < targets.length; k++) obs.observe(targets[k])
   }
 
+  // FR-88 (#1790) P3 — the video facade (`theme/video.ts`): a click swaps the
+  // poster link for the youtube-nocookie player, so nothing loads from YouTube
+  // before someone asks for it. Without JavaScript, the link opens the video
+  // on YouTube; a modified or middle click keeps that behaviour too.
+  function initVideos() {
+    document.addEventListener('click', function (e) {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+      var a = e.target && e.target.closest ? e.target.closest('a[data-video-id]') : null
+      if (!a) return
+      var id = a.getAttribute('data-video-id') || ''
+      if (!/^[A-Za-z0-9_-]{11}$/.test(id)) return
+      e.preventDefault()
+      var f = document.createElement('iframe')
+      f.className = 'video-facade__player'
+      f.src = 'https://www.youtube-nocookie.com/embed/' + id + '?autoplay=1&rel=0'
+      f.title = a.getAttribute('data-video-title') || 'Video'
+      f.setAttribute('allow', 'autoplay; encrypted-media; picture-in-picture; fullscreen')
+      f.setAttribute('allowfullscreen', '')
+      a.parentNode.replaceChild(f, a)
+      f.focus()
+    })
+  }
+
   function boot() {
     initOsTabs()
     initCopy()
     initOutbound()
     initNav()
     initScrollSpy()
+    initVideos()
   }
 
   if (document.readyState === 'loading') {

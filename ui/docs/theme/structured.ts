@@ -111,6 +111,34 @@ export function website(): Record<string, unknown> {
   }
 }
 
+/**
+ * FR-88 (#1790) P3 — a video a page embeds (`ui/src/utils/videos.ts`), for
+ * Google's video results. `embedUrl` is the player the facade loads on the
+ * click; `thumbnailUrl` is our own copy of the poster, absolute.
+ */
+export function videoObject(v: {
+  id: string
+  title: string
+  description: string
+  uploadDate: string
+  duration: string
+  thumbnailUrl: string
+}): Record<string, unknown> {
+  return {
+    '@type': 'VideoObject',
+    '@id': `https://www.youtube.com/watch?v=${v.id}`,
+    name: v.title,
+    description: v.description,
+    thumbnailUrl: [v.thumbnailUrl],
+    uploadDate: v.uploadDate,
+    duration: v.duration,
+    embedUrl: `https://www.youtube-nocookie.com/embed/${v.id}`,
+    url: `https://www.youtube.com/watch?v=${v.id}`,
+    inLanguage: 'en',
+    publisher: orgRef,
+  }
+}
+
 // ── the blog (P4) ────────────────────────────────────────────────────────
 
 export const BLOG_ID = `${SITE_ORIGIN}${BLOG_BASE}/#blog`

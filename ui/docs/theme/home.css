@@ -41,6 +41,11 @@
 .home-sub { text-align: center; color: var(--ink-muted); font-size: 1.05rem; margin: 0 auto 32px; max-width: 680px; }
 .home-pillar + .home-pillar { margin-top: 56px; }
 
+/* FR-88 P3: the video section, a centred column the width of a readable player. */
+.home-video__inner { max-width: 920px; }
+.home-video .video-facade { margin: 0; }
+.home-video .video-facade__caption { text-align: center; }
+
 .home-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
 .home-card {
   padding: 22px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg);

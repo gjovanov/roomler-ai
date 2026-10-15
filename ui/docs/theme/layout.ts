@@ -12,7 +12,7 @@
  */
 import { BASE, SITE_ORIGIN, SITE_TITLE_SUFFIX, type SectionDef } from '../site.ts'
 import { icon } from './icons.ts'
-import { escapeHtml, type Heading, type ResolvedImage } from './render.ts'
+import { escapeHtml, type Heading, type PageVideo, type ResolvedImage } from './render.ts'
 import {
   DEFAULT_OG_IMAGE,
   DOCS_NAV,
@@ -26,7 +26,7 @@ import {
   type ShellNav,
   type SiteAssets,
 } from './shell.ts'
-import { breadcrumbList, collectionPage, graph, organization, techArticle, type Crumb } from './structured.ts'
+import { breadcrumbList, collectionPage, graph, organization, techArticle, videoObject, type Crumb } from './structured.ts'
 
 export type { SiteAssets } from './shell.ts'
 
@@ -50,6 +50,8 @@ export interface DocPage {
   /** Rendered body HTML. */
   html: string
   headings: Heading[]
+  /** FR-88 P3: the `:::video` embeds, for the page's VideoObject nodes. */
+  videos?: PageVideo[]
   /** Body as plain text, for the search index. */
   plain: string
   /** Emit FAQPage structured data from this page's h2s. */
@@ -259,6 +261,11 @@ function structuredData(page: DocPage, canonical: string, crumbs: Crumb[]): Reco
   if (crumbs.length > 1) nodes.push(breadcrumbList(crumbs))
   const faq = faqJsonLd(page)
   if (faq) nodes.push(faq)
+  // FR-88 P3: one VideoObject per embedded video that has a published poster
+  // (Google requires a thumbnail; a page built without the image hook has none).
+  for (const { video, poster } of page.videos ?? []) {
+    if (poster) nodes.push(videoObject({ ...video, thumbnailUrl: `${SITE_ORIGIN}${poster.url}` }))
+  }
   return graph(nodes)
 }
 

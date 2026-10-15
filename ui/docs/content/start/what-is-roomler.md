@@ -12,6 +12,11 @@ Most people arrive here already running two products: something like
 VPN** to reach a service. Roomler is one agent that is *both*, plus the team
 layer, on one identity and one server you can host yourself.
 
+:::video C1YdfmhbAKM
+A 9-minute tour: installing the agent on Windows, macOS and Linux, connecting
+from a browser tab, and how it compares with TeamViewer and AnyDesk.
+:::
+
 ## The three pillars
 
 ### 1 · Desktop sharing and remote control
