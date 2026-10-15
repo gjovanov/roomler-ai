@@ -138,13 +138,16 @@ enum Lock {
     Keep,
 }
 
-/// [`Lock`] as a pure rule: held exactly while a session is live.
+/// [`Lock`] as a pure rule: held exactly while a session is live, and never
+/// taken while a sleep is under way. logind refuses an inhibitor for a sleep
+/// it is already carrying out (`OperationInProgress`, measured on the FR-93
+/// lab), and the next one is taken after the wake.
 #[cfg_attr(
     not(all(target_os = "linux", feature = "portal-capture")),
     allow(dead_code)
 )]
-fn lock_step(live_sessions: usize, held: bool) -> Lock {
-    match (live_sessions > 0, held) {
+fn lock_step(live_sessions: usize, held: bool, sleeping: bool) -> Lock {
+    match (live_sessions > 0 && !sleeping, held) {
         (true, false) => Lock::Take,
         (false, true) => Lock::Release,
         _ => Lock::Keep,
@@ -225,8 +228,19 @@ mod linux {
             })?;
         tracing::info!("sleep notice: watching logind for sleep (FR-93 P5h)");
         let mut lock: Option<zbus::zvariant::OwnedFd> = None;
+        // From `PrepareForSleep(true)` to `(false)`: the sleep is under way.
+        let mut sleeping = false;
         loop {
-            match lock_step(live(), lock.is_some()) {
+            // A wake whose signal never arrived still ends the sleep: logind's
+            // own property says whether one is under way.
+            if sleeping
+                && manager
+                    .get_property::<bool>("PreparingForSleep")
+                    .is_ok_and(|p| !p)
+            {
+                sleeping = false;
+            }
+            match lock_step(live(), lock.is_some(), sleeping) {
                 Lock::Take => match take(&manager) {
                     Ok(fd) => lock = Some(fd),
                     Err(e) => {
@@ -248,8 +262,12 @@ mod linux {
                     // Let it sleep. The next tick after the wake takes the
                     // inhibitor again if a session is still live.
                     lock = None;
+                    sleeping = true;
                 }
-                Ok(false) => tracing::info!("the computer woke up (FR-93 P5h)"),
+                Ok(false) => {
+                    sleeping = false;
+                    tracing::info!("the computer woke up (FR-93 P5h)");
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     anyhow::bail!("logind's PrepareForSleep stream ended")
@@ -281,12 +299,15 @@ mod tests {
 
     /// FR-93 P5h — the inhibitor is held exactly while a session is live:
     /// taken with the first, let go with the last, and nothing in between.
+    /// Never taken while a sleep is under way: logind refuses it then.
     #[test]
     fn the_inhibitor_is_held_exactly_while_a_session_is_live() {
-        assert_eq!(lock_step(1, false), Lock::Take);
-        assert_eq!(lock_step(2, true), Lock::Keep);
-        assert_eq!(lock_step(0, true), Lock::Release);
-        assert_eq!(lock_step(0, false), Lock::Keep);
+        assert_eq!(lock_step(1, false, false), Lock::Take);
+        assert_eq!(lock_step(2, true, false), Lock::Keep);
+        assert_eq!(lock_step(0, true, false), Lock::Release);
+        assert_eq!(lock_step(0, false, false), Lock::Keep);
+        assert_eq!(lock_step(1, false, true), Lock::Keep);
+        assert_eq!(lock_step(1, true, true), Lock::Release);
     }
 
     /// P5h — a session is told for exactly as long as it is registered. By
