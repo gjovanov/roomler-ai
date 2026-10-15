@@ -917,7 +917,7 @@ async fn alerts_fire_once_clear_and_mail_at_most_once_a_day() {
         .unwrap();
     let a = d.sections.unwrap().get_document("alerts").unwrap().clone();
     assert!(
-        a.get_array("open").unwrap().len() >= 1,
+        !a.get_array("open").unwrap().is_empty(),
         "open at the compute: {a}"
     );
     assert_eq!(a.get_array("fired").unwrap().len(), 0, "{a}");
