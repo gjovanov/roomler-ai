@@ -4,7 +4,8 @@
 [#456](https://github.com/gjovanov/roomler-ai/pull/456) (the arch-aware picker and the aarch64 `.deb`). A
 **per-user** daemon cannot install its own update, whichever format, so a root update half installs for
 it: [FR-96](fr/FR-96-per-user-linux-installs-update-themselves.md) (#2052),
-[below](#the-update-half-of-a-per-user-install-fr-96). `install.sh` enables it for a per-user install (P3).
+[below](#the-update-half-of-a-per-user-install-fr-96). `install.sh` enables it for a per-user install (P3,
+0.4.137), and from 0.4.138 the `.deb` enables it too, however it was installed (P5).
 
 ## The problem
 

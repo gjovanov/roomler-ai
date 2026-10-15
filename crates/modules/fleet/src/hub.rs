@@ -238,6 +238,31 @@ pub struct ConnectedAgent {
     /// it is sent only to a connection with it. Per connection; neither `hive`
     /// nor `hive-purge` implies it.
     pub supports_hive_purge_all: bool,
+    /// #2267 — `rc:hive.purge_all` was queued to this connection, which
+    /// happens only at its removal. The removal's kick then leaves the socket
+    /// open instead of telling the device: a daemon exits at once on
+    /// `rc:goodbye AgentDeleted`, which would cut its purge short.
+    pub removal_purge_pushed: bool,
+}
+
+/// #2267 — what a removal's kick did to the device's connection on this pod
+/// ([`Hub::kick_removed_agent`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KickOutcome {
+    /// This pod holds no connection for the device.
+    NotRegistered,
+    /// Taken out of the hub, and `rc:goodbye AgentDeleted` queued behind
+    /// whatever was queued to it before. The device closes the socket.
+    Told,
+    /// Taken out of the hub and not told: the caller asked not to (the device
+    /// is leaving by itself, or `rc.removal_goodbye` is off).
+    NotTold,
+    /// Taken out of the hub and not told, because this removal queued it
+    /// `rc:hive.purge_all`. Its socket stays open, as before #2267.
+    KeptForPurge,
+    /// Taken out of the hub; the goodbye could not be queued (the channel is
+    /// full or closed). The socket ends as it did before #2267.
+    GoodbyeLost,
 }
 
 /// FR-85 P3 — what a device says about remote recording, from its caps.
@@ -786,6 +811,8 @@ impl Hub {
             // FR-90 P2g-4a — set by `set_agent_hive_purge_all_support`; `false`
             // = no removal's purge is ever sent to this connection.
             supports_hive_purge_all: false,
+            // #2267 — set by `push_hive_purge_all` once the frame is queued.
+            removal_purge_pushed: false,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -908,9 +935,9 @@ impl Hub {
     /// late unregister evicted the NEWER displacing connection's
     /// registry entry, killing its in-flight sessions.
     ///
-    /// Pass `None` for admin-driven kicks (e.g. the kick-agent route)
-    /// that don't carry the agent's tx identity — these always
-    /// remove unconditionally.
+    /// `None` removes unconditionally. A device's REMOVAL does not come
+    /// here: it goes through [`Self::kick_removed_agent`], which also tells
+    /// the device (#2267).
     ///
     /// Returns whether the removal was OURS (Phase A-1): callers gate
     /// the Mongo `mark_status(Offline)` + Redis presence delete on it,
@@ -940,21 +967,75 @@ impl Hub {
         let removed = self.inner.agents.remove(&agent_id).is_some();
         if removed {
             info!("agent {} offline", agent_id);
-            // Force-close any sessions tied to this agent.
-            let dead: Vec<ObjectId> = self
-                .inner
-                .sessions
-                .iter()
-                .filter_map(|s| {
-                    let live = s.value().lock();
-                    (live.agent_id == agent_id).then_some(*s.key())
-                })
-                .collect();
-            for sid in dead {
-                let _ = self.terminate(sid, EndReason::AgentDisconnect);
-            }
+            self.end_agent_sessions(agent_id);
         }
         removed
+    }
+
+    /// Force-close every session tied to this agent.
+    fn end_agent_sessions(&self, agent_id: ObjectId) {
+        let dead: Vec<ObjectId> = self
+            .inner
+            .sessions
+            .iter()
+            .filter_map(|s| {
+                let live = s.value().lock();
+                (live.agent_id == agent_id).then_some(*s.key())
+            })
+            .collect();
+        for sid in dead {
+            let _ = self.terminate(sid, EndReason::AgentDisconnect);
+        }
+    }
+
+    /// #2267 — the kick at the end of a device's removal (fleet's
+    /// `removal::remove_agent_device`, an archive's revocation, and the `kick`
+    /// control event on the pod that holds the socket).
+    ///
+    /// The entry leaves the hub first, as [`Self::unregister_agent`] with no
+    /// tx identity, so nothing addresses the device from here on and its
+    /// sessions end. Then, when `goodbye`, `rc:goodbye AgentDeleted` is queued
+    /// on the connection the entry held. The channel is FIFO and the socket's
+    /// handler keeps its own sender, so the pump still delivers what was
+    /// queued before (P2g-4a's purge) and then the goodbye. The daemon stops
+    /// on it exactly as it does at a refused connection (exit 7), and closes
+    /// the socket itself, so no cancel is needed. Before #2267 the kick ended
+    /// here without the goodbye, and the device kept its socket until
+    /// something else dropped it.
+    ///
+    /// ⚠️ An entry that this removal pushed `rc:hive.purge_all` is NOT told:
+    /// the daemon's exit is immediate, and its purge runs after the frame
+    /// lands. That socket stays open as before, which P2g-4a relies on.
+    pub fn kick_removed_agent(&self, agent_id: ObjectId, goodbye: bool) -> KickOutcome {
+        let Some((_, entry)) = self.inner.agents.remove(&agent_id) else {
+            return KickOutcome::NotRegistered;
+        };
+        info!("agent {} offline (removed)", agent_id);
+        self.end_agent_sessions(agent_id);
+        if !goodbye {
+            return KickOutcome::NotTold;
+        }
+        if entry.removal_purge_pushed {
+            info!(
+                %agent_id,
+                "removed device not told: it was sent its purge, which the goodbye's exit would cut short; its socket stays open"
+            );
+            return KickOutcome::KeptForPurge;
+        }
+        let msg = ServerMsg::Goodbye {
+            reason: AgentCloseReason::AgentDeleted,
+            message: "This device was removed from its organization. Re-enrol it with a \
+                      fresh enrollment token from the admin UI \
+                      (`roomlerd re-enroll --token <jwt>`)."
+                .into(),
+        };
+        match entry.tx.try_send(msg) {
+            Ok(()) => KickOutcome::Told,
+            Err(e) => {
+                warn!(%agent_id, %e, "removed device's goodbye not queued; its socket ends as before #2267");
+                KickOutcome::GoodbyeLost
+            }
+        }
     }
 
     /// C-2 — the idle-agent nudge: close an agent's WS (via its
@@ -2885,7 +2966,13 @@ impl Hub {
                 return Err(Error::ExecUnsupported(agent_id.to_hex()));
             }
         }
-        self.send_to_agent(agent_id, ServerMsg::HivePurgeAll { purge_id })
+        self.send_to_agent(agent_id, ServerMsg::HivePurgeAll { purge_id })?;
+        // #2267 — the removal's kick, right after, must not tell this
+        // connection: the goodbye's exit would cut the purge short.
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.removal_purge_pushed = true;
+        }
+        Ok(())
     }
 
     /// FR-90 P2d — record whether this connection carries replica streams
@@ -5825,10 +5912,8 @@ mod tests {
 
     #[tokio::test]
     async fn unregister_agent_with_none_tx_always_removes() {
-        // Admin-kick path: `routes/remote_control.rs::kick_agent`
-        // calls `unregister_agent(aid, None)` — no tx identity is
-        // available there, so the call must always remove
-        // unconditionally (otherwise admins lose their kick power).
+        // No tx identity: the call must always remove unconditionally.
+        // (A removal's kick is `kick_removed_agent`, tested below.)
         let hub = test_hub().await;
         let agent_id = ObjectId::new();
         let (_tx, _cancel, _rx) = hub.register_agent(
@@ -5870,6 +5955,151 @@ mod tests {
             !hub.is_agent_online(agent_id),
             "matching-tx unregister must remove the entry"
         );
+    }
+
+    // ─── #2267: a removal's kick tells the device ────────────────────
+
+    fn register_linux(
+        hub: &Hub,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+    ) -> mpsc::Receiver<ServerMsg> {
+        let (_tx, _cancel, rx) = hub.register_agent(
+            agent_id,
+            tenant_id,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            false,
+        );
+        rx
+    }
+
+    #[tokio::test]
+    async fn a_removal_kick_tells_the_device_after_what_was_queued_before() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let mut rx = register_linux(&hub, agent_id, ObjectId::new());
+        hub.send_to_agent(agent_id, ServerMsg::Pong { id: 7 })
+            .expect("queued before the kick");
+
+        assert_eq!(hub.kick_removed_agent(agent_id, true), KickOutcome::Told);
+
+        assert!(
+            !hub.is_agent_online(agent_id),
+            "nothing addresses a removed device"
+        );
+        // FIFO: the frame queued before the kick is delivered first, so a
+        // removal hook's last word still reaches the device.
+        assert!(matches!(rx.try_recv(), Ok(ServerMsg::Pong { id: 7 })));
+        match rx.try_recv() {
+            Ok(ServerMsg::Goodbye { reason, .. }) => {
+                assert_eq!(reason, AgentCloseReason::AgentDeleted)
+            }
+            other => panic!("expected the removal's goodbye, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_removal_kick_without_goodbye_only_unregisters() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let mut rx = register_linux(&hub, agent_id, ObjectId::new());
+
+        assert_eq!(
+            hub.kick_removed_agent(agent_id, false),
+            KickOutcome::NotTold
+        );
+
+        assert!(!hub.is_agent_online(agent_id));
+        assert!(rx.try_recv().is_err(), "the kill switch sends nothing");
+        assert_eq!(
+            hub.kick_removed_agent(agent_id, true),
+            KickOutcome::NotRegistered,
+            "a second kick, or another pod's, finds nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removal_kick_keeps_a_purging_device_open() {
+        // FR-90 P2g-4a: the device purges after its frame lands, and the
+        // goodbye's exit is immediate, so the purge's connection is not told.
+        let hub = test_hub().await;
+        let (agent_id, tenant_id, purge) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let mut rx = register_linux(&hub, agent_id, tenant_id);
+        hub.set_agent_hive_support(agent_id, true);
+        hub.set_agent_hive_purge_all_support(agent_id, true);
+        hub.push_hive_purge_all(agent_id, tenant_id, purge)
+            .expect("pushed");
+
+        assert_eq!(
+            hub.kick_removed_agent(agent_id, true),
+            KickOutcome::KeptForPurge
+        );
+
+        assert!(!hub.is_agent_online(agent_id));
+        assert!(
+            matches!(rx.try_recv(), Ok(ServerMsg::HivePurgeAll { purge_id }) if purge_id == purge)
+        );
+        assert!(rx.try_recv().is_err(), "no goodbye behind the purge");
+    }
+
+    #[tokio::test]
+    async fn a_refused_purge_push_does_not_keep_the_device_open() {
+        // Only a frame that was queued holds the goodbye back: a connection
+        // without `hive-purge-all` is sent no purge, so it is told.
+        let hub = test_hub().await;
+        let (agent_id, tenant_id) = (ObjectId::new(), ObjectId::new());
+        let mut rx = register_linux(&hub, agent_id, tenant_id);
+        hub.set_agent_hive_support(agent_id, true);
+        assert!(
+            hub.push_hive_purge_all(agent_id, tenant_id, ObjectId::new())
+                .is_err()
+        );
+
+        assert_eq!(hub.kick_removed_agent(agent_id, true), KickOutcome::Told);
+        assert!(matches!(rx.try_recv(), Ok(ServerMsg::Goodbye { .. })));
+    }
+
+    #[tokio::test]
+    async fn the_kick_control_event_tells_the_device_only_when_it_says_so() {
+        // The pod holding the socket applies the removing pod's decision. An
+        // envelope without `goodbye` comes from a pod before #2267 and keeps
+        // that pod's behaviour (unregister only).
+        let hub = test_hub().await;
+        let kick = |aid: ObjectId, goodbye: Option<bool>| {
+            let mut v = serde_json::json!({
+                "class": "rc",
+                "evt": "kick",
+                "agent_id": aid.to_hex(),
+            });
+            if let Some(g) = goodbye {
+                v["goodbye"] = serde_json::json!(g);
+            }
+            v
+        };
+
+        let old = ObjectId::new();
+        let mut rx_old = register_linux(&hub, old, ObjectId::new());
+        crate::ctrl::apply_rc_ctrl(&hub, &kick(old, None));
+        assert!(!hub.is_agent_online(old));
+        assert!(
+            rx_old.try_recv().is_err(),
+            "an old pod's kick tells nothing"
+        );
+
+        let told = ObjectId::new();
+        let mut rx_told = register_linux(&hub, told, ObjectId::new());
+        crate::ctrl::apply_rc_ctrl(&hub, &kick(told, Some(true)));
+        assert!(!hub.is_agent_online(told));
+        assert!(matches!(
+            rx_told.try_recv(),
+            Ok(ServerMsg::Goodbye {
+                reason: AgentCloseReason::AgentDeleted,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

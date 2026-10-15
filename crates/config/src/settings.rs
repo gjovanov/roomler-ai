@@ -710,6 +710,14 @@ pub struct RcSettings {
     /// Never shortened on prod. Env: `ROOMLER__RC__AGENT_TOKEN_TTL_SECS`.
     #[serde(default = "default_agent_token_ttl_secs")]
     pub agent_token_ttl_secs: u64,
+    /// #2267 — a removal tells a CONNECTED device at once: the kick queues
+    /// `rc:goodbye AgentDeleted` on its socket, and its daemon stops as it
+    /// would at its next connection. Default **true**. `false` is the kill
+    /// switch: the kick only takes the device out of the hub, and the device
+    /// keeps its socket until something else drops it, as before #2267.
+    /// Env: `ROOMLER__RC__REMOVAL_GOODBYE`.
+    #[serde(default = "default_true")]
+    pub removal_goodbye: bool,
 }
 
 fn default_agent_token_ttl_secs() -> u64 {
@@ -737,6 +745,7 @@ impl Default for RcSettings {
             token_renewal: true,
             token_generation_check: true,
             agent_token_ttl_secs: default_agent_token_ttl_secs(),
+            removal_goodbye: true,
         }
     }
 }
@@ -1210,6 +1219,7 @@ impl Settings {
             .set_default("rc.token_renewal", true)?
             .set_default("rc.token_generation_check", true)?
             .set_default("rc.agent_token_ttl_secs", 365 * 24 * 60 * 60)?
+            .set_default("rc.removal_goodbye", true)?
             .set_default("s3.enabled", false)?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?
