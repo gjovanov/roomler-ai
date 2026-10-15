@@ -130,6 +130,16 @@ impl ScrapCapture {
         thread::Builder::new()
             .name("roomlerd-capture".into())
             .spawn(move || {
+                // macOS — a sleeping display composites nothing, so a stream
+                // opened on it never delivers a frame and the viewer hangs up
+                // (`power::DisplayAwake`). Taken here, on the thread that owns
+                // the capturer, so it lives exactly as long as the capture.
+                #[cfg(target_os = "macos")]
+                let display_awake = crate::power::DisplayAwake::acquire();
+                // Set only when the display was asleep: the field check that
+                // waking it is what brought the picture back.
+                #[cfg(target_os = "macos")]
+                let mut woke_at = display_awake.was_asleep().then(Instant::now);
                 let mut attempt: u32 = 0;
                 let init_outcome = loop {
                     attempt += 1;
@@ -323,6 +333,14 @@ impl ScrapCapture {
                     #[allow(unused_mut)]
                     let mut reply =
                         capture_one_blocking(&mut cap, w, h, (native_w, native_h), start, downscale);
+                    #[cfg(target_os = "macos")]
+                    if let (Some(since), Ok(Some(_))) = (woke_at, reply.as_ref()) {
+                        tracing::info!(
+                            ms = since.elapsed().as_millis() as u64,
+                            "capture: the first frame after waking the display"
+                        );
+                        woke_at = None;
+                    }
                     // The tracker reports in ROOT coordinates; a delivered
                     // frame may have been downscaled on the way out, so the
                     // rects have to follow it or every consumer would point at
