@@ -34,7 +34,8 @@
 #                     enroll command to run later.
 #
 # The desktop companion (roomler-desktop) rides IN the macOS .pkg. On Linux it
-# is a SEPARATE .deb (FR-27) — installed automatically when this box has a
+# is a SEPARATE .deb (FR-27), or .rpm on Fedora, the RHEL family and openSUSE
+# (FR-93 P6d) — installed automatically when this box has a
 # graphical session, since the companion is the device's consent PROMPT
 # surface and a device set to "Prompt on host" without one cannot ask anybody.
 #   --desktop / --no-desktop   force that decision either way.
@@ -708,7 +709,42 @@ enroll_tunnel() {
     "$cli" enroll --server "$SERVER" --token "$TOKEN" --name "$NAME"
 }
 
-# FR-27 — the Linux desktop companion, from its OWN .deb.
+# FR-93 P6d — the tool that installs a local .rpm and resolves its
+# dependencies from the distro's repositories; nothing when there is none.
+desktop_rpm_tool() {
+    for t in dnf zypper yum; do
+        if command -v "$t" >/dev/null 2>&1; then
+            echo "$t"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Install a downloaded companion package with this host's package manager.
+desktop_install() {
+    case "$1" in
+        *.deb)
+            # `apt-get -f install` pulls webkit2gtk / GTK / appindicator when
+            # dpkg reports them missing, which on a fresh desktop it usually will.
+            sudo dpkg -i "$1" || sudo apt-get -f install -y
+            ;;
+        *.rpm)
+            # The package is ours and its sha256 is checked by the caller;
+            # zypper alone refuses an unsigned local package without being told.
+            case "$(desktop_rpm_tool)" in
+                dnf) sudo dnf install -y "$1" ;;
+                zypper) sudo zypper --non-interactive install --allow-unsigned-rpm "$1" ;;
+                yum) sudo yum install -y "$1" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# FR-27 — the Linux desktop companion, from its OWN package: a .deb, or an
+# .rpm on the hosts with no dpkg (FR-93 P6d).
 #
 # A SEPARATE package on purpose: the daemon .deb installs on headless nodes
 # across the fleet, and folding webkit2gtk + GTK into it to ship a menu-bar app
@@ -739,30 +775,39 @@ install_desktop_linux() {
             return 0
         fi
     fi
-    if ! command -v dpkg >/dev/null 2>&1; then
-        say "no dpkg here — the desktop companion ships as a .deb only; skipping"
+    # FR-93 P6d — a dpkg host takes the .deb; an RPM host (Fedora, the RHEL
+    # family, openSUSE) the .rpm. Either way the host's own package manager
+    # pulls webkit2gtk, GTK and the tray library from the distro's repositories.
+    if command -v dpkg >/dev/null 2>&1; then
+        desktop_ext=deb
+    elif command -v rpm >/dev/null 2>&1 && desktop_rpm_tool >/dev/null; then
+        desktop_ext=rpm
+    else
+        say "no dpkg and no dnf/zypper/yum here — the desktop companion ships as a .deb and an .rpm; skipping"
         return 0
     fi
 
-    desktop_pattern="roomler-desktop-.*${arch}-unknown-linux-gnu\\.deb"
+    desktop_pattern="roomler-desktop-.*${arch}-unknown-linux-gnu\\.${desktop_ext}"
     desktop_url="$(asset_field_for "$releases" "$desktop_pattern" browser_download_url)"
     if [ -z "$desktop_url" ]; then
-        say "no roomler-desktop .deb for ${arch} in this release — skipping the companion"
+        say "no roomler-desktop .${desktop_ext} for ${arch} in this release — skipping the companion"
         return 0
     fi
     desktop_digest="$(asset_field_for "$releases" "$desktop_pattern" digest)"
-    desktop_pkg="$STAGE/roomler-desktop.deb"
+    desktop_pkg="$STAGE/roomler-desktop.${desktop_ext}"
     download "$desktop_url" "$desktop_pkg"
     verify_sha256 "$desktop_pkg" "$desktop_digest"
 
     if [ "$DOWNLOAD_ONLY" = 1 ]; then
-        say "download-only: would run: sudo dpkg -i $desktop_pkg"
+        if [ "$desktop_ext" = deb ]; then
+            say "download-only: would run: sudo dpkg -i $desktop_pkg"
+        else
+            say "download-only: would run: sudo $(desktop_rpm_tool) install $desktop_pkg"
+        fi
         return 0
     fi
-    say "installing the roomler-desktop companion (.deb — sudo required)"
-    # `apt-get -f install` pulls webkit2gtk / GTK / appindicator when dpkg
-    # reports them missing, which on a fresh desktop it usually will.
-    if sudo dpkg -i "$desktop_pkg" || sudo apt-get -f install -y; then
+    say "installing the roomler-desktop companion (.${desktop_ext} — sudo required)"
+    if desktop_install "$desktop_pkg"; then
         # FR-84 D6 — the daemon (started above) watches for the companion and
         # opens it once, with the Welcome tour, in the logged-in graphical
         # session; the package's XDG entry starts it at every later login.
@@ -781,7 +826,7 @@ say "roomler install.sh — role=$ROLE os=$OS server=$SERVER"
 
 case "$ROLE/$OS" in
     # FR-27 — the companion AFTER the daemon: it depends on `roomlerd` (the
-    # package literally Depends on it), and it reuses the release listing the
+    # .deb literally Depends on it), and it reuses the release listing the
     # daemon step already fetched.
     daemon/Linux)  install_daemon_linux; install_desktop_linux ;;
     daemon/Darwin) install_daemon_macos ;;
