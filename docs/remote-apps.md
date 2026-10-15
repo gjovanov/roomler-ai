@@ -126,7 +126,7 @@ Three rules the session arm enforces, each paid for somewhere:
   where an Xvfb the daemon owns could not (`linux.rs:274`).
 
 The same `loginctl` walk serves FR-27's consent companion and FR-45's capture
-helper (`agents/roomlerd/src/companion.rs:457`) — one copy on purpose, because
+helper (`agents/roomlerd/src/companion.rs:461`) — one copy on purpose, because
 a compositor that reports its session differently should break all three in
 the same place.
 
@@ -414,7 +414,7 @@ must never write the device's config as a side effect of being run.
 | `agents/roomlerd/src/apps/windows.rs` | `EnumWindows` (`:49`), `coverage` (`:88`), `list` (`:100`), `focus` (`:120`), `launch` (`:149`) |
 | `agents/roomlerd/src/encode/caps.rs` | `apps_caps` / `apps_caps_for` (`:1487`, `:1493`), assigned by `with_config_lists` (`:655`) from `detect` (`:624`) beside `rpc` and `files` (`files_caps` / `files_caps_for`, `:1532`, `:1539`); `CACHED_CAPS` (`:37`) — why the hello is a snapshot; `cached_or_probed` (`:667`) — why the child's struct must carry no `apps` |
 | `agents/roomlerd/src/peer.rs` | the control-DC arm (`:8595`) |
-| `agents/roomlerd/src/companion.rs` | `graphical_session` (`:457`) |
+| `agents/roomlerd/src/companion.rs` | `graphical_session` (`:461`) |
 | `agents/roomlerd/src/main.rs` | `apps-probe` (`:4707`) — reads the device config through `read_if_present`, never `load` |
 | `crates/remote_control/src/models.rs` | `AgentCaps.apps` and its known values (`:203`) |
 | `crates/agent-core/src/apps_config.rs` · `config_surface.rs` | the `[virtual_desktop_apps]` shapes (`:21`); the config-surface keys (`:1446`, `:988`) |

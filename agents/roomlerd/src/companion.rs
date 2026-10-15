@@ -291,24 +291,28 @@ fn installed_version_inner() -> Option<String> {
     sanitize_version(&after[open..close])
 }
 
-/// Linux: ask dpkg, which OWNS the companion here (its own `roomler-desktop`
-/// .deb). Reading the package database is the one answer that stays true when
-/// apt upgrades the companion without the daemon noticing.
+/// Linux: ask the package database that OWNS the companion here: dpkg for its
+/// `roomler-desktop` .deb, rpm for the .rpm (FR-93 P6d). Reading the package
+/// database is the one answer that stays true when the package manager
+/// upgrades the companion without the daemon noticing.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn installed_version_inner() -> Option<String> {
-    let out = std::process::Command::new("dpkg-query")
-        .args(["-W", "-f=${Version}", "roomler-desktop"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        // Not installed, or no dpkg at all (the Fedora/Asahi host). Both are
-        // "no companion we can name", not an error worth logging every 10 min.
-        return None;
+    // Not installed, or no such tool on this host: "no companion we can name",
+    // not an error worth logging every 10 min.
+    let query = |cmd: &str, args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new(cmd).args(args).output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    if let Some(raw) = query("dpkg-query", &["-W", "-f=${Version}", "roomler-desktop"]) {
+        // cargo-deb appends a Debian revision (`0.4.16-1`); report the upstream
+        // half so the grid can compare it against `agent_version` directly.
+        return sanitize_version(raw.split('-').next().unwrap_or(""));
     }
-    // cargo-deb appends a Debian revision (`0.4.16-1`); report the upstream
-    // half so the grid can compare it against `agent_version` directly.
-    let raw = String::from_utf8_lossy(&out.stdout);
-    sanitize_version(raw.split('-').next().unwrap_or(""))
+    // `%{VERSION}` is the upstream half already (the release is its own tag).
+    query("rpm", &["-q", "--qf", "%{VERSION}", "roomler-desktop"])
+        .and_then(|raw| sanitize_version(&raw))
 }
 
 /// A version string is about to be persisted on the device row and rendered in
