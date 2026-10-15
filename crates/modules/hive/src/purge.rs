@@ -233,6 +233,50 @@ impl PurgeDao {
             .await
     }
 
+    /// FR-90 P2g-4a — `device_id` was removed: its pending part of each
+    /// unfinished purge of `tenant_id` closes `device_removed`, as it would
+    /// at the issue of one after its removal. The purges it had a part in.
+    pub async fn close_removed(
+        &self,
+        tenant_id: ObjectId,
+        device_id: ObjectId,
+    ) -> DaoResult<Vec<ObjectId>> {
+        let filter = doc! {
+            "tenant_id": tenant_id,
+            "done_at": Bson::Null,
+            "devices": { "$elemMatch": {
+                "device_id": device_id,
+                "state": PurgeEntryState::Pending.as_str(),
+            } },
+        };
+        let ids: Vec<ObjectId> = self
+            .base
+            .find_many(filter.clone(), None)
+            .await?
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        self.base
+            .collection()
+            .update_many(
+                filter,
+                doc! { "$set": {
+                    "devices.$[e].state": PurgeEntryState::Closed.as_str(),
+                    "devices.$[e].closed": PurgeClosed::DeviceRemoved.as_str(),
+                    "devices.$[e].answered_at": DateTime::now(),
+                } },
+            )
+            .array_filters(vec![doc! {
+                "e.device_id": device_id,
+                "e.state": PurgeEntryState::Pending.as_str(),
+            }])
+            .await?;
+        Ok(ids)
+    }
+
     /// The purge completes: once, and only while no device's part is
     /// pending. The purge as it now stands; `None` = not complete, or
     /// completed already.
@@ -930,6 +974,52 @@ pub(crate) async fn on_ack(
     if store.closed() && account.closed() {
         finish(state, purge_id).await;
     }
+}
+
+/// FR-90 P2g-4a — `device_id` is being removed from `tenant_id`, its socket
+/// still up (hive leads `HOOK_ORDER`): it is told to purge every session it
+/// holds (`rc:hive.purge_all`), on this pod or on the one that holds its
+/// socket, before the kick that follows; only a connection advertising
+/// `hive-purge-all`. Best effort: nothing answers, its credentials go next,
+/// and one offline now, or of a build before it, keeps what it held (until
+/// P7). Then its pending part of each unfinished purge closes
+/// `device_removed`, and a purge that was waiting on it alone completes.
+pub(crate) async fn device_removed(
+    state: &HiveState,
+    tenant_id: ObjectId,
+    device_id: ObjectId,
+) -> DaoResult<()> {
+    let purge_id = ObjectId::new();
+    match state
+        .fleet
+        .rc_hub
+        .push_hive_purge_all(device_id, tenant_id, purge_id)
+    {
+        Ok(()) => {
+            info!(purge = %purge_id, device = %device_id, "hive: a removed device is told to purge what it holds")
+        }
+        Err(HubError::ExecUnsupported(_)) => {
+            debug!(device = %device_id, "hive: a removed device's agent does not purge at its removal — its disk keeps what it held")
+        }
+        // Not connected here: the pod that holds its socket tells it. The
+        // kick is published after this, on the same channel.
+        Err(_) => {
+            roomler_ai_mod_fleet::ctrl::publish_rc_ctrl(
+                &state.core,
+                "hive_purge_all",
+                serde_json::json!({
+                    "tenant_id": tenant_id.to_hex(),
+                    "agent_id": device_id.to_hex(),
+                    "purge_id": purge_id.to_hex(),
+                }),
+            )
+            .await;
+        }
+    }
+    for id in state.purges.close_removed(tenant_id, device_id).await? {
+        finish(state, id).await;
+    }
+    Ok(())
 }
 
 /// The purge completes once no device's part is pending, and only once:

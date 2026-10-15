@@ -67,7 +67,7 @@ A device that could curtain but whose owner has not allowed it advertises only
 ## Who can say no, and what the viewer says
 
 The server strips `PRIVACY` before the device ever sees it
-([`privacy_grant`, `hub.rs:349`](../crates/modules/fleet/src/hub.rs#L349)). The first reason
+([`privacy_grant`, `hub.rs:355`](../crates/modules/fleet/src/hub.rs#L355)). The first reason
 that applies wins, and it reaches the viewer (`rc:session.created.privacy_refused`) and the
 session's `session_requested` audit row (`privacy_stripped`):
 

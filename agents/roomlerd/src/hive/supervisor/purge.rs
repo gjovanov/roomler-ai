@@ -49,9 +49,41 @@ impl Supervisor {
         }
     }
 
+    /// FR-90 P2g-4a — `rc:hive.purge_all`: this device's enrollment is being
+    /// removed from its organization, so every session it holds is purged,
+    /// one at a time under the start lock, each as `rc:hive.purge` purges
+    /// one. Nothing is answered: the removal kicks the connection next. How
+    /// many were purged whole.
+    pub(crate) async fn purge_all(self: &Arc<Self>, purge_id: ObjectId) -> usize {
+        let held = self.held_ids().await;
+        info!(
+            purge = %purge_id, sessions = held.len(),
+            "hive: this device leaves its organization — every session it holds is purged"
+        );
+        let mut whole = 0;
+        for session in held {
+            let (store, account, detail) = {
+                let _serial = self.start_lock.lock().await;
+                self.purge_parts(session).await
+            };
+            if store.closed() && account.closed() {
+                whole += 1;
+            } else {
+                warn!(
+                    purge = %purge_id, session = %session, store = store.as_str(),
+                    account = account.as_str(), detail = detail.as_deref().unwrap_or(""),
+                    "hive: a session of a removed organization was not purged whole"
+                );
+            }
+        }
+        info!(purge = %purge_id, whole, "hive: what this device held for its organization is purged");
+        whole
+    }
+
     /// Purge `session` here, every part, and how each went: the order the
     /// module's table names. P2g-3d — the device's own clock runs it too
-    /// ([`super::retain`]), under the start lock, with no purge id.
+    /// ([`super::retain`]), under the start lock, with no purge id; and so
+    /// does a removal (P2g-4a, [`Self::purge_all`]).
     pub(super) async fn purge_parts(
         self: &Arc<Self>,
         session: ObjectId,
@@ -210,5 +242,61 @@ fn remove_run_dir(dir: &std::path::Path) -> Result<bool, String> {
             std::fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
             Ok(true)
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::hive::supervisor::tests::{moving_rig, next_state, order};
+    use roomler_ai_remote_control::hive::HiveRunState;
+
+    /// P2g-4a — a removal's purge takes every session the device holds, each
+    /// whole: the copies in its store, and a session it runs, whose run stops
+    /// first and whose account's state directory goes with it. Each id is
+    /// kept purged, and nothing of them is held after.
+    #[tokio::test]
+    async fn a_removal_purges_every_session_the_device_holds() {
+        let mut r = moving_rig(ObjectId::new(), 4);
+        let (a, b) = (ObjectId::new(), ObjectId::new());
+        for s in [a, b] {
+            r.store.join(&s.to_hex(), "owner", 1).await.unwrap();
+        }
+        let mut o = order(&r);
+        o.replicated = true;
+        let run = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, run).await.0, HiveRunState::Idle);
+        r.sup.prompt(run, None, "hi".into()).unwrap();
+        assert_eq!(next_state(&mut r, run).await.0, HiveRunState::Running);
+        assert_eq!(next_state(&mut r, run).await.0, HiveRunState::Idle);
+        let state_dir = r
+            .root
+            .path()
+            .join("home")
+            .join(".roomler")
+            .join("hive")
+            .join(run.to_hex());
+        assert!(state_dir.is_dir() && r.sup.holds_live(run));
+
+        assert_eq!(
+            r.sup.purge_all(ObjectId::new()).await,
+            3,
+            "every session held, purged whole"
+        );
+        assert!(!r.sup.holds_live(run), "the run stopped first");
+        assert!(!state_dir.exists(), "its account's state directory went");
+        for s in [a, b, run] {
+            assert!(r.store.is_purged(&s.to_hex()).await.unwrap(), "{s} purged");
+        }
+        assert!(
+            r.store.held_sessions().await.unwrap().is_empty(),
+            "nothing of them is held"
+        );
+        assert_eq!(
+            r.sup.purge_all(ObjectId::new()).await,
+            0,
+            "a removal told again finds nothing"
+        );
     }
 }

@@ -13,6 +13,15 @@
 //! | B comes back | B hears its purge first and purges its copy | B's part `done` / `not_there`; the purge complete, its tombstone gone |
 //! | each store | it keeps the purged id, and nothing else of the session | `is_purged`, and no event of it |
 //!
+//! P2g-4a, a second scenario on the same pair: A, the primary, is removed
+//! from the organization while online.
+//!
+//! | step | the devices | what the test reads |
+//! |---|---|---|
+//! | `DELETE …/agent/{a}` | A is told to stop the session, then to purge all it holds | the session ended `device_removed` |
+//! | A runs on | A stops the run, purges its copy and, as the account, the session's state directory | A's harness gone, its runtime and state directories gone |
+//! | each store | A keeps the purged id and nothing else of it; B, which stays, keeps its copy | `is_purged`, and the events |
+//!
 //! ⚠️ The stream rides `direct` on loopback: the tests build carries no
 //! overlay, as in the canary. ⚠️ A process holds one supervisor, so neither
 //! device runs in this one.
@@ -125,17 +134,42 @@ fn device_process() {
 
 #[test]
 fn a_purge_reaches_a_member_that_was_offline_and_each_device_keeps_only_its_id() {
-    // Its own thread with a deep stack, and a current-thread runtime, as the
-    // canary: several servers' worth of tasks live in one body.
+    run(Scenario::Purge);
+}
+
+/// P2g-4a — the primary of a running session, removed from its organization
+/// while online: it stops the run, which ends `device_removed`, and purges
+/// its copy and, as the account, what the account held of it. Its member,
+/// which stays, keeps its copy.
+#[test]
+fn a_removed_device_purges_what_it_held_and_its_member_keeps_its_copy() {
+    run(Scenario::Removal);
+}
+
+/// Which scenario a test runs.
+#[derive(Clone, Copy, Debug)]
+enum Scenario {
+    Purge,
+    Removal,
+}
+
+/// The scenario on its own thread with a deep stack, and a current-thread
+/// runtime, as the canary: several servers' worth of tasks live in one body.
+fn run(which: Scenario) {
     let joined = std::thread::Builder::new()
-        .name("hive-purge".into())
+        .name(format!("hive-purge-{which:?}"))
         .stack_size(16 << 20)
-        .spawn(|| {
+        .spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(scenario())
+                .block_on(async move {
+                    match which {
+                        Scenario::Purge => scenario().await,
+                        Scenario::Removal => removal().await,
+                    }
+                })
         })
         .unwrap()
         .join();
@@ -304,7 +338,9 @@ fn alive(pid: &str) -> bool {
     Path::new("/proc").join(pid.trim()).exists()
 }
 
-async fn scenario() {
+/// The server, `hive.replicaset` on, and an organization whose sessions are
+/// copied to a second device.
+async fn replicaset(tag: &str) -> (TestApp, SeededTenant) {
     let app = TestApp::spawn_with_settings(|s| {
         s.modules.hive = true;
         s.hive.replicaset = true;
@@ -312,10 +348,7 @@ async fn scenario() {
         s.app.rate_limit_burst = 10_000;
     })
     .await;
-    let seeded = app.seed_tenant("hivepurge").await;
-    let tid = seeded.tenant_id.clone();
-    let owner = seeded.admin.access_token.clone();
-    let dir = tempfile::tempdir().unwrap();
+    let seeded = app.seed_tenant(tag).await;
     let policy = json!({
         "replicaset": {
             "min": 2, "max": 4, "archive": true,
@@ -326,40 +359,70 @@ async fn scenario() {
         "revision": 0,
     });
     let resp = app
-        .auth_put(&format!("/api/tenant/{tid}/hive/policy"), &owner)
+        .auth_put(
+            &format!("/api/tenant/{}/hive/policy", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
         .json(&policy)
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
+    (app, seeded)
+}
+
+/// A session on A, B its member, after a prompt whose turn B's copy holds;
+/// each device a process of its own.
+struct Pair {
+    a: String,
+    a_dir: PathBuf,
+    a_proc: tokio::process::Child,
+    b: String,
+    b_cfg: roomlerd::config::AgentConfig,
+    b_dir: PathBuf,
+    b_proc: tokio::process::Child,
+    sid: String,
+    room: String,
+    /// A's harness, which runs the session.
+    a_pid: String,
+    /// A's runtime directory of the session.
+    a_run: PathBuf,
+    /// What A's account holds of the session.
+    a_state: PathBuf,
+}
+
+/// [`Pair`], its devices' directories under `dir`, its machines named after
+/// `tag`.
+async fn pair(app: &TestApp, seeded: &SeededTenant, dir: &Path, tag: &str) -> Pair {
+    let owner = seeded.admin.access_token.clone();
 
     // ── A and B, each in a process of its own, each holding copies ─────────
-    let a_dir = dir.path().join("a");
+    let a_dir = dir.join("a");
     let a_work = device_dir(&a_dir);
-    let mut a_cfg = enrol(&app, &seeded, "hive-purge-a").await;
-    runs_and_holds(&mut a_cfg, &seeded, &a_dir);
+    let mut a_cfg = enrol(app, seeded, &format!("{tag}-a")).await;
+    runs_and_holds(&mut a_cfg, seeded, &a_dir);
     let a = a_cfg.agent_id.clone();
-    let a_proc = device(&app, &seeded, &a_dir, &a_cfg).await;
-    let b_dir = dir.path().join("b");
+    let a_proc = device(app, seeded, &a_dir, &a_cfg).await;
+    let b_dir = dir.join("b");
     device_dir(&b_dir);
-    let mut b_cfg = enrol(&app, &seeded, "hive-purge-b").await;
-    runs_and_holds(&mut b_cfg, &seeded, &b_dir);
+    let mut b_cfg = enrol(app, seeded, &format!("{tag}-b")).await;
+    runs_and_holds(&mut b_cfg, seeded, &b_dir);
     let b = b_cfg.agent_id.clone();
-    let b_proc = device(&app, &seeded, &b_dir, &b_cfg).await;
+    let b_proc = device(app, seeded, &b_dir, &b_cfg).await;
 
     // ── The session on A, B its member, and a prompt ───────────────────────
-    let s = start(&app, &seeded, &a, &a_work).await;
+    let s = start(app, seeded, &a, &a_work).await;
     let sid = s["id"].as_str().unwrap().to_string();
     let room = s["room_id"].as_str().unwrap().to_string();
     assert!(
-        reached(&app, &seeded, &sid, "idle").await,
+        reached(app, seeded, &sid, "idle").await,
         "the session never came up"
     );
-    until_session(&app, &seeded, &sid, LONG, "B never took its copy", |s| {
+    until_session(app, seeded, &sid, LONG, "B never took its copy", |s| {
         member(s, &b).is_some_and(|m| m["state"] == "joined")
     })
     .await;
-    let mut ws = UserWs::open(&app, &owner).await;
+    let mut ws = UserWs::open(app, &owner).await;
     let mut on_a = view(&mut ws, &sid).await;
     on_a.send(json!({"op": "hello"})).await;
     let hello = on_a.recv_op("hello").await;
@@ -371,7 +434,7 @@ async fn scenario() {
     on_a.events_until(|e| e["event"]["kind"] == "turn").await;
     on_a.close(&mut ws).await;
     // B's copy reached A's last checkpoint, as B last said.
-    until_session(&app, &seeded, &sid, LONG, "B's copy never caught up", |s| {
+    until_session(app, seeded, &sid, LONG, "B's copy never caught up", |s| {
         let a_cp = member(s, &a).and_then(|m| m["tip"]["checkpoint_seq"].as_u64());
         let b_cp = member(s, &b).and_then(|m| m["tip"]["checkpoint_seq"].as_u64());
         a_cp.is_some() && a_cp == b_cp
@@ -384,6 +447,41 @@ async fn scenario() {
     assert!(a_run.exists(), "A holds the session's runtime directory");
     let a_state = a_dir.join("home").join(".roomler").join("hive").join(&sid);
     assert!(a_state.exists(), "A's account holds the session's state");
+    Pair {
+        a,
+        a_dir,
+        a_proc,
+        b,
+        b_cfg,
+        b_dir,
+        b_proc,
+        sid,
+        room,
+        a_pid,
+        a_run,
+        a_state,
+    }
+}
+
+async fn scenario() {
+    let (app, seeded) = replicaset("hivepurge").await;
+    let tid = seeded.tenant_id.clone();
+    let owner = seeded.admin.access_token.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let Pair {
+        a,
+        a_dir,
+        a_proc,
+        b,
+        b_cfg,
+        b_dir,
+        b_proc,
+        sid,
+        room,
+        a_pid,
+        a_run,
+        a_state,
+    } = pair(&app, &seeded, dir.path(), "hive-purge").await;
 
     // ── B goes offline: its copy is in its store ───────────────────────────
     stop(b_proc).await;
@@ -470,4 +568,54 @@ async fn scenario() {
         let (events, purged) = held(&d.join("hive.db"), &sid);
         assert_eq!((events, purged), (0, true), "{who}'s store");
     }
+}
+
+/// P2g-4a — [`a_removed_device_purges_what_it_held_and_its_member_keeps_its_copy`].
+async fn removal() {
+    let (app, seeded) = replicaset("hiveremove").await;
+    let tid = seeded.tenant_id.clone();
+    let owner = seeded.admin.access_token.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let p = pair(&app, &seeded, dir.path(), "hive-remove").await;
+
+    // ── A, which runs the session, is removed while online ─────────────────
+    let resp = app
+        .auth_delete(&format!("/api/tenant/{tid}/agent/{}", p.a), &owner)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
+    let ended = session(&app, &seeded, &p.sid).await;
+    assert_eq!(
+        (ended["status"].as_str(), ended["end_reason"].as_str()),
+        (Some("ended"), Some("device_removed")),
+        "{ended}"
+    );
+    // What A held of it goes, as A runs on: nothing answers a removal's
+    // purge, so the test watches A's disk.
+    let began = Instant::now();
+    while p.a_state.exists() {
+        assert!(
+            began.elapsed() < LONG,
+            "A never purged what its account held of the session"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+    eprintln!(
+        "hive_purge: the removed device purged in {} ms",
+        began.elapsed().as_millis()
+    );
+    assert!(!alive(&p.a_pid), "A's run of it stopped");
+    assert!(!p.a_run.exists(), "A's runtime directory went");
+
+    // ── A's store keeps only the purged id; B, which stays, its copy ───────
+    stop(p.a_proc).await;
+    stop(p.b_proc).await;
+    assert_eq!(
+        held(&p.a_dir.join("hive.db"), &p.sid),
+        (0, true),
+        "A's store"
+    );
+    let (events, purged) = held(&p.b_dir.join("hive.db"), &p.sid);
+    assert!(events > 0 && !purged, "B keeps its copy: {events} events");
 }

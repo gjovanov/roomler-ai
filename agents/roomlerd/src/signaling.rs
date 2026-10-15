@@ -4841,6 +4841,15 @@ async fn handle_server_msg(
             }
         }
 
+        // FR-90 P2g-4a — this device's enrollment is being removed: every
+        // session it holds is purged.
+        ServerMsg::HivePurgeAll { purge_id } => {
+            #[cfg(hive_host)]
+            crate::hive::handle_purge_all(purge_id, ctx.is_primary);
+            #[cfg(not(hive_host))]
+            debug!(purge = %purge_id, "rc:hive.purge_all ignored — this build does not run agent sessions");
+        }
+
         // FR-90 P2g-3d — what keeps each copy this device asked about: the
         // device's own clock counts from it.
         ServerMsg::HiveRetain { words } => {
