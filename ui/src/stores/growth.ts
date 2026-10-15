@@ -468,6 +468,116 @@ export interface MintedKey extends GrowthKeyRow {
   key: string
 }
 
+// ── P5: the newsletter ─────────────────────────────────────────────────
+// Wire shapes mirror crates/api/src/growth/newsletter.rs. Delivery is
+// SendGrid's signed Event Webhook (delivered, bounces, drops, spam reports —
+// never opens or clicks); `not_measured` when this server does not verify
+// it, never 0. Nothing here names a person: every number is a count.
+
+export interface NewsletterListDay {
+  day: string
+  new: number
+  confirmed: number
+  unsubscribed: number
+  suppressed: number
+}
+
+export interface NewsletterListSize {
+  /** Confirmed, not withdrawn, not suppressed — who the next issue mails. */
+  mailable: number
+  pending: number
+  unsubscribed: number
+  /** Confirmed but suppressed (a hard bounce or a spam report). */
+  suppressed: number
+}
+
+export interface NewsletterListTotals {
+  new: number
+  confirmed: number
+  unsubscribed: number
+  /** Of `unsubscribed`, through an issue's own link. */
+  unsubscribed_via_issue: number
+  suppressed: number
+}
+
+export interface NewsletterListSource {
+  source: string
+  new: number
+  confirmed: number
+  unsubscribed: number
+}
+
+export interface NewsletterList {
+  size: NewsletterListSize
+  totals: NewsletterListTotals
+  days: NewsletterListDay[]
+  by_source: NewsletterListSource[]
+}
+
+/** The send ledger: accepted means "accepted by SendGrid", not delivered. */
+export interface LedgerCounts {
+  recipients: number
+  accepted: number
+  failed: number
+  suppressed: number
+  stale: number
+}
+
+export interface DeliveryCounts {
+  delivered: number
+  /** Every bounce, hard and blocked. */
+  bounced: number
+  hard_bounced: number
+  dropped: number
+  /** Spam reports. */
+  complaints: number
+}
+
+export interface IssueRates {
+  delivered: Rate | null
+  hard_bounce: Rate | null
+  complaint: Rate | null
+  unsubscribe: Rate
+  signup_per_visitor: Rate | null
+}
+
+export interface NewsletterIssueRow {
+  slug: string
+  subject: string
+  status: string
+  sent_at?: string
+  /** The `utm_campaign` its links carried; absent = untagged. */
+  campaign?: string
+  /** A test issue: the size of the audience it was restricted to. */
+  test_audience?: number
+  ledger: LedgerCounts
+  delivery: Measured<DeliveryCounts>
+  unsubscribed_via: number
+  web: Measured<WebCells>
+  signups: number
+  rates: IssueRates
+}
+
+export interface NewsletterReport {
+  enabled: boolean
+  since: string
+  until: string
+  include_internal: boolean
+  excluded: ExcludedCounts
+  n_floor: number
+  /** Whether this server verifies SendGrid's Event Webhook. */
+  webhook_configured: boolean
+  link_tags: boolean
+  /** The whole view's reason (the saas module not mounted). */
+  not_measured?: NotMeasured
+  list?: NewsletterList
+  issues: NewsletterIssueRow[]
+  issues_truncated: boolean
+  web_not_measured?: NotMeasured
+  web_truncated: boolean
+  account_truncated: boolean
+}
+
 /** Cents as a two-decimal amount in the account's currency. */
 export function centsLabel(cents: number): string {
   return (cents / 100).toFixed(2)
@@ -650,6 +760,18 @@ export const useGrowthStore = defineStore('growth', () => {
     return api.get<ChannelsReport>(`/admin/growth/channels${qs ? `?${qs}` : ''}`)
   }
 
+  /** P5 — the newsletter: the list over time and the per-issue table. */
+  async function fetchNewsletter(
+    opts: { since?: string; until?: string; includeInternal?: boolean } = {},
+  ): Promise<NewsletterReport> {
+    const q = new URLSearchParams()
+    if (opts.since) q.set('since', opts.since)
+    if (opts.until) q.set('until', opts.until)
+    if (opts.includeInternal) q.set('include_internal', 'true')
+    const qs = q.toString()
+    return api.get<NewsletterReport>(`/admin/growth/newsletter${qs ? `?${qs}` : ''}`)
+  }
+
   /** P8 — the growth machine keys (never the key or its hash). */
   async function fetchKeys(): Promise<KeysResponse> {
     return api.get<KeysResponse>('/admin/growth/keys')
@@ -677,6 +799,7 @@ export const useGrowthStore = defineStore('growth', () => {
     fetchTimeline,
     fetchCampaigns,
     fetchChannels,
+    fetchNewsletter,
     fetchKeys,
     mintKey,
     revokeKey,

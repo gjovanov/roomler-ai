@@ -4,8 +4,10 @@ How the project learns what a post, an article or an issue produced — visits, 
 orgs, devices, usage, revenue — **joined by the campaign key and never by a person**. This
 page covers what FR-102 has shipped so far: the taxonomy (P1b), the exclusion set (P1c), the
 daily digest (P1d), the account funnel, cohorts and org views (P2), the install trace (P3), the
-web plane — the purestat puller and the Campaigns table (P6) — and social reach: the ingest
-routes the promotion pipeline pushes to, and the Channels table (P8).
+web plane — the purestat puller and the Campaigns table (P6) — social reach: the ingest
+routes the promotion pipeline pushes to, and the Channels table (P8) — and the newsletter's
+delivery side: SendGrid's signed Event Webhook, the per-issue link tags and unsubscribes, and
+the per-issue table (P5).
 Spec: [`docs/fr/FR-102-growth-observability.md`](fr/FR-102-growth-observability.md) (#2127). It
 also places the existing `/observability` page, which no doc described before.
 
@@ -88,7 +90,7 @@ flowchart LR
     F["agents · agent_crashes<br/>(fleet)"]
     RS["remote_sessions<br/>(remote)"]
     CS["call_sessions<br/>(conference)"]
-    NL["subscribers · newsletter_issues<br/>(saas)"]
+    NL["subscribers · newsletter_issues ·<br/>newsletter_sends (saas)"]
     PS["purestat v1 query<br/>(with a key)"]
   end
   X["ExclusionSet::load"] --> J
@@ -115,7 +117,7 @@ this server, not reachable, or not built yet is `{"not_measured": "<reason>",
 | `website` | visitors, visits, pageviews; the day's visitors by organic channel; top 10 referrers and paths | purestat | with a key |
 | `blog` | per post viewed that day: visitors, pageviews, reads, median read time (top 20); top sources | purestat | with a key |
 | `campaigns` | per `(source, medium, campaign)`: visitors, pageviews, the four goals (`signup`, `subscribe`, `install-copy`, `github-outbound`), joined in code with the server's own sign-ups by the same normalised key | purestat + `users` | with a key |
-| `newsletter` | new, confirmed and unsubscribed subscribers, by source; each issue sent that day with its counts | `subscribers`, `newsletter_issues` | P1d; delivery P5 |
+| `newsletter` | new, confirmed and unsubscribed subscribers (and how many left through an issue's link), by source; each issue sent that day with its ledger counts, its delivery so far and its unsubscribes; the window's delivered, bounced, dropped, spam reports and suppressed addresses — [the newsletter](#the-newsletter-delivery-per-issue-tags-and-unsubscribes-p5) | `subscribers`, `newsletter_issues`, `newsletter_sends` | P1d; delivery P5 (`not_measured` without the webhook key) |
 | `revenue` | orgs by plan × subscription status; the list-price MRR, **labelled `estimate: true`** (the same formula as the cost view, `routes/cost.rs::mrr_estimate_cents`) | `tenants`, `tenant_members` | P1d; billed P4 |
 | `quality` | sessions ended by `end_reason`, classed hang-up · refusal · failure; agent crashes by version | `remote_sessions`, `agent_crashes` | P1d |
 | `install` | tokens issued → redeemed; fetches by `(asset, client class, OS)`; enrollments by `(method, OS)`; wizard steps not measured until P3b — [the install trace](#the-install-trace-p3) | `enroll_token_issued`, `growth_daily`, `agents.install` | P3 |
@@ -743,6 +745,193 @@ pushed (and says that nothing new arrives). The SPA's `/observability/growth` ga
 platform cards with their posts, and the ingest-key list with mint (the key shown once) and
 revoke. Every pushed string is rendered as text; a URL becomes a link only when it is http(s).
 
+## The newsletter: delivery, per-issue tags and unsubscribes (P5)
+
+What an issue did — delivered, bounced, complaints, who left through it, the visits and
+sign-ups its links brought — counted **per issue, never per reader** (D5, D6). The
+footer's promise stays literally true: *the only per-recipient thing in this email is
+your unsubscribe link.* The issue's tags are rendered into the issue once, before the
+per-recipient substitution, so they are the same bytes for everyone; the server records
+what SendGrid says happened to each message, and never whether anyone opened it or
+clicked.
+
+```mermaid
+sequenceDiagram
+    participant F as fan-out (saas)
+    participant SG as SendGrid
+    participant M as reader's mailbox
+    participant W as POST /api/sendgrid/webhook (saas)
+    participant DB as newsletter_sends · subscribers
+    F->>F: render ONCE — links to roomler.ai gain utm_source=newsletter&utm_medium=email&utm_campaign=nl-<slug>
+    F->>SG: per recipient: the same bytes + their unsubscribe link (…/{token}?i=<slug>),<br/>custom_args {nl_issue: <slug>}, every tracking switch off
+    SG->>M: deliver
+    SG->>W: signed batch — delivered · bounce · dropped · spamreport (and open/click, ignored)
+    W->>W: ECDSA P-256 over timestamp ‖ body — refused (401) BEFORE the body is parsed
+    W->>DB: delivery.{delivered_at, bounced_at, dropped_at, spam_reported_at} ($min)
+    W->>DB: hard bounce or spam report → subscribers.suppressed_at
+    F->>DB: the NEXT issue: a suppressed address → its ledger row reads `suppressed`, nothing sent
+```
+
+### The Event Webhook — `saas`, hosted-only
+
+[`crates/modules/saas/src/sendgrid.rs`](../crates/modules/saas/src/sendgrid.rs) — mounted
+outside the per-IP governor beside the Stripe webhook (signed, and SendGrid posts a batch
+every 30 s from a handful of addresses), body bounded at 2 MiB (a batch is at most 768 KB).
+
+| Check, in order | Refusal | Where |
+|---|---|---|
+| a usable key is configured (`newsletter.event_webhook_public_key`) | the **empty 404** of an absent path, for everything | [`webhook`, sendgrid.rs:275](../crates/modules/saas/src/sendgrid.rs) |
+| both headers present (`X-Twilio-Email-Event-Webhook-Signature` / `-Timestamp`) | 401 | same |
+| the signed timestamp within 25 h back (SendGrid retries for 24 h) and 5 min ahead | 401 | [`timestamp_fresh`, sendgrid.rs:114](../crates/modules/saas/src/sendgrid.rs) |
+| ECDSA P-256 / SHA-256 over `timestamp ‖ raw body` verifies (either `s` of a signature — SendGrid does not normalise it) | 401 — **the body has not been parsed** | [`EventVerifier::verify`, services sendgrid.rs:67](../crates/services/src/sendgrid.rs) |
+| the verified body is a JSON array of at most 10,000 events | 400 / 413 | `webhook` |
+| a database error while recording | 503 — SendGrid retries; every write is idempotent | [`record_events`, sendgrid.rs:203](../crates/modules/saas/src/sendgrid.rs) |
+
+The key is the one SendGrid shows (base64 DER `SubjectPublicKeyInfo`, starting
+`MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE`) or the same key as PEM; anything that is not an
+uncompressed P-256 key is refused at boot with a warning, and the route then refuses every
+request ([`EventVerifier::from_config`, services sendgrid.rs:39](../crates/services/src/sendgrid.rs)).
+The verifier lives in `roomler-ai-services`, beside the Stripe check, so the host's views and
+the route agree on whether a configured key is usable
+([`webhook_key_usable`, sendgrid.rs:83](../crates/services/src/sendgrid.rs)).
+
+| SendGrid event | Recorded on the ledger row (`newsletter_sends.delivery`) | Effect |
+|---|---|---|
+| `delivered` | `delivered_at` | — |
+| `bounce`, `type: bounce` | `bounced_at`, `bounce_type: bounce`, `reason` (≤ 200 characters) | **suppresses the address** (`subscribers.suppressed_at`, `suppressed_reason: bounce`) |
+| `bounce`, any other type (`blocked`, `expired`, none) | `bounced_at`, `bounce_type: blocked`, `reason` | none — the receiving server refusing one message must not cost the address its subscription |
+| `dropped` | `dropped_at`, `reason` | none |
+| `spamreport` | `spam_reported_at` | **suppresses the address** (`suppressed_reason: spamreport`) |
+| `open`, `click`, `processed`, `deferred`, `unsubscribe`, `group_*`, anything else | **nothing** — `DeliveryEvent` has no variant that could say it | — |
+| any event without the `nl_issue` custom arg (activation mail, an invite) | nothing — not a newsletter message | — |
+
+- **Matched by the issue, never by a per-recipient token.** Every newsletter message carries
+  ONE SendGrid custom arg, `nl_issue = <slug>` — the same for every recipient, and not part of
+  the message a reader receives. An event brings it back with the recipient's address: the
+  subscriber by its unique address, then the row by the unique `(issue_id, subscriber_id)`.
+  A test-send carries no arg (it has no ledger row) so its events can never land on a real
+  recipient's row.
+- **Idempotent.** Every time is a `$min` — the earliest report wins; a replayed batch, or
+  SendGrid's own duplicate, writes nothing new. `status` (our disposition: claimed → sent /
+  failed / suppressed) is never touched: `delivery` is the mailbox provider's answer, which
+  arrives later, out of order, sometimes twice
+  ([`DeliveryEvent`, newsletter_send.rs:31](../crates/services/src/dao/newsletter_send.rs)).
+- **Suppression** is the first reason, written once; the fan-out's per-recipient re-check
+  reads it ([newsletter_send.rs:175](../crates/modules/saas/src/newsletter_send.rs)) and marks
+  the row `suppressed` without sending. Only fresh consent lifts it: subscribing again (the row
+  is revived **unconfirmed** — the confirmation click is the proof the mailbox works) or the
+  signed-in toggle on a verified account.
+- Never an address in a log line: a batch logs `events · recorded · ignored · unmatched ·
+  suppressed`.
+
+**SendGrid's own tracking stays off** (D6), twice over: every newsletter message switches
+open, click, subscription and Google Analytics tracking off in the request itself
+(`SendOptions::no_tracking`, [email.rs:303](../crates/services/src/email.rs) — GA tracking would
+rewrite the issue's own UTM tags), and at boot the module reads the ACCOUNT's open and click
+settings ([`spawn_tracking_check`, sendgrid.rs:338](../crates/modules/saas/src/sendgrid.rs)) and
+logs a **WARN** if either is on — every other mail would be tracked — or if it cannot read them
+(the API key needs the `tracking_settings.read` scope). Spawned, bounded at 10 s per request,
+never blocking the boot; skipped without a SendGrid key.
+
+### Per-issue tags and unsubscribes (D5)
+
+| What | Rule | Where |
+|---|---|---|
+| The tags | `utm_source=newsletter&utm_medium=email&utm_campaign=nl-<slug>` on every **http(s) link to this site** — the body's links, the call to action, the footer's `roomler.ai` — rendered once, before the per-recipient substitution | [`LinkTags::tag`, newsletter.rs:100](../crates/services/src/newsletter.rs), [`render_issue_html`, newsletter.rs:260](../crates/services/src/newsletter.rs) |
+| This site | `roomler.ai`, `www.roomler.ai` and `app.frontend_url`'s host; anything else — a third party, a `mailto:`, a relative path, a URL with credentials — is left **byte-for-byte as written** (a third party learns nothing; a signed URL is not broken) | [`site_hosts`, newsletter.rs:66](../crates/services/src/newsletter.rs) |
+| An operator's own tag | kept; only the missing ones are added, after the query and before the fragment | `LinkTags::tag` |
+| The campaign | `nl-<slug>`, cut to the 64 characters a sign-up's attribution keeps — the one spelling both the links and every per-issue lookup use | [`issue_campaign`, newsletter.rs:57](../crates/services/src/newsletter.rs) |
+| The unsubscribe link | `…/api/subscribe/unsubscribe/{token}?i=<slug>` — the token is the one per-recipient thing; `i=` is the issue, the same for everyone. The `List-Unsubscribe` header carries the same link | [`unsubscribe_link`, saas newsletter.rs:218](../crates/modules/saas/src/newsletter.rs) |
+| The click | stamps `subscribers.unsubscribed_via = <slug>` with `unsubscribed_at` — once, by the click that ends a live subscription; a repeat (a prefetcher, a second issue's link) changes neither the time nor the issue. An `i=` naming no sent issue unsubscribes all the same and records none | [`via_issue`, subscribe.rs:214](../crates/modules/saas/src/subscribe.rs), [`SubscriberDao::unsubscribe`, subscriber.rs:180](../crates/services/src/dao/subscriber.rs) |
+| The stamp | when the fan-out starts, the issue records `campaign` (its links' tag; absent with the tags off) and `delivery_events` (this server verified the webhook when it sent) — what tells a later reader "not measured" from a zero | `NewsletterIssueDao::stamp_send_tags` |
+
+**AC15, as a test**: `every_link_but_the_unsubscribe_link_is_byte_identical_for_two_recipients`
+([`newsletter_send.rs`](../crates/modules/saas/src/newsletter_send.rs), `tests`) renders an issue
+exactly as `run_send` does, composes it for two recipients with the same function the fan-out
+calls ([`compose`, newsletter.rs:244](../crates/modules/saas/src/newsletter.rs)), and asserts that
+of every `href`/`src` in the two messages exactly one differs — the unsubscribe link — that
+with each recipient's unsubscribe link taken out the two bodies are the same bytes, and that
+the send options differ only in that link.
+
+### The per-issue table
+
+`GET /api/admin/growth/newsletter?since&until&include_internal`
+([`get_newsletter`, newsletter.rs:518](../crates/api/src/growth/newsletter.rs)) — platform admins
+only, **404** otherwise and when `growth.enabled = false`. UTC days, both inclusive; the
+default is the **90** closed days ending yesterday (an issue is never more than monthly), at
+most 366.
+
+```mermaid
+flowchart LR
+  subgraph saas["saas collections"]
+    I[("newsletter_issues<br/>campaign · delivery_events")]
+    S[("newsletter_sends<br/>status · delivery")]
+    U[("subscribers<br/>unsubscribed_via · suppressed_at")]
+  end
+  PS[("purestat<br/>utm_source = newsletter<br/>by campaign, live")]
+  F["funnel::read<br/>sign-ups by the issue's key<br/>(exclusions applied)"]
+  I --> V["GET …/growth/newsletter"]
+  S --> V
+  U --> V
+  PS --> V
+  F --> V
+  V --> T["the list over time ·<br/>one row per issue"]
+```
+
+| Cell | What | Not measured when |
+|---|---|---|
+| `ledger` | `recipients` (rows claimed), `accepted` (a SendGrid 202 — not delivered), `failed`, `suppressed`, `stale`: the stamped counts once completed, live while sending | — |
+| `delivery` | `delivered`, `bounced` (`hard_bounced`), `dropped`, `complaints` | this server verifies no webhook (no usable key), or the issue was sent before delivery events were recorded — **never 0** ([`delivery_cell`, newsletter.rs:485](../crates/api/src/growth/newsletter.rs)) |
+| `unsubscribed_via` | subscribers whose current unsubscription came through this issue's link | — |
+| `web` | purestat's visitors, visits, pageviews, reads and goals for the issue's key `(newsletter, email, nl-<slug>)` over the range — one breakdown filtered on `utm_source = newsletter` | the issue's links carried no tags, or purestat cannot be asked (no key, 401, timeout) |
+| `signups` | sign-ups created in the range whose attribution normalises to the issue's key — the funnel's own read, so a link's spelling cased differently still counts, and the exclusion set applies | — |
+| `rates` | `delivered` (n = accepted), `hard_bounce` (n = accepted), `complaint` (n = delivered), `unsubscribe` (n = delivered, or accepted while delivery is unmeasured), `signup_per_visitor` (n = visitors); a value only from n = 30 | the side it rests on is not measured |
+
+**The list over time** ([`read_list`, newsletter.rs:255](../crates/api/src/growth/newsletter.rs)):
+new, confirmed, unsubscribed and suppressed per UTC day and by `source`, from the timestamps
+`subscribers` keeps, and the list's size now — mailable (confirmed, not withdrawn, not
+suppressed), awaiting confirmation, unsubscribed, suppressed. A subscriber carries no account
+id, so the exclusion set cannot apply to the list; a re-subscription restarts a row's history
+(the subscribe path re-stamps `created_at`).
+
+The SPA's `/observability/growth` gains a **Newsletter** tab
+([`GrowthNewsletter.vue`](../ui/src/components/growth/GrowthNewsletter.vue)): the list's size,
+the daily chart and the sources, then one row per issue — a `not_measured` cell is a muted chip
+with its reason on hover, a rate appears only with n ≥ 30, subjects are rendered as text.
+
+**In the digest**, the `newsletter` section gains `delivery` — the day's (and 7/28 days')
+delivered, bounced (hard), dropped, spam reports and addresses suppressed, by each event's own
+time ([`delivery_figures`, digest.rs:1378](../crates/api/src/growth/digest.rs)), `not_measured`
+on a server without the webhook — `unsubscribed_via_issue`, and per issue sent that day its
+delivery so far and its unsubscribes, by the same reads and the same three cells as the table.
+
+### Settings and the operator's setup
+
+| Setting | Env | Default | Effect |
+|---|---|---|---|
+| `newsletter.event_webhook_public_key` | `ROOMLER__NEWSLETTER__EVENT_WEBHOOK_PUBLIC_KEY` | empty | SendGrid's verification key (base64 DER or PEM). Empty or unusable ⇒ `POST /api/sendgrid/webhook` answers 404 to everything and delivery reads "not measured" |
+| `newsletter.link_tags` | `ROOMLER__NEWSLETTER__LINK_TAGS` | `true` | the per-issue UTM tags; `false` sends links as written (and the issue's visits read "not measured") |
+
+Turning delivery on is three steps in SendGrid and one secret here:
+
+1. **Settings → Mail Settings → Event Webhook**: HTTP POST URL
+   `https://roomler.ai/api/sendgrid/webhook`; select **Delivered, Bounced, Dropped, Spam
+   Reports** (Opened and Clicked stay unselected — they would be ignored anyway).
+2. Enable **Signature Verification** on that webhook and copy the **public key** it shows into
+   the cluster secret as `ROOMLER__NEWSLETTER__EVENT_WEBHOOK_PUBLIC_KEY`; roll.
+3. **Settings → Tracking**: Open Tracking and Click Tracking **off** (and Subscription Tracking
+   off — FR-58). Give the API key `ROOMLER__EMAIL__API_KEY` the `tracking_settings.read`
+   scope so the boot check can confirm it; without the scope it logs that it could not.
+4. Check: the boot log says `SendGrid Event Webhook on` and `SendGrid open and click tracking
+   are off`; SendGrid's "Test Your Integration" button posts a signed sample batch, which
+   answers 200 with `{"events": …, "ignored": …}` (its sample events carry no `nl_issue`).
+
+**A test issue** never mails the list: an issue created with `"audience": [1–20 addresses]`
+goes only to the confirmed subscribers among them, and the audience is fixed with the draft,
+so a resumed send cannot widen it. That is what a field run on production uses — two own
+addresses plus one that bounces, sent twice — and the per-issue table marks it `test · N`
+(its size, never the addresses).
+
 ## The `/observability` page as a whole
 
 | Tab / surface | What it shows | Route family |
@@ -752,7 +941,7 @@ revoke. Every pushed string is rendered as text; a URL becomes a link only when 
 | Orgs, machines, calls, users | platform-wide inventories and series | `/api/admin/stats/{orgs,machines,calls,users}` |
 | Usage | per-user minutes and bytes across every org | `/api/admin/stats/usage*` |
 | Attribution (FR-88) | sign-ups by campaign key and how many activated | `/api/admin/stats/attribution` |
-| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), and the Channels table with the ingest keys (P8) | `/api/admin/growth/*` |
+| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), the Channels table with the ingest keys (P8), and the Newsletter tab (P5) | `/api/admin/growth/*` |
 
 ## Field verification
 
@@ -769,3 +958,10 @@ The ingest is to be shown on production to store a snapshot pushed twice once, t
 unknown platform and a body carrying post text, and to answer 404 to a wrong key (AC18); the
 integration suite asserts each, plus the revoked key, the JWT, the kill switch and the
 unmounted module (`crates/tests/src/growth_channels_tests.rs`).
+
+The newsletter's webhook is to be shown on production to refuse a bad signature (control),
+and to record `delivered` and `bounce` for a test send with one forced bounce, the bounced
+address `suppressed` at the next send, with SendGrid's open and click tracking read off at
+boot (AC14). The integration suite asserts the refusal before parsing, the four events and
+nothing else, the suppression at the next send and the replay that changes nothing
+(`crates/tests/src/growth_newsletter_tests.rs`); AC15 is the `saas` unit test above.

@@ -36,6 +36,11 @@ futures.workspace = true
 validator.workspace = true
 async-trait.workspace = true
 urlencoding.workspace = true
+# FR-102 P5 — the newsletter's per-issue link tags parse each link's host.
+url = "2"
+# FR-102 P5 — ECDSA P-256 / SHA-256 verification of SendGrid's signed Event
+# Webhook (`sendgrid.rs`; the version the workspace already builds).
+ring = "0.17"
 nanoid.workspace = true
 hmac.workspace = true
 sha2.workspace = true
