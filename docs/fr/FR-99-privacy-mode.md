@@ -281,6 +281,15 @@ locked from there, so no new process or token is needed.
 | The lock, at the LAST end | `hide_session` (every end: the viewer's hangup, the host's Disconnect, a limit, the connection dropping) asks the tracker. It locks only when no other session is live, and only if this end or an earlier one since the last lock asked for it. A session whose answer never left has no say (`session_aborted`). The OS call runs on a thread of its own |
 | Mechanisms | Windows `LockWorkStation()`; Linux `loginctl lock-session` on seat0's active session; macOS none yet (an end that should lock logs that it could not) |
 
+**The default, against decision 3** (`auto` on new installs, `never` on existing ones until the field cells
+pass). P3a ships `never` everywhere, because AC7's field cells have not passed yet. The flip for new
+installs comes after them, written into the config that enrollment creates, so an existing config that
+lacks the key keeps reading `never`. ⚠️ **A refinement, to confirm with the operator:** the flip should
+cover only installs that can unlock remotely, the Windows service (SystemContext) and the Linux root
+daemon. A per-user install's worker cannot reach the secure desktop. With `auto` there, a session started
+on an idle computer would lock it at the end, and the next session would see a padlock until someone signs
+in at the machine. A mesh feature must never cost the operator remote access to the box.
+
 ⚠️ **`auto` restores what was found at the start.** A person who unlocked the computer during the session
 is locked out at its end and signs in again. Telling their input from the controller's would need the
 input hooks FR-92 bans. ⚠️ **On a per-user install, `always` cannot be undone remotely.** The per-user
