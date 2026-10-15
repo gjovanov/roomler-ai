@@ -163,7 +163,7 @@ Two things make the native backends much cheaper than they look, both verified
 against `Cargo.lock`: **`x11rb 0.13.2`, `objc2 0.6.4` and `objc2-app-kit 0.3.2`
 are already locked** (via enigo/arboard and tauri), so neither adds a new
 dependency tree; and the macOS daemon **already ships as an `.app` with
-`LSUIElement=true`** (`release-agent.yml:2175`), the bundle identity AppKit
+`LSUIElement=true`** (`release-agent.yml:2343`), the bundle identity AppKit
 windows require.
 
 ⚠️ **The macOS native backend has a prerequisite.** `agents/roomlerd/src/main.rs:658`

@@ -805,6 +805,10 @@ jobs:
         # the tool already present, and a plain `cargo install` errors on it.
         run: command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
 
+      - name: Install cargo-generate-rpm
+        # FR-93 P6d — the companion's RPM. Idempotent like cargo-deb's.
+        run: command -v cargo-generate-rpm >/dev/null || cargo install cargo-generate-rpm --locked
+
       # FR-27: until the companion shipped here, a Linux desktop had no consent
       # prompt and no "being viewed" indicator at all (the daemon's native
       # overlay is Windows-only).
@@ -815,7 +819,44 @@ jobs:
         working-directory: agents/roomler-desktop
         run: cargo deb --no-build --no-strip
 
-      - name: Rename + checksum (companion .deb)
+      # FR-93 P6d — the same binary as an RPM, for the hosts with no dpkg
+      # (Fedora, the RHEL family, openSUSE). From the workspace root, where
+      # `target/release/…` resolves; the packaging files resolve in the
+      # package's own directory.
+      - name: Build the companion .rpm
+        run: cargo generate-rpm -p agents/roomler-desktop
+
+      - name: Guard — the companion .rpm requires what the binary links
+        # The requires are written out in Cargo.toml (`auto-req = "no"`), because
+        # `ldd`'s discovery would name Ubuntu 22.04's transitive sonames, ICU
+        # 70's among them, which no Fedora satisfies. A hand-kept list drifts,
+        # so read both back: every library the binary links must be required
+        # (an RPM missing one installs, then fails to start), and neither the
+        # daemon package nor ICU may be.
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq rpm >/dev/null
+          rpmf=$(find target/generate-rpm -name 'roomler-desktop-*.rpm' -print | head -n1)
+          [ -n "$rpmf" ] || { echo "::error::cargo generate-rpm produced no companion .rpm"; exit 1; }
+          rpm -qp --info "$rpmf" | grep -E '^(Name|Version|Release|Architecture)'
+          rpm -qp --info "$rpmf" | grep -qE '^Architecture: *x86_64' || { echo "::error::the companion .rpm is not x86_64"; exit 1; }
+          rpm -qp --requires "$rpmf" > rpm-requires.txt
+          cat rpm-requires.txt
+          missing=0
+          for so in $(readelf -d target/release/roomler-desktop | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
+            case "$so" in ld-linux*) continue ;; esac
+            if ! grep -qF "${so}()(64bit)" rpm-requires.txt; then
+              echo "::error::the companion links $so, which its .rpm does not require: add it to [package.metadata.generate-rpm.requires]"
+              missing=$((missing + 1))
+            fi
+          done
+          if grep -qiE 'libicu|roomlerd' rpm-requires.txt; then
+            echo "::error::the companion .rpm requires the daemon package or ICU by a name no RPM distro shares"
+            missing=$((missing + 1))
+          fi
+          [ "$missing" -eq 0 ]
+
+      - name: Rename + checksum (companion .deb and .rpm)
         id: pack_desktop
         shell: bash
         run: |
@@ -831,6 +872,14 @@ jobs:
           mv "$src" "$dst"
           sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
           echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
+          # FR-93 P6d — the RPM under the same naming, so `install.sh` finds
+          # either by the one pattern with its extension swapped.
+          rsrc=$(find target/generate-rpm -name 'roomler-desktop-*.rpm' -print | head -n1)
+          [ -n "$rsrc" ] || { echo "::error::cargo generate-rpm produced no companion .rpm"; exit 1; }
+          rdst="roomler-desktop-${version}-x86_64-unknown-linux-gnu.rpm"
+          mv "$rsrc" "$rdst"
+          sha256sum "$rdst" | awk '{print $1"  "$2}' > "${rdst}.sha256"
+          echo "rpm=${rdst}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -839,6 +888,8 @@ jobs:
           path: |
             ${{ steps.pack_desktop.outputs.artifact }}
             ${{ steps.pack_desktop.outputs.artifact }}.sha256
+            ${{ steps.pack_desktop.outputs.rpm }}
+            ${{ steps.pack_desktop.outputs.rpm }}.sha256
           if-no-files-found: error
           retention-days: 30
 
@@ -851,6 +902,123 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         with:
           shared-key: agent-linux-companion
+
+  # ---------------------------------------------------------------------------
+  # 1a'. Linux aarch64 desktop companion (FR-93 P6e, decision D5) — the same
+  # .deb and .rpm for arm64 hosts. Until this, an Apple-silicon (Asahi) or
+  # Ampere desktop had no consent prompt and no "being viewed" banner at all:
+  # build-linux-arm64 builds the daemon only. The steps are build-linux-
+  # companion's, with the arm64 job's plain apt (that job's cache key is the
+  # x86_64 set) and its own seed family.
+  # ---------------------------------------------------------------------------
+  build-linux-companion-arm64:
+    name: Build desktop companion .deb + .rpm (Linux aarch64)
+    needs: validate-version
+    # 22.04 for the same glibc reason as build-linux-arm64.
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libglib2.0-dev libgtk-3-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev rpm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Restore cargo seed (lockfile-generation keys)
+        continue-on-error: true
+        uses: ./.github/actions/seed-cache-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          shared-key: agent-linux-companion-arm64
+
+      - name: Install cargo-deb and cargo-generate-rpm
+        # Idempotent, as in build-linux-companion.
+        run: |
+          command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
+          command -v cargo-generate-rpm >/dev/null || cargo install cargo-generate-rpm --locked
+
+      - name: Build the desktop companion
+        run: cargo build -p roomler-desktop --release
+
+      - name: Build the companion .deb
+        working-directory: agents/roomler-desktop
+        run: cargo deb --no-build --no-strip
+
+      - name: Build the companion .rpm
+        run: cargo generate-rpm -p agents/roomler-desktop
+
+      - name: Guard — the companion .rpm requires what the binary links
+        # As in build-linux-companion; `ld-linux-aarch64.so.1` is glibc's.
+        run: |
+          set -euo pipefail
+          rpmf=$(find target/generate-rpm -name 'roomler-desktop-*.rpm' -print | head -n1)
+          [ -n "$rpmf" ] || { echo "::error::cargo generate-rpm produced no companion .rpm"; exit 1; }
+          rpm -qp --info "$rpmf" | grep -E '^(Name|Version|Release|Architecture)'
+          rpm -qp --info "$rpmf" | grep -qE '^Architecture: *aarch64' || { echo "::error::the arm64 companion .rpm is not aarch64"; exit 1; }
+          rpm -qp --requires "$rpmf" > rpm-requires.txt
+          cat rpm-requires.txt
+          missing=0
+          for so in $(readelf -d target/release/roomler-desktop | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
+            case "$so" in ld-linux*) continue ;; esac
+            if ! grep -qF "${so}()(64bit)" rpm-requires.txt; then
+              echo "::error::the companion links $so, which its .rpm does not require: add it to [package.metadata.generate-rpm.requires]"
+              missing=$((missing + 1))
+            fi
+          done
+          if grep -qiE 'libicu|roomlerd' rpm-requires.txt; then
+            echo "::error::the companion .rpm requires the daemon package or ICU by a name no RPM distro shares"
+            missing=$((missing + 1))
+          fi
+          [ "$missing" -eq 0 ]
+
+      - name: Rename + checksum (companion .deb and .rpm)
+        id: pack_desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          src=$(find . -path ./node_modules -prune -o \
+                       -name 'roomler-desktop_*_arm64.deb' -print | head -n1)
+          [ -n "$src" ] || { echo "::error::cargo deb produced no arm64 companion .deb"; exit 1; }
+          dst="roomler-desktop-${version}-aarch64-unknown-linux-gnu.deb"
+          mv "$src" "$dst"
+          sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
+          echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
+          rsrc=$(find target/generate-rpm -name 'roomler-desktop-*.rpm' -print | head -n1)
+          [ -n "$rsrc" ] || { echo "::error::cargo generate-rpm produced no arm64 companion .rpm"; exit 1; }
+          rdst="roomler-desktop-${version}-aarch64-unknown-linux-gnu.rpm"
+          mv "$rsrc" "$rdst"
+          sha256sum "$rdst" | awk '{print $1"  "$2}' > "${rdst}.sha256"
+          echo "rpm=${rdst}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-companion-arm64
+          path: |
+            ${{ steps.pack_desktop.outputs.artifact }}
+            ${{ steps.pack_desktop.outputs.artifact }}.sha256
+            ${{ steps.pack_desktop.outputs.rpm }}
+            ${{ steps.pack_desktop.outputs.rpm }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Save cargo seed (new lockfile generation)
+        if: always() && github.ref_type != 'tag'
+        continue-on-error: true
+        uses: ./.github/actions/seed-cache-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          shared-key: agent-linux-companion-arm64
 
   # ---------------------------------------------------------------------------
   # 1b. Linux aarch64 — the same .deb for arm64 hosts.
@@ -3186,7 +3354,7 @@ jobs:
   release:
     name: Publish GitHub Release
     if: needs.validate-version.outputs.is_release == 'true'
-    needs: [validate-version, build-linux, build-linux-companion, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
+    needs: [validate-version, build-linux, build-linux-companion, build-linux-companion-arm64, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write      # create the release
@@ -3211,7 +3379,9 @@ jobs:
           # `.tar.gz` is the universal Linux installer (docs/linux-self-update.md);
           # it must be listed here or the artifact is silently dropped from the
           # Release and every non-Debian host keeps skipping its updates.
-          find dist -type f \( -name '*.msi' -o -name '*.pkg' -o -name '*.deb' -o -name '*.exe' -o -name '*.tar.gz' -o -name '*.sha256' \) \
+          # `.rpm` is the companion's for those hosts (FR-93 P6d), and the same
+          # silent drop applies to it.
+          find dist -type f \( -name '*.msi' -o -name '*.pkg' -o -name '*.deb' -o -name '*.rpm' -o -name '*.exe' -o -name '*.tar.gz' -o -name '*.sha256' \) \
             -exec mv {} release/ \;
           ls -la release/
 
@@ -3268,7 +3438,7 @@ jobs:
           # nothing, leaves the step green with zero signatures and the freeze
           # lands on the fleet instead. Count what the updater will look for.
           missing=0
-          for f in release/*.deb release/*.pkg release/*.msi; do
+          for f in release/*.deb release/*.rpm release/*.pkg release/*.msi; do
             [ -e "$f" ] || continue
             if [ ! -e "$f.asc" ]; then
               echo "::error::no signature produced for $f"
@@ -3326,12 +3496,13 @@ jobs:
       needs.validate-version.outputs.is_release == 'false' &&
       (needs.build-linux.result == 'failure' ||
        needs.build-linux-companion.result == 'failure' ||
+       needs.build-linux-companion-arm64.result == 'failure' ||
        needs.build-linux-arm64.result == 'failure' ||
        needs.build-windows.result == 'failure' ||
        needs.build-windows-companions.result == 'failure' ||
        needs.build-macos-companion.result == 'failure' ||
        needs.build-macos.result == 'failure')
-    needs: [validate-version, build-linux, build-linux-companion, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
+    needs: [validate-version, build-linux, build-linux-companion, build-linux-companion-arm64, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -3388,12 +3559,13 @@ jobs:
       needs.validate-version.outputs.is_release == 'false' &&
       needs.build-linux.result == 'success' &&
       needs.build-linux-companion.result == 'success' &&
+      needs.build-linux-companion-arm64.result == 'success' &&
       needs.build-linux-arm64.result == 'success' &&
       needs.build-windows.result == 'success' &&
       needs.build-windows-companions.result == 'success' &&
       needs.build-macos-companion.result == 'success' &&
       needs.build-macos.result == 'success'
-    needs: [validate-version, build-linux, build-linux-companion, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
+    needs: [validate-version, build-linux, build-linux-companion, build-linux-companion-arm64, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
     runs-on: ubuntu-latest
     permissions:
       issues: write

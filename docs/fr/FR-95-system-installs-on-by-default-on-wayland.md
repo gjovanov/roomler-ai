@@ -29,7 +29,7 @@ Where an indicator exists today, by install:
 
 | host | "being viewed" banner + Disconnect | source |
 |---|---|---|
-| Debian family, x86_64, system | ✅ the companion (FR-27 P11) | the companion ships as **one x86_64 `.deb`** (`release-agent.yml:830`) |
+| Debian family, x86_64, system | ✅ the companion (FR-27 P11) | the companion ships as **one x86_64 `.deb`** (`release-agent.yml:871`) |
 | any non-Debian (Fedora, Arch, openSUSE), system | ❌ none | `install.sh` skips it: "no dpkg here, the desktop companion ships as a .deb only" (`scripts/install.sh:743`) |
 | aarch64, any distro | ❌ none | no `.deb` for the arch (`scripts/install.sh:750`) |
 | the greeter and the lock screen, anywhere | ❌ none | FR-93 D1b (`FR-93-wayland-out-of-the-box.md:559`), deferred |
