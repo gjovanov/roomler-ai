@@ -15,7 +15,8 @@ It runs on Windows, macOS and Linux, and you can host the whole thing yourself.
 
 ## Do I need to install anything to view a remote screen?
 
-No. The viewing side is a plain Chromium browser with nothing installed. Only the
+No. The viewing side is a plain browser with nothing installed (Chrome, Edge or
+another Chromium browser works best; Safari and Firefox work too). Only the
 machine you are reaching runs an agent.
 
 ## Can Roomler see my screen or my keystrokes?
@@ -106,10 +107,11 @@ independent gates. See [SSH](/docs/network/ssh/).
 
 ## Which browsers work?
 
-Chat, calls and the dashboard work in current Chromium browsers, Firefox and
-Safari. The **remote-desktop viewer** targets Chromium, because it uses a
-low-latency decode path that avoids the roughly 80 ms buffering a normal video
-element enforces.
+Chat, calls, the dashboard and the remote-desktop viewer all work in current
+Chromium browsers, Firefox and Safari. For remote desktop we recommend Chrome,
+Edge or another Chromium browser: that is where the viewer's low-latency decode
+path has had the most testing. Safari and Firefox work too, with less testing so
+far.
 
 ## Can one machine be in two organizations?
 
