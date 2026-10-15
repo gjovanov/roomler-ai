@@ -195,12 +195,9 @@ pub async fn accept_invite(
     {
         let tenant = state.tenants.base.find_by_id(invite.tenant_id).await?;
         let used = state.tenants.count_members(invite.tenant_id).await?;
-        if let Err(d) = quota::check(
-            tenant.plan.clone(),
-            tenant.settings.plan_enforcement,
-            quota::Limit::MaxMembers,
-            used,
-        ) {
+        // FR-102 P4 — through core, which also counts the collision per org.
+        if let Err(d) = roomler_core::quota::check(&state, &tenant, quota::Limit::MaxMembers, used)
+        {
             return Err(ApiError::Forbidden(d.message()));
         }
     }
@@ -536,12 +533,9 @@ pub async fn add_member(
     {
         let tenant = state.tenants.base.find_by_id(tid).await?;
         let used = state.tenants.count_members(tid).await?;
-        if let Err(d) = quota::check(
-            tenant.plan.clone(),
-            tenant.settings.plan_enforcement,
-            quota::Limit::MaxMembers,
-            used,
-        ) {
+        // FR-102 P4 — through core, which also counts the collision per org.
+        if let Err(d) = roomler_core::quota::check(&state, &tenant, quota::Limit::MaxMembers, used)
+        {
             return Err(ApiError::Forbidden(d.message()));
         }
     }

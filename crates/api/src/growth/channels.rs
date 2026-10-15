@@ -13,8 +13,8 @@
 //!   never added to a month-old one.
 //! * **Then the key**: visitors (purestat, live for the range — the same
 //!   breakdown as the Campaigns table, at the post's own depth) → sign-ups
-//!   → activated → first value (P2's funnel) by the post's normalised key;
-//!   paid arrives with P4.
+//!   → activated → first value → paid (P2's funnel, paid from P4) by the
+//!   post's normalised key.
 //! * **Spend**: an optional `cost_cents` per post gives cost per visitor and
 //!   per sign-up — each with its n, a value only from n = 30.
 //! * **Three cells**: a platform with no post pushed in the range is
@@ -128,7 +128,8 @@ pub struct PostRow {
     pub org_created: StepCounts,
     pub activated: Option<StepCounts>,
     pub first_value: Option<StepCounts>,
-    pub paid: NotMeasured,
+    /// P4 — `null` without `saas`.
+    pub paid: Option<StepCounts>,
     pub rates: Rates,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend: Option<Spend>,
@@ -145,7 +146,8 @@ pub struct PlatformSummary {
     pub org_created: StepCounts,
     pub activated: Option<StepCounts>,
     pub first_value: Option<StepCounts>,
-    pub paid: NotMeasured,
+    /// P4 — `null` without `saas`.
+    pub paid: Option<StepCounts>,
     pub rates: Rates,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend: Option<Spend>,
@@ -341,6 +343,7 @@ fn add_groups(acc: &mut GroupCounts, g: &GroupCounts) {
         .first_value
         .zip(g.first_value)
         .map(|(a, b)| add_steps(a, b));
+    acc.paid = acc.paid.zip(g.paid).map(|(a, b)| add_steps(a, b));
 }
 
 fn add_cells(acc: &mut WebCells, w: &WebCells) {
@@ -413,6 +416,7 @@ fn rates_of(web: &Measured<WebCells>, acc: &GroupCounts) -> Rates {
             .map(|w| Rate::of(acc.signups as i64, w.visitors)),
         activation: step_rate(acc.activated),
         first_value: step_rate(acc.first_value),
+        paid: step_rate(acc.paid),
     }
 }
 
@@ -458,7 +462,7 @@ fn post_row(a: &Assemble<'_>, p: &GrowthPost) -> PostRow {
         org_created: b.acc.org_created,
         activated: b.acc.activated,
         first_value: b.acc.first_value,
-        paid: NotMeasured::later("the org's first paid invoice", "P4"),
+        paid: b.acc.paid,
         spend,
     }
 }
@@ -527,7 +531,7 @@ fn summary(a: &Assemble<'_>, posts: &[&GrowthPost]) -> PlatformSummary {
         org_created: acc.org_created,
         activated: acc.activated,
         first_value: acc.first_value,
-        paid: NotMeasured::later("the org's first paid invoice", "P4"),
+        paid: acc.paid,
         spend,
     }
 }
@@ -748,6 +752,11 @@ mod tests {
                 pending: 0,
                 settled: signups,
             }),
+            paid: Some(StepCounts {
+                count: signups.min(1),
+                pending: 0,
+                settled: signups,
+            }),
         }
     }
 
@@ -878,7 +887,9 @@ mod tests {
         assert_eq!(p1.reach.value().unwrap().snapshot, "T+7d");
         assert_eq!(p1.web.value().unwrap().visitors, 55);
         assert_eq!(p1.signups, 2);
-        assert_eq!(p1.paid.arrives_with.as_deref(), Some("P4"));
+        // P4 — the key's paid orgs (the fixture: one per non-empty group).
+        assert_eq!(p1.paid.map(|p| p.count), Some(1));
+        assert_eq!(s.paid.map(|p| p.count), Some(1), "the shared key once");
         // The second post has no snapshot: reach not measured, never 0.
         assert!(!li.posts[1].reach.is_measured());
         assert!(li.posts[1].spend.is_none());

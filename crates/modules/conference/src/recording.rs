@@ -73,11 +73,9 @@ pub async fn create(
     // this records the denial and lets the call through until an operator
     // reads the data and flips the tenant to `Enforce`.
     let tenant = state.tenants.base.find_by_id(tid).await?;
-    if let Err(d) = quota::require_feature(
-        tenant.plan.clone(),
-        tenant.settings.plan_enforcement,
-        quota::Limit::Recordings,
-    ) {
+    // FR-102 P4 — through core, which also counts the collision per org.
+    if let Err(d) = roomler_core::quota::require_feature(&state, &tenant, quota::Limit::Recordings)
+    {
         return Err(ApiError::Forbidden(d.message()));
     }
 

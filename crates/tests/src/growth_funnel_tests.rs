@@ -308,7 +308,9 @@ async fn the_funnel_counts_each_step_with_pending_and_settled() {
     assert_eq!(step(&j, "activated"), (2, 1, 3));
     // first value: a only; b, c cold; d pending.
     assert_eq!(step(&j, "first_value"), (1, 1, 3));
-    assert_eq!(j["steps"]["paid"]["arrives_with"], "P4");
+    // P4 — paid is measured (saas is mounted) and nobody paid: a measured
+    // zero; d is still pending at the org step.
+    assert_eq!(step(&j, "paid"), (0, 1, 3));
     // Time to value has its n.
     assert_eq!(j["time_to_value"]["first_device"]["n"], 2);
     assert_eq!(j["time_to_value"]["first_value"]["n"], 1);

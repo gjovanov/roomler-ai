@@ -1,6 +1,10 @@
 {
   "routes": [
     {
+      "path": "/api/admin/growth/billing/backfill",
+      "methods": "POST"
+    },
+    {
       "path": "/api/admin/growth/campaigns",
       "methods": "GET,HEAD"
     },
@@ -66,6 +70,10 @@
     },
     {
       "path": "/api/admin/growth/orgs",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/admin/growth/revenue",
       "methods": "GET,HEAD"
     },
     {
@@ -1110,6 +1118,40 @@
               "expires_at": 1
             },
             "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
+        "collection": "billing_events",
+        "indexes": [
+          {
+            "key": {
+              "event_id": 1
+            },
+            "sparse": true,
+            "unique": true
+          },
+          {
+            "key": {
+              "kind": 1,
+              "stripe_id": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "kind": "invoice_paid"
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "kind": 1,
+              "ts": 1
+            }
           }
         ]
       },
@@ -2896,6 +2938,40 @@
               "expires_at": 1
             },
             "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
+        "collection": "billing_events",
+        "indexes": [
+          {
+            "key": {
+              "event_id": 1
+            },
+            "sparse": true,
+            "unique": true
+          },
+          {
+            "key": {
+              "kind": 1,
+              "stripe_id": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "kind": "invoice_paid"
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "kind": 1,
+              "ts": 1
+            }
           }
         ]
       },

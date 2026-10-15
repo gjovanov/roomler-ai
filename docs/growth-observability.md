@@ -5,9 +5,10 @@ orgs, devices, usage, revenue — **joined by the campaign key and never by a pe
 page covers what FR-102 has shipped so far: the taxonomy (P1b), the exclusion set (P1c), the
 daily digest (P1d), the account funnel, cohorts and org views (P2), the install trace (P3), the
 web plane — the purestat puller and the Campaigns table (P6) — social reach: the ingest
-routes the promotion pipeline pushes to, and the Channels table (P8) — and the newsletter's
+routes the promotion pipeline pushes to, and the Channels table (P8) — the newsletter's
 delivery side: SendGrid's signed Event Webhook, the per-issue link tags and unsubscribes, and
-the per-issue table (P5).
+the per-issue table (P5) — and revenue: what Stripe billed, billed MRR month by month,
+upgrade intent from plan-limit collisions, and margin against the cost to serve (P4).
 Spec: [`docs/fr/FR-102-growth-observability.md`](fr/FR-102-growth-observability.md) (#2127). It
 also places the existing `/observability` page, which no doc described before.
 
@@ -932,6 +933,192 @@ so a resumed send cannot widen it. That is what a field run on production uses �
 addresses plus one that bounces, sent twice — and the per-issue table marks it `test · N`
 (its size, never the addresses).
 
+## Revenue: what Stripe billed (P4)
+
+Billed revenue — paying orgs, billed MRR, its new / expansion / contraction / churned
+movements per month, trial → paid, `paid_since`, all of it by the owner's acquisition
+channel — read from **what Stripe billed**, never from the price list (§3g). The list-price
+figure (`Plan::price_monthly_cents` × seats, [`mrr_estimate_cents`, cost.rs:68](../crates/api/src/routes/cost.rs))
+stays beside it, labelled an ESTIMATE: for an org with no invoice yet it is the only figure
+there is. Rows carry the org's id and Stripe's ids and amounts — never a card, an address or a
+name — and go with the org.
+
+```mermaid
+sequenceDiagram
+    participant ST as Stripe
+    participant W as POST /api/stripe/webhook (saas)
+    participant SE as stripe_events
+    participant BE as billing_events
+    participant T as tenants
+    participant BF as POST …/growth/billing/backfill (saas)
+    ST->>W: signed event (HMAC-SHA256 over "t.body", ±300 s)
+    W->>W: verify — refused (401) BEFORE the body is parsed
+    W->>SE: insert {_id: evt_…} — a duplicate is a retry: skip
+    W->>BE: one of the six kinds → a row (invoice amounts, plan, seats, period)
+    W->>T: plan · billing status (unchanged behaviour)
+    Note over W,SE: a processing failure removes the stripe_events marker,<br/>so Stripe's retry is processed, not skipped
+    BF->>ST: GET /v1/invoices?status=paid (read-only, ≤ 100 pages)
+    BF->>BE: invoice_paid rows, source: backfill — an invoice already on record is left as it was
+```
+
+### The six kinds — `billing_events`
+
+[`process`, stripe.rs:761](../crates/services/src/stripe.rs) records every billing kind
+before the tenant-state updates it always made; [`parse`, billing.rs:297](../crates/services/src/billing.rs)
+reads Stripe's objects for both API versions in the field (the classic shape and the
+2025-03-31 "basil" one, which moved `invoice.subscription` under `parent`, a line's
+`proration` under `parent.subscription_item_details` and the subscription's period onto its
+items).
+
+| Stripe event | `kind` | What the row holds |
+|---|---|---|
+| `customer.subscription.created` | `subscription_created` | plan (from the price id), seats (items' quantities), period, `status` — **no amount** (`null`, never 0) |
+| `customer.subscription.updated` | `subscription_updated` | the same, after the change — a seat change shows here |
+| `customer.subscription.deleted` | `subscription_deleted` | `ts` = `ended_at` — MRR is 0 from then |
+| `invoice.paid` | `invoice_paid` | `amount_cents` = `amount_paid` (what was billed, after coupons, before tax); `recurring_cents` = the subscription lines that are **not prorations**, after discounts ([`recurring_of`, billing.rs:188](../crates/services/src/billing.rs)); seats, period, interval; `ts` = `paid_at` |
+| `invoice.payment_failed` | `invoice_payment_failed` | `amount_cents` = `amount_due` |
+| `customer.subscription.trial_will_end` | `trial_will_end` | the trial's end |
+
+- **The org** ([`tenant_for`, stripe.rs:690](../crates/services/src/stripe.rs)): the
+  `tenant_id` the checkout stamps on the **subscription's** metadata (from P4,
+  `subscription_data[metadata]`, [stripe.rs:210](../crates/services/src/stripe.rs)), else the
+  org whose `billing.customer_id` / `billing.subscription_id` the object names. An object that
+  names no org here is logged with its ids and not recorded — revenue nobody can be credited
+  with is not a row.
+- **Recorded once** ([`BillingEventDao::record`, billing_event.rs:173](../crates/services/src/dao/billing_event.rs)):
+  a webhook row is unique by `event_id` (sparse — a backfilled row has none), a paid invoice
+  by `(kind, stripe_id)` across the webhook and the backfill, on top of `stripe_events`' own
+  dedupe of Stripe's retries.
+
+### Billed MRR, and the months
+
+```mermaid
+flowchart LR
+  BE[("billing_events")] --> F["fold per org<br/>(paid periods, deletions,<br/>paid_since, trial start)"]
+  F --> MRR["MRR at t = the recurring part of the newest<br/>paid invoice whose period covers t,<br/>÷ its interval in months — 0 after a deletion"]
+  MRR --> M["per month, per currency:<br/>MRR at the month's end vs the one before<br/>→ new · expansion · contraction · churned"]
+  M -->|"live: the open month, any month not frozen,<br/>and include_internal=true"| V["GET …/growth/revenue"]
+  M -->|"nightly, once a month is closed + 3 days<br/>(internal orgs left out)"| GD[("growth_daily<br/>source: billing · day YYYY-MM-01<br/>dims {currency, period: month}")]
+  GD -->|"frozen months"| V
+```
+
+| Figure | Definition | Where |
+|---|---|---|
+| billed MRR at t | the recurring part of the org's newest paid invoice whose period covers t, normalised by the price's interval (a yearly invoice ÷ 12), 0 once a deletion at or before t came after that period began | [`OrgBilling::mrr_at`, billing.rs:498](../crates/services/src/billing.rs) |
+| paying orgs | orgs with billed MRR > 0 | same |
+| new / expansion / contraction / churned | per month and currency, each org's MRR at the month's end against the end of the month before: from 0 = new, to 0 = churned, up = expansion, down = contraction | [`movements`, billing.rs:548](../crates/services/src/billing.rs) |
+| `paid_since` | the org's first invoice paid with an amount above 0 — also the funnel's **paid** step | [`OrgBilling::of`, billing.rs:446](../crates/services/src/billing.rs) |
+| trial → paid | trials started in the range (a `trialing` subscription or `trial_will_end`) and how many paid since | [`trial_to_paid`, billing.rs:948](../crates/services/src/billing.rs) |
+| invoices and billed cash | invoices paid in the month and every line they billed, prorations included — cash beside the MRR | `movements` |
+
+- ⚠️ **Billed, so a seat change moves MRR when an invoice bills it.** The proration invoice
+  in between is cash (`billed_cents`), not MRR; the renewal that bills the new seat count is
+  the expansion. A dunning gap (a renewal not paid yet) reads as 0 until the payment lands,
+  and the live view corrects the history once it does.
+- **The record** ([`record_start`, billing.rs:758](../crates/services/src/billing.rs)): before
+  the first billing row (any org — or the first frozen month, whichever is older) nothing was
+  recorded, so a month that ended before it is `on_record: false` — *not measured*, never a
+  month of zero revenue — and is never frozen ([`on_record`, billing.rs:750](../crates/services/src/billing.rs)).
+  With no row at all, billed revenue is `not_measured` everywhere.
+- **Frozen once closed.** The nightly org-daily job ([`freeze_billing_months`, org_daily.rs:510](../crates/api/src/growth/org_daily.rs))
+  writes every closed month of the last 13 that ended at least 3 days ago (Stripe retries a
+  webhook for three days) and lies on the record into `growth_daily`, internal orgs left out,
+  and marks it in `growth_pulls` (`billing:YYYY-MM-01`). A frozen month is never rewritten —
+  except by the backfill, for the months it touched — so purging an org later does not
+  rewrite last year's MRR ([`freeze_closed_months`, billing.rs:840](../crates/services/src/billing.rs)).
+
+### Upgrade intent: plan-limit collisions
+
+Every plan-limit check now goes through core ([`roomler_core::quota`, quota.rs:33](../crates/core/src/quota.rs))
+— thirteen call sites across `chat`, `conference`, `fleet`, `network` and the host. The
+decision stays `services::quota`'s, unchanged ([`evaluate`, quota.rs:258](../crates/services/src/quota.rs)),
+with the FR-32 warn line written there exactly once. What core adds: a collision — refused in
+`enforce`, **or let through in `warn`** — bumps `growth_daily {source: quota, metric: collision,
+dims: {tenant, limit}}` for the UTC day ([`record_collision`, quota.rs:72](../crates/core/src/quota.rs)).
+The org's id and the limit's wire spelling, never a person; spawned and best-effort (a refused
+request is answered at once), and nothing at all with `growth.enabled = false`. The rows carry
+the tenant, so they go with the org.
+
+### Margin
+
+The cost to serve is FR-20's ledger priced by [`routes/cost.rs`](../crates/api/src/routes/cost.rs)
+— the same prices and the same meters as the Cost & usage tab, through one helper
+([`org_costs`, cost.rs:159](../crates/api/src/routes/cost.rs)). Margin per org = billed MRR −
+the last 30 days' cost, **only** where both exist in the same currency
+([`margin_cents`, revenue.rs:386](../crates/api/src/growth/revenue.rs)); an unpriced meter is
+"not priced", never 0.00 (which would read as free to serve).
+
+### The revenue view
+
+`GET /api/admin/growth/revenue?since=YYYY-MM&until=YYYY-MM&include_internal`
+([`get_revenue`, revenue.rs:721](../crates/api/src/growth/revenue.rs)) — platform admins only,
+**404** otherwise and when `growth.enabled = false`. Months, both inclusive; the default is the
+12 months ending with the current one, at most 36, never before 2020-01, never past the
+current month.
+
+| Part | What | Not measured when |
+|---|---|---|
+| `billed.record` | `since` (the record's start), `last_event_at`, `backfilled_at` (absent = the backfill never ran, so figures start at the webhook), `rows`, `truncated` | — |
+| `billed.now` | billed MRR and paying orgs, per currency, at the request | `saas` not mounted; nothing on record |
+| `billed.months` | one block per month: `frozen`, `partial` (the open month), `on_record`, and per currency the movements, invoices and billed cash ([`month_blocks`, revenue.rs:503](../crates/api/src/growth/revenue.rs)) | a month before the record: `on_record: false` |
+| `billed.totals` | the range's invoices paid, billed cash per currency, first payments, failed payments, cancellations | as `billed` |
+| `billed.trial_to_paid` | trials started in the range, converted, and the rate from n = 30 | as `billed` |
+| `billed.by_channel` | per owner's acquisition channel and currency: paying now, MRR now, first payments, churned, trials → paid ([`channel_rows`, revenue.rs:399](../crates/api/src/growth/revenue.rs)) | as `billed` |
+| `estimate` | the list-price MRR over every live org, `estimate: true` | — |
+| `cost` | the cost basis: range, currency, whether anything is priced | the usage ledger is off (`stats.enabled = false`) |
+| `upgrade_intent` | the range's collisions, orgs, by limit, and the top 50 orgs with their limits and days | — (core's, read on every server) |
+| `orgs` | every org with a billing history, a paid plan or a collision (≤ 500): plan, status, seats, channel, `paid_since`, billed MRR (`null` = no invoice), the list-price estimate, 30-day cost, margin, collisions | per cell, as above |
+
+- **The funnel's `paid` step** ([funnel.rs:245](../crates/api/src/growth/funnel.rs)) is the org's
+  first invoice paid above 0. It has no window, so it hangs off the org step, not the value
+  steps (an org that pays is counted whatever its path to value) and reads "paid so far": its
+  `pending` is only the sign-ups still pending at the org step. The Campaigns and Channels
+  tables' `paid` cells are the same groups. `null` with `not_measured.paid` without `saas`.
+- **The org timeline** gains `plan_history` (the org's billing rows, newest 200) and a
+  `first_paid` milestone ([orgs.rs:667](../crates/api/src/growth/orgs.rs)).
+- **In the digest**, the revenue section gains `billed` — MRR at the day's end per currency;
+  the day's (and 7/28 days') invoices, billed cash, failed payments, first payments,
+  cancellations and trials; `record_since` and `backfilled`
+  ([`billed_figures`, digest.rs:1638](../crates/api/src/growth/digest.rs)) — and `upgrade_intent`,
+  the windows' collisions and the orgs that hit hardest
+  ([`upgrade_intent_section`, digest.rs:1730](../crates/api/src/growth/digest.rs)). The
+  estimate keeps its line and its label.
+- The SPA's `/observability/growth` gains a **Revenue** tab
+  ([`GrowthRevenue.vue`](../ui/src/components/growth/GrowthRevenue.vue)); the Overview's funnel
+  shows **Paid (so far)**, and the org drawer the plan history.
+
+### The backfill — operator-run, once
+
+`POST /api/admin/growth/billing/backfill?since=YYYY-MM-DD` (`saas`,
+[`backfill`, saas stripe.rs:137](../crates/modules/saas/src/stripe.rs)) — platform admins only,
+404 otherwise and with growth off. It reads Stripe's **paid** invoices (created since `since`
+when given; 100 a page, at most 100 pages) into `invoice_paid` rows with `source: backfill`
+([`backfill_paid_invoices`, stripe.rs:396](../crates/services/src/stripe.rs)), then refreezes the
+closed months those invoices touch ([`refreeze`, saas stripe.rs:190](../crates/modules/saas/src/stripe.rs))
+and leaves a `growth_pulls` marker (`billing_backfill:YYYY-MM-DD`) the views read. It only
+reads Stripe. Idempotent: an invoice already on record (the webhook's, or an earlier run's) is
+counted under `already` and left as it was; one naming no org here under `no_org`.
+
+```bash
+# As a platform admin (a JWT from the SPA), once, after the webhook is wired:
+curl -sS -X POST "https://roomler.ai/api/admin/growth/billing/backfill?since=2025-01-01" \
+  -H "Authorization: Bearer $ROOMLER_ADMIN_JWT"
+# {"pages":1,"invoices":12,"recorded":9,"already":3,"no_org":0,"truncated":false,
+#  "months":["2025-11","2025-12",…],"refrozen":["2025-11",…]}
+```
+
+### The operator's setup
+
+| Where | What |
+|---|---|
+| Stripe → Developers → Webhooks → the `https://roomler.ai/api/stripe/webhook` endpoint | add the events `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.paid`, `invoice.payment_failed`, `customer.subscription.trial_will_end` (keep `checkout.session.completed`). Its signing secret stays `ROOMLER__STRIPE__WEBHOOK_SECRET` |
+| `ROOMLER__STRIPE__PRICE_PRO` / `ROOMLER__STRIPE__PRICE_BUSINESS` | the plan a row names comes from these price ids; a price this server does not sell leaves `plan` empty |
+| `ROOMLER__STRIPE__SECRET_KEY` | the backfill's read of the invoice list (a restricted key with *Invoices: read* is enough) |
+| — | nothing to switch on: the rows land as the events arrive; `growth.enabled = false` hides the views and stops counting collisions |
+
+A subscription created before P4 carries no `tenant_id` in its metadata; its events are
+matched through the org's stored customer and subscription ids instead.
+
 ## The `/observability` page as a whole
 
 | Tab / surface | What it shows | Route family |
@@ -941,7 +1128,7 @@ addresses plus one that bounces, sent twice — and the per-issue table marks it
 | Orgs, machines, calls, users | platform-wide inventories and series | `/api/admin/stats/{orgs,machines,calls,users}` |
 | Usage | per-user minutes and bytes across every org | `/api/admin/stats/usage*` |
 | Attribution (FR-88) | sign-ups by campaign key and how many activated | `/api/admin/stats/attribution` |
-| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), the Channels table with the ingest keys (P8), and the Newsletter tab (P5) | `/api/admin/growth/*` |
+| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), the Channels table with the ingest keys (P8), the Newsletter tab (P5), and the Revenue tab (P4) | `/api/admin/growth/*` |
 
 ## Field verification
 
@@ -965,3 +1152,11 @@ address `suppressed` at the next send, with SendGrid's open and click tracking r
 boot (AC14). The integration suite asserts the refusal before parsing, the four events and
 nothing else, the suppression at the next send and the replay that changes nothing
 (`crates/tests/src/growth_newsletter_tests.rs`); AC15 is the `saas` unit test above.
+
+Billed revenue is to be shown on production with a Stripe **test-mode** lifecycle — subscribe
+with a coupon → invoice paid → a seat change → cancel — writing `billing_events` with the
+invoice amounts, and the Revenue tab's MRR equal to the test invoices, not the list price
+(AC13; the coupon is the control that makes the two differ). The integration suite drives the
+same lifecycle through Stripe's own signature scheme — the rows, MRR month by month, the
+frozen months surviving the org's purge, the backfill against a fake Stripe, and the collision
+counter (`crates/tests/src/growth_revenue_tests.rs`).

@@ -8,7 +8,8 @@
 //!   billing status, and `at_risk`;
 //! * `GET /api/admin/growth/org/{tenant_id}/timeline` — one org's
 //!   milestones from its owner's sign-up to its last value day: the trace
-//!   view.
+//!   view; from P4 also its first payment and its billing history (plan
+//!   changes and invoices from `billing_events`, `null` without `saas`).
 //!
 //! **At risk** ([`at_risk`]): active in at least [`AT_RISK_MIN_ACTIVE`] of
 //! the [`AT_RISK_LOOKBACK`] weeks before the last [`AT_RISK_QUIET`], and in
@@ -36,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     cohorts::{plus_weeks, week_label, week_start},
     digest::{
-        NotMeasured, aggregate, day_str, dt_ms, excluded_ids, find_docs, parse_day, str_of,
+        Measured, aggregate, day_str, dt_ms, excluded_ids, find_docs, parse_day, str_of,
         utc_date_of,
     },
     mounted, value,
@@ -174,7 +175,7 @@ fn billing_status(d: &Document) -> Option<String> {
         .and_then(|b| str_of(b, "status"))
 }
 
-async fn owner_attributions(
+pub(crate) async fn owner_attributions(
     state: &AppState,
     owners: &[ObjectId],
 ) -> Result<HashMap<ObjectId, Option<SignupAttribution>>, ApiError> {
@@ -410,6 +411,32 @@ pub struct Totals {
     pub exec_runs: i64,
 }
 
+/// P4 — one row of the org's billing history (`billing_events`): what
+/// Stripe said, never who paid.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanChange {
+    /// RFC 3339.
+    pub at: String,
+    /// `subscription_created` · `subscription_updated` ·
+    /// `subscription_deleted` · `invoice_paid` · `invoice_payment_failed` ·
+    /// `trial_will_end`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seats: Option<i64>,
+    /// Invoices: what was billed (cents). Absent on a subscription event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount_cents: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// The newest billing rows the timeline lists.
+pub const MAX_PLAN_HISTORY: usize = 200;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimelineReport {
     pub enabled: bool,
@@ -421,7 +448,9 @@ pub struct TimelineReport {
     pub plan: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing_status: Option<String>,
-    pub plan_history: NotMeasured,
+    /// P4 — plan changes and invoices, oldest first (the newest
+    /// [`MAX_PLAN_HISTORY`]); `not_measured` without `saas`.
+    pub plan_history: Measured<Vec<PlanChange>>,
     pub members: u64,
     pub devices: Option<DeviceCounts>,
     pub events: Vec<TimelineEvent>,
@@ -634,6 +663,48 @@ pub async fn org_timeline(
         (weeks, Some(t))
     };
 
+    // P4 — the billing history, and the first payment as a milestone.
+    let plan_history = if mounted(&state, "saas") {
+        let rows = roomler_ai_services::dao::billing_event::BillingEventDao::new(&state.db)
+            .list(Some(&[tid]), &[])
+            .await?;
+        if let Some(t) =
+            roomler_ai_services::billing::OrgBilling::of(&rows.iter().collect::<Vec<_>>())
+                .paid_since
+        {
+            events.push((
+                t,
+                TimelineEvent {
+                    at: DateTime::from_millis(t)
+                        .try_to_rfc3339_string()
+                        .unwrap_or_default(),
+                    kind: "first_paid".into(),
+                    attribution: None,
+                    owner: None,
+                    os: None,
+                    value_kinds: None,
+                },
+            ));
+        }
+        let skip = rows.len().saturating_sub(MAX_PLAN_HISTORY);
+        Measured::Value(
+            rows.iter()
+                .skip(skip)
+                .map(|r| PlanChange {
+                    at: r.ts.try_to_rfc3339_string().unwrap_or_default(),
+                    kind: r.kind.as_str().to_string(),
+                    plan: r.plan.clone(),
+                    seats: r.seats,
+                    amount_cents: r.amount_cents,
+                    currency: r.currency.clone(),
+                    status: r.status.clone(),
+                })
+                .collect(),
+        )
+    } else {
+        Measured::unmounted("saas")
+    };
+
     events.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.kind.cmp(&b.1.kind)));
     Ok(Json(TimelineReport {
         enabled: true,
@@ -644,7 +715,7 @@ pub async fn org_timeline(
         archived: tenant.get_bool("is_archived").unwrap_or(false),
         plan: str_of(&tenant, "plan").unwrap_or_else(|| "free".into()),
         billing_status: billing_status(&tenant),
-        plan_history: NotMeasured::later("plan changes and invoices", "P4"),
+        plan_history,
         members: members.len() as u64,
         devices: devices.map(|m| m.get(&tid).copied().unwrap_or_default()),
         events: events.into_iter().map(|(_, e)| e).collect(),

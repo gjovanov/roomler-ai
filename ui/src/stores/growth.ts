@@ -85,7 +85,9 @@ export interface FunnelSteps {
   /** `null` without `fleet` — "cannot see devices", never 0. */
   activated: StepCounts | null
   first_value: StepCounts | null
-  paid: NotMeasured
+  /** P4 — the org's first invoice paid above 0; no window, so "paid so
+   *  far". `null` without `saas` (see `not_measured.paid`). */
+  paid: StepCounts | null
 }
 
 export interface Percentiles {
@@ -105,6 +107,7 @@ export interface FunnelBucket {
   org_created: StepCounts
   activated: StepCounts | null
   first_value: StepCounts | null
+  paid: StepCounts | null
 }
 
 export interface FunnelWindows {
@@ -233,6 +236,149 @@ export interface OrgTimeline {
   not_measured?: string
   weeks: { week: string; start: string; active: boolean }[]
   totals: Record<string, unknown> | null
+  /** P4 — plan changes and invoices, oldest first; not measured without `saas`. */
+  plan_history: Measured<PlanChange[]>
+}
+
+/** P4 — one row of an org's billing history: what Stripe said. */
+export interface PlanChange {
+  at: string
+  /** `subscription_created` · `subscription_updated` · `subscription_deleted`
+   *  · `invoice_paid` · `invoice_payment_failed` · `trial_will_end`. */
+  kind: string
+  plan?: string
+  seats?: number
+  /** Invoices only: what was billed, in cents. */
+  amount_cents?: number
+  currency?: string
+  status?: string
+}
+
+// ── P4: revenue ─────────────────────────────────────────────────────────
+// Wire shapes mirror crates/api/src/growth/revenue.rs. Billed figures are
+// what Stripe billed (`billing_events`); the list-price figure is an
+// ESTIMATE and says so. A month before the first billing row is
+// `on_record: false` — not measured, never a month of zero revenue.
+
+export interface CurrencyNow {
+  /** Lowercase ISO 4217, as Stripe spells it. */
+  currency: string
+  mrr_cents: number
+  paying_orgs: number
+}
+
+/** One currency's movements in one month (MRR at the month's end). */
+export interface CurrencyMonth {
+  currency: string
+  month: string
+  mrr_cents: number
+  paying_orgs: number
+  new_cents: number
+  new_orgs: number
+  expansion_cents: number
+  contraction_cents: number
+  churned_cents: number
+  churned_orgs: number
+  net_new_cents: number
+  invoices_paid: number
+  billed_cents: number
+}
+
+export interface MonthBlock {
+  month: string
+  /** Read from the frozen monthly totals, not computed live. */
+  frozen: boolean
+  /** The open month: its "end" is now. */
+  partial: boolean
+  /** `false` = before the first billing row: not measured. */
+  on_record: boolean
+  currencies: CurrencyMonth[]
+}
+
+export interface RevenueRecord {
+  since: string
+  last_event_at?: string
+  /** Absent = the backfill never ran: figures start at the webhook. */
+  backfilled_at?: string
+  rows: number
+  truncated: boolean
+}
+
+export interface ChannelRevenue {
+  channel: string
+  currency: string
+  paying_orgs: number
+  mrr_cents: number
+  new_paying_orgs: number
+  churned_orgs: number
+  trials: number
+  converted: number
+}
+
+export interface BilledRevenue {
+  record: RevenueRecord
+  now: CurrencyNow[]
+  months: MonthBlock[]
+  totals: {
+    invoices_paid: number
+    billed: { currency: string; cents: number }[]
+    payment_failures: number
+    new_paying_orgs: number
+    cancellations: number
+  }
+  trial_to_paid: { trials: number; converted: number; rate: Rate }
+  by_channel: ChannelRevenue[]
+}
+
+export interface OrgRevenue {
+  tenant_id: string
+  name: string
+  deleted: boolean
+  plan: string
+  billing_status?: string
+  seats: number
+  channel: string | null
+  paid_since: string | null
+  /** `null` = no paid invoice on record. */
+  billed_mrr_cents: number | null
+  currency: string | null
+  /** The list-price ESTIMATE (plan price × seats). */
+  list_price_mrr_cents: number
+  /** In `cost.currency`; `null` = not priced or not measured. */
+  cost_30d: number | null
+  /** Billed MRR − cost, cents; only where both exist in one currency. */
+  margin_cents: number | null
+  collisions: number
+}
+
+export interface CollisionRow {
+  tenant_id: string
+  name: string
+  plan: string
+  total: number
+  days: number
+  last_day: string
+  limits: { limit: string; count: number }[]
+}
+
+export interface RevenueReport {
+  enabled: boolean
+  since: string
+  until: string
+  include_internal: boolean
+  excluded: ExcludedCounts
+  as_of: string
+  billed: Measured<BilledRevenue>
+  estimate: { cents: number; estimate: boolean; basis: string }
+  cost: Measured<{ range: string; currency?: string; priced: boolean }>
+  upgrade_intent: {
+    collisions: number
+    orgs: number
+    by_limit: { limit: string; count: number }[]
+    top: CollisionRow[]
+  }
+  orgs: OrgRevenue[]
+  orgs_truncated: boolean
 }
 
 // ── P6: the Campaigns table ─────────────────────────────────────────────
@@ -286,6 +432,8 @@ export interface Rates {
   signup_per_visitor: Rate | null
   activation: Rate | null
   first_value: Rate | null
+  /** P4 — paid (so far) ÷ the sign-ups settled at the org step. */
+  paid: Rate | null
 }
 
 export interface CampaignRow {
@@ -297,7 +445,7 @@ export interface CampaignRow {
   org_created: StepCounts
   activated: StepCounts | null
   first_value: StepCounts | null
-  paid: NotMeasured
+  paid: StepCounts | null
   /** P8 — each platform's own numbers for the key's posts in the range. */
   reach: Measured<PlatformReach[]>
   coverage: Measured<Coverage>
@@ -400,7 +548,7 @@ export interface PostRow {
   org_created: StepCounts
   activated: StepCounts | null
   first_value: StepCounts | null
-  paid: NotMeasured
+  paid: StepCounts | null
   rates: Rates
   spend?: Spend
 }
@@ -414,7 +562,7 @@ export interface PlatformSummary {
   org_created: StepCounts
   activated: StepCounts | null
   first_value: StepCounts | null
-  paid: NotMeasured
+  paid: StepCounts | null
   rates: Rates
   spend?: Spend
 }
@@ -735,6 +883,18 @@ export const useGrowthStore = defineStore('growth', () => {
     return api.get<OrgTimeline>(`/admin/growth/org/${encodeURIComponent(tenantId)}/timeline`)
   }
 
+  /** P4 — billed revenue: months are `YYYY-MM`, both inclusive. */
+  async function fetchRevenue(
+    opts: { since?: string; until?: string; includeInternal?: boolean } = {},
+  ): Promise<RevenueReport> {
+    const q = new URLSearchParams()
+    if (opts.since) q.set('since', opts.since)
+    if (opts.until) q.set('until', opts.until)
+    if (opts.includeInternal) q.set('include_internal', 'true')
+    const qs = q.toString()
+    return api.get<RevenueReport>(`/admin/growth/revenue${qs ? `?${qs}` : ''}`)
+  }
+
   /** P6 — the Campaigns table: days are `YYYY-MM-DD`, both inclusive. */
   async function fetchCampaigns(
     opts: { since?: string; until?: string; by?: KeyDepth; includeInternal?: boolean } = {},
@@ -797,6 +957,7 @@ export const useGrowthStore = defineStore('growth', () => {
     fetchCohorts,
     fetchOrgs,
     fetchTimeline,
+    fetchRevenue,
     fetchCampaigns,
     fetchChannels,
     fetchNewsletter,

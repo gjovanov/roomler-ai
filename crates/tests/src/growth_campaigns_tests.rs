@@ -689,7 +689,9 @@ async fn the_campaigns_view_joins_both_planes_by_the_normalised_key() {
         "no ratio below n = 30"
     );
     assert_eq!(li["rates"]["signup_per_visitor"]["n"], 55);
-    assert_eq!(li["paid"]["arrives_with"], "P4");
+    // P4 — measured (saas is mounted), nobody paid: a zero, never "P4".
+    assert_eq!(li["paid"]["count"], 0);
+    assert_eq!(li["paid"]["settled"], 1);
     // P8 — no post was pushed with this key: reach not measured, never 0.
     assert_eq!(
         li["reach"]["not_measured"],
@@ -842,6 +844,10 @@ async fn unmounted_modules_read_null_with_the_module_named() {
         "{li}"
     );
     assert!(li["rates"]["activation"].is_null());
+    // P4 — paid needs `saas` (billing_events): null with the module named.
+    assert!(li["paid"].is_null(), "{li}");
+    assert!(li["rates"]["paid"].is_null());
+    assert_eq!(j["not_measured"]["paid"], "saas module not mounted");
     assert_eq!(li["signups"], 1);
     assert_eq!(
         li["web"]["visitors"], 55,

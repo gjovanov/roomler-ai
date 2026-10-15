@@ -674,9 +674,14 @@ async fn every_section_counts_the_seeded_day_exactly() {
     );
     assert_eq!(j["revenue"]["mrr"]["cents"], 1600.0);
     assert_eq!(j["revenue"]["mrr"]["estimate"], true);
+    // P4 — nothing on record: billed is not measured (never "0 MRR"), and
+    // says why rather than which phase brings it; no collision was counted.
+    let (reason, phase) = not_measured(&j["revenue"]["billed"]).expect("not measured");
+    assert!(reason.contains("no billing event on record"), "{reason}");
+    assert_eq!(phase, None);
     assert_eq!(
-        not_measured(&j["revenue"]["billed"]).map(|n| n.1),
-        Some(Some("P4"))
+        fig(&j["revenue"]["upgrade_intent"]["collisions"]),
+        (0, 0, 0)
     );
 
     // Quality: failures apart from hang-ups and refusals; crashes by version.

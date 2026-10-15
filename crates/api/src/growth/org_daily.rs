@@ -503,6 +503,25 @@ pub async fn run_scheduled(state: &AppState, now: DateTime) -> Result<RangeRepor
     run_once(state, now).await
 }
 
+/// P4 — freeze the billed totals of every closed month not frozen yet
+/// (`billing::freeze_closed_months`, internal orgs left out), so deleting
+/// an org later does not rewrite last year's MRR. Without `saas` there is
+/// no `billing_events` to freeze. Runs under the same nightly claim.
+pub async fn freeze_billing_months(
+    state: &AppState,
+    now: DateTime,
+) -> Result<Vec<String>, GrowthError> {
+    if !mounted(state, "saas") {
+        return Ok(Vec::new());
+    }
+    let excluded: Vec<ObjectId> = roomler_core::growth::ExclusionSet::load(&state.core)
+        .await?
+        .tenants
+        .into_iter()
+        .collect();
+    Ok(roomler_ai_services::billing::freeze_closed_months(&state.db, &excluded, now).await?)
+}
+
 /// The scheduler. Only with `growth.enabled`; one run per UTC day per
 /// cluster (the Redis claim) or per pod (no Redis).
 pub fn spawn_org_daily_loop(state: AppState) {
@@ -542,6 +561,13 @@ pub fn spawn_org_daily_loop(state: AppState) {
                             "growth org-daily run"
                         ),
                         Err(e) => warn!(%e, "growth org-daily run failed"),
+                    }
+                    match freeze_billing_months(&state, now).await {
+                        Ok(months) if !months.is_empty() => {
+                            info!(months = ?months, "growth billing months frozen")
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!(%e, "growth billing freeze failed"),
                     }
                 }
             }

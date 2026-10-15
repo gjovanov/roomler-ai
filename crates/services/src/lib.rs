@@ -2,6 +2,7 @@
 // Copyright (C) 2026 G ROX EOOD
 pub mod auth;
 pub mod background;
+pub mod billing;
 pub mod cloud_storage;
 pub mod dao;
 pub mod email;

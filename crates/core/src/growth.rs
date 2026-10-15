@@ -142,11 +142,19 @@ impl ExclusionSet {
 /// everything it knows so that `unarchive` restores a working org, and its
 /// activity history is part of that. When a real deletion path lands, it
 /// calls this.
+///
+/// FR-102 P4 — the org's `billing_events` go too (§3o: "with the org"); the
+/// monthly billed totals frozen into `growth_daily` carry no tenant and stay,
+/// so deleting an org never rewrites last year's MRR.
 pub async fn purge_tenant(
     core: &Core,
     tenant_id: ObjectId,
 ) -> DaoResult<roomler_ai_services::dao::growth::PurgedCounts> {
-    GrowthDao::new(&core.db).purge_tenant(tenant_id).await
+    let mut counts = GrowthDao::new(&core.db).purge_tenant(tenant_id).await?;
+    counts.billing_events = roomler_ai_services::dao::billing_event::BillingEventDao::new(&core.db)
+        .purge_tenant(tenant_id)
+        .await?;
+    Ok(counts)
 }
 
 #[cfg(test)]

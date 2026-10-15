@@ -27,6 +27,7 @@
         <v-tab value="newsletter">Newsletter</v-tab>
         <v-tab value="orgs">Orgs</v-tab>
         <v-tab value="cohorts">Cohorts</v-tab>
+        <v-tab value="revenue">Revenue</v-tab>
         <v-tab value="digest">Digest</v-tab>
       </v-tabs>
 
@@ -141,6 +142,7 @@
                       <th class="text-right">orgs</th>
                       <th class="text-right">activated</th>
                       <th class="text-right">first value</th>
+                      <th class="text-right">paid</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -150,6 +152,7 @@
                       <td class="text-right">{{ b.org_created.count }}</td>
                       <td class="text-right">{{ b.activated?.count ?? '—' }}</td>
                       <td class="text-right">{{ b.first_value?.count ?? '—' }}</td>
+                      <td class="text-right">{{ b.paid?.count ?? '—' }}</td>
                     </tr>
                   </tbody>
                 </v-table>
@@ -296,6 +299,11 @@
           </v-card>
         </v-window-item>
 
+        <!-- ── Revenue (P4) ──────────────────────────────────────────── -->
+        <v-window-item value="revenue">
+          <growth-revenue />
+        </v-window-item>
+
         <!-- ── Digest (P1d) ──────────────────────────────────────────── -->
         <v-window-item value="digest">
           <div class="d-flex align-center flex-wrap mb-3" style="gap: 12px">
@@ -403,6 +411,23 @@
           </div>
           <div v-if="timeline.not_measured">Activity {{ timeline.not_measured }}.</div>
         </div>
+        <!-- P4 — what Stripe said, oldest first. -->
+        <div class="px-3 pb-3">
+          <div class="text-caption text-medium-emphasis mb-1">Plan changes and invoices</div>
+          <growth-not-measured v-if="planHistory.reason" :reason="planHistory.reason" />
+          <template v-else-if="planHistory.rows.length">
+            <div v-for="(p, i) in planHistory.rows" :key="i" class="text-caption">
+              {{ p.at.slice(0, 10) }} · {{ humanKey(p.kind) }}
+              <template v-if="p.plan"> · {{ p.plan }}</template>
+              <template v-if="p.seats != null"> · {{ p.seats }} seats</template>
+              <template v-if="p.amount_cents != null">
+                · {{ (p.amount_cents / 100).toFixed(2) }} {{ (p.currency ?? '').toUpperCase() }}
+              </template>
+              <template v-if="p.status"> · {{ p.status }}</template>
+            </div>
+          </template>
+          <span v-else class="text-caption text-medium-emphasis">None on record.</span>
+        </div>
       </template>
       <div v-else class="pa-4"><v-progress-circular indeterminate size="24" /></div>
     </v-navigation-drawer>
@@ -415,6 +440,7 @@ import { useAuthStore } from '@/stores/auth'
 import {
   useGrowthStore,
   humanKey,
+  isNotMeasured,
   type Digest,
   type DigestPreview,
   type DigestStatus,
@@ -425,6 +451,7 @@ import {
   type OrgsReport,
   type OrgTimeline,
   type Percentiles,
+  type PlanChange,
   rateIfEnough,
 } from '@/stores/growth'
 import GrowthCampaigns from '@/components/growth/GrowthCampaigns.vue'
@@ -433,6 +460,7 @@ import GrowthNewsletter from '@/components/growth/GrowthNewsletter.vue'
 import GrowthNode from '@/components/growth/GrowthNode.vue'
 import GrowthNotMeasured from '@/components/growth/GrowthNotMeasured.vue'
 import GrowthPercentiles from '@/components/growth/GrowthPercentiles.vue'
+import GrowthRevenue from '@/components/growth/GrowthRevenue.vue'
 import TimeSeriesChart from '@/components/stats/TimeSeriesChart.vue'
 
 const authStore = useAuthStore()
@@ -484,7 +512,8 @@ const funnelSteps = computed(() => {
     row('org_created', 'Org created (≤ 7d)', f.steps.org_created),
     row('activated', 'Activated (device ≤ 7d)', f.steps.activated),
     row('first_value', 'First value (≤ 14d)', f.steps.first_value),
-    { name: 'paid', label: 'Paid', count: 0, pending: 0, settled: null, rate: null, notMeasured: `not measured — arrives with ${f.steps.paid.arrives_with ?? 'P4'}` },
+    // P4 — no window: the orgs that have paid so far.
+    row('paid', 'Paid (so far)', f.steps.paid),
   ]
 })
 
@@ -498,6 +527,14 @@ const coverageRatio = computed(() =>
 // ── Timeline drawer ───────────────────────────────────────────────────────
 const timelineOpen = ref(false)
 const timeline = ref<OrgTimeline | null>(null)
+
+// P4 — the org's billing history, or why there is none to show.
+const planHistory = computed<{ reason: string | null; rows: PlanChange[] }>(() => {
+  const h = timeline.value?.plan_history
+  if (!h) return { reason: null, rows: [] }
+  if (isNotMeasured(h)) return { reason: h.not_measured, rows: [] }
+  return { reason: null, rows: h }
+})
 
 const filteredOrgs = computed(() => {
   const list = orgs.value?.orgs ?? []
@@ -520,6 +557,7 @@ function eventColor(kind: string): string {
   if (kind === 'org_created') return 'info'
   if (kind === 'first_device') return 'primary'
   if (kind === 'first_value') return 'success'
+  if (kind === 'first_paid') return 'amber'
   return 'grey'
 }
 
@@ -593,7 +631,7 @@ const excluded = computed<ExcludedCounts | null>(
   () => preview.value?.excluded ?? digest.value?.excluded ?? null,
 )
 
-const WIDE = new Set(['signups', 'campaigns', 'website', 'blog', 'newsletter'])
+const WIDE = new Set(['signups', 'campaigns', 'website', 'blog', 'newsletter', 'revenue'])
 function wide(key: string | number): boolean {
   return WIDE.has(String(key))
 }

@@ -230,12 +230,9 @@ pub async fn enroll_agent(
         let used = state.agents.count_active_for_tenant(tid).await?;
         // FR-32: decision + record in `quota::check`. `MaxDevices` is an
         // established limit, so it refuses whatever the tenant's mode says.
-        if let Err(d) = quota::check(
-            tenant.plan.clone(),
-            tenant.settings.plan_enforcement,
-            quota::Limit::MaxDevices,
-            used,
-        ) {
+        // FR-102 P4 — through core, which also counts the collision per org.
+        if let Err(d) = roomler_core::quota::check(&state, &tenant, quota::Limit::MaxDevices, used)
+        {
             return Err(ApiError::Forbidden(format!(
                 "Device limit reached for the {:?} plan ({} of {} devices used). \
                  Upgrade the plan or remove a device first.",
@@ -383,12 +380,8 @@ async fn enroll_agent_ephemeral(
     // Device cap — an ephemeral device consumes a slot while it exists
     // (FR-51 F5, the simple reading; the reaper is what gives them back).
     let used = state.agents.count_active_for_tenant(tid).await?;
-    if let Err(d) = quota::check(
-        tenant.plan.clone(),
-        tenant.settings.plan_enforcement,
-        quota::Limit::MaxDevices,
-        used,
-    ) {
+    // FR-102 P4 — through core, which also counts the collision per org.
+    if let Err(d) = roomler_core::quota::check(state, &tenant, quota::Limit::MaxDevices, used) {
         return Err(ApiError::Forbidden(format!(
             "Device limit reached for the {:?} plan ({} of {} devices used). \
              Upgrade the plan or remove a device first.",

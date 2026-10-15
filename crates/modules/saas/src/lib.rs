@@ -9,9 +9,11 @@
 //! `growth_daily` collection, through the core DAO) and the promotion
 //! pipeline's ingest routes (P8, [`growth_ingest`] — posts and metric
 //! snapshots into the core `growth_posts` / `growth_post_snapshots`,
-//! behind a hashed ingest key), and the newsletter's delivery side (P5,
+//! behind a hashed ingest key), the newsletter's delivery side (P5,
 //! [`sendgrid`] — SendGrid's signed Event Webhook onto the send ledger, the
-//! per-issue link tags and unsubscribes). Everything here
+//! per-issue link tags and unsubscribes), and billed revenue (P4 — the six
+//! Stripe billing kinds into `billing_events`, and the operator's one-off
+//! backfill of Stripe's paid invoices). Everything here
 //! exists because roomler.ai is a hosted product; a self-hosted deployment
 //! runs without it, which is why it is an **add-on feature** on the host
 //! rather than part of any profile.
@@ -19,7 +21,7 @@
 //! It is also the first module crate, chosen for that reason: it is the
 //! smallest, and it exercises the whole [`Module`] contract at the lowest
 //! risk — `unlimited_routes` for the Stripe webhook (signature-authenticated
-//! and deliberately outside the per-IP governor), `indexes` for its three
+//! and deliberately outside the per-IP governor), `indexes` for its
 //! collections, a runtime switch (`[modules] saas = false`) that unmounts it
 //! on a live pod.
 //!
@@ -40,7 +42,9 @@ use axum::{
     routing::{get, post, put},
 };
 use roomler_ai_config::Settings;
-use roomler_ai_db::indexes::{IndexSet, index, index_unique};
+use roomler_ai_db::indexes::{
+    IndexSet, index, index_unique, index_unique_partial, index_unique_sparse,
+};
 use roomler_ai_services::dao::{
     newsletter_issue::NewsletterIssueDao, newsletter_send::NewsletterSendDao,
     subscriber::SubscriberDao,
@@ -56,7 +60,9 @@ pub mod sendgrid;
 pub mod stripe;
 pub mod subscribe;
 
-/// The module's state: the core plus the three collections it owns.
+/// The module's state: the core plus the DAOs of the three newsletter-side
+/// collections it owns (`billing_events`, its fourth, is written through
+/// the services crate's `BillingEventDao` from the Stripe webhook).
 #[derive(Clone)]
 pub struct SaasState {
     pub core: Core,
@@ -173,6 +179,10 @@ impl Module for SaasState {
 
         Router::new()
             .merge(growth_ingest_routes)
+            // FR-102 P4 — the operator's one-off read of Stripe's paid
+            // invoices into `billing_events` (platform admins; 404 otherwise
+            // and when `growth.enabled = false`). Reads Stripe, never writes.
+            .route("/admin/growth/billing/backfill", post(stripe::backfill))
             .nest("/stripe", stripe)
             .nest("/admin/newsletter", admin_newsletter)
             // FR-32 P1c — "who would break if enforcement were turned on?".
@@ -231,8 +241,9 @@ impl Module for SaasState {
             .with_state(self.clone())
     }
 
-    /// The three collections this module owns. The specs are the ones the
-    /// db crate's plan held before P2, unchanged.
+    /// The collections this module owns. The first three's specs are the
+    /// ones the db crate's plan held before P2, unchanged; FR-102 P4 adds
+    /// `billing_events`.
     fn indexes(&self) -> Vec<IndexSet> {
         vec![
             // Subscribers (FR-39).
@@ -269,6 +280,23 @@ impl Module for SaasState {
                 indexes: vec![
                     index_unique(bson::doc! { "issue_id": 1, "subscriber_id": 1 }),
                     index(bson::doc! { "issue_id": 1, "status": 1 }),
+                ],
+            },
+            // FR-102 P4 — what Stripe billed. A webhook row is unique by its
+            // event (`event_id`; sparse — a backfilled row has none), a paid
+            // invoice by `(kind, stripe_id)` across the webhook and the
+            // backfill; read per org over time and by kind over time.
+            IndexSet {
+                collection: "billing_events",
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index_unique_sparse(bson::doc! { "event_id": 1 }),
+                    index_unique_partial(
+                        bson::doc! { "kind": 1, "stripe_id": 1 },
+                        bson::doc! { "kind": "invoice_paid" },
+                    ),
+                    index(bson::doc! { "tenant_id": 1, "ts": 1 }),
+                    index(bson::doc! { "kind": 1, "ts": 1 }),
                 ],
             },
         ]

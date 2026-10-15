@@ -281,10 +281,11 @@ async fn handle_media_join(
         && let Ok(tenant) = state.tenants.base.find_by_id(room.tenant_id).await
     {
         let present = state.room_manager.get_participant_user_ids(&rid);
+        // FR-102 P4 — through core, which also counts the collision per org.
         if !present.contains(user_id)
-            && let Err(d) = roomler_ai_services::quota::check(
-                tenant.plan.clone(),
-                tenant.settings.plan_enforcement,
+            && let Err(d) = roomler_core::quota::check(
+                state,
+                &tenant,
                 roomler_ai_services::quota::Limit::VideoMaxParticipants,
                 present.len() as u64,
             )

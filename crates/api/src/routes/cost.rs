@@ -80,6 +80,96 @@ fn str_of(v: &serde_json::Value, k: &str) -> String {
         .to_string()
 }
 
+/// Per-tenant (hex id) meter totals over a window.
+type UsagePerOrg = HashMap<String, HashMap<String, f64>>;
+
+/// The ledger, summed per (tenant, meter) over `window` seconds: per org,
+/// and per meter across the fleet.
+async fn usage_per_org(
+    state: &Core,
+    window: i64,
+    tier: super::stats::Tier,
+) -> Result<(UsagePerOrg, HashMap<String, f64>), ApiError> {
+    let usage = agg(
+        state,
+        &tier_coll("stats_usage", tier),
+        vec![
+            doc! { "$match": { "ts": { "$gte": floor_dt(window) } } },
+            doc! { "$group": {
+                "_id": { "t": "$tenant_id", "m": "$meter" },
+                "total": { "$sum": "$value" },
+            }},
+            doc! { "$set": { "tenant_id": { "$toString": "$_id.t" }, "meter": "$_id.m" } },
+            doc! { "$unset": "_id" },
+        ],
+    )
+    .await?;
+    let mut per_org: UsagePerOrg = HashMap::new();
+    let mut fleet: HashMap<String, f64> = HashMap::new();
+    for u in &usage {
+        let meter = str_of(u, "meter");
+        let total = f64_of(u, "total");
+        *per_org
+            .entry(str_of(u, "tenant_id"))
+            .or_default()
+            .entry(meter.clone())
+            .or_insert(0.0) += total;
+        *fleet.entry(meter).or_insert(0.0) += total;
+    }
+    Ok((per_org, fleet))
+}
+
+/// One org's priced cost over the window: the sum over the MONITORED
+/// meters that carry a price, `None` when none of them does (never a 0.00
+/// that would read as "free to serve").
+fn org_cost(mine: Option<&HashMap<String, f64>>, costs: &RelayCosts) -> Option<f64> {
+    let mut total = 0.0;
+    let mut any_priced = false;
+    for m in MONITORED {
+        let used = mine.and_then(|h| h.get(*m)).copied().unwrap_or(0.0);
+        if let Some(c) = cost_of(m, used, costs) {
+            total += c;
+            any_priced = true;
+        }
+    }
+    any_priced.then_some(total)
+}
+
+/// FR-102 P4 — each org's priced cost over `range` (`24h|7d|30d|1y`), for
+/// the revenue view's margin: the same ledger and the same prices as
+/// [`admin_cost`], so the two cannot disagree on what an org cost.
+pub(crate) struct OrgCosts {
+    /// `relay_costs.currency` — the unit the costs are in (major units).
+    pub currency: Option<String>,
+    /// Whether any monitored meter carries a price.
+    pub priced: bool,
+    /// Tenant (hex) → its priced cost; an org with no ledger rows is absent
+    /// (`0.0` when priced — a monitored meter's zero is a measurement).
+    pub per_org: HashMap<String, f64>,
+}
+
+impl OrgCosts {
+    /// One org's cost: `None` when nothing is priced.
+    pub fn of(&self, tenant_hex: &str) -> Option<f64> {
+        self.priced
+            .then(|| self.per_org.get(tenant_hex).copied().unwrap_or(0.0))
+    }
+}
+
+pub(crate) async fn org_costs(state: &Core, range: &str) -> Result<OrgCosts, ApiError> {
+    let (window, tier) = range_spec(Some(range))?;
+    let costs = &state.settings.relay_costs;
+    let (per_org, _) = usage_per_org(state, window, tier).await?;
+    Ok(OrgCosts {
+        currency: costs.currency.clone(),
+        priced: costs.derp_gb.is_some() || costs.sfu_participant_hour.is_some(),
+        per_org: per_org
+            .iter()
+            .filter_map(|(t, mine)| Some((t.clone(), org_cost(Some(mine), costs)?)))
+            .collect(),
+    })
+}
+
 /// `GET /api/admin/stats/cost?range=24h|7d|30d|1y` — per-org metered cost,
 /// list-price MRR, and the fleet carrier mix.
 pub async fn admin_cost(
@@ -95,20 +185,7 @@ pub async fn admin_cost(
     let costs = &state.settings.relay_costs;
 
     // ── the ledger, summed per (tenant, meter) over the range ──────────────
-    let usage = agg(
-        &state,
-        &tier_coll("stats_usage", tier),
-        vec![
-            doc! { "$match": { "ts": { "$gte": floor_dt(window) } } },
-            doc! { "$group": {
-                "_id": { "t": "$tenant_id", "m": "$meter" },
-                "total": { "$sum": "$value" },
-            }},
-            doc! { "$set": { "tenant_id": { "$toString": "$_id.t" }, "meter": "$_id.m" } },
-            doc! { "$unset": "_id" },
-        ],
-    )
-    .await?;
+    let (per_org, fleet) = usage_per_org(&state, window, tier).await?;
 
     let tenants = agg(
         &state,
@@ -140,18 +217,6 @@ pub async fn admin_cost(
     for m in &members {
         seats.insert(str_of(m, "tenant_id"), f64_of(m, "seats"));
     }
-    let mut per_org: HashMap<String, HashMap<String, f64>> = HashMap::new();
-    let mut fleet: HashMap<String, f64> = HashMap::new();
-    for u in &usage {
-        let meter = str_of(u, "meter");
-        let total = f64_of(u, "total");
-        *per_org
-            .entry(str_of(u, "tenant_id"))
-            .or_default()
-            .entry(meter.clone())
-            .or_insert(0.0) += total;
-        *fleet.entry(meter).or_insert(0.0) += total;
-    }
 
     let mut orgs: Vec<serde_json::Value> = Vec::new();
     for t in &tenants {
@@ -161,18 +226,11 @@ pub async fn admin_cost(
         // MONITORED meter, zero is a measurement ("relayed nothing"), which is
         // exactly the fact an operator wants to see.
         let mut meters = serde_json::Map::new();
-        let mut cost_total = 0.0;
-        let mut any_priced = false;
         for m in MONITORED {
             let total = mine.and_then(|h| h.get(*m)).copied().unwrap_or(0.0);
-            let cost = cost_of(m, total, costs);
-            if let Some(c) = cost {
-                cost_total += c;
-                any_priced = true;
-            }
             meters.insert(
                 (*m).to_string(),
-                serde_json::json!({ "total": total, "cost": cost }),
+                serde_json::json!({ "total": total, "cost": cost_of(m, total, costs) }),
             );
         }
         let plan: Plan =
@@ -195,7 +253,7 @@ pub async fn admin_cost(
             "mrr_cents": mrr_cents,
             "meters": meters,
             // `null`, not 0, when nothing this org used carries a price.
-            "cost": if any_priced { Some(cost_total) } else { None },
+            "cost": org_cost(mine, costs),
         }));
     }
 
@@ -477,5 +535,35 @@ mod tests {
     #[test]
     fn an_unknown_meter_is_never_priced() {
         assert_eq!(cost_of("something_new", 1e12, &priced()), None);
+    }
+
+    /// FR-102 P4 — an org's cost, as the margin reads it: `None` with no
+    /// price (never a 0.00 that reads as "free to serve"), a measured 0.0
+    /// for a priced org that used nothing, and the monitored meters summed.
+    #[test]
+    fn an_org_cost_is_none_unpriced_and_a_sum_when_priced() {
+        let used: HashMap<String, f64> = HashMap::from([
+            ("derp_bytes".to_string(), 5e9),
+            ("sfu_participant_seconds".to_string(), 7200.0),
+            // Not monitored: never priced into the org's cost.
+            ("turn_bytes".to_string(), 9e12),
+        ]);
+        assert_eq!(org_cost(Some(&used), &RelayCosts::default()), None);
+        let c = org_cost(Some(&used), &priced()).unwrap();
+        assert!((c - 0.058).abs() < 1e-9, "{c}");
+        assert_eq!(org_cost(None, &priced()), Some(0.0));
+
+        let costs = OrgCosts {
+            currency: Some("EUR".into()),
+            priced: true,
+            per_org: HashMap::from([("a".to_string(), 1.5)]),
+        };
+        assert_eq!(costs.of("a"), Some(1.5));
+        assert_eq!(costs.of("b"), Some(0.0), "priced, no ledger rows: a zero");
+        let unpriced = OrgCosts {
+            priced: false,
+            ..costs
+        };
+        assert_eq!(unpriced.of("a"), None);
     }
 }

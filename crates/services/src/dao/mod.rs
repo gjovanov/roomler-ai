@@ -4,6 +4,7 @@ pub mod agent;
 pub mod agent_crash;
 pub mod agent_log;
 pub mod base;
+pub mod billing_event;
 pub mod config_audit;
 pub mod consent_request;
 pub mod enroll_token_issued;

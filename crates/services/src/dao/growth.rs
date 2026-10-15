@@ -59,6 +59,22 @@ pub const GROWTH_DAILY: &str = "growth_daily";
 pub const INSTALL_SOURCE: &str = "install";
 pub const INSTALL_FETCH_METRIC: &str = "fetch";
 
+/// P4 — a plan-limit collision (`roomler_core::quota`), counted per UTC day
+/// with `dims {tenant, limit}` beside the FR-32 warn line: the upgrade-intent
+/// signal. Named here, below its writers (every module that gates a limit)
+/// and its readers (the host's revenue view and digest).
+pub const QUOTA_SOURCE: &str = "quota";
+pub const QUOTA_COLLISION_METRIC: &str = "collision";
+/// P4 — the monthly billed-revenue totals frozen from `billing_events`
+/// (`roomler_ai_services::billing::freeze_month`): one row per metric per
+/// currency, `day` the month's first day, `dims {currency, period: month}`.
+/// No tenant: an org deleted later does not rewrite last year's MRR.
+pub const BILLING_SOURCE: &str = "billing";
+/// P4 — the `growth_pulls` source of the operator's Stripe backfill: one
+/// `ok` row per day it ran (`rows` = invoices recorded), so a reader can tell
+/// "billed since the webhook was wired" from "billed, history included".
+pub const BILLING_BACKFILL_SOURCE: &str = "billing_backfill";
+
 /// P6 — one pull-status row per `(source, day)` a puller attempted.
 pub const GROWTH_PULLS: &str = "growth_pulls";
 /// P6 — the purestat puller's `source`, in `growth_daily` and `growth_pulls`.
@@ -288,6 +304,9 @@ impl OrgDay {
 pub struct PurgedCounts {
     pub org_days: u64,
     pub daily: u64,
+    /// P4 — the org's `billing_events` rows (`roomler_core::growth::purge_tenant`
+    /// takes them; this DAO does not know the `saas` collection).
+    pub billing_events: u64,
 }
 
 /// What an exclusion row names. The stored spelling is the snake_case
@@ -831,7 +850,11 @@ impl GrowthDao {
             ] })
             .await?
             .deleted_count;
-        Ok(PurgedCounts { org_days, daily })
+        Ok(PurgedCounts {
+            org_days,
+            daily,
+            billing_events: 0,
+        })
     }
 }
 

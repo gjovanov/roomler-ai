@@ -99,8 +99,15 @@
               </div>
             </div>
             <div>
-              <div class="text-caption text-medium-emphasis">Paid</div>
-              <v-chip size="x-small" variant="tonal" color="grey">{{ notMeasuredLabel(p.summary.paid) }}</v-chip>
+              <div class="text-caption text-medium-emphasis">Paid (so far)</div>
+              <div v-if="p.summary.paid" class="text-h6">{{ p.summary.paid.count }}</div>
+              <v-chip
+                v-else
+                size="x-small"
+                variant="tonal"
+                color="grey"
+                :title="report.not_measured?.paid"
+              >not measured</v-chip>
             </div>
             <div v-if="p.summary.spend">
               <div class="text-caption text-medium-emphasis">Spend</div>
@@ -251,7 +258,6 @@ import {
   centsLabel,
   isNotMeasured,
   metricsLabel,
-  notMeasuredLabel,
   safeHref,
   type ChannelsReport,
   type CostRate,

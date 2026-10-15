@@ -25,6 +25,11 @@
 //!   live for the range beside the funnel's account plane, joined by the
 //!   normalised campaign key. (The daily purestat PULL is the `saas`
 //!   module's — it talks to the outside world for the hosted business.)
+//! * [`revenue`] — P4: billed revenue from `billing_events` (the `saas`
+//!   module's Stripe webhook and backfill) — billed MRR, the monthly
+//!   movements (frozen once closed), trial → paid, by channel — beside the
+//!   list-price estimate, the cost to serve (margin) and the plan-limit
+//!   collisions.
 //! * [`channels`], [`keys`] — P8: the Channels table (each platform's own
 //!   reach as the promotion pipeline pushed it, then what each post's key
 //!   brought, and spend) and the machine keys that open the `saas` module's
@@ -45,6 +50,7 @@ pub mod newsletter;
 pub mod org_daily;
 pub mod orgs;
 pub mod render;
+pub mod revenue;
 pub mod routes;
 pub mod value;
 
@@ -89,6 +95,10 @@ pub fn admin_routes() -> Router<AppState> {
         // P6 — the Campaigns table: per normalised key, purestat's web
         // plane (live, for the exact range) beside the account funnel.
         .route("/campaigns", get(campaigns::get_campaigns))
+        // P4 — billed revenue, the monthly movements, margin and the
+        // plan-limit collisions. (The Stripe backfill that fills it is the
+        // `saas` module's `/admin/growth/billing/backfill`.)
+        .route("/revenue", get(revenue::get_revenue))
         // P8 — the Channels table (each platform's own reach, then what the
         // posts' keys brought, and spend) and the growth machine keys (D12:
         // only a hash stored; an `ingest` key opens the `saas` module's

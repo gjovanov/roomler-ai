@@ -214,12 +214,9 @@ pub async fn join_org(
         // wording stays here because it is contextual ("in the target
         // organization"). `MaxDevices` is an established limit, so this
         // refuses regardless of the tenant's `plan_enforcement` mode.
-        if let Err(d) = quota::check(
-            tenant.plan.clone(),
-            tenant.settings.plan_enforcement,
-            quota::Limit::MaxDevices,
-            used,
-        ) {
+        // FR-102 P4 — through core, which also counts the collision per org.
+        if let Err(d) = roomler_core::quota::check(&state, &tenant, quota::Limit::MaxDevices, used)
+        {
             return Err(ApiError::Forbidden(format!(
                 "Device limit reached for the {:?} plan in the target organization \
                  ({} of {} devices used). Upgrade the plan or remove a device first.",

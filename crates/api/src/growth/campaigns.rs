@@ -19,7 +19,8 @@
 //!   timeout or an unreachable purestat make every web cell
 //!   `not_measured` with the reason — never 0; a key purestat answered for
 //!   and saw no visitor of IS a zero. A step whose module is not mounted is
-//!   `null` with the module named. `paid` is `not_measured` until P4.
+//!   `null` with the module named — `paid` (P4) included, which needs
+//!   `saas`.
 //! * **Reach** (P8) is each platform's own numbers for the posts published
 //!   in the range with the key, as the promotion pipeline pushed them
 //!   (`channels::reach_by_key`) — `not_measured` when no such post exists.
@@ -157,6 +158,8 @@ pub struct Rates {
     pub activation: Option<Rate>,
     /// First value ÷ the sign-ups settled at that step.
     pub first_value: Option<Rate>,
+    /// P4 — paid (so far) ÷ the sign-ups settled at the org step.
+    pub paid: Option<Rate>,
 }
 
 /// One row of the table.
@@ -171,7 +174,9 @@ pub struct CampaignRow {
     pub org_created: StepCounts,
     pub activated: Option<StepCounts>,
     pub first_value: Option<StepCounts>,
-    pub paid: NotMeasured,
+    /// P4 — the org's first invoice paid above 0 (no window: as of now);
+    /// `null` without `saas`.
+    pub paid: Option<StepCounts>,
     /// P8 — each platform's own numbers for the posts published in the
     /// range with this key, per snapshot age (raw metric names);
     /// `not_measured` when no such post was pushed.
@@ -380,6 +385,7 @@ pub(crate) fn blank_counts(read: &funnel::Read) -> GroupCounts {
         activated: read.first_device.as_ref().map(|_| StepCounts::default()),
         first_value: (read.first_device.is_some() && read.first_value.is_some())
             .then(StepCounts::default),
+        paid: read.first_paid.as_ref().map(|_| StepCounts::default()),
     }
 }
 
@@ -429,7 +435,7 @@ pub fn join(
                 org_created: acc.org_created,
                 activated: acc.activated,
                 first_value: acc.first_value,
-                paid: NotMeasured::later("the org's first paid invoice", "P4"),
+                paid: acc.paid,
                 reach: match reach.get(key) {
                     Some(r) => Measured::Value(r.clone()),
                     None => Measured::NotMeasured(reach_absent.clone()),
@@ -439,6 +445,7 @@ pub fn join(
                     signup_per_visitor,
                     activation: step_rate(acc.activated),
                     first_value: step_rate(acc.first_value),
+                    paid: step_rate(acc.paid),
                 },
             }
         })
@@ -740,6 +747,12 @@ mod tests {
                 settled,
             }),
             first_value: None,
+            // P4 — one paid org per activated org, settled like the org step.
+            paid: Some(StepCounts {
+                count: activated,
+                pending: 0,
+                settled: signups,
+            }),
         }
     }
 
@@ -857,7 +870,9 @@ mod tests {
                 value: Some(0.018)
             })
         );
-        assert_eq!(li_row.paid.arrives_with.as_deref(), Some("P4"));
+        // P4 — the key's paid orgs, and the rate held back below the floor.
+        assert_eq!(li_row.paid.map(|p| p.count), Some(1));
+        assert_eq!(li_row.rates.paid, Some(Rate { n: 1, value: None }));
         let r = li_row.reach.value().expect("the post's reach");
         assert_eq!((r[0].platform.as_str(), r[0].posts), ("linkedin", 1));
         assert_eq!(r[0].at[0].metrics["impressions"], 1000.0);
