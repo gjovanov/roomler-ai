@@ -745,7 +745,9 @@ escape, `allow_plaintext_server`, which the device owns.
 
 > A session that may cover the device's screen says so on this prompt: "They may also cover this
 > screen while they work." That is privacy mode (FR-99), which needs the device owner's own
-> `privacy_mode_allowed`: [privacy-mode.md](privacy-mode.md).
+> `privacy_mode_allowed`: [privacy-mode.md](privacy-mode.md). What the device then did with the
+> curtain is its claim, kept in `privacy_activity` beside the grant
+> ([privacy-mode.md § What is recorded](privacy-mode.md#what-is-recorded)).
 
 Five modes, set per device (`AccessPolicy.consent_mode`, admin-set, default
 `prompt`). The server resolves one per session and sends it to the agent as a
@@ -1048,7 +1050,7 @@ session goes without it, with a reason:
 
 - ⚠️ **The device enforces the floor itself.** The hub's strip is so the viewer can say why before
   the person clicks. The agent masks the grant ([`mask`, `session_policy.rs:128`](../agents/roomlerd/src/session_policy.rs#L128),
-  applied at [`signaling.rs:3050`](../agents/roomlerd/src/signaling.rs#L3050)) the moment the consent
+  applied at [`signaling.rs:3053`](../agents/roomlerd/src/signaling.rs#L3053)) the moment the consent
   mode resolves, before anything reads it. A request carrying `FILES` with no policy at all, as from a
   bypassed hub, is masked to no `FILES` when the floor says `off`
   (`the_device_floor_holds_when_the_server_sends_no_policy`). Field-verified on 0.4.136, with the red

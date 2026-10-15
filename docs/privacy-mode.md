@@ -13,6 +13,7 @@
 > | P1a | the server's gate: the `PRIVACY` bit, the two capability words, the strip with its reason | shipped |
 > | P1b | the device: the owner's switch, the curtain, the `privacy` channel, the device's own refusals | shipped (0.4.136) |
 > | P1c | the viewer: the toggle, the refusal reasons | shipped |
+> | P1d | the device's account: every curtain up, down (and why) and refused, in `privacy_activity`, including the curtain a killed process could not report | merged; the agent half ships in the next agent release |
 > | P2 | blocking the person's keyboard and mouse (`BlockInput`, Ctrl+Alt+Del to take the computer back) | not built |
 > | P3 | lock the computer when the session ends | not built |
 > | P4 | mute the host | not built |
@@ -37,7 +38,7 @@ Two parties have to agree, and the device's owner speaks first.
 2. **The controller covers the screen.** On a device that allows it, the viewer's toolbar has an
    eye-off toggle ("Cover the device screen"). The session's consent prompt has already told
    the person "They may also cover this screen while they work."
-   ([`privacy.rs:139`](../agents/roomlerd/src/privacy.rs#L139)).
+   ([`privacy.rs:151`](../agents/roomlerd/src/privacy.rs#L151)).
 
 ```mermaid
 sequenceDiagram
@@ -78,7 +79,7 @@ session's `session_requested` audit row (`privacy_stripped`):
 | `device_not_opted_in` | the owner has not allowed it | a disabled control with the reason |
 
 The device decides again at every "on", whatever the server sent
-([`set`, `privacy.rs:288`](../agents/roomlerd/src/privacy.rs#L288)):
+([`set`, `privacy.rs:501`](../agents/roomlerd/src/privacy.rs#L501)):
 
 | # | Gate | Refusal |
 |---|---|---|
@@ -106,6 +107,60 @@ viewed" border and badge ([`set_privacy`, `indicator/win.rs:344`](../agents/room
 - every half second it retakes the top, then puts the border, the badge and any consent panel
   back above it, so the person's way out and a consent question are never behind it.
 
+## What is recorded
+
+Two records, written by two parties, as for recordings and transfers
+([security-baseline.md](security-baseline.md) §4):
+
+| Record | Written by | Says | Where |
+|---|---|---|---|
+| `session_requested` in `remote_audit` | the server, from its own decision | whether `PRIVACY` was granted, and if not why (`privacy_stripped`) | P1a |
+| `privacy_activity` | the device, reporting (FR-99 P1d) | what it then did: each curtain up, each take-down and why, each "on" it refused | `rc:privacy.activity` ([`agent_socket.rs:170`](../crates/modules/remote/src/agent_socket.rs#L170)) |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant V as Viewer
+    participant A as roomlerd (the worker)
+    participant L as Ledger (privacy-curtains.json)
+    participant S as Server
+    V->>A: rc:privacy.set on
+    A->>L: note the session (before the curtain goes up)
+    A->>A: curtain up, out of capture
+    A->>S: rc:privacy.activity on
+    V->>A: rc:privacy.set off
+    A->>A: curtain down
+    A->>L: drop the session
+    A->>S: rc:privacy.activity off {controller}
+    Note over A,L: killed with a curtain up: the windows die with it,<br/>but nothing reaches the server
+    A->>L: the next process, at start: take what is left
+    A->>S: rc:privacy.activity off {worker_exit}, on its org's first connection
+    S->>S: kept only for a session of THIS device whose grant held PRIVACY
+```
+
+| `kind` | `reason` | When |
+|---|---|---|
+| `on` | — | the curtain went up, verified out of capture |
+| `off` | `controller` | the viewer turned it off |
+| `off` | `session_end` | the session ended (the channel closed, or the overlay dropped the session) |
+| `off` | `disabled_on_device` | the owner switched privacy mode off mid-session |
+| `off` | `worker_exit` | the process that drew it died with it up, reported by the next one to start ([`collect_leftovers`, `privacy.rs:373`](../agents/roomlerd/src/privacy.rs#L373)) |
+| `refused` | `disabled_on_device` · `unavailable` · `no_curtain` | the device's gates 2–4 above |
+
+- **The ledger** is a small file in the worker's own local data dir: SYSTEM's profile for a
+  service's worker, the person's for a per-user install. Each curtain is written there *before*
+  it goes up, so a process killed in between leaves an entry rather than a curtain with none
+  ([`Ledger`, `privacy.rs:265`](../agents/roomlerd/src/privacy.rs#L265)). A leftover is reported on
+  the connection of the org its session belonged to, because the server looks the session up within
+  that org.
+- **The server keeps a report only for a session of that device whose grant held `PRIVACY`**,
+  the live session first and the stored row after it ended. That is how a `worker_exit` from the
+  next process is checked. A reason that is not a short code (`a-z`, `0-9`, `_`) is dropped and
+  the row kept.
+- The trail is read at `GET /api/tenant/{tid}/privacy-activity/{agent_id}` under
+  `VIEW_REMOTE_AUDIT`, newest first. A removed device's trail still resolves. Rows expire after
+  90 days, like the audit beside them.
+
 ## Platforms
 
 | Platform | Curtain | Why |
@@ -130,8 +185,10 @@ viewed" border and badge ([`set_privacy`, `indicator/win.rs:344`](../agents/room
   session, move the pointer to the top edge of the screen and choose Disconnect." With P2's block
   it becomes Ctrl+Alt+Del (the operator's decision 4).
 - The notice is English only for now.
-- `privacy_on` / `privacy_off` audit rows are designed (spec §3c) but not written yet. What is
-  audited today is the server's strip, with its reason.
+- ⚠️ **`privacy_activity` is the device's claim.** A compromised host can stay silent, so an empty
+  trail is not proof that no curtain went up. The `PRIVACY` grant in `remote_audit` is what survives
+  it. A report queued as the connection dies is lost, and a `worker_exit` arrives only when the next
+  process starts: on a per-user install, at the person's next sign-in.
 
 ## Related
 

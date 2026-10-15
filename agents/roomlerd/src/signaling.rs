@@ -1520,6 +1520,9 @@ async fn connect_once(
     // rotation, say so again on this healthy socket: the copy sent on the
     // dying session can be lost (it was, in the second field run).
     drain_pending_rotation_report(&cfg.tenant_id, &outbound_tx);
+    // FR-99 P1d — the curtains the previous process died holding, reported as
+    // `worker_exit` on the first healthy connection of the org each belonged to.
+    crate::privacy::drain_leftovers(&cfg.tenant_id, &outbound_tx);
     // FR-90 — the primary enrollment's connection carries this device's Hive
     // state reports: point the supervisor at THIS one, which also replays
     // the latest state of every session a dropped connection may have lost.
@@ -3568,6 +3571,13 @@ async fn handle_server_msg(
                 controller_name: banner_name.clone(),
                 host: std::sync::Arc::new(indicator.clone()),
                 possible: crate::privacy::curtain_possible,
+                // P1d — reported on THIS connection: the session belongs to
+                // the org that asked, and the server looks it up there.
+                report: crate::privacy::Reporter {
+                    outbound: delegated.unwrap_or(outbound_tx).clone(),
+                    tenant_id: tenant_id.to_string(),
+                    ledger: crate::privacy::ledger(),
+                },
             });
 
             let answer_sdp = match peer.handle_offer(sdp).await {

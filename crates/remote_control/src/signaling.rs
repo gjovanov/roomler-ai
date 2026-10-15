@@ -526,6 +526,26 @@ pub enum ClientMsg {
         reason: Option<String>,
     },
 
+    /// FR-99 P1d — the device reports what happened to a session's privacy
+    /// curtain: up, down (and why), or a request it refused. The host's
+    /// CLAIM, kept apart from the server's DECISION (the `PRIVACY` grant in
+    /// `remote_audit`), as `rc:recording.activity` is.
+    ///
+    /// Fire-and-forget: an older server ignores the frame. ⚠️ `tenant_id` /
+    /// `agent_id` come from the authenticated WS, and the server records it
+    /// only for a session of THIS agent whose grant holds `PRIVACY`. A
+    /// `worker_exit` arrives after its session ended, from the next process to
+    /// start, so the stored session row decides then.
+    #[serde(rename = "rc:privacy.activity")]
+    PrivacyActivity {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        kind: crate::models::PrivacyActivityKind,
+        /// A reason code (`models::PrivacyActivityKind` lists them).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
     /// Device reports one thing that happened inside an SSH session (P8).
     ///
     /// Fire-and-forget: no reply, and the server drops it silently if the
@@ -1863,6 +1883,7 @@ impl ClientMsg {
             ClientMsg::SshRequest { .. } => "rc:ssh.request",
             ClientMsg::SshActivity { .. } => "rc:ssh.activity",
             ClientMsg::RecordingActivity { .. } => "rc:recording.activity",
+            ClientMsg::PrivacyActivity { .. } => "rc:privacy.activity",
             ClientMsg::SshGrantAck { .. } => "rc:ssh.grant_ack",
             ClientMsg::ConfigStatus { .. } => "rc:agent.config_status",
             ClientMsg::KeyRotated { .. } => "rc:agent.key_rotated",
@@ -1942,7 +1963,8 @@ impl ClientMsg {
             | ClientMsg::Ice { .. }
             | ClientMsg::Terminate { .. }
             | ClientMsg::SessionStats { .. }
-            | ClientMsg::RecordingActivity { .. } => Owner::Remote,
+            | ClientMsg::RecordingActivity { .. }
+            | ClientMsg::PrivacyActivity { .. } => Owner::Remote,
             ClientMsg::RelayProbeReport { .. }
             | ClientMsg::DerpTicketRequest { .. }
             | ClientMsg::SshRequest { .. }
@@ -2010,6 +2032,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:relay.probe_report", Owner::Network),
     ("rc:session.stats", Owner::Remote),
     ("rc:recording.activity", Owner::Remote),
+    ("rc:privacy.activity", Owner::Remote),
     ("rc:relay.derp_ticket_request", Owner::Network),
     ("rc:rpc.result", Owner::Fleet),
     ("rc:rpc.request", Owner::Fleet),
@@ -5992,6 +6015,51 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// FR-99 P1d — the privacy report's wire shape: the session id as raw hex,
+    /// the kind in snake case, and a reason only when there is one (an `on`
+    /// carries none).
+    #[test]
+    fn a_privacy_activity_report_keeps_its_wire_shape() {
+        use crate::models::PrivacyActivityKind;
+
+        let sid = ObjectId::parse_str("6ad0e0359836bb5de09f59f4").unwrap();
+        let m = ClientMsg::PrivacyActivity {
+            session_id: sid,
+            kind: PrivacyActivityKind::Off,
+            reason: Some("worker_exit".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&m).unwrap(),
+            serde_json::json!({
+                "t": "rc:privacy.activity",
+                "session_id": "6ad0e0359836bb5de09f59f4",
+                "kind": "off",
+                "reason": "worker_exit",
+            })
+        );
+        let on = serde_json::json!({
+            "t": "rc:privacy.activity",
+            "session_id": "6ad0e0359836bb5de09f59f4",
+            "kind": "on",
+        });
+        match serde_json::from_value::<ClientMsg>(on.clone()).unwrap() {
+            ClientMsg::PrivacyActivity {
+                session_id,
+                kind,
+                reason,
+            } => {
+                assert_eq!(
+                    (session_id, kind, reason),
+                    (sid, PrivacyActivityKind::On, None)
+                );
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let back =
+            serde_json::to_value(serde_json::from_value::<ClientMsg>(on.clone()).unwrap()).unwrap();
+        assert_eq!(back, on, "an absent reason stays absent");
     }
 
     #[test]

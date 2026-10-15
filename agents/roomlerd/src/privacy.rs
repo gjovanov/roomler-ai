@@ -32,17 +32,29 @@
 //! too, and the system UI the shell draws above every topmost window (the Start
 //! menu, notifications, Alt+Tab's thumbnails) still shows over it. Blocking
 //! local input is P2's `BlockInput`.
+//!
+//! **The device's account (P1d).** Every curtain up, every take-down with its
+//! reason (`controller`, `session_end`, `disabled_on_device`) and every refused
+//! "on" goes to the server as `rc:privacy.activity`, which keeps it in
+//! `privacy_activity` beside the grant. A process killed with a curtain up
+//! cannot report its end: the OS takes the windows down with it, so the curtain
+//! is gone, but nothing told the server. So each curtain is noted in a
+//! [`Ledger`] on disk while it is up, and the next process to start reports
+//! each one it finds as `off {worker_exit}` ([`collect_leftovers`],
+//! [`drain_leftovers`]).
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use bson::oid::ObjectId;
-use roomler_ai_remote_control::models::RpcCap;
+use roomler_ai_remote_control::models::{PrivacyActivityKind, RpcCap};
 use roomler_ai_remote_control::permissions::Permissions;
+use roomler_ai_remote_control::signaling::ClientMsg;
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
-use tracing::{info, warn};
+use tokio::sync::{mpsc, watch};
+use tracing::{debug, info, warn};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 
@@ -237,6 +249,189 @@ impl CurtainHost for crate::indicator::ViewerIndicator {
     }
 }
 
+// ── The device's account (P1d) ──────────────────────────────────────────────
+
+/// One curtain a process holds, as the [`Ledger`] keeps it: the session, and
+/// the org whose connection reports on it (a session belongs to the org that
+/// asked, and the server looks it up within that org).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Held {
+    pub session_id: String,
+    pub tenant_id: String,
+}
+
+/// The curtains this process holds, kept on disk while they are up, so that
+/// the next process can report the ones this one died holding.
+pub struct Ledger {
+    path: Option<PathBuf>,
+    /// One read-modify-write at a time: two sessions can change it at once.
+    lock: Mutex<()>,
+}
+
+impl Ledger {
+    pub fn at(path: PathBuf) -> Self {
+        Self {
+            path: Some(path),
+            lock: Mutex::new(()),
+        }
+    }
+
+    /// `privacy-curtains.json` in this process's own local data dir: SYSTEM's
+    /// profile for a service's worker, the person's for a per-user install, so
+    /// the next process of the same install finds it and nobody else writes
+    /// it.
+    fn default_location() -> Self {
+        Self {
+            path: roomler_node_core::appdirs::project_dirs()
+                .map(|p| p.data_local_dir().join("privacy-curtains.json")),
+            lock: Mutex::new(()),
+        }
+    }
+
+    fn read(&self) -> Vec<Held> {
+        let Some(path) = &self.path else {
+            return Vec::new();
+        };
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn write(&self, held: &[Held]) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let res = if held.is_empty() {
+            match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        } else {
+            // Written aside and renamed over, so a process killed mid-write
+            // leaves the old ledger or the new one, never half of one.
+            let tmp = path.with_extension("json.tmp");
+            path.parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&tmp, serde_json::to_vec(held).unwrap_or_default()))
+                .and_then(|()| std::fs::rename(&tmp, path))
+        };
+        if let Err(e) = res {
+            warn!(%e, path = %path.display(), "privacy: the curtain ledger could not be written");
+        }
+    }
+
+    fn add(&self, held: Held) {
+        let _l = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut all = self.read();
+        if !all.contains(&held) {
+            all.push(held);
+            self.write(&all);
+        }
+    }
+
+    fn remove(&self, session_id: &str) {
+        let _l = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut all = self.read();
+        let before = all.len();
+        all.retain(|h| h.session_id != session_id);
+        if all.len() != before {
+            self.write(&all);
+        }
+    }
+
+    /// What a previous process left: read, then cleared. Called once, at
+    /// start-up, before any session of this process can put a curtain up.
+    pub fn take_leftovers(&self) -> Vec<Held> {
+        let _l = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let all = self.read();
+        if !all.is_empty() {
+            self.write(&[]);
+        }
+        all
+    }
+}
+
+/// The process's ledger.
+pub fn ledger() -> Arc<Ledger> {
+    static LEDGER: OnceLock<Arc<Ledger>> = OnceLock::new();
+    LEDGER
+        .get_or_init(|| Arc::new(Ledger::default_location()))
+        .clone()
+}
+
+/// The curtains a previous process died holding, waiting for their org's
+/// connection.
+fn leftovers() -> &'static Mutex<Vec<Held>> {
+    static LEFTOVERS: OnceLock<Mutex<Vec<Held>>> = OnceLock::new();
+    LEFTOVERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// At start-up, before the first connection: take what a previous process left
+/// in the ledger. Each is reported as `off {worker_exit}` once its org's
+/// connection is up ([`drain_leftovers`]).
+pub fn collect_leftovers() {
+    let found = ledger().take_leftovers();
+    if !found.is_empty() {
+        info!(
+            count = found.len(),
+            "privacy: the previous process ended with curtains up; reporting them as worker_exit"
+        );
+        leftovers()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend(found);
+    }
+}
+
+/// A connection of the org `tenant_id` is up: report that org's leftovers on
+/// it. One the queue refuses waits for the next connection.
+pub fn drain_leftovers(tenant_id: &str, outbound: &mpsc::Sender<ClientMsg>) {
+    let mut all = leftovers().lock().unwrap_or_else(|p| p.into_inner());
+    drain_into(&mut all, tenant_id, outbound);
+}
+
+fn drain_into(all: &mut Vec<Held>, tenant_id: &str, outbound: &mpsc::Sender<ClientMsg>) {
+    all.retain(|h| {
+        if h.tenant_id != tenant_id {
+            return true;
+        }
+        let Ok(session_id) = ObjectId::parse_str(&h.session_id) else {
+            return false;
+        };
+        let msg = ClientMsg::PrivacyActivity {
+            session_id,
+            kind: PrivacyActivityKind::Off,
+            reason: Some("worker_exit".into()),
+        };
+        outbound.try_send(msg).is_err()
+    });
+}
+
+/// Where a session's privacy activity goes: the server, on the connection of
+/// the org the session belongs to, and the ledger while a curtain is up.
+#[derive(Clone)]
+pub struct Reporter {
+    pub outbound: mpsc::Sender<ClientMsg>,
+    pub tenant_id: String,
+    pub ledger: Arc<Ledger>,
+}
+
+impl Reporter {
+    fn send(&self, session_id: ObjectId, kind: PrivacyActivityKind, reason: Option<&'static str>) {
+        let msg = ClientMsg::PrivacyActivity {
+            session_id,
+            kind,
+            reason: reason.map(str::to_string),
+        };
+        // Never blocks a session: a full queue means the connection is already
+        // struggling, and losing an audit line beats stalling the curtain.
+        if self.outbound.try_send(msg).is_err() {
+            debug!(session = %session_id, "privacy activity dropped (queue full or closed)");
+        }
+    }
+}
+
 /// What the `privacy` channel of one session needs. Set by the signalling loop
 /// before the answer, so a channel can never open without it.
 #[derive(Clone)]
@@ -248,6 +443,8 @@ pub struct PrivacyCtx {
     /// field so the channel's own test can run the whole path on a runner
     /// where no curtain is possible.
     pub possible: fn() -> bool,
+    /// P1d — the session's account to the server, and the ledger.
+    pub report: Reporter,
 }
 
 /// One session's privacy mode: its gates and whether its curtain is up. The
@@ -276,12 +473,28 @@ impl Session {
         self.on.load(Ordering::Acquire)
     }
 
-    fn take_down(&self, why: &str) {
+    /// Take the curtain down, and say why: `controller`, `session_end` or
+    /// `disabled_on_device`, the reason codes the server keeps.
+    fn take_down(&self, reason: &'static str) {
         self.ctx
             .host
             .set_curtain(self.ctx.session_id, false, &self.ctx.controller_name);
         self.on.store(false, Ordering::Release);
-        info!(session = %self.ctx.session_id, why, "privacy: curtain down");
+        self.ctx.report.ledger.remove(&self.ctx.session_id.to_hex());
+        self.ctx
+            .report
+            .send(self.ctx.session_id, PrivacyActivityKind::Off, Some(reason));
+        info!(session = %self.ctx.session_id, reason, "privacy: curtain down");
+    }
+
+    /// Refuse an "on" in the device's words, and report it.
+    fn refuse(&self, id: &str, reason: &'static str) -> StateMsg {
+        self.ctx.report.send(
+            self.ctx.session_id,
+            PrivacyActivityKind::Refused,
+            Some(reason),
+        );
+        StateMsg::new(id, self.is_on(), Some(reason))
     }
 
     /// A controller's `rc:privacy.set`, against the gates as they are now.
@@ -294,23 +507,35 @@ impl Session {
             return StateMsg::new(id, false, None);
         }
         if !allowed {
-            return StateMsg::new(id, self.is_on(), Some("disabled_on_device"));
+            return self.refuse(id, "disabled_on_device");
         }
         if !possible {
-            return StateMsg::new(id, self.is_on(), Some("unavailable"));
+            return self.refuse(id, "unavailable");
         }
         if self.is_on() {
             return StateMsg::new(id, true, None);
         }
+        // Noted BEFORE it goes up: a process that dies between the two then
+        // leaves an entry for a curtain that may never have shown, never a
+        // curtain with no entry.
+        let held = Held {
+            session_id: self.ctx.session_id.to_hex(),
+            tenant_id: self.ctx.report.tenant_id.clone(),
+        };
+        self.ctx.report.ledger.add(held);
         if !self
             .ctx
             .host
             .set_curtain(self.ctx.session_id, true, &self.ctx.controller_name)
         {
+            self.ctx.report.ledger.remove(&self.ctx.session_id.to_hex());
             warn!(session = %self.ctx.session_id, "privacy: the overlay could not put a curtain up");
-            return StateMsg::new(id, false, Some("no_curtain"));
+            return self.refuse(id, "no_curtain");
         }
         self.on.store(true, Ordering::Release);
+        self.ctx
+            .report
+            .send(self.ctx.session_id, PrivacyActivityKind::On, None);
         info!(session = %self.ctx.session_id, "privacy: curtain up");
         StateMsg::new(id, true, None)
     }
@@ -322,7 +547,7 @@ impl Session {
         if !self.is_on() {
             return None;
         }
-        self.take_down("the owner switched it off");
+        self.take_down("disabled_on_device");
         Some(StateMsg::new("", false, Some("disabled_on_device")))
     }
 
@@ -330,7 +555,7 @@ impl Session {
     pub fn end(&self) {
         let _t = self.transition.lock().unwrap_or_else(|p| p.into_inner());
         if self.is_on() {
-            self.take_down("session ended");
+            self.take_down("session_end");
         }
     }
 }
@@ -525,6 +750,9 @@ mod tests {
         }
     }
 
+    /// A session whose reports go nowhere: no ledger file, and a queue
+    /// nobody reads (a report that cannot be queued is dropped, as on a dying
+    /// connection).
     fn session(up_ok: bool) -> (Session, Arc<Recorder>) {
         let host = Arc::new(Recorder {
             calls: Mutex::new(Vec::new()),
@@ -535,8 +763,196 @@ mod tests {
             controller_name: "Alex".into(),
             host: host.clone(),
             possible: || true,
+            report: Reporter {
+                outbound: mpsc::channel(1).0,
+                tenant_id: ObjectId::new().to_hex(),
+                ledger: Arc::new(Ledger {
+                    path: None,
+                    lock: Mutex::new(()),
+                }),
+            },
         });
         (s, host)
+    }
+
+    /// P1d — a session whose reports and ledger can be read back.
+    struct Reporting {
+        s: Session,
+        reports: mpsc::Receiver<ClientMsg>,
+        ledger: Arc<Ledger>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn reporting(up_ok: bool) -> Reporting {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(Ledger::at(dir.path().join("privacy-curtains.json")));
+        let (outbound, reports) = mpsc::channel(32);
+        let s = Session::new(PrivacyCtx {
+            session_id: ObjectId::new(),
+            controller_name: "Alex".into(),
+            host: Arc::new(Recorder {
+                calls: Mutex::new(Vec::new()),
+                up_ok,
+            }),
+            possible: || true,
+            report: Reporter {
+                outbound,
+                tenant_id: "aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                ledger: ledger.clone(),
+            },
+        });
+        Reporting {
+            s,
+            reports,
+            ledger,
+            _dir: dir,
+        }
+    }
+
+    /// Every report queued so far, as (kind, reason).
+    fn drained(rx: &mut mpsc::Receiver<ClientMsg>) -> Vec<(PrivacyActivityKind, Option<String>)> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                ClientMsg::PrivacyActivity { kind, reason, .. } => out.push((kind, reason)),
+                other => panic!("not a privacy report: {other:?}"),
+            }
+        }
+        out
+    }
+
+    /// P1d — the device reports every curtain it put up, every take-down with
+    /// its reason, and every "on" it refused. A second "on" while up, and an
+    /// "off" with nothing up, change nothing and say nothing.
+    #[test]
+    fn the_device_reports_what_it_did_with_the_curtain() {
+        use PrivacyActivityKind::*;
+        let mut r = reporting(true);
+        let s = &r.s;
+        s.set("1", false, true, true);
+        assert!(s.set("2", true, true, true).on);
+        assert!(s.set("3", true, true, true).on);
+        s.set("4", false, true, true);
+        s.set("5", true, false, true);
+        s.set("6", true, true, false);
+        assert!(s.set("7", true, true, true).on);
+        s.owner_switched_off();
+        assert!(s.set("8", true, true, true).on);
+        s.end();
+        s.end();
+        let code = |c: &str| Some(c.to_string());
+        assert_eq!(
+            drained(&mut r.reports),
+            vec![
+                (On, None),
+                (Off, code("controller")),
+                (Refused, code("disabled_on_device")),
+                (Refused, code("unavailable")),
+                (On, None),
+                (Off, code("disabled_on_device")),
+                (On, None),
+                (Off, code("session_end")),
+            ]
+        );
+    }
+
+    /// A refusal from the overlay is reported in its own words.
+    #[test]
+    fn a_failing_overlay_is_reported_as_no_curtain() {
+        let mut r = reporting(false);
+        assert!(!r.s.set("1", true, true, true).on);
+        assert_eq!(
+            drained(&mut r.reports),
+            vec![(PrivacyActivityKind::Refused, Some("no_curtain".into()))]
+        );
+        assert!(
+            r.ledger.read().is_empty(),
+            "a curtain that never went up is not held"
+        );
+    }
+
+    /// A curtain is in the ledger exactly while it is up, under its session
+    /// and its org.
+    #[test]
+    fn a_curtain_is_in_the_ledger_only_while_it_is_up() {
+        let r = reporting(true);
+        assert!(r.ledger.read().is_empty());
+        assert!(r.s.set("1", true, true, true).on);
+        assert_eq!(
+            r.ledger.read(),
+            vec![Held {
+                session_id: r.s.ctx.session_id.to_hex(),
+                tenant_id: "aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            }]
+        );
+        r.s.set("2", false, true, true);
+        assert!(r.ledger.read().is_empty());
+        assert!(r.s.set("3", true, true, true).on);
+        r.s.end();
+        assert!(
+            r.ledger.read().is_empty(),
+            "the session's end clears it too"
+        );
+    }
+
+    /// The next process reports each curtain it finds as `off {worker_exit}`,
+    /// on the connection of the org the session belonged to, and clears the
+    /// file. One the queue refuses waits for the next connection.
+    #[test]
+    fn the_next_process_reports_each_curtain_left_as_worker_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("privacy-curtains.json");
+        let (org_a, org_b) = ("aaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbb");
+        let (s1, s2) = (ObjectId::new(), ObjectId::new());
+        {
+            // The process that died.
+            let before = Ledger::at(path.clone());
+            before.add(Held {
+                session_id: s1.to_hex(),
+                tenant_id: org_a.into(),
+            });
+            before.add(Held {
+                session_id: s2.to_hex(),
+                tenant_id: org_b.into(),
+            });
+        }
+        let after = Ledger::at(path.clone());
+        let mut left = after.take_leftovers();
+        assert_eq!(left.len(), 2);
+        assert!(!path.exists(), "taken once: the file is gone");
+        assert!(after.take_leftovers().is_empty());
+
+        let (tx, mut rx) = mpsc::channel(8);
+        drain_into(&mut left, org_a, &tx);
+        match rx.try_recv().unwrap() {
+            ClientMsg::PrivacyActivity {
+                session_id,
+                kind,
+                reason,
+            } => {
+                assert_eq!(session_id, s1);
+                assert_eq!(kind, PrivacyActivityKind::Off);
+                assert_eq!(reason.as_deref(), Some("worker_exit"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "org B's session is not org A's to report"
+        );
+        assert_eq!(left.len(), 1);
+
+        // A full queue keeps it for the next connection.
+        let (full, _keep) = mpsc::channel(1);
+        full.try_send(ClientMsg::Ping { id: 0 }).unwrap();
+        drain_into(&mut left, org_b, &full);
+        assert_eq!(left.len(), 1, "refused by the queue, so still waiting");
+        drain_into(&mut left, org_b, &tx);
+        assert!(left.is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::PrivacyActivity { session_id, .. }) if session_id == s2
+        ));
     }
 
     /// Each gate refuses in its own words, and none of them touches the
