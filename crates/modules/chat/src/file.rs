@@ -308,9 +308,10 @@ pub async fn upload(
     {
         let tenant = state.tenants.base.find_by_id(tid).await?;
         let current = state.files.sum_storage_for_tenant(tid).await?;
-        if let Err(d) = quota::check_delta(
-            tenant.plan.clone(),
-            tenant.settings.plan_enforcement,
+        // FR-102 P4 — through core, which also counts the collision per org.
+        if let Err(d) = roomler_core::quota::check_delta(
+            &state,
+            &tenant,
             quota::Limit::StorageBytes,
             current,
             data.2.len() as u64,
@@ -511,9 +512,10 @@ pub async fn upload_room(
     {
         let tenant = state.tenants.base.find_by_id(tid).await?;
         let current = state.files.sum_storage_for_tenant(tid).await?;
-        if let Err(d) = quota::check_delta(
-            tenant.plan.clone(),
-            tenant.settings.plan_enforcement,
+        // FR-102 P4 — through core, which also counts the collision per org.
+        if let Err(d) = roomler_core::quota::check_delta(
+            &state,
+            &tenant,
             quota::Limit::StorageBytes,
             current,
             data.2.len() as u64,

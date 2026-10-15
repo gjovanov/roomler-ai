@@ -39,6 +39,10 @@ pub struct StripeEvent {
     #[serde(rename = "type")]
     pub event_type: String,
     pub data: StripeEventData,
+    /// When Stripe created the event (Unix seconds) — FR-102 P4's fallback
+    /// time for a billing row whose object names none.
+    #[serde(default)]
+    pub created: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +68,37 @@ pub enum StripeError {
     InvalidSignature,
     #[error("MongoDB error: {0}")]
     Mongo(#[from] mongodb::error::Error),
+    /// FR-102 P4 — a write of this server's own failed (`billing_events`,
+    /// the backfill's marker): a 500, never Stripe's fault.
+    #[error("storage error: {0}")]
+    Storage(String),
+}
+
+// ---- FR-102 P4: the operator's backfill ------------------------------------
+
+/// Stripe's API base — the backfill reads its invoice list; a test passes a
+/// fake server's.
+pub const STRIPE_API_BASE: &str = "https://api.stripe.com";
+/// The most pages (of 100 invoices) one backfill reads: a bound, not a page.
+pub const BACKFILL_MAX_PAGES: u32 = 100;
+
+/// What a backfill did — counts and months, never a customer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct BackfillReport {
+    pub pages: u32,
+    /// Paid invoices read.
+    pub invoices: u32,
+    /// Recorded now.
+    pub recorded: u32,
+    /// Already on record (the webhook, or an earlier backfill).
+    pub already: u32,
+    /// Naming no org on this server — not recorded.
+    pub no_org: u32,
+    /// More invoices than [`BACKFILL_MAX_PAGES`] pages hold.
+    pub truncated: bool,
+    /// The months (`YYYY-MM`) whose billed figures the recorded invoices
+    /// touch — the months a refreeze must rewrite.
+    pub months: Vec<String>,
 }
 
 // ---- Service -------------------------------------------------------------
@@ -159,6 +194,7 @@ impl StripeService {
                 .await?;
         }
 
+        let tenant_hex = tenant_id.to_hex();
         let params = [
             ("customer", customer_id.as_str()),
             ("mode", "subscription"),
@@ -166,8 +202,13 @@ impl StripeService {
             ("line_items[0][quantity]", "1"),
             ("success_url", success_url),
             ("cancel_url", cancel_url),
-            ("metadata[tenant_id]", &tenant_id.to_hex()),
+            ("metadata[tenant_id]", &tenant_hex),
             ("metadata[plan]", plan),
+            // FR-102 P4 — the SUBSCRIPTION carries the org too, so every
+            // later subscription and invoice event names it directly (the
+            // session's metadata stays on the session).
+            ("subscription_data[metadata][tenant_id]", &tenant_hex),
+            ("subscription_data[metadata][plan]", plan),
         ];
 
         let resp: serde_json::Value = self
@@ -343,6 +384,158 @@ impl StripeService {
         ]
     }
 
+    // ---- FR-102 P4: the operator's one-off backfill -----------------------
+
+    /// Read Stripe's paid invoices (created since `since_unix`, newest
+    /// first, 100 a page, at most [`BACKFILL_MAX_PAGES`] pages) into
+    /// `billing_events` as `invoice_paid` rows with `source: backfill`. An
+    /// invoice the webhook already recorded is left as it was — the two meet
+    /// on `(kind, stripe_id)` — so running it twice records nothing new. An
+    /// invoice whose customer is no org on this server is counted, not
+    /// recorded. Reads only; it never writes to Stripe.
+    pub async fn backfill_paid_invoices(
+        &self,
+        db: &mongodb::Database,
+        api_base: &str,
+        since_unix: Option<i64>,
+        now: DateTime,
+    ) -> Result<BackfillReport, StripeError> {
+        use crate::dao::billing_event::{BillingEventDao, BillingKind, BillingSource, Recorded};
+        if self.settings.secret_key.trim().is_empty() {
+            return Err(StripeError::ApiError(
+                "no Stripe secret key configured (ROOMLER__STRIPE__SECRET_KEY)".into(),
+            ));
+        }
+        let dao = BillingEventDao::new(db);
+        let mut report = BackfillReport::default();
+        let mut months: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut starting_after: Option<String> = None;
+        loop {
+            if report.pages >= BACKFILL_MAX_PAGES {
+                report.truncated = true;
+                break;
+            }
+            let mut query: Vec<(&str, String)> =
+                vec![("status", "paid".into()), ("limit", "100".into())];
+            if let Some(since) = since_unix {
+                query.push(("created[gte]", since.to_string()));
+            }
+            if let Some(after) = &starting_after {
+                query.push(("starting_after", after.clone()));
+            }
+            let resp: serde_json::Value = self
+                .client
+                .get(format!("{}/v1/invoices", api_base.trim_end_matches('/')))
+                .basic_auth(&self.settings.secret_key, None::<&str>)
+                .query(&query)
+                .timeout(std::time::Duration::from_secs(20))
+                .send()
+                .await
+                .map_err(|e| StripeError::ApiError(e.without_url().to_string()))?
+                .json()
+                .await
+                .map_err(|e| StripeError::ApiError(e.without_url().to_string()))?;
+            if let Some(err) = resp.get("error") {
+                return Err(StripeError::ApiError(
+                    err["message"]
+                        .as_str()
+                        .unwrap_or("Unknown Stripe error")
+                        .to_string(),
+                ));
+            }
+            report.pages += 1;
+            let invoices = resp["data"].as_array().cloned().unwrap_or_default();
+            for inv in &invoices {
+                report.invoices += 1;
+                let Some(mut parsed) = crate::billing::parse(
+                    BillingKind::InvoicePaid,
+                    inv,
+                    None,
+                    inv["created"].as_i64(),
+                    &self.settings.price_pro,
+                    &self.settings.price_business,
+                    now,
+                ) else {
+                    continue;
+                };
+                parsed.row.source = BillingSource::Backfill;
+                let Some(tenant) = self.tenant_for(db, &parsed).await? else {
+                    report.no_org += 1;
+                    continue;
+                };
+                let row = parsed.with_tenant(tenant);
+                match dao
+                    .record(&row)
+                    .await
+                    .map_err(|e| StripeError::Storage(format!("billing_events: {e}")))?
+                {
+                    Recorded::Created => {
+                        report.recorded += 1;
+                        months.insert(crate::billing::month_of(row.ts.timestamp_millis()));
+                        if let (Some(s), Some(e)) = (row.period_start, row.period_end) {
+                            let mut t = s.timestamp_millis();
+                            while t < e.timestamp_millis() {
+                                let label = crate::billing::month_of(t);
+                                let Some((_, end)) = crate::billing::month_bounds(&label) else {
+                                    break;
+                                };
+                                months.insert(label);
+                                t = end;
+                            }
+                        }
+                    }
+                    Recorded::Duplicate => report.already += 1,
+                }
+            }
+            if resp["has_more"].as_bool() == Some(true) {
+                starting_after = invoices
+                    .last()
+                    .and_then(|i| i["id"].as_str())
+                    .map(str::to_string);
+                if starting_after.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        report.months = months.into_iter().collect();
+        // The marker the views read (`billing::last_backfill`): billed
+        // figures now include Stripe's history, not only what the webhook
+        // delivered since it was wired.
+        {
+            use crate::dao::growth::{BILLING_BACKFILL_SOURCE, GrowthDao, PulledDay};
+            let day: String = now
+                .try_to_rfc3339_string()
+                .unwrap_or_default()
+                .chars()
+                .take(10)
+                .collect();
+            GrowthDao::new(db)
+                .record_pull_ok(
+                    BILLING_BACKFILL_SOURCE,
+                    &day,
+                    PulledDay {
+                        rows: report.recorded,
+                        missing_goal: None,
+                        truncated: report.truncated,
+                    },
+                    now,
+                )
+                .await
+                .map_err(|e| StripeError::Storage(format!("growth_pulls: {e}")))?;
+        }
+        info!(
+            pages = report.pages,
+            invoices = report.invoices,
+            recorded = report.recorded,
+            already = report.already,
+            no_org = report.no_org,
+            "stripe billing backfill"
+        );
+        Ok(report)
+    }
+
     // ---- Webhook processing ----------------------------------------------
 
     /// S5 hardening — replayed signatures older (or newer) than this are
@@ -454,7 +647,25 @@ impl StripeService {
         }
     }
 
-    /// Handle a verified webhook event, updating tenant billing state.
+    /// FR-102 P4 — a processing failure must not leave the event marked as
+    /// seen, or Stripe's retry would be skipped and the event lost: the
+    /// marker is removed so the retry processes it again (every write it
+    /// makes is idempotent). Best-effort — a failed removal is logged.
+    async fn forget_event(&self, db: &mongodb::Database, event_id: &str) {
+        if event_id.is_empty() {
+            return;
+        }
+        if let Err(e) = db
+            .collection::<bson::Document>("stripe_events")
+            .delete_one(doc! { "_id": event_id })
+            .await
+        {
+            warn!(event_id, error = %e, "could not un-mark a failed Stripe event");
+        }
+    }
+
+    /// Handle a verified webhook event, updating tenant billing state and
+    /// (FR-102 P4) recording the six billing kinds in `billing_events`.
     pub async fn handle_webhook_event(
         &self,
         db: &mongodb::Database,
@@ -463,7 +674,102 @@ impl StripeService {
         if !self.first_time_seeing(db, &event.id).await {
             return Ok(());
         }
+        match self.process(db, event).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.forget_event(db, &event.id).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// The org a billing object belongs to: the `tenant_id` the checkout
+    /// stamped on the subscription's metadata (when that org exists), else
+    /// the org whose `billing.customer_id` / `billing.subscription_id` it
+    /// names. `None` for a customer this server never checked out.
+    async fn tenant_for(
+        &self,
+        db: &mongodb::Database,
+        parsed: &crate::billing::Parsed,
+    ) -> Result<Option<ObjectId>, StripeError> {
+        let tenants = db.collection::<bson::Document>(Tenant::COLLECTION);
+        let id_of = |d: Option<bson::Document>| d.and_then(|d| d.get_object_id("_id").ok());
+        if let Some(t) = parsed.metadata_tenant
+            && let Some(id) = id_of(tenants.find_one(doc! { "_id": t }).await?)
+        {
+            return Ok(Some(id));
+        }
+        if let Some(c) = &parsed.customer
+            && let Some(id) = id_of(tenants.find_one(doc! { "billing.customer_id": c }).await?)
+        {
+            return Ok(Some(id));
+        }
+        if let Some(s) = &parsed.subscription
+            && let Some(id) = id_of(
+                tenants
+                    .find_one(doc! { "billing.subscription_id": s })
+                    .await?,
+            )
+        {
+            return Ok(Some(id));
+        }
+        Ok(None)
+    }
+
+    /// FR-102 P4 — record one of the six billing kinds. An object whose org
+    /// cannot be found is logged (ids only) and skipped: a row with no org
+    /// would count revenue nobody can be credited with.
+    async fn record_billing(
+        &self,
+        db: &mongodb::Database,
+        kind: crate::dao::billing_event::BillingKind,
+        event: &StripeEvent,
+    ) -> Result<(), StripeError> {
+        use crate::dao::billing_event::BillingEventDao;
+        let Some(parsed) = crate::billing::parse(
+            kind,
+            &event.data.object,
+            Some(&event.id),
+            event.created,
+            &self.settings.price_pro,
+            &self.settings.price_business,
+            DateTime::now(),
+        ) else {
+            warn!(event_id = %event.id, kind = kind.as_str(), "billing event without an object id — not recorded");
+            return Ok(());
+        };
+        let Some(tenant) = self.tenant_for(db, &parsed).await? else {
+            warn!(
+                event_id = %event.id, kind = kind.as_str(), stripe_id = %parsed.row.stripe_id,
+                "billing event names no org on this server — not recorded"
+            );
+            return Ok(());
+        };
+        let row = parsed.with_tenant(tenant);
+        let recorded = BillingEventDao::new(db)
+            .record(&row)
+            .await
+            .map_err(|e| StripeError::Storage(format!("billing_events: {e}")))?;
+        info!(
+            tenant_id = %tenant, kind = kind.as_str(), stripe_id = %row.stripe_id,
+            amount_cents = ?row.amount_cents, recorded = ?recorded,
+            "billing event"
+        );
+        Ok(())
+    }
+
+    async fn process(
+        &self,
+        db: &mongodb::Database,
+        event: &StripeEvent,
+    ) -> Result<(), StripeError> {
         let obj = &event.data.object;
+
+        // FR-102 P4 — the six billing kinds land in `billing_events` first;
+        // the tenant-state updates below are unchanged.
+        if let Some(kind) = crate::billing::kind_of(&event.event_type) {
+            self.record_billing(db, kind, event).await?;
+        }
 
         match event.event_type.as_str() {
             "checkout.session.completed" => {
@@ -535,7 +841,9 @@ impl StripeService {
                 let subscription_id = obj["id"].as_str().unwrap_or_default();
                 let status = obj["status"].as_str().unwrap_or_default();
                 let cancel_at_period_end = obj["cancel_at_period_end"].as_bool().unwrap_or(false);
-                let current_period_end = obj["current_period_end"].as_i64();
+                // FR-102 P4 — the 2025-03-31 API moved the period onto the
+                // items; read either.
+                let current_period_end = crate::billing::subscription_period(obj).1;
 
                 let sub_status = match status {
                     "active" => SubscriptionStatus::Active,
