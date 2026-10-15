@@ -3219,7 +3219,7 @@ async fn handle_server_msg(
                     .filter(|l| !l.is_empty())
                     .collect::<Vec<_>>()
                     .join("\n");
-                let native = indicator.show_prompt(crate::indicator::PromptView {
+                let view = crate::indicator::PromptView {
                     session_hex: session_hex.clone(),
                     title: "Remote control request".into(),
                     lead: format!("{controller_name} is requesting to control this device."),
@@ -3227,8 +3227,9 @@ async fn handle_server_msg(
                     permissions: permissions.wire_names(),
                     org: asking_org.clone().unwrap_or_default(),
                     expires_at: std::time::Instant::now() + host_window,
-                });
-                let prompt = crate::consent::PendingPrompt {
+                };
+                let native = indicator.show_prompt(view.clone());
+                let mut prompt = crate::consent::PendingPrompt {
                     kind: crate::consent::PromptKind::RemoteControl,
                     asked_by: &controller_name,
                     permissions: permissions.wire_names(),
@@ -3253,6 +3254,7 @@ async fn handle_server_msg(
                     timeout: host_window,
                 };
 
+                let mut marker = true;
                 if let Err(e) = consent_broker.write_prompt(&session_hex, &prompt) {
                     // Only fatal to the SURFACE when the companion was the
                     // plan: with a native panel already up, a human can still
@@ -3261,9 +3263,11 @@ async fn handle_server_msg(
                     if !native {
                         have_surface = false;
                     }
+                    marker = false;
                     tracing::warn!(session = %session_hex, %e, native, "could not write the .pending consent marker");
                 }
 
+                let mut notified = false;
                 if !native {
                     // FR-27 — the marker only helps if something is READING it.
                     // Nothing used to start the companion, so a device set to
@@ -3286,9 +3290,26 @@ async fn handle_server_msg(
                     if !companion_up {
                         have_surface = false;
                     }
+                    // FR-93 P6f — the last on-screen surface: a desktop
+                    // notification with Approve and Deny, where the companion
+                    // cannot show the question (none installed: a system
+                    // daemon on Fedora, openSUSE, Arch, aarch64; or no marker
+                    // for it to read).
+                    if !(companion_up && marker) {
+                        notified = indicator.show_notification_prompt(view).await;
+                    }
+                    if notified {
+                        have_surface = true;
+                        if marker {
+                            prompt.surface = crate::consent::PromptSurface::Notification;
+                            if let Err(e) = consent_broker.write_prompt(&session_hex, &prompt) {
+                                tracing::warn!(session = %session_hex, %e, "could not mark the consent prompt as shown by a notification");
+                            }
+                        }
+                    }
                 }
                 info!(
-                    session = %session_hex, native, have_surface,
+                    session = %session_hex, native, notified, have_surface,
                     "consent prompt surface"
                 );
                 // FR-34 — a LOCKED host has the panel on the (currently
@@ -4487,7 +4508,7 @@ async fn handle_server_msg(
                 // — and with the command in front of whoever is deciding,
                 // because "approve SSH-ish access" and "approve `rm -rf`
                 // running as SYSTEM" are not the same question.
-                let native = indicator.show_prompt(crate::indicator::PromptView {
+                let view = crate::indicator::PromptView {
                     session_hex: request_id.clone(),
                     title: "Command execution request".into(),
                     lead: format!("{caller} wants to run a command on this device."),
@@ -4495,7 +4516,8 @@ async fn handle_server_msg(
                     permissions: String::new(),
                     org: org.clone(),
                     expires_at: std::time::Instant::now() + crate::consent::DEFAULT_PROMPT_TIMEOUT,
-                });
+                };
+                let native = indicator.show_prompt(view.clone());
                 let prompt = crate::consent::PendingPrompt {
                     kind: crate::consent::PromptKind::Exec,
                     asked_by: &caller,
@@ -4513,7 +4535,19 @@ async fn handle_server_msg(
                     tracing::warn!(%request_id, %e, native, "could not write the .pending consent marker for this command");
                 }
                 if !native {
-                    tokio::spawn(crate::companion::ensure_running());
+                    // FR-93 P6f — and where the companion cannot show it, a
+                    // desktop notification. In the background, as the
+                    // companion's start always was here: the command waits on
+                    // the broker below, not on its surfaces. The marker is not
+                    // rewritten for it, because by the time the notification
+                    // is up the question may be over, and a marker written
+                    // then would outlive it.
+                    let ind = indicator.clone();
+                    tokio::spawn(async move {
+                        if !crate::companion::ensure_running().await {
+                            ind.show_notification_prompt(view).await;
+                        }
+                    });
                 }
             }
 
