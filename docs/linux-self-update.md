@@ -2,8 +2,9 @@
 
 **Status:** shipped for **system** installs: the tarball path landed in #462 (2026-08-15), after
 [#456](https://github.com/gjovanov/roomler-ai/pull/456) (the arch-aware picker and the aarch64 `.deb`). A
-**per-user** install cannot install its own update, whichever format. Its root update half is
-[FR-96](fr/FR-96-per-user-linux-installs-update-themselves.md) (#2052), [below](#the-update-half-of-a-per-user-install-fr-96).
+**per-user** daemon cannot install its own update, whichever format, so a root update half installs for
+it: [FR-96](fr/FR-96-per-user-linux-installs-update-themselves.md) (#2052),
+[below](#the-update-half-of-a-per-user-install-fr-96). `install.sh` enables it for a per-user install (P3).
 
 ## The problem
 
@@ -395,6 +396,41 @@ deleted image. The run went:
   and the server reported the new version
   ([FR-96 §8](fr/FR-96-per-user-linux-installs-update-themselves.md#8-field-verification-log)).
 
+### The installers turn it on (P3)
+
+`install.sh` decides per install, from what the release's binary says it can
+do (`roomlerd update-helper --capabilities`: `wake-file`, `step-aside`,
+`restart-on-replace`):
+
+| install | the helper | the running daemon |
+|---|---|---|
+| per-user, the binary lists `step-aside` | enabled, BEFORE the daemon starts | a fresh install starts it; a re-run restarts it only when nothing else will (below) |
+| per-user, it does not | left off, with a NOTE | as before |
+| `--system` | turned off, if a per-user install left it on | the root daemon installs its own updates |
+
+A re-run finds the daemon already running. It decided at its start who
+installs its updates, and P2b restarts it only onto **another** version. So
+the script compares the running image (`/proc/<pid>/exe`) with the installed
+one, and reads the helper's state before and after by the daemon's own test
+(the same four enable links):
+
+| the running daemon | the helper | a re-run |
+|---|---|---|
+| the installed version | unchanged | leaves it |
+| the installed version | just turned on | restarts it, so that it decides again |
+| another version, lists `restart-on-replace` | either | leaves it: P2b restarts it once idle |
+| another version, older | either | restarts it (anyone connected drops for a few seconds) |
+| any, while the installed binary does not answer `--version` | either | leaves it, with a WARNING |
+
+- ⚠️ **A capability, not a version.** The script ships with a server
+  promote and the daemon with an agent release, and the two need not arrive
+  in order. Enabling the helper beside a daemon that still installs its own
+  updates would put two updaters on one host.
+- A non-root `roomlerd self-update` wakes the helper where it owns updates,
+  through the daemon's own decision, so the CLI and the daemon never disagree.
+- `README.Debian` does the same by hand: enable the helper before starting
+  the user unit, and leave it off with the system unit.
+
 The phases:
 
 | phase | ships |
@@ -402,7 +438,7 @@ The phases:
 | **P1** | the helper on Linux, and the three units in both packages, disabled |
 | **P2a** | the per-user daemon wakes the helper instead of installing, and its unit may write the wake file |
 | **P2b** | the per-user daemon onto its replaced binary once idle, whatever replaced it |
-| **P3** | `install.sh` enables the units for a per-user install |
+| **P3** | `install.sh` enables the units for a per-user install, and turns them off for `--system`; a non-root `self-update` wakes the helper |
 
 Status and evidence: [FR-96](fr/FR-96-per-user-linux-installs-update-themselves.md).
 
