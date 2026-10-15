@@ -1289,6 +1289,9 @@ FR's field-verification log ([FR-102 §8](fr/FR-102-growth-observability.md#8-fi
 | Each enroll path records its `install` on the agent row (AC9) | ✅ 2026-10-15 on vmtest, agent 0.4.137: `script-sh`, `script-ps1`, `wizard`, `manual`; a 0.4.136 agent records `unknown` | `crates/agent-core/src/enrollment.rs` — flag, then env, then `manual`; an unknown env spelling clamped |
 | The Campaigns table's visitors for a closed day equal purestat's own number for the same filter, and read "not measured" with the key revoked (AC16) | ✅ 2026-10-15, 2026-10-13 by `content` | `crates/tests/src/growth_campaigns_tests.rs`, against a fake purestat |
 | The ingest stores a snapshot pushed twice once, refuses an unknown platform and a body carrying post text, and answers 404 to a wrong key (AC18) | ✅ 2026-10-15 | `crates/tests/src/growth_channels_tests.rs`, plus the revoked key, the JWT, the kill switch and the unmounted module |
+| The read key returns, for one closed range, the same JSON a platform admin's session gets on every GET view, and the empty 404 on every write, on `GET …/keys` and after its revocation (AC20) | owed after the promote, with a minted read key | `crates/tests/src/growth_p10_tests.rs` — every GET view compared body for body, every write, the admin surface, an ingest key, a malformed, an unknown and a revoked key, the kill switch |
+| The weekly roll-up is stored and mailed once for the first Monday after `ROOMLER__GROWTH__WEEKLY_ENABLED=true`, with both pods running, and its headline sign-ups equal a hand count for the week | owed | `crates/tests/src/growth_p10_tests.rs` — two concurrent runs → one mail; a `sent` week never re-sent; a preview never cancels the scheduled mail; a manual send racing the scheduler mails once; the routes |
+| An alert fires once, mails once and clears: `digest_missing` on a day the digest is held back (red), cleared once it runs (green), with `ROOMLER__GROWTH__ALERTS=true` | owed | `crates/tests/src/growth_p10_tests.rs` — each evaluable rule fires once, a second evaluation adds nothing, the clear, a re-fire the same day mails nothing, the digest's `alerts` section |
 
 The newsletter's webhook is to be shown on production to refuse a bad signature (control),
 and to record `delivered` and `bounce` for a test send with one forced bounce, the bounced
@@ -1304,13 +1307,3 @@ invoice amounts, and the Revenue tab's MRR equal to the test invoices, not the l
 same lifecycle through Stripe's own signature scheme — the rows, MRR month by month, the
 frozen months surviving the org's purge, the backfill against a fake Stripe, and the collision
 counter (`crates/tests/src/growth_revenue_tests.rs`).
-
-The read key is to be shown on production to return, for one closed range, the same JSON a
-platform admin's session gets on the funnel, the campaigns and a stored digest, and the
-empty 404 on a write (`POST …/digest/run`), on `GET …/keys`, and after its revocation
-(AC20; the integration suite asserts every GET view and every write,
-`crates/tests/src/growth_p10_tests.rs`). The weekly roll-up is to be shown stored and mailed
-once for the first Monday after the switch is on, with both pods running, and its headline
-sign-ups equal to a hand count for the week. The alerts are to be shown on production to
-fire `digest_missing` on a day the digest is held back (red), to clear once it runs
-(green), and to mail once.
