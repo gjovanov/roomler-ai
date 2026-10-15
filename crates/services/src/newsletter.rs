@@ -18,8 +18,18 @@
 //!    [`escape_html`] before entering the wrapper, and header-bound strings
 //!    pass [`clean_header_text`] at the route (a `\r\n` in a subject is SMTP
 //!    header injection on the lettre backend).
+//! 4. **FR-102 P5 (D5) — the issue's tags are the issue's, not the
+//!    reader's.** [`LinkTags`] adds `utm_source=newsletter&utm_medium=email&
+//!    utm_campaign=nl-<slug>` to every link to this site at RENDER time,
+//!    before property 2's substitution — so the tags are, by construction,
+//!    byte-identical for every recipient, and the footer's promise ("the
+//!    only per-recipient thing in this email is your unsubscribe link")
+//!    stays literally true. Links elsewhere are left exactly as written: a
+//!    third party learns nothing, and a signed URL is not broken.
 
-use pulldown_cmark::{Event, Options, Parser, html};
+use std::collections::HashSet;
+
+use pulldown_cmark::{Event, Options, Parser, Tag, html};
 use roomler_ai_db::models::NewsletterIssue;
 
 /// Sentinel the wrapper embeds where a recipient's unsubscribe URL belongs.
@@ -27,6 +37,98 @@ use roomler_ai_db::models::NewsletterIssue;
 /// operator who literally types it into a body gets it substituted, which is
 /// harmless (admin-only surface).
 pub const UNSUB_PLACEHOLDER: &str = "%%UNSUBSCRIBE_URL%%";
+
+/// FR-102 P5 (D5) — the `utm_source` every issue's links carry (the
+/// taxonomy's `newsletter`, `crates/core/src/campaign.rs`).
+pub const ISSUE_UTM_SOURCE: &str = "newsletter";
+/// FR-102 P5 (D5) — the `utm_medium` (the taxonomy's `email`).
+pub const ISSUE_UTM_MEDIUM: &str = "email";
+/// FR-102 P5 (D5) — an issue's `utm_campaign` is this prefix and its slug.
+pub const ISSUE_CAMPAIGN_PREFIX: &str = "nl-";
+/// The hosted site's own hosts, tagged whatever `app.frontend_url` says
+/// (the footer links to `https://roomler.ai`).
+pub const HOSTED_SITE_HOSTS: [&str; 2] = ["roomler.ai", "www.roomler.ai"];
+
+/// `nl-<slug>`, cut to the longest value a sign-up's attribution keeps
+/// (`MAX_ATTRIBUTION_VALUE_LEN`, the clamp ingress applies): a longer
+/// campaign would be cut at sign-up and never meet the issue it came from,
+/// so it is cut the same way here first. The one spelling both the links
+/// and every per-issue lookup use.
+pub fn issue_campaign(slug: &str) -> String {
+    format!("{ISSUE_CAMPAIGN_PREFIX}{slug}")
+        .chars()
+        .take(roomler_ai_db::models::MAX_ATTRIBUTION_VALUE_LEN)
+        .collect()
+}
+
+/// The hosts whose links an issue tags: `frontend_url`'s host and
+/// [`HOSTED_SITE_HOSTS`], lowercased.
+pub fn site_hosts(frontend_url: &str) -> Vec<String> {
+    let mut hosts: Vec<String> = HOSTED_SITE_HOSTS.iter().map(|h| h.to_string()).collect();
+    if let Some(h) = url::Url::parse(frontend_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        && !hosts.contains(&h)
+    {
+        hosts.push(h);
+    }
+    hosts
+}
+
+/// FR-102 P5 (D5) — one issue's link tags: the same three parameters on
+/// every link to this site, for every recipient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkTags {
+    /// `nl-<slug>` ([`issue_campaign`]).
+    pub campaign: String,
+    /// Lowercased hosts whose links are tagged.
+    pub hosts: Vec<String>,
+}
+
+impl LinkTags {
+    pub fn for_issue(slug: &str, hosts: Vec<String>) -> Self {
+        Self {
+            campaign: issue_campaign(slug),
+            hosts: hosts.into_iter().map(|h| h.to_ascii_lowercase()).collect(),
+        }
+    }
+
+    /// `raw` with the issue's tags when it is an http(s) link to one of
+    /// [`Self::hosts`]; otherwise exactly `raw`. A parameter the link
+    /// already carries is the operator's and is kept — only the missing
+    /// ones are added, after the existing query and before any fragment.
+    pub fn tag(&self, raw: &str) -> String {
+        let Ok(mut url) = url::Url::parse(raw) else {
+            return raw.to_string();
+        };
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return raw.to_string();
+        }
+        let ours = url
+            .host_str()
+            .is_some_and(|h| self.hosts.iter().any(|o| o.eq_ignore_ascii_case(h)));
+        if !ours {
+            return raw.to_string();
+        }
+        let present: HashSet<String> = url.query_pairs().map(|(k, _)| k.into_owned()).collect();
+        let missing: Vec<(&str, &str)> = [
+            ("utm_source", ISSUE_UTM_SOURCE),
+            ("utm_medium", ISSUE_UTM_MEDIUM),
+            ("utm_campaign", self.campaign.as_str()),
+        ]
+        .into_iter()
+        .filter(|(k, _)| !present.contains(*k))
+        .collect();
+        if missing.is_empty() {
+            return raw.to_string();
+        }
+        url.query_pairs_mut().extend_pairs(missing);
+        url.to_string()
+    }
+}
 
 /// Minimal, complete HTML escaping for text landing in the wrapper.
 /// (First in the tree — the transactional templates interpolate unescaped,
@@ -61,11 +163,35 @@ pub fn clean_header_text(s: &str, max_chars: usize) -> String {
 
 /// Markdown → HTML with raw-HTML events dropped structurally (property 1).
 pub fn render_markdown(md: &str) -> String {
+    render_markdown_tagged(md, None)
+}
+
+/// [`render_markdown`], with every link's destination passed through the
+/// issue's [`LinkTags`] (property 4). Images are not links and keep their
+/// source as written.
+pub fn render_markdown_tagged(md: &str, tags: Option<&LinkTags>) -> String {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
-    let parser =
-        Parser::new_ext(md, opts).filter(|e| !matches!(e, Event::Html(_) | Event::InlineHtml(_)));
+    let parser = Parser::new_ext(md, opts)
+        .filter(|e| !matches!(e, Event::Html(_) | Event::InlineHtml(_)))
+        .map(|e| match (e, tags) {
+            (
+                Event::Start(Tag::Link {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                }),
+                Some(tags),
+            ) => Event::Start(Tag::Link {
+                link_type,
+                dest_url: tags.tag(&dest_url).into(),
+                title,
+                id,
+            }),
+            (e, _) => e,
+        });
     let mut out = String::new();
     html::push_html(&mut out, parser);
     out
@@ -126,10 +252,20 @@ const FONT_STACK: &str = "system-ui,-apple-system,'Segoe UI',Roboto,sans-serif";
 /// COMPLETE email HTML with [`UNSUB_PLACEHOLDER`] where the recipient's
 /// unsubscribe URL belongs — the exact bytes a recipient receives, which is
 /// also exactly what the admin preview serves.
-pub fn render_issue_html(issue: &NewsletterIssue) -> String {
+///
+/// `tags` (FR-102 P5, property 4) tags every link to this site — the
+/// body's, the call to action and the footer's — and never the unsubscribe
+/// link, which is substituted per recipient afterwards. `None` renders the
+/// links as written (`newsletter.link_tags = false`).
+pub fn render_issue_html(issue: &NewsletterIssue, tags: Option<&LinkTags>) -> String {
+    let tag = |url: &str| match tags {
+        Some(t) => t.tag(url),
+        None => url.to_string(),
+    };
     let subject = escape_html(&issue.subject);
     let preheader = escape_html(&issue.preheader);
-    let body = style_rendered_html(&render_markdown(&issue.body_md));
+    let body = style_rendered_html(&render_markdown_tagged(&issue.body_md, tags));
+    let home = escape_html(&tag("https://roomler.ai"));
 
     let hero = match (&issue.hero_url, &issue.hero_alt) {
         (Some(url), alt) => format!(
@@ -146,7 +282,7 @@ pub fn render_issue_html(issue: &NewsletterIssue) -> String {
              <td style=\"background:#009688;border-radius:6px;\">\
              <a href=\"{}\" style=\"display:inline-block;padding:12px 28px;color:#ffffff;font-family:{};font-size:16px;font-weight:600;text-decoration:none;\">{}</a>\
              </td></tr></table>",
-            escape_html(url),
+            escape_html(&tag(url)),
             FONT_STACK,
             escape_html(text),
         ),
@@ -176,7 +312,7 @@ pub fn render_issue_html(issue: &NewsletterIssue) -> String {
          <tr><td style=\"padding:20px 8px 0;font-family:{font};font-size:12.5px;line-height:1.7;color:#5b6570;text-align:center;\">\n\
          You subscribed at roomler.ai. Product updates only, never more than monthly.<br />\n\
          No tracking pixels — the only per-recipient thing in this email is your unsubscribe link.<br />\n\
-         <a href=\"{unsub}\" style=\"color:#00796B;\">Unsubscribe</a>&nbsp;&middot;&nbsp;<a href=\"https://roomler.ai\" style=\"color:#00796B;\">roomler.ai</a><br />\n\
+         <a href=\"{unsub}\" style=\"color:#00796B;\">Unsubscribe</a>&nbsp;&middot;&nbsp;<a href=\"{home}\" style=\"color:#00796B;\">roomler.ai</a><br />\n\
          Roomler &middot; G ROX LTD, Pazardzhik, Bulgaria\n\
          </td></tr>\n\
          </table>\n</td></tr></table>\n</body>\n</html>\n",
@@ -187,6 +323,7 @@ pub fn render_issue_html(issue: &NewsletterIssue) -> String {
         body = body,
         cta = cta,
         unsub = UNSUB_PLACEHOLDER,
+        home = home,
     )
 }
 
@@ -213,6 +350,7 @@ mod tests {
             hero_alt: Some("An \"alt\" text".into()),
             cta_text: Some("Try it".into()),
             cta_url: Some("https://roomler.ai/".into()),
+            audience: None,
             status: IssueStatus::Draft,
             claimed_by: None,
             claimed_at: None,
@@ -220,7 +358,136 @@ mod tests {
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
             sent_at: None,
+            campaign: None,
+            delivery_events: false,
         }
+    }
+
+    fn tags() -> LinkTags {
+        LinkTags::for_issue("october-notes", site_hosts("https://roomler.ai"))
+    }
+
+    const TAGGED: &str = "utm_source=newsletter&utm_medium=email&utm_campaign=nl-october-notes";
+
+    /// D5 — a link to this site gains the issue's three tags; a link
+    /// anywhere else, a `mailto:`, a relative path and anything unparsable
+    /// are left byte-for-byte as written.
+    #[test]
+    fn only_links_to_this_site_are_tagged_and_the_rest_are_untouched() {
+        let t = tags();
+        assert_eq!(
+            t.tag("https://roomler.ai/docs/install"),
+            format!("https://roomler.ai/docs/install?{TAGGED}")
+        );
+        assert_eq!(
+            t.tag("https://www.roomler.ai/blog/x#part-2"),
+            format!("https://www.roomler.ai/blog/x?{TAGGED}#part-2"),
+            "the fragment stays last"
+        );
+        assert_eq!(
+            t.tag("https://ROOMLER.ai/pricing?plan=pro"),
+            format!("https://roomler.ai/pricing?plan=pro&{TAGGED}"),
+            "the existing query is kept, the tags appended"
+        );
+        assert_eq!(
+            t.tag("https://roomler.ai"),
+            format!("https://roomler.ai/?{TAGGED}")
+        );
+        for untouched in [
+            "https://github.com/gjovanov/roomler-ai",
+            "https://roomler.ai.evil.example/x",
+            "https://evil.example/?u=https://roomler.ai/",
+            "https://user@roomler.ai/x",
+            "mailto:hello@roomler.ai",
+            "/relative/path",
+            "not a url",
+            "ftp://roomler.ai/file",
+        ] {
+            assert_eq!(t.tag(untouched), untouched, "{untouched}");
+        }
+    }
+
+    /// A tag the operator wrote is the operator's: only the missing ones
+    /// are added, and a fully tagged link is left alone.
+    #[test]
+    fn an_operators_own_tag_is_kept() {
+        let t = tags();
+        assert_eq!(
+            t.tag("https://roomler.ai/x?utm_campaign=custom"),
+            "https://roomler.ai/x?utm_campaign=custom&utm_source=newsletter&utm_medium=email"
+        );
+        let full = "https://roomler.ai/x?utm_source=a&utm_medium=b&utm_campaign=c";
+        assert_eq!(t.tag(full), full);
+    }
+
+    /// The campaign is cut where a sign-up's attribution would cut it, so
+    /// the two always meet.
+    #[test]
+    fn the_campaign_is_nl_and_the_slug_cut_like_a_signups() {
+        assert_eq!(issue_campaign("october-notes"), "nl-october-notes");
+        let long = "a".repeat(64);
+        let c = issue_campaign(&long);
+        assert_eq!(c.len(), roomler_ai_db::models::MAX_ATTRIBUTION_VALUE_LEN);
+        assert!(c.starts_with("nl-aaa"));
+    }
+
+    #[test]
+    fn the_site_hosts_are_the_hosted_pair_and_the_frontend() {
+        assert_eq!(
+            site_hosts("https://roomler.ai"),
+            vec!["roomler.ai".to_string(), "www.roomler.ai".to_string()]
+        );
+        assert_eq!(
+            site_hosts("http://Localhost:5173/"),
+            vec![
+                "roomler.ai".to_string(),
+                "www.roomler.ai".to_string(),
+                "localhost".to_string()
+            ]
+        );
+        assert_eq!(site_hosts("not a url").len(), 2);
+    }
+
+    /// Every link in a rendered issue — the body's, the call to action and
+    /// the footer's — carries the tags, except the unsubscribe placeholder
+    /// (substituted per recipient later) and the hero image (not a link).
+    #[test]
+    fn a_tagged_issue_tags_body_cta_and_footer_and_nothing_else() {
+        let i = issue(
+            "See [the docs](https://roomler.ai/docs), [GitHub](https://github.com/gjovanov/roomler-ai) \
+             and <https://roomler.ai/blog/x>.",
+        );
+        let html = render_issue_html(&i, Some(&tags()));
+        let amp = TAGGED.replace('&', "&amp;");
+        assert!(
+            html.contains(&format!("href=\"https://roomler.ai/docs?{amp}\"")),
+            "{html}"
+        );
+        assert!(html.contains(&format!("href=\"https://roomler.ai/blog/x?{amp}\"")));
+        assert!(
+            html.contains("href=\"https://github.com/gjovanov/roomler-ai\""),
+            "third-party links are untouched"
+        );
+        assert!(
+            html.contains(&format!(
+                "href=\"https://roomler.ai/?{amp}\" style=\"display:inline-block"
+            )),
+            "the call to action is tagged"
+        );
+        assert!(
+            html.contains(&format!(
+                "href=\"https://roomler.ai/?{amp}\" style=\"color:#00796B;\">roomler.ai</a>"
+            )),
+            "the footer's link is tagged"
+        );
+        assert!(html.contains(&format!("href=\"{UNSUB_PLACEHOLDER}\"")));
+        assert!(
+            html.contains("src=\"https://roomler.ai/newsletter-img/test-v1.png\""),
+            "the hero image is not a link and is not tagged"
+        );
+        // Untagged, every link is as written.
+        let plain = render_issue_html(&i, None);
+        assert!(!plain.contains("utm_"), "{plain}");
     }
 
     #[test]
@@ -274,7 +541,10 @@ mod tests {
 
     #[test]
     fn wrapper_escapes_operator_strings_and_carries_the_contract() {
-        let html = render_issue_html(&issue("Body **text** with a [link](https://example.com)."));
+        let html = render_issue_html(
+            &issue("Body **text** with a [link](https://example.com)."),
+            None,
+        );
         // Subject escaped, twice (title + h1) — never raw.
         assert!(!html.contains("A <subject>"), "raw subject leaked");
         assert!(html.contains("A &lt;subject&gt; &amp; so"));
@@ -301,14 +571,14 @@ mod tests {
         i.hero_url = None;
         i.cta_text = None;
         i.cta_url = None;
-        let html = render_issue_html(&i);
+        let html = render_issue_html(&i, None);
         assert!(!html.contains("<img"));
         assert!(!html.contains("Try it"));
     }
 
     #[test]
     fn substitution_replaces_every_occurrence() {
-        let html = render_issue_html(&issue("body"));
+        let html = render_issue_html(&issue("body"), None);
         let out = substitute_recipient(&html, "https://roomler.ai/api/subscribe/unsubscribe/abc");
         assert!(!out.contains(UNSUB_PLACEHOLDER));
         assert!(out.contains("unsubscribe/abc"));

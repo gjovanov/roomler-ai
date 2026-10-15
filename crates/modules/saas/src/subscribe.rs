@@ -25,10 +25,11 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::StatusCode,
     response::{IntoResponse, Redirect},
 };
+use roomler_ai_db::models::IssueStatus;
 use roomler_ai_services::dao::subscriber::SubscribeOutcome;
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -206,16 +207,40 @@ pub async fn confirm(
     Json(serde_json::json!({ "confirmed": ok }))
 }
 
+/// FR-102 P5 — the issue an unsubscribe link came in: its `i=<slug>`, kept
+/// only when it names an issue that was sent (a draft never mailed anyone;
+/// a garbage value names nothing). Parsed leniently from the raw query: a
+/// malformed query must never turn an unsubscribe into a 400.
+async fn via_issue(state: &SaasState, raw_query: Option<&str>) -> Option<String> {
+    let slug = url::form_urlencoded::parse(raw_query?.as_bytes())
+        .find(|(k, _)| k == "i")
+        .map(|(_, v)| v.into_owned())?;
+    if !crate::newsletter::valid_slug(&slug) {
+        return None;
+    }
+    match state.newsletter_issues.get_by_slug(&slug).await {
+        Ok(Some(issue)) if issue.status != IssueStatus::Draft => Some(issue.slug),
+        _ => None,
+    }
+}
+
 /// `GET /api/subscribe/unsubscribe/{token}`
 ///
 /// No confirmation step and no session: a one-click unsubscribe that asks the
 /// person to log in first is not a working unsubscribe. Idempotent, because
-/// mail clients prefetch links.
+/// mail clients prefetch links. FR-102 P5: the link's `i=<slug>` records
+/// which issue it came in (`subscribers.unsubscribed_via`).
 pub async fn unsubscribe(
     State(state): State<SaasState>,
     Path(token): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> Result<Redirect, ApiError> {
-    let ok = state.subscribers.unsubscribe(&token).await.unwrap_or(false);
+    let via = via_issue(&state, query.as_deref()).await;
+    let ok = state
+        .subscribers
+        .unsubscribe(&token, via.as_deref())
+        .await
+        .unwrap_or(false);
     Ok(Redirect::to(&outcome_page(
         &state,
         "unsubscribed",
@@ -239,9 +264,20 @@ pub async fn unsubscribe(
 pub async fn unsubscribe_oneclick(
     State(state): State<SaasState>,
     Path(token): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> StatusCode {
-    let ok = state.subscribers.unsubscribe(&token).await.unwrap_or(false);
-    info!(ok, "one-click unsubscribe handled");
+    // The List-Unsubscribe header carries the same link, `i=` included.
+    let via = via_issue(&state, query.as_deref()).await;
+    let ok = state
+        .subscribers
+        .unsubscribe(&token, via.as_deref())
+        .await
+        .unwrap_or(false);
+    info!(
+        ok,
+        via_issue = via.is_some(),
+        "one-click unsubscribe handled"
+    );
     StatusCode::OK
 }
 

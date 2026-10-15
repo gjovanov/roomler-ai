@@ -70,7 +70,11 @@ impl SubscriberDao {
         if let Some(existing) = self.base.find_one(doc! { "email": &email }).await? {
             let id = existing.id.expect("stored subscriber has an id");
 
-            if existing.unsubscribed_at.is_some() {
+            // FR-102 P5 — a SUPPRESSED address (a hard bounce or a spam
+            // report) asking again is treated like a withdrawn one: the
+            // confirmation click is the fresh consent — and the proof the
+            // mailbox works — that lifts the suppression.
+            if existing.unsubscribed_at.is_some() || existing.suppressed_at.is_some() {
                 // Fresh consent after a withdrawal. Deliberately NOT restored to
                 // `confirmed`: whatever the old state was, re-entry is a new
                 // decision and has to be re-proved.
@@ -86,7 +90,13 @@ impl SubscriberDao {
                                 "source": source,
                                 "created_at": DateTime::now(),
                             },
-                            "$unset": { "unsubscribed_at": "", "confirmed_at": "" },
+                            "$unset": {
+                                "unsubscribed_at": "",
+                                "confirmed_at": "",
+                                "unsubscribed_via": "",
+                                "suppressed_at": "",
+                                "suppressed_reason": "",
+                            },
                         },
                     )
                     .await?;
@@ -136,6 +146,9 @@ impl SubscriberDao {
             created_at: DateTime::now(),
             confirmed_at: None,
             unsubscribed_at: None,
+            unsubscribed_via: None,
+            suppressed_at: None,
+            suppressed_reason: None,
         };
         self.base.insert_one(&sub).await?;
         Ok((SubscribeOutcome::Created, Some(confirm_token)))
@@ -157,14 +170,66 @@ impl SubscriberDao {
 
     /// The row is kept and stamped, never deleted — see the model. Idempotent,
     /// because a mail client that prefetches links will call this more than once.
-    pub async fn unsubscribe(&self, token: &str) -> DaoResult<bool> {
+    ///
+    /// FR-102 P5 — `via` is the slug of the issue whose link was followed
+    /// (the link's `i=`, already checked against the issue list by the
+    /// route). The stamp is written ONCE, by the click that ends a live
+    /// subscription: a repeat click (a prefetcher, a second tab) changes
+    /// neither the time the person left nor the issue they left from.
+    /// `true` when the token names a row — this click or an earlier one.
+    pub async fn unsubscribe(&self, token: &str, via: Option<&str>) -> DaoResult<bool> {
+        let mut set = doc! { "confirmed": false, "unsubscribed_at": DateTime::now() };
+        let mut unset = doc! { "confirm_token": "" };
+        match via {
+            Some(slug) => {
+                set.insert("unsubscribed_via", slug);
+            }
+            None => {
+                unset.insert("unsubscribed_via", "");
+            }
+        }
+        let stamped = self
+            .base
+            .update_one(
+                doc! { "unsubscribe_token": token, "unsubscribed_at": null },
+                doc! { "$set": set, "$unset": unset },
+            )
+            .await?;
+        if stamped {
+            return Ok(true);
+        }
+        Ok(self
+            .base
+            .find_one(doc! { "unsubscribe_token": token })
+            .await?
+            .is_some())
+    }
+
+    /// FR-102 P5 — the subscriber an Event Webhook event names, by its
+    /// address (normalised — a read path).
+    pub async fn id_by_email(&self, email: &str) -> DaoResult<Option<bson::oid::ObjectId>> {
+        let email = Subscriber::normalize_email(email);
+        Ok(self
+            .base
+            .find_one(doc! { "email": &email })
+            .await?
+            .and_then(|s| s.id))
+    }
+
+    /// FR-102 P5 (D6) — SendGrid reported a hard bounce or a spam report:
+    /// the fan-out never mails this subscriber again until fresh consent.
+    /// The FIRST reason stays (a replayed event changes nothing); `true` when
+    /// this call suppressed it.
+    pub async fn suppress(
+        &self,
+        id: bson::oid::ObjectId,
+        reason: &str,
+        at: DateTime,
+    ) -> DaoResult<bool> {
         self.base
             .update_one(
-                doc! { "unsubscribe_token": token },
-                doc! {
-                    "$set": { "confirmed": false, "unsubscribed_at": DateTime::now() },
-                    "$unset": { "confirm_token": "" },
-                },
+                doc! { "_id": id, "suppressed_at": null },
+                doc! { "$set": { "suppressed_at": at, "suppressed_reason": reason } },
             )
             .await
     }
@@ -221,11 +286,16 @@ impl SubscriberDao {
                     created_at: DateTime::now(),
                     confirmed_at: Some(DateTime::now()),
                     unsubscribed_at: None,
+                    unsubscribed_via: None,
+                    suppressed_at: None,
+                    suppressed_reason: None,
                 };
                 self.base.insert_one(&sub).await?;
                 Ok(true)
             }
             (Some(row), true) => {
+                // Fresh consent on proven ownership — it also lifts a
+                // suppression (FR-102 P5): the owner is asking for the mail.
                 let id = row.id.expect("stored subscriber has an id");
                 self.base
                     .update_by_id(
@@ -236,20 +306,31 @@ impl SubscriberDao {
                                 "confirmed_at": DateTime::now(),
                                 "source": "account",
                             },
-                            "$unset": { "unsubscribed_at": "", "confirm_token": "" },
+                            "$unset": {
+                                "unsubscribed_at": "",
+                                "confirm_token": "",
+                                "unsubscribed_via": "",
+                                "suppressed_at": "",
+                                "suppressed_reason": "",
+                            },
                         },
                     )
                     .await?;
                 Ok(true)
             }
             (Some(row), false) => {
+                if row.unsubscribed_at.is_some() {
+                    // Already out: the time they left, and the issue they
+                    // left from (FR-102 P5), stay as they were.
+                    return Ok(false);
+                }
                 let id = row.id.expect("stored subscriber has an id");
                 self.base
                     .update_by_id(
                         id,
                         doc! {
                             "$set": { "confirmed": false, "unsubscribed_at": DateTime::now() },
-                            "$unset": { "confirm_token": "" },
+                            "$unset": { "confirm_token": "", "unsubscribed_via": "" },
                         },
                     )
                     .await?;

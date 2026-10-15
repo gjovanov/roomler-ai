@@ -8365,6 +8365,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -8415,6 +8416,7 @@ dependencies = [
  "rand 0.9.4",
  "redis",
  "reqwest 0.12.28",
+ "ring",
  "roomler-ai-config",
  "roomler-ai-db",
  "roomler-ai-remote-control",
@@ -8426,6 +8428,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
  "urlencoding",
  "uuid",
  "validator",
@@ -8448,6 +8451,7 @@ dependencies = [
  "jsonwebtoken",
  "mongodb",
  "reqwest 0.12.28",
+ "ring",
  "roomler-ai-api",
  "roomler-ai-config",
  "roomler-ai-db",

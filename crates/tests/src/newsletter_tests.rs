@@ -232,6 +232,16 @@ async fn preview_is_the_branded_send_bytes_and_drops_raw_html() {
     // Preview IS the sent artifact: the placeholder is substituted, none left.
     assert!(!html.contains("%%UNSUBSCRIBE_URL%%"));
     assert!(html.contains("/api/subscribe/unsubscribe/preview-sample-token"));
+    // FR-102 P5 (D5) — the same tags the send carries: the links to this
+    // site name the issue (the same for every recipient), and so does the
+    // unsubscribe link.
+    assert!(
+        html.contains(
+            "href=\"https://roomler.ai/?utm_source=newsletter&amp;utm_medium=email&amp;utm_campaign=nl-preview-me\""
+        ),
+        "{html}"
+    );
+    assert!(html.contains("/api/subscribe/unsubscribe/preview-sample-token?i=preview-me"));
 }
 
 #[tokio::test]

@@ -89,6 +89,12 @@ mod growth_digest_tests;
 /// (AC8), the weekly cohorts and the org views.
 #[cfg(test)]
 mod growth_funnel_tests;
+/// FR-102 P5 — the newsletter's delivery side: SendGrid's signed Event
+/// Webhook refusing what it cannot verify before parsing it, recording only
+/// the four events, suppressing a hard bounce at the next send (AC14's test
+/// half); the per-issue unsubscribe; the per-issue table and the digest.
+#[cfg(test)]
+mod growth_newsletter_tests;
 /// FR-102 — growth observability: the campaign taxonomy at ingress (AC5),
 /// the exclusion list and the set every growth number applies (AC4).
 #[cfg(test)]

@@ -331,6 +331,25 @@ sequenceDiagram
   click is recorded as `subscribers.unsubscribed_via`.
 - **The per-issue table**: recipients, accepted, delivered, bounced, complaints, unsubscribed via the
   issue, visits (purestat, by campaign), sign-ups (`signup_attribution.campaign`).
+  *(P5 as built: the webhook is `POST /api/sendgrid/webhook` in `saas`, outside the governor; the
+  key is `ROOMLER__NEWSLETTER__EVENT_WEBHOOK_PUBLIC_KEY` (SendGrid's base64 DER key or PEM) and
+  without a usable one the route is the empty 404. A missing header, a timestamp outside 25 h back /
+  5 min ahead, or a signature that does not verify is 401 **before the body is parsed**. Events are
+  matched by ONE SendGrid custom arg, `nl_issue = <slug>` — the same for every recipient — and the
+  recipient's address; only `delivered`, `bounce`, `dropped` and `spamreport` are written, each time
+  as a `$min` (a replay writes nothing); a bounce of `type: bounce` or a spam report sets
+  `subscribers.suppressed_at`, which the fan-out's per-recipient re-check honours (the row reads
+  `suppressed`) until fresh consent. Every newsletter message also switches SendGrid's open, click,
+  subscription and Google Analytics tracking off in the request itself, and the startup check WARNs
+  when the account's open or click tracking is on or cannot be read. The tags go on http(s) links
+  to `roomler.ai`, `www.roomler.ai` and `app.frontend_url`'s host only; third-party links stay as
+  written; `newsletter.link_tags = false` is the sender's kill switch. The issue is stamped with
+  `campaign` and `delivery_events` when the fan-out starts, so an untagged or unrecorded issue
+  reads "not measured", never 0. A **test issue** (`audience`: 1–20 addresses, fixed with the
+  draft) goes only to the confirmed subscribers among them — what AC14's field run uses instead of
+  mailing the list. The table is `GET /api/admin/growth/newsletter` (90 closed days by
+  default), the Newsletter tab, and the digest's `newsletter.delivery`. Detail:
+  [growth-observability.md](../growth-observability.md#the-newsletter-delivery-per-issue-tags-and-unsubscribes-p5).)*
 
 ### 3i. The web plane in Growth (P6, after PS1)
 
@@ -538,7 +557,7 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 | `setup_diagnostics` | `fleet` | `{run, step, outcome, elapsed_ms, error_code, os, wizard_version, ts}` | 90 days | the wizard, opt-in |
 | `agents.install` | `fleet` | `{method, scope, run}` | with the agent row | the enroll |
 | `session_feedback` | `remote` | §3f | 25 months; with the user | the viewer |
-| `subscribers.unsubscribed_via`, `newsletter_sends.delivery` | `saas` | fields on existing collections | as FR-58 | the unsubscribe route, the SendGrid webhook |
+| `subscribers.unsubscribed_via`, `newsletter_sends.delivery` | `saas` | fields on existing collections; P5 adds `subscribers.suppressed_at` / `suppressed_reason` and `newsletter_issues.campaign` / `delivery_events` | as FR-58 | the unsubscribe route, the SendGrid webhook, the fan-out (P5) |
 
 ### 3p. Privacy, retention, and the policy
 
@@ -552,7 +571,7 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 | wizard diagnostics (opt-in) | `setup_diagnostics` | 90 days, then daily counts | — (a per-run random id only) | the wizard's own text, §2.18 |
 | invoices and plan changes | `billing_events` | with the org (Stripe is the record) | the org | §2.12 |
 | session ratings | `session_feedback` | 25 months | the user | new §2.18 |
-| delivery status | `newsletter_sends` | as FR-58 | the subscriber | newsletter section |
+| delivery status | `newsletter_sends` | as FR-58 | the subscriber | newsletter section (P5: §2.14 and §7 name it) |
 | social, search, GitHub | `growth_daily`; social posts and their metric snapshots in `growth_posts` / `growth_post_snapshots` (P8: ids, URLs, numbers and the campaign key — never post text) | indefinitely | — (aggregates about our own content) | — |
 | daily digests | `growth_digests`; the platform admins' mailboxes | 25 months | — (org names, never a person) | new §2.18 |
 
@@ -574,7 +593,7 @@ hosted only). §7's retention list grows, and `docs/data-model.md`'s stale TTLs 
 | P3 | §3e 1–4 and 6: issuance record, fetch counters, the enroll's `install` (server, agent, scripts, wizard), the Install panel | counters off by config; the agent sends `install` only when it is set | **server half live** 2026-10-15 00:10Z (`hosted-20261014-831ebcf`): #2217 `36f871029`; AC10 + AC11 field-verified (§8). The agent half (`roomlerd enroll` flags/env, the scripts, the wizard, the companion) ships with the next agent release after 0.4.136, then AC9 on vmtest |
 | P3b | §3e 5: the wizard's opt-in diagnostics, after D4 | the checkbox; `ROOMLER__GROWTH__SETUP_DIAGNOSTICS=false` | — |
 | P4 | §3g: `billing_events` and the backfill, MRR movements, quota collisions, margin | the new webhook kinds are additive; the panel | — |
-| P5 | §3h: the list over time, SendGrid events (D6), per-issue tags (D5), the per-issue table | the webhook route off; tags off in the sender | — |
+| P5 | §3h: the list over time, SendGrid events (D6), per-issue tags (D5), the per-issue table | the webhook route off (no `ROOMLER__NEWSLETTER__EVENT_WEBHOOK_PUBLIC_KEY`); tags off in the sender (`ROOMLER__NEWSLETTER__LINK_TAGS=false`) | PR #2244 — `POST /api/sendgrid/webhook` (`saas`), the per-issue tags and `i=`, `GET …/growth/newsletter`, the Newsletter tab, the digest's delivery |
 | PS1 | §3n PS1 in purestat | — | **live** with PS0a in v0.1.8; the roomler.ai key minted 2026-10-14 (only its hash stored; sealed into `roomler2-secret`, roomler-ai-deploy#29) |
 | P6 | §3i: the purestat puller, the Campaigns table with coverage | no key ⇒ "not measured" | **merged** #2229 `fb7e45831` — the puller (`saas`), `growth_pulls`, `GET …/growth/campaigns`, the Campaigns tab; live with the next promote, then AC16 (a platform-admin read) and the puller's first cycle |
 | PS3 | §3n PS3 in purestat | a tracker attribute | **live** 2026-10-14 23:02Z: purestat v0.1.9 (gjovanov/purestat#18) — read rate, scroll depth, opt-in link/download events |

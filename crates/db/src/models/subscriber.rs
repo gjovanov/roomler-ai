@@ -61,6 +61,24 @@ pub struct Subscriber {
     /// submission, and there would be no record that consent was withdrawn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unsubscribed_at: Option<DateTime>,
+
+    /// FR-102 P5 — the slug of the issue whose unsubscribe link ended this
+    /// subscription (the link's `i=<slug>`, the same for every recipient of
+    /// that issue). `None` for any other way out — the account toggle, a
+    /// link from before P5 — and cleared when the address subscribes again,
+    /// so it always describes the CURRENT unsubscription.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsubscribed_via: Option<String>,
+
+    /// FR-102 P5 (D6) — SendGrid reported a hard bounce or a spam report for
+    /// this address: the fan-out never mails it again (the per-recipient
+    /// re-check marks its ledger row `suppressed`). Cleared only by fresh
+    /// consent — subscribing again and confirming, or the account toggle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppressed_at: Option<DateTime>,
+    /// `bounce` or `spamreport` — what suppressed it first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppressed_reason: Option<String>,
 }
 
 impl Subscriber {

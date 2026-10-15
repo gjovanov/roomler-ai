@@ -37,6 +37,14 @@ pub struct NewsletterIssue {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cta_url: Option<String>,
 
+    /// FR-102 P5 — a TEST issue's audience: the send goes only to the
+    /// confirmed subscribers among these addresses (normalised, at most 20),
+    /// never to the list. Fixed with the draft, so a resumed send can never
+    /// widen it to everyone. `None` — every issue but a test — mails the
+    /// list. Admin-only: the growth views see its size, never the addresses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<Vec<String>>,
+
     pub status: IssueStatus,
 
     /// Which pod's fan-out task holds the send claim (P3). The claim is an
@@ -56,6 +64,20 @@ pub struct NewsletterIssue {
     pub updated_at: DateTime,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sent_at: Option<DateTime>,
+
+    /// FR-102 P5 (D5) — the `utm_campaign` the issue's links to this site
+    /// carried (`nl-<slug>`), stamped when the fan-out starts. `None` for an
+    /// issue sent before the tags existed or with them switched off: its
+    /// visits cannot be told apart, so they read "not measured".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign: Option<String>,
+    /// FR-102 P5 (D6) — the issue's delivery events are recorded: the
+    /// fan-out tagged every message with the issue for SendGrid's Event
+    /// Webhook, and this server verified the webhook when it sent. `false`
+    /// for an issue sent before P5 or without the webhook key: its delivery
+    /// is not measured, never 0.
+    #[serde(default)]
+    pub delivery_events: bool,
 }
 
 /// ⚠️ The terminal state is `Completed`, never "sent": an issue whose every

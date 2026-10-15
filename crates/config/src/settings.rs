@@ -1047,12 +1047,46 @@ pub struct EmailSettings {
 /// invite mail depend on. Both optional: unset ⇒ fall back to `email.from_*`,
 /// so a self-hosted instance needs no extra configuration.
 /// Env: `ROOMLER__NEWSLETTER__FROM_EMAIL` / `ROOMLER__NEWSLETTER__FROM_NAME`.
-#[derive(Debug, Deserialize, Clone, Default)]
+///
+/// FR-102 P5 adds the delivery side (`docs/growth-observability.md`, the
+/// newsletter): the key SendGrid's signed Event Webhook is verified with, and
+/// the per-issue link tags.
+#[derive(Debug, Deserialize, Clone)]
 pub struct NewsletterSettings {
     #[serde(default)]
     pub from_email: Option<String>,
     #[serde(default)]
     pub from_name: Option<String>,
+    /// FR-102 P5 (D6) — the public key SendGrid signs its Event Webhook
+    /// with (Mail Settings → Event Webhook → Signature Verification): the
+    /// base64 DER key SendGrid shows, or the same key as PEM. Empty — the
+    /// default — and `POST /api/sendgrid/webhook` answers 404 to
+    /// everything: with nothing to verify against, nothing is accepted.
+    /// Env: `ROOMLER__NEWSLETTER__EVENT_WEBHOOK_PUBLIC_KEY`.
+    #[serde(default)]
+    pub event_webhook_public_key: String,
+    /// FR-102 P5 (D5) — the issue's links to this site carry
+    /// `utm_source=newsletter&utm_medium=email&utm_campaign=nl-<slug>`,
+    /// identical for every recipient. Default **on**; `false` sends the
+    /// links as written (and the issue's visits read "not measured").
+    /// Env: `ROOMLER__NEWSLETTER__LINK_TAGS`.
+    #[serde(default = "newsletter_default_link_tags")]
+    pub link_tags: bool,
+}
+
+fn newsletter_default_link_tags() -> bool {
+    true
+}
+
+impl Default for NewsletterSettings {
+    fn default() -> Self {
+        Self {
+            from_email: None,
+            from_name: None,
+            event_webhook_public_key: String::new(),
+            link_tags: newsletter_default_link_tags(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

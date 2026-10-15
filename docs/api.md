@@ -88,6 +88,7 @@ capability URLs, webhook signatures).
 | GET | `/api/stripe/plans` | Plan catalogue |
 | POST | `/api/stripe/checkout` · `/portal` | Stripe checkout / customer portal |
 | POST | `/api/stripe/webhook` | Stripe events (HMAC-signed; un-governed) |
+| POST | `/api/sendgrid/webhook` | FR-102 P5 (`saas`): SendGrid's Event Webhook — ECDSA P-256 signed, verified **before the body is parsed** (401), the empty 404 without `ROOMLER__NEWSLETTER__EVENT_WEBHOOK_PUBLIC_KEY`; records `delivered` · `bounce` · `dropped` · `spamreport` of newsletter messages on their ledger rows (never opens or clicks); un-governed ([growth-observability.md](growth-observability.md#the-newsletter-delivery-per-issue-tags-and-unsubscribes-p5)) |
 | POST | `/api/agent/enroll` | Exchange enrollment token → agent credential |
 | GET | `/api/agent/latest-release` | Agent release manifest (cached GitHub proxy) |
 | GET | `/api/agent/installer/{flavour}` (+`/health`) | Stream the MSI/installer through roomler.ai (`peruser` \| `permachine`) |
@@ -167,8 +168,8 @@ before the search runs, so `q` cannot probe them.
 | POST | `/api/subscribe` | Always **202** (membership-oracle control); double-opt-in confirmation mail, 15-min per-address resend cooldown |
 | GET | `/api/subscribe/confirm/{token}` | **Pure redirect** to the confirm page — never confirms (mailbox link scanners follow GETs; field-hit on day one) |
 | POST | `/api/subscribe/confirm/{token}` | The deliberate click (the confirm page's button); single-use, answers `{confirmed: bool}` |
-| GET | `/api/subscribe/unsubscribe/{token}` | Idempotent; 303 → `/newsletter/unsubscribed?status=…`; the token never expires |
-| POST | `/api/subscribe/unsubscribe/{token}` | RFC 8058 one-click target — plain 200 for every outcome, body unread |
+| GET | `/api/subscribe/unsubscribe/{token}` | Idempotent; 303 → `/newsletter/unsubscribed?status=…`; the token never expires. FR-102 P5: `?i=<slug>` (an issue's link, the same for every recipient) is recorded once as `subscribers.unsubscribed_via` |
+| POST | `/api/subscribe/unsubscribe/{token}` | RFC 8058 one-click target — plain 200 for every outcome, body unread; `?i=` as the GET |
 
 ### Platform-admin (`platform_admins` ObjectId allowlist; 404 on miss)
 
@@ -188,6 +189,7 @@ before the search runs, so `q` cannot probe them.
 | GET/POST | `/api/admin/growth/keys` | FR-102 P8 (D12): list the growth machine keys (prefix, label, use, revoked — never the key or its hash) / mint one `{kind: "ingest", label}` — the key is in the 201 answer only, its SHA-256 is all that is stored; at most 10 live |
 | DELETE | `/api/admin/growth/keys/{key_id}` | Revoke a key (204, idempotent) |
 | POST | `/api/admin/growth/ingest/posts` · `/ingest/snapshots` | FR-102 P8, **`saas` only, authenticated by an ingest key** (`Authorization: Bearer rgi_…`), not a user JWT: the promotion pipeline pushes a post `{platform, platform_id, account, format, url, published_at, utm_*, cost_cents?}` (idempotent on `(platform, platform_id)`) or a snapshot `{platform, platform_id, snapshot: T+1d\|T+7d\|T+28d, taken_at, metrics}` (stored once). A missing, wrong or revoked key is the empty 404 of an absent path; unknown platforms and any field that looks like post text are `422` ([growth-observability.md](growth-observability.md)) |
+| GET | `/api/admin/growth/newsletter?since&until&include_internal` | FR-102 P5: the list over time (new · confirmed · unsubscribed · suppressed per day and by source, the size now) and one row per issue sent in the range — recipients and accepted from the ledger, delivered · bounced · complaints from SendGrid's signed events, unsubscribed through the issue's link, purestat visits and sign-ups by the issue's campaign key; delivery `not_measured` without the webhook key, never 0 ([growth-observability.md](growth-observability.md#the-newsletter-delivery-per-issue-tags-and-unsubscribes-p5)) |
 | GET | `/api/admin/growth/campaigns?since&until&by&include_internal` | FR-102 P6: per normalised campaign key (`by` = `source`·`medium`·`campaign`·`content`), purestat's web plane queried **live** for the exact UTC-day range beside the account funnel; a purestat outage or revoked key reads `not_measured`, never 0; every rate `{n, value}` with a value only at n ≥ 30 ([growth-observability.md](growth-observability.md)) |
 | POST | `/api/admin/overlay-block/reclaim` | Reclaim quarantined overlay address blocks (dry-run by default) |
 | POST/GET | `/api/admin/newsletter/issues` | FR-58: create draft / list issues |

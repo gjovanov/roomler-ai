@@ -29,6 +29,10 @@
 //!   reach as the promotion pipeline pushed it, then what each post's key
 //!   brought, and spend) and the machine keys that open the `saas` module's
 //!   ingest routes.
+//! * [`newsletter`] — P5: the list over time and the per-issue table
+//!   (delivery from SendGrid's signed Event Webhook, unsubscribes through
+//!   the issue's own link, visits and sign-ups by the issue's campaign key).
+//!   The webhook itself is the `saas` module's.
 
 pub mod campaigns;
 pub mod channels;
@@ -37,6 +41,7 @@ pub mod digest;
 pub mod exclusions;
 pub mod funnel;
 pub mod keys;
+pub mod newsletter;
 pub mod org_daily;
 pub mod orgs;
 pub mod render;
@@ -91,6 +96,8 @@ pub fn admin_routes() -> Router<AppState> {
         .route("/channels", get(channels::get_channels))
         .route("/keys", get(keys::list_keys).post(keys::mint_key))
         .route("/keys/{key_id}", delete(keys::revoke_key))
+        // P5 — the newsletter: the list over time and the per-issue table.
+        .route("/newsletter", get(newsletter::get_newsletter))
 }
 
 /// Whether a module is mounted on this pod — the gate every growth read of

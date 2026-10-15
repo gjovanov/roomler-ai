@@ -153,6 +153,24 @@
             opted out — so that it is not silently added again — and stop sending. We do not sell, rent or share
             this list, and we do not use it for advertising.
           </p>
+          <p class="text-body-1 legal-muted mb-4">
+            For each issue we send, we keep a record of which addresses it was sent to and whether our email
+            delivery provider accepted it. The provider then reports, and we record with that send, whether the
+            message was <strong>delivered, bounced, dropped, or reported as spam</strong>. We use this for one
+            purpose: to keep the list deliverable and to know how each issue fared. If the provider reports that an
+            address does not exist (a hard bounce) or that its owner marked the email as spam, we stop sending to
+            it until you subscribe again. <strong>We never record whether you opened an email or clicked a
+            link</strong>: there are no tracking pixels, and the provider's open and click tracking is switched off.
+          </p>
+          <p class="text-body-1 legal-muted mb-4">
+            The links in an issue that point to our own website carry that issue's name (for example
+            <code>utm_campaign=nl-october-notes</code>) so our analytics (2.15) can count visits per issue. The tag is
+            <strong>identical for every reader</strong> — the only part of the email that is specific to you is
+            your unsubscribe link, which also names the issue it came in. If you unsubscribe through it, we note
+            which issue it was. This record is kept with the subscription record (see section 7) and erased with it
+            on request; the legal basis is our legitimate interest in sending a newsletter people want
+            (Art. 6(1)(f) GDPR).
+          </p>
 
           <h3 class="text-h6 font-weight-bold mb-2">2.15 Analytics</h3>
           <p class="text-body-1 legal-muted mb-4">
@@ -299,6 +317,7 @@
             <li class="mb-1">Short-lived operational data such as connection diagnostics and crash reports is deleted automatically on a shorter cycle, typically <strong>7 days</strong>.</li>
             <li class="mb-1">Enrollment tokens and similar one-time credentials expire within minutes to hours.</li>
             <li class="mb-1">Product-update subscriptions are kept until you unsubscribe. After that we retain only the fact that the address opted out, so it cannot be re-added silently; ask us and we will erase that too.</li>
+            <li class="mb-1">The record of which issues were sent to an address — with the delivery status our email provider reported (delivered, bounced, dropped, reported as spam) and, if you unsubscribed through an issue's link, which issue — is kept with that subscription record and erased with it on request.</li>
           </ul>
           <p class="text-body-1 legal-muted">
             These deletions are enforced by the database itself rather than by a manual process. When you delete
