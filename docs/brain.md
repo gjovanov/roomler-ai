@@ -277,7 +277,7 @@ The whole run cost $0.24 in model calls.
 | facts, budgets, revisions, snapshots, the routes | [`crates/modules/hive/src/brain.rs`](../crates/modules/hive/src/brain.rs): `reserve` `:376`, `recount` `:451`, `bump_rev` `:503`, `snapshot` `:641`, `may_write` `:785` |
 | the indexes: facts by instance, one counter per instance, snapshots with a one-day TTL | [`crates/modules/hive/src/lib.rs:303`](../crates/modules/hive/src/lib.rs#L303) |
 | the snapshot at a start, and its re-send | [`routes.rs:491`](../crates/modules/hive/src/routes.rs#L491), [`agent_socket.rs:1156`](../crates/modules/hive/src/agent_socket.rs#L1156) |
-| the frame | `ServerMsg::HiveMemory` in [`signaling.rs:3551`](../crates/remote_control/src/signaling.rs#L3551); `MAX_CORE_MEMORY_BYTES` in [`hive.rs:63`](../crates/remote_control/src/hive.rs#L63); `RpcCap::HiveMemory` (`hive-memory`), matched by equality |
+| the frame | `ServerMsg::HiveMemory` in [`signaling.rs:3574`](../crates/remote_control/src/signaling.rs#L3574); `MAX_CORE_MEMORY_BYTES` in [`hive.rs:63`](../crates/remote_control/src/hive.rs#L63); `RpcCap::HiveMemory` (`hive-memory`), matched by equality |
 | the device | [`supervisor.rs`](../agents/roomlerd/src/hive/supervisor.rs): `receive_memory` `:710`, the launch `:1751`, `write_memory` `:2273`, `memory_note` `:2348`; the copy in `WRAPPER` `:93` and, on Windows, [`hive_win.rs:677`](../agents/roomlerd/src/hive_win.rs#L677) `prep` |
 | the device's key | `hive_core_memory` in [`config.rs:446`](../crates/agent-core/src/config.rs#L446) |
 | the page | [`ui/src/views/hive/HiveMemoryView.vue`](../ui/src/views/hive/HiveMemoryView.vue); the calls in [`stores/hive.ts`](../ui/src/stores/hive.ts) |
