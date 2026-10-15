@@ -17,7 +17,9 @@
 //! And the device's half (P2), the real `roomlerd` code against this server:
 //! a due token is renewed and saved before use; a device that was off across
 //! its expiry renews inside the grace and comes back by itself; a token
-//! re-enrolled on disk is taken up without a restart.
+//! re-enrolled on disk is taken up without a restart; a secondary org renews
+//! against its own server and into its own `[[orgs]]` entry; and a server
+//! that answers the renew route with 404 changes nothing.
 
 use crate::fixtures::test_app::TestApp;
 use crate::tunnel_tests::wait_agent_online;
@@ -707,4 +709,145 @@ async fn a_token_re_enrolled_on_disk_is_used_without_a_restart() {
     );
     let _ = stop_tx.send(true);
     task.abort();
+}
+
+/// A device in two orgs (multi-org) holds a token from each org's server. The
+/// secondary org's token renews against the SECONDARY's server and is saved
+/// into that org's `[[orgs]]` entry. Renewing it at the primary's server is
+/// refused (that server does not know the device), and saving it over the
+/// primary's token would cut the primary off at the next restart.
+#[tokio::test]
+async fn a_secondary_org_renews_against_its_own_server() {
+    use roomlerd::token_renewal::{self, Settings};
+    let primary = TestApp::spawn().await;
+    let secondary = TestApp::spawn().await;
+    let seeded_a = primary.seed_tenant("fr103orga").await;
+    let seeded_b = secondary.seed_tenant("fr103orgb").await;
+    let mut cfg =
+        crate::agent_tests::enrol_via_agent_lib(&primary, &seeded_a, "m-fr103-orgs", "orgs").await;
+    let org_b =
+        crate::agent_tests::enrol_via_agent_lib(&secondary, &seeded_b, "m-fr103-orgs", "orgs")
+            .await;
+    // The control: only its own server renews the secondary's token.
+    assert_ne!(
+        renew(&primary, &org_b.agent_token).await.status(),
+        200,
+        "the primary's server must not renew a token it never issued"
+    );
+    cfg.orgs.push(roomlerd::config::OrgEntry {
+        label: "org-b".into(),
+        server_url: org_b.server_url.clone(),
+        ws_url: None,
+        agent_token: org_b.agent_token.clone(),
+        agent_id: org_b.agent_id.clone(),
+        tenant_id: org_b.tenant_id.clone(),
+        enabled: true,
+        overlay_mode: roomlerd::config::OrgOverlayMode::Off,
+        overlay_wg_secret_key: None,
+        overlay_wg_key_epoch: 0,
+        overlay_advertised_routes: Vec::new(),
+        overlay_exit_node_enabled: false,
+        advertise_routes: Vec::new(),
+        netstack_socks_port: None,
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    roomlerd::config::save(&path, &cfg).unwrap();
+    let services = config_services(&path);
+    // The secondary org's own enrollment, as its signalling loop builds it.
+    let enrollment = token_renewal::Enrollment {
+        label: "org-b".into(),
+        server_url: org_b.server_url.clone(),
+        tenant_id: org_b.tenant_id.clone(),
+        agent_id: org_b.agent_id.clone(),
+        token: roomlerd::token_slot::TokenSlot::new(org_b.agent_token.clone()),
+    };
+    // A token minted in the same second as the enrollment's is byte-identical.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let due_now = Settings {
+        horizon: Some(Duration::from_secs(400 * 86_400)),
+        ..Settings::default()
+    };
+    token_renewal::check_once(
+        &enrollment,
+        &services,
+        due_now,
+        chrono::Utc::now().timestamp(),
+    )
+    .await;
+    let renewed = enrollment.token.get();
+    assert!(renewed != org_b.agent_token, "renewed, by its own server");
+    assert_eq!(self_devices(&secondary, &renewed).await, 200);
+    let back = roomlerd::config::load(&path).unwrap();
+    assert!(
+        back.orgs[0].agent_token == renewed,
+        "saved into its own [[orgs]] entry"
+    );
+    assert!(
+        back.agent_token == cfg.agent_token,
+        "the primary's token is untouched"
+    );
+    assert_eq!(
+        self_devices(&primary, &back.agent_token).await,
+        200,
+        "and the primary still connects with it"
+    );
+}
+
+/// A server older than FR-103, or one with `rc.token_renewal` off, answers the
+/// renew route with 404. The device carries on exactly as before: the token it
+/// has, nothing written to its config, no failure backoff (the next look is on
+/// the normal schedule), and the token still accepted.
+#[tokio::test]
+async fn an_old_server_answering_404_changes_nothing() {
+    use roomlerd::token_renewal::{self, Settings};
+    let old = TestApp::spawn_with_settings(|s| s.rc.token_renewal = false).await;
+    let seeded = old.seed_tenant("fr103oldsrv").await;
+    let cfg =
+        crate::agent_tests::enrol_via_agent_lib(&old, &seeded, "m-fr103-oldsrv", "oldsrv").await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    roomlerd::config::save(&path, &cfg).unwrap();
+    let before = std::fs::read_to_string(&path).unwrap();
+    let services = config_services(&path);
+    let enrollment = token_renewal::Enrollment {
+        label: "primary".into(),
+        server_url: cfg.server_url.clone(),
+        tenant_id: cfg.tenant_id.clone(),
+        agent_id: cfg.agent_id.clone(),
+        token: roomlerd::token_slot::TokenSlot::new(cfg.agent_token.clone()),
+    };
+    let due_now = Settings {
+        horizon: Some(Duration::from_secs(400 * 86_400)),
+        ..Settings::default()
+    };
+    let look = token_renewal::check_once(
+        &enrollment,
+        &services,
+        due_now,
+        chrono::Utc::now().timestamp(),
+    )
+    .await;
+    assert_eq!(
+        look,
+        token_renewal::Look {
+            next: Settings::default().interval,
+            failed: false
+        },
+        "no failure backoff: the next look is on the normal schedule"
+    );
+    assert!(
+        enrollment.token.get() == cfg.agent_token,
+        "the token it had"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        before,
+        "nothing written to the config"
+    );
+    assert_eq!(
+        self_devices(&old, &cfg.agent_token).await,
+        200,
+        "and the token is still accepted"
+    );
 }
