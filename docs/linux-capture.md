@@ -1535,6 +1535,66 @@ over QMP, with no probe window over the top bar:
 - **Plasma 6.7, a KWin crash.** It still reopened from the token: no portal
   `Closed`, exit 4 (§4.8), and a new picture 4.2 s after the crash.
 
+### 5.8 A computer going to sleep (FR-93 P5h)
+
+A sleeping computer says nothing before it goes. Measured on the released
+0.4.136 (the FR-93 lab, 2026-10-15, suspend-to-RAM turned on in the guests):
+- GNOME 50 per-user: the viewer dropped 5.6 s into the suspend and showed no
+  reason for the whole sleep;
+- Plasma 6.7 per-user: *Reconnecting* 8 s in, and nothing naming the sleep.
+
+Linux announces every sleep before it happens. logind sends
+`PrepareForSleep(true)` and then waits for every process that holds a **delay**
+inhibitor, up to its `InhibitDelayMaxSec` (5 s by default). So while a
+remote-control session is live, the daemon holds one. On the signal it tells
+each live session's controller over that session's own control channel, then
+lets go. Each session registers its control channel as it starts
+(`sleep_notice.rs:62`); the watcher (`sleep_notice.rs:161`, the rule
+`:149`) sends `peer.rs:5176`'s notice to all of them at once (`:93`):
+
+```mermaid
+sequenceDiagram
+    participant L as logind
+    participant D as roomlerd (the sleep watcher)
+    participant N as NetworkManager
+    participant V as the viewer
+    D->>L: Inhibit("sleep", delay), while a session is live
+    Note over L: the person (or the idle timer) sleeps the computer
+    L-->>D: PrepareForSleep(true)
+    L-->>N: PrepareForSleep(true)
+    D->>V: rc:media-waiting host_sleep, on each session's control channel
+    N->>N: takes the network down
+    D->>L: the inhibitor's fd closed
+    Note over L: the computer sleeps
+    L-->>D: PrepareForSleep(false), after the wake
+    Note over V: reconnects by itself; the new session names<br/>whatever holds the picture back (a lock: §5.3)
+```
+
+| | what | why |
+|---|---|---|
+| the inhibitor | a logind **delay** inhibitor on `sleep`, held only while a session is live: taken within 2 s of the first, let go within 2 s of the last, and never taken while a sleep is under way | a *delay* leaves the person at the computer the last word about sleep: keeping a host awake through a session is FR-55's, not this. An idle daemon holds nothing (`systemd-inhibit --list` shows it only during a session). logind refuses an inhibitor for a sleep it is already carrying out (`OperationInProgress`); after `PrepareForSleep(true)` the next one waits for the wake, or for logind's `PreparingForSleep` to read false if the wake's signal was missed |
+| the notice | `rc:media-waiting {for: "host_sleep", waits_ms: 3600000}` with its hint, to every live session at once, each within 1.5 s | the notice the other waits use (P2d-2), so `ROOMLERD_MEDIA_WAITING=0` silences it too. 1.5 s keeps the whole well inside logind's 5 s |
+| the race | NetworkManager takes the network down on the same signal | measured: the notice out 44 ms (KDE) and 92 ms (GNOME) before the first failed send. A send is a few milliseconds; a host slower than that would lose it, and its viewer falls back to *Reconnecting*, as before P5h |
+| the viewer | *This computer is going to sleep.*, status *the computer is asleep*, no countdown | a viewer from before P5h shows the agent's hint under its generic title, which still names the sleep |
+| the watcher | a thread on the system bus (`portal-capture`, which every shipped Linux agent carries through `full`); a lost logind is retried every 60 s | zbus's blocking API panics on a runtime thread |
+| the kill switch | `ROOMLERD_SLEEP_NOTICE=0`: no inhibitor, no notice, as before P5h | — |
+
+**Measured** with the lifecycle oracle on the FR-93 lab (2026-10-15), each
+guest a per-user install, the suspend the guest's own `systemctl suspend`, the
+wake libvirt's `dompmwakeup` 30 s later:
+- **Plasma 6.7** (candidate `a81dfcf8c`): the viewer read *This computer is
+  going to sleep* 1.9 s before libvirt saw the guest suspended, then
+  *Reconnecting* 7.3 s into the sleep. After the wake, KDE asked again for the
+  screen share, as on 0.4.136, so the next picture waits for the person.
+- **GNOME 50** (lab build `5f60a0e46`, with the inhibitor rule above): the
+  notice 1.5 s before the suspend, and no refused inhibitor. GNOME locks as it
+  sleeps, so after the wake the new session named the lock (§5.3) 11.2 s after
+  it, most of which is the viewer's reconnect backoff.
+
+⚠️ The lab's guests are virtual. After an S3 resume, GNOME's shell on their
+virtio-gpu display has also hung (llvmpipe), and KDE resumed black. What a wake
+looks like on real hardware is AC12's (Asahi).
+
 ## 6. Where each arm has been proven
 
 | Arm | Host | What was measured |
@@ -1554,6 +1614,7 @@ over QMP, with no probe window over the top bar:
 | mutter, a user switch (FR-93 P5f) | `wlab-gnome`, a per-user install | GDM's login screen for 40 s: the notice 3.9–4.3 s after the switch, held for the whole switch; a new frame 0.4–0.5 s after the switch back. A viewer that left during the switch left no helper behind (before the hold yielded, one was still running 63 s later). The P5e build kept the last frame for the whole switch with no reason (§5.6). The DRM arm (`wlab-gnome-sys`, 0.4.134) follows the switch on its own: the login screen in 3.3 s, back in 0.4 s |
 | mutter, a session opened during a user switch (FR-93 P5g) | the same guest | the viewer connecting while GDM's login screen held the seat: `session_away` at once, held, a picture 1.6 s after the switch back. Through GNOME's own *Switch User* (a lock, then the login screen): `session_away`, then the unlock notice, then a picture 1.2 s after the unlock. Before P5g: `wayland_not_enabled`, which is false, and no picture after the switch back (§5.6) |
 | mutter and the portal, a stop at the screen (FR-93 P6c) | `wlab-gnome` and `wlab-kde`, per-user installs | GNOME's Stop and KDE's End each ended the session as `host_disconnect`: the viewer dropped 1.1 s and 2.2 s after the click and stayed away, and the pill and the tray icon were gone. A lock still waited for the unlock, and a KWin crash still reopened (a new picture 4.2 s after it). Before P6c, Stop was undone 0.5 s later and End 3 s later (§5.7) |
+| every arm, a suspend (FR-93 P5h) | `wlab-kde` and `wlab-gnome`, per-user installs, suspend-to-RAM on | *This computer is going to sleep* 1.9 s (KDE) and 1.5 s (GNOME) before the guest was suspended, sent 44 ms and 92 ms before NetworkManager's teardown failed the first send. The released 0.4.136 gave no reason at all (GNOME) or only *Reconnecting* 8 s in (KDE) (§5.8) |
 | cascade order | a host with DRM **and** the portal | DRM alone → `backend=drm`; both flags → `backend=drm`; neither → no helper, no dialog |
 | dependency rule | x86_64 and aarch64 builds | `readelf -d`: **0** `DT_NEEDED` entries matching `pipewire`/`libspa`; a live run with the library bind-mounted away still completed the portal handshake |
 
@@ -1575,6 +1636,7 @@ the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/co
 | — | `ROOMLERD_DRM_WAKE_WAIT` | **on** | FR-93 P3e (§3.3): a display switched off is told to the controller (`display_wake`) and waited out, by a running session and by an open. Off = the last frame kept alive with no reason, and an open during the blank falls through the cascade, as before P3e |
 | — | `ROOMLERD_SESSION_WATCH` | **on** | FR-93 P5f (§5.6): a per-user capture on the PipeWire arms tells the controller when its user's session is in the background (`session_away`): a user switch, or the login screen. Off = the last frame kept alive with no reason, as before P5f |
 | — | `ROOMLERD_SCREEN_STOP` | **on** | FR-93 P6c (§5.7): a share the person at the screen stopped with the desktop's own control (GNOME's Stop, KDE's End) ends the session as their Disconnect does. Off = the capture is reopened, as before P6c, which undoes their stop |
+| — | `ROOMLERD_SLEEP_NOTICE` | **on** | FR-93 P5h (§5.8): while a session is live, a logind delay inhibitor on sleep, and every controller told `host_sleep` before the computer sleeps. Off = no inhibitor and no notice, as before P5h |
 | `uinput` | `ROOMLERD_UINPUT` | off | inject through `/dev/uinput`, below the compositor — the input pair of `drm_capture` on Wayland. Host-global: it injects into whatever has focus, the greeter included |
 | `portal_capture` | `ROOMLERD_PORTAL_CAPTURE` | off | the portal arm (§4). **Attended**: a logged-in user and a consent dialog on first use; tried after DRM, before X11. A per-user daemon in its own Wayland session uses the portal by itself where mutter is absent (§1.2, P2d-3), so there this key only forces it (`true`) or keeps it off (`false`) |
 | `portal_input` | `ROOMLERD_PORTAL_INPUT` | off for a configured arm; **on** for the automatic portal | input through the portal's RemoteDesktop, on the same session. A configured `portal_capture` takes input only with it `true`. The automatic portal (§1.2) asks for remote control unless it is `false` (FR-93 P4b). On GNOME the dialog's own *Allow Remote Interaction* switch must also be flipped. On a configured mutter arm (`mutter_capture`) it means mutter's own RemoteDesktop (§5.2) |

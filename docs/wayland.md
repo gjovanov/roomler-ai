@@ -77,9 +77,12 @@ log). Each cell names the release it was measured on.
 | **a viewer that connects during a user switch** | not measured | waits with the same notice, then the picture ~2 s after the switch back; through GNOME's *Switch User*, the unlock notice in turn (0.4.136) | the same wait (0.4.136); not measured |
 | **logout → login** | follows the seat to the greeter and back | *Reconnecting* during the logout; the daemon starts with the next login, a picture ~5 s after it (0.4.135) | the same, a picture ~12 s after the login (0.4.135) |
 | **compositor crash** | not measured | GNOME's shell crash ends the session like a logout, then as the login: a picture ~3.5 s after it (0.4.136) | KWin restarts, and the portal reopens from its token: a new picture ~4 s after the crash (0.4.136) |
-| **suspend → resume** | not measured | not measured | not measured |
+| **suspend → resume** | not measured | *"This computer is going to sleep"* 1.5 s before the computer sleeps; after the wake, the lock's notice (GNOME locks as it sleeps), then the desktop after the unlock (P5h, lab) | the same notice 1.9 s before; after the wake KDE asks again for the screen share, so the picture waits for the person (P5h, lab) |
 
-The lab guests have suspend-to-RAM off, so suspend is owed (FR-93 AC7).
+Before P5h a sleeping computer said nothing: on 0.4.136 the GNOME viewer dropped
+5.6 s into the suspend with no reason, and KDE's read *Reconnecting* 8 s in
+([`linux-capture.md`](linux-capture.md) §5.8). The lab's guests are virtual, so
+a wake on real hardware is still owed (FR-93 AC12, Asahi).
 
 ⚠️ On 0.4.135 a running DRM session's *display asleep* notice can be lost to its own last
 frame: the notice travels on the control channel and the last frame on the video one, and the viewer clears a
@@ -115,6 +118,7 @@ Two messages carry it (`useRemoteControl.ts`, `mediaWaitingCopy`).
 | `rc:media-waiting` | `screen_unlock` | GNOME's screen is locked, and GNOME shares no locked screen | unlock it at the computer; the picture comes back by itself |
 | `rc:media-waiting` | `display_wake` | the display is off, so DRM has no scanout to read | move the viewer's mouse, or any input at the computer |
 | `rc:media-waiting` | `session_away` (0.4.136) | the computer shows the login screen or another user's session, and a per-user install shares only its own user's | switch back to that session at the computer |
+| `rc:media-waiting` | `host_sleep` (FR-93 P5h) | the computer is going to sleep; the viewer then loses the connection | wake the computer; the viewer reconnects by itself, and the new session names what still holds the picture back (often the lock) |
 
 An older viewer shows an unknown `for` under the dialog's title, with the
 agent's hint below it, so a newer agent's words still read.
@@ -171,7 +175,8 @@ Release builds were checked against their published digest and signature. The
 arm-by-arm field record is [`linux-capture.md`](linux-capture.md) §6, and every
 run, including the wrong turns, is in the spec's field-verification log.
 
-Still owed (FR-93's open acceptance criteria): suspend and resume; KDE's
+Still owed (FR-93's open acceptance criteria): suspend and resume on a release
+and on real hardware; KDE's
 lifecycle on a release; a real GPU and Asahi on a release (AC12); the indicator
 and consent prompt on every desktop (AC10, with FR-27); and X11, Windows and
 macOS unchanged (AC11).
@@ -189,3 +194,4 @@ ones that decide this page:
 | `portal_capture`, `mutter_capture` | `ROOMLERD_PORTAL_CAPTURE`, `ROOMLERD_MUTTER_CAPTURE` | off | the per-user arms, explicitly; any capture key hands the choice back to the operator |
 | — | `ROOMLERD_MEDIA_WAITING` | on | the `rc:media-waiting` notices (§4); off = the viewer is told nothing and reconnects as before |
 | — | `ROOMLERD_SESSION_WATCH` | on | the user-switch notice (`session_away`); off = the last frame stays, with no reason |
+| — | `ROOMLERD_SLEEP_NOTICE` | on | the sleep notice (`host_sleep`) and the logind delay inhibitor that gives it time; off = a sleeping computer says nothing, as before P5h |
