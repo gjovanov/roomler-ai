@@ -29,7 +29,7 @@ updates, and not one recorded an outcome.
 **1. The watcher waits for its own parent to die, and that death is what kills it.**
 
 `install_tarball_linux` completes the entire install **synchronously** and returns
-`Ok(std::process::id())` — *the daemon's own pid* (`updater.rs:1577`). That pid is
+`Ok(std::process::id())` — *the daemon's own pid* (`updater.rs:2197`). That pid is
 handed to the watcher as `--installer-pid`, and `watch()` calls
 `wait_for_pid(installer_pid, INSTALLER_BUDGET)` unconditionally
 (`post_install.rs:221`), polling `kill(pid, 0)` for up to 600 s
@@ -44,7 +44,7 @@ nothing being waited *for*: the install finished before the watcher existed. The
 **2. The cgroup teardown then removes any chance of finishing.** Both packaged
 units ship with no `KillMode` (`packaging/linux/roomlerd.service`,
 `roomler.service`) ⇒ systemd's default `control-group`. `spawn_watcher` launches
-the watcher as a plain child (`updater.rs:1865`) on the reasoning that it "is
+the watcher as a plain child (`updater.rs:2563`) on the reasoning that it "is
 reparented to init and runs to completion on its own" — but reparenting to PID 1
 does not leave the cgroup. `docs/fr/FR-36-wayland-capture.md:371` already recorded
 this exact lesson for a different subsystem.

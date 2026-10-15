@@ -93,6 +93,18 @@ ReadWritePaths=%t
 ExecStartPre=-+/bin/mkdir -p -m 0700 %h/.local/state/roomler
 ReadWritePaths=-%h/.local/state/roomler
 ReadWritePaths=-%h/Downloads
+# FR-96 P2a — /var/tmp, for ONE file: the wake the root update helper watches
+# (`roomler-update.path`, PathExists=/var/tmp/roomler-update-check). On a host
+# whose installer enabled that helper, this daemon installs nothing itself; a
+# pushed update only touches the wake file. ProtectSystem=strict leaves /var/tmp
+# read-only wherever this sandbox applies (Fedora's user manager — the very
+# population #2046 froze), so without this line every push there would fail
+# EROFS and wait for the helper's own 6 h timer. Only the directory can be
+# granted: a ReadWritePaths entry binds what EXISTS when the sandbox is built,
+# and the helper deletes the wake file each time it runs. Nothing is opened
+# beyond what this account can do outside the sandbox — /var/tmp is world
+# writable. `-`: a host without it still starts.
+ReadWritePaths=-/var/tmp
 
 [Install]
 # Both targets (#2144). `PartOf=` above stops the daemon with the graphical

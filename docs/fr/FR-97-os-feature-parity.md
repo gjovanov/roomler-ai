@@ -515,7 +515,7 @@ model on Windows, so the three agree on what the mode means.
 
 - Unit tests wherever the logic can run on every OS (FR-43's practice: keep `decide()` out of `cfg(macos)`), and a
   macOS `cargo test` lane for `tunnel-core` with `overlay-l3`. Today macOS only compiles, plus the real-utun kernel
-  test (`ci.yml:1097-1113`).
+  test (`ci.yml:1161-1177`).
 - Extend `macos_kernel_tests` on the runner's real utun: an exemption pinned and read back, the pf anchor loaded and
   flushed, the resolver keys installed and purged.
 - Field: the `vmtest` macOS, Win11 (Home and Pro) and Ubuntu cells; one exit cell per (client OS × exit OS) pair;

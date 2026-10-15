@@ -143,7 +143,7 @@ Anything a deployed host — or a deployed *operator runbook* — already depend
   people's shell history.
 - residual on-disk paths not yet behind `appdirs` (§5).
 - the HTTP `user_agent("roomler-agent/…")` sent by the updater
-  (`agents/roomlerd/src/updater.rs:588,671,873`). It is **recorded** into device/session
+  (`agents/roomlerd/src/updater.rs:717,800,1002`). It is **recorded** into device/session
   telemetry at `crates/api/src/ws/handler.rs:69` — confirm nothing *dispatches* on it before
   changing it, because changing it also changes what historical rows mean.
 

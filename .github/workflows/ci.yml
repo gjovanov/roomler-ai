@@ -773,18 +773,24 @@ jobs:
           # Every path the unit lists as optional (`-`), the XDG user folders
           # (~/Videos, ~/Downloads) aside, must be MISSING, as on any host
           # installed after the rename, or the cell proves nothing about a
-          # missing path.
+          # missing path. /var/tmp is aside too: it exists on every Linux
+          # host, its `-` is belt and braces, and what FR-96 P2a needs from it
+          # is that the sandbox leaves it WRITABLE — asserted below, with a
+          # negative control.
           for p in $(grep -E '^ReadWritePaths=' agents/roomlerd/packaging/linux/roomler.service | sed 's/^ReadWritePaths=//' | tr ' ' '\n' | grep '^-' | sed "s|^-||; s|%h|$H|g"); do
-            if [ "$p" != "$H/Videos" ] && [ "$p" != "$H/Downloads" ] && [ -e "$p" ]; then echo "::error::$p exists on the runner; the cell proves nothing"; exit 1; fi
+            if [ "$p" != "$H/Videos" ] && [ "$p" != "$H/Downloads" ] && [ "$p" != /var/tmp ] && [ -e "$p" ]; then echo "::error::$p exists on the runner; the cell proves nothing"; exit 1; fi
           done
           OUT=/tmp/p2c-where.out
+          # Can the unit create a file in /var/tmp? Used by both units below.
+          # No `%` or `$` in it: systemd would expand either in ExecStart.
+          WAKE_PROBE='if touch /var/tmp/.p2c-wake-probe 2>/dev/null; then echo VARTMP_WRITABLE; rm -f /var/tmp/.p2c-wake-probe; else echo VARTMP_READ_ONLY; fi'
           {
             echo "[Service]"
             echo "Type=oneshot"
             echo "User=$ME"
             echo "StandardOutput=file:$OUT"
             echo "StandardError=journal"
-            echo "ExecStart=/bin/sh -c '\"$BIN\" record --where; if touch \"$H/.p2c-probe\" 2>/dev/null; then echo HOME_WRITABLE; else echo HOME_READ_ONLY; fi'"
+            echo "ExecStart=/bin/sh -c '\"$BIN\" record --where; if touch \"$H/.p2c-probe\" 2>/dev/null; then echo HOME_WRITABLE; else echo HOME_READ_ONLY; fi; $WAKE_PROBE'"
             grep -E '^(NoNewPrivileges|ProtectSystem|ProtectHome|ReadWritePaths)=' agents/roomlerd/packaging/linux/roomler.service | sed "s|%h|$H|g"
           } | sudo tee /etc/systemd/system/p2c-sandbox.service
           sudo systemctl daemon-reload
@@ -795,6 +801,32 @@ jobs:
           cat "$OUT"
           grep -q "$H/Videos/Roomler" "$OUT" || { echo "::error::under the sandbox the recorder did not choose ~/Videos/Roomler"; exit 1; }
           grep -q HOME_READ_ONLY "$OUT" || { echo "::error::the sandbox left the rest of home writable"; exit 1; }
+          # FR-96 P2a: a per-user daemon whose host has the root update
+          # helper touches its wake file, /var/tmp/roomler-update-check.
+          # ProtectSystem=strict leaves /var/tmp read-only (measured on
+          # Fedora 44 KDE: EROFS), so the unit grants it.
+          grep -q VARTMP_WRITABLE "$OUT" || { echo "::error::under the sandbox the daemon cannot write /var/tmp — FR-96's wake file would fail EROFS"; exit 1; }
+          # The negative control: the same sandbox WITHOUT that grant must
+          # leave /var/tmp read-only, or the probe cannot tell the two apart
+          # and the check above proves nothing.
+          NC=/tmp/p2c-nogrant.out
+          {
+            echo "[Service]"
+            echo "Type=oneshot"
+            echo "User=$ME"
+            echo "StandardOutput=file:$NC"
+            echo "StandardError=journal"
+            echo "ExecStart=/bin/sh -c '$WAKE_PROBE'"
+            grep -E '^(NoNewPrivileges|ProtectSystem|ProtectHome|ReadWritePaths)=' agents/roomlerd/packaging/linux/roomler.service | grep -vx 'ReadWritePaths=-/var/tmp' | sed "s|%h|$H|g"
+          } | sudo tee /etc/systemd/system/p2c-nogrant.service
+          if grep -q '^ReadWritePaths=.*/var/tmp' /etc/systemd/system/p2c-nogrant.service; then echo "::error::the negative control still grants /var/tmp"; exit 1; fi
+          sudo systemctl daemon-reload
+          if ! sudo systemctl start p2c-nogrant.service; then
+            sudo journalctl -u p2c-nogrant.service --no-pager | tail -20
+            echo "::error::the negative control's unit did not start"; exit 1
+          fi
+          cat "$NC"
+          grep -q VARTMP_READ_ONLY "$NC" || { echo "::error::without its grant the sandbox still let the unit write /var/tmp: the probe cannot tell, so the check above proves nothing"; exit 1; }
 
       - name: The Linux user unit runs where its user manager sandboxes it — Fedora's configuration (#1997)
         # #1997. The cell above copies the unit's sandbox into a SYSTEM unit,
@@ -848,14 +880,18 @@ jobs:
           governing() {
             sudo awk -v p="$1" '{ m = $5; ok = (m == "/" || p == m || index(p, m "/") == 1) } ok && length(m) >= best { best = length(m); o = $6 } END { print o }' "/proc/$PID/mountinfo"
           }
-          for p in "$RUN" "$H/.local/state/roomler" "$H/.config/roomler" "$H/.local/share/roomler"; do
+          # /var/tmp: FR-96 P2a's wake file for the root update helper.
+          # Measured on Fedora 44 KDE, the field configuration this cell
+          # reproduces: 0.4.128's unit left it read-only (EROFS) in the
+          # daemon's namespace; the grant makes it a read-write mount of its own.
+          for p in "$RUN" "$H/.local/state/roomler" "$H/.config/roomler" "$H/.local/share/roomler" /var/tmp; do
             case "$(opts "$p")" in
               rw*) ;;
-              *) echo "::error::$p is not writable inside the unit (mount options '$(opts "$p")')"; sudo awk '{ print $5, $6 }' "/proc/$PID/mountinfo" | grep -E "^($H|/run/user)"; exit 1 ;;
+              *) echo "::error::$p is not writable inside the unit (mount options '$(opts "$p")')"; sudo awk '{ print $5, $6 }' "/proc/$PID/mountinfo" | grep -E "^($H|/run/user|/var/tmp)"; exit 1 ;;
             esac
           done
           case "$(governing "$H")" in ro*) ;; *) echo "::error::$H is writable inside the unit ('$(governing "$H")')"; exit 1 ;; esac
-          echo "the user unit: sandboxed, LocalAPI bound, the runtime, state, config and data folders writable, the rest of home read-only"
+          echo "the user unit: sandboxed, LocalAPI bound, the runtime, state, config and data folders and /var/tmp writable, the rest of home read-only"
           systemctl --user stop roomler.service
 
   rust-recorder-audio:

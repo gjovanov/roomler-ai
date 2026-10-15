@@ -152,7 +152,7 @@ flowchart LR
 
 ⚠️ **The schema stays readable by the daemon before it.** A daemon refuses a store a newer one wrote
 (`crates/hive-node/src/store.rs:86`), and the updater's crash-loop rollback can put an older daemon
-on a device at any time (`agents/roomlerd/src/updater.rs:1241`). P2's state goes in new tables, and
+on a device at any time (`agents/roomlerd/src/updater.rs:1489`). P2's state goes in new tables, and
 `user_version` stays 1. A rolled-back daemon then opens the store, serves what it holds and ignores
 the rest; a new column on `events` would cost it every transcript.
 
