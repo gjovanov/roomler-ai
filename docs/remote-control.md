@@ -713,6 +713,10 @@ escape, `allow_plaintext_server`, which the device owns.
 
 ### 11.2 Consent
 
+> A session that may cover the device's screen says so on this prompt: "They may also cover this
+> screen while they work." That is privacy mode (FR-99), which needs the device owner's own
+> `privacy_mode_allowed`: [privacy-mode.md](privacy-mode.md).
+
 Five modes, set per device (`AccessPolicy.consent_mode`, admin-set, default
 `prompt`). The server resolves one per session and sends it to the agent as a
 directive on `ServerMsg::Request`:
