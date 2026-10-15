@@ -420,6 +420,11 @@ mod parent {
         Closed,
     }
 
+    /// How long a being-viewed notice waits for its session to be registered:
+    /// 60 × 500 ms. A session still unregistered after that never connected.
+    const REGISTERED_POLLS: u32 = 60;
+    const REGISTERED_POLL: Duration = Duration::from_millis(500);
+
     fn viewings() -> &'static Mutex<HashMap<ObjectId, Viewing>> {
         static V: OnceLock<Mutex<HashMap<ObjectId, Viewing>>> = OnceLock::new();
         V.get_or_init(Default::default)
@@ -463,9 +468,22 @@ mod parent {
                 });
                 return;
             }
+            // The pump opens its capture as the peer is built, a moment before
+            // the session is registered (once its answer is ready): wait for
+            // that, and never for a session that does not get there. Measured
+            // in the lab: the first build looked once, too early, and showed
+            // nothing.
             let hex = session.to_hex();
-            let Some(info) = registry.list().into_iter().find(|i| i.session_id == hex) else {
-                // Gone before anything could be shown.
+            let mut found = None;
+            for _ in 0..REGISTERED_POLLS {
+                found = registry.list().into_iter().find(|i| i.session_id == hex);
+                if found.is_some() || !with_viewings(|v| v.contains_key(&session)) {
+                    break;
+                }
+                tokio::time::sleep(REGISTERED_POLL).await;
+            }
+            let Some(info) = found else {
+                tracing::info!(%session, "no being-viewed notification: the session never got to be registered (FR-93 P6g)");
                 with_viewings(|v| v.remove(&session));
                 return;
             };
