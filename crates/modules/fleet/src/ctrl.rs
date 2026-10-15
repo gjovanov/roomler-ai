@@ -198,6 +198,24 @@ pub fn apply_rc_ctrl(hub: &Hub, ctrl: &serde_json::Value) {
                 }
             }
         }
+        // FR-90 P2g-4a — a removed device whose socket is on another pod is
+        // told to purge what it holds, before the kick published after it.
+        // The hub's own checks: its tenant, and `hive-purge-all`.
+        Some("hive_purge_all") => {
+            let oid = |key: &str| {
+                ctrl.get(key)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| ObjectId::parse_str(s).ok())
+            };
+            let (Some(tid), Some(aid), Some(pid)) =
+                (oid("tenant_id"), oid("agent_id"), oid("purge_id"))
+            else {
+                return;
+            };
+            if hub.push_hive_purge_all(aid, tid, pid).is_ok() {
+                info!(agent = %aid, purge = %pid, "rc ctrl: a removed device's purge delivered from another pod");
+            }
+        }
         _ => {}
     }
 }

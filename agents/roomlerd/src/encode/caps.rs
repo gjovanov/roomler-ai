@@ -1727,6 +1727,11 @@ fn rpc_caps() -> Vec<String> {
     // that runs sessions.
     #[cfg(hive_host)]
     caps.push(RpcCap::HivePurge);
+    // FR-90 P2g-4a — and purges every session it holds on
+    // `rc:hive.purge_all`, which its enrollment's removal sends. A property
+    // of the BUILD, as `hive-purge` is.
+    #[cfg(hive_host)]
+    caps.push(RpcCap::HivePurgeAll);
     // ⚠️ FR-99's `privacy-*` words are NOT here: this list is memoized at boot
     // (`detect()`), and those follow the owner's live gate and the overlay
     // coming up. `signaling::stub_caps` adds them at every announcement.

@@ -3501,6 +3501,24 @@ pub enum ServerMsg {
         session_id: ObjectId,
     },
 
+    /// FR-90 P2g-4a — this device's enrollment is being removed from the
+    /// organization: purge every session it holds, each as
+    /// [`Self::HivePurge`] would, a run stopped first. Pushed by the removal
+    /// while the device's socket is still up, best effort: nothing answers
+    /// it, its credentials are revoked right after, and a device offline at
+    /// its removal keeps what it held (until P7). A device holds copies for
+    /// its primary organization only, so a secondary organization's
+    /// connection ignores it, as it does every Hive frame. Pushed only to a
+    /// connection advertising [`crate::models::RpcCap::HivePurgeAll`]: a
+    /// build that purges a session but predates this frame cannot decode it.
+    ///
+    /// ⚠️ An id only, for the logs; the field set is locked by test.
+    #[serde(rename = "rc:hive.purge_all")]
+    HivePurgeAll {
+        #[serde(with = "oid_hex")]
+        purge_id: ObjectId,
+    },
+
     /// FR-90 P2g-3c — the answer to [`ClientMsg::HiveRetainAsk`], on the
     /// connection that asked: for each session asked about whose record names
     /// this device, what keeps its copy ([`crate::hive::HiveRetainWord`]).
@@ -5417,6 +5435,11 @@ mod tests {
             serde_json::to_value(&order).unwrap(),
             serde_json::json!({"t": "rc:hive.purge", "purge_id": purge.to_hex(),
                                "session_id": sid.to_hex()})
+        );
+        // P2g-4a — a removal's purge of everything: an id, nothing else.
+        assert_eq!(
+            serde_json::to_value(ServerMsg::HivePurgeAll { purge_id: purge }).unwrap(),
+            serde_json::json!({"t": "rc:hive.purge_all", "purge_id": purge.to_hex()})
         );
         let ack = ClientMsg::HivePurgeAck {
             purge_id: purge,

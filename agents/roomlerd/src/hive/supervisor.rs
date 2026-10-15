@@ -1211,6 +1211,24 @@ pub fn handle_purge(
     });
 }
 
+/// FR-90 P2g-4a — `rc:hive.purge_all`: this device's enrollment is being
+/// removed, so every session it holds is purged ([`Supervisor::purge_all`]).
+/// The primary enrollment's only, like every Hive frame: a secondary
+/// organization's removal leaves the copies, which are the primary's.
+pub fn handle_purge_all(purge_id: ObjectId, is_primary: bool) {
+    if !is_primary {
+        warn!(purge = %purge_id, "hive: rc:hive.purge_all ignored — not the primary enrollment");
+        return;
+    }
+    let Some(sup) = global() else {
+        debug!(purge = %purge_id, "hive: rc:hive.purge_all with no supervisor");
+        return;
+    };
+    tokio::spawn(async move {
+        sup.purge_all(purge_id).await;
+    });
+}
+
 /// FR-90 P2g-3d — `rc:hive.retain`: what keeps each copy this device asked
 /// about, kept for the sessions it holds, and the device's own clock run at
 /// once ([`Supervisor::retain_heard`]). The primary enrollment's only, like
@@ -9736,7 +9754,7 @@ done
 
     /// P2e-5 — a rig whose daemon knows its own id (`me`), and takes its
     /// checkpoints, and puts copies in place, in process.
-    fn moving_rig(me: ObjectId, max: usize) -> Rig {
+    pub(crate) fn moving_rig(me: ObjectId, max: usize) -> Rig {
         use super::super::checkpointer::Runner;
         rig_with(
             true,

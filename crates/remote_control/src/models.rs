@@ -932,6 +932,16 @@ pub enum RpcCap {
     /// drops the frame, so a purge pushed to it would wait for an answer that
     /// never comes. Equality-matched, locked by test.
     HivePurge,
+    /// FR-90 P2g-4a — `hive-purge-all`: the device purges every session it
+    /// holds on `rc:hive.purge_all`, which its enrollment's removal sends. A
+    /// build property, on every build that runs sessions.
+    ///
+    /// ⚠️ `hive` and `hive-purge` are its prefixes and NOT the same promise:
+    /// `agent-v0.4.136` purges a session but cannot decode this frame, and
+    /// would log a dropped frame at every removal. Nothing waits on the frame,
+    /// so a build without it is sent nothing and keeps what it held, as one
+    /// offline at its removal does. Equality-matched, locked by test.
+    HivePurgeAll,
     /// FR-94 — a Windows device runs Fleet RPC as SYSTEM through its
     /// session-0 service. An administrator anchored the device (the service
     /// holds its own credential, in a file only SYSTEM and Administrators can
@@ -1029,6 +1039,7 @@ impl RpcCap {
             Self::HiveFork => "hive-fork",
             Self::HiveManage => "hive-manage",
             Self::HivePurge => "hive-purge",
+            Self::HivePurgeAll => "hive-purge-all",
             Self::ExecSystem => "exec-system",
             Self::SshSystem => "ssh-system",
             Self::PrivacyMode => "privacy-mode",
@@ -1039,7 +1050,7 @@ impl RpcCap {
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 28] = [
+    pub const ALL: [RpcCap; 29] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1062,6 +1073,7 @@ impl RpcCap {
         Self::HiveFork,
         Self::HiveManage,
         Self::HivePurge,
+        Self::HivePurgeAll,
         Self::ExecSystem,
         Self::SshSystem,
         Self::PrivacyMode,
@@ -5715,6 +5727,7 @@ mod tests {
         assert_eq!(RpcCap::HiveFork.wire(), "hive-fork");
         assert_eq!(RpcCap::HiveManage.wire(), "hive-manage");
         assert_eq!(RpcCap::HivePurge.wire(), "hive-purge");
+        assert_eq!(RpcCap::HivePurgeAll.wire(), "hive-purge-all");
         assert_eq!(RpcCap::PrivacyMode.wire(), "privacy-mode");
         assert_eq!(RpcCap::PrivacyAvailable.wire(), "privacy-available");
         assert_eq!(RpcCap::SessionPolicy.wire(), "session-policy");
@@ -5845,7 +5858,7 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 17] = [
+        const KNOWN: [(RpcCap, RpcCap); 19] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
@@ -5887,6 +5900,11 @@ mod tests {
             // FR-90 P2g-1 — nor "purges a session and answers it". Locked by
             // `hive_purge_is_a_promise_of_its_own`.
             (RpcCap::Hive, RpcCap::HivePurge),
+            // FR-90 P2g-4a — nor "purges everything it holds at its removal",
+            // and neither is "purges a session". Locked by
+            // `hive_purge_all_is_a_promise_of_its_own`.
+            (RpcCap::Hive, RpcCap::HivePurgeAll),
+            (RpcCap::HivePurge, RpcCap::HivePurgeAll),
             // FR-94 — "runs Fleet RPC" is not "runs it as SYSTEM through a
             // service". Locked by `exec_does_not_imply_exec_system`.
             (RpcCap::Exec, RpcCap::ExecSystem),
@@ -6460,6 +6478,30 @@ mod tests {
         assert!(!purges.has_rpc(RpcCap::HivePromote));
         assert_eq!(RpcCap::from_wire("hive-purge"), Some(RpcCap::HivePurge));
         assert!(RpcCap::from_wire("hive-purged").is_none());
+    }
+
+    /// FR-90 P2g-4a — `hive-purge-all` is its own promise: `agent-v0.4.136`
+    /// says `hive` and `hive-purge` and cannot decode `rc:hive.purge_all`, so
+    /// a server that read it out of either would send every such device, at
+    /// its removal, a frame it drops. Nor does it imply purging a session.
+    #[test]
+    fn hive_purge_all_is_a_promise_of_its_own() {
+        let v0_4_136 = AgentCaps {
+            rpc: vec!["hive".into(), "hive-purge".into()],
+            ..Default::default()
+        };
+        assert!(!v0_4_136.has_rpc(RpcCap::HivePurgeAll));
+        let at_removal = AgentCaps {
+            rpc: vec!["hive".into(), "hive-purge-all".into()],
+            ..Default::default()
+        };
+        assert!(at_removal.has_rpc(RpcCap::HivePurgeAll));
+        assert!(!at_removal.has_rpc(RpcCap::HivePurge));
+        assert_eq!(
+            RpcCap::from_wire("hive-purge-all"),
+            Some(RpcCap::HivePurgeAll)
+        );
+        assert!(RpcCap::from_wire("hive-purge-alls").is_none());
     }
 
     /// Forward compatibility: a NEWER agent may advertise verbs this build has
