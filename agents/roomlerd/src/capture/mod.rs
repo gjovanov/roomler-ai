@@ -2108,6 +2108,11 @@ pub enum WaitFor {
     /// per-user install captures only its own user's session, which its
     /// compositor stops drawing while it is in the background.
     SessionAway,
+    /// FR-93 P5h — the computer is going to sleep. Not a capture's wait: the
+    /// sleep watcher says it to every live session just before logind lets the
+    /// computer sleep (`crate::sleep_notice`), because a sleeping host can say
+    /// nothing, and the viewer otherwise saw its picture stop with no reason.
+    HostSleep,
 }
 
 /// FR-93 P6c — a capture error that means the person at the screen stopped

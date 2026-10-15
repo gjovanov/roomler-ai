@@ -4075,6 +4075,9 @@ async fn run_cmd(
     // the first hello can carry it. It reads logind on its own thread; the
     // signalling loop only ever reads its cache.
     roomlerd::desktop_brief::start();
+    // FR-93 P5h — tell each viewer before this computer sleeps (Linux;
+    // nothing elsewhere). A thread of its own; the runtime sends the notices.
+    roomlerd::sleep_notice::start(tokio::runtime::Handle::current());
     // FR-94 — ask this machine's SYSTEM service whether it is anchored, and
     // for which device, so the connection for that device offers
     // `exec-system` (Windows; nothing elsewhere).

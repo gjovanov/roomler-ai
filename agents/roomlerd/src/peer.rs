@@ -265,6 +265,9 @@ pub struct AgentPeer {
     /// stash the lock-state emitter writes through, kept here for the idle
     /// limit's warning ([`Self::idle_handles`]).
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    /// FR-93 P5h — this session's controller is told when the computer goes
+    /// to sleep, for as long as the session lives ([`crate::sleep_notice`]).
+    _sleep_notice: crate::sleep_notice::Registration,
 }
 
 /// FR-16 L0 — the in-process latency harness's one seam into a session.
@@ -1426,6 +1429,8 @@ impl AgentPeer {
             rc_sessions,
         ));
 
+        // FR-93 P5h — told when this computer goes to sleep.
+        let sleep_notice = crate::sleep_notice::register(session_id, control_dc.clone());
         Ok(Self {
             pc,
             session_id,
@@ -1443,6 +1448,7 @@ impl AgentPeer {
             },
             rc_overlay,
             control_dc,
+            _sleep_notice: sleep_notice,
         })
     }
 
@@ -5103,6 +5109,8 @@ fn media_waiting_payload(wait: crate::capture::OpenWait) -> String {
         WaitFor::DisplayWake => ("display_wake", MEDIA_WAITING_HINT_WAKE),
         // FR-93 P5f — this user's session in the background (a user switch).
         WaitFor::SessionAway => ("session_away", MEDIA_WAITING_HINT_AWAY),
+        // FR-93 P5h — the computer is going to sleep (`crate::sleep_notice`).
+        WaitFor::HostSleep => ("host_sleep", MEDIA_WAITING_HINT_SLEEP),
     };
     format!(
         r#"{{"t":"rc:media-waiting","for":"{for_}","waits_ms":{},"hint":"{hint}"}}"#,
@@ -5163,6 +5171,33 @@ const MEDIA_WAITING_HINT_WAKE: &str = "This computer's display is off: it went t
 const MEDIA_WAITING_HINT_AWAY: &str = "This computer is showing the login screen or another user's \
      session. This install shares only its own user's session, so the picture comes back by itself \
      when that session is on screen again.";
+
+/// FR-93 P5h — the hint as the computer goes to sleep. Nothing can be done
+/// from the viewer: a sleeping computer is woken at the computer (or by a
+/// timer it set), and the viewer reconnects by itself once it is back.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+const MEDIA_WAITING_HINT_SLEEP: &str = "This computer is going to sleep. The session comes back by \
+     itself once the computer wakes; a desktop that locks when it sleeps then waits for its unlock.";
+
+/// FR-93 P5h — the `rc:media-waiting` a session's controller is sent as the
+/// computer goes to sleep, or `None` under P2d-2's kill switch
+/// (`ROOMLERD_MEDIA_WAITING=0`), which silences every waiting notice. No sleep
+/// has a known end, so it counts as long as any other host wait.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "portal-capture")),
+    allow(dead_code)
+)]
+pub(crate) fn host_sleep_notice() -> Option<String> {
+    media_waiting_enabled().then(|| {
+        media_waiting_payload(crate::capture::OpenWait {
+            gives_up_in: std::time::Duration::from_secs(60 * 60),
+            why: crate::capture::WaitFor::HostSleep,
+        })
+    })
+}
 
 /// FR-93 P2d-2 kill switch `ROOMLERD_MEDIA_WAITING=0`: no `rc:media-waiting`
 /// is sent, and the viewer behaves as before P2d-2. P3e's pumps then keep
@@ -5326,12 +5361,17 @@ fn media_waiting_hook(
 
 /// Retry one control-DC message until it is sent or `deadline` passes. The
 /// channel usually opens AFTER capture (and seconds late on a relay), so a
-/// one-shot send would be lost. `true` once it went out.
+/// one-shot send would be lost. `true` once it went out. FR-93 P5h's sleep
+/// notice sends through it too (`crate::sleep_notice`).
 #[cfg_attr(
-    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    not(any(
+        feature = "vp9-444",
+        feature = "ffmpeg-encoder",
+        all(target_os = "linux", feature = "portal-capture")
+    )),
     allow(dead_code)
 )]
-async fn send_control_notice(
+pub(crate) async fn send_control_notice(
     control_dc: &Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     payload: &str,
     retry_every: std::time::Duration,
@@ -12223,6 +12263,11 @@ mod codec_cap_tests {
         assert_eq!(f, "session_away");
         assert!(hint.contains("another user's"), "{hint}");
         assert!(hint.contains("comes back by itself"), "{hint}");
+        // FR-93 P5h — the computer going to sleep.
+        let (f, hint, _) = read(WaitFor::HostSleep);
+        assert_eq!(f, "host_sleep");
+        assert!(hint.contains("going to sleep"), "{hint}");
+        assert!(hint.contains("once the computer wakes"), "{hint}");
     }
 
     /// FR-93 P3e — a capture waiting on its host is told once per wait, told
