@@ -38,6 +38,40 @@ pub struct NewsletterSend {
     pub updated_at: DateTime,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sent_at: Option<DateTime>,
+
+    /// FR-102 P5 (D6) — what SendGrid's signed Event Webhook reported for
+    /// this message after it was accepted. `None` until an event arrives.
+    /// ⚠️ Separate from `status` on purpose: `status` is OUR disposition
+    /// (claimed → sent/failed/suppressed) and the at-most-once ledger;
+    /// `delivery` is the mailbox provider's answer, which arrives later,
+    /// possibly out of order, possibly twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<NewsletterDelivery>,
+}
+
+/// FR-102 P5 — the four SendGrid events the newsletter records, each as
+/// the EARLIEST time it was reported (a replayed or duplicated event writes
+/// nothing new). Opens and clicks are never recorded (D6): the footer's
+/// promise is that nothing in the email is per-reader except the
+/// unsubscribe link, and the server keeps nothing per reader either.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NewsletterDelivery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounced_at: Option<DateTime>,
+    /// SendGrid's bounce `type`: `bounce` (hard — the address is suppressed)
+    /// or `blocked` (the receiving server refused this message).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounce_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spam_reported_at: Option<DateTime>,
+    /// The bounce or drop reason as SendGrid gave it, cut to 200 characters
+    /// (it is the receiving server's text about this one message).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// ⚠️ `Sent` means "accepted by the mail backend" (a SendGrid 202), not

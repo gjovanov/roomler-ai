@@ -652,10 +652,17 @@ async fn every_section_counts_the_seeded_day_exactly() {
     assert_eq!(issues[0]["slug"], "oct");
     assert_eq!(issues[0]["counts"]["sent"], 9);
     assert_eq!(issues[0]["sent_at"], "2026-10-01T08:00:00Z");
-    assert_eq!(
-        not_measured(&j["newsletter"]["delivery"]).map(|n| n.1),
-        Some(Some("P5"))
+    // P5 — this server verifies no SendGrid webhook: delivery is not
+    // measured (never 0), and says why rather than which phase brings it.
+    let (reason, phase) = not_measured(&j["newsletter"]["delivery"]).expect("not measured");
+    assert!(reason.contains("EVENT_WEBHOOK_PUBLIC_KEY"), "{reason}");
+    assert_eq!(phase, None);
+    assert!(
+        not_measured(&issues[0]["delivery"]).is_some(),
+        "{}",
+        issues[0]
     );
+    assert_eq!(fig(&j["newsletter"]["unsubscribed_via_issue"]), (0, 0, 0));
 
     // Revenue: the excluded orgs are not counted; MRR is a labelled estimate.
     assert_eq!(

@@ -210,4 +210,23 @@ describe('useGrowthStore', () => {
     await store.revokeKey('69a1dbbad2000f26adc875ce')
     expect(mockApi.delete).toHaveBeenCalledWith('/admin/growth/keys/69a1dbbad2000f26adc875ce')
   })
+
+  it('fetches the newsletter view at the P5 route with its range', async () => {
+    const store = useGrowthStore()
+    mockApi.get.mockResolvedValue({ issues: [] })
+    await store.fetchNewsletter()
+    expect(mockApi.get).toHaveBeenCalledWith('/admin/growth/newsletter')
+    await store.fetchNewsletter({ since: '2026-07-17', until: '2026-10-14', includeInternal: true })
+    expect(mockApi.get).toHaveBeenCalledWith(
+      '/admin/growth/newsletter?since=2026-07-17&until=2026-10-14&include_internal=true',
+    )
+  })
+
+  it('reads an unmeasured delivery as such, and a measured zero as a number', () => {
+    // The two shapes the per-issue table's delivery cell takes.
+    expect(isNotMeasured({ not_measured: 'the SendGrid Event Webhook is not verified' })).toBe(true)
+    expect(
+      isNotMeasured({ delivered: 0, bounced: 0, hard_bounced: 0, dropped: 0, complaints: 0 }),
+    ).toBe(false)
+  })
 })
