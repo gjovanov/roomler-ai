@@ -612,9 +612,39 @@ pub struct DrmCapture {
     unchanged: Arc<AtomicU64>,
     /// FR-93 P3e — the last grab found the display off.
     dark: bool,
+    /// FR-95 P2 — set when a system install switched this capture on by
+    /// itself: the person's session it may read, and nothing else.
+    guard: Option<Guarded>,
+}
+
+/// FR-95 P2 — an automatic capture's binding to the person who was told.
+struct Guarded {
+    /// logind's id for the person's session that was on screen at the open.
+    session: String,
+    /// What the guard said last, when it was closed: the wait the controller
+    /// is told.
+    closed: Option<super::seat_guard::Guard>,
+    /// Counted in `seat_guard::viewing` while open, so the automatic input
+    /// injects only then.
+    mark: super::seat_guard::ViewingMark,
 }
 
 impl DrmCapture {
+    /// FR-95 P2 — bind this capture to `session`: it reads the scanout only
+    /// while that session is on screen, unlocked (`seat_guard`).
+    pub fn guarded(mut self, session: String) -> Self {
+        // Counted from the open, not the first frame: the session's input
+        // reach is read as the capture opens, and must already see it.
+        let mut mark = super::seat_guard::ViewingMark::default();
+        mark.set(super::seat_guard::now(&session) == super::seat_guard::Guard::Open);
+        self.guard = Some(Guarded {
+            session,
+            closed: None,
+            mark,
+        });
+        self
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }
@@ -664,6 +694,7 @@ impl DrmCapture {
             last_frame_at: None,
             unchanged,
             dark: false,
+            guard: None,
         })
     }
 }
@@ -1089,6 +1120,26 @@ impl ScreenCapture for DrmCapture {
     async fn next_frame(&mut self) -> Result<Option<Frame>> {
         let started = Instant::now();
         loop {
+            // FR-95 P2 — an automatic capture reads nothing while the person
+            // it was bound to is not on screen, unlocked: no grab is even
+            // asked of the worker, so the greeter's and the lock screen's
+            // pixels never leave the card. Looked at again a quarter of a
+            // second on, like a dark display.
+            if let Some(g) = self.guard.as_mut() {
+                let now = super::seat_guard::now(&g.session);
+                g.mark.set(now == super::seat_guard::Guard::Open);
+                if now != super::seat_guard::Guard::Open {
+                    if g.closed != Some(now) {
+                        info!(session = %g.session, guard = ?now, "drm capture: the person's session is not on screen, unlocked; reading nothing until it is (FR-95 P2)");
+                        g.closed = Some(now);
+                    }
+                    tokio::time::sleep(DARK_POLL).await;
+                    return Ok(None);
+                }
+                if g.closed.take().is_some() {
+                    info!(session = %g.session, "drm capture: the person's session is on screen again (FR-95 P2)");
+                }
+            }
             if let Some(last) = self.last_frame_at {
                 let elapsed = last.elapsed();
                 if elapsed < self.target_frame_period {
@@ -1158,7 +1209,12 @@ impl ScreenCapture for DrmCapture {
     /// pump's idle log carries beside its own count of empty polls.
     /// FR-93 P3e — a display switched off waits for its wake.
     fn waits_for(&self) -> Option<WaitFor> {
-        self.dark.then_some(WaitFor::DisplayWake)
+        // FR-95 P2 — the guard first: a locked screen may also be dark.
+        self.guard
+            .as_ref()
+            .and_then(|g| g.closed)
+            .and_then(super::seat_guard::Guard::wait)
+            .or(self.dark.then_some(WaitFor::DisplayWake))
     }
 
     fn frames_unchanged(&self) -> u64 {

@@ -166,7 +166,7 @@ dependency tree; and the macOS daemon **already ships as an `.app` with
 `LSUIElement=true`** (`release-agent.yml:2343`), the bundle identity AppKit
 windows require.
 
-⚠️ **The macOS native backend has a prerequisite.** `agents/roomlerd/src/main.rs:658`
+⚠️ **The macOS native backend has a prerequisite.** `agents/roomlerd/src/main.rs:663`
 is `#[tokio::main]`, so the main thread is parked in `block_on` for the daemon's
 whole life — the main dispatch queue never drains and AppKit can never deliver a
 click to an Approve button. The macOS arm has to build the runtime explicitly, run

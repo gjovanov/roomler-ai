@@ -1,6 +1,6 @@
 # FR-95: A system install shows a Wayland desktop by default, once the person at the screen can see it on every distro
 
-**Issue:** [#2041](https://github.com/gjovanov/roomler-ai/issues/2041) · **Status:** proposed 2026-10-12, spec and claim · **Owner:** remote desktop (agent),
+**Issue:** [#2041](https://github.com/gjovanov/roomler-ai/issues/2041) · **Status:** P1 delivered by FR-93 P6d–P6g; **P2 lab-verified 2026-10-15** (GNOME 50 and Plasma 6.7, system installs), on its release next; proposed 2026-10-12 · **Owner:** remote desktop (agent),
 consent surfaces (FR-27) · **Split from:** [FR-93](FR-93-wayland-out-of-the-box.md) (its AC2, re-worded the same
 day) · **Builds on:** [FR-36](FR-36-wayland-capture.md) (DRM + uinput), [FR-27](FR-27-consent-surfaces-and-desktop-companion.md)
 (the companion and the prompt-surface chain), FR-93 P2b (the hello's desktop brief, to measure who this serves)
@@ -39,6 +39,11 @@ A root daemon whose prompt has nowhere to show already says so: `no_prompt_surfa
 
 ## 3. Key design
 
+> **As built (P2).** The design below was the proposal. What P2 built differs in one place: the surface is
+> FR-93 P6g's **being-viewed notice** (the companion's banner, else a notification with Disconnect), not FR-27's
+> consent chain. A default-on capture is unattended, so what the person needs is to be **told and able to end
+> it**, not asked. See §3.1.
+
 ```mermaid
 flowchart TD
     O([capture open, root daemon, Wayland, no keys]) --> S{"a prompt surface<br/>for this session?<br/>(FR-27's chain)"}
@@ -48,7 +53,7 @@ flowchart TD
 ```
 
 1. **Default-on where the person can see it, not per distro.** The root branch of `capture::wayland_plan`
-   (`agents/roomlerd/src/capture/mod.rs:698`, `root` ⇒ `AsConfigured`) gains a third answer. If FR-27's chain
+   (`agents/roomlerd/src/capture/mod.rs:736`, `root` ⇒ `AsConfigured`) gains a third answer. If FR-27's chain
    finds a surface for the session a controller would see, DRM + uinput switch themselves on, the way the keys
    would. If not, nothing changes. A Debian x86_64 host then goes default-on the day this ships, and every other
    host the day it gets a surface.
@@ -64,13 +69,49 @@ flowchart TD
    hosts are Wayland and which arm serves each. The system installs among them answering `none` are the
    population this FR serves.
 
+### 3.1 As built (P2)
+
+```mermaid
+flowchart TD
+    O([capture open, a root daemon]) --> K{"wayland_aware, wayland_auto and<br/>wayland_auto_system on, no capture key,<br/>no virtual desktop?"}
+    K -- no --> C["the cascade, as before FR-95"]
+    K -- yes --> P{"logind: the seat shows a person's<br/>Wayland session (class user)?<br/>locked or not"}
+    P -- "no: the greeter, a tty, nobody" --> C
+    P -- yes --> T{"can that person be told? (live, D-b)<br/>the companion runs for them, or their<br/>notification server shows buttons"}
+    T -- no --> N["the cascade: wayland_not_enabled,<br/>the hint names the missing surface (AC3)"]
+    T -- yes --> D["DRM + uinput, AUTOMATIC,<br/>BOUND to that session"]
+    D --> G{"the seat guard, every frame:<br/>that session on screen, unlocked?"}
+    G -- yes --> R["the scanout is read, input injected;<br/>P6g's notice says who is viewing,<br/>with Disconnect"]
+    G -- "locked" --> W1["nothing read, nothing injected:<br/>screen_unlock"]
+    G -- "the greeter, another person" --> W2["nothing read, nothing injected:<br/>session_away"]
+```
+
+| Piece | Where | What it does |
+|---|---|---|
+| `system_plan` | `agents/roomlerd/src/capture/mod.rs` | D1's system half as a pure function. Cheap checks first: a root daemon that may not go automatic never reads logind, and one with nobody on screen never starts the probe |
+| `person_on_screen` | `agents/roomlerd/src/capture/mod.rs` | the seat's active session, when it is a person's (`class user`) Wayland session. Never the greeter |
+| `notify::can_tell` | `agents/roomlerd/src/indicator/notify.rs` | D-b, live: the companion runs for that uid, or `portal-helper --notify-probe` in their session finds a notification server with the `actions` capability. `false` with P6g's notice off |
+| `seat_guard` | `agents/roomlerd/src/capture/seat_guard.rs` | the seat's active session from logind's D-Bus (`PropertiesChanged`, plus a read every second), and the guard: `Open` only for the bound session, on screen, unlocked. ⚠️ Fail closed: a reading older than 5 s is `Away` |
+| `DrmCapture::guarded` | `agents/roomlerd/src/capture/drm_backend.rs` | the automatic capture asks the worker for nothing while the guard is closed, so the greeter's and the lock screen's pixels never leave the card. The controller is told `screen_unlock` or `session_away` |
+| the automatic uinput | `agents/roomlerd/src/input/mod.rs`, `uinput_backend.rs` | the injector while an automatic capture is alive (`seat_guard::live`), locked or not, injecting only while one views a person's unlocked session (`seat_guard::viewing`) and dropping every event otherwise. Swapped in by the arbiter when such a capture starts, never swapped out while one is alive: what would replace it is enigo, whose XTest reaches Xwayland windows behind a lock screen |
+
+⚠️ **The surface is the being-viewed notice, not the consent chain.** The proposal above checked FR-27's
+prompt chain. But a default-on capture asks nobody: what the person at the screen needs is to know, and to be
+able to end it. That is FR-93 P6g's notice: the companion's banner where one runs, else a critical notification,
+*This screen is being viewed*, with **Disconnect**. So the check is whether that notice can reach this person,
+and `ROOMLERD_VIEWING_NOTICE=0` makes every host one with no surface.
+
+⚠️ **Bound to a session, not a user.** A second login of the same person is a different session, told nothing,
+so the guard compares logind's session id. A user switch to someone else therefore reads `session_away` until
+the person who was told is back. Their own new viewer session re-plans, and tells them.
+
 ## 4. Phases
 
 | Phase | What | Kill switch | Proven on | Size |
 |---|---|---|---|---|
 | **P0** | the population: system installs on Wayland with `capture_arm: none`, from P2b's counts after 0.4.130 | — | the server | S |
-| **P1** | the surface where none exists (D-a): Notifications-with-actions, or the companion packaged for non-Debian and aarch64 | the surface's own switch | FR-93's lab (Fedora KDE, Ubuntu GNOME), then aarch64 | M |
-| **P2** | `wayland_plan`'s third answer: default-on DRM + uinput where a surface exists, for a `user` session only | `wayland_auto` (FR-93), plus a system-specific `wayland_auto_system` | the lab: GNOME and KDE system installs, red first on the release before | S |
+| **P1** | the surface where none exists (D-a): Notifications-with-actions, or the companion packaged for non-Debian and aarch64 | the surface's own switch | ✅ **delivered by FR-93** P6d–P6g (2026-10-15): the companion `.rpm` and aarch64 packages, the notification surface, the being-viewed notice. On aarch64 still owed (FR-93 AC12) | M |
+| **P2** | `system_plan`: default-on DRM + uinput where the person can be told, for their `user` session only, read only while it is on screen, unlocked (§3.1) | `wayland_auto_system` (FR-95, default on), and `wayland_auto` (FR-93) | the lab: GNOME and KDE system installs, red first on 0.4.137 (§8) | S |
 | **P3** | docs: `docs/linux-capture.md` §1.2's table gains the system rows; `docs/desktop-companion.md`; the `docs/README.md` index row | — | — | S |
 
 ## 5. Acceptance criteria
@@ -92,9 +133,9 @@ flowchart TD
 
 | | decision | recommendation |
 |---|---|---|
-| **D-a** | the surface for hosts with none: Notifications-with-actions, or the companion packaged for non-Debian and aarch64 | Notifications first (FR-93 D6 already chose it as the fallback); packaging later if the counts warrant it |
-| **D-b** | is a working surface enough, or does default-on also need the surface proven reachable for that session at open time (a live check, not an installed one)? | the live check: an installed companion that cannot reach the root daemon is no surface (as #1911 was, until its fix) |
-| **D-c** | D1b, the greeter and the lock screen | stays deferred; this FR never captures them by default |
+| **D-a** | the surface for hosts with none: Notifications-with-actions, or the companion packaged for non-Debian and aarch64 | ✅ **Decided: both** (operator, 2026-10-15: *"AC10. non-debian companion package. D5 and D6 per recommendation"*). FR-93 shipped them: the companion as an `.rpm` and on aarch64 (P6d, P6e), the notification as the last consent surface (P6f), and the being-viewed notice (P6g). So P1 is FR-93's, and done |
+| **D-b** | is a working surface enough, or does default-on also need the surface proven reachable for that session at open time (a live check, not an installed one)? | ✅ **The live check**, at every capture open (`notify::can_tell`): the companion running for that person, or a notification server with buttons in their session. An installed companion that is not running does not count on its own |
+| **D-c** | D1b, the greeter and the lock screen | stays deferred; this FR never captures them by default. The guard reads nothing while either is on screen (§3.1) |
 
 ## 7. Out of scope
 
@@ -106,4 +147,13 @@ flowchart TD
 
 | date | build | host | result |
 |---|---|---|---|
-| | | | |
+| 2026-10-15 | **0.4.137, the release** (its `.deb`'s sha256 checked against the release) | `wlab-gnome-sys` (GNOME 50, system install, no capture key) | 🔴 **red, as expected**: the viewer's overlay *"This device cannot capture its screen. This computer is showing a Wayland desktop, and capturing it is switched off on this device…"* (`wayland_not_enabled`) at +4 s, `lit=0.0 %` throughout; the journal's `code="wayland_not_enabled"` and `reach="none"` |
+| 2026-10-15 | 0.4.137, the release | `wlab-kde-sys` (Plasma 6.7 on Fedora 44, system install, no capture key) | 🔴 **red, as expected**: the same overlay at +4 s, `lit=0.0 %`, `wayland_not_enabled`, `reach="none"` |
+| 2026-10-15 | candidate `f70823ebd` | `wlab-gnome-sys`, the companion installed | 🟢 **AC1**: the picture at +4 s (`lit=91.4 %`), the pill *DRM scanout · asks nobody*; the journal's `capture: backend=drm, switched on by itself for the person's session on screen…`; the guest's screen shows the companion's banner *Being viewed by vmtest admin · keyboard + mouse* with **Disconnect** |
+| 2026-10-15 | `f70823ebd` | `wlab-gnome-sys`, a long session | 🟢 **AC4, the lock** (`loginctl lock-sessions` at 21:32:23.267): the guard saw `locked=true` 55 ms later and read nothing from then on; the viewer got the unlock notice. After the typed unlock: `locked=false` at 21:33:12.390, frames again 150 ms later. ⚠️ The overlay was the per-user sentence (*"GNOME shares no locked screen with this per-user install"*), so the guard now has its own waits and words (`0d90bc897`). ⚠️ The session then closed at 21:33:23: not FR-95, a promote rolled the server (the agent's control socket reset, then `502 Bad Gateway`) |
+| 2026-10-15 | `f70823ebd` | `wlab-gnome-sys`, the companion moved aside | 🟢 **D-b's live check, the notification half**: `portal-helper --notify-probe` found GNOME's notification server, the picture at +4 s (`lit=89.8 %`), and the guest's screen shows *This screen is being viewed — vmtest admin is viewing this screen and can use its keyboard and mouse. Disconnect ends the session.* with **Disconnect** |
+| 2026-10-15 | `f70823ebd` | `wlab-gnome-sys` | 🟢 **AC5**: `wayland_auto_system = false` gives 0.4.137's answer exactly: the same overlay, `lit=0.0 %`, `wayland_not_enabled`, `reach="none"` |
+| 2026-10-15 | candidate `0d90bc897` | `wlab-kde-sys`, no companion | 🟢 **AC2**: the picture at +4 s (`lit=81.1 %`), and the guest's screen shows KDE's notification *This screen is being viewed — vmtest admin is viewing this screen and can use its keyboard and mouse. Disconnect ends the session.* with **Disconnect** |
+| 2026-10-15 | `0d90bc897` | `wlab-kde-sys`, the lifecycle harness: lock, unlock, logout, login | 🟢 **AC4, verdict PASS 4/4.** Lock (Super+L): no new picture, and the system install's sentence at +3.7 s; the journal's guard `locked=true` 1.8 s after the key, nothing read from then on. Unlock: a new picture +0.6 s. Logout (`terminate-session`): no new picture, *"…showing the login screen or another person's session"* at +3.5 s; the guard saw nobody, then the greeter `c1`, and read nothing. Login (a NEW session, `39`): still no picture, by design (§3.1: bound to a session, not a user) |
+| 2026-10-15 | `0d90bc897` | `wlab-kde-sys`, rebooted: lock, a viewer move, unlock, a viewer move | 🟢 the picture, PASS 4/4, but 🔴 **a real gap in the input**: the viewer's move during the lock (21:55:03) opened the injector while no automatic capture VIEWED, so `open_default` fell through to enigo, whose XTest reaches Xwayland windows behind a lock screen. The arbiter swapped the automatic uinput in after the unlock (21:55:49). Fixed in `8718f5258`: the automatic uinput is chosen while an automatic capture is ALIVE, and injects only while one views |
+| 2026-10-15 | candidate `8718f5258` | `wlab-kde-sys`, rebooted: the same plan | 🟢 **the fix, PASS 4/4.** The viewer's move during the lock (22:04:03.898) opened the automatic uinput, which said *dropping input while the person's session is not on screen, unlocked*; the unlock at 22:04:28.892, the picture +0.8 s; the move after it, *injecting again, the person's session is on screen* (22:04:49.019) |

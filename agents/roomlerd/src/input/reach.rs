@@ -314,7 +314,13 @@ fn gather_with(x: fn() -> XServer) -> Facts {
 
     #[cfg(all(target_os = "linux", feature = "uinput-input"))]
     let (uinput_on, uinput_ok) = {
-        let on = super::uinput_backend::env_enabled();
+        // FR-95 P2 — or switched on by itself, for an automatic system
+        // capture (`input::open_default`).
+        #[cfg(feature = "drm-capture")]
+        let auto = super::uinput_unset() && crate::capture::seat_guard::live();
+        #[cfg(not(feature = "drm-capture"))]
+        let auto = false;
+        let on = super::uinput_backend::env_enabled() || auto;
         (on, on && super::uinput_backend::available())
     };
     #[cfg(not(all(target_os = "linux", feature = "uinput-input")))]

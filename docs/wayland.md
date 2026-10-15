@@ -23,20 +23,26 @@ flowchart TD
     D -- "GNOME" --> M["mutter's own screencast, automatic<br/>asks nobody · input through mutter's RemoteDesktop"]
     D -- "KDE Plasma, others" --> P["the desktop portal, automatic<br/>asks the person at the screen ONCE,<br/>then a restore token answers"]
     I -- "system (root)" --> K{"drm_capture + uinput set?"}
-    K -- "no (the default, decision D1)" --> W["no picture: wayland_not_enabled,<br/>the hint naming both keys"]
     K -- "yes" --> R["DRM below the compositor + uinput<br/>unattended · sees the lock screen and the greeter"]
+    K -- "no (the default)" --> T{"a person's session on screen,<br/>and a way to tell them? (FR-95)"}
+    T -- "yes" --> A["DRM + uinput, automatic, for THEIR session only:<br/>nothing read while it is locked or away;<br/>a banner or notification says who is viewing"]
+    T -- "no" --> W["no picture: wayland_not_enabled,<br/>the hint naming what is missing"]
 ```
 
 - **Per-user installs capture by themselves** (FR-93 P2, decision D1). The
   daemon runs inside the user's own Wayland session, so it can use the
   session's own screencast: mutter on GNOME, which asks nobody, else the
   desktop portal, which asks the person at the screen once.
-- **System installs stay opt-in.** A root daemon sits in no session. Its arms
-  (DRM for the picture, `uinput` for input) work below the compositor, see the
-  lock screen and the greeter, and inject into whatever has focus, so they are
-  switched on by the owner, never by the daemon. Until then the viewer is told
-  `wayland_not_enabled`, with the two keys to set. Switching them on by default
-  is [FR-95](fr/FR-95-system-installs-on-by-default-on-wayland.md) (#2041).
+- **System installs capture a person who can be told** ([FR-95](fr/FR-95-system-installs-on-by-default-on-wayland.md),
+  #2041). A root daemon sits in no session. Its arms (DRM for the picture,
+  `uinput` for input) work below the compositor, see the lock screen and the
+  greeter, and inject into whatever has focus. So with no key set it switches
+  them on by itself only for a **person's** session on screen, and only where
+  that person is told they are being viewed and can end it (the companion's
+  banner, else a notification with **Disconnect**). It then reads the screen
+  only while that session is on screen and unlocked
+  ([`linux-capture.md`](linux-capture.md) §1.2.1). Otherwise, or with the keys
+  set to off, the viewer is told `wayland_not_enabled` and what is missing.
 - **Every refusal names itself.** A Wayland desktop that no arm may capture
   says so, never a black stream and never "headless"
   ([`linux-capture.md`](linux-capture.md) §1.1).
@@ -47,7 +53,8 @@ flowchart TD
 |---|---|---|---|---|---|---|---|
 | GNOME (mutter) | per-user, stock | ✅ mutter's ScreenCast, automatic ([`linux-capture.md`](linux-capture.md) §5) | ✅ mutter's RemoteDesktop, native windows included | ✅ drawn into the frames | **no** | ❌ GNOME shares no locked screen: the viewer waits for the unlock (§3 below) | 0.4.132 (picture, input, cursor) |
 | KDE Plasma 6 | per-user, stock | ✅ the desktop portal, automatic ([`linux-capture.md`](linux-capture.md) §4) | ✅ the portal's RemoteDesktop (KDE's *Remote Control* dialog) | ✅ drawn into the frames | **once**: one dialog, then the restore token | ✅ KDE's portal streams the lock screen | picture 0.4.132 · input and cursor 0.4.133 |
-| GNOME, KDE | system, stock | ❌ `wayland_not_enabled`, naming `drm_capture` + `uinput` | — | — | — | — | 0.4.130 |
+| GNOME, KDE | system, stock, a person on screen who can be told | ✅ DRM, automatic, bound to their session (FR-95) | ✅ `uinput`, automatic, only while their session is on screen, unlocked | ✅ the cursor plane | **no**; the companion's banner or a notification says who is viewing, with Disconnect | 🔒 nothing read: the viewer waits (`screen_unlock`, `session_away`) | FR-95 candidate (lab, 2026-10-15) |
+| GNOME, KDE | system, stock, the greeter on screen or nobody to tell | ❌ `wayland_not_enabled`, naming what is missing | — | — | — | — | 0.4.130 |
 | GNOME, KDE | system, `drm_capture` + `uinput` | ✅ DRM: the scanout plane, below the compositor | ✅ `uinput`: host-global, it types into whatever has focus | ✅ the cursor plane, on the cursor channel | **no** | ✅ both are pixels on the scanout | picture 0.4.130 · input 0.4.128 · cursor 0.4.134 · idle cost 0.4.135 |
 | wlroots (sway and others) | per-user, `portal_capture` | ⚠️ the portal through `xdg-desktop-portal-wlr`: proven only to the handshake (no GPU on the host measured) | ❌ the wlr portal has no RemoteDesktop | — | — | — | unproven |
 | any | either, `ROOMLERD_VIRTUAL_DESKTOP=1` | ✅ the daemon's own Xvfb, which it captures over X11 | ✅ | ✅ | no | — | (X11, not Wayland) |
@@ -59,8 +66,9 @@ An idle DRM session costs **6.3 % of a core** on 0.4.135 (FR-93 AC8), where
 
 ⚠️ **The system arms are host-global by construction.** `uinput` injects below
 the compositor into whatever has focus, the greeter included, and the DRM arm
-shows whoever is at the screen. That is exactly why a system install never
-switches them on by itself.
+shows whoever is at the screen. That is exactly why a system install switches
+them on by itself only bound to one person's session, and reads and injects
+nothing while that session is not on screen, unlocked (FR-95).
 
 ## 3. Session states
 
@@ -196,6 +204,7 @@ ones that decide this page:
 | Key | Env | Default | Effect |
 |---|---|---|---|
 | `wayland_auto` | `ROOMLERD_WAYLAND_AUTO` | **on** | a per-user daemon in its own Wayland session switches capture on by itself; off = everything opt-in, as before FR-93 P2 |
+| `wayland_auto_system` | `ROOMLERD_WAYLAND_AUTO_SYSTEM` | **on** | a system daemon switches DRM + `uinput` on by itself for a person's session it can tell (FR-95); off = the system half before FR-95 |
 | `wayland_aware` | `ROOMLERD_WAYLAND_AWARE` | **on** | a Wayland desktop no arm may capture says `wayland_not_enabled`; off = the behaviour before FR-93, with no input-reach warning either (P1a) |
 | `drm_capture`, `uinput` | `ROOMLERD_DRM_CAPTURE`, `ROOMLERD_UINPUT` | off | the system arms (§1) |
 | `portal_capture`, `mutter_capture` | `ROOMLERD_PORTAL_CAPTURE`, `ROOMLERD_MUTTER_CAPTURE` | off | the per-user arms, explicitly; any capture key hands the choice back to the operator |

@@ -318,7 +318,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:731-738` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:4187-4284`, `:2338-2360`, `:2370-2382`, `:819-836` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:213-245` |
-| kill switch · epoch | `crates/agent-core/src/config.rs:867-851`, `:1428`, `:1525-1527`; `config_surface.rs:1072-1053` |
+| kill switch · epoch | `crates/agent-core/src/config.rs:867-851`, `:1439`, `:1525-1527`; `config_surface.rs:1072-1053` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:177`, `:1169-1196`, `:1964-2033`; `ui/src/stores/agents.ts:877-884` |
 
 ## Not built

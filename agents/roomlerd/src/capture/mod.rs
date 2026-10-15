@@ -30,6 +30,10 @@ pub mod drm_backend;
 pub mod drm_cursor;
 #[cfg(all(target_os = "linux", feature = "drm-capture"))]
 pub mod drm_idle;
+/// FR-95 P2 — whether a capture a system install switched on by itself may
+/// read the screen now: the person who was told, on screen, unlocked.
+#[cfg(all(target_os = "linux", feature = "drm-capture"))]
+pub(crate) mod seat_guard;
 
 /// FR-45 P1 — desktop-portal availability. Detection only: whether ScreenCast
 /// exists at all, and why not. The capture path itself is P2/P3.
@@ -580,7 +584,20 @@ impl CaptureUnavailableCode {
 /// ⚠️ A hint goes on the wire as a JSON literal, unescaped
 /// (`capture_unavailable_payload`): no double quote, no backslash.
 fn wayland_hint(root: bool) -> &'static str {
-    if root {
+    wayland_hint_with(root, NO_SURFACE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// [`wayland_hint`], with the last system plan's "no surface" passed in.
+fn wayland_hint_with(root: bool, no_surface: bool) -> &'static str {
+    if root && no_surface {
+        "This computer is showing a Wayland desktop, and it is not captured by itself because \
+         nobody at the screen could be told they are being viewed: the session on screen has no \
+         desktop companion and no notification service. Install the desktop companion (the \
+         install script does), or on the host an administrator can run sudo roomler config set \
+         drm_capture true and sudo roomler config set uinput true, then sudo roomler restart. \
+         That capture reads the screen below the desktop, the lock screen included. Remote \
+         shell and file transfer still work."
+    } else if root {
         "This computer is showing a Wayland desktop, and capturing it is switched off on this \
          device. On the host an administrator can run sudo roomler config set drm_capture true \
          and sudo roomler config set uinput true, then sudo roomler restart. That capture reads \
@@ -626,6 +643,27 @@ pub(crate) fn wayland_aware() -> bool {
 fn wayland_auto() -> bool {
     tunnel_core::env::flag("WAYLAND_AUTO", true)
 }
+
+/// FR-95 P2 kill switch (`ROOMLERD_WAYLAND_AUTO_SYSTEM` /
+/// `wayland_auto_system`), default ON. `false` gives back the system half
+/// before FR-95: a root daemon on a Wayland desktop captures only what a key
+/// switches on. `wayland_auto = false` turns this half off too.
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        feature = "drm-capture",
+        feature = "portal-capture"
+    )),
+    allow(dead_code)
+)]
+fn wayland_auto_system() -> bool {
+    tunnel_core::env::flag("WAYLAND_AUTO_SYSTEM", true)
+}
+
+/// FR-95 P2 (AC3) — the last system plan found a person's Wayland session on
+/// screen and nobody to tell them: the hint names that, not only the keys.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+static NO_SURFACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// FR-93 P2 — the keys that choose Linux capture by hand. With any one of them
 /// set, to anything, the operator owns the cascade and it runs exactly as it
@@ -717,6 +755,129 @@ fn wayland_plan(
     }
 }
 
+/// FR-95 P2 — what a ROOT daemon may switch on by itself: D1's system half.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        feature = "drm-capture",
+        feature = "portal-capture"
+    )),
+    allow(dead_code)
+)]
+enum SystemPlan {
+    /// The keys decide, as before FR-95.
+    AsConfigured,
+    /// As configured, because nobody at the screen could be told they are
+    /// being viewed: the hint says so (AC3).
+    NoSurface,
+    /// DRM and uinput as if their keys were set, bound to this logind
+    /// session: the screen is read only while it is on screen, unlocked
+    /// (`seat_guard`).
+    Auto { session: String },
+}
+
+/// FR-95 P2 as a pure function. Cheap checks first: `person` reads logind and
+/// `surface` may start a helper in the person's session, so each is asked
+/// only when everything before it allows.
+///
+/// - `person`: the seat's session, when it is a person's Wayland session
+///   (logind class `user`), locked or not. The greeter is not one: this FR
+///   never captures it by default (D-c).
+/// - `surface`: whether that person can be told they are being viewed and end
+///   it (FR-93 P6g's notice: the companion's banner, else a notification with
+///   Disconnect), checked live (D-b).
+/// - `wayland_auto = false` turns this half off too: one switch for "nothing
+///   automatic", as before FR-95.
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        feature = "drm-capture",
+        feature = "portal-capture"
+    )),
+    allow(dead_code)
+)]
+fn system_plan(
+    aware: bool,
+    auto: bool,
+    auto_system: bool,
+    keys_set: bool,
+    virtual_desktop: bool,
+    person: impl FnOnce() -> Option<Person>,
+    surface: impl FnOnce(&Person) -> bool,
+) -> SystemPlan {
+    if !aware || !auto || !auto_system || keys_set || virtual_desktop {
+        return SystemPlan::AsConfigured;
+    }
+    let Some(person) = person() else {
+        return SystemPlan::AsConfigured;
+    };
+    if surface(&person) {
+        SystemPlan::Auto {
+            session: person.session,
+        }
+    } else {
+        SystemPlan::NoSurface
+    }
+}
+
+/// FR-95 P2 — a person's Wayland session on the seat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        feature = "drm-capture",
+        feature = "portal-capture"
+    )),
+    allow(dead_code)
+)]
+struct Person {
+    /// logind's session id.
+    session: String,
+    uid: u32,
+}
+
+/// FR-95 P2 — [`system_plan`] now, for a root daemon. Records whether the
+/// hint must name the missing surface.
+#[cfg(all(
+    target_os = "linux",
+    feature = "drm-capture",
+    feature = "portal-capture"
+))]
+fn system_plan_now() -> SystemPlan {
+    let plan = system_plan(
+        wayland_aware(),
+        wayland_auto(),
+        wayland_auto_system(),
+        capture_keys_set(),
+        crate::virtual_desktop::requested(),
+        person_on_screen,
+        |p| crate::indicator::notify::can_tell(p.uid),
+    );
+    NO_SURFACE.store(
+        plan == SystemPlan::NoSurface,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    plan
+}
+
+/// FR-95 P2 — the seat's session, when it is a person's Wayland session,
+/// locked or not. Never the greeter.
+#[cfg(all(
+    target_os = "linux",
+    feature = "drm-capture",
+    feature = "portal-capture"
+))]
+fn person_on_screen() -> Option<Person> {
+    let id = seat_guard::on_screen()?.id;
+    crate::keep_busy::logind::show(&id)
+        .filter(|s| s.is_user() && s.kind == "wayland")
+        .map(|s| Person {
+            session: s.id,
+            uid: s.uid,
+        })
+}
+
 /// This daemon's user's Wayland session, from logind. A user can have several
 /// sessions (an SSH login beside the desktop); only a graphical one of class
 /// `user` counts, never a greeter: an active one, else (FR-93 P5g) one in the
@@ -756,6 +917,9 @@ pub(crate) struct ArmFacts {
     /// desktop portal is on this session's bus, running or installed to start
     /// on demand.
     pub auto_portal: bool,
+    /// FR-95 P2 — a root daemon's [`system_plan`] said `Auto`: DRM, bound to
+    /// the person's session on screen.
+    pub auto_system: bool,
     /// `drm_capture`, in a build with the DRM backend.
     pub drm: bool,
     /// `portal_capture`, in a build with the portal backend.
@@ -793,7 +957,7 @@ pub(crate) fn planned_arm(f: &ArmFacts) -> Option<CaptureArm> {
     if f.auto_portal {
         return Some(CaptureArm::Portal);
     }
-    if f.drm {
+    if f.drm || f.auto_system {
         return Some(CaptureArm::Drm);
     }
     if f.portal {
@@ -862,9 +1026,16 @@ pub(crate) fn arm_facts(
     let drm = drm_backend::env_enabled();
     #[cfg(not(feature = "drm-capture"))]
     let drm = false;
+    // FR-95 P2 — a root daemon's automatic arm, planned as `open_with` plans
+    // it (the surface checked live; this runs once a minute, off the runtime).
+    #[cfg(all(feature = "drm-capture", feature = "portal-capture"))]
+    let auto_system = root && matches!(system_plan_now(), SystemPlan::Auto { .. });
+    #[cfg(not(all(feature = "drm-capture", feature = "portal-capture")))]
+    let auto_system = false;
     ArmFacts {
         auto_mutter,
         auto_portal,
+        auto_system,
         drm,
         portal: cfg!(feature = "portal-capture") && tunnel_core::env::flag("PORTAL_CAPTURE", false),
         portal_via_mutter: tunnel_core::env::flag("MUTTER_CAPTURE", false),
@@ -2113,6 +2284,14 @@ pub enum WaitFor {
     /// computer sleep (`crate::sleep_notice`), because a sleeping host can say
     /// nothing, and the viewer otherwise saw its picture stop with no reason.
     HostSleep,
+    /// FR-95 P2 — the person a system install's automatic capture is bound to
+    /// locked their screen: it reads nothing and injects nothing until the
+    /// unlock. `screen_unlock` on the wire, with the system install's words.
+    GuardLocked,
+    /// FR-95 P2 — the person it is bound to is not on screen (the login
+    /// screen, another person's session). `session_away` on the wire, with
+    /// the system install's words.
+    GuardAway,
 }
 
 /// FR-93 P6c — a capture error that means the person at the screen stopped
@@ -2471,9 +2650,35 @@ fn open_with(
         }
     }
 
+    // FR-95 P2 (D1's system half) — a root daemon with no capture key set, a
+    // person's Wayland session on screen, and a way to tell that person (the
+    // companion's banner, else a notification with Disconnect): DRM as if its
+    // key were set, BOUND to that session, so it reads the scanout only while
+    // the session is on screen, unlocked (`seat_guard`). Never the greeter,
+    // never the lock screen, never a person who was not told.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "drm-capture",
+        feature = "portal-capture"
+    ))]
+    let auto_system = if running_as_root() {
+        match system_plan_now() {
+            SystemPlan::Auto { session } => Some(session),
+            SystemPlan::AsConfigured | SystemPlan::NoSurface => None,
+        }
+    } else {
+        None
+    };
+    #[cfg(all(
+        target_os = "linux",
+        feature = "drm-capture",
+        not(feature = "portal-capture")
+    ))]
+    let auto_system: Option<String> = None;
+
     #[cfg(all(target_os = "linux", feature = "drm-capture"))]
     {
-        if drm_backend::env_enabled() {
+        if drm_backend::env_enabled() || auto_system.is_some() {
             // FR-93 P3d — skip an unchanged frame on a Wayland seat only: an X
             // server or the console draws into the buffer on screen in place,
             // where no buffer check sees a change.
@@ -2481,6 +2686,10 @@ fn open_with(
                 drm_backend::idle_skip_enabled() && crate::desktop_brief::seen_is_wayland();
             let open = || {
                 drm_backend::DrmCapture::primary(_target_fps, _downscale, idle_skip)
+                    .map(|c| match auto_system.clone() {
+                        Some(session) => c.guarded(session),
+                        None => c,
+                    })
                     .map_err(|e| format!("{e:#}"))
             };
             // FR-93 P3e — a display the compositor switched off has no scanout
@@ -2510,8 +2719,8 @@ fn open_with(
             } else {
                 open()
             };
-            match opened {
-                Ok(c) => {
+            match (opened, auto_system.as_deref()) {
+                (Ok(c), None) => {
                     tracing::info!(
                         width = c.width(),
                         height = c.height(),
@@ -2520,7 +2729,18 @@ fn open_with(
                     );
                     return Box::new(c);
                 }
-                Err(e) => {
+                (Ok(c), Some(session)) => {
+                    tracing::info!(
+                        width = c.width(),
+                        height = c.height(),
+                        idle_skip,
+                        session,
+                        "capture: backend=drm, switched on by itself for the person's session on \
+                         screen, read only while it is on screen, unlocked (FR-95 P2)"
+                    );
+                    return Box::new(c);
+                }
+                (Err(e), None) => {
                     // Deliberately loud: the operator asked for DRM explicitly,
                     // so silently serving them X11 would look like the feature
                     // simply not working.
@@ -2530,6 +2750,16 @@ fn open_with(
                     );
                     wayland_arm_error = Some(format!(
                         "drm_capture is on, but DRM capture could not open: {e}"
+                    ));
+                }
+                (Err(e), Some(_)) => {
+                    tracing::warn!(
+                        error = %e,
+                        "capture: the automatic system capture could not open DRM (FR-95 P2)"
+                    );
+                    wayland_arm_error = Some(format!(
+                        "this system install switched DRM capture on by itself, and it could not \
+                         open: {e}"
                     ));
                 }
             }
@@ -3105,6 +3335,131 @@ mod wayland_reason_tests {
         assert!(user.contains("mutter_capture"), "{user}");
         assert!(!user.contains("sudo"), "{user}");
         assert!(!user.contains("drm_capture"), "{user}");
+    }
+}
+
+/// FR-95 P2 — D1's system half as a table. Pure, as `wayland_auto_tests`: the
+/// person and the surface are closures, and the order of the checks is part
+/// of the contract. A root daemon that may not go automatic never reads
+/// logind, and one with nobody on screen never starts the probe.
+#[cfg(test)]
+mod system_auto_tests {
+    use super::{Person, SystemPlan, system_plan, wayland_hint_with};
+
+    fn alice() -> impl FnOnce() -> Option<Person> {
+        || {
+            Some(Person {
+                session: "3".into(),
+                uid: 1000,
+            })
+        }
+    }
+
+    fn unasked() -> impl FnOnce() -> Option<Person> {
+        || -> Option<Person> { panic!("logind was asked, and this answer does not depend on it") }
+    }
+
+    fn told(yes: bool) -> impl FnOnce(&Person) -> bool {
+        move |p| {
+            assert_eq!(p.uid, 1000, "the probe runs in the person's own session");
+            yes
+        }
+    }
+
+    fn untold() -> impl FnOnce(&Person) -> bool {
+        |_| -> bool { panic!("the probe ran, and this answer does not depend on it") }
+    }
+
+    /// AC1/AC2 — a person's Wayland session on screen, who can be told: DRM
+    /// and uinput, bound to that session.
+    #[test]
+    fn a_person_who_can_be_told_is_captured_by_a_system_install() {
+        assert_eq!(
+            system_plan(true, true, true, false, false, alice(), told(true)),
+            SystemPlan::Auto {
+                session: "3".into()
+            }
+        );
+    }
+
+    /// AC3 — nobody to tell: nothing switches on, and the hint says why.
+    #[test]
+    fn with_nobody_to_tell_nothing_switches_on_and_the_hint_says_why() {
+        assert_eq!(
+            system_plan(true, true, true, false, false, alice(), told(false)),
+            SystemPlan::NoSurface
+        );
+        let hint = wayland_hint_with(true, true);
+        assert!(hint.contains("being viewed"), "{hint}");
+        assert!(hint.contains("desktop companion"), "{hint}");
+        assert!(hint.contains("drm_capture"), "{hint}");
+        assert!(
+            !wayland_hint_with(true, false).contains("being viewed"),
+            "the keys-only hint stays as it was"
+        );
+        assert_eq!(
+            wayland_hint_with(false, true),
+            wayland_hint_with(false, false),
+            "a per-user install's hint is not the system half's"
+        );
+    }
+
+    /// AC4 — the greeter, a text console, nobody signed in: never by default,
+    /// and the probe never runs.
+    #[test]
+    fn without_a_person_on_screen_nothing_switches_on() {
+        assert_eq!(
+            system_plan(true, true, true, false, false, || None, untold()),
+            SystemPlan::AsConfigured
+        );
+    }
+
+    /// AC5 — every switch gives back the system half before FR-95, and asks
+    /// nothing: `wayland_auto_system`, `wayland_auto`, `wayland_aware`.
+    #[test]
+    fn every_kill_switch_gives_back_the_old_system_half() {
+        for (aware, auto, auto_system) in [
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+        ] {
+            assert_eq!(
+                system_plan(aware, auto, auto_system, false, false, unasked(), untold()),
+                SystemPlan::AsConfigured,
+                "aware={aware} auto={auto} auto_system={auto_system}"
+            );
+        }
+    }
+
+    /// A capture key, to any value, is the operator's choice: `drm_capture =
+    /// true` also reads the greeter and the lock screen, as before.
+    #[test]
+    fn an_explicit_key_always_wins() {
+        assert_eq!(
+            system_plan(true, true, true, true, false, unasked(), untold()),
+            SystemPlan::AsConfigured
+        );
+    }
+
+    /// The daemon's own Xvfb is what it captures.
+    #[test]
+    fn a_virtual_desktop_is_never_replaced() {
+        assert_eq!(
+            system_plan(true, true, true, false, true, unasked(), untold()),
+            SystemPlan::AsConfigured
+        );
+    }
+
+    /// The kill switch only works if `roomler config set` reaches the env the
+    /// plan reads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_kill_switch_is_a_bridged_config_key() {
+        let bridged: Vec<&str> = crate::config::env_bridge_bools(&crate::config::test_fixture())
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        assert!(bridged.contains(&"WAYLAND_AUTO_SYSTEM"), "{bridged:?}");
     }
 }
 

@@ -80,7 +80,7 @@ advertises `session-policy` (P2b). Every other session goes without it:
   `AUDIO` permission bit is read by nothing; the hub clears it along with the flag.
 - The strip takes effect on every deployed agent, because the agent already enforces the grant it is
   sent: it refuses the `files` channel without `FILES` (`agents/roomlerd/src/peer.rs:1197`) and
-  clipboard traffic without `CLIPBOARD` (`agents/roomlerd/src/peer.rs:9965`), and adds no audio track
+  clipboard traffic without `CLIPBOARD` (`agents/roomlerd/src/peer.rs:9992`), and adds no audio track
   without `audio_enabled`. Until P2c the viewer does not explain the refusal.
 - ⚠️ **Mid-roll.** An absent `session_policy` in the relay body comes from an origin pod older than
   the feature and reads as unrestricted: that pod applied no policy and would have granted the
@@ -96,7 +96,7 @@ advertises `session-policy` (P2b). Every other session goes without it:
 
 | Piece | Where |
 |---|---|
-| The owner's floor: `rc_clipboard`, `rc_files`, `rc_audio`, each `on` (default), `ask` or `off`. Live, read strictly when set (`maybe` is refused, where the file's reader would read it as `off`), and absent from `DesiredConfig`, so no server can switch back on what the owner switched off. Over the LocalAPI only the person at the console may set them (root counts on Unix): they govern that person's clipboard, files and audio | `crates/agent-core/src/config.rs:1475`, `config_surface.rs`; `crates/localapi/src/lib.rs:2817` |
+| The owner's floor: `rc_clipboard`, `rc_files`, `rc_audio`, each `on` (default), `ask` or `off`. Live, read strictly when set (`maybe` is refused, where the file's reader would read it as `off`), and absent from `DesiredConfig`, so no server can switch back on what the owner switched off. Over the LocalAPI only the person at the console may set them (root counts on Unix): they govern that person's clipboard, files and audio | `crates/agent-core/src/config.rs:1486`, `config_surface.rs`; `crates/localapi/src/lib.rs:2817` |
 | The masking: the org's policy (from `rc:request`) and the floor, the stricter winning (`FeaturePolicy::stricter`, `crates/remote_control/src/models.rs:1221`, shared with the hub). `off` takes the feature out; `ask` survives only when the person here will approve the session on a prompt this agent raises (`person_asked`: never under `email`, `push` or `prompt_then_email`). Applied the moment the consent mode resolves and before anything reads the grant: the stash the channels enforce, the worker's params, the prompt | `agents/roomlerd/src/session_policy.rs:128` (`mask`), `:102`; applied at `agents/roomlerd/src/signaling.rs:3050` |
 | The prompt names each `ask` feature in words ("Approving also allows clipboard, file transfer and audio."), on its own line under privacy mode's, inside the native panel's two-line detail | `session_policy.rs:183` |
 | `session-policy` in the caps, and the floor itself (`AgentCaps.session_policy`, `models.rs:335`, only when it restricts anything), re-announced on the heartbeat when the owner changes it | `signaling.rs:5743`, `:1914` |
@@ -224,8 +224,8 @@ limit and ends the session itself. The hub's part is to tell it the limit and to
 
   | Entry point | Where | Before P1b |
   |---|---|---|
-  | The agent's enrollment: `roomlerd enroll` / `re-enroll`, the wizard's agent role, the desktop companion | [`enrollment.rs:545`](../../crates/agent-core/src/enrollment.rs#L545) | promoted, but only a lower-case `http://` |
-  | Every load of the agent config: `server_url`, `ws_url`, each `[[orgs]]` entry's | [`config.rs:3088`](../../crates/agent-core/src/config.rs#L3088) → [`secure_server_urls`, `:2231`](../../crates/agent-core/src/config.rs#L2231) | dialled as written |
+  | The agent's enrollment: `roomlerd enroll` / `re-enroll`, the wizard's agent role, the desktop companion | [`enrollment.rs:546`](../../crates/agent-core/src/enrollment.rs#L546) | promoted, but only a lower-case `http://` |
+  | Every load of the agent config: `server_url`, `ws_url`, each `[[orgs]]` entry's | [`config.rs:3101`](../../crates/agent-core/src/config.rs#L3101) → [`secure_server_urls`, `:2242`](../../crates/agent-core/src/config.rs#L2242) | dialled as written |
   | `roomler enroll` and the wizard's tunnel role | [`roomler-cli/src/config.rs:67`](../../agents/roomler-cli/src/config.rs#L67), called at [`cli.rs:1124`](../../agents/roomler-cli/src/cli.rs#L1124) and [`orchestrator_tunnel.rs:236`](../../agents/roomler-setup/src/orchestrator_tunnel.rs#L236) | the tunnel token was posted as written |
   | The tunnel CLI's config, from the file or `ROOMLER_TUNNEL_SERVER` | [`roomler-cli/src/config.rs:46`](../../agents/roomler-cli/src/config.rs#L46) | dialled as written |
   | `roomlerd anchor create` (FR-104) | `exec_service::origin_ok` | refuses plaintext already; unchanged |
