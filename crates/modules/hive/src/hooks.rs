@@ -99,6 +99,10 @@ impl FleetLifecycle for HiveHooks {
         // take its place. Its row is still there while this runs, so it is
         // named as gone.
         if self.state.replicaset {
+            // P2g-4a — and what it holds goes: it is told to purge it all
+            // while its socket is still up, and the purges waiting on it no
+            // longer do.
+            crate::purge::device_removed(&self.state, tenant_id, agent_id).await?;
             let moved =
                 crate::placement::replace_tenant(&self.state, tenant_id, Some(agent_id)).await?;
             if moved > 0 {

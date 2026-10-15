@@ -4638,6 +4638,7 @@
     "rc:hive.lease",
     "rc:hive.demote",
     "rc:hive.purge",
+    "rc:hive.purge_all",
     "rc:hive.retain",
     "rc:hive.prepare",
     "rc:hive.drain",

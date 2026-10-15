@@ -10801,6 +10801,17 @@ const PURGES: &[&str] = &[
     "hive-stream",
     "hive-lease",
     "hive-purge",
+    "hive-purge-all",
+];
+/// A build of P2g-1 to P2g-3d (`agent-v0.4.136`): it purges a session, and
+/// cannot decode a removal's purge of everything.
+const PURGES_A_SESSION: &[&str] = &[
+    "exec",
+    "hive",
+    "hive-replica",
+    "hive-stream",
+    "hive-lease",
+    "hive-purge",
 ];
 /// A build before P2g-1: it holds copies, and does not know a purge.
 const KEEPS: &[&str] = &["exec", "hive", "hive-replica", "hive-stream", "hive-lease"];
@@ -11925,4 +11936,173 @@ async fn a_copy_its_members_own_clock_purged_is_no_longer_counted() {
         "{body}"
     );
     assert_eq!(entry_of(&body["purge"], &p.a.agent_id)["state"], "pending");
+}
+
+// ─── P2g-4a — a removed device purges what it holds ─────────────────────────
+
+/// Remove `device` from its organization, as its admin.
+async fn remove_device(app: &TestApp, tid: &str, admin: &str, device: &str) {
+    let resp = app
+        .auth_delete(&format!("/api/tenant/{tid}/agent/{device}"), admin)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "remove: {:?}", resp.status());
+}
+
+/// FR-90 P2g-4a — a device removed from its organization is told, while its
+/// socket is still up, to purge every session it holds: a member hears
+/// `rc:hive.purge_all`, an id and nothing else, and so does a primary, after
+/// the stop of the session it ran. A build that purges a session but
+/// predates the frame is sent none, and neither is a device that stays.
+#[tokio::test]
+async fn a_removed_device_is_told_to_purge_everything_it_holds() {
+    let app = replicaset_app().await;
+    let mut p = purgeable(&app, "purge-all", &[PURGES, PURGES_A_SESSION]).await;
+    let (tid, admin, sid) = (p.tid.clone(), p.admin.clone(), p.sid.clone());
+    let mut old = p.members.pop().unwrap();
+    let mut m = p.members.pop().unwrap();
+
+    // A member.
+    remove_device(&app, &tid, &admin, &m.agent_id).await;
+    let told = read_until(&mut m.ws, "rc:hive.purge_all")
+        .await
+        .expect("the removed member's purge");
+    assert!(
+        told["purge_id"]
+            .as_str()
+            .is_some_and(|id| ObjectId::parse_str(id).is_ok()),
+        "{told}"
+    );
+    assert_eq!(
+        told.as_object().map(|o| o.len()),
+        Some(2),
+        "an id, nothing else: {told}"
+    );
+
+    // A build of P2g-1 to P2g-3d: never sent a frame it cannot decode.
+    remove_device(&app, &tid, &admin, &old.agent_id).await;
+    assert!(
+        !device_hears(&mut old.ws, "rc:hive.purge_all", Duration::from_millis(500)).await,
+        "a build that purges a session but predates the frame is sent none"
+    );
+    assert!(
+        !device_hears(&mut p.a.ws, "rc:hive.purge_all", Duration::from_millis(500)).await,
+        "the device that stays hears none"
+    );
+
+    // The primary: the stop of the session it ran, then the purge.
+    remove_device(&app, &tid, &admin, &p.a.agent_id).await;
+    let frames = frames_until(&mut p.a.ws, &["rc:hive.stop", "rc:hive.purge_all"]).await;
+    let at = |t: &str| frames.iter().position(|f| f["t"] == t).unwrap();
+    assert!(at("rc:hive.stop") < at("rc:hive.purge_all"), "{frames:?}");
+    let stop = &frames[at("rc:hive.stop")];
+    assert_eq!(
+        (stop["session_id"].as_str(), stop["reason"].as_str()),
+        (Some(sid.as_str()), Some("device_removed")),
+        "{stop}"
+    );
+}
+
+/// FR-90 P2g-4a — a purge waiting on offline members completes once they are
+/// removed: each one's part closes `device_removed` at its own removal, as it
+/// would at the issue of a purge after it, the other members' parts waiting
+/// still, and the last removal completes the purge.
+#[tokio::test]
+async fn a_purge_waiting_on_removed_devices_completes_without_them() {
+    let app = replicaset_app().await;
+    let mut p = purgeable(&app, "purge-gone", &[PURGES, PURGES]).await;
+    let (tid, admin, sid) = (p.tid.clone(), p.admin.clone(), p.sid.clone());
+    let c = p.members.pop().unwrap();
+    let b = p.members.pop().unwrap();
+    drop(b.ws);
+    drop(c.ws);
+    wait_offline(&app, &p.seeded, &b.agent_id).await;
+    wait_offline(&app, &p.seeded, &c.agent_id).await;
+    let (code, body) = delete_session(&app, &tid, &admin, &sid).await;
+    assert_eq!(code, 200, "{body}");
+    let purge = body["purge"]["id"].as_str().unwrap().to_string();
+    read_until(&mut p.a.ws, "rc:hive.purge")
+        .await
+        .expect("the primary's purge");
+    purge_ack(&mut p.a.ws, &purge, &sid, "done", "done").await;
+    wait_purge(&app, &tid, &admin, &sid, "the primary's part", |v| {
+        entry_of(v, &p.a.agent_id)["state"] == "done"
+    })
+    .await;
+
+    // One member removed: its part closes; the other's still waits.
+    remove_device(&app, &tid, &admin, &b.agent_id).await;
+    let (_, v) = read_purge(&app, &tid, &admin, &sid).await;
+    let e = entry_of(&v, &b.agent_id);
+    assert_eq!(
+        (e["state"].as_str(), e["closed"].as_str()),
+        (Some("closed"), Some("device_removed")),
+        "the removed member's part closes: {v}"
+    );
+    assert_eq!(
+        entry_of(&v, &c.agent_id)["state"],
+        "pending",
+        "the other member's part still waits: {v}"
+    );
+    assert_eq!(entry_of(&v, &p.a.agent_id)["state"], "done", "{v}");
+    assert!(v.get("done_at").is_none(), "{v}");
+
+    // The last one removed: the purge completes.
+    remove_device(&app, &tid, &admin, &c.agent_id).await;
+    let v = wait_purge(
+        &app,
+        &tid,
+        &admin,
+        &sid,
+        "the last removal completes the purge",
+        |v| v["done_at"].is_string(),
+    )
+    .await;
+    assert_eq!(entry_of(&v, &c.agent_id)["closed"], "device_removed", "{v}");
+    wait_record_gone(&app, &sid, "the tombstone goes with the purge's completion").await;
+    assert_eq!(
+        purge_audit(&app, &sid).await,
+        vec![("issued".to_string(), None), ("complete".to_string(), None)]
+    );
+}
+
+/// FR-90 P2g-4a — with the replicaset's switch off, a removal tells the
+/// device nothing to purge: its purges are the replicaset's, and off.
+#[tokio::test]
+async fn a_removal_purges_nothing_with_the_switch_off() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("purge-all-off").await;
+    let mut dev = device(&app, &seeded, "mach-purge-all-off", PURGES).await;
+    remove_device(
+        &app,
+        &seeded.tenant_id,
+        &seeded.admin.access_token,
+        &dev.agent_id,
+    )
+    .await;
+    assert!(
+        !device_hears(&mut dev.ws, "rc:hive.purge_all", Duration::from_millis(500)).await,
+        "nothing is purged with the switch off"
+    );
+}
+
+/// FR-90 P2g-4a — a removal on one pod reaches a device whose socket is on
+/// the other: that pod pushes the purge, published ahead of the kick that
+/// unregisters the device there.
+#[tokio::test]
+async fn a_removal_on_one_pod_reaches_a_device_on_the_other() {
+    let (app1, app2) = TestApp::spawn_pair(replicaset_settings).await;
+    if app1.state.redis_pubsub.is_none() || app2.state.redis_pubsub.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    // The member's socket is on pod 1; its removal lands on pod 2.
+    let mut p = purgeable(&app1, "purge-all-xpod", &[PURGES]).await;
+    let (tid, admin) = (p.tid.clone(), p.admin.clone());
+    let mut m = p.members.remove(0);
+    remove_device(&app2, &tid, &admin, &m.agent_id).await;
+    read_until(&mut m.ws, "rc:hive.purge_all")
+        .await
+        .expect("the purge reaches the device on the other pod");
 }

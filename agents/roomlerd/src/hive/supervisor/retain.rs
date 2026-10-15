@@ -170,6 +170,16 @@ impl Supervisor {
 
     /// Ask what keeps every session this device holds anything of.
     pub(crate) async fn ask_retain_all(&self) {
+        let ids = self.held_ids().await;
+        if !ids.is_empty() {
+            self.ask_retain(ids);
+        }
+    }
+
+    /// Every session this device holds anything of, as [`Self::holds_here`]
+    /// reads one: its store's (a copy, a workplace), a run, a hosted entry,
+    /// one waiting to resume. A store that cannot be read adds none.
+    pub(super) async fn held_ids(&self) -> Vec<ObjectId> {
         let mut ids: Vec<ObjectId> = match &self.store {
             Ok(store) => match store.held_sessions().await {
                 Ok(held) => held
@@ -177,7 +187,7 @@ impl Supervisor {
                     .filter_map(|s| ObjectId::parse_str(s).ok())
                     .collect(),
                 Err(e) => {
-                    warn!(%e, "hive: the held sessions were not read — no retention ask");
+                    warn!(%e, "hive: the sessions the store holds were not read");
                     Vec::new()
                 }
             },
@@ -198,11 +208,16 @@ impl Supervisor {
                 .iter()
                 .filter_map(|h| ObjectId::parse_str(&h.session).ok()),
         );
+        ids.extend(
+            self.to_resume
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter_map(|h| ObjectId::parse_str(&h.session).ok()),
+        );
         ids.sort_unstable();
         ids.dedup();
-        if !ids.is_empty() {
-            self.ask_retain(ids);
-        }
+        ids
     }
 
     /// One run of the clock at `now_ms`, by this device's clock: connected,

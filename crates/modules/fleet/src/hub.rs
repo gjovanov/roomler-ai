@@ -232,6 +232,12 @@ pub struct ConnectedAgent {
     /// such frame, so a purge goes only to a connection with it, and waits
     /// for one. Per connection; `hive` does NOT imply it.
     pub supports_hive_purge: bool,
+    /// FR-90 P2g-4a — the agent advertises `hive-purge-all`: it purges every
+    /// session it holds on `rc:hive.purge_all`, sent at its removal. A build
+    /// of P2g-1 to P2g-3d purges a session and cannot decode this frame, so
+    /// it is sent only to a connection with it. Per connection; neither `hive`
+    /// nor `hive-purge` implies it.
+    pub supports_hive_purge_all: bool,
 }
 
 /// FR-85 P3 — what a device says about remote recording, from its caps.
@@ -777,6 +783,9 @@ impl Hub {
             // FR-90 P2g-2 — set by `set_agent_hive_purge_support`; `false` = no
             // purge is ever sent to this connection.
             supports_hive_purge: false,
+            // FR-90 P2g-4a — set by `set_agent_hive_purge_all_support`; `false`
+            // = no removal's purge is ever sent to this connection.
+            supports_hive_purge_all: false,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -2840,6 +2849,43 @@ impl Hub {
             }
         }
         self.send_to_agent(agent_id, msg)
+    }
+
+    /// FR-90 P2g-4a — record whether this connection purges every session it
+    /// holds on `rc:hive.purge_all` (`hive-purge-all`), right after
+    /// registration.
+    pub fn set_agent_hive_purge_all_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_hive_purge_all = supports;
+        }
+    }
+
+    /// FR-90 P2g-4a — push `rc:hive.purge_all {purge_id}` to a device being
+    /// removed, checked in the lookup that sends it, as
+    /// [`Self::push_hive_purge`]: offline or another tenant's is
+    /// [`Error::AgentOffline`]; a connection without `hive` and
+    /// `hive-purge-all` is [`Error::ExecUnsupported`] and receives nothing. A
+    /// build of P2g-1 to P2g-3d says `hive-purge` and cannot decode the frame.
+    pub fn push_hive_purge_all(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        purge_id: ObjectId,
+    ) -> Result<()> {
+        {
+            let entry = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+            if entry.tenant_id != tenant_id {
+                return Err(Error::AgentOffline(agent_id.to_hex()));
+            }
+            if !(entry.supports_hive && entry.supports_hive_purge_all) {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
+        }
+        self.send_to_agent(agent_id, ServerMsg::HivePurgeAll { purge_id })
     }
 
     /// FR-90 P2d — record whether this connection carries replica streams
@@ -6105,7 +6151,8 @@ mod tests {
     /// FR-90 P2g-3b — fleet's `hive_purge` control event, as every pod
     /// applies it: pushed to each connection it names that this hub holds, of
     /// the envelope's tenant; nothing for another tenant's, and nothing past
-    /// the envelope's cap.
+    /// the envelope's cap. P2g-4a — and `hive_purge_all`, a removed device's:
+    /// to its connection, of its tenant, advertising `hive-purge-all`.
     #[tokio::test]
     async fn a_hive_purge_from_another_pod_reaches_only_its_tenants_connection() {
         let hub = test_hub().await;
@@ -6170,6 +6217,33 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "an id past the envelope's cap is not applied"
+        );
+
+        // P2g-4a — a removed device's purge of everything, from another pod.
+        let all = |tid: ObjectId| {
+            serde_json::json!({
+                "class": "rc",
+                "evt": "hive_purge_all",
+                "tenant_id": tid.to_hex(),
+                "agent_id": agent_id.to_hex(),
+                "purge_id": purge.to_hex(),
+            })
+        };
+        crate::ctrl::apply_rc_ctrl(&hub, &all(tenant));
+        assert!(
+            rx.try_recv().is_err(),
+            "a build that purges a session but predates the frame is sent none"
+        );
+        hub.set_agent_hive_purge_all_support(agent_id, true);
+        crate::ctrl::apply_rc_ctrl(&hub, &all(ObjectId::new()));
+        assert!(
+            rx.try_recv().is_err(),
+            "another tenant's purge of everything pushes nothing"
+        );
+        crate::ctrl::apply_rc_ctrl(&hub, &all(tenant));
+        assert!(
+            matches!(rx.try_recv(), Ok(ServerMsg::HivePurgeAll { purge_id }) if purge_id == purge),
+            "a removed device's purge of everything reached its connection"
         );
     }
 
