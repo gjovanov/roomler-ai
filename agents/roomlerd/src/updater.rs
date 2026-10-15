@@ -249,7 +249,7 @@ fn agent_turn_wait() -> Duration {
 }
 
 /// Hold (or release) new agent prompts and starts around an install.
-fn hold_agent_prompts(hold: bool) {
+pub(crate) fn hold_agent_prompts(hold: bool) {
     #[cfg(hive_host)]
     {
         if hold {
@@ -275,7 +275,7 @@ fn hold_agent_prompts(hold: bool) {
 /// ([`crate::hive::begin_update`]) BEFORE a last look, so none begins in the
 /// gap; a prompt admitted before that still runs, and is waited for.
 /// `false` = the daemon is shutting down instead.
-async fn wait_for_agent_turns(
+pub(crate) async fn wait_for_agent_turns(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     by: &'static str,
 ) -> bool {
@@ -382,7 +382,7 @@ pub fn release_install_hold() {
 /// (it holds the image being replaced) — the partial survives and is
 /// finalized `interrupted` later, but it is not the recording the person
 /// was making. Same defer budget as a transfer: ≤ MAX_CONSECUTIVE_DEFERS.
-fn active_work() -> usize {
+pub(crate) fn active_work() -> usize {
     let transfers = crate::files::active_transfer_count();
     #[cfg(feature = "recording")]
     let recording = usize::from(crate::recording::manager::is_recording());
@@ -394,7 +394,7 @@ fn active_work() -> usize {
 /// R5b — did a material MAJOR network change land inside
 /// [`NET_TRANSITION_WINDOW`]? Feature-shaped: no-overlay builds have no
 /// netstate and never defer on this input.
-fn net_transition_recent() -> bool {
+pub(crate) fn net_transition_recent() -> bool {
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
     {
         tunnel_core::overlay::netstate::last_major_within(NET_TRANSITION_WINDOW)
@@ -3518,7 +3518,8 @@ async fn install_from_helper(
         Some(v) if crate::post_install::version_matches(&v, &latest) => tracing::info!(
             %latest,
             installed = %v,
-            "update-helper: installed and verified — a per-user daemon runs it from its next restart"
+            "update-helper: installed and verified — a per-user daemon restarts onto it once idle \
+             (FR-96 P2b; an older one, at its next restart)"
         ),
         other => tracing::warn!(
             %latest,

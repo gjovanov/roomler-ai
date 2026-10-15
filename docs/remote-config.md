@@ -324,6 +324,15 @@ flowchart TD
 | **A restart must not look like a crash.** | It rides the internal-shutdown path the auto-updater already uses: `mark_clean_shutdown`, the runtime torn down as for an update, then the exit code. The SCM supervisor also maps the sentinel 9 to `Respawn` and records no crash for it. |
 | **launchd relaunches only a non-zero exit.** | Everything but the SCM exits `RESTART_REQUESTED_EXIT_CODE = 9` — outside the Linux units' `RestartPreventExitStatus=7 8`, and nothing else in the tree exits 9. Tests assert both packaged units and both packaged plists. |
 
+**A second caller: the daemon itself (FR-96 P2b, 2026-10-13).** A per-user Linux
+daemon whose binary was replaced restarts through the same door once nothing it
+serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:326-385`).
+It runs the same supervisor proof, record and systemd read-back, but not
+`local_restart_enabled`, because no local client is asking. It is not a server
+lever: what sets it off is a file replaced ON the device, by the root update
+helper's verified install or an admin's `apt upgrade`. And an install restarting
+the daemon is what every other install flavour has always done.
+
 **Why the remote path still does not restart anything.** The objection that
 survives is the fleet. A config push lands on every device an admin selects,
 and the ones that cannot come back are precisely the ones D3 refuses — the
