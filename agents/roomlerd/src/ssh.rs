@@ -2485,6 +2485,7 @@ async fn serve_conn(stream: tunnel_core::overlay::netstack::NsTcpStream, ctx: Se
     };
 
     info!(%peer, "ssh: session opening");
+    let _live = LiveConnection::open();
     let handler = sshd::Handler::new(ctx.clone(), peer);
     match russh::server::run_stream(ctx.config.clone(), stream, handler).await {
         Ok(session) => match session.await {
@@ -2528,6 +2529,38 @@ pub async fn serve_for_service<S>(
             Err(e) => tracing::info!(%peer, %e, "ssh-service: session ended"),
         },
         Err(e) => warn!(%peer, %e, "ssh-service: handshake failed"),
+    }
+}
+
+/// FR-96 P2b — SSH connections open on this device right now. A daemon
+/// restart ends every one of them, so the restart onto a replaced binary
+/// waits while any is open: the likeliest way that binary gets replaced is an
+/// admin's `apt upgrade` typed INTO one of these sessions.
+static LIVE_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many SSH connections are open right now; zero in a build without the
+/// SSH server.
+pub fn live_connections() -> usize {
+    LIVE_CONNECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Counts one connection in [`LIVE_CONNECTIONS`] for as long as it lives,
+/// whichever way `serve_conn` returns.
+#[cfg(all(feature = "overlay-netstack", feature = "ssh-server"))]
+struct LiveConnection;
+
+#[cfg(all(feature = "overlay-netstack", feature = "ssh-server"))]
+impl LiveConnection {
+    fn open() -> Self {
+        LIVE_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+#[cfg(all(feature = "overlay-netstack", feature = "ssh-server"))]
+impl Drop for LiveConnection {
+    fn drop(&mut self) {
+        LIVE_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

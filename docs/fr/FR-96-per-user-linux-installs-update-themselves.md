@@ -1,7 +1,8 @@
 # FR-96: Per-user Linux installs update themselves — a root update half beside the daemon, as macOS has
 
-**Issue:** [#2052](https://github.com/gjovanov/roomler-ai/issues/2052) · **Status:** proposed 2026-10-12, spec and claim
-(#2046, on the operator's "do per recommendation") · **Owner:** the agent updater and the Linux installers ·
+**Issue:** [#2052](https://github.com/gjovanov/roomler-ai/issues/2052) · **Status:** in progress — P1 shipped in
+0.4.133; P2a (#2132) and P2b (#2184) in review, both field-verified on the lab's KDE guest; P3–P4 not started (spec and claim 2026-10-12, #2046, on the operator's
+"do per recommendation") · **Owner:** the agent updater and the Linux installers ·
 **Builds on:** [FR-5](FR-5-macos-unattended-update-chain.md) (the macOS update half this mirrors),
 [FR-67](FR-67-update-outcome-observability.md) (what an install reports) · **Fixes:** #2046
 
@@ -142,30 +143,41 @@ shared successor of `macos_forward_triggers`, `:3146-3228`) as before. Linux ask
 
 A host without the helper (an install from before this FR) keeps today's path unchanged.
 
-### 3.3 Onto the new binary
+### 3.3 Onto the new binary (P2b, as built)
 
-After a successful install, the helper asks every per-user daemon on the host to restart.
+The per-user daemon notices for itself (D2): `agents/roomlerd/src/replaced_binary.rs`, spawned beside the updater
+(`main.rs:4523-4524`) on a Linux, non-root daemon whose kill switch is unset and whose supervisor will relaunch it
+(`spawn`, `replaced_binary.rs:241-265`). ONE mechanism serves the helper's install, an admin's `apt upgrade` and a
+hand install alike, and the helper never speaks to a daemon.
 
-- **Find them:** each `/run/user/<uid>/roomler.sock` (`crates/localapi/src/lib.rs:3272`, `user_socket_path`
-  `:3291-3299`). Root reaches the 0600 socket, and the console-user gate accepts uid 0 (`lib.rs:2046-2047`).
-- **Ask:** the existing `Request::RestartDaemon { reason }` (`lib.rs:1334-1338`). It exits 9 (`watchdog.rs:172`),
-  and the unit's `Restart=always` relaunches the new binary (`packaging/linux/roomler.service:27-29`).
-- ⚠️ **Not under a live session (D1).** The restart waits while a remote session, a transfer or a recording is
-  active, the in-process updater's own gate (`active_work`, `updater.rs:385-392`), up to a ceiling.
-- **P2b's likely shape, written down after P2a's review (not yet decided).** D2's backstop and the helper's ask
-  can be ONE mechanism inside the per-user daemon: notice that `/usr/bin/roomlerd` is no longer the image it is
-  running, and restart when idle. That needs no root connection to a socket a user owns (every answer on
-  `/run/user/<uid>/roomler.sock` is untrusted to root), and it covers an admin's `apt upgrade` too. Two traps:
-  the tarball install *renames* the old binary to `.prev`, so a ` (deleted)` suffix on `/proc/self/exe` is not
-  enough on its own — compare the inode of `/proc/self/exe` with the path's. And a daemon may exit only where a
-  supervisor brings it back (`supervision.rs`, FR-84 D3): exiting an orphan `roomlerd run` takes the host offline.
+| step | what | where |
+|---|---|---|
+| baseline | at start, the exec path (`argv[0]` when absolute: systemd passes `ExecStart=`'s) and `/proc/self/exe` must be ONE file by `(st_dev, st_ino)`, or the watch stands down — this filesystem cannot tell a replacement | `baseline`, `replaced_binary.rs:270-287` |
+| replaced | every minute, the path's identity against the running image's. Not a ` (deleted)` check: the tarball's install renames the old binary to `.prev`, which `/proc/self/exe` then names | `watch` `:342-503`, `CHECK_EVERY` `:41` |
+| settled | the same new identity for 2 min: an install places the binary before its libraries and units | `SETTLE` `:45` |
+| answers | the new binary's `--version` must be `roomlerd <another version>`. One that cannot load (a missing shared library) is never restarted onto, so the daemon stays online on the old image; the same version is not worth cutting anything for | `verdict_from` `:196-211` |
+| idle (D1) | no remote-control session, no SSH connection, no transfer or recording — work a restart CUTS, cut after the 24 h ceiling. A network transition in the last 10 min, or an install of the daemon's own in flight — states a restart could WEDGE, never forced. Agent turns are waited for as an install waits for them | `Busy` `:82-107`, `decide` `:164-190`, `CEILING` `:48` |
+| restart | FR-84 D3's door: a supervisor that relaunches, the persisted record that makes a loop impossible, systemd's own read-back of the unit's policy. These are "Apply now"'s gates, minus the owner's switch for LOCAL CLIENTS' requests: nobody is asking. A refusal is retried after 10 min | `RestartHandle::arm_from_within`, `localapi_state.rs:326-385`; `RETRY_AFTER`, `replaced_binary.rs:52` |
+
+- ⚠️ **An SSH session counts as a session.** The likeliest replacement outside the helper is an admin's
+  `apt upgrade` typed into a roomler SSH session on that very device. `ssh.rs` now counts its open connections
+  (`live_connections`, `ssh.rs:2539-2545`), and the restart waits for them.
+- **`auto_update = false` does not stop it.** Running what is already installed is not an update. The kill switch
+  is the FR's, `ROOMLERD_UPDATE_HELPER=0` (AC7).
+- **Root daemons are unchanged** (AC4). An admin's `apt upgrade` on a system install still leaves the root daemon
+  on its old image until something restarts it, because the postinst never restarts anything. Taking D2 to root
+  daemons is a separate decision, not made here.
+- **Why not the helper asking each daemon** (this section's first sketch, over `Request::RestartDaemon` on
+  `/run/user/<uid>/roomler.sock`): root would connect to a socket a user owns and have to distrust every answer,
+  and it would miss every replacement the helper did not make.
 
 ### 3.4 What it must never do
 
 - **Read the wake file's content.** A local user who could pin a version could make root install a genuine but
   old release, the downgrade class `artifact_version` closed on Windows. The macOS rule carries over as-is.
 - **Install for a system install.** That host has one owner already.
-- **Restart a daemon mid-session.**
+- **Restart a daemon mid-session** before D1's 24 h ceiling (P2b's `decide`, `replaced_binary.rs:164-190`), nor
+  ever beside a network transition.
 - **Run as non-root.** It refuses, as macOS's helper does (`updater.rs:3296-3303`).
 - **Stage a download at a fixed or shared name** (security review, finding 1). `/tmp` is sticky but a
   *subdirectory* of it is not, so the old fixed `/tmp/roomlerd-update/<asset>` let any local user own the
@@ -191,8 +203,8 @@ After a successful install, the helper asks every per-user daemon on the host to
 | **P0** | the population: Linux devices by version, and per-user ones by P2b's `session`, from the server's rows | — | the server | S |
 | **P1** | `roomlerd update-helper` on Linux, and the three units in the `.deb` and the tarball | the opt-out marker; the units disabled | the lab: the KDE per-user (tarball) and GNOME per-user (`.deb`) guests, red first on the release | M |
 | **P2a** | the per-user daemon wakes the helper instead of installing (§3.2), and its unit may write the wake file | `ROOMLERD_UPDATE_HELPER=0` | the lab: the KDE per-user guest, a real push → the helper's install (§8) | S |
-| **P2b** | the daemon onto the new binary after an install (§3.3, D1, D2) | `ROOMLERD_UPDATE_HELPER=0` | the lab, with a live session across the install | M |
-| **P3** | the installers: `install.sh` enables the units for a per-user install; a non-root `roomler self-update` wakes the helper (it bails today, `main.rs:5070-5100`) | — | the lab, a fresh install of each format | S |
+| **P2b** | the daemon onto the new binary once idle, after ANY replacement (§3.3, D1, D2) | `ROOMLERD_UPDATE_HELPER=0` | the lab: the KDE per-user guest, a viewer session held across a real push, which was not cut; the restart came once it ended (§8, 2026-10-14) | M |
+| **P3** | the installers: `install.sh` enables the units for a per-user install; a non-root `roomler self-update` wakes the helper (it bails today, `main.rs:5083-5113`) | — | the lab, a fresh install of each format | S |
 | **P4** | docs: `docs/linux-self-update.md` (status, the ladder claim, the helper), `docs/installation.md` (a Linux row beside the macOS three-unit table, `:297-301`, and `:497`), `README.Debian`, the `docs/README.md` index row | — | — | S |
 
 Each phase ships in an agent release (the `ship-it` skill owns the mechanics) and is field-verified before the
@@ -202,13 +214,19 @@ next depends on it.
 
 - [ ] **AC1**: a per-user **tarball** install (the lab's Fedora KDE guest) goes from release N to N+1 with no
   human action: on its timer, or within a minute of a pushed `rc:agent.update`. Red first on 0.4.130 (§2).
-  Progress (P1 + P2a, §8): a real push installed 0.4.133 on the KDE guest 61 s later — the helper's first run
-  waits the full 60 s gap. Still owed: the units were enabled by hand (P3's `install.sh` owes "no human action"),
-  and the daemon runs the new binary only from its next restart (P2b).
+  Progress (P1 + P2a + P2b, §8). A real push installed the release on the KDE guest about a minute later; the
+  helper's first run waits the full 60 s gap. P2b then restarted the daemon onto it once idle, and the server's
+  row reported the new version. Still owed: the units were enabled by hand, and P3's `install.sh` owes "no human
+  action".
 - [ ] **AC2**: a per-user **`.deb`** install (the lab's GNOME guest) does the same, with no `pkexec` or `sudo` and
   no password prompt on its screen.
-- [ ] **AC3**: after the install, the per-user daemon runs the new version (the server's row reports it). A remote
-  session open across the install is not cut by the restart, which waits for it to end (D1).
+- [x] **AC3**: after the install, the per-user daemon runs the new version (the server's row reports it). A remote
+  session open across the install is not cut by the restart, which waits for it to end (D1). Field-verified
+  2026-10-14 on `wlab-kde` (§8, the P2b candidate), red first on the stock build.
+  - A viewer session was held across a real push and the helper's install of 0.4.134.
+  - The daemon logged `restart deferred busy=1 remote-control session(s)`.
+  - The viewer stayed connected at all 32 checks, with 0 cuts.
+  - The restart came 44 s after the viewer let go, and the row read `0.4.134 online=true`.
 - [ ] **AC4**: a system install is unchanged. Its root daemon updates itself in-process, and the helper's units
   are not enabled.
 - [ ] **AC5**: `/etc/roomler/disable-auto-update` stops the helper, and removing it resumes updates (a round
@@ -221,9 +239,12 @@ next depends on it.
   Field-verified 2026-10-12/13 on `wlab-kde` — see §8. "Content never read" rests on the unit tests and direct
   code inspection (`consume_wake` never opens the file for reading); every other clause has a direct field log
   line.
-- [ ] **AC7**: `ROOMLERD_UPDATE_HELPER=0` gives back today's behaviour exactly. P2a's half is field-verified
-  (§8: with the helper enabled, the switch keeps the daemon on the in-process path and says why); P2b's restart
-  owes the other half.
+- [x] **AC7**: `ROOMLERD_UPDATE_HELPER=0` gives back today's behaviour exactly. Field-verified on `wlab-kde`, both
+  halves (§8).
+  - P2a (2026-10-13): with the helper enabled, the switch keeps the daemon on the in-process path, and the log
+    says why.
+  - P2b (2026-10-14): the switch logs `replaced-binary watch: off (ROOMLERD_UPDATE_HELPER=0)`. With the binary
+    replaced underneath it, the daemon kept its pid and ran the deleted image for 4 min, as the stock build does.
 - [ ] **AC8**: Docs: `docs/linux-self-update.md`, `docs/installation.md` and `README.Debian` updated in the house
   style (a mermaid diagram, tables, `file:line` anchors), and the `docs/README.md` index row.
 - [x] **AC9** (security review, #2055): the download is staged in a fresh private directory — a new 0755
@@ -242,8 +263,8 @@ next depends on it.
 
 | | decision | recommendation |
 |---|---|---|
-| **D1** | the restart onto the new binary: at once, or when the daemon is idle | when idle, with a ceiling (say 24 h): a restart under a live session cuts it, and the update is not urgent enough for that |
-| **D2** | a backstop for every other replacement (an admin's `apt upgrade`, a hand install): the daemon notices its executable was replaced and restarts when idle | yes, in P2: it is the same restart, and without it a replaced binary waits for a reboot |
+| **D1** | the restart onto the new binary: at once, or when the daemon is idle | **Decided 2026-10-13 (operator), as recommended: when idle, with a 24 h ceiling** (P2b, §3.3). A restart under a live session cuts it, and the update is not urgent enough for that |
+| **D2** | a backstop for every other replacement (an admin's `apt upgrade`, a hand install): the daemon notices its executable was replaced and restarts when idle | **Decided 2026-10-13 (operator), as recommended: yes** — and it became the ONE mechanism (§3.3): without it a replaced binary waits for a reboot |
 | **D3** | hosts installed before this FR cannot receive it by themselves | say so where the operator looks: a devices-page note for a Linux row more than N releases behind, pointing at re-running `install.sh` |
 | **D4** | the `.deb` ladder's `pkexec`, once the helper ships | drop it on hosts that have the helper; keep `sudo -n` only on hosts that don't. A password prompt every 4 h is worse than either |
 
@@ -266,3 +287,5 @@ next depends on it.
 | 2026-10-13 | P2a candidate (0.4.1), run 1 | `wlab-kde`, `~/wwlab/fr96-p2a-lab.sh` on mars | ⚪ **Measured nothing past setup — a confound in the TEST, kept because it is a real behaviour.** The guest's `config.toml` carries `auto_update = false`, so `run_periodic` never ran and the push was dropped: the per-user switch gates forwarding too (§3.2). Re-run with the updater armed through the user manager's environment (`ROOMLERD_AUTO_UPDATE=1`, not a config edit — #2078: a clean shutdown erases keys the old binary does not know), and with each step asserting `auto-updater armed` before it measures anything |
 | 2026-10-13 | P2a candidate (0.4.1) → released 0.4.133, run 2 | same guest, reverted to `stock-0.4.128` first | 🔴→🟢 **P2a end to end, on a real push.** RED on the stock 0.4.128 unit: `touch` in the daemon's own mount namespace → `cannot touch '/var/tmp/fr96-p2a-probe': Read-only file system`, while its runtime dir (the control) is writable — every forwarded push would have failed `EROFS`. The two controls on the candidate log their reason: `ROOMLERD_UPDATE_HELPER=0` → `this daemon installs its own updates why=ROOMLERD_UPDATE_HELPER=0 — the in-process path, as before FR-96`; the helper disabled → `why=the root update helper is not enabled on this host (roomler-update.path / .timer)`. GREEN with only `roomler-update.path` enabled (the timer left disabled — either link is enough): `the root update helper (roomler-update.service) owns updates on this host — forwarding rc:agent.update to its wake file, installing nothing here enabled_by=/etc/systemd/sys…`, and `/var/tmp` writable in the new unit's namespace. Then a **real push** from the server (`POST …/agent/{id}/update` → `delivered:true`): the daemon at `20:48:15.765` `rc:agent.update queued for the root update helper`; the helper 16 ms later `spacing this run … wait_secs=60` (a reverted guest has no stamp, so the full gap); at `20:49:16.691` `installing as root current=0.4.1 latest=agent-v0.4.133 package=/tmp/roomlerd-update.hePzZM/…tar.gz`; `installed and verified`; `/usr/bin/roomlerd` = 0.4.133, 61 s after the push. The candidate logged no install attempt of its own (0 lines). ⚠️ The contrast count was ALSO 0 — the stock daemon was not armed, and each control ran ~9 s before the next restart — so it proves nothing either way; the split rests on the decision lines above and the unit tests. The daemon itself stays on 0.4.1 until its next restart, which the helper's own line says: P2b's job |
 | 2026-10-13 | the P2a CI guard | systemd 255 (WSL), the two sandbox cells' logic | 🔴→🟢 **The grant's CI guard can fail, measured before it landed.** PR #2132's first CI run went red in FR-85's system-unit sandbox cell, which requires every optional (`-`) path to be missing, and `/var/tmp` exists on every host. That cell now exempts `/var/tmp` and asserts it is WRITABLE instead. Under `roomler.service`'s sandbox as a system unit with `User=`, the probe answered `VARTMP_WRITABLE`. The same sandbox without `ReadWritePaths=-/var/tmp` answered `VARTMP_READ_ONLY`, which is the negative control. Under a user manager that applies the sandbox (the #1997 cell's configuration; the unit in its own mount namespace), the grant gave `/var/tmp rw,nosuid,relatime` as a mount of its own, while without it there was no `/var/tmp` entry and `/` was `ro` |
+| 2026-10-14 | P2b candidate (0.4.1), run 1 | `wlab-kde` | ⚪ **Void: a lab collision, not a result.** Another session's FR-93 P5e run started on the same guest 4 s after this one, and both had passed a "is the guest off?" check. Its candidate swap restarted the stock daemon at 06:31:54, which read like a red that was not one: the stock daemon restarting after its binary was replaced. Every step after that ran on the other session's binary. This run was stopped at 06:33:55, and the other session was told exactly what had changed on the guest; both runs were voided. The lab now has a claim both sessions honour: `flock -n ~/wwlab/locks/<guest>.lock` around the whole run, plus a re-check for other users right after the revert |
+| 2026-10-14 | P2b candidate (0.4.1) → released 0.4.134, run 2 | `wlab-kde` under the lab lock (`~/wwlab/fr96-p2b-lab.sh` on mars), reverted to `stock-0.4.128`, the automatic portal off for the run (`ROOMLERD_WAYLAND_AUTO=0`: a reverted guest has no portal grant, and nobody answers the dialog) | 🔴→🟢 **P2b end to end, D1 included.**<br>• **RED**, the stock 0.4.128 daemon: four minutes after `sudo install` replaced its binary, it was the same pid (1255), running `/usr/bin/roomlerd (deleted)`. Nothing restarts a per-user daemon (§2).<br>• **The candidate** came up `replaced-binary watch: armed … path=/usr/bin/roomlerd supervisor="systemd"`, in P2a's helper mode.<br>• **A viewer session**, held 8 min from 06:43:41. The push was delivered at 06:43:43 and the daemon logged `queued for the root update helper`. The helper installed **0.4.134**, which was released in the meantime, at 06:44:47.<br>• **The watch** logged `the binary was replaced — waiting for it to settle` at 06:45:26, then `the new binary answers — restarting onto it once idle new=0.4.134 running="0.4.1"` at 06:47:26, then `restart deferred busy=1 remote-control session(s)` at 06:48:26.<br>• **The viewer** was connected at all 32 of its 15-s checks, with **0 CUT**, and released at 06:51:42.<br>• **The restart**: at 06:52:26, the very next check, `restart decided by this daemon: armed reason=FR-96 P2b: /usr/bin/roomlerd was replaced (0.4.1 -> 0.4.134) supervisor="systemd" exit_code=9`, then `restart: committed`, then `marking graceful`. systemd logged `Main process exited, code=exited, status=9/n/a` and `Started` at 06:52:31. The new pid 4811 runs `/usr/bin/roomlerd` = 0.4.134, and the server row reads **`0.4.134 online=true`**.<br>• **AC7**: the candidate again under `ROOMLERD_UPDATE_HELPER=0` logged `replaced-binary watch: off (ROOMLERD_UPDATE_HELPER=0)`. Four minutes after the release replaced its binary, it kept its pid (5050) on the deleted image.<br>• The run ended with no `ROOMLERD_*` left in the user manager |

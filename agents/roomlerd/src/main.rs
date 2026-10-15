@@ -3963,13 +3963,13 @@ async fn run_cmd(
     #[cfg(not(unix))]
     let delegation_role = roomlerd::delegate::Delegation::Off;
 
-    // FR-84 D3 — "Apply now": the LocalAPI's `RestartDaemon` verb, the ONLY
-    // way this process restarts itself. It rides the internal-shutdown path
-    // the auto-updater uses (the `shutdown_tx` below), so a restart is
-    // graceful by construction; the select at the end of this function reads
-    // back whether one was accepted. Remote configuration never reaches it —
-    // there is no server message that restarts a daemon (docs/remote-config.md
-    // §7b).
+    // FR-84 D3 — the ONE door this process restarts itself through: the
+    // LocalAPI's `RestartDaemon` verb ("Apply now"), and FR-96 P2b's watch on a
+    // replaced binary. It rides the internal-shutdown path the auto-updater
+    // uses (`shutdown_tx` below), so a restart is graceful by construction; the
+    // select at the end of this function reads back whether one was accepted.
+    // Remote configuration never reaches it — there is no server message that
+    // restarts a daemon (docs/remote-config.md §7b).
     let restart = localapi_state::RestartHandle::new(
         supervision,
         shutdown_tx.clone(),
@@ -4543,6 +4543,15 @@ async fn run_cmd(
         None
     };
 
+    // FR-96 P2b — a per-user Linux daemon restarts onto its replaced binary
+    // once nothing it serves would be cut: the root helper's install, an
+    // admin's `apt upgrade`, a hand install alike. Not an update, so
+    // `auto_update = false` does not stop it; it leaves through FR-84 D3's
+    // door (`restart`), the one way this process restarts itself.
+    #[cfg(target_os = "linux")]
+    let replaced_task =
+        roomlerd::replaced_binary::spawn(shutdown_rx.clone(), restart.clone(), rc_sessions.clone());
+
     // Wait for an internal shutdown, Ctrl-C (SIGINT), or SIGTERM.
     let mut graceful_shutdown = false;
     // FR-51 P3 — true only on the two OS-initiated arms below. The internal
@@ -4625,6 +4634,10 @@ async fn run_cmd(
         t.abort();
     }
     if let Some(t) = upd_task {
+        t.abort();
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(t) = replaced_task {
         t.abort();
     }
     // #1684 — take our own virtual desktop down BEFORE we leave. Under systemd
