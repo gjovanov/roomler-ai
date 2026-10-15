@@ -466,6 +466,20 @@ pub struct ReplicaMember {
     /// claim, numbers and hashes only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip: Option<MemberTip>,
+    /// FR-90 P2g-4b — the purge of this leaving member's copy, once issued:
+    /// placement never takes the member back from then on, the purge is
+    /// delivered only while the row names it, and its completion drops the
+    /// row. Absent on every other member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purging: Option<ObjectId>,
+    /// FR-90 P2g-4b — the fork being made from this leaving member's copy
+    /// (P2f-3c): its first start puts the fork in place from that copy, so
+    /// the copy is not purged while that start is out. Written with the
+    /// leaving, in the write that ends the fork's move; at each look for a
+    /// purge, the fork's own record says whether it still needs the copy.
+    /// Absent on every other member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forking: Option<ObjectId>,
 }
 
 /// FR-90 P2c-3 — whether a member took its copy.
@@ -484,6 +498,8 @@ pub enum MemberState {
     /// changed, a smaller policy, the device removed. Its copy goes with the
     /// purge (P2g), once `min` holds elsewhere; until then it keeps what it
     /// holds, and placement choosing it again makes it `pending` again.
+    /// P2g-4b — once that purge is issued ([`ReplicaMember::purging`]),
+    /// placement never chooses it again: removal is final on the device.
     Leaving,
 }
 
@@ -1011,8 +1027,8 @@ pub struct HivePurge {
     pub owner_id: ObjectId,
     /// Who issued it.
     pub by: ObjectId,
-    /// `owner` (P2g-2); retention and a device's removal or leaving are
-    /// P2g-3's and P2g-4's.
+    /// `owner` (P2g-2), `retention` (P2g-3a), or `leaving` (P2g-4b, with
+    /// [`Self::member`]). A device's removal writes none (P2g-4a).
     pub reason: String,
     /// The session's room, deleted with the purge; kept so its completion
     /// can delete it again should that first delete have failed.
@@ -1024,6 +1040,11 @@ pub struct HivePurge {
     /// days, like the audit; one still pending is kept until it completes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub done_at: Option<DateTime>,
+    /// FR-90 P2g-4b — a member's leaving: the purge of that one device's
+    /// copy, which makes no tombstone and leaves the session as it is. Absent
+    /// on every purge of a whole session, so `{member: null}` finds those.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<ObjectId>,
 }
 
 impl HivePurge {
@@ -1577,9 +1598,14 @@ mod tests {
             ],
             at: DateTime::now(),
             done_at: None,
+            member: None,
         };
         assert!(!p.complete(), "a's part is pending");
         let stored = bson::to_document(&p).unwrap();
+        assert!(
+            !stored.contains_key("member"),
+            "a whole session's purge stores no member, so `{{member: null}}` finds it: {stored}"
+        );
         let first = stored.get_array("devices").unwrap()[0]
             .as_document()
             .unwrap()
@@ -1627,5 +1653,8 @@ mod tests {
         let m: ReplicaMember = bson::from_document(old).expect("a P2c-2b member reads");
         assert_eq!(m.state, MemberState::Pending);
         assert_eq!((m.refusal, m.answered_at, m.tip), (None, None, None));
+        // P2g-4b — and no purge of its copy was ever issued, nor any fork
+        // made from it.
+        assert_eq!((m.purging, m.forking), (None, None));
     }
 }

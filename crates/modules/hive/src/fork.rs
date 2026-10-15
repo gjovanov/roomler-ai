@@ -477,6 +477,7 @@ pub async fn fork(
         .display_name;
     let restricted = restricted_of(&parent);
     let new = NewSession {
+        id: ObjectId::new(),
         tid,
         owner: auth.user_id,
         device_id: target,
@@ -515,8 +516,13 @@ pub async fn fork(
 /// ([`crate::promote`]), as the route makes one on a device that held a copy
 /// already. Its route's gates passed when the move began; the device's own
 /// are asked at its start. `parent` is the session's record as the move
-/// ended.
-pub(crate) async fn make_joined(state: &HiveState, parent: &AgentSession, p: &Promotion) {
+/// ended; `fork_id` the id the move's end named on the target's row (P2g-4b).
+pub(crate) async fn make_joined(
+    state: &HiveState,
+    parent: &AgentSession,
+    p: &Promotion,
+    fork_id: ObjectId,
+) {
     let (Some(sid), Some(plan)) = (parent.id, p.fork.as_ref()) else {
         return;
     };
@@ -539,6 +545,7 @@ pub(crate) async fn make_joined(state: &HiveState, parent: &AgentSession, p: &Pr
     };
     let restricted = restricted_of(parent);
     let new = NewSession {
+        id: fork_id,
         tid,
         owner: p.by,
         device_id: p.to,
@@ -572,6 +579,10 @@ pub(crate) async fn make_joined(state: &HiveState, parent: &AgentSession, p: &Pr
             room::note(state, parent, room::fork_failed_note(p, why)).await;
         }
     }
+    // P2g-4b — the server is done trying: unless the fork's start is still
+    // out (its answer settles it), the copy it was made from may go now,
+    // not at the session's next tip.
+    crate::purge::settle_session(state, sid).await;
 }
 
 #[cfg(test)]
@@ -599,6 +610,8 @@ mod tests {
             refusal: None,
             answered_at: None,
             tip: tip(Some(30)),
+            purging: None,
+            forking: None,
         }
     }
 

@@ -406,6 +406,7 @@ pub async fn start(
         return Ok(Json(StartResponse::refused_by_server(reason, None)));
     }
     let new = NewSession {
+        id: ObjectId::new(),
         tid,
         owner: auth.user_id,
         device_id,
@@ -425,6 +426,9 @@ pub async fn start(
 /// started one, or a fork, which names the session it was made from and
 /// carries that one's restricted tags.
 pub(crate) struct NewSession<'a> {
+    /// The session's id. P2g-4b — a fork made from a member's copy has its
+    /// id named on that member's row before its record is made.
+    pub id: ObjectId,
     pub tid: ObjectId,
     /// Who starts it, and owns it.
     pub owner: ObjectId,
@@ -453,6 +457,7 @@ pub(crate) async fn begin(
     new: NewSession<'_>,
 ) -> Result<StartResponse, ApiError> {
     let NewSession {
+        id: sid,
         tid,
         owner: user_id,
         device_id,
@@ -483,7 +488,6 @@ pub(crate) async fn begin(
     // `.invalid` placeholder `users.email` holds otherwise) and a display name.
     let user = state.users.base.find_by_id(user_id).await?;
     let now = DateTime::now();
-    let sid = ObjectId::new();
     // P1e — core memory, rendered now and frozen with the session: a fact
     // written later reaches the next session, never this one. Only for a
     // device that understands it; one that cannot be rendered is logged and

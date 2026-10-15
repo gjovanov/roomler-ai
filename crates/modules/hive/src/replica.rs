@@ -332,6 +332,9 @@ pub(crate) async fn on_tip(state: &HiveState, device_id: ObjectId, tip: HiveRepl
             // P2e-3 — the promotion moving the session to this member, if
             // one is syncing, may move the lease now.
             crate::promote::on_tip(state, tip.session_id, device_id).await;
+            // P2g-4b — and the copies elsewhere may now be enough for a
+            // member that leaves to be purged.
+            crate::purge::settle_session(state, tip.session_id).await;
         }
         Ok(false) => debug!(
             session = %tip.session_id, device = %device_id,
@@ -405,6 +408,8 @@ mod tests {
             refusal: None,
             answered_at: None,
             tip: None,
+            purging: None,
+            forking: None,
         }
     }
 

@@ -527,20 +527,29 @@ async fn apply_reports(
                             && fence > 1
                             && crate::promote::on_launched(state, session_id, device_id, fence)
                                 .await;
-                        // And say so in the session's room (P0d) — for a
-                        // first start: one at a later fence is a move's, or a
-                        // move back's, whose notes are the promotion's.
-                        if let Ok(Some(s)) = state.sessions.find(session_id).await
-                            && !moved
-                            && (refused.is_some() || s.fence <= 1)
-                        {
-                            let text = match refused {
-                                // P2f-4b — a terminal session made a managed one.
-                                None if s.from_terminal.is_some() => room::made_managed_note(&s),
-                                None => room::started_note(&s),
-                                Some(_) => room::refused_note(&s),
-                            };
-                            room::note(state, &s, text).await;
+                        if let Ok(Some(s)) = state.sessions.find(session_id).await {
+                            // And say so in the session's room (P0d) — for a
+                            // first start: one at a later fence is a move's, or
+                            // a move back's, whose notes are the promotion's.
+                            if !moved && (refused.is_some() || s.fence <= 1) {
+                                let text = match refused {
+                                    // P2f-4b — a terminal session made a managed one.
+                                    None if s.from_terminal.is_some() => {
+                                        room::made_managed_note(&s)
+                                    }
+                                    None => room::started_note(&s),
+                                    Some(_) => room::refused_note(&s),
+                                };
+                                room::note(state, &s, text).await;
+                            }
+                            // P2g-4b — a fork's first start answered: the copy
+                            // of its parent it was made from, should a member
+                            // that leaves hold it, need not stay for it.
+                            if let Some(parent) = &s.parent
+                                && s.fence <= 1
+                            {
+                                crate::purge::settle_session(state, parent.session_id).await;
+                            }
                         }
                         // P2c-3 — it runs: its members may hold copies now.
                         // P2c-4: only while the replicaset's switch is on.

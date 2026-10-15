@@ -1182,7 +1182,8 @@ pub(crate) async fn fail(
 
 /// P2f-1 — a teleport that did not happen lets its target go (`leaving`), and
 /// that target's streams of the session end: it took its copy only to run the
-/// session. What it holds goes with the purge (P2g).
+/// session. What it holds goes with its purge, once the session holds its
+/// `min` copies without it (P2g-4b).
 async fn let_go(state: &HiveState, sid: ObjectId, target: ObjectId) {
     if let Err(e) = state.sessions.mark_leaving(sid, target).await {
         warn!(session = %sid, device = %target, %e, "hive: a teleport's target was not let go");
@@ -1483,25 +1484,24 @@ async fn check_joined(state: &HiveState, s: &AgentSession) {
 
 /// FR-90 P2f-3c — a fork's target caught up with the session's primary: the
 /// fork-joining move ends, its target is let go from this session's
-/// replicaset (it took its copy only to fork it: the copy stays until the
-/// purge, P2g), and the fork is made there from that copy, as the fork route
-/// makes one on a device that held a copy already. Off the frame's task:
-/// making it waits on the device's answer to its start.
+/// replicaset (it took its copy only to fork it), and the fork is made there
+/// from that copy, as the fork route makes one on a device that held a copy
+/// already. Off the frame's task: making it waits on the device's answer to
+/// its start. P2g-4b — the move ends and the target is let go in ONE write,
+/// its row naming the fork about to be made: the copy stays while that
+/// fork may still need it, then goes with the target's purge.
 async fn make_fork(state: &HiveState, s: &AgentSession, p: &Promotion) {
     let Some(sid) = s.id else { return };
-    let before = match state
-        .sessions
-        .end_promotion(sid, p.id, &[PromotionState::Joining])
-        .await
-    {
+    let fork = ObjectId::new();
+    let before = match state.sessions.end_fork_joining(sid, p.id, p.to, fork).await {
         Ok(Some(before)) => before,
         // Another frame took the step, or failed it, first.
         Ok(None) => return,
         Err(e) => return warn!(session = %sid, %e, "hive: a fork's move was not ended"),
     };
-    let_go(state, sid, p.to).await;
+    crate::stream::end_for_member(state, sid, p.to, "teleport_ended");
     let (state, p) = (state.clone(), p.clone());
-    tokio::spawn(async move { crate::fork::make_joined(&state, &before, &p).await });
+    tokio::spawn(async move { crate::fork::make_joined(&state, &before, &p, fork).await });
 }
 
 /// P2f-1 — a join's answer landed (`rc:hive.replica.join_ack`): a teleport
@@ -2253,6 +2253,8 @@ mod tests {
             refusal: None,
             answered_at: None,
             tip,
+            purging: None,
+            forking: None,
         };
         let s = AgentSession {
             id: Some(ObjectId::new()),
