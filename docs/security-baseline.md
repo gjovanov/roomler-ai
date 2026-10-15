@@ -434,6 +434,20 @@ counts, bytes and a SHA-256 of each file name on `rc:session.stats`. The hub kee
   `recording_activity` and `ssh_activity` are. An empty result is not proof that nothing
   crossed: a compromised host can stay silent.
 
+**Privacy mode is audited the same way** (FR-99 P1d, [privacy-mode.md](privacy-mode.md#what-is-recorded)).
+The server decides the `PRIVACY` grant and writes it, or the strip and its reason, into
+`session_requested`. The curtain itself is drawn on the host, at a request that travels peer to
+peer, so the device reports each curtain up, each take-down with its reason, and each refusal on
+`rc:privacy.activity`. The hub keeps a report in `privacy_activity` only for a session of that device
+whose grant held `PRIVACY`.
+
+- A process killed with a curtain up cannot report it. The OS takes the curtain down with the
+  process, so the screen is uncovered, but nothing reaches the server. Each curtain is therefore
+  written to a ledger file before it goes up. The next process to start reports every entry it finds
+  as `off {worker_exit}`, and the stored session row decides that report after the session ended.
+- A reason must be a short code. Free text from a host that may be compromised is dropped, and the
+  row is kept without it.
+
 ---
 
 ## 5 · Network-facing surfaces

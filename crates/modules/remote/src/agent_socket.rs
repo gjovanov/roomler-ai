@@ -8,7 +8,8 @@
 use async_trait::async_trait;
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::models::{
-    RecordingActivityEvent, RecordingActivityKind, TransferActivityEvent, TransferActivityKind,
+    PrivacyActivityEvent, PrivacyActivityKind, RecordingActivityEvent, RecordingActivityKind,
+    TransferActivityEvent, TransferActivityKind,
 };
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::signaling::{ClientMsg, TransferDirection, Transfers};
@@ -18,10 +19,10 @@ use tracing::{debug, warn};
 use crate::RemoteState;
 
 /// `remote`'s half of the agent socket: the session-stats merge, (FR-85 P3)
-/// remote-recording activity, and (FR-101 P3) the clipboard and file
-/// traffic carried on the stats. Everything else remote-owned (session
-/// request, SDP, ICE, terminate) is the Hub's own dispatch, which the socket
-/// runs on whatever a handler hands back.
+/// remote-recording activity, (FR-101 P3) the clipboard and file traffic
+/// carried on the stats, and (FR-99 P1d) privacy-mode activity. Everything
+/// else remote-owned (session request, SDP, ICE, terminate) is the Hub's own
+/// dispatch, which the socket runs on whatever a handler hands back.
 pub struct RemoteAgentSocket {
     state: RemoteState,
 }
@@ -92,6 +93,14 @@ impl AgentMsgHandler for RemoteAgentSocket {
                     .await;
                 None
             }
+            ClientMsg::PrivacyActivity {
+                session_id,
+                kind,
+                reason,
+            } => {
+                self.record_privacy(ctx, session_id, kind, reason).await;
+                None
+            }
             other => Some(other),
         }
     }
@@ -148,6 +157,57 @@ impl RemoteAgentSocket {
         if let Err(e) = self.state.recording_activity.record(event).await {
             // Best-effort, like every activity log: never gates the session.
             debug!(agent = %ctx.agent_id, %e, "recording activity write failed");
+        }
+    }
+
+    /// FR-99 P1d — record what a device reports about privacy mode, but ONLY
+    /// for a session of THIS agent whose grant held `PRIVACY`: a device must
+    /// not be able to write a curtain into a session that could not have one,
+    /// or into another device's. A `worker_exit` arrives from the next process
+    /// to start, after its session is gone, so the stored session row decides
+    /// then ([`Self::grant_of`]). A reason that is not a short code is dropped
+    /// and the row kept: the fact stands, the free text does not.
+    async fn record_privacy(
+        &self,
+        ctx: &AgentCtx,
+        session_id: ObjectId,
+        kind: PrivacyActivityKind,
+        reason: Option<String>,
+    ) {
+        let Some((agent_id, controller_user_id, permissions)) =
+            self.grant_of(ctx, session_id).await
+        else {
+            debug!(agent = %ctx.agent_id, %session_id, "privacy activity for an unknown session — dropped");
+            return;
+        };
+        if agent_id != ctx.agent_id || !permissions.contains(Permissions::PRIVACY) {
+            warn!(
+                agent = %ctx.agent_id,
+                %session_id,
+                "privacy activity for a session this device could not curtain — dropped"
+            );
+            return;
+        }
+        let reason = reason.filter(|r| {
+            let ok = PrivacyActivityEvent::is_reason_code(r);
+            if !ok {
+                debug!(agent = %ctx.agent_id, %session_id, "privacy activity reason is not a code — dropped");
+            }
+            ok
+        });
+        let event = PrivacyActivityEvent {
+            id: None,
+            tenant_id: ctx.tenant_id,
+            agent_id: ctx.agent_id,
+            session_id,
+            controller_user_id,
+            kind,
+            reason,
+            at: bson::DateTime::now(),
+        };
+        if let Err(e) = self.state.privacy_activity.record(event).await {
+            // Best-effort, like every activity log: never gates the session.
+            debug!(agent = %ctx.agent_id, %e, "privacy activity write failed");
         }
     }
 
