@@ -2795,9 +2795,9 @@ pub async fn run_periodic(
     // FR-96 P2a — Linux has the same root half, `roomler-update.service`, on a
     // host whose installer enabled it (P3: a per-user install). There a
     // per-user daemon installs nothing either: it cannot write /usr, which is
-    // the whole of #2046. Decided once, here, at the daemon's start; enabling
-    // or disabling the helper takes effect at the next one (install.sh
-    // restarts the daemon after enabling it).
+    // the whole of #2046. Decided once, here, at the daemon's start; a change
+    // takes effect at the next one (install.sh restarts a daemon whose answer
+    // it just made stale: `restart_old_user_daemon`).
     #[cfg(target_os = "linux")]
     {
         // SAFETY: geteuid takes no arguments and cannot fail.
@@ -3528,6 +3528,77 @@ async fn install_from_helper(
         ),
     }
     Ok(())
+}
+
+/// FR-96 P3 — what this binary's update half can do, one word per line, for
+/// an installer to read before it enables a per-user install's root helper
+/// (`roomlerd update-helper --capabilities`, which any user may run):
+///
+/// - `wake-file`: the root helper exists and consumes the wake file (P1).
+/// - `step-aside`: a per-user daemon on a host whose helper is enabled
+///   forwards pushes to it and installs nothing itself (P2a). Enabling the
+///   helper beside a daemon WITHOUT this would put two updaters on one host,
+///   so `install.sh` enables it only when the installed binary lists it.
+/// - `restart-on-replace`: a per-user daemon restarts onto its replaced
+///   binary once idle (P2b). `install.sh` asks the RUNNING image (through
+///   `/proc/<pid>/exe`) and leaves the restart to it when it can.
+///
+/// ⚠️ A word is never renamed or removed, because an installer matches on it;
+/// words are only added. `the_capabilities_are_the_words_install_sh_matches`
+/// pins the pair.
+#[cfg(target_os = "linux")]
+pub const UPDATE_HELPER_CAPABILITIES: &[&str] = &["wake-file", "step-aside", "restart-on-replace"];
+/// macOS: the agents have always forwarded to `com.roomler.update`.
+#[cfg(target_os = "macos")]
+pub const UPDATE_HELPER_CAPABILITIES: &[&str] = &["wake-file", "step-aside"];
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub const UPDATE_HELPER_CAPABILITIES: &[&str] = &[];
+
+/// FR-96 P3 — is this command line exactly `roomlerd update-helper
+/// --capabilities`? `install.sh` runs that form and no other, so nothing else
+/// is answered before the command line is parsed.
+pub fn is_capabilities_query<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut rest = args.into_iter().skip(1);
+    match (rest.next(), rest.next(), rest.next()) {
+        (Some(verb), Some(flag), None) => {
+            verb.as_ref() == "update-helper" && flag.as_ref() == "--capabilities"
+        }
+        _ => false,
+    }
+}
+
+/// Answers `update-helper --capabilities` when that is this process's command
+/// line, one word per line, and says whether it did. `daemon_main` asks before
+/// clap parses anything: see there for why.
+pub fn answer_capabilities_query() -> bool {
+    if !is_capabilities_query(std::env::args_os()) {
+        return false;
+    }
+    for word in UPDATE_HELPER_CAPABILITIES {
+        println!("{word}");
+    }
+    true
+}
+
+/// FR-96 P3 — P2a's decision for THIS process: the enable link when the root
+/// update helper owns this host's updates (a non-root process, the kill switch
+/// unset, the helper enabled), `None` when this process installs its own.
+/// `self-update` asks it through the same [`decide_update_owner`] the daemon's
+/// [`run_periodic`] uses, so the CLI and the daemon can never disagree about
+/// who installs.
+#[cfg(target_os = "linux")]
+pub fn helper_owns_updates() -> Option<PathBuf> {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let enabled = helper_enable_link_in(&UPDATE_HELPER_ENABLE_LINKS.map(std::path::Path::new));
+    match decide_update_owner(euid, tunnel_core::env::flag("UPDATE_HELPER", true), enabled) {
+        UpdateOwner::Helper(link) => Some(link),
+        UpdateOwner::InProcess(_) | UpdateOwner::InProcessBesideHelper(_) => None,
+    }
 }
 
 // RETIRED-NAME-ANCHOR-BEGIN
@@ -4676,6 +4747,60 @@ mod tests {
             .await
             .expect("the forwarder ends on shutdown")
             .expect("no panic");
+    }
+
+    /// FR-96 P3 — the words `install.sh` matches are the words this binary
+    /// prints. A rename on either side would silently leave every per-user
+    /// install with its helper off, or its daemon never restarted onto a new
+    /// binary.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_capabilities_are_the_words_install_sh_matches() {
+        let script = include_str!("../../../scripts/install.sh");
+        assert!(script.contains("update-helper --capabilities"));
+        for word in ["step-aside", "restart-on-replace"] {
+            assert!(UPDATE_HELPER_CAPABILITIES.contains(&word), "{word}");
+            assert!(
+                script.contains(&format!("grep -qx '{word}'")),
+                "install.sh must match `{word}` as a whole line (grep -qx)"
+            );
+        }
+        // `helper_on` is the daemon's own test, link for link: a script that
+        // read the helper as off where the daemon reads it as on would skip
+        // the restart that hands the daemon's updates over.
+        for link in UPDATE_HELPER_ENABLE_LINKS {
+            assert!(
+                script.contains(link),
+                "install.sh's helper_on must test {link}"
+            );
+        }
+    }
+
+    /// FR-96 P3 — only the exact form `install.sh` runs is answered before
+    /// clap: any other command line, near misses included, goes to the parser.
+    #[test]
+    fn only_the_exact_capabilities_query_is_answered_before_parsing() {
+        assert!(is_capabilities_query([
+            "roomlerd",
+            "update-helper",
+            "--capabilities"
+        ]));
+        assert!(is_capabilities_query([
+            "/proc/4242/exe",
+            "update-helper",
+            "--capabilities"
+        ]));
+        for argv in [
+            &["roomlerd"][..],
+            &["roomlerd", "update-helper"],
+            &["roomlerd", "--capabilities"],
+            &["roomlerd", "--capabilities", "update-helper"],
+            &["roomlerd", "update-helper", "--capabilities", "extra"],
+            &["roomlerd", "update-helper", "--capabilitie"],
+            &["roomlerd", "run"],
+        ] {
+            assert!(!is_capabilities_query(argv), "{argv:?}");
+        }
     }
 
     // ── Linux .deb install candidates ───────────────────────────────

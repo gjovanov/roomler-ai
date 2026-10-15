@@ -16,11 +16,11 @@ twice and they fight over the same identity.
   --------------------------+-----------------+------------------
   screen capture + input    | yes             | opt-in (drm_capture + uinput)
   overlay mesh (roomler0)   | no              | yes (TUN needs CAP_NET_ADMIN)
-  unattended self-update    | no              | yes (installing a .deb needs root)
+  unattended self-update    | yes (helper)    | yes
   starts before login       | no              | yes
 
-Want remote desktop? Use the user unit. Want a mesh node that keeps itself
-up to date with nobody logged in? Use the system unit.
+Want remote desktop? Use the user unit. Want a mesh node that runs with
+nobody logged in? Use the system unit.
 
 Desktop host (systemd --user)
 -----------------------------
@@ -35,6 +35,11 @@ Desktop host (systemd --user)
   #    Wayland since 0.4.130); a tty login won't capture anything.
   RUST_LOG=roomlerd=debug,webrtc=info roomlerd run
 
+  # 4. Updates (FR-96): this daemon runs as you and cannot write /usr, so a
+  #    ROOT helper the package ships disabled installs them for it. Enable it
+  #    BEFORE starting the daemon, which decides at start who installs:
+  sudo systemctl enable --now roomler-update.timer roomler-update.path
+
   systemctl --user daemon-reload
   systemctl --user enable --now roomler.service
   journalctl --user -u roomler.service -f
@@ -43,9 +48,13 @@ Desktop host (systemd --user)
   # (and the agent with it) exits when you log out:
   sudo loginctl enable-linger "$USER"
 
-Self-update note: an unprivileged daemon cannot install a .deb. It logs an
-error, raises ~/.config/roomler/needs-attention.txt, and KEEPS RUNNING —
-upgrade by hand with `sudo dpkg -i`, or move to the system unit.
+Self-update note: with the helper enabled (step 4), each update installs
+unattended as root (`journalctl -u roomler-update.service`), and the daemon
+restarts onto the new binary once nothing it serves would be cut. Opt out
+with `sudo touch /etc/roomler/disable-auto-update`. Without the helper, an
+unprivileged daemon cannot install a .deb. It logs an error, raises
+~/.config/roomler/needs-attention.txt, and KEEPS RUNNING; upgrade it by hand
+with `sudo dpkg -i`.
 
 Headless / server / WSL (systemd system)
 ----------------------------------------
@@ -66,6 +75,9 @@ bearer token):
 
 For a different config path, drop ROOMLERD_CONFIG=/path/to/config.toml into
 /etc/default/roomlerd.
+
+Leave roomler-update.timer and .path DISABLED with the system unit: its root
+daemon installs its own updates, and two updaters must never race.
 
 Both flows above are what `install.sh --role daemon [--system]` automates.
 

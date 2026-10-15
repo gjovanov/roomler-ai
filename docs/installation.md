@@ -190,6 +190,23 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 - Installs the `.deb` (x86_64 **and** arm64) or tarball, verifies SHA-256,
   enrolls, and enables a **systemd user unit** (`roomler.service` →
   `systemctl --user enable --now`).
+- **It updates itself unattended, per-user or `--system`.** A per-user daemon
+  runs as you and cannot write `/usr`, so for a per-user install `install.sh`
+  also enables a **root update helper**. `roomler-update.service` is woken by
+  `roomler-update.timer` (5 min after boot, then every 6 h) and by
+  `roomler-update.path` (the file a pushed update touches). It checks, verifies
+  and installs as root, and the daemon then restarts onto the new binary once
+  nothing it serves would be cut (FR-96).
+  - The helper is enabled only when the installed release's daemon steps aside
+    for it (`roomlerd update-helper --capabilities` lists `step-aside`).
+  - `--system` turns it off: that root daemon installs its own updates, and two
+    updaters must never race.
+  - Opt out with `/etc/roomler/disable-auto-update`.
+  - A re-run of `install.sh` restarts the running daemon only when nothing
+    else will: when it is too old to restart itself onto a new version, or
+    when the re-run just turned the helper on, since the daemon decides at its
+    start who installs its updates.
+  - Details: [linux-self-update.md](linux-self-update.md#the-update-half-of-a-per-user-install-fr-96).
 - ⚠️ The user unit is **sandboxed** (`ProtectSystem=strict`,
   `ProtectHome=read-only`). The daemon can write only these:
   - its own config and data folders;
@@ -537,7 +554,7 @@ when one is needed (FR-27).
 
 | Component | Mechanism |
 |---|---|
-| `roomlerd` (daemon hosts) | Self-updater polls `/api/agent/latest-release` (4 h timer + startup cooldown; a check that fails on the NETWORK — DNS, connect, timeout — rechecks after 5, 15, then 60 min instead of the full interval, #1755, while a verdict such as a 403 rate limit keeps the interval), verifies SHA-256, hands off to MSI / `dpkg` / `installer` and restarts. Admins can force it fleet-wide or per device (`POST …/agent/update`); ⚠️ `delivered: true` means only that the push reached the device's live socket — a device with `auto_update = false` ignores it and logs `update trigger dropped — auto-update is off on this device` (#1689). Crash-looping updates roll back to the last known-good version |
+| `roomlerd` (daemon hosts) | Self-updater polls `/api/agent/latest-release` (4 h timer + startup cooldown; a check that fails on the NETWORK — DNS, connect, timeout — rechecks after 5, 15, then 60 min instead of the full interval, #1755, while a verdict such as a 403 rate limit keeps the interval), verifies SHA-256, hands off to MSI / `dpkg` / `installer` and restarts. A per-user Linux daemon cannot write `/usr`: there a root update helper (`roomler-update.service`) installs, and the daemon restarts onto the new binary once nothing it serves would be cut (FR-96). Admins can force it fleet-wide or per device (`POST …/agent/update`); ⚠️ `delivered: true` means only that the push reached the device's live socket — a device with `auto_update = false` ignores it and logs `update trigger dropped — auto-update is off on this device` (#1689). Crash-looping updates roll back to the last known-good version |
 | `roomler` CLI (tunnel-only hosts) | `roomler self-update` (same proxy origin). On daemon hosts the MSI/.deb owns the binaries — the shim's `self-update` refuses by design |
 | `roomler-desktop` | Not in either MSI: the daemon refreshes it itself at start when the companion's recorded version differs from its own — downloads the signed asset, stages it beside the old EXE, stops the running companion **by PID** (found by the path it was started from, never by image name), promotes the new file and starts it again in the same session (`agents/roomlerd/src/companion.rs`, `swap`). ⚠️ **One refresher per install**: on a Windows service install that is the service host — the worker it spawns skips, because two refreshers raced and left the old companion running, holding the single-instance lock (#1686) |
 | wizard | Fetch-latest by nature; `setup-v<V>` is cut with every `agent-v<V>` (the lockstep job in `release-agent.yml`) |

@@ -19,12 +19,14 @@
 #
 #   --system          (daemon role, Linux only) install as a ROOT systemd
 #                     SYSTEM service instead of the per-user unit. Pick this
-#                     for a headless / server / WSL node: root is what makes
-#                     unattended self-update work (installing a .deb needs it,
-#                     and pkexec cannot authenticate with no polkit agent) and
-#                     what lets the overlay bring up its TUN. You lose screen
-#                     capture + input injection, which need a logged-in X
-#                     session. Config goes to /etc/roomler/config.toml.
+#                     for a headless / server / WSL node: root is what lets
+#                     the overlay bring up its TUN. You lose screen capture +
+#                     input injection, which need a logged-in X session.
+#                     Config goes to /etc/roomler/config.toml. Both kinds
+#                     update unattended: a system install's root daemon
+#                     installs its own updates, and a per-user install gets a
+#                     root update helper (roomler-update.timer + .path, FR-96)
+#                     that installs them for it.
 #
 #   --download-only   resolve + download + verify, print what WOULD run, touch
 #                     nothing else (safe on any box).
@@ -81,7 +83,7 @@ NO_ENROLL=0
 DESKTOP=""
 
 usage() {
-    sed -n '2,30p' "$0" 2>/dev/null || true
+    sed -n '2,32p' "$0" 2>/dev/null || true
     echo "usage: install.sh --role daemon|tunnel [--server URL] [--token JWT] [--name NAME]"
     echo "                  [--daemon-token JWT] [--system] [--download-only] [--no-enroll]"
     echo "                  [--desktop|--no-desktop]"
@@ -276,6 +278,94 @@ repair_tarball_owners() {
     done
 }
 
+# FR-96 — the update half of a per-user install. A per-user daemon runs as the
+# user and cannot write /usr, so its updates come from a ROOT one-shot helper
+# the package ships disabled: roomler-update.service, woken by
+# roomler-update.timer (boot + every 6 h) and roomler-update.path (the file a
+# pushed update touches). Enabled ONLY when this release's daemon steps aside
+# for it (`update-helper --capabilities` lists `step-aside`): beside a daemon
+# that still installs its own updates, two updaters would race. The words are
+# pinned by `the_capabilities_are_the_words_install_sh_matches`.
+# ⚠️ Every branch here ends in a construct that returns 0: under `set -e` a
+# function whose last command fails would abort the whole install.
+enable_update_helper() {
+    if ! /usr/bin/roomlerd update-helper --capabilities 2>/dev/null | grep -qx 'step-aside'; then
+        say "NOTE: this release's daemon cannot hand its updates to the root helper yet, and a per-user daemon cannot install them itself (writing /usr needs root). Re-run this script after the next release, or use --system."
+        return 0
+    fi
+    say "enabling the root update helper (roomler-update.timer + .path — sudo): this daemon's updates install unattended, as root"
+    sudo systemctl daemon-reload || true
+    if sudo systemctl enable --now roomler-update.timer roomler-update.path; then
+        if [ -e /etc/roomler/disable-auto-update ]; then
+            say "NOTE: /etc/roomler/disable-auto-update is set: the helper honours it and installs nothing until it is removed"
+        fi
+    else
+        warn "could not enable roomler-update.timer/.path; this daemon's updates stay manual"
+    fi
+}
+
+# A system install's root daemon installs its own updates, so a helper left
+# enabled by an earlier per-user install would race it: one updater per host.
+disable_update_helper() {
+    for u in roomler-update.timer roomler-update.path; do
+        if systemctl is-enabled --quiet "$u" 2>/dev/null; then
+            say "disabling $u: this system install's root daemon installs its own updates"
+            sudo systemctl disable --now "$u" || warn "could not disable $u"
+        fi
+    done
+}
+
+# Whether the helper is on, by the daemon's own test: one of these enable links
+# leads to a unit file (`UPDATE_HELPER_ENABLE_LINKS` in updater.rs; a unit test
+# pins the list, so the two cannot disagree about who installs).
+helper_on() {
+    for l in /etc/systemd/system/paths.target.wants/roomler-update.path \
+             /etc/systemd/system/timers.target.wants/roomler-update.timer \
+             /run/systemd/system/paths.target.wants/roomler-update.path \
+             /run/systemd/system/timers.target.wants/roomler-update.timer; do
+        [ -e "$l" ] && return 0
+    done
+    return 1
+}
+
+# A re-run finds the per-user daemon already running: on its OLD image, under
+# its old unit's sandbox, and with the answer it gave AT ITS START to who
+# installs its updates (FR-96 P2a). It is restarted here only when it needs a
+# restart and nothing else will give it one:
+#   - the same version, and the helper was just turned on: only a restart
+#     decides again, and FR-96 P2b does not restart onto the same version;
+#   - another version, on a daemon older than P2b. A P2b daemon (it lists
+#     `restart-on-replace`; the RUNNING image is asked, through /proc) restarts
+#     onto a new version by itself once nothing it serves would be cut, and
+#     decides again then.
+# The same version with the same helper needs nothing, and a binary that does
+# not answer `--version` is never restarted onto (P2b's own rule).
+restart_old_user_daemon() {
+    pid="$1"; helper_changed="$2"
+    case "$pid" in ''|0) return 0 ;; esac
+    installed="$(/usr/bin/roomlerd --version 2>/dev/null || true)"
+    if [ -z "$installed" ]; then
+        warn "/usr/bin/roomlerd --version did not answer; leaving the running daemon (pid $pid) as it is"
+        return 0
+    fi
+    running="$("/proc/$pid/exe" --version 2>/dev/null || true)"
+    if [ "$running" = "$installed" ]; then
+        if [ "$helper_changed" = 0 ]; then
+            say "the running daemon (pid $pid) already runs ${installed#roomlerd }: nothing to restart"
+            return 0
+        fi
+        why="the root update helper was just turned on, and the daemon decides at its start who installs its updates"
+    elif "/proc/$pid/exe" update-helper --capabilities 2>/dev/null | grep -qx 'restart-on-replace'; then
+        say "the running daemon (pid $pid) restarts onto ${installed#roomlerd } by itself, once nothing it serves would be cut"
+        return 0
+    else
+        rv="${running#roomlerd }"
+        why="it runs ${rv:-an unknown version}, which cannot restart onto a new binary by itself"
+    fi
+    say "restarting the running daemon (pid $pid): $why (a remote or SSH session to this device drops for a few seconds)"
+    systemctl --user restart roomler.service || warn "could not restart roomler.service; it runs the new binary from its next start"
+}
+
 install_daemon_linux() {
     releases="$STAGE/releases.json"
     say "resolving latest agent release via $SERVER/api/agent/latest-release"
@@ -323,9 +413,11 @@ install_daemon_linux() {
         fi
         if [ "$SYSTEM" = 1 ]; then
             say "download-only: would run: sudo roomlerd --config $SYSTEM_CONFIG enroll --server $SERVER --token <token> --name $NAME"
+            say "download-only: would run: sudo systemctl disable --now roomler-update.timer roomler-update.path (only if a per-user install left them enabled)"
             say "download-only: would run: sudo systemctl enable --now roomlerd.service"
         else
             say "download-only: would run: roomlerd enroll --server $SERVER --token <token> --name $NAME"
+            say "download-only: would run: sudo systemctl enable --now roomler-update.timer roomler-update.path (when the release's daemon lists step-aside)"
             say "download-only: would run: systemctl --user enable --now roomler.service"
         fi
         return 0
@@ -357,18 +449,26 @@ install_daemon_linux() {
     enroll_daemon /usr/bin/roomlerd
 
     if [ "$SYSTEM" = 1 ]; then
+        disable_update_helper
         say "enabling the systemd SYSTEM unit (root — self-update + overlay TUN work; no screen capture)"
         sudo systemctl daemon-reload || true
         sudo systemctl enable --now roomlerd.service
         say "daemon status: $(sudo systemctl is-active roomlerd.service || true)"
         say "logs: sudo journalctl -u roomlerd.service -f"
     else
+        # FR-96 — the helper FIRST: the daemon decides once, at its start,
+        # whether it or the helper installs its updates.
+        helper_before=0; helper_on && helper_before=1
+        enable_update_helper
+        helper_after=0; helper_on && helper_after=1
+        helper_changed=0; [ "$helper_before" = "$helper_after" ] || helper_changed=1
         say "enabling the systemd user unit (autostart, this login session's user)"
+        old_pid="$(systemctl --user show -p MainPID --value roomler.service 2>/dev/null || true)"
         systemctl --user daemon-reload || true
         systemctl --user enable --now roomler.service
+        restart_old_user_daemon "$old_pid" "$helper_changed"
         say "daemon status: $(systemctl --user is-active roomler.service || true)"
         say "NOTE: on a headless host, run 'sudo loginctl enable-linger $USER' so the user unit runs without an open session."
-        say "NOTE: a per-user daemon cannot install its own updates (writing /usr needs root, whichever format). Re-run with --system for unattended self-update."
     fi
 }
 
