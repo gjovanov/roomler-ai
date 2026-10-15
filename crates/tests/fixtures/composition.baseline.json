@@ -657,6 +657,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/tenant/{tenant_id}/privacy-activity/{agent_id}",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/rc-session-limits",
       "methods": "GET,HEAD,PUT"
     },
@@ -1902,6 +1906,30 @@
               "tenant_id": 1,
               "requester_node_id": 1,
               "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "privacy_activity",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "session_id": 1,
+              "at": 1
             }
           },
           {
@@ -3731,6 +3759,30 @@
         ]
       },
       {
+        "collection": "privacy_activity",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "session_id": 1,
+              "at": 1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
         "collection": "reactions",
         "indexes": [
           {
@@ -4595,6 +4647,7 @@
     "rc:rpc.request",
     "rc:ssh.request",
     "rc:recording.activity",
+    "rc:privacy.activity",
     "rc:ssh.activity",
     "rc:ssh.grant_ack",
     "rc:agent.config_status",
@@ -4768,6 +4821,7 @@
     "rc:overlay.srflx": "network",
     "rc:overlay.warm_relay_request": "network",
     "rc:ping": "fleet",
+    "rc:privacy.activity": "remote",
     "rc:recording.activity": "remote",
     "rc:relay.derp_ticket_request": "network",
     "rc:relay.probe_report": "network",

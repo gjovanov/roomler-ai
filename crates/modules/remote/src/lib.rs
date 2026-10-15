@@ -34,8 +34,9 @@ use roomler_ai_config::Settings;
 use roomler_ai_db::indexes::{IndexSet, index, index_ttl};
 use roomler_ai_mod_fleet::FleetState;
 use roomler_ai_services::dao::{
-    recording_activity::RecordingActivityDao, remote_audit::RemoteAuditDao,
-    remote_session::RemoteSessionDao, transfer_activity::TransferActivityDao,
+    privacy_activity::PrivacyActivityDao, recording_activity::RecordingActivityDao,
+    remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao,
+    transfer_activity::TransferActivityDao,
 };
 use roomler_core::{
     AgentSocketHooks, Capabilities, Core, Module, TenantCtx, rate_limit::RateLimiter,
@@ -63,6 +64,10 @@ pub struct RemoteState {
     /// host's claims, beside the `CLIPBOARD` / `FILES` grant in
     /// `remote_audit`).
     pub transfer_activity: Arc<TransferActivityDao>,
+    /// FR-99 P1d — what devices report about privacy mode: the curtain up,
+    /// down and why (the host's claims, beside the `PRIVACY` grant in
+    /// `remote_audit`).
+    pub privacy_activity: Arc<PrivacyActivityDao>,
     /// FR-101 P4a — the per-(caller, device) ceiling on session requests,
     /// checked after the authz gate (`controller::SESSION_REQUESTS_PER_MINUTE`).
     pub session_request_limiter: Arc<RateLimiter>,
@@ -102,6 +107,7 @@ impl Module for RemoteState {
             remote_audit: Arc::new(RemoteAuditDao::new(db)),
             recording_activity: Arc::new(RecordingActivityDao::new(db)),
             transfer_activity: Arc::new(TransferActivityDao::new(db)),
+            privacy_activity: Arc::new(PrivacyActivityDao::new(db)),
             session_request_limiter: Arc::new(RateLimiter::new()),
             rc_proxy_controllers: Arc::new(relay::ProxyControllers::new()),
             remote_rc_conns: Arc::new(relay::RemoteRcConns::new()),
@@ -150,11 +156,15 @@ impl Module for RemoteState {
         // FR-101 P3 — the clipboard and file traffic devices reported, read
         // the same way.
         let transfers = Router::new().route("/{agent_id}", get(routes::transfer_activity));
+        // FR-99 P1d — what devices reported about privacy mode, read the same
+        // way.
+        let privacy = Router::new().route("/{agent_id}", get(routes::privacy_activity));
 
         Router::new()
             .nest("/tenant/{tenant_id}/session", session)
             .nest("/tenant/{tenant_id}/recording-activity", recording)
             .nest("/tenant/{tenant_id}/transfer-activity", transfers)
+            .nest("/tenant/{tenant_id}/privacy-activity", privacy)
             // FR-101 P2a — the org's session policy (clipboard, files, audio):
             // GET for any member, PUT with MANAGE_TENANT.
             .route(
@@ -172,11 +182,11 @@ impl Module for RemoteState {
             .with_state(self.clone())
     }
 
-    /// The four collections this module owns. The first two are the specs
+    /// The five collections this module owns. The first two are the specs
     /// the db crate's plan held before P6, unchanged — `remote_sessions` has
     /// two sets there (the session indexes, then the Wave-3 per-tenant usage
     /// read), in that order. `recording_activity` is FR-85 P3's,
-    /// `transfer_activity` FR-101 P3's.
+    /// `transfer_activity` FR-101 P3's, `privacy_activity` FR-99 P1d's.
     fn indexes(&self) -> Vec<IndexSet> {
         vec![
             IndexSet {
@@ -221,6 +231,18 @@ impl Module for RemoteState {
             // audit it is read with.
             IndexSet {
                 collection: "transfer_activity",
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index(bson::doc! { "tenant_id": 1, "agent_id": 1, "at": -1 }),
+                    index(bson::doc! { "session_id": 1, "at": 1 }),
+                    index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+                ],
+            },
+            // FR-99 P1d — privacy mode as the devices report it (a claim, like
+            // `recording_activity`) — 90-day retention, like the audit it is
+            // read with.
+            IndexSet {
+                collection: "privacy_activity",
                 pre_ops: Vec::new(),
                 indexes: vec![
                     index(bson::doc! { "tenant_id": 1, "agent_id": 1, "at": -1 }),

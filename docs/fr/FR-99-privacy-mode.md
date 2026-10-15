@@ -215,6 +215,36 @@ gate 2 disabled, `the_owner_gate_refuses_before_the_overlay_is_asked` fails.
 Tests: `ui/src/__tests__/composables/usePrivacyMode.spec.ts` (11, through a fake channel); the whole vitest
 suite and `vue-tsc` green.
 
+**As built, P1d (the device's account, 2026-10-15).** The audit this section designed as `privacy_on` /
+`privacy_off {reason}` is the device's **claim**, so it lives beside the decision, not in it: a
+`privacy_activity` collection, as `recording_activity` (FR-85) and `transfer_activity` (FR-101) do. The
+server never sees a curtain. It is drawn on the host, at a request that travels peer to peer, so writing
+it into `remote_audit`, the server's own decisions, would have dressed a host's word as the server's.
+
+| Piece | Where | What it does |
+|---|---|---|
+| `rc:privacy.activity` | `ClientMsg::PrivacyActivity` (`crates/remote_control/src/signaling.rs`), owner `remote` | `{session_id, kind: on \| off \| refused, reason?}`. Fire-and-forget: an older server drops an unknown frame with a debug line (`crates/modules/fleet/src/socket.rs`) |
+| The device's reports | `Session::set`, `take_down`, `refuse` (`agents/roomlerd/src/privacy.rs`) | `on` once the curtain is up; `off` with `controller`, `session_end` or `disabled_on_device`; `refused` with gate 2–4's reason. Sent with `try_send`, so a struggling connection drops a line rather than stalls the curtain |
+| The ledger | `Ledger` (`privacy.rs`), `privacy-curtains.json` in the process's own local data dir | Each curtain is written there **before** it goes up and dropped when it comes down. A process killed in between leaves an entry, never a curtain without one |
+| `worker_exit` | `collect_leftovers` (at start-up, `main.rs`, before any connection) and `drain_leftovers` (`agents/roomlerd/src/signaling.rs`, on each org's connection) | The next process reports each leftover as `off {worker_exit}` on the connection of the org its session belonged to, because the server looks the session up within that org. One the queue refuses waits for the next connection |
+| The server's check | `record_privacy` (`crates/modules/remote/src/agent_socket.rs`) | Kept only for a session of THIS device whose grant held `PRIVACY`: the live hub first, the stored row after the session ended (how a `worker_exit` is checked). A reason that is not a code (`a-z0-9_`, at most 64) is dropped and the row kept |
+| The trail | `GET /api/tenant/{tid}/privacy-activity/{agent_id}` (`crates/modules/remote/src/routes.rs`) | Under `VIEW_REMOTE_AUDIT`, newest first, a removed device's trail included. 90-day TTL, like the audit it is read with |
+
+`local_override` (Ctrl+Alt+Del) and `secure_desktop` arrive with P2. Until then nothing produces them.
+
+Tests: `privacy::tests` (every report in order; the ledger holds a curtain exactly while it is up; the next
+process reports each leftover on its own org's connection, and a full queue keeps it), `tests/privacy_dc.rs`
+(each production channel cell now also reads what the device reported), the wire and model tests, and
+`crates/tests/src/privacy_activity_tests.rs`, two cells through real servers. The first sends reports from
+a granted session (kept), a session without `PRIVACY`, another device and another org (all dropped), plus
+a free-text reason (row kept, text dropped). The second ends two sessions with `terminated: true`, then
+reports `worker_exit` for both: kept for the one granted `PRIVACY`, dropped for the other. **Negative
+controls**, each restored afterwards:
+- the `PRIVACY` check made always true: both cells fail (5 rows for 4, 3 for 2);
+- the reason filter removed: the first fails on the stored text;
+- leftovers drained for every org: the leftover test fails;
+- the ledger never written: the ledger test fails.
+
 ### 3d. Other platforms
 
 - **macOS:** out. Since macOS 15 there is **no public API** that keeps a window out of screen capture. Apple
@@ -250,10 +280,11 @@ says muting the host silences the client too. The FR ships only the honest versi
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | This spec and the claim. The feasibility probes: `BlockInput` (the four questions in §3b), loopback under mute, the macOS lock mechanism | docs only | spec merged. **`BlockInput` and the curtain probed on vmtest 2026-10-13 and 14** (§3b's answers): high integrity needed, only the blocking thread injects (mouse, keys and the wheel alike), Ctrl+Alt+Del lifts the block, and the curtain stays out of both DXGI and WGC capture. Still owed: EDR, loopback under mute, the macOS lock |
-| P1 | The curtain + the permission bit + the device opt-in + audit (Windows), in three steps below | `privacy_mode_allowed=false` (default) | **merged** (P1a, P1b, P1c), and **field-verified end to end on 0.4.136** through the production viewer (§8 rows 9–10: AC1, AC5) |
+| P1 | The curtain + the permission bit + the device opt-in + audit (Windows), in four steps below | `privacy_mode_allowed=false` (default) | **merged** (P1a, P1b, P1c), and **field-verified end to end on 0.4.136** through the production viewer (§8 rows 9–10: AC1, AC5). P1d, the audit, follows |
 | P1a | The server's gate: the bit, the two `rpc` words, the hub's strip with its reasons, break-glass excluded, the storage rule (§3c as built) | none needed: nothing advertises the words yet | **merged** #2186 (`2a1e939de`): unit + `privacy_gate_tests`; the negative control (strip disabled) fails them |
 | P1b | The agent: `privacy_mode_allowed`, the words, the consent line, the curtain, the `privacy` channel, and the device's own refusal (§3a and §3c as built) | `privacy_mode_allowed=false` | **merged** #2191 (`c4df7ecde`): Linux unit + `privacy_dc` 6/6, Windows clippy and units with `viewer-indicator`; NC fails as it should. **Field-verified** with `curtain-smoke` under both capture paths (§8 rows 7 and 8) |
 | P1c | The viewer: the toggle, the refusal reasons, asking for `PRIVACY` only from a device that serves it (§3c as built) | the toggle | **merged** #2199 (`f9a66a01e`): `usePrivacyMode.spec.ts` (11), the vitest suite and `vue-tsc`. **Field-verified** (§8 rows 9–10): the toggle reaches the curtain through the channel on agent 0.4.136 |
+| P1d | The device's account (§3c as built): `rc:privacy.activity`, the `privacy_activity` claims collection and its route, the ledger that lets the next process report a curtain this one died holding (`worker_exit`) | none needed: an older server drops the frame, an older agent sends none | **#2258**: unit, channel and integration tests with four negative controls (§3c). The field cell for AC4 (`taskkill /F` on a curtained worker) waits for the first agent release that carries it |
 | P2 | The input block, if P0 cleared it | `privacy_input_block=false` | — |
 | P3 | Lock on end (Windows, Linux, macOS) | `lock_on_end=never` | — |
 | P4 | Host mute | the toggle | — |
@@ -277,7 +308,11 @@ says muting the host silences the client too. The FR ships only the honest versi
   alone (no block), Disconnect works while privacy is on. *As first written, AC3 said Disconnect works
   "while privacy is on", which P0 showed cannot hold under the block: `BlockInput` swallows the click.*
 - [ ] **AC4 (nothing survives):** `taskkill /F` on the worker clears the curtain and the block within 2 s,
-  and `privacy_off {worker_exit}` is audited. After a session end, nothing of privacy mode remains.
+  and `privacy_off {worker_exit}` is audited. After a session end, nothing of privacy mode remains. *Progress
+  2026-10-15 (P1d):* the audit half is built, as `privacy_activity` `off {worker_exit}`, reported by the
+  next process from a ledger written before each curtain goes up (§3c). The field cell, a `taskkill /F`
+  on a vmtest Win11 worker with a curtain up, needs the first agent release that carries P1d. The
+  block half needs P2.
 - [x] **AC5 (the gate holds):** an agent without the `privacy-mode` verb never receives `PRIVACY` (an
   integration test against the hub). A device that did not opt in refuses it, with a visible reason.
   **Verified.** The integration half is P1a's `privacy_gate_tests`: they read the agent's raw `rc:request`,

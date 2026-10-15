@@ -4383,6 +4383,65 @@ impl TransferActivityEvent {
     }
 }
 
+/// FR-99 P1d — what a [`PrivacyActivityEvent`] says happened to a session's
+/// curtain.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyActivityKind {
+    /// The curtain went up, verified out of capture.
+    On,
+    /// The curtain came down. `reason` says why: `controller` (the viewer
+    /// turned it off), `session_end`, `disabled_on_device` (the owner switched
+    /// privacy mode off), or `worker_exit` (the process that drew it died with
+    /// it up, reported by the next one to start).
+    Off,
+    /// The device refused to put it up: `disabled_on_device`, `unavailable`
+    /// or `no_curtain`, the device's gates in `docs/privacy-mode.md`.
+    Refused,
+}
+
+/// FR-99 P1d — the device's account of privacy mode in one remote session.
+///
+/// ⚠️ **REPORTED BY THE DEVICE, not observed by the server**, the same split
+/// as [`RecordingActivityEvent`] and [`TransferActivityEvent`]. The curtain is
+/// drawn on the host and the request to raise it travels peer to peer, so the
+/// server sees neither. The grant that allowed it (`PRIVACY`), or the strip
+/// and its reason, is the server's own record, in `remote_audit`'s
+/// `SessionRequested`. An empty result is therefore not proof that no curtain
+/// went up: a compromised host can stay silent.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PrivacyActivityEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    /// From the authenticated WS, never from the frame.
+    pub tenant_id: ObjectId,
+    pub agent_id: ObjectId,
+    pub session_id: ObjectId,
+    /// The controller the session belongs to: the SERVER's record of who was
+    /// connected, not the device's.
+    pub controller_user_id: ObjectId,
+    pub kind: PrivacyActivityKind,
+    /// A reason code (see [`PrivacyActivityKind`]), or nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Stamped by the SERVER. A device clock is not evidence.
+    pub at: DateTime,
+}
+
+impl PrivacyActivityEvent {
+    pub const COLLECTION: &'static str = "privacy_activity";
+
+    /// Is `s` a reason code: 1 to 64 of `a-z`, `0-9` and `_`? Every reason the
+    /// agent sends is one. Anything else a device reports is dropped (the row
+    /// is kept without it): free text there would let a host that may be
+    /// compromised write what it likes into the audit.
+    pub fn is_reason_code(s: &str) -> bool {
+        (1..=64).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    }
+}
+
 impl SshActivityEvent {
     pub const COLLECTION: &'static str = "ssh_activity";
 
@@ -6041,6 +6100,44 @@ mod tests {
             assert_eq!(serde_json::to_value(k).unwrap(), serde_json::json!(w));
             let back: TransferActivityKind = serde_json::from_value(serde_json::json!(w)).unwrap();
             assert_eq!(back, k);
+        }
+    }
+
+    #[test]
+    fn privacy_activity_kinds_keep_their_wire_names() {
+        use PrivacyActivityKind::*;
+        for (k, w) in [(On, "on"), (Off, "off"), (Refused, "refused")] {
+            assert_eq!(serde_json::to_value(k).unwrap(), serde_json::json!(w));
+            let back: PrivacyActivityKind = serde_json::from_value(serde_json::json!(w)).unwrap();
+            assert_eq!(back, k);
+        }
+    }
+
+    /// FR-99 P1d — a reason is a short code. Free text, a path or markup from
+    /// a host that may be compromised never passes.
+    #[test]
+    fn only_a_short_code_passes_for_a_privacy_reason() {
+        let (longest, too_long) = ("a".repeat(64), "a".repeat(65));
+        for ok in [
+            "controller",
+            "session_end",
+            "worker_exit",
+            "no_curtain",
+            "x",
+            longest.as_str(),
+        ] {
+            assert!(PrivacyActivityEvent::is_reason_code(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "Controller",
+            "session end",
+            "worker-exit",
+            "<b>",
+            "C:\\x",
+            too_long.as_str(),
+        ] {
+            assert!(!PrivacyActivityEvent::is_reason_code(bad), "{bad}");
         }
     }
 

@@ -143,6 +143,8 @@ mod peer_relay_tests;
 #[cfg(test)]
 mod plan_limit_tests;
 #[cfg(test)]
+mod privacy_activity_tests;
+#[cfg(test)]
 mod privacy_gate_tests;
 #[cfg(test)]
 mod rate_limit_tests;

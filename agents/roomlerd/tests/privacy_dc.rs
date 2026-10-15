@@ -6,7 +6,10 @@
 //! PRODUCTION handlers (`roomlerd::privacy::attach` / `attach_refusing`, as
 //! `peer.rs` routes them), and the curtain is a recorder standing in for the
 //! overlay. What is checked is what a controller sees on the channel and what
-//! the overlay was asked to draw — a refused "on" must never reach it.
+//! the overlay was asked to draw — a refused "on" must never reach it. Since
+//! P1d each cell also reads what the device reported to the server
+//! (`rc:privacy.activity`): every curtain, every take-down with its reason,
+//! every refusal.
 //!
 //! The owner's gate is process-wide, so the tests run one at a time.
 
@@ -15,6 +18,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use bson::oid::ObjectId;
+use roomler_ai_remote_control::signaling::ClientMsg;
 use roomlerd::privacy::{self, CurtainHost, PrivacyCtx};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -53,9 +57,40 @@ struct Rig {
     strings: mpsc::UnboundedReceiver<String>,
     overlay: Arc<Overlay>,
     pcs: (Arc<RTCPeerConnection>, Arc<RTCPeerConnection>),
+    /// P1d — what the device reported to the server, in order.
+    reports: Option<mpsc::Receiver<ClientMsg>>,
+    /// The ledger's directory, alive as long as the rig.
+    _dir: tempfile::TempDir,
+}
+
+/// (kind, reason) of every report queued so far.
+fn reported(rx: &mut mpsc::Receiver<ClientMsg>) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        match m {
+            ClientMsg::PrivacyActivity { kind, reason, .. } => out.push((
+                serde_json::to_value(kind)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                reason,
+            )),
+            other => panic!("not a privacy report: {other:?}"),
+        }
+    }
+    out
+}
+
+fn rep(kind: &str, reason: Option<&str>) -> (String, Option<String>) {
+    (kind.to_string(), reason.map(str::to_string))
 }
 
 impl Rig {
+    fn reported(&mut self) -> Vec<(String, Option<String>)> {
+        reported(self.reports.as_mut().expect("reports not taken"))
+    }
+
     async fn send(&self, v: Value) -> Result<()> {
         self.dc.send_text(v.to_string()).await.context("send")?;
         Ok(())
@@ -129,6 +164,8 @@ async fn rig(attach: Attach, up_ok: bool) -> Result<Rig> {
     let agent_dc = tokio::time::timeout(Duration::from_secs(5), agent_dc_rx)
         .await
         .map_err(|_| anyhow!("agent on_data_channel timed out"))??;
+    let dir = tempfile::tempdir()?;
+    let (outbound, reports) = mpsc::channel::<ClientMsg>(32);
     match attach {
         Attach::NotGranted => privacy::attach_refusing(agent_dc, session_id, "not_granted"),
         Attach::Granted { possible } => privacy::attach(
@@ -138,6 +175,11 @@ async fn rig(attach: Attach, up_ok: bool) -> Result<Rig> {
                 controller_name: "Tester".into(),
                 host: overlay.clone(),
                 possible,
+                report: privacy::Reporter {
+                    outbound,
+                    tenant_id: ObjectId::new().to_hex(),
+                    ledger: Arc::new(privacy::Ledger::at(dir.path().join("ledger.json"))),
+                },
             },
         ),
     }
@@ -164,6 +206,8 @@ async fn rig(attach: Attach, up_ok: bool) -> Result<Rig> {
         strings: strings_rx,
         overlay,
         pcs: (browser_pc, agent_pc),
+        reports: Some(reports),
+        _dir: dir,
     })
 }
 
@@ -178,6 +222,8 @@ async fn a_grant_without_privacy_is_refused_by_name() -> Result<()> {
         json!({"t":"rc:privacy.state","id":"a","on":false,"reason":"not_granted"})
     );
     assert!(r.overlay.calls().is_empty());
+    // Nothing reported: the server would drop it anyway, no PRIVACY in the grant.
+    assert!(r.reported().is_empty());
     r.close().await;
     Ok(())
 }
@@ -198,6 +244,10 @@ async fn the_owner_gate_refuses_before_the_overlay_is_asked() -> Result<()> {
     let s = r.set("2", true).await?;
     assert_eq!(s, json!({"t":"rc:privacy.state","id":"2","on":true}));
     assert_eq!(r.overlay.calls(), vec![true]);
+    assert_eq!(
+        r.reported(),
+        vec![rep("refused", Some("disabled_on_device")), rep("on", None)]
+    );
     r.close().await;
     privacy::set_device_allowed(false);
     Ok(())
@@ -215,6 +265,10 @@ async fn on_status_and_off_draw_and_clear_the_curtain() -> Result<()> {
     let s = r.set("2", false).await?;
     assert_eq!(s, json!({"t":"rc:privacy.state","id":"2","on":false}));
     assert_eq!(r.overlay.calls(), vec![true, false]);
+    assert_eq!(
+        r.reported(),
+        vec![rep("on", None), rep("off", Some("controller"))]
+    );
     r.close().await;
     privacy::set_device_allowed(false);
     Ok(())
@@ -230,6 +284,7 @@ async fn no_curtain_possible_and_a_failing_overlay_are_named() -> Result<()> {
     let s = r.set("1", true).await?;
     assert_eq!(s["reason"], "unavailable", "{s}");
     assert!(r.overlay.calls().is_empty());
+    assert_eq!(r.reported(), vec![rep("refused", Some("unavailable"))]);
     r.close().await;
 
     let mut r = rig(Attach::Granted { possible: || true }, false).await?;
@@ -238,6 +293,7 @@ async fn no_curtain_possible_and_a_failing_overlay_are_named() -> Result<()> {
         s,
         json!({"t":"rc:privacy.state","id":"2","on":false,"reason":"no_curtain"})
     );
+    assert_eq!(r.reported(), vec![rep("refused", Some("no_curtain"))]);
     r.close().await;
     privacy::set_device_allowed(false);
     Ok(())
@@ -256,6 +312,10 @@ async fn the_owner_switching_off_takes_it_down_and_tells_the_viewer() -> Result<
     assert_eq!(s["on"], false, "{s}");
     assert_eq!(s["reason"], "disabled_on_device", "{s}");
     assert_eq!(r.overlay.calls(), vec![true, false]);
+    assert_eq!(
+        r.reported(),
+        vec![rep("on", None), rep("off", Some("disabled_on_device"))]
+    );
     r.close().await;
     Ok(())
 }
@@ -269,6 +329,7 @@ async fn the_channel_going_away_takes_the_curtain_down() -> Result<()> {
     let mut r = rig(Attach::Granted { possible: || true }, true).await?;
     assert_eq!(r.set("1", true).await?["on"], true);
     let overlay = r.overlay.clone();
+    let mut reports = r.reports.take().expect("reports");
     r.close().await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while overlay.calls() != vec![true, false] {
@@ -279,6 +340,14 @@ async fn the_channel_going_away_takes_the_curtain_down() -> Result<()> {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // The report follows the take-down on the same blocking call.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut seen = Vec::new();
+    while seen.len() < 2 && tokio::time::Instant::now() < deadline {
+        seen.extend(reported(&mut reports));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(seen, vec![rep("on", None), rep("off", Some("session_end"))]);
     privacy::set_device_allowed(false);
     Ok(())
 }

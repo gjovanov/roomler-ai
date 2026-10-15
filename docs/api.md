@@ -291,6 +291,7 @@ agent's session can change it.
 | GET | `…/session/{sid}/audit` | Session audit trail |
 | GET | `…/recording-activity/{aid}` | What a device reported about remote recordings (FR-85), newest first; `VIEW_REMOTE_AUDIT` — see [recording.md](recording.md) §10 |
 | GET | `…/transfer-activity/{aid}` | The clipboard and file traffic a device reported for remote sessions (FR-101 P3): counts, bytes, and a SHA-256 of each file name. Never content, never a name. Newest first; `VIEW_REMOTE_AUDIT`. A removed device's trail still resolves — see [remote-control.md](remote-control.md) §11.3a |
+| GET | `…/privacy-activity/{aid}` | What a device reported about privacy mode (FR-99 P1d): each curtain `on`, `off` with its reason (`controller`, `session_end`, `disabled_on_device`, `worker_exit`) and each `refused` "on". The device's claim, kept only for a session whose grant held `PRIVACY`. Newest first; `VIEW_REMOTE_AUDIT`. A removed device's trail still resolves — see [privacy-mode.md](privacy-mode.md#what-is-recorded) |
 
 Exec body (`POST …/exec`): `{shell?: "pwsh"|"powershell"|"cmd"|"bash"|"sh", command,
 timeout_ms?, max_output_bytes?}` — clamped server-side; output is secret-redacted
