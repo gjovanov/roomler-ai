@@ -948,6 +948,64 @@ row, because a file row is written when the transfer completes.
 The trail is read at `GET /api/tenant/{tid}/transfer-activity/{agent_id}` under
 `VIEW_REMOTE_AUDIT`. Like the recording trail, it still resolves for a removed device.
 
+### 11.3b Clipboard, files and audio by policy (FR-101 P2)
+
+An org and each device's owner can each switch the session's clipboard, file transfer and host
+audio to `on` (the default), `ask` or `off`. The stricter of the two wins. Nothing changes for an
+org or a device that sets nothing.
+
+| | The org's switch (P2a) | The device's floor (P2b) |
+|---|---|---|
+| Stored in | `TenantSettings.rc_session` ([`tenant.rs:116`](../crates/db/src/models/tenant.rs#L116)) | `rc_clipboard`, `rc_files`, `rc_audio` in the device's `config.toml` |
+| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:2817`](../crates/localapi/src/lib.rs#L2817)); live, no restart |
+| Pushable by a server | — | **never**: absent from `DesiredConfig`, so a compromised server cannot switch back on what the owner switched off |
+| Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:500`](../crates/remote_control/src/models.rs#L500)) and re-announced on the heartbeat when it changes |
+
+```mermaid
+sequenceDiagram
+    participant V as viewer (browser)
+    participant S as hub (server)
+    participant A as roomlerd
+    participant DB as remote_audit
+    V->>S: rc:session.request (clipboard, files, audio asked for)
+    Note over S: org policy (tenant row) + the device's floor (its caps),<br/>the stricter wins (FeaturePolicy::stricter)
+    S->>DB: session_requested, features_stripped {feature: reason}
+    S->>V: rc:session.created, features_refused {feature: reason}
+    Note over V: each refused control greyed, its reason as the title,<br/>one snackbar names what is off
+    S->>A: rc:request without the stripped bits (+ session_policy)
+    Note over A: mask(): the org policy and its own floor, whatever the hub sent,<br/>`ask` survives only a prompt the person here answers
+    A->>A: the channels refuse what the grant lacks (files, clipboard, and no audio track)
+```
+
+**What `ask` means.** A feature set to `ask` survives only a session that the person at the
+device approves on a prompt naming it ("Approving also allows clipboard, file transfer and
+audio.", [`session_policy.rs:183`](../agents/roomlerd/src/session_policy.rs#L183)). Every other
+session goes without it, with a reason:
+
+| Reason | When |
+|---|---|
+| `org_policy_off` | the org set `off`. It binds every controller, break-glass included |
+| `device_policy_off` | the device's owner set `off` (when both say `off`, the org's is named) |
+| `needs_consent` | `ask`, and nobody at the device is asked (`auto`, `email`, `push`, `prompt_then_email`) |
+| `device_cannot_ask` | `ask`, but the agent does not advertise `session-policy`: one from before P2b grants whatever reaches it, so `ask` would mean `on` |
+| `policy_unavailable` | the org's row could not be read. The session goes ahead without the features asked for |
+
+- ⚠️ **The device enforces the floor itself.** The hub's strip is so the viewer can say why before
+  the person clicks. The agent masks the grant ([`mask`, `session_policy.rs:128`](../agents/roomlerd/src/session_policy.rs#L128),
+  applied at [`signaling.rs:3050`](../agents/roomlerd/src/signaling.rs#L3050)) the moment the consent
+  mode resolves, before anything reads it. A request carrying `FILES` with no policy at all, as from a
+  bypassed hub, is masked to no `FILES` when the floor says `off`
+  (`the_device_floor_holds_when_the_server_sends_no_policy`). Field-verified on 0.4.136, with the red
+  on 0.4.132 (FR-101 AC4).
+- The hub decides in [`feature_grant`, `hub.rs:435`](../crates/modules/fleet/src/hub.rs#L435). The
+  viewer reads `features_refused` into words naming whose decision it was
+  ([`useSessionFeatures.ts:53`](../ui/src/composables/useSessionFeatures.ts#L53)). A reason it does
+  not know still greys the control, so a newer server's refusal is never ignored.
+- Audio is the request's `audio_enabled` flag, which is what the agent adds its track on; the
+  `AUDIO` bit is read by nothing and is cleared with it.
+- A change applies to sessions that start after it. Each watcher is a session of its own through
+  the same path.
+
 ### 11.4 The reality of misuse
 
 A remote-control feature is the most-abused capability in any product. Mitigations:
