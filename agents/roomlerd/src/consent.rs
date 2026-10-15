@@ -214,12 +214,20 @@ pub enum PromptSurface {
     Native,
     /// Nobody is drawing it yet — the companion should.
     Companion,
+    /// FR-93 P6f — the daemon put it up as a desktop notification, because
+    /// neither a panel nor the companion could show it. Written over the
+    /// marker once the notification is up, so a companion that starts late
+    /// lists the question rather than asking it a second time.
+    Notification,
 }
 
 impl PromptSurface {
+    /// ⚠️ [`PromptSurface::Notification`] goes out as `native`: every
+    /// companion renders a marker whose surface is anything but `native`, so
+    /// a new word would have each one already installed ask again.
     pub fn wire(self) -> &'static str {
         match self {
-            PromptSurface::Native => "native",
+            PromptSurface::Native | PromptSurface::Notification => "native",
             PromptSurface::Companion => "companion",
         }
     }
@@ -755,6 +763,26 @@ mod tests {
         // A regular dir at the same depth keeps working.
         assert!(ConsentBroker::new(Mode::AutoGrant, real).is_ok());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// FR-93 P6f — a question a notification shows reaches the companion as
+    /// one to LIST: every companion renders a marker that is not `native`, so
+    /// a new word would put a second Approve on the screen for it.
+    #[test]
+    fn a_notification_prompt_is_listed_not_asked_again() {
+        assert_eq!(PromptSurface::Notification.wire(), "native");
+        let body = PendingPrompt {
+            kind: PromptKind::RemoteControl,
+            asked_by: "Alice",
+            permissions: "VIEW".into(),
+            detail: String::new(),
+            org: String::new(),
+            timeout: Duration::from_secs(30),
+            surface: PromptSurface::Notification,
+        }
+        .to_body("6a00000000000000000000aa");
+        let req: tunnel_core::localapi::ConsentRequest = serde_json::from_str(&body).unwrap();
+        assert_eq!(req.surface, "native");
     }
 
     #[test]

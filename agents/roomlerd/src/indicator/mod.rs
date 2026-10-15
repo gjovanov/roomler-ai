@@ -107,6 +107,11 @@ pub struct ViewerIndicator {
     /// the registry or the native badge, because either may lack the entry.
     recordings:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<bson::oid::ObjectId, bool>>>,
+    /// FR-93 P6f — the consent questions on screen as desktop notifications.
+    /// `None` on a handle built by [`Self::disabled`]: it has no
+    /// `ConsentSender` for an answer to go to.
+    #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+    notify: Option<notify::Prompts>,
 }
 
 impl ViewerIndicator {
@@ -123,6 +128,8 @@ impl ViewerIndicator {
         consent_tx: ConsentSender,
     ) -> Result<Self> {
         Ok(Self {
+            #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+            notify: Some(notify::Prompts::new(consent_tx.clone())),
             inner: Inner::new(kill_tx.clone(), consent_tx)?,
             registry,
             kill_tx: Some(kill_tx),
@@ -143,6 +150,8 @@ impl ViewerIndicator {
             registry: crate::rc_sessions::RcSessionRegistry::new(),
             kill_tx: None,
             recordings: Default::default(),
+            #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+            notify: None,
         }
     }
 
@@ -211,10 +220,42 @@ impl ViewerIndicator {
         self.inner.prompt(view)
     }
 
+    /// FR-93 P6f — the last on-screen surface: the question as a desktop
+    /// notification with Approve and Deny, for a host where neither the native
+    /// panel nor the desktop companion could show it (a system daemon under
+    /// GNOME or KDE Wayland with no companion package). `false` where there is
+    /// none: no graphical session, a notification server without buttons,
+    /// another OS, `ROOMLERD_NOTIFY_CONSENT=0`.
+    ///
+    /// Answers arrive on the same `ConsentSender` as the native panel's, and
+    /// [`Self::hide_prompt`] takes it down.
+    pub async fn show_notification_prompt(&self, view: PromptView) -> bool {
+        #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+        {
+            let Some(n) = self.notify.clone() else {
+                return false;
+            };
+            // Posting waits for the session helper's first line; off the
+            // runtime's threads.
+            tokio::task::spawn_blocking(move || n.show(&view))
+                .await
+                .unwrap_or(false)
+        }
+        #[cfg(not(all(target_os = "linux", feature = "portal-capture")))]
+        {
+            let _ = view;
+            false
+        }
+    }
+
     /// Take a consent prompt down — it was answered, timed out, or resolved
     /// somewhere else (the CLI, the companion, an emailed link). Idempotent.
     pub fn hide_prompt(&self, session_hex: &str) {
         self.inner.dismiss(session_hex);
+        #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+        if let Some(n) = &self.notify {
+            n.dismiss(session_hex);
+        }
     }
 
     /// FR-85 P3 — mark `session_id` as recording (or not) on every surface
@@ -323,6 +364,12 @@ mod x11;
 /// at the process entry point, not buried in an overlay module.
 #[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
 pub mod mac;
+
+/// FR-93 P6f — the desktop's notifications as the last consent surface, where
+/// neither the native panel nor the companion can show a question. `pub`
+/// because `main.rs` runs its session helper (`portal-helper --notify`).
+#[cfg(all(target_os = "linux", feature = "portal-capture"))]
+pub mod notify;
 
 /// Non-Windows fallback. Delegates the PROMPT to a per-OS backend where one is
 /// built in and can start; everything else is a no-op, because the banner on

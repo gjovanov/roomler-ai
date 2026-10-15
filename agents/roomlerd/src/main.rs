@@ -252,6 +252,11 @@ enum Command {
         /// stdin, until the daemon closes it. Reads no input, sends none.
         #[arg(long)]
         keep_busy: bool,
+        /// FR-93 P6f — post the desktop notification described by one JSON
+        /// line on stdin (a consent question with Approve and Deny), say on
+        /// stdout what the person did, and close it when stdin closes.
+        #[arg(long)]
+        notify: bool,
     },
     /// (internal, Linux) FR-45 P2b — open a portal ScreenCast session THROUGH
     /// the session helper and print what came back.
@@ -1606,10 +1611,13 @@ async fn daemon_main() -> Result<()> {
             mutter,
             window,
             keep_busy,
+            notify,
         } => {
             #[cfg(all(target_os = "linux", feature = "portal-capture"))]
             {
-                if keep_busy {
+                if notify {
+                    roomlerd::indicator::notify::run_helper();
+                } else if keep_busy {
                     roomlerd::keep_busy::session_helper::serve();
                 } else {
                     roomlerd::capture::portal::helper::run(
@@ -1624,7 +1632,7 @@ async fn daemon_main() -> Result<()> {
             // answer from "this binary cannot ask".
             #[cfg(not(all(target_os = "linux", feature = "portal-capture")))]
             {
-                let _ = (screencast, stream, input, mutter, window, keep_busy);
+                let _ = (screencast, stream, input, mutter, window, keep_busy, notify);
                 anyhow::bail!(
                     "portal-helper is Linux-only and needs the `portal-capture` feature; this \
                      build cannot query the desktop portal"

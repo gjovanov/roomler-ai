@@ -790,7 +790,8 @@ Fixed-and-shipped issues live in `git log` and the docs. Currently open:
   artifact itself is closed on all three platforms (`ship-it` skill §3).
 - **[MEDIUM]** [2026-04-17, rewritten 2026-08-29 by **FR-27**, #854] Host consent now
   has a **`PromptSurface` chain** — native (`win`·`mac`·`x11`) → companion
-  (`roomler-desktop` over LocalAPI) → cli (`roomlerd consent`) → none, which reports
+  (`roomler-desktop` over LocalAPI) → notification (Linux, the desktop's own, with
+  Approve/Deny: FR-93 P6f) → cli (`roomlerd consent`) → none, which reports
   `no_prompt_surface` instead of a silent deny, and the chosen surface is logged per
   prompt (before it, "the prompt didn't appear" was unattributable). ⚠️ GNOME/KDE
   **Wayland** expose no `wlr-layer-shell` to arbitrary clients, so those sessions
