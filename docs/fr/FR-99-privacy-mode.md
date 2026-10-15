@@ -250,20 +250,24 @@ says muting the host silences the client too. The FR ships only the honest versi
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | This spec and the claim. The feasibility probes: `BlockInput` (the four questions in §3b), loopback under mute, the macOS lock mechanism | docs only | spec merged. **`BlockInput` and the curtain probed on vmtest 2026-10-13 and 14** (§3b's answers): high integrity needed, only the blocking thread injects (mouse, keys and the wheel alike), Ctrl+Alt+Del lifts the block, and the curtain stays out of both DXGI and WGC capture. Still owed: EDR, loopback under mute, the macOS lock |
-| P1 | The curtain + the permission bit + the device opt-in + audit (Windows), in three steps below | `privacy_mode_allowed=false` (default) | P1a and P1b merged; P1c in review |
+| P1 | The curtain + the permission bit + the device opt-in + audit (Windows), in three steps below | `privacy_mode_allowed=false` (default) | **merged** (P1a, P1b, P1c), and **field-verified end to end on 0.4.136** through the production viewer (§8 rows 9–10: AC1, AC5) |
 | P1a | The server's gate: the bit, the two `rpc` words, the hub's strip with its reasons, break-glass excluded, the storage rule (§3c as built) | none needed: nothing advertises the words yet | **merged** #2186 (`2a1e939de`): unit + `privacy_gate_tests`; the negative control (strip disabled) fails them |
 | P1b | The agent: `privacy_mode_allowed`, the words, the consent line, the curtain, the `privacy` channel, and the device's own refusal (§3a and §3c as built) | `privacy_mode_allowed=false` | **merged** #2191 (`c4df7ecde`): Linux unit + `privacy_dc` 6/6, Windows clippy and units with `viewer-indicator`; NC fails as it should. **Field-verified** with `curtain-smoke` under both capture paths (§8 rows 7 and 8) |
-| P1c | The viewer: the toggle, the refusal reasons, asking for `PRIVACY` only from a device that serves it (§3c as built) | the toggle | **#2199**: `usePrivacyMode.spec.ts` (11), the vitest suite and `vue-tsc`. The end-to-end field cell (AC1: the toggle reaching a curtain through the channel) needs P1c deployed and an agent release carrying P1b |
+| P1c | The viewer: the toggle, the refusal reasons, asking for `PRIVACY` only from a device that serves it (§3c as built) | the toggle | **merged** #2199 (`f9a66a01e`): `usePrivacyMode.spec.ts` (11), the vitest suite and `vue-tsc`. **Field-verified** (§8 rows 9–10): the toggle reaches the curtain through the channel on agent 0.4.136 |
 | P2 | The input block, if P0 cleared it | `privacy_input_block=false` | — |
 | P3 | Lock on end (Windows, Linux, macOS) | `lock_on_end=never` | — |
 | P4 | Host mute | the toggle | — |
-| P5 | Docs and the field table | — | — |
+| P5 | Docs and the field table | — | **#2240** (first part): `docs/privacy-mode.md` documents what P1 built. That covers the two parties who must agree, the request's sequence (mermaid), the server's strip reasons and the device's four gates, how the curtain works, the per-OS table and the honest limits. It is linked from `docs/README.md` and from `remote-control.md` §11.2. AC8 stays open until the page can show the block and Ctrl+Alt+Del as the way out, which wait for P2 |
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1 (the curtain, red first):** on a vmtest Win11 guest during a session, `virsh screenshot` (what a
+- [x] **AC1 (the curtain, red first):** on a vmtest Win11 guest during a session, `virsh screenshot` (what a
   person at the screen sees) shows the desktop on the deployed build. With privacy on it shows the curtain,
-  while the Playwright viewer from mars sees lit desktop pixels in the same second.
+  while the Playwright viewer from mars sees lit desktop pixels in the same second. **Verified** on agent
+  0.4.136 through the production viewer's toggle (§8 row 10). The host showed the desktop before the toggle
+  and the curtain while it was on. The viewer showed the live desktop inside the same window: the host shot
+  is at 00:41:18Z and the viewer's at 00:41:23Z, both within the 17 s the curtain was up. That is five
+  seconds apart, not one.
 - [ ] **AC2 (local input):** the "person" (QMP `input-send-event`, `virsh send-key`) does not reach
   `roomlerd probe-target` while privacy is on, and remote input does. The negative control comes first:
   without privacy, the person's input does reach it.
@@ -274,8 +278,13 @@ says muting the host silences the client too. The FR ships only the honest versi
   "while privacy is on", which P0 showed cannot hold under the block: `BlockInput` swallows the click.*
 - [ ] **AC4 (nothing survives):** `taskkill /F` on the worker clears the curtain and the block within 2 s,
   and `privacy_off {worker_exit}` is audited. After a session end, nothing of privacy mode remains.
-- [ ] **AC5 (the gate holds):** an agent without the `privacy-mode` verb never receives `PRIVACY` (an
+- [x] **AC5 (the gate holds):** an agent without the `privacy-mode` verb never receives `PRIVACY` (an
   integration test against the hub). A device that did not opt in refuses it, with a visible reason.
+  **Verified.** The integration half is P1a's `privacy_gate_tests`: they read the agent's raw `rc:request`,
+  and with the strip short-circuited all 4 cells fail. In the field on 0.4.136 (§8 rows 9–10), a device
+  that has not opted in is never asked for `PRIVACY` and its grant holds none. A device whose owner switches
+  privacy mode off mid-session takes the curtain down, and the viewer reads "this device's owner hasn't
+  allowed privacy mode".
 - [ ] **AC6 (no hooks):** the FR-92-style source scan covers this module and fails on a planted
   `SetWindowsHookEx`.
 - [ ] **AC7 (lock on end):** with `auto`, a session that began on a locked guest leaves it locked
@@ -329,6 +338,8 @@ weighed.
 | 6 | 2026-10-14 | The same guest, no viewer. A focused window, elevated, blocks and injects from its UI thread: the keys O W N and one wheel notch. The person types over `virsh send-key`: P Q during the block, R S after it | **Keys and the wheel behave like the mouse.** Control (no block): the window received `ownpqrs` and the notch (120). Under the block (`BlockInput(TRUE) = True`), it held `own` and the notch at the unblock, so the person's P Q, typed about 3 s into the 13 s block, were dropped. R S, typed about 3 s after the unblock, arrived: `ownrs` |
 | 7 | 2026-10-14 | **P1b's production overlay, SystemContext (DXGI) capture.** A vmtest Win11 guest whose installed agent (0.4.134) streamed to the production viewer from a LAN neighbour. `roomlerd curtain-smoke`, built from #2191 (sha256 `c35811fb…`), ran as the signed-in person | **The curtain is up for the person and out of the capture.** Before: the host's screenshot and the stream both showed the desktop. During, 11 s in: the host's screenshot showed the curtain and its notice, with the red border kept above it; the stream showed the desktop under it (the companion, and the console that ran the smoke). After: the desktop again. The guest's log: `privacy: curtain up, out of capture` at 08:05:42Z (the affinity read back), `curtain down` 40 s later; `curtain-smoke: possible=true up=true` |
 | 8 | 2026-10-14 | The same check on an **attended** guest, so the agent captured through WGC | **The same, under WGC.** The host's screenshot showed the curtain, and the stream (VP9 4:4:4 on a direct path) showed the desktop under it: the companion, the console, the taskbar. `curtain up, out of capture` at 10:55:36Z, down 40 s later |
+| 9 | 2026-10-15 | **AC5's field half: a device that has not opted in.** A kept vmtest Win11 **system** cell (vmtest signed in at the console), agent 0.4.136, the production viewer driven by Playwright from the vmtest harness host | The device advertises `privacy-available` and not `privacy-mode`. The viewer's `rc:session.request` asks `VIEW \| INPUT \| CLIPBOARD \| FILES \| RECORD`, with no `PRIVACY`. The grant in `rc:session.created` is `VIEW \| INPUT \| CLIPBOARD \| FILES`. The toolbar shows no privacy control and no refusal control |
+| 10 | 2026-10-15 | **AC1, end to end, and the owner's withdrawal.** The same guest. The owner opts in (`roomler config set privacy_mode_allowed true`, run as the console user through an interactive task, because the LocalAPI takes it from the console only); 70 s later the device advertises `privacy-mode`. The viewer covers the screen with the toggle; the owner then switches it off mid-session. Host truth is `virsh screenshot` at each step | The request asks for `PRIVACY` and the grant holds it (`privacy_refused: null`). **Host:** the desktop before the toggle (the red); **"This computer is being used remotely, by vmtest admin. Privacy mode is on: the screen is hidden while they work. To end the session, move the pointer to the top edge of the screen and choose Disconnect."** while it is on; the desktop again once the owner withdraws. **Viewer:** the live desktop throughout (VP9 4:4:4 over the DataChannel), the toggle lit while on. After the withdrawal the toggle is off, titled "Privacy mode is off: this device's owner hasn't allowed privacy mode" |
 
 Attended runs happen on the operator's spare box, never on a machine someone is using.
 
