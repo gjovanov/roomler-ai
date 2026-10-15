@@ -224,6 +224,15 @@ extern {
         object: DispatchQueue
     );
 
+    // ROOMLER PATCH: a barrier on the stream's serial queue — see
+    // `capturer::Owned::release_off_queue`. It returns once every item queued
+    // before it, CoreGraphics' own frame deliveries included, has finished.
+    pub fn dispatch_sync_f(
+        queue: DispatchQueue,
+        context: *mut c_void,
+        work: extern "C" fn(*mut c_void)
+    );
+
     // Core Foundation
 
     pub static kCFTypeDictionaryKeyCallBacks: CFDictionaryKeyCallBacks;
