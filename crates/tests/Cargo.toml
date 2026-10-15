@@ -22,6 +22,9 @@ roomler-core = { path = "../core" }
 roomler-ai-mod-conference = { path = "../modules/conference" }
 roomler-ai-mod-fleet = { path = "../modules/fleet" }
 roomler-ai-mod-network = { path = "../modules/network" }
+# FR-102 P6 — the purestat puller is the `saas` module's; its test drives
+# `purestat_pull::run_once` with an injected clock against a fake purestat.
+roomler-ai-mod-saas = { path = "../modules/saas" }
 # FR-90 P2e-3 — the promotion's compare-and-sets, raced at the store, where
 # two browsers racing past the route's gate cannot be timed from outside.
 roomler-ai-mod-hive = { path = "../modules/hive" }

@@ -346,6 +346,14 @@ sequenceDiagram
 - **The Campaigns table**, per key: reach (§3j), visitors, engaged visitors and goal conversions, then from
   the account plane sign-ups, orgs, activated, first value and paid. A purestat outage or a revoked key
   renders "not measured", never 0.
+  *(P6 as built: the table queries purestat **live** for the exact range — unique visitors do not add
+  across days, so a sum of the frozen daily rows could not answer a range — by exactly the UTM dimensions
+  of the requested depth (`by=source|medium|campaign|content`), and joins the funnel's account plane in
+  code by `CampaignKey::normalized`, the cleaning a sign-up gets at ingress. purestat's v1 contract has no
+  engaged-visitor metric, so engagement is `reads` (pageviews visible ≥ 30 s). The daily pull keeps the
+  last 7 closed days re-pulled once per cycle (01:00 UTC) and freezes older ones; each day's state is a
+  `growth_pulls` row, so "not pulled" and "failed" are never read as 0. Detail:
+  [growth-observability.md](../growth-observability.md).)*
 
 ### 3j. Social reach (P8)
 
@@ -512,6 +520,7 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 | `growth_exclusions` | core | `{kind: tenant\|user, id, reason, by, at}` | until removed | platform admins |
 | `growth_alerts` | core | `{rule, fired_at, detail, cleared_at}` | 90 days | the host's alert job |
 | `growth_digests` | core | `_id = "yyyy-mm-dd"`, `{status, computed_at, sent_at, recipients, sections}` | 25 months | the host's digest job |
+| `growth_pulls` | core | `_id = "<source>:<day>"`, `{source, day, status: ok\|failed, pulled_at, attempted_at, attempts, rows, error, missing_goal, truncated}` — whether a puller's day exists, so "not pulled" and "failed" are never read as 0 (P6) | indefinitely, like the rows it describes | the pullers (`saas`'s purestat puller from P6) |
 | `billing_events` | `saas` | §3g | with the org | the Stripe webhook |
 | `enroll_token_issued` | `fleet` | `_id = jti`, §3e | 90 days | token issuance, the enroll |
 | `setup_diagnostics` | `fleet` | `{run, step, outcome, elapsed_ms, error_code, os, wizard_version, ts}` | 90 days | the wizard, opt-in |
@@ -555,7 +564,7 @@ hosted only). §7's retention list grows, and `docs/data-model.md`'s stale TTLs 
 | P4 | §3g: `billing_events` and the backfill, MRR movements, quota collisions, margin | the new webhook kinds are additive; the panel | — |
 | P5 | §3h: the list over time, SendGrid events (D6), per-issue tags (D5), the per-issue table | the webhook route off; tags off in the sender | — |
 | PS1 | §3n PS1 in purestat | — | **live** with PS0a in v0.1.8; no key minted for roomler.ai yet |
-| P6 | §3i: the purestat puller, the Campaigns table with coverage | no key ⇒ "not measured" | — |
+| P6 | §3i: the purestat puller, the Campaigns table with coverage | no key ⇒ "not measured" | PR #2229 — the puller (`saas`), `growth_pulls`, `GET …/growth/campaigns`, the Campaigns tab |
 | PS3 | §3n PS3 in purestat | a tracker attribute | — |
 | P7 | §3k: the Search Console, Bing and GitHub pullers, the Content table | no credential ⇒ "not measured" | — |
 | P8 | §3j: the ingest routes, the Channels table, spend | no ingest key ⇒ 404 | — |

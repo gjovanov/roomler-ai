@@ -385,12 +385,62 @@ pub struct FunnelReport {
     pub buckets: Vec<Bucket>,
 }
 
-/// The join and the counting, pure so it is testable without a database.
-pub fn tally(facts: &Facts<'_>, by: Option<Dimension>) -> (Steps, TimeToValue, Vec<Bucket>) {
+fn orgs_by_owner(orgs: &[OrgFact]) -> HashMap<ObjectId, Vec<OrgFact>> {
     let mut orgs_of: HashMap<ObjectId, Vec<OrgFact>> = HashMap::new();
-    for o in facts.orgs {
+    for o in orgs {
         orgs_of.entry(o.owner_id).or_default().push(*o);
     }
+    orgs_of
+}
+
+/// One group's counts — a [`Bucket`] without its key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupCounts {
+    pub signups: u64,
+    pub org_created: StepCounts,
+    pub activated: Option<StepCounts>,
+    pub first_value: Option<StepCounts>,
+}
+
+/// P6 — every sign-up's outcome, grouped by `key_of` (`None` = the
+/// sign-ups it gives no key). The SAME [`outcome`] the funnel tallies with,
+/// so a group's counts and the funnel's cannot disagree on what a step
+/// means; the campaigns view groups by the normalised campaign key.
+pub fn group_by<K: Ord>(
+    facts: &Facts<'_>,
+    key_of: impl Fn(&SignupFact) -> Option<K>,
+) -> BTreeMap<Option<K>, GroupCounts> {
+    let orgs_of = orgs_by_owner(facts.orgs);
+    let can_see_devices = facts.first_device.is_some();
+    let can_see_value = can_see_devices && facts.first_value.is_some();
+    let mut groups: BTreeMap<Option<K>, Tallies> = BTreeMap::new();
+    for s in facts.signups {
+        let o = outcome(
+            s,
+            orgs_of.get(&s.id).map(Vec::as_slice).unwrap_or(&[]),
+            facts,
+        );
+        groups.entry(key_of(s)).or_default().add(&o);
+    }
+    groups
+        .into_iter()
+        .map(|(k, t)| {
+            (
+                k,
+                GroupCounts {
+                    signups: t.signups,
+                    org_created: t.org.counts(t.signups),
+                    activated: can_see_devices.then(|| t.activated.counts(t.signups)),
+                    first_value: can_see_value.then(|| t.value.counts(t.signups)),
+                },
+            )
+        })
+        .collect()
+}
+
+/// The join and the counting, pure so it is testable without a database.
+pub fn tally(facts: &Facts<'_>, by: Option<Dimension>) -> (Steps, TimeToValue, Vec<Bucket>) {
+    let orgs_of = orgs_by_owner(facts.orgs);
     let can_see_devices = facts.first_device.is_some();
     let can_see_value = can_see_devices && facts.first_value.is_some();
 
@@ -459,17 +509,55 @@ pub struct FunnelQuery {
     pub include_internal: bool,
 }
 
-/// What the handler read, before the tally.
-struct Read {
-    signups: Vec<SignupFact>,
-    orgs: Vec<OrgFact>,
-    first_device: Option<HashMap<ObjectId, i64>>,
-    first_value: Option<HashMap<ObjectId, i64>>,
-    truncated: bool,
-    basis: Vec<String>,
+/// What the handler read, before the tally. P6's campaigns view reads the
+/// account plane through the same function.
+pub(crate) struct Read {
+    pub(crate) signups: Vec<SignupFact>,
+    pub(crate) orgs: Vec<OrgFact>,
+    pub(crate) first_device: Option<HashMap<ObjectId, i64>>,
+    pub(crate) first_value: Option<HashMap<ObjectId, i64>>,
+    pub(crate) truncated: bool,
+    pub(crate) basis: Vec<String>,
 }
 
-async fn read(
+impl Read {
+    /// The facts the tally (or a grouping) counts over, at `now_ms`.
+    pub(crate) fn facts(&self, now_ms: i64) -> Facts<'_> {
+        Facts {
+            signups: &self.signups,
+            orgs: &self.orgs,
+            first_device: self.first_device.as_ref(),
+            first_value: self.first_value.as_ref(),
+            now_ms,
+        }
+    }
+
+    /// Step → why it is `null`: the module(s) this server does not mount.
+    pub(crate) fn step_reasons(&self) -> BTreeMap<String, String> {
+        let mut not_measured = BTreeMap::new();
+        if self.first_device.is_none() {
+            not_measured.insert(
+                "activated".to_string(),
+                "fleet module not mounted".to_string(),
+            );
+            not_measured.insert(
+                "first_value".to_string(),
+                "fleet module not mounted (activation precedes value)".to_string(),
+            );
+        } else if self.first_value.is_none() {
+            not_measured.insert(
+                "first_value".to_string(),
+                value::unmounted_reason(&self.basis),
+            );
+        }
+        not_measured
+    }
+}
+
+/// The sign-ups created in `[since, until)` (exclusions applied), the orgs
+/// they own, and — where their modules are mounted — each org's first
+/// device and first value day.
+pub(crate) async fn read(
     state: &AppState,
     set: &ExclusionSet,
     since: DateTime,
@@ -613,29 +701,8 @@ pub async fn get_funnel(
         ExclusionSet::load(&state.core).await?
     };
     let r = read(&state, &set, since, until).await?;
-    let (steps, time_to_value, buckets) = tally(
-        &Facts {
-            signups: &r.signups,
-            orgs: &r.orgs,
-            first_device: r.first_device.as_ref(),
-            first_value: r.first_value.as_ref(),
-            now_ms: now.timestamp_millis(),
-        },
-        by,
-    );
-    let mut not_measured = BTreeMap::new();
-    if r.first_device.is_none() {
-        not_measured.insert(
-            "activated".to_string(),
-            "fleet module not mounted".to_string(),
-        );
-        not_measured.insert(
-            "first_value".to_string(),
-            "fleet module not mounted (activation precedes value)".to_string(),
-        );
-    } else if r.first_value.is_none() {
-        not_measured.insert("first_value".to_string(), value::unmounted_reason(&r.basis));
-    }
+    let (steps, time_to_value, buckets) = tally(&r.facts(now.timestamp_millis()), by);
+    let not_measured = r.step_reasons();
     let (users, tenants) = set.counts();
     Ok(Json(FunnelReport {
         enabled: true,
@@ -893,6 +960,56 @@ mod tests {
                 .org_created
                 .pending,
             0
+        );
+    }
+
+    /// P6 — a grouping by any key counts exactly what the funnel's own
+    /// breakdown counts for the same key: one `outcome`, two callers.
+    #[test]
+    fn a_grouping_by_key_agrees_with_the_funnels_breakdown() {
+        let now = T0 + 40 * DAY_MS;
+        let a = signup(T0, Some("YouTub"), None);
+        let b = signup(T0 + DAY_MS, Some("youtube"), None);
+        let c = signup(now - DAY_MS, Some("linkedin"), None);
+        let e = signup(T0, None, None);
+        let org_a = org(&a, T0 + DAY_MS);
+        let org_c = org(&c, now - DAY_MS + 1);
+        let signups = vec![a, b, c, e];
+        let orgs = vec![org_a, org_c];
+        let devices: HashMap<ObjectId, i64> =
+            [(org_a.tenant_id, T0 + 2 * DAY_MS)].into_iter().collect();
+        let values = HashMap::new();
+        let facts = Facts {
+            signups: &signups,
+            orgs: &orgs,
+            first_device: Some(&devices),
+            first_value: Some(&values),
+            now_ms: now,
+        };
+        let (_, _, buckets) = tally(&facts, Some(Dimension::Source));
+        let groups = group_by(&facts, |s| Dimension::Source.key_of(s.attribution.as_ref()));
+        assert_eq!(groups.len(), buckets.len());
+        for b in &buckets {
+            let g = &groups[&b.key];
+            assert_eq!(
+                (g.signups, g.org_created, g.activated, g.first_value),
+                (b.signups, b.org_created, b.activated, b.first_value),
+                "{:?}",
+                b.key
+            );
+        }
+        // Without fleet, the grouping is as blind as the funnel.
+        let blind = group_by(
+            &Facts {
+                first_device: None,
+                ..facts
+            },
+            |_| Some(()),
+        );
+        let all = &blind[&Some(())];
+        assert_eq!(
+            (all.signups, all.activated, all.first_value),
+            (4, None, None)
         );
     }
 
