@@ -291,6 +291,35 @@ from both branches (FR-87 §9).
   mounts `saas` (failing open, as the SPA does); and live prices from `/api/stripe/plans`,
   over the fallback table the page ships. With JavaScript off, the page is complete and the
   form's place links to sign-up.
+- **A video** (FR-88 P3): add it to [`ui/src/utils/videos.ts`](../ui/src/utils/videos.ts), a
+  **public** video only (the player of a private or scheduled one says "Video unavailable"),
+  with its poster, 1280x720, in `ui/src/assets/tutorial/`, which both builds publish. Then
+  `:::video <id>` on a docs page, its body an optional caption. `FEATURED_VIDEO_ID` is the one
+  the homepage, the SPA landing and the tutorial's first chapter show. An id the manifest does
+  not hold fails the build.
+
+The video facade loads nothing from YouTube until someone presses play:
+
+```mermaid
+sequenceDiagram
+  participant B as Browser
+  participant R as roomler.ai
+  participant Y as youtube-nocookie.com
+  B->>R: the page, docs.css, docs.js and the poster (our own copy)
+  Note over B: a poster, a play button and a link to YouTube. No iframe.
+  B->>B: the click: docs.js (or VideoFacade.vue) swaps in the player
+  B->>Y: /embed/<id>?autoplay=1, the first request to any YouTube host
+```
+
+- **The CSP** allows that one frame host, `frame-src https://www.youtube-nocookie.com`, at
+  server level in [`files/security-headers.conf`](../files/security-headers.conf); without it
+  frames fall back to `default-src 'self'` and the player is blocked. Permissions-Policy still
+  keeps camera, microphone and display capture to the top-level page.
+- **Structured data:** each embed adds a `VideoObject` to the page's graph (§4), on the
+  homepage and on a docs page, with our poster as its `thumbnailUrl`. A post may use
+  `:::video` too, but adds no `VideoObject` yet.
+- **Without JavaScript**, and on a modified or middle click, the poster is a plain link to the
+  video on YouTube.
 
 ## 8. Telling search engines
 
@@ -361,6 +390,8 @@ property from it. Review the coverage at +3, +14 and +28 days after a launch (FR
 | [`ui/docs/theme/posts.ts`](../ui/docs/theme/posts.ts) | the post contract, ordering, backlinks |
 | [`ui/docs/theme/home-layout.ts`](../ui/docs/theme/home-layout.ts) · [`home.js`](../ui/docs/theme/home.js) · [`home.css`](../ui/docs/theme/home.css) | the static homepage, its enhancement (the hand-off first), its styles |
 | [`ui/src/utils/landing.ts`](../ui/src/utils/landing.ts) | the homepage's copy and fallback plans, shared with the SPA |
+| [`ui/src/utils/videos.ts`](../ui/src/utils/videos.ts) · [`ui/docs/theme/video.ts`](../ui/docs/theme/video.ts) · [`VideoFacade.vue`](../ui/src/components/common/VideoFacade.vue) | the embedded videos (FR-88 P3), the static facade, the app's facade |
+| [`files/security-headers.conf`](../files/security-headers.conf) | every page's security headers: the CSP, its `frame-src` for the player |
 | [`ui/docs/theme/structured.ts`](../ui/docs/theme/structured.ts) | JSON-LD |
 | [`ui/docs/theme/xml.ts`](../ui/docs/theme/xml.ts) | sitemaps, robots, the Atom feed |
 | [`ui/docs/theme/assets.ts`](../ui/docs/theme/assets.ts) · [`images.ts`](../ui/docs/theme/images.ts) · [`links.ts`](../ui/docs/theme/links.ts) | hashing · image sizes · the link gate |

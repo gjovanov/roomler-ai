@@ -23,11 +23,14 @@ import {
   HERO,
   PILLARS,
   PRICING,
+  VIDEO_TOUR,
   type Plan,
 } from '../../src/utils/landing.ts'
+import type { SiteVideo } from '../../src/utils/videos.ts'
 import { BASE, SITE_ORIGIN } from '../site.ts'
 import { icon, OS_ICON } from './icons.ts'
 import { escapeHtml, type ResolvedImage } from './render.ts'
+import { videoFacade } from './video.ts'
 import {
   renderBodyScripts,
   renderFooter,
@@ -37,7 +40,7 @@ import {
   type ShellNav,
   type SiteAssets,
 } from './shell.ts'
-import { graph, organization, website } from './structured.ts'
+import { graph, organization, videoObject, website } from './structured.ts'
 
 export const HOME_TITLE = 'Roomler — remote desktop, private mesh network, chat & video'
 export const HOME_DESCRIPTION =
@@ -87,6 +90,8 @@ export interface HomeCtx {
   assets: SiteAssets
   nav: ShellNav
   hero: ResolvedImage
+  /** FR-88 P3: the featured video and its published poster; no section without it. */
+  video?: { video: SiteVideo; poster: ResolvedImage }
 }
 
 export function renderHome(ctx: HomeCtx): string {
@@ -96,7 +101,11 @@ export function renderHome(ctx: HomeCtx): string {
     canonical: `${SITE_ORIGIN}/`,
     noindex: false,
     og: { type: 'website', title: HOME_TITLE },
-    jsonLd: graph([organization(), website()]),
+    jsonLd: graph([
+      organization(),
+      website(),
+      ...(ctx.video ? [videoObject({ ...ctx.video.video, thumbnailUrl: `${SITE_ORIGIN}${ctx.video.poster.url}` })] : []),
+    ]),
     assets: ctx.assets,
     feed: ctx.nav.hasBlog,
     blogStyles: false,
@@ -148,7 +157,19 @@ export function renderHome(ctx: HomeCtx): string {
   <section class="home-caps" aria-label="What Roomler does">
     <ul class="chips home-wrap">${CAPABILITIES.map((c) => `<li><span class="chip">${escapeHtml(c)}</span></li>`).join('')}</ul>
   </section>
-
+${
+  ctx.video
+    ? `
+  <section id="video" class="home-section home-video">
+    <div class="home-wrap home-video__inner">
+      <h2 class="home-h2">${escapeHtml(VIDEO_TOUR.title)}</h2>
+      <p class="home-sub">${escapeHtml(VIDEO_TOUR.lead)}</p>
+      ${videoFacade(ctx.video.video, ctx.video.poster)}
+    </div>
+  </section>
+`
+    : ''
+}
   <section id="features" class="home-section">
     <div class="home-wrap">${pillars}</div>
   </section>

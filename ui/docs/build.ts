@@ -36,6 +36,7 @@ import {
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { resolveDates } from './dates.ts'
 import { ATTRIBUTION_ENABLED } from '../src/utils/attribution.ts'
+import { FEATURED_VIDEO_ID, videoById } from '../src/utils/videos.ts'
 import {
   ANALYTICS,
   BASE,
@@ -351,7 +352,7 @@ function loadPage(file: string): DocPage {
     fail(`${rel} — directory "${sectionDir}" is not a declared section in ui/docs/site.ts`)
   }
 
-  const { html, headings } = renderMarkdown(md, body, rel, {
+  const { html, headings, videos } = renderMarkdown(md, body, rel, {
     resolveImage: (src) => publishImage(src, rel),
     fail,
   })
@@ -373,6 +374,7 @@ function loadPage(file: string): DocPage {
     noindex: optionalBoolean(data, 'noindex') ?? false,
     html,
     headings,
+    videos,
     plain: '',
     faq: optionalBoolean(data, 'faq') ?? false,
     // front-matter `updated` > git > manifest > nothing. `updated` exists for
@@ -698,6 +700,10 @@ function main(): void {
   // The static homepage's art, resolved with every other image so a missing
   // file is reported with the rest (P6).
   const homeHero = publishImage('hero-mesh.svg', 'ui/docs/theme/home-layout.ts')
+  // FR-88 P3: the homepage's video, a build error when the manifest lost it.
+  const homeVideo = videoById(FEATURED_VIDEO_ID)
+  if (!homeVideo) fail(`ui/src/utils/videos.ts — FEATURED_VIDEO_ID "${FEATURED_VIDEO_ID}" is not in VIDEOS`)
+  const homeVideoPoster = homeVideo ? publishImage(homeVideo.poster, 'ui/src/utils/videos.ts') : null
 
   // A post's `related:` pages are listed as cards, so each must exist.
   const pagesByUrl = new Map<string, { url: string; title: string; description: string }>(
@@ -852,7 +858,12 @@ function main(): void {
 
     // The static homepage (P6): nginx serves it at `/` to a request without the
     // session cookie, and `/home/` itself is internal (files/nginx-pod.conf).
-    const homeHtml = renderHome({ assets: siteAssets, nav: { current: 'home', hasBlog }, hero: homeHero! })
+    const homeHtml = renderHome({
+      assets: siteAssets,
+      nav: { current: 'home', hasBlog },
+      hero: homeHero!,
+      video: homeVideo && homeVideoPoster ? { video: homeVideo, poster: homeVideoPoster } : undefined,
+    })
     const homeLinks = checkLinks(
       [...linkPages, { id: 'the static homepage', url: '/', html: homeHtml, anchors: new Set([...homeHtml.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]!)) }],
       owns,

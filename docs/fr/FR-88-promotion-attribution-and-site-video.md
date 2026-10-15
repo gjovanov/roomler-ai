@@ -197,6 +197,20 @@ sequenceDiagram
 - **Kill switch:** an empty manifest renders no facade; revert the `frame-src`.
 - **Privacy policy:** the embed is click-to-load, and YouTube's terms apply after the click.
 
+**As built (P3, 2026-10-15)**, where it differs from the design above:
+
+- **The manifest is `ui/src/utils/videos.ts`, not `ui/docs/videos.json`.** The SPA embeds the
+  same videos (the tutorial's first chapter and `LandingView.vue`, Goran's ask alongside the
+  homepage and the docs page), so the list is a module both builds import, as `landing.ts` is.
+- **The poster is our own copy, not `i.ytimg.com`.** A thumbnail from `i.ytimg.com` is a
+  request to a Google host on page load, which the first bullet rules out. The poster lives in
+  `ui/src/assets/tutorial/`, which the docs build already searches and the SPA imports from.
+- **Docs only** get `:::video <id>`; the blog's `video:` front-matter key is not built. A post
+  can use the container, but adds no `VideoObject` yet.
+- **Proof:** the built site served locally, YouTube blocked at the browser: 0 requests to a
+  YouTube host before the click, then `youtube-nocookie.com/embed/<id>` on the click, on the
+  homepage and the docs page (`ui/docs/__tests__/video.spec.ts` runs `docs.js` the same way).
+
 ## 4. Phases
 
 | P | What | Kill switch | Status |
@@ -205,7 +219,7 @@ sequenceDiagram
 | P1a | the server half of §3a — `RegisterRequest.attribution`, the `utm_*` query on `GET /api/oauth/{provider}` and its Redis parking spot, `users.signup_attribution` — and the §3c view | the SPA omits `attribution`; the view is platform-admin only | **merged** #1800 `fdba707a2`, promoted `hosted-20260930-60fe7a7` |
 | P1b | the site and SPA half of §3a (the shell script, the register view and its select, the provider buttons, the newsletter form), the goals (§3b), the privacy-policy section, and the `/landing` and `/pricing` redirects in nginx that now keep the query | `ATTRIBUTION_ENABLED = false` in `ui/src/utils/attribution.ts`; `ANALYTICS = null` | **merged** #1798 `60fe7a75b`, promoted `hosted-20260930-60fe7a7` |
 | P2 | `/links/` and the short paths (§3d) | remove the locations and the page | PR open |
-| P3 | video on the site (§3e) | empty manifest; revert `frame-src` | — |
+| P3 | video on the site (§3e, as built below it): the homepage, `/docs/start/what-is-roomler/`, the SPA landing and the tutorial's first chapter, with `docs/public-site.md` §7 | empty manifest; revert `frame-src` | PR open |
 | P4 | docs: `docs/public-site.md` gains the attribution flow, the link hub and the video facade, with mermaid; the field log | — | — |
 
 **Deploy order:** P1 is promoted before the first video is published, so the first posts are

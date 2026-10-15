@@ -80,6 +80,15 @@
             </v-chip>
           </div>
 
+          <!-- FR-88 P3: the video tour, loaded from YouTube only on a click. -->
+          <VideoFacade
+            v-if="active.video"
+            class="mb-5"
+            :video-id="active.video.id"
+            :poster="active.video.poster"
+            :caption="active.video.caption"
+          />
+
           <!-- The heroes are the README's own illustrations: a light
                palette on transparent. They are painted on a fixed light
                panel in BOTH themes — recolouring them per theme would mean
@@ -244,6 +253,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useSnackbar } from '@/composables/useSnackbar'
 import { useTutorialProgress } from '@/composables/useTutorialProgress'
+import VideoFacade from '@/components/common/VideoFacade.vue'
 import {
   TUTORIAL_CHAPTERS,
   chapterById,

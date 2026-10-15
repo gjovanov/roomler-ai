@@ -39,6 +39,13 @@ export const HERO = {
   lead: 'Remote desktop from any browser and a private WireGuard-style mesh between your machines — with team chat and video included.',
 }
 
+/** FR-88 P3: the video section under the capability chips. The video itself is
+ *  `FEATURED_VIDEO_ID` in `videos.ts`. */
+export const VIDEO_TOUR = {
+  title: 'See it in action',
+  lead: 'Install the agent on Windows, macOS and Linux, connect from a browser tab, and see what Roomler does that TeamViewer and AnyDesk do, and what they still do better.',
+}
+
 export const CAPABILITIES = [
   'Remote desktop',
   'Private mesh network',
