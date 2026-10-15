@@ -353,8 +353,24 @@ mod parent {
 /// The session helper's half: `roomlerd portal-helper --notify`. Reads one
 /// [`Request`] line on stdin, posts it, says what happened on stdout, and
 /// closes the notification when stdin closes or its lifetime ends.
+///
+/// ⚠️ zbus's blocking API panics inside a tokio runtime ("Cannot start a
+/// runtime from within a runtime"), and the subcommand is reached from the
+/// daemon's runtime, so the D-Bus work runs on a plain thread: the rule keep
+/// busy's helper and `capture::portal::mutter` follow. Measured on the FR-93
+/// lab: called on the runtime's thread, the helper panicked before it posted
+/// anything.
 pub fn run_helper() {
-    if let Err(why) = helper::run() {
+    let outcome = match std::thread::Builder::new()
+        .name("notify-helper".into())
+        .spawn(helper::run)
+    {
+        Ok(worker) => worker
+            .join()
+            .unwrap_or_else(|_| Err("the helper's thread panicked".into())),
+        Err(e) => Err(format!("no thread for the helper: {e}")),
+    };
+    if let Err(why) = outcome {
         eprintln!("portal-helper --notify: {why}");
         println!("{FAILED}{why}");
     }
