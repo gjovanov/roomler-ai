@@ -257,7 +257,7 @@ says muting the host silences the client too. The FR ships only the honest versi
 | P2 | The input block, if P0 cleared it | `privacy_input_block=false` | — |
 | P3 | Lock on end (Windows, Linux, macOS) | `lock_on_end=never` | — |
 | P4 | Host mute | the toggle | — |
-| P5 | Docs and the field table | — | — |
+| P5 | Docs and the field table | — | **#2240** (first part): `docs/privacy-mode.md` documents what P1 built. That covers the two parties who must agree, the request's sequence (mermaid), the server's strip reasons and the device's four gates, how the curtain works, the per-OS table and the honest limits. It is linked from `docs/README.md` and from `remote-control.md` §11.2. AC8 stays open until the page can show the block and Ctrl+Alt+Del as the way out, which wait for P2 |
 
 ## 5. Acceptance criteria
 
