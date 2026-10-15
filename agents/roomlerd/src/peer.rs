@@ -336,6 +336,10 @@ impl AgentPeer {
         outbound: mpsc::Sender<ClientMsg>,
         encoder_preference: encode::EncoderPreference,
         chosen_codec: String,
+        // #2231 — the codec the RTP video track is created and pinned with:
+        // `chosen_codec`, except on a DataChannel transport whose offer lacks
+        // it (`rtp_track_codec`). The pump always encodes `chosen_codec`.
+        track_codec: String,
         negotiated_transport: Option<String>,
         chroma_pref: Option<String>,
         // FR-17 — this controller can parse the framed DataChannel wire
@@ -496,12 +500,25 @@ impl AgentPeer {
         // webrtc-rs's default H.265 registration is PT 126, no fmtp
         // line, same rtcp feedback as H.264 — matches Chrome
         // Canary/Beta/Stable 127+ which accept the same shape.
+        //
+        // #2231 — on a DataChannel transport this track carries no frame (the
+        // DC pump owns the video); it only keeps the SDP answer valid. Its
+        // codec is `track_codec`, which `rtp_track_codec` moves off the pump's
+        // codec when the offer cannot take that one.
+        if track_codec != chosen_codec {
+            info!(
+                %session_id,
+                pump_codec = %chosen_codec,
+                track_codec = %track_codec,
+                "RTP video track takes a codec the offer carries; the DataChannel carries the video"
+            );
+        }
         // RETIRED-NAME-ANCHOR(4): this is the WebRTC STREAM ID, which travels in the
         // SDP as the msid. No viewer code keys on it today, but it is a wire value
         // and a rename would be observable to any consumer that does. Frozen until
         // something proves nothing reads it. See docs/fr/FR-21.
         let video_track = Arc::new(TrackLocalStaticSample::new(
-            build_video_codec_cap(&chosen_codec),
+            build_video_codec_cap(&track_codec),
             "video".to_string(),
             "roomler-agent".to_string(),
         ));
@@ -556,14 +573,14 @@ impl AgentPeer {
             }
         }
         if let Some(transceiver) = matched_transceiver {
-            let codec_params = codec_params_for(&chosen_codec);
+            let codec_params = codec_params_for(&track_codec);
             if let Err(e) = transceiver.set_codec_preferences(vec![codec_params]).await {
                 // Not fatal — transceiver still works, SDP just offers
                 // the default union. Log as warning so a field incident
                 // is diagnosable.
-                warn!(%session_id, %e, codec = %chosen_codec, "set_codec_preferences failed — SDP will carry default codec union");
+                warn!(%session_id, %e, codec = %track_codec, "set_codec_preferences failed — SDP will carry default codec union");
             } else {
-                info!(%session_id, codec = %chosen_codec, "SDP codec preferences pinned");
+                info!(%session_id, codec = %track_codec, "SDP codec preferences pinned");
             }
         }
 
@@ -11852,6 +11869,16 @@ fn build_video_codec_cap(codec: &str) -> RTCRtpCodecCapability {
             sdp_fmtp_line: String::new(),
             rtcp_feedback: feedback,
         },
+        // #2231 — the RTP track's placeholder on a DataChannel transport
+        // whose offer lacks the pump's codec (`rtp_track_codec`). No encoder
+        // ever feeds it. Matches webrtc-rs's default VP8 (PT 96, no fmtp).
+        "vp8" => RTCRtpCodecCapability {
+            mime_type: "video/VP8".to_string(),
+            clock_rate: 90000,
+            channels: 0,
+            sdp_fmtp_line: String::new(),
+            rtcp_feedback: feedback,
+        },
         _ => RTCRtpCodecCapability {
             mime_type: "video/H264".to_string(),
             clock_rate: 90000,
@@ -11993,6 +12020,7 @@ fn codec_params_for(codec: &str) -> webrtc::rtp_transceiver::rtp_codec::RTCRtpCo
     let payload_type = match codec.to_ascii_lowercase().as_str() {
         "av1" => 41,
         "h265" | "hevc" => 126,
+        "vp8" => 96,
         _ => 125,
     };
     RTCRtpCodecParameters {
@@ -12002,9 +12030,107 @@ fn codec_params_for(codec: &str) -> webrtc::rtp_transceiver::rtp_codec::RTCRtpCo
     }
 }
 
+/// #2231 — the codec the RTP video track is created and pinned with.
+///
+/// On a DataChannel transport the track carries no frame (the DC pump owns the
+/// video); it exists only so the SDP answer is valid. The pump's codec comes
+/// from `pick_best_codec`, whose fallback is H.264 even when the browser named
+/// codecs and none intersects with the agent's RTP set. A Firefox without
+/// OpenH264 offers VP8, VP9 and AV1, so an H.264 track left the sender with no
+/// codec, and `create_answer` failed ("RTPSender created with no codecs")
+/// before the DataChannel the session would use could open. So on a DC
+/// transport whose offer lacks the pump's codec, the track takes VP8, which
+/// every WebRTC browser must offer (RFC 7742). On the RTP transport the track
+/// IS the video, and its codec stays the pump's. Read from the offer itself,
+/// the one statement of what this browser will take.
+pub fn rtp_track_codec(chosen: &str, transport: Option<&str>, offer_sdp: &str) -> String {
+    let on_dc = transport.is_some_and(|t| t.starts_with("data-channel-"));
+    if !on_dc {
+        return chosen.to_string();
+    }
+    // `a=rtpmap:<pt> <encoding>/<clock>[/<channels>]`, the encoding name in
+    // any case.
+    let offers = |name: &str| {
+        offer_sdp.lines().any(|line| {
+            let line = line.trim();
+            line.strip_prefix("a=rtpmap:")
+                .and_then(|rest| rest.split_whitespace().nth(1))
+                .and_then(|enc| enc.split('/').next())
+                .is_some_and(|enc| enc.eq_ignore_ascii_case(name))
+        })
+    };
+    let encoding = match chosen.to_ascii_lowercase().as_str() {
+        "av1" => "AV1",
+        "h265" | "hevc" => "H265",
+        _ => "H264",
+    };
+    if offers(encoding) || !offers("VP8") {
+        return chosen.to_string();
+    }
+    "vp8".to_string()
+}
+
 #[cfg(test)]
 mod codec_cap_tests {
-    use super::{build_video_codec_cap, codec_params_for};
+    use super::{build_video_codec_cap, codec_params_for, rtp_track_codec};
+
+    /// A Firefox without OpenH264, as it offers: VP8, VP9 and AV1 (+ rtx/fec),
+    /// with Opus on the audio line.
+    const FIREFOX_NO_H264: &str = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 109\r\n\
+        a=rtpmap:109 opus/48000/2\r\nm=video 9 UDP/TLS/RTP/SAVPF 120 124 121 125 99\r\n\
+        a=rtpmap:120 VP8/90000\r\na=rtpmap:124 rtx/90000\r\na=rtpmap:121 VP9/90000\r\n\
+        a=rtpmap:125 rtx/90000\r\na=rtpmap:99 AV1/90000\r\n";
+    /// Chromium, with H.264.
+    const CHROMIUM: &str = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96 102\r\n\
+        a=rtpmap:96 VP8/90000\r\na=rtpmap:102 H264/90000\r\n";
+
+    /// #2231 — on a DataChannel transport the placeholder track takes VP8
+    /// when the offer lacks the pump's codec; everything else keeps it.
+    #[test]
+    fn the_rtp_track_takes_a_codec_the_offer_carries() {
+        let dc = Some("data-channel-vp9-444");
+        // The field case: a Firefox without OpenH264 on the VP9 DataChannel.
+        assert_eq!(rtp_track_codec("h264", dc, FIREFOX_NO_H264), "vp8");
+        // Every DataChannel transport, not just VP9's.
+        assert_eq!(
+            rtp_track_codec("h264", Some("data-channel-hevc"), FIREFOX_NO_H264),
+            "vp8"
+        );
+        // The offer has the pump's codec: nothing changes.
+        assert_eq!(rtp_track_codec("h264", dc, CHROMIUM), "h264");
+        assert_eq!(rtp_track_codec("av1", dc, FIREFOX_NO_H264), "av1");
+        // The RTP transport: the track IS the video, so its codec stays the
+        // pump's, whatever the offer (that mismatch is a refusal's business).
+        assert_eq!(rtp_track_codec("h264", None, FIREFOX_NO_H264), "h264");
+        // No VP8 to move to either: nothing better to do.
+        assert_eq!(
+            rtp_track_codec("h264", dc, "m=video 9 RTP 99\r\na=rtpmap:99 AV1/90000\r\n"),
+            "h264"
+        );
+        // The encoding name in any case, as an SDP may write it.
+        assert_eq!(
+            rtp_track_codec(
+                "h264",
+                dc,
+                "m=video 9 RTP 102\r\na=rtpmap:102 h264/90000\r\n"
+            ),
+            "h264"
+        );
+        // Opus's line never reads as a video codec.
+        assert_eq!(
+            rtp_track_codec("h264", dc, "a=rtpmap:109 opus/48000/2\r\n"),
+            "h264"
+        );
+    }
+
+    #[test]
+    fn vp8_cap_matches_webrtc_default() {
+        let cap = build_video_codec_cap("vp8");
+        assert_eq!(cap.mime_type, "video/VP8");
+        assert_eq!(cap.clock_rate, 90000);
+        assert!(cap.sdp_fmtp_line.is_empty());
+        assert_eq!(codec_params_for("vp8").payload_type, 96);
+    }
 
     #[test]
     fn h264_cap_matches_webrtc_default() {
@@ -12281,8 +12407,10 @@ mod codec_cap_tests {
     #[test]
     fn unknown_codec_defaults_to_h264() {
         // Belt-and-braces: pick_best_codec should never hand us an
-        // unknown codec, but if it does we must not panic.
-        let cap = build_video_codec_cap("vp8");
+        // unknown codec, but if it does we must not panic. (VP8 is known
+        // since #2231: the DataChannel's placeholder track. The agent never
+        // advertises it for RTP, so pick_best_codec cannot return it.)
+        let cap = build_video_codec_cap("theora");
         assert_eq!(cap.mime_type, "video/H264");
     }
 

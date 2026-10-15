@@ -701,6 +701,16 @@ jobs:
         # reuses that build instead of compiling the agent a third time.
         run: cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test privacy_dc
 
+      - name: A DataChannel session answers an offer without H.264 (#2231)
+        # The production AgentPeer on the VP9 DataChannel transport against a
+        # webrtc-rs "browser" that registers VP8 alone, as a Firefox without
+        # OpenH264 offers: the RTP placeholder track must take a codec the
+        # offer carries, or `create_answer` fails before the DataChannel opens.
+        # The second test keeps the failure itself (an H.264 track cannot
+        # answer that offer). ⚠️ Named explicitly, as the steps around it are;
+        # built with the same features, so it reuses that build.
+        run: cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test dc_track_codec
+
       - name: L0 latency harness (FR-16) — capture → decode on one clock, over a vnet
         # FR-16 L0. The production AgentPeer and media pump on the synthetic
         # source and openh264, a webrtc-rs controller decoding the RTP track,
