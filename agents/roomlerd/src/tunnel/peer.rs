@@ -43,7 +43,7 @@ use bson::oid::ObjectId;
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
-use tunnel_core::forward::FlowDemux;
+use tunnel_core::forward::{FlowCancel, FlowCanceller, FlowDemux};
 use tunnel_core::transport::webrtc_dc::{PeerError, TunnelPeer};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -64,6 +64,12 @@ pub struct AgentTunnelPeer {
     /// populated. Cloned out via [`pool_ready`] so the acceptor can
     /// wait for it before serving the first flow.
     pool_ready: Arc<tokio::sync::Notify>,
+    /// #2129 — ends this peer's live flows when the peer is closed. Every
+    /// flow `run_flow`-driven by the acceptor holds a handle onto it; a flow
+    /// whose app/target is idle cannot end on its own when the session goes
+    /// away (its DC pins the mailbox sender), so [`close`](Self::close) fires
+    /// this so the flow stops and frees its dst socket + DC reference.
+    flow_canceller: FlowCanceller,
 }
 
 impl AgentTunnelPeer {
@@ -251,6 +257,7 @@ impl AgentTunnelPeer {
                 peer,
                 flow_demuxes,
                 pool_ready,
+                flow_canceller: FlowCanceller::new(),
             },
             answer.sdp,
         ))
@@ -296,6 +303,12 @@ impl AgentTunnelPeer {
         guard.get(dc_index as usize).cloned()
     }
 
+    /// #2129 — a handle the acceptor hands to each `run_flow`, so that
+    /// [`close`](Self::close) ends the flow even if its app/target is idle.
+    pub fn flow_cancel(&self) -> FlowCancel {
+        self.flow_canceller.handle()
+    }
+
     /// Build a `HalfCloseSink` that emits `ClientMsg::TcpHalfClose
     /// { direction: DstToSrc }` over the agent's WS outbound channel.
     /// The agent's "local" side of a flow is the dialed destination,
@@ -324,6 +337,14 @@ impl AgentTunnelPeer {
     /// responsible for removing the peer from any agent-side session
     /// map before calling; this is just the resource teardown.
     pub async fn close(&self) {
+        // #2129 — end every live flow FIRST, so an idle flow's pump returns
+        // (closing its dst socket and releasing its DC reference) instead of
+        // hanging on a session that is going away. Every real teardown path
+        // reaches this one method — the terminate arm, the #1754 reap and the
+        // WS-disconnect sweep (`close_all_tunnel_peers`) — so the trigger
+        // lives in one place. A peer that is KEPT (never closed) keeps its
+        // flows: the cancel is tied to `close`, not to any loop exit.
+        self.flow_canceller.cancel();
         if let Err(e) = self.peer.peer_connection().close().await {
             debug!(session_id = %self.session_id, %e, "TunnelPeer close errored");
         }
@@ -334,7 +355,9 @@ impl AgentTunnelPeer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roomler_ai_remote_control::signaling::CloseReason;
     use std::time::{Duration, Instant};
+    use tokio::io::AsyncReadExt;
     use tokio::sync::mpsc::error::TryRecvError;
     use tunnel_core::transport::webrtc_dc::TunnelPeer as CoreTunnelPeer;
 
@@ -639,5 +662,116 @@ mod tests {
         thaw.store(true, Ordering::SeqCst);
         client.thread().unpark();
         client.join().expect("client thread");
+    }
+
+    /// A connected loopback TCP pair: `(accepted, the_other_end)`. `run_flow`
+    /// drives the accepted side; the test holds the other end so it can watch
+    /// for EOF/RST when `run_flow` drops its half.
+    async fn loopback_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let far = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (near, _) = l.accept().await.unwrap();
+        (near, far)
+    }
+
+    /// Spawn a live, idle exit-side flow on the peer's demux(0), dialed at a
+    /// loopback "dst". Returns the flow task and the far ("dst") end the test
+    /// watches. The peer's own cancel handle drives it, so closing the peer
+    /// must end it (#2129).
+    async fn spawn_idle_exit_flow(
+        peer: &AgentTunnelPeer,
+    ) -> (tokio::task::JoinHandle<CloseReason>, tokio::net::TcpStream) {
+        let (dst_tcp, far) = loopback_pair().await;
+        let demux = peer.demux(0).await.expect("demux(0) present");
+        let (from_dc, stats) = demux.register(1).await;
+        let dc = demux.dc();
+        let noop: tunnel_core::forward::HalfCloseSink = Arc::new(|_fid: u32| {});
+        let flow = tokio::spawn(tunnel_core::forward::run_flow(
+            dst_tcp,
+            dc,
+            1,
+            from_dc,
+            noop,
+            stats,
+            peer.flow_cancel(),
+        ));
+        (flow, far)
+    }
+
+    /// #2129 — a real teardown (`AgentTunnelPeer::close`, which every exit
+    /// path reaches: the terminate arm, the #1754 reap, the WS-disconnect
+    /// sweep) ends the peer's LIVE flows. An idle flow's `run_flow` cannot end
+    /// on its own — its DC pins the mailbox sender and its dst is idle — so
+    /// `close()` must cancel it: the dst socket closes (no CLOSE-WAIT) and the
+    /// pump returns. Run under a timeout so a regression fails red.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_the_peer_ends_its_live_flows() {
+        let p = open_pair().await;
+        assert!(p.answerer.wait_pool_ready(POOL_READY).await, "pool ready");
+
+        let (mut flow, mut far) = spawn_idle_exit_flow(&p.answerer).await;
+
+        // Idle: the flow must not end while its session is up.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !flow.is_finished(),
+            "a live flow does not end while its session is up"
+        );
+
+        // A real teardown.
+        p.answerer.close().await;
+
+        let (reason, dst_eof) = tokio::time::timeout(Duration::from_secs(2), async {
+            let reason = (&mut flow).await.unwrap();
+            let mut b = [0u8; 1];
+            let eof = matches!(far.read(&mut b).await, Ok(0) | Err(_));
+            (reason, eof)
+        })
+        .await
+        .expect("close() must end the live flow within 2 s");
+        assert!(
+            matches!(reason, CloseReason::ServerTerminated),
+            "the flow reports the teardown, got {reason:?}"
+        );
+        assert!(
+            dst_eof,
+            "the dst socket must be closed, not left in CLOSE-WAIT"
+        );
+
+        p.drain.abort();
+        p.offerer.close().await;
+    }
+
+    /// #2129 — the exclusion. A peer that is KEPT (never `close()`d — e.g. one
+    /// preserved across a control-WS reattach) keeps its live flows: the
+    /// cancel is tied to `close()`, not to any particular loop exit. So the
+    /// flow runs and its dst stays open for as long as the peer is kept. This
+    /// is the exit-side analogue of the #1754 suite's "nothing is reaped while
+    /// the pair is up".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kept_peer_keeps_its_live_flows() {
+        let p = open_pair().await;
+        assert!(p.answerer.wait_pool_ready(POOL_READY).await, "pool ready");
+
+        let (mut flow, mut far) = spawn_idle_exit_flow(&p.answerer).await;
+
+        // The peer is never closed — well past the point a teardown would have
+        // ended the flow, it is still running and the dst is still open.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!flow.is_finished(), "a kept peer's flow must not end");
+        let mut b = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), far.read(&mut b))
+                .await
+                .is_err(),
+            "the dst socket stays open while the peer is kept"
+        );
+
+        // Now close for real so the test leaks nothing.
+        p.answerer.close().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut flow).await;
+        p.drain.abort();
+        p.offerer.close().await;
     }
 }

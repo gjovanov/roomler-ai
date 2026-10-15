@@ -181,12 +181,16 @@ pub async fn handle_forward_request(
     }
 
     let half_close = tunnel_peer.half_close_sink(outbound.clone());
+    // #2129 — hand this flow the peer's cancel handle so a teardown
+    // (`AgentTunnelPeer::close`) ends it even if the dst is idle.
+    let cancel = tunnel_peer.flow_cancel();
     // Wave 3 — report this end's totals too. The server audits only the
     // ORIGINATOR's close (booking both would double every flow), but an
     // end that CAN count must not put a false zero on the wire.
     let stats_for_audit = Arc::clone(&stats);
     let close_reason =
-        tunnel_core::forward::run_flow(stream, dc, flow_id, from_dc, half_close, stats).await;
+        tunnel_core::forward::run_flow(stream, dc, flow_id, from_dc, half_close, stats, cancel)
+            .await;
     demux.unregister(flow_id).await;
     info!(%session_id, %flow_id, ?close_reason, "agent flow ended");
     let (tcp_read, _dc_send, _dc_recv, tcp_write, _depth) = stats_for_audit.snapshot();
