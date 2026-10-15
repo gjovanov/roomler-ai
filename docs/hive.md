@@ -3907,9 +3907,72 @@ sequenceDiagram
 start's redelivery window (10 minutes from the fork's id), then lets it go at the session's next
 tip or placement: with no record there is no start, and none will come.
 
-The rest of P2 is next (spec §3b and §4): the archive replica image (P2h), full-text search on
-archive replicas (P2i), the UI (P2j) and the field run (P2k). Its server switch is
-`hive.replicaset` and its device switch `hive_replica`, both off by default.
+### P2h-1: the archive replica image
+
+An archive replica is an always-on device of the org that holds copies of its sessions for their
+retention, and serves a session's room when no other member is online (§3b, decision 1). It runs
+no session. The org runs it as a container on its own machines: a replica is a plaintext copy of
+everything the agent saw, so an archive Roomler ran would hold every hosted org's transcripts.
+`Dockerfile.hive-archive` builds it: `roomlerd` with `hive` and `overlay-netstack` only, no
+capture, no input, no TUN.
+
+```mermaid
+sequenceDiagram
+    participant O as the org's operator
+    participant C as the container (first start)
+    participant S as server
+    participant A as an ADMINISTRATOR
+    O->>C: docker run -v vol:/data -e ROOMLER_SERVER -e ROOMLER_ENROLL_TOKEN …
+    C->>C: no /data/config.toml: enroll --archive-replica (fresh config, standard token)
+    C->>S: enroll: the device, named after the fixed hostname
+    C->>C: config written WITH the archive posture, then run
+    A->>S: the org's Hive policy: archive_devices += the device
+    S->>C: rc:hive.replica.join for each session the rules place there
+    Note over C: every later start: run from the volume, no token
+```
+
+```sh
+docker run -d --name hive-archive --hostname hive-archive-1 \
+  --restart unless-stopped -v hive-archive:/data \
+  -e ROOMLER_SERVER=https://roomler.ai \
+  -e ROOMLER_ENROLL_TOKEN=<an ADMINISTRATOR's enrollment token> \
+  ghcr.io/gjovanov/roomler-ai/hive-archive:<tag>
+```
+
+| What the enrollment writes (`--archive-replica`) | Why |
+|---|---|
+| `hive_replica`, `hive_archive` on | it holds copies of the org's sessions and offers itself as an archive replica; an `ADMINISTRATOR` still designates it before it holds anything |
+| `hive_enabled` off | it runs no session and calls no model |
+| `exec_enabled`, `ssh_enabled` off | it reaches the org's network for no one |
+| `forward_acl.enabled` off | no tunnel exit: an empty allowlist would otherwise trust the server |
+| `auto_update` off | it updates by a new container on the same volume, never by a package installed inside one |
+
+| Rule | Why | Where |
+|---|---|---|
+| The posture is written with the enrolled config, before its first save | the first start is already an archive replica; a script appending keys to the file afterwards would land them under whatever `[table]` came last | [`archive_replica.rs:61`](../agents/roomlerd/src/archive_replica.rs#L61), [`main.rs:2458`](../agents/roomlerd/src/main.rs#L2458) |
+| Refused before the single-use token is spent: an existing config, an ephemeral enrollment, a build that holds no copies | the volume is the device, and folding an existing enrollment into one would make some other device an archive replica in place; FR-51 deletes an ephemeral device once it falls silent | [`archive_replica.rs:35`](../agents/roomlerd/src/archive_replica.rs#L35), [`main.rs:2365`](../agents/roomlerd/src/main.rs#L2365) |
+| The entrypoint enrolls only when the volume holds no config, and never prints the token; a failed enrollment writes nothing, so the next start tries again | the token is single use and 10 minutes long; every later start runs from the volume | [`hive-archive-entrypoint.sh:24`](../scripts/hive-archive-entrypoint.sh#L24) |
+| Not root: its own account, uid 10001, whose home is the volume, so the store and every file the daemon keeps live there with the config | it runs no session as anyone, so it needs no account but its own | [`Dockerfile.hive-archive:66`](../Dockerfile.hive-archive#L66) |
+| Built and smoke-tested on every PR that touches it; published only by a dispatch, `dry_run` on by default | publishing puts a public package under the operator's account, as the self-host image (FR-42) | [`hive-archive-image.yml:23`](../.github/workflows/hive-archive-image.yml#L23) |
+
+The smoke test, before any push: the binary starts with the libraries it links; it is the build
+that enrolls archive replicas; it runs as uid 10001; a first start with nothing to enroll with says
+why and fails; an enrollment that fails writes nothing and never prints the token.
+
+⚠️ **The volume is the device.** It holds the config (the agent token, the WireGuard key) and the
+store, every session placed there in plaintext. Whoever holds it can read those sessions and pose
+as the device. Encryption at rest is P7.
+
+⚠️ **A fixed hostname.** The machine id hashes the hostname, the OS and the config path
+(`crates/agent-core/src/machine.rs`): one container keeps its name across restarts (compose's
+`hostname:`, a StatefulSet's pod name), and two archive replicas of one org never share one.
+
+⚠️ **A new package on GHCR is private** until the operator makes it public. Until then only
+accounts with access to the package can pull it.
+
+The rest of P2 is next (spec §3b and §4): the policy page's "Add an archive replica" (P2h-2),
+full-text search on archive replicas (P2i), the UI (P2j) and the field run (P2k). Its server
+switch is `hive.replicaset` and its device switch `hive_replica`, both off by default.
 
 ---
 
@@ -3922,6 +3985,7 @@ archive replicas (P2i), the UI (P2j) and the field run (P2k). Its server switch 
 | the device core, with no daemon in it | [`crates/hive-node/src/`](../crates/hive-node/src/): `event.rs`, `chain.rs`, `stream_json.rs`, `store.rs` (the substitutes, where each session was worked on, and the device's clock: the words, the contact, the copies it purged), `launch.rs` (a fork's first launch), `roots.rs`, `checkpoint.rs` (a fork's allowlist), `stream.rs` (the replica stream's messages, their framing and limits, its opening exchange, and the have and want's frames, `want_pack` and `pack`, and the stand-ins a source's hello lists) |
 | the device | [`agents/roomlerd/src/hive/`](../agents/roomlerd/src/hive/): `gates.rs`, `supervisor.rs` (starts, the fence, the lease word, the drain, the prepare and the moved start, a teleport's prepare, the folder it asks, and the join it admits, a fork's first start from its parent's copy, the session task and its first checkpoint at a primary's join, the resume), `supervisor/adopt.rs` (and a terminal session that ended here made a managed one: its gates, and this device's record of whose terminal it was), `supervisor/purge.rs` (a purge: the run stopped first, the daemon's copy, then the account's part from the debt the store kept; and every session the device holds, at its removal), `supervisor/retain.rs` (the device's own clock: the words it asks for and keeps, a copy purged once its word has passed, and what its manifests name), `supervisor/replica.rs` (the join's gates, the teleport's among them, and the fences' ends it keeps, the primary's join, tips), `supervisor/stream.rs` (the replica stream: its endpoints and dials on the direct, relay and derp rungs, a teleport's dial on a device that holds no copies, then its events, blobs and acks, and a teleport's have and want: the target's `want_pack`, the source's pack, made again from where the session was worked on for a whole pack it holds only a substitute for), `supervisor/follow.rs` (the member's wants: the ladder, the waits, the sessions parked, the renewals, a join that overtakes them, a teleport's copy followed at a connection), `toolbelt.rs`, `resume_note.rs` (the resume note, every earlier folder a move names, a fork's, a terminal session's made managed, and the hook's printer), `sidecar.rs`, `view.rs`, `framing.rs`, `store.rs` (the writer, and the substitutes and workplaces it keeps), `workspace.rs` (a folder checkpointed and materialized through the account's own git, and a pack against what another repository holds, and whether a folder may take a teleport's copy), `checkpointer.rs` (`hive-checkpoint`), `materializer.rs` (`hive-materialize`, the substitute it reads in place of a whole pack, and a parent's chain moved under a fork's names), `packer.rs` (`hive-pack`: which commits a folder's repository holds, the pack against them, and whether the folder may take a teleport's copy, as the account), `importer.rs` (`hive-import`: an ended terminal session's own history, put in place as the managed session's, as the account), `purger.rs` (`hive-purge`: a purged session's state directory, and its checkpoints' refs and index, deleted as the account), `hosted.rs`, `procs.rs`; Windows in [`hive_win.rs`](../agents/roomlerd/src/hive_win.rs) |
 | what builds it | the `hive` feature, and `cfg(hive_host)` on Linux, macOS and Windows ([`build.rs:88`](../agents/roomlerd/build.rs#L88)); the capabilities in [`caps.rs:1622`](../agents/roomlerd/src/encode/caps.rs#L1622) |
+| the archive replica image | [`Dockerfile.hive-archive`](../Dockerfile.hive-archive) and its entrypoint [`hive-archive-entrypoint.sh`](../scripts/hive-archive-entrypoint.sh) (enroll once, then run); the posture its enrollment writes, and what refuses one, in [`archive_replica.rs`](../agents/roomlerd/src/archive_replica.rs); its build, smoke test and dispatch-only publish in [`hive-archive-image.yml`](../.github/workflows/hive-archive-image.yml) |
 | the update wait | [`updater.rs:278`](../agents/roomlerd/src/updater.rs#L278); the macOS hold, `HiveUpdateHold`, in [`crates/localapi/src/lib.rs`](../crates/localapi/src/lib.rs) |
 | `adopt` | the CLI in [`hive_hooks.rs`](../agents/roomler-cli/src/hive_hooks.rs); its protocol in [`crates/localapi/src/hive_adopt.rs`](../crates/localapi/src/hive_adopt.rs) |
 | the SPA | [`stores/hive.ts`](../ui/src/stores/hive.ts), [`useHiveViewer.ts`](../ui/src/composables/useHiveViewer.ts), [`components/hive/`](../ui/src/components/hive/), [`views/hive/`](../ui/src/views/hive/) |
@@ -3962,7 +4026,8 @@ archive replicas (P2i), the UI (P2j) and the field run (P2k). Its server switch 
   or not (P2g-3d). A removed device purges every session it holds, and the purges waiting on it
   no longer do (P2g-4a), and a member that leaves is purged, its copy alone, once the session
   holds its `min` copies without it, and a fork made from its copy no longer needs it (P2g-4b).
-  P2g is done in code.
+  P2g is done in code. A container from the archive replica image enrolls once as one, its
+  posture written with its enrollment and its volume the device (P2h-1).
 - The vault and the rest of the toolbelt (P3), knowhow (P4) and the learning loop
   (P5). `docs/vault.md` and `docs/knowhow.md` come with them.
 - `adopt` on Windows, and a Windows session for anyone but the console user.
