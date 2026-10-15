@@ -114,6 +114,16 @@ enum Command {
         /// something privileged enough to bring up a TUN.
         #[arg(long)]
         overlay: bool,
+        /// FR-90 P2h-1 — enroll as an archive replica of the organization, as
+        /// the archive image does: it holds copies of the org's sessions and
+        /// offers itself as an archive (`hive_replica`, `hive_archive`), runs
+        /// no session, takes no command or SSH session, is no tunnel exit,
+        /// and never updates itself. Written with the enrolled config, so the
+        /// first start is already one. Needs a fresh config, and a standard
+        /// (never an ephemeral) token; an `ADMINISTRATOR` still designates
+        /// the device before it holds anything.
+        #[arg(long)]
+        archive_replica: bool,
         /// FR-102 — how this daemon was installed, for the server's install
         /// trace: one of `wizard`, `script-sh`, `script-ps1`, `msi`, `deb`,
         /// `pkg`, `manual`, `container`, `other`. Falls back to the
@@ -1482,6 +1492,7 @@ async fn daemon_main() -> Result<()> {
             replace,
             ephemeral,
             overlay,
+            archive_replica,
             install_method,
             install_scope,
         } => {
@@ -1496,6 +1507,7 @@ async fn daemon_main() -> Result<()> {
                     replace,
                     ephemeral,
                     overlay,
+                    archive_replica,
                     install_method: install_method.as_deref(),
                     install_scope: install_scope.as_deref(),
                 },
@@ -2273,6 +2285,8 @@ struct EnrollOptions<'a> {
     /// server's response (not this flag) decides what the CONFIG records.
     ephemeral: bool,
     overlay: bool,
+    /// FR-90 P2h-1 — the archive replica's posture ([`roomlerd::archive_replica`]).
+    archive_replica: bool,
     /// FR-102 P3 — the install trace, flag-first; `None` falls back to the
     /// env, then to `manual` / `unknown` (`enrollment::resolve_install`).
     install_method: Option<&'a str>,
@@ -2289,6 +2303,7 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         replace,
         ephemeral,
         overlay,
+        archive_replica,
         install_method,
         install_scope,
     } = opts;
@@ -2343,6 +2358,11 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
              for free) or remove the existing enrollment first.",
             target_path.display()
         );
+    }
+    // FR-90 P2h-1 — before the single-use token is spent, so a refusal
+    // leaves no device row behind.
+    if archive_replica {
+        roomlerd::archive_replica::preflight(existing.is_some(), ephemeral)?;
     }
     let machine_id = match &existing {
         Some(cfg) => {
@@ -2431,6 +2451,11 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // no privilege. Anything else is the explicit `org overlay` verb.
     if overlay {
         roomlerd::org_join::apply_overlay_flag(&mut cfg, &outcome);
+    }
+    // FR-90 P2h-1 — the archive replica's posture, before the first save. The
+    // preflight made this a fresh primary enrollment.
+    if archive_replica {
+        roomlerd::archive_replica::apply(&mut cfg);
     }
 
     config::save(&target_path, &cfg).map_err(|e| {

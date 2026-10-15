@@ -178,14 +178,54 @@ fn enabled() -> bool {
 }
 
 pub(super) use parent::Prompts;
+pub(crate) use parent::{viewing, viewing_ended};
+
+/// FR-93 P6g's button: end the session, as the companion banner's
+/// **Disconnect** does.
+const DISCONNECT: &str = "disconnect";
+
+/// FR-93 P6g kill switch `ROOMLERD_VIEWING_NOTICE=0`: a session the compositor
+/// says nothing about stays unseen at the screen, as before P6g.
+fn viewing_enabled() -> bool {
+    tunnel_core::env::flag("VIEWING_NOTICE", true)
+}
+
+/// FR-93 P6g — who is viewing the screen, whether they can type into it, and
+/// how to end it. Critical urgency, so it stays on screen for the session:
+/// with the DRM arm nothing else at the screen says so.
+fn viewing_request(controller: &str, permissions: &str) -> Request {
+    // Equality on the pipe-separated names, never a substring: a name that
+    // merely contains another is not that permission.
+    let input = permissions.split('|').any(|p| p.trim() == "INPUT");
+    let lead = if input {
+        format!("{controller} is viewing this screen and can use its keyboard and mouse.")
+    } else {
+        format!("{controller} is viewing this screen.")
+    };
+    Request {
+        summary: "This screen is being viewed".to_string(),
+        body: format!("{lead}\nDisconnect ends the session."),
+        actions: vec![
+            (DEFAULT.to_string(), "Show".to_string()),
+            (DISCONNECT.to_string(), "Disconnect".to_string()),
+        ],
+        urgency: 2,
+        // A backstop: the session's end takes it down first.
+        lifetime_ms: 24 * 3600 * 1000,
+    }
+}
 
 mod parent {
-    use super::{Said, consent_answer, consent_request, enabled, parse};
+    use super::{
+        DISCONNECT, Request, Said, consent_answer, consent_request, enabled, parse,
+        viewing_enabled, viewing_request,
+    };
     use crate::indicator::{ConsentSender, PromptView};
+    use bson::oid::ObjectId;
     use std::collections::HashMap;
     use std::io::{BufRead, Write};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
 
     /// How long posting may take: a session bus round trip or three. A wedged
@@ -224,125 +264,47 @@ mod parent {
             if view.expires_at <= now {
                 return false;
             }
-            let req = consent_request(view, now);
-            use crate::capture::portal::helper::{SpawnError, spawn_child};
-            let mut child = match spawn_child(&["--notify"], true) {
-                Ok(c) => c,
-                Err(SpawnError::NoSession) => {
-                    tracing::info!("no notification prompt: no graphical session (FR-93 P6f)");
-                    return false;
-                }
-                Err(SpawnError::Other(why)) => {
-                    tracing::warn!(%why, "no notification prompt (FR-93 P6f)");
-                    return false;
-                }
-            };
-            let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            };
-            let line = match serde_json::to_string(&req) {
-                Ok(l) => l,
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return false;
-                }
-            };
-            // The request, and then nothing: stdin stays open, and its close
-            // is the daemon's "take it down".
-            if writeln!(stdin, "{line}")
-                .and_then(|_| stdin.flush())
-                .is_err()
-            {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-
             static NEXT: AtomicU64 = AtomicU64::new(1);
             let generation = NEXT.fetch_add(1, Ordering::Relaxed);
             let session = view.session_hex.clone();
-            let (shown_tx, shown_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-            let pid = child.id();
             let tx = self.consent_tx.clone();
+            let mut answered = false;
+            let said_session = session.clone();
+            let on_said = move |said: &Said| {
+                let answer = consent_answer(said);
+                tracing::info!(
+                    session = %said_session, ?said, ?answer,
+                    "the person at the screen acted on the notification prompt (FR-93 P6f)"
+                );
+                if let Some(allow) = answer
+                    && !answered
+                {
+                    answered = true;
+                    // The reader's own thread, never the runtime's:
+                    // `blocking_send` is safe here.
+                    let _ = tx.blocking_send((said_session.clone(), allow));
+                }
+            };
             let live = self.live.clone();
-            let reader = std::thread::Builder::new()
-                .name("notify-prompt".into())
-                .spawn(move || {
-                    let mut shown = Some(shown_tx);
-                    let mut answered = false;
-                    for line in std::io::BufReader::new(stdout).lines() {
-                        let Ok(line) = line else { break };
-                        match parse(&line) {
-                            Some(Said::Shown) => {
-                                if let Some(s) = shown.take() {
-                                    let _ = s.send(Ok(()));
-                                }
-                            }
-                            Some(Said::Failed(why)) => {
-                                if let Some(s) = shown.take() {
-                                    let _ = s.send(Err(why));
-                                }
-                            }
-                            Some(said) => {
-                                let answer = consent_answer(&said);
-                                tracing::info!(
-                                    session = %session, ?said, ?answer,
-                                    "the person at the screen acted on the notification prompt (FR-93 P6f)"
-                                );
-                                if let Some(allow) = answer
-                                    && !answered
-                                {
-                                    answered = true;
-                                    // A plain thread, never the runtime's:
-                                    // `blocking_send` is safe here.
-                                    let _ = tx.blocking_send((session.clone(), allow));
-                                }
-                            }
-                            None => {}
-                        }
-                    }
-                    if let Some(s) = shown.take() {
-                        let _ = s.send(Err("the helper ended without posting it".into()));
-                    }
-                    // This question's entry only: a re-asked question under
-                    // the same id has its own.
-                    if let Ok(mut l) = live.lock()
-                        && l.get(&session).is_some_and(|(g, _)| *g == generation)
-                    {
-                        l.remove(&session);
-                    }
-                    let _ = child.wait();
-                });
-            if reader.is_err() {
-                // The child was moved into the closure that never ran; its
-                // stdin closing ends it.
-                return false;
-            }
-            match shown_rx.recv_timeout(SHOW_BUDGET) {
-                Ok(Ok(())) => {
+            let end_session = session.clone();
+            let on_end = move || {
+                // This question's entry only: a re-asked question under the
+                // same id has its own.
+                if let Ok(mut l) = live.lock()
+                    && l.get(&end_session).is_some_and(|(g, _)| *g == generation)
+                {
+                    l.remove(&end_session);
+                }
+            };
+            match launch(&consent_request(view, now), "prompt", on_said, on_end) {
+                Ok(stdin) => {
                     if let Ok(mut l) = self.live.lock() {
-                        l.insert(view.session_hex.clone(), (generation, stdin));
+                        l.insert(session, (generation, stdin));
                     }
                     true
                 }
-                Ok(Err(why)) => {
+                Err(why) => {
                     tracing::info!(%why, "no notification prompt (FR-93 P6f)");
-                    false
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "no notification prompt: the session helper did not post it within {} s (FR-93 P6f)",
-                        SHOW_BUDGET.as_secs()
-                    );
-                    // Not yet reaped (the reader waits on it), so the pid is
-                    // still this child's.
-                    // SAFETY: plain `kill(2)` on our own unreaped child.
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                    }
                     false
                 }
             }
@@ -356,6 +318,227 @@ mod parent {
                 l.remove(session_hex);
             }
         }
+    }
+
+    /// Post `req` from inside the person's session and wait, at most
+    /// [`SHOW_BUDGET`], for it to be up. What the person then does goes to
+    /// `on_said`, on the reader's own thread, and `on_end` runs once the helper
+    /// has gone. The returned stdin is the notification's life: dropping it
+    /// takes the notification down. Blocks, so callers run it off the runtime.
+    fn launch(
+        req: &Request,
+        what: &str,
+        mut on_said: impl FnMut(&Said) + Send + 'static,
+        on_end: impl FnOnce() + Send + 'static,
+    ) -> Result<std::process::ChildStdin, String> {
+        use crate::capture::portal::helper::{SpawnError, spawn_child};
+        let mut child = match spawn_child(&["--notify"], true) {
+            Ok(c) => c,
+            Err(SpawnError::NoSession) => return Err("no graphical session".into()),
+            Err(SpawnError::Other(why)) => return Err(why),
+        };
+        let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("the session helper has no pipes".into());
+        };
+        // The request, and then nothing: stdin stays open, and its close is
+        // the daemon's "take it down".
+        let written = serde_json::to_string(req)
+            .map_err(|e| e.to_string())
+            .and_then(|l| {
+                writeln!(stdin, "{l}")
+                    .and_then(|_| stdin.flush())
+                    .map_err(|e| e.to_string())
+            });
+        if let Err(e) = written {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("writing the request: {e}"));
+        }
+        let (shown_tx, shown_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let pid = child.id();
+        let reader = std::thread::Builder::new()
+            .name(format!("notify-{what}"))
+            .spawn(move || {
+                let mut shown = Some(shown_tx);
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    match parse(&line) {
+                        Some(Said::Shown) => {
+                            if let Some(s) = shown.take() {
+                                let _ = s.send(Ok(()));
+                            }
+                        }
+                        Some(Said::Failed(why)) => {
+                            if let Some(s) = shown.take() {
+                                let _ = s.send(Err(why));
+                            }
+                        }
+                        Some(said) => on_said(&said),
+                        None => {}
+                    }
+                }
+                if let Some(s) = shown.take() {
+                    let _ = s.send(Err("the helper ended without posting it".into()));
+                }
+                on_end();
+                let _ = child.wait();
+            });
+        if reader.is_err() {
+            // The child was moved into the closure that never ran; its stdin
+            // closing ends it.
+            return Err("no thread to read the session helper".into());
+        }
+        match shown_rx.recv_timeout(SHOW_BUDGET) {
+            Ok(Ok(())) => Ok(stdin),
+            Ok(Err(why)) => Err(why),
+            Err(_) => {
+                // Not yet reaped (the reader waits on it), so the pid is still
+                // this child's.
+                // SAFETY: plain `kill(2)` on our own unreaped child.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+                Err(format!(
+                    "the session helper did not post it within {} s",
+                    SHOW_BUDGET.as_secs()
+                ))
+            }
+        }
+    }
+
+    /// FR-93 P6g — what the daemon has put up to say a session is viewed.
+    enum Viewing {
+        /// Being put up: the companion asked first, then the notification.
+        Pending,
+        /// The companion runs, and its banner lists every live session.
+        Companion,
+        /// The notification is up; dropping this takes it down.
+        Live(std::process::ChildStdin),
+        /// The person closed it: not posted again for this session.
+        Closed,
+    }
+
+    /// How long a being-viewed notice waits for its session to be registered:
+    /// 60 × 500 ms. A session still unregistered after that never connected.
+    const REGISTERED_POLLS: u32 = 60;
+    const REGISTERED_POLL: Duration = Duration::from_millis(500);
+
+    fn viewings() -> &'static Mutex<HashMap<ObjectId, Viewing>> {
+        static V: OnceLock<Mutex<HashMap<ObjectId, Viewing>>> = OnceLock::new();
+        V.get_or_init(Default::default)
+    }
+
+    fn with_viewings<T>(f: impl FnOnce(&mut HashMap<ObjectId, Viewing>) -> T) -> T {
+        f(&mut viewings().lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// FR-93 P6g — `session` is served by an arm the compositor shows nothing
+    /// for: DRM reads the scanout below it, so neither GNOME's pill nor KDE's
+    /// tray icon appears, and the person at the screen could be watched with
+    /// nothing saying so. Say it: the companion's banner where a companion can
+    /// run (it lists every live session), else a notification naming the
+    /// controller, with **Disconnect**. Once per session; called on the runtime.
+    pub(crate) fn viewing(session: ObjectId, registry: crate::rc_sessions::RcSessionRegistry) {
+        if !viewing_enabled() {
+            return;
+        }
+        let first = with_viewings(|v| {
+            if v.contains_key(&session) {
+                return false;
+            }
+            v.insert(session, Viewing::Pending);
+            true
+        });
+        if !first {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            with_viewings(|v| v.remove(&session));
+            return;
+        };
+        rt.spawn(async move {
+            if crate::companion::ensure_running().await {
+                tracing::info!(%session, "being viewed: the companion's banner says so (FR-93 P6g)");
+                with_viewings(|v| {
+                    if matches!(v.get(&session), Some(Viewing::Pending)) {
+                        v.insert(session, Viewing::Companion);
+                    }
+                });
+                return;
+            }
+            // The pump opens its capture as the peer is built, a moment before
+            // the session is registered (once its answer is ready): wait for
+            // that, and never for a session that does not get there. Measured
+            // in the lab: the first build looked once, too early, and showed
+            // nothing.
+            let hex = session.to_hex();
+            let mut found = None;
+            for _ in 0..REGISTERED_POLLS {
+                found = registry.list().into_iter().find(|i| i.session_id == hex);
+                if found.is_some() || !with_viewings(|v| v.contains_key(&session)) {
+                    break;
+                }
+                tokio::time::sleep(REGISTERED_POLL).await;
+            }
+            let Some(info) = found else {
+                tracing::info!(%session, "no being-viewed notification: the session never got to be registered (FR-93 P6g)");
+                with_viewings(|v| v.remove(&session));
+                return;
+            };
+            let req = viewing_request(&info.controller_name, &info.permissions);
+            let closed = Arc::new(AtomicBool::new(false));
+            let (closed_said, closed_end) = (closed.clone(), closed);
+            let on_said = move |said: &Said| match said {
+                Said::Action(k) if k == DISCONNECT => {
+                    let ended = registry.disconnect(&session);
+                    tracing::info!(%session, ended, "the person at the screen pressed Disconnect on the being-viewed notification (FR-93 P6g)");
+                }
+                Said::Closed(2) => closed_said.store(true, Ordering::Relaxed),
+                _ => {}
+            };
+            let on_end = move || {
+                // Ended by the person's close: remembered, so a reopen of the
+                // capture does not put it back. Any other end leaves the entry
+                // to `viewing_ended`.
+                if closed_end.load(Ordering::Relaxed) {
+                    with_viewings(|v| {
+                        if v.contains_key(&session) {
+                            v.insert(session, Viewing::Closed);
+                        }
+                    });
+                }
+            };
+            let posted =
+                tokio::task::spawn_blocking(move || launch(&req, "viewing", on_said, on_end)).await;
+            match posted {
+                Ok(Ok(stdin)) => {
+                    tracing::info!(%session, "being viewed: a notification says so, with Disconnect (FR-93 P6g)");
+                    // A session that ended while it was being posted drops it
+                    // here, which takes the notification down at once.
+                    with_viewings(|v| {
+                        if matches!(v.get(&session), Some(Viewing::Pending)) {
+                            v.insert(session, Viewing::Live(stdin));
+                        }
+                    });
+                }
+                Ok(Err(why)) => {
+                    tracing::info!(%session, %why, "no being-viewed notification (FR-93 P6g)");
+                    with_viewings(|v| v.remove(&session));
+                }
+                Err(e) => {
+                    tracing::warn!(%session, %e, "no being-viewed notification (FR-93 P6g)");
+                    with_viewings(|v| v.remove(&session));
+                }
+            }
+        });
+    }
+
+    /// FR-93 P6g — `session` ended: its notification, if one is up, comes
+    /// down. Idempotent.
+    pub(crate) fn viewing_ended(session: &ObjectId) {
+        with_viewings(|v| v.remove(session));
     }
 }
 
@@ -613,6 +796,37 @@ mod tests {
             consent_request(&exec, now).body,
             "Alice is requesting to control this device.\nuname -a\n\
              Unanswered, it is refused in 30 seconds."
+        );
+    }
+
+    /// FR-93 P6g — the being-viewed notice names the controller and whether
+    /// they can type, by permission name, and has Disconnect.
+    #[test]
+    fn the_viewing_notice_names_who_and_what() {
+        let r = viewing_request("Alice", "VIEW|INPUT|CLIPBOARD");
+        assert_eq!(r.summary, "This screen is being viewed");
+        assert_eq!(
+            r.body,
+            "Alice is viewing this screen and can use its keyboard and mouse.\n\
+             Disconnect ends the session."
+        );
+        assert_eq!(
+            r.actions,
+            vec![
+                ("default".to_string(), "Show".to_string()),
+                ("disconnect".to_string(), "Disconnect".to_string())
+            ]
+        );
+        assert_eq!(r.urgency, 2);
+        assert_eq!(
+            viewing_request("Bob", "VIEW").body,
+            "Bob is viewing this screen.\nDisconnect ends the session."
+        );
+        // ⚠️ equality, never a substring: a name that merely contains INPUT
+        // grants no input.
+        assert_eq!(
+            viewing_request("Eve", "VIEW|INPUT_LOG").body,
+            "Eve is viewing this screen.\nDisconnect ends the session."
         );
     }
 

@@ -305,6 +305,12 @@ impl ViewerIndicator {
     /// "recording" while a recording runs: the banner (native and listed)
     /// stays, marked reconnecting, until [`Self::end_recording`].
     pub fn hide_session(&self, session_id: String) {
+        // FR-93 P6g — a being-viewed notification comes down with its session,
+        // a recording's grace or not: nobody is viewing any more.
+        #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+        if let Ok(oid) = bson::oid::ObjectId::parse_str(&session_id) {
+            notify::viewing_ended(&oid);
+        }
         if let Ok(oid) = bson::oid::ObjectId::parse_str(&session_id) {
             let recording = self
                 .recordings

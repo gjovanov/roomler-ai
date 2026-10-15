@@ -18,7 +18,8 @@ layer, on one identity and one server you can host yourself.
 
 Any machine you enroll becomes reachable as a **live screen in a browser tab**.
 There is nothing to install on the viewing side — the controller is a plain
-Chromium browser. Video is hardware-encoded where the hardware allows
+browser, best in Chrome, Edge or another Chromium browser, and Safari and Firefox
+work too. Video is hardware-encoded where the hardware allows
 (H.264, HEVC, AV1, VP9), input is injected on the far end, and clipboard and
 file transfer ride their own data channels.
 
@@ -56,7 +57,7 @@ the product's behaviour.
 | **The agent** (`roomlerd`) | A native binary — the remote-desktop target, the mesh node, the tunnel endpoint, the SSH server | Every machine you enroll |
 | **The CLI** (`roomler`) | Status, peers, tunnels, exec, ssh, diagnostics | Same machine, alongside the agent |
 | **The server** | Accounts, device registry, signalling, coordination, chat and the conferencing SFU | Roomler's cloud, or your own |
-| **The controller** | Any Chromium browser | Wherever you happen to be |
+| **The controller** | A browser (Chromium browsers work best; Safari and Firefox work too) | Wherever you happen to be |
 
 ## What it is *not*
 

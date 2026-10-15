@@ -136,7 +136,7 @@ docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d
 
 ### 1 · Desktop sharing and remote control
 
-Any machine you enroll becomes reachable as a **live screen in a browser tab**. There is nothing to install on the viewing side — the controller is a plain Chromium browser. Video is hardware-encoded where the hardware allows (H.264, HEVC, AV1, VP9), input is injected on the far end, and clipboard and file transfer ride their own data channels.
+Any machine you enroll becomes reachable as a **live screen in a browser tab**. There is nothing to install on the viewing side — the controller is a plain browser (Chromium-based ones work best). Video is hardware-encoded where the hardware allows (H.264, HEVC, AV1, VP9), input is injected on the far end, and clipboard and file transfer ride their own data channels.
 
 ### 2 · Your own private network
 
