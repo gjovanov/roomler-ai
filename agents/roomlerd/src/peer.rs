@@ -2435,6 +2435,9 @@ async fn media_pump(
     if let Some(reason) = capturer.unavailable() {
         spawn_capture_unavailable_notice(session_id, control_dc.clone(), reason.clone());
     }
+    // FR-93 P6g — and an arm the compositor shows nothing for still says, at
+    // the screen, who is viewing it.
+    tell_the_screen(session_id, capturer.arm(), &rc_sessions);
     // FR-93 P1 — and what its input will reach. After the capture opened: a
     // portal capture registers its input route as it opens.
     spawn_input_reach_notice(session_id, control_dc.clone());
@@ -3544,6 +3547,9 @@ async fn media_pump_vp9_444_dc(
     if let Some(reason) = capturer.unavailable() {
         spawn_capture_unavailable_notice(session_id, control_dc.clone(), reason.clone());
     }
+    // FR-93 P6g — and an arm the compositor shows nothing for still says, at
+    // the screen, who is viewing it.
+    tell_the_screen(session_id, capturer.arm(), &rc_sessions);
     // FR-93 P1 — and what its input will reach. After the capture opened: a
     // portal capture registers its input route as it opens.
     spawn_input_reach_notice(session_id, control_dc.clone());
@@ -5084,6 +5090,29 @@ fn spawn_capture_unavailable_notice(
     });
 }
 
+/// FR-93 P6g — a session served by an arm the compositor shows nothing for
+/// says so at the screen. The DRM arm reads the scanout below GNOME and KDE, so
+/// neither raises its screen-sharing indicator: the companion's banner, or a
+/// notification with **Disconnect**, takes its place
+/// ([`crate::indicator::notify::viewing`]). Called once per pump, after its
+/// first open: a reopen keeps its arm.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn tell_the_screen(
+    session_id: bson::oid::ObjectId,
+    arm: Option<crate::capture::CaptureArm>,
+    rc_sessions: &crate::rc_sessions::RcSessionRegistry,
+) {
+    #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+    if arm == Some(crate::capture::CaptureArm::Drm) {
+        crate::indicator::notify::viewing(session_id, rc_sessions.clone());
+    }
+    #[cfg(not(all(target_os = "linux", feature = "portal-capture")))]
+    let _ = (session_id, arm, rc_sessions);
+}
+
 /// FR-93 P2d-2 — `rc:media-waiting`: this session's capture is waiting for the
 /// person at the screen to answer a dialog (the desktop portal's "share your
 /// screen"), and the dialog gives up in `waits_ms`. Without it the viewer saw
@@ -5875,6 +5904,9 @@ async fn media_pump_ffmpeg_dc(
     if let Some(reason) = capturer.unavailable() {
         spawn_capture_unavailable_notice(session_id, control_dc.clone(), reason.clone());
     }
+    // FR-93 P6g — and an arm the compositor shows nothing for still says, at
+    // the screen, who is viewing it.
+    tell_the_screen(session_id, capturer.arm(), &rc_sessions);
     // FR-93 P1 — and what its input will reach. After the capture opened: a
     // portal capture registers its input route as it opens.
     spawn_input_reach_notice(session_id, control_dc.clone());

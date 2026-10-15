@@ -134,7 +134,7 @@ prompt surfaces are FR-27's chain ([`remote-control.md`](remote-control.md)
 | GNOME, per-user | the daemon's own panel, through Xwayland. Until P6a (0.4.137) it stayed on screen after the answer | GNOME's screen-sharing pill in the top bar; the companion's banner if it runs |
 | KDE, per-user | the same panel, through KWin's Xwayland | KDE's tray indicator; the companion's banner if it runs |
 | GNOME, system | the companion's window; with no companion, GNOME's own notification banner with **Approve** and **Deny** (P6f) | the companion's *Being viewed by …* banner, with **Disconnect** (a centred window: Wayland lets no client place itself) |
-| KDE, system | the companion's window, from its `.rpm` (P6d, the lab); with no companion, KDE's own notification with **Approve** and **Deny** (P6f, the lab). Before them **none**: Fedora had no companion package, and the viewer waited | the companion's *Being viewed by …* banner, with **Disconnect**; **nothing** with DRM capture and no companion, which reads below the compositor |
+| KDE, system | the companion's window, from its `.rpm` (P6d, the lab); with no companion, KDE's own notification with **Approve** and **Deny** (P6f, the lab). Before them **none**: Fedora had no companion package, and the viewer waited | the companion's *Being viewed by …* banner, with **Disconnect**, which a DRM session starts by itself; with no companion, a notification with **Disconnect** (P6g). Before P6g **nothing** with DRM capture, which reads below the compositor |
 
 A per-user daemon whose own panel cannot open (no Xwayland) starts the
 companion for the prompt from P6b, through the user's own systemd manager. On
@@ -203,3 +203,4 @@ ones that decide this page:
 | — | `ROOMLERD_SESSION_WATCH` | on | the user-switch notice (`session_away`); off = the last frame stays, with no reason |
 | — | `ROOMLERD_SLEEP_NOTICE` | on | the sleep notice (`host_sleep`) and the logind delay inhibitor that gives it time; off = a sleeping computer says nothing, as before P5h |
 | — | `ROOMLERD_NOTIFY_CONSENT` | on | a consent question no panel or companion can show goes to the desktop's notification (P6f); off = `no_prompt_surface` there, as before |
+| — | `ROOMLERD_VIEWING_NOTICE` | on | a session on the DRM arm, which no compositor indicator shows, starts the companion, else posts a being-viewed notification with Disconnect (P6g); off = nothing at the screen, as before |
