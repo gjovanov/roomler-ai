@@ -938,7 +938,18 @@ pub fn weekly_blocks(doc: &DigestDoc, s: &WeeklySections) -> Vec<Block> {
                 .unwrap_or("not mounted"),
         ),
     ));
-    out.push(Line("Paid".into(), not_measured(&f.steps.paid)));
+    // P4 — paid as of now, no window; `None` where billing is not on
+    // record (the funnel names why).
+    out.push(Line(
+        "Paid (so far)".into(),
+        opt_step(
+            &f.steps.paid,
+            f.not_measured
+                .get("paid")
+                .map(String::as_str)
+                .unwrap_or("billing not on record"),
+        ),
+    ));
     if let Some(p) = &f.time_to_value.first_device {
         out.push(Line(
             "Sign-up → first device".into(),
@@ -1704,7 +1715,7 @@ mod tests {
     #[test]
     fn the_weekly_roll_up_renders_its_baselines_and_keeps_every_n() {
         use super::super::{
-            campaigns::{CampaignsReport, PullSummary, Rates, Totals},
+            campaigns::{CampaignsReport, PullSummary, Totals},
             channels::ChannelsReport,
             cohorts::{CohortsReport, OrgDailyCoverage, WaoWeek},
             digest::Coverage,
@@ -1763,7 +1774,7 @@ mod tests {
                         settled: 40,
                     }),
                     first_value: None,
-                    paid: NotMeasured::later("paid", "P4"),
+                    paid: None,
                 },
                 time_to_value: TimeToValue {
                     first_device: None,
@@ -1874,11 +1885,6 @@ mod tests {
                 cleared: vec![],
                 open: vec![],
             }),
-        };
-        let _ = Rates {
-            signup_per_visitor: None,
-            activation: None,
-            first_value: None,
         };
         let text = render_weekly_text(&doc, &s);
         assert!(

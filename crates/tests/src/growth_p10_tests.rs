@@ -259,11 +259,20 @@ async fn ac20_a_read_key_reads_what_the_admin_reads_and_never_writes() {
         "/api/admin/growth/revenue?since=2026-01&until=2026-03".to_string(),
     ];
     for path in &views {
-        let (s_admin, admin) = get_json(&app, path, &token).await;
+        let (s_admin, mut admin) = get_json(&app, path, &token).await;
         assert_eq!(s_admin, 200, "admin on {path}: {admin}");
         let (s_key, key_text) = with_key(&app, "GET", path, Some(&read_key), None).await;
         assert_eq!(s_key, 200, "read key on {path}: {key_text}");
-        let key_json: Value = serde_json::from_str(&key_text).unwrap();
+        let mut key_json: Value = serde_json::from_str(&key_text).unwrap();
+        // P4's revenue report stamps the instant it was computed (`as_of`,
+        // "now" for the MRR): two calls a few ms apart differ there and
+        // nowhere else — the numbers are compared with the stamp set aside.
+        if path.contains("/revenue") {
+            for v in [&mut admin, &mut key_json] {
+                let stamp = v.as_object_mut().unwrap().remove("as_of");
+                assert!(stamp.is_some_and(|s| s.is_string()), "{path}: no as_of");
+            }
+        }
         assert_eq!(admin, key_json, "the same numbers on {path}");
     }
     // The digest it read is a real one, not an empty answer.
@@ -704,8 +713,15 @@ async fn alerts_fire_once_clear_and_mail_at_most_once_a_day() {
         s.growth.digest_enabled = true;
     })
     .await;
-    let now = DateTime::now();
-    let yesterday = today() - Duration::days(1);
+    // The rules are evaluated on a clock three days back, and every day
+    // seeded or asserted on derives from it: with `digest_enabled` on, the
+    // host's digest scheduler runs inside this app, and on a slow box its
+    // first tick (two minutes in) could compute REAL yesterday before the
+    // first evaluation — a day this test never touches on the shifted
+    // clock, so the scheduler can neither pre-empt `digest_missing` nor
+    // own the day whose digest is read below.
+    let now = DateTime::from_millis(DateTime::now().timestamp_millis() - 3 * 86_400_000);
+    let yesterday = roomler_ai_api::growth::org_daily::parse_day_of(now) - Duration::days(1);
     // A spike: 40 sign-ups over the 28 days before yesterday (mean 1.43,
     // the band's edge 5.0), and 6 yesterday.
     for age in 1..=20 {
@@ -794,7 +810,7 @@ async fn alerts_fire_once_clear_and_mail_at_most_once_a_day() {
     assert_eq!(count(&app, GROWTH_ALERTS, doc! {}).await, 3);
 
     // The same hour again: the same three open rows, nothing new, no mail.
-    let ev2 = alerts::evaluate(&app.state, Some(&mailer), false, DateTime::now())
+    let ev2 = alerts::evaluate(&app.state, Some(&mailer), false, now)
         .await
         .unwrap();
     assert!(ev2.fired.is_empty() && ev2.cleared.is_empty(), "{ev2:?}");
@@ -847,7 +863,7 @@ async fn alerts_fire_once_clear_and_mail_at_most_once_a_day() {
         )
         .await
         .unwrap();
-    let ev3 = alerts::evaluate(&app.state, Some(&mailer), false, DateTime::now())
+    let ev3 = alerts::evaluate(&app.state, Some(&mailer), false, now)
         .await
         .unwrap();
     let cleared: Vec<(String, String)> = ev3
@@ -886,7 +902,7 @@ async fn alerts_fire_once_clear_and_mail_at_most_once_a_day() {
         )
         .await
         .unwrap();
-    let ev4 = alerts::evaluate(&app.state, Some(&mailer), false, DateTime::now())
+    let ev4 = alerts::evaluate(&app.state, Some(&mailer), false, now)
         .await
         .unwrap();
     assert_eq!(
@@ -908,8 +924,9 @@ async fn alerts_fire_once_clear_and_mail_at_most_once_a_day() {
         2
     );
 
-    // The digest's alerts section: the open rows at the compute, and the
-    // rows fired that day (none fired yesterday).
+    // The digest's alerts section: the open rows at the compute (the three
+    // still open, fired after the due day closed), and the rows fired or
+    // cleared inside the due day itself (none: everything fired at `now`).
     let d = DigestStore::new(&app.db)
         .get(&ds(due))
         .await

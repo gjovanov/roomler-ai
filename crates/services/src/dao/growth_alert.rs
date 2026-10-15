@@ -175,15 +175,18 @@ impl GrowthAlertDao {
             .await?)
     }
 
-    /// The rows fired or cleared inside `[from, to)` plus the ones open at
-    /// `to` — what a digest of that window reports.
+    /// The rows fired or cleared inside `[from, to)` plus the ones open NOW
+    /// — what a digest of that window reports: the window's events, and
+    /// what is still open at the compute (a rule that fired this morning
+    /// about yesterday belongs in yesterday's digest, computed this
+    /// morning).
     pub async fn list_window(&self, from: DateTime, to: DateTime) -> DaoResult<Vec<GrowthAlert>> {
         Ok(self
             .coll()
             .find(doc! { "$or": [
                 { "fired_at": { "$gte": from, "$lt": to } },
                 { "cleared_at": { "$gte": from, "$lt": to } },
-                { "fired_at": { "$lt": to }, "cleared_at": bson::Bson::Null },
+                { "cleared_at": bson::Bson::Null },
             ] })
             .sort(doc! { "fired_at": -1 })
             .limit(MAX_LISTED)
