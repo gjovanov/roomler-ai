@@ -708,7 +708,8 @@ async fn run_cell(cell: Cell) -> Result<Run> {
         tx,
         EncoderPreference::Software,
         "h264".into(),
-        None, // the RTP track, as a browser without a DC cell gets
+        "h264".into(), // the RTP track's codec: on the RTP transport, the pump's
+        None,          // the RTP track, as a browser without a DC cell gets
         None,
         false,
         false,

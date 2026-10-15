@@ -3418,6 +3418,12 @@ async fn handle_server_msg(
             // older controllers / sessions that arrived without
             // preferred_transport.
             let negotiated_transport = pending_transports.remove(&session_id).unwrap_or(None);
+            // #2231 — the RTP video track's codec, read from this offer: on a
+            // DataChannel transport it moves to VP8 when the browser cannot
+            // take the pump's codec, so the answer does not fail on a track
+            // that will never carry a frame.
+            let track_codec =
+                crate::peer::rtp_track_codec(&chosen_codec, negotiated_transport.as_deref(), &sdp);
             // rc.62 — pull the per-session chroma override stashed by
             // the Request handler. `None` → AgentPeer falls back to
             // `ROOMLERD_VP9_CHROMA` env-var default.
@@ -3471,6 +3477,7 @@ async fn handle_server_msg(
                 delegated.unwrap_or(outbound_tx).clone(),
                 encoder_preference,
                 chosen_codec,
+                track_codec,
                 negotiated_transport,
                 chroma_pref,
                 chunk_framing,
