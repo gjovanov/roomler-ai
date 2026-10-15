@@ -49,6 +49,15 @@
       </v-container>
     </section>
 
+    <!-- FR-88 P3: the video tour, as on the static homepage. -->
+    <section id="video" class="py-8 py-md-12">
+      <v-container style="max-width: 920px">
+        <h2 class="text-h4 text-md-h3 text-center font-weight-bold mb-2">{{ VIDEO_TOUR.title }}</h2>
+        <p class="text-center text-body-1 landing-muted mb-6">{{ VIDEO_TOUR.lead }}</p>
+        <VideoFacade :video-id="FEATURED_VIDEO_ID" :poster="videoTourPoster" />
+      </v-container>
+    </section>
+
     <!-- Pillars -->
     <section id="features" class="features-section py-8 py-md-16">
       <v-container>
@@ -209,7 +218,10 @@ import NewsletterPrompt from '@/components/landing/NewsletterPrompt.vue'
 import StayInTouch from '@/components/landing/StayInTouch.vue'
 import { BRAND_LOGO_LIGHT } from '@/composables/useBrand'
 import { enrollCommands } from '@/utils/enrollCommands'
-import { CAPABILITIES, CTA, DOWNLOAD, FALLBACK_PLANS, HERO, PILLARS, PRICING, type Plan } from '@/utils/landing'
+import { CAPABILITIES, CTA, DOWNLOAD, FALLBACK_PLANS, HERO, PILLARS, PRICING, VIDEO_TOUR, type Plan } from '@/utils/landing'
+import { FEATURED_VIDEO_ID } from '@/utils/videos'
+import VideoFacade from '@/components/common/VideoFacade.vue'
+import videoTourPoster from '@/assets/tutorial/video-C1YdfmhbAKM.jpg'
 
 const route = useRoute()
 

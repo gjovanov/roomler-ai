@@ -23,11 +23,15 @@
  *   :::cards     a markdown list -> the landing page's feature-card grid
  *   :::badges    a markdown list -> the tutorial's badge row
  *   :::steps     a markdown ordered list -> the tutorial's numbered steps
+ *   :::video <id>  a click-to-load YouTube facade (FR-88 P3); the body, if
+ *                  any, is its caption. The id must be in ui/src/utils/videos.ts
  */
 import MarkdownIt from 'markdown-it'
 import type { Token } from 'markdown-it/index.js'
 import { icon, OS_ICON, OS_LABEL } from './icons.ts'
 import { enrollCommands, type EnrollOs } from '../../src/utils/enrollCommands.ts'
+import { videoById, type SiteVideo } from '../../src/utils/videos.ts'
+import { videoFacade } from './video.ts'
 import { SITE_ORIGIN } from '../site.ts'
 
 export interface Heading {
@@ -36,9 +40,18 @@ export interface Heading {
   slug: string
 }
 
+/** A video the page embeds, with its published poster (null when the
+ *  renderer has no image hook, as in most unit tests). */
+export interface PageVideo {
+  video: SiteVideo
+  poster: ResolvedImage | null
+}
+
 export interface RenderResult {
   html: string
   headings: Heading[]
+  /** Every `:::video` on the page, in order: the layout's structured data. */
+  videos: PageVideo[]
 }
 
 /** What an image resolves to once the build has published it. */
@@ -199,6 +212,7 @@ interface PrePassCtx {
   filePath: string
   groupSeq: { n: number }
   env: RenderEnv
+  videos: PageVideo[]
 }
 
 /** An opening code fence: three or more backticks or tildes. */
@@ -437,10 +451,24 @@ function prePass(ctx: PrePassCtx, src: string, level = 1): string {
       case 'steps':
         out.push(htmlBlock('<div class="doc-steps">', prePass(ctx, body, level), '</div>'))
         break
+      case 'video': {
+        // A build gate (FR-60's rule): an id the manifest does not hold fails
+        // the build, so a typo never ships a player of somebody else's video.
+        const video = videoById(arg)
+        if (!video) {
+          report(ctx.env, `\`:::video ${arg}\` is not in ui/src/utils/videos.ts. Add the video there first (a public one only).`)
+          break
+        }
+        const poster = ctx.env.resolveImage ? ctx.env.resolveImage(video.poster) : null
+        ctx.videos.push({ video, poster })
+        const caption = body.trim() ? ctx.md.renderInline(body.trim()) : undefined
+        out.push('', videoFacade(video, poster, caption), '')
+        break
+      }
       default:
         throw new Error(
           `${ctx.filePath} — unknown container \`:::${kind}\`. ` +
-            `Known: note, tip, warning, danger, os, enroll, cards, badges, steps.`,
+            `Known: note, tip, warning, danger, os, enroll, cards, badges, steps, video.`,
         )
     }
   }
@@ -598,11 +626,11 @@ export function renderMarkdown(
 ): RenderResult {
   const env: RenderEnv = { filePath, ...hooks }
   checkRawImages(md, source, env)
-  const ctx: PrePassCtx = { md, filePath, groupSeq: { n: 0 }, env }
+  const ctx: PrePassCtx = { md, filePath, groupSeq: { n: 0 }, env, videos: [] }
   const expanded = prePass(ctx, source)
   const tokens = md.parse(expanded, env)
   const headings = anchorHeadings(tokens)
-  return { html: md.renderer.render(tokens, md.options, env), headings }
+  return { html: md.renderer.render(tokens, md.options, env), headings, videos: ctx.videos }
 }
 
 export { escapeHtml }

@@ -494,6 +494,22 @@ html[data-os="linux"]   .os-tablist > .os-tab[data-os="linux"] {
 
 .tag-cloud { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 2em; padding: 0; list-style: none; }
 
+/* FR-88 (#1790) P3 — the click-to-load video facade (theme/video.ts): our own
+   poster under a play button; docs.js swaps in the youtube-nocookie player. */
+.video-facade { margin: 1.6em 0; }
+.video-facade__link,
+.video-facade__player { position: relative; display: block; width: 100%; aspect-ratio: 16 / 9; border: 0; border-radius: var(--radius-lg); overflow: hidden; background: var(--code-bg); box-shadow: var(--shadow-card); }
+.video-facade__link:hover { text-decoration: none; }
+.video-facade__poster { display: block; width: 100%; height: 100%; object-fit: cover; }
+.video-facade__play { position: absolute; left: 50%; top: 50%; width: 76px; height: 76px; margin: -38px 0 0 -38px; display: flex; align-items: center; justify-content: center; padding-left: 5px; border-radius: 50%; background: var(--teal); color: #fff; box-shadow: 0 8px 28px rgba(26, 26, 46, .35); transition: transform .15s ease, background-color .15s ease; }
+.video-facade__link:hover .video-facade__play,
+.video-facade__link:focus-visible .video-facade__play { transform: scale(1.08); background: var(--teal-deep); }
+.video-facade__link:focus-visible { outline: 3px solid var(--teal); outline-offset: 3px; }
+.video-facade__time { position: absolute; right: 12px; bottom: 12px; padding: 2px 8px; border-radius: 6px; background: rgba(0, 0, 0, .78); color: #fff; font-size: .8rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.video-facade__caption { margin-top: .6em; font-size: .92rem; color: var(--ink-muted); }
+.video-facade__note { display: block; font-size: .8rem; color: var(--ink-faint); }
+@media (prefers-reduced-motion: reduce) { .video-facade__play { transition: none; } }
+
 @media print {
   .topbar, .sidebar, .toc-rail, .pager, .search-dialog, .site-footer { display: none !important; }
   .layout { display: block; }

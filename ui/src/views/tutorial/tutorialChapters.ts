@@ -15,6 +15,8 @@ import stepAcl from '@/assets/tutorial/step-acl.svg'
 import stepMagicDns from '@/assets/tutorial/step-magicdns.svg'
 import stepCall from '@/assets/tutorial/step-call.svg'
 import stepRooms from '@/assets/tutorial/step-rooms.svg'
+import videoTourPoster from '@/assets/tutorial/video-C1YdfmhbAKM.jpg'
+import { FEATURED_VIDEO_ID } from '@/utils/videos'
 
 /**
  * FR-12 (#788) — the tour's content, kept OUT of the view so it stays
@@ -64,6 +66,9 @@ export interface TutorialChapter {
   chips?: string[]
   hero?: string
   heroAlt?: string
+  /** FR-88 P3 — a click-to-load video (an id from `@/utils/videos` and its
+   *  poster), drawn by `VideoFacade.vue` above the hero. */
+  video?: { id: string; poster: string; caption?: string }
   lead: string
   /** The decorated three-bullet promise. */
   badges?: TutorialBadge[]
@@ -103,6 +108,12 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
       'MagicDNS',
       'Chat & video included',
     ],
+    video: {
+      id: FEATURED_VIDEO_ID,
+      poster: videoTourPoster,
+      caption:
+        'A 9-minute tour: installing the agent on Windows, macOS and Linux, connecting from a browser tab, and how it compares with TeamViewer and AnyDesk.',
+    },
     hero: heroMesh,
     heroAlt:
       'Machines joined in a direct encrypted mesh with stable private addresses, crossing NATs and firewalls',
