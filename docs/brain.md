@@ -110,7 +110,7 @@ fact, an edit, an archive ([`brain.rs:503`](../crates/modules/hive/src/brain.rs#
 A refusal raises nothing.
 
 A session pins the revision when it is created. The start route renders the
-session's snapshot there and then ([`routes.rs:487`](../crates/modules/hive/src/routes.rs#L487),
+session's snapshot there and then ([`routes.rs:491`](../crates/modules/hive/src/routes.rs#L491),
 [`brain.rs:641`](../crates/modules/hive/src/brain.rs#L641) `snapshot`), stores it in
 `hive_session_memory` by session, kept a day, and records `brain_rev` on the
 session's record.
@@ -168,7 +168,7 @@ a start.
 
 | Rule | Why | Where |
 |---|---|---|
-| `rc:hive.memory` goes immediately before `rc:hive.start`, and before that start's re-send when the device reconnects, on the same socket, only to a device that advertises `hive-memory` | `rc:hive.start` stays metadata only, its field set locked, and one socket keeps the order | [`routes.rs:569`](../crates/modules/hive/src/routes.rs#L569), [`agent_socket.rs:1147`](../crates/modules/hive/src/agent_socket.rs#L1147) |
+| `rc:hive.memory` goes immediately before `rc:hive.start`, and before that start's re-send when the device reconnects, on the same socket, only to a device that advertises `hive-memory` | `rc:hive.start` stays metadata only, its field set locked, and one socket keeps the order | [`routes.rs:573`](../crates/modules/hive/src/routes.rs#L573), [`agent_socket.rs:1156`](../crates/modules/hive/src/agent_socket.rs#L1156) |
 | The device takes the frame only on its primary enrollment, drops a document over 32 KiB, keeps at most 64 waiting, each for 10 minutes, by (session, fence), and uses each once, for that start's launch | a snapshot is sent right before its start, so anything older or more is waiting for nothing | [`supervisor.rs:1435`](../agents/roomlerd/src/hive/supervisor.rs#L1435) |
 | ⚠️ `hive_core_memory`, a device key, is **off by default** and never pushable. Off, the frame arrives but no file is written, not even the daemon's own copy, and the transcript says so: "This start came with the organization's core memory (brain revision 1); this device shows none to its sessions (hive_core_memory is off)." | the gate that survives a compromised server, like `hive_accounts` (decision 9, §5 below) | [`supervisor.rs:3897`](../agents/roomlerd/src/hive/supervisor.rs#L3897), [`:4701`](../agents/roomlerd/src/hive/supervisor.rs#L4701) |
 | On, the daemon writes the files into its own runtime directory, `<runtime>/<session>/memory/` (`0755`, root's). Each is created afresh at `0600`, handed to the account through the open file, then renamed into place, and a document the snapshot does not carry is removed | the daemon never writes into a tree the account owns. No other local account reads a session's memory, whose `CLAUDE.md` carries the starter's own facts, and a file an earlier run left can never be copied for this one | [`supervisor.rs:4540`](../agents/roomlerd/src/hive/supervisor.rs#L4540) `write_memory` |
@@ -276,7 +276,7 @@ The whole run cost $0.24 in model calls.
 |---|---|
 | facts, budgets, revisions, snapshots, the routes | [`crates/modules/hive/src/brain.rs`](../crates/modules/hive/src/brain.rs): `reserve` `:376`, `recount` `:451`, `bump_rev` `:503`, `snapshot` `:641`, `may_write` `:785` |
 | the indexes: facts by instance, one counter per instance, snapshots with a one-day TTL | [`crates/modules/hive/src/lib.rs:303`](../crates/modules/hive/src/lib.rs#L303) |
-| the snapshot at a start, and its re-send | [`routes.rs:487`](../crates/modules/hive/src/routes.rs#L487), [`agent_socket.rs:1147`](../crates/modules/hive/src/agent_socket.rs#L1147) |
+| the snapshot at a start, and its re-send | [`routes.rs:491`](../crates/modules/hive/src/routes.rs#L491), [`agent_socket.rs:1156`](../crates/modules/hive/src/agent_socket.rs#L1156) |
 | the frame | `ServerMsg::HiveMemory` in [`signaling.rs:3551`](../crates/remote_control/src/signaling.rs#L3551); `MAX_CORE_MEMORY_BYTES` in [`hive.rs:63`](../crates/remote_control/src/hive.rs#L63); `RpcCap::HiveMemory` (`hive-memory`), matched by equality |
 | the device | [`supervisor.rs`](../agents/roomlerd/src/hive/supervisor.rs): `receive_memory` `:710`, the launch `:1751`, `write_memory` `:2273`, `memory_note` `:2348`; the copy in `WRAPPER` `:93` and, on Windows, [`hive_win.rs:677`](../agents/roomlerd/src/hive_win.rs#L677) `prep` |
 | the device's key | `hive_core_memory` in [`config.rs:446`](../crates/agent-core/src/config.rs#L446) |

@@ -698,6 +698,8 @@ impl AgentSessionDao {
             refusal: None,
             answered_at: None,
             tip: None,
+            purging: None,
+            forking: None,
         })?;
         self.base
             .update_one(
@@ -734,6 +736,44 @@ impl AgentSessionDao {
                     "$set": { "updated_at": DateTime::now() },
                 },
             )
+            .return_document(mongodb::options::ReturnDocument::Before)
+            .await?)
+    }
+
+    /// FR-90 P2g-4b — a fork's move ends once its target caught up (P2f-3c),
+    /// and the target is let go in the same write, its row naming `fork`,
+    /// the fork about to be made from its copy: a purge of that copy waits
+    /// while the fork may still need it. Only the promotion named, while it
+    /// is still joining, as [`Self::end_promotion`]; the record before.
+    pub async fn end_fork_joining(
+        &self,
+        id: ObjectId,
+        pid: ObjectId,
+        target: ObjectId,
+        fork: ObjectId,
+    ) -> DaoResult<Option<AgentSession>> {
+        Ok(self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! {
+                    "_id": id,
+                    "promotion.id": pid,
+                    "promotion.state": PromotionState::Joining.as_str(),
+                },
+                doc! {
+                    "$unset": { "promotion": "" },
+                    "$set": {
+                        "replicaset.members.$[t].state": MemberState::Leaving.as_str(),
+                        "replicaset.members.$[t].forking": fork,
+                        "updated_at": DateTime::now(),
+                    },
+                },
+            )
+            .array_filters(vec![doc! {
+                "t.device_id": target,
+                "t.role": { "$ne": MemberRole::Primary.as_str() },
+            }])
             .return_document(mongodb::options::ReturnDocument::Before)
             .await?)
     }
@@ -1322,7 +1362,9 @@ impl AgentSessionDao {
 
     /// FR-90 P2c-4 — a leaving member placement chooses again, in `role`:
     /// `pending`, so its join goes again, and the device answers it as it
-    /// answered the first (its store holds the membership already).
+    /// answered the first (its store holds the membership already). P2g-4b —
+    /// never one whose purge was issued: removal is final on the device, so
+    /// a join of it would be refused for ever.
     pub async fn rejoin(&self, id: ObjectId, device_id: ObjectId, role: &str) -> DaoResult<bool> {
         self.base
             .update_one(
@@ -1331,6 +1373,7 @@ impl AgentSessionDao {
                     "replicaset.members": { "$elemMatch": {
                         "device_id": device_id,
                         "state": MemberState::Leaving.as_str(),
+                        "purging": Bson::Null,
                     } },
                 },
                 doc! {
@@ -1344,6 +1387,82 @@ impl AgentSessionDao {
                     },
                 },
             )
+            .await
+    }
+
+    /// FR-90 P2g-4b — the purge `purge_id` of a leaving member's copy, now
+    /// issued, named on its row: in one compare-and-set that holds only while
+    /// the member is still leaving with no purge, never the primary, of a
+    /// session that is no tombstone, and names no fork but `forking` (one is
+    /// passed only for a device being removed, which was told to purge
+    /// everything). `false` = placement took it back, another purge took it,
+    /// a fork is being made from its copy, or the session was purged first:
+    /// the purge is to go.
+    pub async fn mark_purging(
+        &self,
+        id: ObjectId,
+        device_id: ObjectId,
+        purge_id: ObjectId,
+        forking: Option<ObjectId>,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "purged": Bson::Null,
+                    "replicaset.members": { "$elemMatch": {
+                        "device_id": device_id,
+                        "role": { "$ne": MemberRole::Primary.as_str() },
+                        "state": MemberState::Leaving.as_str(),
+                        "purging": Bson::Null,
+                        "forking": forking.map_or(Bson::Null, Bson::ObjectId),
+                    } },
+                },
+                doc! { "$set": { "replicaset.members.$.purging": purge_id } },
+            )
+            .await
+    }
+
+    /// FR-90 P2g-4b — a leaving member's purge is complete: its row goes,
+    /// only while it names that purge. `false` = no such row.
+    pub async fn drop_purged_member(
+        &self,
+        id: ObjectId,
+        device_id: ObjectId,
+        purge_id: ObjectId,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "replicaset.members": { "$elemMatch": {
+                        "device_id": device_id,
+                        "purging": purge_id,
+                    } },
+                },
+                doc! { "$pull": { "replicaset.members": {
+                    "device_id": device_id,
+                    "purging": purge_id,
+                } } },
+            )
+            .await
+    }
+
+    /// FR-90 P2g-4b — `id`, while it is live, no tombstone, and holds a
+    /// leaving member whose purge is still to issue: what a member's tip, which
+    /// may make `min` hold, looks for. A session with nothing to settle costs
+    /// one read by its id.
+    pub async fn with_leaving(&self, id: ObjectId) -> DaoResult<Option<AgentSession>> {
+        self.base
+            .find_one(doc! {
+                "_id": id,
+                "purged": Bson::Null,
+                "status": statuses(&SessionStatus::LIVE),
+                "replicaset.members": { "$elemMatch": {
+                    "state": MemberState::Leaving.as_str(),
+                    "purging": Bson::Null,
+                } },
+            })
             .await
     }
 

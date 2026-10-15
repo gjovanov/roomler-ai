@@ -541,10 +541,23 @@ async fn scenario() {
         Some(WORK),
         "the parent's folder, in C's fork's"
     );
-    until_session(&app, &seeded, &sid, LONG, "C was never let go", |s| {
-        member(s, &c).is_some_and(|m| m["state"] == "leaving") && s["promotion"].is_null()
-    })
+    // P2g-4b — C took its copy only to fork it, and the session holds its
+    // `min` copies without it (A's and B's): once the fork's start was
+    // answered, that copy is purged and C's row goes. The fork runs on.
+    until_session(
+        &app,
+        &seeded,
+        &sid,
+        LONG,
+        "C's copy of the session was never purged",
+        |s| member(s, &c).is_none() && s["promotion"].is_null(),
+    )
     .await;
+    let turn = recall(&mut ws, &fsid_c, "f4").await;
+    assert!(
+        turn.iter().any(|e| text_of(e).contains("history: 4")),
+        "C's fork runs on without the copy it was made from: {turn:?}"
+    );
     let parent = session(&app, &seeded, &sid).await;
     assert_eq!(
         (parent["device_id"].as_str(), parent["fence"].as_u64()),
@@ -553,8 +566,22 @@ async fn scenario() {
     );
 
     stop(c_proc).await;
+    let (events, purged) = held(&c_dir.join("hive.db"), &sid);
+    assert_eq!(
+        (events, purged),
+        (0, true),
+        "C's store keeps only the session's id"
+    );
     stop(b_proc).await;
     stop(a_proc).await;
+}
+
+/// Every event of `sid` the store at `db` holds, and whether it keeps `sid`
+/// purged. Read with the device stopped: the store is its own.
+fn held(db: &Path, sid: &str) -> (usize, bool) {
+    let store = roomler_hive_node::store::Store::open(db).expect("the device's store");
+    let events = store.page(sid, 0, 100_000).expect("its copy").len();
+    (events, store.is_purged(sid).expect("its purged ids"))
 }
 
 /// The stored session `sid`, once `pred` holds of it, within [`LONG`].
