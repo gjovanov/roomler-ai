@@ -133,12 +133,10 @@ pub async fn enroll_tunnel_client(
             let used = state.tunnel_clients.count_active_for_tenant(tid).await?;
             // FR-32: decision + record in `quota::check`. `MaxTunnelClients` is
             // an established limit, so it refuses whatever the mode says.
-            if let Err(d) = quota::check(
-                tenant.plan.clone(),
-                tenant.settings.plan_enforcement,
-                quota::Limit::MaxTunnelClients,
-                used,
-            ) {
+            // FR-102 P4 — through core, which also counts the collision per org.
+            if let Err(d) =
+                roomler_core::quota::check(&state, &tenant, quota::Limit::MaxTunnelClients, used)
+            {
                 return Err(ApiError::Forbidden(format!(
                     "Tunnel-client limit reached for the {:?} plan ({} of {} used). \
                      Upgrade the plan or remove a tunnel client first.",

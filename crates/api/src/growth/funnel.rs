@@ -25,7 +25,14 @@
 //!   server cannot see devices, so `activated` (and, sequentially,
 //!   `first_value`) answer `null` and `not_measured` names the module;
 //!   without every value module, `first_value` does the same. Never `0`.
-//! * **Paid** arrives with P4 (`billing_events`): `not_measured`.
+//! * **Paid** (P4) is the org's first invoice paid with an amount above 0
+//!   (`billing_events`, the `saas` module's — `null` without it). It has NO
+//!   window (§3d), so it hangs off the org step, not the value steps: an
+//!   org that pays is counted whatever its path to value (a late device
+//!   still pays), and an org that has not paid is counted as not paid AS OF
+//!   NOW — a cohort's paid count can still grow. Its `pending` is only the
+//!   sign-ups still pending at the org step. So `paid` is a subset of
+//!   `org_created`, not necessarily of `first_value`.
 //!
 //! ⚠️ Every bucket `key` is client-chosen text (a UTM value, a landing
 //! path): an admin UI renders it as TEXT, never as markup.
@@ -43,7 +50,7 @@ use roomler_core::{campaign, growth::ExclusionSet};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    digest::{MAX_ROWS, NotMeasured, aggregate, dt_ms, excluded_ids, find_docs, parse_day},
+    digest::{MAX_ROWS, aggregate, dt_ms, excluded_ids, find_docs, parse_day},
     mounted, value,
 };
 use crate::{
@@ -159,6 +166,9 @@ pub struct Facts<'a> {
     /// tenant → the start of its first value day (ms); `None` = no value
     /// module mounted.
     pub first_value: Option<&'a HashMap<ObjectId, i64>>,
+    /// P4 — tenant → its first invoice paid above 0 (ms); `None` = no
+    /// `saas` module.
+    pub first_paid: Option<&'a HashMap<ObjectId, i64>>,
     pub now_ms: i64,
 }
 
@@ -180,6 +190,7 @@ struct Outcome {
     org: Fate,
     activated: Fate,
     value: Fate,
+    paid: Fate,
 }
 
 /// One windowed step: the event at `reached_at` (if any) against the
@@ -230,10 +241,20 @@ fn outcome(s: &SignupFact, orgs_of_owner: &[OrgFact], facts: &Facts<'_>) -> Outc
         (Fate::Reached(_), _, None) => Fate::Unmeasured,
         (other, _, _) => other,
     };
+    // P4 — no window: off the org step, paid or not paid as of now.
+    let paid = match (org, org_fact, facts.first_paid) {
+        (Fate::Reached(_), Some(o), Some(paid)) => match paid.get(&o.tenant_id) {
+            Some(at) => Fate::Reached(*at),
+            None => Fate::Cold,
+        },
+        (Fate::Reached(_), _, None) => Fate::Unmeasured,
+        (other, _, _) => other,
+    };
     Outcome {
         org,
         activated,
         value,
+        paid,
     }
 }
 
@@ -277,6 +298,7 @@ struct Tallies {
     org: StepTally,
     activated: StepTally,
     value: StepTally,
+    paid: StepTally,
 }
 
 impl Tallies {
@@ -285,18 +307,20 @@ impl Tallies {
         self.org.add(o.org);
         self.activated.add(o.activated);
         self.value.add(o.value);
+        self.paid.add(o.paid);
     }
 }
 
-/// The five steps. `activated` and `first_value` are `null` when their
-/// source is not mounted (see `FunnelReport::not_measured`).
+/// The five steps. `activated`, `first_value` and `paid` are `null` when
+/// their source is not mounted (see `FunnelReport::not_measured`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Steps {
     pub signup: u64,
     pub org_created: StepCounts,
     pub activated: Option<StepCounts>,
     pub first_value: Option<StepCounts>,
-    pub paid: NotMeasured,
+    /// P4 — no window: paid as of now (see the module docs).
+    pub paid: Option<StepCounts>,
 }
 
 /// Median and p75 in hours, with the n they rest on; `None` below n = 1.
@@ -352,6 +376,7 @@ pub struct Bucket {
     pub org_created: StepCounts,
     pub activated: Option<StepCounts>,
     pub first_value: Option<StepCounts>,
+    pub paid: Option<StepCounts>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +425,7 @@ pub struct GroupCounts {
     pub org_created: StepCounts,
     pub activated: Option<StepCounts>,
     pub first_value: Option<StepCounts>,
+    pub paid: Option<StepCounts>,
 }
 
 /// P6 — every sign-up's outcome, grouped by `key_of` (`None` = the
@@ -413,6 +439,7 @@ pub fn group_by<K: Ord>(
     let orgs_of = orgs_by_owner(facts.orgs);
     let can_see_devices = facts.first_device.is_some();
     let can_see_value = can_see_devices && facts.first_value.is_some();
+    let can_see_paid = facts.first_paid.is_some();
     let mut groups: BTreeMap<Option<K>, Tallies> = BTreeMap::new();
     for s in facts.signups {
         let o = outcome(
@@ -432,6 +459,7 @@ pub fn group_by<K: Ord>(
                     org_created: t.org.counts(t.signups),
                     activated: can_see_devices.then(|| t.activated.counts(t.signups)),
                     first_value: can_see_value.then(|| t.value.counts(t.signups)),
+                    paid: can_see_paid.then(|| t.paid.counts(t.signups)),
                 },
             )
         })
@@ -443,6 +471,7 @@ pub fn tally(facts: &Facts<'_>, by: Option<Dimension>) -> (Steps, TimeToValue, V
     let orgs_of = orgs_by_owner(facts.orgs);
     let can_see_devices = facts.first_device.is_some();
     let can_see_value = can_see_devices && facts.first_value.is_some();
+    let can_see_paid = facts.first_paid.is_some();
 
     let mut total = Tallies::default();
     let mut buckets: BTreeMap<Option<String>, Tallies> = BTreeMap::new();
@@ -473,7 +502,7 @@ pub fn tally(facts: &Facts<'_>, by: Option<Dimension>) -> (Steps, TimeToValue, V
         org_created: total.org.counts(total.signups),
         activated: can_see_devices.then(|| total.activated.counts(total.signups)),
         first_value: can_see_value.then(|| total.value.counts(total.signups)),
-        paid: NotMeasured::later("the org's first paid invoice", "P4"),
+        paid: can_see_paid.then(|| total.paid.counts(total.signups)),
     };
     let ttv = TimeToValue {
         first_device: can_see_devices.then(|| Percentiles::of(to_device)),
@@ -487,6 +516,7 @@ pub fn tally(facts: &Facts<'_>, by: Option<Dimension>) -> (Steps, TimeToValue, V
             org_created: t.org.counts(t.signups),
             activated: can_see_devices.then(|| t.activated.counts(t.signups)),
             first_value: can_see_value.then(|| t.value.counts(t.signups)),
+            paid: can_see_paid.then(|| t.paid.counts(t.signups)),
         })
         .collect();
     rows.sort_by(|a, b| b.signups.cmp(&a.signups).then_with(|| a.key.cmp(&b.key)));
@@ -516,6 +546,8 @@ pub(crate) struct Read {
     pub(crate) orgs: Vec<OrgFact>,
     pub(crate) first_device: Option<HashMap<ObjectId, i64>>,
     pub(crate) first_value: Option<HashMap<ObjectId, i64>>,
+    /// P4 — `None` without the `saas` module.
+    pub(crate) first_paid: Option<HashMap<ObjectId, i64>>,
     pub(crate) truncated: bool,
     pub(crate) basis: Vec<String>,
 }
@@ -528,6 +560,7 @@ impl Read {
             orgs: &self.orgs,
             first_device: self.first_device.as_ref(),
             first_value: self.first_value.as_ref(),
+            first_paid: self.first_paid.as_ref(),
             now_ms,
         }
     }
@@ -549,6 +582,9 @@ impl Read {
                 "first_value".to_string(),
                 value::unmounted_reason(&self.basis),
             );
+        }
+        if self.first_paid.is_none() {
+            not_measured.insert("paid".to_string(), "saas module not mounted".to_string());
         }
         not_measured
     }
@@ -653,11 +689,24 @@ pub(crate) async fn read(
         )
     };
 
+    // P4 — each org's first invoice paid above 0 (`billing_events`, the
+    // `saas` module's collection).
+    let first_paid = if mounted(state, "saas") {
+        Some(
+            roomler_ai_services::dao::billing_event::BillingEventDao::new(&state.db)
+                .first_paid(&tenant_ids)
+                .await?,
+        )
+    } else {
+        None
+    };
+
     Ok(Read {
         signups,
         orgs,
         first_device,
         first_value,
+        first_paid,
         truncated,
         basis,
     })
@@ -784,11 +833,20 @@ mod tests {
         .collect();
         let first_value: HashMap<ObjectId, i64> =
             [(org_a.tenant_id, T0 + 5 * DAY_MS)].into_iter().collect();
+        // P4 — A's org paid on day 20 (no window); F's org paid too, but F
+        // never reached the org step (its org came too late).
+        let first_paid: HashMap<ObjectId, i64> = [
+            (org_a.tenant_id, T0 + 20 * DAY_MS),
+            (org_f.tenant_id, T0 + 15 * DAY_MS),
+        ]
+        .into_iter()
+        .collect();
         let facts = Facts {
             signups: &signups,
             orgs: &orgs,
             first_device: Some(&first_device),
             first_value: Some(&first_value),
+            first_paid: Some(&first_paid),
             now_ms: now,
         };
         let (steps, ttv, buckets) = tally(&facts, Some(Dimension::Source));
@@ -817,7 +875,16 @@ mod tests {
                 settled: 4
             })
         );
-        assert_eq!(steps.paid.arrives_with.as_deref(), Some("P4"));
+        // P4 — paid: A; pending only E (still pending at the org step); B
+        // and C reached their org and have not paid — not paid AS OF NOW.
+        assert_eq!(
+            steps.paid,
+            Some(StepCounts {
+                count: 1,
+                pending: 1,
+                settled: 5
+            })
+        );
         assert_eq!(
             ttv.first_device,
             Some(Percentiles {
@@ -841,6 +908,7 @@ mod tests {
         assert_eq!(yt.org_created.count, 1);
         assert_eq!(yt.activated.unwrap().count, 1);
         assert_eq!(yt.first_value.unwrap().count, 1);
+        assert_eq!(yt.paid.unwrap().count, 1);
         let li = key(Some("linkedin"));
         assert_eq!((li.signups, li.activated.unwrap().pending), (1, 1));
         let none = key(None);
@@ -884,6 +952,7 @@ mod tests {
                 orgs: &orgs,
                 first_device: None,
                 first_value: None,
+                first_paid: None,
                 now_ms: now,
             },
             None,
@@ -891,6 +960,7 @@ mod tests {
         assert_eq!(steps.org_created.count, 1);
         assert_eq!((steps.activated, steps.first_value), (None, None));
         assert_eq!((ttv.first_device, ttv.first_value), (None, None));
+        assert_eq!(steps.paid, None, "no saas: paid is null, never 0");
         let empty = HashMap::new();
         let (steps, _, _) = tally(
             &Facts {
@@ -898,9 +968,20 @@ mod tests {
                 orgs: &orgs,
                 first_device: Some(&empty),
                 first_value: None,
+                first_paid: Some(&empty),
                 now_ms: now,
             },
             None,
+        );
+        // P4 — paid hangs off the org step, so it measures without fleet's
+        // or the value modules' help: a measured zero here.
+        assert_eq!(
+            steps.paid,
+            Some(StepCounts {
+                count: 0,
+                pending: 0,
+                settled: 1
+            })
         );
         assert_eq!(
             steps.activated,
@@ -917,6 +998,7 @@ mod tests {
                 orgs: &orgs,
                 first_device: Some(&empty),
                 first_value: Some(&empty),
+                first_paid: None,
                 now_ms: now,
             },
             None,
@@ -941,6 +1023,7 @@ mod tests {
                     orgs,
                     first_device: Some(&empty),
                     first_value: Some(&empty),
+                    first_paid: Some(&empty),
                     now_ms: now,
                 },
                 None,
@@ -979,11 +1062,14 @@ mod tests {
         let devices: HashMap<ObjectId, i64> =
             [(org_a.tenant_id, T0 + 2 * DAY_MS)].into_iter().collect();
         let values = HashMap::new();
+        let paid: HashMap<ObjectId, i64> =
+            [(org_a.tenant_id, T0 + 9 * DAY_MS)].into_iter().collect();
         let facts = Facts {
             signups: &signups,
             orgs: &orgs,
             first_device: Some(&devices),
             first_value: Some(&values),
+            first_paid: Some(&paid),
             now_ms: now,
         };
         let (_, _, buckets) = tally(&facts, Some(Dimension::Source));
@@ -992,12 +1078,13 @@ mod tests {
         for b in &buckets {
             let g = &groups[&b.key];
             assert_eq!(
-                (g.signups, g.org_created, g.activated, g.first_value),
-                (b.signups, b.org_created, b.activated, b.first_value),
+                (g.signups, g.org_created, g.activated, g.first_value, g.paid),
+                (b.signups, b.org_created, b.activated, b.first_value, b.paid),
                 "{:?}",
                 b.key
             );
         }
+        assert_eq!(groups[&Some("youtube".to_string())].paid.unwrap().count, 1);
         // Without fleet, the grouping is as blind as the funnel.
         let blind = group_by(
             &Facts {
@@ -1073,6 +1160,7 @@ mod tests {
                 orgs: &orgs,
                 first_device: Some(&empty),
                 first_value: Some(&empty),
+                first_paid: Some(&empty),
                 now_ms: T0 + 40 * DAY_MS,
             },
             Some(Dimension::Source),

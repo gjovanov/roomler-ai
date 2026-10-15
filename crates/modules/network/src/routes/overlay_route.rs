@@ -389,11 +389,10 @@ pub async fn set_exit_node(
     // they cannot withdraw, which is worse than the feature being free.
     if body.enabled {
         let tenant = state.tenants.base.find_by_id(tid).await?;
-        if let Err(d) = quota::require_feature(
-            tenant.plan.clone(),
-            tenant.settings.plan_enforcement,
-            quota::Limit::ExitNodes,
-        ) {
+        // FR-102 P4 — through core, which also counts the collision per org.
+        if let Err(d) =
+            roomler_core::quota::require_feature(&state, &tenant, quota::Limit::ExitNodes)
+        {
             return Err(ApiError::Forbidden(d.message()));
         }
     }
@@ -558,11 +557,10 @@ pub async fn set_magic_dns(
     // must never leave a tenant unable to switch the feature off.
     if domain.is_some() {
         let tenant = state.tenants.base.find_by_id(tid).await?;
-        if let Err(d) = quota::require_feature(
-            tenant.plan.clone(),
-            tenant.settings.plan_enforcement,
-            quota::Limit::MagicDns,
-        ) {
+        // FR-102 P4 — through core, which also counts the collision per org.
+        if let Err(d) =
+            roomler_core::quota::require_feature(&state, &tenant, quota::Limit::MagicDns)
+        {
             return Err(ApiError::Forbidden(d.message()));
         }
     }

@@ -704,7 +704,76 @@ pub struct MrrEstimate {
 pub struct Revenue {
     pub orgs_by_plan_status: Vec<PlanStatusRow>,
     pub mrr: MrrEstimate,
-    pub billed: NotMeasured,
+    /// P4 — what Stripe billed (`billing_events`); `not_measured` without
+    /// the `saas` module. A digest stored before P4 says "arrives with P4".
+    pub billed: Measured<BilledFigures>,
+    /// P4 — the plan-limit collisions in the windows: the orgs that keep
+    /// hitting the ceiling. Absent from a digest stored before P4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_intent: Option<UpgradeIntent>,
+}
+
+/// P4 — billed MRR at the day's end in one currency, normalised to a month.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrencyMrr {
+    /// Lowercase ISO 4217, as Stripe spells it.
+    pub currency: String,
+    pub mrr_cents: i64,
+    pub paying_orgs: i64,
+}
+
+/// P4 — what the windows' paid invoices billed, in one currency (every
+/// line, prorations included, after coupons, before tax).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrencyBilled {
+    pub currency: String,
+    pub cents: Figure,
+}
+
+/// P4 — billed revenue: MRR at the day's end, and the windows' invoices,
+/// failed payments, first payments, cancellations and trials.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BilledFigures {
+    /// The first day on record (`YYYY-MM-DD`, any org): nothing was
+    /// recorded before it, so a window reaching back past it is partial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_since: Option<String>,
+    /// Whether the operator's backfill has read Stripe's history; until it
+    /// has, the figures cover only what the webhook delivered since it was
+    /// wired (an existing subscriber counts from their next invoice).
+    #[serde(default)]
+    pub backfilled: bool,
+    pub mrr: Vec<CurrencyMrr>,
+    pub invoices_paid: Figure,
+    pub billed: Vec<CurrencyBilled>,
+    pub payment_failures: Figure,
+    /// Orgs whose first invoice above 0 was paid in the window.
+    pub new_paying_orgs: Figure,
+    /// Subscriptions deleted.
+    pub cancellations: Figure,
+    pub trials_started: Figure,
+}
+
+/// P4 — one org's collisions with one limit in the 28-day window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollisionOrg {
+    pub tenant_id: String,
+    /// Client-chosen text.
+    pub name: String,
+    /// The limit's wire spelling (`max_members`, `max_devices`, …).
+    pub limit: String,
+    pub count: i64,
+}
+
+/// P4 — quota collisions (`growth_daily {source: quota}`), the
+/// upgrade-intent signal: how many, in how many orgs, and the orgs that hit
+/// hardest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpgradeIntent {
+    pub collisions: Figure,
+    pub orgs: Figure,
+    /// At most [`TOP_ORGS`] (org, limit) pairs, by their 28-day count.
+    pub top: Vec<CollisionOrg>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1558,7 +1627,177 @@ async fn newsletter_section(state: &AppState, w: &Windows) -> Result<Newsletter,
     })
 }
 
-async fn revenue_section(state: &AppState, set: &ExclusionSet) -> Result<Revenue, DigestError> {
+/// P4 — why billed revenue is not measured while nothing is on record.
+pub const NO_BILLING_RECORD: &str = "no billing event on record yet: Stripe's webhook has \
+     delivered none of the six billing kinds and the backfill has not run";
+
+/// P4 — the billed figures of the windows, pure over `billing_events`
+/// rows (exclusions already applied): MRR at the day's end per currency,
+/// and every count by the instant it happened. `record_since` and
+/// `backfilled` are the caller's (they read the whole record).
+pub fn billed_figures(
+    rows: &[roomler_ai_services::dao::billing_event::BillingEvent],
+    w: &Windows,
+    record_since: Option<String>,
+    backfilled: bool,
+) -> BilledFigures {
+    use roomler_ai_services::{billing, dao::billing_event::BillingKind};
+    let orgs = billing::fold(rows);
+    let at = w.day_end - 1;
+    let mut mrr: BTreeMap<String, CurrencyMrr> = BTreeMap::new();
+    for o in orgs.values() {
+        let cents = o.mrr_at(at);
+        if cents <= 0 {
+            continue;
+        }
+        let currency = o.currency.clone().unwrap_or_else(|| "unknown".into());
+        let e = mrr.entry(currency.clone()).or_insert(CurrencyMrr {
+            currency,
+            mrr_cents: 0,
+            paying_orgs: 0,
+        });
+        e.mrr_cents += cents;
+        e.paying_orgs += 1;
+    }
+    let times = |kind: BillingKind| -> Vec<i64> {
+        rows.iter()
+            .filter(|r| r.kind == kind)
+            .map(|r| r.ts.timestamp_millis())
+            .collect()
+    };
+    let mut billed: BTreeMap<String, Figure> = BTreeMap::new();
+    for r in rows.iter().filter(|r| r.kind == BillingKind::InvoicePaid) {
+        let t = r.ts.timestamp_millis();
+        let cents = r.amount_cents.unwrap_or(0);
+        let f = billed
+            .entry(r.currency.clone().unwrap_or_else(|| "unknown".into()))
+            .or_default();
+        if w.contains(Span::Day, t) {
+            f.day += cents;
+        }
+        if w.contains(Span::D7, t) {
+            f.d7 += cents;
+        }
+        if w.contains(Span::D28, t) {
+            f.d28 += cents;
+        }
+    }
+    BilledFigures {
+        record_since,
+        backfilled,
+        mrr: mrr.into_values().collect(),
+        invoices_paid: w.count(times(BillingKind::InvoicePaid)),
+        billed: billed
+            .into_iter()
+            .filter(|(_, f)| *f != Figure::default())
+            .map(|(currency, cents)| CurrencyBilled { currency, cents })
+            .collect(),
+        payment_failures: w.count(times(BillingKind::InvoicePaymentFailed)),
+        new_paying_orgs: w.count(orgs.values().filter_map(|o| o.paid_since)),
+        cancellations: w.count(times(BillingKind::SubscriptionDeleted)),
+        trials_started: w.count(orgs.values().filter_map(|o| o.trial_started)),
+    }
+}
+
+/// P4 — `billing_events` (internal orgs left out), as [`billed_figures`];
+/// `not_measured` while nothing at all is on record — "no paying org" is
+/// a claim only a record can make.
+async fn billed_section(
+    state: &AppState,
+    w: &Windows,
+    set: &ExclusionSet,
+) -> Result<Measured<BilledFigures>, DigestError> {
+    use roomler_ai_services::billing;
+    let Some(first) = billing::record_start(&state.db).await? else {
+        return Ok(Measured::NotMeasured(NotMeasured::now(NO_BILLING_RECORD)));
+    };
+    let rows = roomler_ai_services::dao::billing_event::BillingEventDao::new(&state.db)
+        .list(None, &excluded_ids(&set.tenants))
+        .await?;
+    let backfilled = billing::last_backfill(&state.db).await?.is_some();
+    Ok(Measured::Value(billed_figures(
+        &rows,
+        w,
+        Some(day_str(utc_date_of(DateTime::from_millis(first)))),
+        backfilled,
+    )))
+}
+
+/// P4 — the quota collisions of the windows, from the per-day counters
+/// `roomler_core::quota` bumps (core: read whatever modules are mounted).
+/// The org is the `tenant` dimension, so an excluded org's rows are left
+/// out here, at read time.
+async fn upgrade_intent_section(
+    state: &AppState,
+    w: &Windows,
+    set: &ExclusionSet,
+) -> Result<UpgradeIntent, DigestError> {
+    use roomler_ai_services::dao::growth::{QUOTA_COLLISION_METRIC, QUOTA_SOURCE};
+    let (day, _, d28) = w.dates();
+    let rows = GrowthDao::new(&state.db)
+        .read_daily(QUOTA_SOURCE, QUOTA_COLLISION_METRIC, &d28, &day)
+        .await?;
+    let mut collisions = Figure::default();
+    let (mut orgs_day, mut orgs_d7, mut orgs_d28) =
+        (HashSet::new(), HashSet::new(), HashSet::new());
+    let mut per_pair: BTreeMap<(ObjectId, String), i64> = BTreeMap::new();
+    for r in &rows {
+        let (Some(tenant), Ok(d)) = (
+            r.dims
+                .get("tenant")
+                .and_then(|t| ObjectId::parse_str(t).ok()),
+            parse_day(&r.day),
+        ) else {
+            continue;
+        };
+        if set.tenant_excluded(&tenant) {
+            continue;
+        }
+        let t = midnight_ms(d);
+        if w.contains(Span::Day, t) {
+            collisions.day += r.value;
+            orgs_day.insert(tenant);
+        }
+        if w.contains(Span::D7, t) {
+            collisions.d7 += r.value;
+            orgs_d7.insert(tenant);
+        }
+        if w.contains(Span::D28, t) {
+            collisions.d28 += r.value;
+            orgs_d28.insert(tenant);
+            let limit = r.dims.get("limit").cloned().unwrap_or_default();
+            *per_pair.entry((tenant, limit)).or_insert(0) += r.value;
+        }
+    }
+    let mut top: Vec<((ObjectId, String), i64)> = per_pair.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    top.truncate(TOP_ORGS);
+    let ids: Vec<ObjectId> = top.iter().map(|((t, _), _)| *t).collect();
+    let names = org_names(state, &ids).await?;
+    Ok(UpgradeIntent {
+        collisions,
+        orgs: Figure {
+            day: orgs_day.len() as i64,
+            d7: orgs_d7.len() as i64,
+            d28: orgs_d28.len() as i64,
+        },
+        top: top
+            .into_iter()
+            .map(|((tenant, limit), count)| CollisionOrg {
+                tenant_id: tenant.to_hex(),
+                name: names.get(&tenant).cloned().unwrap_or_default(),
+                limit,
+                count,
+            })
+            .collect(),
+    })
+}
+
+async fn revenue_section(
+    state: &AppState,
+    w: &Windows,
+    set: &ExclusionSet,
+) -> Result<Revenue, DigestError> {
     let nin = excluded_ids(&set.tenants);
     let tenants = find_docs(
         state,
@@ -1608,7 +1847,14 @@ async fn revenue_section(state: &AppState, set: &ExclusionSet) -> Result<Revenue
             estimate: true,
             basis: "list price × seats (plan.price_monthly_cents), not billed revenue".into(),
         },
-        billed: NotMeasured::later("billed revenue from Stripe invoices", "P4"),
+        // P4 — billed revenue is the `saas` module's (`billing_events`);
+        // the collisions are core's and read on every server.
+        billed: if mounted(state, "saas") {
+            billed_section(state, w, set).await?
+        } else {
+            Measured::unmounted("saas")
+        },
+        upgrade_intent: Some(upgrade_intent_section(state, w, set).await?),
     })
 }
 
@@ -2153,7 +2399,7 @@ pub async fn compute(
     } else {
         Measured::unmounted("saas")
     };
-    let revenue = revenue_section(state, set).await?;
+    let revenue = revenue_section(state, &w, set).await?;
     // P8 — core-level collections, read whether or not `saas` is mounted.
     let social = social_section(state, &w).await?;
     let quality = Quality {
