@@ -1,6 +1,14 @@
 {
   "routes": [
     {
+      "path": "/api/admin/growth/alerts",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/admin/growth/alerts/evaluate",
+      "methods": "POST"
+    },
+    {
       "path": "/api/admin/growth/billing/backfill",
       "methods": "POST"
     },
@@ -75,6 +83,18 @@
     {
       "path": "/api/admin/growth/revenue",
       "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/admin/growth/weeklies",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/admin/growth/weekly",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/admin/growth/weekly/run",
+      "methods": "POST"
     },
     {
       "path": "/api/admin/newsletter/issues",
@@ -1411,6 +1431,29 @@
         ]
       },
       {
+        "collection": "growth_alerts",
+        "indexes": [
+          {
+            "key": {
+              "rule": 1,
+              "key": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "cleared_at": {
+                "$type": "null"
+              }
+            }
+          },
+          {
+            "key": {
+              "fired_at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
         "collection": "growth_daily",
         "indexes": [
           {
@@ -1522,6 +1565,17 @@
               "source": 1,
               "day": 1
             }
+          }
+        ]
+      },
+      {
+        "collection": "growth_weekly",
+        "indexes": [
+          {
+            "key": {
+              "computed_at": 1
+            },
+            "expireAfterSeconds": 64800000
           }
         ]
       },
@@ -3255,6 +3309,29 @@
         ]
       },
       {
+        "collection": "growth_alerts",
+        "indexes": [
+          {
+            "key": {
+              "rule": 1,
+              "key": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "cleared_at": {
+                "$type": "null"
+              }
+            }
+          },
+          {
+            "key": {
+              "fired_at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
         "collection": "growth_daily",
         "indexes": [
           {
@@ -3366,6 +3443,17 @@
               "source": 1,
               "day": 1
             }
+          }
+        ]
+      },
+      {
+        "collection": "growth_weekly",
+        "indexes": [
+          {
+            "key": {
+              "computed_at": 1
+            },
+            "expireAfterSeconds": 64800000
           }
         ]
       },

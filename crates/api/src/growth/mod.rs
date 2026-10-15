@@ -38,7 +38,17 @@
 //!   (delivery from SendGrid's signed Event Webhook, unsubscribes through
 //!   the issue's own link, visits and sign-ups by the issue's campaign key).
 //!   The webhook itself is the `saas` module's.
+//! * [`read_key`] — P10: the read key (D12) — a layer on this router and
+//!   the [`read_key::GrowthAuth`] extractor every GET view names: a live
+//!   key opens a GET of a data route, and everything else it meets is the
+//!   empty 404.
+//! * [`weekly`] — P10: the weekly roll-up — the past ISO week's totals,
+//!   funnel, cohort lines and tables, computed, stored and mailed once
+//!   through the digest's own claim, in `growth_weekly`.
+//! * [`alerts`] — P10: the alert rules, their hourly evaluation, the
+//!   `growth_alerts` rows and the once-a-day mail.
 
+pub mod alerts;
 pub mod campaigns;
 pub mod channels;
 pub mod cohorts;
@@ -49,10 +59,12 @@ pub mod keys;
 pub mod newsletter;
 pub mod org_daily;
 pub mod orgs;
+pub mod read_key;
 pub mod render;
 pub mod revenue;
 pub mod routes;
 pub mod value;
+pub mod weekly;
 
 /// The purestat v1 client lives in `roomler-ai-services` since P6 — below
 /// the host AND the `saas` module, whose daily puller uses it too.
@@ -71,7 +83,13 @@ use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 pub use digest::DigestError as GrowthError;
 
 /// The `/api/admin/growth` router, mounted by `build_router`.
-pub fn admin_routes() -> Router<AppState> {
+///
+/// P10 — [`read_key::read_key_gate`] is a layer on every route here: a
+/// request carrying a growth key is answered by the key's rule (a live
+/// read key opens a GET of a data route; anything else is the empty 404)
+/// before any handler runs, and a request without one reaches the
+/// handlers' session gate as before.
+pub fn admin_routes(state: &AppState) -> Router<AppState> {
     Router::new()
         .route(
             "/exclusions",
@@ -108,6 +126,21 @@ pub fn admin_routes() -> Router<AppState> {
         .route("/keys/{key_id}", delete(keys::revoke_key))
         // P5 — the newsletter: the list over time and the per-issue table.
         .route("/newsletter", get(newsletter::get_newsletter))
+        // P10 — the weekly roll-up: a stored week (the latest when `week`
+        // is omitted), the list, and a recompute through the same claim
+        // the scheduler uses (mails only with `send=true`, never a `sent`
+        // week).
+        .route("/weekly", get(weekly::get_weekly))
+        .route("/weeklies", get(weekly::list_weeklies))
+        .route("/weekly/run", post(weekly::run_weekly))
+        // P10 — alerts: the open and recent rows, and an evaluation of
+        // every rule now (what the hourly job does), for a field check.
+        .route("/alerts", get(alerts::get_alerts))
+        .route("/alerts/evaluate", post(alerts::evaluate_route))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            read_key::read_key_gate,
+        ))
 }
 
 /// Whether a module is mounted on this pod — the gate every growth read of

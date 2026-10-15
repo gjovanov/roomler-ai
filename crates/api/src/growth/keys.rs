@@ -5,16 +5,19 @@
 //! * `GET /api/admin/growth/keys` — every key: kind, label, the display
 //!   prefix, who minted it and when, last use, revoked — never the key or
 //!   its hash;
-//! * `POST /api/admin/growth/keys` `{kind: "ingest", label}` — mint one; the
-//!   key itself is in THIS answer and nowhere else, ever (only its SHA-256
-//!   is stored);
+//! * `POST /api/admin/growth/keys` `{kind: "ingest" | "read", label}` —
+//!   mint one; the key itself is in THIS answer and nowhere else, ever
+//!   (only its SHA-256 is stored);
 //! * `DELETE /api/admin/growth/keys/{key_id}` — revoke (idempotent).
 //!
-//! Platform admins only, 404 otherwise and when `growth.enabled = false` —
-//! the same gate as every growth route. The keys live in core
-//! (`growth_keys`) so a later kind (P10's read key) answers host routes;
-//! an `ingest` key opens the `saas` module's ingest routes and nothing
-//! else, so `ingest_mounted` says whether this server has them.
+//! Platform admins only — a SESSION, never a key: these three routes are
+//! the one place a read key is refused on a GET too (`read_key.rs`), so a
+//! leaked key cannot list the other keys' prefixes or mint itself a
+//! sibling. 404 otherwise and when `growth.enabled = false` — the same
+//! gate as every growth route. The keys live in core (`growth_keys`): an
+//! `ingest` key opens the `saas` module's ingest routes and nothing else,
+//! so `ingest_mounted` says whether this server has them; a `read` key
+//! (P10) opens the growth views' GET routes and nothing else.
 
 use axum::{
     Json,
@@ -204,8 +207,14 @@ mod tests {
             mint_request(&json!({ "kind": "ingest", "label": " promotion pipeline " })).unwrap(),
             (GrowthKeyKind::Ingest, "promotion pipeline".to_string())
         );
+        // P10 — the read kind mints too.
+        assert_eq!(
+            mint_request(&json!({ "kind": "read", "label": "promotion pipeline (read)" })).unwrap(),
+            (GrowthKeyKind::Read, "promotion pipeline (read)".to_string())
+        );
         for bad in [
-            json!({ "kind": "read", "label": "x" }),
+            json!({ "kind": "write", "label": "x" }),
+            json!({ "kind": "Read", "label": "x" }),
             json!({ "kind": "Ingest", "label": "x" }),
             json!({ "label": "x" }),
             json!({ "kind": "ingest" }),

@@ -498,6 +498,34 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
         )],
     ));
 
+    // P10 — the weekly roll-ups: one row per closed ISO week, `_id =
+    // "YYYY-Www"`, the daily digest's claim and statuses in a collection of
+    // their own, and the same 25-month TTL from the compute.
+    sets.push(set(
+        "growth_weekly",
+        vec![index_ttl(
+            bson::doc! { "computed_at": 1 },
+            25 * 30 * 24 * 60 * 60,
+        )],
+    ));
+
+    // P10 — alerts: at most ONE open row per `(rule, key)`. The partial
+    // unique index is the fire's arbiter across pods (a second pod's insert
+    // is a duplicate key, read back as "already open", never a second
+    // alert); `$type: "null"` so only an explicit null — an open row —
+    // takes part, and a cleared row never blocks the next fire. Kept 90
+    // days from `fired_at` (spec §3o).
+    sets.push(set(
+        "growth_alerts",
+        vec![
+            index_unique_partial(
+                bson::doc! { "rule": 1, "key": 1 },
+                bson::doc! { "cleared_at": { "$type": "null" } },
+            ),
+            index_ttl(bson::doc! { "fired_at": 1 }, 90 * 24 * 60 * 60),
+        ],
+    ));
+
     // Hourly rollups (90 d) and daily rollups (730 d). The rollup task
     // whole-bucket-replaces via $merge on _id, so these are also upserts.
     for (coll, ttl_days) in [

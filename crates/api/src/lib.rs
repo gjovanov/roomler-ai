@@ -336,7 +336,7 @@ pub fn build_router(state: AppState) -> Router {
         // P1d, the daily digest. A composition view over core and whichever
         // modules are mounted, so the host's, next to `/admin/stats`; the
         // same platform-admin gate, plus `growth.enabled`.
-        .nest("/admin/growth", growth::admin_routes())
+        .nest("/admin/growth", growth::admin_routes(&state))
         // `/stripe/*`, `/admin/newsletter/*`, `/admin/plan-compliance`,
         // `/user/newsletter` and `/subscribe*` are the `saas` module's
         // (FR-69 P2), merged in by `state.modules.mount` below.

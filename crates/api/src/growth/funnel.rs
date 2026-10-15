@@ -51,12 +51,11 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     digest::{MAX_ROWS, aggregate, dt_ms, excluded_ids, find_docs, parse_day},
-    mounted, value,
+    mounted,
+    read_key::GrowthAuth,
+    value,
 };
-use crate::{
-    error::ApiError, extractors::auth::AuthUser, routes::attribution::parse_instant,
-    state::AppState,
-};
+use crate::{error::ApiError, routes::attribution::parse_instant, state::AppState};
 
 /// An org counts when created within this many days of the sign-up.
 pub const ORG_WINDOW_DAYS: i64 = 7;
@@ -715,10 +714,9 @@ pub(crate) async fn read(
 /// `GET /api/admin/growth/funnel?since&until&by&include_internal`
 pub async fn get_funnel(
     State(state): State<AppState>,
-    auth: AuthUser,
+    _auth: GrowthAuth,
     Query(q): Query<FunnelQuery>,
 ) -> Result<Json<FunnelReport>, ApiError> {
-    super::require_growth_admin(&state, &auth)?;
     let now = DateTime::now();
     let until = match q.until.as_deref() {
         Some(s) => parse_instant(s, "until")?,
@@ -749,15 +747,31 @@ pub async fn get_funnel(
     } else {
         ExclusionSet::load(&state.core).await?
     };
-    let r = read(&state, &set, since, until).await?;
+    Ok(Json(
+        compute(&state, &set, since, until, by, q.include_internal, now).await?,
+    ))
+}
+
+/// The report for `[since, until)` at `now` — what the route answers, and
+/// what P10's weekly roll-up stores for its week.
+pub async fn compute(
+    state: &AppState,
+    set: &ExclusionSet,
+    since: DateTime,
+    until: DateTime,
+    by: Option<Dimension>,
+    include_internal: bool,
+    now: DateTime,
+) -> Result<FunnelReport, ApiError> {
+    let r = read(state, set, since, until).await?;
     let (steps, time_to_value, buckets) = tally(&r.facts(now.timestamp_millis()), by);
     let not_measured = r.step_reasons();
     let (users, tenants) = set.counts();
-    Ok(Json(FunnelReport {
+    Ok(FunnelReport {
         enabled: true,
         since: since.try_to_rfc3339_string().unwrap_or_default(),
         until: until.try_to_rfc3339_string().unwrap_or_default(),
-        include_internal: q.include_internal,
+        include_internal,
         excluded: ExcludedCounts {
             users: users as u32,
             tenants: tenants as u32,
@@ -774,7 +788,7 @@ pub async fn get_funnel(
         time_to_value,
         by,
         buckets,
-    }))
+    })
 }
 
 #[cfg(test)]

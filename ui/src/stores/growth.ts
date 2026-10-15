@@ -592,9 +592,12 @@ export interface ChannelsReport {
   platforms: PlatformRow[]
 }
 
+/** `ingest` opens the pipeline's push routes; `read` (P10) opens the GET views. */
+export type GrowthKeyKind = 'ingest' | 'read'
+
 export interface GrowthKeyRow {
   id: string
-  kind: 'ingest'
+  kind: GrowthKeyKind
   label: string
   /** The key's first characters — to recognise it, never to use it. */
   prefix: string
@@ -614,6 +617,116 @@ export interface KeysResponse {
 /** The mint answer: the only place the key itself ever appears. */
 export interface MintedKey extends GrowthKeyRow {
   key: string
+}
+
+// ── P10: the weekly roll-up and the alerts ─────────────────────────────
+// Wire shapes mirror crates/api/src/growth/{weekly,alerts}.rs. A roll-up
+// is the digest's row shape keyed by the ISO week; an alert is a rule and
+// a key with the numbers behind it — days and counts, never a person.
+
+/** A count of the week, the week before, and the mean of the four before. */
+export interface WeekFigure {
+  week: number
+  prev_week: number
+  w4_avg?: number
+}
+
+export interface Weekly {
+  week: string
+  status: DigestStatus
+  version: number
+  claimed_at: string
+  computed_at?: string
+  sent_at?: string
+  attempts: number
+  error?: string
+  recipients: number
+  excluded: ExcludedCounts
+  sections?: Record<string, unknown>
+}
+
+export interface WeeklyListRow {
+  week: string
+  status: DigestStatus
+  computed_at?: string
+  sent_at?: string
+  attempts: number
+  recipients: number
+  error?: string
+  excluded: ExcludedCounts
+  headline?: Record<string, unknown>
+}
+
+export interface WeeklyList {
+  enabled: boolean
+  /** Whether the scheduler runs on this server. */
+  scheduled: boolean
+  weeks: WeeklyListRow[]
+}
+
+export type AlertRule = 'digest_missing' | 'source_not_measured' | 'spike' | 'drop'
+
+export interface GrowthAlert {
+  id: string
+  rule: AlertRule | string
+  key: string
+  fired_at: string
+  cleared_at?: string
+  /** Days, counts, thresholds — rendered as text. */
+  detail: Record<string, unknown>
+  mailed_on?: string
+}
+
+export interface AlertRuleInfo {
+  rule: AlertRule | string
+  keys: string[]
+  description: string
+}
+
+export interface AlertsResponse {
+  /** Whether the hourly evaluator runs on this server. */
+  enabled: boolean
+  rules: AlertRuleInfo[]
+  open: GrowthAlert[]
+  recent: GrowthAlert[]
+}
+
+export interface AlertVerdict {
+  rule: AlertRule | string
+  key: string
+  holds: boolean
+  detail?: Record<string, unknown>
+}
+
+export interface AlertEvaluation {
+  at: string
+  dry_run: boolean
+  verdicts: AlertVerdict[]
+  fired: { rule: string; key: string; fired_at: string; cleared_at?: string; detail: Record<string, unknown> }[]
+  cleared: { rule: string; key: string; fired_at: string; cleared_at?: string; detail: Record<string, unknown> }[]
+  mailed: number
+}
+
+/** `12 (prev 9 · 4w avg 5.0)` — the week against its baselines. */
+export function weekFigureLabel(f: WeekFigure): string {
+  const base = `${f.week} (prev ${f.prev_week}`
+  return typeof f.w4_avg === 'number' ? `${base} · 4w avg ${f.w4_avg.toFixed(1)})` : `${base})`
+}
+
+export function isWeekFigure(v: unknown): v is WeekFigure {
+  return (
+    typeof v === 'object' &&
+    v !== null &&
+    typeof (v as WeekFigure).week === 'number' &&
+    typeof (v as WeekFigure).prev_week === 'number'
+  )
+}
+
+/** An alert's detail as `k v` pairs, as text. */
+export function alertDetailLabel(detail: Record<string, unknown>): string {
+  return Object.entries(detail)
+    .map(([k, v]) => `${k} ${typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v)}`)
+    .join(' · ')
 }
 
 // ── P5: the newsletter ─────────────────────────────────────────────────
@@ -937,13 +1050,50 @@ export const useGrowthStore = defineStore('growth', () => {
     return api.get<KeysResponse>('/admin/growth/keys')
   }
 
-  /** P8 — mint an ingest key; the answer is the only place it appears. */
-  async function mintKey(label: string): Promise<MintedKey> {
-    return api.post<MintedKey>('/admin/growth/keys', { kind: 'ingest', label })
+  /** P8 — mint a key (an ingest key by default; P10 adds `read`); the answer is the only place it appears. */
+  async function mintKey(label: string, kind: GrowthKeyKind = 'ingest'): Promise<MintedKey> {
+    return api.post<MintedKey>('/admin/growth/keys', { kind, label })
   }
 
   async function revokeKey(id: string): Promise<void> {
     await api.delete(`/admin/growth/keys/${encodeURIComponent(id)}`)
+  }
+
+  /** P10 — a stored weekly roll-up; the latest when `week` is omitted; `null` when there is none. */
+  async function fetchWeekly(week?: string): Promise<Weekly | null> {
+    const q = week ? `?week=${encodeURIComponent(week)}` : ''
+    try {
+      return await api.get<Weekly>(`/admin/growth/weekly${q}`)
+    } catch (e) {
+      if ((e as { status?: number }).status === 404) return null
+      throw e
+    }
+  }
+
+  /** P10 — the stored weeks, newest first. */
+  async function fetchWeeklies(since?: string, limit = 26): Promise<WeeklyList> {
+    const q = new URLSearchParams()
+    if (since) q.set('since', since)
+    q.set('limit', String(limit))
+    return api.get<WeeklyList>(`/admin/growth/weeklies?${q}`)
+  }
+
+  /** P10 — recompute a closed week. Never mails unless `send` — and never a `sent` week. */
+  async function runWeekly(week: string, send = false): Promise<Weekly> {
+    const q = new URLSearchParams({ week, send: String(send) })
+    return api.post<Weekly>(`/admin/growth/weekly/run?${q}`)
+  }
+
+  /** P10 — the open alerts and the ones cleared recently. */
+  async function fetchAlerts(since?: string): Promise<AlertsResponse> {
+    const q = since ? `?since=${encodeURIComponent(since)}` : ''
+    return api.get<AlertsResponse>(`/admin/growth/alerts${q}`)
+  }
+
+  /** P10 — run every rule now; a dry run decides and writes nothing. */
+  async function evaluateAlerts(dryRun = false): Promise<AlertEvaluation> {
+    const q = dryRun ? '?dry_run=true' : ''
+    return api.post<AlertEvaluation>(`/admin/growth/alerts/evaluate${q}`)
   }
 
   return {
@@ -964,5 +1114,10 @@ export const useGrowthStore = defineStore('growth', () => {
     fetchKeys,
     mintKey,
     revokeKey,
+    fetchWeekly,
+    fetchWeeklies,
+    runWeekly,
+    fetchAlerts,
+    evaluateAlerts,
   }
 })

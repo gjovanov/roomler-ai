@@ -4,8 +4,10 @@
 //!
 //! A platform admin mints a key of a KIND, scoped to that kind's routes
 //! only: `ingest` (P8) authenticates the promotion pipeline's pushes to
-//! `POST /api/admin/growth/ingest/*` and nothing else. (P10's `read` key is
-//! the second kind this table is shaped for.)
+//! `POST /api/admin/growth/ingest/*` and nothing else; `read` (P10) opens
+//! the growth views' GET routes — the stored digests, the funnel, the
+//! tables — and nothing else, never a write. A key of one kind presented
+//! where the other is expected is a miss like any other.
 //!
 //! * **Only a hash is stored**: `hex(SHA-256(key))`, plus a short display
 //!   prefix (`rgi_AbCd1234`) to recognise a key in a list. The key itself is
@@ -40,20 +42,24 @@ pub const MAX_LABEL_LEN: usize = 80;
 pub enum GrowthKeyKind {
     /// P8 — push posts and metric snapshots to the ingest routes.
     Ingest,
+    /// P10 — read the growth views (`GET /api/admin/growth/*`), never write.
+    Read,
 }
 
 impl GrowthKeyKind {
-    pub const ALL: [GrowthKeyKind; 1] = [GrowthKeyKind::Ingest];
+    pub const ALL: [GrowthKeyKind; 2] = [GrowthKeyKind::Ingest, GrowthKeyKind::Read];
 
     pub fn as_str(self) -> &'static str {
         match self {
             GrowthKeyKind::Ingest => "ingest",
+            GrowthKeyKind::Read => "read",
         }
     }
 
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "ingest" => Some(GrowthKeyKind::Ingest),
+            "read" => Some(GrowthKeyKind::Read),
             _ => None,
         }
     }
@@ -62,7 +68,15 @@ impl GrowthKeyKind {
     pub fn prefix(self) -> &'static str {
         match self {
             GrowthKeyKind::Ingest => "rgi_",
+            GrowthKeyKind::Read => "rgr_",
         }
+    }
+
+    /// The kind a raw key CLAIMS by its prefix, whatever its shape — so a
+    /// gate can tell "a growth key of some kind was presented" (and answer
+    /// its own 404) from "not a growth key at all" (a user's JWT).
+    pub fn claimed_by(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| raw.starts_with(k.prefix()))
     }
 }
 
@@ -275,15 +289,47 @@ mod tests {
     fn kind_spellings_are_locked() {
         assert_eq!(GrowthKeyKind::Ingest.as_str(), "ingest");
         assert_eq!(GrowthKeyKind::parse("ingest"), Some(GrowthKeyKind::Ingest));
-        assert_eq!(
-            GrowthKeyKind::parse("read"),
-            None,
-            "P10's kind is not minted yet"
-        );
+        assert_eq!(GrowthKeyKind::Read.as_str(), "read");
+        assert_eq!(GrowthKeyKind::parse("read"), Some(GrowthKeyKind::Read));
+        assert_eq!(GrowthKeyKind::parse("Read"), None);
+        assert_eq!(GrowthKeyKind::parse("write"), None);
         assert_eq!(
             serde_json::to_string(&GrowthKeyKind::Ingest).unwrap(),
             "\"ingest\""
         );
+        assert_eq!(
+            serde_json::to_string(&GrowthKeyKind::Read).unwrap(),
+            "\"read\""
+        );
+        assert_eq!(GrowthKeyKind::Read.prefix(), "rgr_");
+        // Every kind has its own prefix: a key can claim at most one.
+        for a in GrowthKeyKind::ALL {
+            for b in GrowthKeyKind::ALL {
+                assert!(a == b || a.prefix() != b.prefix(), "{a:?} {b:?}");
+            }
+        }
+    }
+
+    /// A read key is a miss for the ingest kind and the other way round —
+    /// the prefix is part of the shape, so the lookup never reaches the
+    /// database for a key of the wrong kind.
+    #[test]
+    fn a_key_of_one_kind_is_malformed_for_the_other() {
+        let read = new_raw_key(GrowthKeyKind::Read);
+        let ingest = new_raw_key(GrowthKeyKind::Ingest);
+        assert!(read.starts_with("rgr_") && well_formed(GrowthKeyKind::Read, &read));
+        assert!(!well_formed(GrowthKeyKind::Ingest, &read));
+        assert!(!well_formed(GrowthKeyKind::Read, &ingest));
+        assert_eq!(display_prefix(GrowthKeyKind::Read, &read).len(), 12);
+        assert_eq!(GrowthKeyKind::claimed_by(&read), Some(GrowthKeyKind::Read));
+        assert_eq!(
+            GrowthKeyKind::claimed_by(&ingest),
+            Some(GrowthKeyKind::Ingest)
+        );
+        assert_eq!(GrowthKeyKind::claimed_by("rgr_"), Some(GrowthKeyKind::Read));
+        assert_eq!(GrowthKeyKind::claimed_by("eyJhbGciOi"), None, "a JWT");
+        assert_eq!(GrowthKeyKind::claimed_by("RGR_x"), None);
+        assert_eq!(GrowthKeyKind::claimed_by(""), None);
     }
 
     #[test]

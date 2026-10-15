@@ -40,9 +40,11 @@ use super::{
         Measured, aggregate, day_str, dt_ms, excluded_ids, find_docs, parse_day, str_of,
         utc_date_of,
     },
-    mounted, value,
+    mounted,
+    read_key::GrowthAuth,
+    value,
 };
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{error::ApiError, state::AppState};
 
 pub const DEFAULT_LIMIT: i64 = 500;
 pub const MAX_LIMIT: i64 = 2_000;
@@ -254,10 +256,9 @@ pub fn recent_weeks(today: NaiveDate, n: usize) -> Vec<NaiveDate> {
 /// `GET /api/admin/growth/orgs?limit=&include_internal=`
 pub async fn list_orgs(
     State(state): State<AppState>,
-    auth: AuthUser,
+    _auth: GrowthAuth,
     Query(q): Query<OrgsQuery>,
 ) -> Result<Json<OrgsReport>, ApiError> {
-    super::require_growth_admin(&state, &auth)?;
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let now = DateTime::now();
     let today = utc_date_of(now);
@@ -470,11 +471,10 @@ pub struct TimelineQuery {
 /// `GET /api/admin/growth/org/{tenant_id}/timeline?include_internal=`
 pub async fn org_timeline(
     State(state): State<AppState>,
-    auth: AuthUser,
+    _auth: GrowthAuth,
     Path(tenant_id): Path<String>,
     Query(q): Query<TimelineQuery>,
 ) -> Result<Json<TimelineReport>, ApiError> {
-    super::require_growth_admin(&state, &auth)?;
     let tid = ObjectId::parse_str(tenant_id.trim())
         .map_err(|_| ApiError::BadRequest("tenant_id must be a 24-hex ObjectId".into()))?;
     let set = if q.include_internal {
