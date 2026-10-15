@@ -19,7 +19,7 @@ native panel, the companion shows the "someone wants to view your screen" prompt
 | Crate | `agents/roomler-desktop` (Tauri 2; Rust in `src/`, a plain-JS front in `src/front/`, no bundler) |
 | Window | one 1100×740 main window (close = hide to tray) + two always-on-top panels (consent, "being viewed") |
 | Talks to | the LocalAPI only — `\\.\pipe\roomler` on Windows, a Unix socket elsewhere |
-| Ships in | the agent release (standalone EXE on Windows, `.deb` on Linux, the `.pkg` on macOS) |
+| Ships in | the agent release (standalone EXE on Windows; on Linux a `.deb` and an `.rpm`, each for x86_64 and aarch64 (FR-93 P6d, P6e; §10.1); the `.pkg` on macOS) |
 
 ## 1. Where it sits
 
@@ -438,6 +438,47 @@ flowchart LR
 - The whole device can opt out: `companion_autostart = false` stops the post-install launch
   and removes the Windows login start. On a multi-user server that is the switch to use —
   the machine-wide login start opens a companion in every interactive session.
+
+### 10.1 The Linux packages (FR-93 P6d, P6e)
+
+Before P6d the companion shipped as an x86_64 `.deb` only, so a system install on Fedora,
+the RHEL family or openSUSE, and every aarch64 host (Asahi, Ampere), had no consent prompt
+and no "being viewed" banner. The release now carries four Linux packages, built from the same
+binary per architecture:
+
+| | x86_64 | aarch64 |
+|---|---|---|
+| `.deb` (`cargo deb`) | `roomler-desktop-<v>-x86_64-unknown-linux-gnu.deb` | `roomler-desktop-<v>-aarch64-unknown-linux-gnu.deb` |
+| `.rpm` (`cargo generate-rpm`) | `roomler-desktop-<v>-x86_64-unknown-linux-gnu.rpm` | `roomler-desktop-<v>-aarch64-unknown-linux-gnu.rpm` |
+
+```mermaid
+flowchart LR
+  B["cargo build -p roomler-desktop<br/>(Ubuntu 22.04: the oldest glibc we support)"] --> D["cargo deb"]
+  B --> R["cargo generate-rpm<br/>requires written out"]
+  R --> G{"guard: every DT_NEEDED<br/>soname required? no ICU,<br/>no roomlerd? the arch?"}
+  G -- yes --> U["the release: .deb, .rpm, .sha256, .asc"]
+  G -- no --> F["the job fails"]
+```
+
+- ⚠️ **The `.rpm`'s requires are written out** in `agents/roomler-desktop/Cargo.toml`
+  (`auto-req = "no"`). `cargo generate-rpm`'s discovery runs `ldd`, which names the build host's
+  *transitive* libraries, Ubuntu 22.04's ICU 70 among them, and no Fedora satisfies those. The
+  list is the binary's own `DT_NEEDED`, by soname (the spelling every RPM distro provides), plus
+  `libayatana-appindicator3.so.1`, which the tray dlopens. A hand-kept list drifts, so the
+  release job reads both back: a library the binary links that the package does not require
+  fails the job.
+- There is **no `roomlerd` require** in the `.rpm`: those hosts install the daemon from the
+  tarball, not a package. The `.deb` keeps its `Depends: roomlerd`.
+- `install.sh` picks the package by the host's tools: `dpkg` takes the `.deb`; otherwise `rpm` with
+  `dnf`, `zypper` or `yum` takes the `.rpm`, and the package manager pulls webkit2gtk, GTK and the
+  tray library from the distro's repositories. zypper needs `--allow-unsigned-rpm` for a local
+  package; the sha256 is checked first.
+- The daemon reports the installed companion's version from `dpkg-query`, else from
+  `rpm -q --qf '%{VERSION}'` (`companion.rs`, `installed_version_inner`).
+- Every asset is signed (`.asc`) like the daemon's. The server's daemon-first ordering
+  (`agent_release::order_assets_daemon_first`) keys on the `roomler-desktop-` prefix, so an
+  `.rpm` sorts after the daemon's packages too, and no updater picks one: they match `.deb` and
+  `.tar.gz` only.
 
 ## 11. Testing it
 
