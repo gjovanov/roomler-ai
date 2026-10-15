@@ -2,7 +2,7 @@
 
 Every enrolled device and every `roomler` tunnel client holds a long-lived credential the server issued. This page is what each one is, how it stays alive without hands on the machine (FR-103), and how it ends.
 
-> **The short version.** A device's agent token lives a year. The device renews it itself, 180 days early. A device that was off across its expiry renews within a 90-day grace when it comes back. Removing a device ends every token it was ever given, even if the same machine enrolls again and revives the row.
+> **The short version.** A device's agent token lives a year. The device renews it itself, 180 days early. A device that was off across its expiry renews within a 90-day grace when it comes back. Removing a device ends every token it was ever given, even if the same machine enrolls again and revives the row. A device connected at its removal is told at once and stops (#2267).
 
 ## 1. The credentials
 
@@ -103,6 +103,47 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 
 > ⚠️ Rows removed before FR-103 P1 reached the server keep generation 0, so their old tokens can still revive. That is accepted (the spec's decision 3): such rows are few, and only an old removal is affected.
 
+### A connected device is told at once (#2267)
+
+A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1009`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1038`).
+
+Before #2267 the kick only took the device out of the hub. The device kept its socket and heard nothing. It learned of its removal at its next connection, after a network change or a pod roll, and on a stable network that could take days. Nothing could be done through that socket, because every action re-checks the row, but the device's own status read "connected" throughout.
+
+```mermaid
+sequenceDiagram
+    participant A as admin
+    participant P as pod that takes the request
+    participant Q as pod that holds the socket
+    participant D as device
+    A->>P: DELETE …/agent/{id}
+    P->>P: the holders (Hive's purge, the overlay lease), then the row
+    P->>P: kick: out of this pod's hub
+    P->>Q: control channel: kick {agent_id, goodbye}
+    Q->>D: rc:goodbye AgentDeleted, behind what was queued before
+    D->>D: peers closed, sentinel, exit-node routes dropped, exit 7
+    D-->>Q: the socket closes
+```
+
+| Removal | Is the device told? | Why |
+|---|---|---|
+| the admin's `DELETE …/agent/{id}` | yes | |
+| the ephemeral reaper | yes | |
+| an organization's archive | yes | before #2267 the archive did not even take the device out of the hub (`crates/modules/fleet/src/tenant_hooks.rs:50`) |
+| an ephemeral device's own unenroll | **no** | it is already shutting down, and a goodbye racing that clean stop would turn it into exit 7 (`tells_the_device`, `crates/modules/fleet/src/removal.rs:111`) |
+| a device this removal sent `rc:hive.purge_all` (FR-90 P2g-4a) | **no**, and its socket stays open as before | the exit is immediate, and the purge runs after its frame lands (`crates/modules/fleet/src/hub.rs:2973`) |
+
+What happens after exit 7 depends on the service manager. The device stays down until it is re-enrolled, but only Linux needs a hand to start it again:
+
+| Platform | After exit 7 | After `roomlerd re-enroll` |
+|---|---|---|
+| Windows (the service's own supervisor) | it starts the worker again with a backoff of up to 60 s, and each start is refused and exits 7 (`decide_exit_reaction`, `agents/roomlerd/src/win_service/supervisor.rs:921`) | the next start connects with the new token, with no restart |
+| macOS (launchd, `KeepAlive` on a failed exit) | relaunched at most every 10 s | the same |
+| Linux (systemd) | stays stopped: `RestartPreventExitStatus=7 8`, because restarting only hammers a server that already said no (`agents/roomlerd/packaging/linux/roomlerd.service:72`) | start it: `sudo systemctl start roomlerd`, or `systemctl --user start roomler` for a per-user install |
+
+> ⚠️ Linux's "start it again" is not new. Before #2267 the same exit happened at the device's next connection, so a remove → `re-enroll` sequence kept running without a start only while the socket happened to stay up between the two steps.
+
+> ⚠️ A device is told only on a socket it holds. One that is offline at its removal hears it at its next connection, as before.
+
 ## 5. Kill switches and knobs
 
 | Where | Switch | Default | Off means |
@@ -110,6 +151,7 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 | server | `rc.token_renewal` (`ROOMLER__RC__TOKEN_RENEWAL`) | on | both renew routes answer 404; devices keep the token they have |
 | server | `rc.token_generation_check` | on | the generation is not compared; removal no longer ends earlier tokens |
 | server | `rc.agent_token_ttl_secs` | one year | test knob: the TTL tokens are minted with. Prod is never shortened |
+| server | `rc.removal_goodbye` (`ROOMLER__RC__REMOVAL_GOODBYE`) | on | a removal's kick only takes the device out of the hub, and a connected device keeps its socket until something else drops it, as before #2267 |
 | device | `ROOMLERD_TOKEN_RENEWAL=0` | on | no renewal and no adopting a token from the file: the token it started with, as before FR-103 |
 | device | `ROOMLERD_TOKEN_RENEW_BEFORE_DAYS=N` | unset | renew exactly *N* days before expiry (testing) |
 
