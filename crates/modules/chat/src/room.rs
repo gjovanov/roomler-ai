@@ -149,12 +149,9 @@ pub async fn create(
     {
         let tenant = state.tenants.base.find_by_id(tid).await?;
         let used = state.rooms.count_for_tenant(tid).await?;
-        if let Err(d) = quota::check(
-            tenant.plan.clone(),
-            tenant.settings.plan_enforcement,
-            quota::Limit::MaxChannels,
-            used,
-        ) {
+        // FR-102 P4 — through core, which also counts the collision per org.
+        if let Err(d) = roomler_core::quota::check(&state, &tenant, quota::Limit::MaxChannels, used)
+        {
             return Err(ApiError::Forbidden(d.message()));
         }
     }

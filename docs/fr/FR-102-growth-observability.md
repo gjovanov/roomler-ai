@@ -314,6 +314,26 @@ sequenceDiagram
 - **Cost to serve** (FR-20 P5) sits beside billed revenue, giving margin per org. The list-price MRR column
   stays, labelled as such, for orgs with no invoice yet.
 - **Monthly totals are frozen** into `growth_daily`, so deleting an org does not rewrite last year's MRR.
+  *(P4 as built: `billing_events` lives in `saas` (its index set there — sparse-unique `event_id`, unique
+  `(kind, stripe_id)` partial on `invoice_paid`, `(tenant_id, ts)`, `(kind, ts)`), written through
+  `roomler_ai_services::dao::billing_event` by the Stripe webhook and the backfill. Beyond §3g's fields a
+  row keeps `recurring_cents` (the subscription lines that are not prorations, after discounts — the MRR
+  basis), `interval_months`, `subscription_id`, `status`, `reason`, `cancel_at_period_end`, `event_id`,
+  `source` (`webhook`·`backfill`); a subscription event's amount is `null`, never 0. Both Stripe API shapes
+  in the field are read (classic, and 2025-03-31's `parent.*`). The org comes from the `tenant_id` the
+  checkout now also stamps on the subscription's metadata, else the org's stored customer / subscription
+  id; an object naming no org is logged and not recorded. A processing failure un-marks `stripe_events`
+  so Stripe's retry is processed. **Billed MRR** at t is the recurring part of the org's newest paid
+  invoice whose period covers t, ÷ its interval in months, 0 after a deletion — so a seat change moves
+  MRR when an invoice bills it (the proration between is cash). Months are per currency; a month before
+  the first billing row is `on_record: false` (not measured) and never frozen; the nightly org-daily job
+  freezes each closed month 3 days after it ends (`growth_daily {source: billing}`, `growth_pulls
+  billing:YYYY-MM-01`), internal orgs left out; the backfill (`POST /api/admin/growth/billing/backfill`,
+  `saas`, platform admins) reads Stripe's paid invoices once, refreezes the months it touched and leaves
+  a `billing_backfill` marker. Quota collisions go through `roomler_core::quota` at all thirteen call
+  sites (counted in `warn` and `enforce` alike, nothing with `growth.enabled = false`). The funnel's
+  `paid` hangs off the org step (no window: "paid so far"). View: `GET /api/admin/growth/revenue`, the
+  Revenue tab; the digest's revenue section gains `billed` and `upgrade_intent`.)*
 
 ### 3h. The newsletter (P5)
 
@@ -552,7 +572,7 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 | `growth_posts` | core | `{platform, platform_id, account, format, url, published_at, key, cost_cents}`, unique `(platform, platform_id)`; no post text (P8) | indefinitely (our own content) | `saas`'s ingest route |
 | `growth_post_snapshots` | core | `{platform, platform_id, snapshot: T+1d\|T+7d\|T+28d, taken_at, metrics {raw: number}}`, unique `(platform, platform_id, snapshot)`, written once (P8) | indefinitely | `saas`'s ingest route |
 | `growth_pulls` | core | `_id = "<source>:<day>"`, `{source, day, status: ok\|failed, pulled_at, attempted_at, attempts, rows, error, missing_goal, truncated}` — whether a puller's day exists, so "not pulled" and "failed" are never read as 0 (P6) | indefinitely, like the rows it describes | the pullers (`saas`'s purestat puller from P6) |
-| `billing_events` | `saas` | §3g | with the org | the Stripe webhook |
+| `billing_events` | `saas` | §3g, plus `recurring_cents`, `interval_months`, `subscription_id`, `status`, `reason`, `cancel_at_period_end`, `event_id` (sparse-unique), `source: webhook\|backfill`; unique `(kind, stripe_id)` for paid invoices (P4) | with the org (`purge_tenant`); the monthly totals frozen into `growth_daily` stay | the Stripe webhook, the operator's backfill |
 | `enroll_token_issued` | `fleet` | `_id = jti`, §3e | 90 days | token issuance, the enroll |
 | `setup_diagnostics` | `fleet` | `{run, step, outcome, elapsed_ms, error_code, os, wizard_version, ts}` | 90 days | the wizard, opt-in |
 | `agents.install` | `fleet` | `{method, scope, run}` | with the agent row | the enroll |
@@ -592,7 +612,7 @@ hosted only). §7's retention list grows, and `docs/data-model.md`'s stale TTLs 
 | P2 | §3d: definitions, `growth_org_daily`, the funnel/cohorts/orgs/timeline endpoints, the Growth page (Overview, Orgs, Cohorts) | `ROOMLER__GROWTH__ENABLED=false` (the routes answer 404) | **live** 2026-10-15 00:10Z (`hosted-20261014-831ebcf`): #2215 `193848ff0`. AC6 by the integration lane; AC7 owed (a platform-admin read of the funnel against hand counts); AC8 needs a day older than 90 days |
 | P3 | §3e 1–4 and 6: issuance record, fetch counters, the enroll's `install` (server, agent, scripts, wizard), the Install panel | counters off by config; the agent sends `install` only when it is set | **server half live** 2026-10-15 00:10Z (`hosted-20261014-831ebcf`): #2217 `36f871029`; AC10 + AC11 field-verified (§8). The agent half (`roomlerd enroll` flags/env, the scripts, the wizard, the companion) ships with the next agent release after 0.4.136, then AC9 on vmtest |
 | P3b | §3e 5: the wizard's opt-in diagnostics, after D4 | the checkbox; `ROOMLER__GROWTH__SETUP_DIAGNOSTICS=false` | — |
-| P4 | §3g: `billing_events` and the backfill, MRR movements, quota collisions, margin | the new webhook kinds are additive; the panel | — |
+| P4 | §3g: `billing_events` and the backfill, MRR movements, quota collisions, margin | the new webhook kinds are additive (unselect them on the Stripe endpoint and nothing new is recorded); `growth.enabled = false` hides the view and stops the collision counter | PR #PR_NUMBER — `billing_events` (`saas`) from the six Stripe kinds, `POST …/growth/billing/backfill`, quota collisions through `roomler_core::quota`, the monthly freeze, `GET …/growth/revenue`, the Revenue tab, the funnel's `paid`, the digest's billed section |
 | P5 | §3h: the list over time, SendGrid events (D6), per-issue tags (D5), the per-issue table | the webhook route off (no `ROOMLER__NEWSLETTER__EVENT_WEBHOOK_PUBLIC_KEY`); tags off in the sender (`ROOMLER__NEWSLETTER__LINK_TAGS=false`) | PR #2244 — `POST /api/sendgrid/webhook` (`saas`), the per-issue tags and `i=`, `GET …/growth/newsletter`, the Newsletter tab, the digest's delivery |
 | PS1 | §3n PS1 in purestat | — | **live** with PS0a in v0.1.8; the roomler.ai key minted 2026-10-14 (only its hash stored; sealed into `roomler2-secret`, roomler-ai-deploy#29) |
 | P6 | §3i: the purestat puller, the Campaigns table with coverage | no key ⇒ "not measured" | **merged** #2229 `fb7e45831` — the puller (`saas`), `growth_pulls`, `GET …/growth/campaigns`, the Campaigns tab; live with the next promote, then AC16 (a platform-admin read) and the puller's first cycle |

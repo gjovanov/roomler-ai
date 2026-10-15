@@ -551,7 +551,8 @@ async fn the_channels_view_joins_reach_visitors_signups_and_spend_by_each_posts_
     assert_eq!(s["web"]["visitors"], 55);
     assert_eq!(s["signups"], 1);
     assert_eq!(s["activated"]["count"], 1);
-    assert_eq!(s["paid"]["arrives_with"], "P4");
+    // P4 — measured (saas is mounted), nobody paid: a zero.
+    assert_eq!(s["paid"]["count"], 0);
     assert_eq!(s["spend"]["cost_cents"], 5000);
     assert_eq!(s["spend"]["per_visitor"]["n"], 55);
     assert_eq!(s["spend"]["per_visitor"]["cents"], 90.91);

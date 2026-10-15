@@ -95,6 +95,12 @@ mod growth_funnel_tests;
 /// half); the per-issue unsubscribe; the per-issue table and the digest.
 #[cfg(test)]
 mod growth_newsletter_tests;
+/// FR-102 P4 — billed revenue through Stripe's own signature scheme (AC13's
+/// test half: the lifecycle's invoice amounts, MRR month by month, the
+/// coupon control), the frozen months surviving an org's purge, the
+/// backfill against a fake Stripe, and the quota-collision counter.
+#[cfg(test)]
+mod growth_revenue_tests;
 /// FR-102 — growth observability: the campaign taxonomy at ingress (AC5),
 /// the exclusion list and the set every growth number applies (AC4).
 #[cfg(test)]
