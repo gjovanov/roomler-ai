@@ -295,6 +295,8 @@ enum Command {
     /// Root-only and single-shot. Hidden: launchd or systemd is the caller — by
     /// hand it is `sudo roomlerd update-helper`, and running it non-root only
     /// prints the refusal.
+    /// `update-helper --capabilities` (FR-96 P3) is answered before this
+    /// parser runs: see `daemon_main`.
     #[command(hide = true, name = "update-helper")]
     UpdateHelper,
     /// Smoke-test the encoder cascade: open the preferred encoder at
@@ -1196,6 +1198,18 @@ async fn daemon_main() -> Result<()> {
     // that one has to run before a run loop it can never return from.
     if let Some(argv) = embedded_cli_args() {
         return roomler_cli::cli::run_from(argv, roomler_cli::cli::Origin::EmbeddedInDaemon).await;
+    }
+
+    // FR-96 P3 — `roomlerd update-helper --capabilities`: what this binary's
+    // update half can do, one word per line, for `install.sh` (any user). None
+    // of the setup below is its, and it is read off argv, not through clap.
+    // ⚠️ As a `--capabilities` field on `Command::UpdateHelper` it cost ~9 KB
+    // more main-thread stack at start in an unoptimized build (measured on
+    // Linux: ~1000 KB without it, ~1009 KB with it), and Windows gives the
+    // main thread 1 MB: the debug binary overflowed there before printing a
+    // line (the FR-85 recorder lane, #2225).
+    if updater::answer_capabilities_query() {
+        return Ok(());
     }
 
     // FR-90 P1a — `roomlerd hive-mcp <socket>`: a Hive session's toolbelt
@@ -5128,6 +5142,29 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
             Err(e) => Err(anyhow::anyhow!(e).context(format!(
                 "could not write the update-helper wake file {}",
                 updater::MACOS_UPDATE_TRIGGER
+            ))),
+        };
+    }
+    // FR-96 P3 — Linux: where the root update helper owns this host's updates,
+    // a non-root `self-update` installs nothing either (it could not write
+    // /usr: #2046). It wakes the helper, by the daemon's own decision, so the
+    // two never disagree about who installs. Root keeps the direct path, and
+    // `--check-only` touches nothing.
+    #[cfg(target_os = "linux")]
+    if !check_only && let Some(link) = updater::helper_owns_updates() {
+        return match updater::queue_update_check() {
+            Ok(()) => {
+                println!(
+                    "Queued for the root update helper (roomler-update.service, enabled by {}).\n\
+                     Watch: journalctl -u roomler-update.service\n\
+                     The daemon restarts onto the new binary once nothing it serves would be cut.",
+                    link.display()
+                );
+                Ok(())
+            }
+            Err(e) => Err(anyhow::anyhow!(e).context(format!(
+                "could not write the update-helper wake file {}",
+                updater::LINUX_UPDATE_TRIGGER
             ))),
         };
     }
