@@ -31,7 +31,8 @@ impl TransferActivityDao {
     }
 
     /// "What crossed the clipboard and file channels of this machine?"
-    /// Newest first.
+    /// Newest first, `_id` breaking a tie in one millisecond: a report's rows
+    /// go in as one ordered insert, so `_id` order is arrival order.
     pub async fn list_for_agent(
         &self,
         tenant_id: ObjectId,
@@ -41,7 +42,7 @@ impl TransferActivityDao {
         self.base
             .find_paginated(
                 doc! { "tenant_id": tenant_id, "agent_id": agent_id },
-                Some(doc! { "at": -1 }),
+                Some(doc! { "at": -1, "_id": -1 }),
                 params,
             )
             .await

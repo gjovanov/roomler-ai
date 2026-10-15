@@ -419,3 +419,56 @@ async fn a_worker_exit_is_kept_after_its_session_ended() {
     );
     assert_eq!(body["items"][0]["session_id"].as_str(), Some(with.as_str()));
 }
+
+/// One millisecond of reports lists newest first, in the order the hub
+/// recorded them. This pins the flake the first cell hit on #2272's
+/// integration run (2026-10-15): its four reports landed in one millisecond,
+/// `at` was the only sort key, and the index returned the tied rows oldest
+/// first, so the trail read `refused` before the `off` it followed. These rows
+/// go straight into the collection with one `at`, so the tie is certain rather
+/// than a race.
+#[tokio::test]
+async fn one_millisecond_of_reports_lists_in_arrival_order() {
+    use roomler_ai_remote_control::models::{PrivacyActivityEvent, PrivacyActivityKind};
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr99p1dtie").await;
+    let (a, _a_ws) = connect_agent(&app, &seeded, "mach-fr99-p1d-tie").await;
+    let tenant_id = bson::oid::ObjectId::parse_str(&seeded.tenant_id).unwrap();
+    let agent_id = bson::oid::ObjectId::parse_str(&a).unwrap();
+    let at = bson::DateTime::now();
+    // Ids made in order rise, as the hub's inserts' do.
+    let rows: Vec<PrivacyActivityEvent> = [
+        PrivacyActivityKind::On,
+        PrivacyActivityKind::Off,
+        PrivacyActivityKind::Refused,
+    ]
+    .into_iter()
+    .map(|kind| PrivacyActivityEvent {
+        id: Some(bson::oid::ObjectId::new()),
+        tenant_id,
+        agent_id,
+        session_id: bson::oid::ObjectId::new(),
+        controller_user_id: bson::oid::ObjectId::new(),
+        kind,
+        reason: None,
+        at,
+    })
+    .collect();
+    app.db
+        .collection::<PrivacyActivityEvent>(PrivacyActivityEvent::COLLECTION)
+        .insert_many(rows)
+        .await
+        .unwrap();
+
+    let body = settle(&app, &seeded, &a, 3).await;
+    assert_eq!(
+        trail(&body),
+        [
+            ("on".to_string(), None),
+            ("off".to_string(), None),
+            ("refused".to_string(), None),
+        ],
+        "{body}"
+    );
+}
