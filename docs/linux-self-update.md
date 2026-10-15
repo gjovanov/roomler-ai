@@ -221,7 +221,7 @@ sequenceDiagram
     participant U as roomlerd update-helper (root)
     D->>W: touch: a wake, its content never read (P2a)
     W-->>P: PathExists
-    Note over P: the timer fires too: 5 min after boot, then every 6 h
+    Note over P: the timer fires too: 5 min after boot (at once if started later), then every 6 h
     P->>U: start roomler-update.service
     U->>U: consume/move-aside the wake; space ≥60 s from the last run; the opt-out; the cooldown
     U->>U: check_once, then download_asset → a FRESH private dir (the pinned release key)
@@ -232,7 +232,7 @@ sequenceDiagram
 | unit | what | the macOS twin (`com.roomler.update.plist`) |
 |---|---|---|
 | `roomler-update.service` | `Type=oneshot`, `ExecStart=/usr/bin/roomlerd update-helper` | the program |
-| `roomler-update.timer` | `OnBootSec=5min`, `OnUnitActiveSec=6h`, `RandomizedDelaySec=30min` | `RunAtLoad`, `StartInterval` |
+| `roomler-update.timer` | `OnBootSec=5min` (already past for a timer started after boot, so that one fires at once), `OnUnitActiveSec=6h`, `RandomizedDelaySec=30min` | `RunAtLoad`, `StartInterval` |
 | `roomler-update.path` | `PathExists=/var/tmp/roomler-update-check` | `WatchPaths` |
 
 - **Shipped in both packages, disabled.**
@@ -428,8 +428,41 @@ one, and reads the helper's state before and after by the daemon's own test
   updates would put two updaters on one host.
 - A non-root `roomlerd self-update` wakes the helper where it owns updates,
   through the daemon's own decision, so the CLI and the daemon never disagree.
-- `README.Debian` does the same by hand: enable the helper before starting
-  the user unit, and leave it off with the system unit.
+- `README.Debian` describes the manual flow: check that the helper is on, then
+  start the user unit. With the system unit, the helper steps aside.
+
+### The package turns it on too (P5)
+
+A per-user daemon runs under its unit's `NoNewPrivileges=true`, so it can
+never install a release itself, on any distro. The kernel ignores the setuid
+bit of everything it spawns: pkexec exits 127 (*"must be setuid root"*), and
+sudo exits 1 (*"the 'no new privileges' flag is set"*). P3 turns the helper on
+through `install.sh` only, so a per-user `.deb` installed any other way (apt,
+the Software app, `dpkg -i`) never updated again. From P5 the package takes
+care of it.
+
+```mermaid
+flowchart LR
+    I["a .deb install,<br/>by any path"] -->|"postinst: deb-systemd-helper<br/>enable timer + path"| H["roomler-update.timer<br/>roomler-update.path"]
+    H -->|"at once, then every 6 h;<br/>or a push"| S{"roomlerd.service<br/>enabled?"}
+    S -->|"yes: a system install"| A["the helper steps aside;<br/>the root daemon updates itself"]
+    S -->|"no: a per-user install"| U["the helper installs as root;<br/>the daemon restarts onto it once idle"]
+```
+
+| what | how |
+|---|---|
+| `postinst` turns the update half on | `deb-systemd-helper` enables `roomler-update.timer` and `.path` on the first configure of a version that ships it, which is an existing host's first upgrade too. It never re-enables them over an administrator's `systemctl disable`. The daemon units stay untouched, as they always were. |
+| the helper steps aside on a system install | with `roomlerd.service` enabled, after its 60 s gate, so one updater per host holds however the units got enabled |
+| the timer it starts fires at once | an `OnBootSec` already in the past elapses immediately (`systemd.timer(5)`; measured, FR-96 §8), so the unit needs nothing more |
+| a daemon that cannot install says so | with the helper off it downloads nothing and logs `sudo systemctl enable --now roomler-update.timer roomler-update.path`. It hands its updates to the helper as soon as one is on, with no restart |
+
+⚠️ A host whose daemon is already stuck cannot receive this by itself: one
+install by a person heals it (`sudo apt install ./roomlerd.deb`, the Software
+app, or a re-run of `install.sh`). The running daemon then follows on its own
+only if it has P2b: once idle, and once its own last failed attempt is 10 min
+old. An older daemon runs its old image until its next start, a re-login or a
+reboot (`install.sh` restarts it). Details:
+[FR-96 §3.6](fr/FR-96-per-user-linux-installs-update-themselves.md#36-the-package-turns-on-its-own-update-half-p5-as-built).
 
 The phases:
 
@@ -439,6 +472,7 @@ The phases:
 | **P2a** | the per-user daemon wakes the helper instead of installing, and its unit may write the wake file |
 | **P2b** | the per-user daemon onto its replaced binary once idle, whatever replaced it |
 | **P3** | `install.sh` enables the units for a per-user install, and turns them off for `--system`; a non-root `self-update` wakes the helper |
+| **P5** | the `.deb` enables them itself (`postinst`, the Debian way), the helper steps aside on a system install, and a daemon that cannot install waits for the helper |
 
 Status and evidence: [FR-96](fr/FR-96-per-user-linux-installs-update-themselves.md).
 

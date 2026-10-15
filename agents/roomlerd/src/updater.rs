@@ -2803,7 +2803,8 @@ pub async fn run_periodic(
         // SAFETY: geteuid takes no arguments and cannot fail.
         let euid = unsafe { libc::geteuid() };
         let enabled = helper_enable_link_in(&UPDATE_HELPER_ENABLE_LINKS.map(std::path::Path::new));
-        match decide_update_owner(euid, tunnel_core::env::flag("UPDATE_HELPER", true), enabled) {
+        let helper_switch = tunnel_core::env::flag("UPDATE_HELPER", true);
+        match decide_update_owner(euid, helper_switch, enabled) {
             UpdateOwner::Helper(link) => {
                 tracing::info!(
                     enabled_by = %link.display(),
@@ -2812,15 +2813,25 @@ pub async fn run_periodic(
                 );
                 return forward_triggers(shutdown, trigger_rx).await;
             }
+            // FR-96 P5 — the helper is off, and nothing this daemon spawns can
+            // elevate (its unit's NoNewPrivileges): the in-process path would
+            // download every release only to fail pkexec and sudo. Wait for the
+            // helper instead. Not under the kill switch: that one is AC7's
+            // "today's behaviour exactly".
+            UpdateOwner::InProcess(_)
+                if helper_switch && !can_install_in_process(euid, no_new_privs()) =>
+            {
+                return wait_for_the_helper(shutdown, trigger_rx, interval).await;
+            }
             UpdateOwner::InProcess(why) => {
                 tracing::info!(%why, "auto-updater: this daemon installs its own updates");
             }
-            UpdateOwner::InProcessBesideHelper(link) => tracing::warn!(
+            // FR-96 P5 — the .deb enables the helper on every install, a system
+            // install's too, and there it steps aside (`run_update_helper`).
+            UpdateOwner::InProcessBesideHelper(link) => tracing::info!(
                 enabled_by = %link.display(),
-                "auto-updater: a ROOT daemon on a host whose roomler-update helper is ALSO enabled — \
-                 this daemon keeps installing its own updates (a system install is unchanged), and \
-                 the two can race on the package manager. The helper is for per-user installs: \
-                 `sudo systemctl disable --now roomler-update.path roomler-update.timer`"
+                "auto-updater: this root daemon installs its own updates; the root update helper is \
+                 enabled here too (the .deb enables it) and steps aside for a system install"
             ),
         }
     }
@@ -3054,6 +3065,128 @@ const UPDATE_HELPER_ENABLE_LINKS: [&str; 4] = [
 #[cfg(target_os = "linux")]
 fn helper_enable_link_in(links: &[&std::path::Path]) -> Option<PathBuf> {
     links.iter().find(|l| l.exists()).map(|l| l.to_path_buf())
+}
+
+/// FR-96 P5 — a system install: `roomlerd.service` (`WantedBy=multi-user.target`)
+/// enabled, read by link as [`UPDATE_HELPER_ENABLE_LINKS`] reads the helper's.
+/// The helper steps aside there, because that root daemon installs its own
+/// updates. Locked to the unit by `the_system_daemon_links_are_its_install_target`.
+#[cfg(target_os = "linux")]
+const SYSTEM_DAEMON_ENABLE_LINKS: [&str; 2] = [
+    "/etc/systemd/system/multi-user.target.wants/roomlerd.service",
+    "/run/systemd/system/multi-user.target.wants/roomlerd.service",
+];
+
+/// FR-96 P5 — does this process run with `no_new_privs`? A per-user daemon
+/// under its unit's `NoNewPrivileges=true` does. The kernel then ignores the
+/// setuid bit of everything it spawns: pkexec says "must be setuid root", and
+/// sudo says the flag "prevents sudo from running as root" (measured on Ubuntu
+/// 26.04, 2026-10-15).
+#[cfg(target_os = "linux")]
+fn no_new_privs() -> bool {
+    // SAFETY: PR_GET_NO_NEW_PRIVS takes no pointer and only reads a flag.
+    unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1 }
+}
+
+/// FR-96 P5 — can THIS process install a release itself? Root can. A non-root
+/// process can try the `.deb` ladder (pkexec, then `sudo -n`) only without
+/// `no_new_privs`: a daemon started by hand, say. Under its unit, nothing it
+/// spawns can elevate. Pure, so the rule is a unit test.
+#[cfg(target_os = "linux")]
+fn can_install_in_process(euid: u32, no_new_privs: bool) -> bool {
+    euid == 0 || !no_new_privs
+}
+
+/// FR-96 P5 — how often a daemon waiting for the helper looks for it: the
+/// check is one `stat` per link.
+#[cfg(target_os = "linux")]
+const HELPER_RECHECK: Duration = Duration::from_secs(10 * 60);
+
+/// What turns updates on for a daemon that cannot install them itself.
+#[cfg(target_os = "linux")]
+const ENABLE_THE_HELPER: &str = "sudo systemctl enable --now roomler-update.timer roomler-update.path \
+    (or reinstall the .deb, or re-run install.sh)";
+
+/// FR-96 P5 — the [`run_periodic`] body of a per-user daemon that cannot install
+/// (it runs with `no_new_privs`) on a host whose root update helper is off.
+///
+/// It downloads nothing and installs nothing: the in-process path would fetch
+/// every release only to fail pkexec and sudo. It says once what turns updates
+/// on, and again for each push. It hands over to the helper as soon as one is
+/// enabled, on the next push or within [`HELPER_RECHECK`], with no restart: that
+/// push is forwarded, and so is every later one.
+#[cfg(target_os = "linux")]
+async fn wait_for_the_helper(
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    trigger_rx: tokio::sync::mpsc::Receiver<Option<String>>,
+    interval: Duration,
+) {
+    tracing::warn!(
+        how = ENABLE_THE_HELPER,
+        "auto-updater: this daemon cannot install updates — it runs with no_new_privs (its \
+         unit's NoNewPrivileges), so pkexec and sudo cannot elevate — and the root update helper \
+         is not enabled. Nothing is downloaded until the helper is on"
+    );
+    wait_for_the_helper_with(
+        std::path::Path::new(LINUX_UPDATE_TRIGGER),
+        || helper_enable_link_in(&UPDATE_HELPER_ENABLE_LINKS.map(std::path::Path::new)),
+        interval.min(HELPER_RECHECK),
+        shutdown,
+        trigger_rx,
+    )
+    .await
+}
+
+/// [`wait_for_the_helper`] against an explicit wake path and helper probe, so
+/// a test can turn the helper on mid-wait.
+#[cfg(target_os = "linux")]
+async fn wait_for_the_helper_with(
+    wake: &std::path::Path,
+    helper_on: impl Fn() -> Option<PathBuf>,
+    recheck: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut trigger_rx: tokio::sync::mpsc::Receiver<Option<String>>,
+) {
+    loop {
+        let pushed = tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { return; }
+                continue;
+            }
+            _ = tokio::time::sleep(recheck) => false,
+            maybe = trigger_rx.recv() => {
+                // The sender lives in a process-wide OnceLock, so a closed
+                // channel is unreachable in practice; never hot-loop on one.
+                if maybe.is_none() { return; }
+                true
+            }
+        };
+        let Some(link) = helper_on() else {
+            if pushed {
+                tracing::warn!(
+                    how = ENABLE_THE_HELPER,
+                    "rc:agent.update received, but this daemon cannot install updates and the root \
+                     update helper is not enabled"
+                );
+            }
+            continue;
+        };
+        tracing::info!(
+            enabled_by = %link.display(),
+            "auto-updater: the root update helper is enabled now — handing updates to it"
+        );
+        if pushed {
+            match queue_update_check_at(wake) {
+                Ok(()) => tracing::info!(
+                    trigger = %wake.display(),
+                    "rc:agent.update queued for the root update helper (roomler-update.service); \
+                     watch `journalctl -u roomler-update.service`"
+                ),
+                Err(e) => tracing::warn!(error = %e, "could not write the update-helper wake file"),
+            }
+        }
+        return forward_triggers_to(wake, shutdown, trigger_rx).await;
+    }
 }
 
 /// Who installs this Linux daemon's updates (FR-96 P2a).
@@ -3362,6 +3495,20 @@ pub async fn run_update_helper() -> anyhow::Result<()> {
                 error = %e,
                 "update-helper: could not write the run-spacing stamp; the next run waits the full gap"
             );
+        }
+        // FR-96 P5 — the .deb enables this helper on every install, a system
+        // install's too. There the root daemon installs its own updates, so the
+        // helper steps aside: one updater per host, whoever enabled what. After
+        // the gate, so a flood of wakes is still paced.
+        if let Some(link) =
+            helper_enable_link_in(&SYSTEM_DAEMON_ENABLE_LINKS.map(std::path::Path::new))
+        {
+            tracing::info!(
+                enabled_by = %link.display(),
+                "update-helper: a system install — its root daemon (roomlerd.service) installs its \
+                 own updates; stepping aside"
+            );
+            return Ok(());
         }
     }
 
@@ -4254,6 +4401,12 @@ mod tests {
         );
         let timer = include_str!("../packaging/linux/roomler-update.timer");
         assert!(timer.lines().any(|l| l.trim() == "OnUnitActiveSec=6h"));
+        assert!(
+            timer.lines().any(|l| l.trim() == "OnBootSec=5min"),
+            "the first run: OnUnitActiveSec counts from a run, so without OnBootSec a timer \
+             started after boot (by the .deb's postinst, or install.sh) would never fire. An \
+             OnBootSec already past elapses at once"
+        );
         assert!(timer.lines().any(|l| l.trim() == "WantedBy=timers.target"));
     }
 
@@ -4704,6 +4857,157 @@ mod tests {
             "roomler.service must carry ReadWritePaths= for {}",
             dir.display()
         );
+    }
+
+    /// FR-96 P5 — who can install a release in-process: root always, a non-root
+    /// process only without `no_new_privs` (under its unit, never).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_root_or_a_process_without_no_new_privs_installs_in_process() {
+        assert!(can_install_in_process(0, false));
+        assert!(can_install_in_process(0, true));
+        assert!(
+            can_install_in_process(1000, false),
+            "a daemon started by hand"
+        );
+        assert!(
+            !can_install_in_process(1000, true),
+            "a per-user daemon under its unit"
+        );
+    }
+
+    /// FR-96 P5 — the helper's step-aside reads the links that `systemctl
+    /// enable roomlerd.service` makes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_system_daemon_links_are_its_install_target() {
+        let unit = include_str!("../packaging/linux/roomlerd.service");
+        assert!(
+            unit.lines()
+                .any(|l| l.trim() == "WantedBy=multi-user.target"),
+            "roomlerd.service's install target moved: update SYSTEM_DAEMON_ENABLE_LINKS"
+        );
+        for link in SYSTEM_DAEMON_ENABLE_LINKS {
+            assert!(
+                link.ends_with("/multi-user.target.wants/roomlerd.service"),
+                "{link}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn drained(tx: &tokio::sync::mpsc::Sender<Option<String>>) {
+        for _ in 0..200 {
+            if tx.capacity() == tx.max_capacity() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the push was never taken");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn appears_soon(p: &std::path::Path) -> bool {
+        for _ in 0..200 {
+            if p.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// FR-96 P5 — a daemon that cannot install, on a host whose helper is off:
+    /// a push writes no wake (nothing would hear it). Once the helper is on,
+    /// the push that finds it is forwarded, and so is every later one. The
+    /// loop ends on shutdown.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_daemon_waiting_for_the_helper_hands_over_once_it_is_enabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wake = tmp.path().join("roomler-update-check");
+        let on = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel(4);
+        let (w, o) = (wake.clone(), on.clone());
+        let task = tokio::spawn(async move {
+            let probe = move || {
+                o.load(std::sync::atomic::Ordering::SeqCst).then(|| {
+                    PathBuf::from("/etc/systemd/system/paths.target.wants/roomler-update.path")
+                })
+            };
+            wait_for_the_helper_with(
+                &w,
+                probe,
+                Duration::from_secs(3600),
+                shutdown_rx,
+                trigger_rx,
+            )
+            .await
+        });
+
+        trigger_tx.send(None).await.expect("push");
+        drained(&trigger_tx).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!wake.exists(), "with the helper off, a push wakes nothing");
+
+        on.store(true, std::sync::atomic::Ordering::SeqCst);
+        trigger_tx.send(None).await.expect("push");
+        assert!(
+            appears_soon(&wake).await,
+            "the push that finds the helper on is forwarded"
+        );
+
+        std::fs::remove_file(&wake).expect("the helper consumes it");
+        trigger_tx.send(None).await.expect("push");
+        assert!(appears_soon(&wake).await, "and so is every later one");
+
+        shutdown_tx.send(true).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop ends on shutdown")
+            .expect("join");
+    }
+
+    /// FR-96 P5 — the periodic recheck hands over without a push, and invents
+    /// no wake while doing it; the next push is then forwarded.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_daemon_waiting_for_the_helper_hands_over_on_its_recheck_too() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wake = tmp.path().join("roomler-update-check");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel(4);
+        let w = wake.clone();
+        let task = tokio::spawn(async move {
+            let probe = || {
+                Some(PathBuf::from(
+                    "/etc/systemd/system/timers.target.wants/roomler-update.timer",
+                ))
+            };
+            wait_for_the_helper_with(
+                &w,
+                probe,
+                Duration::from_millis(20),
+                shutdown_rx,
+                trigger_rx,
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !wake.exists(),
+            "the recheck hands over without inventing a wake"
+        );
+        trigger_tx.send(None).await.expect("push");
+        assert!(appears_soon(&wake).await, "the next push is forwarded");
+
+        shutdown_tx.send(true).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop ends on shutdown")
+            .expect("join");
     }
 
     /// A push, on a host whose helper owns updates, writes the wake file and
