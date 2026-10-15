@@ -24,6 +24,7 @@
         <v-tab value="overview">Overview</v-tab>
         <v-tab value="campaigns">Campaigns</v-tab>
         <v-tab value="channels">Channels</v-tab>
+        <v-tab value="newsletter">Newsletter</v-tab>
         <v-tab value="orgs">Orgs</v-tab>
         <v-tab value="cohorts">Cohorts</v-tab>
         <v-tab value="digest">Digest</v-tab>
@@ -166,6 +167,11 @@
         <!-- ── Channels (P8) ─────────────────────────────────────────── -->
         <v-window-item value="channels">
           <growth-channels />
+        </v-window-item>
+
+        <!-- ── Newsletter (P5) ───────────────────────────────────────── -->
+        <v-window-item value="newsletter">
+          <growth-newsletter />
         </v-window-item>
 
         <!-- ── Orgs ──────────────────────────────────────────────────── -->
@@ -423,6 +429,7 @@ import {
 } from '@/stores/growth'
 import GrowthCampaigns from '@/components/growth/GrowthCampaigns.vue'
 import GrowthChannels from '@/components/growth/GrowthChannels.vue'
+import GrowthNewsletter from '@/components/growth/GrowthNewsletter.vue'
 import GrowthNode from '@/components/growth/GrowthNode.vue'
 import GrowthNotMeasured from '@/components/growth/GrowthNotMeasured.vue'
 import GrowthPercentiles from '@/components/growth/GrowthPercentiles.vue'

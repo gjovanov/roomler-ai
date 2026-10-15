@@ -12,6 +12,7 @@ pub mod oauth;
 pub mod purestat;
 pub mod push;
 pub mod quota;
+pub mod sendgrid;
 pub mod stripe;
 
 pub use auth::AuthService;

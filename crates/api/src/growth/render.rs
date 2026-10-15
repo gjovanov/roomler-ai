@@ -452,6 +452,9 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
             out.push(Line("New subscribers".into(), fig(&n.new)));
             out.push(Line("Confirmed".into(), fig(&n.confirmed)));
             out.push(Line("Unsubscribed".into(), fig(&n.unsubscribed)));
+            if let Some(v) = &n.unsubscribed_via_issue {
+                out.push(Line("… through an issue's link".into(), fig(v)));
+            }
             if let Some(p) = pct_if_enough(n.confirmed.d28, n.new.d28) {
                 out.push(Line("Confirm rate (28d)".into(), format!("{p:.1} %")));
             }
@@ -489,10 +492,25 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
                         "Failed".into(),
                         "Suppressed".into(),
                         "Stale".into(),
+                        "Delivered".into(),
+                        "Bounced (hard)".into(),
+                        "Complaints".into(),
+                        "Unsubscribed via".into(),
                     ],
                     n.issues
                         .iter()
                         .map(|i| {
+                            let (delivered, bounced, complaints) = match &i.delivery {
+                                Measured::Value(d) => (
+                                    d.delivered.to_string(),
+                                    format!("{} ({})", d.bounced, d.hard_bounced),
+                                    d.complaints.to_string(),
+                                ),
+                                Measured::NotMeasured(_) => {
+                                    let nm = "not measured".to_string();
+                                    (nm.clone(), nm.clone(), nm)
+                                }
+                            };
                             vec![
                                 i.slug.clone(),
                                 i.subject.clone(),
@@ -502,12 +520,47 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
                                 i.counts.failed.to_string(),
                                 i.counts.suppressed.to_string(),
                                 i.counts.stale.to_string(),
+                                delivered,
+                                bounced,
+                                complaints,
+                                i.unsubscribed_via
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "—".into()),
                             ]
                         })
                         .collect(),
                 ));
+                // Why a delivery cell reads "not measured" (one line per
+                // distinct reason, never a 0).
+                let mut reasons: Vec<String> = n
+                    .issues
+                    .iter()
+                    .filter_map(|i| match &i.delivery {
+                        Measured::NotMeasured(nm) => Some(not_measured(nm)),
+                        Measured::Value(_) => None,
+                    })
+                    .collect();
+                reasons.sort();
+                reasons.dedup();
+                for r in reasons {
+                    out.push(Note(format!("Delivery {r}")));
+                }
             }
-            out.push(Line("Delivery".into(), not_measured(&n.delivery)));
+            match &n.delivery {
+                Measured::Value(d) => {
+                    out.push(Line("Delivered".into(), fig(&d.delivered)));
+                    out.push(Line(
+                        "Bounced".into(),
+                        format!("{} — hard: {}", fig(&d.bounced), fig(&d.hard_bounced)),
+                    ));
+                    out.push(Line("Dropped".into(), fig(&d.dropped)));
+                    out.push(Line("Spam reports".into(), fig(&d.complaints)));
+                    out.push(Line("Addresses suppressed".into(), fig(&d.suppressed)));
+                }
+                Measured::NotMeasured(nm) => {
+                    out.push(Line("Delivery".into(), not_measured(nm)));
+                }
+            }
         }
         Measured::NotMeasured(n) => out.push(Note(not_measured(n))),
     }
@@ -862,6 +915,79 @@ mod tests {
         assert_eq!(pct_if_enough(15, 30), Some(50.0));
         assert_eq!(pct_if_enough(1, 300), Some(0.3));
         assert_eq!(pct_if_enough(0, 0), None);
+    }
+
+    #[test]
+    /// P5 — the newsletter's delivery renders as numbers where SendGrid's
+    /// webhook measured it, and as "not measured" (never 0) where it did
+    /// not; an issue's cells say which.
+    fn newsletter_delivery_renders_measured_and_not_measured_apart() {
+        use super::super::digest::{
+            DeliveryFigures, IssueCountsOut, IssueDelivery, IssueRow, Newsletter,
+        };
+        let (doc, mut s) = sample();
+        let f = |day, d7, d28| Figure { day, d7, d28 };
+        let issue = |slug: &str, delivery| IssueRow {
+            slug: slug.into(),
+            subject: format!("Issue {slug}"),
+            sent_at: "2026-10-13T08:00:00Z".into(),
+            counts: IssueCountsOut {
+                total: 4,
+                sent: 4,
+                ..Default::default()
+            },
+            delivery,
+            unsubscribed_via: Some(1),
+            campaign: Some(format!("nl-{slug}")),
+        };
+        s.newsletter = Measured::Value(Newsletter {
+            new: f(1, 2, 3),
+            confirmed: f(1, 1, 1),
+            unsubscribed: f(1, 1, 2),
+            unsubscribed_via_issue: Some(f(1, 1, 1)),
+            by_source: Vec::new(),
+            issues: vec![
+                issue(
+                    "oct",
+                    Measured::Value(IssueDelivery {
+                        delivered: 3,
+                        bounced: 1,
+                        hard_bounced: 1,
+                        dropped: 0,
+                        complaints: 0,
+                    }),
+                ),
+                issue(
+                    "old",
+                    Measured::NotMeasured(NotMeasured::now(
+                        "sent before delivery events were recorded",
+                    )),
+                ),
+            ],
+            delivery: Measured::Value(DeliveryFigures {
+                delivered: f(3, 3, 9),
+                bounced: f(1, 1, 2),
+                hard_bounced: f(1, 1, 1),
+                dropped: f(0, 0, 0),
+                complaints: f(0, 0, 1),
+                suppressed: f(1, 1, 2),
+            }),
+        });
+        let text = render_text(&doc, &s);
+        assert!(text.contains("Delivered: 3 (7d 3 · 28d 9)"), "{text}");
+        assert!(text.contains("Bounced: 1 (7d 1 · 28d 2) — hard: 1 (7d 1 · 28d 1)"));
+        assert!(text.contains("Addresses suppressed: 1 (7d 1 · 28d 2)"));
+        assert!(text.contains("… through an issue's link: 1 (7d 1 · 28d 1)"));
+        assert!(text.contains("| 3 | 1 (1) | 0 | 1"), "{text}");
+        assert!(text.contains("not measured | not measured | not measured | 1"));
+        assert!(text.contains("Delivery not measured — sent before delivery events were recorded"));
+        // Without the webhook, the window's delivery is a reason, not a 0.
+        if let Measured::Value(n) = &mut s.newsletter {
+            n.delivery = Measured::NotMeasured(NotMeasured::now("no webhook key"));
+        }
+        let text = render_text(&doc, &s);
+        assert!(text.contains("Delivery: not measured — no webhook key"));
+        assert!(!text.contains("Delivered: "));
     }
 
     #[test]

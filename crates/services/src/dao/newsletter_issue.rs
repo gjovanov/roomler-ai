@@ -86,6 +86,28 @@ impl NewsletterIssueDao {
         Ok(claimed)
     }
 
+    /// FR-102 P5 — what the fan-out tagged this issue's messages with, set
+    /// when it starts: the `utm_campaign` its links carry (`None` with the
+    /// tags off), and whether its delivery events are recorded (every
+    /// message names the issue for SendGrid, AND this server verifies the
+    /// Event Webhook — without the key, SendGrid's posts are refused and
+    /// the issue's delivery can never be measured). Re-stamped by a resume.
+    pub async fn stamp_send_tags(
+        &self,
+        slug: &str,
+        campaign: Option<&str>,
+        delivery_events: bool,
+    ) -> DaoResult<bool> {
+        let update = match campaign {
+            Some(c) => doc! { "$set": { "campaign": c, "delivery_events": delivery_events } },
+            None => doc! {
+                "$set": { "delivery_events": delivery_events },
+                "$unset": { "campaign": "" },
+            },
+        };
+        self.base.update_one(doc! { "slug": slug }, update).await
+    }
+
     /// Keep the claim visibly alive while the fan-out runs. Scoped to this
     /// pod's own claim so a superseded task can't extend a claim it lost.
     pub async fn heartbeat(&self, slug: &str, pod_id: &str) -> DaoResult<bool> {

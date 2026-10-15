@@ -55,6 +55,9 @@ tokio-tungstenite = "0.26"
 futures.workspace = true
 # FR-90 P0f — the canary test's browser writes binary DataChannel frames.
 bytes = "1"
+# FR-102 P5 — the newsletter tests sign SendGrid Event Webhook batches with a
+# test P-256 key (the version the workspace already builds).
+ring = "0.17"
 
 # FR-90 P0f — the canary test (`tests/hive_canary.rs`) drives a REAL device:
 # the Hive supervisor, its replica store and its viewer peer, with sessions
