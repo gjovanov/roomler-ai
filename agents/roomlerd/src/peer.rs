@@ -500,10 +500,6 @@ impl AgentPeer {
         // webrtc-rs's default H.265 registration is PT 126, no fmtp
         // line, same rtcp feedback as H.264 — matches Chrome
         // Canary/Beta/Stable 127+ which accept the same shape.
-        // RETIRED-NAME-ANCHOR(4): this is the WebRTC STREAM ID, which travels in the
-        // SDP as the msid. No viewer code keys on it today, but it is a wire value
-        // and a rename would be observable to any consumer that does. Frozen until
-        // something proves nothing reads it. See docs/fr/FR-21.
         //
         // #2231 — on a DataChannel transport this track carries no frame (the
         // DC pump owns the video); it only keeps the SDP answer valid. Its
@@ -517,6 +513,10 @@ impl AgentPeer {
                 "RTP video track takes a codec the offer carries; the DataChannel carries the video"
             );
         }
+        // RETIRED-NAME-ANCHOR(4): this is the WebRTC STREAM ID, which travels in the
+        // SDP as the msid. No viewer code keys on it today, but it is a wire value
+        // and a rename would be observable to any consumer that does. Frozen until
+        // something proves nothing reads it. See docs/fr/FR-21.
         let video_track = Arc::new(TrackLocalStaticSample::new(
             build_video_codec_cap(&track_codec),
             "video".to_string(),
