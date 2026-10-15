@@ -1,6 +1,6 @@
 #!/bin/sh
 # Reload systemd so a unit CHANGE shipped by this package takes effect on
-# upgrade.
+# upgrade, and turn on the package's own update half (FR-96 P5).
 #
 # The units ship as plain cargo-deb assets rather than through its
 # `systemd-units` integration, and that stays deliberate: enabling and
@@ -15,17 +15,58 @@
 # shipped and did nothing. Verified on buildhost: before this script the package
 # had no maintainer scripts at all, only .list and .md5sums.
 #
-# Reload ONLY. This must never enable, start, restart or stop anything:
-# a package upgrade is not permission to change what is running on the host,
-# and restarting the daemon here would fight the self-updater that invoked
-# dpkg in the first place.
+# The DAEMON is never enabled, started, restarted or stopped here — neither
+# `roomlerd.service` (system) nor `roomler.service` (per-user): a package
+# upgrade is not permission to change what is running on the host, and
+# restarting the daemon would fight the self-updater that invoked dpkg in the
+# first place.
+#
+# FR-96 P5 — the one thing this script does turn on is the package's update
+# half: `roomler-update.timer` and `roomler-update.path`, which wake the root
+# one-shot `roomler-update.service`. A per-user daemon runs under its unit's
+# NoNewPrivileges, so it can never install a release itself: pkexec and sudo
+# are both refused. Without the helper, a per-user install made any way but
+# install.sh (apt, the Software app, dpkg) never updates again. On a system
+# install the helper steps aside (that root daemon installs its own updates),
+# so enabling it everywhere keeps one updater per host. Enabled the Debian way,
+# through deb-systemd-helper: on the first configure of a version that ships
+# this, and never again over an administrator who disabled it. The opt-out
+# stays /etc/roomler/disable-auto-update.
 set -e
+
+HELPER_UNITS="roomler-update.timer roomler-update.path"
+
+if [ "$1" = configure ] || [ "$1" = abort-upgrade ] || [ "$1" = abort-deconfigure ] || [ "$1" = abort-remove ]; then
+    if command -v deb-systemd-helper >/dev/null 2>&1; then
+        for unit in $HELPER_UNITS; do
+            # Only lifts the mask this package's postrm sets on removal.
+            deb-systemd-helper unmask "$unit" >/dev/null 2>&1 || true
+            # was-enabled answers yes when there is no state yet (the first
+            # configure of a version that ships this), and no after an
+            # administrator disabled the unit: then the state is refreshed only.
+            if deb-systemd-helper --quiet was-enabled "$unit"; then
+                deb-systemd-helper enable "$unit" >/dev/null 2>&1 || true
+            else
+                deb-systemd-helper update-state "$unit" >/dev/null 2>&1 || true
+            fi
+        done
+    fi
+fi
 
 # Absent in containers / chroots / docker builds, where there is no systemd
 # to talk to and `systemctl` would fail.
 if [ -d /run/systemd/system ]; then
     # Never fatal: a failed reload must not leave the package unconfigured.
     systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ "$1" = configure ] && command -v deb-systemd-invoke >/dev/null 2>&1; then
+        for unit in $HELPER_UNITS; do
+            # The timer and the path only, and only where enabled; starting them
+            # wakes nothing at once (the timer's first run is OnActiveSec later).
+            if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+                deb-systemd-invoke start "$unit" >/dev/null 2>&1 || true
+            fi
+        done
+    fi
 fi
 
 # NOTE: the per-user unit (`roomler.service`, systemd --user) cannot be
