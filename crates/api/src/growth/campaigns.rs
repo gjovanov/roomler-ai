@@ -19,8 +19,10 @@
 //!   timeout or an unreachable purestat make every web cell
 //!   `not_measured` with the reason — never 0; a key purestat answered for
 //!   and saw no visitor of IS a zero. A step whose module is not mounted is
-//!   `null` with the module named. `paid` is `not_measured` until P4,
-//!   `reach` until P8.
+//!   `null` with the module named. `paid` is `not_measured` until P4.
+//! * **Reach** (P8) is each platform's own numbers for the posts published
+//!   in the range with the key, as the promotion pipeline pushed them
+//!   (`channels::reach_by_key`) — `not_measured` when no such post exists.
 //! * **Every rate carries its n**; below [`SMALL_N`] it has no value.
 //!
 //! ⚠️ Every key field is client-chosen text: render it as TEXT.
@@ -47,6 +49,7 @@ use roomler_core::{
 use serde::{Deserialize, Serialize};
 
 use super::{
+    channels::PlatformReach,
     digest::{
         CampaignGoals, Coverage, Measured, NotMeasured, SMALL_N, day_str, parse_day, utc_date_of,
     },
@@ -105,7 +108,8 @@ pub struct WebCells {
 }
 
 impl WebCells {
-    fn zero(goals_measured: bool, conversions: &Option<NotMeasured>) -> Self {
+    /// A measured zero (a key purestat saw no visit of).
+    pub(crate) fn zero(goals_measured: bool, conversions: &Option<NotMeasured>) -> Self {
         Self {
             visitors: 0,
             visits: 0,
@@ -168,8 +172,10 @@ pub struct CampaignRow {
     pub activated: Option<StepCounts>,
     pub first_value: Option<StepCounts>,
     pub paid: NotMeasured,
-    /// Each platform's own numbers for the key's posts (P8).
-    pub reach: NotMeasured,
+    /// P8 — each platform's own numbers for the posts published in the
+    /// range with this key, per snapshot age (raw metric names);
+    /// `not_measured` when no such post was pushed.
+    pub reach: Measured<Vec<PlatformReach>>,
     /// purestat's `signup` conversions against the server's sign-ups for
     /// the key — what share of them the browser saw.
     pub coverage: Measured<Coverage>,
@@ -329,8 +335,52 @@ fn coverage(goals: &Measured<CampaignGoals>, server_signups: u64) -> Measured<Co
     }
 }
 
-fn step_rate(step: Option<StepCounts>) -> Option<Rate> {
+pub(crate) fn step_rate(step: Option<StepCounts>) -> Option<Rate> {
     step.map(|s| Rate::of(s.count as i64, s.settled as i64))
+}
+
+/// `[since 00:00, until+1 00:00)` in milliseconds — the account plane's
+/// window for a range of UTC days, both inclusive.
+pub(crate) fn day_range_ms(since: NaiveDate, until: NaiveDate) -> (i64, i64) {
+    let start = |d: NaiveDate| {
+        d.and_hms_opt(0, 0, 0)
+            .expect("midnight exists")
+            .and_utc()
+            .timestamp_millis()
+    };
+    (start(since), start(until) + DAY_MS)
+}
+
+/// The sign-up's normalised key, cut to `depth`; `None` = organic.
+pub(crate) fn signup_key(s: &funnel::SignupFact, depth: KeyDepth) -> Option<CampaignKey> {
+    let a = s.attribution.as_ref()?;
+    CampaignKey::normalized(
+        a.source.as_deref(),
+        a.medium.as_deref(),
+        a.campaign.as_deref(),
+        a.content.as_deref(),
+    )
+    .map(|k| k.at_depth(depth))
+}
+
+/// The account plane grouped by the normalised key at `depth`.
+pub(crate) fn account_by_key(
+    facts: &funnel::Facts<'_>,
+    depth: KeyDepth,
+) -> BTreeMap<Option<CampaignKey>, GroupCounts> {
+    funnel::group_by(facts, |s| signup_key(s, depth))
+}
+
+/// A key with no sign-up: zeros where the step's module is mounted (a
+/// measured zero), `null` where it is not.
+pub(crate) fn blank_counts(read: &funnel::Read) -> GroupCounts {
+    GroupCounts {
+        signups: 0,
+        org_created: StepCounts::default(),
+        activated: read.first_device.as_ref().map(|_| StepCounts::default()),
+        first_value: (read.first_device.is_some() && read.first_value.is_some())
+            .then(StepCounts::default),
+    }
 }
 
 /// The join, pure: the web plane (a value, or the reason it has none) and
@@ -343,6 +393,8 @@ pub fn join(
     conversions: &Option<NotMeasured>,
     account: &BTreeMap<Option<CampaignKey>, GroupCounts>,
     blank: &GroupCounts,
+    reach: &BTreeMap<CampaignKey, Vec<PlatformReach>>,
+    reach_absent: &NotMeasured,
 ) -> (Vec<CampaignRow>, bool) {
     let mut keys: Vec<&CampaignKey> = account.keys().flatten().collect();
     if let Ok(w) = web {
@@ -378,7 +430,10 @@ pub fn join(
                 activated: acc.activated,
                 first_value: acc.first_value,
                 paid: NotMeasured::later("the org's first paid invoice", "P4"),
-                reach: NotMeasured::later("each platform's own numbers per post", "P8"),
+                reach: match reach.get(key) {
+                    Some(r) => Measured::Value(r.clone()),
+                    None => Measured::NotMeasured(reach_absent.clone()),
+                },
                 coverage,
                 rates: Rates {
                     signup_per_visitor,
@@ -428,30 +483,43 @@ pub fn pull_summary(pulls: &[GrowthPull], days: u32, saas_mounted: bool) -> Pull
     }
 }
 
-/// The web plane for the range: the breakdown at `depth` and the totals,
-/// or the reason there is none. A goal the site lacks costs the
-/// conversions only.
-struct Web {
-    by_key: Result<BTreeMap<CampaignKey, WebCells>, NotMeasured>,
-    totals: Measured<WebCells>,
-    conversions: Option<NotMeasured>,
-    truncated: bool,
+/// One breakdown of the web plane: by the key at a depth, or the reason
+/// there is none. A goal the site lacks costs the conversions only.
+pub(crate) struct WebBreakdown {
+    pub(crate) by_key: Result<BTreeMap<CampaignKey, WebCells>, NotMeasured>,
+    pub(crate) conversions: Option<NotMeasured>,
+    pub(crate) truncated: bool,
 }
 
 fn not_measured_of(e: &PurestatError) -> NotMeasured {
     NotMeasured::now(e.to_string())
 }
 
-async fn read_web(state: &AppState, since: &str, until: &str, depth: KeyDepth) -> Web {
+/// This server's purestat client, or why there is none (no key — and then
+/// nothing is ever asked).
+pub(crate) fn web_client(state: &AppState) -> Result<PurestatClient, NotMeasured> {
     let g = &state.settings.growth;
-    let Some(client) = PurestatClient::new(&g.purestat_url, &g.purestat_api_key) else {
-        let n = not_measured_of(&PurestatError::NotConfigured);
-        return Web {
-            by_key: Err(n.clone()),
-            totals: Measured::NotMeasured(n),
-            conversions: None,
-            truncated: false,
-        };
+    PurestatClient::new(&g.purestat_url, &g.purestat_api_key)
+        .ok_or_else(|| not_measured_of(&PurestatError::NotConfigured))
+}
+
+/// purestat's breakdown of `[since, until]` by exactly the UTM dimensions
+/// of `depth`, folded by the normalised key.
+pub(crate) async fn web_breakdown(
+    client: &Result<PurestatClient, NotMeasured>,
+    since: &str,
+    until: &str,
+    depth: KeyDepth,
+) -> WebBreakdown {
+    let client = match client {
+        Ok(c) => c,
+        Err(n) => {
+            return WebBreakdown {
+                by_key: Err(n.clone()),
+                conversions: None,
+                truncated: false,
+            };
+        }
     };
     let breakdown = client
         .query_or_without_goals(&Query::range(
@@ -462,39 +530,55 @@ async fn read_web(state: &AppState, since: &str, until: &str, depth: KeyDepth) -
             &GOALS,
         ))
         .await;
-    let (paged, missing) = match breakdown {
-        Ok(v) => v,
-        Err(e) => {
-            let n = not_measured_of(&e);
-            return Web {
-                by_key: Err(n.clone()),
-                totals: Measured::NotMeasured(n),
-                conversions: None,
-                truncated: false,
-            };
+    match breakdown {
+        Ok((paged, missing)) => {
+            let conversions = missing.map(|goal| {
+                NotMeasured::now(format!("{goal} is not defined on the purestat site"))
+            });
+            WebBreakdown {
+                by_key: Ok(web_by_key(&paged.rows, depth, &conversions)),
+                conversions,
+                truncated: paged.truncated,
+            }
         }
+        Err(e) => WebBreakdown {
+            by_key: Err(not_measured_of(&e)),
+            conversions: None,
+            truncated: false,
+        },
+    }
+}
+
+/// purestat's totals for `[since, until]` — one query with no dimension, so
+/// its visitors are unique over the range.
+async fn web_totals(
+    client: &Result<PurestatClient, NotMeasured>,
+    since: &str,
+    until: &str,
+    breakdown: &WebBreakdown,
+) -> Measured<WebCells> {
+    let client = match (client, &breakdown.by_key) {
+        (Err(n), _) | (_, Err(n)) => return Measured::NotMeasured(n.clone()),
+        (Ok(c), Ok(_)) => c,
     };
-    let conversions =
-        missing.map(|goal| NotMeasured::now(format!("{goal} is not defined on the purestat site")));
-    let goals: &[&str] = if conversions.is_some() { &[] } else { &GOALS };
-    let totals = match client
+    let goals: &[&str] = if breakdown.conversions.is_some() {
+        &[]
+    } else {
+        &GOALS
+    };
+    match client
         .query(&Query::range(since, until, &[], &WEB_METRICS, goals))
         .await
     {
         Ok(rows) => {
-            let mut t = WebCells::zero(conversions.is_none(), &conversions);
+            let conversions = &breakdown.conversions;
+            let mut t = WebCells::zero(conversions.is_none(), conversions);
             if let Some(r) = rows.first() {
                 t.add(r);
             }
             Measured::Value(t)
         }
         Err(e) => Measured::NotMeasured(not_measured_of(&e)),
-    };
-    Web {
-        by_key: Ok(web_by_key(&paged.rows, depth, &conversions)),
-        totals,
-        conversions,
-        truncated: paged.truncated,
     }
 }
 
@@ -529,17 +613,7 @@ pub async fn get_campaigns(
     };
 
     // The account plane: the range's sign-ups, `[since 00:00, until+1 00:00)`.
-    let start_ms = since
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight exists")
-        .and_utc()
-        .timestamp_millis();
-    let end_ms = until
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight exists")
-        .and_utc()
-        .timestamp_millis()
-        + DAY_MS;
+    let (start_ms, end_ms) = day_range_ms(since, until);
     let read = funnel::read(
         &state,
         &set,
@@ -548,35 +622,36 @@ pub async fn get_campaigns(
     )
     .await?;
     let facts = read.facts(now.timestamp_millis());
-    let account = funnel::group_by(&facts, |s| {
-        let a = s.attribution.as_ref()?;
-        CampaignKey::normalized(
-            a.source.as_deref(),
-            a.medium.as_deref(),
-            a.campaign.as_deref(),
-            a.content.as_deref(),
-        )
-        .map(|k| k.at_depth(depth))
-    });
+    let account = account_by_key(&facts, depth);
     let signups = facts.signups.len() as u64;
     let keyed_signups: u64 = account
         .iter()
         .filter(|(k, _)| k.is_some())
         .map(|(_, g)| g.signups)
         .sum();
-    let blank = GroupCounts {
-        signups: 0,
-        org_created: StepCounts::default(),
-        activated: read.first_device.as_ref().map(|_| StepCounts::default()),
-        first_value: (read.first_device.is_some() && read.first_value.is_some())
-            .then(StepCounts::default),
-    };
+    let blank = blank_counts(&read);
 
     // The web plane, live, for the same days.
     let (since_s, until_s) = (day_str(since), day_str(until));
-    let web = read_web(&state, &since_s, &until_s, depth).await;
-    let (rows, rows_truncated) = join(&web.by_key, &web.conversions, &account, &blank);
-    let totals_coverage = match &web.totals {
+    let client = web_client(&state);
+    let web = web_breakdown(&client, &since_s, &until_s, depth).await;
+    let totals_web = web_totals(&client, &since_s, &until_s, &web).await;
+
+    // P8 — the platforms' own numbers for the posts published in the range,
+    // by the same key.
+    let social = super::channels::read_posts(&state, start_ms, end_ms).await?;
+    let reach = super::channels::reach_by_key(&social.posts, &social.snapshots, depth);
+    let reach_absent = super::channels::no_reach_reason(&state, &social);
+
+    let (rows, rows_truncated) = join(
+        &web.by_key,
+        &web.conversions,
+        &account,
+        &blank,
+        &reach,
+        &reach_absent,
+    );
+    let totals_coverage = match &totals_web {
         Measured::Value(t) => coverage(&t.goals, signups),
         Measured::NotMeasured(n) => Measured::NotMeasured(n.clone()),
     };
@@ -610,7 +685,7 @@ pub async fn get_campaigns(
         value_basis: read.basis.clone(),
         not_measured: read.step_reasons(),
         totals: Totals {
-            web: web.totals,
+            web: totals_web,
             signups,
             keyed_signups,
             coverage: totals_coverage,
@@ -745,7 +820,23 @@ mod tests {
         .into_iter()
         .collect();
         let blank = group(0, 0, 0);
-        let (out, cut) = join(&web, &None, &account, &blank);
+        // P8 — one LinkedIn post carries the li key; nothing else has reach.
+        let reach: BTreeMap<CampaignKey, Vec<PlatformReach>> = [(
+            li.clone(),
+            vec![PlatformReach {
+                platform: "linkedin".into(),
+                posts: 1,
+                at: vec![super::super::channels::ReachAt {
+                    snapshot: "T+1d".into(),
+                    posts: 1,
+                    metrics: [("impressions".to_string(), 1000.0)].into_iter().collect(),
+                }],
+            }],
+        )]
+        .into_iter()
+        .collect();
+        let absent = NotMeasured::now("no post pushed with this key in the range");
+        let (out, cut) = join(&web, &None, &account, &blank, &reach, &absent);
         assert!(!cut);
         assert_eq!(out.len(), 3, "linkedin, youtube, x — no organic row");
         let li_row = &out[0];
@@ -767,11 +858,18 @@ mod tests {
             })
         );
         assert_eq!(li_row.paid.arrives_with.as_deref(), Some("P4"));
-        assert_eq!(li_row.reach.arrives_with.as_deref(), Some("P8"));
-        // youtube from `youtub`, on the web plane only: zero sign-ups.
+        let r = li_row.reach.value().expect("the post's reach");
+        assert_eq!((r[0].platform.as_str(), r[0].posts), ("linkedin", 1));
+        assert_eq!(r[0].at[0].metrics["impressions"], 1000.0);
+        // youtube from `youtub`, on the web plane only: zero sign-ups, and
+        // no post pushed with its key — reach not measured, never 0.
         assert_eq!(out[1].key.source, "youtube");
         assert_eq!(out[1].signups, 0);
         assert_eq!(out[1].group, "youtube");
+        assert_eq!(
+            serde_json::to_value(&out[1].reach).unwrap(),
+            serde_json::json!({ "not_measured": "no post pushed with this key in the range" })
+        );
         // x on the account plane only: a measured zero on the web.
         let x_row = out.iter().find(|r| r.key == x).unwrap();
         assert_eq!(x_row.web.value().unwrap().visitors, 0);
@@ -786,7 +884,7 @@ mod tests {
         // never 0; the account plane is untouched.
         let down: Result<BTreeMap<CampaignKey, WebCells>, NotMeasured> =
             Err(NotMeasured::now("purestat unreachable: unauthorized (401)"));
-        let (out, _) = join(&down, &None, &account, &blank);
+        let (out, _) = join(&down, &None, &account, &blank, &reach, &absent);
         assert_eq!(out.len(), 2, "the account plane's keys still list");
         for r in &out {
             assert!(!r.web.is_measured());
@@ -820,7 +918,14 @@ mod tests {
         )];
         let web = Ok(web_by_key(&rows, KeyDepth::Campaign, &conversions));
         let blank = group(0, 0, 0);
-        let (out, _) = join(&web, &conversions, &BTreeMap::new(), &blank);
+        let (out, _) = join(
+            &web,
+            &conversions,
+            &BTreeMap::new(),
+            &blank,
+            &BTreeMap::new(),
+            &NotMeasured::now("no post"),
+        );
         let w = out[0].web.value().unwrap();
         assert_eq!(w.visitors, 40);
         assert!(!w.goals.is_measured());

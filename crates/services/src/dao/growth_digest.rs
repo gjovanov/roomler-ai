@@ -39,7 +39,10 @@ pub const GROWTH_DIGESTS: &str = "growth_digests";
 /// 2 since FR-102 P3: `sections.install` became a section of its own and
 /// `orgs_devices.by_install_method` a measured list; a version-1 row still
 /// answers the GET as plain JSON (`digest::sections_json` falls back).
-pub const DIGEST_VERSION: u32 = 2;
+/// 3 since P8: `sections.social` is a measured section (posts per platform,
+/// the day's snapshots) instead of a fixed "arrives with P8"; an older row's
+/// `{not_measured, arrives_with}` still reads as the measured type's other arm.
+pub const DIGEST_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

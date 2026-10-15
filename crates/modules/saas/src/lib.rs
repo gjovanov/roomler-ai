@@ -6,7 +6,10 @@
 //! public updates list and the newsletter sending program (FR-39 / FR-58),
 //! the platform-admin plan-compliance view (FR-32), and FR-102's purestat
 //! puller (P6, [`purestat_pull`] — the web plane frozen daily into the core
-//! `growth_daily` collection, through the core DAO). Everything here
+//! `growth_daily` collection, through the core DAO) and the promotion
+//! pipeline's ingest routes (P8, [`growth_ingest`] — posts and metric
+//! snapshots into the core `growth_posts` / `growth_post_snapshots`,
+//! behind a hashed ingest key). Everything here
 //! exists because roomler.ai is a hosted product; a self-hosted deployment
 //! runs without it, which is why it is an **add-on feature** on the host
 //! rather than part of any profile.
@@ -31,7 +34,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::FromRef,
+    extract::{DefaultBodyLimit, FromRef},
     routing::{get, post, put},
 };
 use roomler_ai_config::Settings;
@@ -42,6 +45,7 @@ use roomler_ai_services::dao::{
 };
 use roomler_core::{Capabilities, Core, Module, TenantCtx};
 
+pub mod growth_ingest;
 pub mod newsletter;
 pub mod newsletter_send;
 pub mod plan_compliance;
@@ -133,7 +137,28 @@ impl Module for SaasState {
             .route("/issues/{slug}/send", post(newsletter::send))
             .route("/issues/{slug}/status", get(newsletter::status));
 
+        // FR-102 P8 — the promotion pipeline's pushes (D11), opened by an
+        // INGEST key and nothing else (D12). The gate runs first, before the
+        // body is read: a missing, wrong or revoked key — and
+        // `growth.enabled = false` — is the empty 404 of a path that does
+        // not exist, never 401/403 (AC18).
+        let growth_ingest_routes = Router::new()
+            .route(
+                "/admin/growth/ingest/posts",
+                post(growth_ingest::ingest_post),
+            )
+            .route(
+                "/admin/growth/ingest/snapshots",
+                post(growth_ingest::ingest_snapshot),
+            )
+            .route_layer(DefaultBodyLimit::max(growth_ingest::MAX_BODY_BYTES))
+            .route_layer(axum::middleware::from_fn_with_state(
+                self.clone(),
+                growth_ingest::require_ingest_key,
+            ));
+
         Router::new()
+            .merge(growth_ingest_routes)
             .nest("/stripe", stripe)
             .nest("/admin/newsletter", admin_newsletter)
             // FR-32 P1c — "who would break if enforcement were turned on?".

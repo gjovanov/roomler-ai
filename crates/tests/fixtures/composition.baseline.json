@@ -5,6 +5,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/admin/growth/channels",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/admin/growth/cohorts",
       "methods": "GET,HEAD"
     },
@@ -31,6 +35,22 @@
     {
       "path": "/api/admin/growth/funnel",
       "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/admin/growth/ingest/posts",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/admin/growth/ingest/snapshots",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/admin/growth/keys",
+      "methods": "GET,HEAD,POST"
+    },
+    {
+      "path": "/api/admin/growth/keys/{key_id}",
+      "methods": "DELETE"
     },
     {
       "path": "/api/admin/growth/org-daily/backfill",
@@ -1372,6 +1392,23 @@
         ]
       },
       {
+        "collection": "growth_keys",
+        "indexes": [
+          {
+            "key": {
+              "hash": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "kind": 1,
+              "created_at": -1
+            }
+          }
+        ]
+      },
+      {
         "collection": "growth_org_daily",
         "indexes": [
           {
@@ -1390,6 +1427,36 @@
               "day_start": 1
             },
             "expireAfterSeconds": 64800000
+          }
+        ]
+      },
+      {
+        "collection": "growth_post_snapshots",
+        "indexes": [
+          {
+            "key": {
+              "platform": 1,
+              "platform_id": 1,
+              "snapshot": 1
+            },
+            "unique": true
+          }
+        ]
+      },
+      {
+        "collection": "growth_posts",
+        "indexes": [
+          {
+            "key": {
+              "platform": 1,
+              "platform_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "published_at": 1
+            }
           }
         ]
       },
@@ -3111,6 +3178,23 @@
         ]
       },
       {
+        "collection": "growth_keys",
+        "indexes": [
+          {
+            "key": {
+              "hash": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "kind": 1,
+              "created_at": -1
+            }
+          }
+        ]
+      },
+      {
         "collection": "growth_org_daily",
         "indexes": [
           {
@@ -3129,6 +3213,36 @@
               "day_start": 1
             },
             "expireAfterSeconds": 64800000
+          }
+        ]
+      },
+      {
+        "collection": "growth_post_snapshots",
+        "indexes": [
+          {
+            "key": {
+              "platform": 1,
+              "platform_id": 1,
+              "snapshot": 1
+            },
+            "unique": true
+          }
+        ]
+      },
+      {
+        "collection": "growth_posts",
+        "indexes": [
+          {
+            "key": {
+              "platform": 1,
+              "platform_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "published_at": 1
+            }
           }
         ]
       },
