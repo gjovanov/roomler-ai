@@ -2086,7 +2086,7 @@ mod sshd {
         // was answering exec prompts a minute earlier. `what` is the lead,
         // because "grant SSH" and "open an interactive shell as SYSTEM" are not
         // the same question.
-        let native = indicator.show_prompt(crate::indicator::PromptView {
+        let view = crate::indicator::PromptView {
             session_hex: sentinel.to_string(),
             title: "SSH session request".into(),
             lead: format!("{caller} wants to {what} on this device."),
@@ -2094,8 +2094,9 @@ mod sshd {
             permissions: String::new(),
             org: String::new(),
             expires_at: std::time::Instant::now() + timeout,
-        });
-        let prompt = crate::consent::PendingPrompt {
+        };
+        let native = indicator.show_prompt(view.clone());
+        let mut prompt = crate::consent::PendingPrompt {
             kind: crate::consent::PromptKind::Ssh,
             asked_by: caller,
             permissions: String::new(),
@@ -2111,13 +2112,15 @@ mod sshd {
                 crate::consent::PromptSurface::Companion
             },
         };
-        let mut have_surface = native;
-        if let Err(e) = broker.write_prompt(sentinel, &prompt) {
-            if !native {
-                have_surface = false;
+        let marker = match broker.write_prompt(sentinel, &prompt) {
+            Ok(_) => true,
+            Err(e) => {
+                warn!(%caller, %sentinel, %e, native, "ssh: could not write the .pending consent marker");
+                false
             }
-            warn!(%caller, %sentinel, %e, native, "ssh: could not write the .pending consent marker");
-        }
+        };
+        let mut have_surface = native;
+        let mut notified = false;
         if !native {
             // Awaited, not spawned, and bounded: its verdict is what lets the
             // refusal below say "nobody could be asked" instead of "nobody
@@ -2129,11 +2132,24 @@ mod sshd {
             )
             .await
             .unwrap_or(false);
-            if !companion_up {
-                have_surface = false;
+            // FR-93 P6f — the last on-screen surface, as for a screen-control
+            // request: a desktop notification where the companion cannot show
+            // the question.
+            if !(companion_up && marker) {
+                notified = indicator.show_notification_prompt(view).await;
             }
+            if notified && marker {
+                prompt.surface = crate::consent::PromptSurface::Notification;
+                if let Err(e) = broker.write_prompt(sentinel, &prompt) {
+                    warn!(%caller, %sentinel, %e, "ssh: could not mark the consent prompt as shown by a notification");
+                }
+            }
+            // A companion that is up and has the marker to read IS a surface:
+            // this read `native` alone, so a question the companion showed
+            // and nobody answered was reported as one nobody could be asked.
+            have_surface = (companion_up && marker) || notified;
         }
-        info!(%caller, %sentinel, native, have_surface, "consent prompt surface (ssh)");
+        info!(%caller, %sentinel, native, notified, have_surface, "consent prompt surface (ssh)");
 
         let decision = broker
             .request_with_mode(sentinel, crate::consent::Mode::Prompt { timeout })

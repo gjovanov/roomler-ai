@@ -241,7 +241,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:2615`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:191`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:753`, `delegate.rs:790`; the worker side is `delegate_worker.rs:341`, wired at `main.rs:3702`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:753`, `delegate.rs:790`; the worker side is `delegate_worker.rs:341`, wired at `main.rs:3710`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -786,7 +786,7 @@ flowchart LR
     D --> S{"strictest_of(directive, local)"}
     S -- "auto, local true" --> G["grant, ~1 ms"]
     S -- "auto, local false → Prompt over the server's window" --> P
-    S -- "prompt" --> P["prompt surface chain<br/>native → companion → CLI → none"]
+    S -- "prompt" --> P["prompt surface chain<br/>native → companion → notification → CLI → none"]
     P -- "Approve" --> G
     P -- "Deny" --> N["granted=false"]
     P -- "window expires, a surface existed" --> T["granted=false, reason=timeout"]
@@ -818,7 +818,7 @@ daemon (the config surface notes changes apply on the next start). Making a
 device auto-grant is a device-owner decision the server cannot make for it.
 
 **Prompt surfaces.** A chain, probed per prompt and logged per prompt
-(`native` + `have_surface` on one line):
+(`native`, `notified` and `have_surface` on one line):
 
 1. **native** — the daemon draws the panel itself. Windows
    (`viewer-indicator`, and `WDA_EXCLUDEFROMCAPTURE` so the requester cannot
@@ -827,8 +827,30 @@ device auto-grant is a device-owner decision the server cannot make for it.
    (`viewer-indicator-macos`, AppKit).
 2. **companion** — `roomler-desktop`'s always-on-top consent window. The daemon
    starts it if it is not running (`companion::ensure_running`).
-3. **CLI** — `roomlerd consent --list` / `--approve`, which works everywhere.
-4. **none** — reported as `no_prompt_surface`, not as a deny.
+3. **notification** (Linux, FR-93 P6f) — the desktop's own notification with
+   **Approve** and **Deny**, where the companion cannot show the question: none
+   is installed, or there is no marker for it to read. Posted from inside the
+   person's session by the session helper (`roomlerd portal-helper --notify`,
+   `indicator/notify.rs`), at critical urgency: GNOME and KDE keep it on screen
+   until it is answered, and show it under Do Not Disturb. Closing it is a Deny.
+   The daemon takes it down when the question ends any other way.
+4. **CLI** — `roomlerd consent --list` / `--approve`, which works everywhere.
+5. **none** — reported as `no_prompt_surface`, not as a deny.
+
+⚠️ **A click on a notification's body is not an answer** (FR-93 P6f). GNOME 50
+removes a notification clicked on its body, and the removal arrives as a
+dismissal. Read as one, a person who clicked to read the question had refused
+it (measured in the lab). So the question carries the spec's `default` action:
+the click then arrives first as `ActionInvoked(default)`, and the helper posts
+the question again. Only a close with no `default` before it (the X, a swipe)
+is a refusal, and both signals are read from one stream, in the server's order.
+
+⚠️ A question a notification shows is marked `native` on the wire
+(`PromptSurface::Notification`): every companion renders a marker whose surface
+is not `native`, so a new word would have a companion that starts late ask the
+question a second time. The helper's D-Bus work runs on a plain thread, because
+zbus's blocking API panics on a runtime thread: the first candidate's helper
+panicked there before it posted anything. Kill switch `ROOMLERD_NOTIFY_CONSENT=0`.
 
 ⚠️ **The X11 panel's unmap must be flushed** (FR-93 P6a). x11rb buffers
 requests, and the panel's loop flushed only when it repainted, which it stops

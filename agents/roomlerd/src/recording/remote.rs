@@ -1241,20 +1241,18 @@ impl Handler {
             "record this screen"
         };
         let name = &self.ctx.controller_name;
-        let native = self
-            .ctx
-            .indicator
-            .show_prompt(crate::indicator::PromptView {
-                session_hex: prompt_id.clone(),
-                title: "Screen recording request".into(),
-                lead: format!("{name} wants to {what}."),
-                detail: "The recording is saved on this device, and a banner shows while it runs."
-                    .into(),
-                permissions: String::new(),
-                org: self.ctx.org.clone(),
-                expires_at: Instant::now() + window,
-            });
-        let prompt = crate::consent::PendingPrompt {
+        let view = crate::indicator::PromptView {
+            session_hex: prompt_id.clone(),
+            title: "Screen recording request".into(),
+            lead: format!("{name} wants to {what}."),
+            detail: "The recording is saved on this device, and a banner shows while it runs."
+                .into(),
+            permissions: String::new(),
+            org: self.ctx.org.clone(),
+            expires_at: Instant::now() + window,
+        };
+        let native = self.ctx.indicator.show_prompt(view.clone());
+        let mut prompt = crate::consent::PendingPrompt {
             kind: crate::consent::PromptKind::Record,
             asked_by: name,
             permissions: "RECORD".into(),
@@ -1278,8 +1276,21 @@ impl Handler {
                 false
             }
         };
-        let have_surface = native || (marker && self.ctx.companion.up().await);
-        info!(session = %self.ctx.session_id, native, have_surface, "consent prompt surface (record)");
+        let mut have_surface = native || (marker && self.ctx.companion.up().await);
+        // FR-93 P6f — the last on-screen surface: a desktop notification where
+        // neither the panel nor the companion can show the question.
+        let mut notified = false;
+        if !have_surface {
+            notified = self.ctx.indicator.show_notification_prompt(view).await;
+            have_surface = notified;
+            if notified && marker {
+                prompt.surface = crate::consent::PromptSurface::Notification;
+                if let Err(e) = self.ctx.consent.write_prompt(&prompt_id, &prompt) {
+                    warn!(%e, "record: could not mark the consent prompt as shown by a notification");
+                }
+            }
+        }
+        info!(session = %self.ctx.session_id, native, notified, have_surface, "consent prompt surface (record)");
         if let Ok(mut p) = self.prompt.lock() {
             *p = Some(prompt_id.clone());
         }
