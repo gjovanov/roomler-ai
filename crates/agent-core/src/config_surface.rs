@@ -1190,7 +1190,15 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "FR-93 P2 - a PER-USER install in its own Wayland session, with no capture key set, switches capture on by itself: on GNOME mutter's own screencast (** it asks nobody **), elsewhere (KDE and other desktops) the desktop portal, which asks the person at the screen once and restores their answer afterwards (P2d-3); it asks for remote control, unless portal_input is false (P4b). A root (system) install never switches capture on: DRM and uinput stay opt-in there. Any capture key set (drm_capture, portal_capture, mutter_capture, window_capture) takes the choice back. Built-in default: ON. Off = the behaviour before P2 (the kill switch). Env: ROOMLERD_WAYLAND_AUTO. Restart required.",
+        description: "FR-93 P2 - a PER-USER install in its own Wayland session, with no capture key set, switches capture on by itself: on GNOME mutter's own screencast (** it asks nobody **), elsewhere (KDE and other desktops) the desktop portal, which asks the person at the screen once and restores their answer afterwards (P2d-3); it asks for remote control, unless portal_input is false (P4b). A root (system) install has its own half, wayland_auto_system (FR-95). Any capture key set (drm_capture, portal_capture, mutter_capture, window_capture) takes the choice back. Built-in default: ON. Off = the behaviour before P2 (the kill switch), for both halves. Env: ROOMLERD_WAYLAND_AUTO. Restart required.",
+    },
+    KeyMeta {
+        key: "wayland_auto_system",
+        group: Group::CaptureInput,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-95 - a SYSTEM (root) install on a Wayland desktop, with no capture key set, switches DRM capture and uinput input on by itself where the person at the screen can be told they are being viewed (the desktop companion, or the desktop's own notifications, with Disconnect), and for their session only: the screen is read while that session is on it, unlocked, and never the greeter or the lock screen (** it asks nobody **, like DRM always has). With no way to tell the person, nothing changes and the hint names what is missing. Any capture key set takes the choice back; drm_capture = true also reads the greeter and the lock screen, as before. Built-in default: ON. Off = the behaviour before FR-95 (the kill switch); wayland_auto = false turns it off too. Env: ROOMLERD_WAYLAND_AUTO_SYSTEM. Restart required.",
     },
     KeyMeta {
         key: "mutter_input",
@@ -1927,6 +1935,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "window_capture" => cfg.window_capture.map(fmt_bool),
         "wayland_aware" => cfg.wayland_aware.map(fmt_bool),
         "wayland_auto" => cfg.wayland_auto.map(fmt_bool),
+        "wayland_auto_system" => cfg.wayland_auto_system.map(fmt_bool),
         "mutter_input" => cfg.mutter_input.map(fmt_bool),
         "x11_damage" => cfg.x11_damage.map(fmt_bool),
         "overlay_key_rotation" => cfg.overlay_key_rotation.map(fmt_bool),
@@ -2467,6 +2476,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "window_capture" => cfg.window_capture = parse_tribool(value)?,
         "wayland_aware" => cfg.wayland_aware = parse_tribool(value)?,
         "wayland_auto" => cfg.wayland_auto = parse_tribool(value)?,
+        "wayland_auto_system" => cfg.wayland_auto_system = parse_tribool(value)?,
         "mutter_input" => cfg.mutter_input = parse_tribool(value)?,
         "x11_damage" => cfg.x11_damage = parse_tribool(value)?,
         "overlay_key_rotation" => cfg.overlay_key_rotation = parse_tribool(value)?,
@@ -3240,6 +3250,7 @@ mod tests {
             "window_capture",
             "wayland_aware",
             "wayland_auto",
+            "wayland_auto_system",
             "mutter_input",
         ] {
             apply(&mut cfg, key, Some("on")).unwrap();

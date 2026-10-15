@@ -267,6 +267,11 @@ enum Command {
         /// stdout what the person did, and close it when stdin closes.
         #[arg(long)]
         notify: bool,
+        /// FR-95 P2 — say whether this session can show a notification with
+        /// buttons (its notification server, and the `actions` capability),
+        /// and post nothing.
+        #[arg(long)]
+        notify_probe: bool,
     },
     /// (internal, Linux) FR-45 P2b — open a portal ScreenCast session THROUGH
     /// the session helper and print what came back.
@@ -1624,10 +1629,13 @@ async fn daemon_main() -> Result<()> {
             window,
             keep_busy,
             notify,
+            notify_probe,
         } => {
             #[cfg(all(target_os = "linux", feature = "portal-capture"))]
             {
-                if notify {
+                if notify_probe {
+                    roomlerd::indicator::notify::run_probe_helper();
+                } else if notify {
                     roomlerd::indicator::notify::run_helper();
                 } else if keep_busy {
                     roomlerd::keep_busy::session_helper::serve();
@@ -1644,7 +1652,16 @@ async fn daemon_main() -> Result<()> {
             // answer from "this binary cannot ask".
             #[cfg(not(all(target_os = "linux", feature = "portal-capture")))]
             {
-                let _ = (screencast, stream, input, mutter, window, keep_busy, notify);
+                let _ = (
+                    screencast,
+                    stream,
+                    input,
+                    mutter,
+                    window,
+                    keep_busy,
+                    notify,
+                    notify_probe,
+                );
                 anyhow::bail!(
                     "portal-helper is Linux-only and needs the `portal-capture` feature; this \
                      build cannot query the desktop portal"

@@ -940,6 +940,12 @@ fn inject_all(injector: &mut Option<Box<dyn super::InputInjector + Send>>, msgs:
         if crate::capture::portal::input_route::try_route(m) {
             continue;
         }
+        // FR-95 P2 — the injector follows the automatic system capture: its
+        // uinput while one reads a person's session, the configured cascade
+        // otherwise (`input::stale`).
+        if injector.as_deref().is_some_and(|i| super::stale(i)) {
+            *injector = None;
+        }
         let inj = injector.get_or_insert_with(super::open_default);
         if let Err(e) = inj.inject(m.clone()) {
             tracing::debug!(%e, "input arbiter: inject failed");
@@ -963,6 +969,10 @@ fn keep_busy_op(
 ) -> KbReply {
     if matches!(op, KbOp::Move { .. } | KbOp::MoveNorm { .. }) && state.any_button_held() {
         return KbReply::RemoteButtonHeld;
+    }
+    // FR-95 P2 — the same swap the controller's path makes (`input::stale`).
+    if injector.as_deref().is_some_and(|i| super::stale(i)) {
+        *injector = None;
     }
     if injector.is_none() {
         let fresh = super::open_default();

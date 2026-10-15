@@ -296,7 +296,7 @@ sequenceDiagram
 
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
-  (`exit_for_requested_restart`, `agents/roomlerd/src/main.rs:1557`).
+  (`exit_for_requested_restart`, `agents/roomlerd/src/main.rs:1562`).
 - ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
   daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
   systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's
@@ -531,6 +531,15 @@ ends the session as the banner's does. The notification stays on screen (critica
 comes down with the session, and stays down for that session once the person closes it.
 The kill switch is `ROOMLERD_VIEWING_NOTICE=0`.
 A per-user install, and a supervised Mac through its worker (FR-43), never had this problem.
+
+⚠️ **On a system install this banner is what lets a Wayland desktop be captured by itself**
+(FR-95 P2, [`linux-capture.md`](linux-capture.md) §1.2.1). With no capture key set, a root
+daemon switches DRM and `uinput` on for the person's session on screen only where that
+person can be told: the companion runs for them, or their session's notification server
+shows buttons. That is checked live, at every capture open (`indicator::notify::can_tell`).
+An installed companion that is not running does not count on its own. Without either,
+nothing switches on, and the viewer's hint says so. `ROOMLERD_VIEWING_NOTICE=0` therefore
+also keeps a system install's Wayland capture opt-in.
 
 | | Behaviour | Where |
 |---|---|---|

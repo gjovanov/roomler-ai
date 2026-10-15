@@ -23,7 +23,7 @@ set, switches mutter on by itself, or the portal where mutter is absent (§1.2).
 
 ## 1. The cascade
 
-`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2024`) tries the
+`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2195`) tries the
 backends in this order and returns the first that opens. On Linux the Windows
 arms (SystemContext, WGC) do not exist, so the order is:
 
@@ -54,10 +54,10 @@ A per-user daemon in its own Wayland session, with no capture key set, runs
 
 | Arm | Reads | Sees a locked screen / the greeter | Asks the person at the screen | Needs | Default | Gate |
 |---|---|---|---|---|---|---|
-| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:2452`) |
-| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **no** — mutter refuses to create *or restore* a screencast while locked | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off**; automatic in a per-user Wayland session with no key where mutter is absent (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:2530`) |
+| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:2681`) |
+| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **no** — mutter refuses to create *or restore* a screencast while locked | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off**; automatic in a per-user Wayland session with no key where mutter is absent (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:2782`) |
 | **mutter direct** (`portal/mutter.rs`) | the same kind of PipeWire stream, from `org.gnome.Mutter.ScreenCast` | no (a session API) | **no** | GNOME's mutter on the user's session bus; no portal backend required | **off**; automatic in a per-user GNOME Wayland session with no key (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` **and** `ROOMLERD_MUTTER_CAPTURE=1` (`portal/backend.rs:70`) |
-| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:2599`), after the Xwayland guard (`mod.rs:2572`) |
+| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:2851`), after the Xwayland guard (`mod.rs:2824`) |
 
 Two things about the order are deliberate and worth defending when the next
 backend arrives:
@@ -74,7 +74,7 @@ backend arrives:
   screen). The portal is **attended**: defaulting it on would leave an
   unattended host waiting on a consent dialog nobody will answer — a hang
   dressed up as a feature. Both arms therefore log **loudly** when the operator
-  asked for them and they fell through (`mod.rs:2507`, `mod.rs:2547`), because
+  asked for them and they fell through (`mod.rs:2752`, `mod.rs:2803`), because
   silently serving X11 instead would look like the feature simply not working.
   Since FR-93 that error also travels: it becomes the session's `detail`
   (§1.1). And since FR-93 P2d-3 a per-user daemon in its own Wayland session,
@@ -97,18 +97,18 @@ and a different false thing per install type. Measured on the FR-93 lab
 
 Two changes stop both:
 
-- 🔑 **The Xwayland guard** (`mod.rs:2572`). Before scrap opens, the daemon
+- 🔑 **The Xwayland guard** (`mod.rs:2824`). Before scrap opens, the daemon
   asks the X server named by its `DISPLAY` whether it is Xwayland
-  (`x_server_is_xwayland`, `mod.rs:1711`). There are two signals, the same two
+  (`x_server_is_xwayland`, `mod.rs:1882`). There are two signals, the same two
   keep busy reads (FR-92): the `XWAYLAND` extension, which Xwayland has carried
   since 23.1, and before that its RandR monitors, all named `XWAYLAND<n>`. If
   it is Xwayland, scrap is refused, and the session gets a reason instead of
   black. The answer comes from the server, never from `XDG_SESSION_TYPE`, so a
   real Xorg and the daemon's own Xvfb are captured exactly as before.
 - 🔑 **The seat, not the daemon's environment, decides "headless"**
-  (`linux_no_pixels_code`, `mod.rs:1628`). When every arm has failed and the
+  (`linux_no_pixels_code`, `mod.rs:1799`). When every arm has failed and the
   daemon has no display variables, logind is asked whether a graphical session
-  is showing (`seat_shows_wayland`, `mod.rs:1695`, through
+  is showing (`seat_shows_wayland`, `mod.rs:1866`, through
   `companion::graphical_session`). A Wayland session there means
   `wayland_not_enabled`. No session at all means `no_display`, and that is now
   true.
@@ -131,7 +131,7 @@ because only root can read the scanout or create a uinput device:
 A failed arm is never told to "switch it on". It is already on, and its own
 error is the useful sentence.
 
-⚠️ **The probe dials Unix sockets only** (`x_server_query`, `mod.rs:1786`).
+⚠️ **The probe dials Unix sockets only** (`x_server_query`, `mod.rs:1957`).
 `x11rb::connect` falls back to TCP `localhost:6000+N` when the socket is
 missing. Under WSL2's mirrored networking a localhost connect to a closed port
 hangs instead of being refused, and systemd's `/tmp` handling there had hidden
@@ -229,7 +229,8 @@ found three problems. Each has its fix:
 | | auto? | why |
 |---|---|---|
 | a per-user daemon in its own Wayland session, no capture key | **yes**: mutter, else the portal | D1's per-user half |
-| a root (system) daemon | no | D1's system half: DRM and uinput stay opt-in until a desktop companion ships for non-Debian hosts, because without one a system install there has no "being viewed" banner and no Disconnect |
+| a root (system) daemon, a person's Wayland session on screen, and that person can be told | **yes** (FR-95): DRM + uinput, **bound** to that session (§1.2.1) | D1's system half, from FR-95 |
+| a root (system) daemon otherwise: the greeter on screen, or nobody to tell the person | no | DRM and uinput ask nobody and see the greeter and the lock screen, so they switch on by themselves only for a person who can see they are viewed and end it |
 | any of `drm_capture`, `portal_capture`, `mutter_capture`, `window_capture` set, **to anything** | no | an explicit key always wins. `portal_capture = false` keeps the portal off, as before |
 | `ROOMLERD_VIRTUAL_DESKTOP=1` | no | the daemon's own Xvfb is what it captures |
 | X11, a tty only, nobody signed in, no logind | no | auto applies only where logind says Wayland, so an X11 host keeps FR-29's idle numbers byte for byte |
@@ -329,6 +330,78 @@ from Windows, macOS and older agents.
 **Kill switch**: `wayland_auto` / `ROOMLERD_WAYLAND_AUTO=0` (default on) gives
 back the behaviour before P2.
 
+#### 1.2.1 A system install switches itself on, for a person it can tell (FR-95 P2)
+
+From FR-95 a **root** (system) daemon switches capture on by itself too, on
+narrower terms than the per-user half, because both of its arms ask nobody:
+DRM reads the scanout below the compositor, and `uinput` injects below it.
+FR-36 measured what that means: the greeter's capture holds its password
+field, and the lock screen's holds its unlock dialog. So a system install
+switches DRM and `uinput` on by itself only when all of these hold:
+
+- **No capture key is set.** Any of the four takes the choice back, and
+  `drm_capture = true` also reads the greeter and the lock screen, as before.
+  `uinput` set either way also keeps the automatic input off: `true` is the
+  configured path, `false` keeps an automatic capture view-only.
+- **The seat shows a person's Wayland session** (logind class `user`), locked
+  or not. Never the greeter.
+- **That person can be told.** This is checked live at every open
+  (`indicator::notify::can_tell`): the desktop companion runs for them, or
+  their session's notification server shows buttons. That is FR-93 P6g's
+  notice: the companion's banner, else a critical notification, *This screen
+  is being viewed*, with **Disconnect**.
+
+```mermaid
+flowchart TD
+    O([open_default, a root daemon]) --> K{"wayland_aware, wayland_auto and<br/>wayland_auto_system on, no capture key,<br/>no virtual desktop?"}
+    K -- no --> C["the cascade of §1, as before FR-95"]
+    K -- yes --> P{"logind: the seat shows a person's<br/>Wayland session (class user)?"}
+    P -- "no: the greeter, a tty, nobody" --> C
+    P -- yes --> T{"can that person be told?<br/>the companion runs for them, or their<br/>notification server shows buttons"}
+    T -- no --> N["the cascade of §1: wayland_not_enabled,<br/>the hint names the missing surface"]
+    T -- yes --> D["DRM + uinput, AUTOMATIC,<br/>BOUND to that session"]
+    D --> G{"the seat guard, every frame:<br/>that session on screen, unlocked?"}
+    G -- yes --> R["the scanout is read, input injected,<br/>and P6g's notice says who is viewing"]
+    G -- locked --> W1["nothing read, nothing injected:<br/>screen_unlock"]
+    G -- "the greeter, another person" --> W2["nothing read, nothing injected:<br/>session_away"]
+```
+
+The capture is **bound** to the session that was on screen when it opened
+(`capture/seat_guard.rs`). The guard watches logind's D-Bus for the seat's
+active session and its `LockedHint`. It reads `PropertiesChanged` as it
+arrives, and reads the seat again every second anyway. A capture whose guard
+is closed asks the DRM worker for nothing (`DrmCapture::guarded`), so the
+greeter's and the lock screen's pixels never leave the card. The controller is
+told `screen_unlock` or `session_away`, in a system install's own words.
+
+⚠️ **Input follows the guard, and never falls back to XTest behind a lock.**
+The automatic `uinput` is the injector whenever an automatic capture is
+**alive** (`capture::seat_guard::live`), locked or not, and it injects only
+while one **views** a person's unlocked session (`seat_guard::viewing`),
+dropping every event otherwise. The input arbiter swaps it in when such a
+capture starts, and swaps it out only once no such capture is left and the
+seat no longer shows a Wayland desktop. It never does so for a lock: what
+would replace it is enigo, whose XTest reaches Xwayland windows behind the lock
+screen. **Measured** (the lab's KDE system guest, 2026-10-15): with the input
+chosen on "views" alone, a viewer's first move during a lock opened enigo.
+Chosen on "alive", the same move opened the automatic `uinput`, which said
+*dropping input while the person's session is not on screen, unlocked*, and
+the first move after the unlock said *injecting again*.
+
+⚠️ **Bound to a session, not a user.** A second login of the same person is a
+different session, told nothing. So after a user switch the capture reads
+`session_away` until the person who was told is back. A new viewer session
+plans again, and tells whoever is then on screen.
+
+⚠️ **Fail closed.** A seat reading older than five seconds (the watcher died,
+logind went away) closes the guard, and so does a seat logind cannot vouch
+for.
+
+**Kill switch**: `wayland_auto_system` / `ROOMLERD_WAYLAND_AUTO_SYSTEM=0`
+(default on) gives back the system half before FR-95. `wayland_auto = false`
+turns it off too. `ROOMLERD_VIEWING_NOTICE=0` leaves no way to tell the person,
+so a system install then switches nothing on, and its hint says why.
+
 ### 1.3 What a device reports, and the fleet's count (FR-93 P2b)
 
 A Linux daemon tells the server which desktop it would show a controller now, and
@@ -410,7 +483,7 @@ mode of a missed damage event at a stale tile rather than a frozen stream.
 On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
-`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/main.rs:2742`,
+`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/main.rs:2759`,
 `virtual_desktop.rs:528`) starts Xvfb at `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION`
 (default `1920x1080`) with the window manager named by
 `ROOMLERD_VIRTUAL_DESKTOP_WM` (default `openbox`) and the comma-separated
@@ -457,7 +530,7 @@ buffer handle**, so a daemon that is not root opened DRM capture without
 complaint and then failed every frame. That is a per-user install with
 `drm_capture` set. The session died and re-created itself, and the viewer only
 ever said *"No video from this device after 3 attempts"*. The open now checks
-the handle (`unreadable`, `drm_backend.rs:824`) and refuses with the fix in
+the handle (`unreadable`, `drm_backend.rs:855`) and refuses with the fix in
 words, which reach the viewer as the arm's own error (§1.1): *"drm_capture is
 on, but DRM capture could not open: reading the scanout needs CAP_SYS_ADMIN
 (root), which this daemon lacks: on a per-user install run roomler config
@@ -1550,7 +1623,7 @@ remote-control session is live, the daemon holds one. On the signal it tells
 each live session's controller over that session's own control channel, then
 lets go. Each session registers its control channel as it starts
 (`sleep_notice.rs:62`); the watcher (`sleep_notice.rs:161`, the rule
-`:149`) sends `peer.rs:5222`'s notice to all of them at once (`:93`):
+`:149`) sends `peer.rs:5249`'s notice to all of them at once (`:93`):
 
 ```mermaid
 sequenceDiagram
@@ -1626,7 +1699,7 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 
 Every key below is `restart required`; env wins over the config file. The
 keys are `crates/agent-core/src/config_surface.rs:1131-1202`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2585`).
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2597`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|
@@ -1644,7 +1717,8 @@ the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/co
 | `mutter_capture` | `ROOMLERD_MUTTER_CAPTURE` | off | the mutter arm (§5), **inside** `portal_capture`. **Unattended, GNOME-only, no input** |
 | `window_capture` | `ROOMLERD_WINDOW_CAPTURE` | off | FR-56 P4: one application window instead of the monitor. Attended **by construction** — the portal answers with a window picker, and nothing agent-side can name a window (GNOME refuses `Introspect.GetWindows`) |
 | `wayland_aware` | `ROOMLERD_WAYLAND_AWARE` | **on** | FR-93 P1 (§1.1): a Wayland desktop that no arm may capture reports `wayland_not_enabled`, never black and never "headless". Switches no capture on. Off = the behaviour before FR-93, unchanged: no Xwayland probe, and no session told its input reach (P1a) |
-| `wayland_auto` | `ROOMLERD_WAYLAND_AUTO` | **on** | FR-93 P2 (§1.2): a **per-user** daemon in its own Wayland session, with no capture key set, switches capture on by itself: mutter on GNOME (it asks nobody), else the desktop portal (it asks the person at the screen once, P2d-3). Never on a root daemon. Off = the behaviour before P2 |
+| `wayland_auto` | `ROOMLERD_WAYLAND_AUTO` | **on** | FR-93 P2 (§1.2): a **per-user** daemon in its own Wayland session, with no capture key set, switches capture on by itself: mutter on GNOME (it asks nobody), else the desktop portal (it asks the person at the screen once, P2d-3). A root daemon has its own half, `wayland_auto_system`. Off = the behaviour before P2, for both halves |
+| `wayland_auto_system` | `ROOMLERD_WAYLAND_AUTO_SYSTEM` | **on** | FR-95 P2 (§1.2.1): a **system** daemon, with no capture key set, switches DRM and `uinput` on by itself for the person's Wayland session on screen, where that person can be told they are viewed (the companion, or their notifications). It reads the screen only while that session is on screen, unlocked: never the greeter, never the lock screen. Off = the behaviour before FR-95 |
 | — | `ROOMLERD_VIRTUAL_DESKTOP` (+ `_RESOLUTION`, `_WM`, `_STARTUP`) | off | the daemon's own Xvfb (§2). Turn it **off** when testing the portal arms on a host that has it, or the X11 fallback quietly serves the session in the portal's place |
 | `virtual_desktop_apps` | — | — | the FR-56 launch allowlist — for a virtual desktop **or** a logged-in X11/Xwayland session; [`remote-apps.md`](remote-apps.md) §7 |
 
@@ -1690,12 +1764,12 @@ defect — the capture arms only expose it by being knobs.
 
 | File | Owns |
 |---|---|
-| `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default` (`:2024`), `open_default_async` (`:2044`) and the cascade (`open_with` `:2285`); the FR-80 failure classifier (`:1911`); FR-93's verdicts: `linux_no_pixels_code` (`:1628`), `xwayland_verdict` (`:1677`), the Xwayland guard (`:2594`) and its socket-only probe (`x_server_query` `:1786`), the hints (`wayland_hint` `:582`, `wayland_not_enabled_detail` `:1662`); P2's automatic arm: `wayland_plan` (`:703`), `open_auto_mutter` (`:1477`), and P2d-3's `open_auto_portal` (`:1575`) with `auto_portal_unusable` (`:1609`) and P4b's `auto_portal_input` (`:1559`); P3d's Wayland-only idle skip, decided at the DRM open (`:2480`); P5b's and P3e's wait through a state of the host (`open_through_wait` `:1062`, the states `HostWait` `:942`, `GNOME_LOCK` `:960` and `DISPLAY_OFF` `:972`, bounded by `HOST_WAIT_MAX` `:904` and retried by `HOST_WAIT_RETRY` `:923`), a running capture's own wait (`ScreenCapture::waits_for` `:393`), what a parked open waits for (`OpenWait` `:2082`, `WaitFor` `:2094`) the session behind it (`open_has_session` `:2190`; nothing else waits) and how it learns that session left (`open_abandoned` `:2204`); FR-93 P5g: this user's session in the background still plans the automatic arm (`OwnSession` `:654`, `own_session_in` `:736`), and an open waits for it before either arm (`wait_while_away` `:1117` over `SESSION_AWAY` `:988`, called at `:2423`), its hook firing once per wait (`OnOpenWait` `:2144`, `tell_open_waiting` `:2263`); FR-93 P6c: a stop at the screen, typed for the pumps (`StoppedAtScreen` `:2125`, `stopped_at_screen` `:2136`) |
+| `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default` (`:2195`), `open_default_async` (`:2215`) and the cascade (`open_with` `:2464`); the FR-80 failure classifier (`:2082`); FR-93's verdicts: `linux_no_pixels_code` (`:1799`), `xwayland_verdict` (`:1848`), the Xwayland guard (`:2824`) and its socket-only probe (`x_server_query` `:1957`), the hints (`wayland_hint` `:586`, `wayland_not_enabled_detail` `:1833`); P2's automatic arm: `wayland_plan` (`:741`), `open_auto_mutter` (`:1648`), and P2d-3's `open_auto_portal` (`:1746`) with `auto_portal_unusable` (`:1780`) and P4b's `auto_portal_input` (`:1730`); P3d's Wayland-only idle skip, decided at the DRM open (`:2685`); P5b's and P3e's wait through a state of the host (`open_through_wait` `:1233`, the states `HostWait` `:1113`, `GNOME_LOCK` `:1131` and `DISPLAY_OFF` `:1143`, bounded by `HOST_WAIT_MAX` `:1075` and retried by `HOST_WAIT_RETRY` `:1094`), a running capture's own wait (`ScreenCapture::waits_for` `:397`), what a parked open waits for (`OpenWait` `:2253`, `WaitFor` `:2265`) the session behind it (`open_has_session` `:2369`; nothing else waits) and how it learns that session left (`open_abandoned` `:2383`); FR-93 P5g: this user's session in the background still plans the automatic arm (`OwnSession` `:692`, `own_session_in` `:897`), and an open waits for it before either arm (`wait_while_away` `:1288` over `SESSION_AWAY` `:1159`, called at `:2602`), its hook firing once per wait (`OnOpenWait` `:2323`, `tell_open_waiting` `:2442`); FR-93 P6c: a stop at the screen, typed for the pumps (`StoppedAtScreen` `:2304`, `stopped_at_screen` `:2315`) |
 | `agents/roomlerd/src/desktop_brief.rs` | FR-93 P2b: the hello's `desktop` brief, its `desktop-brief` refresher (`start` `:47`) and the session a controller would see (`seen_session` `:96`); P3d's `seen_is_wayland` (`:34`); `planned_arm`, P4's `planned_input_route` and `arm_facts` live beside the cascade in `capture/mod.rs` (`:789`, `:816`, `:832`) |
 | `agents/roomlerd/src/keep_busy/logind.rs` | the logind facts the cascade, the brief and keep busy read (`Session` `:36`, `parse_show` `:72`, `sessions` `:157`); FR-93 P5g: a session in the background, never one closing (`in_background` `:65`) |
 | `agents/roomlerd/src/capture/scrap_backend.rs` · `x11_damage.rs` | the X11 arm and its damage listener |
 | `agents/roomlerd/src/virtual_desktop.rs` | Xvfb + WM + startup apps for `ROOMLERD_VIRTUAL_DESKTOP=1` |
-| `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled` `:209`, `primary` `:635`); FR-93 P3c: the plane table with each plane's type (`read_planes` `:258`), the primary by type (`primary_plane` `:306`), the cursor caps (`enable_cursor_caps` `:385`) and the per-frame cursor read (`CursorReader` `:398`, `read_cursor_pixels` `:480`); FR-93 P3d/P3f: the buffer's identity (`BufferId` `:118`) and the mapping's key (`maps` `:132`), the kill switch (`idle_skip_enabled` `:333`), the gate in `grab` (`:831`), and the still screen waited out in `next_frame` (`:1089`); FR-93 P3e: a display switched off (`display_off` `:356`, for an open `display_is_off` `:374`), told apart in the worker loop (`:788`), waited out in `next_frame` (`:1131`, `DARK_POLL` `:348`) and reported by `waits_for` (`:1160`), and its kill switch (`wake_wait_enabled` `:341`); FR-93 P3h: a scanout this daemon may not read, refused at open (`unreadable` `:824`) |
+| `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled` `:209`, `primary` `:665`); FR-93 P3c: the plane table with each plane's type (`read_planes` `:258`), the primary by type (`primary_plane` `:306`), the cursor caps (`enable_cursor_caps` `:385`) and the per-frame cursor read (`CursorReader` `:398`, `read_cursor_pixels` `:480`); FR-93 P3d/P3f: the buffer's identity (`BufferId` `:118`) and the mapping's key (`maps` `:132`), the kill switch (`idle_skip_enabled` `:333`), the gate in `grab` (`:862`), and the still screen waited out in `next_frame` (`:1120`); FR-93 P3e: a display switched off (`display_off` `:356`, for an open `display_is_off` `:374`), told apart in the worker loop (`:819`), waited out in `next_frame` (`:1182`, `DARK_POLL` `:348`) and reported by `waits_for` (`:1211`), and its kill switch (`wake_wait_enabled` `:341`); FR-93 P3h: a scanout this daemon may not read, refused at open (`unreadable` `:855`) |
 | `agents/roomlerd/src/capture/drm_cursor.rs` | FR-93 P3c: the published cursor (`publish` `:64`, `latest` `:71`) and the pure conversions (`straighten_and_crop` `:108`, `place` `:167`, `shape_id` `:181`, `pick_primary` `:208`) |
 | `agents/roomlerd/src/capture/drm_idle.rs` | FR-93 P3d: the bounds (`MAX_SKIP` `:44`, `IDLE_WAIT` `:53`, `SAMPLE_ROWS` `:58`), what a tick showed (`Shown` `:62`), the gate (`IdleGate` `:75`, `unchanged` `:83`) and the row hash (`sample_rows` `:110`, `sampled_row` `:125`) |
 | `agents/roomlerd/src/capture/portal/mod.rs` | `PortalStatus` and the detector (`detect` `:161`, P2d-3's bounded `detect_within` `:171`, `detect_in_session` `:318`); the brief's non-activating `reachable` (`:198`); `pub mod helper` (`:337`): the `portal-helper` subcommand, `spawn_streaming` (`:1174`), `spawn_child` (`:1306`); FR-93 P5b: the helper ends with its mutter session, exit 3 on `Closed` (`EXIT_SESSION_CLOSED` `:457`, armed at `:1150`); FR-93 P5c: and with its stream, exit 4 once that has left *streaming* for good (`EXIT_STREAM_ENDED` `:464`, `SOURCE_GONE_AFTER` `:653`, `source_gone` `:658`, read in the frame loop both arms share, P5d: `write_frames` `:613`, which since P5e writes the first frame first); FR-93 P2d-4: a helper that fails before its stream says why (`STREAM_FAILED_MARKER` `:440`, `fail_stream` `:443`, read in `read_stream_handshake` `:1205`); FR-93 P6c: who closed the session (`ClosedBy` `:477`, mutter's `closed_mutter` `:516`, the portal's `closed_portal` `:532`, `end_closed` `:552`), the person's stop as exit 5 (`EXIT_STOPPED_AT_SCREEN` `:472`), the portal arm's watcher armed at `:990`, with KWin's bus owner telling a crash apart (`KWIN_BUS` `:562`) |
@@ -1705,7 +1779,7 @@ defect — the capture arms only expose it by being knobs.
 | `agents/roomlerd/src/capture/portal/mutter.rs` | the mutter broker (`open` `:370`, `RecordMonitor` `:441`, `PipeWireStreamAdded` `:456`); FR-93 P4's RemoteDesktop session (`remote_desktop_session` `:523`) and its kill switch (`input_enabled` `:316`); FR-93 P5b: the session's end (`MutterSession::on_closed` `:191`) and GNOME's lock screen (`GnomeLockScreen` `:245`, `is_up` `:253`); FR-93 P6c: the lock told from the person by mutter's refusal of a new session (`creation_inhibited` `:287`) |
 | `agents/roomlerd/src/capture/portal/pipewire.rs` · `pod.rs` | `dlopen` (`:307`), `negotiate` (`:1024`), `stream` (`:1174`); FR-93 P5c: the stream's state for its caller (`StreamHandle::state` `:1161`, written by `on_state_changed` `:708`); FR-93 P5e: the frame that settled the format, kept for the caller (`StreamHandle::first` `:1165`); the hand-written SPA PODs |
 | `agents/roomlerd/src/capture/portal/wire.rs` · `backend.rs` | the `RPWF` frame wire; `PortalCapture` (`open` `:114`, `HANDSHAKE_DEADLINE` `:669`); FR-93 P5f: a per-user capture's watch on its user's session (`watch_session` `:302`, `SESSION_POLL` `:290`), what reads as away (`session_away` `:396`) from logind's answer (`seat_sessions` `:412`), the answer kept with its time (`SessionWatch` `:338`) and outweighed by a newer frame (`away_now` `:384`, the frame's time `:568`), reported by `waits_for` (`:612`), and its kill switch (`session_watch_enabled` `:294`); FR-93 P6c: the helper's exit status read once its frames stop (`reap` `:630`, `HELPER_EXIT_WAIT` `:625`), status 5 typed as a stop at the screen (`helper_ended` `:649`), and its kill switch (`screen_stop_enabled` `:620`) |
-| `agents/roomlerd/src/peer.rs` | the notice (`media_waiting_payload` `:5037`, `media_waiting_hook` `:5286`); FR-93 P3e/P5f: a running capture's wait in the pumps (`CaptureWait` `:5158`), told after a quiet spell (`QUIET_BEFORE_TELL` `:5179`), and the hold that yields so the pump stays abortable (`:2527`, `:3980`, `:7167`); FR-93 P6c: a stop at the screen ends the session, a shared pipeline's followers first, and never reopens (`end_stopped_at_screen` `:5429`) |
+| `agents/roomlerd/src/peer.rs` | the notice (`media_waiting_payload` `:5037`, `media_waiting_hook` `:5313`); FR-93 P3e/P5f: a running capture's wait in the pumps (`CaptureWait` `:5162`), told after a quiet spell (`QUIET_BEFORE_TELL` `:5183`), and the hold that yields so the pump stays abortable (`:2527`, `:3980`, `:7194`); FR-93 P6c: a stop at the screen ends the session, a shared pipeline's followers first, and never reopens (`end_stopped_at_screen` `:5456`) |
 | `agents/roomlerd/src/capture/portal/input.rs` · `input_route.rs` | FR-45 P4 and FR-93 P4: the helper's `Notify*` mapping (`plan` `:123`, mutter's `mutter_call` `:274`); FR-93 P4b's KDE correction (`for_backend` `:224`) and the awaited portal calls (`Target::delivery` `:348`); the arbiter-side per-event route (`try_route` `:113`) and whose session it feeds (`active` `:97`) |
 | `crates/agent-core/src/config_surface.rs` | the keys in §7 and the descriptions `roomler config` prints (`:1131-1202`) |
-| `agents/roomlerd/src/main.rs` | `capture-smoke` (`capture_smoke_cmd` `:5677`, the portal line `:5704`); the virtual desktop (`maybe_start_virtual_desktop` `:2742`) |
+| `agents/roomlerd/src/main.rs` | `capture-smoke` (`capture_smoke_cmd` `:5694`, the portal line `:5721`); the virtual desktop (`maybe_start_virtual_desktop` `:2759`) |
