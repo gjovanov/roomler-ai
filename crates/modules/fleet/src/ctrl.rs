@@ -73,6 +73,10 @@ pub fn apply_rc_ctrl(hub: &Hub, ctrl: &serde_json::Value) {
                 info!(session = %sid, granted, "rc ctrl: consent applied from another pod");
             }
         }
+        // A device's removal, on the pod that holds its socket. #2267 — the
+        // removing pod decided whether the device is told (`goodbye`); an
+        // envelope without it comes from a pod before #2267, and keeps that
+        // pod's behaviour: out of the hub, not told.
         Some("kick") => {
             let Some(aid) = ctrl
                 .get("agent_id")
@@ -81,8 +85,13 @@ pub fn apply_rc_ctrl(hub: &Hub, ctrl: &serde_json::Value) {
             else {
                 return;
             };
-            if hub.unregister_agent(aid, None) {
-                info!(agent = %aid, "rc ctrl: kick applied from another pod");
+            let goodbye = ctrl
+                .get("goodbye")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let outcome = hub.kick_removed_agent(aid, goodbye);
+            if outcome != crate::hub::KickOutcome::NotRegistered {
+                info!(agent = %aid, ?outcome, "rc ctrl: kick applied from another pod");
             }
         }
         // P3 — admin/controller force-close for a session homed on another

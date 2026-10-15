@@ -280,6 +280,11 @@ route enforces `exp`.
 - ⚠️ The deleted/quarantined check stays FIRST at each site, so a removed device is
   still told it was removed (and stops), rather than seeing a bare 401 it would
   retry forever.
+- A device **connected** at its removal is told on the socket it holds, at once
+  (#2267). Before, the kick only took it out of the hub, and it kept that socket,
+  unaware, until something else dropped it. Nothing could act through it, since
+  every action re-checks the row, but the device's own status still read
+  "connected".
 
 **A WG public key cannot be claimed by two live nodes in a network** —
 `overlay_nodes::wg_key_taken_by_other`, checked in `ws::overlay` join,

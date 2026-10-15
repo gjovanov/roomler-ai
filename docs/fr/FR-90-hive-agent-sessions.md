@@ -335,7 +335,7 @@ flowchart TD
 |---|---|---|
 | A device holds copies only while its OWN `hive_replica` is on. It advertises `hive-replica` only then, as `hive-adopt` is advertised (`agents/roomlerd/src/encode/caps.rs:1638`), and refuses a join otherwise. `hive_archive` (it offers itself as an archive replica) and `hive_store_quota_mib` are device keys too. None is pushable, and each joins the lock test's list | the gate that survives a compromised server. The code keeps every Hive key out of `DesiredConfig` (`crates/remote_control/src/models.rs:6701`); §3g's "can ever be pushed" is the design's allowance, not the code's | `crates/agent-core/src/config.rs:374` |
 | Candidates are the session owner's own devices and the archive replicas an `ADMINISTRATOR` designated, nothing else. "The owner's own" means `enrolled_by` and `owner_user_id` both name the owner | `owner_user_id` is reassignable with `MANAGE_AGENTS` alone, and `enrolled_by` is set once, at enrollment (`crates/services/src/dao/agent.rs:106`, `:1030`): a device manager who hands someone a device must not receive that person's sessions on it | `crates/remote_control/src/models.rs:1666`, `:1670` |
-| A restricted tag only ever takes a device out. When no device left may hold a restricted session, the session has fewer copies than `min`, and its room says why | tags are free-form `MANAGE_AGENTS` labels (`crates/modules/fleet/src/agent.rs:1154`); as a filter they cannot widen where a copy goes. Decision 2 names prod ROLES, which are P3's, so until then the session's primary device is what carries the tag | `models.rs:1144` |
+| A restricted tag only ever takes a device out. When no device left may hold a restricted session, the session has fewer copies than `min`, and its room says why | tags are free-form `MANAGE_AGENTS` labels (`crates/modules/fleet/src/agent.rs:1159`); as a filter they cannot widen where a copy goes. Decision 2 names prod ROLES, which are P3's, so until then the session's primary device is what carries the tag | `models.rs:1144` |
 | A device that no longer qualifies (a tag taken off, its owner changed, its `hive_replica` off) gets a purge for what it may no longer hold | the rules run again when a device's tags or owner change: fleet calls a new `FleetLifecycle::agent_updated` hook (`crates/core/src/hooks.rs:109`) from its update route, as it calls `agent_renamed` there (`agent.rs:1000`) | |
 | Never an ephemeral device (FR-51), never a secondary org's enrollment | an ephemeral row is hard-deleted, and could never acknowledge a purge; Hive frames count only on the primary enrollment (`agents/roomlerd/src/hive/view.rs:244`) | `models.rs:1165` |
 | ⚠️ An adopted session is placed nowhere but where it was adopted | decision 11: only its owner sees it, and whoever runs an archive replica can read that replica's disk. It follows the policy once it is a managed session (P2f) | §3h |
@@ -782,7 +782,9 @@ of is forgotten, never purged, because purging an id is final.
 device while its socket is still up. The frame carries an id, for the logs, and nothing else. It
 goes from the pod that runs the removal, or through fleet's control channel ahead of the kick,
 which unregisters the socket but leaves it open, so a frame queued before it is still delivered.
-Nothing answers it. The device, as its primary enrollment, purges every session it holds: its
+Since #2267 the kick tells every other connected device to stop (`rc:goodbye AgentDeleted`), but
+not one sent this frame: its daemon would exit at once and cut the purge short. Nothing answers it.
+The device, as its primary enrollment, purges every session it holds: its
 store's copies and workplaces, a run (stopped first), a hosted entry, one waiting to resume. Each
 goes through P2g-1's parts under the start lock. The device's pending part of each unfinished purge
 closes `device_removed` at once, and a purge that waited on it alone completes. A device offline at
@@ -1127,7 +1129,7 @@ Such a build runs no session and sends no manifest, so a Windows device that upd
 or a build made without `hive` does the same. The reconcile of a connection the hub records without
 `hive` now ends those sessions as an empty manifest would, before it reads what is pending, and it
 reads only its own registration: a connection a newer one displaced, or one already gone, decides
-nothing (`crates/modules/hive/src/agent_socket.rs:1005`, `crates/modules/fleet/src/hub.rs:2278`
+nothing (`crates/modules/hive/src/agent_socket.rs:1005`, `crates/modules/fleet/src/hub.rs:2359`
 `agent_supports_hive_on`).
 
 **Updates and restarts (P1d).** Today a session's harness is the daemon's child: an update, a crash

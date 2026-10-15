@@ -44,6 +44,10 @@ impl TenantLifecycle for FleetTenantHooks {
                     .unwrap_or(false)
             {
                 devices_revoked += 1;
+                // #2267 — and a connected one is kicked and told, as a removal
+                // does. Before, its socket and even its hub entry outlived the
+                // revocation until something else dropped the socket.
+                crate::removal::kick(&self.state, id, self.state.settings.rc.removal_goodbye).await;
             }
         }
         Ok(TenantArchived {
