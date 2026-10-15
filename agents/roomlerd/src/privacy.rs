@@ -479,6 +479,39 @@ pub fn attach_refusing(dc: Arc<RTCDataChannel>, session_id: ObjectId, reason: &'
 mod tests {
     use super::*;
 
+    /// FR-99 AC6 — FR-92's no-hooks rule covers privacy mode: no hook, raw-input
+    /// sink or keyboard-state read anywhere in the curtain's code, this module
+    /// and the overlay that draws it. Each is what a keylogger looks like to
+    /// EDR, and a GPO-locked desktop running EDR is in the acceptance bar; P2's
+    /// block is `BlockInput` for the same reason. Comments may name them; code,
+    /// string constants included, may not. The banned names are assembled at
+    /// run time, so this file cannot trip its own scan.
+    #[test]
+    fn no_keylogger_shaped_api_in_privacy_mode() {
+        let sources: [(&str, &str); 2] = [
+            ("privacy.rs", include_str!("privacy.rs")),
+            ("indicator/win.rs", include_str!("indicator/win.rs")),
+        ];
+        let banned: Vec<String> = [
+            ["SetWindows", "HookEx"],
+            ["RegisterRaw", "InputDevices"],
+            ["GetRaw", "InputData"],
+            ["GetKeyboard", "State"],
+            ["GetAsync", "KeyState"],
+        ]
+        .iter()
+        .map(|p| p.concat())
+        .collect();
+        for (name, src) in sources {
+            for (i, line) in src.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                for b in &banned {
+                    assert!(!code.contains(b.as_str()), "{name}:{}: uses {b}", i + 1);
+                }
+            }
+        }
+    }
+
     /// Records every call, and answers an "up" with `up_ok`.
     struct Recorder {
         calls: Mutex<Vec<bool>>,

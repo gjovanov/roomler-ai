@@ -285,8 +285,12 @@ says muting the host silences the client too. The FR ships only the honest versi
   that has not opted in is never asked for `PRIVACY` and its grant holds none. A device whose owner switches
   privacy mode off mid-session takes the curtain down, and the viewer reads "this device's owner hasn't
   allowed privacy mode".
-- [ ] **AC6 (no hooks):** the FR-92-style source scan covers this module and fails on a planted
-  `SetWindowsHookEx`.
+- [x] **AC6 (no hooks):** the FR-92-style source scan covers this module and fails on a planted
+  `SetWindowsHookEx`. **Verified** (this PR): `privacy::tests::no_keylogger_shaped_api_in_privacy_mode` scans
+  the curtain's code, `privacy.rs` and the overlay `indicator/win.rs`, for FR-92's Windows list (hooks,
+  raw-input registration and reads, keyboard state, `GetAsyncKeyState`). It passed on master. With a real
+  string constant, `"SetWindowsHookExW"`, planted at the end of `indicator/win.rs` it failed:
+  `indicator/win.rs:1741: uses SetWindowsHookEx`. Restored to an identical file, it passed again.
 - [ ] **AC7 (lock on end):** with `auto`, a session that began on a locked guest leaves it locked
   (`Get-Process LogonUI` present). One that began unlocked and attended leaves it unlocked. `always` locks
   both.
