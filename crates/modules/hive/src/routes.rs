@@ -273,14 +273,18 @@ pub(crate) async fn member_tenant(
 /// P1g — `GET /api/tenant/{tenant_id}/hive`: whether agent sessions serve
 /// this organization. The SPA asks before it shows any of the module's pages;
 /// an organization they do not serve is answered `404`, as every other route
-/// here answers it.
+/// here answers it. P2h-2 — and whether sessions are copied here at all
+/// (`hive.replicaset`): the SPA shows the copies page only then. A server
+/// before it says nothing of it, which reads as off.
 pub async fn serves(
     State(state): State<HiveState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     member_tenant(&state, &tenant_id, &auth).await?;
-    Ok(Json(serde_json::json!({ "enabled": true })))
+    Ok(Json(
+        serde_json::json!({ "enabled": true, "replicaset": state.replicaset }),
+    ))
 }
 
 pub(crate) fn parse_oid(raw: &str, what: &str) -> Result<ObjectId, ApiError> {
