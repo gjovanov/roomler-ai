@@ -3970,9 +3970,54 @@ as the device. Encryption at rest is P7.
 ⚠️ **A new package on GHCR is private** until the operator makes it public. Until then only
 accounts with access to the package can pull it.
 
-The rest of P2 is next (spec §3b and §4): the policy page's "Add an archive replica" (P2h-2),
-full-text search on archive replicas (P2i), the UI (P2j) and the field run (P2k). Its server
-switch is `hive.replicaset` and its device switch `hive_replica`, both off by default.
+### P2h-2: the copies page and its "Add an archive replica"
+
+The SPA's **Agent copies** page (`/tenant/{tid}/copies`) reads the organization's replica policy
+back and lists its archive replicas. A device offers itself as one: its owner's `hive_archive`,
+the `hive-archive` word in its hello. An `ADMINISTRATOR` designates it: the policy's
+`archive_devices`. Both halves are needed before it holds anything. **Add an archive replica**
+mints an enrollment token and shows how to run the archive replica image (P2h-1) with it.
+
+```mermaid
+sequenceDiagram
+    participant A as an ADMINISTRATOR (browser)
+    participant S as server
+    participant C as the archive container
+    A->>S: GET …/hive: {enabled, replicaset} (the page and its nav item only while copies are on)
+    A->>S: GET …/hive/policy · GET …/agent
+    A->>S: Add an archive replica: POST …/agent/enroll-token
+    S-->>A: a single-use token, 10 minutes
+    Note over A: docker run … -e ROOMLER_SERVER=<this origin> -e ROOMLER_ENROLL_TOKEN=…
+    A->>C: the operator runs it
+    C->>S: enroll --archive-replica, then rc:agent.hello with hive-archive
+    A->>S: Designated: PUT …/hive/policy {…, archive_devices + it, revision}
+    S->>S: placement decides again: it joins every session the rules allow
+```
+
+| Rule | Why | Where |
+|---|---|---|
+| The page, and its nav item, only where the server copies sessions: `GET …/hive` answers `replicaset`, and a server before it says nothing, which reads as no | prod has `hive.replicaset` off, and a page there could only say so | [`routes.rs:286`](../crates/modules/hive/src/routes.rs#L286), [`hive.ts:278`](../ui/src/stores/hive.ts#L278), [`AppLayout.vue:147`](../ui/src/components/layout/AppLayout.vue#L147) |
+| Listed: every device that offers itself (`hive-archive` among its words, by equality) and every designated one, once, the designated first. A designated device the agents page did not hold is read on its own, and one that is gone says so | a designation is never shown as missing, and `hive-archives` is not `hive-archive` | [`HiveCopiesView.vue:246`](../ui/src/views/hive/HiveCopiesView.vue#L246), [`HiveCopiesView.vue:298`](../ui/src/views/hive/HiveCopiesView.vue#L298) |
+| Designating writes the whole policy from the revision read. One changed meanwhile is read again and said so; any other refusal shows in the server's words | the policy is one document with a revision (P2c-2a): a write from a stale read would undo another administrator's | [`HiveCopiesView.vue:320`](../ui/src/views/hive/HiveCopiesView.vue#L320) |
+| The switches and the add button only for an `ADMINISTRATOR`, the owner included, and none until the caller's permissions are known | the server's own gate on the write: failing closed costs a moment, failing open a click that is refused | [`permissions.ts:429`](../ui/src/utils/permissions.ts#L429) |
+| **Add an archive replica** mints a standard enrollment token and shows `docker run` and compose with this server's origin, the token, a fixed hostname and the volume. The token leaves the page when the dialog closes | the token is single use, for 10 minutes; the hostname is the device's identity (P2h-1); a closed dialog's content stays mounted | [`HiveCopiesView.vue:368`](../ui/src/views/hive/HiveCopiesView.vue#L368), [`HiveCopiesView.vue:362`](../ui/src/views/hive/HiveCopiesView.vue#L362) |
+| Until a designated archive replica that offers itself is online, the page says a session is readable only while one of its members is | that is what an organization without one has (spec §3b) | [`HiveCopiesView.vue:278`](../ui/src/views/hive/HiveCopiesView.vue#L278) |
+
+⚠️ **The snippet names `hive-archive:latest`.** The image workflow moves `latest` on each publish
+unless told not to (`also_latest`, now on by default). Until the operator first publishes, there is
+no image to pull.
+
+⚠️ **The server in the snippet is the browser's origin.** On `https://roomler.ai` that is right.
+A self-hosted server reached by a name its devices cannot use needs another, and an enrollment
+never sends its token in plaintext to any host but loopback (FR-101): a lab server needs TLS, or
+the container a loopback relay to it.
+
+⚠️ **The list reads the agents page, the newest 100 devices.** A device that offers itself beyond
+them is not listed until it is designated (through the API), while every designated one always is.
+
+The rest of P2 is next (spec §3b and §4): full-text search on archive replicas (P2i), the UI
+(P2j) and the field run (P2k). Its server switch is `hive.replicaset` and its device switch
+`hive_replica`, both off by default.
 
 ---
 
@@ -4027,7 +4072,8 @@ switch is `hive.replicaset` and its device switch `hive_replica`, both off by de
   no longer do (P2g-4a), and a member that leaves is purged, its copy alone, once the session
   holds its `min` copies without it, and a fork made from its copy no longer needs it (P2g-4b).
   P2g is done in code. A container from the archive replica image enrolls once as one, its
-  posture written with its enrollment and its volume the device (P2h-1).
+  posture written with its enrollment and its volume the device (P2h-1). The copies page lists an
+  organization's archive replicas, designates one, and adds one (P2h-2).
 - The vault and the rest of the toolbelt (P3), knowhow (P4) and the learning loop
   (P5). `docs/vault.md` and `docs/knowhow.md` come with them.
 - `adopt` on Windows, and a Windows session for anyone but the console user.

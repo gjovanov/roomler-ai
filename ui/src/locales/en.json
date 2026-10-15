@@ -87,6 +87,7 @@
     "devices": "Devices",
     "agentSessions": "Agent sessions",
     "agentMemory": "Agent memory",
+    "agentCopies": "Agent copies",
     "network": "Network",
     "tunnelAcl": "ACL",
     "subnetRoutes": "Overlay routes",
@@ -334,6 +335,48 @@
       "edit": "Edit",
       "editTitle": "Edit the fact",
       "archive": "Archive — out of every future session's memory"
+    },
+    "copies": {
+      "title": "Agent copies",
+      "about": "Each agent session runs on one device and is copied to the devices your organization's policy places it on, so it stays readable, and can move, while that device is offline. A copy is plaintext on the device that holds it.",
+      "off": "Sessions are not copied on this server: an operator turns on hive.replicaset.",
+      "policy": {
+        "title": "The policy",
+        "defaults": "Defaults",
+        "copies": "{min} to {max} copies of each session, its own device's among them",
+        "archive": "Archive replicas join every session the rules allow",
+        "archiveOff": "Archive replicas join no session",
+        "prefer": "Then the session owner's own devices",
+        "restricted": "A session on a device tagged {tags} is copied only to devices with that tag",
+        "retention": "Kept {days} days after a session ends",
+        "retentionForever": "Kept for good after a session ends"
+      },
+      "archive": {
+        "title": "Archive replicas",
+        "hint": "An always-on device of your organization that keeps a copy of every session the rules allow, for their retention, and serves a session while no other member is online. It runs no session. Your organization runs it, on its own machines.",
+        "none": "No device offers itself as an archive replica yet.",
+        "unreadable": "Until an archive replica is online, a session is readable only while one of its members is.",
+        "offers": "Offers itself as an archive replica",
+        "notOffering": "Does not offer itself: its owner turned hive_archive off, or it has not connected since",
+        "gone": "No longer a device of this organization",
+        "designated": "Designated",
+        "add": "Add an archive replica",
+        "stale": "The policy changed since it was read. It is shown again: try once more."
+      },
+      "add": {
+        "title": "Add an archive replica",
+        "intro": "Run the archive replica image on a machine of your organization's that stays on. Its first start enrolls it with a token from here; every later start runs from its volume, and needs no token.",
+        "volume": "The volume is the device: it holds the device's credentials and every session copied to it, in plaintext. Keep it as you would the sessions themselves.",
+        "hostname": "Give the container a fixed hostname: the device's identity depends on it, and two archive replicas must not share one.",
+        "mint": "Get an enrollment token",
+        "token": "The token works once, for {minutes} minutes, and only the first start needs it.",
+        "docker": "docker run",
+        "compose": "docker compose",
+        "copy": "Copy",
+        "copied": "Copied",
+        "next": "Once it runs it appears under Archive replicas: turn on Designated to make it one.",
+        "close": "Close"
+      }
     }
   },
   "keepBusy": {

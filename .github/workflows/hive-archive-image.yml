@@ -27,9 +27,12 @@ on:
         required: true
         type: string
       also_latest:
-        description: 'Also move `latest` to this image'
+        # FR-90 P2h-2 — the policy page's "Add an archive replica" shows
+        # `docker run … hive-archive:latest`: leave it on unless this is
+        # an older line's patch.
+        description: 'Also move `latest` to this image (the tag the policy page shows)'
         required: false
-        default: false
+        default: true
         type: boolean
       dry_run:
         description: 'Build and smoke-test, but do NOT push'

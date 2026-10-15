@@ -419,3 +419,15 @@ export function canGrantDeviceSsh(mask: number | null, isOwner: boolean): boolea
   if (mask === null) return false
   return hasPermission(mask, byKeys(['MANAGE_AGENTS', 'SSH_DEVICE']))
 }
+
+/**
+ * FR-90 P2h-2 — may this caller set the organization's Hive replica policy:
+ * designate archive replicas, and add one? Server gate: `ADMINISTRATOR`
+ * (`crates/modules/hive/src/policy.rs`, `put_policy`). FAIL-CLOSED on
+ * `mask === null`: the page shows its switches only once it knows.
+ */
+export function canSetHivePolicy(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return false
+  return hasPermission(mask, ADMINISTRATOR)
+}

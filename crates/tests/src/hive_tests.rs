@@ -7805,6 +7805,33 @@ async fn replicaset_app() -> TestApp {
     .await
 }
 
+/// FR-90 P2h-2 — the SPA's question, whether agent sessions serve the
+/// organization, also says whether they are copied here at all
+/// (`hive.replicaset`): its copies page is shown only then.
+#[tokio::test]
+async fn the_hive_question_says_whether_sessions_are_copied_here() {
+    for (app, copied) in [(hive_app().await, false), (replicaset_app().await, true)] {
+        let s = app
+            .seed_tenant(if copied { "copieshere" } else { "nocopies" })
+            .await;
+        let (code, body) = status_and_json(
+            app.auth_get(
+                &format!("/api/tenant/{}/hive", s.tenant_id),
+                &s.admin.access_token,
+            )
+            .send()
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            (code, body["enabled"].clone(), body["replicaset"].clone()),
+            (200, json!(true), json!(copied)),
+            "{body}"
+        );
+    }
+}
+
 async fn get_policy(app: &TestApp, tid: &str, token: &str) -> (u16, Value) {
     let resp = app
         .auth_get(&format!("/api/tenant/{tid}/hive/policy"), token)

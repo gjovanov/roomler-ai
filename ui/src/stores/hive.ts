@@ -129,6 +129,41 @@ export interface BrainView {
   budgets: BrainBudget[]
 }
 
+/** P2c-2a — who holds a session's copies (`ReplicasetRules`,
+ *  `crates/modules/hive/src/policy.rs`). */
+export interface ReplicasetRules {
+  /** The session's own device and `min - 1` more copies. */
+  min: number
+  max: number
+  /** Every archive replica the rules allow joins. */
+  archive: boolean
+  /** Who joins after the archive replicas, in order (`owner_devices`). */
+  prefer: string[]
+  /** A session on a device carrying one of these is copied only to devices
+   *  carrying it too. */
+  restricted_tags: string[]
+}
+
+/** P2c-2a — `PolicyView`: an organization's replica policy. */
+export interface HivePolicy {
+  replicaset: ReplicasetRules
+  /** Days an ended session is kept; 0 keeps it for ever. */
+  retention_days: number
+  /** The devices an administrator designated archive replicas. */
+  archive_devices: string[]
+  /** A write names the revision it was made from. */
+  revision: number
+  /** Nothing written yet: these are the defaults. */
+  is_default: boolean
+  updated_by?: string
+  updated_at?: string
+}
+
+/** P2h-2 — the capability word a device advertises while it offers itself as
+ *  an archive replica (its owner turned `hive_archive` on). Matched by
+ *  equality, as every `rpc` word is. */
+export const HIVE_ARCHIVE_CAP = 'hive-archive'
+
 /** A session that can still change. */
 /** P1j — a terminal session adopted on its device: nobody drives it here. */
 export function isAdopted(s?: Pick<HiveSession, 'origin'> | null): boolean {
@@ -220,6 +255,10 @@ export const useHiveStore = defineStore('hive', () => {
   /** P1g — whether agent sessions serve each organization, as the server
    *  answered (`GET …/hive`); absent until it has. */
   const served = ref<Record<string, boolean>>({})
+  /** P2h-2 — and whether their sessions are copied there at all (the
+   *  server's `hive.replicaset`), from the same answer. A server before it
+   *  says nothing of it, which reads as no. */
+  const copied = ref<Record<string, boolean>>({})
   const servedAsks = new Map<string, Promise<boolean>>()
 
   /**
@@ -233,14 +272,16 @@ export const useHiveStore = defineStore('hive', () => {
     const asked = servedAsks.get(tenantId)
     if (asked) return asked
     const ask = api
-      .get<{ enabled?: boolean }>(`/tenant/${tenantId}/hive`)
+      .get<{ enabled?: boolean; replicaset?: boolean }>(`/tenant/${tenantId}/hive`)
       .then((r) => {
         const on = r.enabled === true
+        copied.value = { ...copied.value, [tenantId]: on && r.replicaset === true }
         served.value = { ...served.value, [tenantId]: on }
         return on
       })
       .catch((e: unknown) => {
         if (e instanceof ApiError && e.status === 404) {
+          copied.value = { ...copied.value, [tenantId]: false }
           served.value = { ...served.value, [tenantId]: false }
         } else {
           console.warn('[hive] could not ask whether agent sessions serve this organization', e)
@@ -287,6 +328,23 @@ export const useHiveStore = defineStore('hive', () => {
     return api.delete<{ archived: boolean }>(`${brainBase(tenantId)}/${factId}`)
   }
 
+  /** P2h-2 — the organization's replica policy, for any of its members: the
+   *  defaults until an administrator writes one. `404` while the server
+   *  copies no sessions. */
+  function fetchPolicy(tenantId: string): Promise<HivePolicy> {
+    return api.get<HivePolicy>(`/tenant/${tenantId}/hive/policy`)
+  }
+
+  /** P2h-2 — an administrator writes the WHOLE policy, from the revision
+   *  read: one changed since is a `409` (read it again), and a device that
+   *  cannot be an archive replica a `400`, both in the server's words. */
+  function putPolicy(
+    tenantId: string,
+    body: Pick<HivePolicy, 'replicaset' | 'retention_days' | 'archive_devices' | 'revision'>,
+  ): Promise<HivePolicy> {
+    return api.put<HivePolicy>(`/tenant/${tenantId}/hive/policy`, body)
+  }
+
   return {
     sessions,
     total,
@@ -301,10 +359,13 @@ export const useHiveStore = defineStore('hive', () => {
     setParticipant,
     removeParticipant,
     served,
+    copied,
     checkServed,
     fetchBrain,
     keepFact,
     editFact,
     archiveFact,
+    fetchPolicy,
+    putPolicy,
   }
 })

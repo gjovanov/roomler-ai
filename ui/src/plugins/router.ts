@@ -240,6 +240,15 @@ const routes: RouteRecordRaw[] = [
             meta: { module: 'hive' },
           },
           {
+            // FR-90 P2h-2 — where the org's agent sessions are copied, and
+            // its archive replicas. The page says so itself where the
+            // server copies none (`hive.replicaset` off).
+            path: 'copies',
+            name: 'hive-copies',
+            component: () => import('@/views/hive/HiveCopiesView.vue'),
+            meta: { module: 'hive' },
+          },
+          {
             // S4 pivot — the overlay/tunnel network group, promoted out
             // of Admin (Tailscale-style IA). Sections stay child routes
             // (bookmarkable, back/forward-friendly), same pattern as
