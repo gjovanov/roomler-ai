@@ -32,7 +32,8 @@ cannot reach the machine's services.
 
 ### Nothing to install on the viewing side
 
-Any Chromium browser is the viewer. That matters on a machine you do not
+A browser tab is the viewer: Chrome, Edge or another Chromium browser works
+best, and Safari and Firefox work too. That matters on a machine you do not
 control — a client's laptop, a locked-down desktop, a borrowed computer.
 
 ### Licensing is settled and written down

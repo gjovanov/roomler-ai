@@ -87,15 +87,17 @@ are typically an order of magnitude better. Check the indicator first.
 
 ## Browser-side decoding
 
-The viewer uses a **low-latency decode path** in Chromium that bypasses the
-video element's built-in buffering.
+Where the browser supports it, the viewer uses a **low-latency decode path** that
+bypasses the video element's built-in buffering. It checks for the pieces it needs
+(WebCodecs and encoded transforms) and falls back to the video element where they
+are missing.
 
-:::warning Why Chromium specifically
+:::warning Why Chromium is the recommendation
 A normal `<video>` element enforces a jitter buffer of roughly 80 ms regardless
 of what you ask for, which is a large share of a remote-control latency budget.
-Decoding frames directly and painting them avoids it. That path is a Chromium
-capability, which is why the viewer targets Chromium even though the rest of the
-product is browser-agnostic.
+Decoding frames directly and painting them avoids it. Chromium browsers are where
+that path has had the most testing, so they give the best experience. Safari and
+Firefox run the viewer too, with less testing so far.
 :::
 
 ## What a good session looks like

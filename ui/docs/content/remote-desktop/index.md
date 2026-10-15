@@ -9,8 +9,8 @@ order: 0
 ---
 
 Any machine running the agent can be opened as a **live screen in a browser
-tab**. The viewing side installs nothing — the controller is a plain Chromium
-browser, on any operating system, including one that has never heard of Roomler.
+tab**. The viewing side installs nothing — the controller is a plain browser, on
+any operating system, including one that has never heard of Roomler.
 
 :::badges
 - **Nothing to install to watch** icon:monitor — only the machine you reach runs an agent.
@@ -46,9 +46,9 @@ once the two ends can talk. It coordinates; it is never a data path.
 
 | Side | Needs |
 |---|---|
-| **Viewer** | A current Chromium-based browser. Nothing installed. |
+| **Viewer** | A current browser: Chrome, Edge or another Chromium browser works best; Safari and Firefox work too. Nothing installed. |
 | **Target** | The agent, and whatever screen-capture permission the OS demands. |
 
-Firefox and Safari can sign in and use chat and calls, but the remote-desktop
-viewer targets Chromium, where the low-latency decode path it relies on is
-available.
+Chromium browsers are the recommendation: the low-latency decode path the viewer
+relies on has had the most testing there. Safari and Firefox run the viewer too,
+with less testing so far.
