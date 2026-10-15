@@ -67,4 +67,18 @@ describe('hive store — the organizations agent sessions serve (FR-90 P1g)', ()
     expect(isAdopted({})).toBe(false)
     expect(isAdopted(undefined)).toBe(false)
   })
+
+  // FR-90 P2h-2 — the same answer says whether sessions are copied there at
+  // all; a server before it says nothing, which is no.
+  it('keeps whether sessions are copied there, from the same answer', async () => {
+    hoisted.get
+      .mockResolvedValueOnce({ enabled: true, replicaset: true })
+      .mockResolvedValueOnce({ enabled: true, replicaset: false })
+      .mockResolvedValueOnce({ enabled: true })
+      .mockRejectedValueOnce(new hoisted.ApiError(404, { error: 'not_found' }))
+    const hive = useHiveStore()
+    for (const tid of ['c1', 'c2', 'c3', 'c4']) await hive.checkServed(tid)
+    expect(hive.copied).toEqual({ c1: true, c2: false, c3: false, c4: false })
+    expect(hive.served).toEqual({ c1: true, c2: true, c3: true, c4: false })
+  })
 })
