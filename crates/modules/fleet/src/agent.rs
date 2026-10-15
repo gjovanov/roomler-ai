@@ -560,9 +560,14 @@ pub async fn self_unenroll(
                 .to_string(),
         ));
     }
-    let released =
-        crate::removal::remove_agent_device(&state, &agent.agent, "ephemeral_self_unenroll")
-            .await?;
+    // The reason is what keeps the removal's kick from telling a device that
+    // is already leaving (#2267).
+    let released = crate::removal::remove_agent_device(
+        &state,
+        &agent.agent,
+        crate::removal::SELF_UNENROLL_REASON,
+    )
+    .await?;
     tracing::info!(
         tenant_id = %agent.tenant_id, agent_id = %agent.agent_id, name = %agent.agent.name,
         overlay_released = released.is_some(),

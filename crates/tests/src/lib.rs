@@ -42,6 +42,10 @@ mod agent_e2e_tests;
 mod agent_exec_tests;
 #[cfg(test)]
 mod agent_presence_tests;
+/// #2267 — a removal (or an archive) tells a connected device at once with
+/// `rc:goodbye AgentDeleted`, instead of leaving it its socket.
+#[cfg(test)]
+mod agent_removal_tests;
 /// FR-84 D5a — `/api/agent/self/{devices,mesh}`: a device's own view of its
 /// org is exactly its netmap ∪ itself (the negative control lives here).
 #[cfg(test)]
