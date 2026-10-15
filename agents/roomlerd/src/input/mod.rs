@@ -257,6 +257,45 @@ pub trait InputInjector: Send {
     fn move_norm(&mut self, _x: f64, _y: f64) -> Result<()> {
         Err(anyhow::Error::new(PxUnsupported))
     }
+
+    /// FR-95 P2 — this injector was switched on by a system install by itself
+    /// (uinput for the automatic DRM capture), and injects only while that
+    /// capture reads the person's unlocked session. Default: `false`.
+    fn automatic(&self) -> bool {
+        false
+    }
+}
+
+/// FR-95 P2 — `uinput` set to anything takes the automatic choice back:
+/// `true` is the configured path, `false` keeps an automatic capture
+/// view-only.
+#[cfg(all(target_os = "linux", feature = "uinput-input", feature = "drm-capture"))]
+fn uinput_unset() -> bool {
+    tunnel_core::env::node_env("UINPUT").is_none()
+}
+
+/// FR-95 P2 — whether the arbiter's cached injector no longer matches what
+/// [`open_default`] would pick now: an automatic system capture started (with
+/// `uinput` unset) while another backend was cached, or an automatic uinput
+/// outlived both its captures and the Wayland desktop they were for. Never
+/// while an automatic capture is alive, locked or not: an injector swapped in
+/// there would be enigo, whose XTest reaches Xwayland windows behind the lock
+/// screen.
+pub(crate) fn stale(inj: &dyn InputInjector) -> bool {
+    #[cfg(all(target_os = "linux", feature = "uinput-input", feature = "drm-capture"))]
+    {
+        let live = crate::capture::seat_guard::live();
+        if inj.automatic() {
+            !live && !crate::desktop_brief::seen_is_wayland()
+        } else {
+            live && uinput_unset()
+        }
+    }
+    #[cfg(not(all(target_os = "linux", feature = "uinput-input", feature = "drm-capture")))]
+    {
+        let _ = inj;
+        false
+    }
 }
 
 /// FR-92 — the backend has no pixel-space read/move (Noop, uinput, a
@@ -384,6 +423,32 @@ pub fn open_default() -> Box<dyn InputInjector + Send> {
                     tracing::warn!(
                         error = %format!("{e:#}"),
                         "ROOMLERD_UINPUT=1 but uinput init failed — falling through to the standard backend"
+                    );
+                }
+            }
+        }
+    }
+    // FR-95 P2 — the input of a capture a system install switched on by
+    // itself: uinput, below the compositor, injecting only while that capture
+    // reads the person's session on screen, unlocked. Chosen whenever one is
+    // alive, locked or not (the arbiter swaps it in when one starts, `stale`),
+    // so a first event during a lock never opens enigo; never with `uinput`
+    // set either way.
+    #[cfg(all(target_os = "linux", feature = "uinput-input", feature = "drm-capture"))]
+    {
+        if uinput_unset() && crate::capture::seat_guard::live() {
+            match uinput_backend::UinputInjector::new() {
+                Ok(u) => {
+                    tracing::info!(
+                        "input: uinput for the automatic system capture, injecting only while it \
+                         reads the person's session (FR-95 P2)"
+                    );
+                    return Box::new(u.for_auto_system());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "input: the automatic system capture's uinput did not open (FR-95 P2)"
                     );
                 }
             }

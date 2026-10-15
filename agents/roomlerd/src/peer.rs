@@ -5140,6 +5140,10 @@ fn media_waiting_payload(wait: crate::capture::OpenWait) -> String {
         WaitFor::SessionAway => ("session_away", MEDIA_WAITING_HINT_AWAY),
         // FR-93 P5h — the computer is going to sleep (`crate::sleep_notice`).
         WaitFor::HostSleep => ("host_sleep", MEDIA_WAITING_HINT_SLEEP),
+        // FR-95 P2 — the same `for`, so a viewer titles them as it already
+        // does; a system install's own sentence.
+        WaitFor::GuardLocked => ("screen_unlock", MEDIA_WAITING_HINT_UNLOCK_SYSTEM),
+        WaitFor::GuardAway => ("session_away", MEDIA_WAITING_HINT_AWAY_SYSTEM),
     };
     format!(
         r#"{{"t":"rc:media-waiting","for":"{for_}","waits_ms":{},"hint":"{hint}"}}"#,
@@ -5200,6 +5204,29 @@ const MEDIA_WAITING_HINT_WAKE: &str = "This computer's display is off: it went t
 const MEDIA_WAITING_HINT_AWAY: &str = "This computer is showing the login screen or another user's \
      session. This install shares only its own user's session, so the picture comes back by itself \
      when that session is on screen again.";
+
+/// FR-95 P2 — the hint while the person a system install's automatic capture
+/// is bound to has locked their screen. It reads nothing and injects nothing
+/// there, so the screen is unlocked at the computer.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+const MEDIA_WAITING_HINT_UNLOCK_SYSTEM: &str = "This computer's screen is locked. This install \
+     switched capture on by itself for the person at the screen, so it shows nothing while their \
+     screen is locked and takes no input there: it has to be unlocked at the computer, and the \
+     picture comes back by itself. A system install with drm_capture and uinput set can show and \
+     unlock a locked screen.";
+
+/// FR-95 P2 — the hint while that person is not on screen.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+const MEDIA_WAITING_HINT_AWAY_SYSTEM: &str = "This computer is showing the login screen or another \
+     person's session. This install switched capture on by itself for the person who was told they \
+     are being viewed, so it shows nothing until that session is back on screen, and the picture \
+     comes back by itself then. If they logged out, or someone else logged in, connect again.";
 
 /// FR-93 P5h — the hint as the computer goes to sleep. Nothing can be done
 /// from the viewer: a sleeping computer is woken at the computer (or by a
@@ -12300,6 +12327,21 @@ mod codec_cap_tests {
         assert_eq!(f, "host_sleep");
         assert!(hint.contains("going to sleep"), "{hint}");
         assert!(hint.contains("once the computer wakes"), "{hint}");
+        // FR-95 P2 — a system install's automatic capture: the viewer's own
+        // `for`, never the per-user install's sentence.
+        let (f, hint, _) = read(WaitFor::GuardLocked);
+        assert_eq!(f, "screen_unlock");
+        assert!(hint.contains("switched capture on by itself"), "{hint}");
+        assert!(hint.contains("unlocked at the computer"), "{hint}");
+        assert!(!hint.contains("per-user"), "{hint}");
+        let (f, hint, _) = read(WaitFor::GuardAway);
+        assert_eq!(f, "session_away");
+        assert!(hint.contains("another person's session"), "{hint}");
+        assert!(hint.contains("comes back by itself"), "{hint}");
+        assert!(
+            hint.contains("connect again"),
+            "a logout's picture never comes back: {hint}"
+        );
     }
 
     /// FR-93 P3e — a capture waiting on its host is told once per wait, told

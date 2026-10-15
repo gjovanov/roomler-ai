@@ -881,7 +881,7 @@ One MCP server per session, reached through `roomler mcp` (a stdio shim the harn
 starts) over a **per-session endpoint**: a Unix socket owned by the mapped account
 (`0600` under a `0700` directory) or a named pipe whose DACL names only that account's
 SID. It can't be the main LocalAPI endpoint: on a root daemon that socket is root-only
-(`crates/localapi/src/lib.rs:2898-2886`), and on Windows the pipe admits every
+(`crates/localapi/src/lib.rs:2898-2898`), and on Windows the pipe admits every
 interactive user and most verbs trust the pipe alone (`lib.rs:1073-1075`).
 
 | Tool or resource | Does | Gate |
@@ -922,7 +922,7 @@ even under allow rules. Because that is UX, the daemon asks again where it matte
 | Need | Primitive | What decides it |
 |---|---|---|
 | a peer's port | on a TUN host, the overlay address or MagicDNS name directly; on a netstack host, `socks5h://` to the netstack front | the netstack front resolves peer names from the netmap and needs no DNS (`crates/tunnel-core/src/overlay/netstack_socks.rs:3-32`), but reaches overlay peers only — not subnets, not exits (`netstack.rs:1146-1150`) |
-| a private subnet behind a device | a session-scoped forward or SOCKS5 **through that device** (`CreateSocks5{node}` semantics) | the exit dials with its own resolver (`agents/roomlerd/src/tunnel/dialer.rs:20-52`); `tunnel_policies` authorize it (`crates/remote_control/src/models.rs:2322-2250`) and `tunnel_audit` records it |
+| a private subnet behind a device | a session-scoped forward or SOCKS5 **through that device** (`CreateSocks5{node}` semantics) | the exit dials with its own resolver (`agents/roomlerd/src/tunnel/dialer.rs:20-52`); `tunnel_policies` authorize it (`crates/remote_control/src/models.rs:2322-2296`) and `tunnel_audit` records it |
 | the internet from a chosen place (an office IP a cloud API allow-lists) | SOCKS5 through that device | ⚠️ **not** an overlay exit node — those are host-wide, primary-org only and reroute the whole machine (`docs/overlay-exit-nodes.md`) |
 
 The daemon needs three changes for this, named here so they aren't discovered in the
