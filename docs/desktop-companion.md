@@ -518,6 +518,18 @@ tries first:
 
 Everything else on it is refused with a pointer to `sudo roomler …`, so the companion's other
 views show that refusal on a system install. The kill switch is `ROOMLERD_PERSON_SOCKET=0`.
+
+⚠️ **A session the compositor says nothing about starts the companion** (FR-93 P6g). On
+Wayland the desktop's own screen-sharing indicator (GNOME's pill, KDE's tray icon) shows for
+the portal and mutter arms, but the DRM arm reads the scanout below the compositor, so neither
+appears. A session that needs no prompt also never started the companion, so nothing at the
+screen said anyone was watching. Now each pump, once its capture opens on DRM, starts the
+companion (`companion::ensure_running`), whose banner lists every live session. Where no
+companion can run, the daemon posts a notification instead: *"This screen is being viewed —
+Alice is viewing this screen and can use its keyboard and mouse."*, with **Disconnect**, which
+ends the session as the banner's does. The notification stays on screen (critical urgency),
+comes down with the session, and stays down for that session once the person closes it.
+The kill switch is `ROOMLERD_VIEWING_NOTICE=0`.
 A per-user install, and a supervised Mac through its worker (FR-43), never had this problem.
 
 | | Behaviour | Where |
