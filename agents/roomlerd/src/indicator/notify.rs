@@ -26,6 +26,10 @@
 //!   Deny: the person saw the question and did not approve it, and a question
 //!   with nothing left on screen would otherwise stand until its window ran
 //!   out, with the controller told "nobody answered".
+//! - A click on the notification's **body** is not an answer. Servers send it
+//!   as the spec's `default` action and then remove the notification (on
+//!   GNOME 50 the removal alone arrived as a dismissal, which read as a
+//!   refusal), so the helper posts the question again.
 //! - **Critical urgency**: GNOME and KDE keep a critical notification on screen
 //!   until it is answered, and show it under Do Not Disturb.
 //! - **The daemon takes it down** (answered elsewhere, timed out, the session
@@ -90,6 +94,10 @@ fn parse(line: &str) -> Option<Said> {
 /// The two buttons of a consent question.
 const APPROVE: &str = "approve";
 const DENY: &str = "deny";
+/// The freedesktop spec's click on the body, which no server draws as a
+/// button. Without it a click there closed the question as dismissed (GNOME
+/// 50), which read as a refusal; with it, the helper posts it again.
+const DEFAULT: &str = "default";
 
 /// A consent question's answer, from what the person did: Approve, Deny, or
 /// closing it (a Deny). Anything else (the server expired it, it was closed by
@@ -127,6 +135,7 @@ fn consent_request(view: &super::PromptView, now: std::time::Instant) -> Request
         summary: view.title.clone(),
         body: lines.join("\n"),
         actions: vec![
+            (DEFAULT.to_string(), "Show".to_string()),
             (APPROVE.to_string(), "Approve".to_string()),
             (DENY.to_string(), "Deny".to_string()),
         ],
@@ -377,7 +386,7 @@ pub fn run_helper() {
 }
 
 mod helper {
-    use super::{ACTION, CLOSED, Request, SHOWN, escape_markup};
+    use super::{ACTION, CLOSED, DEFAULT, Request, SHOWN, escape_markup};
     use std::collections::HashMap;
     use std::io::{BufRead, Write};
     use std::time::{Duration, Instant};
@@ -432,29 +441,33 @@ mod helper {
         };
 
         // Subscribed BEFORE Notify, so a press can never come before the
-        // subscription that would hear it.
+        // subscription that would hear it. ONE stream for both signals, so
+        // they arrive in the order the server sent them: a body click is
+        // `ActionInvoked(default)` then `NotificationClosed`, and read the
+        // other way round it would be a refusal.
         let (tx, rx) = std::sync::mpsc::channel::<Event>();
-        let actions = proxy
-            .receive_signal("ActionInvoked")
-            .map_err(|e| format!("subscribing to ActionInvoked: {e}"))?;
-        let closed = proxy
-            .receive_signal("NotificationClosed")
-            .map_err(|e| format!("subscribing to NotificationClosed: {e}"))?;
+        let signals = proxy
+            .receive_all_signals()
+            .map_err(|e| format!("subscribing to the notification signals: {e}"))?;
         let t = tx.clone();
         std::thread::spawn(move || {
-            for msg in actions {
-                if let Ok((id, key)) = msg.body().deserialize::<(u32, String)>()
-                    && t.send(Event::Action(id, key)).is_err()
-                {
-                    return;
-                }
-            }
-        });
-        let t = tx.clone();
-        std::thread::spawn(move || {
-            for msg in closed {
-                if let Ok((id, reason)) = msg.body().deserialize::<(u32, u32)>()
-                    && t.send(Event::Closed(id, reason)).is_err()
+            for msg in signals {
+                let header = msg.header();
+                let event = match header.member().map(|m| m.as_str()) {
+                    Some("ActionInvoked") => msg
+                        .body()
+                        .deserialize::<(u32, String)>()
+                        .ok()
+                        .map(|(id, key)| Event::Action(id, key)),
+                    Some("NotificationClosed") => msg
+                        .body()
+                        .deserialize::<(u32, u32)>()
+                        .ok()
+                        .map(|(id, reason)| Event::Closed(id, reason)),
+                    _ => None,
+                };
+                if let Some(e) = event
+                    && t.send(e).is_err()
                 {
                     return;
                 }
@@ -471,34 +484,11 @@ mod helper {
             let _ = tx.send(Event::Parent);
         });
 
-        let flat: Vec<&str> = req
-            .actions
-            .iter()
-            .flat_map(|(k, l)| [k.as_str(), l.as_str()])
-            .collect();
-        let mut hints: HashMap<&str, Value> = HashMap::new();
-        hints.insert("urgency", Value::from(req.urgency));
-        let id: u32 = proxy
-            .call_method(
-                "Notify",
-                &(
-                    "Roomler",
-                    0u32,
-                    "preferences-desktop-remote-desktop",
-                    req.summary.as_str(),
-                    body.as_str(),
-                    flat,
-                    hints,
-                    // Never expires by itself: the daemon closes it.
-                    0i32,
-                ),
-            )
-            .and_then(|r| r.body().deserialize())
-            .map_err(|e| format!("Notify: {e}"))?;
+        let mut id = post(&proxy, &req, &body)?;
         say(format!("{SHOWN}{id}"));
         eprintln!("portal-helper --notify: posted notification {id}");
 
-        let close = |why: &str| {
+        let close = |id: u32, why: &str| {
             let _ = proxy.call_method("CloseNotification", &(id,));
             eprintln!("portal-helper --notify: closed notification {id} ({why})");
         };
@@ -506,12 +496,22 @@ mod helper {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(left) {
+                // A click on the body, not a button: the server invokes
+                // `default` and takes the notification away (a dismissal,
+                // measured on GNOME 50). The person was looking, not
+                // answering, so the question comes back. The old one's
+                // `NotificationClosed` then names an id no longer ours.
+                Ok(Event::Action(i, key)) if i == id && key == DEFAULT => {
+                    close(i, "its body was clicked");
+                    id = post(&proxy, &req, &body)?;
+                    eprintln!("portal-helper --notify: posted it again as notification {id}");
+                }
                 Ok(Event::Action(i, key)) if i == id => {
                     say(format!("{ACTION}{key}"));
                     // A question is answered once; the server removes a
                     // non-resident notification on a press, and the close
                     // makes sure.
-                    close("answered");
+                    close(id, "answered");
                     return Ok(());
                 }
                 Ok(Event::Closed(i, reason)) if i == id => {
@@ -519,16 +519,44 @@ mod helper {
                     return Ok(());
                 }
                 Ok(Event::Parent) => {
-                    close("the daemon took it down");
+                    close(id, "the daemon took it down");
                     return Ok(());
                 }
                 Ok(_) => {}
                 Err(_) => {
-                    close("its lifetime ended");
+                    close(id, "its lifetime ended");
                     return Ok(());
                 }
             }
         }
+    }
+
+    /// One `Notify`: the request's words and buttons, at its urgency, never
+    /// expiring by itself (the daemon or the lifetime closes it).
+    fn post(proxy: &zbus::blocking::Proxy<'_>, req: &Request, body: &str) -> Result<u32, String> {
+        let flat: Vec<&str> = req
+            .actions
+            .iter()
+            .flat_map(|(k, l)| [k.as_str(), l.as_str()])
+            .collect();
+        let mut hints: HashMap<&str, Value> = HashMap::new();
+        hints.insert("urgency", Value::from(req.urgency));
+        proxy
+            .call_method(
+                "Notify",
+                &(
+                    "Roomler",
+                    0u32,
+                    "preferences-desktop-remote-desktop",
+                    req.summary.as_str(),
+                    body,
+                    flat,
+                    hints,
+                    0i32,
+                ),
+            )
+            .and_then(|r| r.body().deserialize())
+            .map_err(|e| format!("Notify: {e}"))
     }
 }
 
@@ -568,9 +596,12 @@ mod tests {
             "Alice is requesting to control this device.\nOn behalf of Acme\n\
              Permissions: VIEW|INPUT\nUnanswered, it is refused in 5 minutes."
         );
+        // `default` is the click on the body, which no server draws as a
+        // button: the helper posts the question again on it.
         assert_eq!(
             r.actions,
             vec![
+                ("default".to_string(), "Show".to_string()),
                 ("approve".to_string(), "Approve".to_string()),
                 ("deny".to_string(), "Deny".to_string())
             ]
