@@ -66,25 +66,25 @@ switches them on by itself.
 
 What each event does to a session in progress, measured with the lab's
 lifecycle oracle (the viewer sampled every 500 ms; the spec's §4.6 and field
-log). "Next" is the release after 0.4.135.
+log). Each cell names the release it was measured on.
 
 | Event | DRM (system, opt-in) | mutter (per-user GNOME) | portal (per-user KDE) |
 |---|---|---|---|
 | **lock → unlock** | keeps streaming: the lock screen is pixels | *"Waiting for this computer's screen to be unlocked"* within ~1.5 s, the desktop ~2 s after the unlock (0.4.135) | keeps streaming |
 | **display switched off** (the idle blank) → wake | *"This computer's display is asleep"*, a picture ~1 s after the viewer's own mouse wakes it (0.4.135) | GNOME's idle blank also locks: as the lock | — |
 | **resolution change** | follows in ~1.1 s | re-records the monitor at its new size in ~4.5 s (0.4.135) | renegotiates in place in ~1.5 s |
-| **user switch** | follows the seat: the login screen in 3.3 s, back in 0.4 s | *"This computer is showing another session"* ~4 s in; the picture 0.5 s after the switch back (next) | watched the same way (next); not measured |
-| **a viewer that connects during a user switch** | not measured | waits with the same notice, then the picture 1.6 s after the switch back; through GNOME's *Switch User*, the unlock notice in turn (next) | the same wait (next) |
+| **user switch** | follows the seat: the login screen in 3.3 s, back in 0.4 s | *"This computer is showing another session"* ~4 s in; the picture 0.5 s after the switch back (0.4.136) | watched the same way (0.4.136); not measured |
+| **a viewer that connects during a user switch** | not measured | waits with the same notice, then the picture ~2 s after the switch back; through GNOME's *Switch User*, the unlock notice in turn (0.4.136) | the same wait (0.4.136); not measured |
 | **logout → login** | follows the seat to the greeter and back | *Reconnecting* during the logout; the daemon starts with the next login, a picture ~5 s after it (0.4.135) | the same, a picture ~12 s after the login (0.4.135) |
-| **compositor crash** | not measured | GNOME's shell crash ends the session like a logout, then as the login (next) | KWin restarts, and the portal reopens from its token: a new picture ~4 s after the crash (next) |
+| **compositor crash** | not measured | GNOME's shell crash ends the session like a logout, then as the login: a picture ~3.5 s after it (0.4.136) | KWin restarts, and the portal reopens from its token: a new picture ~4 s after the crash (0.4.136) |
 | **suspend → resume** | not measured | not measured | not measured |
 
 The lab guests have suspend-to-RAM off, so suspend is owed (FR-93 AC7).
 
 ⚠️ On 0.4.135 a running DRM session's *display asleep* notice can be lost to its own last
 frame: the notice travels on the control channel and the last frame on the video one, and the viewer clears a
-notice at the first frame it counts. The viewer then reconnects once, and the new session's notice holds. The next
-release tells the viewer only after 2 s with nothing sent, and the viewer counts only frames after the notice
+notice at the first frame it counts. The viewer then reconnects once, and the new session's notice holds.
+0.4.136 tells the viewer only after 2 s with nothing sent, and the viewer counts only frames after the notice
 ([`linux-capture.md`](linux-capture.md) §5.6, P5f).
 
 ```mermaid
@@ -108,13 +108,13 @@ Two messages carry it (`useRemoteControl.ts`, `mediaWaitingCopy`).
 |---|---|---|---|
 | `rc:media-unavailable` | `wayland_not_enabled` | a Wayland desktop that no arm may capture; the hint names the keys **this install** can use | per-user: `portal_capture` (+ `mutter_capture` on GNOME) if the automatic arm is off; system: `drm_capture` + `uinput` |
 | `rc:media-unavailable` | `backend_error` | an arm that was on, or that switched itself on, failed; the detail is its own error | read the detail: it names the arm and the cause |
-| `rc:media-unavailable` | `backend_error`: *"…the person at the screen declined the request"* (the release after 0.4.135; before it, *"…exited before announcing a stream"*) | the person at the screen said no to remote control and then to a screen share | ask them; the next session asks again |
+| `rc:media-unavailable` | `backend_error`: *"…the person at the screen declined the request"* (0.4.136; before it, *"…exited before announcing a stream"*) | the person at the screen said no to remote control and then to a screen share | ask them; the next session asks again |
 | `rc:media-unavailable` | `backend_error`: *"…the portal ended the request on its own…"* (the same release) | the portal refused without a dialog: its backend for this desktop is stopped or missing | restart the backend the detail names, then `xdg-desktop-portal` (`systemctl --user restart …`) |
 | `rc:media-unavailable` | `backend_error`: *"…reading the scanout needs CAP_SYS_ADMIN (root)…"* (the same release; before it, the session re-created itself with no reason) | `drm_capture` is set on a per-user install, which cannot read the scanout | `roomler config clear drm_capture`: the desktop's own screencast takes over |
 | `rc:media-waiting` | `person_at_screen` | the desktop portal is asking the person at the screen to share it (or to allow remote control) | someone at the computer answers; the viewer waits for the dialog's deadline instead of reconnecting |
 | `rc:media-waiting` | `screen_unlock` | GNOME's screen is locked, and GNOME shares no locked screen | unlock it at the computer; the picture comes back by itself |
 | `rc:media-waiting` | `display_wake` | the display is off, so DRM has no scanout to read | move the viewer's mouse, or any input at the computer |
-| `rc:media-waiting` | `session_away` (the release after 0.4.135) | the computer shows the login screen or another user's session, and a per-user install shares only its own user's | switch back to that session at the computer |
+| `rc:media-waiting` | `session_away` (0.4.136) | the computer shows the login screen or another user's session, and a per-user install shares only its own user's | switch back to that session at the computer |
 
 An older viewer shows an unknown `for` under the dialog's title, with the
 agent's hint below it, so a newer agent's words still read.
