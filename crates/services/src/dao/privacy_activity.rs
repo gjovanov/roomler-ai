@@ -36,7 +36,9 @@ impl PrivacyActivityDao {
     }
 
     /// "When was this machine's screen covered, and by whose session?"
-    /// Newest first.
+    /// Newest first. `_id` breaks a tie: reports in one millisecond are
+    /// common (on, then off), and the hub records each as its frame arrives,
+    /// so `_id` order is arrival order.
     pub async fn list_for_agent(
         &self,
         tenant_id: ObjectId,
@@ -46,7 +48,7 @@ impl PrivacyActivityDao {
         self.base
             .find_paginated(
                 doc! { "tenant_id": tenant_id, "agent_id": agent_id },
-                Some(doc! { "at": -1 }),
+                Some(doc! { "at": -1, "_id": -1 }),
                 params,
             )
             .await
