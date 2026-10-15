@@ -1132,19 +1132,16 @@ matched through the org's stored customer and subscription ids instead.
 
 ## Field verification
 
-The digest's counts for a closed day are to be checked against a hand count from Mongo on
-production (AC23); the log of that check lives in the FR's spec. Until a purestat key exists
-for `roomler.ai`, the web sections read "not measured" by design.
+Each production check below is logged, with its numbers and its failing "before" run, in the
+FR's field-verification log ([FR-102 §8](fr/FR-102-growth-observability.md#8-field-verification-log)).
 
-The Campaigns table's visitors for a closed day are to equal purestat's own number for the
-same filter, and read "not measured" with the key revoked (AC16 — a production check after the
-roll); the integration suite covers the same two halves against a fake purestat
-(`crates/tests/src/growth_campaigns_tests.rs`).
-
-The ingest is to be shown on production to store a snapshot pushed twice once, to refuse an
-unknown platform and a body carrying post text, and to answer 404 to a wrong key (AC18); the
-integration suite asserts each, plus the revoked key, the JWT, the kill switch and the
-unmounted module (`crates/tests/src/growth_channels_tests.rs`).
+| Check | On production | Also covered by |
+|---|---|---|
+| The digest of a closed day equals a Mongo hand count of sign-ups, orgs, devices, sessions and the newsletter (AC23); without a purestat key the web sections read "not measured" by design | ✅ 2026-10-14 (the 10-13 digest) and 2026-10-15 (the 10-14 digest, the first with campaigns measured and the vmtest orgs excluded) | `crates/tests/src/growth_digest_tests.rs` — two concurrent runs store once and send once |
+| The funnel's sign-ups and activated orgs for a closed week equal a hand count (AC7) | ✅ 2026-10-15, the week of 2026-08-31 | `crates/tests/src/growth_funnel_tests.rs` — exact counts per step, `pending` / `settled`, and `null` for an unmounted module (AC6) |
+| Each enroll path records its `install` on the agent row (AC9) | ✅ 2026-10-15 on vmtest, agent 0.4.137: `script-sh`, `script-ps1`, `wizard`, `manual`; a 0.4.136 agent records `unknown` | `crates/agent-core/src/enrollment.rs` — flag, then env, then `manual`; an unknown env spelling clamped |
+| The Campaigns table's visitors for a closed day equal purestat's own number for the same filter, and read "not measured" with the key revoked (AC16) | ✅ 2026-10-15, 2026-10-13 by `content` | `crates/tests/src/growth_campaigns_tests.rs`, against a fake purestat |
+| The ingest stores a snapshot pushed twice once, refuses an unknown platform and a body carrying post text, and answers 404 to a wrong key (AC18) | ✅ 2026-10-15 | `crates/tests/src/growth_channels_tests.rs`, plus the revoked key, the JWT, the kill switch and the unmounted module |
 
 The newsletter's webhook is to be shown on production to refuse a bad signature (control),
 and to record `delivered` and `bounce` for a test send with one forced bounce, the bounced
