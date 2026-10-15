@@ -1,0 +1,24 @@
+#!/bin/sh
+# FR-96 P5 — the deb-systemd-helper bookkeeping for the update half that
+# postinst turned on, as dh_installsystemd writes it: masked on removal (so a
+# leftover enable link cannot start a unit whose file is gone), forgotten and
+# unmasked on purge. The daemon units are never touched here, as in postinst.
+set -e
+
+if command -v deb-systemd-helper >/dev/null 2>&1; then
+    for unit in roomler-update.timer roomler-update.path; do
+        if [ "$1" = remove ]; then
+            deb-systemd-helper mask "$unit" >/dev/null 2>&1 || true
+        fi
+        if [ "$1" = purge ]; then
+            deb-systemd-helper purge "$unit" >/dev/null 2>&1 || true
+            deb-systemd-helper unmask "$unit" >/dev/null 2>&1 || true
+        fi
+    done
+fi
+
+if [ -d /run/systemd/system ] && { [ "$1" = remove ] || [ "$1" = purge ]; }; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+exit 0

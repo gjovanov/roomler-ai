@@ -951,16 +951,102 @@ mod tests {
             "postinst must open with a plain /bin/sh shebang; got {:?}",
             s.lines().next()
         );
-        // Reload only. Enabling/starting/restarting from a package upgrade
-        // would change what runs on the host and would fight the
-        // self-updater that invoked dpkg.
         assert!(s.contains("daemon-reload"), "postinst must reload systemd");
-        for forbidden in ["systemctl enable", "systemctl start", "systemctl restart"] {
-            assert!(
-                !s.contains(forbidden),
-                "postinst must not `{forbidden}` — a package upgrade is not permission \
-                 to change what is running"
-            );
+        // The DAEMON is never enabled, started or restarted from a package
+        // upgrade: that would change what runs on the host and would fight the
+        // self-updater that invoked dpkg. FR-96 P5 — the ONE thing postinst
+        // turns on is the package's update half, the timer and the path, the
+        // Debian way (deb-systemd-helper), so an administrator's disable holds.
+        let code: Vec<&str> = s
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        for line in &code {
+            for daemon in ["roomlerd.service", "roomler.service"] {
+                assert!(
+                    !line.contains(daemon),
+                    "postinst must not act on the daemon unit `{daemon}`: {line}"
+                );
+            }
+            for forbidden in [
+                "systemctl enable",
+                "systemctl start",
+                "systemctl restart",
+                "systemctl stop",
+                "deb-systemd-invoke restart",
+                "deb-systemd-invoke stop",
+            ] {
+                assert!(
+                    !line.contains(forbidden),
+                    "postinst must not `{forbidden}` — a package upgrade is not permission \
+                     to change what is running: {line}"
+                );
+            }
         }
+        assert!(
+            code.contains(&"HELPER_UNITS=\"roomler-update.timer roomler-update.path\""),
+            "postinst turns on exactly the update helper's timer and path"
+        );
+        assert!(
+            code.iter()
+                .any(|l| l.contains("deb-systemd-helper --quiet was-enabled \"$unit\""))
+        );
+        assert!(
+            code.iter()
+                .any(|l| l.contains("deb-systemd-helper enable \"$unit\""))
+        );
+        assert!(
+            code.iter()
+                .any(|l| l.contains("deb-systemd-helper update-state \"$unit\""))
+        );
+        assert!(
+            code.iter()
+                .any(|l| l.contains("deb-systemd-invoke start \"$unit\""))
+        );
+    }
+
+    /// FR-96 P5 — prerm and postrm are the update half's bookkeeping only: the
+    /// timer and the path stopped on removal (never on upgrade: the helper may
+    /// be the process upgrading the package), masked on removal, purged and
+    /// unmasked on purge. Like postinst, they never touch a daemon unit, and
+    /// they ship as plain LF /bin/sh scripts.
+    #[test]
+    fn deb_prerm_and_postrm_touch_only_the_update_half() {
+        for (name, s) in [
+            ("prerm", include_str!("../packaging/linux/debian/prerm")),
+            ("postrm", include_str!("../packaging/linux/debian/postrm")),
+        ] {
+            assert!(
+                !s.contains('\r'),
+                "{name} has CR bytes — dpkg cannot run it"
+            );
+            assert!(
+                s.starts_with("#!/bin/sh\n"),
+                "{name}: a plain /bin/sh shebang"
+            );
+            for line in s.lines().map(str::trim).filter(|l| !l.starts_with('#')) {
+                for daemon in ["roomlerd.service", "roomler.service"] {
+                    assert!(
+                        !line.contains(daemon),
+                        "{name} must not act on `{daemon}`: {line}"
+                    );
+                }
+                assert!(
+                    !line.contains("restart"),
+                    "{name} must not restart anything: {line}"
+                );
+            }
+        }
+        let prerm = include_str!("../packaging/linux/debian/prerm");
+        assert!(
+            prerm.contains("[ \"$1\" = remove ]"),
+            "prerm stops on removal only"
+        );
+        assert!(prerm.contains("deb-systemd-invoke stop roomler-update.timer roomler-update.path"));
+        let postrm = include_str!("../packaging/linux/debian/postrm");
+        assert!(postrm.contains("deb-systemd-helper mask \"$unit\""));
+        assert!(postrm.contains("deb-systemd-helper purge \"$unit\""));
+        assert!(postrm.contains("deb-systemd-helper unmask \"$unit\""));
     }
 }

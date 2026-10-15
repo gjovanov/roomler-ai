@@ -192,11 +192,14 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   `systemctl --user enable --now`).
 - **It updates itself unattended, per-user or `--system`.** A per-user daemon
   runs as you and cannot write `/usr`, so for a per-user install `install.sh`
-  also enables a **root update helper**. `roomler-update.service` is woken by
-  `roomler-update.timer` (5 min after boot, then every 6 h) and by
-  `roomler-update.path` (the file a pushed update touches). It checks, verifies
-  and installs as root, and the daemon then restarts onto the new binary once
-  nothing it serves would be cut (FR-96).
+  also enables a **root update helper**, and so does the `.deb` itself however
+  it is installed (apt, the Software app, `dpkg -i`). `roomler-update.service`
+  is woken by `roomler-update.timer` (5 min after boot, or at once when the
+  install turns it on, then every 6 h) and by `roomler-update.path` (the file
+  a pushed update touches). It checks, verifies and installs as root, and the
+  daemon then restarts onto the new binary once nothing it serves would be cut
+  (FR-96). On a system install the helper steps aside: that root daemon
+  installs its own updates.
   - The helper is enabled only when the installed release's daemon steps aside
     for it (`roomlerd update-helper --capabilities` lists `step-aside`).
   - `--system` turns it off: that root daemon installs its own updates, and two
