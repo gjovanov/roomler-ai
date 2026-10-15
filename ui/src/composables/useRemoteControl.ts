@@ -752,7 +752,8 @@ export interface RcInputReach {
  *
  *  `for` is `person_at_screen` (a dialog), from P5b `screen_unlock` (GNOME's
  *  lock screen, #2145), from P3e `display_wake` (a display switched off, DRM),
- *  or from P5f `session_away` (a user switch); `mediaWaitingCopy` words each.
+ *  from P5f `session_away` (a user switch), or from P5h `host_sleep` (the
+ *  computer going to sleep); `mediaWaitingCopy` words each.
  *  It is typed as a string on purpose: a newer agent may wait for something
  *  else, and its `hint` still reads. */
 export interface RcMediaWaiting {
@@ -834,6 +835,15 @@ export function mediaWaitingCopy(waitingFor: string): RcMediaWaitingCopy {
     return {
       title: 'This computer is showing another session.',
       status: "waiting for this user's session to be on screen",
+      showsDeadline: false,
+    }
+  }
+  // FR-93 P5h — the computer is going to sleep. Nothing here wakes it; the
+  // viewer reconnects by itself once it does, and nothing ends on its own.
+  if (waitingFor === 'host_sleep') {
+    return {
+      title: 'This computer is going to sleep.',
+      status: 'the computer is asleep',
       showsDeadline: false,
     }
   }

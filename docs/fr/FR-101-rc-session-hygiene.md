@@ -79,8 +79,8 @@ advertises `session-policy` (P2b). Every other session goes without it:
 - ⚠️ Audio is the request's `audio_enabled` flag, which is what the agent adds its track on. The
   `AUDIO` permission bit is read by nothing; the hub clears it along with the flag.
 - The strip takes effect on every deployed agent, because the agent already enforces the grant it is
-  sent: it refuses the `files` channel without `FILES` (`agents/roomlerd/src/peer.rs:1194`) and
-  clipboard traffic without `CLIPBOARD` (`agents/roomlerd/src/peer.rs:9893`), and adds no audio track
+  sent: it refuses the `files` channel without `FILES` (`agents/roomlerd/src/peer.rs:1197`) and
+  clipboard traffic without `CLIPBOARD` (`agents/roomlerd/src/peer.rs:9933`), and adds no audio track
   without `audio_enabled`. Until P2c the viewer does not explain the refusal.
 - ⚠️ **Mid-roll.** An absent `session_policy` in the relay body comes from an origin pod older than
   the feature and reads as unrestricted: that pod applied no policy and would have granted the

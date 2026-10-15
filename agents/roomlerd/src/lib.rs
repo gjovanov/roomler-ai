@@ -148,6 +148,8 @@ pub mod session_idle;
 pub mod session_policy;
 pub mod session_telemetry;
 pub mod signaling;
+/// FR-93 P5h — a computer going to sleep tells every viewer first.
+pub mod sleep_notice;
 /// Roomler SSH — the in-daemon SSH surface served on this node's overlay
 /// address, intercepted before the OS (`ssh_enabled`, default off). Gated with
 /// [`overlay`]: without an overlay there is no address to serve on.
