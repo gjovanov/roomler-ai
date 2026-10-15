@@ -675,6 +675,7 @@ bridge for text and images in the lab before deciding.
 | ↳ P6a | the native X11 consent panel leaves the screen once answered or dismissed: its unmap is flushed (`indicator/x11.rs`), where nothing flushed it after the last repaint; a real-X test in CI's Xvfb lane asks the server, as a second client, whether the panel is still mapped | — | ✅ lab (`428efdc83`), GNOME 50 per-user, consent on. **🔴 0.4.135:** the session started under the panel, frozen on its countdown with live-looking buttons, on GNOME 50 and on Plasma 6.7 (both through Xwayland). **P6a:** 4 s after Approve the panel is gone and GNOME's own screen-sharing pill is up; a prompt the viewer gave up on leaves the screen too. Negative control: without the flush the test reads the panel still `VIEWABLE` | S |
 | ↳ P6b | a per-user daemon starts the companion for a prompt through its own user manager (`systemd-run --user`), and counts only the session user's own companion (`pgrep -u`): the shape `launch_once` already had | — | ✅ lab (`428efdc83`), GNOME 50 per-user with no native panel (`DISPLAY` unset for the unit). **🔴 0.4.135:** `systemd-run` on the system manager waited on polkit and failed after 25 s; no prompt anywhere, and the viewer waited. **P6b:** the companion started at once and showed the prompt, and after Approve its *Being viewed by … · Disconnect* banner, beside GNOME's pill | S |
 | ↳ P6c | the desktop's own stop control ends the session. The helper tells the person's stop from a lock (mutter's refusal of a new session) and from a compositor crash (KWin's bus owner), and exits 5. The parent types it (`StoppedAtScreen`), and every pump ends its session through the session registry as the person's Disconnect does, a shared pipeline's followers first, and never reopens (`linux-capture.md` §5.7) | `ROOMLERD_SCREEN_STOP=0` | ✅ lab (`3cf441886`), GNOME 50 and Plasma 6.7 per-user. **🔴 0.4.135:** GNOME's Stop undone 0.5 s later by a new unattended screencast; KDE's End froze the viewer, and with P5d's reopen it was undone from the token 3 s later. **P6c:** GNOME's Stop → `host_disconnect` about a second after the click, the viewer dropped at 1.1 s and stayed away, and the pill was gone; KDE's End → `host_disconnect` about 2 s after the click, the viewer dropped at 2.2 s, and the tray icon was gone. A lock still waits for the unlock (P5b), and a KWin crash still reopens (P5d: a new picture 4.2 s after it) | S |
+| ↳ P6f | D6: a consent question that neither the native panel nor the companion can show goes to the desktop's own notification, with **Approve** and **Deny**: posted from inside the person's session by `portal-helper --notify`, at critical urgency; the answer reaches the broker over the native panel's channel; closing it is a Deny, a click on its body posts it again, and the daemon takes it down when the question ends any other way (`remote-control.md`, "Prompt surfaces") | `ROOMLERD_NOTIFY_CONSENT=0` | ✅ lab (lab builds `dea1cc4f9`, then `bb9617f9e`), Plasma 6.7 system (Fedora 44, no companion) and GNOME 50 system (its companion moved aside). **🔴 0.4.136:** KDE system *"no desktop companion on this host"*, `have_surface=false`, nothing on screen. **P6f:** the notification 31 ms after the request on both desktops; Approve → `Granted`, Deny → `Denied`, its X → `Closed(2)` → `Denied`, answered from the CLI → taken down (*"the daemon took it down"*). 🔴 The first build's helper panicked (*"Cannot start a runtime from within a runtime"*: zbus's blocking API on the runtime's thread); 🔴 on GNOME a click on the body arrived as a dismissal and refused the request, so the question now carries the spec's `default` action | S |
 | **P7** | clipboard (§4.8) | `ROOMLERD_SESSION_CLIPBOARD=0` | lab | M |
 | **P8** | leftovers: FR-45 AC8 + P5b, FR-56 AC7/AC9/AC10, FR-92 AC9, FR-85's Wayland rows | each FR's own | lab, WSL2 | S each |
 | **P9** | docs: a new `docs/wayland.md` (the support matrix — desktop × install × session state × capability, attended vs unattended), `docs/linux-capture.md` refreshed, the lab runbook in `docs/vmtest.md`, a `docs/README.md` row, `README.Debian` | — | — | S |
@@ -919,10 +920,17 @@ New cells run three times before they are trusted. An entry in `expected-failure
   screen-sharing tray icon was gone. A KWin crash still reopens from the token (P5d), with a new picture 4.2 s
   after it.
 
+  ✅ **P6f, in the lab** (2026-10-15, D6): with no companion, the question goes to the desktop's own
+  notification. On Plasma 6.7 system (Fedora 44) and GNOME 50 system (its companion moved aside), it was up
+  31 ms after the request: *"Remote control request — vmtest admin is requesting to control this device.
+  Permissions: VIEW | INPUT | CLIPBOARD | FILES. Unanswered, it is refused in 5 minutes."* Approve granted the
+  session, Deny and the notification's X refused it, and a question answered from the CLI left the screen.
+  KDE shows it as a popup over the tray, GNOME as a banner at the top.
+
   Owed:
-  - KDE system: a non-Debian companion, or D6's Notifications-with-actions fallback (operator decisions).
+  - KDE system: the companion as an `.rpm` (P6d; the non-Debian companion D1 waits for).
   - A banner for a session that needed no prompt, where the compositor shows no indicator (DRM).
-  - The released build that carries P6a, P6b and P6c.
+  - The released build that carries P6a, P6b, P6c and P6f (P6a–P6c are in 0.4.137).
 - [ ] **AC11** — X11 hosts unchanged (FR-29's idle numbers), Windows and macOS unchanged; the kill switch
   restores 0.4.124's behaviour exactly.
   ⏳ **The kill switch, in the lab** (P1a, step log 76). On the released 0.4.135, both switches gave the lab's
@@ -971,8 +979,8 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | **D2** | The lab on zeus (a prod cluster host) | ✅ **approved 2026-10-11** (the operator's go-ahead on this plan) — `wlab-*` prefix, 6 GiB guests, one running by default, never jupiter |
 | **D3** | A real x86 Wayland box | ⏸ **Deferred 2026-10-11: decide when P3 starts.** It blocks only P3g (tiled scanout); everything else in this FR runs on the lab. *(Recommended: an N100-class mini-PC + an HDMI dummy plug, at the operator's home, enrolled. Without it DRM stays "linear only".)* |
 | **D4** | FR-45 AC8 | Option (b): the capture arm on the wire (P2) and viewer copy |
-| **D5** | An aarch64 companion | Yes — `build-linux-arm64` builds `roomlerd` only today; Asahi-class hosts otherwise have no prompt and no banner |
-| **D6** | A Notifications-with-actions consent surface | Yes, as the fallback where no companion runs — coordinate with FR-27's owner |
+| **D5** | An aarch64 companion | ✅ **Decided 2026-10-15 (operator): yes**, as recommended, with a non-Debian (`.rpm`) companion for AC10's KDE system cell: P6d (the `.rpm`) and P6e (aarch64). *(Recommended: yes — `build-linux-arm64` builds `roomlerd` only; Asahi-class hosts otherwise have no prompt and no banner.)* |
+| **D6** | A Notifications-with-actions consent surface | ✅ **Decided 2026-10-15 (operator): yes**, as the fallback where no companion runs: P6f. *(Recommended: yes — coordinate with FR-27's owner.)* |
 | **D7** | wlroots (sway/Hyprland) in scope? | Best effort: portal ScreenCast (attended, no RemoteDesktop) + uinput; `wlab-sway` and FR-56 AC5 only if yes |
 | **D8** | Which org the lab enrols in | ✅ **approved 2026-10-11** — the vmtest org (isolated; Playwright already signs in there) |
 

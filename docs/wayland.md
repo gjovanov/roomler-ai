@@ -131,21 +131,28 @@ prompt surfaces are FR-27's chain ([`remote-control.md`](remote-control.md)
 
 | | the prompt | while viewed |
 |---|---|---|
-| GNOME, per-user | the daemon's own panel, through Xwayland. Until P6a (the release after 0.4.136) it stayed on screen after the answer | GNOME's screen-sharing pill in the top bar; the companion's banner if it runs |
+| GNOME, per-user | the daemon's own panel, through Xwayland. Until P6a (0.4.137) it stayed on screen after the answer | GNOME's screen-sharing pill in the top bar; the companion's banner if it runs |
 | KDE, per-user | the same panel, through KWin's Xwayland | KDE's tray indicator; the companion's banner if it runs |
-| GNOME, system | the companion's window | the companion's *Being viewed by …* banner, with **Disconnect** (a centred window: Wayland lets no client place itself) |
-| KDE, system | **none**: Fedora has no companion package, and the viewer waits | **nothing** with DRM capture, which reads below the compositor |
+| GNOME, system | the companion's window; with no companion, GNOME's own notification banner with **Approve** and **Deny** (P6f) | the companion's *Being viewed by …* banner, with **Disconnect** (a centred window: Wayland lets no client place itself) |
+| KDE, system | KDE's own notification with **Approve** and **Deny** (P6f, the lab). Before it **none**: Fedora has no companion `.deb`, and the viewer waited | **nothing** with DRM capture, which reads below the compositor |
 
 A per-user daemon whose own panel cannot open (no Xwayland) starts the
 companion for the prompt from P6b, through the user's own systemd manager. On
 0.4.135 that launch waited on polkit and failed after 25 s.
 
+Where neither a panel nor the companion can show the question, the daemon posts
+it as the desktop's own notification (P6f), from inside the person's session, at
+critical urgency. Approve and Deny answer it; closing it is a Deny; a click on its
+body brings it back; and it leaves the screen when the question ends any other
+way ([`remote-control.md`](remote-control.md), "Prompt surfaces").
+`ROOMLERD_NOTIFY_CONSENT=0` switches it off.
+
 ⚠️ **The desktop's own stop control did not end a session** on 0.4.135. The
 square in GNOME's screen-sharing pill closed mutter's screencast, and a per-user
 install opened a new one half a second later. KDE's **End** in its tray menu
 froze the viewer instead, and P5d's reopen then undid it from the restore token
-3 s later. From P6c (the release after
-0.4.136), either one ends the session as the companion's **Disconnect** does:
+3 s later. From P6c (0.4.137), either one ends the session as the companion's
+**Disconnect** does:
 the viewer is told the person at the device ended it, and does not reconnect
 ([`linux-capture.md`](linux-capture.md) §5.7). `ROOMLERD_SCREEN_STOP=0` puts
 the reopen back.
@@ -195,3 +202,4 @@ ones that decide this page:
 | — | `ROOMLERD_MEDIA_WAITING` | on | the `rc:media-waiting` notices (§4); off = the viewer is told nothing and reconnects as before |
 | — | `ROOMLERD_SESSION_WATCH` | on | the user-switch notice (`session_away`); off = the last frame stays, with no reason |
 | — | `ROOMLERD_SLEEP_NOTICE` | on | the sleep notice (`host_sleep`) and the logind delay inhibitor that gives it time; off = a sleeping computer says nothing, as before P5h |
+| — | `ROOMLERD_NOTIFY_CONSENT` | on | a consent question no panel or companion can show goes to the desktop's notification (P6f); off = `no_prompt_surface` there, as before |
