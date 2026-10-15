@@ -110,6 +110,110 @@ pub async fn webhook(
     Ok(StatusCode::OK)
 }
 
+// ---- FR-102 P4: the operator's one-off backfill ------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct BackfillQuery {
+    /// `YYYY-MM-DD` (UTC): read invoices created since this day. Absent =
+    /// all of them (bounded by `BACKFILL_MAX_PAGES` pages of 100).
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BackfillAnswer {
+    #[serde(flatten)]
+    pub report: roomler_ai_services::stripe::BackfillReport,
+    /// The closed months refrozen from the rows now on record (`YYYY-MM`).
+    pub refrozen: Vec<String>,
+}
+
+/// `POST /api/admin/growth/billing/backfill?since=YYYY-MM-DD` — FR-102 P4:
+/// read Stripe's paid invoices into `billing_events` (idempotent: an
+/// invoice already on record is left as it was), then refreeze the closed
+/// months those invoices touch. Platform admins only — 404 otherwise and
+/// when `growth.enabled = false`, like every growth route. One-off and
+/// operator-run: it reads Stripe and never writes to it.
+pub async fn backfill(
+    State(state): State<Core>,
+    auth: AuthUser,
+    axum::extract::Query(q): axum::extract::Query<BackfillQuery>,
+) -> Result<Json<BackfillAnswer>, ApiError> {
+    roomler_core::guards::require_platform_admin(&state, &auth)?;
+    if !state.settings.growth.enabled {
+        return Err(ApiError::NotFound("Not found".to_string()));
+    }
+    let since_unix = match q.since.as_deref() {
+        None => None,
+        Some(raw) => {
+            let day = chrono::NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+                .map_err(|_| ApiError::BadRequest("since must be YYYY-MM-DD".into()))?;
+            let floor = chrono::NaiveDate::from_ymd_opt(2020, 1, 1).expect("a real day");
+            if day < floor {
+                return Err(ApiError::BadRequest(
+                    "since must be 2020-01-01 or later".into(),
+                ));
+            }
+            Some(
+                day.and_hms_opt(0, 0, 0)
+                    .expect("midnight exists")
+                    .and_utc()
+                    .timestamp(),
+            )
+        }
+    };
+    let now = bson::DateTime::now();
+    let stripe = StripeService::new(&state.settings.stripe);
+    let report = stripe
+        .backfill_paid_invoices(
+            &state.db,
+            roomler_ai_services::stripe::STRIPE_API_BASE,
+            since_unix,
+            now,
+        )
+        .await
+        .map_err(|e| match e {
+            roomler_ai_services::stripe::StripeError::ApiError(m) => ApiError::BadRequest(m),
+            other => stripe_err(other),
+        })?;
+    let refrozen = refreeze(&state, &report.months, now).await?;
+    tracing::info!(
+        admin = %auth.user_id, recorded = report.recorded, refrozen = refrozen.len(),
+        "growth billing backfill"
+    );
+    Ok(Json(BackfillAnswer { report, refrozen }))
+}
+
+/// Rewrite the frozen totals of the CLOSED months a backfill touched (past
+/// the freeze grace) — the one deliberate correction a frozen month takes.
+/// The current month is never frozen; it is computed live.
+pub async fn refreeze(
+    state: &Core,
+    months: &[String],
+    now: bson::DateTime,
+) -> Result<Vec<String>, ApiError> {
+    use roomler_ai_services::billing;
+    let excluded: Vec<ObjectId> = roomler_core::growth::ExclusionSet::load(state)
+        .await?
+        .tenants
+        .into_iter()
+        .collect();
+    let now_ms = now.timestamp_millis();
+    let mut done = Vec::new();
+    for label in months {
+        let Some((_, end)) = billing::month_bounds(label) else {
+            continue;
+        };
+        if end + billing::FREEZE_GRACE_DAYS * 86_400_000 > now_ms {
+            continue;
+        }
+        if billing::freeze_month(&state.db, label, &excluded, true, now).await? {
+            done.push(label.clone());
+        }
+    }
+    Ok(done)
+}
+
 // ---- Helpers -------------------------------------------------------------
 
 fn parse_oid(s: &str) -> Result<ObjectId, ApiError> {
@@ -156,5 +260,6 @@ fn stripe_err(e: roomler_ai_services::stripe::StripeError) -> ApiError {
         }
         StripeError::ApiError(msg) => ApiError::Internal(format!("Stripe API error: {msg}")),
         StripeError::Mongo(e) => ApiError::Internal(e.to_string()),
+        StripeError::Storage(msg) => ApiError::Internal(msg),
     }
 }

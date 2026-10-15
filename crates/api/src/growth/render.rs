@@ -582,7 +582,62 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
         "MRR (ESTIMATE)".into(),
         format!("{} — {}", money(s.revenue.mrr.cents), s.revenue.mrr.basis),
     ));
-    out.push(Line("Billed".into(), not_measured(&s.revenue.billed)));
+    // P4 — what Stripe billed, beside (never instead of) the estimate.
+    match &s.revenue.billed {
+        Measured::Value(b) => {
+            if !b.backfilled {
+                out.push(Note(format!(
+                    "Billed figures cover what Stripe's webhook delivered since {}; \
+                     the backfill of Stripe's history has not run.",
+                    opt(&b.record_since)
+                )));
+            }
+            if b.mrr.is_empty() {
+                out.push(Line("Billed MRR".into(), "0 — no paying org".into()));
+            }
+            for m in &b.mrr {
+                out.push(Line(
+                    format!("Billed MRR ({})", m.currency.to_uppercase()),
+                    format!(
+                        "{} — {} paying org{}",
+                        money(m.mrr_cents as f64),
+                        m.paying_orgs,
+                        if m.paying_orgs == 1 { "" } else { "s" }
+                    ),
+                ));
+            }
+            out.push(Line("Invoices paid".into(), fig(&b.invoices_paid)));
+            for c in &b.billed {
+                out.push(Line(
+                    format!("Billed ({})", c.currency.to_uppercase()),
+                    format!(
+                        "{} (7d {} · 28d {})",
+                        money(c.cents.day as f64),
+                        money(c.cents.d7 as f64),
+                        money(c.cents.d28 as f64)
+                    ),
+                ));
+            }
+            out.push(Line("Failed payments".into(), fig(&b.payment_failures)));
+            out.push(Line("First payments".into(), fig(&b.new_paying_orgs)));
+            out.push(Line("Cancellations".into(), fig(&b.cancellations)));
+            out.push(Line("Trials started".into(), fig(&b.trials_started)));
+        }
+        Measured::NotMeasured(n) => out.push(Line("Billed".into(), not_measured(n))),
+    }
+    if let Some(u) = &s.revenue.upgrade_intent {
+        out.push(Line("Plan-limit collisions".into(), fig(&u.collisions)));
+        out.push(Line("… orgs that hit a limit".into(), fig(&u.orgs)));
+        if !u.top.is_empty() {
+            out.push(Table(
+                vec!["Org".into(), "Limit".into(), "Collisions (28d)".into()],
+                u.top
+                    .iter()
+                    .map(|c| vec![c.name.clone(), c.limit.clone(), c.count.to_string()])
+                    .collect(),
+            ));
+        }
+    }
 
     out.push(Heading("Quality".into()));
     match &s.quality.remote {
@@ -860,7 +915,8 @@ mod tests {
                     estimate: true,
                     basis: "list price × seats".into(),
                 },
-                billed: NotMeasured::later("billed revenue", "P4"),
+                billed: Measured::unmounted("saas"),
+                upgrade_intent: None,
             },
             quality: Quality {
                 remote: Measured::unmounted("remote"),
@@ -1038,5 +1094,71 @@ mod tests {
         );
         assert!(html.contains("<h3"));
         assert!(!html.contains('@'), "no address anywhere in a digest");
+    }
+
+    /// P4 — billed revenue renders beside the list-price estimate (which
+    /// keeps its label), per currency; without `saas` it is a reason, never
+    /// a 0; the collisions name the org and the limit.
+    #[test]
+    fn billed_revenue_renders_beside_the_estimate() {
+        use crate::growth::digest::{
+            BilledFigures, CollisionOrg, CurrencyBilled, CurrencyMrr, UpgradeIntent,
+        };
+        let (doc, mut s) = sample();
+        let f = |day, d7, d28| Figure { day, d7, d28 };
+        let text = render_text(&doc, &s);
+        assert!(text.contains("Billed: not measured — saas module not mounted"));
+        assert!(!text.contains("Plan-limit collisions"), "absent before P4");
+
+        s.revenue.billed = Measured::Value(BilledFigures {
+            record_since: Some("2026-10-01".into()),
+            backfilled: false,
+            mrr: vec![CurrencyMrr {
+                currency: "eur".into(),
+                mrr_cents: 1920,
+                paying_orgs: 1,
+            }],
+            invoices_paid: f(1, 1, 2),
+            billed: vec![CurrencyBilled {
+                currency: "eur".into(),
+                cents: f(1920, 1920, 2400),
+            }],
+            payment_failures: f(0, 0, 1),
+            new_paying_orgs: f(1, 1, 1),
+            cancellations: f(0, 0, 0),
+            trials_started: f(0, 1, 1),
+        });
+        s.revenue.upgrade_intent = Some(UpgradeIntent {
+            collisions: f(3, 5, 9),
+            orgs: f(1, 2, 2),
+            top: vec![CollisionOrg {
+                tenant_id: "x".into(),
+                name: "<b>Acme</b>".into(),
+                limit: "max_members".into(),
+                count: 7,
+            }],
+        });
+        let text = render_text(&doc, &s);
+        assert!(
+            text.contains(
+                "delivered since 2026-10-01; the backfill of Stripe's history has not run"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("MRR (ESTIMATE): 16.00"), "the estimate stays");
+        assert!(
+            text.contains("Billed MRR (EUR): 19.20 — 1 paying org"),
+            "{text}"
+        );
+        assert!(text.contains("Invoices paid: 1 (7d 1 · 28d 2)"));
+        assert!(text.contains("Billed (EUR): 19.20 (7d 19.20 · 28d 24.00)"));
+        assert!(text.contains("Failed payments: 0 (7d 0 · 28d 1)"));
+        assert!(text.contains("Plan-limit collisions: 3 (7d 5 · 28d 9)"));
+        assert!(text.contains("<b>Acme</b> | max_members | 7"));
+        let html = render_html(&doc, &s);
+        assert!(
+            html.contains("&lt;b&gt;Acme&lt;/b&gt;"),
+            "an org name is text"
+        );
     }
 }

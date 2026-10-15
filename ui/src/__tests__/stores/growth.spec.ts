@@ -172,6 +172,27 @@ describe('useGrowthStore', () => {
     )
   })
 
+  it('fetches billed revenue at the P4 route with its month range', async () => {
+    const store = useGrowthStore()
+    mockApi.get.mockResolvedValue({})
+    await store.fetchRevenue()
+    expect(mockApi.get).toHaveBeenCalledWith('/admin/growth/revenue')
+    await store.fetchRevenue({ since: '2025-11', until: '2026-10', includeInternal: true })
+    expect(mockApi.get).toHaveBeenCalledWith(
+      '/admin/growth/revenue?since=2025-11&until=2026-10&include_internal=true',
+    )
+  })
+
+  it('reads billed revenue with nothing on record as not measured, never 0 MRR', () => {
+    // The two shapes the billed cell takes.
+    expect(
+      isNotMeasured({ not_measured: 'no billing event on record yet' }),
+    ).toBe(true)
+    expect(
+      isNotMeasured({ record: { since: '2026-10-01', rows: 1, truncated: false }, now: [] }),
+    ).toBe(false)
+  })
+
   it('fetches the campaigns table at the P6 route with its range and depth', async () => {
     const store = useGrowthStore()
     mockApi.get.mockResolvedValue({})
