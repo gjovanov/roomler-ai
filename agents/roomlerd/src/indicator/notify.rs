@@ -190,6 +190,70 @@ fn viewing_enabled() -> bool {
     tunnel_core::env::flag("VIEWING_NOTICE", true)
 }
 
+/// Marks the probe's answer: `yes`, or `no` and why.
+const CAN: &str = "ROOMLER_NOTIFY_CAN:";
+
+/// How long the probe may take: a session bus round trip, and the start of a
+/// notification server that is activated on demand.
+const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// FR-95 P2 (decision D-b) — can the person in the session on screen (`uid`)
+/// be told they are being viewed, and end it? FR-93 P6g's notice is that
+/// surface: the companion's banner where one runs for them, else a
+/// notification with Disconnect. Asked LIVE, at the capture's open: a
+/// companion that is installed but not running for them is not counted on
+/// its own, and a session whose notification server shows no buttons is no
+/// surface. `false` with the notice switched off (`ROOMLERD_VIEWING_NOTICE=0`).
+/// Blocking: a helper is started in the session.
+pub(crate) fn can_tell(uid: u32) -> bool {
+    if !viewing_enabled() {
+        return false;
+    }
+    if crate::companion::companion_running_for_uid(uid) {
+        return true;
+    }
+    use crate::capture::portal::helper::{SpawnError, spawn_in_session};
+    match spawn_in_session(&["--notify-probe"], PROBE_BUDGET) {
+        Ok(text) => {
+            let said = text.lines().find_map(|l| l.trim().strip_prefix(CAN));
+            if said.is_some_and(|s| s.starts_with("yes")) {
+                return true;
+            }
+            tracing::info!(
+                said = said.unwrap_or("nothing"),
+                "no way to tell the person at the screen they are viewed (FR-95 P2)"
+            );
+            false
+        }
+        Err(SpawnError::NoSession) => false,
+        Err(SpawnError::Other(why)) => {
+            tracing::info!(%why, "the notification probe did not run (FR-95 P2)");
+            false
+        }
+    }
+}
+
+/// The probe's session half: `roomlerd portal-helper --notify-probe`. Posts
+/// nothing. On a plain thread, for the reason [`run_helper`] gives.
+pub fn run_probe_helper() {
+    let answer = match std::thread::Builder::new()
+        .name("notify-probe".into())
+        .spawn(helper::probe)
+    {
+        Ok(worker) => worker
+            .join()
+            .unwrap_or_else(|_| Err("the probe's thread panicked".into())),
+        Err(e) => Err(format!("no thread for the probe: {e}")),
+    };
+    match answer {
+        Ok(()) => println!("{CAN}yes"),
+        Err(why) => {
+            eprintln!("portal-helper --notify-probe: {why}");
+            println!("{CAN}no {why}");
+        }
+    }
+}
+
 /// FR-93 P6g — who is viewing the screen, whether they can type into it, and
 /// how to end it. Critical urgency, so it stays on screen for the session:
 /// with the DRM arm nothing else at the screen says so.
@@ -590,6 +654,27 @@ mod helper {
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "{line}");
         let _ = out.flush();
+    }
+
+    /// FR-95 P2 — the session has a notification server that shows buttons:
+    /// the one a being-viewed notice's Disconnect needs.
+    pub(super) fn probe() -> Result<(), String> {
+        let conn =
+            zbus::blocking::Connection::session().map_err(|e| format!("no session bus: {e}"))?;
+        let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)
+            .map_err(|e| format!("no notification server: {e}"))?;
+        let caps: Vec<String> = proxy
+            .call_method("GetCapabilities", &())
+            .and_then(|r| r.body().deserialize())
+            .map_err(|e| format!("no notification server: {e}"))?;
+        if caps.iter().any(|c| c == "actions") {
+            Ok(())
+        } else {
+            Err(format!(
+                "the notification server shows no buttons (capabilities: {})",
+                caps.join(" ")
+            ))
+        }
     }
 
     pub(super) fn run() -> Result<(), String> {

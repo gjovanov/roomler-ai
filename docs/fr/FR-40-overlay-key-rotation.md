@@ -23,7 +23,7 @@ were not printed (re-checked with a masked scan of the transcript, 2026-08-30).
 
 There is **no remedy for that today** short of re-enrolling the device: no rotation on the CLI,
 none over LocalAPI (`overlay_wg_secret_key` is deliberately unwritable there,
-`crates/agent-core/src/config_surface.rs:2140-2118`), none on the web. Re-enrolling needs a fresh
+`crates/agent-core/src/config_surface.rs:2149-2118`), none on the web. Re-enrolling needs a fresh
 enrollment token, local or `exec` access as SYSTEM/root, a daemon restart, and it is not what an
 operator reaches for when a key leaks — they reach for "rotate".
 
@@ -38,9 +38,9 @@ additionally refuses a registration whose pubkey is not the row's (`derp.rs:339-
 
 | piece | where | note |
 |---|---|---|
-| primary key mint | `agents/roomlerd/src/main.rs:2138-2129` | lazy, at daemon start, `WgKeypair::generate()` → `config::save`; the ONLY primary mint |
+| primary key mint | `agents/roomlerd/src/main.rs:2155-2129` | lazy, at daemon start, `WgKeypair::generate()` → `config::save`; the ONLY primary mint |
 | secondary-org mint | `crates/agent-core/src/enrollment.rs:331-334` | at enroll-append; never copied from the primary (cross-org correlation) |
-| storage | `crates/agent-core/src/config.rs:1028` (primary), `:1152` (`OrgEntry`), `for_org` at `:1222-1245` | the key is **per org** — `for_org` scopes it, unlike `exec_enabled`/`ssh_*` which are host-global |
+| storage | `crates/agent-core/src/config.rs:1028` (primary), `:1163` (`OrgEntry`), `for_org` at `:1222-1245` | the key is **per org** — `for_org` scopes it, unlike `exec_enabled`/`ssh_*` which are host-global |
 | atomic save | `config.rs:2130` | tmp + `sync_all` + 0600/ACL + `.prev` + rename, under the daemon-wide write lock (`org_join.rs:48`) |
 | how a session gets its key | `agents/roomlerd/src/signaling.rs:442-447`, `:881-883`; `overlay.rs:210-217` | from the in-memory `AgentConfig` snapshot taken at start — **never re-read from disk per session** |
 | runtime identity | `agents/roomlerd/src/overlay.rs:79-86` (`RuntimeFingerprint::same_shape` includes `wg_public_key`), `:236-243`, `:417-425` | a changed secret already fails re-attach and rebuilds the runtime |

@@ -199,9 +199,46 @@ pub struct UinputInjector {
     /// layout" is not actionable, "unsupported layout `de`" is.
     layout: Option<super::keylayout::Layout>,
     layout_name: String,
+    /// FR-95 P2 — switched on by a system install by itself: inject only while
+    /// the automatic capture reads the person's session (`seat_guard`).
+    auto_system: bool,
+    /// The automatic injector dropped input since it last injected: said once
+    /// per closed spell, not per event.
+    dropping: bool,
 }
 
 impl UinputInjector {
+    /// FR-95 P2 — mark this injector as the automatic system capture's.
+    pub fn for_auto_system(mut self) -> Self {
+        self.auto_system = true;
+        self
+    }
+
+    /// FR-95 P2 — whether input may reach the screen now. Always for a
+    /// configured injector; for the automatic one, only while its capture
+    /// reads the person's unlocked session, so a controller who cannot see
+    /// the screen (the lock screen, the greeter) cannot type into it.
+    fn may_inject(&mut self) -> bool {
+        if !self.auto_system {
+            return true;
+        }
+        #[cfg(feature = "drm-capture")]
+        let open = crate::capture::seat_guard::viewing();
+        #[cfg(not(feature = "drm-capture"))]
+        let open = false;
+        if open == self.dropping {
+            self.dropping = !open;
+            if open {
+                info!("uinput: injecting again, the person's session is on screen (FR-95 P2)");
+            } else {
+                info!(
+                    "uinput: dropping input while the person's session is not on screen, unlocked (FR-95 P2)"
+                );
+            }
+        }
+        open
+    }
+
     pub fn new() -> Result<Self> {
         let dev = OpenOptions::new()
             .write(true)
@@ -299,6 +336,8 @@ impl UinputInjector {
             warned_touch: false,
             layout,
             layout_name,
+            auto_system: false,
+            dropping: false,
         })
     }
 
@@ -314,6 +353,8 @@ impl UinputInjector {
             warned_touch: false,
             layout: None,
             layout_name: String::new(),
+            auto_system: false,
+            dropping: false,
         }
     }
 
@@ -372,6 +413,9 @@ fn ck(rc: libc::c_int, what: &str) -> Result<()> {
 
 impl InputInjector for UinputInjector {
     fn inject(&mut self, event: InputMsg) -> Result<()> {
+        if !self.may_inject() {
+            return Ok(());
+        }
         match event {
             InputMsg::MouseMove { x, y, .. } => {
                 self.move_abs(x, y)?;
@@ -506,8 +550,15 @@ impl InputInjector for UinputInjector {
     /// that repeats the axis's current value, so a "move" to where the
     /// device already is resets nothing — keep busy never sends one twice.
     fn move_norm(&mut self, x: f64, y: f64) -> Result<()> {
+        if !self.may_inject() {
+            return Ok(());
+        }
         self.move_abs(x as f32, y as f32)?;
         self.sync()
+    }
+
+    fn automatic(&self) -> bool {
+        self.auto_system
     }
 }
 

@@ -1028,6 +1028,17 @@ pub struct AgentConfig {
     /// required.
     #[serde(default)]
     pub wayland_auto: Option<bool>,
+    /// FR-95 P2 — the SYSTEM half of `wayland_auto`
+    /// (`ROOMLERD_WAYLAND_AUTO_SYSTEM`). A root install on a Wayland desktop,
+    /// with no capture key set, switches DRM and uinput on by itself where the
+    /// person at the screen can be told they are being viewed (the companion,
+    /// or the desktop's notifications), and for their own session only: it
+    /// reads the screen while that session is on it, unlocked, and never the
+    /// greeter or the lock screen. Built-in default: **ON**. `false` is the
+    /// kill switch: the behaviour before FR-95. `wayland_auto = false` turns it
+    /// off too. Restart required.
+    #[serde(default)]
+    pub wayland_auto_system: Option<bool>,
     /// FR-93 P4 — a mutter screencast is driven by mutter's own RemoteDesktop,
     /// which takes the viewer's mouse and keyboard (`ROOMLERD_MUTTER_INPUT`).
     /// Built-in default: **ON**.
@@ -2491,6 +2502,7 @@ pub fn test_fixture() -> AgentConfig {
         window_capture: None,
         wayland_aware: None,
         wayland_auto: None,
+        wayland_auto_system: None,
         mutter_input: None,
         x11_damage: None,
         overlay_key_rotation: None,
@@ -2659,7 +2671,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 87] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 88] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2696,6 +2708,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 87]
         ("WINDOW_CAPTURE", cfg.window_capture),
         ("WAYLAND_AWARE", cfg.wayland_aware),
         ("WAYLAND_AUTO", cfg.wayland_auto),
+        ("WAYLAND_AUTO_SYSTEM", cfg.wayland_auto_system),
         ("MUTTER_INPUT", cfg.mutter_input),
         ("X11_DAMAGE", cfg.x11_damage),
         ("OVERLAY_KEY_ROTATION", cfg.overlay_key_rotation),

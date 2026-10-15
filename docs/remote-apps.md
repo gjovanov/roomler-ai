@@ -25,7 +25,7 @@ The rest of the design follows from taking that sentence seriously.
 
 Everything is P2P over the session's existing `control` data channel — no
 server change, and the server never sees a window title. `peer.rs` routes three
-envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:8627`),
+envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:8654`),
 runs it on `spawn_blocking` because every backend shells out or calls FFI, and
 sends the returned reply back on the same channel. The request/reply shape and
 the id correlation are `rc:logs-fetch`'s.
@@ -385,7 +385,7 @@ label    = "Text editor"
 | `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1012`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
-`roomlerd apps-probe` (`agents/roomlerd/src/main.rs:5651`) answers the whole
+`roomlerd apps-probe` (`agents/roomlerd/src/main.rs:5668`) answers the whole
 question on the host with no session and no browser, the way `capture-smoke`
 does for pixels: which config it loaded and whether apps are enabled there,
 whether a desktop was found and as whom (the display and the cookie), what the
@@ -400,7 +400,7 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2607`),
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2619`),
 not `load`: `load` self-heals — an unreadable live file logs *the host must be
 re-enrolled* and can promote the `.prev` copy back over it — and a diagnostic
 must never write the device's config as a side effect of being run.
@@ -413,9 +413,9 @@ must never write the device's config as a side effect of being run.
 | `agents/roomlerd/src/apps/linux.rs` | `Target` (`:56`), `LinuxWm::cmd` and the privilege drop (`:102`), `on_path` (`:209`) and `HELPERS` (`:228`), `coverage` (`:254`), `list` (`:274`), `focus` (`:337`), `launch` (`:368`), `discover` (`:480`) and its test seam `discover_with` (`:497`), `refused` (`:579`), `Probe` (`:589`) and `probe` (`:605`), `find_xauthority` (`:648`) |
 | `agents/roomlerd/src/apps/windows.rs` | `EnumWindows` (`:49`), `coverage` (`:88`), `list` (`:100`), `focus` (`:120`), `launch` (`:149`) |
 | `agents/roomlerd/src/encode/caps.rs` | `apps_caps` / `apps_caps_for` (`:1487`, `:1493`), assigned by `with_config_lists` (`:655`) from `detect` (`:624`) beside `rpc` and `files` (`files_caps` / `files_caps_for`, `:1532`, `:1539`); `CACHED_CAPS` (`:37`) — why the hello is a snapshot; `cached_or_probed` (`:667`) — why the child's struct must carry no `apps` |
-| `agents/roomlerd/src/peer.rs` | the control-DC arm (`:8627`) |
+| `agents/roomlerd/src/peer.rs` | the control-DC arm (`:8654`) |
 | `agents/roomlerd/src/companion.rs` | `graphical_session` (`:461`) |
-| `agents/roomlerd/src/main.rs` | `apps-probe` (`:4707`) — reads the device config through `read_if_present`, never `load` |
+| `agents/roomlerd/src/main.rs` | `apps-probe` (`:4724`) — reads the device config through `read_if_present`, never `load` |
 | `crates/remote_control/src/models.rs` | `AgentCaps.apps` and its known values (`:203`) |
 | `crates/agent-core/src/apps_config.rs` · `config_surface.rs` | the `[virtual_desktop_apps]` shapes (`:21`); the config-surface keys (`:1446`, `:988`) |
 | `ui/src/composables/useRemoteControl.ts` | the parsers (`parseAppsListReply` `:1105`, `parseAppsUnavailable` `:1181`), the request path (`:5474`, `refreshApps` `:5512`), the reply arm (`:8515`), the no-reason wording (`:890`) |
