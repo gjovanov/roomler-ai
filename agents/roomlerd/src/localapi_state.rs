@@ -231,7 +231,9 @@ pub struct DaemonState {
 /// The verb ARMS a restart (records it, answers `DaemonRestarting`); only
 /// [`Self::commit`] — called by the LocalAPI connection loop once that
 /// answer has been written — starts the shutdown, so a caller never loses its
-/// connection before it knows the restart was accepted.
+/// connection before it knows the restart was accepted. A restart the daemon
+/// decides itself (FR-96 P2b, [`Self::arm_from_within`]) has no answer to
+/// write, and its caller commits at once.
 #[derive(Clone)]
 pub struct RestartHandle {
     inner: Arc<RestartInner>,
@@ -293,7 +295,7 @@ impl RestartHandle {
         }
         tracing::info!(
             supervisor = self.inner.supervision.wire(),
-            "restart: the answer is out — starting the graceful shutdown"
+            "restart: committed — starting the graceful shutdown"
         );
         let _ = self.inner.shutdown.send(true);
     }
@@ -302,6 +304,84 @@ impl RestartHandle {
     /// an update hold (FR-90 P1h-2) stops waiting when the daemon stops.
     pub fn shutdown_rx(&self) -> watch::Receiver<bool> {
         self.inner.shutdown.subscribe()
+    }
+
+    /// Who supervises this process (FR-84 D3), decided once at startup.
+    pub fn supervision(&self) -> crate::supervision::Supervision {
+        self.inner.supervision
+    }
+
+    /// FR-96 P2b — arm a restart this daemon decided on ITSELF: its binary
+    /// was replaced, and nothing it serves would be cut. The same gates as
+    /// the LocalAPI verb, in the same order, through the same shared
+    /// functions: a supervisor that will relaunch it, the persisted record
+    /// that makes a restart loop impossible, and systemd's own read-back of
+    /// the unit's policy. Two inputs differ, on purpose. `local_restart_enabled`
+    /// is the owner's switch for restarts LOCAL CLIENTS ask for, and nobody is
+    /// asking here. A recording is the caller's to weigh (its idle gate, and
+    /// its ceiling).
+    ///
+    /// On `Ok` the restart is armed and recorded; the caller then
+    /// [`Self::commit`]s it — there is no answer to write first.
+    pub async fn arm_from_within(
+        &self,
+        reason: &str,
+    ) -> Result<crate::supervision::RestartPlan, String> {
+        use crate::supervision as sup;
+        let reason = sup::sanitize_reason(reason);
+        let inner = &self.inner;
+        let _one_at_a_time = inner.decide.lock().await;
+        let record_path = inner.record_path.clone();
+        let last = match tokio::task::spawn_blocking(move || sup::read_last_request(&record_path))
+            .await
+        {
+            Ok(Ok(last)) => last,
+            Ok(Err(e)) => {
+                return Err(format!(
+                    "could not read the last restart's record ({e}) — that record is what keeps \
+                     a restart loop impossible"
+                ));
+            }
+            Err(e) => return Err(format!("restart record task: {e}")),
+        };
+        let now_ms = unix_now_ms();
+        let plan = sup::decide_restart(&sup::RestartInputs {
+            supervision: inner.supervision,
+            enabled: true,
+            last_request_ms: last,
+            now_ms,
+            uptime: inner.started.elapsed(),
+            recording: false,
+            already_accepted: inner.accepted.get().is_some(),
+        })?;
+        if let sup::Supervision::Systemd(unit) = inner.supervision {
+            sup::confirm_systemd(unit, plan.exit_code).await?;
+        }
+        let record = sup::RestartRecord {
+            at_ms: now_ms,
+            pid: std::process::id(),
+            supervisor: plan.supervisor.to_string(),
+            reason: reason.clone(),
+        };
+        let record_path = inner.record_path.clone();
+        match tokio::task::spawn_blocking(move || sup::write_record(&record_path, &record)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(format!(
+                    "could not record this restart ({e}) — that record is what keeps a restart \
+                     loop impossible"
+                ));
+            }
+            Err(e) => return Err(format!("restart record task: {e}")),
+        }
+        let _ = inner.accepted.set(plan.exit_code);
+        tracing::info!(
+            %reason,
+            supervisor = plan.supervisor,
+            exit_code = plan.exit_code,
+            "restart decided by this daemon: armed"
+        );
+        Ok(plan)
     }
 }
 
@@ -2596,6 +2676,101 @@ mod tests {
         assert!(!dir.join(RESTART_RECORD_FILE).exists());
         assert!(!*shutdown.borrow());
         assert_eq!(restart.accepted_exit_code(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-96 P2b — a restart the daemon decides itself (its binary was
+    /// replaced) goes through the verb's own gates: never an orphan, and
+    /// under systemd only once systemd confirms. Nothing is recorded or
+    /// armed by a refusal.
+    #[tokio::test]
+    async fn a_self_decided_restart_passes_the_verbs_gates() {
+        let unit = SystemdUnit {
+            name: "roomler.service",
+            user: true,
+        };
+        for (name, supervision, needle) in [
+            (
+                "self-orphan",
+                Supervision::None,
+                "not running under a service manager",
+            ),
+            (
+                "self-systemd",
+                Supervision::Systemd(unit),
+                "roomler.service",
+            ),
+        ] {
+            let dir = restart_dir(name, true);
+            let (_st, restart, shutdown) = restart_state(&dir, supervision);
+            let why = restart
+                .arm_from_within("FR-96 P2b: replaced")
+                .await
+                .expect_err("refused");
+            assert!(why.contains(needle), "{name}: {why}");
+            assert!(!dir.join(RESTART_RECORD_FILE).exists(), "{name}");
+            restart.commit();
+            assert!(
+                !*shutdown.borrow(),
+                "{name}: nothing armed, nothing shut down"
+            );
+            assert_eq!(restart.accepted_exit_code(), None, "{name}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The one gate it does not share: `local_restart_enabled` is the owner's
+    /// switch for restarts LOCAL CLIENTS ask for, and nobody is asking. It is
+    /// recorded before it is armed, and shuts down only on the commit.
+    #[tokio::test]
+    async fn a_self_decided_restart_ignores_the_local_clients_switch() {
+        let dir = restart_dir("self-switch", false);
+        let (st, restart, shutdown) = restart_state(&dir, Supervision::WindowsScm);
+        // The verb itself refuses on that switch…
+        let why = refusal(st.restart_daemon("apply").await);
+        assert!(why.contains("local_restart_enabled = false"), "{why}");
+        // …the daemon's own restart does not.
+        let plan = restart
+            .arm_from_within("FR-96 P2b: replaced (0.4.1 -> 0.4.2)")
+            .await
+            .expect("armed");
+        assert_eq!(plan.exit_code, 0, "the SCM's own respawn code");
+        let record = std::fs::read_to_string(dir.join(RESTART_RECORD_FILE)).unwrap();
+        assert!(record.contains("FR-96 P2b: replaced"), "{record}");
+        assert_eq!(restart.accepted_exit_code(), Some(0));
+        assert!(!*shutdown.borrow(), "armed, not yet committed");
+        restart.commit();
+        assert!(
+            *shutdown.borrow(),
+            "the commit starts the internal shutdown"
+        );
+        let why = restart.arm_from_within("again").await.expect_err("once");
+        assert!(why.contains("already under way"), "{why}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The loop bound is SHARED: a restart "Apply now" made binds the
+    /// relaunched process's own restart too, through the one record.
+    #[tokio::test]
+    async fn a_self_decided_restart_shares_the_rate_limit_record() {
+        let dir = restart_dir("self-ratelimit", true);
+        let (st, _restart, _shutdown) = restart_state(&dir, Supervision::WindowsTask);
+        assert!(matches!(
+            st.restart_daemon("apply").await,
+            Response::DaemonRestarting { .. }
+        ));
+        drop(st);
+        let (_next, next_restart, next_shutdown) = restart_state(&dir, Supervision::WindowsTask);
+        let why = next_restart
+            .arm_from_within("FR-96 P2b: replaced")
+            .await
+            .expect_err("inside the window");
+        assert!(
+            why.contains("s ago") && why.contains("try again in"),
+            "{why}"
+        );
+        assert!(!*next_shutdown.borrow());
+        assert_eq!(next_restart.accepted_exit_code(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

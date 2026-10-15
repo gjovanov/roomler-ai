@@ -225,7 +225,7 @@ sequenceDiagram
     U->>U: consume/move-aside the wake; space ≥60 s from the last run; the opt-out; the cooldown
     U->>U: check_once, then download_asset → a FRESH private dir (the pinned release key)
     U->>U: install as root: apt-get / dpkg, or the tarball
-    Note over D: runs the new binary from its next restart (P2b: once idle)
+    Note over D: notices its binary was replaced, restarts onto it once idle (P2b)
 ```
 
 | unit | what | the macOS twin (`com.roomler.update.plist`) |
@@ -345,13 +345,63 @@ later: its first run waits the full 60 s gap, because it has no stamp yet. The
 daemon logged no install attempt of its own
 ([FR-96 §8](fr/FR-96-per-user-linux-installs-update-themselves.md#8-field-verification-log)).
 
+### The per-user daemon onto the new binary (P2b)
+
+Nothing else restarts a per-user daemon after its binary is replaced. The helper
+never speaks to it, and the `.deb`'s postinst never restarts anything, by rule.
+So the daemon watches its own binary (`replaced_binary.rs`), and restarts once
+nothing it serves would be cut. The same watch covers the helper's install, an
+admin's `apt upgrade` and a hand install:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Running
+    Running --> Replaced: the exec path names another file (st_dev, st_ino)
+    Replaced --> Running: put back
+    Replaced --> Settled: unchanged for 2 min
+    Settled --> Ignored: --version says the same release, or it does not run (asked again in 10 min)
+    Settled --> Waiting: --version says another release
+    Waiting --> Waiting: a session, SSH, a transfer or a recording (up to 24 h) — or a network transition, or its own install in flight (never forced)
+    Waiting --> Restart: idle, or the 24 h ceiling cuts the work
+    Restart --> [*]: graceful exit 9, and systemd starts the new binary
+```
+
+- **"Replaced" is an inode, not ` (deleted)`.** The tarball's install renames the
+  old binary to `.prev`, which `/proc/self/exe` then names. At start the exec
+  path and `/proc/self/exe` must be one file, or the watch stands down: that
+  filesystem cannot tell a replacement.
+- ⚠️ **A binary that does not run is never restarted onto.** Its `--version` is
+  asked first, so a replacement that cannot even load (a missing shared library)
+  leaves the daemon online on its old image instead of in a crash loop.
+- ⚠️ **An SSH session counts.** The likeliest replacement outside the helper is an
+  admin's `apt upgrade` typed into a roomler SSH session on that device, so open
+  SSH connections defer the restart like a remote-control session does.
+- **The restart is "Apply now"'s** (FR-84 D3): only under a supervisor that
+  relaunches the process, rate-limited by the persisted record, and checked
+  against systemd's own policy first. An orphan `roomlerd run` never exits for it.
+- **What does not stop it:** `auto_update = false`, because running what is
+  already installed is not an update. **What does:** `ROOMLERD_UPDATE_HELPER=0`,
+  FR-96's kill switch. A root daemon is not watched at all, since a system
+  install is unchanged.
+
+Field-verified on the lab's Fedora KDE guest, with the stock build failing
+first: four minutes after its binary was replaced, it was still running the
+deleted image. The run went:
+- A viewer session was held open across a real push, and the helper installed
+  0.4.134.
+- The daemon logged `restart deferred busy=1 remote-control session(s)`. The
+  session was never cut (32 of 32 checks connected).
+- At the first check after the viewer left, the daemon restarted onto 0.4.134,
+  and the server reported the new version
+  ([FR-96 §8](fr/FR-96-per-user-linux-installs-update-themselves.md#8-field-verification-log)).
+
 The phases:
 
 | phase | ships |
 |---|---|
 | **P1** | the helper on Linux, and the three units in both packages, disabled |
 | **P2a** | the per-user daemon wakes the helper instead of installing, and its unit may write the wake file |
-| **P2b** | the per-user daemon onto the new binary after an install, once idle |
+| **P2b** | the per-user daemon onto its replaced binary once idle, whatever replaced it |
 | **P3** | `install.sh` enables the units for a per-user install |
 
 Status and evidence: [FR-96](fr/FR-96-per-user-linux-installs-update-themselves.md).

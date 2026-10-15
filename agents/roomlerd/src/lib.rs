@@ -129,6 +129,9 @@ pub mod relay_probe;
 /// FR-19 P1d — the org-relay reachability responder (process-wide, opt-in).
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod relay_server;
+/// FR-96 P2b — a per-user Linux daemon restarts onto its replaced binary once
+/// nothing it serves would be cut.
+pub mod replaced_binary;
 /// FR-98 C6 — `playout-delay` 0/0 on the RTP fallback track, so the
 /// browser's jitter buffer renders as soon as it decodes (default off).
 pub mod rtp_playout;
