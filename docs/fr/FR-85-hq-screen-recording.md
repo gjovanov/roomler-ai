@@ -260,7 +260,7 @@ path will exist.
 ## Installation size — the evaluation
 
 Measured on the 0.4.101 release (see the field log). The Windows MSI guard divides by PowerShell's `1MB`, so its units
-are MiB: the MSI is **15.36 MiB against an 18 MiB hard ceiling** (`.github/workflows/release-agent.yml:1704`), 2.64 MiB of
+are MiB: the MSI is **15.36 MiB against an 18 MiB hard ceiling** (`.github/workflows/release-agent.yml:1872`), 2.64 MiB of
 headroom. Its pinned 13.13 baseline is stale, so the +2 warn band fires already, before this FR adds a byte.
 
 **What keeps it small:** no ffmpeg CLI; no new DLL, `.so` or `.dylib`; no libavfilter; no FFmpeg muxers or demuxers
