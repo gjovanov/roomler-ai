@@ -23,9 +23,15 @@
 //! * [`GROWTH_DAILY`] — the frozen daily totals (P3 onward): one row per
 //!   `(source, metric, dims, day)`, `_id` the four joined, `value` the
 //!   count. Written by whichever module owns the fact
-//!   ([`GrowthDao::bump_daily`] — fleet's fetch counters today), read by the
-//!   digest. A row carries dimensions and a number, never a person, a
-//!   User-Agent or an address.
+//!   ([`GrowthDao::bump_daily`] — fleet's fetch counters; and since P6
+//!   [`GrowthDao::replace_daily`] — the `saas` module's purestat puller),
+//!   read by the digest. A row carries dimensions and a number, never a
+//!   person, a User-Agent or an address.
+//! * [`GROWTH_PULLS`] (P6) — one row per `(source, UTC day)` a puller
+//!   attempted: whether the day was pulled, when, and the last error. It is
+//!   what lets a reader of `growth_daily` tell a day that was **not pulled**
+//!   (no row), or whose pull **failed**, from a pulled day with no rows — a
+//!   zero (spec principle 4: null ≠ 0).
 //!
 //! Stateless over `core.db`, so a caller re-creates it (`GrowthDao::new`)
 //! rather than threading a handle through `Core` (FR-69 rule 5).
@@ -53,6 +59,16 @@ pub const GROWTH_DAILY: &str = "growth_daily";
 pub const INSTALL_SOURCE: &str = "install";
 pub const INSTALL_FETCH_METRIC: &str = "fetch";
 
+/// P6 — one pull-status row per `(source, day)` a puller attempted.
+pub const GROWTH_PULLS: &str = "growth_pulls";
+/// P6 — the purestat puller's `source`, in `growth_daily` and `growth_pulls`.
+/// Named here, below both its writer (`saas`) and its readers (the host).
+pub const PURESTAT_SOURCE: &str = "purestat";
+/// P6 — a pulled day older than this many days is FROZEN: never pulled
+/// again and never rewritten. Within it, every run re-pulls the day, so a
+/// late event (a visit still open at midnight, a buffered batch) lands.
+pub const PURESTAT_FREEZE_DAYS: i64 = 7;
+
 /// The most org-days one read loads — far above this deployment's volume
 /// (every org active every day for 25 months is ~10 rows a day); a bound,
 /// not a page.
@@ -76,11 +92,142 @@ pub struct GrowthDaily {
 
 /// The `_id` of a daily row: `<source>:<metric>:<k=v,k=v>:<day>`, the
 /// dimensions in key order so two writers of the same fact share one row.
-/// A dimension VALUE is a short enum spelling by construction (a client
-/// class, an asset name, an OS), never free text.
+///
+/// P3's dimension values are short enum spellings (a client class, an asset
+/// name, an OS); P6's purestat rows carry campaign keys and paths, which are
+/// client-chosen text. Every part is therefore escaped (`%`, `,`, `=` and
+/// `:` percent-encoded), so no value can forge another row's id —
+/// `campaign=a,content=b` and `campaign=a%2Ccontent%3Db` stay two rows. A
+/// spelling without those four characters is unchanged, which keeps every
+/// P3 id as it was.
 pub fn daily_id(source: &str, metric: &str, dims: &BTreeMap<String, String>, day: &str) -> String {
-    let dims: Vec<String> = dims.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    format!("{source}:{metric}:{}:{day}", dims.join(","))
+    let dims: Vec<String> = dims
+        .iter()
+        .map(|(k, v)| format!("{}={}", id_part(k), id_part(v)))
+        .collect();
+    format!(
+        "{}:{}:{}:{}",
+        id_part(source),
+        id_part(metric),
+        dims.join(","),
+        id_part(day)
+    )
+}
+
+/// One part of a daily `_id`, with the separators percent-encoded.
+fn id_part(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains(['%', ',', '=', ':']) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            ',' => out.push_str("%2C"),
+            '=' => out.push_str("%3D"),
+            ':' => out.push_str("%3A"),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// A row for `(source, metric, dims, day)`, its `_id` derived.
+pub fn daily_row(
+    source: &str,
+    metric: &str,
+    dims: BTreeMap<String, String>,
+    day: &str,
+    value: i64,
+) -> GrowthDaily {
+    GrowthDaily {
+        id: daily_id(source, metric, &dims, day),
+        day: day.to_string(),
+        source: source.to_string(),
+        metric: metric.to_string(),
+        dims,
+        value,
+    }
+}
+
+/// P6 — whether a `(source, day)` was pulled. `ok` once a pull of the day
+/// succeeded (its rows ARE the day's rows); `failed` while none has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullStatus {
+    Ok,
+    Failed,
+}
+
+impl PullStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PullStatus::Ok => "ok",
+            PullStatus::Failed => "failed",
+        }
+    }
+}
+
+/// P6 — one `growth_pulls` row: the state of one `(source, UTC day)`.
+///
+/// A later attempt that fails does NOT turn an `ok` day `failed`: the rows
+/// of the last good pull are still the day's rows, so the status stays `ok`
+/// and `error` carries what the newest attempt met.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GrowthPull {
+    /// `"<source>:<day>"`.
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub source: String,
+    /// `YYYY-MM-DD`, UTC.
+    pub day: String,
+    pub status: PullStatus,
+    /// The last pull that succeeded.
+    #[serde(default)]
+    pub pulled_at: Option<DateTime>,
+    /// The newest attempt, successful or not.
+    pub attempted_at: DateTime,
+    #[serde(default)]
+    pub attempts: u32,
+    /// The `growth_daily` rows the last successful pull left for the day.
+    #[serde(default)]
+    pub rows: u32,
+    /// What the newest attempt met; `None` when it succeeded.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// A goal the source did not define at the last successful pull — its
+    /// conversions are not measured for the day (the rest is).
+    #[serde(default)]
+    pub missing_goal: Option<String>,
+    /// The last successful pull hit the client's page bound: the day holds
+    /// the busiest rows only.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl GrowthPull {
+    pub fn id_of(source: &str, day: &str) -> String {
+        format!("{source}:{day}")
+    }
+}
+
+/// What a successful pull of one day left, for [`GrowthDao::record_pull_ok`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PulledDay<'a> {
+    pub rows: u32,
+    pub missing_goal: Option<&'a str>,
+    pub truncated: bool,
+}
+
+/// What [`GrowthDao::replace_daily`] did to one day.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ReplaceCounts {
+    /// Rows written (new, or a changed value).
+    pub written: u64,
+    /// Rows already holding the pulled value.
+    pub unchanged: u64,
+    /// Rows of the day's metrics the pull no longer carries.
+    pub pruned: u64,
 }
 
 /// One org's activity on one UTC day (spec §3d). Every counter is what
@@ -264,6 +411,217 @@ impl GrowthDao {
             }
         }
         Ok(rows)
+    }
+
+    /// P6 — make one `(source, day)` hold exactly `rows` for the given
+    /// `metrics`: a row whose value changed (or that is new) is written with
+    /// `$set` — idempotent, unlike [`Self::bump_daily`]'s `$inc`, so a day
+    /// pulled twice holds one copy of each fact — an unchanged row is left
+    /// alone, and a row of those metrics the pull no longer carries is
+    /// deleted. Write-then-prune, never delete-then-insert, so a reader
+    /// never meets an empty day between the two. A metric outside `metrics`
+    /// is not touched at all (a pull that could not measure goals keeps the
+    /// goal rows an earlier pull measured).
+    pub async fn replace_daily(
+        &self,
+        source: &str,
+        day: &str,
+        metrics: &[&str],
+        rows: &[GrowthDaily],
+    ) -> DaoResult<ReplaceCounts> {
+        let coll = self.db.collection::<Document>(GROWTH_DAILY);
+        let existing: Vec<Document> = coll
+            .find(doc! { "source": source, "day": day, "metric": { "$in": metrics } })
+            .projection(doc! { "value": 1 })
+            .await?
+            .try_collect()
+            .await?;
+        let had: HashMap<String, i64> = existing
+            .iter()
+            .filter_map(|d| {
+                let id = d.get_str("_id").ok()?.to_string();
+                let v = match d.get("value") {
+                    Some(Bson::Int64(v)) => *v,
+                    Some(Bson::Int32(v)) => i64::from(*v),
+                    Some(Bson::Double(v)) => *v as i64,
+                    _ => i64::MIN,
+                };
+                Some((id, v))
+            })
+            .collect();
+        let mut counts = ReplaceCounts::default();
+        let mut keep: Vec<&str> = Vec::with_capacity(rows.len());
+        for row in rows {
+            debug_assert!(
+                row.source == source && row.day == day && metrics.contains(&row.metric.as_str()),
+                "a row written under the wrong (source, day, metric)"
+            );
+            keep.push(&row.id);
+            if had.get(&row.id) == Some(&row.value) {
+                counts.unchanged += 1;
+                continue;
+            }
+            let dims_doc: Document = row
+                .dims
+                .iter()
+                .map(|(k, v)| (k.clone(), Bson::String(v.clone())))
+                .collect();
+            coll.update_one(
+                doc! { "_id": &row.id },
+                doc! { "$set": {
+                    "day": &row.day,
+                    "source": &row.source,
+                    "metric": &row.metric,
+                    "dims": dims_doc,
+                    "value": row.value,
+                } },
+            )
+            .upsert(true)
+            .await?;
+            counts.written += 1;
+        }
+        counts.pruned = coll
+            .delete_many(doc! {
+                "source": source,
+                "day": day,
+                "metric": { "$in": metrics },
+                "_id": { "$nin": keep },
+            })
+            .await?
+            .deleted_count;
+        Ok(counts)
+    }
+
+    /// P6 — every row of a `(source, day)` range whose `dims.by` is `by`
+    /// (`site`, `campaign`, `path`), any metric. Lenient per row, like
+    /// [`Self::read_daily`].
+    pub async fn read_daily_by(
+        &self,
+        source: &str,
+        by: &str,
+        from: &str,
+        to: &str,
+    ) -> DaoResult<Vec<GrowthDaily>> {
+        let docs: Vec<Document> = self
+            .db
+            .collection::<Document>(GROWTH_DAILY)
+            .find(doc! {
+                "source": source,
+                "day": { "$gte": from, "$lte": to },
+                "dims.by": by,
+            })
+            .await?
+            .try_collect()
+            .await?;
+        Ok(docs
+            .into_iter()
+            .filter_map(|d| bson::from_document::<GrowthDaily>(d).ok())
+            .collect())
+    }
+
+    // ── growth_pulls (P6) ────────────────────────────────────────────────
+
+    /// A pull of `(source, day)` succeeded and left `rows` rows: the day is
+    /// `ok` from now on, whatever an earlier attempt met.
+    pub async fn record_pull_ok(
+        &self,
+        source: &str,
+        day: &str,
+        pulled: PulledDay<'_>,
+        now: DateTime,
+    ) -> DaoResult<()> {
+        let PulledDay {
+            rows,
+            missing_goal,
+            truncated,
+        } = pulled;
+        self.db
+            .collection::<Document>(GROWTH_PULLS)
+            .update_one(
+                doc! { "_id": GrowthPull::id_of(source, day) },
+                doc! {
+                    "$set": {
+                        "source": source,
+                        "day": day,
+                        "status": PullStatus::Ok.as_str(),
+                        "pulled_at": now,
+                        "attempted_at": now,
+                        "rows": i64::from(rows),
+                        "error": Bson::Null,
+                        "missing_goal": missing_goal.map(Bson::from).unwrap_or(Bson::Null),
+                        "truncated": truncated,
+                    },
+                    "$inc": { "attempts": 1_i64 },
+                },
+            )
+            .upsert(true)
+            .await?;
+        Ok(())
+    }
+
+    /// An attempt at `(source, day)` failed with `error` (a short reason,
+    /// never a credential). A day that was already pulled stays `ok` — its
+    /// rows are the last good pull's — and only records the error; a day
+    /// never pulled is `failed`. One pipeline update, so the "stays ok" is
+    /// decided by the stored row itself, not by a read beforehand.
+    pub async fn record_pull_failed(
+        &self,
+        source: &str,
+        day: &str,
+        error: &str,
+        now: DateTime,
+    ) -> DaoResult<()> {
+        let error: String = error.chars().take(200).collect();
+        self.db
+            .collection::<Document>(GROWTH_PULLS)
+            .update_one(
+                doc! { "_id": GrowthPull::id_of(source, day) },
+                vec![doc! { "$set": {
+                    "source": source,
+                    "day": day,
+                    "status": { "$cond": [
+                        { "$eq": ["$status", PullStatus::Ok.as_str()] },
+                        PullStatus::Ok.as_str(),
+                        PullStatus::Failed.as_str(),
+                    ] },
+                    "attempted_at": now,
+                    "attempts": { "$add": [{ "$ifNull": ["$attempts", 0_i64] }, 1_i64] },
+                    "rows": { "$ifNull": ["$rows", 0_i64] },
+                    // `$literal`: inside a pipeline a string that starts
+                    // with `$` would be read as a field path.
+                    "error": { "$literal": error },
+                } }],
+            )
+            .upsert(true)
+            .await?;
+        Ok(())
+    }
+
+    /// The pull rows of `source` for `from <= day <= to`, oldest first.
+    pub async fn pulls_between(
+        &self,
+        source: &str,
+        from: &str,
+        to: &str,
+    ) -> DaoResult<Vec<GrowthPull>> {
+        let docs: Vec<Document> = self
+            .db
+            .collection::<Document>(GROWTH_PULLS)
+            .find(doc! { "source": source, "day": { "$gte": from, "$lte": to } })
+            .sort(doc! { "day": 1 })
+            .await?
+            .try_collect()
+            .await?;
+        let mut out = Vec::with_capacity(docs.len());
+        for d in docs {
+            match bson::from_document::<GrowthPull>(d) {
+                Ok(p) => out.push(p),
+                Err(e) => {
+                    tracing::warn!(source, error = %e, "growth_pulls: skipping an unreadable row")
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Every explicit row, tenants first, then by id — a stable order for
@@ -541,6 +899,93 @@ mod tests {
             daily_id("x", "y", &BTreeMap::new(), "2026-01-01"),
             "x:y::2026-01-01"
         );
+    }
+
+    /// P6 — a client-chosen value cannot forge another row's id: the four
+    /// separators are escaped, so two different dimension sets never share
+    /// an `_id`; a value without them (every P3 spelling) is unchanged.
+    #[test]
+    fn a_daily_id_escapes_what_could_forge_another_rows_id() {
+        let dims = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let a = dims(&[("campaign", "a"), ("content", "b")]);
+        let forged = dims(&[("campaign", "a,content=b")]);
+        assert_ne!(
+            daily_id("purestat", "visitors", &a, "2026-10-13"),
+            daily_id("purestat", "visitors", &forged, "2026-10-13")
+        );
+        assert_eq!(
+            daily_id("purestat", "visitors", &forged, "2026-10-13"),
+            "purestat:visitors:campaign=a%2Ccontent%3Db:2026-10-13"
+        );
+        assert_eq!(
+            daily_id(
+                "purestat",
+                "visitors",
+                &dims(&[("path", "/a:b%")]),
+                "2026-10-13"
+            ),
+            "purestat:visitors:path=/a%3Ab%25:2026-10-13"
+        );
+        // P3's ids are what they were.
+        let p3 = dims(&[
+            ("asset", "installer-permachine"),
+            ("client", "wizard"),
+            ("os", "windows"),
+        ]);
+        assert_eq!(
+            daily_id("install", "fetch", &p3, "2026-10-14"),
+            "install:fetch:asset=installer-permachine,client=wizard,os=windows:2026-10-14"
+        );
+        let row = daily_row(
+            "purestat",
+            "goal.signup",
+            dims(&[("by", "site")]),
+            "2026-10-13",
+            3,
+        );
+        assert_eq!(row.id, "purestat:goal.signup:by=site:2026-10-13");
+        assert_eq!((row.value, row.day.as_str()), (3, "2026-10-13"));
+    }
+
+    /// P6 — a pull row round-trips, and one written by the failure path
+    /// alone (no `pulled_at`, no `missing_goal`) still reads.
+    #[test]
+    fn a_pull_row_round_trips_and_a_failed_one_reads_without_its_optional_fields() {
+        let row = GrowthPull {
+            id: GrowthPull::id_of(PURESTAT_SOURCE, "2026-10-13"),
+            source: PURESTAT_SOURCE.into(),
+            day: "2026-10-13".into(),
+            status: PullStatus::Ok,
+            pulled_at: Some(DateTime::now()),
+            attempted_at: DateTime::now(),
+            attempts: 2,
+            rows: 17,
+            error: None,
+            missing_goal: Some("signup".into()),
+            truncated: false,
+        };
+        assert_eq!(row.id, "purestat:2026-10-13");
+        let doc = bson::to_document(&row).unwrap();
+        assert_eq!(doc.get_str("status").unwrap(), "ok");
+        let back: GrowthPull = bson::from_document(doc).unwrap();
+        assert_eq!(back, row);
+        let failed: GrowthPull = bson::from_document(doc! {
+            "_id": "purestat:2026-10-12", "source": "purestat", "day": "2026-10-12",
+            "status": "failed", "attempted_at": DateTime::now(), "attempts": 1_i64,
+            "rows": 0_i64, "error": "purestat unreachable: unauthorized (401)",
+        })
+        .unwrap();
+        assert_eq!(failed.status, PullStatus::Failed);
+        assert_eq!(failed.pulled_at, None);
+        assert_eq!(failed.missing_goal, None);
+        assert!(!failed.truncated);
+        assert_eq!(failed.attempts, 1);
+        assert_eq!(PullStatus::Failed.as_str(), "failed");
     }
 
     /// P2 — an org-day round-trips as a struct with the composite `_id`,

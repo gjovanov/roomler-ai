@@ -23,6 +23,8 @@ roomler-ai-services = { path = "../../services" }
 anyhow.workspace = true
 axum.workspace = true
 bson.workspace = true
+# FR-102 P6 — the purestat puller's UTC days and its freeze horizon.
+chrono.workspace = true
 futures.workspace = true
 reqwest.workspace = true
 serde.workspace = true
