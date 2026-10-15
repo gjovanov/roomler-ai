@@ -127,7 +127,7 @@ prompt surfaces are FR-27's chain ([`remote-control.md`](remote-control.md)
 
 | | the prompt | while viewed |
 |---|---|---|
-| GNOME, per-user | the daemon's own panel, through Xwayland. Until P6a (the release after 0.4.135) it stayed on screen after the answer | GNOME's screen-sharing pill in the top bar; the companion's banner if it runs |
+| GNOME, per-user | the daemon's own panel, through Xwayland. Until P6a (the release after 0.4.136) it stayed on screen after the answer | GNOME's screen-sharing pill in the top bar; the companion's banner if it runs |
 | KDE, per-user | the same panel, through KWin's Xwayland | KDE's tray indicator; the companion's banner if it runs |
 | GNOME, system | the companion's window | the companion's *Being viewed by …* banner, with **Disconnect** (a centred window: Wayland lets no client place itself) |
 | KDE, system | **none**: Fedora has no companion package, and the viewer waits | **nothing** with DRM capture, which reads below the compositor |
@@ -136,10 +136,15 @@ A per-user daemon whose own panel cannot open (no Xwayland) starts the
 companion for the prompt from P6b, through the user's own systemd manager. On
 0.4.135 that launch waited on polkit and failed after 25 s.
 
-⚠️ **GNOME's own Stop does not end a session** on 0.4.135. Pressing the square
-in the screen-sharing pill closes mutter's screencast, and a per-user install
-opens a new one half a second later. Use the companion's **Disconnect**, or end
-the session from the viewer.
+⚠️ **The desktop's own stop control did not end a session** on 0.4.135. The
+square in GNOME's screen-sharing pill closed mutter's screencast, and a per-user
+install opened a new one half a second later. KDE's **End** in its tray menu
+froze the viewer instead, and P5d's reopen then undid it from the restore token
+3 s later. From P6c (the release after
+0.4.136), either one ends the session as the companion's **Disconnect** does:
+the viewer is told the person at the device ended it, and does not reconnect
+([`linux-capture.md`](linux-capture.md) §5.7). `ROOMLERD_SCREEN_STOP=0` puts
+the reopen back.
 
 ## 5. Choosing an install
 

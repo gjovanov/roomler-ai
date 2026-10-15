@@ -214,7 +214,7 @@ tests; ceiling_learn (12) → 4 prior tests; goodput/rate_profile/encode_pressur
 
 **Risks:** lumpy TURN-TCP (rx_bps primary on Relay, goodput only a stall detector, 2-window
 confirmation, 0.5× per-window floor; fixture 2); DERP stalls (no evidence, bounded relay-only
-pauses); multi-viewer (fold the worst follower's `rx_bps/queue_ms`, `media_share.rs:395`); VP9
+pauses); multi-viewer (fold the worst follower's `rx_bps/queue_ms`, `media_share.rs:409`); VP9
 parity (libvpx takes raw kbps with no IDR — same controller; unify the `mirror_only` divergence
 before B2).
 

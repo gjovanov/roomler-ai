@@ -162,6 +162,13 @@ impl ViewerIndicator {
         self
     }
 
+    /// FR-93 P6c — the session registry this handle keeps, so a media pump
+    /// can end a session the way its Disconnect does: a session's entry
+    /// carries its own loop's kill channel.
+    pub fn sessions(&self) -> &crate::rc_sessions::RcSessionRegistry {
+        &self.registry
+    }
+
     /// Announce that a session has started. The overlay redraws to
     /// include `controller_name` in its caption. Safe to call multiple
     /// times with the same `session_id` (idempotent — the name is

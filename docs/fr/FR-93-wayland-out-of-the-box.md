@@ -8,7 +8,9 @@ promoted. P2d is decided (operator, 2026-10-12): the portal waits for it. P2d-1,
 automatic where mutter is absent), shipped in **0.4.132** with P2d-2's agent half and P4a; P4b in **0.4.133**; P3c
 in **0.4.134** (2026-10-13). P3d, P5a, P5b (#2145), P3e and P5c are in **0.4.135** (tagged 2026-10-14 from
 `bb6ea90ee`); P5d, P5e (#2183), P5f (#2192), P5g (#2194) and P1a (#2210, the kill switch covers the
-input-reach warning, AC11) merged after it; P3h and P2d-4 (AC6's three refusals with no reason) are lab-verified.
+input-reach warning, AC11) merged after it, and so did P3h and P2d-4 (#2218, AC6's three refusals with no
+reason) and P6a + P6b (#2223, AC10's prompt). P6c (the desktop's own stop control ends the session) is
+lab-verified.
 Ticked: AC1–AC5, AC8, AC9, AC13, AC14. The operator approved the
 plan and P0 (the
 lab on zeus, enrolled in the vmtest org: D2, D8). **D1 is decided: split.** Per-user installs go auto, system installs
@@ -599,6 +601,22 @@ the same open then waits for the unlock and says so: an open's hook now fires on
 - An aarch64 companion build (D5).
 - The greeter and lock-screen indicator question is D1b.
 
+**As built (P6c, 2026-10-14): the desktop's own stop control ends the session.** Measured first: on 0.4.135,
+GNOME's Stop (the square in its screen-sharing pill) closed mutter's session. The helper read that as a lock,
+and the pump opened a new unattended screencast 0.5 s later. KDE's End froze the viewer, and with P5d's reopen it
+was undone from the restore token 3 s later. So nobody at the screen could stop being viewed with their own
+desktop's control.
+
+The helper now asks who closed the session:
+- mutter's refusal of a new session (`Session creation inhibited`) is the lock;
+- a new session allowed is the person;
+- on the portal arm, a watcher on the session's own `Closed`, then KWin's bus owner (a crash, P5d's reopen) and
+  the desktop's lock.
+
+The person's stop exits 5. Every pump then ends its session as their Disconnect does (FR-27 P10), a shared
+pipeline's followers first, and never reopens. A doubt reopens, as before. The kill switch is
+`ROOMLERD_SCREEN_STOP=0` ([`linux-capture.md`](../linux-capture.md) §5.7).
+
 ### 4.8 Clipboard (P7)
 
 A root daemon runs the clipboard in the session, the helper pattern: Mutter RemoteDesktop's clipboard on
@@ -654,6 +672,7 @@ bridge for text and images in the lab before deciding.
 | **P6** | consent and indicator (§4.7) | FR-27's switches | lab GNOME + KDE | M |
 | ↳ P6a | the native X11 consent panel leaves the screen once answered or dismissed: its unmap is flushed (`indicator/x11.rs`), where nothing flushed it after the last repaint; a real-X test in CI's Xvfb lane asks the server, as a second client, whether the panel is still mapped | — | ✅ lab (`428efdc83`), GNOME 50 per-user, consent on. **🔴 0.4.135:** the session started under the panel, frozen on its countdown with live-looking buttons, on GNOME 50 and on Plasma 6.7 (both through Xwayland). **P6a:** 4 s after Approve the panel is gone and GNOME's own screen-sharing pill is up; a prompt the viewer gave up on leaves the screen too. Negative control: without the flush the test reads the panel still `VIEWABLE` | S |
 | ↳ P6b | a per-user daemon starts the companion for a prompt through its own user manager (`systemd-run --user`), and counts only the session user's own companion (`pgrep -u`): the shape `launch_once` already had | — | ✅ lab (`428efdc83`), GNOME 50 per-user with no native panel (`DISPLAY` unset for the unit). **🔴 0.4.135:** `systemd-run` on the system manager waited on polkit and failed after 25 s; no prompt anywhere, and the viewer waited. **P6b:** the companion started at once and showed the prompt, and after Approve its *Being viewed by … · Disconnect* banner, beside GNOME's pill | S |
+| ↳ P6c | the desktop's own stop control ends the session. The helper tells the person's stop from a lock (mutter's refusal of a new session) and from a compositor crash (KWin's bus owner), and exits 5. The parent types it (`StoppedAtScreen`), and every pump ends its session through the session registry as the person's Disconnect does, a shared pipeline's followers first, and never reopens (`linux-capture.md` §5.7) | `ROOMLERD_SCREEN_STOP=0` | ✅ lab (`3cf441886`), GNOME 50 and Plasma 6.7 per-user. **🔴 0.4.135:** GNOME's Stop undone 0.5 s later by a new unattended screencast; KDE's End froze the viewer, and with P5d's reopen it was undone from the token 3 s later. **P6c:** GNOME's Stop → `host_disconnect` about a second after the click, the viewer dropped at 1.1 s and stayed away, and the pill was gone; KDE's End → `host_disconnect` about 2 s after the click, the viewer dropped at 2.2 s, and the tray icon was gone. A lock still waits for the unlock (P5b), and a KWin crash still reopens (P5d: a new picture 4.2 s after it) | S |
 | **P7** | clipboard (§4.8) | `ROOMLERD_SESSION_CLIPBOARD=0` | lab | M |
 | **P8** | leftovers: FR-45 AC8 + P5b, FR-56 AC7/AC9/AC10, FR-92 AC9, FR-85's Wayland rows | each FR's own | lab, WSL2 | S each |
 | **P9** | docs: a new `docs/wayland.md` (the support matrix — desktop × install × session state × capability, attended vs unattended), `docs/linux-capture.md` refreshed, the lab runbook in `docs/vmtest.md`, a `docs/README.md` row, `README.Debian` | — | — | S |
@@ -858,13 +877,21 @@ New cells run three times before they are trusted. An entry in `expected-failure
 
   🔴 **GNOME's own Stop is undone.** Pressing the square in GNOME's screen-sharing pill closed mutter's session,
   and the daemon, reading it as a lock, opened a new unattended screencast 0.5 s later. The pill came back, and
-  the viewer's picture never paused (field log, 2026-10-14). P6c.
+  the viewer's picture never paused (field log, 2026-10-14). KDE's End in its tray menu froze the viewer on
+  0.4.135, and with P5d's reopen it was undone from the restore token 3 s later.
+
+  ✅ **P6c, in the lab** (2026-10-14, candidate `3cf441886`): GNOME's Stop ended the session as the
+  person's Disconnect does. The helper read *"the person at the screen stopped the share"*, and the
+  host-disconnect terminate went out about a second after the click. The viewer dropped 1.1 s after the click
+  and did not reconnect, and 5 s after the click the pill was gone. A lock still waits for the unlock, as P5b
+  made it. KDE's End did the same: the viewer dropped 2.2 s after the click and stayed away, and KDE's
+  screen-sharing tray icon was gone. A KWin crash still reopens from the token (P5d), with a new picture 4.2 s
+  after it.
 
   Owed:
   - KDE system: a non-Debian companion, or D6's Notifications-with-actions fallback (operator decisions).
   - A banner for a session that needed no prompt, where the compositor shows no indicator (DRM).
-  - GNOME's Stop honoured (P6c).
-  - The released build that carries P6a and P6b.
+  - The released build that carries P6a, P6b and P6c.
 - [ ] **AC11** — X11 hosts unchanged (FR-29's idle numbers), Windows and macOS unchanged; the kill switch
   restores 0.4.124's behaviour exactly.
   ⏳ **The kill switch, in the lab** (P1a, step log 76). On the released 0.4.135, both switches gave the lab's
@@ -983,6 +1010,9 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-14 | all four guests: `wlab-gnome`, `wlab-kde` (per-user), `wlab-gnome-sys`, `wlab-kde-sys` (system) | **0.4.135** (`wlab-kde-sys`: its 0.4.133) | AC10 red: `auto_grant_session = false` (the product's own `roomler config set`, cleared after), one viewer, a shot of the guest, Approve clicked over QMP | GNOME per-user: the native X11 prompt (*"Remote control request — vmtest admin is requesting to control this device… Expires in 4:48"*); the decision recorded and Granted, the capture started after it (no bypass); 🔴 the panel stayed on screen, frozen at *Expires in 4:28*; GNOME's own pill showed while capturing. KDE per-user: the same panel through KWin's Xwayland, the same 🔴 frozen panel; KDE's tray indicator. GNOME system: the companion's prompt (the companion reports v0.4.125, its package older than the daemon's), closed after Approve, then *Being viewed by vmtest admin · keyboard + mouse · Disconnect* ✅. KDE system: 🔴 *"no desktop companion on this host"*, `have_surface=false`, the viewer `awaiting_consent` with nothing anywhere on the screen |
 | 2026-10-14 | `wlab-gnome` (per-user, the companion installed, v0.4.129) | 0.4.135, then P6a + P6b `428efdc83`; the release put back after (its checksum checked) | P6b red: `DISPLAY` unset for the unit (no native panel); then P6a and P6b on the candidate. ⚠️ The first candidate run waited for a viewer line the dark-open spec never prints, so its clicks came after the viewer had given up; rerun with the p2d3 spec | 🔴 0.4.135: *"could not start the desktop companion … systemd-run failed: Failed to start transient service unit: Connection timed out"* after 25 s, `have_surface=false`, no prompt. ✅ P6a: the panel up at *4:48*, Approve, and 4 s later no panel, GNOME's pill up; a prompt the viewer gave up on left the screen too. ✅ P6b: *"started the desktop companion for a prompt"*, its prompt (*Expires in 4:45*), Approve → Granted, then its banner with Disconnect beside GNOME's pill |
 | 2026-10-14 | `wlab-gnome` (per-user, mutter, consent off) | **0.4.135** | AC10 observation: GNOME's own Stop (the square in the top bar's screen-sharing pill) during a session, no probe window over the top bar | 🔴 Stop closed mutter's session (`mutter closed the session (GNOME closes every screen cast when its screen locks)` — the screen was not locked), and the daemon opened a new unattended screencast 0.5 s later: the pill came back, the viewer's picture never paused. The person at the screen cannot stop being viewed with GNOME's own control. P6c |
+| 2026-10-14 | `wlab-kde` (per-user, the automatic portal) | P6a + P6b `428efdc83` (master's P5d frame loop); the guest's binary put back after | AC10 observation: End in KDE's screen-sharing tray menu (the tray icon, then *End*) during a session | 🔴 End at 22:01:11Z; at 22:01:14Z a new portal capture (`capture: backend=portal, AUTOMATIC`) restored from the token with no dialog, and the pump's heartbeats kept counting frames. On 0.4.135, before P5d, End froze the viewer instead. P6c |
+| 2026-10-14 | `wlab-gnome` (per-user, mutter, consent off) | P6c `3cf441886` (the release's binary kept aside and put back after, its checksum checked) | P6c: the lifecycle oracle (no probe window), `gnome-stop:40`, then `lock:30 unlock:30` | ✅ Stop clicked at 22:43:11Z. At 22:43:12 the helper logged *"mutter closed the session: the person at the screen stopped the share with the desktop's own control"*, and the pump *"ending the session as their Disconnect does, the capture not reopened"*. The kill arm told the server `host_disconnect` 0.1 ms later, and the server's echo came back `HostDisconnect`. The viewer dropped (`disconnected`) 1.1 s after the click, with no new picture and no reconnect in the next 40 s. The guest's screen 5 s after: no screen-sharing pill. ✅ The lock (P5b unchanged): *"mutter closed the session: the screen is locked"*, exit 3, a rebuild, and *"waiting for the unlock"*. The unlock notice reached the viewer 1.6 s after the lock; 1.8 s after the unlock the capture reopened and the notice cleared, with the session kept |
+| 2026-10-14 | `wlab-kde` (per-user, the automatic portal) | P6c `3cf441886` (the guest's own binary kept aside and put back after, its checksum checked) | P6c: the lifecycle oracle, `kde-end:40` with no probe window, then `kwin-crash:40` without the probe and again with it | ✅ End clicked at 22:48:02Z (the tray icon, then *End*). At 22:48:04 the helper logged *"the desktop portal closed the session: the person at the screen stopped the share with the desktop's own control"*, then came the pump's P6c line, `host_disconnect` 0.5 ms later, and the server's echo `HostDisconnect`. The viewer dropped 2.2 s after the click, with no new picture and no reconnect in the next 40 s. The guest's screen 5 s after: KDE's screen-sharing tray icon gone (the red run's shot during a share has it). ✅ A KWin crash (`kill -9 kwin_wayland`) is still P5d's: no portal `Closed` was logged, the helper exited 4 (the stream ended), the reopen restored from the token 0.6 s later, and the session was kept. With the probe, the oracle's verdict was PASS, a new picture **4.2 s** after the crash (P5d's own measurement: 4.0 s). Without the probe it read FAIL, because it cannot call a still desktop's picture new; the journal shows the same reopen |
 
 ## 12. Related
 

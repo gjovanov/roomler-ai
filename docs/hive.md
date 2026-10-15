@@ -1357,7 +1357,7 @@ sequenceDiagram
 
 | Frame | From | Says | Where |
 |---|---|---|---|
-| `rc:hive.start` gains `replicated` | the server | the session has members besides its primary: checkpoint each turn's end (P2b-3b). Absent, as from every earlier server, and a device that predates it ignores it | [`signaling.rs:3215`](../crates/remote_control/src/signaling.rs#L3215); the device takes it into its start order, [`signaling.rs:4446`](../agents/roomlerd/src/signaling.rs#L4446) |
+| `rc:hive.start` gains `replicated` | the server | the session has members besides its primary: checkpoint each turn's end (P2b-3b). Absent, as from every earlier server, and a device that predates it ignores it | [`signaling.rs:3215`](../crates/remote_control/src/signaling.rs#L3215); the device takes it into its start order, [`signaling.rs:4450`](../agents/roomlerd/src/signaling.rs#L4450) |
 | `rc:hive.replica.join` | the server | `{session_id, fence, role}`: hold a copy, as `archive` or `owner`; or, as `primary` (P2c-4b, below), checkpoint the session you run, which has members now. A role the device cannot name decodes as none, and it refuses | [`signaling.rs:3249`](../crates/remote_control/src/signaling.rs#L3249) |
 | `rc:hive.replica.join_ack` | a member | joined, or `refused`: `replica_disabled`, `archive_disabled`, `secondary_org`, `purged`, `stale_fence` or `quota`. An unknown word is still a refusal | [`signaling.rs:831`](../crates/remote_control/src/signaling.rs#L831), [`hive.rs:600`](../crates/remote_control/src/hive.rs#L600) |
 | `rc:hive.replica.tip` | a member, or the primary | `{session_id, fence, seq, hash, checkpoint?}`: where its copy ends, at most every 5 s and at each checkpoint | [`signaling.rs:858`](../crates/remote_control/src/signaling.rs#L858) |
@@ -1444,7 +1444,7 @@ The device advertises `hive-replica` while its owner's `hive_replica` is on and 
 opened, and `hive-archive` while `hive_archive` is on too
 ([`caps.rs:1647`](../agents/roomlerd/src/encode/caps.rs#L1647)). A secondary org's
 connection strips both words, in its hello and in every heartbeat that re-announces the
-caps ([`signaling.rs:5675`](../agents/roomlerd/src/signaling.rs#L5675)), so that org's
+caps ([`signaling.rs:5679`](../agents/roomlerd/src/signaling.rs#L5679)), so that org's
 placement never picks this device.
 
 ⚠️ **Only a device with copies to tell about sends a replica frame**
@@ -2409,7 +2409,7 @@ stateDiagram-v2
 
 | Rule | Why | Where |
 |---|---|---|
-| The drain is taken up as its frame is read, before the next one: from that moment the run refuses prompts, and the session's task reads the drain before anything sent after it | a lease word right behind the drain must reach the session after it, or it would lift nothing and the drain would hold the session for ever | [`signaling.rs:4612`](../agents/roomlerd/src/signaling.rs#L4612), [`supervisor.rs:1239`](../agents/roomlerd/src/hive/supervisor.rs#L1239), [`supervisor.rs:2689`](../agents/roomlerd/src/hive/supervisor.rs#L2689) |
+| The drain is taken up as its frame is read, before the next one: from that moment the run refuses prompts, and the session's task reads the drain before anything sent after it | a lease word right behind the drain must reach the session after it, or it would lift nothing and the drain would hold the session for ever | [`signaling.rs:4616`](../agents/roomlerd/src/signaling.rs#L4616), [`supervisor.rs:1239`](../agents/roomlerd/src/hive/supervisor.rs#L1239), [`supervisor.rs:2689`](../agents/roomlerd/src/hive/supervisor.rs#L2689) |
 | Only the primary enrollment's drain counts. One for a run this device does not have at that fence, or for one a newer fence took, is refused `not_running` and moves nothing | like every Hive frame: a secondary org's admin has no say over the owner's sessions, and a stale frame moves nothing | [`supervisor.rs:1239`](../agents/roomlerd/src/hive/supervisor.rs#L1239), [`supervisor.rs:2689`](../agents/roomlerd/src/hive/supervisor.rs#L2689) |
 | No prompt begins while the session drains: a new one is refused in words, and one admitted before the drain waits in the queue | the session must go quiet at a tip | [`supervisor.rs:2569`](../agents/roomlerd/src/hive/supervisor.rs#L2569), [`supervisor.rs:5072`](../agents/roomlerd/src/hive/supervisor.rs#L5072), [`supervisor.rs:5081`](../agents/roomlerd/src/hive/supervisor.rs#L5081) |
 | The open approvals are withdrawn at once, and one that opens while the session drains is withdrawn as it opens | a turn waiting on a person could not end; the harness hears the approval withdrawn, and goes on | [`supervisor.rs:4876`](../agents/roomlerd/src/hive/supervisor.rs#L4876), [`supervisor.rs:5012`](../agents/roomlerd/src/hive/supervisor.rs#L5012), [`toolbelt.rs:182`](../agents/roomlerd/src/hive/toolbelt.rs#L182) |
@@ -2491,7 +2491,7 @@ sequenceDiagram
 
 | Rule | Why | Where |
 |---|---|---|
-| `rc:hive.prepare` runs every gate a start passes, as the device is configured now, and none of a start's side effects: nothing is stopped, nothing launched, no word kept. It answers in the start's own refusal words, on the connection it came on | a member that would refuse the start refuses before anything moves (spec §3b) | [`supervisor.rs:2265`](../agents/roomlerd/src/hive/supervisor.rs#L2265), [`supervisor.rs:619`](../agents/roomlerd/src/hive/supervisor.rs#L619), [`signaling.rs:4627`](../agents/roomlerd/src/signaling.rs#L4627) |
+| `rc:hive.prepare` runs every gate a start passes, as the device is configured now, and none of a start's side effects: nothing is stopped, nothing launched, no word kept. It answers in the start's own refusal words, on the connection it came on | a member that would refuse the start refuses before anything moves (spec §3b) | [`supervisor.rs:2265`](../agents/roomlerd/src/hive/supervisor.rs#L2265), [`supervisor.rs:619`](../agents/roomlerd/src/hive/supervisor.rs#L619), [`signaling.rs:4631`](../agents/roomlerd/src/signaling.rs#L4631) |
 | The prepare also asks for the copy: the session's checkpoints in this device's store. A teleport's prepare does not (P2f-1a): its copy comes after it | a moved start is put in place from them | [`supervisor.rs:2453`](../agents/roomlerd/src/hive/supervisor.rs#L2453) |
 | A run of the session here at an older fence does not count against `hive_max_sessions`, and a run at the fence asked, or a newer one, is refused unless it is that very run | the start supersedes the older run (P2e-1); a newer one is the session come back | [`supervisor.rs:2436`](../agents/roomlerd/src/hive/supervisor.rs#L2436), [`supervisor.rs:2404`](../agents/roomlerd/src/hive/supervisor.rs#L2404) |
 | `rc:hive.move` is kept by (session, fence) for the start right behind it, 10 min and 64 at once, and dropped only once that start has launched | a start refused before its launch finds it again when re-sent | [`supervisor.rs:1413`](../agents/roomlerd/src/hive/supervisor.rs#L1413), [`supervisor.rs:1433`](../agents/roomlerd/src/hive/supervisor.rs#L1433), [`supervisor.rs:1454`](../agents/roomlerd/src/hive/supervisor.rs#L1454) |
