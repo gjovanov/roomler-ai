@@ -7,6 +7,17 @@ use super::*;
 use crate::error::flatten_errs;
 use crate::track::RTP_OUTBOUND_MTU;
 
+/// Roomler patch (#2284), not in upstream webrtc-rs 0.12: when a sample's
+/// RTP clock advance is spent.
+#[derive(Debug, Clone, Copy)]
+enum Advance {
+    /// Stamp with the running timestamp, then add the sample's `duration`
+    /// (upstream's behaviour).
+    After,
+    /// Add this gap first, then stamp, and add nothing after.
+    Before(std::time::Duration),
+}
+
 #[derive(Debug, Clone)]
 struct TrackLocalStaticSampleInternal {
     packetizer: Option<Box<dyn rtp::packetizer::Packetizer + Send + Sync>>,
@@ -82,6 +93,38 @@ impl TrackLocalStaticSample {
         sample: &Sample,
         extensions: &[rtp::extension::HeaderExtension],
     ) -> Result<()> {
+        self.write_sample_advancing(sample, extensions, Advance::After)
+            .await
+    }
+
+    /// Roomler patch (#2284), not in upstream webrtc-rs 0.12: write a sample
+    /// stamped after the RTP clock has advanced by `gap`, and do not advance
+    /// it afterwards.
+    ///
+    /// [`Self::write_sample`] stamps a sample with the running timestamp and
+    /// only then adds the sample's own `duration`, which suits a caller that
+    /// knows how long the frame it is writing will last. A capturer of
+    /// damage-driven frames knows only the gap BEFORE each frame, and passing
+    /// that as `duration` stamps every frame with the previous frame's time:
+    /// a receiver then reads each change in the gaps as network jitter. Here
+    /// the gap is spent before the sample's packets are stamped, so every
+    /// frame carries its own time. `sample.duration` is not read.
+    pub async fn write_sample_after_gap(
+        &self,
+        sample: &Sample,
+        gap: std::time::Duration,
+        extensions: &[rtp::extension::HeaderExtension],
+    ) -> Result<()> {
+        self.write_sample_advancing(sample, extensions, Advance::Before(gap))
+            .await
+    }
+
+    async fn write_sample_advancing(
+        &self,
+        sample: &Sample,
+        extensions: &[rtp::extension::HeaderExtension],
+        advance: Advance,
+    ) -> Result<()> {
         let mut internal = self.internal.lock().await;
 
         if internal.packetizer.is_none() || internal.sequencer.is_none() {
@@ -134,11 +177,22 @@ impl TrackLocalStaticSample {
         let clock_rate = internal.clock_rate;
 
         let packets = if let Some(packetizer) = &mut internal.packetizer {
-            let samples = (sample.duration.as_secs_f64() * clock_rate) as u32;
-            if sample.prev_dropped_packets > 0 {
-                packetizer.skip_samples(samples * sample.prev_dropped_packets as u32);
+            match advance {
+                Advance::After => {
+                    let samples = (sample.duration.as_secs_f64() * clock_rate) as u32;
+                    if sample.prev_dropped_packets > 0 {
+                        packetizer.skip_samples(samples * sample.prev_dropped_packets as u32);
+                    }
+                    packetizer.packetize(&sample.data, samples)?
+                }
+                // The caller's gap already holds any time a dropped frame
+                // took, so `prev_dropped_packets` skips sequence numbers
+                // (above) and no timestamp of its own.
+                Advance::Before(gap) => {
+                    packetizer.skip_samples((gap.as_secs_f64() * clock_rate) as u32);
+                    packetizer.packetize(&sample.data, 0)?
+                }
             }
-            packetizer.packetize(&sample.data, samples)?
         } else {
             vec![]
         };
