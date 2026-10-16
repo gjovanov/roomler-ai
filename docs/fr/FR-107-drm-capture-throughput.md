@@ -84,14 +84,14 @@ from when a frame was asked of the worker, so it absorbs the grab instead of add
 
 **P3 — the GPU reads the scanout** (`agents/roomlerd/src/capture/drm_gpu.rs`). As built:
 
-- **The context.** `Converter::open` (`drm_gpu.rs:310`) loads `libEGL.so.1` and `libGLESv2.so.2` with
+- **The context.** `Converter::open` (`drm_gpu.rs:312`) loads `libEGL.so.1` and `libGLESv2.so.2` with
   `libloading`, as `gpu_clock.rs` loads NVML, so no package gains a dependency. It opens Mesa's
   **surfaceless** platform (a render node, no display server, no GBM), requires
   `EGL_EXT_image_dma_buf_import`, surfaceless contexts and config-less contexts, and makes a GLES 2 context
   current on the `drm-capture` worker thread for that thread's life.
 - **Refusing software.** It refuses a software renderer (`llvmpipe`, `softpipe`): that would do the CPU
   path's work more slowly, and on AC12's box before its kernel fix it was the only renderer there was.
-- **Each frame** (`convert`, `drm_gpu.rs:676`). The scanout's dma-buf is imported once per buffer and cached
+- **Each frame** (`convert`, `drm_gpu.rs:678`). The scanout's dma-buf is imported once per buffer and cached
   (four entries, keyed by framebuffer and dma-buf inode as the CPU mapping is, FR-93 P3f). One draw renders
   it at **exactly** the pump's encode box with a box filter of up to 4×4 bilinear taps per pixel, written as
   B,G,R,A, so the readback is the `Frame` contract's BGRA. EGL owns the channel order and depth: the import

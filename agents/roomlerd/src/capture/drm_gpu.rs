@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-107 P3 — the GPU reads the scanout.
 //!
 //! The CPU path (`drm_backend.rs`) reads the scanout's dma-buf through an
