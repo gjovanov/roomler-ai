@@ -892,6 +892,23 @@ recorded and the session ran beneath it. Measured on GNOME 50 and Plasma 6.7,
 both through Xwayland; a real X server buffers the same way. The Xvfb lane now
 proves that a dismissed prompt leaves the screen, as a second client sees it.
 
+⚠️ **The X11 panel is drawn at the desktop's scale** (FR-93 P6i). On a scaled
+Wayland desktop, Xwayland's root is in device pixels and an X11 client is
+expected to scale itself. That is KDE's default and GNOME's at an integer
+scale. Drawn at 1×, the panel came out at about 9-px text on a 4K desktop at
+KDE's 2.7×, with its buttons a third of their size (measured on real hardware,
+Plasma 6.6). It now reads `Xft.dpi` from the resources the desktop publishes
+for X11 clients and shows the same drawing at `round(dpi / 96)`, between 1 and
+4 (`scale`, `agents/roomlerd/src/indicator/x11.rs:80`). The drawing is painted
+at 1× into a pixmap, scaled up nearest-neighbour, and written in requests the
+server takes (`blit`, `:493`); a click maps back to the 1× layout. Measured:
+KDE at `Xft.dpi` 259 draws at 3× and GNOME at 192 at 2×, the size of the
+companion's own prompt, and **Approve** on the scaled panel granted the
+session. At 1× nothing changes. `ROOMLERD_CONSENT_PANEL_SCALE` overrides the
+scale; `1` is the kill switch. ⚠️ GNOME shows no X11 window during its
+Activities overview, which it opens after every login, so a prompt raised
+there is seen once the person leaves the overview.
+
 ⚠️ **The companion starts through the manager this daemon may use** (FR-93
 P6b). A root daemon starts a system transient unit as the session's user
 (`--uid=`). A per-user daemon starts it from its own user manager
