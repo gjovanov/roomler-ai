@@ -27,6 +27,11 @@
 //! reqwest's: the OS trust store and the proxy environment, so a
 //! TLS-inspecting corporate middlebox whose root the machine trusts works.
 //!
+//! The device's credential goes on in the form it takes: an API key in
+//! `x-api-key`, or a Claude subscription's token (`claude setup-token`) as a
+//! bearer token under the OAuth beta (FR-90 P2k-1). Whichever it is, the
+//! session's own credential headers never leave the host.
+//!
 //! Only what that contract needs is forwarded: `POST /v1/messages` and
 //! `POST /v1/messages/count_tokens`, matched exactly. The device's key opens
 //! more than inference — the Files API holds every session's uploads under
@@ -358,6 +363,70 @@ fn hop_by_hop(name: &HeaderName) -> bool {
     )
 }
 
+/// FR-90 P2k-1 — how a Claude subscription's token begins, as `claude
+/// setup-token` prints it (Anthropic's own prefix; an API key begins
+/// `sk-ant-api`).
+const SUBSCRIPTION_TOKEN_PREFIX: &str = "sk-ant-oat";
+/// The beta under which the provider takes a subscription's token.
+const OAUTH_BETA: &str = "oauth-2025-04-20";
+
+/// Put the device's credential on a forwarded call, in the form it takes. A
+/// subscription's token goes as a bearer token, with the OAuth beta added
+/// once to the betas the harness asked for; it has no workspace, so none is
+/// sent, the session's own included. Any other credential is an API key, in
+/// `x-api-key`, with the device's workspace when it has one (P0g, field
+/// 2026-10-07: a key not scoped to a workspace needs it on every call); the
+/// device's replaces the session's.
+fn put_credential(
+    headers: &mut HeaderMap,
+    key: &str,
+    workspace: Option<&str>,
+) -> Result<(), Refusal> {
+    let not_a_key = || {
+        Refusal::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "hive_api_key_helper printed something that is not a key",
+        )
+    };
+    if key.starts_with(SUBSCRIPTION_TOKEN_PREFIX) {
+        let bearer = HeaderValue::from_str(&format!("Bearer {key}")).map_err(|_| not_a_key())?;
+        headers.insert(header::AUTHORIZATION, bearer);
+        let mut betas: Vec<String> = Vec::new();
+        for value in headers.get_all("anthropic-beta") {
+            for beta in value.to_str().unwrap_or("").split(',') {
+                let beta = beta.trim();
+                if !beta.is_empty() && !betas.iter().any(|b| b == beta) {
+                    betas.push(beta.to_string());
+                }
+            }
+        }
+        if !betas.iter().any(|b| b == OAUTH_BETA) {
+            betas.push(OAUTH_BETA.to_string());
+        }
+        // Each one came from a header value, or is ours: a valid value.
+        let joined = HeaderValue::from_str(&betas.join(",")).map_err(|_| not_a_key())?;
+        headers.insert("anthropic-beta", joined);
+        headers.remove("anthropic-workspace-id");
+        return Ok(());
+    }
+    headers.insert(
+        "x-api-key",
+        HeaderValue::from_str(key).map_err(|_| not_a_key())?,
+    );
+    if let Some(workspace) = workspace {
+        let workspace = HeaderValue::from_str(workspace).map_err(|_| {
+            Refusal::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                "hive_api_workspace_id is not a workspace id",
+            )
+        })?;
+        headers.insert("anthropic-workspace-id", workspace);
+    }
+    Ok(())
+}
+
 fn refusal(r: Refusal) -> Response<Body> {
     let body = serde_json::json!({
         "type": "error",
@@ -442,34 +511,8 @@ async fn handle(
         }
         headers.append(name.clone(), value.clone());
     }
-    match HeaderValue::from_str(&key) {
-        Ok(v) => {
-            headers.insert("x-api-key", v);
-        }
-        Err(_) => {
-            return refusal(Refusal::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "api_error",
-                "hive_api_key_helper printed something that is not a key",
-            ));
-        }
-    }
-    // A key not scoped to a workspace needs this on every call (P0g, field
-    // 2026-10-07). It travels with the key: the device's, never the
-    // session's — whatever the session sent is replaced.
-    if let Some(workspace) = sup.model_workspace() {
-        match HeaderValue::from_str(workspace) {
-            Ok(v) => {
-                headers.insert("anthropic-workspace-id", v);
-            }
-            Err(_) => {
-                return refusal(Refusal::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "api_error",
-                    "hive_api_workspace_id is not a workspace id",
-                ));
-            }
-        }
+    if let Err(r) = put_credential(&mut headers, &key, sup.model_workspace()) {
+        return refusal(r);
     }
     let method = req.method().clone();
     let body = match Limited::new(req.into_body(), MAX_REQUEST_BYTES)
