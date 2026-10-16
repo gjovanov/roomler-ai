@@ -149,6 +149,25 @@ impl BoundChat {
         self.rooms.is_member(tenant_id, room_id, user).await
     }
 
+    /// FR-90 P2i-2 — which of `rooms` `user` is a member of in `tenant_id`:
+    /// [`Self::is_member`]'s rule for many rooms at once, in one read. A
+    /// module checking a person's right to read many things answers as
+    /// chat's routes would for each.
+    pub async fn member_rooms_of(
+        &self,
+        tenant_id: ObjectId,
+        user: ObjectId,
+        rooms: &[ObjectId],
+    ) -> DaoResult<Vec<ObjectId>> {
+        self.rooms.member_room_ids(tenant_id, user, rooms).await
+    }
+
+    /// FR-90 P2i-2 — every room `user` is a member of in `tenant_id`: each
+    /// one [`Self::is_member`] answers yes for.
+    pub async fn rooms_of(&self, tenant_id: ObjectId, user: ObjectId) -> DaoResult<Vec<ObjectId>> {
+        self.rooms.rooms_of_member(tenant_id, user).await
+    }
+
     /// Post a message authored by an agent (`author_id`, shown as
     /// `author_display`) into `room_id`, and fan it out to the room's members
     /// as `message:create` — the event every client already renders.

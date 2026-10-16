@@ -859,6 +859,7 @@ async fn audit(
         action: "brain".to_string(),
         outcome: outcome.to_string(),
         reason: reason.map(str::to_string),
+        sessions: None,
         at: DateTime::now(),
     };
     if let Err(e) = state.audit.record(ev).await {

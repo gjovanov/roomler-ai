@@ -67,7 +67,7 @@ arrived 4.4 s late still had ~50 s of its 60 s life left — the window was ther
 | step | where | what it does |
 |---|---|---|
 | push | `crates/modules/network/src/routes/agent_ssh.rs:395` | `rc_hub.push_ssh_grant(…)` |
-| enqueue | `crates/modules/fleet/src/hub.rs:1531` → `send_to_agent` | `try_send` onto the agent's outbound mpsc — returns when **queued** |
+| enqueue | `crates/modules/fleet/src/hub.rs:1541` → `send_to_agent` | `try_send` onto the agent's outbound mpsc — returns when **queued** |
 | answer | `crates/modules/network/src/routes/agent_ssh.rs:407` | `Ok(Granted { address, … })` — immediately |
 | record | `agents/roomlerd/src/signaling.rs:3628` → `ssh.rs:2073` | `record_grant` pushes into `GRANTS` whenever the frame arrives |
 | auth | `agents/roomlerd/src/ssh.rs:2167` (`take_grant_for`) | reads `GRANTS`; no entry ⇒ `rejected — no live grant` |
@@ -179,7 +179,7 @@ becomes a typed rejection so the arm can say *which* refusal it was; the log tex
 unchanged.
 
 The ack is sent unconditionally by an ack-capable build. An older server cannot parse the
-frame and drops it at `debug!` (`crates/modules/fleet/src/socket.rs:681`) — harmless, and
+frame and drops it at `debug!` (`crates/modules/fleet/src/socket.rs:688`) — harmless, and
 one small frame per grant.
 
 ### Compatibility, both directions

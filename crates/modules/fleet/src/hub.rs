@@ -244,6 +244,13 @@ pub struct ConnectedAgent {
     /// it is sent only to a connection with it. Per connection; neither `hive`
     /// nor `hive-purge` implies it.
     pub supports_hive_purge_all: bool,
+    /// FR-90 P2i-2 — the agent advertises `hive-search`: an archive replica
+    /// that answers a search over the copies it holds
+    /// (`rc:hive.search.grant`). A search grant goes only to a connection
+    /// with it and with `hive-view`, whose frames carry the search's peer.
+    /// Per connection; neither `hive`, `hive-replica` nor `hive-archive`
+    /// implies it.
+    pub supports_hive_search: bool,
     /// #2267 — `rc:hive.purge_all` was queued to this connection, which
     /// happens only at its removal. Unless the connection drains (below), the
     /// removal's kick then leaves the socket open instead of telling the
@@ -832,6 +839,9 @@ impl Hub {
             // FR-90 P2g-4a — set by `set_agent_hive_purge_all_support`; `false`
             // = no removal's purge is ever sent to this connection.
             supports_hive_purge_all: false,
+            // FR-90 P2i-2 — set by `set_agent_hive_search_support`; `false` =
+            // no search grant is ever pushed to this connection.
+            supports_hive_search: false,
             // #2267 — set by `push_hive_purge_all` once the frame is queued.
             removal_purge_pushed: false,
             // #2294 — set by `set_agent_hive_purge_drain_support`; `false` =
@@ -3025,6 +3035,53 @@ impl Hub {
             entry.removal_purge_pushed = true;
         }
         Ok(())
+    }
+
+    /// FR-90 P2i-2 — record whether this connection answers a search over
+    /// the copies it holds (`hive-search`), right after registration.
+    pub fn set_agent_hive_search_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_hive_search = supports;
+        }
+    }
+
+    /// FR-90 P2i-2 — whether the device's CURRENT connection on this pod
+    /// answers a search over its copies: it advertises `hive-search` and
+    /// `hive-view` both (the search's peer rides the view's frames), in
+    /// `tenant_id`. Not online here, or another tenant's, is `false`, as
+    /// [`Self::push_hive_search`] would answer it.
+    pub fn agent_searches(&self, agent_id: ObjectId, tenant_id: ObjectId) -> bool {
+        self.inner.agents.get(&agent_id).is_some_and(|a| {
+            a.tenant_id == tenant_id && a.supports_hive_view && a.supports_hive_search
+        })
+    }
+
+    /// FR-90 P2i-2 — push a search grant (`rc:hive.search.grant`), checked in
+    /// the lookup that sends it, as [`Self::push_hive_view`]: offline or
+    /// another tenant's is [`Error::AgentOffline`]; a connection without
+    /// `hive-view` and `hive-search` is [`Error::ExecUnsupported`] and receives
+    /// nothing. A build before P2i-1 drops the frame unread, and its searcher
+    /// would wait for an answer that never comes.
+    pub fn push_hive_search(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        msg: ServerMsg,
+    ) -> Result<()> {
+        {
+            let entry = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+            if entry.tenant_id != tenant_id {
+                return Err(Error::AgentOffline(agent_id.to_hex()));
+            }
+            if !(entry.supports_hive_view && entry.supports_hive_search) {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
+        }
+        self.send_to_agent(agent_id, msg)
     }
 
     /// FR-90 P2d — record whether this connection carries replica streams
@@ -6192,6 +6249,61 @@ mod tests {
 
         assert_eq!(hub.kick_removed_agent(agent_id, true), KickOutcome::Told);
         assert!(matches!(rx.try_recv(), Ok(ServerMsg::Goodbye { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_search_grant_goes_only_to_a_connection_that_searches() {
+        // FR-90 P2i-2 — `hive-search` and `hive-view` both: the search's peer
+        // rides the view's frames, and a build before P2i-1 drops the grant.
+        let hub = test_hub().await;
+        let (agent_id, tenant_id) = (ObjectId::new(), ObjectId::new());
+        let grant = |grant_id| ServerMsg::HiveSearchGrant {
+            grant_id,
+            user_id: ObjectId::new(),
+            sessions: vec![ObjectId::new()],
+            ttl_secs: 600,
+        };
+        assert!(
+            matches!(
+                hub.push_hive_search(agent_id, tenant_id, grant(ObjectId::new())),
+                Err(Error::AgentOffline(_))
+            ),
+            "not online here"
+        );
+        let mut rx = register_linux(&hub, agent_id, tenant_id);
+        for (view, search) in [(false, false), (true, false), (false, true)] {
+            hub.set_agent_hive_view_support(agent_id, view);
+            hub.set_agent_hive_search_support(agent_id, search);
+            assert!(
+                !hub.agent_searches(agent_id, tenant_id),
+                "view {view}, search {search}"
+            );
+            assert!(
+                matches!(
+                    hub.push_hive_search(agent_id, tenant_id, grant(ObjectId::new())),
+                    Err(Error::ExecUnsupported(_))
+                ),
+                "view {view}, search {search}"
+            );
+        }
+        assert!(rx.try_recv().is_err(), "nothing was sent");
+
+        hub.set_agent_hive_view_support(agent_id, true);
+        hub.set_agent_hive_search_support(agent_id, true);
+        let other = ObjectId::new();
+        assert!(!hub.agent_searches(agent_id, other), "another tenant's");
+        assert!(matches!(
+            hub.push_hive_search(agent_id, other, grant(ObjectId::new())),
+            Err(Error::AgentOffline(_))
+        ));
+        assert!(hub.agent_searches(agent_id, tenant_id));
+        let gid = ObjectId::new();
+        hub.push_hive_search(agent_id, tenant_id, grant(gid))
+            .expect("pushed");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerMsg::HiveSearchGrant { grant_id, .. }) if grant_id == gid
+        ));
     }
 
     #[tokio::test]

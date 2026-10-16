@@ -902,7 +902,8 @@ pub struct HiveAuditEvent {
     pub session_id: Option<ObjectId>,
     /// `start` | `stop` | `view` | `participant` | `brain` | `policy` (P2c-2a) |
     /// `place` (P2c-2b) | `fork` (P2f-3: its `session_id` the fork, once it is
-    /// made) | `purge` (P2g-2).
+    /// made) | `purge` (P2g-2) | `search` (P2i-2: its `device_id` the archive
+    /// replica asked, no `session_id`, and [`Self::sessions`]).
     pub action: String,
     /// `sent` | `queued` | `refused`; for `participant`, the role given —
     /// `driver` | `reader` — or `removed`; for `brain`, `added` | `edited` |
@@ -913,6 +914,11 @@ pub struct HiveAuditEvent {
     /// Why, for `refused` and `short` — the server's own reason word.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// FR-90 P2i-2 — for `search`, how many sessions the grant named: the
+    /// most the device could search. Never the query, which the server
+    /// never has. Absent on every other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<u32>,
     pub at: DateTime,
 }
 

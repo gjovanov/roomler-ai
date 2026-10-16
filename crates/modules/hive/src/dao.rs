@@ -1640,6 +1640,75 @@ impl AgentSessionDao {
             .count(doc! { "tenant_id": tenant_id, "parent.session_id": id, "purged": Bson::Null })
             .await
     }
+
+    /// FR-90 P2i-2 — the sessions of `tenant_id` that `user` may read and
+    /// whose copy `device_id` holds as a member, as the server knows them, the
+    /// most recently active first, at most `limit`.
+    ///
+    /// Readable as [`crate::access::may_read`] reads it, the organization's
+    /// membership apart (the caller asks that once): `user` owns it, or is a
+    /// member of its room, one of `rooms` (every room `user` is in). Held: not
+    /// purged, the device a member that took its copy (`joined`), or one that
+    /// leaves whose purge is not issued yet (`leaving`, no `purging`: it keeps
+    /// what it holds until then). Never the device's own `primary` row: a
+    /// primary's join is not a member's copy (P2c-4), and the device searches
+    /// only those. The device's store is the word on what it holds; this is
+    /// the most a search grant names.
+    pub async fn searchable(
+        &self,
+        tenant_id: ObjectId,
+        device_id: ObjectId,
+        user: ObjectId,
+        rooms: &[ObjectId],
+        limit: i64,
+    ) -> DaoResult<Vec<HeldCopy>> {
+        let filter = doc! {
+            "tenant_id": tenant_id,
+            "purged": Bson::Null,
+            "$or": [
+                { "owner_id": user },
+                { "room_id": { "$in": rooms.to_vec() } },
+            ],
+            "replicaset.members": { "$elemMatch": {
+                "device_id": device_id,
+                "role": { "$ne": MemberRole::Primary.as_str() },
+                "state": { "$in": [MemberState::Joined.as_str(), MemberState::Leaving.as_str()] },
+                "purging": Bson::Null,
+            } },
+        };
+        let coll = self.base.collection().clone_with_type::<Document>();
+        let mut cursor = coll
+            .find(filter)
+            .projection(doc! { "_id": 1, "owner_id": 1, "room_id": 1 })
+            .sort(doc! { "updated_at": -1 })
+            .limit(limit)
+            .await?;
+        let mut held = Vec::new();
+        while cursor.advance().await? {
+            let d = cursor.deserialize_current()?;
+            let (Ok(session_id), Ok(owner_id)) =
+                (d.get_object_id("_id"), d.get_object_id("owner_id"))
+            else {
+                continue;
+            };
+            held.push(HeldCopy {
+                session_id,
+                owner_id,
+                room_id: d.get_object_id("room_id").ok(),
+            });
+        }
+        Ok(held)
+    }
+}
+
+/// FR-90 P2i-2 — one session an archive replica holds a copy of, as a search
+/// grant reads it: whoever may read it is its owner, or a member of its room
+/// ([`crate::access::may_read`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldCopy {
+    pub session_id: ObjectId,
+    pub owner_id: ObjectId,
+    pub room_id: Option<ObjectId>,
 }
 
 /// FR-90 P1a-2 — `agent_approvals`. One record per (session, approval id),

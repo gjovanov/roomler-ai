@@ -40,7 +40,7 @@ use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
     error::Error as HubError,
     hive::{HARNESS_CLAUDE_CODE, hive_limits},
-    models::Agent,
+    models::{Agent, RpcCap},
     signaling::ServerMsg,
 };
 use roomler_ai_services::dao::base::PaginationParams;
@@ -230,6 +230,12 @@ pub(crate) struct Audit {
 
 impl Audit {
     pub(crate) async fn write(self, state: &HiveState) {
+        self.write_counted(state, None).await
+    }
+
+    /// FR-90 P2i-2 — [`Self::write`], with how many sessions a search grant
+    /// named: what the server decided, never what was searched for.
+    pub(crate) async fn write_counted(self, state: &HiveState, sessions: Option<u32>) {
         let ev = HiveAuditEvent {
             id: None,
             tenant_id: self.tenant_id,
@@ -240,6 +246,7 @@ impl Audit {
             action: self.action.to_string(),
             outcome: self.outcome.to_string(),
             reason: self.reason.map(str::to_string),
+            sessions,
             at: DateTime::now(),
         };
         if let Err(e) = state.audit.record(ev).await {
@@ -275,16 +282,47 @@ pub(crate) async fn member_tenant(
 /// an organization they do not serve is answered `404`, as every other route
 /// here answers it. P2h-2 — and whether sessions are copied here at all
 /// (`hive.replicaset`): the SPA shows the copies page only then. A server
-/// before it says nothing of it, which reads as off.
+/// before it says nothing of it, which reads as off. P2i-2 — and whether the
+/// organization can be searched ([`searches`]): the SPA shows the search box
+/// only then.
 pub async fn serves(
     State(state): State<HiveState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    member_tenant(&state, &tenant_id, &auth).await?;
-    Ok(Json(
-        serde_json::json!({ "enabled": true, "replicaset": state.replicaset }),
-    ))
+    let tid = member_tenant(&state, &tenant_id, &auth).await?;
+    Ok(Json(serde_json::json!({
+        "enabled": true,
+        "replicaset": state.replicaset,
+        "search": searches(&state, tid).await,
+    })))
+}
+
+/// FR-90 P2i-2 — whether `tid` can be searched: copies on, and a designated
+/// archive replica whose row says it searches (`hive-search` in its last
+/// hello, by equality) and is not offline. The rows, not this pod's sockets:
+/// the question may land on any pod, and the open that follows lands on the
+/// device's, which decides again. A read that fails answers no: the SPA shows
+/// no box, and nothing is lost.
+async fn searches(state: &HiveState, tid: ObjectId) -> bool {
+    if !state.replicaset {
+        return false;
+    }
+    let Ok(Some(policy)) = state.policies.get(tid).await else {
+        return false;
+    };
+    for device in policy.archive_devices {
+        if let Ok(a) = state.fleet.agents.find_live_in_tenant(tid, device).await
+            && a.capabilities.has_rpc(RpcCap::HiveSearch)
+            && !matches!(
+                roomler_ai_mod_fleet::agent::derive_agent_presence(&state.fleet, &a, false).0,
+                roomler_ai_mod_fleet::agent::AgentPresence::Offline
+            )
+        {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn parse_oid(raw: &str, what: &str) -> Result<ObjectId, ApiError> {

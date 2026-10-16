@@ -560,6 +560,57 @@ impl RoomDao {
         Ok(found.is_some())
     }
 
+    /// FR-90 P2i-2 — which of `rooms` this user holds a membership row in, in
+    /// this tenant: [`Self::is_member`]'s rule for many rooms at once, in one
+    /// read. Scoped by tenant for the same reason.
+    pub async fn member_room_ids(
+        &self,
+        tenant_id: ObjectId,
+        user_id: ObjectId,
+        rooms: &[ObjectId],
+    ) -> DaoResult<Vec<ObjectId>> {
+        if rooms.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.room_ids_where(doc! {
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "room_id": { "$in": rooms.to_vec() },
+        })
+        .await
+    }
+
+    /// FR-90 P2i-2 — every room this user holds a membership row in, in this
+    /// tenant: each one [`Self::is_member`] answers yes for.
+    pub async fn rooms_of_member(
+        &self,
+        tenant_id: ObjectId,
+        user_id: ObjectId,
+    ) -> DaoResult<Vec<ObjectId>> {
+        self.room_ids_where(doc! { "tenant_id": tenant_id, "user_id": user_id })
+            .await
+    }
+
+    async fn room_ids_where(&self, filter: bson::Document) -> DaoResult<Vec<ObjectId>> {
+        use futures::TryStreamExt;
+
+        let coll = self
+            .members
+            .collection()
+            .clone_with_type::<bson::Document>();
+        let mut cursor = coll
+            .find(filter)
+            .projection(doc! { "room_id": 1, "_id": 0 })
+            .await?;
+        let mut held = Vec::new();
+        while let Some(d) = cursor.try_next().await? {
+            if let Ok(room) = d.get_object_id("room_id") {
+                held.push(room);
+            }
+        }
+        Ok(held)
+    }
+
     pub async fn find_member_user_ids(&self, room_id: ObjectId) -> DaoResult<Vec<ObjectId>> {
         use futures::TryStreamExt;
 
