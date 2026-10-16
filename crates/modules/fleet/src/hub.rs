@@ -245,10 +245,15 @@ pub struct ConnectedAgent {
     /// nor `hive-purge` implies it.
     pub supports_hive_purge_all: bool,
     /// #2267 — `rc:hive.purge_all` was queued to this connection, which
-    /// happens only at its removal. The removal's kick then leaves the socket
-    /// open instead of telling the device: a daemon exits at once on
-    /// `rc:goodbye AgentDeleted`, which would cut its purge short.
+    /// happens only at its removal. Unless the connection drains (below), the
+    /// removal's kick then leaves the socket open instead of telling the
+    /// device: such a daemon exits at once on `rc:goodbye AgentDeleted`, which
+    /// would cut its purge short.
     pub removal_purge_pushed: bool,
+    /// #2294 — the agent advertises `hive-purge-drain`: on the goodbye it
+    /// finishes a removal purge before it exits, so a purged connection is
+    /// told like any other. Per connection; `hive-purge-all` does NOT imply it.
+    pub supports_hive_purge_drain: bool,
 }
 
 /// #2267 — what a removal's kick did to the device's connection on this pod
@@ -264,7 +269,8 @@ pub enum KickOutcome {
     /// is leaving by itself, or `rc.removal_goodbye` is off).
     NotTold,
     /// Taken out of the hub and not told, because this removal queued it
-    /// `rc:hive.purge_all`. Its socket stays open, as before #2267.
+    /// `rc:hive.purge_all` and its build exits at once on the goodbye (no
+    /// `hive-purge-drain`). Its socket stays open, as before #2267.
     KeptForPurge,
     /// Taken out of the hub; the goodbye could not be queued (the channel is
     /// full or closed). The socket ends as it did before #2267.
@@ -828,6 +834,9 @@ impl Hub {
             supports_hive_purge_all: false,
             // #2267 — set by `push_hive_purge_all` once the frame is queued.
             removal_purge_pushed: false,
+            // #2294 — set by `set_agent_hive_purge_drain_support`; `false` =
+            // a purged connection is not told at its removal, as before.
+            supports_hive_purge_drain: false,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -1018,9 +1027,11 @@ impl Hub {
     /// here without the goodbye, and the device kept its socket until
     /// something else dropped it.
     ///
-    /// ⚠️ An entry that this removal pushed `rc:hive.purge_all` is NOT told:
-    /// the daemon's exit is immediate, and its purge runs after the frame
-    /// lands. That socket stays open as before, which P2g-4a relies on.
+    /// ⚠️ An entry that this removal pushed `rc:hive.purge_all` is told only
+    /// when its build drains (`hive-purge-drain`, #2294): that daemon finishes
+    /// the purge before it exits on the goodbye. One of `agent-v0.4.137` or
+    /// `0.4.138` would exit at once and cut its purge short, so its socket
+    /// stays open as before, which P2g-4a relies on.
     pub fn kick_removed_agent(&self, agent_id: ObjectId, goodbye: bool) -> KickOutcome {
         let Some((_, entry)) = self.inner.agents.remove(&agent_id) else {
             return KickOutcome::NotRegistered;
@@ -1030,7 +1041,7 @@ impl Hub {
         if !goodbye {
             return KickOutcome::NotTold;
         }
-        if entry.removal_purge_pushed {
+        if entry.removal_purge_pushed && !entry.supports_hive_purge_drain {
             info!(
                 %agent_id,
                 "removed device not told: it was sent its purge, which the goodbye's exit would cut short; its socket stays open"
@@ -2963,6 +2974,14 @@ impl Hub {
             }
         }
         self.send_to_agent(agent_id, msg)
+    }
+
+    /// #2294 — record whether this connection finishes a removal purge before
+    /// it exits on the goodbye (`hive-purge-drain`), right after registration.
+    pub fn set_agent_hive_purge_drain_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_hive_purge_drain = supports;
+        }
     }
 
     /// FR-90 P2g-4a — record whether this connection purges every session it
@@ -6128,6 +6147,34 @@ mod tests {
             matches!(rx.try_recv(), Ok(ServerMsg::HivePurgeAll { purge_id }) if purge_id == purge)
         );
         assert!(rx.try_recv().is_err(), "no goodbye behind the purge");
+    }
+
+    #[tokio::test]
+    async fn a_draining_device_is_told_after_its_purge() {
+        // #2294: a build that finishes its removal purge before its goodbye
+        // exit (`hive-purge-drain`) is told, and the goodbye follows the
+        // purge's frame on the same channel.
+        let hub = test_hub().await;
+        let (agent_id, tenant_id, purge) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let mut rx = register_linux(&hub, agent_id, tenant_id);
+        hub.set_agent_hive_support(agent_id, true);
+        hub.set_agent_hive_purge_all_support(agent_id, true);
+        hub.set_agent_hive_purge_drain_support(agent_id, true);
+        hub.push_hive_purge_all(agent_id, tenant_id, purge)
+            .expect("pushed");
+
+        assert_eq!(hub.kick_removed_agent(agent_id, true), KickOutcome::Told);
+
+        assert!(
+            matches!(rx.try_recv(), Ok(ServerMsg::HivePurgeAll { purge_id }) if purge_id == purge)
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerMsg::Goodbye {
+                reason: AgentCloseReason::AgentDeleted,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

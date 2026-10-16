@@ -1224,9 +1224,72 @@ pub fn handle_purge_all(purge_id: ObjectId, is_primary: bool) {
         debug!(purge = %purge_id, "hive: rc:hive.purge_all with no supervisor");
         return;
     };
-    tokio::spawn(async move {
-        sup.purge_all(purge_id).await;
-    });
+    // #2294 — kept, so that the goodbye exit that follows can finish it.
+    REMOVAL_PURGES.track(tokio::spawn(async move { sup.purge_all(purge_id).await }));
+}
+
+/// #2294 — how long a goodbye exit waits for a removal purge: enough to stop
+/// a run and delete what it held, not so long that a hung purge keeps a
+/// removed daemon up for good.
+pub const REMOVAL_PURGE_LIMIT: Duration = Duration::from_secs(300);
+
+/// #2294 — the removal purges this daemon started ([`handle_purge_all`]).
+static REMOVAL_PURGES: RemovalPurges = RemovalPurges::new();
+
+/// #2294 — before a goodbye exit (`AgentDeleted`): finish the removal purges
+/// this daemon started, up to `limit` in all. Two goodbyes end one:
+/// - the removal's own, which follows `rc:hive.purge_all` on the same socket;
+/// - the refusal of a reconnect, after a pod roll dropped the socket
+///   mid-purge.
+///
+/// The exit is a `process::exit(7)`, so either would otherwise cut the purge
+/// short. Nothing in flight is no wait. The build says it does this
+/// (`hive-purge-drain`), which is what lets the server's kick tell a purged
+/// device at all.
+pub async fn finish_removal_purge(limit: Duration) {
+    match REMOVAL_PURGES.finish(limit).await {
+        (0, _) => {}
+        (n, true) => {
+            info!(
+                purges = n,
+                "hive: this device's removal purge finished before it stops"
+            );
+        }
+        (n, false) => warn!(
+            purges = n,
+            limit_secs = limit.as_secs(),
+            "hive: this device's removal purge did not finish in time; it stops anyway"
+        ),
+    }
+}
+
+/// The removal purges in flight, each the task [`Supervisor::purge_all`]
+/// runs in. A registry of its own so its tests do not share the daemon's.
+pub(crate) struct RemovalPurges(Mutex<Vec<tokio::task::JoinHandle<usize>>>);
+
+impl RemovalPurges {
+    pub(crate) const fn new() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+
+    pub(crate) fn track(&self, task: tokio::task::JoinHandle<usize>) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(task);
+    }
+
+    /// Wait for every tracked purge, up to `limit` in all: how many were in
+    /// flight, and whether they all finished. What it gives up on keeps
+    /// running until the process ends.
+    pub(crate) async fn finish(&self, limit: Duration) -> (usize, bool) {
+        let tasks = std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
+        let n = tasks.len();
+        let deadline = tokio::time::Instant::now() + limit;
+        for task in tasks {
+            if tokio::time::timeout_at(deadline, task).await.is_err() {
+                return (n, false);
+            }
+        }
+        (n, true)
+    }
 }
 
 /// FR-90 P2g-3d — `rc:hive.retain`: what keeps each copy this device asked
@@ -11301,5 +11364,60 @@ mod win_tests {
             "it lists neither the store nor the runtime root"
         );
         assert!(!other, "nor examines another session's directory");
+    }
+}
+
+/// #2294 — platform-neutral, unlike the rigs above: a goodbye exit on every
+/// system that runs sessions finishes its removal purge first.
+#[cfg(test)]
+mod removal_purge_tests {
+    use super::RemovalPurges;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn nothing_in_flight_is_no_wait() {
+        let r = RemovalPurges::new();
+        let t0 = Instant::now();
+        assert_eq!(r.finish(Duration::from_secs(30)).await, (0, true));
+        assert!(t0.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn a_goodbye_exit_waits_for_the_removal_purge() {
+        let r = RemovalPurges::new();
+        let done = Arc::new(AtomicBool::new(false));
+        let d = done.clone();
+        r.track(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            d.store(true, Ordering::SeqCst);
+            2
+        }));
+        assert_eq!(r.finish(Duration::from_secs(30)).await, (1, true));
+        assert!(
+            done.load(Ordering::SeqCst),
+            "the purge ran to its end before the exit"
+        );
+        assert_eq!(
+            r.finish(Duration::from_secs(30)).await,
+            (0, true),
+            "each purge is waited for once"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_wait_is_bounded() {
+        let r = RemovalPurges::new();
+        r.track(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            0
+        }));
+        let t0 = Instant::now();
+        assert_eq!(r.finish(Duration::from_millis(100)).await, (1, false));
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "a hung purge does not keep a removed daemon up"
+        );
     }
 }
