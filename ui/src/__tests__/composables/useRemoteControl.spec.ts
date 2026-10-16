@@ -66,6 +66,7 @@ import {
   friendlyEndReason,
   endedByHost,
   isRetryableRcErrorCode,
+  isFalloutOfEndedSession,
   readyRecoveryAction,
   sessionGateAllows,
   nextStallAction,
@@ -4162,6 +4163,28 @@ describe('FR-27 P10: the host\'s Disconnect', () => {
 
   it('is not an error: the sentence belongs to the view, not the error alert', () => {
     expect(friendlyEndReason('host_disconnect')).toBeNull()
+  })
+})
+
+// #2251 - after a refusal the viewer showed "session ... not found" instead of
+// the refusal's own sentence: a scoped session_not_found for a candidate still
+// in flight reached failWith. Measured on agent 0.4.139 + hosted-32a9095.
+describe('#2251: an error for a session the server already ended', () => {
+  it('is fallout once that session is closed', () => {
+    expect(isFalloutOfEndedSession('closed', 'abc', 'abc')).toBe(true)
+  })
+
+  it('still acts on an error for a live attempt', () => {
+    for (const phase of ['requesting', 'awaiting_consent', 'negotiating', 'connected']) {
+      expect(isFalloutOfEndedSession(phase, 'abc', 'abc')).toBe(false)
+    }
+  })
+
+  it('never swallows an error for another session, or an unscoped one', () => {
+    expect(isFalloutOfEndedSession('closed', 'other', 'abc')).toBe(false)
+    expect(isFalloutOfEndedSession('closed', undefined, 'abc')).toBe(false)
+    expect(isFalloutOfEndedSession('closed', null, 'abc')).toBe(false)
+    expect(isFalloutOfEndedSession('closed', 'abc', null)).toBe(false)
   })
 })
 
