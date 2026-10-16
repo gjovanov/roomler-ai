@@ -798,6 +798,13 @@ peer-to-peer; the server never sees raw pixels or keystrokes."""
 # installs recommends by default, and Mesa's VA driver drags LLVM (~100 MB)
 # onto every headless server on the next agent update.
 depends = "libc6, libxcb1, libxcb-shm0, libxcb-randr0, libasound2"
+# `ip` (iproute2) is how a Linux node gives its TUN the overlay IPv6; without it
+# the node stays v4-only and an exit cannot serve IPv6 (FR-97 §8, 2026-10-16: a
+# minimal container). A `recommends`, NOT a `depends`, for the reason above: the
+# updater's offline `dpkg --install` replaces the binary before it would fail on a
+# missing dependency. apt installs recommends by default, so a fresh install pulls
+# it in, and every full distro already has it.
+recommends = "iproute2"
 suggests = "mesa-va-drivers, intel-media-va-driver"
 section = "net"
 priority = "optional"
