@@ -828,8 +828,23 @@ same desktop:
 | VP9 4:4:4 over the DataChannel | 6.3 fps, resample 49.5 ms | **27.9 fps**, resample 0.0 ms |
 | H.264 on the RTP track | 15.1 fps, capture 47.8 ms | **28.8 fps** |
 
-The GPU pass alone, measured by a prototype doing the same import, render and
-readback: **1.4 ms** a frame, 4096×2160 to 2048×1080 or 1920×1012.
+The grab alone, `capture-smoke` on the same candidate, 240 frames, the idle
+skip off:
+
+| Scanout 4096×2160 → | GPU (P3) | CPU (`ROOMLERD_DRM_GPU=0`: P1 + P2) |
+|---|---|---|
+| 2048×1080, still | **1.80 ms** | 15.25 ms |
+| 2048×1080, moving | **2.05 ms** | 15.33 ms |
+| 4096×2160, still | 7.17 ms | 23.35 ms |
+| 4096×2160, moving | 6.55 ms | 23.45 ms |
+
+The first GPU frame costs 32–46 ms more, once per capture: the EGL context and
+the shader compile.
+
+⚠️ **Since P2b, `capture-smoke`'s `mean_ms` includes the wait to fill the
+period.** Each call costs at least one frame period, so at `--fps 240` nothing
+reads below 4.17 ms. To measure the grab itself, run it with a period below the
+grab (`--fps 1000`).
 
 ⚠️ **A desktop without GPU acceleration makes everything here slow, including
 the person's own desktop.** On AC12's box, Mesa from the Asahi repository was
