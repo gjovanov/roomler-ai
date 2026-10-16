@@ -541,7 +541,7 @@ dialog's **Approve**. Now the capture open's wait hook marks its session `asking
 dialog is the wait (`agents/roomlerd/src/peer.rs:5401`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:42`). The LocalAPI row carries the mark (`asking`,
 `crates/localapi/src/lib.rs:1085`), and the banner comes up only for a session that sees the
-screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:314`). The mark goes
+screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:322`). The mark goes
 when the open does, whether the dialog was approved, denied or timed out, so a dialog nobody
 answers still ends with the banner. The kill switch is `ROOMLERD_BANNER_WAITS_FOR_DIALOG=0`.
 
@@ -556,12 +556,12 @@ also keeps a system install's Wayland capture opt-in.
 
 | | Behaviour | Where |
 |---|---|---|
-| Shown | when a session starts, for at least `FIRST_SHOW` (4 s), **without taking focus** | `panels.rs:112`, `:331` |
-| Hides | 2.5 s after the pointer leaves it (`HIDE_DELAY`) | `panels.rs:51` |
-| Comes back | after the pointer rests within 4 px of the top edge for 1.2 s (`TOP_ZONE`, `REVEAL_DWELL`) — the Windows badge's numbers | `panels.rs:47-49` |
+| Shown | when a session starts, for at least `FIRST_SHOW` (4 s), **without taking focus** | `panels.rs:115`, `:393` |
+| Hides | 2.5 s after the pointer leaves it (`HIDE_DELAY`) | `panels.rs:54` |
+| Comes back | after the pointer rests within 4 px of the top edge for 1.2 s (`TOP_ZONE`, `REVEAL_DWELL`) — the Windows badge's numbers | `panels.rs:50-52` |
 | Stays | while a recording runs, this device's or a controller's (`tray::recording_now`) | `tray.rs:239` |
 | Moves | by dragging its body (`data-tauri-drag-region`, unchanged) | `front/panel-viewing.html` |
-| Frame | a 2 px red frame round the main screen for the whole session — four click-through strips (macOS) | `panels.rs:428` |
+| Frame | a 2 px red frame round the main screen for the whole session — four click-through strips (macOS) | `panels.rs:490` |
 
 ```mermaid
 stateDiagram-v2
@@ -572,19 +572,19 @@ stateDiagram-v2
     Shown --> [*]: the session ends (banner and frame go)
 ```
 
-The decision is a pure state machine (`Reveal::step`, `panels.rs:247`) fed every 120 ms by a
+The decision is a pure state machine (`Reveal::step`, `panels.rs:262`) fed every 120 ms by a
 watch thread; its six unit tests are the spec.
 
 ⚠️ **On macOS `show()` makes a window KEY**, whatever `focused(false)` said when it was built.
 Every session's banner therefore took key status from the window the person was using, and
 their next click into it was spent making it key again and did nothing else (measured
 2026-10-06: the first click into roomler-desktop after each new session was lost). The banner
-is now brought up with `orderFrontRegardless` (`show_without_focus`, `panels.rs:347`), the way
+is now brought up with `orderFrontRegardless` (`show_without_focus`, `panels.rs:409`), the way
 the native consent panel shows itself.
 
-⚠️ **The pointer cannot always be read** (a Wayland session keeps it to itself). Then the
-banner never hides: one that tucked itself away with no way back would be worse than one
-that stays.
+⚠️ **The pointer cannot always be read** (a Wayland session keeps it to itself, and under
+Xwayland it is not trusted, §12.2). Then the banner never hides: one that tucked itself away
+with no way back would be worse than one that stays.
 
 ⚠️ **Both the banner and the frame appear in the captured stream on macOS.** Our capture is
 `CGDisplayStream`, which ignores `NSWindowSharingNone`; the flag is set anyway and becomes
@@ -611,3 +611,52 @@ daemon's arm that every Disconnect surface reaches, so the Windows badge gets it
 On a supervised Mac the session lives in the GUI worker (FR-43), and so does the
 Disconnect: the worker's `host_disconnect` rides the delegation link to the daemon's
 WS, the way the session's answer did.
+
+### 12.2 Pinned to the top on Wayland (#2286)
+
+`position_top_centre` (`panels.rs:432`) asks for the top centre of the primary monitor.
+Windows, macOS and X11 grant it. **A Wayland compositor ignores it**, because a client
+cannot place its own window there. Measured on Plasma 6.6 and GNOME (2026-10-16), both put
+the banner in the middle of the screen for the whole session. That is where the controller
+was working, and on Linux the banner is in the captured stream too. Each desktop now gets
+the one placement it allows a client (`agents/roomler-desktop/src/pin.rs`):
+
+| Desktop | How the banner gets to the top | Where |
+|---|---|---|
+| **KDE Plasma** (Wayland) | A KWin script, loaded into the running KWin over D-Bus (`org.kde.kwin.Scripting`). It finds the banner by its title (`BANNER_TITLE`), puts it at the top centre of its screen, 48 px down, and keeps it above everything and out of the task switchers. It places the banner again each time it maps, because a hidden banner comes back as a new window. Nothing is written to the person's KWin configuration, and the script goes when that KWin does. | `pin.rs:120`, the script `pin.rs:82` |
+| **GNOME** (Wayland) | mutter offers no placement, no layer-shell and no scripting. The companion runs under **Xwayland** instead (`GDK_BACKEND=x11`), where an X11 window places itself and stays above. It is set as `main`'s first statement: GTK reads it when it starts, and an environment variable may only be set while no other thread exists. | `pin.rs:63`, `agents/roomler-desktop/src/main.rs:53` |
+| X11, Windows, macOS | Unchanged: the window places itself. | `panels.rs:432` |
+
+```mermaid
+flowchart LR
+    A[the banner is shown] --> D{the session}
+    D -- X11 · Windows · macOS --> T[it places itself<br/>position_top_centre]
+    D -- KDE on Wayland --> K[a KWin script, over D-Bus,<br/>places it and keeps it above]
+    D -- GNOME on Wayland --> X[the companion runs under Xwayland,<br/>so it places itself]
+```
+
+⚠️ **Under Xwayland the banner never tucks itself away.** Its pointer is known only over X11
+windows. At GNOME's top bar it reads wherever it last was, so the top-edge gesture that brings
+a hidden banner back would never be seen. The pointer is treated as unreadable there
+(`Sample::read`, `panels.rs:208`), and an unreadable pointer keeps the banner up (§12).
+
+⚠️ **A non-resizable GTK window takes its webview's natural height.** The banner asked for
+76 px and came out 198 px tall, the rest of it empty. On Linux the panels are resizable with
+min = max, which is the same fixed size without that (`panels.rs:318-324`).
+
+⚠️ **On Linux the consent window goes in the middle, not at the top.** The daemon's own X11
+consent panel holds the top centre (`agents/roomlerd/src/indicator/x11.rs`). With the
+companion on Xwayland, a consent window placed there too landed right under it when both
+were asking. `WebviewWindow::center` put the window's corner at the middle under Xwayland at
+2×, half a window off, so the centre is computed the way the top centre is
+(`position_centre`, `panels.rs:369`).
+
+Measured on Fedora Asahi Remix 42 (an Apple M2 Pro Mac mini), 2026-10-16:
+
+| Session | The banner | Its Disconnect | The consent window |
+|---|---|---|---|
+| Plasma 6.6 (KWin 6.6.4) | 360×76 at the top centre, above the other windows | ended the session (`host_disconnect`) | — |
+| GNOME, at 2× | `720x152+1688+96` (360×76 logical, 48 down), still there after its first show | ended the session | centred, clear of the daemon's panel; **Approve** on each granted its own session |
+
+The kill switch is `ROOMLER_DESKTOP_BANNER_PIN=0`. It loads no KWin script, and on GNOME the
+companion stays on native Wayland.

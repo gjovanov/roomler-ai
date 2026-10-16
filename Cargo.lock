@@ -8606,6 +8606,7 @@ version = "0.4.139"
 dependencies = [
  "anyhow",
  "gethostname 0.5.0",
+ "gio",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
