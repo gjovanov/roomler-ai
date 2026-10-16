@@ -4121,6 +4121,11 @@ async fn run_cmd(
     // FR-99 P3 — the owner's lock-on-end policy, live from here on (a local
     // `ConfigSet` re-seeds it; the server cannot reach it).
     roomlerd::lock_on_end::set_device_policy(cfg.lock_on_end);
+    // FR-108 — the owner's display-match policy, likewise device-only, and the
+    // presence sampler from here on (Windows), so a request mid-session can
+    // tell the controller's input from a person's.
+    roomlerd::display_match::set_device_policy(cfg.display_match);
+    roomlerd::presence::start();
     // FR-101 P2b — the owner's session-policy floor, likewise device-only.
     roomlerd::session_policy::set_device_policy(roomlerd::session_policy::from_config(&cfg));
     // FR-92 — the keep-busy engine: restores a keep-busy the signed-in

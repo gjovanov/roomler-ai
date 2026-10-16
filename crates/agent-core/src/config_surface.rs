@@ -1699,6 +1699,15 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-99 - lock this computer when the last remote session ends: never (default) | auto (lock if the session began on a locked screen or with nobody at the computer) | always. Windows and Linux. With always, a per-user install cannot unlock the screen remotely afterwards: someone must sign in at the computer. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
     },
     KeyMeta {
+        key: "display_match",
+        group: Group::RemoteDesktop,
+        tier: Tier::Standard,
+        // LIVE: read at every display-match request.
+        live: true,
+        kind: "string",
+        description: "FR-108 - whether a remote controller's display match may switch this computer's display mode to fit their window: auto (default: only while nobody is using this screen, that is no one has touched its keyboard or mouse for 5 minutes) | always (whenever asked) | never. Windows. A locked screen is switched only once it is unlocked. The original mode comes back when the session ends. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
+    },
+    KeyMeta {
         key: "rc_clipboard",
         group: Group::RemoteDesktop,
         tier: Tier::Standard,
@@ -2013,6 +2022,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "keep_busy_enabled" => Some(fmt_bool(cfg.keep_busy_enabled)),
         "privacy_mode_allowed" => Some(fmt_bool(cfg.privacy_mode_allowed)),
         "lock_on_end" => Some(fmt_lock_on_end(cfg.lock_on_end)),
+        "display_match" => Some(fmt_display_match(cfg.display_match)),
         "rc_clipboard" => Some(fmt_feature_policy(cfg.rc_clipboard)),
         "rc_files" => Some(fmt_feature_policy(cfg.rc_files)),
         "rc_audio" => Some(fmt_feature_policy(cfg.rc_audio)),
@@ -2068,6 +2078,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "keep_busy_enabled" => cfg.keep_busy_enabled = parse_bool_or(value, true)?,
         "privacy_mode_allowed" => cfg.privacy_mode_allowed = parse_bool_or(value, false)?,
         "lock_on_end" => cfg.lock_on_end = parse_lock_on_end(value)?,
+        "display_match" => cfg.display_match = parse_display_match(value)?,
         // FR-101 P2b — cleared means the default, `on`; a value is read
         // strictly here, where a typo is made, rather than becoming `off`
         // silently the way an unknown value in the file reads.
@@ -2814,6 +2825,34 @@ fn parse_lock_on_end(
     }
 }
 
+fn fmt_display_match(p: crate::config::DisplayMatchPolicy) -> String {
+    use crate::config::DisplayMatchPolicy;
+    match p {
+        DisplayMatchPolicy::Auto => "auto",
+        DisplayMatchPolicy::Always => "always",
+        DisplayMatchPolicy::Never => "never",
+    }
+    .to_string()
+}
+
+/// FR-108 — `display_match` as a person sets it: `auto`, `always` or `never`,
+/// in any case; cleared is `auto`, the default. Anything else is refused,
+/// where the file's reader would have read it as `never` without a word.
+fn parse_display_match(v: Option<&str>) -> Result<crate::config::DisplayMatchPolicy, String> {
+    use crate::config::DisplayMatchPolicy;
+    match v
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("auto") => Ok(DisplayMatchPolicy::Auto),
+        Some("always") => Ok(DisplayMatchPolicy::Always),
+        Some("never") => Ok(DisplayMatchPolicy::Never),
+        Some(_) => Err("display_match must be auto | always | never".to_string()),
+    }
+}
+
 fn fmt_feature_policy(p: roomler_ai_remote_control::models::FeaturePolicy) -> String {
     use roomler_ai_remote_control::models::FeaturePolicy;
     match p {
@@ -2947,6 +2986,7 @@ mod tests {
             "rc_files",
             "rc_audio",
             "lock_on_end",
+            "display_match",
         ]
         .into_iter()
         .map(String::from)
@@ -3405,6 +3445,53 @@ mod tests {
             LockOnEnd::Never,
             "a refused value changes nothing"
         );
+    }
+
+    /// FR-108 — `display_match` takes its three words in any case, echoes them,
+    /// clears to `auto`, and refuses anything else (the file's reader would read
+    /// it as `never` without a word).
+    #[test]
+    fn display_match_set_echo_clear() {
+        use crate::config::DisplayMatchPolicy;
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(cfg.display_match, DisplayMatchPolicy::Auto);
+        apply(&mut cfg, "display_match", Some(" NEVER ")).unwrap();
+        assert_eq!(cfg.display_match, DisplayMatchPolicy::Never);
+        assert_eq!(
+            entry_for(&cfg, "display_match").unwrap().value.as_deref(),
+            Some("never")
+        );
+        apply(&mut cfg, "display_match", Some("always")).unwrap();
+        assert_eq!(cfg.display_match, DisplayMatchPolicy::Always);
+        apply(&mut cfg, "display_match", None).unwrap();
+        assert_eq!(cfg.display_match, DisplayMatchPolicy::Auto);
+        assert!(apply(&mut cfg, "display_match", Some("sometimes")).is_err());
+        assert_eq!(
+            cfg.display_match,
+            DisplayMatchPolicy::Auto,
+            "a refused value changes nothing"
+        );
+    }
+
+    /// FR-108 — a value in the file that this build does not know reads as
+    /// `never` (leave the screen alone), and never fails the file.
+    #[test]
+    fn display_match_reads_an_unknown_value_as_never() {
+        use crate::config::DisplayMatchPolicy;
+        #[derive(serde::Deserialize)]
+        struct One {
+            display_match: DisplayMatchPolicy,
+        }
+        for (text, want) in [
+            ("display_match = \"auto\"", DisplayMatchPolicy::Auto),
+            ("display_match = \"always\"", DisplayMatchPolicy::Always),
+            ("display_match = \"never\"", DisplayMatchPolicy::Never),
+            ("display_match = \"when-idle\"", DisplayMatchPolicy::Never),
+            ("display_match = 1", DisplayMatchPolicy::Never),
+        ] {
+            let got: One = toml::from_str(text).expect(text);
+            assert_eq!(got.display_match, want, "{text}");
+        }
     }
 
     /// Multi-org v2 shared-carrier soak flag set/echo/clear (per the

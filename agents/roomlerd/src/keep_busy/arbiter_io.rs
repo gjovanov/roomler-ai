@@ -30,7 +30,11 @@ pub fn cursor() -> Result<(i32, i32), HostError> {
 /// Move the pointer — refused while a controller holds a mouse button.
 pub fn move_to(p: (i32, i32)) -> Result<(), HostError> {
     match arbiter::global().keep_busy(KbOp::Move { x: p.0, y: p.1 }) {
-        KbReply::Moved => Ok(()),
+        KbReply::Moved => {
+            // FR-108 — this move is the machine's, not a person's.
+            super::note_own_move();
+            Ok(())
+        }
         other => Err(map_err(other)),
     }
 }
@@ -49,7 +53,10 @@ pub fn move_to(p: (i32, i32)) -> Result<(), HostError> {
 pub fn move_norm(fx: f64, fy: f64) -> Result<(), HostError> {
     let q = |f: f64| (f.clamp(0.0, 1.0) * f64::from(arbiter::NORM_ONE)).round() as u32;
     match arbiter::global().keep_busy(KbOp::MoveNorm { x: q(fx), y: q(fy) }) {
-        KbReply::Moved => Ok(()),
+        KbReply::Moved => {
+            super::note_own_move();
+            Ok(())
+        }
         other => Err(map_err(other)),
     }
 }

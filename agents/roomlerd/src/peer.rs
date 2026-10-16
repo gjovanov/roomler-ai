@@ -9396,51 +9396,46 @@ fn attach_control_handler(
                 }
                 "rc:display-match" => {
                     // rc.191 — viewer asked the host to switch its display to
-                    // the largest mode fitting the viewer's stage (opt-in
-                    // toggle; makes the whole pixel chain 1:1 — see
-                    // `display_match`). `{enable:false}` restores. Runs off
-                    // the callback thread: ChangeDisplaySettingsExW blocks.
+                    // the largest mode fitting the viewer's stage (makes the
+                    // whole pixel chain 1:1 — see `display_match`).
+                    // `{enable:false}` restores. FR-108: the DEVICE decides
+                    // (its owner's `display_match`, and under `auto` whether
+                    // someone is using the screen), and every request gets one
+                    // `rc:display-match.state` back. Runs off the callback
+                    // thread: ChangeDisplaySettingsExW blocks.
                     let enable = val
                         .get("enable")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
                     let w = val.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                     let h = val.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    tokio::task::spawn_blocking(move || {
-                        if !enable {
-                            // P3: only the owning session's toggle-off
-                            // restores; a non-owner disabling its OWN match
-                            // preference must not revert the mode another
-                            // session applied.
-                            if crate::display_match::restore_for(session_id) {
-                                tracing::info!("display-match: restored original mode");
-                            } else {
-                                tracing::debug!(
-                                    "display-match: disable from non-owner session — no-op"
-                                );
+                    if enable && (w == 0 || h == 0) {
+                        tracing::debug!("display-match: missing width/height — ignored");
+                    } else {
+                        let answer = tokio::task::spawn_blocking(move || {
+                            if !enable {
+                                // P3: only the owning session's toggle-off
+                                // restores; a non-owner disabling its OWN match
+                                // preference must not revert the mode another
+                                // session applied.
+                                if crate::display_match::restore_for(session_id) {
+                                    tracing::info!("display-match: restored original mode");
+                                } else {
+                                    tracing::debug!(
+                                        "display-match: disable from non-owner session — no-op"
+                                    );
+                                }
+                                return crate::display_match::Answer::Off;
                             }
-                            return;
+                            crate::display_match::request_for(session_id, w, h)
+                        })
+                        .await;
+                        if let (Ok(answer), Some(dc)) = (answer, dc_for_reply.upgrade()) {
+                            let _ = dc
+                                .send_text(crate::display_match::state_json(answer))
+                                .await;
                         }
-                        if w == 0 || h == 0 {
-                            tracing::debug!("display-match: missing width/height — ignored");
-                            return;
-                        }
-                        match crate::display_match::apply_for(session_id, w, h) {
-                            Ok((mw, mh)) => tracing::info!(
-                                req_w = w,
-                                req_h = h,
-                                mode_w = mw,
-                                mode_h = mh,
-                                "display-match: switched host display mode"
-                            ),
-                            Err(e) => tracing::warn!(
-                                req_w = w,
-                                req_h = h,
-                                %e,
-                                "display-match: could not switch mode"
-                            ),
-                        }
-                    });
+                    }
                 }
                 // FR-92 — keep busy. The ARBITER decides whether this session
                 // may switch it (it holds the INPUT grant, the floor and the
