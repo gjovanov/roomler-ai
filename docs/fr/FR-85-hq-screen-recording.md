@@ -37,7 +37,7 @@ what it costs in installer size and ships with integration and e2e tests.
   uid drop used by the portal helper (`capture/portal/mod.rs`); cpal loopback audio + audiopus Opus (`audio/`); the
   consent chain and `PromptKind` (`consent.rs:157`); the config surface (`crates/agent-core/src/config_surface.rs:1047`)
   and LocalAPI `ConfigSet`; the capture-excluded Windows indicator (`indicator/win.rs`); the updater's
-  `decide_defer` (`updater.rs:119`); the files-DC chunk pump (`peer.rs:10344`); `.roomler-partial` staging (`files.rs`).
+  `decide_defer` (`updater.rs:119`); the files-DC chunk pump (`peer.rs:10354`); `.roomler-partial` staging (`files.rs`).
 
 ## Decisions taken with the operator (2026-09-25)
 
