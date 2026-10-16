@@ -84,6 +84,41 @@ export interface HiveReplicaMember {
   holds?: number
 }
 
+/** `PurgeView` (P2g-2) — a purge of a session from every device that held
+ *  it: each device `pending` until it answers, then `done`, or `closed`
+ *  (`closed`: `device_removed` · `holds_nothing`); its two parts, the
+ *  daemon's `store` and the `account`'s, are each `done` · `not_there` ·
+ *  `failed` (a newer word is shown as is). */
+export interface HivePurge {
+  id: string
+  session_id: string
+  /** `owner`, or `retention` for one the server's sweep issued. */
+  reason: string
+  at: string
+  done_at?: string
+  devices: Array<{
+    device_id: string
+    state: string
+    store?: string
+    account?: string
+    detail?: string
+    answered_at?: string
+    closed?: string
+  }>
+}
+
+/** `DELETE …/session/{sid}`: `purging` (sent to every device that held it),
+ *  `purged` (every device answered, or none could be asked) or `refused`
+ *  (`no_permission` · `in_progress`). `forks` counts the sessions forked
+ *  from it, which keep its conversation up to their fork. */
+export interface HivePurgeResult {
+  outcome: 'purging' | 'purged' | 'refused'
+  reason?: string
+  message?: string
+  purge?: HivePurge
+  forks?: number
+}
+
 /** `PromotionView` — a move in flight, step by step. */
 export interface HivePromotion {
   id: string
@@ -323,6 +358,20 @@ export const useHiveStore = defineStore('hive', () => {
     return api.post<HiveStartResult>(`${base(tenantId)}/${sessionId}/fork`, body)
   }
 
+  /** P2j-3 — the owner purges the session from every device that held it
+   *  (P2g-2). Once it is purging, the record is its tombstone, read by
+   *  nobody: it leaves the list. */
+  async function purge(tenantId: string, sessionId: string): Promise<HivePurgeResult> {
+    const res = await api.delete<HivePurgeResult>(`${base(tenantId)}/${sessionId}`)
+    if (res.outcome !== 'refused') sessions.value = sessions.value.filter((s) => s.id !== sessionId)
+    return res
+  }
+
+  /** P2j-3 — how a purge of the owner's session goes, device by device. */
+  function fetchPurge(tenantId: string, sessionId: string): Promise<HivePurge> {
+    return api.get<HivePurge>(`${base(tenantId)}/${sessionId}/purge`)
+  }
+
   async function stop(tenantId: string, sessionId: string): Promise<HiveStopResult> {
     const res = await api.post<HiveStopResult>(`${base(tenantId)}/${sessionId}/stop`, {})
     upsert(res.session)
@@ -489,6 +538,8 @@ export const useHiveStore = defineStore('hive', () => {
     promote,
     teleport,
     fork,
+    purge,
+    fetchPurge,
     upsert,
     fetchParticipants,
     setParticipant,

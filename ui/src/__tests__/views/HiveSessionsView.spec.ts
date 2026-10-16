@@ -35,14 +35,20 @@ const hoisted = vi.hoisted(() => ({
   fetchSessions: vi.fn(),
   fetchSession: vi.fn(),
   checkSearchable: vi.fn(),
+  purge: vi.fn(),
+  fetchPurge: vi.fn(),
+  fetchAgent: vi.fn(),
   push: vi.fn(),
   run: vi.fn(),
   close: vi.fn(),
   hive: {
-    sessions: [] as Array<{ id: string; title: string; room_id?: string; status: string }>,
+    sessions: [] as Array<{ id: string; owner_id?: string; title: string; room_id?: string; status: string }>,
     loading: false,
     searchable: {} as Record<string, boolean>,
+    copied: {} as Record<string, boolean>,
   },
+  agents: [] as Array<{ id: string; name: string; display_name?: string }>,
+  user: { id: 'u1' } as { id: string } | null,
   state: null as SearchState | null,
 }))
 
@@ -59,19 +65,34 @@ vi.mock('@/stores/hive', () => ({
     get searchable() {
       return hoisted.hive.searchable
     },
+    get copied() {
+      return hoisted.hive.copied
+    },
     fetchSessions: hoisted.fetchSessions,
     fetchSession: hoisted.fetchSession,
     checkSearchable: hoisted.checkSearchable,
+    purge: hoisted.purge,
+    fetchPurge: hoisted.fetchPurge,
   }),
 }))
 vi.mock('@/stores/devices', () => ({
   useDeviceStore: () => ({ items: [], loading: false, fetchDevices: vi.fn() }),
+}))
+vi.mock('@/stores/agents', () => ({
+  useAgentStore: () => ({ agents: hoisted.agents, fetchAgent: hoisted.fetchAgent }),
 }))
 vi.mock('vue-router', () => ({
   useRoute: () => ({ params: { tenantId: 't1' } }),
   useRouter: () => ({ push: hoisted.push }),
 }))
 vi.mock('@/stores/ws', () => ({ useWsStore: () => ({}) }))
+vi.mock('@/stores/auth', () => ({
+  useAuthStore: () => ({
+    get user() {
+      return hoisted.user
+    },
+  }),
+}))
 
 // The search itself is `useHiveSearch`'s (its own spec); here its state is
 // set by hand. `snippetParts` and the limit stay the real ones.
@@ -101,9 +122,13 @@ const state = (): SearchState => hoisted.state!
 
 const vuetify = createVuetify({ components, directives })
 
+/** A dialog inline, its content there while it is open: jsdom has no
+ *  `visualViewport` for Vuetify's overlay. */
+const DialogStub = { props: ['modelValue'], template: '<div v-if="modelValue"><slot /></div>' }
+
 async function render() {
   const i18n = createI18n({ legacy: false, locale: 'en', messages: { en } })
-  const w = mount(HiveSessionsView, { global: { plugins: [vuetify, i18n] } })
+  const w = mount(HiveSessionsView, { global: { plugins: [vuetify, i18n], stubs: { VDialog: DialogStub } } })
   await flushPromises()
   return w
 }
@@ -117,8 +142,10 @@ beforeEach(() => {
       disconnect() {}
     },
   )
-  hoisted.hive.sessions = [{ id: 's-mine', title: 'Fix the kubelet', room_id: 'r-mine', status: 'ended' }]
+  hoisted.hive.sessions = [{ id: 's-mine', owner_id: 'u1', title: 'Fix the kubelet', room_id: 'r-mine', status: 'ended' }]
+  hoisted.user = { id: 'u1' }
   hoisted.hive.searchable = { t1: true }
+  hoisted.hive.copied = {}
   hoisted.checkSearchable.mockResolvedValue(true)
   state().status.value = 'idle'
   state().reason.value = null
@@ -283,6 +310,31 @@ describe('HiveSessionsView — the search box (FR-90 P2i-3)', () => {
     await flushPromises()
     expect(w.find('[data-testid="hive-search-refused"]').exists()).toBe(false)
     expect(w.find('[data-testid="hive-search-error"]').text()).toContain('this device could not search its copies')
+    w.unmount()
+  })
+})
+
+// FR-90 P2j-3 — a session deleted for good, from the list: the room goes with
+// it, so the way to it is here, and only where sessions are copied at all.
+describe('HiveSessionsView — delete for good (FR-90 P2j-3)', () => {
+  it('offers it only where sessions are copied, and asks for that session', async () => {
+    let w = await render()
+    expect(w.find('[data-testid="hive-purge-open-s-mine"]').exists(), 'not where nothing is copied').toBe(false)
+    w.unmount()
+
+    hoisted.hive.copied = { t1: true }
+    // Someone else's, read from its room: the list holds it too.
+    hoisted.hive.sessions = [
+      ...hoisted.hive.sessions,
+      { id: 's-theirs', owner_id: 'u2', title: 'Theirs', room_id: 'r-theirs', status: 'idle' },
+    ]
+    w = await render()
+    expect(w.find('[data-testid="hive-purge-open-s-theirs"]').exists(), "not on someone else's session").toBe(false)
+    await w.find('[data-testid="hive-purge-open-s-mine"]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-testid="hive-purge-explain"]').exists(), 'the dialog, for the session asked').toBe(true)
+    expect(w.find('[data-testid="hive-purge-explain"]').text()).toContain('"Fix the kubelet"')
+    expect(hoisted.push, 'the row is not opened').not.toHaveBeenCalled()
     w.unmount()
   })
 })
