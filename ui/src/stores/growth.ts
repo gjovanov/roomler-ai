@@ -707,6 +707,114 @@ export interface AlertEvaluation {
   mailed: number
 }
 
+// ── P9a: remote-desktop quality ────────────────────────────────────────
+// Wire shapes mirror crates/api/src/growth/quality.rs. Everything here is
+// read from `growth_quality_daily`, frozen nightly per day and agent version
+// from what the server already records (FR-22's time to first frame lives
+// 7 days in agent_logs — the freeze is what keeps it). An absent part is
+// "not measured", never 0; a pooled percentile with `exact: false` is an
+// estimate from the daily histograms and is labelled `≈`.
+
+/** Several days' distributions read as one window. */
+export interface Pooled {
+  n: number
+  p50?: number
+  p90?: number
+  /** One day's exact values, or an estimate from the summed histograms. */
+  exact: boolean
+  parts: number
+}
+
+export interface EndReasonCount {
+  reached_active: boolean
+  /** The stored `end_reason`; `open` for a session still running at the freeze. */
+  reason: string
+  count: number
+}
+
+export interface SessionWindow {
+  requested: number
+  reached_active: number
+  not_reached: number
+  pending: number
+  /** `reached_active / requested`, only from n = 30. */
+  reached_share?: number
+  by_end_reason: EndReasonCount[]
+  duration_ms: Pooled
+  peak_fps: Pooled
+  avg_rtt_ms: Pooled
+  days: number
+}
+
+export interface TtffWindow {
+  n: number
+  p50_ms?: number
+  p90_ms?: number
+  exact: boolean
+  days_measured: number
+  hidden: number
+  later_attempts: number
+  outcomes: Record<string, number>
+}
+
+export interface VersionQuality {
+  /** A release, `unknown`, or `*` for every version. */
+  agent_version: string
+  sessions?: SessionWindow
+  ttff?: TtffWindow
+  crashes?: number
+  device_days?: number
+  /** Only from 30 device-days. */
+  crashes_per_100_device_days?: number
+  days: number
+}
+
+export interface DayQuality {
+  day: string
+  requested?: number
+  reached_active?: number
+  not_reached?: number
+  pending?: number
+  duration_p50_ms?: number
+  ttff_n?: number
+  ttff_p50_ms?: number
+  ttff_p90_ms?: number
+  crashes?: number
+  device_days?: number
+}
+
+export interface QualityReport {
+  enabled: boolean
+  since: string
+  until: string
+  include_internal: boolean
+  excluded: ExcludedCounts
+  n_floor: number
+  days: number
+  frozen_days: number
+  ttff_horizon_days: number
+  not_measured?: NotMeasured
+  totals?: VersionQuality
+  by_agent_version: VersionQuality[]
+  series: DayQuality[]
+}
+
+/** `820 ms` · `2.7 s` · `12.3 min` · `1.5 h`; `—` for nothing. */
+export function msLabel(ms: number | null | undefined): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) return '—'
+  if (ms < 1000) return `${Math.round(ms)} ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`
+  if (ms < 3_600_000) return `${(ms / 60_000).toFixed(1)} min`
+  return `${(ms / 3_600_000).toFixed(1)} h`
+}
+
+/** `p50 2.7 s · p90 6.1 s (n 94)`, `≈ ` when estimated across days; `no sample` at n 0. */
+export function pooledLabel(p: Pooled, unit: (v: number) => string = msLabel): string {
+  if (p.n === 0) return 'no sample'
+  const one = (v: number | undefined) => (typeof v === 'number' ? unit(v) : '—')
+  return `${p.exact ? '' : '≈ '}p50 ${one(p.p50)} · p90 ${one(p.p90)} (n ${p.n})`
+}
+
 /** `12 (prev 9 · 4w avg 5.0)` — the week against its baselines. */
 export function weekFigureLabel(f: WeekFigure): string {
   const base = `${f.week} (prev ${f.prev_week}`
@@ -1096,6 +1204,18 @@ export const useGrowthStore = defineStore('growth', () => {
     return api.post<AlertEvaluation>(`/admin/growth/alerts/evaluate${q}`)
   }
 
+  /** P9a — remote-desktop quality over a closed range of frozen days (`YYYY-MM-DD`, inclusive). */
+  async function fetchQuality(
+    opts: { since?: string; until?: string; includeInternal?: boolean } = {},
+  ): Promise<QualityReport> {
+    const q = new URLSearchParams()
+    if (opts.since) q.set('since', opts.since)
+    if (opts.until) q.set('until', opts.until)
+    if (opts.includeInternal) q.set('include_internal', 'true')
+    const qs = q.toString()
+    return api.get<QualityReport>(`/admin/growth/quality${qs ? `?${qs}` : ''}`)
+  }
+
   return {
     digests,
     error,
@@ -1119,5 +1239,6 @@ export const useGrowthStore = defineStore('growth', () => {
     runWeekly,
     fetchAlerts,
     evaluateAlerts,
+    fetchQuality,
   }
 })

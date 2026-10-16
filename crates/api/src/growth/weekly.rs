@@ -62,6 +62,7 @@ use super::{
     funnel::{self, Dimension, FunnelReport},
     mounted,
     newsletter::{self, NewsletterReport},
+    quality::{self, QualityReport},
     read_key::GrowthAuth,
 };
 use crate::{error::ApiError, state::AppState};
@@ -225,6 +226,10 @@ pub struct WeeklySections {
     pub newsletter: NewsletterReport,
     /// Fired or cleared in the week, and open at the compute.
     pub alerts: Measured<AlertsSection>,
+    /// P9a — remote-desktop quality over the week's frozen days: sessions
+    /// by outcome, time to first frame, crashes per 100 device-days, by
+    /// agent version. The Quality view's own report for Mon–Sun.
+    pub quality: QualityReport,
 }
 
 // ── Computing ────────────────────────────────────────────────────────────
@@ -433,6 +438,7 @@ pub async fn compute(
             "alerts are off on this server (ROOMLER__GROWTH__ALERTS)",
         ))
     };
+    let quality = quality::compute(state, set, monday, sunday, include_internal, now).await?;
     Ok(WeeklySections {
         headline,
         funnel,
@@ -441,6 +447,7 @@ pub async fn compute(
         channels,
         newsletter,
         alerts,
+        quality,
     })
 }
 

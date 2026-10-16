@@ -8,8 +8,11 @@ the setup wizard's opt-in diagnostics (P3b), the
 web plane — the purestat puller and the Campaigns table (P6) — social reach: the ingest
 routes the promotion pipeline pushes to, and the Channels table (P8) — the newsletter's
 delivery side: SendGrid's signed Event Webhook, the per-issue link tags and unsubscribes, and
-the per-issue table (P5) — and revenue: what Stripe billed, billed MRR month by month,
-upgrade intent from plan-limit collisions, and margin against the cost to serve (P4).
+the per-issue table (P5) — revenue: what Stripe billed, billed MRR month by month,
+upgrade intent from plan-limit collisions, and margin against the cost to serve (P4) — the read
+key, the weekly roll-up and the alert rules (P10) — and remote-desktop quality from what is already
+recorded: sessions by outcome, the time to first frame frozen before its logs expire, crashes per
+100 device-days, by agent version (P9a).
 Spec: [`docs/fr/FR-102-growth-observability.md`](fr/FR-102-growth-observability.md) (#2127). It
 also places the existing `/observability` page, which no doc described before.
 
@@ -121,7 +124,7 @@ this server, not reachable, or not built yet is `{"not_measured": "<reason>",
 | `campaigns` | per `(source, medium, campaign)`: visitors, pageviews, the four goals (`signup`, `subscribe`, `install-copy`, `github-outbound`), joined in code with the server's own sign-ups by the same normalised key | purestat + `users` | with a key |
 | `newsletter` | new, confirmed and unsubscribed subscribers (and how many left through an issue's link), by source; each issue sent that day with its ledger counts, its delivery so far and its unsubscribes; the window's delivered, bounced, dropped, spam reports and suppressed addresses — [the newsletter](#the-newsletter-delivery-per-issue-tags-and-unsubscribes-p5) | `subscribers`, `newsletter_issues`, `newsletter_sends` | P1d; delivery P5 (`not_measured` without the webhook key) |
 | `revenue` | orgs by plan × subscription status; the list-price MRR, **labelled `estimate: true`** (the same formula as the cost view, `routes/cost.rs::mrr_estimate_cents`) | `tenants`, `tenant_members` | P1d; billed P4 |
-| `quality` | sessions ended by `end_reason`, classed hang-up · refusal · failure; agent crashes by version | `remote_sessions`, `agent_crashes` | P1d |
+| `quality` | sessions **requested** → reached Active / never reached it (a share from n = 30), the ended ones by `end_reason` classed hang-up · refusal · failure; duration, peak frame rate and RTT as `{n, p50, p90}` per window; FR-22's **time to first frame** p50/p90 — the day exact, 7d/28d estimated from the frozen daily histograms, `not_measured` until the day is frozen; agent crashes by the version the payload named, device-days and crashes per 100 device-days (from 30); the day **by agent version** — [remote-desktop quality](#remote-desktop-quality-from-what-is-recorded-p9a) | `remote_sessions`, `agent_crashes`, `stats_machine_1d`, `growth_quality_daily` | P1d; TTFF, rates and versions P9a |
 | `install` | tokens issued → redeemed; fetches by `(asset, client class, OS)`; enrollments by `(method, OS)`; the wizard's steps — runs reaching each, their outcomes and the failures by code, **opted-in runs only, labelled with their n** — [the install trace](#the-install-trace-p3), [the wizard's diagnostics](#the-wizards-opt-in-diagnostics-p3b) | `enroll_token_issued`, `growth_daily`, `agents.install`, `setup_diagnostics` | P3; wizard steps P3b (`not_measured` while `growth.setup_diagnostics` is off) |
 | `social` | posts published per platform `{day, d7, d28}`; the snapshots taken that day (at most 20), each with its post's campaign and the platform's own metric names — `not_measured` when nothing was pushed in 28 days | `growth_posts`, `growth_post_snapshots` | P8 |
 | `search` | — | — | P7 |
@@ -1367,6 +1370,129 @@ configured, not mounted or not yet pulled — holds nothing, which clears any op
 | POST | `/api/admin/growth/alerts/evaluate?dry_run=` | session | evaluate every rule now |
 | GET/POST/DELETE | `/api/admin/growth/keys` · `/keys/{key_id}` · GET/PUT `/exclusions` | session **only** | the admin surface — a read key meets the empty 404 here, GET included |
 
+## Remote-desktop quality from what is recorded (P9a)
+
+Per UTC day and per agent version: the sessions that reached Active against those that did
+not, by `end_reason`; the duration, peak frame rate and RTT distributions; FR-22's time to
+first frame as p50/p90; and crashes per 100 device-days (spec §3f). **Server only** — no
+remote-control code path changed; every number is read from rows the product already writes
+([`crates/api/src/growth/quality.rs`](../crates/api/src/growth/quality.rs),
+[`crates/services/src/dao/growth_quality.rs`](../crates/services/src/dao/growth_quality.rs)).
+
+**Why a freeze.** Three of the four sources expire. `agent_logs` — where the browser's
+`rc.connect` record carries `ttff_ms` (FR-22 part 4, [remote-control.md §12.1.5](remote-control.md))
+and where an agent's own batches say which version it ran — live **7 days**; `agent_crashes` 90;
+`stats_machine_1d` 730. Only `remote_sessions` is kept. Once the logs are gone the day's time to
+first frame is gone with them, so a nightly job writes it down first.
+
+```mermaid
+flowchart LR
+  subgraph src["Sources, while they live"]
+    RS["remote_sessions<br/>created_at · started_at · ended_at ·<br/>end_reason · stats (kept)"]
+    AL["agent_logs (7 d)<br/>browser rc.connect records: ttff_ms, hidden, attempt<br/>agent batches: agent_version per session / day"]
+    AC["agent_crashes (90 d)<br/>agentVersion"]
+    SM["stats_machine_1d (730 d)<br/>online_minutes per device-day"]
+  end
+  X["ExclusionSet::load"] --> J
+  src --> J["nightly freeze — under the org-day fold's claim<br/>last 3 closed days, both scopes<br/>(first run: the last 28)"]
+  J -->|"replace-then-prune per (day, scope)"| Q[("growth_quality_daily<br/>_id = day:scope:agent_version<br/>no TTL")]
+  Q --> V["GET /api/admin/growth/quality<br/>the Quality tab"]
+  Q --> D["daily digest: quality.ttff,<br/>quality.by_agent_version"]
+  Q --> W["weekly roll-up: quality"]
+  RS -. "live: outcomes, duration, fps, RTT" .-> D
+  AC -. "live: crashes by agentVersion" .-> D
+  SM -. "live: device-days" .-> D
+```
+
+### The rules
+
+| Rule | As built |
+|---|---|
+| **Which day a session belongs to** | the day it was **requested** (`created_at`). It *reached Active* when `started_at` is set (ended or still running); it *never reached Active* when it ended without one — a refusal (`user_denied`, `consent_timeout`, `no_prompt_surface`), a connect failure (`error`, `agent_disconnect`) or a controller that gave up waiting (`controller_hangup` before Active); it is *pending* when the freeze saw it neither started nor ended. `by_end_reason` keeps the two apart (`reached_active: true/false`); a session not ended reads `open` (`quality::session_quality`) |
+| **Duration, frame rate, RTT** | Active sessions that ended: `ended_at − started_at`; `stats.peak_fps` and `stats.avg_rtt_ms` of the Active sessions whose device reported one above 0 (`stats` is `$max`-merged live by the device's samples, so a session that never reached Active has none) |
+| **Time to first frame** | the `ttff_ms` of `first_frame` records from a **foreground tab** (`hidden: false`), on a **first attempt** (`attempt: 1`, `after_drop: false`) — FR-22's own mining filter. A hidden tab's paint timing is invalid by the standing rule and a retry measures the retry, so both are counted as *set aside* (`hidden`, `later_attempts`), and every foreground record is counted by `outcome` (`first_frame` · `abandoned` · `closed` · `retried`). A record filed under one org's page for another org's device (FR-52, `agent_org_id`) follows both exclusions (`quality::ttff_quality`) |
+| **When TTFF is measured** | only while **every** record of the day still exists: `day_start + 7 d > now` (`quality::logs_complete`). A day whose first rows have started to expire would give a sample biased to its late hours, so it is frozen **without** TTFF — not measured, never 0. At the nightly tick that is yesterday and the two days before; a first fill or a backfill measures the last six closed days and no more |
+| **Which version a device ran** | the device's own log batches carrying the session's id, then its batches of that day (the newest when it updated mid-day), then the device row's current `agent_version`, else `unknown` (`VersionIndex::resolve`). A crash names its own version in its payload. A device-day's version is the day's logs, else the row |
+| **Scopes** | both are frozen: `external` with the exclusion set applied (every default view), `all` with nothing excluded (`include_internal=true`) — a different row, not a different code path. The set is the one **at the freeze**; the three-day recompute and the backfill route re-freeze with the current set while the sources still hold the day |
+| **Percentiles** | nearest-rank, exact per day; a `Dist` also carries a histogram over fixed edges (TTFF 250 ms … 32 s, duration 10 s … 8 h, fps 5 … 120, RTT 10 … 1000 ms), so a window is **pooled** from several days' rows — interpolated inside the bucket the rank falls in, the top bucket answering its lower edge — and says it is an estimate (`exact: false`, rendered `≈`). One day's window is exact |
+| **n floor** | a share (reached Active ÷ requested) and a rate (crashes × 100 ÷ device-days) appear only from 30 (spec principle 5) |
+
+⚠️ **The crash payload is camelCase in the row.** `AgentCrashPayload` is
+`rename_all = "camelCase"` and flattened into the record, so a production crash carries
+`agentVersion`, not `agent_version`. P1d's digest read the latter and reported every crash as
+`unknown`; its integration test had seeded the snake-case spelling and passed. P9a reads
+`agentVersion` first (`agent_version` second, for a row written by hand) and the test seeds the
+shape `AgentCrashDao::record` writes.
+
+### The row — `growth_quality_daily`
+
+`_id = "{day}:{scope}:{agent_version}"`, one per `(day, scope, agent_version)` plus the row
+`agent_version: "*"` that sums every version:
+
+| Part | Holds | `None` when |
+|---|---|---|
+| `sessions` | `requested`, `reached_active`, `not_reached`, `pending`, `by_end_reason [{reached_active, reason, count}]`, `duration_ms` / `peak_fps` / `avg_rtt_ms` as `Dist {n, p50, p90, edges, hist}` | the `remote` module is not mounted |
+| `ttff` | `dist` (ms), `hidden`, `later_attempts`, `outcomes {first_frame, abandoned, closed, retried}` | `fleet` not mounted, or the day's logs had started to expire |
+| `crashes` | crash reports received that day (`reported_at`) by the version the payload named | `fleet` not mounted |
+| `device_days` | devices with `online_minutes > 0` that day | `fleet` not mounted |
+
+Replace-then-prune per `(day, scope)`, so a reader never meets an empty day; a version that no
+longer appears on a recompute loses its row. **No TTL** — counts and percentiles about the
+product, no org, no device, no person (spec §3p). Index `(scope, day)`. The first scheduled run
+on an empty collection fills the last 28 closed days (sessions and crashes exact for all of
+them, TTFF and the log-based version for the six the logs still cover), then every run
+re-freezes the last three closed days — a session open at midnight, a late crash report, an
+exclusion added.
+
+### Where it shows
+
+| Method | Path | Credential | Purpose |
+|---|---|---|---|
+| GET | `/api/admin/growth/quality?since&until&include_internal` | session or read key | a closed range of frozen days (default the last 28; an open `until` clamped to yesterday; at most 400 days): `totals` (every version pooled), `by_agent_version` (newest release first, `unknown` last), `series` (one compact row per frozen day), `frozen_days` of `days`, `ttff_horizon_days`; `not_measured` with the reason when nothing is frozen |
+| POST | `/api/admin/growth/quality/backfill?since=YYYY-MM-DD&until=` | session | re-freeze a closed range, both scopes, with the current exclusion set; clamped to 730 days back and never today; TTFF comes back only for days the logs still cover |
+
+- **The Quality tab** on `/observability/growth`
+  ([`GrowthQuality.vue`](../ui/src/components/growth/GrowthQuality.vue)): the range, the
+  cards (requested · reached Active · never · TTFF p50 · crashes · per 100 device-days), the
+  per-day TTFF p50/p90 chart, the per-version table, how the sessions ended, the pooled
+  distributions and the day-by-day table. A pooled percentile is marked ≈; an absent part is a
+  "not measured" chip.
+- **The daily digest's `quality` section** adds, live from the kept rows: `requested`,
+  `reached_active`, `not_reached` and `reached_share`, `duration_ms` / `peak_fps` /
+  `avg_rtt_ms` as `{day, d7, d28}` of `{n, p50, p90}`, `device_days` and
+  `per_100_device_days`; and from the frozen rows: `ttff` (`n`, `days_measured`, `p50_ms` /
+  `p90_ms` per window, `windows_estimated: true`, `hidden`, `later_attempts`) and
+  `by_agent_version` (the day: requested · active · never · failures · TTFF · crashes ·
+  device-days). Both read "not frozen yet" until the nightly freeze has run for the day, and
+  a digest stored before P9a reads them as "arrives with P9a". The mail renders the same.
+- **The weekly roll-up's `quality` section** is the view's own report for Monday–Sunday.
+
+### Field verification (owed after the promote)
+
+For one closed day, by hand from `mongodb-0`, read-only, exclusions as the digest's footer counts
+them — the frozen `*` row (`growth_quality_daily`, scope `external`) and the Quality tab must equal:
+
+```js
+// Sessions requested that day, by outcome (D = the day's 00:00Z, E = the next):
+db.remote_sessions.aggregate([
+  { $match: { created_at: { $gte: D, $lt: E }, tenant_id: { $nin: EXCLUDED } } },
+  { $group: { _id: { active: { $ne: ['$started_at', null] }, reason: { $ifNull: ['$end_reason', 'open'] } }, n: { $sum: 1 } } } ])
+// TTFF the FR-22 way (MongoDB ≥ 7): foreground, first attempt, no drop, that day:
+db.agent_logs.aggregate([
+  { $match: { source: 'browser', 'lines.target': 'rc.connect', created_at: { $gte: D, $lt: E }, tenant_id: { $nin: EXCLUDED } } },
+  { $unwind: '$lines' },
+  { $match: { 'lines.fields.outcome': 'first_frame', 'lines.fields.hidden': false, 'lines.fields.attempt': 1, 'lines.fields.after_drop': false } },
+  { $group: { _id: null, n: { $sum: 1 }, p: { $percentile: { input: '$lines.fields.ttff_ms', p: [0.5, 0.9], method: 'approximate' } } } } ])
+// Crashes by the payload's version, and device-days:
+db.agent_crashes.aggregate([{ $match: { reported_at: { $gte: D, $lt: E }, tenant_id: { $nin: EXCLUDED } } }, { $group: { _id: '$agentVersion', n: { $sum: 1 } } }])
+db.stats_machine_1d.countDocuments({ ts: { $gte: D, $lt: E }, online_minutes: { $gt: 0 }, tenant_id: { $nin: EXCLUDED } })
+```
+
+`$percentile` is approximate, the freeze's nearest-rank exact: for a day with a few hundred
+records the two agree to the sample; for a tiny day read the sorted `ttff_ms` list instead.
+Fail-first: on the build before P9a the collection does not exist and the digest's `quality`
+has no `ttff`; the digest's `crashes.by_agent_version` reads `unknown` for every crash.
+
 ## The `/observability` page as a whole
 
 | Tab / surface | What it shows | Route family |
@@ -1376,7 +1502,7 @@ configured, not mounted or not yet pulled — holds nothing, which clears any op
 | Orgs, machines, calls, users | platform-wide inventories and series | `/api/admin/stats/{orgs,machines,calls,users}` |
 | Usage | per-user minutes and bytes across every org | `/api/admin/stats/usage*` |
 | Attribution (FR-88) | sign-ups by campaign key and how many activated | `/api/admin/stats/attribution` |
-| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), the Channels table with the machine keys (P8, P10), the Newsletter tab (P5), the Revenue tab (P4), the Weekly tab and the Alerts panel (P10) | `/api/admin/growth/*` |
+| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), the Channels table with the machine keys (P8, P10), the Newsletter tab (P5), the Revenue tab (P4), the Quality tab (P9a), the Weekly tab and the Alerts panel (P10) | `/api/admin/growth/*` |
 
 ## Field verification
 
@@ -1394,6 +1520,7 @@ FR's field-verification log ([FR-102 §8](fr/FR-102-growth-observability.md#8-fi
 | The read key returns, for one closed range, the same JSON a platform admin's session gets on every GET view, and the empty 404 on every write, on `GET …/keys` and after its revocation (AC20) | owed after the promote, with a minted read key | `crates/tests/src/growth_p10_tests.rs` — every GET view compared body for body, every write, the admin surface, an ingest key, a malformed, an unknown and a revoked key, the kill switch |
 | The weekly roll-up is stored and mailed once for the first Monday after `ROOMLER__GROWTH__WEEKLY_ENABLED=true`, with both pods running, and its headline sign-ups equal a hand count for the week | owed | `crates/tests/src/growth_p10_tests.rs` — two concurrent runs → one mail; a `sent` week never re-sent; a preview never cancels the scheduled mail; a manual send racing the scheduler mails once; the routes |
 | An alert fires once, mails once and clears: `digest_missing` on a day the digest is held back (red), cleared once it runs (green), with `ROOMLER__GROWTH__ALERTS=true` | owed | `crates/tests/src/growth_p10_tests.rs` — each evaluable rule fires once, a second evaluation adds nothing, the clear, a re-fire the same day mails nothing, the digest's `alerts` section |
+| For a closed day, the frozen `*` row and the Quality tab equal the hand counts of [remote-desktop quality](#field-verification-owed-after-the-promote): sessions requested by outcome from `remote_sessions`, TTFF p50/p90 from the FR-22 filter over `agent_logs`, crashes by `agentVersion`, device-days from `stats_machine_1d`; the digest's `crashes.by_agent_version` names real versions where it read `unknown` before (P9a) | owed after the promote | `crates/tests/src/growth_quality_tests.rs` — the freeze from the four sources as they are really written (the camelCase crash payload, the browser record, the agents' batches), the version from the logs before the row, both scopes, idempotency, a day past the log horizon frozen without TTFF; the view, the backfill, the digest's and the weekly's sections |
 
 The newsletter's webhook is to be shown on production to refuse a bad signature (control),
 and to record `delivered` and `bounce` for a test send with one forced bounce, the bounced

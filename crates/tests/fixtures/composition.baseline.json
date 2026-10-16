@@ -81,6 +81,14 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/admin/growth/quality",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/admin/growth/quality/backfill",
+      "methods": "POST"
+    },
+    {
       "path": "/api/admin/growth/revenue",
       "methods": "GET,HEAD"
     },
@@ -1567,6 +1575,17 @@
           {
             "key": {
               "source": 1,
+              "day": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "growth_quality_daily",
+        "indexes": [
+          {
+            "key": {
+              "scope": 1,
               "day": 1
             }
           }
@@ -3461,6 +3480,17 @@
           {
             "key": {
               "source": 1,
+              "day": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "growth_quality_daily",
+        "indexes": [
+          {
+            "key": {
+              "scope": 1,
               "day": 1
             }
           }

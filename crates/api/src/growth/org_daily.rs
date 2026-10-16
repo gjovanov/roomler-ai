@@ -659,6 +659,15 @@ pub fn spawn_org_daily_loop(state: AppState) {
                         Ok(_) => {}
                         Err(e) => warn!(%e, "growth wizard step freeze failed"),
                     }
+                    // P9a — remote-desktop quality per day and agent version,
+                    // frozen while `agent_logs` still hold the day (7 days).
+                    match super::quality::freeze_scheduled(&state, now).await {
+                        Ok(r) => info!(
+                            since = %r.since, until = %r.until, rows = r.rows,
+                            "growth quality frozen"
+                        ),
+                        Err(e) => warn!(%e, "growth quality freeze failed"),
+                    }
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(LOOP_INTERVAL_SECS)).await;

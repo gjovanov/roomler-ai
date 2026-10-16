@@ -272,15 +272,21 @@ async fn insert_subscriber(
     insert(app, "subscribers", d).await;
 }
 
+/// An `agent_crashes` row as `AgentCrashDao::record` writes it: the record's
+/// own fields snake_case, the payload flattened **camelCase**
+/// (`AgentCrashPayload` is `rename_all = "camelCase"`). ⚠️ A seed in
+/// `agent_version` would pass a reader of that spelling while every
+/// production row says `agentVersion` — which is how P1d's "crashes by
+/// version" read `unknown` for every crash until P9a.
 async fn insert_crash(app: &TestApp, tenant: ObjectId, reported: DateTime, version: &str) {
     insert(
         app,
         "agent_crashes",
         doc! {
             "tenant_id": tenant, "agent_id": ObjectId::new(), "reported_at": reported,
-            "crashed_at_unix": reported.timestamp_millis() / 1000, "reason": "panic",
-            "summary": "boom", "log_tail": "", "agent_version": version, "os": "linux",
-            "hostname": "box", "pid": 1_i64,
+            "crashedAtUnix": reported.timestamp_millis() / 1000, "reason": "panic",
+            "summary": "boom", "logTail": "", "agentVersion": version, "os": "linux",
+            "hostname": "box", "pid": 1_i64, "suppressedSinceLast": 0_i64,
         },
     )
     .await;
@@ -705,6 +711,19 @@ async fn every_section_counts_the_seeded_day_exactly() {
     assert_eq!(
         j["quality"]["crashes"]["by_agent_version"],
         json!([{ "key": "0.4.130", "count": 1 }])
+    );
+    // P9a — the sessions requested (s1, s3, s5 that day; s2 the day
+    // before), the live distributions, and the frozen parts saying why
+    // they are not there (no freeze ran here).
+    assert_eq!(fig(&j["quality"]["remote"]["requested"]), (3, 4, 4));
+    assert_eq!(fig(&j["quality"]["remote"]["reached_active"]), (2, 3, 3));
+    assert_eq!(fig(&j["quality"]["remote"]["not_reached"]), (1, 1, 1));
+    assert_eq!(j["quality"]["remote"]["duration_ms"]["day"]["n"], 2);
+    assert_eq!(fig(&j["quality"]["crashes"]["device_days"]), (0, 0, 0));
+    assert!(
+        not_measured(&j["quality"]["ttff"]).is_some_and(|(r, _)| r.contains("not frozen yet")),
+        "{}",
+        j["quality"]["ttff"]
     );
 
     // P3 — the install trace. Tokens: issued in the window, minus X's; of

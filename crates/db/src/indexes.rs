@@ -526,6 +526,17 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
         ],
     ));
 
+    // P9a — remote-desktop quality per UTC day, scope and agent version,
+    // `_id = "{day}:{scope}:{version}"`, frozen nightly by the host: the one
+    // place FR-22's time to first frame survives the 7-day `agent_logs`
+    // TTL. Read per scope over a day range (the Quality view, the digest,
+    // the weekly roll-up). No TTL — aggregates about the product, no org
+    // and no person (spec §3o), like `growth_daily`.
+    sets.push(set(
+        "growth_quality_daily",
+        vec![index(bson::doc! { "scope": 1, "day": 1 })],
+    ));
+
     // Hourly rollups (90 d) and daily rollups (730 d). The rollup task
     // whole-bucket-replaces via $merge on _id, so these are also upserts.
     for (coll, ttl_days) in [
