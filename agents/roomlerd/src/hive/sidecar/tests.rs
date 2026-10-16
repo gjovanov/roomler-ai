@@ -689,6 +689,162 @@ async fn the_devices_workspace_travels_with_the_key_and_the_sessions_does_not() 
     }
 }
 
+/// FR-90 P2k-1 — a Claude subscription's token (`claude setup-token`) goes
+/// to the provider as a bearer token under the OAuth beta: the harness's own
+/// betas kept and the OAuth one added once, no `x-api-key`, and no
+/// workspace, the device's or the session's. A subscription has none.
+#[tokio::test]
+async fn a_subscription_token_goes_as_a_bearer_token_under_the_oauth_beta() {
+    const SUBSCRIPTION: &str = "sk-ant-oat01-device-subscription";
+    let p = provider().await;
+    let helper = format!("printf '{SUBSCRIPTION}\\n'");
+    let upstream = p.url.clone();
+    let mut r = rig_with(
+        true,
+        4,
+        move |cfg| {
+            cfg.api_key_helper = Some(helper);
+            cfg.api_workspace_id = Some("wrkspc_device".to_string());
+        },
+        move |sup| sup.with_sidecar(upstream, OFFLINE_GRACE),
+    );
+    std::fs::write(r.root.path().join("claude"), ENV_HARNESS).unwrap();
+    let (sid, base, token) = started(&mut r).await;
+    for betas in [
+        "claude-code-20250219",
+        "claude-code-20250219, oauth-2025-04-20",
+    ] {
+        p.go.notify_one();
+        let resp = tokio::time::timeout(
+            WAIT,
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .header("x-api-key", &token)
+                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", betas)
+                .header("anthropic-workspace-id", "wrkspc_session")
+                .body("{}")
+                .send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        drop(resp);
+    }
+    let seen = p.seen.lock().await.clone();
+    assert_eq!(seen.len(), 2);
+    for s in &seen {
+        assert_eq!(
+            s.headers.get("authorization").map(String::as_str),
+            Some(format!("Bearer {SUBSCRIPTION}").as_str()),
+            "a bearer token"
+        );
+        assert!(
+            !s.headers.contains_key("x-api-key"),
+            "no x-api-key beside it: {:?}",
+            s.headers
+        );
+        assert_eq!(
+            s.headers.get("anthropic-beta").map(String::as_str),
+            Some("claude-code-20250219,oauth-2025-04-20"),
+            "the harness's betas kept, the OAuth beta once"
+        );
+        assert!(
+            !s.headers.contains_key("anthropic-workspace-id"),
+            "no workspace, the device's or the session's: {:?}",
+            s.headers
+        );
+    }
+    r.sup.stop(sid, 1, "owner".into());
+}
+
+/// P2k-1 — each form of the device's credential, on its own.
+#[test]
+fn the_devices_credential_goes_on_in_the_form_it_takes() {
+    let headers_with = |pairs: &[(&'static str, &'static str)]| {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(*k, HeaderValue::from_static(v));
+        }
+        h
+    };
+    let get = |h: &HeaderMap, name: &str| h.get(name).map(|v| v.to_str().unwrap().to_string());
+    // An API key: `x-api-key`, the device's workspace over the session's,
+    // the betas untouched.
+    let mut h = headers_with(&[
+        ("anthropic-beta", "claude-code-20250219"),
+        ("anthropic-workspace-id", "wrkspc_session"),
+    ]);
+    assert!(put_credential(&mut h, "sk-ant-api03-key", Some("wrkspc_device")).is_ok());
+    assert_eq!(
+        get(&h, "x-api-key").as_deref(),
+        Some("sk-ant-api03-key"),
+        "an API key in x-api-key"
+    );
+    assert_eq!(
+        get(&h, "anthropic-workspace-id").as_deref(),
+        Some("wrkspc_device"),
+        "the device's workspace over the session's"
+    );
+    assert_eq!(
+        get(&h, "anthropic-beta").as_deref(),
+        Some("claude-code-20250219"),
+        "an API key's betas untouched"
+    );
+    assert_eq!(get(&h, "authorization"), None, "no bearer token for a key");
+
+    // A subscription's token: the betas of every line, in order, once each,
+    // and the OAuth one once.
+    let mut h = headers_with(&[
+        ("anthropic-beta", "a, b"),
+        ("anthropic-beta", "b,oauth-2025-04-20"),
+        ("anthropic-workspace-id", "wrkspc_session"),
+    ]);
+    assert!(put_credential(&mut h, "sk-ant-oat01-token", Some("wrkspc_device")).is_ok());
+    assert_eq!(
+        get(&h, "authorization").as_deref(),
+        Some("Bearer sk-ant-oat01-token"),
+        "a subscription's token as a bearer token"
+    );
+    assert_eq!(
+        h.get_all("anthropic-beta").iter().count(),
+        1,
+        "one beta header"
+    );
+    assert_eq!(
+        get(&h, "anthropic-beta").as_deref(),
+        Some("a,b,oauth-2025-04-20"),
+        "each beta once"
+    );
+    assert_eq!(
+        get(&h, "x-api-key"),
+        None,
+        "no x-api-key for a subscription"
+    );
+    assert_eq!(
+        get(&h, "anthropic-workspace-id"),
+        None,
+        "no workspace for a subscription"
+    );
+
+    // No betas asked for: the OAuth one alone.
+    let mut h = HeaderMap::new();
+    assert!(put_credential(&mut h, "sk-ant-oat01-token", None).is_ok());
+    assert_eq!(
+        get(&h, "anthropic-beta").as_deref(),
+        Some(OAUTH_BETA),
+        "the OAuth beta alone"
+    );
+
+    // A line no header can carry is no key, in either form.
+    for bad in ["sk-ant-api03-\u{7}", "sk-ant-oat01-\u{7}"] {
+        let refused = put_credential(&mut HeaderMap::new(), bad, None).unwrap_err();
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(refused.message.contains("not a key"), "{}", refused.message);
+    }
+}
+
 #[test]
 fn only_inference_and_token_counting_are_forwarded() {
     use hyper::Method;

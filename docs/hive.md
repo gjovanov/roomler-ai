@@ -237,7 +237,7 @@ Hive key appears in a serialised `DesiredConfig`. The user-facing reference is
 | `hive_roots` | empty, so nowhere | the folders sessions may run in, checked on the resolved path |
 | `hive_max_sessions` | 4 | sessions at once |
 | `hive_harness` | unset | Claude Code's path; unset, the default locations (§3) |
-| `hive_api_key_helper` | unset: no model access | the command the DAEMON runs to print the provider's key (§5) |
+| `hive_api_key_helper` | unset: no model access | the command the DAEMON runs to print the provider's credential: an API key, or a Claude subscription's token from `claude setup-token` (§5) |
 | `hive_api_workspace_id` | unset | sent as `anthropic-workspace-id`, for a key that is not scoped to a workspace |
 | `hive_update_wait_secs` | 1800 | how long an update waits for running turns; `0` never waits (§7) |
 | `hive_core_memory` | off | show the org's core memory to the sessions here ([`brain.md`](brain.md)) |
@@ -467,9 +467,10 @@ sequenceDiagram
 
 ## 5. The model sidecar
 
-The provider's key never enters a session. The daemon runs the device's
-`hive_api_key_helper` itself, as SYSTEM or root, and keeps what it prints. The
-harness gets a loopback base URL and a token that only this sidecar honours
+The provider's credential never enters a session. The daemon runs the device's
+`hive_api_key_helper` itself, as SYSTEM or root, and keeps what it prints: an API
+key, or since P2k-1 a Claude subscription's token. The harness gets a loopback base
+URL and a token that only this sidecar honours
 ([`sidecar.rs`](../agents/roomlerd/src/hive/sidecar.rs)).
 
 ```mermaid
@@ -477,25 +478,32 @@ flowchart LR
     H["Claude Code, as the account<br/>ANTHROPIC_BASE_URL = 127.0.0.1:port/s/session<br/>ANTHROPIC_API_KEY = this run's token"] -->|"x-api-key: the token"| SC
     subgraph D["roomlerd, SYSTEM or root"]
         SC["sidecar: this session's token?<br/>does it run here at that fence?<br/>offline for at most 120 s?"]
-        K["hive_api_key_helper prints the key<br/>cached 5 min, run again after a 401"]
+        K["hive_api_key_helper prints the credential<br/>cached 5 min, run again after a 401"]
     end
-    SC -->|"x-api-key: the device's key,<br/>the body and anthropic-* unchanged"| P["provider"]
+    SC -->|"the device's credential: an API key in x-api-key,<br/>or a subscription's bearer token under the OAuth beta;<br/>the body and the other anthropic-* unchanged"| P["provider"]
     P -->|"streamed back as it arrives"| SC
     K -.-> SC
 ```
 
 | Piece | Rule | Why | Where |
 |---|---|---|---|
-| the token | 256 random bits, bound to (session, fence), minted just before the harness starts and taken back if it does not; each run revokes exactly its own token | a run that ends as the same session starts again here cannot take the new run's | [`sidecar.rs:89`](../agents/roomlerd/src/hive/sidecar.rs#L89) |
-| the paths | exactly `POST /v1/messages` and `POST /v1/messages/count_tokens`; anything else is `404 not_found_error` | the device's key opens more than inference: the Files API holds every session's uploads under it, and a batch outlives its session and its fence | [`sidecar.rs:328`](../agents/roomlerd/src/hive/sidecar.rs#L328) |
-| the fence | a call is forwarded only while the session runs HERE at the token's fence | a stopped session, or a stale primary after a move, spends nothing | [`sidecar.rs:128`](../agents/roomlerd/src/hive/sidecar.rs#L128) `sidecar_admit` |
-| `offline_grace` | 120 s after the primary control connection closed, with no newer one in its place, calls are refused `503 overloaded_error`; they flow again on reconnect | a partitioned primary stalls instead of diverging. "Closed" is the agent's own verdict, so a half-open socket counts as up until `WS_RX_DEADLINE` (80 s) ends it, and the worst case is about 200 s | [`sidecar.rs:64`](../agents/roomlerd/src/hive/sidecar.rs#L64), the agent's [`signaling.rs:61`](../agents/roomlerd/src/signaling.rs#L61) |
-| the forward | the headers unchanged but for `x-api-key` and `authorization` (the device's key swapped in), the hop-by-hop ones, and `anthropic-workspace-id`, set from `hive_api_workspace_id` when that is configured; a body of at most 32 MiB; the answer streamed as it arrives, `retry-after` and the rate-limit headers intact; TLS through the OS trust store and the proxy environment | an SSE turn is never buffered, and a TLS-inspecting middlebox the machine trusts still works | [`sidecar.rs:380`](../agents/roomlerd/src/hive/sidecar.rs#L380) `handle` |
+| the token | 256 random bits, bound to (session, fence), minted just before the harness starts and taken back if it does not; each run revokes exactly its own token | a run that ends as the same session starts again here cannot take the new run's | [`sidecar.rs:94`](../agents/roomlerd/src/hive/sidecar.rs#L94) |
+| the paths | exactly `POST /v1/messages` and `POST /v1/messages/count_tokens`; anything else is `404 not_found_error` | the device's key opens more than inference: the Files API holds every session's uploads under it, and a batch outlives its session and its fence | [`sidecar.rs:333`](../agents/roomlerd/src/hive/sidecar.rs#L333) |
+| the fence | a call is forwarded only while the session runs HERE at the token's fence | a stopped session, or a stale primary after a move, spends nothing | [`sidecar.rs:133`](../agents/roomlerd/src/hive/sidecar.rs#L133) `sidecar_admit` |
+| `offline_grace` | 120 s after the primary control connection closed, with no newer one in its place, calls are refused `503 overloaded_error`; they flow again on reconnect | a partitioned primary stalls instead of diverging. "Closed" is the agent's own verdict, so a half-open socket counts as up until `WS_RX_DEADLINE` (80 s) ends it, and the worst case is about 200 s | [`sidecar.rs:69`](../agents/roomlerd/src/hive/sidecar.rs#L69), the agent's [`signaling.rs:61`](../agents/roomlerd/src/signaling.rs#L61) |
+| the forward | the headers unchanged but for `x-api-key` and `authorization` (the device's credential swapped in, below), the hop-by-hop ones, and `anthropic-workspace-id`; a body of at most 32 MiB; the answer streamed as it arrives, `retry-after` and the rate-limit headers intact; TLS through the OS trust store and the proxy environment | an SSE turn is never buffered, and a TLS-inspecting middlebox the machine trusts still works | [`sidecar.rs:449`](../agents/roomlerd/src/hive/sidecar.rs#L449) `handle` |
+| the credential | the first line the helper prints. One that begins `sk-ant-oat`, a Claude subscription's token as `claude setup-token` prints it, goes as `Authorization: Bearer`, with `oauth-2025-04-20` added once to the betas the harness asked for, and with no workspace, the device's or the session's. Any other is an API key, in `x-api-key`, with `hive_api_workspace_id`, when it is configured, in place of the session's workspace | the provider takes a subscription's token only as a bearer token under that beta, and a subscription has no workspace (P2k-1) | [`sidecar.rs:380`](../agents/roomlerd/src/hive/sidecar.rs#L380) `put_credential` |
+
+⚠️ **A subscription's token spends its owner's own usage.** Every session the device
+runs, whoever started it, is a call against the limits of the person whose
+subscription it is, and that person's own Claude Code shares them: a 429 at the
+weekly limit stops the device's sessions too. An organization's sessions belong on
+an API key; a subscription suits a person's own devices.
 
 The helper runs through `/bin/sh -c` on Unix and `cmd.exe /d /s /c "<helper>"`, by
 its full path, on Windows, within 10 s. The first line it prints is the key, and
 neither its output nor its errors' output is logged
-([`sidecar.rs:218`](../agents/roomlerd/src/hive/sidecar.rs#L218)). With no helper a
+([`sidecar.rs:223`](../agents/roomlerd/src/hive/sidecar.rs#L223)). With no helper a
 session has no model access: its own config directory holds no login of its own.
 
 ---
@@ -2171,7 +2179,7 @@ sequenceDiagram
 |---|---|---|
 | A start at an older fence than the run here is refused, and so is one at the fence of a run a newer fence took | a stale frame: the server's word only grows | [`supervisor.rs:1868`](../agents/roomlerd/src/hive/supervisor.rs#L1868) |
 | A start at a newer fence fences the run here out and stops it before any other gate, and launches only once that run's task has let go: at most 15 s, then it is refused | two harnesses never run on one history (§3d); whatever the gates say, the server has moved past that run | [`supervisor.rs:2971`](../agents/roomlerd/src/hive/supervisor.rs#L2971), [`supervisor.rs:159`](../agents/roomlerd/src/hive/supervisor.rs#L159), [`supervisor.rs:4130`](../agents/roomlerd/src/hive/supervisor.rs#L4130) |
-| A fenced run's model calls, prompts and approval answers are refused from that moment, before its harness has gone | the sidecar's gate is the run's fence ([`sidecar.rs:143`](../agents/roomlerd/src/hive/sidecar.rs#L143)): a run being stopped must not spend | [`supervisor.rs:2945`](../agents/roomlerd/src/hive/supervisor.rs#L2945), [`supervisor.rs:2638`](../agents/roomlerd/src/hive/supervisor.rs#L2638), [`supervisor.rs:2681`](../agents/roomlerd/src/hive/supervisor.rs#L2681), [`supervisor.rs:3664`](../agents/roomlerd/src/hive/supervisor.rs#L3664) |
+| A fenced run's model calls, prompts and approval answers are refused from that moment, before its harness has gone | the sidecar's gate is the run's fence ([`sidecar.rs:148`](../agents/roomlerd/src/hive/sidecar.rs#L148)): a run being stopped must not spend | [`supervisor.rs:2945`](../agents/roomlerd/src/hive/supervisor.rs#L2945), [`supervisor.rs:2638`](../agents/roomlerd/src/hive/supervisor.rs#L2638), [`supervisor.rs:2681`](../agents/roomlerd/src/hive/supervisor.rs#L2681), [`supervisor.rs:3664`](../agents/roomlerd/src/hive/supervisor.rs#L3664) |
 | A run's end removes its live entry and its hosted record only at its own fence, and a run writes its hosted record only at its own fence | an old run's end would take the new run's entry, and with it its model access (§3d ⚠️) | [`supervisor.rs:3860`](../agents/roomlerd/src/hive/supervisor.rs#L3860), [`supervisor.rs:3441`](../agents/roomlerd/src/hive/supervisor.rs#L3441), [`supervisor.rs:3453`](../agents/roomlerd/src/hive/supervisor.rs#L3453), [`hosted.rs:215`](../agents/roomlerd/src/hive/hosted.rs#L215), [`hosted.rs:243`](../agents/roomlerd/src/hive/hosted.rs#L243) |
 | `rc:hive.demote {session, fence}` raises the store's floor to that fence first, then fences out and stops a run at an older fence and forgets its hosted record. A run at that fence or a newer one is left alone | the run's late writes are refused on this device as on every member; no restart resumes it; a session that came back is not the demote's | [`supervisor.rs:2908`](../agents/roomlerd/src/hive/supervisor.rs#L2908), [`supervisor.rs:1402`](../agents/roomlerd/src/hive/supervisor.rs#L1402) |
 | A resume reads the hosted record again under the start lock | a demote or a stop that came while it waited for the lock wins | [`supervisor.rs:3318`](../agents/roomlerd/src/hive/supervisor.rs#L3318) |
@@ -2230,7 +2238,7 @@ sequenceDiagram
 | The word goes on the connection whose manifest it answers and on no other. The report loop holds that connection weakly, and the word is sent on its own sender | a word counts only on its own connection: should a newer connection take the slot meanwhile, the word does not move to it | [`hub.rs:2641`](../crates/modules/fleet/src/hub.rs#L2641), [`agent_socket.rs:435`](../crates/modules/hive/src/agent_socket.rs#L435), [`lease.rs:30`](../crates/modules/hive/src/lease.rs#L30) |
 | A session that gains its first member while it runs is leased from then on: the word goes at once, beside its join | its device then holds it to the word from its next connection, not from the one after | [`placement.rs:579`](../crates/modules/hive/src/placement.rs#L579) |
 | The device keeps a word only when it came on the latest connection, and only for a session it runs or hosts. A newer fence's word voids an older one's, and the first word for a running session leases it, in `hosted.json` too | a word that comes late on an older connection must never take the latest one's place, and a server cannot fill the device with words | [`supervisor.rs:3063`](../agents/roomlerd/src/hive/supervisor.rs#L3063), [`supervisor.rs:2994`](../agents/roomlerd/src/hive/supervisor.rs#L2994) |
-| A leased run's model call waits for the word on the latest connection, at most 30 s, then is refused in the provider's "overloaded" shape, which Claude Code retries | after a reconnect, the server may have moved the session while the device could not hear | [`sidecar.rs:175`](../agents/roomlerd/src/hive/sidecar.rs#L175), [`supervisor.rs:164`](../agents/roomlerd/src/hive/supervisor.rs#L164) |
+| A leased run's model call waits for the word on the latest connection, at most 30 s, then is refused in the provider's "overloaded" shape, which Claude Code retries | after a reconnect, the server may have moved the session while the device could not hear | [`sidecar.rs:180`](../agents/roomlerd/src/hive/sidecar.rs#L180), [`supervisor.rs:164`](../agents/roomlerd/src/hive/supervisor.rs#L164) |
 | After a restart, a leased hosted session is held back until the word, and listed in the manifest meanwhile. The word or a start at its fence launches it; a stop or a demote ends it | the resume launched before the server had said anything | [`supervisor.rs:3333`](../agents/roomlerd/src/hive/supervisor.rs#L3333), [`supervisor.rs:3246`](../agents/roomlerd/src/hive/supervisor.rs#L3246), [`supervisor.rs:2778`](../agents/roomlerd/src/hive/supervisor.rs#L2778) |
 
 ⚠️ **Offline, the word still counts.** While the device is offline, the latest connection is
@@ -2655,7 +2663,7 @@ have stopped its model calls:
 | Clock | Where | Time |
 |---|---|---|
 | the device notices its connection is gone: no frame received, and it closes it | `WS_RX_DEADLINE` ([`signaling.rs:61`](../agents/roomlerd/src/signaling.rs#L61)) | 80 s |
-| from that close, its sidecar keeps serving model calls ([`supervisor.rs:3744`](../agents/roomlerd/src/hive/supervisor.rs#L3744), `lost_connection`) | `OFFLINE_GRACE` ([`sidecar.rs:64`](../agents/roomlerd/src/hive/sidecar.rs#L64)) | 120 s |
+| from that close, its sidecar keeps serving model calls ([`supervisor.rs:3744`](../agents/roomlerd/src/hive/supervisor.rs#L3744), `lost_connection`) | `OFFLINE_GRACE` ([`sidecar.rs:69`](../agents/roomlerd/src/hive/sidecar.rs#L69)) | 120 s |
 | the server may have sent to it after it last recorded hearing from it: a heartbeat comes every 30 s, and a pod can die with no teardown | a margin | 30 s |
 | all of it: `promote_limits::UNREACHABLE_SECS` ([`hive.rs:1022`](../crates/remote_control/src/hive.rs#L1022)) | | **230 s** |
 
@@ -2720,7 +2728,7 @@ stateDiagram-v2
 
 ⚠️ **The 230 s is the device's own budget, held by a test.** A roomlerd test asserts
 `UNREACHABLE_SECS == WS_RX_DEADLINE + OFFLINE_GRACE + 30 s`
-([`sidecar/tests.rs:746`](../agents/roomlerd/src/hive/sidecar/tests.rs#L746)).
+([`sidecar/tests.rs:902`](../agents/roomlerd/src/hive/sidecar/tests.rs#L902)).
 Lengthen either clock on the device and the test fails before the server moves a session
 too soon.
 
