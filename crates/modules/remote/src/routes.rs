@@ -7,20 +7,24 @@
 
 use axum::{
     Json,
+    body::Bytes,
     extract::{Path, Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
 };
-use bson::oid::ObjectId;
+use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_mod_fleet::agent::fmt_dt;
 use roomler_ai_remote_control::{
-    models::{RemoteAuditEvent, RemoteSession},
+    models::{RemoteAuditEvent, RemoteSession, SessionFeedback, SessionFeedbackRequest},
     permissions::Permissions,
     signaling::IceServer,
     turn_creds::ice_servers_for,
 };
-use roomler_ai_services::dao::base::PaginationParams;
+use roomler_ai_services::dao::{base::PaginationParams, session_feedback::Recorded};
 use roomler_core::guards::require_permission;
 use serde::Serialize;
+use tracing::{info, warn};
 
 use roomler_core::{ApiError, extractors::auth::AuthUser};
 
@@ -171,6 +175,131 @@ pub async fn session_audit(
         per_page: page.per_page,
         total_pages: page.total_pages,
     }))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Session feedback (FR-102 P9b)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A refused rating: a stable code for the viewer's log, never the value
+/// that was refused.
+#[derive(Debug, Serialize)]
+struct Refusal {
+    error: &'static str,
+}
+
+fn refuse(status: StatusCode, error: &'static str) -> Response {
+    (status, Json(Refusal { error })).into_response()
+}
+
+/// What a stored rating answers: what was stored, nothing about the person.
+#[derive(Debug, Serialize)]
+pub struct SessionFeedbackResponse {
+    pub session_id: String,
+    pub rating: &'static str,
+    pub reasons: Vec<String>,
+    pub ts: String,
+}
+
+/// FR-102 P9b — `POST /api/tenant/{tenant_id}/session/{session_id}/feedback`:
+/// the viewer's post-session rating (spec §3f, D10) — `{rating: up|down,
+/// reasons: [codes]}` from a person who was in the session.
+///
+/// | Check | Answer |
+/// |---|---|
+/// | `growth.feedback = false` | the **empty 404** of a path that does not exist (the kill switch; the viewer never offers the prompt either) |
+/// | the caller not a member of the path's org | 403 `not_a_member` |
+/// | the session not in that org | 404 — resolved within the tenant, never by id alone |
+/// | the caller neither the session's controller nor a watcher | 403 |
+/// | posted sooner than 30 s after the session was requested | 409 `too_early` — the viewer never offers the prompt before that, so an earlier post did not come from it |
+/// | not JSON, an unknown key (a comment), a rating or a reason outside the vocabulary, too many reasons | 422 `invalid_json` · `unknown_rating` · `unknown_reason` · `too_many_reasons` — a code, never the value, nothing stored |
+/// | a body over 1 KiB | 413 |
+/// | this person already rated the session | 409 `already_rated` — the unique `(session_id, user_id)` index decides, so two posts by one person store one, while the controller and each watcher rate once each |
+/// | stored | 201 with what was stored |
+///
+/// `user_id` comes from the authenticated request and `agent_id` from the
+/// session row — never from the body.
+pub async fn session_feedback(
+    State(state): State<RemoteState>,
+    auth: AuthUser,
+    Path((tenant_id, session_id)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    if !state.core.settings.growth.feedback {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match feedback_inner(&state, auth, &tenant_id, &session_id, &body).await {
+        Ok(r) => r,
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn feedback_inner(
+    state: &RemoteState,
+    auth: AuthUser,
+    tenant_id: &str,
+    session_id: &str,
+    body: &Bytes,
+) -> Result<Response, ApiError> {
+    let tid = ObjectId::parse_str(tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let sid = ObjectId::parse_str(session_id)
+        .map_err(|_| ApiError::BadRequest("Invalid session_id".to_string()))?;
+    if !state.tenants.is_member(tid, auth.user_id).await? {
+        return Err(ApiError::NotAMember);
+    }
+    // Within the tenant: a foreign session is a 404 and leaks nothing.
+    let session = state.remote_sessions.find_in_tenant(tid, sid).await?;
+    let party =
+        session.controller_user_id == auth.user_id || session.watchers.contains(&auth.user_id);
+    if !party {
+        return Err(ApiError::Forbidden(
+            "Only a person who was in the session may rate it".to_string(),
+        ));
+    }
+    let now = DateTime::now();
+    let age_secs = (now.timestamp_millis() - session.created_at.timestamp_millis()) / 1000;
+    if age_secs < SessionFeedback::MIN_SESSION_SECS {
+        return Ok(refuse(StatusCode::CONFLICT, "too_early"));
+    }
+    let request: SessionFeedbackRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(_) => return Ok(refuse(StatusCode::UNPROCESSABLE_ENTITY, "invalid_json")),
+    };
+    let (rating, reasons) = match request.validate() {
+        Ok(v) => v,
+        Err(code) => return Ok(refuse(StatusCode::UNPROCESSABLE_ENTITY, code)),
+    };
+    let row = SessionFeedback {
+        id: None,
+        session_id: sid,
+        tenant_id: tid,
+        user_id: auth.user_id,
+        agent_id: session.agent_id,
+        rating,
+        reasons: reasons.clone(),
+        ts: now,
+    };
+    match state.session_feedback.record(&row).await {
+        Ok(Recorded::Stored(_)) => {
+            info!(session = %sid, rating = rating.as_str(), reasons = ?reasons, "session feedback stored");
+            Ok((
+                StatusCode::CREATED,
+                Json(SessionFeedbackResponse {
+                    session_id: sid.to_hex(),
+                    rating: rating.as_str(),
+                    reasons,
+                    ts: fmt_dt(now),
+                }),
+            )
+                .into_response())
+        }
+        Ok(Recorded::AlreadyRated) => Ok(refuse(StatusCode::CONFLICT, "already_rated")),
+        Err(e) => {
+            warn!(session = %sid, error = %e, "session feedback: write failed");
+            Ok(refuse(StatusCode::SERVICE_UNAVAILABLE, "unavailable"))
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────

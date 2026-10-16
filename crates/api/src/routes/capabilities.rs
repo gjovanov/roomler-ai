@@ -19,6 +19,12 @@
 //! module is extracted), so `modules` = `compiled` − `switched_off`. The field
 //! is named for what it is so no client mistakes it for "absent from the
 //! build" — a client that must tell the two apart reads `compiled`.
+//!
+//! `features` (FR-102 P9b) are server-wide switches a client must read
+//! before offering something — unlike a module, a feature is something the
+//! SPA fails **closed** on: `session_feedback` is the post-session rating,
+//! off by `ROOMLER__GROWTH__FEEDBACK=false`, and a viewer that has not read
+//! `true` never offers it.
 
 use axum::{Json, extract::State};
 use serde_json::{Value, json};
@@ -31,5 +37,9 @@ pub async fn get(State(state): State<AppState>) -> Json<Value> {
         "modules": state.modules.mounted(),
         "compiled": compose::EXTRACTED,
         "switched_off": state.settings.switched_off(),
+        "features": {
+            "session_feedback": state.settings.growth.feedback
+                && state.modules.mounted().contains(&"remote"),
+        },
     }))
 }

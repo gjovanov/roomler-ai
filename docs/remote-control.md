@@ -1317,6 +1317,21 @@ viewer will still ask.
 the bare `error`, which the viewer retries as before. An agent without it fails
 `create_answer`, as before.
 
+### 11.8 The post-session rating (FR-102 P9b)
+
+After a session of 30 s or more — measured in the viewer from its own request to the attempt's
+terminal phase, a reconnect inside the attempt being the same attempt — the ended state offers a
+thumbs up or down with optional reason chips (*lag*, *picture*, *mouse or keyboard*, *couldn't
+connect*, *something else*), at most once a UTC day per browser, dismissible, inline beside the
+Connect button, never a dialog, never focused, never a text field. Every gate fails toward not
+asking (`ui/src/composables/rcSessionRating.ts`), and the server (`remote`,
+`POST /api/tenant/{tid}/session/{sid}/feedback`) accepts one rating per session per party to
+it (the controller and each watcher once), not before 30 s after the request, codes only, and
+answers the empty 404 while
+`ROOMLER__GROWTH__FEEDBACK=false`. Nothing here touches the session's data path: the rating is a
+question asked after it. The rules, the row and the field plan:
+[growth-observability.md](growth-observability.md#the-post-session-rating-p9b).
+
 ## 12. Performance targets & budget
 
 | Stage | Target (LAN) | Target (WAN, RTT 30 ms) |

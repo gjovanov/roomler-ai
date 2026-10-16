@@ -52,6 +52,22 @@
         "title": "The person at the device ended the session.",
         "body": "They ended it from their screen (Disconnect, or their desktop's own Stop for screen sharing), so this viewer stays disconnected. Reconnect asks them again, as any new session does.",
         "reconnect": "Reconnect"
+      },
+      "rating": {
+        "question": "How was that session?",
+        "thumbsUp": "Good",
+        "thumbsDown": "Not good",
+        "dismiss": "Not now",
+        "hint": "Optional — what was off?",
+        "send": "Send",
+        "thanks": "Thanks — noted.",
+        "reasons": {
+          "lag": "Lag",
+          "picture": "Picture",
+          "input": "Mouse or keyboard",
+          "could_not_connect": "Couldn't connect",
+          "other": "Something else"
+        }
       }
     }
   },

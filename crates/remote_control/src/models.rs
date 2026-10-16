@@ -4635,6 +4635,119 @@ impl RemoteSession {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Session feedback (FR-102 P9b)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// FR-102 P9b — a thumb.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackRating {
+    Up,
+    Down,
+}
+
+impl FeedbackRating {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FeedbackRating::Up => "up",
+            FeedbackRating::Down => "down",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "up" => Some(FeedbackRating::Up),
+            "down" => Some(FeedbackRating::Down),
+            _ => None,
+        }
+    }
+}
+
+/// FR-102 P9b — the reason chips, the whole vocabulary (spec §3f). A reason
+/// outside it is refused, never stored: there is no free text in v1, because
+/// free text is where personal data hides.
+pub const FEEDBACK_REASONS: &[&str] = &["lag", "picture", "input", "could_not_connect", "other"];
+
+/// FR-102 P9b — what the viewer posts: the thumb and the chips. Every other
+/// key fails the parse (`deny_unknown_fields`), so a comment field cannot be
+/// smuggled in by a client that invents one.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionFeedbackRequest {
+    pub rating: String,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
+impl SessionFeedbackRequest {
+    /// The body limit on the route: a thumb and five short codes.
+    pub const MAX_BODY_BYTES: usize = 1024;
+
+    /// The rating and the reasons, deduplicated in vocabulary order; or the
+    /// refusal code.
+    pub fn validate(&self) -> Result<(FeedbackRating, Vec<String>), &'static str> {
+        let rating = FeedbackRating::parse(&self.rating).ok_or("unknown_rating")?;
+        if self.reasons.len() > FEEDBACK_REASONS.len() {
+            return Err("too_many_reasons");
+        }
+        if self
+            .reasons
+            .iter()
+            .any(|r| !FEEDBACK_REASONS.contains(&r.as_str()))
+        {
+            return Err("unknown_reason");
+        }
+        let reasons = FEEDBACK_REASONS
+            .iter()
+            .filter(|r| self.reasons.iter().any(|given| given == *r))
+            .map(|r| r.to_string())
+            .collect();
+        Ok((rating, reasons))
+    }
+}
+
+/// FR-102 P9b — one person's rating of one remote session, asked by the
+/// viewer after a session of 30 s or more (spec §3f, D10: "a thumbs rating
+/// after a session now; NPS later").
+///
+/// One per session **per person** (a unique index on `(session_id,
+/// user_id)` — a rating is one person's experience, and the controller and
+/// a watcher of one session may have had different ones), resolved within
+/// the tenant, posted only by a person who was in the session (its
+/// controller or a watcher). `reasons` are codes from [`FEEDBACK_REASONS`];
+/// there is no text field. Kept 25 months (the `remote` module's TTL on
+/// `ts`) and deleted with the user (`SessionFeedbackDao::purge_user`, the
+/// seam an account deletion calls). A self-hosted server keeps its own rows
+/// and sends none anywhere.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SessionFeedback {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub session_id: ObjectId,
+    pub tenant_id: ObjectId,
+    /// Who answered — from the authenticated request, never from the body.
+    pub user_id: ObjectId,
+    /// The session's device, denormalised from its row for a per-device
+    /// read; not a person.
+    pub agent_id: ObjectId,
+    pub rating: FeedbackRating,
+    pub reasons: Vec<String>,
+    /// Stamped by the SERVER.
+    pub ts: DateTime,
+}
+
+impl SessionFeedback {
+    pub const COLLECTION: &'static str = "session_feedback";
+    /// 25 months (spec §3p), kept in lockstep with the `remote` module's
+    /// index plan.
+    pub const TTL_SECONDS: u64 = 25 * 30 * 24 * 60 * 60;
+    /// A session shorter than this is never rated: the viewer never offers
+    /// the prompt before it, and the route refuses a rating posted earlier
+    /// than this after the session was requested.
+    pub const MIN_SESSION_SECS: i64 = 30;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Audit
 // ────────────────────────────────────────────────────────────────────────────
 

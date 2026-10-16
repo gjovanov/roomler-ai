@@ -27,16 +27,17 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::FromRef,
+    extract::{DefaultBodyLimit, FromRef},
     routing::{get, post},
 };
 use roomler_ai_config::Settings;
-use roomler_ai_db::indexes::{IndexSet, index, index_ttl};
+use roomler_ai_db::indexes::{IndexSet, index, index_ttl, index_unique};
 use roomler_ai_mod_fleet::FleetState;
+use roomler_ai_remote_control::models::{SessionFeedback, SessionFeedbackRequest};
 use roomler_ai_services::dao::{
     privacy_activity::PrivacyActivityDao, recording_activity::RecordingActivityDao,
     remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao,
-    transfer_activity::TransferActivityDao,
+    session_feedback::SessionFeedbackDao, transfer_activity::TransferActivityDao,
 };
 use roomler_core::{
     AgentSocketHooks, Capabilities, Core, Module, TenantCtx, rate_limit::RateLimiter,
@@ -68,6 +69,9 @@ pub struct RemoteState {
     /// down and why (the host's claims, beside the `PRIVACY` grant in
     /// `remote_audit`).
     pub privacy_activity: Arc<PrivacyActivityDao>,
+    /// FR-102 P9b — the ratings people give a session from the viewer: a
+    /// thumb and reason codes, one per session, never text.
+    pub session_feedback: Arc<SessionFeedbackDao>,
     /// FR-101 P4a — the per-(caller, device) ceiling on session requests,
     /// checked after the authz gate (`controller::SESSION_REQUESTS_PER_MINUTE`).
     pub session_request_limiter: Arc<RateLimiter>,
@@ -108,6 +112,7 @@ impl Module for RemoteState {
             recording_activity: Arc::new(RecordingActivityDao::new(db)),
             transfer_activity: Arc::new(TransferActivityDao::new(db)),
             privacy_activity: Arc::new(PrivacyActivityDao::new(db)),
+            session_feedback: Arc::new(SessionFeedbackDao::new(db)),
             session_request_limiter: Arc::new(RateLimiter::new()),
             rc_proxy_controllers: Arc::new(relay::ProxyControllers::new()),
             remote_rc_conns: Arc::new(relay::RemoteRcConns::new()),
@@ -145,7 +150,16 @@ impl Module for RemoteState {
         let session = Router::new()
             .route("/{session_id}", get(routes::get_session))
             .route("/{session_id}/terminate", post(routes::terminate_session))
-            .route("/{session_id}/audit", get(routes::session_audit));
+            .route("/{session_id}/audit", get(routes::session_audit))
+            // FR-102 P9b — the viewer's post-session rating: a thumb and
+            // reason codes from a person who was in the session; the empty
+            // 404 while `growth.feedback` is off.
+            .route(
+                "/{session_id}/feedback",
+                post(routes::session_feedback).layer(DefaultBodyLimit::max(
+                    SessionFeedbackRequest::MAX_BODY_BYTES,
+                )),
+            );
         // TURN credentials (user-scoped, no tenant prefix).
         let turn = Router::new().route("/credentials", get(routes::turn_credentials));
         // Multi-region relay PoP topology (user-scoped, read-only, no secrets).
@@ -224,6 +238,22 @@ impl Module for RemoteState {
                     index(bson::doc! { "tenant_id": 1, "agent_id": 1, "at": -1 }),
                     index(bson::doc! { "session_id": 1, "at": 1 }),
                     index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+                ],
+            },
+            // FR-102 P9b — one rating per session PER PERSON: a rating is one
+            // person's experience (the controller and a watcher of the same
+            // session may sit on different networks), so the unique index is
+            // `(session_id, user_id)` — the arbiter between two posts by one
+            // person, never between two people. Read per org over time by the
+            // digest, purged per user with the account; kept 25 months (§3p).
+            IndexSet {
+                collection: "session_feedback",
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index_unique(bson::doc! { "session_id": 1, "user_id": 1 }),
+                    index(bson::doc! { "tenant_id": 1, "ts": -1 }),
+                    index(bson::doc! { "user_id": 1 }),
+                    index_ttl(bson::doc! { "ts": 1 }, SessionFeedback::TTL_SECONDS),
                 ],
             },
             // FR-101 P3 — clipboard and file traffic the devices report (a

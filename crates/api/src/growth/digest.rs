@@ -971,6 +971,30 @@ fn quality_before_p9a<T>() -> Measured<T> {
     ))
 }
 
+/// P9b — what people answered the viewer's post-session prompt (spec §3f,
+/// D10): thumbs per window, and the reason chips over 28 days. Counts of
+/// **answers** — one person's rating of one session; a session with two
+/// parties can carry two — never of sessions and never who answered; a
+/// share only from [`SMALL_N`] answers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Ratings {
+    pub up: Figure,
+    pub down: Figure,
+    /// `up + down`: answers, not sessions.
+    pub rated: Figure,
+    /// `up / rated` over 28 days, only from [`SMALL_N`] answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_share_28d: Option<f64>,
+    pub n_floor: i64,
+    /// The reason chips ticked in 28 days, most often first.
+    pub reasons_28d: Vec<KeyCount>,
+}
+
+/// A row stored before P9b has no `ratings`: it reads as not measured.
+fn quality_before_p9b<T>() -> Measured<T> {
+    Measured::NotMeasured(NotMeasured::later("the post-session ratings", "P9b"))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Quality {
     pub remote: Measured<RemoteQuality>,
@@ -981,6 +1005,10 @@ pub struct Quality {
     /// P9a — the day by agent version, from the frozen rows; newest first.
     #[serde(default = "quality_before_p9a")]
     pub by_agent_version: Measured<Vec<VersionDayRow>>,
+    /// P9b — the viewer's post-session ratings; `not_measured` while the
+    /// prompt is off on this server (`ROOMLER__GROWTH__FEEDBACK`).
+    #[serde(default = "quality_before_p9b")]
+    pub ratings: Measured<Ratings>,
 }
 
 /// P8 — the posts one platform published in the windows.
@@ -2352,6 +2380,58 @@ async fn crashes_section(
     })
 }
 
+/// P9b — the ratings people gave from the viewer, in the windows: by the
+/// answer's `ts`, the exclusion set applied to the org AND to the person
+/// (a platform admin's own thumbs are not the product's).
+async fn ratings_section(
+    state: &AppState,
+    w: &Windows,
+    set: &ExclusionSet,
+) -> Result<Ratings, DigestError> {
+    let docs = find_docs(
+        state,
+        "session_feedback",
+        doc! {
+            "ts": w.between(Span::D28),
+            "tenant_id": { "$nin": excluded_ids(&set.tenants) },
+            "user_id": { "$nin": excluded_ids(&set.users) },
+        },
+        doc! { "ts": 1, "rating": 1, "reasons": 1 },
+    )
+    .await?;
+    let (mut up, mut down) = (Vec::new(), Vec::new());
+    let mut reasons: BTreeMap<String, i64> = BTreeMap::new();
+    for d in &docs {
+        let Some(t) = dt_ms(d, "ts") else {
+            continue;
+        };
+        match str_of(d, "rating").as_deref() {
+            Some("up") => up.push(t),
+            Some("down") => down.push(t),
+            _ => continue,
+        }
+        if let Ok(list) = d.get_array("reasons") {
+            for r in list.iter().filter_map(|r| r.as_str()) {
+                *reasons.entry(r.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    let (up, down) = (w.count(up), w.count(down));
+    let rated = Figure {
+        day: up.day + down.day,
+        d7: up.d7 + down.d7,
+        d28: up.d28 + down.d28,
+    };
+    Ok(Ratings {
+        up,
+        down,
+        rated,
+        up_share_28d: rate_if_enough(up.d28, rated.d28, 1.0),
+        n_floor: SMALL_N,
+        reasons_28d: key_counts(reasons),
+    })
+}
+
 /// P9a — why a day has no frozen row yet.
 const NOT_FROZEN: &str = "the day is not frozen yet — the nightly quality freeze runs after \
                           midnight UTC; POST /api/admin/growth/quality/backfill re-freezes it";
@@ -2942,6 +3022,15 @@ pub async fn compute(
     let social = social_section(state, &w).await?;
     // P9a — the day's TTFF and per-version table come from the frozen rows.
     let (ttff, by_agent_version) = frozen_quality(state, &w, set).await?;
+    // P9b — the ratings: the prompt off is "not measured", never a zero —
+    // with it off nobody could answer, so a 0 would claim nobody did.
+    let ratings = match &remote {
+        None => Measured::unmounted("remote"),
+        Some(_) if !state.settings.growth.feedback => Measured::NotMeasured(NotMeasured::now(
+            "the rating prompt is off on this server (ROOMLER__GROWTH__FEEDBACK)",
+        )),
+        Some(_) => Measured::Value(ratings_section(state, &w, set).await?),
+    };
     let quality = Quality {
         remote: match &remote {
             Some(_) => Measured::Value(remote_quality(state, &w, set).await?),
@@ -2953,6 +3042,7 @@ pub async fn compute(
         },
         ttff,
         by_agent_version,
+        ratings,
     };
 
     // The web plane last, and each piece on its own: a purestat failure
