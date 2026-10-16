@@ -45,6 +45,7 @@ JSON messages, `{"type": "...", ...}`.
 | `media:play_audio` / `media:stop_audio` | Bot/audio playback control |
 | `presence:update` | Presence state |
 | `hive:view.open` / `offer` / `ice` / `renew` / `close` | FR-90 — read an agent session over a viewer peer (module `hive`) |
+| `hive:search.open` | FR-90 P2i-2 — search, over a peer of its own, the copies an archive replica holds of the sessions the asker may read; the peer then takes `hive:view.offer` / `ice` / `renew` / `close`, by its grant |
 | `ping` | Keepalive |
 
 **Server → client** (consumed by `ui/src/stores/ws.ts`)
@@ -58,6 +59,7 @@ JSON messages, `{"type": "...", ...}`.
 | `notification:new` / `notification:unread_count` | Notification bell |
 | `task:update` | Background-task progress |
 | `hive:view.ready` / `refused` / `answer` / `ice` / `renewed` / `closed` | FR-90 — the viewer peer's handshake, addressed to the ONE connection that opened it |
+| `hive:search.ready` / `refused` | FR-90 P2i-2 — a search's grant confirmed by its archive replica (with how many sessions it names), or refused; the rest of its handshake is the view's above |
 
 The mediasoup signalling (`media:*`) carries router RTP capabilities, transport
 parameters, and producer/consumer ids — the SFU forwards RTP between participants
@@ -68,7 +70,9 @@ and ICE of a **data-only** WebRTC peer between the browser and the device that
 holds the session. The server tells the browser `ready` only after the device has
 confirmed the grant (FR-83), relays the handshake to and from the one connection
 that holds the grant, and never sees the transcript that then flows over the
-peer. The server's half is
+peer. A search (`hive:search.open`, P2i-2) is a grant of the same kind toward an
+archive replica, naming the sessions the asker may read whose copy it holds; its
+query and what it finds travel only over its peer. The server's half is
 [`crates/modules/hive/src/view.rs`](../crates/modules/hive/src/view.rs), the
 device's `agents/roomlerd/src/hive/view.rs`.
 

@@ -616,6 +616,7 @@ async fn audit(
         action: "purge".to_string(),
         outcome: outcome.to_string(),
         reason: reason.map(str::to_string),
+        sessions: None,
         at: DateTime::now(),
     };
     if let Err(e) = state.audit.record(ev).await {
@@ -644,6 +645,7 @@ async fn refuse(
         action: "purge".to_string(),
         outcome: "refused".to_string(),
         reason: Some(reason.as_str().to_string()),
+        sessions: None,
         at: DateTime::now(),
     };
     if let Err(e) = state.audit.record(ev).await {

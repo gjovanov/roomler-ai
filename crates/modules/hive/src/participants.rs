@@ -323,6 +323,11 @@ pub async fn remove(
         .await?;
     if was_driver || left {
         view::end_session_grants_of(&state, sid, target, "removed").await;
+        // FR-90 P2i-2 — and their searches that name it: out of its room,
+        // they no longer read it.
+        if left {
+            view::end_searches_naming(&state, sid, target, "removed").await;
+        }
         audit(&s, tid, auth.user_id, target)("removed", None)
             .write(&state)
             .await;

@@ -21,6 +21,7 @@
 //! | `hive:view.ice {grant_id, candidate}` | `hive:view.ice {grant_id, candidate}` |
 //! | `hive:view.renew {grant_id}` | `hive:view.renewed {grant_id, ttl_secs}` |
 //! | `hive:view.close {grant_id}` | `hive:view.closed {grant_id, reason}` (also unasked) |
+//! | `hive:search.open {tenant_id, ref?}` (P2i-2) | `hive:search.ready {ref, grant_id, ice_servers, ttl_secs, sessions}` or `hive:search.refused {ref, reason, message?}`; the peer then takes the view's frames above, by its grant |
 //!
 //! # Whose grant it is
 //!
@@ -46,13 +47,29 @@
 //! is minted toward the primary alone, the one device a prompt can reach. With
 //! neither, the primary's own word refuses (`device_offline`,
 //! `device_unsupported`). The audit row of a view from a copy says `copy`.
+//!
+//! # A search (P2i-2)
+//!
+//! A SEARCH grant goes to the organization's designated archive replica that
+//! searches (`hive-search`, online here; of several, the one that holds the
+//! most of what the asker may read). It names the sessions the asker may read
+//! whose copy that device holds as a member, the most recently active first,
+//! at most [`search_limits::MAX_SESSIONS`]; the device searches only those it
+//! does hold. It sits in the same table as a view's, so the device's answer,
+//! the peer's frames and every end of a grant are a view's; it views no
+//! session (`session_id` is [`NO_SESSION`]). A renewal asks again whether the
+//! asker is in the organization and in every room through which they read a
+//! session it names; one lost closes it, and the browser opens a search named
+//! afresh. The server never holds a query or a word a search found: they
+//! travel only over the peer.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bson::oid::ObjectId;
 use dashmap::DashMap;
-use roomler_ai_remote_control::hive::view_limits;
+use roomler_ai_remote_control::hive::{search_limits, view_limits};
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, ServerMsg};
 use roomler_ai_remote_control::turn_creds::ice_servers_for_session_with_ttl;
 use roomler_core::{WsCtx, WsHandler};
@@ -61,6 +78,7 @@ use tracing::{debug, info, warn};
 
 use crate::HiveState;
 use crate::access::may_read;
+use crate::dao::HeldCopy;
 use crate::routes::Audit;
 
 /// Open grants one browser connection may hold.
@@ -76,6 +94,9 @@ const MAX_REF: usize = 64;
 /// The config TTL (600 s by default) would cut a relayed viewer at ten
 /// minutes, the bug the overlay's warm grants hit (72 h there).
 const TURN_TTL_SECS: u32 = 12 * 3600;
+/// FR-90 P2i-2 — a search grant's session: it views none. The zero id, which
+/// no session record carries, so no session's end or move ever matches it.
+const NO_SESSION: ObjectId = ObjectId::from_bytes([0; 12]);
 
 struct Grant {
     tenant_id: ObjectId,
@@ -89,6 +110,18 @@ struct Grant {
     /// Minted once, the same for both ends.
     ice_servers: Vec<IceServer>,
     reference: Option<String>,
+    /// FR-90 P2i-2 — a search grant's scope; `None` for a view.
+    search: Option<SearchScope>,
+}
+
+/// FR-90 P2i-2 — what a search grant names.
+struct SearchScope {
+    /// The sessions it names, as the device was sent them.
+    sessions: Vec<ObjectId>,
+    /// The rooms through which its user reads a session it names (each once;
+    /// none for the sessions they own): a renewal asks their membership in
+    /// every one again.
+    rooms: Vec<ObjectId>,
 }
 
 /// The view grants this pod holds.
@@ -140,6 +173,7 @@ impl WsHandler for HiveView {
             "hive:view.ice" => ice(&self.state, ctx, &data),
             "hive:view.renew" => renew(&self.state, ctx, &data).await,
             "hive:view.close" => close(&self.state, ctx, &data).await,
+            "hive:search.open" => open_search(&self.state, ctx, &data).await,
             other => debug!(user = %ctx.principal, kind = other, "hive: an unknown view frame"),
         }
         Ok(())
@@ -305,6 +339,7 @@ async fn open(state: &HiveState, ctx: &WsCtx, data: &Value) {
             ready: false,
             ice_servers,
             reference: reference.clone(),
+            search: None,
         },
     );
     let push = ServerMsg::HiveViewGrant {
@@ -335,9 +370,12 @@ async fn open(state: &HiveState, ctx: &WsCtx, data: &Value) {
         grant = %grant_id, session = %sid, device = %device_id, user = %user, may_prompt,
         copy = copy.is_some(), "hive: view granted"
     );
+    await_answer(state, grant_id);
+}
 
-    // A device that never answers: the browser is told, and the device told
-    // to drop the grant should its answer arrive after all.
+/// A device that never answers a grant: the browser is told, and the device
+/// told to drop the grant should its answer arrive after all.
+fn await_answer(state: &HiveState, grant_id: ObjectId) {
     let state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(view_limits::GRANT_ACK_TIMEOUT_SECS)).await;
@@ -345,19 +383,253 @@ async fn open(state: &HiveState, ctx: &WsCtx, data: &Value) {
             return;
         };
         tell_device_closed(&state, grant_id, &g, "no_answer");
-        to_browser(
-            &state,
-            &g.connection_id,
+        let (kind, data) = refused_frame(
+            &g,
+            "no_answer",
+            Some("the device did not answer in time".to_string()),
+        );
+        to_browser(&state, &g.connection_id, kind, data).await;
+    });
+}
+
+/// The browser's word that a grant was refused: a view's names its session,
+/// a search's (P2i-2) none.
+fn refused_frame(g: &Grant, reason: &str, message: Option<String>) -> (&'static str, Value) {
+    match g.search {
+        None => (
             "hive:view.refused",
             json!({
                 "ref": g.reference,
                 "session_id": g.session_id.to_hex(),
-                "reason": "no_answer",
-                "message": "the device did not answer in time",
+                "reason": reason,
+                "message": message,
             }),
-        )
+        ),
+        Some(_) => (
+            "hive:search.refused",
+            json!({ "ref": g.reference, "reason": reason, "message": message }),
+        ),
+    }
+}
+
+/// The browser's word that the device confirmed a grant, so it may dial: a
+/// view's says whether it may prompt, a search's (P2i-2) how many sessions
+/// it named.
+fn ready_frame(grant_id: ObjectId, g: &Grant) -> (&'static str, Value) {
+    match &g.search {
+        None => (
+            "hive:view.ready",
+            json!({
+                "ref": g.reference,
+                "grant_id": grant_id.to_hex(),
+                "session_id": g.session_id.to_hex(),
+                "ice_servers": g.ice_servers,
+                "ttl_secs": view_limits::GRANT_TTL_SECS,
+                "may_prompt": g.may_prompt,
+            }),
+        ),
+        Some(s) => (
+            "hive:search.ready",
+            json!({
+                "ref": g.reference,
+                "grant_id": grant_id.to_hex(),
+                "ice_servers": g.ice_servers,
+                "ttl_secs": view_limits::GRANT_TTL_SECS,
+                "sessions": s.sessions.len(),
+            }),
+        ),
+    }
+}
+
+/// FR-90 P2i-2 — `hive:search.open {tenant_id, ref?}`: a search grant toward
+/// the organization's archive replica, naming the sessions the asker may read
+/// whose copy it holds (the module docs, "A search").
+async fn open_search(state: &HiveState, ctx: &WsCtx, data: &Value) {
+    let reference: Option<String> = data
+        .get("ref")
+        .and_then(Value::as_str)
+        .map(|r| r.chars().take(MAX_REF).collect());
+    let refuse = |reason: &'static str| {
+        let data = json!({ "ref": reference, "reason": reason, "message": Value::Null });
+        async move { to_browser(state, &ctx.connection_id, "hive:search.refused", data).await }
+    };
+    let user = ctx.principal;
+    // An organization the asker is not in, one agent sessions do not serve
+    // (P1g), and a server that copies no sessions answer alike: nobody learns
+    // from the answer what they could not search.
+    let tenant = data
+        .get("tenant_id")
+        .and_then(Value::as_str)
+        .and_then(|t| ObjectId::parse_str(t).ok());
+    let tid = match tenant {
+        Some(t)
+            if state.replicaset
+                && state.scope.serves(t)
+                && matches!(state.tenants.is_member(t, user).await, Ok(true)) =>
+        {
+            t
+        }
+        _ => return refuse("not_found").await,
+    };
+    // The organization's designated archive replicas that search, online
+    // here, in the policy's order.
+    let designated = match state.policies.get(tid).await {
+        Ok(p) => p.map(|p| p.archive_devices).unwrap_or_default(),
+        Err(e) => {
+            warn!(tenant = %tid, %e, "hive: a search could not read the organization's policy");
+            return refuse("unavailable").await;
+        }
+    };
+    let searching: Vec<ObjectId> = designated
+        .into_iter()
+        .filter(|d| state.fleet.rc_hub.agent_searches(*d, tid))
+        .collect();
+    let Some(&first) = searching.first() else {
+        return refuse("no_archive_replica").await;
+    };
+    let audit = |device_id: ObjectId, outcome: &'static str, reason: Option<&'static str>| Audit {
+        tenant_id: tid,
+        user_id: user,
+        target_id: None,
+        device_id,
+        session_id: None,
+        action: "search",
+        outcome,
+        reason,
+    };
+
+    // The cheap refusals before the reads: one connection's grants, and the
+    // pace, after the identity gates.
+    let held_here = state
+        .view_grants
+        .map
+        .iter()
+        .filter(|g| g.connection_id == ctx.connection_id)
+        .count();
+    let paced = (held_here >= MAX_PER_CONNECTION)
+        .then_some("too_many_views")
+        .or_else(|| {
+            (!state
+                .view_limiter
+                .check(user, tid, search_limits::OPEN_RATE_PER_MINUTE))
+            .then_some("rate_limited")
+        });
+    if let Some(reason) = paced {
+        audit(first, "refused", Some(reason)).write(state).await;
+        return refuse(reason).await;
+    }
+
+    // What the asker may read through a room: every room they are in. A read
+    // that fails refuses, rather than search less than they may read without
+    // saying so.
+    let rooms = match state.chat.rooms_of(tid, user).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(tenant = %tid, user = %user, %e, "hive: a search could not read the asker's rooms");
+            audit(first, "refused", Some("unavailable"))
+                .write(state)
+                .await;
+            return refuse("unavailable").await;
+        }
+    };
+    // The one that holds the most of what the asker may read; the first in
+    // the policy's order among equals.
+    let mut best: Option<(ObjectId, Vec<HeldCopy>)> = None;
+    for device in searching {
+        match state
+            .sessions
+            .searchable(
+                tid,
+                device,
+                user,
+                &rooms,
+                search_limits::MAX_SESSIONS as i64,
+            )
+            .await
+        {
+            Ok(held) if best.as_ref().is_none_or(|(_, b)| held.len() > b.len()) => {
+                best = Some((device, held));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(device = %device, %e, "hive: a search could not read what an archive replica holds")
+            }
+        }
+    }
+    let Some((device_id, held)) = best else {
+        audit(first, "refused", Some("unavailable"))
+            .write(state)
+            .await;
+        return refuse("unavailable").await;
+    };
+    let named = u32::try_from(held.len()).unwrap_or(u32::MAX);
+    if held.is_empty() {
+        audit(device_id, "refused", Some("no_session"))
+            .write_counted(state, Some(0))
+            .await;
+        return refuse("no_session").await;
+    }
+
+    let sessions: Vec<ObjectId> = held.iter().map(|h| h.session_id).collect();
+    let mut via: Vec<ObjectId> = held
+        .iter()
+        .filter(|h| h.owner_id != user)
+        .filter_map(|h| h.room_id)
+        .collect();
+    via.sort_unstable();
+    via.dedup();
+    let grant_id = ObjectId::new();
+    let ice_servers = ice_servers_for_session_with_ttl(
+        &user.to_hex(),
+        &grant_id.to_hex(),
+        state.core.turn_map.cfg_for(None),
+        TURN_TTL_SECS,
+    );
+    // The grant BEFORE the push: the device's answer, however fast, must find
+    // it.
+    state.view_grants.map.insert(
+        grant_id,
+        Grant {
+            tenant_id: tid,
+            session_id: NO_SESSION,
+            device_id,
+            user_id: user,
+            connection_id: ctx.connection_id.clone(),
+            may_prompt: false,
+            ready: false,
+            ice_servers,
+            reference: reference.clone(),
+            search: Some(SearchScope {
+                sessions: sessions.clone(),
+                rooms: via,
+            }),
+        },
+    );
+    let push = ServerMsg::HiveSearchGrant {
+        grant_id,
+        user_id: user,
+        sessions,
+        ttl_secs: view_limits::GRANT_TTL_SECS,
+    };
+    if let Err(e) = state.fleet.rc_hub.push_hive_search(device_id, tid, push) {
+        state.view_grants.map.remove(&grant_id);
+        let reason = match e {
+            roomler_ai_remote_control::error::Error::ExecUnsupported(_) => "device_unsupported",
+            _ => "device_offline",
+        };
+        audit(device_id, "refused", Some(reason))
+            .write_counted(state, Some(named))
+            .await;
+        return refuse(reason).await;
+    }
+    audit(device_id, "sent", None)
+        .write_counted(state, Some(named))
         .await;
-    });
+    info!(
+        grant = %grant_id, device = %device_id, user = %user, sessions = named,
+        "hive: search granted"
+    );
+    await_answer(state, grant_id);
 }
 
 /// The grant `data` names, if THIS connection's user holds it and the device
@@ -427,13 +699,16 @@ async fn renew(state: &HiveState, ctx: &WsCtx, data: &Value) {
     let Some((grant_id, device_id, tenant_id)) = ready_grant_of(state, ctx, data) else {
         return;
     };
-    let session_id = match state.view_grants.map.get(&grant_id) {
-        Some(g) => g.session_id,
+    let (session_id, search_rooms) = match state.view_grants.map.get(&grant_id) {
+        Some(g) => (g.session_id, g.search.as_ref().map(|s| s.rooms.clone())),
         None => return,
     };
-    let still = match state.sessions.find(session_id).await {
-        Ok(Some(s)) => may_read(state, &s, ctx.principal).await,
-        _ => false,
+    let still = match search_rooms {
+        Some(rooms) => still_searches(state, tenant_id, ctx.principal, &rooms).await,
+        None => match state.sessions.find(session_id).await {
+            Ok(Some(s)) => may_read(state, &s, ctx.principal).await,
+            _ => false,
+        },
     };
     if !still {
         if let Some((_, g)) = state.view_grants.map.remove(&grant_id) {
@@ -462,6 +737,29 @@ async fn renew(state: &HiveState, ctx: &WsCtx, data: &Value) {
         json!({"grant_id": grant_id.to_hex(), "ttl_secs": view_limits::GRANT_TTL_SECS}),
     )
     .await;
+}
+
+/// FR-90 P2i-2 — whether `user` may still search what their grant named: in
+/// the organization, and a member of every room through which they read a
+/// session it names. One lost closes the grant, and the browser opens a
+/// search named afresh. A session purged since does not: its device purged
+/// its copy, and there is nothing of it left to find.
+async fn still_searches(
+    state: &HiveState,
+    tenant_id: ObjectId,
+    user: ObjectId,
+    rooms: &[ObjectId],
+) -> bool {
+    if !matches!(state.tenants.is_member(tenant_id, user).await, Ok(true)) {
+        return false;
+    }
+    match state.chat.member_rooms_of(tenant_id, user, rooms).await {
+        Ok(held) => {
+            let held: HashSet<ObjectId> = held.into_iter().collect();
+            rooms.iter().all(|r| held.contains(r))
+        }
+        Err(_) => false,
+    }
 }
 
 async fn close(state: &HiveState, ctx: &WsCtx, data: &Value) {
@@ -504,44 +802,28 @@ pub(crate) async fn on_device_frame(state: &HiveState, device_id: ObjectId, msg:
                 match refused {
                     None => {
                         g.ready = true;
-                        Ok((
-                            g.connection_id.clone(),
-                            json!({
-                                "ref": g.reference,
-                                "grant_id": grant_id.to_hex(),
-                                "session_id": g.session_id.to_hex(),
-                                "ice_servers": g.ice_servers,
-                                "ttl_secs": view_limits::GRANT_TTL_SECS,
-                                "may_prompt": g.may_prompt,
-                            }),
-                        ))
+                        let (kind, data) = ready_frame(grant_id, &g);
+                        Ok((g.connection_id.clone(), kind, data))
                     }
                     Some(word) => Err(word),
                 }
             };
             match reply {
-                Ok((conn, data)) => to_browser(state, &conn, "hive:view.ready", data).await,
+                Ok((conn, kind, data)) => to_browser(state, &conn, kind, data).await,
                 Err(word) => {
                     let Some((_, g)) = state.view_grants.map.remove(&grant_id) else {
                         return;
                     };
-                    info!(grant = %grant_id, refused = word.as_str(), "hive: the device refused a view");
+                    info!(
+                        grant = %grant_id, refused = word.as_str(), search = g.search.is_some(),
+                        "hive: the device refused a grant"
+                    );
                     let message = crate::agent_socket::clamp_words(
                         detail,
                         roomler_ai_remote_control::hive::hive_limits::MAX_DETAIL_LEN,
                     );
-                    to_browser(
-                        state,
-                        &g.connection_id,
-                        "hive:view.refused",
-                        json!({
-                            "ref": g.reference,
-                            "session_id": g.session_id.to_hex(),
-                            "reason": word.as_str(),
-                            "message": message,
-                        }),
-                    )
-                    .await;
+                    let (kind, data) = refused_frame(&g, word.as_str(), message);
+                    to_browser(state, &g.connection_id, kind, data).await;
                 }
             }
         }
@@ -630,6 +912,24 @@ pub(crate) async fn end_session_grants_of(
     let gone = state
         .view_grants
         .take_where(|g| !(g.session_id == session_id && g.user_id == user));
+    end_taken(state, gone, reason, true).await
+}
+
+/// FR-90 P2i-2 — end `user`'s search grants that name `session_id`: they no
+/// longer read it (taken out of its room). The browser opens a search named
+/// afresh. A change of their part that leaves them reading it ends none.
+pub(crate) async fn end_searches_naming(
+    state: &HiveState,
+    session_id: ObjectId,
+    user: ObjectId,
+    reason: &str,
+) -> usize {
+    let gone = state.view_grants.take_where(|g| {
+        !(g.user_id == user
+            && g.search
+                .as_ref()
+                .is_some_and(|s| s.sessions.contains(&session_id)))
+    });
     end_taken(state, gone, reason, true).await
 }
 

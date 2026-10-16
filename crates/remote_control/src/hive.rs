@@ -127,6 +127,10 @@ pub mod search_limits {
     /// Search grants one device serves at once, within its viewers
     /// ([`super::view_limits::MAX_PER_DEVICE`]).
     pub const MAX_PER_DEVICE: usize = 8;
+    /// FR-90 P2i-2 — search opens per (user, organization) per minute, after
+    /// the identity gates. A grant serves many searches; an open is the
+    /// server's read of what the person may search, and is paced as a view's.
+    pub const OPEN_RATE_PER_MINUTE: u32 = 20;
 }
 
 /// Why a device refused a view grant, carried in `rc:hive.view.grant_ack`.

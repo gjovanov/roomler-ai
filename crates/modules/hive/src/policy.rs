@@ -382,6 +382,7 @@ async fn audit(
         action: "policy".into(),
         outcome: outcome.into(),
         reason: reason.map(str::to_string),
+        sessions: None,
         at: DateTime::now(),
     };
     if let Err(e) = state.audit.record(event).await {
