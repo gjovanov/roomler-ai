@@ -18,10 +18,64 @@
 //! belongs to exactly one of them; a single shared sender would have to guess.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use bson::oid::ObjectId;
 use tunnel_core::localapi::RcSessionInfo;
+
+/// FR-93 P6h — sessions whose capture is parked on the desktop's own dialog,
+/// with how many live marks hold each. Process-global rather than a registry
+/// field: the capture open that knows it runs far from the registry's owner,
+/// and an `ObjectId` names one session daemon-wide.
+static ASKING: LazyLock<Mutex<HashMap<ObjectId, usize>>> = LazyLock::new(Mutex::default);
+
+/// `ROOMLERD_BANNER_WAITS_FOR_DIALOG=0` — never mark a session as asking, so
+/// the banner shows from the session's start, as before P6h.
+fn asking_marks_enabled() -> bool {
+    tunnel_core::env::flag("BANNER_WAITS_FOR_DIALOG", true)
+}
+
+/// While one lives, `session` lists with `asking` set: the desktop's own
+/// dialog is asking the person at the screen to share it, so nothing is
+/// shared yet. Dropping it — the open returned, or moved on to another
+/// wait — takes the mark away.
+pub struct AskingMark(Option<ObjectId>);
+
+impl AskingMark {
+    pub fn new(session: ObjectId) -> Self {
+        if !asking_marks_enabled() {
+            return Self(None);
+        }
+        *ASKING
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(session)
+            .or_default() += 1;
+        Self(Some(session))
+    }
+}
+
+impl Drop for AskingMark {
+    fn drop(&mut self) {
+        let Some(session) = self.0 else {
+            return;
+        };
+        let mut map = ASKING.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = map.get_mut(&session) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&session);
+            }
+        }
+    }
+}
+
+fn asking(session: &ObjectId) -> bool {
+    ASKING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains_key(session)
+}
 
 /// The channel a signalling loop polls for "the person at this device wants
 /// this session gone" — the same one the Windows overlay's Disconnect button
@@ -159,6 +213,7 @@ impl RcSessionRegistry {
                         started_at_ms: e.started_at_ms,
                         recording: e.recording,
                         reconnecting: e.detached,
+                        asking: asking(id),
                     },
                 )
             })
@@ -353,5 +408,31 @@ mod tests {
         reg.session_ended(&ids[0]);
         let kept = serde_json::to_value(&reg.list()[0]).unwrap();
         assert_eq!(kept["reconnecting"], true, "{kept}");
+    }
+
+    /// FR-93 P6h — a session lists as asking while a mark for it lives, and
+    /// stops the moment the last one goes: a second wait replacing the first
+    /// (the open moving on) must not make it flicker off in between.
+    #[test]
+    fn a_session_is_asking_while_its_mark_lives() {
+        let (reg, ids, _rx) = reg_with(2);
+        let asking = |reg: &RcSessionRegistry| -> Vec<bool> {
+            reg.list().iter().map(|s| s.asking).collect()
+        };
+        assert_eq!(asking(&reg), [false, false]);
+        let first = AskingMark::new(ids[0]);
+        assert_eq!(asking(&reg), [true, false]);
+        let second = AskingMark::new(ids[0]);
+        drop(first);
+        assert_eq!(
+            asking(&reg),
+            [true, false],
+            "a replaced mark still holds it"
+        );
+        drop(second);
+        assert_eq!(asking(&reg), [false, false]);
+        // Additive on the wire: a session nobody asks about carries no field.
+        let row = serde_json::to_value(&reg.list()[0]).unwrap();
+        assert!(row.get("asking").is_none(), "{row}");
     }
 }
