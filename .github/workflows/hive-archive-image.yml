@@ -101,6 +101,9 @@ jobs:
           docker run --rm --entrypoint roomlerd "$IMG" enroll --help | grep -q -- '--archive-replica'
           # It runs as no one in particular, with the volume as its home.
           test "$(docker run --rm --entrypoint id "$IMG" -u)" = 10001
+          # It says it is the archive image, so an archive replica enrolled
+          # before the posture joined the mesh joins it here (FR-90 P2k-4).
+          test "$(docker run --rm --entrypoint printenv "$IMG" ROOMLERD_ARCHIVE_IMAGE)" = 1
           # A first start with nothing to enroll with says why, and fails.
           set +e
           out=$(docker run --rm "$IMG" 2>&1); rc=$?

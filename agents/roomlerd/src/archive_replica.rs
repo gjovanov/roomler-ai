@@ -18,6 +18,11 @@
 //! | `exec_enabled`, `ssh_enabled` | off | it reaches the org's network for no one |
 //! | `forward_acl.enabled` | off | no tunnel exit: an empty allowlist would otherwise trust the server |
 //! | `auto_update` | off | it updates by a new container on the same volume, never by a package installed inside one |
+//! | `overlay_enabled`, `netstack_socks_port` | on, the userspace stack on the container's loopback | FR-90 P2k-4 (F4): on the mesh it holds a DERP connection, and a member's ladder offers the derp rung only while it holds one, so a primary that only DERP reaches could never be followed. A container has no TUN; the stack changes no route and needs no privilege, and its SOCKS5 front is on the loopback, the container's own on a network of its own |
+//!
+//! An archive replica enrolled before its posture joined the mesh joins it
+//! at its next start in the image ([`reconcile_at_start`]), which is how it
+//! is updated: a new container on the same volume.
 //!
 //! ⚠️ Only into a FRESH config, and never an ephemeral one: the volume IS the
 //! device (its config holds the agent token and the WireGuard key, its store
@@ -66,10 +71,45 @@ pub fn apply(cfg: &mut AgentConfig) {
     cfg.ssh_enabled = false;
     cfg.forward_acl.enabled = false;
     cfg.auto_update = Some(false);
+    join_mesh(cfg);
     tracing::info!(
         "archive replica: holds the org's copies; runs no session, takes no command \
-         or SSH session, is no tunnel exit, and never updates itself"
+         or SSH session, is no tunnel exit, and never updates itself; on the mesh, \
+         in the userspace stack"
     );
+}
+
+/// FR-90 P2k-4 (F4) — the loopback port of an archive replica's userspace
+/// stack. Nothing outside the container reaches it.
+pub const NETSTACK_SOCKS_PORT: u16 = 11080;
+
+/// The process runs in the archive replica image, which says so in its
+/// environment (`Dockerfile.hive-archive`).
+pub const IMAGE_ENV: &str = "ROOMLERD_ARCHIVE_IMAGE";
+
+/// FR-90 P2k-4 (F4) — the mesh half of the posture: on the overlay, in the
+/// userspace stack. A port already configured is kept. True when it changed
+/// anything.
+pub fn join_mesh(cfg: &mut AgentConfig) -> bool {
+    let mut changed = false;
+    if !cfg.overlay_enabled {
+        cfg.overlay_enabled = true;
+        changed = true;
+    }
+    if cfg.netstack_socks_port.is_none() {
+        cfg.netstack_socks_port = Some(NETSTACK_SOCKS_PORT);
+        changed = true;
+    }
+    changed
+}
+
+/// FR-90 P2k-4 (F4) — at a start in the archive image: an archive replica
+/// enrolled before its posture joined the mesh joins it now. Outside the
+/// image nothing changes, so a device whose owner offers it as an archive
+/// replica keeps the overlay its owner chose. True when the config changed
+/// and is to be saved.
+pub fn reconcile_at_start(cfg: &mut AgentConfig, in_image: bool) -> bool {
+    in_image && cfg.hive_archive && cfg.hive_replica && join_mesh(cfg)
 }
 
 #[cfg(test)]
@@ -98,6 +138,57 @@ mod tests {
         );
         assert!(!cfg.forward_acl.enabled, "no tunnel exit");
         assert_eq!(cfg.auto_update, Some(false), "no self-update");
+        assert!(cfg.overlay_enabled, "on the mesh (F4)");
+        assert_eq!(
+            cfg.netstack_socks_port,
+            Some(NETSTACK_SOCKS_PORT),
+            "in the userspace stack: a container has no TUN"
+        );
+    }
+
+    /// FR-90 P2k-4 (F4) — an archive replica enrolled before its posture
+    /// joined the mesh joins it at its next start in the image, once; a port
+    /// it had is kept; outside the image nothing changes.
+    #[test]
+    fn an_archive_from_the_image_joins_the_mesh_at_its_start_and_nothing_else_does() {
+        let archive = || {
+            let mut cfg = crate::config::test_fixture();
+            cfg.hive_replica = true;
+            cfg.hive_archive = true;
+            cfg.overlay_enabled = false;
+            cfg.netstack_socks_port = None;
+            cfg
+        };
+        let mut cfg = archive();
+        assert!(reconcile_at_start(&mut cfg, true), "it joins");
+        assert!(cfg.overlay_enabled && cfg.netstack_socks_port == Some(NETSTACK_SOCKS_PORT));
+        assert!(
+            !reconcile_at_start(&mut cfg, true),
+            "once: nothing to save again"
+        );
+
+        let mut kept = archive();
+        kept.netstack_socks_port = Some(1080);
+        assert!(reconcile_at_start(&mut kept, true));
+        assert_eq!(
+            kept.netstack_socks_port,
+            Some(1080),
+            "a port it had is kept"
+        );
+
+        let mut outside = archive();
+        assert!(
+            !reconcile_at_start(&mut outside, false),
+            "nothing outside the image changes"
+        );
+        assert!(!outside.overlay_enabled, "the owner's own choice stays");
+
+        let mut not_archive = archive();
+        not_archive.hive_archive = false;
+        assert!(
+            !reconcile_at_start(&mut not_archive, true),
+            "not an archive replica: left alone"
+        );
     }
 
     /// Refused before the token is spent: an ephemeral enrollment, and an
