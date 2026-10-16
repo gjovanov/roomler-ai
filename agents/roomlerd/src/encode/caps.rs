@@ -1739,6 +1739,11 @@ fn rpc_caps() -> Vec<String> {
     // of the BUILD, as `hive-purge` is.
     #[cfg(hive_host)]
     caps.push(RpcCap::HivePurgeAll);
+    // #2294 — and finishes that purge before it exits on the removal's
+    // goodbye (`hive::finish_removal_purge`), so the server's kick may tell
+    // it. A property of the BUILD, as `hive-purge-all` is.
+    #[cfg(hive_host)]
+    caps.push(RpcCap::HivePurgeDrain);
     // ⚠️ FR-99's `privacy-*` words are NOT here: this list is memoized at boot
     // (`detect()`), and those follow the owner's live gate and the overlay
     // coming up. `signaling::stub_caps` adds them at every announcement.

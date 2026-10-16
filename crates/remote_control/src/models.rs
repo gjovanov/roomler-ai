@@ -942,6 +942,17 @@ pub enum RpcCap {
     /// so a build without it is sent nothing and keeps what it held, as one
     /// offline at its removal does. Equality-matched, locked by test.
     HivePurgeAll,
+    /// #2294 — `hive-purge-drain`: on a goodbye (`AgentDeleted`) the daemon
+    /// finishes the removal purge `rc:hive.purge_all` started before it exits,
+    /// bounded. So a removal's kick may tell it at once: the goodbye that
+    /// follows the purge's frame no longer cuts the purge short. A build
+    /// property, on every build that runs sessions.
+    ///
+    /// ⚠️ `hive` and `hive-purge` are its prefixes and NOT the same promise:
+    /// `agent-v0.4.137` purges at its removal but exits at once on the
+    /// goodbye, so the kick leaves its socket open instead. Equality-matched,
+    /// locked by test.
+    HivePurgeDrain,
     /// FR-90 P2i-1 — `hive-search`: the device answers full-text search over
     /// the copies it holds, for the sessions a `rc:hive.search.grant` names,
     /// to that grant's viewer peer. Only while it offers itself as an
@@ -1057,6 +1068,7 @@ impl RpcCap {
             Self::HiveManage => "hive-manage",
             Self::HivePurge => "hive-purge",
             Self::HivePurgeAll => "hive-purge-all",
+            Self::HivePurgeDrain => "hive-purge-drain",
             Self::HiveSearch => "hive-search",
             Self::ExecSystem => "exec-system",
             Self::SshSystem => "ssh-system",
@@ -1069,7 +1081,7 @@ impl RpcCap {
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 31] = [
+    pub const ALL: [RpcCap; 32] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1093,6 +1105,7 @@ impl RpcCap {
         Self::HiveManage,
         Self::HivePurge,
         Self::HivePurgeAll,
+        Self::HivePurgeDrain,
         Self::HiveSearch,
         Self::ExecSystem,
         Self::SshSystem,
@@ -5922,6 +5935,7 @@ mod tests {
         assert_eq!(RpcCap::HiveManage.wire(), "hive-manage");
         assert_eq!(RpcCap::HivePurge.wire(), "hive-purge");
         assert_eq!(RpcCap::HivePurgeAll.wire(), "hive-purge-all");
+        assert_eq!(RpcCap::HivePurgeDrain.wire(), "hive-purge-drain");
         assert_eq!(RpcCap::HiveSearch.wire(), "hive-search");
         assert_eq!(RpcCap::PrivacyMode.wire(), "privacy-mode");
         assert_eq!(RpcCap::PrivacyAvailable.wire(), "privacy-available");
@@ -6054,7 +6068,7 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 20] = [
+        const KNOWN: [(RpcCap, RpcCap); 22] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
@@ -6101,6 +6115,11 @@ mod tests {
             // `hive_purge_all_is_a_promise_of_its_own`.
             (RpcCap::Hive, RpcCap::HivePurgeAll),
             (RpcCap::HivePurge, RpcCap::HivePurgeAll),
+            // #2294 — nor "finishes a removal purge before its goodbye exit",
+            // and neither is "purges a session". Locked by
+            // `hive_purge_drain_is_a_promise_of_its_own`.
+            (RpcCap::Hive, RpcCap::HivePurgeDrain),
+            (RpcCap::HivePurge, RpcCap::HivePurgeDrain),
             // FR-90 P2i-1 — nor "answers a search over its copies". Locked by
             // `hive_search_is_a_promise_of_its_own`.
             (RpcCap::Hive, RpcCap::HiveSearch),
@@ -6768,6 +6787,31 @@ mod tests {
             Some(RpcCap::HivePurgeAll)
         );
         assert!(RpcCap::from_wire("hive-purge-alls").is_none());
+    }
+
+    /// #2294 — `hive-purge-drain` is its own promise: `agent-v0.4.137` purges
+    /// at its removal (`hive-purge-all`) but exits at once on the goodbye that
+    /// follows, so a server that read the drain out of `hive-purge-all` (or
+    /// out of `hive-purge`, its prefix) would cut that purge short.
+    #[test]
+    fn hive_purge_drain_is_a_promise_of_its_own() {
+        let v0_4_137 = AgentCaps {
+            rpc: vec!["hive".into(), "hive-purge".into(), "hive-purge-all".into()],
+            ..Default::default()
+        };
+        assert!(!v0_4_137.has_rpc(RpcCap::HivePurgeDrain));
+        let drains = AgentCaps {
+            rpc: vec!["hive".into(), "hive-purge-drain".into()],
+            ..Default::default()
+        };
+        assert!(drains.has_rpc(RpcCap::HivePurgeDrain));
+        assert!(!drains.has_rpc(RpcCap::HivePurge));
+        assert!(!drains.has_rpc(RpcCap::HivePurgeAll));
+        assert_eq!(
+            RpcCap::from_wire("hive-purge-drain"),
+            Some(RpcCap::HivePurgeDrain)
+        );
+        assert!(RpcCap::from_wire("hive-purge-drains").is_none());
     }
 
     /// FR-90 P2i-1 — `hive-search` is its own promise: a device that holds

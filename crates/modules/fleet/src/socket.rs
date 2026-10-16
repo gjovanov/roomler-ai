@@ -180,6 +180,10 @@ pub async fn handle_agent_socket(
     // `hive` and `hive-purge` are its prefixes too: a build of P2g-1 to P2g-3d
     // purges a session and cannot decode `rc:hive.purge_all`.
     let purges_hive_at_removal = caps.has_rpc(RpcCap::HivePurgeAll);
+    // #2294 — and finishes that purge before it exits on the removal's
+    // goodbye, so the kick may tell it. Its own word: a build before it
+    // exits at once.
+    let drains_hive_purge = caps.has_rpc(RpcCap::HivePurgeDrain);
     // FR-92 — it parses the org's keep-busy policy. Equality, never a prefix.
     let supports_keep_busy = advertises_keep_busy(&caps);
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
@@ -269,6 +273,9 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_hive_purge_all_support(agent_id, purges_hive_at_removal);
+    state
+        .rc_hub
+        .set_agent_hive_purge_drain_support(agent_id, drains_hive_purge);
     let pump_socket_tx = socket_tx.clone();
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
 
