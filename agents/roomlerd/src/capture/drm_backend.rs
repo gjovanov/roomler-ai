@@ -535,6 +535,37 @@ fn read_cursor_pixels(
     ))
 }
 
+/// How a scanout pixel is laid out — the two facts about its fourcc the
+/// repack needs. Every format here is 32 bits per pixel, little-endian.
+///
+/// ⚠️ **Which order a compositor scans out is the compositor's choice, not
+/// the display's.** mutter picked `XR30` on the Apple-silicon (Asahi) Mac
+/// mini's display and KWin picked `AB24` on the very same one: same driver,
+/// same panel, red and blue in opposite places. A `Layout` is resolved from
+/// each framebuffer, never from what the last one was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Layout {
+    /// 2:10:10:10 packed words (`XR30` and friends) rather than 8-bit bytes.
+    ten_bit: bool,
+    /// Red in the LOW channel — the `XB`/`AB` fourccs (`XBGR8888`: R,G,B,X in
+    /// memory) — where the `XR`/`AR` ones keep blue there.
+    red_low: bool,
+}
+
+impl Layout {
+    /// `None` for anything outside the eight 32-bit RGB fourccs.
+    fn of(format: DrmFourcc) -> Option<Self> {
+        let (ten_bit, red_low) = match format {
+            DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888 => (false, false),
+            DrmFourcc::Xbgr8888 | DrmFourcc::Abgr8888 => (false, true),
+            DrmFourcc::Xrgb2101010 | DrmFourcc::Argb2101010 => (true, false),
+            DrmFourcc::Xbgr2101010 | DrmFourcc::Abgr2101010 => (true, true),
+            _ => return None,
+        };
+        Some(Self { ten_bit, red_low })
+    }
+}
+
 /// Repack one scanout framebuffer into tightly-packed BGRA.
 ///
 /// ⚠️ **The fourcc must be honoured, not assumed.** X11 handed us 8-bit
@@ -542,8 +573,10 @@ fn read_cursor_pixels(
 /// decoding `XR30` with the 8-bit layout yields a *structurally perfect,
 /// psychedelic* frame: correct geometry, correct layout, colours pure noise.
 /// That reads as a colour-space bug rather than a format bug, so it is exactly
-/// the mistake that survives review.
-fn repack_to_bgra(src: &[u8], width: u32, height: u32, pitch: u32, ten_bit: bool) -> Vec<u8> {
+/// the mistake that survives review. The `XB`/`AB` orders fail the same way,
+/// more quietly still: decoded as `XR24`, `AB24` is the right picture with red
+/// and blue exchanged — a blue sky turns orange and nothing else looks wrong.
+fn repack_to_bgra(src: &[u8], width: u32, height: u32, pitch: u32, layout: Layout) -> Vec<u8> {
     let w = width as usize;
     let h = height as usize;
     let pitch = pitch as usize;
@@ -551,34 +584,54 @@ fn repack_to_bgra(src: &[u8], width: u32, height: u32, pitch: u32, ten_bit: bool
     for y in 0..h {
         let row = &src[y * pitch..y * pitch + w * 4];
         let dst = &mut out[y * w * 4..(y + 1) * w * 4];
-        if ten_bit {
-            // XR30/AR30: one packed LE word, x:R:G:B 2:10:10:10. Drop the low
-            // 2 bits per channel to reach 8-bit BGRA; alpha is opaque because
-            // the 2-bit `x` field is padding on the X-variant.
-            //
-            // Written as paired `chunks_exact` rather than indexed arithmetic
-            // so the bounds checks fold away and LLVM can vectorise: this loop
-            // runs 8.8 M times per frame at 4K and was measured as the single
-            // dominant cost of the whole backend there.
-            for (d, s) in dst.chunks_exact_mut(4).zip(row.chunks_exact(4)) {
-                let v = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-                d[0] = ((v & 0x3FF) >> 2) as u8; // B
-                d[1] = (((v >> 10) & 0x3FF) >> 2) as u8; // G
-                d[2] = (((v >> 20) & 0x3FF) >> 2) as u8; // R
-                d[3] = 0xFF;
+        match (layout.ten_bit, layout.red_low) {
+            (true, false) => unpack_ten_bit_row::<false>(dst, row),
+            (true, true) => unpack_ten_bit_row::<true>(dst, row),
+            (false, false) => {
+                // XR24/AR24 is already B,G,R,X in memory — the Frame contract's
+                // byte order. Copy the row wholesale, then force alpha opaque so
+                // an X-variant (where the 4th byte is undefined) cannot render
+                // transparent downstream.
+                dst.copy_from_slice(row);
+                for px in dst.chunks_exact_mut(4) {
+                    px[3] = 0xFF;
+                }
             }
-        } else {
-            // XR24/AR24 is already B,G,R,X in memory — the Frame contract's
-            // byte order. Copy the row wholesale, then force alpha opaque so
-            // an X-variant (where the 4th byte is undefined) cannot render
-            // transparent downstream.
-            dst.copy_from_slice(row);
-            for px in dst.chunks_exact_mut(4) {
-                px[3] = 0xFF;
+            (false, true) => {
+                // XB24/AB24 is R,G,B,X in memory: swap the outer two bytes,
+                // and force alpha opaque for the same reason as above.
+                for (d, s) in dst.chunks_exact_mut(4).zip(row.chunks_exact(4)) {
+                    d[0] = s[2];
+                    d[1] = s[1];
+                    d[2] = s[0];
+                    d[3] = 0xFF;
+                }
             }
         }
     }
     out
+}
+
+/// One row of 2:10:10:10 words to 8-bit BGRA. `RED_LOW` picks XB30/AB30
+/// (x:B:G:R) over XR30/AR30 (x:R:G:B) at compile time, so neither order pays
+/// for the other in the loop.
+///
+/// Written as paired `chunks_exact` rather than indexed arithmetic so the
+/// bounds checks fold away and LLVM can vectorise: this loop runs 8.8 M times
+/// per frame at 4K and was measured as the single dominant cost of the whole
+/// backend there. The low 2 bits of each channel are dropped to reach 8 bits;
+/// alpha is opaque because the 2-bit `x` field is padding on the X-variants.
+fn unpack_ten_bit_row<const RED_LOW: bool>(dst: &mut [u8], row: &[u8]) {
+    for (d, s) in dst.chunks_exact_mut(4).zip(row.chunks_exact(4)) {
+        let v = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+        let low = ((v & 0x3FF) >> 2) as u8;
+        let high = (((v >> 20) & 0x3FF) >> 2) as u8;
+        let (b, r) = if RED_LOW { (high, low) } else { (low, high) };
+        d[0] = b;
+        d[1] = (((v >> 10) & 0x3FF) >> 2) as u8; // G is the middle field in both
+        d[2] = r;
+        d[3] = 0xFF;
+    }
 }
 
 enum WorkerReply {
@@ -904,10 +957,8 @@ fn grab(
 
     let (width, height) = info.size();
     let pitch = info.pitches()[0];
-    let ten_bit = match info.pixel_format() {
-        DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888 => false,
-        DrmFourcc::Xrgb2101010 | DrmFourcc::Argb2101010 => true,
-        other => bail!("unhandled scanout pixel format {other:?}"),
+    let Some(layout) = Layout::of(info.pixel_format()) else {
+        bail!("unhandled scanout pixel format {:?}", info.pixel_format());
     };
     let len = pitch as usize * height as usize;
 
@@ -980,7 +1031,7 @@ fn grab(
     // so the pass count is the cost.
     let scaled = if wants_half(width, height, downscale) {
         Scaled {
-            data: repack_bgra_half(mapping.as_slice(), width, height, pitch, ten_bit),
+            data: repack_bgra_half(mapping.as_slice(), width, height, pitch, layout),
             width: width / 2,
             height: height / 2,
             stride: (width / 2) * 4,
@@ -988,7 +1039,7 @@ fn grab(
         }
     } else {
         Scaled {
-            data: repack_to_bgra(mapping.as_slice(), width, height, pitch, ten_bit),
+            data: repack_to_bgra(mapping.as_slice(), width, height, pitch, layout),
             width,
             height,
             stride: width * 4,
@@ -1048,7 +1099,8 @@ fn wants_half(width: u32, height: u32, policy: DownscalePolicy) -> bool {
 /// materialises the full-size frame, which is the whole point: this backend is
 /// memory-bandwidth bound, so the win is one fewer read and one 4×-smaller
 /// write, not a cheaper inner loop.
-fn repack_bgra_half(src: &[u8], width: u32, height: u32, pitch: u32, ten_bit: bool) -> Vec<u8> {
+fn repack_bgra_half(src: &[u8], width: u32, height: u32, pitch: u32, layout: Layout) -> Vec<u8> {
+    let Layout { ten_bit, red_low } = layout;
     let (dw, dh) = ((width / 2) as usize, (height / 2) as usize);
     let pitch = pitch as usize;
     let mut out = vec![0u8; dw * dh * 4];
@@ -1071,8 +1123,10 @@ fn repack_bgra_half(src: &[u8], width: u32, height: u32, pitch: u32, ten_bit: bo
             let o = 2 * x * 4;
             // Average in the SOURCE's own precision, then narrow — narrowing
             // first would throw away the two bits that make averaging 10-bit
-            // samples worth doing at all.
-            let (mut b, mut g, mut r) = (0u32, 0u32, 0u32);
+            // samples worth doing at all. Summed in the source's channel
+            // order (low, middle, high); which of low/high is blue is decided
+            // once, at the store.
+            let (mut low, mut g, mut high) = (0u32, 0u32, 0u32);
             for base in [r0 + o, r0 + o + 4, r1 + o, r1 + o + 4] {
                 if ten_bit {
                     let v = u32::from_le_bytes([
@@ -1081,13 +1135,13 @@ fn repack_bgra_half(src: &[u8], width: u32, height: u32, pitch: u32, ten_bit: bo
                         src[base + 2],
                         src[base + 3],
                     ]);
-                    b += v & 0x3FF;
+                    low += v & 0x3FF;
                     g += (v >> 10) & 0x3FF;
-                    r += (v >> 20) & 0x3FF;
+                    high += (v >> 20) & 0x3FF;
                 } else {
-                    b += u32::from(src[base]);
+                    low += u32::from(src[base]);
                     g += u32::from(src[base + 1]);
-                    r += u32::from(src[base + 2]);
+                    high += u32::from(src[base + 2]);
                 }
             }
             let narrow = |sum: u32| -> u8 {
@@ -1098,6 +1152,7 @@ fn repack_bgra_half(src: &[u8], width: u32, height: u32, pitch: u32, ten_bit: bo
                     ((sum + 2) / 4) as u8
                 }
             };
+            let (b, r) = if red_low { (high, low) } else { (low, high) };
             dst[x * 4] = narrow(b);
             dst[x * 4 + 1] = narrow(g);
             dst[x * 4 + 2] = narrow(r);
@@ -1226,20 +1281,57 @@ impl ScreenCapture for DrmCapture {
 mod tests {
     use super::*;
 
+    fn layout(format: DrmFourcc) -> Layout {
+        Layout::of(format).expect("a handled scanout fourcc")
+    }
+
+    /// Both channel orders at both depths, and NOTHING else: a fourcc outside
+    /// the table must stay a refusal, because the alternative is decoding it
+    /// with somebody else's layout.
+    #[test]
+    fn layout_covers_both_channel_orders_at_both_depths() {
+        for (format, ten_bit, red_low) in [
+            (DrmFourcc::Xrgb8888, false, false),
+            (DrmFourcc::Argb8888, false, false),
+            (DrmFourcc::Xbgr8888, false, true),
+            (DrmFourcc::Abgr8888, false, true),    // KWin on Asahi
+            (DrmFourcc::Xrgb2101010, true, false), // mutter on Asahi
+            (DrmFourcc::Argb2101010, true, false),
+            (DrmFourcc::Xbgr2101010, true, true),
+            (DrmFourcc::Abgr2101010, true, true),
+        ] {
+            assert_eq!(layout(format), Layout { ten_bit, red_low }, "{format:?}");
+        }
+        for other in [DrmFourcc::Rgb565, DrmFourcc::Nv12, DrmFourcc::Rgbx8888] {
+            assert_eq!(Layout::of(other), None, "{other:?}");
+        }
+    }
+
     /// The 10-bit path is the one that fails SILENTLY — an 8-bit decode of
     /// XR30 keeps every shape and ruins every colour, which reads as a
     /// colour-space bug. Pin the channel extraction against hand-computed
     /// values so a future edit to the shifts fails loudly instead.
     #[test]
     fn repack_unpacks_xr30_channels() {
-        // x=0b11, R=0x3FF (255), G=0x200 (128), B=0x000 (0)
-        let word: u32 = (0b11 << 30) | (0x3FF << 20) | (0x200 << 10);
+        // x=0b11, R=0x3FF (255), G=0x200 (128), B=0x100 (64)
+        let word: u32 = (0b11 << 30) | (0x3FF << 20) | (0x200 << 10) | 0x100;
         let src = word.to_le_bytes().to_vec();
-        let out = repack_to_bgra(&src, 1, 1, 4, true);
-        assert_eq!(out[0], 0, "B");
+        let out = repack_to_bgra(&src, 1, 1, 4, layout(DrmFourcc::Xrgb2101010));
+        assert_eq!(out[0], 64, "B");
         assert_eq!(out[1], 128, "G");
         assert_eq!(out[2], 255, "R");
         assert_eq!(out[3], 255, "alpha must be forced opaque");
+    }
+
+    /// The same word read as XB30 is the same picture with red and blue
+    /// exchanged — the field at bits 20..30 is BLUE there.
+    #[test]
+    fn repack_unpacks_xb30_channels() {
+        // x=0b11, B=0x3FF (255), G=0x200 (128), R=0x100 (64)
+        let word: u32 = (0b11 << 30) | (0x3FF << 20) | (0x200 << 10) | 0x100;
+        let src = word.to_le_bytes().to_vec();
+        let out = repack_to_bgra(&src, 1, 1, 4, layout(DrmFourcc::Abgr2101010));
+        assert_eq!(&out[..], &[255, 128, 64, 0xFF], "B, G, R, opaque");
     }
 
     /// XR24 is already BGRA in memory, so the repack is a copy — except for
@@ -1248,9 +1340,19 @@ mod tests {
     #[test]
     fn repack_passes_xr24_through_and_forces_alpha() {
         let src = vec![10u8, 20, 30, 0x00];
-        let out = repack_to_bgra(&src, 1, 1, 4, false);
+        let out = repack_to_bgra(&src, 1, 1, 4, layout(DrmFourcc::Xrgb8888));
         assert_eq!(&out[..3], &[10, 20, 30]);
         assert_eq!(out[3], 0xFF);
+    }
+
+    /// AB24 is R,G,B,A in memory (KWin's scanout on Asahi). Copied through as
+    /// if it were AR24, the picture keeps every shape and swaps red for blue —
+    /// the bug that reads as "the colours are a bit off".
+    #[test]
+    fn repack_swaps_ab24_into_bgra_and_forces_alpha() {
+        let src = vec![30u8, 20, 10, 0x00]; // R=30, G=20, B=10, A=0
+        let out = repack_to_bgra(&src, 1, 1, 4, layout(DrmFourcc::Abgr8888));
+        assert_eq!(&out[..], &[10, 20, 30, 0xFF], "B, G, R, opaque");
     }
 
     /// Scanout pitch is nearly always wider than width×4 (4096-wide 10-bit
@@ -1263,7 +1365,7 @@ mod tests {
         let mut src = vec![0u8; 12 * 2];
         src[0] = 1; // row 0, px 0, B
         src[12] = 2; // row 1, px 0, B  — only correct if pitch is honoured
-        let out = repack_to_bgra(&src, 2, 2, 12, false);
+        let out = repack_to_bgra(&src, 2, 2, 12, layout(DrmFourcc::Xrgb8888));
         assert_eq!(out[0], 1);
         assert_eq!(
             out[2 * 4],
@@ -1280,8 +1382,8 @@ mod tests {
     /// sample grid by a pixel — which looks fine in a screenshot and is wrong.
     #[cfg(feature = "scrap-capture")]
     #[test]
-    fn fused_half_matches_repack_then_downscale_for_xr24() {
-        // 4×4 XR24 with a padded pitch, values chosen so every 2×2 block
+    fn fused_half_matches_repack_then_downscale_for_xr24_and_ab24() {
+        // 4×4 8-bit with a padded pitch, values chosen so every 2×2 block
         // averages to something non-uniform.
         let (w, h, pitch) = (4u32, 4u32, 20u32);
         let mut src = vec![0u8; (pitch * h) as usize];
@@ -1294,11 +1396,27 @@ mod tests {
                 src[o + 3] = 0x00;
             }
         }
-        let full = repack_to_bgra(&src, w, h, pitch, false);
-        let (two_step, tw, th) = super::super::downscale_bgra_2x(&full, w, h, w * 4);
-        let fused = repack_bgra_half(&src, w, h, pitch, false);
-        assert_eq!((tw, th), (w / 2, h / 2));
-        assert_eq!(fused, two_step, "fusing must not change the picture");
+        for format in [DrmFourcc::Xrgb8888, DrmFourcc::Abgr8888] {
+            let full = repack_to_bgra(&src, w, h, pitch, layout(format));
+            let (two_step, tw, th) = super::super::downscale_bgra_2x(&full, w, h, w * 4);
+            let fused = repack_bgra_half(&src, w, h, pitch, layout(format));
+            assert_eq!((tw, th), (w / 2, h / 2));
+            assert_eq!(
+                fused, two_step,
+                "{format:?}: fusing must not change the picture"
+            );
+        }
+    }
+
+    /// The fused path must swap AB24 exactly as the full-size one does —
+    /// pinned without the shared filter, so it runs in every build.
+    #[test]
+    fn fused_half_swaps_ab24_into_bgra() {
+        // Four identical R=200, G=100, B=50 pixels: the mean is the pixel.
+        let (w, h, pitch) = (2u32, 2u32, 8u32);
+        let src = [200u8, 100, 50, 0x00].repeat(4);
+        let out = repack_bgra_half(&src, w, h, pitch, layout(DrmFourcc::Abgr8888));
+        assert_eq!(&out[..], &[50, 100, 200, 0xFF], "B, G, R, opaque");
     }
 
     /// 10-bit has no two-step equivalent to compare against (the shared filter
@@ -1316,10 +1434,13 @@ mod tests {
             let o = y * pitch as usize + x * 4;
             src[o..o + 4].copy_from_slice(&word.to_le_bytes());
         }
-        let out = repack_bgra_half(&src, w, h, pitch, true);
+        let out = repack_bgra_half(&src, w, h, pitch, layout(DrmFourcc::Xrgb2101010));
         assert_eq!(out.len(), 4, "2x2 → 1 pixel");
         assert_eq!(out[2], 2, "R: mean of 4,8,12,16 in 10-bit is 10 → 8-bit 2");
         assert_eq!(out[3], 0xFF);
+        // The same words as XB30 put that field in BLUE, and red reads zero.
+        let out = repack_bgra_half(&src, w, h, pitch, layout(DrmFourcc::Xbgr2101010));
+        assert_eq!(&out[..], &[2, 0, 0, 0xFF], "XB30: bits 20..30 are blue");
     }
 
     /// The policy has to match scrap's, or a host gets a different picture size
