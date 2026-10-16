@@ -359,7 +359,15 @@ fn pack_cap(cap: Option<(u32, u32)>) -> u64 {
 }
 
 fn unpack_cap(packed: u64) -> Option<(u32, u32)> {
-    (packed != 0).then(|| ((packed >> 32) as u32, packed as u32))
+    (packed != 0).then_some(((packed >> 32) as u32, packed as u32))
+}
+
+/// What decides one grab's size: the policy the capture opened with, and the
+/// pump's encode box at that moment (FR-107 P1, [`wants_half`]).
+#[derive(Clone, Copy, Debug)]
+struct Sizing {
+    policy: DownscalePolicy,
+    cap: Option<(u32, u32)>,
 }
 
 /// How often a capture whose display is off looks again: no frame period's
@@ -949,17 +957,19 @@ fn worker(
     );
 
     while let Ok(reply_tx) = cmd_rx.recv() {
-        let cap = if follow_cap {
-            unpack_cap(output_cap.load(Ordering::Relaxed))
-        } else {
-            None
+        let sizing = Sizing {
+            policy: downscale,
+            cap: if follow_cap {
+                unpack_cap(output_cap.load(Ordering::Relaxed))
+            } else {
+                None
+            },
         };
         let reply = match grab(
             &card,
             &planes,
             &mut cached,
-            downscale,
-            cap,
+            sizing,
             cursor.as_mut(),
             gate.as_mut(),
             &unchanged,
@@ -1014,8 +1024,7 @@ fn grab(
     card: &Card,
     planes: &[PlaneEntry],
     cached: &mut Option<Cached>,
-    downscale: DownscalePolicy,
-    cap: Option<(u32, u32)>,
+    sizing: Sizing,
     cursor: Option<&mut CursorReader>,
     gate: Option<&mut IdleGate>,
     unchanged: &AtomicU64,
@@ -1128,7 +1137,7 @@ fn grab(
     // read 35 MB → write 35 MB → read 35 MB → write 8.8 MB and
     // read 35 MB → write 8.8 MB; the backend there is memory-bandwidth bound,
     // so the pass count is the cost.
-    let scaled = if wants_half(width, height, downscale, cap) {
+    let scaled = if wants_half(width, height, sizing.policy, sizing.cap) {
         Scaled {
             data: repack_bgra_half(mapping.as_slice(), width, height, pitch, layout),
             width: width / 2,
