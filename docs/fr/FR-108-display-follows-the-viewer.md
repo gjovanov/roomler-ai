@@ -45,7 +45,11 @@ the screen.
 `attended` is true when **the person's session is unlocked and a person touched its input within the last
 `N`** (default 5 minutes, open decision 1). Anything else is unattended:
 
-- the session is **locked** (`lock_state` reads `Locked`): the person walked away;
+- the session is **locked** (`lock_state` reads `Locked`): the person walked away. ⚠️ P0 measured that the
+  worker **cannot** switch a locked screen: on the lock screen `ChangeDisplaySettingsExW` failed with
+  `rc=-1` (§8 row 4). So a locked host is answered `locked`, and the request waits. When the session
+  unlocks, typically the controller typing the password, and no person's input has come since, the match
+  applies then (P1b). An unattended office PC is usually locked, so this is the main path, not an edge;
 - **nobody is signed in**: SystemContext at the logon screen;
 - a **virtual desktop** (`ROOMLERD_AGENT_VIRTUAL_DESKTOP=1`, Linux, P2): nobody can sit at it;
 - the input has been idle for at least `N`, or the only input since the session began was the controller's.
@@ -72,7 +76,8 @@ Every request gets one answer, `rc:display-match.state`:
 { "t": "rc:display-match.state", "on": true, "mode": { "w": 1600, "h": 900 } }
 ```
 
-`refused` ∈ `attended`, `disabled_on_device`, `no_fitting_mode`, `switch_failed`, `unsupported`.
+`refused` ∈ `attended`, `locked` (waiting for an unlock, 3a), `disabled_on_device`, `no_fitting_mode`,
+`switch_failed`, `unsupported`.
 - **An older viewer** ignores the unknown `t`.
 - **A newer viewer facing an older agent** gets no answer, and shows the toggle as it does today.
 - ⚠️ **A refusal word the viewer does not know** (from a newer agent) is shown verbatim, never read as success.
@@ -93,6 +98,9 @@ person's screen is not a tug of war (open decision 2).
 stateDiagram-v2
     [*] --> Asked: rc:display-match, the stage size
     Asked --> Refused: never · attended · no fitting mode
+    Asked --> Waiting: locked (the worker cannot switch it)
+    Waiting --> Matched: unlocked, and no person since (P1b)
+    Waiting --> Refused: unlocked by the person
     Asked --> Matched: unattended, or always
     Matched --> Restored: toggle off · session end · peer drop
     Matched --> Restored: a person's input (P1b)
@@ -114,9 +122,9 @@ As plan §5.3 has it:
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| P0 | This spec and the claim. Three probes on vmtest: (1) does `GetLastInputInfo`, read in the worker, move on the person's input (QMP) and on the controller's injection, and can the two be told apart; (2) what `ChangeDisplaySettingsExW(CDS_FULLSCREEN)` does at the lock screen and at the logon screen (SystemContext); (3) a guest with several modes, a display driver beyond the Basic Render Driver, so a real switch and restore can be seen | docs only | this PR |
+| P0 | This spec and the claim. Three probes on vmtest: (1) does `GetLastInputInfo`, read in the worker, move on the person's input (QMP) and on the controller's injection, and can the two be told apart; (2) what `ChangeDisplaySettingsExW(CDS_FULLSCREEN)` does at the lock screen and at the logon screen (SystemContext); (3) a guest with several modes, a display driver beyond the Basic Render Driver, so a real switch and restore can be seen | docs only | **done 2026-10-16** (§8 rows 2–4): (1) the idle clock moves for both the person and the controller, so the guard must subtract the arbiter's injections; (2) at the lock screen the switch **fails** (`rc=-1`), which reshaped 3a; the logon screen is still owed; (3) a virtio video model plus `viogpudo` gives session 1 23 modes, and the red was recorded on it |
 | P1 | The guard (3a), the owner's key (3b), the answer (3c) and the viewer's words (3d), on Windows | `display_match = always` restores rc.191 | — |
-| P1b | The person comes back (3e) | — | — |
+| P1b | The locked host's request applies at the unlock when nobody is at the screen (3a), and the person coming back restores their mode (3e) | — | — |
 | P2 | Linux virtual desktops: the Xvfb mode ladder | — | — |
 | P3 | Modes no monitor offers, through the virtual display | — | — |
 | P4 | Several displays | — | — |
@@ -128,9 +136,10 @@ As plan §5.3 has it:
   minute; QMP input on vmtest), a session with display match ON (the default) leaves the host's mode
   unchanged, and the viewer shows why. Red first: the deployed agent attempts the switch (its log; on a host
   with several modes, the mode itself).
-- [ ] **AC2 (unattended switches, then restores):** a locked host, and a host idle for at least `N`, switch to
-  the picked mode when the viewer asks, and the original mode is back at disconnect. Both are read on the
-  host (the screenshot's size, or `EnumDisplaySettings`).
+- [ ] **AC2 (unattended switches, then restores):** a host idle for at least `N` switches to the picked mode when
+  the viewer asks. A locked host answers `locked`, then switches once the controller has unlocked it (P1b).
+  The original mode is back at disconnect in both cases. All of it is read on the host (the screenshot's
+  size, or `EnumDisplaySettings`).
 - [ ] **AC3 (the person comes back, P1b):** during a matched session, the person's input restores the mode
   within 1 s, and the viewer is told.
 - [ ] **AC4 (the owner decides):** `never` refuses every time with `disabled_on_device`. `always` switches an
@@ -161,6 +170,9 @@ As plan §5.3 has it:
 | # | Date | Cell | Result |
 |---|---|---|---|
 | 1 | 2026-10-16 | **The evidence, not a cell.** A kept vmtest Win11 `--type system` guest on agent 0.4.139, `vmtest` Active at the console; the production viewer (fresh browser storage, so display match ON) driven by Playwright from the vmtest harness host | The agent tried to switch the attended guest's display: `could not switch mode req_w=946 req_h=598 e=no supported mode fits within 946x598 (1 modes)`. The guest's Basic Render Driver offers one mode, so nothing changed, and nothing told the viewer |
+| 2 | 2026-10-16 | **AC1, the red (0.4.139), on a guest with several modes.** The same guest after P0 (3): video model virtio plus `viogpudo` from the harness's virtio-win ISO, so session 1 lists 23 modes (640×480 … 5120×2160) where QXL with the Basic Render Driver listed one. The person was at the screen: `vmtest` Active at the console, with QMP mouse moves just before and during the session. The viewer sent the toggle's exact message on its own control channel, `{t:"rc:display-match", enable:true, width:946, height:598}` | **The attended screen was taken.** 13:43:38.307Z the request; 13 ms later the agent: `switched host display mode req_w=946 req_h=598 mode_w=640 mode_h=480`. The host's own screenshots at 13:43:44 and 13:43:54, while the person kept moving the mouse, were **640×480**, with the companion cut off at the right edge and the taskbar gone. At disconnect: `restored on session close (owner)`, then 1280×800 again. The viewer received no answer. **Wrong turn:** a first session that only connected and held, with the toggle at its ON default, sent no request at all. The viewer sends on connect only if the agent's OS is known and the stage element exists at that moment (`RemoteControl.vue` L4385) |
+| 3 | 2026-10-16 | **P0 (1): the idle clock.** The same guest. A sampler ran as the person in session 1 for 150 s, reading `GetLastInputInfo` every 250 ms; the person moved over QMP, then the controller moved the pointer over the stage (20 moves), then the person again | **Both move it, and nothing tells them apart.** The person's moves (13:46:24.6–26.4) and the controller's (every sample 13:46:55.5–58.6) and the person's again (13:47:19.8–20.5) each advanced the tick, with `idle_ms` 0–234 at each read. So the guard cannot read "a person" from the clock alone; it must subtract the arbiter's own injections (3a), as FR-92 does |
+| 4 | 2026-10-16 | **P0 (2): the lock screen.** The same guest, locked (`LockWorkStation` as the person; LogonUI 1). A session asked for 946×598 | **A locked screen cannot be switched by the worker.** The agent: `could not switch mode req_w=946 req_h=598 e=ChangeDisplaySettingsExW failed rc=-1`, and the host's screenshots before, during and after read 1280×800. So "locked" waits for the unlock instead of switching (3a, P1b). The logon screen (nobody signed in) is still owed |
 
 ## 9. Related
 
