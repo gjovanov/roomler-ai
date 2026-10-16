@@ -268,6 +268,44 @@ controls**, each restored afterwards:
   `loginctl lock-session <id>`. P0 picks the macOS mechanism.
 - It runs on every end, including a host Disconnect and a controller crash.
 
+**P0's answer for Windows (2026-10-15, §8 row 11).** `LockWorkStation` locks from the process that runs the
+session. On a SystemContext install that process is SYSTEM in the console session, not the person's: it
+locked from there, so no new process or token is needed.
+
+**As built, P3a (the device's own policy, 2026-10-15)** (`agents/roomlerd/src/lock_on_end.rs`):
+
+| Piece | What it does |
+|---|---|
+| `lock_on_end` | `never` (default) · `auto` · `always`, a device key (`crates/agent-core/src/config.rs`), live. Absent from `DesiredConfig` (named in `the_device_owned_refusals_are_not_pushable`), and set over the LocalAPI only by the console person, whose screen it locks. `LockOnEnd` (`crates/remote_control/src/models.rs`) is ordered, so `stricter` is a `max`, ready for P3b's directive. An unknown value reads as `always`, as an unknown `FeaturePolicy` reads as `off` |
+| The decision, at the session's START | The indicator's `show_session_full` reads the policy and, for `auto`, what was found: the screen locked (`lock_state`), and nobody at the computer. On Windows that is no input for 5 minutes (`GetLastInputInfo`); on Linux it is logind's `IdleHint`, or no active session at all. A re-offer under the same session id keeps the first decision, because what `auto` found is what it must restore |
+| The lock, at the LAST end | `hide_session` (every end: the viewer's hangup, the host's Disconnect, a limit, the connection dropping) asks the tracker. It locks only when no other session is live, and only if this end or an earlier one since the last lock asked for it. A session whose answer never left has no say (`session_aborted`). The OS call runs on a thread of its own |
+| Mechanisms | Windows `LockWorkStation()`; Linux `loginctl lock-session` on seat0's active session; macOS none yet (an end that should lock logs that it could not) |
+
+**The default, against decision 3** (`auto` on new installs, `never` on existing ones until the field cells
+pass). P3a ships `never` everywhere, because AC7's field cells have not passed yet. The flip for new
+installs comes after them, written into the config that enrollment creates, so an existing config that
+lacks the key keeps reading `never`. ⚠️ **A refinement, to confirm with the operator:** the flip should
+cover only installs that can unlock remotely, the Windows service (SystemContext) and the Linux root
+daemon. A per-user install's worker cannot reach the secure desktop. With `auto` there, a session started
+on an idle computer would lock it at the end, and the next session would see a padlock until someone signs
+in at the machine. A mesh feature must never cost the operator remote access to the box.
+
+⚠️ **`auto` restores what was found at the start.** A person who unlocked the computer during the session
+is locked out at its end and signs in again. Telling their input from the controller's would need the
+input hooks FR-92 bans. ⚠️ **On a per-user install, `always` cannot be undone remotely.** The per-user
+worker cannot reach the secure desktop, so the next session sees a padlock until someone signs in at the
+computer. The key's own description says so.
+
+Tests: the decision table, cell by cell; the tracker (the lock waits for the last session and is taken
+once; a re-offer keeps the first decision; an unknown end or an aborted session never locks); the policy's
+spellings, order and unknown value; the key's set, echo and clear; the console-only gate on the LocalAPI.
+CI's clippy lines pass on Linux, and so does the Windows build with the overlay, which compiles the
+`LockWorkStation` path. **Negative controls**, each restored afterwards:
+- `auto` reading only "locked": the decision table fails;
+- the tracker locking without waiting for the last session: the waiting test fails;
+- a re-offer overwriting the first decision: the re-offer test fails;
+- the LocalAPI's console gate removed: the gate test fails.
+
 ### 3f. Host mute
 
 **P0 measures** whether WASAPI loopback still captures with the render endpoint muted. StarDesk's own help
@@ -286,7 +324,9 @@ says muting the host silences the client too. The FR ships only the honest versi
 | P1c | The viewer: the toggle, the refusal reasons, asking for `PRIVACY` only from a device that serves it (§3c as built) | the toggle | **merged** #2199 (`f9a66a01e`): `usePrivacyMode.spec.ts` (11), the vitest suite and `vue-tsc`. **Field-verified** (§8 rows 9–10): the toggle reaches the curtain through the channel on agent 0.4.136 |
 | P1d | The device's account (§3c as built): `rc:privacy.activity`, the `privacy_activity` claims collection and its route, the ledger that lets the next process report a curtain this one died holding (`worker_exit`) | none needed: an older server drops the frame, an older agent sends none | **#2258**: unit, channel and integration tests with four negative controls (§3c). The field cell for AC4 (`taskkill /F` on a curtained worker) waits for the first agent release that carries it |
 | P2 | The input block, if P0 cleared it | `privacy_input_block=false` | — |
-| P3 | Lock on end (Windows, Linux, macOS) | `lock_on_end=never` | — |
+| P3 | Lock on end (Windows, Linux, macOS), in two steps below | `lock_on_end=never` | P3a #2272 in review; P3b after it |
+| P3a | The device's own `lock_on_end`: the decision at each session's start, the lock at the last end, Windows and Linux (§3e as built) | `lock_on_end=never` (default) | **#2272**: unit tests in four crates. P0's mechanism and AC7's red are field-recorded (§8 rows 11–12). The green waits for the first agent release that carries it |
+| P3b | The server's half: an admin may ask a device's sessions for stricter (`AccessPolicy`, forwarded on `rc:request`), never looser, and the device row's control | `none` | — |
 | P4 | Host mute | the toggle | — |
 | P5 | Docs and the field table | — | **#2240** (first part): `docs/privacy-mode.md` documents what P1 built. That covers the two parties who must agree, the request's sequence (mermaid), the server's strip reasons and the device's four gates, how the curtain works, the per-OS table and the honest limits. It is linked from `docs/README.md` and from `remote-control.md` §11.2. AC8 stays open until the page can show the block and Ctrl+Alt+Del as the way out, which wait for P2 |
 
@@ -328,7 +368,9 @@ says muting the host silences the client too. The FR ships only the honest versi
   `indicator/win.rs:1741: uses SetWindowsHookEx`. Restored to an identical file, it passed again.
 - [ ] **AC7 (lock on end):** with `auto`, a session that began on a locked guest leaves it locked
   (`Get-Process LogonUI` present). One that began unlocked and attended leaves it unlocked. `always` locks
-  both.
+  both. *Progress 2026-10-15:* the red is recorded on agent 0.4.137 (§8 row 12). A session that began
+  locked, unlocked by the controller through the viewer, left the guest unlocked. P3a builds the policy.
+  The green waits for a release that carries it.
 - [ ] **AC8:** **Docs:** a `docs/privacy-mode.md` page with a mermaid diagram of the curtain, the block and
   the way out, the per-OS table, and the honest limits (secure desktop, macOS), linked from
   `docs/README.md`. `docs/remote-control.md`'s consent section links it.
@@ -379,6 +421,8 @@ weighed.
 | 8 | 2026-10-14 | The same check on an **attended** guest, so the agent captured through WGC | **The same, under WGC.** The host's screenshot showed the curtain, and the stream (VP9 4:4:4 on a direct path) showed the desktop under it: the companion, the console, the taskbar. `curtain up, out of capture` at 10:55:36Z, down 40 s later |
 | 9 | 2026-10-15 | **AC5's field half: a device that has not opted in.** A kept vmtest Win11 **system** cell (vmtest signed in at the console), agent 0.4.136, the production viewer driven by Playwright from the vmtest harness host | The device advertises `privacy-available` and not `privacy-mode`. The viewer's `rc:session.request` asks `VIEW \| INPUT \| CLIPBOARD \| FILES \| RECORD`, with no `PRIVACY`. The grant in `rc:session.created` is `VIEW \| INPUT \| CLIPBOARD \| FILES`. The toolbar shows no privacy control and no refusal control |
 | 10 | 2026-10-15 | **AC1, end to end, and the owner's withdrawal.** The same guest. The owner opts in (`roomler config set privacy_mode_allowed true`, run as the console user through an interactive task, because the LocalAPI takes it from the console only); 70 s later the device advertises `privacy-mode`. The viewer covers the screen with the toggle; the owner then switches it off mid-session. Host truth is `virsh screenshot` at each step | The request asks for `PRIVACY` and the grant holds it (`privacy_refused: null`). **Host:** the desktop before the toggle (the red); **"This computer is being used remotely, by vmtest admin. Privacy mode is on: the screen is hidden while they work. To end the session, move the pointer to the top edge of the screen and choose Disconnect."** while it is on; the desktop again once the owner withdraws. **Viewer:** the live desktop throughout (VP9 4:4:4 over the DataChannel), the toggle lit while on. After the withdrawal the toggle is off, titled "Privacy mode is off: this device's owner hasn't allowed privacy mode" |
+| 11 | 2026-10-15 | **P3's mechanism on Windows (P0).** A kept vmtest Win11 `--type system` guest on agent 0.4.137, with autologon (`vmtest` Active in session 1). The call ran through Fleet RPC's HTTP route, whose identity on Windows is the console worker, with the vmtest org's exec switch opened and then restored to `false` | exec's identity was `nt authority\system`, session **1**. `rundll32.exe user32.dll,LockWorkStation` from it: exit 0, and **LogonUI 0 → 1**, read in-session and again from session 0. The host's screenshot went from the unlocked desktop to the lock screen with `vmtest`'s password prompt. So P3 locks from the process that already runs the session |
+| 12 | 2026-10-15 | **AC7, the red (0.4.137).** The same guest, locked by row 11. The production viewer was driven by Playwright from the vmtest harness host. The oracle is LogonUI over SSH, and the surface is the host's own screenshot | Start: **locked** (LogonUI 1). A session connected and streamed the lock screen. The controller typed the guest's password through the viewer: **unlocked** (LogonUI 0), so SystemContext's input reaches the secure desktop. The viewer disconnected. 15 s later the guest was **still unlocked** (LogonUI 0, the host showing the desktop). **Wrong turns:** the first attempt pressed Space to wake the lock screen, but the password field already had the focus, so the space became the password's first character. The second pressed Enter to clear that error, but the dialog had gone, so it submitted an empty password. Both were harness bugs; the third typed straight into the field. Two failed attempts in all |
 
 Attended runs happen on the operator's spare box, never on a machine someone is using.
 

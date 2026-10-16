@@ -2811,6 +2811,18 @@ where
                             .into(),
                     }
                 }
+                // FR-99 P3 — and whether this console's screen is locked when a
+                // remote session ends: it is the console person who would
+                // have to sign in again. Equality.
+                Ok(Request::ConfigSet { key, .. })
+                    if key == "lock_on_end" && !peer.is_console_user() =>
+                {
+                    Response::Error {
+                        message: "only the person at this device's console can change \
+                              whether this computer locks when a remote session ends"
+                            .into(),
+                    }
+                }
                 // FR-101 P2b — and what a remote session may take from this
                 // console: its clipboard, its files, its audio. Equality.
                 Ok(Request::ConfigSet { key, .. })
@@ -6906,6 +6918,42 @@ mod tests {
             let r = ask(
                 me,
                 r#"{"t":"config_set","d":{"key":"allow_plaintext_server","value":"true"}}"#,
+            )
+            .await;
+            assert!(!is_console_refusal(&r), "{r:?}");
+        }
+    }
+
+    /// FR-99 P3 — whether this console locks when a remote session ends is the
+    /// console person's call, as for the TLS escape above: an unidentified
+    /// peer is refused, set AND clear, on the exact key only.
+    #[tokio::test]
+    async fn only_the_console_user_decides_the_lock_on_end() {
+        for line in [
+            r#"{"t":"config_set","d":{"key":"lock_on_end","value":"always"}}"#,
+            r#"{"t":"config_set","d":{"key":"lock_on_end"}}"#,
+        ] {
+            let r = ask(ClientPeer::UNKNOWN, line).await;
+            assert!(
+                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("locks")),
+                "{line} → {r:?}"
+            );
+        }
+        let r = ask(
+            ClientPeer::UNKNOWN,
+            r#"{"t":"config_set","d":{"key":"lock_on_end_x","value":"always"}}"#,
+        )
+        .await;
+        assert!(!is_console_refusal(&r), "{r:?}");
+        let me = ClientPeer {
+            session_id: console_session_id(),
+            uid: own_uid(),
+            system_account: None,
+        };
+        if me.is_console_user() {
+            let r = ask(
+                me,
+                r#"{"t":"config_set","d":{"key":"lock_on_end","value":"auto"}}"#,
             )
             .await;
             assert!(!is_console_refusal(&r), "{r:?}");

@@ -1473,6 +1473,17 @@ pub struct AgentConfig {
     /// LocalAPI only by the person at the console, whose screen it covers.
     #[serde(default)]
     pub privacy_mode_allowed: bool,
+    /// FR-99 P3 — what this device does to its screen when the last remote
+    /// session ends: `never` (the default), `auto` (lock when the session
+    /// began on a locked screen or with nobody at the computer) or `always`.
+    /// Read LIVE: the decision is taken at each session's start and applied
+    /// when the last one ends.
+    ///
+    /// ⚠️ Device-owned: absent from `DesiredConfig`, and set over the LocalAPI
+    /// only by the person at the console, whose screen it locks. A server may
+    /// ask for stricter on a session (P3b), never lower this floor.
+    #[serde(default)]
+    pub lock_on_end: roomler_ai_remote_control::models::LockOnEnd,
     /// FR-101 P2b — this device's own floor for the clipboard in a remote
     /// session: `on` (the default), `ask` (only on a session the person here
     /// approves, on a prompt that names it) or `off`. The stricter of this and
@@ -2562,6 +2573,7 @@ pub fn test_fixture() -> AgentConfig {
         record_remote_audio: false,
         keep_busy_enabled: true,
         privacy_mode_allowed: false,
+        lock_on_end: Default::default(),
         rc_clipboard: Default::default(),
         rc_files: Default::default(),
         rc_audio: Default::default(),

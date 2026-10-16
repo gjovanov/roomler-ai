@@ -3626,6 +3626,9 @@ async fn handle_server_msg(
                 // and it is in no map `close_all_peers` walks: close it here
                 // (dropping a WebRTC peer frees none of its sockets) and take
                 // down the banner just raised for it (found in review).
+                // FR-99 P3: a session that never went live has no say in
+                // locking the screen.
+                crate::lock_on_end::session_aborted(session_id);
                 indicator.hide_session(session_id.to_hex());
                 close_within_budget(peer.close(), session_id, "answer_send_failed").await;
                 return Err(ConnectError::Transient(e.context("sending answer")));

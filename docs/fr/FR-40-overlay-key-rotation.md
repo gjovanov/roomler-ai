@@ -23,7 +23,7 @@ were not printed (re-checked with a masked scan of the transcript, 2026-08-30).
 
 There is **no remedy for that today** short of re-enrolling the device: no rotation on the CLI,
 none over LocalAPI (`overlay_wg_secret_key` is deliberately unwritable there,
-`crates/agent-core/src/config_surface.rs:2149-2118`), none on the web. Re-enrolling needs a fresh
+`crates/agent-core/src/config_surface.rs:2161-2130`), none on the web. Re-enrolling needs a fresh
 enrollment token, local or `exec` access as SYSTEM/root, a daemon restart, and it is not what an
 operator reaches for when a key leaks — they reach for "rotate".
 
