@@ -259,7 +259,22 @@ export const useHiveStore = defineStore('hive', () => {
    *  server's `hive.replicaset`), from the same answer. A server before it
    *  says nothing of it, which reads as no. */
   const copied = ref<Record<string, boolean>>({})
+  /** P2i-3 — and whether its members can search the copies there: copies on,
+   *  and an archive replica that searches is online (`search`, P2i-2). A
+   *  server before it says nothing of it, which reads as no. */
+  const searchable = ref<Record<string, boolean>>({})
   const servedAsks = new Map<string, Promise<boolean>>()
+  const searchAsks = new Map<string, Promise<boolean>>()
+
+  /** Keep one `GET …/hive` answer: `null` is a `404`, served nowhere. */
+  function keepAnswer(tenantId: string, r: { enabled?: boolean; replicaset?: boolean; search?: boolean } | null): boolean {
+    const on = r?.enabled === true
+    const copies = on && r?.replicaset === true
+    copied.value = { ...copied.value, [tenantId]: copies }
+    searchable.value = { ...searchable.value, [tenantId]: copies && r?.search === true }
+    served.value = { ...served.value, [tenantId]: on }
+    return on
+  }
 
   /**
    * P1g — ask once per organization. `200` is served and `404` is not, both
@@ -272,17 +287,11 @@ export const useHiveStore = defineStore('hive', () => {
     const asked = servedAsks.get(tenantId)
     if (asked) return asked
     const ask = api
-      .get<{ enabled?: boolean; replicaset?: boolean }>(`/tenant/${tenantId}/hive`)
-      .then((r) => {
-        const on = r.enabled === true
-        copied.value = { ...copied.value, [tenantId]: on && r.replicaset === true }
-        served.value = { ...served.value, [tenantId]: on }
-        return on
-      })
+      .get<{ enabled?: boolean; replicaset?: boolean; search?: boolean }>(`/tenant/${tenantId}/hive`)
+      .then((r) => keepAnswer(tenantId, r))
       .catch((e: unknown) => {
         if (e instanceof ApiError && e.status === 404) {
-          copied.value = { ...copied.value, [tenantId]: false }
-          served.value = { ...served.value, [tenantId]: false }
+          keepAnswer(tenantId, null)
         } else {
           console.warn('[hive] could not ask whether agent sessions serve this organization', e)
         }
@@ -290,6 +299,31 @@ export const useHiveStore = defineStore('hive', () => {
       })
       .finally(() => servedAsks.delete(tenantId))
     servedAsks.set(tenantId, ask)
+    return ask
+  }
+
+  /**
+   * P2i-3 — whether the organization's copies can be searched NOW, asked
+   * again at every call: archive replicas come and go, so the sessions page
+   * asks each time it opens. No answer keeps what was known; the open
+   * decides anyway.
+   */
+  function checkSearchable(tenantId: string): Promise<boolean> {
+    const asked = searchAsks.get(tenantId)
+    if (asked) return asked
+    const ask = api
+      .get<{ enabled?: boolean; replicaset?: boolean; search?: boolean }>(`/tenant/${tenantId}/hive`)
+      .then((r) => {
+        keepAnswer(tenantId, r)
+        return searchable.value[tenantId] === true
+      })
+      .catch((e: unknown) => {
+        if (e instanceof ApiError && e.status === 404) keepAnswer(tenantId, null)
+        else console.warn('[hive] could not ask whether this organization can be searched', e)
+        return searchable.value[tenantId] === true
+      })
+      .finally(() => searchAsks.delete(tenantId))
+    searchAsks.set(tenantId, ask)
     return ask
   }
 
@@ -360,7 +394,9 @@ export const useHiveStore = defineStore('hive', () => {
     removeParticipant,
     served,
     copied,
+    searchable,
     checkServed,
+    checkSearchable,
     fetchBrain,
     keepFact,
     editFact,
