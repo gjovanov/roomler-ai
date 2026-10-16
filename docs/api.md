@@ -380,6 +380,18 @@ who said no: the server's `not_found` · `device_offline` · `device_unsupported
 server. The starter of a live session may prompt it; everyone else reads. Every open is in
 `hive_audit` (`action: view`).
 
+**Searching (P2i-2) is not a route either.** A member sends `hive:search.open {tenant_id}` on the
+user WebSocket. The server checks the organization (copies on, served, the asker a member; anyone
+else gets `not_found`), then the policy's designated archive replicas online here that advertise
+`hive-search` (none: `no_archive_replica`), one connection's grants and a rate (20 opens per minute
+per user and organization). It names the sessions the asker may read whose copy the archive
+replica holds, at most 500, the most recently active first (none: `no_session`), and answers
+`hive:search.ready` with ICE servers and how many sessions it named once the device has confirmed
+the grant. The rest of the handshake is a view's, by its grant. The query and every hit flow
+browser ⇄ device over the peer and never through the server. Every open is in `hive_audit`
+(`action: search`, with the count, never a query). `GET …/hive` answers `search`: whether the
+organization can be searched, for the SPA's box.
+
 **Adopted sessions (P1j) are not started by a route either.** A person adopts the Claude Code
 sessions they run in a terminal (`roomler hive adopt`, on a device whose owner allows it:
 `hive_adopt`, advertised as `hive-adopt`). The device offers each one with `rc:hive.adopt

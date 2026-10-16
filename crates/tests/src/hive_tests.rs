@@ -12853,3 +12853,686 @@ async fn a_member_a_fork_is_made_from_that_is_removed_is_let_go_at_once() {
         "{all:?}"
     );
 }
+
+// ─── P2i-2 — a search, the server's half ────────────────────────────────────
+
+/// What an archive replica that searches advertises: it serves views (whose
+/// frames carry a search's peer), holds copies, offers itself as an archive,
+/// and answers a search over what it holds.
+const SEARCHES: &[&str] = &[
+    "exec",
+    "hive",
+    "hive-view",
+    "hive-replica",
+    "hive-archive",
+    "hive-search",
+];
+
+/// An organization on Pro with copies on: a primary that runs sessions, and
+/// archive replicas the policy designates in this order, each connected with
+/// its own capabilities.
+struct Searchable {
+    app: TestApp,
+    seeded: SeededTenant,
+    tid: String,
+    admin: String,
+    primary: Device,
+    archives: Vec<Device>,
+}
+
+async fn searchable(tag: &str, archives: &[&[&str]]) -> Searchable {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant(tag).await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let primary = device(&app, &seeded, &format!("{tag}-primary"), VIEWS_HIVE).await;
+    let mut devices = Vec::new();
+    for (i, caps) in archives.iter().enumerate() {
+        devices.push(device(&app, &seeded, &format!("{tag}-archive-{i}"), caps).await);
+    }
+    let mut policy = a_policy(0);
+    policy["replicaset"] = json!({
+        "min": 2, "max": 2 + archives.len(), "archive": true,
+        "prefer": ["owner_devices"], "restricted_tags": [],
+    });
+    policy["archive_devices"] = json!(
+        devices
+            .iter()
+            .map(|d| d.agent_id.clone())
+            .collect::<Vec<_>>()
+    );
+    let (code, p) = put_policy(&app, &tid, &admin, &policy).await;
+    assert_eq!(code, 200, "{p}");
+    Searchable {
+        app,
+        seeded,
+        tid,
+        admin,
+        primary,
+        archives: devices,
+    }
+}
+
+/// A session the admin starts on the primary, whose copy each archive
+/// replica in `holders` (indexes into `archives`) took; its id. The others'
+/// joins go unanswered: pending, they hold nothing.
+async fn held_session(s: &mut Searchable, folder: &str, holders: &[usize]) -> String {
+    let started = started(&s.app, &s.tid, &s.admin, &mut s.primary, folder).await;
+    let sid = started["id"].as_str().unwrap().to_string();
+    for &i in holders {
+        let a = &mut s.archives[i];
+        loop {
+            let join = read_until(&mut a.ws, "rc:hive.replica.join")
+                .await
+                .expect("the archive replica is asked to join");
+            if join["session_id"] == sid.as_str() {
+                break;
+            }
+        }
+        joined(&mut a.ws, &sid).await;
+        let id = a.agent_id.clone();
+        wait_stored(&s.app, &sid, "the archive replica took its copy", |d| {
+            stored_member(d, &id).1 == "joined"
+        })
+        .await;
+    }
+    sid
+}
+
+/// Set a session's last activity, so the order a grant names is known.
+async fn active_at(app: &TestApp, sid: &str, millis_ago: i64) {
+    let at = bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - millis_ago);
+    app.db
+        .collection::<Document>("agent_sessions")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(sid).unwrap() },
+            doc! { "$set": { "updated_at": at } },
+        )
+        .await
+        .unwrap();
+}
+
+/// The `search` audit rows of `tid`, in order: (outcome, reason, sessions),
+/// each row's keys checked to hold nothing a search could have said.
+async fn search_audit(app: &TestApp, tid: &str) -> Vec<(String, String, Option<i64>)> {
+    let mut rows = app
+        .db
+        .collection::<Document>("hive_audit")
+        .find(doc! { "tenant_id": ObjectId::parse_str(tid).unwrap(), "action": "search" })
+        .sort(doc! { "at": 1, "_id": 1 })
+        .await
+        .unwrap();
+    let allowed = [
+        "_id",
+        "tenant_id",
+        "user_id",
+        "device_id",
+        "action",
+        "outcome",
+        "reason",
+        "sessions",
+        "at",
+    ];
+    let mut out = Vec::new();
+    while let Some(d) = rows.next().await {
+        let d = d.unwrap();
+        for k in d.keys() {
+            assert!(
+                allowed.contains(&k.as_str()),
+                "a search's row holds {k}: {d:?}"
+            );
+        }
+        out.push((
+            d.get_str("outcome").unwrap().to_string(),
+            d.get_str("reason").unwrap_or("").to_string(),
+            d.get("sessions")
+                .and_then(|b| b.as_i32().map(i64::from).or_else(|| b.as_i64())),
+        ));
+    }
+    out
+}
+
+/// Wait until `tid` holds `want` `search` audit rows. A grant's row is
+/// written once its push to the device returned, so a test that has just read
+/// the grant off the device's socket can be ahead of it (measured on a loaded
+/// host, 2026-10-16).
+async fn wait_search_audit(app: &TestApp, tid: &str, want: u64) {
+    let filter = doc! { "tenant_id": ObjectId::parse_str(tid).unwrap(), "action": "search" };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let n = app
+            .db
+            .collection::<Document>("hive_audit")
+            .count_documents(filter.clone())
+            .await
+            .unwrap();
+        if n >= want || Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// FR-90 P2i-2 — a search grant names what its asker may read and the
+/// archive replica holds a copy of, and nothing else: a session the asker is
+/// not in the room of, or whose copy the archive replica never took, is left
+/// out; the most recently active first. The browser is told it may dial only
+/// once the device confirmed it, with how many sessions it names; the audit
+/// says how many, and never a word of what was searched.
+#[tokio::test]
+async fn a_search_names_only_what_its_asker_may_read_and_the_archive_holds() {
+    let mut s = searchable("srchname", &[SEARCHES]).await;
+    let (tid, admin) = (s.tid.clone(), s.admin.clone());
+    let member = s.seeded.member.id.clone();
+    let own = held_session(&mut s, "/srv/own", &[0]).await;
+    let shared = held_session(&mut s, "/srv/shared", &[0]).await;
+    let unheld = held_session(&mut s, "/srv/unheld", &[]).await;
+    // A session the archive replica runs itself: its row there is the
+    // primary's, no copy, and it searches only copies.
+    let runs_here = started(&s.app, &tid, &admin, &mut s.archives[0], "/srv/runs-here").await;
+    assert_eq!(
+        members(&runs_here),
+        [(s.archives[0].agent_id.clone(), "primary".to_string())],
+        "{runs_here}"
+    );
+    for sid in [&shared, &unheld] {
+        let (code, body) = set_part(&s.app, &tid, &admin, sid, &member, "reader").await;
+        assert_eq!(code, 200, "{body}");
+    }
+    active_at(&s.app, &own, 60_000).await;
+    active_at(&s.app, &shared, 1_000).await;
+
+    // The member reads `shared` and `unheld`; the archive holds `own` and
+    // `shared`: one session.
+    let mut mws = user_ws(&s.app, &s.seeded.member.access_token).await;
+    user_send(
+        &mut mws,
+        "hive:search.open",
+        json!({"tenant_id": tid, "ref": "m1"}),
+    )
+    .await;
+    let grant = read_until(&mut s.archives[0].ws, "rc:hive.search.grant")
+        .await
+        .expect("the archive replica is asked");
+    assert_eq!(
+        grant["sessions"],
+        json!([shared]),
+        "the member's: only what they may read and the archive holds: {grant}"
+    );
+    assert_eq!(grant["user_id"], member);
+    assert_eq!(grant["ttl_secs"], 600);
+    assert!(
+        grant.get("q").is_none() && grant.get("query").is_none(),
+        "{grant}"
+    );
+    let gid = grant["grant_id"].as_str().unwrap().to_string();
+    assert!(
+        user_read_for(&mut mws, "hive:search.ready", Duration::from_millis(400))
+            .await
+            .is_none(),
+        "the browser was told to dial before the device confirmed"
+    );
+    send(
+        &mut s.archives[0].ws,
+        json!({"t": "rc:hive.view.grant_ack", "grant_id": gid}),
+    )
+    .await;
+    let ready = user_read(&mut mws, "hive:search.ready")
+        .await
+        .expect("ready once the device confirmed");
+    assert_eq!(
+        (
+            ready["grant_id"].as_str(),
+            ready["ref"].as_str(),
+            ready["sessions"].as_u64()
+        ),
+        (Some(gid.as_str()), Some("m1"), Some(1)),
+        "{ready}"
+    );
+    assert!(!ready["ice_servers"].as_array().unwrap().is_empty());
+    assert!(
+        ready.get("session_id").is_none(),
+        "a search views no session: {ready}"
+    );
+
+    // The peer rides the view's frames, by the grant.
+    user_send(
+        &mut mws,
+        "hive:view.offer",
+        json!({"grant_id": gid, "sdp": "v=0 offer"}),
+    )
+    .await;
+    let offer = read_until(&mut s.archives[0].ws, "rc:hive.view.offer")
+        .await
+        .expect("the offer reaches the archive replica");
+    assert_eq!(offer["sdp"], "v=0 offer");
+    assert_eq!(offer["ice_servers"], ready["ice_servers"]);
+
+    // The owner reads both of theirs it holds, the most recently active first.
+    let mut aws = user_ws(&s.app, &admin).await;
+    user_send(&mut aws, "hive:search.open", json!({"tenant_id": tid})).await;
+    let grant = read_until(&mut s.archives[0].ws, "rc:hive.search.grant")
+        .await
+        .unwrap();
+    assert_eq!(
+        grant["sessions"],
+        json!([shared, own]),
+        "the owner's copies, the most recently active first, and never one it runs: {grant}"
+    );
+
+    wait_search_audit(&s.app, &tid, 2).await;
+    assert_eq!(
+        search_audit(&s.app, &tid).await,
+        [
+            ("sent".to_string(), String::new(), Some(1)),
+            ("sent".to_string(), String::new(), Some(2)),
+        ],
+        "the audit says how many sessions each named"
+    );
+}
+
+/// FR-90 P2i-2 — every way a search is refused, each in its own word: an
+/// organization the asker is not in, or where nothing is copied, answers as a
+/// bogus one does; no designated archive replica that searches online here;
+/// one that holds nothing the asker may read; and the device's own word,
+/// with its detail.
+#[tokio::test]
+async fn a_search_is_refused_where_there_is_nothing_to_search() {
+    async fn refused(ws: &mut UserWs, tid: &str) -> Value {
+        user_send(
+            ws,
+            "hive:search.open",
+            json!({"tenant_id": tid, "ref": "r"}),
+        )
+        .await;
+        user_read(ws, "hive:search.refused").await.expect("refused")
+    }
+
+    // Nothing is copied on this server.
+    let off = hive_app().await;
+    let seeded = off.seed_tenant("srchoff").await;
+    let mut ws = user_ws(&off, &seeded.admin.access_token).await;
+    assert_eq!(
+        refused(&mut ws, &seeded.tenant_id).await["reason"],
+        "not_found",
+        "nothing is copied on this server"
+    );
+
+    // An archive replica connected without `hive-search`: it holds copies
+    // and offers itself, but a build before P2i-1 drops a search grant.
+    let mut s = searchable("srchrefuse", &[&SEARCHES[..5]]).await;
+    let tid = s.tid.clone();
+    held_session(&mut s, "/srv/a", &[0]).await;
+    let mut ws = user_ws(&s.app, &s.admin).await;
+    assert_eq!(
+        refused(&mut ws, &tid).await["reason"],
+        "no_archive_replica",
+        "a build without hive-search is never asked"
+    );
+    assert!(
+        !device_hears(
+            &mut s.archives[0].ws,
+            "rc:hive.search.grant",
+            Duration::from_millis(300)
+        )
+        .await
+    );
+
+    // Someone outside the organization, and a bogus organization.
+    let other = s.app.seed_tenant("srchother").await;
+    let mut ows = user_ws(&s.app, &other.admin.access_token).await;
+    assert_eq!(
+        refused(&mut ows, &tid).await["reason"],
+        "not_found",
+        "someone outside the organization"
+    );
+    assert_eq!(
+        refused(&mut ows, "not-an-id").await["reason"],
+        "not_found",
+        "a bogus organization"
+    );
+
+    // An archive replica that searches, holding nothing the member may read.
+    let mut s = searchable("srchnothing", &[SEARCHES]).await;
+    let tid = s.tid.clone();
+    held_session(&mut s, "/srv/b", &[0]).await;
+    let mut mws = user_ws(&s.app, &s.seeded.member.access_token).await;
+    assert_eq!(
+        refused(&mut mws, &tid).await["reason"],
+        "no_session",
+        "nothing the member may read"
+    );
+    assert!(
+        !device_hears(
+            &mut s.archives[0].ws,
+            "rc:hive.search.grant",
+            Duration::from_millis(300)
+        )
+        .await,
+        "nothing to search is sent to no device"
+    );
+
+    // The device's own word, with its detail, reaches the browser.
+    let mut aws = user_ws(&s.app, &s.admin).await;
+    user_send(
+        &mut aws,
+        "hive:search.open",
+        json!({"tenant_id": tid, "ref": "a1"}),
+    )
+    .await;
+    let grant = read_until(&mut s.archives[0].ws, "rc:hive.search.grant")
+        .await
+        .unwrap();
+    send(
+        &mut s.archives[0].ws,
+        json!({"t": "rc:hive.view.grant_ack", "grant_id": grant["grant_id"],
+               "refused": "hive_disabled", "detail": "not an archive\nreplica"}),
+    )
+    .await;
+    let r = user_read(&mut aws, "hive:search.refused")
+        .await
+        .expect("the device's refusal reaches the browser as a search's");
+    assert_eq!(
+        (r["ref"].as_str(), r["reason"].as_str()),
+        (Some("a1"), Some("hive_disabled")),
+        "{r}"
+    );
+    assert!(
+        r["message"].as_str().is_some_and(|m| !m.contains('\n')),
+        "the detail, clamped to one line: {r}"
+    );
+
+    assert_eq!(
+        search_audit(&s.app, &tid).await,
+        [
+            ("refused".to_string(), "no_session".to_string(), Some(0)),
+            ("sent".to_string(), String::new(), Some(1)),
+        ]
+    );
+}
+
+/// FR-90 P2i-2 — a search grant ends when its user no longer reads what it
+/// names: taken out of a session's room, at once; out of the room by any
+/// other road, at its next renewal. A change of their part that leaves them
+/// reading it ends nothing, and a renewal that finds them reading renews.
+#[tokio::test]
+async fn a_search_grant_ends_when_its_user_no_longer_reads_what_it_names() {
+    let mut s = searchable("srchends", &[SEARCHES]).await;
+    let (tid, admin) = (s.tid.clone(), s.admin.clone());
+    let member = s.seeded.member.id.clone();
+    let shared = held_session(&mut s, "/srv/shared", &[0]).await;
+    let (code, body) = set_part(&s.app, &tid, &admin, &shared, &member, "reader").await;
+    assert_eq!(code, 200, "{body}");
+    let mut mws = user_ws(&s.app, &s.seeded.member.access_token).await;
+
+    /// A search the device confirmed; its grant id.
+    async fn ready_search(mws: &mut UserWs, dev: &mut Device, tid: &str) -> String {
+        user_send(mws, "hive:search.open", json!({"tenant_id": tid})).await;
+        let grant = read_until(&mut dev.ws, "rc:hive.search.grant")
+            .await
+            .expect("the archive replica is asked");
+        let gid = grant["grant_id"].as_str().unwrap().to_string();
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.view.grant_ack", "grant_id": gid}),
+        )
+        .await;
+        user_read(mws, "hive:search.ready").await.expect("ready");
+        gid
+    }
+
+    // Driving it now, still reading it: the search goes on, and renews.
+    let gid = ready_search(&mut mws, &mut s.archives[0], &tid).await;
+    grant_hive_run_to_member(&s.app, &s.seeded).await;
+    let (code, body) = set_part(&s.app, &tid, &admin, &shared, &member, "driver").await;
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        user_read_for(&mut mws, "hive:view.closed", Duration::from_millis(500))
+            .await
+            .is_none(),
+        "a change of part that leaves them reading ends no search"
+    );
+    user_send(&mut mws, "hive:view.renew", json!({"grant_id": gid})).await;
+    let renewed = user_read(&mut mws, "hive:view.renewed")
+        .await
+        .expect("a renewal that finds them reading renews");
+    assert_eq!(renewed["grant_id"], gid);
+    let renew = read_until(&mut s.archives[0].ws, "rc:hive.view.renew")
+        .await
+        .unwrap();
+    assert_eq!(renew["grant_id"], gid);
+
+    // Taken out of the room: the search that names it ends at once.
+    let resp = s
+        .app
+        .auth_delete(&participant_url(&tid, &shared, Some(&member)), &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let closed = user_read(&mut mws, "hive:view.closed")
+        .await
+        .expect("the removal ends the search at once");
+    assert_eq!(
+        (closed["grant_id"].as_str(), closed["reason"].as_str()),
+        (Some(gid.as_str()), Some("removed")),
+        "{closed}"
+    );
+    let told = read_until(&mut s.archives[0].ws, "rc:hive.view.close")
+        .await
+        .unwrap();
+    assert_eq!(told["grant_id"], gid);
+
+    // Back in, then out of the room by another road: the next renewal finds
+    // it, closes the grant, and tells the device.
+    let (code, body) = set_part(&s.app, &tid, &admin, &shared, &member, "reader").await;
+    assert_eq!(code, 200, "{body}");
+    let gid = ready_search(&mut mws, &mut s.archives[0], &tid).await;
+    let room = stored(&s.app, &shared)
+        .await
+        .get_object_id("room_id")
+        .unwrap();
+    s.app
+        .db
+        .collection::<Document>("room_members")
+        .delete_many(doc! { "room_id": room, "user_id": ObjectId::parse_str(&member).unwrap() })
+        .await
+        .unwrap();
+    user_send(&mut mws, "hive:view.renew", json!({"grant_id": gid})).await;
+    let closed = user_read(&mut mws, "hive:view.closed")
+        .await
+        .expect("a renewal finds them out of the room");
+    assert_eq!(
+        (closed["grant_id"].as_str(), closed["reason"].as_str()),
+        (Some(gid.as_str()), Some("not_a_member")),
+        "{closed}"
+    );
+    let told = read_until(&mut s.archives[0].ws, "rc:hive.view.close")
+        .await
+        .unwrap();
+    assert_eq!(told["grant_id"], gid);
+}
+
+/// FR-90 P2i-2 — of several archive replicas that search, the one that holds
+/// the most of what the asker may read is asked; among equals, the first in
+/// the policy's order.
+#[tokio::test]
+async fn the_archive_replica_that_holds_the_most_is_asked() {
+    let mut s = searchable("srchmost", &[SEARCHES, SEARCHES]).await;
+    let tid = s.tid.clone();
+    let first = held_session(&mut s, "/srv/one", &[0, 1]).await;
+    let mut ws = user_ws(&s.app, &s.admin).await;
+
+    // Equal: the first designated.
+    user_send(&mut ws, "hive:search.open", json!({"tenant_id": tid})).await;
+    let grant = read_until(&mut s.archives[0].ws, "rc:hive.search.grant")
+        .await
+        .expect("the first designated, among equals");
+    assert_eq!(grant["sessions"], json!([first]));
+    user_send(
+        &mut ws,
+        "hive:view.close",
+        json!({"grant_id": grant["grant_id"]}),
+    )
+    .await;
+
+    // The second holds one more.
+    let second = held_session(&mut s, "/srv/two", &[1]).await;
+    active_at(&s.app, &first, 60_000).await;
+    user_send(&mut ws, "hive:search.open", json!({"tenant_id": tid})).await;
+    let grant = read_until(&mut s.archives[1].ws, "rc:hive.search.grant")
+        .await
+        .expect("the one that holds the most");
+    assert_eq!(grant["sessions"], json!([second, first]));
+    assert!(
+        !device_hears(
+            &mut s.archives[0].ws,
+            "rc:hive.search.grant",
+            Duration::from_millis(300)
+        )
+        .await
+    );
+}
+
+/// FR-90 P2i-2 — the SPA's question says whether the organization can be
+/// searched: copies on, and a designated archive replica whose row says it
+/// searches and is not offline. Its rows, so a pod without its socket answers
+/// alike.
+#[tokio::test]
+async fn the_hive_question_says_whether_the_organization_can_be_searched() {
+    async fn search_flag(app: &TestApp, tid: &str, token: &str) -> Value {
+        let (code, body) = status_and_json(
+            app.auth_get(&format!("/api/tenant/{tid}/hive"), token)
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, 200, "{body}");
+        body["search"].clone()
+    }
+
+    // Nothing is copied on this server, whatever a policy left from when it
+    // was says: an archive replica that searches, connected and designated.
+    let off = hive_app().await;
+    let seeded = off.seed_tenant("srchflagoff").await;
+    let left = device(&off, &seeded, "srchflagoff-archive", SEARCHES).await;
+    off.db
+        .collection::<Document>("hive_policies")
+        .insert_one(doc! {
+            "tenant_id": ObjectId::parse_str(&seeded.tenant_id).unwrap(),
+            "replicaset": { "min": 2, "max": 3, "archive": true,
+                            "prefer": ["owner_devices"], "restricted_tags": [] },
+            "retention_days": 30,
+            "archive_devices": [ObjectId::parse_str(&left.agent_id).unwrap()],
+            "revision": 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        search_flag(&off, &seeded.tenant_id, &seeded.admin.access_token).await,
+        json!(false),
+        "nothing is copied here, whatever a policy left says"
+    );
+
+    let s = searchable("srchflag", &[SEARCHES]).await;
+    let token = s.seeded.member.access_token.clone();
+    assert_eq!(
+        search_flag(&s.app, &s.tid, &token).await,
+        json!(true),
+        "a designated archive replica that searches, online"
+    );
+
+    // Its row says it no longer searches: no box.
+    let rpc: Vec<String> = SEARCHES[..5].iter().map(|w| w.to_string()).collect();
+    set_device(
+        &s.app,
+        &s.archives[0].agent_id,
+        doc! { "capabilities.rpc": rpc },
+    )
+    .await;
+    assert_eq!(
+        search_flag(&s.app, &s.tid, &token).await,
+        json!(false),
+        "its row no longer says it searches"
+    );
+
+    // A row that searches but went quiet long ago, its socket gone: no box.
+    let quiet = stored_device(&s.app, &s.seeded, "srchflag-quiet", SEARCHES).await;
+    let long_ago =
+        bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - 3_600_000);
+    set_device(
+        &s.app,
+        &quiet,
+        doc! { "status": "offline", "last_seen_at": long_ago },
+    )
+    .await;
+    let mut policy = a_policy(1);
+    policy["replicaset"]["archive"] = json!(true);
+    policy["archive_devices"] = json!([quiet]);
+    let (code, p) = put_policy(&s.app, &s.tid, &s.admin, &policy).await;
+    assert_eq!(code, 200, "{p}");
+    assert_eq!(
+        search_flag(&s.app, &s.tid, &token).await,
+        json!(false),
+        "a row that went quiet long ago"
+    );
+}
+
+/// FR-90 P2i-2 — a search is paced after the identity gates: one browser
+/// connection holds at most four grants, a search's counted with a view's;
+/// and a person opens at most [`search_limits::OPEN_RATE_PER_MINUTE`]
+/// searches a minute in an organization. Each refusal is audited.
+#[tokio::test]
+async fn a_search_is_paced_per_connection_and_per_minute() {
+    let mut s = searchable("srchpace", &[SEARCHES]).await;
+    let tid = s.tid.clone();
+    held_session(&mut s, "/srv/p", &[0]).await;
+    let mut ws = user_ws(&s.app, &s.admin).await;
+
+    let mut grants = Vec::new();
+    for _ in 0..4 {
+        user_send(&mut ws, "hive:search.open", json!({"tenant_id": tid})).await;
+        let g = read_until(&mut s.archives[0].ws, "rc:hive.search.grant")
+            .await
+            .expect("granted");
+        grants.push(g["grant_id"].as_str().unwrap().to_string());
+    }
+    user_send(&mut ws, "hive:search.open", json!({"tenant_id": tid})).await;
+    let r = user_read(&mut ws, "hive:search.refused")
+        .await
+        .expect("a fifth grant on one connection is refused");
+    assert_eq!(r["reason"], "too_many_views", "{r}");
+
+    // Closing them frees the connection; the minute's opens run out.
+    for g in &grants {
+        user_send(&mut ws, "hive:view.close", json!({"grant_id": g})).await;
+    }
+    let rate = roomler_ai_remote_control::hive::search_limits::OPEN_RATE_PER_MINUTE;
+    for _ in 4..rate {
+        user_send(&mut ws, "hive:search.open", json!({"tenant_id": tid})).await;
+        let g = read_until(&mut s.archives[0].ws, "rc:hive.search.grant")
+            .await
+            .expect("granted within the minute");
+        user_send(
+            &mut ws,
+            "hive:view.close",
+            json!({"grant_id": g["grant_id"]}),
+        )
+        .await;
+    }
+    user_send(&mut ws, "hive:search.open", json!({"tenant_id": tid})).await;
+    let r = user_read(&mut ws, "hive:search.refused")
+        .await
+        .expect("an open past the minute's is refused");
+    assert_eq!(r["reason"], "rate_limited", "{r}");
+
+    let refusals: Vec<String> = search_audit(&s.app, &tid)
+        .await
+        .into_iter()
+        .filter(|(o, _, _)| o == "refused")
+        .map(|(_, r, _)| r)
+        .collect();
+    assert_eq!(refusals, ["too_many_views", "rate_limited"]);
+}
