@@ -32,9 +32,11 @@
 //!   accident.
 //! - **Wayland** — XWayland gives us a connection, and an override-redirect
 //!   window on it maps as a normal XWayland surface. It shows; it just cannot
-//!   guarantee stacking above native Wayland clients, because no compositor
-//!   outside wlroots exposes `wlr-layer-shell` to arbitrary clients. Better
-//!   than nothing, and honest about it in the log.
+//!   guarantee stacking above native Wayland clients. The protocol that could
+//!   (`wlr-layer-shell`) is a Wayland one: mutter offers none, and KWin offers
+//!   `zwlr_layer_shell_v1` only to a native Wayland client, never to an X11
+//!   window (measured on Plasma 6.6.4, #2286). Better than nothing, and honest
+//!   about it in the log.
 //!
 //! ⚠️ **X11 has no capture exclusion.** The Windows panel is invisible in the
 //! outgoing video (`WDA_EXCLUDEFROMCAPTURE`); this one is not, and there is no

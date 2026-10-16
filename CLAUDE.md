@@ -798,10 +798,12 @@ Fixed-and-shipped issues live in `git log` and the docs. Currently open:
   (`roomler-desktop` over LocalAPI) → notification (Linux, the desktop's own, with
   Approve/Deny: FR-93 P6f) → cli (`roomlerd consent`) → none, which reports
   `no_prompt_surface` instead of a silent deny, and the chosen surface is logged per
-  prompt (before it, "the prompt didn't appear" was unattributable). ⚠️ GNOME/KDE
-  **Wayland** expose no `wlr-layer-shell` to arbitrary clients, so those sessions
-  have no native path at all and fall through to the companion **by design, not by
-  omission**. ⚠️ An agent-side prompt **timeout** must not come back as a bare
+  prompt (before it, "the prompt didn't appear" was unattributable). ⚠️ On
+  **Wayland** the native panel is the X11 one, through Xwayland: a per-user daemon
+  shows it, with no guarantee of stacking above native windows (mutter offers no
+  `wlr-layer-shell` at all; KWin offers `zwlr_layer_shell_v1`, but only to a native
+  Wayland client, #2286), and a root daemon has no `DISPLAY` and falls through to the
+  companion **by design, not by omission**. ⚠️ An agent-side prompt **timeout** must not come back as a bare
   `granted:false` — "nobody was at the machine" reaching the controller as "a human
   refused you"; the hub waits 5 s **longer** than the window it announces, because
   with equal timers its own fallback fired ~130 ms before the agent's reasoned
