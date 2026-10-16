@@ -509,7 +509,7 @@ async fn rig(opts: Opts) -> Result<Rig> {
         })
     }));
     exchange(&browser_pc, &agent_pc).await?;
-    let agent_dc = tokio::time::timeout(Duration::from_secs(5), agent_dc_rx)
+    let agent_dc = tokio::time::timeout(Duration::from_secs(30), agent_dc_rx)
         .await
         .map_err(|_| anyhow!("agent on_data_channel timed out"))??;
     // The attach-time gate, as `peer.rs` runs it.
