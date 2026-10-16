@@ -13,11 +13,11 @@
 > | P1a | the server's gate: the `PRIVACY` bit, the two capability words, the strip with its reason | shipped |
 > | P1b | the device: the owner's switch, the curtain, the `privacy` channel, the device's own refusals | shipped (0.4.136) |
 > | P1c | the viewer: the toggle, the refusal reasons | shipped |
-> | P1d | the device's account: every curtain up, down (and why) and refused, in `privacy_activity`, including the curtain a killed process could not report | merged; the agent half ships in the next agent release |
+> | P1d | the device's account: every curtain up, down (and why) and refused, in `privacy_activity`, including the curtain a killed process could not report | shipped (0.4.139); a killed worker's `worker_exit` field-verified |
 > | P2 | blocking the person's keyboard and mouse (`BlockInput`, Ctrl+Alt+Del to take the computer back) | not built |
-> | P3a | lock the computer when the last session ends: the device's own `lock_on_end` (Windows, Linux) | merged; ships with the next agent release |
-> | P3b | an admin asking a device's sessions for a stricter lock | merged; ships with the next agent release |
-> | P4a | mute the host's speakers while the curtain is up (Windows), the controller keeping the audio | merged; ships with the next agent release |
+> | P3a | lock the computer when the last session ends: the device's own `lock_on_end` (Windows, Linux) | shipped (0.4.139); field-verified on Windows |
+> | P3b | an admin asking a device's sessions for a stricter lock | agent half shipped (0.4.139); the server half awaits a deploy |
+> | P4a | mute the host's speakers while the curtain is up (Windows), the controller keeping the audio | merged; ships with agent 0.4.140 |
 
 While a privacy-mode session runs, **the person at the computer sees a notice instead of the
 desktop**: "This computer is being used remotely, by …". The controller keeps seeing the real
