@@ -349,17 +349,10 @@ fn fresher_than(s: &AgentSession, target: ObjectId, fence: i64, seq: i64) -> Opt
 }
 
 /// P2e-6a — how much of the session's chain a copy that ends at
-/// `(fence, seq)` holds, as a `seq`: every copy's chain is the one the record
-/// knows, up to where each older fence ended, so the `seq` orders them. Past
-/// an end is a tail a move away from an unreachable primary cut off, which
-/// the copy sets aside once it follows the session again (P2d-3): it counts
-/// for nothing. Never `(fence, seq)` compared whole: an empty copy says
-/// `seq` 0 at the fence it joined at, the newest of all.
+/// `(fence, seq)` holds, as a `seq`: [`crate::model::on_chain`], the one rule
+/// the API answers for each member too (P2j-1).
 fn on_chain(s: &AgentSession, fence: i64, seq: i64) -> i64 {
-    s.fences
-        .iter()
-        .find(|m| m.fence == fence)
-        .map_or(seq, |end| seq.min(end.seq))
+    crate::model::on_chain(&s.fences, fence, seq)
 }
 
 /// P2e-6a — whether a copy that ends at `(fence, seq, hash)` ends on the

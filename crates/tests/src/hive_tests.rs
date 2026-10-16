@@ -12995,8 +12995,9 @@ async fn search_audit(app: &TestApp, tid: &str) -> Vec<(String, String, Option<i
 
 /// Wait until `tid` holds `want` `search` audit rows. A grant's row is
 /// written once its push to the device returned, so a test that has just read
-/// the grant off the device's socket can be ahead of it (measured on a loaded
-/// host, 2026-10-16).
+/// the grant off the device's socket can be ahead of it, and so can one that
+/// read the device's refusal, which its answer's handler relays (both
+/// measured on a loaded host, 2026-10-16).
 async fn wait_search_audit(app: &TestApp, tid: &str, want: u64) {
     let filter = doc! { "tenant_id": ObjectId::parse_str(tid).unwrap(), "action": "search" };
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -13243,12 +13244,16 @@ async fn a_search_is_refused_where_there_is_nothing_to_search() {
         "the detail, clamped to one line: {r}"
     );
 
+    // The device's refusal reaches the browser through its answer's handler,
+    // which can run before the open writes its `sent` row.
+    wait_search_audit(&s.app, &tid, 2).await;
     assert_eq!(
         search_audit(&s.app, &tid).await,
         [
             ("refused".to_string(), "no_session".to_string(), Some(0)),
             ("sent".to_string(), String::new(), Some(1)),
-        ]
+        ],
+        "each refusal audited in its own word, and the grant the device refused as sent"
     );
 }
 

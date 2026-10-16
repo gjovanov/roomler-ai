@@ -49,6 +49,66 @@ export interface HiveSession {
   /** P1j — `adopted`: a terminal session its owner adopted, read-only (it
    *  runs in the terminal). Absent from an older server: started. */
   origin?: 'started' | 'adopted'
+  /** P2c-2b — where its copies are. Absent: placed nowhere (the server
+   *  copies nothing, or an older record). */
+  replicaset?: HiveReplicaset
+  /** P2e-3 — the move in flight. Absent: none. */
+  promotion?: HivePromotion
+}
+
+/** `ReplicasetView` — `crates/modules/hive/src/model.rs`. */
+export interface HiveReplicaset {
+  policy_revision: number
+  min: number
+  max: number
+  restricted_tags: string[]
+  members: HiveReplicaMember[]
+  /** Why it holds fewer than `min` copies: `adopted` · `restricted` · `no_device`. */
+  short?: string
+  placed_at: string
+}
+
+/** One copy: `role` is `primary` · `owner` · `archive` · `teleport`; `state`
+ *  `pending` · `joined` · `refused` · `leaving` (a newer word is shown as is). */
+export interface HiveReplicaMember {
+  device_id: string
+  role: string
+  state: string
+  refusal?: string
+  answered_at?: string
+  /** Where its copy ends, as it last said: the device's claim. */
+  tip?: { fence: number; seq: number; hash: string; checkpoint_seq?: number; at: string }
+  /** P2j-1 — how much of the session's chain its copy holds, as a `seq`: the
+   *  rule a move is decided by, so the freshest holds the most. Absent
+   *  without a tip, and from a server before P2j-1. */
+  holds?: number
+}
+
+/** `PromotionView` — a move in flight, step by step. */
+export interface HivePromotion {
+  id: string
+  to: string
+  to_name: string
+  folder: string
+  from: string
+  from_fence: number
+  by: string
+  /** `preparing` · `joining` · `draining` · `syncing` · `moving`. */
+  state: string
+  started_at: string
+  deadline: string
+  teleport: boolean
+  fork: boolean
+}
+
+/** `POST …/promote`: `promoting` (the member is ready, the primary drains),
+ *  `pending` (the member has not answered yet) or `refused`, in the words of
+ *  the gate that said no. Always 200 for a well-formed request. */
+export interface HivePromoteResult {
+  outcome: 'promoting' | 'pending' | 'refused'
+  reason?: string
+  message?: string
+  session: HiveSession
 }
 
 /** `POST …/hive/session` — always 200 for a well-formed request. */
@@ -225,6 +285,18 @@ export const useHiveStore = defineStore('hive', () => {
     return res
   }
 
+  /** P2j-1 — the owner moves a running session to a member that holds a
+   *  copy (P2e-3). The answer's record replaces the one held. */
+  async function promote(
+    tenantId: string,
+    sessionId: string,
+    body: { device_id: string; folder?: string },
+  ): Promise<HivePromoteResult> {
+    const res = await api.post<HivePromoteResult>(`${base(tenantId)}/${sessionId}/promote`, body)
+    if (res.session) upsert(res.session)
+    return res
+  }
+
   async function stop(tenantId: string, sessionId: string): Promise<HiveStopResult> {
     const res = await api.post<HiveStopResult>(`${base(tenantId)}/${sessionId}/stop`, {})
     upsert(res.session)
@@ -388,6 +460,7 @@ export const useHiveStore = defineStore('hive', () => {
     fetchSession,
     start,
     stop,
+    promote,
     upsert,
     fetchParticipants,
     setParticipant,
