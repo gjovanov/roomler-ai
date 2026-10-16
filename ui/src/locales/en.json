@@ -377,6 +377,30 @@
         "next": "Once it runs it appears under Archive replicas: turn on Designated to make it one.",
         "close": "Close"
       }
+    },
+    "search": {
+      "label": "Search the agent sessions you can read",
+      "hint": "Searched on your organization's archive replica: what you type, and what it finds, never reach the server.",
+      "none": "Nothing found.",
+      "scope": "Sessions searched: {n}",
+      "otherSession": "A session you can read",
+      "noRoom": "That session has no room to open.",
+      "openFailed": "Could not open that session: {message}",
+      "failed": "The search failed: {error}",
+      "refusedOther": "The search was refused: {reason}",
+      "refused": {
+        "not_found": "Agent sessions cannot be searched in this organization.",
+        "no_archive_replica": "No archive replica that searches is online right now.",
+        "no_session": "The archive replica holds none of the sessions you can read yet.",
+        "rate_limited": "Too many searches were opened in the last minute. Wait a moment, then type again.",
+        "too_many_views": "This tab holds as many agent session peers as it may. Type again in a moment.",
+        "device_offline": "The archive replica went offline.",
+        "device_unsupported": "The archive replica runs a build that cannot search.",
+        "no_answer": "The archive replica did not answer.",
+        "unavailable": "The server could not prepare the search. Type again in a moment.",
+        "at_capacity": "The archive replica serves as many searches as it can right now.",
+        "hive_disabled": "The archive replica does not serve searches."
+      }
     }
   },
   "keepBusy": {

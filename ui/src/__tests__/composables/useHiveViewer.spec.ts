@@ -246,11 +246,41 @@ describe('useHiveViewer', () => {
     const { viewer, unmount } = await mountViewer()
     viewer.open('sess-redial')
     expect(sent.filter((s) => s.type === 'hive:view.open').length).toBe(1)
+    // A redial as the store makes one: the id cleared at the close, then a
+    // new connection's. Waiting for a new id never saw one (P2i-3).
+    wsState.connectionId = null
+    await flush()
+    expect(sent.filter((s) => s.type === 'hive:view.open').length, 'nothing asked while the socket is down').toBe(1)
+    wsState.connectionId = 'conn-2'
+    await flush()
+    const opens = sent.filter((s) => s.type === 'hive:view.open')
+    expect(opens.length, 'asked again on the new connection').toBe(2)
+    expect(opens[1].data.ref).not.toBe(opens[0].data.ref)
+    unmount()
+  })
+
+  it('takes an open peer down at a redial, and asks again on the new connection', async () => {
+    const { viewer, unmount } = await mountViewer()
+    viewer.open('sess-live')
+    const ref = sent.find((s) => s.type === 'hive:view.open')!.data.ref
+    serverSays('hive:view.ready', { ref, grant_id: 'g-live', ice_servers: [], ttl_secs: 600, may_prompt: true })
+    await flush()
+    const peer = FakePeer.last!
+    peer.channel.open()
+    await flush()
+    peer.channel.deliver({ op: 'hello', v: 1, tip: 0, live: true, state: 'idle', may_prompt: true })
+    await flush()
+    expect(viewer.status.value).toBe('open')
+
+    wsState.connectionId = null
+    await flush()
+    expect(peer.closed, 'the old peer goes with the old connection').toBe(true)
+    expect(sent.some((s) => s.type === 'hive:view.close'), 'nothing said over a socket that is gone').toBe(false)
     wsState.connectionId = 'conn-2'
     await flush()
     const opens = sent.filter((s) => s.type === 'hive:view.open')
     expect(opens.length).toBe(2)
-    expect(opens[1].data.ref).not.toBe(opens[0].data.ref)
+    expect(opens[1].data.session_id).toBe('sess-live')
     unmount()
   })
 
