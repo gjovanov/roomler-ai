@@ -25,6 +25,7 @@
       </span>
       <v-spacer />
       <hive-copies v-if="tenantId" :tenant-id="tenantId" :session-id="sessionId" />
+      <hive-manage v-if="tenantId" :tenant-id="tenantId" :session-id="sessionId" />
       <hive-participants v-if="tenantId" :tenant-id="tenantId" :session-id="sessionId" :adopted="adopted" />
       <v-btn
         v-if="viewer.status.value === 'closed' || viewer.status.value === 'refused'"
@@ -203,6 +204,7 @@ import { renderMarkdown } from '@/composables/useMarkdown'
 import { useHiveViewer, withoutRepeatedInits } from '@/composables/useHiveViewer'
 import HiveParticipants from '@/components/hive/HiveParticipants.vue'
 import HiveCopies from '@/components/hive/HiveCopies.vue'
+import HiveManage from '@/components/hive/HiveManage.vue'
 import HiveToolCall from '@/components/hive/HiveToolCall.vue'
 import HiveToolInput from '@/components/hive/HiveToolInput.vue'
 import HiveToolResult from '@/components/hive/HiveToolResult.vue'

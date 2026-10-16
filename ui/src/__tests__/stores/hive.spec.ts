@@ -15,11 +15,14 @@ const hoisted = vi.hoisted(() => {
       super(`API error ${status}`)
     }
   }
-  return { get: vi.fn(), del: vi.fn(), ApiError }
+  return { get: vi.fn(), del: vi.fn(), post: vi.fn(), ApiError }
 })
-vi.mock('@/api/client', () => ({ api: { get: hoisted.get, delete: hoisted.del }, ApiError: hoisted.ApiError }))
+vi.mock('@/api/client', () => ({
+  api: { get: hoisted.get, delete: hoisted.del, post: hoisted.post },
+  ApiError: hoisted.ApiError,
+}))
 
-import { isAdopted, useHiveStore } from '@/stores/hive'
+import { isAdopted, isBecomingManaged, mayBecomeManaged, useHiveStore } from '@/stores/hive'
 
 beforeEach(() => {
   setActivePinia(createPinia())
@@ -152,5 +155,54 @@ describe('hive store — the organizations agent sessions serve (FR-90 P1g)', ()
     await hive.purge('t', 's1')
     expect(hoisted.del).toHaveBeenLastCalledWith('/tenant/t/hive/session/s1')
     expect(hive.sessions, 'gone once it purges').toEqual([])
+  })
+
+  // FR-90 P2j-5 — an ended terminal session made a managed one: the same
+  // record, its answer's kept; a folder only when one is named.
+  it("asks for a managed session, and keeps the answer's record", async () => {
+    const adopted = {
+      id: 's1',
+      owner_id: 'u1',
+      title: 't',
+      harness: 'claude-code',
+      harness_session: 'h',
+      device_id: 'd',
+      device_name: 'laptop',
+      folder: '/w',
+      status: 'ended' as const,
+      origin: 'adopted' as const,
+      end_reason: 'exited',
+      fence: 1,
+      created_at: '',
+      updated_at: '',
+    }
+    hoisted.post
+      .mockResolvedValueOnce({ outcome: 'pending', session: { ...adopted, origin: undefined, status: 'starting' } })
+      .mockResolvedValueOnce({ outcome: 'refused', reason: 'not_adopted' })
+    const hive = useHiveStore()
+    hive.upsert(adopted)
+    await hive.manage('t', 's1')
+    expect(hoisted.post.mock.calls[0], 'no folder named, none sent').toStrictEqual([
+      '/tenant/t/hive/session/s1/manage',
+      {},
+    ])
+    expect(hive.sessions[0].status, "the answer's record kept").toBe('starting')
+    await hive.manage('t', 's1', '/w2')
+    expect(hoisted.post.mock.calls[1]).toEqual(['/tenant/t/hive/session/s1/manage', { folder: '/w2' }])
+    expect(hive.sessions[0].status, 'an answer without a record changes nothing').toBe('starting')
+  })
+
+  it('tells a session that may become a managed one, and one becoming it', () => {
+    const s = { origin: 'adopted' as const, status: 'ended' as const, end_reason: 'exited' }
+    expect(mayBecomeManaged(s), 'its terminal ended it').toBe(true)
+    expect(mayBecomeManaged({ ...s, end_reason: 'stopped' }), 'stopped from Roomler').toBe(false)
+    expect(mayBecomeManaged({ ...s, status: 'running' }), 'still running').toBe(false)
+    expect(mayBecomeManaged({ ...s, origin: 'started' }), 'a started session').toBe(false)
+    expect(mayBecomeManaged(null)).toBe(false)
+    const asked = { status: 'starting' as const, from_terminal: { at: 'now' } }
+    expect(isBecomingManaged(asked), 'asked, not answered').toBe(true)
+    expect(isBecomingManaged({ ...asked, accepted_at: 'now' }), 'its device took it').toBe(false)
+    expect(isBecomingManaged({ ...asked, from_terminal: { at: 'now', refused: 'folder_taken' } }), 'refused').toBe(false)
+    expect(isBecomingManaged({ status: 'starting' as const }), 'a start that is no asking').toBe(false)
   })
 })

@@ -413,6 +413,19 @@
         "other": "Closed"
       }
     },
+    "manage": {
+      "button": "Make it managed",
+      "title": "Make it a managed session",
+      "explain": "Its terminal session ended. Roomler can carry it on as a managed session on {device}: the same conversation, resumed from its terminal's own history, then run, copied and driven like any session started here.",
+      "folder": "Folder on {device}",
+      "folderHint": "Where its terminal ran, unless you name another",
+      "submit": "Make it managed",
+      "lastRefused": "Its device refused the last asking: {why}",
+      "accepted": "It is a managed session now, on {device}.",
+      "pending": "Asked. Its device has not answered yet: this room shows how it goes.",
+      "refused": "Not made managed: {why}",
+      "inProgress": "Being made a managed session"
+    },
     "memory": {
       "title": "Agent memory",
       "revision": "Revision {rev}",
