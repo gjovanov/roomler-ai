@@ -33,7 +33,8 @@ use roomler_ai_remote_control::models::{
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::session::{ClientTx, LiveSession};
 use roomler_ai_remote_control::signaling::{
-    AgentCloseReason, ClientMsg, IceServer, LocalRelayDescriptor, Role, ServerMsg,
+    AgentCloseReason, ClientMsg, IceServer, LIMIT_NO_COMMON_CODEC, LocalRelayDescriptor, Role,
+    ServerMsg,
 };
 use roomler_ai_remote_control::turn_creds::{
     RelayLoadMap, TurnConfig, TurnMap, ice_servers_for_session, pick_region_with_load,
@@ -526,6 +527,11 @@ pub fn refusals_wire(refused: &FeatureRefusals) -> Option<BTreeMap<String, Strin
 /// only from the AGENT ending a session as `IdleTimeout`. Only the device
 /// measures idleness; a controller claiming it, or the agent pairing it with
 /// another reason, names nothing, and the session ends on its reason alone.
+/// #2251 — likewise `no_common_codec`, only from the agent ending a session
+/// as `Error`: only the device holds both halves of it (the codecs its RTP
+/// track can send, and the offer that carries none of them). A controller's
+/// claim would put the device's verdict in the audit and stop every other
+/// viewer's retry.
 /// A `&'static str` so the hub's own vocabulary is what reaches the viewer
 /// and the audit, never a string off the wire.
 pub fn device_end_limit(
@@ -535,6 +541,7 @@ pub fn device_end_limit(
 ) -> Option<&'static str> {
     match (role, reason, claimed) {
         (Role::Agent, EndReason::IdleTimeout, Some("idle")) => Some("idle"),
+        (Role::Agent, EndReason::Error, Some(LIMIT_NO_COMMON_CODEC)) => Some(LIMIT_NO_COMMON_CODEC),
         _ => None,
     }
 }
@@ -3503,8 +3510,9 @@ impl Hub {
                 };
                 // FR-101 P4b-2 — and the idle limit is the device's claim too:
                 // only it measures idleness, so `limit: "idle"` is named on the
-                // way out only from the agent and only with `IdleTimeout`. A
-                // controller's word, or any other spelling, names no limit.
+                // way out only from the agent and only with `IdleTimeout`
+                // (#2251: `no_common_codec` only with `Error`). A controller's
+                // word, or any other spelling, names no limit.
                 let limit = device_end_limit(role, reason, limit.as_deref());
                 // Terminate stays IDEMPOTENT on an already-gone session (the
                 // agent's overlay-badge disconnect and teardown races rely on
@@ -4145,6 +4153,40 @@ mod tests {
             None
         );
         assert_eq!(device_end_limit(Role::Agent, IdleTimeout, None), None);
+    }
+
+    /// #2251 — `no_common_codec` is the device's to name too, and only with
+    /// `Error`, the reason it rides on.
+    #[test]
+    fn only_the_device_names_no_common_codec() {
+        use EndReason::{AgentHangup, IdleTimeout};
+        assert_eq!(
+            device_end_limit(Role::Agent, EndReason::Error, Some("no_common_codec")),
+            Some("no_common_codec")
+        );
+        assert_eq!(
+            device_end_limit(Role::Controller, EndReason::Error, Some("no_common_codec")),
+            None,
+            "only the device holds both halves: its RTP codecs and the offer"
+        );
+        assert_eq!(
+            device_end_limit(Role::Agent, IdleTimeout, Some("no_common_codec")),
+            None
+        );
+        assert_eq!(
+            device_end_limit(Role::Agent, AgentHangup, Some("no_common_codec")),
+            None
+        );
+        assert_eq!(
+            device_end_limit(Role::Agent, EndReason::Error, Some("NO_COMMON_CODEC")),
+            None
+        );
+        assert_eq!(
+            device_end_limit(Role::Agent, EndReason::Error, Some("idle")),
+            None,
+            "the idle limit stays with `IdleTimeout`"
+        );
+        assert_eq!(device_end_limit(Role::Agent, EndReason::Error, None), None);
     }
 
     /// P3 security — `dispatch` refuses session verbs from a connection

@@ -72,7 +72,7 @@ Every line below was read on `origin/master` at `861d4557`.
    The hub gives every owner-side mode `ASYNC_CONSENT_TIMEOUT` (300 s) and the
    agent uses that as its modal timeout. The doc-comment on
    `ConsentMode::PromptThenEmail` still describes a fallback that was never
-   built. — `hub.rs:38,826`, `models.rs:382`, `state.rs:1199`
+   built. — `hub.rs:39,833`, `models.rs:382`, `state.rs:1199`
 
 ### Desktop companion
 
@@ -586,7 +586,7 @@ auto` for the run (as found: unset) so the directive did not rest on the
 shortcut alone. Nothing in the consent code differs between the two agent
 builds below (`git log agent-v0.4.101..agent-v0.4.102` touches no consent
 file), and the hub sends `consent_timeout_secs = host_prompt_timeout_secs =
-300` for `auto` and `prompt` alike (`crates/modules/fleet/src/hub.rs:965`,
+300` for `auto` and `prompt` alike (`crates/modules/fleet/src/hub.rs:972`,
 `crates/remote_control/src/consent.rs:115`).
 
 | | control (as found) | with the floor | restored |
@@ -616,7 +616,7 @@ timeout: 30s }` (line 1 prints `consent_broker.mode()`,
 `agents/roomlerd/src/signaling.rs:2311`), yet the prompt stood for **300 s** —
 the server's window — which is exactly the shape `strictest_of`
 (`agents/roomlerd/src/consent.rs:136`) produces when it downgrades an `auto`
-directive: `Prompt { timeout: host_window }` (`signaling.rs:2352`). The control
+directive: `Prompt { timeout: host_window }` (`signaling.rs:2363`). The control
 run pins the other half: same account, device and policy, only the local
 setting differs, and it auto-granted (`decision=Granted effective_mode=AutoGrant`,
 1.5 ms after the request). Meanwhile `roomlerd consent --list` on the device

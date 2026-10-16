@@ -94,6 +94,15 @@ pub const REJECT_REASON_NO_SESSION: &str = "no open session (send rc:tunnel.open
 /// Wire-stable, do not reword. Emitted at `crates/api/src/ws/tunnel.rs`.
 pub const REJECT_REASON_SESSION_MISMATCH: &str = "session_id mismatch";
 
+/// #2251 — the `limit` an agent's `rc:terminate` names, with `reason`
+/// `Error`, when the browser's offer carries no codec the device's RTP video
+/// track can send. Nothing a retry changes would fix that, so a viewer reads
+/// it as final and says why. The hub honours it only from the agent and only
+/// with `Error` (`device_end_limit`); an older server drops it, and the
+/// session ends as the plain `Error` every reader knows. Wire-stable, do not
+/// reword.
+pub const LIMIT_NO_COMMON_CODEC: &str = "no_common_codec";
+
 /// Half-close direction in `TcpHalfClose`. SMTP / HTTP-1.1-long-poll /
 /// some legacy protocols rely on this.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1292,10 +1301,12 @@ pub enum ClientMsg {
         reason: EndReason,
         /// FR-101 P4b-2 — the limit that ended it, from the DEVICE: `idle`
         /// (with `IdleTimeout`) when the agent ended a session that sat idle
-        /// past its `Request.idle_secs`. The hub honours it only from the
-        /// agent and only with that reason, and names it on the
+        /// past its `Request.idle_secs`; #2251 — or `no_common_codec` (with
+        /// `Error`, [`LIMIT_NO_COMMON_CODEC`]) when the offer carried no
+        /// codec its RTP video track can send. The hub honours each only from
+        /// the agent and only with its reason, and names it on the
         /// `rc:terminate` it sends both ends. Absent otherwise; an older
-        /// server ignores it and still ends the session as `IdleTimeout`.
+        /// server ignores it and still ends the session on the reason.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<String>,
     },
@@ -2471,7 +2482,10 @@ pub enum ServerMsg {
         /// `max_duration` (the org's maximum session length, ended by the
         /// hub) or `idle` (P4b-2: the idle limit, ended by the device), with
         /// `reason` `IdleTimeout`, the variant every reader already knows.
-        /// Lets a viewer say which. Absent otherwise; older readers ignore it.
+        /// #2251 — or `no_common_codec` with `reason` `Error`: the device can
+        /// send none of the codecs the browser offered, so asking again fails
+        /// the same way. Lets a viewer say which, and not retry that one.
+        /// Absent otherwise; older readers ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<String>,
     },

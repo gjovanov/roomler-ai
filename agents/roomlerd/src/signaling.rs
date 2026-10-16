@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use roomler_ai_remote_control::{
     models::{AgentCaps, DisplayInfo, EndReason, OsKind, RpcCap},
-    signaling::{AgentCloseReason, ClientMsg, CloseReason, ServerMsg},
+    signaling::{AgentCloseReason, ClientMsg, CloseReason, LIMIT_NO_COMMON_CODEC, ServerMsg},
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -3489,6 +3489,36 @@ async fn handle_server_msg(
             // `handle_offer`), not at request time. `permissions` is Copy.
             let banner_name = controller_name.clone();
             let banner_org = asking_org.unwrap_or_default();
+
+            // #2251 — on the RTP transport the track IS the picture, so an
+            // offer that carries none of its codec cannot be answered: that
+            // `create_answer` failed below, the session ended as a bare
+            // `Error`, and the viewer asked again into the same failure.
+            // Refuse before building the peer, naming the cause the viewer
+            // reads as final. Every stash above is already taken.
+            if crate::peer::rtp_track_unanswerable(
+                &track_codec,
+                negotiated_transport.as_deref(),
+                &sdp,
+            ) {
+                warn!(
+                    %session_id,
+                    codec = %track_codec,
+                    offered = ?crate::peer::offered_video_codecs(&sdp),
+                    "rc:sdp.offer — the browser offers no codec the RTP track can send; refusing"
+                );
+                let _ = reply_for_session(
+                    ws,
+                    delegated,
+                    &ClientMsg::Terminate {
+                        session_id,
+                        reason: EndReason::Error,
+                        limit: Some(LIMIT_NO_COMMON_CODEC.to_string()),
+                    },
+                )
+                .await;
+                return Ok(());
+            }
 
             let peer = match AgentPeer::new(
                 session_id,

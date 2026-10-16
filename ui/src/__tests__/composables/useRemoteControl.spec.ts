@@ -4058,6 +4058,16 @@ describe('S3 resilience: isRetryableTerminateReason', () => {
     expect(isRetryableTerminateReason('')).toBe(false)
     expect(isRetryableTerminateReason('some_future_reason')).toBe(false)
   })
+
+  it('#2251: never retries an error the device named no_common_codec', () => {
+    // The same offer would meet the same refusal: a loop that never says why.
+    expect(isRetryableTerminateReason('error', 'no_common_codec')).toBe(false)
+    // Every other error still retries, named or not (an older server drops
+    // the code and sends the bare `error` it always did).
+    expect(isRetryableTerminateReason('error', undefined)).toBe(true)
+    expect(isRetryableTerminateReason('error', 'some_future_limit')).toBe(true)
+    expect(isRetryableTerminateReason('agent_disconnect', undefined)).toBe(true)
+  })
 })
 
 describe('FR-27: friendlyEndReason', () => {
@@ -4097,6 +4107,17 @@ describe('FR-27: friendlyEndReason', () => {
     // Not the maximum length's words, and only with the reason it belongs to.
     expect(friendlyEndReason('idle_timeout', 'idle')).not.toMatch(/maximum length/)
     expect(friendlyEndReason('host_disconnect', 'idle')).toBeNull()
+  })
+
+  it('#2251: says the browser cannot decode what the device sends, and what would help', () => {
+    const msg = friendlyEndReason('error', 'no_common_codec')!
+    expect(msg).toMatch(/can't decode/)
+    expect(msg).toMatch(/OpenH264/)
+    // Not "try again": a retry meets the same refusal.
+    expect(msg).not.toMatch(/again/i)
+    // The code explains only the `error` it rides on; a bare error is unchanged.
+    expect(friendlyEndReason('error', undefined)).toBe('The session could not be established.')
+    expect(friendlyEndReason('idle_timeout', 'no_common_codec')).toBeNull()
   })
 })
 

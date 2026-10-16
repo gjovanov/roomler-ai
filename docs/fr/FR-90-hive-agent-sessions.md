@@ -61,7 +61,7 @@ it.
   has no authentication (`crates/tunnel-core/src/socks5.rs:3`) and a daemon-originated flow is
   attributed to the device owner (`crates/tunnel-core/src/policy.rs:29-51`); `SplitTun` intercepts one
   port and SSH is its only caller (`crates/tunnel-core/src/overlay/split_tun.rs:92-126`); fleet exec
-  always runs as SYSTEM/root (`agents/roomlerd/src/signaling.rs:4563`).
+  always runs as SYSTEM/root (`agents/roomlerd/src/signaling.rs:4593`).
 - **Chat needs four changes.** `AuthorType::Bot` exists and nothing writes it — the DAO hard-codes
   `User` (`crates/services/src/dao/message.rs:76-78`); rooms have no type or binding
   (`crates/db/src/models/room.rs:62-126`); the message list isn't virtualized
@@ -90,7 +90,7 @@ each a module behind the FR-69 contract (`crates/core/src/module.rs:23`); new `E
 (`crates/core/src/hooks.rs:37`), because it holds sessions. The node side is a `roomlerd` feature,
 and its user-level half is `roomlerd hive-host`, re-exec'd as the mapped user like `portal-helper`
 (`agents/roomlerd/src/main.rs:215`) — no second binary. Wire frames are `rc:hive.*`, `rc:vault.*`,
-`rc:knowhow.*` owned through `namespace()` (`crates/remote_control/src/signaling.rs:1529`); new
+`rc:knowhow.*` owned through `namespace()` (`crates/remote_control/src/signaling.rs:1540`); new
 `RpcCap` verbs `hive`, `hive-view` (P0d-2), `hive-replica`, `vault`, `knowhow-scan`, equality-matched
 (`crates/remote_control/src/models.rs:705,697`).
 
@@ -1144,7 +1144,7 @@ Such a build runs no session and sends no manifest, so a Windows device that upd
 or a build made without `hive` does the same. The reconcile of a connection the hub records without
 `hive` now ends those sessions as an empty manifest would, before it reads what is pending, and it
 reads only its own registration: a connection a newer one displaced, or one already gone, decides
-nothing (`crates/modules/hive/src/agent_socket.rs:1005`, `crates/modules/fleet/src/hub.rs:2359`
+nothing (`crates/modules/hive/src/agent_socket.rs:1005`, `crates/modules/fleet/src/hub.rs:2366`
 `agent_supports_hive_on`).
 
 **Updates and restarts (P1d).** Today a session's harness is the daemon's child: an update, a crash
