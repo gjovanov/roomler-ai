@@ -2,7 +2,8 @@
 // Copyright (C) 2026 G ROX EOOD
 //! FR-99 P3 — lock this computer when the last remote session ends.
 //!
-//! The owner's `lock_on_end` (`never` by default, `auto`, `always`) is read at
+//! The owner's `lock_on_end` (`never` by default, `auto`, `always`; a fresh
+//! Windows service install is written with `auto`, FR-99 decision 3) is read at
 //! each session's START, together with what `auto` needs from that moment: was
 //! the screen locked, and was anybody at the computer. The decision is kept per
 //! session and applied when the LAST live session ends, whatever ended it (the

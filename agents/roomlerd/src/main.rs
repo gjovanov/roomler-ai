@@ -2474,6 +2474,11 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     if archive_replica {
         roomlerd::archive_replica::apply(&mut cfg);
     }
+    // FR-99 decision 3 — a fresh Windows service install (`--machine-global`)
+    // starts at `lock_on_end = auto`; a refresh keeps what the device had.
+    if enrollment::takes_service_install_defaults(machine_global, &outcome) {
+        enrollment::apply_service_install_defaults(&mut cfg);
+    }
 
     config::save(&target_path, &cfg).map_err(|e| {
         if machine_global {

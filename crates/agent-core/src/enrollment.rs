@@ -683,6 +683,31 @@ pub fn preserve_operator_config(fresh: AgentConfig, existing: AgentConfig) -> Ag
     }
 }
 
+/// FR-99 decision 3 — does this enrollment write a fresh Windows service
+/// install's defaults ([`apply_service_install_defaults`])? Only a fresh
+/// primary written to the machine-global config, the one the SystemContext
+/// worker reads. A refresh, a rebind or an appended org keeps what the device
+/// already had, so no device in the field changes under its owner.
+pub fn takes_service_install_defaults(machine_global: bool, outcome: &EnrollOutcome) -> bool {
+    machine_global && *outcome == EnrollOutcome::FreshPrimary
+}
+
+/// FR-99 decision 3 — what a FRESH Windows service install starts with:
+/// `lock_on_end = auto`, which locks at the last session's end when that
+/// session began on a locked screen or with nobody at the computer, and so
+/// restores what it found. The service's worker is SYSTEM in the console
+/// session and reaches the secure desktop, so the next controller can lift
+/// that lock (FR-99 §8 rows 12 and 16).
+///
+/// ⚠️ Never a per-user install: its worker cannot reach the secure desktop,
+/// and a lock at the end would leave every later session at a padlock nobody
+/// can lift remotely. Not the Linux root daemon yet either: no field cell has
+/// shown a remote unlock there. Both keep `never`, as does every existing
+/// config that lacks the key.
+pub fn apply_service_install_defaults(cfg: &mut AgentConfig) {
+    cfg.lock_on_end = roomler_ai_remote_control::models::LockOnEnd::Auto;
+}
+
 /// Strip the trailing slash and force the scheme to `https://` if the
 /// caller supplied `http://`. Any other scheme (or a bare host) is
 /// returned trimmed but otherwise untouched — `https://` URLs stay
@@ -984,6 +1009,57 @@ mod tests {
             overlay_exit_node_enabled: false,
             advertise_routes: Vec::new(),
             netstack_socks_port: None,
+        }
+    }
+
+    /// FR-99 decision 3 — a fresh Windows service install (the machine-global
+    /// config) starts at `lock_on_end = auto`. Every other enrollment keeps what
+    /// the device had: a refresh over a config that never set the key still
+    /// reads `never`, and so does a per-user install.
+    #[test]
+    fn only_a_fresh_service_install_starts_at_lock_on_end_auto() {
+        use roomler_ai_remote_control::models::LockOnEnd;
+
+        // A fresh service install: the default applies.
+        let fresh = fresh_for("https://a.invalid", "t1", "tok1");
+        assert_eq!(
+            fresh.lock_on_end,
+            LockOnEnd::Never,
+            "the config's own default"
+        );
+        let (mut cfg, outcome) = apply_enrollment(None, fresh.clone(), None, false).unwrap();
+        assert!(takes_service_install_defaults(true, &outcome));
+        apply_service_install_defaults(&mut cfg);
+        assert_eq!(cfg.lock_on_end, LockOnEnd::Auto);
+
+        // A fresh per-user install: nothing changes.
+        let (_, outcome) = apply_enrollment(None, fresh.clone(), None, false).unwrap();
+        assert!(!takes_service_install_defaults(false, &outcome));
+
+        // A service install already in the field, re-enrolled: it keeps what it
+        // had, and a config that never set the key reads `never`.
+        let existing = crate::config::test_fixture(); // example.invalid / tid
+        let again = fresh_for("https://example.invalid", "tid", "NEW-TOK");
+        let (cfg, outcome) =
+            apply_enrollment(Some(existing.clone()), again.clone(), None, false).unwrap();
+        assert_eq!(outcome, EnrollOutcome::RefreshedPrimary);
+        assert!(!takes_service_install_defaults(true, &outcome));
+        assert_eq!(cfg.lock_on_end, LockOnEnd::Never);
+
+        // Its owner's own choice survives a rebind and an appended org too.
+        let mut owned = existing;
+        owned.lock_on_end = LockOnEnd::Always;
+        for (fresh, replace) in [
+            (again, true),
+            (fresh_for("https://b.invalid", "t2", "T2"), false),
+        ] {
+            let (cfg, outcome) =
+                apply_enrollment(Some(owned.clone()), fresh, None, replace).unwrap();
+            assert!(
+                !takes_service_install_defaults(true, &outcome),
+                "{outcome:?}"
+            );
+            assert_eq!(cfg.lock_on_end, LockOnEnd::Always, "{outcome:?}");
         }
     }
 
