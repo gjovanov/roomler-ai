@@ -1208,6 +1208,12 @@ pub fn resolved_preference() -> Option<EncoderPreference> {
 /// inside the cascade is still the default-adapter SW MFT, so any
 /// box with a working CLSID_MSH264EncoderMFT produces output.
 ///
+/// #2283: under Auto, that fallback is not kept when it ignored the D3D
+/// manager, which leaves Microsoft's encoder with no GPU behind it. On a
+/// VM's Basic Render Driver it held frames for ~850 ms of input to photon
+/// on the RTP track, against 37 ms for OpenH264 on the same host. OpenH264
+/// takes its place wherever it is compiled in ([`keeps_mf`]).
+///
 /// Escape hatch: setting `ROOMLERD_HW_AUTO=0` reverts Auto to
 /// openh264-first (for diagnosing regressions in the field without
 /// a rebuild). `--encoder software` and `encoder_preference=software`
@@ -1233,13 +1239,37 @@ pub fn open_default(
         #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
         {
             match mf::MfEncoder::new(width, height) {
-                Ok(e) => {
+                Ok(e)
+                    if !keeps_mf(
+                        preference,
+                        e.is_pure_software(),
+                        cfg!(feature = "openh264-encoder"),
+                    ) =>
+                {
                     tracing::info!(
                         width,
                         height,
-                        preference = ?preference,
-                        "encoder selected: mf-h264 (hardware)"
+                        "mf-encoder ended on Microsoft's software MFT with no GPU behind it — \
+                         using openh264 instead (#2283)"
                     );
+                    drop(e);
+                }
+                Ok(e) => {
+                    if e.is_hardware() {
+                        tracing::info!(
+                            width,
+                            height,
+                            preference = ?preference,
+                            "encoder selected: mf-h264 (hardware)"
+                        );
+                    } else {
+                        tracing::info!(
+                            width,
+                            height,
+                            preference = ?preference,
+                            "encoder selected: mf-h264 (software MFT)"
+                        );
+                    }
                     return Box::new(e);
                 }
                 Err(e) => {
@@ -1455,6 +1485,18 @@ fn open_for_codec_hevc(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'sta
     }
 }
 
+/// #2283 — does the session keep an MF H.264 encoder that opened? Not under
+/// Auto when it is Microsoft's software MFT with no GPU behind it and
+/// OpenH264 can stand in. An explicit `hardware` preference keeps it: the
+/// operator asked for MF.
+#[cfg_attr(
+    not(all(target_os = "windows", feature = "mf-encoder")),
+    allow(dead_code)
+)]
+fn keeps_mf(preference: EncoderPreference, pure_software: bool, openh264: bool) -> bool {
+    !(preference == EncoderPreference::Auto && pure_software && openh264)
+}
+
 /// Check the `ROOMLERD_HW_AUTO` escape hatch. Any value equal to
 /// `"0"`, `"false"`, `"no"`, or `"off"` (case-insensitive) disables the
 /// MF-HW-first branch of the Auto cascade. Unset or any other value
@@ -1473,6 +1515,24 @@ fn hw_auto_disabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2283: only Auto drops the GPU-less software MFT, and only for
+    /// OpenH264. A hardware MFT, a fallback that took the D3D manager, an
+    /// explicit `hardware` preference, or a build without OpenH264 keeps
+    /// what MF opened.
+    #[test]
+    fn auto_drops_only_the_gpu_less_software_mft_for_openh264() {
+        use EncoderPreference::{Auto, Hardware, Software};
+        assert!(!keeps_mf(Auto, true, true), "the case #2283 measured");
+        assert!(
+            keeps_mf(Auto, false, true),
+            "a hardware MFT, or one with a GPU behind it"
+        );
+        assert!(keeps_mf(Auto, true, false), "no OpenH264 to stand in");
+        assert!(keeps_mf(Hardware, true, true), "the operator asked for MF");
+        // Software never opens MF at all; the predicate leaves it alone too.
+        assert!(keeps_mf(Software, true, true));
+    }
 
     /// The AIMD floor scales with encoded area on unconstrained sessions
     /// (1.5 M was a 1080p legibility tuning; at 5.2 MPix it is mush) and

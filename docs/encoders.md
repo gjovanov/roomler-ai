@@ -296,6 +296,8 @@ flowchart TB
     PROBE -->|ok| USE["use this MFT"]
     PROBE -->|"fail / async-required"| NEXT["next MFT / next adapter"]
     NEXT --> SWMFT["MS software MFT (default adapter)"]
+    SWMFT -->|"took the D3D manager,<br/>or preference = hardware"| OK
+    SWMFT -->|"auto, and it ignored the D3D manager:<br/>no GPU behind it (#2283)"| SW
     MFQ -->|"no (or MF exhausted)"| FF{"FFmpeg available?"}
     FF -->|yes| CASC["the codec's table in order<br/>nvenc → qsv → amf → videotoolbox<br/>→ vaapi → d3d12va → vulkan"]
     FF -->|no| SW
@@ -315,6 +317,15 @@ Key properties:
   switching bitstreams.
 - **Escape hatch**: `ROOMLERD_HW_AUTO=0` reverts `auto` to software-first
   without a rebuild; `ROOMLERD_USE_FFMPEG=0` removes the FFmpeg backends.
+- **Auto does not keep the GPU-less software MFT** (#2283). When the
+  default-adapter fallback also ignores the D3D manager, the session gets
+  OpenH264 instead (`keeps_mf`), and the log says so. On a VM whose only
+  adapter is the Basic Render Driver, that MFT held frames for ~850 ms of
+  input to photon on the RTP track, with a quarter of FR-16's L4 probes never
+  answered; OpenH264 on the same host measured 37 ms. The same CLSID inside
+  the hardware loop, or a fallback that took the manager, may hand frames to a
+  GPU and is kept, as it is under an explicit `hardware` preference. Its
+  pipeline reports `backend="sw-pure"`.
 - Advertised labels look like `mf-h264-hw`, `ffmpeg-hevc_nvenc`,
   `ffmpeg-hevc_vaapi`, `openh264-sw`, `libvpx-vp9-444-sw`; transports like
   `data-channel-hevc`, `data-channel-h264`.

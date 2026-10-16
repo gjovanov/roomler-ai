@@ -133,7 +133,7 @@ impl MfPipeline {
     ///   they get routed to the async pipeline instead.
     ///
     /// `backend_kind` selects rate-control mode: `"hw"` → CBR (NVENC,
-    /// QSV, AMF all honour it), `"sw"` → LowDelayVBR (MS SW MFT rejects
+    /// QSV, AMF all honour it), `"sw"` or `"sw-pure"` → LowDelayVBR (MS SW MFT rejects
     /// CBR + LowLatency combo and silently falls back to quality-VBR,
     /// overshooting target bitrate ~5×). Either value is shared with
     /// the cascade logger via the returned pipeline's name.
