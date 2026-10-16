@@ -49,10 +49,22 @@ pub enum Presence {
 
 /// The decision. `person_ms_ago` is `None` when no person's input is known,
 /// which only happens where the idle clock cannot be read; that is never
-/// taken for an empty chair.
-pub fn decide(locked: bool, person_ms_ago: Option<u64>, window: Duration) -> Presence {
+/// taken for an empty chair. `away_since_lock` (P1b): the screen locked after
+/// the person's last input and they have not touched it since, so whoever
+/// unlocked it was the machine (the controller typing the password through
+/// the session). A person who locked their screen and walked away a minute ago
+/// is not at it, whatever the window says.
+pub fn decide(
+    locked: bool,
+    person_ms_ago: Option<u64>,
+    away_since_lock: bool,
+    window: Duration,
+) -> Presence {
     if locked {
         return Presence::Locked;
+    }
+    if away_since_lock {
+        return Presence::Unattended;
     }
     match person_ms_ago {
         Some(ago) if ago >= window.as_millis() as u64 => Presence::Unattended,
@@ -65,11 +77,16 @@ fn tick_delta(a: u32, b: u32) -> i64 {
     i64::from(a.wrapping_sub(b) as i32)
 }
 
-/// Follows the idle clock and keeps the last move that was a person's.
+/// Follows the idle clock and keeps the last move that was a person's, and
+/// when the screen last locked.
 #[derive(Debug, Default)]
 pub struct Tracker {
     last_input: Option<u32>,
     last_person: Option<u32>,
+    /// P1b — the tick of the reading that first saw the screen locked (after
+    /// an unlocked one, or as the very first reading).
+    last_lock: Option<u32>,
+    was_locked: bool,
 }
 
 impl Tracker {
@@ -95,12 +112,30 @@ impl Tracker {
     pub fn person_ms_ago(&self, now: u32) -> Option<u64> {
         self.last_person.map(|p| tick_delta(now, p).max(0) as u64)
     }
+
+    /// P1b — one reading of the lock state, at `now`.
+    pub fn observe_lock(&mut self, locked: bool, now: u32) {
+        if locked && !self.was_locked {
+            self.last_lock = Some(now);
+        }
+        self.was_locked = locked;
+    }
+
+    /// P1b — the screen locked after the person's last input: they left, and
+    /// whoever unlocked it since did so as the machine. An input at the very
+    /// tick of the lock reading counts as before it (the press that locked).
+    /// With no person's input known this is false: never an empty chair.
+    pub fn away_since_lock(&self) -> bool {
+        matches!((self.last_lock, self.last_person), (Some(l), Some(p)) if tick_delta(p, l) <= 0)
+    }
 }
 
 #[cfg(target_os = "windows")]
 static TRACKER: Mutex<Tracker> = Mutex::new(Tracker {
     last_input: None,
     last_person: None,
+    last_lock: None,
+    was_locked: false,
 });
 
 /// The OS input clock: Windows' `GetTickCount`, the clock `GetLastInputInfo`
@@ -128,19 +163,21 @@ fn last_input_tick() -> Option<u32> {
     (unsafe { GetLastInputInfo(&mut lii) } != 0).then_some(lii.dwTime)
 }
 
-/// One reading into the tracker.
+/// One reading into the tracker: the idle clock and the lock state. Returns
+/// whether the screen is locked now, so a caller decides on one reading.
 #[cfg(target_os = "windows")]
-fn sample() {
+fn sample() -> bool {
+    let locked = crate::lock_state::probe_lock_state() == crate::lock_state::LockState::Locked;
+    let machine = [
+        crate::keep_busy::last_remote_input_tick(),
+        crate::keep_busy::last_own_move_tick(),
+    ];
+    let mut t = TRACKER.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(input) = last_input_tick() {
-        let machine = [
-            crate::keep_busy::last_remote_input_tick(),
-            crate::keep_busy::last_own_move_tick(),
-        ];
-        TRACKER
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .observe(input, &machine);
+        t.observe(input, &machine);
     }
+    t.observe_lock(locked, os_tick());
+    locked
 }
 
 /// Start the sampler (once per process, Windows only): from here on every
@@ -172,13 +209,12 @@ pub fn now() -> Presence {
     #[cfg(target_os = "windows")]
     {
         start();
-        sample();
-        let locked = crate::lock_state::probe_lock_state() == crate::lock_state::LockState::Locked;
-        let ago = TRACKER
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .person_ms_ago(os_tick());
-        decide(locked, ago, crate::lock_on_end::UNATTENDED_AFTER)
+        let locked = sample();
+        let (ago, away) = {
+            let t = TRACKER.lock().unwrap_or_else(|p| p.into_inner());
+            (t.person_ms_ago(os_tick()), t.away_since_lock())
+        };
+        decide(locked, ago, away, crate::lock_on_end::UNATTENDED_AFTER)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -195,22 +231,34 @@ mod tests {
 
     #[test]
     fn locked_wins_over_everything() {
-        assert_eq!(decide(true, Some(0), WINDOW), Presence::Locked);
-        assert_eq!(decide(true, Some(10_000_000), WINDOW), Presence::Locked);
-        assert_eq!(decide(true, None, WINDOW), Presence::Locked);
+        assert_eq!(decide(true, Some(0), false, WINDOW), Presence::Locked);
+        assert_eq!(
+            decide(true, Some(10_000_000), false, WINDOW),
+            Presence::Locked
+        );
+        assert_eq!(decide(true, None, false, WINDOW), Presence::Locked);
     }
 
     #[test]
     fn a_person_inside_the_window_is_attended_and_outside_it_is_not() {
-        assert_eq!(decide(false, Some(0), WINDOW), Presence::Attended);
-        assert_eq!(decide(false, Some(299_999), WINDOW), Presence::Attended);
-        assert_eq!(decide(false, Some(300_000), WINDOW), Presence::Unattended);
-        assert_eq!(decide(false, Some(3_600_000), WINDOW), Presence::Unattended);
+        assert_eq!(decide(false, Some(0), false, WINDOW), Presence::Attended);
+        assert_eq!(
+            decide(false, Some(299_999), false, WINDOW),
+            Presence::Attended
+        );
+        assert_eq!(
+            decide(false, Some(300_000), false, WINDOW),
+            Presence::Unattended
+        );
+        assert_eq!(
+            decide(false, Some(3_600_000), false, WINDOW),
+            Presence::Unattended
+        );
     }
 
     #[test]
     fn an_unknown_is_never_an_empty_chair() {
-        assert_eq!(decide(false, None, WINDOW), Presence::Attended);
+        assert_eq!(decide(false, None, false, WINDOW), Presence::Attended);
     }
 
     #[test]
@@ -235,7 +283,7 @@ mod tests {
             "the person's input is still the one at 1_000"
         );
         assert_eq!(
-            decide(false, t.person_ms_ago(700_000), WINDOW),
+            decide(false, t.person_ms_ago(700_000), false, WINDOW),
             Presence::Unattended
         );
     }
@@ -249,7 +297,7 @@ mod tests {
         t.observe(500_600, &[Some(500_000), None]);
         assert_eq!(t.person_ms_ago(501_000), Some(400));
         assert_eq!(
-            decide(false, t.person_ms_ago(501_000), WINDOW),
+            decide(false, t.person_ms_ago(501_000), false, WINDOW),
             Presence::Attended
         );
     }
@@ -278,6 +326,69 @@ mod tests {
         let inj = before_wrap.wrapping_add(1_500);
         t.observe(inj.wrapping_add(20), &[Some(inj), None]);
         assert_eq!(t.person_ms_ago(now), Some(2_000));
+    }
+
+    /// P1b — the person locks the screen and walks away; the controller
+    /// unlocks it by typing the password through the session. The person's
+    /// last input came before the lock, so they are away, whatever the window.
+    #[test]
+    fn a_lock_after_the_persons_last_input_means_away() {
+        let mut t = Tracker::default();
+        t.observe(10_000, &[None, None]); // the press that locked (Win+L)
+        t.observe_lock(true, 10_400); // the sampler sees the lock
+        t.observe_lock(true, 10_900);
+        // The controller types the password: machine input, not a person's.
+        t.observe(60_000, &[Some(60_010), None]);
+        t.observe_lock(false, 60_500);
+        assert!(t.away_since_lock());
+        assert_eq!(
+            decide(false, t.person_ms_ago(61_000), t.away_since_lock(), WINDOW),
+            Presence::Unattended,
+            "the person's last input is 51 s old, inside the window, but before the lock"
+        );
+    }
+
+    /// P1b — the person unlocks it themselves: their input after the lock
+    /// makes them present again.
+    #[test]
+    fn the_persons_own_unlock_is_the_person() {
+        let mut t = Tracker::default();
+        t.observe(10_000, &[None, None]);
+        t.observe_lock(true, 10_400);
+        t.observe(60_000, &[None, None]); // the person types the password
+        t.observe_lock(false, 60_500);
+        assert!(!t.away_since_lock());
+        assert_eq!(
+            decide(false, t.person_ms_ago(61_000), t.away_since_lock(), WINDOW),
+            Presence::Attended
+        );
+    }
+
+    /// P1b — a screen already locked when the tracker first looks: its last
+    /// input came before that reading, so the person is away once unlocked.
+    #[test]
+    fn a_lock_seen_at_the_first_reading_counts() {
+        let mut t = Tracker::default();
+        t.observe_lock(true, 5_000);
+        t.observe(4_000, &[None, None]);
+        assert!(t.away_since_lock());
+    }
+
+    #[test]
+    fn no_lock_means_nothing_changes() {
+        let mut t = Tracker::default();
+        t.observe(1_000, &[None, None]);
+        t.observe_lock(false, 2_000);
+        assert!(!t.away_since_lock());
+        // And with no person's input known, a lock alone is no empty chair.
+        let mut u = Tracker::default();
+        u.observe_lock(true, 2_000);
+        assert!(!u.away_since_lock());
+    }
+
+    #[test]
+    fn locked_still_wins_over_away() {
+        assert_eq!(decide(true, Some(0), true, WINDOW), Presence::Locked);
     }
 
     #[test]

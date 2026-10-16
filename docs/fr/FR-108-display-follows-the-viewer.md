@@ -94,6 +94,18 @@ While a match is applied, a person's input (3a) restores the original mode at on
 (`on: false`, `refused: attended`). The session does not re-apply it until the viewer asks again: the
 person's screen is not a tug of war (open decision 2).
 
+*As built (P1b):*
+- **The come-back watcher:** a per-session watcher checks four times a second while the session holds a
+  mode. A person's input under `auto` hands it back as `attended`; the owner's `never` hands it back as
+  `disabled_on_device`. A screen that locks is not a person who came back.
+- **The waiting request:** one answered `locked` waits per session and is decided again at the unlock.
+- **The rule that makes the unlock work:** a lock after the person's last input means they are away,
+  however recent that input was. The controller typing the password is machine input, so after the
+  controller's unlock nobody is at the screen. Without the rule, someone who locked and walked off a
+  minute ago would read as `attended` for four more minutes.
+
+[`docs/display-match.md`](../display-match.md) has the tables and the anchors.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Asked: rc:display-match, the stage size
@@ -124,7 +136,7 @@ As plan §5.3 has it:
 |---|---|---|---|
 | P0 | This spec and the claim. Three probes on vmtest: (1) does `GetLastInputInfo`, read in the worker, move on the person's input (QMP) and on the controller's injection, and can the two be told apart; (2) what `ChangeDisplaySettingsExW(CDS_FULLSCREEN)` does at the lock screen and at the logon screen (SystemContext); (3) a guest with several modes, a display driver beyond the Basic Render Driver, so a real switch and restore can be seen | docs only | **done 2026-10-16** (§8 rows 2–4): (1) the idle clock moves for both the person and the controller, so the guard must subtract the arbiter's injections; (2) at the lock screen the switch **fails** (`rc=-1`), which reshaped 3a; the logon screen is still owed; (3) a virtio video model plus `viogpudo` gives session 1 23 modes, and the red was recorded on it |
 | P1 | The guard (3a), the owner's key (3b), the answer (3c) and the viewer's words (3d), on Windows | `display_match = always` restores rc.191 | **built** ([`docs/display-match.md`](../display-match.md)): `presence.rs` (a tracker that keeps the last idle-clock move the machine does not explain, its 500 ms sampler from the worker's start, the decision), `display_match.rs` (the owner's policy, `may_switch`, `request_for`, the answer), the arbiter's and keep busy's tick notes, the console-only and never-pushable key, the viewer's answer and words. Unit tests on Windows and Linux with four negative controls: the tracker counting machine input as a person failed three tests, `auto` ignoring presence failed one, a planted `SetWindowsHookExW` failed the scan, and the gate removed failed the console test. Field green owed: AC1, AC2's idle half, AC4, AC5 |
-| P1b | The locked host's request applies at the unlock when nobody is at the screen (3a), and the person coming back restores their mode (3e) | — | — |
+| P1b | The locked host's request applies at the unlock when nobody is at the screen (3a), and the person coming back restores their mode (3e) | `display_match = always` (no hand-back) | **built** (3e "as built"): `away_since_lock` in the tracker, the waiting request and `on_unlock` from the session's lock watcher, the 250 ms `on_tick` watcher with `hand_back`. Unit tests on Windows and Linux with two negative controls: an `away_since_lock` that never reads a lock as away failed the two lock tests, and a `hand_back` that keeps the mode under `never` failed the hand-back test. Field green owed: AC2's locked half, AC3 |
 | P2 | Linux virtual desktops: the Xvfb mode ladder | — | — |
 | P3 | Modes no monitor offers, through the virtual display | — | — |
 | P4 | Several displays | — | — |

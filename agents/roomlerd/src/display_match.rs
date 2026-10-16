@@ -400,8 +400,19 @@ fn hands_the_screen_back(r: Refusal) -> bool {
 }
 
 /// FR-108 — a viewer asked to match `req_w × req_h`. Blocks on OS calls: run
-/// it off the async threads.
+/// it off the async threads. A request answered `locked` is kept for the
+/// session's unlock (P1b, [`on_unlock`]); any other answer drops it.
 pub fn request_for(session: bson::oid::ObjectId, req_w: u32, req_h: u32) -> Answer {
+    let answer = decide_request(session, req_w, req_h);
+    if answer == Answer::Refused(Refusal::Locked) {
+        pending_set(session, req_w, req_h);
+    } else {
+        pending_forget(session);
+    }
+    answer
+}
+
+fn decide_request(session: bson::oid::ObjectId, req_w: u32, req_h: u32) -> Answer {
     if !cfg!(target_os = "windows") {
         return Answer::Refused(Refusal::Unsupported);
     }
@@ -428,6 +439,83 @@ pub fn request_for(session: bson::oid::ObjectId, req_w: u32, req_h: u32) -> Answ
             Answer::Refused(e.into())
         }
     }
+}
+
+// ── FR-108 P1b: the locked host at the unlock, the person coming back ──────
+
+/// Requests answered `locked`, kept per session for its unlock.
+static PENDING: std::sync::Mutex<Vec<(bson::oid::ObjectId, u32, u32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn pending_set(session: bson::oid::ObjectId, w: u32, h: u32) {
+    let mut p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    p.retain(|(s, _, _)| *s != session);
+    p.push((session, w, h));
+}
+
+fn pending_take(session: bson::oid::ObjectId) -> Option<(u32, u32)> {
+    let mut p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let i = p.iter().position(|(s, _, _)| *s == session)?;
+    let (_, w, h) = p.remove(i);
+    Some((w, h))
+}
+
+fn pending_forget(session: bson::oid::ObjectId) {
+    PENDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(s, _, _)| *s != session);
+}
+
+/// P1b — the session's screen unlocked: the request it was answered `locked`
+/// for is decided again, now. Unlocked by the controller (machine input) with
+/// no person since the lock, that switches; unlocked by the person, that is
+/// `attended`. `None` when nothing was waiting. Blocks on OS calls.
+pub fn on_unlock(session: bson::oid::ObjectId) -> Option<Answer> {
+    let (w, h) = pending_take(session)?;
+    Some(request_for(session, w, h))
+}
+
+/// P1b — does this session hold the mode it applied?
+pub fn owns_mode(session: bson::oid::ObjectId) -> bool {
+    *DM_OWNER.lock().unwrap_or_else(|e| e.into_inner()) == Some(session)
+}
+
+/// P1b — should a mode this session holds go back now, and why? Pure. The
+/// owner turning display match off, or (under `auto`) a person at the screen.
+/// Under `always` the owner said to keep it. `presence` is read only under
+/// `auto`.
+pub fn hand_back(
+    owns: bool,
+    policy: DisplayMatchPolicy,
+    presence: impl FnOnce() -> Presence,
+) -> Option<Refusal> {
+    if !owns {
+        return None;
+    }
+    match policy {
+        DisplayMatchPolicy::Never => Some(Refusal::DisabledOnDevice),
+        DisplayMatchPolicy::Always => None,
+        DisplayMatchPolicy::Auto => (presence() == Presence::Attended).then_some(Refusal::Attended),
+    }
+}
+
+/// P1b — the session's watcher, every quarter second while it holds a mode:
+/// a person who came back, or the owner's `never`, gets the screen back at
+/// once, and the viewer is told. It is not re-applied until the viewer asks
+/// again. Blocks on OS calls.
+pub fn on_tick(session: bson::oid::ObjectId) -> Option<Answer> {
+    let why = hand_back(owns_mode(session), device_policy(), crate::presence::now)?;
+    if !restore_for(session) {
+        return None;
+    }
+    tracing::info!(%session, why = why.word(), "display-match: the screen is handed back");
+    Some(Answer::Refused(why))
+}
+
+/// P1b — the session ended: drop what it was waiting for.
+pub fn forget(session: bson::oid::ObjectId) {
+    pending_forget(session);
 }
 
 /// The answer, as it goes to the viewer on the control channel.
@@ -564,6 +652,56 @@ mod fr108_tests {
             assert_eq!(device_policy(), p);
         }
         set_device_policy(was);
+    }
+
+    /// P1b — the screen goes back only from a session that holds it: to the
+    /// owner's `never` at once, to a person under `auto`, never under `always`.
+    #[test]
+    fn hand_back_follows_the_owner_and_the_person() {
+        let never_read = || -> Presence { panic!("presence must not be read here") };
+        assert_eq!(hand_back(false, DisplayMatchPolicy::Auto, never_read), None);
+        assert_eq!(
+            hand_back(false, DisplayMatchPolicy::Never, never_read),
+            None
+        );
+        assert_eq!(
+            hand_back(true, DisplayMatchPolicy::Never, never_read),
+            Some(Refusal::DisabledOnDevice)
+        );
+        assert_eq!(
+            hand_back(true, DisplayMatchPolicy::Always, never_read),
+            None
+        );
+        assert_eq!(
+            hand_back(true, DisplayMatchPolicy::Auto, || Presence::Attended),
+            Some(Refusal::Attended)
+        );
+        assert_eq!(
+            hand_back(true, DisplayMatchPolicy::Auto, || Presence::Unattended),
+            None
+        );
+        // A locked screen is not a person who came back (and the worker could
+        // not restore through the secure desktop anyway).
+        assert_eq!(
+            hand_back(true, DisplayMatchPolicy::Auto, || Presence::Locked),
+            None
+        );
+    }
+
+    /// P1b — a request answered `locked` waits for its session's unlock: the
+    /// latest one per session, taken once, and dropped when the session ends.
+    #[test]
+    fn a_locked_request_waits_for_its_session() {
+        let a = bson::oid::ObjectId::new();
+        let b = bson::oid::ObjectId::new();
+        pending_set(a, 946, 598);
+        pending_set(a, 1600, 900);
+        pending_set(b, 800, 600);
+        assert_eq!(pending_take(a), Some((1600, 900)), "the latest request");
+        assert_eq!(pending_take(a), None, "taken once");
+        forget(b);
+        assert_eq!(pending_take(b), None, "the session ended");
+        assert_eq!(on_unlock(a), None, "nothing waiting, nothing decided");
     }
 
     #[test]
