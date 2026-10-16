@@ -551,7 +551,7 @@ buffer handle**, so a daemon that is not root opened DRM capture without
 complaint and then failed every frame. That is a per-user install with
 `drm_capture` set. The session died and re-created itself, and the viewer only
 ever said *"No video from this device after 3 attempts"*. The open now checks
-the handle (`unreadable`, `drm_backend.rs:1006`) and refuses with the fix in
+the handle (`unreadable`, `drm_backend.rs:1016`) and refuses with the fix in
 words, which reach the viewer as the arm's own error (§1.1): *"drm_capture is
 on, but DRM capture could not open: reading the scanout needs CAP_SYS_ADMIN
 (root), which this daemon lacks: on a per-user install run roomler config
@@ -562,7 +562,7 @@ arm (§1.2), the desktop's own screencast.
 On one Apple-silicon (Asahi) display, mutter scans out 10-bit `XR30` and KWin
 8-bit `AB24`: the same driver and panel, with red and blue in opposite places.
 The repack resolves a `Layout` from each framebuffer's fourcc (`Layout::of`,
-`drm_backend.rs:577`) and handles the eight 32-bit RGB formats, `XR24`/`AR24`,
+`drm_backend.rs:585`) and handles the eight 32-bit RGB formats, `XR24`/`AR24`,
 `XB24`/`AB24`, `XR30`/`AR30` and `XB30`/`AB30`. Any other fourcc is a refusal
 (*"unhandled scanout pixel format …"*), never a guess. Before it, a KDE host on
 Asahi refused every frame. ⚠️ A wrong channel order does not *look* broken:
@@ -813,8 +813,8 @@ flowchart LR
 
 | Phase | What changed | Where | Kill switch |
 |---|---|---|---|
-| **P1** | The DRM arm honours the pump's encode box (`set_output_cap`, the seam macOS already honours). Whenever half the source still covers the box, it takes the fused half read, whatever the policy says: a 4K scanout for a 1920×1012 encode, but never a 1440p one, whose half would be smaller than what the encode keeps. The VP9 and FFmpeg DataChannel pumps open their capture with `Never` (`agents/roomlerd/src/peer.rs:3547`), so before P1 they read the full 4K and resampled all 8.8 M pixels of it | `wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1191`; `set_output_cap`, `drm_backend.rs:1398` | `ROOMLERD_DRM_FOLLOW_CAP=0` |
-| **P2** | The repack runs in row bands, one thread each (4 by default). Each thread still reads its own rows in order, the one access pattern FR-36 measured this mapping to tolerate. The output is byte-identical to the single pass, which `banded_repacks_match_the_single_pass` locks for every layout | `in_bands`, `drm_backend.rs:616`; `band_threads`, `drm_backend.rs:644` | `ROOMLERD_DRM_THREADS=1` |
+| **P1** | The DRM arm honours the pump's encode box (`set_output_cap`, the seam macOS already honours). Whenever half the source still covers the box, it takes the fused half read, whatever the policy says: a 4K scanout for a 1920×1012 encode, but never a 1440p one, whose half would be smaller than what the encode keeps. The VP9 and FFmpeg DataChannel pumps open their capture with `Never` (`agents/roomlerd/src/peer.rs:3547`), so before P1 they read the full 4K and resampled all 8.8 M pixels of it | `wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1200`; `set_output_cap`, `drm_backend.rs:1407` | `ROOMLERD_DRM_FOLLOW_CAP=0` |
+| **P2** | The repack runs in row bands, one thread each (4 by default). Each thread still reads its own rows in order, the one access pattern FR-36 measured this mapping to tolerate. The output is byte-identical to the single pass, which `banded_repacks_match_the_single_pass` locks for every layout | `in_bands`, `drm_backend.rs:624`; `band_threads`, `drm_backend.rs:652` | `ROOMLERD_DRM_THREADS=1` |
 
 Measured on that box, a continuously moving window (`vkcube`), one viewer:
 

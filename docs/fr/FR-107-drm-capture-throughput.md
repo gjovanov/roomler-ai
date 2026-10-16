@@ -3,7 +3,7 @@
 **Issue:** [#2317](https://github.com/gjovanov/roomler-ai/issues/2317) · **Status:** in progress — spec and
 claim 2026-10-16, on the operator's *"can we improve on it"* after a window drag on FR-93 AC12's box ran at
 9 fps. P1 and P2 are lab-verified on that box · **Owner:** remote desktop (the agent's DRM arm) ·
-**Anchors:** master `1ee8523b7` · **Builds on:** [FR-36](FR-36-wayland-capture.md) (the DRM arm, the fused
+**Anchors:** master `674780d1a` · **Builds on:** [FR-36](FR-36-wayland-capture.md) (the DRM arm, the fused
 half read, P2's deferred EGL detiling), [FR-93](FR-93-wayland-out-of-the-box.md) (AC12's box),
 [FR-95](FR-95-system-installs-on-by-default-on-wayland.md) (the system install's capture)
 
@@ -60,14 +60,14 @@ flowchart LR
 (`agents/roomlerd/src/capture/mod.rs:375`) already exists for exactly this, and every pump calls it with its
 effective box (`peer.rs:4178`). macOS honours it; the DRM arm ignored it. Now the DRM worker reads the box on
 every grab and takes the fused half read whenever half the source still covers it, whatever the policy says
-(`wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1191`; `set_output_cap`, `drm_backend.rs:1398`).
+(`wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1200`; `set_output_cap`, `drm_backend.rs:1407`).
 A 4K scanout encoded at 1920×1012 is read at 2048×1080. A 1440p scanout for the same box keeps its full read,
 because its half (1280×720) is smaller than what the encode keeps. The pump's "native" size is the frame's
 pre-downscale size (`Frame::native_dims`), so the box it computes does not shrink with the frame, and the
 choice cannot feed back into itself.
 
-**P2 — the repack in row bands across threads** (`in_bands`, `drm_backend.rs:616`; `band_threads`,
-`drm_backend.rs:644`). Each thread repacks its own band of rows and still reads them in order, the one access
+**P2 — the repack in row bands across threads** (`in_bands`, `drm_backend.rs:624`; `band_threads`,
+`drm_backend.rs:652`). Each thread repacks its own band of rows and still reads them in order, the one access
 pattern FR-36 measured the mapping to tolerate. The frame is independent row by row, so nothing is
 coordinated but the join. The output is byte-identical to the single pass.
 
