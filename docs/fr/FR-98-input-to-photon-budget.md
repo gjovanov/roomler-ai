@@ -123,7 +123,7 @@ DataChannel cell wherever one exists. A browser without the extension is left wi
 | P2 | C2, the GPU clock pin A/B, then the default decision | `ROOMLERD_GPU_CLOCK_PIN=0` | — |
 | P3 | C3 + C4, the input and cursor cadences | `roomler-rc-input-gap` unset (8 ms); `ROOMLERD_CURSOR_POLL_MS` unset (8 ms) | **knobs built**, defaults unchanged: `storedInputGapMs` (0–16 ms, read once per viewer) and `capture::cursor::poll_interval` (2–50 ms, read once per session). The 0/2/4 ms A/B on L4 is owed, and open decision 3 waits on it |
 | P4 | C5, the NVENC preset/tune A/B, baked per backend | `ROOMLERD_FFMPEG_PRESET` / `_TUNE` | — |
-| P5 | C6, `playout-delay` on the RTP fallback, and the Known-Issue verdict | `ROOMLERD_RTP_PLAYOUT_DELAY_ZERO=0` | **built**, and **on by default** after its A/B (`agents/roomlerd/src/rtp_playout.rs`; off for 0.4.134–0.4.138). Off, the extension is not registered, so the answer and every packet stay byte-identical. On, it is negotiated wherever the browser offers it and written on every video packet. L0's `playout0` cell (the switch unset) proves the default on the wire; every other cell forces it off and proves the off state. **Field-measured 2026-10-16** (§9): on the RTP track with OpenH264, Chrome's jitter buffer 193 → 0.1 ms and L4 p50 78–362 → 35–40 ms. Owed: the field check on the first release carrying the default, then the Known Issue closes (AC6) |
+| P5 | C6, `playout-delay` on the RTP fallback, and the Known-Issue verdict | `ROOMLERD_RTP_PLAYOUT_DELAY_ZERO=0` | **built**, and **on by default** after its A/B (`agents/roomlerd/src/rtp_playout.rs`; off for 0.4.134–0.4.138). Off, the extension is not registered, so the answer and every packet stay byte-identical. On, it is negotiated wherever the browser offers it and written on every video packet. L0's `playout0` cell (the switch unset) proves the default on the wire; every other cell forces it off and proves the off state. **Field-measured 2026-10-16** (§9): on the RTP track with OpenH264, Chrome's jitter buffer 193 → 0.1 ms and L4 p50 78–362 → 35–40 ms. **Field-checked on agent 0.4.139** (§9): with no switch set, the extension is negotiated on every session, Chrome's buffer is 0.1 ms and L4 p50 37 ms (median of 12 batches); the Known Issue is closed (AC6) |
 | P6 | Docs, and the final field table | — | — |
 
 ## 6. Acceptance criteria
@@ -143,10 +143,12 @@ DataChannel cell wherever one exists. A browser without the extension is left wi
   It is measured by L4, and cross-checked once against a 240 fps camera.
 - [ ] **AC5:** no relay pair regresses: CORPLAP-1 → neo16 L4 p95 and freeze count stay within the baseline's
   spread, with every cut on.
-- [ ] **AC6:** C6 either closes the "Chrome ~80 ms jitter-buffer floor" Known Issue with an L4 number on
-  the `<video>` path, or rewrites it with the measured floor. *(Measured 2026-10-16, §9: C6 takes L4 on the
-  `<video>` path from p50 78–362 ms to 35–40 ms. The Known Issue now carries those numbers. It closes, and
-  this box is ticked, once C6 is on by default and that is field-checked on a release.)*
+- [x] **AC6:** C6 either closes the "Chrome ~80 ms jitter-buffer floor" Known Issue with an L4 number on
+  the `<video>` path, or rewrites it with the measured floor. **Closed, field-checked on agent 0.4.139**
+  (§9). On the `<video>` path with no switch set, C6 is negotiated by default. Chrome's buffer reads 0.1 ms,
+  and L4 batch p50s read 34–44 ms (median 37), p95 46–61 ms, with 0 of 480 probes lost. On 0.4.138 the same
+  path read p50 78–362 ms with C6 off. Without the extension, #2284's fix keeps Chrome's buffer at 7.6 ms
+  on average, where it was 193 ms. The Known Issue is gone from `CLAUDE.md`.
 - [ ] **AC7:** **Docs:** `docs/remote-control.md` §12 replaces its target table with the measured budget (a
   mermaid diagram of the stages and their L4 shares) and each cut's switch. Linked from `docs/README.md`.
 
@@ -194,6 +196,8 @@ Planned cells. Each records the deployed build first.
 | L0 | 2026-10-16 | the same | **Negative control, red:** the parser's default turned back off (one marked line) failed `playout0: want playout-delay 0/0 on every packet, saw PlayoutSeen { negotiated: false, zero: 0, other: 0, without: 0 }` (exit 101). Restored from the commit; the diff was that one line |
 | L0 | 2026-10-16 | #2284's branch, unoptimised, Windows dev box | **#2284, the timestamps, green.** The new `cadence` cell (frames at gaps of 33, 33 and 200 ms, repeated): 72 frames, each frame's RTP step within p50 **0.9 ms**, p95 5.6 ms of its arrival step. Every other cell prints the same error, 0.1–3.3 ms at p50 |
 | L0 | 2026-10-16 | the same | **Negative control, red:** the pump's old write put back (one marked line: advance after the frame, by the gap before it) failed `cadence: … p50 158.8 ms, p95 176.5 ms (want … ≤ 10 ms and ≤ 40 ms)` (exit 101). At a fixed rate the old write hides: `clean` read p50 4.1 ms. Restored from the commit; the diff was that one line |
+| R | 2026-10-16 | **Release build, field.** Agent **0.4.139** (MSI, service) on a kept vmtest Win11 guest (KVM, 1280×800, Microsoft Basic Render Driver only), **no `ROOMLERD_*` switch set**. P5's harness: the production viewer in headless Chromium on a LAN neighbour, forced onto the RTP track, with L4 in target mode against `roomlerd probe-target` | **The defaults, green: C6 and #2283 together.** The agent's log: the MF pipeline ended on `backend="sw-pure"`, then "ended on Microsoft's software MFT with no GPU behind it - using openh264 instead (#2283)", then `encoder selected: openh264 (software)`. Every session logged `rtp playout-delay 0/0 offered on the video track (FR-98 C6)`, and the remote description carried the extension. Chrome's jitter buffer: **0.1 ms** (twelve 10 s windows, 0.1–0.2). L4 batch p50s **34.2–43.8 ms** (median 37.2), p95 46.0–60.7 ms, **0 of 480** lost. P5's Auto pair on 0.4.138, on the same kind of guest, read batch-p50 medians of 836–859 ms, with 25–28 % of probes unanswered |
+| R | 2026-10-16 | the same guest, `ROOMLERD_RTP_PLAYOUT_DELAY_ZERO=0` (and a restart) | **#2284, green: the track's timestamps.** The extension is not negotiated, so Chrome's jitter buffer runs on its own estimate. **7.6 ms** on average (median window 2.4 ms, 0.1–32.7). L4 batch p50s 46.0–73.5 ms (median 51.7), p95 66–222 ms, 1 of 480 lost. The red is P5's off cell on 0.4.138 with the same encoder: 193 ms on average, growing from 46 to 326, and L4 p50s 78–362 ms (median 203). So the off-by-one, not the browser, was most of Chrome's hold, and a browser that never offers `playout-delay` now gets a few ms of it |
 
 ## 10. Related
 

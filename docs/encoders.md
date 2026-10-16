@@ -52,10 +52,16 @@ flowchart LR
 Two transport families with different latency behaviour:
 
 - **RTP track** — standard WebRTC video. Simple and universal, but every frame
-  passes the browser's jitter buffer. On damage-driven frames Chrome held them for
-  193 ms on average; FR-98's `playout-delay` 0/0 (C6, default off until its flip)
-  takes that to 0.1 ms. The measurement and the two faults it found on this track
-  (#2283, #2284) are in [FR-98 §9](fr/FR-98-input-to-photon-budget.md#9-field-verification-log).
+  passes the browser's jitter buffer. Up to 0.4.138, Chrome held damage-driven
+  frames for 193 ms on average. Since 0.4.139 two fixes take that back:
+  - the agent offers `playout-delay` 0/0 by default (FR-98 C6), so Chrome holds
+    a frame for 0.1 ms;
+  - each frame carries its own capture time, not the previous frame's (#2284),
+    so a browser that never negotiates the extension holds frames for a few ms.
+
+  Measured on a release, the RTP track's L4 (input to photon) is p50 37 ms with
+  C6 and 52 ms without it. The cells, and the third fault found on this track
+  (#2283), are in [FR-98 §9](fr/FR-98-input-to-photon-budget.md#9-field-verification-log).
 - **Reliable DataChannel bitstream** — the agent sends encoded access units over
   an ordered DC; a worker feeds WebCodecs and paints an OffscreenCanvas. This
   bypasses the jitter buffer entirely and is how HEVC, AV1, VP9 and low-latency
