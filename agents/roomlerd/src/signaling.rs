@@ -5134,6 +5134,7 @@ async fn handle_server_msg(
                     driving_refused: None,
                     copy: false,
                     ttl_secs,
+                    search: None,
                 },
                 ctx.is_primary,
                 outbound_tx.clone(),
@@ -5149,6 +5150,32 @@ async fn handle_server_msg(
                     ttl_secs,
                 );
                 debug!(grant = %grant_id, "rc:hive.view.grant ignored — this build does not serve agent sessions");
+            }
+        }
+        // FR-90 P2i-1 — a search over this device's copies: answered as a view
+        // grant is, and served by the same actor, so the rest rides the view's
+        // frames. Only a connection advertising `hive-search` is sent one.
+        ServerMsg::HiveSearchGrant {
+            grant_id,
+            user_id,
+            sessions,
+            ttl_secs,
+        } => {
+            #[cfg(hive_host)]
+            crate::hive::handle_search_grant(
+                crate::hive::SearchGrant {
+                    grant_id,
+                    user_id,
+                    sessions,
+                    ttl_secs,
+                },
+                ctx.is_primary,
+                outbound_tx.clone(),
+            );
+            #[cfg(not(hive_host))]
+            {
+                let _ = (user_id, &sessions, ttl_secs);
+                debug!(grant = %grant_id, "rc:hive.search.grant ignored — this build does not serve agent sessions");
             }
         }
         ServerMsg::HiveViewOffer {
@@ -6088,12 +6115,14 @@ fn privacy_words_in(rpc: &[String]) -> Vec<String> {
 /// device holds copies for its primary organization only, so another org's
 /// placement must never see it offer them. Equality, never a prefix: `hive`
 /// is a prefix of each, and stays. P2d: nor does it carry another org's
-/// streams (`hive-stream`).
+/// streams (`hive-stream`). P2i-1: nor does it answer a search over them
+/// (`hive-search`).
 fn strip_replica_verbs(rpc: &mut Vec<String>) {
     rpc.retain(|v| {
         v != RpcCap::HiveReplica.wire()
             && v != RpcCap::HiveArchive.wire()
             && v != RpcCap::HiveStream.wire()
+            && v != RpcCap::HiveSearch.wire()
     });
 }
 
@@ -6165,7 +6194,8 @@ mod tests {
 
     /// FR-90 P2c-3 — a secondary org's caps lose the replica words, by
     /// equality: `hive` and every other `hive-*` word stays. P2d: and
-    /// `hive-stream`, so it carries no other org's streams.
+    /// `hive-stream`, so it carries no other org's streams. P2i-1: and
+    /// `hive-search`, so it answers no other org's search.
     #[test]
     fn a_secondary_connection_never_offers_copies() {
         let mut rpc: Vec<String> = [
@@ -6174,6 +6204,7 @@ mod tests {
             "hive-replica",
             "hive-archive",
             "hive-stream",
+            "hive-search",
             "hive-view",
             "hive-adopt",
         ]
