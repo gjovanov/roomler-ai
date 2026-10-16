@@ -147,6 +147,18 @@
           >
             {{ isAdopted(s) ? $t('hive.stopMirroring') : $t('hive.stop') }}
           </v-btn>
+          <!-- P2j-3 — only where sessions are copied (a purge is the replicaset's),
+               on the owner's own sessions. -->
+          <v-btn
+            v-if="copied && ownsIt(s)"
+            icon="mdi-delete-forever-outline"
+            size="small"
+            variant="text"
+            :aria-label="$t('hive.purge.open')"
+            :title="$t('hive.purge.open')"
+            :data-testid="`hive-purge-open-${s.id}`"
+            @click.prevent.stop="askPurge(s)"
+          />
         </template>
       </v-list-item>
     </v-list>
@@ -192,6 +204,8 @@
         </v-card-actions>
       </v-card>
     </v-dialog>
+
+    <hive-purge-dialog v-model="purgeShown" :tenant-id="tenantId" :session="purgeTarget" />
   </v-container>
 </template>
 
@@ -199,8 +213,10 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { isAdopted, isLive, useHiveStore, type HiveSessionStatus } from '@/stores/hive'
+import { isAdopted, isLive, useHiveStore, type HiveSession, type HiveSessionStatus } from '@/stores/hive'
 import { useDeviceStore } from '@/stores/devices'
+import { useAuthStore } from '@/stores/auth'
+import HivePurgeDialog from '@/components/hive/HivePurgeDialog.vue'
 import { MAX_QUERY_CHARS, snippetParts, useHiveSearch, type SearchHit } from '@/composables/useHiveSearch'
 
 const route = useRoute()
@@ -208,6 +224,7 @@ const router = useRouter()
 const { t, te } = useI18n()
 const hive = useHiveStore()
 const devices = useDeviceStore()
+const auth = useAuthStore()
 const tenantId = computed(() => route.params.tenantId as string)
 
 // ─── P2i-3 — the search box ────────────────────────────────────────────────
@@ -290,6 +307,24 @@ const starting = ref(false)
 const startError = ref<string | null>(null)
 const stopping = ref<string | null>(null)
 const form = reactive({ device_id: '' as string, folder: '', title: '' })
+
+// ─── P2j-3 — a session deleted for good ────────────────────────────────────
+
+/** Whether the server copies this organization's sessions: a purge is the
+ *  replicaset's, and the route answers 404 everywhere else. */
+const copied = computed(() => hive.copied[tenantId.value] === true)
+/** Only its owner purges a session (`no_permission` otherwise), and the list
+ *  also holds the sessions read from a room or a search hit. */
+function ownsIt(s: HiveSession): boolean {
+  return !!auth.user && s.owner_id === auth.user.id
+}
+const purgeShown = ref(false)
+const purgeTarget = ref<HiveSession | null>(null)
+
+function askPurge(s: HiveSession): void {
+  purgeTarget.value = s
+  purgeShown.value = true
+}
 
 const deviceItems = computed(() =>
   devices.items
