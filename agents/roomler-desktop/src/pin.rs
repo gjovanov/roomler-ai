@@ -130,7 +130,6 @@ pub fn ensure_kwin_pin(title: &'static str) {
 
 fn load_kwin_script(title: &str) -> anyhow::Result<()> {
     use gio::glib::ToVariant;
-    use gio::prelude::*;
 
     let conn = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)?;
     let call = |method: &str, args: Option<gio::glib::Variant>| {
