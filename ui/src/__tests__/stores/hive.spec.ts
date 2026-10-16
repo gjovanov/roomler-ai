@@ -15,9 +15,9 @@ const hoisted = vi.hoisted(() => {
       super(`API error ${status}`)
     }
   }
-  return { get: vi.fn(), ApiError }
+  return { get: vi.fn(), del: vi.fn(), ApiError }
 })
-vi.mock('@/api/client', () => ({ api: { get: hoisted.get }, ApiError: hoisted.ApiError }))
+vi.mock('@/api/client', () => ({ api: { get: hoisted.get, delete: hoisted.del }, ApiError: hoisted.ApiError }))
 
 import { isAdopted, useHiveStore } from '@/stores/hive'
 
@@ -124,5 +124,33 @@ describe('hive store — the organizations agent sessions serve (FR-90 P1g)', ()
     expect(hive.served).toEqual({ t: false })
     expect(hoisted.get).toHaveBeenCalledTimes(4)
     expect(hoisted.get).toHaveBeenLastCalledWith('/tenant/t/hive')
+  })
+
+  // FR-90 P2j-3 — a purged session's record is its tombstone, read by nobody:
+  // it leaves the list; one whose purge was refused stays.
+  it('takes a purged session out of the list, and keeps one whose purge was refused', async () => {
+    hoisted.del
+      .mockResolvedValueOnce({ outcome: 'refused', reason: 'in_progress', message: 'it is being moved' })
+      .mockResolvedValueOnce({ outcome: 'purging', forks: 0 })
+    const hive = useHiveStore()
+    hive.upsert({
+      id: 's1',
+      owner_id: 'u1',
+      title: 't',
+      harness: 'claude-code',
+      harness_session: 'h',
+      device_id: 'd',
+      device_name: 'laptop',
+      folder: '/w',
+      status: 'ended',
+      fence: 1,
+      created_at: '',
+      updated_at: '',
+    })
+    await hive.purge('t', 's1')
+    expect(hive.sessions.map((s) => s.id), 'a refusal deletes nothing').toEqual(['s1'])
+    await hive.purge('t', 's1')
+    expect(hoisted.del).toHaveBeenLastCalledWith('/tenant/t/hive/session/s1')
+    expect(hive.sessions, 'gone once it purges').toEqual([])
   })
 })

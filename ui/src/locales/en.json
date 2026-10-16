@@ -380,6 +380,39 @@
       },
       "openFork": "Open the fork's room"
     },
+    "purge": {
+      "open": "Delete for good",
+      "title": "Delete this session for good",
+      "explain": "\"{title}\" is deleted from every device that held it: where it runs, each copy, and where it ran before. On each, the account's part goes too, its history and its checkpoints, never the folder it worked in.",
+      "atOnce": "Its room, its core memory snapshot and its approvals are deleted at once. This cannot be undone.",
+      "forksKeep": "A session forked from it keeps its conversation up to its fork.",
+      "confirm": "Type {title} to confirm",
+      "submit": "Delete for good",
+      "refused": "The purge was refused: {reason}",
+      "sent": "Purging.",
+      "going": "Purging: {done} of {total} devices have answered. One offline is purged when it next connects.",
+      "done": "Purged from every device that held it.",
+      "forks": "Sessions forked from it keep its conversation up to their fork: {n}.",
+      "someDevice": "A device of your organization",
+      "state": {
+        "pending": "Waiting for it",
+        "done": "Purged",
+        "closed": "Closed"
+      },
+      "part": {
+        "done": "purged",
+        "not_there": "held nothing",
+        "failed": "failed",
+        "unknown": "not said"
+      },
+      "parts": "Its copy: {store} · the account's part: {account}",
+      "pendingDetail": "It is purged when it next connects.",
+      "closed": {
+        "device_removed": "The device was removed, and purged everything it held",
+        "holds_nothing": "It held nothing to purge",
+        "other": "Closed"
+      }
+    },
     "memory": {
       "title": "Agent memory",
       "revision": "Revision {rev}",
