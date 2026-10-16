@@ -439,10 +439,16 @@ fn build_sw_fallback(width: u32, height: u32) -> Result<MfPipeline> {
             );
         }
 
+        // #2283 — whether a GPU can be behind this MFT at all. Without the
+        // manager it is Microsoft's encoder on the CPU alone.
+        let mut manager_bound = false;
         if let Some((_, ref d3d_manager)) = d3d_aux {
             let manager_ptr: usize = d3d_manager.as_raw() as usize;
             match transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager_ptr) {
-                Ok(()) => tracing::info!("mf-encoder: D3D manager bound to SW MFT"),
+                Ok(()) => {
+                    manager_bound = true;
+                    tracing::info!("mf-encoder: D3D manager bound to SW MFT")
+                }
                 Err(e) => tracing::info!(
                     code = %e.code().0,
                     "mf-encoder: SW MFT ignored D3D manager — continuing pure-SW"
@@ -459,7 +465,11 @@ fn build_sw_fallback(width: u32, height: u32) -> Result<MfPipeline> {
             transform,
             d3d_device,
             d3d_manager,
-            "sw",
+            if manager_bound {
+                "sw"
+            } else {
+                super::BACKEND_PURE_SW
+            },
             width,
             height,
             OutputCodec::H264,
