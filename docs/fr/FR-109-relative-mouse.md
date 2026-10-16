@@ -57,6 +57,12 @@ sequenceDiagram
   rounded away.
 - It is a **real variant**, like #1945's `MouseRelease`: every injector's match is exhaustive, so each
   backend has to decide what it does with it, and none can forget.
+- **A click must not move the pointer.** `mouse_button` carries a position, and every backend moves there
+  before the button (`input/mod.rs`, `MouseButton`). In relative mode the viewer has no position to send:
+  the host app has hidden the cursor and owns where it is. So relative mode presses with a second new
+  variant, `InputMsg::MousePress { btn }`, which presses where the pointer is. It releases with #1945's
+  existing `MouseRelease { btn }`, which already lets go without moving. The wheel carries no position and
+  needs nothing.
 - ⚠️ An older agent fails to parse a variant it does not know, so the frame is **gated at both ends**:
   - the agent advertises `mouse-rel` in `AgentCaps.input` only where its injector can carry it;
   - the viewer sends `mouse_rel` only to an agent that advertises it;
