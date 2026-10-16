@@ -116,12 +116,21 @@ pub struct MfEncoder {
     codec: OutputCodec,
     /// "hw" when the cascade winner was a dedicated HW MFT with a
     /// live D3D11 manager, "sw" when it fell through to
-    /// `CLSID_MSH264EncoderMFT` / `HEVCVideoExtensionEncoder`. Sent
-    /// up from the worker through the ready channel at startup.
-    /// Consulted by `VideoEncoder::is_hardware`; the peer media pump
-    /// reads that to trigger auto-downscale on SW HEVC at 4K.
+    /// `CLSID_MSH264EncoderMFT` / `HEVCVideoExtensionEncoder`, and
+    /// [`BACKEND_PURE_SW`] when that fallback also ignored the D3D
+    /// manager. Sent up from the worker through the ready channel at
+    /// startup. Consulted by `VideoEncoder::is_hardware`; the peer media
+    /// pump reads that to trigger auto-downscale on SW HEVC at 4K.
     backend_kind: &'static str,
 }
+
+/// #2283 — the backend kind of the default-adapter software MFT when it
+/// also ignored the D3D manager: Microsoft's encoder with no GPU behind it,
+/// as on a VM whose only adapter is the Basic Render Driver. On the RTP
+/// track it held frames for ~850 ms of input to photon where OpenH264 took
+/// 37 ms on the same host, so Auto does not keep it
+/// ([`MfEncoder::is_pure_software`]). Rate control reads it as `"sw"`.
+pub(crate) const BACKEND_PURE_SW: &str = "sw-pure";
 
 enum Cmd {
     Encode {
@@ -225,6 +234,14 @@ impl MfEncoder {
             codec,
             backend_kind,
         })
+    }
+
+    /// #2283 — did the cascade end on Microsoft's software MFT with no GPU
+    /// behind it ([`BACKEND_PURE_SW`])? The same CLSID inside the hardware
+    /// loop, or a fallback that took the D3D manager, may hand frames to a
+    /// GPU and is not this.
+    pub fn is_pure_software(&self) -> bool {
+        self.backend_kind == BACKEND_PURE_SW
     }
 }
 
