@@ -530,12 +530,23 @@ buffer handle**, so a daemon that is not root opened DRM capture without
 complaint and then failed every frame. That is a per-user install with
 `drm_capture` set. The session died and re-created itself, and the viewer only
 ever said *"No video from this device after 3 attempts"*. The open now checks
-the handle (`unreadable`, `drm_backend.rs:855`) and refuses with the fix in
+the handle (`unreadable`, `drm_backend.rs:908`) and refuses with the fix in
 words, which reach the viewer as the arm's own error (§1.1): *"drm_capture is
 on, but DRM capture could not open: reading the scanout needs CAP_SYS_ADMIN
 (root), which this daemon lacks: on a per-user install run roomler config
 clear drm_capture"*. Clearing the key gives the choice back to the automatic
 arm (§1.2), the desktop's own screencast.
+
+⚠️ **The scanout's channel order is the compositor's choice, read per frame.**
+On one Apple-silicon (Asahi) display, mutter scans out 10-bit `XR30` and KWin
+8-bit `AB24`: the same driver and panel, with red and blue in opposite places.
+The repack resolves a `Layout` from each framebuffer's fourcc (`Layout::of`,
+`drm_backend.rs:557`) and handles the eight 32-bit RGB formats, `XR24`/`AR24`,
+`XB24`/`AB24`, `XR30`/`AR30` and `XB30`/`AB30`. Any other fourcc is a refusal
+(*"unhandled scanout pixel format …"*), never a guess. Before it, a KDE host on
+Asahi refused every frame. ⚠️ A wrong channel order does not *look* broken:
+decoded as `XR24`, `AB24` is the right picture with a blue sky turned orange,
+so every order has a test pinned to hand-computed bytes.
 
 ⚠️ **A reason must fit FR-80's cap whole.** `CaptureUnavailable` keeps 200
 characters of a detail (`capture/mod.rs:1834`), the cascade's prefix included,
@@ -1769,7 +1780,7 @@ defect — the capture arms only expose it by being knobs.
 | `agents/roomlerd/src/keep_busy/logind.rs` | the logind facts the cascade, the brief and keep busy read (`Session` `:36`, `parse_show` `:72`, `sessions` `:157`); FR-93 P5g: a session in the background, never one closing (`in_background` `:65`) |
 | `agents/roomlerd/src/capture/scrap_backend.rs` · `x11_damage.rs` | the X11 arm and its damage listener |
 | `agents/roomlerd/src/virtual_desktop.rs` | Xvfb + WM + startup apps for `ROOMLERD_VIRTUAL_DESKTOP=1` |
-| `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled` `:209`, `primary` `:665`); FR-93 P3c: the plane table with each plane's type (`read_planes` `:258`), the primary by type (`primary_plane` `:306`), the cursor caps (`enable_cursor_caps` `:385`) and the per-frame cursor read (`CursorReader` `:398`, `read_cursor_pixels` `:480`); FR-93 P3d/P3f: the buffer's identity (`BufferId` `:118`) and the mapping's key (`maps` `:132`), the kill switch (`idle_skip_enabled` `:333`), the gate in `grab` (`:862`), and the still screen waited out in `next_frame` (`:1120`); FR-93 P3e: a display switched off (`display_off` `:356`, for an open `display_is_off` `:374`), told apart in the worker loop (`:819`), waited out in `next_frame` (`:1182`, `DARK_POLL` `:348`) and reported by `waits_for` (`:1211`), and its kill switch (`wake_wait_enabled` `:341`); FR-93 P3h: a scanout this daemon may not read, refused at open (`unreadable` `:855`) |
+| `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled` `:209`, `primary` `:718`) and the scanout's channel order, both depths (`Layout::of` `:557`, `repack_to_bgra` `:579`, `repack_bgra_half` `:1102`); FR-93 P3c: the plane table with each plane's type (`read_planes` `:258`), the primary by type (`primary_plane` `:306`), the cursor caps (`enable_cursor_caps` `:385`) and the per-frame cursor read (`CursorReader` `:398`, `read_cursor_pixels` `:480`); FR-93 P3d/P3f: the buffer's identity (`BufferId` `:118`) and the mapping's key (`maps` `:132`), the kill switch (`idle_skip_enabled` `:333`), the gate in `grab` (`:915`), and the still screen waited out in `next_frame` (`:1175`); FR-93 P3e: a display switched off (`display_off` `:356`, for an open `display_is_off` `:374`), told apart in the worker loop (`:872`), waited out in `next_frame` (`:1237`, `DARK_POLL` `:348`) and reported by `waits_for` (`:1266`), and its kill switch (`wake_wait_enabled` `:341`); FR-93 P3h: a scanout this daemon may not read, refused at open (`unreadable` `:908`) |
 | `agents/roomlerd/src/capture/drm_cursor.rs` | FR-93 P3c: the published cursor (`publish` `:64`, `latest` `:71`) and the pure conversions (`straighten_and_crop` `:108`, `place` `:167`, `shape_id` `:181`, `pick_primary` `:208`) |
 | `agents/roomlerd/src/capture/drm_idle.rs` | FR-93 P3d: the bounds (`MAX_SKIP` `:44`, `IDLE_WAIT` `:53`, `SAMPLE_ROWS` `:58`), what a tick showed (`Shown` `:62`), the gate (`IdleGate` `:75`, `unchanged` `:83`) and the row hash (`sample_rows` `:110`, `sampled_row` `:125`) |
 | `agents/roomlerd/src/capture/portal/mod.rs` | `PortalStatus` and the detector (`detect` `:161`, P2d-3's bounded `detect_within` `:171`, `detect_in_session` `:318`); the brief's non-activating `reachable` (`:198`); `pub mod helper` (`:337`): the `portal-helper` subcommand, `spawn_streaming` (`:1174`), `spawn_child` (`:1306`); FR-93 P5b: the helper ends with its mutter session, exit 3 on `Closed` (`EXIT_SESSION_CLOSED` `:457`, armed at `:1150`); FR-93 P5c: and with its stream, exit 4 once that has left *streaming* for good (`EXIT_STREAM_ENDED` `:464`, `SOURCE_GONE_AFTER` `:653`, `source_gone` `:658`, read in the frame loop both arms share, P5d: `write_frames` `:613`, which since P5e writes the first frame first); FR-93 P2d-4: a helper that fails before its stream says why (`STREAM_FAILED_MARKER` `:440`, `fail_stream` `:443`, read in `read_stream_handshake` `:1205`); FR-93 P6c: who closed the session (`ClosedBy` `:477`, mutter's `closed_mutter` `:516`, the portal's `closed_portal` `:532`, `end_closed` `:552`), the person's stop as exit 5 (`EXIT_STOPPED_AT_SCREEN` `:472`), the portal arm's watcher armed at `:990`, with KWin's bus owner telling a crash apart (`KWIN_BUS` `:562`) |
