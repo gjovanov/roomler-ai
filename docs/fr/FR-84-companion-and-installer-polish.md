@@ -78,7 +78,7 @@ cut one since 0.4.48, which shipped without macOS (`skip_macos`, before Apple si
 | devices | `agents/roomler-desktop/src/front/devices.js:58, 179` | LocalAPI `Peers` (netmap) every 2 s, `p.name` only, no `display_name`, orgs mixed |
 | agent-token routes | `crates/modules/fleet/src/lib.rs:331-340` | crash / self-unenroll / logs; nothing lists devices; the web grid and mesh are `AuthUser` |
 | launch after install | `scripts/install.ps1:283-305`; `agents/roomler-setup/src/orchestrator_agent.rs:501-610`; `agents/roomlerd/wix*/main.wxs` | copy the EXE, launch nothing, register nothing |
-| first launch | `agents/roomler-desktop/src/main.rs:57-75`; `tauri.conf.json:26` | `--view=` handled only in the single-instance callback; the window starts hidden |
+| first launch | `agents/roomler-desktop/src/main.rs:65-83`; `tauri.conf.json:26` | `--view=` handled only in the single-instance callback; the window starts hidden |
 | companion spawn | `agents/roomlerd/src/companion.rs:693` | `std::process::Command` (inherits handles) on the user-session path; the SYSTEM path already passes `bInheritHandles = FALSE` |
 | wizard release | `.github/workflows/release-setup.yml` | runs only on a `setup-v*` tag or a manual dispatch |
 | wizard icon | `agents/roomler-setup/icons/` | 72-byte `.ico` / 67-byte `.png`, 1×1, since `a25d77b36` |

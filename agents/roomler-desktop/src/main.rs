@@ -39,11 +39,19 @@ mod desktop_log;
 mod editor;
 mod first_run;
 mod panels;
+#[cfg(target_os = "linux")]
+mod pin;
 mod tray;
 
 use tauri::Manager;
 
 fn main() {
+    // #2286 — FIRST, before GTK starts and before any thread exists: on GNOME
+    // the companion runs under Xwayland, the only way its banner can sit at
+    // the top of the screen there.
+    #[cfg(target_os = "linux")]
+    pin::prefer_x11();
+
     // Lightweight logging (the agent has its own persistent rolling log;
     // this one is for companion-side issues — a failed enrollment HTTP call,
     // a refresh the daemon refused). FR-84 D1: stderr PLUS a small

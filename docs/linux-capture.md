@@ -504,7 +504,7 @@ grandchild held the unit's cgroup non-empty until systemd's `TimeoutStopSec`
 
 ⚠️ **A virtual-desktop host is not a consent surface**, even though its X
 display connects: the only viewer of that Xvfb is a remote controller, so the
-native consent panel would be drawn where nobody can see it (`indicator/x11.rs:191`
+native consent panel would be drawn where nobody can see it (`indicator/x11.rs:193`
 reads the daemon's own `ROOMLERD_VIRTUAL_DESKTOP` and declines). Detail in
 [`remote-control.md` §11.2](remote-control.md#112-consent).
 

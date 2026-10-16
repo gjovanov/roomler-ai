@@ -899,7 +899,7 @@ scale. Drawn at 1×, the panel came out at about 9-px text on a 4K desktop at
 KDE's 2.7×, with its buttons a third of their size (measured on real hardware,
 Plasma 6.6). It now reads `Xft.dpi` from the resources the desktop publishes
 for X11 clients and shows the same drawing at `round(dpi / 96)`, between 1 and
-4 (`scale`, `agents/roomlerd/src/indicator/x11.rs:80`). The drawing is painted
+4 (`scale`, `agents/roomlerd/src/indicator/x11.rs:82`). The drawing is painted
 at 1× into a pixmap, scaled up nearest-neighbour, and written in requests the
 server takes (`blit`, `:493`); a click maps back to the 1× layout. Measured:
 KDE at `Xft.dpi` 259 draws at 3× and GNOME at 192 at 2×, the size of the

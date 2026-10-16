@@ -35,6 +35,9 @@ use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
 pub const CONSENT: &str = "consent";
 pub const VIEWING: &str = "viewing";
 
+/// The banner window's title. #2286's KWin script finds the banner by it.
+pub const BANNER_TITLE: &str = "Roomler — session active";
+
 // ── FR-27 P9: the banner's Windows manners, here ──────────────────────────
 //
 // The native Windows badge (`roomlerd/src/indicator/win.rs`) hides until the
@@ -114,11 +117,15 @@ pub fn show_banner<R: Runtime>(app: &AppHandle<R>) {
         app,
         VIEWING,
         "panel-viewing.html",
-        "Roomler — session active",
+        BANNER_TITLE,
         360.0,
         76.0,
         false,
     );
+    // #2286 — on KDE, KWin places it: at the top, above everything. Off this
+    // thread, because it is a blocking D-Bus round trip.
+    #[cfg(target_os = "linux")]
+    std::thread::spawn(|| crate::pin::ensure_kwin_pin(BANNER_TITLE));
     BANNER_FRESH.store(true, Ordering::SeqCst);
     BANNER_WANTED.store(true, Ordering::SeqCst);
     if !switched_off("ROOMLER_DESKTOP_FRAME") {
@@ -199,6 +206,14 @@ struct Sample {
 
 impl Sample {
     fn read<R: Runtime>(win: &tauri::WebviewWindow<R>) -> Option<Self> {
+        // #2286 — under Xwayland the pointer is known only over X11 windows:
+        // at GNOME's top bar it reads where it last was, so the top-edge
+        // gesture would never bring a tucked-away banner back. Unreadable,
+        // then, and the banner stays where it is pinned.
+        #[cfg(target_os = "linux")]
+        if crate::pin::under_xwayland() {
+            return None;
+        }
         let p = win.cursor_position().ok()?;
         let mon = win.primary_monitor().ok().flatten()?;
         let scale = mon.scale_factor();
@@ -300,7 +315,13 @@ fn show<R: Runtime>(
     let built = WebviewWindowBuilder::new(app, label, WebviewUrl::App(page.into()))
         .title(title)
         .inner_size(w, h)
-        .resizable(false)
+        // #2286 — and no bigger. On Linux a NON-resizable GTK window takes
+        // its child's natural size, and a webview's is ~200 px: the banner
+        // asked for 76 px and came out 198 px tall, the rest of it empty.
+        // Resizable with min = max is the same fixed size without that.
+        .min_inner_size(w, h)
+        .max_inner_size(w, h)
+        .resizable(cfg!(target_os = "linux"))
         .decorations(false)
         .always_on_top(true)
         .skip_taskbar(true)
@@ -329,8 +350,32 @@ fn show<R: Runtime>(
         }
     };
     exclude_from_capture(&win);
-    position_top_centre(&win, w);
+    // #2286 — on Linux only the banner sits at the top. The daemon's own X11
+    // consent panel already holds the top centre there, and with the
+    // companion on Xwayland (GNOME) a consent window placed there too landed
+    // right under it when two questions were pending; a question goes in the
+    // middle, where a Wayland compositor puts it anyway.
+    if label == VIEWING || !cfg!(target_os = "linux") {
+        position_top_centre(&win, w);
+    } else {
+        position_centre(&win, w, h);
+    }
     present(&win, focus);
+}
+
+/// #2286 — the middle of the primary monitor, computed as the top centre is.
+/// (`WebviewWindow::center` put the window's CORNER at the middle under
+/// Xwayland at 2×, half a window off.)
+fn position_centre<R: Runtime>(win: &tauri::WebviewWindow<R>, logical_w: f64, logical_h: f64) {
+    let Ok(Some(monitor)) = win.primary_monitor() else {
+        return;
+    };
+    let scale = monitor.scale_factor();
+    let size = monitor.size().to_logical::<f64>(scale);
+    let pos = monitor.position().to_logical::<f64>(scale);
+    let x = pos.x + (size.width - logical_w) / 2.0;
+    let y = pos.y + (size.height - logical_h) / 2.0;
+    let _ = win.set_position(tauri::LogicalPosition::new(x, y));
 }
 
 /// Whether a panel's webview takes the FIRST click while its window is
