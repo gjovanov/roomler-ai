@@ -7,7 +7,7 @@
 > |---|---|---|
 > | rc.191 | the viewer asks; the agent switches the primary display to the largest mode inside the viewer's stage, and restores it when the session ends | shipped |
 > | P1 | the device decides: its owner's `display_match`, and under `auto` whether someone is using the screen; every request answered | merged; ships with the next agent release |
-> | P1b | a locked host switches once unlocked with nobody at it; a person coming back gets their mode back | not built |
+> | P1b | a locked host switches once unlocked with nobody at it; a person coming back gets their mode back | merged; ships with the next agent release |
 > | P2–P4 | Linux virtual desktops, modes no monitor offers, several displays | not built |
 
 ## Why it exists, and what went wrong with it
@@ -53,14 +53,14 @@ sequenceDiagram
 ```
 
 [`display_match.rs:380`](../agents/roomlerd/src/display_match.rs#L380) `may_switch` is the decision, pure and
-unit-tested. [`display_match.rs:404`](../agents/roomlerd/src/display_match.rs#L404) `request_for` runs it,
+unit-tested. [`display_match.rs:405`](../agents/roomlerd/src/display_match.rs#L405) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:9397`](../agents/roomlerd/src/peer.rs#L9397)).
+control-channel arm sends the answer ([`peer.rs:9464`](../agents/roomlerd/src/peer.rs#L9464)).
 
 ### The answers
 
 Every request gets exactly one `rc:display-match.state`
-([`display_match.rs:434`](../agents/roomlerd/src/display_match.rs#L434) `state_json`):
+([`display_match.rs:522`](../agents/roomlerd/src/display_match.rs#L522) `state_json`):
 
 | `refused` | It means | The viewer says |
 |---|---|---|
@@ -111,7 +111,7 @@ the session's idle clock, `GetLastInputInfo`.
 
 That clock moves for every input, and FR-108's P0 measured both kinds moving it: the person's
 (QMP on a vmtest guest) and the controller's injected moves. So
-[`presence.rs:79`](../agents/roomlerd/src/presence.rs#L79) `observe` follows it and keeps the last move
+[`presence.rs:96`](../agents/roomlerd/src/presence.rs#L96) `observe` follows it and keeps the last move
 **the machine does not explain**:
 
 | Input | Noted by | On the clock as |
@@ -122,22 +122,54 @@ That clock moves for every input, and FR-108's P0 measured both kinds moving it:
 
 A move within 250 ms of a machine input is that input
 ([`presence.rs:34`](../agents/roomlerd/src/presence.rs#L34) `MACHINE_SLACK_MS`). A sampler reads the clock
-every 500 ms from the worker's start ([`presence.rs:149`](../agents/roomlerd/src/presence.rs#L149) `start`),
+every 500 ms from the worker's start ([`presence.rs:186`](../agents/roomlerd/src/presence.rs#L186) `start`),
 so a request mid-session still tells the controller's input from a person's.
 
 - **Before the first reading nothing is known**, and an unknown is never read as an empty chair: the first
   reading counts as a person's.
-- **The decision** ([`presence.rs:53`](../agents/roomlerd/src/presence.rs#L53) `decide`): locked wins over
-  everything; otherwise a person's input inside the window is `attended`.
-- **The source scan** ([`presence.rs:301`](../agents/roomlerd/src/presence.rs#L301)) fails the build on a
+- **The decision** ([`presence.rs:57`](../agents/roomlerd/src/presence.rs#L57) `decide`): locked wins over
+  everything; a lock after the person's last input means away (P1b, below); otherwise a person's input
+  inside the window is `attended`.
+- **The source scan** ([`presence.rs:412`](../agents/roomlerd/src/presence.rs#L412)) fails the build on a
   hook, raw input or a keyboard poll in `presence.rs` or `display_match.rs`, FR-92's rule.
 
-### Locked is not "switch now"
+### Locked waits for the unlock (P1b)
 
 P0 tried it: on the lock screen the worker's `ChangeDisplaySettingsExW` returns `-1`, and the screen stays as
-it was. So a locked host answers `locked`, and the request waits for the unlock: typically the controller
-typing the password, after which nobody has touched the input. That is P1b. An unattended office PC is
-usually locked, so this is the main path, not an edge.
+it was. So a locked host answers `locked`, and the request waits
+([`display_match.rs:405`](../agents/roomlerd/src/display_match.rs#L405) `request_for` keeps it per session).
+An unattended office PC is usually locked, so this is the main path, not an edge.
+
+At the session's unlock the device decides again
+([`display_match.rs:474`](../agents/roomlerd/src/display_match.rs#L474) `on_unlock`, called from the
+session's lock watcher, [`peer.rs:1314`](../agents/roomlerd/src/peer.rs#L1314)):
+
+| Who unlocked it | What the clock shows | The answer |
+|---|---|---|
+| the controller, typing the password through the session | machine input only since the lock | **switched** (`on: true`): the person left by locking |
+| the person, at the keyboard | a person's input after the lock | `attended` |
+
+⚠️ The rule that makes the first row work: **a lock after the person's last input means they are away**,
+however recent that input was ([`presence.rs:128`](../agents/roomlerd/src/presence.rs#L128)
+`away_since_lock`). Without it, someone who locked their screen and walked off a minute ago would still
+read as `attended` for four more minutes, and the request would be refused for nothing.
+
+## The person comes back (P1b)
+
+While a session holds a mode it applied, a watcher checks four times a second
+([`peer.rs:1337`](../agents/roomlerd/src/peer.rs#L1337), Windows only). It hands the screen back at once
+and tells the viewer ([`display_match.rs:507`](../agents/roomlerd/src/display_match.rs#L507)
+`on_tick`):
+
+| What changed | The answer | Restored |
+|---|---|---|
+| a person's input (under `auto`) | `refused: attended` | yes |
+| the owner set `display_match = never` | `refused: disabled_on_device` | yes |
+| the screen locked | — | no: nobody came back, and the secure desktop cannot be switched anyway |
+
+The mode is not re-applied until the viewer asks again (toggle off and on): a returning person never fights a
+timer for their own screen ([`display_match.rs:488`](../agents/roomlerd/src/display_match.rs#L488)
+`hand_back`).
 
 ## What it does not do
 

@@ -1296,6 +1296,7 @@ impl AgentPeer {
             let mut rx = lock_state_rx.clone();
             let stash = control_dc.clone();
             let until = session_end.clone();
+            let sid = session_id;
             tokio::spawn(async move {
                 let run = async move {
                     // Send the initial state once the control DC is
@@ -1310,7 +1311,52 @@ impl AgentPeer {
                         if current != prev {
                             emit_host_locked(&stash, current == lock_state::LockState::Locked)
                                 .await;
+                            // FR-108 P1b — a display-match request answered
+                            // `locked` is decided again at the unlock (the
+                            // worker could not switch the secure desktop).
+                            if prev == lock_state::LockState::Locked
+                                && let Ok(Some(answer)) = tokio::task::spawn_blocking(move || {
+                                    crate::display_match::on_unlock(sid)
+                                })
+                                .await
+                            {
+                                emit_display_match(&stash, answer).await;
+                            }
                             prev = current;
+                        }
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = until.cancelled() => {}
+                    _ = run => {}
+                }
+            });
+        }
+
+        // FR-108 P1b — while this session holds a display mode it applied, a
+        // person who comes back (or the owner's `never`) gets the screen back
+        // within a quarter second, and the viewer is told. Windows only, where
+        // display match switches anything; it ends with the session.
+        #[cfg(target_os = "windows")]
+        {
+            let stash = control_dc.clone();
+            let until = session_end.clone();
+            let sid = session_id;
+            tokio::spawn(async move {
+                let run = async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tick.tick().await;
+                        if !crate::display_match::owns_mode(sid) {
+                            continue;
+                        }
+                        if let Ok(Some(answer)) =
+                            tokio::task::spawn_blocking(move || crate::display_match::on_tick(sid))
+                                .await
+                        {
+                            emit_display_match(&stash, answer).await;
                         }
                     }
                 };
@@ -1693,6 +1739,8 @@ impl Drop for AgentPeer {
         // `restore_for` touches the OS display API; keep it off this
         // (possibly async-context) thread. Ownership-gated + idempotent.
         std::thread::spawn(move || {
+            // FR-108 P1b — nothing waits for this session's unlock any more.
+            crate::display_match::forget(session_id);
             if crate::display_match::restore_for(session_id) {
                 tracing::info!(session = %session_id, "display-match: restored on peer drop (owner)");
             }
@@ -8982,6 +9030,24 @@ async fn emit_host_locked(
     }
 }
 
+/// FR-108 P1b — tell this session's viewer what display match did on its own
+/// (at the unlock, or handing the screen back), as `rc:display-match.state`.
+async fn emit_display_match(
+    stash: &Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    answer: crate::display_match::Answer,
+) {
+    let dc = {
+        let guard = stash.lock().await;
+        match guard.as_ref() {
+            Some(dc) => dc.clone(),
+            None => return,
+        }
+    };
+    if let Err(e) = dc.send_text(crate::display_match::state_json(answer)).await {
+        debug!(%e, "rc:display-match.state send failed (control DC closed?)");
+    }
+}
+
 /// rc.227 — push one keyboard-layout snapshot to the viewer over the
 /// control DC. Returns `false` when the DC is gone (the emitter task
 /// uses that as its session-scoped exit — the layout watch channel is
@@ -9072,6 +9138,7 @@ fn attach_control_handler(
             crate::input::arbiter::global().session_closed(session_id);
             // Detach — restore is fire-and-forget (JoinHandle drop is fine).
             drop(tokio::task::spawn_blocking(move || {
+                crate::display_match::forget(session_id);
                 if crate::display_match::restore_for(session_id) {
                     tracing::info!(session = %session_id, "display-match: restored on session close (owner)");
                 }
