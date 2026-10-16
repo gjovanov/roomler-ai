@@ -327,25 +327,33 @@ async fn the_panel_reads_what_stripe_billed_not_the_list_price() {
     let (app, token) = revenue_app(|_| {}).await;
     let x = org_with_owner(&app, "acme", ago_days(2), 3).await;
     let period = (ago_days(1), ago_days(1) + 30 * 86_400_000);
+    // Both rows land in ONE second — the subscription's `created` and the
+    // invoice's `paid_at` are the same instant, as Stripe sends them — so
+    // their `ts` (Stripe seconds) tie, and the order the panel reads rests
+    // on the `_id` tiebreak, which must be ARRIVAL order: the row's own
+    // `_id` stays on the paid invoice's upsert (`BillingEventDao::record`).
+    // With mongod minting that `_id` instead, this assertion failed about
+    // every second run.
+    let at = ago_days(1) / 1000 * 1000;
 
     assert_eq!(post_event(&app, &checkout(x, "sub_a", "cus_a")).await, 200);
     let created = event(
         "evt_a1",
         "customer.subscription.created",
-        ago_days(1),
+        at,
         subscription("sub_a", "cus_a", x, 3, period, "active"),
     );
     assert_eq!(post_event(&app, &created).await, 200);
     let paid = event(
         "evt_a2",
         "invoice.paid",
-        ago_days(1),
+        at,
         invoice(
             "in_a1",
             "sub_a",
             "cus_a",
             x,
-            ago_days(1),
+            at,
             1920,
             "subscription_create",
             vec![line(2400, 480, 3, period, false)],

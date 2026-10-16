@@ -60,8 +60,9 @@ use super::{
     },
     mounted,
     orgs::{acquisition_of, owner_attributions},
+    read_key::GrowthAuth,
 };
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{error::ApiError, state::AppState};
 
 /// Months the view spans when the query names none (the current one last).
 pub const DEFAULT_MONTHS: usize = 12;
@@ -723,10 +724,9 @@ fn rfc3339_ms(ms: i64) -> String {
 /// `GET /api/admin/growth/revenue?since=YYYY-MM&until=YYYY-MM&include_internal=`
 pub async fn get_revenue(
     State(state): State<AppState>,
-    auth: AuthUser,
+    _auth: GrowthAuth,
     Query(q): Query<RevenueQuery>,
 ) -> Result<Json<RevenueReport>, ApiError> {
-    super::require_growth_admin(&state, &auth)?;
     let now = DateTime::now();
     let now_ms = now.timestamp_millis();
     let months = month_range(q.since.as_deref(), q.until.as_deref(), now_ms)

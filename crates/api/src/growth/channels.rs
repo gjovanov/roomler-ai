@@ -33,6 +33,7 @@ use axum::{
     extract::{Query as AxumQuery, State},
 };
 use bson::DateTime;
+use chrono::NaiveDate;
 use roomler_ai_services::dao::{
     growth_digest::ExcludedCounts,
     growth_social::{GrowthPost, GrowthSocialDao, MAX_POSTS, PostSnapshot, SNAPSHOTS},
@@ -51,8 +52,9 @@ use super::{
     digest::{Measured, NotMeasured, SMALL_N, day_str, utc_date_of},
     funnel::{self, GroupCounts, StepCounts},
     mounted,
+    read_key::GrowthAuth,
 };
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{error::ApiError, state::AppState};
 
 /// The platform's own numbers at one snapshot age, summed over the posts
 /// that have that snapshot — raw metric names, a metric only ever added to
@@ -586,10 +588,9 @@ fn empty_breakdown() -> WebBreakdown {
 /// `GET /api/admin/growth/channels?since&until&include_internal`
 pub async fn get_channels(
     State(state): State<AppState>,
-    auth: AuthUser,
+    _auth: GrowthAuth,
     AxumQuery(q): AxumQuery<ChannelsQuery>,
 ) -> Result<Json<ChannelsReport>, ApiError> {
-    super::require_growth_admin(&state, &auth)?;
     let now = DateTime::now();
     let (since, until) = range(q.since.as_deref(), q.until.as_deref(), utc_date_of(now))
         .map_err(ApiError::BadRequest)?;
@@ -598,13 +599,29 @@ pub async fn get_channels(
     } else {
         ExclusionSet::load(&state.core).await?
     };
+    Ok(Json(
+        compute(&state, &set, since, until, q.include_internal, now).await?,
+    ))
+}
+
+/// The table for the closed days `[since, until]` (inclusive) at `now` —
+/// what the route answers, and what P10's weekly roll-up stores for its
+/// week.
+pub async fn compute(
+    state: &AppState,
+    set: &ExclusionSet,
+    since: NaiveDate,
+    until: NaiveDate,
+    include_internal: bool,
+    now: DateTime,
+) -> Result<ChannelsReport, ApiError> {
     let (start_ms, end_ms) = day_range_ms(since, until);
-    let social = read_posts(&state, start_ms, end_ms).await?;
+    let social = read_posts(state, start_ms, end_ms).await?;
 
     // The account plane, grouped at both depths a post's key can have.
     let read = funnel::read(
-        &state,
-        &set,
+        state,
+        set,
         DateTime::from_millis(start_ms),
         DateTime::from_millis(end_ms),
     )
@@ -616,7 +633,7 @@ pub async fn get_channels(
 
     // The web plane, live — asked only when there is a post to join.
     let (since_s, until_s) = (day_str(since), day_str(until));
-    let client = web_client(&state);
+    let client = web_client(state);
     let web_campaign = if social.posts.is_empty() {
         empty_breakdown()
     } else {
@@ -631,7 +648,7 @@ pub async fn get_channels(
         .conversions
         .clone()
         .or_else(|| web_content.conversions.clone());
-    let no_posts = if mounted(&state, "saas") {
+    let no_posts = if mounted(state, "saas") {
         NotMeasured::now("no posts pushed for this platform in the range")
     } else {
         NotMeasured::now(
@@ -656,17 +673,17 @@ pub async fn get_channels(
         .or_else(|| web_content.by_key.as_ref().err())
         .cloned();
     let (users, tenants) = set.counts();
-    Ok(Json(ChannelsReport {
+    Ok(ChannelsReport {
         enabled: true,
         since: since_s,
         until: until_s,
-        include_internal: q.include_internal,
+        include_internal,
         excluded: ExcludedCounts {
             users: users as u32,
             tenants: tenants as u32,
         },
         n_floor: SMALL_N,
-        ingest_mounted: mounted(&state, "saas"),
+        ingest_mounted: mounted(state, "saas"),
         web_not_measured,
         conversions,
         web_truncated: web_campaign.truncated || web_content.truncated,
@@ -675,7 +692,7 @@ pub async fn get_channels(
         value_basis: read.basis.clone(),
         not_measured: read.step_reasons(),
         platforms,
-    }))
+    })
 }
 
 #[cfg(test)]

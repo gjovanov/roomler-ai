@@ -56,8 +56,9 @@ use super::{
     },
     funnel::{self, GroupCounts, StepCounts},
     mounted,
+    read_key::GrowthAuth,
 };
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{error::ApiError, state::AppState};
 
 /// The default range: the 28 closed days ending yesterday.
 pub const DEFAULT_RANGE_DAYS: i64 = 28;
@@ -558,7 +559,7 @@ pub(crate) async fn web_breakdown(
 
 /// purestat's totals for `[since, until]` — one query with no dimension, so
 /// its visitors are unique over the range.
-async fn web_totals(
+pub(crate) async fn web_totals(
     client: &Result<PurestatClient, NotMeasured>,
     since: &str,
     until: &str,
@@ -592,10 +593,9 @@ async fn web_totals(
 /// `GET /api/admin/growth/campaigns?since&until&by&include_internal`
 pub async fn get_campaigns(
     State(state): State<AppState>,
-    auth: AuthUser,
+    _auth: GrowthAuth,
     AxumQuery(q): AxumQuery<CampaignsQuery>,
 ) -> Result<Json<CampaignsReport>, ApiError> {
-    super::require_growth_admin(&state, &auth)?;
     let now = DateTime::now();
     let today = utc_date_of(now);
     let (since, until) =
@@ -618,12 +618,28 @@ pub async fn get_campaigns(
     } else {
         ExclusionSet::load(&state.core).await?
     };
+    Ok(Json(
+        compute(&state, &set, since, until, depth, q.include_internal, now).await?,
+    ))
+}
 
+/// The table for the closed days `[since, until]` (inclusive) at `now` —
+/// what the route answers, and what P10's weekly roll-up stores by source
+/// for its week.
+pub async fn compute(
+    state: &AppState,
+    set: &ExclusionSet,
+    since: NaiveDate,
+    until: NaiveDate,
+    depth: KeyDepth,
+    include_internal: bool,
+    now: DateTime,
+) -> Result<CampaignsReport, ApiError> {
     // The account plane: the range's sign-ups, `[since 00:00, until+1 00:00)`.
     let (start_ms, end_ms) = day_range_ms(since, until);
     let read = funnel::read(
-        &state,
-        &set,
+        state,
+        set,
         DateTime::from_millis(start_ms),
         DateTime::from_millis(end_ms),
     )
@@ -640,15 +656,15 @@ pub async fn get_campaigns(
 
     // The web plane, live, for the same days.
     let (since_s, until_s) = (day_str(since), day_str(until));
-    let client = web_client(&state);
+    let client = web_client(state);
     let web = web_breakdown(&client, &since_s, &until_s, depth).await;
     let totals_web = web_totals(&client, &since_s, &until_s, &web).await;
 
     // P8 — the platforms' own numbers for the posts published in the range,
     // by the same key.
-    let social = super::channels::read_posts(&state, start_ms, end_ms).await?;
+    let social = super::channels::read_posts(state, start_ms, end_ms).await?;
     let reach = super::channels::reach_by_key(&social.posts, &social.snapshots, depth);
-    let reach_absent = super::channels::no_reach_reason(&state, &social);
+    let reach_absent = super::channels::no_reach_reason(state, &social);
 
     let (rows, rows_truncated) = join(
         &web.by_key,
@@ -668,12 +684,12 @@ pub async fn get_campaigns(
         .await?;
     let days = ((until - since).num_days() + 1) as u32;
     let (users, tenants) = set.counts();
-    Ok(Json(CampaignsReport {
+    Ok(CampaignsReport {
         enabled: true,
         since: since_s,
         until: until_s,
         by: depth,
-        include_internal: q.include_internal,
+        include_internal,
         excluded: ExcludedCounts {
             users: users as u32,
             tenants: tenants as u32,
@@ -698,8 +714,8 @@ pub async fn get_campaigns(
             coverage: totals_coverage,
         },
         rows,
-        pulls: pull_summary(&pulls, days, mounted(&state, "saas")),
-    }))
+        pulls: pull_summary(&pulls, days, mounted(state, "saas")),
+    })
 }
 
 #[cfg(test)]

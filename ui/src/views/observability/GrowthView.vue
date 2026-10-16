@@ -29,6 +29,7 @@
         <v-tab value="cohorts">Cohorts</v-tab>
         <v-tab value="revenue">Revenue</v-tab>
         <v-tab value="digest">Digest</v-tab>
+        <v-tab value="weekly">Weekly</v-tab>
       </v-tabs>
 
       <v-alert v-if="message" type="error" variant="tonal" density="compact" class="mb-3">
@@ -38,6 +39,8 @@
       <v-window v-model="tab">
         <!-- ── Overview ──────────────────────────────────────────────── -->
         <v-window-item value="overview">
+          <!-- P10 — the alerts open now, and the ones cleared recently. -->
+          <growth-alerts class="mb-3" />
           <v-row dense>
             <v-col cols="12" md="7">
               <v-card>
@@ -379,6 +382,12 @@
             No digest for that day yet. Recompute computes and stores it without mailing.
           </v-alert>
         </v-window-item>
+
+        <!-- ── Weekly (P10) ──────────────────────────────────────────── -->
+        <!-- Lazily rendered: the component loads the stored weeks on first open. -->
+        <v-window-item value="weekly">
+          <growth-weekly />
+        </v-window-item>
       </v-window>
     </template>
 
@@ -454,9 +463,11 @@ import {
   type PlanChange,
   rateIfEnough,
 } from '@/stores/growth'
+import GrowthAlerts from '@/components/growth/GrowthAlerts.vue'
 import GrowthCampaigns from '@/components/growth/GrowthCampaigns.vue'
 import GrowthChannels from '@/components/growth/GrowthChannels.vue'
 import GrowthNewsletter from '@/components/growth/GrowthNewsletter.vue'
+import GrowthWeekly from '@/components/growth/GrowthWeekly.vue'
 import GrowthNode from '@/components/growth/GrowthNode.vue'
 import GrowthNotMeasured from '@/components/growth/GrowthNotMeasured.vue'
 import GrowthPercentiles from '@/components/growth/GrowthPercentiles.vue'

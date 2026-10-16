@@ -31,6 +31,9 @@ import {
   metricsLabel,
   latestReach,
   safeHref,
+  weekFigureLabel,
+  isWeekFigure,
+  alertDetailLabel,
 } from '@/stores/growth'
 import { api } from '@/api/client'
 
@@ -100,6 +103,22 @@ describe('growth helpers', () => {
     )
     expect(safeHref('javascript:alert(1)')).toBeNull()
     expect(safeHref('//evil.example')).toBeNull()
+  })
+
+  it('labels a week figure against its baselines, and an alert detail as text', () => {
+    // P10 — the week, the week before, the four-week mean when measurable.
+    expect(weekFigureLabel({ week: 12, prev_week: 9, w4_avg: 5 })).toBe('12 (prev 9 · 4w avg 5.0)')
+    expect(weekFigureLabel({ week: 300, prev_week: 280 })).toBe('300 (prev 280)')
+    expect(isWeekFigure({ week: 1, prev_week: 0 })).toBe(true)
+    expect(isWeekFigure({ day: 1, d7: 2, d28: 3 })).toBe(false)
+    expect(isWeekFigure({ not_measured: 'fleet module not mounted' })).toBe(false)
+    // Detail values are text, never interpreted; a nested object is JSON.
+    expect(alertDetailLabel({ day: '2026-10-14', value: 9, baseline_mean: 1.07 })).toBe(
+      'day 2026-10-14 · value 9 · baseline_mean 1.07',
+    )
+    expect(alertDetailLabel({ days: { '2026-10-13': 'failed' }, '<b>x</b>': '<i>y</i>' })).toBe(
+      'days {"2026-10-13":"failed"} · <b>x</b> <i>y</i>',
+    )
   })
 
   it('shows a rate only once the settled denominator reaches the n-floor', () => {
@@ -228,8 +247,39 @@ describe('useGrowthStore', () => {
       label: 'promotion pipeline',
     })
     expect(minted.key).toBe('rgi_x')
+    // P10 — the read kind is a second mint, never the default.
+    await store.mintKey('pipeline results', 'read')
+    expect(mockApi.post).toHaveBeenLastCalledWith('/admin/growth/keys', {
+      kind: 'read',
+      label: 'pipeline results',
+    })
     await store.revokeKey('69a1dbbad2000f26adc875ce')
     expect(mockApi.delete).toHaveBeenCalledWith('/admin/growth/keys/69a1dbbad2000f26adc875ce')
+  })
+
+  it('reads the weekly roll-up and the alerts at the P10 routes', async () => {
+    const store = useGrowthStore()
+    mockApi.get.mockResolvedValue({ weeks: [], open: [], recent: [], rules: [] })
+    mockApi.post.mockResolvedValue({ week: '2026-W41', status: 'preview' })
+    await store.fetchWeekly()
+    expect(mockApi.get).toHaveBeenCalledWith('/admin/growth/weekly')
+    await store.fetchWeekly('2026-W41')
+    expect(mockApi.get).toHaveBeenCalledWith('/admin/growth/weekly?week=2026-W41')
+    await store.fetchWeeklies('2026-W30', 10)
+    expect(mockApi.get).toHaveBeenCalledWith('/admin/growth/weeklies?since=2026-W30&limit=10')
+    await store.runWeekly('2026-W41')
+    expect(mockApi.post).toHaveBeenCalledWith('/admin/growth/weekly/run?week=2026-W41&send=false')
+    await store.fetchAlerts()
+    expect(mockApi.get).toHaveBeenCalledWith('/admin/growth/alerts')
+    await store.fetchAlerts('2026-10-01')
+    expect(mockApi.get).toHaveBeenCalledWith('/admin/growth/alerts?since=2026-10-01')
+    await store.evaluateAlerts()
+    expect(mockApi.post).toHaveBeenLastCalledWith('/admin/growth/alerts/evaluate')
+    await store.evaluateAlerts(true)
+    expect(mockApi.post).toHaveBeenLastCalledWith('/admin/growth/alerts/evaluate?dry_run=true')
+    // A missing week is null, not an error.
+    mockApi.get.mockRejectedValueOnce(Object.assign(new Error('nf'), { status: 404 }))
+    expect(await store.fetchWeekly('2020-W01')).toBeNull()
   })
 
   it('fetches the newsletter view at the P5 route with its range', async () => {

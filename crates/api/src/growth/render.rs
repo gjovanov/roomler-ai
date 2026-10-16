@@ -17,13 +17,37 @@
 //! * the footer says how many users and orgs were excluded, and that the
 //!   digest carries no personal addresses.
 
-use roomler_ai_services::{dao::growth_digest::DigestDoc, newsletter::escape_html};
+use roomler_ai_services::{
+    dao::{growth_alert::GrowthAlert, growth_digest::DigestDoc},
+    newsletter::escape_html,
+};
 
-use super::digest::{CampaignGoals, Figure, FigureF, Measured, NotMeasured, SMALL_N, Sections};
+use super::{
+    campaigns::{Rate, WebCells},
+    digest::{
+        AlertRow, AlertsSection, CampaignGoals, Figure, FigureF, Measured, NotMeasured, SMALL_N,
+        Sections,
+    },
+    funnel::StepCounts,
+    weekly::{WeekFigure, WeeklyHeadline, WeeklySections},
+};
 
 /// `Roomler daily digest — YYYY-MM-DD`.
 pub fn subject(day: &str) -> String {
     format!("Roomler daily digest — {day}")
+}
+
+/// P10 — `Roomler weekly roll-up — 2026-W41 (2026-10-05 → 2026-10-11)`.
+pub fn weekly_subject(h: &WeeklyHeadline) -> String {
+    format!(
+        "Roomler weekly roll-up — {} ({} → {})",
+        h.week, h.since, h.until
+    )
+}
+
+/// P10 — `Roomler growth alert — spike: signups`.
+pub fn alert_subject(a: &GrowthAlert) -> String {
+    format!("Roomler growth alert — {}: {}", a.rule, a.key)
 }
 
 /// `num / den` as a percentage, only once `den` reaches [`SMALL_N`].
@@ -724,6 +748,8 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
     out.push(Heading("Not yet measured".into()));
     out.push(Line("Search".into(), not_measured(&s.search)));
 
+    alert_blocks(&mut out, &s.alerts, "the day");
+
     out.push(Note(format!(
         "Excluded from every number above: {} users and {} orgs (platform admins, the orgs they own, \
          and the explicit exclusion list). This digest carries no personal addresses, names or IPs. \
@@ -733,42 +759,610 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
     out
 }
 
+/// P10 — one alert row as a table line: rule, key, fired, cleared, and
+/// its detail as `k v` pairs.
+fn alert_cells(a: &AlertRow) -> Vec<String> {
+    vec![
+        a.rule.clone(),
+        a.key.clone(),
+        a.fired_at.clone(),
+        a.cleared_at.clone().unwrap_or_else(|| "open".into()),
+        a.detail
+            .iter()
+            .map(|(k, v)| format!("{k} {}", bson_text(v)))
+            .collect::<Vec<_>>()
+            .join(" · "),
+    ]
+}
+
+/// A detail value as text (days, numbers, names — never a person).
+fn bson_text(v: &bson::Bson) -> String {
+    match v {
+        bson::Bson::String(s) => s.clone(),
+        bson::Bson::Document(d) => d
+            .iter()
+            .map(|(k, v)| format!("{k}={}", bson_text(v)))
+            .collect::<Vec<_>>()
+            .join(","),
+        bson::Bson::Array(a) => a.iter().map(bson_text).collect::<Vec<_>>().join(","),
+        other => other.to_string(),
+    }
+}
+
+/// P10 — the alerts section of a digest or a roll-up.
+fn alert_blocks(out: &mut Vec<Block>, alerts: &Measured<AlertsSection>, window: &str) {
+    use Block::*;
+    out.push(Heading("Alerts".into()));
+    match alerts {
+        Measured::NotMeasured(n) => out.push(Line("Alerts".into(), not_measured(n))),
+        Measured::Value(a) => {
+            out.push(Line("Open now".into(), a.open.len().to_string()));
+            out.push(Line(
+                format!("Fired during {window}"),
+                a.fired.len().to_string(),
+            ));
+            out.push(Line(
+                format!("Cleared during {window}"),
+                a.cleared.len().to_string(),
+            ));
+            let rows: Vec<&AlertRow> = a
+                .open
+                .iter()
+                .chain(a.fired.iter().filter(|f| {
+                    !a.open
+                        .iter()
+                        .any(|o| o.fired_at == f.fired_at && o.rule == f.rule && o.key == f.key)
+                }))
+                .chain(a.cleared.iter().filter(|c| {
+                    !a.fired
+                        .iter()
+                        .any(|f| f.fired_at == c.fired_at && f.rule == c.rule && f.key == c.key)
+                }))
+                .collect();
+            if !rows.is_empty() {
+                out.push(Table(
+                    vec![
+                        "Rule".into(),
+                        "Key".into(),
+                        "Fired".into(),
+                        "Cleared".into(),
+                        "Detail".into(),
+                    ],
+                    rows.iter().map(|a| alert_cells(a)).collect(),
+                ));
+            }
+        }
+    }
+}
+
+/// P10 — a week figure: the week, the week before, the four-week mean.
+pub fn wfig(f: &WeekFigure) -> String {
+    match f.w4_avg {
+        Some(avg) => format!("{} (prev {} · 4w avg {:.1})", f.week, f.prev_week, avg),
+        None => format!("{} (prev {})", f.week, f.prev_week),
+    }
+}
+
+/// A step's count, pending, settled, and its rate only at n ≥ 30.
+fn step(s: &StepCounts) -> String {
+    match pct_if_enough(s.count as i64, s.settled as i64) {
+        Some(p) => format!(
+            "{} ({p:.1} % of {} settled · {} pending)",
+            s.count, s.settled, s.pending
+        ),
+        None => format!(
+            "{} ({} settled, n < {SMALL_N} · {} pending)",
+            s.count, s.settled, s.pending
+        ),
+    }
+}
+
+fn opt_step(s: &Option<StepCounts>, missing: &str) -> String {
+    match s {
+        Some(s) => step(s),
+        None => format!("not measured — {missing}"),
+    }
+}
+
+fn rate(r: &Option<Rate>) -> String {
+    match r {
+        Some(Rate { value: Some(v), n }) => format!("{:.1} % (n {n})", v * 100.0),
+        Some(Rate { value: None, n }) => format!("n {n} < {SMALL_N}"),
+        None => "—".into(),
+    }
+}
+
+fn web(w: &Measured<WebCells>) -> String {
+    match w {
+        Measured::Value(c) => format!(
+            "{} visitors · {} visits · {} pageviews · {} reads",
+            c.visitors, c.visits, c.pageviews, c.reads
+        ),
+        Measured::NotMeasured(n) => not_measured(n),
+    }
+}
+
+/// P10 — the weekly roll-up as blocks, in the order the operator reads
+/// them: the headline against its baselines, the funnel, the cohort
+/// lines, the tables, the alerts.
+pub fn weekly_blocks(doc: &DigestDoc, s: &WeeklySections) -> Vec<Block> {
+    use Block::*;
+    let mut out = Vec::new();
+    let h = &s.headline;
+
+    out.push(Heading("Headline".into()));
+    out.push(Line("Sign-ups".into(), wfig(&h.signups)));
+    out.push(Line("Orgs created".into(), wfig(&h.orgs_created)));
+    out.push(Line(
+        "Devices enrolled".into(),
+        measured(&h.devices_enrolled, wfig),
+    ));
+    out.push(Line(
+        "Weekly active orgs (north star)".into(),
+        measured(&h.active_orgs, wfig),
+    ));
+    match &h.website {
+        Measured::Value(w) => {
+            out.push(Line("Website visitors".into(), wfig(&w.visitors)));
+            out.push(Line("Website visits".into(), wfig(&w.visits)));
+            out.push(Line("Website pageviews".into(), wfig(&w.pageviews)));
+            out.push(Line("Website reads".into(), wfig(&w.reads)));
+        }
+        Measured::NotMeasured(n) => out.push(Line("Website".into(), not_measured(n))),
+    }
+
+    out.push(Heading("The account funnel — the week's sign-ups".into()));
+    let f = &s.funnel;
+    out.push(Line("Sign-ups".into(), f.steps.signup.to_string()));
+    out.push(Line(
+        format!("Org created (≤ {} d)", f.windows.org_days),
+        step(&f.steps.org_created),
+    ));
+    out.push(Line(
+        format!("Activated (device ≤ {} d)", f.windows.activation_days),
+        opt_step(
+            &f.steps.activated,
+            f.not_measured
+                .get("activated")
+                .map(String::as_str)
+                .unwrap_or("not mounted"),
+        ),
+    ));
+    out.push(Line(
+        format!("First value (≤ {} d)", f.windows.value_days),
+        opt_step(
+            &f.steps.first_value,
+            f.not_measured
+                .get("first_value")
+                .map(String::as_str)
+                .unwrap_or("not mounted"),
+        ),
+    ));
+    // P4 — paid as of now, no window; `None` where billing is not on
+    // record (the funnel names why).
+    out.push(Line(
+        "Paid (so far)".into(),
+        opt_step(
+            &f.steps.paid,
+            f.not_measured
+                .get("paid")
+                .map(String::as_str)
+                .unwrap_or("billing not on record"),
+        ),
+    ));
+    if let Some(p) = &f.time_to_value.first_device {
+        out.push(Line(
+            "Sign-up → first device".into(),
+            match p.median_h {
+                Some(m) => format!("median {m:.1} h (n {})", p.n),
+                None => format!("n {}", p.n),
+            },
+        ));
+    }
+    if !f.buckets.is_empty() {
+        out.push(Table(
+            vec![
+                "Source".into(),
+                "Sign-ups".into(),
+                "Org created".into(),
+                "Activated".into(),
+                "First value".into(),
+            ],
+            f.buckets
+                .iter()
+                .map(|b| {
+                    vec![
+                        b.key.clone().unwrap_or_else(|| "(none)".into()),
+                        b.signups.to_string(),
+                        b.org_created.count.to_string(),
+                        b.activated
+                            .as_ref()
+                            .map(|s| s.count.to_string())
+                            .unwrap_or_else(|| "—".into()),
+                        b.first_value
+                            .as_ref()
+                            .map(|s| s.count.to_string())
+                            .unwrap_or_else(|| "—".into()),
+                    ]
+                })
+                .collect(),
+        ));
+    }
+
+    out.push(Heading("Cohorts — weekly active orgs".into()));
+    match (&s.cohorts.wao, &s.cohorts.not_measured) {
+        (Some(wao), _) => out.push(Table(
+            vec!["Week".into(), "Active orgs".into(), "".into()],
+            wao.iter()
+                .map(|w| {
+                    vec![
+                        w.week.clone(),
+                        w.active_orgs.to_string(),
+                        if w.partial {
+                            "partial".into()
+                        } else {
+                            String::new()
+                        },
+                    ]
+                })
+                .collect(),
+        )),
+        (None, reason) => out.push(Line(
+            "Weekly active orgs".into(),
+            format!(
+                "not measured — {}",
+                reason.clone().unwrap_or_else(|| "no value module".into())
+            ),
+        )),
+    }
+    if let Some(rows) = &s.cohorts.cohorts {
+        let cell = |r: &super::cohorts::CohortRow, k: usize| {
+            r.active
+                .get(k)
+                .copied()
+                .flatten()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "—".into())
+        };
+        out.push(Table(
+            vec![
+                "Cohort".into(),
+                "Orgs".into(),
+                "W1".into(),
+                "W4".into(),
+                "W12".into(),
+            ],
+            rows.iter()
+                .map(|r| {
+                    vec![
+                        r.week.clone(),
+                        r.size.to_string(),
+                        cell(r, 1),
+                        cell(r, 4),
+                        cell(r, 12),
+                    ]
+                })
+                .collect(),
+        ));
+    }
+
+    out.push(Heading("Campaigns by source — the week".into()));
+    let c = &s.campaigns;
+    out.push(Line(
+        "Website (the week, unique)".into(),
+        web(&c.totals.web),
+    ));
+    out.push(Line(
+        "Sign-ups (with a campaign key)".into(),
+        format!("{} ({})", c.totals.signups, c.totals.keyed_signups),
+    ));
+    out.push(Line(
+        "Coverage".into(),
+        match &c.totals.coverage {
+            Measured::Value(cov) => match cov.ratio {
+                Some(r) => format!(
+                    "{:.1} % ({} goals ÷ {} sign-ups)",
+                    r * 100.0,
+                    cov.purestat_signup_goals,
+                    cov.server_signups
+                ),
+                None => format!(
+                    "{} goals ÷ {} sign-ups (n < {})",
+                    cov.purestat_signup_goals, cov.server_signups, cov.n_floor
+                ),
+            },
+            Measured::NotMeasured(n) => not_measured(n),
+        },
+    ));
+    if !c.rows.is_empty() {
+        out.push(Table(
+            vec![
+                "Source".into(),
+                "Visitors".into(),
+                "Reads".into(),
+                "Sign-up goals".into(),
+                "Sign-ups".into(),
+                "Activated".into(),
+                "Sign-up / visitor".into(),
+            ],
+            c.rows
+                .iter()
+                .map(|r| {
+                    let (visitors, reads, goals) = match &r.web {
+                        Measured::Value(w) => (
+                            w.visitors.to_string(),
+                            w.reads.to_string(),
+                            match &w.goals {
+                                Measured::Value(g) => g.signup.to_string(),
+                                Measured::NotMeasured(_) => "not measured".into(),
+                            },
+                        ),
+                        Measured::NotMeasured(_) => (
+                            "not measured".into(),
+                            "not measured".into(),
+                            "not measured".into(),
+                        ),
+                    };
+                    vec![
+                        r.key.source.clone(),
+                        visitors,
+                        reads,
+                        goals,
+                        r.signups.to_string(),
+                        r.activated
+                            .as_ref()
+                            .map(|s| s.count.to_string())
+                            .unwrap_or_else(|| "—".into()),
+                        rate(&r.rates.signup_per_visitor),
+                    ]
+                })
+                .collect(),
+        ));
+    }
+
+    out.push(Heading("Channels — posts published in the week".into()));
+    let with_posts: Vec<_> = s
+        .channels
+        .platforms
+        .iter()
+        .filter(|p| !p.posts.is_empty())
+        .collect();
+    if with_posts.is_empty() {
+        out.push(Line("Posts".into(), "none pushed for the week".into()));
+    } else {
+        out.push(Table(
+            vec![
+                "Platform".into(),
+                "Posts".into(),
+                "Reach (latest age)".into(),
+                "Web".into(),
+                "Sign-ups".into(),
+            ],
+            with_posts
+                .iter()
+                .map(|p| match &p.summary {
+                    Measured::Value(sm) => vec![
+                        p.platform.clone(),
+                        sm.posts.to_string(),
+                        match &sm.reach {
+                            Measured::Value(at) => at
+                                .last()
+                                .map(|r| {
+                                    format!(
+                                        "{}: {}",
+                                        r.snapshot,
+                                        r.metrics
+                                            .iter()
+                                            .take(3)
+                                            .map(|(k, v)| format!("{k} {v}"))
+                                            .collect::<Vec<_>>()
+                                            .join(" · ")
+                                    )
+                                })
+                                .unwrap_or_else(|| "—".into()),
+                            Measured::NotMeasured(n) => not_measured(n),
+                        },
+                        web(&sm.web),
+                        sm.signups.to_string(),
+                    ],
+                    Measured::NotMeasured(n) => vec![
+                        p.platform.clone(),
+                        p.posts.len().to_string(),
+                        not_measured(n),
+                        String::new(),
+                        String::new(),
+                    ],
+                })
+                .collect(),
+        ));
+    }
+
+    out.push(Heading("Newsletter — the week".into()));
+    let n = &s.newsletter;
+    match (&n.not_measured, &n.list) {
+        (Some(reason), _) => out.push(Line("Newsletter".into(), not_measured(reason))),
+        (None, Some(list)) => {
+            out.push(Line(
+                "New · confirmed · unsubscribed".into(),
+                format!(
+                    "{} · {} · {} (via an issue's link {})",
+                    list.totals.new,
+                    list.totals.confirmed,
+                    list.totals.unsubscribed,
+                    list.totals.unsubscribed_via_issue
+                ),
+            ));
+            out.push(Line(
+                "List now".into(),
+                format!(
+                    "{} mailable · {} pending · {} unsubscribed · {} suppressed",
+                    list.size.mailable,
+                    list.size.pending,
+                    list.size.unsubscribed,
+                    list.size.suppressed
+                ),
+            ));
+        }
+        (None, None) => out.push(Line("Newsletter".into(), "no list read".into())),
+    }
+    if !n.issues.is_empty() {
+        out.push(Table(
+            vec![
+                "Issue".into(),
+                "Sent".into(),
+                "Accepted".into(),
+                "Delivered".into(),
+                "Bounced".into(),
+                "Unsubscribed via".into(),
+                "Visitors".into(),
+                "Sign-ups".into(),
+            ],
+            n.issues
+                .iter()
+                .map(|i| {
+                    let (delivered, bounced) = match &i.delivery {
+                        Measured::Value(d) => (d.delivered.to_string(), d.bounced.to_string()),
+                        Measured::NotMeasured(_) => ("not measured".into(), "not measured".into()),
+                    };
+                    vec![
+                        i.slug.clone(),
+                        i.sent_at.clone().unwrap_or_else(|| "—".into()),
+                        i.ledger.accepted.to_string(),
+                        delivered,
+                        bounced,
+                        i.unsubscribed_via.to_string(),
+                        match &i.web {
+                            Measured::Value(w) => w.visitors.to_string(),
+                            Measured::NotMeasured(_) => "not measured".into(),
+                        },
+                        i.signups.to_string(),
+                    ]
+                })
+                .collect(),
+        ));
+    }
+
+    alert_blocks(&mut out, &s.alerts, "the week");
+
+    out.push(Note(format!(
+        "Excluded from every number above: {} users and {} orgs (platform admins, the orgs they own, \
+         and the explicit exclusion list). This roll-up carries no personal addresses, names or IPs. \
+         Week {} ({} → {}, UTC), attempt {}.",
+        doc.excluded.users, doc.excluded.tenants, h.week, h.since, h.until, doc.attempts
+    )));
+    out
+}
+
+/// P10 — an alert's mail: the rule, the key, the detail, and how many
+/// alerts are open.
+pub fn alert_mail(a: &GrowthAlert, open_now: usize) -> (String, String, String) {
+    use Block::*;
+    let fired = a.fired_at.try_to_rfc3339_string().unwrap_or_default();
+    let mut blocks = vec![
+        Heading(format!("{}: {}", a.rule, a.key)),
+        Line("Fired at".into(), fired.clone()),
+    ];
+    for (k, v) in &a.detail {
+        blocks.push(Line(k.clone(), bson_text(v)));
+    }
+    blocks.push(Note(format!(
+        "{open_now} alert(s) open now. This alert is mailed at most once per rule and key per day; \
+         it clears on its own when the condition goes away. See /observability/growth."
+    )));
+    let title = alert_subject(a);
+    (
+        title.clone(),
+        html_document(&title, "", &blocks),
+        text_document(&title, "", &blocks),
+    )
+}
+
 /// The HTML body. Every string escaped; inline styles only (mail clients).
 pub fn render_html(doc: &DigestDoc, s: &Sections) -> String {
+    html_document(
+        &format!("Roomler daily digest — {}", doc.day),
+        &format!(
+            "Every count is the day, then the trailing 7 and 28 days. Rates appear only above n = {SMALL_N}."
+        ),
+        &blocks(doc, s),
+    )
+}
+
+/// The plain-text body: the same blocks, as text.
+pub fn render_text(doc: &DigestDoc, s: &Sections) -> String {
+    text_document(
+        &format!("Roomler daily digest — {}", doc.day),
+        &format!(
+            "Every count is the day, then the trailing 7 and 28 days. Rates appear only above n = {SMALL_N}."
+        ),
+        &blocks(doc, s),
+    )
+}
+
+/// P10 — the weekly roll-up's HTML body.
+pub fn render_weekly_html(doc: &DigestDoc, s: &WeeklySections) -> String {
+    html_document(
+        &weekly_subject(&s.headline),
+        &format!(
+            "Every count is the week, then the week before and the mean of the four before it. \
+             Rates appear only above n = {SMALL_N}."
+        ),
+        &weekly_blocks(doc, s),
+    )
+}
+
+/// P10 — the weekly roll-up's plain-text body.
+pub fn render_weekly_text(doc: &DigestDoc, s: &WeeklySections) -> String {
+    text_document(
+        &weekly_subject(&s.headline),
+        &format!(
+            "Every count is the week, then the week before and the mean of the four before it. \
+             Rates appear only above n = {SMALL_N}."
+        ),
+        &weekly_blocks(doc, s),
+    )
+}
+
+/// The HTML document writer every mail shares. Every string escaped;
+/// inline styles only (mail clients).
+fn html_document(title: &str, intro: &str, blocks: &[Block]) -> String {
     let mut html = String::with_capacity(16 * 1024);
     html.push_str(
         "<div style=\"font-family: sans-serif; max-width: 860px; margin: 0 auto; color: #222;\">",
     );
     html.push_str(&format!(
-        "<h2 style=\"margin-bottom: 4px;\">Roomler daily digest — {}</h2>\
-         <p style=\"color: #666; margin-top: 0;\">Every count is the day, then the trailing 7 and 28 days. \
-         Rates appear only above n = {}.</p>",
-        escape_html(&doc.day),
-        SMALL_N
+        "<h2 style=\"margin-bottom: 4px;\">{}</h2>",
+        escape_html(title)
     ));
-    for b in blocks(doc, s) {
+    if !intro.is_empty() {
+        html.push_str(&format!(
+            "<p style=\"color: #666; margin-top: 0;\">{}</p>",
+            escape_html(intro)
+        ));
+    }
+    for b in blocks {
         match b {
             Block::Heading(h) => html.push_str(&format!(
                 "<h3 style=\"margin: 20px 0 6px; border-bottom: 1px solid #ddd;\">{}</h3>",
-                escape_html(&h)
+                escape_html(h)
             )),
             Block::Line(k, v) => html.push_str(&format!(
                 "<div style=\"margin: 2px 0;\"><strong>{}</strong>: {}</div>",
-                escape_html(&k),
-                escape_html(&v)
+                escape_html(k),
+                escape_html(v)
             )),
             Block::Table(headers, rows) => {
                 html.push_str(
                     "<table style=\"border-collapse: collapse; margin: 6px 0; font-size: 13px;\"><thead><tr>",
                 );
-                for h in &headers {
+                for h in headers {
                     html.push_str(&format!(
                         "<th style=\"text-align: left; padding: 2px 8px; border-bottom: 1px solid #999;\">{}</th>",
                         escape_html(h)
                     ));
                 }
                 html.push_str("</tr></thead><tbody>");
-                for row in &rows {
+                for row in rows {
                     html.push_str("<tr>");
                     for cell in row {
                         html.push_str(&format!(
@@ -782,7 +1376,7 @@ pub fn render_html(doc: &DigestDoc, s: &Sections) -> String {
             }
             Block::Note(n) => html.push_str(&format!(
                 "<p style=\"color: #666; font-size: 13px;\">{}</p>",
-                escape_html(&n)
+                escape_html(n)
             )),
         }
     }
@@ -792,14 +1386,16 @@ pub fn render_html(doc: &DigestDoc, s: &Sections) -> String {
     html
 }
 
-/// The plain-text body: the same blocks, as text.
-pub fn render_text(doc: &DigestDoc, s: &Sections) -> String {
+/// The plain-text writer every mail shares: the same blocks, as text.
+fn text_document(title: &str, intro: &str, blocks: &[Block]) -> String {
     let mut text = String::with_capacity(8 * 1024);
-    text.push_str(&format!(
-        "Roomler daily digest — {}\nEvery count is the day, then the trailing 7 and 28 days. Rates appear only above n = {}.\n",
-        doc.day, SMALL_N
-    ));
-    for b in blocks(doc, s) {
+    text.push_str(title);
+    text.push('\n');
+    if !intro.is_empty() {
+        text.push_str(intro);
+        text.push('\n');
+    }
+    for b in blocks {
         match b {
             Block::Heading(h) => text.push_str(&format!("\n== {h} ==\n")),
             Block::Line(k, v) => text.push_str(&format!("{k}: {v}\n")),
@@ -959,6 +1555,23 @@ mod tests {
                 }],
             }),
             search: NotMeasured::later("search", "P7"),
+            alerts: Measured::Value(AlertsSection {
+                fired: vec![AlertRow {
+                    rule: "spike".into(),
+                    key: "signups".into(),
+                    fired_at: "2026-10-13T09:00:00Z".into(),
+                    cleared_at: None,
+                    detail: bson::doc! { "day": "2026-10-12", "value": 9_i64, "baseline_mean": 1.07 },
+                }],
+                cleared: vec![],
+                open: vec![AlertRow {
+                    rule: "spike".into(),
+                    key: "signups".into(),
+                    fired_at: "2026-10-13T09:00:00Z".into(),
+                    cleared_at: None,
+                    detail: bson::doc! { "day": "2026-10-12", "value": 9_i64, "baseline_mean": 1.07 },
+                }],
+            }),
         };
         (doc, s)
     }
@@ -1079,6 +1692,257 @@ mod tests {
         );
         assert!(text.contains("not measured — arrives with P7"));
         assert_eq!(subject("2026-10-13"), "Roomler daily digest — 2026-10-13");
+        // P10 — the day's alerts: the open row listed once (it fired that
+        // day too), with its detail as text.
+        assert!(text.contains("== Alerts =="), "{text}");
+        assert!(text.contains("Open now: 1\nFired during the day: 1\nCleared during the day: 0"));
+        assert_eq!(
+            text.matches("spike | signups | 2026-10-13T09:00:00Z | open |")
+                .count(),
+            1
+        );
+        assert!(text.contains("day 2026-10-12 · value 9 · baseline_mean 1.07"));
+        // Off: a reason, never a count.
+        let (doc, mut s) = sample();
+        s.alerts = Measured::NotMeasured(NotMeasured::now("alerts are off on this server"));
+        let text = render_text(&doc, &s);
+        assert!(text.contains("Alerts: not measured — alerts are off on this server"));
+        assert!(!text.contains("Open now"));
+    }
+
+    /// P10 — the weekly roll-up: the headline against its baselines, every
+    /// rate with its n, a not-measured cell as a reason, and no address.
+    #[test]
+    fn the_weekly_roll_up_renders_its_baselines_and_keeps_every_n() {
+        use super::super::{
+            campaigns::{CampaignsReport, PullSummary, Totals},
+            channels::ChannelsReport,
+            cohorts::{CohortsReport, OrgDailyCoverage, WaoWeek},
+            digest::Coverage,
+            funnel::{FunnelReport, Steps, TimeToValue, Windows},
+            newsletter::NewsletterReport,
+            weekly::{WebWeek, WeekFigure, WeeklyHeadline, WeeklySections},
+        };
+        let (mut doc, _) = sample();
+        doc.day = "2026-W41".into();
+        let wf = |week, prev_week, w4| WeekFigure {
+            week,
+            prev_week,
+            w4_avg: w4,
+        };
+        let excluded = doc.excluded;
+        let s = WeeklySections {
+            headline: WeeklyHeadline {
+                week: "2026-W41".into(),
+                since: "2026-10-05".into(),
+                until: "2026-10-11".into(),
+                signups: wf(12, 9, Some(5.0)),
+                orgs_created: wf(3, 1, Some(1.5)),
+                devices_enrolled: Measured::unmounted("fleet"),
+                active_orgs: Measured::Value(wf(7, 6, None)),
+                website: Measured::Value(WebWeek {
+                    visitors: wf(300, 280, None),
+                    visits: wf(400, 350, None),
+                    pageviews: wf(900, 800, None),
+                    reads: wf(120, 100, None),
+                }),
+            },
+            funnel: FunnelReport {
+                enabled: true,
+                since: "2026-10-05T00:00:00Z".into(),
+                until: "2026-10-12T00:00:00Z".into(),
+                include_internal: false,
+                excluded,
+                windows: Windows {
+                    org_days: 7,
+                    activation_days: 7,
+                    value_days: 14,
+                },
+                truncated: false,
+                value_basis: vec!["remote".into()],
+                not_measured: Default::default(),
+                steps: Steps {
+                    signup: 12,
+                    org_created: StepCounts {
+                        count: 6,
+                        pending: 2,
+                        settled: 10,
+                    },
+                    activated: Some(StepCounts {
+                        count: 20,
+                        pending: 0,
+                        settled: 40,
+                    }),
+                    first_value: None,
+                    paid: None,
+                },
+                time_to_value: TimeToValue {
+                    first_device: None,
+                    first_value: None,
+                },
+                by: None,
+                buckets: vec![],
+            },
+            cohorts: CohortsReport {
+                enabled: true,
+                unit: "week".into(),
+                since: "2026-07-20".into(),
+                include_internal: false,
+                excluded,
+                weeks_since: 12,
+                highlight: [1, 4, 12],
+                value_basis: vec!["remote".into()],
+                not_measured: None,
+                cohorts: Some(vec![]),
+                wao: Some(vec![WaoWeek {
+                    week: "2026-W41".into(),
+                    start: "2026-10-05".into(),
+                    active_orgs: 7,
+                    partial: false,
+                }]),
+                org_daily: OrgDailyCoverage::default(),
+            },
+            campaigns: CampaignsReport {
+                enabled: true,
+                since: "2026-10-05".into(),
+                until: "2026-10-11".into(),
+                by: roomler_core::campaign::KeyDepth::Source,
+                include_internal: false,
+                excluded,
+                windows: Windows {
+                    org_days: 7,
+                    activation_days: 7,
+                    value_days: 14,
+                },
+                n_floor: SMALL_N,
+                web_not_measured: Some(NotMeasured::now("purestat key not configured")),
+                conversions: None,
+                web_truncated: false,
+                account_truncated: false,
+                rows_truncated: false,
+                value_basis: vec![],
+                not_measured: Default::default(),
+                totals: Totals {
+                    web: Measured::NotMeasured(NotMeasured::now("purestat key not configured")),
+                    signups: 12,
+                    keyed_signups: 4,
+                    coverage: Measured::Value(Coverage {
+                        purestat_signup_goals: 2,
+                        server_signups: 12,
+                        ratio: None,
+                        n_floor: SMALL_N,
+                    }),
+                },
+                rows: vec![],
+                pulls: PullSummary {
+                    source: "purestat".into(),
+                    days: 7,
+                    pulled: 0,
+                    failed: 0,
+                    not_pulled: 7,
+                    freeze_days: 7,
+                    last_pulled_at: None,
+                    last_error: None,
+                    not_measured: None,
+                },
+            },
+            channels: ChannelsReport {
+                enabled: true,
+                since: "2026-10-05".into(),
+                until: "2026-10-11".into(),
+                include_internal: false,
+                excluded,
+                n_floor: SMALL_N,
+                ingest_mounted: true,
+                web_not_measured: None,
+                conversions: None,
+                web_truncated: false,
+                account_truncated: false,
+                posts_truncated: false,
+                value_basis: vec![],
+                not_measured: Default::default(),
+                platforms: vec![],
+            },
+            newsletter: NewsletterReport {
+                enabled: true,
+                since: "2026-10-05".into(),
+                until: "2026-10-11".into(),
+                include_internal: false,
+                excluded,
+                n_floor: SMALL_N,
+                webhook_configured: false,
+                link_tags: true,
+                not_measured: Some(NotMeasured::now("saas module not mounted")),
+                list: None,
+                issues: vec![],
+                issues_truncated: false,
+                web_not_measured: None,
+                web_truncated: false,
+                account_truncated: false,
+            },
+            alerts: Measured::Value(AlertsSection {
+                fired: vec![],
+                cleared: vec![],
+                open: vec![],
+            }),
+        };
+        let text = render_weekly_text(&doc, &s);
+        assert!(
+            text.contains("Roomler weekly roll-up — 2026-W41 (2026-10-05 → 2026-10-11)"),
+            "{text}"
+        );
+        assert!(text.contains("Sign-ups: 12 (prev 9 · 4w avg 5.0)"));
+        assert!(text.contains("Orgs created: 3 (prev 1 · 4w avg 1.5)"));
+        assert!(text.contains("Devices enrolled: not measured — fleet module not mounted"));
+        assert!(text.contains("Weekly active orgs (north star): 7 (prev 6)"));
+        assert!(text.contains("Website visitors: 300 (prev 280)"));
+        // Rates: below n = 30 counts only; at 40 settled a percentage.
+        assert!(
+            text.contains("Org created (≤ 7 d): 6 (10 settled, n < 30 · 2 pending)"),
+            "{text}"
+        );
+        assert!(text.contains("Activated (device ≤ 7 d): 20 (50.0 % of 40 settled · 0 pending)"));
+        assert!(text.contains("First value (≤ 14 d): not measured — not mounted"));
+        assert!(
+            text.contains("Website (the week, unique): not measured — purestat key not configured")
+        );
+        assert!(text.contains("Coverage: 2 goals ÷ 12 sign-ups (n < 30)"));
+        assert!(text.contains("2026-W41 | 7 |"));
+        assert!(text.contains("Newsletter: not measured — saas module not mounted"));
+        assert!(text.contains("Open now: 0"));
+        assert!(text.contains("Week 2026-W41 (2026-10-05 → 2026-10-11, UTC), attempt 1."));
+        assert!(!text.contains('@'));
+        let html = render_weekly_html(&doc, &s);
+        assert!(
+            html.contains("<h2 style=\"margin-bottom: 4px;\">Roomler weekly roll-up — 2026-W41")
+        );
+        assert!(html.contains("4w avg 5.0"));
+        assert!(!html.contains('@'));
+    }
+
+    /// P10 — an alert's mail names the rule and the key, carries the
+    /// detail as text, and says how many are open.
+    #[test]
+    fn an_alert_mail_carries_the_rule_the_key_and_the_detail() {
+        let a = GrowthAlert {
+            id: bson::oid::ObjectId::new(),
+            rule: "spike".into(),
+            key: "signups".into(),
+            fired_at: bson::DateTime::parse_rfc3339_str("2026-10-15T09:00:00Z").unwrap(),
+            cleared_at: None,
+            detail: bson::doc! { "day": "2026-10-14", "value": 9_i64, "baseline_mean": 1.07, "<b>x</b>": "<i>y</i>" },
+            mailed_on: None,
+        };
+        let (subject, html, text) = alert_mail(&a, 2);
+        assert_eq!(subject, "Roomler growth alert — spike: signups");
+        assert!(
+            text.contains("== spike: signups ==\nFired at: 2026-10-15T09:00:00Z\n"),
+            "{text}"
+        );
+        assert!(text.contains("day: 2026-10-14\nvalue: 9\nbaseline_mean: 1.07\n"));
+        assert!(text.contains("2 alert(s) open now"));
+        assert!(html.contains("&lt;b&gt;x&lt;/b&gt;") && !html.contains("<i>y</i>"));
+        assert!(!text.contains('@') && !html.contains('@'));
     }
 
     #[test]
