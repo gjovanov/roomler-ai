@@ -2424,6 +2424,13 @@ pub enum ServerMsg {
         /// limit only for one that advertises `idle-timeout`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idle_secs: Option<u32>,
+        /// FR-99 P3b — what the device's access policy asks of the end of
+        /// this session (`auto` / `always`). The agent takes the stricter of
+        /// this and its own `lock_on_end`, so an ask can only tighten it.
+        /// Sent only to an agent advertising `lock-on-end`; `None` (an older
+        /// server, nothing asked, or `never`) leaves the device's own setting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lock_on_end: Option<crate::models::LockOnEnd>,
     },
 
     /// Server forwards SDP offer from controller → agent.
@@ -6459,6 +6466,7 @@ mod tests {
             rc_overlay,
             session_policy: None,
             idle_secs: None,
+            lock_on_end: None,
         };
         let off = serde_json::to_string(&req(false)).unwrap();
         assert!(
@@ -6504,6 +6512,7 @@ mod tests {
             rc_overlay: false,
             session_policy,
             idle_secs: None,
+            lock_on_end: None,
         };
         let none = serde_json::to_string(&req(None)).unwrap();
         assert!(!none.contains("session_policy"), "{none}");
@@ -6595,6 +6604,7 @@ mod tests {
             rc_overlay: false,
             session_policy: None,
             idle_secs,
+            lock_on_end: None,
         };
         let none = serde_json::to_string(&req(None)).unwrap();
         assert!(!none.contains("idle_secs"), "{none}");
@@ -6645,6 +6655,62 @@ mod tests {
                 assert_eq!(limit, None);
             }
             other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// FR-99 P3b — the lock ask on `rc:request`: skipped when absent, its
+    /// three spellings round-trip, a frame from an older server reads as no
+    /// ask, and a value this build does not know reads as the strictest, so
+    /// a newer server's ask is never read as looser than it was meant.
+    #[test]
+    fn the_lock_on_end_ask_is_additive() {
+        use crate::models::LockOnEnd;
+        let sid = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+        let req = |lock_on_end| ServerMsg::Request {
+            session_id: sid,
+            controller_user_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
+            controller_name: "Alice".into(),
+            permissions: Permissions::VIEW,
+            consent_timeout_secs: 30,
+            browser_caps: vec![],
+            preferred_transport: None,
+            chroma_pref: None,
+            chunk_framing: None,
+            audio_enabled: false,
+            consent_mode: None,
+            host_prompt_timeout_secs: None,
+            input_mode: None,
+            tenant_name: None,
+            rc_overlay: false,
+            session_policy: None,
+            idle_secs: None,
+            lock_on_end,
+        };
+        let none = serde_json::to_string(&req(None)).unwrap();
+        assert!(!none.contains("lock_on_end"), "{none}");
+        for (ask, wire) in [(LockOnEnd::Auto, "auto"), (LockOnEnd::Always, "always")] {
+            let some = serde_json::to_string(&req(Some(ask))).unwrap();
+            assert!(
+                some.contains(&format!(r#""lock_on_end":"{wire}""#)),
+                "{some}"
+            );
+            match serde_json::from_str::<ServerMsg>(&some).unwrap() {
+                ServerMsg::Request { lock_on_end, .. } => assert_eq!(lock_on_end, Some(ask)),
+                _ => panic!("expected Request"),
+            }
+        }
+        let mut older: serde_json::Value = serde_json::from_str(&none).unwrap();
+        assert!(older.get("lock_on_end").is_none());
+        match serde_json::from_value::<ServerMsg>(older.clone()).unwrap() {
+            ServerMsg::Request { lock_on_end, .. } => assert_eq!(lock_on_end, None),
+            _ => panic!("expected Request"),
+        }
+        older["lock_on_end"] = serde_json::json!("on_every_tuesday");
+        match serde_json::from_value::<ServerMsg>(older).unwrap() {
+            ServerMsg::Request { lock_on_end, .. } => {
+                assert_eq!(lock_on_end, Some(LockOnEnd::Always))
+            }
+            _ => panic!("expected Request"),
         }
     }
 

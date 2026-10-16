@@ -159,6 +159,10 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     .get("idle_secs")
                     .and_then(|v| v.as_u64())
                     .and_then(|s| u32::try_from(s).ok());
+                // FR-99 P3b — the device's lock ask, resolved by the same
+                // gate. Absent or null (an older origin pod, or nothing
+                // asked) is no ask, what that pod would have applied itself.
+                let lock_on_end = lock_ask_from_relay(body.get("lock_on_end"));
                 let frame: ClientMsg = serde_json::from_value(
                     body.get("frame")
                         .cloned()
@@ -220,6 +224,7 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     session_policy,
                     max_duration,
                     idle_secs,
+                    lock_on_end,
                 };
                 match state.fleet.rc_hub.dispatch(&ctx, frame) {
                     Ok(()) => Ok(serde_json::json!({ "dispatched": true })),
@@ -368,6 +373,9 @@ pub async fn relay_rc_frame(
     max_duration: Option<std::time::Duration>,
     // P4b-2 — the idle limit; the owner pod's hub sends it to the agent.
     idle_secs: Option<u32>,
+    // FR-99 P3b — the device's lock ask; the owner pod's hub sends it to an
+    // agent that honours it.
+    lock_on_end: Option<roomler_ai_remote_control::models::LockOnEnd>,
     raw_frame: &serde_json::Value,
 ) -> Result<Option<(String, String)>, ()> {
     let Some(bus) = state.cluster_bus.clone() else {
@@ -390,6 +398,7 @@ pub async fn relay_rc_frame(
         "session_policy": session_policy_to_relay(session_policy),
         "max_secs": max_duration.map(|d| d.as_secs()),
         "idle_secs": idle_secs,
+        "lock_on_end": lock_on_end,
         "frame": raw_frame,
     });
     match bus.request(owner_pod, "rc.cmd", body).await {
@@ -491,6 +500,56 @@ fn session_policy_from_relay(v: Option<&serde_json::Value>) -> OrgPolicy {
             .map(OrgPolicy::Read)
             .unwrap_or(OrgPolicy::Unavailable),
         Some(_) => OrgPolicy::Unavailable,
+    }
+}
+
+/// FR-99 P3b — the device's lock ask on the owner pod's side of the relay.
+/// Absent or null is no ask: an origin pod older than the field asked
+/// nothing of the device itself. `never` asks nothing either. A value this
+/// build cannot read reads as `always`, the stricter side, as
+/// `LockOnEnd` reads one everywhere.
+fn lock_ask_from_relay(
+    v: Option<&serde_json::Value>,
+) -> Option<roomler_ai_remote_control::models::LockOnEnd> {
+    use roomler_ai_remote_control::models::LockOnEnd;
+    match v {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => serde_json::from_value::<LockOnEnd>(v.clone())
+            .ok()
+            .filter(|l| *l > LockOnEnd::Never),
+    }
+}
+
+#[cfg(test)]
+mod lock_ask_relay_tests {
+    use super::*;
+    use roomler_ai_remote_control::models::LockOnEnd;
+
+    /// The ask crosses the relay as the origin's gate resolved it; an older
+    /// origin pod's body (no field) asks nothing.
+    #[test]
+    fn the_lock_ask_crosses_the_relay_as_asked() {
+        assert_eq!(lock_ask_from_relay(None), None);
+        assert_eq!(lock_ask_from_relay(Some(&serde_json::Value::Null)), None);
+        assert_eq!(lock_ask_from_relay(Some(&serde_json::json!("never"))), None);
+        assert_eq!(
+            lock_ask_from_relay(Some(&serde_json::json!("auto"))),
+            Some(LockOnEnd::Auto)
+        );
+        assert_eq!(
+            lock_ask_from_relay(Some(&serde_json::json!("always"))),
+            Some(LockOnEnd::Always)
+        );
+        assert_eq!(
+            lock_ask_from_relay(Some(&serde_json::json!("on_tuesdays"))),
+            Some(LockOnEnd::Always)
+        );
+        // What `relay_rc_frame` writes reads back the same.
+        let body = serde_json::json!({ "lock_on_end": Some(LockOnEnd::Auto) });
+        assert_eq!(
+            lock_ask_from_relay(body.get("lock_on_end")),
+            Some(LockOnEnd::Auto)
+        );
     }
 }
 

@@ -189,6 +189,8 @@ describe('useAgentStore', () => {
       allowed_role_ids: ['r1'],
       allowed_user_ids: [],
       auto_terminate_idle_minutes: 30,
+      // FR-99 P3b — the device row's lock ask rides the same PUT.
+      lock_on_end: 'always' as const,
     }
     await s.updateAccessPolicy(TENANT_ID, 'a1', policy)
     expect(mockApi.put).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/agent/a1`, {

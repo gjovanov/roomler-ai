@@ -233,8 +233,9 @@ pub(crate) const COMPANION_START_BUDGET: Duration = Duration::from_secs(3);
 /// P6's controller display name and the device policy's input mode, FR-27's
 /// asking org (the "Being viewed by" banner is raised at peer-build time, not
 /// request time), FR-85 P3b's record-channel context, #1882's overlay
-/// decision, and FR-101 P4b-2's idle limit in seconds (armed once the session
-/// is live).
+/// decision, FR-101 P4b-2's idle limit in seconds (armed once the session
+/// is live), and FR-99 P3b's lock ask (handed to `lock_on_end` as the session
+/// goes live).
 type SessionMeta = (
     String,
     Option<roomler_ai_remote_control::models::InputMode>,
@@ -242,6 +243,7 @@ type SessionMeta = (
     Option<RecordMeta>,
     crate::rc_overlay::RcOverlay,
     Option<u32>,
+    Option<roomler_ai_remote_control::models::LockOnEnd>,
 );
 
 /// FR-85 P3b — what a session's `record` channel needs, resolved when the
@@ -2423,6 +2425,8 @@ async fn connect_once(
                                         // peer, the input and the screen. An
                                         // older daemon sends none.
                                         p.idle_secs,
+                                        // FR-99 P3b — and so is the lock ask.
+                                        p.lock_on_end,
                                     ),
                                 );
                                 info!(session_id = %sid, "delegation: session params received");
@@ -2922,6 +2926,9 @@ async fn handle_server_msg(
             session_policy,
             // FR-101 P4b-2 — the idle limit, kept here once the session is live.
             idle_secs,
+            // FR-99 P3b — the device's lock ask, taken into the decision at
+            // the session's start.
+            lock_on_end,
         } => {
             // #1882 — the device's overlay decision, resolved HERE, by the
             // daemon: it is the process whose overlay knows the blocks, and a
@@ -3008,6 +3015,8 @@ async fn handle_server_msg(
                     rc_overlay.clone(),
                     // FR-101 P4b-2 — `None` from an older server: no limit.
                     idle_secs,
+                    // FR-99 P3b — `None` from an older server: no ask.
+                    lock_on_end,
                 ),
             );
             info!(
@@ -3159,6 +3168,9 @@ async fn handle_server_msg(
                         rc_overlay: Some(rc_overlay.clone()),
                         // FR-101 P4b-2 — the worker keeps the idle limit.
                         idle_secs,
+                        // FR-99 P3b — and takes the lock ask into the lock:
+                        // the session goes live in its process.
+                        lock_on_end,
                     }),
                 ));
                 if !sent {
@@ -3471,18 +3483,27 @@ async fn handle_server_msg(
             // #1882 — and the overlay decision; missing means off, with this
             // process's own overlay blocks.
             // FR-101 P4b-2 — and the idle limit; missing means none.
+            // FR-99 P3b — and the lock ask; missing means none.
             #[cfg_attr(not(feature = "recording"), allow(unused_variables))]
-            let (controller_name, input_mode, asking_org, record_meta, rc_overlay, idle_secs) =
-                pending_session_meta.remove(&session_id).unwrap_or_else(|| {
-                    (
-                        "Controller".to_string(),
-                        None,
-                        None,
-                        None,
-                        crate::rc_overlay::RcOverlay::resolve(false),
-                        None,
-                    )
-                });
+            let (
+                controller_name,
+                input_mode,
+                asking_org,
+                record_meta,
+                rc_overlay,
+                idle_secs,
+                lock_ask,
+            ) = pending_session_meta.remove(&session_id).unwrap_or_else(|| {
+                (
+                    "Controller".to_string(),
+                    None,
+                    None,
+                    None,
+                    crate::rc_overlay::RcOverlay::resolve(false),
+                    None,
+                    None,
+                )
+            });
             // FR-27 follow-up — capture what the "Being viewed by" banner needs
             // BEFORE `controller_name` is moved into `AgentPeer::new` below.
             // The banner is raised once the peer is established (after
@@ -3635,6 +3656,9 @@ async fn handle_server_msg(
             // time so it never shows while consent is still pending — "Being
             // viewed by X" is only true once pixels actually flow. Harmless
             // no-op on non-Windows / when the indicator feature is disabled.
+            // FR-99 P3b — the device's lock ask first: `show_session_full`
+            // takes the lock decision, and the ask is part of it.
+            crate::lock_on_end::set_session_ask(session_id, lock_ask);
             indicator.show_session_full(
                 session_id,
                 banner_name,
@@ -6129,6 +6153,12 @@ fn stub_caps(multi_org_tun: bool) -> AgentCaps {
     // FR-101 P4b-2 — and it keeps an idle limit (`session_idle`), so the hub
     // may tell the viewer the limit this session runs under.
     caps.rpc.push(RpcCap::IdleTimeout.wire().to_string());
+    // FR-99 P3b — and it takes the device policy's lock ask into the lock at
+    // a session's end, where the lock can also be lifted remotely afterwards
+    // (the Windows service, the Linux root daemon; never a per-user install).
+    if crate::lock_on_end::can_honour_ask() {
+        caps.rpc.push(RpcCap::LockOnEnd.wire().to_string());
+    }
     caps
 }
 

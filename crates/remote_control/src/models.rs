@@ -1015,6 +1015,14 @@ pub enum RpcCap {
     /// tells a viewer the limit (`SessionCreated.idle_secs`) only for a
     /// connection advertising this: a limit nothing keeps is no limit.
     IdleTimeout,
+    /// FR-99 P3b — the agent takes the server's lock ask
+    /// (`Request.lock_on_end`) into the lock when the last session ends, the
+    /// stricter of it and the owner's own `lock_on_end` winning. Advertised
+    /// only by an install that can lift the lock remotely afterwards (the
+    /// Windows service, the Linux root daemon), so an admin's ask never leaves
+    /// a per-user install at a padlock no session can lift; the
+    /// `session_requested` audit row says when an ask is not enforced.
+    LockOnEnd,
 }
 
 impl RpcCap {
@@ -1056,11 +1064,12 @@ impl RpcCap {
             Self::PrivacyAvailable => "privacy-available",
             Self::SessionPolicy => "session-policy",
             Self::IdleTimeout => "idle-timeout",
+            Self::LockOnEnd => "lock-on-end",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 30] = [
+    pub const ALL: [RpcCap; 31] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1091,6 +1100,7 @@ impl RpcCap {
         Self::PrivacyAvailable,
         Self::SessionPolicy,
         Self::IdleTimeout,
+        Self::LockOnEnd,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -1269,6 +1279,16 @@ pub struct AccessPolicy {
     /// carries over DERP/TCP reads as a direct host pair.
     #[serde(default)]
     pub rc_overlay: Option<bool>,
+    /// FR-99 P3b — what this device's sessions ask of it when the last one
+    /// ends: `auto` (lock again if the screen was locked, or nobody was at it,
+    /// when the session started) or `always`. Set by a `MANAGE_AGENTS` admin.
+    /// It can only make the device STRICTER: the device takes the stricter of
+    /// this and its own `lock_on_end` (device-owned, never pushable), so
+    /// `never` asks nothing, as `None` does (the default, and every older
+    /// row). Forwarded on `rc:request` only to an agent advertising
+    /// `lock-on-end`.
+    #[serde(default)]
+    pub lock_on_end: Option<LockOnEnd>,
 }
 
 /// FR-101 P4b-2 — the longest idle limit anything sets: a day, the same
@@ -1299,6 +1319,13 @@ impl AccessPolicy {
             None | Some(0) => None,
             Some(m) => Some(m.saturating_mul(60).min(IDLE_LIMIT_MAX_SECS)),
         }
+    }
+
+    /// FR-99 P3b — [`Self::lock_on_end`] as an ask of the device: `None` when
+    /// unset or `never`, which asks nothing of a device whose own setting is
+    /// already the floor.
+    pub fn lock_on_end_ask(&self) -> Option<LockOnEnd> {
+        self.lock_on_end.filter(|l| *l > LockOnEnd::Never)
     }
 
     /// Effective consent mode for a NON-owner controller: the per-device mode,
@@ -4650,6 +4677,16 @@ pub enum AuditKind {
         /// an audit. `None` = no limit to keep.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idle_enforced: Option<bool>,
+        /// FR-99 P3b — what the device's access policy asked of the end of
+        /// the session (`auto` / `always`). `None` = nothing asked: unset, or
+        /// `never`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lock_on_end: Option<LockOnEnd>,
+        /// FR-99 P3b — with `lock_on_end`: whether the device honours the ask
+        /// (its agent advertises `lock-on-end`). `Some(false)` is a lock an
+        /// admin asked for that this session's end will not take.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lock_enforced: Option<bool>,
     },
     ConsentPrompted,
     ConsentGranted,
@@ -5547,6 +5584,47 @@ mod tests {
         assert!(!off.rc_overlay_allowed());
     }
 
+    /// FR-99 P3b — every row written before `lock_on_end` asks nothing, a
+    /// stored `null` asks nothing (the `Option` sees it before `LockOnEnd`'s
+    /// unknown-reads-as-`always` rule can), `never` asks nothing, and an ask
+    /// survives the round trip.
+    #[test]
+    fn a_device_policy_asks_a_lock_only_when_it_says_so() {
+        let old: AccessPolicy = bson::from_document(bson::doc! {
+            "consent_mode": "auto",
+            "allowed_role_ids": [],
+            "allowed_user_ids": [],
+            "auto_terminate_idle_minutes": null,
+        })
+        .expect("a pre-P3b row deserialises");
+        assert_eq!(old.lock_on_end, None);
+        assert_eq!(old.lock_on_end_ask(), None);
+        let null: AccessPolicy = bson::from_document(bson::doc! {
+            "allowed_role_ids": [],
+            "allowed_user_ids": [],
+            "auto_terminate_idle_minutes": null,
+            "lock_on_end": null,
+        })
+        .expect("a stored null deserialises");
+        assert_eq!(null.lock_on_end, None);
+
+        let never = AccessPolicy {
+            lock_on_end: Some(LockOnEnd::Never),
+            ..Default::default()
+        };
+        assert_eq!(never.lock_on_end_ask(), None);
+        for ask in [LockOnEnd::Auto, LockOnEnd::Always] {
+            let p = AccessPolicy {
+                lock_on_end: Some(ask),
+                ..Default::default()
+            };
+            let back: AccessPolicy =
+                bson::from_document(bson::to_document(&p).expect("serialises"))
+                    .expect("round-trips");
+            assert_eq!(back.lock_on_end_ask(), Some(ask));
+        }
+    }
+
     /// FR-51 — a device row written before the ephemeral fields existed must
     /// deserialise PERMANENT. This is the property that makes enabling the
     /// reaper safe against the existing fleet: every pre-FR-51 row reads
@@ -5849,6 +5927,7 @@ mod tests {
         assert_eq!(RpcCap::PrivacyAvailable.wire(), "privacy-available");
         assert_eq!(RpcCap::SessionPolicy.wire(), "session-policy");
         assert_eq!(RpcCap::IdleTimeout.wire(), "idle-timeout");
+        assert_eq!(RpcCap::LockOnEnd.wire(), "lock-on-end");
     }
 
     /// FR-101 P4b-2 — the device's idle setting as a limit: unset and `0`
@@ -7490,6 +7569,8 @@ mod tests {
                 features_stripped: None,
                 idle_secs: None,
                 idle_enforced: None,
+                lock_on_end: None,
+                lock_enforced: None,
             },
             // FR-99 — the new bit takes the same raw path.
             AuditKind::SessionRequested {
@@ -7505,6 +7586,9 @@ mod tests {
                 // FR-101 P4b-2 — and an idle limit the device does not keep.
                 idle_secs: Some(900),
                 idle_enforced: Some(false),
+                // FR-99 P3b — and a lock it cannot take.
+                lock_on_end: Some(LockOnEnd::Always),
+                lock_enforced: Some(false),
             },
             AuditKind::PermissionsChanged {
                 permissions: Permissions::VIEW,

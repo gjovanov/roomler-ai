@@ -1181,8 +1181,9 @@ an allowlist) and simply shows no notice. The full matrix is in the FR-27 spec.
 ### 11.6 Sessions that end: the maximum length and the idle limit (FR-101 P4b)
 
 > What the device does to its own screen when the last session ends (`lock_on_end`: `never`, `auto`,
-> `always`) is FR-99 P3's, the device owner's setting: [privacy-mode.md § Locking when the session
-> ends](privacy-mode.md#locking-when-the-session-ends).
+> `always`) is FR-99 P3's: the device owner's setting, which an admin can make stricter (never looser)
+> from the device's row, on an install that can unlock remotely: [privacy-mode.md § Locking when the
+> session ends](privacy-mode.md#locking-when-the-session-ends).
 
 An org can bound how long a session lasts, and how long it may sit idle. Both
 are off by default. Both end the session as `idle_timeout`, the `EndReason`
