@@ -778,10 +778,15 @@ updater" is per-role; daemon hosts get `roomler.exe` refreshed by the MSI).
 
 Fixed-and-shipped issues live in `git log` and the docs. Currently open:
 
-- **[MEDIUM]** [2026-04-22] Chrome's `<video>` enforces a ~80 ms jitter-buffer floor
-  regardless of `jitterBufferTarget=0` / `playoutDelayHint=0`. The opt-in WebCodecs
-  canvas render path (Chrome-only) is the partial workaround — flip it on by
-  default once field hours accumulate.
+- **[MEDIUM]** [2026-04-22, re-measured 2026-10-16 by **FR-98** P5, #2090] **The RTP
+  fallback track meets the browser's jitter buffer**; the DataChannel/WebCodecs path,
+  the default wherever a DC cell exists, never does. On damage-driven frames Chrome
+  held them for **193 ms on average, growing to 326** (L4 p50 78–362 ms, OpenH264).
+  `playout-delay` 0/0 (`ROOMLERD_RTP_PLAYOUT_DELAY_ZERO=1`, default OFF until its
+  flip) took that to 0.1 ms and L4 p50 to 35–40 ms, but only for a browser that
+  offers the extension (Chrome does). ⚠️ The track's timestamps run one frame behind
+  (#2284), the suspected cause. ⚠️ A Windows host with no H.264 hardware encodes the
+  track on Microsoft's software MFT at **~850 ms**, whatever the browser does (#2283).
 - **[MEDIUM]** [2026-08-23] **User sessions are irrevocable** — no `token_epoch`
   check, no password-change route, no refresh rotation. `docs/security-baseline.md` §1.
 - **[MEDIUM]** [2026-08-23] **The updater's manifest is unsigned** — version + url +

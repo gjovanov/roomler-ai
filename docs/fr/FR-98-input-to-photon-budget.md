@@ -1,7 +1,8 @@
 # FR-98: Input-to-photon budget — make "under 50 ms" true on a direct path, and prove it
 
 **Issue:** [#2090](https://github.com/gjovanov/roomler-ai/issues/2090) · **Status:** proposed 2026-10-13 — spec
-and claim; P1 (C1, the slot-first gate) built behind its switch, field A/B owed · **Owner:** the agent's capture and encode path, the viewer's input and paint path · **Anchors:**
+and claim; P1 (C1, the slot-first gate) built behind its switch, field A/B owed; P5 (C6) field-measured
+2026-10-16, default flip owed (§9) · **Owner:** the agent's capture and encode path, the viewer's input and paint path · **Anchors:**
 master `c2e79221b` · **Program:** [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 1 ·
 **Builds on:** [FR-16](FR-16-rc-quality-benchmark.md) (L0 and L4, the instrument this FR is accepted on),
 [FR-1](FR-1-remote-desktop-drag-smoothness.md), [FR-70](FR-70-media-pipeline-leaves-the-runtime.md),
@@ -99,6 +100,20 @@ Working the legacy gate through on paper, before L4 exists, narrows what C1 can 
 property. It belongs to [FR-17](FR-17-partial-reliability-video.md) stage C, whose spec already says it
 "stops being optional" there.
 
+### 4.2 What P5's field cells found besides C6
+
+C6's A/B (§9, 2026-10-16) ran the RTP track against a vmtest guest and turned up two faults on that track
+that no cut in §4 covers. Each is its own issue, because each is a one-PR fix:
+
+| Fault | Where (master `c61bf3243`) | Measured | Issue |
+|---|---|---|---|
+| A Windows host with no H.264 hardware encodes the track on Microsoft's software MFT, the cascade's last Media Foundation fallback, and logs it as `mf-h264 (hardware)` | `encode/mf/activate.rs` L279, `encode/mod.rs` L1241 | L4 p50 ~850 ms and a quarter of probes unanswered in 2 s, against 37 ms on OpenH264 on the same guest. C6 empties Chrome's buffer and leaves L4 where it was | [#2283](https://github.com/gjovanov/roomler-ai/issues/2283) |
+| The track's timestamps run one frame behind: a sample's `duration` is the gap *before* it, and the packetizer stamps a sample before advancing by it | `peer.rs` L3055–3075; `crates/vendored/rtp/src/packetizer/mod.rs` L127, L135 | Suspected, not proven: with C6 off Chrome held frames for 193 ms on average, growing to 326 ms, against its own ~53 ms target | [#2284](https://github.com/gjovanov/roomler-ai/issues/2284) |
+
+⚠️ **C6 only helps a browser that offers `playout-delay`.** Chrome does. Whether Firefox or Safari do has not
+been checked, and they are the browsers the RTP track mostly serves, because Chrome and Edge take a
+DataChannel cell wherever one exists. A browser without the extension is left with whatever #2284 costs it.
+
 ## 5. Phases
 
 | P | Scope | Kill switch | Status |
@@ -108,7 +123,7 @@ property. It belongs to [FR-17](FR-17-partial-reliability-video.md) stage C, who
 | P2 | C2, the GPU clock pin A/B, then the default decision | `ROOMLERD_GPU_CLOCK_PIN=0` | — |
 | P3 | C3 + C4, the input and cursor cadences | `roomler-rc-input-gap` unset (8 ms); `ROOMLERD_CURSOR_POLL_MS` unset (8 ms) | **knobs built**, defaults unchanged: `storedInputGapMs` (0–16 ms, read once per viewer) and `capture::cursor::poll_interval` (2–50 ms, read once per session). The 0/2/4 ms A/B on L4 is owed, and open decision 3 waits on it |
 | P4 | C5, the NVENC preset/tune A/B, baked per backend | `ROOMLERD_FFMPEG_PRESET` / `_TUNE` | — |
-| P5 | C6, `playout-delay` on the RTP fallback, and the Known-Issue verdict | `ROOMLERD_RTP_PLAYOUT_DELAY_ZERO` unset | **built**, default off: `agents/roomlerd/src/rtp_playout.rs`. Off, the extension is not registered, so the answer and every packet stay byte-identical. On, it is negotiated wherever the browser offers it and written on every video packet. L0's `playout0` cell proves the wire; every other cell proves the off state. Owed: the Chrome measurement (`jitterBufferDelay ÷ jitterBufferEmittedCount` from `getStats`, and L4 on the `<video>` path, on and off) and then the Known-Issue verdict, AC6 |
+| P5 | C6, `playout-delay` on the RTP fallback, and the Known-Issue verdict | `ROOMLERD_RTP_PLAYOUT_DELAY_ZERO` unset | **built**, default off: `agents/roomlerd/src/rtp_playout.rs`. Off, the extension is not registered, so the answer and every packet stay byte-identical. On, it is negotiated wherever the browser offers it and written on every video packet. L0's `playout0` cell proves the wire; every other cell proves the off state. **Field-measured 2026-10-16** (§9): on the RTP track with OpenH264, Chrome's jitter buffer 193 → 0.1 ms and L4 p50 78–362 → 35–40 ms. The Known Issue is rewritten with those numbers. Owed: the default flip, then the Known Issue closes (AC6) |
 | P6 | Docs, and the final field table | — | — |
 
 ## 6. Acceptance criteria
@@ -129,7 +144,9 @@ property. It belongs to [FR-17](FR-17-partial-reliability-video.md) stage C, who
 - [ ] **AC5:** no relay pair regresses: CORPLAP-1 → neo16 L4 p95 and freeze count stay within the baseline's
   spread, with every cut on.
 - [ ] **AC6:** C6 either closes the "Chrome ~80 ms jitter-buffer floor" Known Issue with an L4 number on
-  the `<video>` path, or rewrites it with the measured floor.
+  the `<video>` path, or rewrites it with the measured floor. *(Measured 2026-10-16, §9: C6 takes L4 on the
+  `<video>` path from p50 78–362 ms to 35–40 ms. The Known Issue now carries those numbers. It closes, and
+  this box is ticked, once C6 is on by default and that is field-checked on a release.)*
 - [ ] **AC7:** **Docs:** `docs/remote-control.md` §12 replaces its target table with the measured budget (a
   mermaid diagram of the stages and their L4 shares) and each cut's switch. Linked from `docs/README.md`.
 
@@ -170,6 +187,9 @@ Planned cells. Each records the deployed build first.
 | L0 | 2026-10-13 | the same | **Negative control, red:** a slot-first gate that always sleeps a period (one marked line in `SlotFirst::wait`) failed `gate_slot: 12.7 fps decoded from a 25 fps source` (exit 101). Its p50 difference was 4.9 ms (legacy 35.7, broken slot-first 30.8), which the C1 bound would have refused too. Restored from the commit; the diff was that one line |
 | L0 | 2026-10-13 | P5 branch, unoptimised, Windows dev box | **C6, the wire, green.** The controller offers `playout-delay` the way Chrome does. With the switch off (every cell but one), the answer negotiates nothing, so the default stays byte-identical. `playout0` (switch on): negotiated, **217 of 217** video packets at 0/0 (0 other, 0 without), 30.2 fps, p50 11.9 ms, the same as `clean`. L0's controller has no jitter buffer, so this proves the wire, not the effect on Chrome |
 | L0 | 2026-10-13 | the same | **Negative control, red:** with the switch on but the pump not writing the extension (one marked line), the test failed `playout0: want playout-delay 0/0 on every packet, saw PlayoutSeen { negotiated: true, zero: 0, other: 0, without: 217 }` (exit 101). Restored from the commit; the diff was that one line |
+| P5 | 2026-10-16 | **Release build, field.** Agent **0.4.138** (MSI, service) on a throwaway vmtest Win11 guest (KVM on a fleet host, 1280×800, Microsoft Basic Render Driver only); the **production viewer** in headless Chromium on a LAN neighbour, forced onto the RTP track (`roomler-rc-video-transport.v2 = webrtc`), L4 target mode against `roomlerd probe-target`. C6 switched through the service's own `Environment` value and a restart | **Wrong turn, recorded.** C6 off, then on (the remote description carried the extension only in the second cell). Chrome's jitter buffer averaged 12.8 ms, then 0.7 ms, but L4 read batch p50s of 827–904 ms (median 859), then 825–872 ms (median 836). On top of that, 28 % and 25 % of probes went unanswered within the 2 s TTL. FR-16's DataChannel row on the same kind of guest had read 42–49 ms. The agent log said why: `encoder selected: mf-h264 (hardware)` over `pipeline ready backend="sw"`. That is Microsoft's software MFT, the cascade's last fallback when no hardware MFT opens. The encoder, not the browser: [#2283](https://github.com/gjovanov/roomler-ai/issues/2283) |
+| P5 | 2026-10-16 | the same guest, with `ROOMLERD_ENCODER=software` (OpenH264) | **C6's A/B, green**, with C6 on first this time to reverse the order. **On:** Chrome's jitter buffer 0.1 ms (twelve 10 s windows, 0.0–0.2); L4 batch p50s 35.0–39.5 ms (median 36.9), p95 51–64 ms, 0 of 480 probes lost. **Off:** jitter buffer 192.7 ms on average, its windows climbing 46 → 326 ms and then easing to 113–189 ms; L4 batch p50s 78–362 ms (median 203), p95 206–556 ms, 2 of 482 lost. Chrome's own target (`jitterBufferTargetDelay` per emitted frame) sat at ~50–62 ms in both cells, so most of the off cell's hold sits above the target. [#2284](https://github.com/gjovanov/roomler-ai/issues/2284) is the suspected cause. Both cells: H.264, 4–7 fps of damage from the probes |
+| P5 | 2026-10-16 | the same guest and settings; the viewer's own transport pick | **Control, the DataChannel path:** `data-channel-vp9-444` (libvpx 4:4:4, the WebCodecs worker). L4 batch p50s 43.8–51.9 ms (median 45.5), p95 59–75 ms, 0 of 480 lost, in line with FR-16's 10-13 row. With C6 on, the RTP track ran about 8 ms faster than the DataChannel on this guest. Not an AC cell: a VM, software encoders, headless Chromium. The jitter buffer is the browser's own logic, which headless runs unchanged, and the viewer's display is outside L4 either way |
 
 ## 10. Related
 
@@ -177,4 +197,6 @@ Planned cells. Each records the deployed build first.
 - [FR-1](FR-1-remote-desktop-drag-smoothness.md) P6: the 8 ms input gap and `pointerrawupdate`.
 - [FR-70](FR-70-media-pipeline-leaves-the-runtime.md) M3: why the switches are read once per open.
 - [FR-17](FR-17-partial-reliability-video.md): where intra-refresh belongs.
+- [#2283](https://github.com/gjovanov/roomler-ai/issues/2283) and [#2284](https://github.com/gjovanov/roomler-ai/issues/2284):
+  the two RTP-track faults P5's cells found (§4.2).
 - The program: [`docs/plans/stardesk-teardown-program.md`](../plans/stardesk-teardown-program.md).

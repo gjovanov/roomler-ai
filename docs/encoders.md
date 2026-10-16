@@ -51,8 +51,11 @@ flowchart LR
 
 Two transport families with different latency behaviour:
 
-- **RTP track** — standard WebRTC video. Simple and universal, but Chrome's
-  `<video>` pipeline enforces a ~80 ms jitter-buffer floor.
+- **RTP track** — standard WebRTC video. Simple and universal, but every frame
+  passes the browser's jitter buffer. On damage-driven frames Chrome held them for
+  193 ms on average; FR-98's `playout-delay` 0/0 (C6, default off until its flip)
+  takes that to 0.1 ms. The measurement and the two faults it found on this track
+  (#2283, #2284) are in [FR-98 §9](fr/FR-98-input-to-photon-budget.md#9-field-verification-log).
 - **Reliable DataChannel bitstream** — the agent sends encoded access units over
   an ordered DC; a worker feeds WebCodecs and paints an OffscreenCanvas. This
   bypasses the jitter buffer entirely and is how HEVC, AV1, VP9 and low-latency
