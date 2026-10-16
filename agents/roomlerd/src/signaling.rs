@@ -1007,12 +1007,16 @@ pub async fn run(
                 // `handle_server_msg::ServerMsg::Goodbye` arm
                 // (close_all_peers + close_all_tunnel_peers) — this
                 // arm only writes the operator sentinel + exits.
+                // #2293 — the last line names what brings this install back:
+                // systemd never restarts exit 7.
+                let after =
+                    crate::service::Install::detect(remote_cfg.config_path()).after_removal();
                 let body = format!(
                     "Roomler agent: server-side close — {reason:?}.\n\n{message}\n\n\
                      The agent will not reconnect. Re-enrol with a fresh enrollment \
                      JWT from the admin UI:\n\n\
                      \troomlerd re-enroll --token <new-jwt>\n\n\
-                     then restart the service (or wait for the supervisor to relaunch)."
+                     {after}"
                 );
                 match notify::raise_attention_machine_aware_with_reason(
                     notify::REASON_GOODBYE,

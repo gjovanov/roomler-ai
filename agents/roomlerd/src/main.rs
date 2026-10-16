@@ -2712,7 +2712,13 @@ async fn re_enroll_cmd(
         notify::clear_all_attention();
     }
     println!("Re-enrollment successful for {org_label:?}. Agent id: {refreshed_agent_id}");
-    println!("Run `roomlerd run` (or wait for the supervisor to relaunch) to reconnect.");
+    // #2293 — what actually brings this daemon back depends on its install:
+    // systemd never restarts the removal's exit 7, and `roomlerd run` by
+    // hand beside a unit is an orphan.
+    println!(
+        "{}",
+        service::Install::detect(config_path).after_re_enroll(is_primary)
+    );
     Ok(())
 }
 

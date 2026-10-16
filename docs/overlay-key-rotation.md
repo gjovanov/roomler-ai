@@ -115,7 +115,7 @@ suspect first.
 ## On the device
 
 The handler sits in the WS loop that received the order, next to `ConfigPush`
-(`agents/roomlerd/src/signaling.rs:4244-4341`). Every branch **reports**, refusals
+(`agents/roomlerd/src/signaling.rs:4248-4341`). Every branch **reports**, refusals
 included — the operator is looking at a security action and each refusal has a
 different fix:
 
@@ -124,7 +124,7 @@ different fix:
 | 1 | kill switch `overlay_key_rotation == false` | `refused: disabled` | `signaling.rs:4167-4160` |
 | 2 | the device's **own** 60 s ceiling, per org — "a bound that exists only on the ordering side is not a bound" | `refused: rate_limited` | `signaling.rs:2370-2382`, `:4162-4178` |
 | 3 | mint `WgKeypair::generate()` — the enrollment mint; `None` in a build with no overlay surface | `refused: unsupported` | `agents/roomlerd/src/key_rotation.rs:19-30` |
-| 4 | **persist first**: under the daemon-wide write lock, `config::load` → set the secret on the primary scalar or on the `[[orgs]]` entry whose `tenant_id` is this loop's → bump `overlay_wg_key_epoch` → atomic `config::save` (tmp + fsync + 0600/ACL + `.prev` + rename) | on error: `failed` + detail, **identity unchanged** | `agents/roomlerd/src/remote_config.rs:213-245` |
+| 4 | **persist first**: under the daemon-wide write lock, `config::load` → set the secret on the primary scalar or on the `[[orgs]]` entry whose `tenant_id` is this loop's → bump `overlay_wg_key_epoch` → atomic `config::save` (tmp + fsync + 0600/ACL + `.prev` + rename) | on error: `failed` + detail, **identity unchanged** | `agents/roomlerd/src/remote_config.rs:219-245` |
 | 5 | queue the same report for the *next* session, then send `rc:agent.key_rotated { rotated, old_pub, new_pub, key_epoch }` on this one and give the pump 300 ms | `rotated` | `signaling.rs:4264-4268` |
 | 6 | close every peer, tunnel peer and QUIC peer this org loop carries (the `Goodbye` teardown), return `ConnectError::KeyRotated { secret, epoch }` | — | `signaling.rs:4292-4283`, `:1077` |
 | 7 | the loop adopts the key + epoch into its one config snapshot and re-enters `connect_once` **immediately** — one device re-joining, not a fleet event, so no stagger | — | `signaling.rs:819-836` |
@@ -316,8 +316,8 @@ The server cannot see the device switch, so a switched-off device is still order
 | the conditional report write | `crates/services/src/dao/agent.rs:769-757` |
 | state resolver + grid view | `crates/modules/fleet/src/agent.rs:521-676`, `:1449-1457` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:731-738` |
-| device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:4244-4341`, `:2338-2360`, `:2370-2382`, `:819-836` |
-| mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:213-245` |
+| device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:4248-4341`, `:2338-2360`, `:2370-2382`, `:819-836` |
+| mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:219-245` |
 | kill switch · epoch | `crates/agent-core/src/config.rs:867-851`, `:1439`, `:1525-1527`; `config_surface.rs:1072-1053` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:177`, `:1199-1226`, `:1995-2096`; `ui/src/stores/agents.ts:887-894` |
 

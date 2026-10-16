@@ -102,7 +102,7 @@ The vmtest Ubuntu lane never saw this because it sets the opt-in keys itself
     session's active input source; `mon` is ignored and nothing maps per output (`uinput_backend.rs:361`).
 14. The companion was never field-run as a **consent** window on Wayland; its banner cannot auto-hide there
     (`agents/roomler-desktop/src/panels.rs:188-191`); `pgrep -x` has no `-u` (`companion.rs:477`).
-15. `capture-smoke` ignores `config.toml` (the bridge is registered only in `run_cmd`, `main.rs:2851-2914`)
+15. `capture-smoke` ignores `config.toml` (the bridge is registered only in `run_cmd`, `main.rs:2857-2914`)
     and parks ~1 h on `NoopCapture` (`capture/mod.rs:567-571`).
 16. Keep busy (FR-92, every phase merged 2026-10-11, unreleased) reports a Wayland desktop `unavailable`
     with reason `wayland` (`keep_busy/engine.rs:197-198`) — right, and a **fifth** hand-rolled logind
