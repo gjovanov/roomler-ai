@@ -252,6 +252,11 @@ impl ArbiterState {
         }
     }
 
+    /// FR-93 P4c — whether `session` is registered with an input grant.
+    pub fn can_input(&self, session: ObjectId) -> bool {
+        self.sessions.get(&session).is_some_and(|s| s.can_input)
+    }
+
     /// Deregister a session. Returns the key/button releases to inject
     /// (its whole held set). Reassigns the exclusive holder if it left.
     pub fn close(&mut self, session: ObjectId) -> Vec<InputMsg> {
@@ -818,6 +823,9 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
             Cmd::ControlReady { session } => {
                 tracing::debug!(%session, "input arbiter: control DC ready — re-broadcasting state");
                 broadcast_state(&state, &sinks, &handle);
+                if state.can_input(session) {
+                    warm(&mut injector);
+                }
             }
             Cmd::ReleaseHeld { session } => {
                 let releases = state.release_held(session);
@@ -925,6 +933,34 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
         }
     }
     tracing::debug!("input arbiter worker exiting (channel closed)");
+}
+
+/// FR-93 P4c — open the ONE injector (or replace a stale one) as soon as a
+/// session that may input is ready, instead of at its first event.
+///
+/// ⚠️ A uinput device is not usable the moment it exists: libinput adds it
+/// asynchronously, and under load the first move written after the backend's
+/// settle still reached nobody (measured on KDE, real hardware: 2 of 8 fresh
+/// devices). Opened here, the device has the second or more a viewer takes to
+/// send anything. Linux only — the race is libinput's — and an injector
+/// without the OS's permission is not cached, by `keep_busy_op`'s rule: one
+/// cached before a display exists would break every later controller's input.
+/// `ROOMLERD_INPUT_WARM=0` keeps the first event as the opener.
+fn warm(injector: &mut Option<Box<dyn super::InputInjector + Send>>) {
+    if !cfg!(target_os = "linux") || !tunnel_core::env::flag("INPUT_WARM", true) {
+        return;
+    }
+    if injector.as_deref().is_some_and(|i| super::stale(i)) {
+        *injector = None;
+    }
+    if injector.is_some() {
+        return;
+    }
+    let fresh = super::open_default();
+    if fresh.has_permission() {
+        tracing::info!("input arbiter: injector opened ahead of the first event (FR-93 P4c)");
+        *injector = Some(fresh);
+    }
 }
 
 fn inject_all(injector: &mut Option<Box<dyn super::InputInjector + Send>>, msgs: &[InputMsg]) {
