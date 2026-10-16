@@ -262,6 +262,16 @@ export interface HivePolicy {
  *  equality, as every `rpc` word is. */
 export const HIVE_ARCHIVE_CAP = 'hive-archive'
 
+/** P2j-4 — the most copies of a session a policy asks for, its own device's
+ *  among them, and the longest it keeps an ended session, in days: the
+ *  server's `MAX_MEMBERS` and `MAX_RETENTION_DAYS`, which it enforces. */
+export const HIVE_MAX_MEMBERS = 8
+export const HIVE_MAX_RETENTION_DAYS = 3650
+
+/** P2j-4 — the one word `prefer` names today: the session owner's own
+ *  devices, after the archive replicas. */
+export const HIVE_PREFER_OWNER_DEVICES = 'owner_devices'
+
 /** A session that can still change. */
 /** P1j — a terminal session adopted on its device: nobody drives it here. */
 export function isAdopted(s?: Pick<HiveSession, 'origin'> | null): boolean {

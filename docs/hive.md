@@ -3996,12 +3996,12 @@ sequenceDiagram
 
 | Rule | Why | Where |
 |---|---|---|
-| The page, and its nav item, only where the server copies sessions: `GET …/hive` answers `replicaset`, and a server before it says nothing, which reads as no | prod has `hive.replicaset` off, and a page there could only say so | [`routes.rs:296`](../crates/modules/hive/src/routes.rs#L296), [`hive.ts:419`](../ui/src/stores/hive.ts#L419), [`AppLayout.vue:147`](../ui/src/components/layout/AppLayout.vue#L147) |
-| Listed: every device that offers itself (`hive-archive` among its words, by equality) and every designated one, once, the designated first. A designated device the agents page did not hold is read on its own, and one that is gone says so | a designation is never shown as missing, and `hive-archives` is not `hive-archive` | [`HiveCopiesView.vue:246`](../ui/src/views/hive/HiveCopiesView.vue#L246), [`HiveCopiesView.vue:298`](../ui/src/views/hive/HiveCopiesView.vue#L298) |
-| Designating writes the whole policy from the revision read. One changed meanwhile is read again and said so; any other refusal shows in the server's words | the policy is one document with a revision (P2c-2a): a write from a stale read would undo another administrator's | [`HiveCopiesView.vue:320`](../ui/src/views/hive/HiveCopiesView.vue#L320) |
+| The page, and its nav item, only where the server copies sessions: `GET …/hive` answers `replicaset`, and a server before it says nothing, which reads as no | prod has `hive.replicaset` off, and a page there could only say so | [`routes.rs:296`](../crates/modules/hive/src/routes.rs#L296), [`hive.ts:429`](../ui/src/stores/hive.ts#L429), [`AppLayout.vue:147`](../ui/src/components/layout/AppLayout.vue#L147) |
+| Listed: every device that offers itself (`hive-archive` among its words, by equality) and every designated one, once, the designated first. A designated device the agents page did not hold is read on its own, and one that is gone says so | a designation is never shown as missing, and `hive-archives` is not `hive-archive` | [`HiveCopiesView.vue:377`](../ui/src/views/hive/HiveCopiesView.vue#L377), [`HiveCopiesView.vue:429`](../ui/src/views/hive/HiveCopiesView.vue#L429) |
+| Designating writes the whole policy from the revision read. One changed meanwhile is read again and said so; any other refusal shows in the server's words | the policy is one document with a revision (P2c-2a): a write from a stale read would undo another administrator's | [`HiveCopiesView.vue:451`](../ui/src/views/hive/HiveCopiesView.vue#L451) |
 | The switches and the add button only for an `ADMINISTRATOR`, the owner included, and none until the caller's permissions are known | the server's own gate on the write: failing closed costs a moment, failing open a click that is refused | [`permissions.ts:429`](../ui/src/utils/permissions.ts#L429) |
-| **Add an archive replica** mints a standard enrollment token and shows `docker run` and compose with this server's origin, the token, a fixed hostname and the volume. The token leaves the page when the dialog closes | the token is single use, for 10 minutes; the hostname is the device's identity (P2h-1); a closed dialog's content stays mounted | [`HiveCopiesView.vue:368`](../ui/src/views/hive/HiveCopiesView.vue#L368), [`HiveCopiesView.vue:362`](../ui/src/views/hive/HiveCopiesView.vue#L362) |
-| Until a designated archive replica that offers itself is online, the page says a session is readable only while one of its members is | that is what an organization without one has (spec §3b) | [`HiveCopiesView.vue:278`](../ui/src/views/hive/HiveCopiesView.vue#L278) |
+| **Add an archive replica** mints a standard enrollment token and shows `docker run` and compose with this server's origin, the token, a fixed hostname and the volume. The token leaves the page when the dialog closes | the token is single use, for 10 minutes; the hostname is the device's identity (P2h-1); a closed dialog's content stays mounted | [`HiveCopiesView.vue:618`](../ui/src/views/hive/HiveCopiesView.vue#L618), [`HiveCopiesView.vue:612`](../ui/src/views/hive/HiveCopiesView.vue#L612) |
+| Until a designated archive replica that offers itself is online, the page says a session is readable only while one of its members is | that is what an organization without one has (spec §3b) | [`HiveCopiesView.vue:409`](../ui/src/views/hive/HiveCopiesView.vue#L409) |
 
 ⚠️ **The snippet names `hive-archive:latest`.** The image workflow moves `latest` on each publish
 unless told not to (`also_latest`, now on by default). Until the operator first publishes, there is
@@ -4128,7 +4128,7 @@ sequenceDiagram
 
 | Rule | Why | Where |
 |---|---|---|
-| The box is there only while `GET …/hive` answers `search`, asked again at every visit to the page; no answer keeps what was known | archive replicas come and go; the open decides anyway, and a refusal says why | [`hive.ts:458`](../ui/src/stores/hive.ts#L458), [`HiveSessionsView.vue:23`](../ui/src/views/hive/HiveSessionsView.vue#L23) |
+| The box is there only while `GET …/hive` answers `search`, asked again at every visit to the page; no answer keeps what was known | archive replicas come and go; the open decides anyway, and a refusal says why | [`hive.ts:468`](../ui/src/stores/hive.ts#L468), [`HiveSessionsView.vue:23`](../ui/src/views/hive/HiveSessionsView.vue#L23) |
 | One router for every peer's frames in a tab: an open's answer by its `ref` (`hive:view.ready` and `refused`, `hive:search.ready` and `refused`), the rest of the handshake by its grant | the ws store holds ONE handler per frame type, so a search that took `hive:view.answer` for itself would silently take the viewer's away | [`hiveRouter.ts:24`](../ui/src/utils/hiveRouter.ts#L24) |
 | Opened at the first search and dialled in a viewer's order: no peer before `ready`, our offer before our candidates, theirs held until the answer; `hello` asked again until answered, and one that does not say `search: true` is no search peer | the order the viewer proved (FR-83); a peer that serves no search must not be asked for one | [`useHiveSearch.ts:367`](../ui/src/composables/useHiveSearch.ts#L367), [`useHiveSearch.ts:279`](../ui/src/composables/useHiveSearch.ts#L279) |
 | A query is asked 300 ms after the last keystroke, Enter at once, at most 200 characters, and only the latest query's answer is shown. One refused `too_soon` is asked again once, 300 ms later; any other refusal is shown in the device's words | the device takes one search every 250 ms a grant, and an answer to an older query must not overwrite a newer one | [`HiveSessionsView.vue:234`](../ui/src/views/hive/HiveSessionsView.vue#L234), [`useHiveSearch.ts:442`](../ui/src/composables/useHiveSearch.ts#L442) |
@@ -4236,14 +4236,54 @@ sequenceDiagram
 | Nothing is deleted until the session's title is typed, or its id for one with no title | it cannot be undone, and it takes every device's copy and the room at once | [`HivePurgeDialog.vue:116`](../ui/src/components/hive/HivePurgeDialog.vue#L116) |
 | A refusal (`no_permission`, `in_progress`) is said in the server's words, and deletes nothing | each names its own next step | [`HivePurgeDialog.vue:171`](../ui/src/components/hive/HivePurgeDialog.vue#L171) |
 | Once it purges, each device is followed: its state, and its two parts in words (its copy, the account's part), or why it was closed. Read again every 5 s until every device answered, and never once the dialog closes | a device that is offline is purged when it next connects, and the dialog says so | [`HivePurgeDialog.vue:147`](../ui/src/components/hive/HivePurgeDialog.vue#L147), [`HivePurgeDialog.vue:133`](../ui/src/components/hive/HivePurgeDialog.vue#L133) |
-| The record leaves the list once it purges | it is the purge's tombstone, read by nobody | [`hive.ts:364`](../ui/src/stores/hive.ts#L364) |
+| The record leaves the list once it purges | it is the purge's tombstone, read by nobody | [`hive.ts:374`](../ui/src/stores/hive.ts#L374) |
 
 ⚠️ **The account's part never touches the folder the session worked in.** What goes is its
 history and checkpoints (P2g-1), and the dialog says so before anything is deleted.
 
-The rest of P2 is next (spec §3b and §4): the rest of the UI (P2j-4: the policy's rules) and the
-field run (P2k). Its server switch is `hive.replicaset` and its device switch `hive_replica`, both
-off by default.
+### P2j-4: the policy's rules, edited by an administrator
+
+An administrator edits the organization's replica policy in place, on the policy card of
+**Agent copies** (P2h-2). The route is P2c-2a's: one write carries the whole policy, made from
+the revision it was read at.
+
+```mermaid
+sequenceDiagram
+    participant A as an administrator
+    participant P as Agent copies
+    participant S as server
+    A->>P: Edit: the rules, from the policy read at revision n
+    P->>S: PUT …/hive/policy {replicaset, retention_days, archive_devices as read, revision: n}
+    alt stored
+        S-->>P: the policy at n + 1
+        S->>S: the organization's live sessions placed again under it
+    else changed since it was read (409)
+        S-->>P: read it again
+        P->>S: GET …/hive/policy
+        S-->>P: the policy at m
+        P-->>A: the form, as it is stored now: make the change again
+    end
+```
+
+| Rule | Why | Where |
+|---|---|---|
+| Offered to an administrator only, as the designations are, and to nobody until the caller's permissions are known | only an `ADMINISTRATOR` writes the policy, and a refusal after a whole form is filled in helps nobody | [`HiveCopiesView.vue:40`](../ui/src/views/hive/HiveCopiesView.vue#L40) |
+| At least and at most from 1 to 8, at most never below at least; the days a whole number from 0, for good, to 3650. Nothing is saved while unchanged | the server's own bounds, `MAX_MEMBERS` and `MAX_RETENTION_DAYS`, said where they are typed | [`HiveCopiesView.vue:521`](../ui/src/views/hive/HiveCopiesView.vue#L521), [`HiveCopiesView.vue:525`](../ui/src/views/hive/HiveCopiesView.vue#L525), [`hive.ts:268`](../ui/src/stores/hive.ts#L268) |
+| The whole policy is written: the rules as edited and everything else as read, a `prefer` word or a rule this build does not know among it | a write replaces the policy, so what the form cannot show must not be dropped by it | [`HiveCopiesView.vue:504`](../ui/src/views/hive/HiveCopiesView.vue#L504), [`HiveCopiesView.vue:572`](../ui/src/views/hive/HiveCopiesView.vue#L572) |
+| Written from the revision the form was opened on, never a later one, and the designations are locked while it is open | two administrators editing at once must not overwrite each other in silence, nor one administrator's two writes race | [`HiveCopiesView.vue:581`](../ui/src/views/hive/HiveCopiesView.vue#L581), [`HiveCopiesView.vue:252`](../ui/src/views/hive/HiveCopiesView.vue#L252) |
+| A `409` is read again, and the form shows what is stored now: the change is made again | re-basing it on what another administrator stored would write over that after all | [`HiveCopiesView.vue:588`](../ui/src/views/hive/HiveCopiesView.vue#L588) |
+| Any other refusal is said in the server's words, and the draft is kept | a tag too long, or a bound a newer server holds, is fixed in place | [`HiveCopiesView.vue:591`](../ui/src/views/hive/HiveCopiesView.vue#L591) |
+| Once stored, the card shows the policy as stored, and says the live sessions are placed again under it | the server places them again as it stores the policy | [`policy.rs:354`](../crates/modules/hive/src/policy.rs#L354) |
+
+⚠️ **A restricted tag is compared exactly.** The server trims the tags, drops an empty one and
+keeps each once, as it does a device's tags, but it keeps their case
+([`agent.rs:1132`](../crates/modules/fleet/src/agent.rs#L1132)): `Prod` restricts nothing about a
+session on a device tagged `prod`. The form offers the tags the organization's devices carry
+first for that reason ([`HiveCopiesView.vue:519`](../ui/src/views/hive/HiveCopiesView.vue#L519)).
+
+The rest of P2 is next (spec §3b and §4): the last of the UI (P2j-5: an ended terminal session
+made a managed one, by P2f-4b's route) and the field run (P2k). Its server switch is
+`hive.replicaset` and its device switch `hive_replica`, both off by default.
 
 ---
 
@@ -4259,12 +4299,13 @@ off by default.
 | the archive replica image | [`Dockerfile.hive-archive`](../Dockerfile.hive-archive) and its entrypoint [`hive-archive-entrypoint.sh`](../scripts/hive-archive-entrypoint.sh) (enroll once, then run); the posture its enrollment writes, and what refuses one, in [`archive_replica.rs`](../agents/roomlerd/src/archive_replica.rs); its build, smoke test and dispatch-only publish in [`hive-archive-image.yml`](../.github/workflows/hive-archive-image.yml) |
 | the update wait | [`updater.rs:278`](../agents/roomlerd/src/updater.rs#L278); the macOS hold, `HiveUpdateHold`, in [`crates/localapi/src/lib.rs`](../crates/localapi/src/lib.rs) |
 | `adopt` | the CLI in [`hive_hooks.rs`](../agents/roomler-cli/src/hive_hooks.rs); its protocol in [`crates/localapi/src/hive_adopt.rs`](../crates/localapi/src/hive_adopt.rs) |
-| the SPA | [`stores/hive.ts`](../ui/src/stores/hive.ts), [`useHiveViewer.ts`](../ui/src/composables/useHiveViewer.ts), [`useHiveSearch.ts`](../ui/src/composables/useHiveSearch.ts) (a search's peer, P2i-3), [`utils/hiveRouter.ts`](../ui/src/utils/hiveRouter.ts) (one router for every peer's frames), [`utils/hiveCopies.ts`](../ui/src/utils/hiveCopies.ts) (a session's copies read by the server's count, P2j-1, and the devices a teleport or a fork may go to, P2j-2), [`components/hive/`](../ui/src/components/hive/) (`HiveCopies.vue`: a session's copies in its room, and its Move, P2j-1; `HivePurgeDialog.vue`: a session deleted for good, P2j-3), [`views/hive/`](../ui/src/views/hive/) |
+| the SPA | [`stores/hive.ts`](../ui/src/stores/hive.ts), [`useHiveViewer.ts`](../ui/src/composables/useHiveViewer.ts), [`useHiveSearch.ts`](../ui/src/composables/useHiveSearch.ts) (a search's peer, P2i-3), [`utils/hiveRouter.ts`](../ui/src/utils/hiveRouter.ts) (one router for every peer's frames), [`utils/hiveCopies.ts`](../ui/src/utils/hiveCopies.ts) (a session's copies read by the server's count, P2j-1, and the devices a teleport or a fork may go to, P2j-2), [`components/hive/`](../ui/src/components/hive/) (`HiveCopies.vue`: a session's copies in its room, and its Move, P2j-1; `HivePurgeDialog.vue`: a session deleted for good, P2j-3), [`views/hive/`](../ui/src/views/hive/) (`HiveCopiesView.vue`: the copies page, P2h-2, and its policy's rules edited by an administrator, P2j-4) |
 | the integration tests | `crates/tests/src/hive_tests.rs`, and in `crates/tests/tests/hive_*.rs` the canary, drivers and memory, a device's frames of a promotion (`hive_drain.rs`), a promotion between real devices (`hive_promote.rs`), a teleport between real devices, into a folder and into a clone (`hive_teleport.rs`), forks (`hive_fork.rs`), a terminal session the real hook client adopted, made a managed one (`hive_manage.rs`), and a session purged with a member offline, each device's store keeping only its id, and the primary of a running session removed, purging what it held while its member keeps its copy (`hive_purge.rs`), and a member back after its session's days purging its copy on its own clock (`hive_retain.rs`) |
 
 ## Not built
 
-- The rest of the replicaset (P2f onward). A session is readable from a member's copy
+- The rest of the replicaset: the last of the UI (P2j-5) and the field run (P2k). A session is
+  readable from a member's copy
   while its device is offline (P2d-5), a device holds to the session's fence (P2e-1) and
   to the server's word on each connection (P2e-2), the server moves a session to a member
   (P2e-3), a primary drains for the move (P2e-4), and a member answers the prepare and
@@ -4305,7 +4346,8 @@ off by default.
   it holds (P2i-2). The sessions page searches them, from a box shown only where an archive
   replica that searches is online (P2i-3); P2i is done in code. A session's room shows its
   copies and how far behind each is, and its owner moves it from there (P2j-1), to a device
-  with no copy too, or forks it (P2j-2); the sessions list deletes it for good (P2j-3).
+  with no copy too, or forks it (P2j-2); the sessions list deletes it for good (P2j-3), and an
+  administrator edits the policy's rules on the copies page (P2j-4).
 - A search hit opens its session's room at its newest events, not at the event it names (`seq`),
   and names a session read through a room only once it is opened.
 - The vault and the rest of the toolbelt (P3), knowhow (P4) and the learning loop

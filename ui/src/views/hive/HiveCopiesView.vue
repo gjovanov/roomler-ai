@@ -8,7 +8,8 @@
   `archive_devices`). Both halves are needed before it holds anything.
   "Add an archive replica" mints an enrollment token and shows how to run the
   archive replica image with it. Shown only where the server copies sessions
-  at all (`hive.replicaset`).
+  at all (`hive.replicaset`). P2j-4: an administrator edits the policy's rules
+  in place, from the revision read.
 -->
 <template>
   <v-container fluid class="pa-2 pa-md-4 pa-xl-6">
@@ -32,37 +33,160 @@
     <v-row v-if="policy">
       <v-col cols="12" lg="5">
         <v-card variant="outlined" data-testid="hive-copies-policy">
-          <v-card-title class="text-subtitle-1">{{ $t('hive.copies.policy.title') }}</v-card-title>
-          <v-list density="compact">
-            <v-list-item
-              prepend-icon="mdi-content-copy"
-              :title="$t('hive.copies.policy.copies', { min: policy.replicaset.min, max: policy.replicaset.max })"
-              data-testid="hive-copies-policy-copies"
+          <v-card-title class="d-flex align-center text-subtitle-1">
+            {{ $t('hive.copies.policy.title') }}
+            <v-spacer />
+            <v-btn
+              v-if="canSet && !draft"
+              icon="mdi-pencil-outline"
+              size="small"
+              variant="text"
+              :aria-label="$t('hive.copies.rules.edit')"
+              :title="$t('hive.copies.rules.edit')"
+              :disabled="busy"
+              data-testid="hive-copies-rules-edit"
+              @click="startEdit"
             />
-            <v-list-item
-              prepend-icon="mdi-archive-outline"
-              :title="policy.replicaset.archive ? $t('hive.copies.policy.archive') : $t('hive.copies.policy.archiveOff')"
-            />
-            <v-list-item
-              v-if="policy.replicaset.prefer.includes('owner_devices')"
-              prepend-icon="mdi-account-outline"
-              :title="$t('hive.copies.policy.prefer')"
-            />
-            <v-list-item
-              v-if="policy.replicaset.restricted_tags.length"
-              prepend-icon="mdi-tag-outline"
-              :title="$t('hive.copies.policy.restricted', { tags: policy.replicaset.restricted_tags.join(', ') })"
-            />
-            <v-list-item
-              prepend-icon="mdi-calendar-clock"
-              :title="
-                policy.retention_days > 0
-                  ? $t('hive.copies.policy.retention', { days: policy.retention_days })
-                  : $t('hive.copies.policy.retentionForever')
-              "
-              data-testid="hive-copies-policy-retention"
-            />
-          </v-list>
+          </v-card-title>
+          <!-- P2j-4 — the rules, edited in place by an administrator. -->
+          <template v-if="draft">
+            <v-card-text data-testid="hive-copies-rules">
+              <v-alert
+                v-if="rulesError"
+                type="error"
+                variant="tonal"
+                density="compact"
+                class="mb-3"
+                data-testid="hive-copies-rules-error"
+              >
+                {{ rulesError }}
+              </v-alert>
+              <div class="d-flex ga-3">
+                <v-select
+                  v-model="draft.min"
+                  :items="counts"
+                  :label="$t('hive.copies.rules.min')"
+                  density="compact"
+                  hide-details="auto"
+                  data-testid="hive-copies-rules-min"
+                />
+                <v-select
+                  v-model="draft.max"
+                  :items="counts"
+                  :label="$t('hive.copies.rules.max')"
+                  :error-messages="maxError"
+                  density="compact"
+                  hide-details="auto"
+                  data-testid="hive-copies-rules-max"
+                />
+              </div>
+              <div class="text-caption text-medium-emphasis mt-1 mb-2">
+                {{ $t('hive.copies.rules.copiesHint', { max: HIVE_MAX_MEMBERS }) }}
+              </div>
+              <v-switch
+                v-model="draft.archive"
+                :label="$t('hive.copies.rules.archive')"
+                color="primary"
+                density="compact"
+                hide-details
+                inset
+                data-testid="hive-copies-rules-archive"
+              />
+              <v-switch
+                v-model="draft.prefer"
+                :label="$t('hive.copies.rules.prefer')"
+                color="primary"
+                density="compact"
+                hide-details
+                inset
+                data-testid="hive-copies-rules-prefer"
+              />
+              <v-combobox
+                v-model="draft.tags"
+                :items="knownTags"
+                :label="$t('hive.copies.rules.restricted')"
+                :hint="$t('hive.copies.rules.restrictedHint')"
+                persistent-hint
+                multiple
+                chips
+                closable-chips
+                density="compact"
+                class="mt-3"
+                data-testid="hive-copies-rules-tags"
+              />
+              <v-text-field
+                v-model="draft.retention"
+                type="number"
+                min="0"
+                :max="HIVE_MAX_RETENTION_DAYS"
+                :label="$t('hive.copies.rules.retention')"
+                :hint="$t('hive.copies.rules.retentionHint', { max: HIVE_MAX_RETENTION_DAYS })"
+                persistent-hint
+                :error-messages="retentionError"
+                density="compact"
+                class="mt-3"
+                data-testid="hive-copies-rules-retention"
+              />
+            </v-card-text>
+            <v-card-actions>
+              <v-spacer />
+              <v-btn variant="text" :disabled="saving" data-testid="hive-copies-rules-cancel" @click="cancelEdit">
+                {{ $t('common.cancel') }}
+              </v-btn>
+              <v-btn
+                color="primary"
+                variant="flat"
+                :loading="saving"
+                :disabled="!canSave"
+                data-testid="hive-copies-rules-save"
+                @click="saveRules"
+              >
+                {{ $t('common.save') }}
+              </v-btn>
+            </v-card-actions>
+          </template>
+          <template v-else>
+            <v-alert
+              v-if="rulesNote"
+              type="success"
+              variant="tonal"
+              density="compact"
+              class="mx-4"
+              data-testid="hive-copies-rules-saved"
+            >
+              {{ rulesNote }}
+            </v-alert>
+            <v-list density="compact">
+              <v-list-item
+                prepend-icon="mdi-content-copy"
+                :title="$t('hive.copies.policy.copies', { min: policy.replicaset.min, max: policy.replicaset.max })"
+                data-testid="hive-copies-policy-copies"
+              />
+              <v-list-item
+                prepend-icon="mdi-archive-outline"
+                :title="policy.replicaset.archive ? $t('hive.copies.policy.archive') : $t('hive.copies.policy.archiveOff')"
+              />
+              <v-list-item
+                v-if="policy.replicaset.prefer.includes('owner_devices')"
+                prepend-icon="mdi-account-outline"
+                :title="$t('hive.copies.policy.prefer')"
+              />
+              <v-list-item
+                v-if="policy.replicaset.restricted_tags.length"
+                prepend-icon="mdi-tag-outline"
+                :title="$t('hive.copies.policy.restricted', { tags: policy.replicaset.restricted_tags.join(', ') })"
+              />
+              <v-list-item
+                prepend-icon="mdi-calendar-clock"
+                :title="
+                  policy.retention_days > 0
+                    ? $t('hive.copies.policy.retention', { days: policy.retention_days })
+                    : $t('hive.copies.policy.retentionForever')
+                "
+                data-testid="hive-copies-policy-retention"
+              />
+            </v-list>
+          </template>
         </v-card>
       </v-col>
 
@@ -125,7 +249,7 @@
                 <template #append>
                   <v-switch
                     :model-value="r.designated"
-                    :disabled="!canSet || busy || (r.gone && !r.designated)"
+                    :disabled="!canSet || busy || !!draft || (r.gone && !r.designated)"
                     :label="$t('hive.copies.archive.designated')"
                     color="primary"
                     density="compact"
@@ -201,7 +325,14 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ApiError } from '@/api/client'
-import { HIVE_ARCHIVE_CAP, useHiveStore, type HivePolicy } from '@/stores/hive'
+import {
+  HIVE_ARCHIVE_CAP,
+  HIVE_MAX_MEMBERS,
+  HIVE_MAX_RETENTION_DAYS,
+  HIVE_PREFER_OWNER_DEVICES,
+  useHiveStore,
+  type HivePolicy,
+} from '@/stores/hive'
 import { useAgentStore, type EnrollmentToken } from '@/stores/agents'
 import { useTenantStore } from '@/stores/tenant'
 import { canSetHivePolicy } from '@/utils/permissions'
@@ -345,6 +476,125 @@ async function designate(id: string, on: boolean): Promise<void> {
   }
 }
 
+// ─── P2j-4 — the policy's rules, edited by an administrator ───────────────
+
+/** The rules as the form edits them, the days as typed. */
+interface Draft {
+  min: number
+  max: number
+  archive: boolean
+  prefer: boolean
+  tags: string[]
+  retention: string
+}
+
+function draftOf(p: HivePolicy): Draft {
+  return {
+    min: p.replicaset.min,
+    max: p.replicaset.max,
+    archive: p.replicaset.archive,
+    prefer: p.replicaset.prefer.includes(HIVE_PREFER_OWNER_DEVICES),
+    tags: [...p.replicaset.restricted_tags],
+    retention: String(p.retention_days),
+  }
+}
+
+/** `prefer` as written: as read while its switch is unchanged, so a word a
+ *  newer server knows survives the write. */
+function preferOf(read: string[], on: boolean): string[] {
+  if (on === read.includes(HIVE_PREFER_OWNER_DEVICES)) return [...read]
+  return on ? [HIVE_PREFER_OWNER_DEVICES, ...read] : read.filter((w) => w !== HIVE_PREFER_OWNER_DEVICES)
+}
+
+const counts = Array.from({ length: HIVE_MAX_MEMBERS }, (_, i) => i + 1)
+/** The policy the form was opened on. Its write names this revision, never
+ *  a later one, so a change made meanwhile can only come back a 409. */
+const editedFrom = ref<HivePolicy | null>(null)
+const draft = ref<Draft | null>(null)
+const saving = ref(false)
+const rulesError = ref<string | null>(null)
+const rulesNote = ref<string | null>(null)
+
+/** The tags the organization's devices carry, offered first. */
+const knownTags = computed(() => [...new Set(agents.agents.flatMap((a) => a.tags ?? []))].sort())
+
+const maxError = computed<string[]>(() =>
+  draft.value && draft.value.max < draft.value.min ? [t('hive.copies.rules.maxBelowMin')] : [],
+)
+/** The days typed, if they are a whole number the server keeps. */
+const retentionDays = computed<number | null>(() => {
+  const raw = String(draft.value?.retention ?? '').trim()
+  if (!/^\d+$/.test(raw)) return null
+  const n = Number(raw)
+  return n <= HIVE_MAX_RETENTION_DAYS ? n : null
+})
+const retentionError = computed<string[]>(() =>
+  draft.value && retentionDays.value === null
+    ? [t('hive.copies.rules.retentionInvalid', { max: HIVE_MAX_RETENTION_DAYS })]
+    : [],
+)
+const changed = computed(
+  () => !!draft.value && !!editedFrom.value && JSON.stringify(draft.value) !== JSON.stringify(draftOf(editedFrom.value)),
+)
+const canSave = computed(
+  () => changed.value && maxError.value.length === 0 && retentionDays.value !== null && !saving.value,
+)
+
+function startEdit(): void {
+  const p = policy.value
+  if (!p) return
+  editedFrom.value = p
+  draft.value = draftOf(p)
+  rulesError.value = null
+  rulesNote.value = null
+}
+
+function cancelEdit(): void {
+  editedFrom.value = null
+  draft.value = null
+  rulesError.value = null
+}
+
+/** The whole policy, the rules as edited and everything else as read. One
+ *  changed meanwhile is read again and shown as it is now, never written
+ *  over in silence; any other refusal is the server's words, the draft
+ *  kept. */
+async function saveRules(): Promise<void> {
+  const p = editedFrom.value
+  const d = draft.value
+  const days = retentionDays.value
+  if (!p || !d || days === null || !canSave.value) return
+  rulesError.value = null
+  saving.value = true
+  try {
+    policy.value = await hive.putPolicy(tenantId.value, {
+      replicaset: {
+        ...p.replicaset,
+        min: d.min,
+        max: d.max,
+        archive: d.archive,
+        prefer: preferOf(p.replicaset.prefer, d.prefer),
+        restricted_tags: [...d.tags],
+      },
+      retention_days: days,
+      archive_devices: p.archive_devices,
+      revision: p.revision,
+    })
+    cancelEdit()
+    rulesNote.value = t('hive.copies.rules.saved')
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 409) {
+      await loadPolicy()
+      if (policy.value && !loadError.value) startEdit()
+      rulesError.value = t('hive.copies.rules.stale')
+    } else {
+      rulesError.value = (e as Error).message
+    }
+  } finally {
+    saving.value = false
+  }
+}
+
 const adding = ref(false)
 const minting = ref(false)
 const minted = ref<EnrollmentToken | null>(null)
@@ -424,6 +674,8 @@ async function copy(key: string, text: string): Promise<void> {
 
 watch(tenantId, () => {
   resolved.value = {}
+  cancelEdit()
+  rulesNote.value = null
   void load()
 })
 
