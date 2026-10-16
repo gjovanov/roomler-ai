@@ -4,19 +4,22 @@
 //! track as soon as it can: the `playout-delay` header extension with
 //! min = max = 0.
 //!
-//! Chrome's `<video>` holds frames in a jitter buffer with a floor of
-//! about 80 ms, whatever `jitterBufferTarget` the page asks for (the open
-//! Known Issue). A sender that puts `playout-delay` 0/0 on its packets moves
-//! Chrome to its low-latency path, the one game-streaming services use.
-//! Only the RTP fallback track goes through that buffer: data-channel
-//! sessions decode in a worker and never meet it.
+//! Chrome's `<video>` holds frames in a jitter buffer, whatever
+//! `jitterBufferTarget` the page asks for (the open Known Issue). A sender
+//! that puts `playout-delay` 0/0 on its packets moves Chrome to its
+//! low-latency path, the one game-streaming services use. Only the RTP
+//! fallback track goes through that buffer: data-channel sessions decode in
+//! a worker and never meet it.
 //!
-//! `ROOMLERD_RTP_PLAYOUT_DELAY_ZERO=1` turns it on, read once per session,
-//! default OFF for one release. Off, the extension is not even registered,
-//! so the answer SDP and every packet stay byte-identical to before.
-//! On, it is registered on the media engine, negotiated only if the
-//! browser offers it (Chrome does), and written on every video packet;
-//! a browser that does not offer it never sees it.
+//! On by default since FR-98 P5's field A/B (2026-10-16): on a vmtest guest,
+//! with OpenH264 on the track, Chrome's buffer went from an average of 193 ms
+//! (and growing) to 0.1 ms, and L4 input to photon from p50 78–362 ms to
+//! 35–40 ms. `ROOMLERD_RTP_PLAYOUT_DELAY_ZERO=0` turns it off, read once per
+//! session. Off, the extension is not even registered, so the answer SDP and
+//! every packet stay byte-identical to the agents before it. On, it is
+//! registered on the media engine, negotiated only if the browser offers it
+//! (Chrome does), and written on every video packet; a browser that does
+//! not offer it never sees it.
 
 use anyhow::{Context, Result};
 use webrtc::api::media_engine::MediaEngine;
@@ -27,13 +30,14 @@ use webrtc::rtp_transceiver::rtp_codec::{RTCRtpHeaderExtensionCapability, RTPCod
 /// The extension's URI, as browsers offer it.
 pub const URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";
 
-/// Is a switch value on? Truthy the way every other agent switch is; a
-/// typo stays off.
+/// Is the switch on? It defaults ON: only an explicit off (`0`, `false`,
+/// `no`, `off`, the spellings `ROOMLERD_HW_AUTO` reads) turns it off. An
+/// unset, empty or unrecognised value keeps the default, so a typo cannot
+/// take a host back to the buffered path.
 pub fn parse(raw: Option<&str>) -> bool {
-    matches!(
-        raw.map(str::trim),
-        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
-            || v.eq_ignore_ascii_case("on")
+    !matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "no" | "off")
     )
 }
 
@@ -99,19 +103,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_truthy_value_turns_it_on() {
-        for on in ["1", "true", "YES", " on "] {
-            assert!(parse(Some(on)), "{on:?}");
+    fn only_an_explicit_off_turns_it_off() {
+        for off in ["0", "false", "NO", " off "] {
+            assert!(!parse(Some(off)), "{off:?}");
         }
-        for off in [
+        // Unset, empty, on, or a typo: the default, which is on.
+        for on in [
             None,
             Some(""),
-            Some("0"),
-            Some("false"),
+            Some("1"),
+            Some("true"),
             Some("2"),
-            Some("onn"),
+            Some("of"),
         ] {
-            assert!(!parse(off), "{off:?}");
+            assert!(parse(on), "{on:?}");
         }
     }
 
