@@ -25,7 +25,7 @@
 //! | `probe` | no delay, L4 probes on | a probe sent on the `input` channel comes back painted into decoded frames |
 //! | `probe50` | +50 ms one way, L4 probes on | the probe round trip rises by ≥ 80 ms: it crosses the link in both directions |
 //! | `gate_lgcy` / `gate_slot` | an emulated 25 fps event-driven source behind each capture gate (FR-98 C1) | the slot-first gate's p50 is lower by ≥ a quarter period: the clock starts when a frame lands in the slot, so a frame the legacy gate holds there counts its wait |
-//! | `playout0` | no delay; the agent's `playout-delay` 0/0 switch on (FR-98 C6) | the extension is negotiated and on every video packet at 0/0, without costing frames. In every other cell (the switch off) the answer does not negotiate it at all, though the controller offers it as Chrome does |
+//! | `playout0` | no delay; the agent's `playout-delay` 0/0 switch left unset, which is on by default (FR-98 C6) | the extension is negotiated and on every video packet at 0/0, without costing frames. In every other cell (the switch forced off) the answer does not negotiate it at all, though the controller offers it as Chrome does |
 //! | `replay` | no delay; the transport as the daemon reads it (FR-101 P1a) | the controller's first SRTCP PLI, replayed into the live session a moment after a keyframe the agent cut on its own, cuts no keyframe: the replay window refuses it. In this cell and every other but `legacy`, the agent's ClientHello offers exactly the two ECDHE-AES-128-GCM suites |
 //! | `legacy` | no delay; both FR-101 switches back (`ROOMLERD_DTLS_LEGACY_SUITES=1`, `ROOMLERD_SRTP_REPLAY_WINDOW=0`), which is every session before P1a | the DTLS half's negative control: the ClientHello offers the CBC suites again. A replay is refused here too. With no window set, webrtc-srtp's session supplies its own 64, so replay protection was never off, before FR-101 or after |
 //! | `unguarded` | no delay; replay protection switched off outright through the setting engine, which no production setting does | the replay half's negative control: each replay cuts a keyframe, so a refusal in the other cells is the window's doing, not a blind instrument |
@@ -150,7 +150,9 @@ struct Cell {
     /// behind this capture gate, and the clock starts when a frame lands.
     compositor: Option<synthetic_backend::TestCompositor>,
     /// FR-98 C6: force the agent's `playout-delay` 0/0 switch for this
-    /// session (`None` reads the environment, which is off here).
+    /// session. Every cell forces it off but `playout0`, which leaves it
+    /// unset (`None` reads the environment, whose default is on), so the
+    /// other cells keep the path an off switch gives byte-identical.
     playout_zero: Option<bool>,
     /// FR-101 P1a: force the agent's transport policy (`None` reads the
     /// environment: the hardened default here).
@@ -1031,7 +1033,7 @@ const fn cell(name: &'static str, delay_ms: u64, loss_permille: u32, gate_ms: u6
         gate: Duration::from_millis(gate_ms),
         probe: false,
         compositor: None,
-        playout_zero: None,
+        playout_zero: Some(false),
         transport: None,
         replay_pli: false,
         replay_off: false,
@@ -1100,8 +1102,9 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
     let gate_legacy = gate_cell("gate_lgcy", GateMode::Legacy);
     let gate_slot = gate_cell("gate_slot", GateMode::SlotFirst);
 
+    // FR-98 C6: the switch unset, so this cell is the default, which is on.
     let playout0 = Cell {
-        playout_zero: Some(true),
+        playout_zero: None,
         ..cell("playout0", 0, 0, 0)
     };
     // FR-101 P1a: the transport as the daemon reads it, both of its switches
@@ -1260,15 +1263,15 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
         );
     }
 
-    // FR-98 C6. Off (the default), the agent does not even register the
-    // extension, so an answer to an offer that carries it negotiates nothing
-    // and the session is byte-identical to before.
+    // FR-98 C6. Off (forced here; the default is on), the agent does not even
+    // register the extension, so an answer to an offer that carries it
+    // negotiates nothing and the session is byte-identical to before.
     assert!(
         !clean_run.playout.negotiated,
         "clean: the answer negotiated playout-delay with the switch off: {:?}",
         clean_run.playout
     );
-    // On, it is negotiated and on every video packet, at 0/0.
+    // Unset, which is on, it is negotiated and on every video packet, at 0/0.
     let p = playout_run.playout;
     assert!(
         p.negotiated && p.zero > 0 && p.other == 0 && p.without == 0,
