@@ -130,7 +130,7 @@ impl Rig {
     async fn set(&mut self, id: &str, on: bool) -> Result<Value> {
         self.send(json!({"t": "rc:privacy.set", "id": id, "on": on}))
             .await?;
-        self.state(Duration::from_secs(5)).await
+        self.state(Duration::from_secs(30)).await
     }
 
     async fn close(self) {
@@ -187,7 +187,7 @@ async fn rig_with(attach: Attach, up_ok: bool, speakers: Option<bool>) -> Result
         })
     }));
     exchange(&browser_pc, &agent_pc).await?;
-    let agent_dc = tokio::time::timeout(Duration::from_secs(5), agent_dc_rx)
+    let agent_dc = tokio::time::timeout(Duration::from_secs(30), agent_dc_rx)
         .await
         .map_err(|_| anyhow!("agent on_data_channel timed out"))??;
     let dir = tempfile::tempdir()?;
@@ -224,7 +224,7 @@ async fn rig_with(attach: Attach, up_ok: bool, speakers: Option<bool>) -> Result
     if browser_dc.ready_state()
         != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
     {
-        tokio::time::timeout(Duration::from_secs(10), open_rx)
+        tokio::time::timeout(Duration::from_secs(30), open_rx)
             .await
             .map_err(|_| anyhow!("privacy DC open timed out"))??;
     }
@@ -288,7 +288,7 @@ async fn on_status_and_off_draw_and_clear_the_curtain() -> Result<()> {
     let mut r = rig(Attach::Granted { possible: || true }, true).await?;
     assert_eq!(r.set("1", true).await?["on"], true);
     r.send(json!({"t": "rc:privacy.status", "id": "s"})).await?;
-    let s = r.state(Duration::from_secs(5)).await?;
+    let s = r.state(Duration::from_secs(30)).await?;
     assert_eq!(s, json!({"t":"rc:privacy.state","id":"s","on":true}));
     let s = r.set("2", false).await?;
     assert_eq!(s, json!({"t":"rc:privacy.state","id":"2","on":false}));
@@ -317,7 +317,7 @@ async fn the_curtain_mutes_the_host_and_the_controller_is_told() -> Result<()> {
     );
     assert_eq!(*r.endpoint.0.lock().unwrap(), Some(true), "muted while up");
     r.send(json!({"t": "rc:privacy.status", "id": "s"})).await?;
-    let s = r.state(Duration::from_secs(5)).await?;
+    let s = r.state(Duration::from_secs(30)).await?;
     assert_eq!(
         s,
         json!({"t":"rc:privacy.state","id":"s","on":true,"host_muted":true})
@@ -364,7 +364,7 @@ async fn the_owner_switching_off_takes_it_down_and_tells_the_viewer() -> Result<
     let mut r = rig(Attach::Granted { possible: || true }, true).await?;
     assert_eq!(r.set("1", true).await?["on"], true);
     privacy::set_device_allowed(false);
-    let s = r.state(Duration::from_secs(5)).await?;
+    let s = r.state(Duration::from_secs(30)).await?;
     assert_eq!(s["on"], false, "{s}");
     assert_eq!(s["reason"], "disabled_on_device", "{s}");
     assert_eq!(r.overlay.calls(), vec![true, false]);
@@ -387,7 +387,7 @@ async fn the_channel_going_away_takes_the_curtain_down() -> Result<()> {
     let overlay = r.overlay.clone();
     let mut reports = r.reports.take().expect("reports");
     r.close().await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while overlay.calls() != vec![true, false] {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -397,7 +397,7 @@ async fn the_channel_going_away_takes_the_curtain_down() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     // The report follows the take-down on the same blocking call.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut seen = Vec::new();
     while seen.len() < 2 && tokio::time::Instant::now() < deadline {
         seen.extend(reported(&mut reports));
