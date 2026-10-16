@@ -136,6 +136,19 @@ carrier types), `TimeSeriesChart`, `UptimeStrip`, `UsagePanel`, `UsageTable`,
 nodes) · `MagicDnsSection` · `TunnelPoliciesSection` · `MembersSection` ·
 `RolesSection` · `SettingsSection`.
 
+### The devices list's "needs a person" chips
+
+`AgentsSection` shows these in both its table and its cards. Each appears only when someone has to act, and
+stays silent when the data is missing:
+
+| chip | when | rule |
+|---|---|---|
+| `credential expires in N d` · `credential expired` | the agent token is within 60 days of expiry, so it is not renewing (FR-103) | `ui/src/utils/credentialExpiry.ts` |
+| `not updating` | the device is online, and the **oldest** release it has not installed has been out for 24 h (FR-106). The tooltip names that release and the remedy for the OS. On Linux, a per-user install made before 0.4.138 needs one install by a person. A failed release fetch, or a version that does not parse, shows nothing | `ui/src/utils/updateStall.ts`; the list comes from `useAgentStore().fetchReleases()` (`/api/agent/latest-release`, cached 30 min) |
+
+⚠️ The age is the oldest missed release's, not the newest's. Releases can come 12 h apart: measured from the
+newest, a device stalled for weeks would lose its chip at every release.
+
 ## Everything else
 
 - **Chat**: TipTap v3 editor (markdown, mentions, emoji via emoji-mart, Giphy
