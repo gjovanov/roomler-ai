@@ -54,6 +54,9 @@ export interface HiveSession {
   replicaset?: HiveReplicaset
   /** P2e-3 — the move in flight. Absent: none. */
   promotion?: HivePromotion
+  /** P2f-4b — an adopted session asked to become a managed one: when, and
+   *  the word its device refused it with, if it did. Absent: never asked. */
+  from_terminal?: { at: string; refused?: string }
 }
 
 /** `ReplicasetView` — `crates/modules/hive/src/model.rs`. */
@@ -278,6 +281,20 @@ export function isAdopted(s?: Pick<HiveSession, 'origin'> | null): boolean {
   return s?.origin === 'adopted'
 }
 
+/** P2j-5 — an adopted session its terminal ended (`exited`): the one the
+ *  server makes a managed session (P2f-4b). One stopped from Roomler, whose
+ *  terminal went on after it, and one ended any other way, are not. */
+export function mayBecomeManaged(s?: Pick<HiveSession, 'origin' | 'status' | 'end_reason'> | null): boolean {
+  return !!s && s.origin === 'adopted' && s.status === 'ended' && s.end_reason === 'exited'
+}
+
+/** P2j-5 — asked to become a managed session, and its device has not
+ *  answered: the server's own `managing()`. A refusal makes the record the
+ *  adopted session it was again, its word kept on `from_terminal`. */
+export function isBecomingManaged(s?: Pick<HiveSession, 'status' | 'accepted_at' | 'from_terminal'> | null): boolean {
+  return !!s && s.status === 'starting' && !s.accepted_at && !!s.from_terminal && !s.from_terminal.refused
+}
+
 export function isLive(s: Pick<HiveSession, 'status'>): boolean {
   return !['ended', 'refused', 'lost'].includes(s.status)
 }
@@ -366,6 +383,16 @@ export const useHiveStore = defineStore('hive', () => {
     body: { device_id: string; folder: string; title?: string },
   ): Promise<HiveStartResult> {
     return api.post<HiveStartResult>(`${base(tenantId)}/${sessionId}/fork`, body)
+  }
+
+  /** P2j-5 — the owner makes their ended terminal session a managed one, on
+   *  the device that adopted it (P2f-4b): the SAME record, answered as a
+   *  start is. Its folder is sent only when it is not its terminal's. A
+   *  refused answer carries the record as it is. */
+  async function manage(tenantId: string, sessionId: string, folder?: string): Promise<HiveStartResult> {
+    const res = await api.post<HiveStartResult>(`${base(tenantId)}/${sessionId}/manage`, folder ? { folder } : {})
+    if (res.session) upsert(res.session)
+    return res
   }
 
   /** P2j-3 — the owner purges the session from every device that held it
@@ -548,6 +575,7 @@ export const useHiveStore = defineStore('hive', () => {
     promote,
     teleport,
     fork,
+    manage,
     purge,
     fetchPurge,
     upsert,
