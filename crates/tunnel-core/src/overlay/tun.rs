@@ -2230,11 +2230,12 @@ mod system {
         }
 
         /// N3 — remove a host-exemption row (best-effort; absent is fine).
-        pub fn del_gateway_route(ifindex: u32, dest: IpAddr, plen: u8, gateway: IpAddr) {
+        /// `true` when a row was there and went.
+        pub fn del_gateway_route(ifindex: u32, dest: IpAddr, plen: u8, gateway: IpAddr) -> bool {
             let r = make_gw_row(ifindex, dest, plen, gateway, 0);
             // SAFETY: the row carries the (interface, prefix, next-hop) key
             // the API matches on.
-            unsafe { DeleteIpForwardEntry2(&r) };
+            unsafe { DeleteIpForwardEntry2(&r) == NO_ERROR }
         }
 
         /// N5 — pin the adapter's IPv4 interface METRIC (the route-war
@@ -5628,16 +5629,29 @@ mod system {
         if pins.is_empty() {
             return;
         }
+        // Only what the table still held. After a reboot that is nothing: the
+        // kernel dropped the routes and only the ledger remembers them, so a
+        // count of RECORDS here read as "the reboot left N pins" (FR-97 §8,
+        // 2026-10-16).
+        #[cfg_attr(
+            not(any(target_os = "linux", target_os = "windows", target_os = "macos")),
+            allow(unused_mut)
+        )]
+        let mut removed = 0usize;
         for p in pins {
             #[cfg(target_os = "linux")]
+            if std::process::Command::new("ip")
+                .args(linux_pin_args("del", p))
+                .output()
+                .is_ok_and(|o| o.status.success())
             {
-                let _ = std::process::Command::new("ip")
-                    .args(linux_pin_args("del", p))
-                    .output();
+                removed += 1;
             }
             #[cfg(target_os = "windows")]
-            if let Some((ifindex, gw)) = windows_pin_route(p) {
-                winroute::del_gateway_route(ifindex, p.ip, pin_plen(p.ip), gw);
+            if let Some((ifindex, gw)) = windows_pin_route(p)
+                && winroute::del_gateway_route(ifindex, p.ip, pin_plen(p.ip), gw)
+            {
+                removed += 1;
             }
             #[cfg(target_os = "macos")]
             {
@@ -5654,19 +5668,22 @@ mod system {
                 });
                 if recorded
                     .is_some_and(|up| super::bsd_pin_holds(super::bsd_pin_row(&rows, p.ip), &up))
-                {
-                    let _ = std::process::Command::new("route")
+                    && std::process::Command::new("route")
                         .args(["-n", "delete", bsd_family(v6), "-host", &p.ip.to_string()])
-                        .output();
+                        .output()
+                        .is_ok_and(|o| o.status.success())
+                {
+                    removed += 1;
                 }
             }
             #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             let _ = p;
         }
         tracing::info!(
-            count = pins.len(),
+            recorded = pins.len(),
+            removed,
             pins = ?pins.iter().map(|p| p.ip).collect::<Vec<_>>(),
-            "overlay: removed the exit-client pins an earlier run left in the routing table"
+            "overlay: cleared the exit-client pins the host ledger recorded (removed = still in the routing table)"
         );
     }
 
