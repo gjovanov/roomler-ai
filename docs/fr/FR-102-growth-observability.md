@@ -271,6 +271,18 @@ sequenceDiagram
    wizard sends **zero** requests.
    Why opt-in: EDPB Guidelines 2/2023 read ePrivacy Art. 5(3) as covering what an installed program sends
    from the terminal for a purpose the user did not ask for.
+   *(P3b as built: the record is one shared wire type
+   (`roomler_ai_remote_control::setup_diagnostics`) with fixed vocabularies for `step`, `outcome` and
+   `error_code` that the server validates field by field — a refusal is a 422 with a code and stores
+   nothing — and the handler reads the body and nothing else about the request, so no IP and no
+   User-Agent can reach a row. The pages' boundaries happen before the wizard knows the server, so the
+   Rust recorder buffers them and flushes when `cmd_install` names it; a run cancelled before then sends
+   nothing anywhere. A run writes at most 48 rows. `growth.setup_diagnostics` (default on, for
+   `install_counters`'s reason) is the server's switch: off, the route is the empty 404 of an absent
+   path. The rows live 90 days; the nightly org-day job freezes distinct runs per `(step, outcome, os)`
+   per closed day into `growth_daily` as `install:wizard_step`, and the digest reads the rows for its
+   windows. The kill switch on the wizard's side is the box itself.
+   `docs/growth-observability.md`, "The wizard's opt-in diagnostics".)*
 6. **The Install panel** shows, per method and OS: fetches (approximate, by class), tokens issued, devices
    enrolled, issued → redeemed, enrolled → online within 1 h, → first session within 24 h, and wizard steps
    reached (opted-in runs only, labelled with their n).

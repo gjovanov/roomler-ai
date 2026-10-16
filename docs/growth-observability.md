@@ -3,7 +3,8 @@
 How the project learns what a post, an article or an issue produced — visits, sign-ups,
 orgs, devices, usage, revenue — **joined by the campaign key and never by a person**. This
 page covers what FR-102 has shipped so far: the taxonomy (P1b), the exclusion set (P1c), the
-daily digest (P1d), the account funnel, cohorts and org views (P2), the install trace (P3), the
+daily digest (P1d), the account funnel, cohorts and org views (P2), the install trace (P3) with
+the setup wizard's opt-in diagnostics (P3b), the
 web plane — the purestat puller and the Campaigns table (P6) — social reach: the ingest
 routes the promotion pipeline pushes to, and the Channels table (P8) — the newsletter's
 delivery side: SendGrid's signed Event Webhook, the per-issue link tags and unsubscribes, and
@@ -121,7 +122,7 @@ this server, not reachable, or not built yet is `{"not_measured": "<reason>",
 | `newsletter` | new, confirmed and unsubscribed subscribers (and how many left through an issue's link), by source; each issue sent that day with its ledger counts, its delivery so far and its unsubscribes; the window's delivered, bounced, dropped, spam reports and suppressed addresses — [the newsletter](#the-newsletter-delivery-per-issue-tags-and-unsubscribes-p5) | `subscribers`, `newsletter_issues`, `newsletter_sends` | P1d; delivery P5 (`not_measured` without the webhook key) |
 | `revenue` | orgs by plan × subscription status; the list-price MRR, **labelled `estimate: true`** (the same formula as the cost view, `routes/cost.rs::mrr_estimate_cents`) | `tenants`, `tenant_members` | P1d; billed P4 |
 | `quality` | sessions ended by `end_reason`, classed hang-up · refusal · failure; agent crashes by version | `remote_sessions`, `agent_crashes` | P1d |
-| `install` | tokens issued → redeemed; fetches by `(asset, client class, OS)`; enrollments by `(method, OS)`; wizard steps not measured until P3b — [the install trace](#the-install-trace-p3) | `enroll_token_issued`, `growth_daily`, `agents.install` | P3 |
+| `install` | tokens issued → redeemed; fetches by `(asset, client class, OS)`; enrollments by `(method, OS)`; the wizard's steps — runs reaching each, their outcomes and the failures by code, **opted-in runs only, labelled with their n** — [the install trace](#the-install-trace-p3), [the wizard's diagnostics](#the-wizards-opt-in-diagnostics-p3b) | `enroll_token_issued`, `growth_daily`, `agents.install`, `setup_diagnostics` | P3; wizard steps P3b (`not_measured` while `growth.setup_diagnostics` is off) |
 | `social` | posts published per platform `{day, d7, d28}`; the snapshots taken that day (at most 20), each with its post's campaign and the platform's own metric names — `not_measured` when nothing was pushed in 28 days | `growth_posts`, `growth_post_snapshots` | P8 |
 | `search` | — | — | P7 |
 | `alerts` | the alert rows that `fired` or `cleared` during the day, and the ones `open` at the compute — rule, key, times, the numbers behind it; `not_measured` while the alerts are off on this server — [alerts](#the-read-key-the-weekly-roll-up-and-alerts-p10) | `growth_alerts` | P10 (`ROOMLER__GROWTH__ALERTS`) |
@@ -197,6 +198,7 @@ sequenceDiagram
 | `growth.purestat_url` | `ROOMLER__GROWTH__PURESTAT_URL` | `https://purestat.ai` | the v1 query endpoint's base |
 | `growth.purestat_api_key` | `ROOMLER__GROWTH__PURESTAT_API_KEY` | empty | a site-scoped key (`X-API-Key`); empty ⇒ website, blog, campaigns and coverage read "not measured", the Campaigns table's web cells too, and the `saas` puller (P6) pulls nothing and says so once at boot |
 | `growth.install_counters` | `ROOMLER__GROWTH__INSTALL_COUNTERS` | `true` | the install trace's fetch counters (P3); `false` writes none. The token ledger and the enroll's `install` have no switch — they are ids on rows that exist anyway |
+| `growth.setup_diagnostics` | `ROOMLER__GROWTH__SETUP_DIAGNOSTICS` | `true` | accept the setup wizard's opt-in diagnostics at `POST /api/setup/diagnostics` (P3b); `false` makes the route the empty 404 of an absent path and the digest's `wizard_steps` "not measured". On for the counters' reason: the rows are this server's own, exist only when the person ticked the wizard's box, and name nobody — unlike the three mailing jobs, which default off because they mail people |
 
 The hosted deployment turns the digest on with `ROOMLER__GROWTH__DIGEST_ENABLED=true` (and a
 key once one is minted for `roomler.ai`); a mail backend must be configured
@@ -355,6 +357,7 @@ sequenceDiagram
 | token minted | `enroll_token_issued {_id: jti, tenant_id, issued_by, issued_at, kind: standard, redeemed_at: null, agent_id: null}` — the jti, **never the token** | `POST …/agent/enroll-token` (`agent.rs::issue_enrollment_token`), best-effort | 90 d |
 | fetch | `growth_daily {source: install, metric: fetch, dims: {asset, client, os}, day, value}` | the installer proxy, `/api/agent/latest-release`, `/api/setup/latest-release`, `/api/setup/install.sh`, `/api/setup/install.ps1`, `/api/setup/{platform}` (`install_trace::count_fetch`, spawned, best-effort) | indefinitely |
 | enroll | `agents.install {method, scope, run?}`; `enroll_token_issued.redeemed_at`, `.agent_id` (an upsert from the token's claims, so a token minted before the ledger is on record too) | `POST /api/agent/enroll` | with the row; 90 d |
+| wizard step boundary (**opt-in**) | `setup_diagnostics {run, step, outcome, elapsed_ms, error_code, os, wizard_version, ts}` — [below](#the-wizards-opt-in-diagnostics-p3b) | `POST /api/setup/diagnostics`, from the wizard, only when the box is ticked | 90 d; the daily counts frozen into `growth_daily` indefinitely |
 | first online · first session | already there: `stats_events` (presence), `remote_sessions` | — | — |
 
 ### Fetches by client class
@@ -438,15 +441,113 @@ Compatibility, both directions, is what the shape is built around:
 The row is shown on the device (`GET …/agent/{id}` → `install`), which is what a field check
 reads (AC9).
 
+### The wizard's opt-in diagnostics (P3b)
+
+Where a wizard run gets to, and where it stops — **only for runs whose operator ticked the
+box** (spec §3e item 5; D4: opt-in, unticked). The Welcome page of `roomler-setup` carries
+"Send anonymous setup diagnostics to `<server>`", unticked on every launch: the choice lives
+in the wizard's memory for that run, is never written to its saved state and never restored
+from an earlier run. Ticked, the wizard sends **one `POST /api/setup/diagnostics` per step
+boundary**; unticked, it sends **nothing** — not one request (AC12).
+
+```mermaid
+sequenceDiagram
+    participant P as Person
+    participant W as roomler-setup (SPA + Rust recorder)
+    participant S as the server being enrolled into
+    P->>W: Welcome: ticks the box (memory only)
+    P->>W: Welcome → Server → Token (Continue)
+    Note over W: each page boundary is a record — BUFFERED:<br/>no server is known yet
+    P->>W: Install (cmd_install with the server URL)
+    W->>W: the server is known: flush the buffer, in order
+    W->>S: POST /api/setup/diagnostics {welcome, ok, …}
+    W->>S: POST … {server, ok, …} · {token, ok, …}
+    loop every pipeline step (preflight · resolve · download · verify · msi | extract · integrate · enroll · companion · anchor)
+        W->>S: POST … {step, ok | failed + error_code | cancelled, elapsed_ms}
+    end
+    W->>S: POST /api/agent/enroll {…, install: {method: wizard, scope, run}}
+    W->>S: POST … {done, ok, elapsed_ms = the whole pipeline}
+    Note over S: validate every field → setup_diagnostics {…, ts} — no IP, no User-Agent<br/>nightly: freeze distinct runs per (step, outcome, os) into growth_daily
+```
+
+- **A record is exactly** `{run, step, outcome, elapsed_ms, error_code, os, wizard_version}`
+  (`roomler_ai_remote_control::setup_diagnostics::SetupDiagnostic`, the one shape both ends
+  share; every key always present, `error_code` as `null` on a step that did not fail).
+  `run` is 32 random hex characters minted per wizard launch and kept in memory; `step` is one
+  of `welcome` · `server` · `token` (the pages, measured by the SPA) · `preflight` · `resolve`
+  · `download` · `verify` · `msi` (the daemon roles) · `extract` · `integrate` (the tunnel role)
+  · `enroll` · `companion` · `anchor` (the two best-effort steps, recorded only where they
+  apply) · `done`; `outcome` is `ok` · `failed` · `cancelled`; `error_code` is a **code from a
+  fixed vocabulary** (`advanced_options`, `unsupported_platform`, `preflight`, `resolve`,
+  `download`, `sha256_mismatch`, `msi_spawn`, `msi_wait`, `msi_user_cancel`,
+  `msi_another_install`, `msi_fatal`, `msi_other`, `extract`, `integrate`, `enroll_rejected`,
+  `enroll_network`, `config_write`, `companion`, `anchor`, `other`) — never the error text, a
+  path, a hostname or a user name; `os` is the family; `wizard_version` the crate's version.
+  The enroll's `enroll_rejected` / `enroll_network` is decided on the error's **types** (a
+  `reqwest::Error` in the chain is a network failure), never on its message.
+- **The diagnostics go to the server being enrolled into** — the URL `cmd_install` receives,
+  read by the same TLS rule as the enroll — so a self-hosted server gets its own and roomler.ai
+  never hears of them. The pages happen before the wizard knows that server, so their
+  boundaries are buffered in the recorder and flushed, in order, when `cmd_install` names it;
+  a run cancelled before then **sends nothing anywhere** — the buffer dies with the process,
+  and unticking the box drops it too.
+- **Fire-and-forget**: each send is spawned on the wizard's runtime with a 3-second timeout,
+  never retried, never shown, never awaited by a step. A diagnostics failure — the server off,
+  the switch off, a refusal — is a debug line and nothing else.
+- **The run rides the enroll** (`agents.install.run`, P3's reserved field), so a ticked run
+  joins the device it enrolled; unticked, the enroll carries no `run`.
+- ⚠️ **The recorder is the gate, not the SPA**: a boundary reported while the box is unticked
+  is dropped in Rust (`agents/roomler-setup/src/diagnostics.rs`), so the SPA cannot leak one by
+  calling at the wrong time. Locked by the crate's unit tests: a full simulated run unticked
+  makes zero sends; ticked, one per boundary with exactly the seven keys, each valid by the
+  server's own check; buffered until the server is known; a cancel before then sends nothing.
+
+**The server** (`crates/modules/fleet/src/setup_diagnostics.rs`) takes the route
+**unauthenticated by necessity** — a wizard has no credential until its enroll succeeds, and
+most of what this measures happens before that — so it trusts nothing:
+
+| Check | Answer |
+|---|---|
+| body over 1 KiB (`DefaultBodyLimit` on the route) | 413 |
+| not JSON, a missing key, **an eighth key** (`deny_unknown_fields`) | 422 `invalid_json` |
+| `run` not 32 lowercase hex · `step`, `outcome`, `os` outside the vocabulary · `elapsed_ms` over a day · `error_code` outside the vocabulary, missing on `failed`, present on `ok`/`cancelled` · `wizard_version` not a short Cargo version | 422 `invalid_run` · `unknown_step` · `unknown_outcome` · `unknown_os` · `elapsed_out_of_range` · `unknown_error_code` · `missing_error_code` · `unexpected_error_code` · `invalid_wizard_version` — a code, never the value, and nothing stored |
+| a `run` already holding 48 rows | 429 `run_capped`, nothing stored (counted before the insert, so N racing pods can exceed it by N − 1 — a bound, not a quota) |
+| `growth.setup_diagnostics = false` | the **empty 404** of a path that does not exist, the same bytes as `POST /api/<absent>` |
+| stored | 202, no body; the row is the record plus the server's `ts` |
+
+The handler takes the body and **nothing else about the request** — no `HeaderMap`, no
+`ConnectInfo` — so an address or a User-Agent cannot reach the row by construction; the
+integration test scans every stored row for both. A refusal is logged by its code. The rows
+carry no tenant, so the exclusion set cannot apply to them (like the fetch counters). The
+static `/diagnostics` segment wins over the proxy's `/{platform}` for every method, which
+makes `GET /api/setup/diagnostics` a 405 where it used to fall into the proxy and be refused
+as an unknown platform (400); `GET /api/setup/diagnostics/health` still reaches the proxy.
+
+**Retention**: 90 days (the TTL on `ts`), then daily counts. Under the org-day fold's nightly
+claim, `org_daily::freeze_setup_diagnostics` writes `growth_daily
+{source: install, metric: wizard_step, dims: {step, outcome, os}}` for the last three closed
+days — the value the number of **distinct** runs that ended that step with that outcome (a
+retry re-passing a step is one run), `$set` through `replace_daily`, so a rerun changes
+nothing and a day with no runs holds no rows. A day past that window is never rewritten, so
+the counts stand after the rows expire.
+
 ### In the digest
 
 `install` is a section of its own: `tokens {issued, redeemed}` (tokens issued in the window,
 and how many of those an enroll spent; a redeemed share only at n ≥ 30), `fetches
-[{asset, client, os, fetches}]`, `enrollments_by_method [{method, os, enrolled}]`, and
-`wizard_steps` not measured until P3b. `orgs_devices.by_install_method` lists the day's devices
-by method. Exclusions apply to tokens by the token's tenant and to enrollments by the device's
-tenant; the fetch rows carry no tenant and cannot be filtered. All of it is "not mounted"
-without the `fleet` module, never 0.
+[{asset, client, os, fetches}]`, `enrollments_by_method [{method, os, enrolled}]`, and since
+P3b `wizard_steps {runs, n_floor, done_share_28d?, steps [{step, reached, ok, failed,
+cancelled}], errors [{step, error_code, failures}]}` — every number a count of **distinct
+opted-in runs** per window, in run order, read from `setup_diagnostics` (its 90 days cover
+every window the digest reads), `runs` the n every row is read against, and the share of
+runs reaching `done` only once `runs.d28 ≥ 30`. ⚠️ Opted-in runs only: the section says nothing
+about the runs that did not tick the box, and the email's note says so. With
+`growth.setup_diagnostics = false` it is `not_measured` ("off on this server"), never a zero —
+a zero is a day on which no run opted in. `orgs_devices.by_install_method` lists the day's
+devices by method. Exclusions apply to tokens by the token's tenant and to enrollments by the
+device's tenant; the fetch and wizard rows carry no tenant and cannot be filtered. All of it
+is "not mounted" without the `fleet` module, never 0. The Growth page's Install panel renders
+the same section (`GrowthNode`, a table per list).
 
 ## The web plane: the purestat puller and the Campaigns table (P6)
 
@@ -1287,6 +1388,7 @@ FR's field-verification log ([FR-102 §8](fr/FR-102-growth-observability.md#8-fi
 | The digest of a closed day equals a Mongo hand count of sign-ups, orgs, devices, sessions and the newsletter (AC23); without a purestat key the web sections read "not measured" by design | ✅ 2026-10-14 (the 10-13 digest) and 2026-10-15 (the 10-14 digest, the first with campaigns measured and the vmtest orgs excluded) | `crates/tests/src/growth_digest_tests.rs` — two concurrent runs store once and send once |
 | The funnel's sign-ups and activated orgs for a closed week equal a hand count (AC7) | ✅ 2026-10-15, the week of 2026-08-31 | `crates/tests/src/growth_funnel_tests.rs` — exact counts per step, `pending` / `settled`, and `null` for an unmounted module (AC6) |
 | Each enroll path records its `install` on the agent row (AC9) | ✅ 2026-10-15 on vmtest, agent 0.4.137: `script-sh`, `script-ps1`, `wizard`, `manual`; a 0.4.136 agent records `unknown` | `crates/agent-core/src/enrollment.rs` — flag, then env, then `manual`; an unknown env spelling clamped |
+| Unticked, the wizard sends zero diagnostics requests through a full install (a proxy capture); ticked, one per step with exactly the documented fields (AC12) | owed: needs a wizard release carrying P3b, then a vmtest wizard cell with the capture on both settings | `agents/roomler-setup/src/diagnostics.rs` — a full simulated run unticked makes zero sends; ticked, one per boundary with exactly the seven keys; `crates/tests/src/growth_setup_diagnostics_tests.rs` — the stored row's exact fields with no IP and no UA, every refusal, the kill switch's empty 404, the cap, the freeze, the digest section |
 | The Campaigns table's visitors for a closed day equal purestat's own number for the same filter, and read "not measured" with the key revoked (AC16) | ✅ 2026-10-15, 2026-10-13 by `content` | `crates/tests/src/growth_campaigns_tests.rs`, against a fake purestat |
 | The ingest stores a snapshot pushed twice once, refuses an unknown platform and a body carrying post text, and answers 404 to a wrong key (AC18) | ✅ 2026-10-15 | `crates/tests/src/growth_channels_tests.rs`, plus the revoked key, the JWT, the kill switch and the unmounted module |
 | The read key returns, for one closed range, the same JSON a platform admin's session gets on every GET view, and the empty 404 on every write, on `GET …/keys` and after its revocation (AC20) | owed after the promote, with a minted read key | `crates/tests/src/growth_p10_tests.rs` — every GET view compared body for body, every write, the admin surface, an ingest key, a malformed, an unknown and a revoked key, the kill switch |

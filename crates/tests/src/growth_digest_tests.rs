@@ -730,9 +730,17 @@ async fn every_section_counts_the_seeded_day_exactly() {
             { "method": "wizard", "os": "windows", "enrolled": { "day": 1, "d7": 1, "d28": 1 } },
         ])
     );
+    // P3b — the switch is on and no run opted in: a measured zero with its
+    // n, never "not measured" (that is the switch-off answer, asserted in
+    // `growth_setup_diagnostics_tests`).
     assert_eq!(
-        not_measured(&j["install"]["wizard_steps"]).map(|n| n.1),
-        Some(Some("P3b"))
+        j["install"]["wizard_steps"],
+        json!({
+            "runs": { "day": 0, "d7": 0, "d28": 0 },
+            "n_floor": 30,
+            "steps": [],
+            "errors": [],
+        })
     );
 
     // P8 — built, but nothing was pushed: not measured, never 0.

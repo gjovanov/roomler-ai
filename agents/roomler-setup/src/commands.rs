@@ -365,6 +365,31 @@ pub fn cmd_install_progress_replay() -> Vec<wizard_shared::progress::ProgressEve
     wizard_shared::progress::replay_log().snapshot()
 }
 
+// ─── FR-102 P3b: opt-in setup diagnostics ────────────────────────────────────
+
+/// The Welcome page's "Send anonymous setup diagnostics" box, as the
+/// operator set it. In memory for this process only — never part of
+/// `cmd_save_state`, never read back from an earlier run. Unticking also
+/// drops anything buffered while it was ticked
+/// ([`crate::diagnostics::Diagnostics::set_opt_in`]).
+#[tauri::command]
+pub fn cmd_diagnostics_opt_in(enabled: bool) {
+    crate::diagnostics::Diagnostics::global().set_opt_in(enabled);
+}
+
+/// A page boundary the SPA measured: `welcome` / `server` / `token` with
+/// `ok` or `cancelled` and the time spent on the page. Buffered until the
+/// server is known; dropped while the box is unticked. A spelling outside
+/// the vocabulary is ignored, never an error — diagnostics must not be
+/// able to fail the wizard.
+#[tauri::command(rename_all = "camelCase")]
+pub fn cmd_diagnostics_page(step: String, outcome: String, elapsed_ms: u64) {
+    use roomler_ai_remote_control::setup_diagnostics::{Outcome, Step};
+    if let (Some(step), Some(outcome)) = (Step::parse(&step), Outcome::parse(&outcome)) {
+        crate::diagnostics::Diagnostics::global().page(step, outcome, elapsed_ms);
+    }
+}
+
 /// Cleanly exit the wizard process. Wired to the Done page's Finish
 /// button. JS `window.close()` in Tauri 2 is unreliable: depending on
 /// the OS-window vs webview lifecycle, it can blank the webview but

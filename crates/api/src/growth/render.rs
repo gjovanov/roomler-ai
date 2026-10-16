@@ -288,10 +288,73 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
          bound on intent, not an install."
             .into(),
     ));
-    out.push(Line(
-        "Wizard steps".into(),
-        not_measured(&s.install.wizard_steps),
-    ));
+    // P3b — the wizard's opt-in diagnostics: opted-in runs only, labelled
+    // with their n; a share only once the n clears the floor.
+    match &s.install.wizard_steps {
+        Measured::Value(ws) => {
+            out.push(Line("Wizard runs (opted in)".into(), fig(&ws.runs)));
+            if let Some(share) = ws.done_share_28d {
+                out.push(Line(
+                    "… of which reached done (28d)".into(),
+                    format!("{:.1} %", share * 100.0),
+                ));
+            }
+            if ws.steps.is_empty() {
+                out.push(Note("No opted-in wizard run in the last 28 days.".into()));
+            } else {
+                out.push(Table(
+                    vec![
+                        "Step".into(),
+                        "Runs reaching it (day · 7d · 28d)".into(),
+                        "ok".into(),
+                        "failed".into(),
+                        "cancelled".into(),
+                    ],
+                    ws.steps
+                        .iter()
+                        .map(|r| {
+                            vec![
+                                r.step.clone(),
+                                format!("{} · {} · {}", r.reached.day, r.reached.d7, r.reached.d28),
+                                r.ok.d28.to_string(),
+                                r.failed.d28.to_string(),
+                                r.cancelled.d28.to_string(),
+                            ]
+                        })
+                        .collect(),
+                ));
+            }
+            if !ws.errors.is_empty() {
+                out.push(Table(
+                    vec![
+                        "Step".into(),
+                        "Error code".into(),
+                        "Runs (day · 7d · 28d)".into(),
+                    ],
+                    ws.errors
+                        .iter()
+                        .map(|r| {
+                            vec![
+                                r.step.clone(),
+                                r.error_code.clone(),
+                                format!(
+                                    "{} · {} · {}",
+                                    r.failures.day, r.failures.d7, r.failures.d28
+                                ),
+                            ]
+                        })
+                        .collect(),
+                ));
+            }
+            out.push(Note(format!(
+                "Wizard steps come only from runs whose operator ticked the diagnostics box; \
+                 they say nothing about the runs that did not. Outcomes are distinct runs in \
+                 the 28-day window; a share is shown only from {} runs.",
+                ws.n_floor
+            )));
+        }
+        Measured::NotMeasured(n) => out.push(Line("Wizard steps".into(), not_measured(n))),
+    }
 
     out.push(Heading("Usage".into()));
     out.push(Line(
@@ -1417,7 +1480,7 @@ mod tests {
     use crate::growth::digest::{
         ActiveOrgs, FetchRow, Headline, Install, KeyCount, MethodRow, MrrEstimate, OrgsDevices,
         Quality, Revenue, SignupRow, Signups, Social, SocialPlatform, SocialSnapshot, Tokens,
-        TopOrg, Usage,
+        TopOrg, Usage, WizardErrorRow, WizardStepRow, WizardSteps,
     };
     use roomler_ai_services::dao::growth_digest::{DigestStatus, ExcludedCounts};
 
@@ -1534,7 +1597,33 @@ mod tests {
                     os: "linux".into(),
                     enrolled: f(3, 7, 20),
                 }]),
-                wizard_steps: NotMeasured::later("wizard steps reached (opt-in runs)", "P3b"),
+                // P3b — opted-in runs below the floor: counts only, no share.
+                wizard_steps: Measured::Value(WizardSteps {
+                    runs: f(1, 3, 9),
+                    n_floor: SMALL_N,
+                    done_share_28d: None,
+                    steps: vec![
+                        WizardStepRow {
+                            step: "welcome".into(),
+                            reached: f(1, 3, 9),
+                            ok: f(1, 3, 9),
+                            failed: f(0, 0, 0),
+                            cancelled: f(0, 0, 0),
+                        },
+                        WizardStepRow {
+                            step: "msi".into(),
+                            reached: f(1, 3, 7),
+                            ok: f(1, 2, 5),
+                            failed: f(0, 1, 2),
+                            cancelled: f(0, 0, 0),
+                        },
+                    ],
+                    errors: vec![WizardErrorRow {
+                        step: "msi".into(),
+                        error_code: "msi_user_cancel".into(),
+                        failures: f(0, 1, 2),
+                    }],
+                }),
             },
             social: Measured::Value(Social {
                 posts_by_platform: vec![SocialPlatform {
@@ -1665,10 +1754,17 @@ mod tests {
         let text = render_text(&doc, &s);
         assert!(text.contains("Website"));
         assert!(text.contains("not measured — purestat key not configured"));
-        assert!(
-            text.contains("not measured — arrives with P3b (wizard steps reached (opt-in runs))")
-        );
         assert!(text.contains("not measured — remote module not mounted"));
+        // P3b — the wizard's opt-in runs render as counts labelled with
+        // their n (9 in 28 days, under the floor of 30), the step table
+        // with the outcomes as distinct runs, the failure by code, and the
+        // note that says whose runs these are; no share below the floor.
+        assert!(text.contains("Wizard runs (opted in): 1 (7d 3 · 28d 9)"));
+        assert!(text.contains("msi"));
+        assert!(text.contains("msi_user_cancel"));
+        assert!(text.contains("ticked the diagnostics box"));
+        assert!(text.contains("a share is shown only from 30 runs"));
+        assert!(!text.contains("reached done (28d)"));
         // P3 — the install trace renders as numbers, with the ratio only
         // once its n clears the floor (40 issued ≥ 30).
         assert!(text.contains("Enrollment tokens issued: 3 (7d 12 · 28d 40)"));

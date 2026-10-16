@@ -100,6 +100,9 @@ fn main() {
             commands::cmd_force_kill_msi,
             commands::cmd_install_progress_replay,
             commands::cmd_exit_wizard,
+            // FR-102 P3b — the opt-in diagnostics box and the page boundaries.
+            commands::cmd_diagnostics_opt_in,
+            commands::cmd_diagnostics_page,
         ])
         .run(tauri::generate_context!())
         .expect("error while running roomler-setup");

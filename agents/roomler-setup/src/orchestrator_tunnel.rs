@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use anyhow::Context;
+use roomler_ai_remote_control::setup_diagnostics::{ErrorCode, Step};
 use tauri::ipc::Channel;
 use wizard_shared::asset_resolver;
 use wizard_shared::extract;
@@ -47,6 +48,7 @@ use wizard_shared::progress::{ProgressEvent, replay_log};
 use wizard_shared::tunnel_enroll::{self, EnrollResult};
 
 use crate::commands::DoneReport;
+use crate::diagnostics::{Diagnostics, cancel_requested, enroll_error_code, failed};
 use crate::role::Role;
 
 /// Drive a full tunnel-client install end-to-end. Streams
@@ -66,6 +68,14 @@ pub async fn run_install(
     crate::CANCEL_REQUESTED.store(false, Ordering::SeqCst);
     replay_log().reset();
 
+    // FR-102 P3b — the server is known from here, read the way the enroll
+    // below reads it (FR-101 P1b's TLS rule): the pages' buffered
+    // boundaries flush to it and every step reports as it ends — only if
+    // the Welcome box was ticked.
+    let diag = Diagnostics::global();
+    diag.server_known(&roomler_cli::config::enrollment_server_url(&server));
+    diag.pipeline_started();
+
     let outcome = run_install_inner(role, server, token, device_name, &on_event).await;
 
     crate::INSTALL_IN_PROGRESS.store(false, Ordering::SeqCst);
@@ -73,6 +83,9 @@ pub async fn run_install(
     match outcome {
         Ok(r) => Ok(r),
         Err(e) => {
+            // A step every error site closes itself; this catches one that
+            // did not, so the run's last step is never left unrecorded.
+            diag.abandon(ErrorCode::Other, cancel_requested());
             // Echo terminal failures into both the channel + the
             // replay log so a late-attached SPA listener sees them.
             emit(
@@ -95,8 +108,10 @@ async fn run_install_inner(
     on_event: &Channel<ProgressEvent>,
 ) -> Result<DoneReport, String> {
     emit(on_event, ProgressEvent::Started);
+    let diag = Diagnostics::global();
 
     // --- Step 1: preflight -----------------------------------------------
+    diag.begin(Step::Preflight);
     check_cancel()?;
     emit(on_event, ProgressEvent::PreflightStarted);
     let existing_label = detect_existing_install_label();
@@ -106,15 +121,20 @@ async fn run_install_inner(
             existing: existing_label,
         },
     );
+    diag.ok();
 
     // --- Step 2: resolve archive ---------------------------------------
+    diag.begin(Step::Resolve);
     check_cancel()?;
     let platform = asset_resolver::current_platform().to_string();
     if platform == "unsupported" {
-        return Err(format!(
-            "tunnel client is not supported on this OS+arch combination ({} / {})",
-            std::env::consts::OS,
-            std::env::consts::ARCH
+        return Err(failed(
+            ErrorCode::UnsupportedPlatform,
+            format!(
+                "tunnel client is not supported on this OS+arch combination ({} / {})",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
         ));
     }
     emit(
@@ -130,7 +150,7 @@ async fn run_install_inner(
         crate::proxy::USER_AGENT,
     )
     .await
-    .map_err(|e| format!("resolve installer: {e}"))?;
+    .map_err(|e| failed(ErrorCode::Resolve, format!("resolve installer: {e}")))?;
     emit(
         on_event,
         ProgressEvent::AssetResolved {
@@ -139,8 +159,10 @@ async fn run_install_inner(
             digest: health.digest.clone(),
         },
     );
+    diag.ok();
 
     // --- Step 3: download ----------------------------------------------
+    diag.begin(Step::Download);
     check_cancel()?;
     emit(
         on_event,
@@ -172,13 +194,15 @@ async fn run_install_inner(
         });
     })
     .await
-    .map_err(|e| format!("download installer: {e}"))?;
+    .map_err(|e| failed(ErrorCode::Download, format!("download installer: {e}")))?;
+    diag.ok();
 
     // --- Step 4: verify SHA256 ------------------------------------------
+    diag.begin(Step::Verify);
     check_cancel()?;
     let sha256_match = match health.digest.as_deref() {
         Some(digest) => asset_resolver::verify_sha256(&staged, digest)
-            .map_err(|e| format!("sha256 verify: {e}"))?,
+            .map_err(|e| failed(ErrorCode::Other, format!("sha256 verify: {e}")))?,
         None => {
             tracing::warn!(
                 tag = %health.tag,
@@ -190,13 +214,18 @@ async fn run_install_inner(
     emit(on_event, ProgressEvent::DownloadVerified { sha256_match });
     if !sha256_match {
         let _ = std::fs::remove_file(&staged);
-        return Err(format!(
-            "SHA256 mismatch for {} — staged file deleted; please retry",
-            staged.display()
+        return Err(failed(
+            ErrorCode::Sha256Mismatch,
+            format!(
+                "SHA256 mismatch for {} — staged file deleted; please retry",
+                staged.display()
+            ),
         ));
     }
+    diag.ok();
 
     // --- Step 5: extract -------------------------------------------------
+    diag.begin(Step::Extract);
     check_cancel()?;
     emit(
         on_event,
@@ -204,23 +233,26 @@ async fn run_install_inner(
             archive: staged.display().to_string(),
         },
     );
-    let install_root = default_install_root().map_err(|e| format!("install root: {e}"))?;
+    let install_root = default_install_root()
+        .map_err(|e| failed(ErrorCode::Extract, format!("install root: {e}")))?;
     extract::extract_archive(&staged, &install_root)
-        .map_err(|e| format!("extract archive: {e}"))?;
+        .map_err(|e| failed(ErrorCode::Extract, format!("extract archive: {e}")))?;
     let tunnel_binary = extract::find_tunnel_binary(&install_root)
-        .map_err(|e| format!("locate tunnel binary: {e}"))?;
+        .map_err(|e| failed(ErrorCode::Extract, format!("locate tunnel binary: {e}")))?;
     emit(
         on_event,
         ProgressEvent::ExtractDone {
             tunnel_binary: tunnel_binary.display().to_string(),
         },
     );
+    diag.ok();
 
     // --- Step 6: integrate + enroll -------------------------------------
+    diag.begin(Step::Integrate);
     check_cancel()?;
     emit(on_event, ProgressEvent::IntegrationStarted);
     let integration_report = integration::integrate(&install_root, &tunnel_binary)
-        .map_err(|e| format!("integrate: {e}"))?;
+        .map_err(|e| failed(ErrorCode::Integrate, format!("integrate: {e}")))?;
     emit(
         on_event,
         ProgressEvent::IntegrationDone {
@@ -228,7 +260,9 @@ async fn run_install_inner(
             shortcut_created: integration_report.shortcut_created,
         },
     );
+    diag.ok();
 
+    diag.begin(Step::Enroll);
     check_cancel()?;
     emit(on_event, ProgressEvent::EnrollStarted);
     // FR-101 P1b — the token travels over TLS, as `roomler enroll` sends it:
@@ -245,8 +279,9 @@ async fn run_install_inner(
         crate::proxy::USER_AGENT,
     )
     .await
-    .map_err(|e| format!("enrollment: {e}"))?;
-    let config_path = write_config(&result, None).map_err(|e| format!("write config: {e}"))?;
+    .map_err(|e| failed(enroll_error_code(&e), format!("enrollment: {e}")))?;
+    let config_path = write_config(&result, None)
+        .map_err(|e| failed(ErrorCode::ConfigWrite, format!("write config: {e}")))?;
     emit(
         on_event,
         ProgressEvent::EnrollOk {
@@ -255,9 +290,11 @@ async fn run_install_inner(
             tenant_id: result.tenant_id.clone(),
         },
     );
+    diag.ok();
 
     // --- Step 7: done ----------------------------------------------------
     emit(on_event, ProgressEvent::Done);
+    diag.done();
 
     Ok(DoneReport {
         principal_kind: "tunnel_client".to_string(),
@@ -311,6 +348,9 @@ fn emit(channel: &Channel<ProgressEvent>, event: ProgressEvent) {
 
 fn check_cancel() -> Result<(), String> {
     if crate::CANCEL_REQUESTED.load(Ordering::SeqCst) {
+        // P3b — the step that was about to run (opened just before this
+        // check) ends `cancelled`.
+        Diagnostics::global().cancelled();
         Err("install cancelled by operator".to_string())
     } else {
         Ok(())
