@@ -194,6 +194,11 @@ mod role_reconcile_tests;
 mod role_tests;
 #[cfg(test)]
 mod room_visibility_tests;
+/// FR-102 P9b — the post-session rating's server half: a party stores one
+/// rating with codes only, everyone else is refused with a code, the kill
+/// switch's empty 404, `purge_user`, and the digest's `quality.ratings`.
+#[cfg(test)]
+mod session_feedback_tests;
 #[cfg(test)]
 mod ssh_grant_ack_tests;
 #[cfg(test)]

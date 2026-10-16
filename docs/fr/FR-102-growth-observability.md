@@ -317,6 +317,23 @@ sequenceDiagram
   person, can be dismissed, and never blocks. Stored as `session_feedback {session_id, tenant_id, user_id,
   rating, reasons, ts}` for 25 months and deleted with the user. There is no free text in v1, because free
   text is where personal data hides.
+  *(P9b as built — viewer code, no remote-control data path touched: the 30 s run from the viewer's
+  **request** to the attempt's terminal phase (`closed` / `error`; a reconnect inside the attempt is the
+  same attempt), so a connect given up after 35 s is asked about too — "couldn't connect" is a chip. The
+  prompt is inline in the viewer's ended state, never a dialog, takes no focus, and every gate fails toward
+  not prompting: the server's `features.session_feedback` must have been read as `true`, a session id and
+  a request time must exist, the browser's storage must be able to record the day (private windows get
+  no prompt), and the UTC day is recorded **when the prompt is shown**, so a dismissal counts. The server
+  (`POST /api/tenant/{tid}/session/{sid}/feedback`, `remote`) resolves the session within the org, accepts
+  only its controller or a watcher, refuses a post sooner than 30 s after the request, validates the thumb
+  and the chips against the vocabulary with `deny_unknown_fields` (a comment key fails the parse), stores
+  one per session **per person** (unique `(session_id, user_id)` — the controller and each watcher rate once
+  each; the digest counts answers, not sessions), and answers the empty 404 while
+  `ROOMLER__GROWTH__FEEDBACK=false`.
+  `agent_id` is denormalised from the session row; `SessionFeedbackDao::purge_user` is the seam an account
+  deletion calls (none exists yet; the 25-month TTL bounds the rows). The digest's `quality.ratings` counts
+  thumbs per window and reasons over 28 days, exclusions applied to the org and the person. Detail:
+  [growth-observability.md](../growth-observability.md#the-post-session-rating-p9b).)*
 
 ### 3g. Revenue (P4)
 
@@ -633,7 +650,7 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 | `enroll_token_issued` | `fleet` | `_id = jti`, §3e | 90 days | token issuance, the enroll |
 | `setup_diagnostics` | `fleet` | `{run, step, outcome, elapsed_ms, error_code, os, wizard_version, ts}` | 90 days | the wizard, opt-in |
 | `agents.install` | `fleet` | `{method, scope, run}` | with the agent row | the enroll |
-| `session_feedback` | `remote` | §3f | 25 months; with the user | the viewer |
+| `session_feedback` | `remote` | §3f: `{session_id, tenant_id, user_id, agent_id, rating: up \| down, reasons: [codes], ts}` — unique `(session_id, user_id)` (one per session per person), codes from the fixed vocabulary, no text (P9b) | 25 months (TTL on `ts`); with the user (`SessionFeedbackDao::purge_user`) | the viewer, through `POST …/session/{sid}/feedback` |
 | `subscribers.unsubscribed_via`, `newsletter_sends.delivery` | `saas` | fields on existing collections; P5 adds `subscribers.suppressed_at` / `suppressed_reason` and `newsletter_issues.campaign` / `delivery_events` | as FR-58 | the unsubscribe route, the SendGrid webhook, the fan-out (P5) |
 
 ### 3p. Privacy, retention, and the policy
@@ -677,7 +694,7 @@ hosted only). §7's retention list grows, and `docs/data-model.md`'s stale TTLs 
 | PS3 | §3n PS3 in purestat | a tracker attribute | **live** 2026-10-14 23:02Z: purestat v0.1.9 (gjovanov/purestat#18) — read rate, scroll depth, opt-in link/download events |
 | P7 | §3k: the Search Console, Bing and GitHub pullers, the Content table | no credential ⇒ "not measured" | — |
 | P8 | §3j: the ingest routes, the Channels table, spend | no ingest key ⇒ 404 | **live** 2026-10-15 01:23Z (`hosted-20261015-cb26a2f`): #2237 `a7b56f5df`, AC18 field-verified (§8) — the ingest key, `…/ingest/{posts,snapshots}` (`saas`), `growth_posts` / `growth_post_snapshots`, `GET …/growth/channels`, the Campaigns reach column, the Channels tab. **The pipeline pushes** since 2026-10-15 22:02Z (the promotion repo's `tools/metrics/push.ts`, run by its hourly metrics task): 69 posts and 42 snapshots on the first run (§8). X and LinkedIn posts carry no reach yet: the promotion repo has no collector for either (LinkedIn's API grant is pending; X bills every read) |
-| P9 | §3f: session outcomes, the frozen time-to-first-frame, crashes per version, the session carrier, the rating | `ROOMLER__GROWTH__FEEDBACK=false` hides the prompt; P9a has no switch of its own — it runs under the org-day fold (`growth.enabled`) | **P9a merged** #2305 `955fcee82` (server only; live with the next promote): `growth_quality_daily` frozen nightly from `remote_sessions`, `agent_logs` (FR-22's TTFF before its 7-day horizon, the version a device ran), `agent_crashes` (`agentVersion` — P1d had read `agent_version`, which no production row has, so every crash was `unknown`) and `stats_machine_1d`; `GET …/growth/quality` + `POST …/quality/backfill`; the Quality tab; the digest's and weekly's quality sections. Owed after the promote: the hand count of a closed day (§8). P9b (the rating, AC19) and P9c (the carrier) follow in their own PRs |
+| P9 | §3f: session outcomes, the frozen time-to-first-frame, crashes per version, the session carrier, the rating | `ROOMLER__GROWTH__FEEDBACK=false` hides the prompt; P9a has no switch of its own — it runs under the org-day fold (`growth.enabled`) | **P9a merged** #2305 `955fcee82` (server only; live with the next promote): `growth_quality_daily` frozen nightly from `remote_sessions`, `agent_logs` (FR-22's TTFF before its 7-day horizon, the version a device ran), `agent_crashes` (`agentVersion` — P1d had read `agent_version`, which no production row has, so every crash was `unknown`) and `stats_machine_1d`; `GET …/growth/quality` + `POST …/quality/backfill`; the Quality tab; the digest's and weekly's quality sections. Owed after the promote: the hand count of a closed day (§8). **P9b in PR #2310** (viewer + `remote`): the rating prompt in the viewer's ended state (30 s from the request, once a UTC day per browser, dismissible, no focus, no text), `session_feedback` with its route and index set, `features.session_feedback` on `/api/capabilities`, the digest's `quality.ratings`, the privacy policy's text, AC19 as `ui/e2e/remote-session-rating.spec.ts` (owed: its run in the pod lane, and a real prompt on production). P9c (the carrier) follows in its own PR |
 | P10 | §3l: the read key, the weekly roll-up, alerts | `ROOMLER__GROWTH__ALERTS=false` and `ROOMLER__GROWTH__WEEKLY_ENABLED=false` (the defaults); a read key revoked is a 404 | **live** 2026-10-16 06:11Z (`hosted-20261016-c61bf32`): #2261 `c61bf3243`. Covers the `read` key kind and the gate every growth GET passes, `growth_weekly` and its Monday job, `growth_alerts` and the hourly rules, the Alerts panel and the Weekly tab, and the digest's `alerts` section. AC20 field-verified (§8). Both switches are on for roomler.ai since roomler-ai-deploy#33, in effect from the 10-16 10:17Z roll. **The first scheduled roll-up**, 2026-W41, was computed and mailed once at 10:20:43Z with both pods running (§8). The alert rules run with nothing open. A red→green `digest_missing` has no natural occasion yet and stays owed |
 | PS2, PS4–PS7 | §3n in purestat | per feature | PS2 **live** 2026-10-14 23:02Z (purestat v0.1.9, gjovanov/purestat#17); PS4 + PS5 **live** 23:21Z (v0.1.10, #15, #19); PS6 **live** 2026-10-15: the code in v0.1.9 (#16), switched on by purestat-deploy#12, and given real Google/GitHub client credentials by #13 (production's had been sealed empty since 2026-04-23); a real Google sign-in verified (§8); v0.1.11 2026-10-15: the sidebar's org picker after a direct page load (#20, purestat-deploy#14; red/green §8); PS7 — |
 | P11 | docs: `docs/growth-observability.md`, which also covers the existing `/observability` (no page describes it today); the `docs/data-model.md` TTL fixes; the privacy policy; the `docs/README.md` row | — | — |

@@ -829,6 +829,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/tenant/{tenant_id}/session/{session_id}/feedback",
+      "methods": "POST"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/session/{session_id}/terminate",
       "methods": "POST"
     },
@@ -2206,6 +2210,35 @@
               "purpose": "text",
               "tags": "text"
             }
+          }
+        ]
+      },
+      {
+        "collection": "session_feedback",
+        "indexes": [
+          {
+            "key": {
+              "session_id": 1,
+              "user_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": -1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 64800000
           }
         ]
       },
@@ -4109,6 +4142,35 @@
               "purpose": "text",
               "tags": "text"
             }
+          }
+        ]
+      },
+      {
+        "collection": "session_feedback",
+        "indexes": [
+          {
+            "key": {
+              "session_id": 1,
+              "user_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": -1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 64800000
           }
         ]
       },

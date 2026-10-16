@@ -124,7 +124,7 @@ this server, not reachable, or not built yet is `{"not_measured": "<reason>",
 | `campaigns` | per `(source, medium, campaign)`: visitors, pageviews, the four goals (`signup`, `subscribe`, `install-copy`, `github-outbound`), joined in code with the server's own sign-ups by the same normalised key | purestat + `users` | with a key |
 | `newsletter` | new, confirmed and unsubscribed subscribers (and how many left through an issue's link), by source; each issue sent that day with its ledger counts, its delivery so far and its unsubscribes; the window's delivered, bounced, dropped, spam reports and suppressed addresses — [the newsletter](#the-newsletter-delivery-per-issue-tags-and-unsubscribes-p5) | `subscribers`, `newsletter_issues`, `newsletter_sends` | P1d; delivery P5 (`not_measured` without the webhook key) |
 | `revenue` | orgs by plan × subscription status; the list-price MRR, **labelled `estimate: true`** (the same formula as the cost view, `routes/cost.rs::mrr_estimate_cents`) | `tenants`, `tenant_members` | P1d; billed P4 |
-| `quality` | sessions **requested** → reached Active / never reached it (a share from n = 30), the ended ones by `end_reason` classed hang-up · refusal · failure; duration, peak frame rate and RTT as `{n, p50, p90}` per window; FR-22's **time to first frame** p50/p90 — the day exact, 7d/28d estimated from the frozen daily histograms, `not_measured` until the day is frozen; agent crashes by the version the payload named, device-days and crashes per 100 device-days (from 30); the day **by agent version** — [remote-desktop quality](#remote-desktop-quality-from-what-is-recorded-p9a) | `remote_sessions`, `agent_crashes`, `stats_machine_1d`, `growth_quality_daily` | P1d; TTFF, rates and versions P9a |
+| `quality` | sessions **requested** → reached Active / never reached it (a share from n = 30), the ended ones by `end_reason` classed hang-up · refusal · failure; duration, peak frame rate and RTT as `{n, p50, p90}` per window; FR-22's **time to first frame** p50/p90 — the day exact, 7d/28d estimated from the frozen daily histograms, `not_measured` until the day is frozen; agent crashes by the version the payload named, device-days and crashes per 100 device-days (from 30); the day **by agent version** — [remote-desktop quality](#remote-desktop-quality-from-what-is-recorded-p9a); the viewer's **ratings** (`up` · `down` · `rated` per window, `up_share_28d` from 30 answers, `reasons_28d`), `not_measured` while the prompt is off — [the post-session rating](#the-post-session-rating-p9b) | `remote_sessions`, `agent_crashes`, `stats_machine_1d`, `growth_quality_daily`, `session_feedback` | P1d; TTFF, rates and versions P9a; ratings P9b |
 | `install` | tokens issued → redeemed; fetches by `(asset, client class, OS)`; enrollments by `(method, OS)`; the wizard's steps — runs reaching each, their outcomes and the failures by code, **opted-in runs only, labelled with their n** — [the install trace](#the-install-trace-p3), [the wizard's diagnostics](#the-wizards-opt-in-diagnostics-p3b) | `enroll_token_issued`, `growth_daily`, `agents.install`, `setup_diagnostics` | P3; wizard steps P3b (`not_measured` while `growth.setup_diagnostics` is off) |
 | `social` | posts published per platform `{day, d7, d28}`; the snapshots taken that day (at most 20), each with its post's campaign and the platform's own metric names — `not_measured` when nothing was pushed in 28 days | `growth_posts`, `growth_post_snapshots` | P8 |
 | `search` | — | — | P7 |
@@ -1493,6 +1493,87 @@ records the two agree to the sample; for a tiny day read the sorted `ttff_ms` li
 Fail-first: on the build before P9a the collection does not exist and the digest's `quality`
 has no `ttff`; the digest's `crashes.by_agent_version` reads `unknown` for every crash.
 
+## The post-session rating (P9b)
+
+Asked, not inferred (spec §3f, D10: "a thumbs rating after a session now; NPS later"). After a
+remote session of 30 s or more the viewer offers a thumbs up or down with optional reason chips
+— *lag*, *picture*, *mouse or keyboard*, *couldn't connect*, *something else* — at most once a
+day per person, dismissible, never blocking, never a dialog, no text field. It is **viewer
+code** held to the repo's §3 bar, and every rule in it fails toward **not prompting**: the prompt
+is a courtesy, the session is not.
+
+```mermaid
+sequenceDiagram
+    participant P as Person
+    participant V as the viewer (RemoteControl.vue)
+    participant S as the server (remote module)
+    V->>S: GET /api/capabilities (once per page load)
+    S-->>V: features.session_feedback = true | false
+    P->>V: Connect (phase requesting — the attempt's clock starts)
+    Note over V: rc:session.created → the session id is kept
+    P->>V: Disconnect, or the session ends (phase closed | error)
+    Note over V: ≥ 30 s since the request? feature true? storage can keep the day?<br/>not yet prompted this UTC day? — else nothing
+    V->>V: record today as prompted, then show the strip inline in the ended state
+    alt dismiss, or Connect again
+        V->>V: the strip goes; nothing is posted
+    else thumb (+ chips) + Send
+        V->>S: POST /api/tenant/{tid}/session/{sid}/feedback {rating, reasons}
+        S-->>V: 201 (stored) · 409 already_rated | too_early · 422 code · 403 · 404
+        V->>V: "Thanks — noted." either way
+    end
+```
+
+### The rules
+
+| Rule | As built ([`rcSessionRating.ts`](../ui/src/composables/rcSessionRating.ts), each a pure function with a Vitest) |
+|---|---|
+| **30 s** | measured from the viewer's **request** (`connect()` set phase `requesting`) to the attempt's terminal transition (`closed` or `error`); a reconnect inside the attempt keeps the original start. A connect that stalled for 35 s and was given up is asked about too — "couldn't connect" is a chip. The server refuses a post sooner than 30 s after the session was requested (`too_early`), so a bypassing client gets the same floor |
+| **Once a day** | the UTC day of the **prompt**, recorded in `localStorage` **when it is shown** — a dismissed prompt counts, so nobody is asked twice because they said no. Per browser: the same person on a second browser may be asked there; the server keeps one rating per session regardless |
+| **Fail toward not prompting** | no `features.session_feedback: true` read from `/api/capabilities` (the capabilities store's `feature()` fails **closed**: before the answer, after a failed request, on an older server, for a name never sent), no session id (a `requesting` stall), no request time, a storage that throws (a private window) or cannot record the day — each is a silent no |
+| **Never blocks, never steals focus** | the strip is inline in the viewer's ended state (`SessionRatingPrompt.vue`), beside the Connect button, which works as before; not a dialog, no `autofocus`, nothing captured; a new Connect withdraws it without posting. The Playwright spec asserts no element of the prompt holds the focus when it appears |
+| **No free text** | a thumb and chips from a fixed vocabulary; the request type is `deny_unknown_fields`, so a `comment` key fails the parse on the server; reasons are deduplicated in vocabulary order |
+| **Who may rate** | the session's controller or a watcher, within the path's org (a foreign session is a 404 that leaks nothing; a member who was not in the session is a 403); `user_id` comes from the request, `agent_id` from the session row — never from the body |
+| **One per session per person** | a rating is one person's experience — the controller and a watcher of the same session may have sat on different networks — so the unique index is `(session_id, user_id)`: two posts by one person (a double click, two tabs) store one and the other answers `already_rated`, while each party rates once. The digest counts **answers**, not sessions: a session with two parties can carry two |
+| **One prompt at a time** | the viewer mounts the strip in the closed ending and in the error ending, two branches of one `v-if` chain; `rcRatingMount.spec.ts` parses the template and proves it, and the Playwright spec counts exactly one live |
+
+### The route and the row
+
+| Method | Path | Credential | Answers |
+|---|---|---|---|
+| POST | `/api/tenant/{tenant_id}/session/{session_id}/feedback` `{rating: up \| down, reasons: [codes]}` (≤ 1 KiB) | session, a party to the session | 201 `{session_id, rating, reasons, ts}` · 403 `not_a_member` / `forbidden` · 404 (not this org's session) · 409 `too_early` / `already_rated` (this person, this session) · 422 `invalid_json` / `unknown_rating` / `unknown_reason` / `too_many_reasons` (a code, never the value, nothing stored) · 413 · the **empty 404** of an absent path while `ROOMLER__GROWTH__FEEDBACK=false` |
+
+`session_feedback` (the `remote` module's; `crates/modules/remote/src/routes.rs`,
+`crates/services/src/dao/session_feedback.rs`): `{session_id, tenant_id, user_id, agent_id,
+rating, reasons, ts}`, unique `(session_id, user_id)`, `(tenant_id, ts)`, `(user_id)`,
+**25-month TTL** on `ts`. `SessionFeedbackDao::purge_user` takes one person's answers and nobody else's — the seam
+an account deletion calls; no account hard-delete path exists today, so the TTL is what bounds
+the rows for now. A self-hosted server keeps its own rows and sends none anywhere.
+
+**The kill switch** `ROOMLER__GROWTH__FEEDBACK=false` (default on, for `install_counters`'s
+reason — no mail, no outside party, a person chooses to answer): the viewer never offers the
+prompt (`/api/capabilities` → `features.session_feedback: false`), the route answers the empty
+404 of a path that does not exist, and the digest's `quality.ratings` reads "off on this
+server" — never a zero, since nobody could answer.
+
+**Where the answers show**: the daily digest's `quality.ratings` — `up`, `down`, `rated` as
+`{day, d7, d28}` (answers, not sessions), `up_share_28d` only from 30 answers, `reasons_28d`
+most often first — with the exclusion set applied to the org **and** to the person (a platform
+admin's own thumbs are not the product's); a digest stored before P9b reads it as "arrives with
+P9b". The privacy policy's
+§2.15 says what is asked, what is stored and for how long; §7 lists the retention.
+
+### Field verification (owed after the promote)
+
+AC19 is `ui/e2e/remote-session-rating.spec.ts`, run in the pod lane against the agent-e2e
+harness with every purestat request aborted: a short session shows no prompt; a long one shows
+it, and dismissing it posts nothing and leaves the URL and the Connect button as they were; a
+second long one the same day shows none; a fresh context shows it again, and thumbs down + a chip
++ Send posts exactly one `201`. On production, from the operator's own foreground session: a
+session over 30 s, the strip in the ended state with nothing focused, the row in
+`session_feedback` with codes only, and the next digest's `quality.ratings` counting it.
+Fail-first: on the build before P9b `/api/capabilities` has no `features`, the route is a 404 for
+everyone, and the viewer has no strip.
+
 ## The `/observability` page as a whole
 
 | Tab / surface | What it shows | Route family |
@@ -1502,7 +1583,7 @@ has no `ttff`; the digest's `crashes.by_agent_version` reads `unknown` for every
 | Orgs, machines, calls, users | platform-wide inventories and series | `/api/admin/stats/{orgs,machines,calls,users}` |
 | Usage | per-user minutes and bytes across every org | `/api/admin/stats/usage*` |
 | Attribution (FR-88) | sign-ups by campaign key and how many activated | `/api/admin/stats/attribution` |
-| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), the Channels table with the machine keys (P8, P10), the Newsletter tab (P5), the Revenue tab (P4), the Quality tab (P9a), the Weekly tab and the Alerts panel (P10) | `/api/admin/growth/*` |
+| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), the Channels table with the machine keys (P8, P10), the Newsletter tab (P5), the Revenue tab (P4), the Quality tab (P9a), the Weekly tab and the Alerts panel (P10); the digest's `quality.ratings` from the viewer's post-session prompt (P9b) | `/api/admin/growth/*` |
 
 ## Field verification
 
@@ -1521,6 +1602,7 @@ FR's field-verification log ([FR-102 §8](fr/FR-102-growth-observability.md#8-fi
 | The weekly roll-up is stored and mailed once for the first Monday after `ROOMLER__GROWTH__WEEKLY_ENABLED=true`, with both pods running, and its headline sign-ups equal a hand count for the week | owed | `crates/tests/src/growth_p10_tests.rs` — two concurrent runs → one mail; a `sent` week never re-sent; a preview never cancels the scheduled mail; a manual send racing the scheduler mails once; the routes |
 | An alert fires once, mails once and clears: `digest_missing` on a day the digest is held back (red), cleared once it runs (green), with `ROOMLER__GROWTH__ALERTS=true` | owed | `crates/tests/src/growth_p10_tests.rs` — each evaluable rule fires once, a second evaluation adds nothing, the clear, a re-fire the same day mails nothing, the digest's `alerts` section |
 | For a closed day, the frozen `*` row and the Quality tab equal the hand counts of [remote-desktop quality](#field-verification-owed-after-the-promote): sessions requested by outcome from `remote_sessions`, TTFF p50/p90 from the FR-22 filter over `agent_logs`, crashes by `agentVersion`, device-days from `stats_machine_1d`; the digest's `crashes.by_agent_version` names real versions where it read `unknown` before (P9a) | owed after the promote | `crates/tests/src/growth_quality_tests.rs` — the freeze from the four sources as they are really written (the camelCase crash payload, the browser record, the agents' batches), the version from the logs before the row, both scopes, idempotency, a day past the log horizon frozen without TTFF; the view, the backfill, the digest's and the weekly's sections |
+| The rating prompt appears at most once per user per day and never after a session shorter than 30 s, and dismissing it changes nothing else in the viewer (AC19, P9b); a rating posts once and the next digest counts it | owed: the Playwright spec's run in the pod lane, then a real prompt on production | `ui/e2e/remote-session-rating.spec.ts` (the four sessions, exactly one prompt element); `ui/src/__tests__/components/rcRatingMount.spec.ts` — the two mounts are branches of one `v-if` chain; `ui/src/__tests__/composables/rcSessionRating.spec.ts` — every gate, the 30 s from the request, the UTC day, a storage that cannot keep it; `crates/tests/src/session_feedback_tests.rs` — a party stores once with codes only, the controller and a watcher each once, everyone else refused with a code, the kill switch's empty 404, `purge_user`, the digest's `quality.ratings` |
 
 The newsletter's webhook is to be shown on production to refuse a bad signature (control),
 and to record `delivered` and `bounce` for a test send with one forced bounce, the bounced

@@ -14,6 +14,10 @@ export interface ServerCapabilities {
   compiled?: string[]
   /** Switched off by config; a subset of `compiled`. */
   switched_off?: string[]
+  /** FR-102 P9b — server-wide switches a client must read before offering
+   *  something (`session_feedback`: the post-session rating). Absent on an
+   *  older server. */
+  features?: Record<string, unknown>
 }
 
 /**
@@ -35,6 +39,8 @@ export const useCapabilitiesStore = defineStore('capabilities', () => {
   const version = ref<string | null>(null)
   const loaded = ref(false)
   const failed = ref(false)
+  /** FR-102 P9b — the server's feature switches, only the booleans it sent. */
+  const features = ref<Record<string, boolean>>({})
 
   let inflight: Promise<void> | null = null
 
@@ -43,8 +49,23 @@ export const useCapabilitiesStore = defineStore('capabilities', () => {
     compiled.value = caps.compiled ? caps.compiled.filter(isModuleId) : null
     switchedOff.value = (caps.switched_off ?? []).filter(isModuleId)
     version.value = caps.version ?? null
+    const f: Record<string, boolean> = {}
+    for (const [k, v] of Object.entries(caps.features ?? {})) if (typeof v === 'boolean') f[k] = v
+    features.value = f
     loaded.value = true
     failed.value = false
+  }
+
+  /**
+   * FR-102 P9b — is a server feature on? The opposite rule to `has`: a
+   * feature fails **CLOSED** — before the answer, after a failed request, on
+   * an older server that sends no `features`, and for a name it never sent,
+   * the answer is `false`. A feature is something the client OFFERS (the
+   * rating prompt), and offering what the server refuses is the worse
+   * mistake.
+   */
+  function feature(name: string): boolean {
+    return features.value[name] === true
   }
 
   /** Fetch once; concurrent callers share the request. Never throws. */
@@ -93,6 +114,7 @@ export const useCapabilitiesStore = defineStore('capabilities', () => {
     switchedOff: [...switchedOff.value],
     version: version.value,
     failed: failed.value,
+    features: { ...features.value },
   }))
 
   /** Test seam / logout reset. */
@@ -101,10 +123,26 @@ export const useCapabilitiesStore = defineStore('capabilities', () => {
     compiled.value = null
     switchedOff.value = []
     version.value = null
+    features.value = {}
     loaded.value = false
     failed.value = false
     inflight = null
   }
 
-  return { modules, compiled, switchedOff, version, loaded, failed, summary, load, ready, has, apply, reset }
+  return {
+    modules,
+    compiled,
+    switchedOff,
+    version,
+    features,
+    loaded,
+    failed,
+    summary,
+    load,
+    ready,
+    has,
+    feature,
+    apply,
+    reset,
+  }
 })

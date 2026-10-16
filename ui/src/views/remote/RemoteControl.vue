@@ -838,6 +838,18 @@
             Click <strong>Connect</strong> to start a remote-control session.
           </p>
         </template>
+        <!-- FR-102 P9b — after a session of 30 s or more, at most once a day:
+             a thumb and optional reason chips, dismissible, never a dialog.
+             Mounted here and in the error ending below — two branches of this
+             one v-if chain, so at most one ever renders (locked by
+             `rcRatingMount.spec.ts`). -->
+        <session-rating-prompt
+          v-if="ratingPending"
+          :status="ratingStatus"
+          class="mt-3"
+          @submit="submitRating"
+          @dismiss="dismissRating"
+        />
         <p v-if="agent && !agent.is_online" class="text-caption text-medium-emphasis">
           This agent is currently offline. The session will fail until the agent
           reconnects.
@@ -934,6 +946,16 @@
         <p v-if="rc.error.value" class="text-caption text-medium-emphasis">
           {{ rc.error.value }}
         </p>
+        <!-- FR-102 P9b — a failed attempt of 30 s or more is worth asking
+             about too ("couldn't connect" is a chip). The other branch of the
+             chain above; never both. -->
+        <session-rating-prompt
+          v-if="ratingPending"
+          :status="ratingStatus"
+          class="mt-3"
+          @submit="submitRating"
+          @dismiss="dismissRating"
+        />
         <v-btn
           color="primary"
           variant="flat"
@@ -2036,6 +2058,20 @@ import type { KeepBusyPattern } from '@/composables/keepBusy'
 import { displayMatchSummary } from '@/composables/displayMatch'
 import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 import { asSentence } from '@/utils/sentence'
+import { useCapabilitiesStore } from '@/stores/capabilities'
+import { api } from '@/api/client'
+import SessionRatingPrompt from '@/components/remote/SessionRatingPrompt.vue'
+import {
+  createRatingTracker,
+  markPrompted,
+  ratingPath,
+  readLastPromptDay,
+  shouldOfferRating,
+  storageOrNull,
+  utcDay,
+  type Rating,
+  type RatingReason,
+} from '@/composables/rcSessionRating'
 
 const route = useRoute()
 const tenantId = computed(() => route.params.tenantId as string)
@@ -4213,6 +4249,59 @@ watch(
     if (p === 'reconnecting' || p === 'error') void refreshAgentStatus()
   },
 )
+
+// FR-102 P9b — the post-session rating. The tracker follows the attempt
+// (request → terminal phase); every gate in `shouldOfferRating` fails toward
+// not prompting; the day is recorded when the prompt is SHOWN, so a dismissal
+// counts; a new Connect withdraws the prompt without posting anything. The
+// server is the authority on who may rate what (a party, once per session,
+// not before 30 s) — this only decides whether to ask.
+const capabilitiesStore = useCapabilitiesStore()
+const ratingTracker = createRatingTracker()
+const ratingPending = ref<{ tenantId: string; sessionId: string } | null>(null)
+const ratingStatus = ref<'ask' | 'sent'>('ask')
+watch(
+  () => rc.sessionId.value,
+  (id) => ratingTracker.onSession(id),
+)
+watch(
+  () => rc.phase.value,
+  (next, prev) => {
+    if (next === 'requesting') ratingPending.value = null
+    const ended = ratingTracker.onPhase(prev, next)
+    if (!ended || !ended.sessionId) return
+    const storage = storageOrNull()
+    const nowMs = Date.now()
+    const offer = shouldOfferRating({
+      enabled: capabilitiesStore.feature('session_feedback'),
+      sessionId: ended.sessionId,
+      requestedAtMs: ended.requestedAtMs,
+      endedAtMs: nowMs,
+      lastPromptDay: readLastPromptDay(storage),
+      storageUsable: storage !== null,
+    })
+    if (!offer) return
+    // The day could not be recorded → "once a day" could not be kept → no prompt.
+    if (!markPrompted(storage, utcDay(nowMs))) return
+    ratingStatus.value = 'ask'
+    ratingPending.value = { tenantId: tenantId.value, sessionId: ended.sessionId }
+  },
+)
+async function submitRating(rating: Rating, reasons: RatingReason[]) {
+  const p = ratingPending.value
+  if (!p) return
+  ratingStatus.value = 'sent'
+  try {
+    await api.post(ratingPath(p.tenantId, p.sessionId), { rating, reasons })
+  } catch (e) {
+    // A refusal (already rated, the switch off) or a blip: the thanks line
+    // stays, nothing else happens. The server has what it accepts.
+    console.warn('[rc] session rating not stored', e)
+  }
+}
+function dismissRating() {
+  ratingPending.value = null
+}
 
 function startSession() {
   if (!agent.value) return

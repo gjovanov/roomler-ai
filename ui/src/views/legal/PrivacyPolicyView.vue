@@ -204,6 +204,16 @@
             server you enroll into: a self-hosted server receives its own and sends nothing to us. We use them
             to see where installs stop, and keep them for 90 days; after that only daily counts remain.
           </p>
+          <p class="text-body-1 legal-muted mb-4">
+            After a remote-desktop session of thirty seconds or more, the viewer may ask how it went: a thumbs
+            up or down and, if you like, one or more reasons from a fixed list (lag, picture, mouse or
+            keyboard, couldn't connect, something else). It asks <strong>at most once a day</strong>, you can
+            dismiss it, and there is no text field. If you answer, the server you are signed in to stores the
+            rating with that session's identifier, the workspace, your account identifier and the time, for
+            25 months; it is deleted with your account, and we read it only as counts — how many sessions
+            were rated well or badly, and which reasons were given. A self-hosted server keeps its own
+            ratings and sends none to us, and its administrator can switch the question off entirely.
+          </p>
 
           <h3 class="text-h6 font-weight-bold mb-2">2.16 How You Found Us</h3>
           <p class="text-body-1 legal-muted mb-4">
@@ -343,6 +353,7 @@
             <li class="mb-1">The record of which issues were sent to an address — with the delivery status our email provider reported (delivered, bounced, dropped, reported as spam) and, if you unsubscribed through an issue's link, which issue — is kept with that subscription record and erased with it on request.</li>
             <li class="mb-1">A workspace's billing events (what Stripe reported about its subscription and invoices) and its daily count of plan-limit hits are kept for as long as the workspace exists and deleted with it; monthly revenue totals, which name no workspace, are kept.</li>
             <li class="mb-1">Setup diagnostics the wizard sent with your consent (2.15) are deleted automatically <strong>90 days</strong> after they are written; the daily counts derived from them name no one and are kept.</li>
+            <li class="mb-1">A rating you give a remote-desktop session from the viewer (2.15) is kept for <strong>25 months</strong> and deleted with your account.</li>
           </ul>
           <p class="text-body-1 legal-muted">
             These deletions are enforced by the database itself rather than by a manual process. When you delete
