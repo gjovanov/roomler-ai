@@ -52,20 +52,85 @@ use anyhow::{Context, Result, anyhow};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
-    AtomEnum, ChangeGCAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, Gcontext,
-    PropMode, Rectangle, Window, WindowClass,
+    AtomEnum, ChangeGCAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, Drawable, EventMask,
+    Gcontext, ImageFormat, PropMode, Rectangle, Window, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as _;
 
 use super::{ConsentSender, PromptView};
 
 /// Panel geometry, in pixels. X11 core fonts are bitmap and DPI-naive, so
-/// these are literal — matching how `indicator/win.rs` already works.
+/// these are literal — matching how `indicator/win.rs` already works — and
+/// the whole panel is scaled up as a picture on a HiDPI desktop ([`scale`]).
 const W: u16 = 480;
 const H: u16 = 236;
 const PAD: i16 = 14;
 const BTN_W: i16 = 108;
 const BTN_H: i16 = 30;
+
+/// FR-93 P6i — the panel's integer scale for an X display, from the
+/// `RESOURCE_MANAGER` resources the desktop publishes for X11 clients:
+/// `Xft.dpi` over 96, rounded, between 1 and 4; 1 when it is not set.
+///
+/// ⚠️ On a scaled Wayland desktop, Xwayland's root is in DEVICE pixels and an
+/// X11 client is expected to scale itself (KDE's default, and GNOME at an
+/// integer scale): drawn at 1×, this panel came out at about 9-px text on a
+/// 4K desktop at KDE's 2.7× (`Xft.dpi` 259), legible only up close. Rounded,
+/// not floored: 2.7 draws at 3, a little large rather than a third too small.
+fn scale(resources: &str) -> u16 {
+    let dpi = resources.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == "Xft.dpi")
+            .then(|| value.trim().parse::<f32>().ok())
+            .flatten()
+    });
+    match dpi {
+        Some(d) if d.is_finite() && d > 0.0 => ((d / 96.0).round() as u16).clamp(1, 4),
+        _ => 1,
+    }
+}
+
+/// The scale this display asks for. `ROOMLERD_CONSENT_PANEL_SCALE` overrides
+/// it (1 to 4); `1` is the kill switch, the panel as before P6i.
+fn display_scale<C: Connection>(conn: &C, root: Window) -> u16 {
+    if let Some(k) =
+        tunnel_core::env::node_env("CONSENT_PANEL_SCALE").and_then(|v| v.trim().parse::<u16>().ok())
+    {
+        return k.clamp(1, 4);
+    }
+    conn.get_property(
+        false,
+        root,
+        AtomEnum::RESOURCE_MANAGER,
+        AtomEnum::STRING,
+        0,
+        1 << 16,
+    )
+    .ok()
+    .and_then(|c| c.reply().ok())
+    .map_or(1, |r| scale(&String::from_utf8_lossy(&r.value)))
+}
+
+/// Nearest-neighbour `k`× of a 32-bit ZPixmap image `w` pixels wide with
+/// rows `stride` bytes apart: crisp edges, every pixel a `k`×`k` block.
+fn upscale(src: &[u8], w: usize, h: usize, stride: usize, k: usize) -> Vec<u8> {
+    let out_row = w * k * 4;
+    let mut out = vec![0u8; out_row * h * k];
+    for y in 0..h {
+        let row = &src[y * stride..y * stride + w * 4];
+        let dst_row = &mut out[y * k * out_row..(y * k + 1) * out_row];
+        for (x, px) in row.chunks_exact(4).enumerate() {
+            for i in 0..k {
+                dst_row[(x * k + i) * 4..(x * k + i) * 4 + 4].copy_from_slice(px);
+            }
+        }
+        for r in 1..k {
+            let (done, rest) = out.split_at_mut((y * k + r) * out_row);
+            rest[..out_row].copy_from_slice(&done[y * k * out_row..(y * k + 1) * out_row]);
+        }
+    }
+    out
+}
 
 // 0xRRGGBB, the X pixel format for a TrueColor visual.
 const BG: u32 = 0x001E1E1E;
@@ -220,20 +285,24 @@ fn run<C: Connection + Send + 'static>(
 ) -> Result<()> {
     let screen = &conn.setup().roots[screen_num];
     let win: Window = conn.generate_id()?;
+    // FR-93 P6i — the panel at the desktop's scale: the same 1× drawing,
+    // shown k× (see `scale`).
+    let k = display_scale(&conn, screen.root);
+    let depth = screen.root_depth;
 
     // `override_redirect` keeps the window manager out of it entirely: no
     // decorations, no reparenting, no placement policy. That is what makes it
     // behave like an overlay rather than an app window — and on a bare X
     // session with no WM running at all, it is the only thing that works.
-    let x = ((screen.width_in_pixels as i32 - W as i32) / 2) as i16;
+    let x = ((screen.width_in_pixels as i32 - (W * k) as i32) / 2) as i16;
     conn.create_window(
         x11rb::COPY_DEPTH_FROM_PARENT,
         win,
         screen.root,
         x,
-        48,
-        W,
-        H,
+        (48 * k) as i16,
+        W * k,
+        H * k,
         0,
         WindowClass::INPUT_OUTPUT,
         screen.root_visual,
@@ -281,6 +350,21 @@ fn run<C: Connection + Send + 'static>(
             .background(BG)
             .font(font),
     )?;
+    // FR-93 P6i — scaled, the panel is drawn at 1× into this canvas and
+    // copied up onto the window; at 1× it is drawn on the window directly.
+    let canvas = if k > 1 {
+        let pm = conn.generate_id()?;
+        conn.create_pixmap(depth, pm, win, W, H)?;
+        Some(pm)
+    } else {
+        None
+    };
+    if k > 1 {
+        tracing::info!(
+            scale = k,
+            "x11 consent panel scaled for a HiDPI desktop (FR-93 P6i)"
+        );
+    }
     conn.flush()?;
 
     let mut mapped = false;
@@ -293,9 +377,12 @@ fn run<C: Connection + Send + 'static>(
                     last_secs = u64::MAX; // force a repaint below
                 }
                 Event::ButtonRelease(e) => {
-                    let allow = if hit(approve_rect(), e.event_x, e.event_y) {
+                    // The buttons are laid out at 1×; a scaled panel's click
+                    // is mapped back there.
+                    let (ex, ey) = (e.event_x / k as i16, e.event_y / k as i16);
+                    let allow = if hit(approve_rect(), ex, ey) {
                         true
-                    } else if hit(deny_rect(), e.event_x, e.event_y) {
+                    } else if hit(deny_rect(), ex, ey) {
                         false
                     } else {
                         continue;
@@ -360,7 +447,10 @@ fn run<C: Connection + Send + 'static>(
             // 8 fps to show the same number is flicker for nothing.
             if secs != last_secs || dirty {
                 last_secs = secs;
-                paint(&conn, win, gc, v, secs)?;
+                paint(&conn, canvas.unwrap_or(win), gc, v, secs)?;
+                if let Some(pm) = canvas {
+                    blit(&conn, pm, win, gc, k, depth)?;
+                }
                 conn.flush()?;
             }
         }
@@ -397,9 +487,53 @@ fn open_font<C: Connection>(conn: &C) -> Result<x11rb::protocol::xproto::Font> {
     Err(anyhow!("no usable X core font (not even `fixed`)"))
 }
 
+/// FR-93 P6i — the 1× canvas, `k`× onto the window: read back as a 32-bit
+/// ZPixmap, scaled up, and written in requests the server will take (a 4K
+/// desktop's 3× panel is ~4 MB, past a server's default request size).
+fn blit<C: Connection>(
+    conn: &C,
+    canvas: Drawable,
+    win: Window,
+    gc: Gcontext,
+    k: u16,
+    depth: u8,
+) -> Result<()> {
+    let img = conn
+        .get_image(ImageFormat::Z_PIXMAP, canvas, 0, 0, W, H, !0)?
+        .reply()?;
+    let (w, h, k) = (W as usize, H as usize, k as usize);
+    let stride = img.data.len() / h;
+    if stride < w * 4 {
+        return Err(anyhow!(
+            "the panel's canvas is not a 32-bit image ({stride} bytes a row for {w} pixels)"
+        ));
+    }
+    let big = upscale(&img.data, w, h, stride, k);
+    let row = w * k * 4;
+    let rows_per = (conn.maximum_request_bytes().saturating_sub(64) / row).max(1);
+    let mut y = 0;
+    while y < h * k {
+        let n = rows_per.min(h * k - y);
+        conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            win,
+            gc,
+            (w * k) as u16,
+            n as u16,
+            0,
+            y as i16,
+            0,
+            depth,
+            &big[y * row..(y + n) * row],
+        )?;
+        y += n;
+    }
+    Ok(())
+}
+
 fn paint<C: Connection>(
     conn: &C,
-    win: Window,
+    win: Drawable,
     gc: Gcontext,
     v: &PromptView,
     secs: u64,
@@ -478,6 +612,41 @@ fn paint<C: Connection>(
 #[cfg(test)]
 mod tests {
     use super::display_is_our_own_virtual_desktop;
+
+    /// FR-93 P6i — the scale comes from `Xft.dpi`, rounded, between 1 and 4,
+    /// and from that exact key only.
+    #[test]
+    fn the_panel_scales_with_xft_dpi() {
+        use super::scale;
+        assert_eq!(scale(""), 1, "no resources: 1x");
+        assert_eq!(scale("Xft.antialias:\t1\nXft.dpi:\t96\n"), 1);
+        assert_eq!(
+            scale("Xcursor.size:\t64\nXft.dpi:\t192\n"),
+            2,
+            "GNOME at 2x"
+        );
+        assert_eq!(
+            scale("Xft.dpi:\t259\nXft.hinting:\t1\n"),
+            3,
+            "KDE at 2.7x: rounded, not floored"
+        );
+        assert_eq!(scale("Xft.dpi: 120"), 1, "1.25x stays at 1");
+        assert_eq!(scale("Xft.dpi:\t1000"), 4, "capped");
+        assert_eq!(scale("Xft.dpi:\tnonsense"), 1);
+        assert_eq!(scale("Xft.dpi.extra:\t300"), 1, "only the exact key");
+    }
+
+    /// Nearest-neighbour: every pixel becomes a k×k block, and a padded
+    /// source row's padding is not copied.
+    #[test]
+    fn the_upscale_makes_each_pixel_a_block() {
+        use super::upscale;
+        // 2×1, a 12-byte stride: pixels A and B, then 4 bytes of padding.
+        let src = [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0];
+        let (a, b) = ([1u8, 2, 3, 4], [5u8, 6, 7, 8]);
+        let row: Vec<u8> = [a, a, b, b].concat();
+        assert_eq!(upscale(&src, 2, 1, 12, 2), [row.clone(), row].concat());
+    }
 
     /// FR-93 P6a — against a REAL X server (the Xvfb lane sets
     /// `ROOMLERD_TEST_X11=1`, which makes a missing server a failure): a
