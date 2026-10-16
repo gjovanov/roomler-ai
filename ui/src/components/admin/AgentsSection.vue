@@ -386,6 +386,20 @@
             >
               {{ credentialChip(agentFor(item)!.token_expires_at)!.text }}
             </v-chip>
+            <!-- FR-106 — only when an online device has not installed a
+                 release that has been out for a day. -->
+            <v-chip
+              v-if="item.kind === 'agent' && agentFor(item) && stallChip(agentFor(item)!)"
+              size="x-small"
+              variant="tonal"
+              class="mt-1"
+              prepend-icon="mdi-update"
+              :color="stallChip(agentFor(item)!)!.color"
+              :title="stallChip(agentFor(item)!)!.tooltip"
+              data-testid="agent-update-stall-chip"
+            >
+              {{ stallChip(agentFor(item)!)!.text }}
+            </v-chip>
             <v-chip
               v-if="item.kind === 'agent' && agentFor(item) && remoteConfigChip(agentFor(item)!)"
               size="x-small"
@@ -744,6 +758,18 @@
                 variant="tonal"
               >
                 v{{ a.agent_version }}
+              </v-chip>
+              <!-- FR-106 — the same chip as the table view's. -->
+              <v-chip
+                v-if="stallChip(a)"
+                size="x-small"
+                variant="tonal"
+                prepend-icon="mdi-update"
+                :color="stallChip(a)!.color"
+                :title="stallChip(a)!.tooltip"
+                data-testid="agent-update-stall-chip"
+              >
+                {{ stallChip(a)!.text }}
               </v-chip>
               <!-- FR-27 — same rule as the grid caption: only when the
                    companion disagrees with the daemon. Warning-coloured
@@ -1593,6 +1619,7 @@ import {
 import { codecChips, permissionWarnings } from './agentCodecChips'
 import { keepBusyBriefTitle } from '@/composables/keepBusy'
 import { credentialChip } from '@/utils/credentialExpiry'
+import { updateStallChip } from '@/utils/updateStall'
 import AgentCrashesDialog from './AgentCrashesDialog.vue'
 import AgentLogsDialog from './AgentLogsDialog.vue'
 import DeviceConsoleDialog from './DeviceConsoleDialog.vue'
@@ -1754,6 +1781,13 @@ const agentById = computed(() => {
 })
 function agentFor(row: DeviceRow): Agent | undefined {
   return row.kind === 'agent' ? agentById.value.get(row.id) : undefined
+}
+
+/** FR-106 — the "not updating" chip for a device, or `null`. Online is the
+ *  reachability truth the presence column renders (`is_online`, patched live
+ *  by `applyPresence`). */
+function stallChip(a: Agent) {
+  return updateStallChip(a.agent_version, a.is_online, a.os, agentStore.releases)
 }
 
 /** FR-27 — the companion version to display, or `''` when there is nothing
@@ -2800,6 +2834,8 @@ onMounted(() => {
   agentStore.fetchAgents(props.tenantId)
   agentStore.fetchTenantMembers(props.tenantId)
   loadNetworkStores(props.tenantId)
+  // FR-106 — the release list the "not updating" chip reads (cached 30 min).
+  agentStore.fetchReleases()
 })
 
 watch(() => props.tenantId, (tid) => {
