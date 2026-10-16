@@ -940,11 +940,36 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
         )),
         Measured::NotMeasured(n) => out.push(Line("By agent version".into(), not_measured(n))),
     }
+    // P9b — what people answered the post-session prompt.
+    match &s.quality.ratings {
+        Measured::Value(r) => {
+            out.push(Line("Session ratings: thumbs up".into(), fig(&r.up)));
+            out.push(Line("Session ratings: thumbs down".into(), fig(&r.down)));
+            out.push(Line(
+                "… share up (28d)".into(),
+                r.up_share_28d
+                    .map(share)
+                    .unwrap_or_else(|| format!("— (n < {SMALL_N} answers)")),
+            ));
+            if !r.reasons_28d.is_empty() {
+                out.push(Table(
+                    vec!["Reason (28d)".into(), "Times ticked".into()],
+                    r.reasons_28d
+                        .iter()
+                        .map(|k| vec![k.key.clone(), k.count.to_string()])
+                        .collect(),
+                ));
+            }
+        }
+        Measured::NotMeasured(n) => out.push(Line("Session ratings".into(), not_measured(n))),
+    }
     out.push(Note(
         "Time to first frame is FR-22's browser record (a foreground tab, a first attempt, no \
          drop), frozen nightly from agent_logs before its 7-day horizon; the 7- and 28-day \
          values are estimates from the daily histograms. A device's version is read from its \
-         own logs of the day, else from its device row. A rate appears only from 30."
+         own logs of the day, else from its device row. A rate appears only from 30. Ratings \
+         are what people answered the viewer's prompt after a session of 30 s or more — at most \
+         once a day each, a thumb and reason chips, never text."
             .into(),
     ));
 
@@ -1928,6 +1953,7 @@ mod tests {
                 crashes: Measured::unmounted("fleet"),
                 ttff: Measured::unmounted("fleet"),
                 by_agent_version: Measured::unmounted("fleet"),
+                ratings: Measured::unmounted("remote"),
             },
             install: Install {
                 fetches: Measured::Value(vec![FetchRow {

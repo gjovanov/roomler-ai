@@ -39,6 +39,7 @@ pub mod remote_audit;
 pub mod remote_session;
 pub mod role;
 pub mod room;
+pub mod session_feedback;
 pub mod setup_diagnostics;
 pub mod ssh_activity;
 pub mod ssh_audit;

@@ -533,6 +533,18 @@ pub struct GrowthSettings {
     /// `ROOMLER__GROWTH__WEEKLY_ENABLED`.
     #[serde(default)]
     pub weekly_enabled: bool,
+    /// P9b — the post-session rating (spec §3f, D10): after a remote session
+    /// of 30 s or more the viewer offers a thumbs up or down with optional
+    /// reason chips, at most once a day per person, dismissible, never
+    /// blocking. Stored in `session_feedback` on THIS server and sent
+    /// nowhere (a self-hosted server keeps its own). Default **on**, for
+    /// `install_counters`'s reason: no mail, no outside party, and a person
+    /// chooses to answer. `false` is the kill switch: the viewer never
+    /// offers the prompt (`/api/capabilities` says so) and the route answers
+    /// the empty 404 of a path that does not exist. Env:
+    /// `ROOMLER__GROWTH__FEEDBACK`.
+    #[serde(default = "growth_default_on")]
+    pub feedback: bool,
     /// P10 — the alert rules (`docs/growth-observability.md`, alerts): an
     /// hourly host job that opens a `growth_alerts` row when a rule fires,
     /// mails the digest's recipients at most once per rule per day, and
@@ -568,6 +580,7 @@ impl Default for GrowthSettings {
             setup_diagnostics: true,
             weekly_enabled: false,
             alerts: false,
+            feedback: true,
         }
     }
 }

@@ -98,6 +98,41 @@ describe('useCapabilitiesStore', () => {
     warn.mockRestore()
   })
 
+  /** FR-102 P9b — a feature is something the client OFFERS, so it fails
+   *  CLOSED: before the answer, after a failed request, on a server that
+   *  sends no `features`, and for a name it never sent. Only a boolean
+   *  `true` the server sent switches it on. */
+  it('a feature is on only when the server said true', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const store = useCapabilitiesStore()
+    expect(store.feature('session_feedback')).toBe(false)
+
+    mockApi.get.mockRejectedValueOnce(new Error('503'))
+    await store.load()
+    expect(store.feature('session_feedback')).toBe(false)
+
+    store.reset()
+    mockApi.get.mockResolvedValueOnce({ version: 'x', modules: ['remote'] })
+    await store.load()
+    expect(store.feature('session_feedback')).toBe(false)
+
+    store.reset()
+    mockApi.get.mockResolvedValueOnce({
+      version: 'x',
+      modules: ['remote'],
+      features: { session_feedback: true, other: 'yes', off: false },
+    })
+    await store.load()
+    expect(store.feature('session_feedback')).toBe(true)
+    expect(store.feature('other')).toBe(false)
+    expect(store.feature('off')).toBe(false)
+    expect(store.summary.features).toEqual({ session_feedback: true, off: false })
+
+    store.reset()
+    expect(store.feature('session_feedback')).toBe(false)
+    warn.mockRestore()
+  })
+
   it('ignores module names it does not know (a newer server)', async () => {
     mockApi.get.mockResolvedValueOnce({ version: 'x', modules: ['chat', 'holograms'] })
     const store = useCapabilitiesStore()
