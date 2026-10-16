@@ -119,6 +119,10 @@ export function usePrivacyMode() {
   const reason = ref<string | null>(null)
   /** The channel is open: the control can act. */
   const ready = ref(false)
+  /** FR-99 P4 — while the curtain is up: are the device's speakers muted?
+   *  `false` when muting failed; `null` when the device did not say (the
+   *  curtain is down, it has no speakers, or it predates P4). */
+  const hostMuted = ref<boolean | null>(null)
 
   let channel: PrivacyChannel | null = null
   let seq = 0
@@ -144,6 +148,7 @@ export function usePrivacyMode() {
     if (m.t !== 'rc:privacy.state') return
     on.value = m.on === true
     reason.value = typeof m.reason === 'string' ? m.reason : null
+    hostMuted.value = on.value && typeof m.host_muted === 'boolean' ? m.host_muted : null
     pending.value = false
   }
 
@@ -161,6 +166,7 @@ export function usePrivacyMode() {
       if (channel === ch) channel = null
       ready.value = false
       pending.value = false
+      hostMuted.value = null
       // The device takes the curtain down when the session ends.
       if (on.value) {
         on.value = false
@@ -179,6 +185,7 @@ export function usePrivacyMode() {
     ready.value = false
     pending.value = false
     on.value = false
+    hostMuted.value = null
   }
 
   /** Cover the screen (`true`) or uncover it. The device answers either way. */
@@ -192,5 +199,5 @@ export function usePrivacyMode() {
     pending.value = true
   }
 
-  return { on, pending, reason, ready, attach, detach, set }
+  return { on, pending, reason, ready, hostMuted, attach, detach, set }
 }

@@ -3640,6 +3640,8 @@ async fn handle_server_msg(
                     tenant_id: tenant_id.to_string(),
                     ledger: crate::privacy::ledger(),
                 },
+                // P4 — the host's speakers, muted while the curtain is up.
+                mute: crate::host_mute::host_mute(),
             });
 
             let answer_sdp = match peer.handle_offer(sdp).await {

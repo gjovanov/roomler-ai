@@ -247,7 +247,7 @@ restart changes it. That is why P6 added a fourth value:
   backend (`apps::has_backend`, `mod.rs:357`), independent of what the host
   was doing at boot.
 - The viewer shows the *Remote apps* entry for `list` **or** `status`
-  (`ui/src/views/remote/RemoteControl.vue:3610`), never disables it, and lets
+  (`ui/src/views/remote/RemoteControl.vue:3617`), never disables it, and lets
   the **dialog** carry the truth from the live reply: the list, the caveats,
   or the reason (`useRemoteControl.ts:8515`). A greyed button with no tooltip
   was the one place a reason could not reach.

@@ -62,6 +62,9 @@ pub mod hive;
 /// session's preparation, its toolbelt pipe and its directories' DACLs.
 #[cfg(all(windows, feature = "hive"))]
 pub mod hive_win;
+/// FR-99 P4 — the host's speakers are muted while a privacy curtain is up, and
+/// restored after it, after a crash too; the controller keeps the audio.
+pub mod host_mute;
 /// #1740 — a closed ICE agent (the vendored `webrtc-ice`) leaves nothing
 /// running behind it; black-box over the agent this daemon's sessions use.
 #[cfg(test)]

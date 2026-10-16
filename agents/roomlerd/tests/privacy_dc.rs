@@ -19,6 +19,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::signaling::ClientMsg;
+use roomlerd::host_mute::{HostMute, Speakers};
 use roomlerd::privacy::{self, CurtainHost, PrivacyCtx};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -52,6 +53,23 @@ impl Overlay {
     }
 }
 
+/// P4 — the host's speakers as a flag (`None` = no endpoint), so no cell ever
+/// touches the real speakers of the machine it runs on.
+struct Endpoint(StdMutex<Option<bool>>);
+
+impl Speakers for Endpoint {
+    fn muted(&self) -> Option<bool> {
+        *self.0.lock().unwrap()
+    }
+    fn set_muted(&self, mute: bool) -> bool {
+        let mut m = self.0.lock().unwrap();
+        if m.is_some() {
+            *m = Some(mute);
+        }
+        true
+    }
+}
+
 struct Rig {
     dc: Arc<RTCDataChannel>,
     strings: mpsc::UnboundedReceiver<String>,
@@ -59,6 +77,8 @@ struct Rig {
     pcs: (Arc<RTCPeerConnection>, Arc<RTCPeerConnection>),
     /// P1d — what the device reported to the server, in order.
     reports: Option<mpsc::Receiver<ClientMsg>>,
+    /// P4 — the host's speakers, as the device left them.
+    endpoint: Arc<Endpoint>,
     /// The ledger's directory, alive as long as the rig.
     _dir: tempfile::TempDir,
 }
@@ -128,7 +148,13 @@ enum Attach {
 }
 
 async fn rig(attach: Attach, up_ok: bool) -> Result<Rig> {
+    rig_with(attach, up_ok, None).await
+}
+
+/// [`rig`] over a host endpoint that starts as `speakers` (P4; `None` = none).
+async fn rig_with(attach: Attach, up_ok: bool, speakers: Option<bool>) -> Result<Rig> {
     let (browser_pc, agent_pc) = mk_pc_pair().await?;
+    let endpoint = Arc::new(Endpoint(StdMutex::new(speakers)));
     let session_id = ObjectId::new();
     let overlay = Arc::new(Overlay {
         calls: StdMutex::new(Vec::new()),
@@ -180,6 +206,7 @@ async fn rig(attach: Attach, up_ok: bool) -> Result<Rig> {
                     tenant_id: ObjectId::new().to_hex(),
                     ledger: Arc::new(privacy::Ledger::at(dir.path().join("ledger.json"))),
                 },
+                mute: Arc::new(HostMute::new(endpoint.clone(), None)),
             },
         ),
     }
@@ -207,6 +234,7 @@ async fn rig(attach: Attach, up_ok: bool) -> Result<Rig> {
         overlay,
         pcs: (browser_pc, agent_pc),
         reports: Some(reports),
+        endpoint,
         _dir: dir,
     })
 }
@@ -269,6 +297,34 @@ async fn on_status_and_off_draw_and_clear_the_curtain() -> Result<()> {
         r.reported(),
         vec![rep("on", None), rep("off", Some("controller"))]
     );
+    r.close().await;
+    privacy::set_device_allowed(false);
+    Ok(())
+}
+
+/// P4 — on a device with speakers, the curtain mutes them and the controller
+/// is told, on the answer and on a status; the take-down restores them and the
+/// word goes away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_curtain_mutes_the_host_and_the_controller_is_told() -> Result<()> {
+    let _g = SERIAL.lock().await;
+    privacy::set_device_allowed(true);
+    let mut r = rig_with(Attach::Granted { possible: || true }, true, Some(false)).await?;
+    let s = r.set("1", true).await?;
+    assert_eq!(
+        s,
+        json!({"t":"rc:privacy.state","id":"1","on":true,"host_muted":true})
+    );
+    assert_eq!(*r.endpoint.0.lock().unwrap(), Some(true), "muted while up");
+    r.send(json!({"t": "rc:privacy.status", "id": "s"})).await?;
+    let s = r.state(Duration::from_secs(5)).await?;
+    assert_eq!(
+        s,
+        json!({"t":"rc:privacy.state","id":"s","on":true,"host_muted":true})
+    );
+    let s = r.set("2", false).await?;
+    assert_eq!(s, json!({"t":"rc:privacy.state","id":"2","on":false}));
+    assert_eq!(*r.endpoint.0.lock().unwrap(), Some(false), "restored");
     r.close().await;
     privacy::set_device_allowed(false);
     Ok(())

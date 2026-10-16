@@ -2072,7 +2072,14 @@ watch(rec.audioUnavailable, (why) => {
 // refusal, why it was refused; the device's word decides whether it shows on.
 const privacyTitle = computed(() => {
   if (rc.privacy.on.value) {
-    return 'Privacy mode is on: the person at the device sees a notice instead of the screen. Click to turn it off.'
+    // FR-99 P4 — what the curtain did to the device's speakers, when it says.
+    const sound =
+      rc.privacy.hostMuted.value === true
+        ? ' Its speakers are muted too.'
+        : rc.privacy.hostMuted.value === false
+          ? " Its speakers couldn't be muted."
+          : ''
+    return `Privacy mode is on: the person at the device sees a notice instead of the screen.${sound} Click to turn it off.`
   }
   const why = describePrivacyReason(rc.privacy.reason.value)
   return why

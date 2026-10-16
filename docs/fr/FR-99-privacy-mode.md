@@ -349,6 +349,34 @@ version: mute the speakers and keep remote audio. What P4 owes, from the measure
 - **The cell was a VM's HD Audio endpoint** (software volume). P4's own field cell re-checks a real
   device whose endpoint has hardware volume before the toggle ships.
 
+**As built (P4a, 2026-10-16, #2300): Windows.** There is no toggle: the curtain mutes, because a person
+who must not see the session must not hear it either. One guard per process, `host_mute::HostMute`:
+
+| Step | What it does | Where |
+|---|---|---|
+| A curtain goes up | the guard is held: the first holder mutes the default render endpoint (`IAudioEndpointVolume::SetMute`), and only if it was unmuted | `Session::set`, `HostMute::hold` |
+| Before the mute | a note, `host-mute.json`, beside the curtain ledger | `HostMute::write_note` |
+| A curtain comes down | the last holder unmutes, unless the person unmuted in the meantime, and clears the note | `take_down`, `HostMute::release` |
+| The next process starts | a note left by a process that died muted: unmute if still muted, clear it | `collect_leftovers`, `HostMute::restore_leftover` |
+| The controller | `rc:privacy.state` carries `host_muted` while the curtain is up (`false` when the mute failed, absent with no endpoint); the toolbar's title says "Its speakers are muted too" | `StateMsg`, `usePrivacyMode.hostMuted` |
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unmuted
+    Unmuted --> OurMute: first curtain up, endpoint unmuted (note, then mute)
+    Unmuted --> TheirMute: first curtain up, endpoint muted already
+    OurMute --> Unmuted: last curtain down (unmute if still muted, clear the note)
+    TheirMute --> [*]: last curtain down (left muted)
+    OurMute --> Died: the process dies
+    Died --> Unmuted: next start finds the note (unmute if still muted)
+```
+
+⚠️ **Not a lock.** A person who unmutes from the volume flyout stays unmuted: the restore finds the
+endpoint unmuted and leaves it. ⚠️ **No endpoint, no mute.** The curtain still goes up and the answer
+carries no `host_muted`. Linux and macOS have no endpoint here yet; the curtain is Windows-only too.
+⚠️ **No test touches real speakers:** every cell drives a fake endpoint, because a test that muted
+the machine it runs on would mute a developer's laptop.
+
 ## 4. Phases
 
 | P | Scope | Kill switch | Status |
@@ -363,7 +391,7 @@ version: mute the speakers and keep remote audio. What P4 owes, from the measure
 | P3 | Lock on end (Windows, Linux, macOS), in two steps below | `lock_on_end=never` | P3a and P3b merged; both field cells (AC7, AC9) wait for the release that carries them |
 | P3a | The device's own `lock_on_end`: the decision at each session's start, the lock at the last end, Windows and Linux (§3e as built) | `lock_on_end=never` (default) | **#2272** merged `544bf0ec1`: unit tests in four crates. P0's mechanism and AC7's red are field-recorded (§8 rows 11–12). The green waits for the first agent release that carries it |
 | P3b | The server's half: an admin may ask a device's sessions for stricter (`AccessPolicy`, forwarded on `rc:request`), never looser, and the device row's control (§3e as built) | the admin's `never` or unset: nothing is asked | **#2280** merged `e4a2c1b7f`: unit tests in four crates and an integration cell through the real gate and hub. AC9 is its field cell, on the release that carries it |
-| P4 | Host mute | the toggle | — |
+| P4 | Host mute (§3f), Windows first | none: the curtain mutes; with no endpoint nothing changes | **P4a #2300**: the guard, its note and the restore at the next start, `host_muted` on the channel, the viewer's title. Unit cells (fake endpoints), a `privacy_dc` cell over the real channel, vitest; Windows clippy with `viewer-indicator`. AC10 is its field cell, on the release that carries it |
 | P5 | Docs and the field table | — | **#2240** (first part): `docs/privacy-mode.md` documents what P1 built. That covers the two parties who must agree, the request's sequence (mermaid), the server's strip reasons and the device's four gates, how the curtain works, the per-OS table and the honest limits. It is linked from `docs/README.md` and from `remote-control.md` §11.2. AC8 stays open until the page can show the block and Ctrl+Alt+Del as the way out, which wait for P2 |
 
 ## 5. Acceptance criteria
@@ -415,6 +443,13 @@ version: mute the speakers and keep remote audio. What P4 owes, from the measure
   (`Get-Process LogonUI`), and the request's `session_requested` audit row reads `lock_on_end: always`,
   `lock_enforced: true`. Red first: the same run against an agent without P3b leaves the guest unlocked,
   and the row reads `lock_enforced: false`.
+- [ ] **AC10 (the host's speakers, P4):** on a vmtest Win11 guest given a sound device (§8 row 13's
+  recipe), with the owner opted in: a curtain up mutes the default render endpoint (`GetMute` reads
+  `True`) while the viewer keeps receiving the tone at the unmuted rate, and the viewer reads
+  `host_muted: true`. The curtain's end unmutes it. An endpoint muted before the session stays muted
+  after it; one the person unmuted during it stays unmuted. `taskkill /F` on the curtained worker leaves
+  it unmuted once the next process starts. Red first: the same run against an agent without P4 leaves
+  the endpoint unmuted under the curtain.
 
 ## 6. Decisions
 

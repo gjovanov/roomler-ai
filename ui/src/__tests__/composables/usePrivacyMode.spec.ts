@@ -156,6 +156,26 @@ describe('the channel', () => {
     expect(p.reason.value).toBe('session_ended')
   })
 
+  it("FR-99 P4: says whether the device's speakers are muted, and only while covered", () => {
+    const p = usePrivacyMode()
+    const { ch } = fakeChannel()
+    p.attach(ch)
+    expect(p.hostMuted.value).toBeNull()
+    ch.deliver({ t: 'rc:privacy.state', id: 'a', on: true, host_muted: true })
+    expect(p.hostMuted.value).toBe(true)
+    // A device with no speakers (or before P4) says nothing: unknown, not false.
+    ch.deliver({ t: 'rc:privacy.state', id: 'b', on: true })
+    expect(p.hostMuted.value).toBeNull()
+    ch.deliver({ t: 'rc:privacy.state', id: 'c', on: true, host_muted: false })
+    expect(p.hostMuted.value).toBe(false)
+    // Down: nothing to say, whatever a stray field claims.
+    ch.deliver({ t: 'rc:privacy.state', id: 'd', on: false, host_muted: true })
+    expect(p.hostMuted.value).toBeNull()
+    ch.deliver({ t: 'rc:privacy.state', id: 'e', on: true, host_muted: true })
+    ch.close()
+    expect(p.hostMuted.value).toBeNull()
+  })
+
   it('a request with no open channel is a refusal, never a hang', () => {
     const p = usePrivacyMode()
     p.set(true)
