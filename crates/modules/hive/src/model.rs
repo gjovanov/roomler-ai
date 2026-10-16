@@ -297,6 +297,21 @@ pub struct FenceMark {
     pub hash: String,
 }
 
+/// P2e-6a — how much of the session's chain a copy that ends at
+/// `(fence, seq)` holds, as a `seq`: every copy's chain is the one the record
+/// knows, up to where each older fence ended (`fences`), so the `seq` orders
+/// them. Past an end is a tail a move away from an unreachable primary cut
+/// off, which the copy sets aside once it follows the session again (P2d-3):
+/// it counts for nothing. Never `(fence, seq)` compared whole: an empty copy
+/// says `seq` 0 at the fence it joined at, the newest of all. A promotion is
+/// decided by it, and (P2j-1) the API answers it for each member as `holds`.
+pub(crate) fn on_chain(fences: &[FenceMark], fence: i64, seq: i64) -> i64 {
+    fences
+        .iter()
+        .find(|m| m.fence == fence)
+        .map_or(seq, |end| seq.min(end.seq))
+}
+
 /// FR-90 P2e-3 — where a promotion is. Every step is a compare-and-set on the
 /// state it leaves, so a frame that arrives twice, late, or on another pod
 /// moves it once.
@@ -756,6 +771,11 @@ pub struct ReplicaMemberView {
     pub answered_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tip: Option<MemberTipView>,
+    /// P2j-1 — how much of the session's chain its copy holds, as a `seq`
+    /// ([`on_chain`], the rule a promotion is decided by): the freshest copy
+    /// holds the most. Absent while the member reported no tip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holds: Option<i64>,
 }
 
 /// [`MemberTip`] as the API answers it.
@@ -771,8 +791,10 @@ pub struct MemberTipView {
     pub at: String,
 }
 
-impl From<&Replicaset> for ReplicasetView {
-    fn from(r: &Replicaset) -> Self {
+impl ReplicasetView {
+    /// `fences` are the session's own: what each member's copy holds is
+    /// counted along them ([`on_chain`]).
+    pub fn of(r: &Replicaset, fences: &[FenceMark]) -> Self {
         Self {
             policy_revision: r.policy_revision,
             min: r.min,
@@ -795,6 +817,7 @@ impl From<&Replicaset> for ReplicasetView {
                         checkpoint_hash: t.checkpoint_hash.clone(),
                         at: rfc3339(t.at),
                     }),
+                    holds: m.tip.as_ref().map(|t| on_chain(fences, t.fence, t.seq)),
                 })
                 .collect(),
             short: r.short.clone(),
@@ -832,7 +855,10 @@ impl From<&AgentSession> for SessionView {
             ended_at: s.ended_at.map(rfc3339),
             brain_rev: s.brain_rev,
             origin: s.origin,
-            replicaset: s.replicaset.as_ref().map(ReplicasetView::from),
+            replicaset: s
+                .replicaset
+                .as_ref()
+                .map(|r| ReplicasetView::of(r, &s.fences)),
             promotion: s.promotion.as_ref().map(PromotionView::from),
             parent_session_id: s.parent.as_ref().map(|p| p.session_id.to_hex()),
             from_terminal: s.from_terminal.as_ref().map(|f| FromTerminalView {
@@ -1219,6 +1245,80 @@ mod tests {
             path_map: Vec::new(),
             purged: None,
         }
+    }
+
+    /// FR-90 P2j-1 — each member's view says how much of the session's chain
+    /// its copy holds, by the rule a promotion is decided by: a tail past
+    /// where its fence ended counts for nothing, an empty copy at a newer
+    /// fence is the least, and a member that reported no tip says nothing.
+    #[test]
+    fn a_members_view_says_how_much_of_the_chain_its_copy_holds() {
+        let now = DateTime::now();
+        let member = |role: &str, tip: Option<(i64, i64)>| ReplicaMember {
+            device_id: ObjectId::new(),
+            role: role.into(),
+            state: if tip.is_some() {
+                MemberState::Joined
+            } else {
+                MemberState::Pending
+            },
+            refusal: None,
+            answered_at: None,
+            tip: tip.map(|(fence, seq)| MemberTip {
+                fence,
+                seq,
+                hash: "ab".repeat(32),
+                checkpoint_seq: None,
+                checkpoint_hash: None,
+                at: now,
+            }),
+            purging: None,
+            forking: None,
+        };
+        let s = AgentSession {
+            fence: 2,
+            replicaset: Some(Replicaset {
+                policy_revision: 1,
+                min: 2,
+                max: 4,
+                restricted_tags: Vec::new(),
+                members: vec![
+                    member("primary", Some((2, 8))),
+                    member("owner", Some((1, 10))),
+                    member("archive", Some((2, 0))),
+                    member("owner", None),
+                ],
+                short: None,
+                placed_at: now,
+            }),
+            // Fence 1 ended at 7: a copy's 8..=10 at fence 1 was cut off.
+            fences: vec![FenceMark {
+                fence: 1,
+                seq: 7,
+                hash: "cd".repeat(32),
+            }],
+            ..bare_session()
+        };
+        let v = SessionView::from(&s);
+        let holds: Vec<Option<i64>> = v
+            .replicaset
+            .as_ref()
+            .unwrap()
+            .members
+            .iter()
+            .map(|m| m.holds)
+            .collect();
+        assert_eq!(
+            holds,
+            [Some(8), Some(7), Some(0), None],
+            "the current fence whole, an older one up to its end, an empty copy the least"
+        );
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["replicaset"]["members"][1]["holds"], 7);
+        assert!(
+            json["replicaset"]["members"][3].get("holds").is_none(),
+            "no tip, no word: {json}"
+        );
     }
 
     /// FR-90 P2f-4b — a terminal session is being made a managed one only

@@ -304,6 +304,57 @@
       "remove": "Take them out of the session",
       "adoptedReadersOnly": "It runs in a terminal, so it takes readers only."
     },
+    "roomCopies": {
+      "button": "Copies",
+      "title": "Copies of this session",
+      "explain": "Each device listed holds a copy of this session, its transcript and checkpoints, so it stays readable, and can move, while the device it runs on is offline.",
+      "someDevice": "A device of your organization",
+      "runsIt": "Runs it · {n} events",
+      "upToDate": "Up to date · {n} events",
+      "behind": "{k} events behind · {n} events",
+      "holds": "{n} events",
+      "noTip": "No copy reported yet",
+      "role": {
+        "primary": "Runs it",
+        "owner": "Owner's device",
+        "archive": "Archive replica",
+        "teleport": "Being moved to"
+      },
+      "state": {
+        "pending": "Joining",
+        "joined": "Holds a copy",
+        "refused": "Refused",
+        "leaving": "Letting go"
+      },
+      "short": {
+        "adopted": "A session adopted from a terminal is copied nowhere but the device it runs on.",
+        "restricted": "Fewer copies than the policy asks: a device that would hold one lacks a tag this session is restricted to.",
+        "no_device": "Fewer copies than the policy asks: no other device offers to hold one."
+      },
+      "moving": "Moving to {device}: {step}.",
+      "step": {
+        "preparing": "the device is getting ready",
+        "joining": "the device is taking its copy",
+        "draining": "the device it runs on is finishing its turn",
+        "syncing": "the copy is catching up",
+        "moving": "starting there"
+      },
+      "moveTitle": "Move it to another device",
+      "moveExplain": "It stops where it runs and goes on there, from the copy that device holds. The copy that holds the most is picked: a move to one that holds less is refused.",
+      "folder": "Folder there",
+      "folderHint": "Where it runs on that device: the same folder unless you say otherwise.",
+      "move": "Move",
+      "ahead": "{device} holds more of this session than any device it can move to: a move is refused until one catches up.",
+      "noTarget": "No other device that runs sessions holds a copy yet.",
+      "notRunning": "Only a running session moves.",
+      "alreadyMoving": "It is being moved already.",
+      "adoptedStays": "A session adopted from a terminal stays where it runs.",
+      "outcome": {
+        "promoting": "Moving: the device is ready, and the one it runs on is finishing its turn.",
+        "pending": "Asked: the device has not answered yet. Its room says how it goes on."
+      },
+      "refused": "The move was refused: {reason}"
+    },
     "memory": {
       "title": "Agent memory",
       "revision": "Revision {rev}",
