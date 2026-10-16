@@ -4,7 +4,7 @@
 claim 2026-10-16, on the operator's *"can we improve on it"* after a window drag on FR-93 AC12's box ran at
 9 fps. P1 and P2 merged (#2320); P2b (the pacing) and P3 (the GPU path) are lab-verified on that box: a moving
 window at 27.9 fps on the VP9 path and 28.8 on the RTP track, against 6.3 and 15.1 for 0.4.139 on the same
-desktop · **Owner:** remote desktop (the agent's DRM arm) · **Anchors:** master `7382639b8` · **Builds on:** [FR-36](FR-36-wayland-capture.md) (the DRM arm, the fused
+desktop · **Owner:** remote desktop (the agent's DRM arm) · **Anchors:** master `b8e6e92a0` · **Builds on:** [FR-36](FR-36-wayland-capture.md) (the DRM arm, the fused
 half read, P2's deferred EGL detiling), [FR-93](FR-93-wayland-out-of-the-box.md) (AC12's box),
 [FR-95](FR-95-system-installs-on-by-default-on-wayland.md) (the system install's capture)
 
@@ -65,7 +65,7 @@ flowchart LR
 ```
 
 **P1 — the DRM arm honours the pump's encode box.** `ScreenCapture::set_output_cap`
-(`agents/roomlerd/src/capture/mod.rs:375`) already exists for exactly this, and every pump calls it with its
+(`agents/roomlerd/src/capture/mod.rs:379`) already exists for exactly this, and every pump calls it with its
 effective box (`peer.rs:4226`). macOS honours it; the DRM arm ignored it. Now the DRM worker reads the box on
 every grab and takes the fused half read whenever half the source still covers it, whatever the policy says
 (`wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1312`; `set_output_cap`, `drm_backend.rs:1525`).
