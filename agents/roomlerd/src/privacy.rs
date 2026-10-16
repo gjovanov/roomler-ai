@@ -218,6 +218,11 @@ pub struct StateMsg {
     /// `unavailable`, `no_curtain`. Absent when it did what was asked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
+    /// P4 — while the curtain is up: are the host's speakers muted? `false`
+    /// when muting failed. Absent when the curtain is down, or the device has
+    /// no endpoint to mute. A viewer that predates P4 ignores it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_muted: Option<bool>,
 }
 
 impl StateMsg {
@@ -227,7 +232,13 @@ impl StateMsg {
             id: id.to_string(),
             on,
             reason,
+            host_muted: None,
         }
+    }
+
+    fn muted(mut self, host_muted: Option<bool>) -> Self {
+        self.host_muted = host_muted;
+        self
     }
 }
 
@@ -371,6 +382,9 @@ fn leftovers() -> &'static Mutex<Vec<Held>> {
 /// in the ledger. Each is reported as `off {worker_exit}` once its org's
 /// connection is up ([`drain_leftovers`]).
 pub fn collect_leftovers() {
+    // P4 — and a mute of the host's speakers that a previous process died
+    // holding is undone before any curtain of this one.
+    crate::host_mute::host_mute().restore_leftover();
     let found = ledger().take_leftovers();
     if !found.is_empty() {
         info!(
@@ -445,6 +459,9 @@ pub struct PrivacyCtx {
     pub possible: fn() -> bool,
     /// P1d — the session's account to the server, and the ledger.
     pub report: Reporter,
+    /// P4 — the process's guard over the host's speakers
+    /// ([`crate::host_mute::host_mute`] in production, a fake in tests).
+    pub mute: Arc<crate::host_mute::HostMute>,
 }
 
 /// One session's privacy mode: its gates and whether its curtain is up. The
@@ -458,6 +475,9 @@ pub struct Session {
     on: AtomicBool,
     /// Serialises the transitions (each may block on the overlay).
     transition: Mutex<()>,
+    /// P4 — what [`crate::host_mute::HostMute::hold`] answered for this
+    /// session's curtain; `None` while it is down. Set under `transition`.
+    host_muted: Mutex<Option<Option<bool>>>,
 }
 
 impl Session {
@@ -466,7 +486,17 @@ impl Session {
             ctx,
             on: AtomicBool::new(false),
             transition: Mutex::new(()),
+            host_muted: Mutex::new(None),
         }
+    }
+
+    /// P4 — the host's speakers, as the last hold left them: `None` while the
+    /// curtain is down or there is no endpoint.
+    pub fn host_muted(&self) -> Option<bool> {
+        self.host_muted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .flatten()
     }
 
     pub fn is_on(&self) -> bool {
@@ -480,6 +510,16 @@ impl Session {
             .host
             .set_curtain(self.ctx.session_id, false, &self.ctx.controller_name);
         self.on.store(false, Ordering::Release);
+        // P4 — this session's hold on the host's speakers ends with its curtain.
+        if self
+            .host_muted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .is_some()
+        {
+            self.ctx.mute.release();
+        }
         self.ctx.report.ledger.remove(&self.ctx.session_id.to_hex());
         self.ctx
             .report
@@ -513,7 +553,7 @@ impl Session {
             return self.refuse(id, "unavailable");
         }
         if self.is_on() {
-            return StateMsg::new(id, true, None);
+            return StateMsg::new(id, true, None).muted(self.host_muted());
         }
         // Noted BEFORE it goes up: a process that dies between the two then
         // leaves an entry for a curtain that may never have shown, never a
@@ -533,11 +573,16 @@ impl Session {
             return self.refuse(id, "no_curtain");
         }
         self.on.store(true, Ordering::Release);
+        // P4 — the person at the device neither sees nor hears the session:
+        // the host's speakers are muted while the curtain is up, and the
+        // controller keeps the audio (the loopback survives the mute).
+        let muted = self.ctx.mute.hold();
+        *self.host_muted.lock().unwrap_or_else(|p| p.into_inner()) = Some(muted);
         self.ctx
             .report
             .send(self.ctx.session_id, PrivacyActivityKind::On, None);
-        info!(session = %self.ctx.session_id, "privacy: curtain up");
-        StateMsg::new(id, true, None)
+        info!(session = %self.ctx.session_id, host_muted = ?muted, "privacy: curtain up");
+        StateMsg::new(id, true, None).muted(muted)
     }
 
     /// The owner switched the gate off: a curtain that is up comes down, and
@@ -669,7 +714,8 @@ pub fn attach(dc: Arc<RTCDataChannel>, ctx: PrivacyCtx) {
                     });
                 }
                 Ok(Incoming::Status { id }) => {
-                    send(&dc, &StateMsg::new(&id, session.is_on(), None)).await;
+                    let msg = StateMsg::new(&id, session.is_on(), None).muted(session.host_muted());
+                    send(&dc, &msg).await;
                 }
                 Err(e) => warn!(%e, "privacy DC: unparseable message"),
             }
@@ -713,9 +759,11 @@ mod tests {
     /// run time, so this file cannot trip its own scan.
     #[test]
     fn no_keylogger_shaped_api_in_privacy_mode() {
-        let sources: [(&str, &str); 2] = [
+        let sources: [(&str, &str); 3] = [
             ("privacy.rs", include_str!("privacy.rs")),
             ("indicator/win.rs", include_str!("indicator/win.rs")),
+            // P4 — the host mute is privacy mode's too.
+            ("host_mute.rs", include_str!("host_mute.rs")),
         ];
         let banned: Vec<String> = [
             ["SetWindows", "HookEx"],
@@ -750,14 +798,47 @@ mod tests {
         }
     }
 
+    /// P4 — an endpoint whose mute is a flag (`None` = no endpoint), so no
+    /// test ever touches the real speakers of the machine it runs on.
+    struct FakeSpeakers(Mutex<Option<bool>>);
+
+    impl crate::host_mute::Speakers for FakeSpeakers {
+        fn muted(&self) -> Option<bool> {
+            *self.0.lock().unwrap()
+        }
+        fn set_muted(&self, mute: bool) -> bool {
+            let mut m = self.0.lock().unwrap();
+            if m.is_some() {
+                *m = Some(mute);
+            }
+            true
+        }
+    }
+
+    fn fake_mute(start: Option<bool>) -> (Arc<crate::host_mute::HostMute>, Arc<FakeSpeakers>) {
+        let speakers = Arc::new(FakeSpeakers(Mutex::new(start)));
+        let guard = crate::host_mute::HostMute::new(speakers.clone(), None);
+        (Arc::new(guard), speakers)
+    }
+
     /// A session whose reports go nowhere: no ledger file, and a queue
     /// nobody reads (a report that cannot be queued is dropped, as on a dying
     /// connection).
     fn session(up_ok: bool) -> (Session, Arc<Recorder>) {
+        let (s, host, _) = session_with_speakers(up_ok, None);
+        (s, host)
+    }
+
+    /// [`session`] over a fake endpoint that starts as `speakers` (P4).
+    fn session_with_speakers(
+        up_ok: bool,
+        speakers: Option<bool>,
+    ) -> (Session, Arc<Recorder>, Arc<FakeSpeakers>) {
         let host = Arc::new(Recorder {
             calls: Mutex::new(Vec::new()),
             up_ok,
         });
+        let (mute, fake) = fake_mute(speakers);
         let s = Session::new(PrivacyCtx {
             session_id: ObjectId::new(),
             controller_name: "Alex".into(),
@@ -771,8 +852,52 @@ mod tests {
                     lock: Mutex::new(()),
                 }),
             },
+            mute,
         });
-        (s, host)
+        (s, host, fake)
+    }
+
+    /// P4 — the curtain mutes the host's speakers and says so; its end
+    /// restores them. A status while it is up says so too.
+    #[test]
+    fn a_curtain_mutes_the_host_and_its_end_unmutes_it() {
+        let (s, _host, speakers) = session_with_speakers(true, Some(false));
+        let up = s.set("a", true, true, true);
+        assert_eq!((up.on, up.host_muted), (true, Some(true)));
+        assert_eq!(*speakers.0.lock().unwrap(), Some(true), "muted while up");
+        assert_eq!(s.host_muted(), Some(true));
+        let again = s.set("b", true, true, true);
+        assert_eq!(again.host_muted, Some(true), "a repeated on says the same");
+        s.end();
+        assert_eq!(
+            *speakers.0.lock().unwrap(),
+            Some(false),
+            "restored at the end"
+        );
+        assert_eq!(s.host_muted(), None, "nothing to say once down");
+        let json =
+            serde_json::to_value(StateMsg::new("c", false, None).muted(s.host_muted())).unwrap();
+        assert!(
+            json.get("host_muted").is_none(),
+            "absent while down: {json}"
+        );
+    }
+
+    /// P4 — no endpoint: the curtain still goes up, and the answer carries no
+    /// `host_muted` at all; a curtain that could not go up never mutes.
+    #[test]
+    fn no_endpoint_or_no_curtain_means_no_mute() {
+        let (s, _host, _sp) = session_with_speakers(true, None);
+        let up = s.set("a", true, true, true);
+        assert_eq!((up.on, up.host_muted), (true, None));
+        let json = serde_json::to_value(&up).unwrap();
+        assert!(json.get("host_muted").is_none(), "{json}");
+        s.end();
+
+        let (s, _host, speakers) = session_with_speakers(false, Some(false));
+        let refused = s.set("a", true, true, true);
+        assert_eq!((refused.on, refused.reason), (false, Some("no_curtain")));
+        assert_eq!(*speakers.0.lock().unwrap(), Some(false), "never muted");
     }
 
     /// P1d — a session whose reports and ledger can be read back.
@@ -800,6 +925,7 @@ mod tests {
                 tenant_id: "aaaaaaaaaaaaaaaaaaaaaaaa".into(),
                 ledger: ledger.clone(),
             },
+            mute: fake_mute(None).0,
         });
         Reporting {
             s,
