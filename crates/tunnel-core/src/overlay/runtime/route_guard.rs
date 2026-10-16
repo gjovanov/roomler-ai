@@ -622,7 +622,7 @@ impl OverlayRuntime {
                 Ok(()) => {
                     state.exemptions.insert(*ip);
                     state.exemption_failures.remove(ip);
-                    info!(%ip, "overlay exit-node: pinned carrier-endpoint exemption via the original uplink");
+                    info!(%ip, "overlay exit-node: pinned carrier-endpoint exemption via the current uplink");
                 }
                 Err(e) => {
                     // FR-97 P1a — once per cause, not once per reconcile.
