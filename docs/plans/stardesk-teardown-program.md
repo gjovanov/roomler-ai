@@ -142,7 +142,9 @@ teardown are not lost.
 - **Never surprise the person at the screen.** `display_match` refuses while someone is at the screen:
   not locked, and real input within N minutes (`GetLastInputInfo`, already read by keep-busy). It answers
   `refused: attended`.
-- **Linux:** a declared Xvfb mode ladder.
+- **Linux:** the virtual desktop switches to the viewer's size. *Corrected by FR-108's P2 probe
+  (2026-10-16): there is no Xvfb ladder to declare, because Xvfb keeps one fixed mode. Xorg with the dummy
+  driver switches to any size, and the choice of server is FR-108's decision 4.*
 - **Several displays at once:** one pump and one `video-bytes` channel per display, the viewer's windows
   placed with `getScreenDetails`.
 - **macOS:** out (private API).

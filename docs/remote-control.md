@@ -1303,7 +1303,7 @@ sequenceDiagram
 | Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:3531`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:12263`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:555`), on both ends' `rc:terminate` and in the `session_ended` audit row |
-| Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:259`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:624`) |
+| Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:259`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:624`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:323`, #2326) |
 | Tests | the predicate on recorded offers (`codec_cap_tests` in `peer.rs`); the field's own offer, which `create_answer` fails on, is the one it refuses (`agents/roomlerd/tests/dc_track_codec.rs`); who may name the code (`only_the_device_names_no_common_codec`, `hub.rs:4272`); the real agent through a real server, with an H.264 offer as the control (`crates/tests/src/rc_no_common_codec_tests.rs:147`) |
 
 ⚠️ **The consent prompt has already been answered** by the time the offer
@@ -1316,6 +1316,12 @@ viewer will still ask.
 ⚠️ **Both halves are needed.** A server without #2251 drops the code and sends
 the bare `error`, which the viewer retries as before. An agent without it fails
 `create_answer`, as before.
+
+**Field-verified** on agent 0.4.139 with prod at `hosted-20261016-377f1d4`. A
+Firefox 153 with no H.264 made one request and got one `error/no_common_codec`
+2.4 s after Connect, and the sentence was still on screen 75 s later. Agent
+0.4.138 had made 12 requests, each ending in a bare `error`. With prod at
+`32a9095`, before #2326, the sentence had been replaced by the generic one.
 
 ### 11.8 The post-session rating (FR-102 P9b)
 
