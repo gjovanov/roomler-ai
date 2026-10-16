@@ -243,6 +243,7 @@
         "opening": "Asking the device…",
         "connecting": "Connecting…",
         "open": "Live from the device",
+        "openCopy": "Reading a copy",
         "closed": "Disconnected",
         "refused": "Not available"
       },

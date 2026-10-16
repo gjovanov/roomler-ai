@@ -2100,7 +2100,11 @@ members hold: the replicaset's switch stops all of it.
 
 ⚠️ **The SPA says so.** A view from a copy reads "You are reading a copy another device
 holds", with no composer, for a driver too
-([`HiveTranscript.vue:191`](../ui/src/components/hive/HiveTranscript.vue#L191)).
+([`HiveTranscript.vue:191`](../ui/src/components/hive/HiveTranscript.vue#L191)). Its status
+chip says "Reading a copy", never "Live from the device" (P2k-6: the field run found the chip
+saying live over a copy, the note right below it saying otherwise); a copy still being
+connected to says "Connecting…" as any view does
+([`HiveTranscript.vue:354`](../ui/src/components/hive/HiveTranscript.vue#L354)).
 
 ### P2d-6: AC2 on two devices in CI
 
