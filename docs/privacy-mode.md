@@ -16,8 +16,8 @@
 > | P1d | the device's account: every curtain up, down (and why) and refused, in `privacy_activity`, including the curtain a killed process could not report | merged; the agent half ships in the next agent release |
 > | P2 | blocking the person's keyboard and mouse (`BlockInput`, Ctrl+Alt+Del to take the computer back) | not built |
 > | P3a | lock the computer when the last session ends: the device's own `lock_on_end` (Windows, Linux) | merged; ships with the next agent release |
-> | P3b | an admin asking a device's sessions for a stricter lock | not built |
-> | P4 | mute the host | not built |
+> | P3b | an admin asking a device's sessions for a stricter lock | merged; ships with the next agent release |
+> | P4a | mute the host's speakers while the curtain is up (Windows), the controller keeping the audio | merged; ships with the next agent release |
 
 While a privacy-mode session runs, **the person at the computer sees a notice instead of the
 desktop**: "This computer is being used remotely, by …". The controller keeps seeing the real
@@ -80,7 +80,7 @@ session's `session_requested` audit row (`privacy_stripped`):
 | `device_not_opted_in` | the owner has not allowed it | a disabled control with the reason |
 
 The device decides again at every "on", whatever the server sent
-([`set`, `privacy.rs:501`](../agents/roomlerd/src/privacy.rs#L501)):
+([`set`, `privacy.rs:541`](../agents/roomlerd/src/privacy.rs#L541)):
 
 | # | Gate | Refusal |
 |---|---|---|
@@ -145,13 +145,13 @@ sequenceDiagram
 | `off` | `controller` | the viewer turned it off |
 | `off` | `session_end` | the session ended (the channel closed, or the overlay dropped the session) |
 | `off` | `disabled_on_device` | the owner switched privacy mode off mid-session |
-| `off` | `worker_exit` | the process that drew it died with it up, reported by the next one to start ([`collect_leftovers`, `privacy.rs:373`](../agents/roomlerd/src/privacy.rs#L373)) |
+| `off` | `worker_exit` | the process that drew it died with it up, reported by the next one to start ([`collect_leftovers`, `privacy.rs:384`](../agents/roomlerd/src/privacy.rs#L384)) |
 | `refused` | `disabled_on_device` · `unavailable` · `no_curtain` | the device's gates 2–4 above |
 
 - **The ledger** is a small file in the worker's own local data dir: SYSTEM's profile for a
   service's worker, the person's for a per-user install. Each curtain is written there *before*
   it goes up, so a process killed in between leaves an entry rather than a curtain with none
-  ([`Ledger`, `privacy.rs:265`](../agents/roomlerd/src/privacy.rs#L265)). A leftover is reported on
+  ([`Ledger`, `privacy.rs:276`](../agents/roomlerd/src/privacy.rs#L276)). A leftover is reported on
   the connection of the org its session belonged to, because the server looks the session up within
   that org.
 - **The server keeps a report only for a session of that device whose grant held `PRIVACY`**,
@@ -254,6 +254,40 @@ sequenceDiagram
 - ⚠️ **An unknown value reads as `always`**, the stricter side, as everywhere `LockOnEnd` is read: an API
   caller's typo locks rather than silently asking nothing.
 
+## The host's speakers (P4)
+
+While a curtain is up, the host's speakers are muted, so the person at the device neither sees nor
+hears the session. The controller keeps the audio: the agent captures it by WASAPI loopback, and P0
+measured the loopback carrying the same audio with the endpoint muted as unmuted
+([FR-99](fr/FR-99-privacy-mode.md) §8 row 13). StarDesk's help says its mute silences the client
+too; this one does not.
+
+```mermaid
+sequenceDiagram
+    participant V as Viewer
+    participant A as Agent (the curtain's process)
+    participant S as Speakers (default render endpoint)
+    V->>A: rc:privacy.set {on: true}
+    A->>A: curtain up
+    A->>A: note host-mute.json (only if S is unmuted)
+    A->>S: SetMute(true)
+    A-->>V: rc:privacy.state {on: true, host_muted: true}
+    V->>A: rc:privacy.set {on: false}
+    A->>A: curtain down
+    A->>S: SetMute(false), unless the person unmuted it
+    A->>A: clear the note
+    A-->>V: rc:privacy.state {on: false}
+```
+
+| Case | What happens |
+|---|---|
+| The endpoint was unmuted | muted at the first curtain, unmuted at the last one down |
+| The endpoint was muted already | left muted; it is the person's, never unmuted by us |
+| The person unmutes during the session | left unmuted at the end: it is not a lock |
+| The process dies while muted | the next process of the same install finds the note and unmutes |
+| No endpoint (or not Windows) | the curtain goes up without a mute, and the answer carries no `host_muted` |
+| Muting fails | `host_muted: false`; the viewer's title says the speakers couldn't be muted |
+
 ## Platforms
 
 | Platform | Curtain | Why |
@@ -263,6 +297,8 @@ sequenceDiagram
 | **macOS** | ❌ | since macOS 15 there is no public API that keeps a window out of capture; `NSWindow.sharingType = .none` is ignored by ScreenCaptureKit |
 | Linux X11 | ❌ (later, perhaps DPMS-off) | injected input wakes the display, so it would have to be re-asserted |
 | Linux Wayland | ❌ | — |
+
+The host mute follows the curtain: Windows only, and only where a render endpoint exists.
 
 ## Honest limits
 
@@ -278,6 +314,9 @@ sequenceDiagram
   session, move the pointer to the top edge of the screen and choose Disconnect." With P2's block
   it becomes Ctrl+Alt+Del (the operator's decision 4).
 - The notice is English only for now.
+- ⚠️ **The host mute is not a lock.** The person can unmute from the volume flyout, and stays
+  unmuted. It was measured on a VM's HD Audio endpoint, whose volume is in software; AC10's field
+  cell re-checks a real endpoint with hardware volume.
 - ⚠️ **`privacy_activity` is the device's claim.** A compromised host can stay silent, so an empty
   trail is not proof that no curtain went up. The `PRIVACY` grant in `remote_audit` is what survives
   it. A report queued as the connection dies is lost, and a `worker_exit` arrives only when the next
