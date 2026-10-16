@@ -64,6 +64,9 @@ const BTN_EXTRA: u16 = 0x114;
 /// `KEY_LEFTSHIFT` — needed directly by the KeyText path, which presses shift
 /// around a character rather than going through the HID table for it.
 const KEY_LEFTSHIFT: u16 = 42;
+/// FR-93 P4c — the other shift, so a viewer holding EITHER counts as holding
+/// shift when KeyText decides whether to press it.
+const KEY_RIGHTSHIFT: u16 = 54;
 
 /// Absolute axis range. 0..=32767 is the conventional span for an absolute
 /// pointing device; the compositor scales it to the current screen, so this
@@ -79,6 +82,17 @@ const WHEEL_PIXELS_PER_DETENT: f32 = 53.0;
 /// How long to let udev/libinput enumerate the new device before trusting it
 /// to deliver events. Without this the first events after open go nowhere.
 const SETTLE: Duration = Duration::from_millis(300);
+
+/// FR-93 P4c — the settle, overridable for measuring it on a host
+/// (`ROOMLERD_UINPUT_SETTLE_MS`, at most 5 s). Under load the default is not
+/// always enough (measured on KDE: 2 of 8 first moves reached nobody); the
+/// arbiter's warm-up (`input::arbiter`) is what makes the first event safe,
+/// by opening the device a second or more before anything is written.
+fn settle() -> Duration {
+    tunnel_core::env::node_env("UINPUT_SETTLE_MS")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(SETTLE, |ms| Duration::from_millis(ms.min(5000)))
+}
 
 // --- ioctl plumbing ---
 
@@ -205,6 +219,10 @@ pub struct UinputInjector {
     /// The automatic injector dropped input since it last injected: said once
     /// per closed spell, not per event.
     dropping: bool,
+    /// FR-93 P4c — the shift keys a viewer holds down through `Key` (left,
+    /// right), so KeyText neither presses shift again nor lets go of the
+    /// viewer's own.
+    shift_held: [bool; 2],
 }
 
 impl UinputInjector {
@@ -312,7 +330,7 @@ impl UinputInjector {
         // ⚠️ Load-bearing. udev and libinput enumerate the new device
         // asynchronously; anything written before they do reaches nobody, so
         // without this the first click of a session is simply lost.
-        std::thread::sleep(SETTLE);
+        std::thread::sleep(settle());
         info!("input: backend=uinput (virtual kernel device, below the compositor)");
 
         let (layout, layout_name) = super::keylayout::detect();
@@ -338,6 +356,7 @@ impl UinputInjector {
             layout_name,
             auto_system: false,
             dropping: false,
+            shift_held: [false; 2],
         })
     }
 
@@ -355,6 +374,7 @@ impl UinputInjector {
             layout_name: String::new(),
             auto_system: false,
             dropping: false,
+            shift_held: [false; 2],
         }
     }
 
@@ -469,6 +489,11 @@ impl InputInjector for UinputInjector {
                     // HID usage is DROPPED, never guessed at.
                     return Ok(());
                 };
+                match key {
+                    KEY_LEFTSHIFT => self.shift_held[0] = down,
+                    KEY_RIGHTSHIFT => self.shift_held[1] = down,
+                    _ => {}
+                }
                 self.emit(EV_KEY, key, i32::from(down))?;
                 self.sync()
             }
@@ -498,25 +523,32 @@ impl InputInjector for UinputInjector {
                         skipped += 1;
                         continue;
                     };
-                    if k.shift {
-                        self.emit(EV_KEY, KEY_LEFTSHIFT, 1)?;
-                    }
                     let Some(code) = hid_to_evdev(k.hid) else {
                         skipped += 1;
-                        if k.shift {
-                            self.emit(EV_KEY, KEY_LEFTSHIFT, 0)?;
-                        }
                         continue;
                     };
+                    // FR-93 P4c — shift goes in a report of its OWN, before
+                    // the key and after it. KWin (Plasma 6.6, measured) gives
+                    // every key in a report the modifiers that report ENDS
+                    // with: a key pressed together with shift's release came
+                    // out unshifted, so "A" typed "a" and "!" typed "1". And a
+                    // shift the viewer is holding is theirs: neither pressed
+                    // again nor let go of here.
+                    let press_shift = k.shift && !self.shift_held.contains(&true);
+                    if press_shift {
+                        self.emit(EV_KEY, KEY_LEFTSHIFT, 1)?;
+                        self.sync()?;
+                    }
                     self.emit(EV_KEY, code, 1)?;
                     self.emit(EV_KEY, code, 0)?;
-                    if k.shift {
-                        self.emit(EV_KEY, KEY_LEFTSHIFT, 0)?;
-                    }
                     // One report per character: a compositor coalescing an
                     // entire string into a single frame can drop repeats of the
                     // same key, which is exactly what typing "ll" looks like.
                     self.sync()?;
+                    if press_shift {
+                        self.emit(EV_KEY, KEY_LEFTSHIFT, 0)?;
+                        self.sync()?;
+                    }
                 }
                 if skipped > 0 && !self.warned_text {
                     self.warned_text = true;
@@ -603,10 +635,19 @@ mod tests {
     /// Inject one event into an injector over a plain file and decode what
     /// it wrote, as `(type, code, value)`.
     fn written(msg: InputMsg) -> Vec<(u16, u16, i32)> {
+        written_seq(vec![msg])
+    }
+
+    /// As [`written`], for a sequence through ONE injector that has a
+    /// verified layout (KeyText types nothing without one).
+    fn written_seq(msgs: Vec<InputMsg>) -> Vec<(u16, u16, i32)> {
         use std::io::{Read, Seek};
         let mut file = tempfile::tempfile().expect("a temp file");
         let mut inj = UinputInjector::over(file.try_clone().expect("clone the fd"));
-        inj.inject(msg).expect("inject");
+        inj.layout = Some(crate::input::keylayout::Layout::Us);
+        for msg in msgs {
+            inj.inject(msg).expect("inject");
+        }
         drop(inj);
         let mut bytes = Vec::new();
         file.rewind().expect("rewind");
@@ -652,6 +693,66 @@ mod tests {
                 (EV_KEY, BTN_LEFT, 0),
                 (EV_SYN, SYN_REPORT, 0),
             ]
+        );
+    }
+
+    const SYN: (u16, u16, i32) = (EV_SYN, SYN_REPORT, 0);
+    /// `KEY_A` — what `Layout::Us` strokes for both "a" and "A".
+    const KEY_A: u16 = 30;
+
+    /// FR-93 P4c — KWin gives every key in a report the modifiers that
+    /// report ENDS with, so shift goes in reports of its own: pressed before
+    /// the key, released after it. One report for all three typed "a".
+    #[test]
+    fn a_shifted_character_keeps_shift_in_reports_of_its_own() {
+        assert_eq!(
+            written_seq(vec![InputMsg::KeyText { text: "A".into() }]),
+            [
+                (EV_KEY, KEY_LEFTSHIFT, 1),
+                SYN,
+                (EV_KEY, KEY_A, 1),
+                (EV_KEY, KEY_A, 0),
+                SYN,
+                (EV_KEY, KEY_LEFTSHIFT, 0),
+                SYN,
+            ]
+        );
+    }
+
+    /// What a desktop browser sends for Shift+A: the shift as a `Key`, then
+    /// the letter as KeyText. The viewer's shift is theirs — not pressed
+    /// again, not let go of — so no left shift appears at all.
+    #[test]
+    fn a_shift_the_viewer_holds_is_left_alone() {
+        let right_shift = |down| InputMsg::Key {
+            code: 0xe5,
+            down,
+            mods: 0,
+        };
+        assert_eq!(
+            written_seq(vec![
+                right_shift(true),
+                InputMsg::KeyText { text: "A".into() },
+                right_shift(false),
+            ]),
+            [
+                (EV_KEY, KEY_RIGHTSHIFT, 1),
+                SYN,
+                (EV_KEY, KEY_A, 1),
+                (EV_KEY, KEY_A, 0),
+                SYN,
+                (EV_KEY, KEY_RIGHTSHIFT, 0),
+                SYN,
+            ]
+        );
+    }
+
+    /// The control: an unshifted character is still one report.
+    #[test]
+    fn an_unshifted_character_is_one_report() {
+        assert_eq!(
+            written_seq(vec![InputMsg::KeyText { text: "a".into() }]),
+            [(EV_KEY, KEY_A, 1), (EV_KEY, KEY_A, 0), SYN]
         );
     }
 }

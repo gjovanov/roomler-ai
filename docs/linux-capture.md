@@ -524,6 +524,27 @@ XTest reaches Xwayland clients only, so DRM capture without uinput is a
 read-only session. The rest — the device-node scan, the 10-bit repack, the
 field numbers — is in the [FR-36 spec](fr/FR-36-wayland-capture.md).
 
+⚠️ **uinput: shift goes in reports of its own** (FR-93 P4c). A desktop browser
+sends Shift+A as the shift `Key`, then "A" as KeyText. The backend wrote the
+letter and shift's release in one evdev report, and KWin gives every key in a
+report the modifiers that report ends with. So on a KDE system install "A"
+typed "a", and every shifted symbol came out unshifted: a password with a
+capital in it failed. Shift is now pressed in a report before the key and
+released in one after it, and a shift the viewer holds is left alone
+(`agents/roomlerd/src/input/uinput_backend.rs:537`).
+
+⚠️ **uinput: the injector opens before the first event** (FR-93 P4c). libinput
+adds a new uinput device asynchronously. Under load, a move written after the
+backend's 300 ms settle still reached nobody: 2 of 8 fresh devices on KDE on
+real hardware, and the AC4 oracle's first target went missing. The device used
+to be created at the session's first event. The input arbiter now opens it as
+soon as a session that may input has its control channel
+(`warm`, `agents/roomlerd/src/input/arbiter.rs:949`), which gives it the second
+or more a viewer takes to send anything. This applies on Linux only, and an
+injector without the OS's permission is never cached. The kill switch is
+`ROOMLERD_INPUT_WARM=0`; `ROOMLERD_UINPUT_SETTLE_MS` (at most 5 s) overrides
+the settle for measuring it on a host.
+
 ⚠️ **Root, or a refusal at open (FR-93 P3h).** `drmModeGetFB2` does not fail
 for a caller without `CAP_SYS_ADMIN`. It answers with the geometry and **no
 buffer handle**, so a daemon that is not root opened DRM capture without
