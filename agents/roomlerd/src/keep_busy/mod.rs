@@ -65,7 +65,7 @@ pub mod session_helper;
 pub use wire::SetRequest;
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -77,15 +77,44 @@ use engine::{Engine, Host, Reason, Settings, Snapshot};
 /// engine knows — exactly — that a remote person is active.
 static REMOTE_INPUT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
+/// FR-108 — the OS input-clock tick of the latest controller injection and of
+/// keep busy's latest own move (`presence::os_tick`, the clock
+/// `GetLastInputInfo` reports in), so a person's input can be told from the
+/// machine's by WHEN it came. `0` = none yet in this process.
+static LAST_REMOTE_INPUT_TICK: AtomicU32 = AtomicU32::new(0);
+static LAST_OWN_MOVE_TICK: AtomicU32 = AtomicU32::new(0);
+
 /// A controller's input reached the OS. Called by the arbiter for every
 /// injected session event (never a heartbeat, never a denied event).
 pub fn note_remote_input() {
     REMOTE_INPUT_EPOCH.fetch_add(1, Ordering::Relaxed);
+    LAST_REMOTE_INPUT_TICK.store(crate::presence::os_tick(), Ordering::Relaxed);
 }
 
 /// The current remote-input epoch.
 pub fn remote_input_epoch() -> u64 {
     REMOTE_INPUT_EPOCH.load(Ordering::Relaxed)
+}
+
+/// FR-108 — keep busy moved the pointer itself (a move the arbiter executed).
+pub fn note_own_move() {
+    LAST_OWN_MOVE_TICK.store(crate::presence::os_tick(), Ordering::Relaxed);
+}
+
+/// FR-108 — when the controller last injected, on the OS input clock.
+pub fn last_remote_input_tick() -> Option<u32> {
+    match LAST_REMOTE_INPUT_TICK.load(Ordering::Relaxed) {
+        0 => None,
+        t => Some(t),
+    }
+}
+
+/// FR-108 — when keep busy last moved the pointer, on the OS input clock.
+pub fn last_own_move_tick() -> Option<u32> {
+    match LAST_OWN_MOVE_TICK.load(Ordering::Relaxed) {
+        0 => None,
+        t => Some(t),
+    }
 }
 
 /// Is keep-busy built for this host at all? Windows (FR-92 P1), Linux X11

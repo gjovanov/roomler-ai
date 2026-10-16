@@ -24,6 +24,16 @@
 //! the OS reverts on its own — crash-safe by construction. The explicit
 //! restore (`ChangeDisplaySettingsExW(NULL, NULL, …)`) covers the orderly
 //! paths (toggle off, session end).
+//!
+//! FR-108 — **never on a screen someone is using.** The viewer's toggle is ON
+//! by default, so every request is decided by the device ([`request_for`]):
+//! the owner's `display_match` (`auto` | `always` | `never`), and under `auto`
+//! who is at the screen ([`crate::presence`]). Every request gets one answer,
+//! `rc:display-match.state` ([`state_json`]), so the viewer can say what
+//! happened instead of guessing.
+
+use crate::config::DisplayMatchPolicy;
+use crate::presence::Presence;
 
 /// Pick the largest mode (by area) that fits entirely within the requested
 /// box; ties broken toward the mode closest to the request's aspect. Returns
@@ -177,30 +187,64 @@ mod win {
     }
 }
 
+/// Why a switch did not happen (FR-108: each maps to the word the viewer is
+/// told). `Display` keeps rc.191's log texts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyError {
+    /// No mode the display offers fits inside the request.
+    NoFittingMode {
+        req_w: u32,
+        req_h: u32,
+        modes: usize,
+    },
+    /// `ChangeDisplaySettingsExW` refused (P0: `-1` on the lock screen).
+    SwitchFailed(i32),
+    /// Not a platform display match runs on.
+    Unsupported,
+}
+
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoFittingMode {
+                req_w,
+                req_h,
+                modes,
+            } => write!(
+                f,
+                "no supported mode fits within {req_w}x{req_h} ({modes} modes)"
+            ),
+            Self::SwitchFailed(rc) => write!(f, "ChangeDisplaySettingsExW failed rc={rc}"),
+            Self::Unsupported => write!(f, "display-match is Windows-only in v1"),
+        }
+    }
+}
+
 /// Apply a display-match request: pick the best-fitting mode for the
 /// viewer's stage and switch to it. Returns the mode picked (for the log)
-/// or an error string. Non-Windows: unsupported (logged by the caller).
-pub fn apply(req_w: u32, req_h: u32) -> Result<(u32, u32), String> {
+/// or why not. Non-Windows: unsupported.
+pub fn apply(req_w: u32, req_h: u32) -> Result<(u32, u32), ApplyError> {
     #[cfg(target_os = "windows")]
     {
         let modes = win::supported_modes();
         let Some((w, h)) = pick_display_mode(&modes, req_w, req_h) else {
-            return Err(format!(
-                "no supported mode fits within {req_w}x{req_h} ({} modes)",
-                modes.len()
-            ));
+            return Err(ApplyError::NoFittingMode {
+                req_w,
+                req_h,
+                modes: modes.len(),
+            });
         };
         if win::current_mode() == Some((w, h)) {
             return Ok((w, h)); // already there — nothing to change/restore
         }
         win::apply_mode(w, h)
             .map(|_| (w, h))
-            .map_err(|rc| format!("ChangeDisplaySettingsExW failed rc={rc}"))
+            .map_err(ApplyError::SwitchFailed)
     }
     #[cfg(not(target_os = "windows"))]
     {
         let _ = (req_w, req_h);
-        Err("display-match is Windows-only in v1".into())
+        Err(ApplyError::Unsupported)
     }
 }
 
@@ -228,7 +272,7 @@ pub fn apply_for(
     session: bson::oid::ObjectId,
     req_w: u32,
     req_h: u32,
-) -> Result<(u32, u32), String> {
+) -> Result<(u32, u32), ApplyError> {
     let picked = apply(req_w, req_h)?;
     *DM_OWNER.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
     Ok(picked)
@@ -245,6 +289,290 @@ pub fn restore_for(session: bson::oid::ObjectId) -> bool {
         true
     } else {
         false
+    }
+}
+
+// ── FR-108: the device decides, and answers ─────────────────────────────────
+
+/// The owner's `display_match`, live (a local `ConfigSet` re-seeds it; the
+/// server cannot reach it). 0 = auto, 1 = always, 2 = never.
+static DEVICE_POLICY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn policy_byte(p: DisplayMatchPolicy) -> u8 {
+    match p {
+        DisplayMatchPolicy::Auto => 0,
+        DisplayMatchPolicy::Always => 1,
+        DisplayMatchPolicy::Never => 2,
+    }
+}
+
+/// The owner set `display_match` (at start, and on every local change).
+pub fn set_device_policy(p: DisplayMatchPolicy) {
+    let was = DEVICE_POLICY.swap(policy_byte(p), std::sync::atomic::Ordering::Relaxed);
+    if was != policy_byte(p) {
+        tracing::info!(policy = ?p, "display-match: the owner's policy");
+    }
+}
+
+/// The owner's `display_match` now.
+pub fn device_policy() -> DisplayMatchPolicy {
+    match DEVICE_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => DisplayMatchPolicy::Always,
+        2 => DisplayMatchPolicy::Never,
+        _ => DisplayMatchPolicy::Auto,
+    }
+}
+
+/// Why a request was not switched, in the word the viewer is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Someone is using this screen.
+    Attended,
+    /// The screen is locked; the worker cannot switch it (P0).
+    Locked,
+    /// The owner set `display_match = never`.
+    DisabledOnDevice,
+    /// No mode the display offers fits the viewer's window.
+    NoFittingMode,
+    /// The switch itself failed.
+    SwitchFailed,
+    /// Not a platform display match runs on.
+    Unsupported,
+}
+
+impl Refusal {
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Attended => "attended",
+            Self::Locked => "locked",
+            Self::DisabledOnDevice => "disabled_on_device",
+            Self::NoFittingMode => "no_fitting_mode",
+            Self::SwitchFailed => "switch_failed",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+impl From<ApplyError> for Refusal {
+    fn from(e: ApplyError) -> Self {
+        match e {
+            ApplyError::NoFittingMode { .. } => Self::NoFittingMode,
+            ApplyError::SwitchFailed(_) => Self::SwitchFailed,
+            ApplyError::Unsupported => Self::Unsupported,
+        }
+    }
+}
+
+/// What the device answers a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// The display runs at this mode for the session.
+    On { w: u32, h: u32 },
+    /// Display match is off for this session (its viewer turned it off).
+    Off,
+    /// Not switched, and why.
+    Refused(Refusal),
+}
+
+/// May a switch be tried? The owner's policy, and under `auto` who is at the
+/// screen. `presence` is only read under `auto`, so `never` and `always` cost
+/// no OS call.
+pub fn may_switch(
+    policy: DisplayMatchPolicy,
+    presence: impl FnOnce() -> Presence,
+) -> Result<(), Refusal> {
+    match policy {
+        DisplayMatchPolicy::Never => Err(Refusal::DisabledOnDevice),
+        DisplayMatchPolicy::Always => Ok(()),
+        DisplayMatchPolicy::Auto => match presence() {
+            Presence::Locked => Err(Refusal::Locked),
+            Presence::Attended => Err(Refusal::Attended),
+            Presence::Unattended => Ok(()),
+        },
+    }
+}
+
+/// A refusal that hands the screen back: the person is using it, or its owner
+/// turned display match off. A mode this session applied earlier is restored.
+/// (Not for `locked`: the worker cannot touch the secure desktop, P0.)
+fn hands_the_screen_back(r: Refusal) -> bool {
+    matches!(r, Refusal::Attended | Refusal::DisabledOnDevice)
+}
+
+/// FR-108 — a viewer asked to match `req_w × req_h`. Blocks on OS calls: run
+/// it off the async threads.
+pub fn request_for(session: bson::oid::ObjectId, req_w: u32, req_h: u32) -> Answer {
+    if !cfg!(target_os = "windows") {
+        return Answer::Refused(Refusal::Unsupported);
+    }
+    if let Err(r) = may_switch(device_policy(), crate::presence::now) {
+        if hands_the_screen_back(r) && restore_for(session) {
+            tracing::info!(%session, why = r.word(), "display-match: restored this session's mode");
+        }
+        tracing::info!(req_w, req_h, why = r.word(), "display-match: not switched");
+        return Answer::Refused(r);
+    }
+    match apply_for(session, req_w, req_h) {
+        Ok((w, h)) => {
+            tracing::info!(
+                req_w,
+                req_h,
+                mode_w = w,
+                mode_h = h,
+                "display-match: switched host display mode"
+            );
+            Answer::On { w, h }
+        }
+        Err(e) => {
+            tracing::warn!(req_w, req_h, %e, "display-match: could not switch mode");
+            Answer::Refused(e.into())
+        }
+    }
+}
+
+/// The answer, as it goes to the viewer on the control channel.
+pub fn state_json(a: Answer) -> String {
+    let v = match a {
+        Answer::On { w, h } => serde_json::json!({
+            "t": "rc:display-match.state",
+            "on": true,
+            "mode": { "w": w, "h": h },
+        }),
+        Answer::Off => serde_json::json!({ "t": "rc:display-match.state", "on": false }),
+        Answer::Refused(r) => serde_json::json!({
+            "t": "rc:display-match.state",
+            "on": false,
+            "refused": r.word(),
+        }),
+    };
+    v.to_string()
+}
+
+#[cfg(test)]
+mod fr108_tests {
+    use super::*;
+
+    #[test]
+    fn never_refuses_without_asking_who_is_there() {
+        let r = may_switch(DisplayMatchPolicy::Never, || {
+            panic!("presence must not be read under never")
+        });
+        assert_eq!(r, Err(Refusal::DisabledOnDevice));
+    }
+
+    #[test]
+    fn always_switches_without_asking_who_is_there() {
+        let r = may_switch(DisplayMatchPolicy::Always, || {
+            panic!("presence must not be read under always")
+        });
+        assert_eq!(r, Ok(()));
+    }
+
+    #[test]
+    fn auto_switches_only_an_unattended_screen() {
+        assert_eq!(
+            may_switch(DisplayMatchPolicy::Auto, || Presence::Unattended),
+            Ok(())
+        );
+        assert_eq!(
+            may_switch(DisplayMatchPolicy::Auto, || Presence::Attended),
+            Err(Refusal::Attended)
+        );
+        assert_eq!(
+            may_switch(DisplayMatchPolicy::Auto, || Presence::Locked),
+            Err(Refusal::Locked)
+        );
+    }
+
+    #[test]
+    fn only_the_person_and_the_owner_take_the_screen_back() {
+        assert!(hands_the_screen_back(Refusal::Attended));
+        assert!(hands_the_screen_back(Refusal::DisabledOnDevice));
+        for r in [
+            Refusal::Locked,
+            Refusal::NoFittingMode,
+            Refusal::SwitchFailed,
+            Refusal::Unsupported,
+        ] {
+            assert!(!hands_the_screen_back(r), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn every_switch_failure_has_its_word() {
+        let cases = [
+            (
+                ApplyError::NoFittingMode {
+                    req_w: 946,
+                    req_h: 598,
+                    modes: 1,
+                },
+                "no_fitting_mode",
+            ),
+            (ApplyError::SwitchFailed(-1), "switch_failed"),
+            (ApplyError::Unsupported, "unsupported"),
+        ];
+        for (e, word) in cases {
+            assert_eq!(Refusal::from(e).word(), word, "{e}");
+        }
+        // rc.191's log text is unchanged: the field logs are grepped for it.
+        assert_eq!(
+            ApplyError::NoFittingMode {
+                req_w: 946,
+                req_h: 598,
+                modes: 1
+            }
+            .to_string(),
+            "no supported mode fits within 946x598 (1 modes)"
+        );
+        assert_eq!(
+            ApplyError::SwitchFailed(-1).to_string(),
+            "ChangeDisplaySettingsExW failed rc=-1"
+        );
+    }
+
+    #[test]
+    fn the_answer_on_the_wire() {
+        let on: serde_json::Value =
+            serde_json::from_str(&state_json(Answer::On { w: 1600, h: 900 })).unwrap();
+        assert_eq!(
+            on,
+            serde_json::json!({"t": "rc:display-match.state", "on": true, "mode": {"w": 1600, "h": 900}})
+        );
+        let off: serde_json::Value = serde_json::from_str(&state_json(Answer::Off)).unwrap();
+        assert_eq!(
+            off,
+            serde_json::json!({"t": "rc:display-match.state", "on": false})
+        );
+        let refused: serde_json::Value =
+            serde_json::from_str(&state_json(Answer::Refused(Refusal::Attended))).unwrap();
+        assert_eq!(
+            refused,
+            serde_json::json!({"t": "rc:display-match.state", "on": false, "refused": "attended"})
+        );
+    }
+
+    #[test]
+    fn the_policy_round_trips_through_the_static() {
+        let was = device_policy();
+        for p in [
+            DisplayMatchPolicy::Never,
+            DisplayMatchPolicy::Always,
+            DisplayMatchPolicy::Auto,
+        ] {
+            set_device_policy(p);
+            assert_eq!(device_policy(), p);
+        }
+        set_device_policy(was);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn elsewhere_every_request_is_unsupported() {
+        assert_eq!(
+            request_for(bson::oid::ObjectId::new(), 1600, 900),
+            Answer::Refused(Refusal::Unsupported)
+        );
     }
 }
 

@@ -433,6 +433,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // FR-99 — off until the device's owner allows it.
         privacy_mode_allowed: false,
         lock_on_end: Default::default(),
+        // FR-108 — display match only while nobody is using the screen.
+        display_match: Default::default(),
         // FR-101 P2b — no floor of the device's own until its owner sets one.
         rc_clipboard: Default::default(),
         rc_files: Default::default(),

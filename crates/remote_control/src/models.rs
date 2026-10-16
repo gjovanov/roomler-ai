@@ -7543,6 +7543,9 @@ mod tests {
             // session ends. A server may ask for stricter on a session (P3b),
             // never set the floor.
             "lock_on_end",
+            // FR-108 — whether a controller may switch this device's display.
+            // A server that could set it could take every screen it reaches.
+            "display_match",
         ] {
             assert!(
                 !keys.contains(&forbidden),

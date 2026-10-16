@@ -2831,6 +2831,18 @@ where
                             .into(),
                     }
                 }
+                // FR-108 — and whether a controller's display match may switch
+                // this console's display mode: it is the console person whose
+                // screen would change. Equality.
+                Ok(Request::ConfigSet { key, .. })
+                    if key == "display_match" && !peer.is_console_user() =>
+                {
+                    Response::Error {
+                        message: "only the person at this device's console can change \
+                              whether a remote session may switch this display"
+                            .into(),
+                    }
+                }
                 // FR-101 P2b — and what a remote session may take from this
                 // console: its clipboard, its files, its audio. Equality.
                 Ok(Request::ConfigSet { key, .. })
@@ -6962,6 +6974,42 @@ mod tests {
             let r = ask(
                 me,
                 r#"{"t":"config_set","d":{"key":"lock_on_end","value":"auto"}}"#,
+            )
+            .await;
+            assert!(!is_console_refusal(&r), "{r:?}");
+        }
+    }
+
+    /// FR-108 — whether a remote session may switch this console's display is
+    /// the console person's call too: an unidentified peer is refused, set AND
+    /// clear, on the exact key only.
+    #[tokio::test]
+    async fn only_the_console_user_decides_display_match() {
+        for line in [
+            r#"{"t":"config_set","d":{"key":"display_match","value":"always"}}"#,
+            r#"{"t":"config_set","d":{"key":"display_match"}}"#,
+        ] {
+            let r = ask(ClientPeer::UNKNOWN, line).await;
+            assert!(
+                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("display")),
+                "{line} → {r:?}"
+            );
+        }
+        let r = ask(
+            ClientPeer::UNKNOWN,
+            r#"{"t":"config_set","d":{"key":"display_match_x","value":"always"}}"#,
+        )
+        .await;
+        assert!(!is_console_refusal(&r), "{r:?}");
+        let me = ClientPeer {
+            session_id: console_session_id(),
+            uid: own_uid(),
+            system_account: None,
+        };
+        if me.is_console_user() {
+            let r = ask(
+                me,
+                r#"{"t":"config_set","d":{"key":"display_match","value":"never"}}"#,
             )
             .await;
             assert!(!is_console_refusal(&r), "{r:?}");

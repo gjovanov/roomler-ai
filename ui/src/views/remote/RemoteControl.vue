@@ -1382,6 +1382,13 @@
           >
             1:1 Match host display — {{ displayMatchOn ? 'ON' : 'OFF' }}
           </v-btn>
+          <div
+            v-if="displayMatchSaid"
+            class="text-caption text-medium-emphasis mt-1 ml-1"
+            data-testid="rc-display-match-said"
+          >
+            {{ displayMatchSaid }}
+          </div>
           <div class="text-caption text-medium-emphasis mb-1 ml-1 mt-4">Text sharpening (FSR)</div>
           <v-btn-toggle
             v-model="sharpen"
@@ -2026,6 +2033,7 @@ import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
 import KeepBusyMenu from '@/components/remote/KeepBusyMenu.vue'
 import type { KeepBusyPattern } from '@/composables/keepBusy'
+import { displayMatchSummary } from '@/composables/displayMatch'
 import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 import { asSentence } from '@/utils/sentence'
 
@@ -3448,9 +3456,19 @@ const agentSupportsDisplayMatch = computed<boolean>(() => {
   // there's no version gate needed (harmless no-op there).
   return (agent.value?.os ?? '').toLowerCase().startsWith('win')
 })
+/** FR-108 — what the device answered this session's request, in one line;
+ *  null when it said nothing (an agent before FR-108, or no request yet). */
+const displayMatchSaid = computed<string | null>(() =>
+  displayMatchOn.value ? displayMatchSummary(rc.displayMatchState.value) : null,
+)
 const displayMatchTooltip = computed<string>(() => {
   if (!agentSupportsDisplayMatch.value) {
     return 'Match remote display is available for Windows hosts only (v1)'
+  }
+  // FR-108 — the device decides (its owner's setting, and whether someone is
+  // using the screen); say what it answered when it has.
+  if (displayMatchSaid.value) {
+    return `Match remote display ON — ${displayMatchSaid.value}. Click to turn it off.`
   }
   return displayMatchOn.value
     ? 'Match remote display ON — the host switched its display mode to fit this window (restored on disconnect). Sharpest text.'
