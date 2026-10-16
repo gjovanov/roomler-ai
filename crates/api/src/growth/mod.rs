@@ -47,6 +47,11 @@
 //!   through the digest's own claim, in `growth_weekly`.
 //! * [`alerts`] — P10: the alert rules, their hourly evaluation, the
 //!   `growth_alerts` rows and the once-a-day mail.
+//! * [`quality`] — P9a: remote-desktop quality per day and agent version,
+//!   frozen nightly into `growth_quality_daily` from `remote_sessions`,
+//!   `agent_logs` (FR-22's time to first frame, before its 7-day horizon),
+//!   `agent_crashes` and `stats_machine_1d`; the Quality view and the
+//!   re-freeze route. Server only — no remote-control code path changes.
 
 pub mod alerts;
 pub mod campaigns;
@@ -59,6 +64,7 @@ pub mod keys;
 pub mod newsletter;
 pub mod org_daily;
 pub mod orgs;
+pub mod quality;
 pub mod read_key;
 pub mod render;
 pub mod revenue;
@@ -137,6 +143,11 @@ pub fn admin_routes(state: &AppState) -> Router<AppState> {
         // every rule now (what the hourly job does), for a field check.
         .route("/alerts", get(alerts::get_alerts))
         .route("/alerts/evaluate", post(alerts::evaluate_route))
+        // P9a — remote-desktop quality over a closed range of frozen days
+        // (per agent version, the day series), and a re-freeze of a closed
+        // range with the current exclusion set.
+        .route("/quality", get(quality::get_quality))
+        .route("/quality/backfill", post(quality::backfill_route))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             read_key::read_key_gate,

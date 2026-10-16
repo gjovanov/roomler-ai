@@ -257,6 +257,8 @@ async fn ac20_a_read_key_reads_what_the_admin_reads_and_never_writes() {
         // P4's view, a closed range (nothing on record: not measured, and
         // the same not-measured for both credentials).
         "/api/admin/growth/revenue?since=2026-01&until=2026-03".to_string(),
+        // P9a's view, a closed range (nothing frozen: not measured).
+        format!("/api/admin/growth/quality?since={since}&until={until}"),
     ];
     for path in &views {
         let (s_admin, mut admin) = get_json(&app, path, &token).await;
@@ -332,6 +334,11 @@ async fn ac20_a_read_key_reads_what_the_admin_reads_and_never_writes() {
         ),
         ("POST", "/api/admin/growth/weekly/run?week=2026-W01", None),
         ("POST", "/api/admin/growth/alerts/evaluate", None),
+        (
+            "POST",
+            "/api/admin/growth/quality/backfill?since=2026-01-01",
+            None,
+        ),
         ("POST", "/api/admin/growth/ingest/posts", Some("{}")),
         ("POST", "/api/admin/growth/ingest/snapshots", Some("{}")),
         ("GET", "/api/admin/growth/keys", None),

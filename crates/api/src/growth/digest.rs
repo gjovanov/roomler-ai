@@ -53,6 +53,9 @@ use roomler_ai_services::{
         growth_digest::{
             ClaimMode, ClaimOutcome, DigestDoc, DigestStatus, DigestStore, ExcludedCounts,
         },
+        growth_quality::{
+            ALL_VERSIONS, Dist, GrowthQualityDao, QualityDay, Scope, SessionQuality, TtffQuality,
+        },
         growth_social::{GROWTH_POST_SNAPSHOTS, GROWTH_POSTS, SNAPSHOTS},
         setup_diagnostics::SetupDiagnosticsDao,
     },
@@ -62,6 +65,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::purestat::{Filter, PurestatClient, PurestatError, Query, Row};
+use super::quality::{
+    SessionRow, rate_if_enough, session_projection, session_quality, session_row, version_order,
+};
 use crate::{error::ApiError, state::AppState};
 
 /// A `computing` claim older than this is a dead pod's, and is re-claimed.
@@ -832,25 +838,149 @@ pub struct EndReasonRow {
     pub count: i64,
 }
 
+/// P9a — one window's distribution: the sample size and the exact p50 /
+/// p90 (live from `remote_sessions`, which are kept).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DistSummary {
+    pub n: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p90: Option<i64>,
+}
+
+/// P9a — a [`DistSummary`] of the day, and of the trailing 7 and 28 days.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DistFigure {
+    pub day: DistSummary,
+    pub d7: DistSummary,
+    pub d28: DistSummary,
+}
+
+/// P9a — a percentile per window, `None` where there was no sample.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptFigure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d7: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d28: Option<i64>,
+}
+
+/// P9a — a rate per window, each only from the n floor ([`SMALL_N`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateFigure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d7: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d28: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteQuality {
+    /// Sessions ENDED in the window (`ended_at`), and their reasons.
     pub ended: Figure,
     pub hangups: Figure,
     pub refusals: Figure,
     pub failures: Figure,
     pub by_end_reason: Vec<EndReasonRow>,
+    /// P9a — sessions REQUESTED in the window (`created_at`) …
+    #[serde(default)]
+    pub requested: Figure,
+    /// … of which reached Active (`started_at` set), …
+    #[serde(default)]
+    pub reached_active: Figure,
+    /// … and of which ended without ever reaching it.
+    #[serde(default)]
+    pub not_reached: Figure,
+    /// `reached_active / requested`, only from 30 requested.
+    #[serde(default)]
+    pub reached_share: RateFigure,
+    /// Active sessions that ended: `ended_at − started_at`, milliseconds.
+    #[serde(default)]
+    pub duration_ms: DistFigure,
+    /// `stats.peak_fps` of the Active sessions that reported one.
+    #[serde(default)]
+    pub peak_fps: DistFigure,
+    /// `stats.avg_rtt_ms` of the Active sessions that reported one.
+    #[serde(default)]
+    pub avg_rtt_ms: DistFigure,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Crashes {
     pub total: Figure,
+    /// By the version the crash payload named (`agentVersion`).
     pub by_agent_version: Vec<KeyCount>,
+    /// P9a — devices online per day, summed (`stats_machine_1d`).
+    #[serde(default)]
+    pub device_days: Figure,
+    /// P9a — `total × 100 / device_days`, only from 30 device-days.
+    #[serde(default)]
+    pub per_100_device_days: RateFigure,
+}
+
+/// P9a — FR-22's time to first frame, from the frozen daily rows
+/// (`growth_quality_daily`): foreground tabs, first attempts, no drop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TtffFigures {
+    /// Records in the distribution.
+    pub n: Figure,
+    /// Frozen days of the window whose TTFF was measured.
+    pub days_measured: Figure,
+    pub p50_ms: OptFigure,
+    pub p90_ms: OptFigure,
+    /// `d7` and `d28` are estimates from the daily histograms; `day` is
+    /// exact.
+    pub windows_estimated: bool,
+    /// Records set aside: a hidden tab, and later attempts or a retry
+    /// after a drop.
+    pub hidden: Figure,
+    pub later_attempts: Figure,
+}
+
+/// P9a — one agent version on the day, from its frozen row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionDayRow {
+    pub agent_version: String,
+    pub requested: i64,
+    pub reached_active: i64,
+    pub not_reached: i64,
+    /// Sessions that ended on a failure-class reason, Active or not.
+    pub failures: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttff_n: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttff_p50_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttff_p90_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crashes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_days: Option<i64>,
+}
+
+/// A row stored before P9a has neither field: both read as not measured.
+fn quality_before_p9a<T>() -> Measured<T> {
+    Measured::NotMeasured(NotMeasured::later(
+        "time to first frame and the per-version table",
+        "P9a",
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Quality {
     pub remote: Measured<RemoteQuality>,
     pub crashes: Measured<Crashes>,
+    /// P9a — from the frozen rows; `not_measured` until the day is frozen.
+    #[serde(default = "quality_before_p9a")]
+    pub ttff: Measured<TtffFigures>,
+    /// P9a — the day by agent version, from the frozen rows; newest first.
+    #[serde(default = "quality_before_p9a")]
+    pub by_agent_version: Measured<Vec<VersionDayRow>>,
 }
 
 /// P8 — the posts one platform published in the windows.
@@ -2060,17 +2190,26 @@ async fn revenue_section(
     })
 }
 
+fn summary(d: &Dist) -> DistSummary {
+    DistSummary {
+        n: d.n,
+        p50: d.p50,
+        p90: d.p90,
+    }
+}
+
 async fn remote_quality(
     state: &AppState,
     w: &Windows,
     set: &ExclusionSet,
 ) -> Result<RemoteQuality, DigestError> {
+    let excluded = excluded_ids(&set.tenants);
     let docs = find_docs(
         state,
         "remote_sessions",
         doc! {
             "ended_at": w.between(Span::D28),
-            "tenant_id": { "$nin": excluded_ids(&set.tenants) },
+            "tenant_id": { "$nin": excluded.clone() },
         },
         doc! { "ended_at": 1, "end_reason": 1 },
     )
@@ -2102,12 +2241,50 @@ async fn remote_quality(
         })
         .collect();
     by_end_reason.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.reason.cmp(&b.reason)));
+
+    // P9a — the sessions REQUESTED in the windows, by what became of them,
+    // and the duration, frame-rate and RTT distributions of the Active ones:
+    // the rule the nightly freeze applies (`quality::session_quality`), live
+    // here because `remote_sessions` are kept.
+    let rows: Vec<SessionRow> = find_docs(
+        state,
+        "remote_sessions",
+        doc! { "created_at": w.between(Span::D28), "tenant_id": { "$nin": excluded } },
+        session_projection(),
+    )
+    .await?
+    .iter()
+    .filter_map(session_row)
+    .collect();
+    let per = |span: Span| session_quality(rows.iter().filter(|r| w.contains(span, r.created_ms)));
+    let (qd, q7, q28) = (per(Span::Day), per(Span::D7), per(Span::D28));
+    let count = |f: fn(&SessionQuality) -> i64| Figure {
+        day: f(&qd),
+        d7: f(&q7),
+        d28: f(&q28),
+    };
+    let dist = |f: fn(&SessionQuality) -> &Dist| DistFigure {
+        day: summary(f(&qd)),
+        d7: summary(f(&q7)),
+        d28: summary(f(&q28)),
+    };
     Ok(RemoteQuality {
         ended: w.count(ended),
         hangups: class_figure("hangup"),
         refusals: class_figure("refusal"),
         failures: class_figure("failure"),
         by_end_reason,
+        requested: count(|q| q.requested),
+        reached_active: count(|q| q.reached_active),
+        not_reached: count(|q| q.not_reached),
+        reached_share: RateFigure {
+            day: rate_if_enough(qd.reached_active, qd.requested, 1.0),
+            d7: rate_if_enough(q7.reached_active, q7.requested, 1.0),
+            d28: rate_if_enough(q28.reached_active, q28.requested, 1.0),
+        },
+        duration_ms: dist(|q| &q.duration_ms),
+        peak_fps: dist(|q| &q.peak_fps),
+        avg_rtt_ms: dist(|q| &q.avg_rtt_ms),
     })
 }
 
@@ -2116,28 +2293,178 @@ async fn crashes_section(
     w: &Windows,
     set: &ExclusionSet,
 ) -> Result<Crashes, DigestError> {
+    let excluded = excluded_ids(&set.tenants);
     let docs = find_docs(
         state,
         "agent_crashes",
         doc! {
             "reported_at": w.between(Span::D28),
-            "tenant_id": { "$nin": excluded_ids(&set.tenants) },
+            "tenant_id": { "$nin": excluded.clone() },
         },
-        doc! { "reported_at": 1, "agent_version": 1 },
+        doc! { "reported_at": 1, "agentVersion": 1, "agent_version": 1 },
     )
     .await?;
     let mut by_version: BTreeMap<String, i64> = BTreeMap::new();
     for d in &docs {
         if dt_ms(d, "reported_at").is_some_and(|t| w.contains(Span::Day, t)) {
-            *by_version
-                .entry(str_of(d, "agent_version").unwrap_or_else(|| "unknown".into()))
-                .or_insert(0) += 1;
+            // The payload is camelCase in the row (`AgentCrashPayload`,
+            // flattened): `agentVersion`. `agent_version` is read too, for
+            // a row written by hand. Before P9a only the latter was read,
+            // and every production crash was "unknown".
+            let version = str_of(d, "agentVersion")
+                .or_else(|| str_of(d, "agent_version"))
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "unknown".into());
+            *by_version.entry(version).or_insert(0) += 1;
         }
     }
+    let total = w.count(docs.iter().filter_map(|d| dt_ms(d, "reported_at")));
+    // P9a — device-days: one per device per day with online minutes
+    // (`stats_machine_1d` holds one row per device per day bucket).
+    let online = aggregate(
+        state,
+        "stats_machine_1d",
+        vec![
+            doc! { "$match": {
+                "ts": w.between(Span::D28),
+                "online_minutes": { "$gt": 0 },
+                "tenant_id": { "$nin": excluded },
+            } },
+            doc! { "$group": { "_id": { "a": "$agent_id", "t": "$ts" } } },
+        ],
+    )
+    .await?;
+    let device_days = w.count(
+        online
+            .iter()
+            .filter_map(|d| d.get_document("_id").ok().and_then(|id| dt_ms(id, "t"))),
+    );
+    let rate = |c: i64, d: i64| rate_if_enough(c, d, 100.0);
     Ok(Crashes {
-        total: w.count(docs.iter().filter_map(|d| dt_ms(d, "reported_at"))),
+        total,
         by_agent_version: key_counts(by_version),
+        device_days,
+        per_100_device_days: RateFigure {
+            day: rate(total.day, device_days.day),
+            d7: rate(total.d7, device_days.d7),
+            d28: rate(total.d28, device_days.d28),
+        },
     })
+}
+
+/// P9a — why a day has no frozen row yet.
+const NOT_FROZEN: &str = "the day is not frozen yet — the nightly quality freeze runs after \
+                          midnight UTC; POST /api/admin/growth/quality/backfill re-freezes it";
+
+/// P9a — what the frozen daily rows (`growth_quality_daily`) say: the day's
+/// time to first frame with its 7- and 28-day context, and the day's
+/// per-version table. Read from the rows rather than recomputed because the
+/// records behind TTFF expire after 7 days — the freeze is what keeps them.
+/// The scope follows the exclusion set: an empty set (`include_internal`)
+/// reads the `all` rows, any other the `external` rows.
+async fn frozen_quality(
+    state: &AppState,
+    w: &Windows,
+    set: &ExclusionSet,
+) -> Result<(Measured<TtffFigures>, Measured<Vec<VersionDayRow>>), DigestError> {
+    if !mounted(state, "fleet") {
+        return Ok((Measured::unmounted("fleet"), Measured::unmounted("fleet")));
+    }
+    let scope = if set.users.is_empty() && set.tenants.is_empty() {
+        Scope::All
+    } else {
+        Scope::External
+    };
+    let (day_s, d7_s, d28_s) = w.dates();
+    let rows = GrowthQualityDao::new(&state.db)
+        .rows_between(scope, &d28_s, &day_s)
+        .await?;
+    let all: Vec<&QualityDay> = rows
+        .iter()
+        .filter(|r| r.agent_version == ALL_VERSIONS)
+        .collect();
+    if !all.iter().any(|r| r.day == day_s) {
+        let n = NotMeasured::now(NOT_FROZEN);
+        return Ok((Measured::NotMeasured(n.clone()), Measured::NotMeasured(n)));
+    }
+    let measured = |from: &str| -> Vec<&TtffQuality> {
+        all.iter()
+            .filter(|r| r.day.as_str() >= from)
+            .filter_map(|r| r.ttff.as_ref())
+            .collect()
+    };
+    let (td, t7, t28) = (measured(&day_s), measured(&d7_s), measured(&d28_s));
+    let ttff = if td.is_empty() {
+        Measured::NotMeasured(NotMeasured::now(
+            "the day's connect records (agent_logs, 7-day TTL) had expired before it was frozen",
+        ))
+    } else {
+        let pool = |v: &[&TtffQuality]| Dist::pool(v.iter().map(|t| &t.dist));
+        let (pd, p7, p28) = (pool(&td), pool(&t7), pool(&t28));
+        let sum = |v: &[&TtffQuality], f: fn(&TtffQuality) -> i64| -> i64 {
+            v.iter().map(|t| f(t)).sum()
+        };
+        Measured::Value(TtffFigures {
+            n: Figure {
+                day: pd.n,
+                d7: p7.n,
+                d28: p28.n,
+            },
+            days_measured: Figure {
+                day: td.len() as i64,
+                d7: t7.len() as i64,
+                d28: t28.len() as i64,
+            },
+            p50_ms: OptFigure {
+                day: pd.p50,
+                d7: p7.p50,
+                d28: p28.p50,
+            },
+            p90_ms: OptFigure {
+                day: pd.p90,
+                d7: p7.p90,
+                d28: p28.p90,
+            },
+            windows_estimated: true,
+            hidden: Figure {
+                day: sum(&td, |t| t.hidden),
+                d7: sum(&t7, |t| t.hidden),
+                d28: sum(&t28, |t| t.hidden),
+            },
+            later_attempts: Figure {
+                day: sum(&td, |t| t.later_attempts),
+                d7: sum(&t7, |t| t.later_attempts),
+                d28: sum(&t28, |t| t.later_attempts),
+            },
+        })
+    };
+    let mut versions: Vec<VersionDayRow> = rows
+        .iter()
+        .filter(|r| r.day == day_s && r.agent_version != ALL_VERSIONS)
+        .map(|r| {
+            let s = r.sessions.as_ref();
+            VersionDayRow {
+                agent_version: r.agent_version.clone(),
+                requested: s.map_or(0, |s| s.requested),
+                reached_active: s.map_or(0, |s| s.reached_active),
+                not_reached: s.map_or(0, |s| s.not_reached),
+                failures: s.map_or(0, |s| {
+                    s.by_end_reason
+                        .iter()
+                        .filter(|c| end_reason_class(&c.reason) == "failure")
+                        .map(|c| c.count)
+                        .sum()
+                }),
+                ttff_n: r.ttff.as_ref().map(|t| t.dist.n),
+                ttff_p50_ms: r.ttff.as_ref().and_then(|t| t.dist.p50),
+                ttff_p90_ms: r.ttff.as_ref().and_then(|t| t.dist.p90),
+                crashes: r.crashes,
+                device_days: r.device_days,
+            }
+        })
+        .collect();
+    versions.sort_by(|a, b| version_order(&a.agent_version, &b.agent_version));
+    Ok((ttff, Measured::Value(versions)))
 }
 
 /// P8 — the posts published per platform in the 28-day window, and the
@@ -2613,6 +2940,8 @@ pub async fn compute(
     let revenue = revenue_section(state, &w, set).await?;
     // P8 — core-level collections, read whether or not `saas` is mounted.
     let social = social_section(state, &w).await?;
+    // P9a — the day's TTFF and per-version table come from the frozen rows.
+    let (ttff, by_agent_version) = frozen_quality(state, &w, set).await?;
     let quality = Quality {
         remote: match &remote {
             Some(_) => Measured::Value(remote_quality(state, &w, set).await?),
@@ -2622,6 +2951,8 @@ pub async fn compute(
             Some(_) => Measured::Value(crashes_section(state, &w, set).await?),
             None => Measured::unmounted("fleet"),
         },
+        ttff,
+        by_agent_version,
     };
 
     // The web plane last, and each piece on its own: a purestat failure

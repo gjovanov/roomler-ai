@@ -18,17 +18,18 @@
 //!   digest carries no personal addresses.
 
 use roomler_ai_services::{
-    dao::{growth_alert::GrowthAlert, growth_digest::DigestDoc},
+    dao::{growth_alert::GrowthAlert, growth_digest::DigestDoc, growth_quality::Pooled},
     newsletter::escape_html,
 };
 
 use super::{
     campaigns::{Rate, WebCells},
     digest::{
-        AlertRow, AlertsSection, CampaignGoals, Figure, FigureF, Measured, NotMeasured, SMALL_N,
-        Sections,
+        AlertRow, AlertsSection, CampaignGoals, DistFigure, DistSummary, Figure, FigureF, Measured,
+        NotMeasured, RateFigure, SMALL_N, Sections,
     },
     funnel::StepCounts,
+    quality::{QualityReport, VersionQuality},
     weekly::{WeekFigure, WeeklyHeadline, WeeklySections},
 };
 
@@ -72,6 +73,78 @@ pub fn fig(f: &Figure) -> String {
 
 pub fn figf(f: &FigureF) -> String {
     format!("{:.1} (7d {:.1} · 28d {:.1})", f.day, f.d7, f.d28)
+}
+
+/// P9a — milliseconds as a reader reads them: `820 ms`, `2.7 s`, `12.3 min`,
+/// `1.5 h`.
+pub fn ms_label(ms: i64) -> String {
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else if ms < 60_000 {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    } else if ms < 3_600_000 {
+        format!("{:.1} min", ms as f64 / 60_000.0)
+    } else {
+        format!("{:.1} h", ms as f64 / 3_600_000.0)
+    }
+}
+
+fn opt_unit(v: Option<i64>, unit: &dyn Fn(i64) -> String) -> String {
+    v.map(unit).unwrap_or_else(|| "—".into())
+}
+
+/// P9a — `p50 2.7 s · p90 6.1 s (n 94)`, or `no sample`.
+pub fn dist_summary_label(d: &DistSummary, unit: &dyn Fn(i64) -> String) -> String {
+    if d.n == 0 {
+        return "no sample".into();
+    }
+    format!(
+        "p50 {} · p90 {} (n {})",
+        opt_unit(d.p50, unit),
+        opt_unit(d.p90, unit),
+        d.n
+    )
+}
+
+/// P9a — the day's distribution, then the windows'.
+pub fn dist_fig(d: &DistFigure, unit: &dyn Fn(i64) -> String) -> String {
+    format!(
+        "{} · 7d {} · 28d {}",
+        dist_summary_label(&d.day, unit),
+        dist_summary_label(&d.d7, unit),
+        dist_summary_label(&d.d28, unit)
+    )
+}
+
+/// P9a — a pooled distribution, `≈` when estimated from the daily
+/// histograms rather than one day's exact values.
+pub fn pooled_label(p: &Pooled, unit: &dyn Fn(i64) -> String) -> String {
+    if p.n == 0 {
+        return "no sample".into();
+    }
+    format!(
+        "{}p50 {} · p90 {} (n {})",
+        if p.exact { "" } else { "≈ " },
+        opt_unit(p.p50, unit),
+        opt_unit(p.p90, unit),
+        p.n
+    )
+}
+
+/// P9a — a rate per window; `n < 30` where the floor was not reached.
+pub fn rate_fig(r: &RateFigure, unit: &dyn Fn(f64) -> String) -> String {
+    let one = |v: Option<f64>| v.map(unit).unwrap_or_else(|| format!("— (n < {SMALL_N})"));
+    format!("{} · 7d {} · 28d {}", one(r.day), one(r.d7), one(r.d28))
+}
+
+/// A share as `93.3 %`.
+fn share(v: f64) -> String {
+    format!("{:.1} %", v * 100.0)
+}
+
+fn opt_count(v: Option<i64>) -> String {
+    v.map(|c| c.to_string())
+        .unwrap_or_else(|| "not measured".into())
 }
 
 pub fn not_measured(n: &NotMeasured) -> String {
@@ -729,6 +802,17 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
     out.push(Heading("Quality".into()));
     match &s.quality.remote {
         Measured::Value(q) => {
+            // P9a — the sessions requested, by what became of them.
+            out.push(Line("Sessions requested".into(), fig(&q.requested)));
+            out.push(Line(
+                "… reached Active".into(),
+                format!(
+                    "{} — share {}",
+                    fig(&q.reached_active),
+                    rate_fig(&q.reached_share, &share)
+                ),
+            ));
+            out.push(Line("… never reached Active".into(), fig(&q.not_reached)));
             out.push(Line("Sessions ended".into(), fig(&q.ended)));
             out.push(Line("Hang-ups".into(), fig(&q.hangups)));
             out.push(Line("Refusals".into(), fig(&q.refusals)));
@@ -745,12 +829,64 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
                         .collect(),
                 ));
             }
+            out.push(Line(
+                "Session duration (Active, ended)".into(),
+                dist_fig(&q.duration_ms, &ms_label),
+            ));
+            out.push(Line(
+                "Peak frame rate".into(),
+                dist_fig(&q.peak_fps, &|v| format!("{v} fps")),
+            ));
+            out.push(Line(
+                "Average RTT".into(),
+                dist_fig(&q.avg_rtt_ms, &ms_label),
+            ));
         }
         Measured::NotMeasured(n) => out.push(Line("Remote sessions".into(), not_measured(n))),
+    }
+    // P9a — FR-22's time to first frame, from the frozen daily rows.
+    match &s.quality.ttff {
+        Measured::Value(t) => {
+            let ms = |v: Option<i64>| opt_unit(v, &ms_label);
+            out.push(Line(
+                "Time to first frame (foreground, first attempts)".into(),
+                format!(
+                    "p50 {} · p90 {} (n {}) · 7d ≈ p50 {} · p90 {} (n {}, {} days) · 28d ≈ p50 {} · p90 {} (n {}, {} days)",
+                    ms(t.p50_ms.day),
+                    ms(t.p90_ms.day),
+                    t.n.day,
+                    ms(t.p50_ms.d7),
+                    ms(t.p90_ms.d7),
+                    t.n.d7,
+                    t.days_measured.d7,
+                    ms(t.p50_ms.d28),
+                    ms(t.p90_ms.d28),
+                    t.n.d28,
+                    t.days_measured.d28,
+                ),
+            ));
+            out.push(Line(
+                "… records set aside".into(),
+                format!(
+                    "hidden tab {} · later attempts {}",
+                    fig(&t.hidden),
+                    fig(&t.later_attempts)
+                ),
+            ));
+        }
+        Measured::NotMeasured(n) => out.push(Line("Time to first frame".into(), not_measured(n))),
     }
     match &s.quality.crashes {
         Measured::Value(c) => {
             out.push(Line("Agent crashes".into(), fig(&c.total)));
+            out.push(Line(
+                "Device-days (devices online)".into(),
+                fig(&c.device_days),
+            ));
+            out.push(Line(
+                "Crashes per 100 device-days".into(),
+                rate_fig(&c.per_100_device_days, &|v| format!("{v:.2}")),
+            ));
             if !c.by_agent_version.is_empty() {
                 out.push(Table(
                     vec!["Agent version".into(), "Crashes".into()],
@@ -763,6 +899,54 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
         }
         Measured::NotMeasured(n) => out.push(Line("Agent crashes".into(), not_measured(n))),
     }
+    // P9a — the day by agent version, from the frozen rows.
+    match &s.quality.by_agent_version {
+        Measured::Value(rows) if !rows.is_empty() => out.push(Table(
+            vec![
+                "Agent version".into(),
+                "Requested".into(),
+                "Active".into(),
+                "Never active".into(),
+                "Failures".into(),
+                "TTFF p50 · p90 (n)".into(),
+                "Crashes".into(),
+                "Device-days".into(),
+            ],
+            rows.iter()
+                .map(|r| {
+                    vec![
+                        r.agent_version.clone(),
+                        r.requested.to_string(),
+                        r.reached_active.to_string(),
+                        r.not_reached.to_string(),
+                        r.failures.to_string(),
+                        match r.ttff_n {
+                            Some(n) if n > 0 => format!(
+                                "{} · {} ({n})",
+                                opt_unit(r.ttff_p50_ms, &ms_label),
+                                opt_unit(r.ttff_p90_ms, &ms_label)
+                            ),
+                            Some(_) => "no sample".into(),
+                            None => "not measured".into(),
+                        },
+                        opt_count(r.crashes),
+                        opt_count(r.device_days),
+                    ]
+                })
+                .collect(),
+        )),
+        Measured::Value(_) => out.push(Note(
+            "No session, crash or online device on record for the day, by version.".into(),
+        )),
+        Measured::NotMeasured(n) => out.push(Line("By agent version".into(), not_measured(n))),
+    }
+    out.push(Note(
+        "Time to first frame is FR-22's browser record (a foreground tab, a first attempt, no \
+         drop), frozen nightly from agent_logs before its 7-day horizon; the 7- and 28-day \
+         values are estimates from the daily histograms. A device's version is read from its \
+         own logs of the day, else from its device row. A rate appears only from 30."
+            .into(),
+    ));
 
     out.push(Heading("Social reach".into()));
     match &s.social {
@@ -1305,6 +1489,8 @@ pub fn weekly_blocks(doc: &DigestDoc, s: &WeeklySections) -> Vec<Block> {
         ));
     }
 
+    quality_blocks(&mut out, &s.quality);
+
     alert_blocks(&mut out, &s.alerts, "the week");
 
     out.push(Note(format!(
@@ -1314,6 +1500,166 @@ pub fn weekly_blocks(doc: &DigestDoc, s: &WeeklySections) -> Vec<Block> {
         doc.excluded.users, doc.excluded.tenants, h.week, h.since, h.until, doc.attempts
     )));
     out
+}
+
+/// P9a — one version's (or every version's) lines of a quality report.
+fn version_lines(out: &mut Vec<Block>, v: &VersionQuality) {
+    use Block::*;
+    match &v.sessions {
+        Some(s) => {
+            out.push(Line("Sessions requested".into(), s.requested.to_string()));
+            out.push(Line(
+                "… reached Active".into(),
+                format!(
+                    "{} ({})",
+                    s.reached_active,
+                    s.reached_share
+                        .map(share)
+                        .unwrap_or_else(|| format!("n < {SMALL_N}"))
+                ),
+            ));
+            out.push(Line(
+                "… never reached Active".into(),
+                s.not_reached.to_string(),
+            ));
+            out.push(Line(
+                "… pending at the freeze".into(),
+                s.pending.to_string(),
+            ));
+            if !s.by_end_reason.is_empty() {
+                out.push(Table(
+                    vec![
+                        "Reached Active".into(),
+                        "End reason".into(),
+                        "Sessions".into(),
+                    ],
+                    s.by_end_reason
+                        .iter()
+                        .map(|c| {
+                            vec![
+                                if c.reached_active { "yes" } else { "no" }.into(),
+                                c.reason.clone(),
+                                c.count.to_string(),
+                            ]
+                        })
+                        .collect(),
+                ));
+            }
+            out.push(Line(
+                "Session duration (Active, ended)".into(),
+                pooled_label(&s.duration_ms, &ms_label),
+            ));
+            out.push(Line(
+                "Peak frame rate".into(),
+                pooled_label(&s.peak_fps, &|v| format!("{v} fps")),
+            ));
+            out.push(Line(
+                "Average RTT".into(),
+                pooled_label(&s.avg_rtt_ms, &ms_label),
+            ));
+        }
+        None => out.push(Line(
+            "Sessions".into(),
+            "not measured — remote module not mounted".into(),
+        )),
+    }
+    match &v.ttff {
+        Some(t) => out.push(Line(
+            "Time to first frame (foreground, first attempts)".into(),
+            format!(
+                "{}p50 {} · p90 {} (n {}, {} days measured) · set aside: hidden tab {} · later attempts {}",
+                if t.exact { "" } else { "≈ " },
+                opt_unit(t.p50_ms, &ms_label),
+                opt_unit(t.p90_ms, &ms_label),
+                t.n,
+                t.days_measured,
+                t.hidden,
+                t.later_attempts
+            ),
+        )),
+        None => out.push(Line(
+            "Time to first frame".into(),
+            "not measured — no frozen day with its connect records still complete".into(),
+        )),
+    }
+    out.push(Line("Agent crashes".into(), opt_count(v.crashes)));
+    out.push(Line(
+        "Device-days (devices online)".into(),
+        opt_count(v.device_days),
+    ));
+    out.push(Line(
+        "Crashes per 100 device-days".into(),
+        v.crashes_per_100_device_days
+            .map(|r| format!("{r:.2}"))
+            .unwrap_or_else(|| format!("— (n < {SMALL_N} device-days)")),
+    ));
+}
+
+/// P9a — the weekly roll-up's quality section: the Quality view's own
+/// report for Mon–Sun, from the frozen daily rows.
+fn quality_blocks(out: &mut Vec<Block>, q: &QualityReport) {
+    use Block::*;
+    out.push(Heading("Remote-desktop quality — the week".into()));
+    if let Some(n) = &q.not_measured {
+        out.push(Line("Quality".into(), not_measured(n)));
+        return;
+    }
+    out.push(Line(
+        "Frozen days".into(),
+        format!("{} of {}", q.frozen_days, q.days),
+    ));
+    if let Some(t) = &q.totals {
+        version_lines(out, t);
+    }
+    if !q.by_agent_version.is_empty() {
+        out.push(Table(
+            vec![
+                "Agent version".into(),
+                "Requested".into(),
+                "Active".into(),
+                "Never active".into(),
+                "TTFF p50 · p90 (n)".into(),
+                "Crashes".into(),
+                "Device-days".into(),
+                "Per 100 device-days".into(),
+            ],
+            q.by_agent_version
+                .iter()
+                .map(|v| {
+                    let s = v.sessions.as_ref();
+                    vec![
+                        v.agent_version.clone(),
+                        s.map(|s| s.requested.to_string()).unwrap_or_default(),
+                        s.map(|s| s.reached_active.to_string()).unwrap_or_default(),
+                        s.map(|s| s.not_reached.to_string()).unwrap_or_default(),
+                        match &v.ttff {
+                            Some(t) if t.n > 0 => format!(
+                                "{}{} · {} ({})",
+                                if t.exact { "" } else { "≈ " },
+                                opt_unit(t.p50_ms, &ms_label),
+                                opt_unit(t.p90_ms, &ms_label),
+                                t.n
+                            ),
+                            Some(_) => "no sample".into(),
+                            None => "not measured".into(),
+                        },
+                        opt_count(v.crashes),
+                        opt_count(v.device_days),
+                        v.crashes_per_100_device_days
+                            .map(|r| format!("{r:.2}"))
+                            .unwrap_or_else(|| "—".into()),
+                    ]
+                })
+                .collect(),
+        ));
+    }
+    out.push(Note(
+        "Time to first frame is FR-22's browser record (a foreground tab, a first attempt, no \
+         drop), frozen nightly from agent_logs before its 7-day horizon; a value marked ≈ is \
+         estimated from the daily histograms. A device's version is read from its own logs of \
+         the day, else from its device row. A rate appears only from 30."
+            .into(),
+    ));
 }
 
 /// P10 — an alert's mail: the rule, the key, the detail, and how many
@@ -1580,6 +1926,8 @@ mod tests {
             quality: Quality {
                 remote: Measured::unmounted("remote"),
                 crashes: Measured::unmounted("fleet"),
+                ttff: Measured::unmounted("fleet"),
+                by_agent_version: Measured::unmounted("fleet"),
             },
             install: Install {
                 fetches: Measured::Value(vec![FetchRow {
@@ -1810,6 +2158,7 @@ mod tests {
     /// rate with its n, a not-measured cell as a reason, and no address.
     #[test]
     fn the_weekly_roll_up_renders_its_baselines_and_keeps_every_n() {
+        use super::super::quality::QualityReport;
         use super::super::{
             campaigns::{CampaignsReport, PullSummary, Totals},
             channels::ChannelsReport,
@@ -1981,12 +2330,33 @@ mod tests {
                 cleared: vec![],
                 open: vec![],
             }),
+            quality: QualityReport {
+                enabled: true,
+                since: "2026-10-05".into(),
+                until: "2026-10-11".into(),
+                include_internal: false,
+                excluded,
+                n_floor: SMALL_N,
+                days: 7,
+                frozen_days: 0,
+                ttff_horizon_days: 7,
+                not_measured: Some(NotMeasured::now("no frozen day in the range")),
+                totals: None,
+                by_agent_version: vec![],
+                series: vec![],
+            },
         };
         let text = render_weekly_text(&doc, &s);
         assert!(
             text.contains("Roomler weekly roll-up — 2026-W41 (2026-10-05 → 2026-10-11)"),
             "{text}"
         );
+        // P9a — a week with nothing frozen is a reason, never zeros.
+        assert!(
+            text.contains("Quality: not measured — no frozen day in the range"),
+            "{text}"
+        );
+        assert!(!text.contains("Sessions requested"));
         assert!(text.contains("Sign-ups: 12 (prev 9 · 4w avg 5.0)"));
         assert!(text.contains("Orgs created: 3 (prev 1 · 4w avg 1.5)"));
         assert!(text.contains("Devices enrolled: not measured — fleet module not mounted"));

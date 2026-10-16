@@ -28,6 +28,7 @@
         <v-tab value="orgs">Orgs</v-tab>
         <v-tab value="cohorts">Cohorts</v-tab>
         <v-tab value="revenue">Revenue</v-tab>
+        <v-tab value="quality">Quality</v-tab>
         <v-tab value="digest">Digest</v-tab>
         <v-tab value="weekly">Weekly</v-tab>
       </v-tabs>
@@ -307,6 +308,12 @@
           <growth-revenue />
         </v-window-item>
 
+        <!-- ── Quality (P9a) ─────────────────────────────────────────── -->
+        <!-- Lazily rendered: the component loads its own range on first open. -->
+        <v-window-item value="quality">
+          <growth-quality />
+        </v-window-item>
+
         <!-- ── Digest (P1d) ──────────────────────────────────────────── -->
         <v-window-item value="digest">
           <div class="d-flex align-center flex-wrap mb-3" style="gap: 12px">
@@ -471,6 +478,7 @@ import GrowthWeekly from '@/components/growth/GrowthWeekly.vue'
 import GrowthNode from '@/components/growth/GrowthNode.vue'
 import GrowthNotMeasured from '@/components/growth/GrowthNotMeasured.vue'
 import GrowthPercentiles from '@/components/growth/GrowthPercentiles.vue'
+import GrowthQuality from '@/components/growth/GrowthQuality.vue'
 import GrowthRevenue from '@/components/growth/GrowthRevenue.vue'
 import TimeSeriesChart from '@/components/stats/TimeSeriesChart.vue'
 
@@ -642,8 +650,9 @@ const excluded = computed<ExcludedCounts | null>(
   () => preview.value?.excluded ?? digest.value?.excluded ?? null,
 )
 
-// `install` since P3b: the wizard steps table carries five figure columns.
-const WIDE = new Set(['signups', 'campaigns', 'website', 'blog', 'newsletter', 'revenue', 'install'])
+// `install` since P3b: the wizard steps table carries five figure columns;
+// `quality` since P9a: the per-version table carries eight.
+const WIDE = new Set(['signups', 'campaigns', 'website', 'blog', 'newsletter', 'revenue', 'install', 'quality'])
 function wide(key: string | number): boolean {
   return WIDE.has(String(key))
 }

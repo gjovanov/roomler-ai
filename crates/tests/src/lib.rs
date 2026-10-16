@@ -105,6 +105,13 @@ mod growth_newsletter_tests;
 /// clearing, and mailing at most once a day.
 #[cfg(test)]
 mod growth_p10_tests;
+/// FR-102 P9a — remote-desktop quality from what is already recorded: the
+/// nightly freeze of `growth_quality_daily` from the four sources as they
+/// are really written (the camelCase crash payload, the browser's
+/// `rc.connect` records, the agents' own batches), both scopes, the 7-day
+/// log horizon, the Quality view and the digest's and weekly's sections.
+#[cfg(test)]
+mod growth_quality_tests;
 /// FR-102 P4 — billed revenue through Stripe's own signature scheme (AC13's
 /// test half: the lifecycle's invoice amounts, MRR month by month, the
 /// coupon control), the frozen months surviving an org's purge, the
