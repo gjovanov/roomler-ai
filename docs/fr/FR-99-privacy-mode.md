@@ -281,14 +281,27 @@ locked from there, so no new process or token is needed.
 | The lock, at the LAST end | `hide_session` (every end: the viewer's hangup, the host's Disconnect, a limit, the connection dropping) asks the tracker. It locks only when no other session is live, and only if this end or an earlier one since the last lock asked for it. A session whose answer never left has no say (`session_aborted`). The OS call runs on a thread of its own |
 | Mechanisms | Windows `LockWorkStation()`; Linux `loginctl lock-session` on seat0's active session; macOS none yet (an end that should lock logs that it could not) |
 
-**The default, against decision 3** (`auto` on new installs, `never` on existing ones until the field cells
-pass). P3a ships `never` everywhere, because AC7's field cells have not passed yet. The flip for new
-installs comes after them, written into the config that enrollment creates, so an existing config that
-lacks the key keeps reading `never`. ⚠️ **A refinement, to confirm with the operator:** the flip should
-cover only installs that can unlock remotely, the Windows service (SystemContext) and the Linux root
-daemon. A per-user install's worker cannot reach the secure desktop. With `auto` there, a session started
-on an idle computer would lock it at the end, and the next session would see a padlock until someone signs
-in at the machine. A mesh feature must never cost the operator remote access to the box.
+**The default, as built (decision 3, P3c, 2026-10-16).** P3a shipped `never` everywhere until AC7's field
+cells passed (0.4.139, §8 row 16). Now a **fresh Windows service install** is written with
+`lock_on_end = auto`. That covers the wizard's SystemContext flavour and `roomlerd enroll
+--machine-global` (`install.ps1 -Role daemon-system`). Both call one helper,
+[`enrollment.rs:707`](../../crates/agent-core/src/enrollment.rs#L707) `apply_service_install_defaults`,
+from [`main.rs:2479`](../../agents/roomlerd/src/main.rs#L2479) and
+[`orchestrator_agent.rs:574`](../../agents/roomler-setup/src/orchestrator_agent.rs#L574):
+
+| Install | Starts at | Why |
+|---|---|---|
+| Windows service (SystemContext), fresh | `auto` | its worker is SYSTEM in the console session and reaches the secure desktop, so the next controller can lift the lock (§8 rows 12, 16) |
+| Windows per-user, or perMachine without SystemContext | `never` | the worker cannot reach the secure desktop: a lock at the end would leave the next session at a padlock nobody can lift remotely |
+| Linux root daemon | `never` | the operator's refinement named it, but no field cell has shown a remote unlock there yet (X11 and Wayland); the flip waits for one |
+| any install already in the field, re-enrolled | what it had | a refresh, a rebind or an appended org keeps the existing config ([`enrollment.rs:691`](../../crates/agent-core/src/enrollment.rs#L691) `takes_service_install_defaults`), and a config that lacks the key reads `never` |
+
+The wizard always writes a fresh config, so a wizard install counts as new.
+
+⚠️ **`auto` also locks an unlocked computer that nobody had touched for 5 minutes**, because it restores
+what it found. A kiosk that signs itself in and is left alone ends each session at a padlock. Someone has to
+sign in, either at the machine or through the next session, which needs the account's password. Where
+that is wrong, the person at the console sets `roomler config set lock_on_end never`.
 
 ⚠️ **`auto` restores what was found at the start.** A person who unlocked the computer during the session
 is locked out at its end and signs in again. Telling their input from the controller's would need the
@@ -388,9 +401,10 @@ the machine it runs on would mute a developer's laptop.
 | P1c | The viewer: the toggle, the refusal reasons, asking for `PRIVACY` only from a device that serves it (§3c as built) | the toggle | **merged** #2199 (`f9a66a01e`): `usePrivacyMode.spec.ts` (11), the vitest suite and `vue-tsc`. **Field-verified** (§8 rows 9–10): the toggle reaches the curtain through the channel on agent 0.4.136 |
 | P1d | The device's account (§3c as built): `rc:privacy.activity`, the `privacy_activity` claims collection and its route, the ledger that lets the next process report a curtain this one died holding (`worker_exit`) | none needed: an older server drops the frame, an older agent sends none | **#2258**: unit, channel and integration tests with four negative controls (§3c). **Field-verified on 0.4.139** (§8 rows 15 and 17): killing the curtained worker (`Stop-Process -Force`) left no report on 0.4.138; on 0.4.139 the next worker sent `off {worker_exit}` |
 | P2 | The input block, if P0 cleared it | `privacy_input_block=false` | — |
-| P3 | Lock on end (Windows, Linux, macOS), in two steps below | `lock_on_end=never` | P3a and P3b merged, both in agent 0.4.139. **AC7 and AC9 are field-verified on 0.4.139** (§8 rows 16, 18–19), AC9 with prod at `hosted-20261016-32a9095`, which carries the server half (#2280) |
+| P3 | Lock on end (Windows, Linux, macOS), in three steps below | `lock_on_end=never` | P3a and P3b merged, both in agent 0.4.139. **AC7 and AC9 are field-verified on 0.4.139** (§8 rows 16, 18–19), AC9 with prod at `hosted-20261016-32a9095`, which carries the server half (#2280) |
 | P3a | The device's own `lock_on_end`: the decision at each session's start, the lock at the last end, Windows and Linux (§3e as built) | `lock_on_end=never` (default) | **#2272** merged `544bf0ec1`: unit tests in four crates. P0's mechanism and AC7's red are field-recorded (§8 rows 11–12). The green waits for the first agent release that carries it |
 | P3b | The server's half: an admin may ask a device's sessions for stricter (`AccessPolicy`, forwarded on `rc:request`), never looser, and the device row's control (§3e as built) | the admin's `never` or unset: nothing is asked | **#2280** merged `e4a2c1b7f`: unit tests in four crates and an integration cell through the real gate and hub. AC9 is its field cell, on the release that carries it |
+| P3c | The default (decision 3): a fresh Windows service install starts at `lock_on_end = auto`; per-user installs, the Linux root daemon and every existing config keep `never` (§3e "the default, as built") | per device: `roomler config set lock_on_end never` | **merged; ships with the next agent release.** One unit test covers fresh service, fresh per-user, re-enroll, rebind and appended org. Three negative controls each failed it: a gate that admits per-user installs, one that ignores the outcome, and a no-op default. AC11 is its field cell |
 | P4 | Host mute (§3f), Windows first | none: the curtain mutes; with no endpoint nothing changes | **P4a #2300**: the guard, its note and the restore at the next start, `host_muted` on the channel, the viewer's title. Unit cells (fake endpoints), a `privacy_dc` cell over the real channel, vitest; Windows clippy with `viewer-indicator`. AC10 is its field cell, on the release that carries it |
 | P5 | Docs and the field table | — | **#2240** (first part): `docs/privacy-mode.md` documents what P1 built. That covers the two parties who must agree, the request's sequence (mermaid), the server's strip reasons and the device's four gates, how the curtain works, the per-OS table and the honest limits. It is linked from `docs/README.md` and from `remote-control.md` §11.2. AC8 stays open until the page can show the block and Ctrl+Alt+Del as the way out, which wait for P2 |
 
@@ -464,6 +478,9 @@ the machine it runs on would mute a developer's laptop.
   after it; one the person unmuted during it stays unmuted. `taskkill /F` on the curtained worker leaves
   it unmuted once the next process starts. Red first: the same run against an agent without P4 leaves
   the endpoint unmuted under the curtain.
+- [ ] **AC11 (the default, P3c):** a fresh vmtest Win11 `--type system` install reads `lock_on_end` as
+  `auto` (`roomler config get lock_on_end`, as the console user), and a fresh `--type user` install reads
+  `never`. Red first: a fresh `--type system` install on 0.4.139 reads `never`.
 
 ## 6. Decisions
 
@@ -478,7 +495,9 @@ weighed.
    Recommended: no. `BlockInput` swallows it anyway, and Ctrl+Alt+Del is the one path that cannot be faked
    by software. **Decided: no.**
 3. **Default `lock_on_end`.** Recommended: `auto` on new installs, `never` on existing ones until the field
-   cells pass. **Decided: as recommended.**
+   cells pass. **Decided: as recommended.** The refinement was confirmed on 2026-10-16: only installs that
+   can unlock remotely, after AC7 is field-green. **As built (P3c):** fresh Windows service installs. The
+   Linux root daemon waits for a field cell that shows a remote unlock (§3e).
 4. **How the person reaches P10's Disconnect under the block** (raised by P0, 2026-10-13). `BlockInput`
    swallows the click, so Disconnect is reachable only after Ctrl+Alt+Del, which ends the block anyway.
    AC3 says "Disconnect works while privacy is on", which holds for the curtain alone but not under the

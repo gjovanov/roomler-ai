@@ -85,7 +85,7 @@ prevent, and the guard re-asserts it on every tick.
 
 **S2 — exit and subnet serving is offered where nothing NATs, and an approval outlives the offer.** ✔
 
-- The `/0` advertisement is unconditional (`crates/agent-core/src/config.rs:2077-2066`) and independent of NAT setup
+- The `/0` advertisement is unconditional (`crates/agent-core/src/config.rs:2079-2068`) and independent of NAT setup
   (`runtime.rs:2108-2113`; the setup's success only picks a log level, `nat.rs:80-94`). macOS has no NAT arm at all
   (`nat.rs:353-355` returns `false`), and because the guard is armed only on Linux and Windows (`nat.rs:87`), it logs
   nothing. Windows Home fails `New-NetNat` silently and leaves IPv4 forwarding on after the revert (#2077).
@@ -173,13 +173,13 @@ and the consent chain's fallbacks.
 | O1 | A per-user install updates itself | ✅ | ❌ | ✅ | #2046 | FR-96 |
 | O2 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | ❌ | ❌ | `Unsupported` → the install proceeds (`artifact_version.rs:272-289`, `updater.rs:1404`): a signed older package under a newer manifest installs | P6a |
 | O3 | Tunnel CLI `roomler self-update` | ✅ | ❌ | ❌ | `agents/roomler-cli/src/update.rs:96-101` | P6b |
-| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:4833` | P6c |
+| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:4838` | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 apt only; the tarball has none | ❌ | A pasted recipe (`docs/installation.md:394-420`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
 | O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | ❌ | `macos_supervisor.rs` never calls `crash_recorder` | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1170-1179` | P6f |
-| O10 | An ephemeral device removes itself on a clean stop | 🟡 SCM installs only | ✅ | ✅ | A Scheduled-Task install has no stop signal (`main.rs:2680-2686`) | P4d |
+| O10 | An ephemeral device removes itself on a clean stop | 🟡 SCM installs only | ✅ | ✅ | A Scheduled-Task install has no stop signal (`main.rs:2685-2691`) | P4d |
 | A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2312-2318`); the CLI and the wizard are universal | D6 |
 | A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:80-81`); behaviour under emulation unverified | D6 |
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` (`release-agent.yml:1093`); recordings write Opus, not AAC | P7a |
