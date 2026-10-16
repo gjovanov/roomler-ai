@@ -39,7 +39,7 @@ commitment — a proven floor (FR-59 P8's remembered-slow-pair open) still wins.
 ### The constrained cell (why this was blocked, and now is not)
 
 `constrained` is measured from the nominated ICE pair
-(`detect_constrained_transport`, `peer.rs:1384`), so the constrained posture
+(`detect_constrained_transport`, `peer.rs:1430`), so the constrained posture
 exists only on a path that actually relays. Field-measured 2026-09-03:
 CORPLAP-1 on 0.4.55 took a **direct** pair (`tgt=12096000`, `c=false`, paint
 age 11-42 ms), so slow-start could not engage and the A/B could not run —

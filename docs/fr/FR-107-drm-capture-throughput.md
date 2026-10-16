@@ -36,7 +36,7 @@ What the numbers say:
   10-bit `XR30` unpacked on the way. FR-36 already measured how unforgiving it is: a strided read was 6×
   slower than a sequential one.
 - **The DataChannel pumps read the full 4K, then resample it all.** The VP9-444 and FFmpeg DataChannel
-  pumps open their capture with `DownscalePolicy::Never` (`agents/roomlerd/src/peer.rs:3547`, written for
+  pumps open their capture with `DownscalePolicy::Never` (`agents/roomlerd/src/peer.rs:3595`, written for
   1080p sources: "fast enough at 1080p"). They then resample every frame down to the software cap,
   1920×1012 here. That resample is a Lanczos-3, which costs in proportion to the **source** area
   (`scrap_backend.rs`'s own note: 38 ms from a Retina panel). So 8.8 M pixels were read and resampled for
@@ -58,7 +58,7 @@ flowchart LR
 
 **P1 — the DRM arm honours the pump's encode box.** `ScreenCapture::set_output_cap`
 (`agents/roomlerd/src/capture/mod.rs:375`) already exists for exactly this, and every pump calls it with its
-effective box (`peer.rs:4178`). macOS honours it; the DRM arm ignored it. Now the DRM worker reads the box on
+effective box (`peer.rs:4226`). macOS honours it; the DRM arm ignored it. Now the DRM worker reads the box on
 every grab and takes the fused half read whenever half the source still covers it, whatever the policy says
 (`wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1200`; `set_output_cap`, `drm_backend.rs:1407`).
 A 4K scanout encoded at 1920×1012 is read at 2048×1080. A 1440p scanout for the same box keeps its full read,

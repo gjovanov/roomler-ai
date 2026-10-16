@@ -16,7 +16,7 @@ rc=vbr cq=22 preset=p4 tune=ll rc-lookahead=0 bf=0 forced-idr=1 maxrate=2550000 
 ```
 
 Per-frame sizes read off the `video-bytes` DataChannel in the browser (FR-17 framing header,
-then the pump's own header — `peer.rs:9589`, `byte[4]` flags, bit 0 = keyframe). Identical in
+then the pump's own header — `peer.rs:9656`, `byte[4]` flags, bit 0 = keyframe). Identical in
 every run:
 
 | frame | bytes | arrival | flags |
@@ -101,7 +101,7 @@ default 0 (inert). If the driver honours `ldkfs` only under CBR, the remaining p
 vendored-ffmpeg patch mapping `rc_initial_buffer_occupancy` → `vbvInitialDelay`.
 
 **P0 — the A/B, on this box's own daemon** (self-view over `ROOMLERD_ICE_RELAY_TCP=1`, which
-forces both a relay-class ICE path and the constrained profile — `peer.rs:1376`; the mirror
+forces both a relay-class ICE path and the constrained profile — `peer.rs:1422`; the mirror
 recursion only affects inter-frame dynamics, the opening IDR captures a static screen). Legs:
 baseline · `pct=100` · `pct=40` · `tune=hq` (driver-default reservoir under a different
 tuning; env `ROOMLERD_FFMPEG_TUNE`, no code). Metrics per leg, N ≥ 5, foreground tab, 100 ms
