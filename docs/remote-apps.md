@@ -72,7 +72,7 @@ Three properties of the wire are load-bearing:
 - 🔑 **Every path returns a well-formed `*.reply`**, including a panic in the
   handler (`peer.rs` catches the join error and answers `ok:false`). A request
   that got no answer is how the viewer detects an agent too old to speak
-  `rc:apps.*` at all (a 10 s timeout, `ui/src/composables/useRemoteControl.ts:5474`).
+  `rc:apps.*` at all (a 10 s timeout, `ui/src/composables/useRemoteControl.ts:5485`).
 
 ## 2. How the Linux backend finds a desktop — and as whom
 
@@ -247,9 +247,9 @@ restart changes it. That is why P6 added a fourth value:
   backend (`apps::has_backend`, `mod.rs:357`), independent of what the host
   was doing at boot.
 - The viewer shows the *Remote apps* entry for `list` **or** `status`
-  (`ui/src/views/remote/RemoteControl.vue:3617`), never disables it, and lets
+  (`ui/src/views/remote/RemoteControl.vue:3635`), never disables it, and lets
   the **dialog** carry the truth from the live reply: the list, the caveats,
-  or the reason (`useRemoteControl.ts:8515`). A greyed button with no tooltip
+  or the reason (`useRemoteControl.ts:8527`). A greyed button with no tooltip
   was the one place a reason could not reach.
 - 🔑 **`availability_for()` is the single source for both** (`mod.rs:321`): the
   hello's `list` and the reply's `unavailable` come from one function, so they
@@ -271,7 +271,7 @@ restart changes it. That is why P6 added a fourth value:
   unit test without spawning the probe child.
 - ⚠️ An agent older than P6 answers `supported: false` with nothing beside it.
   The viewer names that as such (*"this agent did not say why"*,
-  `useRemoteControl.ts:901`) rather than papering over it — inventing a reason
+  `useRemoteControl.ts:902`) rather than papering over it — inventing a reason
   would be the same lie in the other direction.
 
 ## 5. Launch, and the tmux session model
@@ -385,7 +385,7 @@ label    = "Text editor"
 | `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1012`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
-`roomlerd apps-probe` (`agents/roomlerd/src/main.rs:5677`) answers the whole
+`roomlerd apps-probe` (`agents/roomlerd/src/main.rs:5682`) answers the whole
 question on the host with no session and no browser, the way `capture-smoke`
 does for pixels: which config it loaded and whether apps are enabled there,
 whether a desktop was found and as whom (the display and the cookie), what the
@@ -400,7 +400,7 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2631`),
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2678`),
 not `load`: `load` self-heals — an unreadable live file logs *the host must be
 re-enrolled* and can promote the `.prev` copy back over it — and a diagnostic
 must never write the device's config as a side effect of being run.

@@ -111,6 +111,9 @@ pub mod person_socket;
 pub mod pgp_verify;
 pub mod post_install;
 pub mod preflight;
+/// FR-108 — is someone using this screen? The idle clock, less the machine's
+/// own input, for display match.
+pub mod presence;
 /// FR-99 P1b — privacy mode: the owner's gate, the `privacy-*` words, and the
 /// session's `privacy` channel that puts the overlay's curtain up.
 pub mod privacy;

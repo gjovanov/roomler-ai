@@ -88,6 +88,7 @@ import {
   type PrivacyChannel,
 } from './usePrivacyMode'
 import { keepBusySetMessage, parseKeepBusyState, type KeepBusyRequest, type KeepBusyState } from './keepBusy'
+import { parseDisplayMatchState, type DisplayMatchState } from './displayMatch'
 import { parseFeaturesRefused } from './useSessionFeatures'
 
 /**
@@ -1188,6 +1189,8 @@ export type RcControlInbound =
   | { kind: 'host_locked'; locked: boolean }
   /** FR-92 — the device's keep-busy state (to every viewer, on change). */
   | { kind: 'keep_busy'; state: KeepBusyState }
+  /** FR-108 — the device's answer to this viewer's display-match request. */
+  | { kind: 'display_match'; state: DisplayMatchState }
   | { kind: 'clock_echo'; t0: number; agentUs: number }
   | { kind: 'desktop_changed'; name: string }
   | { kind: 'video_info'; info: RcVideoInfo }
@@ -1412,6 +1415,11 @@ export function parseControlInbound(data: unknown): RcControlInbound {
   if (obj.t === 'rc:keep-busy.state') {
     const state = parseKeepBusyState(obj)
     return state ? { kind: 'keep_busy', state } : null
+  }
+  // FR-108 — display match: the device decided, and says how.
+  if (obj.t === 'rc:display-match.state') {
+    const state = parseDisplayMatchState(obj)
+    return state ? { kind: 'display_match', state } : null
   }
   // rc.227 Ã¢ÂÂ keyboard-layout snapshot from the agent (Windows hosts).
   // Defensive filtering: malformed installed entries are dropped, a
@@ -4457,6 +4465,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   /** FR-92 — the device's keep-busy state; `null` until an agent that has
    *  the feature says something (older agents never do). */
   const keepBusy = ref<KeepBusyState | null>(null)
+  /** FR-108 — the device's answer to this session's latest display-match
+   *  request; `null` until it answers (agents before FR-108 never do). */
+  const displayMatchState = ref<DisplayMatchState | null>(null)
   /** rc.227 Ã¢ÂÂ the remote host's keyboard-layout state, pushed by
    *  Windows agents as `rc:layout` over the control DC (on change;
    *  first snapshot arrives with the first input event). Null on old
@@ -8024,6 +8035,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     mediaIntrinsicH.value = 0
     hostLocked.value = false
     keepBusy.value = null
+    displayMatchState.value = null
     currentDesktop.value = 'Default'
     videoInfo.value = null
     // FR-80 — a host whose permission was restored must not keep showing
@@ -9119,6 +9131,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         hostLocked.value = parsed.locked
       } else if (parsed?.kind === 'keep_busy') {
         keepBusy.value = parsed.state
+      } else if (parsed?.kind === 'display_match') {
+        displayMatchState.value = parsed.state
       } else if (parsed?.kind === 'clock_echo') {
         // FR-1 P7 — clock probe round trip complete; fold the sample.
         handleClockEcho(parsed.t0, parsed.agentUs)
@@ -11707,6 +11721,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     hostLocked,
     keepBusy,
     setKeepBusy,
+    /** FR-108 — the device's answer to the latest display-match request. */
+    displayMatchState,
     /** rc.87 Ã¢ÂÂ real encoder info from the agent (`rc:video-info`).
      *  Null on the legacy track / libvpx paths (no message); the
      *  badge falls back to a selection-derived label then. */

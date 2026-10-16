@@ -1484,6 +1484,15 @@ pub struct AgentConfig {
     /// ask for stricter on a session (P3b), never lower this floor.
     #[serde(default)]
     pub lock_on_end: roomler_ai_remote_control::models::LockOnEnd,
+    /// FR-108 — whether a controller's display match may switch this host's
+    /// display mode: `auto` (the default: only while nobody is using this
+    /// screen), `always` (whenever asked, rc.191's behaviour) or `never`. Read
+    /// LIVE: every request is decided by the value at that moment.
+    ///
+    /// ⚠️ Device-owned: absent from `DesiredConfig`, and set over the LocalAPI
+    /// only by the person at the console, whose screen it would change.
+    #[serde(default)]
+    pub display_match: DisplayMatchPolicy,
     /// FR-101 P2b — this device's own floor for the clipboard in a remote
     /// session: `on` (the default), `ask` (only on a session the person here
     /// approves, on a prompt that names it) or `off`. The stricter of this and
@@ -2357,6 +2366,43 @@ pub enum EncoderPreferenceChoice {
     Software,
 }
 
+/// FR-108 — when a remote controller's display match may switch this host's
+/// display mode to fit their window.
+///
+/// ⚠️ A value this build does not know reads as [`Self::Never`], never as an
+/// error: it must not fail the whole config file, and the strictest reading
+/// of a setting about someone's screen is to leave the screen alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DisplayMatchPolicy {
+    /// Only while nobody is using this screen (the default).
+    #[default]
+    Auto,
+    /// Whenever a controller asks (rc.191's behaviour), for a machine its
+    /// owner never sits at.
+    Always,
+    /// Never.
+    Never,
+}
+
+impl<'de> Deserialize<'de> for DisplayMatchPolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Text(String),
+            Other(serde::de::IgnoredAny),
+        }
+        Ok(match Raw::deserialize(d)? {
+            Raw::Text(s) if s == "auto" => Self::Auto,
+            Raw::Text(s) if s == "always" => Self::Always,
+            // "never", anything a newer build may write, and anything that is
+            // not a string at all.
+            _ => Self::Never,
+        })
+    }
+}
+
 /// Resolve the default config path. Can be overridden by `--config` on the CLI.
 /// Default for `enable_remote_browse` — `true` so a 0.3.0 install
 /// preserves self-controlled-host auto-grant semantics. Operators on
@@ -2574,6 +2620,7 @@ pub fn test_fixture() -> AgentConfig {
         keep_busy_enabled: true,
         privacy_mode_allowed: false,
         lock_on_end: Default::default(),
+        display_match: Default::default(),
         rc_clipboard: Default::default(),
         rc_files: Default::default(),
         rc_audio: Default::default(),

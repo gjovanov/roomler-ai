@@ -1,7 +1,7 @@
 # FR-108: Display follows the viewer — never on a screen someone is using
 
-**Issue:** [#2322](https://github.com/gjovanov/roomler-ai/issues/2322) · **Status:** proposed 2026-10-16 —
-spec and claim · **Owner:** the Windows agent (`display_match.rs`, the user-context worker), the viewer (the
+**Issue:** [#2322](https://github.com/gjovanov/roomler-ai/issues/2322) · **Status:** in progress — P0
+measured, P1 built ([`docs/display-match.md`](../display-match.md)) · **Owner:** the Windows agent (`display_match.rs`, the user-context worker), the viewer (the
 display-match toggle); later the Linux virtual desktop · **Anchors:** master `e0fcc2174` · **Program:**
 [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 2 (§5.3) · **Builds on:** rc.191's display
 match, [FR-92](FR-92-keep-busy.md) (a person told from the controller without hooks),
@@ -123,12 +123,12 @@ As plan §5.3 has it:
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | This spec and the claim. Three probes on vmtest: (1) does `GetLastInputInfo`, read in the worker, move on the person's input (QMP) and on the controller's injection, and can the two be told apart; (2) what `ChangeDisplaySettingsExW(CDS_FULLSCREEN)` does at the lock screen and at the logon screen (SystemContext); (3) a guest with several modes, a display driver beyond the Basic Render Driver, so a real switch and restore can be seen | docs only | **done 2026-10-16** (§8 rows 2–4): (1) the idle clock moves for both the person and the controller, so the guard must subtract the arbiter's injections; (2) at the lock screen the switch **fails** (`rc=-1`), which reshaped 3a; the logon screen is still owed; (3) a virtio video model plus `viogpudo` gives session 1 23 modes, and the red was recorded on it |
-| P1 | The guard (3a), the owner's key (3b), the answer (3c) and the viewer's words (3d), on Windows | `display_match = always` restores rc.191 | — |
+| P1 | The guard (3a), the owner's key (3b), the answer (3c) and the viewer's words (3d), on Windows | `display_match = always` restores rc.191 | **built** ([`docs/display-match.md`](../display-match.md)): `presence.rs` (a tracker that keeps the last idle-clock move the machine does not explain, its 500 ms sampler from the worker's start, the decision), `display_match.rs` (the owner's policy, `may_switch`, `request_for`, the answer), the arbiter's and keep busy's tick notes, the console-only and never-pushable key, the viewer's answer and words. Unit tests on Windows and Linux with four negative controls: the tracker counting machine input as a person failed three tests, `auto` ignoring presence failed one, a planted `SetWindowsHookExW` failed the scan, and the gate removed failed the console test. Field green owed: AC1, AC2's idle half, AC4, AC5 |
 | P1b | The locked host's request applies at the unlock when nobody is at the screen (3a), and the person coming back restores their mode (3e) | — | — |
 | P2 | Linux virtual desktops: the Xvfb mode ladder | — | — |
 | P3 | Modes no monitor offers, through the virtual display | — | — |
 | P4 | Several displays | — | — |
-| P5 | Docs: a display-match section in `docs/remote-control.md` (mermaid, the answers, the owner's key) and a `docs/README.md` row | — | — |
+| P5 | Docs: [`docs/display-match.md`](../display-match.md) (mermaid, the answers, the owner's key), linked from `docs/remote-control.md` §18.6.1 and indexed in `docs/README.md` | — | the page exists from P1 and grows with each phase |
 
 ## 5. Acceptance criteria
 
@@ -146,11 +146,18 @@ As plan §5.3 has it:
   attended host, as rc.191 does.
 - [ ] **AC5 (old and new together):** an older viewer with a P1 agent ignores the answer, and a P1 viewer with
   an older agent shows the toggle as today.
-- [ ] **AC6 (no hooks):** FR-92's source scan covers the guard's code and fails on a planted
-  `SetWindowsHookEx`.
+- [x] **AC6 (no hooks):** FR-92's source scan covers the guard's code and fails on a planted
+  `SetWindowsHookEx`. **Verified** (P1). `presence::tests::no_keylogger_shaped_api_in_display_match` scans
+  `presence.rs` and `display_match.rs` for FR-92's Windows list: hooks, raw input, keyboard state,
+  `GetAsyncKeyState`. It passed. With the string constant `"SetWindowsHookExW"` planted at the end of
+  `display_match.rs` it failed; restored from the commit, it passed again. It is a sibling of FR-92's own
+  scan rather than an entry in it, because FR-92's scan asserts that it lists every file of `keep_busy/`.
 - [ ] **AC7 (Linux, P2):** a virtual-desktop host switches to a declared mode and restores it.
-- [ ] **AC8:** **Docs:** `docs/remote-control.md` carries the display-match section (mermaid, the answers, the
-  owner's key), with a row in `docs/README.md`'s index.
+- [ ] **AC8:** **Docs:** a `docs/display-match.md` page (mermaid, the answers, the owner's key), linked from
+  `docs/remote-control.md`, with a row in `docs/README.md`'s index. *(Reworded in P1: first written as a
+  section inside `docs/remote-control.md`, but other specs cite that page by line number, and a page of its
+  own, like `privacy-mode.md`, moves none of them. The page exists from P1 and is ticked when the last
+  phase is in it.)*
 
 ## 6. Open decisions
 
