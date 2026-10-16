@@ -271,7 +271,7 @@ restart changes it. That is why P6 added a fourth value:
   unit test without spawning the probe child.
 - ⚠️ An agent older than P6 answers `supported: false` with nothing beside it.
   The viewer names that as such (*"this agent did not say why"*,
-  `useRemoteControl.ts:890`) rather than papering over it — inventing a reason
+  `useRemoteControl.ts:901`) rather than papering over it — inventing a reason
   would be the same lie in the other direction.
 
 ## 5. Launch, and the tmux session model

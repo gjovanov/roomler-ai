@@ -11,6 +11,8 @@
 //! which the hub names to the controller and in the `session_ended` audit
 //! row. The route and the hub's half (what rides to whom, who may name the
 //! limit) are covered with a raw agent socket in `rc_session_limits_tests`.
+//! #2251's cells (`rc_no_common_codec_tests`) drive the same agent through
+//! the helpers here.
 
 use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
@@ -22,10 +24,10 @@ use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use webrtc::peer_connection::RTCPeerConnection;
 
-type Ws =
+pub(crate) type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     s.replace('+', "%2B")
         .replace('/', "%2F")
         .replace('=', "%3D")
@@ -33,7 +35,7 @@ fn urlencode(s: &str) -> String {
 
 /// Spawn the agent signalling loop with test-friendly defaults. Duplicated
 /// from `agent_e2e_tests.rs` so this file stands alone, as that one is.
-fn spawn_agent_signaling(
+pub(crate) fn spawn_agent_signaling(
     cfg: AgentConfig,
     stop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -73,7 +75,7 @@ fn spawn_agent_signaling(
 }
 
 /// Enroll a device through the agent library, as `agent_e2e_tests` does.
-async fn enrol(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -> AgentConfig {
+pub(crate) async fn enrol(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -> AgentConfig {
     let et: Value = app
         .auth_post(
             &format!("/api/tenant/{}/agent/enroll-token", seeded.tenant_id),
@@ -100,7 +102,7 @@ async fn enrol(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -> AgentC
 /// reason to look again, never a panic: TestApp's per-IP limiter answers a
 /// fast poll with a 429 that is not JSON, which once hid the real failure (an
 /// agent that never started) behind a decode error.
-async fn wait_online(app: &TestApp, seeded: &SeededTenant, cfg: &AgentConfig) {
+pub(crate) async fn wait_online(app: &TestApp, seeded: &SeededTenant, cfg: &AgentConfig) {
     let url = format!("/api/tenant/{}/agent/{}", seeded.tenant_id, cfg.agent_id);
     for _ in 0..40 {
         if let Ok(resp) = app.auth_get(&url, &seeded.admin.access_token).send().await
@@ -116,7 +118,7 @@ async fn wait_online(app: &TestApp, seeded: &SeededTenant, cfg: &AgentConfig) {
 }
 
 /// The next frame of type `t` on `ws` within `within`, or `None`.
-async fn next_of(ws: &mut Ws, t: &str, within: Duration) -> Option<Value> {
+pub(crate) async fn next_of(ws: &mut Ws, t: &str, within: Duration) -> Option<Value> {
     let deadline = tokio::time::Instant::now() + within;
     while tokio::time::Instant::now() < deadline {
         let Ok(Some(Ok(Message::Text(text)))) =
@@ -214,7 +216,7 @@ async fn store_idle_secs(app: &TestApp, seeded: &SeededTenant, secs: Option<i64>
 }
 
 /// The `session_ended` audit row of a session, once it lands.
-async fn ended_row(app: &TestApp, seeded: &SeededTenant, sid: &str) -> Option<Value> {
+pub(crate) async fn ended_row(app: &TestApp, seeded: &SeededTenant, sid: &str) -> Option<Value> {
     let url = app.url(&format!(
         "/api/tenant/{}/session/{}/audit",
         seeded.tenant_id, sid

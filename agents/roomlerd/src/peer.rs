@@ -12153,35 +12153,99 @@ fn codec_params_for(codec: &str) -> webrtc::rtp_transceiver::rtp_codec::RTCRtpCo
 /// IS the video, and its codec stays the pump's. Read from the offer itself,
 /// the one statement of what this browser will take.
 pub fn rtp_track_codec(chosen: &str, transport: Option<&str>, offer_sdp: &str) -> String {
-    let on_dc = transport.is_some_and(|t| t.starts_with("data-channel-"));
-    if !on_dc {
+    if !on_data_channel(transport) {
         return chosen.to_string();
     }
-    // `a=rtpmap:<pt> <encoding>/<clock>[/<channels>]`, the encoding name in
-    // any case.
-    let offers = |name: &str| {
-        offer_sdp.lines().any(|line| {
-            let line = line.trim();
-            line.strip_prefix("a=rtpmap:")
-                .and_then(|rest| rest.split_whitespace().nth(1))
-                .and_then(|enc| enc.split('/').next())
-                .is_some_and(|enc| enc.eq_ignore_ascii_case(name))
-        })
-    };
-    let encoding = match chosen.to_ascii_lowercase().as_str() {
-        "av1" => "AV1",
-        "h265" | "hevc" => "H265",
-        _ => "H264",
-    };
-    if offers(encoding) || !offers("VP8") {
+    if offer_carries_track(offer_sdp, chosen) || !offer_names(offer_sdp, "VP8") {
         return chosen.to_string();
     }
     "vp8".to_string()
 }
 
+/// #2251 — the offer leaves the RTP video track nothing it can send.
+///
+/// On the RTP transport the track IS the video: it sends the encoder's codec
+/// and cannot take another the way the DataChannel's placeholder does
+/// (`rtp_track_codec`). An offer with a video section and no `a=rtpmap` for
+/// that codec fails `create_answer` ("RTPSender created with no codecs"); the
+/// session then ended as a bare `Error`, which the viewer retries, and the
+/// same offer failed again. The caller refuses before it builds the peer
+/// instead, naming `no_common_codec`.
+///
+/// False on a DataChannel transport, and for an offer with no `m=video` at
+/// all, which is answered without the track.
+pub fn rtp_track_unanswerable(track_codec: &str, transport: Option<&str>, offer_sdp: &str) -> bool {
+    let has_video = offer_sdp
+        .lines()
+        .any(|line| line.trim_start().starts_with("m=video "));
+    !on_data_channel(transport) && has_video && !offer_carries_track(offer_sdp, track_codec)
+}
+
+/// The video codecs an offer names, each once and in its order, for the line
+/// a refusal logs. Retransmission and FEC payloads are left out.
+pub fn offered_video_codecs(offer_sdp: &str) -> Vec<String> {
+    let mut in_video = false;
+    let mut out: Vec<String> = Vec::new();
+    for line in offer_sdp.lines().map(str::trim) {
+        if let Some(media) = line.strip_prefix("m=") {
+            in_video = media.starts_with("video ");
+            continue;
+        }
+        if !in_video {
+            continue;
+        }
+        let Some(encoding) = rtpmap_encoding(line) else {
+            continue;
+        };
+        let repair = ["rtx", "red", "ulpfec", "flexfec-03"]
+            .iter()
+            .any(|r| encoding.eq_ignore_ascii_case(r));
+        if !repair && !out.iter().any(|o| o.eq_ignore_ascii_case(encoding)) {
+            out.push(encoding.to_string());
+        }
+    }
+    out
+}
+
+fn on_data_channel(transport: Option<&str>) -> bool {
+    transport.is_some_and(|t| t.starts_with("data-channel-"))
+}
+
+/// The encoding of an `a=rtpmap:<pt> <encoding>/<clock>[/<channels>]` line.
+fn rtpmap_encoding(line: &str) -> Option<&str> {
+    line.trim()
+        .strip_prefix("a=rtpmap:")
+        .and_then(|rest| rest.split_whitespace().nth(1))
+        .and_then(|enc| enc.split('/').next())
+}
+
+/// Some `a=rtpmap` line of the offer names `encoding`, in any case.
+fn offer_names(offer_sdp: &str, encoding: &str) -> bool {
+    offer_sdp
+        .lines()
+        .filter_map(rtpmap_encoding)
+        .any(|enc| enc.eq_ignore_ascii_case(encoding))
+}
+
+/// The offer carries what the RTP video track sends for `codec`:
+/// `build_video_codec_cap`'s choice, where every codec the track cannot carry
+/// (VP9 among them) falls to H.264. HEVC answers to both spellings, RFC
+/// 7798's `H265`, which browsers write, and `HEVC`, webrtc-rs's own name.
+fn offer_carries_track(offer_sdp: &str, codec: &str) -> bool {
+    match codec.to_ascii_lowercase().as_str() {
+        "av1" => offer_names(offer_sdp, "AV1"),
+        "h265" | "hevc" => offer_names(offer_sdp, "H265") || offer_names(offer_sdp, "HEVC"),
+        "vp8" => offer_names(offer_sdp, "VP8"),
+        _ => offer_names(offer_sdp, "H264"),
+    }
+}
+
 #[cfg(test)]
 mod codec_cap_tests {
-    use super::{build_video_codec_cap, codec_params_for, rtp_track_codec};
+    use super::{
+        build_video_codec_cap, codec_params_for, offered_video_codecs, rtp_track_codec,
+        rtp_track_unanswerable,
+    };
 
     /// A Firefox without OpenH264, as it offers: VP8, VP9 and AV1 (+ rtx/fec),
     /// with Opus on the audio line.
@@ -12230,6 +12294,51 @@ mod codec_cap_tests {
             rtp_track_codec("h264", dc, "a=rtpmap:109 opus/48000/2\r\n"),
             "h264"
         );
+    }
+
+    /// #2251 — on the RTP transport an offer without the track's codec cannot
+    /// be answered, and is refused; nothing else is.
+    #[test]
+    fn the_rtp_track_refuses_an_offer_it_cannot_answer() {
+        // The field case: a Firefox without OpenH264, on the RTP track.
+        assert!(rtp_track_unanswerable("h264", None, FIREFOX_NO_H264));
+        // VP9 is no codec of the RTP track: its track is H.264's, so the same.
+        assert!(rtp_track_unanswerable("vp9", None, FIREFOX_NO_H264));
+        // The offer carries the track's codec.
+        assert!(!rtp_track_unanswerable("h264", None, CHROMIUM));
+        assert!(!rtp_track_unanswerable("av1", None, FIREFOX_NO_H264));
+        // HEVC under either spelling.
+        let h265 = "m=video 9 RTP 49\r\na=rtpmap:49 H265/90000\r\n";
+        assert!(!rtp_track_unanswerable("h265", None, h265));
+        assert!(!rtp_track_unanswerable("hevc", None, h265));
+        assert!(!rtp_track_unanswerable(
+            "h265",
+            None,
+            "m=video 9 RTP 49\r\na=rtpmap:49 HEVC/90000\r\n"
+        ));
+        assert!(rtp_track_unanswerable("h265", None, CHROMIUM));
+        // A DataChannel transport is the placeholder's business, never this.
+        assert!(!rtp_track_unanswerable(
+            "h264",
+            Some("data-channel-vp9-444"),
+            FIREFOX_NO_H264
+        ));
+        // No video section: answered without the track, as test harnesses
+        // offer only a DataChannel.
+        assert!(!rtp_track_unanswerable(
+            "h264",
+            None,
+            "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+        ));
+    }
+
+    /// #2251 — the refusal's log line names what the browser offered, video
+    /// only, without the repair payloads.
+    #[test]
+    fn a_refusal_names_the_offers_video_codecs() {
+        assert_eq!(offered_video_codecs(FIREFOX_NO_H264), ["VP8", "VP9", "AV1"]);
+        assert_eq!(offered_video_codecs(CHROMIUM), ["VP8", "H264"]);
+        assert!(offered_video_codecs("a=rtpmap:109 opus/48000/2\r\n").is_empty());
     }
 
     #[test]

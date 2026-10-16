@@ -161,6 +161,8 @@ mod rate_limit_tests;
 #[cfg(test)]
 mod rc_idle_limit_tests;
 #[cfg(test)]
+mod rc_no_common_codec_tests;
+#[cfg(test)]
 mod rc_request_ceiling_tests;
 #[cfg(test)]
 mod rc_session_limits_tests;
