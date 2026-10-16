@@ -206,7 +206,7 @@ the "unknown" half and the code does not implement it.** The enum is a plain
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2117`) handles a
 *missing* field, not an *unrecognised* one. An unknown tag is a hard serde error failing the
 **entire enclosing `ServerMsg`**, and the agent's parse arm swallows it at `debug!`
-(`agents/roomlerd/src/signaling.rs:1514`).
+(`agents/roomlerd/src/signaling.rs:1521`).
 
 Add a variant carelessly and every pre-FR-19 agent **drops whole netmap frames** and stops
 installing peers — a fleet-wide outage delivered by the server, visible only at `debug!`.
@@ -409,7 +409,7 @@ is 24 bits, so two `u32`s differing above bit 23 would alias to one session.
 
 ⚠️ **Gate 2's default is not "deny" — it is "off, and permits everything."** The first draft
 claimed four default-deny gates; there are three. `OverlayAclMode` derives `#[default] Off`
-(`crates/remote_control/src/models.rs:1650`), documented as *"every node sees every peer…
+(`crates/remote_control/src/models.rs:1663`), documented as *"every node sees every peer…
 The default, so enabling the feature never breaks a live mesh"*; `Warn` *"ship[s] the
 permissive netmap"*; and `CLAUDE.md`'s own open-issues list records that **nothing has ever
 run under `enforce` in the field**. Tailscale's `cap/relay` is an *affirmative grant*; a

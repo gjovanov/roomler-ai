@@ -110,13 +110,13 @@ pub use resume_note::{
 #[cfg(all(unix, feature = "hive-test-launcher"))]
 pub use supervisor::init_as_daemon;
 pub use supervisor::{
-    Author, CoreMemory, Moved, StartOrder, Supervisor, adopt_enabled, archive_enabled,
-    begin_shutdown, begin_update, end_update, global, handle_adopt_ack, handle_demote,
-    handle_drain, handle_lease, handle_memory, handle_move, handle_prepare, handle_purge,
-    handle_purge_all, handle_replica_candidate, handle_replica_close, handle_replica_dial,
-    handle_replica_grant, handle_replica_join, handle_replica_refused, handle_retain, handle_start,
-    handle_stop, init, on_connected, replica_enabled, stream_enabled, turns_running, update_wait,
-    wind_down,
+    Author, CoreMemory, Moved, REMOVAL_PURGE_LIMIT, StartOrder, Supervisor, adopt_enabled,
+    archive_enabled, begin_shutdown, begin_update, end_update, finish_removal_purge, global,
+    handle_adopt_ack, handle_demote, handle_drain, handle_lease, handle_memory, handle_move,
+    handle_prepare, handle_purge, handle_purge_all, handle_replica_candidate, handle_replica_close,
+    handle_replica_dial, handle_replica_grant, handle_replica_join, handle_replica_refused,
+    handle_retain, handle_start, handle_stop, init, on_connected, replica_enabled, stream_enabled,
+    turns_running, update_wait, wind_down,
 };
 pub use toolbelt::{relay, relay_args};
 pub use view::{

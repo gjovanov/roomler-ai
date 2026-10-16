@@ -1041,6 +1041,13 @@ pub async fn run(
                 // no restart will run the boot reconciler, so drop any exit-node
                 // split-default now or the host stays blackholed until reboot.
                 crate::purge_exit_routes();
+                // #2294 — and the removal purge Hive started (FR-90 P2g-4a)
+                // finishes first: the removal's goodbye follows its frame on
+                // this socket, and a pod roll mid-purge ends in this same
+                // goodbye at the reconnect. Bounded; none in flight, no wait.
+                // The build's `hive-purge-drain` is what lets the kick tell it.
+                #[cfg(hive_host)]
+                crate::hive::finish_removal_purge(crate::hive::REMOVAL_PURGE_LIMIT).await;
                 std::process::exit(watchdog::AGENT_DELETED_EXIT_CODE);
             }
             Err(ConnectError::KeyRotated {
