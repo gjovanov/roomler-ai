@@ -87,6 +87,9 @@ pub struct SyntheticCapture {
     /// FR-98 C1 — an emulated event-driven source behind a capture gate,
     /// set by a test (bench mode only). `None` in every real run.
     compositor: Option<Compositor>,
+    /// #2284 — the gaps between frames, repeated, in place of `interval`
+    /// (bench mode only). `None` in every real run.
+    cadence: Option<&'static [Duration]>,
 }
 
 /// FR-98 C1 — what a test asks the synthetic source to emulate: a source
@@ -234,6 +237,26 @@ impl Compositor {
     }
 }
 
+/// #2284 — a repeating pattern of gaps between frames, set by a test (bench
+/// mode only). Damage-driven frames come a few at a time and then pause, and
+/// a source at a fixed rate cannot show a timestamp that lags one frame:
+/// every gap is the same, so the previous one is right too.
+static TEST_CADENCE: std::sync::Mutex<Option<&'static [Duration]>> = std::sync::Mutex::new(None);
+
+/// Set (or clear) the cadence every NEW synthetic session uses. Honoured in
+/// bench mode only, and ignored when a test compositor is set.
+pub fn set_test_cadence(gaps: Option<&'static [Duration]>) {
+    *TEST_CADENCE.lock().unwrap_or_else(|p| p.into_inner()) = gaps.filter(|g| !g.is_empty());
+}
+
+/// Where frame `k` falls on a repeating pattern of gaps: frame 0 at once,
+/// frame `k` after the first `k` gaps of the pattern repeated.
+fn cadence_offset(gaps: &[Duration], k: u64) -> Duration {
+    let n = gaps.len() as u64;
+    let round: Duration = gaps.iter().sum();
+    round * (k / n) as u32 + gaps[..(k % n) as usize].iter().sum::<Duration>()
+}
+
 /// L0's planted gate, set by a test in the same process (µs; bench mode
 /// only). An env var cannot carry it: the gate changes between cells of one
 /// test binary, and changing the environment while webrtc's threads run is
@@ -298,6 +321,11 @@ impl SyntheticCapture {
         } else {
             None
         };
+        let cadence = if bench {
+            *TEST_CADENCE.lock().unwrap_or_else(|p| p.into_inner())
+        } else {
+            None
+        };
         Self {
             interval: Duration::from_micros(1_000_000 / fps as u64),
             start: Instant::now(),
@@ -306,6 +334,7 @@ impl SyntheticCapture {
             height,
             gate,
             compositor,
+            cadence,
         }
     }
 
@@ -397,7 +426,11 @@ impl ScreenCapture for SyntheticCapture {
             // drift on a host where the encoder takes variable time per
             // frame (the deadline stays anchored to wall-clock, not to
             // "previous frame returned at X").
-            let deadline = self.start + self.interval * (self.counter as u32);
+            let deadline = self.start
+                + match self.cadence {
+                    Some(gaps) => cadence_offset(gaps, self.counter),
+                    None => self.interval * (self.counter as u32),
+                };
             let now = Instant::now();
             if deadline > now {
                 tokio::time::sleep(deadline - now).await;
@@ -552,6 +585,22 @@ pub mod clock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2284: the cadence repeats, frame 0 comes at once, and frame `k`
+    /// waits out the first `k` gaps.
+    #[test]
+    fn a_cadence_repeats_its_gaps() {
+        const G: [Duration; 3] = [
+            Duration::from_millis(33),
+            Duration::from_millis(33),
+            Duration::from_millis(200),
+        ];
+        let at = |k| cadence_offset(&G, k).as_millis();
+        assert_eq!(
+            [at(0), at(1), at(2), at(3), at(4), at(6)],
+            [0, 33, 66, 266, 299, 532]
+        );
+    }
 
     #[test]
     fn render_emits_320x240_bgra() {

@@ -2452,14 +2452,14 @@ async fn media_pump(
     // override via `rc:resolution` must not be clobbered by a
     // re-evaluation on an incidental encoder rebuild (DPI flip, etc.).
     let mut auto_downscale_evaluated = false;
-    // Floor on the `duration` field of each Sample. DXGI Desktop Duplication
-    // only emits a frame when the screen changes, so on an idle desktop the
-    // real gap between two write_sample calls can be seconds. RTP timestamp
-    // increments are `duration * clock_rate`; if duration stays at target_fps
-    // (16.6 ms at 60 fps, 33 ms at 30 fps) while wallclock advances by 1 s,
-    // the browser's playout clock starves and the video element goes black.
-    // Measure the wallclock gap per frame and use that as the duration — the
-    // first sample uses the nominal floor derived from target_fps.
+    // Floor on the gap the RTP clock advances by before each frame. DXGI
+    // Desktop Duplication only emits a frame when the screen changes, so on
+    // an idle desktop the real gap between two frames can be seconds. RTP
+    // timestamp increments are `gap * clock_rate`; if the step stayed at
+    // target_fps (16.6 ms at 60 fps, 33 ms at 30 fps) while wallclock advances
+    // by 1 s, the browser's playout clock starves and the video element goes
+    // black. Measure the wallclock gap per frame and spend it before the
+    // frame is stamped (#2284).
     let mut frame_duration_floor = Duration::from_micros(1_000_000 / target_fps as u64);
     let mut last_sample_at: Option<std::time::Instant> = None;
     // FR-98 C6 — read once per open, never per frame (FR-70). The extension
@@ -3052,9 +3052,14 @@ async fn media_pump(
         };
         encode_time_us = encode_time_us.saturating_add(encode_started.elapsed().as_micros() as u64);
 
-        // Wallclock-based duration so RTP timestamps advance at real time,
-        // not at an assumed 30 fps. First sample falls back to the nominal
-        // floor (the track has nothing to reference from).
+        // Wallclock-based RTP timestamps, so they advance at real time, not
+        // at an assumed 30 fps. #2284: the gap since the previous frame is
+        // spent BEFORE this frame is stamped, so each frame carries its own
+        // time. Passed as `duration`, it advanced the clock after the frame
+        // instead, and every frame carried the previous one's time: on
+        // damage-driven frames a receiver read each change in the gaps as
+        // network jitter (Chrome's buffer grew to 326 ms, FR-98 P5). The
+        // first frame advances by nothing.
         let now = std::time::Instant::now();
         // Clamp: floor at the nominal frame duration, cap at 1 s so a
         // multi-second idle doesn't cause an enormous RTP timestamp jump.
@@ -3062,25 +3067,35 @@ async fn media_pump(
             Some(t) => now
                 .duration_since(t)
                 .clamp(frame_duration_floor, Duration::from_secs(1)),
-            None => frame_duration_floor,
+            None => Duration::ZERO,
         };
         last_sample_at = Some(now);
+        let extensions: &[webrtc::rtp::extension::HeaderExtension] =
+            playout_zero.as_ref().map_or(&[], |ext| &ext[..]);
 
+        // Each packet one encode returns is a frame of its own: MF can hand
+        // back frames it had buffered, and openh264 (one spatial layer)
+        // returns one. Share the gap out, so each frame gets a time of its
+        // own and the newest lands at `now`.
+        let frames_out = packets.len().max(1) as u32;
         let mut packet_bytes: u64 = 0;
-        for p in packets {
+        for (i, p) in packets.into_iter().enumerate() {
             packet_bytes += p.data.len() as u64;
             let sample = Sample {
                 data: Bytes::from(p.data),
                 timestamp: SystemTime::now(),
-                duration: wallclock_gap,
+                duration: frame_duration_floor,
                 packet_timestamp: 0,
                 prev_dropped_packets: 0,
                 prev_padding_packets: 0,
             };
-            let written = match &playout_zero {
-                Some(ext) => track.write_sample_with_extensions(&sample, ext).await,
-                None => track.write_sample(&sample).await,
+            let gap = match (wallclock_gap.is_zero(), i) {
+                // The stream's first frame.
+                (true, 0) => Duration::ZERO,
+                (true, _) => Duration::from_millis(1),
+                (false, _) => wallclock_gap / frames_out,
             };
+            let written = track.write_sample_after_gap(&sample, gap, extensions).await;
             if let Err(e) = written {
                 write_errors += 1;
                 // Elevated from debug — silent drops were hiding the real

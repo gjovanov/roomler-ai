@@ -29,6 +29,7 @@
 //! | `replay` | no delay; the transport as the daemon reads it (FR-101 P1a) | the controller's first SRTCP PLI, replayed into the live session a moment after a keyframe the agent cut on its own, cuts no keyframe: the replay window refuses it. In this cell and every other but `legacy`, the agent's ClientHello offers exactly the two ECDHE-AES-128-GCM suites |
 //! | `legacy` | no delay; both FR-101 switches back (`ROOMLERD_DTLS_LEGACY_SUITES=1`, `ROOMLERD_SRTP_REPLAY_WINDOW=0`), which is every session before P1a | the DTLS half's negative control: the ClientHello offers the CBC suites again. A replay is refused here too. With no window set, webrtc-srtp's session supplies its own 64, so replay protection was never off, before FR-101 or after |
 //! | `unguarded` | no delay; replay protection switched off outright through the setting engine, which no production setting does | the replay half's negative control: each replay cuts a keyframe, so a refusal in the other cells is the window's doing, not a blind instrument |
+//! | `cadence` | no delay; the synthetic source's frames in bursts and pauses (gaps of 33, 33 and 200 ms, repeated), as damage-driven frames come (#2284) | each frame's RTP timestamp steps the way its arrival does, within p50 10 ms and p95 40 ms. A timestamp that lags one frame misses every change in the gaps by the whole change. Every cell prints the same error; at a fixed rate it is near zero either way. Its pauses count as freezes, which this cell does not assert on |
 //!
 //! The FR-101 cells read the wire itself. A tap on the link parses the DTLS
 //! hellos out of the cleartext handshake records, and keeps the
@@ -165,7 +166,18 @@ struct Cell {
     /// production setting does this, and none ever did. It takes effect
     /// only where the policy sets no window (`transport` with 0).
     replay_off: bool,
+    /// #2284: the synthetic source's frames come on this repeating pattern
+    /// of gaps instead of at a fixed rate, the way damage-driven frames do.
+    cadence: Option<&'static [Duration]>,
 }
+
+/// #2284: the `cadence` cell's frames, three at a time and then a pause.
+/// Every change between 33 and 200 ms is a step a lagging timestamp misses.
+const CADENCE: [Duration; 3] = [
+    Duration::from_millis(33),
+    Duration::from_millis(33),
+    Duration::from_millis(200),
+];
 
 /// What the controller saw of the `playout-delay` extension.
 #[derive(Debug, Default, Clone, Copy)]
@@ -396,6 +408,9 @@ struct Run {
     /// Replayed PLIs, and how many of them a keyframe answered.
     replays: usize,
     replays_answered: usize,
+    /// #2284: per step from one frame to the next, how far the RTP clock's
+    /// step strayed from the arrival step, in ms.
+    step_err_ms: Vec<f64>,
 }
 
 /// The `p`-quantile of `samples`, NaN when empty.
@@ -434,7 +449,7 @@ impl Run {
             String::new()
         };
         format!(
-            "L0 {:<9} decoded={:>3} fps={:>5.1} p50={:>6.1}ms p95={:>6.1}ms max={:>6.1}ms freezes={} idr={}{probe}",
+            "L0 {:<9} decoded={:>3} fps={:>5.1} p50={:>6.1}ms p95={:>6.1}ms max={:>6.1}ms freezes={} idr={}{probe} | ts-step err p50={:.1}ms p95={:.1}ms",
             cell.name,
             self.decoded,
             self.fps(),
@@ -442,7 +457,9 @@ impl Run {
             self.pct(0.95),
             self.pct(1.0),
             self.freezes,
-            self.idr
+            self.idr,
+            quantile(&self.step_err_ms, 0.50),
+            quantile(&self.step_err_ms, 0.95)
         )
     }
 }
@@ -478,9 +495,15 @@ impl Assembler {
         s
     }
 
-    /// Push one packet; return the access units it completed, and whether a
-    /// frame had to be skipped.
-    fn push(&mut self, seq: u16, ts: u32, marker: bool, payload: Bytes) -> (Vec<Vec<u8>>, bool) {
+    /// Push one packet; return the access units it completed, each with its
+    /// RTP timestamp, and whether a frame had to be skipped.
+    fn push(
+        &mut self,
+        seq: u16,
+        ts: u32,
+        marker: bool,
+        payload: Bytes,
+    ) -> (Vec<(u32, Vec<u8>)>, bool) {
         let s = self.unwrap_seq(seq);
         if self.next.is_some_and(|n| s < n) {
             return (Vec::new(), false); // a late retransmit of a frame already released or skipped
@@ -490,10 +513,10 @@ impl Assembler {
         let mut skipped = false;
         while let Some(start) = self.next.or_else(|| self.pkts.keys().next().copied()) {
             match self.complete_from(start) {
-                Some((end, au)) => {
+                Some((end, au_ts, au)) => {
                     self.pkts.retain(|&k, _| k > end);
                     self.next = Some(end + 1);
-                    out.push(au);
+                    out.push((au_ts, au));
                 }
                 None => {
                     // Skip a frame only when a LATER frame is already whole:
@@ -514,7 +537,7 @@ impl Assembler {
     }
 
     /// The packets `start..=marker` if all are present and share a timestamp.
-    fn complete_from(&self, start: u64) -> Option<(u64, Vec<u8>)> {
+    fn complete_from(&self, start: u64) -> Option<(u64, u32, Vec<u8>)> {
         let (ts0, _, _) = self.pkts.get(&start)?;
         // A fresh depacketizer per attempt: it buffers FU-A fragments, and an
         // attempt that stops at a missing packet must not leave half a NAL
@@ -530,7 +553,7 @@ impl Assembler {
             let part = depacketizer.depacketize(payload).ok()?;
             au.extend_from_slice(&part);
             if *marker {
-                return Some((s, au));
+                return Some((s, *ts0, au));
             }
             s += 1;
         }
@@ -680,6 +703,7 @@ async fn controller_peer(net: Arc<Net>) -> Result<Arc<RTCPeerConnection>> {
 async fn run_cell(cell: Cell) -> Result<Run> {
     synthetic_backend::set_test_gate(cell.gate);
     synthetic_backend::set_test_compositor(cell.compositor);
+    synthetic_backend::set_test_cadence(cell.cadence);
     roomlerd::rtp_playout::set_test_override(cell.playout_zero);
     rc_transport::set_test_override(cell.transport);
     let wire = Arc::new(Wire::default());
@@ -753,12 +777,15 @@ async fn run_cell(cell: Cell) -> Result<Run> {
     // When each IDR arrived.
     let idr_at: Arc<std::sync::Mutex<Vec<Instant>>> = Arc::default();
     let playout: Arc<std::sync::Mutex<PlayoutSeen>> = Arc::default();
+    // #2284: each access unit's RTP timestamp and arrival instant.
+    let steps: Arc<std::sync::Mutex<Vec<(u32, Instant)>>> = Arc::default();
     {
         let results = Arc::clone(&results);
         let idr_at = Arc::clone(&idr_at);
         let sent = Arc::clone(&sent);
         let probe_rtts = Arc::clone(&probe_rtts);
         let playout = Arc::clone(&playout);
+        let steps = Arc::clone(&steps);
         let pc_weak = Arc::downgrade(&pc);
         pc.on_track(Box::new(move |track, _, _| {
             let results = Arc::clone(&results);
@@ -766,6 +793,7 @@ async fn run_cell(cell: Cell) -> Result<Run> {
             let sent = Arc::clone(&sent);
             let probe_rtts = Arc::clone(&probe_rtts);
             let playout = Arc::clone(&playout);
+            let steps = Arc::clone(&steps);
             let pc_weak = pc_weak.clone();
             Box::pin(async move {
                 let ssrc = track.ssrc();
@@ -820,7 +848,11 @@ async fn run_cell(cell: Cell) -> Result<Run> {
                             pkt.payload.clone(),
                         );
                         let mut want_keyframe = skipped;
-                        for au in aus {
+                        for (au_ts, au) in aus {
+                            // #2284: each frame's RTP time against when it
+                            // arrived, the comparison a receiver's jitter
+                            // estimate makes.
+                            steps.lock().unwrap().push((au_ts, Instant::now()));
                             if has_idr(&au) {
                                 idr_at.lock().unwrap().push(Instant::now());
                             }
@@ -984,6 +1016,7 @@ async fn run_cell(cell: Cell) -> Result<Run> {
     l0::set_setting_engine_hook(None);
     synthetic_backend::set_test_gate(Duration::ZERO);
     synthetic_backend::set_test_compositor(None);
+    synthetic_backend::set_test_cadence(None);
     roomlerd::rtp_playout::set_test_override(None);
     rc_transport::set_test_override(None);
     let _ = wan.lock().await.stop().await;
@@ -1021,7 +1054,24 @@ async fn run_cell(cell: Cell) -> Result<Run> {
         run.window = b.0 - a.0;
     }
     run.freezes = kept.windows(2).filter(|w| w[1].0 - w[0].0 > FREEZE).count();
+    run.step_err_ms = step_errors(&steps.lock().unwrap(), from);
     Ok(run)
+}
+
+/// #2284: for each step from one access unit to the next (both past `from`),
+/// how far the RTP clock's step (90 kHz) strays from the arrival step, in ms.
+/// A sender that stamps each frame with its own time keeps this near zero; one
+/// that stamps it with the previous frame's time is off by every change in
+/// the gaps between frames.
+fn step_errors(steps: &[(u32, Instant)], from: Instant) -> Vec<f64> {
+    let kept: Vec<_> = steps.iter().filter(|(_, at)| *at >= from).collect();
+    kept.windows(2)
+        .map(|w| {
+            let rtp_ms = w[1].0.wrapping_sub(w[0].0) as f64 / 90.0;
+            let arrival_ms = (w[1].1 - w[0].1).as_secs_f64() * 1e3;
+            (rtp_ms - arrival_ms).abs()
+        })
+        .collect()
 }
 
 const fn cell(name: &'static str, delay_ms: u64, loss_permille: u32, gate_ms: u64) -> Cell {
@@ -1037,6 +1087,7 @@ const fn cell(name: &'static str, delay_ms: u64, loss_permille: u32, gate_ms: u6
         transport: None,
         replay_pli: false,
         replay_off: false,
+        cadence: None,
     }
 }
 
@@ -1130,6 +1181,11 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
         }),
         ..cell("unguarded", 0, 0, 0)
     };
+    // #2284: damage-driven frames, in bursts and pauses.
+    let cadence = Cell {
+        cadence: Some(&CADENCE),
+        ..cell("cadence", 0, 0, 0)
+    };
 
     let cells = [
         clean,
@@ -1144,6 +1200,7 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
         replay,
         unhardened,
         unguarded,
+        cadence,
     ];
     let mut runs = Vec::new();
     for c in cells {
@@ -1207,7 +1264,23 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
         replay_run,
         unhardened_run,
         unguarded_run,
-    ] = <[Run; 12]>::try_from(runs).unwrap();
+        cadence_run,
+    ] = <[Run; 13]>::try_from(runs).unwrap();
+
+    // #2284: on frames that come in bursts and pauses, each frame's RTP time
+    // steps the way its arrival does. A sender that stamps a frame with the
+    // previous frame's time misses every change between 33 and 200 ms by the
+    // whole change, which is what a receiver's jitter estimate reads as
+    // network jitter. Enough steps that a pass is not an empty one.
+    let errs = &cadence_run.step_err_ms;
+    let (e50, e95) = (quantile(errs, 0.50), quantile(errs, 0.95));
+    assert!(
+        errs.len() >= 20 && e50 <= 10.0 && e95 <= 40.0,
+        "cadence: over {} frame steps the RTP clock strayed from the arrivals by p50 \
+         {e50:.1} ms, p95 {e95:.1} ms (want ≥ 20 steps, ≤ 10 ms and ≤ 40 ms): a frame stamped \
+         with the previous frame's time is off by every change in the gaps",
+        errs.len()
+    );
 
     // FR-101 P1a, the SRTCP half (AC2). With replay protection switched off
     // outright, the agent obeys a replayed PLI and cuts a keyframe each time:
