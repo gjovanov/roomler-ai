@@ -4,6 +4,10 @@
   FR-90 — your agent sessions: start one on a device, see where each stands,
   open its room, stop it. The list is the server's RECORD — the transcript
   itself lives on the device and is read in the session's room.
+
+  P2i-3 — and, where the organization's copies can be searched, a search box:
+  what is typed travels to the archive replica alone, over a peer of its own
+  (`useHiveSearch`), and so does every hit.
 -->
 <template>
   <v-container fluid class="pa-2 pa-md-4 pa-xl-6">
@@ -15,7 +19,79 @@
       </v-btn>
     </div>
 
-    <v-card v-if="hive.loading && hive.sessions.length === 0">
+    <v-text-field
+      v-if="searchable"
+      v-model="query"
+      :label="$t('hive.search.label')"
+      :hint="$t('hive.search.hint')"
+      persistent-hint
+      prepend-inner-icon="mdi-magnify"
+      clearable
+      :maxlength="MAX_QUERY_CHARS"
+      :loading="search.searching.value"
+      variant="outlined"
+      density="comfortable"
+      class="mb-2 mb-md-4"
+      data-testid="hive-search"
+      @keydown.enter="searchNow"
+    />
+
+    <div v-if="searchActive" data-testid="hive-search-results">
+      <v-alert
+        v-if="search.status.value === 'refused'"
+        type="info"
+        variant="tonal"
+        density="compact"
+        class="mb-2"
+        data-testid="hive-search-refused"
+      >
+        {{ refusalText }}
+      </v-alert>
+      <v-alert
+        v-else-if="search.error.value"
+        type="warning"
+        variant="tonal"
+        density="compact"
+        class="mb-2"
+        data-testid="hive-search-error"
+      >
+        {{ $t('hive.search.failed', { error: search.error.value }) }}
+      </v-alert>
+      <v-alert v-if="openError" type="warning" variant="tonal" density="compact" class="mb-2">
+        {{ openError }}
+      </v-alert>
+      <p
+        v-if="search.answered.value === query?.trim() && search.hits.value.length === 0"
+        class="text-body-2 text-medium-emphasis"
+        data-testid="hive-search-none"
+      >
+        {{ $t('hive.search.none') }}
+      </p>
+      <v-list v-if="search.hits.value.length" lines="two">
+        <v-list-item
+          v-for="(h, i) in search.hits.value"
+          :key="`${h.session}:${h.seq}:${i}`"
+          :data-testid="`hive-hit-${i}`"
+          @click="openHit(h)"
+        >
+          <template #prepend>
+            <v-icon>mdi-text-search</v-icon>
+          </template>
+          <v-list-item-title>{{ hitTitle(h) }}</v-list-item-title>
+          <!-- The device marks a match [ ]: drawn as <mark> from text, never as HTML. -->
+          <v-list-item-subtitle class="hive-snippet" data-testid="hive-hit-snippet">
+            <template v-for="(p, k) in snippetParts(h.snippet)" :key="k">
+              <mark v-if="p.mark">{{ p.text }}</mark><span v-else>{{ p.text }}</span>
+            </template>
+          </v-list-item-subtitle>
+        </v-list-item>
+      </v-list>
+      <p v-if="search.searched.value !== null" class="text-caption text-medium-emphasis mt-1" data-testid="hive-search-scope">
+        {{ $t('hive.search.scope', { n: search.searched.value }) }}
+      </p>
+    </div>
+
+    <v-card v-else-if="hive.loading && hive.sessions.length === 0">
       <v-card-text class="text-center"><v-progress-circular indeterminate /></v-card-text>
     </v-card>
 
@@ -120,18 +196,94 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { isAdopted, isLive, useHiveStore, type HiveSessionStatus } from '@/stores/hive'
 import { useDeviceStore } from '@/stores/devices'
+import { MAX_QUERY_CHARS, snippetParts, useHiveSearch, type SearchHit } from '@/composables/useHiveSearch'
 
 const route = useRoute()
 const router = useRouter()
-const { t } = useI18n()
+const { t, te } = useI18n()
 const hive = useHiveStore()
 const devices = useDeviceStore()
 const tenantId = computed(() => route.params.tenantId as string)
+
+// ─── P2i-3 — the search box ────────────────────────────────────────────────
+
+/** A search is asked this long after the last keystroke (Enter asks at once):
+ *  the device takes one every 250 ms. */
+const SEARCH_DEBOUNCE_MS = 300
+
+const search = useHiveSearch()
+const searchable = computed(() => hive.searchable[tenantId.value] === true)
+const query = ref<string | null>('')
+const searchActive = computed(() => searchable.value && (query.value ?? '').trim() !== '')
+const openError = ref<string | null>(null)
+let debounce: ReturnType<typeof setTimeout> | null = null
+
+function stopDebounce(): void {
+  if (debounce) clearTimeout(debounce)
+  debounce = null
+}
+
+watch(query, (q) => {
+  stopDebounce()
+  openError.value = null
+  const text = (q ?? '').trim()
+  if (!text) {
+    void search.run(tenantId.value, '')
+    return
+  }
+  debounce = setTimeout(() => {
+    debounce = null
+    void search.run(tenantId.value, text)
+  }, SEARCH_DEBOUNCE_MS)
+})
+
+function searchNow(): void {
+  stopDebounce()
+  void search.run(tenantId.value, query.value ?? '')
+}
+
+/** The refusal in words: a word this build knows, else the word itself,
+ *  with the detail it came with. */
+const refusalText = computed(() => {
+  const word = search.reason.value ?? 'refused'
+  const detail = search.detail.value
+  const key = `hive.search.refused.${word}`
+  const said = te(key) ? t(key) : t('hive.search.refusedOther', { reason: word })
+  return detail ? `${said} (${detail})` : said
+})
+
+/** A session of yours by its title; one you read through a room says so
+ *  until it is opened: titles are the server's, and a hit names an id. */
+function hitTitle(h: SearchHit): string {
+  return hive.sessions.find((s) => s.id === h.session)?.title || t('hive.search.otherSession')
+}
+
+async function openHit(h: SearchHit): Promise<void> {
+  openError.value = null
+  try {
+    const known = hive.sessions.find((s) => s.id === h.session)
+    const s = known?.room_id ? known : await hive.fetchSession(tenantId.value, h.session)
+    if (s.room_id) await router.push(`/tenant/${tenantId.value}/room/${s.room_id}`)
+    else openError.value = t('hive.search.noRoom')
+  } catch (e) {
+    openError.value = t('hive.search.openFailed', { message: (e as Error).message })
+  }
+}
+
+// Another organization: its own box, its own peer.
+watch(tenantId, (tid) => {
+  stopDebounce()
+  query.value = ''
+  search.close()
+  if (tid) void hive.checkSearchable(tid)
+})
+
+onBeforeUnmount(stopDebounce)
 
 const showStart = ref(false)
 const starting = ref(false)
@@ -200,5 +352,18 @@ async function stopSession(id: string): Promise<void> {
   }
 }
 
-onMounted(() => hive.fetchSessions(tenantId.value))
+onMounted(() => {
+  void hive.fetchSessions(tenantId.value)
+  // Asked again at every visit: archive replicas come and go.
+  void hive.checkSearchable(tenantId.value)
+})
 </script>
+
+<style scoped>
+.hive-snippet mark {
+  background-color: rgba(var(--v-theme-primary), 0.2);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+</style>

@@ -25,6 +25,15 @@
 import { onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import { useWsStore } from '@/stores/ws'
 import { Reassembler, decodeJson, encodeJson, type FrameError } from '@/utils/hiveFraming'
+import {
+  newRef,
+  offGrant,
+  offRef,
+  onGrant,
+  onRef,
+  routeHiveFrames,
+  type HiveFrame as Frame,
+} from '@/utils/hiveRouter'
 
 /** One transcript event — `crates/hive-node/src/event.rs`. */
 export type TranscriptEvent =
@@ -81,32 +90,8 @@ const HELLO_ATTEMPTS = 4
 /** What we accept from the device: pages are ≤ 1 MiB plus framing. */
 const INBOUND = { maxMessageBytes: 4 * 1024 * 1024, maxInFlight: 4 }
 
-// ─── One router for every viewer: the ws store holds ONE handler per type ───
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type Frame = { type: string } & Record<string, any>
-const byRef = new Map<string, (f: Frame) => void>()
-const byGrant = new Map<string, (f: Frame) => void>()
-
-function routeFrames(ws: ReturnType<typeof useWsStore>): void {
-  // Re-registered on every open: `disconnect()` clears the store's handlers.
-  for (const type of ['hive:view.ready', 'hive:view.refused']) {
-    ws.onMediaMessage(type, (data) => {
-      const handler = data?.ref ? byRef.get(data.ref) : undefined
-      handler?.({ type, ...data })
-    })
-  }
-  for (const type of ['hive:view.answer', 'hive:view.ice', 'hive:view.renewed', 'hive:view.closed']) {
-    ws.onMediaMessage(type, (data) => {
-      const handler = data?.grant_id ? byGrant.get(data.grant_id) : undefined
-      handler?.({ type, ...data })
-    })
-  }
-}
-
-function newRef(): string {
-  return Math.random().toString(36).slice(2, 12)
-}
+// The frames reach every viewer, and every search, through ONE router
+// (`utils/hiveRouter.ts`): the ws store holds one handler per type.
 
 /** The events worth showing: Claude Code on stream-json announces its
  *  session again at EVERY prompt, so a `session_init` that repeats the one
@@ -201,9 +186,9 @@ export function useHiveViewer() {
     gen++
     if (renewTimer) clearInterval(renewTimer)
     renewTimer = null
-    if (reference) byRef.delete(reference)
+    if (reference) offRef(reference)
     if (grantId) {
-      byGrant.delete(grantId)
+      offGrant(grantId)
       if (sayClose) ws.send('hive:view.close', { grant_id: grantId })
     }
     try {
@@ -357,7 +342,7 @@ export function useHiveViewer() {
 
   async function dial(ready: Frame, myGen: number): Promise<void> {
     grantId = ready.grant_id
-    byGrant.set(ready.grant_id, (f) => void onFrame(f, myGen))
+    onGrant(ready.grant_id, (f) => void onFrame(f, myGen))
     mayPrompt.value = !!ready.may_prompt
     status.value = 'connecting'
     const ttl = Number(ready.ttl_secs ?? 600)
@@ -408,11 +393,11 @@ export function useHiveViewer() {
     runState.value = null
     reason.value = null
     status.value = 'opening'
-    routeFrames(ws)
+    routeHiveFrames(ws)
     reference = newRef()
-    byRef.set(reference, (f) => {
+    onRef(reference, (f) => {
       if (myGen !== gen) return
-      if (reference) byRef.delete(reference)
+      if (reference) offRef(reference)
       if (f.type === 'hive:view.refused') {
         finish('refused', f.reason ?? 'refused', false)
         if (f.message) reason.value = `${f.reason}: ${f.message}`
@@ -493,21 +478,21 @@ export function useHiveViewer() {
   watch(
     () => ws.connectionId,
     (now, before) => {
-      if (!now || !sessionId) return
-      // The socket is up: send the open that had to wait for it.
-      if (openPending) {
-        sendOpen()
+      if (!sessionId) return
+      const live = status.value === 'open' || status.value === 'connecting' || status.value === 'opening'
+      // The socket redialled: the server ended our grant — or forgot our
+      // request — with the old connection, so ask again on the new one. A
+      // redial goes through null (the store clears the id at its close, then
+      // dials again), so the drop itself is the cue; waiting for a new id
+      // never saw one, and a request on its way was lost for good (P2i-3).
+      // Torn down quietly: the old connection is gone, and its grant with it.
+      if (live && !openPending && before && now !== before) {
+        teardown(false)
+        open(sessionId)
         return
       }
-      // The socket redialled: the server ended our grant — or forgot our
-      // request — with the old connection, so ask again on the new one.
-      if (
-        before &&
-        now !== before &&
-        (status.value === 'open' || status.value === 'connecting' || status.value === 'opening')
-      ) {
-        open(sessionId)
-      }
+      // The socket is up: send the open that had to wait for it.
+      if (now && openPending) sendOpen()
     },
   )
 

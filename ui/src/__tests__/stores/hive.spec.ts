@@ -81,4 +81,48 @@ describe('hive store — the organizations agent sessions serve (FR-90 P1g)', ()
     expect(hive.copied).toEqual({ c1: true, c2: false, c3: false, c4: false })
     expect(hive.served).toEqual({ c1: true, c2: true, c3: true, c4: false })
   })
+
+  // FR-90 P2i-3 — and whether its copies can be searched: only with copies
+  // on; a server before P2i-2 says nothing, which is no.
+  it('keeps whether the copies can be searched, from the same answer', async () => {
+    hoisted.get
+      .mockResolvedValueOnce({ enabled: true, replicaset: true, search: true })
+      .mockResolvedValueOnce({ enabled: true, replicaset: true })
+      .mockResolvedValueOnce({ enabled: true, replicaset: false, search: true })
+      .mockResolvedValueOnce({ enabled: false, replicaset: true, search: true })
+      .mockRejectedValueOnce(new hoisted.ApiError(404, { error: 'not_found' }))
+    const hive = useHiveStore()
+    for (const tid of ['s1', 's2', 's3', 's4', 's5']) await hive.checkServed(tid)
+    expect(hive.searchable, 'only with copies on, in an organization served').toEqual({
+      s1: true,
+      s2: false,
+      s3: false,
+      s4: false,
+      s5: false,
+    })
+  })
+
+  it('asks again whether the copies can be searched at every call, and keeps what it knew on no answer', async () => {
+    hoisted.get
+      .mockResolvedValueOnce({ enabled: true, replicaset: true, search: false })
+      .mockResolvedValueOnce({ enabled: true, replicaset: true, search: true })
+      .mockRejectedValueOnce(new hoisted.ApiError(503, null))
+      .mockRejectedValueOnce(new hoisted.ApiError(404, { error: 'not_found' }))
+    const hive = useHiveStore()
+    // One ask for two callers at once.
+    const [a, b] = await Promise.all([hive.checkSearchable('t'), hive.checkSearchable('t')])
+    expect([a, b]).toEqual([false, false])
+    expect(hoisted.get).toHaveBeenCalledTimes(1)
+    // An archive replica came online since.
+    expect(await hive.checkSearchable('t'), 'asked again: an archive replica came online').toBe(true)
+    expect(hive.searchable).toEqual({ t: true })
+    expect(hive.served).toEqual({ t: true })
+    // No answer is not an answer.
+    expect(await hive.checkSearchable('t'), 'no answer keeps what it knew').toBe(true)
+    // A 404 is: served nowhere, searched nowhere.
+    expect(await hive.checkSearchable('t')).toBe(false)
+    expect(hive.served).toEqual({ t: false })
+    expect(hoisted.get).toHaveBeenCalledTimes(4)
+    expect(hoisted.get).toHaveBeenLastCalledWith('/tenant/t/hive')
+  })
 })
