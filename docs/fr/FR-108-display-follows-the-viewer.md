@@ -123,9 +123,18 @@ stateDiagram-v2
 
 ### 3f. Linux, modes no monitor offers, several displays (P2–P4)
 
-As plan §5.3 has it:
-- **P2:** a declared Xvfb mode ladder in `virtual_desktop.rs` (RandR picks only declared modes), for
-  virtual-desktop hosts, which are unattended by construction.
+As plan §5.3 has it, with P2 corrected by its probe:
+- **P2:** virtual-desktop hosts, which are unattended by construction. The plan said "a declared Xvfb mode
+  ladder in `virtual_desktop.rs`". **P2's probe found no ladder to declare** (§8 row 5). Xvfb 21.1 has one
+  mode, its start size. `xrandr --newmode` returns success but keeps nothing, and the screen cannot shrink
+  below that mode. Xorg with the dummy driver, run unprivileged, switched at runtime to every size asked:
+  a viewer's 946×598, 3840×2160, even past its configured `Virtual` size. So P2 runs the virtual desktop
+  on Xorg + dummy where `xserver-xorg-video-dummy` is installed, and keeps Xvfb, answering `unsupported`,
+  where it is not (open decision 4). Two more things P2 has to build:
+  - **The capture reopens after a switch.** On Linux, scrap's X11 capturer takes its size when it opens;
+    only the macOS arm reopens on a size change (`capture/scrap_backend.rs`).
+  - **The restore** returns to the start mode, as on Windows. The mode the viewer asked for is added for
+    the session and removed after it.
 - **P3:** a mode no monitor offers comes from the virtual display (the IddCx FR, when it exists).
 - **P4:** several displays at once, with a pump and a `video-bytes` channel per display, and viewer windows
   placed by `getScreenDetails`.
@@ -134,10 +143,10 @@ As plan §5.3 has it:
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| P0 | This spec and the claim. Three probes on vmtest: (1) does `GetLastInputInfo`, read in the worker, move on the person's input (QMP) and on the controller's injection, and can the two be told apart; (2) what `ChangeDisplaySettingsExW(CDS_FULLSCREEN)` does at the lock screen and at the logon screen (SystemContext); (3) a guest with several modes, a display driver beyond the Basic Render Driver, so a real switch and restore can be seen | docs only | **done 2026-10-16** (§8 rows 2–4): (1) the idle clock moves for both the person and the controller, so the guard must subtract the arbiter's injections; (2) at the lock screen the switch **fails** (`rc=-1`), which reshaped 3a; the logon screen is still owed; (3) a virtio video model plus `viogpudo` gives session 1 23 modes, and the red was recorded on it |
+| P0 | This spec and the claim. Three probes on vmtest: (1) does `GetLastInputInfo`, read in the worker, move on the person's input (QMP) and on the controller's injection, and can the two be told apart; (2) what `ChangeDisplaySettingsExW(CDS_FULLSCREEN)` does at the lock screen and at the logon screen (SystemContext); (3) a guest with several modes, a display driver beyond the Basic Render Driver, so a real switch and restore can be seen | docs only | **done 2026-10-16** (§8 rows 2–4): (1) the idle clock moves for both the person and the controller, so the guard must subtract the arbiter's injections; (2) at the lock screen the switch **fails** (`rc=-1`), which reshaped 3a. The logon screen is still owed. By the code it takes the same path: `lock_state` reads any input desktop but `Default` as `Locked`, so P1 answers it `locked` and it waits. Its cell rides AC2's locked half on the release; (3) a virtio video model plus `viogpudo` gives session 1 23 modes, and the red was recorded on it |
 | P1 | The guard (3a), the owner's key (3b), the answer (3c) and the viewer's words (3d), on Windows | `display_match = always` restores rc.191 | **built** ([`docs/display-match.md`](../display-match.md)): `presence.rs` (a tracker that keeps the last idle-clock move the machine does not explain, its 500 ms sampler from the worker's start, the decision), `display_match.rs` (the owner's policy, `may_switch`, `request_for`, the answer), the arbiter's and keep busy's tick notes, the console-only and never-pushable key, the viewer's answer and words. Unit tests on Windows and Linux with four negative controls: the tracker counting machine input as a person failed three tests, `auto` ignoring presence failed one, a planted `SetWindowsHookExW` failed the scan, and the gate removed failed the console test. Field green owed: AC1, AC2's idle half, AC4, AC5 |
 | P1b | The locked host's request applies at the unlock when nobody is at the screen (3a), and the person coming back restores their mode (3e) | `display_match = always` (no hand-back) | **built** (3e "as built"): `away_since_lock` in the tracker, the waiting request and `on_unlock` from the session's lock watcher, the 250 ms `on_tick` watcher with `hand_back`. Unit tests on Windows and Linux with two negative controls: an `away_since_lock` that never reads a lock as away failed the two lock tests, and a `hand_back` that keeps the mode under `never` failed the hand-back test. Field green owed: AC2's locked half, AC3 |
-| P2 | Linux virtual desktops: the Xvfb mode ladder | — | — |
+| P2 | Linux virtual desktops: switch the virtual desktop's mode to the one asked (Xorg + dummy, open decision 4), reopen the capture after a switch, restore at the end | `display_match = never` | **probe done 2026-10-16** (§8 row 5): Xvfb cannot switch at all; Xorg + dummy switches to any size. The build waits for decision 4 |
 | P3 | Modes no monitor offers, through the virtual display | — | — |
 | P4 | Several displays | — | — |
 | P5 | Docs: [`docs/display-match.md`](../display-match.md) (mermaid, the answers, the owner's key), linked from `docs/remote-control.md` §18.6.1 and indexed in `docs/README.md` | — | the page exists from P1 and grows with each phase |
@@ -164,7 +173,10 @@ As plan §5.3 has it:
   `GetAsyncKeyState`. It passed. With the string constant `"SetWindowsHookExW"` planted at the end of
   `display_match.rs` it failed; restored from the commit, it passed again. It is a sibling of FR-92's own
   scan rather than an entry in it, because FR-92's scan asserts that it lists every file of `keep_busy/`.
-- [ ] **AC7 (Linux, P2):** a virtual-desktop host switches to a declared mode and restores it.
+- [ ] **AC7 (Linux, P2):** a virtual-desktop host switches to the mode the viewer asks for and restores it,
+  read on the host (`xrandr`, the root window's size), and the stream follows the new size. On a host with
+  only Xvfb, the answer is `unsupported`. *(Reworded by P2's probe: first written as "a declared mode", but
+  Xvfb has no modes to declare, §8 row 5.)*
 - [ ] **AC8:** **Docs:** a `docs/display-match.md` page (mermaid, the answers, the owner's key), linked from
   `docs/remote-control.md`, with a row in `docs/README.md`'s index. *(Reworded in P1: first written as a
   section inside `docs/remote-control.md`, but other specs cite that page by line number, and a page of its
@@ -178,6 +190,16 @@ As plan §5.3 has it:
 2. **Re-arm when the person leaves again** (3e). Recommended: no; the viewer asks again (toggle off and on),
    so a returning person never fights a timer.
 3. **The viewer's default.** With the guard in place ON is safe. Recommended: keep it ON.
+4. **The X server behind a virtual desktop (P2, raised by its probe).** Xvfb cannot change its mode (§8
+   row 5). The options:
+   - **Xorg + the dummy driver where `xserver-xorg-video-dummy` is installed, Xvfb otherwise.** It is one
+     small package from the distribution's main archive, runs as the daemon's own user (the real binary,
+     not the console-only wrapper), and takes any size at runtime. A host without it keeps today's Xvfb and
+     answers `unsupported`, so nothing changes for it;
+   - TigerVNC's `Xvnc`, which also resizes. Not measured;
+   - keep Xvfb everywhere and answer `unsupported`: no package, and no crisp 1:1 text on a virtual desktop.
+
+   Recommended: the first.
 
 ## 7. Out of scope
 
@@ -192,6 +214,7 @@ As plan §5.3 has it:
 | 2 | 2026-10-16 | **AC1, the red (0.4.139), on a guest with several modes.** The same guest after P0 (3): video model virtio plus `viogpudo` from the harness's virtio-win ISO, so session 1 lists 23 modes (640×480 … 5120×2160) where QXL with the Basic Render Driver listed one. The person was at the screen: `vmtest` Active at the console, with QMP mouse moves just before and during the session. The viewer sent the toggle's exact message on its own control channel, `{t:"rc:display-match", enable:true, width:946, height:598}` | **The attended screen was taken.** 13:43:38.307Z the request; 13 ms later the agent: `switched host display mode req_w=946 req_h=598 mode_w=640 mode_h=480`. The host's own screenshots at 13:43:44 and 13:43:54, while the person kept moving the mouse, were **640×480**, with the companion cut off at the right edge and the taskbar gone. At disconnect: `restored on session close (owner)`, then 1280×800 again. The viewer received no answer. **Wrong turn:** a first session that only connected and held, with the toggle at its ON default, sent no request at all. The viewer sends on connect only if the agent's OS is known and the stage element exists at that moment (`RemoteControl.vue` L4385) |
 | 3 | 2026-10-16 | **P0 (1): the idle clock.** The same guest. A sampler ran as the person in session 1 for 150 s, reading `GetLastInputInfo` every 250 ms; the person moved over QMP, then the controller moved the pointer over the stage (20 moves), then the person again | **Both move it, and nothing tells them apart.** The person's moves (13:46:24.6–26.4) and the controller's (every sample 13:46:55.5–58.6) and the person's again (13:47:19.8–20.5) each advanced the tick, with `idle_ms` 0–234 at each read. So the guard cannot read "a person" from the clock alone; it must subtract the arbiter's own injections (3a), as FR-92 does |
 | 4 | 2026-10-16 | **P0 (2): the lock screen.** The same guest, locked (`LockWorkStation` as the person; LogonUI 1). A session asked for 946×598 | **A locked screen cannot be switched by the worker.** The agent: `could not switch mode req_w=946 req_h=598 e=ChangeDisplaySettingsExW failed rc=-1`, and the host's screenshots before, during and after read 1280×800. So "locked" waits for the unlock instead of switching (3a, P1b). The logon screen (nobody signed in) is still owed |
+| 5 | 2026-10-16 | **P2's probe (a dev box, not a cell).** Ubuntu with X.Org 21.1.11/21.1.12. Xvfb started at 1920×1080 and again at 3840×2160. Then Xorg with `xserver-xorg-video-dummy` 0.4.0, started unprivileged as the real binary (`/usr/lib/xorg/Xorg`, not the console-only wrapper) with a `-config` of `VideoRam 256000` and `Virtual 3840 2160`. Each was read with `xrandr` and the root window's size (`xwininfo -root`) | **Xvfb cannot switch.** RandR lists one mode, the start size, and reports it as the maximum too. `xrandr --newmode` returns 0, but the mode is not kept: it is not listed, and `--addmode` says `cannot find mode`. `--fb` to any smaller size fails `BadValue` on `RRSetCrtcConfig`, because the one CRTC still holds the start mode. **Xorg + dummy switches to anything asked, at runtime:** newmode, addmode, then `--output DUMMY0 --mode` took it from 2048×1536 to 1280×720, then 946×598 (a 1280×720 browser's stage, row 2), 3840×2160 and 5120×2880 (past `Virtual`), the root window following each time. The plan's "declared Xvfb mode ladder" cannot exist; decision 4 picks the server |
 
 ## 9. Related
 
