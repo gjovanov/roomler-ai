@@ -3996,7 +3996,7 @@ sequenceDiagram
 
 | Rule | Why | Where |
 |---|---|---|
-| The page, and its nav item, only where the server copies sessions: `GET …/hive` answers `replicaset`, and a server before it says nothing, which reads as no | prod has `hive.replicaset` off, and a page there could only say so | [`routes.rs:296`](../crates/modules/hive/src/routes.rs#L296), [`hive.ts:344`](../ui/src/stores/hive.ts#L344), [`AppLayout.vue:147`](../ui/src/components/layout/AppLayout.vue#L147) |
+| The page, and its nav item, only where the server copies sessions: `GET …/hive` answers `replicaset`, and a server before it says nothing, which reads as no | prod has `hive.replicaset` off, and a page there could only say so | [`routes.rs:296`](../crates/modules/hive/src/routes.rs#L296), [`hive.ts:370`](../ui/src/stores/hive.ts#L370), [`AppLayout.vue:147`](../ui/src/components/layout/AppLayout.vue#L147) |
 | Listed: every device that offers itself (`hive-archive` among its words, by equality) and every designated one, once, the designated first. A designated device the agents page did not hold is read on its own, and one that is gone says so | a designation is never shown as missing, and `hive-archives` is not `hive-archive` | [`HiveCopiesView.vue:246`](../ui/src/views/hive/HiveCopiesView.vue#L246), [`HiveCopiesView.vue:298`](../ui/src/views/hive/HiveCopiesView.vue#L298) |
 | Designating writes the whole policy from the revision read. One changed meanwhile is read again and said so; any other refusal shows in the server's words | the policy is one document with a revision (P2c-2a): a write from a stale read would undo another administrator's | [`HiveCopiesView.vue:320`](../ui/src/views/hive/HiveCopiesView.vue#L320) |
 | The switches and the add button only for an `ADMINISTRATOR`, the owner included, and none until the caller's permissions are known | the server's own gate on the write: failing closed costs a moment, failing open a click that is refused | [`permissions.ts:429`](../ui/src/utils/permissions.ts#L429) |
@@ -4128,7 +4128,7 @@ sequenceDiagram
 
 | Rule | Why | Where |
 |---|---|---|
-| The box is there only while `GET …/hive` answers `search`, asked again at every visit to the page; no answer keeps what was known | archive replicas come and go; the open decides anyway, and a refusal says why | [`hive.ts:383`](../ui/src/stores/hive.ts#L383), [`HiveSessionsView.vue:23`](../ui/src/views/hive/HiveSessionsView.vue#L23) |
+| The box is there only while `GET …/hive` answers `search`, asked again at every visit to the page; no answer keeps what was known | archive replicas come and go; the open decides anyway, and a refusal says why | [`hive.ts:409`](../ui/src/stores/hive.ts#L409), [`HiveSessionsView.vue:23`](../ui/src/views/hive/HiveSessionsView.vue#L23) |
 | One router for every peer's frames in a tab: an open's answer by its `ref` (`hive:view.ready` and `refused`, `hive:search.ready` and `refused`), the rest of the handshake by its grant | the ws store holds ONE handler per frame type, so a search that took `hive:view.answer` for itself would silently take the viewer's away | [`hiveRouter.ts:24`](../ui/src/utils/hiveRouter.ts#L24) |
 | Opened at the first search and dialled in a viewer's order: no peer before `ready`, our offer before our candidates, theirs held until the answer; `hello` asked again until answered, and one that does not say `search: true` is no search peer | the order the viewer proved (FR-83); a peer that serves no search must not be asked for one | [`useHiveSearch.ts:367`](../ui/src/composables/useHiveSearch.ts#L367), [`useHiveSearch.ts:279`](../ui/src/composables/useHiveSearch.ts#L279) |
 | A query is asked 300 ms after the last keystroke, Enter at once, at most 200 characters, and only the latest query's answer is shown. One refused `too_soon` is asked again once, 300 ms later; any other refusal is shown in the device's words | the device takes one search every 250 ms a grant, and an answer to an older query must not overwrite a newer one | [`HiveSessionsView.vue:217`](../ui/src/views/hive/HiveSessionsView.vue#L217), [`useHiveSearch.ts:442`](../ui/src/composables/useHiveSearch.ts#L442) |
@@ -4173,11 +4173,11 @@ sequenceDiagram
 | Rule | Why | Where |
 |---|---|---|
 | Each member's view says `holds`: how much of the session's chain its copy holds, as a `seq`, counted by the rule a promotion is decided by. A tail past where its fence ended counts for nothing; absent without a tip | a tip's `(fence, seq)` compared whole reads an empty copy at a newer fence as the freshest. One count, the server's, so the panel never disagrees with the move it offers | [`model.rs:308`](../crates/modules/hive/src/model.rs#L308), [`model.rs:820`](../crates/modules/hive/src/model.rs#L820) |
-| Shown only for a record that carries a replicaset, and read fresh at every opening; each device by its name, a device the page has not seen read once | a server that copies nothing, or a session placed nowhere, has no copies to show; a copy's tip moves while the room is open | [`HiveCopies.vue:158`](../ui/src/components/hive/HiveCopies.vue#L158), [`HiveCopies.vue:214`](../ui/src/components/hive/HiveCopies.vue#L214) |
+| Shown only for a record that carries a replicaset, and read fresh at every opening; each device by its name, a device the page has not seen read once | a server that copies nothing, or a session placed nowhere, has no copies to show; a copy's tip moves while the room is open | [`HiveCopies.vue:291`](../ui/src/components/hive/HiveCopies.vue#L291), [`HiveCopies.vue:364`](../ui/src/components/hive/HiveCopies.vue#L364) |
 | A copy's freshness: the primary's own count, then each other copy as up to date, or so many events behind the primary's | what a reader wants to know before trusting a copy, or moving to it | [`hiveCopies.ts:21`](../ui/src/utils/hiveCopies.ts#L21) |
 | A move goes to a copy taken on another device that runs sessions: not the primary, not an archive replica, which runs none, nor a teleport's target. The one that holds the most is preselected, the first among equals | the server refuses a move to a copy that holds less than another (`not_freshest`), counting one that reported nothing as none | [`hiveCopies.ts:29`](../ui/src/utils/hiveCopies.ts#L29), [`hiveCopies.ts:44`](../ui/src/utils/hiveCopies.ts#L44) |
-| Move is the owner's alone; the folder is sent only when changed; the answer is shown in the server's words | the server keeps the folder the session runs in unless told; each refusal names its own next step | [`HiveCopies.vue:164`](../ui/src/components/hive/HiveCopies.vue#L164), [`HiveCopies.vue:236`](../ui/src/components/hive/HiveCopies.vue#L236) |
-| Why it cannot move, said instead of a Move: being moved already, not running, adopted from a terminal | each is a refusal the server would answer; saying it first spares a click | [`HiveCopies.vue:167`](../ui/src/components/hive/HiveCopies.vue#L167) |
+| Move is the owner's alone; the folder is sent only when changed; the answer is shown in the server's words | the server keeps the folder the session runs in unless told; each refusal names its own next step | [`HiveCopies.vue:299`](../ui/src/components/hive/HiveCopies.vue#L299), [`HiveCopies.vue:386`](../ui/src/components/hive/HiveCopies.vue#L386) |
+| Why it cannot move, said instead of a Move: being moved already, not running, adopted from a terminal | each is a refusal the server would answer; saying it first spares a click | [`HiveCopies.vue:302`](../ui/src/components/hive/HiveCopies.vue#L302) |
 
 ⚠️ **An archive replica can hold a move up.** The server compares a move's target with every
 copy taken, an archive replica's included, though an archive replica runs no session. While one
@@ -4187,9 +4187,34 @@ panel names it, until a target catches up.
 ⚠️ **The panel is a reading, not a watch.** It reads the record when it opens and after a move
 answers. A move in flight goes on in the session's room, which says how it ends.
 
-The rest of P2 is next (spec §3b and §4): the rest of the UI (P2j-2 onward: the teleport and fork
-dialogs, a purge, the policy's rules) and the field run (P2k). Its server switch is
-`hive.replicaset` and its device switch `hive_replica`, both off by default.
+### P2j-2: move elsewhere, and fork, from the same panel
+
+Beside Move, the owner's panel offers a move to a device that holds no copy (a teleport, P2f-1)
+and a fork (P2f-3). Both may go to a device the panel lists no copy on, so the organization's
+devices are read the first time either opens.
+
+```mermaid
+flowchart LR
+    O["the owner, in the room's Copies"] --> M["Move: to a copy taken<br/>POST …/promote"]
+    O --> T["Move elsewhere: to a device with no copy<br/>POST …/teleport"]
+    O --> F["Fork: a new session, a folder of its own<br/>POST …/fork"]
+    T --> TD["online · hive-teleport · no copy taken<br/>not where it runs · no archive replica"]
+    F --> FD["online · hive-fork · no archive replica<br/>those with a copy first"]
+```
+
+| Rule | Why | Where |
+|---|---|---|
+| A teleport goes to an online device that advertises `hive-teleport`, holds no copy taken, is not the one it runs on, and is no archive replica. The first is preselected; the folder is sent only when changed | a device that holds a copy is moved to by Move (`already_a_member`); an archive replica runs no session | [`hiveCopies.ts:83`](../ui/src/utils/hiveCopies.ts#L83), [`HiveCopies.vue:425`](../ui/src/components/hive/HiveCopies.vue#L425) |
+| A fork goes to an online device that advertises `hive-fork` and is no archive replica: those that hold a copy first, then those that take one first. Its folder is required, its name optional; once made, its room is offered | a fork is a session of its own, in a folder of its own: the device refuses one into the folder its parent runs in (P2f-3d) | [`hiveCopies.ts:97`](../ui/src/utils/hiveCopies.ts#L97), [`HiveCopies.vue:448`](../ui/src/components/hive/HiveCopies.vue#L448) |
+| The organization's devices are read once, when either opens | a page of devices is a read the panel should not repeat at every switch | [`HiveCopies.vue:412`](../ui/src/components/hive/HiveCopies.vue#L412) |
+| Why it cannot be forked is said instead of a Fork: adopted from a terminal, being moved. An ended session forks from its copies | the server's `not_forkable` and `in_progress`; the move's reasons are not a fork's | [`HiveCopies.vue:313`](../ui/src/components/hive/HiveCopies.vue#L313) |
+
+⚠️ **A device's words are matched by equality.** `hive` is a prefix of every hive word, and a
+lookalike such as `hive-teleports` must not read as `hive-teleport`.
+
+The rest of P2 is next (spec §3b and §4): the rest of the UI (P2j-3 onward: a purge, the policy's
+rules) and the field run (P2k). Its server switch is `hive.replicaset` and its device switch
+`hive_replica`, both off by default.
 
 ---
 
@@ -4205,7 +4230,7 @@ dialogs, a purge, the policy's rules) and the field run (P2k). Its server switch
 | the archive replica image | [`Dockerfile.hive-archive`](../Dockerfile.hive-archive) and its entrypoint [`hive-archive-entrypoint.sh`](../scripts/hive-archive-entrypoint.sh) (enroll once, then run); the posture its enrollment writes, and what refuses one, in [`archive_replica.rs`](../agents/roomlerd/src/archive_replica.rs); its build, smoke test and dispatch-only publish in [`hive-archive-image.yml`](../.github/workflows/hive-archive-image.yml) |
 | the update wait | [`updater.rs:278`](../agents/roomlerd/src/updater.rs#L278); the macOS hold, `HiveUpdateHold`, in [`crates/localapi/src/lib.rs`](../crates/localapi/src/lib.rs) |
 | `adopt` | the CLI in [`hive_hooks.rs`](../agents/roomler-cli/src/hive_hooks.rs); its protocol in [`crates/localapi/src/hive_adopt.rs`](../crates/localapi/src/hive_adopt.rs) |
-| the SPA | [`stores/hive.ts`](../ui/src/stores/hive.ts), [`useHiveViewer.ts`](../ui/src/composables/useHiveViewer.ts), [`useHiveSearch.ts`](../ui/src/composables/useHiveSearch.ts) (a search's peer, P2i-3), [`utils/hiveRouter.ts`](../ui/src/utils/hiveRouter.ts) (one router for every peer's frames), [`utils/hiveCopies.ts`](../ui/src/utils/hiveCopies.ts) (a session's copies read by the server's count, P2j-1), [`components/hive/`](../ui/src/components/hive/) (`HiveCopies.vue`: a session's copies in its room, and its Move, P2j-1), [`views/hive/`](../ui/src/views/hive/) |
+| the SPA | [`stores/hive.ts`](../ui/src/stores/hive.ts), [`useHiveViewer.ts`](../ui/src/composables/useHiveViewer.ts), [`useHiveSearch.ts`](../ui/src/composables/useHiveSearch.ts) (a search's peer, P2i-3), [`utils/hiveRouter.ts`](../ui/src/utils/hiveRouter.ts) (one router for every peer's frames), [`utils/hiveCopies.ts`](../ui/src/utils/hiveCopies.ts) (a session's copies read by the server's count, P2j-1, and the devices a teleport or a fork may go to, P2j-2), [`components/hive/`](../ui/src/components/hive/) (`HiveCopies.vue`: a session's copies in its room, and its Move, P2j-1), [`views/hive/`](../ui/src/views/hive/) |
 | the integration tests | `crates/tests/src/hive_tests.rs`, and in `crates/tests/tests/hive_*.rs` the canary, drivers and memory, a device's frames of a promotion (`hive_drain.rs`), a promotion between real devices (`hive_promote.rs`), a teleport between real devices, into a folder and into a clone (`hive_teleport.rs`), forks (`hive_fork.rs`), a terminal session the real hook client adopted, made a managed one (`hive_manage.rs`), and a session purged with a member offline, each device's store keeping only its id, and the primary of a running session removed, purging what it held while its member keeps its copy (`hive_purge.rs`), and a member back after its session's days purging its copy on its own clock (`hive_retain.rs`) |
 
 ## Not built
@@ -4250,7 +4275,8 @@ dialogs, a purge, the policy's rules) and the field run (P2k). Its server switch
   (P2i-1), and the server names, for a member who asks, the sessions they may read whose copy
   it holds (P2i-2). The sessions page searches them, from a box shown only where an archive
   replica that searches is online (P2i-3); P2i is done in code. A session's room shows its
-  copies and how far behind each is, and its owner moves it from there (P2j-1).
+  copies and how far behind each is, and its owner moves it from there (P2j-1), to a device
+  with no copy too, or forks it (P2j-2).
 - A search hit opens its session's room at its newest events, not at the event it names (`seq`),
   and names a session read through a room only once it is opened.
 - The vault and the rest of the toolbelt (P3), knowhow (P4) and the learning loop

@@ -103,17 +103,20 @@ export interface HivePromotion {
 
 /** `POST …/promote`: `promoting` (the member is ready, the primary drains),
  *  `pending` (the member has not answered yet) or `refused`, in the words of
- *  the gate that said no. Always 200 for a well-formed request. */
+ *  the gate that said no; `POST …/teleport` says `teleporting` in place of
+ *  `promoting`. Always 200 for a well-formed request. */
 export interface HivePromoteResult {
-  outcome: 'promoting' | 'pending' | 'refused'
+  outcome: 'promoting' | 'teleporting' | 'pending' | 'refused'
   reason?: string
   message?: string
   session: HiveSession
 }
 
-/** `POST …/hive/session` — always 200 for a well-formed request. */
+/** `POST …/hive/session` — always 200 for a well-formed request. A fork's
+ *  answer is a start's too, or (P2f-3c) `joining` while a device with no
+ *  copy takes one first. */
 export interface HiveStartResult {
-  outcome: 'accepted' | 'refused' | 'pending'
+  outcome: 'accepted' | 'refused' | 'pending' | 'joining'
   reason?: string
   message?: string
   session?: HiveSession
@@ -297,6 +300,29 @@ export const useHiveStore = defineStore('hive', () => {
     return res
   }
 
+  /** P2j-2 — the owner moves a running session to a device that holds no
+   *  copy of it (P2f-1): it takes one while the session still runs. */
+  async function teleport(
+    tenantId: string,
+    sessionId: string,
+    body: { device_id: string; folder?: string },
+  ): Promise<HivePromoteResult> {
+    const res = await api.post<HivePromoteResult>(`${base(tenantId)}/${sessionId}/teleport`, body)
+    if (res.session) upsert(res.session)
+    return res
+  }
+
+  /** P2j-2 — the owner makes a new session from this one's conversation
+   *  (P2f-3), in a folder of its own. The answer's record is the FORK's,
+   *  with its own room; the session it forks is not changed. */
+  function fork(
+    tenantId: string,
+    sessionId: string,
+    body: { device_id: string; folder: string; title?: string },
+  ): Promise<HiveStartResult> {
+    return api.post<HiveStartResult>(`${base(tenantId)}/${sessionId}/fork`, body)
+  }
+
   async function stop(tenantId: string, sessionId: string): Promise<HiveStopResult> {
     const res = await api.post<HiveStopResult>(`${base(tenantId)}/${sessionId}/stop`, {})
     upsert(res.session)
@@ -461,6 +487,8 @@ export const useHiveStore = defineStore('hive', () => {
     start,
     stop,
     promote,
+    teleport,
+    fork,
     upsert,
     fetchParticipants,
     setParticipant,

@@ -63,50 +63,160 @@
         </v-list>
 
         <div v-if="isOwner" class="mt-3" data-testid="hive-copies-move">
-          <div class="text-subtitle-2">{{ $t('hive.roomCopies.moveTitle') }}</div>
-          <p class="text-caption text-medium-emphasis mb-1">{{ $t('hive.roomCopies.moveExplain') }}</p>
-          <p v-if="notMovable" class="text-caption text-medium-emphasis" data-testid="hive-copies-not-movable">
-            {{ notMovable }}
-          </p>
-          <template v-else-if="targets.length">
-            <v-radio-group v-model="target" density="compact" hide-details>
-              <v-radio
-                v-for="m in targets"
-                :key="m.device_id"
-                :value="m.device_id"
-                :label="nameOf(m.device_id)"
-                :data-testid="`hive-copies-target-${m.device_id}`"
-              />
-            </v-radio-group>
-            <v-text-field
-              v-model="folder"
-              :label="$t('hive.roomCopies.folder')"
-              :hint="$t('hive.roomCopies.folderHint')"
-              persistent-hint
-              density="compact"
-              class="mt-2"
-              data-testid="hive-copies-folder"
-            />
-            <p v-if="ahead" class="text-caption text-warning mt-2" data-testid="hive-copies-ahead">
-              {{ $t('hive.roomCopies.ahead', { device: nameOf(ahead.device_id) }) }}
+          <v-btn-toggle v-model="action" mandatory density="compact" variant="outlined" divided class="mb-2">
+            <v-btn value="move" size="small" data-testid="hive-copies-action-move">
+              {{ $t('hive.roomCopies.actions.move') }}
+            </v-btn>
+            <v-btn value="teleport" size="small" data-testid="hive-copies-action-teleport">
+              {{ $t('hive.roomCopies.actions.teleport') }}
+            </v-btn>
+            <v-btn value="fork" size="small" data-testid="hive-copies-action-fork">
+              {{ $t('hive.roomCopies.actions.fork') }}
+            </v-btn>
+          </v-btn-toggle>
+
+          <!-- P2j-2 — to a device that holds no copy: it takes one while the session runs. -->
+          <template v-if="action === 'teleport'">
+            <p class="text-caption text-medium-emphasis mb-1">{{ $t('hive.roomCopies.teleportExplain') }}</p>
+            <p v-if="notMovable" class="text-caption text-medium-emphasis" data-testid="hive-copies-not-movable">
+              {{ notMovable }}
             </p>
-            <div class="d-flex justify-end mt-2">
-              <v-btn
-                color="primary"
-                variant="flat"
-                size="small"
-                :loading="moving"
-                :disabled="!target"
-                data-testid="hive-copies-move-submit"
-                @click="move"
-              >
-                {{ $t('hive.roomCopies.move') }}
-              </v-btn>
-            </div>
+            <template v-else-if="teleports.length">
+              <v-radio-group v-model="teleportTo" density="compact" hide-details>
+                <v-radio
+                  v-for="d in teleports"
+                  :key="d.id"
+                  :value="d.id"
+                  :label="d.display_name || d.name"
+                  :data-testid="`hive-copies-teleport-to-${d.id}`"
+                />
+              </v-radio-group>
+              <v-text-field
+                v-model="folder"
+                :label="$t('hive.roomCopies.folder')"
+                :hint="$t('hive.roomCopies.folderHint')"
+                persistent-hint
+                density="compact"
+                class="mt-2"
+                data-testid="hive-copies-teleport-folder"
+              />
+              <div class="d-flex justify-end mt-2">
+                <v-btn
+                  color="primary"
+                  variant="flat"
+                  size="small"
+                  :loading="moving"
+                  :disabled="!teleportTo"
+                  data-testid="hive-copies-teleport-submit"
+                  @click="teleportNow"
+                >
+                  {{ $t('hive.roomCopies.move') }}
+                </v-btn>
+              </div>
+            </template>
+            <p v-else-if="!loadingDevices" class="text-caption text-medium-emphasis" data-testid="hive-copies-no-teleport">
+              {{ $t('hive.roomCopies.noTeleport') }}
+            </p>
           </template>
-          <p v-else class="text-caption text-medium-emphasis" data-testid="hive-copies-no-target">
-            {{ $t('hive.roomCopies.noTarget') }}
-          </p>
+
+          <!-- P2j-2 — a new session from this one's conversation, in a folder of its own. -->
+          <template v-else-if="action === 'fork'">
+            <p class="text-caption text-medium-emphasis mb-1">{{ $t('hive.roomCopies.forkExplain') }}</p>
+            <p v-if="notForkable" class="text-caption text-medium-emphasis" data-testid="hive-copies-not-forkable">
+              {{ notForkable }}
+            </p>
+            <template v-else-if="forks.length">
+              <v-radio-group v-model="forkOn" density="compact" hide-details>
+                <v-radio
+                  v-for="f in forks"
+                  :key="f.device.id"
+                  :value="f.device.id"
+                  :label="forkLabel(f)"
+                  :data-testid="`hive-copies-fork-on-${f.device.id}`"
+                />
+              </v-radio-group>
+              <v-text-field
+                v-model="forkFolder"
+                :label="$t('hive.roomCopies.forkFolder')"
+                :hint="$t('hive.roomCopies.forkFolderHint')"
+                persistent-hint
+                density="compact"
+                class="mt-2"
+                data-testid="hive-copies-fork-folder"
+              />
+              <v-text-field
+                v-model="forkTitle"
+                :label="$t('hive.roomCopies.forkName')"
+                :placeholder="$t('hive.roomCopies.forkNameDefault', { title: session?.title ?? '' })"
+                density="compact"
+                class="mt-2"
+                data-testid="hive-copies-fork-title"
+              />
+              <div class="d-flex justify-end mt-2">
+                <v-btn
+                  color="primary"
+                  variant="flat"
+                  size="small"
+                  :loading="moving"
+                  :disabled="!forkOn || !forkFolder.trim()"
+                  data-testid="hive-copies-fork-submit"
+                  @click="forkNow"
+                >
+                  {{ $t('hive.roomCopies.fork') }}
+                </v-btn>
+              </div>
+            </template>
+            <p v-else-if="!loadingDevices" class="text-caption text-medium-emphasis" data-testid="hive-copies-no-fork">
+              {{ $t('hive.roomCopies.noFork') }}
+            </p>
+          </template>
+
+          <template v-else>
+            <div class="text-subtitle-2">{{ $t('hive.roomCopies.moveTitle') }}</div>
+            <p class="text-caption text-medium-emphasis mb-1">{{ $t('hive.roomCopies.moveExplain') }}</p>
+            <p v-if="notMovable" class="text-caption text-medium-emphasis" data-testid="hive-copies-not-movable">
+              {{ notMovable }}
+            </p>
+            <template v-else-if="targets.length">
+              <v-radio-group v-model="target" density="compact" hide-details>
+                <v-radio
+                  v-for="m in targets"
+                  :key="m.device_id"
+                  :value="m.device_id"
+                  :label="nameOf(m.device_id)"
+                  :data-testid="`hive-copies-target-${m.device_id}`"
+                />
+              </v-radio-group>
+              <v-text-field
+                v-model="folder"
+                :label="$t('hive.roomCopies.folder')"
+                :hint="$t('hive.roomCopies.folderHint')"
+                persistent-hint
+                density="compact"
+                class="mt-2"
+                data-testid="hive-copies-folder"
+              />
+              <p v-if="ahead" class="text-caption text-warning mt-2" data-testid="hive-copies-ahead">
+                {{ $t('hive.roomCopies.ahead', { device: nameOf(ahead.device_id) }) }}
+              </p>
+              <div class="d-flex justify-end mt-2">
+                <v-btn
+                  color="primary"
+                  variant="flat"
+                  size="small"
+                  :loading="moving"
+                  :disabled="!target"
+                  data-testid="hive-copies-move-submit"
+                  @click="move"
+                >
+                  {{ $t('hive.roomCopies.move') }}
+                </v-btn>
+              </div>
+            </template>
+            <p v-else class="text-caption text-medium-emphasis" data-testid="hive-copies-no-target">
+              {{ $t('hive.roomCopies.noTarget') }}
+            </p>
+          </template>
           <v-alert
             v-if="outcome"
             :type="outcome.kind"
@@ -117,6 +227,11 @@
           >
             {{ outcome.text }}
           </v-alert>
+          <div v-if="forkRoom" class="d-flex justify-end mt-2">
+            <v-btn size="small" variant="tonal" :to="forkRoom" data-testid="hive-copies-fork-room">
+              {{ $t('hive.roomCopies.openFork') }}
+            </v-btn>
+          </div>
         </div>
         <div v-if="error" class="text-caption text-error mt-2" data-testid="hive-copies-error">{{ error }}</div>
       </v-card-text>
@@ -134,7 +249,15 @@ import { useI18n } from 'vue-i18n'
 import { isLive, useHiveStore, type HiveReplicaMember, type HiveSession } from '@/stores/hive'
 import { useAgentStore } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
-import { aheadOfTargets, behind, freshestTarget, moveTargets, primaryOf } from '@/utils/hiveCopies'
+import {
+  aheadOfTargets,
+  behind,
+  forkTargets,
+  freshestTarget,
+  moveTargets,
+  primaryOf,
+  teleportTargets,
+} from '@/utils/hiveCopies'
 
 const props = defineProps<{ tenantId: string; sessionId: string }>()
 const hive = useHiveStore()
@@ -151,6 +274,16 @@ const target = ref<string | null>(null)
 const folder = ref('')
 const moving = ref(false)
 const outcome = ref<{ kind: 'success' | 'warning' | 'error'; text: string } | null>(null)
+/** P2j-2 — the owner's action: a move to a copy, to a device with none, or a fork. */
+const action = ref<'move' | 'teleport' | 'fork'>('move')
+const teleportTo = ref<string | null>(null)
+const forkOn = ref<string | null>(null)
+const forkFolder = ref('')
+const forkTitle = ref('')
+/** The room of the fork just made, to open it. */
+const forkRoom = ref<string | null>(null)
+const loadingDevices = ref(false)
+let devicesRead = false
 
 const session = computed<HiveSession | null>(
   () => read.value ?? hive.sessions.find((s) => s.id === props.sessionId) ?? null,
@@ -160,6 +293,8 @@ const members = computed(() => session.value?.replicaset?.members ?? [])
 const primary = computed(() => (session.value ? primaryOf(session.value) : undefined))
 const targets = computed(() => (session.value ? moveTargets(session.value) : []))
 const ahead = computed(() => (session.value ? aheadOfTargets(session.value) : undefined))
+const teleports = computed(() => (session.value ? teleportTargets(session.value, agents.agents) : []))
+const forks = computed(() => (session.value ? forkTargets(session.value, agents.agents) : []))
 /** Only the owner moves a session; the server says so to anyone else. */
 const isOwner = computed(() => !!session.value && !!auth.user && session.value.owner_id === auth.user.id)
 
@@ -172,6 +307,21 @@ const notMovable = computed(() => {
   if (!isLive(s) || s.status === 'stopping') return t('hive.roomCopies.notRunning')
   return null
 })
+
+/** Why it cannot be forked now, in words; null when it can. An ended session
+ *  forks from its copies: only a terminal's, and one being moved, do not. */
+const notForkable = computed(() => {
+  const s = session.value
+  if (!s) return null
+  if (s.origin === 'adopted') return t('hive.roomCopies.adoptedNoFork')
+  if (s.promotion) return t('hive.roomCopies.forkWhileMoving')
+  return null
+})
+
+function forkLabel(f: { device: { name: string; display_name?: string }; holds: boolean }): string {
+  const name = f.device.display_name || f.device.name
+  return t(f.holds ? 'hive.roomCopies.forkFromCopy' : 'hive.roomCopies.forkTakesCopy', { device: name })
+}
 
 const movingText = computed(() => {
   const p = session.value?.promotion
@@ -257,8 +407,81 @@ async function move(): Promise<void> {
   }
 }
 
+/** P2j-2 — the organization's devices, read once a dialog opening needs them:
+ *  a teleport and a fork may go to a device that holds no copy. */
+async function readDevices(): Promise<void> {
+  if (devicesRead || loadingDevices.value) return
+  loadingDevices.value = true
+  try {
+    await agents.fetchAgents(props.tenantId)
+    devicesRead = true
+  } finally {
+    loadingDevices.value = false
+  }
+  teleportTo.value ??= teleports.value[0]?.id ?? null
+  forkOn.value ??= forks.value[0]?.device.id ?? null
+}
+
+async function teleportNow(): Promise<void> {
+  const s = session.value
+  if (!s || !teleportTo.value || moving.value) return
+  moving.value = true
+  outcome.value = null
+  try {
+    const typed = folder.value.trim()
+    const res = await hive.teleport(props.tenantId, props.sessionId, {
+      device_id: teleportTo.value,
+      ...(typed && typed !== s.folder ? { folder: typed } : {}),
+    })
+    if (res.session) read.value = res.session
+    outcome.value =
+      res.outcome === 'refused'
+        ? { kind: 'warning', text: res.message ?? t('hive.roomCopies.refused', { reason: res.reason ?? '' }) }
+        : { kind: 'success', text: t(`hive.roomCopies.outcome.${res.outcome}`) }
+  } catch (e) {
+    outcome.value = { kind: 'error', text: (e as Error).message }
+  } finally {
+    moving.value = false
+  }
+}
+
+async function forkNow(): Promise<void> {
+  if (!forkOn.value || !forkFolder.value.trim() || moving.value) return
+  moving.value = true
+  outcome.value = null
+  forkRoom.value = null
+  try {
+    const title = forkTitle.value.trim()
+    const res = await hive.fork(props.tenantId, props.sessionId, {
+      device_id: forkOn.value,
+      folder: forkFolder.value.trim(),
+      ...(title ? { title } : {}),
+    })
+    if (res.outcome === 'refused') {
+      outcome.value = { kind: 'warning', text: res.message ?? t('hive.roomCopies.refused', { reason: res.reason ?? '' }) }
+      return
+    }
+    outcome.value = { kind: 'success', text: t(`hive.roomCopies.forkOutcome.${res.outcome}`) }
+    // The fork is a session of its own, with its own room.
+    if (res.session?.room_id) forkRoom.value = `/tenant/${props.tenantId}/room/${res.session.room_id}`
+  } catch (e) {
+    outcome.value = { kind: 'error', text: (e as Error).message }
+  } finally {
+    moving.value = false
+  }
+}
+
+watch(action, (a) => {
+  outcome.value = null
+  forkRoom.value = null
+  if (a !== 'move') void readDevices()
+})
+
 watch(shown, (open) => {
   if (open) void load()
-  else read.value = null
+  else {
+    read.value = null
+    action.value = 'move'
+  }
 })
 </script>

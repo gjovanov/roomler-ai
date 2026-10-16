@@ -6,7 +6,24 @@
 // which one it should, and a copy ahead of every target.
 import { describe, expect, it } from 'vitest'
 import type { HiveReplicaMember, HiveSession } from '@/stores/hive'
-import { aheadOfTargets, behind, freshestTarget, moveTargets, primaryOf } from '@/utils/hiveCopies'
+import {
+  aheadOfTargets,
+  behind,
+  forkTargets,
+  freshestTarget,
+  moveTargets,
+  primaryOf,
+  teleportTargets,
+  type DeviceLike,
+} from '@/utils/hiveCopies'
+
+const device = (id: string, rpc: string[], presence: 'online' | 'stale' | 'offline' = 'online'): DeviceLike => ({
+  id,
+  name: id,
+  presence,
+  is_online: presence === 'online',
+  capabilities: { rpc },
+})
 
 /** A copy; its tip is where it ends, which past a fence's end holds less
  *  than its `seq` says (`at` overrides it). */
@@ -105,5 +122,46 @@ describe('hiveCopies (FR-90 P2j-1)', () => {
     expect(aheadOfTargets(even), 'as much is not more').toBeUndefined()
     const noTarget = session([member('p', 'primary', 'joined', 40), member('arch', 'archive', 'joined', 40)])
     expect(aheadOfTargets(noTarget), 'no target, nothing to refuse').toBeUndefined()
+  })
+
+  // P2j-2 — the devices a teleport and a fork may go to.
+  it('teleports only to an online device that takes it and holds no copy', () => {
+    const s = session([member('p', 'primary', 'joined', 40), member('a', 'owner', 'joined', 31), member('w', 'owner', 'pending')])
+    const devices = [
+      device('p', ['hive', 'hive-teleport']),
+      device('a', ['hive', 'hive-teleport']),
+      device('w', ['hive', 'hive-teleport']),
+      device('n', ['hive', 'hive-teleport']),
+      device('off', ['hive', 'hive-teleport'], 'offline'),
+      device('old', ['hive', 'hive-replica']),
+      device('look', ['hive', 'hive-teleports']),
+      device('arch', ['hive', 'hive-teleport', 'hive-archive']),
+    ]
+    expect(
+      teleportTargets(s, devices).map((d) => d.id),
+      'not where it runs, not a copy taken (Move goes there), never offline, by the word itself, no archive replica',
+    ).toEqual(['w', 'n'])
+  })
+
+  it('forks on a device that holds a copy first, then on one that takes one, never an archive replica', () => {
+    const s = session([member('p', 'primary', 'joined', 40), member('a', 'owner', 'joined', 31), member('w', 'owner', 'pending')])
+    const devices = [
+      device('n', ['hive', 'hive-fork']),
+      device('a', ['hive', 'hive-fork']),
+      device('p', ['hive', 'hive-fork']),
+      device('w', ['hive', 'hive-fork']),
+      device('off', ['hive', 'hive-fork'], 'stale'),
+      device('old', ['hive', 'hive-teleport']),
+      device('arch', ['hive', 'hive-fork', 'hive-archive']),
+    ]
+    expect(
+      forkTargets(s, devices).map((f) => [f.device.id, f.holds]),
+      'the copies first, in order, then the rest; a pending copy holds nothing yet',
+    ).toEqual([
+      ['a', true],
+      ['p', true],
+      ['n', false],
+      ['w', false],
+    ])
   })
 })
