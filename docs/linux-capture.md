@@ -1667,7 +1667,7 @@ remote-control session is live, the daemon holds one. On the signal it tells
 each live session's controller over that session's own control channel, then
 lets go. Each session registers its control channel as it starts
 (`sleep_notice.rs:62`); the watcher (`sleep_notice.rs:161`, the rule
-`:149`) sends `peer.rs:5249`'s notice to all of them at once (`:93`):
+`:149`) sends `peer.rs:5264`'s notice to all of them at once (`:93`):
 
 ```mermaid
 sequenceDiagram

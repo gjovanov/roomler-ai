@@ -61,7 +61,7 @@ therefore **increased**.
 
 4. **The queue budget is denominated in the nominal ceiling.**
    `constrained_queue_budget_bytes(relay_max_bps())` (`rate_profile.rs:326`, called once at
-   `peer.rs:4670`) = 3,000,000 × 450 ms / 8000 = **168,750 bytes**. At 395 kbps that "450 ms"
+   `peer.rs:4685`) = 3,000,000 × 450 ms / 8000 = **168,750 bytes**. At 395 kbps that "450 ms"
    budget is **3.4 seconds** of standing queue. The gate never fired.
 
 5. **The only true latency signal is silent, rejected, or toothless.** `viewer_age_ms=None` in
