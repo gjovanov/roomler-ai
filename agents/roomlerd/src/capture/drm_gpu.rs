@@ -29,10 +29,14 @@
 //!
 //! Everything here runs on the `drm-capture` worker thread, which owns the
 //! EGL context for its whole life: an EGL context is current on one thread.
+//! The display is the process's ([`Egl`]), brought up once and never torn
+//! down; a capture owns its context and nothing more, and retires it unbound
+//! ([`Egl::retire`]).
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_void};
 use std::os::fd::RawFd;
+use std::sync::Mutex;
 
 use anyhow::{Result, anyhow, bail};
 use libloading::Library;
@@ -76,6 +80,7 @@ type FnGetError = unsafe extern "C" fn() -> EglInt;
 type FnCreateImage =
     unsafe extern "C" fn(EglDisplay, EglContext, EglEnum, *mut c_void, *const EglInt) -> EglImage;
 type FnDestroyImage = unsafe extern "C" fn(EglDisplay, EglImage) -> EglBoolean;
+type FnReleaseThread = unsafe extern "C" fn() -> EglBoolean;
 
 // ── GLES 2 ────────────────────────────────────────────────────────────────
 
@@ -262,18 +267,11 @@ struct Imported {
     texture: GlUint,
 }
 
-/// The GPU path: an EGL context of its own on the render node Mesa picks,
-/// the imported buffers, and the target it renders into.
+/// The GPU path: an EGL context of its own on the process's display, the
+/// imported buffers, and the target it renders into.
 pub struct Converter {
-    _egl_lib: Library,
-    _gl_lib: Library,
-    display: EglDisplay,
+    egl: &'static Egl,
     context: EglContext,
-    destroy_image: FnDestroyImage,
-    destroy_context: FnDestroyContext,
-    terminate: FnTerminate,
-    create_image: FnCreateImage,
-    egl_get_error: FnGetError,
     gl: Gl,
     program: GlUint,
     u_tex: GlInt,
@@ -305,11 +303,55 @@ unsafe fn proc<T: Copy>(gpa: FnGetProcAddress, lib: &Library, name: &CStr) -> Re
         .map_err(|e| anyhow!("{}: {e}", name.to_string_lossy()))
 }
 
-impl Converter {
-    /// Bring up EGL on the render node Mesa's surfaceless platform picks, and
-    /// the one program this module draws with. Any failure means "no GPU
-    /// path here", and the caller keeps the CPU path.
-    pub fn open() -> Result<Self> {
+/// The process's EGL: both libraries, the entry points, and the surfaceless
+/// display. The first capture that reaches for the GPU brings it up, and it
+/// stays up for the life of the process.
+///
+/// ⚠️ **Never terminated, never unloaded.** EGL hands every caller in a
+/// process the same display, so a capture that terminated it on its way out
+/// would pull it from under any capture still running — a second viewer, or a
+/// pump restart whose new capture opened before the old worker exited. That
+/// capture would lose its imports and fall back to the CPU without a word
+/// about why. A capture owns its context and nothing more ([`Egl::retire`]).
+struct Egl {
+    _egl_lib: Library,
+    gl_lib: Library,
+    gpa: FnGetProcAddress,
+    display: EglDisplay,
+    bind_api: FnBindApi,
+    create_context: FnCreateContext,
+    make_current: FnMakeCurrent,
+    destroy_context: FnDestroyContext,
+    release_thread: FnReleaseThread,
+    get_error: FnGetError,
+    create_image: FnCreateImage,
+    destroy_image: FnDestroyImage,
+}
+
+// SAFETY: EGL's entry points may be called from any thread, and a display is
+// one handle for the whole process. What EGL keeps per thread (the bound API,
+// the current context) each capture sets on its own worker thread.
+unsafe impl Send for Egl {}
+// SAFETY: as above; nothing in an `Egl` changes after `load`.
+unsafe impl Sync for Egl {}
+
+/// The process's [`Egl`], once one came up. A failure is not kept: the next
+/// capture tries again.
+static EGL: Mutex<Option<&'static Egl>> = Mutex::new(None);
+
+impl Egl {
+    /// The process's EGL, brought up by the first caller.
+    fn get() -> Result<&'static Egl> {
+        let mut slot = EGL.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(egl) = *slot {
+            return Ok(egl);
+        }
+        let egl: &'static Egl = Box::leak(Box::new(Self::load()?));
+        *slot = Some(egl);
+        Ok(egl)
+    }
+
+    fn load() -> Result<Self> {
         // SAFETY: loading the system's EGL and GLES by their sonames; their
         // constructors are the GL vendor's, as in every GL program.
         let egl_lib =
@@ -327,13 +369,14 @@ impl Converter {
             unsafe { proc(gpa, &egl_lib, c"eglGetPlatformDisplayEXT") }?;
         let initialize: FnInitialize = unsafe { proc(gpa, &egl_lib, c"eglInitialize") }?;
         let query_string: FnQueryString = unsafe { proc(gpa, &egl_lib, c"eglQueryString") }?;
+        let terminate: FnTerminate = unsafe { proc(gpa, &egl_lib, c"eglTerminate") }?;
+        let get_error: FnGetError = unsafe { proc(gpa, &egl_lib, c"eglGetError") }?;
         let bind_api: FnBindApi = unsafe { proc(gpa, &egl_lib, c"eglBindAPI") }?;
         let create_context: FnCreateContext = unsafe { proc(gpa, &egl_lib, c"eglCreateContext") }?;
         let make_current: FnMakeCurrent = unsafe { proc(gpa, &egl_lib, c"eglMakeCurrent") }?;
         let destroy_context: FnDestroyContext =
             unsafe { proc(gpa, &egl_lib, c"eglDestroyContext") }?;
-        let terminate: FnTerminate = unsafe { proc(gpa, &egl_lib, c"eglTerminate") }?;
-        let egl_get_error: FnGetError = unsafe { proc(gpa, &egl_lib, c"eglGetError") }?;
+        let release_thread: FnReleaseThread = unsafe { proc(gpa, &egl_lib, c"eglReleaseThread") }?;
         let create_image: FnCreateImage = unsafe { proc(gpa, &egl_lib, c"eglCreateImageKHR") }?;
         let destroy_image: FnDestroyImage = unsafe { proc(gpa, &egl_lib, c"eglDestroyImageKHR") }?;
 
@@ -360,7 +403,7 @@ impl Converter {
         let (mut major, mut minor) = (0, 0);
         // SAFETY: out-pointers to locals.
         if unsafe { initialize(display, &mut major, &mut minor) } == 0 {
-            bail!("eglInitialize failed: {:#x}", unsafe { egl_get_error() });
+            bail!("eglInitialize failed: {:#x}", unsafe { get_error() });
         }
         // SAFETY: an initialised display.
         let ext = cstr(unsafe { query_string(display, EGL_EXTENSIONS) });
@@ -370,60 +413,100 @@ impl Converter {
             "EGL_KHR_no_config_context",
         ] {
             if !ext.split_ascii_whitespace().any(|e| e == need) {
-                // SAFETY: tearing down what we initialised.
+                // SAFETY: tearing down what this call initialised. Nothing
+                // else holds the display: it is published only on success.
                 unsafe { terminate(display) };
                 bail!("EGL lacks {need}");
             }
         }
-        // SAFETY: plain enum.
-        unsafe { bind_api(EGL_OPENGL_ES_API) };
+        Ok(Self {
+            _egl_lib: egl_lib,
+            gl_lib,
+            gpa,
+            display,
+            bind_api,
+            create_context,
+            make_current,
+            destroy_context,
+            release_thread,
+            get_error,
+            create_image,
+            destroy_image,
+        })
+    }
+
+    /// Retire a capture's context, on the thread it is current on.
+    ///
+    /// ⚠️ **Unbind first.** EGL frees a destroyed context only once it is no
+    /// longer current, and a worker thread that exits with its context still
+    /// bound never unbinds it. Destroying it bound leaked the context for the
+    /// life of the process: 2.8 MB a capture on an M2 Pro, 53 → 191 MB over
+    /// 50 captures, against flat with the unbind (#2317).
+    fn retire(&self, context: EglContext) {
+        // SAFETY: `context` is current on this thread, made so by `open`.
+        unsafe {
+            (self.make_current)(
+                self.display,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            (self.destroy_context)(self.display, context);
+            (self.release_thread)();
+        }
+    }
+}
+
+impl Converter {
+    /// A context on the process's EGL display ([`Egl`]), and the one program
+    /// this module draws with. Any failure means "no GPU path here", and the
+    /// caller keeps the CPU path.
+    pub fn open() -> Result<Self> {
+        let egl = Egl::get()?;
+        // SAFETY: plain enum. The bound API is per thread, so every capture
+        // binds it on its own worker.
+        unsafe { (egl.bind_api)(EGL_OPENGL_ES_API) };
         let attrs = [EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE];
         // SAFETY: EGL_NO_CONFIG_KHR (null) with EGL_KHR_no_config_context.
         let context = unsafe {
-            create_context(
-                display,
+            (egl.create_context)(
+                egl.display,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 attrs.as_ptr(),
             )
         };
         if context.is_null() {
-            let err = unsafe { egl_get_error() };
-            unsafe { terminate(display) };
-            bail!("eglCreateContext failed: {err:#x}");
+            bail!("eglCreateContext failed: {:#x}", unsafe {
+                (egl.get_error)()
+            });
         }
         // SAFETY: no surfaces, with EGL_KHR_surfaceless_context; this thread
         // owns the context from here on.
-        if unsafe { make_current(display, std::ptr::null_mut(), std::ptr::null_mut(), context) }
-            == 0
+        if unsafe {
+            (egl.make_current)(
+                egl.display,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                context,
+            )
+        } == 0
         {
-            let err = unsafe { egl_get_error() };
+            let err = unsafe { (egl.get_error)() };
+            // SAFETY: a context that never became current is freed as it is
+            // destroyed.
             unsafe {
-                destroy_context(display, context);
-                terminate(display);
+                (egl.destroy_context)(egl.display, context);
+                (egl.release_thread)();
             }
             bail!("eglMakeCurrent failed: {err:#x}");
         }
 
-        let release = || {
-            // SAFETY: undoing this function's own make-current, context and
-            // display, on the thread that made them.
-            unsafe {
-                make_current(
-                    display,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
-                destroy_context(display, context);
-                terminate(display);
-            }
-        };
         // SAFETY: a current context; every entry point resolved by its name.
-        let gl = match unsafe { Gl::load(gpa, &gl_lib) } {
+        let gl = match unsafe { Gl::load(egl.gpa, &egl.gl_lib) } {
             Ok(gl) => gl,
             Err(e) => {
-                release();
+                egl.retire(context);
                 return Err(e);
             }
         };
@@ -435,20 +518,13 @@ impl Converter {
             .iter()
             .any(|s| lower.contains(s))
         {
-            release();
+            egl.retire(context);
             bail!("the renderer is software ({renderer}): the CPU path is faster");
         }
 
         let mut conv = Self {
-            _egl_lib: egl_lib,
-            _gl_lib: gl_lib,
-            display,
+            egl,
             context,
-            destroy_image,
-            destroy_context,
-            terminate,
-            create_image,
-            egl_get_error,
             gl,
             program: 0,
             u_tex: -1,
@@ -461,7 +537,7 @@ impl Converter {
             images: VecDeque::new(),
             renderer,
         };
-        // From here `Drop` releases the context, whatever fails.
+        // From here `Drop` retires the context, whatever fails.
         conv.build_program()?;
         Ok(conv)
     }
@@ -583,8 +659,8 @@ impl Converter {
         // SAFETY: an initialised display; `attrs` is EGL_NONE-terminated and
         // names a dma-buf fd that is open for the call.
         let image = unsafe {
-            (self.create_image)(
-                self.display,
+            (self.egl.create_image)(
+                self.egl.display,
                 std::ptr::null_mut(),
                 EGL_LINUX_DMA_BUF_EXT,
                 std::ptr::null_mut(),
@@ -593,7 +669,7 @@ impl Converter {
         };
         if image.is_null() {
             bail!("eglCreateImage(dma-buf) failed: {:#x}", unsafe {
-                (self.egl_get_error)()
+                (self.egl.get_error)()
             });
         }
         let gl = &self.gl;
@@ -610,7 +686,7 @@ impl Converter {
             let err = (gl.get_error)();
             if err != GL_NO_ERROR {
                 (gl.delete_textures)(1, &texture);
-                (self.destroy_image)(self.display, image);
+                (self.egl.destroy_image)(self.egl.display, image);
                 bail!("binding the imported buffer failed: GL error {err:#x}");
             }
         }
@@ -631,7 +707,7 @@ impl Converter {
         // SAFETY: deleting what `texture_for` created, on its context.
         unsafe {
             (self.gl.delete_textures)(1, &e.texture);
-            (self.destroy_image)(self.display, e.image);
+            (self.egl.destroy_image)(self.egl.display, e.image);
         }
     }
 
@@ -680,8 +756,13 @@ impl Converter {
             bail!("empty output size");
         }
         let texture = self.texture_for(key, src)?;
+        self.render(texture, (src.width, src.height), out)
+    }
+
+    /// One draw of `texture` (a `src`-sized image) at `out`, read back.
+    fn render(&mut self, texture: GlUint, src: (u32, u32), out: (u32, u32)) -> Result<Vec<u8>> {
         self.target_at(out)?;
-        let (n, step, first) = taps((src.width, src.height), out);
+        let (n, step, first) = taps(src, out);
         let mut data = vec![0u8; out.0 as usize * out.1 as usize * 4];
         let gl = &self.gl;
         // SAFETY: a current context; `data` holds exactly the pixels read.
@@ -713,17 +794,14 @@ impl Converter {
 
 impl Drop for Converter {
     fn drop(&mut self) {
+        // The imports belong to the display, not the context: they would
+        // outlive it unless destroyed.
         while let Some(e) = self.images.pop_front() {
             self.release(e);
         }
-        // SAFETY: tearing down this thread's own context, then the display.
-        unsafe {
-            if self.target != 0 {
-                (self.gl.delete_textures)(1, &self.target);
-            }
-            (self.destroy_context)(self.display, self.context);
-            (self.terminate)(self.display);
-        }
+        // The program, the framebuffer and the render target go with the
+        // context; the display stays the process's.
+        self.egl.retire(self.context);
     }
 }
 
@@ -789,5 +867,48 @@ mod tests {
         assert!((first.0 + step.0 / 2.0).abs() < 1e-9);
         assert!((first.1 + step.1 / 2.0).abs() < 1e-9);
         assert_eq!(taps((7680, 4320), (640, 360)).0, 4);
+    }
+
+    /// A capture's teardown leaves nothing behind. Thirty captures, each on a
+    /// thread of its own as a `drm-capture` worker is, each drawing and
+    /// reading back one frame at the 4K → half size, and the process's
+    /// resident memory ends where the warm-up left it. Destroying the context
+    /// while it was still current leaked it: 2.8 MB a capture on an M2 Pro,
+    /// so ~84 MB here (#2317). Run it alone, on a host with a GPU:
+    /// `cargo test -p roomlerd --lib --features full -- --ignored --test-threads=1 a_capture_leaks_nothing`
+    #[test]
+    #[ignore = "needs a GPU render node and Mesa's surfaceless EGL"]
+    fn a_capture_leaks_nothing_when_it_ends() {
+        fn capture() {
+            std::thread::spawn(|| {
+                let mut c = Converter::open().expect("a GPU path on this host");
+                // Texture 0 samples as black: the draw and the readback are
+                // the capture's, without a scanout to import.
+                let frame = c.render(0, (4096, 2160), (2048, 1080)).expect("one draw");
+                assert_eq!(frame.len(), 2048 * 1080 * 4);
+            })
+            .join()
+            .expect("the capture thread");
+        }
+        fn rss_kb() -> u64 {
+            std::fs::read_to_string("/proc/self/status")
+                .expect("procfs")
+                .lines()
+                .find_map(|l| l.strip_prefix("VmRSS:"))
+                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+                .expect("VmRSS")
+        }
+        // The first captures load the driver and compile the shaders.
+        capture();
+        capture();
+        let before = rss_kb();
+        for _ in 0..30 {
+            capture();
+        }
+        let grown = rss_kb().saturating_sub(before);
+        assert!(
+            grown < 12 * 1024,
+            "resident memory grew {grown} kB over 30 captures"
+        );
     }
 }
