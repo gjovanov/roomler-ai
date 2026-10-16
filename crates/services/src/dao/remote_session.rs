@@ -42,6 +42,7 @@ impl RemoteSessionDao {
             end_reason: None,
             recording_url: None,
             stats: SessionStats::default(),
+            carrier: None,
         };
         // Insert with explicit _id so the Hub-provided ObjectId remains the canonical key.
         self.base.collection().insert_one(&session).await?;
@@ -119,24 +120,33 @@ impl RemoteSessionDao {
         session_id: ObjectId,
         agent_id: ObjectId,
         stats: &SessionStats,
+        // FR-102 P9c — the carrier the agent recorded, when the sample
+        // carries one (already validated to a code by the socket); written
+        // beside `stats`, never inside it, so `mark_ended`'s whole-`stats`
+        // write cannot reset it. `None` leaves whatever the row holds.
+        carrier: Option<&str>,
     ) -> DaoResult<bool> {
+        let mut set = doc! {
+            "stats.bytes_sent": stats.bytes_sent as i64,
+            "stats.bytes_recv": stats.bytes_recv as i64,
+            "stats.avg_rtt_ms": f64::from(stats.avg_rtt_ms),
+            "stats.keyframe_requests": stats.keyframe_requests as i64,
+            "stats.input_events": stats.input_events as i64,
+            // P8 Phase 4 — hand-built doc: a field added to
+            // SessionStats MUST be added here too or live
+            // merges silently drop it (mark_ended's whole-
+            // struct to_bson is the safe twin).
+            "stats.shared_seconds": stats.shared_seconds as i64,
+            "stats.mixed_dial_seconds": stats.mixed_dial_seconds as i64,
+        };
+        if let Some(c) = carrier {
+            set.insert("carrier", c);
+        }
         self.base
             .update_one(
                 doc! { "_id": session_id, "agent_id": agent_id, "ended_at": bson::Bson::Null },
                 doc! {
-                    "$set": {
-                        "stats.bytes_sent": stats.bytes_sent as i64,
-                        "stats.bytes_recv": stats.bytes_recv as i64,
-                        "stats.avg_rtt_ms": f64::from(stats.avg_rtt_ms),
-                        "stats.keyframe_requests": stats.keyframe_requests as i64,
-                        "stats.input_events": stats.input_events as i64,
-                        // P8 Phase 4 — hand-built doc: a field added to
-                        // SessionStats MUST be added here too or live
-                        // merges silently drop it (mark_ended's whole-
-                        // struct to_bson is the safe twin).
-                        "stats.shared_seconds": stats.shared_seconds as i64,
-                        "stats.mixed_dial_seconds": stats.mixed_dial_seconds as i64,
-                    },
+                    "$set": set,
                     "$max": { "stats.peak_fps": f64::from(stats.peak_fps) },
                 },
             )

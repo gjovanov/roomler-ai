@@ -149,6 +149,10 @@ pub mod rtp_playout;
 /// asked of the server with the org's agent token.
 pub mod self_view;
 pub mod service;
+/// FR-102 P9c — the carrier a remote-control session rides (direct, TURN,
+/// the overlay's own carrier under an overlay pair: DERP, an org relay),
+/// recorded once the session reaches Active. Record, never decide.
+pub mod session_carrier;
 /// FR-101 P4b-2 — the idle limit, kept by the device: no input from the
 /// controller and no significant change on the screen for `idle_secs` ends
 /// the session.

@@ -194,6 +194,12 @@ mod role_reconcile_tests;
 mod role_tests;
 #[cfg(test)]
 mod room_visibility_tests;
+/// FR-102 P9c — the carrier a session rides: the agent records it on
+/// `rc:session.stats` once Active, and the server stores it on
+/// `remote_sessions.carrier` — a code only, absent read as unknown, never
+/// overwritten by a later sample with none.
+#[cfg(test)]
+mod session_carrier_tests;
 /// FR-102 P9b — the post-session rating's server half: a party stores one
 /// rating with codes only, everyone else is refused with a code, the kill
 /// switch's empty 404, `purge_user`, and the digest's `quality.ratings`.

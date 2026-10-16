@@ -1431,7 +1431,7 @@ shape `AgentCrashDao::record` writes.
 
 | Part | Holds | `None` when |
 |---|---|---|
-| `sessions` | `requested`, `reached_active`, `not_reached`, `pending`, `by_end_reason [{reached_active, reason, count}]`, `duration_ms` / `peak_fps` / `avg_rtt_ms` as `Dist {n, p50, p90, edges, hist}` | the `remote` module is not mounted |
+| `sessions` | `requested`, `reached_active`, `not_reached`, `pending`, `by_end_reason [{reached_active, reason, count}]`, `duration_ms` / `peak_fps` / `avg_rtt_ms` as `Dist {n, p50, p90, edges, hist}`, and (P9c) `by_carrier [{carrier, reached_active, duration_ms, peak_fps, avg_rtt_ms}]` — the Active sessions by the carrier they rode | the `remote` module is not mounted |
 | `ttff` | `dist` (ms), `hidden`, `later_attempts`, `outcomes {first_frame, abandoned, closed, retried}` | `fleet` not mounted, or the day's logs had started to expire |
 | `crashes` | crash reports received that day (`reported_at`) by the version the payload named | `fleet` not mounted |
 | `device_days` | devices with `online_minutes > 0` that day | `fleet` not mounted |
@@ -1454,9 +1454,18 @@ exclusion added.
 - **The Quality tab** on `/observability/growth`
   ([`GrowthQuality.vue`](../ui/src/components/growth/GrowthQuality.vue)): the range, the
   cards (requested · reached Active · never · TTFF p50 · crashes · per 100 device-days), the
-  per-day TTFF p50/p90 chart, the per-version table, how the sessions ended, the pooled
+  per-day TTFF p50/p90 chart, the per-version table, a **By carrier** table (P9c: each carrier's
+  Active sessions and their duration / frame-rate / RTT), how the sessions ended, the pooled
   distributions and the day-by-day table. A pooled percentile is marked ≈; an absent part is a
   "not measured" chip.
+
+**The carrier (P9c).** Each Active session also records the carrier it rode — `direct` · `turn` ·
+`turn_local` · `overlay_direct` · `overlay_turn` · `derp` · `org_relay` · `unknown` — set by the
+agent once the session reaches Active ([remote-control.md §11.9](remote-control.md)) and stored on
+`remote_sessions.carrier`. The freeze groups the day's Active sessions by it into
+`sessions.by_carrier` above, so "does TURN or DERP feel worse than direct" is answered from the
+same rows. ⚠️ A session with no carrier recorded — from before P9c, from an agent older than the
+field, or ended before the observation landed — is `unknown`, **never read as direct**.
 - **The daily digest's `quality` section** adds, live from the kept rows: `requested`,
   `reached_active`, `not_reached` and `reached_share`, `duration_ms` / `peak_fps` /
   `avg_rtt_ms` as `{day, d7, d28}` of `{n, p50, p90}`, `device_days` and
@@ -1486,7 +1495,19 @@ db.agent_logs.aggregate([
 // Crashes by the payload's version, and device-days:
 db.agent_crashes.aggregate([{ $match: { reported_at: { $gte: D, $lt: E }, tenant_id: { $nin: EXCLUDED } } }, { $group: { _id: '$agentVersion', n: { $sum: 1 } } }])
 db.stats_machine_1d.countDocuments({ ts: { $gte: D, $lt: E }, online_minutes: { $gt: 0 }, tenant_id: { $nin: EXCLUDED } })
+// P9c — Active sessions by carrier (needs agent 0.4.140; before it every row is `unknown`):
+db.remote_sessions.aggregate([
+  { $match: { created_at: { $gte: D, $lt: E }, started_at: { $ne: null }, tenant_id: { $nin: EXCLUDED } } },
+  { $group: { _id: { $ifNull: ['$carrier', 'unknown'] }, n: { $sum: 1 } } } ])
 ```
+
+The carrier split needs an agent carrying P9c (**0.4.140**): on today's fleet every Active session
+is `unknown`, which is the P9c fail-first. With it released, prove each carrier from the topology
+that produces it — a LAN pair records `direct`, a Check Point / symmetric-NAT host records `turn`
+(or `turn_local`), an overlay pair records `overlay_direct` or, when the mesh fell, `derp` /
+`org_relay` / `overlay_turn` (cross-checked against `roomler peers --json` `relay_kind`) — and read
+the agent's `session carrier recorded (FR-102 P9c)` log line to check the value against the pair's
+addresses.
 
 `$percentile` is approximate, the freeze's nearest-rank exact: for a day with a few hundred
 records the two agree to the sample; for a tiny day read the sorted `ttff_ms` list instead.

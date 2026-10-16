@@ -48,6 +48,7 @@ impl AgentMsgHandler for RemoteAgentSocket {
                 shared_seconds,
                 mixed_dial_seconds,
                 transfers,
+                carrier,
             } => {
                 let sid = ObjectId::parse_str(&session_id).ok();
                 // FR-101 P3 — an audit, not a statistic: kept whether or not
@@ -70,10 +71,16 @@ impl AgentMsgHandler for RemoteAgentSocket {
                         shared_seconds,
                         mixed_dial_seconds,
                     };
+                    // FR-102 P9c — the carrier, when the agent named one and
+                    // it is a code: anything else is dropped and the row
+                    // stays as it was (unknown, never direct).
+                    let carrier = carrier
+                        .as_deref()
+                        .and_then(roomler_ai_remote_control::models::session_carrier_label);
                     if let Err(e) = self
                         .state
                         .remote_sessions
-                        .merge_live_stats(sid, ctx.agent_id, &stats)
+                        .merge_live_stats(sid, ctx.agent_id, &stats, carrier)
                         .await
                     {
                         debug!(agent = %ctx.agent_id, %e, "session stats merge failed");
