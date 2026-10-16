@@ -95,6 +95,12 @@ objc2-app-kit = { version = "0.3", features = [
 ] }
 objc2-foundation = { version = "0.3", features = ["NSGeometry"] }
 
+# #2286 — KWin's scripting interface over D-Bus, to pin the banner to the top
+# on KDE. The same gio GTK already links (`libgio-2.0` is in the .rpm's
+# requires), at the version tauri's GTK 3 stack pins: no new library.
+[target.'cfg(target_os = "linux")'.dependencies]
+gio = "0.18"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

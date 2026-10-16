@@ -48,7 +48,7 @@ ships — works the way a Windows or macOS host does: install, enroll, connect, 
 | What the viewer is told about input | `has_input_permission = true`, hard-coded off macOS (`encode/caps.rs:1412-1414`, `:815-824`, `:843-852`) | the same |
 | Cursor | none — the Linux cursor tracker is unwired (`capture/cursor.rs:88-94`); the viewer paints the controller's initials badge | none |
 | Clipboard | arboard over X11 into Xwayland's selection bridge (unmeasured) | **off** — `clipboard.rs` has no session discovery; `supports_clipboard` is compile-time (`caps.rs:1416`) |
-| Consent / indicator | the X11 panel over Xwayland — "it shows; it just cannot guarantee stacking above native Wayland clients" (`indicator/x11.rs:33-37`), never field-run; the companion fallback launches through the **system** manager (`companion.rs:484`), which its own doc says asks polkit for a password nobody types (`:507-518`) | the companion over the P11 person socket — GREEN on vmtest Ubuntu 24.04 (FR-27 P10/P11). **x86_64 only**: no aarch64 companion is built (`.github/workflows/release-agent.yml:1040-1162`) |
+| Consent / indicator | the X11 panel over Xwayland — "it shows; it just cannot guarantee stacking above native Wayland clients" (`indicator/x11.rs:33-39`), never field-run; the companion fallback launches through the **system** manager (`companion.rs:484`), which its own doc says asks polkit for a password nobody types (`:507-518`) | the companion over the P11 person socket — GREEN on vmtest Ubuntu 24.04 (FR-27 P10/P11). **x86_64 only**: no aarch64 companion is built (`.github/workflows/release-agent.yml:1040-1162`) |
 
 The vmtest Ubuntu lane never saw this because it sets the opt-in keys itself
 (`roomler-ai-deploy:vmtest/guest/linux-lane.sh:149-169`). Its per-user cell set an inert one
@@ -101,7 +101,7 @@ The vmtest Ubuntu lane never saw this because it sets the opt-in keys itself
 13. uinput types **US layout only**, detected from root's view (`keylayout.rs:43-58`, `:138-155`) rather than the
     session's active input source; `mon` is ignored and nothing maps per output (`uinput_backend.rs:361`).
 14. The companion was never field-run as a **consent** window on Wayland; its banner cannot auto-hide there
-    (`agents/roomler-desktop/src/panels.rs:188-191`); `pgrep -x` has no `-u` (`companion.rs:477`).
+    (`agents/roomler-desktop/src/panels.rs:195-198`); `pgrep -x` has no `-u` (`companion.rs:477`).
 15. `capture-smoke` ignores `config.toml` (the bridge is registered only in `run_cmd`, `main.rs:2857-2914`)
     and parks ~1 h on `NoopCapture` (`capture/mod.rs:567-571`).
 16. Keep busy (FR-92, every phase merged 2026-10-11, unreleased) reports a Wayland desktop `unavailable`
@@ -110,7 +110,7 @@ The vmtest Ubuntu lane never saw this because it sets the opt-in keys itself
 17. Docs drift: `docs/linux-capture.md` anchors (`open_default` is `capture/mod.rs:682`, not `:665`;
     `spawn_child` is `portal/mod.rs:764`, not `:755`); `README.Debian:86-91`; `docs/remote-control.md:159,175`
     name files that do not exist; `CLAUDE.md` says GNOME/KDE Wayland get "no native overlay" while
-    `indicator/x11.rs:33-37` describes the Xwayland one.
+    `indicator/x11.rs:33-39` describes the Xwayland one.
 
 ### 2.4 Leftovers elsewhere that the same test bed unblocks
 

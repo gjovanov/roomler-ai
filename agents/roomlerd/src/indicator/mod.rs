@@ -211,9 +211,10 @@ impl ViewerIndicator {
     /// FR-27 — put a consent question on this device's screen, natively.
     ///
     /// Returns `false` when this build/platform/session has no native surface
-    /// — which is the ordinary answer on a headless host, on Wayland under
-    /// GNOME or KDE (neither exposes `wlr-layer-shell` to arbitrary clients),
-    /// and in a build without the per-OS feature. The caller then falls back
+    /// — which is the ordinary answer on a headless host, under a root daemon
+    /// with no `DISPLAY` (a Wayland desktop's per-user daemon shows the X11
+    /// panel through Xwayland, `x11.rs`), and in a build without the per-OS
+    /// feature. The caller then falls back
     /// to the desktop companion, and only reports `no_prompt_surface` when
     /// that fails too.
     ///
