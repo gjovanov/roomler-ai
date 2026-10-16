@@ -78,6 +78,7 @@ pub mod keep_busy;
 /// in every build (see the module doc for the rustc ICE that forced this).
 pub mod key_rotation;
 pub mod localapi_state;
+pub mod lock_on_end;
 pub mod lock_overlay;
 pub mod lock_state;
 pub mod logs_fetch;

@@ -1689,6 +1689,16 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-99 - let a remote controller turn on privacy mode during a session: a curtain covers this screen for the person in front of it, with a notice saying who is connected, while the controller still sees the desktop (default off). Windows 10 2004 and later. The curtain hides the screen; it does not stop someone at this keyboard. Off also takes a curtain that is up down. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
     },
     KeyMeta {
+        key: "lock_on_end",
+        group: Group::RemoteDesktop,
+        tier: Tier::Standard,
+        // LIVE: read at each session's start; applied when the last session
+        // ends.
+        live: true,
+        kind: "string",
+        description: "FR-99 - lock this computer when the last remote session ends: never (default) | auto (lock if the session began on a locked screen or with nobody at the computer) | always. Windows and Linux. With always, a per-user install cannot unlock the screen remotely afterwards: someone must sign in at the computer. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
+    },
+    KeyMeta {
         key: "rc_clipboard",
         group: Group::RemoteDesktop,
         tier: Tier::Standard,
@@ -2002,6 +2012,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "record_remote_audio" => Some(fmt_bool(cfg.record_remote_audio)),
         "keep_busy_enabled" => Some(fmt_bool(cfg.keep_busy_enabled)),
         "privacy_mode_allowed" => Some(fmt_bool(cfg.privacy_mode_allowed)),
+        "lock_on_end" => Some(fmt_lock_on_end(cfg.lock_on_end)),
         "rc_clipboard" => Some(fmt_feature_policy(cfg.rc_clipboard)),
         "rc_files" => Some(fmt_feature_policy(cfg.rc_files)),
         "rc_audio" => Some(fmt_feature_policy(cfg.rc_audio)),
@@ -2056,6 +2067,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // 2026-10-10); the owner turns it off by setting it false.
         "keep_busy_enabled" => cfg.keep_busy_enabled = parse_bool_or(value, true)?,
         "privacy_mode_allowed" => cfg.privacy_mode_allowed = parse_bool_or(value, false)?,
+        "lock_on_end" => cfg.lock_on_end = parse_lock_on_end(value)?,
         // FR-101 P2b — cleared means the default, `on`; a value is read
         // strictly here, where a typo is made, rather than becoming `off`
         // silently the way an unknown value in the file reads.
@@ -2772,6 +2784,36 @@ fn parse_bool_or(v: Option<&str>, default: bool) -> Result<bool, String> {
 }
 
 /// FR-101 P2b — how an `rc_*` key prints: the word the file and the wire use.
+fn fmt_lock_on_end(p: roomler_ai_remote_control::models::LockOnEnd) -> String {
+    use roomler_ai_remote_control::models::LockOnEnd;
+    match p {
+        LockOnEnd::Never => "never",
+        LockOnEnd::Auto => "auto",
+        LockOnEnd::Always => "always",
+    }
+    .to_string()
+}
+
+/// FR-99 P3 — `lock_on_end` as a person sets it: `never`, `auto` or `always`,
+/// in any case; cleared is `never`, the default. Anything else is refused,
+/// where the file's reader would have read it as `always` without a word.
+fn parse_lock_on_end(
+    v: Option<&str>,
+) -> Result<roomler_ai_remote_control::models::LockOnEnd, String> {
+    use roomler_ai_remote_control::models::LockOnEnd;
+    match v
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("never") => Ok(LockOnEnd::Never),
+        Some("auto") => Ok(LockOnEnd::Auto),
+        Some("always") => Ok(LockOnEnd::Always),
+        Some(_) => Err("lock_on_end must be never | auto | always".to_string()),
+    }
+}
+
 fn fmt_feature_policy(p: roomler_ai_remote_control::models::FeaturePolicy) -> String {
     use roomler_ai_remote_control::models::FeaturePolicy;
     match p {
@@ -2904,6 +2946,7 @@ mod tests {
             "rc_clipboard",
             "rc_files",
             "rc_audio",
+            "lock_on_end",
         ]
         .into_iter()
         .map(String::from)
@@ -3336,6 +3379,32 @@ mod tests {
         apply(&mut cfg, "overlay_relay_tls", None).unwrap();
         assert_eq!(cfg.overlay_relay_tls, None);
         assert!(apply(&mut cfg, "overlay_relay_tls", Some("maybe")).is_err());
+    }
+
+    /// FR-99 P3 — `lock_on_end` takes its three words in any case, echoes them,
+    /// clears to `never`, and refuses anything else (the file's reader would
+    /// read it as `always` without a word).
+    #[test]
+    fn lock_on_end_set_echo_clear() {
+        use roomler_ai_remote_control::models::LockOnEnd;
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(cfg.lock_on_end, LockOnEnd::Never);
+        apply(&mut cfg, "lock_on_end", Some(" AUTO ")).unwrap();
+        assert_eq!(cfg.lock_on_end, LockOnEnd::Auto);
+        assert_eq!(
+            entry_for(&cfg, "lock_on_end").unwrap().value.as_deref(),
+            Some("auto")
+        );
+        apply(&mut cfg, "lock_on_end", Some("always")).unwrap();
+        assert_eq!(cfg.lock_on_end, LockOnEnd::Always);
+        apply(&mut cfg, "lock_on_end", None).unwrap();
+        assert_eq!(cfg.lock_on_end, LockOnEnd::Never);
+        assert!(apply(&mut cfg, "lock_on_end", Some("sometimes")).is_err());
+        assert_eq!(
+            cfg.lock_on_end,
+            LockOnEnd::Never,
+            "a refused value changes nothing"
+        );
     }
 
     /// Multi-org v2 shared-carrier soak flag set/echo/clear (per the

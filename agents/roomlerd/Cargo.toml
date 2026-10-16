@@ -428,6 +428,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_RemoteDesktop",        # WTS* APIs
     "Win32_System_Threading",            # CreateProcessAsUserW, STARTUPINFO
     "Win32_System_Power",                # FR-55 PowerCreateRequest/PowerSetRequest + GetSystemPowerStatus
+    "Win32_System_Shutdown",             # FR-99 P3 LockWorkStation — lock the console when the last remote session ends
+    "Win32_System_SystemInformation",    # FR-99 P3 GetTickCount — against GetLastInputInfo, "nobody at the computer"
     "Win32_Media",                       # timeBeginPeriod/timeEndPeriod/timeGetDevCaps (rc.92 — 1ms timer res so the FFmpeg DC pump isn't quantized to the 15.6ms default)
     "Win32_System_Environment",          # CreateEnvironmentBlock
     "Win32_System_StationsAndDesktops",  # winsta0\default desktop attach

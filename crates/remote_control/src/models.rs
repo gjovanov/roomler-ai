@@ -1399,6 +1399,52 @@ impl SessionPolicy {
     }
 }
 
+/// FR-99 P3 — what a device does to its screen when the last remote session
+/// ends. Ordered from the loosest to the strictest, so [`Self::stricter`] is a
+/// `max`: the device's own setting is a floor a server may raise, never lower.
+///
+/// ⚠️ A value this build does not know reads as [`Self::Always`], never as an
+/// error, as [`FeaturePolicy`] reads one as `off`: a stricter setting from a
+/// newer build is still a stricter setting, and an unknown string must not
+/// fail the whole config file or frame.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LockOnEnd {
+    /// Leave the screen as it is (the default).
+    #[default]
+    Never,
+    /// Restore what was found: lock when the session began on a locked screen,
+    /// or with nobody at the computer.
+    Auto,
+    /// Lock at the end of every remote session.
+    Always,
+}
+
+impl LockOnEnd {
+    /// The stricter of two: `always` beats `auto` beats `never`.
+    pub fn stricter(self, other: Self) -> Self {
+        self.max(other)
+    }
+}
+
+impl<'de> Deserialize<'de> for LockOnEnd {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Text(String),
+            Other(serde::de::IgnoredAny),
+        }
+        Ok(match Raw::deserialize(d)? {
+            Raw::Text(s) if s == "never" => Self::Never,
+            Raw::Text(s) if s == "auto" => Self::Auto,
+            // "always", anything a newer build may write, and anything that is
+            // not a string at all.
+            _ => Self::Always,
+        })
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Fleet RPC (remote command execution)
 // ────────────────────────────────────────────────────────────────────────────
@@ -6103,6 +6149,35 @@ mod tests {
         }
     }
 
+    /// FR-99 P3 — the three spellings, the order `stricter` relies on, and an
+    /// unknown value reading as the strictest rather than failing.
+    #[test]
+    fn lock_on_end_reads_and_orders_as_documented() {
+        use LockOnEnd::*;
+        for (p, w) in [(Never, "never"), (Auto, "auto"), (Always, "always")] {
+            assert_eq!(serde_json::to_value(p).unwrap(), serde_json::json!(w));
+            assert_eq!(
+                serde_json::from_value::<LockOnEnd>(serde_json::json!(w)).unwrap(),
+                p
+            );
+        }
+        assert_eq!(LockOnEnd::default(), Never);
+        assert!(Never < Auto && Auto < Always);
+        assert_eq!(Never.stricter(Auto), Auto);
+        assert_eq!(Always.stricter(Never), Always);
+        assert_eq!(Auto.stricter(Auto), Auto);
+        for unknown in [
+            serde_json::json!("sometimes"),
+            serde_json::json!(3),
+            serde_json::json!(null),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<LockOnEnd>(unknown).unwrap(),
+                Always
+            );
+        }
+    }
+
     #[test]
     fn privacy_activity_kinds_keep_their_wire_names() {
         use PrivacyActivityKind::*;
@@ -7305,6 +7380,10 @@ mod tests {
             // FR-101 P1b — keeping a plaintext server URL. A server that
             // could set it could talk a device down to plaintext.
             "allow_plaintext_server",
+            // FR-99 P3 — the device's own floor for locking its screen when a
+            // session ends. A server may ask for stricter on a session (P3b),
+            // never set the floor.
+            "lock_on_end",
         ] {
             assert!(
                 !keys.contains(&forbidden),

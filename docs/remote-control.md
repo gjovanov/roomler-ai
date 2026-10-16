@@ -1015,7 +1015,7 @@ org or a device that sets nothing.
 | | The org's switch (P2a) | The device's floor (P2b) |
 |---|---|---|
 | Stored in | `TenantSettings.rc_session` ([`tenant.rs:116`](../crates/db/src/models/tenant.rs#L116)) | `rc_clipboard`, `rc_files`, `rc_audio` in the device's `config.toml` |
-| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:2817`](../crates/localapi/src/lib.rs#L2817)); live, no restart |
+| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:2829`](../crates/localapi/src/lib.rs#L2829)); live, no restart |
 | Pushable by a server | — | **never**: absent from `DesiredConfig`, so a compromised server cannot switch back on what the owner switched off |
 | Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:500`](../crates/remote_control/src/models.rs#L500)) and re-announced on the heartbeat when it changes |
 
@@ -1179,6 +1179,10 @@ A pre-P10 **viewer** treats the unknown reason as terminal (the retry list is
 an allowlist) and simply shows no notice. The full matrix is in the FR-27 spec.
 
 ### 11.6 Sessions that end: the maximum length and the idle limit (FR-101 P4b)
+
+> What the device does to its own screen when the last session ends (`lock_on_end`: `never`, `auto`,
+> `always`) is FR-99 P3's, the device owner's setting: [privacy-mode.md § Locking when the session
+> ends](privacy-mode.md#locking-when-the-session-ends).
 
 An org can bound how long a session lasts, and how long it may sit idle. Both
 are off by default. Both end the session as `idle_timeout`, the `EndReason`

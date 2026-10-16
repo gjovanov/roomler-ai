@@ -1261,6 +1261,9 @@ impl LocalApiState for DaemonState {
                 // leaves the caps on the next heartbeat. The console gate on
                 // the key has already run.
                 crate::privacy::set_device_allowed(cfg.privacy_mode_allowed);
+                // FR-99 P3 — and the lock-on-end policy: the next session's
+                // start reads it. The console gate on the key has already run.
+                crate::lock_on_end::set_device_policy(cfg.lock_on_end);
                 // FR-101 P2b — and the session-policy floor: the next session
                 // is masked by it, and the hub hears it on the next heartbeat.
                 crate::session_policy::set_device_policy(crate::session_policy::from_config(&cfg));

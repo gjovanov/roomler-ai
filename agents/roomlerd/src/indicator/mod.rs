@@ -203,6 +203,9 @@ impl ViewerIndicator {
             self.registry
                 .insert(session_id, controller_name, permissions, org, kill.clone());
         }
+        // FR-99 P3 — the same lifecycle point decides whether this session's
+        // end locks the computer (what `auto` needs is read now).
+        crate::lock_on_end::session_started(session_id);
     }
 
     /// FR-27 — put a consent question on this device's screen, natively.
@@ -312,6 +315,9 @@ impl ViewerIndicator {
             notify::viewing_ended(&oid);
         }
         if let Ok(oid) = bson::oid::ObjectId::parse_str(&session_id) {
+            // FR-99 P3 — the session is over whether or not a recording keeps
+            // its banner: the last end locks, when the decisions say so.
+            crate::lock_on_end::session_ended(oid);
             let recording = self
                 .recordings
                 .lock()

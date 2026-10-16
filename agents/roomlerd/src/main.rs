@@ -4112,6 +4112,9 @@ async fn run_cmd(
     // FR-99 P1d — before any connection, so before any session: the curtains a
     // previous process died holding, to report as `worker_exit`.
     roomlerd::privacy::collect_leftovers();
+    // FR-99 P3 — the owner's lock-on-end policy, live from here on (a local
+    // `ConfigSet` re-seeds it; the server cannot reach it).
+    roomlerd::lock_on_end::set_device_policy(cfg.lock_on_end);
     // FR-101 P2b — the owner's session-policy floor, likewise device-only.
     roomlerd::session_policy::set_device_policy(roomlerd::session_policy::from_config(&cfg));
     // FR-92 — the keep-busy engine: restores a keep-busy the signed-in
