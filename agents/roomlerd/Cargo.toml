@@ -488,6 +488,10 @@ features = [
     # Multi-monitor enumeration (MonitorFromPoint / EnumDisplayMonitors).
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",                    # GetDpiForMonitor (future: scale-aware reporting)
+    # FR-99 P4 host mute: IMMDeviceEnumerator + IAudioEndpointVolume on the
+    # default render endpoint, muted while a privacy curtain is up.
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
 ]
 
 [features]
