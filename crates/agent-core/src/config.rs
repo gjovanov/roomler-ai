@@ -1477,7 +1477,9 @@ pub struct AgentConfig {
     /// session ends: `never` (the default), `auto` (lock when the session
     /// began on a locked screen or with nobody at the computer) or `always`.
     /// Read LIVE: the decision is taken at each session's start and applied
-    /// when the last one ends.
+    /// when the last one ends. A fresh Windows service install is written with
+    /// `auto` (decision 3, `enrollment::apply_service_install_defaults`); a
+    /// config that lacks the key reads `never`.
     ///
     /// ⚠️ Device-owned: absent from `DesiredConfig`, and set over the LocalAPI
     /// only by the person at the console, whose screen it locks. A server may

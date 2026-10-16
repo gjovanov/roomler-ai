@@ -1696,7 +1696,7 @@ const KEYS: &[KeyMeta] = &[
         // ends.
         live: true,
         kind: "string",
-        description: "FR-99 - lock this computer when the last remote session ends: never (default) | auto (lock if the session began on a locked screen or with nobody at the computer) | always. Windows and Linux. With always, a per-user install cannot unlock the screen remotely afterwards: someone must sign in at the computer. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
+        description: "FR-99 - lock this computer when the last remote session ends: never (default) | auto (lock if the session began on a locked screen or with nobody at the computer) | always. A new Windows service install starts at auto. Windows and Linux. With always, a per-user install cannot unlock the screen remotely afterwards: someone must sign in at the computer. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
     },
     KeyMeta {
         key: "display_match",

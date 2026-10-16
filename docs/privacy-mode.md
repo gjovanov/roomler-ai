@@ -16,7 +16,8 @@
 > | P1d | the device's account: every curtain up, down (and why) and refused, in `privacy_activity`, including the curtain a killed process could not report | shipped (0.4.139); a killed worker's `worker_exit` field-verified |
 > | P2 | blocking the person's keyboard and mouse (`BlockInput`, Ctrl+Alt+Del to take the computer back) | not built |
 > | P3a | lock the computer when the last session ends: the device's own `lock_on_end` (Windows, Linux) | shipped (0.4.139); field-verified on Windows |
-> | P3b | an admin asking a device's sessions for a stricter lock | agent half shipped (0.4.139); the server half awaits a deploy |
+> | P3b | an admin asking a device's sessions for a stricter lock | shipped (0.4.139, server deployed); field-verified on Windows |
+> | P3c | a new Windows service install starts at `lock_on_end = auto` | merged; ships with the next agent release |
 > | P4a | mute the host's speakers while the curtain is up (Windows), the controller keeping the audio | merged; ships with agent 0.4.140 |
 
 While a privacy-mode session runs, **the person at the computer sees a notice instead of the
@@ -169,7 +170,7 @@ A remote admin who unlocks a computer to work on it should not leave it unlocked
 console:
 
 ```
-roomler config set lock_on_end auto      # never (default) | auto | always
+roomler config set lock_on_end auto      # never | auto | always
 ```
 
 | `lock_on_end` | When the last remote session ends |
@@ -203,6 +204,13 @@ sequenceDiagram
   mechanism yet: an end that should lock logs that it could not.
 - The key is the device's own. It is set over the LocalAPI only by the person at the console, whose screen
   it locks, and no server can push it. An admin can ask for stricter (below).
+- **The default is `never`, except on a new Windows service install, which starts at `auto`** (P3c, the
+  spec's decision 3; [`apply_service_install_defaults`](../crates/agent-core/src/enrollment.rs#L707)). Its
+  worker reaches the secure desktop, so the next controller can unlock what `auto` locked. Per-user installs
+  keep `never`, since nothing could unlock them remotely. So does the Linux root daemon, until a field cell
+  shows a remote unlock there. An install already in the field keeps its value when it is re-enrolled.
+- ⚠️ **`auto` also locks an unlocked computer nobody had touched for 5 minutes.** A kiosk that signs itself
+  in ends each session at a padlock; set `never` there.
 - ⚠️ **`auto` restores what was found at the start.** A person who unlocked the computer during the session
   signs in again after it. Telling their input from the controller's would need the input hooks FR-92 bans.
 - ⚠️ **On a per-user install, `always` cannot be undone remotely.** That worker cannot reach the secure

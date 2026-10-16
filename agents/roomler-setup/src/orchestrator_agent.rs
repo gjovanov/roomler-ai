@@ -567,6 +567,12 @@ async fn run_install_inner(
     let mut cfg = roomlerd::enrollment::enroll(inputs)
         .await
         .map_err(|e| failed(enroll_error_code(&e), format!("enrollment: {e}")))?;
+    // FR-99 decision 3 — the SystemContext flavour is a Windows service
+    // install, and the wizard always writes a fresh config: it starts at
+    // `lock_on_end = auto` (`enrollment::apply_service_install_defaults`).
+    if is_system_context {
+        roomlerd::enrollment::apply_service_install_defaults(&mut cfg);
+    }
     // S2 — fold the wizard's advanced options into the enrolled config
     // before it's written (route lists already validated pre-MSI). An
     // overlay choice the SPA did not send follows the flavour (FR-84 S2).
