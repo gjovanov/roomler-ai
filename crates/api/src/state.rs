@@ -427,6 +427,14 @@ impl AppState {
         // closed days are recomputed; an empty collection is first filled
         // over the sources' horizon. No-op unless `growth.enabled`.
         crate::growth::org_daily::spawn_org_daily_loop(state.clone());
+        // FR-102 P10 — the weekly roll-up (once the clock passes Monday
+        // `digest_hour_utc`, the past ISO week is computed, stored in
+        // `growth_weekly` and mailed once through the digest's claim) and
+        // the alert evaluator (hourly; a rule opens one `growth_alerts` row,
+        // mails once a day, clears itself). No-ops unless
+        // `growth.weekly_enabled` / `growth.alerts` (both default OFF).
+        crate::growth::weekly::spawn_weekly_loop(state.clone());
+        crate::growth::alerts::spawn_alert_loop(state.clone());
 
         // FR-69 P5a — the inverse edges (D6). Each mounted module registers
         // its hooks (since P7a that includes the network steps of the agent

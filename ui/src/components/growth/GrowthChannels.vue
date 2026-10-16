@@ -187,15 +187,25 @@
     </template>
     <div v-else-if="loading" class="pa-4"><v-progress-circular indeterminate size="24" /></div>
 
-    <!-- The ingest keys (D12): only a hash is stored; a minted key is shown once. -->
+    <!-- The machine keys (D12): only a hash is stored; a minted key is shown once. -->
     <v-card class="mt-4">
-      <v-card-title class="text-subtitle-1">Ingest keys</v-card-title>
+      <v-card-title class="text-subtitle-1">Machine keys</v-card-title>
       <v-card-text>
         <p class="text-caption text-medium-emphasis mb-2">
-          An ingest key opens <code>POST /api/admin/growth/ingest/posts</code> and
-          <code>…/snapshots</code> and nothing else. Only its hash is stored: copy it when it is shown.
+          An <strong>ingest</strong> key opens <code>POST /api/admin/growth/ingest/posts</code> and
+          <code>…/snapshots</code> and nothing else; a <strong>read</strong> key (P10) opens the
+          <code>GET /api/admin/growth/*</code> views and nothing else — never a write, never this
+          list. Only a hash is stored: copy a key when it is shown.
         </p>
         <div class="d-flex align-center flex-wrap mb-2" style="gap: 8px">
+          <v-select
+            v-model="newKind"
+            :items="kindItems"
+            label="Kind"
+            density="compact"
+            hide-details
+            style="max-width: 140px"
+          />
           <v-text-field
             v-model="newLabel"
             label="Label"
@@ -205,7 +215,7 @@
             maxlength="80"
           />
           <v-btn size="small" variant="tonal" :disabled="!newLabel.trim()" :loading="minting" @click="mint">
-            Mint ingest key
+            Mint {{ newKind }} key
           </v-btn>
         </div>
         <v-alert v-if="minted" type="warning" variant="tonal" density="compact" class="mb-2">
@@ -217,6 +227,7 @@
         <v-table v-if="keys.length" density="compact">
           <thead>
             <tr>
+              <th class="text-left">Kind</th>
               <th class="text-left">Prefix</th>
               <th class="text-left">Label</th>
               <th class="text-left">Created</th>
@@ -227,6 +238,7 @@
           </thead>
           <tbody>
             <tr v-for="k in keys" :key="k.id">
+              <td>{{ k.kind }}</td>
               <td><code>{{ k.prefix }}…</code></td>
               <td>{{ k.label }}</td>
               <td>{{ k.created_at.slice(0, 10) }}</td>
@@ -261,6 +273,7 @@ import {
   safeHref,
   type ChannelsReport,
   type CostRate,
+  type GrowthKeyKind,
   type GrowthKeyRow,
   type Measured,
   type ReachAt,
@@ -285,6 +298,11 @@ const report = ref<ChannelsReport | null>(null)
 
 const keys = ref<GrowthKeyRow[]>([])
 const newLabel = ref('')
+const newKind = ref<GrowthKeyKind>('ingest')
+const kindItems = [
+  { title: 'ingest', value: 'ingest' },
+  { title: 'read', value: 'read' },
+]
 const minting = ref(false)
 const minted = ref<string | null>(null)
 
@@ -327,7 +345,7 @@ async function loadKeys() {
 async function mint() {
   minting.value = true
   try {
-    const k = await store.mintKey(newLabel.value.trim())
+    const k = await store.mintKey(newLabel.value.trim(), newKind.value)
     minted.value = k.key
     newLabel.value = ''
     await loadKeys()

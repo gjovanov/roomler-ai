@@ -25,6 +25,12 @@
 //! typed `Sections` (never a hand-built `doc!{}`: a field added later must
 //! travel). This crate does not know that type, so the store carries a
 //! `Document`.
+//!
+//! P10 — the weekly roll-up is the same row shape and the same claim, in
+//! its own collection (`growth_weekly`, `_id` the ISO week `YYYY-Www`):
+//! [`DigestStore::weekly`]. Its own collection rather than a `week:` id in
+//! `growth_digests`, so `latest()` and `list()` of the daily store never
+//! meet a week where they expect a day.
 
 use bson::{DateTime, Document, doc};
 use futures::TryStreamExt;
@@ -34,6 +40,8 @@ use serde::{Deserialize, Serialize};
 use super::base::DaoResult;
 
 pub const GROWTH_DIGESTS: &str = "growth_digests";
+/// P10 — the weekly roll-ups, `_id = "YYYY-Www"` (the ISO week).
+pub const GROWTH_WEEKLY: &str = "growth_weekly";
 
 /// The stored shape's version, for a reader that meets an older row.
 /// 2 since FR-102 P3: `sections.install` became a section of its own and
@@ -42,7 +50,9 @@ pub const GROWTH_DIGESTS: &str = "growth_digests";
 /// 3 since P8: `sections.social` is a measured section (posts per platform,
 /// the day's snapshots) instead of a fixed "arrives with P8"; an older row's
 /// `{not_measured, arrives_with}` still reads as the measured type's other arm.
-pub const DIGEST_VERSION: u32 = 3;
+/// 4 since P10: `sections.alerts` (the day's fired and cleared alerts, and
+/// the ones open at compute time); a version-3 row reads it as not measured.
+pub const DIGEST_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,7 +93,8 @@ pub struct ExcludedCounts {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DigestDoc {
-    /// The UTC day, `YYYY-MM-DD`.
+    /// The UTC day, `YYYY-MM-DD` — or, in the weekly store, the ISO week
+    /// `YYYY-Www`.
     #[serde(rename = "_id")]
     pub day: String,
     pub status: DigestStatus,
@@ -141,19 +152,37 @@ pub enum ClaimOutcome {
 
 pub struct DigestStore {
     db: Database,
+    collection: &'static str,
 }
 
 impl DigestStore {
+    /// The daily digests (`growth_digests`).
     pub fn new(db: &Database) -> Self {
-        Self { db: db.clone() }
+        Self {
+            db: db.clone(),
+            collection: GROWTH_DIGESTS,
+        }
+    }
+
+    /// P10 — the weekly roll-ups (`growth_weekly`): the same claim, the
+    /// same statuses, the ISO week as the id.
+    pub fn weekly(db: &Database) -> Self {
+        Self {
+            db: db.clone(),
+            collection: GROWTH_WEEKLY,
+        }
+    }
+
+    pub fn collection_name(&self) -> &'static str {
+        self.collection
     }
 
     fn coll(&self) -> Collection<DigestDoc> {
-        self.db.collection::<DigestDoc>(GROWTH_DIGESTS)
+        self.db.collection::<DigestDoc>(self.collection)
     }
 
     fn docs(&self) -> Collection<Document> {
-        self.db.collection::<Document>(GROWTH_DIGESTS)
+        self.db.collection::<Document>(self.collection)
     }
 
     /// Claim `day` for a run in `mode`: insert-first, then the compare-and-

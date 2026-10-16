@@ -834,6 +834,34 @@ pub struct Social {
     pub snapshots: Vec<SocialSnapshot>,
 }
 
+/// P10 — one alert as the digest lists it: the rule, its key, when it
+/// fired and cleared, and the numbers behind it. Never a person.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertRow {
+    pub rule: String,
+    pub key: String,
+    /// RFC 3339.
+    pub fired_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_at: Option<String>,
+    #[serde(default)]
+    pub detail: Document,
+}
+
+/// P10 — the day's alerts: the rows that fired or cleared during the day,
+/// and the ones still open when the digest was computed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertsSection {
+    pub fired: Vec<AlertRow>,
+    pub cleared: Vec<AlertRow>,
+    pub open: Vec<AlertRow>,
+}
+
+/// A row stored before P10 has no `alerts` field: it reads as not measured.
+fn alerts_before_p10() -> Measured<AlertsSection> {
+    Measured::NotMeasured(NotMeasured::later("alerts", "P10"))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sections {
     pub headline: Headline,
@@ -851,6 +879,10 @@ pub struct Sections {
     /// them; `not_measured` when nothing was pushed in the 28-day window.
     pub social: Measured<Social>,
     pub search: NotMeasured,
+    /// P10 — the alerts that fired or cleared that day and the ones open at
+    /// the compute; `not_measured` while `growth.alerts` is off.
+    #[serde(default = "alerts_before_p10")]
+    pub alerts: Measured<AlertsSection>,
 }
 
 /// How an `end_reason` reads in the quality section: a normal hang-up, a
@@ -2424,6 +2456,15 @@ pub async fn compute(
         .await
         .into();
 
+    // P10 — the day's alerts, when the rules run on this server.
+    let alerts = if state.settings.growth.alerts {
+        Measured::Value(super::alerts::day_section(state, &w).await?)
+    } else {
+        Measured::NotMeasured(NotMeasured::now(
+            "alerts are off on this server (ROOMLER__GROWTH__ALERTS)",
+        ))
+    };
+
     Ok(Sections {
         headline: Headline {
             signups: signups.total,
@@ -2476,6 +2517,7 @@ pub async fn compute(
         install,
         social,
         search: NotMeasured::later("clicks, impressions, top queries and pages", "P7"),
+        alerts,
     })
 }
 
@@ -2552,6 +2594,7 @@ pub async fn recipients(state: &AppState) -> Result<Vec<String>, DigestError> {
 /// What a run did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunReport {
+    /// The row's key: the day — or, for the weekly roll-up, the ISO week.
     pub day: String,
     /// False when another pod held the day, or it was already done.
     pub claimed: bool,
@@ -2623,6 +2666,56 @@ fn not_run(day: String, status: DigestStatus) -> RunReport {
     }
 }
 
+/// What a run computed: the sections to store, and the mail rendered from
+/// them (what was mailed is what the GET answers).
+pub(crate) struct Computed {
+    pub sections: Document,
+    pub subject: String,
+    pub html: String,
+    pub text: String,
+}
+
+/// A report the engine below runs: the daily digest, and from P10 the
+/// weekly roll-up — one claim, one store, one delivery for both, each
+/// contributing only what it computes and how it reads.
+pub(crate) trait Report: Send + Sync {
+    /// Compute and render. `doc` is the row the mail describes — its key,
+    /// attempts, recipient count and excluded counts; the sections are not
+    /// on it yet.
+    fn compute<'a>(
+        &'a self,
+        state: &'a AppState,
+        set: &'a ExclusionSet,
+        doc: &'a DigestDoc,
+        now: DateTime,
+    ) -> Pin<Box<dyn Future<Output = Result<Computed, DigestError>> + Send + 'a>>;
+}
+
+/// The daily digest of one closed day.
+pub(crate) struct DailyReport {
+    pub day: NaiveDate,
+}
+
+impl Report for DailyReport {
+    fn compute<'a>(
+        &'a self,
+        state: &'a AppState,
+        set: &'a ExclusionSet,
+        doc: &'a DigestDoc,
+        now: DateTime,
+    ) -> Pin<Box<dyn Future<Output = Result<Computed, DigestError>> + Send + 'a>> {
+        Box::pin(async move {
+            let sections = compute(state, self.day, set, now).await?;
+            Ok(Computed {
+                sections: bson::to_document(&sections)?,
+                subject: super::render::subject(&doc.day),
+                html: super::render::render_html(doc, &sections),
+                text: super::render::render_text(doc, &sections),
+            })
+        })
+    }
+}
+
 /// The scheduled path: claim-first, then compute, store and deliver. A
 /// finished day (`sent`, `stored`) and a fresh claim are left alone.
 pub async fn run_scheduled(
@@ -2631,16 +2724,35 @@ pub async fn run_scheduled(
     mailer: Option<&dyn DigestMailer>,
     now: DateTime,
 ) -> Result<RunReport, DigestError> {
-    let store = DigestStore::new(&state.db);
-    let key = day_str(day);
+    run_scheduled_report(
+        state,
+        &DigestStore::new(&state.db),
+        &day_str(day),
+        &DailyReport { day },
+        mailer,
+        now,
+    )
+    .await
+}
+
+/// The scheduled path for any report (the daily digest, the weekly
+/// roll-up): claim `key` in `store`, then [`finish`].
+pub(crate) async fn run_scheduled_report(
+    state: &AppState,
+    store: &DigestStore,
+    key: &str,
+    report: &dyn Report,
+    mailer: Option<&dyn DigestMailer>,
+    now: DateTime,
+) -> Result<RunReport, DigestError> {
     let attempts = match store
-        .claim(&key, now, STALE_CLAIM_SECS, ClaimMode::Scheduled)
+        .claim(key, now, STALE_CLAIM_SECS, ClaimMode::Scheduled)
         .await?
     {
         ClaimOutcome::Claimed { attempts, .. } => attempts,
-        ClaimOutcome::Busy => return Ok(not_run(key, DigestStatus::Computing)),
+        ClaimOutcome::Busy => return Ok(not_run(key.to_string(), DigestStatus::Computing)),
         ClaimOutcome::Done(status) | ClaimOutcome::InPlace(status) => {
-            return Ok(not_run(key, status));
+            return Ok(not_run(key.to_string(), status));
         }
     };
     let hold = Hold {
@@ -2648,7 +2760,7 @@ pub async fn run_scheduled(
         claimed: true,
         prior: None,
     };
-    finish(state, &store, day, attempts, hold, mailer, now).await
+    finish(state, store, key, attempts, hold, mailer, now, report).await
 }
 
 /// The manual path (`POST …/digest/run`): recompute and overwrite the
@@ -2670,14 +2782,35 @@ pub async fn run_manual(
     mailer: Option<&dyn DigestMailer>,
     now: DateTime,
 ) -> Result<RunReport, RunError> {
-    let store = DigestStore::new(&state.db);
-    let key = day_str(day);
+    run_manual_report(
+        state,
+        &DigestStore::new(&state.db),
+        &day_str(day),
+        &DailyReport { day },
+        send,
+        mailer,
+        now,
+    )
+    .await
+}
+
+/// The manual path for any report: the claim in its manual mode, then
+/// [`finish`].
+pub(crate) async fn run_manual_report(
+    state: &AppState,
+    store: &DigestStore,
+    key: &str,
+    report: &dyn Report,
+    send: bool,
+    mailer: Option<&dyn DigestMailer>,
+    now: DateTime,
+) -> Result<RunReport, RunError> {
     let mode = if send {
         ClaimMode::ManualSend
     } else {
         ClaimMode::ManualPreview
     };
-    let (attempts, hold) = match store.claim(&key, now, STALE_CLAIM_SECS, mode).await? {
+    let (attempts, hold) = match store.claim(key, now, STALE_CLAIM_SECS, mode).await? {
         ClaimOutcome::Claimed { attempts, prior } => (
             attempts,
             Hold {
@@ -2696,44 +2829,61 @@ pub async fn run_manual(
             },
         ),
     };
-    Ok(finish(state, &store, day, attempts, hold, mailer, now).await?)
+    Ok(finish(state, store, key, attempts, hold, mailer, now, report).await?)
 }
 
+/// The engine: compute and render through the report, store the sections,
+/// then deliver or not as the hold allows — the same for the daily digest
+/// and the weekly roll-up.
+#[allow(clippy::too_many_arguments)]
 async fn finish(
     state: &AppState,
     store: &DigestStore,
-    day: NaiveDate,
+    key: &str,
     attempts: u32,
     hold: Hold,
     mailer: Option<&dyn DigestMailer>,
     now: DateTime,
+    report: &dyn Report,
 ) -> Result<RunReport, DigestError> {
-    let key = day_str(day);
     let set = ExclusionSet::load(&state.core).await?;
-    let sections = match compute(state, day, &set, now).await {
-        Ok(s) => s,
-        Err(e) => {
-            // Only a held day may be marked failed: an in-place refresh of
-            // a `sent` day that fails must not hand that day back to the
-            // scheduler, which would mail it again.
-            if hold.claimed {
-                store
-                    .set_status(&key, DigestStatus::Failed, None, Some(e.to_string()))
-                    .await?;
-            }
-            return Err(e);
-        }
-    };
     let recipients = recipients(state).await?;
     let (users, tenants) = set.counts();
     let excluded = ExcludedCounts {
         users: users as u32,
         tenants: tenants as u32,
     };
+    let doc = DigestDoc {
+        day: key.to_string(),
+        status: DigestStatus::Computing,
+        version: roomler_ai_services::dao::growth_digest::DIGEST_VERSION,
+        claimed_at: now,
+        computed_at: Some(now),
+        sent_at: None,
+        attempts,
+        error: None,
+        recipients: recipients.len() as u32,
+        excluded,
+        sections: None,
+    };
+    let computed = match report.compute(state, &set, &doc, now).await {
+        Ok(c) => c,
+        Err(e) => {
+            // Only a held day may be marked failed: an in-place refresh of
+            // a `sent` day that fails must not hand that day back to the
+            // scheduler, which would mail it again.
+            if hold.claimed {
+                store
+                    .set_status(key, DigestStatus::Failed, None, Some(e.to_string()))
+                    .await?;
+            }
+            return Err(e);
+        }
+    };
     store
         .store_sections(
-            &key,
-            bson::to_document(&sections)?,
+            key,
+            computed.sections,
             excluded,
             recipients.len() as u32,
             now,
@@ -2749,7 +2899,7 @@ async fn finish(
     //    are refreshed and the status is not touched.
     let deliver = hold.claimed && matches!(hold.mode, ClaimMode::Scheduled | ClaimMode::ManualSend);
     let mut report = RunReport {
-        day: key.clone(),
+        day: key.to_string(),
         claimed: hold.claimed,
         status: hold.prior.unwrap_or(DigestStatus::Stored),
         attempts,
@@ -2761,36 +2911,23 @@ async fn finish(
         (false, _, _, _) => {}
         (true, false, _, _) => {
             store
-                .set_status(&key, DigestStatus::Preview, None, None)
+                .set_status(key, DigestStatus::Preview, None, None)
                 .await?;
             report.status = DigestStatus::Preview;
         }
         (true, true, Some(mailer), false) => {
-            let doc = DigestDoc {
-                day: key.clone(),
-                status: DigestStatus::Computing,
-                version: roomler_ai_services::dao::growth_digest::DIGEST_VERSION,
-                claimed_at: now,
-                computed_at: Some(now),
-                sent_at: None,
-                attempts,
-                error: None,
-                recipients: recipients.len() as u32,
-                excluded,
-                sections: None,
-            };
-            let subject = super::render::subject(&key);
-            let html = super::render::render_html(&doc, &sections);
-            let text = super::render::render_text(&doc, &sections);
             let mut first_error: Option<String> = None;
             for to in &recipients {
                 report.send_attempts += 1;
-                match mailer.send(to, &subject, &html, &text).await {
+                match mailer
+                    .send(to, &computed.subject, &computed.html, &computed.text)
+                    .await
+                {
                     Ok(()) => report.sent += 1,
                     Err(e) => {
                         // The error is the mailer's text about our request;
                         // it never carries the recipient.
-                        warn!(day = %key, %e, "digest send failed");
+                        warn!(key = %key, collection = store.collection_name(), %e, "growth report send failed");
                         first_error.get_or_insert(e);
                     }
                 }
@@ -2804,13 +2941,13 @@ async fn finish(
                     )
                 });
                 store
-                    .set_status(&key, DigestStatus::Sent, Some(now), note)
+                    .set_status(key, DigestStatus::Sent, Some(now), note)
                     .await?;
                 report.status = DigestStatus::Sent;
             } else {
                 let e = first_error.unwrap_or_else(|| "every send failed".into());
                 store
-                    .set_status(&key, DigestStatus::Failed, None, Some(e))
+                    .set_status(key, DigestStatus::Failed, None, Some(e))
                     .await?;
                 report.status = DigestStatus::Failed;
             }
@@ -2819,19 +2956,20 @@ async fn finish(
             // Delivering, with nobody to deliver to (no recipients, or no
             // mail service): the digest exists, and the day is done.
             store
-                .set_status(&key, DigestStatus::Stored, None, None)
+                .set_status(key, DigestStatus::Stored, None, None)
                 .await?;
             report.status = DigestStatus::Stored;
         }
     }
     info!(
-        day = %key,
+        key = %key,
+        collection = store.collection_name(),
         status = report.status.as_str(),
         recipients = report.recipients,
         sent = report.sent,
         excluded_users = excluded.users,
         excluded_tenants = excluded.tenants,
-        "growth digest run"
+        "growth report run"
     );
     Ok(report)
 }

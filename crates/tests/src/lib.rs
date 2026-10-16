@@ -99,6 +99,12 @@ mod growth_funnel_tests;
 /// half); the per-issue unsubscribe; the per-issue table and the digest.
 #[cfg(test)]
 mod growth_newsletter_tests;
+/// FR-102 P10 — the read key (AC20: the admin's numbers on every GET view,
+/// the empty 404 on every write and on the admin surface), the weekly
+/// roll-up's once-only claim and routes, and the alert rules firing once,
+/// clearing, and mailing at most once a day.
+#[cfg(test)]
+mod growth_p10_tests;
 /// FR-102 P4 — billed revenue through Stripe's own signature scheme (AC13's
 /// test half: the lifecycle's invoice amounts, MRR month by month, the
 /// coupon control), the frozen months surviving an org's purge, the

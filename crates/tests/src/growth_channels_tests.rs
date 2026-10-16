@@ -412,9 +412,20 @@ async fn ingest_keys_are_minted_once_stored_hashed_and_admin_only() {
     assert!(!list.to_string().contains(&key[12..]), "{list}");
     assert!(list["keys"][0].get("hash").is_none());
 
-    // Refusals: a kind not minted yet, an empty label.
+    // Refusals: an unknown kind, an empty label. (P10 — `read` is the
+    // second kind and mints, with its own prefix and its own ceiling.)
+    let r = app
+        .auth_post("/api/admin/growth/keys", &token)
+        .json(&json!({ "kind": "read", "label": "pipeline results" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201);
+    let read: Value = r.json().await.unwrap();
+    assert!(read["key"].as_str().unwrap().starts_with("rgr_"), "{read}");
+    assert_eq!(read["kind"], "read");
     for bad in [
-        json!({ "kind": "read", "label": "x" }),
+        json!({ "kind": "write", "label": "x" }),
         json!({ "kind": "ingest", "label": "" }),
     ] {
         let r = app
@@ -436,6 +447,14 @@ async fn ingest_keys_are_minted_once_stored_hashed_and_admin_only() {
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 409);
+    // The ceiling is per kind: a second read key still mints.
+    let r = app
+        .auth_post("/api/admin/growth/keys", &token)
+        .json(&json!({ "kind": "read", "label": "a second reader" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201);
 
     // Hidden from everyone else.
     let plain = app

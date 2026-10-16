@@ -124,6 +124,7 @@ this server, not reachable, or not built yet is `{"not_measured": "<reason>",
 | `install` | tokens issued → redeemed; fetches by `(asset, client class, OS)`; enrollments by `(method, OS)`; wizard steps not measured until P3b — [the install trace](#the-install-trace-p3) | `enroll_token_issued`, `growth_daily`, `agents.install` | P3 |
 | `social` | posts published per platform `{day, d7, d28}`; the snapshots taken that day (at most 20), each with its post's campaign and the platform's own metric names — `not_measured` when nothing was pushed in 28 days | `growth_posts`, `growth_post_snapshots` | P8 |
 | `search` | — | — | P7 |
+| `alerts` | the alert rows that `fired` or `cleared` during the day, and the ones `open` at the compute — rule, key, times, the numbers behind it; `not_measured` while the alerts are off on this server — [alerts](#the-read-key-the-weekly-roll-up-and-alerts-p10) | `growth_alerts` | P10 (`ROOMLER__GROWTH__ALERTS`) |
 
 A module that is not mounted (`[modules] remote = false`, a reduced profile) makes its part
 `not_measured: "<module> module not mounted"`; the rest of the digest still completes. The
@@ -212,7 +213,8 @@ key once one is minted for `roomler.ai`); a mail backend must be configured
 | GET | `/api/admin/growth/digest/preview?day=&include_internal=` | compute live, store nothing |
 
 All platform-admin only (`ROOMLER__STATS__PLATFORM_ADMINS`), **404** otherwise — the same
-gate as `/admin/stats`. The SPA's `/observability/growth` (the Digest view) picks a day,
+gate as `/admin/stats`; since P10 the GETs also answer a [read key](#the-read-key-d12).
+The SPA's `/observability/growth` (the Digest view) picks a day,
 lists recent digests, recomputes without sending, and shows every section as cards; a
 `not_measured` cell is a muted chip, never a 0, and every string is rendered as text.
 
@@ -641,8 +643,9 @@ only `hex(SHA-256(key))` and a display prefix (`rgi_AbCd1234`) in `growth_keys`
 used and whether it is revoked — never the key or its hash. `DELETE …/keys/{key_id}` revokes
 (a timestamp, so the row stays as the record); at most 10 live keys of a kind.
 
-An ingest key opens the two ingest routes and **nothing else** — not a growth view, not any
-other route. ⚠️ Every way of not holding a live one is the same **empty 404** a path that does
+An ingest key opens the two ingest routes and **nothing else** — not a growth view (a
+[read key](#the-read-key-d12) is the kind for that, P10), not any other route. ⚠️ Every way
+of not holding a live one is the same **empty 404** a path that does
 not exist answers ([`require_ingest_key`, growth_ingest.rs:467](../crates/modules/saas/src/growth_ingest.rs)),
 decided in a gate that runs before the body is read and before the method is matched: no
 `Authorization` header, a malformed key, an unknown one, a revoked one, a user's JWT,
@@ -1118,6 +1121,150 @@ curl -sS -X POST "https://roomler.ai/api/admin/growth/billing/backfill?since=202
 
 A subscription created before P4 carries no `tenant_id` in its metadata; its events are
 matched through the org's stored customer and subscription ids instead.
+## The read key, the weekly roll-up and alerts (P10)
+
+The results feed (spec §3l): the numbers the Growth page shows, readable by a machine; the
+week read against the weeks before it, once, in every admin's mailbox on Monday; and a
+small set of rules that say so when a source stops measuring or a count leaves its band.
+
+```mermaid
+flowchart LR
+  subgraph callers["Callers"]
+    PA["platform admin's session"]
+    RK["read key<br/>Authorization: Bearer rgr_…"]
+  end
+  subgraph host["host — crates/api/src/growth"]
+    G{"read_key_gate<br/>a growth key? → GET of a data route<br/>+ live read key, or the empty 404"}
+    V["GET views: digest(s) · funnel · cohorts · orgs ·<br/>timeline · campaigns · channels · newsletter ·<br/>revenue · weekly · weeklies · alerts<br/>(extractor: GrowthAuth)"]
+    W["writes + the admin surface:<br/>exclusions · digest/run · backfill · keys ·<br/>weekly/run · alerts/evaluate<br/>(extractor: AuthUser)"]
+    WK["weekly job<br/>Monday ≥ digest hour · the last closed ISO week"]
+    AL["alert evaluator<br/>hourly · Redis NX claim"]
+    DG["digest job"]
+  end
+  subgraph core["core collections"]
+    K[("growth_keys<br/>kind: ingest | read")]
+    WY[("growth_weekly<br/>_id = YYYY-Www")]
+    A[("growth_alerts<br/>one open row per (rule, key)")]
+    D[("growth_digests")]
+  end
+  PA --> G
+  RK --> G
+  G -->|"SHA-256 lookup"| K
+  G --> V
+  G -->|"session only"| W
+  WK -->|"claim → compute → store → mail once"| WY
+  AL -->|"fire (insert) · clear · mailed_on CAS"| A
+  AL -.->|"reads"| D
+  DG -->|"sections.alerts"| A
+  WY --> V
+  A --> V
+```
+
+### The read key (D12)
+
+A platform admin mints it where the ingest key is minted — `/observability/growth` →
+**Channels** → *Machine keys*, kind `read`, or `POST /api/admin/growth/keys`
+`{"kind": "read", "label": "…"}` ([`keys.rs`](../crates/api/src/growth/keys.rs)). It is
+`rgr_` and 32 random characters, answered once; only `hex(SHA-256(key))` and a display prefix
+are stored in `growth_keys` ([`growth_key.rs`](../crates/services/src/dao/growth_key.rs)).
+The promotion pipeline and the sessions that run it read the stored digests, the funnel and
+the tables with it instead of querying databases by hand.
+
+**One rule, in two halves** ([`read_key.rs`](../crates/api/src/growth/read_key.rs)):
+
+| Half | What it decides |
+|---|---|
+| `read_key_gate` — a layer on the whole `/api/admin/growth` router | When the bearer is a growth key of **any** kind, the answer is the key's and never the session's: a **live read key** on a **GET** of a **data route** opens it (the use is recorded as `last_used_at` and logged with the key's prefix and the path — never the key, never a query string). Everything else is the **empty 404** of a path that does not exist: any non-GET, the admin surface (`/keys`, `/exclusions` — session-only even on GET, so a leaked key can neither list its siblings nor read the admin ids), an ingest key, a malformed, unknown or revoked key, and `growth.enabled = false`. Never 401 or 403. A database error is a 503, so a Mongo blip never reads as a revocation. A bearer that is not a growth key (a JWT) passes through untouched. |
+| `GrowthAuth` — the extractor every GET view names | The mark the gate left, or else a platform admin's session on a server whose growth surface is on — the same 404s as before. A handler does not know which it serves, which is what makes AC20 a property rather than a promise: the key reads exactly what the admin's session reads at the same route. A write route keeps `AuthUser` + `require_growth_admin`; the gate has already answered a key on it. |
+
+The integration test `crates/tests/src/growth_p10_tests.rs::ac20_…` asserts the same JSON for
+the two credentials on every GET view, and the identical empty 404 on every write, on the
+admin surface, for an ingest key, a malformed and an unknown key, a revoked key, and the kill
+switch.
+
+### The weekly roll-up
+
+Every closed ISO week (Monday–Sunday, UTC) is computed once, stored once in
+`growth_weekly` (`_id = "YYYY-Www"`) and mailed once to the digest's recipients
+([`weekly.rs`](../crates/api/src/growth/weekly.rs)). Nothing in it is a second definition:
+each section is the matching route's own report, computed for exactly that week through the
+same function the route calls (`funnel::compute`, `cohorts::compute`, `campaigns::compute`,
+`channels::compute`, `newsletter::compute`).
+
+| Section | What |
+|---|---|
+| `headline` | sign-ups, orgs created, devices enrolled and weekly active orgs as `{week, prev_week, w4_avg}` — the week, the week before, and the mean of the **four before** the week; purestat's visitors, visits, pageviews and reads for the week and the week before (unique per week, never a sum of days; no four-week mean, which would be four more queries for a number that does not add) |
+| `funnel` | the week's sign-ups through the account funnel, by source — every step `{count, pending, settled}` |
+| `cohorts` | the cohort lines (12 weeks ending with the week) and the WAO series as they stood the morning after |
+| `campaigns` | the Campaigns table by source for the week, web cells live from purestat (`not_measured` without a key) |
+| `channels` | the Channels table for the posts published in the week |
+| `newsletter` | the list over the week and the issues sent in it |
+| `alerts` | fired or cleared in the week, and open at the compute |
+
+- **Once, with two pods** — the digest's own claim, in a collection of its own
+  (`DigestStore::weekly`, [`growth_digest.rs`](../crates/services/src/dao/growth_digest.rs)):
+  the unique `_id` decides which pod computes and mails; a `failed` or stale `computing` week
+  is re-claimed; a `sent` week is **never sent again**; a manual `send=false` run ends
+  `preview`, which the scheduler still claims. The engine is `digest::finish` behind the
+  `Report` seam, so the matrix is one piece of code with the digest's tests behind it, plus
+  the weekly's own (`growth_p10_tests.rs`: two concurrent runs → one mail; a re-run after
+  `sent` does nothing; a preview never cancels the scheduled mail; a manual send racing the
+  scheduler mails once). Its own collection rather than a `week:` id among the days, so the
+  daily store's `latest()` and `list()` never meet a week where they expect a day.
+- **When** — the scheduler ticks every 10 minutes and owes the **last closed week** once the
+  clock passes Monday `00:00 + digest_hour_utc`. A pod that was down on Monday computes it
+  at its next tick (one mail, never a backfill); an older week is the run route's business.
+- **The mail** — `Roomler weekly roll-up — 2026-W41 (2026-10-05 → 2026-10-11)`: the headline
+  against its baselines, the funnel with its n at every step, the WAO table, the campaigns
+  by source, the channels, the newsletter, the alerts, the exclusion footer. Every rate
+  appears only above n = 30; a not-measured cell is a reason; no address, name or IP.
+
+### Alerts
+
+A small set of rules over this server's own numbers ([`alerts.rs`](../crates/api/src/growth/alerts.rs)),
+evaluated hourly by a host job behind `ROOMLER__GROWTH__ALERTS` (default **off**). Each
+rule has an n floor (principle 5); a rule that cannot be evaluated — its source not
+configured, not mounted or not yet pulled — holds nothing, which clears any open row.
+
+| Rule | Key | Fires when | Clears when |
+|---|---|---|---|
+| `digest_missing` | `daily` | the digest is on and the latest **due** day (yesterday from `digest_hour_utc` + 2 h; the day before until then) has no row, a `failed` one, or a `computing` one older than the 30-minute stale cutoff | that day is `sent`, `stored` or `preview`, or the digest is off |
+| `source_not_measured` | `purestat` | the digest's web plane read "not measured" on the two latest due days while a purestat key is configured | either day measured, or no key |
+| `source_not_measured` | `purestat_pull` | the `saas` puller's `growth_pulls` rows for its two latest cycled days (01:00 UTC + 1 h) are both absent or `failed` — once the puller has any row at all (a fresh server's first cycle is still ahead) | either day `ok`, or nothing pulls here |
+| `source_not_measured` | `sendgrid` | on each of the two latest closed days ≥ 1 newsletter send was accepted and not one delivery event arrived, with the webhook key configured | either day recorded an event, or no key |
+| `spike` · `drop` | `signups` | yesterday's sign-ups (exclusions applied) against the 28 days before: baseline n ≥ 30; spike `x > mean + 3√mean` and `x ≥ 2 × mean`; drop `x < mean − 3√mean` | yesterday is within the band |
+| `spike` · `drop` | `visitors` | the same, over the puller's daily `visitors` rows (`by = site`); needs yesterday's row and ≥ 21 of the 28 baseline days | the same |
+
+- **One open row per `(rule, key)`** — `growth_alerts` has a partial unique index on
+  `{rule, key}` where `cleared_at` is an explicit `null`; a second pod's fire is a duplicate
+  key read back as "already open", never a second alert. A recurrence after a clear is a
+  new row, so the collection is the history. Rows expire 90 days after `fired_at`.
+- **Mailed at most once per rule and key per day** — a row never mailed is mailed to the
+  digest's recipients once a compare-and-set on its `mailed_on` succeeds and no row of the
+  pair was mailed that day, so neither two pods nor a clear-and-re-fire inside one day send
+  twice. A clear mails nothing; the next digest lists it.
+- **Where they show** — `GET /api/admin/growth/alerts` (open and recently cleared, with the
+  rule table), the Alerts panel at the top of `/observability/growth` → Overview (with
+  *Evaluate now* and a *dry run* that decides and writes nothing), the daily digest's
+  `alerts` section and the weekly roll-up's. `POST …/alerts/evaluate` runs every rule as
+  the hourly job would (409 when the alerts are off, unless `dry_run=true`) — a field
+  check that does not wait an hour.
+
+### Settings and routes (P10)
+
+| Setting | Env | Default | Effect |
+|---|---|---|---|
+| `growth.weekly_enabled` | `ROOMLER__GROWTH__WEEKLY_ENABLED` | **`false`** | the weekly scheduler; the recipients, hour and mail backend are the digest's |
+| `growth.alerts` | `ROOMLER__GROWTH__ALERTS` | **`false`** | the hourly evaluator, the stored digest's `alerts` section, and `POST …/alerts/evaluate` without `dry_run` |
+
+| Method | Path | Credential | Purpose |
+|---|---|---|---|
+| GET | every `/api/admin/growth/*` view above and below | session **or read key** | the numbers |
+| GET | `/api/admin/growth/weekly?week=` · `/weeklies?since=&limit=` | session or read key | a stored week (the latest when omitted; dates RFC 3339, the sections as stored) and the list with each week's status and headline |
+| POST | `/api/admin/growth/weekly/run?week=&send=false` | session | recompute a closed ISO week through the claim; mail only with `send=true` and never a `sent` week; 409 while a run is in progress; 400 for an open week or a label that is not `YYYY-Www` |
+| GET | `/api/admin/growth/alerts?since=` | session or read key | open rows, rows cleared since `since` (default 7 days), the rule table |
+| POST | `/api/admin/growth/alerts/evaluate?dry_run=` | session | evaluate every rule now |
+| GET/POST/DELETE | `/api/admin/growth/keys` · `/keys/{key_id}` · GET/PUT `/exclusions` | session **only** | the admin surface — a read key meets the empty 404 here, GET included |
 
 ## The `/observability` page as a whole
 
@@ -1128,7 +1275,7 @@ matched through the org's stored customer and subscription ids instead.
 | Orgs, machines, calls, users | platform-wide inventories and series | `/api/admin/stats/{orgs,machines,calls,users}` |
 | Usage | per-user minutes and bytes across every org | `/api/admin/stats/usage*` |
 | Attribution (FR-88) | sign-ups by campaign key and how many activated | `/api/admin/stats/attribution` |
-| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), the Channels table with the ingest keys (P8), the Newsletter tab (P5), and the Revenue tab (P4) | `/api/admin/growth/*` |
+| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), the Channels table with the machine keys (P8, P10), the Newsletter tab (P5), the Revenue tab (P4), the Weekly tab and the Alerts panel (P10) | `/api/admin/growth/*` |
 
 ## Field verification
 
@@ -1142,6 +1289,9 @@ FR's field-verification log ([FR-102 §8](fr/FR-102-growth-observability.md#8-fi
 | Each enroll path records its `install` on the agent row (AC9) | ✅ 2026-10-15 on vmtest, agent 0.4.137: `script-sh`, `script-ps1`, `wizard`, `manual`; a 0.4.136 agent records `unknown` | `crates/agent-core/src/enrollment.rs` — flag, then env, then `manual`; an unknown env spelling clamped |
 | The Campaigns table's visitors for a closed day equal purestat's own number for the same filter, and read "not measured" with the key revoked (AC16) | ✅ 2026-10-15, 2026-10-13 by `content` | `crates/tests/src/growth_campaigns_tests.rs`, against a fake purestat |
 | The ingest stores a snapshot pushed twice once, refuses an unknown platform and a body carrying post text, and answers 404 to a wrong key (AC18) | ✅ 2026-10-15 | `crates/tests/src/growth_channels_tests.rs`, plus the revoked key, the JWT, the kill switch and the unmounted module |
+| The read key returns, for one closed range, the same JSON a platform admin's session gets on every GET view, and the empty 404 on every write, on `GET …/keys` and after its revocation (AC20) | owed after the promote, with a minted read key | `crates/tests/src/growth_p10_tests.rs` — every GET view compared body for body, every write, the admin surface, an ingest key, a malformed, an unknown and a revoked key, the kill switch |
+| The weekly roll-up is stored and mailed once for the first Monday after `ROOMLER__GROWTH__WEEKLY_ENABLED=true`, with both pods running, and its headline sign-ups equal a hand count for the week | owed | `crates/tests/src/growth_p10_tests.rs` — two concurrent runs → one mail; a `sent` week never re-sent; a preview never cancels the scheduled mail; a manual send racing the scheduler mails once; the routes |
+| An alert fires once, mails once and clears: `digest_missing` on a day the digest is held back (red), cleared once it runs (green), with `ROOMLER__GROWTH__ALERTS=true` | owed | `crates/tests/src/growth_p10_tests.rs` — each evaluable rule fires once, a second evaluation adds nothing, the clear, a re-fire the same day mails nothing, the digest's `alerts` section |
 
 The newsletter's webhook is to be shown on production to refuse a bad signature (control),
 and to record `delivered` and `bounce` for a test send with one forced bounce, the bounced

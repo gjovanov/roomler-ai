@@ -22,7 +22,10 @@ use roomler_ai_services::dao::growth_digest::{DigestStatus, DigestStore, Exclude
 use roomler_core::growth::ExclusionSet;
 use serde::{Deserialize, Serialize};
 
-use super::digest::{self, DigestJson, DigestMailer};
+use super::{
+    digest::{self, DigestJson, DigestMailer},
+    read_key::GrowthAuth,
+};
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 
 const DEFAULT_LIST_LIMIT: i64 = 30;
@@ -52,13 +55,13 @@ pub struct DayQuery {
     pub day: Option<String>,
 }
 
-/// `GET /api/admin/growth/digest?day=`
+/// `GET /api/admin/growth/digest?day=` — a platform admin, or a read key
+/// (P10: `GrowthAuth` is the gate).
 pub async fn get_digest(
     State(state): State<AppState>,
-    auth: AuthUser,
+    _auth: GrowthAuth,
     Query(q): Query<DayQuery>,
 ) -> Result<Json<DigestJson>, ApiError> {
-    super::require_growth_admin(&state, &auth)?;
     let store = DigestStore::new(&state.db);
     let found = match q.day.as_deref() {
         Some(raw) => {
@@ -105,10 +108,9 @@ pub struct DigestListResponse {
 /// `GET /api/admin/growth/digests?since=&limit=`
 pub async fn list_digests(
     State(state): State<AppState>,
-    auth: AuthUser,
+    _auth: GrowthAuth,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<DigestListResponse>, ApiError> {
-    super::require_growth_admin(&state, &auth)?;
     let since = match q.since.as_deref() {
         Some(s) => Some(digest::day_str(
             digest::parse_day(s).map_err(ApiError::BadRequest)?,
@@ -196,10 +198,9 @@ pub struct PreviewJson {
 /// `GET /api/admin/growth/digest/preview?day=&include_internal=`
 pub async fn preview_digest(
     State(state): State<AppState>,
-    auth: AuthUser,
+    _auth: GrowthAuth,
     Query(q): Query<PreviewQuery>,
 ) -> Result<Json<PreviewJson>, ApiError> {
-    super::require_growth_admin(&state, &auth)?;
     let now = DateTime::now();
     let day = closed_day(q.day.as_deref(), now)?;
     let set = if q.include_internal {

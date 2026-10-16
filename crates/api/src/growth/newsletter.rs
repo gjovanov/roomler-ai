@@ -56,8 +56,9 @@ use super::{
         parse_day, str_of, utc_date_of,
     },
     funnel, mounted,
+    read_key::GrowthAuth,
 };
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{error::ApiError, state::AppState};
 
 /// The default range: the 90 closed days ending yesterday (an issue is
 /// never more than monthly).
@@ -524,10 +525,9 @@ pub fn rates(
 /// `GET /api/admin/growth/newsletter?since&until&include_internal`
 pub async fn get_newsletter(
     State(state): State<AppState>,
-    auth: AuthUser,
+    _auth: GrowthAuth,
     AxumQuery(q): AxumQuery<NewsletterQuery>,
 ) -> Result<Json<NewsletterReport>, ApiError> {
-    super::require_growth_admin(&state, &auth)?;
     let now = DateTime::now();
     let today = utc_date_of(now);
     let (since, until) =
@@ -537,13 +537,29 @@ pub async fn get_newsletter(
     } else {
         ExclusionSet::load(&state.core).await?
     };
+    Ok(Json(
+        compute(&state, &set, since, until, q.include_internal, now).await?,
+    ))
+}
+
+/// The report for the closed days `[since, until]` (inclusive) at `now` —
+/// what the route answers, and what P10's weekly roll-up stores for its
+/// week.
+pub async fn compute(
+    state: &AppState,
+    set: &ExclusionSet,
+    since: NaiveDate,
+    until: NaiveDate,
+    include_internal: bool,
+    now: DateTime,
+) -> Result<NewsletterReport, ApiError> {
     let (users, tenants) = set.counts();
-    let webhook_configured = webhook_on(&state);
+    let webhook_configured = webhook_on(state);
     let mut report = NewsletterReport {
         enabled: true,
         since: day_str(since),
         until: day_str(until),
-        include_internal: q.include_internal,
+        include_internal,
         excluded: ExcludedCounts {
             users: users as u32,
             tenants: tenants as u32,
@@ -559,32 +575,32 @@ pub async fn get_newsletter(
         web_truncated: false,
         account_truncated: false,
     };
-    if !mounted(&state, "saas") {
+    if !mounted(state, "saas") {
         report.not_measured = Some(NotMeasured::now("saas module not mounted"));
-        return Ok(Json(report));
+        return Ok(report);
     }
 
-    report.list = Some(read_list(&state, since, until).await?);
+    report.list = Some(read_list(state, since, until).await?);
     let (start_ms, end_ms) = day_range_ms(since, until);
-    let (issues, truncated) = read_issues(&state, start_ms, end_ms, MAX_ISSUES).await?;
+    let (issues, truncated) = read_issues(state, start_ms, end_ms, MAX_ISSUES).await?;
     report.issues_truncated = truncated;
     if issues.is_empty() {
-        return Ok(Json(report));
+        return Ok(report);
     }
 
     let ids: Vec<ObjectId> = issues.iter().map(|i| i.id).collect();
     let slugs: Vec<String> = issues.iter().map(|i| i.slug.clone()).collect();
-    let ledgers = ledger_counts(&state, &issues, now).await?;
+    let ledgers = ledger_counts(state, &issues, now).await?;
     let delivery = NewsletterSendDao::new(&state.db)
         .delivery_counts(&ids)
         .await?;
-    let via = unsubscribed_via(&state, &slugs).await?;
+    let via = unsubscribed_via(state, &slugs).await?;
 
     // The account plane: the funnel's own read of the range's sign-ups,
     // grouped by the normalised key at the campaign depth.
     let read = funnel::read(
-        &state,
-        &set,
+        state,
+        set,
         DateTime::from_millis(start_ms),
         DateTime::from_millis(end_ms),
     )
@@ -595,7 +611,7 @@ pub async fn get_newsletter(
 
     // The web plane: ONE purestat breakdown of the newsletter's own
     // traffic, by campaign, over the range.
-    let web = match web_client(&state) {
+    let web = match web_client(state) {
         Err(n) => Err(n),
         Ok(client) => {
             let (from, to) = (day_str(since), day_str(until));
@@ -661,7 +677,7 @@ pub async fn get_newsletter(
             signups,
         });
     }
-    Ok(Json(report))
+    Ok(report)
 }
 
 #[cfg(test)]

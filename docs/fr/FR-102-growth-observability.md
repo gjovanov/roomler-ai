@@ -499,6 +499,21 @@ computes the day, stores it, and emails it to the platform admins.
   querying databases by hand.
 - **A weekly roll-up.** On Mondays the digest adds the week's totals, the funnel, and from P2 the cohort
   lines.
+  *(P10 as built: the read key is a second kind of the P8 machine key (`growth_keys`, kind `read`,
+  `rgr_…`, only its SHA-256 stored), minted where the ingest key is. One rule, in two halves —
+  `read_key_gate`, a layer on the whole `/api/admin/growth` router, and the `GrowthAuth` extractor every
+  GET view names: a live read key on a GET of a data route opens exactly what a platform admin's session
+  gets there; every non-GET, the admin surface (`/keys`, `/exclusions`, session-only even on GET), an
+  ingest key, a malformed, unknown or revoked key and `growth.enabled = false` are the empty 404; each
+  use is logged with the key's prefix and the path, never the key. The weekly roll-up is its own job and
+  collection (`growth_weekly`, `_id = "YYYY-Www"`) on the digest's claim through a `Report` seam —
+  `finish` is one engine for both — computed once the clock passes Monday `digest_hour_utc` for the last
+  closed ISO week, never older; it stores the week's headline against the week before and the mean of the
+  four before, and the funnel by source, the cohort lines and WAO series, the Campaigns table by source,
+  the Channels table, the newsletter and the alerts, each through the route's own `compute`; opt-in
+  `ROOMLER__GROWTH__WEEKLY_ENABLED`, recipients the digest's. Routes `GET …/weekly?week=`, `GET
+  …/weeklies`, `POST …/weekly/run?week=&send=`. Detail:
+  [growth-observability.md](../growth-observability.md#the-read-key-the-weekly-roll-up-and-alerts-p10).)*
 
 **Alerts** (P10).
 
@@ -510,6 +525,20 @@ computes the day, stores it, and emails it to the platform admins.
   - coverage below 0.3 for 7 days;
   - a purestat, Search Console or GitHub pull failing two days running;
   - an issue's hard bounces above 5 %.
+  *(P10 as built — a smaller, documented set, each with its n floor, evaluated hourly by a host job: the
+  daily digest failed, stalled or did not run for the latest due day; a source "not measured" two
+  consecutive days while configured — the digest's purestat read, the `saas` puller's `growth_pulls`,
+  SendGrid delivery once the webhook key is set; and a spike or drop of sign-ups and of the puller's
+  daily visitors against the trailing 28 days, only at a baseline n ≥ 30 (`> mean + 3√mean` and `≥ 2×`
+  for a spike, `< mean − 3√mean` for a drop). An alert opens once — `growth_alerts` holds at most one
+  open row per `(rule, key)` through a partial unique index, which is also the arbiter between two pods
+  — clears itself when the condition goes away, and mails the digest's recipients at most once per rule
+  and key per day (a compare-and-set on the row's `mailed_on`). It shows in `GET …/alerts`, the Alerts
+  panel on the Growth page, the daily digest's `alerts` section and the weekly roll-up; `POST
+  …/alerts/evaluate?dry_run=` runs the rules on demand. The remaining rules of the list above — the
+  72-hour silence, tokens issued and never redeemed, a method's enroll rate, coverage, Search Console
+  and GitHub pulls, an issue's hard bounces — are not built; the first needs a volume the baseline
+  cannot yet carry, the last four need P7 and P9's sources.)*
 
 ### 3m. The measures, and what each is for
 
@@ -566,9 +595,10 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 | `growth_daily` | core | `_id = "<source>:<metric>:<dims>:<day>"`, `{day, source, metric, dims, value}`; upserted, frozen after 7 days | indefinitely; rows with a `tenant` dimension go with the org | the pullers, the ingest routes, fetch counters, quota collisions, the host's freeze |
 | `growth_org_daily` | core | `_id = "<tenant>:<day>"`, the §3d fields | 25 months; with the org | the host's nightly job |
 | `growth_exclusions` | core | `{kind: tenant\|user, id, reason, by, at}` | until removed | platform admins |
-| `growth_alerts` | core | `{rule, fired_at, detail, cleared_at}` | 90 days | the host's alert job |
+| `growth_alerts` | core | `{rule, key, fired_at, detail, cleared_at, mailed_on}` — `cleared_at` an explicit `null` while open; at most one open row per `(rule, key)` (a partial unique index, P10) | 90 days | the host's alert job |
 | `growth_digests` | core | `_id = "yyyy-mm-dd"`, `{status, computed_at, sent_at, recipients, sections}` | 25 months | the host's digest job |
-| `growth_keys` | core | `{kind: ingest, label, prefix, hash, created_by, created_at, revoked_at, last_used_at}` — the key's SHA-256 and a display prefix, never the key (D12, P8) | until deleted; revoked rows stay | platform admins (host routes) |
+| `growth_weekly` | core | `_id = "YYYY-Www"` (the ISO week), the digest's row shape and claim; `sections` the week's headline against the weeks before and the reports computed for that week (P10) | 25 months | the host's weekly job |
+| `growth_keys` | core | `{kind: ingest \| read, label, prefix, hash, created_by, created_at, revoked_at, last_used_at}` — the key's SHA-256 and a display prefix, never the key (D12, P8; the `read` kind P10) | until deleted; revoked rows stay | platform admins (host routes) |
 | `growth_posts` | core | `{platform, platform_id, account, format, url, published_at, key, cost_cents}`, unique `(platform, platform_id)`; no post text (P8) | indefinitely (our own content) | `saas`'s ingest route |
 | `growth_post_snapshots` | core | `{platform, platform_id, snapshot: T+1d\|T+7d\|T+28d, taken_at, metrics {raw: number}}`, unique `(platform, platform_id, snapshot)`, written once (P8) | indefinitely | `saas`'s ingest route |
 | `growth_pulls` | core | `_id = "<source>:<day>"`, `{source, day, status: ok\|failed, pulled_at, attempted_at, attempts, rows, error, missing_goal, truncated}` — whether a puller's day exists, so "not pulled" and "failed" are never read as 0 (P6) | indefinitely, like the rows it describes | the pullers (`saas`'s purestat puller from P6) |
@@ -620,7 +650,7 @@ hosted only). §7's retention list grows, and `docs/data-model.md`'s stale TTLs 
 | P7 | §3k: the Search Console, Bing and GitHub pullers, the Content table | no credential ⇒ "not measured" | — |
 | P8 | §3j: the ingest routes, the Channels table, spend | no ingest key ⇒ 404 | **live** 2026-10-15 01:23Z (`hosted-20261015-cb26a2f`): #2237 `a7b56f5df`, AC18 field-verified (§8) — the ingest key, `…/ingest/{posts,snapshots}` (`saas`), `growth_posts` / `growth_post_snapshots`, `GET …/growth/channels`, the Campaigns reach column, the Channels tab |
 | P9 | §3f: session outcomes, the frozen time-to-first-frame, crashes per version, the session carrier, the rating | `ROOMLER__GROWTH__FEEDBACK=false` hides the prompt | — |
-| P10 | §3l: the read key, the weekly roll-up, alerts | `ROOMLER__GROWTH__ALERTS=false` | — |
+| P10 | §3l: the read key, the weekly roll-up, alerts | `ROOMLER__GROWTH__ALERTS=false` and `ROOMLER__GROWTH__WEEKLY_ENABLED=false` (the defaults); a read key revoked is a 404 | **PR #2261** — the `read` key kind and the gate every growth GET passes (AC20 by the integration suite; the production check owed), `growth_weekly` and its Monday job, `growth_alerts` and the hourly rules, the Alerts panel and the Weekly tab, the digest's `alerts` section. AC20's field half, the first scheduled roll-up and a red→green `digest_missing` on production are owed after the promote with both switches on |
 | PS2, PS4–PS7 | §3n in purestat | per feature | PS2 **live** 2026-10-14 23:02Z (purestat v0.1.9, gjovanov/purestat#17); PS4 + PS5 **live** 23:21Z (v0.1.10, #15, #19); PS6 **live** 2026-10-15: the code in v0.1.9 (#16), switched on by purestat-deploy#12, and given real Google/GitHub client credentials by #13 (production's had been sealed empty since 2026-04-23); a real Google sign-in verified (§8); PS7 — |
 | P11 | docs: `docs/growth-observability.md`, which also covers the existing `/observability` (no page describes it today); the `docs/data-model.md` TTL fixes; the privacy policy; the `docs/README.md` row | — | — |
 

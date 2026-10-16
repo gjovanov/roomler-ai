@@ -32,9 +32,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     digest::{day_str, dt_ms, excluded_ids, find_docs, parse_day, utc_date_of},
+    read_key::GrowthAuth,
     value,
 };
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{error::ApiError, state::AppState};
 
 /// Cells per cohort: W0..W12.
 pub const WEEKS_SINCE: usize = 12;
@@ -196,18 +197,16 @@ pub struct CohortsQuery {
 /// `GET /api/admin/growth/cohorts?unit=week&since=&include_internal=`
 pub async fn get_cohorts(
     State(state): State<AppState>,
-    auth: AuthUser,
+    _auth: GrowthAuth,
     Query(q): Query<CohortsQuery>,
 ) -> Result<Json<CohortsReport>, ApiError> {
-    super::require_growth_admin(&state, &auth)?;
     if let Some(u) = q.unit.as_deref()
         && u != "week"
     {
         return Err(ApiError::BadRequest("unit must be week".into()));
     }
     let now = DateTime::now();
-    let today = utc_date_of(now);
-    let this_monday = week_start(today);
+    let this_monday = week_start(utc_date_of(now));
     let floor = plus_weeks(this_monday, -MAX_SINCE_WEEKS);
     let since = match q.since.as_deref() {
         Some(s) => week_start(parse_day(s).map_err(ApiError::BadRequest)?),
@@ -219,6 +218,23 @@ pub async fn get_cohorts(
     } else {
         ExclusionSet::load(&state.core).await?
     };
+    Ok(Json(
+        compute(&state, &set, since, q.include_internal, now).await?,
+    ))
+}
+
+/// The report from the Monday `since` at `now` — what the route answers,
+/// and what P10's weekly roll-up stores (the WAO series and the cohort
+/// lines as they stood the morning after the week closed).
+pub async fn compute(
+    state: &AppState,
+    set: &ExclusionSet,
+    since: NaiveDate,
+    include_internal: bool,
+    now: DateTime,
+) -> Result<CohortsReport, ApiError> {
+    let today = utc_date_of(now);
+    let this_monday = week_start(today);
     let (users, tenants) = set.counts();
     let excluded = ExcludedCounts {
         users: users as u32,
@@ -234,11 +250,11 @@ pub async fn get_cohorts(
     };
     let basis = value::value_basis(&state.modules.mounted());
     if basis.is_empty() {
-        return Ok(Json(CohortsReport {
+        return Ok(CohortsReport {
             enabled: true,
             unit: "week".into(),
             since: day_str(since),
-            include_internal: q.include_internal,
+            include_internal,
             excluded,
             weeks_since: WEEKS_SINCE,
             highlight: HIGHLIGHT,
@@ -247,7 +263,7 @@ pub async fn get_cohorts(
             cohorts: None,
             wao: None,
             org_daily,
-        }));
+        });
     }
 
     let since_dt = DateTime::from_millis(
@@ -258,7 +274,7 @@ pub async fn get_cohorts(
             .timestamp_millis(),
     );
     let orgs: Vec<(ObjectId, NaiveDate)> = find_docs(
-        &state,
+        state,
         "tenants",
         doc! { "created_at": { "$gte": since_dt }, "_id": { "$nin": excluded_ids(&set.tenants) } },
         doc! { "created_at": 1 },
@@ -290,11 +306,11 @@ pub async fn get_cohorts(
         .filter_map(|r| Some((r.tenant_id, week_start(parse_day(&r.day).ok()?))))
         .collect();
 
-    Ok(Json(CohortsReport {
+    Ok(CohortsReport {
         enabled: true,
         unit: "week".into(),
         since: day_str(since),
-        include_internal: q.include_internal,
+        include_internal,
         excluded,
         weeks_since: WEEKS_SINCE,
         highlight: HIGHLIGHT,
@@ -303,7 +319,7 @@ pub async fn get_cohorts(
         cohorts: Some(cohort_table(&orgs, &active, since, today)),
         wao: Some(wao_series(&active, today)),
         org_daily,
-    }))
+    })
 }
 
 #[cfg(test)]

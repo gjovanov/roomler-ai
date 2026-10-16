@@ -511,6 +511,21 @@ pub struct GrowthSettings {
     /// kill switch. Env: `ROOMLER__GROWTH__INSTALL_COUNTERS`.
     #[serde(default = "growth_default_on")]
     pub install_counters: bool,
+    /// P10 — the weekly roll-up job: once the clock passes Monday
+    /// `digest_hour_utc`, the past ISO week (Mon–Sun, UTC) is computed,
+    /// stored in `growth_weekly` and mailed once to the digest's recipients.
+    /// Default **off**, for the digest's reason. Env:
+    /// `ROOMLER__GROWTH__WEEKLY_ENABLED`.
+    #[serde(default)]
+    pub weekly_enabled: bool,
+    /// P10 — the alert rules (`docs/growth-observability.md`, alerts): an
+    /// hourly host job that opens a `growth_alerts` row when a rule fires,
+    /// mails the digest's recipients at most once per rule per day, and
+    /// clears the row when the condition goes away. Default **off**: the
+    /// rules read this server's own numbers, but a self-hosted server never
+    /// starts mailing its admins unasked. Env: `ROOMLER__GROWTH__ALERTS`.
+    #[serde(default)]
+    pub alerts: bool,
 }
 
 fn growth_default_on() -> bool {
@@ -535,6 +550,8 @@ impl Default for GrowthSettings {
             purestat_url: growth_default_purestat_url(),
             purestat_api_key: String::new(),
             install_counters: true,
+            weekly_enabled: false,
+            alerts: false,
         }
     }
 }
@@ -1437,6 +1454,12 @@ mod growth_settings_tests {
         let absent: GrowthSettings = toml::from_str("").expect("every key defaults");
         assert!(!absent.digest_enabled);
         assert!(absent.enabled);
+        // P10 — the weekly roll-up and the alerts ship OFF too, and read
+        // from a file as they do from the env.
+        assert!(!d.weekly_enabled && !d.alerts);
+        assert!(!absent.weekly_enabled && !absent.alerts);
+        let p10: GrowthSettings = toml::from_str("weekly_enabled = true\nalerts = true").unwrap();
+        assert!(p10.weekly_enabled && p10.alerts);
         // P3 — the fetch counters are on unless switched off; the switch
         // reads from a file as it does from the env.
         assert!(d.install_counters && absent.install_counters);
