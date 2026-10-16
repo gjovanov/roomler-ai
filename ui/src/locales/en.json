@@ -351,9 +351,34 @@
       "adoptedStays": "A session adopted from a terminal stays where it runs.",
       "outcome": {
         "promoting": "Moving: the device is ready, and the one it runs on is finishing its turn.",
+        "teleporting": "Moving: the device is taking its copy while the session still runs.",
         "pending": "Asked: the device has not answered yet. Its room says how it goes on."
       },
-      "refused": "The move was refused: {reason}"
+      "refused": "The move was refused: {reason}",
+      "actions": {
+        "move": "Move",
+        "teleport": "Move elsewhere",
+        "fork": "Fork"
+      },
+      "teleportExplain": "Moves it to a device that holds no copy: that device takes one while the session still runs, then it moves there as a move to a copy does. The device it runs on must be online.",
+      "noTeleport": "No other online device that runs sessions can take it.",
+      "forkExplain": "Makes a new session from this one's conversation, in a folder of its own. This session goes on as it is.",
+      "forkFromCopy": "{device} · from its copy",
+      "forkTakesCopy": "{device} · takes a copy first",
+      "forkFolder": "Folder for the fork",
+      "forkFolderHint": "Its own folder on that device: a fork cannot share the folder the session runs in.",
+      "forkName": "Name (optional)",
+      "forkNameDefault": "Fork of {title}",
+      "fork": "Fork",
+      "noFork": "No online device that runs sessions can make a fork.",
+      "adoptedNoFork": "A session adopted from a terminal is not forked.",
+      "forkWhileMoving": "It is being moved: fork it once it settles.",
+      "forkOutcome": {
+        "accepted": "Forked: the new session starts on that device.",
+        "pending": "Asked: the device has not answered yet. The fork's room says how it goes on.",
+        "joining": "Forking: the device is taking a copy first."
+      },
+      "openFork": "Open the fork's room"
     },
     "memory": {
       "title": "Agent memory",
