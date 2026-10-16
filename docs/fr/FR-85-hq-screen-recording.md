@@ -20,9 +20,9 @@ what it costs in installer size and ships with integration and e2e tests.
   (`crates/remote_control/src/permissions.rs:21`) and already in `requires_consent_prompt()`, but nothing in `agents/`,
   `crates/modules/` or `ui/src/` uses it. `RemoteSession.recording_url` is always `None`. `docs/remote-control.md`
   §11.3 (`:679`) promises a banner that cannot be dismissed and a red tray dot while recording; neither exists.
-- ⚠️ **Any tab can already request RECORD.** `resolve_session_authz` (`crates/modules/remote/src/controller.rs:375`)
+- ⚠️ **Any tab can already request RECORD.** `resolve_session_authz` (`crates/modules/remote/src/controller.rs:381`)
   never reads the requested permissions, and `Hub::create_session` narrows only INPUT
-  (`crates/modules/fleet/src/hub.rs:1053-850`). Harmless today because no agent honours the bit. It stops being harmless
+  (`crates/modules/fleet/src/hub.rs:1061-858`). Harmless today because no agent honours the bit. It stops being harmless
   the day one does, so the strip ships before the agent learns the bit (P3).
 - **Recording what the viewer receives would not be HQ.** The live stream is rate-controlled to the network
   (FR-62/63/79) and its capture is capped by the live plan (`agents/roomlerd/src/peer.rs` `set_output_cap`), so the
@@ -190,7 +190,7 @@ Each refusal carries a named reason on the wire and in the UI.
 1. **Server authorization.** A new role bit `RECORD_REMOTE_SCREEN` (bit 31: `role.rs` `NAMED`, an `ALL` bump, in no
    managed row below ADMINISTRATOR; the UI mirror is `2 ** 31`, because `1 << 31` is negative in JavaScript).
    `resolve_session_authz` computes `SessionAuthz.may_record` — owner, ADMINISTRATOR or the role bit — and it is
-   **false whenever `override_reason` is set**. Break-glass forces `ConsentMode::Auto` (`controller.rs:453`); allowed to
+   **false whenever `override_reason` is set**. Break-glass forces `ConsentMode::Auto` (`controller.rs:465`); allowed to
    record, it would be covert monitoring, which §11.4 rules out.
 2. **Hub strip.** RECORD survives `create_session` only if `may_record` and the agent advertises
    `AgentCaps.record ∋ "remote"` — a new typed capability list in the `RpcCap` style (variant → `wire()` → `ALL`,
@@ -198,7 +198,7 @@ Each refusal carries a named reason on the wire and in the UI.
    RECORD never reaches one.
 3. **Device gate.** `record_remote_enabled` and `record_remote_audio`, both default **OFF**, device-owned and
    **structurally absent from `DesiredConfig`** — a `record_` twin of `no_relay_key_is_server_pushable_via_desired_config`
-   (`crates/remote_control/src/models.rs:4283`). Capabilities are read once at hello, so ON takes effect at the next
+   (`crates/remote_control/src/models.rs:4310`). Capabilities are read once at hello, so ON takes effect at the next
    connect; **OFF is immediate** — new starts are refused and a running remote recording stops.
 4. **A `record` DataChannel**, attached only when the grant holds RECORD — the same attach-time gate as `files` and
    `input`. The control channel carries no permission context, so it cannot host this. Messages:

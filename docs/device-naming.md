@@ -23,7 +23,7 @@ someone has named a device, the machine-reported name is usually noise.
 
 | Surface | Where the checkbox is | What it hides |
 |---|---|---|
-| Devices grid (`/tenant/{tid}/device`) | the column picker (`AgentsSection.vue:1036`) | the fleet name in the Name cell's caption line (`:340`) |
+| Devices grid (`/tenant/{tid}/device`) | the column picker (`AgentsSection.vue:1066`) | the fleet name in the Name cell's caption line (`:340`) |
 | Remote control (`/tenant/{tid}/agent/{id}/remote`) | Settings › Display (`RemoteControl.vue:1269`) | the fleet name in the header subtitle, before OS · version (`:36`) |
 
 Both surfaces use the same composable (`ui/src/composables/useHideDeviceName.ts:48`),
@@ -43,7 +43,7 @@ equal.
 `display_name` still never enters the netmap, so `PeerInfo.name` — the NAME
 `roomler peers` prints — is the MagicDNS label, and neither resolver a typed
 selector reaches knows a display name: the server's exec/SSH target resolver
-(`crates/modules/fleet/src/socket.rs:1034` `resolve_exec_target`: hex id → exact
+(`crates/modules/fleet/src/socket.rs:1045` `resolve_exec_target`: hex id → exact
 `agents.name` → case-insensitive `agents.name`) or the daemon's ping resolver
 (`agents/roomlerd/src/localapi_state.rs:485` `resolve_overlay`: literal address
 → mesh label, whole or first label). The CLI closes the gap **on the client**,

@@ -306,6 +306,33 @@ CI's clippy lines pass on Linux, and so does the Windows build with the overlay,
 - a re-offer overwriting the first decision: the re-offer test fails;
 - the LocalAPI's console gate removed: the gate test fails.
 
+**As built, P3b (the server's ask, 2026-10-16, #2280):** an admin may ask for stricter, never looser.
+
+| Piece | What it does |
+|---|---|
+| `AccessPolicy.lock_on_end` | `auto` · `always`; `never` or unset asks nothing (`AccessPolicy::lock_on_end_ask`, `crates/remote_control/src/models.rs`). Set by a `MANAGE_AGENTS` admin from the device row. An unknown value reads as `always`, as `LockOnEnd` reads one everywhere |
+| The gate | `resolve_session_authz` reads it on every allowed path, the owner and break-glass included: it describes the device, not who is asking (`crates/modules/remote/src/controller.rs`). The cross-pod relay carries it (`lock_ask_from_relay`, `relay.rs`); an older origin pod's body asks nothing |
+| The hub | sends `Request.lock_on_end` only to an agent advertising `lock-on-end` (`honours_lock_on_end`, from the hello's and each heartbeat's caps). The `session_requested` audit row records `lock_on_end` and `lock_enforced` (`crates/modules/fleet/src/hub.rs`) |
+| The agent | advertises `lock-on-end` only where the lock can be lifted remotely afterwards: the Windows service and the Linux root daemon (`can_honour_ask`). It keeps the ask with the session's metadata, hands it to a service install's worker in `SessionParams`, and registers it as the session goes live; `session_started` then decides under `effective_policy`, the stricter of the ask and the owner's own (`agents/roomlerd/src/lock_on_end.rs`) |
+| The viewer | **Lock when sessions end** on the device row, both layouts, saved with the access policy (`ui/src/components/admin/AgentsSection.vue`) |
+
+⚠️ **A per-user install never takes an ask.** Its worker cannot reach the secure desktop, so a lock an admin
+asked for would leave every later session at a padlock no session can lift: a mesh feature costing the
+operator remote access to the box. The owner's own `lock_on_end` stays theirs there.
+
+Tests: the policy's old rows, `null` and `never` asking nothing, and an ask's round trip; the ask on the
+wire (skipped when absent, its spellings, an older frame, an unknown value as `always`); the relay (as
+asked, an older origin asking nothing); the agent (`effective_policy` cell by cell, an ask taken once at
+the session's start); and the integration cell `the_lock_ask_reaches_only_a_device_that_honours_it`
+through the real gate and hub (honoured: sent and enforced; not honoured: not sent, not enforced; `never`:
+nothing). **Negative controls**, each restored afterwards:
+- `effective_policy` ignoring the ask: the agent's table fails (`Never` where `Auto` was due);
+- the relay dropping every ask: its test fails (`None` for `auto`);
+- `never` read as an ask: the policy test fails (`Some(Never)`);
+- the hub sending the ask to every agent: the integration cell fails where the device that does not honour
+  it must receive nothing;
+- the gate never reading the policy: the cell fails where the honouring device must be sent `always`.
+
 ### 3f. Host mute
 
 **P0 measures** whether WASAPI loopback still captures with the render endpoint muted. StarDesk's own help
@@ -324,9 +351,9 @@ says muting the host silences the client too. The FR ships only the honest versi
 | P1c | The viewer: the toggle, the refusal reasons, asking for `PRIVACY` only from a device that serves it (§3c as built) | the toggle | **merged** #2199 (`f9a66a01e`): `usePrivacyMode.spec.ts` (11), the vitest suite and `vue-tsc`. **Field-verified** (§8 rows 9–10): the toggle reaches the curtain through the channel on agent 0.4.136 |
 | P1d | The device's account (§3c as built): `rc:privacy.activity`, the `privacy_activity` claims collection and its route, the ledger that lets the next process report a curtain this one died holding (`worker_exit`) | none needed: an older server drops the frame, an older agent sends none | **#2258**: unit, channel and integration tests with four negative controls (§3c). The field cell for AC4 (`taskkill /F` on a curtained worker) waits for the first agent release that carries it |
 | P2 | The input block, if P0 cleared it | `privacy_input_block=false` | — |
-| P3 | Lock on end (Windows, Linux, macOS), in two steps below | `lock_on_end=never` | P3a #2272 in review; P3b after it |
-| P3a | The device's own `lock_on_end`: the decision at each session's start, the lock at the last end, Windows and Linux (§3e as built) | `lock_on_end=never` (default) | **#2272**: unit tests in four crates. P0's mechanism and AC7's red are field-recorded (§8 rows 11–12). The green waits for the first agent release that carries it |
-| P3b | The server's half: an admin may ask a device's sessions for stricter (`AccessPolicy`, forwarded on `rc:request`), never looser, and the device row's control | `none` | — |
+| P3 | Lock on end (Windows, Linux, macOS), in two steps below | `lock_on_end=never` | P3a merged; P3b #2280 |
+| P3a | The device's own `lock_on_end`: the decision at each session's start, the lock at the last end, Windows and Linux (§3e as built) | `lock_on_end=never` (default) | **#2272** merged `544bf0ec1`: unit tests in four crates. P0's mechanism and AC7's red are field-recorded (§8 rows 11–12). The green waits for the first agent release that carries it |
+| P3b | The server's half: an admin may ask a device's sessions for stricter (`AccessPolicy`, forwarded on `rc:request`), never looser, and the device row's control (§3e as built) | the admin's `never` or unset: nothing is asked | **#2280**: unit tests in four crates and an integration cell through the real gate and hub. AC9 is its field cell, on the release that carries it |
 | P4 | Host mute | the toggle | — |
 | P5 | Docs and the field table | — | **#2240** (first part): `docs/privacy-mode.md` documents what P1 built. That covers the two parties who must agree, the request's sequence (mermaid), the server's strip reasons and the device's four gates, how the curtain works, the per-OS table and the honest limits. It is linked from `docs/README.md` and from `remote-control.md` §11.2. AC8 stays open until the page can show the block and Ctrl+Alt+Del as the way out, which wait for P2 |
 
@@ -374,6 +401,11 @@ says muting the host silences the client too. The FR ships only the honest versi
 - [ ] **AC8:** **Docs:** a `docs/privacy-mode.md` page with a mermaid diagram of the curtain, the block and
   the way out, the per-OS table, and the honest limits (secure desktop, macOS), linked from
   `docs/README.md`. `docs/remote-control.md`'s consent section links it.
+- [ ] **AC9 (the server's ask, P3b):** on a vmtest Win11 service install whose owner left `lock_on_end` at
+  `never`, an admin's **Lock: always** on the device row locks the guest when the session ends
+  (`Get-Process LogonUI`), and the request's `session_requested` audit row reads `lock_on_end: always`,
+  `lock_enforced: true`. Red first: the same run against an agent without P3b leaves the guest unlocked,
+  and the row reads `lock_enforced: false`.
 
 ## 6. Decisions
 

@@ -220,6 +220,12 @@ pub struct SessionParams {
     /// field) never ends a session as idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_secs: Option<u32>,
+    /// FR-99 P3b — the device policy's lock ask (`Request.lock_on_end`). The
+    /// worker takes it into the lock decision: the session goes live, and
+    /// ends, in its process. `None` (nothing asked, or a daemon older than
+    /// the field) leaves the owner's own `lock_on_end`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_on_end: Option<roomler_ai_remote_control::models::LockOnEnd>,
 }
 
 /// FR-85 P1e-mac — what a delegated session's `record` channel needs, carried
@@ -1879,6 +1885,7 @@ mod params_tests {
             record: None,
             rc_overlay: None,
             idle_secs: None,
+            lock_on_end: None,
         };
         let wire = serde_json::to_string(&DelegateFrame::SessionParams(Box::new(params)))
             .expect("serialises");
@@ -1919,6 +1926,7 @@ mod params_tests {
             record: None,
             rc_overlay: None,
             idle_secs: None,
+            lock_on_end: None,
         };
         let track = serde_json::to_string(&p).unwrap();
         p.transport = Some("data-channel-h264".into());
@@ -1944,6 +1952,7 @@ mod params_tests {
             record: None,
             rc_overlay: None,
             idle_secs: None,
+            lock_on_end: None,
         }
     }
 

@@ -88,6 +88,78 @@ pub fn device_policy() -> LockOnEnd {
     }
 }
 
+// ── The server's ask (P3b) ──────────────────────────────────────────────────
+
+/// Whether a server's ask may reach this install, so whether it advertises
+/// `lock-on-end`: it has a way to lock, AND the lock can be lifted remotely
+/// afterwards. That is the Windows service (its worker is SYSTEM in the
+/// console session and reaches the secure desktop) and the Linux root daemon.
+/// A per-user install's worker cannot reach the secure desktop, so a lock an
+/// admin asked for would leave every later session at a padlock nobody can
+/// lift remotely: such an install never advertises it, and the audit records
+/// the ask as not enforced. The owner's own `lock_on_end` stays theirs on any
+/// install. Read once per process.
+pub fn can_honour_ask() -> bool {
+    static CAN: OnceLock<bool> = OnceLock::new();
+    *CAN.get_or_init(system_install)
+}
+
+#[cfg(all(target_os = "windows", feature = "system-context"))]
+fn system_install() -> bool {
+    use crate::system_context::worker_role::{WorkerRole, probe_self};
+    matches!(probe_self(), Ok(WorkerRole::SystemContext))
+}
+
+#[cfg(all(target_os = "windows", not(feature = "system-context")))]
+fn system_install() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn system_install() -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn system_install() -> bool {
+    false
+}
+
+/// The policy a session runs under: the owner's own, or stricter where the
+/// device's access policy asked for stricter (`Request.lock_on_end`). Never
+/// looser: the owner's setting is the floor.
+pub fn effective_policy(device: LockOnEnd, ask: Option<LockOnEnd>) -> LockOnEnd {
+    ask.map_or(device, |a| device.stricter(a))
+}
+
+/// Each session's ask, from its request until it goes live.
+fn asks() -> &'static Mutex<HashMap<ObjectId, LockOnEnd>> {
+    static ASKS: OnceLock<Mutex<HashMap<ObjectId, LockOnEnd>>> = OnceLock::new();
+    ASKS.get_or_init(Default::default)
+}
+
+/// Record a session's ask before it goes live. `None` asks nothing, and
+/// forgets an earlier ask for the same session.
+pub fn set_session_ask(session: ObjectId, ask: Option<LockOnEnd>) {
+    let mut a = asks().lock().unwrap_or_else(|p| p.into_inner());
+    match ask {
+        Some(l) => {
+            a.insert(session, l);
+        }
+        None => {
+            a.remove(&session);
+        }
+    }
+}
+
+fn take_session_ask(session: &ObjectId) -> Option<LockOnEnd> {
+    asks()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(session)
+}
+
 // ── Which end locks ─────────────────────────────────────────────────────────
 
 /// The live sessions and their decisions, and whether an end since the last
@@ -150,16 +222,18 @@ fn tracker() -> &'static Tracker {
 
 // ── The production hooks (the indicator's show and hide) ────────────────────
 
-/// The session went live: read the policy, and what `auto` needs, now.
+/// The session went live: read the policy (the owner's, made stricter by the
+/// session's ask, if any), and what `auto` needs, now.
 pub fn session_started(session: ObjectId) {
-    let policy = device_policy();
+    let ask = take_session_ask(&session);
+    let policy = effective_policy(device_policy(), ask);
     let found = if policy == LockOnEnd::Auto {
         probe_found()
     } else {
         Found::default()
     };
     if policy != LockOnEnd::Never {
-        info!(%session, ?policy, locked = found.locked, unattended = found.unattended,
+        info!(%session, ?policy, ?ask, locked = found.locked, unattended = found.unattended,
             locks_at_end = wants_lock(policy, found), "lock_on_end: decided at the session's start");
     }
     tracker().started(session, policy, found);
@@ -169,6 +243,8 @@ pub fn session_started(session: ObjectId) {
 /// session and the decisions say so, on a thread of its own: the OS call may
 /// take a moment, and the session's teardown must not wait on it.
 pub fn session_ended(session: ObjectId) {
+    // An ask for a session that ended before it went live goes with it.
+    let _ = take_session_ask(&session);
     if tracker().ended(&session) {
         std::thread::spawn(move || match lock_now() {
             Ok(()) => {
@@ -183,6 +259,7 @@ pub fn session_ended(session: ObjectId) {
 
 /// A session that never went live (its answer never left).
 pub fn session_aborted(session: ObjectId) {
+    let _ = take_session_ask(&session);
     tracker().forget(&session);
 }
 
@@ -380,5 +457,46 @@ mod tests {
         assert_eq!(device_policy(), LockOnEnd::Auto);
         set_device_policy(LockOnEnd::Never);
         assert_eq!(device_policy(), LockOnEnd::Never);
+    }
+
+    /// P3b — the server's ask tightens the owner's policy and never loosens
+    /// it: the owner's setting is the floor.
+    #[test]
+    fn an_ask_can_only_tighten_the_owners_policy() {
+        use LockOnEnd::*;
+        for (device, ask, want) in [
+            (Never, None, Never),
+            (Never, Some(Auto), Auto),
+            (Never, Some(Always), Always),
+            (Auto, None, Auto),
+            (Auto, Some(Never), Auto),
+            (Auto, Some(Always), Always),
+            (Always, Some(Never), Always),
+            (Always, Some(Auto), Always),
+        ] {
+            assert_eq!(
+                effective_policy(device, ask),
+                want,
+                "device {device:?}, ask {ask:?}"
+            );
+        }
+    }
+
+    /// P3b — a session's ask waits for its start and is taken there once; a
+    /// `None` forgets an earlier one.
+    #[test]
+    fn a_sessions_ask_is_taken_once() {
+        let s = ObjectId::new();
+        set_session_ask(s, Some(LockOnEnd::Always));
+        assert_eq!(take_session_ask(&s), Some(LockOnEnd::Always));
+        assert_eq!(take_session_ask(&s), None, "taken once");
+        set_session_ask(s, Some(LockOnEnd::Auto));
+        set_session_ask(s, None);
+        assert_eq!(take_session_ask(&s), None, "a None forgets it");
+        // Another session's ask is its own.
+        let t = ObjectId::new();
+        set_session_ask(t, Some(LockOnEnd::Auto));
+        assert_eq!(take_session_ask(&s), None);
+        assert_eq!(take_session_ask(&t), Some(LockOnEnd::Auto));
     }
 }

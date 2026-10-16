@@ -453,6 +453,13 @@ whose grant held `PRIVACY`.
 - A reason must be a short code. Free text from a host that may be compromised is dropped, and the
   row is kept without it.
 
+**An admin's lock ask is the server's decision** (FR-99 P3b,
+[privacy-mode.md](privacy-mode.md#an-admin-can-ask-for-stricter-p3b)). `session_requested` records
+what the device's access policy asked of the session's end (`lock_on_end`) and whether the device
+honours an ask (`lock_enforced`). The ask can only make the owner's own `lock_on_end` stricter, and
+only an install that can lift the lock remotely takes one, so it can never cost an operator remote
+access to a per-user install.
+
 ---
 
 ## 5 · Network-facing surfaces
