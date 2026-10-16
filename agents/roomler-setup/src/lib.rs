@@ -20,6 +20,9 @@
 #![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
 
 pub mod commands;
+/// FR-102 P3b — the opt-in setup diagnostics: the recorder, its gate, the
+/// buffer until the server is known, and the fire-and-forget sender.
+pub mod diagnostics;
 pub mod orchestrator_agent;
 pub mod orchestrator_tunnel;
 pub mod proxy;

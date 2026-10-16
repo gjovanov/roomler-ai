@@ -59,6 +59,12 @@ const state = {
                        // WizardState, so a relaunch re-derives it from the
                        // role instead of replaying a stale click.
   anchorSkipReason: null, // FR-104: why the anchor step did not anchor
+  diagOptIn: false,    // FR-102 P3b: the Welcome page's diagnostics box.
+                       // Memory only — deliberately NOT in the persisted
+                       // WizardState and never defaulted from an earlier
+                       // run: unticked is the default, every launch.
+  pageEnteredAt: 0,    // performance.now() when the current page was shown;
+                       // a page boundary's elapsed_ms is measured from it.
 };
 
 // Checklist rows keyed by event type — replay + live events render
@@ -132,6 +138,7 @@ async function probeAndRender() {
     state.device = await invoke("cmd_default_device_name");
   }
 
+  state.pageEnteredAt = performance.now();
   render();
 }
 
@@ -190,8 +197,39 @@ function renderStepIndicator() {
 
 async function gotoStep(name) {
   state.step = name;
+  state.pageEnteredAt = performance.now();
   await persistState();
   render();
+}
+
+// ─── FR-102 P3b: opt-in setup diagnostics ──────────────────────────────────
+
+// A page boundary: `welcome` / `server` / `token` with `ok` (Continue) or
+// `cancelled` (Cancel), and the time spent on the page. The Rust recorder is
+// the gate — it drops everything while the box is unticked and buffers until
+// cmd_install names the server — so this is only ever a report, never a
+// send, and it can never fail the wizard (the invoke's error is swallowed).
+async function pageBoundary(step, outcome) {
+  if (!state.diagOptIn) return;
+  const elapsedMs = Math.max(0, Math.round(performance.now() - state.pageEnteredAt));
+  try {
+    await invoke("cmd_diagnostics_page", { step, outcome, elapsedMs });
+  } catch (err) {
+    console.warn("[diagnostics] page boundary not recorded:", err);
+  }
+}
+
+async function setDiagOptIn(enabled) {
+  state.diagOptIn = enabled;
+  try {
+    await invoke("cmd_diagnostics_opt_in", { enabled });
+  } catch (err) {
+    console.warn("[diagnostics] opt-in not recorded:", err);
+    // The recorder never heard the tick, so nothing is sent — the honest
+    // state to show is unticked.
+    state.diagOptIn = false;
+    document.getElementById("diag-opt-in").checked = false;
+  }
 }
 
 // ─── Role helpers ──────────────────────────────────────────────────────────
@@ -234,9 +272,19 @@ function overlayChecked(role, choice) {
 // ─── Step 1: Welcome ────────────────────────────────────────────────────────
 
 function wireWelcome() {
-  document.getElementById("welcome-cancel").addEventListener("click", exitWizard);
+  document.getElementById("welcome-cancel").addEventListener("click", async () => {
+    // FR-102 P3b: a cancel before any server is known is buffered in the
+    // recorder and dies with the process — nothing is sent anywhere.
+    await pageBoundary("welcome", "cancelled");
+    await exitWizard();
+  });
   document.getElementById("welcome-continue").addEventListener("click", async () => {
+    await pageBoundary("welcome", "ok");
     await gotoStep("server");
+  });
+  // FR-102 P3b: the diagnostics box — memory only, reported to the recorder.
+  document.getElementById("diag-opt-in").addEventListener("change", async (e) => {
+    await setDiagOptIn(e.target.checked);
   });
   document.querySelectorAll("input[name='role']").forEach((radio) => {
     radio.addEventListener("change", (e) => {
@@ -319,6 +367,12 @@ function renderWelcome() {
   // Continue button gate.
   const canContinue = state.role !== null && (warning === null || state.roleAck);
   document.getElementById("welcome-continue").disabled = !canContinue;
+
+  // FR-102 P3b: the box shows the in-memory state (unticked on every
+  // launch) and names the server the diagnostics would go to — the one the
+  // enrollment goes to, as the Server page currently has it.
+  document.getElementById("diag-opt-in").checked = state.diagOptIn;
+  document.getElementById("diag-server").textContent = state.server || "https://roomler.ai";
 }
 
 function crossFlavourWarning(agentDetect, flavour) {
@@ -347,6 +401,7 @@ function wireServer() {
     state.server = document.getElementById("server-url").value.trim();
     state.device = document.getElementById("device-name").value.trim();
     await persistState();
+    await pageBoundary("server", "ok");
     await gotoStep("token");
   });
   document.getElementById("server-url").addEventListener("input", () => {
@@ -411,6 +466,9 @@ function wireToken() {
     await gotoStep("server");
   });
   document.getElementById("token-continue").addEventListener("click", async () => {
+    // FR-102 P3b: the token page is passed once, here; a Retry from the
+    // Install page re-runs the pipeline, not this boundary.
+    await pageBoundary("token", "ok");
     await runInstall();
   });
   let debounce;

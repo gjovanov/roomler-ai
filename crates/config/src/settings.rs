@@ -511,6 +511,21 @@ pub struct GrowthSettings {
     /// kill switch. Env: `ROOMLER__GROWTH__INSTALL_COUNTERS`.
     #[serde(default = "growth_default_on")]
     pub install_counters: bool,
+    /// P3b — accept the setup wizard's opt-in diagnostics at
+    /// `POST /api/setup/diagnostics` (`docs/growth-observability.md`, the
+    /// install trace). Default **on**, for `install_counters`'s reason: the
+    /// rows are this server's own — a self-hosted server receives its own
+    /// wizards' and sends them nowhere — they exist only when the person
+    /// ticked the box in the wizard, and they carry a random run id and
+    /// codes, never an address, a User-Agent, a name or a path. The three
+    /// jobs that default OFF (`digest_enabled`, `weekly_enabled`, `alerts`)
+    /// are off because they MAIL people; this writes a row the admin asked
+    /// the wizard to send. `false` is the kill switch: the route answers
+    /// the empty 404 of a path that does not exist, and the wizard treats
+    /// that like any other failure — silently. Env:
+    /// `ROOMLER__GROWTH__SETUP_DIAGNOSTICS`.
+    #[serde(default = "growth_default_on")]
+    pub setup_diagnostics: bool,
     /// P10 — the weekly roll-up job: once the clock passes Monday
     /// `digest_hour_utc`, the past ISO week (Mon–Sun, UTC) is computed,
     /// stored in `growth_weekly` and mailed once to the digest's recipients.
@@ -550,6 +565,7 @@ impl Default for GrowthSettings {
             purestat_url: growth_default_purestat_url(),
             purestat_api_key: String::new(),
             install_counters: true,
+            setup_diagnostics: true,
             weekly_enabled: false,
             alerts: false,
         }
@@ -1465,6 +1481,12 @@ mod growth_settings_tests {
         assert!(d.install_counters && absent.install_counters);
         let off: GrowthSettings = toml::from_str("install_counters = false").unwrap();
         assert!(!off.install_counters);
+        // P3b — the wizard's opt-in diagnostics are accepted unless switched
+        // off (the same reason as the counters: the rows are the server's
+        // own, opt-in at the source, and name nobody).
+        assert!(d.setup_diagnostics && absent.setup_diagnostics);
+        let off: GrowthSettings = toml::from_str("setup_diagnostics = false").unwrap();
+        assert!(!off.setup_diagnostics);
         let set: GrowthSettings = toml::from_str(
             "digest_enabled = true\ndigest_hour_utc = 7\ndigest_to = \" a@x.test, ,b@x.test \"\npurestat_api_key = \"k\"",
         )

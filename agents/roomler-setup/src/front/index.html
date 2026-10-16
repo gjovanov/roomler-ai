@@ -86,6 +86,21 @@
         </div>
       </div>
 
+      <!-- FR-102 P3b: opt-in setup diagnostics. Unticked by default, held in
+           JS memory for this run only (never in the persisted WizardState,
+           never restored from an earlier run). The server named here is the
+           one the enrollment goes to; it follows the Server page's field. -->
+      <div class="card">
+        <label class="field checkline">
+          <input id="diag-opt-in" type="checkbox">
+          <span>Send anonymous setup diagnostics to
+            <code id="diag-server">https://roomler.ai</code></span>
+        </label>
+        <p class="muted">One record per step: which step, whether it passed, how long it
+        took and an error code — never the token, a name, a path or an address. Nothing
+        is sent unless you tick this, and it is not remembered for the next run.</p>
+      </div>
+
       <footer class="actions">
         <button id="welcome-cancel" class="secondary">Cancel</button>
         <button id="welcome-continue" disabled>Continue →</button>

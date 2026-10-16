@@ -522,6 +522,88 @@ pub async fn freeze_billing_months(
     Ok(roomler_ai_services::billing::freeze_closed_months(&state.db, &excluded, now).await?)
 }
 
+/// P3b — freeze the wizard's opt-in step diagnostics of the last
+/// [`RECOMPUTE_DAYS`] closed days into `growth_daily`
+/// (`install:wizard_step:{step, outcome, os}`, the value the number of
+/// DISTINCT runs), so the counts outlive the 90-day `setup_diagnostics`
+/// rows the way the fetch counters do. Idempotent per day
+/// ([`GrowthDao::replace_daily`]: an unchanged row is left alone, a day
+/// with no runs ends with no rows, never zeros). The collection is the
+/// `fleet` module's, so without it there is nothing to freeze. Runs under
+/// the same nightly claim as the org-day fold. Returns the days whose rows
+/// changed.
+pub async fn freeze_setup_diagnostics(
+    state: &AppState,
+    now: DateTime,
+) -> Result<Vec<String>, GrowthError> {
+    use roomler_ai_remote_control::setup_diagnostics::{Outcome, Step};
+    use roomler_ai_services::dao::{
+        growth::{INSTALL_SOURCE, INSTALL_WIZARD_STEP_METRIC, daily_row},
+        setup_diagnostics::SetupDiagnosticsDao,
+    };
+
+    if !mounted(state, "fleet") {
+        return Ok(Vec::new());
+    }
+    let dao = SetupDiagnosticsDao::new(&state.db);
+    let growth = GrowthDao::new(&state.db);
+    let (from, to) = due_range(now);
+    let mut changed = Vec::new();
+    let mut day = from;
+    while day <= to {
+        let start = DateTime::from_millis(
+            day.and_hms_opt(0, 0, 0)
+                .expect("midnight exists")
+                .and_utc()
+                .timestamp_millis(),
+        );
+        let end = DateTime::from_millis(start.timestamp_millis() + 86_400_000);
+        let rows = dao.rows_between(start, end).await?;
+        // Distinct runs per (step, outcome, os): a retry re-passing a step
+        // is one run, and a spelling this build does not know is skipped.
+        let mut runs: BTreeMap<(String, String, String), HashSet<&str>> = BTreeMap::new();
+        for r in &rows {
+            if Step::parse(&r.step).is_none() || Outcome::parse(&r.outcome).is_none() {
+                continue;
+            }
+            runs.entry((r.step.clone(), r.outcome.clone(), r.os.clone()))
+                .or_default()
+                .insert(r.run.as_str());
+        }
+        let label = day_str(day);
+        let frozen: Vec<_> = runs
+            .into_iter()
+            .map(|((step, outcome, os), set)| {
+                let dims = BTreeMap::from([
+                    ("step".to_string(), step),
+                    ("outcome".to_string(), outcome),
+                    ("os".to_string(), os),
+                ]);
+                daily_row(
+                    INSTALL_SOURCE,
+                    INSTALL_WIZARD_STEP_METRIC,
+                    dims,
+                    &label,
+                    set.len() as i64,
+                )
+            })
+            .collect();
+        let counts = growth
+            .replace_daily(
+                INSTALL_SOURCE,
+                &label,
+                &[INSTALL_WIZARD_STEP_METRIC],
+                &frozen,
+            )
+            .await?;
+        if counts.written > 0 || counts.pruned > 0 {
+            changed.push(label);
+        }
+        day = day.succ_opt().expect("a next day exists");
+    }
+    Ok(changed)
+}
+
 /// The scheduler. Only with `growth.enabled`; one run per UTC day per
 /// cluster (the Redis claim) or per pod (no Redis).
 pub fn spawn_org_daily_loop(state: AppState) {
@@ -568,6 +650,14 @@ pub fn spawn_org_daily_loop(state: AppState) {
                         }
                         Ok(_) => {}
                         Err(e) => warn!(%e, "growth billing freeze failed"),
+                    }
+                    // P3b — the wizard's opt-in step counts, per closed day.
+                    match freeze_setup_diagnostics(&state, now).await {
+                        Ok(days) if !days.is_empty() => {
+                            info!(days = ?days, "growth wizard step counts frozen")
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!(%e, "growth wizard step freeze failed"),
                     }
                 }
             }

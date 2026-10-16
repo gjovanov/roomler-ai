@@ -58,6 +58,12 @@ pub const GROWTH_DAILY: &str = "growth_daily";
 /// and the digest must read the rows whether or not that module is compiled.
 pub const INSTALL_SOURCE: &str = "install";
 pub const INSTALL_FETCH_METRIC: &str = "fetch";
+/// P3b — the wizard's opt-in diagnostics frozen per day: `dims {step,
+/// outcome, os}`, the value the number of DISTINCT runs that ended `step`
+/// with `outcome` on `os` that day (a retry re-passing a step is one run).
+/// Written by the host's nightly freeze from `setup_diagnostics`, whose rows
+/// expire at 90 days; these do not.
+pub const INSTALL_WIZARD_STEP_METRIC: &str = "wizard_step";
 
 /// P4 — a plan-limit collision (`roomler_core::quota`), counted per UTC day
 /// with `dims {tenant, limit}` beside the FR-32 warn line: the upgrade-intent

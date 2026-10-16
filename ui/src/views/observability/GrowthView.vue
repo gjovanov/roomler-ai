@@ -642,7 +642,8 @@ const excluded = computed<ExcludedCounts | null>(
   () => preview.value?.excluded ?? digest.value?.excluded ?? null,
 )
 
-const WIDE = new Set(['signups', 'campaigns', 'website', 'blog', 'newsletter', 'revenue'])
+// `install` since P3b: the wizard steps table carries five figure columns.
+const WIDE = new Set(['signups', 'campaigns', 'website', 'blog', 'newsletter', 'revenue', 'install'])
 function wide(key: string | number): boolean {
   return WIDE.has(String(key))
 }

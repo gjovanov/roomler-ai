@@ -44,6 +44,7 @@ use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
 use chrono::{NaiveDate, Timelike};
 use futures::TryStreamExt;
 use roomler_ai_db::models::tenant::Plan;
+use roomler_ai_remote_control::setup_diagnostics::{Outcome, Step};
 use roomler_ai_services::{
     EmailService,
     dao::{
@@ -53,6 +54,7 @@ use roomler_ai_services::{
             ClaimMode, ClaimOutcome, DigestDoc, DigestStatus, DigestStore, ExcludedCounts,
         },
         growth_social::{GROWTH_POST_SNAPSHOTS, GROWTH_POSTS, SNAPSHOTS},
+        setup_diagnostics::SetupDiagnosticsDao,
     },
 };
 use roomler_core::{campaign, growth::ExclusionSet};
@@ -469,6 +471,49 @@ pub struct MethodRow {
     pub enrolled: Figure,
 }
 
+/// P3b — one wizard step over the opted-in runs of the windows: how many
+/// DISTINCT runs ended it, and with which outcome. A run that retried a
+/// step counts once under `reached` and once under each outcome it had.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WizardStepRow {
+    pub step: String,
+    pub reached: Figure,
+    pub ok: Figure,
+    pub failed: Figure,
+    pub cancelled: Figure,
+}
+
+/// P3b — a step's failures by error code (distinct runs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WizardErrorRow {
+    pub step: String,
+    pub error_code: String,
+    pub failures: Figure,
+}
+
+/// P3b — the wizard's opt-in step diagnostics (`setup_diagnostics`): the
+/// opted-in runs seen in the windows, which step each reached and how it
+/// ended, and the failures by code. **Opted-in runs only**, labelled with
+/// their n (`runs`): a run that did not tick the box is not here, so these
+/// numbers say nothing about the runs that did not. A share appears only
+/// once `runs.d28` clears `n_floor`; below it the counts stand alone. The
+/// rows carry no tenant, so the exclusion set cannot apply, like the fetch
+/// counters. Not measured while the server's switch is off, never 0.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WizardSteps {
+    /// Distinct opted-in runs with any boundary in each window — the n.
+    pub runs: Figure,
+    pub n_floor: i64,
+    /// Of the runs in the 28-day window, the share that reached `done`;
+    /// only at `runs.d28 >= n_floor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_share_28d: Option<f64>,
+    /// In run order, the steps at least one run reached in 28 days.
+    pub steps: Vec<WizardStepRow>,
+    /// By failures in 28 days, then run order, then the code.
+    pub errors: Vec<WizardErrorRow>,
+}
+
 /// P3 — the install trace (spec §3e item 6): fetches by client class,
 /// tokens issued → redeemed, enrollments by method and OS. The fetch rows
 /// carry no tenant, so the exclusion set cannot apply to them; the other
@@ -478,8 +523,11 @@ pub struct Install {
     pub fetches: Measured<Vec<FetchRow>>,
     pub tokens: Measured<Tokens>,
     pub enrollments_by_method: Measured<Vec<MethodRow>>,
-    /// The wizard's step diagnostics are opt-in and not built yet (P3b).
-    pub wizard_steps: NotMeasured,
+    /// P3b — the wizard's opt-in step diagnostics; not measured while
+    /// `growth.setup_diagnostics` is off on this server. A digest stored
+    /// before P3b holds the old `{not_measured, arrives_with: P3b}` here,
+    /// which still reads as this type's other arm.
+    pub wizard_steps: Measured<WizardSteps>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1271,6 +1319,128 @@ async fn read_fetches(state: &AppState, w: &Windows) -> Result<Vec<FetchRow>, Di
             .then_with(|| a.os.cmp(&b.os))
     });
     Ok(out)
+}
+
+/// Per-span sets of distinct run ids — the P3b counting unit.
+#[derive(Default)]
+struct RunSets {
+    day: HashSet<String>,
+    d7: HashSet<String>,
+    d28: HashSet<String>,
+}
+
+impl RunSets {
+    fn add(&mut self, w: &Windows, t: i64, run: &str) {
+        if w.contains(Span::Day, t) {
+            self.day.insert(run.to_string());
+        }
+        if w.contains(Span::D7, t) {
+            self.d7.insert(run.to_string());
+        }
+        if w.contains(Span::D28, t) {
+            self.d28.insert(run.to_string());
+        }
+    }
+
+    fn figure(&self) -> Figure {
+        Figure {
+            day: self.day.len() as i64,
+            d7: self.d7.len() as i64,
+            d28: self.d28.len() as i64,
+        }
+    }
+}
+
+/// P3b — the wizard's opt-in step diagnostics of the 28-day window, as
+/// `setup_diagnostics` holds them: distinct runs per step and outcome, and
+/// per failing code. The rows outlive nothing (90 days) but cover every
+/// window the digest reads; the nightly freeze keeps the daily counts.
+async fn read_wizard_steps(state: &AppState, w: &Windows) -> Result<WizardSteps, DigestError> {
+    let rows = SetupDiagnosticsDao::new(&state.db)
+        .rows_between(w.start_dt(Span::D28), w.end_dt())
+        .await?;
+    if rows.len() as i64 >= roomler_ai_services::dao::setup_diagnostics::MAX_READ_ROWS {
+        warn!(
+            rows = rows.len(),
+            "setup_diagnostics: the digest's read hit its row bound; the counts are a floor"
+        );
+    }
+    let mut runs = RunSets::default();
+    let mut reached: BTreeMap<usize, RunSets> = BTreeMap::new();
+    let mut by_outcome: BTreeMap<(usize, Outcome), RunSets> = BTreeMap::new();
+    let mut errors: BTreeMap<(usize, String), RunSets> = BTreeMap::new();
+    for r in &rows {
+        let (Some(step), Some(outcome)) = (Step::parse(&r.step), Outcome::parse(&r.outcome)) else {
+            // A spelling this build does not know (a newer wizard's): it is
+            // not a row of any step we can name, so it costs itself only.
+            continue;
+        };
+        let t = r.ts.timestamp_millis();
+        runs.add(w, t, &r.run);
+        reached.entry(step.index()).or_default().add(w, t, &r.run);
+        by_outcome
+            .entry((step.index(), outcome))
+            .or_default()
+            .add(w, t, &r.run);
+        if outcome == Outcome::Failed
+            && let Some(code) = &r.error_code
+        {
+            errors
+                .entry((step.index(), code.clone()))
+                .or_default()
+                .add(w, t, &r.run);
+        }
+    }
+    let outcome_figure = |idx: usize, o: Outcome| {
+        by_outcome
+            .get(&(idx, o))
+            .map(RunSets::figure)
+            .unwrap_or_default()
+    };
+    let steps: Vec<WizardStepRow> = Step::ALL
+        .iter()
+        .filter_map(|s| {
+            let sets = reached.get(&s.index())?;
+            Some(WizardStepRow {
+                step: s.wire().to_string(),
+                reached: sets.figure(),
+                ok: outcome_figure(s.index(), Outcome::Ok),
+                failed: outcome_figure(s.index(), Outcome::Failed),
+                cancelled: outcome_figure(s.index(), Outcome::Cancelled),
+            })
+        })
+        .collect();
+    let mut errors: Vec<WizardErrorRow> = errors
+        .into_iter()
+        .map(|((idx, code), sets)| WizardErrorRow {
+            step: Step::ALL[idx].wire().to_string(),
+            error_code: code,
+            failures: sets.figure(),
+        })
+        .collect();
+    errors.sort_by(|a, b| {
+        b.failures
+            .d28
+            .cmp(&a.failures.d28)
+            .then_with(|| {
+                Step::parse(&a.step)
+                    .map(Step::index)
+                    .cmp(&Step::parse(&b.step).map(Step::index))
+            })
+            .then_with(|| a.error_code.cmp(&b.error_code))
+    });
+    let runs = runs.figure();
+    let done_28d = reached
+        .get(&Step::Done.index())
+        .map(|s| s.figure().d28)
+        .unwrap_or(0);
+    Ok(WizardSteps {
+        runs,
+        n_floor: SMALL_N,
+        done_share_28d: (runs.d28 >= SMALL_N).then(|| done_28d as f64 / runs.d28 as f64),
+        steps,
+        errors,
+    })
 }
 
 /// Per-span tenant sets with a value event.
@@ -2341,13 +2511,22 @@ pub async fn compute(
             fetches: Measured::Value(read_fetches(state, &w).await?),
             tokens: Measured::Value(read_tokens(state, &w, set).await?),
             enrollments_by_method: Measured::Value(d.by_method_os.clone()),
-            wizard_steps: NotMeasured::later("wizard steps reached (opt-in runs)", "P3b"),
+            // P3b — the switch off is "not measured", never a measured zero:
+            // with it off the route refuses every record, so a 0 here would
+            // claim nobody opted in when nobody could.
+            wizard_steps: if state.settings.growth.setup_diagnostics {
+                Measured::Value(read_wizard_steps(state, &w).await?)
+            } else {
+                Measured::NotMeasured(NotMeasured::now(
+                    "setup diagnostics are off on this server (growth.setup_diagnostics)",
+                ))
+            },
         },
         None => Install {
             fetches: Measured::unmounted("fleet"),
             tokens: Measured::unmounted("fleet"),
             enrollments_by_method: Measured::unmounted("fleet"),
-            wizard_steps: NotMeasured::later("wizard steps reached (opt-in runs)", "P3b"),
+            wizard_steps: Measured::unmounted("fleet"),
         },
     };
     let remote = if mounted(state, "remote") {

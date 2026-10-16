@@ -111,6 +111,13 @@ mod growth_p10_tests;
 /// backfill against a fake Stripe, and the quota-collision counter.
 #[cfg(test)]
 mod growth_revenue_tests;
+/// FR-102 P3b — the setup wizard's opt-in diagnostics (AC12's server half):
+/// a record stored with exactly its fields and nothing about the request,
+/// every invalid field refused with nothing stored, the kill switch's empty
+/// 404, the per-run cap, the nightly freeze into `growth_daily`, and the
+/// digest's `wizard_steps` over opted-in runs.
+#[cfg(test)]
+mod growth_setup_diagnostics_tests;
 /// FR-102 — growth observability: the campaign taxonomy at ingress (AC5),
 /// the exclusion list and the set every growth number applies (AC4).
 #[cfg(test)]
