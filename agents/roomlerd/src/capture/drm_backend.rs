@@ -342,6 +342,34 @@ pub fn wake_wait_enabled() -> bool {
     tunnel_core::env::flag("DRM_WAKE_WAIT", true)
 }
 
+/// FR-107 P1 — kill switch `ROOMLERD_DRM_FOLLOW_CAP=0`: the pump's encode box
+/// no longer picks the half-size read, and a 4K scanout is read at full size
+/// whenever the policy says `Never`, as before.
+fn follow_cap_enabled() -> bool {
+    tunnel_core::env::flag("DRM_FOLLOW_CAP", true)
+}
+
+/// FR-107 P1 — the pump's encode box, packed `(w << 32) | h` (`0`: none), as
+/// [`ScreenCapture::set_output_cap`] hands it over and the worker reads it.
+fn pack_cap(cap: Option<(u32, u32)>) -> u64 {
+    match cap {
+        Some((w, h)) if w >= 2 && h >= 2 => (u64::from(w) << 32) | u64::from(h),
+        _ => 0,
+    }
+}
+
+fn unpack_cap(packed: u64) -> Option<(u32, u32)> {
+    (packed != 0).then_some(((packed >> 32) as u32, packed as u32))
+}
+
+/// What decides one grab's size: the policy the capture opened with, and the
+/// pump's encode box at that moment (FR-107 P1, [`wants_half`]).
+#[derive(Clone, Copy, Debug)]
+struct Sizing {
+    policy: DownscalePolicy,
+    cap: Option<(u32, u32)>,
+}
+
 /// How often a capture whose display is off looks again: no frame period's
 /// worth of ioctls while nothing can change, and a wake seen within a quarter
 /// of a second.
@@ -579,11 +607,67 @@ impl Layout {
 fn repack_to_bgra(src: &[u8], width: u32, height: u32, pitch: u32, layout: Layout) -> Vec<u8> {
     let w = width as usize;
     let h = height as usize;
-    let pitch = pitch as usize;
     let mut out = vec![0u8; w * h * 4];
-    for y in 0..h {
+    in_bands(&mut out, w * 4, h, |y0, band| {
+        repack_rows(src, w, pitch as usize, layout, y0, band);
+    });
+    out
+}
+
+/// FR-107 P2 — split `out` (`rows` rows of `row_bytes`) into one band of rows
+/// per thread and fill every band at once: `fill(first_row, band)`.
+///
+/// One core reads this mapping slowly (it is uncached device memory: each core
+/// keeps only a few reads in flight), and the frame is independent row by row,
+/// so the bands need no coordination. Each thread still reads its own rows in
+/// order, the one access pattern FR-36 measured the mapping to tolerate.
+fn in_bands<F>(out: &mut [u8], row_bytes: usize, rows: usize, fill: F)
+where
+    F: Fn(usize, &mut [u8]) + Sync,
+{
+    in_bands_n(band_threads(rows), out, row_bytes, rows, fill);
+}
+
+/// [`in_bands`] with the thread count given, so a test can drive every split.
+fn in_bands_n<F>(threads: usize, out: &mut [u8], row_bytes: usize, rows: usize, fill: F)
+where
+    F: Fn(usize, &mut [u8]) + Sync,
+{
+    if threads <= 1 || row_bytes == 0 {
+        fill(0, out);
+        return;
+    }
+    let per = rows.div_ceil(threads);
+    std::thread::scope(|s| {
+        for (i, band) in out.chunks_mut(per * row_bytes).enumerate() {
+            let fill = &fill;
+            s.spawn(move || fill(i * per, band));
+        }
+    });
+}
+
+/// FR-107 P2 — how many threads repack one frame: `ROOMLERD_DRM_THREADS`
+/// (`1` is the single pass every release before it made), else 4. Never more
+/// than the cores there are, nor more than one per 64 rows.
+fn band_threads(rows: usize) -> usize {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let want = *THREADS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        std::env::var("ROOMLERD_DRM_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, cores.max(1))
+    });
+    want.min((rows / 64).max(1))
+}
+
+/// The rows of `band` (output rows from `y0`), repacked from the same rows of
+/// `src`.
+fn repack_rows(src: &[u8], w: usize, pitch: usize, layout: Layout, y0: usize, band: &mut [u8]) {
+    for (j, dst) in band.chunks_exact_mut(w * 4).enumerate() {
+        let y = y0 + j;
         let row = &src[y * pitch..y * pitch + w * 4];
-        let dst = &mut out[y * w * 4..(y + 1) * w * 4];
         match (layout.ten_bit, layout.red_low) {
             (true, false) => unpack_ten_bit_row::<false>(dst, row),
             (true, true) => unpack_ten_bit_row::<true>(dst, row),
@@ -609,7 +693,6 @@ fn repack_to_bgra(src: &[u8], width: u32, height: u32, pitch: u32, layout: Layou
             }
         }
     }
-    out
 }
 
 /// One row of 2:10:10:10 words to 8-bit BGRA. `RED_LOW` picks XB30/AB30
@@ -668,6 +751,9 @@ pub struct DrmCapture {
     /// FR-95 P2 — set when a system install switched this capture on by
     /// itself: the person's session it may read, and nothing else.
     guard: Option<Guarded>,
+    /// FR-107 P1 — the pump's encode box ([`pack_cap`]), read by the worker on
+    /// every grab.
+    output_cap: Arc<AtomicU64>,
 }
 
 /// FR-95 P2 — an automatic capture's binding to the person who was told.
@@ -724,10 +810,21 @@ impl DrmCapture {
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<FrameRequest>();
         let unchanged = Arc::new(AtomicU64::new(0));
         let worker_unchanged = Arc::clone(&unchanged);
+        let output_cap = Arc::new(AtomicU64::new(0));
+        let worker_cap = Arc::clone(&output_cap);
 
         std::thread::Builder::new()
             .name("drm-capture".into())
-            .spawn(move || worker(ready_tx, cmd_rx, downscale, idle_skip, worker_unchanged))
+            .spawn(move || {
+                worker(
+                    ready_tx,
+                    cmd_rx,
+                    downscale,
+                    idle_skip,
+                    worker_unchanged,
+                    worker_cap,
+                )
+            })
             .map_err(|e| anyhow!("spawn drm-capture worker: {e}"))?;
 
         let (width, height, path) = ready_rx
@@ -748,6 +845,7 @@ impl DrmCapture {
             unchanged,
             dark: false,
             guard: None,
+            output_cap,
         })
     }
 }
@@ -760,7 +858,9 @@ fn worker(
     downscale: DownscalePolicy,
     idle_skip: bool,
     unchanged: Arc<AtomicU64>,
+    output_cap: Arc<AtomicU64>,
 ) {
+    let follow_cap = follow_cap_enabled();
     let (card, path) = match open_display_node() {
         Ok(v) => v,
         Err(e) => {
@@ -857,11 +957,19 @@ fn worker(
     );
 
     while let Ok(reply_tx) = cmd_rx.recv() {
+        let sizing = Sizing {
+            policy: downscale,
+            cap: if follow_cap {
+                unpack_cap(output_cap.load(Ordering::Relaxed))
+            } else {
+                None
+            },
+        };
         let reply = match grab(
             &card,
             &planes,
             &mut cached,
-            downscale,
+            sizing,
             cursor.as_mut(),
             gate.as_mut(),
             &unchanged,
@@ -916,7 +1024,7 @@ fn grab(
     card: &Card,
     planes: &[PlaneEntry],
     cached: &mut Option<Cached>,
-    downscale: DownscalePolicy,
+    sizing: Sizing,
     cursor: Option<&mut CursorReader>,
     gate: Option<&mut IdleGate>,
     unchanged: &AtomicU64,
@@ -1029,7 +1137,7 @@ fn grab(
     // read 35 MB → write 35 MB → read 35 MB → write 8.8 MB and
     // read 35 MB → write 8.8 MB; the backend there is memory-bandwidth bound,
     // so the pass count is the cost.
-    let scaled = if wants_half(width, height, downscale) {
+    let scaled = if wants_half(width, height, sizing.policy, sizing.cap) {
         Scaled {
             data: repack_bgra_half(mapping.as_slice(), width, height, pitch, layout),
             width: width / 2,
@@ -1081,9 +1189,23 @@ struct Scaled {
 /// Mirror the scrap backend's policy — sharing `DOWNSCALE_TRIGGER_PIXELS`
 /// rather than restating the threshold — so a host does not get a different
 /// picture size purely because it switched capture backend.
-fn wants_half(width: u32, height: u32, policy: DownscalePolicy) -> bool {
+///
+/// FR-107 P1 — and whatever the policy, a half-size frame whenever it still
+/// covers the pump's encode box `cap`. The pump resamples every frame down to
+/// that box anyway, and its Lanczos costs in proportion to the SOURCE area, so
+/// a 4K scanout encoded at 1920×1012 was read in full and resampled from 8.8 M
+/// pixels (measured 43 ms a frame on the Asahi box) for detail the encode then
+/// threw away. A box bigger than half the source keeps the full read: halving
+/// there would lose pixels the encode keeps.
+fn wants_half(width: u32, height: u32, policy: DownscalePolicy, cap: Option<(u32, u32)>) -> bool {
     if width < 2 || height < 2 {
         return false;
+    }
+    if let Some((cw, ch)) = cap
+        && cw <= width / 2
+        && ch <= height / 2
+    {
+        return true;
     }
     match policy {
         DownscalePolicy::Always => true,
@@ -1100,25 +1222,34 @@ fn wants_half(width: u32, height: u32, policy: DownscalePolicy) -> bool {
 /// memory-bandwidth bound, so the win is one fewer read and one 4×-smaller
 /// write, not a cheaper inner loop.
 fn repack_bgra_half(src: &[u8], width: u32, height: u32, pitch: u32, layout: Layout) -> Vec<u8> {
-    let Layout { ten_bit, red_low } = layout;
     let (dw, dh) = ((width / 2) as usize, (height / 2) as usize);
-    let pitch = pitch as usize;
     let mut out = vec![0u8; dw * dh * 4];
+    in_bands(&mut out, dw * 4, dh, |y0, band| {
+        half_rows(src, width as usize, pitch as usize, layout, y0, band);
+    });
+    out
+}
+
+/// The output rows of `band` (from `y0`) of [`repack_bgra_half`], each from
+/// its two source rows.
+fn half_rows(src: &[u8], width: usize, pitch: usize, layout: Layout, y0: usize, band: &mut [u8]) {
+    let Layout { ten_bit, red_low } = layout;
+    let dw = width / 2;
     // ⚠️ Copy each source row pair into cached scratch FIRST, then filter from
     // there. Reading the two rows directly would alternate between addresses a
     // whole pitch apart on every output pixel, and the scanout mapping punishes
     // strided access brutally: the naive version measured 329 ms/frame at 4K
     // against 53 ms for read-everything-then-filter. Sequential reads out of
     // this mapping are the constraint — not the number of passes over it.
-    let row_bytes = (width as usize) * 4;
+    let row_bytes = width * 4;
     let mut scratch = vec![0u8; row_bytes * 2];
-    for y in 0..dh {
+    for (j, dst) in band.chunks_exact_mut(dw * 4).enumerate() {
+        let y = y0 + j;
         scratch[..row_bytes].copy_from_slice(&src[2 * y * pitch..2 * y * pitch + row_bytes]);
         scratch[row_bytes..]
             .copy_from_slice(&src[(2 * y + 1) * pitch..(2 * y + 1) * pitch + row_bytes]);
         let (r0, r1) = (0usize, row_bytes);
         let src = &scratch[..];
-        let dst = &mut out[y * dw * 4..(y + 1) * dw * 4];
         for x in 0..dw {
             let o = 2 * x * 4;
             // Average in the SOURCE's own precision, then narrow — narrowing
@@ -1159,7 +1290,6 @@ fn repack_bgra_half(src: &[u8], width: u32, height: u32, pitch: u32, layout: Lay
             dst[x * 4 + 3] = 0xFF;
         }
     }
-    out
 }
 
 fn now_us() -> u64 {
@@ -1272,6 +1402,12 @@ impl ScreenCapture for DrmCapture {
             .or(self.dark.then_some(WaitFor::DisplayWake))
     }
 
+    /// FR-107 P1 — the pump's encode box: a half-size read wherever it still
+    /// covers it ([`wants_half`]), from the next grab.
+    fn set_output_cap(&mut self, target: Option<(u32, u32)>) {
+        self.output_cap.store(pack_cap(target), Ordering::Relaxed);
+    }
+
     fn frames_unchanged(&self) -> u64 {
         self.unchanged.load(Ordering::Relaxed)
     }
@@ -1353,6 +1489,52 @@ mod tests {
         let src = vec![30u8, 20, 10, 0x00]; // R=30, G=20, B=10, A=0
         let out = repack_to_bgra(&src, 1, 1, 4, layout(DrmFourcc::Abgr8888));
         assert_eq!(&out[..], &[10, 20, 30, 0xFF], "B, G, R, opaque");
+    }
+
+    /// FR-107 P2 — splitting a frame into bands of rows, one per thread,
+    /// changes nothing in the picture: every split of every layout is
+    /// byte-identical to the single pass, with an odd height, an odd width
+    /// and a padded pitch.
+    #[test]
+    fn banded_repacks_match_the_single_pass() {
+        let (w, h, pitch) = (37usize, 131usize, 37 * 4 + 12);
+        let src: Vec<u8> = (0..pitch * h).map(|i| (i * 7 + i / 13) as u8).collect();
+        for fourcc in [
+            DrmFourcc::Xrgb8888,
+            DrmFourcc::Abgr8888,
+            DrmFourcc::Xrgb2101010,
+            DrmFourcc::Abgr2101010,
+        ] {
+            let l = layout(fourcc);
+            let full = |threads: usize| {
+                let mut out = vec![0u8; w * h * 4];
+                in_bands_n(threads, &mut out, w * 4, h, |y0, band| {
+                    repack_rows(&src, w, pitch, l, y0, band)
+                });
+                out
+            };
+            let half = |threads: usize| {
+                let (dw, dh) = (w / 2, h / 2);
+                let mut out = vec![0u8; dw * dh * 4];
+                in_bands_n(threads, &mut out, dw * 4, dh, |y0, band| {
+                    half_rows(&src, w, pitch, l, y0, band)
+                });
+                out
+            };
+            let (one_full, one_half) = (full(1), half(1));
+            for threads in [2, 3, 4, 7, 64] {
+                assert_eq!(
+                    full(threads),
+                    one_full,
+                    "{fourcc:?} full, {threads} threads"
+                );
+                assert_eq!(
+                    half(threads),
+                    one_half,
+                    "{fourcc:?} half, {threads} threads"
+                );
+            }
+        }
     }
 
     /// Scanout pitch is nearly always wider than width×4 (4096-wide 10-bit
@@ -1447,13 +1629,34 @@ mod tests {
     /// purely from switching backend.
     #[test]
     fn wants_half_follows_the_shared_threshold() {
-        assert!(!wants_half(1920, 1080, DownscalePolicy::Never));
-        assert!(wants_half(1920, 1080, DownscalePolicy::Always));
+        assert!(!wants_half(1920, 1080, DownscalePolicy::Never, None));
+        assert!(wants_half(1920, 1080, DownscalePolicy::Always, None));
         // 1080p is under the trigger; 4K is over it.
-        assert!(!wants_half(1920, 1080, DownscalePolicy::Auto));
-        assert!(wants_half(4096, 2160, DownscalePolicy::Auto));
+        assert!(!wants_half(1920, 1080, DownscalePolicy::Auto, None));
+        assert!(wants_half(4096, 2160, DownscalePolicy::Auto, None));
         // Degenerate sizes must never halve into nothing.
-        assert!(!wants_half(1, 1, DownscalePolicy::Always));
+        assert!(!wants_half(1, 1, DownscalePolicy::Always, None));
+    }
+
+    /// FR-107 P1 — the pump's encode box halves the read only where the half
+    /// still covers it: a 4K scanout for a 1920×1012 encode (the software cap
+    /// on the Asahi box), never a 1440p one for the same box, whose half is
+    /// smaller than what the encode keeps.
+    #[test]
+    fn the_encode_box_halves_only_what_it_cannot_tell() {
+        let never = DownscalePolicy::Never;
+        assert!(wants_half(4096, 2160, never, Some((1920, 1012))));
+        assert!(wants_half(4096, 2160, never, Some((2048, 1080))));
+        assert!(!wants_half(4096, 2160, never, Some((2050, 1080))));
+        assert!(!wants_half(2560, 1440, never, Some((1920, 1080))));
+        assert!(!wants_half(1920, 1080, never, Some((1920, 1080))));
+        assert!(wants_half(1920, 1080, never, Some((960, 540))));
+        // No box: the policy alone, as before.
+        assert!(!wants_half(4096, 2160, never, None));
+        // The packing round-trips, and a degenerate box is no box.
+        assert_eq!(unpack_cap(pack_cap(Some((1920, 1012)))), Some((1920, 1012)));
+        assert_eq!(unpack_cap(pack_cap(Some((1, 1012)))), None);
+        assert_eq!(unpack_cap(pack_cap(None)), None);
     }
 
     /// A framebuffer with no reported modifier is a pre-modifier one, which is

@@ -551,7 +551,7 @@ buffer handle**, so a daemon that is not root opened DRM capture without
 complaint and then failed every frame. That is a per-user install with
 `drm_capture` set. The session died and re-created itself, and the viewer only
 ever said *"No video from this device after 3 attempts"*. The open now checks
-the handle (`unreadable`, `drm_backend.rs:908`) and refuses with the fix in
+the handle (`unreadable`, `drm_backend.rs:1016`) and refuses with the fix in
 words, which reach the viewer as the arm's own error (§1.1): *"drm_capture is
 on, but DRM capture could not open: reading the scanout needs CAP_SYS_ADMIN
 (root), which this daemon lacks: on a per-user install run roomler config
@@ -562,7 +562,7 @@ arm (§1.2), the desktop's own screencast.
 On one Apple-silicon (Asahi) display, mutter scans out 10-bit `XR30` and KWin
 8-bit `AB24`: the same driver and panel, with red and blue in opposite places.
 The repack resolves a `Layout` from each framebuffer's fourcc (`Layout::of`,
-`drm_backend.rs:557`) and handles the eight 32-bit RGB formats, `XR24`/`AR24`,
+`drm_backend.rs:585`) and handles the eight 32-bit RGB formats, `XR24`/`AR24`,
 `XB24`/`AB24`, `XR30`/`AR30` and `XB30`/`AB30`. Any other fourcc is a refusal
 (*"unhandled scanout pixel format …"*), never a guess. Before it, a KDE host on
 Asahi refused every frame. ⚠️ A wrong channel order does not *look* broken:
@@ -789,6 +789,52 @@ The candidate also met a second blank in the same run: GNOME's lock screen
 blanks after a short idle of its own. It was told and woken the same way. The
 prod viewer showed the agent's hint under its P2d-2 title until a promote
 carries P3e's words.
+
+### 3.4 Throughput at 4K (FR-107)
+
+A 4K scanout is 35 MB a frame, and the CPU reads it out of uncached device
+memory. On an Apple M2 Pro with GNOME's 10-bit `XR30` that measured 47–55 ms
+for a full read and 27–34 ms for FR-36's fused half-size read
+(`capture-smoke`, still and moving screen). The software-encode pumps then
+resample every frame down to their encode box, 1920×1012 there, with a
+Lanczos-3 that costs in proportion to the *source* area. A window drag on
+0.4.139 ran at **9.2 fps** on the VP9 path and 16.1 fps on the RTP track
+(FR-107, #2317). The encode was never the problem: OpenH264 took 13–19 ms.
+
+```mermaid
+flowchart LR
+    S["scanout<br/>4096×2160 XR30<br/>35 MB, uncached"] -->|"P1: the pump's box fits in half?"| H["fused half read<br/>2048×1080 BGRA"]
+    S -->|"otherwise"| F["full read<br/>4096×2160 BGRA"]
+    H --> B["P2: row bands,<br/>one thread each"]
+    F --> B
+    B --> R["pump resample<br/>to the encode box"]
+    R --> E["software encode"]
+```
+
+| Phase | What changed | Where | Kill switch |
+|---|---|---|---|
+| **P1** | The DRM arm honours the pump's encode box (`set_output_cap`, the seam macOS already honours). Whenever half the source still covers the box, it takes the fused half read, whatever the policy says: a 4K scanout for a 1920×1012 encode, but never a 1440p one, whose half would be smaller than what the encode keeps. The VP9 and FFmpeg DataChannel pumps open their capture with `Never` (`agents/roomlerd/src/peer.rs:3547`), so before P1 they read the full 4K and resampled all 8.8 M pixels of it | `wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1200`; `set_output_cap`, `drm_backend.rs:1407` | `ROOMLERD_DRM_FOLLOW_CAP=0` |
+| **P2** | The repack runs in row bands, one thread each (4 by default). Each thread still reads its own rows in order, the one access pattern FR-36 measured this mapping to tolerate. The output is byte-identical to the single pass, which `banded_repacks_match_the_single_pass` locks for every layout | `in_bands`, `drm_backend.rs:624`; `band_threads`, `drm_backend.rs:652` | `ROOMLERD_DRM_THREADS=1` |
+
+Measured on that box, a continuously moving window (`vkcube`), one viewer:
+
+| | 0.4.139 | P1 + P2 |
+|---|---|---|
+| VP9 4:4:4 over the DataChannel | 9.2 fps, resample 36.5 ms | **18.1 fps**, resample 16.5 ms |
+| H.264 on the RTP track | 16.1 fps, capture 47.7 ms | **20.6 fps**, capture 30.0 ms |
+
+⚠️ **More threads stop paying under motion.** On a still screen the half read
+went 27 → 18 → 12.6 ms at 1, 4 and 8 threads. With the compositor animating,
+it went only 34 → 29 ms, because the compositor uses the same memory
+bandwidth the read needs. The remaining wall is the CPU read itself. FR-107 P3
+moves it to the GPU: an EGL import of the scanout's dma-buf, a GPU downscale
+and conversion, and a readback four times smaller. The M2's hardware video
+encoder has no Linux driver, so the encode stays in software.
+
+⚠️ **A benchmark that toggles GNOME's overview measures the content, not the
+pipeline.** The animation moves for part of each toggle, and the idle skip
+(§3.2) rightly sends nothing in between, so "frames per second" there reads 4–5
+for every build. Measure with motion that never stops.
 
 ## 4. The portal arm (FR-45 P1–P4)
 
@@ -1751,6 +1797,8 @@ the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/co
 | — | `ROOMLERD_DRM_CURSOR` | **on** | FR-93 P3c (§3.1): the DRM arm reads the cursor plane for the cursor channel. Off = the viewer's own badge for the pointer, as before P3c |
 | — | `ROOMLERD_DRM_IDLE_SKIP` | **on** | FR-93 P3d (§3.2): on a Wayland seat the DRM arm skips a frame nothing changed in. Off = every frame read, converted and encoded, as before P3d |
 | — | `ROOMLERD_DRM_WAKE_WAIT` | **on** | FR-93 P3e (§3.3): a display switched off is told to the controller (`display_wake`) and waited out, by a running session and by an open. Off = the last frame kept alive with no reason, and an open during the blank falls through the cascade, as before P3e |
+| — | `ROOMLERD_DRM_FOLLOW_CAP` | **on** | FR-107 P1 (§3.4): the DRM arm reads at half size whenever half the scanout still covers the pump's encode box. Off = the policy alone decides, as before P1 |
+| — | `ROOMLERD_DRM_THREADS` | **4** | FR-107 P2 (§3.4): the threads the DRM repack splits a frame across, at most the host's cores. `1` = the single pass, as before P2 |
 | — | `ROOMLERD_SESSION_WATCH` | **on** | FR-93 P5f (§5.6): a per-user capture on the PipeWire arms tells the controller when its user's session is in the background (`session_away`): a user switch, or the login screen. Off = the last frame kept alive with no reason, as before P5f |
 | — | `ROOMLERD_SCREEN_STOP` | **on** | FR-93 P6c (§5.7): a share the person at the screen stopped with the desktop's own control (GNOME's Stop, KDE's End) ends the session as their Disconnect does. Off = the capture is reopened, as before P6c, which undoes their stop |
 | — | `ROOMLERD_SLEEP_NOTICE` | **on** | FR-93 P5h (§5.8): while a session is live, a logind delay inhibitor on sleep, and every controller told `host_sleep` before the computer sleeps. Off = no inhibitor and no notice, as before P5h |
