@@ -6,6 +6,7 @@ import { api } from '@/api/client'
 import { useTenantStore } from '@/stores/tenant'
 import { canManageOrgSettings } from '@/utils/permissions'
 import { isKeepBusyPattern, type KeepBusyPattern } from '@/composables/keepBusy'
+import type { AgentReleaseBrief } from '@/utils/updateStall'
 
 /**
  * The three org-level switches (`exec-settings`, `ssh-settings`,
@@ -830,6 +831,9 @@ interface AgentLogsListResponse {
   batches: AgentLogBatch[]
 }
 
+/** FR-106 — how long the release list is kept before it is fetched again. */
+export const RELEASES_TTL_MS = 30 * 60 * 1000
+
 export const useAgentStore = defineStore('agents', () => {
   const agents = ref<Agent[]>([])
   const total = ref(0)
@@ -854,6 +858,32 @@ export const useAgentStore = defineStore('agents', () => {
       total.value = 0
     } finally {
       loading.value = false
+    }
+  }
+
+  /** FR-106 — the agent releases, newest first, each with its publish time:
+   *  `GET /api/agent/latest-release`, the server's cached copy of GitHub's
+   *  list (~560 KB, ~90 KB gzipped). Fetched at most once per
+   *  {@link RELEASES_TTL_MS}, and kept slim: only what the "not updating" chip
+   *  reads. A failed fetch leaves the list empty, and an empty list shows no
+   *  chip anywhere — the absence of a signal never invents a problem. */
+  const releases = ref<AgentReleaseBrief[]>([])
+  let releasesFetchedAt = 0
+  async function fetchReleases() {
+    if (releases.value.length && Date.now() - releasesFetchedAt < RELEASES_TTL_MS) return
+    try {
+      const list = await api.get<AgentReleaseBrief[]>('/agent/latest-release')
+      releases.value = Array.isArray(list)
+        ? list.map((r) => ({
+            tag_name: r.tag_name,
+            published_at: r.published_at ?? null,
+            draft: !!r.draft,
+            prerelease: !!r.prerelease,
+          }))
+        : []
+      releasesFetchedAt = Date.now()
+    } catch {
+      releases.value = []
     }
   }
 
@@ -1613,8 +1643,10 @@ export const useAgentStore = defineStore('agents', () => {
     total,
     loading,
     error,
+    releases,
     fetchAgents,
     fetchAgent,
+    fetchReleases,
     applyPresence,
     issueEnrollmentToken,
     rename,

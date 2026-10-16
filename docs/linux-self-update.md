@@ -464,6 +464,10 @@ only if it has P2b: once idle, and once its own last failed attempt is 10 min
 old. An older daemon runs its old image until its next start, a re-login or a
 reboot (`install.sh` restarts it). Details:
 [FR-96 §3.6](fr/FR-96-per-user-linux-installs-update-themselves.md#36-the-package-turns-on-its-own-update-half-p5-as-built).
+The devices page marks such a host **not updating** once the first release it
+missed has been out for a day, and its tooltip carries the same remedy
+([FR-106](fr/FR-106-devices-say-when-not-updating.md),
+[ui.md](ui.md#the-devices-lists-needs-a-person-chips)).
 
 The phases:
 
