@@ -295,7 +295,7 @@ async fn consent_watch_loop(app: tauri::AppHandle) {
         // FR-27 — the "Being viewed by …" banner. Windows has a native,
         // capture-excluded overlay for this and keeps it; everywhere else this
         // is the only such indicator there has ever been.
-        let want_banner = !live.is_empty() && panels::banner_enabled();
+        let want_banner = wants_banner(&live) && panels::banner_enabled();
         if want_banner != banner_up {
             if want_banner {
                 panels::show_banner(&app);
@@ -304,5 +304,40 @@ async fn consent_watch_loop(app: tauri::AppHandle) {
             }
             banner_up = want_banner;
         }
+    }
+}
+
+/// FR-93 P6h — the banner is for a session that sees the screen. One whose
+/// capture still waits on the desktop's own dialog (`asking`) shares nothing
+/// yet: saying "Being viewed" then is untrue, and on a desktop that centres
+/// new windows the banner lands on the dialog the person has to answer.
+fn wants_banner(live: &[roomler_localapi::RcSessionInfo]) -> bool {
+    live.iter().any(|s| !s.asking)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FR-93 P6h — the banner waits while the desktop's own dialog is still
+    /// asking about every session, and comes up as soon as one of them sees
+    /// the screen.
+    #[test]
+    fn the_banner_waits_while_the_desktop_asks() {
+        let session = |asking| roomler_localapi::RcSessionInfo {
+            session_id: "0".repeat(24),
+            asking,
+            ..Default::default()
+        };
+        assert!(!wants_banner(&[]), "no session, no banner");
+        assert!(
+            !wants_banner(&[session(true)]),
+            "the dialog still asks: nothing is shared yet"
+        );
+        assert!(wants_banner(&[session(false)]));
+        assert!(
+            wants_banner(&[session(true), session(false)]),
+            "one session that sees the screen is enough"
+        );
     }
 }

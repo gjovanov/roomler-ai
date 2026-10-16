@@ -5387,10 +5387,20 @@ fn media_waiting_hook(
         return Box::new(|_| {});
     }
     let runtime = tokio::runtime::Handle::current();
+    let asking: std::sync::Mutex<Option<crate::rc_sessions::AskingMark>> =
+        std::sync::Mutex::new(None);
     Box::new(move |wait| {
         const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
         const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
         const SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+        // FR-93 P6h — while the desktop's own dialog asks the person at the
+        // screen, nothing is shared yet, and the companion's "Being viewed"
+        // banner would cover the very window that asks (measured on KDE,
+        // where both are centred). The session lists as `asking` until this
+        // hook goes with its open, or the open moves on to another wait.
+        let mark = matches!(wait.why, crate::capture::WaitFor::Dialog { .. })
+            .then(|| crate::rc_sessions::AskingMark::new(session_id));
+        *asking.lock().unwrap_or_else(|p| p.into_inner()) = mark;
         let payload = media_waiting_payload(wait);
         info!(
             %session_id,

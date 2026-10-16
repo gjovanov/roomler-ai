@@ -80,7 +80,7 @@ advertises `session-policy` (P2b). Every other session goes without it:
   `AUDIO` permission bit is read by nothing; the hub clears it along with the flag.
 - The strip takes effect on every deployed agent, because the agent already enforces the grant it is
   sent: it refuses the `files` channel without `FILES` (`agents/roomlerd/src/peer.rs:1197`) and
-  clipboard traffic without `CLIPBOARD` (`agents/roomlerd/src/peer.rs:9992`), and adds no audio track
+  clipboard traffic without `CLIPBOARD` (`agents/roomlerd/src/peer.rs:10002`), and adds no audio track
   without `audio_enabled`. Until P2c the viewer does not explain the refusal.
 - ⚠️ **Mid-roll.** An absent `session_policy` in the relay body comes from an origin pod older than
   the feature and reads as unrestricted: that pod applied no policy and would have granted the
@@ -96,7 +96,7 @@ advertises `session-policy` (P2b). Every other session goes without it:
 
 | Piece | Where |
 |---|---|
-| The owner's floor: `rc_clipboard`, `rc_files`, `rc_audio`, each `on` (default), `ask` or `off`. Live, read strictly when set (`maybe` is refused, where the file's reader would read it as `off`), and absent from `DesiredConfig`, so no server can switch back on what the owner switched off. Over the LocalAPI only the person at the console may set them (root counts on Unix): they govern that person's clipboard, files and audio | `crates/agent-core/src/config.rs:1497`, `config_surface.rs`; `crates/localapi/src/lib.rs:2829` |
+| The owner's floor: `rc_clipboard`, `rc_files`, `rc_audio`, each `on` (default), `ask` or `off`. Live, read strictly when set (`maybe` is refused, where the file's reader would read it as `off`), and absent from `DesiredConfig`, so no server can switch back on what the owner switched off. Over the LocalAPI only the person at the console may set them (root counts on Unix): they govern that person's clipboard, files and audio | `crates/agent-core/src/config.rs:1497`, `config_surface.rs`; `crates/localapi/src/lib.rs:2837` |
 | The masking: the org's policy (from `rc:request`) and the floor, the stricter winning (`FeaturePolicy::stricter`, `crates/remote_control/src/models.rs:1232`, shared with the hub). `off` takes the feature out; `ask` survives only when the person here will approve the session on a prompt this agent raises (`person_asked`: never under `email`, `push` or `prompt_then_email`). Applied the moment the consent mode resolves and before anything reads the grant: the stash the channels enforce, the worker's params, the prompt | `agents/roomlerd/src/session_policy.rs:128` (`mask`), `:102`; applied at `agents/roomlerd/src/signaling.rs:3050` |
 | The prompt names each `ask` feature in words ("Approving also allows clipboard, file transfer and audio."), on its own line under privacy mode's, inside the native panel's two-line detail | `session_policy.rs:183` |
 | `session-policy` in the caps, and the floor itself (`AgentCaps.session_policy`, `models.rs:500`, only when it restricts anything), re-announced on the heartbeat when the owner changes it | `signaling.rs:6098`, `:2033` |

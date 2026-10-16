@@ -1075,6 +1075,14 @@ pub struct RcSessionInfo {
     /// to disconnect. Additive, like `recording`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reconnecting: bool,
+    /// FR-93 P6h — the desktop's own dialog (the portal's *Remote Control* /
+    /// *Share screen*) is asking the person at the screen right now: nothing
+    /// is shared yet, and the answer is theirs to give in that dialog. The
+    /// banner waits rather than say "Being viewed" over the very window that
+    /// asks. Additive: an older companion ignores it, an older daemon never
+    /// sets it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub asking: bool,
 }
 
 /// A LocalAPI request. P1 exposed read-only verbs; P2b adds the (mutating)
