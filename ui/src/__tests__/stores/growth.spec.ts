@@ -34,6 +34,8 @@ import {
   weekFigureLabel,
   isWeekFigure,
   alertDetailLabel,
+  msLabel,
+  pooledLabel,
 } from '@/stores/growth'
 import { api } from '@/api/client'
 
@@ -121,6 +123,28 @@ describe('growth helpers', () => {
     )
   })
 
+  it('labels milliseconds as a reader reads them, and a pooled percentile as an estimate', () => {
+    // P9a — the server's own labelling; `—` for nothing, never 0.
+    expect(msLabel(820)).toBe('820 ms')
+    expect(msLabel(2736)).toBe('2.7 s')
+    expect(msLabel(738_000)).toBe('12.3 min')
+    expect(msLabel(5_400_000)).toBe('1.5 h')
+    expect(msLabel(null)).toBe('—')
+    expect(msLabel(undefined)).toBe('—')
+    // One day's values are exact; several days' are pooled from the daily
+    // histograms and say so; no sample is not a zero.
+    expect(pooledLabel({ n: 94, p50: 2736, p90: 6100, exact: true, parts: 1 })).toBe(
+      'p50 2.7 s · p90 6.1 s (n 94)',
+    )
+    expect(pooledLabel({ n: 300, p50: 2500, p90: 7000, exact: false, parts: 7 })).toBe(
+      '≈ p50 2.5 s · p90 7.0 s (n 300)',
+    )
+    expect(pooledLabel({ n: 0, exact: true, parts: 1 })).toBe('no sample')
+    expect(pooledLabel({ n: 3, p50: 30, exact: true, parts: 1 }, (v) => `${v} fps`)).toBe(
+      'p50 30 fps · p90 — (n 3)',
+    )
+  })
+
   it('shows a rate only once the settled denominator reaches the n-floor', () => {
     // P2 — below SMALL_N the UI shows counts and hides the percentage.
     expect(rateIfEnough(5, SMALL_N - 1)).toBeNull()
@@ -188,6 +212,17 @@ describe('useGrowthStore', () => {
     await store.fetchTimeline('69a1dbbad2000f26adc875ce')
     expect(mockApi.get).toHaveBeenCalledWith(
       '/admin/growth/org/69a1dbbad2000f26adc875ce/timeline',
+    )
+  })
+
+  it('fetches remote-desktop quality at the P9a route with its day range', async () => {
+    const store = useGrowthStore()
+    mockApi.get.mockResolvedValue({})
+    await store.fetchQuality()
+    expect(mockApi.get).toHaveBeenCalledWith('/admin/growth/quality')
+    await store.fetchQuality({ since: '2026-09-18', until: '2026-10-15', includeInternal: true })
+    expect(mockApi.get).toHaveBeenCalledWith(
+      '/admin/growth/quality?since=2026-09-18&until=2026-10-15&include_internal=true',
     )
   })
 

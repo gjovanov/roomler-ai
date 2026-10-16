@@ -297,6 +297,18 @@ sequenceDiagram
   - median duration, `stats.peak_fps`, `stats.avg_rtt_ms`;
   - FR-22's time to first frame, as p50/p90 frozen nightly from `agent_logs` before its 7-day horizon;
   - crashes per 100 device-days from `agent_crashes`.
+  *(P9a as built — server only, no remote-control code path touched: a nightly freeze under the
+  org-day fold's claim writes `growth_quality_daily`, one row per `(day, scope, agent_version)`,
+  from `remote_sessions` (sessions **requested** that day: reached Active / never / pending, by
+  `end_reason`; duration, `stats.peak_fps`, `stats.avg_rtt_ms` as exact p50/p90 plus a histogram),
+  the browser's `rc.connect` records in `agent_logs` (TTFF over foreground, first-attempt paints —
+  FR-22's own filter — measured only while every record of the day still exists), `agent_crashes`
+  (by the payload's `agentVersion`) and `stats_machine_1d` (device-days). The version a device ran
+  comes from its own log batches that day, else its device row. Both scopes (`external` with the
+  exclusion set, `all`) are frozen; an absent part is not measured, never 0; a rate from n = 30.
+  Read by `GET …/growth/quality`, the Quality tab, the digest's `quality` section (the day's TTFF
+  and per-version table; the outcome counts and distributions live) and the weekly roll-up.
+  Detail: [growth-observability.md](../growth-observability.md#remote-desktop-quality-from-what-is-recorded-p9a).)*
 - **The carrier on an RC session.** Direct, TURN or DERP is recorded when the session reaches Active; the
   agent already knows it. This is remote-desktop code: it is held to the repo's §3 bar and proven on the
   fleet, as any carrier change is.
@@ -478,7 +490,7 @@ computes the day, stores it, and emails it to the platform admins.
 | Campaigns | per `utm_source` / `utm_medium` / `utm_campaign`: visitors and goal conversions from purestat, sign-ups from roomler | purestat + `users` | after PS1 |
 | Newsletter | new, confirmed and unsubscribed subscribers; each issue sent that day, accepted (delivered and bounced from P5) | `subscribers`, `newsletter_sends` | P1d |
 | Revenue | orgs by plan and subscription status; the list-price MRR, labelled an estimate (`crates/api/src/routes/cost.rs:22-30`) | `tenants` | P1d; billed from P4 |
-| Quality | sessions that ended on a failure reason; agent crashes by version | `remote_sessions`, `agent_crashes` | P1d; rating and TTFF from P9 |
+| Quality | sessions requested → reached Active / never, by `end_reason` (and the ended ones by class); duration, peak frame rate and RTT as p50/p90 with n; FR-22's time to first frame p50/p90 (the day exact, 7d/28d estimated from the frozen histograms); agent crashes by version and per 100 device-days; the day by agent version | `remote_sessions`, `agent_crashes`, `stats_machine_1d`, `growth_quality_daily` | P1d; TTFF, the rates and the versions P9a; the rating P9b |
 | Install | fetches by client class; tokens issued → redeemed | §3e | P3 |
 | Social reach | each platform's own numbers per post | the pipeline's push | P8 |
 | Search | clicks, impressions, top queries and pages | Search Console, Bing | P7 |
@@ -588,9 +600,11 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 
 - **Host** (`crates/api/src/growth/`): the views (funnel, cohorts, orgs, timeline, campaigns, content,
   install, revenue, newsletter, quality); the nightly job that writes `growth_org_daily` and freezes daily
-  totals; the digest and alerts. A source whose module is unmounted answers `null` with the module's name.
+  totals and the quality rows; the digest and alerts. A source whose module is unmounted answers `null`
+  with the module's name.
 - **Core** (`crates/services/src/dao/growth.rs`, indexes in core's plan beside `stats_*`): `growth_daily`,
-  `growth_org_daily`, `growth_exclusions`, `growth_alerts`.
+  `growth_org_daily`, `growth_exclusions`, `growth_alerts`, `growth_quality_daily` (P9a,
+  `dao/growth_quality.rs`).
 - **`saas`** (hosted-only, never in a self-host profile): what exists only for the hosted business. That is
   the purestat, Search Console, Bing and GitHub pullers; the promotion pipeline's ingest routes; the
   SendGrid webhook; `billing_events` and the wider Stripe handling. A self-hosted server compiles none of
@@ -610,6 +624,7 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 | `growth_alerts` | core | `{rule, key, fired_at, detail, cleared_at, mailed_on}` — `cleared_at` an explicit `null` while open; at most one open row per `(rule, key)` (a partial unique index, P10) | 90 days | the host's alert job |
 | `growth_digests` | core | `_id = "yyyy-mm-dd"`, `{status, computed_at, sent_at, recipients, sections}` | 25 months | the host's digest job |
 | `growth_weekly` | core | `_id = "YYYY-Www"` (the ISO week), the digest's row shape and claim; `sections` the week's headline against the weeks before and the reports computed for that week (P10) | 25 months | the host's weekly job |
+| `growth_quality_daily` | core | `_id = "<day>:<scope>:<agent_version>"`, `{day, day_start, scope: external \| all, agent_version, sessions {requested, reached_active, not_reached, pending, by_end_reason, duration_ms, peak_fps, avg_rtt_ms}, ttff {dist, hidden, later_attempts, outcomes}, crashes, device_days, computed_at}` — each distribution the day's exact p50/p90 plus a histogram over fixed edges; `agent_version` a release, `unknown` or `*` for every version; an absent part is **not measured** (P9a) | indefinitely (no org, no person) | the host's nightly freeze, under the org-day fold's claim; `POST …/quality/backfill` |
 | `growth_keys` | core | `{kind: ingest \| read, label, prefix, hash, created_by, created_at, revoked_at, last_used_at}` — the key's SHA-256 and a display prefix, never the key (D12, P8; the `read` kind P10) | until deleted; revoked rows stay | platform admins (host routes) |
 | `growth_posts` | core | `{platform, platform_id, account, format, url, published_at, key, cost_cents}`, unique `(platform, platform_id)`; no post text (P8) | indefinitely (our own content) | `saas`'s ingest route |
 | `growth_post_snapshots` | core | `{platform, platform_id, snapshot: T+1d\|T+7d\|T+28d, taken_at, metrics {raw: number}}`, unique `(platform, platform_id, snapshot)`, written once (P8) | indefinitely | `saas`'s ingest route |
@@ -636,6 +651,7 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 | delivery status | `newsletter_sends` | as FR-58 | the subscriber | newsletter section (P5: §2.14 and §7 name it) |
 | social, search, GitHub | `growth_daily`; social posts and their metric snapshots in `growth_posts` / `growth_post_snapshots` (P8: ids, URLs, numbers and the campaign key — never post text) | indefinitely | — (aggregates about our own content) | — |
 | daily digests | `growth_digests`; the platform admins' mailboxes | 25 months | — (org names, never a person) | new §2.18 |
+| remote-desktop quality per day and agent version (P9a) | `growth_quality_daily` | indefinitely | — (counts and percentiles about the product; no org, no device, no person) | new §2.18 |
 
 The privacy policy (`ui/src/views/legal/PrivacyPolicyView.vue`) gains §2.18, product analytics (purpose:
 improving the product and knowing which channels bring its users; basis Art. 6(1)(f); the retention
@@ -661,7 +677,7 @@ hosted only). §7's retention list grows, and `docs/data-model.md`'s stale TTLs 
 | PS3 | §3n PS3 in purestat | a tracker attribute | **live** 2026-10-14 23:02Z: purestat v0.1.9 (gjovanov/purestat#18) — read rate, scroll depth, opt-in link/download events |
 | P7 | §3k: the Search Console, Bing and GitHub pullers, the Content table | no credential ⇒ "not measured" | — |
 | P8 | §3j: the ingest routes, the Channels table, spend | no ingest key ⇒ 404 | **live** 2026-10-15 01:23Z (`hosted-20261015-cb26a2f`): #2237 `a7b56f5df`, AC18 field-verified (§8) — the ingest key, `…/ingest/{posts,snapshots}` (`saas`), `growth_posts` / `growth_post_snapshots`, `GET …/growth/channels`, the Campaigns reach column, the Channels tab. **The pipeline pushes** since 2026-10-15 22:02Z (the promotion repo's `tools/metrics/push.ts`, run by its hourly metrics task): 69 posts and 42 snapshots on the first run (§8). X and LinkedIn posts carry no reach yet: the promotion repo has no collector for either (LinkedIn's API grant is pending; X bills every read) |
-| P9 | §3f: session outcomes, the frozen time-to-first-frame, crashes per version, the session carrier, the rating | `ROOMLER__GROWTH__FEEDBACK=false` hides the prompt | — |
+| P9 | §3f: session outcomes, the frozen time-to-first-frame, crashes per version, the session carrier, the rating | `ROOMLER__GROWTH__FEEDBACK=false` hides the prompt; P9a has no switch of its own — it runs under the org-day fold (`growth.enabled`) | **P9a in PR #2305** (server only): `growth_quality_daily` frozen nightly from `remote_sessions`, `agent_logs` (FR-22's TTFF before its 7-day horizon, the version a device ran), `agent_crashes` (`agentVersion` — P1d had read `agent_version`, which no production row has, so every crash was `unknown`) and `stats_machine_1d`; `GET …/growth/quality` + `POST …/quality/backfill`; the Quality tab; the digest's and weekly's quality sections. Owed after the promote: the hand count of a closed day (§8). P9b (the rating, AC19) and P9c (the carrier) follow in their own PRs |
 | P10 | §3l: the read key, the weekly roll-up, alerts | `ROOMLER__GROWTH__ALERTS=false` and `ROOMLER__GROWTH__WEEKLY_ENABLED=false` (the defaults); a read key revoked is a 404 | **live** 2026-10-16 06:11Z (`hosted-20261016-c61bf32`): #2261 `c61bf3243`. Covers the `read` key kind and the gate every growth GET passes, `growth_weekly` and its Monday job, `growth_alerts` and the hourly rules, the Alerts panel and the Weekly tab, and the digest's `alerts` section. AC20 field-verified (§8). Both switches are on for roomler.ai since roomler-ai-deploy#33, effective at the next roll; the first scheduled roll-up and a red→green `digest_missing` are owed after it |
 | PS2, PS4–PS7 | §3n in purestat | per feature | PS2 **live** 2026-10-14 23:02Z (purestat v0.1.9, gjovanov/purestat#17); PS4 + PS5 **live** 23:21Z (v0.1.10, #15, #19); PS6 **live** 2026-10-15: the code in v0.1.9 (#16), switched on by purestat-deploy#12, and given real Google/GitHub client credentials by #13 (production's had been sealed empty since 2026-04-23); a real Google sign-in verified (§8); v0.1.11 2026-10-15: the sidebar's org picker after a direct page load (#20, purestat-deploy#14; red/green §8); PS7 — |
 | P11 | docs: `docs/growth-observability.md`, which also covers the existing `/observability` (no page describes it today); the `docs/data-model.md` TTL fixes; the privacy policy; the `docs/README.md` row | — | — |
