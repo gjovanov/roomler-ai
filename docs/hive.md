@@ -540,7 +540,7 @@ sequenceDiagram
 |---|---|---|
 | `hosted.json` sits beside the store, root's, `0600`, written whole. Per session it holds the launch's inputs (fence, account, the folder as asked, the starter and their address, Claude Code's session id), the turns begun, the turn in progress and who asked for it, its open approvals, and the harness's pid and start time | after a restart the device holds nothing else: the replay of its last reports lived in memory | [`hosted.rs`](../agents/roomlerd/src/hive/hosted.rs) |
 | A new turn's number and a new approval are written before the frame that tells the server, and so is a turn's end; an approval's end is written after its frame | a reused turn number would have every later stub ignored as older than the newest, and a finished turn must never be reported cut. A withdrawal sent twice changes only an approval still open | [`supervisor.rs:5238`](../agents/roomlerd/src/hive/supervisor.rs#L5238) |
-| From `begin_shutdown` on, the record is frozen, the toolbelt is ignored, and new prompts and starts are refused ("this device is restarting"). `begin_shutdown` runs the moment any shutdown is signalled: an update, a requested restart, a rollback, an OS stop | the teardown's frames go into closing connections; recorded, they would be lost twice. Field, 2026-10-08: an approval the teardown withdrew stayed "needed" | [`main.rs:3796`](../agents/roomlerd/src/main.rs#L3796), [`supervisor.rs:3405`](../agents/roomlerd/src/hive/supervisor.rs#L3405) |
+| From `begin_shutdown` on, the record is frozen, the toolbelt is ignored, and new prompts and starts are refused ("this device is restarting"). `begin_shutdown` runs the moment any shutdown is signalled: an update, a requested restart, a rollback, an OS stop | the teardown's frames go into closing connections; recorded, they would be lost twice. Field, 2026-10-08: an approval the teardown withdrew stayed "needed" | [`main.rs:3814`](../agents/roomlerd/src/main.rs#L3814), [`supervisor.rs:3405`](../agents/roomlerd/src/hive/supervisor.rs#L3405) |
 | A harness that ends without a stop waits 1 s before its end counts, and if the daemon was told to stop by then the session is kept and nothing is reported | under systemd the daemon hears its stop a moment before the harness dies | [`supervisor.rs:3503`](../agents/roomlerd/src/hive/supervisor.rs#L3503) |
 | The next daemon resumes at the first connection of its primary enrollment, once, and that connection's manifest waits for it, at most 60 s | a manifest sent first would leave the resuming sessions out, and the server would end every one. A device that never comes back online launches nothing | [`supervisor.rs:3266`](../agents/roomlerd/src/hive/supervisor.rs#L3266) |
 | ⚠️ Every gate a start passes is passed again, as the device is configured now: `hive_enabled`, the starter mapped to the SAME account, the folder inside `hive_roots`, capacity, a harness. A refusal ends the session ("not resumed after the device restarted: …") and forgets it | an owner who turns sessions off, or remaps an account, and restarts must not find the session back | [`supervisor.rs:3299`](../agents/roomlerd/src/hive/supervisor.rs#L3299) |
@@ -3922,7 +3922,8 @@ retention, and serves a session's room when no other member is online (§3b, dec
 no session. The org runs it as a container on its own machines: a replica is a plaintext copy of
 everything the agent saw, so an archive Roomler ran would hold every hosted org's transcripts.
 `Dockerfile.hive-archive` builds it: `roomlerd` with `hive` and `overlay-netstack` only, no
-capture, no input, no TUN.
+capture, no input, no TUN. It is on the org's mesh in that userspace stack (P2k-4), so a member
+that only DERP reaches is followed over DERP.
 
 ```mermaid
 sequenceDiagram
@@ -3934,6 +3935,7 @@ sequenceDiagram
     C->>C: no /data/config.toml: enroll --archive-replica (fresh config, standard token)
     C->>S: enroll: the device, named after the fixed hostname
     C->>C: config written WITH the archive posture, then run
+    C->>S: on the mesh, in the userspace stack: its lease, a DERP connection
     A->>S: the org's Hive policy: archive_devices += the device
     S->>C: rc:hive.replica.join for each session the rules place there
     Note over C: every later start: run from the volume, no token
@@ -3954,13 +3956,15 @@ docker run -d --name hive-archive --hostname hive-archive-1 \
 | `exec_enabled`, `ssh_enabled` off | it reaches the org's network for no one |
 | `forward_acl.enabled` off | no tunnel exit: an empty allowlist would otherwise trust the server |
 | `auto_update` off | it updates by a new container on the same volume, never by a package installed inside one |
+| `overlay_enabled` on, `netstack_socks_port` 11080 (P2k-4) | on the mesh it holds a DERP connection, and a member asks on the `derp` rung only while it holds one ([`follow.rs:271`](../agents/roomlerd/src/hive/supervisor/follow.rs#L271)): before P2k-4, a primary that only DERP reached was never followed (the field run's F4). The userspace stack changes no route and needs no privilege, and a container has no TUN |
 
 | Rule | Why | Where |
 |---|---|---|
-| The posture is written with the enrolled config, before its first save | the first start is already an archive replica; a script appending keys to the file afterwards would land them under whatever `[table]` came last | [`archive_replica.rs:61`](../agents/roomlerd/src/archive_replica.rs#L61), [`main.rs:2475`](../agents/roomlerd/src/main.rs#L2475) |
-| Refused before the single-use token is spent: an existing config, an ephemeral enrollment, a build that holds no copies | the volume is the device, and folding an existing enrollment into one would make some other device an archive replica in place; FR-51 deletes an ephemeral device once it falls silent | [`archive_replica.rs:35`](../agents/roomlerd/src/archive_replica.rs#L35), [`main.rs:2382`](../agents/roomlerd/src/main.rs#L2382) |
+| The posture is written with the enrolled config, before its first save | the first start is already an archive replica; a script appending keys to the file afterwards would land them under whatever `[table]` came last | [`archive_replica.rs:66`](../agents/roomlerd/src/archive_replica.rs#L66), [`main.rs:2475`](../agents/roomlerd/src/main.rs#L2475) |
+| Refused before the single-use token is spent: an existing config, an ephemeral enrollment, a build that holds no copies | the volume is the device, and folding an existing enrollment into one would make some other device an archive replica in place; FR-51 deletes an ephemeral device once it falls silent | [`archive_replica.rs:40`](../agents/roomlerd/src/archive_replica.rs#L40), [`main.rs:2382`](../agents/roomlerd/src/main.rs#L2382) |
+| An archive replica enrolled before P2k-4 joins the mesh at its first start in a newer image, and its config is saved once; a port it already had is kept. Only in the image, which says so in its environment (`ROOMLERD_ARCHIVE_IMAGE=1`) | it updates by a new container on the same volume, so that start is the one place an older enrollment can take the newer posture; a device whose owner offers it as an archive replica outside the image keeps the overlay its owner chose | [`archive_replica.rs:111`](../agents/roomlerd/src/archive_replica.rs#L111), [`main.rs:3153`](../agents/roomlerd/src/main.rs#L3153) |
 | The entrypoint enrolls only when the volume holds no config, and never prints the token; a failed enrollment writes nothing, so the next start tries again | the token is single use and 10 minutes long; every later start runs from the volume | [`hive-archive-entrypoint.sh:24`](../scripts/hive-archive-entrypoint.sh#L24) |
-| Not root: its own account, uid 10001, whose home is the volume, so the store and every file the daemon keeps live there with the config | it runs no session as anyone, so it needs no account but its own | [`Dockerfile.hive-archive:66`](../Dockerfile.hive-archive#L66) |
+| Not root: its own account, uid 10001, whose home is the volume, so the store and every file the daemon keeps live there with the config | it runs no session as anyone, so it needs no account but its own | [`Dockerfile.hive-archive:73`](../Dockerfile.hive-archive#L73) |
 | Built and smoke-tested on every PR that touches it; published only by a dispatch, `dry_run` on by default | publishing puts a public package under the operator's account, as the self-host image (FR-42) | [`hive-archive-image.yml:23`](../.github/workflows/hive-archive-image.yml#L23) |
 
 The smoke test, before any push: the binary starts with the libraries it links; it is the build
@@ -3974,6 +3978,11 @@ as the device. Encryption at rest is P7.
 ⚠️ **A fixed hostname.** The machine id hashes the hostname, the OS and the config path
 (`crates/agent-core/src/machine.rs`): one container keeps its name across restarts (compose's
 `hostname:`, a StatefulSet's pod name), and two archive replicas of one org never share one.
+
+⚠️ **On the mesh as this device (P2k-4).** The userspace stack's SOCKS5 front is on
+`127.0.0.1:11080`, the container's own loopback on a network of its own, as `docker run` gives
+it above. Under `--network host` it is the host's, and anything running there reaches the org's
+mesh as the archive replica. A port the front cannot bind leaves the mesh up without it.
 
 ⚠️ **A new package on GHCR is private** until the operator makes it public. Until then only
 accounts with access to the package can pull it.
