@@ -15,7 +15,7 @@
   <div class="hive-transcript d-flex flex-column">
     <div class="d-flex align-center px-3 py-2 ga-2">
       <v-chip size="small" :color="statusColor" variant="tonal" data-testid="hive-viewer-status">
-        {{ $t(`hive.viewer.status.${viewer.status.value}`) }}
+        {{ $t(`hive.viewer.status.${statusKey}`) }}
       </v-chip>
       <v-chip v-if="viewer.runState.value" size="small" variant="outlined">
         {{ $t(`hive.state.${viewer.runState.value}`, viewer.runState.value) }}
@@ -349,10 +349,18 @@ function checkpointLine(e: any): string {
   return head
 }
 
+// FR-90 P2k-6 (F2) — an open view of a member's copy (P2d-5) is not the
+// device live: the chip says so, as the read-only note below does.
+const statusKey = computed(() =>
+  viewer.status.value === 'open' && viewer.copy.value ? 'openCopy' : viewer.status.value,
+)
+
 const statusColor = computed(() => {
-  switch (viewer.status.value) {
+  switch (statusKey.value) {
     case 'open':
       return 'success'
+    case 'openCopy':
+      return 'info'
     case 'opening':
     case 'connecting':
       return 'info'

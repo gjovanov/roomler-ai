@@ -312,6 +312,24 @@ describe('HiveTranscript — who drives (FR-90 P1c)', () => {
     )
   })
 
+  it('says on its chip that it reads a copy (P2k-6), never that it is live from the device', async () => {
+    hoisted.viewer = makeViewer([], [], false)
+    const live = await render()
+    expect(live.find('[data-testid="hive-viewer-status"]').text()).toBe('Live from the device')
+    hoisted.viewer = makeViewer([], [], false)
+    hoisted.viewer.copy.value = true
+    const copy = await render()
+    expect(copy.find('[data-testid="hive-viewer-status"]').text()).toBe('Reading a copy')
+    hoisted.viewer = makeViewer([], [], false)
+    hoisted.viewer.copy.value = true
+    hoisted.viewer.status.value = 'connecting'
+    const dialing = await render()
+    expect(
+      dialing.find('[data-testid="hive-viewer-status"]').text(),
+      'a copy not yet open is still being connected to',
+    ).toBe('Connecting…')
+  })
+
   it('says a copy (P2d-5) is read-only because the device that runs the session cannot serve it, with no composer', async () => {
     hoisted.viewer = makeViewer([], [], false)
     hoisted.viewer.copy.value = true
