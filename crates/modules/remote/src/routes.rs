@@ -214,7 +214,7 @@ pub struct SessionFeedbackResponse {
 /// | posted sooner than 30 s after the session was requested | 409 `too_early` — the viewer never offers the prompt before that, so an earlier post did not come from it |
 /// | not JSON, an unknown key (a comment), a rating or a reason outside the vocabulary, too many reasons | 422 `invalid_json` · `unknown_rating` · `unknown_reason` · `too_many_reasons` — a code, never the value, nothing stored |
 /// | a body over 1 KiB | 413 |
-/// | the session already rated | 409 `already_rated` — the unique index decides, so two posts store one |
+/// | this person already rated the session | 409 `already_rated` — the unique `(session_id, user_id)` index decides, so two posts by one person store one, while the controller and each watcher rate once each |
 /// | stored | 201 with what was stored |
 ///
 /// `user_id` comes from the authenticated request and `agent_id` from the

@@ -839,7 +839,10 @@
           </p>
         </template>
         <!-- FR-102 P9b — after a session of 30 s or more, at most once a day:
-             a thumb and optional reason chips, dismissible, never a dialog. -->
+             a thumb and optional reason chips, dismissible, never a dialog.
+             Mounted here and in the error ending below — two branches of this
+             one v-if chain, so at most one ever renders (locked by
+             `rcRatingMount.spec.ts`). -->
         <session-rating-prompt
           v-if="ratingPending"
           :status="ratingStatus"
@@ -944,7 +947,8 @@
           {{ rc.error.value }}
         </p>
         <!-- FR-102 P9b — a failed attempt of 30 s or more is worth asking
-             about too ("couldn't connect" is a chip). -->
+             about too ("couldn't connect" is a chip). The other branch of the
+             chain above; never both. -->
         <session-rating-prompt
           v-if="ratingPending"
           :status="ratingStatus"

@@ -240,15 +240,17 @@ impl Module for RemoteState {
                     index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
                 ],
             },
-            // FR-102 P9b — one rating per session (the unique index is the
-            // arbiter between two posts for one session), read per org over
-            // time by the digest, purged per user with the account; kept 25
-            // months (spec §3p).
+            // FR-102 P9b — one rating per session PER PERSON: a rating is one
+            // person's experience (the controller and a watcher of the same
+            // session may sit on different networks), so the unique index is
+            // `(session_id, user_id)` — the arbiter between two posts by one
+            // person, never between two people. Read per org over time by the
+            // digest, purged per user with the account; kept 25 months (§3p).
             IndexSet {
                 collection: "session_feedback",
                 pre_ops: Vec::new(),
                 indexes: vec![
-                    index_unique(bson::doc! { "session_id": 1 }),
+                    index_unique(bson::doc! { "session_id": 1, "user_id": 1 }),
                     index(bson::doc! { "tenant_id": 1, "ts": -1 }),
                     index(bson::doc! { "user_id": 1 }),
                     index_ttl(bson::doc! { "ts": 1 }, SessionFeedback::TTL_SECONDS),

@@ -3,13 +3,15 @@
 //! FR-102 P9b — `session_feedback`: a person's rating of one remote session
 //! (spec §3f, D10), the `remote` module's collection.
 //!
-//! One row per session — the unique index on `session_id` is the arbiter,
-//! so two posts for one session (a double click, two tabs) store one and
-//! answer the other `AlreadyRated` rather than a second row. Rows carry a
-//! thumb, reason codes and ids, never text. They expire after 25 months (the
-//! module's TTL on `ts`) and go with the user ([`SessionFeedbackDao::purge_user`]
-//! is the one call an account deletion makes for them; no account hard-delete
-//! path exists today, so the TTL is what bounds them for now).
+//! One row per session **per person** — the unique index on
+//! `(session_id, user_id)` is the arbiter, so two posts by one person for one
+//! session (a double click, two tabs) store one and answer the other
+//! `AlreadyRated`, while the controller and each watcher of a session rate it
+//! once each: a rating is one person's experience. Rows carry a thumb, reason
+//! codes and ids, never text. They expire after 25 months (the module's TTL
+//! on `ts`) and go with the user ([`SessionFeedbackDao::purge_user`] is the
+//! one call an account deletion makes for them; no account hard-delete path
+//! exists today, so the TTL is what bounds them for now).
 
 use bson::{doc, oid::ObjectId};
 use mongodb::Database;
@@ -25,7 +27,7 @@ pub struct SessionFeedbackDao {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recorded {
     Stored(ObjectId),
-    /// The session already has a rating; nothing was written.
+    /// This person already rated this session; nothing was written.
     AlreadyRated,
 }
 
@@ -36,24 +38,31 @@ impl SessionFeedbackDao {
         }
     }
 
-    /// Insert one rating. A duplicate on `session_id` is `AlreadyRated`; a
-    /// duplicate on anything else is the error it is.
+    /// Insert one rating. A duplicate on `(session_id, user_id)` — the
+    /// dup-key document names both — is `AlreadyRated`; a duplicate on
+    /// anything else is the error it is.
     pub async fn record(&self, feedback: &SessionFeedback) -> DaoResult<Recorded> {
         match self.base.insert_one(feedback).await {
             Ok(id) => Ok(Recorded::Stored(id)),
-            Err(DaoError::DuplicateKey(msg)) if duplicate_key_is_on(&msg, "session_id") => {
+            Err(DaoError::DuplicateKey(msg))
+                if duplicate_key_is_on(&msg, "session_id")
+                    && duplicate_key_is_on(&msg, "user_id") =>
+            {
                 Ok(Recorded::AlreadyRated)
             }
             Err(e) => Err(e),
         }
     }
 
-    /// The rating of one session, when there is one.
-    pub async fn find_for_session(
+    /// One person's rating of one session, when there is one.
+    pub async fn find_for_session_and_user(
         &self,
         session_id: ObjectId,
+        user_id: ObjectId,
     ) -> DaoResult<Option<SessionFeedback>> {
-        self.base.find_one(doc! { "session_id": session_id }).await
+        self.base
+            .find_one(doc! { "session_id": session_id, "user_id": user_id })
+            .await
     }
 
     /// Everything one person ever answered, removed — spec principle 7: rows

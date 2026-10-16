@@ -1325,8 +1325,9 @@ thumbs up or down with optional reason chips (*lag*, *picture*, *mouse or keyboa
 connect*, *something else*), at most once a UTC day per browser, dismissible, inline beside the
 Connect button, never a dialog, never focused, never a text field. Every gate fails toward not
 asking (`ui/src/composables/rcSessionRating.ts`), and the server (`remote`,
-`POST /api/tenant/{tid}/session/{sid}/feedback`) accepts one rating per session from a party to
-it, not before 30 s after the request, codes only, and answers the empty 404 while
+`POST /api/tenant/{tid}/session/{sid}/feedback`) accepts one rating per session per party to
+it (the controller and each watcher once), not before 30 s after the request, codes only, and
+answers the empty 404 while
 `ROOMLER__GROWTH__FEEDBACK=false`. Nothing here touches the session's data path: the rating is a
 question asked after it. The rules, the row and the field plan:
 [growth-observability.md](growth-observability.md#the-post-session-rating-p9b).

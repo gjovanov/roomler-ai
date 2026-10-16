@@ -1533,18 +1533,19 @@ sequenceDiagram
 | **Never blocks, never steals focus** | the strip is inline in the viewer's ended state (`SessionRatingPrompt.vue`), beside the Connect button, which works as before; not a dialog, no `autofocus`, nothing captured; a new Connect withdraws it without posting. The Playwright spec asserts no element of the prompt holds the focus when it appears |
 | **No free text** | a thumb and chips from a fixed vocabulary; the request type is `deny_unknown_fields`, so a `comment` key fails the parse on the server; reasons are deduplicated in vocabulary order |
 | **Who may rate** | the session's controller or a watcher, within the path's org (a foreign session is a 404 that leaks nothing; a member who was not in the session is a 403); `user_id` comes from the request, `agent_id` from the session row — never from the body |
-| **One per session** | the unique index on `session_id` is the arbiter: two posts (a double click, two tabs) store one, the other answers `already_rated` |
+| **One per session per person** | a rating is one person's experience — the controller and a watcher of the same session may have sat on different networks — so the unique index is `(session_id, user_id)`: two posts by one person (a double click, two tabs) store one and the other answers `already_rated`, while each party rates once. The digest counts **answers**, not sessions: a session with two parties can carry two |
+| **One prompt at a time** | the viewer mounts the strip in the closed ending and in the error ending, two branches of one `v-if` chain; `rcRatingMount.spec.ts` parses the template and proves it, and the Playwright spec counts exactly one live |
 
 ### The route and the row
 
 | Method | Path | Credential | Answers |
 |---|---|---|---|
-| POST | `/api/tenant/{tenant_id}/session/{session_id}/feedback` `{rating: up \| down, reasons: [codes]}` (≤ 1 KiB) | session, a party to the session | 201 `{session_id, rating, reasons, ts}` · 403 `not_a_member` / `forbidden` · 404 (not this org's session) · 409 `too_early` / `already_rated` · 422 `invalid_json` / `unknown_rating` / `unknown_reason` / `too_many_reasons` (a code, never the value, nothing stored) · 413 · the **empty 404** of an absent path while `ROOMLER__GROWTH__FEEDBACK=false` |
+| POST | `/api/tenant/{tenant_id}/session/{session_id}/feedback` `{rating: up \| down, reasons: [codes]}` (≤ 1 KiB) | session, a party to the session | 201 `{session_id, rating, reasons, ts}` · 403 `not_a_member` / `forbidden` · 404 (not this org's session) · 409 `too_early` / `already_rated` (this person, this session) · 422 `invalid_json` / `unknown_rating` / `unknown_reason` / `too_many_reasons` (a code, never the value, nothing stored) · 413 · the **empty 404** of an absent path while `ROOMLER__GROWTH__FEEDBACK=false` |
 
 `session_feedback` (the `remote` module's; `crates/modules/remote/src/routes.rs`,
 `crates/services/src/dao/session_feedback.rs`): `{session_id, tenant_id, user_id, agent_id,
-rating, reasons, ts}`, unique `session_id`, `(tenant_id, ts)`, `(user_id)`, **25-month TTL** on
-`ts`. `SessionFeedbackDao::purge_user` takes one person's answers and nobody else's — the seam
+rating, reasons, ts}`, unique `(session_id, user_id)`, `(tenant_id, ts)`, `(user_id)`,
+**25-month TTL** on `ts`. `SessionFeedbackDao::purge_user` takes one person's answers and nobody else's — the seam
 an account deletion calls; no account hard-delete path exists today, so the TTL is what bounds
 the rows for now. A self-hosted server keeps its own rows and sends none anywhere.
 
@@ -1555,9 +1556,10 @@ prompt (`/api/capabilities` → `features.session_feedback: false`), the route a
 server" — never a zero, since nobody could answer.
 
 **Where the answers show**: the daily digest's `quality.ratings` — `up`, `down`, `rated` as
-`{day, d7, d28}`, `up_share_28d` only from 30 answers, `reasons_28d` most often first — with the
-exclusion set applied to the org **and** to the person (a platform admin's own thumbs are not
-the product's); a digest stored before P9b reads it as "arrives with P9b". The privacy policy's
+`{day, d7, d28}` (answers, not sessions), `up_share_28d` only from 30 answers, `reasons_28d`
+most often first — with the exclusion set applied to the org **and** to the person (a platform
+admin's own thumbs are not the product's); a digest stored before P9b reads it as "arrives with
+P9b". The privacy policy's
 §2.15 says what is asked, what is stored and for how long; §7 lists the retention.
 
 ### Field verification (owed after the promote)
@@ -1600,7 +1602,7 @@ FR's field-verification log ([FR-102 §8](fr/FR-102-growth-observability.md#8-fi
 | The weekly roll-up is stored and mailed once for the first Monday after `ROOMLER__GROWTH__WEEKLY_ENABLED=true`, with both pods running, and its headline sign-ups equal a hand count for the week | owed | `crates/tests/src/growth_p10_tests.rs` — two concurrent runs → one mail; a `sent` week never re-sent; a preview never cancels the scheduled mail; a manual send racing the scheduler mails once; the routes |
 | An alert fires once, mails once and clears: `digest_missing` on a day the digest is held back (red), cleared once it runs (green), with `ROOMLER__GROWTH__ALERTS=true` | owed | `crates/tests/src/growth_p10_tests.rs` — each evaluable rule fires once, a second evaluation adds nothing, the clear, a re-fire the same day mails nothing, the digest's `alerts` section |
 | For a closed day, the frozen `*` row and the Quality tab equal the hand counts of [remote-desktop quality](#field-verification-owed-after-the-promote): sessions requested by outcome from `remote_sessions`, TTFF p50/p90 from the FR-22 filter over `agent_logs`, crashes by `agentVersion`, device-days from `stats_machine_1d`; the digest's `crashes.by_agent_version` names real versions where it read `unknown` before (P9a) | owed after the promote | `crates/tests/src/growth_quality_tests.rs` — the freeze from the four sources as they are really written (the camelCase crash payload, the browser record, the agents' batches), the version from the logs before the row, both scopes, idempotency, a day past the log horizon frozen without TTFF; the view, the backfill, the digest's and the weekly's sections |
-| The rating prompt appears at most once per user per day and never after a session shorter than 30 s, and dismissing it changes nothing else in the viewer (AC19, P9b); a rating posts once and the next digest counts it | owed: the Playwright spec's run in the pod lane, then a real prompt on production | `ui/e2e/remote-session-rating.spec.ts` (the four sessions); `ui/src/__tests__/composables/rcSessionRating.spec.ts` — every gate, the 30 s from the request, the UTC day, a storage that cannot keep it; `crates/tests/src/session_feedback_tests.rs` — a party stores once with codes only, everyone else refused with a code, the kill switch's empty 404, `purge_user`, the digest's `quality.ratings` |
+| The rating prompt appears at most once per user per day and never after a session shorter than 30 s, and dismissing it changes nothing else in the viewer (AC19, P9b); a rating posts once and the next digest counts it | owed: the Playwright spec's run in the pod lane, then a real prompt on production | `ui/e2e/remote-session-rating.spec.ts` (the four sessions, exactly one prompt element); `ui/src/__tests__/components/rcRatingMount.spec.ts` — the two mounts are branches of one `v-if` chain; `ui/src/__tests__/composables/rcSessionRating.spec.ts` — every gate, the 30 s from the request, the UTC day, a storage that cannot keep it; `crates/tests/src/session_feedback_tests.rs` — a party stores once with codes only, the controller and a watcher each once, everyone else refused with a code, the kill switch's empty 404, `purge_user`, the digest's `quality.ratings` |
 
 The newsletter's webhook is to be shown on production to refuse a bad signature (control),
 and to record `delivered` and `bounce` for a test send with one forced bounce, the bounced

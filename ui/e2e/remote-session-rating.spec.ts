@@ -130,6 +130,10 @@ test.describe('AC19 — the post-session rating prompt', () => {
     //    it posts nothing and leaves the viewer exactly where it was.
     await runSession(page, LONG_SESSION_HOLD_MS)
     await expect(prompt(page)).toBeVisible({ timeout: 10_000 })
+    // Exactly one prompt: the viewer mounts it in the closed ending and in
+    // the error ending, two branches of one v-if chain (locked structurally
+    // by `rcRatingMount.spec.ts`; live here for the closed ending).
+    await expect(prompt(page)).toHaveCount(1)
     await expect(page.getByTestId('rc-rating-up')).toBeVisible()
     await expect(page.getByTestId('rc-rating-down')).toBeVisible()
     // Nothing in the prompt took the focus: the active element is the body
@@ -163,6 +167,7 @@ test.describe('AC19 — the post-session rating prompt', () => {
       await page2.goto(remoteUrl)
       await runSession(page2, LONG_SESSION_HOLD_MS)
       await expect(prompt(page2)).toBeVisible({ timeout: 10_000 })
+      await expect(prompt(page2)).toHaveCount(1)
       await page2.getByTestId('rc-rating-down').click()
       await expect(page2.getByTestId('rc-rating-reason-lag')).toBeVisible()
       await page2.getByTestId('rc-rating-reason-lag').click()

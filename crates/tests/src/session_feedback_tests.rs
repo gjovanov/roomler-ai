@@ -5,8 +5,9 @@
 //!
 //! * a party to the session (its controller, a watcher) stores one rating
 //!   with exactly the documented fields — the person from the request, the
-//!   device from the session row, codes only; a second post for the same
-//!   session is `already_rated` and stores nothing;
+//!   device from the session row, codes only; the controller and a watcher
+//!   each rate the same session once, and the same person's second post is
+//!   `already_rated` and stores nothing;
 //! * a member who was not in the session, a foreign org's member, an
 //!   unauthenticated caller, a session the path's org does not own, a post
 //!   sooner than 30 s after the request, every bad body and an oversize one
@@ -156,7 +157,8 @@ async fn a_party_rates_a_session_once_with_codes_only_and_everyone_else_is_refus
     assert_eq!(d.get_object_id("tenant_id").unwrap(), tid);
     assert_eq!(d.get_str("rating").unwrap(), "up");
 
-    // A second post for s1 — a double click, another tab — stores nothing.
+    // The same person's second post for s1 — a double click, another tab —
+    // stores nothing.
     let (status, j) = post(
         &app,
         &path(&org.tenant_id, &s1),
@@ -177,6 +179,32 @@ async fn a_party_rates_a_session_once_with_codes_only_and_everyone_else_is_refus
     .await;
     assert_eq!(status, 201, "{j}");
     assert_eq!(j["reasons"], json!(["lag", "other"]));
+    // A rating is one person's experience: the controller of s2 rates it
+    // too, once — and not twice.
+    let (status, j) = post(
+        &app,
+        &path(&org.tenant_id, &s2),
+        &org.admin.access_token,
+        json!({ "rating": "up" }),
+    )
+    .await;
+    assert_eq!(status, 201, "the controller after the watcher: {j}");
+    let (status, j) = post(
+        &app,
+        &path(&org.tenant_id, &s2),
+        &org.admin.access_token,
+        json!({ "rating": "up" }),
+    )
+    .await;
+    assert_eq!((status, j["error"].as_str()), (409, Some("already_rated")));
+    let s2_raters: Vec<ObjectId> = rows(&app)
+        .await
+        .iter()
+        .filter(|d| d.get_object_id("session_id").unwrap() == s2)
+        .map(|d| d.get_object_id("user_id").unwrap())
+        .collect();
+    assert_eq!(s2_raters.len(), 2, "two people, one row each");
+    assert!(s2_raters.contains(&member) && s2_raters.contains(&admin));
 
     // A session that never reached Active is rated like any other.
     let (status, _) = post(

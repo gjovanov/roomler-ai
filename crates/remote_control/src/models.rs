@@ -4710,13 +4710,15 @@ impl SessionFeedbackRequest {
 /// viewer after a session of 30 s or more (spec §3f, D10: "a thumbs rating
 /// after a session now; NPS later").
 ///
-/// One per session (a unique index on `session_id`), resolved within the
-/// tenant, posted only by a person who was in the session (its controller
-/// or a watcher). `reasons` are codes from [`FEEDBACK_REASONS`]; there is no
-/// text field. Kept 25 months (the `remote` module's TTL on `ts`) and
-/// deleted with the user (`SessionFeedbackDao::purge_user`, the seam an
-/// account deletion calls). A self-hosted server keeps its own rows and
-/// sends none anywhere.
+/// One per session **per person** (a unique index on `(session_id,
+/// user_id)` — a rating is one person's experience, and the controller and
+/// a watcher of one session may have had different ones), resolved within
+/// the tenant, posted only by a person who was in the session (its
+/// controller or a watcher). `reasons` are codes from [`FEEDBACK_REASONS`];
+/// there is no text field. Kept 25 months (the `remote` module's TTL on
+/// `ts`) and deleted with the user (`SessionFeedbackDao::purge_user`, the
+/// seam an account deletion calls). A self-hosted server keeps its own rows
+/// and sends none anywhere.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SessionFeedback {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]

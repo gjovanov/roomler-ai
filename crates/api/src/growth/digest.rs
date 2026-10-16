@@ -973,12 +973,14 @@ fn quality_before_p9a<T>() -> Measured<T> {
 
 /// P9b — what people answered the viewer's post-session prompt (spec §3f,
 /// D10): thumbs per window, and the reason chips over 28 days. Counts of
-/// answers, never who answered; a share only from [`SMALL_N`] answers.
+/// **answers** — one person's rating of one session; a session with two
+/// parties can carry two — never of sessions and never who answered; a
+/// share only from [`SMALL_N`] answers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Ratings {
     pub up: Figure,
     pub down: Figure,
-    /// `up + down`.
+    /// `up + down`: answers, not sessions.
     pub rated: Figure,
     /// `up / rated` over 28 days, only from [`SMALL_N`] answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
