@@ -958,7 +958,7 @@ New cells run three times before they are trusted. An entry in `expected-failure
   the X server for it. On P1a's candidate the picture is the same and there is no warning (0 of 58).
   **Windows and macOS, in the code:**
   - The pumps' wait hold (P3e, P5f) engages only when a capture backend reports a wait. Only the Linux DRM and
-    portal backends do; the trait's default is `None` (`capture/mod.rs:393`).
+    portal backends do; the trait's default is `None` (`capture/mod.rs:397`).
   - The reach verdict is `full` on Windows, so a session there is told nothing. On macOS the warning comes only
     while Accessibility is not granted. That is P1's own, deliberate: before it, such a session looked
     interactive and did nothing.
