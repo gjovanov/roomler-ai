@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use tracing::info;
+use tracing::{info, warn};
 
 use drm::buffer::DrmFourcc;
 use drm::control::{crtc, framebuffer, plane, property};
@@ -124,6 +124,94 @@ struct BufferId {
 struct Cached {
     id: BufferId,
     mapping: Mapping,
+}
+
+/// What a worker keeps between grabs: the CPU mapping of the last buffer
+/// (the idle check reads it, and the CPU path repacks from it), and the GPU
+/// path's state (FR-107 P3).
+struct ReadCache {
+    mapping: Option<Cached>,
+    gpu: GpuState,
+}
+
+/// FR-107 P3 — whether this worker reads the scanout through the GPU.
+enum GpuState {
+    /// Not opened yet: the first grab tries, on this worker thread, which is
+    /// where its EGL context must live.
+    Untried,
+    Ready(Box<super::drm_gpu::Converter>),
+    /// `ROOMLERD_DRM_GPU=0`, no usable GPU, or a GPU pass that failed: the CPU
+    /// reads every frame of this capture.
+    Off,
+}
+
+/// FR-107 P3 — this frame through the GPU, where it is up; `None` hands it to
+/// the CPU path. A failure turns the GPU off for the rest of this capture,
+/// said once: a GPU that failed once is not trusted with the next frame.
+fn via_gpu(
+    gpu: &mut GpuState,
+    id: BufferId,
+    src: &super::drm_gpu::Source,
+    sizing: Sizing,
+) -> Option<Scaled> {
+    if matches!(gpu, GpuState::Untried) {
+        *gpu = match super::drm_gpu::Converter::open() {
+            Ok(c) => {
+                info!(
+                    renderer = c.renderer.as_str(),
+                    "drm capture: the GPU reads the scanout (FR-107 P3; ROOMLERD_DRM_GPU=0 hands it back to the CPU)"
+                );
+                GpuState::Ready(Box::new(c))
+            }
+            Err(e) => {
+                info!(
+                    error = %format!("{e:#}"),
+                    "drm capture: no GPU path here, the CPU reads the scanout (FR-107 P3)"
+                );
+                GpuState::Off
+            }
+        };
+    }
+    let GpuState::Ready(conv) = gpu else {
+        return None;
+    };
+    let out = gpu_out(src.width, src.height, sizing);
+    match conv.convert((u32::from(id.fb), id.inode), src, out) {
+        Ok(data) => Some(Scaled {
+            data,
+            width: out.0,
+            height: out.1,
+            stride: out.0 * 4,
+            source: (out != (src.width, src.height)).then_some((src.width, src.height)),
+        }),
+        Err(e) => {
+            warn!(
+                error = %format!("{e:#}"),
+                "drm capture: a GPU pass failed, the CPU reads the scanout for the rest of this capture (FR-107 P3)"
+            );
+            *gpu = GpuState::Off;
+            None
+        }
+    }
+}
+
+/// FR-107 P3 — the size the GPU renders: exactly the pump's encode box where
+/// it is smaller than the source, so the pump's resample passes the frame
+/// through untouched; otherwise what the CPU path would deliver.
+fn gpu_out(width: u32, height: u32, sizing: Sizing) -> (u32, u32) {
+    if let Some((cw, ch)) = sizing.cap
+        && cw >= 2
+        && ch >= 2
+        && cw <= width
+        && ch <= height
+    {
+        return (cw, ch);
+    }
+    if wants_half(width, height, sizing.policy, None) {
+        (width / 2, height / 2)
+    } else {
+        (width, height)
+    }
 }
 
 /// Whether a mapping of `mapped` (its buffer and length) still maps buffer
@@ -942,7 +1030,14 @@ fn worker(
         return;
     }
 
-    let mut cached: Option<Cached> = None;
+    let mut cache = ReadCache {
+        mapping: None,
+        gpu: if super::drm_gpu::enabled() {
+            GpuState::Untried
+        } else {
+            GpuState::Off
+        },
+    };
     // FR-93 P3d — the frame skip for an unchanged screen, Wayland seats only.
     let mut gate = idle_skip.then(IdleGate::default);
     // FR-93 P3e — an empty scanout is told apart: a display switched off.
@@ -968,7 +1063,7 @@ fn worker(
         let reply = match grab(
             &card,
             &planes,
-            &mut cached,
+            &mut cache,
             sizing,
             cursor.as_mut(),
             gate.as_mut(),
@@ -1023,7 +1118,7 @@ fn unreadable(buffers: [Option<drm::buffer::Handle>; 4]) -> Option<&'static str>
 fn grab(
     card: &Card,
     planes: &[PlaneEntry],
-    cached: &mut Option<Cached>,
+    cache: &mut ReadCache,
     sizing: Sizing,
     cursor: Option<&mut CursorReader>,
     gate: Option<&mut IdleGate>,
@@ -1085,6 +1180,7 @@ fn grab(
     };
 
     // Re-map only when the compositor handed us a different buffer.
+    let cached = &mut cache.mapping;
     if !maps(cached.as_ref().map(|c| (c.id, c.mapping.len)), id, len) {
         // SAFETY: a fresh private read-only mapping of the exported dma-buf,
         // sized from the framebuffer's own pitch × height.
@@ -1109,10 +1205,10 @@ fn grab(
             mapping: Mapping { ptr, len },
         });
     }
-    // The mapping holds the dma-buf, which holds the buffer.
-    drop(prime);
+    // The mapping holds the dma-buf, which holds the buffer. `prime` stays
+    // open until the GPU path (FR-107 P3) has imported it, below.
 
-    let Some(Cached { mapping, .. }) = cached.as_ref() else {
+    let Some(Cached { mapping, .. }) = cache.mapping.as_ref() else {
         return Ok(Grabbed::Nothing);
     };
 
@@ -1137,7 +1233,23 @@ fn grab(
     // read 35 MB → write 35 MB → read 35 MB → write 8.8 MB and
     // read 35 MB → write 8.8 MB; the backend there is memory-bandwidth bound,
     // so the pass count is the cost.
-    let scaled = if wants_half(width, height, sizing.policy, sizing.cap) {
+    //
+    // FR-107 P3 — the GPU first, where it is up: it reads the buffer itself,
+    // so the mapping above serves only the idle check.
+    let src = super::drm_gpu::Source {
+        fd: prime.as_raw_fd(),
+        width,
+        height,
+        fourcc: info.pixel_format() as u32,
+        offset: info.offsets()[0],
+        pitch,
+        modifier: info.modifier().map(u64::from),
+    };
+    let via_gpu = via_gpu(&mut cache.gpu, id, &src, sizing);
+    drop(prime);
+    let scaled = if let Some(scaled) = via_gpu {
+        scaled
+    } else if wants_half(width, height, sizing.policy, sizing.cap) {
         Scaled {
             data: repack_bgra_half(mapping.as_slice(), width, height, pitch, layout),
             width: width / 2,
@@ -1331,6 +1443,7 @@ impl ScreenCapture for DrmCapture {
                     tokio::time::sleep(self.target_frame_period - elapsed).await;
                 }
             }
+            let asked_at = Instant::now();
             let (res_tx, res_rx) = oneshot::channel();
             self.cmd_tx
                 .send(res_tx)
@@ -1338,7 +1451,12 @@ impl ScreenCapture for DrmCapture {
             let reply = res_rx
                 .await
                 .map_err(|_| anyhow!("drm capture worker dropped reply"))?;
-            self.last_frame_at = Some(Instant::now());
+            // FR-107 — the frame period runs from when this frame was ASKED
+            // for. Timed from its arrival, every period also paid for the
+            // grab, and a 30 fps target ran at 1000 / (33.3 + grab): 16 fps
+            // with the CPU's ~34 ms read of a 4K scanout, 27 with the GPU's
+            // ~3 ms (measured on the Asahi box, both matching to within 1 fps).
+            self.last_frame_at = Some(asked_at);
             if !matches!(reply, WorkerReply::Grabbed(Grabbed::Dark)) && self.dark {
                 self.dark = false;
                 info!("drm capture: the display is on again (FR-93 P3e)");
@@ -1636,6 +1754,31 @@ mod tests {
         assert!(wants_half(4096, 2160, DownscalePolicy::Auto, None));
         // Degenerate sizes must never halve into nothing.
         assert!(!wants_half(1, 1, DownscalePolicy::Always, None));
+    }
+
+    /// FR-107 P3 — the GPU renders exactly the pump's encode box where it is
+    /// smaller than the source, so the pump's resample has nothing left to
+    /// do; with no box, or a box it cannot honour, it delivers what the CPU
+    /// path would.
+    #[test]
+    fn the_gpu_renders_the_encode_box() {
+        let s = |policy, cap| Sizing { policy, cap };
+        let never = DownscalePolicy::Never;
+        assert_eq!(
+            gpu_out(4096, 2160, s(never, Some((1920, 1012)))),
+            (1920, 1012)
+        );
+        assert_eq!(gpu_out(4096, 2160, s(never, None)), (4096, 2160));
+        assert_eq!(
+            gpu_out(4096, 2160, s(DownscalePolicy::Auto, None)),
+            (2048, 1080)
+        );
+        // A box bigger than the source, or a degenerate one, is no box.
+        assert_eq!(
+            gpu_out(1920, 1080, s(never, Some((2560, 1440)))),
+            (1920, 1080)
+        );
+        assert_eq!(gpu_out(1920, 1080, s(never, Some((1, 1)))), (1920, 1080));
     }
 
     /// FR-107 P1 — the pump's encode box halves the read only where the half

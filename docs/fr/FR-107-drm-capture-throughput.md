@@ -2,8 +2,9 @@
 
 **Issue:** [#2317](https://github.com/gjovanov/roomler-ai/issues/2317) · **Status:** in progress — spec and
 claim 2026-10-16, on the operator's *"can we improve on it"* after a window drag on FR-93 AC12's box ran at
-9 fps. P1 and P2 are lab-verified on that box · **Owner:** remote desktop (the agent's DRM arm) ·
-**Anchors:** master `674780d1a` · **Builds on:** [FR-36](FR-36-wayland-capture.md) (the DRM arm, the fused
+9 fps. P1 and P2 merged (#2320); P2b (the pacing) and P3 (the GPU path) are lab-verified on that box: a moving
+window at 27.9 fps on the VP9 path and 28.8 on the RTP track, against 6.3 and 15.1 for 0.4.139 on the same
+desktop · **Owner:** remote desktop (the agent's DRM arm) · **Anchors:** master `7382639b8` · **Builds on:** [FR-36](FR-36-wayland-capture.md) (the DRM arm, the fused
 half read, P2's deferred EGL detiling), [FR-93](FR-93-wayland-out-of-the-box.md) (AC12's box),
 [FR-95](FR-95-system-installs-on-by-default-on-wayland.md) (the system install's capture)
 
@@ -41,43 +42,68 @@ What the numbers say:
   1920×1012 here. That resample is a Lanczos-3, which costs in proportion to the **source** area
   (`scrap_backend.rs`'s own note: 38 ms from a Retina panel). So 8.8 M pixels were read and resampled for
   an encode that keeps 1.9 M.
+- **The frame period paid for the grab.** `DrmCapture::next_frame` timed its 33.3 ms period from when the
+  last frame *arrived*, so every frame cost the period plus the grab: 1000 / (33.3 + grab) fps. That predicts
+  15 fps for the CPU's ~34 ms read (measured 15.1–16.1) and 27 fps for the GPU's ~3 ms (measured 26.1–26.2).
+- **The box's own desktop had no GPU acceleration** until it was fixed on 10-16 (#2317's comment). The
+  Asahi repository's Mesa 25.3.6 was newer than the 6.14.2 kernel's GPU interface (`DRM_IOCTL_ASAHI_GET_PARAMS
+  failed: Invalid argument`), so Mesa fell back to `llvmpipe`, and GNOME composited 4K on the CPU, in
+  competition with the capture. Kernel 6.19.14 restored the GPU: `vkcube` reports `Apple M2 Pro (G14S B1)`.
+  The measurements before the fix compare builds on the same software-rendered desktop. Those after it are
+  the ones the acceptance criteria use.
 
 ## 3. Key design
 
 ```mermaid
 flowchart LR
-    S["scanout<br/>4096×2160 XR30<br/>35 MB, uncached"] -->|"P1: the pump's box fits in half?"| H["fused half read<br/>2048×1080 BGRA"]
-    S -->|"otherwise"| F["full read"]
-    H --> B["P2: row bands,<br/>one thread each"]
-    F --> B
-    B --> R["pump resample<br/>to the encode box"]
-    R --> E["software encode"]
-    S -.->|"P3: EGL dma-buf import"| G["GPU: downscale +<br/>convert to the box"]
-    G -.->|"4× smaller readback"| E
+    S["scanout<br/>4096×2160 XR30<br/>35 MB"] -->|"P3: EGL dma-buf import"| G["GPU: one GLES pass<br/>to the encode box,<br/>BGRA"]
+    G -->|"~4× smaller readback"| E["software encode<br/>(resample passes through)"]
+    S -.->|"no usable GPU"| H["CPU: fused half read<br/>when the box fits (P1)"]
+    H -.-> B["P2: row bands,<br/>one thread each"]
+    B -.-> R["pump resample<br/>to the encode box"]
+    R -.-> E
 ```
 
 **P1 — the DRM arm honours the pump's encode box.** `ScreenCapture::set_output_cap`
 (`agents/roomlerd/src/capture/mod.rs:375`) already exists for exactly this, and every pump calls it with its
 effective box (`peer.rs:4226`). macOS honours it; the DRM arm ignored it. Now the DRM worker reads the box on
 every grab and takes the fused half read whenever half the source still covers it, whatever the policy says
-(`wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1200`; `set_output_cap`, `drm_backend.rs:1407`).
+(`wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1312`; `set_output_cap`, `drm_backend.rs:1525`).
 A 4K scanout encoded at 1920×1012 is read at 2048×1080. A 1440p scanout for the same box keeps its full read,
 because its half (1280×720) is smaller than what the encode keeps. The pump's "native" size is the frame's
 pre-downscale size (`Frame::native_dims`), so the box it computes does not shrink with the frame, and the
 choice cannot feed back into itself.
 
-**P2 — the repack in row bands across threads** (`in_bands`, `drm_backend.rs:624`; `band_threads`,
-`drm_backend.rs:652`). Each thread repacks its own band of rows and still reads them in order, the one access
+**P2 — the repack in row bands across threads** (`in_bands`, `drm_backend.rs:712`; `band_threads`,
+`drm_backend.rs:740`). Each thread repacks its own band of rows and still reads them in order, the one access
 pattern FR-36 measured the mapping to tolerate. The frame is independent row by row, so nothing is
 coordinated but the join. The output is byte-identical to the single pass.
 
-**P3 — the GPU reads the scanout.** EGL imports the scanout's dma-buf (`EGL_EXT_image_dma_buf_import`, with
-its modifier). A GL pass downscales and converts the 10-bit format straight to the encode box, and the CPU
-reads back a frame four times smaller, from cached memory. libEGL and libGLESv2 are `dlopen`ed (the portal
-helper's precedent, `linux-capture.md` §4.1), so no package gains a dependency, and a host without them (a
-headless server, a container) keeps P1/P2. The same import reads the tiled and compressed scanouts the CPU
-path refuses today: Intel CCS, AMD DCC, Nvidia block-linear. That is FR-36 P2's deferred detiling, arrived at
-from the other side.
+**P2b — the frame period runs from the ask** (`next_frame`, `drm_backend.rs:1459`). The period is timed
+from when a frame was asked of the worker, so it absorbs the grab instead of adding to it.
+
+**P3 — the GPU reads the scanout** (`agents/roomlerd/src/capture/drm_gpu.rs`). As built:
+
+- **The context.** `Converter::open` (`drm_gpu.rs:310`) loads `libEGL.so.1` and `libGLESv2.so.2` with
+  `libloading`, as `gpu_clock.rs` loads NVML, so no package gains a dependency. It opens Mesa's
+  **surfaceless** platform (a render node, no display server, no GBM), requires
+  `EGL_EXT_image_dma_buf_import`, surfaceless contexts and config-less contexts, and makes a GLES 2 context
+  current on the `drm-capture` worker thread for that thread's life.
+- **Refusing software.** It refuses a software renderer (`llvmpipe`, `softpipe`): that would do the CPU
+  path's work more slowly, and on AC12's box before its kernel fix it was the only renderer there was.
+- **Each frame** (`convert`, `drm_gpu.rs:676`). The scanout's dma-buf is imported once per buffer and cached
+  (four entries, keyed by framebuffer and dma-buf inode as the CPU mapping is, FR-93 P3f). One draw renders
+  it at **exactly** the pump's encode box with a box filter of up to 4×4 bilinear taps per pixel, written as
+  B,G,R,A, so the readback is the `Frame` contract's BGRA. EGL owns the channel order and depth: the import
+  names the fourcc, and a sample is always (r, g, b, a).
+- **What stays the CPU's.** The idle skip (FR-93 P3d) still samples 32 rows from the CPU mapping before the
+  GPU runs, and the cursor plane is read as before.
+- **Failure.** Any GPU failure turns the GPU off for the rest of that capture, said once
+  (`via_gpu`, `drm_backend.rs:151`). A host without EGL, or with only a software renderer, keeps P1 and P2.
+- **Not yet.** The same import could read the tiled and compressed scanouts the CPU path refuses (Intel CCS,
+  AMD DCC, Nvidia block-linear): FR-36 P2's deferred detiling, reached from the other side. It is not
+  enabled here, because the open still refuses a non-linear modifier. That is a later phase, with its own
+  field proof on such a GPU.
 
 **P4 — the GPU writes the encoder's planes** (I420/I444), which removes the CPU's BGRA → YUV pass as well.
 
@@ -88,9 +114,10 @@ software. The GPU's work is the capture.
 
 | Phase | What | Kill switch | Proven on | Size |
 |---|---|---|---|---|
-| **P1** | the DRM arm follows the pump's encode box to the half read (§3) | `ROOMLERD_DRM_FOLLOW_CAP=0` | ✅ the Asahi box, a candidate on 0.4.139's source (§8) | S |
-| **P2** | the repack in row bands, 4 threads by default | `ROOMLERD_DRM_THREADS=1` | ✅ the same candidate (§8); `banded_repacks_match_the_single_pass` | S |
-| **P3** | the GPU path: EGL import, GL downscale and convert, readback | `ROOMLERD_DRM_GPU=0` | — | M |
+| **P1** | the DRM arm follows the pump's encode box to the half read (§3) | `ROOMLERD_DRM_FOLLOW_CAP=0` | ✅ the Asahi box, a candidate on 0.4.139's source (§9); merged #2320 | S |
+| **P2** | the repack in row bands, 4 threads by default | `ROOMLERD_DRM_THREADS=1` | ✅ the same candidate (§9); `banded_repacks_match_the_single_pass`; merged #2320 | S |
+| **P2b** | the frame period runs from the ask, not the arrival (§3) | — (a timing fix) | ✅ the Asahi box, a candidate on master `7382639b8` (§9) | S |
+| **P3** | the GPU path: an EGL import, a GLES pass to the encode box, a readback (§3) | `ROOMLERD_DRM_GPU=0` | ✅ the same candidate (§9); unit: `the_gpu_renders_the_encode_box`, `the_taps_cover_the_footprint`, `the_import_names_the_buffer_as_getfb2_described_it` | M |
 | **P4** | the GPU writes I420/I444 for the encoder | `ROOMLERD_DRM_GPU_YUV=0` | — | M |
 | **P5** | docs: `docs/linux-capture.md` §3.4 (with P1/P2) and each later phase; the `docs/README.md` index row | — | — | S |
 
@@ -138,6 +165,13 @@ software. The GPU's work is the capture.
 
 - Hardware encoding on Apple Silicon Linux (no driver).
 - The per-user portal and mutter arms: the compositor hands over its own buffers there.
+- **The X11 backend's frame gate** (`scrap_backend.rs`, `next_frame`) times its period from the arrival
+  too, so it should pay for every grab the same way P2b found. It is a follow-up with its own before/after
+  on an X11 host, not changed here without one.
+- **The VP9-444 path's encode budget.** On a fast link the rate control rises to ~17.5 Mbps at QP 6, and
+  libvpx (8 threads, row-mt, 4 tile columns, `cpu-used` 6) is then the slowest stage. It stayed under the
+  frame period after P3 (27.9 fps), but trading quality for frame rate under motion is rate control's
+  question (`docs/rate-control.md`), not this FR's.
 
 ## 9. Field-verification log
 
@@ -146,3 +180,5 @@ software. The GPU's work is the capture.
 | 2026-10-16 | the Asahi box (M2 Pro, 4096×2160 `XR30`, GNOME 48, the system install), the operator's sessions from a Windows laptop | **0.4.139, the release** | the report: a window drag | 🔴 VP9-444/DataChannel 6.7–9.1 fps (`avg_scale_ms ≈ 43`); H.264/RTP `avg_capture_ms=114` |
 | 2026-10-16 | the same box, `capture-smoke`, the idle skip off | 0.4.139; then a lab build of master `1ee8523b7` + P2 | the read alone | half: still 27 ms, moving 34 ms; full: still 46 ms, moving 52–55 ms. P2 at 1/4/8 threads: still half 27 → 18 → **12.6 ms**, full 46 → 27 → 17.7 ms; moving half 34 → 31 → 29 ms, full 55 → 47 → 41 ms. Under motion the compositor uses the same bandwidth |
 | 2026-10-16 | the same box, one viewer, a continuously moving window (`vkcube`) | **0.4.139** (`/usr/bin/roomlerd`), then a lab build: 0.4.139's source `d11fe94ae` + P1 + P2 (`/usr/local/bin/roomlerd-cand-sys`) | the pipeline, per path | 🔴 0.4.139: VP9-444/DataChannel **9.2 fps** (resample 36.5 ms); H.264/RTP **16.1 fps** (capture 47.7 ms, encode 13.1 ms). ✅ P1 + P2: VP9-444/DataChannel **18.1 fps** (resample 16.5 ms); H.264/RTP **20.6 fps** (capture 30.0 ms, encode 17.2 ms). Unit: 18/18 `drm_backend` tests on the patched tree, natively on the box. ⚠️ **Wrong turns, recorded:** the first "before" runs shared the screen with the operator's own session (two capture pipelines; their session started 25 min before the check window), and the first benchmark toggled GNOME's overview, which measures the content rather than the pipeline (§5) |
+| 2026-10-16 15:30Z | the same box | — | P3's prototype: an EGL import of the scanout | 🔴 **The box had no GPU acceleration.** `DRM_IOCTL_ASAHI_GET_PARAMS failed: Invalid argument`, and every `vkcube` used as this FR's motion had run on `llvmpipe`. Mesa 25.3.6 (the Asahi repository, installed with GNOME on 10-15) was newer than kernel 6.14.2's GPU interface, so GNOME and KDE composited 4K on the CPU. ✅ **Kernel 6.19.14-400.asahi** (operator: *"yes proceed"*), booted once through `grub2-reboot`, with 6.14.2 as the saved default until it came back, then made the default. After it: `vkcube` on `Apple M2 Pro (G14S B1)`, and the prototype (`gpucap.c`: GETFB2 → PRIME → EGL import → one GLES pass → `glReadPixels`) captured 4096×2160 `XR30` in **1.46 ms** to 2048×1080 and **1.38 ms** to 1920×1012, the colours right |
+| 2026-10-16 | the same box, now GPU-composited, one viewer, `vkcube` | 0.4.139; P1+P2 (0.4.139's source + #2320); P3 then P3 + P2b (master `7382639b8` + this phase, `/usr/local/bin/roomlerd-cand-sys`) | the pipeline per path, back to back | VP9-444/DataChannel: **6.3** (0.4.139, resample 49.5 ms) → 12.7 (P1+P2, encode-bound at QP 6 and 17.5 Mbps) → 26.1 (P3, resample 0.0 ms) → **27.9 fps** (P3 + P2b). H.264/RTP: **15.1** (capture 47.8 ms) → 19.9 → 26.2 → **28.8 fps** (capture 17.0 ms with the pacing's wait, encode 16.3 ms). The log names the path: *"the GPU reads the scanout (FR-107 P3…) renderer="Apple M2 Pro (G14S B1)""*. Unit: 36/36 `capture::drm` tests and CI's full clippy line, natively on the box. ⚠️ The 26 fps plateau was the pacing (§2), predicted to within 1 fps before the fix |

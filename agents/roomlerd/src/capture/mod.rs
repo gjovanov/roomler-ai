@@ -28,6 +28,10 @@ pub mod x11_damage;
 pub mod drm_backend;
 #[cfg(all(target_os = "linux", feature = "drm-capture"))]
 pub mod drm_cursor;
+/// FR-107 P3 — the DRM arm's GPU path: the scanout imported through EGL and
+/// scaled by one GLES pass, with the CPU repack as its fallback.
+#[cfg(all(target_os = "linux", feature = "drm-capture"))]
+mod drm_gpu;
 #[cfg(all(target_os = "linux", feature = "drm-capture"))]
 pub mod drm_idle;
 /// FR-95 P2 — whether a capture a system install switched on by itself may
