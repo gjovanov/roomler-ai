@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::FromRef,
+    extract::{DefaultBodyLimit, FromRef},
     routing::{delete, get, post, put},
 };
 use bson::oid::ObjectId;
@@ -48,6 +48,7 @@ use roomler_ai_services::dao::{
     config_audit::ConfigAuditDao, consent_request::ConsentRequestDao,
     enroll_token_issued::EnrollTokenIssuedDao, enrollment_key::EnrollmentKeyDao,
     exec_audit::ExecAuditDao, exec_pending::ExecPendingDao, keep_busy_event::KeepBusyEventDao,
+    setup_diagnostics::SetupDiagnosticsDao,
 };
 use roomler_core::{Capabilities, Core, Module, TenantCtx, rate_limit::RateLimiter};
 use tokio::sync::mpsc;
@@ -72,6 +73,7 @@ pub mod presence;
 pub mod releases;
 pub mod remote_config;
 pub mod removal;
+pub mod setup_diagnostics;
 pub mod setup_release;
 pub mod socket;
 pub mod tenant_hooks;
@@ -90,6 +92,10 @@ pub struct FleetState {
     /// marked when it is redeemed: "tokens issued → redeemed" in the digest.
     /// An id ledger; the token itself is never stored.
     pub enroll_tokens: Arc<EnrollTokenIssuedDao>,
+    /// FR-102 P3b — the setup wizard's opt-in step diagnostics, one row per
+    /// boundary a ticked run reported; written by `POST /api/setup/diagnostics`
+    /// only. No address, no User-Agent, no person: a random run id and codes.
+    pub setup_diagnostics: Arc<SetupDiagnosticsDao>,
     pub agent_crashes: Arc<AgentCrashDao>,
     pub agent_logs: Arc<AgentLogDao>,
     /// Phase 4 — owner-side consent requests (email/push approve-link tokens).
@@ -205,6 +211,7 @@ impl Module for FleetState {
             agents,
             enrollment_keys,
             enroll_tokens: Arc::new(EnrollTokenIssuedDao::new(db)),
+            setup_diagnostics: Arc::new(SetupDiagnosticsDao::new(db)),
             agent_crashes: Arc::new(AgentCrashDao::new(db)),
             agent_logs: Arc::new(AgentLogDao::new(db)),
             consent_requests,
@@ -403,10 +410,24 @@ impl Module for FleetState {
 
         // `/api/setup/…` — the unified `roomler-setup` wizard's proxy. The
         // static `/install.sh` + `/install.ps1` segments win over `/{platform}`.
+        //
+        // FR-102 P3b — `/diagnostics` is static too, so it wins over the
+        // `/{platform}` catch-all for EVERY method: `POST` is the wizard's
+        // opt-in diagnostics (body capped by its own layer; the handler
+        // answers the empty 404 while `growth.setup_diagnostics` is off),
+        // and a `GET /api/setup/diagnostics` is now a 405 where it used to
+        // fall into the proxy and be refused as an unknown platform (400).
+        // `GET /api/setup/diagnostics/health` still reaches the proxy's
+        // `/{platform}/health` and is refused there as before.
         let public_setup = Router::new()
             .route("/latest-release", get(setup_release::setup_latest_release))
             .route("/install.sh", get(setup_release::install_script_sh))
             .route("/install.ps1", get(setup_release::install_script_ps1))
+            .route(
+                "/diagnostics",
+                post(setup_diagnostics::ingest)
+                    .layer(DefaultBodyLimit::max(setup_diagnostics::MAX_BODY_BYTES)),
+            )
             .route(
                 "/{platform}/health",
                 get(setup_release::setup_installer_health),
@@ -436,10 +457,10 @@ impl Module for FleetState {
             .with_state(self.clone())
     }
 
-    /// The eleven collections this module owns. The first eight specs are the
+    /// The twelve collections this module owns. The first eight specs are the
     /// ones the db crate's plan held before P5a, unchanged; `keep_busy_events`
-    /// (FR-92 P7), `exec_pending` (FR-94) and `enroll_token_issued` (FR-102
-    /// P3) were born here.
+    /// (FR-92 P7), `exec_pending` (FR-94), `enroll_token_issued` (FR-102 P3)
+    /// and `setup_diagnostics` (FR-102 P3b) were born here.
     fn indexes(&self) -> Vec<IndexSet> {
         vec![
             IndexSet {
@@ -500,6 +521,21 @@ impl Module for FleetState {
                     index_ttl(
                         bson::doc! { "issued_at": 1 },
                         roomler_ai_services::dao::enroll_token_issued::ENROLL_TOKEN_ISSUED_TTL_SECS,
+                    ),
+                ],
+            },
+            // FR-102 P3b — the wizard's opt-in step diagnostics. `run` serves
+            // the per-run cap's count; the TTL index on `ts` doubles as the
+            // digest's and the nightly freeze's range scan. 90 days (spec
+            // §3p); the frozen daily counts in `growth_daily` outlive it.
+            IndexSet {
+                collection: roomler_ai_services::dao::setup_diagnostics::SETUP_DIAGNOSTICS,
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index(bson::doc! { "run": 1 }),
+                    index_ttl(
+                        bson::doc! { "ts": 1 },
+                        roomler_ai_services::dao::setup_diagnostics::SETUP_DIAGNOSTICS_TTL_SECS,
                     ),
                 ],
             },

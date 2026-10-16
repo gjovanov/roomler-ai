@@ -43,6 +43,9 @@ pub mod serde_helpers;
 /// FR-101 P1b — how an agent or the CLI reaches its server: over TLS.
 pub mod server_url;
 pub mod session;
+/// FR-102 P3b — the setup wizard's opt-in diagnostics: the one record of
+/// `POST /api/setup/diagnostics` and the vocabularies both ends check.
+pub mod setup_diagnostics;
 pub mod signaling;
 pub mod turn_creds;
 pub mod turn_url;

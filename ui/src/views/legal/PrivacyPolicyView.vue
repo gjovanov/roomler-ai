@@ -193,6 +193,17 @@
             copying an install command, and following a link to our source code. We do not use third-party
             advertising or cross-site tracking services.
           </p>
+          <p class="text-body-1 legal-muted mb-4">
+            The setup wizard can also send us <strong>anonymous setup diagnostics</strong>, but only if you tick
+            the box on its first page; it is unticked by default and not remembered for the next run. If you do,
+            it sends one record per step of the install: the step's name, whether it passed, failed or was
+            cancelled, how long it took, a short error code from a fixed list when it failed, the operating
+            system family and the wizard's version — under a random identifier for that run. The record cannot
+            carry the enrollment token, a name, a file path, a hostname or a network address, and we store
+            neither the address nor the browser-style identifier the request came with. The records go to the
+            server you enroll into: a self-hosted server receives its own and sends nothing to us. We use them
+            to see where installs stop, and keep them for 90 days; after that only daily counts remain.
+          </p>
 
           <h3 class="text-h6 font-weight-bold mb-2">2.16 How You Found Us</h3>
           <p class="text-body-1 legal-muted mb-4">
@@ -331,6 +342,7 @@
             <li class="mb-1">Product-update subscriptions are kept until you unsubscribe. After that we retain only the fact that the address opted out, so it cannot be re-added silently; ask us and we will erase that too.</li>
             <li class="mb-1">The record of which issues were sent to an address — with the delivery status our email provider reported (delivered, bounced, dropped, reported as spam) and, if you unsubscribed through an issue's link, which issue — is kept with that subscription record and erased with it on request.</li>
             <li class="mb-1">A workspace's billing events (what Stripe reported about its subscription and invoices) and its daily count of plan-limit hits are kept for as long as the workspace exists and deleted with it; monthly revenue totals, which name no workspace, are kept.</li>
+            <li class="mb-1">Setup diagnostics the wizard sent with your consent (2.15) are deleted automatically <strong>90 days</strong> after they are written; the daily counts derived from them name no one and are kept.</li>
           </ul>
           <p class="text-body-1 legal-muted">
             These deletions are enforced by the database itself rather than by a manual process. When you delete

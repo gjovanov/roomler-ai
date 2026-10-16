@@ -345,6 +345,10 @@
       "methods": "POST"
     },
     {
+      "path": "/api/setup/diagnostics",
+      "methods": "POST"
+    },
+    {
       "path": "/api/setup/install.ps1",
       "methods": "GET,HEAD"
     },
@@ -2183,6 +2187,22 @@
               "purpose": "text",
               "tags": "text"
             }
+          }
+        ]
+      },
+      {
+        "collection": "setup_diagnostics",
+        "indexes": [
+          {
+            "key": {
+              "run": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 7776000
           }
         ]
       },
@@ -4059,6 +4079,22 @@
               "purpose": "text",
               "tags": "text"
             }
+          }
+        ]
+      },
+      {
+        "collection": "setup_diagnostics",
+        "indexes": [
+          {
+            "key": {
+              "run": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 7776000
           }
         ]
       },

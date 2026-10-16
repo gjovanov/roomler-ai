@@ -86,6 +86,17 @@ directories = { workspace = true }
 # (`toml::from_str::<roomler_cli::config::TunnelConfig>`).
 toml = { workspace = true }
 
+# FR-102 P3b — the opt-in setup diagnostics (`diagnostics.rs`): the one
+# record shape and its vocabularies are the wire crate's, shared with the
+# server that validates them (`default-features = false` — wire-only, no
+# driver, like every agent-side consumer); `uuid` mints the per-run id
+# (a v4's simple form is exactly the 32 hex chars the server accepts);
+# `reqwest` posts a record and tells a network failure from a refusal on
+# the enroll's error chain. All three already compile for `roomlerd`.
+roomler-ai-remote-control = { path = "../../crates/remote_control", default-features = false }
+uuid = { workspace = true }
+reqwest = { workspace = true }
+
 # (windows-sys deliberately absent — roomler-setup-core owns every
 # Win32 mechanic this app needs: MSI wait/terminate, registry PATH
 # edit, WM_SETTINGCHANGE broadcast.)

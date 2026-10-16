@@ -45,6 +45,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use roomler_ai_remote_control::setup_diagnostics::{ErrorCode, Step};
 use roomlerd::install_detect::{ExistingInstall, detect_existing_install};
 use roomlerd::updater::{WindowsInstallFlavour, spawn_installer_for_flavour_with_properties};
 use tauri::ipc::Channel;
@@ -53,6 +54,7 @@ use wizard_shared::msi_runner::{MsiExitDecoded, MsiRunner};
 use wizard_shared::progress::{ProgressEvent, replay_log};
 
 use crate::commands::DoneReport;
+use crate::diagnostics::{Diagnostics, cancel_requested, enroll_error_code, failed};
 use crate::role::Role;
 
 /// S2 — optional advanced daemon options from the wizard's collapsed
@@ -152,6 +154,15 @@ pub async fn run_install(
     crate::ACTIVE_MSI_PID.store(0, Ordering::SeqCst);
     replay_log().reset();
 
+    // FR-102 P3b — the server is known from here: the diagnostics go to
+    // the server being enrolled into, exactly where the enroll's POST goes
+    // (the same TLS rule, `enrollment::normalize_server_url`'s), so the
+    // pages' buffered boundaries flush now and every step below reports
+    // as it ends. Nothing is sent unless the Welcome box was ticked.
+    let diag = Diagnostics::global();
+    diag.server_known(&diagnostics_server(&server));
+    diag.pipeline_started();
+
     // Outer Result so we can always clear INSTALL_IN_PROGRESS on
     // any exit path.
     let outcome = run_install_inner(role, server, token, device_name, advanced, &on_event).await;
@@ -162,6 +173,9 @@ pub async fn run_install(
     match outcome {
         Ok(r) => Ok(r),
         Err(e) => {
+            // A step every error site closes itself; this catches one that
+            // did not, so the run's last step is never left unrecorded.
+            diag.abandon(ErrorCode::Other, cancel_requested());
             // Echo terminal failures into both the channel + the
             // replay log so a late-attached SPA listener sees them.
             emit(
@@ -176,6 +190,16 @@ pub async fn run_install(
     }
 }
 
+/// FR-102 P3b — the origin the diagnostics are posted to: the server as the
+/// enroll will reach it (a remote `http://` is upgraded to `https://`, a
+/// loopback one left alone), without a trailing slash.
+fn diagnostics_server(server: &str) -> String {
+    roomler_ai_remote_control::server_url::secure(server, false)
+        .url
+        .trim_end_matches('/')
+        .to_string()
+}
+
 async fn run_install_inner(
     role: Role,
     server: String,
@@ -185,21 +209,34 @@ async fn run_install_inner(
     on_event: &Channel<ProgressEvent>,
 ) -> Result<DoneReport, String> {
     emit(on_event, ProgressEvent::Started);
+    let diag = Diagnostics::global();
+
+    // --- Step 1: preflight -----------------------------------------------
+    // (P3b: the step opens before the checks below, so a CIDR typo or a
+    // cancel before any IO is a preflight outcome, not an unrecorded one.)
+    diag.begin(Step::Preflight);
+    check_cancel()?;
 
     // S2 — validate the advanced route lists FIRST: a CIDR typo must
     // fail here, before the MSI runs and before the single-use
     // enrollment token is burned.
-    advanced.validate()?;
+    advanced
+        .validate()
+        .map_err(|e| failed(ErrorCode::AdvancedOptions, e))?;
 
     // --- Role → flavour (was: parse_flavour on the SPA string) ----------
     let flavour_str = role
         .msi_flavour()
-        .ok_or_else(|| format!("role {role:?} has no MSI flavour — not a daemon role"))?
+        .ok_or_else(|| {
+            failed(
+                ErrorCode::UnsupportedPlatform,
+                format!("role {role:?} has no MSI flavour — not a daemon role"),
+            )
+        })?
         .to_string();
-    let (wfx, is_system_context) = flavour_parts(role)?;
+    let (wfx, is_system_context) =
+        flavour_parts(role).map_err(|e| failed(ErrorCode::UnsupportedPlatform, e))?;
 
-    // --- Step 1: preflight -----------------------------------------------
-    check_cancel()?;
     emit(on_event, ProgressEvent::PreflightStarted);
     let detected = detect_existing_install();
     let existing_label = label_existing(&detected);
@@ -209,6 +246,7 @@ async fn run_install_inner(
             existing: existing_label.clone(),
         },
     );
+    diag.ok();
 
     // Surface cross-flavour switch as a warning. The SPA gates the
     // Continue button on an operator-acknowledgement checkbox per
@@ -236,6 +274,7 @@ async fn run_install_inner(
     // perMachine+SC: ENABLE_SYSTEM_CONTEXT=1.
 
     // --- Step 2: resolve installer ---------------------------------------
+    diag.begin(Step::Resolve);
     check_cancel()?;
     let flavour_for_proxy = match wfx {
         WindowsInstallFlavour::PerUser => "peruser",
@@ -254,7 +293,7 @@ async fn run_install_inner(
         crate::proxy::USER_AGENT,
     )
     .await
-    .map_err(|e| format!("resolve installer: {e}"))?;
+    .map_err(|e| failed(ErrorCode::Resolve, format!("resolve installer: {e}")))?;
     emit(
         on_event,
         ProgressEvent::AssetResolved {
@@ -263,8 +302,10 @@ async fn run_install_inner(
             digest: health.digest.clone(),
         },
     );
+    diag.ok();
 
     // --- Step 3: download ------------------------------------------------
+    diag.begin(Step::Download);
     check_cancel()?;
     emit(
         on_event,
@@ -297,13 +338,15 @@ async fn run_install_inner(
         });
     })
     .await
-    .map_err(|e| format!("download installer: {e}"))?;
+    .map_err(|e| failed(ErrorCode::Download, format!("download installer: {e}")))?;
+    diag.ok();
 
     // --- Step 4: verify SHA256 ------------------------------------------
+    diag.begin(Step::Verify);
     check_cancel()?;
     let sha256_match = match health.digest.as_deref() {
         Some(digest) => asset_resolver::verify_sha256(&staged, digest)
-            .map_err(|e| format!("sha256 verify: {e}"))?,
+            .map_err(|e| failed(ErrorCode::Other, format!("sha256 verify: {e}")))?,
         None => {
             // Pre-Oct-2024 releases lack the digest field. Accept
             // the download as-is but flag it loudly.
@@ -317,11 +360,15 @@ async fn run_install_inner(
     emit(on_event, ProgressEvent::DownloadVerified { sha256_match });
     if !sha256_match {
         let _ = std::fs::remove_file(&staged);
-        return Err(format!(
-            "SHA256 mismatch for {} — staged file deleted; please retry",
-            staged.display()
+        return Err(failed(
+            ErrorCode::Sha256Mismatch,
+            format!(
+                "SHA256 mismatch for {} — staged file deleted; please retry",
+                staged.display()
+            ),
         ));
     }
+    diag.ok();
 
     // --- Step 5: spawn msiexec ------------------------------------------
     //
@@ -336,6 +383,7 @@ async fn run_install_inner(
     // ERROR_INSTALL_PACKAGE_REJECTED. Field repro 2026-05-15 on a
     // Windows field-test host; BLOCKER B6 from the rc.27/rc.28 master
     // plan.
+    diag.begin(Step::Msi);
     check_cancel()?;
     // rc.44: build the property table from the parsed flavour.
     //   peruser              → no property (wix/main.wxs doesn't declare it)
@@ -353,17 +401,18 @@ async fn run_install_inner(
         }
     };
     let pid = spawn_installer_for_flavour_with_properties(&staged, wfx, &properties)
-        .map_err(|e| format!("spawn msiexec: {e}"))?;
+        .map_err(|e| failed(ErrorCode::MsiSpawn, format!("spawn msiexec: {e}")))?;
     crate::ACTIVE_MSI_PID.store(pid, Ordering::SeqCst);
     emit(on_event, ProgressEvent::MsiSpawned { pid });
 
     // --- Step 6: attach + wait + decode ----------------------------------
-    let runner = MsiRunner::attach(pid).map_err(|e| format!("attach msiexec: {e}"))?;
+    let runner = MsiRunner::attach(pid)
+        .map_err(|e| failed(ErrorCode::MsiWait, format!("attach msiexec: {e}")))?;
     // 15-min budget covers slow corporate disks + Defender scans.
     let outcome = runner
         .wait_for_exit(Duration::from_secs(15 * 60))
         .await
-        .map_err(|e| format!("wait for msiexec: {e}"))?;
+        .map_err(|e| failed(ErrorCode::MsiWait, format!("wait for msiexec: {e}")))?;
     let outcome_str = format!("{outcome:?}");
     emit(
         on_event,
@@ -379,6 +428,7 @@ async fn run_install_inner(
             // agent's first start can pick up the new install state
             // after the OS reboots; enrollment is just an HTTP call
             // that doesn't depend on the agent binary running.
+            diag.ok();
         }
         MsiExitDecoded::UserCancel => {
             // rc.44: branch on is_system_context. SystemContext mode
@@ -397,15 +447,16 @@ async fn run_install_inner(
                 "Installation cancelled (you clicked No on the UAC prompt). \
                  Try again or pick perUser mode if you can't get admin rights."
             };
-            return Err(msg.to_string());
+            return Err(failed(ErrorCode::MsiUserCancel, msg.to_string()));
         }
         MsiExitDecoded::AnotherInstall => {
-            return Err(
+            return Err(failed(
+                ErrorCode::MsiAnotherInstall,
                 "Another Windows Installer operation is already running on this \
                  host. Wait for it to finish (check Get-Process msiexec), \
                  then click Retry."
                     .to_string(),
-            );
+            ));
         }
         MsiExitDecoded::FatalError => {
             // rc.44: on SystemContext flavour, the WiX CA may have
@@ -424,17 +475,22 @@ async fn run_install_inner(
                     },
                 );
             }
-            return Err(
+            return Err(failed(
+                ErrorCode::MsiFatal,
                 "MSI installer failed (exit 1603). Check the MSI log at %TEMP%\\MSI*.LOG for details."
                     .to_string(),
-            );
+            ));
         }
         MsiExitDecoded::Other(code) => {
-            return Err(format!("MSI installer exited with unexpected code {code}"));
+            return Err(failed(
+                ErrorCode::MsiOther,
+                format!("MSI installer exited with unexpected code {code}"),
+            ));
         }
     }
 
     // --- Step 7: enroll --------------------------------------------------
+    diag.begin(Step::Enroll);
     check_cancel()?;
     emit(on_event, ProgressEvent::EnrollStarted);
     // rc.52: the SystemContext flavour writes its config to the
@@ -459,10 +515,14 @@ async fn run_install_inner(
         }
         #[cfg(not(target_os = "windows"))]
         {
-            return Err("SystemContext flavour is Windows-only".to_string());
+            return Err(failed(
+                ErrorCode::UnsupportedPlatform,
+                "SystemContext flavour is Windows-only".to_string(),
+            ));
         }
     } else {
-        roomlerd::config::default_config_path().map_err(|e| format!("resolve config path: {e}"))?
+        roomlerd::config::default_config_path()
+            .map_err(|e| failed(ErrorCode::ConfigWrite, format!("resolve config path: {e}")))?
     };
     // rc.52: for the SystemContext flavour, lock down
     // %PROGRAMDATA%\roomler\ with an inheritable SYSTEM+Administrators
@@ -488,11 +548,15 @@ async fn run_install_inner(
     // FR-102 P3 — the wizard says so itself, in-process: `wizard`, with the
     // scope its role installs (`Role::install_scope`). A daemon role always
     // has one; the `None` arm is the tunnel role, which never reaches here.
-    let install = roomlerd::enrollment::InstallInfo::new(
+    // P3b — a ticked run's id rides along (`install.run`), so the device
+    // joins its diagnostics; unticked, `run_id()` is `None` and nothing is
+    // added to the body.
+    let mut install = roomlerd::enrollment::InstallInfo::new(
         roomlerd::enrollment::InstallMethod::Wizard,
         role.install_scope()
             .unwrap_or(roomlerd::enrollment::InstallScope::Unknown),
     );
+    install.run = diag.run_id();
     let inputs = roomlerd::enrollment::EnrollInputs {
         server_url: &server,
         enrollment_token: &token,
@@ -502,14 +566,18 @@ async fn run_install_inner(
     };
     let mut cfg = roomlerd::enrollment::enroll(inputs)
         .await
-        .map_err(|e| format!("enrollment: {e}"))?;
+        .map_err(|e| failed(enroll_error_code(&e), format!("enrollment: {e}")))?;
     // S2 — fold the wizard's advanced options into the enrolled config
     // before it's written (route lists already validated pre-MSI). An
     // overlay choice the SPA did not send follows the flavour (FR-84 S2).
-    advanced.with_flavour_defaults(wfx).apply_to(&mut cfg)?;
+    advanced
+        .with_flavour_defaults(wfx)
+        .apply_to(&mut cfg)
+        .map_err(|e| failed(ErrorCode::AdvancedOptions, e))?;
     let agent_id = cfg.agent_id.clone();
     let tenant_id = cfg.tenant_id.clone();
-    roomlerd::config::save(&config_path, &cfg).map_err(|e| format!("write config.toml: {e}"))?;
+    roomlerd::config::save(&config_path, &cfg)
+        .map_err(|e| failed(ErrorCode::ConfigWrite, format!("write config.toml: {e}")))?;
     emit(
         on_event,
         ProgressEvent::EnrollOk {
@@ -518,6 +586,7 @@ async fn run_install_inner(
             tenant_id: tenant_id.clone(),
         },
     );
+    diag.ok();
 
     // --- Step 7b: place the roomler-desktop GUI companion (GAP-A / P6) ---
     // The desktop EXE is NOT in the MSI (it's a standalone release
@@ -525,14 +594,20 @@ async fn run_install_inner(
     // roomler. Fetch + place it beside the daemon so all three ship
     // together. Best-effort — a failure never sinks the enrolled
     // install; the operator can always grab it later.
+    // (P3b: recorded as its own step — `ok`, or `failed: companion` — and
+    // not at all where it does not apply.)
+    diag.begin(Step::Companion);
     let desktop_installed = place_desktop_companion(wfx, on_event).await;
+    best_effort_outcome(diag, desktop_installed, ErrorCode::Companion);
 
     // --- Step 7b': anchor the device for SYSTEM exec (FR-104) -----------
     // Only for a token the admin minted to anchor, on a machine-wide install
     // (the only flavours with a SYSTEM service). Best-effort, like the
     // companion step: a declined prompt or a failure leaves an enrolled
     // install, and the Done page carries the manual command.
+    diag.begin(Step::Anchor);
     let anchored = anchor_device(role, wfx, &server, &token, &agent_id, on_event).await;
+    best_effort_outcome(diag, anchored, ErrorCode::Anchor);
 
     // --- Step 7c: start a per-user daemon now (FR-84 D6) -----------------
     // The perUser MSI registers the Scheduled Task for the NEXT logon only,
@@ -548,6 +623,7 @@ async fn run_install_inner(
 
     // --- Step 8: done ----------------------------------------------------
     emit(on_event, ProgressEvent::Done);
+    diag.done();
 
     // P4b (role→action composition): the MSI carries the `roomler`
     // CLI, so a daemon install subsumes the tunnel client. Existence-
@@ -571,6 +647,17 @@ async fn run_install_inner(
         desktop_installed,
         anchored,
     })
+}
+
+/// FR-102 P3b — a best-effort step's diagnostics outcome from its report:
+/// `Some(true)` passed, `Some(false)` failed with `code` (the install
+/// stands either way), `None` did not apply, so no record at all.
+fn best_effort_outcome(diag: &Diagnostics, report: Option<bool>, code: ErrorCode) {
+    match report {
+        Some(true) => diag.ok(),
+        Some(false) => diag.fail(code, false),
+        None => diag.discard(),
+    }
 }
 
 /// FR-104 — does an install of `role` have a SYSTEM service an anchor is
@@ -1019,6 +1106,9 @@ fn emit(channel: &Channel<ProgressEvent>, event: ProgressEvent) {
 
 fn check_cancel() -> Result<(), String> {
     if crate::CANCEL_REQUESTED.load(Ordering::SeqCst) {
+        // P3b — the step that was about to run (opened just before this
+        // check) ends `cancelled`.
+        Diagnostics::global().cancelled();
         Err("install cancelled by operator".to_string())
     } else {
         Ok(())

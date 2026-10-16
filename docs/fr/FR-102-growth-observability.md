@@ -271,6 +271,18 @@ sequenceDiagram
    wizard sends **zero** requests.
    Why opt-in: EDPB Guidelines 2/2023 read ePrivacy Art. 5(3) as covering what an installed program sends
    from the terminal for a purpose the user did not ask for.
+   *(P3b as built: the record is one shared wire type
+   (`roomler_ai_remote_control::setup_diagnostics`) with fixed vocabularies for `step`, `outcome` and
+   `error_code` that the server validates field by field — a refusal is a 422 with a code and stores
+   nothing — and the handler reads the body and nothing else about the request, so no IP and no
+   User-Agent can reach a row. The pages' boundaries happen before the wizard knows the server, so the
+   Rust recorder buffers them and flushes when `cmd_install` names it; a run cancelled before then sends
+   nothing anywhere. A run writes at most 48 rows. `growth.setup_diagnostics` (default on, for
+   `install_counters`'s reason) is the server's switch: off, the route is the empty 404 of an absent
+   path. The rows live 90 days; the nightly org-day job freezes distinct runs per `(step, outcome, os)`
+   per closed day into `growth_daily` as `install:wizard_step`, and the digest reads the rows for its
+   windows. The kill switch on the wizard's side is the box itself.
+   `docs/growth-observability.md`, "The wizard's opt-in diagnostics".)*
 6. **The Install panel** shows, per method and OS: fetches (approximate, by class), tokens issued, devices
    enrolled, issued → redeemed, enrolled → online within 1 h, → first session within 24 h, and wizard steps
    reached (opted-in runs only, labelled with their n).
@@ -641,7 +653,7 @@ hosted only). §7's retention list grows, and `docs/data-model.md`'s stale TTLs 
 | P1d | §3l: the daily digest (the job, `growth_digests`, the email, the JSON routes, the Digest view); every section not yet built says which phase brings it | `ROOMLER__GROWTH__DIGEST_ENABLED=false` (the default) | **live** since 2026-10-14 07:33Z (`hosted-20261014-cc63c4d`, with roomler-ai-deploy#29's config and purestat key); the first digest (2026-10-13) was mailed at 07:35Z |
 | P2 | §3d: definitions, `growth_org_daily`, the funnel/cohorts/orgs/timeline endpoints, the Growth page (Overview, Orgs, Cohorts) | `ROOMLER__GROWTH__ENABLED=false` (the routes answer 404) | **live** 2026-10-15 00:10Z (`hosted-20261014-831ebcf`): #2215 `193848ff0`. AC6 by the integration lane; AC7 field-verified 2026-10-15 (§8); AC8 needs a day older than 90 days |
 | P3 | §3e 1–4 and 6: issuance record, fetch counters, the enroll's `install` (server, agent, scripts, wizard), the Install panel | counters off by config; the agent sends `install` only when it is set | **server half live** 2026-10-15 00:10Z (`hosted-20261014-831ebcf`): #2217 `36f871029`; AC10 + AC11 field-verified (§8). The agent half (`roomlerd enroll` flags/env, the scripts, the wizard, the companion) **released** in agent 0.4.137 (2026-10-15 11:51Z); AC9 field-verified on vmtest (§8) |
-| P3b | §3e 5: the wizard's opt-in diagnostics, after D4 | the checkbox; `ROOMLER__GROWTH__SETUP_DIAGNOSTICS=false` | — |
+| P3b | §3e 5: the wizard's opt-in diagnostics, after D4 | the checkbox; `ROOMLER__GROWTH__SETUP_DIAGNOSTICS=false` | **PR #2289** — the Welcome-page box (unticked, memory only), one record per step boundary buffered until `cmd_install` names the server, `POST /api/setup/diagnostics` (`fleet`; validated field by field, no IP, no UA, ≤ 48 rows per run), `setup_diagnostics` (90 d) with the nightly freeze into `growth_daily`, the digest's `wizard_steps`, the docs. AC12's field half (a wizard release, then a vmtest wizard cell with a capture) is owed |
 | P4 | §3g: `billing_events` and the backfill, MRR movements, quota collisions, margin | the new webhook kinds are additive (unselect them on the Stripe endpoint and nothing new is recorded); `growth.enabled = false` hides the view and stops the collision counter | **live** 2026-10-15 21:33Z (`hosted-20261015-410376a`): #2246 `d44c614cd`, plus the same-second ordering fix in #2261. Owed with the operator: the six kinds selected on the Stripe endpoint, the backfill run, then AC13. Covers `billing_events` (`saas`) from the six Stripe kinds, `POST …/growth/billing/backfill`, quota collisions through `roomler_core::quota`, the monthly freeze, `GET …/growth/revenue`, the Revenue tab, the funnel's `paid`, the digest's billed section |
 | P5 | §3h: the list over time, SendGrid events (D6), per-issue tags (D5), the per-issue table | the webhook route off (no `ROOMLER__NEWSLETTER__EVENT_WEBHOOK_PUBLIC_KEY`); tags off in the sender (`ROOMLER__NEWSLETTER__LINK_TAGS=false`) | **live** 2026-10-15 17:29Z (`hosted-20261015-3df732f`): #2244 `4e26327a0` — `POST /api/sendgrid/webhook` (`saas`), the per-issue tags and `i=`, `GET …/growth/newsletter`, the Newsletter tab, the digest's delivery. The webhook stays 404 until the SendGrid Event Webhook's public key is configured (with the operator), then AC14 |
 | PS1 | §3n PS1 in purestat | — | **live** with PS0a in v0.1.8; the roomler.ai key minted 2026-10-14 (only its hash stored; sealed into `roomler2-secret`, roomler-ai-deploy#29) |
