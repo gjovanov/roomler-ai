@@ -23,7 +23,7 @@ set, switches mutter on by itself, or the portal where mutter is absent (§1.2).
 
 ## 1. The cascade
 
-`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2195`) tries the
+`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2199`) tries the
 backends in this order and returns the first that opens. On Linux the Windows
 arms (SystemContext, WGC) do not exist, so the order is:
 
@@ -54,10 +54,10 @@ A per-user daemon in its own Wayland session, with no capture key set, runs
 
 | Arm | Reads | Sees a locked screen / the greeter | Asks the person at the screen | Needs | Default | Gate |
 |---|---|---|---|---|---|---|
-| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:2681`) |
-| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **no** — mutter refuses to create *or restore* a screencast while locked | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off**; automatic in a per-user Wayland session with no key where mutter is absent (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:2782`) |
+| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:2685`) |
+| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **no** — mutter refuses to create *or restore* a screencast while locked | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off**; automatic in a per-user Wayland session with no key where mutter is absent (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:2786`) |
 | **mutter direct** (`portal/mutter.rs`) | the same kind of PipeWire stream, from `org.gnome.Mutter.ScreenCast` | no (a session API) | **no** | GNOME's mutter on the user's session bus; no portal backend required | **off**; automatic in a per-user GNOME Wayland session with no key (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` **and** `ROOMLERD_MUTTER_CAPTURE=1` (`portal/backend.rs:70`) |
-| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:2851`), after the Xwayland guard (`mod.rs:2824`) |
+| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:2855`), after the Xwayland guard (`mod.rs:2828`) |
 
 Two things about the order are deliberate and worth defending when the next
 backend arrives:
@@ -74,7 +74,7 @@ backend arrives:
   screen). The portal is **attended**: defaulting it on would leave an
   unattended host waiting on a consent dialog nobody will answer — a hang
   dressed up as a feature. Both arms therefore log **loudly** when the operator
-  asked for them and they fell through (`mod.rs:2752`, `mod.rs:2803`), because
+  asked for them and they fell through (`mod.rs:2756`, `mod.rs:2807`), because
   silently serving X11 instead would look like the feature simply not working.
   Since FR-93 that error also travels: it becomes the session's `detail`
   (§1.1). And since FR-93 P2d-3 a per-user daemon in its own Wayland session,
@@ -97,18 +97,18 @@ and a different false thing per install type. Measured on the FR-93 lab
 
 Two changes stop both:
 
-- 🔑 **The Xwayland guard** (`mod.rs:2824`). Before scrap opens, the daemon
+- 🔑 **The Xwayland guard** (`mod.rs:2828`). Before scrap opens, the daemon
   asks the X server named by its `DISPLAY` whether it is Xwayland
-  (`x_server_is_xwayland`, `mod.rs:1882`). There are two signals, the same two
+  (`x_server_is_xwayland`, `mod.rs:1886`). There are two signals, the same two
   keep busy reads (FR-92): the `XWAYLAND` extension, which Xwayland has carried
   since 23.1, and before that its RandR monitors, all named `XWAYLAND<n>`. If
   it is Xwayland, scrap is refused, and the session gets a reason instead of
   black. The answer comes from the server, never from `XDG_SESSION_TYPE`, so a
   real Xorg and the daemon's own Xvfb are captured exactly as before.
 - 🔑 **The seat, not the daemon's environment, decides "headless"**
-  (`linux_no_pixels_code`, `mod.rs:1799`). When every arm has failed and the
+  (`linux_no_pixels_code`, `mod.rs:1803`). When every arm has failed and the
   daemon has no display variables, logind is asked whether a graphical session
-  is showing (`seat_shows_wayland`, `mod.rs:1866`, through
+  is showing (`seat_shows_wayland`, `mod.rs:1870`, through
   `companion::graphical_session`). A Wayland session there means
   `wayland_not_enabled`. No session at all means `no_display`, and that is now
   true.
@@ -131,7 +131,7 @@ because only root can read the scanout or create a uinput device:
 A failed arm is never told to "switch it on". It is already on, and its own
 error is the useful sentence.
 
-⚠️ **The probe dials Unix sockets only** (`x_server_query`, `mod.rs:1957`).
+⚠️ **The probe dials Unix sockets only** (`x_server_query`, `mod.rs:1961`).
 `x11rb::connect` falls back to TCP `localhost:6000+N` when the socket is
 missing. Under WSL2's mirrored networking a localhost connect to a closed port
 hangs instead of being refused, and systemd's `/tmp` handling there had hidden
@@ -420,7 +420,7 @@ all strings, so a newer agent's word reaches an older server as a word:
 | `capture_arm` | `mutter` · `drm` · `portal` · `x11` · `none` | the arm a session opened **now** would try first |
 | `input_reach` | `full` · `xwayland_only` · `none` | the `rc:input-reach` verdict (`input/reach.rs:285`), with the portal's input route predicted for a portal or mutter arm with `portal_input` on. ⚠️ **It never starts an X server.** GNOME starts Xwayland **on demand** for any client that connects, so on a Wayland desktop the brief connects only to an Xwayland already running (found in `/proc`), and with none it reads "no X server". It is also read again only when another field changed. The per-session `rc:input-reach` stays the authority |
 
-`capture_arm` is `capture::planned_arm` (`capture/mod.rs:789`), a pure function
+`capture_arm` is `capture::planned_arm` (`capture/mod.rs:957`), a pure function
 that walks `open_with`'s own order (`:1505`). The two sit together in one file
 because they must not drift:
 
@@ -551,7 +551,7 @@ buffer handle**, so a daemon that is not root opened DRM capture without
 complaint and then failed every frame. That is a per-user install with
 `drm_capture` set. The session died and re-created itself, and the viewer only
 ever said *"No video from this device after 3 attempts"*. The open now checks
-the handle (`unreadable`, `drm_backend.rs:1016`) and refuses with the fix in
+the handle (`unreadable`, `drm_backend.rs:1111`) and refuses with the fix in
 words, which reach the viewer as the arm's own error (§1.1): *"drm_capture is
 on, but DRM capture could not open: reading the scanout needs CAP_SYS_ADMIN
 (root), which this daemon lacks: on a per-user install run roomler config
@@ -562,7 +562,7 @@ arm (§1.2), the desktop's own screencast.
 On one Apple-silicon (Asahi) display, mutter scans out 10-bit `XR30` and KWin
 8-bit `AB24`: the same driver and panel, with red and blue in opposite places.
 The repack resolves a `Layout` from each framebuffer's fourcc (`Layout::of`,
-`drm_backend.rs:585`) and handles the eight 32-bit RGB formats, `XR24`/`AR24`,
+`drm_backend.rs:673`) and handles the eight 32-bit RGB formats, `XR24`/`AR24`,
 `XB24`/`AB24`, `XR30`/`AR30` and `XB30`/`AB30`. Any other fourcc is a refusal
 (*"unhandled scanout pixel format …"*), never a guess. Before it, a KDE host on
 Asahi refused every frame. ⚠️ A wrong channel order does not *look* broken:
@@ -570,7 +570,7 @@ decoded as `XR24`, `AB24` is the right picture with a blue sky turned orange,
 so every order has a test pinned to hand-computed bytes.
 
 ⚠️ **A reason must fit FR-80's cap whole.** `CaptureUnavailable` keeps 200
-characters of a detail (`capture/mod.rs:1834`), the cascade's prefix included,
+characters of a detail (`capture/mod.rs:2009`), the cascade's prefix included,
 and cuts the rest. The first draft of this reason was longer, and on the lab the
 viewer showed it ending *"…run roomler config clear"*: the fix, at the end, was
 the part cut off. Each new reason's test now builds the detail as the viewer
@@ -797,39 +797,80 @@ memory. On an Apple M2 Pro with GNOME's 10-bit `XR30` that measured 47–55 ms
 for a full read and 27–34 ms for FR-36's fused half-size read
 (`capture-smoke`, still and moving screen). The software-encode pumps then
 resample every frame down to their encode box, 1920×1012 there, with a
-Lanczos-3 that costs in proportion to the *source* area. A window drag on
-0.4.139 ran at **9.2 fps** on the VP9 path and 16.1 fps on the RTP track
+Lanczos-3 that costs in proportion to the *source* area. A moving window on
+0.4.139 ran at **6–9 fps** on the VP9 path and 15–16 fps on the RTP track
 (FR-107, #2317). The encode was never the problem: OpenH264 took 13–19 ms.
+The GPU now reads the scanout instead, and the frame period no longer pays
+for the grab.
 
 ```mermaid
 flowchart LR
-    S["scanout<br/>4096×2160 XR30<br/>35 MB, uncached"] -->|"P1: the pump's box fits in half?"| H["fused half read<br/>2048×1080 BGRA"]
-    S -->|"otherwise"| F["full read<br/>4096×2160 BGRA"]
-    H --> B["P2: row bands,<br/>one thread each"]
-    F --> B
-    B --> R["pump resample<br/>to the encode box"]
-    R --> E["software encode"]
+    S["scanout<br/>4096×2160 XR30<br/>35 MB"] -->|"P3: EGL dma-buf import"| G["GPU: one GLES pass<br/>scaled to the encode box,<br/>converted to BGRA"]
+    G -->|"readback, ~4× smaller"| E["software encode<br/>(the pump's resample<br/>passes it through)"]
+    S -.->|"no usable GPU"| C["CPU: fused half read (P1)<br/>in row bands (P2)"]
+    C -.-> R["pump resample<br/>to the encode box"]
+    R -.-> E
 ```
 
 | Phase | What changed | Where | Kill switch |
 |---|---|---|---|
-| **P1** | The DRM arm honours the pump's encode box (`set_output_cap`, the seam macOS already honours). Whenever half the source still covers the box, it takes the fused half read, whatever the policy says: a 4K scanout for a 1920×1012 encode, but never a 1440p one, whose half would be smaller than what the encode keeps. The VP9 and FFmpeg DataChannel pumps open their capture with `Never` (`agents/roomlerd/src/peer.rs:3595`), so before P1 they read the full 4K and resampled all 8.8 M pixels of it | `wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1200`; `set_output_cap`, `drm_backend.rs:1407` | `ROOMLERD_DRM_FOLLOW_CAP=0` |
-| **P2** | The repack runs in row bands, one thread each (4 by default). Each thread still reads its own rows in order, the one access pattern FR-36 measured this mapping to tolerate. The output is byte-identical to the single pass, which `banded_repacks_match_the_single_pass` locks for every layout | `in_bands`, `drm_backend.rs:624`; `band_threads`, `drm_backend.rs:652` | `ROOMLERD_DRM_THREADS=1` |
+| **P1** | The DRM arm honours the pump's encode box (`set_output_cap`, the seam macOS already honours). Whenever half the source still covers the box, the CPU path takes the fused half read, whatever the policy says: a 4K scanout for a 1920×1012 encode, but never a 1440p one, whose half would be smaller than what the encode keeps. The VP9 and FFmpeg DataChannel pumps open their capture with `Never` (`agents/roomlerd/src/peer.rs:3595`), so before P1 they read the full 4K and resampled all 8.8 M pixels of it | `wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1312`; `set_output_cap`, `drm_backend.rs:1525` | `ROOMLERD_DRM_FOLLOW_CAP=0` |
+| **P2** | The CPU repack runs in row bands, one thread each (4 by default). Each thread still reads its own rows in order, the one access pattern FR-36 measured this mapping to tolerate. The output is byte-identical to the single pass, which `banded_repacks_match_the_single_pass` locks for every layout | `in_bands`, `drm_backend.rs:712`; `band_threads`, `drm_backend.rs:740` | `ROOMLERD_DRM_THREADS=1` |
+| **P2b** | The frame period runs from when a frame was *asked for*, not from when it arrived. Timed from the arrival, every period also paid for the grab, so a 30 fps target ran at 1000 / (33.3 + grab): 15–16 fps with the CPU's ~34 ms read, 26–27 with the GPU's ~3 ms. Both predictions matched the measurements to within 1 fps | `next_frame`, `drm_backend.rs:1459` | — (a timing fix) |
+| **P3** | The GPU reads the scanout. EGL imports its dma-buf through Mesa's surfaceless platform, on the render node, with no display server. One GLES pass renders it at **exactly** the pump's encode box (a box filter of up to 4×4 bilinear taps a pixel), and converts any of the eight RGB scanout formats to BGRA. The CPU reads back that small frame, and the pump's resample has nothing left to do. Imports are cached per buffer, keyed as the mapping is (FR-93 P3f). `libEGL.so.1` and `libGLESv2.so.2` are loaded at runtime, so no package gains a dependency. A host without them, with a software renderer (`llvmpipe`), or whose GPU pass fails keeps the CPU path, said once in the log. The idle skip (§3.2) and the cursor plane (§3.1) are unchanged | `Egl`, `agents/roomlerd/src/capture/drm_gpu.rs:316`; `Egl::retire`, `drm_gpu.rs:445`; `Converter::open`, `drm_gpu.rs:464`; `convert`, `drm_gpu.rs:754`; `via_gpu`, `drm_backend.rs:151` | `ROOMLERD_DRM_GPU=0` |
 
-Measured on that box, a continuously moving window (`vkcube`), one viewer:
+Measured on that box (GNOME, 4096×2160 `XR30`), one viewer, a continuously
+moving window (`vkcube`), the release and the candidate back to back on the
+same desktop:
 
-| | 0.4.139 | P1 + P2 |
+| | 0.4.139 | FR-107 (P1–P3) |
 |---|---|---|
-| VP9 4:4:4 over the DataChannel | 9.2 fps, resample 36.5 ms | **18.1 fps**, resample 16.5 ms |
-| H.264 on the RTP track | 16.1 fps, capture 47.7 ms | **20.6 fps**, capture 30.0 ms |
+| VP9 4:4:4 over the DataChannel | 6.3 fps, resample 49.5 ms | **27.9 fps**, resample 0.0 ms |
+| H.264 on the RTP track | 15.1 fps, capture 47.8 ms | **28.8 fps** |
 
-⚠️ **More threads stop paying under motion.** On a still screen the half read
-went 27 → 18 → 12.6 ms at 1, 4 and 8 threads. With the compositor animating,
-it went only 34 → 29 ms, because the compositor uses the same memory
-bandwidth the read needs. The remaining wall is the CPU read itself. FR-107 P3
-moves it to the GPU: an EGL import of the scanout's dma-buf, a GPU downscale
-and conversion, and a readback four times smaller. The M2's hardware video
-encoder has no Linux driver, so the encode stays in software.
+The grab alone, `capture-smoke` on the same candidate, 240 frames, the idle
+skip off:
+
+| Scanout 4096×2160 → | GPU (P3) | CPU (`ROOMLERD_DRM_GPU=0`: P1 + P2) |
+|---|---|---|
+| 2048×1080, still | **1.80 ms** | 15.25 ms |
+| 2048×1080, moving | **2.05 ms** | 15.33 ms |
+| 4096×2160, still | 7.17 ms | 23.35 ms |
+| 4096×2160, moving | 6.55 ms | 23.45 ms |
+
+The first GPU frame costs 32–46 ms more, once per capture: the EGL context and
+the shader compile.
+
+⚠️ **The EGL display belongs to the process, and a capture owns only its
+context.** `Egl` (`drm_gpu.rs:316`) comes up with the first capture that reaches
+for the GPU and is never terminated. EGL hands every caller in a process the
+same display, so one capture terminating it would cut off the imports of every
+other capture still running. A capture retires its context **unbound**
+(`Egl::retire`, `drm_gpu.rs:445`). A context destroyed while still current is
+never freed once its thread exits: the first build leaked 2.8 MB of resident
+memory a capture that way (FR-107 §9).
+
+⚠️ **Since P2b, `capture-smoke`'s `mean_ms` includes the wait to fill the
+period.** Each call costs at least one frame period, so at `--fps 240` nothing
+reads below 4.17 ms. To measure the grab itself, run it with a period below the
+grab (`--fps 1000`).
+
+⚠️ **A desktop without GPU acceleration makes everything here slow, including
+the person's own desktop.** On AC12's box, Mesa from the Asahi repository was
+newer than the kernel's GPU interface (`DRM_IOCTL_ASAHI_GET_PARAMS failed:
+Invalid argument`). Mesa fell back to `llvmpipe`, so GNOME composited a 4K
+desktop on the CPU, in competition with the capture for cores and memory
+bandwidth. The P3 path refuses software renderers for that reason. Upgrading
+the kernel to match Mesa gave the GPU back, along with every number above.
+Check it with any Vulkan or GL program on the host: `vkcube` prints *Selected
+GPU*.
+
+⚠️ **More threads stop paying under motion.** On a still screen the CPU's half
+read went 27 → 18 → 12.6 ms at 1, 4 and 8 threads. With the compositor
+animating it went only 34 → 29 ms, because the compositor uses the same memory
+bandwidth the read needs. That is why P3 moved the read to the GPU rather than
+spreading it wider. The M2's hardware video encoder has no Linux driver, so the
+encode stays in software.
 
 ⚠️ **A benchmark that toggles GNOME's overview measures the content, not the
 pipeline.** The animation moves for part of each toggle, and the idle skip
@@ -1799,6 +1840,7 @@ the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/co
 | — | `ROOMLERD_DRM_WAKE_WAIT` | **on** | FR-93 P3e (§3.3): a display switched off is told to the controller (`display_wake`) and waited out, by a running session and by an open. Off = the last frame kept alive with no reason, and an open during the blank falls through the cascade, as before P3e |
 | — | `ROOMLERD_DRM_FOLLOW_CAP` | **on** | FR-107 P1 (§3.4): the DRM arm reads at half size whenever half the scanout still covers the pump's encode box. Off = the policy alone decides, as before P1 |
 | — | `ROOMLERD_DRM_THREADS` | **4** | FR-107 P2 (§3.4): the threads the DRM repack splits a frame across, at most the host's cores. `1` = the single pass, as before P2 |
+| — | `ROOMLERD_DRM_GPU` | **on** | FR-107 P3 (§3.4): the GPU reads the scanout through an EGL dma-buf import, scaled to the encode box. Off = the CPU reads it, as before P3. A host without EGL or with a software renderer keeps the CPU path by itself |
 | — | `ROOMLERD_SESSION_WATCH` | **on** | FR-93 P5f (§5.6): a per-user capture on the PipeWire arms tells the controller when its user's session is in the background (`session_away`): a user switch, or the login screen. Off = the last frame kept alive with no reason, as before P5f |
 | — | `ROOMLERD_SCREEN_STOP` | **on** | FR-93 P6c (§5.7): a share the person at the screen stopped with the desktop's own control (GNOME's Stop, KDE's End) ends the session as their Disconnect does. Off = the capture is reopened, as before P6c, which undoes their stop |
 | — | `ROOMLERD_SLEEP_NOTICE` | **on** | FR-93 P5h (§5.8): while a session is live, a logind delay inhibitor on sleep, and every controller told `host_sleep` before the computer sleeps. Off = no inhibitor and no notice, as before P5h |
