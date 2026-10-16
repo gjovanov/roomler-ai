@@ -69,7 +69,7 @@ A device that could curtain but whose owner has not allowed it advertises only
 ## Who can say no, and what the viewer says
 
 The server strips `PRIVACY` before the device ever sees it
-([`privacy_grant`, `hub.rs:381`](../crates/modules/fleet/src/hub.rs#L381)). The first reason
+([`privacy_grant`, `hub.rs:386`](../crates/modules/fleet/src/hub.rs#L386)). The first reason
 that applies wins, and it reaches the viewer (`rc:session.created.privacy_refused`) and the
 session's `session_requested` audit row (`privacy_stripped`):
 
@@ -202,11 +202,57 @@ sequenceDiagram
   (§8 row 11). **Linux** locks seat0's active session with `loginctl lock-session`. **macOS** has no
   mechanism yet: an end that should lock logs that it could not.
 - The key is the device's own. It is set over the LocalAPI only by the person at the console, whose screen
-  it locks, and no server can push it. An admin's request for a stricter lock is P3b.
+  it locks, and no server can push it. An admin can ask for stricter (below).
 - ⚠️ **`auto` restores what was found at the start.** A person who unlocked the computer during the session
   signs in again after it. Telling their input from the controller's would need the input hooks FR-92 bans.
 - ⚠️ **On a per-user install, `always` cannot be undone remotely.** That worker cannot reach the secure
   desktop, so the next session sees a padlock until someone signs in at the computer.
+
+### An admin can ask for stricter (P3b)
+
+A `MANAGE_AGENTS` admin can ask a device's sessions to lock at their end: **Lock when sessions end** on the
+device's row in the device list (`AccessPolicy.lock_on_end`: `auto` or `always`; `never` asks nothing).
+The device runs each session under the **stricter** of the ask and its owner's own `lock_on_end`
+([`effective_policy`](../agents/roomlerd/src/lock_on_end.rs)), so an ask can tighten the owner's setting and
+never loosen it:
+
+| owner's `lock_on_end` | admin's ask | the session runs under |
+|---|---|---|
+| `never` | none, or `never` | `never` |
+| `never` | `auto` | `auto` |
+| `auto` | `always` | `always` |
+| `always` | `auto` | `always` |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Adm as Admin (device row)
+    participant S as hub (server)
+    participant D as roomlerd (daemon)
+    participant W as worker
+    Adm->>S: AccessPolicy.lock_on_end = always
+    Note over S: the authz gate reads it for every controller,<br/>the owner and break-glass included
+    S->>D: rc:request lock_on_end=always (only if it advertises lock-on-end)
+    Note over S: audit session_requested: lock_on_end, lock_enforced
+    D->>W: SessionParams.lock_on_end (a service install's session runs in the worker)
+    Note over W: the session goes live: stricter of the ask and the owner's own
+    W->>W: the last session ends: LockWorkStation() / loginctl lock-session
+```
+
+- **Only an install that can lift the lock remotely takes an ask**: the Windows service (its worker is SYSTEM
+  in the console session and reaches the secure desktop) and the Linux root daemon. Only they advertise
+  `lock-on-end` ([`can_honour_ask`](../agents/roomlerd/src/lock_on_end.rs)). A per-user install never
+  receives one, because a lock an admin asked for there would leave every later session at a padlock no
+  session can lift. The owner's own setting stays theirs on any install.
+- The hub sends the ask on `rc:request` only to an agent that advertises `lock-on-end`. The
+  `session_requested` audit row records the ask and `lock_enforced`; `false` is an ask this session's end
+  will not take (a per-user install, a macOS device, or an agent older than P3b).
+- The ask binds every controller, the owner and break-glass included: it describes the device, not who is
+  asking. It crosses the cross-pod relay with the rest of the gate's decision, and a service install's
+  daemon hands it to the worker in `SessionParams`, because the worker is where the session goes live and
+  ends.
+- ⚠️ **An unknown value reads as `always`**, the stricter side, as everywhere `LockOnEnd` is read: an API
+  caller's typo locks rather than silently asking nothing.
 
 ## Platforms
 

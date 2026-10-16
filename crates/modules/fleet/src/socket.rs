@@ -224,6 +224,11 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_enforces_idle(agent_id, caps.has_rpc(RpcCap::IdleTimeout));
+    // FR-99 P3b — whether it honours a lock ask, so the ask is sent only
+    // where the device can take it. Equality-matched.
+    state
+        .rc_hub
+        .set_agent_honours_lock_on_end(agent_id, caps.has_rpc(RpcCap::LockOnEnd));
     state
         .rc_hub
         .set_agent_keep_busy_support(agent_id, supports_keep_busy);
@@ -451,6 +456,7 @@ pub async fn handle_agent_socket(
         session_policy: crate::hub::OrgPolicy::Unavailable,
         max_duration: None,
         idle_secs: None,
+        lock_on_end: None,
     };
 
     // Phase A-1 — server-side receive-liveness, symmetric to the agent's
@@ -726,6 +732,11 @@ pub async fn handle_agent_socket(
                                     state.rc_hub.set_agent_enforces_idle(
                                         agent_id,
                                         caps.has_rpc(RpcCap::IdleTimeout),
+                                    );
+                                    // FR-99 P3b — and its lock word.
+                                    state.rc_hub.set_agent_honours_lock_on_end(
+                                        agent_id,
+                                        caps.has_rpc(RpcCap::LockOnEnd),
                                     );
                                     // FR-94 — the SYSTEM service came up, was
                                     // anchored, or went away while this worker

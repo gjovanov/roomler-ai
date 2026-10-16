@@ -30,7 +30,7 @@ distinguish "default" from explicit `sort=name`. Change: keep the param as
 (the sidebar's exact order); `Some(k)` → the existing whitelist (`:114-129`)
 unchanged. `cmp_rows` (`:377-401`) gains the compound arm; the id tiebreak
 (`:219-223`) stays. UI needs **zero change**: an untouched grid emits
-`sortBy: []` → no `sort` param (`AgentsSection.vue:1456-1466`,
+`sortBy: []` → no `sort` param (`AgentsSection.vue:1486-1496`,
 `stores/devices.ts:77-78`). `device_list_tests.rs:280`'s comment updates
 (order itself survives — the three fixture agents share one presence bucket).
 
@@ -87,7 +87,7 @@ over `code`/`target_email`) + optional `status` exact filter to
 
 ### P2 UI (all three pages)
 The devices-grid kit verbatim: `v-data-table-server` + `@update:options` as
-the single fetch trigger (`AgentsSection.vue:1453-1466`), 300ms debounced
+the single fetch trigger (`AgentsSection.vue:1483-1496`), 300ms debounced
 search with page-1 reset (`:1468-1477`), h-scroll CSS (nowrap +
 `width:max-content` wrapper), `useGridColumns` +
 `GridColumnPickerDialog` (`composables/useGridColumns.ts:34-163`,

@@ -1132,6 +1132,8 @@ async fn session_audit_reads_back_rows_the_audit_sink_wrote() {
             features_stripped: None,
             idle_secs: None,
             idle_enforced: None,
+            lock_on_end: None,
+            lock_enforced: None,
         },
     );
     sink.record(

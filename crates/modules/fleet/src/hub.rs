@@ -27,8 +27,8 @@ use roomler_ai_remote_control::consent::{
 };
 use roomler_ai_remote_control::error::{Error, Result};
 use roomler_ai_remote_control::models::{
-    AgentCaps, AuditKind, ConsentMode, EndReason, ExecOutcome, FeaturePolicy, OsKind, RecordCap,
-    RpcCap, SessionPhase, SessionPolicy,
+    AgentCaps, AuditKind, ConsentMode, EndReason, ExecOutcome, FeaturePolicy, LockOnEnd, OsKind,
+    RecordCap, RpcCap, SessionPhase, SessionPolicy,
 };
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::session::{ClientTx, LiveSession};
@@ -167,6 +167,11 @@ pub struct ConnectedAgent {
     /// still rides the request (an older agent ignores it) but the viewer is
     /// not told one, since nothing would keep it.
     pub enforces_idle: bool,
+    /// FR-99 P3b — the agent advertises `lock-on-end` in `AgentCaps.rpc`: it
+    /// takes `Request.lock_on_end` into the lock at the session's end. Per
+    /// CONNECTION; `false` ⇒ the ask is not sent, and the audit row records
+    /// it as not enforced.
+    pub honours_lock_on_end: bool,
     /// FR-92 — the agent advertises `keep-busy` in `AgentCaps.input`: it
     /// parses `rc:agent.keep_busy_policy`. Per CONNECTION; a pre-FR-92 agent
     /// would log every policy frame as an unknown `rc:*` at WARN.
@@ -776,6 +781,9 @@ impl Hub {
             // FR-101 P4b-2 — set by `set_agent_enforces_idle`; `false` (no
             // idle limit promised to a viewer) until it is.
             enforces_idle: false,
+            // FR-99 P3b — set by `set_agent_honours_lock_on_end`; `false` (no
+            // lock ask sent) until it is.
+            honours_lock_on_end: false,
             // FR-92 — set by `set_agent_keep_busy_support`; `false` = no
             // policy frame is ever pushed to this connection.
             supports_keep_busy: false,
@@ -1271,6 +1279,7 @@ impl Hub {
             OrgPolicy::Read(SessionPolicy::default()),
             None,
             None,
+            None,
         )
     }
 
@@ -1311,6 +1320,9 @@ impl Hub {
         // and the device's own, resolved by the authz gate. The device keeps
         // it; `None` = no idle limit.
         idle_secs: Option<u32>,
+        // FR-99 P3b — what the device's access policy asks of the session's
+        // end, resolved by the authz gate. `None` = nothing asked.
+        lock_on_end: Option<LockOnEnd>,
     ) -> Result<ObjectId> {
         // rc.185 — self-heal the fast connect→disconnect race. A controller
         // that connects then drops before teardown completes can leave an
@@ -1432,6 +1444,7 @@ impl Hub {
             agent_asks,
             agent_floor,
             agent_enforces_idle,
+            agent_honours_lock,
         ) = {
             let mut agent = self
                 .inner
@@ -1450,6 +1463,7 @@ impl Hub {
                 agent.asks_features,
                 agent.device_session_policy,
                 agent.enforces_idle,
+                agent.honours_lock_on_end,
             )
         };
 
@@ -1655,6 +1669,8 @@ impl Hub {
             // FR-101 P4b-2 — the idle limit, to every agent: one that keeps it
             // measures and ends the session; an older one ignores the field.
             idle_secs,
+            // FR-99 P3b — the lock ask, only to an agent that honours it.
+            lock_on_end: lock_on_end.filter(|_| agent_honours_lock),
         };
         // Keep the Request while consent is pending so `register_agent` can
         // re-push it if the agent's control WS flaps before `rc:consent`
@@ -1680,6 +1696,8 @@ impl Hub {
                 features_stripped: refusals_wire(&features_refused),
                 idle_secs,
                 idle_enforced: idle_secs.map(|_| agent_enforces_idle),
+                lock_on_end,
+                lock_enforced: lock_on_end.map(|_| agent_honours_lock),
             },
         );
         self.audit(session_id, agent_id, agent_org, AuditKind::ConsentPrompted);
@@ -2294,6 +2312,14 @@ impl Hub {
     pub fn set_agent_enforces_idle(&self, agent_id: ObjectId, enforces: bool) {
         if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
             entry.enforces_idle = enforces;
+        }
+    }
+
+    /// FR-99 P3b — record whether the agent honours a lock ask (its hello's,
+    /// or a heartbeat's, `AgentCaps.rpc` has `lock-on-end`).
+    pub fn set_agent_honours_lock_on_end(&self, agent_id: ObjectId, honours: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.honours_lock_on_end = honours;
         }
     }
 
@@ -3343,6 +3369,11 @@ pub struct DispatchCtx {
     /// carries it too. `None` = none. Ignored for non-request messages and
     /// agent-role dispatch.
     pub idle_secs: Option<u32>,
+    /// FR-99 P3b — what the device's access policy asks of the session's end
+    /// (`AccessPolicy::lock_on_end_ask`). The relay carries it too, or a
+    /// session landing on the other pod would drop the ask. `None` = nothing
+    /// asked. Ignored for non-request messages and agent-role dispatch.
+    pub lock_on_end: Option<LockOnEnd>,
 }
 
 impl Hub {
@@ -3434,6 +3465,7 @@ impl Hub {
                     ctx.session_policy,
                     ctx.max_duration,
                     ctx.idle_secs,
+                    ctx.lock_on_end,
                 )?;
                 Ok(())
             }
@@ -3968,6 +4000,7 @@ mod tests {
                 OrgPolicy::Read(SessionPolicy::default()),
                 max,
                 None,
+                None,
             )
             .unwrap()
         };
@@ -4043,6 +4076,7 @@ mod tests {
                 OrgPolicy::Read(SessionPolicy::default()),
                 None,
                 idle,
+                None,
             )
             .unwrap()
         };
@@ -4094,6 +4128,7 @@ mod tests {
             session_policy: OrgPolicy::Unavailable,
             max_duration: None,
             idle_secs: None,
+            lock_on_end: None,
         };
         hub.dispatch(
             &device,
@@ -4244,6 +4279,7 @@ mod tests {
             session_policy: OrgPolicy::Read(SessionPolicy::default()),
             max_duration: None,
             idle_secs: None,
+            lock_on_end: None,
         };
         let stranger = ctx_for(Role::Controller, Some(ObjectId::new()), None);
         let owner_ctx = ctx_for(Role::Controller, Some(owner), None);
@@ -4409,6 +4445,7 @@ mod tests {
             session_policy: OrgPolicy::Read(SessionPolicy::default()),
             max_duration: None,
             idle_secs: None,
+            lock_on_end: None,
         };
         let device = ctx_for(Role::Agent, None, Some(agent_id));
         let viewer = ctx_for(Role::Controller, Some(owner), None);
@@ -4555,6 +4592,7 @@ mod tests {
                 OrgPolicy::Read(SessionPolicy::default()),
                 None,
                 None,
+                None,
             )
             .unwrap();
             match rx.try_recv().unwrap() {
@@ -4657,6 +4695,7 @@ mod tests {
                 None,
                 true,
                 OrgPolicy::Read(SessionPolicy::default()),
+                None,
                 None,
                 None,
             )
@@ -4790,6 +4829,7 @@ mod tests {
                 None,
                 false,
                 OrgPolicy::Read(SessionPolicy::default()),
+                None,
                 None,
                 None,
             )
@@ -5117,6 +5157,7 @@ mod tests {
                 org,
                 None,
                 None,
+                None,
             )
             .unwrap();
             let (granted, refused) = match rx.try_recv().unwrap() {
@@ -5190,6 +5231,7 @@ mod tests {
             None,
             false,
             org,
+            None,
             None,
             None,
         )
@@ -5758,6 +5800,7 @@ mod tests {
                 None, // tenant_name
                 false,
                 OrgPolicy::Read(SessionPolicy::default()),
+                None,
                 None,
                 None,
             )

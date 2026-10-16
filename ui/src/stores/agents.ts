@@ -43,6 +43,10 @@ export type AgentStatusValue = 'online' | 'offline' | 'unenrolled' | 'quarantine
  *  (`prompt` — attended). Replaces the legacy `require_consent` bool. */
 export type ConsentMode = 'auto' | 'prompt' | 'email' | 'push' | 'prompt_then_email'
 
+/** FR-99 P3 — whether a device locks its screen when the last remote session
+ *  ends. Mirrors the Rust `LockOnEnd` (lowercase on the wire). */
+export type LockOnEnd = 'never' | 'auto' | 'always'
+
 /** FR-101 P2 — one sensitive session feature, as an org allows it. Mirrors the
  *  Rust `RcFeaturePolicy` (lowercase on the wire). */
 export type RcFeaturePolicy = 'on' | 'ask' | 'off'
@@ -81,6 +85,12 @@ export interface AccessPolicy {
    *  the best one (it can be the only working path between two hostile NATs,
    *  but it inherits the mesh's failure modes). */
   rc_overlay?: boolean | null
+  /** FR-99 P3b — what this device's sessions ask of it when the last one
+   *  ends: `auto` (lock again if it was locked, or nobody was at it, when the
+   *  session began) or `always`. The device takes the stricter of this and its
+   *  owner's own setting, so an ask can only tighten it. `null`/absent/`never`
+   *  asks nothing. */
+  lock_on_end?: LockOnEnd | null
 }
 
 /** Codec + HW backend availability advertised by the agent in its

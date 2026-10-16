@@ -523,3 +523,95 @@ async fn the_idle_limit_reaches_the_device_and_only_a_keeping_device_tells_the_v
         .expect("a session_ended audit row");
     assert_eq!(ended["limit"], "idle", "{ended}");
 }
+
+/// Replace a device's access policy, as the device row's selects do.
+async fn set_access_policy(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    token: &str,
+    agent_id: &str,
+    policy: Value,
+) {
+    let resp = app
+        .client
+        .put(app.url(&format!(
+            "/api/tenant/{}/agent/{}",
+            seeded.tenant_id, agent_id
+        )))
+        .bearer_auth(token)
+        .json(&json!({ "access_policy": policy }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+}
+
+/// FR-99 P3b — the device's lock ask, through the real authz gate and hub.
+/// An admin sets `AccessPolicy.lock_on_end`. A device that honours it
+/// (`lock-on-end`) is sent the ask on its request, and the audit row says it
+/// is enforced. A device that does not is sent nothing, and the audit row says
+/// the ask is not enforced. `never` asks nothing at all.
+#[tokio::test]
+async fn the_lock_ask_reaches_only_a_device_that_honours_it() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr99p3bask").await;
+    let admin = seeded.admin.access_token.clone();
+
+    // A device that honours it, asked for `always`.
+    let (new_agent, mut new_ws) =
+        connect_agent_rpc(&app, &seeded, "mach-fr99-lock-new", &["lock-on-end"]).await;
+    set_access_policy(
+        &app,
+        &seeded,
+        &admin,
+        &new_agent,
+        json!({ "lock_on_end": "always" }),
+    )
+    .await;
+    let (_ctl, created, request) = request_session(&app, &admin, &new_agent, &mut new_ws).await;
+    assert_eq!(request["lock_on_end"], "always", "{request}");
+    let sid = created["session_id"].as_str().unwrap().to_string();
+    let requested = audit_event(&app, &seeded, &sid, "session_requested")
+        .await
+        .expect("a session_requested audit row");
+    assert_eq!(requested["lock_on_end"], "always", "{requested}");
+    assert_eq!(requested["lock_enforced"], true, "{requested}");
+
+    // A device that does not: nothing rides its request, and the audit row
+    // records an ask this session's end will not take.
+    let (old_agent, mut old_ws) = connect_agent(&app, &seeded, "mach-fr99-lock-old").await;
+    set_access_policy(
+        &app,
+        &seeded,
+        &admin,
+        &old_agent,
+        json!({ "lock_on_end": "auto" }),
+    )
+    .await;
+    let (_ctl, created, request) = request_session(&app, &admin, &old_agent, &mut old_ws).await;
+    assert!(request["lock_on_end"].is_null(), "{request}");
+    let sid = created["session_id"].as_str().unwrap().to_string();
+    let requested = audit_event(&app, &seeded, &sid, "session_requested")
+        .await
+        .expect("a session_requested audit row");
+    assert_eq!(requested["lock_on_end"], "auto", "{requested}");
+    assert_eq!(requested["lock_enforced"], false, "{requested}");
+
+    // `never` asks nothing, even of a device that would honour an ask.
+    set_access_policy(
+        &app,
+        &seeded,
+        &admin,
+        &new_agent,
+        json!({ "lock_on_end": "never" }),
+    )
+    .await;
+    let (_ctl, created, request) = request_session(&app, &admin, &new_agent, &mut new_ws).await;
+    assert!(request["lock_on_end"].is_null(), "{request}");
+    let sid = created["session_id"].as_str().unwrap().to_string();
+    let requested = audit_event(&app, &seeded, &sid, "session_requested")
+        .await
+        .expect("a session_requested audit row");
+    assert!(requested["lock_on_end"].is_null(), "{requested}");
+    assert!(requested["lock_enforced"].is_null(), "{requested}");
+}

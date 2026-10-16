@@ -527,6 +527,21 @@
                 :aria-label="`Idle limit for ${item.name}`"
                 @update:model-value="(m) => onIdleMinutesChange(agentFor(item)!, m as number)"
               />
+              <!-- FR-99 P3b — ask this device to lock its screen when the last
+                   remote session ends. The device takes the stricter of this and
+                   its owner's own setting, so it can only tighten it. -->
+              <v-select
+                :model-value="agentFor(item)!.access_policy.lock_on_end ?? 'never'"
+                :items="LOCK_ON_END_ITEMS"
+                density="compact"
+                variant="plain"
+                hide-details
+                :disabled="consentBusy === item.id"
+                class="consent-select"
+                :title="LOCK_ON_END_HINT"
+                :aria-label="`Lock ${item.name} when its remote sessions end`"
+                @update:model-value="(m) => onLockOnEndChange(agentFor(item)!, m as LockOnEnd)"
+              />
               <!-- #1882 — may a session to this device ride the mesh? Off by
                    default: the agent keeps overlay addresses out of its ICE. -->
               <v-checkbox
@@ -825,6 +840,21 @@
               :title="IDLE_LIMIT_HINT"
               :aria-label="`Idle limit for ${a.name}`"
               @update:model-value="(m) => onIdleMinutesChange(a, m as number)"
+            />
+            <!-- FR-99 P3b — see the desktop table: it can only tighten the
+                 device owner's own setting. -->
+            <v-select
+              :model-value="a.access_policy.lock_on_end ?? 'never'"
+              :items="LOCK_ON_END_ITEMS"
+              label="Lock when sessions end"
+              density="compact"
+              variant="outlined"
+              hide-details
+              :disabled="consentBusy === a.id"
+              class="mb-2"
+              :title="LOCK_ON_END_HINT"
+              :aria-label="`Lock ${a.name} when its remote sessions end`"
+              @update:model-value="(m) => onLockOnEndChange(a, m as LockOnEnd)"
             />
             <!-- #1882 — see the desktop table: off by default. -->
             <v-checkbox
@@ -1558,6 +1588,7 @@ import {
   type Agent,
   type ConsentMode,
   type EnrollmentToken,
+  type LockOnEnd,
 } from '@/stores/agents'
 import { codecChips, permissionWarnings } from './agentCodecChips'
 import { keepBusyBriefTitle } from '@/composables/keepBusy'
@@ -2019,6 +2050,38 @@ async function onIdleMinutesChange(a: Agent, minutes: number) {
     await agentStore.updateAccessPolicy(props.tenantId, a.id, {
       ...a.access_policy,
       auto_terminate_idle_minutes: next,
+    })
+  } catch (e) {
+    agentStore.error = (e as Error).message
+  } finally {
+    consentBusy.value = null
+  }
+}
+
+// FR-99 P3b — what this device's sessions ask of it when the last one ends
+// (`AccessPolicy.lock_on_end`). `never` in the select asks nothing (stored as
+// null), so the device owner's own setting alone applies.
+const LOCK_ON_END_ITEMS: { title: string; value: LockOnEnd }[] = [
+  { title: 'Lock: the device decides', value: 'never' },
+  { title: 'Lock: if locked or idle at the start', value: 'auto' },
+  { title: 'Lock: always', value: 'always' },
+]
+const LOCK_ON_END_HINT =
+  'Lock this device’s screen when the last remote-desktop session to it ends. ' +
+  '“If locked or idle at the start” locks it again only if it was locked, or nobody was ' +
+  'at it, when the session began. The device takes the stricter of this and its owner’s ' +
+  'own setting, so this can only tighten it. Honoured by service installs on Windows and ' +
+  'Linux, where a session can unlock the screen again; a per-user install, or an agent that ' +
+  'predates it, does not take it. Applies to the next session.'
+
+async function onLockOnEndChange(a: Agent, lock: LockOnEnd) {
+  const next = lock === 'never' ? null : lock
+  if ((a.access_policy.lock_on_end ?? null) === next) return
+  consentBusy.value = a.id
+  try {
+    await agentStore.updateAccessPolicy(props.tenantId, a.id, {
+      ...a.access_policy,
+      lock_on_end: next,
     })
   } catch (e) {
     agentStore.error = (e as Error).message
