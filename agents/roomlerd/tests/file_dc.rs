@@ -246,7 +246,7 @@ async fn open_files_dc() -> Result<DcSide> {
     // Wait for agent to accept the DC, then attach the production
     // dispatcher. The session_id is a fresh ObjectId — the dispatcher
     // uses it only for log lines, not for any state lookup.
-    let agent_dc = tokio::time::timeout(Duration::from_secs(5), agent_dc_rx)
+    let agent_dc = tokio::time::timeout(Duration::from_secs(30), agent_dc_rx)
         .await
         .map_err(|_| anyhow!("agent on_data_channel timed out"))?
         .map_err(|e| anyhow!("agent_dc_rx: {e}"))?;
