@@ -66,7 +66,7 @@ sequenceDiagram
   - never before the first connect, so a device that cannot reach its server asks it nothing;
   - a random 0–60 s delay spreads a fleet that reconnected at once;
   - after a failure that may pass, it waits a full hour, and reconnects meanwhile do not trigger another try.
-- **Saving** (`RemoteConfigServices::persist_agent_token`, `agents/roomlerd/src/remote_config.rs:262`). A compare-and-swap under the daemon's config lock, finding the enrollment by `(server_url, tenant_id)` wherever it now lives (scalar or `[[orgs]]`).
+- **Saving** (`RemoteConfigServices::persist_agent_token`, `agents/roomlerd/src/remote_config.rs:268`). A compare-and-swap under the daemon's config lock, finding the enrollment by `(server_url, tenant_id)` wherever it now lives (scalar or `[[orgs]]`).
   - A file holding a *different* token was re-enrolled meanwhile, and that token wins.
   - A file naming another device for the enrollment is refused, with nothing written.
   - A save that fails still puts the renewed token in use: the file's token stays valid, so nothing is lost.
@@ -105,7 +105,7 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 
 ### A connected device is told at once (#2267)
 
-A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1024`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1040`).
+A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1024`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1044`).
 
 Before #2267 the kick only took the device out of the hub. The device kept its socket and heard nothing. It learned of its removal at its next connection, after a network change or a pod roll, and on a stable network that could take days. Nothing could be done through that socket, because every action re-checks the row, but the device's own status read "connected" throughout.
 
@@ -132,13 +132,19 @@ sequenceDiagram
 | an ephemeral device's own unenroll | **no** | it is already shutting down, and a goodbye racing that clean stop would turn it into exit 7 (`tells_the_device`, `crates/modules/fleet/src/removal.rs:111`) |
 | a device this removal sent `rc:hive.purge_all` (FR-90 P2g-4a) | **no**, and its socket stays open as before | the exit is immediate, and the purge runs after its frame lands (`crates/modules/fleet/src/hub.rs:3006`) |
 
-What happens after exit 7 depends on the service manager. The device stays down until it is re-enrolled, but only Linux needs a hand to start it again:
+What happens after exit 7 depends on how the daemon is installed. The device stays down until it is re-enrolled, and on some installs it needs a hand to start again. `roomlerd re-enroll` ends by naming the right step for the install it runs on, and so does the removal's needs-attention sentinel (`Install`, `agents/roomlerd/src/service.rs`; #2293):
 
-| Platform | After exit 7 | After `roomlerd re-enroll` |
+| Install | After exit 7 | After `roomlerd re-enroll` |
 |---|---|---|
-| Windows (the service's own supervisor) | it starts the worker again with a backoff of up to 60 s, and each start is refused and exits 7 (`decide_exit_reaction`, `agents/roomlerd/src/win_service/supervisor.rs:921`) | the next start connects with the new token, with no restart |
-| macOS (launchd, `KeepAlive` on a failed exit) | relaunched at most every 10 s | the same |
-| Linux (systemd) | stays stopped: `RestartPreventExitStatus=7 8`, because restarting only hammers a server that already said no (`agents/roomlerd/packaging/linux/roomlerd.service:72`) | start it: `sudo systemctl start roomlerd`, or `systemctl --user start roomler` for a per-user install |
+| Windows, the `Roomler` service (machine installs, attended or not) | its supervisor starts the worker again with a backoff of up to 60 s, for good; each start is refused and exits 7 (`decide_exit_reaction`, `agents/roomlerd/src/win_service/supervisor.rs:921`) | the next start connects with the new token, with no hand |
+| Windows, the per-user Scheduled Task | `<RestartOnFailure>` relaunches it **ten times, a minute apart**, then it stays down until the next sign-in | within those ten minutes, the next relaunch; after them, `roomlerd service start` |
+| macOS (launchd, `KeepAlive` on a failed exit) | relaunched at most every 10 s | the next relaunch, with no hand |
+| Linux, the system unit `roomlerd` | stays stopped: `RestartPreventExitStatus=7 8`, because restarting only hammers a server that already said no (`agents/roomlerd/packaging/linux/roomlerd.service:72`) | `sudo systemctl start roomlerd` |
+| Linux, the per-user unit `roomler` | stays stopped, by the same rule | `roomlerd service start` |
+
+A secondary organization's goodbye ends only that organization's loop, and nothing starts the loop again: after re-enrolling it, restart the daemon (`roomler restart`, or `sudo systemctl restart roomlerd` for the Linux system unit).
+
+> ⚠️ Never answer a removal with `roomlerd run` on a host whose daemon a service manager owns. By hand it starts an unmanaged orphan beside the unit, the task or launchd. `re-enroll` suggested exactly that until #2293.
 
 > ⚠️ Linux's "start it again" is not new. Before #2267 the same exit happened at the device's next connection, so a remove → `re-enroll` sequence kept running without a start only while the socket happened to stay up between the two steps.
 

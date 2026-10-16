@@ -24,6 +24,148 @@
 //! "Screen Recording" authorization that fires on first run).
 
 use anyhow::{Context, Result, bail};
+use std::path::Path;
+
+/// #2293 — how this host's daemon is run, which decides what starts it again
+/// after a removal stopped it (exit 7, `AGENT_DELETED_EXIT_CODE`), and so what
+/// `roomlerd re-enroll` and the removal's sentinel tell the person:
+///
+/// | Install | After exit 7 |
+/// |---|---|
+/// | Linux, the system or the user unit | nothing: `RestartPreventExitStatus=7 8` |
+/// | Windows, the `Roomler` service | its supervisor, at most 60 s apart, for good |
+/// | Windows, the per-user task | `<RestartOnFailure>`: ten times, a minute apart |
+/// | macOS, the LaunchDaemon or the LaunchAgent | launchd, on any failed exit |
+///
+/// Before #2293 both said "wait for the supervisor to relaunch", which on
+/// Linux never comes, and offered `roomlerd run`, which by hand starts an
+/// unmanaged orphan beside the unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Install {
+    /// `roomlerd.service`: root, `/etc/roomler/config.toml`.
+    LinuxSystem,
+    /// `roomler.service`, the person's user unit.
+    LinuxUser,
+    /// The `Roomler` SCM service, whose supervisor runs the worker. It owns
+    /// attended installs too, whose config is the person's.
+    WindowsService,
+    /// The per-user Scheduled Task (the perUser MSI).
+    WindowsTask,
+    /// launchd: the LaunchDaemon or the LaunchAgent.
+    MacOs,
+    /// No service manager this code knows.
+    Other,
+}
+
+impl Install {
+    /// The install a daemon with the config at `config_path` runs as.
+    ///
+    /// ⚠️ Windows asks the SCM (a read-only status query), not the path: an
+    /// attended service install keeps its config in the person's profile, as
+    /// a per-user install does. A failed query takes the per-user answer,
+    /// whose words fit both.
+    pub fn detect(config_path: &Path) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            if config_path == crate::appdirs::system_config_path()
+                || crate::appdirs::running_as_root()
+            {
+                Self::LinuxSystem
+            } else {
+                Self::LinuxUser
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = config_path;
+            match crate::win_service::status() {
+                Ok(crate::win_service::InstalledStatus::NotInstalled) | Err(_) => Self::WindowsTask,
+                Ok(_) => Self::WindowsService,
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = config_path;
+            Self::MacOs
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        {
+            let _ = config_path;
+            Self::Other
+        }
+    }
+
+    /// What `roomlerd re-enroll` ends with. `primary`: the enrollment it
+    /// refreshed is the config's own. A secondary organization's loop ended
+    /// at its goodbye, and only a daemon restart starts it again.
+    pub fn after_re_enroll(self, primary: bool) -> &'static str {
+        if !primary {
+            return match self {
+                Self::LinuxSystem => {
+                    "This organization connects again when the daemon restarts: \
+                     `sudo systemctl restart roomlerd`."
+                }
+                Self::Other => "This organization connects again when the daemon restarts.",
+                _ => {
+                    "This organization connects again when the daemon restarts: \
+                     `roomler restart`."
+                }
+            };
+        }
+        match self {
+            Self::LinuxSystem => {
+                "Start the daemon: `sudo systemctl start roomlerd`. systemd does not \
+                 restart a daemon the server removed (exit 7). If it is still running, \
+                 `sudo systemctl restart roomlerd` makes it use the new token now."
+            }
+            Self::LinuxUser => {
+                "Start the daemon: `roomlerd service start`. systemd does not restart \
+                 a daemon the server removed (exit 7). If it is still running, \
+                 `roomler restart` makes it use the new token now."
+            }
+            Self::WindowsService => {
+                "The Roomler service starts the agent again within a minute, with the \
+                 new token. If it is still running, `roomler restart` makes it use the \
+                 new token now."
+            }
+            Self::WindowsTask => {
+                "The agent's task starts it again within a minute, with the new token, \
+                 but only ten times after a removal: if it is not back, start it with \
+                 `roomlerd service start`. If it is still running, `roomler restart` \
+                 makes it use the new token now."
+            }
+            Self::MacOs => {
+                "launchd starts the agent again within seconds, with the new token. If \
+                 it is still running, `roomler restart` makes it use the new token now."
+            }
+            Self::Other => "Start the daemon again: `roomlerd run`, or your service manager.",
+        }
+    }
+
+    /// The last line of the removal's sentinel, after the `re-enroll` command
+    /// it names.
+    pub fn after_removal(self) -> &'static str {
+        match self {
+            Self::LinuxSystem => {
+                "then start it: sudo systemctl start roomlerd\n\
+                 (systemd does not restart a daemon the server removed)."
+            }
+            Self::LinuxUser => {
+                "then start it: roomlerd service start\n\
+                 (systemd does not restart a daemon the server removed)."
+            }
+            Self::WindowsService => {
+                "and the Roomler service starts it again within a minute, with the new token."
+            }
+            Self::WindowsTask => {
+                "and its task starts it again within a minute, but only ten times;\n\
+                 after that: roomlerd service start"
+            }
+            Self::MacOs => "and launchd starts it again within seconds, with the new token.",
+            Self::Other => "then start the daemon again.",
+        }
+    }
+}
 
 /// Status of the auto-start hook as reported by the OS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1182,5 +1324,105 @@ mod tests {
             ) => {}
             Err(_) => panic!("status() errored on this platform"),
         }
+    }
+
+    // ─── #2293: what brings a removed daemon back ────────────────────
+
+    const EVERY: [Install; 6] = [
+        Install::LinuxSystem,
+        Install::LinuxUser,
+        Install::WindowsService,
+        Install::WindowsTask,
+        Install::MacOs,
+        Install::Other,
+    ];
+
+    #[test]
+    fn a_service_managed_install_is_never_told_to_run_the_daemon_by_hand() {
+        // `roomlerd run` beside a unit, a task or launchd is an unmanaged
+        // orphan: the hint #2293 removed. Only a host with no service manager
+        // may be told it.
+        for i in EVERY {
+            for primary in [true, false] {
+                let says = i.after_re_enroll(primary);
+                assert_eq!(
+                    says.contains("roomlerd run"),
+                    i == Install::Other && primary,
+                    "{i:?} primary={primary}: {says}"
+                );
+                assert!(
+                    !says.contains("wait for the supervisor"),
+                    "{i:?}: the relaunch that never comes on Linux: {says}"
+                );
+            }
+            assert!(!i.after_removal().contains("wait for the supervisor"));
+        }
+    }
+
+    #[test]
+    fn linux_names_the_start_systemd_will_not_make() {
+        // exit 7 is in `RestartPreventExitStatus` for both units.
+        let system = Install::LinuxSystem.after_re_enroll(true);
+        assert!(system.contains("sudo systemctl start roomlerd"), "{system}");
+        let user = Install::LinuxUser.after_re_enroll(true);
+        assert!(user.contains("roomlerd service start"), "{user}");
+        assert!(!user.contains("sudo"), "a user unit needs no root: {user}");
+        assert!(
+            Install::LinuxSystem
+                .after_removal()
+                .contains("sudo systemctl start roomlerd")
+        );
+        assert!(
+            Install::LinuxUser
+                .after_removal()
+                .contains("roomlerd service start")
+        );
+    }
+
+    #[test]
+    fn the_per_user_windows_task_is_said_to_give_up() {
+        // `<RestartOnFailure>` relaunches ten times, then the task stays
+        // down until the next sign-in: unlike the service's supervisor.
+        for says in [
+            Install::WindowsTask.after_re_enroll(true),
+            Install::WindowsTask.after_removal(),
+        ] {
+            assert!(says.contains("ten times"), "{says}");
+            assert!(says.contains("roomlerd service start"), "{says}");
+        }
+        assert!(
+            !Install::WindowsService
+                .after_re_enroll(true)
+                .contains("roomlerd service start"),
+            "the service's supervisor restarts the worker for good"
+        );
+    }
+
+    #[test]
+    fn a_secondary_org_is_told_to_restart_the_daemon() {
+        // Its loop ended at its goodbye; nothing but a restart starts it.
+        for i in EVERY {
+            let says = i.after_re_enroll(false);
+            assert!(says.contains("restarts"), "{i:?}: {says}");
+        }
+        assert!(
+            Install::LinuxSystem
+                .after_re_enroll(false)
+                .contains("sudo systemctl restart roomlerd")
+        );
+        assert!(
+            Install::WindowsService
+                .after_re_enroll(false)
+                .contains("roomler restart")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_system_config_is_the_system_unit() {
+        assert_eq!(
+            Install::detect(&crate::appdirs::system_config_path()),
+            Install::LinuxSystem
+        );
     }
 }

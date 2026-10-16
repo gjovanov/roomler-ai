@@ -83,6 +83,12 @@ impl RemoteConfigServices {
         }
     }
 
+    /// The config file this daemon runs from. #2293 — the removal's sentinel
+    /// names the restart that fits its install.
+    pub fn config_path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     /// Gate 4 for Fleet RPC, read per request.
     pub fn exec_enabled(&self) -> bool {
         self.exec_enabled.load(Ordering::Relaxed)
