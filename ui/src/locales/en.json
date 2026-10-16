@@ -460,6 +460,22 @@
         "retention": "Kept {days} days after a session ends",
         "retentionForever": "Kept for good after a session ends"
       },
+      "rules": {
+        "edit": "Edit the policy",
+        "min": "At least",
+        "max": "At most",
+        "copiesHint": "Copies of each session, its own device's among them: 1 to {max}",
+        "maxBelowMin": "At most is fewer than at least",
+        "archive": "Archive replicas join every session the rules allow",
+        "prefer": "Then the session owner's own devices",
+        "restricted": "Restricted tags",
+        "restrictedHint": "A session on a device with one of these tags is copied only to devices with that tag too. Press Enter to add one.",
+        "retention": "Days kept after a session ends",
+        "retentionHint": "0 keeps it for good, and at most {max}",
+        "retentionInvalid": "A whole number of days, from 0 to {max}",
+        "saved": "Saved. The organization's live sessions are placed again under it.",
+        "stale": "The policy changed since you read it. It is shown as it is now: make your change again."
+      },
       "archive": {
         "title": "Archive replicas",
         "hint": "An always-on device of your organization that keeps a copy of every session the rules allow, for their retention, and serves a session while no other member is online. It runs no session. Your organization runs it, on its own machines.",

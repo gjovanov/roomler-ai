@@ -39,6 +39,9 @@ const hoisted = vi.hoisted(() => {
 vi.mock('@/api/client', () => ({ ApiError: hoisted.ApiError }))
 vi.mock('@/stores/hive', () => ({
   HIVE_ARCHIVE_CAP: 'hive-archive',
+  HIVE_MAX_MEMBERS: 8,
+  HIVE_MAX_RETENTION_DAYS: 3650,
+  HIVE_PREFER_OWNER_DEVICES: 'owner_devices',
   useHiveStore: () => ({ fetchPolicy: hoisted.fetchPolicy, putPolicy: hoisted.putPolicy }),
 }))
 vi.mock('@/stores/agents', () => ({
@@ -48,8 +51,8 @@ vi.mock('@/stores/agents', () => ({
       { id: 'd1', name: 'archive-1', is_online: true, capabilities: { rpc: ['hive', 'hive-replica', 'hive-archive'] } },
       // Designated, but its owner turned hive_archive off.
       { id: 'd2', name: 'old-archive', display_name: 'Old archive', is_online: true, capabilities: { rpc: ['hive', 'hive-replica'] } },
-      // Neither: not listed.
-      { id: 'd3', name: 'laptop', is_online: true, capabilities: { rpc: ['hive', 'hive-replica'] } },
+      // Neither: not listed. Its tags are offered as restricted tags (P2j-4).
+      { id: 'd3', name: 'laptop', is_online: true, tags: ['pci', 'prod'], capabilities: { rpc: ['hive', 'hive-replica'] } },
       // `hive-archives` is not `hive-archive`: words match by equality.
       { id: 'd4', name: 'lookalike', is_online: true, capabilities: { rpc: ['hive-archives'] } },
     ],
@@ -249,5 +252,175 @@ describe('HiveCopiesView (FR-90 P2h-2)', () => {
     await flushPromises()
     expect(w.find('[data-testid="hive-copies-off"]').exists()).toBe(true)
     expect(w.find('[data-testid="hive-copies-archive"]').exists()).toBe(false)
+  })
+})
+
+// FR-90 P2j-4 — the policy's rules, edited in place by an administrator: the
+// whole policy written, the rules as edited and the rest as read, at the
+// revision the form was opened on; a policy changed meanwhile is read again
+// and shown as it is now, never written over in silence; any other refusal
+// is the server's words, the draft kept.
+describe("HiveCopiesView — the policy's rules (FR-90 P2j-4)", () => {
+  type W = Awaited<ReturnType<typeof render>>
+  const by = (w: W, id: string) => w.find(`[data-testid="hive-copies-rules-${id}"]`)
+  /** An element's text, or '' where it is not shown. */
+  const textOf = (w: W, id: string) => (by(w, id).exists() ? by(w, id).text() : '')
+  const save = (w: W) => by(w, 'save')
+  const selects = (w: W) => w.findAllComponents({ name: 'VSelect' })
+  const combo = (w: W) => w.findComponent({ name: 'VCombobox' })
+  async function edit(w: W) {
+    await by(w, 'edit').trigger('click')
+    await flushPromises()
+  }
+
+  it('writes the whole policy, the rules as edited and the rest as read, at the revision read', async () => {
+    const w = await render()
+    expect(by(w, 'edit').exists(), 'an administrator may edit it').toBe(true)
+    await edit(w)
+    expect(save(w).attributes('disabled'), 'nothing changed yet').toBeDefined()
+    expect(combo(w).props('items'), "the org's device tags are offered").toEqual(['pci', 'prod'])
+
+    await selects(w)[0].setValue(3)
+    await selects(w)[1].setValue(5)
+    await by(w, 'archive').trigger('click')
+    await by(w, 'prefer').trigger('click')
+    await combo(w).setValue(['prod', 'pci'])
+    await w.find('[data-testid="hive-copies-rules-retention"] input').setValue('30')
+    expect(save(w).attributes('disabled'), 'changed, and valid').toBeUndefined()
+
+    hoisted.putPolicy.mockResolvedValue({
+      ...policy(['d2', 'd9'], 4),
+      replicaset: { min: 3, max: 5, archive: false, prefer: [], restricted_tags: ['prod', 'pci'] },
+      retention_days: 30,
+    })
+    await save(w).trigger('click')
+    await flushPromises()
+    expect(hoisted.putPolicy).toHaveBeenCalledTimes(1)
+    const [tid, body] = hoisted.putPolicy.mock.calls[0]
+    expect(tid).toBe('t1')
+    expect(body.revision, 'at the revision read').toBe(3)
+    expect(body, 'the whole policy, the rules as edited and the rest as read').toEqual({
+      replicaset: { min: 3, max: 5, archive: false, prefer: [], restricted_tags: ['prod', 'pci'] },
+      retention_days: 30,
+      archive_devices: ['d2', 'd9'],
+      revision: 3,
+    })
+    expect(by(w, 'save').exists(), 'the form closes').toBe(false)
+    expect(w.find('[data-testid="hive-copies-policy-copies"]').text(), 'the stored policy shown').toContain(
+      '3 to 5 copies',
+    )
+    expect(w.find('[data-testid="hive-copies-policy-retention"]').text()).toContain('Kept 30 days')
+    expect(textOf(w, 'saved'), 'said it is applied').toContain('placed again under it')
+  })
+
+  it('saves nothing the server would refuse, and nothing unchanged', async () => {
+    const w = await render()
+    await edit(w)
+    await selects(w)[0].setValue(5)
+    expect(textOf(w, 'max'), 'at most below at least').toContain('At most is fewer than at least')
+    expect(save(w).attributes('disabled'), 'at most below at least: no save').toBeDefined()
+    await selects(w)[1].setValue(5)
+    expect(save(w).attributes('disabled'), 'at most up to it').toBeUndefined()
+
+    const retention = w.find('[data-testid="hive-copies-rules-retention"] input')
+    for (const bad of ['', '-1', '1.5', '3651', 'ten']) {
+      await retention.setValue(bad)
+      expect(save(w).attributes('disabled'), `${JSON.stringify(bad)} days`).toBeDefined()
+      expect(textOf(w, 'retention'), `${JSON.stringify(bad)} said`).toContain('A whole number of days, from 0 to 3650')
+    }
+    await retention.setValue('0')
+    expect(save(w).attributes('disabled'), 'for good').toBeUndefined()
+
+    // Back to what was read: nothing to write.
+    await selects(w)[0].setValue(2)
+    await selects(w)[1].setValue(4)
+    await retention.setValue('90')
+    expect(save(w).attributes('disabled'), 'as read').toBeDefined()
+    expect(hoisted.putPolicy).not.toHaveBeenCalled()
+  })
+
+  it('reads a policy changed meanwhile again, shows it as it is now, and says so', async () => {
+    const w = await render()
+    await edit(w)
+    await selects(w)[1].setValue(6)
+    hoisted.putPolicy.mockRejectedValueOnce(new hoisted.ApiError(409, null))
+    hoisted.fetchPolicy.mockResolvedValue({ ...policy(['d2', 'd9'], 7), replicaset: { ...rules, min: 1, max: 2 } })
+    await save(w).trigger('click')
+    await flushPromises()
+    expect(hoisted.fetchPolicy, 'read again').toHaveBeenCalledTimes(2)
+    expect(selects(w).length, 'the form stays open').toBe(2)
+    expect(textOf(w, 'error'), 'said so').toContain('It is shown as it is now: make your change again')
+    expect(selects(w)[0].props('modelValue'), 'what is stored now').toBe(1)
+    expect(selects(w)[1].props('modelValue'), 'the draft is not re-based in silence').toBe(2)
+    expect(save(w).attributes('disabled'), 'nothing changed from what is stored now').toBeDefined()
+
+    await selects(w)[1].setValue(3)
+    hoisted.putPolicy.mockResolvedValue(policy(['d2', 'd9'], 8))
+    await save(w).trigger('click')
+    await flushPromises()
+    expect(hoisted.putPolicy).toHaveBeenLastCalledWith(
+      't1',
+      expect.objectContaining({ revision: 7, replicaset: expect.objectContaining({ min: 1, max: 3 }) }),
+    )
+  })
+
+  it("keeps the draft, and shows the server's words, on any other refusal", async () => {
+    const w = await render()
+    await edit(w)
+    await combo(w).setValue(['x'.repeat(41)])
+    hoisted.putPolicy.mockRejectedValue(new Error('restricted_tags: Tag too long (max 40 chars)'))
+    await save(w).trigger('click')
+    await flushPromises()
+    expect(combo(w).exists(), 'the form stays open').toBe(true)
+    expect(textOf(w, 'error'), "the server's words").toContain('Tag too long')
+    expect(combo(w).props('modelValue'), 'the draft kept').toEqual(['x'.repeat(41)])
+    expect(save(w).attributes('disabled'), 'to fix and save again').toBeUndefined()
+    expect(hoisted.fetchPolicy, 'nothing read again').toHaveBeenCalledTimes(1)
+  })
+
+  it('carries what it does not edit as read: a prefer word, and a rule, from a newer server', async () => {
+    const newer = { ...rules, prefer: ['owner_devices', 'same_site'], spread: 'zones' }
+    hoisted.fetchPolicy.mockResolvedValue({ ...policy(['d2']), replicaset: newer })
+    const i18n = createI18n({ legacy: false, locale: 'en', messages: { en } })
+    const w = mount(HiveCopiesView, {
+      global: { plugins: [vuetify, i18n], stubs: { VDialog: DialogStub, VSwitch: SwitchStub } },
+    })
+    await flushPromises()
+    await edit(w)
+    await by(w, 'archive').trigger('click')
+    hoisted.putPolicy.mockResolvedValue({ ...policy(['d2'], 4), replicaset: { ...newer, archive: false } })
+    await save(w).trigger('click')
+    await flushPromises()
+    const written = hoisted.putPolicy.mock.calls[0][1].replicaset
+    expect(written.prefer, 'every prefer word as read').toEqual(['owner_devices', 'same_site'])
+    expect(written, 'and a rule it does not know').toEqual({ ...newer, archive: false })
+
+    await edit(w)
+    await by(w, 'prefer').trigger('click')
+    await save(w).trigger('click')
+    await flushPromises()
+    expect(hoisted.putPolicy.mock.calls[1][1].replicaset.prefer, 'only its own word goes').toEqual(['same_site'])
+    expect(hoisted.putPolicy.mock.calls[1][1].revision, 'from the revision the save stored').toBe(4)
+  })
+
+  it('locks the designations while the form is open', async () => {
+    const w = await render()
+    expect(sw(w, 'd1').attributes('disabled')).toBeUndefined()
+    await edit(w)
+    expect(sw(w, 'd1').attributes('disabled'), 'one write at a time, from one revision').toBeDefined()
+    await by(w, 'cancel').trigger('click')
+    expect(sw(w, 'd1').attributes('disabled'), 'unlocked once it closes').toBeUndefined()
+    expect(by(w, 'save').exists(), 'cancelled').toBe(false)
+    expect(hoisted.putPolicy).not.toHaveBeenCalled()
+  })
+
+  it('offers no edit to a member who is no administrator, or before membership loads', async () => {
+    hoisted.tenant.myPermissions = 0
+    let w = await render()
+    expect(by(w, 'edit').exists(), 'no administrator').toBe(false)
+    w.unmount()
+    hoisted.tenant.myPermissions = null
+    w = await render()
+    expect(by(w, 'edit').exists(), 'membership not loaded').toBe(false)
   })
 })
