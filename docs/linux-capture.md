@@ -1191,6 +1191,18 @@ mutter's and ends on a mode change as §5.4 describes.
 A stream that the person at the screen ended with KDE's **End** ends here too,
 but it is never reopened: the portal's own `Closed` says so first (P6c, §5.7).
 
+⚠️ **A stream the compositor never drives stays `paused`** (FR-93 P5i). The
+compositor is the PipeWire driver, and a consumer's stream goes from `paused`
+to `streaming` only when the driver triggers a frame. On AC12's real hardware
+(Plasma 6.6), after one spell every new KDE stream stayed `paused`. Each open
+failed at its 15 s deadline with *"no frame arrived before the deadline"*, on
+0.4.138 and master alike, until a new KWin (the user's every session ended)
+streamed the same still desktop in 28 ms. Moving the pointer, KWin's
+`reconfigure` and a notification popup did not drive the stuck stream. The
+helper now logs each state change (*"the PipeWire stream is paused"*), and the
+error names the state the stream reached, so this case reads as the
+compositor's and not as a format that produces nothing.
+
 ## 5. The mutter arm (FR-45 P5) — the unattended sibling
 
 The portal is the obstacle on the host FR-45 was opened for, not the

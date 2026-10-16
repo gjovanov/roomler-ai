@@ -705,12 +705,31 @@ fn guard(data: *mut c_void, f: impl FnOnce(&mut Shared)) {
     }));
 }
 
+/// `pw_stream_state` in words, for the helper's log and its errors.
+fn state_name(s: i32) -> &'static str {
+    match s {
+        -1 => "in error",
+        0 => "unconnected",
+        1 => "connecting",
+        2 => "paused",
+        3 => "streaming",
+        _ => "in an unknown state",
+    }
+}
+
 unsafe extern "C" fn on_state_changed(
     data: *mut c_void,
     _old: c_int,
     state: c_int,
     error: *const c_char,
 ) {
+    // FR-93 P5i — said as it happens: a stream that stays `paused` is one the
+    // compositor never drove, which a missing frame alone cannot tell apart
+    // from a format that produces nothing.
+    eprintln!(
+        "portal-helper: the PipeWire stream is {}",
+        state_name(state)
+    );
     guard(data, |shared| {
         if let Some(cell) = &shared.state {
             cell.store(state, std::sync::atomic::Ordering::Relaxed);
@@ -1208,9 +1227,14 @@ pub fn stream(source: PwSource, node_id: u32, max_fps: u32) -> Result<StreamHand
                     return Err(e);
                 }
                 if std::time::Instant::now() >= deadline {
-                    return Err(PwError::Other(
-                        "no frame arrived before the deadline".into(),
-                    ));
+                    // FR-93 P5i — which state the stream reached says whose
+                    // turn it was. Measured on KDE (real hardware): after one
+                    // spell every new stream stayed `paused` (KWin, the
+                    // driver, never triggered a frame) until KWin restarted.
+                    return Err(PwError::Other(format!(
+                        "no frame arrived before the deadline (the stream was {})",
+                        state_name(state.load(std::sync::atomic::Ordering::Relaxed))
+                    )));
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -1296,5 +1320,22 @@ mod tests {
         for e in all {
             assert!(!e.to_string().is_empty(), "{e:?} has no message");
         }
+    }
+
+    /// FR-93 P5i — every `pw_stream_state` has its word, and a state a newer
+    /// PipeWire adds is said as unknown rather than as one it is not.
+    #[test]
+    fn every_stream_state_has_a_word() {
+        use super::state_name;
+        assert_eq!(
+            state_name(2),
+            "paused",
+            "the state a never-driven stream stays in"
+        );
+        assert_eq!(state_name(3), "streaming");
+        for s in -1..=3 {
+            assert_ne!(state_name(s), "in an unknown state", "{s}");
+        }
+        assert_eq!(state_name(9), "in an unknown state");
     }
 }
