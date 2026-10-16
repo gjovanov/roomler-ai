@@ -311,6 +311,24 @@ export function isRetryableRcErrorCode(code: unknown): boolean {
 }
 
 /**
+ * #2251 - is this `rc:error` fallout of a session the server already ended?
+ * After a scoped `rc:terminate` the phase is `closed` and the view shows that
+ * end's own sentence. Frames that were in flight as it ended (the ICE
+ * candidates a viewer trickles after an offer the device refused) come back as
+ * errors scoped to that same session, `session_not_found`. They are not news:
+ * failing on one replaced "This browser can't decode the video this device
+ * sends" with "session ... not found" and turned a refusal into "The session
+ * could not continue".
+ */
+export function isFalloutOfEndedSession(
+  phase: string,
+  errorSessionId: unknown,
+  sessionId: string | null,
+): boolean {
+  return phase === 'closed' && typeof errorSessionId === 'string' && errorSessionId === sessionId
+}
+
+/**
  * Session-gate for inbound rc:* handlers: a message carrying a
  * session_id is only accepted when it matches the CURRENT session.
  * Messages without one (pre-session errors) always pass. Before this
@@ -7747,6 +7765,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // session (e.g. session_not_found for our own hangup). Ignore.
       if (phase.value === 'reconnecting') return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
+      // #2251 - and once the server has ENDED this session, an error scoped to
+      // it is fallout of frames in flight, never news: the end said why.
+      if (isFalloutOfEndedSession(phase.value, msg.session_id, sessionId.value)) {
+        console.info('[rc] rc:error (', msg.code, ') for a session already ended - ignoring')
+        return
+      }
       // #1045 — while `awaiting_consent` the SERVER owns the timeout and a
       // human is at the host prompt. An un-scoped transient here (an
       // agent_offline bounced by our own hangup for a PRIOR session while the
