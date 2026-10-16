@@ -4775,6 +4775,7 @@
     "rc:hive.memory",
     "rc:hive.adopt_ack",
     "rc:hive.view.grant",
+    "rc:hive.search.grant",
     "rc:hive.view.renew",
     "rc:hive.view.offer",
     "rc:hive.view.ice",

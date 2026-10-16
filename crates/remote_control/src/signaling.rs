@@ -3755,6 +3755,32 @@ pub enum ServerMsg {
         ttl_secs: u32,
     },
 
+    /// FR-90 P2i-1 — a search grant: `user_id` may search the copies this
+    /// device holds of `sessions`, over a data-only WebRTC peer, for
+    /// `ttl_secs`. Only to a connection advertising `hive-search`. The device
+    /// answers [`ClientMsg::HiveViewGrantAck`], as for a view grant, and the
+    /// peer then rides the view's frames, keyed by the grant: the offer, the
+    /// candidates, the renewals and the close. The query, and all it finds,
+    /// travel only over the peer: the server never sees either.
+    ///
+    /// ⚠️ A frame of its own, never a field on [`ServerMsg::HiveViewGrant`]:
+    /// a build before it must never read a search grant as a view of one
+    /// session.
+    #[serde(rename = "rc:hive.search.grant")]
+    HiveSearchGrant {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        #[serde(with = "oid_hex")]
+        user_id: ObjectId,
+        /// The sessions the viewer may search: those it may read that this
+        /// device holds a copy of, as the server knows them, at most
+        /// [`crate::hive::search_limits::MAX_SESSIONS`]. The device searches
+        /// only the ones it does hold.
+        #[serde(default, with = "vec_oid_hex")]
+        sessions: Vec<ObjectId>,
+        ttl_secs: u32,
+    },
+
     /// A grant's renewal: a fresh `ttl_secs` from receipt, after the server
     /// re-checked the viewer's right to read.
     #[serde(rename = "rc:hive.view.renew")]
@@ -5976,6 +6002,40 @@ mod tests {
             ClientMsg::HiveViewGrantAck { refused, .. } => {
                 assert_eq!(refused, Some(HiveViewRefusal::Other))
             }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// FR-90 P2i-1 — a search grant names who searches and which sessions,
+    /// and nothing more: never a query, never a word of what it may find,
+    /// which travel only over the peer. Its TTL is relative, as a view's.
+    #[test]
+    fn a_search_grant_names_who_and_which_sessions_and_carries_no_query() {
+        let (grant, user) = (ObjectId::new(), ObjectId::new());
+        let sessions = vec![ObjectId::new(), ObjectId::new()];
+        let g = serde_json::to_value(ServerMsg::HiveSearchGrant {
+            grant_id: grant,
+            user_id: user,
+            sessions: sessions.clone(),
+            ttl_secs: 600,
+        })
+        .unwrap();
+        assert_eq!(g["t"], "rc:hive.search.grant");
+        let mut keys: Vec<&String> = g.as_object().unwrap().keys().collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["grant_id", "sessions", "t", "ttl_secs", "user_id"]);
+        assert_eq!(
+            g["sessions"],
+            serde_json::json!([sessions[0].to_hex(), sessions[1].to_hex()])
+        );
+        let back: ServerMsg = serde_json::from_value(g).unwrap();
+        match back {
+            ServerMsg::HiveSearchGrant {
+                grant_id,
+                sessions: s,
+                ttl_secs,
+                ..
+            } => assert_eq!((grant_id, s, ttl_secs), (grant, sessions, 600)),
             other => panic!("wrong variant: {other:?}"),
         }
     }

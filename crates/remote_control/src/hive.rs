@@ -108,6 +108,27 @@ pub mod view_limits {
     pub const OPEN_RATE_PER_MINUTE: u32 = 20;
 }
 
+/// FR-90 P2i — full-text search over an archive replica's copies, through a
+/// search grant's viewer peer. The query and what it finds travel only over
+/// the peer; these bound what the peer carries and what a device serves.
+pub mod search_limits {
+    /// The most sessions one grant names: the store's own bound on a search
+    /// filter (`roomler_hive_node::store::MAX_SEARCH_SESSIONS`).
+    pub const MAX_SESSIONS: usize = 500;
+    /// The longest query, in characters. It is taken as plain words.
+    pub const MAX_QUERY_CHARS: usize = 200;
+    /// The most hits one search answers, and how many when it does not say.
+    pub const MAX_HITS: usize = 50;
+    pub const DEFAULT_HITS: usize = 20;
+    /// How soon after one search a grant may ask the next: the store's one
+    /// writer answers every search, and a typing viewer must not crowd out
+    /// the copies it is meant to search.
+    pub const MIN_INTERVAL_MS: u64 = 250;
+    /// Search grants one device serves at once, within its viewers
+    /// ([`super::view_limits::MAX_PER_DEVICE`]).
+    pub const MAX_PER_DEVICE: usize = 8;
+}
+
 /// Why a device refused a view grant, carried in `rc:hive.view.grant_ack`.
 /// Absent = the device holds the session and will answer the viewer's offer.
 ///

@@ -1671,6 +1671,13 @@ fn rpc_caps() -> Vec<String> {
     if crate::hive::archive_enabled() {
         caps.push(RpcCap::HiveArchive);
     }
+    // FR-90 P2i-1 — and answers a search over those copies, as an archive
+    // replica: `hive-search`, only with `hive-archive` and `hive-replica`,
+    // which the device's own gate asks again at each grant.
+    #[cfg(hive_host)]
+    if crate::hive::archive_enabled() && crate::hive::replica_enabled() {
+        caps.push(RpcCap::HiveSearch);
+    }
     // FR-90 P2d-3b — and carries the replica stream: serves a member's grant
     // as a source and follows a dial as a member. While its store is open,
     // whatever its owner says of holding copies: a primary serves its own

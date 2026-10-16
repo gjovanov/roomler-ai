@@ -36,6 +36,7 @@ fn grant(session: ObjectId, user: ObjectId, may_prompt: bool, ttl_secs: u32) -> 
         driving_refused: None,
         copy: false,
         ttl_secs,
+        search: None,
     }
 }
 
@@ -195,6 +196,15 @@ impl Browser {
                 return v;
             }
         }
+    }
+
+    /// The next message, whatever it is: a search grant (P2i-1) pushes
+    /// nothing of its own, so its answers arrive exactly in order.
+    async fn recv(&mut self) -> Value {
+        tokio::time::timeout(WAIT, self.inbox.recv())
+            .await
+            .expect("a message in time")
+            .expect("the channel is open")
     }
 
     /// Every transcript event that arrives until `until` matches one.
@@ -657,4 +667,439 @@ async fn a_driver_answers_an_approval_over_the_peer_and_a_reader_cannot() {
     let _ = reader.pc.close().await;
     let _ = driver.pc.close().await;
     r.sup.stop(sid, 1, "owner".into());
+}
+
+// ─── FR-90 P2i-1 — a search grant ───────────────────────────────────────────
+
+// The gate test views a copy past as many searches as a session has viewers.
+const _: () = assert!(search_limits::MAX_PER_DEVICE >= view_limits::MAX_PER_SESSION);
+
+fn search_grant(sessions: Vec<ObjectId>) -> SearchGrant {
+    SearchGrant {
+        grant_id: ObjectId::new(),
+        user_id: ObjectId::new(),
+        sessions,
+        ttl_secs: 60,
+    }
+}
+
+/// A device with agent sessions themselves off and its owner's
+/// `hive_archive` and `hive_replica` as given: with both, an archive replica.
+fn archive(archive: bool, replica: bool) -> Rig {
+    rig_with(
+        false,
+        4,
+        |c| {
+            c.archive = archive;
+            c.replica = replica;
+        },
+        |s| s,
+    )
+}
+
+fn note(text: &str) -> roomler_hive_node::TranscriptEvent {
+    roomler_hive_node::TranscriptEvent::Note { text: text.into() }
+}
+
+/// A copy of `sid` that the rig's device holds as a member, `notes` in it.
+async fn copy_of(r: &Rig, sid: ObjectId, notes: &[&str]) {
+    r.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+    for text in notes {
+        r.store.append(&sid.to_hex(), 1, note(text));
+    }
+}
+
+/// What the device logs, as text.
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Logs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
+    }
+
+    /// Everything this thread logs while what it returns lives. A
+    /// `#[tokio::test]` runs on a current-thread runtime, so that is every
+    /// task the test spawns.
+    ///
+    /// ⚠️ Two dispatchers, never one. With a single one registered, tracing
+    /// takes a callsite's interest from the default of whichever thread
+    /// reaches it first and caches it for every thread: a parallel test's,
+    /// with no subscriber, makes it `never`, and this capture would never see
+    /// that line (measured: the search tests reach the actor's lines in
+    /// parallel). A second registered dispatcher makes every callsite ask the
+    /// thread's own each time.
+    fn capture(&self) -> (tracing::Dispatch, tracing::dispatcher::DefaultGuard) {
+        let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let logs = self.clone();
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(move || logs.clone())
+                .finish(),
+        );
+        (second, guard)
+    }
+}
+
+/// The device's refusal of `g`, or a panic that it served what it must not.
+async fn refused(
+    r: &Rig,
+    g: SearchGrant,
+    is_primary: bool,
+    what: &str,
+) -> (HiveViewRefusal, String) {
+    match r.sup.search_grant(g, is_primary).await {
+        Err(e) => e,
+        Ok(()) => panic!("served a search it must refuse: {what}"),
+    }
+}
+
+/// P2i-1 — a search grant passes the device's own gates or names the one
+/// that said no: served only by an archive replica (its owner's
+/// `hive_archive` and `hive_replica`, whatever the server asks), only to the
+/// primary organization, and only over the copies it holds of the sessions
+/// the grant names; idempotent on the grant id and bounded per device — and
+/// a search is no session's viewer.
+#[tokio::test]
+async fn a_search_grant_passes_the_devices_gates_or_names_the_one_that_said_no() {
+    let sid = ObjectId::new();
+    // `hive_archive` without `hive_replica` is a config the device never
+    // resolves (`gates`); refused here all the same.
+    for (archive_on, replica_on) in [(false, true), (true, false), (false, false)] {
+        let r = archive(archive_on, replica_on);
+        copy_of(&r, sid, &["held"]).await;
+        let what = format!("hive_archive {archive_on}, hive_replica {replica_on}");
+        let (why, detail) = refused(&r, search_grant(vec![sid]), true, &what).await;
+        assert_eq!(why, HiveViewRefusal::HiveDisabled, "{what}: {detail}");
+        assert!(detail.contains("hive_archive"), "{detail}");
+    }
+
+    let r = archive(true, true);
+    copy_of(&r, sid, &["held"]).await;
+    // In the store, but as a session this device ran: not a member's copy.
+    let own = ObjectId::new();
+    r.store.append(&own.to_hex(), 1, note("its own"));
+    let (why, detail) = refused(
+        &r,
+        search_grant(vec![sid]),
+        false,
+        "a secondary organization",
+    )
+    .await;
+    assert_eq!(why, HiveViewRefusal::HiveDisabled, "{detail}");
+    for (what, named) in [
+        ("none of them held", vec![ObjectId::new()]),
+        ("none named", vec![]),
+        ("one this device ran, not a copy", vec![own]),
+    ] {
+        let (why, detail) = refused(&r, search_grant(named), true, what).await;
+        assert_eq!(why, HiveViewRefusal::NoSession, "{what}: {detail}");
+    }
+    // As many sessions as the store takes as a filter, and not one more.
+    let named = |n: usize| -> Vec<ObjectId> {
+        std::iter::once(sid)
+            .chain((1..n).map(|_| ObjectId::new()))
+            .collect()
+    };
+    let (why, detail) = refused(
+        &r,
+        search_grant(named(search_limits::MAX_SESSIONS + 1)),
+        true,
+        "one session past the store's filter",
+    )
+    .await;
+    assert_eq!(why, HiveViewRefusal::Other, "{detail}");
+    let most = search_grant(named(search_limits::MAX_SESSIONS));
+    let most_id = most.grant_id;
+    r.sup
+        .search_grant(most, true)
+        .await
+        .expect("as many sessions as the store takes");
+    r.sup.viewers().command(most_id, Cmd::Close("test".into()));
+    wait_viewers(&r, 0).await;
+
+    // Idempotent on the grant id; bounded per device.
+    let first = search_grant(vec![sid]);
+    r.sup.search_grant(first.clone(), true).await.unwrap();
+    r.sup.search_grant(first.clone(), true).await.unwrap();
+    assert_eq!(
+        r.sup.viewers().count(),
+        1,
+        "a re-sent grant is not a second search"
+    );
+    let mut held = vec![first.grant_id];
+    for _ in 1..search_limits::MAX_PER_DEVICE {
+        let g = search_grant(vec![sid]);
+        held.push(g.grant_id);
+        r.sup.search_grant(g, true).await.unwrap();
+    }
+    let (why, detail) = refused(
+        &r,
+        search_grant(vec![sid]),
+        true,
+        "one past the device's searches",
+    )
+    .await;
+    assert_eq!(why, HiveViewRefusal::AtCapacity, "{detail}");
+    assert!(detail.contains("searches"), "{detail}");
+    // No session's viewer: the copy they all search is viewed still, past as
+    // many searches as a session has viewers.
+    let view = grant(sid, r.user, false, 60);
+    held.push(view.grant_id);
+    r.sup
+        .view_grant(view, true)
+        .await
+        .expect("a search counts toward no session's viewers");
+    for g in held {
+        r.sup.viewers().command(g, Cmd::Close("test".into()));
+    }
+    wait_viewers(&r, 0).await;
+}
+
+/// P2i-1 — a search over the peer finds what its grant names and this
+/// device holds a copy of, and nothing else: a copy the grant does not name
+/// is never searched, and a session it names that this device holds no copy
+/// of is left out, the hello saying how many are searched. A hit names its
+/// session and its event, the words marked.
+#[tokio::test]
+async fn a_search_finds_only_the_copies_its_grant_names() {
+    let mut r = archive(true, true);
+    let [s1, s2, unnamed, own]: [ObjectId; 4] = std::array::from_fn(|_| ObjectId::new());
+    copy_of(&r, s1, &["the kubelet restarted at noon"]).await;
+    copy_of(&r, s2, &["nothing to see", "the kubelet again"]).await;
+    copy_of(
+        &r,
+        unnamed,
+        &["a kubelet in a copy the grant does not name"],
+    )
+    .await;
+    r.store.append(
+        &own.to_hex(),
+        1,
+        note("a kubelet in a session this device ran"),
+    );
+    let g = search_grant(vec![s1, own, s2, s1]);
+    let gid = g.grant_id;
+    r.sup.search_grant(g, true).await.unwrap();
+    let mut b = dial(&mut r, gid).await;
+
+    b.send(json!({"op": "hello"})).await;
+    assert_eq!(
+        b.recv().await,
+        json!({"op": "hello", "v": 1, "search": true, "sessions": 2}),
+        "the hello counts the copies searched"
+    );
+    b.send(json!({"op": "search", "id": "q1", "q": "kubelet"}))
+        .await;
+    let found = b.recv().await;
+    assert_eq!(
+        (
+            found["op"].as_str(),
+            found["id"].as_str(),
+            found["ok"].as_bool()
+        ),
+        (Some("search"), Some("q1"), Some(true)),
+        "{found}"
+    );
+    let mut hits: Vec<(String, u64)> = found["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            assert!(h["snippet"].as_str().unwrap().contains("[kubelet]"), "{h}");
+            (
+                h["session"].as_str().unwrap().to_string(),
+                h["seq"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    hits.sort();
+    let mut want = vec![(s1.to_hex(), 1), (s2.to_hex(), 2)];
+    want.sort();
+    assert_eq!(hits, want, "found only the copies the grant names: {found}");
+
+    r.sup.viewers().command(gid, Cmd::Close("test".into()));
+    wait_viewers(&r, 0).await;
+    let _ = b.pc.close().await;
+}
+
+/// P2i-1 — a search grant does nothing a view does: no page, no feed, no
+/// prompt, no answer — each refused, nothing else said, and a search still
+/// answered.
+#[tokio::test]
+async fn a_search_grant_does_nothing_a_view_does() {
+    let mut r = archive(true, true);
+    let sid = ObjectId::new();
+    copy_of(&r, sid, &["the kubelet restarted"]).await;
+    let g = search_grant(vec![sid]);
+    let gid = g.grant_id;
+    r.sup.search_grant(g, true).await.unwrap();
+    let mut b = dial(&mut r, gid).await;
+
+    for (op, req) in [
+        ("page", json!({"op": "page", "after": 0})),
+        ("follow", json!({"op": "follow", "after": 0})),
+        (
+            "prompt",
+            json!({"op": "prompt", "id": "p", "text": "rm -rf"}),
+        ),
+        (
+            "answer",
+            json!({"op": "answer", "id": "a", "approval": "x", "decision": "allow"}),
+        ),
+    ] {
+        b.send(req).await;
+        let refused = b.recv().await;
+        assert_eq!(
+            refused["op"], "error",
+            "a search grant does no {op}: {refused}"
+        );
+        assert!(refused["error"].as_str().unwrap().contains(op), "{refused}");
+    }
+    b.send(json!({"op": "search", "id": "q", "q": "kubelet"}))
+        .await;
+    let found = b.recv().await;
+    assert_eq!(
+        (found["op"].as_str(), found["ok"].as_bool()),
+        (Some("search"), Some(true)),
+        "nothing came between: {found}"
+    );
+
+    r.sup.viewers().command(gid, Cmd::Close("test".into()));
+    wait_viewers(&r, 0).await;
+    let _ = b.pc.close().await;
+}
+
+/// P2i-1 — what a search may ask is bounded on the device: one sooner than
+/// [`search_limits::MIN_INTERVAL_MS`] after the last is refused; an empty
+/// one, or one longer than [`search_limits::MAX_QUERY_CHARS`] characters —
+/// characters, not bytes — is refused without counting as a search; it
+/// answers at most [`search_limits::MAX_HITS`] hits, and
+/// [`search_limits::DEFAULT_HITS`] when it does not say. And neither the
+/// query nor what it finds reaches the device's log, which may reach the
+/// server.
+#[tokio::test]
+async fn a_search_is_bounded_and_never_logged() {
+    let logs = Logs::default();
+    let _capture = logs.capture();
+    let mut r = archive(true, true);
+    let sid = ObjectId::new();
+    let notes: Vec<String> = (0..60).map(|i| format!("quokkafleet event {i}")).collect();
+    let notes: Vec<&str> = notes.iter().map(String::as_str).collect();
+    copy_of(&r, sid, &notes).await;
+    let g = search_grant(vec![sid]);
+    let gid = g.grant_id;
+    r.sup.search_grant(g, true).await.unwrap();
+    let mut b = dial(&mut r, gid).await;
+    let hits = |v: &Value| v["hits"].as_array().map(Vec::len);
+    let pause = || tokio::time::sleep(Duration::from_millis(search_limits::MIN_INTERVAL_MS + 50));
+
+    // Two at once: the second is too soon.
+    b.send(json!({"op": "search", "id": "a", "q": "quokkafleet", "limit": 10_000}))
+        .await;
+    b.send(json!({"op": "search", "id": "b", "q": "quokkafleet"}))
+        .await;
+    let a = b.recv().await;
+    assert_eq!(
+        (a["id"].as_str(), a["ok"].as_bool(), hits(&a)),
+        (Some("a"), Some(true), Some(search_limits::MAX_HITS)),
+        "a search answers at most MAX_HITS hits: {a}"
+    );
+    let soon = b.recv().await;
+    assert!(
+        soon["id"] == "b"
+            && soon["ok"] == false
+            && soon["error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("too_soon")),
+        "the second search, sent at once, is too soon: {soon}"
+    );
+
+    pause().await;
+    b.send(json!({"op": "search", "id": "c", "q": "quokkafleet"}))
+        .await;
+    assert_eq!(
+        hits(&b.recv().await),
+        Some(search_limits::DEFAULT_HITS),
+        "a search that does not say answers DEFAULT_HITS"
+    );
+    pause().await;
+    b.send(json!({"op": "search", "id": "d", "q": "quokkafleet", "limit": 0}))
+        .await;
+    assert_eq!(hits(&b.recv().await), Some(1), "a limit of 0 answers one");
+
+    // Refused before the rate is asked, so neither counts as a search: an
+    // empty one, and one a character too long. Then the longest, in
+    // characters — twice as many bytes — is the first search since the pause.
+    pause().await;
+    let longest = "é".repeat(search_limits::MAX_QUERY_CHARS);
+    b.send(json!({"op": "search", "id": "e", "q": "   "})).await;
+    b.send(json!({"op": "search", "id": "f",
+        "q": "q".repeat(search_limits::MAX_QUERY_CHARS + 1)}))
+        .await;
+    b.send(json!({"op": "search", "id": "g", "q": longest}))
+        .await;
+    let e = b.recv().await;
+    assert_eq!(
+        (e["id"].as_str(), e["ok"].as_bool(), e["error"].as_str()),
+        (Some("e"), Some(false), Some("an empty search")),
+        "an empty search is refused: {e}"
+    );
+    let f = b.recv().await;
+    assert!(
+        f["id"] == "f"
+            && f["ok"] == false
+            && f["error"].as_str().is_some_and(|e| e.contains("at most")),
+        "one a character too long is refused: {f}"
+    );
+    let g = b.recv().await;
+    assert!(
+        !g["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("too_soon")),
+        "a refused search counted as one: {g}"
+    );
+    assert_eq!(
+        (g["id"].as_str(), g["ok"].as_bool(), hits(&g)),
+        (Some("g"), Some(true), Some(0)),
+        "the longest query, in characters, is asked: {g}"
+    );
+
+    r.sup.viewers().command(gid, Cmd::Close("test".into()));
+    // The capture sees the actor's own task, or its silence proves nothing.
+    let deadline = Instant::now() + WAIT;
+    while !logs.text().contains("hive: view closed by the server") {
+        assert!(
+            Instant::now() < deadline,
+            "the actor's end never reached the capture:\n{}",
+            logs.text()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = b.pc.close().await;
+    let logged = logs.text();
+    assert!(
+        logged.contains("hive: search granted"),
+        "the grant never reached the capture:\n{logged}"
+    );
+    assert!(
+        !logged.contains("quokkafleet"),
+        "a query or a hit reached the log:\n{logged}"
+    );
 }

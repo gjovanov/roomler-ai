@@ -49,7 +49,7 @@ use std::time::Duration;
 
 use bson::oid::ObjectId;
 use bytes::Bytes;
-use roomler_ai_remote_control::hive::{HiveRunState, HiveViewRefusal, view_limits};
+use roomler_ai_remote_control::hive::{HiveRunState, HiveViewRefusal, search_limits, view_limits};
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer};
 use roomler_hive_node::EventEnvelope;
 use serde_json::{Value, json};
@@ -80,6 +80,9 @@ const OFFER_DEADLINE: Duration = if cfg!(test) {
 };
 /// A grant's TTL is clamped to this, whatever the server sends.
 const MAX_TTL_SECS: u32 = 60 * 60;
+// P2i-1 — a search grant names at most what the store takes as a filter: a
+// grant the device accepted must never be a search the store refuses.
+const _: () = assert!(search_limits::MAX_SESSIONS == roomler_hive_node::store::MAX_SEARCH_SESSIONS);
 /// Bytes queued on the channel before the device waits for the viewer.
 const BACKPRESSURE_HIGH: usize = 4 * 1024 * 1024;
 /// A viewer that reads nothing for this long is gone.
@@ -120,6 +123,21 @@ pub struct ViewGrant {
     /// the viewer is told in `hello`.
     pub copy: bool,
     pub ttl_secs: u32,
+    /// FR-90 P2i-1 — a search grant: the sessions it searches, as this device
+    /// holds them (the server's list, less any it holds no copy of), in hex.
+    /// `None` = a view of `session_id`. Set by the device's gate, never by
+    /// the server; a search grant's `session_id` names no session (the zero
+    /// id, which no session state or approval ever names).
+    pub search: Option<Arc<[String]>>,
+}
+
+/// FR-90 P2i-1 — `rc:hive.search.grant`, as the device takes it.
+#[derive(Debug, Clone)]
+pub struct SearchGrant {
+    pub grant_id: ObjectId,
+    pub user_id: ObjectId,
+    pub sessions: Vec<ObjectId>,
+    pub ttl_secs: u32,
 }
 
 /// What the server tells a grant's actor.
@@ -146,6 +164,9 @@ enum PeerEvent {
 struct Viewer {
     session: ObjectId,
     cmd: mpsc::Sender<Cmd>,
+    /// FR-90 P2i-1 — a search grant's: it counts toward the device's search
+    /// grants, and toward no session's viewers.
+    search: bool,
 }
 
 /// The device's viewer peers, by grant.
@@ -190,6 +211,32 @@ pub fn handle_view_grant(grant: ViewGrant, is_primary: bool, tx: mpsc::Sender<Cl
         let grant_id = grant.grant_id;
         let (refused, detail) = match global() {
             Some(sup) => match sup.view_grant(grant, is_primary).await {
+                Ok(()) => (None, None),
+                Err((r, d)) => (Some(r), Some(d)),
+            },
+            None => (
+                Some(HiveViewRefusal::HiveDisabled),
+                Some("agent sessions are not set up on this daemon".to_string()),
+            ),
+        };
+        let _ = tx
+            .send(ClientMsg::HiveViewGrantAck {
+                grant_id,
+                refused,
+                detail,
+            })
+            .await;
+    });
+}
+
+/// FR-90 P2i-1 — `rc:hive.search.grant`: answered on `tx` with
+/// `rc:hive.view.grant_ack`, as a view grant is, from a task of its own (it
+/// reads the store). The rest rides the view's frames, keyed by the grant.
+pub fn handle_search_grant(grant: SearchGrant, is_primary: bool, tx: mpsc::Sender<ClientMsg>) {
+    tokio::spawn(async move {
+        let grant_id = grant.grant_id;
+        let (refused, detail) = match global() {
+            Some(sup) => match sup.search_grant(grant, is_primary).await {
                 Ok(()) => (None, None),
                 Err((r, d)) => (Some(r), Some(d)),
             },
@@ -342,6 +389,7 @@ impl Supervisor {
                 Viewer {
                     session: grant.session_id,
                     cmd: tx,
+                    search: false,
                 },
             );
             rx
@@ -369,6 +417,117 @@ impl Supervisor {
             grant = %grant.grant_id, session = %grant.session_id, user = %grant.user_id,
             may_prompt = grant.may_prompt, copy = grant.copy, "hive: view granted"
         );
+        tokio::spawn(run(Arc::clone(self), grant, store, rx));
+        Ok(())
+    }
+
+    /// FR-90 P2i-1 — the device's gates for a search grant; on success its
+    /// actor is running and waits for the searcher's offer. Only on the
+    /// primary enrollment, only while this device is an archive replica (its
+    /// owner's `hive_archive` and `hive_replica`: a gate that survives a
+    /// compromised server), and over the copies it holds of the sessions the
+    /// grant names, never one it does not: those the server named that it
+    /// holds no copy of are left out, and a grant left with none is refused.
+    pub(crate) async fn search_grant(
+        self: &Arc<Self>,
+        g: SearchGrant,
+        is_primary: bool,
+    ) -> Result<(), (HiveViewRefusal, String)> {
+        if !is_primary {
+            return Err((
+                HiveViewRefusal::HiveDisabled,
+                "agent sessions are served only to this device's primary organization".into(),
+            ));
+        }
+        if !(self.offers_archive() && self.holds_copies()) {
+            return Err((
+                HiveViewRefusal::HiveDisabled,
+                "this device serves a search only as an archive replica (hive_archive)".into(),
+            ));
+        }
+        if g.sessions.len() > search_limits::MAX_SESSIONS {
+            return Err((
+                HiveViewRefusal::Other,
+                format!(
+                    "a search grant names at most {} sessions",
+                    search_limits::MAX_SESSIONS
+                ),
+            ));
+        }
+        let store = self
+            .store_handle()
+            .map_err(|e| (HiveViewRefusal::NoSession, e))?;
+        let held: std::collections::HashSet<String> = store
+            .memberships()
+            .await
+            .map_err(|e| (HiveViewRefusal::NoSession, e.to_string()))?
+            .into_iter()
+            .map(|m| m.session)
+            .collect();
+        let mut sessions: Vec<String> = Vec::new();
+        for s in &g.sessions {
+            let hex = s.to_hex();
+            if held.contains(&hex) && !sessions.contains(&hex) {
+                sessions.push(hex);
+            }
+        }
+        if sessions.is_empty() {
+            return Err((
+                HiveViewRefusal::NoSession,
+                "this device holds a copy of none of those sessions".into(),
+            ));
+        }
+        let rx = {
+            let mut map = self.viewers().lock();
+            // Idempotent on the grant id, as a view grant is.
+            if map.contains_key(&g.grant_id) {
+                return Ok(());
+            }
+            if map.len() >= view_limits::MAX_PER_DEVICE {
+                return Err((
+                    HiveViewRefusal::AtCapacity,
+                    format!(
+                        "this device already serves {} viewers",
+                        view_limits::MAX_PER_DEVICE
+                    ),
+                ));
+            }
+            if map.values().filter(|v| v.search).count() >= search_limits::MAX_PER_DEVICE {
+                return Err((
+                    HiveViewRefusal::AtCapacity,
+                    format!(
+                        "this device already serves {} searches",
+                        search_limits::MAX_PER_DEVICE
+                    ),
+                ));
+            }
+            let (tx, rx) = mpsc::channel(64);
+            map.insert(
+                g.grant_id,
+                Viewer {
+                    session: ObjectId::from_bytes([0; 12]),
+                    cmd: tx,
+                    search: true,
+                },
+            );
+            rx
+        };
+        info!(
+            grant = %g.grant_id, user = %g.user_id, sessions = sessions.len(),
+            named = g.sessions.len(), "hive: search granted"
+        );
+        let grant = ViewGrant {
+            grant_id: g.grant_id,
+            session_id: ObjectId::from_bytes([0; 12]),
+            user_id: g.user_id,
+            user_name: String::new(),
+            may_prompt: false,
+            user_email: None,
+            driving_refused: None,
+            copy: true,
+            ttl_secs: g.ttl_secs,
+            search: Some(sessions.into()),
+        };
         tokio::spawn(run(Arc::clone(self), grant, store, rx));
         Ok(())
     }
@@ -498,10 +657,12 @@ async fn run(
                 let pending = match open {
                     Ok((session, ids)) if session == grant.session_id => Some(ids),
                     Ok(_) => None,
-                    // Behind: say what is open NOW rather than nothing.
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        Some(sup.pending_approvals(grant.session_id))
-                    }
+                    // Behind: say what is open NOW rather than nothing. A
+                    // search grant (P2i-1) views no session: nothing to say.
+                    Err(broadcast::error::RecvError::Lagged(_)) => grant
+                        .search
+                        .is_none()
+                        .then(|| sup.pending_approvals(grant.session_id)),
                     Err(broadcast::error::RecvError::Closed) => None,
                 };
                 if let Some(ids) = pending
@@ -679,6 +840,8 @@ struct Channel {
     dc: Arc<RTCDataChannel>,
     next_id: u32,
     reasm: Reassembler,
+    /// FR-90 P2i-1 — when this grant's last search ran.
+    last_search: Option<Instant>,
 }
 
 impl Channel {
@@ -709,6 +872,7 @@ impl Channel {
             dc,
             next_id: 0,
             reasm: Reassembler::new(INBOUND),
+            last_search: None,
         }
     }
 
@@ -770,6 +934,11 @@ async fn on_request(
     let Ok(req) = serde_json::from_slice::<Value>(message) else {
         return ch.send(&json!({"op": "error", "error": "not JSON"})).await;
     };
+    // P2i-1 — a search grant answers a search over its own sessions, and
+    // nothing a view does.
+    if let Some(sessions) = &grant.search {
+        return on_search_request(store, ch, sessions, &req).await;
+    }
     match req.get("op").and_then(Value::as_str).unwrap_or("") {
         "hello" => {
             let tip = store.tip(sid).await.unwrap_or(0);
@@ -917,6 +1086,101 @@ async fn on_request(
             let other = other.chars().take(32).collect::<String>();
             ch.send(&json!({"op": "error", "error": format!("unknown op {other:?}")}))
                 .await
+        }
+    }
+}
+
+/// FR-90 P2i-1 — what a search grant answers: its `hello`, and a `search`
+/// over the sessions it names as this device holds them, never any other.
+/// The query is taken as plain words ([`roomler_hive_node::store::Store::search`]);
+/// neither it nor anything it finds is logged, since a device's log may
+/// reach the server.
+async fn on_search_request(
+    store: &super::store::StoreHandle,
+    ch: &mut Channel,
+    sessions: &Arc<[String]>,
+    req: &Value,
+) -> Result<(), String> {
+    let id: String = req
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .chars()
+        .take(MAX_REQUEST_ID)
+        .collect();
+    match req.get("op").and_then(Value::as_str).unwrap_or("") {
+        "hello" => {
+            ch.send(&json!({
+                "op": "hello",
+                "v": 1,
+                "search": true,
+                "sessions": sessions.len(),
+            }))
+            .await
+        }
+        "search" => {
+            let q = req.get("q").and_then(Value::as_str).unwrap_or("").trim();
+            let limit =
+                req.get("limit")
+                    .and_then(Value::as_u64)
+                    .map_or(search_limits::DEFAULT_HITS, |l| {
+                        usize::try_from(l)
+                            .unwrap_or(usize::MAX)
+                            .clamp(1, search_limits::MAX_HITS)
+                    });
+            let too_soon = ch.last_search.is_some_and(|at| {
+                at.elapsed() < Duration::from_millis(search_limits::MIN_INTERVAL_MS)
+            });
+            let refused = if q.is_empty() {
+                Some("an empty search".to_string())
+            } else if q.chars().count() > search_limits::MAX_QUERY_CHARS {
+                Some(format!(
+                    "a search is at most {} characters",
+                    search_limits::MAX_QUERY_CHARS
+                ))
+            } else if too_soon {
+                Some(format!(
+                    "too_soon: one search every {} ms",
+                    search_limits::MIN_INTERVAL_MS
+                ))
+            } else {
+                None
+            };
+            if let Some(error) = refused {
+                return ch
+                    .send(&json!({"op": "search", "id": id, "ok": false, "error": error}))
+                    .await;
+            }
+            ch.last_search = Some(Instant::now());
+            match store.search(q, sessions.to_vec(), limit).await {
+                Ok(hits) => {
+                    let hits: Vec<Value> = hits
+                        .into_iter()
+                        .map(|h| json!({"session": h.session, "seq": h.seq, "snippet": h.snippet}))
+                        .collect();
+                    ch.send(&json!({"op": "search", "id": id, "ok": true, "hits": hits}))
+                        .await
+                }
+                Err(_) => {
+                    // Not the error's words: they may quote the query.
+                    warn!("hive: a search over this device's copies failed");
+                    ch.send(&json!({
+                        "op": "search",
+                        "id": id,
+                        "ok": false,
+                        "error": "this device could not search its copies",
+                    }))
+                    .await
+                }
+            }
+        }
+        other => {
+            let other = other.chars().take(32).collect::<String>();
+            ch.send(&json!({
+                "op": "error",
+                "error": format!("a search grant answers a search, not {other:?}"),
+            }))
+            .await
         }
     }
 }

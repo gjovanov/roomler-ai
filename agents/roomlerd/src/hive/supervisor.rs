@@ -3536,6 +3536,12 @@ impl Supervisor {
         self.cfg.replica
     }
 
+    /// P2i-1 — the device's own `hive_archive`: it offers itself as the
+    /// organization's archive replica, whose copies a search is served from.
+    pub(crate) fn offers_archive(&self) -> bool {
+        self.cfg.archive
+    }
+
     pub(crate) fn store_handle(&self) -> Result<StoreHandle, String> {
         self.store.clone()
     }
