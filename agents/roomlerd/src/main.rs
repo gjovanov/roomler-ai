@@ -3147,6 +3147,24 @@ async fn run_cmd(
     // never reaches `default.target` twice. Per-user only, on its own thread.
     roomlerd::service::repair_session_wants_at_start();
     let mut cfg = config::load(config_path).context("loading config")?;
+    // FR-90 P2k-4 (F4) — an archive replica enrolled before its posture
+    // joined the mesh joins it at its first start in a newer image, before
+    // anything reads the overlay keys (the WG key is minted below from them).
+    if roomlerd::archive_replica::reconcile_at_start(
+        &mut cfg,
+        std::env::var(roomlerd::archive_replica::IMAGE_ENV).is_ok_and(|v| v == "1"),
+    ) {
+        match config::save(config_path, &cfg) {
+            Ok(()) => tracing::info!(
+                "archive replica: joined the mesh, in the userspace stack (FR-90 P2k-4)"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "archive replica: on the mesh for this run; persisting it failed, so the \
+                 next start in the image joins it again"
+            ),
+        }
+    }
 
     // FR-84 D3 — who will relaunch this process if it exits, decided once,
     // from evidence the supervisor left (argv, environment, cgroup) — never
