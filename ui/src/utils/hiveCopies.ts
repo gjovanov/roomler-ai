@@ -49,6 +49,58 @@ export function freshestTarget(s: HiveSession): HiveReplicaMember | undefined {
   return best
 }
 
+/** A device of the organization, as the agents store lists it. */
+export interface DeviceLike {
+  id: string
+  name: string
+  display_name?: string
+  presence?: 'online' | 'stale' | 'offline'
+  is_online?: boolean
+  capabilities?: { rpc?: string[] }
+}
+
+/** A word in what a device advertises, matched by equality: `hive` is a
+ *  prefix of every hive word, and `hive-purge` of `hive-purge-all`. */
+export function advertises(d: DeviceLike, word: string): boolean {
+  return d.capabilities?.rpc?.includes(word) ?? false
+}
+
+function online(d: DeviceLike): boolean {
+  return d.presence ? d.presence === 'online' : !!d.is_online
+}
+
+/** Whether a device holds a copy the server counts: a joined row that is not
+ *  the primary's (a teleport to one is refused `already_a_member`). */
+function holdsCopy(s: HiveSession, deviceId: string): boolean {
+  return (s.replicaset?.members ?? []).some(
+    (m) => m.device_id === deviceId && m.role !== 'primary' && m.state === 'joined',
+  )
+}
+
+/** P2j-2 — the devices a teleport may go to: online, advertising
+ *  `hive-teleport`, holding no copy (one that does is moved to by Move), not
+ *  the device it runs on, and no archive replica, which runs no session. */
+export function teleportTargets(s: HiveSession, devices: DeviceLike[]): DeviceLike[] {
+  return devices.filter(
+    (d) =>
+      online(d) &&
+      advertises(d, 'hive-teleport') &&
+      !advertises(d, 'hive-archive') &&
+      d.id !== s.device_id &&
+      !holdsCopy(s, d.id),
+  )
+}
+
+/** P2j-2 — the devices a fork may go to, each saying whether it holds a copy
+ *  to fork from or takes one first (P2f-3c): online, advertising `hive-fork`,
+ *  and no archive replica. The device the session runs on holds its own. */
+export function forkTargets(s: HiveSession, devices: DeviceLike[]): Array<{ device: DeviceLike; holds: boolean }> {
+  return devices
+    .filter((d) => online(d) && advertises(d, 'hive-fork') && !advertises(d, 'hive-archive'))
+    .map((d) => ({ device: d, holds: d.id === s.device_id || holdsCopy(s, d.id) }))
+    .sort((a, b) => Number(b.holds) - Number(a.holds))
+}
+
 /** A copy that is no target and holds more than every target (an archive
  *  replica a laptop has not caught up with): while it does, the server
  *  refuses every move as `not_freshest`. */

@@ -20,8 +20,18 @@ const hoisted = vi.hoisted(() => ({
   sessions: [] as HiveSession[],
   fetchSession: vi.fn(),
   promote: vi.fn(),
+  teleport: vi.fn(),
+  fork: vi.fn(),
   fetchAgent: vi.fn(),
-  agents: null as null | Array<{ id: string; name: string; display_name?: string }>,
+  fetchAgents: vi.fn(),
+  agents: null as null | Array<{
+    id: string
+    name: string
+    display_name?: string
+    presence?: 'online' | 'stale' | 'offline'
+    is_online?: boolean
+    capabilities?: { rpc?: string[] }
+  }>,
   user: { id: 'u-owner' } as { id: string } | null,
 }))
 vi.mock('@/stores/hive', async (importOriginal) => {
@@ -34,13 +44,17 @@ vi.mock('@/stores/hive', async (importOriginal) => {
       },
       fetchSession: hoisted.fetchSession,
       promote: hoisted.promote,
+      teleport: hoisted.teleport,
+      fork: hoisted.fork,
     }),
   }
 })
 vi.mock('@/stores/agents', async () => {
   const { reactive } = await import('vue')
   hoisted.agents = reactive([])
-  return { useAgentStore: () => ({ agents: hoisted.agents, fetchAgent: hoisted.fetchAgent }) }
+  return {
+    useAgentStore: () => ({ agents: hoisted.agents, fetchAgent: hoisted.fetchAgent, fetchAgents: hoisted.fetchAgents }),
+  }
 })
 vi.mock('@/stores/auth', () => ({
   useAuthStore: () => ({
@@ -122,6 +136,11 @@ const copy = (w: Awaited<ReturnType<typeof render>>, id: string) => w.find(`[dat
 /** Why it cannot move, or '' when the panel offers a move. */
 const notMovable = (w: Awaited<ReturnType<typeof render>>) => {
   const p = w.find('[data-testid="hive-copies-not-movable"]')
+  return p.exists() ? p.text() : ''
+}
+/** Why it cannot be forked, or '' when the panel offers a fork. */
+const notForkable = (w: Awaited<ReturnType<typeof render>>) => {
+  const p = w.find('[data-testid="hive-copies-not-forkable"]')
   return p.exists() ? p.text() : ''
 }
 
@@ -247,5 +266,121 @@ describe('HiveCopies (FR-90 P2j-1)', () => {
     expect(w.find('[data-testid="hive-copies-ahead"]').text(), 'the server would refuse every move').toContain(
       'archive-1 holds more of this session than any device it can move to',
     )
+  })
+})
+
+// FR-90 P2j-2 — the owner's teleport and fork, from the same panel: the
+// organization's devices are read once either is opened.
+describe('HiveCopies — move elsewhere and fork (FR-90 P2j-2)', () => {
+  const online = (id: string, name: string, rpc: string[], display_name?: string) => ({
+    id,
+    name,
+    ...(display_name ? { display_name } : {}),
+    presence: 'online' as const,
+    is_online: true,
+    capabilities: { rpc },
+  })
+  /** The organization's devices, as `fetchAgents` reads them. */
+  function fleet(): void {
+    hoisted.fetchAgents.mockImplementation(async () => {
+      hoisted.agents!.splice(
+        0,
+        hoisted.agents!.length,
+        online('p', 'laptop', ['hive', 'hive-teleport', 'hive-fork']),
+        online('a', 'desktop', ['hive', 'hive-teleport', 'hive-fork']),
+        online('d', 'workstation', ['hive', 'hive-teleport', 'hive-fork'], 'Big box'),
+        online('arch', 'archive-1', ['hive', 'hive-teleport', 'hive-fork', 'hive-archive']),
+        online('n', 'new-mac', ['hive', 'hive-teleport', 'hive-fork']),
+      )
+    })
+  }
+
+  async function open(w: Awaited<ReturnType<typeof render>>, action: 'teleport' | 'fork'): Promise<void> {
+    await w.find(`[data-testid="hive-copies-action-${action}"]`).trigger('click')
+    await flushPromises()
+  }
+
+  it('moves it to a device that holds no copy, from the devices the organization has', async () => {
+    fleet()
+    const w = await render(record())
+    await open(w, 'teleport')
+    expect(hoisted.fetchAgents, "the organization's devices, read once").toHaveBeenCalledTimes(1)
+    expect(
+      w.findAll('[data-testid^="hive-copies-teleport-to-"]').map((x) => x.attributes('data-testid')),
+      'a device with no copy taken, not where it runs, no archive replica',
+    ).toEqual(['hive-copies-teleport-to-n'])
+    expect(
+      (w.find('[data-testid="hive-copies-teleport-to-n"] input').element as HTMLInputElement).checked,
+      'the one offered, picked',
+    ).toBe(true)
+    hoisted.teleport.mockResolvedValueOnce({ outcome: 'teleporting', session: record() })
+    await w.find('[data-testid="hive-copies-teleport-submit"]').trigger('click')
+    await flushPromises()
+    expect(hoisted.teleport, 'to the device picked, the folder only when changed').toHaveBeenLastCalledWith('t1', 's1', {
+      device_id: 'n',
+    })
+    expect(w.find('[data-testid="hive-copies-outcome"]').text()).toContain('the device is taking its copy')
+
+    hoisted.teleport.mockResolvedValueOnce({
+      outcome: 'refused',
+      reason: 'primary_offline',
+      message: 'the device it runs on is offline: a teleport copies from it',
+      session: record(),
+    })
+    await w.find('[data-testid="hive-copies-teleport-submit"]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-testid="hive-copies-outcome"]').text(), "a refusal in the server's words").toContain(
+      'a teleport copies from it',
+    )
+    await open(w, 'fork')
+    expect(hoisted.fetchAgents, 'not read again').toHaveBeenCalledTimes(1)
+  })
+
+  it('forks it on a device that holds a copy or takes one, in a folder of its own', async () => {
+    fleet()
+    const w = await render(record())
+    await open(w, 'fork')
+    const labels = w.findAll('[data-testid^="hive-copies-fork-on-"]')
+    expect(labels.map((x) => x.text()), 'its copies first, then a device that takes one, no archive replica').toEqual([
+      'laptop · from its copy',
+      'desktop · from its copy',
+      'Big box · from its copy',
+      'new-mac · takes a copy first',
+    ])
+    const submit = () => w.find('[data-testid="hive-copies-fork-submit"]')
+    expect(submit().attributes('disabled'), 'a folder of its own first').toBeDefined()
+    await w.find('[data-testid="hive-copies-fork-on-n"] input').setValue(true)
+    await w.find('[data-testid="hive-copies-fork-folder"] input').setValue('/work/try')
+    hoisted.fork.mockResolvedValueOnce({ outcome: 'joining', session: { ...record(), id: 'f1', room_id: 'r-fork' } })
+    await submit().trigger('click')
+    await flushPromises()
+    expect(hoisted.fork, 'no name sent unless typed').toHaveBeenLastCalledWith('t1', 's1', {
+      device_id: 'n',
+      folder: '/work/try',
+    })
+    expect(w.find('[data-testid="hive-copies-outcome"]').text()).toContain('the device is taking a copy first')
+    expect(w.find('[data-testid="hive-copies-fork-room"]').exists(), "the fork's own room").toBe(true)
+
+    await w.find('[data-testid="hive-copies-fork-title"] input').setValue('Try another way')
+    hoisted.fork.mockResolvedValueOnce({ outcome: 'refused', reason: 'same_folder', message: 'the session it forks runs in this folder' })
+    await submit().trigger('click')
+    await flushPromises()
+    expect(hoisted.fork).toHaveBeenLastCalledWith('t1', 's1', { device_id: 'n', folder: '/work/try', title: 'Try another way' })
+    expect(w.find('[data-testid="hive-copies-outcome"]').text(), "the device's refusal in its words").toContain(
+      'the session it forks runs in this folder',
+    )
+    expect(w.find('[data-testid="hive-copies-fork-room"]').exists(), 'no room for a fork refused').toBe(false)
+  })
+
+  it('says why it cannot fork: adopted from a terminal, being moved', async () => {
+    fleet()
+    let w = await render(record({ origin: 'adopted' }))
+    await open(w, 'fork')
+    expect(notForkable(w), 'an adopted session is not forked').toContain('is not forked')
+    w.unmount()
+    const promotion = { id: 'm1', to: 'd', to_name: 'Big box', folder: '/work/app', from: 'p', from_fence: 2, by: 'u-owner', state: 'draining', started_at: '', deadline: '', teleport: false, fork: false }
+    w = await render(record({ promotion }))
+    await open(w, 'fork')
+    expect(notForkable(w), 'not while it moves').toContain('once it settles')
   })
 })
