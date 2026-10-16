@@ -84,14 +84,22 @@ from when a frame was asked of the worker, so it absorbs the grab instead of add
 
 **P3 — the GPU reads the scanout** (`agents/roomlerd/src/capture/drm_gpu.rs`). As built:
 
-- **The context.** `Converter::open` (`drm_gpu.rs:312`) loads `libEGL.so.1` and `libGLESv2.so.2` with
-  `libloading`, as `gpu_clock.rs` loads NVML, so no package gains a dependency. It opens Mesa's
-  **surfaceless** platform (a render node, no display server, no GBM), requires
-  `EGL_EXT_image_dma_buf_import`, surfaceless contexts and config-less contexts, and makes a GLES 2 context
-  current on the `drm-capture` worker thread for that thread's life.
+- **The display is the process's.** The first capture that reaches for the GPU brings up `Egl`
+  (`drm_gpu.rs:316`). It loads `libEGL.so.1` and `libGLESv2.so.2` with `libloading`, as `gpu_clock.rs` loads
+  NVML, so no package gains a dependency. It opens Mesa's **surfaceless** platform (a render node, no display
+  server, no GBM) and requires `EGL_EXT_image_dma_buf_import`, surfaceless contexts and config-less contexts.
+  It is **never terminated and never unloaded**. EGL gives every caller in a process the same display, so a
+  capture that terminated it on its way out pulled it from under any capture still running: a second viewer,
+  or a pump restart whose new capture opened before the old worker exited. That capture would lose its imports
+  and fall back to the CPU. A failure to bring it up is not kept, so the next capture tries again.
+- **The context is the capture's.** `Converter::open` (`drm_gpu.rs:464`) makes a GLES 2 context current on
+  the `drm-capture` worker thread for that thread's life. `Egl::retire` (`drm_gpu.rs:445`) **unbinds** it
+  before destroying it. EGL frees a destroyed context only once it is no longer current, and a worker that
+  exits with its context bound never unbinds it. The first build destroyed it bound and leaked every
+  capture's context for the life of the daemon (§9).
 - **Refusing software.** It refuses a software renderer (`llvmpipe`, `softpipe`): that would do the CPU
   path's work more slowly, and on AC12's box before its kernel fix it was the only renderer there was.
-- **Each frame** (`convert`, `drm_gpu.rs:678`). The scanout's dma-buf is imported once per buffer and cached
+- **Each frame** (`convert`, `drm_gpu.rs:754`). The scanout's dma-buf is imported once per buffer and cached
   (four entries, keyed by framebuffer and dma-buf inode as the CPU mapping is, FR-93 P3f). One draw renders
   it at **exactly** the pump's encode box with a box filter of up to 4×4 bilinear taps per pixel, written as
   B,G,R,A, so the readback is the `Frame` contract's BGRA. EGL owns the channel order and depth: the import
@@ -117,7 +125,7 @@ software. The GPU's work is the capture.
 | **P1** | the DRM arm follows the pump's encode box to the half read (§3) | `ROOMLERD_DRM_FOLLOW_CAP=0` | ✅ the Asahi box, a candidate on 0.4.139's source (§9); merged #2320 | S |
 | **P2** | the repack in row bands, 4 threads by default | `ROOMLERD_DRM_THREADS=1` | ✅ the same candidate (§9); `banded_repacks_match_the_single_pass`; merged #2320 | S |
 | **P2b** | the frame period runs from the ask, not the arrival (§3) | — (a timing fix) | ✅ the Asahi box, a candidate on master `7382639b8` (§9) | S |
-| **P3** | the GPU path: an EGL import, a GLES pass to the encode box, a readback (§3) | `ROOMLERD_DRM_GPU=0` | ✅ the same candidate (§9); unit: `the_gpu_renders_the_encode_box`, `the_taps_cover_the_footprint`, `the_import_names_the_buffer_as_getfb2_described_it` | M |
+| **P3** | the GPU path: an EGL import, a GLES pass to the encode box, a readback (§3) | `ROOMLERD_DRM_GPU=0` | ✅ the same candidate (§9); unit: `the_gpu_renders_the_encode_box`, `the_taps_cover_the_footprint`, `the_import_names_the_buffer_as_getfb2_described_it`; on a GPU (`#[ignore]`d): `a_capture_leaks_nothing_when_it_ends` | M |
 | **P4** | the GPU writes I420/I444 for the encoder | `ROOMLERD_DRM_GPU_YUV=0` | — | M |
 | **P5** | docs: `docs/linux-capture.md` §3.4 (with P1/P2) and each later phase; the `docs/README.md` index row | — | — | S |
 
@@ -137,6 +145,13 @@ software. The GPU's work is the capture.
 - **The fallbacks**, mars `~/wwlab/p3-ac45-mars.sh`: the binary's `DT_NEEDED`, then `capture-smoke` three
   ways: the GPU path; `ROOMLERD_DRM_GPU=0`; and `libEGL.so.1` hidden by a `/dev/null` bind mount in a
   private mount namespace, which fails the `dlopen` as a host without EGL would.
+- **A capture's teardown leaks nothing**, natively on a host with a GPU: `cargo test -p roomlerd --lib
+  --features full -- --ignored --test-threads=1 a_capture_leaks_nothing`. It runs 30 captures on threads of
+  their own and bounds resident memory. Its negative control is `retire` stripped of the unbind and
+  `eglReleaseThread`, which is the first build's teardown, and the control must fail it. `eglReleaseThread`
+  alone also releases the current context, so a control that strips only the unbind passes, and proves
+  nothing. In production the same check is the service's resident memory across sessions: mars
+  `~/wwlab/rss-sessions.sh <label> <n>`.
 - **A live session per path**, one viewer, the screen moving continuously (`vkcube`): mars
   `~/wwlab/fps-ab.sh <label> dc|rtp 30 vkcube`. It reads the pump's heartbeats for that session only and
   prints the service's actual binary first.
@@ -190,3 +205,4 @@ software. The GPU's work is the capture.
 | 2026-10-16 15:30Z | the same box | — | P3's prototype: an EGL import of the scanout | 🔴 **The box had no GPU acceleration.** `DRM_IOCTL_ASAHI_GET_PARAMS failed: Invalid argument`, and every `vkcube` used as this FR's motion had run on `llvmpipe`. Mesa 25.3.6 (the Asahi repository, installed with GNOME on 10-15) was newer than kernel 6.14.2's GPU interface, so GNOME and KDE composited 4K on the CPU. ✅ **Kernel 6.19.14-400.asahi** (operator: *"yes proceed"*), booted once through `grub2-reboot`, with 6.14.2 as the saved default until it came back, then made the default. After it: `vkcube` on `Apple M2 Pro (G14S B1)`, and the prototype (`gpucap.c`: GETFB2 → PRIME → EGL import → one GLES pass → `glReadPixels`) captured 4096×2160 `XR30` in **1.46 ms** to 2048×1080 and **1.38 ms** to 1920×1012, the colours right |
 | 2026-10-16 | the same box, now GPU-composited, one viewer, `vkcube` | 0.4.139; P1+P2 (0.4.139's source + #2320); P3 then P3 + P2b (master `7382639b8` + this phase, `/usr/local/bin/roomlerd-cand-sys`) | the pipeline per path, back to back | VP9-444/DataChannel: **6.3** (0.4.139, resample 49.5 ms) → 12.7 (P1+P2, encode-bound at QP 6 and 17.5 Mbps) → 26.1 (P3, resample 0.0 ms) → **27.9 fps** (P3 + P2b). H.264/RTP: **15.1** (capture 47.8 ms) → 19.9 → 26.2 → **28.8 fps** (capture 17.0 ms with the pacing's wait, encode 16.3 ms). The log names the path: *"the GPU reads the scanout (FR-107 P3…) renderer="Apple M2 Pro (G14S B1)""*. Unit: 36/36 `capture::drm` tests and CI's full clippy line, natively on the box. ⚠️ The 26 fps plateau was the pacing (§2), predicted to within 1 fps before the fix |
 | 2026-10-16 16:30Z | the same box, no session live (the last ended 16:08Z) | the same candidate | AC4 and AC5, through `capture-smoke` (§5) | **The grab** (240 frames, `--fps 1000`): GPU **1.80 ms** still and **2.05 ms** moving, 4096×2160 → 2048×1080; a full-size 4K readback 7.17 / 6.55 ms. The CPU path (`ROOMLERD_DRM_GPU=0`): 15.25 / 15.33 ms half, 23.35 / 23.45 ms full. Against 0.4.139's 27 / 34 ms half and 46 / 52–55 ms full (row 2). **No EGL:** `libEGL.so.1` hidden in a private mount namespace gives exactly one line, *"no GPU path here, the CPU reads the scanout (FR-107 P3) error=libEGL.so.1: /lib64/libEGL.so.1: file too short"*, then 60/60 frames from the CPU. **No new dependency:** no `libEGL`/`libGLES` in the binary's `DT_NEEDED`. **Kill switch:** `ROOMLERD_DRM_GPU=0` prints no P3 line and reads at the CPU's cost. ⚠️ The first run read 5.65 ms at `--fps 240`: since P2b, the smoke's mean includes the wait to fill the period (§5). P1's switch (`ROOMLERD_DRM_FOLLOW_CAP=0`) needs a live session and is owed with 0.4.140's verification |
+| 2026-10-16 17:15Z | the same box | the P3 build, then the fix: master `b8e6e92a0` + #2330 with `Egl` and `retire` (the service's `/proc/<pid>/exe` sha256 `3c27e96e…`, the build's own) | the GPU path's teardown, found while reviewing #2330 before its merge | 🔴 **Every capture leaked its EGL context.** `Drop` destroyed the context while it was still current on the worker, then terminated the display. EGL frees a destroyed context only once it is no longer current, and the worker exits without unbinding it. The same sequence in a C loop, 50 captures on fresh threads: resident memory 53 → 191 MB, 2.8 MB a capture. With an unbind first it stays flat at 51 MB. ✅ **The fix:** `a_capture_leaks_nothing_when_it_ends` passes, and its negative control fails it (`retire` stripped of the unbind and `eglReleaseThread`): *"resident memory grew 95120 kB over 30 captures"*. On the service, each of three sessions logged *"the GPU reads the scanout"*, so the shared display served every capture. The grab is unchanged (1.96 / 1.93 ms half, 6.61 / 5.62 ms full), and the fallbacks re-ran as in the row above. ⚠️ **Wrong turns:** a control that stripped only the unbind PASSED, because `eglReleaseThread` releases the current context too. The service's resident memory over four live sessions moved ±15 MB either way on both builds (`mem_trim`), too noisy to show 3 MB a capture. One session read 14.6 fps with the GPU path up, and it was encode-bound: `frames_captured` went 216 → 418 while `frames_encoded` went 180 → 300, at ~24 Mbps. That is §8's VP9 budget, not the capture |
