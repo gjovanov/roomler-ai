@@ -6143,6 +6143,13 @@ fn stub_caps(multi_org_tun: bool) -> AgentCaps {
     if crate::keep_busy::advertised() {
         caps.input.push("keep-busy".into());
     }
+    // FR-109 — `mouse-rel` where this build's injector carries relative
+    // motion and `ROOMLERD_INPUT_MOUSE_REL` has not switched it off. A viewer
+    // sends `mouse_rel` only to an agent that says so: an older one cannot
+    // parse it.
+    if crate::input::advertises_mouse_rel() {
+        caps.input.push("mouse-rel".into());
+    }
     // FR-93 P2b — the desktop a controller would see now, read from the
     // refresher's cache (never logind on this path). Live, like the words
     // above: the heartbeat re-announces when it changes.

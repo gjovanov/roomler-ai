@@ -207,6 +207,7 @@ pub struct UinputInjector {
     /// unsupported stream cannot flood the daemon log.
     warned_text: bool,
     warned_touch: bool,
+    warned_rel: bool,
     /// FR-36 P4b — the verified keyboard layout for this host, if we have a
     /// table for it, plus the raw name that was detected. The name is kept even
     /// when unsupported so the refusal can SAY what it found: "unsupported
@@ -352,6 +353,7 @@ impl UinputInjector {
             wheel_rem: (0.0, 0.0),
             warned_text: false,
             warned_touch: false,
+            warned_rel: false,
             layout,
             layout_name,
             auto_system: false,
@@ -370,6 +372,7 @@ impl UinputInjector {
             wheel_rem: (0.0, 0.0),
             warned_text: false,
             warned_touch: false,
+            warned_rel: false,
             layout: None,
             layout_name: String::new(),
             auto_system: false,
@@ -457,6 +460,23 @@ impl InputInjector for UinputInjector {
             InputMsg::MouseRelease { btn } => {
                 self.emit(EV_KEY, button_code(btn), 0)?;
                 self.sync()
+            }
+            // FR-109 — relative mode's press: no EV_ABS, so it lands where the
+            // pointer is, the twin of the release above.
+            InputMsg::MousePress { btn } => {
+                self.emit(EV_KEY, button_code(btn), 1)?;
+                self.sync()
+            }
+            // FR-109 P2 — this device is an absolute tablet by design (the
+            // module docs); relative motion needs a second, relative-only
+            // device. Until then this agent never advertises `mouse-rel`, so
+            // a viewer that sends it anyway is told nothing and moves nothing.
+            InputMsg::MouseRel { .. } => {
+                if !self.warned_rel {
+                    self.warned_rel = true;
+                    warn!("uinput: relative motion is not implemented yet (FR-109 P2); dropped");
+                }
+                Ok(())
             }
             InputMsg::MouseWheel { dx, dy, mode } => {
                 let scale = match mode {
@@ -672,6 +692,23 @@ mod tests {
             written(InputMsg::MouseRelease { btn: Button::Left }),
             [(EV_KEY, BTN_LEFT, 0), (EV_SYN, SYN_REPORT, 0)]
         );
+    }
+
+    /// FR-109 — relative mode's press, the release's twin: one key-down and a
+    /// SYN, no EV_ABS.
+    #[test]
+    fn a_relative_press_never_moves_the_pointer() {
+        assert_eq!(
+            written(InputMsg::MousePress { btn: Button::Left }),
+            [(EV_KEY, BTN_LEFT, 1), (EV_SYN, SYN_REPORT, 0)]
+        );
+    }
+
+    /// FR-109 P2 — until the relative device exists, relative motion writes
+    /// nothing to the absolute tablet: no EV_ABS jump, no stray EV_REL.
+    #[test]
+    fn relative_motion_writes_nothing_to_the_tablet() {
+        assert_eq!(written(InputMsg::MouseRel { dx: 40, dy: 7 }), []);
     }
 
     /// The control: a viewer's own button-up still positions first, in the

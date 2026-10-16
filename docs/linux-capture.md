@@ -409,7 +409,7 @@ what would capture it. An exec sweep cannot answer "how many hosts are Wayland,
 and which arm serves each": a sweep reaches only the devices that are online.
 The server can, because every device says it in its hello.
 
-The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1269`),
+The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1275`),
 all strings, so a newer agent's word reaches an older server as a word:
 
 | field | values | from |
@@ -531,7 +531,7 @@ report the modifiers that report ends with. So on a KDE system install "A"
 typed "a", and every shifted symbol came out unshifted: a password with a
 capital in it failed. Shift is now pressed in a report before the key and
 released in one after it, and a shift the viewer holds is left alone
-(`agents/roomlerd/src/input/uinput_backend.rs:537`).
+(`agents/roomlerd/src/input/uinput_backend.rs:557`).
 
 ⚠️ **uinput: the injector opens before the first event** (FR-93 P4c). libinput
 adds a new uinput device asynchronously. Under load, a move written after the
@@ -539,7 +539,7 @@ backend's 300 ms settle still reached nobody: 2 of 8 fresh devices on KDE on
 real hardware, and the AC4 oracle's first target went missing. The device used
 to be created at the session's first event. The input arbiter now opens it as
 soon as a session that may input has its control channel
-(`warm`, `agents/roomlerd/src/input/arbiter.rs:949`), which gives it the second
+(`warm`, `agents/roomlerd/src/input/arbiter.rs:955`), which gives it the second
 or more a viewer takes to send anything. This applies on Linux only, and an
 injector without the OS's permission is never cached. The kill switch is
 `ROOMLERD_INPUT_WARM=0`; `ROOMLERD_UINPUT_SETTLE_MS` (at most 5 s) overrides

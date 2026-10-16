@@ -358,7 +358,7 @@ decide."*
 1. A node opts in locally (`relay_server_enabled`, `relay_server_port`) and advertises the
    capability verb `relay-server` through `models::RpcCap` — variant → `wire()` arm → `ALL`
    entry. ⚠️ Equality matching only: `relay` is a prefix of `relay-server`, the
-   `ssh`/`ssh-consent` trap. (`RpcCap::ALL` is `[RpcCap; 6]` at `models.rs:315`, a
+   `ssh`/`ssh-consent` trap. (`RpcCap::ALL` is `[RpcCap; 6]` at `models.rs:321`, a
    fixed-size array — the **compiler** forces the entry, not a test.)
 2. An admin approves the device — the offer is not the grant (§2, gate 3).
 3. The **server** mints the session and pushes it to both nodes plus the relay.
@@ -409,7 +409,7 @@ is 24 bits, so two `u32`s differing above bit 23 would alias to one session.
 
 ⚠️ **Gate 2's default is not "deny" — it is "off, and permits everything."** The first draft
 claimed four default-deny gates; there are three. `OverlayAclMode` derives `#[default] Off`
-(`crates/remote_control/src/models.rs:1663`), documented as *"every node sees every peer…
+(`crates/remote_control/src/models.rs:1669`), documented as *"every node sees every peer…
 The default, so enabling the feature never breaks a live mesh"*; `Warn` *"ship[s] the
 permissive netmap"*; and `CLAUDE.md`'s own open-issues list records that **nothing has ever
 run under `enforce` in the field**. Tailscale's `cap/relay` is an *affirmative grant*; a
