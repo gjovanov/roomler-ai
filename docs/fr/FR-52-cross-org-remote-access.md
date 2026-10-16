@@ -124,7 +124,7 @@ never consulted, and never leak that they exist.
 | 5 | Host consent | whoever is at the machine | The existing `ConsentMode` path, resolved from `external_consent_mode` rather than `AccessPolicy.consent_mode` (`:430`), defaulting to `Prompt`. |
 
 Gate 5 needs one wire addition: the prompt must say the controller is **outside the
-organization**. `ServerMsg::Request` (`crates/remote_control/src/signaling.rs:1508`)
+organization**. `ServerMsg::Request` (`crates/remote_control/src/signaling.rs:1519`)
 carries `tenant_name` for the multi-org case, which answers *which* org is asking —
 not whether the asker is in one at all. A `controller_scope: external` field is
 additive and serde-defaulted, so older agents keep today's prompt text; a device
@@ -240,7 +240,7 @@ P5, do not assume.**
 ### F4 — `local_relay` is validated as *an* overlay address, not as *the caller's*
 
 `is_overlay_relay_ip` (`crates/remote_control/src/hub.rs:58`) accepts any
-`100.64.0.0/10` or `fc00::/7` literal, and `hub.rs:1176` hands it to the agent as a
+`100.64.0.0/10` or `fc00::/7` literal, and `hub.rs:1183` hands it to the agent as a
 TURN URL. An external controller has no overlay presence, so for them the field must
 be **rejected outright** — otherwise it is a probe into the org's mesh, dialled by
 the agent, from outside the org.

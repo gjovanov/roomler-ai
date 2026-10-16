@@ -23,7 +23,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
 - `AgentCaps` (`crates/remote_control/src/models.rs:40-186`) carries chroma as a
   transport name (`data-channel-vp9-444`, `:59` — used even when libvpx emits 4:2:0), a
   string `vp9_chroma` (`:165`) and a list `hevc_chroma` (`:177`). The session request
-  carries `preferred_transport` + `chroma_pref` (`crates/remote_control/src/signaling.rs:655,665`).
+  carries `preferred_transport` + `chroma_pref` (`crates/remote_control/src/signaling.rs:664,665`).
 - The agent hard-wires `yuv420` for the VP9/AV1/H.264 data-channel codecs
   (`agents/roomlerd/src/peer.rs:4425-4420`); the ONLY hardware 4:4:4 path is
   `hevc_nvenc` with the RExt profile (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:698-715`),

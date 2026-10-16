@@ -105,7 +105,7 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 
 ### A connected device is told at once (#2267)
 
-A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1009`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1038`).
+A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1016`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1038`).
 
 Before #2267 the kick only took the device out of the hub. The device kept its socket and heard nothing. It learned of its removal at its next connection, after a network change or a pod roll, and on a stable network that could take days. Nothing could be done through that socket, because every action re-checks the row, but the device's own status read "connected" throughout.
 
@@ -130,7 +130,7 @@ sequenceDiagram
 | the ephemeral reaper | yes | |
 | an organization's archive | yes | before #2267 the archive did not even take the device out of the hub (`crates/modules/fleet/src/tenant_hooks.rs:50`) |
 | an ephemeral device's own unenroll | **no** | it is already shutting down, and a goodbye racing that clean stop would turn it into exit 7 (`tells_the_device`, `crates/modules/fleet/src/removal.rs:111`) |
-| a device this removal sent `rc:hive.purge_all` (FR-90 P2g-4a) | **no**, and its socket stays open as before | the exit is immediate, and the purge runs after its frame lands (`crates/modules/fleet/src/hub.rs:2973`) |
+| a device this removal sent `rc:hive.purge_all` (FR-90 P2g-4a) | **no**, and its socket stays open as before | the exit is immediate, and the purge runs after its frame lands (`crates/modules/fleet/src/hub.rs:2980`) |
 
 What happens after exit 7 depends on the service manager. The device stays down until it is re-enrolled, but only Linux needs a hand to start it again:
 
