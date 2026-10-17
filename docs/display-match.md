@@ -8,7 +8,8 @@
 > | rc.191 | the viewer asks; the agent switches the primary display to the largest mode inside the viewer's stage, and restores it when the session ends | shipped |
 > | P1 | the device decides: its owner's `display_match`, and under `auto` whether someone is using the screen; every request answered | shipped (0.4.140); field-verified on Windows |
 > | P1b | a locked host switches once unlocked with nobody at it; a person coming back gets their mode back | shipped (0.4.140); field-verified on Windows |
-> | P2–P4 | Linux virtual desktops, modes no monitor offers, several displays | not built |
+> | P2 | Linux virtual desktops: the desktop runs on Xorg with the dummy driver, which takes any mode, so the viewer's stage size becomes the mode exactly; restored at the end | built (the operator settled decision 4 on 2026-10-17) |
+> | P3–P4 | modes no monitor offers, several displays | not built |
 
 ## Why it exists, and what went wrong with it
 
@@ -52,15 +53,15 @@ sequenceDiagram
     Note over V,A: the session's end, or {enable:false}, restores the mode (only the session that applied it)
 ```
 
-[`display_match.rs:380`](../agents/roomlerd/src/display_match.rs#L380) `may_switch` is the decision, pure and
-unit-tested. [`display_match.rs:405`](../agents/roomlerd/src/display_match.rs#L405) `request_for` runs it,
+[`display_match.rs:589`](../agents/roomlerd/src/display_match.rs#L589) `may_switch` is the decision, pure and
+unit-tested. [`display_match.rs:614`](../agents/roomlerd/src/display_match.rs#L614) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:9464`](../agents/roomlerd/src/peer.rs#L9464)).
+control-channel arm sends the answer ([`peer.rs:9684`](../agents/roomlerd/src/peer.rs#L9684)).
 
 ### The answers
 
 Every request gets exactly one `rc:display-match.state`
-([`display_match.rs:522`](../agents/roomlerd/src/display_match.rs#L522) `state_json`):
+([`display_match.rs:742`](../agents/roomlerd/src/display_match.rs#L742) `state_json`):
 
 | `refused` | It means | The viewer says |
 |---|---|---|
@@ -69,8 +70,8 @@ Every request gets exactly one `rc:display-match.state`
 | `locked` | the secure desktop is up (locked, or the logon screen) | "the computer is locked; it switches once unlocked" (P1b) |
 | `disabled_on_device` | the owner set `display_match = never` | "this device's owner turned display match off" |
 | `no_fitting_mode` | no mode the display offers fits inside the stage | "no display mode fits this window" |
-| `switch_failed` | `ChangeDisplaySettingsExW` refused | "the display could not be switched" |
-| `unsupported` | not a Windows host | "this device can't switch its display" |
+| `switch_failed` | `ChangeDisplaySettingsExW` refused, or on a Linux virtual desktop `xrandr` did | "the display could not be switched" |
+| `unsupported` | neither a Windows host nor a Linux virtual desktop on Xorg with the dummy driver (P2) | "this device can't switch its display" |
 
 ⚠️ An agent from before FR-108 answers nothing, and the viewer then shows the toggle as it always did. A word
 this viewer does not know, from a newer agent, is shown as it came and never read as success
@@ -79,7 +80,7 @@ puts the answer under the toggle ([`RemoteControl.vue:3898`](../ui/src/views/rem
 `displayMatchSaid`).
 
 ⚠️ `attended` and `disabled_on_device` hand the screen back: a mode this session applied earlier is restored
-([`display_match.rs:398`](../agents/roomlerd/src/display_match.rs#L398) `hands_the_screen_back`). `locked`
+([`display_match.rs:607`](../agents/roomlerd/src/display_match.rs#L607) `hands_the_screen_back`). `locked`
 does not, because the worker cannot touch the secure desktop (below).
 
 ## The owner's key
@@ -96,9 +97,9 @@ roomler config set display_match auto     # auto (default) | always | never
 
 - **Device-owned:** set over the LocalAPI only by the person at the console
   ([`lib.rs:2890`](../crates/localapi/src/lib.rs#L2890)), and absent from `DesiredConfig`, so a server cannot
-  push it ([`models.rs:7644`](../crates/remote_control/src/models.rs#L7644)). A server that could set it could
+  push it ([`models.rs:8136`](../crates/remote_control/src/models.rs#L8136)). A server that could set it could
   take every screen it reaches.
-- **Read live** at every request ([`display_match.rs:310`](../agents/roomlerd/src/display_match.rs#L310)
+- **Read live** at every request ([`display_match.rs:519`](../agents/roomlerd/src/display_match.rs#L519)
   `set_device_policy`).
 - ⚠️ A value this build does not know reads as `never`, the strictest, and never fails the config file
   ([`config.rs:2379`](../crates/agent-core/src/config.rs#L2379) `DisplayMatchPolicy`).
@@ -137,12 +138,12 @@ so a request mid-session still tells the controller's input from a person's.
 
 P0 tried it: on the lock screen the worker's `ChangeDisplaySettingsExW` returns `-1`, and the screen stays as
 it was. So a locked host answers `locked`, and the request waits
-([`display_match.rs:405`](../agents/roomlerd/src/display_match.rs#L405) `request_for` keeps it per session).
+([`display_match.rs:614`](../agents/roomlerd/src/display_match.rs#L614) `request_for` keeps it per session).
 An unattended office PC is usually locked, so this is the main path, not an edge.
 
 At the session's unlock the device decides again
-([`display_match.rs:474`](../agents/roomlerd/src/display_match.rs#L474) `on_unlock`, called from the
-session's lock watcher, [`peer.rs:1314`](../agents/roomlerd/src/peer.rs#L1314)):
+([`display_match.rs:694`](../agents/roomlerd/src/display_match.rs#L694) `on_unlock`, called from the
+session's lock watcher, [`peer.rs:1387`](../agents/roomlerd/src/peer.rs#L1387)):
 
 | Who unlocked it | What the clock shows | The answer |
 |---|---|---|
@@ -157,8 +158,8 @@ read as `attended` for four more minutes, and the request would be refused for n
 ## The person comes back (P1b)
 
 While a session holds a mode it applied, a watcher checks four times a second
-([`peer.rs:1337`](../agents/roomlerd/src/peer.rs#L1337), Windows only). It hands the screen back at once
-and tells the viewer ([`display_match.rs:507`](../agents/roomlerd/src/display_match.rs#L507)
+([`peer.rs:1416`](../agents/roomlerd/src/peer.rs#L1416), Windows only). It hands the screen back at once
+and tells the viewer ([`display_match.rs:727`](../agents/roomlerd/src/display_match.rs#L727)
 `on_tick`):
 
 | What changed | The answer | Restored |
@@ -168,12 +169,68 @@ and tells the viewer ([`display_match.rs:507`](../agents/roomlerd/src/display_ma
 | the screen locked | — | no: nobody came back, and the secure desktop cannot be switched anyway |
 
 The mode is not re-applied until the viewer asks again (toggle off and on): a returning person never fights a
-timer for their own screen ([`display_match.rs:488`](../agents/roomlerd/src/display_match.rs#L488)
+timer for their own screen ([`display_match.rs:708`](../agents/roomlerd/src/display_match.rs#L708)
 `hand_back`).
+
+## A Linux virtual desktop (P2)
+
+A daemon started with `ROOMLERD_VIRTUAL_DESKTOP=1` runs a desktop of its own: an X server, a window manager
+and the startup apps. Nobody sits at that screen, since it is the daemon's own, so display match switches it
+without asking who is there ([`display_match.rs:628`](../agents/roomlerd/src/display_match.rs#L628)). The
+owner's `never` still holds.
+
+```mermaid
+sequenceDiagram
+    participant V as Viewer
+    participant A as roomlerd
+    participant X as the desktop's Xorg (dummy driver)
+    participant C as capture
+    V->>A: rc:display-match {946, 598}
+    A->>X: xrandr --newmode roomler-946x598 … · --addmode · --output DUMMY0 --mode
+    X-->>A: the screen is 946x598
+    A-->>V: rc:display-match.state {on, mode 946x598}
+    A->>C: mode generation +1
+    C->>C: open again at 946x598 (the encoder follows the new size)
+    V->>A: the session ends
+    A->>X: --output DUMMY0 --mode roomler-1920x1080 · --delmode · --rmmode
+    A->>C: mode generation +1
+```
+
+- **The server is Xorg with the dummy driver** wherever `xserver-xorg-video-dummy` and `xrandr` are installed
+  ([`virtual_desktop.rs:110`](../agents/roomlerd/src/virtual_desktop.rs#L110) `xorg_dummy`). Xvfb has one
+  mode, its start size, and cannot switch at all (the spec's §8 row 5), so a desktop on Xvfb still answers
+  `unsupported`.
+- The real Xorg binary runs **unprivileged**, never the console-only wrapper. It gets a config of its own
+  and an **empty** config directory, so no `xorg.conf.d` snippet of the host's (a GPU's, an input device's)
+  leaks in, and no input device at all: input arrives through XTest, as on Xvfb
+  ([`virtual_desktop.rs:182`](../agents/roomlerd/src/virtual_desktop.rs#L182) `xorg_args`). It starts at the
+  configured size exactly, as a `roomler-WxH` modeline
+  ([`virtual_desktop.rs:138`](../agents/roomlerd/src/virtual_desktop.rs#L138) `xorg_conf`).
+- ⚠️ **The config declares `ReducedBlanking`.** The modelines carry reduced blanking, and without the option
+  Xorg drops the start mode ("monitor doesn't support reduced blanking") and starts at the dummy driver's
+  2048×1536, leaving no named mode to restore to. Found in the build's own probe.
+- **A request becomes a mode of exactly that size**, even on both axes for the encoders: the dummy driver
+  takes any size, so a 946×598 stage gets 946×598, not the nearest standard mode (`cvt` would have rounded it
+  to 952) ([`display_match.rs:98`](../agents/roomlerd/src/display_match.rs#L98) `virtual_mode_for`,
+  [`display_match.rs:74`](../agents/roomlerd/src/display_match.rs#L74) `modeline`). Below 640×480 the display is
+  left alone, as on Windows. Above the framebuffer (`VideoRam`, room for 8K) the request is scaled down.
+- **The switch** adds the mode and makes it current
+  ([`display_match.rs:186`](../agents/roomlerd/src/display_match.rs#L186) `lin::apply_mode`). **The restore**
+  makes the start mode current again, then removes the modes the session added, in that order, because X
+  refuses to delete the mode in use ([`display_match.rs:226`](../agents/roomlerd/src/display_match.rs#L226)).
+- **The capture opens again at the new size.** X11's capturer takes its size when it opens, so every switch
+  and restore bumps a counter the capture worker watches
+  ([`scrap_backend.rs:235`](../agents/roomlerd/src/capture/scrap_backend.rs#L235)). The encoder already
+  rebuilds when the frame size changes.
+- **A failing Xorg costs the switch, never the desktop:** if it does not come up, the desktop runs on Xvfb
+  ([`virtual_desktop.rs:741`](../agents/roomlerd/src/virtual_desktop.rs#L741) `spawn_x_server`).
+- Kill switches: `ROOMLERD_VIRTUAL_DESKTOP_SERVER=xvfb` keeps the desktop on Xvfb; `display_match = never`
+  stops the switching.
 
 ## What it does not do
 
-- macOS and Wayland hosts: display match is Windows only (Linux virtual desktops come in P2).
+- macOS and Wayland hosts, and a Linux desktop a person is using: display match runs on Windows and on a
+  Linux virtual desktop only.
 - DPI and scaling are never changed.
 - One primary display; several displays at once are P4.
 

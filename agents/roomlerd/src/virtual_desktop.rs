@@ -73,6 +73,151 @@ pub struct Config {
     pub startup: Vec<String>,
 }
 
+/// FR-108 P2 — the X server behind the desktop. Only Xorg with the dummy
+/// driver can change its mode at runtime; Xvfb has one mode, its start size,
+/// and `xrandr --newmode` there keeps nothing (spec §8 row 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Server {
+    Xvfb,
+    XorgDummy,
+}
+
+/// The real Xorg binary, never the console-only wrapper, which refuses an
+/// unprivileged caller that is not on a VT.
+const XORG_BINARIES: &[&str] = &["/usr/lib/xorg/Xorg", "/usr/libexec/Xorg", "/usr/lib/Xorg"];
+
+/// `xserver-xorg-video-dummy`, wherever a distribution puts its modules.
+const DUMMY_DRIVERS: &[&str] = &[
+    "/usr/lib/xorg/modules/drivers/dummy_drv.so",
+    "/usr/lib64/xorg/modules/drivers/dummy_drv.so",
+    "/usr/lib/x86_64-linux-gnu/xorg/modules/drivers/dummy_drv.so",
+    "/usr/lib/aarch64-linux-gnu/xorg/modules/drivers/dummy_drv.so",
+];
+
+/// The dummy driver's framebuffer, in KiB: room for an 8K desktop.
+pub const XORG_VIDEO_RAM_KIB: u64 = 256_000;
+
+/// FR-108 P2 — the kill switch: `VIRTUAL_DESKTOP_SERVER=xvfb` (through
+/// `node_env`: the env var under any of its names, then the config) keeps the
+/// desktop on Xvfb, as before P2, wherever the dummy driver is installed.
+fn server_forced_xvfb(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| v.trim().eq_ignore_ascii_case("xvfb"))
+}
+
+/// FR-108 P2 — Xorg with the dummy driver, when the real binary, the driver
+/// and `xrandr` (which switches its modes) are all installed and the kill
+/// switch is not set. The first file of each list that exists is used.
+fn xorg_dummy() -> Option<std::path::PathBuf> {
+    if server_forced_xvfb(tunnel_core::env::node_env("VIRTUAL_DESKTOP_SERVER").as_deref()) {
+        return None;
+    }
+    pick_xorg_dummy(
+        |p| Path::new(p).is_file(),
+        binary_on_path("xrandr").is_some(),
+    )
+}
+
+/// [`xorg_dummy`]'s decision, with the filesystem behind `exists` so it is
+/// testable.
+fn pick_xorg_dummy(exists: impl Fn(&str) -> bool, xrandr: bool) -> Option<std::path::PathBuf> {
+    let xorg = XORG_BINARIES.iter().find(|p| exists(p))?;
+    if !DUMMY_DRIVERS.iter().any(|p| exists(p)) || !xrandr {
+        return None;
+    }
+    Some(std::path::PathBuf::from(xorg))
+}
+
+/// FR-108 P2 — the dummy driver's config. The start mode is the configured
+/// resolution exactly, as a `roomler-WxH` modeline: the dummy driver's own
+/// default would be 2048x1536. ⚠️ `ReducedBlanking` is not decoration: the
+/// modelines carry reduced blanking, and without the option Xorg drops the
+/// start mode ("monitor doesn't support reduced blanking") and starts at its
+/// default, leaving nothing named to restore to. No input devices: input
+/// arrives through XTest, as on Xvfb, and a desktop that adds the host's real
+/// devices would take the person's keyboard.
+fn xorg_conf(w: u32, h: u32) -> String {
+    let (name, timings) = crate::display_match::modeline(w, h);
+    format!(
+        r#"Section "ServerFlags"
+  Option "AutoAddDevices" "false"
+  Option "AutoEnableDevices" "false"
+  Option "DontVTSwitch" "true"
+  Option "BlankTime" "0"
+  Option "StandbyTime" "0"
+  Option "SuspendTime" "0"
+  Option "OffTime" "0"
+EndSection
+Section "Device"
+  Identifier "roomler-dummy"
+  Driver "dummy"
+  VideoRam {XORG_VIDEO_RAM_KIB}
+EndSection
+Section "Monitor"
+  Identifier "roomler-monitor"
+  HorizSync 1.0 - 2000.0
+  VertRefresh 1.0 - 200.0
+  Option "ReducedBlanking" "true"
+  Modeline "{name}" {timings}
+EndSection
+Section "Screen"
+  Identifier "roomler-screen"
+  Device "roomler-dummy"
+  Monitor "roomler-monitor"
+  DefaultDepth 24
+  SubSection "Display"
+    Depth 24
+    Virtual 3840 2160
+    Modes "{name}"
+  EndSubSection
+EndSection
+"#
+    )
+}
+
+/// FR-108 P2 — the argv for Xorg with the dummy driver, unprivileged. Its own
+/// `-configdir` (empty), so no `xorg.conf.d` snippet of the host's (a GPU's,
+/// an input device's) leaks into the desktop. Like Xvfb's: no TCP, no access
+/// control on the loopback socket, and no screen saver. `-dpms` too, since
+/// Xorg, unlike Xvfb, carries DPMS and would blank the screen.
+fn xorg_args(display: &str, conf: &Path, configdir: &Path, log: &Path) -> Vec<String> {
+    vec![
+        display.to_string(),
+        "-config".into(),
+        conf.display().to_string(),
+        "-configdir".into(),
+        configdir.display().to_string(),
+        "-logfile".into(),
+        log.display().to_string(),
+        "-noreset".into(),
+        "-nolisten".into(),
+        "tcp".into(),
+        "-ac".into(),
+        "-s".into(),
+        "0".into(),
+        "-dpms".into(),
+        "-novtswitch".into(),
+        "-sharevts".into(),
+    ]
+}
+
+/// Where the desktop's Xorg keeps its config and log: private to the daemon.
+fn xorg_dir(display: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("roomler-xorg-{}", display.trim_start_matches(':')))
+}
+
+/// The running desktop's display and server, for display match (FR-108 P2).
+static SERVER: std::sync::Mutex<Option<(String, Server)>> = std::sync::Mutex::new(None);
+
+/// FR-108 P2 — the display of this daemon's own virtual desktop when its
+/// server can change mode (Xorg with the dummy driver); `None` otherwise,
+/// including on Xvfb and when no virtual desktop runs.
+pub fn switchable_display() -> Option<String> {
+    match &*SERVER.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some((d, Server::XorgDummy)) => Some(d.clone()),
+        _ => None,
+    }
+}
+
 /// A running virtual desktop. Its `Drop` tears the whole process tree down
 /// (see [`teardown`]), so the caller keeps the handle alive for the agent's
 /// lifetime.
@@ -311,6 +456,12 @@ pub fn teardown() {
         };
         let Some(handle) = handle else { return };
         kill_tree(&handle.roots, handle.pgid, TEARDOWN_GRACE);
+        // FR-108 P2 — the desktop is gone, so nothing is left to switch.
+        if let Some((dpy, server)) = SERVER.lock().unwrap_or_else(|e| e.into_inner()).take()
+            && server == Server::XorgDummy
+        {
+            let _ = std::fs::remove_dir_all(xorg_dir(&dpy));
+        }
     }
 }
 
@@ -527,33 +678,16 @@ fn kill_tree_with(p: &mut dyn Procs, roots: &[i32], pgid: Option<i32>, grace: Du
 /// if the required binaries are missing or Xvfb doesn't come up.
 pub fn start(cfg: &Config) -> Result<VirtualDesktop> {
     preflight(cfg)?;
-    let dpy = pick_display(X11_UNIX_DIR);
     let (w, h) = parse_resolution(&cfg.resolution);
     let mut children = Vec::new();
 
-    let mut xvfb_cmd = Command::new("Xvfb");
-    xvfb_cmd
-        .args(xvfb_args(&dpy, w, h))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // Xvfb LEADS a new process group of its own (`process_group(0)`), so the
-    // whole desktop tree is separable from the daemon and can be torn down as a
-    // unit (#1684) without ever signalling the daemon or its other children.
-    lead_new_group(&mut xvfb_cmd);
-    let xvfb = xvfb_cmd.spawn().context("spawn Xvfb")?;
-    // The desktop's group id is Xvfb's pid (a group leader's pgid == its pid).
-    let pgid = group_of(&xvfb);
-    children.push(xvfb);
-
-    if let Err(e) = wait_display_ready(&dpy, Duration::from_secs(15)) {
-        // We haven't built `VirtualDesktop` yet, so Drop won't fire — kill
-        // the Xvfb we just spawned before bailing.
-        for c in &mut children {
-            let _ = c.kill();
-        }
-        return Err(e);
-    }
-    info!(display = dpy.as_str(), resolution = %cfg.resolution, "virtual-desktop: Xvfb up");
+    let (x, server, dpy) = spawn_x_server(w, h)?;
+    // The desktop's group id is the X server's pid (a group leader's pgid ==
+    // its pid).
+    let pgid = group_of(&x);
+    children.push(x);
+    *SERVER.lock().unwrap_or_else(|e| e.into_inner()) = Some((dpy.clone(), server));
+    info!(display = dpy.as_str(), resolution = %cfg.resolution, ?server, "virtual-desktop: X server up");
 
     let mut wm_cmd = Command::new(&cfg.wm);
     wm_cmd
@@ -595,6 +729,72 @@ pub fn start(cfg: &Config) -> Result<VirtualDesktop> {
         display: dpy,
         children,
     })
+}
+
+/// Spawn the desktop's X server on a free display and wait for its socket.
+/// FR-108 P2: Xorg with the dummy driver where it is installed, so display
+/// match can switch its mode; Xvfb otherwise, and also when Xorg does not come
+/// up, so a failing Xorg costs only the switch, never the desktop. The server
+/// LEADS a new process group of its own (`process_group(0)`), so the whole
+/// desktop tree is separable from the daemon and can be torn down as a unit
+/// (#1684) without ever signalling the daemon or its other children.
+fn spawn_x_server(w: u32, h: u32) -> Result<(Child, Server, String)> {
+    if let Some(xorg) = xorg_dummy() {
+        let dpy = pick_display(X11_UNIX_DIR);
+        match spawn_xorg(&xorg, &dpy, w, h) {
+            Ok(mut child) => match wait_display_ready(&dpy, Duration::from_secs(15)) {
+                Ok(()) => return Ok((child, Server::XorgDummy, dpy)),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    warn!(%e, log = %xorg_dir(&dpy).join("Xorg.log").display(), "virtual-desktop: Xorg with the dummy driver did not come up — using Xvfb, so display match answers unsupported");
+                }
+            },
+            Err(e) => {
+                warn!(%e, "virtual-desktop: could not start Xorg with the dummy driver — using Xvfb, so display match answers unsupported")
+            }
+        }
+    }
+    // Picked afresh: a failed Xorg may have left its lock behind on the first.
+    let dpy = pick_display(X11_UNIX_DIR);
+    let mut cmd = Command::new("Xvfb");
+    cmd.args(xvfb_args(&dpy, w, h))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    lead_new_group(&mut cmd);
+    let mut child = cmd.spawn().context("spawn Xvfb")?;
+    if let Err(e) = wait_display_ready(&dpy, Duration::from_secs(15)) {
+        // No `VirtualDesktop` yet, so Drop won't fire: kill what we spawned.
+        let _ = child.kill();
+        return Err(e);
+    }
+    Ok((child, Server::Xvfb, dpy))
+}
+
+/// FR-108 P2 — start Xorg with the dummy driver on `dpy`, its config and log
+/// in a directory of its own.
+fn spawn_xorg(xorg: &Path, dpy: &str, w: u32, h: u32) -> Result<Child> {
+    let dir = xorg_dir(dpy);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("conf.d")).context("creating the Xorg directory")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let conf = dir.join("xorg.conf");
+    std::fs::write(&conf, xorg_conf(w, h)).context("writing xorg.conf")?;
+    let mut cmd = Command::new(xorg);
+    cmd.args(xorg_args(
+        dpy,
+        &conf,
+        &dir.join("conf.d"),
+        &dir.join("Xorg.log"),
+    ))
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    lead_new_group(&mut cmd);
+    cmd.spawn().context("spawn Xorg")
 }
 
 /// Place a child at the head of a NEW process group (`setpgid(0, 0)` before
@@ -667,7 +867,8 @@ fn xvfb_args(display: &str, w: u32, h: u32) -> Vec<String> {
 /// Confirm the required binaries exist, else bail with the apt line.
 fn preflight(cfg: &Config) -> Result<()> {
     let mut missing = Vec::new();
-    if binary_on_path("Xvfb").is_none() {
+    // FR-108 P2 — Xorg with the dummy driver needs no Xvfb.
+    if xorg_dummy().is_none() && binary_on_path("Xvfb").is_none() {
         missing.push("xvfb".to_string());
     }
     if binary_on_path(&cfg.wm).is_none() {
@@ -739,7 +940,7 @@ fn wait_display_ready(display: &str, timeout: Duration) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    bail!("virtual-desktop: Xvfb display {display} did not become ready within {timeout:?}")
+    bail!("virtual-desktop: X server display {display} did not become ready within {timeout:?}")
 }
 
 #[cfg(test)]
@@ -771,6 +972,104 @@ mod tests {
         assert_eq!(a.first().map(String::as_str), Some(":7"));
         assert!(a.iter().any(|s| s == "1280x720x24"), "got {a:?}");
         assert!(a.iter().any(|s| s == "-ac"));
+    }
+
+    /// FR-108 P2 — the config starts at the configured size exactly, declares
+    /// the reduced blanking its modelines carry (or Xorg drops the start mode
+    /// and starts at the dummy's 2048x1536, with nothing named to restore to),
+    /// and adds no input device.
+    #[test]
+    fn xorg_conf_starts_at_the_configured_size() {
+        let c = xorg_conf(1920, 1080);
+        assert!(c.contains(r#"Driver "dummy""#), "{c}");
+        assert!(c.contains(&format!("VideoRam {XORG_VIDEO_RAM_KIB}")), "{c}");
+        assert!(c.contains(r#"Option "ReducedBlanking" "true""#), "{c}");
+        assert!(
+            c.contains(r#"Modeline "roomler-1920x1080" 138.52 1920 1968 2000 2080 1080 1083 1088 1110 +hsync +vsync"#),
+            "{c}"
+        );
+        assert!(c.contains(r#"Modes "roomler-1920x1080""#), "{c}");
+        assert!(c.contains(r#"Option "AutoAddDevices" "false""#), "{c}");
+        assert!(c.contains(r#"Option "BlankTime" "0""#), "{c}");
+    }
+
+    /// FR-108 P2 — Xorg's argv: its own config and an EMPTY config dir (no
+    /// host `xorg.conf.d` snippet), loopback only, and nothing that blanks.
+    #[test]
+    fn xorg_args_isolate_and_never_blank() {
+        let a = xorg_args(
+            ":101",
+            Path::new("/tmp/x/xorg.conf"),
+            Path::new("/tmp/x/conf.d"),
+            Path::new("/tmp/x/Xorg.log"),
+        );
+        assert_eq!(a.first().map(String::as_str), Some(":101"));
+        let after = |flag: &str| {
+            a.iter()
+                .position(|s| s == flag)
+                .and_then(|i| a.get(i + 1))
+                .cloned()
+        };
+        assert_eq!(after("-config").as_deref(), Some("/tmp/x/xorg.conf"));
+        assert_eq!(after("-configdir").as_deref(), Some("/tmp/x/conf.d"));
+        assert_eq!(after("-nolisten").as_deref(), Some("tcp"));
+        assert_eq!(
+            after("-s").as_deref(),
+            Some("0"),
+            "-s 0 disables the screen saver"
+        );
+        for flag in ["-dpms", "-ac", "-noreset", "-novtswitch"] {
+            assert!(a.iter().any(|s| s == flag), "{flag} missing from {a:?}");
+        }
+    }
+
+    /// FR-108 P2 — Xorg with the dummy driver only when the real binary, the
+    /// driver and `xrandr` are all there; the first binary found wins.
+    #[test]
+    fn xorg_dummy_needs_the_binary_the_driver_and_xrandr() {
+        let have = |set: &'static [&'static str]| move |p: &str| set.contains(&p);
+        let all: &'static [&'static str] = &[
+            "/usr/lib/xorg/Xorg",
+            "/usr/lib/xorg/modules/drivers/dummy_drv.so",
+        ];
+        assert_eq!(
+            pick_xorg_dummy(have(all), true),
+            Some(std::path::PathBuf::from("/usr/lib/xorg/Xorg"))
+        );
+        assert_eq!(
+            pick_xorg_dummy(have(all), false),
+            None,
+            "no xrandr: no way to switch"
+        );
+        let fedora: &'static [&'static str] = &[
+            "/usr/libexec/Xorg",
+            "/usr/lib64/xorg/modules/drivers/dummy_drv.so",
+        ];
+        assert_eq!(
+            pick_xorg_dummy(have(fedora), true),
+            Some(std::path::PathBuf::from("/usr/libexec/Xorg"))
+        );
+        let no_driver: &'static [&'static str] = &["/usr/lib/xorg/Xorg"];
+        assert_eq!(pick_xorg_dummy(have(no_driver), true), None);
+        let wrapper_only: &'static [&'static str] = &[
+            "/usr/bin/Xorg",
+            "/usr/lib/xorg/modules/drivers/dummy_drv.so",
+        ];
+        assert_eq!(
+            pick_xorg_dummy(have(wrapper_only), true),
+            None,
+            "the console-only wrapper is not the binary"
+        );
+    }
+
+    /// FR-108 P2 — the kill switch is the one word, any case.
+    #[test]
+    fn the_server_kill_switch() {
+        assert!(server_forced_xvfb(Some("xvfb")));
+        assert!(server_forced_xvfb(Some(" XVFB ")));
+        assert!(!server_forced_xvfb(Some("xorg")));
+        assert!(!server_forced_xvfb(Some("")));
+        assert!(!server_forced_xvfb(None));
     }
 
     #[test]
