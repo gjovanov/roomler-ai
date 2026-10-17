@@ -126,7 +126,13 @@
       chip.className = 'chip ' + (exit.active ? 'chip-ok' : 'chip-warn');
     }
     let detail;
-    if (exit.active) {
+    if (exit.active && exit.socks5_port) {
+      // FR-97 P0c-3 — a netstack node installs no OS routes: only what its
+      // SOCKS5 front dials rides the exit, so the v6/DNS caveats below (which
+      // describe a host whose traffic all goes through it) would mislead.
+      detail = 'only SOCKS5 clients of 127.0.0.1:' + exit.socks5_port +
+        ' use the exit (IPv4 destinations) · nothing else on this device does';
+    } else if (exit.active) {
       const caveats = [];
       if (!exit.v6_active) caveats.push('IPv6 blackholed (exit is v4-only)');
       if (!exit.dns_steered) caveats.push('DNS not steered — queries may leak locally');

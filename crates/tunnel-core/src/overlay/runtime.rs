@@ -1275,6 +1275,12 @@ pub struct OverlayRuntime {
     /// still worked when they were resolved. Coturn worker IPs are added
     /// dynamically from live relay carriers. Empty unless `exit_node` is set.
     exit_server_ips: Vec<IpAddr>,
+    /// FR-97 P0c-3 — the netstack SOCKS5 front's port, when the agent built
+    /// this runtime over the userspace netstack. Copied onto the exit state:
+    /// such a node's exit carries only what that front dials, and it never
+    /// steers the host's DNS. Set via
+    /// [`with_netstack_socks`](Self::with_netstack_socks).
+    netstack_socks: Option<u16>,
     /// Phase D (DERP) — a factory that OPENS this node's `/derp` WS + returns
     /// its demux, called LAZILY by [`run`](Self::run) only when the node is
     /// itself UDP-blocked (its srflx gather found nothing). A UDP-capable node
@@ -1519,6 +1525,7 @@ impl OverlayRuntime {
             org_primary: false,
             exit_node: None,
             exit_server_ips: Vec::new(),
+            netstack_socks: None,
             derp_mux_factory: None,
             regional_derp_factory: None,
             path_shadow: std::sync::Mutex::new(PathShadow::new()),
@@ -1552,6 +1559,7 @@ impl OverlayRuntime {
             org_primary: false,
             exit_node: None,
             exit_server_ips: Vec::new(),
+            netstack_socks: None,
             derp_mux_factory: None,
             regional_derp_factory: None,
             path_shadow: std::sync::Mutex::new(PathShadow::new()),
@@ -1622,6 +1630,16 @@ impl OverlayRuntime {
     pub fn with_exit_node(mut self, exit_node: Option<String>, server_ips: Vec<IpAddr>) -> Self {
         self.exit_node = exit_node;
         self.exit_server_ips = server_ips;
+        self
+    }
+
+    /// FR-97 P0c-3 — this runtime runs over the userspace netstack, whose
+    /// SOCKS5 front listens on `127.0.0.1:<port>`. A netstack node installs no
+    /// OS routes, so an exit then carries only what the front dials:
+    /// `roomler status` says so, never claims IPv6 through it, and the host's
+    /// DNS is left alone. `None` (an OS TUN, tests) changes nothing.
+    pub fn with_netstack_socks(mut self, port: Option<u16>) -> Self {
+        self.netstack_socks = port;
         self
     }
 
@@ -2010,7 +2028,12 @@ impl OverlayRuntime {
         // join below sends `advertised_routes`, and `nat::enable` (after the
         // first netmap) and the ingress scope read the same list. A host that
         // cannot serve offers nothing, so no admin can approve a black hole.
-        let offer = super::nat::gate_offer(std::mem::take(&mut self.advertised_routes)).await;
+        // FR-97 P0c-3 — and never from a netstack node, which forwards nothing.
+        let offer = super::nat::gate_offer(
+            std::mem::take(&mut self.advertised_routes),
+            self.netstack_socks.is_some(),
+        )
+        .await;
         if let Some(why) = &offer.withheld {
             warn!(reason = %why,
                 "overlay: route offer WITHHELD (no /0, no subnet route advertised): this host cannot forward or NAT for its peers");
@@ -2644,6 +2667,7 @@ impl OverlayRuntime {
             dns_magic_domain: dns_magic,
             dns_target: Some(dns_target),
             dns_bound,
+            socks5_port: self.netstack_socks,
             ..Default::default()
         };
         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state)
@@ -8181,6 +8205,65 @@ mod tests {
                 .unwrap()
                 .dns_steered
         );
+    }
+
+    /// FR-97 P0c-3 — measured 2026-10-17 on a netstack exit client: its SOCKS5
+    /// front carried IPv4 literals through the exit (a SYN from its overlay
+    /// address on the exit's TUN, one new MASQUERADE flow) and refused IPv6
+    /// destinations, while `roomler status` said "active, v6 on" for the whole
+    /// host. The status now carries the front, never IPv6 through it.
+    #[test]
+    fn a_netstack_exit_reports_its_socks_front_and_never_v6() {
+        let mut st = ExitRoutingState {
+            split_default_installed: true,
+            v6_active: Some(true),
+            ..Default::default()
+        };
+        let os_tun = exit_node_status(Some("exit"), &st).unwrap();
+        assert!(os_tun.active && os_tun.v6_active);
+        assert_eq!(os_tun.socks5_port, None);
+        st.socks5_port = Some(1080);
+        let ns = exit_node_status(Some("exit"), &st).unwrap();
+        assert!(ns.active, "the front's IPv4 dials do ride the exit");
+        assert!(
+            !ns.v6_active,
+            "the front refuses every non-overlay IPv6 destination"
+        );
+        assert_eq!(ns.socks5_port, Some(1080));
+    }
+
+    /// FR-97 P0c-3 — the DNS steer is host-wide on Windows (an NRPT catch-all)
+    /// and macOS (a resolver entry). From a netstack node, whose OS routes
+    /// nothing through the exit, it would only move every app to the public
+    /// upstream over the uplink, and cut a managed laptop off from its own
+    /// names. Locked here so the gate cannot drift from the reconcile.
+    #[test]
+    fn a_netstack_node_never_steers_the_hosts_dns() {
+        let mut st = ExitRoutingState {
+            split_default_installed: true,
+            dns_target: Some(Ipv4Addr::new(1, 1, 1, 1)),
+            ..Default::default()
+        };
+        assert!(
+            dns_steer_allowed(&st),
+            "MagicDNS off, an OS TUN: the steer runs"
+        );
+        st.socks5_port = Some(1080);
+        assert!(!dns_steer_allowed(&st));
+        // The pre-existing gates still hold for an OS TUN.
+        st.socks5_port = None;
+        st.dns_magic_domain = Some("org.example".into());
+        assert!(
+            !dns_steer_allowed(&st),
+            "MagicDNS on needs a live local resolver"
+        );
+        st.dns_bound = true;
+        assert!(dns_steer_allowed(&st));
+        st.dns_steered = true;
+        assert!(!dns_steer_allowed(&st), "once is enough");
+        st.dns_steered = false;
+        st.split_default_installed = false;
+        assert!(!dns_steer_allowed(&st), "never without the split-default");
     }
 
     // ---- FR-97 P1a — pins that stop holding, and the cause they report ----

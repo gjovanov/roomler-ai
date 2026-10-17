@@ -96,6 +96,15 @@ pub struct ExitNodeStatus {
     /// with a daemon/CLI that predates DNS steering.
     #[serde(default)]
     pub dns_steered: bool,
+    /// FR-97 P0c-3 — `Some(port)` when this node runs the userspace netstack.
+    /// It installs no OS routes, so the exit carries only what its SOCKS5
+    /// front on `127.0.0.1:<port>` dials: IPv4 destinations, including names
+    /// the SOCKS client resolves itself. Nothing else on the host uses the
+    /// exit; the front refuses IPv6 destinations and resolves names only to
+    /// overlay peers; no DNS is steered. Measured 2026-10-17 (FR-97 §8).
+    /// `None` on an OS-TUN node, and from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socks5_port: Option<u16>,
 }
 
 /// Snapshot of the local node.
@@ -4627,6 +4636,40 @@ pub struct LanCaptureStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-97 P0c-3 — WIRE SHAPE. An OS-TUN exit client's status is
+    /// byte-identical to one from before the field existed, and a status from
+    /// an older daemon (no key) reads as an OS-TUN node, never as SOCKS-only.
+    #[test]
+    fn socks5_port_is_absent_on_an_os_tun_node_and_carried_for_netstack() {
+        let os_tun = ExitNodeStatus {
+            selector: "exit".into(),
+            active: true,
+            withheld_reason: None,
+            v6_active: true,
+            dns_steered: true,
+            socks5_port: None,
+        };
+        let json = serde_json::to_string(&os_tun).unwrap();
+        assert!(!json.contains("socks5_port"), "{json}");
+        let older: ExitNodeStatus = serde_json::from_str(
+            r#"{"selector":"exit","active":true,"v6_active":true,"dns_steered":true}"#,
+        )
+        .unwrap();
+        assert_eq!(older, os_tun);
+        let netstack = ExitNodeStatus {
+            socks5_port: Some(1080),
+            v6_active: false,
+            dns_steered: false,
+            ..os_tun
+        };
+        let json = serde_json::to_string(&netstack).unwrap();
+        assert!(json.contains(r#""socks5_port":1080"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ExitNodeStatus>(&json).unwrap(),
+            netstack
+        );
+    }
 
     /// WIRE SHAPE. A node that is not serving relay probes must produce
     /// **byte-identical** status JSON to one built before FR-19 existed —

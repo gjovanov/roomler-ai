@@ -8,8 +8,10 @@
 - P0d, the measurement, merged (#2397): the native architecture in the hello, and `scripts/fr97-caps-census.sh`.
   It reaches the fleet with the next agent release and server promote. The count before P0c was taken on
   2026-10-17 (§8, AC15).
-- P0c, honest caps (§3.3a): P0c-1, the map and the daemon's decision, merged (#2400); P0c-2, the viewer and
-  the enroll dialog, is in review (#2401). P0c-3 (the netstack exit status) was measured (D12) and is next.
+- P0c, honest caps (§3.3a): P0c-1, the map and the daemon's decision (#2400), and P0c-2, the viewer and the
+  enroll dialog (#2401), merged. P0c-3, a netstack node's exit status, DNS and route offer, was measured (D12) and is
+  in review (#2404). They reach the fleet with the next agent release and server promote; AC3's field sessions
+  follow.
 - P2–P7 are open.
 
 **Owner:** the agent on all
@@ -74,9 +76,9 @@ never run.
 **S1 (#2081) — a Mac exit-node client installs the split-default with nothing pinned.** ✔
 `TunIo::add_host_exemption` defaults to `Ok(())` (`crates/tunnel-core/src/overlay/tun.rs:162-164`), and
 `SystemTun` overrides it only on Linux and Windows (`tun.rs:4248-4249`, `cfg(any(linux, windows))`). On macOS every
-carrier exemption therefore "succeeds" without installing a route (`runtime/route_guard.rs:523-526`), the v4 gate
-passes (`route_guard.rs:541-556`), and the `/1` halves go in through the real macOS route arm
-(`route_guard.rs:566-570` → `tun.rs:3876-3925`). The coordination server, coturn and the exit peer's own endpoint
+carrier exemption therefore "succeeds" without installing a route (`runtime/route_guard.rs:552-555`), the v4 gate
+passes (`route_guard.rs:570-585`), and the `/1` halves go in through the real macOS route arm
+(`route_guard.rs:595-599` → `tun.rs:3876-3925`). The coordination server, coturn and the exit peer's own endpoint
 then route into the utun that is supposed to carry them. That is the self-wedge the withhold gate exists to
 prevent, and the guard re-asserts it on every tick.
 
@@ -87,16 +89,16 @@ prevent, and the guard re-asserts it on every tick.
   `sudo roomler config set` can, and so can an `exec` on the daemon's row. Once it lands, the control WS that the
   `exec` came in on is captured too, so the same channel cannot undo it.
 - `NetstackTun` inherits the same default. It installs no OS routes, so it cannot wedge, but `roomler status`
-  reports the exit `active` although its userspace stack has no route off the overlay prefixes
-  (`netstack.rs:1176-1186`), so nothing reaches the exit (P0c). Whether a SOCKS5 client's IPv4 literal does is
-  measured before that changes (D12).
+  reported the exit `active, v6 on` for the whole host. The reading that nothing reaches the exit was wrong:
+  measured 2026-10-17 (§8), its SOCKS5 front's IPv4 dials do, because the split-default lives in the userspace
+  router, and nothing else does. P0c-3 makes the status say so (§3.3a, D12).
 - This is a reading of the code path, not yet reproduced on a Mac. P0a reproduces it, red, on a throwaway VM first.
 
 **S2 — exit and subnet serving is offered where nothing NATs, and an approval outlives the offer.** ✔
 
 - The `/0` advertisement is unconditional (`crates/agent-core/src/config.rs:2079-2068`) and independent of NAT setup
-  (`runtime.rs:2108-2113`; the setup's success only picks a log level, `nat.rs:80-94`). macOS has no NAT arm at all
-  (`nat.rs:353-355` returns `false`), and because the guard is armed only on Linux and Windows (`nat.rs:87`), it logs
+  (`runtime.rs:2131-2136`; the setup's success only picks a log level, `nat.rs:80-94`). macOS has no NAT arm at all
+  (`nat.rs:376-378` returns `false`), and because the guard is armed only on Linux and Windows (`nat.rs:87`), it logs
   nothing. Windows Home fails `New-NetNat` silently and leaves IPv4 forwarding on after the revert (#2077).
 - The server derives `can_be_exit_node` from the advertisement alone
   (`crates/modules/network/src/routes/overlay_route.rs:63`), and the admin row carries no OS (`overlay_route.rs:28-59`)
@@ -113,8 +115,8 @@ prevent, and the guard re-asserts it on every tick.
 |---|---|---|---|---|---|---|
 | N1 | In the mesh on a default install | ✅ | ✅ | ❌ | The default `.pkg` installs the per-user half, which cannot create a utun; the mesh needs `--daemon-token`, a second enrollment and a second device row (`scripts/install.sh:508-511`, `packaging/macos/com.roomler.daemon.plist` header) | FR-43 P3 |
 | N2 | Exit node, client | ✅ | ✅ | ✅ P1a + P1c (AC4, AC6 field-verified) | S1; no original-default capture (`tun.rs:1931-1939`, `3471-3503` are `cfg(any(linux, windows))`) | P0a, P1a |
-| N3 | Exit node, serving v4 | 🟡 WinNAT; Home ❌ | ✅ iptables | ✅ P1b: pf, in our own anchor (0.4.141; #2377 in 0.4.142; AC5, §8) | Silent no-op (`nat.rs:353-355`); Home: #2077 | P0b, P1b, P4e |
-| N4 | Exit node, serving v6 | ⛔ WinNAT has no v6 (`nat.rs:245-251`) | ✅ ip6tables | ✅ P1b: pf NAT66 to a stable address (global first, else a ULA), where an unscoped v6 default exists (0.4.141; AC5, §8) | — | P1b; Windows: D1 |
+| N3 | Exit node, serving v4 | 🟡 WinNAT; Home ❌ | ✅ iptables | ✅ P1b: pf, in our own anchor (0.4.141; #2377 in 0.4.142; AC5, §8) | Silent no-op (`nat.rs:376-378`); Home: #2077 | P0b, P1b, P4e |
+| N4 | Exit node, serving v6 | ⛔ WinNAT has no v6 (`nat.rs:268-274`) | ✅ ip6tables | ✅ P1b: pf NAT66 to a stable address (global first, else a ULA), where an unscoped v6 default exists (0.4.141; AC5, §8) | — | P1b; Windows: D1 |
 | N5 | Subnet router, serving | 🟡 WinNAT; Home ❌ | ✅ | ✅ P1b (0.4.141; AC5, §8) | Same no-op; routes still advertised and approvable | P0b, P1b |
 | N6 | MagicDNS OS steer | ✅ NRPT | 🟡 systemd-resolved only (`dns.rs:408-429`) | ✅ P1c (AC6) | A TUN-mode Mac resolves names only with the opt-in hosts ladder. *P1c:* a temporary SCDynamicStore supplemental resolver per utun | P1c, P3h |
 | N7 | Exit DNS steer (no leak) | ✅ NRPT `.` | 🟡 resolved only | ✅ P1c (AC6) | Reported honestly as `DNS NOT steered`. *P1c:* a temporary catch-all key (`SupplementalMatchDomains = [""]`) | P1c, P3h |
@@ -161,7 +163,7 @@ and the consent chain's fallbacks.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | D1 | Companion: tray, banner, consent, Apply now | ✅ | 🟡 | ✅ | One x86_64 `.deb` (`release-agent.yml:744-871`); Fedora, Arch and arm64 have none | P3g (with FR-93 D5/D6, FR-95) |
-| D2 | Companion pages on a system install | ✅ | 🟡 safety pages only | ❓ | Person socket (`crates/localapi/src/lib.rs:2550-2594`); a two-half Mac may answer Routes and Devices from the user half | #1911; FR-43 P3 |
+| D2 | Companion pages on a system install | ✅ | 🟡 safety pages only | ❓ | Person socket (`crates/localapi/src/lib.rs:2559-2603`); a two-half Mac may answer Routes and Devices from the user half | #1911; FR-43 P3 |
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ❌ | ✅ IOPMAssertion | A stub whose reason, "zbus is in no shipped Linux feature set" (`power.rs:649-660`), is stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | ✅ | ❌ | ✅ | Root's home or `/tmp` (`files.rs:182-206`, `2483-2521`) | P3d |
 | D5 | The setup wizard installs the daemon | ✅ | ❌ | ❌ | Tunnel client only (`agents/roomler-setup/src/commands.rs:79-103`) ✔, yet the enroll dialog offered it for agents. P0c-2 offers it for agents on Windows only (`ui/src/utils/enrollCommands.ts:136`) | P0c, D5 |
@@ -259,7 +261,7 @@ can do.
 ### 3.2 P0a — fail toward withhold (#2081)
 
 `SystemTun` refuses an exemption wherever it has no arm: a `cfg(not(any(linux, windows)))` `add_host_exemption`
-returns `ErrorKind::Unsupported`, so on macOS the gate at `route_guard.rs:545-556` withholds and `roomler status`
+returns `ErrorKind::Unsupported`, so on macOS the gate at `route_guard.rs:574-585` withholds and `roomler status`
 says why. The trait default stays `Ok(())`, now documented as safe only for a device that installs no OS routes
 (the in-memory mocks, netstack); changing it would move every mock and netstack for no safety gain. Netstack's untrue
 `active` belongs to P0c. The test that fails on master is
@@ -341,15 +343,22 @@ beside the words.
 **Out of the hello:**
 - **The wizard (D5).** The enroll dialog stops offering it for agents off Windows (`ui/src/utils/enrollCommands.ts:136`,
   used at `:176` and `:192`). There it installs only the tunnel client.
-- **A netstack node's exit status (D12).** Today it reads `active` while the OS routes nothing. Yet its SOCKS5 front
-  dials an IPv4 literal as given (`crates/tunnel-core/src/overlay/netstack_socks.rs:75`), and the overlay router
-  picks a peer for each packet by its allowed IPs, the exit's `/0` among them. So a literal may well reach the exit,
-  and "never `active`" may itself be wrong. It is measured before it is changed.
+- **A netstack node's exit (D12, P0c-3).** Measured first (§8, 2026-10-17). The front dials an IPv4 literal as
+  given (`crates/tunnel-core/src/overlay/netstack_socks.rs:75`), and the exit install puts the split-default in the
+  userspace router, so a literal does reach the exit. Names the front is handed resolve only to overlay peers, it
+  refuses IPv6 destinations, and nothing else on the host uses the exit. So:
+  - `ExitNodeStatus.socks5_port` (`crates/localapi/src/lib.rs:107`): `roomler status` says "active for SOCKS5
+    clients of 127.0.0.1:1080 only", and never `v6 on`.
+  - The host's DNS is never steered from a netstack node
+    (`crates/tunnel-core/src/overlay/runtime/route_guard.rs:363`): on Windows and macOS the steer is host-wide and
+    would route nothing through the exit.
+  - A netstack node withholds every route offer (`crates/tunnel-core/src/overlay/nat.rs:179`): its stack forwards
+    nothing. On 0.4.141, a netstack node on a host where iptables worked offered `/0`.
 
 **Order.**
 - **P0c-1:** the map and the daemon (this section).
 - **P0c-2:** the viewer and the enroll dialog read it.
-- **P0c-3:** the netstack status.
+- **P0c-3:** a netstack node's exit status, its DNS and its route offer.
 
 The server stores the map as it stores every caps field, so P0c-2 needs a promoted server, and the honest no's
 reach a viewer from agents on the release after P0c-1.
@@ -377,7 +386,7 @@ Mirror the Linux arm with the BSD tools the macOS code already drives, and close
    change`: it resolves its target the way the lookup does, and on the field Mac it left the pin untouched. The table
    then decides; a pin that does not hold comes out again and the call errs.
 4. **The pins follow the uplink.** `TunIo::stale_host_exemptions` (new; `tun.rs:4838` on macOS, an empty default
-   elsewhere) names the pins the table does not show through the current uplink. The gate (`route_guard.rs:570`)
+   elsewhere) names the pins the table does not show through the current uplink. The gate (`route_guard.rs:599`)
    asks at most every 3 s, re-pins each, and DELETES one it cannot re-pin before forgetting it, so an untracked
    route never outlives the exit. Then the usual rule applies: a v4 pin missing means WITHHOLD.
 5. **`del_host_exemption`** removes only the pin the table shows, never a route on our utun (a peer route): with no
@@ -385,8 +394,8 @@ Mirror the Linux arm with the BSD tools the macOS code already drives, and close
    removes the `/1`s (`tun.rs:4603-4646` at the time of writing); pins an unclean exit leaves behind are N13, all
    three OSes.
 6. **The two 0.4.132 follow-ups.** The pin WARN fires once per (endpoint, cause) (`note_exemption_failure`,
-   `route_guard.rs:370`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
-   (`exemption_withheld_reason`, `route_guard.rs:382`) instead of `no original default route?`.
+   `route_guard.rs:393`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
+   (`exemption_withheld_reason`, `route_guard.rs:405`) instead of `no original default route?`.
 
 Kill switch: `ROOMLERD_EXIT_CLIENT_MACOS=0` refuses every exemption, as 0.4.132 did. DNS is not steered yet (P1c):
 `roomler status` says `DNS NOT steered`.
@@ -496,7 +505,7 @@ Prefer the SCDynamicStore to files: a supplemental resolver (`SupplementalMatchD
 `SCDynamicStoreAddTemporaryValue` should disappear when the daemon's store session ends, which would make the steer
 crash-safe by construction (unverified; P1c's first task). The fallback for the split zone is `/etc/resolver/<domain>`
 (honoured by the system resolver, not by `dig`), purged at boot. Keep the existing bound-resolver gate
-(`runtime.rs:2372-2392`): never steer at a `:53` that did not bind.
+(`runtime.rs:2395-2415`): never steer at a `:53` that did not bind.
 
 *Done first, 2026-10-14, on throwaway tart VMs with `scutil` only, before any code (§8):* a temporary key's holder
 SIGKILLed → the key is gone within 1–4 s (two keys in one session: both); the same key without the flag survives its
@@ -545,7 +554,7 @@ test of the SIGKILL property itself.
   Downloads *as that user*, the twin of `active_user_downloads_path` on Windows (`files.rs:2467-2480`).
   ⚠️ Never as root followed by a `chown`: in a directory the user owns, a root path operation can be redirected
   through a swapped-in symlink to any file root can reach. Do every path step on a thread switched with
-  `setfsuid`/`setfsgid`, the pattern FR-27 P11's person socket already uses (`crates/localapi/src/lib.rs:3611-3642`),
+  `setfsuid`/`setfsgid`, the pattern FR-27 P11's person socket already uses (`crates/localapi/src/lib.rs:3620-3651`),
   so the file is born theirs. ⚠️ "The user" is the seat owner, never whoever asked over the person socket.
 - **P3e, X11 polish.** Layout (`XkbGetState` / `XkbLockGroup`; Wayland has no cross-compositor API, so refuse with a
   reason), display-match through RandR (`x11rb` is linked) with a restore guard, clipboard image watching (XFixes
@@ -621,7 +630,7 @@ model on Windows, so the three agree on what the mode means.
 |---|---|---|---|---|
 | **P0a** | `SystemTun` refuses an exemption it has no arm for, so a Mac withholds (S1, #2081) | — (a safety fix) | the macOS kernel test in CI, red on master; a throwaway macOS VM, red on 0.4.131, then green | S |
 | **P0b** | The NAT probe gates the offer; the server fans approved ∩ advertised; the Windows revert restores forwarding; an OS chip and the reason in the admin UI (S2, #2077) | device `ROOMLERD_ROUTE_OFFER_UNPROBED=1`; a server flag for the plain fan | Win11 Home and Pro, Linux, macOS cells | S–M |
-| **P0c** | Honest caps: `opus` only with a capture backend; the image-event cap only where watched; no clipboard cap on a root Linux daemon without a display; Ctrl+Alt+Del saying what its keys reach, and gone where the chord means nothing; the wizard offered only where it installs the agent; a netstack node's exit status never `active` | — | a test per word, failing on master | S |
+| **P0c** | Honest caps: `opus` only with a capture backend; the image-event cap only where watched; no clipboard cap on a root Linux daemon without a display; Ctrl+Alt+Del saying what its keys reach, and gone where the chord means nothing; the wizard offered only where it installs the agent; a netstack node's exit status naming its SOCKS5 front, and no route offered from it | — | a test per word, failing on master | S |
 | **P0d** | Measure: the native architecture in the hello; a server count of capability words by OS and architecture | — | the server | S |
 | **P0e** | Exit-client pins on all three: they follow the uplink on Linux and Windows too (N12), and a ledger lets the boot and pre-exit purge remove the ones an unclean exit left (N13). *Part 1 = N13* (the pins in the host ledger, and a purge after every exit of the daemon); *part 2 = N12*; *part 3 = N14* (netstate sees the uplink beneath the exit, so the control WS is probed at once) | — (a safety fix); N14: `ROOMLERD_OVERLAY_NETMON_UPLINK=0` | a Linux and a Windows client changing networks under an active exit, red first; `kill -9`, then a network change | M |
 | **P1a** | macOS exit client | `overlay_exit_node` unset; `ROOMLERD_EXIT_CLIENT_MACOS=0` | the macOS kernel tests in CI (a staged capture of TEST-NET-3); vmtest: a macOS client of a Linux exit | M |
@@ -754,7 +763,7 @@ one depends on it.
 | **D9** | S1 | **Decided (operator, 2026-10-13):** filed as #2081; P0a ships ahead of the rest of the FR |
 | **D10** | How a device says "not here" | **Decided (per recommendation, 2026-10-17):** `AgentCaps.unavailable`, a map of feature → `{code, reason}` beside the lists; the viewer shows the reason and hides only `not-applicable`; the lists still decide what works (§3.3a) |
 | **D11** | Ctrl+Alt+Del until P4a | **Decided (per recommendation, 2026-10-17):** Windows and Linux keep the button and say what the keys reach (Linux desktops bind the chord, so hiding it would take a working key away); macOS hides it. P4a's `SendSAS` brings an `input: sas` word |
-| **D12** | A netstack node's exit status | Measure whether its SOCKS5 front carries internet-bound literals through the exit before changing what `status` says (P0c-3) |
+| **D12** | A netstack node's exit status | **Decided (measured, 2026-10-17):** it is `active` for the SOCKS5 front's IPv4 dials and nothing else, so the status names the front instead of reading "never active" (the plan before the measurement, which would itself have been wrong). The DNS steer and the route offer follow from the same fact (P0c-3) |
 
 ## 7. Out of scope
 
@@ -822,3 +831,5 @@ one depends on it.
 | 2026-10-17 | the same candidate | the full AC5 cell, as for the P1b candidate: the exit + subnet router with its v6 uplink, a second throwaway Mac VM as the LAN host, a Linux exit client, a Linux subnet client, a Win11 exit client | **AC5's remaining clauses, on the fixed code.** 🟢 The anchor NATs v4 and v6 and passes the adapter, `routes=["<the LAN host>/32", "0.0.0.0/0"]`. The Linux exit client got v4 + v6 through the Mac, the subnet client reached the LAN host's SSH through it, and the Windows client was `active, v6 on, DNS steered` with the Mac's egress. The Mac forwarded ~2,450 v4 and 142 v6 packets. 🟢 **`kill -9`, no respawn:** pf and forwarding as a crash leaves them; the restart's purge flushed the anchor, released our reference and put forwarding back (`internet_sharing=false`), then served again. 🟢 **`kill -9` plus a reboot:** pf `Disabled`, forwarding 0/0, as found; the next start purged and served. 🟢 **A clean stop:** `pf NAT for the overlay reverted`, pf `Disabled`, forwarding 0/0, the ledger empty |
 | 2026-10-17 | the same candidate | the exit VM; macOS's Application Firewall (ALF) switched on, then stealth mode, then "block all incoming", then off again, 75 s each; a Linux exit client sampled every 5 s (egress, a ping to the exit's overlay address, its path) | **P1b's open note on ALF.** 🟢 Forwarded traffic is untouched: the client kept the Mac's egress through all three settings. ⚠️ **Stealth mode silences the Mac's own overlay address:** the client's ping to it failed from the moment stealth went on until ALF was off again. So a ping is no test of a Mac exit's health. ⚪ Not measured: ALF against an inbound DIRECT carrier. The exit VM sat behind the home NAT, and no direct carrier formed even with ALF off, so the path was the relay throughout |
 | 2026-10-17 | prod, read-only: `scripts/fr97-caps-census.sh 30` | every agent seen in the last 30 days and not removed: 24 Linux, 4 macOS, 41 Windows; none yet reports its architecture | **P0d, the count before P0c (AC15).** ⛔ `audio: opus` on **4 of 4** macOS agents, with no capture backend behind it (R1, §2.7). ⛔ `clipboard: events` + `images` on **24 of 24** Linux and **4 of 4** macOS agents, whose watchers never send image events (R8); clipboard `native` only on Windows. ⛔ `supports_clipboard` on every Linux agent. The census cannot tell a root daemon from a per-user one, so R10 is proven in the field, not by count. ⛔ No word governs Ctrl+Alt+Del: it is in no list, and the button shows for every host. Honest gaps, each with its phase: `apps` absent on macOS (P2c), `layout` only on Windows (P2d, P3e), `privacy-*` only on Windows (FR-99) |
+| 2026-10-17 | released 0.4.141 | mars: a throwaway Linux exit (a container with iptables, approved) and two netstack clients (no `/dev/net/tun`, no `NET_ADMIN`, `ROOMLERD_OVERLAY_NETSTACK_SOCKS=1080`), one with `overlay_exit_node` and one without | **D12 measured.** 🔴 No exit: a SOCKS5 connect to `1.1.1.1` times out. 🟢 With the exit: it completes; the exit's tcpdump shows the client's SYN from its overlay address on `roomler0`, and its MASQUERADE counts one new flow; a name curl resolves itself goes through too. A name handed to the front (`socks5h`) and an IPv6 literal are refused. Meanwhile `roomler status` said `active, v6 on, DNS NOT steered` for the whole host. The positive control (an HTTP listener on the exit's overlay address) answered in neither phase, a rig fault (`python3-minimal` has no `http.server`); the result rests on the tcpdump and NAT counts. A first take was void: a clean stop between its phases unenrolled the ephemeral client |
+| 2026-10-17 | released 0.4.141 | mars: one netstack node on a host where iptables works (`NET_ADMIN`, iptables), `overlay_exit_node_enabled = true`, never approved | 🔴 **It offers `/0`**: the server row says `can_be_exit_node: true`, `route_offer_withheld: null`, though its userspace stack forwards nothing, so every client of it would black-hole. P0c-3 withholds every route offer from a netstack node; the green check rides the release that carries it |

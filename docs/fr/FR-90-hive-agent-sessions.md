@@ -57,7 +57,7 @@ it.
 - **The gaps are measured, not guessed.** `RunAs` sets no working directory and only `TERM`
   (`agents/roomlerd/src/pty/unix.rs:148`); on Windows it reaches only the console user and will not
   ask for credentials (`agents/roomlerd/src/exec.rs:503-508`); a root daemon's LocalAPI socket is
-  `0600`, so a non-root process can't reach it (`crates/localapi/src/lib.rs:2953-2906`); tunnel SOCKS5
+  `0600`, so a non-root process can't reach it (`crates/localapi/src/lib.rs:2962-2915`); tunnel SOCKS5
   has no authentication (`crates/tunnel-core/src/socks5.rs:3`) and a daemon-originated flow is
   attributed to the device owner (`crates/tunnel-core/src/policy.rs:29-51`); `SplitTun` intercepts one
   port and SSH is its only caller (`crates/tunnel-core/src/overlay/split_tun.rs:92-126`); fleet exec
