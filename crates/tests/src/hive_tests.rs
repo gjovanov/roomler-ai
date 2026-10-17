@@ -12320,7 +12320,8 @@ async fn a_member_a_smaller_policy_lets_go_is_purged_at_once() {
 
 /// FR-90 P2g-4b — make-before-break: a member that leaves keeps its copy
 /// while the copies elsewhere fall short, and a device that took its place
-/// counts only once it has said where its copy ends. Then its purge goes.
+/// counts only once its copy holds as much as the leaving one's (P2k-2: not
+/// at the empty tip it says when it joins). Then its purge goes.
 #[tokio::test]
 async fn a_member_that_leaves_keeps_its_copy_until_min_holds_without_it() {
     let app = replicaset_app().await;
@@ -12355,6 +12356,19 @@ async fn a_member_that_leaves_keeps_its_copy_until_min_holds_without_it() {
     assert!(
         !device_hears(&mut l.m.ws, "rc:hive.purge", Duration::from_millis(500)).await,
         "a copy that has said nothing is not yet one"
+    );
+
+    // P2k-2 (F1) — it says it joined, at its floor, holding nothing yet: a
+    // device does so the moment it takes its copy. Still not one.
+    send(&mut l.n.ws, tip_at(&sid, 1, 0, "00")).await;
+    let n_id = l.n.agent_id.clone();
+    wait_stored(&app, &sid, "n's empty tip", |s| {
+        member_row(s, &n_id).contains_key("tip")
+    })
+    .await;
+    assert!(
+        !device_hears(&mut l.m.ws, "rc:hive.purge", Duration::from_millis(500)).await,
+        "a copy that holds less than m's is not yet one"
     );
 
     // It says where its copy ends: min holds, and m's purge goes.
@@ -12720,6 +12734,16 @@ async fn a_member_a_fork_is_never_started_on_lets_its_copy_go() {
     let (mut m, mut c) = joinable_with(&app, "forknever", TAKES_A_COPY_TO_FORK_AND_PURGES).await;
     let sid = m.sid.clone();
     fork_joined(&app, &mut m, &mut c, "/srv/forknever-c", false).await;
+    // b follows the primary to seq 9, as a member does: min holds without c
+    // only once b holds what c is about to (P2k-2).
+    send(&mut m.b.ws, tip_with_checkpoint(&sid, 9, 5)).await;
+    let b = m.b.agent_id.clone();
+    wait_stored(&app, &sid, "b's next tip", |s| {
+        member_row(s, &b)
+            .get_document("tip")
+            .is_ok_and(|t| t.get_i64("seq") == Ok(9))
+    })
+    .await;
 
     // Back as a build that starts no fork, where its copy catches up.
     let (token, machine, c_id) = (c.token.clone(), c.machine.clone(), c.agent_id.clone());
@@ -12826,6 +12850,16 @@ async fn a_member_a_fork_is_made_from_that_is_removed_is_let_go_at_once() {
     read_until(&mut c.ws, "rc:hive.start")
         .await
         .expect("the fork's start, once the copy caught up");
+    // b follows the primary to seq 9, as a member does: min holds without c
+    // only once b holds what c holds (P2k-2).
+    send(&mut m.b.ws, tip_with_checkpoint(&sid, 9, 5)).await;
+    let b = m.b.agent_id.clone();
+    wait_stored(&app, &sid, "b's next tip", |s| {
+        member_row(s, &b)
+            .get_document("tip")
+            .is_ok_and(|t| t.get_i64("seq") == Ok(9))
+    })
+    .await;
     let c_id = c.agent_id.clone();
     wait_stored(&app, &sid, "its row names the fork", |s| {
         member_row(s, &c_id).contains_key("forking")
