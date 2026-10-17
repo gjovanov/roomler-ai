@@ -612,7 +612,7 @@ flowchart LR
     way), and a clamped runtime would clock up every timer the daemon wakes for, with no session open.
   - Elsewhere it is a no-op. macOS (a QoS class) and Windows (power throttling) are P3, each to be measured on
     its own hardware first.
-- **Software paths target 60, paced to what they sustain** (P2). `SoftwarePace` (`encode/encode_pressure.rs:217`)
+- **Software paths target 60, paced to what they sustain** (P2). `SoftwarePace` (`encode/encode_pressure.rs:239`)
   runs FR-1's `FpsPace` over its own encode EWMA. It is its own EWMA so that `ROOMLERD_ENCODE_PRESSURE=0`, the
   hardware path's switch, cannot turn the software pace off as a side effect. The pace is never below 30
   (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:731`), so a host that cannot sustain 30 runs exactly as it did before.
@@ -622,6 +622,13 @@ flowchart LR
   - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:724`). On a host whose clock was
     never the limit, 60 frames cost twice the CPU of 30, and an attended desktop pays for it, so Windows and
     macOS opt in with `ROOMLERD_SW_FPS_60=1` until P3. `ROOMLERD_SW_FPS_60=0` gives back 30 everywhere.
+  - ⚠️ **A step up waits for headroom** (P2d, `SW_PACE_UP_MARGIN_FPS`, `encode/encode_pressure.rs:249`).
+    `FpsPace` was meant to hold an engaged pace until the estimate moved a full step, but it compared two 5-fps
+    steps, which always differ by one, so on 0.4.142 a pace on a step boundary moved every window the estimate
+    crossed it. The software pace steps down at once and up only when the encoder clears the higher step by
+    2.5 fps; `ROOMLERD_SW_PACE_UP_MARGIN=0` gives back 0.4.142's pace. A unit test replays the field trace that
+    found it, window for window. The hardware pace keeps margin 0 until it is measured on hardware
+    ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)).
 - **The bitrate base follows the rate the pump runs at**, by √(fps/30) (`bitrate_base_for_fps`,
   `encode/mod.rs:709`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
   measured.
