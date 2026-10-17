@@ -93,6 +93,12 @@ mod growth_digest_tests;
 /// (AC8), the weekly cohorts and the org views.
 #[cfg(test)]
 mod growth_funnel_tests;
+/// FR-102 P7 — the GitHub puller against a fake GitHub (the closed day's
+/// snapshot read once in its window, releases paged, drafts out, traffic
+/// only with a token, a refused token recorded rather than zeroed) and its
+/// readers (snapshots differenced, a gap read as null, never 0).
+#[cfg(test)]
+mod growth_github_tests;
 /// FR-102 P5 — the newsletter's delivery side: SendGrid's signed Event
 /// Webhook refusing what it cannot verify before parsing it, recording only
 /// the four events, suppressing a hard bounce at the next send (AC14's test
@@ -118,6 +124,12 @@ mod growth_quality_tests;
 /// backfill against a fake Stripe, and the quota-collision counter.
 #[cfg(test)]
 mod growth_revenue_tests;
+/// FR-102 P7 — the search pullers against fakes of Google, Bing and the
+/// blog's feed: only final Search Console days, the service account's
+/// token exchange, the weighted position, URL Inspection into
+/// `growth_content`, Bing at its own grain, every refusal recorded.
+#[cfg(test)]
+mod growth_search_tests;
 /// FR-102 P3b — the setup wizard's opt-in diagnostics (AC12's server half):
 /// a record stored with exactly its fields and nothing about the request,
 /// every invalid field refused with nothing stored, the kill switch's empty

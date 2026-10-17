@@ -25,6 +25,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/admin/growth/content",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/admin/growth/digest",
       "methods": "GET,HEAD"
     },
@@ -1466,6 +1470,16 @@
               "fired_at": 1
             },
             "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "growth_content",
+        "indexes": [
+          {
+            "key": {
+              "published_at": -1
+            }
           }
         ]
       },
@@ -3406,6 +3420,16 @@
               "fired_at": 1
             },
             "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "growth_content",
+        "indexes": [
+          {
+            "key": {
+              "published_at": -1
+            }
           }
         ]
       },
