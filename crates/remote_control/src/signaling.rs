@@ -3541,10 +3541,10 @@ pub enum ServerMsg {
     /// repository: never the person's working tree. What is deleted is this
     /// device's own record of the session, never this frame's word. The
     /// device keeps the session's id and refuses any join, start or event for
-    /// it afterwards. Answered [`ClientMsg::HivePurgeAck`], per part;
-    /// idempotent by `purge_id`, so a re-send after a failed part retries it.
-    /// Pushed only to a connection advertising
-    /// [`crate::models::RpcCap::HivePurge`].
+    /// it afterwards, unless `leaving` says this was its copy alone.
+    /// Answered [`ClientMsg::HivePurgeAck`], per part; idempotent by
+    /// `purge_id`, so a re-send after a failed part retries it. Pushed only
+    /// to a connection advertising [`crate::models::RpcCap::HivePurge`].
     ///
     /// ⚠️ Metadata only, and the field set is locked by test.
     #[serde(rename = "rc:hive.purge")]
@@ -3553,6 +3553,14 @@ pub enum ServerMsg {
         purge_id: ObjectId,
         #[serde(with = "oid_hex")]
         session_id: ObjectId,
+        /// FR-90 P2k-3 — this device's copy alone, as a member that leaves
+        /// (P2g-4b): purged as any purge is, but its removal is not final
+        /// there, so placement may choose the device again and a teleport may
+        /// land on it. Absent on a whole session's purge, so that wire is as
+        /// before; a device before P2k-3 ignores the word and keeps every
+        /// removal final, as it did.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        leaving: bool,
     },
 
     /// FR-90 P2g-4a — this device's enrollment is being removed from the
@@ -5510,11 +5518,40 @@ mod tests {
         let order = ServerMsg::HivePurge {
             purge_id: purge,
             session_id: sid,
+            leaving: false,
         };
         assert_eq!(
             serde_json::to_value(&order).unwrap(),
             serde_json::json!({"t": "rc:hive.purge", "purge_id": purge.to_hex(),
-                               "session_id": sid.to_hex()})
+                               "session_id": sid.to_hex()}),
+            "a whole session's purge: the wire as before"
+        );
+        // P2k-3 — a leaving member's copy alone says so; a frame without the
+        // word, from a server before it, is a whole session's.
+        let leaving = ServerMsg::HivePurge {
+            purge_id: purge,
+            session_id: sid,
+            leaving: true,
+        };
+        let v = serde_json::to_value(&leaving).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"t": "rc:hive.purge", "purge_id": purge.to_hex(),
+                               "session_id": sid.to_hex(), "leaving": true})
+        );
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(v).unwrap(),
+            ServerMsg::HivePurge { purge_id, session_id, leaving: true }
+                if purge_id == purge && session_id == sid
+        ));
+        assert!(
+            matches!(
+                serde_json::from_value::<ServerMsg>(serde_json::json!({"t": "rc:hive.purge",
+                    "purge_id": purge.to_hex(), "session_id": sid.to_hex()}))
+                .unwrap(),
+                ServerMsg::HivePurge { leaving: false, .. }
+            ),
+            "no word: a whole session's purge, final"
         );
         // P2g-4a — a removal's purge of everything: an id, nothing else.
         assert_eq!(

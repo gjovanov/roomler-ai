@@ -1284,6 +1284,20 @@ impl Store {
     /// A blob goes with the last session that holds it; one another session
     /// holds too stays.
     pub fn purge(&mut self, session: &str) -> Result<u64, StoreError> {
+        self.purge_with(session, true)
+    }
+
+    /// FR-90 P2k-3 — delete this store's copy of `session` as a member that
+    /// leaves it (P2g-4b): everything [`Self::purge`] deletes, the account's
+    /// part owed the same way, but nothing kept of its id. A later join of
+    /// it starts a copy from nothing, as of a session never held here: the
+    /// session goes on elsewhere, and placement may choose this device again.
+    /// A session already purged for good here stays so.
+    pub fn purge_copy(&mut self, session: &str) -> Result<u64, StoreError> {
+        self.purge_with(session, false)
+    }
+
+    fn purge_with(&mut self, session: &str, keep_id: bool) -> Result<u64, StoreError> {
         let tx = self.conn.transaction()?;
         let n = tx.execute("DELETE FROM events WHERE session = ?1", params![session])?;
         let set_aside = tx.execute("DELETE FROM divergent WHERE session = ?1", params![session])?;
@@ -1327,10 +1341,12 @@ impl Store {
         // FR-90 P2g-3d — the word that kept the copy goes with it.
         tx.execute("DELETE FROM retains WHERE session = ?1", params![session])?;
         // The first purge's time is kept; a repeated one changes nothing.
-        tx.execute(
-            "INSERT INTO purged (session, purged_ms) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
-            params![session, now_ms()],
-        )?;
+        if keep_id {
+            tx.execute(
+                "INSERT INTO purged (session, purged_ms) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+                params![session, now_ms()],
+            )?;
+        }
         tx.commit()?;
         Ok((n + set_aside) as u64)
     }
@@ -2061,6 +2077,46 @@ mod tests {
         assert!(s.page("s1", 0, 10).unwrap().is_empty());
         assert!(s.sessions().unwrap().is_empty());
         assert_eq!(s.floor("s1").unwrap(), None);
+    }
+
+    /// FR-90 P2k-3 — a leaving member's copy, purged: everything the session
+    /// held goes as with a purge, but not its id, so the same stream from the
+    /// start is taken again as a copy from nothing. A session purged for good
+    /// stays so, whatever a copy's purge says after.
+    #[test]
+    fn a_leaving_members_copy_goes_whole_and_may_be_taken_again() {
+        let mut s = Store::open_in_memory().unwrap();
+        let envs = sent("s1", None, 1, &["one", "two", "three"]);
+        apply_all(&mut s, &envs[..2]);
+        s.raise_floor("s1", 2).unwrap();
+        s.put_blob("s1", b"s1 alone").unwrap();
+        assert_eq!(s.purge_copy("s1").unwrap(), 2, "its two events");
+        assert!(!s.is_purged("s1").unwrap(), "no id kept: not gone for good");
+        assert!(!s.holds("s1").unwrap(), "nothing of it held");
+        for table in ["events", "tips", "floors", "blob_refs"] {
+            assert_eq!(
+                count(
+                    &s,
+                    &format!("SELECT count(*) FROM {table} WHERE session = 's1'")
+                ),
+                0,
+                "{table}"
+            );
+        }
+
+        apply_all(&mut s, &envs);
+        assert_eq!(
+            s.tip("s1").unwrap().map(|t| t.seq),
+            Some(3),
+            "taken again, whole"
+        );
+
+        s.purge("s1").unwrap();
+        s.purge_copy("s1").unwrap();
+        assert!(
+            s.is_purged("s1").unwrap(),
+            "a removal that was final stays final"
+        );
     }
 
     #[test]

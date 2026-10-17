@@ -255,7 +255,7 @@ impl Supervisor {
                 let _serial = self.start_lock.lock().await;
                 // Under the lock, so a purge that just took it is seen.
                 if self.holds_here(session).await {
-                    Some(self.purge_parts(session).await)
+                    Some(self.purge_parts(session, true).await)
                 } else {
                     None
                 }

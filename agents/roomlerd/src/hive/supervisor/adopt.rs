@@ -1914,7 +1914,7 @@ mod tests {
 
         let ack = {
             let _serial = r.sup.start_lock.lock().await;
-            r.sup.purge(ObjectId::new(), sid).await
+            r.sup.purge(ObjectId::new(), sid, false).await
         };
         assert!(
             matches!(

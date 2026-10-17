@@ -839,6 +839,8 @@ async fn send(state: &HiveState, p: &HivePurge, device: ObjectId) -> Sent {
     let msg = ServerMsg::HivePurge {
         purge_id: p.id,
         session_id: p.session_id,
+        // P2k-3 — a leaving member's purge is of its copy alone.
+        leaving: p.member.is_some(),
     };
     match state.fleet.rc_hub.push_hive_purge(device, p.tenant_id, msg) {
         Ok(()) => {
@@ -876,6 +878,8 @@ async fn tell_other_pods(state: &HiveState, p: &HivePurge, devices: &[ObjectId])
             "purge_id": p.id.to_hex(),
             "session_id": p.session_id.to_hex(),
             "agent_ids": agent_ids,
+            // P2k-3 — so the pod that holds the socket says it too.
+            "leaving": p.member.is_some(),
         }),
     )
     .await;
