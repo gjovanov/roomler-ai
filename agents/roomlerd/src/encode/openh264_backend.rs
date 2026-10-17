@@ -41,8 +41,8 @@ use tokio::sync::oneshot;
 // changing it on a live Encoder requires the C-API SetOption with
 // ENCODER_OPTION_BITRATE + an SBitrateInfo struct.
 use openh264_sys2::{
-    ENCODER_OPTION_BITRATE, ENCODER_OPTION_FRAME_RATE, ENCODER_OPTION_MAX_BITRATE, SBitrateInfo,
-    SPATIAL_LAYER_0,
+    ENCODER_OPTION_BITRATE, ENCODER_OPTION_FRAME_RATE, ENCODER_OPTION_IDR_INTERVAL,
+    ENCODER_OPTION_MAX_BITRATE, SBitrateInfo, SPATIAL_LAYER_0,
 };
 
 use super::{EncodedPacket, VideoEncoder};
@@ -51,6 +51,12 @@ use crate::capture::{Frame, PixelFormat};
 use super::initial_bitrate_for;
 
 const TARGET_FPS: u32 = 30;
+
+/// The live profile's keyframe floor: an IDR about every two seconds,
+/// whatever the frame rate (60 frames at 30 fps, 120 at 60). FR-112 P2b keeps
+/// it in seconds when the pump's rate changes: a period left at 60 frames
+/// would double the keyframes at 60 fps, each a big frame on the link.
+const IDR_EVERY_S: u32 = 2;
 
 /// FR-85 — the recording profile's rate target: ~0.2 bits per pixel per
 /// frame, floored at 4 Mbps and capped at 40 Mbps. Quality mode treats it as
@@ -84,19 +90,25 @@ impl Openh264Encoder {
     /// (dock/undock) the caller must rebuild this encoder.
     pub fn new(width: u32, height: u32) -> Result<Self> {
         let bitrate_bps = initial_bitrate_for(width, height);
-        Self::spawn(width, height, "roomlerd-encoder", move || {
-            tracing::info!(bitrate_bps, width, height, "openh264 encoder init");
-            EncoderConfig::new()
-                .bitrate(BitRate::from_bps(bitrate_bps))
-                .max_frame_rate(FrameRate::from_hz(TARGET_FPS as f32))
-                // Force an IDR every 60 frames (≈2 s @ 30 fps).
-                // Without a bounded IDR interval, openh264 can go
-                // 300+ frames between keyframes on a static
-                // desktop; a single lost packet then freezes the
-                // decoder for ~10 s. 60 gives <2 s recovery floor
-                // even if the RTCP-PLI round-trip drops.
-                .intra_frame_period(IntraFramePeriod::from_num_frames(60))
-        })
+        Self::spawn(
+            width,
+            height,
+            "roomlerd-encoder",
+            Some(IDR_EVERY_S),
+            move || {
+                tracing::info!(bitrate_bps, width, height, "openh264 encoder init");
+                EncoderConfig::new()
+                    .bitrate(BitRate::from_bps(bitrate_bps))
+                    .max_frame_rate(FrameRate::from_hz(TARGET_FPS as f32))
+                    // Force an IDR every 60 frames (≈2 s @ 30 fps).
+                    // Without a bounded IDR interval, openh264 can go
+                    // 300+ frames between keyframes on a static
+                    // desktop; a single lost packet then freezes the
+                    // decoder for ~10 s. 60 gives <2 s recovery floor
+                    // even if the RTCP-PLI round-trip drops.
+                    .intra_frame_period(IntraFramePeriod::from_num_frames(TARGET_FPS * IDR_EVERY_S))
+            },
+        )
     }
 
     /// FR-85 — the RECORDING profile. What differs from the live one, and why:
@@ -115,7 +127,9 @@ impl Openh264Encoder {
         let fps = fps.clamp(1, 60);
         let bitrate_bps = recording_bitrate_for(width, height, fps);
         let gop = gop_frames.max(1);
-        Self::spawn(width, height, "roomlerd-rec-encoder", move || {
+        // `None`: the recording's GOP is its own (fragment boundaries), and no
+        // frame-rate change moves it.
+        Self::spawn(width, height, "roomlerd-rec-encoder", None, move || {
             tracing::info!(
                 bitrate_bps,
                 width,
@@ -137,10 +151,13 @@ impl Openh264Encoder {
         })
     }
 
+    /// `idr_every_s`: the keyframe floor in seconds, which a frame-rate change
+    /// keeps (FR-112 P2b); `None` leaves the configured period alone.
     fn spawn(
         width: u32,
         height: u32,
         thread_name: &str,
+        idr_every_s: Option<u32>,
         make_config: impl FnOnce() -> EncoderConfig + Send + 'static,
     ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<Cmd>();
@@ -169,7 +186,7 @@ impl Openh264Encoder {
                         return;
                     }
                 };
-                run_worker(&mut enc, width, height, cmd_rx);
+                run_worker(&mut enc, width, height, idr_every_s, cmd_rx);
             })
             .context("spawning encoder thread")?;
 
@@ -334,15 +351,50 @@ fn set_bitrate_now(enc: &mut Encoder, bps: u32) {
     }
 }
 
-fn set_frame_rate_now(enc: &mut Encoder, fps: u32) {
-    if let Err(e) = apply_runtime_frame_rate(enc, fps) {
-        tracing::warn!(fps, %e, "openh264 set_frame_rate failed");
+/// FR-112 P2b — the keyframe period in frames (`ENCODER_OPTION_IDR_INTERVAL`,
+/// an int; OpenH264 takes it at runtime).
+fn apply_runtime_idr_interval(enc: &mut Encoder, frames: u32) -> Result<()> {
+    let mut period = frames.min(i32::MAX as u32) as i32;
+    // SAFETY: as `apply_runtime_frame_rate` — an `int*` that lives for the
+    // call, on an initialised encoder.
+    let rc = unsafe {
+        enc.raw_api().set_option(
+            ENCODER_OPTION_IDR_INTERVAL,
+            (&raw mut period) as *mut std::ffi::c_void,
+        )
+    };
+    if rc == 0 {
+        Ok(())
     } else {
-        tracing::info!(fps, "openh264 frame rate applied (FR-112)");
+        Err(anyhow!(
+            "openh264 SetOption(ENCODER_OPTION_IDR_INTERVAL, {frames}) returned {rc}"
+        ))
     }
 }
 
-fn run_worker(enc: &mut Encoder, width: u32, height: u32, cmd_rx: std_mpsc::Receiver<Cmd>) {
+/// The frame rate, and with it the keyframe period that keeps `idr_every_s`
+/// (when the profile has one).
+fn set_frame_rate_now(enc: &mut Encoder, fps: u32, idr_every_s: Option<u32>) {
+    if let Err(e) = apply_runtime_frame_rate(enc, fps) {
+        tracing::warn!(fps, %e, "openh264 set_frame_rate failed");
+        return;
+    }
+    let idr_frames = idr_every_s.map(|s| fps.max(1) * s);
+    if let Some(frames) = idr_frames
+        && let Err(e) = apply_runtime_idr_interval(enc, frames)
+    {
+        tracing::warn!(fps, frames, %e, "openh264 keyframe period not moved");
+    }
+    tracing::info!(fps, idr_frames, "openh264 frame rate applied (FR-112)");
+}
+
+fn run_worker(
+    enc: &mut Encoder,
+    width: u32,
+    height: u32,
+    idr_every_s: Option<u32>,
+    cmd_rx: std_mpsc::Receiver<Cmd>,
+) {
     let mut settings = Settings::default();
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
@@ -354,7 +406,7 @@ fn run_worker(enc: &mut Encoder, width: u32, height: u32, cmd_rx: std_mpsc::Rece
                         set_bitrate_now(enc, bps);
                     }
                     if let Some(fps) = fps {
-                        set_frame_rate_now(enc, fps);
+                        set_frame_rate_now(enc, fps, idr_every_s);
                     }
                 }
                 let _ = reply.send(result);
@@ -369,7 +421,7 @@ fn run_worker(enc: &mut Encoder, width: u32, height: u32, cmd_rx: std_mpsc::Rece
             }
             Cmd::SetFrameRate(fps) => {
                 if let Some(fps) = settings.frame_rate(fps) {
-                    set_frame_rate_now(enc, fps);
+                    set_frame_rate_now(enc, fps, idr_every_s);
                 }
             }
             Cmd::Shutdown => break,
@@ -658,6 +710,16 @@ mod tests {
             )
         };
         assert_eq!((rc, rate), (0, 60.0));
+        apply_runtime_idr_interval(&mut enc, 120).expect("the keyframe period taken");
+        let mut period = 0i32;
+        // SAFETY: an `int*` that lives for the call; the encoder is initialised.
+        let rc = unsafe {
+            enc.raw_api().get_option(
+                ENCODER_OPTION_IDR_INTERVAL,
+                (&raw mut period) as *mut std::ffi::c_void,
+            )
+        };
+        assert_eq!((rc, period), (0, 120));
         apply_runtime_bitrate(&mut enc, 2_000_000).expect("raised past the construction max");
         assert_eq!(
             read_bitrate_option(&mut enc, ENCODER_OPTION_BITRATE),
@@ -692,6 +754,37 @@ mod tests {
         assert_eq!(s.frame_rate(45), Some(45));
         let mut s = Settings::default();
         assert_eq!(s.went_live(), (None, None), "nothing held, nothing applied");
+    }
+
+    /// FR-112 P2b — at 60 fps the live encoder still cuts a keyframe about every
+    /// two seconds: 120 frames apart, not the 60 that were two seconds at 30.
+    #[tokio::test]
+    async fn the_keyframe_period_keeps_its_seconds_at_60_fps() {
+        let mut enc = Openh264Encoder::new(64, 64).expect("encoder");
+        enc.set_frame_rate(60);
+        let mut keyframes = Vec::new();
+        for i in 0..130u32 {
+            // A small step a frame: no scene change for the encoder to answer.
+            let shade = i as u8;
+            let out = enc
+                .encode(std::sync::Arc::new(make_bgra_frame(
+                    64,
+                    64,
+                    shade,
+                    255 - shade,
+                    shade / 2,
+                )))
+                .await
+                .expect("encode");
+            if out.iter().any(|p| p.is_keyframe) {
+                keyframes.push(i);
+            }
+        }
+        assert_eq!(
+            keyframes,
+            vec![0, 120],
+            "one at the start, the next two seconds of 60 fps later"
+        );
     }
 
     /// FR-112 P2b — through the worker: a frame rate and a bitrate sent before
