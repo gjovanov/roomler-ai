@@ -488,7 +488,12 @@ impl Module for FleetState {
                 pre_ops: Vec::new(),
                 indexes: vec![
                     index(bson::doc! { "tenant_id": 1, "agent_id": 1, "crashed_at_unix": -1 }),
-                    index_ttl(bson::doc! { "reported_at": 1 }, 90 * 24 * 60 * 60),
+                    // FR-102 decision 15 (operator, 2026-10-17): 30 days, as the
+                    // privacy policy's §7 says. A report names the device's hostname
+                    // and carries a log tail. Every reader fits inside it: the
+                    // digest's 28-day window, the nightly per-day freeze, the
+                    // per-device list of the last 50.
+                    index_ttl(bson::doc! { "reported_at": 1 }, 30 * 24 * 60 * 60),
                 ],
             },
             IndexSet {
