@@ -172,17 +172,34 @@ pub struct PinRecord {
 
 /// FR-97 P1b — one pf serve on a Mac: our anchor, every reference token we took
 /// with `pfctl -E`, and whether forwarding was off before we turned it on. The
-/// purge flushes the anchor, releases the tokens (pf goes back to disabled if
-/// nothing else holds it), and puts forwarding back unless Internet Sharing runs.
+/// purge flushes the anchor, releases the references that are still ours (pf
+/// goes back to disabled if nothing else holds it), and puts forwarding back
+/// unless Internet Sharing runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PfRecord {
     pub anchor: String,
+    /// The token values alone: all a 0.4.141 daemon reads, after a rollback.
     #[serde(default)]
     pub tokens: Vec<u64>,
+    /// The same references, each with the pid of the `pfctl` that took it.
+    #[serde(default)]
+    pub refs: Vec<PfToken>,
     #[serde(default)]
     pub v4_was_off: bool,
     #[serde(default)]
     pub v6_was_off: bool,
+}
+
+/// FR-97 P1b — a pf reference a serve took: the `pfctl -E` token, and the pid
+/// of that `pfctl`, which `pfctl -s References` lists beside it. A value alone
+/// does not identify a reference. The kernel hands a freed token's value
+/// straight back to the next taker (field, FR-97 §8), so after another
+/// program's `pfctl -d` that program can hold OUR old value, and only the pid
+/// tells the two apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PfToken {
+    pub token: u64,
+    pub pid: u32,
 }
 
 /// What this daemon changed on the host and has not yet undone; persisted,
@@ -683,6 +700,10 @@ mod tests {
             pf: vec![PfRecord {
                 anchor: "com.apple/roomler-utun4".into(),
                 tokens: vec![13889181449326457865],
+                refs: vec![PfToken {
+                    token: 13889181449326457865,
+                    pid: 674,
+                }],
                 v4_was_off: true,
                 v6_was_off: false,
             }],
@@ -714,6 +735,20 @@ mod tests {
             serde_json::from_str("{\"pf\":[{\"anchor\":\"com.apple/roomler-utun4\"}]}").unwrap();
         assert_eq!(bare.pf[0].tokens, Vec::<u64>::new());
         assert!(!bare.pf[0].v4_was_off && !bare.pf[0].v6_was_off);
+        // One a 0.4.141 daemon wrote: token values, no pids.
+        let v141: HostLedger = serde_json::from_str(
+            "{\"pf\":[{\"anchor\":\"com.apple/roomler-utun4\",\"tokens\":[7],\"v4_was_off\":true,\"v6_was_off\":false}]}",
+        )
+        .unwrap();
+        assert_eq!(v141.pf[0].tokens, vec![7]);
+        assert!(v141.pf[0].refs.is_empty());
+        // And a 0.4.141 daemon, after a rollback, still finds the values it
+        // knows in what this one writes.
+        let written = serde_json::to_value(&l).unwrap();
+        assert_eq!(
+            written["pf"][0]["tokens"],
+            serde_json::json!([13889181449326457865u64])
+        );
     }
 
     /// FR-97 P0b-2c — only an instance named like ours is ever removed, and

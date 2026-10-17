@@ -20,15 +20,30 @@
 //!   (every one is ifscoped), and a forwarded packet then has no route: v6 is
 //!   served only where an unscoped default exists.
 //!
+//! And after it, beside Internet Sharing (driven through vmnet's shared mode, the
+//! NAT behind a Mac's VMs) and other users of pf (§8, 2026-10-17):
+//! - a token's value is a hash of its kernel allocation's address, and a freed
+//!   one comes straight back: after another program's `pfctl -d` freed every
+//!   reference, the next `pfctl -E` got our old value 20 times out of 20. So a
+//!   reference is released only while `pfctl -s References` still lists it
+//!   with the pid of the `pfctl` that took it ([`still_ours`]);
+//! - Internet Sharing holds its own reference (through `pfd`) and keeps its
+//!   rules in `com.apple.internet-sharing`, so our stop leaves its NAT running;
+//!   but when its last share stops it switches forwarding OFF, a serving exit's
+//!   included, so the re-assert switches it back on;
+//! - the InternetSharing process outlives its last share (by 40 s to a minute
+//!   here), so "Internet Sharing is NATing" is read from its anchor's rules, not
+//!   from the process.
+//!
 //! The anchor holds one `nat` per egress interface (Linux's MASQUERADE has no
 //! `-o` either), never onto another VPN's utun, and a `pass` for the overlay
 //! adapter. Forwarding (`net.inet.ip.forwarding`, and the v6 one when v6 is
-//! served) is turned on and put back as found, unless Internet Sharing runs:
-//! it needs forwarding too, and AC5 says it keeps working.
+//! served) is turned on and put back as found, unless Internet Sharing is
+//! NATing: it needs forwarding too, and AC5 says it keeps working.
 //!
 //! A crash skips every `Drop`, so each serve is recorded in the host ledger
-//! (anchor, tokens, what forwarding was) and [`purge`] undoes it at boot and
-//! after every exit of the daemon.
+//! (anchor, references, what forwarding was) and [`purge`] undoes it at boot
+//! and after every exit of the daemon.
 
 #[allow(unused_imports)]
 use tracing::{info, warn};
@@ -165,6 +180,80 @@ pub(crate) fn parse_token(output: &str) -> Option<u64> {
     })
 }
 
+/// One row of `pfctl -s References`: a reference that keeps pf enabled.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StarterRef {
+    pub(crate) pid: u32,
+    pub(crate) name: String,
+    pub(crate) token: u64,
+}
+
+/// `pfctl -s References` as macOS prints it (field, FR-97 §8):
+///
+/// ```text
+/// TOKENS:
+/// PID      Process Name                 TOKEN                    TIMESTAMP
+/// 674      pfctl                        5506544203745733392      0 days 00:00:00
+/// ```
+///
+/// or `No pf starter references held`. `None` for anything else, a row that
+/// does not parse included, so a caller can tell "none held" from "could not
+/// read them". A row starts with its pid; any other line is one of pfctl's
+/// notices (`No ALTQ support in kernel`), which follow the table once its
+/// stderr is joined after its stdout. A process name may hold spaces; the
+/// timestamp is the last three fields.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn parse_references(output: &str) -> Option<Vec<StarterRef>> {
+    let mut rows = Vec::new();
+    let mut header = false;
+    for l in output.lines().map(str::trim) {
+        if l.starts_with("No pf starter references held") {
+            return Some(Vec::new());
+        }
+        if l.starts_with("PID") && l.contains("TOKEN") {
+            header = true;
+            continue;
+        }
+        if !header || !l.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+        }
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let n = f.len();
+        if n < 6 || !f[n - 1].contains(':') || !f[n - 2].starts_with("day") {
+            return None;
+        }
+        let (Ok(pid), Ok(token)) = (f[0].parse(), f[n - 4].parse()) else {
+            return None;
+        };
+        rows.push(StarterRef {
+            pid,
+            name: f[1..n - 4].join(" "),
+            token,
+        });
+    }
+    header.then_some(rows)
+}
+
+/// Whether the reference we took as `token` is still ours. The kernel derives
+/// a token's value from its allocation's address and hands a freed one
+/// straight back: after another program's `pfctl -d` freed every reference,
+/// the next `pfctl -E` got our old value 20 times out of 20 (field, FR-97 §8).
+/// Release by value alone, and our stop would drop THAT program's reference,
+/// and pf with it if it was the last. So a token is ours only while the kernel
+/// lists it with the pid of the `pfctl -E` that took it. One recorded without a
+/// pid (a ledger a 0.4.141 daemon wrote) is accepted only from a `pfctl`.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn still_ours(token: u64, pid: Option<u32>, listed: &[StarterRef]) -> bool {
+    listed.iter().any(|r| {
+        r.token == token
+            && match pid {
+                Some(p) => r.pid == p,
+                None => r.name == "pfctl",
+            }
+    })
+}
+
 /// The anchor's text: per egress interface a `nat` for the overlay's IPv4
 /// blocks, and one for its v6 ULA where v6 is served and the interface has a
 /// stable address (a global one first, else a ULA); then a `pass` for the
@@ -209,23 +298,34 @@ pub(crate) fn render(
 #[cfg(target_os = "macos")]
 mod host {
     use super::{
-        ANCHOR_PREFIX, Ipv6Addr, anchor_for, egress, has_unscoped_v6_default, is_ifname,
-        is_our_anchor, nat66_source, parse_token, render,
+        Ipv6Addr, StarterRef, anchor_for, egress, has_unscoped_v6_default, is_ifname,
+        is_our_anchor, nat66_source, parse_references, parse_token, render, still_ours,
     };
-    use crate::overlay::host_ledger::PfRecord;
+    use crate::overlay::host_ledger::{PfRecord, PfToken};
     use std::sync::{Arc, Mutex};
     use tracing::{info, warn};
 
     const PFCTL: &str = "/sbin/pfctl";
     const FWD4: &str = "net.inet.ip.forwarding";
     const FWD6: &str = "net.inet6.ip6.forwarding";
-    /// How often a serving Mac re-checks its anchor and pf: another program's
-    /// `pfctl -F all` or `-d`, or an interface that came or went.
+    /// Internet Sharing's rules live here and in the anchors below it.
+    const IS_ANCHOR: &str = "com.apple.internet-sharing";
+    /// How often a serving Mac re-checks its anchor, its pf reference and
+    /// forwarding: another program's `pfctl -F all` or `-d`, Internet Sharing
+    /// switching forwarding off as its last share stops, or an interface that
+    /// came or went.
     const REASSERT: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// Run `pfctl`, `stdin` piped in; `(exit 0, stdout + stderr)`. pfctl
     /// prints its token and most notices on stderr.
     fn pfctl(args: &[&str], stdin: Option<&str>) -> (bool, String) {
+        let (ok, out, _) = pfctl_as(args, stdin);
+        (ok, out)
+    }
+
+    /// [`pfctl`], and the pid it ran as: what `pfctl -s References` lists
+    /// beside a token that `pfctl -E` took.
+    fn pfctl_as(args: &[&str], stdin: Option<&str>) -> (bool, String, u32) {
         use std::io::Write as _;
         use std::process::{Command, Stdio};
         let child = Command::new(PFCTL)
@@ -239,8 +339,9 @@ mod host {
             .stderr(Stdio::piped())
             .spawn();
         let Ok(mut child) = child else {
-            return (false, format!("{PFCTL} could not start"));
+            return (false, format!("{PFCTL} could not start"), 0);
         };
+        let pid = child.id();
         if let (Some(text), Some(mut w)) = (stdin, child.stdin.take()) {
             let _ = w.write_all(text.as_bytes());
         }
@@ -248,9 +349,9 @@ mod host {
             Ok(o) => {
                 let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
                 s.push_str(&String::from_utf8_lossy(&o.stderr));
-                (o.status.success(), s)
+                (o.status.success(), s, pid)
             }
-            Err(e) => (false, e.to_string()),
+            Err(e) => (false, e.to_string(), pid),
         }
     }
 
@@ -270,10 +371,29 @@ mod host {
         run("/usr/sbin/sysctl", &["-w", &kv]).is_some()
     }
 
-    /// Internet Sharing turns forwarding on for itself; switching it off under
-    /// it would cut the Macs and phones it serves.
-    fn internet_sharing_running() -> bool {
-        run("/usr/bin/pgrep", &["-x", "InternetSharing"]).is_some()
+    /// Whether Internet Sharing is NATing now: the share System Settings turns
+    /// on, or vmnet's shared mode, the NAT behind every VM on a Mac in NAT
+    /// mode. Either turns forwarding on for itself, and switching it off under
+    /// it would cut whatever it serves. Its rules live in [`IS_ANCHOR`] and the
+    /// anchors below it. The InternetSharing process says nothing: it outlives
+    /// the last share by 40 s to a minute (field, FR-97 §8, 2026-10-17).
+    fn internet_sharing_nats() -> bool {
+        pf_enabled()
+            && pfctl(&["-v", "-s", "Anchors"], None)
+                .1
+                .lines()
+                .map(str::trim)
+                .filter(|a| {
+                    *a == IS_ANCHOR
+                        || a.strip_prefix(IS_ANCHOR)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+                .any(|a| {
+                    pfctl(&["-a", a, "-s", "nat"], None)
+                        .1
+                        .lines()
+                        .any(|l| l.trim_start().starts_with("nat on "))
+                })
     }
 
     fn pf_enabled() -> bool {
@@ -340,12 +460,46 @@ mod host {
         let _ = pfctl(&["-a", anchor, "-F", "all"], None);
     }
 
-    fn enable() -> Option<u64> {
-        parse_token(&pfctl(&["-E"], None).1)
+    /// `pfctl -E`: a reference of our own on pf, enabling pf if it was off.
+    fn take() -> Option<PfToken> {
+        let (_, out, pid) = pfctl_as(&["-E"], None);
+        parse_token(&out).map(|token| PfToken { token, pid })
     }
 
     fn release(token: u64) {
         let _ = pfctl(&["-X", &token.to_string()], None);
+    }
+
+    /// The references pf holds; `None` if they could not be read.
+    fn references() -> Option<Vec<StarterRef>> {
+        parse_references(&pfctl(&["-s", "References"], None).1)
+    }
+
+    /// Release those of `ours` that pf still lists as ours ([`still_ours`]),
+    /// and nothing else. If the list cannot be read, release none: a
+    /// reference left held only keeps pf enabled, while one released in error
+    /// can switch pf off under whoever enabled it.
+    fn release_ours(ours: &[(u64, Option<u32>)]) {
+        if ours.is_empty() {
+            return;
+        }
+        let Some(listed) = references() else {
+            warn!(
+                "overlay: could not read pf's references (pfctl -s References) — keeping ours rather than risk releasing another program's"
+            );
+            return;
+        };
+        for &(token, pid) in ours {
+            if still_ours(token, pid, &listed) {
+                release(token);
+            } else {
+                info!(
+                    token,
+                    ?pid,
+                    "overlay: a pf reference of ours is gone (another program's pfctl -d freed it) — not releasing a value pf may have handed to someone else"
+                );
+            }
+        }
     }
 
     fn first_line(s: &str) -> String {
@@ -419,15 +573,18 @@ mod host {
     /// task does not stop a blocking closure already running, which would
     /// otherwise load the anchor again, or take a token, after `stop`.
     struct Live {
+        overlay_if: String,
+        v4: Vec<String>,
         rules: String,
-        tokens: Vec<u64>,
+        tokens: Vec<PfToken>,
         stopped: bool,
     }
 
     fn record(anchor: &str, live: &Live, v4_restore: bool, v6_restore: bool) {
         crate::overlay::host_ledger::record_pf(PfRecord {
             anchor: anchor.to_string(),
-            tokens: live.tokens.clone(),
+            tokens: live.tokens.iter().map(|t| t.token).collect(),
+            refs: live.tokens.clone(),
             v4_was_off: v4_restore,
             v6_was_off: v6_restore,
         });
@@ -468,11 +625,13 @@ mod host {
                 ok = false;
             }
             let mut live = Live {
+                overlay_if,
+                v4,
                 rules,
                 tokens: Vec::new(),
                 stopped: false,
             };
-            match enable() {
+            match take() {
                 Some(t) => live.tokens.push(t),
                 None => {
                     warn!("overlay: pfctl -E returned no token; pf may not be enabled");
@@ -481,21 +640,14 @@ mod host {
             }
             record(&anchor, &live, v4_restore, v6_restore);
             info!(%anchor, rules = %live.rules.trim().replace('\n', " | "), "overlay: pf NAT for the overlay loaded");
-            (ok, anchor, serve_v6, live, v4)
+            (ok, anchor, serve_v6, live)
         })
         .await;
-        let Ok((ok, anchor, serve_v6, live, v4)) = started else {
+        let Ok((ok, anchor, serve_v6, live)) = started else {
             return (false, None);
         };
-        let overlay_if = anchor.trim_start_matches(ANCHOR_PREFIX).to_string();
         let live = Arc::new(Mutex::new(live));
-        let task = tokio::spawn(reassert(
-            anchor.clone(),
-            overlay_if,
-            v4,
-            serve_v6,
-            live.clone(),
-        ));
+        let task = tokio::spawn(reassert(anchor.clone(), serve_v6, live.clone()));
         (
             ok,
             Some(Serve {
@@ -507,50 +659,112 @@ mod host {
         )
     }
 
-    /// Keep the anchor and pf as served: another program may flush all rules
-    /// or disable pf, and an interface may come or go (a re-render follows
-    /// the new set). Logs only what it changes.
-    async fn reassert(
-        anchor: String,
-        overlay_if: String,
-        v4: Vec<String>,
-        v6: bool,
-        live: Arc<Mutex<Live>>,
-    ) {
+    /// Keep the serve as served, every [`REASSERT`]. See [`reassert_once`].
+    async fn reassert(anchor: String, v6: bool, live: Arc<Mutex<Live>>) {
         loop {
             tokio::time::sleep(REASSERT).await;
             let anchor = anchor.clone();
-            let overlay_if = overlay_if.clone();
-            let v4 = v4.clone();
             let live = live.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let mut l = live.lock().unwrap_or_else(|e| e.into_inner());
-                if l.stopped {
-                    return;
+            let _ = tokio::task::spawn_blocking(move || reassert_once(&anchor, v6, &live)).await;
+        }
+    }
+
+    /// One re-assert. Another program may flush all rules, disable pf, or
+    /// switch forwarding off (Internet Sharing does, as its last share stops,
+    /// under a serving exit too: field, FR-97 §8, 2026-10-17); an interface
+    /// may come or go (a re-render follows the new set). Logs only what it
+    /// changes.
+    fn reassert_once(anchor: &str, v6: bool, live: &Mutex<Live>) {
+        let mut l = live.lock().unwrap_or_else(|e| e.into_inner());
+        if l.stopped {
+            return;
+        }
+        let rules = render(&l.overlay_if, &current_egress(), &l.v4, v6);
+        let present = pfctl(&["-a", anchor, "-s", "nat"], None)
+            .1
+            .contains("nat on ");
+        if rules != l.rules || !present {
+            match load(anchor, &rules) {
+                Ok(()) => {
+                    info!(%anchor, flushed = !present, rules = %rules.trim().replace('\n', " | "), "overlay: pf anchor re-asserted")
                 }
-                let rules = render(&overlay_if, &current_egress(), &v4, v6);
-                let present = pfctl(&["-a", &anchor, "-s", "nat"], None).1.contains("nat on ");
-                if rules != l.rules || !present {
-                    match load(&anchor, &rules) {
-                        Ok(()) => info!(%anchor, flushed = !present, rules = %rules.trim().replace('\n', " | "), "overlay: pf anchor re-asserted"),
-                        Err(e) => warn!(%anchor, err = %e, "overlay: pf anchor re-assert failed"),
-                    }
-                    l.rules = rules;
-                }
-                if !pf_enabled() && let Some(t) = enable() {
-                    warn!("overlay: pf was disabled under a serving exit — enabled it again");
+                Err(e) => warn!(%anchor, err = %e, "overlay: pf anchor re-assert failed"),
+            }
+            l.rules = rules;
+        }
+        // Our reference. Another program's `pfctl -d` frees every one, ours
+        // with it, and pf may hand our value to whoever takes the next: keep
+        // only what pf still lists as ours, and always hold one.
+        let mut changed = false;
+        let was_disabled = !pf_enabled();
+        if was_disabled {
+            changed |= !l.tokens.is_empty();
+            l.tokens.clear();
+        } else if let Some(listed) = references() {
+            let before = l.tokens.len();
+            l.tokens
+                .retain(|t| still_ours(t.token, Some(t.pid), &listed));
+            changed |= l.tokens.len() != before;
+        }
+        if l.tokens.is_empty() {
+            match take() {
+                Some(t) => {
                     l.tokens.push(t);
-                    let f = FWD.lock().unwrap_or_else(|e| e.into_inner());
-                    record(&anchor, &l, f.v4_restore, v6 && f.v6_restore);
+                    changed = true;
+                    if was_disabled {
+                        warn!("overlay: pf was disabled under a serving exit — enabled it again");
+                    } else {
+                        warn!(
+                            "overlay: another program dropped our pf reference (its pfctl -d) — took a new one"
+                        );
+                    }
                 }
-            })
-            .await;
+                None => warn!("overlay: pfctl -E returned no token; pf may not stay enabled"),
+            }
+        }
+        // Forwarding. Whoever switched it off wanted it off, so from now on
+        // our stop puts it back off too.
+        let mut f = FWD.lock().unwrap_or_else(|e| e.into_inner());
+        if sysctl_on(FWD4) == Some(false) && sysctl_set(FWD4, true) {
+            warn!(
+                "overlay: IPv4 forwarding was switched off under a serving exit — switched it back on"
+            );
+            f.v4_restore = true;
+            changed = true;
+        }
+        if v6 && sysctl_on(FWD6) == Some(false) && sysctl_set(FWD6, true) {
+            warn!(
+                "overlay: IPv6 forwarding was switched off under a serving exit — switched it back on"
+            );
+            f.v6_restore = true;
+            changed = true;
+        }
+        if changed {
+            record(anchor, &l, f.v4_restore, v6 && f.v6_restore);
         }
     }
 
     impl Serve {
-        /// Flush the anchor, release every token we took (never `pfctl -d`),
-        /// and put forwarding back as found once the last holder stops.
+        /// Run one re-assert now, as the task does every [`REASSERT`].
+        #[cfg(test)]
+        pub(crate) fn reassert_now(&self) {
+            reassert_once(&self.anchor, self.v6, &self.live);
+        }
+
+        /// Our recorded references now carry the value `token`, their pid
+        /// kept: the state pf leaves whenever it hands our freed value to
+        /// another program, made certain for a test.
+        #[cfg(test)]
+        pub(crate) fn pretend_ours_is(&self, token: u64) {
+            let mut l = self.live.lock().unwrap_or_else(|e| e.into_inner());
+            for t in &mut l.tokens {
+                t.token = token;
+            }
+        }
+
+        /// Flush the anchor, release the references that are still ours
+        /// (never `pfctl -d`), and put forwarding back as found once the last
+        /// holder stops.
         pub(crate) fn stop(mut self) {
             if let Some(t) = self.task.take() {
                 t.abort();
@@ -560,11 +774,13 @@ mod host {
             let mut l = self.live.lock().unwrap_or_else(|e| e.into_inner());
             l.stopped = true;
             flush(&self.anchor);
-            for t in std::mem::take(&mut l.tokens) {
-                release(t);
-            }
+            let ours: Vec<(u64, Option<u32>)> = std::mem::take(&mut l.tokens)
+                .into_iter()
+                .map(|t| (t.token, Some(t.pid)))
+                .collect();
+            release_ours(&ours);
             drop(l);
-            let sharing = internet_sharing_running();
+            let sharing = internet_sharing_nats();
             let mut f = FWD.lock().unwrap_or_else(|e| e.into_inner());
             f.v4_holders = f.v4_holders.saturating_sub(1);
             if f.v4_holders == 0 && f.v4_restore && !sharing {
@@ -590,13 +806,20 @@ mod host {
         if ours.is_empty() {
             return;
         }
-        let sharing = internet_sharing_running();
+        let mut held: Vec<(u64, Option<u32>)> = Vec::new();
         for r in &ours {
             flush(&r.anchor);
-            for t in &r.tokens {
-                release(*t);
-            }
+            held.extend(r.refs.iter().map(|t| (t.token, Some(t.pid))));
+            // A ledger a 0.4.141 daemon wrote has token values only.
+            held.extend(
+                r.tokens
+                    .iter()
+                    .filter(|v| !r.refs.iter().any(|t| t.token == **v))
+                    .map(|v| (*v, None)),
+            );
         }
+        release_ours(&held);
+        let sharing = internet_sharing_nats();
         if !sharing {
             if ours.iter().any(|r| r.v4_was_off) && sysctl_on(FWD4) == Some(true) {
                 sysctl_set(FWD4, false);
@@ -676,13 +899,13 @@ mod tests {
         let ifc = "en7: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
                    \tinet6 fe80::1448:e811:8eee:e167%en7 prefixlen 64 secured scopeid 0x20\n\
                    \tinet6 fd00:ac4::2 prefixlen 64\n\
-                   \tinet6 2a01:5a8:51b:fb6b:1c2a:3b4c:5d6e:7f80 prefixlen 64 autoconf temporary\n\
-                   \tinet6 2a01:5a8:51b:fb6b:aaaa:bbbb:cccc:dddd prefixlen 64 autoconf secured\n\
+                   \tinet6 2001:db8:51b:fb6b:1c2a:3b4c:5d6e:7f80 prefixlen 64 autoconf temporary\n\
+                   \tinet6 2001:db8:51b:fb6b:aaaa:bbbb:cccc:dddd prefixlen 64 autoconf secured\n\
                    \tinet 172.20.10.2 netmask 0xfffffff0 broadcast 172.20.10.15\n";
         // the global wins over a ULA listed before it; the temporary never counts
         assert_eq!(
             nat66_source(ifc),
-            Some("2a01:5a8:51b:fb6b:aaaa:bbbb:cccc:dddd".parse().unwrap())
+            Some("2001:db8:51b:fb6b:aaaa:bbbb:cccc:dddd".parse().unwrap())
         );
         // a ULA where the uplink has nothing else (v6 NATed upstream)
         assert_eq!(
@@ -726,16 +949,108 @@ mod tests {
         assert_eq!(parse_token("pfctl: /dev/pf: Permission denied\n"), None);
     }
 
+    /// `pfctl -s References` as a macOS VM printed it (FR-97 §8, 2026-10-17):
+    /// our `pfctl -E` and Internet Sharing's `pfd`.
+    const REFS: &str = "No ALTQ support in kernel\n\
+                        ALTQ related functions disabled\n\
+                        TOKENS:\n\
+                        PID      Process Name                 TOKEN                    TIMESTAMP\n\
+                        751      pfctl                        5506544203745733392      0 days 00:00:00\n\
+                        672      pfd                          15547325524921387773     0 days 00:00:07\n";
+
+    #[test]
+    fn pf_references_are_read_with_the_pid_and_name_that_took_each() {
+        let refs = parse_references(REFS).expect("the listing parses");
+        assert_eq!(
+            refs,
+            vec![
+                StarterRef {
+                    pid: 751,
+                    name: "pfctl".into(),
+                    token: 5506544203745733392
+                },
+                StarterRef {
+                    pid: 672,
+                    name: "pfd".into(),
+                    token: 15547325524921387773
+                },
+            ]
+        );
+        assert_eq!(
+            parse_references(
+                "No ALTQ support in kernel\nALTQ related functions disabled\nNo pf starter references held\n"
+            ),
+            Some(vec![])
+        );
+        // As the daemon reads it: stdout (the table), THEN stderr (the
+        // notices). Read as notices, not as rows that fail to parse: the first
+        // cut returned None here, so a stop kept our reference and pf stayed
+        // on (CI's macOS kernel test, 2026-10-17).
+        let joined = "TOKENS:\n\
+                      PID      Process Name                 TOKEN                    TIMESTAMP\n\
+                      751      pfctl                        5506544203745733392      0 days 00:00:00\n\
+                      No ALTQ support in kernel\n\
+                      ALTQ related functions disabled\n";
+        assert_eq!(
+            parse_references(joined).map(|r| r.len()),
+            Some(1),
+            "the notices after the table are not rows"
+        );
+        assert_eq!(
+            parse_references(
+                "No pf starter references held\nNo ALTQ support in kernel\nALTQ related functions disabled\n"
+            ),
+            Some(vec![])
+        );
+        // A name with a space, and a token held for days.
+        let r = parse_references(
+            "TOKENS:\nPID      Process Name                 TOKEN                    TIMESTAMP\n\
+             901      Some VPN Helper              42                       3 days 04:05:06\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            (r[0].pid, r[0].name.as_str(), r[0].token),
+            (901, "Some VPN Helper", 42)
+        );
+        // Anything else is "could not read them", never "none held".
+        for unknown in [
+            "",
+            "pfctl: /dev/pf: Permission denied\n",
+            "TOKENS:\nPID      Process Name                 TOKEN                    TIMESTAMP\n\
+             751      pfctl                        notanumber               0 days 00:00:00\n",
+            "TOKENS:\nPID      Process Name                 TOKEN\n751      pfctl     7\n",
+        ] {
+            assert_eq!(parse_references(unknown), None, "{unknown:?}");
+        }
+    }
+
+    #[test]
+    fn a_reference_is_ours_only_while_pf_lists_it_with_our_pid() {
+        let refs = parse_references(REFS).unwrap();
+        assert!(still_ours(5506544203745733392, Some(751), &refs));
+        // The value came back to another program after its `pfctl -d`: the
+        // same token, another pid. Releasing it would drop THEIR reference.
+        assert!(!still_ours(5506544203745733392, Some(750), &refs));
+        assert!(!still_ours(15547325524921387773, Some(751), &refs));
+        // Freed and not handed out again.
+        assert!(!still_ours(7, Some(751), &refs));
+        assert!(!still_ours(7, None, &refs));
+        // A 0.4.141 ledger's value has no pid: only a `pfctl`'s is ours.
+        assert!(still_ours(5506544203745733392, None, &refs));
+        assert!(!still_ours(15547325524921387773, None, &refs));
+        assert!(!still_ours(5506544203745733392, Some(751), &[]));
+    }
+
     #[test]
     fn the_anchor_nats_every_egress_and_passes_the_overlay_adapter() {
-        let v6: Ipv6Addr = "2a01:5a8:51b:fb6b:aaaa:bbbb:cccc:dddd".parse().unwrap();
+        let v6: Ipv6Addr = "2001:db8:51b:fb6b:aaaa:bbbb:cccc:dddd".parse().unwrap();
         let eg = vec![("en0".to_string(), None), ("en7".to_string(), Some(v6))];
         let one = render("utun4", &eg, &["100.65.20.0/24".into()], true);
         assert_eq!(
             one,
             "nat on en0 inet from 100.65.20.0/24 to any -> (en0)\n\
              nat on en7 inet from 100.65.20.0/24 to any -> (en7)\n\
-             nat on en7 inet6 from fd72:6f6f:6d6c::/96 to any -> 2a01:5a8:51b:fb6b:aaaa:bbbb:cccc:dddd\n\
+             nat on en7 inet6 from fd72:6f6f:6d6c::/96 to any -> 2001:db8:51b:fb6b:aaaa:bbbb:cccc:dddd\n\
              pass quick on utun4 all keep state\n"
         );
         // v6 not served: no inet6 rule even where an address exists
@@ -836,9 +1151,118 @@ mod macos_kernel_tests {
             anchor_nat(&anchor)
         );
         assert_eq!(fwd4(), "1", "forwarding on while serving");
+        // Read as the daemon reads it (stdout, then stderr).
+        let listed = pfctl(&["-s", "References"]);
+        eprintln!("pf references while serving:\n{listed}");
+        let refs = super::parse_references(&listed).expect("pf's references parse");
+        assert_eq!(
+            refs.iter().filter(|r| r.name == "pfctl").count(),
+            1,
+            "one reference of ours: {refs:?}"
+        );
         serve.stop();
         assert_eq!(anchor_nat(&anchor).trim(), "", "our anchor is empty again");
         assert_eq!(pf_status(), status0, "pf back as found");
         assert_eq!(fwd4(), fwd0, "forwarding back as found");
+    }
+
+    /// `pfctl` as "another program" would run it; stdout + stderr.
+    fn pfctl(args: &[&str]) -> String {
+        let o = std::process::Command::new("/sbin/pfctl")
+            .args(args)
+            .output()
+            .expect("pfctl");
+        let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+        s.push_str(&String::from_utf8_lossy(&o.stderr));
+        s
+    }
+
+    fn set_fwd4(on: bool) {
+        let kv = if on {
+            "net.inet.ip.forwarding=1"
+        } else {
+            "net.inet.ip.forwarding=0"
+        };
+        let _ = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-w", kv])
+            .output();
+    }
+
+    /// These two play "another program" with `pfctl -d`, which frees every
+    /// reference on the box: only where nothing else holds pf.
+    fn pf_idle() -> bool {
+        let idle = pf_status() == "Disabled";
+        if !idle {
+            eprintln!("pf is in use on this runner; skipping a test that runs pfctl -d");
+        }
+        idle
+    }
+
+    /// Another program's `pfctl -d` frees our reference, and its next
+    /// `pfctl -E` may get our old value back (20 times out of 20 on a macOS
+    /// VM, FR-97 §8). Our stop must leave THAT reference alone, and pf on.
+    #[tokio::test]
+    async fn another_programs_reference_with_our_old_value_is_never_released() {
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").is_err() || !pf_idle() {
+            return;
+        }
+        let (status0, fwd0) = (pf_status(), fwd4());
+        let (_, serve) = super::serve("utun198", &["100.64.0.0/10".to_string()]).await;
+        let serve = serve.expect("a serve to stop");
+        let ours = super::parse_references(&pfctl(&["-s", "References"])).expect("listed");
+        pfctl(&["-d"]);
+        let theirs = super::parse_token(&pfctl(&["-E"])).expect("their token");
+        eprintln!(
+            "their pfctl -E got our old value back: {}",
+            ours.iter().any(|r| r.token == theirs)
+        );
+        // Whether or not the kernel recycled it this time, make the collision
+        // certain: our record holds their value, our pid. Released by value,
+        // as #2362 did, their reference goes and pf with it.
+        serve.pretend_ours_is(theirs);
+        serve.stop();
+        assert_eq!(pf_status(), "Enabled", "their reference still holds pf on");
+        pfctl(&["-X", &theirs.to_string()]);
+        assert_eq!(pf_status(), status0, "pf back as found once they let go");
+        assert_eq!(fwd4(), fwd0, "forwarding back as found");
+    }
+
+    /// Internet Sharing switches forwarding off as its last share stops, a
+    /// serving exit's included (FR-97 §8), and another program may run
+    /// `pfctl -d`. One re-assert puts both back with ONE reference of ours;
+    /// the stop then leaves forwarding off, as the program that switched it
+    /// off wanted it.
+    #[tokio::test]
+    async fn forwarding_and_pf_switched_off_under_a_serve_come_back() {
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").is_err() || !pf_idle() {
+            return;
+        }
+        let (status0, fwd0) = (pf_status(), fwd4());
+        let anchor = super::anchor_for("utun197");
+        let (_, serve) = super::serve("utun197", &["100.64.0.0/10".to_string()]).await;
+        let serve = serve.expect("a serve to stop");
+        set_fwd4(false);
+        pfctl(&["-d"]);
+        serve.reassert_now();
+        assert_eq!(fwd4(), "1", "forwarding switched back on");
+        assert_eq!(pf_status(), "Enabled", "pf enabled again");
+        assert!(
+            anchor_nat(&anchor).contains("nat on "),
+            "our anchor still NATs"
+        );
+        let refs = super::parse_references(&pfctl(&["-s", "References"])).expect("listed");
+        assert_eq!(
+            refs.iter().filter(|r| r.name == "pfctl").count(),
+            1,
+            "exactly one reference of ours: {refs:?}"
+        );
+        serve.stop();
+        assert_eq!(pf_status(), status0, "pf back as found");
+        assert_eq!(
+            fwd4(),
+            "0",
+            "forwarding left off, as whoever switched it off left it"
+        );
+        set_fwd4(fwd0 == "1");
     }
 }

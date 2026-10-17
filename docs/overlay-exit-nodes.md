@@ -481,14 +481,17 @@ sequenceDiagram
     R->>P: serve(utunN, the overlay's blocks)
     P->>K: forwarding on (what it was is recorded)
     P->>K: pfctl -a com.apple/roomler-utunN -f - (a nat per egress, pass utunN)
-    P->>K: pfctl -E
+    P->>K: pfctl -E (a pfctl with pid M)
     K-->>P: Token : N
-    P->>L: anchor, tokens, what forwarding was
+    P->>L: anchor, references (N, M), what forwarding was
     loop every 30 s
-        P->>K: re-assert: flushed by someone? pf disabled? interfaces changed?
+        P->>K: re-assert: flushed? pf disabled? our reference freed? forwarding off? interfaces changed?
     end
     R->>P: stop (the guard's Drop)
-    P->>K: flush the anchor, pfctl -X each token, forwarding back
+    P->>K: flush the anchor
+    P->>K: pfctl -s References
+    K-->>P: N held by pid M? then it is still ours
+    P->>K: pfctl -X N (only if so), forwarding back
     P->>L: forget
 ```
 
@@ -496,10 +499,25 @@ sequenceDiagram
 |---|---|
 | Our own anchor | `/etc/pf.conf` stays untouched: a fresh boot loads the stock ruleset with pf **disabled**, and it references `com.apple/*` |
 | `pfctl -E`, then `-X <token>` | a reference token: releasing ours turns pf off only if nothing else holds it. Never `pfctl -d`, which would turn it off under Internet Sharing or a VPN client |
+| A reference is ours only by **value and pid** | the kernel derives a token's value from its allocation's address and hands a freed one straight back. After another program's `pfctl -d` freed every reference, its next `pfctl -E` got our old value 20 times out of 20 (FR-97 §8). Released by value alone, our stop would drop **its** reference, and pf with it. So the stop and the boot purge release a token only while `pfctl -s References` lists it with the pid of the `pfctl` that took it; if the list cannot be read, they release nothing, since a reference left held only keeps pf on. The re-assert drops references pf no longer lists as ours and always holds one |
 | A `nat` per egress | every `en*` interface with an IPv4 address, plus a default route's interface that is not a tunnel, because Linux's MASQUERADE has no `-o` either. Never another VPN's utun: NAT onto it would hand every peer a path into whatever that VPN reaches |
 | v6 | `nat … inet6 … -> <stable global address>`: for `inet6`, `(if)` round-robins over every address of the interface, link-local included. Served only where an unscoped v6 default exists; elsewhere a client's v6 stays fail-closed at the exit |
-| Forwarding | `net.inet.ip.forwarding` (and the v6 one) is turned on, and put back as found by the last org guard to stop, unless Internet Sharing is running: it needs forwarding too |
-| The ledger | a crash skips `Drop`, so the boot purge flushes the anchor, releases the tokens and puts forwarding back |
+| Forwarding | `net.inet.ip.forwarding` (and the v6 one) is turned on, and put back as found by the last org guard to stop, unless Internet Sharing is NATing: it needs forwarding too. The re-assert switches it back on if another program switched it off, and the stop then leaves it off, as that program wanted |
+| The ledger | a crash skips `Drop`, so the boot purge flushes the anchor, releases the references that are still ours and puts forwarding back |
+
+> 🔑 **Internet Sharing is one more user of pf and forwarding**, and not only
+> when someone shares a connection: the same `InternetSharing` daemon is the
+> NAT behind vmnet's shared mode, i.e. behind every VM on a Mac in NAT mode.
+> Measured on a macOS VM with a vmnet client behind it (FR-97 §8, 2026-10-17):
+> - It holds its own pf reference, through `pfd`, and keeps its rules in
+>   `com.apple.internet-sharing/*`, so our stop and our purge leave its NAT
+>   running.
+> - **When its last share stops it switches forwarding OFF**, under a serving
+>   exit too. Before the re-assert covered forwarding, a Mac exit stopped
+>   forwarding the moment its last NAT-mode VM shut down.
+> - The process outlives its last share, by 40 s to a minute here, so
+>   "Internet Sharing is NATing" is read from its anchor's `nat` rules, not
+>   from `pgrep`.
 
 > ⚠️ **Root only.** `pfctl` needs root, so a per-user daemon's probe refuses
 > and the Mac offers nothing, with the reason in `roomler status` and the admin
@@ -507,7 +525,8 @@ sequenceDiagram
 
 > ⚠️ **Still unmeasured:** what the common corporate VPN clients do to pf, and
 > the Application Firewall's stealth mode on forwarded flows (FR-97 §3.5). The
-> re-assert loop restores our anchor after a `pfctl -F all`, and pf after a `-d`.
+> re-assert loop restores our anchor after a `pfctl -F all`, pf and our
+> reference after a `-d`, and forwarding after anyone switches it off.
 
 ## Caveats & gotchas
 
