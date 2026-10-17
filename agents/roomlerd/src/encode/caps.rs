@@ -637,9 +637,14 @@ pub(crate) struct HostFacts {
     pub(crate) os: roomler_ai_remote_control::models::OsKind,
     /// The `audio` feature is compiled in.
     pub(crate) audio_built: bool,
-    /// A system-audio capture backend exists on this OS: cpal loopback on
-    /// Linux and Windows; macOS has only the no-op that streams silence
-    /// (`audio::open_default`) until FR-97 P2a.
+    /// This host can capture the computer's own sound:
+    ///
+    /// - Windows: always (WASAPI loopback).
+    /// - Linux: only when the host's owner named a capture device
+    ///   (`ROOMLERD_AUDIO_SOURCE`). FR-97 P3c: cpal sees no sound server's
+    ///   sources, and the default input it fell back to is a microphone
+    ///   (`crate::audio_source`).
+    /// - macOS: never, until FR-97 P2a.
     pub(crate) audio_backend: bool,
     /// The clipboard watcher reports copied images: Windows only
     /// (`clipboard::install_watcher` drops image events elsewhere).
@@ -660,7 +665,8 @@ impl HostFacts {
                 OsKind::Linux
             },
             audio_built: cfg!(feature = "audio"),
-            audio_backend: cfg!(any(target_os = "linux", target_os = "windows")),
+            audio_backend: cfg!(target_os = "windows")
+                || (cfg!(target_os = "linux") && crate::audio_source::named().is_some()),
             watches_clipboard_images: cfg!(target_os = "windows"),
             clipboard_reachable: clipboard_reachable(),
         }
@@ -696,13 +702,18 @@ pub(crate) fn with_honest_words(mut caps: AgentCaps, facts: &HostFacts) -> Agent
     if facts.audio_built && !facts.audio_backend {
         // Without a backend the session would carry a silent track (R1).
         caps.audio.clear();
-        caps.unavailable.insert(
-            "audio".into(),
-            Unavailable::new(
+        let why = match facts.os {
+            // FR-97 P3c-1 — before it, this track carried the microphone.
+            OsKind::Linux => Unavailable::new(
+                "no-monitor",
+                "This host sends no sound: a session carries what the computer plays, never its microphone, and this Linux agent cannot capture the computer's sound until a capture device is named for it (ROOMLERD_AUDIO_SOURCE)",
+            ),
+            OsKind::Windows | OsKind::Macos => Unavailable::new(
                 "no-backend",
                 "System-audio capture is not implemented on this OS yet, so this host sends no sound",
             ),
-        );
+        };
+        caps.unavailable.insert("audio".into(), why);
     }
     if !facts.clipboard_reachable && (caps.supports_clipboard || !caps.clipboard.is_empty()) {
         caps.supports_clipboard = false;
@@ -1469,10 +1480,10 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
     // whether to set `audio_enabled` in `rc:session.request`; an empty
     // list means the agent won't add an audio track at all. Mirrors the
     // vp9-444 pattern (advertise a capability only when the code path
-    // that fulfils it is actually built). No runtime probe: unlike the
-    // video HW encoders, a failed audio-device open degrades to silence
-    // (NoopAudioCapture) rather than a black/broken track, so it's safe
-    // to advertise on feature presence alone.
+    // that fulfils it is actually built). No runtime probe: a failed
+    // audio-device open leaves the track silent and tells the controller
+    // why (`rc:audio-unavailable`, FR-97 P3c-1). What the OS cannot
+    // capture at all is taken out by `with_honest_words` (FR-97 P0c).
     #[allow(unused_mut)]
     let mut audio: Vec<String> = Vec::new();
     #[cfg(feature = "audio")]
@@ -2522,9 +2533,27 @@ mod tests {
             mac.audio
         );
         assert_eq!(mac.unavailable["audio"].code, "no-backend");
+        // A Linux host with a capture device named for it.
         let linux = with_honest_words(p0c_caps(), &p0c_facts(OsKind::Linux));
         assert_eq!(linux.audio, vec!["opus".to_string()]);
         assert!(!linux.unavailable.contains_key("audio"));
+        // FR-97 P3c-1 — and without one: no track, rather than the microphone
+        // every Linux session carried before (measured 2026-10-17).
+        let unnamed = with_honest_words(
+            p0c_caps(),
+            &HostFacts {
+                audio_backend: false,
+                ..p0c_facts(OsKind::Linux)
+            },
+        );
+        assert!(unnamed.audio.is_empty(), "{:?}", unnamed.audio);
+        assert_eq!(unnamed.unavailable["audio"].code, "no-monitor");
+        assert!(
+            unnamed.unavailable["audio"]
+                .reason
+                .contains("ROOMLERD_AUDIO_SOURCE"),
+            "the reason names the setting that fixes it"
+        );
         // A build without the feature had nothing to claim, and says nothing.
         let none = with_honest_words(
             AgentCaps {
@@ -2623,7 +2652,14 @@ mod tests {
     #[test]
     fn this_hosts_facts_follow_its_os() {
         let f = HostFacts::here();
-        assert_eq!(f.audio_backend, !cfg!(target_os = "macos"));
+        if cfg!(target_os = "windows") {
+            assert!(f.audio_backend, "WASAPI loopback");
+        } else if cfg!(target_os = "linux") {
+            // FR-97 P3c-1: only a named capture device is the computer's sound.
+            assert_eq!(f.audio_backend, crate::audio_source::named().is_some());
+        } else {
+            assert!(!f.audio_backend, "macOS until FR-97 P2a");
+        }
         assert_eq!(f.watches_clipboard_images, cfg!(target_os = "windows"));
     }
 

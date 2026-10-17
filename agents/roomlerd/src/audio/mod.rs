@@ -10,14 +10,19 @@
 //! Opus packets → `TrackLocalStaticSample::write_sample`.
 //!
 //! Capture backend ([`open_default`]):
-//!   * **Linux** — PulseAudio *monitor* source (the loopback of the
-//!     default sink), via cpal. Under WSLg `PULSE_SERVER` must point at
-//!     `/mnt/wslg/PulseServer` — see `virtual_desktop.rs`.
+//!   * **Linux** — the ALSA capture device the host's owner names in
+//!     `ROOMLERD_AUDIO_SOURCE`, or one named as a monitor, via cpal; otherwise
+//!     none, and the controller is told why. ⚠️ Never the default input,
+//!     which is the microphone (FR-97 P3c, [`crate::audio_source`]).
 //!   * **Windows** — WASAPI loopback: cpal opens the default OUTPUT
 //!     device with `build_input_stream` (cpal 0.15 special-cases an
 //!     output device driven as an input into a loopback capture).
-//!   * **macOS / everything else** — [`NoopAudioCapture`] (real
-//!     ScreenCaptureKit system-audio is a later phase).
+//!   * **macOS / everything else** — none (ScreenCaptureKit system audio
+//!     is FR-97 P2a). The hello offers no track there, so no session asks.
+//!
+//! A capture that cannot open says why: the pump sends the reason to the
+//! controller as `rc:audio-unavailable` (`peer.rs`) instead of a silent
+//! track nobody can explain.
 //!
 //! The whole module is gated behind `#[cfg(feature = "audio")]` at the
 //! `lib.rs` `pub mod audio;` site, so default / signalling-only builds
@@ -53,10 +58,11 @@ pub trait AudioCapture: Send {
     async fn next_frame(&mut self) -> anyhow::Result<Option<AudioFrame>>;
 }
 
-/// Capture backend that never produces audio. Used on macOS (until
-/// ScreenCaptureKit lands) and as the fallback when the cpal backend
-/// fails to open a device. `next_frame` parks so the pump task idles
-/// cheaply instead of busy-looping on `Ok(None)`.
+/// Capture backend that never produces audio: the recorder's stand-in for a
+/// source it has nothing to open for (its synthetic-test microphone).
+/// `next_frame` parks so a pump idles cheaply instead of busy-looping on
+/// `Ok(None)`. The live path no longer falls back to it: a capture that does
+/// not open is a reason sent to the controller (FR-97 P3c-1).
 pub struct NoopAudioCapture;
 
 #[async_trait]
@@ -71,28 +77,28 @@ impl AudioCapture for NoopAudioCapture {
     }
 }
 
-/// Open the best available system-audio capture for this platform.
-/// Never fails: on any backend error (or on macOS / unsupported
-/// targets) it logs and returns a [`NoopAudioCapture`] so the audio
-/// pump degrades to silence rather than tearing down the session.
-pub fn open_default() -> Box<dyn AudioCapture> {
+/// Open this platform's system-audio capture for a live session: the
+/// loopback / monitor source only, never a microphone (FR-97 P3c).
+///
+/// On failure, the reason, which the audio pump sends to the controller.
+/// Before P3c-1 this returned a [`NoopAudioCapture`] and kept the reason in
+/// the log, so the session carried a silent track nobody could explain.
+pub fn open_default() -> Result<Box<dyn AudioCapture>, crate::audio_source::AudioUnavailable> {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         match cpal_backend::CpalLoopbackCapture::open() {
             Ok(cap) => {
                 tracing::info!("audio: opened cpal loopback capture");
-                return Box::new(cap);
+                Ok(Box::new(cap))
             }
-            Err(e) => {
-                tracing::warn!(%e, "audio: cpal loopback capture failed to open — falling back to silence");
-            }
+            Err(e) => Err(crate::audio_source::AudioUnavailable::from_error(&e)),
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        tracing::info!(
-            "audio: no system-audio capture backend on this platform (macOS ScreenCaptureKit is a later phase) — using silent capture"
-        );
+        Err(crate::audio_source::AudioUnavailable::new(
+            crate::audio_source::AudioUnavailableCode::NotSupported,
+            "no system-audio capture backend on this OS (macOS ScreenCaptureKit audio is FR-97 P2a)",
+        ))
     }
-    Box::new(NoopAudioCapture)
 }
