@@ -163,14 +163,61 @@ pub enum TouchPhase {
 pub const MOUSE_REL_ENV: &str = "ROOMLERD_INPUT_MOUSE_REL";
 
 /// FR-109 — does this agent advertise `mouse-rel` in `AgentCaps.input`?
-/// Only where its injector carries relative motion, and not when the kill
-/// switch is set. P1 is Windows: the user worker and SystemContext both
-/// inject through the same enigo `dispatch` (`SendInput` relative). Linux
-/// and macOS come with P2 (uinput's relative device, the portal, macOS
-/// deltas), so until then they never receive the frame.
+/// Only where the injector a session opens now carries relative motion, and
+/// not when the kill switch is set. On Windows the user worker and
+/// SystemContext both inject through the same enigo `dispatch` (`SendInput`
+/// relative). On Linux it is enigo on a real X11 display (P2a,
+/// [`linux_xtest_carries_rel`]). uinput's relative device, the portal and
+/// macOS come later in P2, so until then those never receive the frame.
 pub fn advertises_mouse_rel() -> bool {
-    cfg!(all(target_os = "windows", feature = "enigo-input"))
-        && !mouse_rel_switched_off(std::env::var(MOUSE_REL_ENV).ok().as_deref())
+    !mouse_rel_switched_off(std::env::var(MOUSE_REL_ENV).ok().as_deref()) && injector_carries_rel()
+}
+
+#[cfg(all(target_os = "windows", feature = "enigo-input"))]
+fn injector_carries_rel() -> bool {
+    true
+}
+
+/// The cached desktop brief is at most a minute old, and the heartbeat
+/// re-announces the caps when it changes, so a login to Wayland takes the
+/// word back.
+#[cfg(all(target_os = "linux", feature = "enigo-input"))]
+fn injector_carries_rel() -> bool {
+    #[cfg(feature = "uinput-input")]
+    let uinput = uinput_backend::env_enabled();
+    #[cfg(not(feature = "uinput-input"))]
+    let uinput = false;
+    #[cfg(feature = "drm-capture")]
+    let system_capture = crate::capture::seat_guard::live();
+    #[cfg(not(feature = "drm-capture"))]
+    let system_capture = false;
+    linux_xtest_carries_rel(uinput, system_capture, crate::desktop_brief::current().as_ref())
+}
+
+#[cfg(not(all(any(target_os = "windows", target_os = "linux"), feature = "enigo-input")))]
+fn injector_carries_rel() -> bool {
+    false
+}
+
+/// FR-109 P2a — on Linux, whether the injector a session opens now is enigo
+/// on a real X11 display, whose `Coordinate::Rel` is XTest relative motion:
+/// an XI2 raw reader sees it 1:1 (spec §8 row 4). Mirrors
+/// [`open_default`]'s order:
+/// - uinput opted in (`ROOMLERD_UINPUT=1`), or the input of the automatic
+///   system capture (FR-95), comes first, and has no relative device before
+///   P2b;
+/// - on a Wayland desktop XTest reaches only Xwayland clients, so the
+///   brief's `input_reach` must be `full` on an `x11` session;
+/// - no brief yet (the refresher's first pass has not landed) is no.
+#[cfg_attr(not(all(target_os = "linux", feature = "enigo-input")), allow(dead_code))]
+pub(crate) fn linux_xtest_carries_rel(
+    uinput_opted_in: bool,
+    system_capture_live: bool,
+    brief: Option<&roomler_ai_remote_control::models::DesktopBrief>,
+) -> bool {
+    !uinput_opted_in
+        && !system_capture_live
+        && brief.is_some_and(|b| b.kind == "x11" && b.input_reach == "full")
 }
 
 /// FR-109 — the kill switch's reading of [`MOUSE_REL_ENV`]: only an explicit
@@ -598,13 +645,36 @@ mod tests {
         assert!(!mouse_rel_switched_off(None));
     }
 
-    /// FR-109 P1 — only Windows injects relative motion, so no other OS may
-    /// advertise `mouse-rel` (a Linux viewer's frames would be dropped by
-    /// the tablet, a Wayland one's by the portal).
+    /// FR-109 — outside Windows, nothing is advertised while no X11 desktop
+    /// brief says enigo reaches the session: a test process has none.
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn fr109_only_windows_advertises_mouse_rel() {
+    fn fr109_no_brief_advertises_no_mouse_rel() {
         assert!(!advertises_mouse_rel());
+    }
+
+    /// FR-109 P2a — enigo on a real X11 display carries relative motion; a
+    /// Wayland desktop, Xwayland-only reach, a tty, no brief, uinput opted in
+    /// and the automatic system capture's uinput all do not.
+    #[test]
+    fn fr109_linux_mouse_rel_only_for_xtest_on_a_real_x11_display() {
+        use roomler_ai_remote_control::models::DesktopBrief;
+        let brief = |kind: &str, reach: &str| DesktopBrief {
+            session: "user".into(),
+            kind: kind.into(),
+            desktop: None,
+            capture_arm: "x11".into(),
+            input_reach: reach.into(),
+        };
+        let x11 = brief("x11", "full");
+        assert!(linux_xtest_carries_rel(false, false, Some(&x11)));
+        assert!(!linux_xtest_carries_rel(true, false, Some(&x11)));
+        assert!(!linux_xtest_carries_rel(false, true, Some(&x11)));
+        assert!(!linux_xtest_carries_rel(false, false, Some(&brief("wayland", "full"))));
+        assert!(!linux_xtest_carries_rel(false, false, Some(&brief("wayland", "xwayland_only"))));
+        assert!(!linux_xtest_carries_rel(false, false, Some(&brief("x11", "none"))));
+        assert!(!linux_xtest_carries_rel(false, false, Some(&brief("tty", "none"))));
+        assert!(!linux_xtest_carries_rel(false, false, None));
     }
 
     /// FR-109 AC6 — relative mode only INJECTS: no hook, raw-input sink or key
