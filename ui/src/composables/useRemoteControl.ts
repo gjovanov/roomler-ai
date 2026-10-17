@@ -90,6 +90,7 @@ import {
 import { keepBusySetMessage, parseKeepBusyState, type KeepBusyRequest, type KeepBusyState } from './keepBusy'
 import { parseDisplayMatchState, type DisplayMatchState } from './displayMatch'
 import { createRelAccumulator, relativeButtonMessage } from './relativeMouse'
+import { createPointerPressTracker, releaseForCancelledPointer } from './touchInput'
 import { parseFeaturesRefused } from './useSessionFeatures'
 
 /**
@@ -10104,6 +10105,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         const btn = browserButton(ev.button)
         sendInput(relativeButtonMessage(btn, true))
         heldInputs.button(btn, true)
+        pointerPresses.press(ev.pointerId, btn)
         return
       }
       const { x, y, insideVideo } = normalisedXY(ev)
@@ -10113,9 +10115,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       lastPointerNorm = { x, y }
       sendInput({ t: 'mouse_button', btn: browserButton(ev.button), down: true, x, y, mon: 0 })
       heldInputs.button(browserButton(ev.button), true)
+      pointerPresses.press(ev.pointerId, browserButton(ev.button))
     }
 
     function onPointerUp(ev: PointerEvent) {
+      pointerPresses.end(ev.pointerId)
       if (relativeMouse.value) {
         flushRel()
         const btn = browserButton(ev.button)
@@ -10136,6 +10140,25 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       const uy = insideVideo ? y : lastPointerNorm.y
       if (insideVideo) lastPointerNorm = { x, y }
       sendInput({ t: 'mouse_button', btn, down: false, x: ux, y: uy, mon: 0 })
+      heldInputs.button(btn, false)
+    }
+
+    // FR-111 — a browser that takes a pointer over (a touch drag read as a pan
+    // or a zoom, a system gesture) ends it with `pointercancel` and never sends
+    // `pointerup`. The press is already on the host, so it must still be let
+    // go, or the host's button stays down and the next touch's moves become a
+    // drag (P0 measured exactly that). A cancel's position is not worth
+    // trusting: release at the last point the pointer reached.
+    function onPointerCancel(ev: PointerEvent) {
+      const btn = pointerPresses.end(ev.pointerId)
+      if (btn === undefined) return
+      if (relativeMouse.value) {
+        flushRel()
+      } else {
+        try { surface.releasePointerCapture(ev.pointerId) } catch { /* noop */ }
+        cancelPendingMove()
+      }
+      sendInput(releaseForCancelledPointer(btn, relativeMouse.value, lastPointerNorm))
       heldInputs.button(btn, false)
     }
 
@@ -10215,6 +10238,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // and force-released when this window loses focus (alt-tab, minimize,
     // OS-level steal) — see createHeldInputTracker for the stuck-Alt story.
     const heldInputs = createHeldInputTracker()
+    // FR-111 — which button each pointer pressed on the host, so a pointer the
+    // browser cancels (a touch drag it took over as a pan) still lets go of
+    // exactly that button, and one that pressed nothing releases nothing.
+    const pointerPresses = createPointerPressTracker()
     // Last normalized pointer position inside the picture — synthetic
     // button-ups reuse it so releasing a stuck drag doesn't teleport the host
     // cursor. ⚠️ Every pointer MOVE updates it (onPointerMove), not only a
@@ -10667,6 +10694,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
     surface.addEventListener('pointerdown', onPointerDown)
     surface.addEventListener('pointerup', onPointerUp)
+    surface.addEventListener('pointercancel', onPointerCancel)
     surface.addEventListener('pointerenter', onPointerEnter)
     surface.addEventListener('pointerleave', onPointerLeave)
     surface.addEventListener('wheel', onWheel, { passive: false })
@@ -10701,6 +10729,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
       surface.removeEventListener('pointerdown', onPointerDown)
       surface.removeEventListener('pointerup', onPointerUp)
+      surface.removeEventListener('pointercancel', onPointerCancel)
       surface.removeEventListener('pointerenter', onPointerEnter)
       surface.removeEventListener('pointerleave', onPointerLeave)
       surface.removeEventListener('wheel', onWheel)

@@ -991,7 +991,7 @@
         ref="stageEl"
         class="video-frame"
         :class="[`scale-${rc.scaleMode.value}`, { 'drag-over': isDragOver }]"
-        :style="{ cursor: remoteCursorCss ?? 'none' }"
+        :style="{ cursor: remoteCursorCss ?? 'none', touchAction: stageTouchActionCss }"
         tabindex="0"
         @pointermove="onStagePointerMove"
         @pointerleave="cursorVisible = false"
@@ -2085,6 +2085,7 @@ import KeepBusyMenu from '@/components/remote/KeepBusyMenu.vue'
 import type { KeepBusyPattern } from '@/composables/keepBusy'
 import { displayMatchSummary } from '@/composables/displayMatch'
 import { agentSupportsRelativeMouse, relativeMouseSwitchedOff } from '@/composables/relativeMouse'
+import { stageTouchAction } from '@/composables/touchInput'
 import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 import { asSentence } from '@/utils/sentence'
 import { useCapabilitiesStore } from '@/stores/capabilities'
@@ -3040,6 +3041,19 @@ const relativeMouseOffered = computed<boolean>(() => {
     && !relativeMouseSwitchedOff(storage)
 })
 watch(relativeMouseOffered, (offered) => rc.setRelativeMouseAllowed(offered), { immediate: true })
+// FR-111 — every touch on the picture belongs to the viewer. Without
+// `touch-action: none` a touch browser takes a drag over as a pan, and the
+// press already on the host is never let go. `roomler-rc-touch=legacy` gives
+// the stage back to the browser; read once, like the other kill switches.
+const stageTouchActionCss = (() => {
+  let storage: Storage | null = null
+  try {
+    storage = globalThis.localStorage
+  } catch {
+    /* blocked site data: not switched off */
+  }
+  return stageTouchAction(storage)
+})()
 /** FR-109 — the toolbar control: a click is the gesture Pointer Lock needs.
  *  Once locked the pointer is hidden, so leaving is Esc (the browser's own
  *  rule); a click while locked leaves too, for a lock the page still sees. */
