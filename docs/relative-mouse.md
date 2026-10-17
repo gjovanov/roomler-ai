@@ -5,7 +5,7 @@
 >
 > | Phase | What | State |
 > |---|---|---|
-> | P1 | the wire, the gate, Windows hosts (the user worker and SystemContext), the viewer's control | shipped in 0.4.140, but there a Windows relative move went out ABSOLUTE (enigo's default, below); the fix rides the next agent release |
+> | P1 | the wire, the gate, Windows hosts (the user worker and SystemContext), the viewer's control | shipped in 0.4.140, but there a Windows relative move went out ABSOLUTE (enigo's default, below). The fix (#2352) is field-green on a candidate on both Windows paths, and rides the next agent release |
 > | P2 | Linux (a relative uinput device, XTest, the portal) and macOS | not built |
 > | P3 | switching on by itself when the host hides its cursor | not built |
 
@@ -128,7 +128,8 @@ person's.
 ## What it does not do
 
 - It never reads input on the host. The agent only injects; there is no hook and no raw-input reader in
-  `roomlerd` (FR-92's rule).
+  `roomlerd` (FR-92's rule). A unit test scans the relative-mouse code for any of them
+  ([`input/mod.rs:618`](../agents/roomlerd/src/input/mod.rs#L618) `fr109_relative_mouse_reads_no_input`).
 - No ghost cursor in relative mode: other viewers see the host's own cursor in the picture.
 - The host's pointer speed and acceleration settings are not changed.
 
