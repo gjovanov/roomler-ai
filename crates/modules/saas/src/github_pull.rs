@@ -774,6 +774,8 @@ mod tests {
                 "roomler-setup-universal-apple-darwin.tar.gz",
             ),
             (
+                // RETIRED-NAME-RECORD(2): a real asset of a release cut before
+                // FR-46; those files are immutable, so the flavour reads them as named.
                 "roomler-agent-0.3.0-rc.480-x86_64-unknown-linux-gnu.deb",
                 "roomler-agent-x86_64-unknown-linux-gnu.deb",
             ),
