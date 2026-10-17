@@ -531,7 +531,7 @@ report the modifiers that report ends with. So on a KDE system install "A"
 typed "a", and every shifted symbol came out unshifted: a password with a
 capital in it failed. Shift is now pressed in a report before the key and
 released in one after it, and a shift the viewer holds is left alone
-(`agents/roomlerd/src/input/uinput_backend.rs:557`).
+(`agents/roomlerd/src/input/uinput_backend.rs:665`).
 
 ⚠️ **uinput: the injector opens before the first event** (FR-93 P4c). libinput
 adds a new uinput device asynchronously. Under load, a move written after the
