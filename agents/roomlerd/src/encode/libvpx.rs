@@ -1557,15 +1557,62 @@ mod fr112_bench {
         let fr = frames(150);
         println!(
             "{W}x{H}, 120 frames measured per row, {} logical CPUs, encoder threads {}, clock {clock:?}",
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(0),
             num_cpus_for_encode()
         );
         let q = vp9_direct_max_q_from_env();
         let (y444, y420) = (Vp9Chroma::Yuv444, Vp9Chroma::Yuv420);
-        one("444 30fps 17.5M cpu6 tiles4 (today)", 30, y444, 17_500_000, 6, None, q, &fr);
-        one("444 60fps 25M cpu6 tiles4", 60, y444, 25_000_000, 6, None, q, &fr);
-        one("444 60fps 25M cpu6 tiles8", 60, y444, 25_000_000, 6, Some(3), q, &fr);
-        one("444 60fps 25M cpu8 tiles8", 60, y444, 25_000_000, 8, Some(3), q, &fr);
-        one("420 60fps 25M cpu6 tiles4", 60, y420, 25_000_000, 6, None, q, &fr);
+        one(
+            "444 30fps 17.5M cpu6 tiles4 (today)",
+            30,
+            y444,
+            17_500_000,
+            6,
+            None,
+            q,
+            &fr,
+        );
+        one(
+            "444 60fps 25M cpu6 tiles4",
+            60,
+            y444,
+            25_000_000,
+            6,
+            None,
+            q,
+            &fr,
+        );
+        one(
+            "444 60fps 25M cpu6 tiles8",
+            60,
+            y444,
+            25_000_000,
+            6,
+            Some(3),
+            q,
+            &fr,
+        );
+        one(
+            "444 60fps 25M cpu8 tiles8",
+            60,
+            y444,
+            25_000_000,
+            8,
+            Some(3),
+            q,
+            &fr,
+        );
+        one(
+            "420 60fps 25M cpu6 tiles4",
+            60,
+            y420,
+            25_000_000,
+            6,
+            None,
+            q,
+            &fr,
+        );
     }
 }

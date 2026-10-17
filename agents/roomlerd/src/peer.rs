@@ -4173,8 +4173,9 @@ async fn media_pump_vp9_444_dc(
         // software encoder cannot hold the target, take frames on an even grid
         // at the rate it sustains instead of a ragged mix of 16 and 33 ms gaps.
         // Slots run from consumption, so an encode longer than the interval
-        // degrades to the natural cadence, never a burst.
-        if let Some(paced) = governor.paced_fps() {
+        // degrades to the natural cadence, never a burst. Never below 30, the
+        // pace 0.4.141 ran at (`paced_software_fps`).
+        if let Some(paced) = governor.paced_software_fps() {
             let interval = Duration::from_micros(1_000_000 / paced.max(1) as u64);
             let now = std::time::Instant::now();
             if let Some(due) = pace_due
@@ -4597,10 +4598,12 @@ async fn media_pump_vp9_444_dc(
         let q_now = pipeline.min_quality(quality_state.load(std::sync::atomic::Ordering::Relaxed));
         if let Some((ew, eh)) = encoder_dims {
             // FR-112 P2 — the base follows the rate the pump actually runs at
-            // (paced when the encoder cannot hold the target), by √(fps/30);
-            // the kill switch keeps 0.4.141's linear base at the target.
+            // (paced when the encoder cannot hold the target, never below 30),
+            // by √(fps/30); the kill switch keeps 0.4.141's linear base at the
+            // target.
             let base = if sw_tier {
-                encode::bitrate_base_for_fps(ew, eh, governor.paced_fps().unwrap_or(target_fps))
+                let runs_at = governor.paced_software_fps().unwrap_or(target_fps);
+                encode::bitrate_base_for_fps(ew, eh, runs_at)
             } else {
                 encode::initial_bitrate_for_fps(ew, eh, target_fps)
             };
@@ -4931,7 +4934,7 @@ async fn media_pump_vp9_444_dc(
                 settle_kf_suppressed,
                 avg_scale_ms,
                 avg_encode_ms,
-                paced_fps = ?governor.paced_fps(),
+                paced_fps = ?governor.paced_software_fps(),
                 target_bps = governor.applied_bps(),
                 avg_qp = ?avg_qp,
                 max_qp = ?max_qp,
@@ -12909,10 +12912,22 @@ mod tests {
     #[test]
     fn the_vp9_target_is_60_unless_pinned_or_switched_off() {
         assert_eq!(super::vp9_444_target_fps(None, true), 60);
-        assert_eq!(super::vp9_444_target_fps(None, false), 30, "the kill switch: 0.4.141's default");
-        assert_eq!(super::vp9_444_target_fps(Some(30), true), 30, "a pin wins over the tier");
+        assert_eq!(
+            super::vp9_444_target_fps(None, false),
+            30,
+            "the kill switch: 0.4.141's default"
+        );
+        assert_eq!(
+            super::vp9_444_target_fps(Some(30), true),
+            30,
+            "a pin wins over the tier"
+        );
         assert_eq!(super::vp9_444_target_fps(Some(60), false), 60);
-        assert_eq!(super::vp9_444_target_fps(Some(50), true), 60, "rounds to the nearer");
+        assert_eq!(
+            super::vp9_444_target_fps(Some(50), true),
+            60,
+            "rounds to the nearer"
+        );
         assert_eq!(super::vp9_444_target_fps(Some(40), true), 30);
     }
 

@@ -86,7 +86,10 @@ fn say_once(role: &'static str, outcome: Outcome) {
             uclamp_min = CLAMP_MIN,
             "encoder clock: asked for (FR-112; ROOMLERD_ENCODER_CLOCK=0 turns it off)"
         ),
-        Outcome::Off => tracing::info!(role, "encoder clock: not asked for (ROOMLERD_ENCODER_CLOCK=0, FR-112)"),
+        Outcome::Off => tracing::info!(
+            role,
+            "encoder clock: not asked for (ROOMLERD_ENCODER_CLOCK=0, FR-112)"
+        ),
         Outcome::Refused(errno) => tracing::info!(
             role,
             errno,
@@ -127,7 +130,9 @@ mod imp {
     pub(super) fn request(min: u32) -> SchedAttr {
         SchedAttr {
             size: std::mem::size_of::<SchedAttr>() as u32,
-            sched_flags: SCHED_FLAG_KEEP_POLICY | SCHED_FLAG_KEEP_PARAMS | SCHED_FLAG_UTIL_CLAMP_MIN,
+            sched_flags: SCHED_FLAG_KEEP_POLICY
+                | SCHED_FLAG_KEEP_PARAMS
+                | SCHED_FLAG_UTIL_CLAMP_MIN,
             sched_util_min: min,
             ..Default::default()
         }
@@ -194,11 +199,16 @@ mod tests {
         assert_eq!(attr.size, 56, "SCHED_ATTR_SIZE_VER1");
         assert_eq!(
             attr.sched_flags,
-            imp::SCHED_FLAG_KEEP_POLICY | imp::SCHED_FLAG_KEEP_PARAMS | imp::SCHED_FLAG_UTIL_CLAMP_MIN,
+            imp::SCHED_FLAG_KEEP_POLICY
+                | imp::SCHED_FLAG_KEEP_PARAMS
+                | imp::SCHED_FLAG_UTIL_CLAMP_MIN,
             "policy and priority kept, only the minimum clamp set"
         );
         assert_eq!(attr.sched_util_min, 1024);
-        assert_eq!((attr.sched_policy, attr.sched_priority, attr.sched_nice), (0, 0, 0));
+        assert_eq!(
+            (attr.sched_policy, attr.sched_priority, attr.sched_nice),
+            (0, 0, 0)
+        );
     }
 
     /// On a kernel with util clamping the thread reads its clamp back, and a
