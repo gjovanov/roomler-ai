@@ -706,7 +706,7 @@ hosted only). §7's retention list grows, and `docs/data-model.md`'s stale TTLs 
 | PS3 | §3n PS3 in purestat | a tracker attribute | **live** 2026-10-14 23:02Z: purestat v0.1.9 (gjovanov/purestat#18) — read rate, scroll depth, opt-in link/download events |
 | P7 | §3k: the Search Console, Bing and GitHub pullers, the Content table | no credential ⇒ "not measured" | — |
 | P8 | §3j: the ingest routes, the Channels table, spend | no ingest key ⇒ 404 | **live** 2026-10-15 01:23Z (`hosted-20261015-cb26a2f`): #2237 `a7b56f5df`, AC18 field-verified (§8) — the ingest key, `…/ingest/{posts,snapshots}` (`saas`), `growth_posts` / `growth_post_snapshots`, `GET …/growth/channels`, the Campaigns reach column, the Channels tab. **The pipeline pushes** since 2026-10-15 22:02Z (the promotion repo's `tools/metrics/push.ts`, run by its hourly metrics task): 69 posts and 42 snapshots on the first run (§8). X and LinkedIn posts carry no reach yet: the promotion repo has no collector for either (LinkedIn's API grant is pending; X bills every read) |
-| P9 | §3f: session outcomes, the frozen time-to-first-frame, crashes per version, the session carrier, the rating | `ROOMLER__GROWTH__FEEDBACK=false` hides the prompt; P9a has no switch of its own — it runs under the org-day fold (`growth.enabled`) | **P9a merged** #2305 `955fcee82` (server only; live with the next promote): `growth_quality_daily` frozen nightly from `remote_sessions`, `agent_logs` (FR-22's TTFF before its 7-day horizon, the version a device ran), `agent_crashes` (`agentVersion` — P1d had read `agent_version`, which no production row has, so every crash was `unknown`) and `stats_machine_1d`; `GET …/growth/quality` + `POST …/quality/backfill`; the Quality tab; the digest's and weekly's quality sections. Owed after the promote: the hand count of a closed day (§8). **P9b in PR #2310** (viewer + `remote`): the rating prompt in the viewer's ended state (30 s from the request, once a UTC day per browser, dismissible, no focus, no text), `session_feedback` with its route and index set, `features.session_feedback` on `/api/capabilities`, the digest's `quality.ratings`, the privacy policy's text, AC19 as `ui/e2e/remote-session-rating.spec.ts` (owed: its run in the pod lane, and a real prompt on production). **P9c in PR #2332** (agent + wire + server): the carrier recorded once a session reaches Active (`direct` · `turn` · `turn_local` · `overlay_direct` · `overlay_turn` · `derp` · `org_relay` · `unknown` — never direct for an unknown tier), additive on `rc:session.stats`, stored on `remote_sessions.carrier`, split by the P9a freeze and shown in the Quality tab and weekly; the ICE/relay→carrier mapping unit-tested for every kind. Owed: an agent 0.4.140 release, then the LAN / TURN / peer-relay field reads and the pre-P9c control (§8). No route, no index, no wire-variant change — the composition baseline is unchanged |
+| P9 | §3f: session outcomes, the frozen time-to-first-frame, crashes per version, the session carrier, the rating | `ROOMLER__GROWTH__FEEDBACK=false` hides the prompt; P9a has no switch of its own — it runs under the org-day fold (`growth.enabled`) | **P9a merged** #2305 `955fcee82` (server only; live with the next promote): `growth_quality_daily` frozen nightly from `remote_sessions`, `agent_logs` (FR-22's TTFF before its 7-day horizon, the version a device ran), `agent_crashes` (`agentVersion` — P1d had read `agent_version`, which no production row has, so every crash was `unknown`) and `stats_machine_1d`; `GET …/growth/quality` + `POST …/quality/backfill`; the Quality tab; the digest's and weekly's quality sections. **Live** 2026-10-16 11:08Z (`hosted-20261016-32a9095`); the hand count of 2026-10-15 matched every frozen figure (§8). **P9b in PR #2310** (viewer + `remote`): the rating prompt in the viewer's ended state (30 s from the request, once a UTC day per browser, dismissible, no focus, no text), `session_feedback` with its route and index set, `features.session_feedback` on `/api/capabilities`, the digest's `quality.ratings`, the privacy policy's text, AC19 as `ui/e2e/remote-session-rating.spec.ts` (✅ on production 2026-10-17 against a vmtest guest, once the spec signed in with the session cookie; owed: its run in the pod lane). **P9c in PR #2332** (agent + wire + server): the carrier recorded once a session reaches Active (`direct` · `turn` · `turn_local` · `overlay_direct` · `overlay_turn` · `derp` · `org_relay` · `unknown` — never direct for an unknown tier), additive on `rc:session.stats`, stored on `remote_sessions.carrier`, split by the P9a freeze and shown in the Quality tab and weekly; the ICE/relay→carrier mapping unit-tested for every kind. Owed: an agent 0.4.140 release, then the LAN / TURN / peer-relay field reads and the pre-P9c control (§8). No route, no index, no wire-variant change — the composition baseline is unchanged |
 | P10 | §3l: the read key, the weekly roll-up, alerts | `ROOMLER__GROWTH__ALERTS=false` and `ROOMLER__GROWTH__WEEKLY_ENABLED=false` (the defaults); a read key revoked is a 404 | **live** 2026-10-16 06:11Z (`hosted-20261016-c61bf32`): #2261 `c61bf3243`. Covers the `read` key kind and the gate every growth GET passes, `growth_weekly` and its Monday job, `growth_alerts` and the hourly rules, the Alerts panel and the Weekly tab, and the digest's `alerts` section. AC20 field-verified (§8). Both switches are on for roomler.ai since roomler-ai-deploy#33, in effect from the 10-16 10:17Z roll. **The first scheduled roll-up**, 2026-W41, was computed and mailed once at 10:20:43Z with both pods running (§8). The alert rules run with nothing open. A red→green `digest_missing` has no natural occasion yet and stays owed |
 | PS2, PS4–PS7 | §3n in purestat | per feature | PS2 **live** 2026-10-14 23:02Z (purestat v0.1.9, gjovanov/purestat#17); PS4 + PS5 **live** 23:21Z (v0.1.10, #15, #19); PS6 **live** 2026-10-15: the code in v0.1.9 (#16), switched on by purestat-deploy#12, and given real Google/GitHub client credentials by #13 (production's had been sealed empty since 2026-04-23); a real Google sign-in verified (§8); v0.1.11 2026-10-15: the sidebar's org picker after a direct page load (#20, purestat-deploy#14; red/green §8); PS7 — |
 | P11 | docs: `docs/growth-observability.md`, which also covers the existing `/observability` (no page describes it today); the `docs/data-model.md` TTL fixes; the privacy policy; the `docs/README.md` row | — | — |
@@ -796,8 +796,16 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
 - [ ] **AC14 (P5):** the webhook refuses a bad signature (control) and records `delivered` and `bounce` for
   a test send with one forced bounce; that address is suppressed at the next send; SendGrid's open and
   click tracking read off.
-- [ ] **AC15 (P5):** in a rendered issue, every link except the unsubscribe link is byte-identical for two
+- [x] **AC15 (P5):** in a rendered issue, every link except the unsubscribe link is byte-identical for two
   recipients (the footer's promise, as a test).
+  *(A test criterion. Master CI run 39014055189 on `bfc38e95a`, job "Rust unit tests (server + crates)",
+  2026-10-17 07:55Z:
+  `newsletter_send::tests::every_link_but_the_unsubscribe_link_is_byte_identical_for_two_recipients ... ok`.
+  The test renders one issue once, exactly as `run_send` does, and composes it for two recipients. It
+  asserts that exactly one link differs: the unsubscribe link, which names the issue for both. With that
+  link taken out, the two bodies are the same bytes. The links to this site carry the issue's tags and no
+  other link does. The headers and custom args carry nothing per recipient. Any per-recipient link fails
+  it.)*
 - [x] **AC16 (P6):** the Campaigns table's visitors for a closed day equal purestat's own number for the
   same filter; with the key revoked the cells read "not measured" (control).
   *(2026-10-15 on `hosted-20261015-cb26a2f`: for 2026-10-13 by `content`, the row `{linkedin, post,
@@ -815,8 +823,17 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
   post carrying a `caption` got 422 `post_text_refused` and stored nothing; a wrong key, a nonexistent path
   and the revoked key got the same empty 404. The test key was minted by direct insert (hash only), then
   revoked, and its rows deleted. §8.)*
-- [ ] **AC19 (P9):** the rating prompt appears at most once per user per day and never after a session
+- [x] **AC19 (P9):** the rating prompt appears at most once per user per day and never after a session
   shorter than 30 s, and dismissing it changes nothing else in the viewer (Playwright).
+  *(2026-10-17 08:01–08:03Z on production `hosted-20261017-57519de`. The spec ran from mars in the pinned
+  Playwright container, one pass with no retries, against a kept vmtest Ubuntu guest on agent 0.4.140:
+  `remote-session-rating.spec.ts` passed in 1.9 min. The server holds its four sessions at 3 s, 33 s, 33 s
+  and 34 s from request to end. `session_feedback` holds exactly one row, on the fourth session: `down`,
+  `["lag"]`, by the controller, codes only. The dismissed prompt and the same-day repeat stored nothing.
+  Red: the spec as P9b merged it seeded `localStorage` tokens, which have done nothing since sessions became
+  cookie-only (#680/#690). Run once against the same server, it failed at the login form, so it could never
+  have passed. It now signs in through each context's own cookie jar. Still owed: its run in the pod lane,
+  which needs the agent-e2e harness. §8.)*
 - [x] **AC20 (P10):** the read key returns the same numbers as the UI for the same range, and 404 on any
   non-GET or non-growth route.
   *(Production 2026-10-16 on `hosted-20261016-c61bf32`, with a minted read key (only its hash on the server)
@@ -828,9 +845,29 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
   sees the key as a credential and answers the anonymous **401** (`/api/auth/me` did). That is refused, not
   opened, which is the criterion's point, but it is not a 404; the "non-growth route" clause means a growth
   path that is not a GET data view. No red run: before P10 the `read` kind did not exist. §8.)*
-- [ ] **AC21 (privacy):** the privacy policy names every new data item with its purpose and retention, and
+- [x] **AC21 (privacy):** the privacy policy names every new data item with its purpose and retention, and
   nothing new is written to a visitor's device (FR-88 AC4's Playwright check over `/`, a docs page, a post,
   `/links/` and `/register`).
+  *(2026-10-17 on production `hosted-20261017-5f14468` (#2357, promoted 08:14Z), checked in a real browser
+  from mars with every purestat request aborted.
+  **The policy.** The rendered `/privacy` names every new item with its purpose and retention:
+  - the install method (§2.8);
+  - a session's path kind and quality (§2.9);
+  - the wizard's opt-in diagnostics and the session rating (§2.15);
+  - in §7, the 90-day audit trail apart from the session record (25 months, decision 14), the
+    enrollment-token ledger (90 days), setup diagnostics (90 days) and the rating (25 months);
+  - the newsletter's delivery record and a workspace's billing events, each kept with what it belongs to.
+
+  Red at 07:53Z on `57519de`: the old line ("Access and audit records — remote sessions, …") and neither new
+  statement. Green at 08:24Z. Production enforces every number: its TTL indexes read `remote_sessions` and
+  `session_feedback` 750 d, `setup_diagnostics` and `enroll_token_issued` 90 d, `remote_audit`, `exec_audit`,
+  `ssh_audit` and `ssh_activity` 90 d, and `growth_org_daily` 750 d.
+  **The device.** `/`, `/docs/`, a post, `/links/` and `/register`, with four `utm_*` values on the URL, in a
+  fresh context: no cookie and no `localStorage` or `sessionStorage` entry, on both runs.
+  "Deleted with your account" is a manual erasure today. No account or org hard-delete path exists;
+  `purge_user` and `purge_tenant` are the seams one will call, and the TTLs bound the rows meanwhile.
+  ⚠️ The same cross-check found a mismatch older than FR-102: §7 says crash reports go after "typically 7
+  days", but `agent_crashes` has a 90-day TTL (raised with the operator). §8.)*
 - [x] **AC22 (docs):** `docs/growth-observability.md` with mermaid diagrams (the two planes, the install
   trace, the funnel definitions) and the `/observability` page as a whole, linked from `docs/README.md`;
   `docs/data-model.md`'s TTLs corrected.
@@ -923,6 +960,10 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
 | 2026-10-16 06:11–06:50Z | production `hosted-20261016-c61bf32` (P10) | P10's roll; AC20; AC4's production half | AC20 and AC4 as ticked. The roll: pods Ready with 0 restarts and `/health` fine. Of 21 agents connected when it began, only 10 wrote an `offline`/`online` presence pair (the previous rolls wrote about 23 each). All 11 others answered `roomler exec` (cluster hosts, Windows, macOS, WSL), so they were on the new pods' hubs. ⚠️ Presence events are not proof of a reconnect; an exec is |
 | 2026-10-16 10:17–10:22Z | production `hosted-20261016-d11fe94` (the 0.4.139 release commit; P3b's server half; P10's weekly + alerts switched on by roomler-ai-deploy#33) | the roll; P3b's route; the first weekly roll-up; the alert switch | Pods Ready with 0 restarts, `/health` 0.4.139, and 22 of 22 agents connected at the roll reconnected. `POST /api/setup/diagnostics {}` got 422 and a malformed `run` got 422 `invalid_run`, nothing stored; `GET` got 405. **2026-W41** (10-05 → 10-11) was computed and mailed **once** at 10:20:43Z with both pods running (`attempts: 1`, 2 recipients, the digest's exclusions). `GET …/alerts` read `enabled: true` with all four rules and nothing open |
 | 2026-10-16 10:39–10:46Z | setup 0.4.139 (published 10:37Z) against production; two vmtest Win11 wizard cells from a private workspace | AC12 | AC12 as ticked. Both cells passed 7/7. Unticked: 0 rows, and no `install.run`. Ticked: 15 rows of one run with exactly the seven documented keys, and the device's `install.run` equal to the run |
+| 2026-10-16 11:08–11:14Z | production `hosted-20261016-32a9095` (P9a) | P9a's roll, its backfill, and the hand count of a closed day | Pods Ready with 0 restarts; 24 of 24 agents connected at the roll reconnected. The admin backfill froze 10-09 … 10-15 at once (71 rows), before `agent_logs`' 7-day TTL took those days' time to first frame. For 2026-10-15, scope `all`, every frozen figure equals the hand count from the raw collections: sessions requested / reached Active / never / pending 144 / 122 / 22 / 0, each `end_reason` bucket, TTFF n 58 with p50 523 ms and p90 7,186 ms, and 1 crash. The `external` scope read 0 sessions, because every session that day was in an excluded org. The hand count's own first pass disagreed on TTFF and crashes: it filtered on `event` instead of `outcome`, and on `created_at`, which `agent_crashes` does not have. In the digests, the 2026-10-15 one (computed before the roll) reads the per-version table as "arrives with P9a"; the 2026-10-16 one names `0.4.139`. Neither day had a crash in the digest's scope, so no crash version was there to name |
+| 2026-10-17 06:53Z | production `hosted-20261017-57519de` (P9c's server half; agent 0.4.140 released 05:33Z) | the roll | Pods Ready with 0 restarts, `/health` 0.4.140, and 24 of 24 agents connected at the roll reconnected |
+| 2026-10-17 08:01–08:04Z | production `hosted-20261017-57519de`; a kept vmtest Ubuntu guest (`ubuntu/script/system`, agent 0.4.140, Wayland; its cell passed 8 of 9 with the usual reverse-ping WARN) from a private workspace | AC19 | **green**. The spec, fixed to sign in through each context's cookie jar and to pick the guest by exact name, ran from mars in the pinned Playwright container, one pass with no retries: 1 passed in 1.9 min. On the server: four sessions of 3 s, 33 s, 33 s and 34 s from request to end, all `controller_hangup`, and exactly one `session_feedback` row, on the fourth (`down`, `["lag"]`, by the controller, keys `session_id, tenant_id, user_id, agent_id, rating, reasons, ts`). **Red**: the spec as merged, run once against the same server, failed at `connectButton(...).toBeVisible()`. Its page snapshot was the login form, because seeding `localStorage` tokens has done nothing since sessions became cookie-only. The guest was shut down cleanly, so its ephemeral row unenrolled itself, then destroyed by name. ⚠️ The rating sits in an excluded org, so the digest's `quality.ratings` cannot count it; only an `include_internal` preview of 2026-10-17 can |
+| 2026-10-17 08:14–08:26Z | production `hosted-20261017-5f14468` (#2357, the 25-month session record and the policy) | the roll; the TTL; AC21 | **green**. Pods Ready with 0 restarts, `/health` 0.4.140 with all seven modules, and 24 of 24 agents connected at the roll reconnected. `remote_sessions` now has `created_at_1` with `expireAfterSeconds` 64,800,000 (750 days); before the roll it had no TTL index. It holds 8,570 rows, the oldest from 2026-08-04, so nothing was deleted. AC21 is green as ticked. Listing every production TTL index against §7 found one mismatch, older than FR-102: crash reports at 90 days, where the policy says "typically 7" |
 
 ## 9. Related
 
