@@ -7,7 +7,7 @@
 > |---|---|---|
 > | P1 | the wire, the gate, Windows hosts (the user worker and SystemContext), the viewer's control | shipped in 0.4.140, where a Windows relative move went out ABSOLUTE (enigo's default, below). **0.4.141 carries the fix (#2352)**, field-verified on its released bytes on both Windows paths |
 > | P2 | Linux (XTest, a relative uinput device, the portal) and macOS | X11 through enigo's XTest (P2a) and a relative uinput pointer for system installs (P2b): merged, field-green on candidates. Per-user Wayland through the RemoteDesktop session, the portal's or mutter's (P2c): built, field-green on a candidate. macOS not built |
-> | P3 | switching on by itself when the host hides its cursor | not built |
+> | P3 | switching on by itself when the host hides its cursor | built (the operator settled the spec's decision 1 on 2026-10-17: enter on the next click), with a rule P2 made necessary: a hide counts only after the host has reported its pointer |
 
 ## Why it exists
 
@@ -129,21 +129,63 @@ each absolute move as a large jump. In relative mode the same probe read the del
 ## The viewer
 
 - **The control** is a toolbar button, shown only for an agent that advertises `mouse-rel`
-  ([`RemoteControl.vue:3101`](../ui/src/views/remote/RemoteControl.vue#L3101) `relativeMouseOffered`).
+  ([`RemoteControl.vue:3102`](../ui/src/views/remote/RemoteControl.vue#L3102) `relativeMouseOffered`).
   Pointer Lock needs a user gesture, and the click is one.
 - **Entering** asks for raw, unaccelerated deltas (`unadjustedMovement`). A browser that rejects the option
-  gets plain Pointer Lock ([`useRemoteControl.ts:5966`](../ui/src/composables/useRemoteControl.ts#L5966)
+  gets plain Pointer Lock ([`useRemoteControl.ts:5990`](../ui/src/composables/useRemoteControl.ts#L5990)
   `enterRelativeMouse`).
 - **While locked**, every pointer move is a delta into the accumulator
-  ([`useRemoteControl.ts:10129`](../ui/src/composables/useRemoteControl.ts#L10129)), and a hint at the
+  ([`useRemoteControl.ts:10179`](../ui/src/composables/useRemoteControl.ts#L10179)), and a hint at the
   bottom of the picture says how to get the pointer back.
 - **Leaving** is Esc, the browser's own rule. Under Keyboard Lock in fullscreen, Esc reaches the host, so
   the browser wants it held, and the hint says so. Leaving sends the motion still gathered and lets go of
   any held button where the pointer is, before moves turn absolute again
-  ([`useRemoteControl.ts:11000`](../ui/src/composables/useRemoteControl.ts#L11000)). An absolute button-up
+  ([`useRemoteControl.ts:11076`](../ui/src/composables/useRemoteControl.ts#L11076)). An absolute button-up
   there would throw the host's cursor to an old position.
 - A blur or a hidden tab releases held buttons with `mouse_release` in relative mode, never with a
   position.
+
+## Switching on by itself (P3)
+
+An app that captures the pointer usually hides the cursor first. The agent already says so on the cursor
+channel (`cursor:hide`), so the viewer can offer relative mode without the toolbar:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Untracked
+    Untracked --> Absolute: cursor:pos or cursor:shape (this host's tracker sees the pointer)
+    Untracked --> Untracked: cursor:hide (a tracker that sees no pointer says only this)
+    Absolute --> Hidden: cursor:hide
+    Hidden --> Absolute: cursor:pos (the cursor is back)
+    Hidden --> Relative: a click inside the picture (not forwarded)
+    Relative --> Absolute: cursor:pos (the auto-switch's own lock goes)
+    Relative --> Suppressed: Esc, the cursor still hidden
+    Suppressed --> Absolute: cursor:pos
+```
+
+- **The click that switches is the gesture, not input**
+  ([`useRemoteControl.ts:10242`](../ui/src/composables/useRemoteControl.ts#L10242)). Forwarded as an
+  absolute press, it would first jump the captured pointer to where the click happened. Its button-up is
+  swallowed too.
+- **The cursor coming back** is the next `cursor:pos` after a `cursor:hide`, not `cursor:shape`, which
+  arrives only when the shape changes ([`useRemoteControl.ts:6011`](../ui/src/composables/useRemoteControl.ts#L6011)
+  `onHostCursorShown`). It ends a lock the auto-switch took. A lock the person took from the toolbar stays
+  theirs until Esc.
+- **Esc while the cursor stays hidden** leaves relative mode and holds it off until the cursor shows again
+  ([`useRemoteControl.ts:11090`](../ui/src/composables/useRemoteControl.ts#L11090)). Otherwise a host that
+  keeps its cursor hidden, fullscreen video for one, would trap the person on every click.
+- ⚠️ **Never while the host is locked.** The lock screen hides the cursor too
+  ([`relativeMouse.ts:108`](../ui/src/composables/relativeMouse.ts#L108) `shouldAutoEnterRelative`
+  checks `rc:host_locked`).
+- ⚠️ **Only after this host has reported its pointer** on the channel, a `cursor:pos` or `cursor:shape`
+  ([`useRemoteControl.ts:5917`](../ui/src/composables/useRemoteControl.ts#L5917) `hostCursorTracked`). A
+  tracker that sees no pointer (a Linux host without DRM capture, macOS) sends one `cursor:hide` when the
+  channel opens and nothing after it. Those Linux hosts advertise `mouse-rel` since P2, so without this rule
+  their first click would take the pointer. The price is small: a Windows session that starts with the
+  cursor already hidden switches only after the cursor has shown once, and until then the toolbar control
+  works.
+- Switched off in one browser with `localStorage['roomler-rc-relative-auto'] = 'off'`; the toolbar control
+  still works.
 
 ## The arbiter
 
@@ -159,6 +201,7 @@ person's.
 |---|---|
 | The device | `ROOMLERD_INPUT_MOUSE_REL=0` (or `false`, `no`, `off`): the agent stops advertising `mouse-rel` ([`mod.rs:163`](../agents/roomlerd/src/input/mod.rs#L163)) |
 | One browser | `localStorage['roomler-rc-relative-mouse'] = 'off'` hides the control |
+| One browser, the auto-switch alone | `localStorage['roomler-rc-relative-auto'] = 'off'` ([`relativeMouse.ts:68`](../ui/src/composables/relativeMouse.ts#L68)): relative mode stays manual, and the toolbar control still works |
 
 ## What it does not do
 

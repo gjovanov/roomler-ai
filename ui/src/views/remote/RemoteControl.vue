@@ -1252,7 +1252,8 @@
           data-testid="rc-relative-mouse-hint"
         >
           <v-icon size="x-small" class="mr-1">mdi-cursor-move</v-icon>
-          <span>{{ rc.keyboardLockActive.value ? 'Relative mouse: hold Esc to release it' : 'Relative mouse: Esc releases it' }}</span>
+          <span>{{ (rc.relativeMouseAuto.value ? 'The host hid its cursor, so the mouse is relative' : 'Relative mouse')
+            + (rc.keyboardLockActive.value ? ': hold Esc to release it' : ': Esc releases it') }}</span>
         </div>
       </div>
     </div>

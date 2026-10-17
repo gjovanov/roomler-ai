@@ -4,9 +4,12 @@ import { describe, expect, it } from 'vitest'
 import {
   agentSupportsRelativeMouse,
   createRelAccumulator,
+  relativeAutoSwitchedOff,
   relativeButtonMessage,
   relativeMouseSwitchedOff,
+  RELATIVE_AUTO_STORAGE_KEY,
   RELATIVE_MOUSE_STORAGE_KEY,
+  shouldAutoEnterRelative,
 } from '@/composables/relativeMouse'
 import { createHeldInputTracker } from '@/composables/useRemoteControl'
 
@@ -71,6 +74,42 @@ describe('FR-109: relative mouse', () => {
   it('presses and lets go where the pointer is: no position on the wire', () => {
     expect(relativeButtonMessage('left', true)).toEqual({ t: 'mouse_press', btn: 'left' })
     expect(relativeButtonMessage('right', false)).toEqual({ t: 'mouse_release', btn: 'right' })
+  })
+
+  it('P3: a click switches only when the host hid its cursor and every gate agrees', () => {
+    const ok = {
+      allowed: true,
+      autoOff: false,
+      cursorHidden: true,
+      cursorTracked: true,
+      hostLocked: false,
+      suppressed: false,
+      relativeActive: false,
+      inputGranted: true,
+    }
+    expect(shouldAutoEnterRelative(ok)).toBe(true)
+    // Each gate alone keeps the click a click.
+    expect(shouldAutoEnterRelative({ ...ok, allowed: false })).toBe(false)
+    expect(shouldAutoEnterRelative({ ...ok, autoOff: true })).toBe(false)
+    expect(shouldAutoEnterRelative({ ...ok, cursorHidden: false })).toBe(false)
+    // A host whose tracker never saw a pointer (Linux without DRM capture,
+    // macOS) sends one `cursor:hide` at the start and nothing after it: that
+    // hide is not an app capturing the pointer, and its first click must stay
+    // a click.
+    expect(shouldAutoEnterRelative({ ...ok, cursorTracked: false })).toBe(false)
+    // The lock screen hides the cursor too: a locked host never switches.
+    expect(shouldAutoEnterRelative({ ...ok, hostLocked: true })).toBe(false)
+    // Left with Esc while the cursor stayed hidden: not pulled back in.
+    expect(shouldAutoEnterRelative({ ...ok, suppressed: true })).toBe(false)
+    expect(shouldAutoEnterRelative({ ...ok, relativeActive: true })).toBe(false)
+    expect(shouldAutoEnterRelative({ ...ok, inputGranted: false })).toBe(false)
+  })
+
+  it('P3: the auto-switch has its own kill switch', () => {
+    const store = (v: string | null) => ({ getItem: (k: string) => (k === RELATIVE_AUTO_STORAGE_KEY ? v : null) })
+    expect(relativeAutoSwitchedOff(store('off'))).toBe(true)
+    expect(relativeAutoSwitchedOff(store(null))).toBe(false)
+    expect(relativeAutoSwitchedOff({ getItem: () => { throw new Error('SecurityError') } })).toBe(false)
   })
 
   it('leaving Pointer Lock lets go of the mouse, not of a chord', () => {

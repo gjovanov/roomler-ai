@@ -62,6 +62,54 @@ export function createRelAccumulator(): RelAccumulator {
   }
 }
 
+/** FR-109 P3 — viewer-side kill switch for the auto-switch alone:
+ *  `localStorage['roomler-rc-relative-auto'] = 'off'` keeps relative mode
+ *  manual (the toolbar control still works). */
+export const RELATIVE_AUTO_STORAGE_KEY = 'roomler-rc-relative-auto'
+
+export function relativeAutoSwitchedOff(storage: Pick<Storage, 'getItem'> | null | undefined): boolean {
+  try {
+    return storage?.getItem(RELATIVE_AUTO_STORAGE_KEY) === 'off'
+  } catch {
+    return false
+  }
+}
+
+/** What the auto-switch decides on, read at the moment of a click inside the
+ *  picture. */
+export interface AutoEnterState {
+  /** The agent advertises `mouse-rel` and the viewer has not switched it off. */
+  allowed: boolean
+  /** `roomler-rc-relative-auto` is `off`. */
+  autoOff: boolean
+  /** The agent said `cursor:hide` and no `cursor:pos` has come since. */
+  cursorHidden: boolean
+  /** The agent has reported the host's pointer on this channel (a `cursor:pos`
+   *  or `cursor:shape`). A tracker that cannot see the pointer (Linux without
+   *  DRM capture, macOS) sends one `cursor:hide` at the start and nothing
+   *  after it, so a hide means "an app hid the cursor" only after this. */
+  cursorTracked: boolean
+  /** The host's input desktop is the lock screen (`rc:host_locked`). */
+  hostLocked: boolean
+  /** The person left relative mode while the cursor stayed hidden: no
+   *  re-entry until the cursor shows again. */
+  suppressed: boolean
+  relativeActive: boolean
+  inputGranted: boolean
+}
+
+/** FR-109 P3 — should this click enter relative mode by itself? Only when the
+ *  host has hidden its cursor (an app captured the pointer) and every other
+ *  gate agrees. ⚠️ The lock screen hides the cursor too, so a locked host never
+ *  switches; once the person has left with Esc, a still-hidden cursor does not
+ *  pull them back in on the next click; and a host that never reported a
+ *  pointer (whose only cursor message is that first `cursor:hide`) never
+ *  switches, or its first click would take the pointer. */
+export function shouldAutoEnterRelative(s: AutoEnterState): boolean {
+  return s.allowed && !s.autoOff && s.cursorHidden && s.cursorTracked && !s.hostLocked
+    && !s.suppressed && !s.relativeActive && s.inputGranted
+}
+
 /** A button in relative mode presses and lets go WHERE THE POINTER IS:
  *  `mouse_button` carries a position every backend moves to first, and in
  *  Pointer Lock the viewer has none to send (the host app owns the cursor). */
