@@ -5,7 +5,7 @@
 >
 > | Phase | What | State |
 > |---|---|---|
-> | P1 | the wire, the gate, Windows hosts (the user worker and SystemContext), the viewer's control | merged; ships with the next agent release |
+> | P1 | the wire, the gate, Windows hosts (the user worker and SystemContext), the viewer's control | shipped in 0.4.140, but there a Windows relative move went out ABSOLUTE (enigo's default, below); the fix rides the next agent release |
 > | P2 | Linux (a relative uinput device, XTest, the portal) and macOS | not built |
 > | P3 | switching on by itself when the host hides its cursor | not built |
 
@@ -71,11 +71,22 @@ sequenceDiagram
 
 | Host | Relative motion | A press where the pointer is |
 |---|---|---|
-| Windows, user worker | `SendInput` with `MOUSEEVENTF_MOVE` and no `ABSOLUTE` ([`enigo_backend.rs:173`](../agents/roomlerd/src/input/enigo_backend.rs#L173)) | [`enigo_backend.rs:180`](../agents/roomlerd/src/input/enigo_backend.rs#L180) |
+| Windows, user worker | `SendInput` with `MOUSEEVENTF_MOVE` and no `ABSOLUTE` ([`enigo_backend.rs:193`](../agents/roomlerd/src/input/enigo_backend.rs#L193)) | [`enigo_backend.rs:200`](../agents/roomlerd/src/input/enigo_backend.rs#L200) |
 | Windows, SystemContext | the same `dispatch`, on its desktop-bound thread | the same |
 | Linux, system install (uinput) | **P2**: the device is an absolute tablet by design; a relative device comes beside it ([`uinput_backend.rs:474`](../agents/roomlerd/src/input/uinput_backend.rs#L474) drops it) | ✅ [`uinput_backend.rs:466`](../agents/roomlerd/src/input/uinput_backend.rs#L466) |
 | Linux, Wayland portal | **P2**: `NotifyPointerMotion` exists, this path does not carry it yet ([`portal/input.rs:159`](../agents/roomlerd/src/capture/portal/input.rs#L159)) | ✅ [`portal/input.rs:152`](../agents/roomlerd/src/capture/portal/input.rs#L152) |
 | Linux X11 (XTest), macOS | **P2** | — |
+
+⚠️ **On Windows, enigo has to be told to send a relative move as relative.** enigo 0.6's default
+(`windows_subject_to_mouse_speed_and_acceleration_level = false`) turns `Coordinate::Rel` into an
+ABSOLUTE move to cursor + delta, so that pointer acceleration does not apply. Raw input then sees an
+absolute event and no motion, and a game sees nothing. Agent 0.4.140 shipped that way: ten `mouse_rel`
+frames reached the host as 0 relative counts and 10 absolute events (the spec's §8 row 5). Every enigo
+the agent builds now starts from one helper with the flag set
+([`enigo_backend.rs:112`](../agents/roomlerd/src/input/enigo_backend.rs#L112) `enigo_settings`), and a
+test locks it.
+The visible cursor then follows pointer speed and acceleration, as a real mouse does; the raw deltas are
+the counts sent.
 
 Until P2, Linux and macOS agents **do not advertise** `mouse-rel`, so no viewer offers relative mode to
 them. The presses above exist because each backend's match is exhaustive and must decide.

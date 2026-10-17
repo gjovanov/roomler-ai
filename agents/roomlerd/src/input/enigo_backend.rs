@@ -39,7 +39,7 @@ impl EnigoInjector {
         thread::Builder::new()
             .name("roomlerd-input".into())
             .spawn(move || {
-                let settings = Settings::default();
+                let settings = enigo_settings();
                 let enigo = match Enigo::new(&settings) {
                     Ok(e) => {
                         let _ = ready_tx.send(Ok(()));
@@ -93,6 +93,26 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<Job>) {
             }
             Job::Px(job) => run_px_job(&mut enigo, job),
         }
+    }
+}
+
+/// FR-109 — the settings every `Enigo` this agent builds starts from, the
+/// user worker's and the SystemContext worker's alike.
+///
+/// ⚠️ enigo 0.6 sends `Coordinate::Rel` on Windows as an ABSOLUTE move unless
+/// `windows_subject_to_mouse_speed_and_acceleration_level` is set: it reads the
+/// cursor and moves it to cursor + delta, so that pointer speed and acceleration
+/// do not apply. Raw input, which is what a game or a 3D viewport reads, then
+/// sees one absolute event and no motion at all. Field, agent 0.4.140: ten
+/// `mouse_rel {dx: 100}` frames reached the host as 0 relative counts and 10
+/// absolute events. With the flag set, `Rel` is `SendInput` with
+/// `MOUSEEVENTF_MOVE`, the relative event FR-109's P0 measured arriving 1:1.
+/// The visible cursor then follows pointer speed and acceleration, as a real
+/// mouse does. Absolute moves ignore the flag, and no other caller sends `Rel`.
+pub(super) fn enigo_settings() -> Settings {
+    Settings {
+        windows_subject_to_mouse_speed_and_acceleration_level: true,
+        ..Settings::default()
     }
 }
 
@@ -1083,6 +1103,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.calls, ["move 960,540 Abs", "button Left Release"]);
+    }
+
+    /// FR-109 — every enigo this agent builds sends `Coordinate::Rel` as a real
+    /// relative move. With enigo 0.6's default the flag is off, and `Rel` on
+    /// Windows went out as an absolute move to cursor + delta. Raw input saw
+    /// one absolute event and no motion (field, 0.4.140: 10 frames reached the
+    /// host as 0 relative counts and 10 absolute events). The dispatch test
+    /// below checks that `Rel` is asked for; this checks what enigo does with it.
+    #[test]
+    fn enigo_settings_send_relative_moves_as_relative() {
+        let s = enigo_settings();
+        assert!(
+            s.windows_subject_to_mouse_speed_and_acceleration_level,
+            "enigo must send Coordinate::Rel as MOUSEEVENTF_MOVE, not as an absolute move"
+        );
+        // Everything else stays enigo's default.
+        let d = Settings::default();
+        assert_eq!(s.release_keys_when_dropped, d.release_keys_when_dropped);
+        assert_eq!(
+            s.independent_of_keyboard_state,
+            d.independent_of_keyboard_state
+        );
     }
 
     /// FR-109 — relative motion is one relative move, by exactly the counts
