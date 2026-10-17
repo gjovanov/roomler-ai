@@ -1601,6 +1601,18 @@ current month.
 | `upgrade_intent` | the range's collisions, orgs, by limit, and the top 50 orgs with their limits and days | — (core's, read on every server) |
 | `orgs` | every org with a billing history, a paid plan or a collision (≤ 500): plan, status, seats, channel, `paid_since`, billed MRR (`null` = no invoice), the list-price estimate, 30-day cost, margin, collisions | per cell, as above |
 
+> [!NOTE]
+> **"Nothing on record" states what the backfill did, as its ledger row says**
+> ([`no_billing_record`, digest.rs:2050](../crates/api/src/growth/digest.rs)). The panel's `billed` and
+> the digest's share one reason, and it reads three ways:
+>
+> - *the backfill has not run*;
+> - *the backfill on DAY recorded no paid invoice* (none it read names an org on this server);
+> - *the N the backfill on DAY recorded have since been deleted with their org*.
+>
+> Before this, a fixed "the backfill has not run" outlived a real backfill. Production's first run
+> (2026-10-17) read Stripe's one paid invoice, whose customer is no org here, and recorded nothing.
+
 - **The funnel's `paid` step** ([funnel.rs:245](../crates/api/src/growth/funnel.rs)) is the org's
   first invoice paid above 0. It has no window, so it hangs off the org step, not the value
   steps (an org that pays is counted whatever its path to value) and reads "paid so far": its

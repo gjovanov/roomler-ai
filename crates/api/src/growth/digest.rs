@@ -2040,9 +2040,32 @@ async fn newsletter_section(state: &AppState, w: &Windows) -> Result<Newsletter,
     })
 }
 
-/// P4 — why billed revenue is not measured while nothing is on record.
-pub const NO_BILLING_RECORD: &str = "no billing event on record yet: Stripe's webhook has \
-     delivered none of the six billing kinds and the backfill has not run";
+/// P4 — why billed revenue is not measured while nothing is on record, as
+/// the operator's newest backfill (its `growth_pulls` row) says: not run,
+/// run and recording nothing — no paid invoice it read names an org on
+/// this server — or run and recording rows that have since gone with their
+/// org. Read, never assumed: a fixed "the backfill has not run" went on
+/// saying so after a real one (2026-10-17: one paid invoice read, naming no
+/// org here).
+pub fn no_billing_record(
+    backfill: Option<&roomler_ai_services::dao::growth::GrowthPull>,
+) -> String {
+    match backfill {
+        None => "no billing event on record yet: none from Stripe's webhook, and the backfill \
+                 has not run"
+            .to_string(),
+        Some(p) if p.rows == 0 => format!(
+            "no billing event on record yet: none from Stripe's webhook, and the backfill on {} \
+             recorded no paid invoice — none it read names an org on this server",
+            p.day
+        ),
+        Some(p) => format!(
+            "no billing event on record: none from Stripe's webhook, and the {} the backfill on \
+             {} recorded have since been deleted with their org",
+            p.rows, p.day
+        ),
+    }
+}
 
 /// P4 — the billed figures of the windows, pure over `billing_events`
 /// rows (exclusions already applied): MRR at the day's end per currency,
@@ -2122,7 +2145,10 @@ async fn billed_section(
 ) -> Result<Measured<BilledFigures>, DigestError> {
     use roomler_ai_services::billing;
     let Some(first) = billing::record_start(&state.db).await? else {
-        return Ok(Measured::NotMeasured(NotMeasured::now(NO_BILLING_RECORD)));
+        let backfill = billing::last_backfill(&state.db).await?;
+        return Ok(Measured::NotMeasured(NotMeasured::now(no_billing_record(
+            backfill.as_ref(),
+        ))));
     };
     let rows = roomler_ai_services::dao::billing_event::BillingEventDao::new(&state.db)
         .list(None, &excluded_ids(&set.tenants))
@@ -3981,5 +4007,39 @@ mod tests {
             !text.contains("$date") && !text.contains("$numberLong"),
             "{text}"
         );
+    }
+
+    /// P4 — with nothing on record, the reason reads the backfill's ledger
+    /// row: "has not run" only while no run is on record; a run that
+    /// recorded nothing says so and names its day; rows a run recorded and
+    /// that are gone now went with their org.
+    #[test]
+    fn the_no_billing_reason_says_whether_the_backfill_ran() {
+        use roomler_ai_services::dao::growth::{BILLING_BACKFILL_SOURCE, GrowthPull, PullStatus};
+        let run = |rows: u32| GrowthPull {
+            id: GrowthPull::id_of(BILLING_BACKFILL_SOURCE, "2026-10-17"),
+            source: BILLING_BACKFILL_SOURCE.into(),
+            day: "2026-10-17".into(),
+            status: PullStatus::Ok,
+            pulled_at: None,
+            attempted_at: DateTime::parse_rfc3339_str("2026-10-17T21:18:25Z").unwrap(),
+            attempts: 1,
+            rows,
+            error: None,
+            missing_goal: None,
+            truncated: false,
+        };
+        let never = no_billing_record(None);
+        assert!(never.contains("the backfill has not run"), "{never}");
+
+        let empty = no_billing_record(Some(&run(0)));
+        assert!(!empty.contains("has not run"), "{empty}");
+        assert!(empty.contains("the backfill on 2026-10-17"), "{empty}");
+        assert!(empty.contains("names an org on this server"), "{empty}");
+
+        let gone = no_billing_record(Some(&run(3)));
+        assert!(!gone.contains("has not run"), "{gone}");
+        assert!(gone.contains("the 3 the backfill on 2026-10-17"), "{gone}");
+        assert!(gone.contains("deleted with their org"), "{gone}");
     }
 }
