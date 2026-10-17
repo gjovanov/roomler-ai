@@ -228,6 +228,9 @@ export const BUILTIN_PRESETS: readonly TouchPreset[] = [
 /** FR-111 P4 — an org's preset is offered under `org:<its server id>`, so it
  *  can never take a built-in's id. */
 export const ORG_PRESET_PREFIX = 'org:'
+/** FR-111 P4b-2 — a member's own preset, kept in this browser, under
+ *  `mine:<id>`. */
+export const MINE_PRESET_PREFIX = 'mine:'
 
 /** A built-in by its id, or one of `extra` (the org's presets, P4). */
 export function presetById(id: string | null, extra: readonly TouchPreset[] = []): TouchPreset | null {
@@ -264,6 +267,7 @@ export function readControlsPreset(
   try {
     const v = storage?.getItem(CONTROLS_STORAGE_PREFIX + deviceId) ?? null
     if (v?.startsWith(ORG_PRESET_PREFIX) && v.length > ORG_PRESET_PREFIX.length) return v
+    if (v?.startsWith(MINE_PRESET_PREFIX) && v.length > MINE_PRESET_PREFIX.length) return v
     return presetById(v)?.id ?? null
   } catch {
     return null

@@ -382,8 +382,45 @@
               @click="setTouchControls(p.id)"
             />
           </template>
+          <!-- FR-111 P4b-2 — this member's own, kept in this browser. -->
+          <template v-if="myTouchPresets.length">
+            <v-list-subheader>This browser</v-list-subheader>
+            <v-list-item
+              v-for="p in myTouchPresets"
+              :key="p.id"
+              :active="touchControlsPreset?.id === p.id"
+              :title="p.name"
+              :data-testid="`rc-touch-controls-${p.id}`"
+              @click="setTouchControls(p.id)"
+            />
+          </template>
+          <v-divider />
+          <v-list-item
+            title="Edit layouts…"
+            prepend-icon="mdi-pencil-outline"
+            data-testid="rc-touch-controls-edit"
+            @click="touchEditorOpen = true"
+          />
         </v-list>
       </v-menu>
+      <!-- FR-111 P4b-2 — the layout editor: the built-ins (copied, never
+           changed), this member's own in this browser, the org's (changed by
+           an org admin). The keyboard types into it, never into the host. -->
+      <v-dialog v-model="touchEditorOpen" max-width="960" :fullscreen="mobile" scrollable>
+        <TouchPresetEditor
+          v-if="touchEditorOpen"
+          :builtins="BUILTIN_PRESETS"
+          :mine="myTouchPresets"
+          :org="orgTouchList"
+          :can-publish="canPublishTouch"
+          :publish="publishTouchPreset"
+          :delete-org="deleteOrgTouchPreset"
+          :ctrl-is-cmd="rc.hostIsMac.value && rc.ctrlAsCmd.value"
+          @save-mine="saveMyTouchPreset"
+          @delete-mine="deleteMyTouchPreset"
+          @close="touchEditorOpen = false"
+        />
+      </v-dialog>
       <!-- rc.199 — clipboard send / get: frequent connected-session
            actions, kept on the toolbar (not the Settings panel) at
            every viewport. Relocated here from the retired Row 2. -->
@@ -2176,6 +2213,10 @@ import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
 import KeepBusyMenu from '@/components/remote/KeepBusyMenu.vue'
 import TouchControls from '@/components/remote/TouchControls.vue'
+import TouchPresetEditor from '@/components/remote/TouchPresetEditor.vue'
+import { readMyPresets, writeMyPresets } from '@/composables/touchPresetEdit'
+import { useTenantStore } from '@/stores/tenant'
+import { canManageOrgSettings } from '@/utils/permissions'
 import type { KeepBusyPattern } from '@/composables/keepBusy'
 import { displayMatchSummary } from '@/composables/displayMatch'
 import { agentSupportsRelativeMouse, relativeMouseSwitchedOff } from '@/composables/relativeMouse'
@@ -2186,6 +2227,7 @@ import {
   orgPresets,
   presetById,
   readControlsPreset,
+  type TouchPreset,
 } from '@/composables/touchControls'
 import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 import { asSentence } from '@/utils/sentence'
@@ -3216,16 +3258,76 @@ watch(
   },
   { immediate: true },
 )
+/** FR-111 P4b-2 — a member's own layouts, kept in this browser (open
+ *  decision 6), per user. */
+const myTouchPresets = ref<TouchPreset[]>([])
+function myPresetsStorage(): Storage | null {
+  try {
+    return globalThis.localStorage
+  } catch {
+    return null
+  }
+}
+watch(
+  () => authStore.user?.id ?? null,
+  (uid) => {
+    myTouchPresets.value = uid ? readMyPresets(myPresetsStorage(), uid) : []
+  },
+  { immediate: true },
+)
+/** Every preset beside the built-ins: the org's, then this member's own. */
+const extraTouchPresets = computed(() => [...orgTouchList.value, ...myTouchPresets.value])
 const touchControlsPreset = computed(() =>
-  touchModeOffered ? presetById(touchControlsId.value, orgTouchList.value) : null,
+  touchModeOffered ? presetById(touchControlsId.value, extraTouchPresets.value) : null,
 )
 function setTouchControls(id: string | null) {
-  touchControlsId.value = presetById(id, orgTouchList.value)?.id ?? null
+  touchControlsId.value = presetById(id, extraTouchPresets.value)?.id ?? null
   try {
     globalThis.localStorage.setItem(CONTROLS_STORAGE_PREFIX + agentId.value, touchControlsId.value ?? 'off')
   } catch {
     /* blocked site data: this tab only */
   }
+}
+
+/** FR-111 P4b-2 — the layout editor. While it is open the keyboard types into
+ *  it, never into the host (`keyboardPaused`). */
+const touchEditorOpen = ref(false)
+const canPublishTouch = ref(false)
+watch(touchEditorOpen, async (open) => {
+  rc.keyboardPaused.value = open
+  if (!open) return
+  try {
+    const tenants = useTenantStore()
+    await tenants.ensureMyMembership(tenantId.value)
+    canPublishTouch.value = canManageOrgSettings(tenants.myPermissions, tenants.isOwner)
+  } catch {
+    canPublishTouch.value = false
+  }
+})
+onBeforeUnmount(() => {
+  rc.keyboardPaused.value = false
+})
+function saveMyTouchPreset(p: TouchPreset) {
+  const uid = authStore.user?.id
+  if (!uid) return
+  const next = myTouchPresets.value.some((m) => m.id === p.id)
+    ? myTouchPresets.value.map((m) => (m.id === p.id ? p : m))
+    : [...myTouchPresets.value, p]
+  myTouchPresets.value = next
+  writeMyPresets(myPresetsStorage(), uid, next)
+}
+function deleteMyTouchPreset(id: string) {
+  const uid = authStore.user?.id
+  if (!uid) return
+  myTouchPresets.value = myTouchPresets.value.filter((m) => m.id !== id)
+  writeMyPresets(myPresetsStorage(), uid, myTouchPresets.value)
+  if (touchControlsId.value === id) setTouchControls(null)
+}
+function publishTouchPreset(body: { name: string; controls: unknown[] }, serverId: string | null) {
+  return agentStore.saveOrgTouchPreset(tenantId.value, body, serverId)
+}
+function deleteOrgTouchPreset(serverId: string) {
+  return agentStore.deleteOrgTouchPreset(tenantId.value, serverId)
 }
 /** The stage's scroll offsets, so the overlay stays over the part of the
  *  stage on screen when a zoomed picture scrolls. */
