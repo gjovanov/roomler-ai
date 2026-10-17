@@ -40,7 +40,9 @@ use tokio::sync::oneshot;
 // crate exposes a builder-style `bitrate()` only at construction;
 // changing it on a live Encoder requires the C-API SetOption with
 // ENCODER_OPTION_BITRATE + an SBitrateInfo struct.
-use openh264_sys2::{ENCODER_OPTION_BITRATE, SBitrateInfo, SPATIAL_LAYER_0};
+use openh264_sys2::{
+    ENCODER_OPTION_BITRATE, ENCODER_OPTION_FRAME_RATE, SBitrateInfo, SPATIAL_LAYER_0,
+};
 
 use super::{EncodedPacket, VideoEncoder};
 use crate::capture::{Frame, PixelFormat};
@@ -70,6 +72,8 @@ enum Cmd {
     },
     RequestKeyframe,
     SetBitrate(u32),
+    /// FR-112 P2b — the rate the pump feeds frames at.
+    SetFrameRate(u32),
     Shutdown,
 }
 
@@ -213,21 +217,117 @@ fn apply_runtime_bitrate(enc: &mut Encoder, bps: u32) -> Result<()> {
     }
 }
 
+/// FR-112 P2b — set the live encoder's frame rate (`ENCODER_OPTION_FRAME_RATE`,
+/// a float that OpenH264 clips to 1–60). Its rate control budgets each frame's
+/// bits from it.
+fn apply_runtime_frame_rate(enc: &mut Encoder, fps: u32) -> Result<()> {
+    let mut rate = fps as f32;
+    // SAFETY: as `apply_runtime_bitrate` — the option takes a `float*` that
+    // lives for the call, and the encoder is initialised (see `Settings`).
+    let rc = unsafe {
+        let raw = enc.raw_api();
+        raw.set_option(
+            ENCODER_OPTION_FRAME_RATE,
+            (&raw mut rate) as *mut std::ffi::c_void,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "openh264 SetOption(ENCODER_OPTION_FRAME_RATE, {fps}) returned {rc}"
+        ))
+    }
+}
+
+/// FR-112 P2b — what a live encoder's runtime settings wait for. The openh264
+/// crate creates the C encoder's state at the FIRST encode (it needs the
+/// frame's dimensions), and `SetOption` before then answers `cmInitExpected`
+/// (4). The RTP pump applies its bitrate before its first frame, so on every
+/// session that first `set_bitrate` failed, was never retried (the pump had
+/// recorded it as applied), and the encoder ran at its construction bitrate
+/// until REMB moved 15 %. Settings that arrive early are held here and applied
+/// once the first frame is through; the newest of each wins.
+#[derive(Debug, Default)]
+struct Settings {
+    live: bool,
+    bitrate: Option<u32>,
+    frame_rate: Option<u32>,
+}
+
+impl Settings {
+    /// The bitrate to apply now, or `None` when it is held for the first frame.
+    fn bitrate(&mut self, bps: u32) -> Option<u32> {
+        if self.live {
+            return Some(bps);
+        }
+        self.bitrate = Some(bps);
+        None
+    }
+
+    /// The frame rate to apply now, or `None` when it is held.
+    fn frame_rate(&mut self, fps: u32) -> Option<u32> {
+        if self.live {
+            return Some(fps);
+        }
+        self.frame_rate = Some(fps);
+        None
+    }
+
+    /// A frame went through: what was held, to apply now (once).
+    fn went_live(&mut self) -> (Option<u32>, Option<u32>) {
+        if self.live {
+            return (None, None);
+        }
+        self.live = true;
+        (self.bitrate.take(), self.frame_rate.take())
+    }
+}
+
+fn set_bitrate_now(enc: &mut Encoder, bps: u32) {
+    if let Err(e) = apply_runtime_bitrate(enc, bps) {
+        tracing::warn!(bps, %e, "openh264 set_bitrate failed");
+    } else {
+        tracing::debug!(bps, "openh264 set_bitrate applied");
+    }
+}
+
+fn set_frame_rate_now(enc: &mut Encoder, fps: u32) {
+    if let Err(e) = apply_runtime_frame_rate(enc, fps) {
+        tracing::warn!(fps, %e, "openh264 set_frame_rate failed");
+    } else {
+        tracing::info!(fps, "openh264 frame rate applied (FR-112)");
+    }
+}
+
 fn run_worker(enc: &mut Encoder, width: u32, height: u32, cmd_rx: std_mpsc::Receiver<Cmd>) {
+    let mut settings = Settings::default();
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             Cmd::Encode { frame, reply } => {
                 let result = encode_one(enc, width, height, frame);
+                if result.is_ok() {
+                    let (bps, fps) = settings.went_live();
+                    if let Some(bps) = bps {
+                        set_bitrate_now(enc, bps);
+                    }
+                    if let Some(fps) = fps {
+                        set_frame_rate_now(enc, fps);
+                    }
+                }
                 let _ = reply.send(result);
             }
             Cmd::RequestKeyframe => {
                 enc.force_intra_frame();
             }
             Cmd::SetBitrate(bps) => {
-                if let Err(e) = apply_runtime_bitrate(enc, bps) {
-                    tracing::warn!(bps, %e, "openh264 set_bitrate failed");
-                } else {
-                    tracing::debug!(bps, "openh264 set_bitrate applied");
+                if let Some(bps) = settings.bitrate(bps) {
+                    set_bitrate_now(enc, bps);
+                }
+            }
+            Cmd::SetFrameRate(fps) => {
+                if let Some(fps) = settings.frame_rate(fps) {
+                    set_frame_rate_now(enc, fps);
                 }
             }
             Cmd::Shutdown => break,
@@ -314,6 +414,10 @@ impl VideoEncoder for Openh264Encoder {
 
     fn set_bitrate(&mut self, bps: u32) {
         let _ = self.cmd_tx.send(Cmd::SetBitrate(bps));
+    }
+
+    fn set_frame_rate(&mut self, fps: u32) {
+        let _ = self.cmd_tx.send(Cmd::SetFrameRate(fps));
     }
 
     fn name(&self) -> &'static str {
@@ -456,5 +560,71 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_empty());
+    }
+
+    /// FR-112 P2b — the premise of `Settings`: before its first frame the C
+    /// encoder refuses every runtime option (`cmInitExpected`); after it, the
+    /// bitrate and the frame rate take, and the frame rate reads back.
+    #[test]
+    fn options_take_only_after_the_first_frame() {
+        let cfg = EncoderConfig::new().max_frame_rate(FrameRate::from_hz(30.0));
+        let mut enc =
+            Encoder::with_api_config(openh264::OpenH264API::from_source(), cfg).expect("encoder");
+        assert!(
+            apply_runtime_bitrate(&mut enc, 2_000_000).is_err(),
+            "refused before"
+        );
+        assert!(
+            apply_runtime_frame_rate(&mut enc, 60).is_err(),
+            "refused before"
+        );
+        let frame = std::sync::Arc::new(make_bgra_frame(64, 64, 10, 20, 30));
+        encode_one(&mut enc, 64, 64, frame).expect("the first frame");
+        apply_runtime_bitrate(&mut enc, 2_000_000).expect("taken after");
+        apply_runtime_frame_rate(&mut enc, 60).expect("taken after");
+        let mut rate = 0f32;
+        // SAFETY: `ENCODER_OPTION_FRAME_RATE` reads into a `float*` that lives
+        // for the call; the encoder is initialised (a frame went through).
+        let rc = unsafe {
+            enc.raw_api().get_option(
+                ENCODER_OPTION_FRAME_RATE,
+                (&raw mut rate) as *mut std::ffi::c_void,
+            )
+        };
+        assert_eq!((rc, rate), (0, 60.0));
+    }
+
+    /// FR-112 P2b — settings sent before the first frame are held, the newest
+    /// of each wins, they are released once, and later ones apply at once.
+    #[test]
+    fn early_settings_wait_for_the_first_frame() {
+        let mut s = Settings::default();
+        assert_eq!(s.bitrate(1_000_000), None);
+        assert_eq!(s.bitrate(3_000_000), None);
+        assert_eq!(s.frame_rate(60), None);
+        assert_eq!(s.went_live(), (Some(3_000_000), Some(60)));
+        assert_eq!(s.went_live(), (None, None), "released once");
+        assert_eq!(s.bitrate(2_000_000), Some(2_000_000));
+        assert_eq!(s.frame_rate(45), Some(45));
+        let mut s = Settings::default();
+        assert_eq!(s.went_live(), (None, None), "nothing held, nothing applied");
+    }
+
+    /// FR-112 P2b — through the worker: a frame rate and a bitrate sent before
+    /// the first frame cost nothing and break nothing.
+    #[tokio::test]
+    async fn the_worker_holds_settings_until_its_first_frame() {
+        let mut enc = Openh264Encoder::new(64, 64).expect("encoder");
+        enc.set_frame_rate(60);
+        enc.set_bitrate(2_000_000);
+        for shade in [0u8, 128, 255] {
+            let out = enc
+                .encode(std::sync::Arc::new(make_bgra_frame(
+                    64, 64, shade, shade, shade,
+                )))
+                .await
+                .expect("encode");
+            assert!(!out.is_empty());
+        }
     }
 }

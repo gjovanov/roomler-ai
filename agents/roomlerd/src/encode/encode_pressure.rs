@@ -203,6 +203,58 @@ impl Default for FpsPace {
     }
 }
 
+/// FR-112 P2 — a software pump's pace: its encode cost through [`FpsPace`],
+/// never below 0.4.141's software target
+/// ([`SW_PACE_FLOOR_FPS`](super::SW_PACE_FLOOR_FPS)). A host that cannot
+/// sustain 30 then runs exactly as it did: its loop is slower than the 33 ms
+/// cadence, so the gate never waits, and the bitrate base is 30's. Without the
+/// floor, `FpsPace`'s 5-fps steps would pace a 27 fps host to 25.
+///
+/// Its own EWMA (α 0.4, seeded by the first window), not [`EncodePressure`]'s:
+/// that one stops learning under `ROOMLERD_ENCODE_PRESSURE=0`, a kill switch
+/// for the hardware path's bitrate factor that must not also switch the
+/// software pace off. `ROOMLERD_FPS_PACE=0` still does, through `FpsPace`.
+pub struct SoftwarePace {
+    ewma_ms: f32,
+    pace: FpsPace,
+}
+
+impl SoftwarePace {
+    pub fn new() -> Self {
+        Self {
+            ewma_ms: 0.0,
+            pace: FpsPace::new(),
+        }
+    }
+
+    /// Step once per heartbeat window with the window's average encode time
+    /// (ms); a window that encoded nothing says nothing, so pass nothing.
+    /// Returns [`Self::paced`].
+    pub fn observe(&mut self, avg_encode_ms: f32, target_fps: u32) -> Option<u32> {
+        if avg_encode_ms.is_finite() && avg_encode_ms > 0.0 {
+            const ALPHA: f32 = 0.4;
+            self.ewma_ms = if self.ewma_ms <= 0.0 {
+                avg_encode_ms
+            } else {
+                (1.0 - ALPHA) * self.ewma_ms + ALPHA * avg_encode_ms
+            };
+            let _ = self.pace.observe(self.ewma_ms, target_fps);
+        }
+        self.paced()
+    }
+
+    /// The rate the pump runs at (`None` = its target), never below 30.
+    pub fn paced(&self) -> Option<u32> {
+        self.pace.paced().map(|p| p.max(super::SW_PACE_FLOOR_FPS))
+    }
+}
+
+impl Default for SoftwarePace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Long-edge caps per tier: native → ~1440p-class → ~1080p-class floor.
 /// Fed to `effective_target_resolution`'s SOFT slot, so an explicit
 /// controller-side Fixed pick always wins (the auto tier only shapes
@@ -540,5 +592,57 @@ mod tests {
             assert_eq!(t.observe(TierSignal::Down, now), None);
         }
         assert_eq!(t.cap(), None);
+    }
+
+    fn sw_pace() -> SoftwarePace {
+        SoftwarePace {
+            ewma_ms: 0.0,
+            pace: pace(),
+        }
+    }
+
+    /// FR-112 P2 — a software encoder that cannot hold 60 is paced to what it
+    /// sustains, in 5-fps steps, and released to the target once it can.
+    #[test]
+    fn a_software_pump_is_paced_to_what_its_encoder_sustains() {
+        let mut p = sw_pace();
+        assert_eq!(p.observe(25.0, 60), Some(40), "1000 / 25 ms = 40 fps");
+        let mut paced = Some(40);
+        for _ in 0..20 {
+            paced = p.observe(8.0, 60);
+        }
+        assert_eq!(paced, None, "an encoder that holds 60 runs at the target");
+    }
+
+    /// FR-112 P2 — and never below 0.4.141's 30: an encoder that sustains 22
+    /// runs at 30's cadence and base, which on a loop that slow is exactly the
+    /// unpaced 0.4.141 pump.
+    #[test]
+    fn a_software_pump_is_never_paced_below_thirty() {
+        let mut p = sw_pace();
+        assert_eq!(
+            p.observe(45.0, 60),
+            Some(30),
+            "1000 / 45 ms = 22 fps: held at 30, not stepped to 20"
+        );
+        assert_eq!(
+            sw_pace().observe(45.0, 30),
+            Some(30),
+            "a pinned 30 stays 30"
+        );
+    }
+
+    /// FR-112 P2 — a window that encoded nothing moves nothing, and the pace
+    /// does not depend on the hardware path's bitrate-factor kill switch.
+    #[test]
+    fn an_empty_window_leaves_the_pace_alone() {
+        let mut p = sw_pace();
+        assert_eq!(p.observe(25.0, 60), Some(40));
+        assert_eq!(p.observe(0.0, 60), Some(40));
+        assert_eq!(p.observe(f32::NAN, 60), Some(40));
+        assert!(
+            (p.ewma_ms - 25.0).abs() < 1e-3,
+            "seeded by the first window only"
+        );
     }
 }
