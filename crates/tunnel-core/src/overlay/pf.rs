@@ -751,6 +751,17 @@ mod host {
             reassert_once(&self.anchor, self.v6, &self.live);
         }
 
+        /// Our recorded references now carry the value `token`, their pid
+        /// kept: the state pf leaves whenever it hands our freed value to
+        /// another program, made certain for a test.
+        #[cfg(test)]
+        pub(crate) fn pretend_ours_is(&self, token: u64) {
+            let mut l = self.live.lock().unwrap_or_else(|e| e.into_inner());
+            for t in &mut l.tokens {
+                t.token = token;
+            }
+        }
+
         /// Flush the anchor, release the references that are still ours
         /// (never `pfctl -d`), and put forwarding back as found once the last
         /// holder stops.
@@ -1205,6 +1216,10 @@ mod macos_kernel_tests {
             "their pfctl -E got our old value back: {}",
             ours.iter().any(|r| r.token == theirs)
         );
+        // Whether or not the kernel recycled it this time, make the collision
+        // certain: our record holds their value, our pid. Released by value,
+        // as #2362 did, their reference goes and pf with it.
+        serve.pretend_ours_is(theirs);
         serve.stop();
         assert_eq!(pf_status(), "Enabled", "their reference still holds pf on");
         pfctl(&["-X", &theirs.to_string()]);
