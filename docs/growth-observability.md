@@ -652,7 +652,7 @@ goes: `source` → `medium` → `campaign` → `content`, each one UTM dimension
 ### The puller — `saas`, hosted-only
 
 [`crates/modules/saas/src/purestat_pull.rs`](../crates/modules/saas/src/purestat_pull.rs),
-spawned from the module's `init` ([`lib.rs:96`](../crates/modules/saas/src/lib.rs)). No
+spawned from the module's `init` ([`lib.rs:110`](../crates/modules/saas/src/lib.rs)). No
 self-host profile compiles `saas`, and without `ROOMLER__GROWTH__PURESTAT_API_KEY` (or with
 `growth.enabled = false`) it starts nothing and logs that once.
 
@@ -663,7 +663,7 @@ self-host profile compiles `saas`, and without `ROOMLER__GROWTH__PURESTAT_API_KE
 | **A cycle** | starts at 01:00 UTC (purestat closes a visit 30 min after its last event); every day of the horizon is re-pulled once per cycle, which is what catches a late event | `CYCLE_HOUR_UTC` |
 | **A failure** | the day stays due, so the next hourly tick retries; after a fatal error (no key, 401, timeout, unreachable) the run stops asking and records the same reason for every day it owed | `run_once` ([`purestat_pull.rs:309`](../crates/modules/saas/src/purestat_pull.rs)) |
 | **Once across pods** | a DB-name-scoped Redis `NX` claim per tick (`roomler:growth-purestat-pull:<db>`), as the stats rollup and the reapers; without Redis the pod runs locally | `spawn_puller` ([`purestat_pull.rs:370`](../crates/modules/saas/src/purestat_pull.rs)) |
-| **Idempotent** | each row is `$set` on its own `_id` — a day pulled twice holds one copy; an unchanged row is not written; a row of the pulled metrics the pull no longer carries is deleted (write-then-prune, never an empty day) | `GrowthDao::replace_daily` ([`growth.rs:425`](../crates/services/src/dao/growth.rs)) |
+| **Idempotent** | each row is `$set` on its own `_id` — a day pulled twice holds one copy; an unchanged row is not written; a row of the pulled metrics the pull no longer carries is deleted (write-then-prune, never an empty day) | `GrowthDao::replace_daily` ([`growth.rs:471`](../crates/services/src/dao/growth.rs)) |
 
 A day is three purestat queries ([`pull_day`](../crates/modules/saas/src/purestat_pull.rs)),
 each row's `dims.by` naming its breakdown:
@@ -688,12 +688,12 @@ each row's `dims.by` naming its breakdown:
   pull stored are left as they were.
 - `reads` (pageviews visible ≥ 30 s) is the engagement purestat's v1 contract carries; it has
   **no engaged-visitor metric**, so the spec's "engaged visitors" are `reads` here.
-- The `_id` is escaped ([`daily_id`, growth.rs:103](../crates/services/src/dao/growth.rs)):
+- The `_id` is escaped ([`daily_id`, growth.rs:146](../crates/services/src/dao/growth.rs)):
   `%` `,` `=` `:` inside a value are percent-encoded, so a crafted UTM value cannot forge
   another row's id. P3's ids, which contain none of them, are unchanged.
 
 **`growth_pulls`** — one row per `(source, day)` attempted, `_id = "purestat:YYYY-MM-DD"`
-([`GrowthPull`, growth.rs:177](../crates/services/src/dao/growth.rs)):
+([`GrowthPull`, growth.rs:220](../crates/services/src/dao/growth.rs)):
 
 | Field | Meaning |
 |---|---|
@@ -1168,6 +1168,13 @@ Console answers, and nothing here pretends it does:
 **The Bing key**: Bing Webmaster Tools → *Settings → API access → API key → Generate* (the key is
 the user's and covers every site that user verified), sealed into `roomler2-secret` as
 `ROOMLER__GROWTH__BING_API_KEY`.
+
+> ⚠️ **Unlike Google's token, Bing's API key has no scope.** It is one key per Bing user, and it
+> opens every method of the API on every site that user verified: `AddBlockedUrl` (which hides a
+> page from Bing), `RemoveSite` and `AddSiteRoles` as much as the three reads the puller makes
+> (`GetRankAndTrafficStats`, `GetQueryStats`, `GetPageStats`). Hold it as a write credential.
+> Bing's OAuth has a read-only `webmaster.read` scope, but it needs an interactive consent and a
+> stored refresh token; the puller does not implement it.
 
 ## The newsletter: delivery, per-issue tags and unsubscribes (P5)
 

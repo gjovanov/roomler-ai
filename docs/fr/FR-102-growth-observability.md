@@ -1010,6 +1010,12 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
     reader fits inside 30 days: the digest's 28-day window, P9a's nightly freeze of one closed day, and the
     per-device list of the last 50. The per-version counts stay in `growth_quality_daily`. The other
     options were the policy saying 90 days, or a 7-day TTL, which would have deleted 1,646.
+16. **Bing's credential** (raised by P7b, 2026-10-17; not yet put to the operator). Bing's API key has
+    no scope: one key per Bing user opens every method of the API on every site that user verified,
+    writes included (`AddBlockedUrl`, `RemoveSite`, `AddSiteRoles`). **The API key, as P7's brief
+    chose**, held as a write credential in `roomler2-secret`; or Bing's OAuth with its read-only
+    `webmaster.read` scope, which needs a one-time interactive consent and a stored refresh token
+    (not built).
 
 ## 7. Out of scope
 
