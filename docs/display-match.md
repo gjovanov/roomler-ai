@@ -75,7 +75,7 @@ Every request gets exactly one `rc:display-match.state`
 ⚠️ An agent from before FR-108 answers nothing, and the viewer then shows the toggle as it always did. A word
 this viewer does not know, from a newer agent, is shown as it came and never read as success
 ([`displayMatch.ts:39`](../ui/src/composables/displayMatch.ts#L39) `describeDisplayMatchRefusal`). The viewer
-puts the answer under the toggle ([`RemoteControl.vue:3461`](../ui/src/views/remote/RemoteControl.vue#L3461)
+puts the answer under the toggle ([`RemoteControl.vue:3514`](../ui/src/views/remote/RemoteControl.vue#L3514)
 `displayMatchSaid`).
 
 ⚠️ `attended` and `disabled_on_device` hand the screen back: a mode this session applied earlier is restored
@@ -96,7 +96,7 @@ roomler config set display_match auto     # auto (default) | always | never
 
 - **Device-owned:** set over the LocalAPI only by the person at the console
   ([`lib.rs:2838`](../crates/localapi/src/lib.rs#L2838)), and absent from `DesiredConfig`, so a server cannot
-  push it ([`models.rs:7548`](../crates/remote_control/src/models.rs#L7548)). A server that could set it could
+  push it ([`models.rs:7554`](../crates/remote_control/src/models.rs#L7554)). A server that could set it could
   take every screen it reaches.
 - **Read live** at every request ([`display_match.rs:310`](../agents/roomlerd/src/display_match.rs#L310)
   `set_device_policy`).

@@ -45,13 +45,13 @@ additionally refuses a registration whose pubkey is not the row's (`derp.rs:339-
 | how a session gets its key | `agents/roomlerd/src/signaling.rs:444-449`, `:881-883`; `overlay.rs:210-217` | from the in-memory `AgentConfig` snapshot taken at start — **never re-read from disk per session** |
 | runtime identity | `agents/roomlerd/src/overlay.rs:79-86` (`RuntimeFingerprint::same_shape` includes `wg_public_key`), `:236-243`, `:417-425` | a changed secret already fails re-attach and rebuilds the runtime |
 | existing per-org cycle | `main.rs:2820-2851` (`spawn_org`: stop the previous loop, re-load config from disk, respawn) | the primary loop has NO stop handle |
-| server join | `crates/api/src/ws/overlay.rs:232`, `:279-297` (`wg_key_taken_by_other`, machine-scoped ⇒ a same-machine rotation is allowed), `:299-390` (`rehydrate` stores `wg_public_key` + `key_epoch`) | `key_epoch` is stored and **read by nothing** (`models.rs:2725`; the agent always sends 0, `runtime.rs:1921`) |
+| server join | `crates/api/src/ws/overlay.rs:232`, `:279-297` (`wg_key_taken_by_other`, machine-scoped ⇒ a same-machine rotation is allowed), `:299-390` (`rehydrate` stores `wg_public_key` + `key_epoch`) | `key_epoch` is stored and **read by nothing** (`models.rs:2731`; the agent always sends 0, `runtime.rs:1921`) |
 | peer fan-out | `overlay.rs:531-561` → `OverlayNetmapDelta { upserts, removes }` (`signaling.rs:1824`) | an upsert IS the update; the re-join already carries the new key to every peer |
 | peer reinstall | `crates/tunnel-core/src/overlay/runtime/establish.rs:1147-1180` | "peer's WG public key changed — reinstalling its carrier" (`PeerRoute::Keep`) |
 | DERP | `crates/api/src/ws/derp.rs:339-362` (pubkey must equal the row's), `derp_acl.rs:99-140` rebuilt on every join (`overlay.rs:481-490`) | the row must carry the new key BEFORE the node re-registers — the join does exactly that |
 | the push precedent | `crates/api/src/routes/remote_control.rs:831-872` (`trigger_agent_update`, `MANAGE_AGENTS`, `Hub::send_to_agent`), agent arm `signaling.rs:2740-2762` (primary-only) | `UpdateNow` is sent BLIND — no cap gate |
-| the report-back precedent | `ClientMsg::ConfigStatus` (`signaling.rs:461`), `record_config_report` (`ws/remote_control.rs:940-985`), `config_audit` (`models.rs:2294-2280`) | the shape to copy: revision-bumped request, device reports the revision, server resolves ONE state |
-| capability verbs | `crates/remote_control/src/models.rs:271-373` | `RpcCap` — no rotation verb exists |
+| the report-back precedent | `ClientMsg::ConfigStatus` (`signaling.rs:461`), `record_config_report` (`ws/remote_control.rs:940-985`), `config_audit` (`models.rs:2300-2286`) | the shape to copy: revision-bumped request, device reports the revision, server resolves ONE state |
+| capability verbs | `crates/remote_control/src/models.rs:271-379` | `RpcCap` — no rotation verb exists |
 | UI | `ui/src/components/admin/AgentsSection.vue:1884-1906`, `ui/src/stores/agents.ts:688-696` | "Update now"; **no view shows the overlay public key anywhere** |
 | retired keys | — | none: `wg_key_taken_by_other` is live-scoped, a tombstone's key neither blocks nor denies |
 

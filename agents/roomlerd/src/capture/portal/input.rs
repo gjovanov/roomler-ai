@@ -148,6 +148,15 @@ pub fn plan(msg: &InputMsg, logical: (f64, f64), wheel: &mut WheelAccum) -> Vec<
             code: i32::from(button_code(*btn)),
             down: false,
         }],
+        // FR-109 — relative mode's press, the release's twin: no motion.
+        InputMsg::MousePress { btn } => vec![PortalCall::Button {
+            code: i32::from(button_code(*btn)),
+            down: true,
+        }],
+        // FR-109 P2 — the portal has relative motion (`NotifyPointerMotion`,
+        // no stream needed), but this path does not carry it yet, so this
+        // agent never advertises `mouse-rel` and nothing is sent.
+        InputMsg::MouseRel { .. } => vec![],
         InputMsg::MouseWheel { dx, dy, mode } => match mode {
             // Smooth deltas pass through: the browser's pixels are already
             // libinput's "scroll distance", positive down/right on both ends.
@@ -636,6 +645,20 @@ mod tests {
                 down: false
             }]
         );
+    }
+
+    /// FR-109 — relative mode's press, the release's twin: a button and no
+    /// motion. Relative motion itself plans nothing until P2.
+    #[test]
+    fn a_relative_press_never_moves_the_pointer() {
+        assert_eq!(
+            plan1(InputMsg::MousePress { btn: Button::Left }),
+            vec![PortalCall::Button {
+                code: 0x110,
+                down: true
+            }]
+        );
+        assert_eq!(plan1(InputMsg::MouseRel { dx: 5, dy: 5 }), vec![]);
     }
 
     /// Clicks position first, then press — same rule as uinput, same reason.
