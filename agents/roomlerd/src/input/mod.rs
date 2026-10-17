@@ -168,8 +168,9 @@ pub const MOUSE_REL_ENV: &str = "ROOMLERD_INPUT_MOUSE_REL";
 /// SystemContext both inject through the same enigo `dispatch` (`SendInput`
 /// relative). On Linux it is uinput's relative pointer (P2b), a RemoteDesktop
 /// session on Wayland (P2c) or enigo on a real X11 display (P2a),
-/// [`linux_injector_carries_rel`]. macOS comes later in P2, so until then it
-/// never receives the frame.
+/// [`linux_injector_carries_rel`]. On macOS it is enigo's CGEvent motion in a
+/// GUI session with the Accessibility grant (P2d),
+/// [`macos_injector_carries_rel`].
 pub fn advertises_mouse_rel() -> bool {
     !mouse_rel_switched_off(std::env::var(MOUSE_REL_ENV).ok().as_deref()) && injector_carries_rel()
 }
@@ -227,12 +228,41 @@ fn uinput_would_inject(brief: Option<&roomler_ai_remote_control::models::Desktop
     }
 }
 
+/// Read at every announcement, like the Linux brief: a grant given while the
+/// daemon runs is announced by the next heartbeat.
+#[cfg(all(target_os = "macos", feature = "enigo-input"))]
+fn injector_carries_rel() -> bool {
+    macos_injector_carries_rel(
+        crate::tcc::has_gui_session(),
+        crate::tcc::accessibility_trusted(),
+    )
+}
+
 #[cfg(not(all(
-    any(target_os = "windows", target_os = "linux"),
+    any(target_os = "windows", target_os = "linux", target_os = "macos"),
     feature = "enigo-input"
 )))]
 fn injector_carries_rel() -> bool {
     false
+}
+
+/// FR-109 P2d — on macOS, whether the input a session opens now carries
+/// relative motion. enigo's `Coordinate::Rel` posts a `MouseMoved` (or, with a
+/// button held, a `…Dragged`) CGEvent at the cursor plus the delta, and sets
+/// the event's `MOUSE_EVENT_DELTA_X/Y` to the delta itself, which is what a
+/// game reading raw deltas takes. Both of these must hold:
+/// - **a GUI session.** The root LaunchDaemon is in session 0 with no
+///   WindowServer, and its TCC preflight can still answer "granted" (FR-80),
+///   so the grant alone would advertise a word no event could honour.
+/// - **the Accessibility grant.** Without it macOS drops every `CGEventPost`
+///   and reports success, and the enigo we ship refuses to construct, so the
+///   session falls back to no input at all.
+#[cfg_attr(
+    not(all(target_os = "macos", feature = "enigo-input")),
+    allow(dead_code)
+)]
+pub(crate) fn macos_injector_carries_rel(gui_session: bool, accessibility: bool) -> bool {
+    gui_session && accessibility
 }
 
 /// FR-109 P2 — on Linux, whether the input a session opens now carries
@@ -693,9 +723,11 @@ mod tests {
         assert!(!mouse_rel_switched_off(None));
     }
 
-    /// FR-109 — outside Windows, nothing is advertised while no X11 desktop
-    /// brief says enigo reaches the session: a test process has none.
-    #[cfg(not(target_os = "windows"))]
+    /// FR-109 — on Linux, nothing is advertised while no X11 desktop brief
+    /// says enigo reaches the session: a test process has none. (Not on
+    /// macOS, where the answer is the grant of whatever launched the test,
+    /// [`fr109_macos_needs_a_gui_session_and_the_grant`].)
+    #[cfg(target_os = "linux")]
     #[test]
     fn fr109_no_brief_advertises_no_mouse_rel() {
         assert!(!advertises_mouse_rel());
@@ -763,6 +795,20 @@ mod tests {
             Some(&brief("tty", "none"))
         ));
         assert!(!linux_injector_carries_rel(false, None));
+    }
+
+    /// FR-109 P2d — on macOS, the word needs a GUI session AND the
+    /// Accessibility grant. The root LaunchDaemon's preflight can answer
+    /// "granted" with no WindowServer to post into, so a grant alone is no.
+    #[test]
+    fn fr109_macos_needs_a_gui_session_and_the_grant() {
+        assert!(macos_injector_carries_rel(true, true));
+        assert!(
+            !macos_injector_carries_rel(false, true),
+            "the root LaunchDaemon"
+        );
+        assert!(!macos_injector_carries_rel(true, false), "no grant");
+        assert!(!macos_injector_carries_rel(false, false));
     }
 
     /// FR-109 AC6 — relative mode only INJECTS: no hook, raw-input sink or key
