@@ -206,7 +206,11 @@ software. The GPU's work is the capture.
 - The per-user portal and mutter arms: the compositor hands over its own buffers there.
 - **The X11 backend's frame gate** (`scrap_backend.rs`, `next_frame`) times its period from the arrival
   too, so it should pay for every grab the same way P2b found. It is a follow-up with its own before/after
-  on an X11 host, not changed here without one.
+  on an X11 host, not changed here without one. **Done in #2421** (2026-10-17), on Linux only. The before/after
+  was a kept vmtest Ubuntu cell, GNOME on Xorg, master against master plus the change, alternated A B A B at a
+  60 fps target. At 3840×2160, H.264/RTP went from 32.6 and 33.8 fps to 46.1 and 46.5 (+39 %). VP9-444 stayed at
+  16–18 fps either way, bound by its 30 ms CPU resample. At 1280×800 (a ~1 ms grab) it went from 55.5 to 57.6 fps.
+  An idle desktop cost the same.
 - **The VP9-444 path's encode budget.** On a fast link the rate control rises to ~17.5 Mbps at QP 6, and
   libvpx (8 threads, row-mt, 4 tile columns, `cpu-used` 6) is then the slowest stage. It stayed under the
   frame period after P3 (27.9 fps), but trading quality for frame rate under motion is rate control's
