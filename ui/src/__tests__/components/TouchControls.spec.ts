@@ -175,4 +175,70 @@ describe('TouchControls (FR-111 P3)', () => {
       ['key', HID.Space, false],
     ])
   })
+
+  it('FR-111 P4 — a macro plays its steps, stays lit after the lift until it ends, and stops on a preset change', async () => {
+    // Only the timeouts: the frames stay the test's own (`frames`).
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const { sink, calls } = sinkRecorder()
+      const preset: TouchPreset = {
+        id: 'org:a1',
+        name: 'Org',
+        controls: [
+          {
+            kind: 'row',
+            id: 'm',
+            at: {},
+            buttons: [
+              {
+                id: 'paste',
+                label: 'Paste',
+                action: {
+                  kind: 'macro',
+                  steps: [
+                    { op: 'press', key: HID.ControlLeft },
+                    { op: 'tap', key: HID.KeyV, wait_ms: 100 },
+                    { op: 'release', key: HID.ControlLeft },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      }
+      const w = mount(TouchControls, { props: { preset, sink }, attachTo: document.body })
+      wrapper = w
+      const btn = () => w.find('[data-testid="rc-tc-m-paste"]')
+      pointer(btn().element, 'pointerdown', { id: 1 })
+      pointer(btn().element, 'pointerup', { id: 1 })
+      await nextTick()
+      expect(calls).toEqual([['key', HID.ControlLeft, true]])
+      expect(btn().classes()).toContain('tc-held') // lit after the lift: it still plays
+      vi.advanceTimersByTime(0)
+      expect(calls.slice(1)).toEqual([
+        ['key', HID.KeyV, true],
+        ['key', HID.KeyV, false],
+      ])
+      vi.advanceTimersByTime(100)
+      // A zero wait set from inside a timer fires 1 ms later under fake timers.
+      vi.advanceTimersByTime(10)
+      expect(calls.slice(3)).toEqual([['key', HID.ControlLeft, false]])
+      // The light's check finds it finished (and queues no further frame).
+      for (let guard = 0; frames.length && guard < 10; guard++) frames.shift()!(0)
+      expect(frames.length).toBe(0)
+      await nextTick()
+      expect(btn().classes()).not.toContain('tc-held')
+      // A preset change mid-macro stops it and lets go of what it holds.
+      pointer(btn().element, 'pointerdown', { id: 2 })
+      await w.setProps({ preset: presetById('arrows') as TouchPreset } as unknown as Parameters<typeof w.setProps>[0])
+      expect(calls.slice(4)).toEqual([
+        ['key', HID.ControlLeft, true],
+        ['key', HID.ControlLeft, false],
+      ])
+      vi.advanceTimersByTime(1000) // a stopped macro never plays on
+      expect(calls).toHaveLength(6)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

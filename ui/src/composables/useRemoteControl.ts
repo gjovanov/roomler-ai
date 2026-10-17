@@ -5910,6 +5910,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   // picture then enters relative mode, and the cursor coming back
   // (`cursor:pos`) leaves it, but only a lock the switch itself took.
   const relativeMouseAuto = ref(false)
+  /** FR-111 P4b-2 — while a viewer dialog takes typing (the layout editor's
+   *  names and labels), the keyboard does not reach the host: the window's
+   *  key listener leaves every event to the page. Setting it lets go of
+   *  what the keyboard holds on the host. */
+  const keyboardPaused = ref(false)
   const hostCursorHidden = ref(false)
   /** This cursor channel has carried the host's pointer (`cursor:pos` or
    *  `cursor:shape`). A tracker that cannot see the pointer (Linux without DRM
@@ -10796,6 +10801,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
 
     function onKey(ev: KeyboardEvent, down: boolean) {
+      // FR-111 P4b-2 — a dialog is taking the typing: leave the event to it,
+      // untouched (no preventDefault, no stopPropagation).
+      if (keyboardPaused.value) return
       // Ctrl+Alt+End (RDP convention) / literal Ctrl+Alt+Del Ã¢ÂÂ
       // canonical SAS sequence via sendCtrlAltDel(). Swallow BOTH key
       // directions so no stray End/Delete HID events reach the host;
@@ -11144,8 +11152,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // (Tab navigation, Esc closing dialogs) still work.
     window.addEventListener('keydown', onKeyDown, { capture: true })
     window.addEventListener('keyup', onKeyUp, { capture: true })
+    // FR-111 P4b-2 — pausing the keyboard lets go of what it holds on the
+    // host: the key-ups of a chord held at that moment will go to the dialog.
+    const stopPauseWatch = watch(keyboardPaused, (paused) => {
+      if (paused) releaseHeldInputs()
+    })
 
     return () => {
+      stopPauseWatch()
       if (benchSurface === surface) benchSurface = null
       surface.removeEventListener('pointermove', onPointerMove)
       if ('onpointerrawupdate' in surface) {
@@ -12348,6 +12362,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     /** FR-109 P3 — the lock was taken by the auto-switch (the host hid its
      *  cursor), not from the toolbar. */
     relativeMouseAuto,
+    /** FR-111 P4b-2 — set while a viewer dialog takes typing. */
+    keyboardPaused,
     enterRelativeMouse,
     exitRelativeMouse,
     setRelativeMouseAllowed,

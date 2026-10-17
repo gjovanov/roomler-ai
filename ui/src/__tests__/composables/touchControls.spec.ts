@@ -9,13 +9,18 @@ import {
   dpadKeys,
   HID,
   hidLabel,
+  MACRO_STEP_MAX_MS,
   modsOf,
+  ORG_PRESET_PREFIX,
+  orgPresets,
   placeStyle,
+  presetById,
   readControlsPreset,
   stickVelocity,
   type ButtonControl,
   type ControlsSink,
   type DpadControl,
+  type DriverTimers,
   type MouseBtn,
   type StickControl,
 } from '@/composables/touchControls'
@@ -288,5 +293,177 @@ describe('FR-111 P3 createControlsDriver', () => {
       { k: HID.ControlLeft, down: false },
     ])
     expect(d.active()).toBe(false)
+  })
+})
+
+/** Timers the test steps by hand: each `set` queues, `run` fires the next. */
+function fakeTimers() {
+  const queue: Array<{ fn: () => void; ms: number; live: boolean }> = []
+  return {
+    waits: () => queue.map((q) => q.ms),
+    pending: () => queue.filter((q) => q.live).length,
+    timers: {
+      set: (fn: () => void, ms: number) => {
+        const t = { fn, ms, live: true }
+        queue.push(t)
+        return t
+      },
+      clear: (h: unknown) => {
+        ;(h as { live: boolean }).live = false
+      },
+    } satisfies DriverTimers,
+    /** Fire every live timer, oldest first, until none is left. */
+    drain() {
+      for (let guard = 0; guard < 100; guard++) {
+        const t = queue.find((q) => q.live)
+        if (!t) return
+        t.live = false
+        t.fn()
+      }
+    },
+  }
+}
+
+const pasteTwice: ButtonControl = {
+  id: 'paste2',
+  label: 'Paste x2',
+  action: {
+    kind: 'macro',
+    steps: [
+      { op: 'press', key: HID.ControlLeft },
+      { op: 'tap', key: HID.KeyV, wait_ms: 120 },
+      { op: 'tap', key: HID.KeyV },
+      { op: 'release', key: HID.ControlLeft },
+    ],
+  },
+}
+
+describe('FR-111 P4 macros', () => {
+  it('plays its steps in order, a tap as a press and a release, with the waits between', () => {
+    const { sink, sent } = recordingSink()
+    const t = fakeTimers()
+    const d = createControlsDriver(sink, t.timers)
+    d.pressButton(1, pasteTwice)
+    expect(sent).toEqual([{ k: HID.ControlLeft, down: true }])
+    expect(d.playing('paste2')).toBe(true)
+    t.drain()
+    expect(sent).toEqual([
+      { k: HID.ControlLeft, down: true },
+      { k: HID.KeyV, down: true },
+      { k: HID.KeyV, down: false },
+      { k: HID.KeyV, down: true },
+      { k: HID.KeyV, down: false },
+      { k: HID.ControlLeft, down: false },
+    ])
+    expect(t.waits()).toEqual([0, 120, 0, 0])
+    expect(d.playing('paste2')).toBe(false)
+  })
+
+  it('plays to its end after the finger lifts, and ignores a press while it plays', () => {
+    const { sink, sent } = recordingSink()
+    const t = fakeTimers()
+    const d = createControlsDriver(sink, t.timers)
+    d.pressButton(1, pasteTwice)
+    d.release(1)
+    d.pressButton(2, pasteTwice) // still playing: ignored
+    d.release(2)
+    expect(d.active()).toBe(true)
+    t.drain()
+    expect(sent.filter((s) => 'k' in s && s.k === HID.KeyV && s.down)).toHaveLength(2)
+    expect(d.active()).toBe(false)
+    // Once it has finished, a press plays it again.
+    d.pressButton(3, pasteTwice)
+    t.drain()
+    expect(sent.filter((s) => 'k' in s && s.k === HID.KeyV && s.down)).toHaveLength(4)
+  })
+
+  it('releaseAll stops it and lets go of what it holds', () => {
+    const { sink, sent } = recordingSink()
+    const t = fakeTimers()
+    const d = createControlsDriver(sink, t.timers)
+    d.pressButton(1, pasteTwice)
+    d.releaseAll()
+    expect(sent).toEqual([
+      { k: HID.ControlLeft, down: true },
+      { k: HID.ControlLeft, down: false },
+    ])
+    expect(t.pending()).toBe(0)
+    t.drain() // a cleared step never runs
+    expect(sent).toHaveLength(2)
+    expect(d.playing('paste2')).toBe(false)
+  })
+
+  it('releases only what it pressed, and lets go of a press with no release at its end', () => {
+    const { sink, sent } = recordingSink()
+    const t = fakeTimers()
+    const d = createControlsDriver(sink, t.timers)
+    d.pressButton(1, ctrl) // another finger holds Ctrl
+    const odd: ButtonControl = {
+      id: 'odd',
+      label: 'Odd',
+      action: {
+        kind: 'macro',
+        steps: [
+          { op: 'release', key: HID.ControlLeft }, // not this macro's: ignored
+          { op: 'press', key: HID.ShiftLeft }, // never released by a step
+          { op: 'tap', btn: 'right', wait_ms: 50 },
+        ],
+      },
+    }
+    d.pressButton(2, odd)
+    t.drain()
+    expect(sent).toEqual([
+      { k: HID.ControlLeft, down: true },
+      { k: HID.ShiftLeft, down: true },
+      { b: 'right', down: true },
+      { b: 'right', down: false },
+      { k: HID.ShiftLeft, down: false },
+    ])
+    // The other finger's Ctrl is still down until that finger lifts.
+    d.release(1)
+    expect(sent[sent.length - 1]).toEqual({ k: HID.ControlLeft, down: false })
+  })
+
+  it('never waits longer than a step may, whatever a stored row says', () => {
+    const { sink } = recordingSink()
+    const t = fakeTimers()
+    const d = createControlsDriver(sink, t.timers)
+    d.pressButton(1, {
+      id: 'slow',
+      label: 'Slow',
+      action: { kind: 'macro', steps: [{ op: 'tap', key: HID.KeyA, wait_ms: 60_000 }] },
+    })
+    expect(t.waits()).toEqual([MACRO_STEP_MAX_MS])
+  })
+})
+
+describe('FR-111 P4 the org presets', () => {
+  it('offers the server rows under org ids, and leaves out a row that is not a preset', () => {
+    const got = orgPresets([
+      { id: 'a1', name: 'Game pad', controls: [], updated_at: 'x' },
+      { id: 7, name: 'bad id', controls: [] },
+      { name: 'no id', controls: [] },
+      { id: 'b2', name: 'no controls' },
+      null,
+    ])
+    expect(got).toEqual([{ id: `${ORG_PRESET_PREFIX}a1`, name: 'Game pad', controls: [] }])
+    expect(orgPresets({ items: [] })).toEqual([])
+  })
+
+  it('finds an org preset beside the built-ins, and a built-in id always means the built-in', () => {
+    const org = orgPresets([{ id: 'a1', name: 'Game pad', controls: [] }])
+    expect(presetById(`${ORG_PRESET_PREFIX}a1`, org)?.name).toBe('Game pad')
+    expect(presetById(`${ORG_PRESET_PREFIX}a1`)).toBeNull()
+    expect(presetById(BUILTIN_PRESETS[0].id, [{ id: BUILTIN_PRESETS[0].id, name: 'impostor', controls: [] }])).toBe(
+      BUILTIN_PRESETS[0],
+    )
+  })
+
+  it('remembers an org preset id until the list arrives', () => {
+    const store = new Map([[`${CONTROLS_STORAGE_PREFIX}dev1`, `${ORG_PRESET_PREFIX}a1`]])
+    const storage = { getItem: (k: string) => store.get(k) ?? null }
+    expect(readControlsPreset(storage, 'dev1')).toBe(`${ORG_PRESET_PREFIX}a1`)
+    store.set(`${CONTROLS_STORAGE_PREFIX}dev1`, ORG_PRESET_PREFIX)
+    expect(readControlsPreset(storage, 'dev1')).toBeNull()
   })
 })
