@@ -20,7 +20,7 @@ Nothing to install on the controlling side stays true: Pointer Lock is a web API
 
 | What | Where |
 |---|---|
-| Every move is absolute: `mouse_move {x, y, mon}`, normalised `0..1` per monitor, so a resolution change mid-session needs no resync | [`input/mod.rs:191`](../../agents/roomlerd/src/input/mod.rs#L191) `InputMsg` |
+| Every move is absolute: `mouse_move {x, y, mon}`, normalised `0..1` per monitor, so a resolution change mid-session needs no resync | [`input/mod.rs:238`](../../agents/roomlerd/src/input/mod.rs#L238) `InputMsg` |
 | enigo moves to an absolute pixel | [`enigo_backend.rs:152`](../../agents/roomlerd/src/input/enigo_backend.rs#L152) `Coordinate::Abs` |
 | The uinput device is an absolute tablet **by design**: "a relative device would force us to track the pointer and guess at acceleration" | [`uinput_backend.rs:18`](../../agents/roomlerd/src/input/uinput_backend.rs#L18), axes at `:298` |
 | The portal path moves with `NotifyPointerMotionAbsolute` on the stream | [`portal/input.rs:449`](../../agents/roomlerd/src/capture/portal/input.rs#L449) |
@@ -112,7 +112,7 @@ happens while the host is locked.
 The agent only injects. It never reads input, so there is no hook, no raw-input sink and no key polling, by
 FR-92's rule. The field probes that read raw input (§5) are test scripts on throwaway guests, never part
 of `roomlerd`. A unit test holds this
-([`input/mod.rs:618`](../../agents/roomlerd/src/input/mod.rs#L618) `fr109_relative_mouse_reads_no_input`,
+([`input/mod.rs:688`](../../agents/roomlerd/src/input/mod.rs#L688) `fr109_relative_mouse_reads_no_input`,
 AC6). It scans the six files relative mode touches for hooks, raw-input registration and reads,
 keyboard-state reads, an evdev grab, XRecord, XI2 event selection and a macOS event tap. It allows exactly
 one key-state call: FR-92's own keep-busy check for a held mouse button (`buttons_held_now`), and only
@@ -141,7 +141,7 @@ inside that function.
 |---|---|---|---|
 | P0 | This spec and the claim. Probes: (1) Windows `SendInput` relative from the user worker and from SystemContext, read by a raw-input probe that hides and recentres the cursor, with acceleration on and off; (2) X11 XTest relative; (3) a relative uinput device beside the tablet, on GNOME and KDE; (4) the portal's `NotifyPointerMotion`; (5) the browsers: Pointer Lock, `unadjustedMovement`, Esc under Keyboard Lock | docs only | spec and claim 2026-10-16 (#2334). **(1), (2) and (5) measured** (§8 rows 1, 2, 4): relative `SendInput` and relative XTest both reach a raw reader 1:1, absolute moves give it nothing on either, and every headless engine rejects `unadjustedMovement`. Owed: (1) from SystemContext (AC1's green), (3) uinput beside the tablet, (4) the portal, which decide the rest of P2 |
 | P1 | The wire, the gate, enigo's relative path (Windows user and SystemContext), the arbiter, the viewer's toggle and pump | agent `ROOMLERD_INPUT_MOUSE_REL=0` (stops advertising `mouse-rel`); viewer `roomler-rc-relative-mouse=off` | **built** (3g): `mouse_rel` and `mouse_press` in every backend's match. Windows advertises `mouse-rel`; Linux and macOS do not until P2, and their backends press where the pointer is but drop relative motion. Unit tests: wire spellings, the kill switch, enigo's calls, the arbiter, uinput's events, the portal plan, and the viewer's accumulator and gate (vitest 2153). Negative controls, each of which failed its test: a prefix-matched cap, rounding in the accumulator (it passed at first, so the test was tightened), a dropped carry, an untracked press, and a press that moves first. **Shipped in 0.4.140, where the field found a Windows relative move going out ABSOLUTE** (enigo's default, §8 row 5). It is fixed by building every enigo with `windows_subject_to_mouse_speed_and_acceleration_level` (#2352, merged `29184b9a3`), and the fix rides the next agent release. **On #2352's candidate, AC1 is green on both Windows paths and AC4 is green** (§8 rows 6–8). AC6's source scan is added. AC3 is green with master's viewer served into the page (§8 row 9). Owed: AC1 and AC4 again on the release that carries #2352, and AC3 again once a promote serves the viewer |
-| P2 | uinput's relative device; the portal and macOS by P0's answers | the same | — |
+| P2 | X11 through enigo's XTest (P2a); uinput's relative device, the portal and macOS by P0's answers | the same | **P2a built**: on Linux, `advertises_mouse_rel` asks `linux_xtest_carries_rel`. It is yes only when the cached desktop brief is an `x11` session with `full` input reach, uinput is not opted in, and no automatic system capture (FR-95) is alive, because those two route a session to uinput. enigo's `MouseRel` arm already sent XTest relative motion on every OS, so the advertisement was all that was missing. A unit test covers the predicate's eight cases. The field cell on an X11 host is owed. uinput's relative device, the portal and macOS: not built |
 | P3 | Auto-switch on `cursor:hide` | viewer storage key | — |
 | P4 | Docs: `docs/relative-mouse.md`, linked from `docs/remote-control.md` §6 and indexed in `docs/README.md` | — | the page exists from P1 and grows with each phase |
 
