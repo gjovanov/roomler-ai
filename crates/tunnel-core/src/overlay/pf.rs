@@ -198,8 +198,10 @@ pub(crate) struct StarterRef {
 ///
 /// or `No pf starter references held`. `None` for anything else, a row that
 /// does not parse included, so a caller can tell "none held" from "could not
-/// read them". A process name may hold spaces; the timestamp is the last three
-/// fields.
+/// read them". A row starts with its pid; any other line is one of pfctl's
+/// notices (`No ALTQ support in kernel`), which follow the table once its
+/// stderr is joined after its stdout. A process name may hold spaces; the
+/// timestamp is the last three fields.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn parse_references(output: &str) -> Option<Vec<StarterRef>> {
     let mut rows = Vec::new();
@@ -212,7 +214,7 @@ pub(crate) fn parse_references(output: &str) -> Option<Vec<StarterRef>> {
             header = true;
             continue;
         }
-        if !header || l.is_empty() {
+        if !header || !l.starts_with(|c: char| c.is_ascii_digit()) {
             continue;
         }
         let f: Vec<&str> = l.split_whitespace().collect();
@@ -968,6 +970,26 @@ mod tests {
             ),
             Some(vec![])
         );
+        // As the daemon reads it: stdout (the table), THEN stderr (the
+        // notices). Read as notices, not as rows that fail to parse: the first
+        // cut returned None here, so a stop kept our reference and pf stayed
+        // on (CI's macOS kernel test, 2026-10-17).
+        let joined = "TOKENS:\n\
+                      PID      Process Name                 TOKEN                    TIMESTAMP\n\
+                      751      pfctl                        5506544203745733392      0 days 00:00:00\n\
+                      No ALTQ support in kernel\n\
+                      ALTQ related functions disabled\n";
+        assert_eq!(
+            parse_references(joined).map(|r| r.len()),
+            Some(1),
+            "the notices after the table are not rows"
+        );
+        assert_eq!(
+            parse_references(
+                "No pf starter references held\nNo ALTQ support in kernel\nALTQ related functions disabled\n"
+            ),
+            Some(vec![])
+        );
         // A name with a space, and a token held for days.
         let r = parse_references(
             "TOKENS:\nPID      Process Name                 TOKEN                    TIMESTAMP\n\
@@ -1117,6 +1139,15 @@ mod macos_kernel_tests {
             anchor_nat(&anchor)
         );
         assert_eq!(fwd4(), "1", "forwarding on while serving");
+        // Read as the daemon reads it (stdout, then stderr).
+        let listed = pfctl(&["-s", "References"]);
+        eprintln!("pf references while serving:\n{listed}");
+        let refs = super::parse_references(&listed).expect("pf's references parse");
+        assert_eq!(
+            refs.iter().filter(|r| r.name == "pfctl").count(),
+            1,
+            "one reference of ours: {refs:?}"
+        );
         serve.stop();
         assert_eq!(anchor_nat(&anchor).trim(), "", "our anchor is empty again");
         assert_eq!(pf_status(), status0, "pf back as found");
