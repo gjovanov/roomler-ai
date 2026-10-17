@@ -131,7 +131,7 @@ REFUSAL (`other`), and only an absent or `null` field means recorded.
 ### 2. The capability — `ssh-grant-ack`, read from the LIVE connection
 
 `RpcCap::SshGrantAck` = `ssh-grant-ack`, advertised only by `ssh-server` builds, next to
-`ssh` and `ssh-consent` (`agents/roomlerd/src/encode/caps.rs:1546`).
+`ssh` and `ssh-consent` (`agents/roomlerd/src/encode/caps.rs:1587`).
 
 ⚠️ **Equality-matched**, like every verb: `ssh` is a prefix of `ssh-grant-ack` exactly as it
 is of `ssh-consent`, and `starts_with` would mark every `ssh` agent ack-capable — the

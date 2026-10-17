@@ -1072,7 +1072,7 @@ sequenceDiagram
   for the new console user and stops the old worker's process group, recorder
   included. The partial is finalized as `interrupted` the next time that
   person records (the recorder reconciles its staging folder as it starts,
-  `child.rs:358`); a recording never follows a user switch.
+  `child.rs:370`); a recording never follows a user switch.
 - ⚠️ **Not built on macOS yet:** the microphone and computer audio (P1c-mac:
   cpal, `NSMicrophoneUsageDescription`, the `audio-input` entitlement,
   ScreenCaptureKit on 13+). They are refused by name, and computer audio is
