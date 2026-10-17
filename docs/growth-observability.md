@@ -1468,6 +1468,18 @@ agent once the session reaches Active ([remote-control.md §11.9](remote-control
 `sessions.by_carrier` above, so "does TURN or DERP feel worse than direct" is answered from the
 same rows. ⚠️ A session with no carrier recorded — from before P9c, from an agent older than the
 field, or ended before the observation landed — is `unknown`, **never read as direct**.
+- **When the carrier reaches the server (P9d).** P9c sent it only on the agent's free-running 30 s
+  heartbeat tick, and in an end-of-session sample that lands only where the server still holds the
+  session live (the device-ended path; a controller-ended session's is dropped once `ended_at` is
+  set), so a session with no tick after the observation — which lands ~2.5–6 s after Connected —
+  recorded none, and that bias fell on short sessions. Since P9d the observation signals the agent's
+  signalling loop the moment it lands and one `rc:session.stats` goes out at once, through the
+  peer's own sender (the FR-43 seam: the loop's outbound queue for its own session, the delegation
+  channel for a supervised Mac's delegated one, so the sample carries the daemon's identity, the one
+  the session row has), so a session that **outlives** the observation records its carrier whatever
+  its length. Only a session that **ends before** the observation lands records `unknown`: a pair
+  was nominated, but the settle read that names the carrier never ran. Needs an agent carrying P9d
+  to take effect; before it, short sessions read `unknown`.
 - **The daily digest's `quality` section** adds, live from the kept rows: `requested`,
   `reached_active`, `not_reached` and `reached_share`, `duration_ms` / `peak_fps` /
   `avg_rtt_ms` as `{day, d7, d28}` of `{n, p50, p90}`, `device_days` and
