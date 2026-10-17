@@ -471,9 +471,10 @@ async fn todays_install(app: &TestApp) -> Value {
 /// P3c — a fetch whose client address falls inside one of the operator's
 /// internal networks counts as `internal`, keeping its asset and OS; an
 /// outside one counts under its class. The address is the limiter's rule —
-/// the entry our ONE trusted proxy hop vouches for, else the socket peer —
-/// so a client cannot seed its way into (or out of) the lab with the
-/// header. The updater is still never counted, and no row carries any of
+/// the entry just left of our ONE trusted proxy hop's own address (the
+/// client that hop recorded), else the socket peer — so a client cannot seed
+/// its way into (or out of) the lab with the header, and `X-Real-IP` is
+/// never read. The updater is still never counted, and no row carries any of
 /// the addresses involved. The digest leaves the internal rows out of its
 /// fetch table and reports them on their own.
 #[tokio::test]
@@ -522,6 +523,16 @@ async fn fetches_from_internal_networks_count_as_internal_and_store_no_address()
     get("/api/setup/install.sh", "curl/8.5.0", Some("203.0.113.9"))
         .await
         .unwrap();
+    // `X-Real-IP` is never read: an outsider naming a lab address in it is
+    // still outside (review of #2378).
+    app.client
+        .get(app.url("/api/setup/install.sh"))
+        .header("User-Agent", "curl/8.5.0")
+        .header("X-Forwarded-For", "198.51.100.7, 10.10.0.1")
+        .header("X-Real-IP", "203.0.113.9")
+        .send()
+        .await
+        .unwrap();
 
     let sum = |rows: &[Document]| -> i64 {
         rows.iter()
@@ -531,11 +542,11 @@ async fn fetches_from_internal_networks_count_as_internal_and_store_no_address()
             })
             .sum()
     };
-    wait_daily(&app, |rows| sum(rows) >= 5).await;
+    wait_daily(&app, |rows| sum(rows) >= 6).await;
     // Let any straggling write land — the updater's must not exist.
     tokio::time::sleep(Duration::from_millis(400)).await;
     let rows = all_docs(&app, "growth_daily").await;
-    assert_eq!(sum(&rows), 5, "{rows:?}");
+    assert_eq!(sum(&rows), 6, "{rows:?}");
     assert_eq!(rows.len(), 3, "{rows:?}");
     assert_eq!(
         value_of(&rows, "install.sh", "internal", "unknown"),
@@ -547,7 +558,7 @@ async fn fetches_from_internal_networks_count_as_internal_and_store_no_address()
     );
     assert_eq!(
         value_of(&rows, "install.sh", "script-sh", "unknown"),
-        Some(3)
+        Some(4)
     );
 
     // No address reached a row — not the lab's, not the outsider's, not
@@ -582,7 +593,7 @@ async fn fetches_from_internal_networks_count_as_internal_and_store_no_address()
     assert_eq!(
         install["fetches"],
         json!([{ "asset": "install.sh", "client": "script-sh", "os": "unknown",
-                 "fetches": { "day": 3, "d7": 3, "d28": 3 } }])
+                 "fetches": { "day": 4, "d7": 4, "d28": 4 } }])
     );
     assert_eq!(
         install["internal_fetches"],
@@ -630,6 +641,18 @@ async fn without_internal_networks_nothing_changes_and_internal_is_not_measured(
         todays_install(&configured).await["internal_fetches"],
         json!({ "day": 0, "d7": 0, "d28": 0 })
     );
+
+    // Something written but nothing usable — a widened host and a typo — is
+    // still not measured, and says why differently: the boot warning names
+    // each entry (review of #2378).
+    let unusable = TestApp::spawn_with_settings(|s| {
+        s.growth.internal_networks = "94.130.141.98/24, not-a-net".into();
+    })
+    .await;
+    assert_eq!(
+        todays_install(&unusable).await["internal_fetches"]["not_measured"],
+        "no usable entry in growth.internal_networks (see the boot warning)"
+    );
 }
 
 #[tokio::test]
@@ -645,6 +668,16 @@ async fn the_counters_switch_off_by_config() {
     assert_eq!(resp.status().as_u16(), 200, "the script is still served");
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(all_docs(&app, "growth_daily").await.is_empty());
+    // And the digest says so: "not measured" for both fetch fields, never an
+    // empty table or a 0 claiming nobody fetched anything (review of #2378).
+    let install = todays_install(&app).await;
+    for field in ["fetches", "internal_fetches"] {
+        assert_eq!(
+            install[field]["not_measured"],
+            "install counters are off on this server (growth.install_counters)",
+            "{field}: {install}"
+        );
+    }
 }
 
 // ── The enroll's `install` ───────────────────────────────────────────────

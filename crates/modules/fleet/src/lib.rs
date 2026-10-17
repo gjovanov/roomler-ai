@@ -151,23 +151,25 @@ impl FromRef<FleetState> for Core {
     }
 }
 
-/// FR-102 P3c — `growth.internal_networks`, parsed once. An entry that does
-/// not parse is echoed in a warning here, once, so the operator can fix it,
-/// and skipped; the rest still apply. The accepted ones are logged as a
-/// count.
+/// FR-102 P3c — `growth.internal_networks`, parsed once. An entry it cannot
+/// use (not an address, host bits set, a prefix too short to be one network)
+/// is echoed in a warning here, once, with its reason, so the operator can fix
+/// it, and skipped; the rest still apply. The networks in effect are logged
+/// as CIDRs, so a widened or missing range is visible at boot rather than as
+/// a quiet shift in the counts.
 fn internal_networks_from(settings: &Settings) -> roomler_core::growth::InternalNetworks {
     let (nets, refused) =
         roomler_core::growth::InternalNetworks::parse(&settings.growth.internal_networks);
     if !refused.is_empty() {
         tracing::warn!(
             refused = ?refused,
-            "growth.internal_networks: skipping entries that are neither a CIDR nor an address"
+            "growth.internal_networks: skipping entries it cannot use, each with its reason; the rest still apply"
         );
     }
     if !nets.is_empty() {
         tracing::info!(
-            networks = nets.len(),
-            "install trace: fetches from the configured internal networks count as `internal`"
+            networks = ?nets.networks(),
+            "install trace: fetches from these internal networks count as `internal`"
         );
     }
     nets

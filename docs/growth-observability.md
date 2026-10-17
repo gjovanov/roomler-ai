@@ -202,7 +202,7 @@ sequenceDiagram
 | `growth.purestat_url` | `ROOMLER__GROWTH__PURESTAT_URL` | `https://purestat.ai` | the v1 query endpoint's base |
 | `growth.purestat_api_key` | `ROOMLER__GROWTH__PURESTAT_API_KEY` | empty | a site-scoped key (`X-API-Key`); empty ⇒ website, blog, campaigns and coverage read "not measured", the Campaigns table's web cells too, and the `saas` puller (P6) pulls nothing and says so once at boot |
 | `growth.install_counters` | `ROOMLER__GROWTH__INSTALL_COUNTERS` | `true` | the install trace's fetch counters (P3); `false` writes none. The token ledger and the enroll's `install` have no switch — they are ids on rows that exist anyway |
-| `growth.internal_networks` | `ROOMLER__GROWTH__INTERNAL_NETWORKS` | empty | comma-separated CIDRs or addresses of the operator's own networks (the lab, the CI runners, the operator's machines); a fetch from inside counts as `internal` instead of its class (P3c, [the lab's own fetches](#the-labs-own-fetches-p3c)); empty changes nothing and leaves the digest's internal line "not measured" |
+| `growth.internal_networks` | `ROOMLER__GROWTH__INTERNAL_NETWORKS` | empty | comma-separated CIDRs or addresses of the operator's own networks (the lab's egress, self-hosted CI runners, never GitHub-hosted ranges, which are shared cloud space, and the operator's machines); a fetch from inside counts as `internal` instead of its class (P3c, [the lab's own fetches](#the-labs-own-fetches-p3c)); empty changes nothing and leaves the digest's internal line "not measured" |
 | `growth.setup_diagnostics` | `ROOMLER__GROWTH__SETUP_DIAGNOSTICS` | `true` | accept the setup wizard's opt-in diagnostics at `POST /api/setup/diagnostics` (P3b); `false` makes the route the empty 404 of an absent path and the digest's `wizard_steps` "not measured". On for the counters' reason: the rows are this server's own, exist only when the person ticked the wizard's box, and name nobody — unlike the three mailing jobs, which default off because they mail people |
 
 The hosted deployment turns the digest on with `ROOMLER__GROWTH__DIGEST_ENABLED=true` (and a
@@ -410,7 +410,7 @@ instead, and a fetch from inside is counted as `internal` in place of its class.
 flowchart TD
   F["a fetch of an installer, a manifest or a script"] --> U{"User-Agent: roomlerd/ · roomler-* (not the wizard)?"}
   U -->|yes| N["not counted at all (the updater rule)"]
-  U -->|no| A["client address = the limiter's rule:<br/>the X-Forwarded-For entry our one trusted hop appended,<br/>else the socket peer"]
+  U -->|no| A["client address = the limiter's rule:<br/>the X-Forwarded-For entry just left of<br/>our one trusted hop's own, else the socket peer"]
   A --> I{"inside growth.internal_networks?"}
   I -->|yes| INT["growth_daily {asset, client: internal, os} += 1"]
   I -->|"no, none configured, or no address"| CL["growth_daily {asset, client: class, os} += 1"]
@@ -419,16 +419,27 @@ flowchart TD
 
 | Rule | Where |
 |---|---|
-| The setting: comma-separated CIDRs (`203.0.113.0/24`, `2001:db8::/32`) or bare addresses (their own `/32` / `/128`); a CIDR with host bits set means its network; an IPv4-mapped IPv6 peer (`::ffff:a.b.c.d`) is compared as the IPv4 it carries | `InternalNetworks::parse` / `contains` ([`growth.rs:158`](../crates/core/src/growth.rs), [`:187`](../crates/core/src/growth.rs)) |
-| Parsed once at boot. An entry that does not parse is echoed in one warning and skipped, and the rest still apply | `internal_networks_from` ([`fleet/src/lib.rs:158`](../crates/modules/fleet/src/lib.rs)) |
-| **One client-address rule.** The entry our own proxies vouch for (`app.rate_limit_trusted_hops`, 1 in production), else the socket peer. It moved from the api crate to core so `fleet` reads it exactly as the per-IP governor and the credential gate do. A client that seeds `X-Forwarded-For` with a lab address moves nobody: that entry sits left of the one our hop recorded | `client_ip_or_peer` ([`client_ip.rs:67`](../crates/core/src/client_ip.rs)); the handlers take `PeerAddr` ([`:90`](../crates/core/src/client_ip.rs)), an extractor that never refuses |
+| The setting: comma-separated CIDRs (`203.0.113.0/24`, `2001:db8::/32`) or bare addresses (their own `/32` / `/128`). A CIDR with host bits set, or a prefix shorter than /8 (IPv4) or /16 (IPv6), is refused, never widened. An IPv4-mapped IPv6 peer (`::ffff:a.b.c.d`) is compared as the IPv4 it carries | `InternalNetworks::parse` / `contains` ([`growth.rs:171`](../crates/core/src/growth.rs), [`:221`](../crates/core/src/growth.rs)) |
+| Parsed once at boot. An entry it cannot use (not an address, host bits set, a prefix too short) is echoed in one warning with its reason and skipped, and the rest still apply. The networks in effect are logged as CIDRs | `internal_networks_from` ([`fleet/src/lib.rs:160`](../crates/modules/fleet/src/lib.rs)) |
+| **One client-address rule.** The `X-Forwarded-For` entry just left of our trusted hops' own (`app.rate_limit_trusted_hops`, 1 in production), the client the edge recorded, else the socket peer; `X-Real-IP` is never read. It moved from the api crate to core so `fleet` reads it exactly as the per-IP governor and the credential gate do. A client that seeds `X-Forwarded-For` with a lab address moves nobody: that entry sits left of the one our hop recorded | `client_ip_or_peer` ([`client_ip.rs:67`](../crates/core/src/client_ip.rs)); the handlers take `PeerAddr` ([`:90`](../crates/core/src/client_ip.rs)), an extractor that never refuses |
 | The class becomes `internal`; the asset and OS stay. The updater rule comes first, so a `roomlerd/` fetch from the lab still writes nothing | `fetch_dims` ([`install_trace.rs:188`](../crates/modules/fleet/src/install_trace.rs)), `count_fetch` ([`:211`](../crates/modules/fleet/src/install_trace.rs)) |
 | **Still no IP, anywhere.** The address is compared in memory and dropped; the row stays three enum-like dimensions and a count. The integration test scans every row for each address it used (the lab's, the outsider's, our hop's, the peer's) | `install_trace_tests::fetches_from_internal_networks_count_as_internal_and_store_no_address` |
 | Unset (the default) changes nothing: every fetch counts under its class | `ROOMLER__GROWTH__INTERNAL_NETWORKS` |
 
 > ⚠️ A network that is too broad hides real users. The `internal` line in the digest shows how
-> many fetches the setting reclassified, so a `/0` typo shows up as an `internal` count that
-> swallows the classes. Name the lab's egress addresses and the operator's own, nothing wider.
+> many fetches the setting reclassified, and the parser refuses the worst typos: a `/0`, a
+> prefix shorter than /8 or /16, or host bits set. Name the lab's egress addresses and the
+> operator's own, nothing wider. **Take them from the edge's access log for one lab run**, not from a
+> guess. A guest on mars reaches the edge on its private VM-network address, not mars's public IP; a
+> guest on zeus shows zeus's public IP.
+>
+> ⚠️ The rule trusts `app.rate_limit_trusted_hops` to match the proxies in front of the server. A
+> self-hosted image exposed directly, with nothing in front, lets a client choose its address, for
+> the rate limiter and for this count alike.
+>
+> For the first 28 days after the setting is applied, the 7d/28d internal counts start at that day,
+> while the table's 7d/28d still hold the lab's earlier fetches. With `growth.install_counters`
+> off, both fetch fields read "not measured".
 
 ### The enroll says how
 

@@ -1490,12 +1490,16 @@ async fn read_fetches(
         }
         f.d28 += r.value;
     }
-    let (networks, _) =
+    let (networks, refused) =
         roomler_core::growth::InternalNetworks::parse(&state.settings.growth.internal_networks);
     let internal = if networks.is_empty() && internal_rows == 0 {
-        Measured::NotMeasured(NotMeasured::now(
-            "no internal network configured on this server (growth.internal_networks)",
-        ))
+        // Two reasons for one state, said apart: nothing written, or nothing
+        // usable written (the boot warning names each entry and why).
+        Measured::NotMeasured(NotMeasured::now(if refused.is_empty() {
+            "no internal network configured on this server (growth.internal_networks)"
+        } else {
+            "no usable entry in growth.internal_networks (see the boot warning)"
+        }))
     } else {
         Measured::Value(internal)
     };
@@ -2956,9 +2960,23 @@ pub async fn compute(
     let install = match &devices {
         Some(d) => {
             let (fetches, internal_fetches) = read_fetches(state, &w).await?;
+            // P3c review — the counters off is "not measured" for both fetch
+            // fields, never a measured zero: with them off nothing is counted,
+            // so an empty table or a 0 would claim nobody fetched anything.
+            const COUNTERS_OFF: &str =
+                "install counters are off on this server (growth.install_counters)";
+            let counting = state.settings.growth.install_counters;
             Install {
-                fetches: Measured::Value(fetches),
-                internal_fetches,
+                fetches: if counting {
+                    Measured::Value(fetches)
+                } else {
+                    Measured::NotMeasured(NotMeasured::now(COUNTERS_OFF))
+                },
+                internal_fetches: if counting {
+                    internal_fetches
+                } else {
+                    Measured::NotMeasured(NotMeasured::now(COUNTERS_OFF))
+                },
                 tokens: Measured::Value(read_tokens(state, &w, set).await?),
                 enrollments_by_method: Measured::Value(d.by_method_os.clone()),
                 // P3b — the switch off is "not measured", never a measured zero:

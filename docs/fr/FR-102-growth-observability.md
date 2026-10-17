@@ -252,13 +252,19 @@ sequenceDiagram
    empty, so nothing changes until it is set). A counted fetch whose client address falls inside is
    counted under the class `internal` instead of its own, keeping its asset and OS. The updater rule comes
    first: a `roomlerd/` fetch from the lab is still not counted at all. The address is the per-IP limiter's
-   (`roomler_core::client_ip`, moved there from the api crate so `fleet` reads it the same way): the entry
-   our one trusted proxy hop appended to `X-Forwarded-For`, else the socket peer. A client therefore cannot
-   seed its way into the lab or out of it. The address is compared in memory and dropped, so the row stays
+   (`roomler_core::client_ip`, moved there from the api crate so `fleet` reads it the same way): the
+   `X-Forwarded-For` entry just left of our one trusted hop's own address, the client that hop recorded,
+   else the socket peer. A client therefore cannot seed its way into the lab or out of it, and `X-Real-IP`
+   is never read. ⚠️ That holds while `app.rate_limit_trusted_hops` matches the proxies in front of the
+   server. A self-hosted image exposed directly lets a client choose its address, for the rate limiter and
+   for this count alike. The address is compared in memory and dropped, so the row stays
    `{asset, client, os}` and a count. The digest leaves the `internal` rows out of the fetch table and
-   reports them as `install.internal_fetches`. That line reads "not measured" while no network is
-   configured and the 28 days hold no internal row, never a 0. An entry that does not parse is warned
-   about once at boot and skipped.)*
+   reports them as `install.internal_fetches`. That line reads "not measured", never a 0, in three
+   cases: no network is configured and the 28 days hold no internal row; no entry is usable; or the
+   install counters are off (then the fetch table is "not measured" too). An entry it cannot use is warned
+   about once at boot with its reason, and skipped. Refused are: not an address, host bits set
+   (`94.130.141.98/24` is refused, not widened to the /24), and a prefix shorter than /8 (IPv4) or /16
+   (IPv6). The networks in effect are logged as CIDRs.)*
 3. **The enroll says how.** `EnrollRequest` gains `install: Option<InstallInfo { method, scope }>`, additive
    and `#[serde(default)]`; an agent from before this change records `unknown`. `method` is one of `wizard`,
    `script-sh`, `script-ps1`, `msi`, `deb`, `pkg`, `manual`, `container`, `other`; `scope` is one of
@@ -899,6 +905,10 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
   *(CI: the integration suite on #2175. Field, production 2026-10-14: the 2026-10-13 digest was stored and
   mailed once, `attempts: 1`, with both pods running; its counts equal the hand counts; its stored
   sections carry no `@`. §8.)*
+- [ ] **AC24 (P3c):** with the lab's egress networks configured (taken from the edge's access log), a
+  vmtest install's fetches count as `internal`, an outside fetch counts under its class, the digest reports
+  the internal count on its own line, and no `growth_daily` row carries an address. Red first: on the
+  deploy before P3c, or with the setting empty, the same lab fetch counts under its class.
 
 ## 6. Open decisions (defaults in bold)
 
