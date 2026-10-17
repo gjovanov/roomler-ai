@@ -5,7 +5,9 @@
   AC17).
 - The macOS exit, P1b (#2362), shipped in 0.4.141. Its pf-reference and Internet Sharing fix (#2377) rides 0.4.142.
   AC5 is field-verified on a candidate of that fix (§8); a check on the 0.4.142 release is owed.
-- P2–P7 are open.
+- P0d, the measurement, is in review: the native architecture in the hello, and `scripts/fr97-caps-census.sh`.
+  The count before P0c was taken on 2026-10-17 (§8, AC15).
+- P0c and P2–P7 are open.
 
 **Owner:** the agent on all
 three platforms; the network module for the route gate (P0b) ·
@@ -406,8 +408,9 @@ Kernel NAT through pf, the macOS twin of the iptables arm:
 So the code (`overlay/pf.rs`) renders one `nat` per egress interface (every `en*` with an address, plus a non-tunnel
 default; never another VPN's utun), keeps the tokens, holds forwarding process-wide across orgs, and leaves it on
 while Internet Sharing runs. A task re-asserts the anchor every 30 s against a `pfctl -F all` or `-d` from someone
-else, and re-renders when the interfaces change. Still unmeasured: the common corporate VPN clients' effect on pf,
-and the Application Firewall's stealth mode on forwarded flows.
+else, and re-renders when the interfaces change. Still unmeasured: the common corporate VPN clients' effect on pf.
+The Application Firewall was measured on 2026-10-17 (§8). Forwarded flows pass under every setting, but stealth
+mode stops the Mac's own overlay address answering a ping.
 
 **Verified on hardware after the code**, beside Internet Sharing and another user of pf (§8, 2026-10-17). Internet
 Sharing is driven through vmnet's shared mode: on current macOS the same `InternetSharing` daemon is the NAT behind
@@ -669,6 +672,9 @@ one depends on it.
   install.
 - [ ] **AC15 (the rule):** P0d's server count of advertised capability words by OS, taken before P0 and after the
   last phase, shows no word advertised on an OS that cannot serve it.
+  *(The count before P0c, 2026-10-17, §8. P0a, P0b and P0e changed no word, so it stands for "before P0". It
+  shows `opus` on every macOS agent and clipboard image events on every Linux and macOS agent, neither of which
+  those OSes serve.)*
 - [ ] **AC16 (docs):** `docs/platform-support.md` (a mermaid map, the per-pillar tables, the reason for every ⛔,
   `file:line` anchors), the user-facing `ui/docs/content/reference/platform-support.md`, every row of §2.8
   corrected, and the `docs/README.md` index row.
@@ -755,3 +761,5 @@ one depends on it.
 | 2026-10-17 | a #2377 candidate (run 39026213502, master @ `30356ee17`) | a throwaway tart Mac exit bridged over Wi-Fi, with the ULA v6 uplink the MacBook NATs; a Linux exit client on a fleet host; a throwaway Win11 exit client | 🟢 The Linux client: v4 + v6 through the exit (`dev roomler0 src fd72:…`). 🟢 **The Windows client's v6, AC5's owed clause:** no v6 egress before the exit. Through it, `active, v6 on, DNS steered`, v4 egress the Mac's uplink and **v6 egress over the `roomler` adapter, 3 samples of 3**; none after its stop. ⚪ The run's phases never started. From 11:07 to 11:28 the MacBook's default route moved to the iPhone's USB link and its Wi-Fi lost its address (the host daemon's own netstate log: `default_moved=true v4_default=en7`, then back to `en0`), so the host could not reach the bridged VM to hand it the go. The VM kept serving its client throughout |
 | 2026-10-17 | the same candidate | the same exit (v4 only), with Internet Sharing from vmnet's shared mode and the vmnet client behind it; a Linux exit client | **#2377 green; AC5's Internet Sharing clause.** 🟢 Internet Sharing came up under the serving exit: `pfd` held its own reference, and the client behind it pinged out. 🟢 **Its stop zeroed forwarding. 10 s later the exit logged `IPv4 forwarding was switched off under a serving exit — switched it back on`.** The exit client lost egress for ~10 s, against ≥ 59 s on the code 0.4.141 ships. 🟢 Beside a live share, a `kill -9` and a restart: the purge released only our old reference, logged `internet_sharing=true` and left forwarding alone, and the client behind the share kept pinging. 🟢 **The recycled token, in the field:** another program's `pfctl -d` + `pfctl -E` got our old value back. The re-assert logged `another program dropped our pf reference … took a new one`, and the clean stop released only ours, so pf stayed `Enabled` for them. On #2362's code that stop releases theirs. 🟢 The stop came while the `InternetSharing` process was still up but not NATing: `internet_sharing=false`, forwarding back to 0/0, as found. ⚪ The exit client's egress classifier took its reference sample while the path was still settling, so this run's EXIT/NONE labels read inverted. Read as answered/unanswered, they match the phases |
 | 2026-10-17 | the same candidate | the full AC5 cell, as for the P1b candidate: the exit + subnet router with its v6 uplink, a second throwaway Mac VM as the LAN host, a Linux exit client, a Linux subnet client, a Win11 exit client | **AC5's remaining clauses, on the fixed code.** 🟢 The anchor NATs v4 and v6 and passes the adapter, `routes=["<the LAN host>/32", "0.0.0.0/0"]`. The Linux exit client got v4 + v6 through the Mac, the subnet client reached the LAN host's SSH through it, and the Windows client was `active, v6 on, DNS steered` with the Mac's egress. The Mac forwarded ~2,450 v4 and 142 v6 packets. 🟢 **`kill -9`, no respawn:** pf and forwarding as a crash leaves them; the restart's purge flushed the anchor, released our reference and put forwarding back (`internet_sharing=false`), then served again. 🟢 **`kill -9` plus a reboot:** pf `Disabled`, forwarding 0/0, as found; the next start purged and served. 🟢 **A clean stop:** `pf NAT for the overlay reverted`, pf `Disabled`, forwarding 0/0, the ledger empty |
+| 2026-10-17 | the same candidate | the exit VM; macOS's Application Firewall (ALF) switched on, then stealth mode, then "block all incoming", then off again, 75 s each; a Linux exit client sampled every 5 s (egress, a ping to the exit's overlay address, its path) | **P1b's open note on ALF.** 🟢 Forwarded traffic is untouched: the client kept the Mac's egress through all three settings. ⚠️ **Stealth mode silences the Mac's own overlay address:** the client's ping to it failed from the moment stealth went on until ALF was off again. So a ping is no test of a Mac exit's health. ⚪ Not measured: ALF against an inbound DIRECT carrier. The exit VM sat behind the home NAT, and no direct carrier formed even with ALF off, so the path was the relay throughout |
+| 2026-10-17 | prod, read-only: `scripts/fr97-caps-census.sh 30` | every agent seen in the last 30 days and not removed: 24 Linux, 4 macOS, 41 Windows; none yet reports its architecture | **P0d, the count before P0c (AC15).** ⛔ `audio: opus` on **4 of 4** macOS agents, with no capture backend behind it (R1, §2.7). ⛔ `clipboard: events` + `images` on **24 of 24** Linux and **4 of 4** macOS agents, whose watchers never send image events (R8); clipboard `native` only on Windows. ⛔ `supports_clipboard` on every Linux agent. The census cannot tell a root daemon from a per-user one, so R10 is proven in the field, not by count. ⛔ No word governs Ctrl+Alt+Del: it is in no list, and the button shows for every host. Honest gaps, each with its phase: `apps` absent on macOS (P2c), `layout` only on Windows (P2d, P3e), `privacy-*` only on Windows (FR-99) |

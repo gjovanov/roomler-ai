@@ -1498,9 +1498,13 @@ async fn connect_once(
     let mut last_announced_privacy = privacy_words_in(&hello_caps.rpc);
     // FR-101 P2b — and the owner's session-policy floor it carried, likewise.
     let mut last_announced_session_policy = hello_caps.session_policy;
+    let (arch, arch_emulated) = crate::arch::native();
     let hello = ClientMsg::AgentHello {
         machine_name: cfg.machine_name.clone(),
         os: detect_os(),
+        // FR-97 P0d — the hardware's architecture, not this build's.
+        arch,
+        arch_emulated,
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         displays: stub_displays(),
         caps: Box::new(hello_caps),

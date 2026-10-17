@@ -523,10 +523,19 @@ sequenceDiagram
 > and the Mac offers nothing, with the reason in `roomler status` and the admin
 > routes table (FR-97 P0b). `ROOMLERD_PF_NAT=0` refuses the same way.
 
-> ⚠️ **Still unmeasured:** what the common corporate VPN clients do to pf, and
-> the Application Firewall's stealth mode on forwarded flows (FR-97 §3.5). The
-> re-assert loop restores our anchor after a `pfctl -F all`, pf and our
-> reference after a `-d`, and forwarding after anyone switches it off.
+> ⚠️ **Still unmeasured:** what the common corporate VPN clients do to pf
+> (FR-97 §3.5). The re-assert loop restores our anchor after a `pfctl -F all`,
+> pf and our reference after a `-d`, and forwarding after anyone switches it
+> off.
+
+> 🔑 **The Application Firewall leaves the exit alone, but stealth mode
+> silences its overlay address.** Measured on a Mac exit (FR-97 §8,
+> 2026-10-17):
+> - Forwarded traffic passed under ALF on, stealth mode, and "block all
+>   incoming".
+> - With stealth mode on, a ping to the Mac's own overlay address goes
+>   unanswered, even from a mesh peer. A failed ping says nothing about a Mac
+>   exit's health; check `roomler peers` and the client's egress instead.
 
 ## Caveats & gotchas
 
