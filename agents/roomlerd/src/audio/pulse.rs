@@ -30,7 +30,7 @@
 //! over a bounded channel, the cpal backend's shape.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -518,6 +518,9 @@ impl HelperCapture {
     /// its handshake, and read its PCM on a thread.
     pub fn spawn() -> Result<Self, AudioUnavailable> {
         use crate::capture::portal::helper::{SpawnError, spawn_child};
+        // Here, not at the top: only this path reads a byte stream, and a
+        // build without the helper must not carry an unused import.
+        use std::io::Read;
         let mut child = spawn_child(&["--audio"], false).map_err(|e| match e {
             SpawnError::NoSession => AudioUnavailable::new(
                 AudioUnavailableCode::NoSession,
