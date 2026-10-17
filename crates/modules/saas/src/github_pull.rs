@@ -17,7 +17,7 @@
 //!
 //! | `dims.by` | other dims | metrics |
 //! |---|---|---|
-//! | `repo` | `repo` | `stars` `forks` `watchers`; `downloads` (every asset of every published PRODUCT release) and `helper_downloads` (the rest) |
+//! | `repo` | `repo` | `stars` `forks` `watchers`; `downloads` (every asset but the sidecars of every published PRODUCT release) and `helper_downloads` (the rest) |
 //! | `release` | `repo`, `release` (the tag), `kind` (`product` · `helper`) | `downloads` |
 //! | `flavour` | `repo`, `flavour` (a product asset's name without its version: `roomlerd-x86_64-pc-windows-msvc.msi`) | `downloads` |
 //!
@@ -36,13 +36,18 @@
 //!   re-read later in the window, which would move its snapshot's time.
 //! * Drafts are left out (their assets are not public). A zero is not
 //!   stored: on an `ok` day a missing release or flavour row is a zero.
+//! * **Sidecars are not downloads** ([`is_sidecar`]): the updater fetches a
+//!   package's `.asc` beside the package itself, so counting the `.asc`
+//!   and `.sha256` files would count every update twice.
+//! * **A listing past [`MAX_RELEASE_PAGES`] is a lower bound.** The pull
+//!   row says `truncated`, and the reader refuses every downloads change
+//!   that needs that snapshot.
 //! * ⚠️ GitHub counts every download of a release asset, **the fleet's
-//!   self-updates included** — the updater fetches the MSI/.deb/.pkg and
-//!   its `.asc` from GitHub directly, hosted and self-hosted devices alike,
-//!   and the installer proxy fetches from GitHub on each request. A download
-//!   is distribution, not an install, and the `.asc` flavours are mostly
-//!   updaters. Nothing here tells one deployment from another: it is
-//!   GitHub's own public aggregate.
+//!   self-updates included** — the updater fetches the MSI/.deb/.pkg from
+//!   GitHub directly, hosted and self-hosted devices alike, and the
+//!   installer proxy fetches from GitHub on each request. A download is
+//!   distribution, not an install. Nothing here tells one deployment from
+//!   another: it is GitHub's own public aggregate.
 //!
 //! # Traffic — `source: github_traffic`, with the token
 //!
@@ -55,11 +60,18 @@
 //! labelled as such by every reader. Without a token none of it is read
 //! and the readers say "not measured".
 //!
+//! **The token rides the traffic requests only.** The counters are public;
+//! a token that expired, was revoked or was sealed wrong must cost the
+//! traffic and never the day's snapshot, which no later read can recover.
+//!
 //! # Rate
 //!
-//! A cycle is two requests plus one per hundred releases, and three more
-//! with a token — far inside the 60 an hour GitHub allows an unauthenticated
-//! address, which the releases cache (`fleet::releases`) also draws on.
+//! The counters are read without a token, from the 60 requests an hour
+//! GitHub allows an unauthenticated address — which the releases cache
+//! (`fleet::releases`, the updater's source of truth) draws on too. A cycle
+//! is one request plus one per hundred releases (8 pages on 2026-10-17);
+//! the listing stops, and the snapshot is retried next tick, rather than
+//! spend the hour's last [`RATE_RESERVE`] requests.
 
 use std::collections::BTreeMap;
 
@@ -88,7 +100,11 @@ pub const CYCLE_HOUR_UTC: u32 = 1;
 /// A day's snapshot may be read from the cycle's start until this many
 /// hours after it; later, the day has no snapshot.
 pub const SNAPSHOT_GRACE_HOURS: i64 = 6;
-/// Traffic days re-pulled each cycle — GitHub keeps 14, today among them.
+/// Traffic days re-pulled each cycle. GitHub answers 14 daily buckets: a
+/// read on 2026-10-17 ended at the previous UTC day, and one that also
+/// carries today's partial bucket ends a day later. The last 13 closed days
+/// are inside either, so a day outside GitHub's window is never read as a
+/// quiet one.
 pub const TRAFFIC_HORIZON_DAYS: i64 = 13;
 /// The scheduler's cadence — also how soon a failed read is retried.
 pub const LOOP_INTERVAL_SECS: u64 = 60 * 60;
@@ -96,10 +112,17 @@ pub const LOOP_INTERVAL_SECS: u64 = 60 * 60;
 pub const FIRST_TICK_DELAY_SECS: u64 = 5 * 60;
 /// Releases per page (GitHub's maximum).
 pub const PER_PAGE: usize = 100;
-/// Pages followed before the answer is called truncated.
-pub const MAX_RELEASE_PAGES: u32 = 10;
+/// Pages followed before the answer is called truncated: 3,000 releases.
+/// 732 existed on 2026-10-17, and 50 to 240 are cut a month.
+pub const MAX_RELEASE_PAGES: u32 = 30;
+/// The unauthenticated requests of the hour the counters leave untouched
+/// (GitHub's `X-RateLimit-Remaining`): the releases cache the updater
+/// relies on reads from the same address.
+pub const RATE_RESERVE: u32 = 10;
 /// Per-request ceiling.
-pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The largest answer read: a page of 100 releases measured 4.96 MB.
+pub const MAX_BODY_BYTES: usize = 32 << 20;
 /// The counters' metrics — the set a snapshot replaces.
 pub const COUNTER_METRICS: [&str; 5] = [
     "stars",
@@ -188,6 +211,11 @@ pub enum GithubError {
     Timeout,
     Transport(String),
     Decode(String),
+    /// An answer past [`MAX_BODY_BYTES`].
+    TooLarge,
+    /// The hour's unauthenticated requests are down to this many: the
+    /// listing stops short of [`RATE_RESERVE`] and the day is retried.
+    RateReserve(u32),
 }
 
 impl std::fmt::Display for GithubError {
@@ -200,16 +228,35 @@ impl std::fmt::Display for GithubError {
             Self::Timeout => write!(f, "github unreachable: timed out"),
             Self::Transport(e) => write!(f, "github unreachable: {e}"),
             Self::Decode(e) => write!(f, "github unreachable: unreadable answer ({e})"),
+            Self::TooLarge => write!(
+                f,
+                "github unreachable: answer larger than {} MiB",
+                MAX_BODY_BYTES >> 20
+            ),
+            Self::RateReserve(left) => write!(
+                f,
+                "github rate limit nearly spent ({left} requests left this hour); retried next tick"
+            ),
+        }
+    }
+}
+
+impl From<crate::capped::BodyError> for GithubError {
+    fn from(e: crate::capped::BodyError) -> Self {
+        match e {
+            crate::capped::BodyError::TooLarge(_) => Self::TooLarge,
+            crate::capped::BodyError::Timeout => Self::Timeout,
+            crate::capped::BodyError::Transport(t) => Self::Transport(short(&t)),
         }
     }
 }
 
 impl GithubError {
     /// Whether a later request of the same run could succeed. A wrong
-    /// token, a missing permission, a missing repository or an unreachable
-    /// host will not fix itself between two requests.
+    /// token, a missing permission, a missing repository, an unreachable
+    /// host or a spent rate limit will not fix itself between two requests.
     pub fn is_fatal(&self) -> bool {
-        !matches!(self, Self::Status(..) | Self::Decode(_))
+        !matches!(self, Self::Status(..) | Self::Decode(_) | Self::TooLarge)
     }
 }
 
@@ -227,6 +274,8 @@ pub struct GithubClient {
     repo: String,
     token: Option<String>,
     http: reqwest::Client,
+    /// [`MAX_RELEASE_PAGES`]; a test lowers it with [`Self::with_max_pages`].
+    max_pages: u32,
 }
 
 impl std::fmt::Debug for GithubClient {
@@ -255,7 +304,14 @@ impl GithubClient {
             repo,
             token,
             http,
+            max_pages: MAX_RELEASE_PAGES,
         })
+    }
+
+    /// The same client with another page bound — a test's way to reach it.
+    pub fn with_max_pages(mut self, pages: u32) -> Self {
+        self.max_pages = pages.max(1);
+        self
     }
 
     pub fn repo(&self) -> &str {
@@ -267,13 +323,20 @@ impl GithubClient {
         self.token.is_some()
     }
 
-    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, GithubError> {
+    /// One GET, and GitHub's `X-RateLimit-Remaining` with it. The token is
+    /// sent only when `with_token` (the traffic): the public counters never
+    /// carry it, so a bad token cannot cost a snapshot.
+    async fn get<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        with_token: bool,
+    ) -> Result<(T, Option<u32>), GithubError> {
         let mut req = self
             .http
             .get(format!("{}/repos/{}{path}", self.base, self.repo))
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28");
-        if let Some(t) = &self.token {
+        if with_token && let Some(t) = &self.token {
             req = req.bearer_auth(t);
         }
         let sent = req.send().await.map_err(|e| {
@@ -284,9 +347,14 @@ impl GithubClient {
             }
         })?;
         let status = sent.status().as_u16();
+        let remaining = sent
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        let body = crate::capped::read_capped(sent, MAX_BODY_BYTES).await?;
         if !(200..300).contains(&status) {
-            let text = sent.text().await.unwrap_or_default();
-            let msg = serde_json::from_str::<serde_json::Value>(&text)
+            let msg = serde_json::from_slice::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(short))
                 .unwrap_or_default();
@@ -297,23 +365,33 @@ impl GithubClient {
                 _ => GithubError::Status(status, msg),
             });
         }
-        sent.json::<T>()
-            .await
-            .map_err(|e| GithubError::Decode(short(&e.without_url().to_string())))
+        let value = serde_json::from_slice::<T>(&body)
+            .map_err(|e| GithubError::Decode(short(&e.to_string())))?;
+        Ok((value, remaining))
     }
 
-    pub async fn repo_info(&self) -> Result<RepoInfo, GithubError> {
-        self.get("").await
+    /// The repository's public counters, and the hour's remaining requests.
+    pub async fn repo_info(&self) -> Result<(RepoInfo, Option<u32>), GithubError> {
+        self.get("", false).await
     }
 
-    /// Every release, page by page; `true` when [`MAX_RELEASE_PAGES`] cut
-    /// the list short.
-    pub async fn releases(&self) -> Result<(Vec<Release>, bool), GithubError> {
+    /// Every release, page by page; `true` when the page bound cut the list
+    /// short. `remaining` is what the request before the first page left:
+    /// no page is asked while GitHub says fewer than [`RATE_RESERVE`]
+    /// requests are left this hour.
+    pub async fn releases(
+        &self,
+        mut remaining: Option<u32>,
+    ) -> Result<(Vec<Release>, bool), GithubError> {
         let mut out = Vec::new();
-        for page in 1..=MAX_RELEASE_PAGES {
-            let batch: Vec<Release> = self
-                .get(&format!("/releases?per_page={PER_PAGE}&page={page}"))
+        for page in 1..=self.max_pages {
+            if let Some(left) = remaining.filter(|n| *n < RATE_RESERVE) {
+                return Err(GithubError::RateReserve(left));
+            }
+            let (batch, left): (Vec<Release>, _) = self
+                .get(&format!("/releases?per_page={PER_PAGE}&page={page}"), false)
                 .await?;
+            remaining = left;
             let n = batch.len();
             out.extend(batch);
             if n < PER_PAGE {
@@ -324,15 +402,15 @@ impl GithubClient {
     }
 
     pub async fn views(&self) -> Result<TrafficSeries, GithubError> {
-        self.get("/traffic/views?per=day").await
+        Ok(self.get("/traffic/views?per=day", true).await?.0)
     }
 
     pub async fn clones(&self) -> Result<TrafficSeries, GithubError> {
-        self.get("/traffic/clones?per=day").await
+        Ok(self.get("/traffic/clones?per=day", true).await?.0)
     }
 
     pub async fn referrers(&self) -> Result<Vec<Referrer>, GithubError> {
-        self.get("/traffic/popular/referrers").await
+        Ok(self.get("/traffic/popular/referrers", true).await?.0)
     }
 }
 
@@ -441,11 +519,24 @@ pub fn is_product_release(tag: &str) -> bool {
     PRODUCT_TAG_PREFIXES.iter().any(|p| tag.starts_with(p))
 }
 
-/// The counters' rows for the snapshot of `day`. Drafts are left out; a
-/// zero is not stored. The product's releases and the helpers are kept
-/// apart: `downloads` counts the product only, `helper_downloads` the rest,
-/// each release row says which it is (`kind`), and the flavours are the
-/// product's.
+/// The endings of a SIDECAR: a signature or checksum fetched beside the
+/// asset it describes (`roomlerd-0.4.140-x86_64-unknown-linux-gnu.deb.asc`,
+/// `….deb.sha256`), or the release key itself (`roomler-release-pubkey.asc`).
+pub const SIDECAR_SUFFIXES: [&str; 4] = [".asc", ".sig", ".sha256", ".sha512"];
+
+/// Whether an asset is a sidecar (see [`SIDECAR_SUFFIXES`]). The updater
+/// fetches a package's `.asc` with the package, so a sidecar counted as a
+/// download would count every update twice; none is counted.
+pub fn is_sidecar(asset: &str) -> bool {
+    let lower = asset.to_ascii_lowercase();
+    SIDECAR_SUFFIXES.iter().any(|s| lower.ends_with(s))
+}
+
+/// The counters' rows for the snapshot of `day`. Drafts and sidecars are
+/// left out; a zero is not stored. The product's releases and the helpers
+/// are kept apart: `downloads` counts the product only, `helper_downloads`
+/// the rest, each release row says which it is (`kind`), and the flavours
+/// are the product's.
 pub fn counter_rows(
     day: &str,
     repo: &str,
@@ -460,7 +551,7 @@ pub fn counter_rows(
             continue;
         };
         let is_product = is_product_release(&tag);
-        for a in &r.assets {
+        for a in r.assets.iter().filter(|a| !is_sidecar(&a.name)) {
             let n = a.download_count.max(0);
             if is_product {
                 product += n;
@@ -611,8 +702,8 @@ async fn snapshot(
     client: &GithubClient,
     day: &str,
 ) -> Result<(Vec<GrowthDaily>, bool), GithubError> {
-    let info = client.repo_info().await?;
-    let (releases, truncated) = client.releases().await?;
+    let (info, remaining) = client.repo_info().await?;
+    let (releases, truncated) = client.releases(remaining).await?;
     Ok((
         counter_rows(day, client.repo(), &info, &releases),
         truncated,
@@ -650,7 +741,7 @@ pub async fn run_once(core: &Core, client: &GithubClient, now: DateTime) -> DaoR
                 )
                 .await?;
                 if truncated {
-                    warn!(day = %yesterday, "github pull: the release list hit the page bound; the snapshot holds the first {} pages", MAX_RELEASE_PAGES);
+                    warn!(day = %yesterday, pages = client.max_pages, "github pull: the release list hit the page bound; its downloads are a lower bound and the reader refuses their changes");
                 }
                 report.snapshot_ok = true;
                 report.rows_written += c.written;
@@ -814,10 +905,8 @@ mod tests {
                 "roomler-setup-universal-apple-darwin.tar.gz",
             ),
             (
-                // RETIRED-NAME-RECORD(2): a real asset of a release cut before
-                // FR-46; those files are immutable, so the flavour reads them as named.
-                "roomler-agent-0.3.0-rc.480-x86_64-unknown-linux-gnu.deb",
-                "roomler-agent-x86_64-unknown-linux-gnu.deb",
+                "roomlerd-0.3.0-rc.480-x86_64-unknown-linux-gnu.deb",
+                "roomlerd-x86_64-unknown-linux-gnu.deb",
             ),
             ("roomler-v0.4.7.zip", "roomler.zip"),
             ("SHA256SUMS", "SHA256SUMS"),
@@ -828,7 +917,8 @@ mod tests {
     }
 
     /// A snapshot: the repo's counters, downloads summed per release and per
-    /// flavour, drafts left out, zeros not stored, and every row its own id.
+    /// flavour, drafts and sidecars left out, zeros not stored, and every
+    /// row its own id.
     #[test]
     fn a_snapshot_sums_downloads_per_release_and_flavour_without_drafts() {
         let info = RepoInfo {
@@ -846,7 +936,10 @@ mod tests {
                 draft: false,
                 assets: vec![
                     asset("roomlerd-0.4.140-x86_64-pc-windows-msvc.msi", 30),
+                    // Sidecars: fetched beside the package, never a download.
                     asset("roomlerd-0.4.140-x86_64-pc-windows-msvc.msi.asc", 25),
+                    asset("roomlerd-0.4.140-x86_64-pc-windows-msvc.msi.sha256", 4),
+                    asset("roomler-release-pubkey.asc", 3),
                     asset("roomlerd_0.4.140_amd64.deb", 0),
                 ],
             },
@@ -903,8 +996,8 @@ mod tests {
         );
         assert_eq!(
             value(&rows, "repo", None, "downloads"),
-            Some(125),
-            "the draft is out"
+            Some(100),
+            "the draft and the sidecars are out"
         );
         assert_eq!(
             value(
@@ -913,8 +1006,19 @@ mod tests {
                 Some(("release", "agent-v0.4.140")),
                 "downloads"
             ),
-            Some(55)
+            Some(30)
         );
+        assert!(
+            rows.iter()
+                .filter(|r| r.dims.get("by").map(String::as_str) == Some("flavour"))
+                .all(|r| !r.dims["flavour"].ends_with(".asc")
+                    && !r.dims["flavour"].ends_with(".sha256")),
+            "no sidecar flavour"
+        );
+        assert!(is_sidecar(
+            "roomlerd-0.4.140-x86_64-unknown-linux-gnu.deb.ASC"
+        ));
+        assert!(!is_sidecar("roomlerd-0.4.140-x86_64-unknown-linux-gnu.deb"));
         assert_eq!(
             value(
                 &rows,
@@ -1055,6 +1159,15 @@ mod tests {
         );
         assert!(GithubError::NotFound.is_fatal());
         assert!(!GithubError::Status(502, "bad gateway".into()).is_fatal());
+        assert!(GithubError::RateReserve(4).is_fatal());
+        assert_eq!(
+            GithubError::RateReserve(4).to_string(),
+            "github rate limit nearly spent (4 requests left this hour); retried next tick"
+        );
+        assert_eq!(
+            GithubError::from(crate::capped::BodyError::TooLarge(1)).to_string(),
+            "github unreachable: answer larger than 32 MiB"
+        );
         let g = GrowthSettings {
             github_token: "ghp_secret_value".into(),
             ..Default::default()

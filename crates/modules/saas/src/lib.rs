@@ -53,6 +53,7 @@ use roomler_ai_services::dao::{
 };
 use roomler_core::{Capabilities, Core, Module, TenantCtx};
 
+pub mod capped;
 pub mod github_pull;
 pub mod growth_ingest;
 pub mod newsletter;

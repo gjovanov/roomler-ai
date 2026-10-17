@@ -930,26 +930,31 @@ flowchart LR
 ### The public counters — cumulative snapshots
 
 [`crates/modules/saas/src/github_pull.rs`](../crates/modules/saas/src/github_pull.rs), spawned
-from the module's `init` ([`lib.rs:117`](../crates/modules/saas/src/lib.rs)). No self-host
+from the module's `init` ([`lib.rs:118`](../crates/modules/saas/src/lib.rs)). No self-host
 profile compiles `saas`; `growth.enabled = false` or an empty `growth.github_repo` starts
-nothing and says so once. The counters need **no credential**: a cycle is two requests plus
-one per hundred releases, inside the 60 an hour GitHub allows an unauthenticated address
-(which the releases cache also draws on).
+nothing and says so once. The counters need **no credential and never carry one**, so a
+token that expired, was revoked or was sealed wrong costs the traffic and never a snapshot. A
+cycle is one request plus one per hundred releases (8 pages on 2026-10-17), from the 60 an hour
+GitHub allows an unauthenticated address — which the releases cache the updater relies on
+draws on too.
 
 | Rule | Value | Where |
 |---|---|---|
-| **A snapshot is the close of a day.** Day D's is the counters as read between 01:00 and 07:00 UTC on D+1, so two consecutive snapshots are 24 h apart give or take six | `SNAPSHOT_GRACE_HOURS` ([`github_pull.rs:90`](../crates/modules/saas/src/github_pull.rs)), `snapshot_due` ([`:585`](../crates/modules/saas/src/github_pull.rs)) |
+| **A snapshot is the close of a day.** Day D's is the counters as read between 01:00 and 07:00 UTC on D+1, so two consecutive snapshots are 24 h apart give or take six | `SNAPSHOT_GRACE_HOURS` ([`github_pull.rs:102`](../crates/modules/saas/src/github_pull.rs)), `snapshot_due` ([`:676`](../crates/modules/saas/src/github_pull.rs)) |
 | **The first good read stands.** A day pulled `ok` is not re-read later in its window, which would move its snapshot's time | `snapshot_due` |
 | **A missed window is a missing day.** A cumulative counter cannot be read for the past, so a day not read inside its window has no snapshot, and every delta across it is `null` | the reader, below |
-| Releases are paged 100 at a time, at most 10 pages (`truncated` on the pull row past that); drafts are left out | `releases` ([`:311`](../crates/modules/saas/src/github_pull.rs)), `counter_rows` ([`:449`](../crates/modules/saas/src/github_pull.rs)) |
-| A **flavour** is an asset's name without its version, so the same artifact of every release groups together: `roomlerd-0.4.140-x86_64-pc-windows-msvc.msi` → `roomlerd-x86_64-pc-windows-msvc.msi` | `flavour` ([`:405`](../crates/modules/saas/src/github_pull.rs)) |
+| Releases are paged 100 at a time, at most 30 pages (3,000 releases; 732 existed on 2026-10-17). A longer listing is stored with `truncated` on its pull row, and the reader shows its downloads as a lower bound and refuses every downloads change that needs it. Drafts are left out | `releases` ([`:382`](../crates/modules/saas/src/github_pull.rs)), `counter_rows` ([`:540`](../crates/modules/saas/src/github_pull.rs)) |
+| **The updater's rate stays whole.** No page is asked while GitHub's `X-RateLimit-Remaining` is below 10 (`RATE_RESERVE`): the snapshot fails for that tick, nothing partial is stored, and the next tick inside the window retries | `releases` |
+| **A sidecar is not a download.** `.asc`, `.sig`, `.sha256`, `.sha512` (and the release key `roomler-release-pubkey.asc`) are left out: the updater fetches a package's `.asc` with the package, so counting it would count every update twice | `is_sidecar` ([`:530`](../crates/modules/saas/src/github_pull.rs)) |
+| Every answer is read with a ceiling of 32 MiB (a page of 100 releases measured 4.96 MB) | `capped::read_capped` ([`capped.rs:31`](../crates/modules/saas/src/capped.rs)) |
+| A **flavour** is an asset's name without its version, so the same artifact of every release groups together: `roomlerd-0.4.140-x86_64-pc-windows-msvc.msi` → `roomlerd-x86_64-pc-windows-msvc.msi` | `flavour` ([`:483`](../crates/modules/saas/src/github_pull.rs)) |
 | Each row is `$set` on its own `_id`; a zero is not stored, so on an `ok` day a missing release or flavour row is a zero | `GrowthDao::replace_daily` |
-| A failure is recorded per day with its reason (`github unreachable: unauthorized (401)`), never a 0; the next hourly tick inside the window retries | `run_once` ([`:626`](../crates/modules/saas/src/github_pull.rs)) |
+| A failure is recorded per day with its reason (`github unreachable: unauthorized (401)`), never a 0; the next hourly tick inside the window retries | `run_once` ([`:717`](../crates/modules/saas/src/github_pull.rs)) |
 | Once across pods: the DB-scoped Redis claim `roomler:growth-github-pull:<db>` per tick | `pull_schedule::spawn_hourly` ([`pull_schedule.rs:89`](../crates/modules/saas/src/pull_schedule.rs)) |
 
 | `growth_daily` (`source: github`) | dims | metrics |
 |---|---|---|
-| `by: repo` | `repo` | `stars` · `forks` · `watchers` (GitHub's `subscribers_count`; its `watchers_count` is the stars) · `downloads` (every asset of every published **product** release, ever) · `helper_downloads` (the rest) |
+| `by: repo` | `repo` | `stars` · `forks` · `watchers` (GitHub's `subscribers_count`; its `watchers_count` is the stars) · `downloads` (every asset but the sidecars of every published **product** release, ever) · `helper_downloads` (the rest) |
 | `by: release` | `repo`, `release` (the tag), `kind` (`product` · `helper`) | `downloads` |
 | `by: flavour` | `repo`, `flavour` (product assets only) | `downloads` |
 
@@ -963,50 +968,54 @@ have been half CI; they are counted apart, never dropped.
 > The updater fetches the MSI/.deb/.pkg and its `.asc` from GitHub directly
 > (`agents/roomlerd/src/updater.rs`, `download_asset`), hosted and self-hosted devices alike,
 > and the installer proxy fetches from GitHub on each request. A download is distribution, not
-> an install; the `.asc` flavours are mostly updaters. Nothing here tells one deployment from
+> an install (the `.asc` itself is not counted). Nothing here tells one deployment from
 > another: the number is GitHub's own public aggregate, readable by anyone.
 
 ### Traffic — with a read-only token
 
 GitHub keeps 14 days of a repository's traffic, so it is pulled daily, and only with
-`growth.github_token`; without one nothing is asked and every reader says "not measured".
+`growth.github_token`; without one nothing is asked and every reader says "not measured". The
+token rides these three requests only.
 
 | `growth_daily` (`source: github_traffic`) | dims | metrics | Pulled |
 |---|---|---|---|
-| `by: traffic` | `repo` | `views` · `views_uniques` · `clones` · `clones_uniques` — GitHub's per-day buckets (UTC days) | each of the last 13 closed days re-pulled once per cycle (01:00 UTC), frozen after (`TRAFFIC_HORIZON_DAYS`, [`:92`](../crates/modules/saas/src/github_pull.rs)); today's bucket is partial and never stored |
+| `by: traffic` | `repo` | `views` · `views_uniques` · `clones` · `clones_uniques` — GitHub's per-day buckets (UTC days). Clones are mostly CI's `actions/checkout`, not people | each of the last 13 closed days re-pulled once per cycle (01:00 UTC), frozen after (`TRAFFIC_HORIZON_DAYS`, [`:108`](../crates/modules/saas/src/github_pull.rs)). GitHub's 14 buckets ended at the previous UTC day on a 2026-10-17 read; 13 closed days are inside them whether or not a read also carries today's partial bucket, which is never stored |
 | `by: referrer` | `repo`, `referrer` | `referrer_views` · `referrer_uniques` — GitHub's top-10 ranking of the last 14 days, which has no per-day split | stored under the closed day it was read after, and read as such |
 
-A refused token (401, or a 403 for a missing permission) is recorded on every day the run owed,
-with the reason; the counters' own pull is independent of it.
+A refused token (401, or a 403 for a missing permission) is recorded on every traffic day the run
+owed, with the reason. The counters never carry the token, so their snapshot is taken all the
+same — a day's snapshot cannot be read later, and a bad token must not leave holes in it.
 
 ### In the digest and the weekly roll-up
 
 [`crates/api/src/growth/github.rs`](../crates/api/src/growth/github.rs) reads the stored rows;
-`section` ([`:424`](../crates/api/src/growth/github.rs)) is the digest's `github` section and,
+`section` ([`:463`](../crates/api/src/growth/github.rs)) is the digest's `github` section and,
 for Sunday, the weekly roll-up's.
 
 | Field | What | Rule |
 |---|---|---|
-| `counters.at` | the snapshot read: the digest's day, else the latest one before it (at most 7 days) | `counters_at` ([`:258`](../crates/api/src/growth/github.rs)) |
+| `counters.at` | the snapshot read: the digest's day, else the latest one before it (at most 7 days) | `counters_at` ([`:275`](../crates/api/src/growth/github.rs)) |
 | `stars`, `forks`, `watchers`, `downloads`, `helper_downloads` | the cumulative values at that snapshot | — |
 | `*_delta {day, d7, d28}` | the snapshot minus the one 1, 7 or 28 days before | **`null` when that snapshot is missing — never 0, never spread across a gap.** A 7-day delta needs only its two ends |
-| downloads' deltas | differenced **per release**, a counter reset read as a reset: a new release counts fully, one whose count went down (an asset re-uploaded) counts what it has now, a deleted one counts nothing; the product's releases and the helpers' each on their own (`downloads_delta`, `helper_downloads_delta`) | `per_key_downloads` ([`:198`](../crates/api/src/growth/github.rs)) |
-| `top_releases_7d`, `top_flavours_7d` | downloads in the 7 days ending `at`, top 10; not measured without the snapshot 7 days before. A flavour has no per-release split, so its change is clamped at 0 | — |
-| `traffic.views`, `clones` (+ `_uniques`) | GitHub's daily buckets summed per window over the days the puller holds an `ok` row for; `measured_days` says how many that is. Daily uniques summed are an upper bound on a window's uniques | `traffic_at` ([`:304`](../crates/api/src/growth/github.rs)) |
+| downloads' deltas | differenced **per release**: a new release counts fully, a deleted one counts nothing, and **one whose total went down counts nothing**. A total goes down when an asset is re-uploaded (CI's `seed-cache`, 28 assets, is clobbered on every seed save; the vendored builds are re-uploaded too), which restarts that asset's count; the total alone cannot tell the other assets' downloads from the restart, so the day is an under-count for that release and never an over-count. The product's releases and the helpers' each on their own (`downloads_delta`, `helper_downloads_delta`); `null` across a snapshot whose listing was truncated | `per_key_downloads` ([`:228`](../crates/api/src/growth/github.rs)) |
+| `downloads_truncated` | the snapshot read hit the puller's page bound: `downloads` and `helper_downloads` are lower bounds, and the email says so | `counters_at` |
+| `top_releases_7d`, `top_flavours_7d` | downloads in the 7 days ending `at`, top 10; not measured without the snapshot 7 days before, or when either listing was truncated. A flavour's change is clamped at 0 the same way | — |
+| `traffic.views`, `clones` (+ `_uniques`) | GitHub's daily buckets summed per window over the days the puller holds an `ok` row for; `measured_days` says how many that is, and the email prints `—` for a window with none. Daily uniques summed are an upper bound on a window's uniques | `traffic_at` ([`:328`](../crates/api/src/growth/github.rs)) |
 | `traffic.referrers`, `referrers_as_of` | the newest stored 14-day ranking on or before the day | — |
 
 The email renders a **GitHub** block: each counter with its signed changes (`—` where a
 snapshot is missing), the week's downloads by release and by flavour, the traffic with its
-measured days and the referrer ranking, and the note that downloads are not installs. A digest
-stored before P7 reads both halves as `arrives_with: P7`.
+measured days (`—` for a window with no day pulled, never a 0 nobody counted; clones labelled as
+mostly CI's checkouts) and the referrer ranking, and the note that downloads are not installs.
+A digest stored before P7 reads both halves as `arrives_with: P7`.
 
 ### Settings and the operator's setup
 
 | Setting | Env | Default | Effect |
 |---|---|---|---|
-| `growth.github_repo` | `ROOMLER__GROWTH__GITHUB_REPO` | `gjovanov/roomler-ai` | the repository read; anything that is not `owner/name` (GitHub's characters only) switches the puller off ([`settings.rs:650`](../crates/config/src/settings.rs)) |
+| `growth.github_repo` | `ROOMLER__GROWTH__GITHUB_REPO` | `gjovanov/roomler-ai` | the repository read; anything that is not `owner/name` (GitHub's characters only) switches the puller off ([`settings.rs:665`](../crates/config/src/settings.rs)) |
 | `growth.github_api_url` | `ROOMLER__GROWTH__GITHUB_API_URL` | `https://api.github.com` | only a test changes it |
-| `growth.github_token` | `ROOMLER__GROWTH__GITHUB_TOKEN` | empty | the traffic's token; never logged, never in a pull row's error; empty ⇒ traffic "not measured" |
+| `growth.github_token` | `ROOMLER__GROWTH__GITHUB_TOKEN` | empty | the traffic's token, sent on the three traffic requests and nothing else; never logged, never in a pull row's error; empty ⇒ traffic "not measured" |
 
 The counters work on the hosted deployment as soon as `saas` runs this build. Traffic needs a
 **fine-grained personal access token** created by the repository's owner: resource owner
@@ -1824,12 +1833,14 @@ The GitHub puller (P7a) is to be shown on production after the promote: for the 
 day after the roll, `growth_pulls github:<day>` is `ok` and its `by: repo` row's stars and forks
 equal `GET https://api.github.com/repos/gjovanov/roomler-ai` read in the same window, its
 `downloads` equals the sum of `download_count` over the assets of every published **product**
-release (`agent-v`, `setup-v`, `tunnel-v`, `tunnel-wizard-v`) and its `helper_downloads` the same
-sum over every other published release, and the day after, the digest's
-`github.counters.stars_delta.day` is the difference of the two snapshots. The integration suite
-drives the puller and the readers against a fake GitHub — the window, the paging, the drafts, a
-helper release counted apart, the token on every request, a refused token recorded per day, a gap
-read as `null` (`crates/tests/src/growth_github_tests.rs`).
+release (`agent-v`, `setup-v`, `tunnel-v`, `tunnel-wizard-v`) but its `.asc`/`.sha256` sidecars,
+and its `helper_downloads` the same sum over every other published release, and the day after,
+the digest's `github.counters.stars_delta.day` is the difference of the two snapshots. The
+integration suite drives the puller and the readers against a fake GitHub — the window, the
+paging, the drafts and sidecars, a helper release counted apart, the token on the traffic requests
+only, a refused token recorded per traffic day while the snapshot is still taken, a listing past
+the page bound marked, a spent rate limit retried next tick, a gap read as `null`
+(`crates/tests/src/growth_github_tests.rs`).
 
 The newsletter's webhook is to be shown on production to refuse a bad signature (control),
 and to record `delivered` and `bounce` for a test send with one forced bounce, the bounced

@@ -9,12 +9,20 @@
 //!   snapshots. A delta whose snapshots are not both there is `null`, never
 //!   0 and never spread across the gap: a 7-day delta needs the snapshot 7
 //!   days before, whatever happened in between.
-//! * **Downloads are differenced per release**, with a counter reset read
-//!   as a reset: a release present later and not before started at 0; a
-//!   release whose count went DOWN (an asset deleted and re-uploaded) counts
-//!   what it has now; a release that vanished (deleted) counts nothing. The
-//!   per-flavour downloads have no per-release split, so a flavour's change
-//!   is clamped at 0 — a deletion can only hide that flavour's day.
+//! * **Downloads are differenced per release**: a release present later
+//!   and not before started at 0 and counts fully; a release that vanished
+//!   (deleted) counts nothing; and a release whose total went DOWN counts
+//!   nothing either. A total goes down when an asset is re-uploaded (CI's
+//!   `seed-cache` has 28, clobbered on every seed save), which restarts that
+//!   asset's count, and the release's total alone cannot tell the other
+//!   assets' downloads from the restart — so that day is an under-count for
+//!   the release, never an over-count. The per-flavour downloads have no
+//!   per-release split either, and a flavour's change is clamped at 0 the
+//!   same way.
+//! * **A truncated listing is a lower bound**: when the puller's release
+//!   listing hit its page bound (`truncated` on the day's pull row), that
+//!   snapshot's downloads are shown as a lower bound and every downloads
+//!   change that needs it is `null`.
 //! * **The product apart from the helpers**: a release row's `kind` says
 //!   whether it is the product's (the daemon, the wizard, the tunnel CLI) or
 //!   a helper our own CI downloads (vendored builds, caches) — half of the
@@ -27,8 +35,8 @@
 //!   closed day it is stored under.
 //!
 //! ⚠️ GitHub counts every download of a release asset — the fleet's
-//! self-updates (and their `.asc` signatures) among them. Downloads are
-//! distribution, not installs.
+//! self-updates among them (their `.asc` and `.sha256` sidecars are not
+//! counted). Downloads are distribution, not installs.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -69,12 +77,17 @@ pub struct GithubCounters {
     pub stars: i64,
     pub forks: i64,
     pub watchers: i64,
-    /// Every download of every published PRODUCT release asset, ever — the
-    /// fleet's self-updates included.
+    /// Every download of every published PRODUCT release asset but the
+    /// sidecars, ever — the fleet's self-updates included.
     pub downloads: i64,
     /// The helper releases' downloads (vendored builds and caches our own CI
     /// fetches), counted apart so the product's number is not half CI.
     pub helper_downloads: i64,
+    /// The snapshot's release listing hit the puller's page bound:
+    /// `downloads` and `helper_downloads` are lower bounds, and every
+    /// downloads change that needs this snapshot is `null`.
+    #[serde(default)]
+    pub downloads_truncated: bool,
     pub stars_delta: Delta,
     pub forks_delta: Delta,
     pub watchers_delta: Delta,
@@ -142,6 +155,8 @@ pub struct Snapshot {
     pub releases: BTreeMap<String, i64>,
     pub helper_releases: BTreeMap<String, i64>,
     pub flavours: BTreeMap<String, i64>,
+    /// The listing hit the page bound: the downloads are a lower bound.
+    pub truncated: bool,
 }
 
 impl Snapshot {
@@ -151,12 +166,24 @@ impl Snapshot {
 }
 
 /// Pure: the snapshots of the `ok` days among `rows` (one repository),
-/// keyed by day. A day with an `ok` pull and no row of a kind holds a zero
-/// there — zeros are not stored.
-pub fn snapshots(rows: &[GrowthDaily], ok_days: &HashSet<String>) -> BTreeMap<String, Snapshot> {
+/// keyed by day, those in `truncated_days` marked. A day with an `ok` pull
+/// and no row of a kind holds a zero there — zeros are not stored.
+pub fn snapshots(
+    rows: &[GrowthDaily],
+    ok_days: &HashSet<String>,
+    truncated_days: &HashSet<String>,
+) -> BTreeMap<String, Snapshot> {
     let mut out: BTreeMap<String, Snapshot> = ok_days
         .iter()
-        .map(|d| (d.clone(), Snapshot::default()))
+        .map(|d| {
+            (
+                d.clone(),
+                Snapshot {
+                    truncated: truncated_days.contains(d),
+                    ..Snapshot::default()
+                },
+            )
+        })
         .collect();
     for r in rows {
         let Some(s) = out.get_mut(&r.day) else {
@@ -192,9 +219,12 @@ fn counter_delta(later: &Snapshot, earlier: Option<&Snapshot>, metric: &str) -> 
     earlier.map(|e| later.counter(metric) - e.counter(metric))
 }
 
-/// Pure: the downloads between two snapshots, per key, with counter resets
-/// read as resets — new keys count fully, a key that went down counts what
-/// it has now, a vanished key counts nothing.
+/// Pure: the downloads between two snapshots, per key (a release, or a
+/// flavour) — a new key counts fully, a vanished key counts nothing, and a
+/// key whose total went DOWN counts nothing: an asset re-uploaded restarted
+/// its count, and the total alone cannot tell the downloads of the key's
+/// other assets from the restart. An under-count of that key's day, never
+/// an over-count.
 pub fn per_key_downloads(
     later: &BTreeMap<String, i64>,
     earlier: &BTreeMap<String, i64>,
@@ -203,43 +233,30 @@ pub fn per_key_downloads(
         .iter()
         .map(|(k, &now)| {
             let before = earlier.get(k).copied().unwrap_or(0);
-            let d = if now >= before { now - before } else { now };
-            (k.clone(), d)
+            (k.clone(), (now - before).max(0))
         })
         .collect()
 }
 
-/// Pure: the per-flavour change, clamped at 0 (no per-release split to
-/// read a reset from).
-fn per_flavour_downloads(
-    later: &BTreeMap<String, i64>,
-    earlier: &BTreeMap<String, i64>,
-) -> BTreeMap<String, i64> {
-    later
-        .iter()
-        .map(|(k, &now)| {
-            (
-                k.clone(),
-                (now - earlier.get(k).copied().unwrap_or(0)).max(0),
-            )
-        })
-        .collect()
+/// Pure: a downloads change between two snapshots, from the per-release
+/// totals `pick` chooses: `null` when the earlier snapshot is missing or
+/// either listing was truncated (a lower bound differenced is no change).
+fn release_delta(
+    later: &Snapshot,
+    earlier: Option<&Snapshot>,
+    pick: fn(&Snapshot) -> &BTreeMap<String, i64>,
+) -> Option<i64> {
+    earlier
+        .filter(|e| !e.truncated && !later.truncated)
+        .map(|e| per_key_downloads(pick(later), pick(e)).values().sum())
 }
 
 fn downloads_delta(later: &Snapshot, earlier: Option<&Snapshot>) -> Option<i64> {
-    earlier.map(|e| {
-        per_key_downloads(&later.releases, &e.releases)
-            .values()
-            .sum()
-    })
+    release_delta(later, earlier, |s| &s.releases)
 }
 
 fn helper_downloads_delta(later: &Snapshot, earlier: Option<&Snapshot>) -> Option<i64> {
-    earlier.map(|e| {
-        per_key_downloads(&later.helper_releases, &e.helper_releases)
-            .values()
-            .sum()
-    })
+    release_delta(later, earlier, |s| &s.helper_releases)
 }
 
 fn top(map: BTreeMap<String, i64>) -> Vec<KeyCount> {
@@ -270,11 +287,23 @@ pub fn counters_at(
         d7: f(now, back(7)),
         d28: f(now, back(28)),
     };
-    let missing_week = || {
-        Measured::NotMeasured(NotMeasured::now(format!(
-            "no snapshot for {} to difference against",
-            day_str(at - Duration::days(7))
-        )))
+    let week_start = day_str(at - Duration::days(7));
+    let week = back(7);
+    let week_list = |pick: fn(&Snapshot) -> &BTreeMap<String, i64>| match week {
+        None => Measured::NotMeasured(NotMeasured::now(format!(
+            "no snapshot for {week_start} to difference against"
+        ))),
+        Some(e) if e.truncated || now.truncated => {
+            let cut = if now.truncated {
+                day_str(at)
+            } else {
+                week_start.clone()
+            };
+            Measured::NotMeasured(NotMeasured::now(format!(
+                "the release listing of {cut} hit the page bound"
+            )))
+        }
+        Some(e) => Measured::Value(top(per_key_downloads(pick(now), pick(e)))),
     };
     Some(GithubCounters {
         repo: repo.to_string(),
@@ -284,19 +313,14 @@ pub fn counters_at(
         watchers: now.counter("watchers"),
         downloads: now.counter("downloads"),
         helper_downloads: now.counter("helper_downloads"),
+        downloads_truncated: now.truncated,
         stars_delta: delta(&|l, e| counter_delta(l, e, "stars")),
         forks_delta: delta(&|l, e| counter_delta(l, e, "forks")),
         watchers_delta: delta(&|l, e| counter_delta(l, e, "watchers")),
         downloads_delta: delta(&downloads_delta),
         helper_downloads_delta: delta(&helper_downloads_delta),
-        top_releases_7d: match back(7) {
-            Some(e) => Measured::Value(top(per_key_downloads(&now.releases, &e.releases))),
-            None => missing_week(),
-        },
-        top_flavours_7d: match back(7) {
-            Some(e) => Measured::Value(top(per_flavour_downloads(&now.flavours, &e.flavours))),
-            None => missing_week(),
-        },
+        top_releases_7d: week_list(|s| &s.releases),
+        top_flavours_7d: week_list(|s| &s.flavours),
     })
 }
 
@@ -386,6 +410,15 @@ pub fn traffic_at(
     }
 }
 
+/// What [`read`] found for one source.
+struct Read {
+    rows: Vec<GrowthDaily>,
+    /// The days whose pull is `ok`.
+    ok: HashSet<String>,
+    /// The `ok` days whose last good pull hit the client's page bound.
+    truncated: HashSet<String>,
+}
+
 /// The rows of one `(source, repo)` and breakdowns for
 /// `from <= day <= to`, and the days whose pull is `ok`.
 async fn read(
@@ -395,21 +428,27 @@ async fn read(
     repo: &str,
     from: &str,
     to: &str,
-) -> Result<(Vec<GrowthDaily>, HashSet<String>), DigestError> {
+) -> Result<Read, DigestError> {
     let dao = GrowthDao::new(&state.db);
     let mut rows = Vec::new();
     for by in bys {
         rows.extend(dao.read_daily_by(source, by, from, to).await?);
     }
     rows.retain(|r| r.dims.get("repo").map(String::as_str) == Some(repo));
-    let ok: HashSet<String> = dao
-        .pulls_between(source, from, to)
-        .await?
-        .into_iter()
-        .filter(|p| p.status == PullStatus::Ok)
-        .map(|p| p.day)
-        .collect();
-    Ok((rows, ok))
+    let (mut ok, mut truncated) = (HashSet::new(), HashSet::new());
+    for p in dao.pulls_between(source, from, to).await? {
+        if p.status == PullStatus::Ok {
+            if p.truncated {
+                truncated.insert(p.day.clone());
+            }
+            ok.insert(p.day);
+        }
+    }
+    Ok(Read {
+        rows,
+        ok,
+        truncated,
+    })
 }
 
 fn not_pulled(state: &AppState, what: &str) -> NotMeasured {
@@ -438,7 +477,7 @@ pub async fn section(state: &AppState, day: NaiveDate) -> Result<GithubSection, 
     // 28 days behind it.
     let from = day_str(day - Duration::days(SNAPSHOT_LOOKBACK_DAYS + 28));
     let to = day_str(day);
-    let (rows, ok) = read(
+    let r = read(
         state,
         GITHUB_SOURCE,
         &["repo", "release", "flavour"],
@@ -447,7 +486,7 @@ pub async fn section(state: &AppState, day: NaiveDate) -> Result<GithubSection, 
         &to,
     )
     .await?;
-    let counters = match counters_at(repo, day, &snapshots(&rows, &ok)) {
+    let counters = match counters_at(repo, day, &snapshots(&r.rows, &r.ok, &r.truncated)) {
         Some(c) => Measured::Value(c),
         None => Measured::NotMeasured(not_pulled(
             state,
@@ -461,7 +500,7 @@ pub async fn section(state: &AppState, day: NaiveDate) -> Result<GithubSection, 
     let t_from = day_str(day - Duration::days(27));
     // The referrer ranking may be up to 14 days older than the window's
     // newest ok day; reading the 28 days covers it.
-    let (t_rows, t_ok) = read(
+    let t = read(
         state,
         GITHUB_TRAFFIC_SOURCE,
         &["traffic", "referrer"],
@@ -470,7 +509,7 @@ pub async fn section(state: &AppState, day: NaiveDate) -> Result<GithubSection, 
         &to,
     )
     .await?;
-    let traffic = if t_ok.is_empty() {
+    let traffic = if t.ok.is_empty() {
         Measured::NotMeasured(if g.github_traffic_configured() {
             not_pulled(
                 state,
@@ -483,7 +522,7 @@ pub async fn section(state: &AppState, day: NaiveDate) -> Result<GithubSection, 
             NotMeasured::now("no GitHub token configured (ROOMLER__GROWTH__GITHUB_TOKEN)")
         })
     } else {
-        Measured::Value(traffic_at(day, &t_rows, &t_ok))
+        Measured::Value(traffic_at(day, &t.rows, &t.ok))
     };
     Ok(GithubSection { counters, traffic })
 }
@@ -530,7 +569,12 @@ mod tests {
         // 10-10 … 10-14 missing: a gap.
         rows.extend(snap("2026-10-15", 104, &[("v1", 60)]));
         rows.extend(snap("2026-10-16", 105, &[("v1", 61), ("v2", 4)]));
-        let snaps = snapshots(&rows, &ok(&["2026-10-09", "2026-10-15", "2026-10-16"]));
+        let none = HashSet::new();
+        let snaps = snapshots(
+            &rows,
+            &ok(&["2026-10-09", "2026-10-15", "2026-10-16"]),
+            &none,
+        );
         let c = counters_at("o/r", d("2026-10-16"), &snaps).unwrap();
         assert_eq!(c.at, "2026-10-16");
         assert_eq!(c.stars, 105);
@@ -552,8 +596,30 @@ mod tests {
         // Past the lookback: nothing.
         assert!(counters_at("o/r", d("2026-10-30"), &snaps).is_none());
         // A row of a day whose pull is not ok is not a snapshot.
-        let not_ok = snapshots(&rows, &ok(&["2026-10-16"]));
+        let not_ok = snapshots(&rows, &ok(&["2026-10-16"]), &none);
         assert_eq!(not_ok.len(), 1);
+
+        // A listing that hit the page bound: its downloads are a lower bound,
+        // every downloads change that needs it is null, the stars are not.
+        let cut = snapshots(
+            &rows,
+            &ok(&["2026-10-09", "2026-10-15", "2026-10-16"]),
+            &ok(&["2026-10-09"]),
+        );
+        let c = counters_at("o/r", d("2026-10-16"), &cut).unwrap();
+        assert!(!c.downloads_truncated, "10-16's own listing was whole");
+        assert_eq!(c.downloads_delta.day, Some(5), "10-15 and 10-16 are whole");
+        assert_eq!(c.downloads_delta.d7, None, "10-09 is a lower bound");
+        assert_eq!(c.stars_delta.d7, Some(5), "the stars are whole");
+        assert!(
+            matches!(&c.top_releases_7d, Measured::NotMeasured(n)
+                if n.not_measured.contains("2026-10-09 hit the page bound")),
+            "{:?}",
+            c.top_releases_7d
+        );
+        let at9 = counters_at("o/r", d("2026-10-09"), &cut).unwrap();
+        assert!(at9.downloads_truncated);
+        assert_eq!(at9.downloads, 50, "shown, as a lower bound");
 
         // A helper release (CI's vendored build) is differenced apart and
         // never reaches the product's downloads.
@@ -571,6 +637,7 @@ mod tests {
         let snaps = snapshots(
             &with_helper,
             &ok(&["2026-10-09", "2026-10-15", "2026-10-16"]),
+            &none,
         );
         let c = counters_at("o/r", d("2026-10-16"), &snaps).unwrap();
         assert_eq!(c.downloads_delta.day, Some(5), "the product alone");
@@ -578,27 +645,43 @@ mod tests {
         assert_eq!(c.helper_downloads_delta.d7, Some(1300), "new since 10-09");
     }
 
-    /// A counter that went down is a reset (an asset re-uploaded), a release
-    /// that vanished counts nothing, a new one counts fully; the flavours
-    /// clamp at 0.
+    /// A total that went down (an asset re-uploaded) counts nothing — the
+    /// release's other assets cannot be told from the restart — a release
+    /// that vanished counts nothing, and a new one counts fully.
     #[test]
-    fn downloads_read_resets_as_resets() {
-        let earlier: BTreeMap<String, i64> =
-            [("a".into(), 10), ("b".into(), 7), ("gone".into(), 40)].into();
-        let later: BTreeMap<String, i64> =
-            [("a".into(), 12), ("b".into(), 3), ("new".into(), 5)].into();
+    fn a_total_that_went_down_counts_nothing() {
+        let earlier: BTreeMap<String, i64> = [
+            ("a".into(), 10),
+            ("b".into(), 7),
+            ("gone".into(), 40),
+            // CI's seed cache: 28 assets, six clobbered on one save.
+            ("seed-cache".into(), 5_000),
+        ]
+        .into();
+        let later: BTreeMap<String, i64> = [
+            ("a".into(), 12),
+            ("b".into(), 3),
+            ("new".into(), 5),
+            ("seed-cache".into(), 3_900),
+        ]
+        .into();
         let per = per_key_downloads(&later, &earlier);
         assert_eq!(per["a"], 2);
-        assert_eq!(per["b"], 3, "went down: the new asset's own count");
+        assert_eq!(
+            per["b"], 0,
+            "went down: an under-count, never the new total"
+        );
+        assert_eq!(
+            per["seed-cache"], 0,
+            "not the 3,900 the clobbered release now holds"
+        );
         assert_eq!(per["new"], 5);
         assert!(!per.contains_key("gone"));
-        let fl = per_flavour_downloads(&later, &earlier);
-        assert_eq!(fl["b"], 0, "a flavour never goes negative");
         // The top list drops the zeros and sorts by count.
         let t = top(per);
         assert_eq!(
             t.iter().map(|k| k.key.as_str()).collect::<Vec<_>>(),
-            ["new", "b", "a"]
+            ["new", "a"]
         );
     }
 

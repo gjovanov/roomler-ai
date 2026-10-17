@@ -517,16 +517,24 @@ sequenceDiagram
   `kind`) and `by: flavour` downloads — a flavour is the asset name without its version), read between 01:00
   and 07:00 the next day. The product's releases (`agent-v`, `setup-v`, `tunnel-v`, `tunnel-wizard-v`) are
   counted apart from the helpers our own CI downloads (vendored builds, caches), which held 8,032 of the
-  16,740 downloads when read live on 2026-10-17. The first
-  good read stands, and a day not read inside that window has no snapshot. The readers (`growth::github`)
+  16,740 downloads when read live on 2026-10-17. Signature and checksum sidecars (`.asc`, `.sha256`) are
+  not counted: the updater fetches one beside every package. The first
+  good read stands, and a day not read inside that window has no snapshot. The counters never carry the
+  token, so a bad token cannot cost a snapshot; they read from GitHub's 60 unauthenticated requests an hour,
+  which the releases cache also uses, so the listing (at most 30 pages) stops before the hour's last 10
+  and the next tick retries. A listing past 30 pages is stored as `truncated`, and the readers treat its
+  downloads as a lower bound. The readers (`growth::github`)
   difference two snapshots: a delta whose earlier snapshot is missing is `null`, never 0 and never split
-  across the gap, and downloads are differenced per release with a counter reset read as a reset. Traffic
+  across the gap, and downloads are differenced per release — a release whose total went down (an asset
+  re-uploaded, as CI's `seed-cache` is on every seed save) counts nothing that day, an under-count rather
+  than the over-count of reading its new total as new downloads. Traffic
   (`source: github_traffic`) needs `ROOMLER__GROWTH__GITHUB_TOKEN`: the per-day views and clones are
   re-pulled for the last 13 closed days and frozen after, and the referrers, which GitHub answers only as a
   14-day top-10 ranking, are stored under the closed day they were read after. ⚠️ GitHub's download counts
   include every agent self-update, hosted and self-hosted alike, because the updater downloads from GitHub
-  directly: they measure distribution, not installs, and nothing tells one deployment from another. Shown as
-  the digest's `github` section and the weekly roll-up's. Detail:
+  directly: they measure distribution, not installs, and nothing tells one deployment from another. Clones
+  are mostly CI's `actions/checkout`, not people, and the email labels them so.
+  Shown as the digest's `github` section and the weekly roll-up's. Detail:
   [growth-observability.md](../growth-observability.md#github-the-repositorys-counters-and-traffic-p7a).)*
 
 ### 3l. The daily digest (P1d), the results feed and alerts (P10)
