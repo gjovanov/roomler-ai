@@ -1563,11 +1563,22 @@ pub fn srflx_hairpin_pointless(
 ///
 /// `base == 0` skips straight to ephemeral (explicit opt-out). `None` only
 /// when even the ephemeral bind fails.
+///
+/// FR-110: every socket this returns has asked for carrier-sized buffers
+/// ([`super::sockbuf::tune_carrier`]). At the OS default the kernel dropped
+/// bursts before the daemon read them.
 pub(crate) async fn bind_direct_socket(
     ip: Ipv4Addr,
     base: u16,
     what: &'static str,
 ) -> Option<UdpSocket> {
+    let sock = bind_on_band(ip, base, what).await?;
+    super::sockbuf::tune_carrier(&sock, what);
+    Some(sock)
+}
+
+/// The stable-port policy itself (the three tiers above), unchanged by FR-110.
+async fn bind_on_band(ip: Ipv4Addr, base: u16, what: &'static str) -> Option<UdpSocket> {
     let mut candidates = direct_port_candidates(base);
     if let Some(first) = candidates.next() {
         for attempt in 0u8..3 {
