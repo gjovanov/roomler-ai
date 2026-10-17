@@ -75,6 +75,10 @@ const dist = (ax: number, ay: number, bx: number, by: number) => Math.hypot(ax -
  *  a few pixels each. */
 export const AGENT_WHEEL_STEP_PX = 100
 
+/** #2367 — a mouse or trackpad scroll that pauses this long has ended: its
+ *  carry (under one step) is dropped, so it never adds to the next one. */
+export const WHEEL_CARRY_IDLE_MS = 400
+
 /** Gathers a gesture's wheel pixels and lets out only whole agent steps,
  *  carrying the rest, so a slow two-finger scroll reaches every deployed agent
  *  instead of rounding to nothing frame by frame. */
