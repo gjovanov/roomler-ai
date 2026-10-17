@@ -3,8 +3,10 @@
 import { describe, expect, it } from 'vitest'
 import {
   createPointerPressTracker,
+  readTouchMode,
   releaseForCancelledPointer,
   stageTouchAction,
+  TOUCH_MODE_STORAGE_KEY,
   TOUCH_STORAGE_KEY,
 } from '@/composables/touchInput'
 
@@ -79,5 +81,20 @@ describe('FR-111 releaseForCancelledPointer', () => {
       t: 'mouse_release',
       btn: 'left',
     })
+  })
+})
+
+describe('FR-111 readTouchMode', () => {
+  const store = (v: string | null): Pick<Storage, 'getItem'> => ({
+    getItem: (k: string) => (k === TOUCH_MODE_STORAGE_KEY ? v : null),
+  })
+  it('is direct unless this browser chose the trackpad (decision 1 pending)', () => {
+    expect(readTouchMode(store(null))).toBe('direct')
+    expect(readTouchMode(store('trackpad'))).toBe('trackpad')
+    expect(readTouchMode(store('Trackpad'))).toBe('direct')
+    expect(readTouchMode(null)).toBe('direct')
+  })
+  it('reads storage that throws as direct', () => {
+    expect(readTouchMode({ getItem: () => { throw new Error('SecurityError') } })).toBe('direct')
   })
 })
