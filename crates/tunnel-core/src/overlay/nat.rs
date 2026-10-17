@@ -153,11 +153,34 @@ pub struct RouteOffer {
 /// node advertises nothing and says why: in `roomler status`, and in its join.
 ///
 /// `ROOMLERD_ROUTE_OFFER_UNPROBED=1` skips the probe and offers as before.
-pub async fn gate_offer(advertised: Vec<String>) -> RouteOffer {
+///
+/// FR-97 P0c-3 — `netstack`: this node's device is the userspace netstack,
+/// which offers nothing whatever the host's NAT could do ([`netstack_offer`]).
+pub async fn gate_offer(advertised: Vec<String>, netstack: bool) -> RouteOffer {
+    if let Some(offer) = netstack_offer(&advertised, netstack) {
+        return offer;
+    }
     // Through the node env chain like every other knob, so the config-backed
     // fallback and the older prefix are honoured too.
     let unprobed = crate::env::flag("ROUTE_OFFER_UNPROBED", false);
     gate_offer_with(advertised, unprobed, probe()).await
+}
+
+/// FR-97 P0c-3 — why a netstack node offers no route.
+pub const NETSTACK_FORWARDS_NOTHING: &str =
+    "this node runs the userspace netstack, which forwards nothing for its peers";
+
+/// FR-97 P0c-3 — a netstack node terminates every packet addressed to it in
+/// its own userspace stack and forwards none, so a `/0` or a subnet it
+/// advertised would black-hole every peer that took it, however well the
+/// host's own NAT works. A certainty rather than a probe, so
+/// `ROUTE_OFFER_UNPROBED` does not lift it. `None` = not netstack, or nothing
+/// to offer: the probe decides. Pure.
+fn netstack_offer(advertised: &[String], netstack: bool) -> Option<RouteOffer> {
+    (netstack && !advertised.is_empty()).then(|| RouteOffer {
+        routes: Vec::new(),
+        withheld: Some(NETSTACK_FORWARDS_NOTHING.to_string()),
+    })
 }
 
 async fn gate_offer_with(
@@ -858,7 +881,22 @@ async fn run_capture(args: Vec<String>) -> (bool, String) {
 
 #[cfg(test)]
 mod offer_tests {
-    use super::{RouteOffer, gate_offer_with};
+    use super::{NETSTACK_FORWARDS_NOTHING, RouteOffer, gate_offer_with, netstack_offer};
+
+    /// FR-97 P0c-3 — a netstack node offers nothing it was configured to, and
+    /// says why, before any probe; with nothing to offer it says nothing.
+    #[test]
+    fn a_netstack_node_offers_nothing_and_says_why() {
+        assert_eq!(
+            netstack_offer(&routes(&["0.0.0.0/0", "10.1.0.0/24"]), true),
+            Some(RouteOffer {
+                routes: Vec::new(),
+                withheld: Some(NETSTACK_FORWARDS_NOTHING.to_string()),
+            })
+        );
+        assert_eq!(netstack_offer(&[], true), None);
+        assert_eq!(netstack_offer(&routes(&["0.0.0.0/0"]), false), None);
+    }
 
     fn routes(r: &[&str]) -> Vec<String> {
         r.iter().map(|s| s.to_string()).collect()

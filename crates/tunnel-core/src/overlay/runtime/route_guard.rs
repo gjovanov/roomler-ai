@@ -339,10 +339,33 @@ pub(super) fn exit_node_status(
         // S3b — global IPv6 also routes through the exit only when v4 is active
         // AND v6 egress was enabled (v6 exemptions pinned). Otherwise v6 is
         // fail-closed even while v4 egress is active.
-        v6_active: state.split_default_installed && state.v6_active == Some(true),
+        // FR-97 P0c-3 — and never from a netstack node: its SOCKS5 front
+        // refuses every IPv6 destination that is not an overlay address, so
+        // no global v6 packet leaves it for the exit, whatever the router holds.
+        v6_active: state.split_default_installed
+            && state.v6_active == Some(true)
+            && state.socks5_port.is_none(),
         // S4b — DNS steered through the exit only while v4 egress is active.
         dns_steered: state.split_default_installed && state.dns_steered,
+        socks5_port: state.socks5_port,
     })
+}
+
+/// S4b — whether the exit's DNS steer may run now: only beside an installed
+/// split-default, once, and with MagicDNS on only at a live local resolver.
+///
+/// FR-97 P0c-3 — never from a netstack node. Its OS routes nothing through the
+/// exit, so a steer would only move every app on the host to the public
+/// upstream over the uplink: the Windows NRPT rule and the macOS resolver entry
+/// are host-wide, and on a managed laptop they would cut off its internal
+/// names. Only the SOCKS5 front's dials use the exit. Pure, so the gate is
+/// tested on every OS.
+pub(super) fn dns_steer_allowed(state: &ExitRoutingState) -> bool {
+    state.split_default_installed
+        && !state.dns_steered
+        && state.socks5_port.is_none()
+        && (state.dns_magic_domain.is_none() || state.dns_bound)
+        && state.dns_target.is_some()
 }
 
 /// S4 — record the split-tunnel WITHHELD reason on the state and log it ONCE per
@@ -455,6 +478,12 @@ pub(super) struct ExitRoutingState {
     /// [`exit_selector_drifted`]. `None` for a hex selector (unambiguous) or
     /// before the first successful resolution.
     pub(super) pinned_exit: Option<ObjectId>,
+    /// FR-97 P0c-3 — the netstack SOCKS5 front's port, when that is this
+    /// node's device. Fixed for the runtime's life: a netstack node installs
+    /// no OS routes, so the split-default lives only in the userspace router
+    /// and the exit carries only what the front dials. Reported in
+    /// [`ExitNodeStatus::socks5_port`].
+    pub(super) socks5_port: Option<u16>,
 }
 
 /// Surface a duplicate subnet claim — NEVER silently. Two live routers approved
@@ -719,9 +748,8 @@ impl OverlayRuntime {
         // before the first reconcile) — steering "." at a dead :53 would blackhole
         // ALL DNS. A not-bound resolver is left unsteered (working local DNS beats a
         // blackhole) and surfaced via `dns_steered=false` in `roomler status`.
-        if state.split_default_installed
-            && !state.dns_steered
-            && (state.dns_magic_domain.is_none() || state.dns_bound)
+        // FR-97 P0c-3 — and never from a netstack node ([`dns_steer_allowed`]).
+        if dns_steer_allowed(state)
             && let Some(target) = state.dns_target
         {
             if dns::steer_default_dns(target, state.dns_magic_domain.as_deref()).await {

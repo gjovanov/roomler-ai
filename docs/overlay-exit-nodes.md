@@ -15,8 +15,9 @@ appears on the internet from the exit node's IP (and resolves DNS from the
 exit's vantage). This is the Tailscale "exit node" model.
 
 Feature-gated on **`overlay-l3`** (the OS-TUN carrier); **default-OFF**. The
-userspace `overlay-netstack` build has no OS routing table, so it silently
-no-ops for exit routing. Everything below is `overlay-l3` only.
+userspace `overlay-netstack` device has no OS routing table: as a client its
+exit carries only what its SOCKS5 front dials ([below](#a-netstack-client-fr-97-p0c-3)),
+and it never serves as one. Everything else below is `overlay-l3`.
 
 The design's north star is **"never self-wedge."** A client that routes all
 egress through a peer can trivially cut off its own control channel (the
@@ -536,6 +537,59 @@ sequenceDiagram
 > - With stealth mode on, a ping to the Mac's own overlay address goes
 >   unanswered, even from a mesh peer. A failed ping says nothing about a Mac
 >   exit's health; check `roomler peers` and the client's egress instead.
+
+### A netstack client (FR-97 P0c-3)
+
+A node in netstack mode (`ROOMLERD_OVERLAY_NETSTACK_SOCKS`, or
+`netstack_socks_port` in its config) has no TUN and no routing table: the
+mesh lives in a userspace stack inside the daemon, reached through a SOCKS5
+front on `127.0.0.1`. Selecting an exit there installs the split-default in
+that userspace router only
+([`route_guard.rs:695`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L695)),
+so the exit carries exactly what the front dials and nothing else.
+
+```mermaid
+flowchart LR
+    S["a SOCKS5 client<br/>curl --socks5 127.0.0.1:1080"] --> F["SOCKS5 front"]
+    F -->|"IPv4 address"| U["userspace stack<br/>+ router: the exit's /1s"]
+    U --> W["WireGuard"] --> E["exit: NAT → internet"]
+    F -.->|"IPv6 address, or a name<br/>that is no overlay peer"| X["refused<br/>(host unreachable)"]
+    A["every other app"] --> O["the OS: no overlay route"] --> L["the local uplink, directly"]
+```
+
+| What | Through the exit? | Why |
+|---|---|---|
+| A SOCKS5 connect to an IPv4 address | ✅ | the front dials it as given ([`netstack_socks.rs:75`](../crates/tunnel-core/src/overlay/netstack_socks.rs#L75)) |
+| A name the SOCKS client resolves itself (`curl --socks5`) | ✅ | it reaches the front as an IPv4 address |
+| A name handed to the front (`curl --socks5-hostname`) | ❌ refused | the front resolves names only to overlay peers |
+| An IPv6 address | ❌ refused | the front takes no IPv6 destination that is not an overlay address |
+| Any app not using the front | ❌ direct | nothing in the OS routes through the overlay |
+| DNS | never steered | below |
+
+`roomler status` says so, from `ExitNodeStatus.socks5_port`
+([`lib.rs:107`](../crates/localapi/src/lib.rs#L107)):
+
+```text
+  exit node   <exit> (active for SOCKS5 clients of 127.0.0.1:1080 only — IPv4 destinations; nothing else on this host uses it)
+```
+
+Before P0c-3 it printed `active, v6 on, DNS NOT steered`, as if every app on
+the host left through the exit (field, 2026-10-17; FR-97 §8).
+
+⚠️ **A netstack node never steers the host's DNS**
+([`dns_steer_allowed`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L363)).
+The steer is host-wide on Windows (an NRPT catch-all) and macOS (a resolver
+entry). On a node whose OS routes nothing through the exit it would only move
+every app to the public upstream over the uplink, and on a managed laptop cut
+it off from its internal names.
+
+⚠️ **A netstack node never serves as an exit or a subnet router.** Its stack
+terminates every packet addressed to it and forwards none, so it withholds
+every route offer, whatever the host's own NAT could do: the reason is
+`this node runs the userspace netstack, which forwards nothing for its peers`,
+in `roomler status` and in the admin routes table. Before P0c-3, a netstack
+node on a host where iptables worked offered `/0` (field, 0.4.141), and every
+client of it would have black-holed.
 
 ## Caveats & gotchas
 
