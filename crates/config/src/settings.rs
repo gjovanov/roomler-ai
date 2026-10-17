@@ -588,10 +588,60 @@ pub struct GrowthSettings {
     /// need it. Never logged. Env: `ROOMLER__GROWTH__GITHUB_TOKEN`.
     #[serde(default)]
     pub github_token: String,
+    /// P7 — the Search Console property the `saas` puller reads, as Search
+    /// Console names it (`sc-domain:roomler.ai`, or a URL-prefix property's
+    /// `https://…/`). Env: `ROOMLER__GROWTH__SEARCH_CONSOLE_SITE`.
+    #[serde(default = "growth_default_search_console_site")]
+    pub search_console_site: String,
+    /// P7 — a service account's JSON key (the file Google Cloud hands out),
+    /// whose `client_email` is a user of the property. Empty — the default
+    /// — pulls nothing and leaves every search cell "not measured". Never
+    /// logged, never echoed in an error. Env:
+    /// `ROOMLER__GROWTH__SEARCH_CONSOLE_KEY`.
+    #[serde(default)]
+    pub search_console_key: String,
+    /// P7 — the Search Console API base. Only a test changes it.
+    /// Env: `ROOMLER__GROWTH__SEARCH_CONSOLE_API_URL`.
+    #[serde(default = "growth_default_search_console_api_url")]
+    pub search_console_api_url: String,
+    /// P7 — the site as verified in Bing Webmaster Tools (`https://…/`).
+    /// Env: `ROOMLER__GROWTH__BING_SITE_URL`.
+    #[serde(default = "growth_default_bing_site_url")]
+    pub bing_site_url: String,
+    /// P7 — a Bing Webmaster API key. Empty — the default — pulls nothing
+    /// and leaves the Bing cells "not measured". Never logged.
+    /// Env: `ROOMLER__GROWTH__BING_API_KEY`.
+    #[serde(default)]
+    pub bing_api_key: String,
+    /// P7 — the Bing Webmaster JSON API base. Only a test changes it.
+    /// Env: `ROOMLER__GROWTH__BING_API_URL`.
+    #[serde(default = "growth_default_bing_api_url")]
+    pub bing_api_url: String,
+    /// P7 — the blog's Atom feed, the list of posts the Content table and
+    /// URL Inspection read. Empty — the default — is
+    /// `{app.frontend_url}/blog/feed.xml`. Env: `ROOMLER__GROWTH__BLOG_FEED_URL`.
+    #[serde(default)]
+    pub blog_feed_url: String,
 }
 
 fn growth_default_on() -> bool {
     true
+}
+
+fn growth_default_search_console_site() -> String {
+    "sc-domain:roomler.ai".to_string()
+}
+
+fn growth_default_search_console_api_url() -> String {
+    "https://searchconsole.googleapis.com".to_string()
+}
+
+fn growth_default_bing_site_url() -> String {
+    "https://roomler.ai/".to_string()
+}
+
+fn growth_default_bing_api_url() -> String {
+    "https://ssl.bing.com/webmaster/api.svc/json".to_string()
 }
 
 fn growth_default_github_repo() -> String {
@@ -628,6 +678,13 @@ impl Default for GrowthSettings {
             github_repo: growth_default_github_repo(),
             github_api_url: growth_default_github_api_url(),
             github_token: String::new(),
+            search_console_site: growth_default_search_console_site(),
+            search_console_key: String::new(),
+            search_console_api_url: growth_default_search_console_api_url(),
+            bing_site_url: growth_default_bing_site_url(),
+            bing_api_key: String::new(),
+            bing_api_url: growth_default_bing_api_url(),
+            blog_feed_url: String::new(),
         }
     }
 }
@@ -678,6 +735,17 @@ impl GrowthSettings {
     /// P7 — whether repository traffic can be read at all.
     pub fn github_traffic_configured(&self) -> bool {
         !self.github_token.trim().is_empty()
+    }
+
+    /// P7 — whether a Search Console key is set (whether it PARSES is the
+    /// puller's to say, once, at boot).
+    pub fn search_console_configured(&self) -> bool {
+        !self.search_console_key.trim().is_empty() && !self.search_console_site.trim().is_empty()
+    }
+
+    /// P7 — whether a Bing Webmaster key is set.
+    pub fn bing_configured(&self) -> bool {
+        !self.bing_api_key.trim().is_empty() && !self.bing_site_url.trim().is_empty()
     }
 }
 
@@ -1595,6 +1663,16 @@ mod growth_settings_tests {
             toml::from_str("github_repo = \" acme/site.io \"\ngithub_token = \"t\"").unwrap();
         assert_eq!(gh.github_repo(), Some("acme/site.io"));
         assert!(gh.github_traffic_configured());
+        // P7 — the search pullers: the hosted property and site by default,
+        // and nothing configured until a key is set.
+        assert_eq!(d.search_console_site, "sc-domain:roomler.ai");
+        assert_eq!(d.bing_site_url, "https://roomler.ai/");
+        assert!(!d.search_console_configured() && !d.bing_configured());
+        assert!(!absent.search_console_configured() && !absent.bing_configured());
+        assert!(d.blog_feed_url.is_empty());
+        let keyed: GrowthSettings =
+            toml::from_str("search_console_key = \"{}\"\nbing_api_key = \"k\"").unwrap();
+        assert!(keyed.search_console_configured() && keyed.bing_configured());
         // P3b — the wizard's opt-in diagnostics are accepted unless switched
         // off (the same reason as the counters: the rows are the server's
         // own, opt-in at the source, and name nobody).

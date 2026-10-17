@@ -26,6 +26,9 @@ bson.workspace = true
 # FR-102 P6 — the purestat puller's UTC days and its freeze horizon.
 chrono.workspace = true
 futures.workspace = true
+# FR-102 P7 — the Search Console service account's RS256 assertion (the
+# OAuth JWT-bearer grant).
+jsonwebtoken.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

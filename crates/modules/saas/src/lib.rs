@@ -53,7 +53,9 @@ use roomler_ai_services::dao::{
 };
 use roomler_core::{Capabilities, Core, Module, TenantCtx};
 
+pub mod bing_pull;
 pub mod capped;
+pub mod content_pull;
 pub mod github_pull;
 pub mod growth_ingest;
 pub mod newsletter;
@@ -61,6 +63,8 @@ pub mod newsletter_send;
 pub mod plan_compliance;
 pub mod pull_schedule;
 pub mod purestat_pull;
+pub mod search_console;
+pub mod search_pull;
 pub mod sendgrid;
 pub mod stripe;
 pub mod subscribe;
@@ -116,6 +120,14 @@ impl Module for SaasState {
         // with the optional token. Nothing without `growth.enabled` and a
         // repository; one pod per tick through its own Redis claim.
         github_pull::spawn_puller(core.clone());
+        // FR-102 P7 — search: Google Search Console per final day (with a
+        // service-account key), the blog's feed and each post's URL
+        // Inspection verdict (the feed needs nothing; the verdicts the same
+        // key), and Bing Webmaster at Bing's own grain (with an API key).
+        // Each says once why it pulls nothing, and claims its own tick.
+        search_pull::spawn_puller(core.clone());
+        content_pull::spawn_puller(core.clone());
+        bing_pull::spawn_puller(core.clone());
         // FR-102 P5 (D6) — SendGrid's account-level open/click tracking,
         // read once and warned about loudly if on. Spawned, bounded, never
         // blocks the boot; nothing without a SendGrid key.
@@ -308,6 +320,15 @@ impl Module for SaasState {
                     index(bson::doc! { "tenant_id": 1, "ts": 1 }),
                     index(bson::doc! { "kind": 1, "ts": 1 }),
                 ],
+            },
+            // FR-102 P7 — the blog's posts as the content puller read them
+            // from the feed, `_id` the post's path, with Google's URL
+            // Inspection verdict. Read newest first by the Content table.
+            // No TTL: our own content, no person (spec §3p).
+            IndexSet {
+                collection: roomler_ai_services::dao::growth_content::GROWTH_CONTENT,
+                pre_ops: Vec::new(),
+                indexes: vec![index(bson::doc! { "published_at": -1 })],
             },
         ]
     }

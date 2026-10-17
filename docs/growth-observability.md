@@ -14,7 +14,9 @@ upgrade intent from plan-limit collisions, and margin against the cost to serve 
 key, the weekly roll-up and the alert rules (P10) — and remote-desktop quality from what is already
 recorded: sessions by outcome, the time to first frame frozen before its logs expire, crashes per
 100 device-days, by agent version (P9a) — and the repository on GitHub: stars, forks and release
-downloads as daily snapshots, and its traffic with a token (P7a).
+downloads as daily snapshots, and its traffic with a token (P7a) — and search: Google Search
+Console per final day, the blog's posts with their URL Inspection verdict, and Bing at its own
+grain (P7b).
 Spec: [`docs/fr/FR-102-growth-observability.md`](fr/FR-102-growth-observability.md) (#2127). It
 also places the existing `/observability` page, which no doc described before.
 
@@ -1025,6 +1027,148 @@ permission **Administration: Read-only** (GitHub adds *Metadata: Read-only* itse
 someone with push access, which is why a read-only token still needs that one permission; a
 classic token would need the whole `repo` scope.
 
+## Search: Search Console, Bing and the blog's posts (P7b)
+
+What search does before anyone visits: impressions, clicks and positions per page and query,
+whether each post is indexed, and Bing beside Google. Three `saas` pullers on P6's pattern —
+hosted-only, each "not measured" without its credential and saying so once at boot, one
+`growth_pulls` row per (source, day), a failure recorded with its reason and never a 0. The
+Content table and the digest's Search section that read them are P7c.
+
+```mermaid
+flowchart LR
+  subgraph saas["saas module — hosted only"]
+    SP["Search Console puller<br/>search_pull"]
+    CP["content puller<br/>content_pull"]
+    BP["Bing puller<br/>bing_pull"]
+  end
+  TOK[("oauth2.googleapis.com/token<br/>JWT-bearer, RS256")]
+  SC[("Search Analytics<br/>searchAnalytics.query")]
+  UI[("URL Inspection<br/>index:inspect")]
+  FEED[("roomler.ai/blog/feed.xml")]
+  BING[("Bing Webmaster API")]
+  SP -->|"service account assertion"| TOK
+  SP -->|"date (dataState: all) → firstIncompleteDate<br/>then page · query · page×query per FINAL day"| SC
+  CP -->|"once a day"| FEED
+  CP -->|"each post, ≤ 200 a day"| UI
+  BP -->|"GetRankAndTrafficStats · GetQueryStats · GetPageStats"| BING
+  SP --> GD[("growth_daily<br/>search_console")]
+  BP --> GD2[("growth_daily<br/>bing · bing_weekly")]
+  CP --> GC[("growth_content<br/>_id = the post's path")]
+  SP & CP & BP --> GPU[("growth_pulls")]
+```
+
+### Google Search Console — only final days
+
+[`search_pull.rs`](../crates/modules/saas/src/search_pull.rs) and its client
+[`search_console.rs`](../crates/modules/saas/src/search_console.rs).
+
+| Rule | Value | Where |
+|---|---|---|
+| **The credential** is a service account's JSON key. The token is the OAuth JWT-bearer grant: an RS256 assertion `{iss: client_email, scope: webmasters.readonly, aud: token_uri, iat, exp = iat + 1 h}`, cached until a minute before it expires. The scope caps the token at **read-only**, whatever role the account holds on the property | `assertion` ([`search_console.rs:330`](../crates/modules/saas/src/search_console.rs)), `access_token` ([`:348`](../crates/modules/saas/src/search_console.rs)) |
+| A key that does not parse (not JSON, not `service_account`, not an RSA PEM) is said once, loudly, at boot — without echoing the key — and nothing is pulled | `from_key_json` ([`:271`](../crates/modules/saas/src/search_console.rs)), `spawn_puller` ([`search_pull.rs:303`](../crates/modules/saas/src/search_pull.rs)) |
+| **Only final days are stored.** Each cycle first asks the `date` breakdown with `dataState: all`; its `metadata.firstIncompleteDate` says where Google's unsettled days start (usually two or three days back). A day from there on stays **due, with nothing stored** — never a partial day read as whole. A final day's breakdowns are asked with `dataState: final` | `final_days` ([`search_pull.rs:163`](../crates/modules/saas/src/search_pull.rs)), `run_once` ([`:215`](../crates/modules/saas/src/search_pull.rs)) |
+| **The horizon** is the last 30 closed days: the first cycle fills them all (the Content table reads 28 days); a day younger than 5 is re-pulled once per cycle to catch a late correction, an older one pulled until it succeeds once; past 30, frozen | `HORIZON_DAYS`, `SETTLE_DAYS` ([`:66`](../crates/modules/saas/src/search_pull.rs)), `pull_schedule::due_days` |
+| A day is **Google's**: Search Console dates are Pacific-time days | — |
+| Each breakdown pages 25,000 rows at a time, at most four pages (`truncated` on the pull row past that) | `query_all` ([`search_console.rs:440`](../crates/modules/saas/src/search_console.rs)) |
+| Google's answer is read leniently: no `rows` key is no rows; a `"NaN"` position is no position; an exponent is a number | `lenient_f64` ([`:153`](../crates/modules/saas/src/search_console.rs)) |
+| A fatal error (the key, the token, a 401 / 403, a quota, a timeout) stops the run and records the reason on every day it owed | `run_once` |
+
+| `growth_daily` (`source: search_console`) | dims | from | note |
+|---|---|---|---|
+| `by: site` | — | the `date` breakdown | the property's totals — by property, one impression per results page |
+| `by: page` | `page` (the URL as Google reports it) | a `page` breakdown | **the per-page totals, anonymised queries included** — what Search Console's UI shows for a page |
+| `by: query` | `query` | a `query` breakdown | Google leaves the rare, anonymised queries out of it |
+| `by: page_query` | `page`, `query` | a `page` × `query` breakdown | its sum is lower than the page rows by exactly those anonymised queries |
+
+Every row carries `clicks`, `impressions` and **`position_x100`** — the position weighted by
+impressions, ×100 and rounded (`Σ position · impressions · 100`), so any set of rows averages as
+Google averages: `Σ position_x100 / Σ impressions / 100`. CTR is `clicks / impressions` and is
+not stored. A zero is not stored; a value is cut to 300 characters (a page) or 200 (a query) with
+control characters dropped, and keys that fold into one are summed
+([`rows_of`, `search_pull.rs:123`](../crates/modules/saas/src/search_pull.rs)).
+
+### The blog's posts and URL Inspection
+
+[`content_pull.rs`](../crates/modules/saas/src/content_pull.rs) keeps `growth_content`, a
+collection of `saas`'s own (its index set in the module, FR-69 rule 3), read by the host through
+`roomler_ai_services::dao::growth_content`
+([`sync_feed`, `growth_content.rs:124`](../crates/services/src/dao/growth_content.rs)).
+
+- **The feed is the list.** No server record holds the posts: the blog is built by the docs
+  generator and published by the blog lane. Its Atom feed, `{frontend_url}/blog/feed.xml`
+  (`ROOMLER__GROWTH__BLOG_FEED_URL` overrides it), carries every post's permanent URL, title and
+  `published` time ([`parse_feed`, `content_pull.rs:117`](../crates/modules/saas/src/content_pull.rs)).
+  It is read once a day (`growth_pulls content:<day>`) with no credential — it is the site's
+  own. `_id` is the post's path, the key every reader joins on; a post that leaves the feed keeps
+  its row with `in_feed: false`; a 404 is "no blog", not a failure.
+- **URL Inspection**, with the Search Console key: each post in the feed, at most 200 a day
+  (`MAX_INSPECTIONS`, inside Google's 2,000), gets Google's `verdict` (`PASS` · `NEUTRAL` —
+  excluded · `FAIL`), `coverage_state` ("Submitted and indexed", "Crawled - currently not
+  indexed", …), `indexing_state`, `page_fetch_state`, `robots_txt_state`, `last_crawl_time` and
+  `google_canonical`. A failed inspection keeps the last good verdict and records only the error;
+  a fatal one stops the day's inspections and fails `url_inspection:<day>` with its reason.
+
+> ⚠️ **Restricted is enough for the numbers, maybe not for the index column.** Google's own
+> permission table gives a *Restricted* user Performance (Search Analytics) but only "fetch only"
+> on URL Inspection, and community reports say the API needs *Full*. With a Restricted account
+> the clicks and impressions arrive and every post's inspection records `forbidden (403)` —
+> never a 0 — until the account is raised to Full. The token stays read-only either way.
+
+### Bing Webmaster — at Bing's own grain
+
+[`bing_pull.rs`](../crates/modules/saas/src/bing_pull.rs). Bing does not answer what Search
+Console answers, and nothing here pretends it does:
+
+| Bing method | Bing's grain | Stored as |
+|---|---|---|
+| `GetRankAndTrafficStats` | one row per **day**: the site's clicks and impressions | `source: bing`, `by: site`, `clicks` · `impressions` |
+| `GetQueryStats` | one row per query per **weekly bucket** ("updated every week"; the newest bucket is rewritten until it closes) | `source: bing_weekly`, `by: query`, dims `query`, under the bucket's date |
+| `GetPageStats` | one row per page per weekly bucket (the URL comes in Bing's `Query` field) | `source: bing_weekly`, `by: page`, dims `page` |
+
+- Weekly rows carry `clicks`, `impressions` and Bing's `AvgImpressionPosition` /
+  `AvgClickPosition` **as Bing returns them, ×10** (`avg_impression_position_x10`,
+  `avg_click_position_x10`); Bing's "none" (−1) is not stored. They are a week as Bing cuts it,
+  never relabelled as a 7-day window.
+- A row's day is Bing's: `/Date(1760252400000-0700)/` is epoch milliseconds with a Pacific
+  offset, applied before the calendar day is taken
+  ([`bing_day`, `bing_pull.rs:245`](../crates/modules/saas/src/bing_pull.rs)).
+- Every call returns the whole history, so a cycle (once a day, after 03:00 UTC, marked
+  `growth_pulls bing:<yesterday>`) rewrites only the last 30 daily rows and 35 days of weekly
+  buckets; older rows stay as first stored.
+- Bing exposes **no index status**, and its per-URL crawl method (`GetUrlInfo`) is reported broken
+  for verified sites, so the index column is Google's alone.
+- A refused key is Bing's `ErrorCode` with its message (`3` InvalidApiKey, `14` NotAuthorized — an
+  unverified site), recorded on the cycle's row.
+
+### Settings and the operator's setup
+
+| Setting | Env | Default | Effect |
+|---|---|---|---|
+| `growth.search_console_site` | `ROOMLER__GROWTH__SEARCH_CONSOLE_SITE` | `sc-domain:roomler.ai` | the property, as Search Console names it |
+| `growth.search_console_key` | `ROOMLER__GROWTH__SEARCH_CONSOLE_KEY` | empty | the service account's JSON key; empty ⇒ nothing pulled and nothing inspected, every Google cell "not measured"; never logged |
+| `growth.search_console_api_url` | `ROOMLER__GROWTH__SEARCH_CONSOLE_API_URL` | `https://searchconsole.googleapis.com` | only a test changes it |
+| `growth.bing_site_url` | `ROOMLER__GROWTH__BING_SITE_URL` | `https://roomler.ai/` | the site exactly as verified in Bing Webmaster Tools |
+| `growth.bing_api_key` | `ROOMLER__GROWTH__BING_API_KEY` | empty | Bing's API key; empty ⇒ nothing pulled; never logged |
+| `growth.bing_api_url` | `ROOMLER__GROWTH__BING_API_URL` | `https://ssl.bing.com/webmaster/api.svc/json` | only a test changes it |
+| `growth.blog_feed_url` | `ROOMLER__GROWTH__BLOG_FEED_URL` | empty ⇒ `{app.frontend_url}/blog/feed.xml` | the list of posts |
+
+**The Search Console credential** is created by the operator, once:
+
+1. In Google Cloud (any project the operator owns), enable the **Google Search Console API**,
+   then *IAM & Admin → Service accounts → Create service account* (no project role is needed),
+   and on it *Keys → Add key → Create new key → JSON*.
+2. Seal the downloaded JSON, whole, into `roomler2-secret` as
+   `ROOMLER__GROWTH__SEARCH_CONSOLE_KEY`. Nothing else holds it.
+3. In Search Console, property `sc-domain:roomler.ai` → *Settings → Users and permissions → Add
+   user* → the key's `client_email` → **Restricted** for the search numbers; **Full** if the index
+   column should fill (see the warning above). The token's `webmasters.readonly` scope keeps it
+   read-only under either role.
+
+**The Bing key**: Bing Webmaster Tools → *Settings → API access → API key → Generate* (the key is
+the user's and covers every site that user verified), sealed into `roomler2-secret` as
+`ROOMLER__GROWTH__BING_API_KEY`.
+
 ## The newsletter: delivery, per-issue tags and unsubscribes (P5)
 
 What an issue did — delivered, bounced, complaints, who left through it, the visits and
@@ -1841,6 +1985,15 @@ paging, the drafts and sidecars, a helper release counted apart, the token on th
 only, a refused token recorded per traffic day while the snapshot is still taken, a listing past
 the page bound marked, a spent rate limit retried next tick, a gap read as `null`
 (`crates/tests/src/growth_github_tests.rs`).
+
+The search pullers (P7b) wait for the operator's two credentials. Then, for one closed day that
+Google calls final, `growth_pulls search_console:<day>` is `ok` and its `by: page` rows for a post
+equal Search Console's own Performance report filtered to that page and day (AC17 reads it over a
+week, in the Content table, P7c); `growth_content` lists every post of the feed, and each carries a
+verdict (or, with a Restricted account, `forbidden (403)`); `growth_pulls bing:<day>` is `ok`. The
+integration suite drives all three against fakes — the token exchange with its claims checked,
+only final days stored, the weighted position, a refused token and a missing permission recorded,
+the feed and the inspections, Bing's grain and dates (`crates/tests/src/growth_search_tests.rs`).
 
 The newsletter's webhook is to be shown on production to refuse a bad signature (control),
 and to record `delivered` and `bounce` for a test send with one forced bounce, the bounced

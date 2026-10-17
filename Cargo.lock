@@ -8356,6 +8356,7 @@ dependencies = [
  "bson",
  "chrono",
  "futures",
+ "jsonwebtoken",
  "reqwest 0.12.28",
  "roomler-ai-config",
  "roomler-ai-db",

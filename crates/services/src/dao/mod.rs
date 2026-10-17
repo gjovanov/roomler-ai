@@ -14,6 +14,7 @@ pub mod exec_pending;
 pub mod file;
 pub mod growth;
 pub mod growth_alert;
+pub mod growth_content;
 pub mod growth_digest;
 pub mod growth_key;
 pub mod growth_quality;

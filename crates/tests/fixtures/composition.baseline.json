@@ -1470,6 +1470,16 @@
         ]
       },
       {
+        "collection": "growth_content",
+        "indexes": [
+          {
+            "key": {
+              "published_at": -1
+            }
+          }
+        ]
+      },
+      {
         "collection": "growth_daily",
         "indexes": [
           {
@@ -3406,6 +3416,16 @@
               "fired_at": 1
             },
             "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "growth_content",
+        "indexes": [
+          {
+            "key": {
+              "published_at": -1
+            }
           }
         ]
       },
