@@ -1012,7 +1012,7 @@ sequenceDiagram
 | **A claim, kept apart from the decision**: rows go to `transfer_activity`, never `remote_audit` | `remote_audit` holds what the server decided, here the `CLIPBOARD` / `FILES` grant. A transfer is something a host that may be compromised reports, so it is a claim, as in `recording_activity` and `ssh_activity`. The four clipboard and file `AuditKind`s are left unwritten |
 | **The session must be the reporting device's, and the grant must allow the traffic** | Otherwise a device could write about a session it does not hold, or claim traffic the session could not carry. The live session decides first; after it ends, its stored row decides |
 | **The clipboard tallies are cumulative; the server keeps the difference** | A lost sample costs nothing, and a repeated one adds nothing. The totals sit in `transfer_totals`, outside `stats`, which `mark_ended` rewrites whole: a reset would count everything again |
-| **A last sample as the session ends** (`rc:terminate`, or the host's Disconnect, sent before the terminate) | A session shorter than one 30 s sample would otherwise report nothing. It is skipped when the session's telemetry does not answer, because a sample of zeros could overwrite the live totals of a session the server has not ended yet |
+| **A last sample as the session ends** (`rc:terminate`, or the host's Disconnect, sent before the terminate) | A session shorter than one 30 s sample would otherwise report nothing. It is skipped when the session's telemetry does not answer, because a sample of zeros could overwrite the live totals of a session the server has not ended yet. ⚠️ Pre-existing follow-up: on a supervised Mac (FR-43) the host's-Disconnect sample goes up the delegation channel for every session the worker's loop holds, its own included, so a worker's own session's last sample is dropped as another device's. FR-102 P9d moved the live samples onto the peer's own sender (§11.9); this one stays on the direct write ahead of its terminate |
 | **A name hash must be 64 lowercase hex digits** | Free text there would let a host store the very name the hash keeps out. At most 256 files are kept per sample |
 | **A renegotiated session keeps its readings** (a second offer for one session id builds a new peer) | The old peer's drop forgets its counters. The device carries the tallies and waiting notes over to the new peer, or its cumulative readings would restart below the server's stored totals and count nothing until they caught up |
 
@@ -1354,6 +1354,30 @@ so `mark_ended`'s whole-`stats` write cannot reset it, only when the value is a 
 device is the only writer). Absent is unknown, never direct. The P9a freeze splits the day's
 Active sessions by carrier, and the Quality tab and weekly roll-up show it. Rules, storage and
 the field plan: [growth-observability.md](growth-observability.md#remote-desktop-quality-from-what-is-recorded-p9a).
+
+**When it reaches the server (FR-102 P9d).** The observation lands ~2.5–6 s after `Connected`
+(`NOMINATION_WAIT` 3 s + `SETTLE` 2 s + the LocalAPI budget). P9c sent the carrier only on the
+heartbeat's free-running 30 s tick and in the end-of-session sample — and that last sample lands only
+where the server still holds the session live: on the device-ended path (sent ahead of the device's
+own `rc:terminate`), not on the controller-ended one, where `ended_at` is already set when the agent
+hears the terminate and `merge_live_stats` matches nothing. So a session with no tick after the
+observation — overwhelmingly a short one — recorded none, which the freeze reads as `unknown`. Since
+P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:937`)
+and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2165`), by the
+same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:6115`) queues the sample on
+**the peer's own sender**, the FR-43 seam the peer was built with (`peer.rs:285`) — the loop's outbound
+queue for its own session, flushed to the WS one hop later, or the delegation channel for a delegated
+session, so a supervised Mac's sample reaches the server under the daemon's identity, the one the
+session row carries, rather than up the GUI worker's own WS, where `merge_live_stats` would match
+nothing and drop it. `try_send`, never an await: the loop that queues is the loop that drains, so a
+full queue skips the round, hands the FR-101 file notes back, and the next tick retries. A session that
+**outlives** the observation therefore records its carrier whatever its length. Only a session that
+**ends before** the observation lands still records `unknown`: a pair was nominated, but the settle read
+that names the carrier never ran. ⚠️ Not on that road yet: the device-ended last sample (§11.3a), which
+must stay ahead of the terminate written directly after it. On a supervised Mac it still goes up the
+delegation channel connection-wide, so a worker's **own** session's last sample is dropped as another
+device's — a pre-existing follow-up; a fix needs the terminate on the same queue, or a per-session
+delegation marker.
 
 ## 12. Performance targets & budget
 

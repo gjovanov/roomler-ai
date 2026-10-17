@@ -147,6 +147,16 @@ note per completed file, with the name hashed the moment it is noted. It sends t
 `rc:session.stats`, and once more as the session ends, so that a session shorter than one sample
 still reports. Detail, with the diagram: [`remote-control.md`](../remote-control.md) §11.3a.
 
+⚠️ **Follow-up, found by FR-102 P9d's review (2026-10-17): the device-ended last sample on a
+supervised Mac.** The signalling loop's device-end arm (`agents/roomlerd/src/signaling.rs:2253`) sends
+that sample, then the terminate, on the connection's delegation channel whenever one is attached — for
+every session the loop holds, the worker's own included. A worker's own session (FR-43: the GUI worker
+is its own enrollment and serves its own sessions) therefore reports under the daemon's identity, and
+the server drops the sample as another device's. The 30 s samples and P9d's early sample take the
+peer's own sender since P9d; this one deliberately does not, because it must land before the terminate
+written directly after it. A fix needs the terminate on the same queue, or a per-session delegation
+marker. Open.
+
 ### 3c. Sessions that end
 
 - **An idle timeout:** no input from the controller and no damage on screen for N minutes. It produces the

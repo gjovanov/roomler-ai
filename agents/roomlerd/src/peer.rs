@@ -273,6 +273,16 @@ pub struct AgentPeer {
     /// carried on every `rc:session.stats` from then on. Set once; a later
     /// path change is not recorded.
     carrier: Arc<std::sync::OnceLock<crate::session_carrier::SessionCarrier>>,
+    /// FR-43 P2b-2 — THE seam: the sender this peer was constructed with.
+    /// Everything about this session leaves through it — the peer's own ICE
+    /// and `Terminate`, and (FR-102 P9d) every `rc:session.stats` the
+    /// signalling loop sends for it ([`Self::outbound`]) — so a delegated
+    /// session needs exactly one routing decision, taken once, in
+    /// `handle_server_msg`. For an own session it is the loop's `outbound_tx`,
+    /// flushed to the control WS one hop later; for a delegated one it is the
+    /// delegation channel, relayed by the daemon under the DAEMON's identity,
+    /// which is the identity the session row carries.
+    outbound: mpsc::Sender<ClientMsg>,
 }
 
 /// FR-16 L0 — the in-process latency harness's one seam into a session.
@@ -382,6 +392,17 @@ impl AgentPeer {
         // session through it, as the person's Disconnect does, when they stop
         // the share with the desktop's own control.
         rc_sessions: crate::rc_sessions::RcSessionRegistry,
+        // FR-102 P9d — the signalling loop learns the carrier observation has
+        // landed for this session through this channel, so it can send ONE
+        // `rc:session.stats` promptly instead of waiting for the 30 s tick (a
+        // short session may contain no tick after the observation). The sender
+        // belongs to the loop whose `peers` map holds this peer (the daemon, a
+        // standalone agent, or — for a delegated session — the macOS GUI
+        // worker). ⚠️ That loop is NOT necessarily the one whose WS serves the
+        // session: the sample itself leaves through `outbound` above, the
+        // peer's own sender (the seam), which for a delegated session is the
+        // delegation channel to the daemon, never the worker's own WS.
+        carrier_ready_tx: mpsc::Sender<bson::oid::ObjectId>,
     ) -> Result<Self> {
         let mut engine = MediaEngine::default();
         engine
@@ -890,6 +911,7 @@ impl AgentPeer {
             let tx = outbound.clone();
             let carrier_slot = carrier.clone();
             let pc_for_carrier = Arc::downgrade(&pc);
+            let carrier_ready_tx = carrier_ready_tx.clone();
             pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
                 info!(session = %session_id, state = ?s, "PC state change");
                 let tx = tx.clone();
@@ -899,10 +921,20 @@ impl AgentPeer {
                 if matches!(s, RTCPeerConnectionState::Connected) && carrier_slot.get().is_none() {
                     let slot = carrier_slot.clone();
                     let weak = pc_for_carrier.clone();
+                    // FR-102 P9d — tell the signalling loop the moment the
+                    // carrier is known, so it sends one `rc:session.stats` now.
+                    // A clone per spawn; the observation itself still holds only
+                    // a WEAK peer handle.
+                    let carrier_ready_tx = carrier_ready_tx.clone();
                     tokio::spawn(async move {
                         let Some(pc) = weak.upgrade() else { return };
                         let observed = crate::session_carrier::observe(&pc, session_id).await;
                         let _ = slot.set(observed);
+                        // Best-effort: a full/closed channel just means this one
+                        // session waits for the next 30 s tick, the pre-P9d
+                        // behaviour. `unknown` signals too — recorded beats
+                        // absent (P9c's "never direct for an unknown tier").
+                        let _ = carrier_ready_tx.try_send(session_id);
                     });
                 }
                 Box::pin(async move {
@@ -1521,7 +1553,25 @@ impl AgentPeer {
             control_dc,
             _sleep_notice: sleep_notice,
             carrier,
+            outbound,
         })
+    }
+
+    /// FR-43 P2b-2 / FR-102 P9d — the sender this peer was constructed with:
+    /// the seam every message about this session leaves through. The
+    /// signalling loop's `rc:session.stats` for this session go here too, so
+    /// a delegated session's sample reaches the server under the identity the
+    /// session row carries (the daemon's), never up the worker's own WS, where
+    /// `merge_live_stats` would match nothing and drop it without a word.
+    pub(crate) fn outbound(&self) -> &mpsc::Sender<ClientMsg> {
+        &self.outbound
+    }
+
+    /// Test seam — record the carrier as the observation after `Connected`
+    /// would. A peer a unit test never connects has no nominated pair to read.
+    #[cfg(test)]
+    pub(crate) fn record_carrier_for_test(&self, carrier: crate::session_carrier::SessionCarrier) {
+        let _ = self.carrier.set(carrier);
     }
 
     /// FR-101 P4b-2 — what the idle limit needs from this session: the token

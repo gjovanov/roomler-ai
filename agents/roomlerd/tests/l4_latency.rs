@@ -744,6 +744,9 @@ async fn run_cell(cell: Cell) -> Result<Run> {
         None,
         RcOverlay::default(),
         roomlerd::rc_sessions::RcSessionRegistry::new(),
+        // FR-102 P9d — the carrier-ready signal; the L4 harness does not read
+        // it, so a throwaway sender is correct.
+        mpsc::channel(1).0,
     )
     .await
     .context("AgentPeer::new")?;
