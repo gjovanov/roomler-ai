@@ -831,9 +831,15 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
 - [ ] **AC21 (privacy):** the privacy policy names every new data item with its purpose and retention, and
   nothing new is written to a visitor's device (FR-88 AC4's Playwright check over `/`, a docs page, a post,
   `/links/` and `/register`).
-- [ ] **AC22 (docs):** `docs/growth-observability.md` with mermaid diagrams (the two planes, the install
+- [x] **AC22 (docs):** `docs/growth-observability.md` with mermaid diagrams (the two planes, the install
   trace, the funnel definitions) and the `/observability` page as a whole, linked from `docs/README.md`;
   `docs/data-model.md`'s TTLs corrected.
+  *(2026-10-17: the growth doc carries 16 mermaid diagrams, including the two planes, the install trace
+  and the account funnel, and a section per phase from P1 to P10. Its "/observability page as a whole"
+  section lists every tab, the Growth tabs included. It is indexed in `docs/README.md`. Every growth
+  collection's retention in `docs/data-model.md` matches its index in the code. That check found
+  `remote_sessions` with no TTL while the privacy policy claimed 90 days, settled by decision 14.
+  P7's sections come with P7.)*
 - [x] **AC23 (P1d):** with two pods racing, the digest of a closed day is stored once and mailed once
   (integration test: two concurrent runs, one insert, one send). Its sign-up, org, device, session and
   newsletter counts equal a hand count from Mongo for the same day (field log). Without a purestat key,
@@ -868,6 +874,12 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
     token.
 13. **purestat's OAuth providers.** **Google and GitHub first**, with the apps registered under the
     operator's own account (private annex).
+14. **Remote-session record retention** (operator, 2026-10-17). It came up while checking AC21: the
+    privacy policy's §7 promised that remote-session records are deleted after 90 days, but only the
+    audit trail (`remote_audit`) had that TTL, and `remote_sessions` was kept with no bound. **Decided:
+    25 months**, as a TTL on `created_at`, with the policy corrected to say so. Nothing was older than
+    25 months at the time, so nothing was deleted at rollout. The long-term numbers stay in
+    `growth_org_daily` and `growth_quality_daily`.
 
 ## 7. Out of scope
 
