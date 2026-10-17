@@ -1041,7 +1041,7 @@
             "key": {
               "reported_at": 1
             },
-            "expireAfterSeconds": 7776000
+            "expireAfterSeconds": 2592000
           }
         ]
       },
@@ -2981,7 +2981,7 @@
             "key": {
               "reported_at": 1
             },
-            "expireAfterSeconds": 7776000
+            "expireAfterSeconds": 2592000
           }
         ]
       },

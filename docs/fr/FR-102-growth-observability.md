@@ -917,6 +917,15 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
     25 months**, as a TTL on `created_at`, with the policy corrected to say so. Nothing was older than
     25 months at the time, so nothing was deleted at rollout. The long-term numbers stay in
     `growth_org_daily` and `growth_quality_daily`.
+15. **Crash-report retention** (operator, 2026-10-17). AC21's check of every production TTL index against
+    the policy's §7 found one more mismatch, older than FR-102. The policy said crash reports go after
+    "typically 7 days", but `agent_crashes` had a deliberate 90-day TTL. A report names the device's
+    hostname and carries a log tail. **Decided: 30 days**, as the TTL on `reported_at`, with the policy
+    saying so. When decided, 1,529 of the 1,678 reports were older than 30 days (the oldest from
+    2026-07-19), so the rollout deletes them. Every
+    reader fits inside 30 days: the digest's 28-day window, P9a's nightly freeze of one closed day, and the
+    per-device list of the last 50. The per-version counts stay in `growth_quality_daily`. The other
+    options were the policy saying 90 days, or a 7-day TTL, which would have deleted 1,646.
 
 ## 7. Out of scope
 
