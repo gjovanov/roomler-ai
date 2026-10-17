@@ -89,7 +89,12 @@ import {
 } from './usePrivacyMode'
 import { keepBusySetMessage, parseKeepBusyState, type KeepBusyRequest, type KeepBusyState } from './keepBusy'
 import { parseDisplayMatchState, type DisplayMatchState } from './displayMatch'
-import { createRelAccumulator, relativeButtonMessage } from './relativeMouse'
+import {
+  createRelAccumulator,
+  relativeAutoSwitchedOff,
+  relativeButtonMessage,
+  shouldAutoEnterRelative,
+} from './relativeMouse'
 import {
   createPointerPressTracker,
   readTouchMode,
@@ -5899,6 +5904,25 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   // (`mouse-rel`), so an agent that cannot parse the frame never gets one.
   const relativeMouse = ref(false)
   const relativeMouseAllowed = ref(false)
+  // FR-109 P3 — the auto-switch. The agent says `cursor:hide` when the host
+  // hides its cursor (an app captured the pointer); the next click inside the
+  // picture then enters relative mode, and the cursor coming back
+  // (`cursor:pos`) leaves it, but only a lock the switch itself took.
+  const relativeMouseAuto = ref(false)
+  const hostCursorHidden = ref(false)
+  /** This cursor channel has carried the host's pointer (`cursor:pos` or
+   *  `cursor:shape`). A tracker that cannot see the pointer (Linux without DRM
+   *  capture, macOS) sends one `cursor:hide` at the start and nothing more, so
+   *  until then a hide does not switch. */
+  let hostCursorTracked = false
+  /** The person left an auto-entered lock while the cursor stayed hidden:
+   *  no re-entry until it shows again. */
+  let relativeAutoSuppressed = false
+  /** `roomler-rc-relative-auto=off`, read when the input surface attaches. */
+  let relativeAutoOff = false
+  /** The click that entered relative mode is the gesture, not input: its
+   *  button-up is swallowed too. */
+  let swallowedButton: string | null = null
   const relAcc = createRelAccumulator()
   let relTimer: ReturnType<typeof setTimeout> | null = null
   let lastRelSentAt = 0
@@ -5979,6 +6003,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
     }
     return true
+  }
+
+  /** FR-109 P3 — the host's cursor is visible again (`cursor:pos` after a
+   *  `cursor:hide`): an auto-entered lock goes, and the next hide may switch
+   *  again. A lock the person took from the toolbar stays theirs. */
+  function onHostCursorShown() {
+    if (!hostCursorHidden.value) return
+    hostCursorHidden.value = false
+    relativeAutoSuppressed = false
+    if (relativeMouse.value && relativeMouseAuto.value) exitRelativeMouse()
   }
 
   /** FR-109 — leave relative mode (Esc does it too, as the browser's rule). */
@@ -9173,6 +9207,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // Subscribe to the cursor DC. The agent pumps `cursor:pos` /
     // `cursor:shape` / `cursor:hide` at ~30 Hz; decode shape bitmaps
     // eagerly so the paint loop is a zero-copy `drawImage`.
+    // FR-109 P3 — a new cursor channel knows nothing yet about a hidden cursor,
+    // nor whether this host's tracker sees a pointer at all.
+    hostCursorHidden.value = false
+    hostCursorTracked = false
     channels.cursor.onmessage = (ev) => {
       if (typeof ev.data !== 'string') return
       let msg: { t?: string } & Record<string, unknown>
@@ -9188,6 +9226,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         if (Number.isFinite(id) && Number.isFinite(x) && Number.isFinite(y)) {
           cursor.value = { ...cursor.value, pos: { id, x, y } }
         }
+        hostCursorTracked = true
+        onHostCursorShown()
       } else if (msg.t === 'cursor:peer') {
         // P6 — another session's pointer (ghost cursor), name-tagged,
         // normalized 0..1 per monitor, throttled agent-side to ~30 Hz.
@@ -9207,9 +9247,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           }
         }
       } else if (msg.t === 'cursor:shape') {
+        hostCursorTracked = true
         void applyCursorShape(msg)
       } else if (msg.t === 'cursor:hide') {
         cursor.value = { ...cursor.value, pos: null }
+        hostCursorHidden.value = true
       }
     }
 
@@ -9977,6 +10019,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     benchSurface = surface
     // FR-109 — and Pointer Lock locks it.
     relativeSurface = surface
+    // FR-109 P3 — the auto-switch's kill switch, read once per attach.
+    try {
+      relativeAutoOff = relativeAutoSwitchedOff(globalThis.localStorage)
+    } catch {
+      relativeAutoOff = false
+    }
+    relativeAutoSuppressed = false
+    swallowedButton = null
 
     /**
      * Returns [0,1]-normalised coordinates relative to the *visible video
@@ -10185,6 +10235,27 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
       const { x, y, insideVideo } = normalisedXY(ev)
       if (!insideVideo) return
+      // FR-109 P3 — the host hid its cursor (an app captured the pointer):
+      // this click enters relative mode. It is the gesture Pointer Lock needs,
+      // not input: forwarded, an absolute press would first jump the captured
+      // pointer to where the click happened.
+      if (shouldAutoEnterRelative({
+        allowed: relativeMouseAllowed.value,
+        autoOff: relativeAutoOff,
+        cursorHidden: hostCursorHidden.value,
+        cursorTracked: hostCursorTracked,
+        hostLocked: hostLocked.value,
+        suppressed: relativeAutoSuppressed,
+        relativeActive: relativeMouse.value,
+        inputGranted: inputGranted.value,
+      })) {
+        swallowedButton = browserButton(ev.button)
+        relativeMouseAuto.value = true
+        void enterRelativeMouse().then((ok) => {
+          if (!ok) relativeMouseAuto.value = false
+        })
+        return
+      }
       cancelPendingMove()
       surface.setPointerCapture(ev.pointerId)
       lastPointerNorm = { x, y }
@@ -10200,6 +10271,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         return
       }
       pointerPresses.end(ev.pointerId)
+      // FR-109 P3 — the button-up of the click that entered relative mode.
+      if (swallowedButton !== null && browserButton(ev.button) === swallowedButton) {
+        swallowedButton = null
+        return
+      }
       if (relativeMouse.value) {
         flushRel()
         const btn = browserButton(ev.button)
@@ -11006,6 +11082,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         for (const btn of heldInputs.releaseButtons()) {
           sendInput(relativeButtonMessage(btn, false))
         }
+        // FR-109 P3 — the person left an auto-entered lock while the cursor
+        // is still hidden (Esc): no re-entry on the next click until the
+        // cursor shows again, or a hidden cursor would trap them.
+        if (relativeMouseAuto.value) {
+          relativeMouseAuto.value = false
+          if (hostCursorHidden.value) relativeAutoSuppressed = true
+        }
       }
       relativeMouse.value = locked
     }
@@ -11085,6 +11168,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
       relAcc.reset()
       relativeMouse.value = false
+      relativeMouseAuto.value = false
+      relativeAutoSuppressed = false
+      swallowedButton = null
       if (relativeSurface === surface) relativeSurface = null
       // Same `capture: true` as the add Ã¢ÂÂ required for matching.
       window.removeEventListener('keydown', onKeyDown, { capture: true })
@@ -12248,6 +12334,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     displayMatchState,
     /** FR-109 — relative mode: true while the stage holds Pointer Lock. */
     relativeMouse,
+    /** FR-109 P3 — the lock was taken by the auto-switch (the host hid its
+     *  cursor), not from the toolbar. */
+    relativeMouseAuto,
     enterRelativeMouse,
     exitRelativeMouse,
     setRelativeMouseAllowed,
