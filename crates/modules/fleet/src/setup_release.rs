@@ -27,7 +27,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, time::Duration};
 
-use roomler_core::ApiError;
+use roomler_core::{ApiError, client_ip::PeerAddr};
 
 use crate::{
     FleetState,
@@ -62,10 +62,16 @@ pub struct InstallerHealth {
 /// (filtered server-side from the mixed tag list the cache holds).
 pub async fn setup_latest_release(
     State(state): State<FleetState>,
+    PeerAddr(peer): PeerAddr,
     headers: HeaderMap,
 ) -> Result<Json<Vec<AgentRelease>>, ApiError> {
     // FR-102 P3 — counted by client class; see `install_trace`.
-    install_trace::count_fetch(&state, &headers, install_trace::asset::SETUP_LATEST_RELEASE);
+    install_trace::count_fetch(
+        &state,
+        &headers,
+        peer,
+        install_trace::asset::SETUP_LATEST_RELEASE,
+    );
     let releases = releases::cached(&state).await?;
     let filtered: Vec<AgentRelease> = releases
         .into_iter()
@@ -111,11 +117,17 @@ pub async fn setup_installer_proxy(
     State(state): State<FleetState>,
     Path(platform): Path<String>,
     Query(params): Query<InstallerQuery>,
+    PeerAddr(peer): PeerAddr,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let normalised = normalise_platform(&platform)?;
     // FR-102 P3 — the wizard archive itself, usually a browser on the site.
-    install_trace::count_fetch(&state, &headers, &install_trace::asset::setup(normalised));
+    install_trace::count_fetch(
+        &state,
+        &headers,
+        peer,
+        &install_trace::asset::setup(normalised),
+    );
     let releases = releases::cached(&state).await?;
     let release = pick_release_for(&releases, &params.version, "setup-v").ok_or_else(|| {
         ApiError::NotFound(format!(
@@ -282,9 +294,13 @@ fn script_response(body: Cow<'static, str>, content_type: &'static str) -> Respo
 }
 
 /// `GET /api/setup/install.sh` — the Linux/macOS terminal installer.
-pub async fn install_script_sh(State(state): State<FleetState>, headers: HeaderMap) -> Response {
+pub async fn install_script_sh(
+    State(state): State<FleetState>,
+    PeerAddr(peer): PeerAddr,
+    headers: HeaderMap,
+) -> Response {
     // FR-102 P3 — a fetch of the script, by client class (curl, a browser…).
-    install_trace::count_fetch(&state, &headers, install_trace::asset::INSTALL_SH);
+    install_trace::count_fetch(&state, &headers, peer, install_trace::asset::INSTALL_SH);
     let body = with_server_default(
         INSTALL_SH,
         SERVER_NEEDLE_SH,
@@ -295,8 +311,12 @@ pub async fn install_script_sh(State(state): State<FleetState>, headers: HeaderM
 }
 
 /// `GET /api/setup/install.ps1` — the Windows terminal installer.
-pub async fn install_script_ps1(State(state): State<FleetState>, headers: HeaderMap) -> Response {
-    install_trace::count_fetch(&state, &headers, install_trace::asset::INSTALL_PS1);
+pub async fn install_script_ps1(
+    State(state): State<FleetState>,
+    PeerAddr(peer): PeerAddr,
+    headers: HeaderMap,
+) -> Response {
+    install_trace::count_fetch(&state, &headers, peer, install_trace::asset::INSTALL_PS1);
     let body = with_server_default(
         INSTALL_PS1,
         SERVER_NEEDLE_PS1,

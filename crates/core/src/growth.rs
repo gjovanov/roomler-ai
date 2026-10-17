@@ -130,6 +130,71 @@ impl ExclusionSet {
     }
 }
 
+/// FR-102 P3c — the operator's internal source networks
+/// (`growth.internal_networks`): the address ranges the lab, the CI runners
+/// and the operator's own machines fetch from.
+///
+/// The exclusion set above removes internal orgs and people, but an install
+/// fetch carries no tenant — the request happens before any enrollment — so
+/// the lab's own installs inflated the install section's fetch counters with
+/// nothing to remove them by (spec §8, 2026-10-16). This set is the other
+/// half of "internal": a fetch whose client address falls inside is counted
+/// as `internal` instead of under its client class, so the digest can say
+/// how many were left out (nothing vanishes silently).
+///
+/// ⚠️ The address is compared in memory and dropped. Nothing here stores it,
+/// logs it or hands it on; the set is the operator's configuration, never a
+/// record of who asked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InternalNetworks {
+    nets: Vec<ipnet::IpNet>,
+}
+
+impl InternalNetworks {
+    /// Parse the comma-separated setting: each entry a CIDR (`203.0.113.0/24`,
+    /// `2001:db8::/32`) or a bare address (its own `/32` or `/128`). Returns
+    /// the set and every entry it refused, verbatim, for the caller to warn
+    /// about once — a refused entry is NOT a reason to refuse the rest.
+    pub fn parse(raw: &str) -> (Self, Vec<String>) {
+        let mut nets = Vec::new();
+        let mut refused = Vec::new();
+        for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Ok(net) = entry.parse::<ipnet::IpNet>() {
+                // `trunc` so `203.0.113.9/24` means the network it names.
+                nets.push(net.trunc());
+            } else if let Ok(ip) = entry.parse::<std::net::IpAddr>() {
+                nets.push(ipnet::IpNet::from(ip));
+            } else {
+                refused.push(entry.to_string());
+            }
+        }
+        (Self { nets }, refused)
+    }
+
+    /// No network configured (or none that parsed): nothing is classified
+    /// internal, so an "internal" count is not measured — never a zero.
+    pub fn is_empty(&self) -> bool {
+        self.nets.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.nets.len()
+    }
+
+    /// Whether `ip` is inside one of the networks. An IPv4-mapped IPv6
+    /// address (`::ffff:a.b.c.d`, what a dual-stack listener records) is
+    /// compared as the IPv4 address it carries.
+    pub fn contains(&self, ip: std::net::IpAddr) -> bool {
+        let mapped = match ip {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4),
+            std::net::IpAddr::V4(_) => None,
+        };
+        self.nets
+            .iter()
+            .any(|n| n.contains(&ip) || mapped.is_some_and(|m| n.contains(&m)))
+    }
+}
+
 /// P2 — everything the growth collections hold about one org, removed:
 /// its `growth_org_daily` rows and the `growth_daily` rows whose dims carry
 /// it (spec principle 7: aggregates may outlive rows; rows never outlive
@@ -176,5 +241,46 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// P3c — the setting's spellings: CIDRs of both families, bare
+    /// addresses, padding and empties; a bad entry is refused on its own and
+    /// the rest still apply.
+    #[test]
+    fn internal_networks_parse_each_entry_on_its_own() {
+        let (nets, refused) = InternalNetworks::parse(
+            " 203.0.113.0/24 , 198.51.100.7,, 2001:db8::/32, not-a-net, 10.0.0.0/33 ,192.0.2.9/24",
+        );
+        assert_eq!(nets.len(), 4);
+        assert_eq!(refused, vec!["not-a-net", "10.0.0.0/33"]);
+        assert!(nets.contains(ip("203.0.113.9")));
+        assert!(nets.contains(ip("203.0.113.255")));
+        assert!(!nets.contains(ip("203.0.114.1")));
+        // A bare address is its own /32.
+        assert!(nets.contains(ip("198.51.100.7")));
+        assert!(!nets.contains(ip("198.51.100.8")));
+        // IPv6.
+        assert!(nets.contains(ip("2001:db8::1")));
+        assert!(!nets.contains(ip("2001:db9::1")));
+        // A host bit set in the CIDR names its network.
+        assert!(nets.contains(ip("192.0.2.200")));
+        // What a dual-stack listener records for an IPv4 client.
+        assert!(nets.contains(ip("::ffff:203.0.113.9")));
+        assert!(!nets.contains(ip("::ffff:8.8.8.8")));
+    }
+
+    /// The default (unset) is the empty set: nothing is ever internal.
+    #[test]
+    fn no_internal_networks_means_nothing_is_internal() {
+        for raw in ["", "  ", ",, ,"] {
+            let (nets, refused) = InternalNetworks::parse(raw);
+            assert!(nets.is_empty() && refused.is_empty(), "{raw:?}");
+            assert!(!nets.contains(ip("127.0.0.1")));
+        }
+        assert!(InternalNetworks::default().is_empty());
     }
 }

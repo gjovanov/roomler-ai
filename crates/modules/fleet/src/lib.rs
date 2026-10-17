@@ -131,6 +131,9 @@ pub struct FleetState {
     /// The GitHub-releases cache behind every installer and latest-release
     /// proxy; busted fleet-wide over the bus by `POST /api/releases/refresh`.
     pub releases_cache: Arc<releases::ReleasesCache>,
+    /// FR-102 P3c — `growth.internal_networks`, parsed once at boot: a fetch
+    /// from inside is counted as `internal` (`install_trace::count_fetch`).
+    pub internal_networks: Arc<roomler_core::growth::InternalNetworks>,
 }
 
 impl std::ops::Deref for FleetState {
@@ -146,6 +149,28 @@ impl FromRef<FleetState> for Core {
     fn from_ref(state: &FleetState) -> Self {
         state.core.clone()
     }
+}
+
+/// FR-102 P3c — `growth.internal_networks`, parsed once. An entry that does
+/// not parse is echoed in a warning here, once, so the operator can fix it,
+/// and skipped; the rest still apply. The accepted ones are logged as a
+/// count.
+fn internal_networks_from(settings: &Settings) -> roomler_core::growth::InternalNetworks {
+    let (nets, refused) =
+        roomler_core::growth::InternalNetworks::parse(&settings.growth.internal_networks);
+    if !refused.is_empty() {
+        tracing::warn!(
+            refused = ?refused,
+            "growth.internal_networks: skipping entries that are neither a CIDR nor an address"
+        );
+    }
+    if !nets.is_empty() {
+        tracing::info!(
+            networks = nets.len(),
+            "install trace: fetches from the configured internal networks count as `internal`"
+        );
+    }
+    nets
 }
 
 impl Module for FleetState {
@@ -226,6 +251,7 @@ impl Module for FleetState {
             agent_nudge_throttle: Arc::new(DashMap::new()),
             exec_rate_limiter: Arc::new(RateLimiter::new()),
             releases_cache,
+            internal_networks: Arc::new(internal_networks_from(settings)),
             core,
         };
 

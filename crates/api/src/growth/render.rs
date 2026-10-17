@@ -355,10 +355,23 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
         )),
         Measured::NotMeasured(n) => out.push(Line("Fetches".into(), not_measured(n))),
     }
+    // P3c — the lab's own fetches, left out of the table above and counted
+    // here, so nothing vanishes silently.
+    match &s.install.internal_fetches {
+        Measured::Value(f) => out.push(Line(
+            "Fetches from internal networks (not in the table)".into(),
+            fig(f),
+        )),
+        Measured::NotMeasured(n) => out.push(Line(
+            "Fetches from internal networks".into(),
+            not_measured(n),
+        )),
+    }
     out.push(Note(
         "Fetches are counted by client class from the User-Agent (wizard, script-sh, script-ps1, \
-         browser, other) and never include the daemon's own update checks; a fetch is a lower \
-         bound on intent, not an install."
+         browser, other) and never include the daemon's own update checks; a fetch from one of \
+         the configured internal networks is counted as internal instead of its class; a fetch \
+         is a lower bound on intent, not an install."
             .into(),
     ));
     // P3b — the wizard's opt-in diagnostics: opted-in runs only, labelled
@@ -1985,6 +1998,7 @@ mod tests {
                     os: "unknown".into(),
                     fetches: f(4, 10, 30),
                 }]),
+                internal_fetches: Measured::Value(f(6, 20, 50)),
                 tokens: Measured::Value(Tokens {
                     issued: f(3, 12, 40),
                     redeemed: f(2, 9, 30),
@@ -2169,6 +2183,12 @@ mod tests {
         assert!(text.contains("script-sh | linux | 3 · 7 · 20"));
         assert!(text.contains("install.sh | script-sh | unknown | 4 · 10 · 30"));
         assert!(text.contains("never include the daemon's own update checks"));
+        // P3c — the lab's fetches on their own line, beside the table.
+        assert!(
+            text.contains("Fetches from internal networks (not in the table): 6 (7d 20 · 28d 50)"),
+            "{text}"
+        );
+        assert!(text.contains("counted as internal instead of its class"));
         assert!(text.contains("Remote-desktop minutes: not measured"));
         // The figure carries its context, and the footer its exclusions.
         assert!(text.contains("Sign-ups: 2 (7d 9 · 28d 31)"));
