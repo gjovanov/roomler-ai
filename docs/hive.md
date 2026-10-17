@@ -489,7 +489,7 @@ flowchart LR
 |---|---|---|---|
 | the token | 256 random bits, bound to (session, fence), minted just before the harness starts and taken back if it does not; each run revokes exactly its own token | a run that ends as the same session starts again here cannot take the new run's | [`sidecar.rs:94`](../agents/roomlerd/src/hive/sidecar.rs#L94) |
 | the paths | exactly `POST /v1/messages` and `POST /v1/messages/count_tokens`; anything else is `404 not_found_error` | the device's key opens more than inference: the Files API holds every session's uploads under it, and a batch outlives its session and its fence | [`sidecar.rs:333`](../agents/roomlerd/src/hive/sidecar.rs#L333) |
-| the fence | a call is forwarded only while the session runs HERE at the token's fence | a stopped session, or a stale primary after a move, spends nothing | [`sidecar.rs:133`](../agents/roomlerd/src/hive/sidecar.rs#L133) `sidecar_admit` |
+| the fence | a call is forwarded only while the session runs HERE at the token's fence; a demote ends that at once, before the run has let go | a stopped session, or a stale primary after a move, spends nothing: a demoted run's call reaches no provider (P2k-7) | [`sidecar.rs:133`](../agents/roomlerd/src/hive/sidecar.rs#L133) `sidecar_admit`; at the provider, [`sidecar/tests.rs:413`](../agents/roomlerd/src/hive/sidecar/tests.rs#L413) `a_demoted_run_makes_no_model_call` |
 | `offline_grace` | 120 s after the primary control connection closed, with no newer one in its place, calls are refused `503 overloaded_error`; they flow again on reconnect | a partitioned primary stalls instead of diverging. "Closed" is the agent's own verdict, so a half-open socket counts as up until `WS_RX_DEADLINE` (80 s) ends it, and the worst case is about 200 s | [`sidecar.rs:69`](../agents/roomlerd/src/hive/sidecar.rs#L69), the agent's [`signaling.rs:61`](../agents/roomlerd/src/signaling.rs#L61) |
 | the forward | the headers unchanged but for `x-api-key` and `authorization` (the device's credential swapped in, below), the hop-by-hop ones, and `anthropic-workspace-id`; a body of at most 32 MiB; the answer streamed as it arrives, `retry-after` and the rate-limit headers intact; TLS through the OS trust store and the proxy environment | an SSE turn is never buffered, and a TLS-inspecting middlebox the machine trusts still works | [`sidecar.rs:449`](../agents/roomlerd/src/hive/sidecar.rs#L449) `handle` |
 | the credential | the first line the helper prints. One that begins `sk-ant-oat`, a Claude subscription's token as `claude setup-token` prints it, goes as `Authorization: Bearer`, with `oauth-2025-04-20` added once to the betas the harness asked for, and with no workspace, the device's or the session's. Any other is an API key, in `x-api-key`, with `hive_api_workspace_id`, when it is configured, in place of the session's workspace | the provider takes a subscription's token only as a bearer token under that beta, and a subscription has no workspace (P2k-1) | [`sidecar.rs:380`](../agents/roomlerd/src/hive/sidecar.rs#L380) `put_credential` |
@@ -2735,7 +2735,7 @@ stateDiagram-v2
 
 ⚠️ **The 230 s is the device's own budget, held by a test.** A roomlerd test asserts
 `UNREACHABLE_SECS == WS_RX_DEADLINE + OFFLINE_GRACE + 30 s`
-([`sidecar/tests.rs:902`](../agents/roomlerd/src/hive/sidecar/tests.rs#L902)).
+([`sidecar/tests.rs:968`](../agents/roomlerd/src/hive/sidecar/tests.rs#L968)).
 Lengthen either clock on the device and the test fails before the server moves a session
 too soon.
 
