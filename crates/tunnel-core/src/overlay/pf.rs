@@ -786,6 +786,9 @@ mod tests {
 /// these under `sudo` with `ROOMLER_TUN_KERNEL_TEST=1`.
 #[cfg(all(test, target_os = "macos"))]
 mod macos_kernel_tests {
+    /// `Enabled` or `Disabled`: the word alone. The line around it changes
+    /// with a toggle (`Disabled for 0 days 00:00:00` once pf has been on),
+    /// which CI's first run compared and failed on with pf correctly off.
     fn pf_status() -> String {
         let o = std::process::Command::new("/sbin/pfctl")
             .args(["-s", "info"])
@@ -794,6 +797,7 @@ mod macos_kernel_tests {
         let s = String::from_utf8_lossy(&o.stdout).into_owned();
         s.lines()
             .find(|l| l.starts_with("Status:"))
+            .and_then(|l| l.split_whitespace().nth(1))
             .unwrap_or("")
             .to_string()
     }
@@ -825,7 +829,7 @@ mod macos_kernel_tests {
         let (ok, serve) = super::serve("utun199", &["100.64.0.0/10".to_string()]).await;
         let serve = serve.expect("a serve to stop");
         assert!(ok, "the serve set up fully");
-        assert!(pf_status().contains("Enabled"), "pf enabled by our token");
+        assert_eq!(pf_status(), "Enabled", "pf enabled by our token");
         assert!(
             anchor_nat(&anchor).contains("nat on "),
             "our anchor holds its nat: {}",
