@@ -74,7 +74,7 @@
 ))]
 
 use anyhow::{Context, Result, anyhow};
-use enigo::{Enigo, Settings};
+use enigo::Enigo;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
@@ -133,7 +133,8 @@ impl SystemContextInjector {
                         );
                     }
                 }
-                let settings = Settings::default();
+                // FR-109 — enigo_settings, or `Coordinate::Rel` goes out absolute.
+                let settings = enigo_backend::enigo_settings();
                 let enigo = match Enigo::new(&settings) {
                     Ok(e) => {
                         let _ = ready_tx.send(Ok(()));
@@ -187,7 +188,7 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<Job>) {
                     desktop_rebind::try_change_desktop()
                 {
                     tracing::info!(%name, "system-context input: rebound desktop before a keep-busy job");
-                    if let Ok(fresh) = Enigo::new(&Settings::default()) {
+                    if let Ok(fresh) = Enigo::new(&enigo_backend::enigo_settings()) {
                         enigo = fresh;
                     }
                 }
@@ -251,7 +252,7 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<Job>) {
                 // modifiers can't be released because their down-
                 // events landed on the OLD desktop. Rebuilding Enigo
                 // is cheap (~ms) and resets cached state cleanly.
-                if let Ok(fresh) = Enigo::new(&Settings::default()) {
+                if let Ok(fresh) = Enigo::new(&enigo_backend::enigo_settings()) {
                     enigo = fresh;
                 }
             }
@@ -303,7 +304,7 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<Job>) {
                         "system-context input dispatch error; forcing rebind + retry"
                     );
                     let _ = desktop_rebind::try_change_desktop();
-                    if let Ok(fresh) = Enigo::new(&Settings::default()) {
+                    if let Ok(fresh) = Enigo::new(&enigo_backend::enigo_settings()) {
                         enigo = fresh;
                     }
                     if let Err(e2) = enigo_backend::dispatch_for_external(&mut enigo, msg) {
