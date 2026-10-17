@@ -55,8 +55,8 @@ use serde::{Deserialize, Serialize};
 use super::{
     campaigns::Rate,
     digest::{
-        Measured, MrrEstimate, NO_BILLING_RECORD, NotMeasured, aggregate, day_str, excluded_ids,
-        find_docs, i64_of, str_of, utc_date_of,
+        Measured, MrrEstimate, NotMeasured, aggregate, day_str, excluded_ids, find_docs, i64_of,
+        no_billing_record, str_of, utc_date_of,
     },
     mounted,
     orgs::{acquisition_of, owner_attributions},
@@ -761,10 +761,13 @@ pub async fn get_revenue(
     // Billed — the `saas` module's record.
     let (billed, org_billing) = if mounted(&state, "saas") {
         match billing::record_start(&state.db).await? {
-            None => (
-                Measured::NotMeasured(NotMeasured::now(NO_BILLING_RECORD)),
-                HashMap::new(),
-            ),
+            None => {
+                let backfill = billing::last_backfill(&state.db).await?;
+                (
+                    Measured::NotMeasured(NotMeasured::now(no_billing_record(backfill.as_ref()))),
+                    HashMap::new(),
+                )
+            }
             Some(first) => {
                 let rows = BillingEventDao::new(&state.db)
                     .list(None, &excluded)

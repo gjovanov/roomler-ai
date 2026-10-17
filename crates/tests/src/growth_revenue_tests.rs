@@ -1078,6 +1078,83 @@ async fn the_backfill_reads_stripe_once() {
     assert_eq!(eur(m3).unwrap()["new_cents"], 1600);
 }
 
+/// Production's first backfill (2026-10-17): Stripe's only paid invoice
+/// names no org on this server, so the run records nothing and billed stays
+/// `not_measured` — and both the panel and the digest now say the backfill
+/// RAN, on its day, where the fixed reason went on saying it "has not run".
+#[tokio::test]
+async fn a_backfill_that_records_nothing_says_it_ran() {
+    let (app, token) = revenue_app(|_| {}).await;
+    let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+    let digest = format!(
+        "/api/admin/growth/digest/preview?day={}",
+        yesterday.format("%Y-%m-%d")
+    );
+    let reasons = |j: &Value, d: &Value| {
+        (
+            j["billed"]["not_measured"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            d["sections"]["revenue"]["billed"]["not_measured"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        )
+    };
+    let (s, j) = get_json(&app, "/api/admin/growth/revenue", &token).await;
+    assert_eq!(s, 200, "{j}");
+    let (s, d) = get_json(&app, &digest, &token).await;
+    assert_eq!(s, 200, "{d}");
+    let (panel, daily) = reasons(&j, &d);
+    for before in [panel, daily] {
+        assert!(before.contains("the backfill has not run"), "{before}");
+    }
+
+    let period = (at(1, 10), at(0, 1));
+    let mut stranger = invoice(
+        "in_nobody",
+        "sub_nobody",
+        "cus_nobody",
+        ObjectId::new(),
+        at(1, 10),
+        999,
+        "subscription_create",
+        vec![line(999, 0, 1, period, false)],
+    );
+    stranger["subscription_details"] = json!({ "metadata": {} });
+    let pages = vec![json!({ "object": "list", "data": [stranger], "has_more": false })];
+    let base = fake_stripe(pages, Arc::new(AtomicUsize::new(0))).await;
+    let stripe = StripeService::new(&roomler_ai_config::StripeSettings {
+        secret_key: "sk_test_fake".into(),
+        webhook_secret: SECRET.into(),
+        price_pro: PRICE_PRO.into(),
+        price_business: PRICE_BIZ.into(),
+    });
+    let now = DateTime::now();
+    let r = stripe
+        .backfill_paid_invoices(&app.db, &base, None, now)
+        .await
+        .unwrap();
+    assert_eq!((r.invoices, r.recorded, r.no_org), (1, 0, 1), "{r:?}");
+
+    let ran_on = now.try_to_rfc3339_string().unwrap()[..10].to_string();
+    let (s, j) = get_json(&app, "/api/admin/growth/revenue", &token).await;
+    assert_eq!(s, 200, "{j}");
+    let (s, d) = get_json(&app, &digest, &token).await;
+    assert_eq!(s, 200, "{d}");
+    let (panel, daily) = reasons(&j, &d);
+    for after in [panel, daily] {
+        assert!(!after.contains("has not run"), "{after}");
+        assert!(
+            after.contains(&format!(
+                "the backfill on {ran_on} recorded no paid invoice"
+            )),
+            "{after}"
+        );
+    }
+}
+
 // ── The routes ───────────────────────────────────────────────────────────
 
 /// 404 to everyone but a platform admin, and to the admin with growth off;
