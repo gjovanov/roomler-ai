@@ -567,10 +567,39 @@ pub struct GrowthSettings {
     /// starts mailing its admins unasked. Env: `ROOMLER__GROWTH__ALERTS`.
     #[serde(default)]
     pub alerts: bool,
+    /// P7 — the GitHub repository (`owner/name`) whose public counters the
+    /// `saas` puller reads once a day: stars, forks, watchers and every
+    /// release asset's download count, stored as cumulative snapshots and
+    /// differenced into daily deltas. They need no credential (a handful of
+    /// the 60 unauthenticated requests an hour). Empty switches the puller
+    /// off. `saas` is hosted-only, so no self-hosted server ever asks.
+    /// Env: `ROOMLER__GROWTH__GITHUB_REPO`.
+    #[serde(default = "growth_default_github_repo")]
+    pub github_repo: String,
+    /// P7 — GitHub's REST API base. Only a test changes it.
+    /// Env: `ROOMLER__GROWTH__GITHUB_API_URL`.
+    #[serde(default = "growth_default_github_api_url")]
+    pub github_api_url: String,
+    /// P7 — an optional read-only token for the repository's traffic
+    /// (views, clones and referrers; GitHub keeps 14 days of it, so it is
+    /// pulled daily). A fine-grained token scoped to this one repository
+    /// with the "Administration: read" permission is enough. Empty — the
+    /// default — leaves traffic "not measured"; the public counters never
+    /// need it. Never logged. Env: `ROOMLER__GROWTH__GITHUB_TOKEN`.
+    #[serde(default)]
+    pub github_token: String,
 }
 
 fn growth_default_on() -> bool {
     true
+}
+
+fn growth_default_github_repo() -> String {
+    "gjovanov/roomler-ai".to_string()
+}
+
+fn growth_default_github_api_url() -> String {
+    "https://api.github.com".to_string()
 }
 
 fn growth_default_digest_hour() -> u8 {
@@ -596,6 +625,9 @@ impl Default for GrowthSettings {
             weekly_enabled: false,
             alerts: false,
             feedback: true,
+            github_repo: growth_default_github_repo(),
+            github_api_url: growth_default_github_api_url(),
+            github_token: String::new(),
         }
     }
 }
@@ -624,6 +656,28 @@ impl GrowthSettings {
     /// Whether the web sections can be measured at all.
     pub fn purestat_configured(&self) -> bool {
         !self.purestat_api_key.trim().is_empty()
+    }
+
+    /// P7 — the repository the GitHub puller reads, when it is a plausible
+    /// `owner/name` (one slash, both halves non-empty, GitHub's characters
+    /// only); `None` switches the puller off rather than asking GitHub for
+    /// a path a typo built.
+    pub fn github_repo(&self) -> Option<&str> {
+        let repo = self.github_repo.trim();
+        let (owner, name) = repo.split_once('/')?;
+        let ok = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 100
+                && !s.chars().all(|c| c == '.')
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        };
+        (ok(owner) && ok(name)).then_some(repo)
+    }
+
+    /// P7 — whether repository traffic can be read at all.
+    pub fn github_traffic_configured(&self) -> bool {
+        !self.github_token.trim().is_empty()
     }
 }
 
@@ -1515,6 +1569,32 @@ mod growth_settings_tests {
         let lab: GrowthSettings =
             toml::from_str("internal_networks = \"203.0.113.0/24, 2001:db8::/32\"").unwrap();
         assert_eq!(lab.internal_networks, "203.0.113.0/24, 2001:db8::/32");
+        // P7 — the GitHub puller reads the hosted repo by default and needs
+        // no token for its counters; traffic needs one. A repo that is not
+        // `owner/name` switches the puller off rather than build a path.
+        assert_eq!(d.github_repo(), Some("gjovanov/roomler-ai"));
+        assert_eq!(absent.github_repo(), Some("gjovanov/roomler-ai"));
+        assert_eq!(d.github_api_url, "https://api.github.com");
+        assert!(!d.github_traffic_configured());
+        for bad in [
+            "",
+            "  ",
+            "roomler-ai",
+            "/x",
+            "x/",
+            "a/b/c",
+            "a b/c",
+            "a/../b",
+            "a/..",
+            "./b",
+        ] {
+            let s: GrowthSettings = toml::from_str(&format!("github_repo = {bad:?}")).unwrap();
+            assert_eq!(s.github_repo(), None, "{bad:?}");
+        }
+        let gh: GrowthSettings =
+            toml::from_str("github_repo = \" acme/site.io \"\ngithub_token = \"t\"").unwrap();
+        assert_eq!(gh.github_repo(), Some("acme/site.io"));
+        assert!(gh.github_traffic_configured());
         // P3b — the wizard's opt-in diagnostics are accepted unless switched
         // off (the same reason as the counters: the rows are the server's
         // own, opt-in at the source, and name nobody).

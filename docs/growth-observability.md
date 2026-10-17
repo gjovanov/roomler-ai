@@ -13,7 +13,8 @@ the per-issue table (P5) — revenue: what Stripe billed, billed MRR month by mo
 upgrade intent from plan-limit collisions, and margin against the cost to serve (P4) — the read
 key, the weekly roll-up and the alert rules (P10) — and remote-desktop quality from what is already
 recorded: sessions by outcome, the time to first frame frozen before its logs expire, crashes per
-100 device-days, by agent version (P9a).
+100 device-days, by agent version (P9a) — and the repository on GitHub: stars, forks and release
+downloads as daily snapshots, and its traffic with a token (P7a).
 Spec: [`docs/fr/FR-102-growth-observability.md`](fr/FR-102-growth-observability.md) (#2127). It
 also places the existing `/observability` page, which no doc described before.
 
@@ -128,7 +129,8 @@ this server, not reachable, or not built yet is `{"not_measured": "<reason>",
 | `quality` | sessions **requested** → reached Active / never reached it (a share from n = 30), the ended ones by `end_reason` classed hang-up · refusal · failure; duration, peak frame rate and RTT as `{n, p50, p90}` per window; FR-22's **time to first frame** p50/p90 — the day exact, 7d/28d estimated from the frozen daily histograms, `not_measured` until the day is frozen; agent crashes by the version the payload named, device-days and crashes per 100 device-days (from 30); the day **by agent version** — [remote-desktop quality](#remote-desktop-quality-from-what-is-recorded-p9a); the viewer's **ratings** (`up` · `down` · `rated` per window, `up_share_28d` from 30 answers, `reasons_28d`), `not_measured` while the prompt is off — [the post-session rating](#the-post-session-rating-p9b) | `remote_sessions`, `agent_crashes`, `stats_machine_1d`, `growth_quality_daily`, `session_feedback` | P1d; TTFF, rates and versions P9a; ratings P9b |
 | `install` | tokens issued → redeemed; fetches by `(asset, client class, OS)`; enrollments by `(method, OS)`; the wizard's steps — runs reaching each, their outcomes and the failures by code, **opted-in runs only, labelled with their n** — [the install trace](#the-install-trace-p3), [the wizard's diagnostics](#the-wizards-opt-in-diagnostics-p3b) | `enroll_token_issued`, `growth_daily`, `agents.install`, `setup_diagnostics` | P3; wizard steps P3b (`not_measured` while `growth.setup_diagnostics` is off) |
 | `social` | posts published per platform `{day, d7, d28}`; the snapshots taken that day (at most 20), each with its post's campaign and the platform's own metric names — `not_measured` when nothing was pushed in 28 days | `growth_posts`, `growth_post_snapshots` | P8 |
-| `search` | — | — | P7 |
+| `github` | the repository's stars, forks, watchers and release downloads at the day's snapshot, each with its day / 7-day / 28-day change (`null` where a snapshot is missing), the week's downloads by release and by flavour; with a token, views and clones per window over the measured days and GitHub's 14-day referrer ranking — [GitHub](#github-the-repositorys-counters-and-traffic-p7a) | `growth_daily` (`github`, `github_traffic`), `growth_pulls` | P7a; traffic with `ROOMLER__GROWTH__GITHUB_TOKEN` |
+| `search` | — | — | P7 (the search half) |
 | `alerts` | the alert rows that `fired` or `cleared` during the day, and the ones `open` at the compute — rule, key, times, the numbers behind it; `not_measured` while the alerts are off on this server — [alerts](#the-read-key-the-weekly-roll-up-and-alerts-p10) | `growth_alerts` | P10 (`ROOMLER__GROWTH__ALERTS`) |
 
 A module that is not mounted (`[modules] remote = false`, a reduced profile) makes its part
@@ -901,6 +903,127 @@ pushed (and says that nothing new arrives). The SPA's `/observability/growth` ga
 **Channels** tab ([`GrowthChannels.vue`](../ui/src/components/growth/GrowthChannels.vue)):
 platform cards with their posts, and the ingest-key list with mint (the key shown once) and
 revoke. Every pushed string is rendered as text; a URL becomes a link only when it is http(s).
+
+## GitHub: the repository's counters and traffic (P7a)
+
+The repository is a leading indicator: a star, a fork, a release download and a visit to the
+code arrive before a sign-up does, and at today's volume they are among the few numbers big
+enough to steer by. Spec §3k; P7's search half (Search Console, Bing, the Content table) is
+not built yet.
+
+```mermaid
+flowchart LR
+  subgraph saas["saas module — hosted only"]
+    P["GitHub puller<br/>hourly tick · Redis NX claim"]
+  end
+  GH[("api.github.com")]
+  P -->|"GET /repos/{repo}<br/>GET /repos/{repo}/releases (100 a page)"| GH
+  P -->|"with a token:<br/>/traffic/views · /traffic/clones · /traffic/popular/referrers"| GH
+  P -->|"the closed day's snapshot<br/>$set, write-then-prune"| GD[("growth_daily<br/>source: github · github_traffic")]
+  P -->|"ok · failed · error"| GPU[("growth_pulls<br/>github:day · github_traffic:day")]
+  GD --> R["growth::github::section<br/>snapshots differenced"]
+  GPU --> R
+  R --> DG["the digest's github section"]
+  R --> WK["the weekly roll-up's"]
+```
+
+### The public counters — cumulative snapshots
+
+[`crates/modules/saas/src/github_pull.rs`](../crates/modules/saas/src/github_pull.rs), spawned
+from the module's `init` ([`lib.rs:118`](../crates/modules/saas/src/lib.rs)). No self-host
+profile compiles `saas`; `growth.enabled = false` or an empty `growth.github_repo` starts
+nothing and says so once. The counters need **no credential and never carry one**, so a
+token that expired, was revoked or was sealed wrong costs the traffic and never a snapshot. A
+cycle is one request plus one per hundred releases (8 pages on 2026-10-17), from the 60 an hour
+GitHub allows an unauthenticated address — which the releases cache the updater relies on
+draws on too.
+
+| Rule | Value | Where |
+|---|---|---|
+| **A snapshot is the close of a day.** Day D's is the counters as read between 01:00 and 07:00 UTC on D+1, so two consecutive snapshots are 24 h apart give or take six | `SNAPSHOT_GRACE_HOURS` ([`github_pull.rs:102`](../crates/modules/saas/src/github_pull.rs)), `snapshot_due` ([`:676`](../crates/modules/saas/src/github_pull.rs)) |
+| **The first good read stands.** A day pulled `ok` is not re-read later in its window, which would move its snapshot's time | `snapshot_due` |
+| **A missed window is a missing day.** A cumulative counter cannot be read for the past, so a day not read inside its window has no snapshot, and every delta across it is `null` | the reader, below |
+| Releases are paged 100 at a time, at most 30 pages (3,000 releases; 732 existed on 2026-10-17). A longer listing is stored with `truncated` on its pull row, and the reader shows its downloads as a lower bound and refuses every downloads change that needs it. Drafts are left out | `releases` ([`:382`](../crates/modules/saas/src/github_pull.rs)), `counter_rows` ([`:540`](../crates/modules/saas/src/github_pull.rs)) |
+| **The updater's rate stays whole.** No page is asked while GitHub's `X-RateLimit-Remaining` is below 10 (`RATE_RESERVE`): the snapshot fails for that tick, nothing partial is stored, and the next tick inside the window retries | `releases` |
+| **A sidecar is not a download.** `.asc`, `.sig`, `.sha256`, `.sha512` (and the release key `roomler-release-pubkey.asc`) are left out: the updater fetches a package's `.asc` with the package, so counting it would count every update twice | `is_sidecar` ([`:530`](../crates/modules/saas/src/github_pull.rs)) |
+| Every answer is read with a ceiling of 32 MiB (a page of 100 releases measured 4.96 MB) | `capped::read_capped` ([`capped.rs:31`](../crates/modules/saas/src/capped.rs)) |
+| A **flavour** is an asset's name without its version, so the same artifact of every release groups together: `roomlerd-0.4.140-x86_64-pc-windows-msvc.msi` → `roomlerd-x86_64-pc-windows-msvc.msi` | `flavour` ([`:483`](../crates/modules/saas/src/github_pull.rs)) |
+| Each row is `$set` on its own `_id`; a zero is not stored, so on an `ok` day a missing release or flavour row is a zero | `GrowthDao::replace_daily` |
+| A failure is recorded per day with its reason (`github unreachable: unauthorized (401)`), never a 0; the next hourly tick inside the window retries | `run_once` ([`:717`](../crates/modules/saas/src/github_pull.rs)) |
+| Once across pods: the DB-scoped Redis claim `roomler:growth-github-pull:<db>` per tick | `pull_schedule::spawn_hourly` ([`pull_schedule.rs:89`](../crates/modules/saas/src/pull_schedule.rs)) |
+
+| `growth_daily` (`source: github`) | dims | metrics |
+|---|---|---|
+| `by: repo` | `repo` | `stars` · `forks` · `watchers` (GitHub's `subscribers_count`; its `watchers_count` is the stars) · `downloads` (every asset but the sidecars of every published **product** release, ever) · `helper_downloads` (the rest) |
+| `by: release` | `repo`, `release` (the tag), `kind` (`product` · `helper`) | `downloads` |
+| `by: flavour` | `repo`, `flavour` (product assets only) | `downloads` |
+
+A **helper** release is one our own CI downloads from: vendored builds and caches
+(`vendored-ffmpeg-*`, `vendored-libvpx-*`, `seed-cache-*`). The product's are the tags in
+`PRODUCT_TAG_PREFIXES` — `agent-v`, `setup-v`, `tunnel-v`, `tunnel-wizard-v`. Read live on
+2026-10-17, the helpers held **8,032 of the repository's 16,740 downloads**, so a single total would
+have been half CI; they are counted apart, never dropped.
+
+> ⚠️ **GitHub counts every download of a release asset, the fleet's self-updates included.**
+> The updater fetches the MSI/.deb/.pkg and its `.asc` from GitHub directly
+> (`agents/roomlerd/src/updater.rs`, `download_asset`), hosted and self-hosted devices alike,
+> and the installer proxy fetches from GitHub on each request. A download is distribution, not
+> an install (the `.asc` itself is not counted). Nothing here tells one deployment from
+> another: the number is GitHub's own public aggregate, readable by anyone.
+
+### Traffic — with a read-only token
+
+GitHub keeps 14 days of a repository's traffic, so it is pulled daily, and only with
+`growth.github_token`; without one nothing is asked and every reader says "not measured". The
+token rides these three requests only.
+
+| `growth_daily` (`source: github_traffic`) | dims | metrics | Pulled |
+|---|---|---|---|
+| `by: traffic` | `repo` | `views` · `views_uniques` · `clones` · `clones_uniques` — GitHub's per-day buckets (UTC days). Clones are mostly CI's `actions/checkout`, not people | each of the last 13 closed days re-pulled once per cycle (01:00 UTC), frozen after (`TRAFFIC_HORIZON_DAYS`, [`:108`](../crates/modules/saas/src/github_pull.rs)). GitHub's 14 buckets ended at the previous UTC day on a 2026-10-17 read; 13 closed days are inside them whether or not a read also carries today's partial bucket, which is never stored |
+| `by: referrer` | `repo`, `referrer` | `referrer_views` · `referrer_uniques` — GitHub's top-10 ranking of the last 14 days, which has no per-day split | stored under the closed day it was read after, and read as such |
+
+A refused token (401, or a 403 for a missing permission) is recorded on every traffic day the run
+owed, with the reason. The counters never carry the token, so their snapshot is taken all the
+same — a day's snapshot cannot be read later, and a bad token must not leave holes in it.
+
+### In the digest and the weekly roll-up
+
+[`crates/api/src/growth/github.rs`](../crates/api/src/growth/github.rs) reads the stored rows;
+`section` ([`:463`](../crates/api/src/growth/github.rs)) is the digest's `github` section and,
+for Sunday, the weekly roll-up's.
+
+| Field | What | Rule |
+|---|---|---|
+| `counters.at` | the snapshot read: the digest's day, else the latest one before it (at most 7 days) | `counters_at` ([`:275`](../crates/api/src/growth/github.rs)) |
+| `stars`, `forks`, `watchers`, `downloads`, `helper_downloads` | the cumulative values at that snapshot | — |
+| `*_delta {day, d7, d28}` | the snapshot minus the one 1, 7 or 28 days before | **`null` when that snapshot is missing — never 0, never spread across a gap.** A 7-day delta needs only its two ends |
+| downloads' deltas | differenced **per release**: a new release counts fully, a deleted one counts nothing, and **one whose total went down counts nothing**. A total goes down when an asset is re-uploaded (CI's `seed-cache`, 28 assets, is clobbered on every seed save; the vendored builds are re-uploaded too), which restarts that asset's count; the total alone cannot tell the other assets' downloads from the restart, so the day is an under-count for that release and never an over-count. The product's releases and the helpers' each on their own (`downloads_delta`, `helper_downloads_delta`); `null` across a snapshot whose listing was truncated | `per_key_downloads` ([`:228`](../crates/api/src/growth/github.rs)) |
+| `downloads_truncated` | the snapshot read hit the puller's page bound: `downloads` and `helper_downloads` are lower bounds, and the email says so | `counters_at` |
+| `top_releases_7d`, `top_flavours_7d` | downloads in the 7 days ending `at`, top 10; not measured without the snapshot 7 days before, or when either listing was truncated. A flavour's change is clamped at 0 the same way | — |
+| `traffic.views`, `clones` (+ `_uniques`) | GitHub's daily buckets summed per window over the days the puller holds an `ok` row for; `measured_days` says how many that is, and the email prints `—` for a window with none. Daily uniques summed are an upper bound on a window's uniques | `traffic_at` ([`:328`](../crates/api/src/growth/github.rs)) |
+| `traffic.referrers`, `referrers_as_of` | the newest stored 14-day ranking on or before the day | — |
+
+The email renders a **GitHub** block: each counter with its signed changes (`—` where a
+snapshot is missing), the week's downloads by release and by flavour, the traffic with its
+measured days (`—` for a window with no day pulled, never a 0 nobody counted; clones labelled as
+mostly CI's checkouts) and the referrer ranking, and the note that downloads are not installs.
+A digest stored before P7 reads both halves as `arrives_with: P7`.
+
+### Settings and the operator's setup
+
+| Setting | Env | Default | Effect |
+|---|---|---|---|
+| `growth.github_repo` | `ROOMLER__GROWTH__GITHUB_REPO` | `gjovanov/roomler-ai` | the repository read; anything that is not `owner/name` (GitHub's characters only) switches the puller off ([`settings.rs:665`](../crates/config/src/settings.rs)) |
+| `growth.github_api_url` | `ROOMLER__GROWTH__GITHUB_API_URL` | `https://api.github.com` | only a test changes it |
+| `growth.github_token` | `ROOMLER__GROWTH__GITHUB_TOKEN` | empty | the traffic's token, sent on the three traffic requests and nothing else; never logged, never in a pull row's error; empty ⇒ traffic "not measured" |
+
+The counters work on the hosted deployment as soon as `saas` runs this build. Traffic needs a
+**fine-grained personal access token** created by the repository's owner: resource owner
+`gjovanov`, repository access *Only select repositories* → `gjovanov/roomler-ai`, repository
+permission **Administration: Read-only** (GitHub adds *Metadata: Read-only* itself), sealed into
+`roomler2-secret` as `ROOMLER__GROWTH__GITHUB_TOKEN`. GitHub's traffic endpoints answer only
+someone with push access, which is why a read-only token still needs that one permission; a
+classic token would need the whole `repo` scope.
 
 ## The newsletter: delivery, per-issue tags and unsubscribes (P5)
 
@@ -1685,7 +1808,7 @@ everyone, and the viewer has no strip.
 | Orgs, machines, calls, users | platform-wide inventories and series | `/api/admin/stats/{orgs,machines,calls,users}` |
 | Usage | per-user minutes and bytes across every org | `/api/admin/stats/usage*` |
 | Attribution (FR-88) | sign-ups by campaign key and how many activated | `/api/admin/stats/attribution` |
-| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), the Channels table with the machine keys (P8, P10), the Newsletter tab (P5), the Revenue tab (P4), the Quality tab (P9a), the Weekly tab and the Alerts panel (P10); the digest's `quality.ratings` from the viewer's post-session prompt (P9b) | `/api/admin/growth/*` |
+| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), the Channels table with the machine keys (P8, P10), the Newsletter tab (P5), the Revenue tab (P4), the Quality tab (P9a), the Weekly tab and the Alerts panel (P10); the digest's `quality.ratings` from the viewer's post-session prompt (P9b); the digest's and the weekly's `github` section (P7a) | `/api/admin/growth/*` |
 
 ## Field verification
 
@@ -1705,6 +1828,19 @@ FR's field-verification log ([FR-102 §8](fr/FR-102-growth-observability.md#8-fi
 | An alert fires once, mails once and clears: `digest_missing` on a day the digest is held back (red), cleared once it runs (green), with `ROOMLER__GROWTH__ALERTS=true` | owed | `crates/tests/src/growth_p10_tests.rs` — each evaluable rule fires once, a second evaluation adds nothing, the clear, a re-fire the same day mails nothing, the digest's `alerts` section |
 | For a closed day, the frozen `*` row and the Quality tab equal the hand counts of [remote-desktop quality](#field-verification-owed-after-the-promote): sessions requested by outcome from `remote_sessions`, TTFF p50/p90 from the FR-22 filter over `agent_logs`, crashes by `agentVersion`, device-days from `stats_machine_1d`; the digest's `crashes.by_agent_version` names real versions where it read `unknown` before (P9a) | ✅ 2026-10-16 for 2026-10-15, scope `all`: 144 / 122 / 22 / 0 by outcome and every `end_reason` bucket, TTFF n 58 (p50 523 ms, p90 7,186 ms), 1 crash, each equal to the hand count. The 2026-10-16 digest names `0.4.139` in the per-version table, where the 10-15 one read "arrives with P9a"; neither day had a crash in the digest's scope | `crates/tests/src/growth_quality_tests.rs` — the freeze from the four sources as they are really written (the camelCase crash payload, the browser record, the agents' batches), the version from the logs before the row, both scopes, idempotency, a day past the log horizon frozen without TTFF; the view, the backfill, the digest's and the weekly's sections |
 | The rating prompt appears at most once per user per day and never after a session shorter than 30 s, and dismissing it changes nothing else in the viewer (AC19, P9b); a rating posts once and the next digest counts it | ✅ 2026-10-17 on production against a vmtest guest (agent 0.4.140): one pass; four sessions and exactly one stored rating. Owed: the pod-lane run (no agent-e2e harness yet) and a digest counting a rating from an org that is not excluded | `ui/e2e/remote-session-rating.spec.ts` (the four sessions, exactly one prompt element); `ui/src/__tests__/components/rcRatingMount.spec.ts` — the two mounts are branches of one `v-if` chain; `ui/src/__tests__/composables/rcSessionRating.spec.ts` — every gate, the 30 s from the request, the UTC day, a storage that cannot keep it; `crates/tests/src/session_feedback_tests.rs` — a party stores once with codes only, the controller and a watcher each once, everyone else refused with a code, the kill switch's empty 404, `purge_user`, the digest's `quality.ratings` |
+
+The GitHub puller (P7a) is to be shown on production after the promote: for the first closed
+day after the roll, `growth_pulls github:<day>` is `ok` and its `by: repo` row's stars and forks
+equal `GET https://api.github.com/repos/gjovanov/roomler-ai` read in the same window, its
+`downloads` equals the sum of `download_count` over the assets of every published **product**
+release (`agent-v`, `setup-v`, `tunnel-v`, `tunnel-wizard-v`) but its `.asc`/`.sha256` sidecars,
+and its `helper_downloads` the same sum over every other published release, and the day after,
+the digest's `github.counters.stars_delta.day` is the difference of the two snapshots. The
+integration suite drives the puller and the readers against a fake GitHub — the window, the
+paging, the drafts and sidecars, a helper release counted apart, the token on the traffic requests
+only, a refused token recorded per traffic day while the snapshot is still taken, a listing past
+the page bound marked, a spent rate limit retried next tick, a gap read as `null`
+(`crates/tests/src/growth_github_tests.rs`).
 
 The newsletter's webhook is to be shown on production to refuse a bad signature (control),
 and to record `delivered` and `bounce` for a test send with one forced bounce, the bounced
