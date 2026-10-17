@@ -107,6 +107,7 @@ import {
   type TouchSample,
   type TrackpadAction,
 } from './touchGestures'
+import { modsOf, type ControlsSink, type MouseBtn } from './touchControls'
 import { parseFeaturesRefused } from './useSessionFeatures'
 
 /**
@@ -5923,6 +5924,20 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
   }
 
+  // FR-111 P3 — the on-screen controls press through the attached stage,
+  // which owns the held-input tracking and both pointer paths. The proxy is
+  // stable for the overlay to hold; it drops presses while no stage is
+  // attached.
+  let controlsSink: ControlsSink | null = null
+  const touchControlsSink: ControlsSink = {
+    key: (code, down) => controlsSink?.key(code, down),
+    button: (btn, down) => controlsSink?.button(btn, down),
+    move: (dx, dy) => controlsSink?.move(dx, dy),
+    begin: () => controlsSink?.begin(),
+    end: () => controlsSink?.end(),
+    width: () => controlsSink?.width() ?? 0,
+  }
+
   function flushRel() {
     if (relTimer !== null) {
       clearTimeout(relTimer)
@@ -10488,6 +10503,66 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
     }
 
+    // FR-111 P3 — the on-screen controls' presses. A key goes out as the
+    // keyboard's frame would (Ctrl as Cmd on a Mac host, FR-13); a mouse
+    // button and the stick take the trackpad's two paths. What they hold is
+    // tracked like any other press, so a blur or a detach lets go of it, and
+    // a release for something already let go is dropped.
+    const controlKeys = new Map<number, number>() // the usage pressed → the usage sent
+    const controlBtns = new Set<MouseBtn>()
+    const stageControls: ControlsSink = {
+      key(code, down) {
+        if (down === controlKeys.has(code)) return
+        let sent = code
+        if (down) {
+          if (hostIsMac.value && ctrlAsCmd.value && (code === 0xe0 || code === 0xe4)) sent = 0xe3
+          controlKeys.set(code, sent)
+        } else {
+          sent = controlKeys.get(code) ?? code
+          controlKeys.delete(code)
+        }
+        heldInputs.key(sent, down)
+        sendInput({ t: 'key', code: sent, down, mods: modsOf(controlKeys.values()) })
+      },
+      button(btn, down) {
+        if (down === controlBtns.has(btn)) return
+        if (down) controlBtns.add(btn)
+        else controlBtns.delete(btn)
+        if (relativeMouseAllowed.value) {
+          flushRel()
+          sendInput(relativeButtonMessage(btn, down))
+        } else {
+          const p = padPointer ?? hostPointerNorm()
+          cancelPendingMove()
+          sendInput({ t: 'mouse_button', btn, down, x: p.x, y: p.y, mon: 0 })
+        }
+        heldInputs.button(btn, down)
+      },
+      move(dx, dy) {
+        if (relativeMouseAllowed.value) {
+          relAcc.add(dx, dy)
+          scheduleRel()
+          return
+        }
+        const w = mediaIntrinsicW.value
+        const h = mediaIntrinsicH.value
+        if (w <= 0 || h <= 0) return
+        const p = padPointer ?? hostPointerNorm()
+        padPointer = { x: clamp01(p.x + dx / w), y: clamp01(p.y + dy / h) }
+        lastPointerNorm = { ...padPointer }
+        pendingMove = { x: padPointer.x, y: padPointer.y, mon: 0 }
+        schedulePendingMove()
+      },
+      begin() {
+        padPointer = null
+      },
+      end() {
+        padPointer = null
+      },
+      width: () => mediaIntrinsicW.value,
+    }
+    controlsSink = stageControls
+
     /** One touch event, to the current mode's recognizer. */
     function touchStep(kind: 'down' | 'move' | 'up', ev: PointerEvent) {
       const p = touchSample(ev)
@@ -10509,6 +10584,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (pendingCtrlV?.timer) clearTimeout(pendingCtrlV.timer)
       pendingCtrlV = null
       const held = heldInputs.releaseAll()
+      // FR-111 P3 — this lets go of the on-screen controls' presses too, so
+      // the overlay's own release later is a duplicate and is dropped.
+      controlKeys.clear()
+      controlBtns.clear()
       for (const btn of held.buttons) {
         // FR-109 — in relative mode there is no position to go back to: the
         // host app owns the cursor, so let go where it is.
@@ -10994,6 +11073,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // Release anything still held on the host BEFORE the channels close
       // (detach mid-chord must not leave a stuck modifier behind).
       releaseHeldInputs()
+      if (controlsSink === stageControls) controlsSink = null
       window.removeEventListener('blur', onWindowBlurInput)
       document.removeEventListener('visibilitychange', onVisibilityInput)
       // FR-109 — the surface is going: so is its lock, and relative mode.
@@ -12173,6 +12253,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     setRelativeMouseAllowed,
     touchMode,
     setTouchMode,
+    /** FR-111 P3 — where the on-screen controls press. */
+    touchControlsSink,
     /** rc.87 Ã¢ÂÂ real encoder info from the agent (`rc:video-info`).
      *  Null on the legacy track / libvpx paths (no message); the
      *  badge falls back to a selection-derived label then. */
