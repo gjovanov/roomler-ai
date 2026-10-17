@@ -8,7 +8,7 @@
 > | P1 | touch on the stage: it keeps every touch (`touch-action: none`), a cancelled pointer still lets go, and the gestures of direct mode (the right button, two-finger scroll, pinch zooming only the viewer) | built (viewer only) |
 > | P2 | a trackpad mode: the finger moves the host's pointer, a tap clicks where it is | built (viewer only). With nothing remembered, a phone-sized screen starts in trackpad mode and a larger one in direct mode (the operator's decision 1, 2026-10-17) |
 > | P3 | on-screen controls: rows of keys, a d-pad, a mouse stick, in three built-in presets remembered per device | built (viewer only); the presets follow the recommendation until the operator decides |
-> | P4 | an editor, macros, tenant presets | not built |
+> | P4 | an editor, macros, tenant presets | **P4a built**: the org's presets on the server (four routes, strict validation, macros in the schema). P4b, the editor and the overlay reading them, not built |
 
 ## Why it exists
 
@@ -171,6 +171,59 @@ flowchart LR
   as the physical keys do. On a Mac host it is Option+Tab, not the app switcher (Cmd+Tab). A preset cannot
   bind a chord per host OS until P4's editor.
 
+## The org's presets (P4)
+
+An org can keep presets of its own beside the three built-ins: an admin saves one, and every member's
+viewer offers it. **P4a, the server half, is built**. P4b (the editor, the presets in the overlay, macros
+played by the viewer) is not yet, so nothing reads them today.
+
+```mermaid
+sequenceDiagram
+    participant Ad as Org admin (MANAGE_TENANT)
+    participant S as Server (remote module)
+    participant DB as touch_presets
+    participant M as A member's viewer
+    Ad->>S: POST /api/tenant/{tid}/touch-preset {name, controls}
+    S->>S: deny unknown fields, TouchPresetRequest::validate
+    S->>DB: insert (unique per org by name)
+    S-->>Ad: 201 the stored preset, or 409 / 422 with a code
+    M->>S: GET /api/tenant/{tid}/touch-preset
+    S-->>M: {items: [{id, name, controls, updated_at}]}
+```
+
+- **The data is the viewer's own preset**, stored as it is: rows of buttons, d-pads and sticks
+  ([`models.rs:4868`](../crates/remote_control/src/models.rs#L4868) `TouchPreset`). P4 adds one action
+  beside a chord of keys and a mouse button: a **macro**, a list of steps, each a key or a mouse button
+  pressed, released or tapped, then a wait
+  ([`models.rs:4986`](../crates/remote_control/src/models.rs#L4986) `MacroStep`).
+- **Who:** any member reads them, since every viewer in the org offers them. Writing takes `MANAGE_TENANT`,
+  like the org's session policy, because a stored preset runs on every member's viewer
+  ([`touch_presets.rs:88`](../crates/modules/remote/src/touch_presets.rs#L88) `list`,
+  [`touch_presets.rs:109`](../crates/modules/remote/src/touch_presets.rs#L109) `create`). That is open
+  decision 5, built to its recommendation.
+- **Resolved within the org.** A change or a delete looks the preset up in the org it names, so a foreign id
+  is a 404 that leaks nothing
+  ([`touch_presets.rs:152`](../crates/modules/remote/src/touch_presets.rs#L152) `update`,
+  [`touch_presets.rs:185`](../crates/modules/remote/src/touch_presets.rs#L185) `delete`).
+- **Read strictly** ([`models.rs:5040`](../crates/remote_control/src/models.rs#L5040) `validate`). Each
+  refusal is a 422 with a code, and nothing is stored:
+
+  | Refused | Code |
+  |---|---|
+  | an unknown field at any level, a key past a byte, a malformed body | `invalid_json` |
+  | a key the keyboard path cannot send: only the Keyboard/Keypad page's keys and its eight modifiers ([`models.rs:5015`](../crates/remote_control/src/models.rs#L5015) `touch_key_ok`) | `key_invalid` |
+  | a name empty, over 48 characters or with a control character | `name_empty`, `name_invalid` |
+  | a label over 16 characters, an id over 32 or repeated within the preset | `label_invalid`, `id_invalid`, `id_duplicate` |
+  | no controls or more than 24, an empty row or one of more than 12 buttons, a chord of more than 4 keys | `no_controls`, `too_many_controls`, `row_buttons`, `chord_keys` |
+  | a size outside 48 to 400 px, a stick speed outside 0.05 to 5, an edge past 4000 px, both edges of one axis | `size_invalid`, `speed_invalid`, `place_invalid`, `place_both_edges` |
+  | a macro with no step or more than 32, a step with both or neither of a key and a button, a wait over 5 s, the whole over 30 s | `macro_steps`, `step_key_or_button`, `step_wait`, `macro_too_long` |
+
+  A body over 32 KiB is a 413. A name the org already has is a 409 `name_taken`, on a create and on a rename
+  alike, decided by the unique `(tenant_id, name)` index. An org keeps at most 50 presets, and a 51st is a
+  409 `too_many_presets`.
+- **A member's own layout stays in the browser**, and needs no permission (open decision 6, for P4b). The
+  server holds only what the org shares.
+
 ## The stage keeps every touch
 
 ```mermaid
@@ -213,7 +266,8 @@ sequenceDiagram
 
 ## What it does not do yet
 
-- No layout editor, no macros and no presets shared across a tenant (P4). G1's three presets are built in.
+- No layout editor and no macros in the viewer (P4b). The server keeps an org's presets (P4a), but no
+  viewer offers them yet; G1's three presets are built in.
 - In trackpad mode two fingers moving together still scroll the host, so a zoomed picture is moved around
   in direct mode, or by zooming out and in again.
 - No native touch on the host: `InputMsg::Touch` is still dropped by every injector (P5, optional).
