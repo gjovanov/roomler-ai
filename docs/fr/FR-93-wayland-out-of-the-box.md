@@ -890,8 +890,15 @@ New cells run three times before they are trusted. An entry in `expected-failure
   - after the wake, the new session names what holds the picture back: GNOME's lock 11.2 s after the wake (P5b),
     KDE's repeated share dialog 16.5 s after it (as on 0.4.136). Most of that is the viewer's reconnect backoff.
 
-  Owed: P5h on a release, and a wake on real hardware (the lab's virtio-gpu guests resume badly: GNOME's
-  shell hung once and KDE resumed black; AC12, Asahi).
+  ✅ **P5h on the released 0.4.141** (2026-10-17, the per-user guests self-updated to the release, the running
+  binary checked): *This computer is going to sleep. The session comes back by itself once the computer wakes; a
+  desktop that locks when it sleeps then waits for its unlock.* reached the viewer before the guest slept, on
+  GNOME and on KDE (KDE once its two portal dialogs were answered at the screen). The guests sleep `s2idle` now, and
+  QEMU's `system_wakeup` cannot wake that (*"guest is not in suspended state"*), so neither run could time a wake:
+  both were shut down and restarted.
+
+  Owed: a wake on real hardware (the lab's guests cannot be woken from `s2idle`; AC12's Asahi box is the operator's
+  own, so a suspend there waits for their go-ahead).
 - [x] **AC8** — an idle DRM session's CPU, measured before and after, within 2× of FR-29's X11 figure.
   ✅ in the lab on P3d (`cac2d7c43`): the GNOME 50 system guest, an idle desktop on the viewer's default path,
   every `roomlerd` process's CPU over two 60 s windows. **57.9 %** of a core on the released 0.4.133, **5.5 % and
@@ -948,8 +955,24 @@ New cells run three times before they are trusted. An entry in `expected-failure
   the session."* 0.55 s after the capture opened, and its **Disconnect** ended the session as
   `host_disconnect`; with the companion, its *Being viewed by …* banner.
 
+  ✅ **On the released 0.4.141** (2026-10-17), all four lab desktops, `auto_grant_session = false`, every answer
+  given at the screen over QMP, every screen shot kept (`~/vmtest/lab/ac10/*-a10*.png` on the lab host):
+  - **GNOME 50 system** (the companion 0.4.141): *started the desktop companion for a prompt*, its *Remote control
+    request* window, Approve, then its *Being viewed by vmtest admin · Disconnect* banner, and a picture.
+  - **GNOME 50 per-user**: the native prompt through Xwayland, Approve, and it **closed** (P6a: on 0.4.135 it
+    stayed); GNOME's screen-sharing pill in the top bar; a picture.
+  - **Plasma 6.7 per-user**: the native prompt. A server roll reset the agent's control socket 6 s in, and the
+    viewer re-created the session. The new session found the native panel busy and asked through KDE's
+    notification (P6f): Approve, then KDE's own *Remote Control* portal dialog, Approve, then KDE's tray
+    indicator and a picture. ⚠️ The first session's native prompt **stayed on screen** after its session was gone,
+    and approving it did nothing (*"outbound consent send failed (channel closed)"*). That is a stale prompt the
+    person at the screen can still answer.
+  - **Plasma 6.7 system** (no companion): KDE's notification *Remote control request … Approve / Deny* (P6f),
+    Approve, then *This screen is being viewed … Disconnect* (P6g), and a picture.
+
   Owed:
-  - The released build that carries P6a–P6g (P6a–P6c are in 0.4.137), and the aarch64 packages on Asahi.
+  - The aarch64 companion on Asahi (AC12's box is the operator's own).
+  - A prompt whose session died should leave the screen (#2416).
 - [ ] **AC11** — X11 hosts unchanged (FR-29's idle numbers), Windows and macOS unchanged; the kill switch
   restores 0.4.124's behaviour exactly.
   ⏳ **The kill switch, in the lab** (P1a, step log 76). On the released 0.4.135, both switches gave the lab's
