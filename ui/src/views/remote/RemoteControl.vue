@@ -370,6 +370,18 @@
             :data-testid="`rc-touch-controls-${p.id}`"
             @click="setTouchControls(p.id)"
           />
+          <!-- FR-111 P4 — the org's own presets, under their own heading. -->
+          <template v-if="orgTouchList.length">
+            <v-list-subheader>Your organization</v-list-subheader>
+            <v-list-item
+              v-for="p in orgTouchList"
+              :key="p.id"
+              :active="touchControlsPreset?.id === p.id"
+              :title="p.name"
+              :data-testid="`rc-touch-controls-${p.id}`"
+              @click="setTouchControls(p.id)"
+            />
+          </template>
         </v-list>
       </v-menu>
       <!-- rc.199 — clipboard send / get: frequent connected-session
@@ -2168,7 +2180,13 @@ import type { KeepBusyPattern } from '@/composables/keepBusy'
 import { displayMatchSummary } from '@/composables/displayMatch'
 import { agentSupportsRelativeMouse, relativeMouseSwitchedOff } from '@/composables/relativeMouse'
 import { pictureOverflows, stageTouchAction } from '@/composables/touchInput'
-import { BUILTIN_PRESETS, CONTROLS_STORAGE_PREFIX, presetById, readControlsPreset } from '@/composables/touchControls'
+import {
+  BUILTIN_PRESETS,
+  CONTROLS_STORAGE_PREFIX,
+  orgPresets,
+  presetById,
+  readControlsPreset,
+} from '@/composables/touchControls'
 import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 import { asSentence } from '@/utils/sentence'
 import { hostOffers, hostReason } from '@/utils/hostUnavailable'
@@ -3188,9 +3206,21 @@ watch(agentId, (id) => {
   }
   touchControlsId.value = id ? readControlsPreset(storage, id) : null
 }, { immediate: true })
-const touchControlsPreset = computed(() => (touchModeOffered ? presetById(touchControlsId.value) : null))
+/** FR-111 P4 — the org's presets, offered beside the built-ins: fetched once
+ *  the session connects on a device that offers the controls at all. */
+const orgTouchList = computed(() => orgPresets(agentStore.orgTouchPresets))
+watch(
+  () => rc.phase.value === 'connected' && touchModeOffered,
+  (offer) => {
+    if (offer) void agentStore.fetchOrgTouchPresets(tenantId.value)
+  },
+  { immediate: true },
+)
+const touchControlsPreset = computed(() =>
+  touchModeOffered ? presetById(touchControlsId.value, orgTouchList.value) : null,
+)
 function setTouchControls(id: string | null) {
-  touchControlsId.value = presetById(id)?.id ?? null
+  touchControlsId.value = presetById(id, orgTouchList.value)?.id ?? null
   try {
     globalThis.localStorage.setItem(CONTROLS_STORAGE_PREFIX + agentId.value, touchControlsId.value ?? 'off')
   } catch {

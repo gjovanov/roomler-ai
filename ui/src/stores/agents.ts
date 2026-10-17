@@ -1388,6 +1388,26 @@ export const useAgentStore = defineStore('agents', () => {
     }
   }
 
+  // ── FR-111 P4 — the org's on-screen control presets ───────────────
+  //
+  // Read by ANY member (`GET …/touch-preset`): every viewer in the org offers
+  // them beside the built-ins. The rows go to the overlay as the server sends
+  // them, and `orgPresets` (touchControls.ts) turns them into presets.
+
+  /** The org's presets, as the server sent them. */
+  const orgTouchPresets = ref<unknown[]>([])
+
+  /** An older server without the route, or any error, is none: the built-ins
+   *  are still offered. */
+  async function fetchOrgTouchPresets(tenantId: string) {
+    try {
+      const r = await api.get<{ items?: unknown[] }>(`/tenant/${tenantId}/touch-preset`)
+      orgTouchPresets.value = Array.isArray(r?.items) ? r.items : []
+    } catch {
+      orgTouchPresets.value = []
+    }
+  }
+
   /** Set one or more features (MANAGE_TENANT server-side). The route leaves
    *  a feature the body does not name alone, and answers with all three. */
   async function setOrgRcSessionPolicy(tenantId: string, patch: Partial<RcSessionPolicy>) {
@@ -1695,6 +1715,8 @@ export const useAgentStore = defineStore('agents', () => {
     orgRcSessionPolicy,
     fetchOrgRcSessionPolicy,
     setOrgRcSessionPolicy,
+    orgTouchPresets,
+    fetchOrgTouchPresets,
     orgEphemeralKeysEnabled,
     fetchOrgEphemeralKeysEnabled,
     setOrgEphemeralKeysEnabled,

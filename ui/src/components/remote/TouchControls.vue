@@ -26,7 +26,7 @@
           :key="b.id"
           type="button"
           class="tc-btn"
-          :class="{ 'tc-held': lit.has(`${c.id}/${b.id}`) }"
+          :class="{ 'tc-held': lit.has(`${c.id}/${b.id}`) || macroLit.has(`${c.id}/${b.id}`) }"
           :data-testid="`rc-tc-${c.id}-${b.id}`"
           :aria-label="controlLabel(b.label, !!ctrlIsCmd)"
           @pointerdown.stop.prevent="onButtonDown($event, c, b)"
@@ -114,6 +114,9 @@ const driver = createControlsDriver(props.sink)
 
 /** What is lit: `control/button` for a held button. */
 const lit = reactive(new Set<string>())
+/** FR-111 P4 — a macro button stays lit while its macro plays, which it does
+ *  after the finger lifts too. */
+const macroLit = reactive(new Set<string>())
 /** The keys each d-pad holds now. */
 const padKeys = reactive(new Map<string, number[]>())
 /** Each held stick's push, as a share of its radius. */
@@ -172,6 +175,17 @@ function onButtonDown(ev: PointerEvent, c: RowControl, b: ButtonControl) {
   fingers.set(ev.pointerId, { control: c.id, button: key, kind: 'button', cx: 0, cy: 0, r: 1 })
   lit.add(key)
   driver.pressButton(ev.pointerId, b)
+  if (b.action.kind === 'macro' && driver.playing(b.id)) watchMacro(key, b.id)
+}
+
+function watchMacro(key: string, buttonId: string) {
+  if (macroLit.has(key)) return
+  macroLit.add(key)
+  const check = () => {
+    if (driver.playing(buttonId)) requestAnimationFrame(check)
+    else macroLit.delete(key)
+  }
+  requestAnimationFrame(check)
 }
 
 function onPadDown(ev: PointerEvent, c: DpadControl) {
@@ -226,6 +240,7 @@ function onUp(ev: PointerEvent) {
 
 function releaseAll() {
   driver.releaseAll()
+  macroLit.clear()
   for (const id of [...fingers.keys()]) forget(id)
   if (raf !== null) {
     cancelAnimationFrame(raf)
