@@ -19,6 +19,8 @@ pub use roomler_node_core::{
 };
 
 pub mod apps;
+/// FR-97 P0d — the machine's native CPU architecture, for the hello.
+pub(crate) mod arch;
 /// FR-90 P2h-1 — `roomlerd enroll --archive-replica`: an archive replica's
 /// posture, written with the enrolled config.
 pub mod archive_replica;

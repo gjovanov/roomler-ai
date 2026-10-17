@@ -138,6 +138,9 @@ impl AgentDao {
             ephemeral_ttl_secs: None,
             enroll_key_id: None,
             os,
+            // FR-97 P0d — the hello reports it; enrolment never does.
+            arch: None,
+            arch_emulated: false,
             agent_version,
             // FR-27 — unknown until the device's first heartbeat, for the same
             // reason as the host key below: enrolment never reaches the machine.
@@ -442,6 +445,7 @@ impl AgentDao {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_hello(
         &self,
         agent_id: ObjectId,
@@ -450,6 +454,8 @@ impl AgentDao {
         capabilities: &AgentCaps,
         advertised_routes: &[String],
         ssh_host_pubkey: &str,
+        arch: &str,
+        arch_emulated: bool,
     ) -> DaoResult<bool> {
         let displays_bson = bson::to_bson(displays).unwrap_or(bson::Bson::Array(vec![]));
         let caps_bson = bson::to_bson(capabilities).unwrap_or(bson::Bson::Null);
@@ -458,22 +464,23 @@ impl AgentDao {
         // switched SSH off, or downgraded to a build without it, must stop
         // advertising a key it no longer holds — leaving the old value would
         // have clients verifying against an identity that is gone.
-        self.base
-            .update_by_id(
-                agent_id,
-                doc! {
-                    "$set": {
-                        "agent_version": agent_version,
-                        "displays": displays_bson,
-                        "capabilities": caps_bson,
-                        "advertised_routes": advertised_bson,
-                        "ssh_host_pubkey": ssh_host_pubkey,
-                        "status": bson::to_bson(&AgentStatus::Online).unwrap(),
-                        "last_seen_at": DateTime::now(),
-                    }
-                },
-            )
-            .await
+        let mut set = doc! {
+            "agent_version": agent_version,
+            "displays": displays_bson,
+            "capabilities": caps_bson,
+            "advertised_routes": advertised_bson,
+            "ssh_host_pubkey": ssh_host_pubkey,
+            "status": bson::to_bson(&AgentStatus::Online).unwrap(),
+            "last_seen_at": DateTime::now(),
+        };
+        // FR-97 P0d — the hardware does not change, so only a hello that
+        // reports it writes it: a rollback to an agent predating the field
+        // keeps the last value instead of erasing it.
+        if !arch.is_empty() {
+            set.insert("arch", arch);
+            set.insert("arch_emulated", arch_emulated);
+        }
+        self.base.update_by_id(agent_id, doc! { "$set": set }).await
     }
 
     pub async fn mark_status(&self, agent_id: ObjectId, status: AgentStatus) -> DaoResult<bool> {
