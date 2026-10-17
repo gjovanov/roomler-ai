@@ -73,7 +73,7 @@ pub const MAX_VERIFY_FAILURES: usize = 100;
 
 /// The organization a route names, once the caller is shown to be in it
 /// and the vault serves it.
-async fn member_tenant(
+pub(crate) async fn member_tenant(
     state: &VaultState,
     tenant_id: &str,
     auth: &AuthUser,
@@ -89,17 +89,19 @@ async fn member_tenant(
 }
 
 /// What was asked, as the audit records it.
-struct Ask {
+pub(crate) struct Ask {
     action: &'static str,
     op: &'static str,
     secret_id: Option<ObjectId>,
     rrn: Option<String>,
     field: Option<String>,
     n: Option<i64>,
+    /// P3-2 — a role or a policy the decision is about.
+    target: Option<String>,
 }
 
 impl Ask {
-    fn new(action: &'static str, op: &'static str) -> Self {
+    pub(crate) fn new(action: &'static str, op: &'static str) -> Self {
         Self {
             action,
             op,
@@ -107,11 +109,18 @@ impl Ask {
             rrn: None,
             field: None,
             n: None,
+            target: None,
         }
     }
 
     fn secret(mut self, id: Option<ObjectId>) -> Self {
         self.secret_id = id;
+        self
+    }
+
+    /// P3-2 — `role:<name>` or `policy:<id>`.
+    pub(crate) fn target(mut self, target: String) -> Self {
+        self.target = Some(target);
         self
     }
 
@@ -134,6 +143,7 @@ impl Ask {
             rrn: self.rrn.clone(),
             field: self.field.clone(),
             n: self.n,
+            target: self.target.clone(),
             at: DateTime::now(),
         }
     }
@@ -142,7 +152,7 @@ impl Ask {
 /// P3-1's one policy: the organization's administrators, and no one else.
 /// A refusal is recorded (best effort: the caller is refused whatever the
 /// database says) and answered 403.
-async fn decide(
+pub(crate) async fn decide(
     state: &VaultState,
     tid: ObjectId,
     auth: &AuthUser,
@@ -165,7 +175,7 @@ async fn decide(
 
 /// Record an allow, before acting on it. ⚠️ Fails CLOSED: an allow the
 /// vault cannot record is answered 500 and not acted on.
-async fn record_allow(
+pub(crate) async fn record_allow(
     state: &VaultState,
     tid: ObjectId,
     auth: &AuthUser,
@@ -196,16 +206,16 @@ fn kek_or_503(state: &VaultState) -> Result<std::sync::Arc<crate::crypto::Kek>, 
 }
 
 /// The organization's slug, for its RRNs.
-async fn org_slug(state: &VaultState, tid: ObjectId) -> Result<String, ApiError> {
+pub(crate) async fn org_slug(state: &VaultState, tid: ObjectId) -> Result<String, ApiError> {
     Ok(state.tenants.base.find_by_id(tid).await?.slug)
 }
 
-fn parse_secret_id(raw: &str) -> Result<ObjectId, ApiError> {
+pub(crate) fn parse_secret_id(raw: &str) -> Result<ObjectId, ApiError> {
     ObjectId::parse_str(raw).map_err(|_| ApiError::BadRequest("Invalid secret id".into()))
 }
 
 /// A live secret of the organization, or the 404 every other id gets.
-async fn live_secret(
+pub(crate) async fn live_secret(
     state: &VaultState,
     tid: ObjectId,
     id: ObjectId,
@@ -219,7 +229,7 @@ async fn live_secret(
 
 // ─── views: metadata only ───────────────────────────────────────────────────
 
-fn rfc3339(t: DateTime) -> String {
+pub(crate) fn rfc3339(t: DateTime) -> String {
     t.try_to_rfc3339_string().unwrap_or_default()
 }
 
@@ -310,7 +320,7 @@ impl VersionView {
 
 // ─── request checks ─────────────────────────────────────────────────────────
 
-fn check_description(d: &str) -> Result<(), ApiError> {
+pub(crate) fn check_description(d: &str) -> Result<(), ApiError> {
     if d.len() > MAX_DESCRIPTION_LEN {
         return Err(ApiError::BadRequest(format!(
             "description is longer than {MAX_DESCRIPTION_LEN} bytes"
@@ -378,7 +388,11 @@ fn check_rotation(days: u32) -> Result<(), ApiError> {
 }
 
 /// An owner must be a member of the organization.
-async fn check_owner(state: &VaultState, tid: ObjectId, raw: &str) -> Result<ObjectId, ApiError> {
+pub(crate) async fn check_owner(
+    state: &VaultState,
+    tid: ObjectId,
+    raw: &str,
+) -> Result<ObjectId, ApiError> {
     let owner =
         ObjectId::parse_str(raw).map_err(|_| ApiError::BadRequest("Invalid owner_id".into()))?;
     if !state.tenants.is_member(tid, owner).await? {
@@ -957,6 +971,7 @@ pub async fn audit(
                     "rrn": e.rrn,
                     "field": e.field,
                     "n": e.n,
+                    "target": e.target,
                 })
             })
             .collect(),

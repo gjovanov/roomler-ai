@@ -23,6 +23,9 @@ roomler-ai-services = { path = "../../services" }
 # data key wrapped to the KEK, an `age` X25519 identity — so a wrapped key
 # opens with the stock `age` tool and an `age-keygen` file is the KEK.
 age.workspace = true
+# P3-2 — roles and policies in Cedar, every policy validated against the
+# vault's schema on write.
+cedar-policy.workspace = true
 chacha20poly1305.workspace = true
 zeroize.workspace = true
 

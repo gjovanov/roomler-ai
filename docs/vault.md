@@ -9,8 +9,9 @@ People use it too.
 > Spec, steps and the field log: [`fr/FR-90-hive-agent-sessions.md`](fr/FR-90-hive-agent-sessions.md)
 > §3e (#1827). The whole design (roles, Cedar policies, leases, the modes a
 > session gets a secret in) is [`roomler-hive-design.md`](roomler-hive-design.md)
-> §8. **This page describes what is built: P3-1, the store.** No device and no
-> session reaches a value yet.
+> §8. **This page describes what is built: P3-1, the store, and P3-2a, roles
+> and Cedar policies (§7).** No device and no session reaches a value yet, and
+> no session assumes a role yet (P3-2b).
 
 ## 1. Custody: who can read a secret
 
@@ -183,6 +184,12 @@ All under `/api/tenant/{tenant_id}/vault`, for the organization's
 | PUT | `/secret/{id}/value` | write a field's next version, `{field?, value, expires_at?}`; answers the number | **yes** | `secret:write` · `value`, with the number |
 | POST | `/verify` | open every version the organization holds (up to 10,000) and answer which do not open: `other_kek`, `dek_unreadable`, `tampered`. Never a value | **yes** | `vault:verify` · `verify` |
 | GET | `/audit` | the decisions, newest first (`?before=`, `?limit=` up to 200) | no | — |
+| GET | `/schema` | P3-2a — the Cedar schema policies are written against, and the actions, modes and OSes it names | no | — |
+| GET · POST | `/role` | P3-2a — the vault roles; declare one `{name, description?}` | no | `policy:write` · `role_create` |
+| DELETE | `/role/{name}` | P3-2a — tombstone a role; **409** while a live policy names it | no | `policy:write` · `role_delete` |
+| GET · POST | `/policy` | P3-2a — the guardrails, then the organization's policies; add one `{name, description?, text}` | no | `policy:write` · `policy_create` |
+| GET · PUT · DELETE | `/policy/{id}` | P3-2a — one policy; replace it `{…, rev}` from the revision read (**409** if it moved); tombstone it. A `guardrail:*` id is **400** for both writes | no | `policy:write` · `policy_update` / `policy_delete` |
+| POST | `/simulate` | P3-2a — decide a request as the vault would, and say which policies decided it; `with` / `without` for a change not yet made | no | — (decides nothing for real) |
 
 > [!WARNING]
 > **No route answers a value.** In P3-1 a value goes in through `PUT …/value`
@@ -190,7 +197,87 @@ All under `/api/tenant/{tenant_id}/vault`, for the organization's
 > `secret:read`, which puts the value in front of a human, is a later step with
 > its own gate.
 
-## 7. Audit
+## 7. Roles and policies (P3-2a)
+
+A session will assume one **role** at its start (P3-2b), and the
+organization's **policies**, written in [Cedar](https://www.cedarpolicy.com),
+say what each role may do. The mapping to AWS IAM is design §8.1; what is
+built is the language, the checks, the guardrails and `simulate`
+([`policy.rs`](../crates/modules/vault/src/policy.rs)).
+
+```mermaid
+flowchart LR
+    W["an administrator writes a policy"] --> C{"checked before it is kept"}
+    C -->|"one Cedar statement · valid against the schema, strictly ·<br/>names only this organization"| S[("vault_policies")]
+    C -->|"anything else"| R["400, in words"]
+    G["the guardrails<br/>(code, never rows)"] --> SET["the organization's set"]
+    S --> SET
+    SET --> D{"decide"}
+    Q["a request: role:assume or secret:use"] --> D
+    D -->|"a permit applies, and no forbid"| A["allow"]
+    D -->|"a forbid applies, or nothing permits"| N["deny"]
+```
+
+**The schema** ([`policy.cedarschema`](../crates/modules/vault/src/policy.cedarschema)),
+namespace `Roomler`:
+
+| Entity | What it is |
+|---|---|
+| `User` `in Group` | a person; one `Group` per roomler role they hold (`owner`, `admin`, `member`, … and the organization's own) |
+| `Role` | a vault role, `Roomler::Role::"dev"` |
+| `Session` `in Role` | an agent session in the role it assumed; `owner`, and `playbook` when it runs one |
+| `Secret` `in SecretFolder` | `rrn:{org}:secret:{path}`, with `path`, `kind`, `tags`; a folder per path prefix, each in the one above |
+
+| Action | Principal → resource | Context |
+|---|---|---|
+| `role:assume` | `User` → `Role` | `device {os, tags, owner}` |
+| `secret:use` | `Session` → `Secret` | `mode`, `audience`, `ttl_s`, `device {os, tags, owner}`, `approval? {approver}` |
+
+`os` is `linux`, `macos` or `windows`, exactly as the device rows store it; any
+other spelling is refused, never lowercased into a match. A device's tags are
+lowercased, because they are free-form and a policy compares by equality.
+
+**The guardrails** are in every organization's set from its first decision.
+They are code, not rows, so no organization can edit or lose one, and their
+text names no organization:
+
+| Guardrail | Forbids |
+|---|---|
+| `guardrail:windows-proxy-only` | any `secret:use` on Windows in a mode other than `proxy`: there is no Claude Code sandbox there (AC13; decision 17) |
+| `guardrail:prod-never-materializes` | `secret:use` in `file`, `env` or `exec` for a secret tagged `prod` or under `prod/` |
+
+**A policy is checked before it is kept** ([`check_policy`](../crates/modules/vault/src/policy.rs)):
+exactly one static Cedar statement, valid against the schema in strict mode,
+and naming only its organization:
+
+- a `Secret` or `SecretFolder` literal must carry the organization's RRN
+  prefix, with a valid path after it;
+- a `Role` must be one of its vault roles;
+- a `Group` must be one of its roomler roles;
+- a `User` must be one of its members;
+- a `Session` is never named: sessions come and go, and a policy for one would
+  outlive it.
+
+> [!IMPORTANT]
+> - **Default deny; a `forbid` beats every `permit`.**
+> - **A set that does not build is a deny, never an allow.** A stored policy
+>   that no longer parses fails the whole set, rather than being skipped: the
+>   one skipped could be a `forbid`.
+> - **A role a live policy names cannot be deleted.** A role re-created under
+>   the old name would inherit every policy that still named it. Whether a
+>   policy names a role is read from the parsed policy, so no spacing or escape
+>   in the text hides it.
+
+**`simulate`** decides a request as the vault would and answers which policies
+decided it: the permits that allowed it, the forbid or guardrail that denied
+it, or nothing (the default deny). With `with` (policies as if added, each
+checked as a write) and `without` (stored policies as if deleted, never a
+guardrail), it answers for a change before it is made. It decides nothing for
+real and records nothing. Replaying a change against the last 7 days of
+recorded decisions waits for P3-2b, the first step that records a Cedar
+decision.
+
+## 8. Audit
 
 `vault_audit` holds every `secret:*` and `vault:verify` decision, allow and
 deny. Each row has the principal (`user` in P3-1), the action as a policy
@@ -210,19 +297,21 @@ one. Rows expire after 90 days, like the other audits.
   that may be compromised. From P3-3 it goes to `vault_activity`, never here,
   as `ssh_audit` and `ssh_activity` are kept apart.
 
-## 8. Collections
+## 9. Collections
 
 | Collection | One row per | Indexes | Retention |
 |---|---|---|---|
 | `vault_secrets` | secret | unique `(tenant_id, path)` over live rows (partial on `deleted_at: {$type: "null"}`, so a live row stores an explicit `null`); `(tenant_id, deleted_at, path)` | tombstoned, kept |
 | `vault_versions` | value written | unique `(secret_id, field, n)`; `(tenant_id, kek)` | the last 10 per field; all go with their secret |
 | `vault_audit` | decision | `(tenant_id, at desc)`, `(secret_id, at)` | 90 days (TTL on `at`) |
+| `vault_roles` | vault role (P3-2a) | unique `(tenant_id, name)` over live rows | tombstoned, kept |
+| `vault_policies` | policy (P3-2a): one Cedar statement, its effect, a revision | unique `(tenant_id, name)` over live rows; `(tenant_id, deleted_at, created_at)` | tombstoned, kept |
 
-## 9. What comes next
+## 10. What comes next
 
 | Step | Builds |
 |---|---|
-| P3-2 | Cedar: roles, policies checked against a schema on write, the seeded guardrails (no materializing mode on Windows; prod values never materialize), `role:assume` at a session's start, `simulate` |
+| P3-2b | `role:assume` at a session's start, decided again whenever a session moves to another device; Cedar decisions recorded with their request, so `simulate` can replay a change against the last 7 days |
 | P3-3 | the device's own X25519 vault key, leases (requested, revoked by a push and by TTL, bound to the fence), a value sealed to the device and held in daemon memory, `vault_activity` |
 | P3-4 | the toolbelt's vault tools and the approval card a policy can ask for |
 | P3-5 to P3-9 | `proxy` mode, `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |

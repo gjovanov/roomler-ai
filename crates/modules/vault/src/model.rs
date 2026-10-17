@@ -139,10 +139,11 @@ pub struct VaultAuditEvent {
     pub principal: String,
     pub user_id: ObjectId,
     /// The action as a policy names it: `secret:list` | `secret:write` |
-    /// `secret:delete` | `vault:verify`.
+    /// `secret:delete` | `vault:verify`; P3-2 adds `policy:write`.
     pub action: String,
     /// What exactly: `list` | `describe` | `create` | `update` | `value` |
-    /// `delete` | `verify`.
+    /// `delete` | `verify`; P3-2 adds `role_create` | `role_delete` |
+    /// `policy_create` | `policy_update` | `policy_delete`.
     pub op: String,
     /// `allow` | `deny`.
     pub decision: String,
@@ -159,11 +160,68 @@ pub struct VaultAuditEvent {
     /// For `value`, the version the write was given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n: Option<i64>,
+    /// P3-2 — the role (`role:<name>`) or policy (`policy:<id>`) a
+    /// `policy:write` was about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     pub at: DateTime,
 }
 
 impl VaultAuditEvent {
     pub const COLLECTION: &'static str = "vault_audit";
+}
+
+/// P3-2 — a vault role (`vault_roles`): a name an agent session assumes at
+/// its start, which policies then permit things to. Unique among the
+/// organization's live roles; tombstoned, never deleted, and never while a
+/// live policy names it — a role re-created under an old name would inherit
+/// every policy that still named it.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VaultRole {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    /// One spelling: [`crate::rrn::check_tag`]'s rule. The Cedar entity is
+    /// `Roomler::Role::"<name>"`.
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub created_by: ObjectId,
+    pub created_at: DateTime,
+    pub deleted_at: Option<DateTime>,
+}
+
+impl VaultRole {
+    pub const COLLECTION: &'static str = "vault_roles";
+}
+
+/// P3-2 — a policy the organization wrote (`vault_policies`): ONE Cedar
+/// statement, valid against the vault's schema and naming only its
+/// organization when it was stored ([`crate::policy::check_policy`]).
+/// The guardrails are not rows: they are code, in every set.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VaultPolicy {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    /// For people; unique among the organization's live policies.
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub text: String,
+    /// `permit` | `forbid`, read from the text when it was stored.
+    pub effect: String,
+    /// Bumped by every write: a write names the revision it read.
+    pub rev: i64,
+    pub created_by: ObjectId,
+    pub updated_by: ObjectId,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    pub deleted_at: Option<DateTime>,
+}
+
+impl VaultPolicy {
+    pub const COLLECTION: &'static str = "vault_policies";
 }
 
 #[cfg(test)]

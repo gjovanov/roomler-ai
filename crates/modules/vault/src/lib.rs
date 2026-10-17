@@ -25,7 +25,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::FromRef,
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use roomler_ai_config::Settings;
 use roomler_ai_db::indexes::{IndexSet, index, index_ttl, index_unique, index_unique_partial};
@@ -34,6 +34,8 @@ use roomler_core::{Capabilities, Core, Module, TenantCtx};
 pub mod crypto;
 pub mod dao;
 pub mod model;
+pub mod policy;
+pub mod policy_routes;
 pub mod routes;
 pub mod rrn;
 pub mod scope;
@@ -45,6 +47,9 @@ pub struct VaultState {
     pub secrets: Arc<dao::VaultSecretDao>,
     pub versions: Arc<dao::VaultVersionDao>,
     pub audit: Arc<dao::VaultAuditDao>,
+    /// P3-2 — the roles sessions assume, and the policies over them.
+    pub roles: Arc<dao::VaultRoleDao>,
+    pub policies: Arc<dao::VaultPolicyDao>,
     /// The organizations the vault serves (`vault.tenants`).
     pub scope: Arc<scope::TenantScope>,
     /// The KEK, or why there is none: read once at boot.
@@ -85,6 +90,8 @@ impl Module for VaultState {
             secrets: Arc::new(dao::VaultSecretDao::new(db)),
             versions: Arc::new(dao::VaultVersionDao::new(db)),
             audit: Arc::new(dao::VaultAuditDao::new(db)),
+            roles: Arc::new(dao::VaultRoleDao::new(db)),
+            policies: Arc::new(dao::VaultPolicyDao::new(db)),
             scope: Arc::new(scope),
             kek,
             core,
@@ -110,11 +117,39 @@ impl Module for VaultState {
                     .delete(routes::delete),
             )
             .route("/{secret_id}/value", put(routes::put_value));
+        // P3-2 — roles, policies, and what a request would be decided.
+        let role = Router::new()
+            .route(
+                "/",
+                get(policy_routes::list_roles).post(policy_routes::create_role),
+            )
+            .route("/{name}", delete(policy_routes::delete_role));
+        let policy = Router::new()
+            .route(
+                "/",
+                get(policy_routes::list_policies).post(policy_routes::create_policy),
+            )
+            .route(
+                "/{policy_id}",
+                get(policy_routes::get_policy)
+                    .put(policy_routes::replace_policy)
+                    .delete(policy_routes::delete_policy),
+            );
         Router::new()
             .route("/tenant/{tenant_id}/vault", get(routes::status))
             .route("/tenant/{tenant_id}/vault/verify", post(routes::verify))
             .route("/tenant/{tenant_id}/vault/audit", get(routes::audit))
+            .route(
+                "/tenant/{tenant_id}/vault/schema",
+                get(policy_routes::schema),
+            )
+            .route(
+                "/tenant/{tenant_id}/vault/simulate",
+                post(policy_routes::simulate),
+            )
             .nest("/tenant/{tenant_id}/vault/secret", secret)
+            .nest("/tenant/{tenant_id}/vault/role", role)
+            .nest("/tenant/{tenant_id}/vault/policy", policy)
             .with_state(self.clone())
     }
 
@@ -156,6 +191,28 @@ impl Module for VaultState {
                     index(bson::doc! { "tenant_id": 1, "at": -1 }),
                     index(bson::doc! { "secret_id": 1, "at": 1 }),
                     index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+                ],
+            },
+            // P3-2 — one live role, and one live policy, per name in an
+            // organization; a tombstone frees its name.
+            IndexSet {
+                collection: model::VaultRole::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![index_unique_partial(
+                    bson::doc! { "tenant_id": 1, "name": 1 },
+                    bson::doc! { "deleted_at": { "$type": "null" } },
+                )],
+            },
+            IndexSet {
+                collection: model::VaultPolicy::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index_unique_partial(
+                        bson::doc! { "tenant_id": 1, "name": 1 },
+                        bson::doc! { "deleted_at": { "$type": "null" } },
+                    ),
+                    // The organization's set, oldest first.
+                    index(bson::doc! { "tenant_id": 1, "deleted_at": 1, "created_at": 1 }),
                 ],
             },
         ]

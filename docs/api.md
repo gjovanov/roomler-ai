@@ -430,6 +430,12 @@ is written before it is acted on. Full treatment: [vault.md](vault.md).
 | PUT | `…/vault/secret/{id}/value` | `{field?, value, expires_at?}` — the field's next version, sealed: `{field, n, created_at, expires_at}`. **503** without a usable KEK |
 | POST | `…/vault/verify` | Open every version (up to 10,000): `{versions, ok, failed, failures[{secret_id, field, n, reason: other_kek · dek_unreadable · tampered}], truncated}`. **503** without a usable KEK |
 | GET | `…/vault/audit` | The decisions, newest first (`?before=` RFC 3339, `?limit=` 1–200) |
+| GET | `…/vault/schema` | P3-2a — `{schema, actions, modes, oses, secret_prefix}`: what a policy is written against |
+| GET · POST | `…/vault/role` | P3-2a — the vault roles; `{name, description?}` declares one (**409** when a live role holds the name) |
+| DELETE | `…/vault/role/{name}` | P3-2a — tombstone a role; **409** naming the live policies that still name it |
+| GET · POST | `…/vault/policy` | P3-2a — the guardrails, then the organization's policies (`{id, name, description, text, effect, guardrail, rev, …}`); `{name, description?, text}` adds one, checked first (**400** in words) |
+| GET · PUT · DELETE | `…/vault/policy/{id}` | P3-2a — one policy; `PUT {name, description?, text, rev}` replaces it from the revision read (**409** if it moved); a `guardrail:*` id is **400** for `PUT` and `DELETE` |
+| POST | `…/vault/simulate` | P3-2a — `{action: role:assume · secret:use, principal, resource, device: {os, tags, owner_id}, mode?, audience?, ttl_s?, approver_id?, with?, without?}` → `{decision, determining[{id, name, guardrail}], errors}`. Decides nothing for real; records nothing |
 
 ### Observability
 
