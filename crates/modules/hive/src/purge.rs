@@ -75,8 +75,8 @@ use tracing::{debug, info, warn};
 use crate::HiveState;
 use crate::agent_socket::clamp_words;
 use crate::model::{
-    AgentSession, HiveAuditEvent, HivePurge, MemberState, PurgeClosed, PurgeEntry, PurgeEntryState,
-    PurgeView, PurgedMark, SessionStatus,
+    AgentSession, HiveAuditEvent, HivePurge, MemberState, MemberTip, PurgeClosed, PurgeEntry,
+    PurgeEntryState, PurgeView, PurgedMark, SessionStatus, on_chain,
 };
 use crate::placement::MemberRole;
 use crate::routes::{member_tenant, parse_oid};
@@ -1050,13 +1050,29 @@ pub(crate) async fn device_removed(
 
 /// FR-90 P2g-4b — whether `s` holds its `min` copies without `device`: its
 /// primary, while the session is live, and each member that took its copy
-/// and has said where it ends (`joined`, with a tip). A member that leaves
-/// is never one of them.
+/// and holds at least as much of the session as `device`'s copy does
+/// (`joined`, with a tip, by [`on_chain`]). A member that leaves is never one
+/// of them.
+///
+/// P2k-2 (F1) — "as much as", not "a tip": a member says `seq` 0 at its floor
+/// the moment it joins, which is how the server learns it did, so a tip alone
+/// counted a replacement that held nothing yet, and the leaving member's whole
+/// copy went before its replacement held one event (the field run,
+/// 2026-10-16). A copy stands in for the one that goes only once it holds
+/// what that one holds; the next tip looks again.
 pub(crate) fn holds_without(s: &AgentSession, device: ObjectId) -> bool {
     let Some(r) = s.replicaset.as_ref() else {
         return false;
     };
     let primary = s.location.device_id;
+    let holds = |t: &MemberTip| on_chain(&s.fences, t.fence, t.seq);
+    // What the copy that goes holds: nothing, without a tip.
+    let goes = r
+        .members
+        .iter()
+        .find(|m| m.device_id == device)
+        .and_then(|m| m.tip.as_ref())
+        .map_or(0, holds);
     let members = r
         .members
         .iter()
@@ -1065,7 +1081,7 @@ pub(crate) fn holds_without(s: &AgentSession, device: ObjectId) -> bool {
                 && m.device_id != primary
                 && m.role != MemberRole::Primary.as_str()
                 && m.state == MemberState::Joined
-                && m.tip.is_some()
+                && m.tip.as_ref().is_some_and(|t| holds(t) >= goes)
         })
         .count();
     let live = SessionStatus::LIVE.contains(&s.status) && primary != device;
@@ -1617,6 +1633,82 @@ mod tests {
         assert!(!holds_without(&s, d), "min 3: d is still needed");
         s.replicaset.as_mut().unwrap().min = 0;
         assert!(holds_without(&s, b), "min 0: always");
+    }
+
+    /// FR-90 P2k-2 (F1) — make-before-break: a copy counts toward `min` only
+    /// once it holds as much of the session as the one that goes. A member
+    /// says `seq` 0 at its floor the moment it joins, which a tip alone
+    /// counted; and a tail past where its fence ended holds nothing, on
+    /// either side.
+    #[test]
+    fn a_copy_stands_in_for_a_leaving_one_only_once_it_holds_as_much() {
+        use crate::model::{FenceMark, MemberTip};
+        let [a, b, d]: [ObjectId; 3] = std::array::from_fn(|_| ObjectId::new());
+        let at = |device, state, fence, seq| ReplicaMember {
+            tip: Some(MemberTip {
+                fence,
+                seq,
+                hash: "0".repeat(64),
+                checkpoint_seq: None,
+                checkpoint_hash: None,
+                at: DateTime::now(),
+            }),
+            ..member(device, state, None)
+        };
+        let mut s = session(a);
+        s.replicaset = Some(Replicaset {
+            policy_revision: 1,
+            min: 2,
+            max: 3,
+            restricted_tags: Vec::new(),
+            members: vec![
+                ReplicaMember {
+                    role: MemberRole::Primary.as_str().into(),
+                    ..at(a, MemberState::Joined, 3, 20)
+                },
+                at(b, MemberState::Joined, 3, 0),
+                at(d, MemberState::Leaving, 3, 20),
+            ],
+            short: None,
+            placed_at: DateTime::now(),
+        });
+        let set = |s: &mut AgentSession, i: usize, fence: i64, seq: i64| {
+            let t = s.replicaset.as_mut().unwrap().members[i]
+                .tip
+                .as_mut()
+                .unwrap();
+            (t.fence, t.seq) = (fence, seq);
+        };
+        assert!(
+            !holds_without(&s, d),
+            "a replacement that just joined holds nothing yet"
+        );
+        set(&mut s, 1, 3, 19);
+        assert!(!holds_without(&s, d), "one event short is still short");
+        set(&mut s, 1, 3, 20);
+        assert!(
+            holds_without(&s, d),
+            "as much as the one that goes: it may go"
+        );
+
+        // Fence 2 ended at seq 15.
+        s.fences = vec![FenceMark {
+            fence: 2,
+            seq: 15,
+            hash: "1".repeat(64),
+        }];
+        set(&mut s, 2, 2, 18);
+        set(&mut s, 1, 3, 15);
+        assert!(
+            holds_without(&s, d),
+            "the leaving copy's tail past its fence's end holds nothing"
+        );
+        set(&mut s, 2, 3, 17);
+        set(&mut s, 1, 2, 18);
+        assert!(
+            !holds_without(&s, d),
+            "nor does a member's own tail past its fence's end"
+        );
     }
 
     /// FR-90 P2g-4b — a fork made from a leaving member's copy needs that
