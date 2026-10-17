@@ -572,6 +572,78 @@ flowchart LR
   42–77 ms per apply. `encoder-smoke --reconfigure-sweep --name <encoder>` is
   the read for any host.
 
+## Software encoders: the clock and 60 fps (FR-112)
+
+A host with no hardware encoder (an Asahi Mac, a Linux box without VAAPI) encodes in software: libvpx for VP9
+4:4:4 on the DataChannel, OpenH264 on the RTP track. Until FR-112 both were pinned at 30 fps, and on Apple
+Silicon even 30 was out of reach. The constant was not the limit. **The scheduler was**: Linux's energy-aware
+scheduling gives a thread that works a third of every frame period a low clock on an efficiency core, until its
+work fills the period.
+
+| Live, the Asahi M2 Pro (2048×1080) | 0.4.141 | with the clock (P1) | + the tier (P2) |
+|---|---|---|---|
+| OpenH264 encode, 30 fps target | 16.1 ms | **5.2 ms** | — |
+| VP9-444 over the DataChannel | 27 fps, 3.5 cores | — | **56.3 fps**, 1.6 cores |
+| H.264 over RTP | 28.7 fps | — | **56.2 fps** |
+| a still screen, VP9-444 | 44 % of a core | 13 % | 13 % |
+
+The same OpenH264 frame costs 6 ms back to back and 16–20 ms at a 30 fps cadence, even pinned to the
+performance cores: per-frame time tracks the idle gap. A clocked-down core is slow, not idle, so the clock also
+**lowers** the CPU time a session costs.
+
+```mermaid
+flowchart LR
+    S["session opens<br/>(software encoder, Linux)"] --> T["target 60"]
+    T --> E["encode timed per frame<br/>(heartbeat window)"]
+    E --> P{"SoftwarePace:<br/>sustains ≥ 55?"}
+    P -->|yes| R60["run at 60"]
+    P -->|no| RP["paced to what it sustains<br/>(5-fps steps, never below 30)"]
+    R60 & RP --> B["bitrate base ×√(fps/30)<br/>OpenH264: frame rate + 2 s keyframe period"]
+    B --> E
+    C["encode/clock.rs:<br/>uclamp_min 1024 on the encoding<br/>and capture threads"] -. the clock .-> E
+```
+
+- **The encoder asks for its clock** (P1, `encode/clock.rs:58`). On Linux the encoder thread, OpenH264's worker
+  and the DRM capture worker each set their own utilisation clamp (`sched_setattr`, `SCHED_FLAG_UTIL_CLAMP_MIN`,
+  `uclamp_min` 1024, `encode/clock.rs:36`), keeping their policy and priority. A clamp counts only while the
+  thread is runnable, and threads it starts afterwards inherit it: libvpx's workers, and Mesa's shader-cache
+  thread from the capture worker's EGL. Kill switch: `ROOMLERD_ENCODER_CLOCK=0`.
+  - ⚠️ **Not the async runtime.** Clamping every daemon thread was measured and added nothing (56.3 fps either
+    way), and a clamped runtime would clock up every timer the daemon wakes for, with no session open.
+  - Elsewhere it is a no-op. macOS (a QoS class) and Windows (power throttling) are P3, each to be measured on
+    its own hardware first.
+- **Software paths target 60, paced to what they sustain** (P2). `SoftwarePace` (`encode/encode_pressure.rs:217`)
+  runs FR-1's `FpsPace` over its own encode EWMA. It is its own EWMA so that `ROOMLERD_ENCODE_PRESSURE=0`, the
+  hardware path's switch, cannot turn the software pace off as a side effect. The pace is never below 30
+  (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:731`), so a host that cannot sustain 30 runs exactly as it did before.
+  The RTP pump starts at 60 under the tier (`target_fps_with_tier`, `peer.rs:123`). The auto-fps-cap that drops
+  a software encoder to 30 applies only where the tier is off: Windows and macOS by default, where the WGC
+  readback it was written for lives.
+  - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:724`). On a host whose clock was
+    never the limit, 60 frames cost twice the CPU of 30, and an attended desktop pays for it, so Windows and
+    macOS opt in with `ROOMLERD_SW_FPS_60=1` until P3. `ROOMLERD_SW_FPS_60=0` gives back 30 everywhere.
+- **The bitrate base follows the rate the pump runs at**, by √(fps/30) (`bitrate_base_for_fps`,
+  `encode/mod.rs:709`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
+  measured.
+
+### OpenH264's runtime settings (FR-112 P2b)
+
+Three facts about OpenH264 that the RTP pump now respects, the first two older than FR-112 and true of every
+release before it:
+
+| Fact | What went wrong | Now |
+|---|---|---|
+| The `openh264` crate creates the C encoder's state at the **first encode**, and `SetOption` before that answers `cmInitExpected` (4) | every session's first `set_bitrate` (the quality-derived target) was refused, recorded as applied, and never retried | early settings wait for the first frame (`Settings`, `encode/openh264_backend.rs:311`) |
+| The crate sets layer 0's **max** bitrate to the construction bitrate, and OpenH264 refuses a target above the max (`cmInitParaError`) | no runtime raise past the construction figure ever took: not Quality=High, not REMB recovering | the max moves with the target: raised first, lowered after (`apply_runtime_bitrate`, `:216`) |
+| OpenH264 budgets each frame's bits from its **frame rate**, and its keyframe period is counted in frames | at 60 fps a 30 fps budget per frame, and the 60-frame period put a keyframe every second | `set_frame_rate` hands it the rate the pump runs at, and the period follows to keep 2 s (`IDR_EVERY_S`, `:59`) |
+
+The keyframe period was caught by CI: `tests/l4_latency.rs`'s replay cell assumes nothing but a replayed PLI cuts
+a keyframe inside its answer window, and a keyframe a second did.
+
+⚠️ **One slice stays.** Size-limited slices with threads measured 1.7× faster on an x86-64 laptop and **2.2×
+slower** on the Asahi host, where openh264-sys2 builds no assembly either (it ships NASM for x86 only). Measure on
+the host before changing it (FR-112 §2).
+
 ## Building the FFmpeg backend locally on Windows (FR-77 P0)
 
 The `ffmpeg-encoder` feature links the **vendored** FFmpeg (static-md, LGPL,

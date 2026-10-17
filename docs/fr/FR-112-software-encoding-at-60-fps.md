@@ -185,6 +185,10 @@ flowchart LR
   the first frame is through. And the crate sets layer 0's max bitrate to the construction bitrate, and OpenH264
   refuses a target above the max (`cmInitParaError`), so no runtime raise past it ever took: not Quality=High, not
   REMB recovering, not the 60 fps base. `apply_runtime_bitrate` now moves the max with the target.
+- **The keyframe period keeps its seconds.** OpenH264 counts its IDR period in frames, and the live encoder's was
+  60: two seconds at 30 fps, one at 60. A frame-rate change now carries the period with it
+  (`ENCODER_OPTION_IDR_INTERVAL` = fps × 2 s, `IDR_EVERY_S`); the recording profile keeps its own GOP. CI caught
+  it: `tests/l4_latency.rs`'s replay cell read the periodic keyframe at +1 s as an obeyed replay (4 of 5).
 - **The ≤ 1280-px cap is not the limit it looks like.** The cap that shrinks software H.264 "so encode stays under
   the 33 ms 30-fps budget" fires on the host, and 230 ms later the viewer's default resolution (`original`,
   `ui/src/composables/useRemoteControl.ts:4748`) overrides it: the field already encodes 2048×1080, and with its
@@ -203,7 +207,7 @@ flowchart LR
 | **P2b** | the H.264 RTP pump's tier: target 60 on Linux, the same pace (`SoftwarePace`, shared with P2a) and ceiling, OpenH264's frame rate following the rate it runs at, its runtime settings held until its first frame and its max bitrate moving with the target, the auto-fps-cap left to Windows | `ROOMLERD_SW_FPS_60=0` | 🟡 a candidate on the Asahi host (§9); the max-bitrate fix and the release check owed | M |
 | ~~**P2c**~~ | ~~software H.264's ≤ 1280-px cap decided by the measured encode~~ — dropped: the viewer's default `original` already overrides the cap (§3), and the host encodes 2048×1080 in 5.5 ms | — | — | — |
 | **P3** | the clock elsewhere: macOS (the encoder threads' QoS class) and Windows (no power throttling for the encode thread), each measured on its own hardware first | per OS | ⏳ | S |
-| **P4** | docs: `docs/rate-control.md` (the software tier, the ceiling), `docs/encoders.md` (the clock, why one slice), the `docs/README.md` index row | — | ⏳ | S |
+| **P4** | docs: `docs/rate-control.md` (the software tier, the ceiling), `docs/encoders.md` (the clock, why one slice), the `docs/README.md` index row | — | ✅ `encoders.md` § Software encoders (the clock, the tier, OpenH264's settings), `rate-control.md` § Software encoders and two config rows, both index rows | S |
 
 ## 5. Test plan
 
@@ -230,8 +234,11 @@ flowchart LR
 - [ ] **AC5** — Quality under motion: the 60 fps session's average QP within 6 of the 30 fps session's on the same
   content, and a still screen refines to the same QP as 0.4.141.
 - [ ] **AC6** — Every kill switch restores 0.4.141's behaviour (30 fps, no clamp).
-- [ ] **AC7** — Docs: `docs/rate-control.md` and `docs/encoders.md` in the house style, and a `docs/README.md`
+- [x] **AC7** — Docs: `docs/rate-control.md` and `docs/encoders.md` in the house style, and a `docs/README.md`
   index row.
+  ✅ `encoders.md` § *Software encoders: the clock and 60 fps* (a mermaid flow, the field table, `file:line`
+  anchors, OpenH264's three facts), `rate-control.md` § *Software encoders at 60 fps* and the two config rows,
+  and both `docs/README.md` rows.
 - [ ] **AC8** — The clock: on the Asahi host at a 30 fps target, the H.264 encode costs **≤ 8 ms** (16.1 on
   0.4.141), the encoding and capture threads (and the threads they start) carry the clamp and no other thread
   does, and a per-user install gets it too or says why not.
