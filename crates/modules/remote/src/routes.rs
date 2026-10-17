@@ -188,7 +188,7 @@ struct Refusal {
     error: &'static str,
 }
 
-fn refuse(status: StatusCode, error: &'static str) -> Response {
+pub(crate) fn refuse(status: StatusCode, error: &'static str) -> Response {
     (status, Json(Refusal { error })).into_response()
 }
 

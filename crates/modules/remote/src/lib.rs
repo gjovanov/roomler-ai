@@ -28,16 +28,19 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::{DefaultBodyLimit, FromRef},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use roomler_ai_config::Settings;
 use roomler_ai_db::indexes::{IndexSet, index, index_ttl, index_unique};
 use roomler_ai_mod_fleet::FleetState;
-use roomler_ai_remote_control::models::{SessionFeedback, SessionFeedbackRequest};
+use roomler_ai_remote_control::models::{
+    SessionFeedback, SessionFeedbackRequest, TouchPreset, TouchPresetRequest,
+};
 use roomler_ai_services::dao::{
     privacy_activity::PrivacyActivityDao, recording_activity::RecordingActivityDao,
     remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao,
-    session_feedback::SessionFeedbackDao, transfer_activity::TransferActivityDao,
+    session_feedback::SessionFeedbackDao, touch_preset::TouchPresetDao,
+    transfer_activity::TransferActivityDao,
 };
 use roomler_core::{
     AgentSocketHooks, Capabilities, Core, Module, TenantCtx, rate_limit::RateLimiter,
@@ -48,6 +51,7 @@ pub mod controller;
 pub mod relay;
 pub mod routes;
 pub mod session_policy;
+pub mod touch_presets;
 
 /// The module's state: the core, the fleet module it is built on, and what
 /// remote owns.
@@ -72,6 +76,9 @@ pub struct RemoteState {
     /// FR-102 P9b — the ratings people give a session from the viewer: a
     /// thumb and reason codes, one per session, never text.
     pub session_feedback: Arc<SessionFeedbackDao>,
+    /// FR-111 P4a — the org's on-screen control presets, which every
+    /// member's viewer offers beside the built-ins.
+    pub touch_presets: Arc<TouchPresetDao>,
     /// FR-101 P4a — the per-(caller, device) ceiling on session requests,
     /// checked after the authz gate (`controller::SESSION_REQUESTS_PER_MINUTE`).
     pub session_request_limiter: Arc<RateLimiter>,
@@ -113,6 +120,7 @@ impl Module for RemoteState {
             transfer_activity: Arc::new(TransferActivityDao::new(db)),
             privacy_activity: Arc::new(PrivacyActivityDao::new(db)),
             session_feedback: Arc::new(SessionFeedbackDao::new(db)),
+            touch_presets: Arc::new(TouchPresetDao::new(db)),
             session_request_limiter: Arc::new(RateLimiter::new()),
             rc_proxy_controllers: Arc::new(relay::ProxyControllers::new()),
             remote_rc_conns: Arc::new(relay::RemoteRcConns::new()),
@@ -191,16 +199,32 @@ impl Module for RemoteState {
                 "/tenant/{tenant_id}/rc-session-limits",
                 get(session_policy::get_limits).put(session_policy::set_limits),
             )
+            // FR-111 P4a — the org's on-screen control presets: GET for any
+            // member, writes with MANAGE_TENANT, a preset resolved within the
+            // tenant, the body read strictly and capped.
+            .route(
+                "/tenant/{tenant_id}/touch-preset",
+                get(touch_presets::list)
+                    .post(touch_presets::create)
+                    .layer(DefaultBodyLimit::max(TouchPresetRequest::MAX_BODY_BYTES)),
+            )
+            .route(
+                "/tenant/{tenant_id}/touch-preset/{preset_id}",
+                put(touch_presets::update)
+                    .delete(touch_presets::delete)
+                    .layer(DefaultBodyLimit::max(TouchPresetRequest::MAX_BODY_BYTES)),
+            )
             .nest("/turn", turn)
             .nest("/relay", relay)
             .with_state(self.clone())
     }
 
-    /// The five collections this module owns. The first two are the specs
-    /// the db crate's plan held before P6, unchanged — `remote_sessions` has
-    /// two sets there (the session indexes, then the Wave-3 per-tenant usage
+    /// The collections this module owns. The first two are the specs the db
+    /// crate's plan held before P6, unchanged — `remote_sessions` has two
+    /// sets there (the session indexes, then the Wave-3 per-tenant usage
     /// read), in that order. `recording_activity` is FR-85 P3's,
-    /// `transfer_activity` FR-101 P3's, `privacy_activity` FR-99 P1d's.
+    /// `transfer_activity` FR-101 P3's, `privacy_activity` FR-99 P1d's,
+    /// `session_feedback` FR-102 P9b's, `touch_presets` FR-111 P4a's.
     fn indexes(&self) -> Vec<IndexSet> {
         vec![
             IndexSet {
@@ -285,6 +309,15 @@ impl Module for RemoteState {
                     index(bson::doc! { "session_id": 1, "at": 1 }),
                     index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
                 ],
+            },
+            // FR-111 P4a — the org's on-screen control presets: a name is
+            // unique per org (the index arbitrates two admins saving one name
+            // at once), and the listing reads by tenant in name order, which
+            // this index serves too.
+            IndexSet {
+                collection: TouchPreset::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![index_unique(bson::doc! { "tenant_id": 1, "name": 1 })],
             },
         ]
     }
