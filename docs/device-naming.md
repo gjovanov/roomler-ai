@@ -24,7 +24,7 @@ someone has named a device, the machine-reported name is usually noise.
 | Surface | Where the checkbox is | What it hides |
 |---|---|---|
 | Devices grid (`/tenant/{tid}/device`) | the column picker (`AgentsSection.vue:1066`) | the fleet name in the Name cell's caption line (`:340`) |
-| Remote control (`/tenant/{tid}/agent/{id}/remote`) | Settings › Display (`RemoteControl.vue:1316`) | the fleet name in the header subtitle, before OS · version (`:36`) |
+| Remote control (`/tenant/{tid}/agent/{id}/remote`) | Settings › Display (`RemoteControl.vue:1363`) | the fleet name in the header subtitle, before OS · version (`:36`) |
 
 Both surfaces use the same composable (`ui/src/composables/useHideDeviceName.ts:48`),
 so a flip on one shows on the other at once, including a surface open in

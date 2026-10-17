@@ -94,18 +94,18 @@ them. The presses above exist because each backend's match is exhaustive and mus
 ## The viewer
 
 - **The control** is a toolbar button, shown only for an agent that advertises `mouse-rel`
-  ([`RemoteControl.vue:3052`](../ui/src/views/remote/RemoteControl.vue#L3052) `relativeMouseOffered`).
+  ([`RemoteControl.vue:3101`](../ui/src/views/remote/RemoteControl.vue#L3101) `relativeMouseOffered`).
   Pointer Lock needs a user gesture, and the click is one.
 - **Entering** asks for raw, unaccelerated deltas (`unadjustedMovement`). A browser that rejects the option
-  gets plain Pointer Lock ([`useRemoteControl.ts:5951`](../ui/src/composables/useRemoteControl.ts#L5951)
+  gets plain Pointer Lock ([`useRemoteControl.ts:5966`](../ui/src/composables/useRemoteControl.ts#L5966)
   `enterRelativeMouse`).
 - **While locked**, every pointer move is a delta into the accumulator
-  ([`useRemoteControl.ts:10114`](../ui/src/composables/useRemoteControl.ts#L10114)), and a hint at the
+  ([`useRemoteControl.ts:10129`](../ui/src/composables/useRemoteControl.ts#L10129)), and a hint at the
   bottom of the picture says how to get the pointer back.
 - **Leaving** is Esc, the browser's own rule. Under Keyboard Lock in fullscreen, Esc reaches the host, so
   the browser wants it held, and the hint says so. Leaving sends the motion still gathered and lets go of
   any held button where the pointer is, before moves turn absolute again
-  ([`useRemoteControl.ts:10921`](../ui/src/composables/useRemoteControl.ts#L10921)). An absolute button-up
+  ([`useRemoteControl.ts:11000`](../ui/src/composables/useRemoteControl.ts#L11000)). An absolute button-up
   there would throw the host's cursor to an old position.
 - A blur or a hidden tab releases held buttons with `mouse_release` in relative mode, never with a
   position.

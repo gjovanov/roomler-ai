@@ -333,6 +333,41 @@
       >
         <v-icon>{{ rc.touchMode.value === 'trackpad' ? 'mdi-gesture-swipe' : 'mdi-gesture-tap' }}</v-icon>
       </v-btn>
+      <!-- FR-111 P3 — on-screen controls over the stage: off, or a built-in
+           preset. Chosen per device and remembered in this browser. -->
+      <v-menu v-if="rc.phase.value === 'connected' && touchModeOffered" location="bottom">
+        <template #activator="{ props: menuProps }">
+          <v-btn
+            v-bind="menuProps"
+            icon
+            variant="text"
+            size="small"
+            class="mr-1"
+            :color="touchControlsPreset ? 'primary' : undefined"
+            :aria-label="touchControlsPreset ? `On-screen controls: ${touchControlsPreset.name}` : 'On-screen controls: off'"
+            :title="touchControlsPreset ? `On-screen controls: ${touchControlsPreset.name}` : 'On-screen controls'"
+            data-testid="rc-touch-controls-menu"
+          >
+            <v-icon>mdi-gamepad-variant-outline</v-icon>
+          </v-btn>
+        </template>
+        <v-list density="compact">
+          <v-list-item
+            :active="!touchControlsPreset"
+            title="Off"
+            data-testid="rc-touch-controls-off"
+            @click="setTouchControls(null)"
+          />
+          <v-list-item
+            v-for="p in BUILTIN_PRESETS"
+            :key="p.id"
+            :active="touchControlsPreset?.id === p.id"
+            :title="p.name"
+            :data-testid="`rc-touch-controls-${p.id}`"
+            @click="setTouchControls(p.id)"
+          />
+        </v-list>
+      </v-menu>
       <!-- rc.199 — clipboard send / get: frequent connected-session
            actions, kept on the toolbar (not the Settings panel) at
            every viewport. Relocated here from the retired Row 2. -->
@@ -1012,6 +1047,7 @@
         :class="[`scale-${rc.scaleMode.value}`, { 'drag-over': isDragOver }]"
         :style="{ cursor: remoteCursorCss ?? 'none', touchAction: stageTouchActionCss }"
         tabindex="0"
+        @scroll.passive="onStageScroll"
         @pointermove="onStagePointerMove"
         @pointerleave="cursorVisible = false"
         @pointerenter="cursorVisible = true"
@@ -1179,6 +1215,17 @@
           <div class="cursor-arrow" />
           <div class="cursor-chip ghost-chip">{{ g.name }}</div>
         </div>
+        <!-- FR-111 P3 — the on-screen controls. Inside the stage, which is
+             the fullscreen element, so they stay in fullscreen. A touch on a
+             control stays with it; a touch anywhere else reaches the stage. -->
+        <TouchControls
+          v-if="touchControlsPreset"
+          :preset="touchControlsPreset"
+          :sink="rc.touchControlsSink"
+          :scroll-x="stageScroll.x"
+          :scroll-y="stageScroll.y"
+          :ctrl-is-cmd="rc.hostIsMac.value && rc.ctrlAsCmd.value"
+        />
         <!-- Keyboard-lock affordances. Plain divs INSIDE the fullscreen
              element (.video-frame) — Vuetify snackbars teleport to
              <body>, which is invisible in fullscreen. pointer-events:
@@ -2101,10 +2148,12 @@ import { featureRefusal, summarizeRefusals } from '@/composables/useSessionFeatu
 import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
 import KeepBusyMenu from '@/components/remote/KeepBusyMenu.vue'
+import TouchControls from '@/components/remote/TouchControls.vue'
 import type { KeepBusyPattern } from '@/composables/keepBusy'
 import { displayMatchSummary } from '@/composables/displayMatch'
 import { agentSupportsRelativeMouse, relativeMouseSwitchedOff } from '@/composables/relativeMouse'
 import { stageTouchAction } from '@/composables/touchInput'
+import { BUILTIN_PRESETS, CONTROLS_STORAGE_PREFIX, presetById, readControlsPreset } from '@/composables/touchControls'
 import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 import { asSentence } from '@/utils/sentence'
 import { useCapabilitiesStore } from '@/stores/capabilities'
@@ -3086,6 +3135,42 @@ const touchModeOffered = (() => {
     return false
   }
 })()
+/** FR-111 P3 — the on-screen controls: off, or a built-in preset, chosen per
+ *  device and remembered in this browser. Offered where the touch mode is. */
+const touchControlsId = ref<string | null>(null)
+watch(agentId, (id) => {
+  let storage: Storage | null = null
+  try {
+    storage = globalThis.localStorage
+  } catch {
+    /* blocked site data: off */
+  }
+  touchControlsId.value = id ? readControlsPreset(storage, id) : null
+}, { immediate: true })
+const touchControlsPreset = computed(() => (touchModeOffered ? presetById(touchControlsId.value) : null))
+function setTouchControls(id: string | null) {
+  touchControlsId.value = presetById(id)?.id ?? null
+  try {
+    globalThis.localStorage.setItem(CONTROLS_STORAGE_PREFIX + agentId.value, touchControlsId.value ?? 'off')
+  } catch {
+    /* blocked site data: this tab only */
+  }
+}
+/** The stage's scroll offsets, so the overlay stays over the part of the
+ *  stage on screen when a zoomed picture scrolls. */
+const stageScroll = ref({ x: 0, y: 0 })
+function onStageScroll(ev: Event) {
+  const el = ev.currentTarget as HTMLElement
+  stageScroll.value = { x: el.scrollLeft, y: el.scrollTop }
+}
+// No scroll event fires when a reconnect mounts a fresh stage or a zoom mode
+// that does not scroll takes over, so read the offsets again then.
+watch([stageEl, () => rc.scaleMode.value], () => {
+  void nextTick(() => {
+    const el = stageEl.value
+    stageScroll.value = { x: el?.scrollLeft ?? 0, y: el?.scrollTop ?? 0 }
+  })
+})
 /** FR-111 — a pinch zooms the viewer's own picture (nothing reaches the host),
  *  around the point between the fingers, so what they were over stays under
  *  them. It switches to Custom zoom, starting from the size the picture is
