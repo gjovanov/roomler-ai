@@ -6,7 +6,7 @@
 > | Phase | What | State |
 > |---|---|---|
 > | P1 | the wire, the gate, Windows hosts (the user worker and SystemContext), the viewer's control | shipped in 0.4.140, where a Windows relative move went out ABSOLUTE (enigo's default, below). **0.4.141 carries the fix (#2352)**, field-verified on its released bytes on both Windows paths |
-> | P2 | Linux (XTest, a relative uinput device, the portal) and macOS | X11 through enigo's XTest (P2a) and a relative uinput pointer for system installs (P2b): built, field-green on candidates; the portal and macOS not built |
+> | P2 | Linux (XTest, a relative uinput device, the portal) and macOS | X11 through enigo's XTest (P2a) and a relative uinput pointer for system installs (P2b): merged, field-green on candidates. Per-user Wayland through the RemoteDesktop session, the portal's or mutter's (P2c): built, field-green on a candidate. macOS not built |
 > | P3 | switching on by itself when the host hides its cursor | not built |
 
 ## Why it exists
@@ -48,8 +48,8 @@ sequenceDiagram
 
 | Frame | Fields | Meaning |
 |---|---|---|
-| `mouse_rel` | `dx`, `dy`: whole counts | move by this much from wherever the pointer is ([`mod.rs:313`](../agents/roomlerd/src/input/mod.rs#L313)) |
-| `mouse_press` | `btn` | press **where the pointer is** ([`mod.rs:321`](../agents/roomlerd/src/input/mod.rs#L321)) |
+| `mouse_rel` | `dx`, `dy`: whole counts | move by this much from wherever the pointer is ([`mod.rs:324`](../agents/roomlerd/src/input/mod.rs#L324)) |
+| `mouse_press` | `btn` | press **where the pointer is** ([`mod.rs:332`](../agents/roomlerd/src/input/mod.rs#L332)) |
 | `mouse_release` | `btn` | let go where the pointer is: #1945's frame, unchanged |
 
 - **Whole counts.** The viewer sums `movementX/Y` over the input gap and sends only whole counts, carrying
@@ -62,7 +62,7 @@ sequenceDiagram
   cursor. So it presses with `mouse_press` and releases with `mouse_release`, neither of which moves.
 - ⚠️ **Both frames are gated at both ends.** An older agent cannot parse them. The agent advertises
   `mouse-rel` in `AgentCaps.input` only where its injector carries relative motion
-  ([`mod.rs:172`](../agents/roomlerd/src/input/mod.rs#L172) `advertises_mouse_rel`, appended at every
+  ([`mod.rs:173`](../agents/roomlerd/src/input/mod.rs#L173) `advertises_mouse_rel`, appended at every
   announcement, [`signaling.rs:6278`](../agents/roomlerd/src/signaling.rs#L6278)). The viewer offers the
   control only to an agent that says so, matched by equality
   ([`relativeMouse.ts:17`](../ui/src/composables/relativeMouse.ts#L17) `agentSupportsRelativeMouse`).
@@ -74,7 +74,7 @@ sequenceDiagram
 | Windows, user worker | `SendInput` with `MOUSEEVENTF_MOVE` and no `ABSOLUTE` ([`enigo_backend.rs:193`](../agents/roomlerd/src/input/enigo_backend.rs#L193)) | [`enigo_backend.rs:200`](../agents/roomlerd/src/input/enigo_backend.rs#L200) |
 | Windows, SystemContext | the same `dispatch`, on its desktop-bound thread | the same |
 | Linux, system install (uinput) | ✅ **P2b**: a second, relative-only pointer beside the absolute tablet (`REL_X`/`REL_Y` plus buttons), made on the first `mouse_rel` ([`uinput_backend.rs:460`](../agents/roomlerd/src/input/uinput_backend.rs#L460) `open_rel_device`; the frame at [`uinput_backend.rs:554`](../agents/roomlerd/src/input/uinput_backend.rs#L554)). libinput adds it as a pointer on GNOME and KDE and hands relative-pointer clients its unaccelerated deltas, the counts sent | ✅ [`uinput_backend.rs:545`](../agents/roomlerd/src/input/uinput_backend.rs#L545) |
-| Linux, Wayland portal | **P2**: `NotifyPointerMotion` exists, this path does not carry it yet ([`portal/input.rs:159`](../agents/roomlerd/src/capture/portal/input.rs#L159)) | ✅ [`portal/input.rs:152`](../agents/roomlerd/src/capture/portal/input.rs#L152) |
+| Linux, per-user Wayland (the RemoteDesktop session) | ✅ **P2c**: the session's own relative call, which names no stream ([`portal/input.rs:163`](../agents/roomlerd/src/capture/portal/input.rs#L163)): the portal's `NotifyPointerMotion` ([`portal/input.rs:468`](../agents/roomlerd/src/capture/portal/input.rs#L468)), or `NotifyPointerMotionRelative` on mutter's own session, where FR-93 routes GNOME's input ([`portal/input.rs:497`](../agents/roomlerd/src/capture/portal/input.rs#L497)). Both move the pointer by exactly the counts sent | ✅ [`portal/input.rs:155`](../agents/roomlerd/src/capture/portal/input.rs#L155) |
 | Linux X11 (enigo, XTest) | ✅ **P2a**: XTest relative motion (`XTestFakeRelativeMotionEvent`, enigo's `Coordinate::Rel`, [`enigo_backend.rs:193`](../agents/roomlerd/src/input/enigo_backend.rs#L193)), which an XI2 raw reader sees 1:1 | ✅ the same `dispatch` |
 | macOS | **P2** | — |
 
@@ -91,22 +91,34 @@ the counts sent.
 
 A Linux agent advertises `mouse-rel` **only while the session a controller would open now carries it**. It
 decides when the caps are announced, which is before any session
-([`mod.rs:253`](../agents/roomlerd/src/input/mod.rs#L253) `linux_injector_carries_rel`):
+([`mod.rs:258`](../agents/roomlerd/src/input/mod.rs#L258) `linux_injector_carries_rel`):
 - **uinput**, below the compositor, carries it for any session, Wayland or X11. That is uinput opted in
   (`ROOMLERD_UINPUT=1`) with the device openable, the brief planning the DRM arm that a system install's
   automatic capture (FR-95) pairs with uinput, or such a capture already alive
-  ([`mod.rs:200`](../agents/roomlerd/src/input/mod.rs#L200) `uinput_would_inject`). A capture alive only
+  ([`mod.rs:201`](../agents/roomlerd/src/input/mod.rs#L201) `uinput_would_inject`). A capture alive only
   during a session would come too late for the hello, which is why the plan counts.
+- **A RemoteDesktop session** carries it on a Wayland desktop whose capture plans the portal or mutter arm
+  with input that reaches the desktop (the brief's `input_reach` is `full`). While that session is live the
+  arbiter hands it every event before any injector, and its own relative call moves the compositor's
+  pointer as any pointer moves.
 - **enigo** carries it on a real X11 desktop its input reaches, read from the cached desktop brief. On a
-  Wayland desktop XTest reaches only Xwayland clients, so a per-user install there waits for the portal.
+  Wayland desktop XTest reaches only Xwayland clients.
 
-The brief is at most a minute old, and the heartbeat re-announces the caps when it changes, so a login to
-Wayland takes the word back. macOS agents **do not advertise** it. The presses above exist because each
+The brief is at most a minute old, and the heartbeat re-announces the caps when it changes, so the word
+follows the session: a desktop whose input reaches only Xwayland takes it back. macOS agents **do not
+advertise** it. The presses above exist because each
 backend's match is exhaustive and must decide.
 
 ⚠️ **The relative pointer settles before its first frame**, as the tablet does, because udev and libinput
 enumerate a new device asynchronously and anything written before that reaches nobody. Frames sent while it
 is being made wait and then arrive together: the spec's §8 row 17 read all ten in one burst, none lost.
+
+⚠️ **A RemoteDesktop session's motion never passes libinput,** so `libinput debug-events` sees none of it,
+and a Linux agent reports `cursor:pos` only from DRM capture. The spec's §8 rows 20–23 read it two other
+ways. The lab's fullscreen GTK probe logged ten steps of exactly +50 for 10 × `{dx: 50}`, through mutter on
+GNOME and through the portal on KDE. The cursor embedded in the stream moved the same distance. On KDE the
+session can need the person at the screen to approve it first (Plasma's input-devices prompt, then the
+portal's dialog), and relative motion waits for that like every other event.
 
 ⚠️ **On a real Xorg an absolute move reaches a raw reader as a jump.** Xorg raises an XI2 RawMotion for an
 absolute XTest move too, but its valuators carry the pointer's **position**, not a delta. The spec's §8
@@ -152,7 +164,7 @@ person's.
 
 - It never reads input on the host. The agent only injects; there is no hook and no raw-input reader in
   `roomlerd` (FR-92's rule). A unit test scans the relative-mouse code for any of them
-  ([`input/mod.rs:744`](../agents/roomlerd/src/input/mod.rs#L744) `fr109_relative_mouse_reads_no_input`).
+  ([`input/mod.rs:776`](../agents/roomlerd/src/input/mod.rs#L776) `fr109_relative_mouse_reads_no_input`).
 - No ghost cursor in relative mode: other viewers see the host's own cursor in the picture.
 - The host's pointer speed and acceleration settings are not changed.
 
