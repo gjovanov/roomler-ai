@@ -144,6 +144,9 @@ impl Ask {
             field: self.field.clone(),
             n: self.n,
             target: self.target.clone(),
+            session_id: None,
+            device_id: None,
+            request: None,
             at: DateTime::now(),
         }
     }

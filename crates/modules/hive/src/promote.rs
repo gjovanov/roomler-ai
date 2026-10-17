@@ -137,6 +137,13 @@ pub enum PromoteDenyReason {
     PrimaryOffline,
     PrimaryUnsupported,
     RateLimited,
+    /// FR-90 P3-2b — the session holds a vault role the vault's policies do
+    /// not let this person take on the target device.
+    RoleRefused,
+    /// P3-2b — the session holds a role and no vault is mounted to decide it.
+    VaultUnavailable,
+    /// P3-2b — the vault could not decide (or record) it.
+    RoleUndecided,
 }
 
 impl PromoteDenyReason {
@@ -157,6 +164,9 @@ impl PromoteDenyReason {
             Self::PrimaryOffline => "primary_offline",
             Self::PrimaryUnsupported => "primary_unsupported",
             Self::RateLimited => "rate_limited",
+            Self::RoleRefused => "role_refused",
+            Self::VaultUnavailable => "vault_unavailable",
+            Self::RoleUndecided => "role_undecided",
         }
     }
 
@@ -202,10 +212,18 @@ impl PromoteDenyReason {
                 "the device the session runs on does not take part in moving sessions — update it"
             }
             Self::RateLimited => "too many sessions started on that device in the last minute",
+            Self::RoleRefused => {
+                "the session holds a vault role the vault's policies do not let you take on \
+                 that device"
+            }
+            Self::VaultUnavailable => {
+                "the session holds a vault role and the vault is not available here to decide it"
+            }
+            Self::RoleUndecided => "the vault could not decide the role just now — try again",
         }
     }
 
-    pub const ALL: [PromoteDenyReason; 14] = [
+    pub const ALL: [PromoteDenyReason; 17] = [
         Self::OrgArchived,
         Self::NoPermission,
         Self::NotRunning,
@@ -220,7 +238,20 @@ impl PromoteDenyReason {
         Self::PrimaryOffline,
         Self::PrimaryUnsupported,
         Self::RateLimited,
+        Self::RoleRefused,
+        Self::VaultUnavailable,
+        Self::RoleUndecided,
     ];
+}
+
+impl From<crate::vault_gate::RoleDeny> for PromoteDenyReason {
+    fn from(d: crate::vault_gate::RoleDeny) -> Self {
+        match d {
+            crate::vault_gate::RoleDeny::Refused(_) => Self::RoleRefused,
+            crate::vault_gate::RoleDeny::Unavailable => Self::VaultUnavailable,
+            crate::vault_gate::RoleDeny::Undecided => Self::RoleUndecided,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -684,7 +715,32 @@ async fn begin(
         s = state.sessions.find_owned(tid, auth.user_id, sid).await?;
     }
 
-    let reach = match authorize(&state, &s, target, auth.user_id, kind).await? {
+    // P3-2b — a session that holds a vault role moves with it only as the
+    // vault allows it for this person on the TARGET device: a policy may
+    // grant a role on a build box and nowhere else.
+    let decided = match (
+        authorize(&state, &s, target, auth.user_id, kind).await?,
+        s.vault_role.as_deref(),
+    ) {
+        (Ok(reach), Some(role)) => {
+            match crate::vault_gate::assume(
+                &state,
+                tid,
+                auth.user_id,
+                role,
+                sid,
+                &device,
+                kind.action(),
+            )
+            .await
+            {
+                Ok(()) => Ok(reach),
+                Err(deny) => Err(PromoteDenyReason::from(deny)),
+            }
+        }
+        (decided, _) => decided,
+    };
+    let reach = match decided {
         Ok(reach) => reach,
         Err(reason) => {
             info!(
@@ -2272,6 +2328,7 @@ mod tests {
             updated_at: now,
             ended_at: None,
             brain_rev: None,
+            vault_role: None,
             origin: SessionOrigin::Started,
             replicaset: Some(Replicaset {
                 policy_revision: 0,

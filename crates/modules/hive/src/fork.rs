@@ -105,6 +105,13 @@ pub enum ForkDenyReason {
     /// P2f-3c — the session's primary does not hand copies over.
     PrimaryUnsupported,
     RateLimited,
+    /// P3-2b — the session holds a vault role the vault's policies do not
+    /// let this person take on that device.
+    RoleRefused,
+    /// P3-2b — the session holds a role and no vault is mounted to decide it.
+    VaultUnavailable,
+    /// P3-2b — the vault could not decide (or record) it.
+    RoleUndecided,
 }
 
 impl ForkDenyReason {
@@ -125,6 +132,9 @@ impl ForkDenyReason {
             Self::PrimaryOffline => "primary_offline",
             Self::PrimaryUnsupported => "primary_unsupported",
             Self::RateLimited => "rate_limited",
+            Self::RoleRefused => "role_refused",
+            Self::VaultUnavailable => "vault_unavailable",
+            Self::RoleUndecided => "role_undecided",
         }
     }
 
@@ -170,6 +180,24 @@ impl ForkDenyReason {
                  fork on a device that holds a copy"
             }
             Self::RateLimited => "too many sessions started on this device in the last minute",
+            Self::RoleRefused => {
+                "the session holds a vault role the vault's policies do not let you take on \
+                 that device"
+            }
+            Self::VaultUnavailable => {
+                "the session holds a vault role and the vault is not available here to decide it"
+            }
+            Self::RoleUndecided => "the vault could not decide the role just now — try again",
+        }
+    }
+}
+
+impl From<crate::vault_gate::RoleDeny> for ForkDenyReason {
+    fn from(d: crate::vault_gate::RoleDeny) -> Self {
+        match d {
+            crate::vault_gate::RoleDeny::Refused(_) => Self::RoleRefused,
+            crate::vault_gate::RoleDeny::Unavailable => Self::VaultUnavailable,
+            crate::vault_gate::RoleDeny::Undecided => Self::RoleUndecided,
         }
     }
 }
@@ -236,6 +264,9 @@ fn refusal_of(r: PromoteDenyReason) -> ForkDenyReason {
         PromoteDenyReason::PrimaryOffline => ForkDenyReason::PrimaryOffline,
         PromoteDenyReason::PrimaryUnsupported => ForkDenyReason::PrimaryUnsupported,
         PromoteDenyReason::RateLimited => ForkDenyReason::RateLimited,
+        PromoteDenyReason::RoleRefused => ForkDenyReason::RoleRefused,
+        PromoteDenyReason::VaultUnavailable => ForkDenyReason::VaultUnavailable,
+        PromoteDenyReason::RoleUndecided => ForkDenyReason::RoleUndecided,
         // The session stopped running meanwhile, or a move's word a fork
         // cannot have: no copy can be taken now.
         PromoteDenyReason::NotRunning
@@ -410,6 +441,21 @@ pub async fn fork(
             Ok(CopyFrom::Taken) => Ok(CopyFrom::Taken),
             Err(reason) => Err(reason),
         };
+    // P3-2b — a session's role goes with a fork only as the vault allows it
+    // for this person on the fork's device, decided before either path (a
+    // copy held, or taken first). The audit names the parent: the fork has
+    // no id until it is made.
+    let decided = match (decided, parent.vault_role.as_deref()) {
+        (Ok(from), Some(role)) => {
+            match crate::vault_gate::assume(&state, tid, auth.user_id, role, sid, &device, "fork")
+                .await
+            {
+                Ok(()) => Ok(from),
+                Err(deny) => Err(ForkDenyReason::from(deny)),
+            }
+        }
+        (decided, _) => decided,
+    };
     let from = match decided {
         Ok(from) => from,
         Err(reason) => {
@@ -492,6 +538,7 @@ pub async fn fork(
         restricted: &restricted,
         action: "fork",
         opening: Some(room::forked_from_note(&parent, &by)),
+        vault_role: parent.vault_role.clone(),
     };
     let answer = crate::routes::begin(&state, new).await?;
     // The parent's room hears of a fork its device took, or has yet to
@@ -560,6 +607,7 @@ pub(crate) async fn make_joined(
         restricted: &restricted,
         action: "fork",
         opening: Some(room::forked_from_note(parent, &by)),
+        vault_role: parent.vault_role.clone(),
     };
     match crate::routes::begin(state, new).await {
         // As the route: a fork its device took, or has yet to answer.
@@ -646,6 +694,7 @@ mod tests {
             updated_at: now,
             ended_at: None,
             brain_rev: None,
+            vault_role: None,
             origin: SessionOrigin::Started,
             replicaset: Some(Replicaset {
                 policy_revision: 0,

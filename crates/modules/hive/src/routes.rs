@@ -63,6 +63,11 @@ pub struct StartBody {
     /// Defaults to the folder's last component.
     #[serde(default)]
     pub title: Option<String>,
+    /// FR-90 P3-2b — the vault role the session takes, if any: the vault
+    /// decides `role:assume` for the starter on this device before anything
+    /// is made. None: no role, and nothing in the vault is allowed it.
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 /// Why the SERVER refused a start. The device's own refusals are
@@ -74,6 +79,14 @@ pub enum StartDenyReason {
     DeviceOffline,
     DeviceUnsupported,
     RateLimited,
+    /// FR-90 P3-2b — the vault's policies do not let the person assume the
+    /// role named, on this device.
+    RoleRefused,
+    /// P3-2b — a role was named and no vault is mounted to decide it: a
+    /// refusal, never a session started without the role it asked for.
+    VaultUnavailable,
+    /// P3-2b — the vault could not decide (or record) it.
+    RoleUndecided,
 }
 
 impl StartDenyReason {
@@ -84,6 +97,9 @@ impl StartDenyReason {
             Self::DeviceOffline => "device_offline",
             Self::DeviceUnsupported => "device_unsupported",
             Self::RateLimited => "rate_limited",
+            Self::RoleRefused => "role_refused",
+            Self::VaultUnavailable => "vault_unavailable",
+            Self::RoleUndecided => "role_undecided",
         }
     }
 
@@ -101,6 +117,13 @@ impl StartDenyReason {
                  or it was built without them"
             }
             Self::RateLimited => "too many sessions started on this device in the last minute",
+            Self::RoleRefused => {
+                "the vault's policies do not let you take that role on this device"
+            }
+            Self::VaultUnavailable => {
+                "the vault is not available here, so a session cannot take a role"
+            }
+            Self::RoleUndecided => "the vault could not decide the role just now — try again",
         }
     }
 }
@@ -447,8 +470,45 @@ pub async fn start(
         .await;
         return Ok(Json(StartResponse::refused_by_server(reason, None)));
     }
+    // P3-2b — a role named at the start is the vault's to allow, for this
+    // person on this device, before anything is made.
+    let sid = ObjectId::new();
+    let vault_role = match body.role.as_deref() {
+        None => None,
+        Some(raw) => {
+            let role = crate::vault_gate::clean_role(raw).map_err(ApiError::BadRequest)?;
+            if let Err(deny) =
+                crate::vault_gate::assume(&state, tid, auth.user_id, &role, sid, &device, "start")
+                    .await
+            {
+                let reason = match deny {
+                    crate::vault_gate::RoleDeny::Refused(_) => StartDenyReason::RoleRefused,
+                    crate::vault_gate::RoleDeny::Unavailable => StartDenyReason::VaultUnavailable,
+                    crate::vault_gate::RoleDeny::Undecided => StartDenyReason::RoleUndecided,
+                };
+                info!(
+                    tenant = %tid, device = %device_id, user = %auth.user_id,
+                    reason = reason.as_str(), "hive: start refused"
+                );
+                Audit {
+                    tenant_id: tid,
+                    user_id: auth.user_id,
+                    target_id: None,
+                    device_id,
+                    session_id: None,
+                    action: "start",
+                    outcome: "refused",
+                    reason: Some(reason.as_str()),
+                }
+                .write(&state)
+                .await;
+                return Ok(Json(StartResponse::refused_by_server(reason, None)));
+            }
+            Some(role)
+        }
+    };
     let new = NewSession {
-        id: ObjectId::new(),
+        id: sid,
         tid,
         owner: auth.user_id,
         device_id,
@@ -460,6 +520,7 @@ pub async fn start(
         restricted: &[],
         action: "start",
         opening: None,
+        vault_role,
     };
     begin(&state, new).await.map(Json)
 }
@@ -487,6 +548,9 @@ pub(crate) struct NewSession<'a> {
     pub action: &'static str,
     /// What its room says first, once the record is made (a fork's origin).
     pub opening: Option<String>,
+    /// P3-2b — the vault role, already allowed for this device by the
+    /// vault's gate (a fork's, its parent's, decided again).
+    pub vault_role: Option<String>,
 }
 
 /// A new session: its core memory, where its copies go, its room, its record,
@@ -511,6 +575,7 @@ pub(crate) async fn begin(
         restricted,
         action,
         opening,
+        vault_role,
     } = new;
     let forked_from = parent.as_ref().map(|p| p.session_id);
     let audit =
@@ -601,6 +666,7 @@ pub(crate) async fn begin(
         updated_at: now,
         ended_at: None,
         brain_rev: memory.as_ref().map(|m| m.brain_rev),
+        vault_role: vault_role.clone(),
         origin: SessionOrigin::Started,
         replicaset,
         promotion: None,

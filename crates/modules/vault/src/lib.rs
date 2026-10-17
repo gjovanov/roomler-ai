@@ -29,10 +29,11 @@ use axum::{
 };
 use roomler_ai_config::Settings;
 use roomler_ai_db::indexes::{IndexSet, index, index_ttl, index_unique, index_unique_partial};
-use roomler_core::{Capabilities, Core, Module, TenantCtx};
+use roomler_core::{Capabilities, Core, Hooks, Module, TenantCtx};
 
 pub mod crypto;
 pub mod dao;
+pub mod gate;
 pub mod model;
 pub mod policy;
 pub mod policy_routes;
@@ -147,10 +148,26 @@ impl Module for VaultState {
                 "/tenant/{tenant_id}/vault/simulate",
                 post(policy_routes::simulate),
             )
+            // P3-2b — a change replayed against the recorded decisions.
+            .route(
+                "/tenant/{tenant_id}/vault/simulate/replay",
+                post(policy_routes::replay),
+            )
             .nest("/tenant/{tenant_id}/vault/secret", secret)
             .nest("/tenant/{tenant_id}/vault/role", role)
             .nest("/tenant/{tenant_id}/vault/policy", policy)
             .with_state(self.clone())
+    }
+
+    /// P3-2b — the gate hive asks, through core, before a session takes a
+    /// role or moves with one ([`gate::VaultGate`]).
+    fn hooks(&self) -> Hooks {
+        Hooks {
+            session: Some(Arc::new(gate::VaultGate {
+                state: self.clone(),
+            })),
+            ..Default::default()
+        }
     }
 
     fn indexes(&self) -> Vec<IndexSet> {

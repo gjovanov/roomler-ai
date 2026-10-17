@@ -160,6 +160,11 @@ pub struct AgentSession {
     /// reaches the next session, never this one. Absent before P1e.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brain_rev: Option<i64>,
+    /// FR-90 P3-2b — the vault role the session assumed at its start, as the
+    /// vault's gate allowed it (`role:assume`), and decided again at every
+    /// move and fork. Absent = no role: nothing in the vault is allowed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_role: Option<String>,
     /// FR-90 P1j — how the session came to be. Absent = started from Roomler
     /// (every record before P1j).
     #[serde(default, skip_serializing_if = "SessionOrigin::is_started")]
@@ -1259,6 +1264,7 @@ mod tests {
             updated_at: now,
             ended_at: None,
             brain_rev: None,
+            vault_role: None,
             origin: SessionOrigin::Started,
             replicaset: None,
             promotion: None,
@@ -1441,6 +1447,7 @@ mod tests {
             updated_at: now,
             ended_at: None,
             brain_rev: None,
+            vault_role: None,
             origin: SessionOrigin::Started,
             replicaset: None,
             promotion: None,
