@@ -312,6 +312,15 @@ pub(crate) fn on_chain(fences: &[FenceMark], fence: i64, seq: i64) -> i64 {
         .map_or(seq, |end| seq.min(end.seq))
 }
 
+/// FR-90 P2k-5 — how many events a copy that ends at `(fence, seq)` holds
+/// past where its fence ended: what a primary cut off went on writing after
+/// the session moved away from it (P2e-6a), which no copy on the session's
+/// chain holds, so it did not carry over. Zero at the current fence, and for
+/// a copy within its fence's end.
+pub(crate) fn past_end(fences: &[FenceMark], fence: i64, seq: i64) -> i64 {
+    seq - on_chain(fences, fence, seq)
+}
+
 /// FR-90 P2e-3 — where a promotion is. Every step is a compare-and-set on the
 /// state it leaves, so a frame that arrives twice, late, or on another pod
 /// moves it once.
@@ -1146,6 +1155,21 @@ impl From<&HivePurge> for PurgeView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-90 P2k-5 — what a copy holds past where its fence ended: nothing at
+    /// the current fence or within its fence's end, the rest past it.
+    #[test]
+    fn a_copy_past_its_fences_end_holds_that_many_events_that_did_not_carry_over() {
+        let fences = [FenceMark {
+            fence: 1,
+            seq: 5,
+            hash: "a".repeat(64),
+        }];
+        assert_eq!(past_end(&fences, 2, 40), 0, "the current fence has no end");
+        assert_eq!(past_end(&fences, 1, 3), 0, "within its fence's end");
+        assert_eq!(past_end(&fences, 1, 5), 0, "at its fence's end");
+        assert_eq!(past_end(&fences, 1, 9), 4, "four past where fence 1 ended");
+    }
 
     #[test]
     fn status_spellings_are_locked_and_match_serde() {
