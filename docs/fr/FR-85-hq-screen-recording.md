@@ -153,7 +153,7 @@ what it costs in installer size and ships with integration and e2e tests.
   default and remembered; the list (name, date, duration, size, origin, pending delivery) with Play, Edit, Show in
   folder and Delete; settings for the folder, "Allow remote recording" and "Include computer audio in remote
   recordings". The tray gets Start/Stop and a red REC dot.
-- LocalAPI verbs (`crates/localapi/src/lib.rs:948`, the exhaustive `handle()` and `serve_connection`): `RecordStart`,
+- LocalAPI verbs (`crates/localapi/src/lib.rs:957`, the exhaustive `handle()` and `serve_connection`): `RecordStart`,
   `RecordStop`, `RecordStatus`, `RecordingsList`, `RecordingDelete`.
   ⚠️ **They need a peer check the pipe does not have.** The pipe's DACL admits every Interactive User, RDP sessions
   included (`lib.rs:1649`), and there is no peer-credential check, so a guest in an RDP session could start a local

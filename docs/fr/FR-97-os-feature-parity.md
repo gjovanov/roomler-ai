@@ -74,9 +74,9 @@ never run.
 **S1 (#2081) — a Mac exit-node client installs the split-default with nothing pinned.** ✔
 `TunIo::add_host_exemption` defaults to `Ok(())` (`crates/tunnel-core/src/overlay/tun.rs:162-164`), and
 `SystemTun` overrides it only on Linux and Windows (`tun.rs:4248-4249`, `cfg(any(linux, windows))`). On macOS every
-carrier exemption therefore "succeeds" without installing a route (`runtime/route_guard.rs:523-526`), the v4 gate
-passes (`route_guard.rs:541-556`), and the `/1` halves go in through the real macOS route arm
-(`route_guard.rs:566-570` → `tun.rs:3876-3925`). The coordination server, coturn and the exit peer's own endpoint
+carrier exemption therefore "succeeds" without installing a route (`runtime/route_guard.rs:552-555`), the v4 gate
+passes (`route_guard.rs:570-585`), and the `/1` halves go in through the real macOS route arm
+(`route_guard.rs:595-599` → `tun.rs:3876-3925`). The coordination server, coturn and the exit peer's own endpoint
 then route into the utun that is supposed to carry them. That is the self-wedge the withhold gate exists to
 prevent, and the guard re-asserts it on every tick.
 
@@ -95,8 +95,8 @@ prevent, and the guard re-asserts it on every tick.
 **S2 — exit and subnet serving is offered where nothing NATs, and an approval outlives the offer.** ✔
 
 - The `/0` advertisement is unconditional (`crates/agent-core/src/config.rs:2079-2068`) and independent of NAT setup
-  (`runtime.rs:2108-2113`; the setup's success only picks a log level, `nat.rs:80-94`). macOS has no NAT arm at all
-  (`nat.rs:353-355` returns `false`), and because the guard is armed only on Linux and Windows (`nat.rs:87`), it logs
+  (`runtime.rs:2131-2136`; the setup's success only picks a log level, `nat.rs:80-94`). macOS has no NAT arm at all
+  (`nat.rs:376-378` returns `false`), and because the guard is armed only on Linux and Windows (`nat.rs:87`), it logs
   nothing. Windows Home fails `New-NetNat` silently and leaves IPv4 forwarding on after the revert (#2077).
 - The server derives `can_be_exit_node` from the advertisement alone
   (`crates/modules/network/src/routes/overlay_route.rs:63`), and the admin row carries no OS (`overlay_route.rs:28-59`)
@@ -113,8 +113,8 @@ prevent, and the guard re-asserts it on every tick.
 |---|---|---|---|---|---|---|
 | N1 | In the mesh on a default install | ✅ | ✅ | ❌ | The default `.pkg` installs the per-user half, which cannot create a utun; the mesh needs `--daemon-token`, a second enrollment and a second device row (`scripts/install.sh:508-511`, `packaging/macos/com.roomler.daemon.plist` header) | FR-43 P3 |
 | N2 | Exit node, client | ✅ | ✅ | ✅ P1a + P1c (AC4, AC6 field-verified) | S1; no original-default capture (`tun.rs:1931-1939`, `3471-3503` are `cfg(any(linux, windows))`) | P0a, P1a |
-| N3 | Exit node, serving v4 | 🟡 WinNAT; Home ❌ | ✅ iptables | ✅ P1b: pf, in our own anchor (0.4.141; #2377 in 0.4.142; AC5, §8) | Silent no-op (`nat.rs:353-355`); Home: #2077 | P0b, P1b, P4e |
-| N4 | Exit node, serving v6 | ⛔ WinNAT has no v6 (`nat.rs:245-251`) | ✅ ip6tables | ✅ P1b: pf NAT66 to a stable address (global first, else a ULA), where an unscoped v6 default exists (0.4.141; AC5, §8) | — | P1b; Windows: D1 |
+| N3 | Exit node, serving v4 | 🟡 WinNAT; Home ❌ | ✅ iptables | ✅ P1b: pf, in our own anchor (0.4.141; #2377 in 0.4.142; AC5, §8) | Silent no-op (`nat.rs:376-378`); Home: #2077 | P0b, P1b, P4e |
+| N4 | Exit node, serving v6 | ⛔ WinNAT has no v6 (`nat.rs:268-274`) | ✅ ip6tables | ✅ P1b: pf NAT66 to a stable address (global first, else a ULA), where an unscoped v6 default exists (0.4.141; AC5, §8) | — | P1b; Windows: D1 |
 | N5 | Subnet router, serving | 🟡 WinNAT; Home ❌ | ✅ | ✅ P1b (0.4.141; AC5, §8) | Same no-op; routes still advertised and approvable | P0b, P1b |
 | N6 | MagicDNS OS steer | ✅ NRPT | 🟡 systemd-resolved only (`dns.rs:408-429`) | ✅ P1c (AC6) | A TUN-mode Mac resolves names only with the opt-in hosts ladder. *P1c:* a temporary SCDynamicStore supplemental resolver per utun | P1c, P3h |
 | N7 | Exit DNS steer (no leak) | ✅ NRPT `.` | 🟡 resolved only | ✅ P1c (AC6) | Reported honestly as `DNS NOT steered`. *P1c:* a temporary catch-all key (`SupplementalMatchDomains = [""]`) | P1c, P3h |
@@ -161,7 +161,7 @@ and the consent chain's fallbacks.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | D1 | Companion: tray, banner, consent, Apply now | ✅ | 🟡 | ✅ | One x86_64 `.deb` (`release-agent.yml:744-871`); Fedora, Arch and arm64 have none | P3g (with FR-93 D5/D6, FR-95) |
-| D2 | Companion pages on a system install | ✅ | 🟡 safety pages only | ❓ | Person socket (`crates/localapi/src/lib.rs:2550-2594`); a two-half Mac may answer Routes and Devices from the user half | #1911; FR-43 P3 |
+| D2 | Companion pages on a system install | ✅ | 🟡 safety pages only | ❓ | Person socket (`crates/localapi/src/lib.rs:2559-2603`); a two-half Mac may answer Routes and Devices from the user half | #1911; FR-43 P3 |
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ❌ | ✅ IOPMAssertion | A stub whose reason, "zbus is in no shipped Linux feature set" (`power.rs:649-660`), is stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | ✅ | ❌ | ✅ | Root's home or `/tmp` (`files.rs:182-206`, `2483-2521`) | P3d |
 | D5 | The setup wizard installs the daemon | ✅ | ❌ | ❌ | Tunnel client only (`agents/roomler-setup/src/commands.rs:79-103`) ✔, yet the enroll dialog offered it for agents. P0c-2 offers it for agents on Windows only (`ui/src/utils/enrollCommands.ts:136`) | P0c, D5 |
@@ -259,7 +259,7 @@ can do.
 ### 3.2 P0a — fail toward withhold (#2081)
 
 `SystemTun` refuses an exemption wherever it has no arm: a `cfg(not(any(linux, windows)))` `add_host_exemption`
-returns `ErrorKind::Unsupported`, so on macOS the gate at `route_guard.rs:545-556` withholds and `roomler status`
+returns `ErrorKind::Unsupported`, so on macOS the gate at `route_guard.rs:574-585` withholds and `roomler status`
 says why. The trait default stays `Ok(())`, now documented as safe only for a device that installs no OS routes
 (the in-memory mocks, netstack); changing it would move every mock and netstack for no safety gain. Netstack's untrue
 `active` belongs to P0c. The test that fails on master is
@@ -377,7 +377,7 @@ Mirror the Linux arm with the BSD tools the macOS code already drives, and close
    change`: it resolves its target the way the lookup does, and on the field Mac it left the pin untouched. The table
    then decides; a pin that does not hold comes out again and the call errs.
 4. **The pins follow the uplink.** `TunIo::stale_host_exemptions` (new; `tun.rs:4838` on macOS, an empty default
-   elsewhere) names the pins the table does not show through the current uplink. The gate (`route_guard.rs:570`)
+   elsewhere) names the pins the table does not show through the current uplink. The gate (`route_guard.rs:599`)
    asks at most every 3 s, re-pins each, and DELETES one it cannot re-pin before forgetting it, so an untracked
    route never outlives the exit. Then the usual rule applies: a v4 pin missing means WITHHOLD.
 5. **`del_host_exemption`** removes only the pin the table shows, never a route on our utun (a peer route): with no
@@ -385,8 +385,8 @@ Mirror the Linux arm with the BSD tools the macOS code already drives, and close
    removes the `/1`s (`tun.rs:4603-4646` at the time of writing); pins an unclean exit leaves behind are N13, all
    three OSes.
 6. **The two 0.4.132 follow-ups.** The pin WARN fires once per (endpoint, cause) (`note_exemption_failure`,
-   `route_guard.rs:370`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
-   (`exemption_withheld_reason`, `route_guard.rs:382`) instead of `no original default route?`.
+   `route_guard.rs:393`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
+   (`exemption_withheld_reason`, `route_guard.rs:405`) instead of `no original default route?`.
 
 Kill switch: `ROOMLERD_EXIT_CLIENT_MACOS=0` refuses every exemption, as 0.4.132 did. DNS is not steered yet (P1c):
 `roomler status` says `DNS NOT steered`.
@@ -496,7 +496,7 @@ Prefer the SCDynamicStore to files: a supplemental resolver (`SupplementalMatchD
 `SCDynamicStoreAddTemporaryValue` should disappear when the daemon's store session ends, which would make the steer
 crash-safe by construction (unverified; P1c's first task). The fallback for the split zone is `/etc/resolver/<domain>`
 (honoured by the system resolver, not by `dig`), purged at boot. Keep the existing bound-resolver gate
-(`runtime.rs:2372-2392`): never steer at a `:53` that did not bind.
+(`runtime.rs:2395-2415`): never steer at a `:53` that did not bind.
 
 *Done first, 2026-10-14, on throwaway tart VMs with `scutil` only, before any code (§8):* a temporary key's holder
 SIGKILLed → the key is gone within 1–4 s (two keys in one session: both); the same key without the flag survives its
@@ -545,7 +545,7 @@ test of the SIGKILL property itself.
   Downloads *as that user*, the twin of `active_user_downloads_path` on Windows (`files.rs:2467-2480`).
   ⚠️ Never as root followed by a `chown`: in a directory the user owns, a root path operation can be redirected
   through a swapped-in symlink to any file root can reach. Do every path step on a thread switched with
-  `setfsuid`/`setfsgid`, the pattern FR-27 P11's person socket already uses (`crates/localapi/src/lib.rs:3611-3642`),
+  `setfsuid`/`setfsgid`, the pattern FR-27 P11's person socket already uses (`crates/localapi/src/lib.rs:3620-3651`),
   so the file is born theirs. ⚠️ "The user" is the seat owner, never whoever asked over the person socket.
 - **P3e, X11 polish.** Layout (`XkbGetState` / `XkbLockGroup`; Wayland has no cross-compositor API, so refuse with a
   reason), display-match through RandR (`x11rb` is linked) with a restore guard, clipboard image watching (XFixes
