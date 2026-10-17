@@ -504,6 +504,55 @@ pub struct AgentCaps {
     /// from every agent before P2b. Live, re-announced on the heartbeat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_policy: Option<SessionPolicy>,
+    /// FR-97 P0c — the honest "no": a feature this device does NOT offer on
+    /// this host, keyed by feature, with why. A viewer shows the reason on the
+    /// control instead of offering one that fails silently, and hides the
+    /// control only for [`Unavailable::NOT_APPLICABLE`]. Keys, matched by
+    /// EQUALITY ([`Unavailable::KEYS`], locked by test):
+    ///
+    /// * `audio` — no system-audio capture here (macOS until FR-97 P2a); the
+    ///   `audio` list is then empty, so no silent track is ever offered.
+    /// * `clipboard` — no clipboard this process can reach (a root Linux
+    ///   daemon outside any desktop session); `clipboard` and
+    ///   `supports_clipboard` are then empty/false.
+    /// * `clipboard-image-events` — `events` still pushes text, but copied
+    ///   images are not watched here (everywhere but Windows), so images move
+    ///   only on request.
+    /// * `sas` — Ctrl+Alt+Del is sent as ordinary keys (`keys-only`): on
+    ///   Windows they miss the lock and sign-in screens until FR-97 P4a sends
+    ///   the real secure attention sequence; on Linux the desktop binds them.
+    ///   On macOS the chord means nothing (`not-applicable`).
+    ///
+    /// Empty from every agent before P0c: those agents claim what their lists
+    /// say, so an absent key never means "unavailable".
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub unavailable: std::collections::BTreeMap<String, Unavailable>,
+}
+
+/// FR-97 P0c — why a feature is not offered here; see [`AgentCaps::unavailable`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Unavailable {
+    /// Machine-readable. [`Self::NOT_APPLICABLE`] means the feature means
+    /// nothing on this OS, so a viewer hides the control. Any other code
+    /// leaves the control to the lists, which say whether it works, and
+    /// adds [`Self::reason`] to it.
+    pub code: String,
+    /// One sentence for the person at the viewer.
+    pub reason: String,
+}
+
+impl Unavailable {
+    /// The feature means nothing on this OS: hide the control.
+    pub const NOT_APPLICABLE: &'static str = "not-applicable";
+    /// The keys [`AgentCaps::unavailable`] may carry, in wire spelling.
+    pub const KEYS: [&'static str; 4] = ["audio", "clipboard", "clipboard-image-events", "sas"];
+
+    pub fn new(code: &str, reason: &str) -> Self {
+        Self {
+            code: code.to_string(),
+            reason: reason.to_string(),
+        }
+    }
 }
 
 /// FR-77 — one encoder (codec × backend) and the chroma formats it produced
@@ -6081,6 +6130,39 @@ mod tests {
     /// WIRE LOCK. These exact strings are what every deployed agent already
     /// sends and what the server gates on; changing one does not fail loudly,
     /// it silently makes every existing device look like it lacks the feature.
+    /// FR-97 P0c — the honest "no" rides the caps. Its keys and the code a
+    /// viewer hides on are a compatibility surface with every viewer, and an
+    /// absent map must read as "nothing withheld", never as "everything".
+    #[test]
+    fn unavailable_wire_shape_is_locked() {
+        assert_eq!(
+            Unavailable::KEYS,
+            ["audio", "clipboard", "clipboard-image-events", "sas"]
+        );
+        assert_eq!(Unavailable::NOT_APPLICABLE, "not-applicable");
+        let mut caps = AgentCaps::default();
+        caps.unavailable.insert(
+            "audio".into(),
+            Unavailable::new("no-backend", "no sound here"),
+        );
+        let v = serde_json::to_value(&caps).unwrap();
+        assert_eq!(
+            v["unavailable"]["audio"],
+            serde_json::json!({"code": "no-backend", "reason": "no sound here"})
+        );
+        let back: AgentCaps = serde_json::from_value(v).unwrap();
+        assert_eq!(back.unavailable["audio"].code, "no-backend");
+        // The server stores caps on the agent row as BSON.
+        let stored: AgentCaps = bson::from_bson(bson::to_bson(&caps).unwrap()).unwrap();
+        assert_eq!(stored.unavailable["audio"].reason, "no sound here");
+        // Empty stays off the wire, and an older agent's caps (no key) read
+        // as nothing withheld.
+        let plain = serde_json::to_value(AgentCaps::default()).unwrap();
+        assert!(plain.get("unavailable").is_none(), "{plain}");
+        let old: AgentCaps = serde_json::from_value(plain).unwrap();
+        assert!(old.unavailable.is_empty());
+    }
+
     /// Spelled out literally rather than derived, so a rename has to be a
     /// deliberate edit here.
     #[test]

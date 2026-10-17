@@ -5,9 +5,12 @@
   AC17).
 - The macOS exit, P1b (#2362), shipped in 0.4.141. Its pf-reference and Internet Sharing fix (#2377) rides 0.4.142.
   AC5 is field-verified on a candidate of that fix (§8); a check on the 0.4.142 release is owed.
-- P0d, the measurement, is in review: the native architecture in the hello, and `scripts/fr97-caps-census.sh`.
-  The count before P0c was taken on 2026-10-17 (§8, AC15).
-- P0c and P2–P7 are open.
+- P0d, the measurement, merged (#2397): the native architecture in the hello, and `scripts/fr97-caps-census.sh`.
+  It reaches the fleet with the next agent release and server promote. The count before P0c was taken on
+  2026-10-17 (§8, AC15).
+- P0c, honest caps (§3.3a), is in review: P0c-1 the map and the daemon's decision, P0c-2 the viewer and the
+  enroll dialog. P0c-3 (the netstack exit status) is measured first (D12).
+- P2–P7 are open.
 
 **Owner:** the agent on all
 three platforms; the network module for the route gate (P0b) ·
@@ -80,12 +83,13 @@ prevent, and the guard re-asserts it on every tick.
 - A restart does not heal it: `purge_split_default` runs at boot, then the runtime re-installs from the persisted
   `overlay_exit_node`.
 - Reach: a Mac running the opt-in root daemon whose operator sets `overlay_exit_node`. The key is not in
-  `DesiredConfig` (`crates/remote_control/src/models.rs:1947-1957`), so no server push can set it; a local
+  `DesiredConfig` (`crates/remote_control/src/models.rs:2437`), so no server push can set it; a local
   `sudo roomler config set` can, and so can an `exec` on the daemon's row. Once it lands, the control WS that the
   `exec` came in on is captured too, so the same channel cannot undo it.
 - `NetstackTun` inherits the same default. It installs no OS routes, so it cannot wedge, but `roomler status`
   reports the exit `active` although its userspace stack has no route off the overlay prefixes
-  (`netstack.rs:1176-1186`), so nothing reaches the exit (P0c).
+  (`netstack.rs:1176-1186`), so nothing reaches the exit (P0c). Whether a SOCKS5 client's IPv4 literal does is
+  measured before that changes (D12).
 - This is a reading of the code path, not yet reproduced on a Mac. P0a reproduces it, red, on a throwaway VM first.
 
 **S2 — exit and subnet serving is offered where nothing NATs, and an approval outlives the offer.** ✔
@@ -96,7 +100,7 @@ prevent, and the guard re-asserts it on every tick.
   nothing. Windows Home fails `New-NetNat` silently and leaves IPv4 forwarding on after the revert (#2077).
 - The server derives `can_be_exit_node` from the advertisement alone
   (`crates/modules/network/src/routes/overlay_route.rs:63`), and the admin row carries no OS (`overlay_route.rs:28-59`)
-  although every agent row has one (`models.rs:1432`).
+  although every agent row has one (`models.rs:1952`).
 - `approved_routes` survives a rejoin on purpose (`crates/services/src/dao/overlay_node.rs:239-241`), and the netmap
   fans `approved_routes` without intersecting what the node still advertises
   (`crates/modules/network/src/overlay.rs:2549`). A client accepts any peer whose fanned routes hold `/0`
@@ -131,14 +135,14 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
-| R1 | System audio in a session | ✅ WASAPI loopback | 🟡 a Pulse `.monitor`, else **the default microphone** (`audio/cpal_backend.rs:277-304`) | ❌ | macOS: `NoopAudioCapture` (`audio/mod.rs:78-98`) while `opus` is advertised (`encode/caps.rs:1343`) ✔ | P0c, P2a, P3c |
+| R1 | System audio in a session | ✅ WASAPI loopback | 🟡 a Pulse `.monitor`, else **the default microphone** (`audio/cpal_backend.rs:277-304`) | ❌ | macOS: `NoopAudioCapture` (`audio/mod.rs:78-98`) while `opus` is advertised (`encode/caps.rs:1480`) ✔ | P0c, P2a, P3c |
 | R2 | Native consent panel | ✅ | ✅ X11 · ⛔ Wayland → companion | ❌ | Built (`indicator/mac.rs`), not in the release set (`release-agent.yml:2564-2580`) | P2b (D3) |
 | R3 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows (FR-56) | ❌ | `Unavailable::Platform` (`apps/mod.rs:347`); no `apps/macos.rs` | P2c |
 | R4 | Live cursor shape | ✅ | ❌ | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`) | P3a, P2d |
 | R5 | "Host is locked" consent hint | ✅ | ❌ | ❌ | Always `Unlocked` off Windows (`lock_state.rs:290-311`) | P2d, P3b |
-| R6 | Keyboard layout report / switch | ✅ | ❌ | ❌ | Windows-only cap (`caps.rs:1375-1383`) | P2d, P3e |
+| R6 | Keyboard layout report / switch | ✅ | ❌ | ❌ | Windows-only cap (`caps.rs:1516-1520`) | P2d, P3e |
 | R7 | Match remote display | ✅ | ❌ | ❌ | `display_match.rs:247` | P2d, P3e |
-| R8 | Clipboard: host → viewer image sync | ✅ | ❌ | ❌ | Forced off (`clipboard.rs:818-822`) ✔ while advertised (`caps.rs:1356-1364`) | P0c, P2e, P3e |
+| R8 | Clipboard: host → viewer image sync | ✅ | ❌ | ❌ | Forced off (`clipboard.rs:818-822`) ✔ while advertised (`caps.rs:1493-1501`) | P0c, P2e, P3e |
 | R9 | Clipboard: RTF lane | ✅ | ❌ | ❌ | `clipboard.rs:792` | P2e, P3e |
 | R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:9538-9541`) | FR-93 P7 |
 | R11 | Typing text on a non-US layout (uinput) | ✅ | 🟡 US table only | ✅ | `keylayout.rs:40-46`, `uinput_backend.rs:628-634` | P3f |
@@ -190,7 +194,7 @@ and the consent chain's fallbacks.
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` (`release-agent.yml:1093`); recordings write Opus, not AAC | P7a |
 | A4 | Tunnel CLI and wizard on Linux arm64 | — | ❌ | — | x86_64 only (`release-tunnel.yml:127-131`, `release-setup.yml:184-189`) | P7b |
 
-The server records `os` on every agent row but no architecture (`models.rs:14-18`, `:1432`), so it cannot count the
+The server records `os` on every agent row but no architecture (`models.rs:14-18`, `:1952`), so it cannot count the
 devices A1 and A2 would serve. P0d adds the native machine architecture to the hello. On Windows that is
 `IsWow64Process2`'s native machine, because an x64 build under emulation would otherwise report x86_64.
 
@@ -229,7 +233,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:181-224`); DRM captures from root (opt-in) |
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`) |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93 |
-| code comments: `power.rs:649-654`, `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1623`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps |
+| code comments: `power.rs:649-654`, `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1766`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps |
 
 ### 2.9 Equal on all three: not parity, recorded so nobody files them here
 
@@ -297,6 +301,58 @@ flowchart TB
   An agent older than P0b keeps advertising what it always did, so the intersection changes nothing for it.
 - **Admin UI.** An OS chip on the routes row (`OverlayNodeResponse` gains `os`, read from `Agent.os`), and the
   device's reason when it offers nothing.
+
+### 3.3a P0c — honest caps
+
+The count before P0c (§8) found the hello's words compile-time constants. `opus` sat on every Mac, which streams
+silence (R1). Clipboard image events sat on every Linux and macOS agent, whose watchers never send them (R8).
+`supports_clipboard` sat on root Linux daemons that have no clipboard to reach (R10). No word governed
+Ctrl+Alt+Del at all.
+
+**The shape (D10).** A word stays a promise. What a host cannot keep, the daemon takes out and explains in a new map,
+`AgentCaps.unavailable: {feature → {code, reason}}` (`crates/remote_control/src/models.rs:529`). The keys are
+matched by equality (`Unavailable::KEYS`, `:548`), and the wire shape is locked by
+`unavailable_wire_shape_is_locked`. The viewer's rule:
+
+- It shows `reason` on the control.
+- It **hides** the control only for `not-applicable`, a feature that means nothing on that OS (Ctrl+Alt+Del on a
+  Mac). That keeps the UI from gating on `agent.os`.
+- Whether a control works still follows the lists, as today. An empty `audio` list already disables the toggle;
+  `unavailable` adds the why.
+
+An agent before P0c sends no map, and an absent key never means "unavailable": its lists say what it claims.
+
+**The decision** is one daemon-side seam, `with_honest_words` (`agents/roomlerd/src/encode/caps.rs:694`), applied
+in `detect()` (`:624`) after the config lists, over plain `HostFacts` (`:636`). It runs, and is tested, on every
+OS: FR-43's practice of keeping the decision out of `cfg(target_os)`.
+
+| Feature | When | What the hello says |
+|---|---|---|
+| `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:78`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:3064`); `unavailable.audio = no-backend` |
+| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:675`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
+| `clipboard-image-events` | everywhere but Windows, whose watcher alone keeps image events (`clipboard.rs:817-822`) | `events` and `images` stay: text still syncs, and an image moves on request. `not-watched` |
+| `sas` | Windows | `keys-only`: the button types three ordinary keys, which apps on the desktop get and the lock screen does not. P4a's `SendSAS` replaces it with an `input: sas` word (D11) |
+| `sas` | Linux | `keys-only`: the same keys, which the desktop binds (GNOME and KDE to log out), so the button says so rather than going |
+| `sas` | macOS | `not-applicable`: the chord means nothing there, and the viewer hides the button |
+
+The census (`scripts/fr97-caps-census.sh`) counts the map as `key:code` by OS, so AC15's "after" shows each no
+beside the words.
+
+**Out of the hello:**
+- **The wizard (D5).** The enroll dialog stops offering it for agents off Windows (`ui/src/utils/enrollCommands.ts:169`,
+  `:185`). There it installs only the tunnel client.
+- **A netstack node's exit status (D12).** Today it reads `active` while the OS routes nothing. Yet its SOCKS5 front
+  dials an IPv4 literal as given (`crates/tunnel-core/src/overlay/netstack_socks.rs:75`), and the overlay router
+  picks a peer for each packet by its allowed IPs, the exit's `/0` among them. So a literal may well reach the exit,
+  and "never `active`" may itself be wrong. It is measured before it is changed.
+
+**Order.**
+- **P0c-1:** the map and the daemon (this section).
+- **P0c-2:** the viewer and the enroll dialog read it.
+- **P0c-3:** the netstack status.
+
+The server stores the map as it stores every caps field, so P0c-2 needs a promoted server, and the honest no's
+reach a viewer from agents on the release after P0c-1.
 
 ### 3.4 P1a — the macOS exit client
 
@@ -565,7 +621,7 @@ model on Windows, so the three agree on what the mode means.
 |---|---|---|---|---|
 | **P0a** | `SystemTun` refuses an exemption it has no arm for, so a Mac withholds (S1, #2081) | — (a safety fix) | the macOS kernel test in CI, red on master; a throwaway macOS VM, red on 0.4.131, then green | S |
 | **P0b** | The NAT probe gates the offer; the server fans approved ∩ advertised; the Windows revert restores forwarding; an OS chip and the reason in the admin UI (S2, #2077) | device `ROOMLERD_ROUTE_OFFER_UNPROBED=1`; a server flag for the plain fan | Win11 Home and Pro, Linux, macOS cells | S–M |
-| **P0c** | Honest caps: `opus` only with a capture backend; the image-event cap only where watched; no clipboard cap on a root Linux daemon without a display; Ctrl+Alt+Del only where the host can send it; the wizard offered only where it installs the agent; a netstack node's exit status never `active` | — | a test per word, failing on master | S |
+| **P0c** | Honest caps: `opus` only with a capture backend; the image-event cap only where watched; no clipboard cap on a root Linux daemon without a display; Ctrl+Alt+Del saying what its keys reach, and gone where the chord means nothing; the wizard offered only where it installs the agent; a netstack node's exit status never `active` | — | a test per word, failing on master | S |
 | **P0d** | Measure: the native architecture in the hello; a server count of capability words by OS and architecture | — | the server | S |
 | **P0e** | Exit-client pins on all three: they follow the uplink on Linux and Windows too (N12), and a ledger lets the boot and pre-exit purge remove the ones an unclean exit left (N13). *Part 1 = N13* (the pins in the host ledger, and a purge after every exit of the daemon); *part 2 = N12*; *part 3 = N14* (netstate sees the uplink beneath the exit, so the control WS is probed at once) | — (a safety fix); N14: `ROOMLERD_OVERLAY_NETMON_UPLINK=0` | a Linux and a Windows client changing networks under an active exit, red first; `kill -9`, then a network change | M |
 | **P1a** | macOS exit client | `overlay_exit_node` unset; `ROOMLERD_EXIT_CLIENT_MACOS=0` | the macOS kernel tests in CI (a staged capture of TEST-NET-3); vmtest: a macOS client of a Linux exit | M |
@@ -696,6 +752,9 @@ one depends on it.
 | **D7** | What `console_user` means off Windows | The active graphical seat's user (logind seat0, the macOS console user); refuse when nobody is at the screen |
 | **D8** | Order after P0 | P1 (macOS networking), then by field demand |
 | **D9** | S1 | **Decided (operator, 2026-10-13):** filed as #2081; P0a ships ahead of the rest of the FR |
+| **D10** | How a device says "not here" | **Decided (per recommendation, 2026-10-17):** `AgentCaps.unavailable`, a map of feature → `{code, reason}` beside the lists; the viewer shows the reason and hides only `not-applicable`; the lists still decide what works (§3.3a) |
+| **D11** | Ctrl+Alt+Del until P4a | **Decided (per recommendation, 2026-10-17):** Windows and Linux keep the button and say what the keys reach (Linux desktops bind the chord, so hiding it would take a working key away); macOS hides it. P4a's `SendSAS` brings an `input: sas` word |
+| **D12** | A netstack node's exit status | Measure whether its SOCKS5 front carries internet-bound literals through the exit before changing what `status` says (P0c-3) |
 
 ## 7. Out of scope
 

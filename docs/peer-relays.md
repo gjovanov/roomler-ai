@@ -74,7 +74,7 @@ actor can turn one device into the org's traffic chokepoint.
 
 | # | gate | owner | default | where |
 |---|---|---|---|---|
-| 1 | org switch `peer_relay_mode` — `off` · `warn` · `on` | the org owner (`MANAGE_TENANT`) | `off` | [`models.rs:2392`](../crates/remote_control/src/models.rs#L2392) |
+| 1 | org switch `peer_relay_mode` — `off` · `warn` · `on` | the org owner (`MANAGE_TENANT`) | `off` | [`models.rs:2449`](../crates/remote_control/src/models.rs#L2449) |
 | 2 | overlay ACL grants **each** member the relay node | the policy author | no grant | [`org_relay.rs:377`](../crates/modules/network/src/org_relay.rs#L377) |
 | 3 | per-device approval `peer_relay_policy.serve` | the fleet admin (`MANAGE_AGENTS` **and** `EXEC_DEVICE`) | `false` | [`routes/peer_relay.rs:53`](../crates/modules/network/src/routes/peer_relay.rs#L53) |
 | 4 | the relay device's own `relay_server_enabled` | the relay host's owner, **locally** | off | [`orgrelay/mod.rs:36`](../crates/tunnel-core/src/overlay/orgrelay/mod.rs#L36) |
@@ -388,7 +388,7 @@ the capacity gained: the relay was in France and the members in Austria and Germ
 |---|---|
 | the mint: gates, ranking, session, push | [`crates/modules/network/src/org_relay.rs`](../crates/modules/network/src/org_relay.rs) — `plan_mint` `:377`, `maybe_mint` `:544`, revoke `:742`–`:815` |
 | admin routes + approval policy | [`crates/modules/network/src/routes/peer_relay.rs`](../crates/modules/network/src/routes/peer_relay.rs) |
-| modes, policy, limits, deny reasons, audit row | [`crates/remote_control/src/models.rs`](../crates/remote_control/src/models.rs) `:2065`–`:2241` |
+| modes, policy, limits, deny reasons, audit row | [`crates/remote_control/src/models.rs`](../crates/remote_control/src/models.rs) `:2122`–`:2298` |
 | wire framing and shape rules | [`orgrelay/wire.rs`](../crates/tunnel-core/src/overlay/orgrelay/wire.rs) |
 | the authenticated bind | [`orgrelay/bind.rs`](../crates/tunnel-core/src/overlay/orgrelay/bind.rs) |
 | the relay's session table (pure) | [`orgrelay/session.rs`](../crates/tunnel-core/src/overlay/orgrelay/session.rs) |

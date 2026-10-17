@@ -623,8 +623,130 @@ const PROBE_HEIGHT: u32 = 270;
 /// cached result.
 pub fn detect() -> AgentCaps {
     CACHED_CAPS
-        .get_or_init(|| with_config_lists(cached_or_probed()))
+        .get_or_init(|| {
+            with_honest_words(with_config_lists(cached_or_probed()), &HostFacts::here())
+        })
         .clone()
+}
+
+/// FR-97 P0c — what this host can actually serve, as plain facts, so the
+/// decision ([`with_honest_words`]) runs, and is tested, on every OS (FR-43's
+/// practice: the decision stays out of `cfg(target_os)`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HostFacts {
+    pub(crate) os: roomler_ai_remote_control::models::OsKind,
+    /// The `audio` feature is compiled in.
+    pub(crate) audio_built: bool,
+    /// A system-audio capture backend exists on this OS: cpal loopback on
+    /// Linux and Windows; macOS has only the no-op that streams silence
+    /// (`audio::open_default`) until FR-97 P2a.
+    pub(crate) audio_backend: bool,
+    /// The clipboard watcher reports copied images: Windows only
+    /// (`clipboard::install_watcher` drops image events elsewhere).
+    pub(crate) watches_clipboard_images: bool,
+    /// This process has a clipboard to reach at all.
+    pub(crate) clipboard_reachable: bool,
+}
+
+impl HostFacts {
+    pub(crate) fn here() -> Self {
+        use roomler_ai_remote_control::models::OsKind;
+        Self {
+            os: if cfg!(target_os = "windows") {
+                OsKind::Windows
+            } else if cfg!(target_os = "macos") {
+                OsKind::Macos
+            } else {
+                OsKind::Linux
+            },
+            audio_built: cfg!(feature = "audio"),
+            audio_backend: cfg!(any(target_os = "linux", target_os = "windows")),
+            watches_clipboard_images: cfg!(target_os = "windows"),
+            clipboard_reachable: clipboard_reachable(),
+        }
+    }
+}
+
+/// A root Linux daemon (a system install) runs outside every desktop session:
+/// with neither display variable it has no clipboard to reach, the same test
+/// capture makes before it reports `no_display`. A per-user daemon, and every
+/// other OS, keeps the compile-time answer. FR-93 P7 makes the root case work
+/// through the session; until then the honest answer is no.
+fn clipboard_reachable() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let root = unsafe { libc::geteuid() } == 0;
+        let display =
+            std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        !root || display
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+/// FR-97 P0c — take out of `caps` what this host cannot serve, and say why in
+/// [`AgentCaps::unavailable`]. A word in the hello is a promise; the viewer
+/// shows these reasons instead of a control that fails silently (FR-97 §3.1).
+/// The census (`scripts/fr97-caps-census.sh`) counts the result by OS.
+pub(crate) fn with_honest_words(mut caps: AgentCaps, facts: &HostFacts) -> AgentCaps {
+    use roomler_ai_remote_control::models::{OsKind, Unavailable};
+    if facts.audio_built && !facts.audio_backend {
+        // Without a backend the session would carry a silent track (R1).
+        caps.audio.clear();
+        caps.unavailable.insert(
+            "audio".into(),
+            Unavailable::new(
+                "no-backend",
+                "System-audio capture is not implemented on this OS yet, so this host sends no sound",
+            ),
+        );
+    }
+    if !facts.clipboard_reachable && (caps.supports_clipboard || !caps.clipboard.is_empty()) {
+        caps.supports_clipboard = false;
+        caps.clipboard.clear();
+        caps.unavailable.insert(
+            "clipboard".into(),
+            Unavailable::new(
+                "no-session",
+                "This daemon runs as root outside any desktop session, so it has no clipboard to reach",
+            ),
+        );
+    } else if !facts.watches_clipboard_images
+        && caps.clipboard.iter().any(|w| w == "events")
+        && caps.clipboard.iter().any(|w| w == "images")
+    {
+        // `events` still pushes text; only copied images go unwatched (R8).
+        caps.unavailable.insert(
+            "clipboard-image-events".into(),
+            Unavailable::new(
+                "not-watched",
+                "Copied images are not watched on this host, so they do not sync on their own: send or fetch one with the clipboard buttons",
+            ),
+        );
+    }
+    // The viewer's button types three ordinary keys everywhere.
+    let sas = match facts.os {
+        // Until FR-97 P4a calls SendSAS.
+        OsKind::Windows => Unavailable::new(
+            "keys-only",
+            "Ctrl+Alt+Del is sent as ordinary keys: apps on the desktop get it, but the Windows lock and sign-in screens do not",
+        ),
+        // Not meaningless: the desktop binds the chord, and what it binds is
+        // worth knowing before pressing it.
+        OsKind::Linux => Unavailable::new(
+            "keys-only",
+            "Ctrl+Alt+Del is sent as ordinary keys, and the desktop decides what they do: GNOME and KDE bind them to log out",
+        ),
+        OsKind::Macos => Unavailable::new(
+            Unavailable::NOT_APPLICABLE,
+            "Ctrl+Alt+Del has no system meaning on macOS",
+        ),
+    };
+    caps.unavailable.insert("sas".into(), sas);
+    caps
 }
 
 /// The config-derived lists, assigned by the DAEMON over whatever
@@ -1481,6 +1603,9 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         // FR-101 P2b — `None` HERE for the same reason: the owner's floor is
         // live config, and `stub_caps` fills it at every announcement.
         session_policy: None,
+        // FR-97 P0c — empty HERE: the honest "no" is the daemon's
+        // (`with_honest_words`), like the config lists above.
+        unavailable: Default::default(),
     }
 }
 
@@ -2354,6 +2479,152 @@ mod tests {
             vec!["upload", "download", "download-folder", "resume", "browse"],
             "browse enabled: the same four, plus `browse`"
         );
+    }
+
+    // ─── FR-97 P0c — a word is a promise this host keeps ─────────────────
+    // Each test below fails on master, where every one of these words was a
+    // compile-time constant (the census before P0c, FR-97 §8).
+
+    fn p0c_facts(os: roomler_ai_remote_control::models::OsKind) -> HostFacts {
+        HostFacts {
+            os,
+            audio_built: true,
+            audio_backend: true,
+            watches_clipboard_images: true,
+            clipboard_reachable: true,
+        }
+    }
+
+    fn p0c_caps() -> AgentCaps {
+        AgentCaps {
+            audio: vec!["opus".into()],
+            supports_clipboard: true,
+            clipboard: ["ack", "events", "images", "html"]
+                .map(String::from)
+                .to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_host_without_an_audio_backend_offers_no_track_and_says_why() {
+        use roomler_ai_remote_control::models::OsKind;
+        let mac = with_honest_words(
+            p0c_caps(),
+            &HostFacts {
+                audio_backend: false,
+                ..p0c_facts(OsKind::Macos)
+            },
+        );
+        assert!(
+            mac.audio.is_empty(),
+            "no backend, no opus (R1): {:?}",
+            mac.audio
+        );
+        assert_eq!(mac.unavailable["audio"].code, "no-backend");
+        let linux = with_honest_words(p0c_caps(), &p0c_facts(OsKind::Linux));
+        assert_eq!(linux.audio, vec!["opus".to_string()]);
+        assert!(!linux.unavailable.contains_key("audio"));
+        // A build without the feature had nothing to claim, and says nothing.
+        let none = with_honest_words(
+            AgentCaps {
+                audio: Vec::new(),
+                ..p0c_caps()
+            },
+            &HostFacts {
+                audio_built: false,
+                audio_backend: false,
+                ..p0c_facts(OsKind::Macos)
+            },
+        );
+        assert!(!none.unavailable.contains_key("audio"));
+    }
+
+    #[test]
+    fn copied_images_are_claimed_only_where_the_watcher_reports_them() {
+        use roomler_ai_remote_control::models::OsKind;
+        let unwatched = with_honest_words(
+            p0c_caps(),
+            &HostFacts {
+                watches_clipboard_images: false,
+                ..p0c_facts(OsKind::Linux)
+            },
+        );
+        assert_eq!(
+            unwatched.unavailable["clipboard-image-events"].code,
+            "not-watched"
+        );
+        // Text events and on-request images still work: the words stay.
+        assert!(unwatched.clipboard.iter().any(|w| w == "events"));
+        assert!(unwatched.clipboard.iter().any(|w| w == "images"));
+        assert!(unwatched.supports_clipboard);
+        let watched = with_honest_words(p0c_caps(), &p0c_facts(OsKind::Windows));
+        assert!(!watched.unavailable.contains_key("clipboard-image-events"));
+    }
+
+    #[test]
+    fn a_root_daemon_outside_every_session_offers_no_clipboard() {
+        use roomler_ai_remote_control::models::OsKind;
+        let root = with_honest_words(
+            p0c_caps(),
+            &HostFacts {
+                clipboard_reachable: false,
+                watches_clipboard_images: false,
+                ..p0c_facts(OsKind::Linux)
+            },
+        );
+        assert!(!root.supports_clipboard, "R10");
+        assert!(root.clipboard.is_empty(), "{:?}", root.clipboard);
+        assert_eq!(root.unavailable["clipboard"].code, "no-session");
+        assert!(
+            !root.unavailable.contains_key("clipboard-image-events"),
+            "no clipboard at all says so once, not twice"
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_del_says_what_the_keys_reach_and_goes_on_a_mac() {
+        use roomler_ai_remote_control::models::{OsKind, Unavailable};
+        for os in [OsKind::Windows, OsKind::Linux] {
+            let c = with_honest_words(p0c_caps(), &p0c_facts(os));
+            assert_eq!(c.unavailable["sas"].code, "keys-only", "{os:?}");
+        }
+        let mac = with_honest_words(p0c_caps(), &p0c_facts(OsKind::Macos));
+        assert_eq!(mac.unavailable["sas"].code, Unavailable::NOT_APPLICABLE);
+    }
+
+    #[test]
+    fn every_reason_uses_a_known_key_and_says_something() {
+        use roomler_ai_remote_control::models::{OsKind, Unavailable};
+        for os in [OsKind::Windows, OsKind::Macos, OsKind::Linux] {
+            for reachable in [true, false] {
+                let c = with_honest_words(
+                    p0c_caps(),
+                    &HostFacts {
+                        os,
+                        audio_built: true,
+                        audio_backend: false,
+                        watches_clipboard_images: false,
+                        clipboard_reachable: reachable,
+                    },
+                );
+                for (key, why) in &c.unavailable {
+                    assert!(Unavailable::KEYS.contains(&key.as_str()), "{key}");
+                    assert!(
+                        !why.code.is_empty() && why.reason.len() > 20,
+                        "{key}: {why:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The facts this build reports for its own OS: what the census will count.
+    #[test]
+    fn this_hosts_facts_follow_its_os() {
+        let f = HostFacts::here();
+        assert_eq!(f.audio_backend, !cfg!(target_os = "macos"));
+        assert_eq!(f.watches_clipboard_images, cfg!(target_os = "windows"));
     }
 
     /// #1672 (review of #1679) — the daemon's side of the split, locked. The
