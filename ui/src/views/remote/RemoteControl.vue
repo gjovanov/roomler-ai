@@ -1255,6 +1255,16 @@
           <span>{{ (rc.relativeMouseAuto.value ? 'The host hid its cursor, so the mouse is relative' : 'Relative mouse')
             + (rc.keyboardLockActive.value ? ': hold Esc to release it' : ': Esc releases it') }}</span>
         </div>
+        <!-- FR-111 decision 4 — two fingers are panning a zoomed picture, so
+             say why the host did not scroll. -->
+        <div
+          v-if="touchPanHint"
+          class="relative-mouse-hint"
+          data-testid="rc-touch-pan-hint"
+        >
+          <v-icon size="x-small" class="mr-1">mdi-gesture-swipe</v-icon>
+          <span>Two fingers move the zoomed picture; zoom out to scroll the host</span>
+        </div>
       </div>
     </div>
     </v-card>
@@ -2153,7 +2163,7 @@ import TouchControls from '@/components/remote/TouchControls.vue'
 import type { KeepBusyPattern } from '@/composables/keepBusy'
 import { displayMatchSummary } from '@/composables/displayMatch'
 import { agentSupportsRelativeMouse, relativeMouseSwitchedOff } from '@/composables/relativeMouse'
-import { stageTouchAction } from '@/composables/touchInput'
+import { pictureOverflows, stageTouchAction } from '@/composables/touchInput'
 import { BUILTIN_PRESETS, CONTROLS_STORAGE_PREFIX, presetById, readControlsPreset } from '@/composables/touchControls'
 import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 import { asSentence } from '@/utils/sentence'
@@ -3197,6 +3207,24 @@ function onPinchZoom(factor: number, cx: number, cy: number) {
     el.scrollLeft = px * ratio - ox
     el.scrollTop = py * ratio - oy
   })
+}
+/** FR-111 decision 4 (operator, 2026-10-17) — while the picture is larger than
+ *  the stage (zoomed past it; the stage scrolls in Custom zoom), two fingers
+ *  moving together pan it instead of scrolling the host, and a one-line hint
+ *  says so. Once it fits, they scroll the host again. */
+const touchPanHint = ref(false)
+let touchPanHintTimer: ReturnType<typeof setTimeout> | null = null
+function onTwoFingerScroll(dx: number, dy: number): boolean {
+  const el = stageEl.value as HTMLElement | null
+  if (!el || !pictureOverflows(el)) return false
+  el.scrollLeft += dx
+  el.scrollTop += dy
+  touchPanHint.value = true
+  if (touchPanHintTimer) clearTimeout(touchPanHintTimer)
+  touchPanHintTimer = setTimeout(() => {
+    touchPanHint.value = false
+  }, 2500)
+  return true
 }
 /** FR-109 — the toolbar control: a click is the gesture Pointer Lock needs.
  *  Once locked the pointer is hidden, so leaving is Esc (the browser's own
@@ -4657,6 +4685,7 @@ watch(
     if (phase === 'connected' && el && !detachInput) {
       detachInput = rc.attachInput(el as HTMLElement, {
         onPinchZoom,
+        onTwoFingerScroll,
         // Phase 5: when the operator hits Ctrl+V over the viewer
         // with files in their OS clipboard, route to the upload
         // pipeline. The composable suppresses the Ctrl+V keystroke
