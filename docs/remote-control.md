@@ -241,7 +241,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:2615`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:191`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:341`, wired at `main.rs:3725`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:341`, wired at `main.rs:3746`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -375,7 +375,7 @@ flowchart LR
 ```
 
 The decision is one daemon-side seam, `with_honest_words`
-([`caps.rs:700`](../agents/roomlerd/src/encode/caps.rs#L700)), applied in
+([`caps.rs:745`](../agents/roomlerd/src/encode/caps.rs#L745)), applied in
 `detect()` ([`caps.rs:624`](../agents/roomlerd/src/encode/caps.rs#L624))
 after the config lists, over plain `HostFacts`
 ([`caps.rs:636`](../agents/roomlerd/src/encode/caps.rs#L636)), so it runs and
@@ -384,8 +384,8 @@ is tested on every OS.
 | Feature | When | What the hello says | What the viewer does |
 |---|---|---|---|
 | `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3064`](../agents/roomlerd/src/signaling.rs#L3064)); `no-backend` | the receive-audio toggle is off, with the device's reason |
-| `audio` | Linux, unless a capture device is named for it in `ROOMLERD_AUDIO_SOURCE` (FR-97 P3c-1, §5.1c) | `audio` empty; `no-monitor` | the same |
-| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:681`](../agents/roomlerd/src/encode/caps.rs#L681)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
+| `audio` | Linux with no way to the computer's sound (FR-97 P3c, §5.1c) | `audio` empty; `no-sound-server` (no Pulse client library), `no-session` (a root build without the session helper), or `no-monitor` (`ROOMLERD_AUDIO_SESSION=0` with nothing named) | the same |
+| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:726`](../agents/roomlerd/src/encode/caps.rs#L726)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone reports copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
 | `sas` | Windows, Linux | `keys-only`: the button types three ordinary keys. Windows' lock and sign-in screens ignore them (until P4a's `SendSAS`); Linux desktops bind them, GNOME and KDE to log out | the button stays, and says what the keys reach |
 | `sas` | macOS | `not-applicable`: the chord means nothing there | the button is hidden |
@@ -428,7 +428,7 @@ OS may open, and the session says why when it opens nothing.
 | OS | What a session captures | Where it cannot |
 |---|---|---|
 | Windows | WASAPI loopback of the default output device | no output device, usual on a server or a VM with no sound device: `no_output` |
-| Linux | the ALSA capture device named in `ROOMLERD_AUDIO_SOURCE`, else one named as a monitor ([`audio_source.rs:151`](../agents/roomlerd/src/audio_source.rs#L151)) | nothing named: the hello offers no track (`no-monitor`, [`caps.rs:668`](../agents/roomlerd/src/encode/caps.rs#L668)); a name that is not there: `source_not_found` |
+| Linux | the default output's monitor (`@DEFAULT_MONITOR@`) through Pulse's client library, in the daemon for a per-user install and through the seat user's helper for a root one (P3c-2, [`audio_source.rs:209`](../agents/roomlerd/src/audio_source.rs#L209)); a device named in `ROOMLERD_AUDIO_SOURCE` wins | no Pulse client library: the hello offers no track (`no-sound-server`, [`caps.rs:684`](../agents/roomlerd/src/encode/caps.rs#L684)); a root daemon with nobody at the screen: `no_session`; a named device that is not there: `source_not_found`; `ROOMLERD_AUDIO_SESSION=0`: P3c-1's rule, a named device or `no-monitor` |
 | macOS | nothing yet (ScreenCaptureKit audio is FR-97 P2a) | the hello offers no track (`no-backend`, §5.1b) |
 
 ⚠️ **On Linux the default input is a microphone, and before P3c-1 it was the
@@ -457,8 +457,51 @@ PULSE_SOURCE=@DEFAULT_MONITOR@
 
 `PULSE_SOURCE` points the `pulse` device at the default output's monitor
 (measured on the same host). Without it, `pulse` is the microphone again, by
-the owner's own choice. A root daemon reaches no session's sound server this
-way: capturing the session's monitor for it is P3c-2.
+the owner's own choice. Since P3c-2 nobody needs to name anything for the
+speakers: the override is for a device the owner prefers.
+
+**The monitor, without naming anything (P3c-2).** PulseAudio and PipeWire's
+Pulse server both resolve the device name `@DEFAULT_MONITOR@` to the default
+sink's monitor, so the agent records that through Pulse's own client library
+([`pulse.rs`](../agents/roomlerd/src/audio/pulse.rs)). One route function
+decides, for the hello and for every session alike:
+
+```mermaid
+flowchart TD
+    A["linux_route<br/>(audio_source.rs)"] --> N{"a device named in<br/>ROOMLERD_AUDIO_SOURCE?"}
+    N -->|yes| C["cpal: that ALSA device<br/>(the owner's choice)"]
+    N -->|no| K{"ROOMLERD_AUDIO_SESSION=0?"}
+    K -->|yes| R1["refuse: no_monitor<br/>(P3c-1's rule)"]
+    K -->|no| L{"libpulse-simple.so.0<br/>present?"}
+    L -->|no| R2["refuse: no_sound_server"]
+    L -->|yes| U{"daemon runs as root?"}
+    U -->|no| P["PulseCapture: @DEFAULT_MONITOR@<br/>in this process"]
+    U -->|yes| H["HelperCapture: portal-helper --audio<br/>as the seat user, PCM on its stdout"]
+    H -->|nobody at the screen| R3["refuse: no_session"]
+```
+
+- **In the daemon** for a per-user install, which is already the session's
+  owner ([`pulse.rs:369`](../agents/roomlerd/src/audio/pulse.rs#L369)). One
+  plain thread owns the blocking `pa_simple` stream and hands 10 ms frames
+  (48 kHz stereo s16, the encoder's own format) to the pump.
+- **Through the seat user's helper** for a root daemon
+  ([`pulse.rs:519`](../agents/roomlerd/src/audio/pulse.rs#L519)). It is the same
+  `portal-helper` subcommand, session lookup and privilege drop that portal
+  capture and keep-busy use. PulseAudio admits a client by uid or cookie, so
+  root cannot record the session's server itself. The helper writes one marked
+  line and then raw PCM on stdout ([`pulse.rs:443`](../agents/roomlerd/src/audio/pulse.rs#L443)).
+  Closing the pipe stops it.
+- **The library is loaded at run time** (`dlopen`), as libpipewire is. It is on
+  nearly every desktop and on few servers. A link would stop the agent from
+  starting on a host without it; this way only session audio says why.
+- **The hello asks the disk, not the loader**
+  ([`pulse.rs:124`](../agents/roomlerd/src/audio/pulse.rs#L124)). libpulse pulls
+  a dozen libraries into whatever loads it, and a root daemon never needs them
+  itself. A library somewhere unusual reads as absent: an honest no.
+- **Kill switch:** `ROOMLERD_AUDIO_SESSION=0` puts Linux back on P3c-1's rule.
+
+⚠️ **None of these routes is the default input.** Each one records the
+default sink's monitor, or the device the owner named.
 
 When the track cannot carry sound, the agent says why over the control channel:
 
@@ -491,6 +534,8 @@ and puts it on the toggle's title
 | `no_output` | Windows: no output device to loop back |
 | `backend_error` | the device failed to open, the Opus encoder did not start, or capture stopped mid-session; `detail` is the backend's own words |
 | `not_supported` | an OS with no capture backend |
+| `no_sound_server` | Linux: no Pulse client library, or no sound server would take the stream (`detail` carries libpulse's words, e.g. "Connection refused") |
+| `no_session` | Linux: a root daemon with nobody signed in at the screen, so there is no session sound |
 
 ⚠️ **`rc:audio-unavailable` is its own message, not an `rc:media-unavailable`
 code.** A viewer that predates it ignores it, where the video notice would put
@@ -498,10 +543,12 @@ code.** A viewer that predates it ignores it, where the video notice would put
 control-DC JSON between the peers, so it touches neither the server wire nor
 the composition baseline.
 
-⚠️ **The recorder shares the rule.** A recording's computer audio opens the
-same loopback or monitor only (`Source::SystemOnly`), so on Linux it refuses
-its start by name until a device is named, as it always did in practice; only
-its words changed.
+⚠️ **The recorder shares the route.** A recording's computer audio opens the
+same loopback or monitor only. On Linux it takes `linux_route` too
+([`child.rs:128`](../agents/roomlerd/src/recording/child.rs#L128)), and since
+the recorder already runs as the person at the screen, it records the monitor
+in its own process. Before P3c-2 it refused its start on every Linux host,
+because the `.monitor` pick never matched.
 
 ### 5.2 Encoder selection
 

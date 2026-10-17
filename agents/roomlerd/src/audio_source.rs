@@ -91,6 +91,12 @@ pub enum AudioUnavailableCode {
     BackendError,
     /// This OS has no system-audio capture (macOS until FR-97 P2a).
     NotSupported,
+    /// FR-97 P3c-2 — Linux: no sound server could be reached, or no Pulse
+    /// client library to reach one with.
+    NoSoundServer,
+    /// FR-97 P3c-2 — a root daemon with nobody signed in at the screen: there
+    /// is no session, so no session sound.
+    NoSession,
 }
 
 impl AudioUnavailableCode {
@@ -103,6 +109,8 @@ impl AudioUnavailableCode {
             Self::NoOutput => "no_output",
             Self::BackendError => "backend_error",
             Self::NotSupported => "not_supported",
+            Self::NoSoundServer => "no_sound_server",
+            Self::NoSession => "no_session",
         }
     }
 
@@ -130,8 +138,102 @@ impl AudioUnavailableCode {
             Self::NotSupported => {
                 "This host's OS cannot capture the computer's sound yet, so the session carries none."
             }
+            Self::NoSoundServer => {
+                "This host sends no sound: the agent could not reach the session's sound server \
+                 (PulseAudio, or PipeWire's Pulse server), or this host has no Pulse client library."
+            }
+            Self::NoSession => {
+                "This host sends no sound: nobody is signed in at its screen, so there is no session \
+                 sound to capture."
+            }
         }
     }
+}
+
+/// FR-97 P3c-2's kill switch: `ROOMLERD_AUDIO_SESSION=0` puts Linux back on
+/// P3c-1's rule (a named device, or nothing). On by default.
+pub fn session_audio_enabled() -> bool {
+    tunnel_core::env::node_env("AUDIO_SESSION").is_none_or(|v| v.trim() != "0")
+}
+
+/// How Linux reaches the computer's sound, decided once for the hello and
+/// again for each session, by the same function ([`linux_route`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxRoute {
+    /// The ALSA device the host's owner named (`ROOMLERD_AUDIO_SOURCE`),
+    /// through cpal. An explicit choice, so it wins.
+    Named,
+    /// The default output's monitor, recorded in this process through Pulse's
+    /// client library: a per-user daemon is already the session's owner.
+    Pulse,
+    /// The same, recorded by the seat user's helper (`portal-helper --audio`):
+    /// a root daemon reaches no session's sound server itself, because
+    /// PulseAudio admits a client by uid or cookie.
+    Helper,
+}
+
+/// The facts [`linux_route`] decides on, as plain values so it is tested on
+/// every OS.
+#[derive(Debug, Clone, Copy)]
+pub struct LinuxAudioFacts {
+    pub named: bool,
+    pub session_audio: bool,
+    /// `libpulse-simple.so.0` loads.
+    pub pulse_lib: bool,
+    pub root: bool,
+    /// This build carries the seat-user helper (`portal-capture`).
+    pub helper_built: bool,
+}
+
+/// This process's facts for [`linux_route`]. `pulse_lib` is the caller's: the
+/// hello asks the disk (`audio::pulse::present`), and a capture asks the
+/// loader when it opens.
+pub fn linux_facts(pulse_lib: bool) -> LinuxAudioFacts {
+    #[cfg(unix)]
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let root = unsafe { libc::geteuid() } == 0;
+    #[cfg(not(unix))]
+    let root = false;
+    LinuxAudioFacts {
+        named: named().is_some(),
+        session_audio: session_audio_enabled(),
+        pulse_lib,
+        root,
+        helper_built: cfg!(all(target_os = "linux", feature = "portal-capture")),
+    }
+}
+
+/// The Linux route to the computer's sound, or why there is none. ⚠️ Every
+/// route captures a monitor or the owner's named device: none of them is the
+/// default input.
+pub fn linux_route(f: LinuxAudioFacts) -> Result<LinuxRoute, AudioUnavailable> {
+    if f.named {
+        return Ok(LinuxRoute::Named);
+    }
+    if !f.session_audio {
+        return Err(AudioUnavailable::new(
+            AudioUnavailableCode::NoMonitor,
+            "session audio is switched off on this host (ROOMLERD_AUDIO_SESSION=0), and no capture \
+             device is named",
+        ));
+    }
+    if !f.pulse_lib {
+        return Err(AudioUnavailable::new(
+            AudioUnavailableCode::NoSoundServer,
+            "no Pulse client library (libpulse-simple.so.0) on this host",
+        ));
+    }
+    if !f.root {
+        return Ok(LinuxRoute::Pulse);
+    }
+    if f.helper_built {
+        return Ok(LinuxRoute::Helper);
+    }
+    Err(AudioUnavailable::new(
+        AudioUnavailableCode::NoSession,
+        "this daemon runs as root and was built without the session helper that records a \
+         session's sound",
+    ))
 }
 
 /// The capture device the host's owner named for computer audio
@@ -239,6 +341,77 @@ mod tests {
         assert_eq!(other.detail, "WASAPI said no");
     }
 
+    fn facts() -> LinuxAudioFacts {
+        LinuxAudioFacts {
+            named: false,
+            session_audio: true,
+            pulse_lib: true,
+            root: false,
+            helper_built: true,
+        }
+    }
+
+    #[test]
+    fn a_per_user_daemon_records_the_monitor_itself_and_root_through_the_seat_user() {
+        assert_eq!(linux_route(facts()), Ok(LinuxRoute::Pulse));
+        assert_eq!(
+            linux_route(LinuxAudioFacts {
+                root: true,
+                ..facts()
+            }),
+            Ok(LinuxRoute::Helper)
+        );
+        let no_helper = linux_route(LinuxAudioFacts {
+            root: true,
+            helper_built: false,
+            ..facts()
+        })
+        .unwrap_err();
+        assert_eq!(no_helper.code, AudioUnavailableCode::NoSession);
+    }
+
+    #[test]
+    fn a_named_device_wins_even_with_session_audio_off_or_no_library() {
+        for (session_audio, pulse_lib, root) in [(false, false, false), (true, false, true)] {
+            assert_eq!(
+                linux_route(LinuxAudioFacts {
+                    named: true,
+                    session_audio,
+                    pulse_lib,
+                    root,
+                    helper_built: false,
+                }),
+                Ok(LinuxRoute::Named)
+            );
+        }
+    }
+
+    #[test]
+    fn the_kill_switch_is_p3c_1s_rule_and_a_missing_library_says_so() {
+        let off = linux_route(LinuxAudioFacts {
+            session_audio: false,
+            ..facts()
+        })
+        .unwrap_err();
+        assert_eq!(off.code, AudioUnavailableCode::NoMonitor);
+        assert!(
+            off.detail.contains("ROOMLERD_AUDIO_SESSION=0"),
+            "{}",
+            off.detail
+        );
+        let no_lib = linux_route(LinuxAudioFacts {
+            pulse_lib: false,
+            ..facts()
+        })
+        .unwrap_err();
+        assert_eq!(no_lib.code, AudioUnavailableCode::NoSoundServer);
+        assert!(
+            no_lib.detail.contains("libpulse-simple"),
+            "{}",
+            no_lib.detail
+        );
+    }
+
     #[test]
     fn the_detail_is_capped_on_a_char_boundary() {
         let long = "é".repeat(AudioUnavailable::DETAIL_MAX + 50);
@@ -255,6 +428,8 @@ mod tests {
             NoOutput,
             BackendError,
             NotSupported,
+            NoSoundServer,
+            NoSession,
         ];
         let mut wires: Vec<&str> = all.iter().map(|c| c.wire()).collect();
         wires.sort_unstable();

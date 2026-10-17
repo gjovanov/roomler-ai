@@ -272,6 +272,12 @@ enum Command {
         /// and post nothing.
         #[arg(long)]
         notify_probe: bool,
+        /// FR-97 P3c-2 — record this session's sound (the default output's
+        /// monitor, never a microphone) and write raw 48 kHz stereo s16le on
+        /// stdout after one marked line, until the daemon closes the pipe.
+        /// ⚠️ stdout is BINARY in this mode.
+        #[arg(long)]
+        audio: bool,
     },
     /// (internal, Linux) FR-45 P2b — open a portal ScreenCast session THROUGH
     /// the session helper and print what came back.
@@ -1630,10 +1636,24 @@ async fn daemon_main() -> Result<()> {
             keep_busy,
             notify,
             notify_probe,
+            audio,
         } => {
             #[cfg(all(target_os = "linux", feature = "portal-capture"))]
             {
-                if notify_probe {
+                if audio {
+                    #[cfg(feature = "audio")]
+                    roomlerd::audio::pulse::serve_helper();
+                    // The parent reads the marked line: a build without the
+                    // feature says so there rather than exit with silence.
+                    #[cfg(not(feature = "audio"))]
+                    println!(
+                        "ROOMLER_AUDIO_FAILED:{}",
+                        serde_json::json!({
+                            "code": "backend_error",
+                            "detail": "this build has no audio capture"
+                        })
+                    );
+                } else if notify_probe {
                     roomlerd::indicator::notify::run_probe_helper();
                 } else if notify {
                     roomlerd::indicator::notify::run_helper();
@@ -1661,6 +1681,7 @@ async fn daemon_main() -> Result<()> {
                     keep_busy,
                     notify,
                     notify_probe,
+                    audio,
                 );
                 anyhow::bail!(
                     "portal-helper is Linux-only and needs the `portal-capture` feature; this \

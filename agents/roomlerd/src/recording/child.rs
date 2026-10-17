@@ -115,7 +115,19 @@ fn open_system_audio() -> Result<Box<dyn crate::audio::AudioCapture>> {
             440.0, 44_100, 1, 8_000.0,
         )));
     }
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    // FR-97 P3c-2 — the live path's own route: the owner's named device, or
+    // the default output's monitor through Pulse's client library. The
+    // recorder already runs as the person at the screen, so it records in
+    // this process; never a microphone.
+    #[cfg(target_os = "linux")]
+    {
+        const _: () = assert!(
+            super::system_audio_supported(),
+            "a monitor opens here, so `system_audio_supported` must say so"
+        );
+        crate::audio::open_linux_system_audio().map_err(anyhow::Error::new)
+    }
+    #[cfg(target_os = "windows")]
     {
         const _: () = assert!(
             super::system_audio_supported(),
