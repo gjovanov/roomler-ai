@@ -1138,7 +1138,7 @@ pub fn pick_latest_release(mut releases: Vec<GithubRelease>) -> Option<GithubRel
 
 /// Name prefix of a private per-download staging directory. A cleanup
 /// recognises its own by this prefix and removes nothing else.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 const STAGING_DIR_PREFIX: &str = "roomlerd-update.";
 
 /// Where a just-downloaded installer is staged before it runs.
@@ -1167,11 +1167,200 @@ fn stage_dir() -> std::io::Result<PathBuf> {
     Ok(td.keep())
 }
 
-/// macOS/Windows: the per-user (macOS `confstr(_CS_DARWIN_USER_TEMP_DIR)`) or
-/// SYSTEM (Windows `GetTempPath2`) temp dir is already a trust boundary, and a
-/// fixed name is needed on Windows where the companion refresh re-downloads the
-/// same asset name across calls — so the historical shared dir is kept.
-#[cfg(not(target_os = "linux"))]
+/// Windows: a fresh, private staging directory per download — Linux's #2055
+/// fix, applied to the second OS with the identical flaw.
+///
+/// GHSA-r3xj-4wh9-xh2v: on an **unpatched Win10 SYSTEM** install (no
+/// KB5053594 or the equivalent; Win11 and Server 2022+ are unaffected, and a
+/// patched Win10 is not either — see the advisory for the version split),
+/// `std::env::temp_dir()` for the SYSTEM account falls back to the Win32
+/// `GetTempPath` behaviour and resolves to the SHARED `C:\Windows\Temp`,
+/// whose default ACL lets any authenticated standard user create a
+/// subdirectory there and own it. That is Linux's #2055 shape one OS over: a
+/// local user pre-creates `roomlerd-update\`, owns it, and in the window
+/// between this download's in-memory verification and `msiexec`'s own
+/// re-read of the PATH, swaps in their own MSI — SYSTEM installs it.
+///
+/// Two cases, because only ONE of them can safely carry a hardened DACL:
+///
+/// * **This process is actually holding the SYSTEM token right now**
+///   ([`running_as_system`] — the LIVE token, never "SystemContext is
+///   configured": a perMachine service that has winlogon-token-swapped to
+///   the console user (M3 A1) is no longer SYSTEM by the time this runs).
+///   [`create_fresh_protected_dir`] makes a directory nobody but SYSTEM and
+///   Administrators can read or write, DACL applied AT CREATION so there is
+///   no window where it exists with the parent's permissive, inherited ACL.
+/// * **Everyone else** — a perUser install (runs as the signed-in user, whose
+///   `%TEMP%` is already a private, per-user trust boundary — nobody else
+///   can write there regardless of the dir's own ACL) or a perMachine worker
+///   that is not, right now, SYSTEM. A SYSTEM-and-Administrators-only DACL
+///   would lock either of those OUT of its own staging dir, so they get
+///   [`stage_dir_as_current_user`] instead: still fresh and privately named
+///   (closing the swap window the same way Linux's mkdtemp does — a
+///   non-owner cannot create, rename or unlink inside a directory it does
+///   not own), just without the extra DACL that would backfire here.
+///
+/// A fresh dir per call also retires the old reason the shared name existed
+/// (the companion refresh re-downloading `roomler-desktop.exe` under the same
+/// name): each download is alone in its own directory now, so there is
+/// nothing left for a shared name to coordinate.
+#[cfg(target_os = "windows")]
+fn stage_dir() -> std::io::Result<PathBuf> {
+    if running_as_system() {
+        create_fresh_protected_dir(&std::env::temp_dir())
+    } else {
+        stage_dir_as_current_user()
+    }
+}
+
+/// Is this process, right now, holding the LocalSystem token? `S-1-5-18` is
+/// the one well-known SID LocalSystem always has, on every Windows version —
+/// unlike "is SystemContext configured", this reads the LIVE token, so a
+/// worker that has winlogon-token-swapped to the console user (M3 A1)
+/// correctly reads `false` here even on a SystemContext-enabled install.
+#[cfg(target_os = "windows")]
+fn running_as_system() -> bool {
+    is_system_sid(crate::win_token::own_user_sid().as_deref())
+}
+
+/// Pure half of [`running_as_system`], so the comparison is unit-testable
+/// without a real token.
+#[cfg(target_os = "windows")]
+fn is_system_sid(sid: Option<&str>) -> bool {
+    sid == Some("S-1-5-18")
+}
+
+/// The non-SYSTEM staging dir: fresh and privately named, exactly like
+/// Linux's mkdtemp (no chmod step needed — a per-user `%TEMP%` already keeps
+/// other accounts out, so there is no inherited ACL here to harden).
+#[cfg(target_os = "windows")]
+fn stage_dir_as_current_user() -> std::io::Result<PathBuf> {
+    let td = tempfile::Builder::new()
+        .prefix(STAGING_DIR_PREFIX)
+        .tempdir_in(std::env::temp_dir())?;
+    Ok(td.keep())
+}
+
+/// A security descriptor built from SDDL, and the `SECURITY_ATTRIBUTES` that
+/// hand it to `CreateDirectoryW`. Freed on drop.
+///
+/// Deliberately its own copy rather than a shared import: `hive_win::Sddl` is
+/// the identical shape but compiles only with the optional `hive` feature,
+/// and `win_service::stop_event` builds its descriptor inline for one event —
+/// neither is reachable from every Windows build the way this fix must be.
+/// `exec_service.rs` carries the same duplicate for the same reason (its own
+/// doc comment says so); this is the fourth copy, not the first.
+#[cfg(target_os = "windows")]
+struct ProtectedDirSd {
+    sa: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+    psd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+}
+
+#[cfg(target_os = "windows")]
+impl ProtectedDirSd {
+    /// `O:BA` — owner explicitly Administrators, same as the exec-service
+    /// anchor dir's `DIR_SDDL` (`exec_service.rs`) and for the identical
+    /// reason: an owner always keeps WRITE_DAC on its own object regardless
+    /// of the DACL, so leaving the owner field out would default it to
+    /// whichever token happened to call `CreateDirectoryW` — correct when
+    /// that is SYSTEM (the only caller [`running_as_system`] permits in
+    /// production), but a silent weakening if this were ever reached by
+    /// anyone else. Naming the owner makes that reachable only by failing
+    /// outright instead: an unprivileged caller cannot assign an owner it is
+    /// not itself or a member of, so `CreateDirectoryW` refuses rather than
+    /// quietly creating something weaker than the DACL below promises.
+    /// `D:P` protected (no inheritance from the world-writable parent);
+    /// SYSTEM and BUILTIN\Administrators get `FILE_ALL_ACCESS` (`OICI` —
+    /// object+container inherit, so the installer, its `.log`, and the
+    /// staged watcher copy this directory holds all inherit the same grant);
+    /// nobody else is named, so nobody else gets anything.
+    const SDDL: &'static str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+    fn new() -> std::io::Result<Self> {
+        use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+        use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+        let wide: Vec<u16> = Self::SDDL
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated string; `psd` receives a LocalAlloc'd
+        // descriptor, freed in Drop. The size out-param is optional.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                1, // SDDL_REVISION_1
+                &mut psd,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            sa: SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: psd,
+                bInheritHandle: 0,
+            },
+            psd,
+        })
+    }
+
+    fn attributes(&mut self) -> *mut windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        &raw mut self.sa
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ProtectedDirSd {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::LocalFree;
+        // SAFETY: the one descriptor ConvertStringSecurityDescriptor… made.
+        unsafe { LocalFree(self.psd as _) };
+    }
+}
+
+/// Make a fresh, uniquely-named directory under `base`, its DACL set AT
+/// CREATION ([`ProtectedDirSd`]) so there is never a moment where it exists
+/// with the parent's permissive, inherited ACL. Retries on a name collision
+/// with a fresh random suffix (mkdtemp semantics) — `tempfile` cannot be used
+/// here because its `Builder` has no way to pass Windows security attributes.
+#[cfg(target_os = "windows")]
+fn create_fresh_protected_dir(base: &std::path::Path) -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    for _ in 0..8 {
+        let name = format!("{}{:016x}", STAGING_DIR_PREFIX, rand::random::<u64>());
+        let dir = base.join(name);
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut sd = ProtectedDirSd::new()?;
+        // SAFETY: a NUL-terminated path; the descriptor lives in `sd` for the
+        // duration of this call.
+        let ok = unsafe { CreateDirectoryW(wide.as_ptr(), sd.attributes()) };
+        if ok != 0 {
+            return Ok(dir);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(e);
+        }
+        // Name collision — try again with a fresh random suffix.
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique staging dir name",
+    ))
+}
+
+/// macOS: the per-user `confstr(_CS_DARWIN_USER_TEMP_DIR)` temp dir is
+/// already a trust boundary, so the historical shared dir is kept as-is.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn stage_dir() -> std::io::Result<PathBuf> {
     let dir = std::env::temp_dir().join("roomlerd-update");
     std::fs::create_dir_all(&dir)?;
@@ -1180,12 +1369,12 @@ fn stage_dir() -> std::io::Result<PathBuf> {
 
 /// Write the downloaded installer to its staging path.
 ///
-/// ⚠️ Linux: `O_CREAT|O_EXCL` (`create_new`) — refuse to write through anything
-/// already at the name rather than follow a symlink or truncate a planted file.
-/// Belt to [`stage_dir`]'s braces (the fresh private dir already means nobody
-/// else can plant here); kept because the cost is one flag and what is written
-/// runs as root.
-#[cfg(target_os = "linux")]
+/// ⚠️ Linux and Windows: `O_CREAT|O_EXCL` (`create_new`) — refuse to write
+/// through anything already at the name rather than follow a symlink or
+/// truncate a planted file. Belt to [`stage_dir`]'s braces (the fresh private
+/// dir already means nobody else can plant here); kept because the cost is
+/// one flag and what is written runs as root/SYSTEM.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn write_installer(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
@@ -1195,21 +1384,20 @@ fn write_installer(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> 
     f.write_all(bytes)
 }
 
-/// macOS/Windows: the shared staging dir reuses a file name per release (the
-/// Windows companion refresh re-downloads the same name), so a create-or-
-/// truncate is what the repeated download needs.
-#[cfg(not(target_os = "linux"))]
+/// macOS: the shared staging dir reuses a file name per release, so a
+/// create-or-truncate is what a repeated download needs.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn write_installer(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
 }
 
 /// Whether `dir` is one of our private staging directories, by name
-/// (`STAGING_DIR_PREFIX` + mkdtemp's random suffix) and location (directly in
+/// (`STAGING_DIR_PREFIX` + a random suffix) and location (directly in
 /// `temp_dir()`). Name-and-place only, on purpose: the guard's job is to stop a
 /// cleanup touching a path that is NOT ours — the old fixed `roomlerd-update`
 /// (no trailing dot, so excluded) from a pre-fix build, or a wizard-supplied
 /// installer elsewhere.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn is_staging_dir(dir: &std::path::Path) -> bool {
     dir.parent() == Some(std::env::temp_dir().as_path())
         && dir
@@ -1220,9 +1408,10 @@ fn is_staging_dir(dir: &std::path::Path) -> bool {
 
 /// Remove the private staging directory that holds `installer_path`, if it is
 /// one of ours. Best-effort: a failure is logged, never fatal. `remove_dir_all`
-/// does not follow symlinks (std ≥ 1.58.1); in a 0755 dir nobody else could
-/// have planted one anyway.
-#[cfg(target_os = "linux")]
+/// does not follow symlinks (std ≥ 1.58.1); nobody else could have planted one
+/// in a directory only we own (Linux: 0755 and caller-owned; Windows: SYSTEM
+/// is the caller, or the per-user `%TEMP%` already keeps everyone else out).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn discard_staging(installer_path: &std::path::Path) {
     let Some(dir) = installer_path.parent() else {
         return;
@@ -1241,16 +1430,102 @@ fn discard_staging(installer_path: &std::path::Path) {
     }
 }
 
+/// How old an abandoned Windows staging directory must be before
+/// [`sweep_stale_update_staging_at_start`] will remove it. Generous relative
+/// to how long this daemon's own post-install watcher ever runs (a wedged
+/// msiexec resolves via RestartManager well under a minute in every field
+/// case logged here; the FR-93 lab's own forced-exit watchdog fires around
+/// 90s) specifically so the sweep at the NEXT startup can never be unsure
+/// whether THIS update's watcher might still be using its directory.
+#[cfg(target_os = "windows")]
+const STALE_STAGING_DIR_AGE: Duration = Duration::from_secs(3600);
+
+/// Pure half of the sweep's age gate, so the threshold is unit-testable
+/// without fabricating directory timestamps.
+#[cfg(target_os = "windows")]
+fn is_stale(age: Duration) -> bool {
+    age >= STALE_STAGING_DIR_AGE
+}
+
+/// GHSA-r3xj-4wh9-xh2v — remove this daemon's own abandoned staging
+/// directories from a PRIOR update, once, at startup (called from `main.rs`
+/// next to the Linux `tarball_owner` repair, behind the same single-instance
+/// lock).
+///
+/// ⚠️ Why startup, and not inside [`download_asset`] where the directory is
+/// made: `download_asset` is shared plumbing — `check_once`, `pin_version`,
+/// and the companion refresh (`crate::companion`) all call it, from
+/// independent tokio tasks that are **not** serialised against each other. A
+/// sweep run there could find and remove another call's directory while its
+/// download is still in flight, or — worse — remove the directory a
+/// just-spawned watcher is still retrying an install from. Neither hazard
+/// exists at startup: this runs once, before any update task is spawned, so
+/// every directory it can find was made by a PREVIOUS process generation
+/// that already exited after creating it (every success path here ends in
+/// [`spawn_installer_with_watch`] followed by `std::process::exit` — see its
+/// doc comment). [`STALE_STAGING_DIR_AGE`] is the second, independent guard
+/// for the one remaining edge: an update's watcher may still be running when
+/// the FRESH binary it just installed reaches ITS OWN startup (an MSI install
+/// restarts the service while the watcher is still polling it), so a
+/// directory younger than the gate is left for a later start to reconsider
+/// rather than risk deleting what that watcher is still using.
+///
+/// Best-effort: nothing to sweep is the normal case on every start, and a
+/// removal failure — most likely a file a surviving watcher still holds open
+/// — is logged and skipped, never fatal, exactly like Linux's
+/// [`discard_staging`].
+pub fn sweep_stale_update_staging_at_start() {
+    let base = std::env::temp_dir();
+    let entries = match std::fs::read_dir(&base) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                dir = %base.display(),
+                "update: could not list the temp dir for the staging sweep"
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !is_staging_dir(&dir) {
+            continue;
+        }
+        let age = std::fs::metadata(&dir)
+            .ok()
+            .and_then(|m| m.created().ok())
+            .and_then(|created| created.elapsed().ok());
+        // Unknown age (exotic on NTFS) is treated the same as "too young":
+        // the safe default when staleness can't be proven is to leave it for
+        // a later start to judge, not to guess and remove it now.
+        if !age.is_some_and(is_stale) {
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => tracing::info!(
+                dir = %dir.display(),
+                "update: removed a staging dir left by a prior update"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                dir = %dir.display(),
+                "update: could not remove a stale staging dir"
+            ),
+        }
+    }
+}
+
 /// Discard a staged download that will not be installed (a failed verification,
-/// or the debug dry-run). Linux: the whole private dir (it holds only this
-/// file). Elsewhere: the file alone — the staging dir is shared across
+/// or the debug dry-run). Linux and Windows: the whole private dir (it holds
+/// only this file). macOS: the file alone — its staging dir is shared across
 /// downloads.
 fn discard_download(path: &std::path::Path) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         discard_staging(path);
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = std::fs::remove_file(path);
     }
@@ -4552,6 +4827,329 @@ mod tests {
 
         // A path whose parent is not a staging dir at all: a no-op, no panic.
         discard_staging(std::path::Path::new("/usr/bin/roomlerd"));
+    }
+
+    // ── GHSA-r3xj-4wh9-xh2v: the Windows private staging dir ──────────
+
+    /// Every download gets its own directory, recognised by [`is_staging_dir`]
+    /// and never the shared legacy name — exercised through the real
+    /// [`stage_dir`] dispatcher, so this passes whichever branch the test
+    /// process's own identity happens to route through (ordinary dev/CI
+    /// accounts take the non-SYSTEM path; a field-verification run as SYSTEM
+    /// — see the advisory's own field-verification note — takes the hardened
+    /// one; both produce a fresh, recognised directory, which is all this
+    /// asserts).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn staging_dir_is_fresh_and_ours() {
+        let a = stage_dir().expect("stage_dir a");
+        let b = stage_dir().expect("stage_dir b");
+        assert_ne!(a, b, "each download gets a fresh directory");
+        for d in [&a, &b] {
+            assert!(
+                is_staging_dir(d),
+                "our own dir is recognised: {}",
+                d.display()
+            );
+        }
+        assert!(
+            !is_staging_dir(std::env::temp_dir().as_path()),
+            "temp_dir itself is not one of ours"
+        );
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn is_system_sid_recognises_only_local_system() {
+        assert!(is_system_sid(Some("S-1-5-18")));
+        assert!(!is_system_sid(None));
+        assert!(!is_system_sid(Some("S-1-5-21-111-222-333-1001")));
+        // BUILTIN\Administrators — a trusted group, but not SYSTEM, and the
+        // whole point of the gate is to tell the two apart.
+        assert!(!is_system_sid(Some("S-1-5-32-544")));
+    }
+
+    /// Read back `dir`'s owner + DACL and confirm only SYSTEM or
+    /// BUILTIN\Administrators have any write-like access — the same shape as
+    /// `exec_service`'s `check_private`, duplicated here for the same reason
+    /// that one duplicates `hive_win::Sddl` (see [`ProtectedDirSd`]'s doc
+    /// comment).
+    #[cfg(target_os = "windows")]
+    fn assert_dacl_is_system_and_admins_only(dir: &std::path::Path) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+        };
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION,
+            GetAce, GetAclInformation, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
+            PSECURITY_DESCRIPTOR, PSID, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, OPEN_EXISTING, READ_CONTROL,
+        };
+
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+        const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+        const INHERIT_ONLY_ACE: u8 = 0x08;
+        const WRITE_LIKE: u32 = 0x2 // FILE_WRITE_DATA / FILE_ADD_FILE
+            | 0x4 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+            | 0x10 // FILE_WRITE_EA
+            | 0x40 // FILE_DELETE_CHILD
+            | 0x100 // FILE_WRITE_ATTRIBUTES
+            | 0x1_0000 // DELETE
+            | 0x4_0000 // WRITE_DAC
+            | 0x8_0000 // WRITE_OWNER
+            | 0x1000_0000 // GENERIC_ALL
+            | 0x4000_0000; // GENERIC_WRITE
+
+        fn is_well_known(sid: PSID, kind: i32) -> bool {
+            // SAFETY: `sid` points into a descriptor that outlives the call.
+            !sid.is_null() && unsafe { IsWellKnownSid(sid, kind) } != 0
+        }
+        fn is_trusted(sid: PSID) -> bool {
+            is_well_known(sid, WinLocalSystemSid) || is_well_known(sid, WinBuiltinAdministratorsSid)
+        }
+
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: a NUL-terminated directory path; FILE_FLAG_BACKUP_SEMANTICS
+        // is required to open a directory handle at all.
+        let handle: HANDLE = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                READ_CONTROL,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            handle, INVALID_HANDLE_VALUE,
+            "opening the staging dir for READ_CONTROL"
+        );
+
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: `handle` was just opened with READ_CONTROL; the out-params
+        // point into `psd`, freed below.
+        let rc = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut psd,
+            )
+        };
+        // SAFETY: a handle this function opened and owns exclusively.
+        unsafe { CloseHandle(handle) };
+        assert_eq!(rc, 0, "GetSecurityInfo on the staging dir");
+
+        assert!(
+            is_trusted(owner),
+            "staging dir is owned by SYSTEM or Administrators"
+        );
+        assert!(
+            !dacl.is_null(),
+            "staging dir has a DACL (not NULL — everyone)"
+        );
+
+        let mut info = ACL_SIZE_INFORMATION {
+            AceCount: 0,
+            AclBytesInUse: 0,
+            AclBytesFree: 0,
+        };
+        // SAFETY: `dacl` is valid inside `psd`, which outlives this block.
+        let ok = unsafe {
+            GetAclInformation(
+                dacl,
+                (&raw mut info).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        };
+        assert_ne!(ok, 0, "reading the DACL's ACE count");
+
+        for i in 0..info.AceCount {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `i` < AceCount; `ace` points into the ACL inside `psd`.
+            assert_ne!(unsafe { GetAce(dacl, i, &mut ace) }, 0, "reading ACE {i}");
+            // SAFETY: every ACE starts with an ACE_HEADER.
+            let header = unsafe { &*(ace as *const ACE_HEADER) };
+            if header.AceFlags & INHERIT_ONLY_ACE != 0 {
+                continue;
+            }
+            match header.AceType {
+                ACCESS_DENIED_ACE_TYPE => {}
+                ACCESS_ALLOWED_ACE_TYPE => {
+                    // SAFETY: ACCESS_ALLOWED_ACE layout — header(4) + mask(4)
+                    // + SID, which GetAce guarantees fits within AceSize.
+                    let mask = unsafe {
+                        std::ptr::read_unaligned((ace as *const u8).add(4) as *const u32)
+                    };
+                    let sid = unsafe { (ace as *mut u8).add(8) } as PSID;
+                    if mask & WRITE_LIKE != 0 {
+                        assert!(
+                            is_trusted(sid),
+                            "an ACE grants write-like access to someone other than \
+                             SYSTEM/Administrators"
+                        );
+                    }
+                }
+                other => panic!("unexpected ACE type {other} on the staging dir"),
+            }
+        }
+        // SAFETY: the descriptor GetSecurityInfo allocated.
+        unsafe { LocalFree(psd as _) };
+    }
+
+    /// [`create_fresh_protected_dir`] is what [`stage_dir`] calls when
+    /// [`running_as_system`] is true — exercised directly here because the
+    /// test process itself is not SYSTEM. `ProtectedDirSd`'s SDDL names
+    /// `O:BA` explicitly (see its doc comment), so an ordinary, unelevated
+    /// test account cannot even assign that owner: `CreateDirectoryW` is
+    /// expected to refuse outright rather than silently create something
+    /// weaker than the DACL promises. Either outcome is correct and this
+    /// asserts on whichever one this process's own privilege produces: if
+    /// creation succeeds (a SYSTEM test run, or an elevated/Administrator
+    /// one), the result MUST be exactly as hardened as designed; if it
+    /// fails, nothing was left behind, which is the fail-closed direction
+    /// every other check in [`download_asset`] already takes.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn protected_staging_dir_either_locks_down_or_cleanly_refuses() {
+        match create_fresh_protected_dir(&std::env::temp_dir()) {
+            Ok(dir) => {
+                assert!(
+                    is_staging_dir(&dir),
+                    "our own dir is recognised: {}",
+                    dir.display()
+                );
+                assert_dacl_is_system_and_admins_only(&dir);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            Err(e) => eprintln!(
+                "create_fresh_protected_dir refused, as expected for an unprivileged \
+                 caller (a real Win10 SYSTEM host must still be field-verified): {e}"
+            ),
+        }
+    }
+
+    /// The SDDL string itself parses on every run, with no filesystem or
+    /// privilege involved — the one assertion from the test above that does
+    /// not depend on this process's own elevation.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn protected_dir_sddl_parses() {
+        ProtectedDirSd::new().expect("the staging dir's SDDL parses");
+    }
+
+    /// The write refuses anything already at the name — a planted file (never
+    /// truncated) always; a planted symlink (never followed) when the test
+    /// process holds `SeCreateSymbolicLinkPrivilege` (Developer Mode or
+    /// elevation) to even create one — CI may have neither, so that half
+    /// skips cleanly instead of flaking on an environment it doesn't control.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn write_installer_refuses_a_planted_symlink_and_a_planted_file() {
+        use std::io::ErrorKind;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let canary = tmp.path().join("canary");
+        std::fs::write(&canary, b"original").expect("canary");
+        let link = tmp.path().join("installer-link");
+        match std::os::windows::fs::symlink_file(&canary, &link) {
+            Ok(()) => {
+                let err = write_installer(&link, b"payload").expect_err("must refuse a symlink");
+                assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+                assert_eq!(
+                    std::fs::read(&canary).unwrap(),
+                    b"original",
+                    "the symlink target was not written through"
+                );
+            }
+            Err(e) => eprintln!(
+                "skipping the symlink half: this test process cannot create one ({e}) — \
+                 Developer Mode or elevation is not guaranteed on every runner"
+            ),
+        }
+        let existing = tmp.path().join("installer");
+        std::fs::write(&existing, b"existing").expect("existing");
+        let err = write_installer(&existing, b"payload").expect_err("must refuse an existing file");
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&existing).unwrap(),
+            b"existing",
+            "not truncated"
+        );
+    }
+
+    /// Cleanup removes our own staging dir whole, and refuses to touch
+    /// anything that is not ours (a wrong-prefix sibling, a path outside
+    /// temp_dir()).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn discard_staging_removes_only_our_own_dir_windows() {
+        let ours = stage_dir().expect("stage_dir");
+        let installer = ours.join("roomlerd-0.4.0-x86_64-pc-windows-msvc.msi");
+        std::fs::write(&installer, b"x").expect("write installer");
+        discard_staging(&installer);
+        assert!(!ours.exists(), "our own staging dir is removed");
+
+        let not_ours = tempfile::Builder::new()
+            .prefix("not-ours.")
+            .tempdir_in(std::env::temp_dir())
+            .expect("not-ours dir");
+        let other = not_ours.path().join("foo.msi");
+        std::fs::write(&other, b"y").expect("write other");
+        discard_staging(&other);
+        assert!(other.exists(), "a dir that is not ours is left alone");
+
+        // A path whose parent is not a staging dir at all: a no-op, no panic.
+        discard_staging(std::path::Path::new(r"C:\Windows\System32\cmd.exe"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn staging_dir_is_stale_uses_the_one_hour_gate() {
+        assert!(!is_stale(Duration::from_secs(0)));
+        assert!(!is_stale(Duration::from_secs(3599)));
+        assert!(is_stale(Duration::from_secs(3600)));
+        assert!(is_stale(Duration::from_secs(7200)));
+    }
+
+    /// A freshly-made staging dir is, by definition, younger than the gate —
+    /// the sweep must leave it alone (this is the regression test for the
+    /// hazard [`sweep_stale_update_staging_at_start`]'s doc comment names:
+    /// never race a directory that could still be in use). A non-staging
+    /// sibling is untouched regardless of age.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn sweep_leaves_a_fresh_staging_dir_alone() {
+        let ours = stage_dir().expect("stage_dir");
+        let sibling = tempfile::Builder::new()
+            .prefix("not-ours.")
+            .tempdir_in(std::env::temp_dir())
+            .expect("sibling dir");
+        sweep_stale_update_staging_at_start();
+        assert!(ours.exists(), "a fresh staging dir survives the sweep");
+        assert!(
+            sibling.path().exists(),
+            "a non-staging sibling is never touched"
+        );
+        let _ = std::fs::remove_dir_all(&ours);
     }
 
     // ── FR-96 security review (#2055): the run-spacing gate ──────────

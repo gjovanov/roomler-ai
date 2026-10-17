@@ -347,9 +347,11 @@ x11rb = { version = "0.13", features = ["damage", "screensaver", "randr"], optio
 
 # FR-96 security review (#2055) — the root update helper stages each download in
 # a FRESH private directory (mkdtemp) instead of a fixed world-creatable name in
-# /tmp, and moves a planted wake-file entry aside into one. Linux-only: the
-# staging + consume code is `#[cfg(target_os = "linux")]`. Already a dev-dep
-# below and in the lockfile, so this adds no new dependency tree.
+# /tmp, and moves a planted wake-file entry aside into one. The staging +
+# consume code here is `#[cfg(target_os = "linux")]`; GHSA-r3xj-4wh9-xh2v
+# carried the identical fix to Windows's non-SYSTEM staging path too — see the
+# matching entry in the Windows target table below. Already a dev-dep below
+# and in the lockfile, so this adds no new dependency tree.
 tempfile = { workspace = true }
 
 # FR-36 P1 — DRM/KMS scanout capture (`drm-capture`). MIT, and its whole tree
@@ -414,6 +416,14 @@ windows-service = "0.7"
 # clipboard open. Already compiled transitively by arboard on Windows,
 # so this adds zero new code to the build.
 clipboard-win = { version = "5", optional = true }
+
+# GHSA-r3xj-4wh9-xh2v — the non-SYSTEM half of the Windows updater staging
+# fix (`updater::stage_dir_as_current_user`) needs a fresh, privately-named
+# directory per download, the same mkdtemp-style primitive Linux's #2055 fix
+# already uses (see the matching entry in the Linux target table above).
+# Already a dev-dep below and in the lockfile, so this adds no new
+# dependency tree — only a production (non-test) use of it on this platform.
+tempfile = { workspace = true }
 
 # Raw Win32 FFI for the M2 worker-supervisor: WTSGetActiveConsoleSessionId,
 # WTSQueryUserToken, CreateProcessAsUserW, CreateEnvironmentBlock. Going

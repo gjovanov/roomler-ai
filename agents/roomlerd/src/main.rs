@@ -3156,6 +3156,12 @@ async fn run_cmd(
     // healthy host. After the lock, so one daemon does it.
     #[cfg(target_os = "linux")]
     roomlerd::tarball_owner::repair_at_start();
+    // GHSA-r3xj-4wh9-xh2v — the Windows twin: a per-download staging dir a
+    // prior update's watcher left behind. Swept once here, behind the same
+    // lock, before any update task runs — see the function's doc comment for
+    // why it must NOT run on every download instead.
+    #[cfg(target_os = "windows")]
+    roomlerd::updater::sweep_stale_update_staging_at_start();
     // FR-93 P5 (#2144) — a per-user unit enabled before it was wanted by the
     // graphical session is enabled again, so the next login starts it: it stops
     // with the session (`PartOf=`), and a user manager that outlives a logout
