@@ -1,7 +1,8 @@
 # FR-109: Relative mouse — Pointer Lock in the browser for apps that capture the pointer
 
 **Issue:** [#2333](https://github.com/gjovanov/roomler-ai/issues/2333) · **Status:** in progress — P1 shipped
-(Windows, fixed in 0.4.141); P2a (X11), P2b (uinput), P2c (per-user Wayland) and P3 (the auto-switch) merged; P2d (macOS) built; [`docs/relative-mouse.md`](../relative-mouse.md) · **Owner:** the agent's input path (`input/`, every injector), the viewer (Pointer Lock, the input
+(Windows, fixed in 0.4.141); P2a (X11), P2b (uinput), P2c (per-user Wayland), P2d (macOS) and P3 (the auto-switch) merged; every
+criterion verified, with the agent halves of P2 to be re-checked on the release that carries them; [`docs/relative-mouse.md`](../relative-mouse.md) · **Owner:** the agent's input path (`input/`, every injector), the viewer (Pointer Lock, the input
 pump) · **Anchors:** master `7382639b8` · **Program:** [StarDesk teardown](../plans/stardesk-teardown-program.md),
 wave 3 (§6.1, row P9) · **Builds on:** [FR-92](FR-92-keep-busy.md) (the agent never reads input), #1945
 (the arbiter's release-all), FR-98 C3 (the input gap)
@@ -193,11 +194,13 @@ inside that function.
   input exclusive, the watcher's 70 counts never reached the host (1030, not 1100). The holder's press,
   dropped mid-drag by its disconnect, was let go: left button 1 down, 1 up, and only the arbiter could
   have sent that up. **The released 0.4.141 read the same** (row 11): 1030, and 1 down, 1 up.
-- [ ] **AC5 (auto-switch):** a hidden cursor offers relative mode on the next click; a locked host never
-  enters it. *Progress:* the first clause is field-verified on a candidate bundle. A Windows host app
-  hiding its cursor switched the click into Pointer Lock and its return ended it (rows 27–28). A host
-  whose tracker never sees a pointer keeps the click a click (rows 25–26). The locked-host clause is held
-  by a unit-tested gate only, so the box waits for a field cell on a locked host.
+- [x] **AC5 (auto-switch):** a hidden cursor offers relative mode on the next click; a locked host never
+  enters it. **Verified on the live viewer** (rows 34–35, production after the 2026-10-17 19:27Z promote).
+  - The first clause: a Windows host app hiding its cursor switches the click into Pointer Lock, and its
+    return ends it. Row 35, as on the candidate in rows 27–28. A host whose tracker never sees a pointer
+    keeps the click a click (rows 25–26).
+  - The locked-host clause: with the cursor tracked and then hidden, and the host locked, the click stays a
+    click. In the same session, unlocked through the viewer, the same click enters relative mode (row 34).
 - [x] **AC6 (no hooks):** a source scan in FR-92's shape covers this FR's agent code and fails on a planted
   raw-input registration. **Verified:** `input::tests::fr109_relative_mouse_reads_no_input` (§3f) passed
   on Windows. Two negative controls each failed it, with the file and line. A `RegisterRawInputDevices`
@@ -273,6 +276,8 @@ inside that function.
 | 31 | 2026-10-17 | **P2d's green.** Row 30's cell on this branch's release build (run 39058988214, `.pkg` `f0d63766…`, `roomlerd` `5c1b620c…`) | **Advertised, offered, and every count arrives.** `input` added `mouse-rel`, and the viewer showed the relative-mouse control. The app received all 10 events of the coupled burst, each `deltaX` = `mouseEventDeltaX` = +40, sum +400, cursor 307 → 707. With the cursor decoupled and hidden it received all 10 of the next, each −40, sum −400. The tap read the same 20 |
 | 32 | 2026-10-17 | **The predicate's grant half.** Row 31's build with Screen Recording only, no Accessibility | **No word without the grant.** `permissions` read `screen-capture`, `has_input_permission` false, no `mouse-rel`, no control. The agent logged `enigo init failed — the application does not have the permission to simulate input`, and the tap read no event at all |
 | 33 | 2026-10-17 | **The kill switch.** Row 31's build with both grants and `ROOMLERD_INPUT_MOUSE_REL=0` in the LaunchAgent's `EnvironmentVariables` | **No word.** `has_input_permission` true, no `mouse-rel`, no control. Frames sent straight onto the channel still injected (sum +400, then −400), as on every OS: the switch withdraws the word, and the word is what keeps a viewer from sending them. Each VM of rows 30–33 was deleted at the end of its cell |
+| 34 | 2026-10-17 | **AC5's locked host, on the live viewer.** Production was promoted to `hosted-20261017-76f83fe` at 19:27Z, which serves P3. One session from production's own viewer (`index-tJoqjQJP.js`, nothing served into the page) to a kept vmtest Win11 `--type system` guest on the released 0.4.141 (`vmtest-w-ins-sys-193053`, `vmtest` at the console, `lock_on_end` pinned to `never`). The page watched its cursor channel and its control channel's `rc:host_locked`. Once the host's pointer had been reported, the host's probe (`hidecursor.ps1`, row 27's) hid the cursor. Once the page saw that hide, the host was locked as its person (`lockws.ps1`, LogonUI up). The page clicked the picture, then typed the guest password through the viewer to unlock, waited for the probe's hidden cursor again, and clicked once more (`rc-rel-lock.spec.ts`, `fr109-ac5-lock.sh`) | **A locked host never enters it, and the same click does once unlocked.** The cursor channel read `shape pos … hide`, then `rc:host_locked {locked: true}`, the last cursor message still `hide`. **The locked click: no Pointer Lock, no hint**, sent as a click (`mouse_button` × 2). After the password: `locked: false`, the cursor hidden again, and **the same click took Pointer Lock**. The hint read "The host hid its cursor, so the mouse is relative: Esc releases it", and the page sent `mouse_rel` |
+| 35 | 2026-10-17 | **P3 on the live viewer.** Row 28's cell with no bundle served into the page, on row 34's guest | **The same as the candidate.** The click on the hidden cursor took Pointer Lock with the hint; the 10 moves after it went out as 20 `mouse_rel` frames; the cursor's return ended relative mode on its own. **Wrong turn:** the first pass read `host cursor hidden after a tracked pointer: false`. The fresh guest's cursor sat suppressed (its last input a tablet's), and the tracker reports nothing while it is, so the viewer never saw a pointer and rightly kept the click a click. The cell now sweeps the mouse across the picture first, so injected moves wake the cursor. A first run of rows 34–35 also failed "agent not online": the reboot that pinned `lock_on_end` had unenrolled the ephemeral device, so it was re-enrolled. The guest was destroyed by name afterwards and its row removed |
 
 ## 9. Related
 

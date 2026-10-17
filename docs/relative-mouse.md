@@ -7,7 +7,7 @@
 > |---|---|---|
 > | P1 | the wire, the gate, Windows hosts (the user worker and SystemContext), the viewer's control | shipped in 0.4.140, where a Windows relative move went out ABSOLUTE (enigo's default, below). **0.4.141 carries the fix (#2352)**, field-verified on its released bytes on both Windows paths |
 > | P2 | Linux (XTest, a relative uinput device, the portal) and macOS | X11 through enigo's XTest (P2a) and a relative uinput pointer for system installs (P2b): merged, field-green on candidates. Per-user Wayland through the RemoteDesktop session, the portal's or mutter's (P2c): built, field-green on a candidate. macOS through enigo's CGEvent motion, in a GUI session with the Accessibility grant (P2d): built, field-green on a candidate |
-> | P3 | switching on by itself when the host hides its cursor | built (the operator settled the spec's decision 1 on 2026-10-17: enter on the next click), with a rule P2 made necessary: a hide counts only after the host has reported its pointer |
+> | P3 | switching on by itself when the host hides its cursor | merged and live since the 2026-10-17 promote (the operator settled the spec's decision 1: enter on the next click), with a rule P2 made necessary: a hide counts only after the host has reported its pointer. Field-verified on the live viewer, the locked host included (FR-109 §8 rows 34–35) |
 
 ## Why it exists
 
@@ -187,7 +187,9 @@ stateDiagram-v2
   keeps its cursor hidden, fullscreen video for one, would trap the person on every click.
 - ⚠️ **Never while the host is locked.** The lock screen hides the cursor too
   ([`relativeMouse.ts:108`](../ui/src/composables/relativeMouse.ts#L108) `shouldAutoEnterRelative`
-  checks `rc:host_locked`).
+  checks `rc:host_locked`). Field-verified on the live viewer (FR-109 §8 row 34). With the cursor tracked
+  and then hidden on a locked Windows host, the click stayed a click; unlocked through the viewer in the
+  same session, the same click entered relative mode.
 - ⚠️ **Only after this host has reported its pointer** on the channel, a `cursor:pos` or `cursor:shape`
   ([`useRemoteControl.ts:5918`](../ui/src/composables/useRemoteControl.ts#L5918) `hostCursorTracked`). A
   tracker that sees no pointer (a Linux host without DRM capture, macOS) sends one `cursor:hide` when the
