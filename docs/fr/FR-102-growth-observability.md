@@ -513,8 +513,11 @@ sequenceDiagram
   *(P7a as built — `saas::github_pull`, the P6 puller's pattern: one `growth_pulls` row per (source, day),
   `$set` on each row's own `_id`, the Redis claim per tick, a failure recorded per day with its reason and
   never a 0. The counters are stored as one cumulative SNAPSHOT per closed UTC day (`growth_daily {source:
-  github}`, `by: repo` stars / forks / watchers / downloads, `by: release` and `by: flavour` downloads — a
-  flavour is the asset name without its version), read between 01:00 and 07:00 the next day. The first
+  github}`, `by: repo` stars / forks / watchers / downloads / helper_downloads, `by: release` (with its
+  `kind`) and `by: flavour` downloads — a flavour is the asset name without its version), read between 01:00
+  and 07:00 the next day. The product's releases (`agent-v`, `setup-v`, `tunnel-v`, `tunnel-wizard-v`) are
+  counted apart from the helpers our own CI downloads (vendored builds, caches), which held 8,032 of the
+  16,740 downloads when read live on 2026-10-17. The first
   good read stands, and a day not read inside that window has no snapshot. The readers (`growth::github`)
   difference two snapshots: a delta whose earlier snapshot is missing is `null`, never 0 and never split
   across the gap, and downloads are differenced per release with a counter reset read as a reset. Traffic

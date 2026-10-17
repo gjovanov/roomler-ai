@@ -177,7 +177,8 @@ async fn referrers(
     )
 }
 
-/// 150 releases: page 1 and half of page 2. The newest is a draft.
+/// 151 releases: page 1 and half of page 2. The newest is a draft, the last
+/// a helper (a vendored build).
 fn seed_releases(f: &Fake) {
     let mut v = vec![(
         "agent-v0.4.999".to_string(),
@@ -197,6 +198,15 @@ fn seed_releases(f: &Fake) {
             ],
         ));
     }
+    // A helper: the vendored build our own CI downloads, counted apart.
+    v.push((
+        "vendored-ffmpeg-n7.1".to_string(),
+        false,
+        vec![(
+            "ffmpeg-linux64-lgpl-shared-minimal.tar.xz".to_string(),
+            1000,
+        )],
+    ));
     *f.releases.lock().unwrap() = v;
 }
 
@@ -311,10 +321,33 @@ async fn the_puller_snapshots_the_closed_day_once_inside_its_window() {
         daily(&app, GITHUB_SOURCE, &y, "watchers", none.clone()).await,
         Some(3)
     );
-    // 149 published releases × (2 + 1); the draft's 500 is not counted.
+    // 149 published product releases × (2 + 1); the draft's 500 is not
+    // counted, and the vendored build CI fetches is counted apart.
     assert_eq!(
         daily(&app, GITHUB_SOURCE, &y, "downloads", doc! { "by": "repo" }).await,
         Some(447)
+    );
+    assert_eq!(
+        daily(
+            &app,
+            GITHUB_SOURCE,
+            &y,
+            "helper_downloads",
+            doc! { "by": "repo" }
+        )
+        .await,
+        Some(1000)
+    );
+    assert_eq!(
+        daily(
+            &app,
+            GITHUB_SOURCE,
+            &y,
+            "downloads",
+            doc! { "by": "release", "release": "vendored-ffmpeg-n7.1", "kind": "helper" }
+        )
+        .await,
+        Some(1000)
     );
     assert_eq!(
         daily(

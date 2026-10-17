@@ -15,6 +15,11 @@
 //!   what it has now; a release that vanished (deleted) counts nothing. The
 //!   per-flavour downloads have no per-release split, so a flavour's change
 //!   is clamped at 0 — a deletion can only hide that flavour's day.
+//! * **The product apart from the helpers**: a release row's `kind` says
+//!   whether it is the product's (the daemon, the wizard, the tunnel CLI) or
+//!   a helper our own CI downloads (vendored builds, caches) — half of the
+//!   repository's downloads on 2026-10-17 — and each is differenced on its
+//!   own (`downloads_delta`, `helper_downloads_delta`).
 //! * **Traffic** (`growth_daily {source: github_traffic}`, the token's) is
 //!   GitHub's per-day buckets, summed over the days the puller holds an
 //!   `ok` row for — `measured_days` says how many of each window that is —
@@ -64,15 +69,19 @@ pub struct GithubCounters {
     pub stars: i64,
     pub forks: i64,
     pub watchers: i64,
-    /// Every download of every published release asset, ever — the fleet's
-    /// self-updates included.
+    /// Every download of every published PRODUCT release asset, ever — the
+    /// fleet's self-updates included.
     pub downloads: i64,
+    /// The helper releases' downloads (vendored builds and caches our own CI
+    /// fetches), counted apart so the product's number is not half CI.
+    pub helper_downloads: i64,
     pub stars_delta: Delta,
     pub forks_delta: Delta,
     pub watchers_delta: Delta,
     pub downloads_delta: Delta,
-    /// Downloads in the 7 days ending `at`, by release tag; not measured
-    /// without the snapshot 7 days before.
+    pub helper_downloads_delta: Delta,
+    /// Product downloads in the 7 days ending `at`, by release tag; not
+    /// measured without the snapshot 7 days before.
     pub top_releases_7d: Measured<Vec<KeyCount>>,
     /// The same, by flavour (the asset name without its version).
     pub top_flavours_7d: Measured<Vec<KeyCount>>,
@@ -125,11 +134,13 @@ impl GithubSection {
     }
 }
 
-/// One snapshot: the repo counters, and downloads per release and flavour.
+/// One snapshot: the repo counters, and downloads per release (the
+/// product's and the helpers' apart) and per flavour.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
     pub repo: BTreeMap<String, i64>,
     pub releases: BTreeMap<String, i64>,
+    pub helper_releases: BTreeMap<String, i64>,
     pub flavours: BTreeMap<String, i64>,
 }
 
@@ -157,7 +168,12 @@ pub fn snapshots(rows: &[GrowthDaily], ok_days: &HashSet<String>) -> BTreeMap<St
             }
             Some("release") => {
                 if let Some(tag) = r.dims.get("release") {
-                    *s.releases.entry(tag.clone()).or_insert(0) += r.value;
+                    let map = if r.dims.get("kind").map(String::as_str) == Some("helper") {
+                        &mut s.helper_releases
+                    } else {
+                        &mut s.releases
+                    };
+                    *map.entry(tag.clone()).or_insert(0) += r.value;
                 }
             }
             Some("flavour") => {
@@ -218,6 +234,14 @@ fn downloads_delta(later: &Snapshot, earlier: Option<&Snapshot>) -> Option<i64> 
     })
 }
 
+fn helper_downloads_delta(later: &Snapshot, earlier: Option<&Snapshot>) -> Option<i64> {
+    earlier.map(|e| {
+        per_key_downloads(&later.helper_releases, &e.helper_releases)
+            .values()
+            .sum()
+    })
+}
+
 fn top(map: BTreeMap<String, i64>) -> Vec<KeyCount> {
     let mut v: Vec<KeyCount> = map
         .into_iter()
@@ -259,10 +283,12 @@ pub fn counters_at(
         forks: now.counter("forks"),
         watchers: now.counter("watchers"),
         downloads: now.counter("downloads"),
+        helper_downloads: now.counter("helper_downloads"),
         stars_delta: delta(&|l, e| counter_delta(l, e, "stars")),
         forks_delta: delta(&|l, e| counter_delta(l, e, "forks")),
         watchers_delta: delta(&|l, e| counter_delta(l, e, "watchers")),
         downloads_delta: delta(&downloads_delta),
+        helper_downloads_delta: delta(&helper_downloads_delta),
         top_releases_7d: match back(7) {
             Some(e) => Measured::Value(top(per_key_downloads(&now.releases, &e.releases))),
             None => missing_week(),
@@ -528,6 +554,28 @@ mod tests {
         // A row of a day whose pull is not ok is not a snapshot.
         let not_ok = snapshots(&rows, &ok(&["2026-10-16"]));
         assert_eq!(not_ok.len(), 1);
+
+        // A helper release (CI's vendored build) is differenced apart and
+        // never reaches the product's downloads.
+        let helper = |day: &str, n: i64| {
+            let mut dims = BTreeMap::new();
+            dims.insert("by".to_string(), "release".to_string());
+            dims.insert("repo".to_string(), "o/r".to_string());
+            dims.insert("release".to_string(), "vendored-ffmpeg-n7.1".to_string());
+            dims.insert("kind".to_string(), "helper".to_string());
+            daily_row(GITHUB_SOURCE, "downloads", dims, day, n)
+        };
+        let mut with_helper = rows.clone();
+        with_helper.push(helper("2026-10-15", 1000));
+        with_helper.push(helper("2026-10-16", 1300));
+        let snaps = snapshots(
+            &with_helper,
+            &ok(&["2026-10-09", "2026-10-15", "2026-10-16"]),
+        );
+        let c = counters_at("o/r", d("2026-10-16"), &snaps).unwrap();
+        assert_eq!(c.downloads_delta.day, Some(5), "the product alone");
+        assert_eq!(c.helper_downloads_delta.day, Some(300));
+        assert_eq!(c.helper_downloads_delta.d7, Some(1300), "new since 10-09");
     }
 
     /// A counter that went down is a reset (an asset re-uploaded), a release

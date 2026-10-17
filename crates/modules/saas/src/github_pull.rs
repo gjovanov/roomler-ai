@@ -17,9 +17,14 @@
 //!
 //! | `dims.by` | other dims | metrics |
 //! |---|---|---|
-//! | `repo` | `repo` | `stars` `forks` `watchers` `downloads` (every asset of every published release) |
-//! | `release` | `repo`, `release` (the tag) | `downloads` |
-//! | `flavour` | `repo`, `flavour` (the asset name without its version: `roomlerd-x86_64-pc-windows-msvc.msi`) | `downloads` |
+//! | `repo` | `repo` | `stars` `forks` `watchers`; `downloads` (every asset of every published PRODUCT release) and `helper_downloads` (the rest) |
+//! | `release` | `repo`, `release` (the tag), `kind` (`product` · `helper`) | `downloads` |
+//! | `flavour` | `repo`, `flavour` (a product asset's name without its version: `roomlerd-x86_64-pc-windows-msvc.msi`) | `downloads` |
+//!
+//! A **helper** release is one our own CI downloads from — vendored builds
+//! and caches ([`PRODUCT_TAG_PREFIXES`] names the product's): on
+//! 2026-10-17 they held 8,032 of the repository's 16,740 downloads, so they
+//! are counted apart rather than mixed into the product's number.
 //!
 //! * **A snapshot is the close of a day.** Day D's snapshot is the counters
 //!   as read in the cycle that follows it, between [`CYCLE_HOUR_UTC`] and
@@ -96,7 +101,13 @@ pub const MAX_RELEASE_PAGES: u32 = 10;
 /// Per-request ceiling.
 pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// The counters' metrics — the set a snapshot replaces.
-pub const COUNTER_METRICS: [&str; 4] = ["stars", "forks", "watchers", "downloads"];
+pub const COUNTER_METRICS: [&str; 5] = [
+    "stars",
+    "forks",
+    "watchers",
+    "downloads",
+    "helper_downloads",
+];
 /// The traffic series' metrics.
 pub const TRAFFIC_METRICS: [&str; 4] = ["views", "views_uniques", "clones", "clones_uniques"];
 /// The referrer ranking's metrics, stored under the day it was read after.
@@ -416,28 +427,50 @@ pub fn flavour(asset: &str) -> String {
     asset.to_string()
 }
 
+/// The tags of the product's own releases — what a person installs or the
+/// fleet updates to: the daemon, the setup wizard, the tunnel CLI and its
+/// retired wizard. Every other release is a HELPER: vendored builds and
+/// caches our own CI downloads (`vendored-ffmpeg-*`, `vendored-libvpx-*`,
+/// `seed-cache-*`). Measured 2026-10-17 on the live repository, helpers held
+/// 8,032 of 16,740 downloads — a product total that included them would be
+/// half CI.
+pub const PRODUCT_TAG_PREFIXES: [&str; 4] = ["agent-v", "setup-v", "tunnel-v", "tunnel-wizard-v"];
+
+/// Whether a release is the product's (see [`PRODUCT_TAG_PREFIXES`]).
+pub fn is_product_release(tag: &str) -> bool {
+    PRODUCT_TAG_PREFIXES.iter().any(|p| tag.starts_with(p))
+}
+
 /// The counters' rows for the snapshot of `day`. Drafts are left out; a
-/// zero is not stored.
+/// zero is not stored. The product's releases and the helpers are kept
+/// apart: `downloads` counts the product only, `helper_downloads` the rest,
+/// each release row says which it is (`kind`), and the flavours are the
+/// product's.
 pub fn counter_rows(
     day: &str,
     repo: &str,
     info: &RepoInfo,
     releases: &[Release],
 ) -> Vec<GrowthDaily> {
-    let mut by_release: BTreeMap<String, i64> = BTreeMap::new();
+    let mut by_release: BTreeMap<String, (bool, i64)> = BTreeMap::new();
     let mut by_flavour: BTreeMap<String, i64> = BTreeMap::new();
-    let mut total = 0i64;
+    let (mut product, mut helper) = (0i64, 0i64);
     for r in releases.iter().filter(|r| !r.draft) {
         let Some(tag) = clean_dim(&r.tag_name) else {
             continue;
         };
+        let is_product = is_product_release(&tag);
         for a in &r.assets {
             let n = a.download_count.max(0);
-            total += n;
-            *by_release.entry(tag.clone()).or_insert(0) += n;
-            if let Some(f) = clean_dim(&flavour(&a.name)) {
-                *by_flavour.entry(f).or_insert(0) += n;
+            if is_product {
+                product += n;
+                if let Some(f) = clean_dim(&flavour(&a.name)) {
+                    *by_flavour.entry(f).or_insert(0) += n;
+                }
+            } else {
+                helper += n;
             }
+            by_release.entry(tag.clone()).or_insert((is_product, 0)).1 += n;
         }
     }
     let repo_dims = dims(&[("by", "repo"), ("repo", repo)]);
@@ -446,15 +479,22 @@ pub fn counter_rows(
         ("stars", info.stargazers_count),
         ("forks", info.forks_count),
         ("watchers", info.subscribers_count),
-        ("downloads", total),
+        ("downloads", product),
+        ("helper_downloads", helper),
     ] {
         if value != 0 {
             rows.push(daily_row(SOURCE, metric, repo_dims.clone(), day, value));
         }
     }
-    for (tag, n) in by_release {
+    for (tag, (is_product, n)) in by_release {
         if n != 0 {
-            let d = dims(&[("by", "release"), ("repo", repo), ("release", tag.as_str())]);
+            let kind = if is_product { "product" } else { "helper" };
+            let d = dims(&[
+                ("by", "release"),
+                ("repo", repo),
+                ("release", tag.as_str()),
+                ("kind", kind),
+            ]);
             rows.push(daily_row(SOURCE, "downloads", d, day, n));
         }
     }
@@ -820,8 +860,40 @@ mod tests {
                 draft: true,
                 assets: vec![asset("roomlerd-0.4.141-x86_64-pc-windows-msvc.msi", 999)],
             },
+            // A helper: a vendored build our CI downloads.
+            Release {
+                tag_name: "vendored-ffmpeg-n7.1".into(),
+                draft: false,
+                assets: vec![asset("ffmpeg-linux64-lgpl-shared-minimal.tar.xz", 4000)],
+            },
         ];
         let rows = counter_rows("2026-10-16", "gjovanov/roomler-ai", &info, &releases);
+        // The helper is counted apart: its own total, its release row marked,
+        // no flavour of the product's.
+        assert_eq!(value(&rows, "repo", None, "helper_downloads"), Some(4000));
+        assert_eq!(
+            value(&rows, "release", Some(("kind", "helper")), "downloads"),
+            Some(4000)
+        );
+        assert_eq!(
+            value(
+                &rows,
+                "release",
+                Some(("release", "agent-v0.4.139")),
+                "downloads"
+            ),
+            Some(70)
+        );
+        assert!(
+            rows.iter()
+                .filter(|r| r.dims.get("by").map(String::as_str) == Some("flavour"))
+                .all(|r| !r.dims["flavour"].starts_with("ffmpeg")),
+            "a helper's assets are no product flavour"
+        );
+        assert!(is_product_release("setup-v0.4.139") && is_product_release("tunnel-wizard-v0.3.0"));
+        assert!(
+            !is_product_release("seed-cache-2026") && !is_product_release("vendored-libvpx-1.15")
+        );
         assert_eq!(value(&rows, "repo", None, "stars"), Some(120));
         assert_eq!(value(&rows, "repo", None, "forks"), Some(9));
         assert_eq!(
