@@ -12,11 +12,15 @@
 //!   missing permission recorded per day, never a 0.
 //! * **The feed and URL Inspection** (`saas::content_pull::run_once`): the
 //!   blog's Atom feed into `growth_content`, a post that leaves it kept as
-//!   `in_feed: false`, each post's verdict and last crawl, a 403 recorded
-//!   with the last good verdict kept, and a missing feed read as no blog.
+//!   `in_feed: false`, each post's verdict and last crawl, a 403 recorded on
+//!   every owed post with the last good verdict and its time kept, a
+//!   retried day asking only about the posts not inspected in its cycle, a
+//!   slow URL as one post's failure and three in a row as the run's; a 404,
+//!   a page that is not a feed, a redirect or a non-https URL a failed read
+//!   that changes nothing.
 //! * **Bing** (`saas::bing_pull::run_once`): the daily totals and the weekly
-//!   buckets at Bing's own grain, Bing's `/Date(…)/` read with its offset,
-//!   and a refused key recorded.
+//!   buckets at Bing's own grain, Bing's `/Date(…)/` read with its offset, a
+//!   rare query's text never stored, and a refused key recorded.
 
 use std::{
     collections::HashMap,
@@ -75,6 +79,10 @@ struct Google {
     forbid: Arc<Mutex<bool>>,
     /// Refuse URL Inspection only, as a Restricted user may be refused.
     forbid_inspection: Arc<Mutex<bool>>,
+    /// Refuse the inspection of a URL ending so (403), once per entry.
+    forbid_once: Arc<Mutex<Vec<String>>>,
+    /// Answer the inspection of a URL ending so only after this long.
+    slow: Arc<Mutex<Vec<(String, std::time::Duration)>>>,
 }
 
 async fn g_token(
@@ -210,6 +218,23 @@ async fn g_inspect(
     }
     assert_eq!(body["siteUrl"], SITE);
     let url = body["inspectionUrl"].as_str().unwrap().to_string();
+    {
+        let mut once = g.forbid_once.lock().unwrap();
+        if let Some(i) = once.iter().position(|end| url.ends_with(end.as_str())) {
+            once.remove(i);
+            return forbidden();
+        }
+    }
+    let delay = g
+        .slow
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(end, _)| url.ends_with(end.as_str()))
+        .map(|(_, d)| *d);
+    if let Some(d) = delay {
+        tokio::time::sleep(d).await;
+    }
     g.inspected.lock().unwrap().push(url.clone());
     let status = if url.ends_with("/blog/a/") {
         json!({ "verdict": "PASS", "coverageState": "Submitted and indexed",
@@ -229,7 +254,8 @@ async fn g_inspect(
     )
 }
 
-/// The blog's feed: `None` answers 404 (a site with no post).
+/// The blog's feed: `None` answers 404 (a site mid-deploy, or one that
+/// stopped publishing it).
 #[derive(Clone, Default)]
 struct Feed(Arc<Mutex<Option<String>>>);
 
@@ -238,6 +264,12 @@ async fn feed(State(f): State<Feed>) -> (StatusCode, String) {
         Some(xml) => (StatusCode::OK, xml),
         None => (StatusCode::NOT_FOUND, String::new()),
     }
+}
+
+/// A feed that moved: a redirect to the real one, which must not be
+/// followed.
+async fn moved() -> (StatusCode, [(&'static str, &'static str); 1]) {
+    (StatusCode::FOUND, [("location", "/blog/feed.xml")])
 }
 
 async fn fake_google() -> (String, Google, Feed) {
@@ -254,6 +286,7 @@ async fn fake_google() -> (String, Google, Feed) {
         .merge(
             Router::new()
                 .route("/blog/feed.xml", get(feed))
+                .route("/blog/moved.xml", get(moved))
                 .with_state(f.clone()),
         );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -525,10 +558,21 @@ fn feed_xml(posts: &[(&str, &str, &str)]) -> String {
     s
 }
 
+async fn content_doc(app: &TestApp, path: &str) -> Document {
+    app.db
+        .collection::<Document>(GROWTH_CONTENT)
+        .find_one(doc! { "_id": path })
+        .await
+        .unwrap()
+        .unwrap()
+}
+
 /// The feed fills `growth_content`; URL Inspection adds each post's verdict
 /// and last crawl; a post that leaves the feed is kept as `in_feed: false`;
-/// a refused inspection keeps the last good verdict, records the error and
-/// fails the day's inspection row; a missing feed is no blog, not a failure.
+/// a refused inspection keeps the last good verdict and the time it was
+/// read, records the error and the attempt on EVERY post the run owed, and
+/// fails the day's inspection row; a retried day asks Google only about
+/// the posts not yet inspected in its cycle.
 #[tokio::test]
 async fn the_feed_and_url_inspection_fill_growth_content() {
     let (base, g, f) = fake_google().await;
@@ -550,12 +594,7 @@ async fn the_feed_and_url_inspection_fill_growth_content() {
         (2, 2, 0),
         "{r:?}"
     );
-    let posts = app.db.collection::<Document>(GROWTH_CONTENT);
-    let a = posts
-        .find_one(doc! { "_id": "/blog/a/" })
-        .await
-        .unwrap()
-        .unwrap();
+    let a = content_doc(&app, "/blog/a/").await;
     assert_eq!(a.get_str("title").unwrap(), "Post & A");
     assert!(a.get_bool("in_feed").unwrap());
     let ia = a.get_document("inspection").unwrap();
@@ -565,11 +604,10 @@ async fn the_feed_and_url_inspection_fill_growth_content() {
         "Submitted and indexed"
     );
     assert!(ia.get_datetime("last_crawl_time").is_ok());
-    let b = posts
-        .find_one(doc! { "_id": "/blog/b/" })
-        .await
-        .unwrap()
-        .unwrap();
+    let first_read = *ia.get_datetime("inspected_at").unwrap();
+    assert_eq!(first_read, at_day(t, 3), "the verdict's own time");
+    assert_eq!(*ia.get_datetime("attempted_at").unwrap(), at_day(t, 3));
+    let b = content_doc(&app, "/blog/b/").await;
     assert_eq!(
         b.get_document("inspection")
             .unwrap()
@@ -594,49 +632,258 @@ async fn the_feed_and_url_inspection_fill_growth_content() {
     assert!(!again.feed_due && !again.inspection_due);
     assert_eq!(g.inspected.lock().unwrap().len(), 2);
 
-    // The next day: B left the feed, and inspection is refused.
-    *f.0.lock().unwrap() = Some(feed_xml(&[("a", "Post A", "2026-09-25T22:45:13Z")]));
+    // The next day: B left the feed, C joined, and inspection is refused —
+    // as Google refuses a Restricted user. The refusal is every owed
+    // post's, not only the first one's.
+    *f.0.lock().unwrap() = Some(feed_xml(&[
+        ("a", "Post A", "2026-09-25T22:45:13Z"),
+        ("c", "Post C", "2026-10-10T08:00:00Z"),
+    ]));
     *g.forbid_inspection.lock().unwrap() = true;
     let next = t + Duration::days(1);
     let r = content_pull::run_once(&app.state.core, &feed_url, Some(&client), at_day(next, 3))
         .await
         .unwrap();
-    assert_eq!((r.posts, r.left_feed), (1, 1), "{r:?}");
-    let b = posts
-        .find_one(doc! { "_id": "/blog/b/" })
-        .await
-        .unwrap()
-        .unwrap();
+    assert_eq!((r.posts, r.left_feed), (2, 1), "{r:?}");
+    assert_eq!(r.inspection_failed, 2, "{r:?}");
+    let b = content_doc(&app, "/blog/b/").await;
     assert!(!b.get_bool("in_feed").unwrap(), "kept, out of the feed");
-    let a = posts
-        .find_one(doc! { "_id": "/blog/a/" })
+    let ia = content_doc(&app, "/blog/a/")
         .await
+        .get_document("inspection")
         .unwrap()
-        .unwrap();
-    let ia = a.get_document("inspection").unwrap();
+        .clone();
     assert_eq!(
         ia.get_str("verdict").unwrap(),
         "PASS",
         "the last good verdict stays"
     );
+    assert_eq!(
+        *ia.get_datetime("inspected_at").unwrap(),
+        first_read,
+        "inspected when the verdict was read, not at the failed attempt"
+    );
+    assert_eq!(*ia.get_datetime("attempted_at").unwrap(), at_day(next, 3));
     assert!(ia.get_str("error").unwrap().contains("forbidden (403)"));
+    let ic = content_doc(&app, "/blog/c/")
+        .await
+        .get_document("inspection")
+        .unwrap()
+        .clone();
+    assert!(ic.get_str("error").unwrap().contains("forbidden (403)"));
+    assert!(
+        ic.get("verdict").is_none() && ic.get("inspected_at").is_none(),
+        "never inspected: no verdict, no inspected_at: {ic}"
+    );
     let (status, error) = pull(&app, content_pull::INSPECTION_SOURCE, &ds(next))
         .await
         .unwrap();
     assert_eq!(status, "failed");
     assert!(error.unwrap().contains("forbidden (403)"));
 
-    // No feed at all is no blog — an empty read, not a failure. Without a
-    // Search Console client nothing is inspected.
-    *f.0.lock().unwrap() = None;
-    let other = TestApp::spawn().await;
-    let r = content_pull::run_once(&other.state.core, &feed_url, None, at_day(t, 3))
+    // A later tick retries the day: C (newest) is inspected, A is refused
+    // once more and stops the run.
+    *g.forbid_inspection.lock().unwrap() = false;
+    g.forbid_once.lock().unwrap().push("/blog/a/".into());
+    let r = content_pull::run_once(&app.state.core, &feed_url, Some(&client), at_day(next, 4))
         .await
         .unwrap();
-    assert_eq!((r.posts, r.inspection_due), (0, false), "{r:?}");
+    assert!(r.inspection_due && !r.feed_due, "{r:?}");
+    assert_eq!((r.inspected, r.inspection_failed), (1, 1), "{r:?}");
+    // The tick after: only A is asked — C was inspected in this cycle.
+    let r = content_pull::run_once(&app.state.core, &feed_url, Some(&client), at_day(next, 5))
+        .await
+        .unwrap();
     assert_eq!(
-        pull(&other, content_pull::CONTENT_SOURCE, &ds(t)).await,
+        (r.already_inspected, r.inspected, r.inspection_failed),
+        (1, 1, 0),
+        "{r:?}"
+    );
+    let asked = g.inspected.lock().unwrap().clone();
+    assert_eq!(
+        asked.iter().filter(|u| u.ends_with("/blog/c/")).count(),
+        1,
+        "C is not inspected twice in a cycle: {asked:?}"
+    );
+    assert_eq!(
+        pull(&app, content_pull::INSPECTION_SOURCE, &ds(next)).await,
         Some(("ok".into(), None))
+    );
+    let ia = content_doc(&app, "/blog/a/")
+        .await
+        .get_document("inspection")
+        .unwrap()
+        .clone();
+    assert!(
+        ia.get("error").is_none_or(|e| e == &bson::Bson::Null),
+        "{ia}"
+    );
+    assert_eq!(*ia.get_datetime("inspected_at").unwrap(), at_day(next, 5));
+}
+
+/// Only a feed moves the list. A 404, an answer that is not an Atom feed
+/// (an SPA's index served for any path), a redirect, or a feed URL that is
+/// not https is a failed read with its reason, and leaves every post as it
+/// was — none is marked out of the feed on the strength of it.
+#[tokio::test]
+async fn a_read_that_is_not_the_feed_changes_nothing() {
+    let (base, _g, f) = fake_google().await;
+    let app = TestApp::spawn().await;
+    let feed_url = format!("{base}/blog/feed.xml");
+    let t = today();
+    *f.0.lock().unwrap() = Some(feed_xml(&[
+        ("a", "Post A", "2026-09-25T22:45:13Z"),
+        ("b", "Post B", "2026-10-01T08:00:00Z"),
+    ]));
+    let r = content_pull::run_once(&app.state.core, &feed_url, None, at_day(t, 3))
+        .await
+        .unwrap();
+    assert_eq!(r.posts, 2, "{r:?}");
+
+    let next = t + Duration::days(1);
+    let html = "<!DOCTYPE html><html><head><title>Roomler</title></head><body><div id=\"app\"></div></body></html>";
+    for (hour, answer, url, reason) in [
+        (3, None, feed_url.clone(), "feed not found (404)"),
+        (
+            4,
+            Some(html.to_string()),
+            feed_url.clone(),
+            "feed unreadable: the answer is not an Atom feed",
+        ),
+        (
+            5,
+            Some(feed_xml(&[])),
+            format!("{base}/blog/moved.xml"),
+            "a redirect, not followed",
+        ),
+        (
+            6,
+            Some(feed_xml(&[])),
+            "http://roomler.ai/blog/feed.xml".to_string(),
+            "its URL is not https",
+        ),
+    ] {
+        *f.0.lock().unwrap() = answer;
+        let r = content_pull::run_once(&app.state.core, &url, None, at_day(next, hour))
+            .await
+            .unwrap();
+        assert!(r.feed_due, "a failed read leaves the day owed: {r:?}");
+        assert_eq!((r.posts, r.left_feed), (0, 0), "{r:?}");
+        assert!(
+            r.error.as_deref().is_some_and(|e| e.contains(reason)),
+            "{reason}: {r:?}"
+        );
+        let (status, error) = pull(&app, content_pull::CONTENT_SOURCE, &ds(next))
+            .await
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert!(error.unwrap().contains(reason));
+        for p in ["/blog/a/", "/blog/b/"] {
+            assert!(
+                content_doc(&app, p).await.get_bool("in_feed").unwrap(),
+                "{p} stays in the feed after: {reason}"
+            );
+        }
+    }
+    // A feed none of whose entries parse is not a list either.
+    *f.0.lock().unwrap() =
+        Some(feed_xml(&[("x", "X", "2026-10-01T08:00:00Z")]).replace("<published>", "<when>"));
+    let r = content_pull::run_once(&app.state.core, &feed_url, None, at_day(next, 7))
+        .await
+        .unwrap();
+    assert!(
+        r.error
+            .as_deref()
+            .is_some_and(|e| e.contains("none of its 1 entries parsed")),
+        "{r:?}"
+    );
+    assert!(
+        content_doc(&app, "/blog/a/")
+            .await
+            .get_bool("in_feed")
+            .unwrap()
+    );
+}
+
+/// One slow URL is that post's failure and the run goes on; three timeouts
+/// in a row are Google down, which stops the run and records the reason on
+/// every post the run still owed, unasked.
+#[tokio::test]
+async fn an_inspection_timeout_is_one_posts_failure_until_three_in_a_row() {
+    let (base, g, f) = fake_google().await;
+    let app = TestApp::spawn().await;
+    let client = sc(&base, SECRET).with_timeout(std::time::Duration::from_millis(400));
+    let feed_url = format!("{base}/blog/feed.xml");
+    let t = today();
+    *f.0.lock().unwrap() = Some(feed_xml(&[
+        ("a", "Post A", "2026-09-25T22:45:13Z"),
+        ("b", "Post B", "2026-10-01T08:00:00Z"),
+        ("c", "Post C", "2026-10-05T08:00:00Z"),
+        ("d", "Post D", "2026-10-09T08:00:00Z"),
+    ]));
+    let slow = std::time::Duration::from_millis(1500);
+    g.slow.lock().unwrap().push(("/blog/c/".into(), slow));
+    let r = content_pull::run_once(&app.state.core, &feed_url, Some(&client), at_day(t, 3))
+        .await
+        .unwrap();
+    assert_eq!((r.inspected, r.inspection_failed), (3, 1), "{r:?}");
+    assert_eq!(
+        pull(&app, content_pull::INSPECTION_SOURCE, &ds(t)).await,
+        Some(("ok".into(), None)),
+        "one slow URL does not fail the day"
+    );
+    let ic = content_doc(&app, "/blog/c/")
+        .await
+        .get_document("inspection")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        ic.get_str("error").unwrap(),
+        "search console unreachable: timed out"
+    );
+
+    // The next day the three newest are slow: the run stops after the
+    // third, and A — never asked — carries the reason too.
+    let next = t + Duration::days(1);
+    {
+        let mut s = g.slow.lock().unwrap();
+        s.clear();
+        for p in ["/blog/d/", "/blog/c/", "/blog/b/"] {
+            s.push((p.into(), slow));
+        }
+    }
+    let asked_before = g.inspected.lock().unwrap().clone();
+    let r = content_pull::run_once(&app.state.core, &feed_url, Some(&client), at_day(next, 3))
+        .await
+        .unwrap();
+    assert_eq!((r.inspected, r.inspection_failed), (0, 4), "{r:?}");
+    let (status, error) = pull(&app, content_pull::INSPECTION_SOURCE, &ds(next))
+        .await
+        .unwrap();
+    assert_eq!(status, "failed");
+    assert_eq!(
+        error.as_deref(),
+        Some("search console unreachable: timed out (3 inspections in a row)")
+    );
+    let ia = content_doc(&app, "/blog/a/")
+        .await
+        .get_document("inspection")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        ia.get_str("error").unwrap(),
+        "search console unreachable: timed out"
+    );
+    assert_eq!(
+        ia.get_str("verdict").unwrap(),
+        "PASS",
+        "its last verdict kept"
+    );
+    let a_asks = |list: &[String]| list.iter().filter(|u| u.ends_with("/blog/a/")).count();
+    assert_eq!(
+        a_asks(&g.inspected.lock().unwrap()),
+        a_asks(&asked_before),
+        "A was never asked on the second day"
     );
 }
 
@@ -678,6 +925,8 @@ async fn bing_call(
         ] }),
         "GetQueryStats" => json!({ "d": [
             { "Query": "roomler", "Date": d(6), "Clicks": 2, "Impressions": 30, "AvgImpressionPosition": 4, "AvgClickPosition": 3 },
+            // Below the floor: its text is never stored.
+            { "Query": "jane doe roomler invoice", "Date": d(6), "Clicks": 1, "Impressions": 3, "AvgImpressionPosition": 1, "AvgClickPosition": 1 },
         ] }),
         "GetPageStats" => json!({ "d": [
             { "Query": "https://roomler.ai/blog/a/", "Date": d(6), "Clicks": 1, "Impressions": 12, "AvgImpressionPosition": 9, "AvgClickPosition": -1 },
@@ -752,6 +1001,16 @@ async fn bing_lands_at_its_own_grain_and_a_refused_key_is_recorded() {
         )
         .await,
         Some(30)
+    );
+    assert_eq!(
+        count(
+            &app,
+            GROWTH_DAILY,
+            doc! { "source": BING_WEEKLY_SOURCE, "dims.query": "jane doe roomler invoice" }
+        )
+        .await,
+        0,
+        "a query below the floor is not stored"
     );
     assert_eq!(
         daily(

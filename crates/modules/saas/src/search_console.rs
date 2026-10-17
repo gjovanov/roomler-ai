@@ -40,6 +40,8 @@ pub const ROW_LIMIT: u32 = 25_000;
 pub const MAX_PAGES: u32 = 4;
 /// A token is renewed this long before it expires.
 const TOKEN_MARGIN_MS: i64 = 60_000;
+/// The largest answer read: a page of 25,000 rows is a few MB.
+pub const MAX_BODY_BYTES: usize = 32 << 20;
 
 /// Why a call gave nothing. `Display` is the short reason a pull row
 /// stores; none carries the key, a token or a body.
@@ -304,11 +306,6 @@ impl ScClient {
         key: EncodingKey,
         alg: Algorithm,
     ) -> Self {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("roomler-ai-api/", env!("CARGO_PKG_VERSION")))
-            .timeout(TIMEOUT)
-            .build()
-            .expect("a reqwest client with a timeout builds");
         Self {
             site: site.trim().to_string(),
             api_base: api_base.trim_end_matches('/').to_string(),
@@ -317,9 +314,16 @@ impl ScClient {
             key_id,
             key,
             alg,
-            http,
+            http: http_client(TIMEOUT),
             token: Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    /// The same client with another per-request ceiling — a test's way to
+    /// reach a timeout without waiting [`TIMEOUT`].
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.http = http_client(timeout);
+        self
     }
 
     pub fn site(&self) -> &str {
@@ -365,18 +369,16 @@ impl ScClient {
             .await
             .map_err(transport)?;
         let status = sent.status().as_u16();
+        let body = read(sent).await?;
         if !(200..300).contains(&status) {
-            let text = sent.text().await.unwrap_or_default();
-            let why = serde_json::from_str::<serde_json::Value>(&text)
+            let why = serde_json::from_slice::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(short))
                 .unwrap_or_else(|| format!("HTTP {status}"));
             return Err(ScError::Token(why));
         }
-        let t: TokenResponse = sent
-            .json()
-            .await
-            .map_err(|e| ScError::Decode(short(&e.without_url().to_string())))?;
+        let t: TokenResponse =
+            serde_json::from_slice(&body).map_err(|e| ScError::Decode(short(&e.to_string())))?;
         let exp = now_ms + t.expires_in.unwrap_or(3600) * 1000;
         *slot = Some((t.access_token.clone(), exp));
         Ok(t.access_token)
@@ -397,9 +399,9 @@ impl ScClient {
             .await
             .map_err(transport)?;
         let status = sent.status().as_u16();
+        let body = read(sent).await?;
         if !(200..300).contains(&status) {
-            let text = sent.text().await.unwrap_or_default();
-            let msg = serde_json::from_str::<serde_json::Value>(&text)
+            let msg = serde_json::from_slice::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|v| {
                     v.pointer("/error/message")
@@ -415,9 +417,7 @@ impl ScClient {
                 _ => ScError::Status(status, msg),
             });
         }
-        sent.json::<T>()
-            .await
-            .map_err(|e| ScError::Decode(short(&e.without_url().to_string())))
+        serde_json::from_slice::<T>(&body).map_err(|e| ScError::Decode(short(&e.to_string())))
     }
 
     /// The property's path segment: `sc-domain:roomler.ai` →
@@ -481,6 +481,24 @@ fn transport(e: reqwest::Error) -> ScError {
     } else {
         ScError::Transport(short(&e.without_url().to_string()))
     }
+}
+
+fn http_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(concat!("roomler-ai-api/", env!("CARGO_PKG_VERSION")))
+        .timeout(timeout)
+        .build()
+        .expect("a reqwest client with a timeout builds")
+}
+
+/// A body, capped at [`MAX_BODY_BYTES`].
+async fn read(resp: reqwest::Response) -> Result<Vec<u8>, ScError> {
+    crate::capped::read_capped(resp, MAX_BODY_BYTES)
+        .await
+        .map_err(|e| match e {
+            crate::capped::BodyError::Timeout => ScError::Timeout,
+            other => ScError::Transport(short(&other.to_string())),
+        })
 }
 
 #[cfg(test)]
@@ -574,6 +592,64 @@ mod tests {
         assert_eq!(claims["scope"], SCOPE);
         assert_eq!(claims["iat"], 1_760_000_000_i64);
         assert_eq!(claims["exp"], 1_760_003_600_i64);
+    }
+
+    /// The production path end to end: a service-account key JSON with a
+    /// PKCS#8 RSA key — the form Google issues — parses, and its assertion
+    /// is RS256, carries the key's id, and verifies against the public half
+    /// with the grant's claims. The key is made here, so no private key
+    /// lives in the repository.
+    #[test]
+    fn a_pkcs8_service_account_key_signs_rs256() {
+        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+        let private = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+        let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+        assert!(pem.starts_with("-----BEGIN PRIVATE KEY-----"), "PKCS#8");
+        let public = private
+            .to_public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let key_json = serde_json::json!({
+            "type": "service_account",
+            "project_id": "roomler-test",
+            "private_key_id": "a1b2c3",
+            "private_key": pem.as_str(),
+            "client_email": "growth-reader@roomler-test.iam.gserviceaccount.com",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        })
+        .to_string();
+        let c = ScClient::from_key_json("sc-domain:roomler.ai", "https://x", &key_json).unwrap();
+        let now = DateTime::now().timestamp_millis() / 1000;
+        let jwt = c.assertion(now).unwrap();
+        let mut v = jsonwebtoken::Validation::new(Algorithm::RS256);
+        v.set_audience(&["https://oauth2.googleapis.com/token"]);
+        let data = jsonwebtoken::decode::<serde_json::Value>(
+            &jwt,
+            &jsonwebtoken::DecodingKey::from_rsa_pem(public.as_bytes()).unwrap(),
+            &v,
+        )
+        .unwrap();
+        assert_eq!(data.header.alg, Algorithm::RS256);
+        assert_eq!(data.header.kid.as_deref(), Some("a1b2c3"));
+        assert_eq!(
+            data.claims["iss"],
+            "growth-reader@roomler-test.iam.gserviceaccount.com"
+        );
+        assert_eq!(data.claims["scope"], SCOPE);
+        assert_eq!(data.claims["exp"], now + 3600);
+        // The check is not vacuous: the same token with its signature's first
+        // character changed fails it.
+        let (head, sig) = jwt.rsplit_once('.').unwrap();
+        let flipped = if sig.starts_with('A') { 'B' } else { 'A' };
+        let forged = format!("{head}.{flipped}{}", &sig[1..]);
+        assert!(
+            jsonwebtoken::decode::<serde_json::Value>(
+                &forged,
+                &jsonwebtoken::DecodingKey::from_rsa_pem(public.as_bytes()).unwrap(),
+                &v,
+            )
+            .is_err()
+        );
     }
 
     #[test]

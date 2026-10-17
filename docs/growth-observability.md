@@ -652,7 +652,7 @@ goes: `source` → `medium` → `campaign` → `content`, each one UTM dimension
 ### The puller — `saas`, hosted-only
 
 [`crates/modules/saas/src/purestat_pull.rs`](../crates/modules/saas/src/purestat_pull.rs),
-spawned from the module's `init` ([`lib.rs:110`](../crates/modules/saas/src/lib.rs)). No
+spawned from the module's `init` ([`lib.rs:111`](../crates/modules/saas/src/lib.rs)). No
 self-host profile compiles `saas`, and without `ROOMLER__GROWTH__PURESTAT_API_KEY` (or with
 `growth.enabled = false`) it starts nothing and logs that once.
 
@@ -663,7 +663,7 @@ self-host profile compiles `saas`, and without `ROOMLER__GROWTH__PURESTAT_API_KE
 | **A cycle** | starts at 01:00 UTC (purestat closes a visit 30 min after its last event); every day of the horizon is re-pulled once per cycle, which is what catches a late event | `CYCLE_HOUR_UTC` |
 | **A failure** | the day stays due, so the next hourly tick retries; after a fatal error (no key, 401, timeout, unreachable) the run stops asking and records the same reason for every day it owed | `run_once` ([`purestat_pull.rs:309`](../crates/modules/saas/src/purestat_pull.rs)) |
 | **Once across pods** | a DB-name-scoped Redis `NX` claim per tick (`roomler:growth-purestat-pull:<db>`), as the stats rollup and the reapers; without Redis the pod runs locally | `spawn_puller` ([`purestat_pull.rs:370`](../crates/modules/saas/src/purestat_pull.rs)) |
-| **Idempotent** | each row is `$set` on its own `_id` — a day pulled twice holds one copy; an unchanged row is not written; a row of the pulled metrics the pull no longer carries is deleted (write-then-prune, never an empty day) | `GrowthDao::replace_daily` ([`growth.rs:471`](../crates/services/src/dao/growth.rs)) |
+| **Idempotent** | each row is `$set` on its own `_id` — a day pulled twice holds one copy; an unchanged row is not written; a row of the pulled metrics the pull no longer carries is deleted (write-then-prune, never an empty day) | `GrowthDao::replace_daily` ([`growth.rs:476`](../crates/services/src/dao/growth.rs)) |
 
 A day is three purestat queries ([`pull_day`](../crates/modules/saas/src/purestat_pull.rs)),
 each row's `dims.by` naming its breakdown:
@@ -688,12 +688,12 @@ each row's `dims.by` naming its breakdown:
   pull stored are left as they were.
 - `reads` (pageviews visible ≥ 30 s) is the engagement purestat's v1 contract carries; it has
   **no engaged-visitor metric**, so the spec's "engaged visitors" are `reads` here.
-- The `_id` is escaped ([`daily_id`, growth.rs:146](../crates/services/src/dao/growth.rs)):
+- The `_id` is escaped ([`daily_id`, growth.rs:151](../crates/services/src/dao/growth.rs)):
   `%` `,` `=` `:` inside a value are percent-encoded, so a crafted UTM value cannot forge
   another row's id. P3's ids, which contain none of them, are unchanged.
 
 **`growth_pulls`** — one row per `(source, day)` attempted, `_id = "purestat:YYYY-MM-DD"`
-([`GrowthPull`, growth.rs:220](../crates/services/src/dao/growth.rs)):
+([`GrowthPull`, growth.rs:225](../crates/services/src/dao/growth.rs)):
 
 | Field | Meaning |
 |---|---|
@@ -910,8 +910,8 @@ revoke. Every pushed string is rendered as text; a URL becomes a link only when 
 
 The repository is a leading indicator: a star, a fork, a release download and a visit to the
 code arrive before a sign-up does, and at today's volume they are among the few numbers big
-enough to steer by. Spec §3k; P7's search half (Search Console, Bing, the Content table) is
-not built yet.
+enough to steer by. Spec §3k; P7's search half (Search Console, Bing, the blog's posts) is the
+next section, and the Content table that reads it comes with P7c.
 
 ```mermaid
 flowchart LR
@@ -932,7 +932,7 @@ flowchart LR
 ### The public counters — cumulative snapshots
 
 [`crates/modules/saas/src/github_pull.rs`](../crates/modules/saas/src/github_pull.rs), spawned
-from the module's `init` ([`lib.rs:118`](../crates/modules/saas/src/lib.rs)). No self-host
+from the module's `init` ([`lib.rs:122`](../crates/modules/saas/src/lib.rs)). No self-host
 profile compiles `saas`; `growth.enabled = false` or an empty `growth.github_repo` starts
 nothing and says so once. The counters need **no credential and never carry one**, so a
 token that expired, was revoked or was sealed wrong costs the traffic and never a snapshot. A
@@ -1015,7 +1015,7 @@ A digest stored before P7 reads both halves as `arrives_with: P7`.
 
 | Setting | Env | Default | Effect |
 |---|---|---|---|
-| `growth.github_repo` | `ROOMLER__GROWTH__GITHUB_REPO` | `gjovanov/roomler-ai` | the repository read; anything that is not `owner/name` (GitHub's characters only) switches the puller off ([`settings.rs:665`](../crates/config/src/settings.rs)) |
+| `growth.github_repo` | `ROOMLER__GROWTH__GITHUB_REPO` | `gjovanov/roomler-ai` | the repository read; anything that is not `owner/name` (GitHub's characters only) switches the puller off ([`settings.rs:722`](../crates/config/src/settings.rs)) |
 | `growth.github_api_url` | `ROOMLER__GROWTH__GITHUB_API_URL` | `https://api.github.com` | only a test changes it |
 | `growth.github_token` | `ROOMLER__GROWTH__GITHUB_TOKEN` | empty | the traffic's token, sent on the three traffic requests and nothing else; never logged, never in a pull row's error; empty ⇒ traffic "not measured" |
 
@@ -1065,13 +1065,14 @@ flowchart LR
 
 | Rule | Value | Where |
 |---|---|---|
-| **The credential** is a service account's JSON key. The token is the OAuth JWT-bearer grant: an RS256 assertion `{iss: client_email, scope: webmasters.readonly, aud: token_uri, iat, exp = iat + 1 h}`, cached until a minute before it expires. The scope caps the token at **read-only**, whatever role the account holds on the property | `assertion` ([`search_console.rs:330`](../crates/modules/saas/src/search_console.rs)), `access_token` ([`:348`](../crates/modules/saas/src/search_console.rs)) |
-| A key that does not parse (not JSON, not `service_account`, not an RSA PEM) is said once, loudly, at boot — without echoing the key — and nothing is pulled | `from_key_json` ([`:271`](../crates/modules/saas/src/search_console.rs)), `spawn_puller` ([`search_pull.rs:303`](../crates/modules/saas/src/search_pull.rs)) |
-| **Only final days are stored.** Each cycle first asks the `date` breakdown with `dataState: all`; its `metadata.firstIncompleteDate` says where Google's unsettled days start (usually two or three days back). A day from there on stays **due, with nothing stored** — never a partial day read as whole. A final day's breakdowns are asked with `dataState: final` | `final_days` ([`search_pull.rs:163`](../crates/modules/saas/src/search_pull.rs)), `run_once` ([`:215`](../crates/modules/saas/src/search_pull.rs)) |
-| **The horizon** is the last 30 closed days: the first cycle fills them all (the Content table reads 28 days); a day younger than 5 is re-pulled once per cycle to catch a late correction, an older one pulled until it succeeds once; past 30, frozen | `HORIZON_DAYS`, `SETTLE_DAYS` ([`:66`](../crates/modules/saas/src/search_pull.rs)), `pull_schedule::due_days` |
+| **The credential** is a service account's JSON key. The token is the OAuth JWT-bearer grant: an RS256 assertion `{iss: client_email, scope: webmasters.readonly, aud: token_uri, iat, exp = iat + 1 h}`, cached until a minute before it expires. The scope caps the token at **read-only**, whatever role the account holds on the property | `assertion` ([`search_console.rs:334`](../crates/modules/saas/src/search_console.rs)), `access_token` ([`:352`](../crates/modules/saas/src/search_console.rs)) |
+| A key that does not parse (not JSON, not `service_account`, not an RSA PEM) is said once, loudly, at boot — without echoing the key — and nothing is pulled | `from_key_json` ([`:273`](../crates/modules/saas/src/search_console.rs)), `spawn_puller` ([`search_pull.rs:320`](../crates/modules/saas/src/search_pull.rs)) |
+| **Only final days are stored.** Each cycle first asks the `date` breakdown with `dataState: all`; its `metadata.firstIncompleteDate` says where Google's unsettled days start (usually two or three days back). A day from there on stays **due, with nothing stored** — never a partial day read as whole. When Google omits the date, the Pacific day still running stays due all the same (read as of `now − 8 h`, never later than the true Pacific date). A final day's breakdowns are asked with `dataState: final` | `final_days` ([`search_pull.rs:165`](../crates/modules/saas/src/search_pull.rs)), `pacific_today` ([`:181`](../crates/modules/saas/src/search_pull.rs)), `run_once` ([`:232`](../crates/modules/saas/src/search_pull.rs)) |
+| **The horizon** is the last 30 closed days: the first cycle fills them all (the Content table reads 28 days); a day younger than 5 is re-pulled once per cycle to catch a late correction, an older one pulled until it succeeds once; past 30, frozen | `HORIZON_DAYS`, `SETTLE_DAYS` ([`:68`](../crates/modules/saas/src/search_pull.rs)), `pull_schedule::due_days` |
 | A day is **Google's**: Search Console dates are Pacific-time days | — |
 | Each breakdown pages 25,000 rows at a time, at most four pages (`truncated` on the pull row past that) | `query_all` ([`search_console.rs:440`](../crates/modules/saas/src/search_console.rs)) |
-| Google's answer is read leniently: no `rows` key is no rows; a `"NaN"` position is no position; an exponent is a number | `lenient_f64` ([`:153`](../crates/modules/saas/src/search_console.rs)) |
+| Google's answer is read leniently: no `rows` key is no rows; a `"NaN"` position is no position; an exponent is a number | `lenient_f64` ([`:155`](../crates/modules/saas/src/search_console.rs)) |
+| Every answer is read with a ceiling of 32 MiB (a page of 25,000 rows is a few MB) | `MAX_BODY_BYTES`, `capped::read_capped` |
 | A fatal error (the key, the token, a 401 / 403, a quota, a timeout) stops the run and records the reason on every day it owed | `run_once` |
 
 | `growth_daily` (`source: search_console`) | dims | from | note |
@@ -1086,28 +1087,41 @@ impressions, ×100 and rounded (`Σ position · impressions · 100`), so any set
 Google averages: `Σ position_x100 / Σ impressions / 100`. CTR is `clicks / impressions` and is
 not stored. A zero is not stored; a value is cut to 300 characters (a page) or 200 (a query) with
 control characters dropped, and keys that fold into one are summed
-([`rows_of`, `search_pull.rs:123`](../crates/modules/saas/src/search_pull.rs)).
+([`rows_of`, `search_pull.rs:125`](../crates/modules/saas/src/search_pull.rs)).
 
 ### The blog's posts and URL Inspection
 
 [`content_pull.rs`](../crates/modules/saas/src/content_pull.rs) keeps `growth_content`, a
 collection of `saas`'s own (its index set in the module, FR-69 rule 3), read by the host through
 `roomler_ai_services::dao::growth_content`
-([`sync_feed`, `growth_content.rs:124`](../crates/services/src/dao/growth_content.rs)).
+([`sync_feed`, `growth_content.rs:132`](../crates/services/src/dao/growth_content.rs)).
 
 - **The feed is the list.** No server record holds the posts: the blog is built by the docs
   generator and published by the blog lane. Its Atom feed, `{frontend_url}/blog/feed.xml`
   (`ROOMLER__GROWTH__BLOG_FEED_URL` overrides it), carries every post's permanent URL, title and
-  `published` time ([`parse_feed`, `content_pull.rs:117`](../crates/modules/saas/src/content_pull.rs)).
+  `published` time ([`parse_feed`, `content_pull.rs:165`](../crates/modules/saas/src/content_pull.rs)).
   It is read once a day (`growth_pulls content:<day>`) with no credential — it is the site's
   own. `_id` is the post's path, the key every reader joins on; a post that leaves the feed keeps
-  its row with `in_feed: false`; a 404 is "no blog", not a failure.
+  its row with `in_feed: false`.
+- **Only a feed moves the list.** A 404, a redirect (never followed), a feed URL that is not
+  `https` (plain `http` only to a loopback test site), an answer that is not an Atom feed — an
+  SPA's index page served for any path, a site mid-deploy — or a feed none of whose entries parse
+  is a **failed** read, recorded on `content:<day>` with its reason, and changes nothing: a post
+  is marked out of the feed only by a feed that lacks it
+  ([`read_feed`, `content_pull.rs:258`](../crates/modules/saas/src/content_pull.rs),
+  [`is_atom_feed`, `:131`](../crates/modules/saas/src/content_pull.rs)). Only `https` entry
+  links are read, since the Content table renders them as links; the body is capped at 8 MiB.
 - **URL Inspection**, with the Search Console key: each post in the feed, at most 200 a day
   (`MAX_INSPECTIONS`, inside Google's 2,000), gets Google's `verdict` (`PASS` · `NEUTRAL` —
   excluded · `FAIL`), `coverage_state` ("Submitted and indexed", "Crawled - currently not
   indexed", …), `indexing_state`, `page_fetch_state`, `robots_txt_state`, `last_crawl_time` and
-  `google_canonical`. A failed inspection keeps the last good verdict and records only the error;
-  a fatal one stops the day's inspections and fails `url_inspection:<day>` with its reason.
+  `google_canonical`, and `inspected_at` — when that verdict was read. Every attempt sets
+  `attempted_at`; a failed one keeps the last good verdict and its `inspected_at`, and records
+  the error. A timeout is that post's failure unless three come in a row; a fatal error (the key,
+  the token, a 403, a quota, three timeouts) stops the day's inspections, is recorded on **every**
+  post the run still owed, and fails `url_inspection:<day>` with its reason. A post inspected
+  successfully in the cycle is not asked again when a later tick retries the day
+  ([`run_once`, `content_pull.rs:325`](../crates/modules/saas/src/content_pull.rs)).
 
 > ⚠️ **Restricted is enough for the numbers, maybe not for the index column.** Google's own
 > permission table gives a *Restricted* user Performance (Search Analytics) but only "fetch only"
@@ -1130,9 +1144,16 @@ Console answers, and nothing here pretends it does:
   `AvgClickPosition` **as Bing returns them, ×10** (`avg_impression_position_x10`,
   `avg_click_position_x10`); Bing's "none" (−1) is not stored. They are a week as Bing cuts it,
   never relabelled as a 7-day window.
+- **A rare query's text is not stored**: a query row needs 10 impressions in its weekly bucket
+  (`QUERY_MIN_IMPRESSIONS`). Google drops rare queries itself ("anonymised"); Bing documents no
+  threshold, and a query seen a handful of times can be one person's words. Its clicks and
+  impressions stay in the site's daily totals, which come from `GetRankAndTrafficStats`. Pages
+  are our own URLs and are stored whatever their count.
+- The key rides the query string, so the client follows **no redirect** (it would carry the key
+  to the next hop and into reqwest's debug log of the move), and each answer is capped at 32 MiB.
 - A row's day is Bing's: `/Date(1760252400000-0700)/` is epoch milliseconds with a Pacific
   offset, applied before the calendar day is taken
-  ([`bing_day`, `bing_pull.rs:245`](../crates/modules/saas/src/bing_pull.rs)).
+  ([`bing_day`, `bing_pull.rs:270`](../crates/modules/saas/src/bing_pull.rs)).
 - Every call returns the whole history, so a cycle (once a day, after 03:00 UTC, marked
   `growth_pulls bing:<yesterday>`) rewrites only the last 30 daily rows and 35 days of weekly
   buckets; older rows stay as first stored.

@@ -506,21 +506,28 @@ sequenceDiagram
   RS256 assertion (`webmasters.readonly`, which caps the token at read-only whatever the account's role)
   exchanged for a cached token. Only **final** days are stored: each cycle asks the `date` breakdown with
   `dataState: all`, and a day from its `metadata.firstIncompleteDate` on stays due with nothing stored,
-  never a partial day read as whole. A final day holds four breakdowns — `site` (the property's totals),
+  never a partial day read as whole; when Google omits that date the Pacific day still running stays due
+  all the same. A final day holds four breakdowns — `site` (the property's totals),
   `page` (per-page totals with the anonymised queries), `query`, `page_query` — as `clicks`, `impressions`
   and `position_x100` (the position weighted by impressions, so any set of rows averages as Google does); CTR
   is derived. The first cycle fills the last 30 closed days; a day younger than 5 is re-pulled once per cycle,
   then frozen. Its days are Google's (Pacific). **The blog's posts** (`saas::content_pull`, `growth_content`,
   `saas`'s index set): the site's own Atom feed once a day, `_id` the post's path; a post that leaves the
-  feed is kept `in_feed: false`; with the same key, each post's URL Inspection verdict, coverage state and
-  last crawl (at most 200 a day). ⚠️ Google's own permission table gives a *Restricted* user "fetch only"
+  feed is kept `in_feed: false`, and only a feed can say so — a 404, a redirect, a non-https URL or an
+  answer that is not an Atom feed is a failed read that changes nothing. With the same key, each post's
+  URL Inspection verdict, coverage state and last crawl (at most 200 a day), `inspected_at` the time the
+  verdict was read; a failed attempt keeps them and records the error, a timeout is one post's failure
+  until three come in a row, and a post inspected in the cycle is not asked again on a retry.
+  ⚠️ Google's own permission table gives a *Restricted* user "fetch only"
   on URL Inspection, and community reports say the API needs *Full*: with a Restricted account the search
-  numbers arrive and the index column records `forbidden (403)` — never a 0 — until the account is raised
-  to Full. **Bing** (`saas::bing_pull`): Bing answers per DAY only for the site's totals
+  numbers arrive and the index column records `forbidden (403)` on every post — never a 0 — until the
+  account is raised to Full. **Bing** (`saas::bing_pull`): Bing answers per DAY only for the site's totals
   (`GetRankAndTrafficStats` → `source: bing`) and per WEEKLY bucket for queries and pages
   (`GetQueryStats`, `GetPageStats` → `source: bing_weekly`), the whole history on every call; both are
   stored at Bing's own grain under Bing's (Pacific) dates and labelled as such, the recent part rewritten
-  and the rest frozen. Bing exposes no index status. Detail:
+  and the rest frozen. A Bing query's text is stored only from 10 impressions in its bucket (§3p). Bing's
+  key rides the query string, so no redirect is followed. Bing exposes no index status. Every puller reads
+  its answers with a size ceiling. Detail:
   [growth-observability.md](../growth-observability.md#search-search-console-bing-and-the-blogs-posts-p7b).)*
 - **The Content table**, per article:
   - published date, visitors, reads, median read time, top channels;
@@ -745,7 +752,7 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 | invoices and plan changes | `billing_events` | with the org (Stripe is the record) | the org | §2.12 |
 | session ratings | `session_feedback` | 25 months | the user | new §2.18 |
 | delivery status | `newsletter_sends` | as FR-58 | the subscriber | newsletter section (P5: §2.14 and §7 name it) |
-| social, search, GitHub | `growth_daily`; social posts and their metric snapshots in `growth_posts` / `growth_post_snapshots` (P8: ids, URLs, numbers and the campaign key — never post text); the blog's posts and their index status in `growth_content` (P7b) | indefinitely | — (aggregates about our own content: search queries are Google's and Bing's aggregates, from which Google already drops the rare, possibly identifying ones; GitHub's referrers are site names) | — |
+| social, search, GitHub | `growth_daily`; social posts and their metric snapshots in `growth_posts` / `growth_post_snapshots` (P8: ids, URLs, numbers and the campaign key — never post text); the blog's posts and their index status in `growth_content` (P7b) | indefinitely | — (aggregates about our own content: search queries are Google's and Bing's aggregates. Google already drops the rare, possibly identifying ones; Bing documents no such threshold, so a Bing query's text is stored only from 10 impressions in its weekly bucket — `bing_pull::QUERY_MIN_IMPRESSIONS` — and the rest live on only in the site's daily totals. GitHub's referrers are site names) | — |
 | daily digests | `growth_digests`; the platform admins' mailboxes | 25 months | — (org names, never a person) | new §2.18 |
 | remote-desktop quality per day and agent version (P9a) | `growth_quality_daily` | indefinitely | — (counts and percentiles about the product; no org, no device, no person) | new §2.18 |
 

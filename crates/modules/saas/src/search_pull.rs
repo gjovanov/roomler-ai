@@ -30,8 +30,10 @@
 //!   more). Each cycle first asks the `date` breakdown with
 //!   `dataState: all`, whose `metadata.firstIncompleteDate` says where the
 //!   unsettled days start; a day from there on is NOT pulled — it stays
-//!   due, "pending", never a partial day stored as if it were whole. The
-//!   breakdowns of a final day are asked with `dataState: final`.
+//!   due, "pending", never a partial day stored as if it were whole. When
+//!   Google omits the date, the Pacific day still running is pending all
+//!   the same ([`pacific_today`]). The breakdowns of a final day are asked
+//!   with `dataState: final`.
 //! * **The horizon** is the last [`HORIZON_DAYS`] closed days: on its first
 //!   cycle the puller fills them all (Search Console keeps 16 months, but
 //!   the Content table reads 28 days), and a day older than that is frozen.
@@ -160,11 +162,26 @@ pub fn rows_of(day: &str, by: &str, keys: &[&str], rows: &[ScRow]) -> Vec<Growth
 
 /// The days of `due` that Google calls final: before `first_incomplete`
 /// (all of them when Google names no incomplete day).
-pub fn final_days(due: &[String], first_incomplete: Option<&str>) -> Vec<String> {
+pub fn final_days(due: &[String], first_incomplete: Option<&str>, now: DateTime) -> Vec<String> {
+    let in_progress = pacific_today(now);
     due.iter()
         .filter(|d| first_incomplete.is_none_or(|f| d.as_str() < f))
+        // Whatever Google's metadata says — or omits — the Pacific day still
+        // running is never final.
+        .filter(|d| d.as_str() < in_progress.as_str())
         .cloned()
         .collect()
+}
+
+/// The Pacific date at `now`, read conservatively. Google's day is
+/// America/Los_Angeles — UTC−8 in winter, UTC−7 in summer — and the date at
+/// `now` − 8 h is never later than the true one, so a day still running is
+/// never taken for final; in summer a day is held back at most an hour past
+/// its end.
+pub fn pacific_today(now: DateTime) -> String {
+    day_str(date_of(DateTime::from_millis(
+        now.timestamp_millis() - 8 * 3_600_000,
+    )))
 }
 
 /// One final day, pulled: its `site` rows come from the `date` breakdown
@@ -250,7 +267,7 @@ pub async fn run_once(core: &Core, client: &ScClient, now: DateTime) -> DaoResul
         .metadata
         .as_ref()
         .and_then(|m| m.first_incomplete_date.clone());
-    let finals = final_days(&due, first_incomplete.as_deref());
+    let finals = final_days(&due, first_incomplete.as_deref(), now);
     report.pending = due
         .iter()
         .filter(|d| !finals.contains(d))
@@ -450,11 +467,23 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
+        let later = DateTime::parse_rfc3339_str("2026-10-20T12:00:00Z").unwrap();
         assert_eq!(
-            final_days(&due, Some("2026-10-12")),
+            final_days(&due, Some("2026-10-12"), later),
             ["2026-10-10", "2026-10-11"]
         );
-        assert_eq!(final_days(&due, None).len(), 4);
-        assert!(final_days(&due, Some("2026-10-01")).is_empty());
+        assert_eq!(final_days(&due, None, later).len(), 4);
+        assert!(final_days(&due, Some("2026-10-01"), later).is_empty());
+        // Google omitted `firstIncompleteDate`: the Pacific day still running
+        // is not final. At 03:00 UTC on 10-14 it is 10-13 in California.
+        let early = DateTime::parse_rfc3339_str("2026-10-14T03:00:00Z").unwrap();
+        assert_eq!(pacific_today(early), "2026-10-13");
+        assert_eq!(
+            final_days(&due, None, early),
+            ["2026-10-10", "2026-10-11", "2026-10-12"]
+        );
+        // From 08:00 UTC the 13th is over in both of Pacific's offsets.
+        let after = DateTime::parse_rfc3339_str("2026-10-14T08:00:00Z").unwrap();
+        assert_eq!(final_days(&due, None, after).len(), 4);
     }
 }

@@ -11,12 +11,24 @@
 //!   title and its `published` time — what the Content table needs and what
 //!   no server record holds. A post that leaves the feed keeps its row,
 //!   `in_feed: false`.
+//! * **Only a feed moves the list.** A 404, a redirect, a non-https URL, or
+//!   a 200 that is not an Atom feed (an SPA's index page served for any
+//!   path; a half-deployed site) is a FAILED read, recorded with its reason:
+//!   nothing is marked out of the feed on the strength of an answer that
+//!   was never the feed. A feed whose entries all fail to parse is a failed
+//!   read too. Only `https` entry links are read — the Content table renders
+//!   them as links. No redirect is followed, and the body is capped at
+//!   [`MAX_FEED_BYTES`].
 //! * **URL Inspection** asks Google about each post in the feed, within its
 //!   quota of 2,000 a day per property ([`MAX_INSPECTIONS`] here). A post's
-//!   failed inspection keeps its last good verdict and records the error; a
-//!   fatal one (the key, the token, a 403 — a service account that is only a
-//!   *Restricted* user may be refused here while Search Analytics answers it)
-//!   stops the run and is recorded on the day's pull row.
+//!   failed inspection keeps its last good verdict (and the time it was
+//!   read) and records the error and the attempt's time. A timeout is that
+//!   post's failure, unless [`MAX_TIMEOUTS_IN_A_ROW`] come in a row; a fatal
+//!   error (the key, the token, a 403 — a service account that is only a
+//!   *Restricted* user is refused here while Search Analytics answers it)
+//!   stops the run, is recorded on EVERY post the run still owed, and on the
+//!   day's pull row. A post inspected successfully in this cycle is not
+//!   asked again when a later tick retries the day.
 //! * Once per cycle each, marked by `growth_pulls` rows `content:<day>` and
 //!   `url_inspection:<day>` (the UTC day of the read).
 
@@ -51,6 +63,11 @@ pub const MAX_INSPECTIONS: usize = 200;
 pub const MAX_TITLE_LEN: usize = 200;
 pub const MAX_URL_LEN: usize = 300;
 pub const FEED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// The largest feed read: the site's was 116 KB on 2026-10-17.
+pub const MAX_FEED_BYTES: usize = 8 << 20;
+/// Inspection timeouts in a row that stop the run: one slow URL is that
+/// post's failure, a run of them is Google being down.
+pub const MAX_TIMEOUTS_IN_A_ROW: u32 = 3;
 
 /// The text between `<tag>` and `</tag>` in `block`, the first one.
 fn between<'a>(block: &'a str, open: &str, close: &str) -> Option<&'a str> {
@@ -109,10 +126,41 @@ fn bounded(s: &str, max: usize) -> String {
         .collect()
 }
 
+/// Pure: whether `xml` is an Atom feed — its root element is `feed` in the
+/// Atom namespace. An HTML page, a JSON error, an empty body are not.
+pub fn is_atom_feed(xml: &str) -> bool {
+    // Skip the prolog: a BOM, whitespace, processing instructions
+    // (`<?xml …?>`, a stylesheet) and comments. The first element must be
+    // the feed itself.
+    let mut rest = xml.trim_start_matches('\u{feff}');
+    loop {
+        rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix("<?") {
+            let Some(e) = r.find("?>") else {
+                return false;
+            };
+            rest = &r[e + 2..];
+        } else if let Some(r) = rest.strip_prefix("<!--") {
+            let Some(e) = r.find("-->") else {
+                return false;
+            };
+            rest = &r[e + 3..];
+        } else {
+            break;
+        }
+    }
+    let Some(tag) = rest.strip_prefix("<feed") else {
+        return false;
+    };
+    let tag = &tag[..tag.find('>').unwrap_or(tag.len())];
+    tag.starts_with(|c: char| c.is_ascii_whitespace())
+        && tag.contains("http://www.w3.org/2005/Atom")
+}
+
 /// Pure: the posts of an Atom feed as our generator writes it
 /// (`ui/docs/theme/xml.ts`): each `<entry>`'s alternate link, title and
-/// `published` / `updated` times. An entry without a parseable URL under
-/// `/blog/` or without a `published` time is skipped; at most
+/// `published` / `updated` times. An entry whose link is not an `https`
+/// URL under `/blog/`, or without a `published` time, is skipped; at most
 /// [`MAX_POSTS`].
 pub fn parse_feed(xml: &str) -> Vec<FeedPost> {
     let mut out = Vec::new();
@@ -131,6 +179,10 @@ pub fn parse_feed(xml: &str) -> Vec<FeedPost> {
         let Ok(url) = url::Url::parse(href.trim()) else {
             continue;
         };
+        // The Content table renders the URL as a link: https, nothing else.
+        if url.scheme() != "https" || url.host_str().is_none() {
+            continue;
+        }
         let path = url.path().to_string();
         if !path.starts_with("/blog/") || path == "/blog/" || path.len() > MAX_URL_LEN {
             continue;
@@ -175,16 +227,45 @@ pub struct ContentReport {
     pub posts: u64,
     pub left_feed: u64,
     pub inspection_due: bool,
+    /// Posts in the feed already inspected successfully this cycle — a
+    /// retried day does not ask Google about them again.
+    pub already_inspected: u32,
     pub inspected: u32,
     pub inspection_failed: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
+/// Whether the feed may be read from `url`: `https`, or plain `http` to a
+/// loopback address (a test's fake site).
+pub fn feed_url_allowed(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url.trim()) else {
+        return false;
+    };
+    match (u.scheme(), u.host()) {
+        ("https", Some(_)) => true,
+        ("http", Some(url::Host::Ipv4(ip))) => ip.is_loopback(),
+        ("http", Some(url::Host::Ipv6(ip))) => ip.is_loopback(),
+        ("http", Some(url::Host::Domain(d))) => d.eq_ignore_ascii_case("localhost"),
+        _ => false,
+    }
+}
+
+/// The posts of one read of the feed, or why there are none to trust.
+/// Only an Atom feed is a list: a 404, a redirect, a non-https URL, an
+/// answer that is not a feed, or a feed none of whose entries parse is an
+/// error, so the caller never marks posts out of the feed on its strength.
 async fn read_feed(url: &str) -> Result<Vec<FeedPost>, String> {
+    if !feed_url_allowed(url) {
+        return Err(
+            "feed refused: its URL is not https (ROOMLER__GROWTH__BLOG_FEED_URL)".to_string(),
+        );
+    }
     let http = reqwest::Client::builder()
         .user_agent(concat!("roomler-ai-api/", env!("CARGO_PKG_VERSION")))
         .timeout(FEED_TIMEOUT)
+        // A redirect is the site moving its feed: said, never followed.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
     let resp = http
@@ -193,18 +274,32 @@ async fn read_feed(url: &str) -> Result<Vec<FeedPost>, String> {
         .await
         .map_err(|e| format!("feed unreachable: {}", e.without_url()))?;
     let status = resp.status().as_u16();
+    if (300..400).contains(&status) {
+        return Err(format!(
+            "feed unreachable: HTTP {status}, a redirect, not followed (point ROOMLER__GROWTH__BLOG_FEED_URL at its target)"
+        ));
+    }
     if status == 404 {
-        // No post, no blog (`ui/blog/README.md`): an empty list, not a failure.
-        return Ok(Vec::new());
+        return Err("feed not found (404)".to_string());
     }
     if !(200..300).contains(&status) {
         return Err(format!("feed unreachable: HTTP {status}"));
     }
-    let text = resp
-        .text()
+    let body = crate::capped::read_capped(resp, MAX_FEED_BYTES)
         .await
-        .map_err(|e| format!("feed unreadable: {}", e.without_url()))?;
-    Ok(parse_feed(&text))
+        .map_err(|e| format!("feed unreadable: {e}"))?;
+    let text = String::from_utf8_lossy(&body);
+    if !is_atom_feed(&text) {
+        return Err("feed unreadable: the answer is not an Atom feed".to_string());
+    }
+    let posts = parse_feed(&text);
+    let entries = text.matches("<entry>").count();
+    if posts.is_empty() && entries > 0 {
+        return Err(format!(
+            "feed unreadable: none of its {entries} entries parsed"
+        ));
+    }
+    Ok(posts)
 }
 
 fn inspection_of(status: crate::search_console::IndexStatus, now: DateTime) -> Inspection {
@@ -219,7 +314,8 @@ fn inspection_of(status: crate::search_console::IndexStatus, now: DateTime) -> I
             .as_deref()
             .and_then(|t| DateTime::parse_rfc3339_str(t).ok()),
         google_canonical: status.google_canonical,
-        inspected_at: now,
+        inspected_at: Some(now),
+        attempted_at: Some(now),
         error: None,
     }
 }
@@ -277,37 +373,70 @@ pub async fn run_once(
         return Ok(report);
     }
     report.inspection_due = true;
-    let posts: Vec<_> = content
+    // A post inspected successfully in this cycle is not asked again when a
+    // later tick retries the day: a recurring failure must not re-inspect
+    // from the top every hour.
+    let cycle_start = pull_schedule::cycle_start_ms(now, CYCLE_HOUR_UTC);
+    let (done, owed): (Vec<_>, Vec<_>) = content
         .list()
         .await?
         .into_iter()
         .filter(|p| p.in_feed)
-        .take(MAX_INSPECTIONS)
-        .collect();
+        .partition(|p| {
+            p.inspection
+                .as_ref()
+                .and_then(|i| i.inspected_at)
+                .is_some_and(|t| t.timestamp_millis() >= cycle_start)
+        });
+    report.already_inspected = done.len() as u32;
+    let truncated = owed.len() > MAX_INSPECTIONS;
+    let owed: Vec<_> = owed.into_iter().take(MAX_INSPECTIONS).collect();
     let mut fatal: Option<ScError> = None;
-    for p in &posts {
-        match sc.inspect(&p.url).await {
+    let mut timeouts = 0u32;
+    for (i, p) in owed.iter().enumerate() {
+        let e = match sc.inspect(&p.url).await {
             Ok(status) => {
+                timeouts = 0;
                 content
                     .set_inspection(&p.path, &inspection_of(status, now))
                     .await?;
                 report.inspected += 1;
+                continue;
             }
-            Err(e) => {
-                report.inspection_failed += 1;
+            Err(e) => e,
+        };
+        report.inspection_failed += 1;
+        content
+            .set_inspection(&p.path, &Inspection::failed(now, e.to_string()))
+            .await?;
+        // One slow URL is that post's failure; a run of them is Google down.
+        let stop = if e == ScError::Timeout {
+            timeouts += 1;
+            timeouts >= MAX_TIMEOUTS_IN_A_ROW
+        } else {
+            timeouts = 0;
+            e.is_fatal()
+        };
+        if stop {
+            // The reason is every remaining post's, not the first's: a
+            // Restricted account's 403 answers them all the same.
+            for rest in &owed[i + 1..] {
                 content
-                    .set_inspection(&p.path, &Inspection::failed(now, e.to_string()))
+                    .set_inspection(&rest.path, &Inspection::failed(now, e.to_string()))
                     .await?;
-                if e.is_fatal() {
-                    fatal = Some(e);
-                    break;
-                }
+                report.inspection_failed += 1;
             }
+            fatal = Some(e);
+            break;
         }
     }
     match fatal {
         Some(e) => {
-            let reason = e.to_string();
+            let reason = if e == ScError::Timeout {
+                format!("{e} ({MAX_TIMEOUTS_IN_A_ROW} inspections in a row)")
+            } else {
+                e.to_string()
+            };
             warn!(%reason, "url inspection stopped");
             dao.record_pull_failed(INSPECTION_SOURCE, &today, &reason, now)
                 .await?;
@@ -318,9 +447,9 @@ pub async fn run_once(
                 INSPECTION_SOURCE,
                 &today,
                 PulledDay {
-                    rows: report.inspected,
+                    rows: report.inspected + report.already_inspected,
                     missing_goal: None,
-                    truncated: posts.len() >= MAX_INSPECTIONS,
+                    truncated,
                 },
                 now,
             )
@@ -409,6 +538,16 @@ mod tests {
     <title>No date</title>
     <link rel="alternate" type="text/html" href="https://roomler.ai/blog/undated/"/>
   </entry>
+  <entry>
+    <title>Plain http</title>
+    <link rel="alternate" type="text/html" href="http://roomler.ai/blog/plain/"/>
+    <published>2026-10-02T00:00:00Z</published>
+  </entry>
+  <entry>
+    <title>Script</title>
+    <link rel="alternate" type="text/html" href="javascript:alert(1)//blog/x/"/>
+    <published>2026-10-03T00:00:00Z</published>
+  </entry>
 </feed>
 "#;
 
@@ -442,6 +581,49 @@ mod tests {
         // Not a feed at all: nothing, never a panic.
         assert!(parse_feed("<html>nope</html>").is_empty());
         assert!(parse_feed("<entry><link href=\"").is_empty());
+        assert!(
+            posts.iter().all(|p| p.url.starts_with("https://")),
+            "an http or javascript: link is never read: {posts:?}"
+        );
+    }
+
+    /// Only an Atom feed is a list: an HTML page (an SPA's index served for
+    /// any path), a JSON error or nothing at all is not, whatever it holds.
+    #[test]
+    fn only_an_atom_feed_is_a_feed() {
+        assert!(is_atom_feed(FEED));
+        assert!(is_atom_feed(
+            "\u{feff}<!-- built --><feed xmlns=\"http://www.w3.org/2005/Atom\"></feed>"
+        ));
+        for not_a_feed in [
+            "",
+            "<!DOCTYPE html><html><body><feed xmlns=\"http://www.w3.org/2005/Atom\">",
+            "<?xml version=\"1.0\"?><rss version=\"2.0\"></rss>",
+            "<feeds xmlns=\"http://www.w3.org/2005/Atom\"></feeds>",
+            "<feed></feed>",
+            "{\"error\":\"not found\"}",
+        ] {
+            assert!(!is_atom_feed(not_a_feed), "{not_a_feed:?}");
+        }
+    }
+
+    /// The feed is read over https; plain http only from a loopback test
+    /// site.
+    #[test]
+    fn the_feed_url_must_be_https() {
+        assert!(feed_url_allowed("https://roomler.ai/blog/feed.xml"));
+        assert!(feed_url_allowed("http://127.0.0.1:5000/blog/feed.xml"));
+        assert!(feed_url_allowed("http://localhost/blog/feed.xml"));
+        assert!(feed_url_allowed("http://[::1]:8080/blog/feed.xml"));
+        for bad in [
+            "http://roomler.ai/blog/feed.xml",
+            "ftp://roomler.ai/feed.xml",
+            "file:///etc/passwd",
+            "not a url",
+            "",
+        ] {
+            assert!(!feed_url_allowed(bad), "{bad:?}");
+        }
     }
 
     #[test]

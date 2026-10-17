@@ -51,16 +51,23 @@ pub struct Inspection {
     pub last_crawl_time: Option<DateTime>,
     #[serde(default)]
     pub google_canonical: Option<String>,
-    pub inspected_at: DateTime,
-    /// Why the newest inspection of this post failed, when it did; the
-    /// fields above are then the last good inspection's.
+    /// When the verdict above was read: the last SUCCESSFUL inspection.
+    /// `None` while every attempt so far has failed.
+    #[serde(default)]
+    pub inspected_at: Option<DateTime>,
+    /// The newest attempt, successful or not.
+    #[serde(default)]
+    pub attempted_at: Option<DateTime>,
+    /// Why the newest attempt failed, when it did; the fields above are then
+    /// the last good inspection's (none, if there never was one).
     #[serde(default)]
     pub error: Option<String>,
 }
 
 impl Inspection {
-    /// A failed inspection: the error and its time, nothing else —
-    /// [`GrowthContentDao::set_inspection`] keeps the last good verdict.
+    /// A failed attempt: the error and its time, nothing else —
+    /// [`GrowthContentDao::set_inspection`] keeps the last good verdict and
+    /// its `inspected_at`.
     pub fn failed(at: DateTime, error: String) -> Self {
         Self {
             verdict: None,
@@ -70,7 +77,8 @@ impl Inspection {
             robots_txt_state: None,
             last_crawl_time: None,
             google_canonical: None,
-            inspected_at: at,
+            inspected_at: None,
+            attempted_at: Some(at),
             error: Some(error),
         }
     }
@@ -154,12 +162,13 @@ impl GrowthContentDao {
     }
 
     /// The newest inspection of one post. A failed one keeps the last good
-    /// result's fields and records only the error and its time.
+    /// result's fields — its verdict and the `inspected_at` it was read at —
+    /// and records only the error and the attempt's time.
     pub async fn set_inspection(&self, path: &str, inspection: &Inspection) -> DaoResult<()> {
         let update = if inspection.error.is_some() {
             doc! { "$set": {
                 "inspection.error": inspection.error.clone(),
-                "inspection.inspected_at": inspection.inspected_at,
+                "inspection.attempted_at": inspection.attempted_at,
             } }
         } else {
             doc! { "$set": { "inspection": bson::to_bson(inspection)? } }

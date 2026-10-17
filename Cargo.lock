@@ -8362,6 +8362,7 @@ dependencies = [
  "roomler-ai-db",
  "roomler-ai-services",
  "roomler-core",
+ "rsa",
  "serde",
  "serde_json",
  "tokio",

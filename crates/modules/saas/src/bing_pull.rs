@@ -24,6 +24,12 @@
 //!   frozen as first stored.
 //! * A row's day is Bing's: `/Date(1316156400000-0700)/` is epoch
 //!   milliseconds with a Pacific offset, applied before the date is taken.
+//! * **A rare query's text is not stored**: a query row needs
+//!   [`QUERY_MIN_IMPRESSIONS`] in its bucket. Google drops rare queries
+//!   itself; Bing documents no threshold. Pages are our own URLs and are
+//!   stored whatever their count; the site's daily totals hold every query.
+//! * The key rides the query string, so no redirect is followed (it would
+//!   carry the key on), and each answer is capped at [`MAX_BODY_BYTES`].
 //! * Bing exposes no index status, and its per-URL crawl method
 //!   (`GetUrlInfo`) is reported broken for verified sites, so the Content
 //!   table's index column is Google's alone.
@@ -63,6 +69,14 @@ pub const WEEKLY_METRICS: [&str; 4] = [
     "avg_click_position_x10",
 ];
 pub const MAX_KEY_LEN: usize = 300;
+/// The largest answer read: every call returns Bing's whole history.
+pub const MAX_BODY_BYTES: usize = 32 << 20;
+/// A query's text is stored only from this many impressions in its weekly
+/// bucket. Google drops rare queries itself ("anonymised"); Bing documents
+/// no such threshold, and a query seen a handful of times can be one
+/// person's words (a name, an address). Its clicks and impressions stay in
+/// the site's daily totals, which come from another call.
+pub const QUERY_MIN_IMPRESSIONS: i64 = 10;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BingError {
@@ -82,6 +96,15 @@ impl std::fmt::Display for BingError {
             Self::Timeout => write!(f, "bing unreachable: timed out"),
             Self::Transport(e) => write!(f, "bing unreachable: {e}"),
             Self::Decode(e) => write!(f, "bing unreachable: unreadable answer ({e})"),
+        }
+    }
+}
+
+impl From<crate::capped::BodyError> for BingError {
+    fn from(e: crate::capped::BodyError) -> Self {
+        match e {
+            crate::capped::BodyError::Timeout => Self::Timeout,
+            other => Self::Transport(short(&other.to_string())),
         }
     }
 }
@@ -171,6 +194,10 @@ impl BingClient {
         let http = reqwest::Client::builder()
             .user_agent(concat!("roomler-ai-api/", env!("CARGO_PKG_VERSION")))
             .timeout(TIMEOUT)
+            // The key rides the query string, and a redirect would carry it
+            // to wherever the next hop points (and into reqwest's debug log
+            // of the move). Bing's API does not redirect: a 3xx is an error.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .ok()?;
         Some(Self {
@@ -200,10 +227,8 @@ impl BingClient {
                 }
             })?;
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| BingError::Decode(short(&e.without_url().to_string())))?;
+        let body = crate::capped::read_capped(resp, MAX_BODY_BYTES).await?;
+        let text = String::from_utf8_lossy(&body);
         if !(200..300).contains(&status) {
             let v = serde_json::from_str::<serde_json::Value>(&text).ok();
             let code = v
@@ -345,6 +370,11 @@ pub fn weekly_rows(
     }
     let mut out: BTreeMap<String, Vec<GrowthDaily>> = BTreeMap::new();
     for ((day, key), (clicks, impressions, imp_pos, click_pos, _)) in acc {
+        // A rare query's text is not stored (QUERY_MIN_IMPRESSIONS); a page
+        // is our own URL and always is.
+        if by == "query" && impressions < QUERY_MIN_IMPRESSIONS {
+            continue;
+        }
         let mut dims = BTreeMap::new();
         dims.insert("by".to_string(), by.to_string());
         dims.insert(by.to_string(), key);
@@ -534,8 +564,9 @@ mod tests {
 
         let weekly: Vec<KeyStats> = serde_json::from_str(
             r#"[{"Query":"roomler","Date":"/Date(1760079600000-0700)/","Clicks":3,"Impressions":40,"AvgImpressionPosition":7,"AvgClickPosition":-1},
-                {"Query":" Roomler","Date":"/Date(1760079600000-0700)/","Clicks":1,"Impressions":5,"AvgImpressionPosition":2.5,"AvgClickPosition":2},
-                {"Query":"roomler","Date":"/Date(1760079600000-0700)/","Clicks":0,"Impressions":1,"AvgImpressionPosition":12,"AvgClickPosition":-1}]"#,
+                {"Query":" Roomler","Date":"/Date(1760079600000-0700)/","Clicks":1,"Impressions":15,"AvgImpressionPosition":2.5,"AvgClickPosition":2},
+                {"Query":"roomler","Date":"/Date(1760079600000-0700)/","Clicks":0,"Impressions":1,"AvgImpressionPosition":12,"AvgClickPosition":-1},
+                {"Query":"jane doe 12 main street","Date":"/Date(1760079600000-0700)/","Clicks":1,"Impressions":3,"AvgImpressionPosition":1,"AvgClickPosition":1}]"#,
         )
         .unwrap();
         let w = weekly_rows("query", &weekly, d("2025-10-01"), d("2025-10-13"));
@@ -564,6 +595,24 @@ mod tests {
             "a decimal survives"
         );
         assert!(bucket.iter().all(|r| r.source == BING_WEEKLY_SOURCE));
+        // A query below the floor is not stored at all — its text could be
+        // one person's words — while a page with as few is: it is our URL.
+        assert!(
+            bucket
+                .iter()
+                .all(|r| r.dims.get("query").map(String::as_str) != Some("jane doe 12 main street")),
+            "{bucket:?}"
+        );
+        let pages: Vec<KeyStats> = serde_json::from_str(
+            r#"[{"Query":"https://roomler.ai/blog/a/","Date":"/Date(1760079600000-0700)/","Clicks":0,"Impressions":2,"AvgImpressionPosition":30,"AvgClickPosition":-1}]"#,
+        )
+        .unwrap();
+        let p = weekly_rows("page", &pages, d("2025-10-01"), d("2025-10-13"));
+        assert!(
+            p["2025-10-10"]
+                .iter()
+                .any(|r| r.metric == "impressions" && r.value == 2)
+        );
     }
 
     #[test]
