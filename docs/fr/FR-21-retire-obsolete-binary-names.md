@@ -168,7 +168,7 @@ const OLD_APP: &str = "roomler-agent";
 **The RC console's "open staging folder" affordance points at a path that does not exist on a
 fresh install.**
 
-`ui/src/views/remote/RemoteControl.vue:1723` hardcodes:
+`ui/src/views/remote/RemoteControl.vue:1725` hardcodes:
 
 ```js
 const STAGING_PATH = 'C:\\ProgramData\\roomler\\roomler-agent\\staging'
