@@ -2223,25 +2223,7 @@ fn print_status(s: &NodeStatus) {
     // fail-closed (Windows exit / no v6 uplink). S4b — and whether DNS is steered
     // through the exit (NOT steered = a DNS leak the operator should see).
     if let Some(ex) = &s.exit_node {
-        let state = if ex.active {
-            let v6 = if ex.v6_active {
-                "v6 on"
-            } else {
-                "v6 fail-closed"
-            };
-            let dns = if ex.dns_steered {
-                "DNS steered"
-            } else {
-                "DNS NOT steered"
-            };
-            format!("active, {v6}, {dns}")
-        } else {
-            format!(
-                "withheld — {}",
-                ex.withheld_reason.as_deref().unwrap_or("not ready")
-            )
-        };
-        println!("  exit node   {} ({state})", ex.selector);
+        println!("  exit node   {} ({})", ex.selector, exit_node_state(ex));
     }
     // FR-97 P0b — this node was configured to offer `/0` or subnet routes and
     // offers none, because the host cannot forward or NAT for its peers.
@@ -2549,6 +2531,41 @@ fn credential_expiry(expires_at: i64, now_unix: i64) -> String {
         };
         format!("EXPIRED {days} day{} ago ({next})", plural(days))
     }
+}
+
+/// P5/S4 — the state half of `roomler status`'s exit-node line. While active
+/// it says whether global IPv6 rides the exit or is fail-closed (S3b), and
+/// whether DNS is steered through it, since NOT steered is a DNS leak the
+/// operator should see (S4b).
+///
+/// FR-97 P0c-3 — a netstack node (`socks5_port`) installs no OS routes, so
+/// its exit carries only what the SOCKS5 front dials. Saying "active, v6 on"
+/// there told the operator that every app on the host left through the exit,
+/// when none did (field, 2026-10-17).
+fn exit_node_state(ex: &tunnel_core::localapi::ExitNodeStatus) -> String {
+    if !ex.active {
+        return format!(
+            "withheld — {}",
+            ex.withheld_reason.as_deref().unwrap_or("not ready")
+        );
+    }
+    if let Some(port) = ex.socks5_port {
+        return format!(
+            "active for SOCKS5 clients of 127.0.0.1:{port} only — IPv4 destinations; \
+             nothing else on this host uses it"
+        );
+    }
+    let v6 = if ex.v6_active {
+        "v6 on"
+    } else {
+        "v6 fail-closed"
+    };
+    let dns = if ex.dns_steered {
+        "DNS steered"
+    } else {
+        "DNS NOT steered"
+    };
+    format!("active, {v6}, {dns}")
 }
 
 fn unix_now() -> i64 {
@@ -3135,6 +3152,41 @@ mod tests {
     /// identically. Before this, an overlay-off org produced no section at all
     /// in `roomler peers`, which is exactly what an org whose peers happen to
     /// be offline produces.
+    /// FR-97 P0c-3 — a netstack node's exit line says the exit carries only its
+    /// SOCKS5 front, never "v6 on" or a DNS clause about a host it does not
+    /// route; an OS-TUN node's line, and the withheld one, read as before.
+    #[test]
+    fn a_netstack_exit_says_it_carries_only_the_socks_front() {
+        let os_tun = tunnel_core::localapi::ExitNodeStatus {
+            selector: "exit".into(),
+            active: true,
+            withheld_reason: None,
+            v6_active: true,
+            dns_steered: false,
+            socks5_port: None,
+        };
+        assert_eq!(exit_node_state(&os_tun), "active, v6 on, DNS NOT steered");
+        let netstack = tunnel_core::localapi::ExitNodeStatus {
+            socks5_port: Some(1080),
+            ..os_tun.clone()
+        };
+        let line = exit_node_state(&netstack);
+        assert!(
+            line.starts_with("active for SOCKS5 clients of 127.0.0.1:1080 only"),
+            "{line}"
+        );
+        assert!(!line.contains("v6") && !line.contains("DNS"), "{line}");
+        let withheld = tunnel_core::localapi::ExitNodeStatus {
+            active: false,
+            withheld_reason: Some("exit node has no live carrier yet".into()),
+            ..netstack
+        };
+        assert_eq!(
+            exit_node_state(&withheld),
+            "withheld — exit node has no live carrier yet"
+        );
+    }
+
     /// FR-103 — the credential line is relative, and an expired token says
     /// so loudly, with the grace the server still gives it.
     #[test]

@@ -693,7 +693,7 @@ the counter was added without a reader"*. Still true: `stale_drops()`
 | surface | addition |
 |---|---|
 | `roomler peers` | `CONN` reads `relay:org/udp` — free via `relay_qualified_label` (`localclient.rs:1028`) |
-| `roomler peers --json` | `relay_kind: "org"`, `relay_via`, `relay_endpoint` (`PeerInfo`, `crates/localapi/src/lib.rs:346`) |
+| `roomler peers --json` | `relay_kind: "org"`, `relay_via`, `relay_endpoint` (`PeerInfo`, `crates/localapi/src/lib.rs:355`) |
 | `roomler why <peer>` | the relay row names the kind; the tier ladder is unchanged (§6) |
 | `roomler netcheck` | relay node: `relay server: listening :3478, N sessions` |
 | relay node | per-session `packets_rx`/`bytes_rx`, **one labelled counter per refusal reason** — bad MAC, unknown VNI, wrong tenant, at-capacity, expired, unbound-source — each with a `NodeStatus` reader. ⚠️ One counter for six causes cannot tell an attack from a misconfiguration during a flood |

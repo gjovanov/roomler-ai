@@ -117,7 +117,7 @@ inside a live one) belongs to FR-47's reconciler, not here.
 There is **no counter** for route evictions or carrier revalidations. Both are log-only,
 throttled to **1 WARN/min/prefix** carrying `suppressed_since_last` — a naive `grep -c`
 under-reports by up to 40×. Three cumulative counters, following the canonical path
-`crates/tunnel-core/src/evidence.rs:36-37` → `crates/localapi/src/lib.rs:180` →
+`crates/tunnel-core/src/evidence.rs:36-37` → `crates/localapi/src/lib.rs:189` →
 `agents/roomler-cli/src/localclient.rs:1381-1387`:
 
 `ROUTE_EVICTIONS` (split `sibling` / `foreign`) · `ROUTE_WAVES` · `FORCED_REVALIDATIONS`

@@ -402,6 +402,14 @@ pub async fn maybe_start(
         // P5 — route THIS node's default egress through a chosen exit peer (with
         // carrier-endpoint exemptions), when `overlay_exit_node` is set.
         .with_exit_node(cfg.overlay_exit_node.clone(), exit_server_ips)
+        // FR-97 P0c-3 — the netstack front, when that is the device chosen
+        // above (never under multi-org, which overrides netstack): an exit then
+        // carries only what the front dials, and the host's DNS is left alone.
+        .with_netstack_socks(
+            (!cfg.overlay_multi_org)
+                .then(|| netstack_socks_port(cfg))
+                .flatten(),
+        )
         // Phase D — LAZY `/derp`: the runtime opens the WS via this factory only
         // if the node is itself UDP-blocked (else no idle WS).
         .with_derp_mux_factory(derp_factory)
