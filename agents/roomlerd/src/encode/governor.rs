@@ -218,6 +218,9 @@ pub struct RateGovernor {
     // P5 (FR-1) — fps-first cadence pacing for HW encoders; sits between
     // the factor (masked while engaged) and the tier (unchanged).
     pace: super::encode_pressure::FpsPace,
+    // FR-112 P2 — the software pump's pace (never below 30), kept apart from
+    // the hardware one above: the VP9-444 pump feeds only this.
+    sw_pace: super::encode_pressure::SoftwarePace,
 
     // Measured-rate v2 (2026-08-27) — CONSUMED at stage 1: the send
     // task reports per-frame blocked sends, the viewer-window tick
@@ -395,6 +398,7 @@ impl RateGovernor {
             goodput: GoodputEstimator::new(),
             goodput_sink: GoodputSink::new(),
             pace: super::encode_pressure::FpsPace::new(),
+            sw_pace: super::encode_pressure::SoftwarePace::new(),
             measured_ceiling: flags.measured_ceiling,
             learner: super::ceiling_learn::CeilingLearner::new(ceiling_hi_bps, ceiling_seed_bps),
             last_decreases: 0,
@@ -1464,28 +1468,21 @@ impl RateGovernor {
         self.pace.paced()
     }
 
-    /// FR-112 P2 — a software pump's cadence, once per heartbeat window: the
-    /// encode EWMA paces the pump when the encoder cannot hold `target_fps`
-    /// (`FpsPace`: the sustainable rate in 5-fps steps, hysteretic). Neither the
-    /// bitrate factor nor the resolution tier is engaged here: libvpx's cost
-    /// barely follows the bitrate (FR-112 §2), and the VP9-444 pump takes no
-    /// tier. Returns [`Self::paced_software_fps`].
+    /// FR-112 P2 — a software pump's cadence, once per heartbeat window
+    /// ([`SoftwarePace`](super::encode_pressure::SoftwarePace): the
+    /// sustainable rate in 5-fps steps, hysteretic, never below 30). Neither
+    /// the bitrate factor nor the resolution tier is engaged here: libvpx's
+    /// cost barely follows the bitrate (FR-112 §2), and the VP9-444 pump takes
+    /// no tier. Returns [`Self::paced_software_fps`].
     pub fn pace_software(&mut self, avg_encode_ms: f32, target_fps: u32) -> Option<u32> {
-        let _ = self.pressure.observe(avg_encode_ms);
-        let _ = self.pace.observe(self.pressure.ewma_ms(), target_fps);
-        self.paced_software_fps()
+        self.sw_pace.observe(avg_encode_ms, target_fps)
     }
 
     /// FR-112 P2 — the rate a software pump runs at (`None` = its target),
-    /// never paced below 0.4.141's software target
-    /// ([`SW_PACE_FLOOR_FPS`](crate::encode::SW_PACE_FLOOR_FPS)). A host that
-    /// cannot sustain 30 then runs exactly as it did: its loop is slower than
-    /// the 33 ms cadence, so the gate never waits, and the bitrate base is
-    /// 30's. The tier only ever adds frames.
+    /// never paced below 0.4.141's software target. The tier only ever adds
+    /// frames.
     pub fn paced_software_fps(&self) -> Option<u32> {
-        self.pace
-            .paced()
-            .map(|p| p.max(crate::encode::SW_PACE_FLOOR_FPS))
+        self.sw_pace.paced()
     }
 
     /// The encode-pressure maxrate scale (1.0 = full quality) —
@@ -3645,38 +3642,16 @@ mod tests {
         );
     }
 
-    /// FR-112 P2 — a software encoder that cannot hold 60 is paced to what it
-    /// sustains, in 5-fps steps, and released to the target once it can.
+    /// FR-112 P2 — the VP9-444 pump's pace is the software one (`SoftwarePace`,
+    /// tested in `encode_pressure`): paced to what the encoder sustains, never
+    /// below 30, and apart from the hardware pace, which it never moves.
     #[test]
-    fn a_software_pump_is_paced_to_what_its_encoder_sustains() {
+    fn the_software_pace_is_its_own() {
         let mut g = gov(Instant::now());
         assert_eq!(g.pace_software(25.0, 60), Some(40), "1000 / 25 ms = 40 fps");
-        assert_eq!(g.paced_fps(), Some(40));
-        let mut paced = Some(40);
-        for _ in 0..20 {
-            paced = g.pace_software(8.0, 60);
-        }
-        assert_eq!(paced, None, "an encoder that holds 60 runs at the target");
-        assert_eq!(g.paced_fps(), None);
-    }
-
-    /// FR-112 P2 — and never below 0.4.141's 30: an encoder that sustains 22
-    /// runs at 30's cadence and base, which on a loop that slow is exactly the
-    /// unpaced 0.4.141 pump.
-    #[test]
-    fn a_software_pump_is_never_paced_below_thirty() {
+        assert_eq!(g.paced_software_fps(), Some(40));
+        assert_eq!(g.paced_fps(), None, "the hardware pace is untouched");
         let mut g = gov(Instant::now());
-        assert_eq!(
-            g.pace_software(45.0, 60),
-            Some(30),
-            "1000 / 45 ms = 22 fps: held at 30, not stepped to 20"
-        );
-        assert_eq!(g.paced_software_fps(), Some(30));
-        assert_eq!(g.paced_fps(), Some(20), "FpsPace's own step is untouched");
-        assert_eq!(
-            gov(Instant::now()).pace_software(45.0, 30),
-            Some(30),
-            "a pinned 30 stays 30"
-        );
+        assert_eq!(g.pace_software(45.0, 60), Some(30), "22 fps: held at 30");
     }
 }

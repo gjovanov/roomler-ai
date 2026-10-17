@@ -704,8 +704,8 @@ pub(crate) fn initial_bitrate_for_fps(width: u32, height: u32, fps: u32) -> u32 
 /// window travels half as far between frames, so a frame needs fewer bits than
 /// at 30; and a base computed for 60 while the encoder is paced to 30 would
 /// double every frame's bits (FR-112 §2: the 60 target took the VP9 ceiling from
-/// 17.5 to 30.4 Mbps and bought nothing). At 30 it is exactly today's.
-#[cfg_attr(not(feature = "vp9-444"), allow(dead_code))]
+/// 17.5 to 30.4 Mbps and bought nothing). At 30 it is exactly today's. Both
+/// software pumps use it (the RTP pump's since P2b).
 pub(crate) fn bitrate_base_for_fps(width: u32, height: u32, fps: u32) -> u32 {
     let at_30 = initial_bitrate_for_fps(width, height, 30) as f64;
     let scaled = at_30 * (fps.max(1) as f64 / 30.0).sqrt();
@@ -713,21 +713,21 @@ pub(crate) fn bitrate_base_for_fps(width: u32, height: u32, fps: u32) -> u32 {
 }
 
 /// FR-112 P2 — software encoders target 60 fps, paced down to what the encoder
-/// sustains (`FpsPace`, fed by the pump's `avg_encode_ms`), with the bitrate
-/// base following the rate they actually run at. Default **on for Linux**,
-/// where the encoder asks for its clock (P1) and the tier was measured;
-/// Windows and macOS opt in with `ROOMLERD_SW_FPS_60=1` until P3 measures them
-/// on their own hardware (60 frames cost twice the CPU of 30 on a host whose
-/// clock was never the limit, and an attended desktop pays for it).
+/// sustains (`SoftwarePace`, fed by the pump's `avg_encode_ms`), with the
+/// bitrate base following the rate they actually run at: the VP9-444 pump
+/// (P2a) and the RTP pump's OpenH264 (P2b). Default **on for Linux**, where the
+/// encoder asks for its clock (P1) and the tier was measured; Windows and
+/// macOS opt in with `ROOMLERD_SW_FPS_60=1` until P3 measures them on their own
+/// hardware (60 frames cost twice the CPU of 30 on a host whose clock was
+/// never the limit, and an attended desktop pays for it).
 /// `ROOMLERD_SW_FPS_60=0` restores 0.4.141's 30 fps and its base.
-#[cfg_attr(not(feature = "vp9-444"), allow(dead_code))]
 pub fn sw_fps_60_enabled() -> bool {
     tunnel_core::env::flag("SW_FPS_60", cfg!(target_os = "linux"))
 }
 
 /// FR-112 P2 — 0.4.141's software target, and the floor of the software tier's
 /// pace: a software pump is never paced below it, so a host that cannot
-/// sustain 30 runs exactly as it did (`RateGovernor::paced_software_fps`).
+/// sustain 30 runs exactly as it did (`encode_pressure::SoftwarePace`).
 pub const SW_PACE_FLOOR_FPS: u32 = 30;
 
 /// True when the ICE transport is forced to a TURN relay — on TCP (WSL,
@@ -1133,6 +1133,14 @@ pub trait VideoEncoder: Send {
     /// caller.
     fn set_roi_hints(&mut self, rects: &[DirtyRect], frame_dims: (u32, u32)) {
         let _ = (rects, frame_dims);
+    }
+    /// FR-112 P2b — the rate the pump feeds this encoder at, for a backend
+    /// whose rate control budgets each frame's bits from it. OpenH264's is
+    /// `max_frame_rate`: configured for 30 and fed 60 frames a second, it spends
+    /// a 30 fps frame's bits on every one of them. Called when the pump's rate
+    /// changes. Default: a no-op.
+    fn set_frame_rate(&mut self, fps: u32) {
+        let _ = fps;
     }
     /// Stable name for logging, e.g. `"openh264"`, `"nvenc-h264"`.
     fn name(&self) -> &'static str;

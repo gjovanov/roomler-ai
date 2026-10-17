@@ -121,8 +121,10 @@ const CLEAN_FPS_FLOOR: f64 = 0.75;
 /// FR-101 P1a's replay cells. Each keyframe past the warm-up triggers one
 /// replay, `REPLAY_AFTER_IDR` after it, and a keyframe within `REPLAY_ANSWER`
 /// of the replay is the agent obeying it. Nothing else cuts one in that
-/// window: the encoder's own period is 60 frames (two seconds at 30 fps), and
-/// a clean link never makes the controller ask.
+/// window: the encoder's own period is about two seconds at any rate (60 frames
+/// at 30 fps, 120 at the software tier's 60, FR-112 P2b: a period left at 60
+/// frames put a keyframe every second inside this window, which is how this
+/// cell caught it), and a clean link never makes the controller ask.
 ///
 /// Where replays are refused, only that period triggers them: three in a
 /// run at 30 fps, two at the clean cell's fps floor. Where they are obeyed,

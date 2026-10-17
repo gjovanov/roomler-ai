@@ -117,6 +117,17 @@ fn target_fps_for(pref: encode::EncoderPreference) -> u32 {
     }
 }
 
+/// FR-112 P2b — the RTP pump's starting target: under the software tier every
+/// encoder starts at 60 (a software one is then paced down to what it
+/// sustains, never below 30); without it, [`target_fps_for`].
+fn target_fps_with_tier(pref: encode::EncoderPreference, sw_tier: bool) -> u32 {
+    if sw_tier {
+        TARGET_FPS_HW
+    } else {
+        target_fps_for(pref)
+    }
+}
+
 /// Quality preference advertised by the controller over the `control`
 /// data channel. Encoded as `AtomicU8` so the media pump can poll it
 /// per-frame without locking. Translated to a bitrate clamp on the
@@ -2544,7 +2555,10 @@ async fn media_pump(
     // optimistic Auto-on-Windows 60 to 30 if the encoder cascade ends
     // up on a SW MFT. Keep it as the single source of truth so
     // `frame_duration_floor` stays consistent.
-    let mut target_fps = target_fps_for(encoder_preference);
+    // FR-112 P2b — under the software tier (Linux by default) a software
+    // encoder targets 60 too, paced down to what it sustains, never below 30.
+    let sw_tier = crate::encode::sw_fps_60_enabled();
+    let mut target_fps = target_fps_with_tier(encoder_preference, sw_tier);
     tracing::info!(
         %session_id,
         ?encoder_preference,
@@ -2581,6 +2595,13 @@ async fn media_pump(
     // override via `rc:resolution` must not be clobbered by a
     // re-evaluation on an incidental encoder rebuild (DPI flip, etc.).
     let mut auto_downscale_evaluated = false;
+    // FR-112 P2b — the software tier, live once the cascade lands on a
+    // software encoder: its pace (from the heartbeat's encode cost), the
+    // cadence gate's next slot, and the frame rate last handed to the encoder.
+    let mut sw_live = false;
+    let mut sw_pace = crate::encode::encode_pressure::SoftwarePace::new();
+    let mut sw_pace_due: Option<std::time::Instant> = None;
+    let mut sw_rate_applied: Option<u32> = None;
     // Floor on the gap the RTP clock advances by before each frame. DXGI
     // Desktop Duplication only emits a frame when the screen changes, so on
     // an idle desktop the real gap between two frames can be seconds. RTP
@@ -2686,6 +2707,24 @@ async fn media_pump(
     const HYSTERESIS_PCT: u32 = 15;
 
     loop {
+        // FR-112 P2b — cadence pacing, as the VP9-444 pump's: a software
+        // encoder that cannot hold 60 takes frames on an even grid at the rate
+        // it sustains, never below 30. Slots run from consumption, so a frame
+        // that takes longer than the interval degrades to the natural cadence.
+        if sw_live {
+            if let Some(paced) = sw_pace.paced() {
+                let interval = Duration::from_micros(1_000_000 / paced.max(1) as u64);
+                let now = std::time::Instant::now();
+                if let Some(due) = sw_pace_due
+                    && due > now
+                {
+                    tokio::time::sleep(due - now).await;
+                }
+                sw_pace_due = Some(std::time::Instant::now() + interval);
+            } else {
+                sw_pace_due = None;
+            }
+        }
         let capture_started = std::time::Instant::now();
         // Bound to a local first so the mutable borrow of `capturer` ends
         // here — the idle arm below reads `capturer.frames_unchanged()`, and
@@ -2901,6 +2940,8 @@ async fn media_pump(
             // instance, so a rebuild starts from the resolution-
             // derived default until we re-apply.
             last_applied_quality = 0xFF;
+            // FR-112 P2b — and the frame rate, which lives there too.
+            sw_rate_applied = None;
 
             // Loudly surface the Noop case. Previously this only
             // showed up in the ~1 s heartbeat log as `backend="noop"`,
@@ -3016,7 +3057,22 @@ async fn media_pump(
                 // when target_fps was already <= 30 (operator
                 // chose Software preference, or capture-side
                 // downcap from a future tier).
-                if backend_is_sw && target_fps > 30 {
+                //
+                // FR-112 P2b — except under the software tier, where a
+                // software encoder keeps 60 and the pace brings it down
+                // to what it sustains (the readback this cap absorbs is
+                // WGC's, on Windows, where the tier is opt-in).
+                sw_live = sw_tier && backend_is_sw;
+                if sw_live {
+                    info!(
+                        %session_id,
+                        target_fps,
+                        codec = %chosen_codec,
+                        encoder = enc_ref.name(),
+                        "FR-112: software encoder at a 60 fps target, paced to what it sustains (never below 30; ROOMLERD_SW_FPS_60=0 restores 30)"
+                    );
+                }
+                if backend_is_sw && target_fps > 30 && !sw_live {
                     let new_fps: u32 = 30;
                     tracing::warn!(
                         %session_id,
@@ -3118,10 +3174,23 @@ async fn media_pump(
         // or out-of-hysteresis movement. MF + openh264 both honour
         // set_bitrate now (1F.2). Cheap on every frame: two atomic
         // loads + integer math + a single comparison.
+        // FR-112 P2b — the encoder budgets each frame's bits from its frame
+        // rate: hand it the rate the pump runs at, whenever that changes.
+        let runs_at = sw_pace.paced().unwrap_or(target_fps);
+        if sw_live && sw_rate_applied != Some(runs_at) {
+            enc.set_frame_rate(runs_at);
+            sw_rate_applied = Some(runs_at);
+        }
         let q_now = quality_state.load(std::sync::atomic::Ordering::Relaxed);
         let remb_now = remb_bps.load(std::sync::atomic::Ordering::Relaxed);
         if let Some((w, h)) = encoder_dims {
-            let base = encode::initial_bitrate_for_fps(w, h, target_fps);
+            // FR-112 P2b — under the tier the base follows the rate the pump
+            // runs at, by √(fps/30); otherwise 0.4.141's linear base.
+            let base = if sw_live {
+                encode::bitrate_base_for_fps(w, h, runs_at)
+            } else {
+                encode::initial_bitrate_for_fps(w, h, target_fps)
+            };
             let quality_target = quality::target_bitrate(q_now, base);
             // If REMB hasn't reported, defer to the quality-derived
             // target. Once it does, take min(quality, remb*safety) so
@@ -3288,6 +3357,12 @@ async fn media_pump(
                 .saturating_sub(heartbeat_damage_rects_base)
                 .checked_div(damage_frames_window)
                 .unwrap_or(0);
+            // FR-112 P2b — the software tier steps once per heartbeat, on the
+            // window's encode cost.
+            if sw_live {
+                let window_ms = encode_us_window as f32 / (1000.0 * frames_in_window as f32);
+                let _ = sw_pace.observe(window_ms, target_fps);
+            }
             info!(
                 %session_id,
                 backend,
@@ -3299,6 +3374,8 @@ async fn media_pump(
                 avg_damage_rects,
                 bytes_written, write_errors,
                 avg_capture_ms, avg_encode_ms,
+                target_fps,
+                paced_fps = ?sw_pace.paced(),
                 "media pump heartbeat (≈1s window)"
             );
             heartbeat_frames_base = frames_encoded;
@@ -12905,6 +12982,22 @@ mod codec_cap_tests {
 #[cfg(test)]
 mod tests {
     use super::quality::*;
+
+    /// FR-112 P2b — under the software tier every preference starts the RTP
+    /// pump at 60; without it, 0.4.141's targets.
+    #[test]
+    fn the_rtp_target_is_60_under_the_tier() {
+        use crate::encode::EncoderPreference as P;
+        for pref in [P::Auto, P::Software, P::Hardware] {
+            assert_eq!(super::target_fps_with_tier(pref, true), 60, "{pref:?}");
+            assert_eq!(
+                super::target_fps_with_tier(pref, false),
+                super::target_fps_for(pref),
+                "{pref:?}: the kill switch"
+            );
+        }
+        assert_eq!(super::target_fps_with_tier(P::Software, false), 30);
+    }
 
     /// FR-112 P2 — the VP9-444 target: an explicit `ROOMLERD_VP9_FPS` pins it;
     /// otherwise 60 with the software tier on, and 30 with it off.
