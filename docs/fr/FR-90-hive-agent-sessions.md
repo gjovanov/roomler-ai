@@ -2,7 +2,7 @@
 
 **Issue:** [#1827](https://github.com/gjovanov/roomler-ai/issues/1827) · **Status:** in progress
 — design approved 2026-10-07; P0a (device core), P0b (server module), P0c (device
-supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; AC1 field-verified on a throwaway stack (2026-10-07), and its six findings fixed in P0g (merged); AC3 and AC4 partly field-verified (§5, §8); P1a-1 and P1a-2 (approvals: the device, the UI and the server) merged and field-run, AC5 ticked (2026-10-08); P1a-3 (Bash that runs on any host) and P1b (a restarted device's sessions end) merged and field-run; P1c-1 (drivers, the server) merged; P1c-2a (drivers, the device) merged; P1c-3 (drivers, the UI) merged, AC6 ticked on its field run; P1c-2b (AC6 as a CI test) merged; P1d-1 (the updater waits for running turns, AC7 on Linux field-verified) merged; P1d-2 (a restart resumes what the device hosted; AC20 on Linux field-verified) merged; P1e (core memory from a hand-curated brain) merged, AC8 ticked (field-verified 2026-10-08, and in CI); P1f (the transcript's renderers, P1f-1, and the long list, P1f-2) merged; P1g (the org gate, so prod can serve one test organization) and P1g-2 (a `hive.tenants` list is the switch) merged; P1h-1 (sessions on macOS: the build, and the daemon takes its harnesses down) merged; prod serves agent sessions to the test organization only (2026-10-09); P1j-1 (`adopt`, the server) merged; P1j-2 (`adopt`, the device) merged; P1j-3 (`roomler hive adopt`) and P1j-4 (`adopt`, the UI) merged; P1j-5 (the field run) merged, AC21 field-verified; P1h-2 (the macOS helper waits for agent turns; `hive` in the Linux and macOS release builds) merged; P1i-0 (Windows sessions' design) merged; P1i-1 (the Windows launcher's building blocks) merged; P1i-2 (Windows sessions wired: `hive_host` on Windows, the identity rule, the toolbelt's pipe) merged; P1i-3 (`hive` in the Windows release build) merged; P1i-4 (the Windows field run: AC3, AC7 and AC20 there, a remote-desktop connection swapping no worker) field-verified; P2-0 (the replicaset's design) merged; P1h-3 (the macOS field run: AC3, AC7 and AC20 there) field-verified, and AC3 and AC7 ticked; P2a (the member's store) merged; P1h-4 (decisions 13 and 15: a Unix session holds no administrator group, a Linux one cannot `sudo`, and a Mac refuses an account whose `sudo` needs no password) field-verified; P2b-1 (what a checkpoint takes of the config directory) merged; P2b-2 (the workspace, through the account's own git) merged; P2b-3a (`hive-checkpoint`, as the account, held to its request) merged; P2b-3b (a checkpoint at each turn's end, for a replicated session) merged; P2b-4a (`hive-materialize`, the config directory, as the account) merged; P2b-4b (`hive-materialize`, the folder, through the account's own git) merged; P2c-1 (the device's gates for holding copies, and a folder too big for one checkpoint skipped at once) merged; P2c-2a (the org's replica policy) merged; P2c-2b (placement at a start) merged; P2c-3a (the join, the server's half) merged; P2c-3b (the join, the device's half) merged; P2c-4a (placement decided again) merged; P2c-4b (the primary told, and sessions from before placement) merged; P2d-1 (the stream's grants, the server's half) merged; P2d-2a (the direct rung on the devices, and the stream's opening exchange) merged; P2d-2b (the relay rung, and a grant registered before its endpoint is built) merged; P2d-2c (the derp rung, on a route of its own) merged; P2d-3a (the events, the blobs and the acks) merged; P2d-3b (the member's wants, the ladder, a session over parked, `hive-stream` advertised) merged; P2d-4 (renewals: make-before-break at half a grant's life) merged; P2d-5 (a replica's read-only view) merged; P2d-6 (AC2 on two devices in CI) merged; P2e-1 (the fence on the device, and `rc:hive.demote`) merged; P2e-2 (the lease word: a leased session runs only on the server's word on each connection) merged; P2e-3 (the server's promotion: the route, its steps, the lease CAS and the move back, inert until a build advertises `hive-promote`) merged; P2e-4 (the primary's drain, on the device) merged; P2e-5a (the member's prepare and the moved start, taken over from its copy) merged; P2e-5b (the old fence's end on every join) merged; P2e-5c (promotion on, and what the first promotion between real devices found) merged; P2e-6a (an unreachable primary waited out, then moved away from with no drain, to the member that holds the most) merged; P2e-6b (a target that never answered its moved start: the start re-sent however late, and the session moved on from it once it is unreachable) merged; P2e-7 (the resume note: a session moved to a device told, once, who moved it, from where, where its earlier paths live now and its last tool call left open) merged; P2f (teleport, fork, an ended adopted session made managed), P2g (purges and retention), P2h (the archive replica image), P2i (full-text search on archive replicas) and P2j (the UI) merged; P2k, the field run on prod's test organization (2026-10-16): AC2, AC9, AC10, AC11, AC22, AC24, AC25 and AC26 field-verified and ticked, AC4 ticked with P2k-7's capture at the provider, and the run's fixes and that capture, P2k-1 to P2k-7, merged; its re-check on the promoted server (2026-10-17): the fixes proven in the field, AC23 and AC27 field-verified and ticked, and the replicaset switched off again after it; AC20 completed by an update's restart on macOS and Windows (2026-10-17) · **Owner:** agent platform — the `hive`, `vault` and
+supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; AC1 field-verified on a throwaway stack (2026-10-07), and its six findings fixed in P0g (merged); AC3 and AC4 partly field-verified (§5, §8); P1a-1 and P1a-2 (approvals: the device, the UI and the server) merged and field-run, AC5 ticked (2026-10-08); P1a-3 (Bash that runs on any host) and P1b (a restarted device's sessions end) merged and field-run; P1c-1 (drivers, the server) merged; P1c-2a (drivers, the device) merged; P1c-3 (drivers, the UI) merged, AC6 ticked on its field run; P1c-2b (AC6 as a CI test) merged; P1d-1 (the updater waits for running turns, AC7 on Linux field-verified) merged; P1d-2 (a restart resumes what the device hosted; AC20 on Linux field-verified) merged; P1e (core memory from a hand-curated brain) merged, AC8 ticked (field-verified 2026-10-08, and in CI); P1f (the transcript's renderers, P1f-1, and the long list, P1f-2) merged; P1g (the org gate, so prod can serve one test organization) and P1g-2 (a `hive.tenants` list is the switch) merged; P1h-1 (sessions on macOS: the build, and the daemon takes its harnesses down) merged; prod serves agent sessions to the test organization only (2026-10-09); P1j-1 (`adopt`, the server) merged; P1j-2 (`adopt`, the device) merged; P1j-3 (`roomler hive adopt`) and P1j-4 (`adopt`, the UI) merged; P1j-5 (the field run) merged, AC21 field-verified; P1h-2 (the macOS helper waits for agent turns; `hive` in the Linux and macOS release builds) merged; P1i-0 (Windows sessions' design) merged; P1i-1 (the Windows launcher's building blocks) merged; P1i-2 (Windows sessions wired: `hive_host` on Windows, the identity rule, the toolbelt's pipe) merged; P1i-3 (`hive` in the Windows release build) merged; P1i-4 (the Windows field run: AC3, AC7 and AC20 there, a remote-desktop connection swapping no worker) field-verified; P2-0 (the replicaset's design) merged; P1h-3 (the macOS field run: AC3, AC7 and AC20 there) field-verified, and AC3 and AC7 ticked; P2a (the member's store) merged; P1h-4 (decisions 13 and 15: a Unix session holds no administrator group, a Linux one cannot `sudo`, and a Mac refuses an account whose `sudo` needs no password) field-verified; P2b-1 (what a checkpoint takes of the config directory) merged; P2b-2 (the workspace, through the account's own git) merged; P2b-3a (`hive-checkpoint`, as the account, held to its request) merged; P2b-3b (a checkpoint at each turn's end, for a replicated session) merged; P2b-4a (`hive-materialize`, the config directory, as the account) merged; P2b-4b (`hive-materialize`, the folder, through the account's own git) merged; P2c-1 (the device's gates for holding copies, and a folder too big for one checkpoint skipped at once) merged; P2c-2a (the org's replica policy) merged; P2c-2b (placement at a start) merged; P2c-3a (the join, the server's half) merged; P2c-3b (the join, the device's half) merged; P2c-4a (placement decided again) merged; P2c-4b (the primary told, and sessions from before placement) merged; P2d-1 (the stream's grants, the server's half) merged; P2d-2a (the direct rung on the devices, and the stream's opening exchange) merged; P2d-2b (the relay rung, and a grant registered before its endpoint is built) merged; P2d-2c (the derp rung, on a route of its own) merged; P2d-3a (the events, the blobs and the acks) merged; P2d-3b (the member's wants, the ladder, a session over parked, `hive-stream` advertised) merged; P2d-4 (renewals: make-before-break at half a grant's life) merged; P2d-5 (a replica's read-only view) merged; P2d-6 (AC2 on two devices in CI) merged; P2e-1 (the fence on the device, and `rc:hive.demote`) merged; P2e-2 (the lease word: a leased session runs only on the server's word on each connection) merged; P2e-3 (the server's promotion: the route, its steps, the lease CAS and the move back, inert until a build advertises `hive-promote`) merged; P2e-4 (the primary's drain, on the device) merged; P2e-5a (the member's prepare and the moved start, taken over from its copy) merged; P2e-5b (the old fence's end on every join) merged; P2e-5c (promotion on, and what the first promotion between real devices found) merged; P2e-6a (an unreachable primary waited out, then moved away from with no drain, to the member that holds the most) merged; P2e-6b (a target that never answered its moved start: the start re-sent however late, and the session moved on from it once it is unreachable) merged; P2e-7 (the resume note: a session moved to a device told, once, who moved it, from where, where its earlier paths live now and its last tool call left open) merged; P2f (teleport, fork, an ended adopted session made managed), P2g (purges and retention), P2h (the archive replica image), P2i (full-text search on archive replicas) and P2j (the UI) merged; P2k, the field run on prod's test organization (2026-10-16): AC2, AC9, AC10, AC11, AC22, AC24, AC25 and AC26 field-verified and ticked, AC4 ticked with P2k-7's capture at the provider, and the run's fixes and that capture, P2k-1 to P2k-7, merged; its re-check on the promoted server (2026-10-17): the fixes proven in the field, AC23 and AC27 field-verified and ticked, and the replicaset switched off again after it; AC20 completed by an update's restart on macOS and Windows (2026-10-17); P3-0 (P3's design, with decision 17 for the operator) in review · **Owner:** agent platform — the `hive`, `vault` and
 `knowhow` modules, `roomlerd` feature `hive`, the SPA · **Anchors:** master `29ef33d58` ·
 **Design:** [`../roomler-hive-design.md`](../roomler-hive-design.md) (v0.4: the full design, the
 review of v0.2 and the decisions) · **Builds on:** [FR-69](FR-69-modular-monolith.md) (modules),
@@ -1584,6 +1584,99 @@ because a desk with the app open is not a phone in a pocket. ⚠️ Who answered
 the answer travels over the viewer peer, so the server believes it only when it names a driver (in
 P1, the starter), and no stub names a person who could not have answered.
 
+**P3, as designed (P3-0, 2026-10-17).** The vault is P3's core. Every other P3 tool, from the
+proxies and dynamic credentials to session SOCKS, `ssh_run` and `fleet_exec`, is a way a session
+spends a decision the vault makes. This design fixes where each piece lives, and what it must hold,
+before any code. Decision 17 lists the positions for the operator to confirm. The design itself is
+the design document's §7 and §8; what follows binds it to the code as it stands.
+
+| Piece | Home | Why |
+|---|---|---|
+| the store, the keys, policies, leases and audit | a new module, `vault` (`crates/modules/vault`, package `roomler-ai-mod-vault`), mounted by `[modules] vault` and served only to the orgs a `vault.tenants` list names, as `hive.tenants` gates Hive (`crates/config/src/settings.rs:81`) | an unmounted module answers 503, and the list keeps the vault to the test org until its field run |
+| its edges | `vault → hive` (the session record: its location, fence, role, and its room for approval cards) and `vault → fleet` (devices, their vault keys, the Hub): two new entries in `graph::EDGES` (`crates/core/src/graph.rs:29`) | hive never calls the vault. A session's requests ride its device's control WS as `rc:vault.*` frames, which the vault owns |
+| the device's half | a `roomlerd` feature `vault` beside `hive`: the device's vault key, the lease cache, the proxies and the toolbelt's vault tools | a value is decrypted in the daemon, never in the harness's process, which runs as another account |
+
+**Custody and keys.**
+- Envelope encryption as designed (design §8.2): a data key per version (XChaCha20-Poly1305),
+  wrapped by the org's key-encryption key (KEK).
+- The KEK in P3 is an `age` X25519 identity. A self-hoster keeps it in a file. Hosted roomler.ai
+  keeps it in a sealed secret on the cluster, which has no cloud KMS under it. Cloud KMS backends
+  come later, behind the same trait (decision 17).
+- ⚠️ **Managed custody in v1.** The vault module can decrypt every secret, so a compromised server
+  can read them all. `docs/vault.md` says so in its first section, not in a footnote.
+  Customer-managed keys and sovereign custody stay P7.
+- The vault brings its own keys. It derives nothing from the JWT secret (HS256,
+  `crates/services/src/auth/mod.rs:274`) or from the DERP ticket key
+  (`crates/remote_control/src/derp_ticket.rs:8`).
+- **The device's vault key** is an X25519 key the daemon makes on first need. It is kept in the
+  root-only config like the overlay key, and it is never the WireGuard key. Its public half rides
+  the hello. A value crosses to a device as a sealed box for that key, and lives in daemon memory
+  for its lease only.
+
+**A session's identity to the vault.** The token the sidecar mints is the device's own, bound to the
+session and its fence (`agents/roomlerd/src/hive/sidecar.rs:94`). To the server, a session is its
+record. So a vault request is a frame from the device that runs the session, naming the session and
+its fence. The vault believes it only from the record's location at that fence, as hive's frames
+are (`crates/modules/hive/src/agent_socket.rs:942`), and with the role the session assumed at its
+start.
+
+**Roles and policies.**
+- **The language:** `cedar-policy` (Apache-2.0), with every policy checked against the schema on
+  write.
+- **The role:** a session assumes one role at its start, chosen as a start option. `role:assume`
+  is decided with the starter as the principal, and the role is stored on the record.
+- **What a session may do:** its role's permits, less any matching `forbid`, less what the
+  device's own gates refuse. It is not narrowed to the owner's own grants (design §8.1).
+- **Seeded guardrails**, when an org turns the vault on: no materializing mode on Windows, where
+  no Claude Code sandbox exists (AC13); prod values never materialize.
+- **`simulate`** explains a decision, and diffs a policy change against the last 7 days of
+  `vault_audit`.
+
+**Modes in P3** (design §8.5):
+
+| Mode | What it covers |
+|---|---|
+| `identity` | SSH, exec and forwards, authorized by the session principal |
+| `proxy` | HTTP named upstreams (git through `insteadOf`); Postgres and MongoDB, authenticating upstream with SCRAM; the Kubernetes API; an SSH agent socket |
+| `short-lived` | dynamic credentials: database users, GitHub App tokens, AWS STS, a Kubernetes `TokenRequest` |
+| `file`, `env`, `exec` | behind a permit, and flagged |
+
+`placeholder` is P3b. `raw` stays for people only.
+
+**Audit.** `vault_audit` holds every decision the server makes, allow and deny, with the 90-day TTL
+of the network module's audits (`crates/modules/network/src/lib.rs:748`). `vault_activity` is the
+device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
+
+**A session's own egress.**
+- **Authenticated per-session SOCKS5** (RFC 1929, the password the session's capability). Today's
+  SOCKS server is "CONNECT only, no authentication" (`crates/tunnel-core/src/socks5.rs:3`).
+- **`Principal::Session {sid, owner}`**, beside `TunnelClient` and `Agent`
+  (`crates/tunnel-core/src/policy.rs:37`), so `tunnel_audit` names the session and not just its
+  owner.
+
+**The toolbelt grows** beyond `approve` (`agents/roomlerd/src/hive/toolbelt.rs:563`):
+- the vault tools: `vault_list`, `vault_describe`, `vault_request`, `vault_exec`, `vault_render`;
+- the network tools: `net_forward`, `net_socks`;
+- `ssh_run`;
+- `fleet_exec`, with a person approving every call.
+
+**P3's steps.** Each is a PR behind its kill switch; §4 tracks them.
+
+| Step | Builds | Kill switch | Criteria |
+|---|---|---|---|
+| P3-0 | this design | docs only | — |
+| P3-1 | the vault module: secrets and versions, envelope encryption under the `age` KEK, RRNs, `vault_audit`, the metadata routes, `[modules] vault` and `vault.tenants` | the module unmounted; the org not listed | — |
+| P3-2 | Cedar: the schema, roles, policies validated on write, the seeded guardrails, `role:assume` at a session's start, `simulate` | `vault.tenants` | AC13 (its decision half) |
+| P3-3 | the device's vault key; leases, requested, revoked by a push and by TTL, and bound to the fence; a value sealed to the device and held in memory | device `vault_enabled = false` | — |
+| P3-4 | the toolbelt's vault tools, and the approval card a policy can ask for | the same | AC13 |
+| P3-5 | `proxy` mode: Postgres and MongoDB first, then HTTP named upstreams, Kubernetes and the SSH agent | per-secret `disabled` | AC12 |
+| P3-6 | `short-lived`: database users and GitHub App tokens first, then AWS STS and a Kubernetes `TokenRequest` | per provider | — |
+| P3-7 | authenticated session SOCKS, `Principal::Session`, `net_forward` and `net_socks` | `vault.tenants` | — |
+| P3-8 | `ssh_run` and `fleet_exec` as tools | the existing SSH and exec gates | — |
+| P3-9 | `roomler connect <handle>` for people (knowhow's `roomler_connect(entity)` waits for P4) | — | — |
+| P3k | the field run in the test org, and `docs/vault.md` | — | AC12, AC13, AC19's vault half |
+| P3b | `placeholder` egress, as designed | `vault.placeholder = false` | AC14 |
+
 ### 3f. The brain
 
 Central, in the `hive` module: core memory in four scopes (org, project, user, device) with budgets
@@ -1887,6 +1980,7 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P2k-5 | the room says how many events did not carry over (`docs/hive.md` §12 "P2e-6a"), the field run's F5 and AC23's last clause: the device set a cut-off tail aside and logged how many, but nothing told the server, so the room never said it; the server now counts it itself: a member's tip at a fence that ended, past that end (`model::past_end`, the tip less the end the record keeps, so exactly what no copy on the session's chain holds) has the room say so in the device's name, once, as the tip that first crosses the end; the device's own `moved` is not used (it counts the events it took again too: 9 where 4 were lost, in the field); unit tests on the count and the note, the unreachable-primary integration test given the note and its once, NCs | the replicaset's switch: off, no move and no tip | **merged** #2347 `57519de92` |
 | P2k-6 | the viewer's chip over a copy (`docs/hive.md` §12 "P2d-5"), the field run's F2: reading a member's copy, the status chip said "Live from the device" while the read-only note said it was a copy; an open view of a copy now says "Reading a copy" (in the info colour), one still connecting "Connecting…" as any view; Vitest on the component, 2 NCs | the SPA only: a view of a copy reads as before | **merged** #2341 `5c90fb1d1` |
 | P2k-7 | a demoted run's call, at the provider (`docs/hive.md` §5, the fence row): AC4's stale-fence half was seen in the field only on the device's own sidecar log, and no test sent a demoted run's call through the sidecar to a mock provider (step 126 said CI held such a capture; it held none); `a_demoted_run_makes_no_model_call` does: a run calls at its own fence, and after a demote to a newer fence its next call (the run not let go yet) and one after it ended are both refused `401 authentication_error`, the provider seeing nothing; an NC with the fence gate removed | tests only | **merged** #2353 `597aaf14f` |
+| P3-0 | P3's design (§3e "P3, as designed"): the `vault` module and its graph edges, custody and keys (envelope encryption under an `age` KEK; the device's own X25519 vault key, never the WireGuard key), a session's identity to the vault (the record's location at its fence), Cedar roles and the seeded guardrails, the modes P3 builds, the audit split, authenticated session SOCKS and `Principal::Session`, the toolbelt's new tools, P3's steps P3-1 to P3-9, then P3k; decision 17 for the operator | docs only | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -2374,6 +2468,22 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     after the move. Members apply events in order, so the old whole pack's blobs are still asked for.
     P2f-2b ships the stream's half behind `hive.teleport_have_want`, off by default: confirming
     this decision means turning that on.
+17. **P3's positions, for the operator to confirm** (P3-0, §3e "P3, as designed"). No P3 code is
+    written until these are confirmed or changed:
+    - **The KEK on hosted roomler.ai.** *Recommended:* an `age` identity in a sealed secret on the
+      cluster, since there is no cloud KMS under it, with cloud KMS backends later behind the same
+      trait. *Or:* a KMS service brought up for it first.
+    - **Managed custody in v1.** The server can decrypt, and the docs say so plainly.
+      Customer-managed keys and sovereign custody stay P7.
+    - **A new `vault` module**, with the graph edges `vault → hive` and `vault → fleet`.
+    - **Cedar** (`cedar-policy`) as the policy language.
+    - **The first proxies:** Postgres and MongoDB (AC12), then HTTP named upstreams, Kubernetes and
+      the SSH agent.
+    - **The first dynamic providers:** database users and GitHub App tokens. AWS STS needs a stored
+      AWS key until P7's federation, so it comes after.
+    - **Windows:** `proxy` mode only, by a seeded guardrail.
+
+    *Confirmed 2026-10-17 by the operator: every position, as recommended. P3-1 may start.*
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
