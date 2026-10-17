@@ -578,8 +578,11 @@ mod tests {
             apply_runtime_frame_rate(&mut enc, 60).is_err(),
             "refused before"
         );
-        let frame = std::sync::Arc::new(make_bgra_frame(64, 64, 10, 20, 30));
-        encode_one(&mut enc, 64, 64, frame).expect("the first frame");
+        // 720p, not a thumbnail: OpenH264 picks the level from the first frame's
+        // size and refuses a bitrate above that level's ceiling (a 64×64 frame
+        // is level 1, whose ceiling is ~77 kbps), which is a different refusal.
+        let frame = std::sync::Arc::new(make_bgra_frame(1280, 720, 10, 20, 30));
+        encode_one(&mut enc, 1280, 720, frame).expect("the first frame");
         apply_runtime_bitrate(&mut enc, 2_000_000).expect("taken after");
         apply_runtime_frame_rate(&mut enc, 60).expect("taken after");
         let mut rate = 0f32;
