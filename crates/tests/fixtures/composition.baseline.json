@@ -897,6 +897,14 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/tenant/{tenant_id}/touch-preset",
+      "methods": "GET,HEAD,POST"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/touch-preset/{preset_id}",
+      "methods": "DELETE,PUT"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/transfer-activity/{agent_id}",
       "methods": "GET,HEAD"
     },
@@ -2759,6 +2767,18 @@
             "key": {
               "owner_id": 1
             }
+          }
+        ]
+      },
+      {
+        "collection": "touch_presets",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "name": 1
+            },
+            "unique": true
           }
         ]
       },
@@ -4707,6 +4727,18 @@
             "key": {
               "owner_id": 1
             }
+          }
+        ]
+      },
+      {
+        "collection": "touch_presets",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "name": 1
+            },
+            "unique": true
           }
         ]
       },

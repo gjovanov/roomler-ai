@@ -1,8 +1,9 @@
 # FR-111: Touch controls — a phone or tablet as a real controller
 
-**Issue:** [#2359](https://github.com/gjovanov/roomler-ai/issues/2359) · **Status:** proposed — spec and claim
-2026-10-17 · **Owner:** the viewer's input path (`useRemoteControl.ts`, the stage, `MobileKeyboard.vue`);
-the agent only from P5 · **Anchors:** master `f93c23f74` · **Program:**
+**Issue:** [#2359](https://github.com/gjovanov/roomler-ai/issues/2359) · **Status:** in progress — P1–P3 and decisions 1 and 4
+merged and live; P4a (the org's presets on the server) built · **Owner:** the viewer's input path
+(`useRemoteControl.ts`, the stage, `MobileKeyboard.vue`), and from P4a the `remote` module's
+`touch_presets`; the agent only from P5 · **Anchors:** master `f93c23f74` · **Program:**
 [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 3 (§3 "Touch controls", row P11) ·
 **Builds on:** [FR-109](FR-109-relative-mouse.md) (`mouse_rel`, for the trackpad mode)
 
@@ -141,6 +142,36 @@ flowchart LR
 - **Presets become tenant-scoped data**, per `docs/data-model.md`: a collection keyed by tenant, shared by
   its members, never agent config.
 
+*The server half as built (P4a), the viewer's as designed (P4b):*
+
+- **The data is the viewer's own `TouchPreset`** (`touchControls.ts`), stored as it is: a name and a list of
+  rows, d-pads and sticks. P4 adds one action kind beside `keys` and `mouse`: a **macro**, a list of steps,
+  each a key or a mouse button with `press`, `release` or `tap`, and a wait after it. The stored shape and
+  the viewer's are one, so a built-in can be copied into the editor and saved as it is.
+- **`touch_presets`, owned by the `remote` module** (the module a controller reaches). One document per
+  preset: `tenant_id`, `name` (unique per tenant), `controls`, who created and last changed it, and when.
+  Routes, nested like the org's session policy:
+
+  | Route | Who |
+  |---|---|
+  | `GET /api/tenant/{tid}/touch-preset` | any member: every viewer in the org offers them |
+  | `POST /api/tenant/{tid}/touch-preset` | `MANAGE_TENANT` (open decision 5) |
+  | `PUT /api/tenant/{tid}/touch-preset/{id}` | `MANAGE_TENANT`; the id resolved **within** the tenant, so a foreign one is a 404 that leaks nothing |
+  | `DELETE /api/tenant/{tid}/touch-preset/{id}` | `MANAGE_TENANT`, the same |
+
+- **Validated strictly on the server**, because every member's viewer runs what is stored:
+  - unknown fields are refused, so a misspelt key is an error rather than nothing;
+  - keys must be HID usages on the keyboard page that the viewer's keyboard path can produce;
+  - labels are short and drawn as text, never HTML;
+  - sizes and places stay within sane pixel ranges;
+  - a macro has at most 32 steps, a wait at most 5 s and the whole macro at most 30 s;
+  - at most 24 controls per preset and 50 presets per org, with a body limit on the routes.
+- **A member's own layout stays in the browser** (open decision 6): the editor saves to `localStorage`
+  per user, with no server and no permission, and an org admin can publish a layout to the org.
+- **A macro runs on the viewer**, through the same sink as a button: each step is a `key` or mouse frame,
+  each wait a timer. Lifting the finger, closing the overlay, a blur, a hidden tab or a disconnect cancels
+  it and lets go of whatever it holds, the same release the driver already does for a held button.
+
 ### 3e. Native touch (P5, G3, optional)
 
 - `InputMsg::Touch` injected natively: `InjectTouchInput` on Windows, a uinput multitouch device on Linux.
@@ -159,7 +190,8 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
 | P1 | Touch on the stage (3a) | viewer storage key `roomler-rc-touch=legacy` | **built** (3a "as built"): the stage keeps every touch, a cancelled pointer lets go, and the direct-mode gestures. Unit tests: `touchInput.spec.ts` (8), `touchGestures.spec.ts` (11), vitest 2173. A negative control, a press tracker that never forgets a pointer, failed 3 tests. **Field-green on a candidate bundle** (this branch's `ui/dist` served into the page, §8 rows 2–4). Re-checked on the live viewer after the 2026-10-17 promote (§8 rows 9–10) |
 | P2 | Trackpad mode (3b) | the mode switch | **built** (3b "as built"): 5 trackpad tests, plus 2 for the mode's storage, vitest green. **Field-green on a candidate bundle** on both paths (§8 rows 5–6). The default stays direct until decision 1 |
 | P3 | On-screen controls and built-in presets (3c) | the overlay's toggle | **built** (3c "as built"): the overlay, the driver, three presets built to decision 2's recommendation, remembered per device. 26 unit tests, vitest 2209. **Field-green on a candidate bundle** (§8 rows 7–8): every control reached the host as the key it names, on both pointer paths. Re-checked on the live viewer after the 2026-10-17 promote (§8 rows 9–10) |
-| P4 | Editor, macros, tenant presets (3d) | — | — |
+| P4a | The org's presets on the server: `touch_presets` (the `remote` module), its four routes, strict validation, macro steps in the schema (3d) | — (inert until P4b's viewer reads it) | **built** (3d; decision 5 open, built to its recommendation): `TouchPreset` and `TouchPresetRequest::validate` in `remote_control`, `TouchPresetDao`, the four routes in `modules/remote/src/touch_presets.rs`, the unique `(tenant_id, name)` index. Tests: 4 unit (a viewer's own JSON parses and validates, unknown fields refused at every level, 35 refusal cases each by its code, the key range) and 4 integration (who reads and writes, a foreign id as a 404, refusals by code with nothing stored and a 413, the 50 cap). The composition baseline is re-recorded for exactly the two routes and the one index |
+| P4b | The editor, the org's presets and a member's own in the overlay, macros in the driver (3d) | the overlay's toggle | — |
 | P5 | Native touch injection (3e) | agent capability word | — |
 | P6 | Docs: `docs/touch-controls.md` (mermaid, the gestures, the modes, the presets), linked from `docs/remote-control.md` §6 and indexed in `docs/README.md` | — | grows with each phase |
 
@@ -198,7 +230,8 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
 
 ## 6. Open decisions
 
-All four were **decided by the operator on 2026-10-17, as recommended**.
+Decisions 1–4 were **decided by the operator on 2026-10-17, as recommended**. Decisions 5 and 6 are P4's,
+and open.
 
 1. **The default on a phone.** Direct touch (today's) or trackpad. Recommended: trackpad on a phone-sized
    screen, direct on a tablet, switchable in the toolbar. **Decided as recommended.** Built: with nothing
@@ -217,6 +250,16 @@ All four were **decided by the operator on 2026-10-17, as recommended**.
    pans the stage while `pictureOverflows`, shows the hint, and only otherwise does the wheel reach the
    host (`onTwoFingerScroll`). Trackpad mode keeps a laptop's two-finger scroll; following the host's
    pointer was the alternative and was not taken.
+5. **Who writes the org's presets** (P4). Recommended: `MANAGE_TENANT`, the bit that already decides the
+   org's session policy and limits for every session. A preset runs on every member's viewer, so writing
+   one is deciding for the org; reading stays open to every member. The alternative, a new permission bit,
+   is one more grant to reconcile on every managed role (`docs/permissions.md`) for a setting that sends
+   only keys the member could press anyway. *Open; P4a is built to the recommendation, which a different
+   answer changes in one guard per route.*
+6. **A member's own layout** (P4). Recommended: kept in the browser (`localStorage`, per user), so a member
+   needs no permission and the server holds only what the org shares. The alternative, per-user rows on
+   the server, would follow a person across devices at the cost of a second, per-user collection.
+   *Open; P4b is built to the recommendation.*
 
 ## 7. Out of scope
 
@@ -240,6 +283,8 @@ All four were **decided by the operator on 2026-10-17, as recommended**.
 | 10 | 2026-10-17 | **AC3–AC5 on the live viewer.** Rows 5–8's cells, the same way: trackpad mode and the on-screen controls on the agent as it is, then again with `ROOMLERD_INPUT_MOUSE_REL=0` in its service environment (re-enrolled to restart), then the switch cleared | **The same, both ways.** With `mouse-rel`, ten `mouse_rel` frames of about 32 moved the host's cursor from x 640 to 1276, and the tap clicked where the pointer was. Without it, absolute frames moved it from 640 to 315, and the tap clicked at x 0.246. Every key of the three presets reached the host's probe window, chords in order, and the stick moved the cursor by `mouse_rel` and then by absolute frames. The preset was remembered across a reload, and `off` hid it |
 | 11 | 2026-10-17 | **Open decision 1, on a phone and on a tablet.** Row 9's guest, in Chromium's touch emulation with nothing remembered in the browser (`rc-touch-decisions.spec.ts`, `DECISION=1`). Production's viewer, then this change's bundle (`index-BzLyLHX2.js`) on a Pixel 7 (412×839) and on an iPad Mini (768×1024) | **A phone starts in trackpad mode, a tablet in direct.** Pixel 7: production's control read "Touch: direct", this bundle's "Touch: trackpad". iPad Mini: "Touch: direct". Nothing was remembered in any run |
 | 12 | 2026-10-17 | **Open decision 4: two fingers on a zoomed picture.** The same, `DECISION=4`, direct mode pinned in storage: a two-finger drag upwards while the picture fits, a pinch outwards past the stage, then the same drag again. Every input frame the page sent was counted, and the stage's scroll offsets read | **Zoomed, the drag pans the picture instead of scrolling the host.** While the picture fit, both builds sent one `mouse_wheel`, so the host scrolled. After the pinch (the picture 3222 px wide): production sent a `mouse_wheel` again and the stage stayed at 0,700; this bundle sent **nothing**, the stage panned from 0,700 to 0,820, and the pan hint showed |
+| 13 | 2026-10-17 | **Decision 1 on the live viewer.** Production was promoted to `hosted-20261017-76f83fe` at 19:27Z, which serves #2398. Row 11's cell with no bundle served into the page (production's own `index-tJoqjQJP.js`), on a kept vmtest Win11 `--type system` guest on the released 0.4.141 (`vmtest-w-ins-sys-193053`) | **The same as the candidate.** Pixel 7: "Touch: trackpad (tap to use direct touch)". iPad Mini: "Touch: direct (tap to use a trackpad)". Nothing remembered in either run |
+| 14 | 2026-10-17 | **Decision 4 on the live viewer.** Row 12's cell, the same way | **The same as the candidate.** While the picture fit, one `mouse_wheel`. Zoomed to 3222 px: **no frame at all**, the stage panned from 0,700 to 0,820, and the pan hint showed. The guest was destroyed by name afterwards and its row removed |
 
 ## 9. Related
 

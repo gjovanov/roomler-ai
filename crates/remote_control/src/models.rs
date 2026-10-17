@@ -4856,6 +4856,340 @@ impl SessionFeedback {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// FR-111 P4a — the org's on-screen control presets
+// ────────────────────────────────────────────────────────────────────────────
+
+/// FR-111 P4a — one of an org's on-screen control presets (spec
+/// `docs/fr/FR-111-touch-controls.md` §3d): the viewer's own `TouchPreset`
+/// (`ui/src/composables/touchControls.ts`) stored as it is, with who made and
+/// last changed it. Every member's viewer runs what is stored here, so it is
+/// written only after [`TouchPresetRequest::validate`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TouchPreset {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    /// Unique per org (the `remote` module's unique index).
+    pub name: String,
+    pub controls: Vec<TouchControl>,
+    /// From the authenticated request, never from the body.
+    pub created_by: ObjectId,
+    pub updated_by: ObjectId,
+    /// Stamped by the SERVER.
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+impl TouchPreset {
+    pub const COLLECTION: &'static str = "touch_presets";
+    /// An org keeps at most this many.
+    pub const MAX_PER_TENANT: u64 = 50;
+}
+
+/// A control on the overlay: the viewer's `TouchControl`, tagged by `kind`.
+/// ⚠️ Unknown fields are refused, so a misspelt key is an error, never a
+/// control that quietly does something else.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TouchControl {
+    /// Buttons side by side, or stacked (`dir: column`).
+    Row {
+        id: String,
+        at: ControlPlace,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<RowDir>,
+        buttons: Vec<ButtonControl>,
+    },
+    /// Four keys under one thumb, two held on a diagonal.
+    Dpad {
+        id: String,
+        label: String,
+        at: ControlPlace,
+        /// Diameter in CSS pixels.
+        size: u16,
+        up: u8,
+        down: u8,
+        left: u8,
+        right: u8,
+    },
+    /// A thumb stick that moves the host's pointer.
+    Stick {
+        id: String,
+        label: String,
+        at: ControlPlace,
+        size: u16,
+        /// Full deflection moves the pointer this share of the picture's
+        /// width a second.
+        speed: f32,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RowDir {
+    Row,
+    Column,
+}
+
+/// Where a control sits: CSS pixels from the overlay's edges. An axis given
+/// no edge is centred, and an axis given both is refused.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ControlPlace {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<f32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ButtonControl {
+    pub id: String,
+    pub label: String,
+    pub action: ControlAction,
+}
+
+/// What a button does. `keys` and `mouse` are G1's (held while the finger
+/// is down); `macro` is P4's, a sequence the viewer plays once per press.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ControlAction {
+    /// A chord, pressed in order and released in reverse.
+    Keys {
+        keys: Vec<u8>,
+    },
+    Mouse {
+        btn: TouchMouseBtn,
+    },
+    Macro {
+        steps: Vec<MacroStep>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TouchMouseBtn {
+    Left,
+    Right,
+    Middle,
+}
+
+/// One step of a macro: a key or a mouse button, pressed, released or both
+/// (`tap`), then a wait before the next step.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MacroStep {
+    pub op: MacroOp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btn: Option<TouchMouseBtn>,
+    #[serde(default)]
+    pub wait_ms: u16,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MacroOp {
+    Press,
+    Release,
+    Tap,
+}
+
+/// The body of `POST` and `PUT /api/tenant/{tid}/touch-preset[/{id}]`: a name
+/// and the controls. Unknown keys fail the parse.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TouchPresetRequest {
+    pub name: String,
+    pub controls: Vec<TouchControl>,
+}
+
+/// Is `k` a HID usage the viewer's keyboard path can send: the Keyboard/Keypad
+/// page's keys (`0x04..=0xA4`) or its eight modifiers (`0xE0..=0xE7`)?
+pub fn touch_key_ok(k: u8) -> bool {
+    (0x04..=0xA4).contains(&k) || (0xE0..=0xE7).contains(&k)
+}
+
+impl TouchPresetRequest {
+    /// The body limit on the routes.
+    pub const MAX_BODY_BYTES: usize = 32 * 1024;
+    pub const MAX_NAME_CHARS: usize = 48;
+    pub const MAX_LABEL_CHARS: usize = 16;
+    pub const MAX_ID_CHARS: usize = 32;
+    pub const MAX_CONTROLS: usize = 24;
+    pub const MAX_ROW_BUTTONS: usize = 12;
+    pub const MAX_CHORD_KEYS: usize = 4;
+    pub const MAX_MACRO_STEPS: usize = 32;
+    pub const MAX_STEP_WAIT_MS: u16 = 5_000;
+    pub const MAX_MACRO_MS: u32 = 30_000;
+    /// A control's edge offset, in CSS pixels.
+    pub const MAX_PLACE_PX: f32 = 4_000.0;
+    pub const SIZE_PX: std::ops::RangeInclusive<u16> = 48..=400;
+    pub const STICK_SPEED: std::ops::RangeInclusive<f32> = 0.05..=5.0;
+
+    /// The name, trimmed; or the refusal code. Every member's viewer draws and
+    /// runs a stored preset, so everything it holds is bounded here: lengths,
+    /// counts, pixel ranges, the keys (only what the keyboard path can send),
+    /// ids unique within the preset, and a macro's steps and waits.
+    pub fn validate(&self) -> Result<String, &'static str> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err("name_empty");
+        }
+        if !text_ok(name, Self::MAX_NAME_CHARS) {
+            return Err("name_invalid");
+        }
+        if self.controls.is_empty() {
+            return Err("no_controls");
+        }
+        if self.controls.len() > Self::MAX_CONTROLS {
+            return Err("too_many_controls");
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut id = |s: &str| -> Result<(), &'static str> {
+            if s.is_empty() || !text_ok(s, Self::MAX_ID_CHARS) {
+                return Err("id_invalid");
+            }
+            if !ids.insert(s.to_string()) {
+                return Err("id_duplicate");
+            }
+            Ok(())
+        };
+        for c in &self.controls {
+            match c {
+                TouchControl::Row {
+                    id: cid,
+                    at,
+                    buttons,
+                    ..
+                } => {
+                    id(cid)?;
+                    place_ok(at)?;
+                    if buttons.is_empty() || buttons.len() > Self::MAX_ROW_BUTTONS {
+                        return Err("row_buttons");
+                    }
+                    for b in buttons {
+                        id(&b.id)?;
+                        label_ok(&b.label)?;
+                        action_ok(&b.action)?;
+                    }
+                }
+                TouchControl::Dpad {
+                    id: cid,
+                    label,
+                    at,
+                    size,
+                    up,
+                    down,
+                    left,
+                    right,
+                } => {
+                    id(cid)?;
+                    label_ok(label)?;
+                    place_ok(at)?;
+                    if !Self::SIZE_PX.contains(size) {
+                        return Err("size_invalid");
+                    }
+                    if ![up, down, left, right].iter().all(|k| touch_key_ok(**k)) {
+                        return Err("key_invalid");
+                    }
+                }
+                TouchControl::Stick {
+                    id: cid,
+                    label,
+                    at,
+                    size,
+                    speed,
+                } => {
+                    id(cid)?;
+                    label_ok(label)?;
+                    place_ok(at)?;
+                    if !Self::SIZE_PX.contains(size) {
+                        return Err("size_invalid");
+                    }
+                    if !speed.is_finite() || !Self::STICK_SPEED.contains(speed) {
+                        return Err("speed_invalid");
+                    }
+                }
+            }
+        }
+        Ok(name.to_string())
+    }
+}
+
+/// Printable text of at most `max` characters: no control characters, so a
+/// label is a label and never a line break or an escape.
+fn text_ok(s: &str, max: usize) -> bool {
+    s.chars().count() <= max && !s.chars().any(char::is_control)
+}
+
+fn label_ok(s: &str) -> Result<(), &'static str> {
+    if s.trim().is_empty() || !text_ok(s, TouchPresetRequest::MAX_LABEL_CHARS) {
+        return Err("label_invalid");
+    }
+    Ok(())
+}
+
+fn place_ok(at: &ControlPlace) -> Result<(), &'static str> {
+    if at.left.is_some() && at.right.is_some() || at.top.is_some() && at.bottom.is_some() {
+        return Err("place_both_edges");
+    }
+    let ok = |v: Option<f32>| {
+        v.is_none_or(|v| v.is_finite() && (0.0..=TouchPresetRequest::MAX_PLACE_PX).contains(&v))
+    };
+    if !(ok(at.left) && ok(at.right) && ok(at.top) && ok(at.bottom)) {
+        return Err("place_invalid");
+    }
+    Ok(())
+}
+
+fn action_ok(a: &ControlAction) -> Result<(), &'static str> {
+    match a {
+        ControlAction::Keys { keys } => {
+            if keys.is_empty() || keys.len() > TouchPresetRequest::MAX_CHORD_KEYS {
+                return Err("chord_keys");
+            }
+            if !keys.iter().all(|k| touch_key_ok(*k)) {
+                return Err("key_invalid");
+            }
+        }
+        ControlAction::Mouse { .. } => {}
+        ControlAction::Macro { steps } => {
+            if steps.is_empty() || steps.len() > TouchPresetRequest::MAX_MACRO_STEPS {
+                return Err("macro_steps");
+            }
+            let mut total: u32 = 0;
+            for s in steps {
+                // Exactly one of a key or a mouse button.
+                match (s.key, s.btn) {
+                    (Some(k), None) => {
+                        if !touch_key_ok(k) {
+                            return Err("key_invalid");
+                        }
+                    }
+                    (None, Some(_)) => {}
+                    _ => return Err("step_key_or_button"),
+                }
+                if s.wait_ms > TouchPresetRequest::MAX_STEP_WAIT_MS {
+                    return Err("step_wait");
+                }
+                total += u32::from(s.wait_ms);
+            }
+            if total > TouchPresetRequest::MAX_MACRO_MS {
+                return Err("macro_too_long");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Audit
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -7984,6 +8318,246 @@ mod tests {
         );
         let back: RemoteSession = bson::from_slice(bits.as_bytes()).unwrap();
         assert_eq!(back.permissions, row.permissions);
+    }
+
+    /// FR-111 P4a — a preset the viewer writes, in its own JSON: a row of
+    /// keys, a d-pad, a stick and a macro, as `touchControls.ts` shapes them.
+    fn preset_json() -> serde_json::Value {
+        serde_json::json!({
+            "name": "  WASD and look  ",
+            "controls": [
+                { "kind": "row", "id": "keys", "at": { "bottom": 12 }, "buttons": [
+                    { "id": "esc", "label": "Esc", "action": { "kind": "keys", "keys": [0x29] } },
+                    { "id": "copy", "label": "Copy", "action": { "kind": "keys", "keys": [0xe0, 0x06] } },
+                    { "id": "click", "label": "Click", "action": { "kind": "mouse", "btn": "left" } },
+                    { "id": "paste2", "label": "Paste x2", "action": { "kind": "macro", "steps": [
+                        { "op": "press", "key": 0xe0 },
+                        { "op": "tap", "key": 0x19, "wait_ms": 120 },
+                        { "op": "tap", "key": 0x19 },
+                        { "op": "release", "key": 0xe0 },
+                        { "op": "tap", "btn": "right", "wait_ms": 50 }
+                    ] } }
+                ] },
+                { "kind": "dpad", "id": "move", "label": "Move", "at": { "left": 16, "bottom": 16 },
+                  "size": 150, "up": 0x1a, "down": 0x16, "left": 0x04, "right": 0x07 },
+                { "kind": "stick", "id": "look", "label": "Look", "at": { "right": 16, "bottom": 16 },
+                  "size": 150, "speed": 1 },
+                { "kind": "row", "id": "col", "dir": "column", "at": { "right": 16, "top": 80 }, "buttons": [
+                    { "id": "tab", "label": "Tab", "action": { "kind": "keys", "keys": [0x2b] } }
+                ] }
+            ]
+        })
+    }
+
+    fn req(v: serde_json::Value) -> TouchPresetRequest {
+        serde_json::from_value(v).expect("parses")
+    }
+
+    #[test]
+    fn fr111_a_viewer_preset_parses_validates_and_round_trips() {
+        let r = req(preset_json());
+        assert_eq!(
+            r.validate(),
+            Ok("WASD and look".to_string()),
+            "the name trimmed"
+        );
+        // What is served back reads as the same controls: nothing lost. (As
+        // JSON text a place comes back `12.0` and a step without a wait gains
+        // `"wait_ms": 0`, the same numbers to the viewer's `JSON.parse`.)
+        let served = serde_json::to_value(&r.controls).unwrap();
+        let again: Vec<TouchControl> = serde_json::from_value(served.clone()).unwrap();
+        assert_eq!(again, r.controls);
+        assert_eq!(served[0]["at"]["bottom"], serde_json::json!(12.0));
+        assert_eq!(served[3]["dir"], "column");
+        assert!(served[0].get("dir").is_none(), "no dir unless given");
+        assert_eq!(served[0]["buttons"][3]["action"]["steps"][0]["wait_ms"], 0);
+        assert!(
+            served[0]["buttons"][3]["action"]["steps"][0]
+                .get("btn")
+                .is_none()
+        );
+        // And through BSON, as Mongo stores them.
+        let row = TouchPreset {
+            id: None,
+            tenant_id: ObjectId::new(),
+            name: "x".into(),
+            controls: r.controls.clone(),
+            created_by: ObjectId::new(),
+            updated_by: ObjectId::new(),
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        let stored: TouchPreset = bson::from_document(bson::to_document(&row).unwrap()).unwrap();
+        assert_eq!(stored.controls, r.controls);
+    }
+
+    #[test]
+    fn fr111_unknown_fields_are_refused_at_every_level() {
+        for path in [
+            vec!["extra"],
+            vec!["controls", "0", "extra"],
+            vec!["controls", "0", "at", "extra"],
+            vec!["controls", "0", "buttons", "0", "extra"],
+            vec!["controls", "0", "buttons", "0", "action", "extra"],
+            vec![
+                "controls", "0", "buttons", "3", "action", "steps", "0", "extra",
+            ],
+            vec!["controls", "1", "extra"],
+        ] {
+            let mut v = preset_json();
+            let mut at = &mut v;
+            for seg in &path[..path.len() - 1] {
+                at = match seg.parse::<usize>() {
+                    Ok(i) => &mut at[i],
+                    Err(_) => &mut at[*seg],
+                };
+            }
+            at[path[path.len() - 1]] = serde_json::json!(1);
+            assert!(
+                serde_json::from_value::<TouchPresetRequest>(v).is_err(),
+                "an unknown field at {path:?} must fail the parse"
+            );
+        }
+        // A key past a byte is not a HID usage at all.
+        let mut v = preset_json();
+        v["controls"][0]["buttons"][0]["action"]["keys"][0] = serde_json::json!(300);
+        assert!(serde_json::from_value::<TouchPresetRequest>(v).is_err());
+    }
+
+    #[test]
+    fn fr111_validation_refuses_what_a_viewer_should_not_run() {
+        let refused = |edit: &dyn Fn(&mut serde_json::Value), code: &str| {
+            let mut v = preset_json();
+            edit(&mut v);
+            assert_eq!(req(v).validate(), Err(code), "{code}");
+        };
+        refused(&|v| v["name"] = "   ".into(), "name_empty");
+        refused(&|v| v["name"] = "n".repeat(49).into(), "name_invalid");
+        refused(&|v| v["name"] = "two\nlines".into(), "name_invalid");
+        refused(&|v| v["controls"] = serde_json::json!([]), "no_controls");
+        refused(
+            &|v| {
+                let one = v["controls"][2].clone();
+                v["controls"] = serde_json::json!(
+                    (0..25)
+                        .map(|i| {
+                            let mut c = one.clone();
+                            c["id"] = format!("s{i}").into();
+                            c
+                        })
+                        .collect::<Vec<_>>()
+                );
+            },
+            "too_many_controls",
+        );
+        refused(&|v| v["controls"][1]["id"] = "keys".into(), "id_duplicate");
+        refused(
+            &|v| v["controls"][0]["buttons"][1]["id"] = "esc".into(),
+            "id_duplicate",
+        );
+        refused(&|v| v["controls"][1]["id"] = "".into(), "id_invalid");
+        refused(
+            &|v| v["controls"][1]["label"] = "a label far too long".into(),
+            "label_invalid",
+        );
+        refused(
+            &|v| v["controls"][0]["buttons"][0]["label"] = " ".into(),
+            "label_invalid",
+        );
+        refused(
+            &|v| v["controls"][0]["buttons"] = serde_json::json!([]),
+            "row_buttons",
+        );
+        refused(
+            &|v| v["controls"][0]["buttons"][0]["action"]["keys"] = serde_json::json!([]),
+            "chord_keys",
+        );
+        refused(
+            &|v| {
+                v["controls"][0]["buttons"][0]["action"]["keys"] =
+                    serde_json::json!([0x04, 0x05, 0x06, 0x07, 0x08])
+            },
+            "chord_keys",
+        );
+        // 0x00..0x03 are error codes, 0xA5..0xDF and 0xE8.. are not keys the
+        // keyboard path sends.
+        for bad in [0x00, 0x03, 0xa5, 0xdf, 0xe8, 0xff] {
+            refused(
+                &|v| v["controls"][0]["buttons"][0]["action"]["keys"][0] = bad.into(),
+                "key_invalid",
+            );
+        }
+        refused(&|v| v["controls"][1]["up"] = 0xf0.into(), "key_invalid");
+        refused(&|v| v["controls"][1]["size"] = 47.into(), "size_invalid");
+        refused(&|v| v["controls"][2]["size"] = 401.into(), "size_invalid");
+        refused(&|v| v["controls"][2]["speed"] = 0.0.into(), "speed_invalid");
+        refused(&|v| v["controls"][2]["speed"] = 5.5.into(), "speed_invalid");
+        refused(
+            &|v| v["controls"][1]["at"]["right"] = 4.into(),
+            "place_both_edges",
+        );
+        refused(
+            &|v| v["controls"][3]["at"]["bottom"] = 4.into(),
+            "place_both_edges",
+        );
+        refused(
+            &|v| v["controls"][1]["at"]["left"] = (-1).into(),
+            "place_invalid",
+        );
+        refused(
+            &|v| v["controls"][1]["at"]["left"] = 4001.into(),
+            "place_invalid",
+        );
+        let step = |v: &mut serde_json::Value| -> serde_json::Value {
+            v["controls"][0]["buttons"][3]["action"]["steps"].clone()
+        };
+        refused(
+            &|v| v["controls"][0]["buttons"][3]["action"]["steps"] = serde_json::json!([]),
+            "macro_steps",
+        );
+        refused(
+            &|v| {
+                let one = step(v)[0].clone();
+                v["controls"][0]["buttons"][3]["action"]["steps"] =
+                    serde_json::json!(vec![one; 33]);
+            },
+            "macro_steps",
+        );
+        refused(
+            &|v| v["controls"][0]["buttons"][3]["action"]["steps"][0]["btn"] = "left".into(),
+            "step_key_or_button",
+        );
+        refused(
+            &|v| {
+                let s = &mut v["controls"][0]["buttons"][3]["action"]["steps"][4];
+                s.as_object_mut().unwrap().remove("btn");
+            },
+            "step_key_or_button",
+        );
+        refused(
+            &|v| v["controls"][0]["buttons"][3]["action"]["steps"][1]["key"] = 0xe9.into(),
+            "key_invalid",
+        );
+        refused(
+            &|v| v["controls"][0]["buttons"][3]["action"]["steps"][1]["wait_ms"] = 5001.into(),
+            "step_wait",
+        );
+        refused(
+            &|v| {
+                let mut one = step(v)[1].clone();
+                one["wait_ms"] = 5000.into();
+                v["controls"][0]["buttons"][3]["action"]["steps"] = serde_json::json!(vec![one; 7]);
+            },
+            "macro_too_long",
+        );
+    }
+
+    #[test]
+    fn fr111_touch_keys_are_the_keyboard_page() {
+        assert!(touch_key_ok(0x04) && touch_key_ok(0x73) && touch_key_ok(0xa4));
+        assert!(touch_key_ok(0xe0) && touch_key_ok(0xe7));
+        assert!(!touch_key_ok(0x00) && !touch_key_ok(0x03));
+        assert!(!touch_key_ok(0xa5) && !touch_key_ok(0xdf) && !touch_key_ok(0xe8));
     }
 }
 

@@ -48,6 +48,7 @@ pub mod ssh_pending;
 pub mod stats;
 pub mod subscriber;
 pub mod tenant;
+pub mod touch_preset;
 pub mod transfer_activity;
 pub mod tunnel_audit;
 pub mod tunnel_client;
