@@ -760,6 +760,15 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
   route's is inclusive — a follow-up. §8.)*
 - [ ] **AC8 (P2):** `growth_org_daily` for a day older than 90 days still shows tunnel and SSH use after the
   audit rows expired; an org's rows are gone after the org is deleted.
+  *(Partly verified, not yet ticked.
+  **Tunnel, in the field (2026-10-17, production, read-only):** P2's backfill reached 2026-07-17. That day
+  one org's row reads `tunnel_flows=2`, and `tunnel_audit` holds **0** rows for it: its oldest row is from
+  07-22. The raw source has lost that use; only the frozen row still reports it.
+  **SSH:** `ssh_audit` begins 2026-08-21, so no SSH day is older than 90 days yet. It becomes field-checkable
+  from about 2026-11-20.
+  **Deletion:** no org hard-delete path exists (`purge_tenant` has no caller by design), so this half is the
+  integration test `org_daily_outlives_the_audit_rows_and_dies_with_the_org` until one does. That test also
+  covers the SSH half. §8.)*
 - [x] **AC9 (P3):** a vmtest install by `install.sh`, by `install.ps1`, by the wizard and by a hand-typed
   `roomlerd enroll` records that `install.method` on the agent row; an agent from before P3 records
   `unknown` (control).
@@ -867,7 +876,8 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
   "Deleted with your account" is a manual erasure today. No account or org hard-delete path exists;
   `purge_user` and `purge_tenant` are the seams one will call, and the TTLs bound the rows meanwhile.
   ⚠️ The same cross-check found a mismatch older than FR-102: §7 says crash reports go after "typically 7
-  days", but `agent_crashes` has a 90-day TTL (raised with the operator). §8.)*
+  days", but `agent_crashes` has a 90-day TTL. That was settled by decision 15: 30 days, live
+  2026-10-17 12:46Z (#2372). §8.)*
 - [x] **AC22 (docs):** `docs/growth-observability.md` with mermaid diagrams (the two planes, the install
   trace, the funnel definitions) and the `/observability` page as a whole, linked from `docs/README.md`;
   `docs/data-model.md`'s TTLs corrected.
@@ -922,7 +932,9 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
     "typically 7 days", but `agent_crashes` had a deliberate 90-day TTL. A report names the device's
     hostname and carries a log tail. **Decided: 30 days**, as the TTL on `reported_at`, with the policy
     saying so. When decided, 1,529 of the 1,678 reports were older than 30 days (the oldest from
-    2026-07-19), so the rollout deletes them. Every
+    2026-07-19), so the rollout would delete them. It did. At 12:46Z the first new pod's boot rebuilt
+    `agent_crashes`' two indexes, and only that collection's (error 85, the existing conflict handler).
+    By 12:48Z 149 reports remained, none older than 30 days. Every
     reader fits inside 30 days: the digest's 28-day window, P9a's nightly freeze of one closed day, and the
     per-device list of the last 50. The per-version counts stay in `growth_quality_daily`. The other
     options were the policy saying 90 days, or a 7-day TTL, which would have deleted 1,646.
@@ -974,6 +986,8 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
 | 2026-10-17 06:54–07:33Z | production `hosted-20261017-57519de` (agent 0.4.140 rolled; `/health` live 06:53:52Z); read-only Mongo | P9c's carrier on `remote_sessions` for the sessions since the roll, read by duration — the motivation for P9d | **The bug, in the field.** Every Active session read as one line, and short ones overwhelmingly carried no carrier. One Windows agent on 0.4.140 throughout — it recorded `direct` at 07:07:47 and agents do not downgrade — recorded `direct` on its 23 s and 20 s sessions but **nothing on three of its four 13 s sessions**; a Linux agent's 23 s session recorded `direct`; a 6 s session recorded nothing; two ephemeral sessions (5 s and ~38 s) left no row to read. With a uniformly random tick phase P(recorded) ≈ (D − ~2.5 s) / 30 s, so the gap falls on exactly the short, abandoned sessions the carrier split exists to diagnose ("relay sessions end quickly" would be invisible). **Control (pre-P9c):** an agent still on 0.4.139 recorded no carrier on a session opened after the server half went live — correct, because 0.4.139 has no observation code at all. The fix is P9d (PR #2368); a release carries no observation downgrade, so this read is the red the released fix must turn green — field read owed after the next agent release |
 | 2026-10-17 08:01–08:04Z | production `hosted-20261017-57519de`; a kept vmtest Ubuntu guest (`ubuntu/script/system`, agent 0.4.140, Wayland; its cell passed 8 of 9 with the usual reverse-ping WARN) from a private workspace | AC19 | **green**. The spec, fixed to sign in through each context's cookie jar and to pick the guest by exact name, ran from mars in the pinned Playwright container, one pass with no retries: 1 passed in 1.9 min. On the server: four sessions of 3 s, 33 s, 33 s and 34 s from request to end, all `controller_hangup`, and exactly one `session_feedback` row, on the fourth (`down`, `["lag"]`, by the controller, keys `session_id, tenant_id, user_id, agent_id, rating, reasons, ts`). **Red**: the spec as merged, run once against the same server, failed at `connectButton(...).toBeVisible()`. Its page snapshot was the login form, because seeding `localStorage` tokens has done nothing since sessions became cookie-only. The guest was shut down cleanly, so its ephemeral row unenrolled itself, then destroyed by name. ⚠️ The rating sits in an excluded org, so the digest's `quality.ratings` cannot count it; only an `include_internal` preview of 2026-10-17 can |
 | 2026-10-17 08:14–08:26Z | production `hosted-20261017-5f14468` (#2357, the 25-month session record and the policy) | the roll; the TTL; AC21 | **green**. Pods Ready with 0 restarts, `/health` 0.4.140 with all seven modules, and 24 of 24 agents connected at the roll reconnected. `remote_sessions` now has `created_at_1` with `expireAfterSeconds` 64,800,000 (750 days); before the roll it had no TTL index. It holds 8,570 rows, the oldest from 2026-08-04, so nothing was deleted. AC21 is green as ticked. Listing every production TTL index against §7 found one mismatch, older than FR-102: crash reports at 90 days, where the policy says "typically 7" |
+| 2026-10-17 09:05Z | production `hosted-20261017-5f14468`, read-only | AC8's field half | **Tunnel half green; not ticked.** `growth_org_daily` holds 306 rows, the oldest for 2026-07-17 (P2's 10-15 backfill went the full 90 days back). One day is older than 90 days and shows use: 2026-07-17, one org, `tunnel_flows=2`, with **0** `tunnel_audit` rows left for that org and day. The oldest surviving audit row is from 07-22. The raw source has lost that use, and only the frozen row still reports it. The SSH half has no field instance yet (`ssh_audit` begins 08-21). The deletion half has no product path |
+| 2026-10-17 12:45–12:48Z | production `hosted-20261017-30356ee` (promoted 12:45Z; carries #2372) | decision 15 live: the crash-report TTL and the policy | **green.** Both pods are on the new image, Ready, 0 restarts; `/health` 0.4.141. The first pod's boot logged `Index conflict detected … collection="agent_crashes"`, then `Indexes recreated after conflict resolution`, for that collection only. The second pod found the index already built. `reported_at_1` is now `expireAfterSeconds` 2,592,000 (30 d). The collection holds **149** reports, none older than 30 days, the oldest from 2026-09-25; 1,678 − 1,529 = 149, so exactly the measured set was deleted. Red at 09:15Z on `5f14468`: 90 d, 1,678 rows, and §7's old line. The rendered `/privacy` now carries "Crash reports (2.11) are deleted automatically 30 days after we receive them", the old wording is gone, and the five pages write nothing. Of 23 agents connected when the roll began, 23 reconnected |
 
 ## 9. Related
 
