@@ -1,9 +1,10 @@
 # FR-112: 60 fps without a hardware encoder — the frame rate follows what the encoder sustains
 
-**Issue:** [#2394](https://github.com/gjovanov/roomler-ai/issues/2394) · **Status:** P1 + P2a built
-([#2399](https://github.com/gjovanov/roomler-ai/pull/2399)): on a candidate the Asahi host sends **56.3 fps** of
-VP9-444 where 0.4.141 sends 27, at 1.6 cores instead of 3.5, and a still screen costs 13 % CPU instead of 44 %. The
-release check is owed; P2b (H.264) is next. Spec and claim 2026-10-17, on the operator's *"why is asahi having
+**Issue:** [#2394](https://github.com/gjovanov/roomler-ai/issues/2394) · **Status:** P1 + P2a merged
+([#2399](https://github.com/gjovanov/roomler-ai/pull/2399), `ed7c7e3d6`): on a candidate the Asahi host sends
+**56.3 fps** of VP9-444 where 0.4.141 sends 27, at 1.6 cores instead of 3.5, and a still screen costs 13 % CPU
+instead of 44 %. P2b (H.264) built: **56.2 fps** where 0.4.141 sends 28.7. The release check is owed for both.
+Spec and claim 2026-10-17, on the operator's *"why is asahi having
 less than 30fps, cant it reach 60?"* and, after the answer, *"yes do it"* · **Owner:** remote desktop (the software
 encode paths) · **Anchors:** master `a20bda769` ·
 **Builds on:** [FR-107](FR-107-drm-capture-throughput.md) (the capture costs 1.9 ms), [FR-74](FR-74-text-clarity-on-direct-paths.md)
@@ -171,11 +172,23 @@ flowchart LR
   pump runs at 30 doubles every frame's bits, so the ceiling is computed from the paced rate. It grows by
   √(fps/30) rather than linearly: at 60 a moving window travels half as far between frames, so each frame needs
   fewer bits than at 30.
-- **H.264's static assumptions go.** The auto-fps-cap that drops every software backend to 30 (`peer.rs:3027`)
-  and OpenH264's `max_frame_rate(30)` follow the tier instead. The cap that shrinks software H.264 to ≤ 1280 px
-  "so encode stays under the 33 ms 30-fps budget" fired on the host, whose clocked encoder costs 5 ms. It is
-  decided by the measured encode, as the hardware path's `DownscaleTier` already is. One slice stays: slicing
+- **H.264's static assumptions go.** Under the tier the RTP pump starts at 60 (`target_fps_with_tier`), and the
+  auto-fps-cap that drops a software backend to 30 stays off for it: the readback that cap absorbs is WGC's, on
+  Windows, where the tier is opt-in. The pump hands OpenH264 the rate it runs at
+  (`VideoEncoder::set_frame_rate`, `ENCODER_OPTION_FRAME_RATE`), because OpenH264 budgets each frame's bits from
+  it: configured for 30 and fed 60, it spends a 30 fps frame's bits on every one. One slice stays: slicing
   measured slower on the host (§2).
+- **OpenH264's runtime settings reach it.** Two defects kept them out, both older than this FR. The crate creates
+  the C encoder's state at the first encode, and `SetOption` before that answers `cmInitExpected` (4): every
+  session's first `set_bitrate` (the quality-derived target, applied before the first frame) failed, was recorded
+  as applied, and was never retried. The release logs it twice a session (§9). Early settings are now held until
+  the first frame is through. And the crate sets layer 0's max bitrate to the construction bitrate, and OpenH264
+  refuses a target above the max (`cmInitParaError`), so no runtime raise past it ever took: not Quality=High, not
+  REMB recovering, not the 60 fps base. `apply_runtime_bitrate` now moves the max with the target.
+- **The ≤ 1280-px cap is not the limit it looks like.** The cap that shrinks software H.264 "so encode stays under
+  the 33 ms 30-fps budget" fires on the host, and 230 ms later the viewer's default resolution (`original`,
+  `ui/src/composables/useRemoteControl.ts:4721`) overrides it: the field already encodes 2048×1080, and with its
+  clock that costs 5.5 ms a frame. So P2c, which would have decided the cap from the measured encode, is dropped.
 - **No VP9 quality trade on this host.** With its clock, today's settings (`cpu-used` 6, four tile columns, the
   q-index-16 cap) send 56 fps. `ROOMLERD_VP9_CPU_USED` stays the lever for a host that measures short.
 - **Static screens cost what they cost today.** The idle skip (FR-93 P3d) and the keepalive cadence do not change;
@@ -187,8 +200,8 @@ flowchart LR
 |---|---|---|---|---|
 | **P1** | the encoder asks for its clock: on Linux a `uclamp_min` on the encoder thread (libvpx's workers inherit it), OpenH264's worker and the capture worker; the VP9-444 pump times its encode (`avg_encode_ms`); the VP9 bench kept as an ignored test | `ROOMLERD_ENCODER_CLOCK=0` | 🟡 a candidate on the Asahi host (§9); the release check owed | S |
 | **P2a** | the VP9-444 pump's tier: target 60, `FpsPace` fed by its encode EWMA and never below 30, the ceiling from the rate it runs at (×√2 at 60); on by default on Linux | `ROOMLERD_SW_FPS_60=0` (back to 30) | 🟡 a candidate on the Asahi host (§9); the release check owed | M |
-| **P2b** | the H.264 RTP pump's tier: target 60 on Linux, OpenH264's frame rate following it (and its runtime settings held until the encoder exists: today the first `set_bitrate` of every session fails `cmInitExpected`), the auto-fps-cap left to Windows, the same pace and ceiling | `ROOMLERD_SW_FPS_60=0` | ⏳ | M |
-| **P2c** | software H.264's ≤ 1280-px cap decided by the measured encode, as the hardware path's `DownscaleTier` is | `ROOMLERD_SW_FPS_60=0` | ⏳ | S |
+| **P2b** | the H.264 RTP pump's tier: target 60 on Linux, the same pace (`SoftwarePace`, shared with P2a) and ceiling, OpenH264's frame rate following the rate it runs at, its runtime settings held until its first frame and its max bitrate moving with the target, the auto-fps-cap left to Windows | `ROOMLERD_SW_FPS_60=0` | 🟡 a candidate on the Asahi host (§9); the max-bitrate fix and the release check owed | M |
+| ~~**P2c**~~ | ~~software H.264's ≤ 1280-px cap decided by the measured encode~~ — dropped: the viewer's default `original` already overrides the cap (§3), and the host encodes 2048×1080 in 5.5 ms | — | — | — |
 | **P3** | the clock elsewhere: macOS (the encoder threads' QoS class) and Windows (no power throttling for the encode thread), each measured on its own hardware first | per OS | ⏳ | S |
 | **P4** | docs: `docs/rate-control.md` (the software tier, the ceiling), `docs/encoders.md` (the clock, why one slice), the `docs/README.md` index row | — | ⏳ | S |
 
@@ -239,6 +252,8 @@ flowchart LR
 - The X11 capture's frame gate (FR-107 §8): a separate before/after on an X11 host.
 - The GPU writing the encoder's YUV (FR-107 P4): worth it only if the bench shows the conversion matters.
 - A 120 Hz target: no field host asks for it yet.
+- Noticed, not this FR's: software H.264's ≤ 1280-px auto-downscale fires at session start and the viewer's
+  default `original` overrides it 230 ms later, so every such session pays an extra encoder rebuild and a resize.
 
 ## 9. Field-verification log
 
@@ -269,3 +284,26 @@ flowchart LR
   H.264 frame back at 16.6 ms.
 - **The pace never engaged** (`paced_fps=None` in every window): this host sustains 60. AC3 needs a host that
   does not.
+
+**P2b, 2026-10-17 18:21–18:33Z**, the Asahi host, the system service: a P2b candidate built on the host (sha256
+`034840a7…`, before the max-bitrate fix), then both kill switches, then the released 0.4.141; one session per arm.
+Every H.264 session ran at 2048×1080: the ≤ 1280-px cap fired and the viewer's `original` overrode it (§3).
+
+| Arm (H.264/RTP unless named; 20 s of a spinning cube, the still arm 60 s) | encoded fps | `avg_encode_ms` | roomlerd CPU | what the session logged |
+|---|---|---|---|---|
+| the candidate | **56.2** (target 60, never paced) | 5–6 | 0.4 cores | the tier; OpenH264's frame rate set to 60; `set_bitrate` refused **1** for the 60 fps base |
+| the candidate again | **56.2** | 5–6 | 0.4 cores | the same |
+| the candidate, still | — | 4–6 | 5 % | — |
+| the candidate, VP9-444 (the shared pace) | 56.3 | 7.6 | 1.8 cores | — |
+| both kill switches | 28.8 at the 30 target | 16.6 | 0.6 cores | no refusal at all: the held bitrate took after the first frame |
+| the release 0.4.141 | 28.7 | 16.6 | 0.6 cores | `set_bitrate` refused **4** (`cmInitExpected`) twice: the red for the held settings |
+
+- **AC2's measurement passes on the candidate**: 56.2 fps twice, against 28.7 on the release.
+- ⚠️ The candidate's `set_bitrate` refused **1** (`cmInitParaError`) for every raise past the construction
+  bitrate: the max-bitrate defect (§3), found here and fixed after this run, so its field check is owed. Until it,
+  this H.264 session ran at the construction 13.3 Mbps instead of the 18.8 Mbps the 60 fps base asks for.
+- ⚠️ The release's still arm is void: the operator connected to the host from the grox org in the middle of it
+  (18:30:04Z). Worse, the harness's live check compared the last session request with the last termination across
+  all sessions, so the end of its own session hid the operator's, and its cleanup restarted roomlerd under them at
+  18:31:12Z. The check is now per session id, over the running process only, and a cleanup restarts only when the
+  host is not already on the release.
