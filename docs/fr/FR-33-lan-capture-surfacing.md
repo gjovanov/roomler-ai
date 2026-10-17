@@ -50,7 +50,7 @@ stays out of scope (operator's standing rule).
    Network Adapter For Endpoint VPN Client); direct on the LAN is impossible while it does`
    and `lan         clear` otherwise. Wire: `NodeStatus.lan_capture: Option<LanCaptureStatus>`
    (`crates/localapi/src/lib.rs:89`), populated the way `srflx` is
-   (`agents/roomlerd/src/localapi_state.rs:371` ← `runtime.rs:3188`). Optional field: an old
+   (`agents/roomlerd/src/localapi_state.rs:371` ← `runtime.rs:3224`). Optional field: an old
    CLI against a new daemon, or the reverse, prints nothing extra.
 3. **`peers --json why`**: `BlockedBy::LanCaptured` (`path.rs:1310`) when the LAN tier is refused
    while a capture is active on *this* host — a fact about this host, the way

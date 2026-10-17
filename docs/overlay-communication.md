@@ -560,15 +560,15 @@ does instead:
 
 - The overlay runtime asks firewalld, then ufw, what governs its adapter,
   once the adapter is up and every ten minutes
-  ([`runtime.rs:2135`](../crates/tunnel-core/src/overlay/runtime.rs#L2135),
+  ([`runtime.rs:2158`](../crates/tunnel-core/src/overlay/runtime.rs#L2158),
   [`hostfw.rs:220`](../crates/tunnel-core/src/overlay/hostfw.rs#L220)), off
   the run loop.
 - The answer is `HostFirewallStatus`
-  ([`lib.rs:111`](../crates/localapi/src/lib.rs#L111)), parsed from
+  ([`lib.rs:120`](../crates/localapi/src/lib.rs#L120)), parsed from
   `firewall-cmd --info-zone` ([`hostfw.rs:45`](../crates/tunnel-core/src/overlay/hostfw.rs#L45))
   or `ufw status verbose` ([`hostfw.rs:130`](../crates/tunnel-core/src/overlay/hostfw.rs#L130)).
 - `roomler status` prints it only when the firewall limits what a mesh peer
-  reaches ([`localclient.rs:2563`](../agents/roomler-cli/src/localclient.rs#L2563)):
+  reaches ([`localclient.rs:2580`](../agents/roomler-cli/src/localclient.rs#L2580)):
 
   ```text
     host fw     firewalld has roomler0 in no zone, so the default zone public applies: mesh peers reach only dhcpv6-client, ssh here
