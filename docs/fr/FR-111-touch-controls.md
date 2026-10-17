@@ -196,18 +196,25 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
 
 ## 6. Open decisions
 
+All four were **decided by the operator on 2026-10-17, as recommended**.
+
 1. **The default on a phone.** Direct touch (today's) or trackpad. Recommended: trackpad on a phone-sized
-   screen, direct on a tablet, switchable in the toolbar.
+   screen, direct on a tablet, switchable in the toolbar. **Decided as recommended.** Built: with nothing
+   remembered, a screen whose shorter side is under 600 CSS px starts in trackpad mode (`phoneSized`,
+   `readTouchMode`), and the toolbar's choice is remembered and wins.
 2. **The built-in presets G1 ships.** Recommended: arrows; WASD with mouse look; an office row (Esc, Tab,
    Alt+Tab, Ctrl+C / V / Z). P3 is built to this recommendation, and the presets are data
-   (`BUILTIN_PRESETS`), so another answer is an edit to that table.
+   (`BUILTIN_PRESETS`), so another answer is an edit to that table. **Decided as recommended**, so P3 stands.
 3. **G3 at all.** Native touch injection only if a host app needs real touch (a touch-first Windows app)
-   once G1 and G2 exist.
+   once G1 and G2 exist. **Decided as recommended:** P5 waits for such an app.
 4. **Panning a zoomed picture on a phone.** In P1, two fingers moving together scroll the host, so a picture
    zoomed past the stage is moved around by zooming out and back in elsewhere (the zoom keeps the point
    between the fingers under them). Recommended: while the picture is larger than the stage, two fingers
    pan the picture and the host scrolls only when it fits, with a one-line hint. The trackpad mode (P2)
-   could instead pan to follow the host's pointer.
+   could instead pan to follow the host's pointer. **Decided as recommended**, for direct mode: the view
+   pans the stage while `pictureOverflows`, shows the hint, and only otherwise does the wheel reach the
+   host (`onTwoFingerScroll`). Trackpad mode keeps a laptop's two-finger scroll; following the host's
+   pointer was the alternative and was not taken.
 
 ## 7. Out of scope
 

@@ -3,6 +3,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   createPointerPressTracker,
+  phoneSized,
+  pictureOverflows,
   readTouchMode,
   releaseForCancelledPointer,
   stageTouchAction,
@@ -88,13 +90,52 @@ describe('FR-111 readTouchMode', () => {
   const store = (v: string | null): Pick<Storage, 'getItem'> => ({
     getItem: (k: string) => (k === TOUCH_MODE_STORAGE_KEY ? v : null),
   })
-  it('is direct unless this browser chose the trackpad (decision 1 pending)', () => {
+  it('a remembered choice wins; with none, a phone-sized screen starts in trackpad (decision 1)', () => {
+    // Nothing remembered: the screen decides.
     expect(readTouchMode(store(null))).toBe('direct')
-    expect(readTouchMode(store('trackpad'))).toBe('trackpad')
-    expect(readTouchMode(store('Trackpad'))).toBe('direct')
-    expect(readTouchMode(null)).toBe('direct')
+    expect(readTouchMode(store(null), false)).toBe('direct')
+    expect(readTouchMode(store(null), true)).toBe('trackpad')
+    expect(readTouchMode(null, true)).toBe('trackpad')
+    // The toolbar's choice is remembered as the exact word, and wins either way.
+    expect(readTouchMode(store('trackpad'), false)).toBe('trackpad')
+    expect(readTouchMode(store('direct'), true)).toBe('direct')
+    // Any other word is nothing remembered.
+    expect(readTouchMode(store('Trackpad'), false)).toBe('direct')
+    expect(readTouchMode(store('Trackpad'), true)).toBe('trackpad')
   })
-  it('reads storage that throws as direct', () => {
-    expect(readTouchMode({ getItem: () => { throw new Error('SecurityError') } })).toBe('direct')
+  it('reads storage that throws as nothing remembered', () => {
+    const throwing = { getItem: () => { throw new Error('SecurityError') } }
+    expect(readTouchMode(throwing)).toBe('direct')
+    expect(readTouchMode(throwing, true)).toBe('trackpad')
+  })
+})
+
+describe('FR-111 phoneSized (decision 1)', () => {
+  it('is the screen whose shorter side is under 600 CSS px, either way round', () => {
+    expect(phoneSized({ width: 412, height: 915 })).toBe(true)
+    expect(phoneSized({ width: 915, height: 412 })).toBe(true)
+    expect(phoneSized({ width: 599, height: 1000 })).toBe(true)
+    expect(phoneSized({ width: 600, height: 1000 })).toBe(false)
+    expect(phoneSized({ width: 768, height: 1024 })).toBe(false)
+    expect(phoneSized({ width: 1920, height: 1080 })).toBe(false)
+  })
+  it('is not a phone when the screen is unknown or reads nonsense', () => {
+    expect(phoneSized(null)).toBe(false)
+    expect(phoneSized(undefined)).toBe(false)
+    expect(phoneSized({ width: 0, height: 0 })).toBe(false)
+    expect(phoneSized({ width: Number.NaN, height: 800 })).toBe(false)
+  })
+})
+
+describe('FR-111 pictureOverflows (decision 4)', () => {
+  const stage = (sw: number, cw: number, sh: number, ch: number) => ({ scrollWidth: sw, clientWidth: cw, scrollHeight: sh, clientHeight: ch })
+  it('pans only a picture larger than the stage, on either axis', () => {
+    expect(pictureOverflows(stage(800, 400, 600, 600))).toBe(true)
+    expect(pictureOverflows(stage(400, 400, 900, 600))).toBe(true)
+    expect(pictureOverflows(stage(400, 400, 600, 600))).toBe(false)
+  })
+  it('a pixel of layout rounding is not an overflow', () => {
+    expect(pictureOverflows(stage(401, 400, 601, 600))).toBe(false)
+    expect(pictureOverflows(stage(402, 400, 600, 600))).toBe(true)
   })
 })
