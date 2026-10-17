@@ -28,7 +28,7 @@ and the host's raw input read the press and then no release (the spec's §8 row 
 The finger is still the mouse: a tap clicks where it lands, and a drag drags from where it landed. What is new
 is that the viewer **waits for the finger to say what it is** before it presses anything. So a long press
 never starts as a left press, and a second finger never drags along with the first
-([`touchGestures.ts:109`](../ui/src/composables/touchGestures.ts#L109) `createDirectGestures`, a pure state
+([`touchGestures.ts:113`](../ui/src/composables/touchGestures.ts#L113) `createDirectGestures`, a pure state
 machine with its own tests).
 
 | Gesture | Reaches the host as |
@@ -66,10 +66,10 @@ stateDiagram-v2
   100 px a step and rounds every frame on its own (`enigo_backend.rs` `wheel_to_steps`), so a frame under
   50 px scrolls nothing, and a finger's scroll arrives a few pixels at a time. The viewer gathers the
   gesture's pixels and sends only whole steps, carrying the rest
-  ([`touchGestures.ts:88`](../ui/src/composables/touchGestures.ts#L88) `createWheelSteps`). On the
+  ([`touchGestures.ts:92`](../ui/src/composables/touchGestures.ts#L92) `createWheelSteps`). On the
   field run that turned 21 frames of about 6 px, which the host never saw, into one step it did.
 - A mouse and a pen keep their own paths. Only a pointer whose `pointerType` is `touch` goes through the
-  gestures ([`useRemoteControl.ts:10285`](../ui/src/composables/useRemoteControl.ts#L10285)).
+  gestures ([`useRemoteControl.ts:10303`](../ui/src/composables/useRemoteControl.ts#L10303)).
 - Every gesture is made of frames a mouse already sends (`mouse_button`, `mouse_move`, `mouse_wheel`), so
   it works with every deployed agent.
 
