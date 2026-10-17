@@ -5855,6 +5855,14 @@ mod system {
                     stderr = %String::from_utf8_lossy(&out.stderr).trim(),
                     "overlay: derived-IPv6 assign failed; node stays v4-only"
                 ),
+                // A minimal container has no iproute2: say so, because the bare
+                // ENOENT reads as a missing TUN, and the same absence also turns
+                // the IPv6 default route "missing", so an exit serves no IPv6.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => tracing::warn!(
+                    addr = %cidr,
+                    "overlay: derived-IPv6 assign failed; node stays v4-only: `ip` is not \
+                     installed (iproute2), and without it an exit cannot serve IPv6 either"
+                ),
                 Err(e) => tracing::warn!(
                     addr = %cidr,
                     error = %e,
