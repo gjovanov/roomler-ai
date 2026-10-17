@@ -1474,6 +1474,7 @@ fn is_stale(age: Duration) -> bool {
 /// removal failure — most likely a file a surviving watcher still holds open
 /// — is logged and skipped, never fatal, exactly like Linux's
 /// [`discard_staging`].
+#[cfg(target_os = "windows")]
 pub fn sweep_stale_update_staging_at_start() {
     let base = std::env::temp_dir();
     let entries = match std::fs::read_dir(&base) {
