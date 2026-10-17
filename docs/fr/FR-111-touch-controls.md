@@ -95,8 +95,9 @@ flowchart LR
   agent it becomes absolute moves from `cursor:pos` divided by the picture's intrinsic size, re-read at each
   gesture's start.
 - The mode is `touchMode` / `setTouchMode` on the composable, remembered as `roomler-rc-touch-mode`. The
-  toolbar control (`rc-touch-mode`) shows on a touch device unless the `legacy` switch is set. **The default
-  is direct** until open decision 1 is settled. The ghost cursor is the host's own cursor overlay, which
+  toolbar control (`rc-touch-mode`) shows on a touch device unless the `legacy` switch is set. **With
+  nothing remembered, a phone-sized screen starts in trackpad mode** and a larger one in direct mode (open
+  decision 1, settled 2026-10-17; `phoneSized`, `readTouchMode`). The ghost cursor is the host's own cursor overlay, which
   `cursor:pos` already drives.
 
 ### 3c. On-screen controls (P3, G1)
@@ -155,9 +156,9 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | Probes: (1) **red first**, a one-finger drag on today's stage in touch emulation, read on a vmtest Win11 host by a raw-input probe that counts button downs and ups; (2) what each engine's touch emulation gives Playwright (taps, drags, two-finger gestures), for the ACs' cells | docs only | spec and claim 2026-10-17. **(1) measured** (§8 row 1): in Chromium's touch emulation a drag is taken as a pan after 69 ms, and the host's button stays down until something else releases it. (2) is measured for Chromium only (CDP touch events reach the page and its gesture handling); WebKit and Firefox are owed |
-| P1 | Touch on the stage (3a) | viewer storage key `roomler-rc-touch=legacy` | **built** (3a "as built"): the stage keeps every touch, a cancelled pointer lets go, and the direct-mode gestures. Unit tests: `touchInput.spec.ts` (8), `touchGestures.spec.ts` (11), vitest 2173. A negative control, a press tracker that never forgets a pointer, failed 3 tests. **Field-green on a candidate bundle** (this branch's `ui/dist` served into the page, §8 rows 2–4). It gets re-checked once a promote serves it |
+| P1 | Touch on the stage (3a) | viewer storage key `roomler-rc-touch=legacy` | **built** (3a "as built"): the stage keeps every touch, a cancelled pointer lets go, and the direct-mode gestures. Unit tests: `touchInput.spec.ts` (8), `touchGestures.spec.ts` (11), vitest 2173. A negative control, a press tracker that never forgets a pointer, failed 3 tests. **Field-green on a candidate bundle** (this branch's `ui/dist` served into the page, §8 rows 2–4). Re-checked on the live viewer after the 2026-10-17 promote (§8 rows 9–10) |
 | P2 | Trackpad mode (3b) | the mode switch | **built** (3b "as built"): 5 trackpad tests, plus 2 for the mode's storage, vitest green. **Field-green on a candidate bundle** on both paths (§8 rows 5–6). The default stays direct until decision 1 |
-| P3 | On-screen controls and built-in presets (3c) | the overlay's toggle | **built** (3c "as built"): the overlay, the driver, three presets built to decision 2's recommendation, remembered per device. 26 unit tests, vitest 2209. **Field-green on a candidate bundle** (§8 rows 7–8): every control reached the host as the key it names, on both pointer paths. It gets re-checked once a promote serves it |
+| P3 | On-screen controls and built-in presets (3c) | the overlay's toggle | **built** (3c "as built"): the overlay, the driver, three presets built to decision 2's recommendation, remembered per device. 26 unit tests, vitest 2209. **Field-green on a candidate bundle** (§8 rows 7–8): every control reached the host as the key it names, on both pointer paths. Re-checked on the live viewer after the 2026-10-17 promote (§8 rows 9–10) |
 | P4 | Editor, macros, tenant presets (3d) | — | — |
 | P5 | Native touch injection (3e) | agent capability word | — |
 | P6 | Docs: `docs/touch-controls.md` (mermaid, the gestures, the modes, the presets), linked from `docs/remote-control.md` §6 and indexed in `docs/README.md` | — | grows with each phase |
@@ -168,21 +169,22 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
   released (a raw-input probe on a vmtest Win11 host counts downs and ups). Red: today a drag the browser
   cancels leaves it down. **Verified** on a candidate bundle (§8 rows 1–3). Red: production's viewer left the
   press without a release for 4.6 s. Green: the press and its release 484 ms apart, and with the browser
-  free to cancel (the legacy switch), 78 ms apart. It gets re-checked once a promote serves P1.
+  free to cancel (the legacy switch), 78 ms apart. **Re-checked on the live viewer after the 2026-10-17 promote** (row 9): 406 ms apart, and 78 ms under the legacy switch.
 - [x] **AC2:** in direct mode, long press and two-finger tap give the right button, two-finger drag scrolls
   the host, and a pinch zooms only the viewer (nothing reaches the host). **Verified** on a candidate bundle
   (§8 row 4). The host read a right click for each, one wheel notch for a 135 px scroll, and nothing for a
-  pinch that zoomed the picture five times. It gets re-checked once a promote serves P1.
+  pinch that zoomed the picture five times. **Re-checked on the live viewer** (row 9): the same four answers.
 - [x] **AC3:** trackpad mode moves the host's pointer relatively, on an agent that advertises `mouse-rel`
   and on an older one, and a tap clicks where the pointer is. **Verified** on a candidate bundle (§8 rows
   5–6). A 100 px drag moved the host's cursor about 325 px, by `mouse_rel` on 0.4.140 and by absolute
-  moves from `cursor:pos` with `mouse-rel` switched off. Each time the tap clicked at the pointer. It gets
-  re-checked once a promote serves P2.
+  moves from `cursor:pos` with `mouse-rel` switched off. Each time the tap clicked at the pointer.
+  **Re-checked on the live viewer** (row 10): 640 → 1276 by `mouse_rel`, 640 → 315 by absolute frames, each
+  tap at the pointer.
 - [x] **AC4:** on-screen buttons and the d-pad reach the host as the keys they name, read by a test-only
   probe on the guest. **Verified** on a candidate bundle (§8 row 7). A window on the host recorded the keys
   delivered to it. Each of the three presets' buttons and both d-pads read as the key it names, every chord
   pressed in order and let go in reverse, and a finger sliding from up through the diagonal to right held both
-  keys on the diagonal. It gets re-checked once a promote serves P3.
+  keys on the diagonal. **Re-checked on the live viewer** (row 10): every key, and the stick, both ways.
 - [x] **AC5:** G1 works with every deployed agent: AC1–AC4's cells pass on an agent from before this FR.
   **Verified** (§8 rows 1–8). Every cell ran on 0.4.140, which predates this FR and carries none of its code.
   Each pointer path also ran with `mouse-rel` switched off (rows 6 and 8), which is what every agent
@@ -196,18 +198,25 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
 
 ## 6. Open decisions
 
+All four were **decided by the operator on 2026-10-17, as recommended**.
+
 1. **The default on a phone.** Direct touch (today's) or trackpad. Recommended: trackpad on a phone-sized
-   screen, direct on a tablet, switchable in the toolbar.
+   screen, direct on a tablet, switchable in the toolbar. **Decided as recommended.** Built: with nothing
+   remembered, a screen whose shorter side is under 600 CSS px starts in trackpad mode (`phoneSized`,
+   `readTouchMode`), and the toolbar's choice is remembered and wins.
 2. **The built-in presets G1 ships.** Recommended: arrows; WASD with mouse look; an office row (Esc, Tab,
    Alt+Tab, Ctrl+C / V / Z). P3 is built to this recommendation, and the presets are data
-   (`BUILTIN_PRESETS`), so another answer is an edit to that table.
+   (`BUILTIN_PRESETS`), so another answer is an edit to that table. **Decided as recommended**, so P3 stands.
 3. **G3 at all.** Native touch injection only if a host app needs real touch (a touch-first Windows app)
-   once G1 and G2 exist.
+   once G1 and G2 exist. **Decided as recommended:** P5 waits for such an app.
 4. **Panning a zoomed picture on a phone.** In P1, two fingers moving together scroll the host, so a picture
    zoomed past the stage is moved around by zooming out and back in elsewhere (the zoom keeps the point
    between the fingers under them). Recommended: while the picture is larger than the stage, two fingers
    pan the picture and the host scrolls only when it fits, with a one-line hint. The trackpad mode (P2)
-   could instead pan to follow the host's pointer.
+   could instead pan to follow the host's pointer. **Decided as recommended**, for direct mode: the view
+   pans the stage while `pictureOverflows`, shows the hint, and only otherwise does the wheel reach the
+   host (`onTwoFingerScroll`). Trackpad mode keeps a laptop's two-finger scroll; following the host's
+   pointer was the alternative and was not taken.
 
 ## 7. Out of scope
 
@@ -227,6 +236,10 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
 | 6 | 2026-10-17 | **AC3, trackpad mode on an agent without `mouse-rel`.** The same, with the agent's kill switch `ROOMLERD_INPUT_MOUSE_REL=0` set (restart and re-enroll), so the viewer took its absolute path. The drag went 100 CSS px to the left. The switch was cleared afterwards | **The same motion, from absolute moves.** The viewer started from the host's pointer, its last `cursor:pos` (x 1278 of 1280), and sent absolute `mouse_move` frames from x 0.973 to 0.745, a share of 0.254. The host's cursor went from (1278, 400) to **(952, 400)**, 326 px in steps of about 32. The tap sent `mouse_button` at (0.744, 0.5), the pointer's own position and not the finger's, and the host read `L l`. **Wrong turn:** the first run dragged right, but the cursor already sat at the right edge from row 5, so every move clamped at x = 1. The cell was re-run dragging left |
 | 7 | 2026-10-17 | **AC4 and AC6's G1 half: the on-screen controls (a candidate bundle).** The same guest (0.4.140), with P3's own `ui/dist` in Chromium's Pixel 7 emulation; the page ran `/assets/index-D3SDkDdi.js`. A test-only window on the host, visible and maximized, recorded the keys and buttons delivered to it. It has no hook and hears only its own input, so a first tap on the picture gave it the focus. A second probe kept the cursor's position. The viewer picked each preset from the toolbar and pressed its controls with real CDP touch: the office row; the arrow d-pad's four arms, then a finger sliding from up through up-right to right; PgUp, PgDn, Space and Enter; then WASD's W, Jump, Shift, Ctrl, E, R, Fire and Aim, and the stick pushed 0.6 of its radius to the right for 0.86 s. Then a reload | **Every control reached the host as the key it names.** The window read the focus tap (`F L l`), then Esc `D1B U1B`, Tab `D09 U09`, and the chords `D11 D43 U43 U11` (Ctrl+C), `D11 D56 U56 U11` (Ctrl+V) and `D11 D5A U5A U11` (Ctrl+Z), each pressed in order and let go in reverse. The arrow d-pad read `D26 U26`, `D27 U27`, `D28 U28`, `D25 U25`, and the slide `D26 D27 U26 U27`: both keys held on the diagonal. PgUp, PgDn, Space and Enter read `D21 U21`, `D22 U22`, `D20 U20`, `D0D U0D`. WASD read W `D57 U57`, Jump `D20 U20`, Shift `D10 U10`, Ctrl `D11 U11`, E `D45 U45`, R `D52 U52`, Fire `L l` and Aim `R r`; the viewer sent Fire and Aim as `mouse_press` and `mouse_release`. The stick sent `mouse_rel` of 6 counts a frame, and the host's cursor went from x 646 to 948 in 0.86 s. **AC6, G1:** the choice was kept as `roomler-rc-touch-controls:<device>=wasd`. After a reload the overlay came back as WASD, and Off removed it and kept `off` |
 | 8 | 2026-10-17 | **AC4 and AC5: the same controls on an agent without `mouse-rel`.** Row 7's cell again, with the agent's kill switch `ROOMLERD_INPUT_MOUSE_REL=0` in the service environment (re-enrolled to restart), so the agent advertised what every agent before 0.4.140 does. The switch was cleared and the device re-enrolled afterwards | **The same keys, and the mouse by absolute frames.** The viewer sent no `mouse_rel` at all. Fire went out as `mouse_button` at (0.5, 0.5), the host pointer's position from `cursor:pos`, and the host read `L l`, then Aim `R r`. The stick moved the host's cursor from x 643 to 948 in 0.9 s by absolute moves. Every key read as in row 7, the slide through the diagonal included (`D26 D27 U26 U27`) |
+| 9 | 2026-10-17 | **AC1 and AC2 on the live viewer, after a promote.** Production was promoted to `hosted-20261017-30356ee` at 12:45Z, which serves P1–P3. Rows 2–4's cells were run again with no bundle served into the page (production's own `index-BH7zOrId.js`), on a kept vmtest Win11 `--type system` guest on the released 0.4.141 (`vmtest-w-ins-sys-162509`), with `vmtest` at the console and `lock_on_end` pinned to `never` | **The live viewer does what the candidate did.** AC1: `touch-action: none`, and the drag's press and release reached the host 406 ms apart. With the legacy switch, the browser cancelled 78 ms in and the release went out at once, as in row 3. AC2: the tap is a left click, the long press and the two-finger tap are right clicks, the two-finger scroll is one wheel notch, and the pinch zoomed only the picture, from 394 to 1979 px wide. **Wrong turn:** a first pass read nothing on the host at all. A fresh system install starts at `lock_on_end=auto` (FR-99 P3c), so the console sat locked after the first session, under every probe. Pinned to `never` and rebooted, the second pass read everything |
+| 10 | 2026-10-17 | **AC3–AC5 on the live viewer.** Rows 5–8's cells, the same way: trackpad mode and the on-screen controls on the agent as it is, then again with `ROOMLERD_INPUT_MOUSE_REL=0` in its service environment (re-enrolled to restart), then the switch cleared | **The same, both ways.** With `mouse-rel`, ten `mouse_rel` frames of about 32 moved the host's cursor from x 640 to 1276, and the tap clicked where the pointer was. Without it, absolute frames moved it from 640 to 315, and the tap clicked at x 0.246. Every key of the three presets reached the host's probe window, chords in order, and the stick moved the cursor by `mouse_rel` and then by absolute frames. The preset was remembered across a reload, and `off` hid it |
+| 11 | 2026-10-17 | **Open decision 1, on a phone and on a tablet.** Row 9's guest, in Chromium's touch emulation with nothing remembered in the browser (`rc-touch-decisions.spec.ts`, `DECISION=1`). Production's viewer, then this change's bundle (`index-BzLyLHX2.js`) on a Pixel 7 (412×839) and on an iPad Mini (768×1024) | **A phone starts in trackpad mode, a tablet in direct.** Pixel 7: production's control read "Touch: direct", this bundle's "Touch: trackpad". iPad Mini: "Touch: direct". Nothing was remembered in any run |
+| 12 | 2026-10-17 | **Open decision 4: two fingers on a zoomed picture.** The same, `DECISION=4`, direct mode pinned in storage: a two-finger drag upwards while the picture fits, a pinch outwards past the stage, then the same drag again. Every input frame the page sent was counted, and the stage's scroll offsets read | **Zoomed, the drag pans the picture instead of scrolling the host.** While the picture fit, both builds sent one `mouse_wheel`, so the host scrolled. After the pinch (the picture 3222 px wide): production sent a `mouse_wheel` again and the stage stayed at 0,700; this bundle sent **nothing**, the stage panned from 0,700 to 0,820, and the pan hint showed |
 
 ## 9. Related
 
