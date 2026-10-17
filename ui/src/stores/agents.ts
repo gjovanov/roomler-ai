@@ -226,6 +226,14 @@ export interface AgentCapabilities {
   probe_ms?: number
   /** FR-77 P3 — the cells came from the daemon's probe cache (probe_ms is the cached probe's duration). */
   probe_cached?: boolean
+  /** FR-97 P0c — what this host cannot serve, and why: feature →
+   *  `{code, reason}`. Known features, matched by equality: 'audio',
+   *  'clipboard', 'clipboard-image-events', 'sas'. The lists above still
+   *  decide what works; this says why a control does not, and
+   *  `not-applicable` hides it. Absent on older agents, which never means
+   *  "unavailable". Read it through `utils/hostUnavailable`, never directly.
+   *  Mirrors `AgentCaps.unavailable`. */
+  unavailable?: Record<string, { code: string; reason: string }>
 }
 
 /** FR-77 — one encoder and the chroma formats it opened in. Wire strings:

@@ -284,15 +284,19 @@
            browser sees it, so expose an explicit toolbar button that
            emits the equivalent key sequence over the input DC.
            Visible at every viewport during a session — emergency-
-           recovery action, must not hide behind an extra tap. -->
+           recovery action, must not hide behind an extra tap.
+           FR-97 P0c — gone where the device says the chord means nothing
+           on its OS (a Mac), and its title carries what the keys can and
+           cannot do there. -->
       <v-btn
-        v-if="rc.phase.value === 'connected'"
+        v-if="rc.phase.value === 'connected' && sasOffered"
         icon
         variant="text"
         size="small"
         class="mr-1"
         aria-label="Send Ctrl+Alt+Del to remote"
-        title="Send Ctrl+Alt+Del (Ctrl+Alt+End over the viewer does the same)"
+        :title="sasTitle"
+        data-testid="rc-ctrl-alt-del"
         @click="rc.sendCtrlAltDel()"
       >
         <v-icon>mdi-keyboard-outline</v-icon>
@@ -2167,6 +2171,7 @@ import { pictureOverflows, stageTouchAction } from '@/composables/touchInput'
 import { BUILTIN_PRESETS, CONTROLS_STORAGE_PREFIX, presetById, readControlsPreset } from '@/composables/touchControls'
 import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 import { asSentence } from '@/utils/sentence'
+import { hostOffers, hostReason } from '@/utils/hostUnavailable'
 import { useCapabilitiesStore } from '@/stores/capabilities'
 import { api } from '@/api/client'
 import SessionRatingPrompt from '@/components/remote/SessionRatingPrompt.vue'
@@ -2253,8 +2258,24 @@ watch(
 // the reason in words, or null when the feature is there. Each greyed control
 // carries its own reason in its title.
 const filesRefusal = computed(() => featureRefusal(rc.featuresRefused.value, 'files'))
-const clipboardRefusal = computed(() => featureRefusal(rc.featuresRefused.value, 'clipboard'))
+// FR-97 P0c — the device's own "not here" (`AgentCaps.unavailable`) greys the
+// same controls. The session's refusal speaks first: it is about this session,
+// the device's about the host.
+const clipboardRefusal = computed(
+  () =>
+    featureRefusal(rc.featuresRefused.value, 'clipboard') ??
+    hostReason(agent.value?.capabilities, 'clipboard'),
+)
 const audioRefusal = computed(() => featureRefusal(rc.featuresRefused.value, 'audio'))
+// FR-97 P0c — the button types three ordinary keys. A Mac gives the chord no
+// meaning (`not-applicable`, so no button); Windows and Linux say what the
+// keys reach there, until FR-97 P4a sends the real secure attention sequence.
+const sasOffered = computed(() => hostOffers(agent.value?.capabilities, 'sas'))
+const sasTitle = computed(() => {
+  const base = 'Send Ctrl+Alt+Del (Ctrl+Alt+End over the viewer does the same).'
+  const why = hostReason(agent.value?.capabilities, 'sas')
+  return why ? `${base} ${why}` : base
+})
 // Said once as the session starts, so nobody has to find out by clicking.
 watch(
   () => rc.featuresRefused.value,
@@ -3033,7 +3054,12 @@ const audioTooltip = computed<string>(() => {
   // the toggle says.
   if (sessionLive.value && audioRefusal.value) return audioRefusal.value
   if (!agentSupportsAudio.value) {
-    return 'This agent does not advertise audio support (needs an agent built with the audio feature) — receive-audio unavailable'
+    // FR-97 P0c — the device says why, where it knows (no capture backend on
+    // its OS); an older agent leaves only the build to blame.
+    return (
+      hostReason(agent.value?.capabilities, 'audio') ??
+      'This agent does not advertise audio support (needs an agent built with the audio feature) — receive-audio unavailable'
+    )
   }
   if (sessionLive.value) {
     return audioOn.value
@@ -3074,8 +3100,12 @@ const clipboardAutoSyncTooltip = computed<string>(() => {
   if (!clipboardAutoSyncOn.value) {
     return 'Clipboard auto-sync OFF — use the toolbar buttons to send/get the clipboard manually.'
   }
-  const base =
-    'Clipboard auto-sync ON — text and images you copy on either side sync automatically while this tab is focused. Turn off to use the manual toolbar buttons only.'
+  // FR-97 P0c — a host whose watcher does not report copied images says so,
+  // so the tooltip stops promising them.
+  const images = hostReason(agent.value?.capabilities, 'clipboard-image-events')
+  const base = images
+    ? `Clipboard auto-sync ON — text you copy on either side, and images you copy here, sync automatically while this tab is focused. ${images} Turn off to use the manual toolbar buttons only.`
+    : 'Clipboard auto-sync ON — text and images you copy on either side sync automatically while this tab is focused. Turn off to use the manual toolbar buttons only.'
   return rc.supportsClipboardEvents.value
     ? base
     : base +
