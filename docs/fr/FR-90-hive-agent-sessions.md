@@ -2483,6 +2483,8 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       AWS key until P7's federation, so it comes after.
     - **Windows:** `proxy` mode only, by a seeded guardrail.
 
+    *Confirmed 2026-10-17 by the operator: every position, as recommended. P3-1 may start.*
+
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
 default LLM route is `node`; the database is the brain's source of truth; session cards default to
