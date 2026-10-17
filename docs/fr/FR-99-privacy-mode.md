@@ -479,8 +479,10 @@ the machine it runs on would mute a developer's laptop.
   it unmuted once the next process starts. Red first: the same run against an agent without P4 leaves
   the endpoint unmuted under the curtain.
 - [ ] **AC11 (the default, P3c):** a fresh vmtest Win11 `--type system` install reads `lock_on_end` as
-  `auto` (`roomler config get lock_on_end`, as the console user), and a fresh `--type user` install reads
-  `never`. Red first: a fresh `--type system` install on 0.4.139 reads `never`.
+  `auto` (`roomler config ls --json`, as the console user, and the config file), and a fresh `--type user`
+  install reads `never`. Red first: a fresh `--type system` install on 0.4.139 reads `never` (§8 row 20).
+  *(Corrected after the merge: first written as `roomler config get`, a verb the CLI does not have; its
+  config verbs are `ls`, `set` and `clear`.)*
 
 ## 6. Decisions
 
@@ -539,6 +541,7 @@ weighed.
 | 17 | 2026-10-16 | **AC4, the green for its audit half (0.4.139).** The same guest as row 16, opted in; a curtain up through the viewer, then `Stop-Process -Force` on the session-1 worker | **The next worker reports the curtain the last one died holding.** Curtain up at 13:08:46.17Z, with its `on` row at 13:08:46.171Z. The kill at 13:09:02.391Z; the channel closed 257 ms later. The next worker started at 13:09:04, and the trail gained **`off {worker_exit}` at 13:09:06.098Z**, for the same session. The host's screenshot 2.6 s after the kill shows the desktop. While the worker restarted, the companion briefly read "Not enrolled yet" and "the Roomler service is not running", which is misleading for a two-second restart |
 | 18 | 2026-10-16 | **AC9, the red (0.4.138).** A fresh kept vmtest Win11 `--type system` guest pinned to the 0.4.138 MSI, with prod at `hosted-20261016-32a9095` (it carries #2280). The admin's ask was set as the device row sets it: `PUT /api/tenant/{tid}/agent/{aid}` with the whole `access_policy`, read, modified and written back, `lock_on_end: "always"`. The production viewer connected to the unlocked guest, held 20 s and disconnected. The oracles are LogonUI over SSH 15 s after the end and the session's `session_requested` audit row | **Asked, not honoured, and the audit says so.** The owner has no `lock_on_end` on this build (`unknown or non-editable config key`). After the session: LogonUI **0**, unlocked. The audit row: `lock_on_end: always`, **`lock_enforced: false`**. The `access_policy` was put back (`lock_on_end: null`) |
 | 19 | 2026-10-16 | **AC9, the green (0.4.139).** Row 16's guest, the owner's `lock_on_end` at `never` (read back from the daemon's config), the same ask and the same session | **The admin's ask is honoured.** After the session: LogonUI **1**, locked. The audit row: `lock_on_end: always`, **`lock_enforced: true`**. The `access_policy` was put back, and the guest was unlocked again through the viewer under `never` |
+| 20 | 2026-10-17 | **AC11, the red (0.4.139).** A fresh vmtest Win11 `--type system` install pinned to agent 0.4.139, with `vmtest` Active at the console. It was provisioned 2026-10-16 18:21–18:31Z (harness PASS 18/20) and read 2026-10-17 04:10Z, from the config file (as admin) and with `roomler config ls --json` run as the console user | **A new service install starts at `never`.** The file: `lock_on_end = "never"`; the daemon: `never`. The green is owed on 0.4.140, which carries P3c: a fresh `--type system` install should read `auto`, and a fresh `--type user` one `never` |
 
 Attended runs happen on the operator's spare box, never on a machine someone is using.
 
