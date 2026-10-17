@@ -1823,11 +1823,13 @@ FR's field-verification log ([FR-102 §8](fr/FR-102-growth-observability.md#8-fi
 The GitHub puller (P7a) is to be shown on production after the promote: for the first closed
 day after the roll, `growth_pulls github:<day>` is `ok` and its `by: repo` row's stars and forks
 equal `GET https://api.github.com/repos/gjovanov/roomler-ai` read in the same window, its
-`downloads` equals the sum of every published release asset's `download_count`, and the day
-after, the digest's `github.counters.stars_delta.day` is the difference of the two snapshots.
-The integration suite drives the puller and the readers against a fake GitHub — the window, the
-paging, the drafts, the token on every request, a refused token recorded per day, a gap read as
-`null` (`crates/tests/src/growth_github_tests.rs`).
+`downloads` equals the sum of `download_count` over the assets of every published **product**
+release (`agent-v`, `setup-v`, `tunnel-v`, `tunnel-wizard-v`) and its `helper_downloads` the same
+sum over every other published release, and the day after, the digest's
+`github.counters.stars_delta.day` is the difference of the two snapshots. The integration suite
+drives the puller and the readers against a fake GitHub — the window, the paging, the drafts, a
+helper release counted apart, the token on every request, a refused token recorded per day, a gap
+read as `null` (`crates/tests/src/growth_github_tests.rs`).
 
 The newsletter's webhook is to be shown on production to refuse a bad signature (control),
 and to record `delivered` and `bounce` for a test send with one forced bounce, the bounced
