@@ -5,9 +5,12 @@
   AC17).
 - The macOS exit, P1b (#2362), shipped in 0.4.141. Its pf-reference and Internet Sharing fix (#2377) rides 0.4.142.
   AC5 is field-verified on a candidate of that fix (§8); a check on the 0.4.142 release is owed.
-- P0d, the measurement, is in review: the native architecture in the hello, and `scripts/fr97-caps-census.sh`.
-  The count before P0c was taken on 2026-10-17 (§8, AC15).
-- P0c and P2–P7 are open.
+- P0d, the measurement, merged (#2397): the native architecture in the hello, and `scripts/fr97-caps-census.sh`.
+  It reaches the fleet with the next agent release and server promote. The count before P0c was taken on
+  2026-10-17 (§8, AC15).
+- P0c, honest caps (§3.3a), is in review: P0c-1 the map and the daemon's decision, P0c-2 the viewer and the
+  enroll dialog. P0c-3 (the netstack exit status) is measured first (D12).
+- P2–P7 are open.
 
 **Owner:** the agent on all
 three platforms; the network module for the route gate (P0b) ·
@@ -80,7 +83,7 @@ prevent, and the guard re-asserts it on every tick.
 - A restart does not heal it: `purge_split_default` runs at boot, then the runtime re-installs from the persisted
   `overlay_exit_node`.
 - Reach: a Mac running the opt-in root daemon whose operator sets `overlay_exit_node`. The key is not in
-  `DesiredConfig` (`crates/remote_control/src/models.rs:1996-1957`), so no server push can set it; a local
+  `DesiredConfig` (`crates/remote_control/src/models.rs:2437`), so no server push can set it; a local
   `sudo roomler config set` can, and so can an `exec` on the daemon's row. Once it lands, the control WS that the
   `exec` came in on is captured too, so the same channel cannot undo it.
 - `NetstackTun` inherits the same default. It installs no OS routes, so it cannot wedge, but `roomler status`
@@ -325,7 +328,7 @@ OS: FR-43's practice of keeping the decision out of `cfg(target_os)`.
 
 | Feature | When | What the hello says |
 |---|---|---|
-| `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:78`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:3060`); `unavailable.audio = no-backend` |
+| `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:78`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:3064`); `unavailable.audio = no-backend` |
 | `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:675`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone keeps image events (`clipboard.rs:817-822`) | `events` and `images` stay: text still syncs, and an image moves on request. `not-watched` |
 | `sas` | Windows | `keys-only`: the button types three ordinary keys, which apps on the desktop get and the lock screen does not. P4a's `SendSAS` replaces it with an `input: sas` word (D11) |

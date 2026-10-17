@@ -136,7 +136,7 @@ operator's to restore; the product's job is to say so.
 - Restoring the permission itself. A remote agent must not be able to grant
   itself screen capture, and nothing here tries.
 - Making `has_input_permission` track the OS rather than the build
-  (`encode/caps.rs:1654` records that gap). Same class, separate change.
+  (`encode/caps.rs:1779` records that gap). Same class, separate change.
 - Re-signing or pinning the macOS identity so TCC grants survive a
   certificate change. That is FR-7's ground, and the answer there is that a
   Developer ID move is a one-time cost.
