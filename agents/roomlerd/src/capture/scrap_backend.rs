@@ -221,9 +221,48 @@ impl ScrapCapture {
                 // off, in which case every tick captures exactly as before.
                 #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
                 let mut damage = super::x11_damage::DamageTracker::open();
+                // FR-108 P2 — the X11 capturer takes its size when it opens, so
+                // a display-match switch on the virtual desktop opens it again.
+                #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+                let mut seen_mode = crate::display_match::mode_generation();
+                #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+                let mut reopen_tried: Option<Instant> = None;
 
                 // Wait for capture requests.
                 while let Ok(res_tx) = cmd_rx.recv() {
+                    #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+                    {
+                        let now_mode = crate::display_match::mode_generation();
+                        if now_mode != seen_mode
+                            && reopen_tried.is_none_or(|t| t.elapsed() >= Duration::from_millis(500))
+                        {
+                            reopen_tried = Some(Instant::now());
+                            match Display::primary().and_then(Capturer::new) {
+                                Ok(c) => {
+                                    let (was_w, was_h) = (w, h);
+                                    w = c.width() as u32;
+                                    h = c.height() as u32;
+                                    native_w = w;
+                                    native_h = h;
+                                    cap = c;
+                                    damage = super::x11_damage::DamageTracker::open();
+                                    seen_mode = now_mode;
+                                    reopen_tried = None;
+                                    tracing::info!(
+                                        was_w,
+                                        was_h,
+                                        w,
+                                        h,
+                                        "capture: the display mode changed — opened again at the new size (FR-108 P2)"
+                                    );
+                                }
+                                Err(e) => tracing::warn!(
+                                    %e,
+                                    "capture: the display mode changed but the capturer did not open again — retrying"
+                                ),
+                            }
+                        }
+                    }
                     // Phase B (macOS) — re-open the CGDisplayStream at the
                     // encode box so CoreGraphics does the reduction on the GPU.
                     // Capturing native and CPU-resampling to the same size cost
