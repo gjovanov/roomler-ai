@@ -28,7 +28,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
   (`agents/roomlerd/src/peer.rs:4488-4483`); the ONLY hardware 4:4:4 path is
   `hevc_nvenc` with the RExt profile (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:698-715`),
   advertised by `hevc_chroma` iff the name is `hevc_nvenc` (`agents/roomlerd/src/encode/caps.rs:502-505`).
-- The picker (`ui/src/views/remote/RemoteControl.vue:2512-2578`) is a hard-coded list
+- The picker (`ui/src/views/remote/RemoteControl.vue:2533-2599`) is a hard-coded list
   — `auto / av1 / hevc / hevc-444 / vp9-444 / vp9-420 / h264` — English literals, no
   i18n, chroma inside the value. Its per-agent override allow-list omitted `hevc-444`
   (fixed in #1468 by making the list the single source the type derives from).

@@ -37,7 +37,7 @@ machine with its own tests).
 | a finger that moves more than 8 px | a left press where it landed, the moves, a release where it lifted ([`touchGestures.ts:37`](../ui/src/composables/touchGestures.ts#L37) `SLOP_PX`) |
 | a finger held still for 500 ms | a right click where it is ([`touchGestures.ts:39`](../ui/src/composables/touchGestures.ts#L39) `LONG_PRESS_MS`) |
 | two fingers lifted within 350 ms, unmoved | a right click between them ([`touchGestures.ts:42`](../ui/src/composables/touchGestures.ts#L42)) |
-| two fingers moving together | the wheel, one notch per 100 px the fingers travel. The picture follows the fingers, so fingers moving up scroll down. **While the picture is zoomed past the stage**, they pan the picture instead and a one-line hint says so; the host scrolls only once the picture fits (the operator's decision 4, 2026-10-17; [`RemoteControl.vue:3217`](../ui/src/views/remote/RemoteControl.vue#L3217) `onTwoFingerScroll`, [`touchInput.ts:104`](../ui/src/composables/touchInput.ts#L104) `pictureOverflows`) |
+| two fingers moving together | the wheel, one notch per 100 px the fingers travel. The picture follows the fingers, so fingers moving up scroll down. **While the picture is zoomed past the stage**, they pan the picture instead and a one-line hint says so; the host scrolls only once the picture fits (the operator's decision 4, 2026-10-17; [`RemoteControl.vue:3247`](../ui/src/views/remote/RemoteControl.vue#L3247) `onTwoFingerScroll`, [`touchInput.ts:104`](../ui/src/composables/touchInput.ts#L104) `pictureOverflows`) |
 | two fingers spreading or pinching | **nothing**: the viewer zooms its own picture around the point between the fingers |
 
 ```mermaid
@@ -59,7 +59,7 @@ stateDiagram-v2
 
 - **The zoom** switches the viewer to Custom zoom, starting from the size the picture is shown at, and scrolls
   the stage so the point between the fingers stays under them
-  ([`RemoteControl.vue:3189`](../ui/src/views/remote/RemoteControl.vue#L3189) `onPinchZoom`). Zooming
+  ([`RemoteControl.vue:3219`](../ui/src/views/remote/RemoteControl.vue#L3219) `onPinchZoom`). Zooming
   out and back in somewhere else is how a phone moves around a zoomed picture today (open decision 4 in the
   spec).
 - ⚠️ **The scroll goes out in whole steps.** The agent turns a `mouse_wheel` in pixels into wheel steps at
@@ -166,7 +166,7 @@ flowchart LR
   default is off.
 - **In fullscreen and in a zoomed picture.** The overlay lives inside the stage, which is the fullscreen
   element, and follows the stage's scroll, so it stays over the part of the picture on screen
-  ([`RemoteControl.vue:3173`](../ui/src/views/remote/RemoteControl.vue#L3173) `onStageScroll`).
+  ([`RemoteControl.vue:3203`](../ui/src/views/remote/RemoteControl.vue#L3203) `onStageScroll`).
 - ⚠️ **Alt+Tab is the host's own chord.** On a Windows host it opens the task switcher and moves the focus,
   as the physical keys do. On a Mac host it is Option+Tab, not the app switcher (Cmd+Tab). A preset cannot
   bind a chord per host OS until P4's editor.
@@ -194,7 +194,7 @@ sequenceDiagram
 ```
 
 - The stage sets `touch-action: none`
-  ([`RemoteControl.vue:1048`](../ui/src/views/remote/RemoteControl.vue#L1048), decided by
+  ([`RemoteControl.vue:1052`](../ui/src/views/remote/RemoteControl.vue#L1052), decided by
   [`touchInput.ts:17`](../ui/src/composables/touchInput.ts#L17) `stageTouchAction`). The browser no longer
   pans or zooms the page under a finger on the picture, and the page around the stage still scrolls as usual.
 - **A cancelled pointer still lets go.** A cancelled drag is released at its last point; a press the gestures

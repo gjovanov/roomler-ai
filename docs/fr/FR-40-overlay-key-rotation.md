@@ -52,7 +52,7 @@ additionally refuses a registration whose pubkey is not the row's (`derp.rs:339-
 | the push precedent | `crates/api/src/routes/remote_control.rs:831-872` (`trigger_agent_update`, `MANAGE_AGENTS`, `Hub::send_to_agent`), agent arm `signaling.rs:2740-2762` (primary-only) | `UpdateNow` is sent BLIND — no cap gate |
 | the report-back precedent | `ClientMsg::ConfigStatus` (`signaling.rs:461`), `record_config_report` (`ws/remote_control.rs:940-985`), `config_audit` (`models.rs:2357-2343`) | the shape to copy: revision-bumped request, device reports the revision, server resolves ONE state |
 | capability verbs | `crates/remote_control/src/models.rs:271-379` | `RpcCap` — no rotation verb exists |
-| UI | `ui/src/components/admin/AgentsSection.vue:1884-1906`, `ui/src/stores/agents.ts:688-696` | "Update now"; **no view shows the overlay public key anywhere** |
+| UI | `ui/src/components/admin/AgentsSection.vue:1884-1906`, `ui/src/stores/agents.ts:696-704` | "Update now"; **no view shows the overlay public key anywhere** |
 | retired keys | — | none: `wg_key_taken_by_other` is live-scoped, a tombstone's key neither blocks nor denies |
 
 ## Design
