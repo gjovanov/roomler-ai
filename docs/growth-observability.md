@@ -1944,8 +1944,10 @@ field, or ended before the observation landed — is `unknown`, **never read as 
   channel for a supervised Mac's delegated one, so the sample carries the daemon's identity, the one
   the session row has), so a session that **outlives** the observation records its carrier whatever
   its length. Only a session that **ends before** the observation lands records `unknown`: a pair
-  was nominated, but the settle read that names the carrier never ran. Needs an agent carrying P9d
-  to take effect; before it, short sessions read `unknown`.
+  was nominated, but the settle read that names the carrier never ran. It takes effect from agent
+  **0.4.142** on; before it, short sessions read `unknown`. On production after 0.4.142's
+  publication, every one of the 16 Active sessions shorter than 30 s carried a carrier, sessions of
+  4–5 s included (FR-102 §8).
 - **The daily digest's `quality` section** adds, live from the kept rows: `requested`,
   `reached_active`, `not_reached` and `reached_share`, `duration_ms` / `peak_fps` /
   `avg_rtt_ms` as `{day, d7, d28}` of `{n, p50, p90}`, `device_days` and
