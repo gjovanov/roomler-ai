@@ -507,6 +507,10 @@ const RELAY_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 /// How often the carrier-health sweep runs. Cheap (lock-free atomic reads), so
 /// a tighter cadence is fine and makes detection quicker.
 const FALLBACK_TICK: Duration = Duration::from_secs(5);
+/// FR-97 P3i — how often the host firewall is asked again what it lets a mesh
+/// peer reach on the adapter. Zones and rules change by hand and rarely; the
+/// sweep's view publish (every [`FALLBACK_TICK`]) carries a new answer out.
+const HOST_FIREWALL_REPROBE: Duration = Duration::from_secs(600);
 /// #26 — after a netstate MAJOR arms the forced revalidation pokes, pull the
 /// next fallback tick forward to just past
 /// [`lifecycle::MAJOR_POKE_DEADLINE`] instead of letting it land wherever
@@ -1312,6 +1316,11 @@ pub struct OverlayRuntime {
     /// silently on 2026-08-06 because both failure paths only logged at
     /// `debug!`.
     srflx_status: Option<crate::localapi::SrflxStatus>,
+    /// FR-97 P3i — what the host's firewall lets a mesh peer reach on this
+    /// runtime's adapter. Written by the probe task [`run`](Self::run) starts
+    /// once the adapter exists (at once, then every ten minutes), read into
+    /// every published view; shared because that task is not the run loop.
+    host_firewall: Arc<std::sync::Mutex<Option<crate::localapi::HostFirewallStatus>>>,
     /// C4 stage 1 — the warm allocation's state, published into
     /// [`OverlayView::warm_relay`](crate::localapi::OverlayView) on every
     /// view publish. `None` while the feature is off.
@@ -1473,6 +1482,7 @@ fn build_overlay_view(
         // and DNS bring-up state (S2).
         exit_node: None,
         route_offer_withheld: None,
+        host_firewall: None,
         dns: None,
         srflx: None,
         warm_relay: None,
@@ -1531,6 +1541,7 @@ impl OverlayRuntime {
             path_shadow: std::sync::Mutex::new(PathShadow::new()),
             dns_status: None,
             srflx_status: None,
+            host_firewall: Default::default(),
             warm_relay_status: None,
             carrier_plane: None,
             disco_rounds: std::sync::atomic::AtomicU64::new(0),
@@ -1565,6 +1576,7 @@ impl OverlayRuntime {
             path_shadow: std::sync::Mutex::new(PathShadow::new()),
             dns_status: None,
             srflx_status: None,
+            host_firewall: Default::default(),
             warm_relay_status: None,
             carrier_plane: None,
             disco_rounds: std::sync::atomic::AtomicU64::new(0),
@@ -1941,6 +1953,12 @@ impl OverlayRuntime {
             } else {
                 wg.direct_sock_stats()
             };
+            // FR-97 P3i — the host firewall's word on the adapter, as last probed.
+            view.host_firewall = self
+                .host_firewall
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             // #32 — the `/derp` inbound-drop counters, so an operator can ask
             // "is a peer relaying to us that we have not followed?" instead of
             // inferring it from an absence of log lines. Process-global (see
@@ -2130,6 +2148,24 @@ impl OverlayRuntime {
             }
         };
         info!(%self_v4, mtu = self.mtu, "overlay: TUN up");
+
+        // FR-97 P3i — what the host's firewall lets a mesh peer reach on this
+        // adapter: probed now and every ten minutes, off the run loop, into the
+        // slot every published view reads. It dies with the runtime. A device
+        // with no OS surface (netstack, mocks) has no adapter to govern.
+        // `ROOMLERD_HOST_FW_PROBE=0` switches it off.
+        let probe_host_firewall = crate::env::flag("HOST_FW_PROBE", true);
+        let _host_firewall_probe = tun.os_name().filter(|_| probe_host_firewall).map(|ifname| {
+            let slot = self.host_firewall.clone();
+            crate::driver::AbortOnDrop::new(tokio::spawn(async move {
+                let mut every = tokio::time::interval(HOST_FIREWALL_REPROBE);
+                loop {
+                    every.tick().await;
+                    let status = super::hostfw::probe(&ifname).await;
+                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = status;
+                }
+            }))
+        });
 
         // Phase 1 — if this node advertises subnet routes, turn on IP forwarding
         // + NAT so overlay peers can reach the LANs it fronts. Held for the

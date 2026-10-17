@@ -2230,6 +2230,11 @@ fn print_status(s: &NodeStatus) {
     if let Some(why) = &s.route_offer_withheld {
         println!("  routes      offer withheld — {why}");
     }
+    // FR-97 P3i — said only when the host's firewall limits what a mesh peer
+    // reaches here, so an open host's output is unchanged.
+    if let Some(line) = s.host_firewall.as_ref().and_then(host_firewall_line) {
+        println!("  host fw     {line}");
+    }
     // S2 — MagicDNS status (only when the tenant has a magic domain and the
     // overlay published it). "resolver down" / "OS steer failed" are the two
     // states worth an operator's eye.
@@ -2566,6 +2571,29 @@ fn exit_node_state(ex: &tunnel_core::localapi::ExitNodeStatus) -> String {
         "DNS NOT steered"
     };
     format!("active, {v6}, {dns}")
+}
+
+/// FR-97 P3i — the `host fw` line: what the host's own firewall lets a mesh
+/// peer reach on this node's overlay address, or `None` when it admits
+/// everything there. Carriers are not in it: they pass a host firewall
+/// through conntrack (FR-97 §8). A service the line does not name is refused.
+fn host_firewall_line(fw: &tunnel_core::localapi::HostFirewallStatus) -> Option<String> {
+    if fw.admits_all {
+        return None;
+    }
+    let reach = if fw.admits.is_empty() {
+        "mesh peers reach nothing here".to_string()
+    } else {
+        format!("mesh peers reach only {} here", fw.admits.join(", "))
+    };
+    Some(match fw.zone.as_deref() {
+        Some(zone) if fw.zone_is_default => format!(
+            "{} has {} in no zone, so the default zone {zone} applies: {reach}",
+            fw.kind, fw.interface
+        ),
+        Some(zone) => format!("{} has {} in zone {zone}: {reach}", fw.kind, fw.interface),
+        None => format!("{} limits incoming on {}: {reach}", fw.kind, fw.interface),
+    })
 }
 
 fn unix_now() -> i64 {
@@ -3185,6 +3213,53 @@ mod tests {
             exit_node_state(&withheld),
             "withheld — exit node has no live carrier yet"
         );
+    }
+
+    /// FR-97 P3i — the `host fw` line names what governs the adapter and what
+    /// it admits, and says nothing when the firewall admits everything there.
+    #[test]
+    fn the_host_firewall_line_says_what_a_mesh_peer_reaches() {
+        let public = tunnel_core::localapi::HostFirewallStatus {
+            kind: "firewalld".into(),
+            interface: "roomler0".into(),
+            zone: Some("public".into()),
+            zone_is_default: true,
+            admits_all: false,
+            admits: vec!["dhcpv6-client".into(), "ssh".into()],
+        };
+        assert_eq!(
+            host_firewall_line(&public).as_deref(),
+            Some(
+                "firewalld has roomler0 in no zone, so the default zone public applies: \
+                 mesh peers reach only dhcpv6-client, ssh here"
+            )
+        );
+        let work = tunnel_core::localapi::HostFirewallStatus {
+            zone: Some("work".into()),
+            zone_is_default: false,
+            admits: Vec::new(),
+            ..public.clone()
+        };
+        assert_eq!(
+            host_firewall_line(&work).as_deref(),
+            Some("firewalld has roomler0 in zone work: mesh peers reach nothing here")
+        );
+        let ufw = tunnel_core::localapi::HostFirewallStatus {
+            kind: "ufw".into(),
+            zone: None,
+            zone_is_default: false,
+            admits: vec!["22/tcp".into()],
+            ..public.clone()
+        };
+        assert_eq!(
+            host_firewall_line(&ufw).as_deref(),
+            Some("ufw limits incoming on roomler0: mesh peers reach only 22/tcp here")
+        );
+        let trusted = tunnel_core::localapi::HostFirewallStatus {
+            admits_all: true,
+            ..public
+        };
+        assert_eq!(host_firewall_line(&trusted), None);
     }
 
     /// FR-103 — the credential line is relative, and an expired token says

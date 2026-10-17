@@ -107,6 +107,38 @@ pub struct ExitNodeStatus {
     pub socks5_port: Option<u16>,
 }
 
+/// FR-97 P3i — what the host's own firewall lets a mesh peer reach on this
+/// node's overlay address.
+///
+/// Measured (FR-97 §8): carriers pass a host firewall, because hole-punched
+/// and LAN-direct paths both ride conntrack, but the overlay adapter falls
+/// under the firewall's default zone or default incoming policy, so a service
+/// on the overlay address is refused unless the firewall admits it. The daemon
+/// leaves the firewall to the host's owner and reports what governs the
+/// adapter, so a refused connection has a stated cause.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HostFirewallStatus {
+    /// `firewalld` or `ufw`.
+    pub kind: String,
+    /// The overlay adapter this describes (`roomler0`).
+    pub interface: String,
+    /// firewalld: the zone that governs the adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    /// firewalld: the adapter is in no zone, so the default zone governs it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub zone_is_default: bool,
+    /// Every inbound connection on the adapter is accepted: a zone whose
+    /// target is `ACCEPT`, ufw allowing incoming by default, or a ufw rule
+    /// open to anything on the adapter.
+    pub admits_all: bool,
+    /// Otherwise what it admits, as the firewall names it: firewalld services,
+    /// ports, protocols and a count of rich rules; ufw's incoming ALLOW rules
+    /// that apply to the adapter. Empty = nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admits: Vec<String>,
+}
+
 /// Snapshot of the local node.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct NodeStatus {
@@ -148,6 +180,12 @@ pub struct NodeStatus {
     /// ways: an older daemon omits it, an older CLI ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_offer_withheld: Option<String>,
+    /// FR-97 P3i — what the host's own firewall lets a mesh peer reach on this
+    /// node's overlay address, copied from [`OverlayView::host_firewall`].
+    /// `None` when no firewalld or ufw is active (or the daemon cannot ask),
+    /// and from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_firewall: Option<HostFirewallStatus>,
     /// S1b — the config file this daemon actually LOADED. Ends the desktop's
     /// guessing game about which of the per-user / machine-global copies is
     /// live (their resolution ladders disagreed for plain-SCM installs).
@@ -2247,6 +2285,11 @@ pub struct OverlayView {
     /// by the overlay runtime. The daemon copies it verbatim into
     /// [`NodeStatus::route_offer_withheld`].
     pub route_offer_withheld: Option<String>,
+    /// FR-97 P3i — what the host's firewall lets a mesh peer reach on this
+    /// node's overlay adapter, probed by the overlay runtime at bring-up and
+    /// every ten minutes. The daemon copies it verbatim into
+    /// [`NodeStatus::host_firewall`].
+    pub host_firewall: Option<HostFirewallStatus>,
     /// S2 — MagicDNS status, filled by the overlay runtime after its DNS
     /// bring-up. `None` when MagicDNS is off. The daemon copies it
     /// verbatim into [`NodeStatus::dns`].
@@ -4753,6 +4796,7 @@ mod tests {
                 ephemeral: false,
                 exit_node: None,
                 route_offer_withheld: None,
+                host_firewall: None,
                 config_path: None,
                 dns: None,
                 srflx: None,

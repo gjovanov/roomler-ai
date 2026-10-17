@@ -531,6 +531,70 @@ found no naturally-occurring both-UDP-blocked pair. DERP exists for the strictly
 harder network where the only thing that survives is TCP/443-TLS. It was built
 for **completeness of the solution**, not because demand forced it.
 
+### The node's own firewall (FR-97 P3i)
+
+The networks above sit between two nodes. A Linux node can also run a host
+firewall of its own, firewalld or ufw. Measured on 2026-10-17 (FR-97 §8), it
+affects the mesh in one way only.
+
+| What crosses it | Behind firewalld | Why |
+|---|---|---|
+| A hole-punched carrier | ✅ passes (a Fedora host, zone `FedoraServer`) | direct carriers initiate bilaterally (UC-1): each side's outbound probe makes the conntrack entry that lets the other side's reply in |
+| A LAN-direct carrier | ✅ passes (`tier=Lan`, 497 ms; zone `public`) | the same |
+| A service on the node's overlay address | ❌ refused unless the zone admits it | the overlay adapter is in no zone, so the default zone governs it |
+| Roomler's own services | ✅ untouched | roomler SSH is intercepted below the OS; exec, remote control and tunnels ride the daemon's own connections |
+
+```mermaid
+flowchart LR
+    P["a packet for this node's<br/>overlay address"] --> A{"arrives on roomler0"}
+    A -->|"a reply to our own probe"| C["conntrack: accepted<br/>(carriers keep working)"]
+    A -->|"a new connection to a service"| Z{"the zone governing roomler0<br/>(no zone = the default zone)"}
+    Z -->|"its services / ports"| OK["accepted"]
+    Z -->|"anything else"| NO["refused<br/>(rc 7 at the client)"]
+```
+
+**The daemon reports this and never changes it** (FR-97 D13). The firewall
+belongs to the host's owner, and putting the adapter in a trusting zone would
+open every service on the host to every peer the overlay ACL admits. What it
+does instead:
+
+- The overlay runtime asks firewalld, then ufw, what governs its adapter,
+  once the adapter is up and every ten minutes
+  ([`runtime.rs:2158`](../crates/tunnel-core/src/overlay/runtime.rs#L2158),
+  [`hostfw.rs:220`](../crates/tunnel-core/src/overlay/hostfw.rs#L220)), off
+  the run loop.
+- The answer is `HostFirewallStatus`
+  ([`lib.rs:120`](../crates/localapi/src/lib.rs#L120)), parsed from
+  `firewall-cmd --info-zone` ([`hostfw.rs:45`](../crates/tunnel-core/src/overlay/hostfw.rs#L45))
+  or `ufw status verbose` ([`hostfw.rs:130`](../crates/tunnel-core/src/overlay/hostfw.rs#L130)).
+- `roomler status` prints it only when the firewall limits what a mesh peer
+  reaches ([`localclient.rs:2580`](../agents/roomler-cli/src/localclient.rs#L2580)):
+
+  ```text
+    host fw     firewalld has roomler0 in no zone, so the default zone public applies: mesh peers reach only dhcpv6-client, ssh here
+  ```
+
+To open the mesh, the owner runs one of these. Measured: the overlay address
+answered while the LAN address stayed as its zone said.
+
+```bash
+sudo firewall-cmd --zone=trusted --add-interface=roomler0              # until firewalld reloads
+sudo firewall-cmd --permanent --zone=trusted --add-interface=roomler0  # and after
+sudo ufw allow in on roomler0
+```
+
+⚠️ **`trusted` admits every port to every peer the overlay ACL admits.** A
+narrower zone, or `--add-port` on the governing one, opens less.
+
+⚠️ **Rich rules and source-bound zones are not interpreted.** The status counts
+a zone's rich rules ("2 rich rules") rather than guessing what they admit, and
+a zone bound to a source range can admit more than the interface's zone says.
+
+⚠️ **ufw needs root to answer**, so a per-user daemon reports no ufw line rather
+than a guess. `ROOMLERD_HOST_FW_PROBE=0` switches the probe off. macOS's
+Application Firewall is not asked: it passes forwarded traffic and filters per
+application ([`overlay-exit-nodes.md`](overlay-exit-nodes.md)).
+
 ---
 
 ## 6. DERP in detail
