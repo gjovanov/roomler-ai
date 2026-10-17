@@ -162,6 +162,10 @@ enum Member {
         session: String,
         reply: Reply<u64>,
     },
+    PurgeCopy {
+        session: String,
+        reply: Reply<u64>,
+    },
     IsPurged {
         session: String,
         reply: Reply<bool>,
@@ -622,6 +626,14 @@ impl StoreHandle {
         self.ask(|reply| Member::Purge { session, reply }).await
     }
 
+    /// FR-90 P2k-3 — purge this device's copy of `session` as a leaving
+    /// member's, keeping nothing of it, its id included; how many events
+    /// were removed.
+    pub(crate) async fn purge_copy(&self, session: &str) -> Result<u64, WriterError> {
+        let session = session.to_string();
+        self.ask(|reply| Member::PurgeCopy { session, reply }).await
+    }
+
     /// Whether `session` was purged here.
     pub(crate) async fn is_purged(&self, session: &str) -> Result<bool, WriterError> {
         let session = session.to_string();
@@ -1007,6 +1019,9 @@ fn member(store: &mut Store, publish: &broadcast::Sender<Arc<EventEnvelope>>, cm
         }
         Member::Purge { session, reply } => {
             let _ = reply.send(store.purge(&session));
+        }
+        Member::PurgeCopy { session, reply } => {
+            let _ = reply.send(store.purge_copy(&session));
         }
         Member::IsPurged { session, reply } => {
             let _ = reply.send(store.is_purged(&session));

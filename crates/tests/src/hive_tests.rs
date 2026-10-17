@@ -11069,6 +11069,10 @@ async fn a_purge_issued_while_a_member_is_offline_is_applied_when_it_connects() 
         .expect("the primary's purge");
     assert_eq!(told["purge_id"], purge, "{told}");
     assert_eq!(told["session_id"], sid, "{told}");
+    assert!(
+        told.get("leaving").is_none(),
+        "a whole session's purge carries no leaving word (P2k-3): {told}"
+    );
 
     // Gone for its owner at once: the session, its listing, its room.
     assert_eq!(get_session(&app, &tid, &admin, &sid).await.0, 404);
@@ -12280,6 +12284,10 @@ async fn a_member_a_smaller_policy_lets_go_is_purged_at_once() {
         .await
         .expect("the member that leaves hears its purge");
     assert_eq!(told["session_id"], sid, "{told}");
+    assert_eq!(
+        told["leaving"], true,
+        "its copy alone, which is not final on the device (P2k-3): {told}"
+    );
     let purge = told["purge_id"].as_str().unwrap().to_string();
     assert_eq!(
         purging_of(&app, &sid, &gone.agent_id).await.as_deref(),
@@ -12330,6 +12338,51 @@ async fn a_member_a_smaller_policy_lets_go_is_purged_at_once() {
             ("issued".to_string(), Some("leaving".to_string())),
             ("complete".to_string(), Some("leaving".to_string())),
         ]
+    );
+}
+
+/// FR-90 P2k-3 — a leaving member's purge issued on one pod reaches its
+/// device on the other still saying `leaving`: the pod that holds the socket
+/// builds the frame from the purge's envelope, so the device keeps no id
+/// there either.
+#[tokio::test]
+async fn a_leaving_members_purge_from_the_other_pod_still_says_so() {
+    let (app1, app2) = TestApp::spawn_pair(replicaset_settings).await;
+    if app1.state.redis_pubsub.is_none() || app2.state.redis_pubsub.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    // The members' sockets, and the session, are on pod 1.
+    let mut p = purgeable(&app1, "leave-xpod", &[PURGES, PURGES]).await;
+    let (tid, admin, sid) = (p.tid.clone(), p.admin.clone(), p.sid.clone());
+    for m in &mut p.members {
+        send(&mut m.ws, tip_at(&sid, 1, 3, "ab")).await;
+    }
+    for m in &p.members {
+        let id = m.agent_id.clone();
+        wait_stored(&app1, &sid, "each member's tip", |s| {
+            member_row(s, &id).contains_key("tip")
+        })
+        .await;
+    }
+
+    // The smaller policy lands on pod 2, which holds no socket of theirs.
+    let (code, body) = put_policy(&app2, &tid, &admin, &policy_min(2, 1)).await;
+    assert_eq!(code, 200, "{body}");
+    let s = stored(&app1, &sid).await;
+    let i = p
+        .members
+        .iter()
+        .position(|m| stored_member(&s, &m.agent_id).1 == "leaving")
+        .expect("one member leaves");
+    let mut gone = p.members.remove(i);
+    let told = read_until(&mut gone.ws, "rc:hive.purge")
+        .await
+        .expect("the member that leaves hears its purge, from the other pod");
+    assert_eq!(told["session_id"], sid, "{told}");
+    assert_eq!(
+        told["leaving"], true,
+        "its copy alone, from the other pod too: {told}"
     );
 }
 
