@@ -149,6 +149,19 @@ A secondary organization's goodbye ends only that organization's loop, and nothi
 
 > ⚠️ Never answer a removal with `roomlerd run` on a host whose daemon a service manager owns. By hand it starts an unmanaged orphan beside the unit, the task or launchd. `re-enroll` suggested exactly that until #2293.
 
+A first `roomlerd enroll` ends the same way, by naming the step that connects the new enrollment on its install (`Install::after_enroll`, #2371). A fresh primary may land on a daemon that is stopped, crash-looping on its missing config, or running, so each step works in all three states:
+
+| Install | After `roomlerd enroll` |
+|---|---|
+| Linux, the system unit | `sudo systemctl restart roomlerd` |
+| Linux, the user unit | `roomlerd service start` (`roomlerd service install` also starts it at every login), or `roomler restart` if it is running |
+| Windows, the `Roomler` service | the supervisor picks the config up within a minute, or `roomler restart` |
+| Windows, the per-user task | `roomlerd service start` (`roomlerd service install` first if there is no task), or `roomler restart` |
+| macOS | launchd picks it up within seconds, or `roomler restart` |
+| an added organization (`[[orgs]]`), any install | a daemon restart, since only a restart starts its loop |
+
+`roomlerd run` is named last, for a host without the package.
+
 > ⚠️ Linux's "start it again" is not new. Before #2267 the same exit happened at the device's next connection, so a remove → `re-enroll` sequence kept running without a start only while the socket happened to stay up between the two steps.
 
 > ⚠️ A device is told only on a socket it holds. One that is offline at its removal hears it at its next connection, as before.

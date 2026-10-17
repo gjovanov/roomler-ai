@@ -2561,7 +2561,17 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         }
     }
     println!("Config written to: {}", target_path.display());
-    println!("Run `roomlerd run` (or restart the service) to connect.");
+    // #2371 — the step that connects THIS enrollment on this install: the
+    // service manager's (`roomlerd run` beside one is an orphan), and for an
+    // added org a restart, since only a restart starts its loop.
+    let secondary = matches!(
+        outcome,
+        EnrollOutcome::RefreshedOrg { .. } | EnrollOutcome::AppendedOrg { .. }
+    );
+    println!(
+        "{}",
+        service::Install::detect(&target_path).after_enroll(secondary)
+    );
 
     // rc.53 Phase 7: WINHOST-B's recurring pain — operator runs
     // `enroll --machine-global` from a user PowerShell, the config
