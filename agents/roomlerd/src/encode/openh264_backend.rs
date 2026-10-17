@@ -144,6 +144,10 @@ impl Openh264Encoder {
         thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
+                // FR-112 P1 — this thread encodes every frame; ask for its clock
+                // first (a 30 fps encoder is otherwise clocked down to fill its
+                // period: 16 ms a frame live against 5 with the clock).
+                crate::encode::clock::ask_for_this_thread("openh264");
                 let init = || -> Result<Encoder> {
                     let api = openh264::OpenH264API::from_source();
                     let cfg = make_config();

@@ -55,6 +55,9 @@ pub mod ffmpeg;
 pub mod aimd;
 /// FR-35 — the constrained ceiling learns the pair (pure controller).
 pub mod ceiling_learn;
+/// FR-112 P1 — an encoding thread asks the scheduler for its clock (a Linux
+/// utilisation clamp): a periodic encoder is otherwise parked on a slow core.
+pub mod clock;
 /// FR-79 — the validity gate every estimator consumes: was this window
 /// evidence about the PIPE? (pure; no clock, no I/O, and no kill switch —
 /// it replaced three).
@@ -695,6 +698,37 @@ pub(crate) fn initial_bitrate_for_fps(width: u32, height: u32, fps: u32) -> u32 
     let raw = (pixels * fps as f64 * DESKTOP_BPP_PER_SECOND) as u32;
     raw.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
 }
+
+/// FR-112 P2 — the bitrate base for a software pump running at `fps`: today's
+/// 30 fps figure, scaled by √(fps/30) rather than linearly. At 60 a moving
+/// window travels half as far between frames, so a frame needs fewer bits than
+/// at 30; and a base computed for 60 while the encoder is paced to 30 would
+/// double every frame's bits (FR-112 §2: the 60 target took the VP9 ceiling from
+/// 17.5 to 30.4 Mbps and bought nothing). At 30 it is exactly today's.
+#[cfg_attr(not(feature = "vp9-444"), allow(dead_code))]
+pub(crate) fn bitrate_base_for_fps(width: u32, height: u32, fps: u32) -> u32 {
+    let at_30 = initial_bitrate_for_fps(width, height, 30) as f64;
+    let scaled = at_30 * (fps.max(1) as f64 / 30.0).sqrt();
+    (scaled.round() as u32).clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
+}
+
+/// FR-112 P2 — software encoders target 60 fps, paced down to what the encoder
+/// sustains (`FpsPace`, fed by the pump's `avg_encode_ms`), with the bitrate
+/// base following the rate they actually run at. Default **on for Linux**,
+/// where the encoder asks for its clock (P1) and the tier was measured;
+/// Windows and macOS opt in with `ROOMLERD_SW_FPS_60=1` until P3 measures them
+/// on their own hardware (60 frames cost twice the CPU of 30 on a host whose
+/// clock was never the limit, and an attended desktop pays for it).
+/// `ROOMLERD_SW_FPS_60=0` restores 0.4.141's 30 fps and its base.
+#[cfg_attr(not(feature = "vp9-444"), allow(dead_code))]
+pub fn sw_fps_60_enabled() -> bool {
+    tunnel_core::env::flag("SW_FPS_60", cfg!(target_os = "linux"))
+}
+
+/// FR-112 P2 — 0.4.141's software target, and the floor of the software tier's
+/// pace: a software pump is never paced below it, so a host that cannot
+/// sustain 30 runs exactly as it did (`RateGovernor::paced_software_fps`).
+pub const SW_PACE_FLOOR_FPS: u32 = 30;
 
 /// True when the ICE transport is forced to a TURN relay — on TCP (WSL,
 /// corp-UDP-blocked nets) that path is bandwidth- + head-of-line-constrained.
@@ -1515,6 +1549,30 @@ fn hw_auto_disabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-112 P2 — at 30 the base is exactly today's; at 60 it grows by √2,
+    /// not 2×; it never leaves the bitrate bounds.
+    #[test]
+    fn the_software_base_is_todays_at_30_and_grows_by_root_two_at_60() {
+        let (w, h) = (2048, 1080);
+        assert_eq!(
+            bitrate_base_for_fps(w, h, 30),
+            initial_bitrate_for_fps(w, h, 30)
+        );
+        let at_60 = bitrate_base_for_fps(w, h, 60) as f64;
+        let at_30 = initial_bitrate_for_fps(w, h, 30) as f64;
+        assert!(
+            (at_60 / at_30 - 2f64.sqrt()).abs() < 1e-3,
+            "×√2, got ×{}",
+            at_60 / at_30
+        );
+        assert!(
+            bitrate_base_for_fps(w, h, 60) < initial_bitrate_for_fps(w, h, 60),
+            "below the linear base that starved the encoder"
+        );
+        assert_eq!(bitrate_base_for_fps(7680, 4320, 60), MAX_BITRATE_BPS);
+        assert_eq!(bitrate_base_for_fps(320, 240, 15), MIN_BITRATE_BPS);
+    }
 
     /// #2283: only Auto drops the GPU-less software MFT, and only for
     /// OpenH264. A hardware MFT, a fallback that took the D3D manager, an
