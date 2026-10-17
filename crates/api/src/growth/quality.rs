@@ -12,7 +12,8 @@
 //! Three of the four sources expire. `agent_logs` — where the browser's
 //! `rc.connect` record carries `ttff_ms` (FR-22 part 4) and where an agent's
 //! own batches say which version it ran — live **7 days**; `agent_crashes`
-//! 90; `stats_machine_1d` 730. Only `remote_sessions` is kept. So a nightly
+//! 90; `stats_machine_1d` 730; `remote_sessions` 25 months (its TTL since
+//! 2026-10-17, `RemoteSession::TTL_SECONDS`). So a nightly
 //! job (under the org-day fold's claim, [`super::org_daily`]) reads the last
 //! three closed days and writes one row per `(day, scope, agent_version)`
 //! into `growth_quality_daily` ([`GrowthQualityDao`]). Once the logs are

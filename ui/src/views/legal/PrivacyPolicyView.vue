@@ -90,7 +90,8 @@
             When you enroll a device, we store a record of it so it can be addressed on your private network and
             shown in your workspace: a machine identifier, the device name you choose, its operating system,
             the agent version, its assigned address on the private network, its public key for the encrypted
-            network, and which user enrolled and owns it. The agent reports periodic status so the workspace can
+            network, which user enrolled and owns it, and how it was installed (the setup wizard, an install
+            script or by hand, and for the whole machine or one user). The agent reports periodic status so the workspace can
             show whether a device is online, together with capability information (for example which video
             encoders and displays it has).
           </p>
@@ -100,8 +101,10 @@
             To connect two devices directly wherever possible, the agent and our servers exchange candidate
             network addresses — including public and local IP addresses and ports — and measurements about which
             paths work. We keep connection diagnostics (which route was chosen, latency, packet loss, whether a
-            relay was needed) to operate the network and to investigate faults. This is metadata about
-            connections; it is not the contents of them.
+            relay was needed) to operate the network and to investigate faults. For a remote-desktop session we
+            also note the kind of path it used — direct, through a relay, or through the private network — with
+            the session's own record, and we count sessions by path, per day and without naming anyone, to
+            measure remote-desktop quality. This is metadata about connections; it is not the contents of them.
           </p>
 
           <h3 class="text-h6 font-weight-bold mb-2">2.10 Access and Audit Records</h3>
@@ -346,9 +349,10 @@
           <ul class="text-body-1 legal-muted ml-6 mb-2">
             <li class="mb-1">Chat message history is retained according to your workspace plan limits.</li>
             <li class="mb-1">Files are retained until deleted by you or a workspace administrator; call recordings according to your workspace settings.</li>
-            <li class="mb-1">Access and audit records — remote sessions, command execution, SSH decisions and device-reported activity — are deleted automatically <strong>90 days</strong> after they are written.</li>
+            <li class="mb-1">Access and audit records — the audit trail of remote sessions, command execution, SSH decisions and device-reported activity — are deleted automatically <strong>90 days</strong> after they are written.</li>
+            <li class="mb-1">The record of a remote-desktop session itself — who controlled which device, when, for how long, its connection quality and the kind of network path it used — is deleted automatically <strong>25 months</strong> after the session began. Daily counts derived from these records name no one and are kept.</li>
             <li class="mb-1">Short-lived operational data such as connection diagnostics and crash reports is deleted automatically on a shorter cycle, typically <strong>7 days</strong>.</li>
-            <li class="mb-1">Enrollment tokens and similar one-time credentials expire within minutes to hours.</li>
+            <li class="mb-1">Enrollment tokens and similar one-time credentials expire within minutes to hours. The record that an administrator issued one, and whether a device used it — never the token itself — is deleted automatically after <strong>90 days</strong>.</li>
             <li class="mb-1">Product-update subscriptions are kept until you unsubscribe. After that we retain only the fact that the address opted out, so it cannot be re-added silently; ask us and we will erase that too.</li>
             <li class="mb-1">The record of which issues were sent to an address — with the delivery status our email provider reported (delivered, bounced, dropped, reported as spam) and, if you unsubscribed through an issue's link, which issue — is kept with that subscription record and erased with it on request.</li>
             <li class="mb-1">A workspace's billing events (what Stripe reported about its subscription and invoices) and its daily count of plan-limit hits are kept for as long as the workspace exists and deleted with it; monthly revenue totals, which name no workspace, are kept.</li>

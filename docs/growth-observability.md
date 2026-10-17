@@ -1382,7 +1382,8 @@ remote-control code path changed; every number is read from rows the product alr
 **Why a freeze.** Three of the four sources expire. `agent_logs` — where the browser's
 `rc.connect` record carries `ttff_ms` (FR-22 part 4, [remote-control.md §12.1.5](remote-control.md))
 and where an agent's own batches say which version it ran — live **7 days**; `agent_crashes` 90;
-`stats_machine_1d` 730. Only `remote_sessions` is kept. Once the logs are gone the day's time to
+`stats_machine_1d` 730. `remote_sessions` lasts longest: **25 months** (a TTL on `created_at` since
+2026-10-17, the retention the privacy policy states). Once the logs are gone the day's time to
 first frame is gone with them, so a nightly job writes it down first.
 
 ```mermaid
