@@ -105,7 +105,7 @@ them. The presses above exist because each backend's match is exhaustive and mus
 - **Leaving** is Esc, the browser's own rule. Under Keyboard Lock in fullscreen, Esc reaches the host, so
   the browser wants it held, and the hint says so. Leaving sends the motion still gathered and lets go of
   any held button where the pointer is, before moves turn absolute again
-  ([`useRemoteControl.ts:10771`](../ui/src/composables/useRemoteControl.ts#L10771)). An absolute button-up
+  ([`useRemoteControl.ts:10789`](../ui/src/composables/useRemoteControl.ts#L10789)). An absolute button-up
   there would throw the host's cursor to an old position.
 - A blur or a hidden tab releases held buttons with `mouse_release` in relative mode, never with a
   position.
