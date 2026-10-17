@@ -41,7 +41,8 @@ use tokio::sync::oneshot;
 // changing it on a live Encoder requires the C-API SetOption with
 // ENCODER_OPTION_BITRATE + an SBitrateInfo struct.
 use openh264_sys2::{
-    ENCODER_OPTION_BITRATE, ENCODER_OPTION_FRAME_RATE, SBitrateInfo, SPATIAL_LAYER_0,
+    ENCODER_OPTION_BITRATE, ENCODER_OPTION_FRAME_RATE, ENCODER_OPTION_MAX_BITRATE, SBitrateInfo,
+    SPATIAL_LAYER_0,
 };
 
 use super::{EncodedPacket, VideoEncoder};
@@ -186,9 +187,33 @@ impl Drop for Openh264Encoder {
 }
 
 /// Apply a runtime bitrate change to a live OpenH264 encoder via raw
-/// FFI. Sets ENCODER_OPTION_BITRATE on layer 0 (we only use a single
-/// spatial layer). C-API returns 0 on success, non-zero on error.
+/// FFI, on layer 0 (we only use a single spatial layer).
+///
+/// FR-112 P2b — the layer's MAX bitrate moves with the target. The crate
+/// initialises the max to the construction bitrate, and OpenH264 refuses a
+/// target above the max (`cmInitParaError`, "MaxSpatialBitrate should be
+/// larger than SpatialBitrate"): until this, no runtime raise above the
+/// construction figure ever took — not Quality=High, not REMB recovering past
+/// it, not the 60 fps base. So a rising target raises the max first, and a
+/// falling one lowers it after, which keeps the two equal as the crate set them.
 fn apply_runtime_bitrate(enc: &mut Encoder, bps: u32) -> Result<()> {
+    let raising = runtime_bitrate(enc).is_none_or(|current| bps > current);
+    if raising {
+        set_bitrate_option(enc, ENCODER_OPTION_MAX_BITRATE, "MAX_BITRATE", bps)?;
+        set_bitrate_option(enc, ENCODER_OPTION_BITRATE, "BITRATE", bps)
+    } else {
+        set_bitrate_option(enc, ENCODER_OPTION_BITRATE, "BITRATE", bps)?;
+        set_bitrate_option(enc, ENCODER_OPTION_MAX_BITRATE, "MAX_BITRATE", bps)
+    }
+}
+
+/// One `SBitrateInfo` option on layer 0. C-API returns 0 on success.
+fn set_bitrate_option(
+    enc: &mut Encoder,
+    option: openh264_sys2::ENCODER_OPTION,
+    name: &str,
+    bps: u32,
+) -> Result<()> {
     let mut info = SBitrateInfo {
         iLayer: SPATIAL_LAYER_0,
         // OpenH264's iBitrate is signed 32-bit; clamp at 2 Gbps to
@@ -199,12 +224,12 @@ fn apply_runtime_bitrate(enc: &mut Encoder, bps: u32) -> Result<()> {
     // SAFETY: raw_api gives us &mut EncoderRawAPI; set_option is a C
     // function pointer accepting (encoder*, option_id, *mut c_void).
     // SBitrateInfo is repr(C) and `info` lives for the duration of
-    // this call. The encoder is initialised (we've encoded frames
-    // before) so the option is valid at this point.
+    // this call. The encoder is initialised (a frame went through; see
+    // `Settings`) so the option is valid at this point.
     let rc = unsafe {
         let raw = enc.raw_api();
         raw.set_option(
-            ENCODER_OPTION_BITRATE,
+            option,
             (&raw mut info) as *mut openh264_sys2::SBitrateInfo as *mut std::ffi::c_void,
         )
     };
@@ -212,9 +237,26 @@ fn apply_runtime_bitrate(enc: &mut Encoder, bps: u32) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!(
-            "openh264 SetOption(ENCODER_OPTION_BITRATE, {bps}) returned {rc}"
+            "openh264 SetOption(ENCODER_OPTION_{name}, {bps}) returned {rc}"
         ))
     }
+}
+
+/// The live encoder's layer-0 target bitrate, or `None` if it will not say.
+fn runtime_bitrate(enc: &mut Encoder) -> Option<u32> {
+    let mut info = SBitrateInfo {
+        iLayer: SPATIAL_LAYER_0,
+        iBitrate: 0,
+    };
+    // SAFETY: as `set_bitrate_option`; GetOption fills `info`, which lives
+    // for the call.
+    let rc = unsafe {
+        enc.raw_api().get_option(
+            ENCODER_OPTION_BITRATE,
+            (&raw mut info) as *mut openh264_sys2::SBitrateInfo as *mut std::ffi::c_void,
+        )
+    };
+    (rc == 0).then(|| info.iBitrate.max(0) as u32)
 }
 
 /// FR-112 P2b — set the live encoder's frame rate (`ENCODER_OPTION_FRAME_RATE`,
@@ -562,11 +604,33 @@ mod tests {
         assert!(!out.is_empty());
     }
 
-    /// FR-112 P2b — the premise of `Settings`: before its first frame the C
-    /// encoder refuses every runtime option (`cmInitExpected`); after it, the
-    /// bitrate and the frame rate take, and the frame rate reads back.
+    /// Layer 0's bitrate option (`ENCODER_OPTION_BITRATE` or `_MAX_BITRATE`)
+    /// as the live encoder reports it.
+    fn read_bitrate_option(enc: &mut Encoder, option: openh264_sys2::ENCODER_OPTION) -> u32 {
+        let mut info = SBitrateInfo {
+            iLayer: SPATIAL_LAYER_0,
+            iBitrate: 0,
+        };
+        // SAFETY: GetOption fills `info`, which lives for the call; the
+        // encoder is initialised.
+        let rc = unsafe {
+            enc.raw_api().get_option(
+                option,
+                (&raw mut info) as *mut openh264_sys2::SBitrateInfo as *mut std::ffi::c_void,
+            )
+        };
+        assert_eq!(rc, 0);
+        info.iBitrate as u32
+    }
+
+    /// FR-112 P2b — the premises of `Settings` and of `apply_runtime_bitrate`:
+    /// before its first frame the C encoder refuses every runtime option
+    /// (`cmInitExpected`); after it the frame rate takes, a bitrate far above
+    /// the construction figure takes (the max rises with it), and a lower one
+    /// takes too, the max following it down.
     #[test]
     fn options_take_only_after_the_first_frame() {
+        // The crate's default construction bitrate (120 kbps) is also the max.
         let cfg = EncoderConfig::new().max_frame_rate(FrameRate::from_hz(30.0));
         let mut enc =
             Encoder::with_api_config(openh264::OpenH264API::from_source(), cfg).expect("encoder");
@@ -583,7 +647,6 @@ mod tests {
         // is level 1, whose ceiling is ~77 kbps), which is a different refusal.
         let frame = std::sync::Arc::new(make_bgra_frame(1280, 720, 10, 20, 30));
         encode_one(&mut enc, 1280, 720, frame).expect("the first frame");
-        apply_runtime_bitrate(&mut enc, 2_000_000).expect("taken after");
         apply_runtime_frame_rate(&mut enc, 60).expect("taken after");
         let mut rate = 0f32;
         // SAFETY: `ENCODER_OPTION_FRAME_RATE` reads into a `float*` that lives
@@ -595,6 +658,24 @@ mod tests {
             )
         };
         assert_eq!((rc, rate), (0, 60.0));
+        apply_runtime_bitrate(&mut enc, 2_000_000).expect("raised past the construction max");
+        assert_eq!(
+            read_bitrate_option(&mut enc, ENCODER_OPTION_BITRATE),
+            2_000_000
+        );
+        assert_eq!(
+            read_bitrate_option(&mut enc, ENCODER_OPTION_MAX_BITRATE),
+            2_000_000
+        );
+        apply_runtime_bitrate(&mut enc, 1_000_000).expect("lowered");
+        assert_eq!(
+            read_bitrate_option(&mut enc, ENCODER_OPTION_BITRATE),
+            1_000_000
+        );
+        assert_eq!(
+            read_bitrate_option(&mut enc, ENCODER_OPTION_MAX_BITRATE),
+            1_000_000
+        );
     }
 
     /// FR-112 P2b — settings sent before the first frame are held, the newest
