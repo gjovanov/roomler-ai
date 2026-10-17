@@ -64,3 +64,21 @@ export function releaseForCancelledPointer(
   if (relative) return { t: 'mouse_release', btn }
   return { t: 'mouse_button', btn, down: false, x: last.x, y: last.y, mon: 0 }
 }
+
+/** FR-111 P2 — how a finger drives the host: `direct` (the finger is the
+ *  pointer, today's) or `trackpad` (the screen is a laptop's trackpad). */
+export type TouchMode = 'direct' | 'trackpad'
+
+/** Where this browser remembers the touch mode. */
+export const TOUCH_MODE_STORAGE_KEY = 'roomler-rc-touch-mode'
+
+/** The remembered touch mode: `trackpad` only for that exact word, `direct`
+ *  otherwise (the default until the operator decides FR-111's open decision 1),
+ *  and `direct` when storage throws. */
+export function readTouchMode(storage: Pick<Storage, 'getItem'> | null | undefined): TouchMode {
+  try {
+    return storage?.getItem(TOUCH_MODE_STORAGE_KEY) === 'trackpad' ? 'trackpad' : 'direct'
+  } catch {
+    return 'direct'
+  }
+}

@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 import {
   AGENT_WHEEL_STEP_PX,
   createDirectGestures,
+  createTrackpadGestures,
   createWheelSteps,
   LONG_PRESS_MS,
   SLOP_PX,
@@ -175,5 +176,60 @@ describe('FR-111 createWheelSteps', () => {
     w.add(0, 90)
     w.reset()
     expect(w.add(0, 20)).toBeNull()
+  })
+})
+
+describe('FR-111 trackpad gestures', () => {
+  it('a moving finger moves the pointer by everything it travelled, the slop included', () => {
+    const g = createTrackpadGestures()
+    g.down(s(1, 100, 100, 0))
+    expect(g.move(s(1, 105, 100, 20))).toEqual([])
+    expect(g.move(s(1, 112, 104, 40))).toEqual([{ kind: 'pointer', dx: 12, dy: 4 }])
+    expect(g.move(s(1, 120, 100, 60))).toEqual([{ kind: 'pointer', dx: 8, dy: -4 }])
+    // Lifting a moved finger clicks nothing: the pointer just stays.
+    expect(g.up(s(1, 120, 100, 80))).toEqual([])
+  })
+
+  it('a tap clicks where the pointer is, carrying no position', () => {
+    const g = createTrackpadGestures()
+    g.down(s(1, 300, 200, 0))
+    expect(g.up(s(1, 302, 201, 90))).toEqual([
+      { kind: 'press', btn: 'left' },
+      { kind: 'release', btn: 'left' },
+    ])
+  })
+
+  it('held 500 ms, then moved, it drags with the left button, let go when the finger lifts', () => {
+    const g = createTrackpadGestures()
+    g.down(s(1, 300, 200, 1000))
+    expect(g.deadline()).toBe(1000 + LONG_PRESS_MS)
+    expect(g.tick(1000 + LONG_PRESS_MS)).toEqual([{ kind: 'press', btn: 'left' }])
+    expect(g.move(s(1, 340, 210, 1600))).toEqual([{ kind: 'pointer', dx: 40, dy: 10 }])
+    expect(g.up(s(1, 340, 210, 1700))).toEqual([{ kind: 'release', btn: 'left' }])
+  })
+
+  it('a cancelled held drag is let go; a cancelled move sends nothing', () => {
+    const g = createTrackpadGestures()
+    g.down(s(1, 300, 200, 0))
+    g.tick(LONG_PRESS_MS)
+    expect(g.cancel(1)).toEqual([{ kind: 'release', btn: 'left' }])
+    g.down(s(2, 300, 200, 1000))
+    g.move(s(2, 330, 200, 1020))
+    expect(g.cancel(2)).toEqual([])
+  })
+
+  it('two fingers behave as in direct mode, the right button carrying no position', () => {
+    const g = createTrackpadGestures()
+    g.down(s(1, 100, 100, 0))
+    g.down(s(2, 300, 100, 30))
+    expect(g.up(s(1, 100, 100, 120))).toEqual([
+      { kind: 'press', btn: 'right' },
+      { kind: 'release', btn: 'right' },
+    ])
+    expect(g.up(s(2, 300, 100, 140))).toEqual([])
+    g.down(s(3, 100, 300, 500))
+    g.down(s(4, 300, 300, 510))
+    g.move(s(3, 100, 280, 530))
+    expect(g.move(s(4, 300, 280, 540))).toEqual([{ kind: 'wheel', dx: 0, dy: 10 }])
   })
 })

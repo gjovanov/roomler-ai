@@ -59,15 +59,70 @@ export interface DirectGestures {
 }
 
 type Finger = { id: number; start: TouchSample; last: TouchSample }
+/** The two-finger part every touch mode shares (FR-111 P1, P2). */
+type TwoFinger = { a: Finger; b: Finger; t0: number; mode: 'undecided' | 'scroll' | 'pinch'; cx: number; cy: number; dist: number }
 type State =
   | { s: 'idle' }
   | { s: 'pending'; f: Finger }
   | { s: 'dragging'; f: Finger }
   | { s: 'held'; id: number }
-  | { s: 'two'; a: Finger; b: Finger; t0: number; mode: 'undecided' | 'scroll' | 'pinch'; cx: number; cy: number; dist: number }
+  | ({ s: 'two' } & TwoFinger)
   | { s: 'draining' }
 
 const dist = (ax: number, ay: number, bx: number, by: number) => Math.hypot(ax - bx, ay - by)
+
+type WheelOrZoom = Extract<GestureAction, { kind: 'wheel' | 'zoom' }>
+
+function twoFrom(a: Finger, b: Finger, t0: number): TwoFinger {
+  return {
+    a,
+    b,
+    t0,
+    mode: 'undecided',
+    cx: (a.last.px + b.last.px) / 2,
+    cy: (a.last.py + b.last.py) / 2,
+    dist: dist(a.last.px, a.last.py, b.last.px, b.last.py),
+  }
+}
+
+/** A move of either finger of a two-finger gesture: decides scroll or pinch
+ *  once the fingers say which, then reads the wheel (natural direction: the
+ *  content follows the fingers, so fingers moving up turn it down) or the
+ *  zoom. Updates `st` in place. */
+function twoMove(st: TwoFinger, p: TouchSample): WheelOrZoom[] {
+  if (p.id === st.a.id) st.a.last = p
+  else st.b.last = p
+  const { a, b } = st
+  const cx = (a.last.px + b.last.px) / 2
+  const cy = (a.last.py + b.last.py) / 2
+  const d = dist(a.last.px, a.last.py, b.last.px, b.last.py)
+  if (st.mode === 'undecided') {
+    const d0 = dist(a.start.px, a.start.py, b.start.px, b.start.py)
+    const c0x = (a.start.px + b.start.px) / 2
+    const c0y = (a.start.py + b.start.py) / 2
+    if (Math.abs(d - d0) > PINCH_SLOP_PX) st.mode = 'pinch'
+    else if (dist(cx, cy, c0x, c0y) > SLOP_PX) st.mode = 'scroll'
+    else return []
+  }
+  const out: WheelOrZoom[] = []
+  if (st.mode === 'scroll') {
+    const dx = st.cx - cx
+    const dy = st.cy - cy
+    if (dx !== 0 || dy !== 0) out.push({ kind: 'wheel', dx, dy })
+  } else if (st.dist > 0 && d > 0) {
+    const factor = d / st.dist
+    if (factor !== 1) out.push({ kind: 'zoom', factor, cx, cy })
+  }
+  st.cx = cx
+  st.cy = cy
+  st.dist = d
+  return out
+}
+
+/** Was the gesture a two-finger tap (lifted quickly, never moved)? */
+function twoTapped(st: TwoFinger, t: number): boolean {
+  return st.mode === 'undecided' && t - st.t0 <= TWO_FINGER_TAP_MS
+}
 
 /** The agent turns a `mouse_wheel` in pixels into wheel steps at 100 px a step
  *  and rounds EVERY frame on its own (`enigo_backend.rs` `wheel_to_steps`), so
@@ -120,19 +175,6 @@ export function createDirectGestures(): DirectGestures {
     return down.size === 0 ? { s: 'idle' } : { s: 'draining' }
   }
 
-  function twoFrom(a: Finger, b: Finger, t0: number): State {
-    return {
-      s: 'two',
-      a,
-      b,
-      t0,
-      mode: 'undecided',
-      cx: (a.last.px + b.last.px) / 2,
-      cy: (a.last.py + b.last.py) / 2,
-      dist: dist(a.last.px, a.last.py, b.last.px, b.last.py),
-    }
-  }
-
   return {
     down(p) {
       down.add(p.id)
@@ -143,7 +185,7 @@ export function createDirectGestures(): DirectGestures {
       if (st.s === 'pending') {
         // A second finger before the first decided anything: a two-finger
         // gesture, and the first finger's press never happens.
-        st = twoFrom(st.f, { id: p.id, start: p, last: p }, p.t)
+        st = { s: 'two', ...twoFrom(st.f, { id: p.id, start: p, last: p }, p.t) }
         return []
       }
       // A finger added to a drag, a long press or a two-finger gesture is ignored.
@@ -168,35 +210,7 @@ export function createDirectGestures(): DirectGestures {
         return [{ kind: 'move', x: p.nx, y: p.ny }]
       }
       if (st.s === 'two' && (p.id === st.a.id || p.id === st.b.id)) {
-        if (p.id === st.a.id) st.a.last = p
-        else st.b.last = p
-        const { a, b } = st
-        const cx = (a.last.px + b.last.px) / 2
-        const cy = (a.last.py + b.last.py) / 2
-        const d = dist(a.last.px, a.last.py, b.last.px, b.last.py)
-        if (st.mode === 'undecided') {
-          const d0 = dist(a.start.px, a.start.py, b.start.px, b.start.py)
-          const c0x = (a.start.px + b.start.px) / 2
-          const c0y = (a.start.py + b.start.py) / 2
-          if (Math.abs(d - d0) > PINCH_SLOP_PX) st.mode = 'pinch'
-          else if (dist(cx, cy, c0x, c0y) > SLOP_PX) st.mode = 'scroll'
-          else return []
-        }
-        const out: GestureAction[] = []
-        if (st.mode === 'scroll') {
-          // Natural scrolling: the content follows the fingers, so fingers
-          // moving up turn the wheel down.
-          const dx = st.cx - cx
-          const dy = st.cy - cy
-          if (dx !== 0 || dy !== 0) out.push({ kind: 'wheel', dx, dy })
-        } else if (st.dist > 0 && d > 0) {
-          const factor = d / st.dist
-          if (factor !== 1) out.push({ kind: 'zoom', factor, cx, cy })
-        }
-        st.cx = cx
-        st.cy = cy
-        st.dist = d
-        return out
+        return twoMove(st, p)
       }
       return []
     },
@@ -221,11 +235,11 @@ export function createDirectGestures(): DirectGestures {
         return []
       }
       if (st.s === 'two' && (p.id === st.a.id || p.id === st.b.id)) {
-        const { a, b, t0, mode } = st
+        const two = st
         st = clearedOrDraining()
-        if (mode === 'undecided' && p.t - t0 <= TWO_FINGER_TAP_MS) {
-          const x = (a.start.nx + b.start.nx) / 2
-          const y = (a.start.ny + b.start.ny) / 2
+        if (twoTapped(two, p.t)) {
+          const x = (two.a.start.nx + two.b.start.nx) / 2
+          const y = (two.a.start.ny + two.b.start.ny) / 2
           return [
             { kind: 'press', btn: 'right', x, y },
             { kind: 'release', btn: 'right', x, y },
@@ -264,6 +278,152 @@ export function createDirectGestures(): DirectGestures {
           { kind: 'press', btn: 'right', x: f.start.nx, y: f.start.ny },
           { kind: 'release', btn: 'right', x: f.start.nx, y: f.start.ny },
         ]
+      }
+      return []
+    },
+
+    deadline() {
+      return st.s === 'pending' ? st.f.start.t + LONG_PRESS_MS : null
+    },
+
+    active() {
+      return down.size > 0
+    },
+  }
+}
+
+// FR-111 P2 — trackpad mode: the screen is a laptop's trackpad. The finger no
+// longer IS the pointer; it moves the host's pointer, which stays where it is
+// between touches.
+//   one finger   moved: the pointer moves by the finger's travel · a tap: a
+//                left click where the pointer is · held 500 ms, then moved: a
+//                left drag, let go when the finger lifts
+//   two fingers  as in direct mode: a quick tap is the right button, moving
+//                together is the wheel, spreading or pinching is the zoom
+// The wiring turns `pointer` travel into FR-109's `mouse_rel` for an agent that
+// advertises `mouse-rel`, and into absolute moves from the host pointer's last
+// known position for one that does not.
+
+export type TrackpadAction =
+  | { kind: 'pointer'; dx: number; dy: number }
+  | { kind: 'press'; btn: 'left' | 'right' }
+  | { kind: 'release'; btn: 'left' | 'right' }
+  | WheelOrZoom
+
+export interface TrackpadGestures {
+  down(p: TouchSample): TrackpadAction[]
+  move(p: TouchSample): TrackpadAction[]
+  up(p: TouchSample): TrackpadAction[]
+  /** A cancelled finger: a held drag is let go; nothing else is sent. */
+  cancel(id: number): TrackpadAction[]
+  /** Call once {@link deadline} has passed: the hold that arms a drag. */
+  tick(t: number): TrackpadAction[]
+  deadline(): number | null
+  active(): boolean
+}
+
+type PadState =
+  | { s: 'idle' }
+  | { s: 'pending'; f: Finger }
+  | { s: 'moving'; f: Finger }
+  | { s: 'armed'; f: Finger }
+  | ({ s: 'two' } & TwoFinger)
+  | { s: 'draining' }
+
+export function createTrackpadGestures(): TrackpadGestures {
+  let st: PadState = { s: 'idle' }
+  const down = new Set<number>()
+  const settle = (): PadState => (down.size === 0 ? { s: 'idle' } : { s: 'draining' })
+
+  return {
+    down(p) {
+      down.add(p.id)
+      if (st.s === 'idle') {
+        st = { s: 'pending', f: { id: p.id, start: p, last: p } }
+      } else if (st.s === 'pending') {
+        st = { s: 'two', ...twoFrom(st.f, { id: p.id, start: p, last: p }, p.t) }
+      }
+      // A finger added while the pointer moves or a drag is held is ignored.
+      return []
+    },
+
+    move(p) {
+      if (st.s === 'pending' && p.id === st.f.id) {
+        if (dist(p.px, p.py, st.f.start.px, st.f.start.py) <= SLOP_PX) {
+          st.f.last = p
+          return []
+        }
+        // Past the slop: the pointer moves, by everything the finger has
+        // travelled, so the slop is not swallowed.
+        const f = st.f
+        f.last = p
+        st = { s: 'moving', f }
+        return [{ kind: 'pointer', dx: p.px - f.start.px, dy: p.py - f.start.py }]
+      }
+      if ((st.s === 'moving' || st.s === 'armed') && p.id === st.f.id) {
+        const dx = p.px - st.f.last.px
+        const dy = p.py - st.f.last.py
+        st.f.last = p
+        return dx !== 0 || dy !== 0 ? [{ kind: 'pointer', dx, dy }] : []
+      }
+      if (st.s === 'two' && (p.id === st.a.id || p.id === st.b.id)) {
+        return twoMove(st, p)
+      }
+      return []
+    },
+
+    up(p) {
+      down.delete(p.id)
+      if (st.s === 'pending' && p.id === st.f.id) {
+        st = settle()
+        return [
+          { kind: 'press', btn: 'left' },
+          { kind: 'release', btn: 'left' },
+        ]
+      }
+      if (st.s === 'moving' && p.id === st.f.id) {
+        st = settle()
+        return []
+      }
+      if (st.s === 'armed' && p.id === st.f.id) {
+        st = settle()
+        return [{ kind: 'release', btn: 'left' }]
+      }
+      if (st.s === 'two' && (p.id === st.a.id || p.id === st.b.id)) {
+        const two = st
+        st = settle()
+        return twoTapped(two, p.t)
+          ? [
+              { kind: 'press', btn: 'right' },
+              { kind: 'release', btn: 'right' },
+            ]
+          : []
+      }
+      if (st.s === 'draining' && down.size === 0) st = { s: 'idle' }
+      return []
+    },
+
+    cancel(id) {
+      down.delete(id)
+      if (st.s === 'armed' && id === st.f.id) {
+        st = settle()
+        return [{ kind: 'release', btn: 'left' }]
+      }
+      if (
+        ((st.s === 'pending' || st.s === 'moving') && id === st.f.id) ||
+        (st.s === 'two' && (id === st.a.id || id === st.b.id))
+      ) {
+        st = settle()
+        return []
+      }
+      if (st.s === 'draining' && down.size === 0) st = { s: 'idle' }
+      return []
+    },
+
+    tick(t) {
+      if (st.s === 'pending' && t >= st.f.start.t + LONG_PRESS_MS) {
+        st = { s: 'armed', f: st.f }
+        return [{ kind: 'press', btn: 'left' }]
       }
       return []
     },

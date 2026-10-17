@@ -314,6 +314,25 @@
       >
         <v-icon>mdi-cursor-move</v-icon>
       </v-btn>
+      <!-- FR-111 P2 — on a touch screen: the finger is the pointer (direct),
+           or the screen is a trackpad that moves the pointer. Hidden where
+           there is no touch, and under the `roomler-rc-touch=legacy` switch. -->
+      <v-btn
+        v-if="rc.phase.value === 'connected' && touchModeOffered"
+        icon
+        variant="text"
+        size="small"
+        class="mr-1"
+        :color="rc.touchMode.value === 'trackpad' ? 'primary' : undefined"
+        :aria-label="rc.touchMode.value === 'trackpad' ? 'Touch: trackpad (tap to use direct touch)' : 'Touch: direct (tap to use a trackpad)'"
+        :title="rc.touchMode.value === 'trackpad'
+          ? 'Trackpad: a finger moves the pointer; tap to click, hold then move to drag. Tap for direct touch.'
+          : 'Direct touch: the finger is the pointer. Tap to use the screen as a trackpad.'"
+        data-testid="rc-touch-mode"
+        @click="rc.setTouchMode(rc.touchMode.value === 'trackpad' ? 'direct' : 'trackpad')"
+      >
+        <v-icon>{{ rc.touchMode.value === 'trackpad' ? 'mdi-gesture-swipe' : 'mdi-gesture-tap' }}</v-icon>
+      </v-btn>
       <!-- rc.199 — clipboard send / get: frequent connected-session
            actions, kept on the toolbar (not the Settings panel) at
            every viewport. Relocated here from the retired Row 2. -->
@@ -3053,6 +3072,19 @@ const stageTouchActionCss = (() => {
     /* blocked site data: not switched off */
   }
   return stageTouchAction(storage)
+})()
+/** FR-111 P2 — the touch-mode control, only where a finger can reach the
+ *  stage and the gestures are on (not under the `legacy` switch). */
+const touchModeOffered = (() => {
+  if (stageTouchActionCss !== 'none') return false
+  try {
+    return (
+      (globalThis.navigator?.maxTouchPoints ?? 0) > 0 ||
+      globalThis.matchMedia?.('(pointer: coarse)').matches === true
+    )
+  } catch {
+    return false
+  }
 })()
 /** FR-111 — a pinch zooms the viewer's own picture (nothing reaches the host),
  *  around the point between the fingers, so what they were over stays under

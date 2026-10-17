@@ -85,6 +85,20 @@ flowchart LR
   `mouse_move` and `mouse_button` frames. That works with every deployed agent.
 - The ghost cursor shows where the host's pointer is, since the finger is no longer on it.
 
+*As built (P2):*
+- `touchGestures.ts` `createTrackpadGestures`: a moving finger is `pointer` travel (the slop included, so a
+  small move is not swallowed); a tap is a left click with no position; a 500 ms hold arms a left drag, let
+  go on lift. Two fingers share direct mode's handling, factored out (`twoMove`, `twoTapped`).
+- `useRemoteControl.ts` `runTrackpad`: the travel is measured in the picture's normalised space
+  (`padTravel`, the stage's own mapping, so letterbox and zoom need nothing extra). To a `mouse-rel` agent
+  it goes as `mouse_rel` through FR-109's accumulator, with `mouse_press` / `mouse_release`. To an older
+  agent it becomes absolute moves from `cursor:pos` divided by the picture's intrinsic size, re-read at each
+  gesture's start.
+- The mode is `touchMode` / `setTouchMode` on the composable, remembered as `roomler-rc-touch-mode`. The
+  toolbar control (`rc-touch-mode`) shows on a touch device unless the `legacy` switch is set. **The default
+  is direct** until open decision 1 is settled. The ghost cursor is the host's own cursor overlay, which
+  `cursor:pos` already drives.
+
 ### 3c. On-screen controls (P3, G1)
 
 - An overlay on the stage with buttons, a d-pad and a stick, each emitting existing frames: `key` for keys,
@@ -117,7 +131,7 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
 |---|---|---|---|
 | P0 | Probes: (1) **red first**, a one-finger drag on today's stage in touch emulation, read on a vmtest Win11 host by a raw-input probe that counts button downs and ups; (2) what each engine's touch emulation gives Playwright (taps, drags, two-finger gestures), for the ACs' cells | docs only | spec and claim 2026-10-17. **(1) measured** (§8 row 1): in Chromium's touch emulation a drag is taken as a pan after 69 ms, and the host's button stays down until something else releases it. (2) is measured for Chromium only (CDP touch events reach the page and its gesture handling); WebKit and Firefox are owed |
 | P1 | Touch on the stage (3a) | viewer storage key `roomler-rc-touch=legacy` | **built** (3a "as built"): the stage keeps every touch, a cancelled pointer lets go, and the direct-mode gestures. Unit tests: `touchInput.spec.ts` (8), `touchGestures.spec.ts` (11), vitest 2173. A negative control, a press tracker that never forgets a pointer, failed 3 tests. **Field-green on a candidate bundle** (this branch's `ui/dist` served into the page, §8 rows 2–4). It gets re-checked once a promote serves it |
-| P2 | Trackpad mode (3b) | the mode switch | — |
+| P2 | Trackpad mode (3b) | the mode switch | **built** (3b "as built"): 5 trackpad tests, plus 2 for the mode's storage, vitest green. **Field-green on a candidate bundle** on both paths (§8 rows 5–6). The default stays direct until decision 1 |
 | P3 | On-screen controls and built-in presets (3c) | the overlay's toggle | — |
 | P4 | Editor, macros, tenant presets (3d) | — | — |
 | P5 | Native touch injection (3e) | agent capability word | — |
@@ -134,8 +148,11 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
   the host, and a pinch zooms only the viewer (nothing reaches the host). **Verified** on a candidate bundle
   (§8 row 4). The host read a right click for each, one wheel notch for a 135 px scroll, and nothing for a
   pinch that zoomed the picture five times. It gets re-checked once a promote serves P1.
-- [ ] **AC3:** trackpad mode moves the host's pointer relatively, on an agent that advertises `mouse-rel`
-  and on an older one, and a tap clicks where the pointer is.
+- [x] **AC3:** trackpad mode moves the host's pointer relatively, on an agent that advertises `mouse-rel`
+  and on an older one, and a tap clicks where the pointer is. **Verified** on a candidate bundle (§8 rows
+  5–6). A 100 px drag moved the host's cursor about 325 px, by `mouse_rel` on 0.4.140 and by absolute
+  moves from `cursor:pos` with `mouse-rel` switched off. Each time the tap clicked at the pointer. It gets
+  re-checked once a promote serves P2.
 - [ ] **AC4:** on-screen buttons and the d-pad reach the host as the keys they name, read by a test-only
   probe on the guest.
 - [ ] **AC5:** G1 works with every deployed agent: AC1–AC4's cells pass on an agent from before this FR.
@@ -172,6 +189,8 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
 | 2 | 2026-10-17 | **AC1, the green: the stage keeps the drag (a candidate bundle).** Row 1's guest, cell and probe. The viewer was P1a's own `ui/dist`, served into the page on the real origin by Playwright (documents get its `index.html`, `/assets/*` comes from the bundle, `/api` and `/ws` go to production), so the cell needed no promote. The page ran `/assets/index-DHl0de8i.js` | **The drag completes, and its release reaches the host.** The stage reported `touch-action: none`. Chromium no longer cancelled: the drag delivered 14 moves, and the viewer sent the release at the drag's end point. The host read the press and its release **484 ms apart** (`D@12047 U@12531`). The control tap read `D@16531 U@16531` |
 | 3 | 2026-10-17 | **AC1's other half: a cancel that happens anyway is released.** The same, with the kill switch `roomler-rc-touch=legacy` set, so the stage was `touch-action: auto` and the browser free to cancel | **The cancel handler lets go at once.** Chromium cancelled 91 ms into the drag, and the viewer sent `mouse_button {left, up}` at the last point the finger reached, in the same millisecond. The host read the press and its release **78 ms apart** (`D@9203 U@9281`) |
 | 4 | 2026-10-17 | **AC2: the direct-mode gestures (a candidate bundle).** The same guest, with P1's own `ui/dist` in Chromium's Pixel 7 emulation. Real CDP multi-touch, 2.5 s apart: a tap (the control), a long press (800 ms), a two-finger tap (100 ms), a two-finger drag upwards (10 steps, about 135 px) and a pinch outwards. The host's probe kept a timeline of both buttons and the wheel | **Each gesture reaches the host as what it means.** Tap: `L l`, a left click. Long press: a right click 509 ms after the finger landed (`R r`). Two-finger tap: a right click between the fingers (`R r`). Scroll: **one** `mouse_wheel {dy: 100}`, which the host read as `W-120`, one notch down (the fingers went up). Pinch: the picture went from 394 to 1979 px wide, and the host read **nothing**. **Wrong turns, three runs:** the first run aimed the tap and the scroll at the stage's box, and the second at the picture element's box. On a phone the picture is letterboxed inside both, so both times the two gestures landed outside it and, as designed, did nothing. The third run aimed at the picture's own rectangle. **A finding that changed the code:** in that run the viewer sent 21 wheel frames of 6–12 px and the host read none. The agent rounds every frame to a 100 px step on its own (`enigo_backend.rs` `wheel_to_steps`), so the viewer now gathers a gesture's pixels and sends whole steps (`createWheelSteps`). The run above is with that change |
+| 5 | 2026-10-17 | **AC3, trackpad mode on a `mouse-rel` agent (a candidate bundle).** The same guest (0.4.140, which advertises `mouse-rel`), with P2's own `ui/dist` in Chromium's Pixel 7 emulation and `roomler-rc-touch-mode=trackpad` (the toolbar control read "Touch: trackpad"). A one-finger drag of 100 CSS px to the right across the 394 px picture, then a tap at 70 % of the picture. Two test-only probes ran as the person: the cursor's position every 40 ms, and the buttons | **The finger moves the pointer, and the tap clicks where the pointer is.** The viewer sent ten `mouse_rel` frames of 32–33 counts, 324 in all, which is 100/394 of the host's 1280 px width. The host's cursor walked from (964, 400) in steps of about 32 px to (1279, 400), where the screen's edge stopped it. The tap sent `mouse_press` then `mouse_release`, with no position, and the host read a left click (`L l`) |
+| 6 | 2026-10-17 | **AC3, trackpad mode on an agent without `mouse-rel`.** The same, with the agent's kill switch `ROOMLERD_INPUT_MOUSE_REL=0` set (restart and re-enroll), so the viewer took its absolute path. The drag went 100 CSS px to the left. The switch was cleared afterwards | **The same motion, from absolute moves.** The viewer started from the host's pointer, its last `cursor:pos` (x 1278 of 1280), and sent absolute `mouse_move` frames from x 0.973 to 0.745, a share of 0.254. The host's cursor went from (1278, 400) to **(952, 400)**, 326 px in steps of about 32. The tap sent `mouse_button` at (0.744, 0.5), the pointer's own position and not the finger's, and the host read `L l`. **Wrong turn:** the first run dragged right, but the cursor already sat at the right edge from row 5, so every move clamped at x = 1. The cell was re-run dragging left |
 
 ## 9. Related
 

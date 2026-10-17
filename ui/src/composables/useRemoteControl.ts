@@ -90,8 +90,23 @@ import {
 import { keepBusySetMessage, parseKeepBusyState, type KeepBusyRequest, type KeepBusyState } from './keepBusy'
 import { parseDisplayMatchState, type DisplayMatchState } from './displayMatch'
 import { createRelAccumulator, relativeButtonMessage } from './relativeMouse'
-import { createPointerPressTracker, releaseForCancelledPointer, stageTouchAction } from './touchInput'
-import { createDirectGestures, createWheelSteps, WHEEL_CARRY_IDLE_MS, type GestureAction, type TouchSample } from './touchGestures'
+import {
+  createPointerPressTracker,
+  readTouchMode,
+  releaseForCancelledPointer,
+  stageTouchAction,
+  TOUCH_MODE_STORAGE_KEY,
+  type TouchMode,
+} from './touchInput'
+import {
+  createDirectGestures,
+  createTrackpadGestures,
+  createWheelSteps,
+  WHEEL_CARRY_IDLE_MS,
+  type GestureAction,
+  type TouchSample,
+  type TrackpadAction,
+} from './touchGestures'
 import { parseFeaturesRefused } from './useSessionFeatures'
 
 /**
@@ -5889,6 +5904,25 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   /** The surface `attachInput` wired, which is what Pointer Lock locks. */
   let relativeSurface: HTMLElement | null = null
 
+  // FR-111 P2 — how a finger drives the host: `direct` (the finger is the
+  // pointer) or `trackpad` (it moves the pointer, which stays between
+  // touches). Remembered per browser; `direct` until decision 1 says otherwise.
+  const touchMode = ref<TouchMode>(readTouchMode((() => {
+    try {
+      return globalThis.localStorage
+    } catch {
+      return null
+    }
+  })()))
+  function setTouchMode(m: TouchMode) {
+    touchMode.value = m
+    try {
+      globalThis.localStorage.setItem(TOUCH_MODE_STORAGE_KEY, m)
+    } catch {
+      /* blocked site data: this tab only */
+    }
+  }
+
   function flushRel() {
     if (relTimer !== null) {
       clearTimeout(relTimer)
@@ -10071,7 +10105,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     function onPointerMove(ev: PointerEvent) {
       // FR-111 — a finger's moves are the recognizer's to read.
       if (isGestureTouch(ev)) {
-        runGestures(touchGestures.move(touchSample(ev)))
+        touchStep('move', ev)
         return
       }
       // FR-109 — under Pointer Lock the position is frozen and only the
@@ -10113,10 +10147,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // landing outside the picture starts nothing, as a mouse press there
       // does, but a second finger during a gesture still counts.
       if (isGestureTouch(ev)) {
-        if (!normalisedXY(ev).insideVideo && !touchGestures.active()) return
-        if (!touchGestures.active()) touchWheel.reset()
+        // In trackpad mode the whole stage is the pad, letterbox included.
+        const pad = touchMode.value === 'trackpad'
+        if (!pad && !normalisedXY(ev).insideVideo && !touchActive()) return
+        if (!touchActive()) {
+          touchWheel.reset()
+          padPointer = null
+        }
         try { surface.setPointerCapture(ev.pointerId) } catch { /* noop */ }
-        runGestures(touchGestures.down(touchSample(ev)))
+        touchStep('down', ev)
         return
       }
       // FR-109 — relative mode presses where the host's pointer is. The
@@ -10142,7 +10181,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     function onPointerUp(ev: PointerEvent) {
       if (isGestureTouch(ev)) {
         try { surface.releasePointerCapture(ev.pointerId) } catch { /* noop */ }
-        runGestures(touchGestures.up(touchSample(ev)))
+        touchStep('up', ev)
         return
       }
       pointerPresses.end(ev.pointerId)
@@ -10177,7 +10216,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // trusting: release at the last point the pointer reached.
     function onPointerCancel(ev: PointerEvent) {
       if (isGestureTouch(ev)) {
-        runGestures(touchGestures.cancel(ev.pointerId))
+        touchCancel(ev.pointerId)
         return
       }
       const btn = pointerPresses.end(ev.pointerId)
@@ -10356,18 +10395,111 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
             break
         }
       }
-      // Re-arm the long press for whatever the recognizer waits on now.
+      armTouchTimer()
+    }
+
+    // FR-111 P2 — trackpad mode. The finger moves the host's pointer; its
+    // travel is measured in the picture's own normalised space, so letterbox
+    // and zoom are already accounted for.
+    const trackpad = createTrackpadGestures()
+    /** For an agent without `mouse-rel`: where the host's pointer is, seeded
+     *  from the last `cursor:pos` when a gesture starts, then moved by the
+     *  finger. */
+    let padPointer: { x: number; y: number } | null = null
+    function hostPointerNorm(): { x: number; y: number } {
+      const pos = cursor.value.pos
+      const w = mediaIntrinsicW.value
+      const h = mediaIntrinsicH.value
+      if (pos && w > 0 && h > 0) return { x: clamp01(pos.x / w), y: clamp01(pos.y / h) }
+      return { ...lastPointerNorm }
+    }
+    /** A finger's travel in CSS pixels, as a share of the picture. */
+    function padTravel(dx: number, dy: number): { x: number; y: number } {
+      const r = surface.getBoundingClientRect()
+      const cx = r.left + r.width / 2
+      const cy = r.top + r.height / 2
+      const a = normalisedXY({ clientX: cx, clientY: cy } as MouseEvent)
+      const b = normalisedXY({ clientX: cx + dx, clientY: cy + dy } as MouseEvent)
+      return { x: b.x - a.x, y: b.y - a.y }
+    }
+    function runTrackpad(actions: TrackpadAction[]) {
+      // An agent that takes `mouse_rel` (FR-109) gets the travel as motion and
+      // presses where its pointer is; an older one gets absolute moves from
+      // the pointer's last known position.
+      const rel = relativeMouseAllowed.value
+      for (const a of actions) {
+        switch (a.kind) {
+          case 'pointer': {
+            const t = padTravel(a.dx, a.dy)
+            if (rel) {
+              relAcc.add(t.x * mediaIntrinsicW.value, t.y * mediaIntrinsicH.value)
+              scheduleRel()
+            } else {
+              const p = padPointer ?? hostPointerNorm()
+              padPointer = { x: clamp01(p.x + t.x), y: clamp01(p.y + t.y) }
+              lastPointerNorm = { ...padPointer }
+              pendingMove = { x: padPointer.x, y: padPointer.y, mon: 0 }
+              schedulePendingMove()
+            }
+            break
+          }
+          case 'press':
+          case 'release': {
+            const down = a.kind === 'press'
+            if (rel) {
+              flushRel()
+              sendInput(relativeButtonMessage(a.btn, down))
+            } else {
+              const p = padPointer ?? hostPointerNorm()
+              cancelPendingMove()
+              sendInput({ t: 'mouse_button', btn: a.btn, down, x: p.x, y: p.y, mon: 0 })
+            }
+            heldInputs.button(a.btn, down)
+            break
+          }
+          case 'wheel': {
+            const step = touchWheel.add(a.dx, a.dy)
+            if (step) sendInput({ t: 'mouse_wheel', dx: step.dx, dy: step.dy, mode: 'pixel' })
+            break
+          }
+          case 'zoom':
+            options?.onPinchZoom?.(a.factor, a.cx, a.cy)
+            break
+        }
+      }
+      armTouchTimer()
+    }
+
+    /** Re-arm the long-press / hold timer for whatever the current mode's
+     *  recognizer waits on now. */
+    function armTouchTimer() {
       if (longPressTimer !== null) {
         clearTimeout(longPressTimer)
         longPressTimer = null
       }
-      const due = touchGestures.deadline()
+      const pad = touchMode.value === 'trackpad'
+      const due = pad ? trackpad.deadline() : touchGestures.deadline()
       if (due !== null) {
         longPressTimer = setTimeout(() => {
           longPressTimer = null
-          runGestures(touchGestures.tick(performance.now()))
+          if (pad) runTrackpad(trackpad.tick(performance.now()))
+          else runGestures(touchGestures.tick(performance.now()))
         }, Math.max(0, due - performance.now()) + 5)
       }
+    }
+
+    /** One touch event, to the current mode's recognizer. */
+    function touchStep(kind: 'down' | 'move' | 'up', ev: PointerEvent) {
+      const p = touchSample(ev)
+      if (touchMode.value === 'trackpad') runTrackpad(trackpad[kind](p))
+      else runGestures(touchGestures[kind](p))
+    }
+    function touchCancel(id: number) {
+      if (touchMode.value === 'trackpad') runTrackpad(trackpad.cancel(id))
+      else runGestures(touchGestures.cancel(id))
+    }
+    function touchActive(): boolean {
+      return touchMode.value === 'trackpad' ? trackpad.active() : touchGestures.active()
     }
 
     function releaseHeldInputs() {
@@ -12039,6 +12171,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     enterRelativeMouse,
     exitRelativeMouse,
     setRelativeMouseAllowed,
+    touchMode,
+    setTouchMode,
     /** rc.87 Ã¢ÂÂ real encoder info from the agent (`rc:video-info`).
      *  Null on the legacy track / libvpx paths (no message); the
      *  badge falls back to a selection-derived label then. */
