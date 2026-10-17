@@ -11,8 +11,10 @@ connection** — they do not take a detour through the server.
 
 ## Clipboard
 
-Copy on one side, paste on the other. Text is synchronised in both directions
-while the session is open.
+Copy on one side, paste on the other. Text, formatted text and images move in
+both directions while the session is open. With auto-sync on, what you copy
+follows you without a click; the clipboard buttons on the session toolbar send
+or fetch it on demand.
 
 :::warning The clipboard is shared while the session lasts
 Anything you copy on either machine becomes available to the other. Be aware of
@@ -60,6 +62,9 @@ better options:
 
 ## Limits worth knowing
 
-- **Clipboard sync is text.** Copying an image or a file object through the clipboard is not the transfer path — drag the file instead.
-- **On macOS**, remote *audio* capture is unavailable, which occasionally surprises people expecting a full session mirror.
+- **A file is not a clipboard item.** Copying a file object in the remote file manager does not carry the file — drag it, or use the transfer panel.
+- **An image copied on a macOS or Linux machine waits to be fetched.** Only a Windows host notices copied images by itself; elsewhere text still follows you automatically, and the clipboard button brings an image across.
+- **A Linux machine whose agent runs as a system service outside any desktop session has no clipboard to share.** Its clipboard buttons stay greyed, with the reason in their tooltip.
+- **On macOS**, remote *audio* capture is unavailable, which occasionally surprises people expecting a full session mirror. The receive-audio toggle says so.
+- **The Ctrl+Alt+Del button types the three keys.** On Windows they reach the programs on the desktop but not the lock or sign-in screen. On Linux the desktop decides what they do: GNOME and KDE offer to log out. A Mac gives the keys no meaning, so the button is not shown there.
 - **SFTP against a Windows target** works when the SSH session runs as the daemon's own account; running it as the logged-in console user is not yet supported there.

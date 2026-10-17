@@ -77,6 +77,10 @@ export const DEVICE_ID_PLACEHOLDER = '<device-id>'
  * enrolls. A machine-wide Windows install then gets a fourth block, the
  * elevated `roomlerd anchor create` with the same token, for the script
  * and manual paths; Roomler Setup runs it itself.
+ *
+ * FR-97 D5: Roomler Setup installs the agent on Windows only — on Linux and
+ * macOS it installs the tunnel client (`agents/roomler-setup`), so an agent
+ * enrollment there offers the script and the manual path, never the wizard.
  */
 export function enrollCommands(
   kind: EnrollKind,
@@ -128,6 +132,9 @@ export function enrollCommands(
     command: `${base}/api/setup/${platform}`,
     isDownload: true,
   })
+  // FR-97 D5 — off Windows the wizard has no agent role to install.
+  const wizardUnlessAgent = (os: EnrollOs, platform: string): CommandBlock[] =>
+    kind === 'agent' ? [] : [wizard(os, platform)]
 
   return [
     {
@@ -166,7 +173,7 @@ export function enrollCommands(
       note: machineWide
         ? "Installs a root systemd system service (sudo will prompt). Screen capture needs a logged-in session — pick 'This user only' for desktops."
         : undefined,
-      blocks: [shOneLiner('linux'), wizard('linux', 'linux'), manual('linux')],
+      blocks: [shOneLiner('linux'), ...wizardUnlessAgent('linux', 'linux'), manual('linux')],
     },
     {
       os: 'macos',
@@ -182,7 +189,7 @@ export function enrollCommands(
         kind === 'agent'
           ? 'Installs the per-user half (screen sharing + input). To also join the overlay mesh, mint a second enrollment token and append --daemon-token <token> — that adds a root LaunchDaemon and a second device row for this Mac.'
           : undefined,
-      blocks: [shOneLiner('macos'), wizard('macos', 'macos'), manual('macos')],
+      blocks: [shOneLiner('macos'), ...wizardUnlessAgent('macos', 'macos'), manual('macos')],
     },
   ]
 }
