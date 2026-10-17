@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
+//
+// The vault's Cedar schema (FR-90 P3-2, design §8.4). Every policy an
+// organization writes is validated against it, strictly, before it is
+// stored: a policy that names an attribute or an action this schema does
+// not have is refused, never kept to do nothing.
+
+namespace Roomler {
+  // A person in the organization, in one Group per roomler role they hold
+  // (`owner`, `admin`, `member`, … and the organization's own).
+  entity Group;
+  entity User in [Group];
+
+  // A role an agent session assumes at its start.
+  entity Role;
+
+  // An agent session, in the role it assumed. `playbook` names the playbook
+  // it runs, when it runs one.
+  entity Session in [Role] = {
+    owner: User,
+    playbook?: String,
+  };
+
+  // A secret's folders, one per path prefix, each in the one above it: the
+  // secret `rrn:org:secret:prod/db/main` is in the folders
+  // `rrn:org:secret:prod/db` and `rrn:org:secret:prod`. `path` is the
+  // secret's path within its organization (`prod/db/main`).
+  entity SecretFolder in [SecretFolder];
+  entity Secret in [SecretFolder] = {
+    path: String,
+    kind: String,
+    tags: Set<String>,
+  };
+
+  // The device a request is made on, as its row holds it: `os` is `linux`,
+  // `macos` or `windows`; tags are lowercased.
+  type Device = {
+    os: String,
+    tags: Set<String>,
+    owner: User,
+  };
+
+  // A person answered an approval card in the session's room.
+  type Approval = {
+    approver: User,
+  };
+
+  // Who may assume a role, and on which device.
+  action "role:assume" appliesTo {
+    principal: [User],
+    resource: [Role],
+    context: {
+      device: Device,
+    },
+  };
+
+  // A session using a secret: in which mode, toward which audience, for how
+  // long, on which device, and whether a person approved it.
+  action "secret:use" appliesTo {
+    principal: [Session],
+    resource: [Secret],
+    context: {
+      mode: String,
+      audience: String,
+      ttl_s: Long,
+      device: Device,
+      approval?: Approval,
+    },
+  };
+}

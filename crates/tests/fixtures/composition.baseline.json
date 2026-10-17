@@ -941,6 +941,26 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/tenant/{tenant_id}/vault/policy",
+      "methods": "GET,HEAD,POST"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/vault/policy/{policy_id}",
+      "methods": "DELETE,GET,HEAD,PUT"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/vault/role",
+      "methods": "GET,HEAD,POST"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/vault/role/{name}",
+      "methods": "DELETE"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/vault/schema",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/vault/secret",
       "methods": "GET,HEAD,POST"
     },
@@ -951,6 +971,10 @@
     {
       "path": "/api/tenant/{tenant_id}/vault/secret/{secret_id}/value",
       "methods": "PUT"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/vault/simulate",
+      "methods": "POST"
     },
     {
       "path": "/api/tenant/{tenant_id}/vault/verify",
@@ -2970,6 +2994,47 @@
               "at": 1
             },
             "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "vault_policies",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "name": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "deleted_at": {
+                "$type": "null"
+              }
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "deleted_at": 1,
+              "created_at": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "vault_roles",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "name": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "deleted_at": {
+                "$type": "null"
+              }
+            }
           }
         ]
       },
@@ -4996,6 +5061,47 @@
               "at": 1
             },
             "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "vault_policies",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "name": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "deleted_at": {
+                "$type": "null"
+              }
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "deleted_at": 1,
+              "created_at": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "vault_roles",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "name": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "deleted_at": {
+                "$type": "null"
+              }
+            }
           }
         ]
       },
