@@ -991,7 +991,14 @@ New cells run three times before they are trusted. An entry in `expected-failure
   `ROOMLERD_WAYLAND_AWARE=0` through a unit drop-in): `backend=scrap`, black, no reason, as 0.4.124, and no
   input-reach warning (0 of 50 samples, where 0.4.135 sent one in 59 of 60).
 
-  Owed: FR-29's idle numbers on an X11 host, and a Windows and a macOS session on 0.4.136, which carries P1a.
+  ✅ **An X11 host on the released 0.4.141** (2026-10-17): a kept vmtest Ubuntu 24.04 cell, a per-user install,
+  GNOME on **Xorg** (`capture: backend=scrap`), 1280×800, one viewer per arm. An idle desktop over the RTP track
+  costs **1.4 %** of a core (median 1, n 60), against FR-29's 3.4 %. The same idle desktop over the VP9-444
+  DataChannel costs 13 %, because the pump keeps sending its quality refine. A moving window reaches 28.7 fps
+  over DC and 28.5 over RTP at the 30 target. Nothing reached the viewer that 0.4.124 would not have sent: a
+  picture, the scrap arm, no wait and no reach warning.
+
+  Owed: a Windows and a macOS session on a release that carries P1a.
 - [x] **AC12** — Asahi (real scanout) passes AC1/AC4/AC5/AC7 on the released build.
   ✅ **0.4.139, the release** (published 2026-10-16 10:15Z; step log 93), on a rented Apple M2 Pro Mac mini with
   Fedora Asahi Remix 42 (`apple-drm`, HDMI 4096×2160), GNOME 48 and Plasma 6.6 beside each other. Installed by the

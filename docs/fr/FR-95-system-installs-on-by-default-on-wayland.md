@@ -140,7 +140,9 @@ the person who was told is back. Their own new viewer session re-plans, and tell
 - [ ] **AC5**: either kill switch gives back the behaviour before this FR exactly, and X11 hosts are unchanged.
   ⏳ Both kill switches pass on the released 0.4.141 (`wayland_auto_system = false` on both desktops,
   `wayland_auto = false` on GNOME): 0.4.137's overlay, word for word. X11 is unchanged by construction (the plan
-  needs a Wayland session on screen), but no X11 host has been run. Owed: one.
+  needs a Wayland session on screen). An X11 host was run on the release on 2026-10-17 (FR-93 AC11: a vmtest
+  Ubuntu cell, GNOME on Xorg, the scrap arm, an idle RTP session at 1.4 % of a core), but as a **per-user**
+  install, which this FR does not change. Owed: a system install on an X11 host.
 - [ ] **AC6**: P0's counts recorded before and after the roll (the server, not an exec sweep).
   ⏳ **After** (prod, 2026-10-17 19:03Z, §8): no customer device answers `none` on Wayland. **Before** was never
   snapshotted at the 0.4.139 roll; the devices still on older versions are what is left of it, and none of them
