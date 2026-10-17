@@ -794,3 +794,339 @@ async fn patch_changes_the_rules_never_the_name() {
         (json!("svc"), json!("static"))
     );
 }
+
+// ─── P3-2 — roles, policies, simulate ──────────────────────────────────────
+
+async fn post_json(
+    app: &TestApp,
+    t: &SeededTenant,
+    rest: &str,
+    body: Value,
+) -> (u16, String, Value) {
+    call(
+        app.auth_post(&vpath(&t.tenant_id, rest), &t.admin.access_token)
+            .json(&body),
+    )
+    .await
+}
+
+/// Roles and policies: an administrator's, each policy checked before it is
+/// kept (Cedar, the schema, this organization's names only), a write from
+/// the revision read, a role no live policy names the only one that goes,
+/// a guardrail never edited or removed, and every write recorded.
+#[tokio::test]
+async fn roles_and_policies_are_checked_before_they_are_kept() {
+    let app = vault_app(Some(fresh_kek())).await;
+    let t = app.seed_tenant("vaultpolicy").await;
+    let tok = &t.admin.access_token;
+
+    let (code, text, role) = post_json(&app, &t, "/role", json!({ "name": "dev" })).await;
+    assert_eq!(code, 201, "{text}");
+    assert_eq!(role["name"], json!("dev"));
+    let (code, _, _) = post_json(&app, &t, "/role", json!({ "name": "dev" })).await;
+    assert_eq!(code, 409, "one live role per name");
+    let (code, _, _) = post_json(&app, &t, "/role", json!({ "name": "Dev" })).await;
+    assert_eq!(code, 400, "one spelling");
+
+    let permit = format!(
+        r#"permit (principal in Roomler::Role::"dev", action == Roomler::Action::"secret:use", resource in Roomler::SecretFolder::"rrn:{}:secret:staging");"#,
+        t.tenant_slug
+    );
+    let (code, text, p) = post_json(
+        &app,
+        &t,
+        "/policy",
+        json!({ "name": "dev-staging", "text": permit }),
+    )
+    .await;
+    assert_eq!(code, 201, "{text}");
+    assert_eq!(
+        (
+            p["effect"].clone(),
+            p["rev"].clone(),
+            p["guardrail"].clone()
+        ),
+        (json!("permit"), json!(1), json!(false))
+    );
+    let pid = p["id"].as_str().unwrap().to_string();
+    assert!(pid.starts_with("policy:"), "{pid}");
+
+    for (text, why) in [
+        (
+            r#"permit (principal, action == Roomler::Action::"secret:use", resource in Roomler::SecretFolder::"rrn:someone-else:secret:prod");"#.to_string(),
+            "not this organization",
+        ),
+        (
+            r#"permit (principal in Roomler::Role::"ghost", action, resource);"#.to_string(),
+            "vault roles",
+        ),
+        (
+            "permit (principal, action, resource)".to_string(),
+            "not a Cedar policy",
+        ),
+        (
+            r#"permit (principal, action == Roomler::Action::"secret:read", resource);"#.to_string(),
+            "schema",
+        ),
+        (
+            format!(
+                r#"forbid (principal == Roomler::User::"{}", action, resource);"#,
+                ObjectId::new().to_hex()
+            ),
+            "not a member",
+        ),
+    ] {
+        let (code, _, body) =
+            post_json(&app, &t, "/policy", json!({ "name": "bad", "text": text })).await;
+        assert_eq!(code, 400, "{text}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains(why),
+            "{text} → {body}"
+        );
+    }
+
+    // The guardrails first, then the organization's own.
+    let (_, _, list) = call(app.auth_get(&vpath(&t.tenant_id, "/policy"), tok)).await;
+    let ids: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "guardrail:windows-proxy-only",
+            "guardrail:prod-never-materializes",
+            pid.as_str()
+        ],
+        "{list}"
+    );
+
+    // A write from the revision read.
+    let one = vpath(&t.tenant_id, &format!("/policy/{pid}"));
+    let put = |rev: i64| {
+        app.client
+            .put(app.url(&one))
+            .header("Authorization", format!("Bearer {tok}"))
+            .json(&json!({
+                "name": "dev-staging",
+                "description": "staging, by proxy",
+                "text": permit,
+                "rev": rev,
+            }))
+    };
+    let (code, _, _) = call(put(7)).await;
+    assert_eq!(code, 409, "a stale revision");
+    let (code, text, p2) = call(put(1)).await;
+    assert_eq!(code, 200, "{text}");
+    assert_eq!(p2["rev"], json!(2));
+
+    // A guardrail is never edited or removed.
+    let g = vpath(&t.tenant_id, "/policy/guardrail:windows-proxy-only");
+    let (code, _, _) = call(
+        app.client
+            .put(app.url(&g))
+            .header("Authorization", format!("Bearer {tok}"))
+            .json(&json!({ "name": "x", "text": permit, "rev": 1 })),
+    )
+    .await;
+    assert_eq!(code, 400);
+    let (code, _, _) = call(app.auth_delete(&g, tok)).await;
+    assert_eq!(code, 400);
+
+    // A role a live policy names does not go; once nothing names it, it does.
+    let (code, _, body) = call(app.auth_delete(&vpath(&t.tenant_id, "/role/dev"), tok)).await;
+    assert_eq!(code, 409, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("dev-staging"),
+        "{body}"
+    );
+    let (code, _, _) = call(app.auth_delete(&one, tok)).await;
+    assert_eq!(code, 200);
+    let (code, _, _) = call(app.auth_delete(&vpath(&t.tenant_id, "/role/dev"), tok)).await;
+    assert_eq!(code, 200);
+
+    // A member reaches none of it; every write is recorded.
+    let m = &t.member.access_token;
+    for req in [
+        app.auth_post(&vpath(&t.tenant_id, "/role"), m)
+            .json(&json!({ "name": "mine" })),
+        app.auth_post(&vpath(&t.tenant_id, "/policy"), m)
+            .json(&json!({ "name": "mine", "text": "permit (principal, action, resource);" })),
+        app.auth_get(&vpath(&t.tenant_id, "/policy"), m),
+        app.auth_get(&vpath(&t.tenant_id, "/schema"), m),
+    ] {
+        let (code, _, body) = call(req).await;
+        assert_eq!(code, 403, "{body}");
+    }
+    let writes = audit_rows(&app, doc! { "action": "policy:write" }).await;
+    let seen: Vec<(String, String)> = writes
+        .iter()
+        .map(|d| {
+            (
+                d.get_str("op").unwrap().to_string(),
+                d.get_str("decision").unwrap().to_string(),
+            )
+        })
+        .collect();
+    for want in [
+        ("role_create", "allow"),
+        ("policy_create", "allow"),
+        ("policy_update", "allow"),
+        ("policy_delete", "allow"),
+        ("role_delete", "allow"),
+        ("role_create", "deny"),
+        ("policy_create", "deny"),
+    ] {
+        assert!(
+            seen.contains(&(want.0.to_string(), want.1.to_string())),
+            "{want:?} not recorded: {seen:?}"
+        );
+    }
+}
+
+/// `simulate`: the vault's own decision for a request it is asked about —
+/// which policy permitted it, which guardrail forbade it, or nothing (the
+/// default deny) — and the same with a change not yet made. It records
+/// nothing.
+#[tokio::test]
+async fn simulate_says_what_would_decide_a_request() {
+    let app = vault_app(Some(fresh_kek())).await;
+    let t = app.seed_tenant("vaultsim").await;
+    let me = t.admin.id.clone();
+    let slug = t.tenant_slug.clone();
+    post_json(&app, &t, "/role", json!({ "name": "dev" })).await;
+    let (_, _, staging) = create(&app, &t, json!({ "path": "staging/db", "kind": "static" })).await;
+    let (_, _, prod) = create(&app, &t, json!({ "path": "prod/db", "kind": "static" })).await;
+    let staging = staging["id"].as_str().unwrap().to_string();
+    let prod = prod["id"].as_str().unwrap().to_string();
+    let permit = format!(
+        r#"permit (principal in Roomler::Role::"dev", action == Roomler::Action::"secret:use", resource in Roomler::SecretFolder::"rrn:{slug}:secret:staging");"#
+    );
+    let (_, _, p) = post_json(
+        &app,
+        &t,
+        "/policy",
+        json!({ "name": "dev-staging", "text": permit }),
+    )
+    .await;
+    let pid = p["id"].as_str().unwrap().to_string();
+    let assume = r#"permit (principal in Roomler::Group::"member", action == Roomler::Action::"role:assume", resource == Roomler::Role::"dev") when { context.device.owner == principal };"#;
+    let (code, text, _) = post_json(
+        &app,
+        &t,
+        "/policy",
+        json!({ "name": "members-assume-dev-on-own", "text": assume }),
+    )
+    .await;
+    assert_eq!(code, 201, "{text}");
+    let audit_before = audit_rows(&app, doc! {}).await.len();
+
+    let sim = |secret: &str, mode: &str, os: &str, extra: Value| {
+        let mut body = json!({
+            "action": "secret:use",
+            "principal": { "role": "dev", "owner_id": me },
+            "resource": { "secret_id": secret },
+            "mode": mode,
+            "device": { "os": os, "tags": [], "owner_id": me },
+        });
+        if let (Some(b), Some(e)) = (body.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                b.insert(k.clone(), v.clone());
+            }
+        }
+        post_json(&app, &t, "/simulate", body)
+    };
+    let decided = |v: &Value| -> (String, Vec<String>) {
+        (
+            v["decision"].as_str().unwrap().to_string(),
+            v["determining"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["id"].as_str().unwrap().to_string())
+                .collect(),
+        )
+    };
+
+    let (code, text, v) = sim(&staging, "proxy", "linux", json!({})).await;
+    assert_eq!(code, 200, "{text}");
+    assert_eq!(decided(&v), ("allow".into(), vec![pid.clone()]), "{v}");
+    assert_eq!(v["determining"][0]["name"], json!("dev-staging"));
+
+    let (_, _, v) = sim(&prod, "proxy", "linux", json!({})).await;
+    assert_eq!(
+        decided(&v),
+        ("deny".into(), vec![]),
+        "nothing permits prod: {v}"
+    );
+
+    let (_, _, v) = sim(&staging, "env", "windows", json!({})).await;
+    assert_eq!(
+        decided(&v),
+        ("deny".into(), vec!["guardrail:windows-proxy-only".into()]),
+        "{v}"
+    );
+
+    // A change not yet made: without the permit; with a broader one.
+    let (_, _, v) = sim(&staging, "proxy", "linux", json!({ "without": [pid] })).await;
+    assert_eq!(decided(&v).0, "deny", "{v}");
+    let everything = r#"permit (principal in Roomler::Role::"dev", action == Roomler::Action::"secret:use", resource);"#;
+    let (_, _, v) = sim(&prod, "proxy", "linux", json!({ "with": [everything] })).await;
+    assert_eq!(decided(&v), ("allow".into(), vec!["with:0".into()]), "{v}");
+    let (_, _, v) = sim(&prod, "env", "linux", json!({ "with": [everything] })).await;
+    assert_eq!(
+        decided(&v),
+        (
+            "deny".into(),
+            vec!["guardrail:prod-never-materializes".into()]
+        ),
+        "a prod value never materializes, whatever permits it: {v}"
+    );
+    let (code, _, _) = sim(
+        &prod,
+        "proxy",
+        "linux",
+        json!({ "without": ["guardrail:windows-proxy-only"] }),
+    )
+    .await;
+    assert_eq!(code, 400, "a guardrail cannot be left out");
+
+    // role:assume reads the device: the member's own, yes; another's, no.
+    let member = t.member.id.clone();
+    let assume_on = |owner: &str| {
+        post_json(
+            &app,
+            &t,
+            "/simulate",
+            json!({
+                "action": "role:assume",
+                "principal": { "user_id": member },
+                "resource": { "role": "dev" },
+                "device": { "os": "macos", "tags": [], "owner_id": owner },
+            }),
+        )
+    };
+    let (code, text, v) = assume_on(&member).await;
+    assert_eq!(code, 200, "{text}");
+    assert_eq!(decided(&v).0, "allow", "{v}");
+    let (_, _, v) = assume_on(&me).await;
+    assert_eq!(decided(&v).0, "deny", "{v}");
+
+    // Bad requests are refused in words, and nothing was recorded.
+    for bad in [
+        json!({ "action": "secret:read", "device": { "os": "linux", "owner_id": me } }),
+        json!({ "action": "secret:use", "principal": { "role": "ghost", "owner_id": me }, "resource": { "secret_id": staging }, "mode": "proxy", "device": { "os": "linux", "owner_id": me } }),
+        json!({ "action": "secret:use", "principal": { "role": "dev", "owner_id": me }, "resource": { "secret_id": staging }, "mode": "raw", "device": { "os": "linux", "owner_id": me } }),
+        json!({ "action": "secret:use", "principal": { "role": "dev", "owner_id": me }, "resource": { "secret_id": staging }, "mode": "proxy", "device": { "os": "Windows", "owner_id": me } }),
+    ] {
+        let (code, _, body) = post_json(&app, &t, "/simulate", bad.clone()).await;
+        assert_eq!(code, 400, "{bad} → {body}");
+    }
+    assert_eq!(
+        audit_rows(&app, doc! {}).await.len(),
+        audit_before,
+        "simulate records nothing"
+    );
+}

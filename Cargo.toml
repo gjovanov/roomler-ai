@@ -294,6 +294,10 @@ hex = "0.4"
 # `kem` 0.3.0, and one lockfile holds one `kem` 0.3.x. The X25519 recipient and
 # the file format are the same in both.
 age = { version = "0.11", default-features = false }
+# FR-90 P3-2 — the vault's policy language (design §8.4): Rust-native,
+# schema-validated, formally analysed. No extensions: the vault's policies
+# compare strings, sets and integers.
+cedar-policy = { version = "4.14", default-features = false }
 chacha20poly1305 = "0.10"
 zeroize = "1"
 

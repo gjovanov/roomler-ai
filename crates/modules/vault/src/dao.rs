@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-//! The vault's three collections.
+//! The vault's collections: secrets, versions and audit (P3-1), roles and
+//! policies (P3-2).
 //!
 //! ⚠️ A metadata read never loads a sealed value: the version listing
 //! projects `ciphertext`, `nonce` and `dek_wrapped` away, so describing a
@@ -12,7 +13,11 @@ use mongodb::{Database, options::ReturnDocument};
 use roomler_ai_services::dao::base::{BaseDao, DaoError, DaoResult, escape_regex};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{VaultAuditEvent, VaultSecret, VaultVersion};
+use crate::model::{VaultAuditEvent, VaultPolicy, VaultRole, VaultSecret, VaultVersion};
+
+/// The most roles, and the most policies, an organization keeps.
+pub const MAX_ROLES: i64 = 200;
+pub const MAX_POLICIES: i64 = 500;
 
 /// The most secrets one listing answers with.
 pub const MAX_LIST: i64 = 1000;
@@ -292,4 +297,144 @@ impl VaultAuditDao {
 pub fn is_path_taken(e: &DaoError) -> bool {
     matches!(e, DaoError::DuplicateKey(msg)
         if roomler_ai_services::dao::base::duplicate_key_is_on(msg, "path"))
+}
+
+/// `DuplicateKey` on a `name` index (roles, policies).
+pub fn is_name_taken(e: &DaoError) -> bool {
+    matches!(e, DaoError::DuplicateKey(msg)
+        if roomler_ai_services::dao::base::duplicate_key_is_on(msg, "name"))
+}
+
+/// Every live row of `T` in an organization, sorted, at most `limit`.
+async fn live_rows<T>(
+    base: &BaseDao<T>,
+    tenant_id: ObjectId,
+    sort: Document,
+    limit: i64,
+) -> DaoResult<Vec<T>>
+where
+    T: Serialize + for<'de> Deserialize<'de> + Unpin + Send + Sync,
+{
+    let mut cursor = base
+        .collection()
+        .find(doc! { "tenant_id": tenant_id, "deleted_at": null })
+        .sort(sort)
+        .limit(limit)
+        .await?;
+    let mut out = Vec::new();
+    while let Some(r) = cursor.try_next().await? {
+        out.push(r);
+    }
+    Ok(out)
+}
+
+/// Tombstone a live row: a compare-and-set, `true` only for the call that
+/// moved it from live.
+async fn tombstone_row<T>(base: &BaseDao<T>, filter: Document) -> DaoResult<bool>
+where
+    T: Serialize + for<'de> Deserialize<'de> + Unpin + Send + Sync,
+{
+    let mut filter = filter;
+    filter.insert("deleted_at", bson::Bson::Null);
+    let r = base
+        .collection()
+        .update_one(filter, doc! { "$set": { "deleted_at": DateTime::now() } })
+        .await?;
+    Ok(r.modified_count > 0)
+}
+
+pub struct VaultRoleDao {
+    pub base: BaseDao<VaultRole>,
+}
+
+impl VaultRoleDao {
+    pub fn new(db: &Database) -> Self {
+        Self {
+            base: BaseDao::new(db, VaultRole::COLLECTION),
+        }
+    }
+
+    /// A new role. `DuplicateKey` on `name` when a live role holds it.
+    pub async fn create(&self, role: &VaultRole) -> DaoResult<ObjectId> {
+        self.base.insert_one(role).await
+    }
+
+    pub async fn list_live(&self, tenant_id: ObjectId) -> DaoResult<Vec<VaultRole>> {
+        live_rows(&self.base, tenant_id, doc! { "name": 1 }, MAX_ROLES).await
+    }
+
+    pub async fn count_live(&self, tenant_id: ObjectId) -> DaoResult<u64> {
+        self.base
+            .count(doc! { "tenant_id": tenant_id, "deleted_at": null })
+            .await
+    }
+
+    pub async fn tombstone(&self, tenant_id: ObjectId, name: &str) -> DaoResult<bool> {
+        tombstone_row(&self.base, doc! { "tenant_id": tenant_id, "name": name }).await
+    }
+}
+
+pub struct VaultPolicyDao {
+    pub base: BaseDao<VaultPolicy>,
+}
+
+impl VaultPolicyDao {
+    pub fn new(db: &Database) -> Self {
+        Self {
+            base: BaseDao::new(db, VaultPolicy::COLLECTION),
+        }
+    }
+
+    /// A new policy. `DuplicateKey` on `name` when a live policy holds it.
+    pub async fn create(&self, policy: &VaultPolicy) -> DaoResult<ObjectId> {
+        self.base.insert_one(policy).await
+    }
+
+    /// The organization's live policies, oldest first.
+    pub async fn list_live(&self, tenant_id: ObjectId) -> DaoResult<Vec<VaultPolicy>> {
+        live_rows(
+            &self.base,
+            tenant_id,
+            doc! { "created_at": 1, "_id": 1 },
+            MAX_POLICIES,
+        )
+        .await
+    }
+
+    pub async fn count_live(&self, tenant_id: ObjectId) -> DaoResult<u64> {
+        self.base
+            .count(doc! { "tenant_id": tenant_id, "deleted_at": null })
+            .await
+    }
+
+    pub async fn get_live(&self, tenant_id: ObjectId, id: ObjectId) -> DaoResult<VaultPolicy> {
+        self.base.find_live_by_id_in_tenant(tenant_id, id).await
+    }
+
+    /// Replace a live policy's name, description and text — only from the
+    /// revision the writer read. `None` when that revision is not the live
+    /// one any more (or the policy is gone); the new row otherwise.
+    pub async fn replace(
+        &self,
+        tenant_id: ObjectId,
+        id: ObjectId,
+        rev: i64,
+        set: Document,
+    ) -> DaoResult<Option<VaultPolicy>> {
+        let mut set = set;
+        set.insert("updated_at", DateTime::now());
+        Ok(self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! { "_id": id, "tenant_id": tenant_id, "deleted_at": null, "rev": rev },
+                doc! { "$set": set, "$inc": { "rev": 1_i64 } },
+            )
+            .return_document(ReturnDocument::After)
+            .await?)
+    }
+
+    pub async fn tombstone(&self, tenant_id: ObjectId, id: ObjectId) -> DaoResult<bool> {
+        tombstone_row(&self.base, doc! { "_id": id, "tenant_id": tenant_id }).await
+    }
 }
