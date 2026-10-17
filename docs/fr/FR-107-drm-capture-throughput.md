@@ -1,10 +1,10 @@
 # FR-107: 4K DRM capture at full frame rate — honour the encode box, read in parallel, then the GPU
 
-**Issue:** [#2317](https://github.com/gjovanov/roomler-ai/issues/2317) · **Status:** in progress — spec and
-claim 2026-10-16, on the operator's *"can we improve on it"* after a window drag on FR-93 AC12's box ran at
-9 fps. P1 and P2 merged (#2320); P2b (the pacing) and P3 (the GPU path) are lab-verified on that box: a moving
-window at 27.9 fps on the VP9 path and 28.8 on the RTP track, against 6.3 and 15.1 for 0.4.139 on the same
-desktop · **Owner:** remote desktop (the agent's DRM arm) · **Anchors:** master `b8e6e92a0` · **Builds on:** [FR-36](FR-36-wayland-capture.md) (the DRM arm, the fused
+**Issue:** [#2317](https://github.com/gjovanov/roomler-ai/issues/2317) · **Status:** **closed 2026-10-17**,
+field-verified on the released **0.4.140**. The spec and claim date from 2026-10-16, on the operator's *"can we
+improve on it"* after a window drag on FR-93 AC12's box ran at 9 fps. P1 and P2 merged in #2320, P2b and P3 in
+#2330. On that box a moving window now holds 27.3 fps on the VP9 path and 28.8 on the RTP track, against 6.3
+and 15.1 for 0.4.139 on the same desktop. A frame's grab went from 23 ms to 1.9 ms (§9) · **Owner:** remote desktop (the agent's DRM arm) · **Anchors:** master `b8e6e92a0` · **Builds on:** [FR-36](FR-36-wayland-capture.md) (the DRM arm, the fused
 half read, P2's deferred EGL detiling), [FR-93](FR-93-wayland-out-of-the-box.md) (AC12's box),
 [FR-95](FR-95-system-installs-on-by-default-on-wayland.md) (the system install's capture)
 
@@ -122,12 +122,12 @@ software. The GPU's work is the capture.
 
 | Phase | What | Kill switch | Proven on | Size |
 |---|---|---|---|---|
-| **P1** | the DRM arm follows the pump's encode box to the half read (§3) | `ROOMLERD_DRM_FOLLOW_CAP=0` | ✅ the Asahi box, a candidate on 0.4.139's source (§9); merged #2320 | S |
-| **P2** | the repack in row bands, 4 threads by default | `ROOMLERD_DRM_THREADS=1` | ✅ the same candidate (§9); `banded_repacks_match_the_single_pass`; merged #2320 | S |
-| **P2b** | the frame period runs from the ask, not the arrival (§3) | — (a timing fix) | ✅ the Asahi box, a candidate on master `7382639b8` (§9) | S |
-| **P3** | the GPU path: an EGL import, a GLES pass to the encode box, a readback (§3) | `ROOMLERD_DRM_GPU=0` | ✅ the same candidate (§9); unit: `the_gpu_renders_the_encode_box`, `the_taps_cover_the_footprint`, `the_import_names_the_buffer_as_getfb2_described_it`; on a GPU (`#[ignore]`d): `a_capture_leaks_nothing_when_it_ends` | M |
-| **P4** | the GPU writes I420/I444 for the encoder | `ROOMLERD_DRM_GPU_YUV=0` | — | M |
-| **P5** | docs: `docs/linux-capture.md` §3.4 (with P1/P2) and each later phase; the `docs/README.md` index row | — | — | S |
+| **P1** | the DRM arm follows the pump's encode box to the half read (§3) | `ROOMLERD_DRM_FOLLOW_CAP=0` | ✅ merged #2320; **released in 0.4.140, field-verified** on the Asahi box (§9) | S |
+| **P2** | the repack in row bands, 4 threads by default | `ROOMLERD_DRM_THREADS=1` | ✅ merged #2320, `banded_repacks_match_the_single_pass`; **released in 0.4.140, field-verified** (§9) | S |
+| **P2b** | the frame period runs from the ask, not the arrival (§3) | — (a timing fix) | ✅ merged #2330; **released in 0.4.140, field-verified** (§9) | S |
+| **P3** | the GPU path: an EGL import, a GLES pass to the encode box, a readback (§3) | `ROOMLERD_DRM_GPU=0` | ✅ merged #2330. Unit: `the_gpu_renders_the_encode_box`, `the_taps_cover_the_footprint`, `the_import_names_the_buffer_as_getfb2_described_it`; on a GPU (`#[ignore]`d): `a_capture_leaks_nothing_when_it_ends`. **Released in 0.4.140, field-verified** (§9) | M |
+| **P4** | the GPU writes I420/I444 for the encoder | `ROOMLERD_DRM_GPU_YUV=0` | **Deferred, not built (D2).** P3 alone met every criterion: the grab costs 1.9 ms, and the encode is now the slowest stage (§8) | M |
+| **P5** | docs: `docs/linux-capture.md` §3.4 (with P1/P2) and each later phase; the `docs/README.md` index row | — | ✅ #2320, #2330, and the close | S |
 
 ## 5. Test plan
 
@@ -163,25 +163,42 @@ software. The GPU's work is the capture.
 
 ## 6. Acceptance criteria
 
-- [ ] **AC1** — On the Asahi box (4K, GNOME, the FR-95 system capture), a continuously moving window holds
+- [x] **AC1** — On the Asahi box (4K, GNOME, the FR-95 system capture), a continuously moving window holds
   **≥ 25 fps** on both the H.264/RTP and the VP9-444/DataChannel paths, from the pump's heartbeats. Red first
   on 0.4.139.
-- [ ] **AC2** — The picture is unchanged in content. The banded repack is byte-identical to the single pass
+  *0.4.140: VP9-444/DataChannel **27.3 fps**, H.264/RTP **28.8 fps**. Red on 0.4.139, same desktop: 6.3 and
+  15.1 (§9).*
+- [x] **AC2** — The picture is unchanged in content. The banded repack is byte-identical to the single pass
   (unit test). The half read is FR-36's existing filter. A 1440p source keeps its full read for a 1080p box.
-- [ ] **AC3** — The capture's per-frame cost is recorded before and after each phase (`capture-smoke`, still
+  *The unit tests cover the CPU path. For the GPU path, on 0.4.140, one frame from the GPU and one from the CPU
+  path of the same still scanout at 2048×1080 differ by a mean of **0.10 levels of 255**, and 0.000% of
+  samples differ by more than 16. The frame looks right by eye too: upright, true colour (§9).*
+- [x] **AC3** — The capture's per-frame cost is recorded before and after each phase (`capture-smoke`, still
   and moving).
-- [ ] **AC4** — P3: capture ≤ 8 ms a frame at 4K on the box. A host without EGL falls back to the CPU path
+  *§9, per phase. On 0.4.140 the grab measured 1.92 / 1.91 ms (GPU), 13.1 / 13.8 ms (CPU), against 23.0 /
+  24.1 ms for 0.4.139 on the same desktop.*
+- [x] **AC4** — P3: capture ≤ 8 ms a frame at 4K on the box. A host without EGL falls back to the CPU path
   with one log line and no new package dependency.
-- [ ] **AC5** — Each kill switch restores the behaviour before its phase.
-- [ ] **AC6** — Docs: `docs/linux-capture.md` updated in the house style for each phase, and a
+  *0.4.140: **1.92 ms** a frame from 4096×2160 to 2048×1080, and 6.58 ms for a full-size readback. With
+  `libEGL.so.1` hidden, one line (*"no GPU path here, the CPU reads the scanout"*), then 60/60 frames from the
+  CPU. No `libEGL`/`libGLES` in the released binary's `DT_NEEDED`.*
+- [x] **AC5** — Each kill switch restores the behaviour before its phase.
+  *0.4.140:*
+  - *`ROOMLERD_DRM_FOLLOW_CAP=0`: the VP9 pump resamples a full 4K frame again (45.2 ms) and runs 8.7 fps.*
+  - *`ROOMLERD_DRM_THREADS=1` (with the GPU off): the half read takes 21.1 ms, the single pass, against 13.2.*
+  - *`ROOMLERD_DRM_GPU=0`: no P3 line, at the CPU path's cost.*
+  - *P2b has no switch.*
+- [x] **AC6** — Docs: `docs/linux-capture.md` updated in the house style for each phase, and a
   `docs/README.md` index row.
+  *`docs/linux-capture.md` §3.4 (the flow, the phase table with anchors, the measurements, the EGL lifecycle,
+  the callouts) and §7's switches; the `docs/README.md` row; #2320, #2330 and the close.*
 
 ## 7. Open decisions (operator)
 
 | | Decision | Status |
 |---|---|---|
-| **D1** | The GPU path's API | *(Recommended: EGL + GLES through `dlopen`. Mesa ships them everywhere it runs, Asahi included, and GLES is enough for a downscale and a format conversion. Vulkan would add a second, larger surface for the same work.)* |
-| **D2** | Whether P4 (the GPU's YUV) ships with P3 or after it | *(Recommended: after. P3 alone moves the read off the CPU, which is the measured wall.)* |
+| **D1** | The GPU path's API | **EGL + GLES through `dlopen`**, as built in P3. Mesa ships them everywhere it runs, Asahi included, and GLES is enough for a downscale and a format conversion. Vulkan would add a second, larger surface for the same work |
+| **D2** | Whether P4 (the GPU's YUV) ships with P3 or after it | **After, and not under this FR.** P3 alone met every criterion, and the encode is now the slowest stage (§8) |
 
 ## 8. Out of scope
 
@@ -194,6 +211,9 @@ software. The GPU's work is the capture.
   libvpx (8 threads, row-mt, 4 tile columns, `cpu-used` 6) is then the slowest stage. It stayed under the
   frame period after P3 (27.9 fps), but trading quality for frame rate under motion is rate control's
   question (`docs/rate-control.md`), not this FR's.
+- **P4, the GPU writing the encoder's I420/I444**, deferred at the close (D2). With the grab at 1.9 ms, the
+  BGRA → YUV pass is not where a frame's time goes. It is worth building once an encoder that takes YUV
+  directly is the bottleneck, with its own measurement.
 
 ## 9. Field-verification log
 
@@ -206,3 +226,4 @@ software. The GPU's work is the capture.
 | 2026-10-16 | the same box, now GPU-composited, one viewer, `vkcube` | 0.4.139; P1+P2 (0.4.139's source + #2320); P3 then P3 + P2b (master `7382639b8` + this phase, `/usr/local/bin/roomlerd-cand-sys`) | the pipeline per path, back to back | VP9-444/DataChannel: **6.3** (0.4.139, resample 49.5 ms) → 12.7 (P1+P2, encode-bound at QP 6 and 17.5 Mbps) → 26.1 (P3, resample 0.0 ms) → **27.9 fps** (P3 + P2b). H.264/RTP: **15.1** (capture 47.8 ms) → 19.9 → 26.2 → **28.8 fps** (capture 17.0 ms with the pacing's wait, encode 16.3 ms). The log names the path: *"the GPU reads the scanout (FR-107 P3…) renderer="Apple M2 Pro (G14S B1)""*. Unit: 36/36 `capture::drm` tests and CI's full clippy line, natively on the box. ⚠️ The 26 fps plateau was the pacing (§2), predicted to within 1 fps before the fix |
 | 2026-10-16 16:30Z | the same box, no session live (the last ended 16:08Z) | the same candidate | AC4 and AC5, through `capture-smoke` (§5) | **The grab** (240 frames, `--fps 1000`): GPU **1.80 ms** still and **2.05 ms** moving, 4096×2160 → 2048×1080; a full-size 4K readback 7.17 / 6.55 ms. The CPU path (`ROOMLERD_DRM_GPU=0`): 15.25 / 15.33 ms half, 23.35 / 23.45 ms full. Against 0.4.139's 27 / 34 ms half and 46 / 52–55 ms full (row 2). **No EGL:** `libEGL.so.1` hidden in a private mount namespace gives exactly one line, *"no GPU path here, the CPU reads the scanout (FR-107 P3) error=libEGL.so.1: /lib64/libEGL.so.1: file too short"*, then 60/60 frames from the CPU. **No new dependency:** no `libEGL`/`libGLES` in the binary's `DT_NEEDED`. **Kill switch:** `ROOMLERD_DRM_GPU=0` prints no P3 line and reads at the CPU's cost. ⚠️ The first run read 5.65 ms at `--fps 240`: since P2b, the smoke's mean includes the wait to fill the period (§5). P1's switch (`ROOMLERD_DRM_FOLLOW_CAP=0`) needs a live session and is owed with 0.4.140's verification |
 | 2026-10-16 17:15Z | the same box | the P3 build, then the fix: master `b8e6e92a0` + #2330 with `Egl` and `retire` (the service's `/proc/<pid>/exe` sha256 `3c27e96e…`, the build's own) | the GPU path's teardown, found while reviewing #2330 before its merge | 🔴 **Every capture leaked its EGL context.** `Drop` destroyed the context while it was still current on the worker, then terminated the display. EGL frees a destroyed context only once it is no longer current, and the worker exits without unbinding it. The same sequence in a C loop, 50 captures on fresh threads: resident memory 53 → 191 MB, 2.8 MB a capture. With an unbind first it stays flat at 51 MB. ✅ **The fix:** `a_capture_leaks_nothing_when_it_ends` passes, and its negative control fails it (`retire` stripped of the unbind and `eglReleaseThread`): *"resident memory grew 95120 kB over 30 captures"*. On the service, each of three sessions logged *"the GPU reads the scanout"*, so the shared display served every capture. The grab is unchanged (1.96 / 1.93 ms half, 6.61 / 5.62 ms full), and the fallbacks re-ran as in the row above. ⚠️ **Wrong turns:** a control that stripped only the unbind PASSED, because `eglReleaseThread` releases the current context too. The service's resident memory over four live sessions moved ±15 MB either way on both builds (`mem_trim`), too noisy to show 3 MB a capture. One session read 14.6 fps with the GPU path up, and it was encode-bound: `frames_captured` went 216 → 418 while `frames_encoded` went 180 → 300, at ~24 Mbps. That is §8's VP9 budget, not the capture |
+| 2026-10-17 05:35Z | the same box, GPU-composited GNOME, the system install, now also on its org's mesh | **0.4.140, the release.** `/usr/bin/roomlerd`, sha256 `6c338ca5…`: the published tarball's own bytes, installed by `roomlerd self-update` with its `.asc` verified against the pinned key | AC1–AC5 on the released bytes | ✅ **AC1:** VP9-444/DataChannel **27.3 fps** (resample 0.0 ms), H.264/RTP **28.8 fps** (capture 16.8 ms with the pacing's wait, encode 16.6 ms). **AC3/AC4, the grab** (240 frames, `--fps 1000`): GPU 1.92 / 1.91 ms half and 6.58 / 6.47 ms full; CPU path 13.10 / 13.79 ms half. 0.4.139, measured the same hour on the same desktop: 23.0 / 24.1 ms half, 42.3 / 51.0 ms full. **AC2:** a GPU frame and a CPU frame of the same still scanout at 2048×1080 differ by a mean of 0.10 levels of 255, with 0.000% of samples apart by more than 16. The GPU frame is upright and in true colour. **AC4:** with libEGL hidden, one line and 60/60 CPU frames; no EGL in `DT_NEEDED`. **AC5:** `FOLLOW_CAP=0` gives resample 45.2 ms and 8.7 fps; `THREADS=1` gives a 21.1 ms half read against 13.2; `GPU=0` gives no P3 line, at the CPU's cost. ⚠️ The first environment check of the FOLLOW_CAP drop-in read nothing either way, because the `< /proc/<pid>/environ` redirect ran as the unprivileged user before `sudo`. It was re-read in a root shell, beside a control variable that must be present |
