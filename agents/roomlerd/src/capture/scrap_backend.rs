@@ -567,6 +567,7 @@ impl ScreenCapture for ScrapCapture {
             }
         }
 
+        let asked_at = Instant::now();
         let (res_tx, res_rx) = oneshot::channel();
         self.cmd_tx
             .send(res_tx)
@@ -574,7 +575,17 @@ impl ScreenCapture for ScrapCapture {
         let reply = res_rx
             .await
             .map_err(|_| anyhow!("capture worker dropped reply"))?;
-        self.last_frame_at = Some(Instant::now());
+        // FR-107's P2b, for X11: the frame period runs from when this frame
+        // was ASKED for. Timed from its arrival, every period also paid for
+        // the XShm grab, so a 30 fps target ran at 1000 / (33.3 + grab), as the
+        // DRM backend did until P2b. Linux only: on Windows and macOS this
+        // backend is the fallback, and its waits there (DXGI's and the CG
+        // stream's) were never measured against the change.
+        self.last_frame_at = Some(if cfg!(target_os = "linux") {
+            asked_at
+        } else {
+            Instant::now()
+        });
         let _ = self.monitor; // (exercised below by `monitor_count`)
         reply
     }
