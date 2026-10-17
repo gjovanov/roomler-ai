@@ -606,4 +606,72 @@ mod tests {
     fn fr109_only_windows_advertises_mouse_rel() {
         assert!(!advertises_mouse_rel());
     }
+
+    /// FR-109 AC6 — relative mode only INJECTS: no hook, raw-input sink or key
+    /// poll anywhere in its agent code, FR-92's rule. Each is what a keylogger
+    /// looks like to EDR, and a GPO-locked desktop running EDR is in the
+    /// acceptance bar. The one sanctioned read is FR-92's own: keep busy asks
+    /// whether a MOUSE button is down (`buttons_held_now`, never a key), and
+    /// only that function may. The banned names are assembled at run time, so
+    /// this file cannot trip its own scan.
+    #[test]
+    fn fr109_relative_mouse_reads_no_input() {
+        let sources = [
+            ("input/mod.rs", include_str!("mod.rs")),
+            ("input/enigo_backend.rs", include_str!("enigo_backend.rs")),
+            (
+                "input/system_context_backend.rs",
+                include_str!("system_context_backend.rs"),
+            ),
+            ("input/arbiter.rs", include_str!("arbiter.rs")),
+            ("input/uinput_backend.rs", include_str!("uinput_backend.rs")),
+            (
+                "capture/portal/input.rs",
+                include_str!("../capture/portal/input.rs"),
+            ),
+        ];
+        let banned: Vec<String> = [
+            ["SetWindows", "HookEx"],
+            ["RegisterRaw", "InputDevices"],
+            ["GetRaw", "InputData"],
+            ["GetKeyboard", "State"],
+            ["EVIOC", "GRAB"],
+            ["XRecord", "EnableContext"],
+            ["XISelect", "Events"],
+            ["CGEvent", "TapCreate"],
+        ]
+        .iter()
+        .map(|p| p.concat())
+        .collect();
+        let key_poll = ["GetAsync", "KeyState"].concat();
+        for (name, src) in sources {
+            let lines: Vec<&str> = src.lines().collect();
+            // FR-92's mouse-button read: the first `buttons_held_now` (the
+            // Windows one) down to its closing brace.
+            let sanctioned = if name == "input/enigo_backend.rs" {
+                lines
+                    .iter()
+                    .position(|l| l.starts_with("fn buttons_held_now"))
+                    .and_then(|start| {
+                        let len = lines[start..].iter().position(|l| *l == "}")?;
+                        Some(start..=start + len)
+                    })
+            } else {
+                None
+            };
+            for (i, line) in lines.iter().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                for b in &banned {
+                    assert!(!code.contains(b.as_str()), "{name}:{}: uses {b}", i + 1);
+                }
+                if code.contains(key_poll.as_str()) {
+                    assert!(
+                        sanctioned.as_ref().is_some_and(|r| r.contains(&i)),
+                        "{name}:{}: polls key state outside FR-92's mouse-button read",
+                        i + 1
+                    );
+                }
+            }
+        }
+    }
 }
