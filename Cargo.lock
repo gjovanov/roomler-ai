@@ -8497,6 +8497,7 @@ dependencies = [
  "hmac 0.12.1",
  "if-addrs",
  "ipnet",
+ "libc",
  "quinn",
  "rand 0.9.4",
  "rcgen",
