@@ -4634,10 +4634,47 @@ pub struct RemoteSession {
     pub recording_url: Option<String>,
     #[serde(default)]
     pub stats: SessionStats,
+    /// FR-102 P9c — the carrier the session rode, as the agent recorded it
+    /// once the session reached Active (`direct` · `turn` · `turn_local` ·
+    /// `overlay_direct` · `overlay_turn` · `derp` · `org_relay` ·
+    /// `unknown`; [`session_carrier_label`]). Set by the live stats merge,
+    /// beside `stats` rather than inside it so `mark_ended`'s whole-`stats`
+    /// write cannot reset it. **Absent is unknown, never direct**: a row
+    /// from before P9c, from an agent older than the field, or from a
+    /// session that ended before the observation landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrier: Option<String>,
 }
 
 impl RemoteSession {
     pub const COLLECTION: &'static str = "remote_sessions";
+}
+
+/// FR-102 P9c — the carrier spellings this server knows (the agent's
+/// `session_carrier::SessionCarrier::as_str`). For display and grouping
+/// only: a spelling a newer agent sends is stored as sent, so an additive
+/// vocabulary stays additive.
+pub const SESSION_CARRIERS: &[&str] = &[
+    "direct",
+    "turn",
+    "turn_local",
+    "overlay_direct",
+    "overlay_turn",
+    "derp",
+    "org_relay",
+    "unknown",
+];
+
+/// The carrier label a session row may hold: the agent's spelling when it
+/// is a short lowercase code, else nothing — the row is left as it was and
+/// reads as unknown. A code, never free text: the device is the only writer
+/// and a compromised one must not get a string field to fill.
+pub fn session_carrier_label(raw: &str) -> Option<&str> {
+    ((1..=32).contains(&raw.len())
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
+    .then_some(raw)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -7832,6 +7869,7 @@ mod tests {
             end_reason: None,
             recording_url: None,
             stats: SessionStats::default(),
+            carrier: None,
         };
         let names = bson::to_document(&row).unwrap();
         assert_eq!(

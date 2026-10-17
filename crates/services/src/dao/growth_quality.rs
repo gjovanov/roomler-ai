@@ -230,6 +230,23 @@ pub struct EndReasonCount {
     pub count: i64,
 }
 
+/// FR-102 P9c — the Active sessions that rode one carrier, with their
+/// distributions: whether TURN or DERP sessions feel different is the
+/// question this answers. `carrier` is the agent's spelling (`direct` ·
+/// `turn` · `turn_local` · `overlay_direct` · `overlay_turn` · `derp` ·
+/// `org_relay`), or `unknown` for a row with none — a session from before
+/// P9c, from an agent older than the field, or one that ended before the
+/// observation landed. **Never read as direct.**
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarrierQuality {
+    pub carrier: String,
+    /// Sessions that reached Active on this carrier.
+    pub reached_active: i64,
+    pub duration_ms: Dist,
+    pub peak_fps: Dist,
+    pub avg_rtt_ms: Dist,
+}
+
 /// The sessions REQUESTED on the day (`remote_sessions.created_at`), by what
 /// became of them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +267,10 @@ pub struct SessionQuality {
     pub peak_fps: Dist,
     /// Active sessions whose device reported an average RTT above 0.
     pub avg_rtt_ms: Dist,
+    /// P9c — the Active sessions by the carrier they rode; a row frozen
+    /// before P9c has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_carrier: Vec<CarrierQuality>,
 }
 
 /// FR-22's time to first frame on the day, from the browser's `rc.connect`
@@ -486,6 +507,13 @@ mod tests {
                 duration_ms: Dist::of(vec![60_000, 120_000], DURATION_EDGES_MS),
                 peak_fps: Dist::of(vec![30], FPS_EDGES),
                 avg_rtt_ms: Dist::of(vec![], RTT_EDGES_MS),
+                by_carrier: vec![CarrierQuality {
+                    carrier: "derp".into(),
+                    reached_active: 2,
+                    duration_ms: Dist::of(vec![60_000, 120_000], DURATION_EDGES_MS),
+                    peak_fps: Dist::of(vec![30], FPS_EDGES),
+                    avg_rtt_ms: Dist::of(vec![], RTT_EDGES_MS),
+                }],
             }),
             ttff: None,
             crashes: Some(1),
@@ -500,8 +528,16 @@ mod tests {
         let doc = bson::to_document(&row).unwrap();
         assert_eq!(doc.get_str("scope").unwrap(), "external");
         assert!(doc.get("ttff").is_none(), "an absent part is not written");
-        let back: QualityDay = bson::from_document(doc).unwrap();
+        let back: QualityDay = bson::from_document(doc.clone()).unwrap();
         assert_eq!(back, row);
+        // P9c — a row frozen before the carrier existed reads with none.
+        let mut older = doc;
+        older
+            .get_document_mut("sessions")
+            .unwrap()
+            .remove("by_carrier");
+        let older: QualityDay = bson::from_document(older).unwrap();
+        assert!(older.sessions.unwrap().by_carrier.is_empty());
         assert_eq!(Scope::of_include_internal(true), Scope::All);
         assert_eq!(Scope::of_include_internal(false), Scope::External);
     }

@@ -428,6 +428,16 @@ pub enum ClientMsg {
         /// older agent's sample parses with none.
         #[serde(default, skip_serializing_if = "Transfers::is_empty")]
         transfers: Transfers,
+        /// FR-102 P9c — the carrier the session rides, as the agent
+        /// recorded it once the session reached Active: `direct` · `turn` ·
+        /// `turn_local` · `overlay_direct` · `overlay_turn` · `derp` ·
+        /// `org_relay` · `unknown` (`roomlerd::session_carrier`). Absent
+        /// from an agent older than the field and from a sample before the
+        /// observation landed; the server stores it beside
+        /// `remote_sessions.stats` and reads absence as **unknown, never
+        /// direct**. Additive: an older server ignores the key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        carrier: Option<String>,
     },
 
     /// Multi-region DERP: request an EdDSA admission ticket for the regional
@@ -9427,6 +9437,45 @@ mod tests {
 
     /// FR-101 P3 — `transfers` is absent from a sample that moved nothing, so
     /// an older server never sees the field; an older agent's sample, which
+    /// FR-102 P9c — the carrier is additive both ways: a sample from an
+    /// agent older than the field (or before the observation landed) parses
+    /// with none, a sample without one serialises without the key (an older
+    /// server never sees it), and a named carrier travels as its spelling.
+    #[test]
+    fn session_stats_carrier_is_optional_both_ways() {
+        let older = r#"{"t":"rc:session.stats","session_id":"a","bytes_sent":1,"bytes_recv":2,
+            "fps":30.0,"rtt_ms":4.0,"keyframe_requests":0,"input_events":0}"#;
+        match serde_json::from_str::<ClientMsg>(older).unwrap() {
+            ClientMsg::SessionStats { carrier, .. } => assert_eq!(carrier, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let named = r#"{"t":"rc:session.stats","session_id":"a","bytes_sent":1,"bytes_recv":2,
+            "fps":30.0,"rtt_ms":4.0,"keyframe_requests":0,"input_events":0,"carrier":"org_relay"}"#;
+        let msg = serde_json::from_str::<ClientMsg>(named).unwrap();
+        match &msg {
+            ClientMsg::SessionStats { carrier, .. } => {
+                assert_eq!(carrier.as_deref(), Some("org_relay"))
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let s = serde_json::to_string(&msg).unwrap();
+        assert!(s.contains(r#""carrier":"org_relay""#), "{s}");
+        let none = ClientMsg::SessionStats {
+            session_id: "a".into(),
+            bytes_sent: 0,
+            bytes_recv: 0,
+            fps: 0.0,
+            rtt_ms: 0.0,
+            keyframe_requests: 0,
+            input_events: 0,
+            shared_seconds: 0,
+            mixed_dial_seconds: 0,
+            transfers: Transfers::default(),
+            carrier: None,
+        };
+        assert!(!serde_json::to_string(&none).unwrap().contains("carrier"));
+    }
+
     /// has none, parses with none; and the wire names are a compatibility
     /// surface.
     #[test]
@@ -9449,6 +9498,7 @@ mod tests {
             shared_seconds: 0,
             mixed_dial_seconds: 0,
             transfers: Transfers::default(),
+            carrier: None,
         };
         let s = serde_json::to_string(&quiet).unwrap();
         assert!(!s.contains("transfers"), "{s}");
@@ -9475,6 +9525,7 @@ mod tests {
                     bytes: 9,
                 }],
             },
+            carrier: None,
         };
         let v = serde_json::to_value(&busy).unwrap();
         let t = &v["transfers"];

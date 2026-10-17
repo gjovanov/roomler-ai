@@ -134,6 +134,9 @@ async fn project_session(sessions: &Collection<RemoteSession>, ev: &RemoteAuditE
                 end_reason: None,
                 recording_url: None,
                 stats: Default::default(),
+                // FR-102 P9c — recorded by the live stats merge once the
+                // session reaches Active; absent at creation.
+                carrier: None,
             };
             let doc = match bson::to_document(&row) {
                 Ok(d) => d,

@@ -1338,6 +1338,23 @@ answers the empty 404 while
 question asked after it. The rules, the row and the field plan:
 [growth-observability.md](growth-observability.md#the-post-session-rating-p9b).
 
+### 11.9 The carrier a session rides (FR-102 P9c)
+
+Once a session reaches `Connected`, the agent records **what it rode** — `direct` · `turn` ·
+`turn_local` · `overlay_direct` · `overlay_turn` · `derp` · `org_relay` · `unknown`
+(`agents/roomlerd/src/session_carrier.rs`) — and carries it, additively, on every
+`rc:session.stats` (`#[serde(default)]`). **Record, never decide**: it reads the nominated ICE
+pair webrtc-rs already has and, when that pair rides the overlay, the overlay runtime's own
+carrier for the peer (the same LocalAPI lookup the adaptive-bitrate probe makes); no path choice
+changes. ⚠️ A relay kind the build does not know, a daemon older than the overlay field, a
+tunnel/blocked/offline peer, or nothing learned is **`unknown`, never `direct`** — CLAUDE.md's
+`is_direct()` trap, closed. It is read once after a 2 s settle (Chrome renominates relay→direct a
+moment after `Connected`), and the server stores it on `remote_sessions.carrier`, beside `stats`
+so `mark_ended`'s whole-`stats` write cannot reset it, only when the value is a short code (the
+device is the only writer). Absent is unknown, never direct. The P9a freeze splits the day's
+Active sessions by carrier, and the Quality tab and weekly roll-up show it. Rules, storage and
+the field plan: [growth-observability.md](growth-observability.md#remote-desktop-quality-from-what-is-recorded-p9a).
+
 ## 12. Performance targets & budget
 
 | Stage | Target (LAN) | Target (WAN, RTT 30 ms) |

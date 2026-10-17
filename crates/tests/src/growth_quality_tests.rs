@@ -1128,3 +1128,127 @@ async fn the_digest_and_the_weekly_carry_the_frozen_quality() {
         "{text}"
     );
 }
+
+// ── P9c — the Active sessions split by carrier ───────────────────────────
+
+/// A `remote_sessions` row with a chosen carrier (or none), Active and ended
+/// on the day, with fps/rtt so the per-carrier distributions have samples.
+#[allow(clippy::too_many_arguments)]
+async fn carrier_session(
+    app: &TestApp,
+    tenant: ObjectId,
+    day: NaiveDate,
+    start_h: u32,
+    duration_secs: i64,
+    fps: f64,
+    rtt: f64,
+    carrier: Option<&str>,
+) {
+    let created = at_day(day, start_h);
+    let started = DateTime::from_millis(created.timestamp_millis() + 2000);
+    let ended = DateTime::from_millis(started.timestamp_millis() + duration_secs * 1000);
+    let mut d = doc! {
+        "agent_id": ObjectId::new(), "tenant_id": tenant, "controller_user_id": ObjectId::new(),
+        "watchers": [], "permissions": 1_i32, "phase": "closed",
+        "created_at": created, "started_at": started, "ended_at": ended,
+        "end_reason": "controller_hangup", "recording_url": Bson::Null,
+        "stats": {
+            "bytes_sent": 1000_i64, "bytes_recv": 100_i64, "peak_fps": fps, "avg_rtt_ms": rtt,
+            "keyframe_requests": 0_i64, "input_events": 1_i64, "shared_seconds": 0_i64, "mixed_dial_seconds": 0_i64,
+        },
+    };
+    if let Some(c) = carrier {
+        d.insert("carrier", c);
+    }
+    insert(app, "remote_sessions", d).await;
+}
+
+/// The freeze splits the day's Active sessions by the carrier they rode; a
+/// session the agent never recorded one for is `unknown`, never direct; and
+/// the Quality view pools the split over its range.
+#[tokio::test]
+async fn the_freeze_splits_active_sessions_by_carrier() {
+    let app = TestApp::spawn().await;
+    let now = DateTime::now();
+    let day = today() - chrono::Duration::days(1);
+    let owner = ObjectId::new();
+    app.db
+        .collection::<Document>("tenants")
+        .insert_one(doc! {
+            "_id": owner, "name": "org", "slug": "cg-org", "owner_id": ObjectId::new(), "plan": "free",
+            "features": [], "settings": {}, "created_at": at_day(day - chrono::Duration::days(10), 1),
+            "updated_at": at_day(day, 1), "deleted_at": Bson::Null, "is_archived": false,
+        })
+        .await
+        .unwrap();
+    let t = owner;
+    // Two DERP sessions, one direct, one org-relay, and one with no carrier.
+    carrier_session(&app, t, day, 9, 600, 30.0, 120.0, Some("derp")).await;
+    carrier_session(&app, t, day, 10, 300, 24.0, 160.0, Some("derp")).await;
+    carrier_session(&app, t, day, 11, 1200, 60.0, 20.0, Some("direct")).await;
+    carrier_session(&app, t, day, 12, 120, 15.0, 240.0, Some("org_relay")).await;
+    carrier_session(&app, t, day, 13, 90, 30.0, 80.0, None).await;
+
+    quality::freeze_range(&app.state, day, day, now)
+        .await
+        .unwrap();
+    let row = app
+        .db
+        .collection::<Document>(GROWTH_QUALITY_DAILY)
+        .find_one(doc! { "day": ds(day), "scope": "all", "agent_version": ALL_VERSIONS })
+        .await
+        .unwrap()
+        .expect("the every-version row");
+    let by: Vec<&Document> = row
+        .get_document("sessions")
+        .unwrap()
+        .get_array("by_carrier")
+        .unwrap()
+        .iter()
+        .filter_map(|b| b.as_document())
+        .collect();
+    let cell = |carrier: &str| {
+        by.iter()
+            .find(|c| c.get_str("carrier").unwrap() == carrier)
+            .map(|c| c.get_i64("reached_active").unwrap())
+    };
+    // Most-ridden first: derp (2), then the singles alphabetically.
+    assert_eq!(by[0].get_str("carrier").unwrap(), "derp");
+    assert_eq!(cell("derp"), Some(2));
+    assert_eq!(cell("direct"), Some(1));
+    assert_eq!(cell("org_relay"), Some(1));
+    assert_eq!(
+        cell("unknown"),
+        Some(1),
+        "a session with no carrier is unknown, never direct"
+    );
+    assert_eq!(cell("overlay_direct"), None);
+    // The derp cell's duration distribution saw both derp sessions.
+    let derp = by
+        .iter()
+        .find(|c| c.get_str("carrier").unwrap() == "derp")
+        .unwrap();
+    assert_eq!(
+        derp.get_document("duration_ms")
+            .unwrap()
+            .get_i64("n")
+            .unwrap(),
+        2
+    );
+
+    // The Quality view pools the same split over its range (include_internal,
+    // since the org is not excluded here but the default set is empty anyway).
+    let set = ExclusionSet::none();
+    let report = quality::compute(&app.state, &set, day, day, true, now)
+        .await
+        .unwrap();
+    let j = serde_json::to_value(&report).unwrap();
+    let vcarriers = j["totals"]["sessions"]["by_carrier"].as_array().unwrap();
+    assert_eq!(vcarriers[0]["carrier"], "derp");
+    assert_eq!(vcarriers[0]["reached_active"], 2);
+    assert!(
+        vcarriers
+            .iter()
+            .any(|c| c["carrier"] == "unknown" && c["reached_active"] == 1)
+    );
+}
