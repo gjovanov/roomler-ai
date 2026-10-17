@@ -5,8 +5,8 @@
 >
 > | Phase | What | State |
 > |---|---|---|
-> | P1 | the wire, the gate, Windows hosts (the user worker and SystemContext), the viewer's control | shipped in 0.4.140, but there a Windows relative move went out ABSOLUTE (enigo's default, below). The fix (#2352) is field-green on a candidate on both Windows paths, and rides the next agent release |
-> | P2 | Linux (XTest, a relative uinput device, the portal) and macOS | X11 through enigo's XTest built (P2a); a relative uinput device, the portal and macOS not built |
+> | P1 | the wire, the gate, Windows hosts (the user worker and SystemContext), the viewer's control | shipped in 0.4.140, where a Windows relative move went out ABSOLUTE (enigo's default, below). **0.4.141 carries the fix (#2352)**, field-verified on its released bytes on both Windows paths |
+> | P2 | Linux (XTest, a relative uinput device, the portal) and macOS | X11 through enigo's XTest built (P2a), field-green on a candidate; a relative uinput device, the portal and macOS not built |
 > | P3 | switching on by itself when the host hides its cursor | not built |
 
 ## Why it exists
@@ -48,8 +48,8 @@ sequenceDiagram
 
 | Frame | Fields | Meaning |
 |---|---|---|
-| `mouse_rel` | `dx`, `dy`: whole counts | move by this much from wherever the pointer is ([`mod.rs:276`](../agents/roomlerd/src/input/mod.rs#L276)) |
-| `mouse_press` | `btn` | press **where the pointer is** ([`mod.rs:284`](../agents/roomlerd/src/input/mod.rs#L284)) |
+| `mouse_rel` | `dx`, `dy`: whole counts | move by this much from wherever the pointer is ([`mod.rs:286`](../agents/roomlerd/src/input/mod.rs#L286)) |
+| `mouse_press` | `btn` | press **where the pointer is** ([`mod.rs:294`](../agents/roomlerd/src/input/mod.rs#L294)) |
 | `mouse_release` | `btn` | let go where the pointer is: #1945's frame, unchanged |
 
 - **Whole counts.** The viewer sums `movementX/Y` over the input gap and sends only whole counts, carrying
@@ -93,10 +93,16 @@ A Linux agent advertises `mouse-rel` **only while the session a controller would
 real X11 desktop its input reaches, read from the cached desktop brief, with neither uinput opted in
 (`ROOMLERD_UINPUT=1`) nor the automatic system capture (FR-95) alive. Those two route a session to uinput,
 which has no relative device yet, and on a Wayland desktop XTest reaches only Xwayland clients
-([`mod.rs:213`](../agents/roomlerd/src/input/mod.rs#L213) `linux_xtest_carries_rel`). The brief is at most
+([`mod.rs:223`](../agents/roomlerd/src/input/mod.rs#L223) `linux_xtest_carries_rel`). The brief is at most
 a minute old, and the heartbeat re-announces the caps when it changes, so a login to Wayland takes the word
 back. macOS agents **do not advertise** it. The presses above exist because each backend's match is
 exhaustive and must decide.
+
+⚠️ **On a real Xorg an absolute move reaches a raw reader as a jump.** Xorg raises an XI2 RawMotion for an
+absolute XTest move too, but its valuators carry the pointer's **position**, not a delta. The spec's §8
+row 12 read 640, 653, 667, … for a pointer crossing the screen, so a game that reads raw motion takes
+each absolute move as a large jump. In relative mode the same probe read the deltas sent, 100 each (row
+13). Xvfb, by contrast, raises no RawMotion for an absolute move at all (row 4).
 
 ## The viewer
 
@@ -136,7 +142,7 @@ person's.
 
 - It never reads input on the host. The agent only injects; there is no hook and no raw-input reader in
   `roomlerd` (FR-92's rule). A unit test scans the relative-mouse code for any of them
-  ([`input/mod.rs:688`](../agents/roomlerd/src/input/mod.rs#L688) `fr109_relative_mouse_reads_no_input`).
+  ([`input/mod.rs:714`](../agents/roomlerd/src/input/mod.rs#L714) `fr109_relative_mouse_reads_no_input`).
 - No ghost cursor in relative mode: other viewers see the host's own cursor in the picture.
 - The host's pointer speed and acceleration settings are not changed.
 
