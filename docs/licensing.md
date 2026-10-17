@@ -40,7 +40,7 @@ The single source of truth is
 [`scripts/licence-classes.sh`](../scripts/licence-classes.sh). `LICENSING.md`'s
 table mirrors it for readers, and CI reads only the script.
 
-| class | by path ([`:31`](../scripts/licence-classes.sh#L31), [`:45`](../scripts/licence-classes.sh#L45)) | by crate ([`:70`](../scripts/licence-classes.sh#L70), [`:86`](../scripts/licence-classes.sh#L86)) | SPDX |
+| class | by path ([`:31`](../scripts/licence-classes.sh#L31), [`:45`](../scripts/licence-classes.sh#L45)) | by crate ([`:81`](../scripts/licence-classes.sh#L81), [`:99`](../scripts/licence-classes.sh#L99)) | SPDX |
 |---|---|---|---|
 | server | `crates/{api,services,db,config,core,modules,derp-relay,tests}`, `ui/` | `roomler-ai-*`, `roomler-core`, all six `roomler-ai-mod-*`, `derp-relay` | `AGPL-3.0-only` |
 | client | `agents/*`, `crates/{agent-core,roomler-setup-core,tunnel-core,remote_control,localapi,tcp-turn-conn}` | `roomlerd`, `roomler-cli`, `roomler-node-core`, `roomler-ai-tunnel-core`, … | `MPL-2.0` |
@@ -48,7 +48,7 @@ table mirrors it for readers, and CI reads only the script.
 | excluded | `crates/vendored/*` (upstream terms, unchanged), build output | — | upstream |
 
 The **shipped** agents, the binaries the graph check guards, are listed separately
-([`:103`](../scripts/licence-classes.sh#L103)): `roomlerd`, `roomler-cli`,
+([`:117`](../scripts/licence-classes.sh#L117)): `roomlerd`, `roomler-cli`,
 `roomler-cli-shim`, `roomler-desktop` and `roomler-setup`.
 
 ⚠️ **A new crate must be added to one of the two crate lists.** The manifest check

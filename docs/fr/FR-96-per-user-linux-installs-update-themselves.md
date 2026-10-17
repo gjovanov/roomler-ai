@@ -131,9 +131,9 @@ shared successor of `macos_forward_triggers`, `:3279-3361`) as before. Linux ask
   `EROFS`. P2a adds `ReadWritePaths=-/var/tmp` (only the directory can be granted: a `ReadWritePaths` entry binds
   what exists when the sandbox is built, and the helper deletes the wake file each run). A daemon whose unit
   predates P2a logs the failure and names the cure; the push then waits for the helper's 6 h timer. CI guards
-  the grant in both sandbox cells. The system-unit cell (`ci.yml:804-829`) has the sandboxed unit write
+  the grant in both sandbox cells. The system-unit cell (`ci.yml:808-833`) has the sandboxed unit write
   `/var/tmp`, and a negative control (the same sandbox without the grant) must come back read-only. The
-  user-manager cell (Fedora's configuration, `ci.yml:883-887`) requires a read-write `/var/tmp` mount in the
+  user-manager cell (Fedora's configuration, `ci.yml:887-891`) requires a read-write `/var/tmp` mount in the
   daemon's namespace. Both directions were measured on systemd 255 before landing (§8).
 - **Decided at the start.** Enabling or disabling the helper takes effect at the daemon's next start — `install.sh`
   (P3) must refresh `roomler.service`, then `systemctl --user daemon-reload` and restart the per-user daemon after

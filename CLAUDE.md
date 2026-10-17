@@ -265,8 +265,10 @@ crates/
   modules/hive/       → FR-90 agent sessions, server side: the session record + lifecycle,
                         `rc:hive.*`, `hive_audit` — never session content. Built ON
                         `fleet` and `chat` (a session IS a secret room, written to only
-                        as notes + turn stubs); its `[modules]` switch is the one that
-                        defaults OFF
+                        as notes + turn stubs); its `[modules]` switch defaults OFF
+  modules/vault/      → FR-90 P3 secrets: each value sealed under its own data key,
+                        wrapped to an `age` KEK; RRNs; `vault_audit`. No route answers a
+                        value. On core alone so far; switch defaults OFF (`docs/vault.md`)
   api/              → Axum HTTP/WS server: ~85 routes + /ws + /health; `compose.rs` is
                       the host composition
   tests/            → Integration tests (spawns real servers; drives the agent in-process)

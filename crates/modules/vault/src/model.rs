@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
+//! What the vault stores (`docs/roomler-hive-design.md` §8.2).
+//!
+//! | Collection | One row per | Holds |
+//! |---|---|---|
+//! | `vault_secrets` | secret | its path, kind, audiences, the counters of its fields — never a value |
+//! | `vault_versions` | value written | the sealed value, its nonce, its wrapped data key ([`crate::crypto`]) |
+//! | `vault_audit` | decision | who asked for what, allowed or denied, and why; 90 days |
+
+use std::collections::BTreeMap;
+
+use bson::{Binary, DateTime, oid::ObjectId, spec::BinarySubtype};
+use serde::{Deserialize, Serialize};
+
+/// The kinds P3-1 accepts. `dynamic`, `template` and `llm_credential` come
+/// with the steps that give them meaning (P3-6 and later); a row is read
+/// whatever its kind says, so a server rolled back past them still lists
+/// what a later one wrote.
+pub const KINDS: &[&str] = &[KIND_STATIC, KIND_STRUCTURED];
+/// One field, `value`.
+pub const KIND_STATIC: &str = "static";
+/// Named fields: a username, a password, a host…
+pub const KIND_STRUCTURED: &str = "structured";
+
+/// A secret: the name and the rules, never the value (`vault_secrets`).
+///
+/// ⚠️ Tombstoned, not deleted: `deleted_at` is set, the row stays, and its
+/// path is free again — the unique index covers live rows only, so it is
+/// serialised as an explicit `null` while live (the index's filter is
+/// `$type: "null"`, which does not match an absent field).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VaultSecret {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    /// Unique among the organization's live secrets; the RRN is
+    /// `rrn:{org slug}:secret:{path}` ([`crate::rrn`]). Never changes.
+    pub path: String,
+    /// [`KINDS`], as a string: an unknown kind still reads.
+    pub kind: String,
+    #[serde(default)]
+    pub description: String,
+    /// Each field's counter and current version, by name. A field appears
+    /// with its first value.
+    #[serde(default)]
+    pub fields: BTreeMap<String, FieldState>,
+    /// Where a value may be presented: host patterns, a knowhow entity, a
+    /// named upstream. Stored as given in P3-1; P3-5 is where the daemon
+    /// holds a use to them.
+    #[serde(default)]
+    pub audiences: Vec<String>,
+    /// The programs a value may be handed to, as `argv[0]` (P3-4's
+    /// `vault_exec`).
+    #[serde(default)]
+    pub exec_allow: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub owner_id: ObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_days: Option<u32>,
+    /// P3-5's per-secret kill switch: a disabled secret is never USED. An
+    /// administrator still reads its metadata and writes its value.
+    #[serde(default)]
+    pub disabled: bool,
+    pub created_by: ObjectId,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    pub deleted_at: Option<DateTime>,
+}
+
+impl VaultSecret {
+    pub const COLLECTION: &'static str = "vault_secrets";
+}
+
+/// One field's versions, on its secret.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct FieldState {
+    /// The last version number handed out. An `$inc` on the secret, so two
+    /// writers never get one number; a number whose write failed is a gap,
+    /// never reused.
+    pub seq: i64,
+    /// The newest version stored: the one a use reads. `0` until the first
+    /// value lands.
+    #[serde(default)]
+    pub current: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime>,
+}
+
+/// One value, sealed (`vault_versions`). Unique on (secret, field, number).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VaultVersion {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub secret_id: ObjectId,
+    pub field: String,
+    pub n: i64,
+    /// The value under this version's data key.
+    pub ciphertext: Binary,
+    pub nonce: Binary,
+    /// The data key, `age`-encrypted to the KEK.
+    pub dek_wrapped: Binary,
+    /// The KEK's recipient (`age1…`) the data key was wrapped to.
+    pub kek: String,
+    pub created_by: ObjectId,
+    pub created_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime>,
+}
+
+impl VaultVersion {
+    pub const COLLECTION: &'static str = "vault_versions";
+}
+
+/// Bytes as BSON binary (subtype generic).
+pub fn binary(bytes: Vec<u8>) -> Binary {
+    Binary {
+        subtype: BinarySubtype::Generic,
+        bytes,
+    }
+}
+
+/// One decision (`vault_audit`): who asked to do what, allowed or denied,
+/// and the server's reason. Written by the server from its own decision,
+/// BEFORE it acts on an allow — a decision it cannot record is not acted
+/// on. 90-day TTL, like the other audits.
+///
+/// The device's own report of using a value is a different claim, by a host
+/// that may be compromised, and goes to `vault_activity` (P3-3), never here.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VaultAuditEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    /// `user` in P3-1; `session` and `device` principals arrive with P3-2
+    /// and P3-3.
+    pub principal: String,
+    pub user_id: ObjectId,
+    /// The action as a policy names it: `secret:list` | `secret:write` |
+    /// `secret:delete` | `vault:verify`.
+    pub action: String,
+    /// What exactly: `list` | `describe` | `create` | `update` | `value` |
+    /// `delete` | `verify`.
+    pub op: String,
+    /// `allow` | `deny`.
+    pub decision: String,
+    /// The server's reason word: `administrator` (P3-1's one allow) or
+    /// `not_administrator`.
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_id: Option<ObjectId>,
+    /// The secret's RRN as it was named at the decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rrn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// For `value`, the version the write was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<i64>,
+    pub at: DateTime,
+}
+
+impl VaultAuditEvent {
+    pub const COLLECTION: &'static str = "vault_audit";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_live_secret_stores_an_explicit_null_tombstone() {
+        // The unique index's filter is `deleted_at: {$type: "null"}`, which
+        // an absent field does not match: a live row without the field
+        // would escape the index, and two could share a path.
+        let now = DateTime::now();
+        let s = VaultSecret {
+            id: None,
+            tenant_id: ObjectId::new(),
+            path: "db".into(),
+            kind: KIND_STATIC.into(),
+            description: String::new(),
+            fields: BTreeMap::new(),
+            audiences: Vec::new(),
+            exec_allow: Vec::new(),
+            tags: Vec::new(),
+            owner_id: ObjectId::new(),
+            rotation_days: None,
+            disabled: false,
+            created_by: ObjectId::new(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        let d = bson::to_document(&s).unwrap();
+        assert_eq!(d.get("deleted_at"), Some(&bson::Bson::Null));
+        assert!(d.get("_id").is_none());
+    }
+
+    #[test]
+    fn sealed_bytes_are_stored_as_binary() {
+        let now = DateTime::now();
+        let v = VaultVersion {
+            id: None,
+            tenant_id: ObjectId::new(),
+            secret_id: ObjectId::new(),
+            field: "value".into(),
+            n: 1,
+            ciphertext: binary(vec![1, 2, 3]),
+            nonce: binary(vec![0; 24]),
+            dek_wrapped: binary(vec![9; 40]),
+            kek: "age1example".into(),
+            created_by: ObjectId::new(),
+            created_at: now,
+            expires_at: None,
+        };
+        let raw = bson::to_raw_document_buf(&v).unwrap();
+        let back: VaultVersion = bson::from_slice(raw.as_bytes()).unwrap();
+        assert_eq!(back.ciphertext.bytes, vec![1, 2, 3]);
+        assert!(matches!(
+            raw.get("ciphertext").unwrap(),
+            Some(bson::RawBsonRef::Binary(_))
+        ));
+        // And through the other entry point the driver uses for updates.
+        let d = bson::to_document(&v).unwrap();
+        assert!(matches!(d.get("nonce"), Some(bson::Bson::Binary(_))));
+        let back: VaultVersion = bson::from_document(d).unwrap();
+        assert_eq!(back.nonce.bytes.len(), 24);
+    }
+
+    #[test]
+    fn a_field_without_a_value_yet_reads() {
+        // `$inc` creates `{seq: 1}` before the version lands.
+        let d = bson::doc! { "seq": 1_i64 };
+        let f: FieldState = bson::from_document(d).unwrap();
+        assert_eq!(
+            f,
+            FieldState {
+                seq: 1,
+                current: 0,
+                updated_at: None
+            }
+        );
+    }
+}

@@ -41,7 +41,7 @@ flowchart LR
 
 `bun run build` is `vue-tsc && vite build && bun docs/build.ts`. **The generator must run
 after `vite build`**, which empties `dist/`. CI runs the three separately so each failure gets
-its own annotation ([`ci.yml:1912`](../.github/workflows/ci.yml)).
+its own annotation ([`ci.yml:1916`](../.github/workflows/ci.yml)).
 
 | Collection | Source | URL | Dated from |
 |---|---|---|---|

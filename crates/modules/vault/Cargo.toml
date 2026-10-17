@@ -1,0 +1,38 @@
+[package]
+name = "roomler-ai-mod-vault"
+license = "AGPL-3.0-only"
+publish = false
+version.workspace = true
+edition.workspace = true
+description = "FR-90 module: vault — IAM for secrets, the server side: secrets and their versions under envelope encryption (an age KEK), RRNs, and the audit of every decision. Never a value in an answer."
+
+[lib]
+name = "roomler_ai_mod_vault"
+path = "src/lib.rs"
+
+# P3-1 depends on core alone. The design's edges (`vault → hive`: a session's
+# record, its role, its room; `vault → fleet`: devices, their vault keys, the
+# Hub) arrive with the steps that use them (P3-2, P3-3), not before.
+[dependencies]
+roomler-core = { path = "../../core" }
+roomler-ai-config = { path = "../../config" }
+roomler-ai-db = { path = "../../db" }
+roomler-ai-services = { path = "../../services" }
+
+# Envelope encryption: a data key per version under XChaCha20-Poly1305, the
+# data key wrapped to the KEK, an `age` X25519 identity — so a wrapped key
+# opens with the stock `age` tool and an `age-keygen` file is the KEK.
+age.workspace = true
+chacha20poly1305.workspace = true
+zeroize.workspace = true
+
+anyhow.workspace = true
+axum.workspace = true
+bson.workspace = true
+futures.workspace = true
+mongodb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# A verify opens every version: CPU work, moved off the request's thread.
+tokio.workspace = true
+tracing.workspace = true
