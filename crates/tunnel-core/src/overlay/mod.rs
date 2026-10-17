@@ -68,6 +68,10 @@ pub(crate) mod path;
 pub mod relay_link;
 pub mod router;
 pub mod runtime;
+/// FR-110 — the buffers a carrier socket asks for. At the OS default the
+/// kernel dropped bursts before the daemon read them, and TCP inside the tunnel
+/// read every drop as congestion.
+pub(crate) mod sockbuf;
 /// Port-intercept shim: terminates one TCP port of this node's overlay address
 /// in the in-process [`netstack`] instead of handing it to the OS, so an
 /// in-daemon service can own e.g. `:22` on a host where `sshd` already holds
