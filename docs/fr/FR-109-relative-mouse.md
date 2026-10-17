@@ -1,7 +1,7 @@
 # FR-109: Relative mouse — Pointer Lock in the browser for apps that capture the pointer
 
-**Issue:** [#2333](https://github.com/gjovanov/roomler-ai/issues/2333) · **Status:** in progress — spec and
-claim · **Owner:** the agent's input path (`input/`, every injector), the viewer (Pointer Lock, the input
+**Issue:** [#2333](https://github.com/gjovanov/roomler-ai/issues/2333) · **Status:** in progress — P1 built
+(Windows; [`docs/relative-mouse.md`](../relative-mouse.md)) · **Owner:** the agent's input path (`input/`, every injector), the viewer (Pointer Lock, the input
 pump) · **Anchors:** master `7382639b8` · **Program:** [StarDesk teardown](../plans/stardesk-teardown-program.md),
 wave 3 (§6.1, row P9) · **Builds on:** [FR-92](FR-92-keep-busy.md) (the agent never reads input), #1945
 (the arbiter's release-all), FR-98 C3 (the input gap)
@@ -20,12 +20,12 @@ Nothing to install on the controlling side stays true: Pointer Lock is a web API
 
 | What | Where |
 |---|---|
-| Every move is absolute: `mouse_move {x, y, mon}`, normalised `0..1` per monitor, so a resolution change mid-session needs no resync | [`input/mod.rs:164`](../../agents/roomlerd/src/input/mod.rs#L164) `InputMsg` |
+| Every move is absolute: `mouse_move {x, y, mon}`, normalised `0..1` per monitor, so a resolution change mid-session needs no resync | [`input/mod.rs:191`](../../agents/roomlerd/src/input/mod.rs#L191) `InputMsg` |
 | enigo moves to an absolute pixel | [`enigo_backend.rs:132`](../../agents/roomlerd/src/input/enigo_backend.rs#L132) `Coordinate::Abs` |
-| The uinput device is an absolute tablet **by design**: "a relative device would force us to track the pointer and guess at acceleration" | [`uinput_backend.rs:18`](../../agents/roomlerd/src/input/uinput_backend.rs#L18), axes at `:297` |
-| The portal path moves with `NotifyPointerMotionAbsolute` on the stream | [`portal/input.rs:440`](../../agents/roomlerd/src/capture/portal/input.rs#L440) |
-| The viewer coalesces pointer moves at the input gap and sends the last position | [`useRemoteControl.ts:5853`](../../ui/src/composables/useRemoteControl.ts#L5853), the gap's key at `:2172` |
-| The agent already says when the host hides its cursor (`cursor:hide`); the viewer only drops its ghost cursor | `useRemoteControl.ts:9082` |
+| The uinput device is an absolute tablet **by design**: "a relative device would force us to track the pointer and guess at acceleration" | [`uinput_backend.rs:18`](../../agents/roomlerd/src/input/uinput_backend.rs#L18), axes at `:298` |
+| The portal path moves with `NotifyPointerMotionAbsolute` on the stream | [`portal/input.rs:449`](../../agents/roomlerd/src/capture/portal/input.rs#L449) |
+| The viewer coalesces pointer moves at the input gap and sends the last position | [`useRemoteControl.ts:5862`](../../ui/src/composables/useRemoteControl.ts#L5862), the gap's key at `:2173` |
+| The agent already says when the host hides its cursor (`cursor:hide`); the viewer only drops its ghost cursor | `useRemoteControl.ts:9160` |
 | No Pointer Lock anywhere in the viewer | `git grep requestPointerLock ui/src`: nothing |
 | `AgentCaps.input` today: `arbiter`, `exclusive`, `ghost-cursor` | [`caps.rs:1460`](../../agents/roomlerd/src/encode/caps.rs#L1460) |
 
@@ -113,15 +113,32 @@ The agent only injects. It never reads input, so there is no hook, no raw-input 
 FR-92's rule. The field probes that read raw input (§5) are test scripts on throwaway guests, never part
 of `roomlerd`.
 
+### 3g. As built (P1)
+
+- **The wire:** `MouseRel { dx: i32, dy: i32 }` and `MousePress { btn }`. A fractional `dx` does not parse,
+  so the agent drops it as it drops any unreadable frame.
+- **The gate:** `advertises_mouse_rel()` is true on a Windows build with `enigo-input` unless
+  `ROOMLERD_INPUT_MOUSE_REL` says a false word, and `stub_caps` appends the word at every announcement,
+  beside `keep-busy`. The viewer offers the control on equality, unless the browser's
+  `roomler-rc-relative-mouse` is `off`.
+- **Windows** needed one change for both injectors: enigo's shared `dispatch`, which the SystemContext
+  worker reuses through `dispatch_for_external`.
+- **The arbiter** tracks `MousePress` as held. Its tracking ended in a `_ => {}` arm, where the new press
+  would have fallen through, and a session ending mid-drag would never have let go.
+- **Leaving Pointer Lock** sends the gathered motion and releases held buttons with `mouse_release`. The
+  blur release uses `mouse_release` too in relative mode: the old one sent `mouse_button` at the last
+  absolute point, which would throw a captured pointer there.
+- `docs/relative-mouse.md` has the tables and the anchors.
+
 ## 4. Phases
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | This spec and the claim. Probes: (1) Windows `SendInput` relative from the user worker and from SystemContext, read by a raw-input probe that hides and recentres the cursor, with acceleration on and off; (2) X11 XTest relative; (3) a relative uinput device beside the tablet, on GNOME and KDE; (4) the portal's `NotifyPointerMotion`; (5) the browsers: Pointer Lock, `unadjustedMovement`, Esc under Keyboard Lock | docs only | spec and claim 2026-10-16 |
-| P1 | The wire, the gate, enigo's relative path (Windows user and SystemContext, X11), the arbiter, the viewer's toggle and pump | agent `ROOMLERD_INPUT_MOUSE_REL=0` (stops advertising `mouse-rel`); viewer storage key | — |
+| P1 | The wire, the gate, enigo's relative path (Windows user and SystemContext), the arbiter, the viewer's toggle and pump | agent `ROOMLERD_INPUT_MOUSE_REL=0` (stops advertising `mouse-rel`); viewer `roomler-rc-relative-mouse=off` | **built** (3g): `mouse_rel` and `mouse_press` in every backend's match. Windows advertises `mouse-rel`; Linux and macOS do not until P2, and their backends press where the pointer is but drop relative motion. Unit tests: wire spellings, the kill switch, enigo's calls, the arbiter, uinput's events, the portal plan, and the viewer's accumulator and gate (vitest 2153). Negative controls, each of which failed its test: a prefix-matched cap, rounding in the accumulator (it passed at first, so the test was tightened), a dropped carry, an untracked press, and a press that moves first. Field green owed: AC1, AC3, AC4 on the agent release that carries it |
 | P2 | uinput's relative device; the portal and macOS by P0's answers | the same | — |
 | P3 | Auto-switch on `cursor:hide` | viewer storage key | — |
-| P4 | Docs: `docs/relative-mouse.md`, linked from `docs/remote-control.md` §6 and indexed in `docs/README.md` | — | — |
+| P4 | Docs: `docs/relative-mouse.md`, linked from `docs/remote-control.md` §6 and indexed in `docs/README.md` | — | the page exists from P1 and grows with each phase |
 
 ## 5. Acceptance criteria
 

@@ -374,6 +374,12 @@ impl ArbiterState {
                 InputMsg::MouseRelease { btn } => {
                     core.held.remove(&Held::Btn(*btn));
                 }
+                // FR-109 — relative mode presses where the pointer is. It is
+                // held like any press, so a session that ends mid-drag still
+                // has its button released.
+                InputMsg::MousePress { btn } => {
+                    core.held.insert(Held::Btn(*btn));
+                }
                 _ => {}
             }
         }
@@ -1258,6 +1264,43 @@ mod tests {
             InputMsg::Key { down: false, .. } | InputMsg::MouseRelease { .. }
         )));
         // Idempotent.
+        assert!(st.close(a).is_empty());
+    }
+
+    /// FR-109 — relative mode presses with `MousePress`, and that press is
+    /// held like any other: a session that ends mid-drag still has its button
+    /// released, and released where the pointer is. A watcher without input
+    /// moves nothing, relatively or not.
+    #[test]
+    fn a_relative_press_is_held_and_released_at_the_end() {
+        let now = Instant::now();
+        let mut st = ArbiterState::default();
+        let (a, w) = (sid(), sid());
+        st.open(a, "A".into(), true, None, now);
+        st.open(w, "W".into(), false, None, now);
+        assert_eq!(
+            st.plan(a, &InputMsg::MousePress { btn: Button::Left }, now),
+            EventPlan::Inject { pre: vec![] }
+        );
+        assert_eq!(
+            st.plan(a, &InputMsg::MouseRel { dx: 30, dy: 0 }, now),
+            EventPlan::Inject { pre: vec![] }
+        );
+        assert_eq!(
+            st.plan(w, &InputMsg::MouseRel { dx: 30, dy: 0 }, now),
+            EventPlan::Deny
+        );
+        assert_eq!(
+            st.close(a),
+            vec![InputMsg::MouseRelease { btn: Button::Left }]
+        );
+
+        // The control: a release lets go of the relative press, so nothing is
+        // left to release when the session ends.
+        let mut st = ArbiterState::default();
+        st.open(a, "A".into(), true, None, now);
+        st.plan(a, &InputMsg::MousePress { btn: Button::Left }, now);
+        st.plan(a, &InputMsg::MouseRelease { btn: Button::Left }, now);
         assert!(st.close(a).is_empty());
     }
 

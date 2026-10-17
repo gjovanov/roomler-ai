@@ -297,6 +297,23 @@
       >
         <v-icon>mdi-keyboard-outline</v-icon>
       </v-btn>
+      <!-- FR-109 — relative mouse: Pointer Lock for an app that captures the
+           pointer (a 3D viewport, a game camera). Offered only where the
+           agent advertises `mouse-rel`; Esc releases the mouse. -->
+      <v-btn
+        v-if="rc.phase.value === 'connected' && relativeMouseOffered"
+        icon
+        variant="text"
+        size="small"
+        class="mr-1"
+        :color="rc.relativeMouse.value ? 'primary' : undefined"
+        aria-label="Relative mouse for 3D apps and games"
+        title="Relative mouse: for 3D apps and games that capture the pointer. Esc releases the mouse."
+        data-testid="rc-relative-mouse"
+        @click="onRelativeMouse"
+      >
+        <v-icon>mdi-cursor-move</v-icon>
+      </v-btn>
       <!-- rc.199 — clipboard send / get: frequent connected-session
            actions, kept on the toolbar (not the Settings panel) at
            every viewport. Relocated here from the retired Row 2. -->
@@ -1159,6 +1176,17 @@
         >
           <v-icon size="x-small" class="mr-1">mdi-keyboard-variant</v-icon>
           <span>remote keys</span>
+        </div>
+        <!-- FR-109 — relative mode is on and the pointer is hidden: say how
+             to get it back. Under Keyboard Lock Esc reaches the host, so the
+             browser wants it held. -->
+        <div
+          v-if="rc.relativeMouse.value"
+          class="relative-mouse-hint"
+          data-testid="rc-relative-mouse-hint"
+        >
+          <v-icon size="x-small" class="mr-1">mdi-cursor-move</v-icon>
+          <span>{{ rc.keyboardLockActive.value ? 'Relative mouse: hold Esc to release it' : 'Relative mouse: Esc releases it' }}</span>
         </div>
       </div>
     </div>
@@ -2056,6 +2084,7 @@ import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
 import KeepBusyMenu from '@/components/remote/KeepBusyMenu.vue'
 import type { KeepBusyPattern } from '@/composables/keepBusy'
 import { displayMatchSummary } from '@/composables/displayMatch'
+import { agentSupportsRelativeMouse, relativeMouseSwitchedOff } from '@/composables/relativeMouse'
 import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 import { asSentence } from '@/utils/sentence'
 import { useCapabilitiesStore } from '@/stores/capabilities'
@@ -2997,6 +3026,30 @@ const agentLayoutCaps = computed<string[]>(() => agent.value?.capabilities?.layo
 const agentSupportsKeepBusy = computed<boolean>(
   () => agent.value?.capabilities?.input?.includes('keep-busy') ?? false,
 )
+// FR-109 — relative mouse, offered only to an agent that advertises
+// `mouse-rel` (equality: an older agent cannot parse `mouse_rel`), and only
+// while this browser has not switched it off.
+const relativeMouseOffered = computed<boolean>(() => {
+  let storage: Storage | null = null
+  try {
+    storage = globalThis.localStorage
+  } catch {
+    /* blocked site data: not switched off */
+  }
+  return agentSupportsRelativeMouse(agent.value?.capabilities?.input)
+    && !relativeMouseSwitchedOff(storage)
+})
+watch(relativeMouseOffered, (offered) => rc.setRelativeMouseAllowed(offered), { immediate: true })
+/** FR-109 — the toolbar control: a click is the gesture Pointer Lock needs.
+ *  Once locked the pointer is hidden, so leaving is Esc (the browser's own
+ *  rule); a click while locked leaves too, for a lock the page still sees. */
+async function onRelativeMouse() {
+  if (rc.relativeMouse.value) {
+    rc.exitRelativeMouse()
+    return
+  }
+  await rc.enterRelativeMouse()
+}
 // FR-92 P8 — the org's default pattern, for a device this person has no
 // remembered choice on. Read once per viewer open; any member may read it,
 // and a failure means circle (the store never throws here).
@@ -4827,6 +4880,24 @@ onBeforeUnmount(() => {
   padding: 4px 8px;
   border-radius: 999px;
   opacity: 0.45;
+  pointer-events: none;
+  z-index: 30;
+}
+/* FR-109 — bottom centre, clear of the keyboard-lock toast (top centre) and
+   pill (top right); never takes a click meant for the remote. */
+.relative-mouse-hint {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  background: rgba(0, 0, 0, 0.6);
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 12px;
+  line-height: 1.3;
+  padding: 4px 10px;
+  border-radius: 999px;
   pointer-events: none;
   z-index: 30;
 }

@@ -166,6 +166,22 @@ fn dispatch<E: Mouse + Keyboard>(enigo: &mut E, msg: InputMsg) -> Result<()> {
                 .button(map_button(btn), Direction::Release)
                 .map_err(|e| anyhow!("button: {e}"))?;
         }
+        // FR-109 — relative motion, as a mouse moves: `SendInput` with
+        // `MOUSEEVENTF_MOVE` and no `ABSOLUTE` on Windows, XTest relative
+        // motion on X11. Nothing to verify against: the host app owns where
+        // the cursor is, and usually recentres it.
+        InputMsg::MouseRel { dx, dy } => {
+            enigo
+                .move_mouse(dx, dy, Coordinate::Rel)
+                .map_err(|e| anyhow!("move_mouse rel: {e}"))?;
+        }
+        // FR-109 — relative mode's press, where the pointer is: the twin of
+        // the release above, and for the same reason it never moves first.
+        InputMsg::MousePress { btn } => {
+            enigo
+                .button(map_button(btn), Direction::Press)
+                .map_err(|e| anyhow!("button: {e}"))?;
+        }
         InputMsg::MouseWheel { dx, dy, mode } => {
             let (x_steps, y_steps) = wheel_to_steps(dx, dy, mode);
             if y_steps != 0 {
@@ -1067,5 +1083,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.calls, ["move 960,540 Abs", "button Left Release"]);
+    }
+
+    /// FR-109 — relative motion is one relative move, by exactly the counts
+    /// sent, and never an absolute one: the host app owns the cursor.
+    #[test]
+    fn relative_motion_moves_by_its_counts() {
+        let mut r = Recorder::default();
+        dispatch(&mut r, InputMsg::MouseRel { dx: 37, dy: -12 }).unwrap();
+        assert_eq!(r.calls, ["move 37,-12 Rel"]);
+    }
+
+    /// FR-109 — relative mode's press lands where the pointer is. A press
+    /// that moved first, as a click does, would throw the pointer to a
+    /// position the viewer never had.
+    #[test]
+    fn a_relative_press_never_moves_the_pointer() {
+        let mut r = Recorder::default();
+        dispatch(&mut r, InputMsg::MousePress { btn: Button::Right }).unwrap();
+        assert_eq!(r.calls, ["button Right Press"]);
     }
 }

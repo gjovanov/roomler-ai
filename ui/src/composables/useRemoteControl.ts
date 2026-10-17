@@ -89,6 +89,7 @@ import {
 } from './usePrivacyMode'
 import { keepBusySetMessage, parseKeepBusyState, type KeepBusyRequest, type KeepBusyState } from './keepBusy'
 import { parseDisplayMatchState, type DisplayMatchState } from './displayMatch'
+import { createRelAccumulator, relativeButtonMessage } from './relativeMouse'
 import { parseFeaturesRefused } from './useSessionFeatures'
 
 /**
@@ -3658,6 +3659,9 @@ export interface HeldInputTracker {
   button(btn: string, down: boolean): void
   /** Held codes/buttons in press order; clears the tracker. */
   releaseAll(): { keys: number[]; buttons: string[] }
+  /** FR-109 — held pointer buttons only, in press order; held keys stay.
+   *  Leaving Pointer Lock lets go of the mouse, not of a chord. */
+  releaseButtons(): string[]
   size(): number
 }
 
@@ -3676,6 +3680,11 @@ export function createHeldInputTracker(): HeldInputTracker {
     releaseAll() {
       const out = { keys: [...keys], buttons: [...buttons] }
       keys.clear()
+      buttons.clear()
+      return out
+    },
+    releaseButtons() {
+      const out = [...buttons]
       buttons.clear()
       return out
     },
@@ -5863,6 +5872,75 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     } else {
       moveTimer = setTimeout(flushPendingMove, INPUT_MOVE_GAP_MS - since)
     }
+  }
+
+  // FR-109 — relative mode. While the input surface holds Pointer Lock the
+  // pointer belongs to the host app: moves are deltas, summed over the same
+  // gap and sent as `mouse_rel` in whole counts (the accumulator keeps the
+  // fraction). The view sets `relativeMouseAllowed` from the agent's caps
+  // (`mouse-rel`), so an agent that cannot parse the frame never gets one.
+  const relativeMouse = ref(false)
+  const relativeMouseAllowed = ref(false)
+  const relAcc = createRelAccumulator()
+  let relTimer: ReturnType<typeof setTimeout> | null = null
+  let lastRelSentAt = 0
+  /** The surface `attachInput` wired, which is what Pointer Lock locks. */
+  let relativeSurface: HTMLElement | null = null
+
+  function flushRel() {
+    if (relTimer !== null) {
+      clearTimeout(relTimer)
+      relTimer = null
+    }
+    const d = relAcc.take()
+    if (!d) return
+    lastRelSentAt = performance.now()
+    sendInput({ t: 'mouse_rel', dx: d.dx, dy: d.dy })
+  }
+
+  function scheduleRel() {
+    if (relTimer !== null) return
+    const since = performance.now() - lastRelSentAt
+    if (since >= INPUT_MOVE_GAP_MS) {
+      flushRel()
+    } else {
+      relTimer = setTimeout(flushRel, INPUT_MOVE_GAP_MS - since)
+    }
+  }
+
+  /** FR-109 — enter relative mode: Pointer Lock on the input surface, asking
+   *  for raw, unaccelerated deltas. Must run inside a user gesture (the
+   *  toolbar control is one). A browser that rejects `unadjustedMovement`
+   *  gets plain Pointer Lock. Resolves whether the lock was requested. */
+  async function enterRelativeMouse(): Promise<boolean> {
+    const el = relativeSurface
+    if (!el || !relativeMouseAllowed.value || !inputGranted.value) return false
+    if (globalThis.document?.pointerLockElement === el) return true
+    type Lockable = { requestPointerLock(options?: { unadjustedMovement?: boolean }): Promise<void> | void }
+    const lockable = el as unknown as Lockable
+    try {
+      await lockable.requestPointerLock({ unadjustedMovement: true })
+    } catch {
+      try {
+        await lockable.requestPointerLock()
+      } catch {
+        return false
+      }
+    }
+    return true
+  }
+
+  /** FR-109 — leave relative mode (Esc does it too, as the browser's rule). */
+  function exitRelativeMouse() {
+    const doc = globalThis.document
+    if (doc && relativeSurface && doc.pointerLockElement === relativeSurface) doc.exitPointerLock()
+  }
+
+  /** FR-109 — the view's gate, from `AgentCaps.input` and its kill switch.
+   *  Withdrawn mid-lock (an older agent after a reconnect), the lock goes. */
+  function setRelativeMouseAllowed(allowed: boolean) {
+    relativeMouseAllowed.value = allowed
+    if (!allowed) exitRelativeMouse()
   }
 
   function sendInput(msg: Record<string, unknown>) {
@@ -9842,6 +9920,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     const clamp01 = (n: number) => Math.min(Math.max(n, 0), 1)
     // FR-16 L4 — the bench sampler finds the `<video>` in here.
     benchSurface = surface
+    // FR-109 — and Pointer Lock locks it.
+    relativeSurface = surface
 
     /**
      * Returns [0,1]-normalised coordinates relative to the *visible video
@@ -9983,6 +10063,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
 
     function onPointerMove(ev: PointerEvent) {
+      // FR-109 — under Pointer Lock the position is frozen and only the
+      // deltas mean anything; they go out as `mouse_rel` at the input gap.
+      if (relativeMouse.value) {
+        relAcc.add(ev.movementX, ev.movementY)
+        scheduleRel()
+        return
+      }
       const { x, y, insideVideo } = normalisedXY(ev)
       if (!insideVideo) return
       // FR-93 — every synthetic button-up reuses this (`releaseHeldInputs` on
@@ -10010,6 +10097,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
 
     function onPointerDown(ev: PointerEvent) {
       ev.preventDefault()
+      // FR-109 — relative mode presses where the host's pointer is. The
+      // motion gathered so far goes first, so the press lands after it.
+      if (relativeMouse.value) {
+        flushRel()
+        const btn = browserButton(ev.button)
+        sendInput(relativeButtonMessage(btn, true))
+        heldInputs.button(btn, true)
+        return
+      }
       const { x, y, insideVideo } = normalisedXY(ev)
       if (!insideVideo) return
       cancelPendingMove()
@@ -10020,6 +10116,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
 
     function onPointerUp(ev: PointerEvent) {
+      if (relativeMouse.value) {
+        flushRel()
+        const btn = browserButton(ev.button)
+        sendInput(relativeButtonMessage(btn, false))
+        heldInputs.button(btn, false)
+        return
+      }
       try { surface.releasePointerCapture(ev.pointerId) } catch { /* noop */ }
       const { x, y, insideVideo } = normalisedXY(ev)
       cancelPendingMove()
@@ -10126,14 +10229,18 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       pendingCtrlV = null
       const held = heldInputs.releaseAll()
       for (const btn of held.buttons) {
-        sendInput({
-          t: 'mouse_button',
-          btn,
-          down: false,
-          x: lastPointerNorm.x,
-          y: lastPointerNorm.y,
-          mon: 0,
-        })
+        // FR-109 — in relative mode there is no position to go back to: the
+        // host app owns the cursor, so let go where it is.
+        sendInput(relativeMouse.value
+          ? relativeButtonMessage(btn, false)
+          : {
+              t: 'mouse_button',
+              btn,
+              down: false,
+              x: lastPointerNorm.x,
+              y: lastPointerNorm.y,
+              mon: 0,
+            })
       }
       for (const code of held.keys) {
         sendInput({ t: 'key', code, down: false, mods: 0 })
@@ -10526,6 +10633,22 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     const onVisibilityInput = () => {
       if (globalThis.document.visibilityState === 'hidden') releaseHeldInputs()
     }
+    // FR-109 — Pointer Lock came or went: the control, Esc, a lost focus.
+    // Leaving it sends the motion still gathered and lets go of any held
+    // button where the pointer is, before moves turn absolute again (an
+    // absolute button-up would throw the host's cursor to the old position).
+    const onPointerLockChange = () => {
+      const locked = globalThis.document.pointerLockElement === surface
+      if (locked === relativeMouse.value) return
+      if (!locked) {
+        flushRel()
+        relAcc.reset()
+        for (const btn of heldInputs.releaseButtons()) {
+          sendInput(relativeButtonMessage(btn, false))
+        }
+      }
+      relativeMouse.value = locked
+    }
 
     // Disable the OS-native context menu so right-click forwards cleanly.
     function onContextMenu(ev: MouseEvent) { ev.preventDefault() }
@@ -10556,6 +10679,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     window.addEventListener('paste', onPaste)
     window.addEventListener('blur', onWindowBlurInput)
     document.addEventListener('visibilitychange', onVisibilityInput)
+    document.addEventListener('pointerlockchange', onPointerLockChange)
     // rc.18: register on CAPTURE phase so we run BEFORE any focused
     // element's bubble-phase handlers. Combined with the per-handler
     // `stopPropagation` when pointer is inside, this stops a focused
@@ -10587,6 +10711,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       releaseHeldInputs()
       window.removeEventListener('blur', onWindowBlurInput)
       document.removeEventListener('visibilitychange', onVisibilityInput)
+      // FR-109 — the surface is going: so is its lock, and relative mode.
+      document.removeEventListener('pointerlockchange', onPointerLockChange)
+      exitRelativeMouse()
+      if (relTimer !== null) {
+        clearTimeout(relTimer)
+        relTimer = null
+      }
+      relAcc.reset()
+      relativeMouse.value = false
+      if (relativeSurface === surface) relativeSurface = null
       // Same `capture: true` as the add Ã¢ÂÂ required for matching.
       window.removeEventListener('keydown', onKeyDown, { capture: true })
       window.removeEventListener('keyup', onKeyUp, { capture: true })
@@ -11747,6 +11881,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     setKeepBusy,
     /** FR-108 — the device's answer to the latest display-match request. */
     displayMatchState,
+    /** FR-109 — relative mode: true while the stage holds Pointer Lock. */
+    relativeMouse,
+    enterRelativeMouse,
+    exitRelativeMouse,
+    setRelativeMouseAllowed,
     /** rc.87 Ã¢ÂÂ real encoder info from the agent (`rc:video-info`).
      *  Null on the legacy track / libvpx paths (no message); the
      *  badge falls back to a selection-derived label then. */

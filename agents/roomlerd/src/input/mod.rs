@@ -157,6 +157,32 @@ pub enum TouchPhase {
     Cancel,
 }
 
+/// FR-109 — the kill switch for relative mode. `ROOMLERD_INPUT_MOUSE_REL=0`
+/// (or `false`, `no`, `off`) stops this agent advertising `mouse-rel`, so no
+/// viewer sends it `mouse_rel`. Read where the caps are built.
+pub const MOUSE_REL_ENV: &str = "ROOMLERD_INPUT_MOUSE_REL";
+
+/// FR-109 — does this agent advertise `mouse-rel` in `AgentCaps.input`?
+/// Only where its injector carries relative motion, and not when the kill
+/// switch is set. P1 is Windows: the user worker and SystemContext both
+/// inject through the same enigo `dispatch` (`SendInput` relative). Linux
+/// and macOS come with P2 (uinput's relative device, the portal, macOS
+/// deltas), so until then they never receive the frame.
+pub fn advertises_mouse_rel() -> bool {
+    cfg!(all(target_os = "windows", feature = "enigo-input"))
+        && !mouse_rel_switched_off(std::env::var(MOUSE_REL_ENV).ok().as_deref())
+}
+
+/// FR-109 — the kill switch's reading of [`MOUSE_REL_ENV`]: only an explicit
+/// false word switches relative mode off. Unset, or anything else, leaves it
+/// on.
+pub fn mouse_rel_switched_off(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
+
 /// Input event from the controller. Coordinates are normalised 0..1 per
 /// monitor so the agent's resolution can change mid-session without
 /// needing a resync.
@@ -190,6 +216,25 @@ pub enum InputMsg {
     /// backend cannot forget it. A viewer may send it as well; it can only let
     /// go of a button.
     MouseRelease {
+        btn: Button,
+    },
+    /// FR-109 — relative motion in whole counts: the pointer moves by
+    /// `(dx, dy)` from wherever it is, as a mouse moves it. Pointer Lock's
+    /// deltas, for an app that hides the cursor and recentres it (a 3D
+    /// viewport, a game camera), which an absolute move cannot drive past
+    /// the edge of the viewer's stage.
+    ///
+    /// ⚠️ Sent only to an agent that advertises `mouse-rel`
+    /// ([`advertises_mouse_rel`]): an older agent cannot parse it.
+    MouseRel {
+        dx: i32,
+        dy: i32,
+    },
+    /// FR-109 — press a button WHERE THE POINTER IS. In relative mode the
+    /// viewer has no position to send, because the host app owns the cursor,
+    /// and a `MouseButton` moves to its position first. This is the press
+    /// twin of [`InputMsg::MouseRelease`], which lets go without moving.
+    MousePress {
         btn: Button,
     },
     MouseWheel {
@@ -520,5 +565,45 @@ mod tests {
         assert!(!parse_virtual_screen_flag(Some("maybe")));
         assert!(!parse_virtual_screen_flag(Some("2")));
         assert!(!parse_virtual_screen_flag(Some("enabled")));
+    }
+
+    /// FR-109 — the two new frames as the viewer spells them. A wire name is
+    /// a compatibility surface: renaming one makes every viewer's frames
+    /// unparseable without failing anything loudly.
+    #[test]
+    fn fr109_the_wire_spells_mouse_rel_and_mouse_press() {
+        let rel: InputMsg = serde_json::from_str(r#"{"t":"mouse_rel","dx":3,"dy":-4}"#).unwrap();
+        assert_eq!(rel, InputMsg::MouseRel { dx: 3, dy: -4 });
+        let press: InputMsg = serde_json::from_str(r#"{"t":"mouse_press","btn":"left"}"#).unwrap();
+        assert_eq!(press, InputMsg::MousePress { btn: Button::Left });
+        assert_eq!(
+            serde_json::to_string(&InputMsg::MouseRel { dx: -1, dy: 0 }).unwrap(),
+            r#"{"t":"mouse_rel","dx":-1,"dy":0}"#
+        );
+        // Whole counts only: the viewer carries the fraction, so a float is a
+        // viewer bug, refused rather than truncated here.
+        assert!(serde_json::from_str::<InputMsg>(r#"{"t":"mouse_rel","dx":0.5,"dy":0}"#).is_err());
+    }
+
+    /// FR-109 — the kill switch reads only an explicit false word; unset or
+    /// anything else leaves relative mode on.
+    #[test]
+    fn fr109_the_kill_switch_reads_only_false_words() {
+        for off in ["0", "false", "FALSE", " no ", "off"] {
+            assert!(mouse_rel_switched_off(Some(off)), "{off:?}");
+        }
+        for on in ["1", "true", "yes", "", "maybe"] {
+            assert!(!mouse_rel_switched_off(Some(on)), "{on:?}");
+        }
+        assert!(!mouse_rel_switched_off(None));
+    }
+
+    /// FR-109 P1 — only Windows injects relative motion, so no other OS may
+    /// advertise `mouse-rel` (a Linux viewer's frames would be dropped by
+    /// the tablet, a Wayland one's by the portal).
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn fr109_only_windows_advertises_mouse_rel() {
+        assert!(!advertises_mouse_rel());
     }
 }

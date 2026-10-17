@@ -276,6 +276,12 @@ pub struct AgentCaps {
     ///   (`rc:control.request` / `rc:control.mode` on the control DC).
     /// * `ghost-cursor` — other sessions' pointers are rebroadcast as
     ///   `cursor:peer` on the cursor DC.
+    /// * `keep-busy` — FR-92: this agent can run keep busy here and its owner
+    ///   allows it.
+    /// * `mouse-rel` — FR-109: the agent injects relative motion
+    ///   (`mouse_rel`) and presses where the pointer is (`mouse_press`). A
+    ///   viewer sends either only to an agent advertising it, because an
+    ///   older agent cannot parse them.
     ///
     /// Empty / unset = a pre-P6 agent → the P3 single-holder rule stays.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
