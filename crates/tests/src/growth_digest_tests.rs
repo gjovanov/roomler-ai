@@ -782,8 +782,22 @@ async fn every_section_counts_the_seeded_day_exactly() {
         not_measured(&j["social"]),
         Some(("no posts pushed in the last 28 days", None))
     );
-    // Not built yet.
-    assert_eq!(not_measured(&j["search"]).map(|n| n.1), Some(Some("P7")));
+    // P7 — built, but this server holds no search credential: each engine
+    // says so, never a 0.
+    assert_eq!(
+        not_measured(&j["search"]["google"]),
+        Some((
+            "no Search Console key configured (ROOMLER__GROWTH__SEARCH_CONSOLE_KEY)",
+            None
+        ))
+    );
+    assert_eq!(
+        not_measured(&j["search"]["bing"]),
+        Some((
+            "no Bing Webmaster API key configured (ROOMLER__GROWTH__BING_API_KEY)",
+            None
+        ))
+    );
 
     // Nothing about a person.
     let text = j.to_string();

@@ -1030,8 +1030,9 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
         Measured::NotMeasured(n) => out.push(Line("Social reach".into(), not_measured(n))),
     }
 
-    out.push(Heading("Not yet measured".into()));
-    out.push(Line("Search".into(), not_measured(&s.search)));
+    github_blocks(&mut out, &s.github);
+
+    search_blocks(&mut out, &s.search);
 
     alert_blocks(&mut out, &s.alerts, "the day");
 
@@ -1042,6 +1043,246 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
         doc.excluded.users, doc.excluded.tenants, doc.day, doc.attempts
     )));
     out
+}
+
+/// P7 — a search row as table cells: the key, clicks, impressions, and the
+/// position only where the reader gave one (from 30 impressions).
+fn search_cells(r: &super::search::SearchRow) -> Vec<String> {
+    vec![
+        r.key.clone(),
+        r.cell.clicks.to_string(),
+        r.cell.impressions.to_string(),
+        r.cell
+            .position
+            .map(|p| format!("{p:.1}"))
+            .unwrap_or_else(|| "—".into()),
+    ]
+}
+
+/// P7 — the Search section: Google over its final days, Bing at its own
+/// grain. Shared by the daily digest and the weekly roll-up.
+pub(crate) fn search_blocks(out: &mut Vec<Block>, s: &Measured<super::search::SearchSection>) {
+    use Block::*;
+    out.push(Heading("Search".into()));
+    let s = match s {
+        Measured::Value(s) => s,
+        Measured::NotMeasured(n) => {
+            out.push(Line("Search".into(), not_measured(n)));
+            return;
+        }
+    };
+    match &s.google {
+        Measured::Value(g) => {
+            out.push(Line(
+                "Google, final through".into(),
+                format!("{} (Search Console's own day)", g.through),
+            ));
+            out.push(Line("Clicks".into(), fig_over(&g.clicks, &g.days)));
+            out.push(Line(
+                "Impressions".into(),
+                fig_over(&g.impressions, &g.days),
+            ));
+            out.push(Line("Days pulled".into(), fig(&g.days)));
+            if let (Some(ctr), Some(pos)) = (g.d28.ctr, g.d28.position) {
+                out.push(Line(
+                    "CTR · average position (28d)".into(),
+                    format!("{:.1} % · {pos:.1}", ctr * 100.0),
+                ));
+            }
+            for (title, rows) in [
+                ("Top queries (7d)", &g.top_queries_7d),
+                ("Top pages (7d)", &g.top_pages_7d),
+            ] {
+                if !rows.is_empty() {
+                    out.push(Table(
+                        vec![
+                            title.into(),
+                            "Clicks".into(),
+                            "Impressions".into(),
+                            "Position".into(),
+                        ],
+                        rows.iter().map(search_cells).collect(),
+                    ));
+                }
+            }
+        }
+        Measured::NotMeasured(n) => out.push(Line("Google".into(), not_measured(n))),
+    }
+    match &s.bing {
+        Measured::Value(b) => {
+            out.push(Line(
+                "Bing, daily through".into(),
+                format!(
+                    "{} (Bing's own day; read by the pull for {})",
+                    b.through, b.pulled
+                ),
+            ));
+            out.push(Line("Bing clicks".into(), fig(&b.clicks)));
+            out.push(Line("Bing impressions".into(), fig(&b.impressions)));
+            if let Some(week) = &b.week {
+                for (title, rows) in [
+                    (
+                        format!("Bing queries, its week of {week}"),
+                        &b.top_queries_week,
+                    ),
+                    (format!("Bing pages, its week of {week}"), &b.top_pages_week),
+                ] {
+                    if !rows.is_empty() {
+                        out.push(Table(
+                            vec![
+                                title,
+                                "Clicks".into(),
+                                "Impressions".into(),
+                                "Position".into(),
+                            ],
+                            rows.iter().map(search_cells).collect(),
+                        ));
+                    }
+                }
+            }
+        }
+        Measured::NotMeasured(n) => out.push(Line("Bing".into(), not_measured(n))),
+    }
+    out.push(Note(
+        "Google's numbers are its final days only — Search Console settles two or three days \
+         behind — on its own (Pacific) dates; a position is weighted by impressions, and a CTR \
+         or a position appears only from 30 impressions. Bing's queries and pages come in Bing's \
+         weekly buckets and are never relabelled as 7 days."
+            .into(),
+    ));
+}
+
+/// P7 — a change as text: signed, or `—` when a snapshot it needs is
+/// missing (never a 0 for "not measured").
+fn delta_str(d: Option<i64>) -> String {
+    match d {
+        Some(n) if n > 0 => format!("+{n}"),
+        Some(n) => n.to_string(),
+        None => "—".into(),
+    }
+}
+
+fn deltas(d: &super::github::Delta) -> String {
+    format!(
+        "day {} · 7d {} · 28d {}",
+        delta_str(d.day),
+        delta_str(d.d7),
+        delta_str(d.d28)
+    )
+}
+
+/// P7 — a traffic figure per window over the days pulled: `—` for a window
+/// with no measured day, never a 0 it did not count.
+pub fn fig_over(f: &Figure, measured_days: &Figure) -> String {
+    let cell = |n: i64, days: i64| {
+        if days == 0 {
+            "—".to_string()
+        } else {
+            n.to_string()
+        }
+    };
+    format!(
+        "{} (7d {} · 28d {})",
+        cell(f.day, measured_days.day),
+        cell(f.d7, measured_days.d7),
+        cell(f.d28, measured_days.d28)
+    )
+}
+
+/// P7 — the repository: counters at their snapshot with the changes, the
+/// week's downloads by release and flavour, and the traffic with its
+/// measured days. Shared by the daily digest and the weekly roll-up.
+pub(crate) fn github_blocks(out: &mut Vec<Block>, g: &super::github::GithubSection) {
+    use Block::*;
+    out.push(Heading("GitHub".into()));
+    match &g.counters {
+        Measured::Value(c) => {
+            out.push(Line(
+                "Snapshot".into(),
+                format!("{} at the close of {} (UTC)", c.repo, c.at),
+            ));
+            let lower = if c.downloads_truncated {
+                ", a lower bound: the release listing hit the page bound"
+            } else {
+                ""
+            };
+            for (label, now, d) in [
+                ("Stars".to_string(), c.stars, &c.stars_delta),
+                ("Forks".to_string(), c.forks, &c.forks_delta),
+                ("Watchers".to_string(), c.watchers, &c.watchers_delta),
+                (
+                    format!("Release downloads (all time{lower})"),
+                    c.downloads,
+                    &c.downloads_delta,
+                ),
+                (
+                    format!("Helper-release downloads (CI's vendored builds{lower})"),
+                    c.helper_downloads,
+                    &c.helper_downloads_delta,
+                ),
+            ] {
+                out.push(Line(label, format!("{now} ({})", deltas(d))));
+            }
+            for (title, list) in [
+                ("Downloads in 7 days, by release", &c.top_releases_7d),
+                ("Downloads in 7 days, by flavour", &c.top_flavours_7d),
+            ] {
+                match list {
+                    Measured::Value(rows) if !rows.is_empty() => out.push(Table(
+                        vec![title.into(), "Downloads".into()],
+                        rows.iter()
+                            .map(|k| vec![k.key.clone(), k.count.to_string()])
+                            .collect(),
+                    )),
+                    Measured::Value(_) => out.push(Line(title.into(), "none".into())),
+                    Measured::NotMeasured(n) => out.push(Line(title.into(), not_measured(n))),
+                }
+            }
+        }
+        Measured::NotMeasured(n) => out.push(Line("Counters".into(), not_measured(n))),
+    }
+    match &g.traffic {
+        Measured::Value(t) => {
+            out.push(Line("Views".into(), fig_over(&t.views, &t.measured_days)));
+            out.push(Line(
+                "Clones (mostly CI's checkouts, not people)".into(),
+                fig_over(&t.clones, &t.measured_days),
+            ));
+            out.push(Line("Days measured".into(), fig(&t.measured_days)));
+            if let Some(as_of) = &t.referrers_as_of
+                && !t.referrers.is_empty()
+            {
+                out.push(Table(
+                    vec![
+                        format!("Referrers (GitHub's 14 days, read after {as_of})"),
+                        "Views".into(),
+                        "Uniques".into(),
+                    ],
+                    t.referrers
+                        .iter()
+                        .map(|r| {
+                            vec![
+                                r.referrer.clone(),
+                                r.views.to_string(),
+                                r.uniques.to_string(),
+                            ]
+                        })
+                        .collect(),
+                ));
+            }
+        }
+        Measured::NotMeasured(n) => out.push(Line("Traffic".into(), not_measured(n))),
+    }
+    out.push(Note(
+        "A change is the difference of two daily snapshots; — means a snapshot it needs is \
+         missing, or a traffic window with no day pulled. GitHub counts every download of a \
+         release asset, the fleet's self-updates included: downloads are distribution, not \
+         installs. Release downloads are the product's (the daemon, the wizard, the tunnel CLI), \
+         without the signature and checksum files fetched beside each package; the vendored \
+         builds our own CI downloads are counted apart. A release whose total went down (an asset \
+         re-uploaded) counts nothing that day."
+            .into(),
+    ));
 }
 
 /// P10 — one alert row as a table line: rule, key, fired, cleared, and
@@ -1528,6 +1769,11 @@ pub fn weekly_blocks(doc: &DigestDoc, s: &WeeklySections) -> Vec<Block> {
     }
 
     quality_blocks(&mut out, &s.quality);
+
+    // P7 — the repository at Sunday's snapshot: its 7-day changes are the
+    // week's; search over the windows ending on Sunday's newest final day.
+    github_blocks(&mut out, &s.github);
+    search_blocks(&mut out, &s.search);
 
     alert_blocks(&mut out, &s.alerts, "the week");
 
@@ -2054,7 +2300,72 @@ mod tests {
                     .collect(),
                 }],
             }),
-            search: NotMeasured::later("search", "P7"),
+            github: crate::growth::github::GithubSection {
+                counters: Measured::Value(crate::growth::github::GithubCounters {
+                    repo: "gjovanov/roomler-ai".into(),
+                    at: "2026-10-12".into(),
+                    stars: 130,
+                    forks: 11,
+                    watchers: 4,
+                    downloads: 9_000,
+                    helper_downloads: 8_000,
+                    downloads_truncated: false,
+                    helper_downloads_delta: crate::growth::github::Delta {
+                        day: Some(100),
+                        d7: None,
+                        d28: None,
+                    },
+                    stars_delta: crate::growth::github::Delta {
+                        day: Some(2),
+                        d7: Some(9),
+                        d28: None,
+                    },
+                    forks_delta: crate::growth::github::Delta::default(),
+                    watchers_delta: crate::growth::github::Delta::default(),
+                    downloads_delta: crate::growth::github::Delta {
+                        day: Some(40),
+                        d7: Some(300),
+                        d28: None,
+                    },
+                    top_releases_7d: Measured::Value(vec![KeyCount {
+                        key: "agent-v0.4.140".into(),
+                        count: 250,
+                    }]),
+                    top_flavours_7d: Measured::NotMeasured(NotMeasured::now(
+                        "no snapshot for 2026-10-05 to difference against",
+                    )),
+                }),
+                traffic: Measured::NotMeasured(NotMeasured::now(
+                    "no GitHub token configured (ROOMLER__GROWTH__GITHUB_TOKEN)",
+                )),
+            },
+            search: Measured::Value(crate::growth::search::SearchSection {
+                google: Measured::Value(crate::growth::search::GoogleReport {
+                    through: "2026-10-10".into(),
+                    clicks: f(3, 20, 70),
+                    impressions: f(150, 900, 4000),
+                    d28: crate::growth::search::SearchCell {
+                        clicks: 70,
+                        impressions: 4000,
+                        ctr: Some(0.02),
+                        position: Some(8.4),
+                    },
+                    days: f(1, 7, 28),
+                    top_queries_7d: vec![crate::growth::search::SearchRow {
+                        key: "self-hosted teamviewer alternative".into(),
+                        cell: crate::growth::search::SearchCell {
+                            clicks: 6,
+                            impressions: 12,
+                            ctr: None,
+                            position: None,
+                        },
+                    }],
+                    top_pages_7d: vec![],
+                }),
+                bing: Measured::NotMeasured(NotMeasured::now(
+                    "no Bing Webmaster API key configured (ROOMLER__GROWTH__BING_API_KEY)",
+                )),
+            }),
             alerts: Measured::Value(AlertsSection {
                 fired: vec![AlertRow {
                     rule: "spike".into(),
@@ -2074,6 +2385,110 @@ mod tests {
             }),
         };
         (doc, s)
+    }
+
+    /// P7 — traffic over its measured days: a window with no day pulled is
+    /// "—", never a 0 nobody counted; clones say whose they mostly are; a
+    /// truncated listing says its downloads are a lower bound.
+    #[test]
+    fn github_traffic_and_a_truncated_listing_read_honestly() {
+        use crate::growth::github::{Delta, GithubCounters, GithubSection, GithubTraffic};
+        let counters = GithubCounters {
+            repo: "o/r".into(),
+            at: "2026-10-16".into(),
+            stars: 1,
+            forks: 0,
+            watchers: 0,
+            downloads: 50,
+            helper_downloads: 0,
+            downloads_truncated: true,
+            stars_delta: Delta::default(),
+            forks_delta: Delta::default(),
+            watchers_delta: Delta::default(),
+            downloads_delta: Delta::default(),
+            helper_downloads_delta: Delta::default(),
+            top_releases_7d: Measured::Value(vec![]),
+            top_flavours_7d: Measured::Value(vec![]),
+        };
+        let traffic = GithubTraffic {
+            views: Figure {
+                day: 0,
+                d7: 12,
+                d28: 40,
+            },
+            views_uniques: Figure::default(),
+            clones: Figure {
+                day: 0,
+                d7: 3358,
+                d28: 9000,
+            },
+            clones_uniques: Figure::default(),
+            measured_days: Figure {
+                day: 0,
+                d7: 6,
+                d28: 20,
+            },
+            referrers: vec![],
+            referrers_as_of: None,
+        };
+        let mut out = Vec::new();
+        github_blocks(
+            &mut out,
+            &GithubSection {
+                counters: Measured::Value(counters),
+                traffic: Measured::Value(traffic),
+            },
+        );
+        let text = text_document("t", "i", &out);
+        assert!(text.contains("Views: — (7d 12 · 28d 40)"), "{text}");
+        assert!(
+            text.contains("Clones (mostly CI's checkouts, not people): — (7d 3358 · 28d 9000)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Release downloads (all time, a lower bound: the release listing hit the page bound): 50"
+            ),
+            "{text}"
+        );
+    }
+
+    /// P7 — the Search block: a Google window with no final day pulled reads
+    /// "—", never 0; Bing says which pull its numbers come from.
+    #[test]
+    fn search_reads_unpulled_windows_as_a_dash_and_names_bings_pull() {
+        use crate::growth::search::{BingReport, GoogleReport, SearchCell, SearchSection};
+        let f = |day: i64, d7: i64, d28: i64| Figure { day, d7, d28 };
+        let s = Measured::Value(SearchSection {
+            google: Measured::Value(GoogleReport {
+                through: "2026-10-10".into(),
+                clicks: f(0, 4, 9),
+                impressions: f(0, 80, 300),
+                d28: SearchCell::default(),
+                days: f(0, 3, 20),
+                top_queries_7d: vec![],
+                top_pages_7d: vec![],
+            }),
+            bing: Measured::Value(BingReport {
+                through: "2026-10-12".into(),
+                pulled: "2026-10-13".into(),
+                clicks: f(1, 2, 5),
+                impressions: f(10, 40, 90),
+                week: None,
+                top_queries_week: vec![],
+                top_pages_week: vec![],
+            }),
+        });
+        let mut out = Vec::new();
+        search_blocks(&mut out, &s);
+        let text = text_document("t", "i", &out);
+        assert!(text.contains("Clicks: — (7d 4 · 28d 9)"), "{text}");
+        assert!(
+            text.contains(
+                "Bing, daily through: 2026-10-12 (Bing's own day; read by the pull for 2026-10-13)"
+            ),
+            "{text}"
+        );
     }
 
     /// Below n = 30 there is no percentage; at 30 there is.
@@ -2198,12 +2613,47 @@ mod tests {
         // P8 — social reach: posts per platform, and the day's snapshots in
         // the platform's own metric names.
         assert!(text.contains("== Social reach =="));
+        // P7 — the repository: the counters at their snapshot with signed
+        // changes, a missing end as "—" (never 0), the week by release, a
+        // list that cannot be differenced yet and traffic without a token
+        // as not measured, and the note that downloads are not installs.
+        assert!(text.contains("== GitHub =="), "{text}");
+        assert!(text.contains("gjovanov/roomler-ai at the close of 2026-10-12 (UTC)"));
+        assert!(
+            text.contains("Stars: 130 (day +2 · 7d +9 · 28d —)"),
+            "{text}"
+        );
+        assert!(text.contains("Forks: 11 (day — · 7d — · 28d —)"));
+        assert!(text.contains("Release downloads (all time): 9000 (day +40 · 7d +300 · 28d —)"));
+        assert!(text.contains("agent-v0.4.140 | 250"));
+        assert!(text.contains("no snapshot for 2026-10-05 to difference against"));
+        assert!(text.contains("Traffic: not measured"), "{text}");
+        assert!(text.contains("downloads are distribution, not installs"));
+        assert!(text.contains(
+            "Helper-release downloads (CI's vendored builds): 8000 (day +100 · 7d — · 28d —)"
+        ));
+        // P7 — search: Google's final days with the day it is final
+        // through, the rates only where the reader gave them (28 days, from
+        // 30 impressions), a query below the floor with no position, and
+        // Bing saying why it is absent.
+        assert!(text.contains("== Search =="), "{text}");
+        assert!(text.contains("Google, final through: 2026-10-10 (Search Console's own day)"));
+        assert!(text.contains("Clicks: 3 (7d 20 · 28d 70)"));
+        assert!(
+            text.contains("CTR · average position (28d): 2.0 % · 8.4"),
+            "{text}"
+        );
+        assert!(text.contains("self-hosted teamviewer alternative | 6 | 12 | —"));
+        assert!(text.contains("Bing: not measured — no Bing Webmaster API key configured"));
+        assert!(text.contains("never relabelled as 7 days"));
+        assert!(!text.contains("Not yet measured"));
         assert!(text.contains("linkedin | 1 (7d 2 · 28d 5)"), "{text}");
         assert!(
             text.contains("T+7d | clicks 80 · impressions 3000"),
             "{text}"
         );
-        assert!(text.contains("not measured — arrives with P7"));
+        // P7 is built: no section of this day still waits for it.
+        assert!(!text.contains("arrives with P7"), "{text}");
         assert_eq!(subject("2026-10-13"), "Roomler daily digest — 2026-10-13");
         // P10 — the day's alerts: the open row listed once (it fired that
         // day too), with its detail as text.
@@ -2414,8 +2864,16 @@ mod tests {
                 by_agent_version: vec![],
                 series: vec![],
             },
+            github: crate::growth::github::GithubSection::before_p7(),
+            search: Measured::NotMeasured(NotMeasured::later(
+                "clicks, impressions, top queries and pages",
+                "P7",
+            )),
         };
         let text = render_weekly_text(&doc, &s);
+        // P7 — the section renders even when nothing is measured yet.
+        assert!(text.contains("== GitHub =="), "{text}");
+        assert!(text.contains("Counters: not measured — arrives with P7"));
         assert!(
             text.contains("Roomler weekly roll-up — 2026-W41 (2026-10-05 → 2026-10-11)"),
             "{text}"

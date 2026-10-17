@@ -181,6 +181,7 @@ mod tests {
             "/org/0123456789abcdef01234567/timeline",
             "/campaigns",
             "/channels",
+            "/content",
             "/newsletter",
             "/revenue",
             "/weekly",

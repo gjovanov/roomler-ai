@@ -57,9 +57,11 @@ pub mod alerts;
 pub mod campaigns;
 pub mod channels;
 pub mod cohorts;
+pub mod content;
 pub mod digest;
 pub mod exclusions;
 pub mod funnel;
+pub mod github;
 pub mod keys;
 pub mod newsletter;
 pub mod org_daily;
@@ -69,6 +71,7 @@ pub mod read_key;
 pub mod render;
 pub mod revenue;
 pub mod routes;
+pub mod search;
 pub mod value;
 pub mod weekly;
 
@@ -119,6 +122,11 @@ pub fn admin_routes(state: &AppState) -> Router<AppState> {
         // P6 — the Campaigns table: per normalised key, purestat's web
         // plane (live, for the exact range) beside the account funnel.
         .route("/campaigns", get(campaigns::get_campaigns))
+        // P7 — the Content table: per blog post, the web plane over the
+        // range (purestat, live), Google's final days from the `saas`
+        // pullers, the URL Inspection verdict, and the sign-ups that
+        // landed on it.
+        .route("/content", get(content::get_content))
         // P4 — billed revenue, the monthly movements, margin and the
         // plan-limit collisions. (The Stripe backfill that fills it is the
         // `saas` module's `/admin/growth/billing/backfill`.)

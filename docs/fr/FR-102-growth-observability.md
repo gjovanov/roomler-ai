@@ -501,15 +501,84 @@ sequenceDiagram
   impressions, CTR and position. Search Console is read through a service account added to
   `sc-domain:roomler.ai` as a restricted user; Bing through an API key. URL Inspection adds each post's
   index status and last crawl, within its 2,000-a-day quota.
+  *(P7b as built — three `saas` pullers on P6's pattern, each "not measured" without its credential and
+  saying so once. **Search Console** (`saas::search_pull`, `saas::search_console`): the service account's
+  RS256 assertion (`webmasters.readonly`, which caps the token at read-only whatever the account's role)
+  exchanged for a cached token. Only **final** days are stored: each cycle asks the `date` breakdown with
+  `dataState: all`, and a day from its `metadata.firstIncompleteDate` on stays due with nothing stored,
+  never a partial day read as whole; when Google omits that date the Pacific day still running stays due
+  all the same. A final day holds four breakdowns — `site` (the property's totals),
+  `page` (per-page totals with the anonymised queries), `query`, `page_query` — as `clicks`, `impressions`
+  and `position_x100` (the position weighted by impressions, so any set of rows averages as Google does); CTR
+  is derived. The first cycle fills the last 30 closed days; a day younger than 5 is re-pulled once per cycle,
+  then frozen. Its days are Google's (Pacific). **The blog's posts** (`saas::content_pull`, `growth_content`,
+  `saas`'s index set): the site's own Atom feed once a day, `_id` the post's path; a post that leaves the
+  feed is kept `in_feed: false`, and only a feed can say so — a 404, a redirect, a non-https URL or an
+  answer that is not an Atom feed is a failed read that changes nothing. With the same key, each post's
+  URL Inspection verdict, coverage state and last crawl (at most 200 a day), `inspected_at` the time the
+  verdict was read; a failed attempt keeps them and records the error, a timeout is one post's failure
+  until three come in a row, and a post inspected in the cycle is not asked again on a retry.
+  ⚠️ Google's own permission table gives a *Restricted* user "fetch only"
+  on URL Inspection, and community reports say the API needs *Full*: with a Restricted account the search
+  numbers arrive and the index column records `forbidden (403)` on every post — never a 0 — until the
+  account is raised to Full. **Bing** (`saas::bing_pull`): Bing answers per DAY only for the site's totals
+  (`GetRankAndTrafficStats` → `source: bing`) and per WEEKLY bucket for queries and pages
+  (`GetQueryStats`, `GetPageStats` → `source: bing_weekly`), the whole history on every call; both are
+  stored at Bing's own grain under Bing's (Pacific) dates and labelled as such, the recent part rewritten
+  and the rest frozen. A Bing query's text is stored only from 10 impressions in its bucket (§3p). Bing's
+  key rides the query string, so no redirect is followed. Bing exposes no index status. Every puller reads
+  its answers with a size ceiling. Detail:
+  [growth-observability.md](../growth-observability.md#search-search-console-bing-and-the-blogs-posts-p7b).)*
 - **The Content table**, per article:
   - published date, visitors, reads, median read time, top channels;
   - search impressions, clicks, CTR and position (7 d and 28 d), and whether the post is indexed;
   - sign-ups whose `landing_path` is the post (needs FR-91 P3).
+  *(P7c as built — `GET /api/admin/growth/content?since&until&include_internal` (host, platform admins and
+  the read key) and the Content tab. One row per post of `growth_content`. The web cells are purestat **live**
+  for the range (visitors, reads with a read share from 30 pageviews, median read time, the top three
+  channels from `path × referrer_host`), never a sum of daily rows. The Google cells come from the stored
+  `page` breakdown matched by path, so the anonymised queries count. They cover the 7 and 28 days ending on
+  the newest final day pulled on or before `until` (`google_through`), with CTR and position only from 30
+  impressions, and the top five queries from `page_query`; `google_days` says how many final days of each
+  window were pulled, so an unpulled day is not read as 0. A post is its path without the trailing slash:
+  the rows of `/blog/a` and `/blog/a/` add up. The index column is the URL Inspection verdict, dated by
+  when that verdict was read, not by a later failed attempt.
+  Sign-ups are `users.signup_attribution.landing_path` equal to the post's path, the exclusion set
+  applied. ⚠️ That field exists but the site writes it only on a campaign link's journey (FR-88's carry);
+  organic arrivals carry none until FR-91 P3, so the cell is a lower bound and the tab says so in text.
+  Each column is `not_measured` with its reason, never 0. Detail:
+  [growth-observability.md](../growth-observability.md#the-content-table-and-the-search-section-p7c).)*
 - **GitHub.**
   - Public counters need no token: stars, forks, and release-asset downloads per day (cumulative counters,
     differenced).
   - Repository traffic is optional: views, clones and referrers, read with a read-only token. GitHub keeps
     only 14 days of it, so it is pulled daily.
+  *(P7a as built — `saas::github_pull`, the P6 puller's pattern: one `growth_pulls` row per (source, day),
+  `$set` on each row's own `_id`, the Redis claim per tick, a failure recorded per day with its reason and
+  never a 0. The counters are stored as one cumulative SNAPSHOT per closed UTC day (`growth_daily {source:
+  github}`, `by: repo` stars / forks / watchers / downloads / helper_downloads, `by: release` (with its
+  `kind`) and `by: flavour` downloads — a flavour is the asset name without its version), read between 01:00
+  and 07:00 the next day. The product's releases (`agent-v`, `setup-v`, `tunnel-v`, `tunnel-wizard-v`) are
+  counted apart from the helpers our own CI downloads (vendored builds, caches), which held 8,032 of the
+  16,740 downloads when read live on 2026-10-17. Signature and checksum sidecars (`.asc`, `.sha256`) are
+  not counted: the updater fetches one beside every package. The first
+  good read stands, and a day not read inside that window has no snapshot. The counters never carry the
+  token, so a bad token cannot cost a snapshot; they read from GitHub's 60 unauthenticated requests an hour,
+  which the releases cache also uses, so the listing (at most 30 pages) stops before the hour's last 10
+  and the next tick retries. A listing past 30 pages is stored as `truncated`, and the readers treat its
+  downloads as a lower bound. The readers (`growth::github`)
+  difference two snapshots: a delta whose earlier snapshot is missing is `null`, never 0 and never split
+  across the gap, and downloads are differenced per release — a release whose total went down (an asset
+  re-uploaded, as CI's `seed-cache` is on every seed save) counts nothing that day, an under-count rather
+  than the over-count of reading its new total as new downloads. Traffic
+  (`source: github_traffic`) needs `ROOMLER__GROWTH__GITHUB_TOKEN`: the per-day views and clones are
+  re-pulled for the last 13 closed days and frozen after, and the referrers, which GitHub answers only as a
+  14-day top-10 ranking, are stored under the closed day they were read after. ⚠️ GitHub's download counts
+  include every agent self-update, hosted and self-hosted alike, because the updater downloads from GitHub
+  directly: they measure distribution, not installs, and nothing tells one deployment from another. Clones
+  are mostly CI's `actions/checkout`, not people, and the email labels them so.
+  Shown as the digest's `github` section and the weekly roll-up's. Detail:
+  [growth-observability.md](../growth-observability.md#github-the-repositorys-counters-and-traffic-p7a).)*
 
 ### 3l. The daily digest (P1d), the results feed and alerts (P10)
 
@@ -541,7 +610,7 @@ computes the day, stores it, and emails it to the platform admins.
 | Quality | sessions requested → reached Active / never, by `end_reason` (and the ended ones by class); duration, peak frame rate and RTT as p50/p90 with n; FR-22's time to first frame p50/p90 (the day exact, 7d/28d estimated from the frozen histograms); agent crashes by version and per 100 device-days; the day by agent version | `remote_sessions`, `agent_crashes`, `stats_machine_1d`, `growth_quality_daily` | P1d; TTFF, the rates and the versions P9a; the rating P9b |
 | Install | fetches by client class; tokens issued → redeemed | §3e | P3 |
 | Social reach | each platform's own numbers per post | the pipeline's push | P8 |
-| Search | clicks, impressions, top queries and pages | Search Console, Bing | P7 |
+| Search | clicks, impressions, top queries and pages | Search Console, Bing | P7 (P7c: Google through its newest final day, Bing at its own grain, each `not_measured` without its key) |
 
 - **Small numbers stay honest.** Below n = 30 the digest shows counts, not percentages. Each count of the
   day sits beside its trailing 7-day and 28-day totals, so a quiet day is read against a baseline, not
@@ -676,8 +745,9 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 | `growth_keys` | core | `{kind: ingest \| read, label, prefix, hash, created_by, created_at, revoked_at, last_used_at}` — the key's SHA-256 and a display prefix, never the key (D12, P8; the `read` kind P10) | until deleted; revoked rows stay | platform admins (host routes) |
 | `growth_posts` | core | `{platform, platform_id, account, format, url, published_at, key, cost_cents}`, unique `(platform, platform_id)`; no post text (P8) | indefinitely (our own content) | `saas`'s ingest route |
 | `growth_post_snapshots` | core | `{platform, platform_id, snapshot: T+1d\|T+7d\|T+28d, taken_at, metrics {raw: number}}`, unique `(platform, platform_id, snapshot)`, written once (P8) | indefinitely | `saas`'s ingest route |
-| `growth_pulls` | core | `_id = "<source>:<day>"`, `{source, day, status: ok\|failed, pulled_at, attempted_at, attempts, rows, error, missing_goal, truncated}` — whether a puller's day exists, so "not pulled" and "failed" are never read as 0 (P6) | indefinitely, like the rows it describes | the pullers (`saas`'s purestat puller from P6) |
+| `growth_pulls` | core | `_id = "<source>:<day>"`, `{source, day, status: ok\|failed, pulled_at, attempted_at, attempts, rows, error, missing_goal, truncated}` — whether a puller's day exists, so "not pulled" and "failed" are never read as 0 (P6) | indefinitely, like the rows it describes | the pullers (`saas`'s purestat puller from P6; its GitHub puller from P7a, `github:` and `github_traffic:`) |
 | `billing_events` | `saas` | §3g, plus `recurring_cents`, `interval_months`, `subscription_id`, `status`, `reason`, `cancel_at_period_end`, `event_id` (sparse-unique), `source: webhook\|backfill`; unique `(kind, stripe_id)` for paid invoices (P4) | with the org (`purge_tenant`); the monthly totals frozen into `growth_daily` stay | the Stripe webhook, the operator's backfill |
+| `growth_content` | `saas` | `_id` = the post's path, `{url, title, published_at, updated_at, first_seen_at, last_seen_at, in_feed, inspection {verdict, coverage_state, indexing_state, page_fetch_state, robots_txt_state, last_crawl_time, google_canonical, inspected_at, error}}` — the blog's own feed, and Google's URL Inspection of each post (P7b) | indefinitely (our own content, no person); a post that leaves the feed is kept `in_feed: false` | `saas`'s content puller |
 | `enroll_token_issued` | `fleet` | `_id = jti`, §3e | 90 days | token issuance, the enroll |
 | `setup_diagnostics` | `fleet` | `{run, step, outcome, elapsed_ms, error_code, os, wizard_version, ts}` | 90 days | the wizard, opt-in |
 | `agents.install` | `fleet` | `{method, scope, run}` | with the agent row | the enroll |
@@ -697,7 +767,7 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 | invoices and plan changes | `billing_events` | with the org (Stripe is the record) | the org | §2.12 |
 | session ratings | `session_feedback` | 25 months | the user | new §2.18 |
 | delivery status | `newsletter_sends` | as FR-58 | the subscriber | newsletter section (P5: §2.14 and §7 name it) |
-| social, search, GitHub | `growth_daily`; social posts and their metric snapshots in `growth_posts` / `growth_post_snapshots` (P8: ids, URLs, numbers and the campaign key — never post text) | indefinitely | — (aggregates about our own content) | — |
+| social, search, GitHub | `growth_daily`; social posts and their metric snapshots in `growth_posts` / `growth_post_snapshots` (P8: ids, URLs, numbers and the campaign key — never post text); the blog's posts and their index status in `growth_content` (P7b) | indefinitely | — (aggregates about our own content: search queries are Google's and Bing's aggregates. Google already drops the rare, possibly identifying ones; Bing documents no such threshold, so a Bing query's text is stored only from 10 impressions in its weekly bucket — `bing_pull::QUERY_MIN_IMPRESSIONS` — and the rest live on only in the site's daily totals. GitHub's referrers are site names) | — |
 | daily digests | `growth_digests`; the platform admins' mailboxes | 25 months | — (org names, never a person) | new §2.18 |
 | remote-desktop quality per day and agent version (P9a) | `growth_quality_daily` | indefinitely | — (counts and percentiles about the product; no org, no device, no person) | new §2.18 |
 
@@ -724,7 +794,7 @@ hosted only). §7's retention list grows, and `docs/data-model.md`'s stale TTLs 
 | PS1 | §3n PS1 in purestat | — | **live** with PS0a in v0.1.8; the roomler.ai key minted 2026-10-14 (only its hash stored; sealed into `roomler2-secret`, roomler-ai-deploy#29) |
 | P6 | §3i: the purestat puller, the Campaigns table with coverage | no key ⇒ "not measured" | **live** 2026-10-15 01:23Z (`hosted-20261015-cb26a2f`): #2229 `fb7e45831` — the puller (`saas`), `growth_pulls`, `GET …/growth/campaigns`, the Campaigns tab. The puller's first cycle and AC16 field-verified (§8) |
 | PS3 | §3n PS3 in purestat | a tracker attribute | **live** 2026-10-14 23:02Z: purestat v0.1.9 (gjovanov/purestat#18) — read rate, scroll depth, opt-in link/download events |
-| P7 | §3k: the Search Console, Bing and GitHub pullers, the Content table | no credential ⇒ "not measured" | — |
+| P7 | §3k: the Search Console, Bing and GitHub pullers, the Content table | no credential ⇒ "not measured" | **P7a (GitHub) in PR #2381** (2026-10-17): the `saas` GitHub puller (public counters as daily cumulative snapshots, no token; traffic with `ROOMLER__GROWTH__GITHUB_TOKEN`), `growth::github` (snapshots differenced, a gap read as `null`), the digest's and the weekly's `github` section, `crates/tests/src/growth_github_tests.rs` against a fake GitHub, the docs. No route, no index, no collection: the composition baseline is unchanged. Owed after the promote: the field read of the first snapshot against `api.github.com` (§8). **P7b (the search pullers) in PR #2385**, stacked on P7a: Search Console per final day through a service account (`ROOMLER__GROWTH__SEARCH_CONSOLE_KEY`), the blog's feed and URL Inspection into `growth_content` (a new `saas` collection; the composition baseline re-recorded for its index), Bing at its own grain (`ROOMLER__GROWTH__BING_API_KEY`), `crates/tests/src/growth_search_tests.rs` against fakes of Google, Bing and the feed. Owed: the operator's two credentials, then the first final day against Search Console's UI (AC17). **P7c (the Content table, the digest's Search section) in PR #2386**, stacked on P7b: `GET …/growth/content` (a new route; the composition baseline re-recorded) and the Content tab, `growth::search` (Google through its newest final day, Bing at its own grain) as the digest's and the weekly's `search` section, the email's Search block. AC17 is read in the Content table once the credential exists — not ticked. Not built: §3l's "Search Console or GitHub pull failing two days running" alert — no rule reads the pullers' `growth_pulls` rows yet. Until one does, a failing pull keeps the newest good day on show, each reader labelling it with its own date (GitHub's `counters.at`, Google's `through`, Bing's `pulled`), and turns "not measured" only once its lookback holds no good day (7, 14 and 4 days); the error is on that day's `growth_pulls` row. Bing's reader checks its pull rows since the review of #2386 — before, a failing Bing pull kept old rows shown as measured |
 | P8 | §3j: the ingest routes, the Channels table, spend | no ingest key ⇒ 404 | **live** 2026-10-15 01:23Z (`hosted-20261015-cb26a2f`): #2237 `a7b56f5df`, AC18 field-verified (§8) — the ingest key, `…/ingest/{posts,snapshots}` (`saas`), `growth_posts` / `growth_post_snapshots`, `GET …/growth/channels`, the Campaigns reach column, the Channels tab. **The pipeline pushes** since 2026-10-15 22:02Z (the promotion repo's `tools/metrics/push.ts`, run by its hourly metrics task): 69 posts and 42 snapshots on the first run (§8). X and LinkedIn posts carry no reach yet: the promotion repo has no collector for either (LinkedIn's API grant is pending; X bills every read) |
 | P9 | §3f: session outcomes, the frozen time-to-first-frame, crashes per version, the session carrier, the rating | `ROOMLER__GROWTH__FEEDBACK=false` hides the prompt; P9a has no switch of its own — it runs under the org-day fold (`growth.enabled`) | **P9a merged** #2305 `955fcee82` (server only; live with the next promote): `growth_quality_daily` frozen nightly from `remote_sessions`, `agent_logs` (FR-22's TTFF before its 7-day horizon, the version a device ran), `agent_crashes` (`agentVersion` — P1d had read `agent_version`, which no production row has, so every crash was `unknown`) and `stats_machine_1d`; `GET …/growth/quality` + `POST …/quality/backfill`; the Quality tab; the digest's and weekly's quality sections. **Live** 2026-10-16 11:08Z (`hosted-20261016-32a9095`); the hand count of 2026-10-15 matched every frozen figure (§8). **P9b in PR #2310** (viewer + `remote`): the rating prompt in the viewer's ended state (30 s from the request, once a UTC day per browser, dismissible, no focus, no text), `session_feedback` with its route and index set, `features.session_feedback` on `/api/capabilities`, the digest's `quality.ratings`, the privacy policy's text, AC19 as `ui/e2e/remote-session-rating.spec.ts` (✅ on production 2026-10-17 against a vmtest guest, once the spec signed in with the session cookie; owed: its run in the pod lane). **P9c in PR #2332** (agent + wire + server): the carrier recorded once a session reaches Active (`direct` · `turn` · `turn_local` · `overlay_direct` · `overlay_turn` · `derp` · `org_relay` · `unknown` — never direct for an unknown tier), additive on `rc:session.stats`, stored on `remote_sessions.carrier`, split by the P9a freeze and shown in the Quality tab and weekly; the ICE/relay→carrier mapping unit-tested for every kind. Owed: an agent 0.4.140 release, then the LAN / TURN / peer-relay field reads and the pre-P9c control (§8). No route, no index, no wire-variant change — the composition baseline is unchanged. **P9d in PR #2368** (agent only, no wire or server change): P9c carried the carrier to the server ONLY on the free-running 30 s heartbeat tick (and in the end-of-session sample, which lands only on the device-ended path — a controller-ended session's is dropped once `ended_at` is set), so a session whose Active span held no tick after the observation (~2.5–6 s after Connected) recorded none — a bias toward short sessions, which the 0.4.140 field read confirmed (§8). The observation now signals the signalling loop (`agents/roomlerd/src/peer.rs:937`) the moment it lands and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2165`), through one shared helper the 30 s tick calls too (`send_one_session_stats`, `signaling.rs:6115`); an `unknown` carrier signals too. The review's finding, fixed in the same PR: both sends had written up the loop's own WS, which on a supervised Mac (FR-43) is the GUI worker's own enrollment, while a delegated session's row carries the daemon's `agent_id` — `merge_live_stats` matched nothing and dropped the sample, with the FR-101 file notes it had taken. Now `AgentPeer` keeps the sender it was built with (`peer.rs:285`, the FR-43 seam) and the helper `try_send`s on it (never an await: the loop that queues is the loop that drains), so an own session's sample rides the loop's outbound queue to the WS and a delegated one rides the delegation channel under the daemon's identity; a full or closed queue skips the round, hands the notes back, and the next tick retries, one peer's failure never stopping the others. Unit tests: a sample leaves through the peer's own sender with its carrier, and a full or closed sender restores the notes (`signaling.rs:6498`, `:6538`); red→green regression test (`crates/tests/src/session_carrier_tests.rs:382`, a real agent to Connected, held under 30 s, its controller kept off overlay addresses so a dev box reads `direct` as CI does). A session that ends before the observation lands still records `unknown` (a pair was nominated; the settle read never ran). ⚠️ Pre-existing follow-up, out of scope: the device-ended last sample (FR-101 P3, `signaling.rs:2253`) stays on the direct write ahead of its terminate and still uses `delegated_out` connection-wide, so a worker's OWN session's last sample is misrouted on a supervised Mac; a fix needs the terminate on the same queue or a per-session delegation marker. Owed: an agent release carrying it, then the short-session field read |
 | P10 | §3l: the read key, the weekly roll-up, alerts | `ROOMLER__GROWTH__ALERTS=false` and `ROOMLER__GROWTH__WEEKLY_ENABLED=false` (the defaults); a read key revoked is a 404 | **live** 2026-10-16 06:11Z (`hosted-20261016-c61bf32`): #2261 `c61bf3243`. Covers the `read` key kind and the gate every growth GET passes, `growth_weekly` and its Monday job, `growth_alerts` and the hourly rules, the Alerts panel and the Weekly tab, and the digest's `alerts` section. AC20 field-verified (§8). Both switches are on for roomler.ai since roomler-ai-deploy#33, in effect from the 10-16 10:17Z roll. **The first scheduled roll-up**, 2026-W41, was computed and mailed once at 10:20:43Z with both pods running (§8). The alert rules run with nothing open. A red→green `digest_missing` has no natural occasion yet and stays owed |
@@ -962,6 +1032,12 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
     reader fits inside 30 days: the digest's 28-day window, P9a's nightly freeze of one closed day, and the
     per-device list of the last 50. The per-version counts stay in `growth_quality_daily`. The other
     options were the policy saying 90 days, or a 7-day TTL, which would have deleted 1,646.
+16. **Bing's credential** (raised by P7b, 2026-10-17; not yet put to the operator). Bing's API key has
+    no scope: one key per Bing user opens every method of the API on every site that user verified,
+    writes included (`AddBlockedUrl`, `RemoveSite`, `AddSiteRoles`). **The API key, as P7's brief
+    chose**, held as a write credential in `roomler2-secret`; or Bing's OAuth with its read-only
+    `webmaster.read` scope, which needs a one-time interactive consent and a stored refresh token
+    (not built).
 
 ## 7. Out of scope
 
@@ -1011,6 +1087,7 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
 | 2026-10-17 08:01–08:04Z | production `hosted-20261017-57519de`; a kept vmtest Ubuntu guest (`ubuntu/script/system`, agent 0.4.140, Wayland; its cell passed 8 of 9 with the usual reverse-ping WARN) from a private workspace | AC19 | **green**. The spec, fixed to sign in through each context's cookie jar and to pick the guest by exact name, ran from mars in the pinned Playwright container, one pass with no retries: 1 passed in 1.9 min. On the server: four sessions of 3 s, 33 s, 33 s and 34 s from request to end, all `controller_hangup`, and exactly one `session_feedback` row, on the fourth (`down`, `["lag"]`, by the controller, keys `session_id, tenant_id, user_id, agent_id, rating, reasons, ts`). **Red**: the spec as merged, run once against the same server, failed at `connectButton(...).toBeVisible()`. Its page snapshot was the login form, because seeding `localStorage` tokens has done nothing since sessions became cookie-only. The guest was shut down cleanly, so its ephemeral row unenrolled itself, then destroyed by name. ⚠️ The rating sits in an excluded org, so the digest's `quality.ratings` cannot count it; only an `include_internal` preview of 2026-10-17 can |
 | 2026-10-17 08:14–08:26Z | production `hosted-20261017-5f14468` (#2357, the 25-month session record and the policy) | the roll; the TTL; AC21 | **green**. Pods Ready with 0 restarts, `/health` 0.4.140 with all seven modules, and 24 of 24 agents connected at the roll reconnected. `remote_sessions` now has `created_at_1` with `expireAfterSeconds` 64,800,000 (750 days); before the roll it had no TTL index. It holds 8,570 rows, the oldest from 2026-08-04, so nothing was deleted. AC21 is green as ticked. Listing every production TTL index against §7 found one mismatch, older than FR-102: crash reports at 90 days, where the policy says "typically 7" |
 | 2026-10-17 09:05Z | production `hosted-20261017-5f14468`, read-only | AC8's field half | **Tunnel half green; not ticked.** `growth_org_daily` holds 306 rows, the oldest for 2026-07-17 (P2's 10-15 backfill went the full 90 days back). One day is older than 90 days and shows use: 2026-07-17, one org, `tunnel_flows=2`, with **0** `tunnel_audit` rows left for that org and day. The oldest surviving audit row is from 07-22. The raw source has lost that use, and only the frozen row still reports it. The SSH half has no field instance yet (`ssh_audit` begins 08-21). The deletion half has no product path |
+| 2026-10-17 11:02Z | **not production**: P7a's puller (`github_pull::run_once`) run once from the dev box against `api.github.com`, before any promote | the real repository against the parser | Stars 6, forks 1 and watchers 0 equal `GET /repos/gjovanov/roomler-ai` read the same minute. 639 releases had downloads, on 7 pages (inside the 10-page bound), for 16,740 downloads in all. The per-release listing read at 11:05Z (16,742 by then) put **8,032 of them in helper releases our own CI downloads** (`vendored-ffmpeg` 5,944, `vendored-libvpx` 1,944, `seed-cache` 144), which is why P7a counts the product's releases apart (`helper_downloads`). The production read of the first snapshot stays owed after the promote |
 | 2026-10-17 12:45–12:48Z | production `hosted-20261017-30356ee` (promoted 12:45Z; carries #2372) | decision 15 live: the crash-report TTL and the policy | **green.** Both pods are on the new image, Ready, 0 restarts; `/health` 0.4.141. The first pod's boot logged `Index conflict detected … collection="agent_crashes"`, then `Indexes recreated after conflict resolution`, for that collection only. The second pod found the index already built. `reported_at_1` is now `expireAfterSeconds` 2,592,000 (30 d). The collection holds **149** reports, none older than 30 days, the oldest from 2026-09-25; 1,678 − 1,529 = 149, so exactly the measured set was deleted. Red at 09:15Z on `5f14468`: 90 d, 1,678 rows, and §7's old line. The rendered `/privacy` now carries "Crash reports (2.11) are deleted automatically 30 days after we receive them", the old wording is gone, and the five pages write nothing. Of 23 agents connected when the roll began, 23 reconnected |
 
 ## 9. Related
