@@ -232,7 +232,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 |---|---|---|
 | A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:386` |
 | An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:409`, `crates/modules/fleet/src/hub.rs:1587` |
-| A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1459`, `peer.rs:1501`, `peer.rs:1427` |
+| A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1466`, `peer.rs:1508`, `peer.rs:1434` |
 
 "Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, learned as each runtime brings its TUN up: `crates/tunnel-core/src/overlay_footprint.rs`, fed at `runtime.rs:2148`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
 
@@ -375,7 +375,7 @@ flowchart LR
 ```
 
 The decision is one daemon-side seam, `with_honest_words`
-([`caps.rs:694`](../agents/roomlerd/src/encode/caps.rs#L694)), applied in
+([`caps.rs:700`](../agents/roomlerd/src/encode/caps.rs#L700)), applied in
 `detect()` ([`caps.rs:624`](../agents/roomlerd/src/encode/caps.rs#L624))
 after the config lists, over plain `HostFacts`
 ([`caps.rs:636`](../agents/roomlerd/src/encode/caps.rs#L636)), so it runs and
@@ -384,7 +384,8 @@ is tested on every OS.
 | Feature | When | What the hello says | What the viewer does |
 |---|---|---|---|
 | `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3064`](../agents/roomlerd/src/signaling.rs#L3064)); `no-backend` | the receive-audio toggle is off, with the device's reason |
-| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:675`](../agents/roomlerd/src/encode/caps.rs#L675)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
+| `audio` | Linux, unless a capture device is named for it in `ROOMLERD_AUDIO_SOURCE` (FR-97 P3c-1, §5.1c) | `audio` empty; `no-monitor` | the same |
+| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:681`](../agents/roomlerd/src/encode/caps.rs#L681)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone reports copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
 | `sas` | Windows, Linux | `keys-only`: the button types three ordinary keys. Windows' lock and sign-in screens ignore them (until P4a's `SendSAS`); Linux desktops bind them, GNOME and KDE to log out | the button stays, and says what the keys reach |
 | `sas` | macOS | `not-applicable`: the chord means nothing there | the button is hidden |
@@ -417,6 +418,90 @@ The keys are matched by equality (`Unavailable::KEYS`,
 shape is locked by `unavailable_wire_shape_is_locked`. FR-97's census
 (`scripts/fr97-caps-census.sh`) counts the map by OS as `key:code`, beside
 the words.
+
+### 5.1c Session audio is the computer's sound, never a microphone (FR-97 P3c)
+
+"Receive host audio" carries what the host plays. One rule, in
+[`audio_source.rs`](../agents/roomlerd/src/audio_source.rs), decides what each
+OS may open, and the session says why when it opens nothing.
+
+| OS | What a session captures | Where it cannot |
+|---|---|---|
+| Windows | WASAPI loopback of the default output device | no output device, usual on a server or a VM with no sound device: `no_output` |
+| Linux | the ALSA capture device named in `ROOMLERD_AUDIO_SOURCE`, else one named as a monitor ([`audio_source.rs:151`](../agents/roomlerd/src/audio_source.rs#L151)) | nothing named: the hello offers no track (`no-monitor`, [`caps.rs:668`](../agents/roomlerd/src/encode/caps.rs#L668)); a name that is not there: `source_not_found` |
+| macOS | nothing yet (ScreenCaptureKit audio is FR-97 P2a) | the hello offers no track (`no-backend`, §5.1b) |
+
+⚠️ **On Linux the default input is a microphone, and before P3c-1 it was the
+only thing a session ever captured there.** cpal 0.15 has one Linux host,
+ALSA, so it lists ALSA devices and never a sound server's sources. Measured
+2026-10-17 on a PulseAudio host:
+
+- the devices were exactly `pipewire`, `pulse` and `default`;
+- the auto-pick, a name ending in `.monitor`, never matched, and neither did
+  the documented `ROOMLERD_AUDIO_SOURCE=<sink>.monitor`;
+- so every session fell back to `default`, and PulseAudio showed the capture
+  on the microphone while the speakers' monitor stayed suspended.
+
+P3c-1 removed that fallback ([`cpal_backend.rs:247`](../agents/roomlerd/src/audio/cpal_backend.rs#L247)).
+A Linux host now offers no track until a device is named for it.
+
+**Naming the device (a per-user daemon).** `ROOMLERD_AUDIO_SOURCE` takes an ALSA
+device name, as `arecord -L` prints it, not a PulseAudio source. To capture the
+speakers through PulseAudio or PipeWire's Pulse server, set both in the
+daemon's environment and restart it:
+
+```text
+ROOMLERD_AUDIO_SOURCE=pulse
+PULSE_SOURCE=@DEFAULT_MONITOR@
+```
+
+`PULSE_SOURCE` points the `pulse` device at the default output's monitor
+(measured on the same host). Without it, `pulse` is the microphone again, by
+the owner's own choice. A root daemon reaches no session's sound server this
+way: capturing the session's monitor for it is P3c-2.
+
+When the track cannot carry sound, the agent says why over the control channel:
+
+```mermaid
+sequenceDiagram
+    participant V as Viewer
+    participant A as Agent audio pump
+    participant B as audio::open_default
+    V->>A: rc:session.request {audio_enabled}
+    Note over A: the hello offered opus,<br/>so the Opus track is added
+    A->>B: open the loopback or monitor
+    B-->>A: AudioUnavailable {code, detail}
+    A->>V: rc:audio-unavailable {code, detail, hint}
+    Note over A,V: retried until the control DC opens<br/>(FR-80's send_control_notice)
+    V-->>V: a snackbar once, and the reason<br/>on the audio control's title
+```
+
+The pump ([`peer.rs:12390`](../agents/roomlerd/src/peer.rs#L12390)) sends it
+from every exit: a capture that does not open, an encoder that does not start,
+and a capture or encode that stops mid-session. The payload is built by
+[`peer.rs:5382`](../agents/roomlerd/src/peer.rs#L5382); the viewer parses it
+at [`useRemoteControl.ts:1354`](../ui/src/composables/useRemoteControl.ts#L1354)
+and puts it on the toggle's title
+([`RemoteControl.vue:3125`](../ui/src/views/remote/RemoteControl.vue#L3125)).
+
+| `code` | Means |
+|---|---|
+| `no_monitor` | Linux: nothing among the capture devices is the computer's sound, and the default input is not opened |
+| `source_not_found` | the device `ROOMLERD_AUDIO_SOURCE` names is not there, and no microphone is opened in its place |
+| `no_output` | Windows: no output device to loop back |
+| `backend_error` | the device failed to open, the Opus encoder did not start, or capture stopped mid-session; `detail` is the backend's own words |
+| `not_supported` | an OS with no capture backend |
+
+⚠️ **`rc:audio-unavailable` is its own message, not an `rc:media-unavailable`
+code.** A viewer that predates it ignores it, where the video notice would put
+"no screen capture" over a working picture. Like FR-80's notice, it is
+control-DC JSON between the peers, so it touches neither the server wire nor
+the composition baseline.
+
+⚠️ **The recorder shares the rule.** A recording's computer audio opens the
+same loopback or monitor only (`Source::SystemOnly`), so on Linux it refuses
+its start by name until a device is named, as it always did in practice; only
+its words changed.
 
 ### 5.2 Encoder selection
 
@@ -1367,8 +1452,8 @@ sequenceDiagram
 
 | | |
 |---|---|
-| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:12254`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:12232`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:3535`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:12263`) |
+| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:12311`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:12289`). An offer with no `m=video` is answered without the track |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:3535`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:12320`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:555`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:284`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:649`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:348`, #2326) |
@@ -1430,7 +1515,7 @@ where the server still holds the session live: on the device-ended path (sent ah
 own `rc:terminate`), not on the controller-ended one, where `ended_at` is already set when the agent
 hears the terminate and `merge_live_stats` matches nothing. So a session with no tick after the
 observation — overwhelmingly a short one — recorded none, which the freeze reads as `unknown`. Since
-P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:937`)
+P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:944`)
 and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2169`), by the
 same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:6119`) queues the sample on
 **the peer's own sender**, the FR-43 seam the peer was built with (`peer.rs:285`) — the loop's outbound
@@ -1531,7 +1616,7 @@ that dominate a relayed connect (a DERP-relayed LAN pair measured on 2026-08-29:
 ⚠️ **Marks are per ATTEMPT, never per connect.** A recorder shared across the
 ladder would let the fast retry overwrite the lost attempt's marks and report an
 18 s connect as a 3 s one — hiding the exact defect being hunted. Each retry
-calls `beginAttempt()` (`useRemoteControl.ts:8306`) and gets a fresh recorder.
+calls `beginAttempt()` (`useRemoteControl.ts:8339`) and gets a fresh recorder.
 
 ⚠️ **An unreached mark is the finding.** The console line prints it as
 `<name>:—` and the record omits the key; the first missing mark
@@ -1634,7 +1719,7 @@ leaves **no server row at all** (the request never reached a hub), and
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
-the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4258`)
+the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4282`)
 posts **one record**: the console line, persisted.
 
 ```jsonc
@@ -1667,7 +1752,7 @@ posts **one record**: the console line, persisted.
 | outcome | means | snackbar |
 |---|---|---|
 | `first_frame` | the attempt painted; `ttff_ms` is set | per the rules above |
-| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:3916`) | stall warning |
+| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:3940`) | stall warning |
 | `closed` | the operator hung up, the view unmounted, or a terminal `rc:error` failed it (`error_code` says which) | none |
 | `retried` | the ladder advanced past a live attempt for another reason — a transient `rc:error` it rides, an ICE failure, dead air before the first frame (`scheduleReconnect`, `:7157`) | none |
 
@@ -1850,7 +1935,7 @@ system guest, idle 60 s after each of three 2-minute DRM sessions, with gdb's
 | session 3 | 303 MB | 256 MB | 290 MB | **9.2 MB** | 32 |
 | one `malloc_trim(0)` | **89 MB** | **42 MB** | 290 MB | 9.2 MB | 32 |
 
-So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1636`) asks for a trim, and
+So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1643`) asks for a trim, and
 `agents/roomlerd/src/mem_trim.rs:33` runs `malloc_trim(0)` once, on a short-lived
 `mem-trim` thread, **5 s after the last session ended**. The delay lets the
 encoder thread finish freeing (`encode/thread.rs:257` joins it), and sessions

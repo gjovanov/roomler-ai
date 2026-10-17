@@ -579,6 +579,17 @@ impl AgentPeer {
         // is created so the m=audio section is advertised; when audio is
         // off we add no track and the SDP carries video only (fully
         // backward-compatible with controllers that never request audio).
+        //
+        // Control-DC stash so the lock-state emitter task (spawned
+        // alongside the media pump below) can write `rc:host_locked`
+        // messages without a separate channel lookup. Tokio mutex
+        // mirrors `video_bytes_dc`'s rationale: the on_data_channel
+        // callback writes from an async context, the emitter reads
+        // from its own task, both very briefly. FR-97 P3c-1 — created
+        // before the audio track, so the audio pump can tell the
+        // controller why it has no sound.
+        let control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
         #[cfg(feature = "audio")]
         let audio_pump_handle: Option<JoinHandle<()>> = if audio_enabled {
             // RETIRED-NAME-ANCHOR(4): wire-visible stream id, as above.
@@ -591,7 +602,11 @@ impl AgentPeer {
                 .await
                 .context("add_track(audio)")?;
             info!(%session_id, "audio: Opus track added — spawning audio pump");
-            Some(tokio::spawn(audio_pump(session_id, audio_track)))
+            Some(tokio::spawn(audio_pump(
+                session_id,
+                audio_track,
+                control_dc.clone(),
+            )))
         } else {
             None
         };
@@ -704,14 +719,6 @@ impl AgentPeer {
         // callback writes from an async context and the pump reads
         // from its own task — both brief, no contention.
         let video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>> =
-            Arc::new(tokio::sync::Mutex::new(None));
-        // Control-DC stash so the lock-state emitter task (spawned
-        // alongside the media pump below) can write `rc:host_locked`
-        // messages without a separate channel lookup. Tokio mutex
-        // mirrors `video_bytes_dc`'s rationale: the on_data_channel
-        // callback writes from an async context, the emitter reads
-        // from its own task, both very briefly.
-        let control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>> =
             Arc::new(tokio::sync::Mutex::new(None));
         // P6 — cursor-DC stash: the arbiter writes `cursor:peer` (ghost
         // cursor) messages to OTHER sessions through this handle.
@@ -5364,6 +5371,54 @@ fn spawn_capture_unavailable_notice(
     });
 }
 
+/// FR-97 P3c-1 — this session's audio track will carry no sound, and why.
+///
+/// The audio twin of FR-80's `rc:media-unavailable`, under its own name so a
+/// viewer that predates it ignores it rather than reading "no pixels".
+///
+/// Always compiled (the `audio` feature gates the CALLER) so the default-build
+/// unit test locks the wire shape, as `capture_unavailable_payload`'s does.
+#[cfg_attr(not(feature = "audio"), allow(dead_code))]
+fn audio_unavailable_payload(reason: &crate::audio_source::AudioUnavailable) -> String {
+    serde_json::json!({
+        "t": "rc:audio-unavailable",
+        "code": reason.code.wire(),
+        "detail": reason.detail,
+        "hint": reason.code.hint(),
+    })
+    .to_string()
+}
+
+/// FR-97 P3c-1 — deliver [`audio_unavailable_payload`] to the controller, with
+/// FR-80's retry: the control DC usually opens after the audio pump starts
+/// (the pump is spawned before the SDP answer exists).
+#[cfg(feature = "audio")]
+fn spawn_audio_unavailable_notice(
+    session_id: bson::oid::ObjectId,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    reason: crate::audio_source::AudioUnavailable,
+) {
+    const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+    const SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+    let payload = audio_unavailable_payload(&reason);
+    warn!(
+        %session_id,
+        code = reason.code.wire(),
+        detail = %reason.detail,
+        "audio unavailable — this session's audio track carries no sound; telling the controller"
+    );
+    tokio::spawn(async move {
+        if !send_control_notice(&control_dc, &payload, RETRY_EVERY, DEADLINE, SEND_BUDGET).await {
+            warn!(
+                %session_id,
+                "audio-unavailable notice never reached the controller — its control channel \
+                 did not open within the deadline"
+            );
+        }
+    });
+}
+
 /// FR-93 P6g — a session served by an arm the compositor shows nothing for
 /// says so at the screen. The DRM arm reads the scanout below GNOME and KDE, so
 /// neither raises its screen-sharing indicator: the companion's banner, or a
@@ -5702,11 +5757,13 @@ fn media_waiting_hook(
 /// Retry one control-DC message until it is sent or `deadline` passes. The
 /// channel usually opens AFTER capture (and seconds late on a relay), so a
 /// one-shot send would be lost. `true` once it went out. FR-93 P5h's sleep
-/// notice sends through it too (`crate::sleep_notice`).
+/// notice sends through it too (`crate::sleep_notice`), and FR-97 P3c-1's
+/// audio notice.
 #[cfg_attr(
     not(any(
         feature = "vp9-444",
         feature = "ffmpeg-encoder",
+        feature = "audio",
         all(target_os = "linux", feature = "portal-capture")
     )),
     allow(dead_code)
@@ -12316,10 +12373,13 @@ fn build_audio_codec_cap() -> RTCRtpCodecCapability {
 
 /// Per-session system-audio pump. Captures desktop/system audio,
 /// encodes to Opus (48 kHz stereo, 20 ms frames), and writes each
-/// packet into the WebRTC Opus track. Self-regulating: with no capture
-/// backend (macOS, or a device-open failure) `open_default` returns a
-/// Noop that parks forever, so this task idles producing no samples —
-/// the m=audio section is still negotiated but stays silent.
+/// packet into the WebRTC Opus track.
+///
+/// A capture that does not open, an encoder that does not start, or a
+/// capture that fails mid-session ends the pump and tells the controller
+/// why (`rc:audio-unavailable`, FR-97 P3c-1). The m=audio section stays
+/// negotiated and silent, as it always was; before P3c-1 the silence came
+/// with no reason, and on Linux a microphone opened in its place.
 ///
 /// Each 20 ms Opus packet is written with a fixed `duration` of 20 ms so
 /// the track's RTP timestamps advance at the real audio clock (unlike
@@ -12327,14 +12387,33 @@ fn build_audio_codec_cap() -> RTCRtpCodecCapability {
 ///
 /// Aborted by `AgentPeer::close()`.
 #[cfg(feature = "audio")]
-async fn audio_pump(session_id: bson::oid::ObjectId, audio_track: Arc<TrackLocalStaticSample>) {
+async fn audio_pump(
+    session_id: bson::oid::ObjectId,
+    audio_track: Arc<TrackLocalStaticSample>,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+) {
     use crate::audio;
+    use crate::audio_source::{AudioUnavailable, AudioUnavailableCode};
 
-    let mut capture = audio::open_default();
+    let mut capture = match audio::open_default() {
+        Ok(c) => c,
+        Err(reason) => {
+            spawn_audio_unavailable_notice(session_id, control_dc, reason);
+            return;
+        }
+    };
     let mut encoder = match audio::opus_encode::OpusEncoder::new() {
         Ok(e) => e,
         Err(e) => {
             warn!(%session_id, %e, "audio: failed to init Opus encoder — audio pump exiting");
+            spawn_audio_unavailable_notice(
+                session_id,
+                control_dc,
+                AudioUnavailable::new(
+                    AudioUnavailableCode::BackendError,
+                    format!("the Opus encoder did not start: {e:#}"),
+                ),
+            );
             return;
         }
     };
@@ -12367,6 +12446,14 @@ async fn audio_pump(session_id: bson::oid::ObjectId, audio_track: Arc<TrackLocal
             }
             Err(e) => {
                 warn!(%session_id, %e, "audio: capture error — audio pump exiting");
+                spawn_audio_unavailable_notice(
+                    session_id,
+                    control_dc,
+                    AudioUnavailable::new(
+                        AudioUnavailableCode::BackendError,
+                        format!("audio capture stopped: {e:#}"),
+                    ),
+                );
                 return;
             }
         };
@@ -12376,6 +12463,14 @@ async fn audio_pump(session_id: bson::oid::ObjectId, audio_track: Arc<TrackLocal
             Ok(p) => p,
             Err(e) => {
                 warn!(%session_id, %e, "audio: opus encode error — audio pump exiting");
+                spawn_audio_unavailable_notice(
+                    session_id,
+                    control_dc,
+                    AudioUnavailable::new(
+                        AudioUnavailableCode::BackendError,
+                        format!("audio encoding stopped: {e:#}"),
+                    ),
+                );
                 return;
             }
         };
@@ -12930,6 +13025,29 @@ mod codec_cap_tests {
             200,
             "capped on a CHAR boundary, so a multi-byte error text cannot split a code point"
         );
+    }
+
+    /// FR-97 P3c-1 — the audio notice's wire shape, which the viewer parses
+    /// (`parseControlMessage`, `rc:audio-unavailable`).
+    #[test]
+    fn audio_unavailable_payload_wire_shape() {
+        use crate::audio_source::{AudioUnavailable, AudioUnavailableCode};
+        let payload = super::audio_unavailable_payload(&AudioUnavailable::new(
+            AudioUnavailableCode::NoMonitor,
+            "devices: pipewire, pulse, default",
+        ));
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("JSON");
+        assert_eq!(parsed["t"], "rc:audio-unavailable");
+        assert_eq!(parsed["code"], "no_monitor");
+        assert_eq!(parsed["detail"], "devices: pipewire, pulse, default");
+        assert_eq!(parsed["hint"], AudioUnavailableCode::NoMonitor.hint());
+        // A backend's own words arrive as written, quotes and newlines too.
+        let odd = "he said \"no\"\nand a \\ too";
+        let parsed: serde_json::Value = serde_json::from_str(&super::audio_unavailable_payload(
+            &AudioUnavailable::new(AudioUnavailableCode::BackendError, odd),
+        ))
+        .expect("JSON");
+        assert_eq!(parsed["detail"], odd);
     }
 
     #[test]

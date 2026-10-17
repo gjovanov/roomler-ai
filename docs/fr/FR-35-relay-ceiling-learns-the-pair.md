@@ -10,9 +10,9 @@ measured-rate line (#678: a sender cannot see capacity it is not using). Operato
 
 - `relay_max_bps()` = **3 Mbps** (`agents/roomlerd/src/encode/mod.rs:454`, env `RELAY_MAX_KBPS`),
   applied as the encoder's `maxrate` cap on every constrained session
-  (`encoder.rs` ↔ `rate_profile::ffmpeg_maxrate_bps_scaled`, `peer.rs:3077`), opened at 85 % =
+  (`encoder.rs` ↔ `rate_profile::ffmpeg_maxrate_bps_scaled`, `peer.rs:3084`), opened at 85 % =
   **2.55 Mbps**, and as the AIMD's ceiling (`governor.rs:254-273`); the send-queue budget derives
-  from the same constant (`peer.rs:4581`).
+  from the same constant (`peer.rs:4588`).
 - The AIMD (`encode/aimd.rs`) climbs additively (+ceiling/16 ≥ 150 kbps per 5 s of quiet) but
   **never above that ceiling**; it decreases ×0.85 on a full send channel, on a send-wait stall
   (#818) and on viewer-age excess (FR-15 P2). The governor's measured-ceiling clamp (stage 1) is

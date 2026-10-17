@@ -783,6 +783,16 @@ export interface RcMediaUnavailable {
   hint: string
 }
 
+/** FR-97 P3c-1 — `rc:audio-unavailable`: this session's audio track will carry
+ *  no sound, and why. The audio twin of `rc:media-unavailable`, with the same
+ *  shape. Before it, a host that could not capture its sound sent silence and
+ *  said nothing, and a Linux host sent its microphone instead.
+ *
+ *  `code` is `no_monitor`, `source_not_found`, `no_output`, `backend_error` or
+ *  `not_supported` today, typed as a string so a newer agent's code still
+ *  shows its `hint`. */
+export type RcAudioUnavailable = RcMediaUnavailable
+
 /** FR-93 P1 — `rc:input-reach`: this session's mouse and keyboard will NOT
  *  reach the whole desktop. Sent once, and only then; a session that reaches
  *  everything sends nothing. An injector that reaches nothing does not fail
@@ -1238,6 +1248,8 @@ export type RcControlInbound =
   | { kind: 'desktop_changed'; name: string }
   | { kind: 'video_info'; info: RcVideoInfo }
   | { kind: 'media_unavailable'; reason: RcMediaUnavailable }
+  /** FR-97 P3c-1 — the session's audio track carries no sound, and why. */
+  | { kind: 'audio_unavailable'; reason: RcAudioUnavailable }
   | { kind: 'media_waiting'; for: string; waitsMs: number; hint: string }
   | { kind: 'input_reach'; reach: RcInputReach }
   /** FR-101 P4b-2b — the device's idle limit: the session ends in `endsInMs`
@@ -1330,6 +1342,18 @@ export function parseControlInbound(data: unknown): RcControlInbound {
   if (obj.t === 'rc:media-unavailable' && typeof obj.code === 'string') {
     return {
       kind: 'media_unavailable',
+      reason: {
+        code: obj.code,
+        detail: typeof obj.detail === 'string' ? obj.detail : '',
+        hint: typeof obj.hint === 'string' ? obj.hint : '',
+      },
+    }
+  }
+  // FR-97 P3c-1 — the same rule for the session's sound: an unknown code is
+  // kept, because its hint is still worth showing.
+  if (obj.t === 'rc:audio-unavailable' && typeof obj.code === 'string') {
+    return {
+      kind: 'audio_unavailable',
       reason: {
         code: obj.code,
         detail: typeof obj.detail === 'string' ? obj.detail : '',
@@ -4582,6 +4606,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   /** FR-80 — set when the agent tells us it cannot capture; cleared on every
    *  new connect so a fixed host stops showing yesterday's reason. */
   const mediaUnavailable = ref<RcMediaUnavailable | null>(null)
+  /** FR-97 P3c-1 — set when the agent says this session's audio track carries
+   *  no sound; cleared on every new connect, like `mediaUnavailable`. */
+  const audioUnavailable = ref<RcAudioUnavailable | null>(null)
   /** FR-93 P1 — set when the agent says this session's input will not reach
    *  the whole desktop; cleared on every new connect, like `mediaUnavailable`. */
   const inputReach = ref<RcInputReach | null>(null)
@@ -8237,6 +8264,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // yesterday's reason, and the pill must not carry the last session's
     // codec into one that has not named its own yet.
     mediaUnavailable.value = null
+    audioUnavailable.value = null
     mediaWaiting.value = null
     inputReach.value = null
     idleEndsAt.value = null
@@ -9373,6 +9401,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         deadAirStreak.value = 0
         reconnectAttempt.value = 0
         notice.value = null
+      } else if (parsed?.kind === 'audio_unavailable') {
+        // FR-97 P3c-1 — the host sends no sound this session, and says why.
+        // The view puts it on the audio control and says it once.
+        audioUnavailable.value = parsed.reason
+        console.warn(
+          `[rc] the host sends no sound (${parsed.reason.code}) — ${parsed.reason.hint}`,
+          parsed.reason.detail,
+        )
       } else if (parsed?.kind === 'media_waiting') {
         // FR-93 P2d-2 — the host is asking the person at its screen to share
         // it. The deadline is set HERE, on this browser's clock.
@@ -12376,6 +12412,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      *  badge falls back to a selection-derived label then. */
     videoInfo,
     mediaUnavailable,
+    // FR-97 P3c-1 — why this session's audio track carries no sound, or null.
+    audioUnavailable,
     mediaWaiting,
     inputReach,
     // FR-101 P4b-2b — the device's idle countdown (epoch ms, or null).

@@ -2016,6 +2016,34 @@ describe('parseControlInbound', () => {
     expect(parseControlInbound('{"t":"rc:keep-busy.state","on":"maybe"}')).toBeNull()
   })
 
+  it('FR-97 P3c-1: parses rc:audio-unavailable and keeps a code it does not know', () => {
+    // The agent's payload, as `audio_unavailable_payload` builds it.
+    const r = parseControlInbound(
+      JSON.stringify({
+        t: 'rc:audio-unavailable',
+        code: 'no_monitor',
+        detail: 'devices: pipewire, pulse, default',
+        hint: 'This host sends no sound.',
+      }),
+    )
+    expect(r).toEqual({
+      kind: 'audio_unavailable',
+      reason: {
+        code: 'no_monitor',
+        detail: 'devices: pipewire, pulse, default',
+        hint: 'This host sends no sound.',
+      },
+    })
+    // Not the video notice: a viewer must not read "no pixels" from it.
+    expect(r?.kind).not.toBe('media_unavailable')
+    const newer = parseControlInbound('{"t":"rc:audio-unavailable","code":"from_a_newer_agent"}')
+    expect(newer).toEqual({
+      kind: 'audio_unavailable',
+      reason: { code: 'from_a_newer_agent', detail: '', hint: '' },
+    })
+    expect(parseControlInbound('{"t":"rc:audio-unavailable"}')).toBeNull()
+  })
+
   it('parses rc:clock.echo (FR-1 P7) and rejects non-numeric fields', () => {
     const r = parseControlInbound('{"t":"rc:clock.echo","t0":1500,"agent_us":5000}')
     expect(r).toEqual({ kind: 'clock_echo', t0: 1500, agentUs: 5000 })

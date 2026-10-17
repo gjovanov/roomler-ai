@@ -90,7 +90,7 @@ operator's to restore; the product's job is to say so.
    turned out to have a GUI session and to capture fine. The ordering is right;
    the evidence for it was wrong, and no fleet host currently exercises it.
 3. **One new control-DC message**, `rc:media-unavailable`, built by a sibling of
-   `video_info_payload` (`peer.rs:4538`) and sent with the same
+   `video_info_payload` (`peer.rs:4545`) and sent with the same
    retry-until-delivered discipline both pumps already use for `rc:video-info`
    (rc.87: a once-only send races the control-DC open and is silently lost).
    It is peer-to-peer JSON on the control channel, **not** a `ClientMsg` /

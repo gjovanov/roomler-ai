@@ -27,6 +27,8 @@ pub mod archive_replica;
 pub mod artifact_version;
 #[cfg(feature = "audio")]
 pub mod audio;
+/// FR-97 P3c — what "computer audio" may open, and why it opened nothing.
+pub mod audio_source;
 pub mod capture;
 #[cfg(feature = "clipboard")]
 pub mod clipboard;
