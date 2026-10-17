@@ -904,6 +904,9 @@ impl DrmCapture {
         std::thread::Builder::new()
             .name("drm-capture".into())
             .spawn(move || {
+                // FR-112 P1 — the grab is on every frame's path too; the same
+                // periodic-thread clocking applies to it as to the encoder.
+                crate::encode::clock::ask_for_this_thread("capture");
                 worker(
                     ready_tx,
                     cmd_rx,
