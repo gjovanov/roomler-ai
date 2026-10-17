@@ -90,6 +90,10 @@ async fn agent(track_codec: String) -> Result<(AgentPeer, mpsc::Receiver<ClientM
         None,
         RcOverlay::default(),
         roomlerd::rc_sessions::RcSessionRegistry::new(),
+        // FR-102 P9d — this test never drives the peer to Connected, so the
+        // carrier observation never fires; a throwaway sender is the honest
+        // value.
+        mpsc::channel(1).0,
     )
     .await
     .context("AgentPeer::new")?;

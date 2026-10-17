@@ -776,6 +776,18 @@ pub async fn run(
     // the `select!`. A hand-back during a reconnect gap is drained by the next
     // connection, whose maps no longer hold the session: nothing to end.
     let (idle_tx, mut idle_rx) = mpsc::channel::<bson::oid::ObjectId>(16);
+    // FR-102 P9d — where a live session's carrier observation reports that it
+    // has LANDED, so this loop sends ONE `rc:session.stats` for it promptly
+    // instead of waiting for the free-running 30 s tick (a session shorter than
+    // one tick's gap after the observation would otherwise record no carrier at
+    // all — the P9d field evidence). Same shape as `idle_tx`: created once per
+    // ORG loop, the receiver borrowed into every connection so a signal that
+    // lands during a reconnect gap is drained by the next connection (whose
+    // `peers` map no longer holds the session — nothing to send), and this
+    // sender held for the loop's life so the receiver never closes and never
+    // busy-spins the `select!`. Each live peer gets a clone via
+    // `handle_server_msg` → `AgentPeer::new`.
+    let (carrier_ready_tx, mut carrier_ready_rx) = mpsc::channel::<bson::oid::ObjectId>(32);
     // rc.307 (B) — multi-region DERP admission-ticket cache, hoisted from
     // connect_once scope: the PERSISTENT overlay runtime's regional-DERP
     // factory captures this slot ONCE, so a per-connection slot went stale
@@ -900,6 +912,8 @@ pub async fn run(
             &mut quic_setup_rx,
             &idle_tx,
             &mut idle_rx,
+            &carrier_ready_tx,
+            &mut carrier_ready_rx,
         )
         .await;
         if !matches!(attempt, Err(ConnectError::AuthRejected)) {
@@ -1366,6 +1380,12 @@ async fn connect_once(
     // beside `kill_rx`. Both borrowed from `run` so they span reconnects.
     idle_tx: &mpsc::Sender<bson::oid::ObjectId>,
     idle_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
+    // FR-102 P9d — handed (cloned) to every live session's peer so its carrier
+    // observation can signal this loop, and the receiver the `carrier_ready_rx`
+    // arm drains. Both borrowed from `run` so they span reconnects (see the
+    // channel's doc).
+    carrier_ready_tx: &mpsc::Sender<bson::oid::ObjectId>,
+    carrier_ready_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
 ) -> Result<(), ConnectError> {
     // S6 — `tid` is the tenant-affinity key the server-front LB hashes
     // on, co-locating this agent's WS with its tenant's controllers on
@@ -2115,35 +2135,12 @@ async fn connect_once(
                 // server folds these into `remote_sessions.stats`, which
                 // recorded zeros for every session before this.
                 for (session_id, peer) in peers.iter() {
-                    let t = match tokio::time::timeout(SESSION_STATS_BUDGET, peer.telemetry())
-                        .await
-                    {
-                        Ok(t) => t,
-                        Err(_elapsed) => {
-                            warn!(
-                                %session_id,
-                                "session telemetry timed out — skipping its stats this \
-                                 round (wedged ICE after a network transition?)"
-                            );
-                            watchdog::tick(ctx.pump);
-                            continue;
-                        }
-                    };
-                    // FR-101 P3 — with the clipboard and file traffic for
-                    // the audit; the file notes are taken, so a failed send
-                    // hands them back.
-                    let transfers =
-                        crate::session_telemetry::counters(*session_id).take_transfers();
-                    let msg = session_stats_msg(*session_id, &t, transfers);
-                    // Best-effort: telemetry must never tear down a
-                    // working session, so a failed send is only logged —
-                    // the heartbeat above is what proves liveness.
-                    if let Err(e) = send_msg(&mut ws, &msg).await {
-                        debug!(%session_id, %e, "session stats send failed");
-                        if let ClientMsg::SessionStats { transfers, .. } = msg {
-                            crate::session_telemetry::counters(*session_id)
-                                .restore_file_notes(transfers.files);
-                        }
+                    // FR-102 P9d — the per-peer send is one helper now, shared
+                    // with the carrier-ready arm. `false` means the WS write
+                    // failed, so stop trying the remaining peers this round (a
+                    // telemetry timeout returns `true`: skip this peer, keep
+                    // going — the original `continue`).
+                    if !send_one_session_stats(&mut ws, *session_id, peer, ctx.pump).await {
                         break;
                     }
                 }
@@ -2161,6 +2158,24 @@ async fn connect_once(
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     return Err(ConnectError::Transient(e.context("outbound flush")));
+                }
+                watchdog::tick(ctx.pump);
+            }
+            Some(sid) = carrier_ready_rx.recv() => {
+                // FR-102 P9d — the carrier observation for a LIVE session just
+                // landed (`session_carrier::observe` set the OnceLock and
+                // signalled). Send ONE `rc:session.stats` for it NOW, by the
+                // SAME road the 30 s tick uses — this loop's `peers` and its
+                // own `ws` — so a session that ends before the next tick still
+                // records its carrier. The 30 s tick is unchanged and keeps
+                // re-sending it (the server's `$set` is idempotent).
+                //
+                // A session already gone — ended between the signal and here —
+                // is no longer in `peers`: nothing to send, which is exactly
+                // the weak-handle property P9c kept. A failed send is logged by
+                // the shared helper and is never fatal.
+                if let Some(peer) = peers.get(&sid) {
+                    let _ = send_one_session_stats(&mut ws, sid, peer, ctx.pump).await;
                 }
                 watchdog::tick(ctx.pump);
             }
@@ -2484,6 +2499,7 @@ async fn connect_once(
                     remote_cfg,
                     delegate.as_ref(),
                     delegated_out.as_ref(),
+                    carrier_ready_tx,
                 )
                 .await?;
             }
@@ -2547,6 +2563,7 @@ async fn connect_once(
                                 // A message off our OWN control WS is never a
                                 // delegated one — its replies belong here.
                                 None,
+                                carrier_ready_tx,
                             )
                             .await?;
                         }
@@ -2865,6 +2882,13 @@ async fn handle_server_msg(
     // daemon, in which case the session's replies belong on the delegation
     // channel and not on our own control WS. `None` is every ordinary session.
     delegated: Option<&mpsc::Sender<ClientMsg>>,
+    // FR-102 P9d — handed to every peer built here so its carrier observation
+    // can signal this loop (the `carrier_ready_rx` arm) to send one
+    // `rc:session.stats` the moment the carrier is known. This is THIS loop's
+    // sender, so the signal reaches the loop whose `peers` serve the session —
+    // the daemon's, a standalone agent's, or the GUI worker's for a delegated
+    // session, which is the loop that holds the delegated peer.
+    carrier_ready_tx: &mpsc::Sender<bson::oid::ObjectId>,
 ) -> Result<(), ConnectError> {
     // #1632 — a Terminate takes any consent prompt still standing for its
     // session down with it, and does so AHEAD of the delegation gate below:
@@ -3582,6 +3606,9 @@ async fn handle_server_msg(
                 // person at the screen stops the share with the desktop's own
                 // control: the same kill path as their Disconnect.
                 indicator.sessions().clone(),
+                // FR-102 P9d — so this peer's carrier observation signals the
+                // loop that holds it (the clone drops with the peer).
+                carrier_ready_tx.clone(),
             )
             .await
             {
@@ -6026,6 +6053,55 @@ fn session_stats_msg(
     }
 }
 
+/// Send ONE `rc:session.stats` for a live session up THIS connection's own WS,
+/// the way Wave 2 built it inline. Shared by the 30 s heartbeat tick and the
+/// FR-102 P9d carrier-ready trigger so the two cannot drift.
+///
+/// - Real telemetry within [`SESSION_STATS_BUDGET`]. ⚠️ Never a zeros sample:
+///   `merge_live_stats` `$set`s every counter, so a sample of zeros would
+///   overwrite the server's live totals (the hazard [`final_session_stats`]'s
+///   doc spells out). A telemetry timeout therefore SKIPS this peer — it takes
+///   nothing and sends nothing.
+/// - FR-101 P3 — the session's clipboard and file traffic ride along; the file
+///   notes are TAKEN, so a failed send hands them back with
+///   [`crate::session_telemetry::SessionCounters::restore_file_notes`].
+/// - FR-102 P9c — the recorded carrier rides it, once observed.
+///
+/// Best-effort: telemetry must never tear down a working session, so a failed
+/// send is only logged — the heartbeat frame is what proves liveness. Returns
+/// `true` to keep going (sent, or telemetry timed out), `false` when the WS
+/// write failed (the heartbeat loop then stops this round). The P9d trigger
+/// serves one peer and ignores the value.
+async fn send_one_session_stats(
+    ws: &mut Ws,
+    session_id: bson::oid::ObjectId,
+    peer: &AgentPeer,
+    pump: &'static str,
+) -> bool {
+    let t = match tokio::time::timeout(SESSION_STATS_BUDGET, peer.telemetry()).await {
+        Ok(t) => t,
+        Err(_elapsed) => {
+            warn!(
+                %session_id,
+                "session telemetry timed out — skipping its stats this round \
+                 (wedged ICE after a network transition?)"
+            );
+            watchdog::tick(pump);
+            return true;
+        }
+    };
+    let transfers = crate::session_telemetry::counters(session_id).take_transfers();
+    let msg = session_stats_msg(session_id, &t, transfers);
+    if let Err(e) = send_msg(ws, &msg).await {
+        debug!(%session_id, %e, "session stats send failed");
+        if let ClientMsg::SessionStats { transfers, .. } = msg {
+            crate::session_telemetry::counters(session_id).restore_file_notes(transfers.files);
+        }
+        return false;
+    }
+    true
+}
+
 /// FR-101 P3 — the last `rc:session.stats` of a session that is ending, so
 /// the clipboard and file traffic since the previous 30 s sample still
 /// reaches the audit. A session shorter than one sample would otherwise
@@ -6266,6 +6342,73 @@ mod tests {
             climbed,
             "an attempt that never sent its hello keeps climbing, however long it hung"
         );
+    }
+
+    /// FR-102 P9d — the sample `send_one_session_stats` builds (via the shared
+    /// `session_stats_msg`, for both the 30 s tick and the carrier-ready
+    /// trigger) carries REAL telemetry and the recorded carrier. ⚠️ Never a
+    /// zeros sample: `merge_live_stats` `$set`s every counter, so a zeros
+    /// sample would overwrite the server's live totals. This locks that the
+    /// builder copies the telemetry through rather than defaulting it.
+    #[test]
+    fn a_session_stats_sample_carries_real_telemetry_and_the_carrier() {
+        let sid = bson::oid::ObjectId::new();
+        let t = crate::peer::SessionTelemetry {
+            bytes_sent: 1_234,
+            bytes_recv: 5_678,
+            rtt_ms: 42.0,
+            fps: 30.0,
+            keyframe_requests: 3,
+            input_events: 7,
+            shared_seconds: 0,
+            mixed_dial_seconds: 0,
+            carrier: Some(crate::session_carrier::SessionCarrier::OverlayTurn),
+        };
+        match session_stats_msg(sid, &t, Default::default()) {
+            ClientMsg::SessionStats {
+                session_id,
+                bytes_sent,
+                bytes_recv,
+                rtt_ms,
+                keyframe_requests,
+                input_events,
+                carrier,
+                ..
+            } => {
+                assert_eq!(session_id, sid.to_hex());
+                assert_eq!(bytes_sent, 1_234);
+                assert_eq!(bytes_recv, 5_678);
+                assert_eq!(rtt_ms, 42.0);
+                assert_eq!(keyframe_requests, 3);
+                assert_eq!(input_events, 7);
+                // The whole point of P9d: the carrier rides the early sample.
+                assert_eq!(carrier.as_deref(), Some("overlay_turn"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// FR-102 P9d — a carrier the observation could not name still rides the
+    /// sample: `unknown` recorded beats absent (P9c's "never direct for an
+    /// unknown tier"), and the trigger sends it regardless. A session that
+    /// never recorded one carries `None`, which the server reads as unknown.
+    #[test]
+    fn an_unknown_carrier_rides_the_sample_but_none_is_absent() {
+        let unknown = crate::peer::SessionTelemetry {
+            carrier: Some(crate::session_carrier::SessionCarrier::Unknown),
+            ..Default::default()
+        };
+        match session_stats_msg(bson::oid::ObjectId::new(), &unknown, Default::default()) {
+            ClientMsg::SessionStats { carrier, .. } => {
+                assert_eq!(carrier.as_deref(), Some("unknown"))
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let none = crate::peer::SessionTelemetry::default();
+        match session_stats_msg(bson::oid::ObjectId::new(), &none, Default::default()) {
+            ClientMsg::SessionStats { carrier, .. } => assert_eq!(carrier, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     /// #2221 — `note_ws_down` says whether a failure STARTED an outage: the

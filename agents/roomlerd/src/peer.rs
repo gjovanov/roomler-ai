@@ -382,6 +382,14 @@ impl AgentPeer {
         // session through it, as the person's Disconnect does, when they stop
         // the share with the desktop's own control.
         rc_sessions: crate::rc_sessions::RcSessionRegistry,
+        // FR-102 P9d — the signalling loop learns the carrier observation has
+        // landed for this session through this channel, so it can send ONE
+        // `rc:session.stats` promptly instead of waiting for the 30 s tick (a
+        // short session may contain no tick after the observation). The sender
+        // belongs to the loop that owns this peer (the daemon, a standalone
+        // agent, or — for a delegated session — the macOS GUI worker), so the
+        // signal always reaches the loop whose `peers` map and WS serve it.
+        carrier_ready_tx: mpsc::Sender<bson::oid::ObjectId>,
     ) -> Result<Self> {
         let mut engine = MediaEngine::default();
         engine
@@ -890,6 +898,7 @@ impl AgentPeer {
             let tx = outbound.clone();
             let carrier_slot = carrier.clone();
             let pc_for_carrier = Arc::downgrade(&pc);
+            let carrier_ready_tx = carrier_ready_tx.clone();
             pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
                 info!(session = %session_id, state = ?s, "PC state change");
                 let tx = tx.clone();
@@ -899,10 +908,20 @@ impl AgentPeer {
                 if matches!(s, RTCPeerConnectionState::Connected) && carrier_slot.get().is_none() {
                     let slot = carrier_slot.clone();
                     let weak = pc_for_carrier.clone();
+                    // FR-102 P9d — tell the signalling loop the moment the
+                    // carrier is known, so it sends one `rc:session.stats` now.
+                    // A clone per spawn; the observation itself still holds only
+                    // a WEAK peer handle.
+                    let carrier_ready_tx = carrier_ready_tx.clone();
                     tokio::spawn(async move {
                         let Some(pc) = weak.upgrade() else { return };
                         let observed = crate::session_carrier::observe(&pc, session_id).await;
                         let _ = slot.set(observed);
+                        // Best-effort: a full/closed channel just means this one
+                        // session waits for the next 30 s tick, the pre-P9d
+                        // behaviour. `unknown` signals too — recorded beats
+                        // absent (P9c's "never direct for an unknown tier").
+                        let _ = carrier_ready_tx.try_send(session_id);
                     });
                 }
                 Box::pin(async move {
