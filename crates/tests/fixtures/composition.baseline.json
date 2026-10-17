@@ -933,6 +933,30 @@
       "methods": "POST"
     },
     {
+      "path": "/api/tenant/{tenant_id}/vault",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/vault/audit",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/vault/secret",
+      "methods": "GET,HEAD,POST"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/vault/secret/{secret_id}",
+      "methods": "DELETE,GET,HEAD,PATCH"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/vault/secret/{secret_id}/value",
+      "methods": "PUT"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/vault/verify",
+      "methods": "POST"
+    },
+    {
       "path": "/api/tunnel-client/agents",
       "methods": "GET,HEAD"
     },
@@ -2927,6 +2951,72 @@
         ]
       },
       {
+        "collection": "vault_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "secret_id": 1,
+              "at": 1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "vault_secrets",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "path": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "deleted_at": {
+                "$type": "null"
+              }
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "deleted_at": 1,
+              "path": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "vault_versions",
+        "indexes": [
+          {
+            "key": {
+              "secret_id": 1,
+              "field": 1,
+              "n": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "kek": 1
+            }
+          }
+        ]
+      },
+      {
         "collection": "ws_sessions",
         "indexes": [
           {
@@ -4882,6 +4972,72 @@
           {
             "key": {
               "created_at": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "vault_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "secret_id": 1,
+              "at": 1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "vault_secrets",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "path": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "deleted_at": {
+                "$type": "null"
+              }
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "deleted_at": 1,
+              "path": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "vault_versions",
+        "indexes": [
+          {
+            "key": {
+              "secret_id": 1,
+              "field": 1,
+              "n": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "kek": 1
             }
           }
         ]

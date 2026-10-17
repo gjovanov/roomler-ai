@@ -28,6 +28,7 @@ flowchart BT
     network["modules/network<br/>overlay IPAM + netmaps + ACL · tunnels · /derp<br/>peer relays · Roomler SSH · MagicDNS"]
     saas["modules/saas (add-on)<br/>Stripe · newsletter · plan compliance"]
     hive["modules/hive (FR-90, default OFF)<br/>agent sessions: the record + lifecycle<br/>rc:hive.* · hive_audit · turn stubs · never content"]
+    vault["modules/vault (FR-90 P3, default OFF)<br/>secrets under envelope encryption (an age KEK)<br/>RRNs · vault_audit · never a value in an answer"]
     fleet --> core
     chat --> core
     saas --> core
@@ -36,16 +37,18 @@ flowchart BT
     network -->|"agents, presence, the socket"| fleet
     hive -->|"a session's frames ride the agent socket"| fleet
     hive -->|"a session IS a secret room"| chat
+    vault -->|"P3-1: core alone"| core
     style core fill:#e8f0fe
     style saas fill:#fff4e5
     style hive fill:#f3e8fd
+    style vault fill:#f3e8fd
 ```
 
 Three rules keep it a monolith rather than a pile of crates:
 
 | Rule | What it means in code |
 |---|---|
-| **The DAG is data** | `crates/core/src/graph.rs` lists the modules and the five edges (`conference → chat`, `remote → fleet`, `network → fleet`, `hive → fleet`, `hive → chat`). Any module may call core; core **never** calls a module. |
+| **The DAG is data** | `crates/core/src/graph.rs` lists the modules and the five edges (`conference → chat`, `remote → fleet`, `network → fleet`, `hive → fleet`, `hive → chat`); `vault` (FR-90 P3-1) has none yet — its `vault → hive` and `vault → fleet` arrive with the steps that use them. Any module may call core; core **never** calls a module. |
 | **Core membership is narrow** | Something is in `roomler-core` only if at least two modules need it **and** it is identity, tenancy or infrastructure. Everything else belongs to exactly one module. |
 | **Inverse flows are hooks** | When core must reach "up" (a tenant is archived, an agent is removed), it invokes a registry of hooks in a fixed order — see §6. |
 
@@ -68,7 +71,8 @@ inside one (FR-24, FR-69 AC10).
 | RC session routes, `rc:*` controller dispatch + authz + consent-mode gate, the cross-pod RC relay, `/turn/credentials`, `/relay/regions` | **remote** | the session state machine stays in fleet's Hub; the controller path is a host → module **call**, not a `ws` namespace |
 | overlay engine (IPAM, netmaps, leases, L3 ACL, relay grants), the org relay mint, the DERP ACL cache + `/derp` upgrade + cluster convergence, tunnel clients + policies, peer relays, Roomler SSH, the ephemeral reaper | **network** | `Module::indexes_for(multi_block)` is born here — `overlay_blocks` has two schemas |
 | Stripe, the public updates list + newsletter, plan compliance | **saas** | an add-on feature on the api crate; no self-host image carries it |
-| agent sessions: `agent_sessions` + `hive_audit`, the start/stop routes and their gates, the devices' `rc:hive.*` answers, reconcile-on-connect, each session's room notes and turn stubs | **hive** (FR-90) | built ON fleet (`Module::Deps = FleetState`: the Hub) **and** chat (the session room) — chat is stateless, so hive re-creates `chat::bound::BoundChat` from the core rather than taking chat's state (rule 5). Chat stores a room's or message's `binding {module, ref}` and never interprets it; the ONLY module whose switch defaults **off** (`ModulesSettings::DEFAULT_OFF`), so `switched_off` lists it until an operator turns it on (`[modules] hive`, or a `hive.tenants` list — FR-90 P1g-2); leads `HOOK_ORDER` as a session holder |
+| agent sessions: `agent_sessions` + `hive_audit`, the start/stop routes and their gates, the devices' `rc:hive.*` answers, reconcile-on-connect, each session's room notes and turn stubs | **hive** (FR-90) | built ON fleet (`Module::Deps = FleetState`: the Hub) **and** chat (the session room) — chat is stateless, so hive re-creates `chat::bound::BoundChat` from the core rather than taking chat's state (rule 5). Chat stores a room's or message's `binding {module, ref}` and never interprets it; one of the two modules whose switch defaults **off** (`ModulesSettings::DEFAULT_OFF`, with `vault`), so `switched_off` lists it until an operator turns it on (`[modules] hive`, or a `hive.tenants` list — FR-90 P1g-2); leads `HOOK_ORDER` as a session holder |
+| the vault: `vault_secrets` + `vault_versions` (each value sealed under its own data key, wrapped to an `age` KEK) + `vault_audit`, the administrator's metadata routes — none answers a value | **vault** (FR-90 P3-1) | on core alone (`Module::Deps = ()`): no edge until a step needs one. Its switch defaults **off** like hive's, and a `vault.tenants` list mounts it by itself. Second in `HOOK_ORDER`, right after `hive`: from P3-3 it holds leases that sessions hold, so it revokes them once the sessions have ended and while the device is still there to be told. Registers no hooks yet ([vault.md](vault.md)) |
 | the device listing (`/tenant/{tid}/device`) | **the host** | a view over fleet (required) and network (optional) — see §4's lesson |
 
 ---
@@ -126,7 +130,7 @@ What the host drives, and in which order — each of these is a rule paid for in
 ```mermaid
 flowchart LR
     subgraph feats["Cargo features on crates/api"]
-        F1["profile-full = chat + conference + fleet + remote + network + hive"]
+        F1["profile-full = chat + conference + fleet + remote + network + hive + vault"]
         F2["profile-collab = chat + conference"]
         F3["profile-remote = fleet + remote"]
         F4["profile-mesh = fleet + network"]

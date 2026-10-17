@@ -55,6 +55,8 @@ pub const EXTRACTED: &[&str] = &[
     "network",
     #[cfg(feature = "hive")]
     "hive",
+    #[cfg(feature = "vault")]
+    "vault",
 ];
 
 /// The modules this build links, initialised — `None` where the operator
@@ -87,6 +89,10 @@ pub struct Modules {
     /// `rc:hive.*` frames reach no handler.
     #[cfg(feature = "hive")]
     pub hive: Option<roomler_ai_mod_hive::HiveState>,
+    /// FR-90 P3-1 — the vault, on core alone; `None` when switched off (the
+    /// default): its routes are absent.
+    #[cfg(feature = "vault")]
+    pub vault: Option<roomler_ai_mod_vault::VaultState>,
     /// Every mounted module's WebSocket namespace handlers, collected at
     /// init so the socket dispatch can look one up per message.
     ws: Vec<WsHandlerSpec>,
@@ -202,6 +208,15 @@ impl Modules {
                 }
             }
         }
+        #[cfg(feature = "vault")]
+        {
+            // On core alone in P3-1. Its switch defaults off, like hive's.
+            modules.vault =
+                init_one::<roomler_ai_mod_vault::VaultState>(core.clone(), settings, ()).await?;
+            if let Some(m) = &modules.vault {
+                modules.ws.extend(m.ws().handlers);
+            }
+        }
 
         let _ = core;
         Ok(modules)
@@ -238,6 +253,10 @@ impl Modules {
         #[cfg(feature = "hive")]
         if self.hive.is_some() {
             ids.push("hive");
+        }
+        #[cfg(feature = "vault")]
+        if self.vault.is_some() {
+            ids.push("vault");
         }
         ids
     }
@@ -276,6 +295,10 @@ impl Modules {
         #[cfg(feature = "hive")]
         if let Some(hive) = &self.hive {
             api = api.merge(hive.routes().with_state(()));
+        }
+        #[cfg(feature = "vault")]
+        if let Some(vault) = &self.vault {
+            api = api.merge(vault.routes().with_state(()));
         }
         api
     }
@@ -454,6 +477,10 @@ impl Modules {
         if let Some(hive) = &self.hive {
             root = root.merge(hive.unlimited_routes().with_state(()));
         }
+        #[cfg(feature = "vault")]
+        if let Some(vault) = &self.vault {
+            root = root.merge(vault.unlimited_routes().with_state(()));
+        }
         root
     }
 
@@ -489,6 +516,10 @@ impl Modules {
         #[cfg(feature = "hive")]
         if let Some(hive) = &self.hive {
             sets.extend(hive.indexes());
+        }
+        #[cfg(feature = "vault")]
+        if let Some(vault) = &self.vault {
+            sets.extend(vault.indexes());
         }
         sets
     }
@@ -527,6 +558,10 @@ impl Modules {
         if let Some(hive) = &self.hive {
             sets.extend(hive.indexes_for(multi_block));
         }
+        #[cfg(feature = "vault")]
+        if let Some(vault) = &self.vault {
+            sets.extend(vault.indexes_for(multi_block));
+        }
         sets
     }
 
@@ -561,6 +596,10 @@ impl Modules {
         #[cfg(feature = "hive")]
         if let Some(hive) = &self.hive {
             jobs.extend(hive.jobs());
+        }
+        #[cfg(feature = "vault")]
+        if let Some(vault) = &self.vault {
+            jobs.extend(vault.jobs());
         }
         jobs
     }
@@ -605,6 +644,11 @@ impl Modules {
         if let Some(hive) = &self.hive {
             core.hooks
                 .register(roomler_ai_mod_hive::HiveState::ID, hive.hooks());
+        }
+        #[cfg(feature = "vault")]
+        if let Some(vault) = &self.vault {
+            core.hooks
+                .register(roomler_ai_mod_vault::VaultState::ID, vault.hooks());
         }
     }
 
@@ -660,6 +704,10 @@ impl Modules {
     /// Orderly stop of every mounted module, in REVERSE composition order
     /// (a module stops before the ones it depends on).
     pub async fn shutdown(&self) {
+        #[cfg(feature = "vault")]
+        if let Some(vault) = &self.vault {
+            vault.shutdown().await;
+        }
         #[cfg(feature = "hive")]
         if let Some(hive) = &self.hive {
             hive.shutdown().await;

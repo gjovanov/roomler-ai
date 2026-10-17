@@ -28,7 +28,7 @@ path = "src/main.rs"
 # boot smoke asserts the image does not mount it — enforced where the image is
 # made, not by a default a recipe would have to remember.
 default = ["profile-full", "saas"]
-profile-full = ["chat", "conference", "fleet", "remote", "network", "hive"]
+profile-full = ["chat", "conference", "fleet", "remote", "network", "hive", "vault"]
 profile-collab = ["chat", "conference"]
 profile-remote = ["fleet", "remote"]
 profile-mesh = ["fleet", "network"]
@@ -49,6 +49,10 @@ network = ["dep:roomler-ai-mod-network", "fleet"]
 # In `profile-full` only, and its runtime switch is the one that defaults OFF:
 # `[modules] hive = true` turns it on.
 hive = ["dep:roomler-ai-mod-hive", "fleet", "chat"]
+# FR-90 P3-1 — the vault: secrets under envelope encryption, on core alone
+# for now. In `profile-full` only, and its runtime switch defaults OFF like
+# hive's: `[modules] vault = true`, or a `vault.tenants` list.
+vault = ["dep:roomler-ai-mod-vault"]
 
 
 [dependencies]
@@ -74,6 +78,7 @@ roomler-ai-mod-fleet = { path = "../modules/fleet", optional = true }
 # feature when the sockets move (P7b).
 roomler-ai-mod-network = { path = "../modules/network", optional = true }
 roomler-ai-mod-hive = { path = "../modules/hive", optional = true }
+roomler-ai-mod-vault = { path = "../modules/vault", optional = true }
 
 axum.workspace = true
 tokio.workspace = true

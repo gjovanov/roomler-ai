@@ -15,6 +15,7 @@ pub const MODULES: &[&str] = &[
     "remote",
     "network",
     "hive",
+    "vault",
 ];
 
 /// The allowed **module → module** call edges. Every module may call core;
@@ -26,6 +27,11 @@ pub const MODULES: &[&str] = &[
 /// a room, and its turns are messages in it. Hive never calls `remote` or
 /// `network`: it reaches a device over the control WS like exec does, and
 /// session content travels device-to-browser, never through a module.
+///
+/// FR-90 P3 — `vault` has no edge yet: P3-1 is the store, on core alone.
+/// Its two (`vault → hive`: a session's record, role and room; `vault →
+/// fleet`: devices, their vault keys, the Hub) come with the steps that use
+/// them, and hive never calls the vault.
 pub const EDGES: &[(&str, &str)] = &[
     ("conference", "chat"),
     ("remote", "fleet"),

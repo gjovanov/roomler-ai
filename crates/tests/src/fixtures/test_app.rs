@@ -495,6 +495,9 @@ fn test_settings() -> Settings {
         modules: roomler_ai_config::ModulesSettings::default(),
         // FR-90 P1g — every organization, as a deployment without `[hive]`.
         hive: roomler_ai_config::HiveSettings::default(),
+        // FR-90 P3-1 — every organization and no KEK, as a deployment
+        // without `[vault]`; a vault test makes its own KEK.
+        vault: roomler_ai_config::VaultSettings::default(),
         // #1731 — inert here: the stall watchdog is armed by the binary's
         // `main`, which these in-process servers never run.
         diag: roomler_ai_config::DiagSettings::default(),

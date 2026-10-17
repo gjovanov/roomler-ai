@@ -70,7 +70,7 @@ other with different anchor text, so they don't compete for one query.
 (`ui/blog/posts/*.md`, assets in `ui/blog/assets/`) and a **homepage template**. They share the
 `<head>`, sitemaps, robots, search index, link checker and a new asset pipeline. The build
 command (`bun run build`, `ui/package.json:9`), the Dockerfile and the CI invocation
-(`ci.yml:1912-1952`) stay as they are, and **no dependency is added**. A separate blog builder
+(`ci.yml:1916-1956`) stay as they are, and **no dependency is added**. A separate blog builder
 was rejected: it would mean two writers of `dist/sitemap.xml` and a link checker that can't see
 a `/blog` → `/docs` link.
 

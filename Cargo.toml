@@ -33,6 +33,9 @@ members = [
     # FR-90 — agent sessions, the server side: the session record and its
     # lifecycle, never what is in a session.
     "crates/modules/hive",
+    # FR-90 P3 — the vault: secrets under envelope encryption, and the audit
+    # of every decision. Never a value in an answer.
+    "crates/modules/vault",
 
     "crates/api",
     "crates/tests",
@@ -281,6 +284,18 @@ hmac = "0.12"
 sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
+
+# FR-90 P3 — the vault's envelope encryption: an XChaCha20-Poly1305 data key
+# per version (the version the tree already builds), wrapped to an `age`
+# X25519 KEK. `age` is the reference implementation's library, so a wrapped
+# key opens with the stock `age` tool and the KEK is an `age-keygen` file.
+# ⚠️ 0.11, not 0.12: 0.12's post-quantum recipients pull `ml-kem` 0.2, which
+# needs `kem` 0.3.0-pre.0 — while russh already resolves `ml-kem` 0.3 onto
+# `kem` 0.3.0, and one lockfile holds one `kem` 0.3.x. The X25519 recipient and
+# the file format are the same in both.
+age = { version = "0.11", default-features = false }
+chacha20poly1305 = "0.10"
+zeroize = "1"
 
 # Agent-specific
 clap = { version = "4", features = ["derive"] }

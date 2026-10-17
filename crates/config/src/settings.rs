@@ -53,9 +53,61 @@ pub struct Settings {
     /// `[modules] hive` is on. Absent ⇒ every one.
     #[serde(default)]
     pub hive: HiveSettings,
+    /// FR-90 P3-1 — the vault: which organizations it serves once
+    /// `[modules] vault` is on, and its key-encryption key. Absent ⇒ every
+    /// organization, and no KEK.
+    #[serde(default)]
+    pub vault: VaultSettings,
     /// #1731 — the stall watchdog. Absent ⇒ on, with its defaults.
     #[serde(default)]
     pub diag: DiagSettings,
+}
+
+/// FR-90 P3-1 — `[vault]`, env `ROOMLER__VAULT__*`.
+///
+/// ⚠️ `kek` is the vault's root secret: whoever holds it and a copy of the
+/// database reads every secret. `Debug` is written by hand so it never
+/// prints, and nothing that reports settings may serialise this struct.
+#[derive(Deserialize, Clone, Default)]
+pub struct VaultSettings {
+    /// The organizations the vault serves, as comma-separated ids
+    /// (`ROOMLER__VAULT__TENANTS=<id>,<id>`), with `hive.tenants`'s rules:
+    /// empty or `*` is every organization, a list is only those, and an
+    /// entry that is no id matches nothing.
+    ///
+    /// ⚠️ A list switches the module ON by itself ([`Settings::vault_on`]):
+    /// the form a hosted server uses, because it fails safe — no older image
+    /// reads it. Clearing the list is the kill switch.
+    #[serde(default)]
+    pub tenants: String,
+    /// The key-encryption key (`ROOMLER__VAULT__KEK`): an `age` X25519
+    /// identity, `AGE-SECRET-KEY-1…` as `age-keygen` writes it — or the
+    /// whole text of such a file. A hosted server mounts it from a sealed
+    /// secret.
+    #[serde(default)]
+    pub kek: String,
+    /// Or the path of an `age-keygen` identity file
+    /// (`ROOMLER__VAULT__KEK_FILE`). Both set is refused: the two may
+    /// disagree, and the vault does not guess.
+    #[serde(default)]
+    pub kek_file: String,
+}
+
+impl std::fmt::Debug for VaultSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultSettings")
+            .field("tenants", &self.tenants)
+            .field(
+                "kek",
+                &if self.kek.trim().is_empty() {
+                    "<unset>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("kek_file", &self.kek_file)
+            .finish()
+    }
 }
 
 /// FR-90 P1g — `[hive]`, env `ROOMLER__HIVE__*`.
@@ -242,14 +294,20 @@ pub struct ModulesSettings {
     pub network: bool,
     #[serde(default = "modules_default_on")]
     pub saas: bool,
-    /// FR-90 — agent sessions. **Default OFF**, the only module that is: it
-    /// is the P0 kill switch while the pillar is built, so a roll that ships
-    /// the code exposes nothing until an operator turns it on
+    /// FR-90 — agent sessions. **Default OFF**, like `vault`: it is the P0
+    /// kill switch while the pillar is built, so a roll that ships the code
+    /// exposes nothing until an operator turns it on
     /// (`ROOMLER__MODULES__HIVE=true`, or a `hive.tenants` list — read
     /// [`Settings::hive_on`], never this field alone). Listed in
     /// [`Self::DEFAULT_OFF`].
     #[serde(default)]
     pub hive: bool,
+    /// FR-90 P3-1 — the vault. **Default OFF**, for the same reason:
+    /// `ROOMLER__MODULES__VAULT=true`, or a `vault.tenants` list — read
+    /// [`Settings::vault_on`], never this field alone. Listed in
+    /// [`Self::DEFAULT_OFF`].
+    #[serde(default)]
+    pub vault: bool,
 }
 
 fn modules_default_on() -> bool {
@@ -266,6 +324,7 @@ impl Default for ModulesSettings {
             network: true,
             saas: true,
             hive: false,
+            vault: false,
         }
     }
 }
@@ -274,14 +333,14 @@ impl ModulesSettings {
     /// Modules whose switch is OFF unless an operator turns it on. Their
     /// absence from a build that does not link them is the default, not a
     /// configuration worth a boot warning.
-    pub const DEFAULT_OFF: &'static [&'static str] = &["hive"];
+    pub const DEFAULT_OFF: &'static [&'static str] = &["hive", "vault"];
 
     /// The module ids an operator has switched off, in the composition order
     /// of `roomler_core::graph::MODULES` — including a default-off module
     /// nobody switched on, so `modules = compiled − switched_off` holds.
     ///
-    /// ⚠️ It cannot see a `hive.tenants` list, which also switches `hive`
-    /// on; the boot log and `/api/capabilities` read
+    /// ⚠️ It cannot see a `hive.tenants` or `vault.tenants` list, which also
+    /// switches its module on; the boot log and `/api/capabilities` read
     /// [`Settings::switched_off`].
     pub fn switched_off(&self) -> Vec<&'static str> {
         let mut off = Vec::new();
@@ -305,6 +364,9 @@ impl ModulesSettings {
         }
         if !self.hive {
             off.push("hive");
+        }
+        if !self.vault {
+            off.push("vault");
         }
         off
     }
@@ -1330,14 +1392,23 @@ impl Settings {
         self.modules.hive || !self.hive.tenants.trim().is_empty()
     }
 
-    /// [`ModulesSettings::switched_off`], with `hive` on wherever
-    /// [`Self::hive_on`] says it is — what boot logs and
-    /// `GET /api/capabilities` report, so `modules = compiled − switched_off`
-    /// still holds.
+    /// FR-90 P3-1 — whether the vault is on: `[modules] vault`, or a
+    /// `vault.tenants` list ([`VaultSettings::tenants`]).
+    pub fn vault_on(&self) -> bool {
+        self.modules.vault || !self.vault.tenants.trim().is_empty()
+    }
+
+    /// [`ModulesSettings::switched_off`], with `hive` and `vault` on wherever
+    /// [`Self::hive_on`] and [`Self::vault_on`] say they are — what boot
+    /// logs and `GET /api/capabilities` report, so
+    /// `modules = compiled − switched_off` still holds.
     pub fn switched_off(&self) -> Vec<&'static str> {
         let mut off = self.modules.switched_off();
         if self.hive_on() {
             off.retain(|m| *m != "hive");
+        }
+        if self.vault_on() {
+            off.retain(|m| *m != "vault");
         }
         off
     }
@@ -1598,6 +1669,43 @@ mod hive_settings_tests {
         assert!(!absent.teleport_have_want, "a file without the key");
         let on: HiveSettings = toml::from_str("teleport_have_want = true").unwrap();
         assert!(on.teleport_have_want);
+    }
+}
+
+#[cfg(test)]
+mod vault_settings_tests {
+    use super::{ModulesSettings, VaultSettings};
+
+    /// FR-90 P3-1 — the vault ships OFF and listed as such, and a file that
+    /// leaves every key out is a vault with no KEK.
+    #[test]
+    fn the_vault_is_off_until_turned_on() {
+        let m = ModulesSettings::default();
+        assert!(!m.vault);
+        assert!(ModulesSettings::DEFAULT_OFF.contains(&"vault"));
+        assert!(m.switched_off().contains(&"vault"));
+        let absent: VaultSettings = toml::from_str("").expect("every key defaults");
+        assert!(absent.tenants.is_empty() && absent.kek.is_empty() && absent.kek_file.is_empty());
+    }
+
+    /// ⚠️ The KEK is the vault's root secret: whatever prints settings must
+    /// not print it.
+    #[test]
+    fn the_kek_never_prints() {
+        // Not key-shaped on purpose: a secret scanner must not take a test's
+        // probe for a leaked key.
+        let key = "AGE-SECRET-KEY-1-REDACTION-PROBE-NOT-A-KEY";
+        let s = VaultSettings {
+            tenants: "65f0000000000000000000a1".into(),
+            kek: key.into(),
+            kek_file: String::new(),
+        };
+        let shown = format!("{s:?} {s:#?}");
+        assert!(!shown.contains(key), "{shown}");
+        assert!(!shown.contains("REDACTION-PROBE"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(shown.contains("65f0000000000000000000a1"), "{shown}");
+        assert!(format!("{:?}", VaultSettings::default()).contains("<unset>"));
     }
 }
 
