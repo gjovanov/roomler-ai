@@ -1388,6 +1388,64 @@ export const useAgentStore = defineStore('agents', () => {
     }
   }
 
+  // ── FR-111 P4 — the org's on-screen control presets ───────────────
+  //
+  // Read by ANY member (`GET …/touch-preset`): every viewer in the org offers
+  // them beside the built-ins. The rows go to the overlay as the server sends
+  // them, and `orgPresets` (touchControls.ts) turns them into presets.
+
+  /** The org's presets, as the server sent them. */
+  const orgTouchPresets = ref<unknown[]>([])
+
+  /** An older server without the route, or any error, is none: the built-ins
+   *  are still offered. */
+  async function fetchOrgTouchPresets(tenantId: string) {
+    try {
+      const r = await api.get<{ items?: unknown[] }>(`/tenant/${tenantId}/touch-preset`)
+      orgTouchPresets.value = Array.isArray(r?.items) ? r.items : []
+    } catch {
+      orgTouchPresets.value = []
+    }
+  }
+
+  /** The refusal code a write answered (`name_taken`, `key_invalid`, …), or a
+   *  generic one: the editor says what it means. */
+  function touchPresetRefusal(e: unknown): string {
+    const data = (e as { data?: { error?: unknown } } | null)?.data
+    return typeof data?.error === 'string' ? data.error : 'unavailable'
+  }
+
+  /** FR-111 P4b-2 — publish a layout to the org (MANAGE_TENANT server-side):
+   *  `serverId` null creates one, else it replaces that one. Resolves to
+   *  `null`, or the refusal code; the list is fetched again either way. */
+  async function saveOrgTouchPreset(
+    tenantId: string,
+    body: { name: string; controls: unknown[] },
+    serverId: string | null,
+  ): Promise<string | null> {
+    try {
+      if (serverId) await api.put(`/tenant/${tenantId}/touch-preset/${serverId}`, body)
+      else await api.post(`/tenant/${tenantId}/touch-preset`, body)
+      return null
+    } catch (e) {
+      return touchPresetRefusal(e)
+    } finally {
+      await fetchOrgTouchPresets(tenantId)
+    }
+  }
+
+  /** FR-111 P4b-2 — remove an org layout (MANAGE_TENANT server-side). */
+  async function deleteOrgTouchPreset(tenantId: string, serverId: string): Promise<string | null> {
+    try {
+      await api.delete(`/tenant/${tenantId}/touch-preset/${serverId}`)
+      return null
+    } catch (e) {
+      return touchPresetRefusal(e)
+    } finally {
+      await fetchOrgTouchPresets(tenantId)
+    }
+  }
+
   /** Set one or more features (MANAGE_TENANT server-side). The route leaves
    *  a feature the body does not name alone, and answers with all three. */
   async function setOrgRcSessionPolicy(tenantId: string, patch: Partial<RcSessionPolicy>) {
@@ -1695,6 +1753,10 @@ export const useAgentStore = defineStore('agents', () => {
     orgRcSessionPolicy,
     fetchOrgRcSessionPolicy,
     setOrgRcSessionPolicy,
+    orgTouchPresets,
+    fetchOrgTouchPresets,
+    saveOrgTouchPreset,
+    deleteOrgTouchPreset,
     orgEphemeralKeysEnabled,
     fetchOrgEphemeralKeysEnabled,
     setOrgEphemeralKeysEnabled,

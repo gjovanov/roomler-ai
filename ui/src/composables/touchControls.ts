@@ -38,11 +38,23 @@ export const HID = {
   AltLeft: 0xe2,
 } as const
 
-/** What a button does while it is held: a chord of keys, pressed in order
- *  and released in reverse, or a mouse button. */
+/** FR-111 P4 — one step of a macro: a key or a mouse button, pressed,
+ *  released or both (`tap`), then a wait before the next step. The server
+ *  stores exactly this (`MacroStep` in `remote_control`). */
+export interface MacroStep {
+  op: 'press' | 'release' | 'tap'
+  key?: number
+  btn?: MouseBtn
+  wait_ms?: number
+}
+
+/** What a button does: a chord of keys, pressed in order and released in
+ *  reverse, or a mouse button, both held while the finger is down; or a
+ *  macro (P4), played once per press. */
 export type ControlAction =
   | { kind: 'keys'; keys: number[] }
   | { kind: 'mouse'; btn: MouseBtn }
+  | { kind: 'macro'; steps: MacroStep[] }
 
 export interface ButtonControl {
   id: string
@@ -213,8 +225,31 @@ export const BUILTIN_PRESETS: readonly TouchPreset[] = [
   },
 ]
 
-export function presetById(id: string | null): TouchPreset | null {
-  return BUILTIN_PRESETS.find((p) => p.id === id) ?? null
+/** FR-111 P4 — an org's preset is offered under `org:<its server id>`, so it
+ *  can never take a built-in's id. */
+export const ORG_PRESET_PREFIX = 'org:'
+/** FR-111 P4b-2 — a member's own preset, kept in this browser, under
+ *  `mine:<id>`. */
+export const MINE_PRESET_PREFIX = 'mine:'
+
+/** A built-in by its id, or one of `extra` (the org's presets, P4). */
+export function presetById(id: string | null, extra: readonly TouchPreset[] = []): TouchPreset | null {
+  if (!id) return null
+  return BUILTIN_PRESETS.find((p) => p.id === id) ?? extra.find((p) => p.id === id) ?? null
+}
+
+/** FR-111 P4 — the org's presets as the overlay offers them: the server's
+ *  rows under `org:` ids. A row that is not a preset (a newer server's shape)
+ *  is left out rather than drawn wrong. */
+export function orgPresets(items: unknown): TouchPreset[] {
+  if (!Array.isArray(items)) return []
+  const out: TouchPreset[] = []
+  for (const it of items) {
+    const p = it as { id?: unknown; name?: unknown; controls?: unknown }
+    if (typeof p?.id !== 'string' || typeof p.name !== 'string' || !Array.isArray(p.controls)) continue
+    out.push({ id: ORG_PRESET_PREFIX + p.id, name: p.name, controls: p.controls as TouchControl[] })
+  }
+  return out
 }
 
 /** The overlay is remembered per device, in this browser: a host that runs a
@@ -223,13 +258,16 @@ export const CONTROLS_STORAGE_PREFIX = 'roomler-rc-touch-controls:'
 
 /** The preset this browser chose for `deviceId`, or `null` for none (the
  *  default). An id this build does not know, say from a newer one, reads as
- *  none. */
+ *  none. An org preset's id is kept as it is: the org's list arrives after
+ *  the page loads, and the view resolves it then (`presetById`). */
 export function readControlsPreset(
   storage: Pick<Storage, 'getItem'> | null | undefined,
   deviceId: string,
 ): string | null {
   try {
     const v = storage?.getItem(CONTROLS_STORAGE_PREFIX + deviceId) ?? null
+    if (v?.startsWith(ORG_PRESET_PREFIX) && v.length > ORG_PRESET_PREFIX.length) return v
+    if (v?.startsWith(MINE_PRESET_PREFIX) && v.length > MINE_PRESET_PREFIX.length) return v
     return presetById(v)?.id ?? null
   } catch {
     return null
@@ -358,12 +396,23 @@ interface Hold {
  * the same key (a d-pad diagonal and a button) send one press and one
  * release. Sticks move the pointer from `tick`, which the overlay calls
  * every animation frame while one is held.
+ *
+ * FR-111 P4 — a macro button plays its steps once per press, through the same
+ * counted presses. It plays to its end once started: lifting the finger does
+ * not stop it, since a quick tap would otherwise cut a short macro in half.
+ * Only `releaseAll` stops it (the overlay hides, the preset changes, the page
+ * loses the user), and it lets go of whatever the macro holds. A second press
+ * while it plays is ignored. A step releases only what the macro itself
+ * pressed, so it never takes a key from another finger, and whatever is still
+ * held at the end is let go: a press with no release never sticks.
  */
-export function createControlsDriver(sink: ControlsSink) {
+export function createControlsDriver(sink: ControlsSink, timers: DriverTimers = realTimers) {
   const fingers = new Map<number, Hold>()
   const keyCount = new Map<number, number>()
   const btnCount = new Map<MouseBtn, number>()
   let lastTick: number | null = null
+  /** The macros playing now, by button id. */
+  const macros = new Map<string, Macro>()
 
   function keyDown(code: number) {
     const n = keyCount.get(code) ?? 0
@@ -417,6 +466,66 @@ export function createControlsDriver(sink: ControlsSink) {
     if (h.stick && ![...fingers.values()].some((f) => f.stick)) sink.end()
   }
 
+  function playMacro(buttonId: string, steps: MacroStep[]) {
+    if (macros.has(buttonId)) return
+    const m: Macro = { handle: null, keys: [], btns: [] }
+    macros.set(buttonId, m)
+    let i = 0
+    const finish = () => {
+      macros.delete(buttonId)
+      for (const k of [...m.keys].reverse()) keyUp(k)
+      for (const b of [...m.btns].reverse()) btnUp(b)
+    }
+    const next = () => {
+      m.handle = null
+      if (macros.get(buttonId) !== m) return
+      if (i >= steps.length) {
+        finish()
+        return
+      }
+      const s = steps[i++]
+      if (s.key !== undefined) {
+        if (s.op !== 'release') {
+          keyDown(s.key)
+          m.keys.push(s.key)
+        }
+        if (s.op !== 'press') {
+          const at = m.keys.lastIndexOf(s.key)
+          if (at >= 0) {
+            m.keys.splice(at, 1)
+            keyUp(s.key)
+          }
+        }
+      } else if (s.btn) {
+        if (s.op !== 'release') {
+          btnDown(s.btn)
+          m.btns.push(s.btn)
+        }
+        if (s.op !== 'press') {
+          const at = m.btns.lastIndexOf(s.btn)
+          if (at >= 0) {
+            m.btns.splice(at, 1)
+            btnUp(s.btn)
+          }
+        }
+      }
+      m.handle = timers.set(next, Math.min(Math.max(s.wait_ms ?? 0, 0), MACRO_STEP_MAX_MS))
+    }
+    next()
+  }
+  /** Stop every macro and let go of what each holds. */
+  function stopMacros() {
+    for (const m of [...macros.values()].reverse()) {
+      if (m.handle !== null) timers.clear(m.handle)
+      m.handle = null
+      for (const k of [...m.keys].reverse()) keyUp(k)
+      for (const b of [...m.btns].reverse()) btnUp(b)
+      m.keys = []
+      m.btns = []
+    }
+    macros.clear()
+  }
+
   return {
     pressButton(id: number, b: ButtonControl) {
       if (fingers.has(id)) return
@@ -426,9 +535,11 @@ export function createControlsDriver(sink: ControlsSink) {
           keyDown(k)
           h.keys.push(k)
         }
-      } else {
+      } else if (b.action.kind === 'mouse') {
         btnDown(b.action.btn)
         h.btn = b.action.btn
+      } else {
+        playMacro(b.id, b.action.steps)
       }
       fingers.set(id, h)
     },
@@ -462,9 +573,14 @@ export function createControlsDriver(sink: ControlsSink) {
     },
     release,
     /** Let go of everything: the overlay hides, the preset changes, the page
-     *  loses the user. */
+     *  loses the user. A playing macro stops, and lets go of what it holds. */
     releaseAll() {
+      stopMacros()
       for (const id of [...fingers.keys()].reverse()) release(id)
+    },
+    /** Whether a button's macro is playing now (the overlay lights it). */
+    playing(buttonId: string): boolean {
+      return macros.has(buttonId)
     },
     /** Move the pointer for every held stick up to `now`. Returns whether a
      *  stick is still held, so the overlay keeps calling. */
@@ -493,9 +609,32 @@ export function createControlsDriver(sink: ControlsSink) {
       return [...(fingers.get(id)?.keys ?? [])]
     },
     active(): boolean {
-      return fingers.size > 0
+      return fingers.size > 0 || macros.size > 0
     },
   }
 }
 
 export type ControlsDriver = ReturnType<typeof createControlsDriver>
+
+/** A wait between two macro steps is never longer than this (the server
+ *  refuses a longer one; a stored row is trusted no further). */
+export const MACRO_STEP_MAX_MS = 5000
+
+/** The timers a driver plays macros on: the page's own by default, a fake in
+ *  tests. */
+export interface DriverTimers {
+  set(fn: () => void, ms: number): unknown
+  clear(handle: unknown): void
+}
+
+const realTimers: DriverTimers = {
+  set: (fn, ms) => setTimeout(fn, ms),
+  clear: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+}
+
+interface Macro {
+  handle: unknown
+  /** The keys and buttons this macro pressed and has not let go yet. */
+  keys: number[]
+  btns: MouseBtn[]
+}
