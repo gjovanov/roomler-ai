@@ -191,10 +191,17 @@ fn injector_carries_rel() -> bool {
     let system_capture = crate::capture::seat_guard::live();
     #[cfg(not(feature = "drm-capture"))]
     let system_capture = false;
-    linux_xtest_carries_rel(uinput, system_capture, crate::desktop_brief::current().as_ref())
+    linux_xtest_carries_rel(
+        uinput,
+        system_capture,
+        crate::desktop_brief::current().as_ref(),
+    )
 }
 
-#[cfg(not(all(any(target_os = "windows", target_os = "linux"), feature = "enigo-input")))]
+#[cfg(not(all(
+    any(target_os = "windows", target_os = "linux"),
+    feature = "enigo-input"
+)))]
 fn injector_carries_rel() -> bool {
     false
 }
@@ -209,7 +216,10 @@ fn injector_carries_rel() -> bool {
 /// - on a Wayland desktop XTest reaches only Xwayland clients, so the
 ///   brief's `input_reach` must be `full` on an `x11` session;
 /// - no brief yet (the refresher's first pass has not landed) is no.
-#[cfg_attr(not(all(target_os = "linux", feature = "enigo-input")), allow(dead_code))]
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "enigo-input")),
+    allow(dead_code)
+)]
 pub(crate) fn linux_xtest_carries_rel(
     uinput_opted_in: bool,
     system_capture_live: bool,
@@ -670,10 +680,26 @@ mod tests {
         assert!(linux_xtest_carries_rel(false, false, Some(&x11)));
         assert!(!linux_xtest_carries_rel(true, false, Some(&x11)));
         assert!(!linux_xtest_carries_rel(false, true, Some(&x11)));
-        assert!(!linux_xtest_carries_rel(false, false, Some(&brief("wayland", "full"))));
-        assert!(!linux_xtest_carries_rel(false, false, Some(&brief("wayland", "xwayland_only"))));
-        assert!(!linux_xtest_carries_rel(false, false, Some(&brief("x11", "none"))));
-        assert!(!linux_xtest_carries_rel(false, false, Some(&brief("tty", "none"))));
+        assert!(!linux_xtest_carries_rel(
+            false,
+            false,
+            Some(&brief("wayland", "full"))
+        ));
+        assert!(!linux_xtest_carries_rel(
+            false,
+            false,
+            Some(&brief("wayland", "xwayland_only"))
+        ));
+        assert!(!linux_xtest_carries_rel(
+            false,
+            false,
+            Some(&brief("x11", "none"))
+        ));
+        assert!(!linux_xtest_carries_rel(
+            false,
+            false,
+            Some(&brief("tty", "none"))
+        ));
         assert!(!linux_xtest_carries_rel(false, false, None));
     }
 
