@@ -91,7 +91,7 @@ import { keepBusySetMessage, parseKeepBusyState, type KeepBusyRequest, type Keep
 import { parseDisplayMatchState, type DisplayMatchState } from './displayMatch'
 import { createRelAccumulator, relativeButtonMessage } from './relativeMouse'
 import { createPointerPressTracker, releaseForCancelledPointer, stageTouchAction } from './touchInput'
-import { createDirectGestures, createWheelSteps, type GestureAction, type TouchSample } from './touchGestures'
+import { createDirectGestures, createWheelSteps, WHEEL_CARRY_IDLE_MS, type GestureAction, type TouchSample } from './touchGestures'
 import { parseFeaturesRefused } from './useSessionFeatures'
 
 /**
@@ -10192,15 +10192,33 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       heldInputs.button(btn, false)
     }
 
+    // #2367 — the agent turns a pixel wheel into 100 px steps and rounds every
+    // frame on its own, so the few-pixel frames of a precision trackpad or a
+    // high-resolution wheel scrolled nothing (10 × 20 px reached the host as
+    // no wheel at all). Pixel-mode events are gathered and sent as whole steps,
+    // like FR-111's touch scroll; a pause drops the carry, so a stopped scroll
+    // leaves nothing behind for the next one.
+    const pixelWheel = createWheelSteps()
+    let pixelWheelIdle: ReturnType<typeof setTimeout> | null = null
     function onWheel(ev: WheelEvent) {
       ev.preventDefault()
       // Browser uses positive Y for down; agent does the same.
-      sendInput({
-        t: 'mouse_wheel',
-        dx: ev.deltaX,
-        dy: ev.deltaY,
-        mode: ev.deltaMode === 0 ? 'pixel' : ev.deltaMode === 1 ? 'line' : 'page',
-      })
+      if (ev.deltaMode !== 0) {
+        sendInput({
+          t: 'mouse_wheel',
+          dx: ev.deltaX,
+          dy: ev.deltaY,
+          mode: ev.deltaMode === 1 ? 'line' : 'page',
+        })
+        return
+      }
+      const step = pixelWheel.add(ev.deltaX, ev.deltaY)
+      if (step) sendInput({ t: 'mouse_wheel', dx: step.dx, dy: step.dy, mode: 'pixel' })
+      if (pixelWheelIdle !== null) clearTimeout(pixelWheelIdle)
+      pixelWheelIdle = setTimeout(() => {
+        pixelWheelIdle = null
+        pixelWheel.reset()
+      }, WHEEL_CARRY_IDLE_MS)
     }
 
     // Track whether the pointer is currently over the remote-viewer
@@ -10840,6 +10858,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       surface.removeEventListener('contextmenu', onContextMenu)
       window.removeEventListener('paste', onPaste)
       if (longPressTimer !== null) clearTimeout(longPressTimer)
+      if (pixelWheelIdle !== null) clearTimeout(pixelWheelIdle)
       // Release anything still held on the host BEFORE the channels close
       // (detach mid-chord must not leave a stuck modifier behind).
       releaseHeldInputs()
