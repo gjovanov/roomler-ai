@@ -47,6 +47,14 @@ for (const f of lists) {
     { \$sort: { "_id.os": 1, "_id.w": 1 } },
   ]).forEach(r => print([f, r._id.os, r._id.w, r.n].join("\t")));
 }
+// FR-97 P0c — the honest "no": each withheld feature as key:code.
+db2.agents.aggregate([
+  { \$match: live },
+  { \$project: { os: 1, u: { \$objectToArray: { \$ifNull: ["\$capabilities.unavailable", {}] } } } },
+  { \$unwind: "\$u" },
+  { \$group: { _id: { os: "\$os", w: { \$concat: ["\$u.k", ":", { \$ifNull: ["\$u.v.code", "?"] }] } }, n: { \$sum: 1 } } },
+  { \$sort: { "_id.os": 1, "_id.w": 1 } },
+]).forEach(r => print(["unavailable", r._id.os, r._id.w, r.n].join("\t")));
 for (const b of ["supports_clipboard", "supports_file_transfer", "has_input_permission"]) {
   db2.agents.aggregate([
     { \$match: Object.assign({}, live, { ["capabilities." + b]: true }) },
