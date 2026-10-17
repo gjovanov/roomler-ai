@@ -592,6 +592,83 @@ export interface ChannelsReport {
   platforms: PlatformRow[]
 }
 
+// ── Content (P7) ──────────────────────────────────────────────────────────
+
+/** Clicks and impressions; CTR and position only from n ≥ 30 impressions. */
+export interface SearchCell {
+  clicks: number
+  impressions: number
+  ctr?: number
+  position?: number
+}
+
+export interface SearchRow extends SearchCell {
+  key: string
+}
+
+export interface ContentWeb {
+  visitors: number
+  pageviews: number
+  reads: number
+  /** `reads / pageviews`, only from 30 pageviews. */
+  read_share?: number
+  median_read_s?: number | null
+  channels: { key: string; count: number }[]
+}
+
+export interface ContentGoogle {
+  d7: SearchCell
+  d28: SearchCell
+  top_queries_28d: SearchRow[]
+}
+
+export interface ContentIndex {
+  verdict?: string
+  coverage_state?: string
+  last_crawl_time?: string
+  /** When the verdict was read — never a later failed attempt's time;
+   *  absent while no inspection has succeeded. */
+  inspected_at?: string
+  /** The newest attempt. */
+  attempted_at?: string
+  /** The newest attempt's error, when it failed. */
+  error?: string
+}
+
+/** How many final days of each Google window were pulled. */
+export interface ContentGoogleDays {
+  d7: number
+  d28: number
+}
+
+export interface ContentRow {
+  path: string
+  url: string
+  title: string
+  published_at: string
+  in_feed: boolean
+  web: Measured<ContentWeb>
+  google: Measured<ContentGoogle>
+  index: Measured<ContentIndex>
+  signups: { count: number; note: string }
+}
+
+export interface ContentReport {
+  since: string
+  until: string
+  include_internal: boolean
+  excluded: ExcludedCounts
+  n_floor: number
+  posts_not_measured?: NotMeasured
+  web_not_measured?: NotMeasured
+  /** The newest final Search Console day the Google cells end on. */
+  google_through?: string
+  /** How many of each window's days were pulled; a missing one is uncounted, not 0. */
+  google_days?: ContentGoogleDays
+  google_not_measured?: NotMeasured
+  rows: ContentRow[]
+}
+
 /** `ingest` opens the pipeline's push routes; `read` (P10) opens the GET views. */
 export type GrowthKeyKind = 'ingest' | 'read'
 
@@ -1143,6 +1220,18 @@ export const useGrowthStore = defineStore('growth', () => {
     return api.get<CampaignsReport>(`/admin/growth/campaigns${qs ? `?${qs}` : ''}`)
   }
 
+  /** P7 — the Content table: per blog post, the web plane, Google and the index. */
+  async function fetchContent(
+    opts: { since?: string; until?: string; includeInternal?: boolean } = {},
+  ): Promise<ContentReport> {
+    const q = new URLSearchParams()
+    if (opts.since) q.set('since', opts.since)
+    if (opts.until) q.set('until', opts.until)
+    if (opts.includeInternal) q.set('include_internal', 'true')
+    const qs = q.toString()
+    return api.get<ContentReport>(`/admin/growth/content${qs ? `?${qs}` : ''}`)
+  }
+
   /** P8 — the Channels table: posts published in the range, per platform. */
   async function fetchChannels(
     opts: { since?: string; until?: string; includeInternal?: boolean } = {},
@@ -1243,6 +1332,7 @@ export const useGrowthStore = defineStore('growth', () => {
     fetchTimeline,
     fetchRevenue,
     fetchCampaigns,
+    fetchContent,
     fetchChannels,
     fetchNewsletter,
     fetchKeys,

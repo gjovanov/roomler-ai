@@ -24,6 +24,7 @@
         <v-tab value="overview">Overview</v-tab>
         <v-tab value="campaigns">Campaigns</v-tab>
         <v-tab value="channels">Channels</v-tab>
+        <v-tab value="content">Content</v-tab>
         <v-tab value="newsletter">Newsletter</v-tab>
         <v-tab value="orgs">Orgs</v-tab>
         <v-tab value="cohorts">Cohorts</v-tab>
@@ -174,6 +175,12 @@
         <!-- ── Channels (P8) ─────────────────────────────────────────── -->
         <v-window-item value="channels">
           <growth-channels />
+        </v-window-item>
+
+        <!-- ── Content (P7) ──────────────────────────────────────────── -->
+        <!-- Lazily rendered: the component loads its own range on first open. -->
+        <v-window-item value="content">
+          <growth-content />
         </v-window-item>
 
         <!-- ── Newsletter (P5) ───────────────────────────────────────── -->
@@ -473,6 +480,7 @@ import {
 import GrowthAlerts from '@/components/growth/GrowthAlerts.vue'
 import GrowthCampaigns from '@/components/growth/GrowthCampaigns.vue'
 import GrowthChannels from '@/components/growth/GrowthChannels.vue'
+import GrowthContent from '@/components/growth/GrowthContent.vue'
 import GrowthNewsletter from '@/components/growth/GrowthNewsletter.vue'
 import GrowthWeekly from '@/components/growth/GrowthWeekly.vue'
 import GrowthNode from '@/components/growth/GrowthNode.vue'
