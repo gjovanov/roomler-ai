@@ -214,6 +214,17 @@ pub fn init() {
             "turn::client::relay_conn=error"
                 .parse()
                 .expect("static EnvFilter directive is valid"),
+        )
+        // FR-110 — each carrier socket's granted buffer sizes, said once per
+        // bind (startup and plane rebuilds: a handful of lines a day). On
+        // Windows nothing like `ss -m` exists, so the line is the only evidence
+        // of the size. The packaged Linux units set `RUST_LOG=roomlerd=info,warn`,
+        // which drops `tunnel_core` INFO, so this is appended UNCONDITIONALLY,
+        // like the directive above.
+        .add_directive(
+            "tunnel_core::overlay::sockbuf=info"
+                .parse()
+                .expect("static EnvFilter directive is valid"),
         );
 
     let stdout = fmt::layer().with_target(false).compact();
