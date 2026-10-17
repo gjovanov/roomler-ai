@@ -22,6 +22,9 @@
 //!   the modern, scriptable, no-reboot NAT engine (Win10 1607+/Server 2016+),
 //!   the same one Docker/WSL2 use. Skipped when an overlapping `Get-NetNat`
 //!   already exists (WinNAT rejects overlapping internal prefixes).
+//! - **macOS (FR-97 P1b):** pf, in our own anchor under the stock
+//!   `com.apple/*` wildcard, enabled with a `pfctl -E` reference token, and
+//!   `net.inet.ip.forwarding` put back as found: see [`super::pf`].
 //! - Other platforms: no-op.
 //!
 //! Only the *advertising* node needs this; clients of a subnet route need just
@@ -59,6 +62,10 @@ pub struct SubnetRouterGuard {
     /// an interface we turned on switches it back off.
     #[cfg(target_os = "windows")]
     forwarding: Vec<super::host_ledger::FwdTarget>,
+    /// FR-97 P1b — the pf serve `Drop` stops: our anchor, our pf references,
+    /// and forwarding as found.
+    #[cfg(target_os = "macos")]
+    pf: Option<super::pf::Serve>,
 }
 
 /// FR-97 P0b-2b — this process's forwarding holds, shared by every router
@@ -88,18 +95,25 @@ pub async fn enable(
             active: false,
             #[cfg(target_os = "windows")]
             forwarding: Vec::new(),
+            #[cfg(target_os = "macos")]
+            pf: None,
         };
     }
     #[cfg(target_os = "windows")]
     let (fully_ok, forwarding) = setup(if_name, overlay_cidrs, advertised_routes).await;
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    let (fully_ok, pf) = super::pf::serve(if_name, overlay_cidrs).await;
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let fully_ok = setup(if_name, overlay_cidrs, advertised_routes).await;
     // Arm the guard on any platform where `setup` installs rules, so `Drop`
     // reverts even a PARTIALLY-applied ruleset (each `-D` / `Remove-NetNat` is
     // idempotent — reverting an absent rule is a harmless no-op). `fully_ok`
     // only drives the log level. Previously `active = setup()`, which leaked the
     // rules that DID apply whenever one of the (now multiple, P5/A4) commands
-    // failed.
+    // failed. macOS: armed whenever a serve exists to stop.
+    #[cfg(target_os = "macos")]
+    let active = pf.is_some();
+    #[cfg(not(target_os = "macos"))]
     let active = cfg!(any(target_os = "linux", target_os = "windows"));
     if active && fully_ok {
         info!(%if_name, cidrs = ?overlay_cidrs, routes = ?advertised_routes,
@@ -114,6 +128,8 @@ pub async fn enable(
         active,
         #[cfg(target_os = "windows")]
         forwarding,
+        #[cfg(target_os = "macos")]
+        pf,
     }
 }
 
@@ -211,12 +227,22 @@ async fn probe() -> Result<(), String> {
     })
 }
 
-/// Can this host forward and NAT for the overlay? Not yet, on this platform.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+/// Can this Mac forward and NAT for the overlay? `Err` says why not: the
+/// kill switch, a pf this daemon cannot drive (a per-user daemon), or a main
+/// ruleset that does not evaluate `com.apple/*` (FR-97 P1b).
+#[cfg(target_os = "macos")]
+async fn probe() -> Result<(), String> {
+    tokio::task::spawn_blocking(super::pf::probe)
+        .await
+        .unwrap_or_else(|e| Err(format!("the probe task failed: {e}")))
+}
+
+/// Can this host forward and NAT for the overlay? Not on this platform.
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 async fn probe() -> Result<(), String> {
     Err(
-        "this platform has no NAT for the overlay yet, so it cannot be an exit node or a \
-         subnet router (FR-97 P1b)"
+        "this platform has no NAT for the overlay, so it cannot be an exit node or a \
+         subnet router"
             .into(),
     )
 }
@@ -648,7 +674,7 @@ pub(crate) fn restore_forwarding_guids(guids: &[String]) {
     let _ = guids;
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 async fn setup(_if_name: &str, _overlay_cidrs: &[String], _advertised_routes: &[String]) -> bool {
     false
 }
@@ -657,6 +683,11 @@ impl Drop for SubnetRouterGuard {
     fn drop(&mut self) {
         if !self.active {
             return;
+        }
+        // FR-97 P1b — the anchor, the pf tokens, then forwarding as found.
+        #[cfg(target_os = "macos")]
+        if let Some(serve) = self.pf.take() {
+            serve.stop();
         }
         // `Drop` can't await — revert synchronously via blocking `Command`.
         #[cfg(target_os = "linux")]
@@ -884,7 +915,7 @@ mod offer_tests {
 
     /// The platform without a NAT arm says so, rather than offering a route
     /// nothing on the host would forward.
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     #[tokio::test]
     async fn a_platform_without_a_nat_arm_withholds() {
         assert!(super::probe().await.is_err());
