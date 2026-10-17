@@ -1355,6 +1355,16 @@ device is the only writer). Absent is unknown, never direct. The P9a freeze spli
 Active sessions by carrier, and the Quality tab and weekly roll-up show it. Rules, storage and
 the field plan: [growth-observability.md](growth-observability.md#remote-desktop-quality-from-what-is-recorded-p9a).
 
+**When it reaches the server (FR-102 P9d).** The observation lands ~2.5–6 s after `Connected`
+(`NOMINATION_WAIT` 3 s + `SETTLE` 2 s + the LocalAPI budget). P9c sent the carrier only on the
+heartbeat's free-running 30 s tick and in the end-of-session sample, so a session with no tick
+after the observation — overwhelmingly a short one — recorded none, which the freeze reads as
+`unknown`. Since P9d the observation signals the signalling loop the moment it lands
+(`agents/roomlerd/src/peer.rs:924`) and the loop sends one `rc:session.stats` at once by the same
+road the tick uses (`agents/roomlerd/src/signaling.rs:2164`), so a session that **outlives** the
+observation records its carrier whatever its length. Only a session that **ends before** the
+observation lands still records `unknown` — which is correct: no pair was ever nominated to read.
+
 ## 12. Performance targets & budget
 
 | Stage | Target (LAN) | Target (WAN, RTT 30 ms) |
