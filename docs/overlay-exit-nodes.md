@@ -515,8 +515,9 @@ sequenceDiagram
 > - **When its last share stops it switches forwarding OFF**, under a serving
 >   exit too. Before the re-assert covered forwarding, a Mac exit stopped
 >   forwarding the moment its last NAT-mode VM shut down.
-> - The process stays up after sharing ends, so "Internet Sharing is NATing"
->   is read from its anchor's `nat` rules, not from `pgrep`.
+> - The process outlives its last share, by 40 s to a minute here, so
+>   "Internet Sharing is NATing" is read from its anchor's `nat` rules, not
+>   from `pgrep`.
 
 > ⚠️ **Root only.** `pfctl` needs root, so a per-user daemon's probe refuses
 > and the Mac offers nothing, with the reason in `roomler status` and the admin

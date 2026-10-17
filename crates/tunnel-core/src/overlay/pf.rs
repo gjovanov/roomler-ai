@@ -31,8 +31,9 @@
 //!   rules in `com.apple.internet-sharing`, so our stop leaves its NAT running;
 //!   but when its last share stops it switches forwarding OFF, a serving exit's
 //!   included, so the re-assert switches it back on;
-//! - the InternetSharing process stays up after sharing ends: "Internet Sharing
-//!   is NATing" is read from its anchor's rules, not from the process.
+//! - the InternetSharing process outlives its last share (by 40 s to a minute
+//!   here), so "Internet Sharing is NATing" is read from its anchor's rules, not
+//!   from the process.
 //!
 //! The anchor holds one `nat` per egress interface (Linux's MASQUERADE has no
 //! `-o` either), never onto another VPN's utun, and a `pass` for the overlay
@@ -374,8 +375,8 @@ mod host {
     /// on, or vmnet's shared mode, the NAT behind every VM on a Mac in NAT
     /// mode. Either turns forwarding on for itself, and switching it off under
     /// it would cut whatever it serves. Its rules live in [`IS_ANCHOR`] and the
-    /// anchors below it. The InternetSharing process says nothing: it stays up
-    /// after the last share stops (field, FR-97 §8, 2026-10-17).
+    /// anchors below it. The InternetSharing process says nothing: it outlives
+    /// the last share by 40 s to a minute (field, FR-97 §8, 2026-10-17).
     fn internet_sharing_nats() -> bool {
         pf_enabled()
             && pfctl(&["-v", "-s", "Anchors"], None)
