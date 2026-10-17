@@ -88,6 +88,9 @@ pub mod stall;
 /// FR-70 M1 — the encoder thread (generic; the FFmpeg encoder implements its
 /// trait behind the feature).
 pub mod thread;
+/// FR-112 P1 — an encoding thread asks the scheduler for its clock (a Linux
+/// utilisation clamp): a periodic encoder is otherwise parked on a slow core.
+pub mod clock;
 
 // Viewer-rate controller (rc.188) — folds the browser's measured `rc:decodestat`
 // (decoded fps + struggling) into a send-fps cap for the DC pumps, so the agent

@@ -3806,6 +3806,11 @@ async fn media_pump_vp9_444_dc(
     // scale_ops counts REAL resamples only.
     let mut scale_us: u64 = 0;
     let mut scale_ops: u64 = 0;
+    // FR-112 P1 — the encode's own cost per window, as the RTP pump reports it:
+    // without it a frame rate held by the encoder is indistinguishable from one
+    // held by the capture or the link.
+    let mut encode_us: u64 = 0;
+    let mut encode_ops: u64 = 0;
     // Phase A — pump-local resampler (cached taps + pooled intermediate).
     let mut resampler = crate::encode::resample::Resampler::new();
     // Phase B — the backend cap last handed to the capturer (change-gated).
@@ -4620,6 +4625,7 @@ async fn media_pump_vp9_444_dc(
             last_applied_quality = q_now;
         }
 
+        let encode_start = std::time::Instant::now();
         let packets = match enc.encode(&frame).await {
             Ok(p) => p,
             Err(e) => {
@@ -4627,6 +4633,8 @@ async fn media_pump_vp9_444_dc(
                 return;
             }
         };
+        encode_us += encode_start.elapsed().as_micros() as u64;
+        encode_ops += 1;
         frames_encoded += packets.len() as u64;
 
         // P8 Phase 5 — fold the encoder's QP reports into the window.
@@ -4859,6 +4867,11 @@ async fn media_pump_vp9_444_dc(
             let avg_scale_ms = (scale_us / scale_ops.max(1)) as f64 / 1000.0;
             scale_us = 0;
             scale_ops = 0;
+            // FR-112 P1 — the window's encode cost (BGRA → YUV + libvpx, on the
+            // encoder thread when `media_thread` is on).
+            let avg_encode_ms = (encode_us / encode_ops.max(1)) as f64 / 1000.0;
+            encode_us = 0;
+            encode_ops = 0;
             // P8 Phase 4 — shared / mixed-dial pipeline seconds (SVC
             // go/no-go dataset; ~1 s window — see the ffmpeg twin).
             if pipeline.follower_count() > 0 {
@@ -4882,6 +4895,7 @@ async fn media_pump_vp9_444_dc(
                 scene_change_keyframes,
                 settle_kf_suppressed,
                 avg_scale_ms,
+                avg_encode_ms,
                 target_bps = governor.applied_bps(),
                 avg_qp = ?avg_qp,
                 max_qp = ?max_qp,
