@@ -550,8 +550,14 @@ test of the SIGKILL property itself.
 
 - **P3a, cursor.** On X11, `XFixesGetCursorImage`, wiring the recorder's decoder (`capture/pointer.rs:187-230`) into
   the live channel. On portal and mutter, PipeWire cursor metadata (`SPA_META_Cursor`).
-- **P3b, lock and sleep.** `host_locked` from logind's `LockedHint` (`keep_busy/logind.rs`), advisory only; sleep
-  inhibited with logind `Inhibit("sleep:idle", …)` over the zbus that already ships.
+- **P3b, lock and sleep** (built). `rc:host_locked` from logind's `LockedHint` for seat0's active session, polled
+  every 2 s, **advisory only**. It never becomes a `LockState`: the Windows overlay and input suppression would blank
+  a lock screen the viewer can see and stop the keystrokes that unlock it. The message carries `input: "passes"`, so
+  the viewer's chip says input reaches the lock screen (`docs/remote-control.md` §5.1d). Kill switch:
+  `ROOMLERD_LOCK_HINT=0`. Sleep: the power keeper's Linux backend takes a logind block inhibitor over the zbus that
+  ships, from a plain thread (zbus's blocking API panics in the runtime). It takes `sleep:idle` as root and `idle`
+  only for a per-user daemon, which polkit refuses a `sleep` block. This is FR-55 P3, whose deferral reasons, no
+  D-Bus and no Linux desktops, both lapsed.
 - **P3c, audio.** Measured first (2026-10-17, §8), and the premise was wrong: the fallback to a microphone was not
   a corner case, it was the only path. cpal 0.15 has one Linux host, ALSA, which lists `pipewire`, `pulse` and
   `default` and never a sound server's sources, so neither the `.monitor` auto-pick nor the documented
@@ -674,7 +680,7 @@ model on Windows, so the three agree on what the mode means.
 | **P2e** | macOS clipboard images + RTF | `ROOMLERD_CLIPBOARD_NATIVE=0` | a field Mac | S–M |
 | **P2f** | macOS microphone for recordings | the recording's `mic` option | a field Mac | S–M |
 | **P3a** | Linux cursor shape (X11, then PipeWire) | `ROOMLERD_CURSOR_CHANNEL=0` | the FR-93 lab, Xorg + Wayland | S → M |
-| **P3b** | Linux lock hint + sleep inhibit | `power_policy`; per-verb | the lab | S |
+| **P3b** | Linux lock hint (advisory, `input: "passes"`) + a logind block inhibitor (FR-55 P3) (built) | `ROOMLERD_LOCK_HINT=0`; `power_policy` | a vmtest Ubuntu guest, red on 0.4.142 | S |
 | **P3c** | Linux audio. *P3c-1*: never a microphone; no `opus` without a named device; `rc:audio-unavailable` says why (built). *P3c-2*: the session's monitor through Pulse's client library, per-user and root (D14, built) | P3c-1: — (a privacy fix; an owner names a device to opt back in); P3c-2: `ROOMLERD_AUDIO_SESSION=0` | a Linux host with a microphone and a sound server, red on 0.4.141 | M |
 | **P3d** | Linux system-install files land as the seat user | `ROOMLERD_FILES_AS_SEAT_USER=0` | the lab | M |
 | **P3e** | Linux X11 layout, display-match, clipboard images + RTF | per-verb | the lab | M |

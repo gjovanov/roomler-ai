@@ -550,6 +550,46 @@ the recorder already runs as the person at the screen, it records the monitor
 in its own process. Before P3c-2 it refused its start on every Linux host,
 because the `.monitor` pick never matched.
 
+### 5.1d A locked host, and a session that keeps the host awake (FR-97 P3b)
+
+What the viewer is told when the host's screen locks, and what holds the
+machine awake while a session is live, per OS:
+
+| | Windows | Linux | macOS |
+|---|---|---|---|
+| The lock signal | the input desktop moves to `winsta0\Winlogon` (`lock_state`) | logind's `LockedHint` for seat0's active session, polled every 2 s ([`lock_state.rs:331`](../agents/roomlerd/src/lock_state.rs#L331)); GNOME, KDE and light-locker set it | P2d |
+| What the session does | paints the "Host locked" overlay and suppresses input: the worker can neither capture nor inject there | **nothing**: the lock screen is captured like any other screen, and input reaches it | — |
+| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:9357`](../agents/roomlerd/src/peer.rs#L9357)), retried until the control DC carries it | — |
+| The viewer's chip | "input is suppressed" | "Your input reaches it, so you can type the password to unlock" ([`RemoteControl.vue:78`](../ui/src/views/remote/RemoteControl.vue#L78)) | — |
+| Holding the machine awake while a session is live (FR-55) | `PowerCreateRequest` | a logind **block** inhibitor ([`power.rs:670`](../agents/roomlerd/src/power.rs#L670)): `sleep:idle` for a root daemon, `idle` only for a per-user one | `IOPMAssertion` |
+
+⚠️ **The Linux hint is advisory and never a `LockState`.** The pump's overlay
+and the input path keep reading the Windows probe, which says Unlocked on
+Linux. Feeding the hint there would blank a lock screen the viewer can see and
+stop the very keystrokes that unlock it. `ROOMLERD_LOCK_HINT=0` turns the hint
+off.
+
+⚠️ **The inhibitor is the FR-55 half, and it sits beside FR-93 P5h's.** P5h
+holds a logind **delay** inhibitor during a session so that a sleep the person
+chooses is announced to the viewer first ([`linux-capture.md`](linux-capture.md)).
+The **block** inhibitor is FR-55's own design for Linux (`what="sleep"`,
+`mode="block"`, [FR-55](fr/FR-55-always-reachable.md)): an idle timer must not
+end a live session. What a desktop does with an explicit suspend or a closed
+lid while a block is held is the desktop's and logind's own
+(`LidSwitchIgnoreInhibited=` and the rest); the field cell measures the idle
+case.
+
+⚠️ **A per-user daemon gets `idle` only.** It runs outside every login
+session, and logind's polkit policy grants a `sleep` block only to session
+processes (`inhibit-block-sleep` is `allow_any=no`). It falls back to `idle`
+and logs why. A desktop's own idle suspend may still end such a session; a
+system install, the default, has both.
+
+The inhibitor lives exactly as long as its fd: logind drops it when the fd
+closes, so a daemon that crashes leaves nothing pinned. `systemd-inhibit
+--list` shows it (`roomlerd`, `block`) only while a session or an SSH or exec
+run is live.
+
 ### 5.2 Encoder selection
 
 Picked at agent startup, redetected on GPU change:

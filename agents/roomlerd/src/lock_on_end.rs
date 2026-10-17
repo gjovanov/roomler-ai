@@ -301,7 +301,7 @@ fn lock_now() -> Result<(), String> {
 
 /// seat0's active session, as logind names it.
 #[cfg(target_os = "linux")]
-fn linux_active_session() -> Option<String> {
+pub(crate) fn linux_active_session() -> Option<String> {
     let out = std::process::Command::new("loginctl")
         .args(["show-seat", "seat0", "--property=ActiveSession", "--value"])
         .output()
@@ -311,7 +311,7 @@ fn linux_active_session() -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_session_hint(id: &str, property: &str) -> bool {
+pub(crate) fn linux_session_hint(id: &str, property: &str) -> bool {
     std::process::Command::new("loginctl")
         .args([
             "show-session",

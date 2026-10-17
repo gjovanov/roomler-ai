@@ -75,7 +75,9 @@
         variant="flat"
         prepend-icon="mdi-lock"
         class="mr-2"
-        title="The remote host is on the lock screen — input is suppressed."
+        :title="rc.hostLockedInputPasses.value
+          ? 'The remote host is on its lock screen. Your input reaches it, so you can type the password to unlock.'
+          : 'The remote host is on the lock screen — input is suppressed.'"
       >
         Host locked
       </v-chip>
