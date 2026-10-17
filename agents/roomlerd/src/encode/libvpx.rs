@@ -1411,3 +1411,208 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod fr112_bench {
+    //! FR-112 P1 — what one VP9 frame costs at the encode box a 4K host sends
+    //! (2048×1080), by bitrate, tile columns, speed and chroma, through the
+    //! pump's own `encode_sync` (BGRA → YUV included). The thread asks for its
+    //! clock first, as the encoder thread does, so the rows are what the CPU
+    //! can do and not what a throttled core does (FR-112 §2). Run by name, in
+    //! release, on the host it measures:
+    //! `cargo test --release -p roomlerd --lib --features full,vp9-444,vp9-444-bindgen -- --ignored vp9_encode_cost_bench --nocapture --test-threads=1`
+    use super::*;
+    use std::time::Instant;
+
+    const W: u32 = 2048;
+    const H: u32 = 1080;
+
+    fn xorshift(s: &mut u64) -> u8 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        (*s >> 24) as u8
+    }
+
+    /// Screen-like BGRA: a static text-like desktop, a window dragged 8 px a
+    /// frame, and a 256×256 block that changes wholly (worst-case content).
+    fn frames(n: usize) -> Vec<Frame> {
+        let (w, h) = (W as usize, H as usize);
+        let mut base = vec![0u8; w * h * 4];
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for row in 0..h {
+            let text = (row / 18) % 3 != 2 && (row % 18) < 12;
+            for col in 0..w {
+                let v = if text && (col / 600) % 2 == 0 {
+                    if xorshift(&mut s) > 150 { 30 } else { 235 }
+                } else {
+                    (200 + ((col + row) % 32) as u8).min(250)
+                };
+                let i = (row * w + col) * 4;
+                base[i] = v;
+                base[i + 1] = v;
+                base[i + 2] = v;
+                base[i + 3] = 255;
+            }
+        }
+        (0..n)
+            .map(|k| {
+                let mut d = base.clone();
+                let (wx, wy) = ((k * 8) % (w - 600), 300usize);
+                let mut s = 0x1234_5678_9ABC_DEF0u64;
+                for r in 0..400 {
+                    for c in 0..600 {
+                        let v = if r < 24 {
+                            70
+                        } else if (r / 16) % 2 == 0 && xorshift(&mut s) > 160 {
+                            20
+                        } else {
+                            245
+                        };
+                        let i = ((wy + r) * w + wx + c) * 4;
+                        d[i] = v;
+                        d[i + 1] = v.saturating_add(10);
+                        d[i + 2] = v;
+                    }
+                }
+                let mut t = (k as u64 + 1).wrapping_mul(0x2545_F491_4F6C_DD1D);
+                for r in 0..256 {
+                    for c in 0..256 {
+                        let i = ((700 + r) * w + 1600 + c) * 4;
+                        d[i] = xorshift(&mut t);
+                        d[i + 1] = xorshift(&mut t);
+                        d[i + 2] = xorshift(&mut t);
+                    }
+                }
+                Frame {
+                    width: W,
+                    height: H,
+                    stride: W * 4,
+                    pixel_format: PixelFormat::Bgra,
+                    data: d,
+                    monotonic_us: (k as u64) * 16_667,
+                    monitor: 0,
+                    damage: crate::capture::Damage::Unknown,
+                    source: None,
+                }
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn one(
+        label: &str,
+        fps: u32,
+        chroma: Vp9Chroma,
+        bps: u32,
+        cpu: c_int,
+        tiles_log2: Option<c_int>,
+        max_q: u32,
+        fr: &[Frame],
+    ) {
+        let mut enc = Vp9Encoder::new_with_fps_chroma(W, H, fps, chroma).expect("encoder");
+        enc.set_max_quantizer(max_q);
+        enc.set_speed(cpu);
+        if let Some(t) = tiles_log2 {
+            enc.set_ctrl(
+                vpx::vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as c_int,
+                t,
+                "VP9E_SET_TILE_COLUMNS",
+            );
+        }
+        VideoEncoder::set_bitrate(&mut enc, bps);
+        for f in fr.iter().take(30) {
+            enc.encode_sync(f).expect("warmup");
+        }
+        let (mut ms, mut bytes, mut qps) = (Vec::new(), 0usize, Vec::new());
+        for f in fr.iter().skip(30) {
+            let t = Instant::now();
+            let p = enc.encode_sync(f).expect("encode");
+            ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            bytes += p.iter().map(|x| x.data.len()).sum::<usize>();
+            qps.extend(p.iter().filter_map(|x| x.qp));
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = ms.len();
+        let mean = ms.iter().sum::<f64>() / n as f64;
+        let qp = if qps.is_empty() {
+            -1.0
+        } else {
+            qps.iter().sum::<i32>() as f64 / qps.len() as f64
+        };
+        println!(
+            "{label:<34} mean {mean:6.2} ms  p50 {:6.2}  p95 {:6.2}  max fps {:5.1}  {:7.0} B/frame  avg q {:4.1}",
+            ms[n / 2],
+            ms[n * 95 / 100],
+            1000.0 / mean,
+            bytes as f64 / n as f64,
+            qp
+        );
+    }
+
+    #[test]
+    #[ignore = "a benchmark: run by name, in release, on the host it measures"]
+    fn vp9_encode_cost_bench() {
+        let clock = crate::encode::clock::ask_for_this_thread("bench");
+        let fr = frames(150);
+        println!(
+            "{W}x{H}, 120 frames measured per row, {} logical CPUs, encoder threads {}, clock {clock:?}",
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(0),
+            num_cpus_for_encode()
+        );
+        let q = vp9_direct_max_q_from_env();
+        let (y444, y420) = (Vp9Chroma::Yuv444, Vp9Chroma::Yuv420);
+        one(
+            "444 30fps 17.5M cpu6 tiles4 (today)",
+            30,
+            y444,
+            17_500_000,
+            6,
+            None,
+            q,
+            &fr,
+        );
+        one(
+            "444 60fps 25M cpu6 tiles4",
+            60,
+            y444,
+            25_000_000,
+            6,
+            None,
+            q,
+            &fr,
+        );
+        one(
+            "444 60fps 25M cpu6 tiles8",
+            60,
+            y444,
+            25_000_000,
+            6,
+            Some(3),
+            q,
+            &fr,
+        );
+        one(
+            "444 60fps 25M cpu8 tiles8",
+            60,
+            y444,
+            25_000_000,
+            8,
+            Some(3),
+            q,
+            &fr,
+        );
+        one(
+            "420 60fps 25M cpu6 tiles4",
+            60,
+            y420,
+            25_000_000,
+            6,
+            None,
+            q,
+            &fr,
+        );
+    }
+}

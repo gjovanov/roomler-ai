@@ -139,6 +139,10 @@ impl<E: EncoderOps> EncoderThread<E> {
         let join = match std::thread::Builder::new()
             .name(name.clone())
             .spawn(move || {
+                // FR-112 P1 — ask for this thread's clock before anything else:
+                // threads the encoder creates later (libvpx's workers, at the
+                // first encode) inherit it.
+                crate::encode::clock::ask_for_this_thread("encoder");
                 // The encoder arrives right after the spawn succeeded; a sender
                 // dropped without sending means the caller kept it, and this
                 // thread simply ends.
