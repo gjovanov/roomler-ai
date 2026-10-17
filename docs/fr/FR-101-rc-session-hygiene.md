@@ -1,7 +1,8 @@
 # FR-101: Remote-desktop session hygiene — sensitive features off by policy, the audit that exists emitted, sessions that end, the transport hardened
 
-**Issue:** [#2093](https://github.com/gjovanov/roomler-ai/issues/2093) · **Status:** proposed 2026-10-13 —
-spec and claim · **Owner:** the agent (permission masking, the transport), the hub (policy, audit, limits),
+**Issue:** [#2093](https://github.com/gjovanov/roomler-ai/issues/2093) · **Status:** in progress — every
+criterion but AC8 field-verified (AC1's last half, Safari, on 2026-10-17); AC8, TURN over IPv6, is an
+operations item (no coturn host has an AAAA record) · **Owner:** the agent (permission masking, the transport), the hub (policy, audit, limits),
 the viewer (defaults) · **Anchors:** master `c2e79221b` · **Program:**
 [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 1 · **Builds on:**
 [security baseline](../security-baseline.md), [permissions](../permissions.md),
@@ -299,13 +300,15 @@ and gives labs an explicit escape before the default flips.
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1 (red first):** a pcap of the deployed agent's DTLS ClientHello lists the CBC suites. After P1 it
-  lists only ECDHE-GCM, and every fleet browser still connects. *Progress (field log rows 8, 9 and
-  12):* both pcap halves are shown on the deployed binary (2026-10-14). Chromium and Firefox connect to
+- [x] **AC1 (red first):** a pcap of the deployed agent's DTLS ClientHello lists the CBC suites. After P1 it
+  lists only ECDHE-GCM, and every fleet browser still connects. **Verified** (field log rows 8, 9, 12 and
+  14): both pcap halves are shown on the deployed binary (2026-10-14). Chromium and Firefox connect to
   0.4.137 and both pick `c02b` (2026-10-15). The Firefox was Playwright's, which has no OpenH264. This
   criterion asked for one *with* OpenH264 only because that Firefox could not connect at all before
   #2247 (#2231). DTLS is the same either way, since the agent is the DTLS client and its suite list does
-  not depend on the browser's codecs. Still owed: a Safari session.
+  not depend on the browser's codecs. **Safari connects too** (2026-10-17, row 14): Safari 18.6 on
+  macOS 15.7.7 to 0.4.142, DTLS 1.2 with `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` (`c02b`), and H.264
+  decoding on a direct pair.
 - [x] **AC2 (amended 2026-10-13):** a test replays an SRTCP packet into the agent's **live session**. It
   is refused under P1's policy, and the test shows it can see a replay accepted: with protection
   disabled through the setting engine, the replay is obeyed. *As first written, this criterion asked
@@ -396,6 +399,7 @@ weighed.
 | 11 | 2026-10-15 | **AC6's idle half, green then red**, the same guest. The production viewer (Playwright, Chromium) and server, with the server's frames on the viewer's `/ws` and the session's audit rows as the oracle. The device's own `access_policy.auto_terminate_idle_minutes` is set to 1, so no other device in the shared org is touched, and restored in a `finally` | **Green (0.4.137):** `rc:session.created` carries `idle_secs: 60`. The viewer's warning shows 50.2 s after the agent's answer, then `rc:terminate` with `idle_timeout` and `limit: idle` at 60.0 s, and the `session_ended` row names the same. Two runs (14:12Z and 14:21Z) gave the same result. **The control:** the next session, with a pointer move over the stage every 20 s, is still live after 100 s. This guest has no input path ("no X display, no uinput"), so the moves are counted, not injected. That is the agent's rule (`note_input_seen`): a controller who is present is activity. **Red (0.4.136, the agent put back on the same guest):** `idle_secs: null`, because without the `idle-timeout` word the viewer is told no limit. No warning and no end in 3.5 minutes, and the spec fails on its `idle_timeout` assertion |
 | 12 | 2026-10-15 | **AC1's Firefox half, and #2231's field proof.** The same guest on 0.4.137. Playwright 1.62's Firefox (no OpenH264), then Chromium, each under a UDP capture that starts before the connect | Both went live. **Firefox:** the agent logs `RTP video track takes a codec the offer carries; the DataChannel carries the video pump_codec=h264 track_codec=vp8` and answers. The session runs on the VP9 DataChannel. The agent offers `c02b c02f`, and Firefox's ServerHello picks `c02b` (relayed, over TURN ChannelData). On 0.4.136 the same Firefox never reached DTLS (row 9). **Chromium:** the same offer, and `c02b` picked (direct). Safari is still owed |
 | 13 | 2026-10-15 | **Wrong turns** | (1) **The control's first run failed, and the harness was at fault.** On the DataChannel paths the viewer hides its `<video>`, the first child of the stage. A `video, canvas` locator picked it, got no bounding box and moved nothing, so the control idled out at 60 s like the untouched session. Re-run over the stage (`.video-frame`), it held. (2) The green's first journal read used a 60 s window that opened after the restart's lines, and found nothing. Re-read by the daemon's invocation id. (3) The "read as TLS" warning is logged twice per start, 51 ms apart. Harmless; not chased |
+| 14 | 2026-10-17 | **AC1's Safari half.** Safari 18.6 on macOS 15.7.7, in a throwaway clone of the vmtest tart golden on the operator's MacBook, driven by `safaridriver` (WebDriver, from a standard-library client), with `purestat.ai` blocked in the VM's `/etc/hosts`. Production's viewer, nothing served into the page, against a fresh vmtest Win11 `--type system` guest on the released 0.4.142 (`vmtest-w-ins-sys-224044`). The page's `RTCPeerConnection` was wrapped before Connect so its `getStats()` could be read | **Safari connects, on an ECDHE-GCM suite.** "connected" one second after Connect. The transport read `dtlsState: connected`, `dtlsCipher: TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` (`c02b`) and `tlsVersion: FEFD` (DTLS 1.2), with Safari the DTLS server (the agent is the client, as for the others). Media: H.264 at 1280×800, 167 frames decoded in the first 12 s of a static desktop, the `<video>` clock advancing, and all five data channels open. The pair was srflx to srflx over UDP, 41 ms round trip. Safari's own screenshot shows the guest's desktop in the viewer. The SRTP profile Safari chose was `AES_CM_128_HMAC_SHA1_80`; that is not this criterion's (it is about the DTLS suites), and is recorded only. **Wrong turn:** the first run clicked Connect through WebDriver, and the click never returned (and wedged `safaridriver` until the VM was deleted). The likely cause, not observed directly: a WebDriver click is a trusted gesture, and inside one Safari answers the viewer's clipboard read with its native "Paste" callout, which nobody can answer in an automated session. The second run clicked Connect from a script, which carries no gesture (WebRTC does not need one), and connected at once. The guest was destroyed by name afterwards and its row removed |
 
 ## 9. Related
 
