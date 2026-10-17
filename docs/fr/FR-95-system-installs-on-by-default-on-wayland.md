@@ -1,6 +1,8 @@
 # FR-95: A system install shows a Wayland desktop by default, once the person at the screen can see it on every distro
 
-**Issue:** [#2041](https://github.com/gjovanov/roomler-ai/issues/2041) · **Status:** P1 delivered by FR-93 P6d–P6g; **P2 lab-verified 2026-10-15** (GNOME 50 and Plasma 6.7, system installs), on its release next; proposed 2026-10-12 · **Owner:** remote desktop (agent),
+**Issue:** [#2041](https://github.com/gjovanov/roomler-ai/issues/2041) · **Status:** P1 delivered by FR-93 P6d–P6g; P2 lab-verified 2026-10-15; **P2 verified on the released 0.4.141**
+2026-10-17 (GNOME 50 and Plasma 6.7 system installs: AC1–AC4 and AC7 ticked; both kill switches pass; AC5's
+X11 half and AC6's "before" count owed); proposed 2026-10-12 · **Owner:** remote desktop (agent),
 consent surfaces (FR-27) · **Split from:** [FR-93](FR-93-wayland-out-of-the-box.md) (its AC2, re-worded the same
 day) · **Builds on:** [FR-36](FR-36-wayland-capture.md) (DRM + uinput), [FR-27](FR-27-consent-surfaces-and-desktop-companion.md)
 (the companion and the prompt-surface chain), FR-93 P2b (the hello's desktop brief, to measure who this serves)
@@ -116,18 +118,37 @@ the person who was told is back. Their own new viewer session re-plans, and tell
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1**: a default **system** install on GNOME 50 Wayland, no keys, with a prompt surface: the viewer shows
+- [x] **AC1**: a default **system** install on GNOME 50 Wayland, no keys, with a prompt surface: the viewer shows
   the real desktop, and the person at the screen sees the banner and can Disconnect. Red on the release before P2
   first (`wayland_not_enabled`).
-- [ ] **AC2**: the same on Plasma 6.7 (Fedora 44), whose surface is P1's.
-- [ ] **AC3**: a system install with **no** surface: unchanged, `wayland_not_enabled`, and the hint names the missing
+  ✅ Red on 0.4.137 (§8); green on the released **0.4.141** (2026-10-17): the picture at +10 s (`lit=91.5 %`),
+  and the companion's banner *Being viewed by vmtest admin · Disconnect* on the guest's screen (QMP).
+- [x] **AC2**: the same on Plasma 6.7 (Fedora 44), whose surface is P1's.
+  ✅ On the released 0.4.141: the picture (`lit=81.0 %`), and KDE's notification *This screen is being viewed* with
+  **Disconnect** (QMP).
+- [x] **AC3**: a system install with **no** surface: unchanged, `wayland_not_enabled`, and the hint names the missing
   surface rather than only the keys.
-- [ ] **AC4**: the greeter and a locked session are never captured by default (`user` sessions only), shown with
+  ✅ On the released 0.4.141 with `ROOMLERD_VIEWING_NOTICE=0`: `wayland_not_enabled`, and the hint says *"…not
+  captured by itself because nobody at the screen could be told they are being viewed: the session on screen has
+  no desktop companion and no notification service. Install the desktop companion…"*.
+- [x] **AC4**: the greeter and a locked session are never captured by default (`user` sessions only), shown with
   QMP on both lab desktops.
+  ✅ On the released 0.4.141, both desktops: at a lock the guard read nothing (QMP: GNOME's blanked lock screen,
+  KDE's lock screen), and the lifecycle harness passed lock, unlock, logout and login 4/4 on each. The
+  greeter was never read. One mostly black transition frame reached the viewer just after GNOME's logout, before
+  the guard flipped (§8).
 - [ ] **AC5**: either kill switch gives back the behaviour before this FR exactly, and X11 hosts are unchanged.
+  ⏳ Both kill switches pass on the released 0.4.141 (`wayland_auto_system = false` on both desktops,
+  `wayland_auto = false` on GNOME): 0.4.137's overlay, word for word. X11 is unchanged by construction (the plan
+  needs a Wayland session on screen), but no X11 host has been run. Owed: one.
 - [ ] **AC6**: P0's counts recorded before and after the roll (the server, not an exec sweep).
-- [ ] **AC7**: Docs: `docs/linux-capture.md` and `docs/desktop-companion.md` updated in the house style, and the
+  ⏳ **After** (prod, 2026-10-17 19:03Z, §8): no customer device answers `none` on Wayland. **Before** was never
+  snapshotted at the 0.4.139 roll; the devices still on older versions are what is left of it, and none of them
+  answers `none` either.
+- [x] **AC7**: Docs: `docs/linux-capture.md` and `docs/desktop-companion.md` updated in the house style, and the
   `docs/README.md` index row.
+  ✅ `linux-capture.md` §1.2.1 (the plan, its mermaid, the guard, the kill switches), `desktop-companion.md`
+  (the four Linux packages, the being-viewed notification), and `docs/README.md`'s rows for both, on master.
 
 ## 6. Open decisions (operator)
 
@@ -159,3 +180,6 @@ the person who was told is back. Their own new viewer session re-plans, and tell
 | 2026-10-15 | candidate `8718f5258` | `wlab-kde-sys`, rebooted: the same plan | 🟢 **the fix, PASS 4/4.** The viewer's move during the lock (22:04:03.898) opened the automatic uinput, which said *dropping input while the person's session is not on screen, unlocked*; the unlock at 22:04:28.892, the picture +0.8 s; the move after it, *injecting again, the person's session is on screen* (22:04:49.019) |
 | 2026-10-16 | candidate `83af5cce2` (master + FR-93 P4c, built natively on the host) | **real hardware**: FR-93 AC12's Apple M2 Pro Mac mini (Fedora Asahi Remix 42), a system install by the served `install.sh --system`, no capture key, Plasma 6.6 then GNOME 48 | 🟢 **KDE**: *"switched on by itself for the person's session on screen"*, a picture at +4 s; the lifecycle harness PASS 4/4 (lock: the system install's sentence +3.5 s and nothing read; unlock +0.7 s; logout +5.5 s; login withheld, by design). 🟢 **GNOME**: a picture at +4 s, the input oracle 8/8 through the automatic uinput, the cursor in the stream, and the same lifecycle PASS 4/4 |
 | 2026-10-16 | **0.4.139, the release** (the service's binary checked: `/usr/bin/roomlerd`) | real hardware (FR-93 AC12's box), the served `install.sh --system`, no capture key, Plasma 6.6 then GNOME 48 | 🟢 **KDE**: *switched on by itself*; the input oracle 8/8, twice, through the automatic uinput; the cursor in the DRM stream; the lifecycle harness 4/4 (locked and away named, nothing read). 🟢 **GNOME**: the same: 8/8, the cursor, 4/4. ⚠️ The first runs measured a lab build that a leftover unit drop-in still started; they were re-run on the release. ⚠️ GNOME's post-login overview took one oracle's input (the lab, not the product: reproduced on purpose, and libinput's trace showed every event delivered). **Still owed for the ticks:** the lab's GNOME 50 and Plasma 6.7 guests on the release |
+| 2026-10-17 | **0.4.141, the release**: the guest self-updated (`roomlerd self-update`, the service's running binary checked), and its companion updated to the release's `roomler-desktop` 0.4.141 `.deb` (sha256 checked) | `wlab-gnome-sys` (GNOME 50, Ubuntu 26.04, system install, no capture key) | 🟢 **AC1**: the picture at +10 s (`lit=91.5 %`), the pill *DRM scanout · asks nobody*; `capture: backend=drm, switched on by itself for the person's session on screen…` and `being viewed: the companion's banner says so`; QMP shows the banner *Being viewed by vmtest admin · keyboard + mouse* with **Disconnect** (and the 0.4.141 companion's first-run tour). 🟢 **AC3** (`ROOMLERD_VIEWING_NOTICE=0` in a unit drop-in, removed after): `wayland_not_enabled`, and the overlay names the missing surface (AC3's quote). 🟢 **AC4**: `loginctl lock-sessions` → the guard `locked=true`, nothing read, the viewer told *Waiting for this computer's screen to be unlocked*; QMP: the display blanked. The lifecycle harness, lock / unlock / logout / login: **PASS 4/4**; after the logout the guard read nothing from +1.4 s (`guard=Away`), the viewer told *This computer is showing another session* at +4.0 s. ⚠️ One frame reached the viewer at +1.85 s, before the guard's flip: mostly black, a few dim cells top-left (a console's text), not the greeter. 🟢 **AC5**: `wayland_auto_system = false` and, separately, `wayland_auto = false` each give 0.4.137's overlay word for word, `lit=0.0 %`, `reach="none"` |
+| 2026-10-17 | 0.4.141, the release (`roomlerd self-update` installed the tarball's binary; the running daemon kept the old one until a restart, as a self-update run from the CLI does) | `wlab-kde-sys` (Plasma 6.7, Fedora 44, system install, no capture key, no companion) | 🟢 **AC2**: the picture at +10 s (`lit=81.0 %`), *DRM scanout · asks nobody*; `being viewed: a notification says so, with Disconnect`; QMP shows KDE's popup *This screen is being viewed — vmtest admin is viewing this screen and can use its keyboard and mouse. Disconnect ends the session.* with **Disconnect**. 🟢 **AC4**: the lock → `locked=true`, nothing read (QMP: KDE's lock screen); the lifecycle harness, lock / unlock / KDE's own logout / login: **PASS 4/4**, the logout named *showing another session* at +5.9 s with nothing new read. 🟢 **AC5**: `wayland_auto_system = false` → 0.4.137's overlay. ⚠️ The lab's `p2d3` spec first failed *"never reported online"*: it read one page of the device listing (25 rows of 41); 22 lab spec copies now ask for 100 |
+| 2026-10-17 19:03Z | — | the fleet: prod's `agents`, each device's stored desktop brief (`capabilities.desktop`) | **AC6, after the roll.** Customer orgs: Wayland **4** (DRM 3: two on 0.4.135 with the keys set by hand, one on 0.4.141 switched on by itself; mutter 1, on 0.4.132), no desktop 8 (headless), **none answering `none`**. The lab org: DRM 2, mutter 4, portal 1, and 1 answering `none` (`wlab-gnome-sys` mid-AC3, its notice switched off on purpose). 54 devices send no brief (Windows, macOS, older agents). ⚠️ The "before" count was not taken at the 0.4.139 roll. What is left of it is the devices still on older versions, and none of them answers `none`. As far as the server can see, this FR shipped ahead of its users: the population it serves was the lab |
