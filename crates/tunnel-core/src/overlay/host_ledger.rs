@@ -170,6 +170,21 @@ pub struct PinRecord {
     pub onlink: bool,
 }
 
+/// FR-97 P1b — one pf serve on a Mac: our anchor, every reference token we took
+/// with `pfctl -E`, and whether forwarding was off before we turned it on. The
+/// purge flushes the anchor, releases the tokens (pf goes back to disabled if
+/// nothing else holds it), and puts forwarding back unless Internet Sharing runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PfRecord {
+    pub anchor: String,
+    #[serde(default)]
+    pub tokens: Vec<u64>,
+    #[serde(default)]
+    pub v4_was_off: bool,
+    #[serde(default)]
+    pub v6_was_off: bool,
+}
+
 /// What this daemon changed on the host and has not yet undone; persisted,
 /// what the boot purge must undo.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,11 +203,18 @@ pub struct HostLedger {
     /// Windows it can stand in the way of Docker's or WSL's own NAT.
     #[serde(default)]
     pub nat: Vec<String>,
+    /// FR-97 P1b — the pf serves a Mac router or exit set up and had not yet
+    /// taken back out, one per overlay adapter.
+    #[serde(default)]
+    pub pf: Vec<PfRecord>,
 }
 
 impl HostLedger {
     pub fn is_empty(&self) -> bool {
-        self.forwarding.is_empty() && self.pins.is_empty() && self.nat.is_empty()
+        self.forwarding.is_empty()
+            && self.pins.is_empty()
+            && self.nat.is_empty()
+            && self.pf.is_empty()
     }
 
     /// Record `pin`, replacing any earlier record for the same address.
@@ -215,6 +237,7 @@ static LEDGER: Mutex<HostLedger> = Mutex::new(HostLedger {
     forwarding: Vec::new(),
     pins: Vec::new(),
     nat: Vec::new(),
+    pf: Vec::new(),
 });
 
 /// FR-97 P0b-2c — a WinNAT instance name a router of ours creates:
@@ -249,7 +272,23 @@ pub(crate) fn forget_nat(names: &[String]) {
     with_ledger(|l| l.nat.retain(|n| !names.contains(n)));
 }
 
-#[cfg(any(windows, feature = "overlay-l3"))]
+/// FR-97 P1b — a pf serve is in (or took another token): record it before
+/// anything can kill the daemon. One record per anchor.
+#[cfg(target_os = "macos")]
+pub(crate) fn record_pf(r: PfRecord) {
+    with_ledger(|l| {
+        l.pf.retain(|p| p.anchor != r.anchor);
+        l.pf.push(r);
+    });
+}
+
+/// FR-97 P1b — a pf serve is out.
+#[cfg(target_os = "macos")]
+pub(crate) fn forget_pf(anchor: &str) {
+    with_ledger(|l| l.pf.retain(|p| p.anchor != anchor));
+}
+
+#[cfg(any(windows, target_os = "macos", feature = "overlay-l3"))]
 fn with_ledger(f: impl FnOnce(&mut HostLedger)) {
     let mut ledger = LEDGER.lock().unwrap_or_else(|e| e.into_inner());
     f(&mut ledger);
@@ -303,6 +342,7 @@ pub fn purge() {
     }
     super::nat::remove_nat_instances(&on_disk.nat);
     super::nat::restore_forwarding_guids(&on_disk.forwarding);
+    super::pf::purge(&on_disk.pf);
     #[cfg(feature = "overlay-l3")]
     super::tun::purge_pins(&on_disk.pins);
     *LEDGER.lock().unwrap_or_else(|e| e.into_inner()) = HostLedger::default();
@@ -640,23 +680,40 @@ mod tests {
                 pin("2a01:4f8::1", "fe80::1%en0"),
             ],
             nat: vec!["roomler-overlay".into()],
+            pf: vec![PfRecord {
+                anchor: "com.apple/roomler-utun4".into(),
+                tokens: vec![13889181449326457865],
+                v4_was_off: true,
+                v6_was_off: false,
+            }],
         };
         let back: HostLedger = serde_json::from_slice(&serde_json::to_vec(&l).unwrap()).unwrap();
         assert_eq!(back, l);
         let empty: HostLedger = serde_json::from_str("{}").unwrap();
         assert!(empty.is_empty());
-        // A ledger written by P0b-2b, before pins and NAT names existed,
+        // A ledger written by P0b-2b, before pins, NAT names and pf existed,
         // still reads.
         let old: HostLedger =
             serde_json::from_str(&format!("{{\"forwarding\":[\"{GUID_A}\"]}}")).unwrap();
         assert_eq!(old.forwarding, vec![GUID_A.to_string()]);
-        assert!(old.pins.is_empty() && old.nat.is_empty());
+        assert!(old.pins.is_empty() && old.nat.is_empty() && old.pf.is_empty());
         // A NAT name alone keeps the ledger (and its purge) alive.
         let nat_only = HostLedger {
             nat: vec!["roomler-overlay".into()],
             ..HostLedger::default()
         };
         assert!(!nat_only.is_empty());
+        // FR-97 P1b — so does a pf serve, and one written with only its anchor
+        // reads with no tokens and forwarding left alone.
+        let pf_only = HostLedger {
+            pf: l.pf.clone(),
+            ..HostLedger::default()
+        };
+        assert!(!pf_only.is_empty());
+        let bare: HostLedger =
+            serde_json::from_str("{\"pf\":[{\"anchor\":\"com.apple/roomler-utun4\"}]}").unwrap();
+        assert_eq!(bare.pf[0].tokens, Vec::<u64>::new());
+        assert!(!bare.pf[0].v4_was_off && !bare.pf[0].v6_was_off);
     }
 
     /// FR-97 P0b-2c — only an instance named like ours is ever removed, and

@@ -65,6 +65,8 @@ pub mod netstate;
 /// holds session state.
 pub mod orgrelay;
 pub(crate) mod path;
+/// FR-97 P1b — a Mac serves as an exit or subnet router through pf.
+pub(crate) mod pf;
 pub mod relay_link;
 pub mod router;
 pub mod runtime;

@@ -368,9 +368,9 @@ AC17 field cells (released 0.4.134, then a P0e candidate; FR-97 §8):
 | **Client**: v4 egress through an exit | ✓ | ✓ | ✓ (FR-97 P1a) |
 | **Client**: v6 egress through an exit | ✓ | ✓ | ✓ when the uplink has v6, else **fail-closed** |
 | **Client**: `/32`/`/128` exemptions | `ip route replace … [onlink]`, re-pinned when the uplink moves (FR-97 P0e) | IP Helper route via the uplink's gateway, re-pinned when the uplink moves (FR-97 P0e) | `route -n add/change -host`, read back, re-pinned when the uplink moves ([below](#macos-client-fr-97-p1a)) |
-| **Client**: DNS steering | `resolvectl … ~.` | NRPT `.`-root rule | ✗ not yet (FR-97 P1c): `roomler status` says `DNS NOT steered` |
-| **Exit**: v4 egress + NAT | iptables MASQUERADE | WinNAT, which needs the Hyper-V feature; without it (always on Home) the offer is withheld (#2077) | ✗ not yet (FR-97 P1b): the offer is withheld |
-| **Exit**: v6 egress + NAT | ip6tables MASQUERADE | ✗ → v6 **fail-closed** | ✗ |
+| **Client**: DNS steering | `resolvectl … ~.` | NRPT `.`-root rule | a temporary SCDynamicStore catch-all key (FR-97 P1c) |
+| **Exit**: v4 egress + NAT | iptables MASQUERADE | WinNAT, which needs the Hyper-V feature; without it (always on Home) the offer is withheld (#2077) | pf, in our own anchor under `com.apple/*` (FR-97 P1b, [below](#macos-exit-fr-97-p1b)); root daemon only |
+| **Exit**: v6 egress + NAT | ip6tables MASQUERADE | ✗ → v6 **fail-closed** | pf NAT66 to a stable global address, where an unscoped v6 default exists; else v6 **fail-closed** |
 
 A device that cannot serve as an exit advertises nothing and says why, in
 `roomler status` and in the admin routes table (FR-97 P0b), rather than
@@ -459,6 +459,55 @@ sequenceDiagram
 > with *"Nexthop has invalid gateway"* and the exit stays permanently withheld.
 > The agent captures and propagates the flag from the discovered default route
 > (fixed after it bit a Hetzner field-test).
+
+### macOS exit (FR-97 P1b)
+
+A Mac serves as an exit node or subnet router through **pf**, the macOS twin of
+the iptables arm. Its rules live in our own anchor, one per overlay adapter,
+under the stock `com.apple/*` wildcard that `/etc/pf.conf` already evaluates,
+so `pf.conf` is never edited (`crates/tunnel-core/src/overlay/pf.rs`).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as overlay runtime
+    participant P as pf.rs
+    participant K as pf + sysctl
+    participant L as host ledger
+    R->>P: probe, before the first join
+    P->>K: pfctl -s nat
+    K-->>P: nat-anchor "com.apple/*" (the stock ruleset)
+    P-->>R: Ok, so /0 and the subnet routes are offered
+    R->>P: serve(utunN, the overlay's blocks)
+    P->>K: forwarding on (what it was is recorded)
+    P->>K: pfctl -a com.apple/roomler-utunN -f - (a nat per egress, pass utunN)
+    P->>K: pfctl -E
+    K-->>P: Token : N
+    P->>L: anchor, tokens, what forwarding was
+    loop every 30 s
+        P->>K: re-assert: flushed by someone? pf disabled? interfaces changed?
+    end
+    R->>P: stop (the guard's Drop)
+    P->>K: flush the anchor, pfctl -X each token, forwarding back
+    P->>L: forget
+```
+
+| Step | Why |
+|---|---|
+| Our own anchor | `/etc/pf.conf` stays untouched: a fresh boot loads the stock ruleset with pf **disabled**, and it references `com.apple/*` |
+| `pfctl -E`, then `-X <token>` | a reference token: releasing ours turns pf off only if nothing else holds it. Never `pfctl -d`, which would turn it off under Internet Sharing or a VPN client |
+| A `nat` per egress | every `en*` interface with an IPv4 address, plus a default route's interface that is not a tunnel, because Linux's MASQUERADE has no `-o` either. Never another VPN's utun: NAT onto it would hand every peer a path into whatever that VPN reaches |
+| v6 | `nat … inet6 … -> <stable global address>`: for `inet6`, `(if)` round-robins over every address of the interface, link-local included. Served only where an unscoped v6 default exists; elsewhere a client's v6 stays fail-closed at the exit |
+| Forwarding | `net.inet.ip.forwarding` (and the v6 one) is turned on, and put back as found by the last org guard to stop, unless Internet Sharing is running: it needs forwarding too |
+| The ledger | a crash skips `Drop`, so the boot purge flushes the anchor, releases the tokens and puts forwarding back |
+
+> ⚠️ **Root only.** `pfctl` needs root, so a per-user daemon's probe refuses
+> and the Mac offers nothing, with the reason in `roomler status` and the admin
+> routes table (FR-97 P0b). `ROOMLERD_PF_NAT=0` refuses the same way.
+
+> ⚠️ **Still unmeasured:** what the common corporate VPN clients do to pf, and
+> the Application Firewall's stealth mode on forwarded flows (FR-97 §3.5). The
+> re-assert loop restores our anchor after a `pfctl -F all`, and pf after a `-d`.
 
 ## Caveats & gotchas
 
