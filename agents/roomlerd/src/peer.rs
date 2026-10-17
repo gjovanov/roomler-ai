@@ -12395,7 +12395,22 @@ async fn audio_pump(
     use crate::audio;
     use crate::audio_source::{AudioUnavailable, AudioUnavailableCode};
 
-    let mut capture = match audio::open_default() {
+    // FR-97 P3c-2 — a Linux open can wait on a sound server or on the seat
+    // user's helper (up to `audio::pulse`'s 8 s), so it runs off the runtime.
+    // Windows keeps the inline open: its WASAPI stream is created, used and
+    // dropped on one task (see `CpalLoopbackCapture`'s `Send`).
+    #[cfg(target_os = "linux")]
+    let opened = tokio::task::spawn_blocking(audio::open_default)
+        .await
+        .unwrap_or_else(|e| {
+            Err(AudioUnavailable::new(
+                AudioUnavailableCode::BackendError,
+                format!("the audio open did not finish: {e}"),
+            ))
+        });
+    #[cfg(not(target_os = "linux"))]
+    let opened = audio::open_default();
+    let mut capture = match opened {
         Ok(c) => c,
         Err(reason) => {
             spawn_audio_unavailable_notice(session_id, control_dc, reason);

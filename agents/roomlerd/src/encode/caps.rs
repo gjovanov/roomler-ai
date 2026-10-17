@@ -640,12 +640,15 @@ pub(crate) struct HostFacts {
     /// This host can capture the computer's own sound:
     ///
     /// - Windows: always (WASAPI loopback).
-    /// - Linux: only when the host's owner named a capture device
-    ///   (`ROOMLERD_AUDIO_SOURCE`). FR-97 P3c: cpal sees no sound server's
-    ///   sources, and the default input it fell back to is a microphone
-    ///   (`crate::audio_source`).
+    /// - Linux: when `audio_source::linux_route` finds a way to it: the
+    ///   default output's monitor through Pulse's client library (FR-97
+    ///   P3c-2), or a capture device the owner named. Never the default input,
+    ///   which is a microphone (P3c-1).
     /// - macOS: never, until FR-97 P2a.
     pub(crate) audio_backend: bool,
+    /// Linux: why there is no way to the computer's sound, by the route's own
+    /// code ([`linux_audio_refusal`]). `None` elsewhere, and where there is one.
+    pub(crate) linux_audio_refusal: Option<crate::audio_source::AudioUnavailableCode>,
     /// The clipboard watcher reports copied images: Windows only
     /// (`clipboard::install_watcher` drops image events elsewhere).
     pub(crate) watches_clipboard_images: bool,
@@ -656,6 +659,7 @@ pub(crate) struct HostFacts {
 impl HostFacts {
     pub(crate) fn here() -> Self {
         use roomler_ai_remote_control::models::OsKind;
+        let linux_audio_refusal = linux_audio_refusal();
         Self {
             os: if cfg!(target_os = "windows") {
                 OsKind::Windows
@@ -666,10 +670,51 @@ impl HostFacts {
             },
             audio_built: cfg!(feature = "audio"),
             audio_backend: cfg!(target_os = "windows")
-                || (cfg!(target_os = "linux") && crate::audio_source::named().is_some()),
+                || (cfg!(target_os = "linux") && linux_audio_refusal.is_none()),
+            linux_audio_refusal,
             watches_clipboard_images: cfg!(target_os = "windows"),
             clipboard_reachable: clipboard_reachable(),
         }
+    }
+}
+
+/// FR-97 P3c-2 — Linux: why a session could not reach the computer's sound,
+/// by the route the capture itself takes, or `None` when it can. Asked of the
+/// disk (`audio::pulse::present`): the hello loads no library to answer.
+fn linux_audio_refusal() -> Option<crate::audio_source::AudioUnavailableCode> {
+    #[cfg(all(target_os = "linux", feature = "audio"))]
+    {
+        use crate::audio_source::{linux_facts, linux_route};
+        linux_route(linux_facts(crate::audio::pulse::present()))
+            .err()
+            .map(|r| r.code)
+    }
+    #[cfg(not(all(target_os = "linux", feature = "audio")))]
+    {
+        None
+    }
+}
+
+/// FR-97 P3c — the hello's word for a Linux host with no way to the computer's
+/// sound, by why. Before P3c-1 this track carried the microphone.
+fn linux_audio_word(
+    why: Option<crate::audio_source::AudioUnavailableCode>,
+) -> roomler_ai_remote_control::models::Unavailable {
+    use crate::audio_source::AudioUnavailableCode as Why;
+    use roomler_ai_remote_control::models::Unavailable;
+    match why {
+        Some(Why::NoSoundServer) => Unavailable::new(
+            "no-sound-server",
+            "This host sends no sound: it has no Pulse client library (libpulse-simple), so the agent cannot reach its sound server",
+        ),
+        Some(Why::NoSession) => Unavailable::new(
+            "no-session",
+            "This host sends no sound: the agent runs as root without the session helper that records a session's sound",
+        ),
+        _ => Unavailable::new(
+            "no-monitor",
+            "This host sends no sound: session audio is switched off on it (ROOMLERD_AUDIO_SESSION=0), and no capture device is named for it (ROOMLERD_AUDIO_SOURCE)",
+        ),
     }
 }
 
@@ -703,11 +748,7 @@ pub(crate) fn with_honest_words(mut caps: AgentCaps, facts: &HostFacts) -> Agent
         // Without a backend the session would carry a silent track (R1).
         caps.audio.clear();
         let why = match facts.os {
-            // FR-97 P3c-1 — before it, this track carried the microphone.
-            OsKind::Linux => Unavailable::new(
-                "no-monitor",
-                "This host sends no sound: a session carries what the computer plays, never its microphone, and this Linux agent cannot capture the computer's sound until a capture device is named for it (ROOMLERD_AUDIO_SOURCE)",
-            ),
+            OsKind::Linux => linux_audio_word(facts.linux_audio_refusal),
             OsKind::Windows | OsKind::Macos => Unavailable::new(
                 "no-backend",
                 "System-audio capture is not implemented on this OS yet, so this host sends no sound",
@@ -2501,6 +2542,7 @@ mod tests {
             os,
             audio_built: true,
             audio_backend: true,
+            linux_audio_refusal: None,
             watches_clipboard_images: true,
             clipboard_reachable: true,
         }
@@ -2533,27 +2575,31 @@ mod tests {
             mac.audio
         );
         assert_eq!(mac.unavailable["audio"].code, "no-backend");
-        // A Linux host with a capture device named for it.
+        // A Linux host with a way to the computer's sound.
         let linux = with_honest_words(p0c_caps(), &p0c_facts(OsKind::Linux));
         assert_eq!(linux.audio, vec!["opus".to_string()]);
         assert!(!linux.unavailable.contains_key("audio"));
-        // FR-97 P3c-1 — and without one: no track, rather than the microphone
-        // every Linux session carried before (measured 2026-10-17).
-        let unnamed = with_honest_words(
-            p0c_caps(),
-            &HostFacts {
-                audio_backend: false,
-                ..p0c_facts(OsKind::Linux)
-            },
-        );
-        assert!(unnamed.audio.is_empty(), "{:?}", unnamed.audio);
-        assert_eq!(unnamed.unavailable["audio"].code, "no-monitor");
-        assert!(
-            unnamed.unavailable["audio"]
-                .reason
-                .contains("ROOMLERD_AUDIO_SOURCE"),
-            "the reason names the setting that fixes it"
-        );
+        // FR-97 P3c — and without one: no track, rather than the microphone
+        // every Linux session carried before (measured 2026-10-17), and the
+        // route's own reason.
+        use crate::audio_source::AudioUnavailableCode as Why;
+        for (why, code, names) in [
+            (Why::NoMonitor, "no-monitor", "ROOMLERD_AUDIO_SESSION=0"),
+            (Why::NoSoundServer, "no-sound-server", "libpulse-simple"),
+            (Why::NoSession, "no-session", "session helper"),
+        ] {
+            let c = with_honest_words(
+                p0c_caps(),
+                &HostFacts {
+                    audio_backend: false,
+                    linux_audio_refusal: Some(why),
+                    ..p0c_facts(OsKind::Linux)
+                },
+            );
+            assert!(c.audio.is_empty(), "{why:?}: {:?}", c.audio);
+            assert_eq!(c.unavailable["audio"].code, code, "{why:?}");
+            assert!(c.unavailable["audio"].reason.contains(names), "{why:?}");
+        }
         // A build without the feature had nothing to claim, and says nothing.
         let none = with_honest_words(
             AgentCaps {
@@ -2633,6 +2679,7 @@ mod tests {
                         os,
                         audio_built: true,
                         audio_backend: false,
+                        linux_audio_refusal: None,
                         watches_clipboard_images: false,
                         clipboard_reachable: reachable,
                     },
@@ -2655,8 +2702,14 @@ mod tests {
         if cfg!(target_os = "windows") {
             assert!(f.audio_backend, "WASAPI loopback");
         } else if cfg!(target_os = "linux") {
-            // FR-97 P3c-1: only a named capture device is the computer's sound.
-            assert_eq!(f.audio_backend, crate::audio_source::named().is_some());
+            // FR-97 P3c: a way to the computer's sound, and a reason exactly
+            // when there is none.
+            assert_eq!(
+                f.audio_backend,
+                f.linux_audio_refusal.is_none(),
+                "{:?}",
+                f.linux_audio_refusal
+            );
         } else {
             assert!(!f.audio_backend, "macOS until FR-97 P2a");
         }

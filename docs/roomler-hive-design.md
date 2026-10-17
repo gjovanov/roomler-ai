@@ -220,7 +220,7 @@ v0.2 also put the node side in a second binary, `hived`, supervised by `roomlerd
 doubles the signing, updater and installer couplings on every platform and contradicts
 "one daemon per machine". The node side is a cargo feature of `roomlerd`. Its
 user-level half is `roomlerd hive-host`, re-exec'd as the user the way `portal-helper`
-and `record` already are (`agents/roomlerd/src/main.rs:203,333`), so it ships, signs
+and `record` already are (`agents/roomlerd/src/main.rs:203,339`), so it ships, signs
 and updates with the daemon.
 
 ### 3.2 Who runs as what
