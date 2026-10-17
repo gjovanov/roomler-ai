@@ -3461,6 +3461,21 @@ async fn an_unreachable_primary_is_waited_out_then_moved_away_from_with_no_drain
         mm["state"] == "joined" && mm["tip"]["seq"] == 9
     })
     .await;
+    // P2k-5 — the room says how many of A's events did not carry over: the
+    // four it wrote past where fence 1 ended. Once: the same tip again adds
+    // nothing.
+    let tail = wait_note(&app, &m, "did not carry over").await;
+    assert!(
+        tail.len() == 1 && tail[0].contains("holds 4 events it wrote after the session moved on"),
+        "{tail:?}"
+    );
+    send(&mut m.a.ws, tip_at(&sid, 1, 9, "ff")).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        notes_with(&app, &m, "did not carry over").await.len(),
+        1,
+        "said once"
+    );
 
     // B goes too, before A followed it. A holds fence 1 up to its end, more
     // than C: C yields. A's copy runs past that end: never moved to.
