@@ -796,8 +796,16 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
 - [ ] **AC14 (P5):** the webhook refuses a bad signature (control) and records `delivered` and `bounce` for
   a test send with one forced bounce; that address is suppressed at the next send; SendGrid's open and
   click tracking read off.
-- [ ] **AC15 (P5):** in a rendered issue, every link except the unsubscribe link is byte-identical for two
+- [x] **AC15 (P5):** in a rendered issue, every link except the unsubscribe link is byte-identical for two
   recipients (the footer's promise, as a test).
+  *(A test criterion. Master CI run 39014055189 on `bfc38e95a`, job "Rust unit tests (server + crates)",
+  2026-10-17 07:55Z:
+  `newsletter_send::tests::every_link_but_the_unsubscribe_link_is_byte_identical_for_two_recipients ... ok`.
+  The test renders one issue once, exactly as `run_send` does, and composes it for two recipients. It
+  asserts that exactly one link differs: the unsubscribe link, which names the issue for both. With that
+  link taken out, the two bodies are the same bytes. The links to this site carry the issue's tags and no
+  other link does. The headers and custom args carry nothing per recipient. Any per-recipient link fails
+  it.)*
 - [x] **AC16 (P6):** the Campaigns table's visitors for a closed day equal purestat's own number for the
   same filter; with the key revoked the cells read "not measured" (control).
   *(2026-10-15 on `hosted-20261015-cb26a2f`: for 2026-10-13 by `content`, the row `{linkedin, post,
