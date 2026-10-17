@@ -20,7 +20,10 @@
 //!   A relative device would force us to track the pointer and guess at
 //!   acceleration; an absolute one (`ABS_X`/`ABS_Y` over a fixed 0..=32767
 //!   range, the convention for tablets) lands exactly where asked, and the
-//!   compositor maps that onto whatever the screen currently is.
+//!   compositor maps that onto whatever the screen currently is. Relative
+//!   mode (FR-109 P2b) is the one exception: it carries movement, never a
+//!   position, through a second, relative-only pointer made on its first
+//!   frame (`open_rel_device`).
 //! - **HID usage → Linux keycode is an explicit table.** It cannot be
 //!   arithmetic: HID orders letters alphabetically (`0x04` = A) while Linux
 //!   keycodes follow the physical QWERTY row order (`KEY_Q` = 16, `KEY_A` = 30).
@@ -52,6 +55,8 @@ const EV_KEY: u16 = 0x01;
 const EV_REL: u16 = 0x02;
 const EV_ABS: u16 = 0x03;
 const SYN_REPORT: u16 = 0;
+const REL_X: u16 = 0x00;
+const REL_Y: u16 = 0x01;
 const REL_WHEEL: u16 = 0x08;
 const REL_HWHEEL: u16 = 0x06;
 const ABS_X: u16 = 0x00;
@@ -200,6 +205,10 @@ pub fn available() -> bool {
 
 pub struct UinputInjector {
     dev: File,
+    /// FR-109 P2b — a relative-only pointer beside the tablet, made on the
+    /// first `mouse_rel` and destroyed with the injector, so no second device
+    /// appears unless relative mode is used.
+    rel: Option<File>,
     /// Carried wheel remainder, so sub-detent scrolling accumulates instead of
     /// being truncated to nothing on every event.
     wheel_rem: (f32, f32),
@@ -350,6 +359,7 @@ impl UinputInjector {
 
         Ok(Self {
             dev,
+            rel: None,
             wheel_rem: (0.0, 0.0),
             warned_text: false,
             warned_touch: false,
@@ -369,6 +379,7 @@ impl UinputInjector {
     fn over(dev: File) -> Self {
         Self {
             dev,
+            rel: None,
             wheel_rem: (0.0, 0.0),
             warned_text: false,
             warned_touch: false,
@@ -381,27 +392,16 @@ impl UinputInjector {
         }
     }
 
+    /// As [`Self::over`], with a plain file standing in for the relative
+    /// pointer, so a test reads back what `mouse_rel` became.
+    #[cfg(test)]
+    fn with_rel(mut self, rel: File) -> Self {
+        self.rel = Some(rel);
+        self
+    }
+
     fn emit(&mut self, type_: u16, code: u16, value: i32) -> Result<()> {
-        let ev = InputEvent {
-            time: libc::timeval {
-                tv_sec: 0,
-                tv_usec: 0,
-            },
-            type_,
-            code,
-            value,
-        };
-        // SAFETY: `InputEvent` is #[repr(C)] and layout-compatible with the
-        // kernel's `struct input_event`; we write exactly its size.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &ev as *const InputEvent as *const u8,
-                std::mem::size_of::<InputEvent>(),
-            )
-        };
-        self.dev
-            .write_all(bytes)
-            .map_err(|e| anyhow!("uinput write: {e}"))
+        write_event(&mut self.dev, type_, code, value)
     }
 
     /// Publish the batch. evdev consumers act on the SYN_REPORT, not on the
@@ -420,11 +420,90 @@ impl UinputInjector {
 
 impl Drop for UinputInjector {
     fn drop(&mut self) {
-        // SAFETY: destroying the device we created, on our own fd.
+        // SAFETY: destroying the devices we created, on our own fds.
         unsafe {
+            if let Some(rel) = &self.rel {
+                libc::ioctl(rel.as_raw_fd(), ui_dev_destroy());
+            }
             libc::ioctl(self.dev.as_raw_fd(), ui_dev_destroy());
         }
     }
+}
+
+/// Write one event to a uinput device.
+fn write_event(dev: &mut File, type_: u16, code: u16, value: i32) -> Result<()> {
+    let ev = InputEvent {
+        time: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        type_,
+        code,
+        value,
+    };
+    // SAFETY: `InputEvent` is #[repr(C)] and layout-compatible with the
+    // kernel's `struct input_event`; we write exactly its size.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            &ev as *const InputEvent as *const u8,
+            std::mem::size_of::<InputEvent>(),
+        )
+    };
+    dev.write_all(bytes)
+        .map_err(|e| anyhow!("uinput write: {e}"))
+}
+
+/// FR-109 P2b — the relative-only pointer: `REL_X`/`REL_Y`, and buttons so
+/// udev and libinput take it for a mouse (spec §8, P0 (3): both GNOME and KDE
+/// add it as a pointer beside the tablet). It settles before it is returned,
+/// as the tablet does, so the first frame written to it reaches libinput.
+fn open_rel_device() -> Result<File> {
+    let dev = OpenOptions::new()
+        .write(true)
+        .open(UINPUT_PATH)
+        .map_err(|e| anyhow!("open {UINPUT_PATH}: {e}"))?;
+    let fd = dev.as_raw_fd();
+    // SAFETY: documented uinput setup calls on a fd we just opened; each
+    // argument is a plain integer or a #[repr(C)] struct matching the
+    // kernel's, and each return is checked.
+    unsafe {
+        for ev in [EV_KEY, EV_REL, EV_SYN] {
+            ck(
+                libc::ioctl(fd, ui_set_evbit(), ev as libc::c_int),
+                "SET_EVBIT rel",
+            )?;
+        }
+        for btn in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE] {
+            ck(
+                libc::ioctl(fd, ui_set_keybit(), btn as libc::c_int),
+                "SET_KEYBIT rel",
+            )?;
+        }
+        for rel in [REL_X, REL_Y] {
+            ck(
+                libc::ioctl(fd, ui_set_relbit(), rel as libc::c_int),
+                "SET_RELBIT rel",
+            )?;
+        }
+        let mut name = [0u8; 80];
+        let label = b"Roomler Virtual Pointer";
+        name[..label.len()].copy_from_slice(label);
+        let setup = UinputSetup {
+            id: InputId {
+                bustype: 0x03,
+                vendor: 0x1209,
+                product: 0x0002,
+                version: 1,
+            },
+            name,
+            ff_effects_max: 0,
+        };
+        ck(libc::ioctl(fd, ui_dev_setup(), &setup), "DEV_SETUP rel")?;
+        ck(libc::ioctl(fd, ui_dev_create()), "DEV_CREATE rel")?;
+    }
+    std::thread::sleep(settle());
+    info!("uinput: relative pointer made for relative mode (FR-109 P2b)");
+    Ok(dev)
 }
 
 fn ck(rc: libc::c_int, what: &str) -> Result<()> {
@@ -467,16 +546,45 @@ impl InputInjector for UinputInjector {
                 self.emit(EV_KEY, button_code(btn), 1)?;
                 self.sync()
             }
-            // FR-109 P2 — this device is an absolute tablet by design (the
-            // module docs); relative motion needs a second, relative-only
-            // device. Until then this agent never advertises `mouse-rel`, so
-            // a viewer that sends it anyway is told nothing and moves nothing.
-            InputMsg::MouseRel { .. } => {
-                if !self.warned_rel {
-                    self.warned_rel = true;
-                    warn!("uinput: relative motion is not implemented yet (FR-109 P2); dropped");
+            // FR-109 P2b — the tablet is absolute by design (the module docs),
+            // so relative motion goes through the relative-only pointer beside
+            // it, made on the first frame. libinput hands relative-pointer
+            // clients (a game camera) its unaccelerated deltas, which are the
+            // counts sent; the cursor follows the accelerated ones.
+            InputMsg::MouseRel { dx, dy } => {
+                if dx == 0 && dy == 0 {
+                    return Ok(());
                 }
-                Ok(())
+                if self.rel.is_none() {
+                    // A test injector writes to plain files and never makes a
+                    // real device (`with_rel` gives it one to read back).
+                    if cfg!(test) {
+                        return Ok(());
+                    }
+                    match open_rel_device() {
+                        Ok(rel) => self.rel = Some(rel),
+                        Err(e) => {
+                            if !self.warned_rel {
+                                self.warned_rel = true;
+                                warn!(
+                                    error = %format!("{e:#}"),
+                                    "uinput: the relative pointer did not open; relative motion dropped (FR-109 P2b)"
+                                );
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+                let Some(rel) = self.rel.as_mut() else {
+                    return Ok(());
+                };
+                if dx != 0 {
+                    write_event(rel, EV_REL, REL_X, dx)?;
+                }
+                if dy != 0 {
+                    write_event(rel, EV_REL, REL_Y, dy)?;
+                }
+                write_event(rel, EV_SYN, SYN_REPORT, 0)
             }
             InputMsg::MouseWheel { dx, dy, mode } => {
                 let scale = match mode {
@@ -704,11 +812,83 @@ mod tests {
         );
     }
 
-    /// FR-109 P2 — until the relative device exists, relative motion writes
-    /// nothing to the absolute tablet: no EV_ABS jump, no stray EV_REL.
+    /// FR-109 P2b — relative motion never touches the absolute tablet: no
+    /// EV_ABS jump, no stray EV_REL.
     #[test]
     fn relative_motion_writes_nothing_to_the_tablet() {
         assert_eq!(written(InputMsg::MouseRel { dx: 40, dy: 7 }), []);
+    }
+
+    /// Events as `(type, code, value)`.
+    type Events = Vec<(u16, u16, i32)>;
+
+    /// Decode what one plain file received.
+    fn read_back(mut file: File) -> Events {
+        use std::io::{Read, Seek};
+        let mut bytes = Vec::new();
+        file.rewind().expect("rewind");
+        file.read_to_end(&mut bytes).expect("read back");
+        bytes
+            .chunks_exact(std::mem::size_of::<InputEvent>())
+            .map(|ev| {
+                let n = |at: usize| u16::from_ne_bytes([ev[at], ev[at + 1]]);
+                (
+                    n(16),
+                    n(18),
+                    i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]),
+                )
+            })
+            .collect()
+    }
+
+    /// Inject into an injector with a relative pointer, both over plain files;
+    /// returns what (the tablet, the relative pointer) received.
+    fn written_rel(msgs: Vec<InputMsg>, auto_system: bool) -> (Events, Events) {
+        let tablet = tempfile::tempfile().expect("a temp file");
+        let rel = tempfile::tempfile().expect("a temp file");
+        let mut inj = UinputInjector::over(tablet.try_clone().expect("clone"))
+            .with_rel(rel.try_clone().expect("clone"));
+        inj.auto_system = auto_system;
+        for msg in msgs {
+            inj.inject(msg).expect("inject");
+        }
+        drop(inj);
+        (read_back(tablet), read_back(rel))
+    }
+
+    /// FR-109 P2b — relative motion goes to the relative pointer as `REL_X` /
+    /// `REL_Y` and one SYN per frame; a zero axis is left out and an all-zero
+    /// frame writes nothing.
+    #[test]
+    fn relative_motion_goes_to_the_relative_pointer() {
+        let (tablet, rel) = written_rel(
+            vec![
+                InputMsg::MouseRel { dx: 100, dy: -5 },
+                InputMsg::MouseRel { dx: 0, dy: 3 },
+                InputMsg::MouseRel { dx: 0, dy: 0 },
+            ],
+            false,
+        );
+        assert_eq!(tablet, []);
+        assert_eq!(
+            rel,
+            [
+                (EV_REL, REL_X, 100),
+                (EV_REL, REL_Y, -5),
+                (EV_SYN, SYN_REPORT, 0),
+                (EV_REL, REL_Y, 3),
+                (EV_SYN, SYN_REPORT, 0),
+            ]
+        );
+    }
+
+    /// FR-95 P2's rule holds for relative motion too: the automatic system
+    /// capture's injector drops it while nobody's session is on screen.
+    #[test]
+    fn the_automatic_injector_drops_relative_motion_off_screen() {
+        let (tablet, rel) = written_rel(vec![InputMsg::MouseRel { dx: 100, dy: 0 }], true);
+        assert_eq!(tablet, []);
+        assert_eq!(rel, []);
     }
 
     /// The control: a viewer's own button-up still positions first, in the
