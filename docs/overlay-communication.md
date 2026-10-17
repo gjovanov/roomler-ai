@@ -241,9 +241,12 @@ flowchart LR
 | macOS | `SO_RCVBUF` / `SO_SNDBUF`, stepping down 7 → 4 → 2 → 1 MiB | `kern.ipc.maxsockbuf`, which refuses a larger size outright |
 
 Measured into an M2 Pro Linux host over the overlay, 256 MiB from a server
-17 ms away: **116 / 128 Mbit/s with 455 / 623 drops** (`RcvbufErrors`) at the
-default, against **509 / 513 Mbit/s with none** at 7 MiB. CPU was ~1% on both
-ends both times.
+17 ms away: **116 / 128 Mbit/s with 455 / 623 drops** (`RcvbufErrors`) on
+0.4.140, against **516 / 543 Mbit/s with none** on the released 0.4.141. CPU was
+~1% on both ends both times. Windows and macOS grant the full 7 MiB to the plain
+option. A Windows receiver was not dropping at its default (UDP Receive Errors
+0), so it gains little: 416 → 435 Mbit/s, interleaved with the old build under
+one load.
 
 ⚠️ **Check the size with `ss`, not with a throughput test.** `ss -uampn` shows
 each socket's `rb`. Linux reports twice the request, so a carrier socket shows
@@ -253,6 +256,12 @@ buffers"*) whatever `RUST_LOG` says. The packaged Linux units set
 `RUST_LOG=roomlerd=info,warn`, which drops `tunnel_core` INFO, so the logger
 appends this one target on its own (`crates/agent-core/src/logging.rs:225`). On
 Windows that line is the only evidence of the size.
+
+⚠️ **A per-user Linux install gains nothing until the host allows it.** It runs
+without `CAP_NET_ADMIN`, so FORCE is refused. Under a distro-default
+`rmem_max` its carrier sockets stay at 416 KB (`rb425984`), and the daemon says
+so in a WARN line. Raise `net.core.rmem_max` and `net.core.wmem_max` to at least
+7340032 (persisted in `/etc/sysctl.d/`), or install the daemon system-wide.
 
 ⚠️ **A full buffer delays instead of dropping.** A queue builds only when the
 reader falls behind the arrival rate. Datagrams then wait rather than vanish,
@@ -796,9 +805,9 @@ feature.
 | **DERP** | buildhost↔fleet-host-2, both UDP **and** coturn-TCP blocked | **0 % loss, ~2.7 ms** |
 
 **Throughput (FR-110):** TCP over a direct carrier into an M2 Pro Linux host
-went from 116–128 Mbit/s to **509–513 Mbit/s**, with the receiver's drops from
-+455–623 per 256 MiB to none, once the carrier sockets asked for 7 MiB buffers
-(§2).
+went from 116–128 Mbit/s to **516–543 Mbit/s** on the released 0.4.141, with the
+receiver's drops from +455–623 per 256 MiB to none, once the carrier sockets
+asked for 7 MiB buffers (§2).
 
 Every tier in the cascade has now carried real WireGuard traffic between two
 genuinely separated hosts. The cascade is complete: there is no longer a network
