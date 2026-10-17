@@ -71,7 +71,7 @@ therefore **increased**.
    `age_over` cuts **fps** and issues an AIMD MD — which stops at the 1.5 Mbps floor.
 
 6. **Video rides a reliable + ordered DataChannel.** FR-17 stage B exists but is behind a
-   viewer `localStorage` opt-in (`useRemoteControl.ts:2905`). On a lossy mobile link every lost
+   viewer `localStorage` opt-in (`useRemoteControl.ts:2910`). On a lossy mobile link every lost
    chunk head-of-line-blocks the stream *and* burns scarce capacity retransmitting a frame that
    is already stale. `peer.rs:2815` still records "a gap cannot occur".
 
