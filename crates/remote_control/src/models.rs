@@ -1901,6 +1901,14 @@ pub struct Agent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enroll_key_id: Option<ObjectId>,
     pub os: OsKind,
+    /// FR-97 P0d — the machine's native CPU architecture from its last hello
+    /// that reported one (`x86_64`, `aarch64`, …). `None` until a device on
+    /// an agent with the field connects; a hello without it leaves this alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    /// FR-97 P0d — the agent binary runs under emulation on that hardware.
+    #[serde(default)]
+    pub arch_emulated: bool,
     pub agent_version: String,
     /// FR-27 — the version of the `roomler-desktop` companion INSTALLED on this
     /// host, reported on the heartbeat. `None` means one of three different

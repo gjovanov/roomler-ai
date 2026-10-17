@@ -261,6 +261,20 @@ pub enum ClientMsg {
     AgentHello {
         machine_name: String,
         os: OsKind,
+        /// FR-97 P0d — the machine's NATIVE CPU architecture, in Rust's
+        /// `target_arch` spelling (`x86_64`, `aarch64`, `x86`, `arm`). The
+        /// hardware, not this binary: an x86_64 build under Rosetta 2, or
+        /// under emulation on Windows on Arm, reports `aarch64` and sets
+        /// `arch_emulated`. The fleet's capability words
+        /// are counted by OS and by this (`scripts/fr97-caps-census.sh`).
+        /// Empty from an agent that predates the field, and never sent empty.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        arch: String,
+        /// FR-97 P0d — this agent's binary runs under emulation on `arch`
+        /// hardware (an x86_64 build on Apple silicon or Windows on Arm).
+        /// Absent ⇒ `false`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        arch_emulated: bool,
         agent_version: String,
         displays: Vec<DisplayInfo>,
         /// Boxed: `AgentCaps` is ~15 `Vec` fields and dominates the size of
@@ -4500,6 +4514,8 @@ mod tests {
         let m = ClientMsg::AgentHello {
             machine_name: "host".into(),
             os: OsKind::Linux,
+            arch: String::new(),
+            arch_emulated: false,
             agent_version: "0.3.0".into(),
             displays: vec![],
             caps: Box::new(AgentCaps::default()),
@@ -6242,6 +6258,8 @@ mod tests {
         let m = ClientMsg::AgentHello {
             machine_name: "host".into(),
             os: OsKind::Linux,
+            arch: String::new(),
+            arch_emulated: false,
             agent_version: "0.3.0".into(),
             displays: vec![],
             caps: Box::new(AgentCaps::default()),
@@ -6281,6 +6299,8 @@ mod tests {
         let none = ClientMsg::AgentHello {
             machine_name: "host".into(),
             os: OsKind::Linux,
+            arch: String::new(),
+            arch_emulated: false,
             agent_version: "0.3.0".into(),
             displays: vec![],
             caps: Box::new(AgentCaps::default()),
@@ -6293,6 +6313,65 @@ mod tests {
                 .unwrap()
                 .contains("ssh_host_pubkey"),
             "an empty host key must be omitted, not sent as \"\""
+        );
+    }
+
+    /// FR-97 P0d — the native architecture rides the hello beside the OS.
+    /// Locked: its spelling, that an empty value and a `false` emulation flag
+    /// stay off the wire, and that an agent predating both still parses.
+    #[test]
+    fn agent_hello_native_arch_roundtrips_and_absent_reads_unreported() {
+        let m = ClientMsg::AgentHello {
+            machine_name: "host".into(),
+            os: OsKind::Macos,
+            arch: "aarch64".into(),
+            arch_emulated: true,
+            agent_version: "0.4.142".into(),
+            displays: vec![],
+            caps: Box::new(AgentCaps::default()),
+            advertised_routes: vec![],
+            supports_relay_regions: true,
+            ssh_host_pubkey: String::new(),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""arch":"aarch64""#), "{s}");
+        assert!(s.contains(r#""arch_emulated":true"#), "{s}");
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::AgentHello {
+                arch,
+                arch_emulated,
+                ..
+            } => assert_eq!((arch.as_str(), arch_emulated), ("aarch64", true)),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let mut obj = serde_json::to_value(&m).unwrap();
+        obj.as_object_mut().unwrap().remove("arch");
+        obj.as_object_mut().unwrap().remove("arch_emulated");
+        let old = serde_json::to_string(&obj).unwrap();
+        match serde_json::from_str::<ClientMsg>(&old).unwrap() {
+            ClientMsg::AgentHello {
+                arch,
+                arch_emulated,
+                ..
+            } => assert!(arch.is_empty() && !arch_emulated),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let native = ClientMsg::AgentHello {
+            machine_name: "host".into(),
+            os: OsKind::Linux,
+            arch: String::new(),
+            arch_emulated: false,
+            agent_version: "0.4.142".into(),
+            displays: vec![],
+            caps: Box::new(AgentCaps::default()),
+            advertised_routes: vec![],
+            supports_relay_regions: false,
+            ssh_host_pubkey: String::new(),
+        };
+        let s = serde_json::to_string(&native).unwrap();
+        assert!(
+            !s.contains(r#""arch""#) && !s.contains(r#""arch_emulated""#),
+            "empty and false stay off the wire: {s}"
         );
     }
 

@@ -952,6 +952,8 @@ mod tests {
             ephemeral_ttl_secs: None,
             enroll_key_id: None,
             os: OsKind::Linux,
+            arch: None,
+            arch_emulated: false,
             agent_version: "0".into(),
             companion_version: None,
             keep_busy: None,

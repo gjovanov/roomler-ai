@@ -60,6 +60,8 @@ pub async fn handle_agent_socket(
         Some(ClientMsg::AgentHello {
             machine_name,
             os,
+            arch,
+            arch_emulated,
             agent_version,
             displays,
             caps,
@@ -69,6 +71,7 @@ pub async fn handle_agent_socket(
         }) => (
             machine_name,
             os,
+            (arch, arch_emulated),
             agent_version,
             displays,
             caps,
@@ -84,6 +87,7 @@ pub async fn handle_agent_socket(
     let (
         machine_name,
         os,
+        (arch, arch_emulated),
         agent_version,
         displays,
         caps,
@@ -103,6 +107,8 @@ pub async fn handle_agent_socket(
             &caps,
             &advertised_routes,
             &ssh_host_pubkey,
+            &arch,
+            arch_emulated,
         )
         .await
     {
