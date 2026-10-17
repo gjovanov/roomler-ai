@@ -63,7 +63,7 @@ per-session keypairs; as a device lifecycle it does not exist.
 
 **1b. Five live rows have not been seen in over a week, one in over a month.** Each still
 consumes a `max_devices` slot — `count_active_for_tenant`
-(`crates/services/src/dao/agent.rs:175`) counts every `deleted_at: null` row and
+(`crates/services/src/dao/agent.rs:178`) counts every `deleted_at: null` row and
 `enroll_agent` gates the plan cap on it — still holds an overlay address, still holds its
 MagicDNS name, and still appears in the device grid as a device.
 
@@ -115,7 +115,7 @@ property belongs to the enrollment, not to the host".
 
 ### F2 — the presence sweep cannot host the reaper: a settled-offline row leaves its scan set
 
-`find_presence_scan_set` (`crates/services/src/dao/agent.rs:363`) matches
+`find_presence_scan_set` (`crates/services/src/dao/agent.rs:366`) matches
 
 ```
 deleted_at: null  AND  ( status == Online  OR  last_presence ∈ {online, stale} )

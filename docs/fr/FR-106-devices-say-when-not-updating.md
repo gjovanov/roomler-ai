@@ -32,7 +32,7 @@ one install by a person does. The chip is how the operator learns that a person 
   cache in `crate::releases`). Nothing on the server or the device has to change. That matters, because a stuck
   device cannot receive an agent change anyway.
 - The server cannot tell a per-user daemon from a system one for these devices. `desktop.session` is logind's
-  class for the session a viewer would see (`crates/remote_control/src/models.rs:1693-1711`), which reads
+  class for the session a viewer would see (`crates/remote_control/src/models.rs:1742-1760`), which reads
   `user` for a system daemon on a logged-in desktop too. FR-102's install record (`install {method, scope}`)
   exists only for devices enrolled after it shipped. So the Linux tooltip names both remedies.
 
