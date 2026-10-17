@@ -120,7 +120,7 @@ prevent, and the guard re-asserts it on every tick.
 | N5 | Subnet router, serving | 🟡 WinNAT; Home ❌ | ✅ | ✅ P1b (0.4.141; AC5, §8) | Same no-op; routes still advertised and approvable | P0b, P1b |
 | N6 | MagicDNS OS steer | ✅ NRPT | 🟡 systemd-resolved only (`dns.rs:408-429`) | ✅ P1c (AC6) | A TUN-mode Mac resolves names only with the opt-in hosts ladder. *P1c:* a temporary SCDynamicStore supplemental resolver per utun | P1c, P3h |
 | N7 | Exit DNS steer (no leak) | ✅ NRPT `.` | 🟡 resolved only | ✅ P1c (AC6) | Reported honestly as `DNS NOT steered`. *P1c:* a temporary catch-all key (`SupplementalMatchDomains = [""]`) | P1c, P3h |
-| N8 | Host firewall admits the daemon's inbound UDP | ✅ Defender rule + WFP (`winfw.rs`, `wfp.rs`) | ❌ firewalld / ufw / nft untouched | ❌ ALF untouched | Linux, firewalld (§8, 2026-10-17): punched carriers pass via conntrack; services on the overlay IP are refused by the default zone | P3i (evidence first) |
+| N8 | Host firewall admits the daemon's inbound UDP | ✅ Defender rule + WFP (`winfw.rs`, `wfp.rs`) | 🟡 firewalld / ufw untouched by decision (D13), and reported | ❌ ALF untouched | Linux, firewalld (§8, 2026-10-17): punched and LAN-direct carriers pass via conntrack, so no UDP allow is needed; services on the overlay IP are refused by the zone that governs the adapter, which `roomler status` now names (P3i) | P3i |
 | N9 | LAN-direct egress pin; own-route repair | ✅ `IP_UNICAST_IF` (`direct.rs:466-507`), `lan_repair.rs` | ❌ | ❌ | The field case was Windows + AnyConnect | §7 (evidence first) |
 | N10 | Per-org TUN (multi-org) | ✅ | ✅ | ❓ | One utun per org in code (`agents/roomlerd/src/overlay.rs:303-316`), never run on a Mac; `roomler org join` still warns it is unsupported (`org_join.rs:561-566`, stale) | P1d |
 | N11 | Port-holder diagnostics | ✅ | ✅ | 🟡 `Unknown` (`port_holder.rs:316-323`) | Diagnostics only | P1d |
@@ -565,8 +565,18 @@ test of the SIGKILL property itself.
   `install.sh` already has the hook (`scripts/install.sh:742-750`).
 - **P3h, DNS without systemd-resolved.** NetworkManager when it owns `resolv.conf`, else a managed `resolv.conf` with a
   restore. Evidence first: which fleet distros lack resolved.
-- **P3i, host firewall.** A best-effort allow for the daemon's UDP port in firewalld, ufw or nft where one is active,
-  like the Windows Defender pass. Evidence first: do punched and LAN-direct carriers actually fall to relay there?
+- **P3i, host firewall.** The evidence (§8, 2026-10-17) answered the question this phase opened on:
+  - Punched and LAN-direct carriers do not fall to relay behind firewalld. Both ends probe, so conntrack lets each
+    side's reply in (`tier=Lan`, 497 ms). The UDP allow first specced here is unnecessary.
+  - The overlay adapter is in no zone, so the default zone governs it, and a service on the overlay address is
+    refused unless that zone admits it. Putting the adapter in `trusted` opened exactly the mesh; the LAN stayed as
+    its zone said.
+
+  So P3i reports and never changes (D13): the overlay runtime asks firewalld, then ufw, what governs its adapter, at
+  bring-up and every ten minutes (`crates/tunnel-core/src/overlay/hostfw.rs`), and `roomler status` prints a
+  `host fw` line when the firewall limits what a mesh peer reaches. Kill switch: `ROOMLERD_HOST_FW_PROBE=0`.
+  Opening the mesh stays the host owner's call (`docs/overlay-communication.md` §5). macOS's Application Firewall
+  passes forwarded traffic (§8) and filters per application, so it is not asked.
 
 ### 3.9 P4 — Windows
 
@@ -651,7 +661,7 @@ model on Windows, so the three agree on what the mode means.
 | **P3f** | uinput text on any layout | `ROOMLERD_UINPUT_XKB=0` | the lab, German and French layouts | M |
 | **P3g** | Linux companion for arm64 + tarball | — (a package) | the FR-93 lab, an arm64 vmtest guest | M |
 | **P3h** | Linux DNS without systemd-resolved | `ROOMLERD_DNS_NM=0` | evidence first | M |
-| **P3i** | Linux / macOS host-firewall allow | `ROOMLERD_HOST_FW=0` | evidence first | S–M |
+| **P3i** | Linux host firewall: what governs the overlay adapter, reported in `roomler status`, never changed (D13) | `ROOMLERD_HOST_FW_PROBE=0` | a firewalld node (zone `public`) and a ufw node, red then green | S |
 | **P4a** | Windows `SendSAS` | its cap word | Win11 Pro + a GPO-locked laptop | S–M |
 | **P4b** | Windows SFTP as `console_user` | `ssh_sftp_as_user` | Win11 SystemContext | S–M |
 | **P4c** | Windows Hive adopt | `hive_adopt` | Win11 | M |
@@ -764,6 +774,7 @@ one depends on it.
 | **D10** | How a device says "not here" | **Decided (per recommendation, 2026-10-17):** `AgentCaps.unavailable`, a map of feature → `{code, reason}` beside the lists; the viewer shows the reason and hides only `not-applicable`; the lists still decide what works (§3.3a) |
 | **D11** | Ctrl+Alt+Del until P4a | **Decided (per recommendation, 2026-10-17):** Windows and Linux keep the button and say what the keys reach (Linux desktops bind the chord, so hiding it would take a working key away); macOS hides it. P4a's `SendSAS` brings an `input: sas` word |
 | **D12** | A netstack node's exit status | **Decided (measured, 2026-10-17):** it is `active` for the SOCKS5 front's IPv4 dials and nothing else, so the status names the front instead of reading "never active" (the plan before the measurement, which would itself have been wrong). The DNS steer and the route offer follow from the same fact (P0c-3) |
+| **D13** | A host firewall that refuses services on the overlay address | **Decided (per recommendation, 2026-10-17):** report, never change. The firewall is the host owner's, and trusting the adapter would open every service on the host to every peer the overlay ACL admits, an ACL not yet field-proven under `enforce`. Carriers need no allow (measured). The status names the zone and what it admits; the owner opens the mesh (`firewall-cmd --zone=trusted --add-interface=roomler0`, `ufw allow in on roomler0`) |
 
 ## 7. Out of scope
 
@@ -833,3 +844,4 @@ one depends on it.
 | 2026-10-17 | prod, read-only: `scripts/fr97-caps-census.sh 30` | every agent seen in the last 30 days and not removed: 24 Linux, 4 macOS, 41 Windows; none yet reports its architecture | **P0d, the count before P0c (AC15).** ⛔ `audio: opus` on **4 of 4** macOS agents, with no capture backend behind it (R1, §2.7). ⛔ `clipboard: events` + `images` on **24 of 24** Linux and **4 of 4** macOS agents, whose watchers never send image events (R8); clipboard `native` only on Windows. ⛔ `supports_clipboard` on every Linux agent. The census cannot tell a root daemon from a per-user one, so R10 is proven in the field, not by count. ⛔ No word governs Ctrl+Alt+Del: it is in no list, and the button shows for every host. Honest gaps, each with its phase: `apps` absent on macOS (P2c), `layout` only on Windows (P2d, P3e), `privacy-*` only on Windows (FR-99) |
 | 2026-10-17 | released 0.4.141 | mars: a throwaway Linux exit (a container with iptables, approved) and two netstack clients (no `/dev/net/tun`, no `NET_ADMIN`, `ROOMLERD_OVERLAY_NETSTACK_SOCKS=1080`), one with `overlay_exit_node` and one without | **D12 measured.** 🔴 No exit: a SOCKS5 connect to `1.1.1.1` times out. 🟢 With the exit: it completes; the exit's tcpdump shows the client's SYN from its overlay address on `roomler0`, and its MASQUERADE counts one new flow; a name curl resolves itself goes through too. A name handed to the front (`socks5h`) and an IPv6 literal are refused. Meanwhile `roomler status` said `active, v6 on, DNS NOT steered` for the whole host. The positive control (an HTTP listener on the exit's overlay address) answered in neither phase, a rig fault (`python3-minimal` has no `http.server`); the result rests on the tcpdump and NAT counts. A first take was void: a clean stop between its phases unenrolled the ephemeral client |
 | 2026-10-17 | released 0.4.141 | mars: one netstack node on a host where iptables works (`NET_ADMIN`, iptables), `overlay_exit_node_enabled = true`, never approved | 🔴 **It offers `/0`**: the server row says `can_be_exit_node: true`, `route_offer_withheld: null`, though its userspace stack forwards nothing, so every client of it would black-hole. P0c-3 withholds every route offer from a netstack node; the green check rides the release that carries it |
+| 2026-10-17 | released 0.4.141 | mars: two throwaway TUN nodes on one docker bridge (a LAN). FW ran firewalld 1.1.1, default zone `public` (ssh, dhcpv6-client), nothing putting `roomler0` in a zone; P ran no firewall | **P3i's question, the LAN half.** 🟢 **Carriers:** FW and P see each other `direct`; FW's log has `direct carrier promoted … tier=Lan probe_ms=497`. LAN-direct does not fall to relay behind firewalld, as the punched path did not on the Fedora host. 🔴 **Services:** HTTP to FW's overlay address refused (rc 7), as on the Fedora host; HTTP to its LAN address refused too (the same zone, a control). 🟢 **The remedy, scoped:** with `roomler0` in `trusted` (runtime only) the overlay address answered 200 while the LAN address stayed refused; removed, refused again. The ping probe never ran (the plain client image has no `ping`). So the UDP allow P3i was specced as is unnecessary, and what remains is saying which zone governs the adapter (D13) |

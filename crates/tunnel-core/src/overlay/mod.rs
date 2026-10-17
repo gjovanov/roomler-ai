@@ -38,6 +38,9 @@ pub mod dns;
 /// (IPv4 forwarding a Windows router turned on), refcounted in process and
 /// persisted for the boot purge.
 pub mod host_ledger;
+/// FR-97 P3i — what the host's own firewall (firewalld, ufw) lets a mesh peer
+/// reach on the overlay adapter; reported, never changed.
+pub mod hostfw;
 pub mod hosts;
 pub mod ingress;
 /// A LAN interface's own prefix route made unusable underneath it (a next
