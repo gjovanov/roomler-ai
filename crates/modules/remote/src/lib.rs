@@ -210,6 +210,12 @@ impl Module for RemoteState {
                     index(bson::doc! { "agent_id": 1, "created_at": -1 }),
                     index(bson::doc! { "controller_user_id": 1, "created_at": -1 }),
                     index(bson::doc! { "tenant_id": 1, "phase": 1 }),
+                    // 25-month retention from `created_at` — the privacy
+                    // policy's §7 (see `RemoteSession::TTL_SECONDS`).
+                    index_ttl(
+                        bson::doc! { "created_at": 1 },
+                        roomler_ai_remote_control::models::RemoteSession::TTL_SECONDS,
+                    ),
                 ],
             },
             // Remote-control audit log — 90-day retention.

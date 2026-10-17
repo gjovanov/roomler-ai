@@ -4648,6 +4648,14 @@ pub struct RemoteSession {
 
 impl RemoteSession {
     pub const COLLECTION: &'static str = "remote_sessions";
+    /// A session record — who controlled which device, when, for how long,
+    /// its stats and the carrier it rode — is kept **25 months** from
+    /// `created_at`, then the database deletes it (a TTL index in the `remote`
+    /// module). The privacy policy states this retention (§7; operator
+    /// decision 2026-10-17). Until then the rows were kept with no bound,
+    /// while the policy claimed 90 days. The long-term numbers survive in the
+    /// growth aggregates (`growth_org_daily`, `growth_quality_daily`).
+    pub const TTL_SECONDS: u64 = 25 * 30 * 24 * 60 * 60;
 }
 
 /// FR-102 P9c — the carrier spellings this server knows (the agent's

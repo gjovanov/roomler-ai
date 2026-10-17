@@ -2118,6 +2118,12 @@
               "tenant_id": 1,
               "phase": 1
             }
+          },
+          {
+            "key": {
+              "created_at": 1
+            },
+            "expireAfterSeconds": 64800000
           }
         ]
       },
@@ -4050,6 +4056,12 @@
               "tenant_id": 1,
               "phase": 1
             }
+          },
+          {
+            "key": {
+              "created_at": 1
+            },
+            "expireAfterSeconds": 64800000
           }
         ]
       },
