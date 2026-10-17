@@ -13,7 +13,7 @@
 //! | a prompt on the fork | B's harness answers from the parent's conversation, now the fork's own | `history: 3`: the parent's two prompts, then this one; the folder's file |
 //! | the parent | A runs it on as it was | its harness alive, nothing of the fork's prompt in it |
 //! | a fork on A, the parent's own device, in a folder of its own | A puts it in place from its own store | `history: 3` again |
-//! | P2f-3c — a fork onto C, which holds no copies (`hive_replica` off) | C prepares as a teleport's target, joins in that role and takes its copy from A; once it caught up, the fork is made there | the answer `joining`; `history: 3`; C let go from the session's replicaset; the session never moved |
+//! | P2f-3c — a fork onto C, which holds no copies (`hive_replica` off) | C prepares as a teleport's target, joins in that role and takes its copy from A; once it caught up, the fork is made there | the answer `joining`; `history: 3`; C let go from the session's replicaset, its copy gone and nothing kept against the session (P2k-3); the session never moved |
 //!
 //! ⚠️ The stream rides `direct` on loopback: the tests build carries no
 //! overlay, as in the canary. ⚠️ A process holds one supervisor, so neither
@@ -566,11 +566,14 @@ async fn scenario() {
     );
 
     stop(c_proc).await;
+    // P2k-3 — C was let go as a member, not purged with the session: its copy
+    // goes whole, and its store keeps nothing against the session, so a later
+    // teleport or fork may hand it a copy again.
     let (events, purged) = held(&c_dir.join("hive.db"), &sid);
     assert_eq!(
         (events, purged),
-        (0, true),
-        "C's store keeps only the session's id"
+        (0, false),
+        "C's store holds nothing of the session, and does not refuse it"
     );
     stop(b_proc).await;
     stop(a_proc).await;
