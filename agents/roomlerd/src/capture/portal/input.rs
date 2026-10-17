@@ -93,6 +93,9 @@ pub enum PortalCall {
     /// `NotifyPointerMotionAbsolute` — coordinates in the STREAM's logical
     /// space, which is why planning needs the logical size.
     MotionAbs { x: f64, y: f64 },
+    /// `NotifyPointerMotion` — FR-109 P2c, relative motion. It names no
+    /// stream: it moves the pointer from wherever it is.
+    MotionRel { dx: f64, dy: f64 },
     /// `NotifyPointerButton` — `code` is a Linux `BTN_*`.
     Button { code: i32, down: bool },
     /// `NotifyPointerAxis` — smooth scroll, positive down/right.
@@ -153,10 +156,20 @@ pub fn plan(msg: &InputMsg, logical: (f64, f64), wheel: &mut WheelAccum) -> Vec<
             code: i32::from(button_code(*btn)),
             down: true,
         }],
-        // FR-109 P2 — the portal has relative motion (`NotifyPointerMotion`,
-        // no stream needed), but this path does not carry it yet, so this
-        // agent never advertises `mouse-rel` and nothing is sent.
-        InputMsg::MouseRel { .. } => vec![],
+        // FR-109 P2c — relative motion rides the RemoteDesktop session's own
+        // call (the portal's `NotifyPointerMotion`, mutter's
+        // `NotifyPointerMotionRelative`), which names no stream. An all-zero
+        // frame sends nothing.
+        InputMsg::MouseRel { dx, dy } => {
+            if *dx == 0 && *dy == 0 {
+                vec![]
+            } else {
+                vec![PortalCall::MotionRel {
+                    dx: f64::from(*dx),
+                    dy: f64::from(*dy),
+                }]
+            }
+        }
         InputMsg::MouseWheel { dx, dy, mode } => match mode {
             // Smooth deltas pass through: the browser's pixels are already
             // libinput's "scroll distance", positive down/right on both ends.
@@ -265,6 +278,9 @@ pub enum MutterCall {
     /// `NotifyPointerMotionAbsolute(stream, x, y)`: the stream's own
     /// coordinates, which mutter maps onto the monitor it records.
     MotionAbs { x: f64, y: f64 },
+    /// `NotifyPointerMotionRelative(d, d)`: FR-109 P2c, from wherever the
+    /// pointer is.
+    MotionRel { dx: f64, dy: f64 },
     /// `NotifyPointerButton(i, b)`: a Linux `BTN_*`.
     Button { code: i32, down: bool },
     /// `NotifyPointerAxis(d, d, u)`.
@@ -283,6 +299,7 @@ pub enum MutterCall {
 pub fn mutter_call(call: PortalCall) -> Option<MutterCall> {
     Some(match call {
         PortalCall::MotionAbs { x, y } => MutterCall::MotionAbs { x, y },
+        PortalCall::MotionRel { dx, dy } => MutterCall::MotionRel { dx, dy },
         PortalCall::Button { code, down } => MutterCall::Button { code, down },
         PortalCall::Axis { dx, dy } => MutterCall::Axis {
             dx,
@@ -448,6 +465,9 @@ impl InputContext {
             PortalCall::MotionAbs { x, y } => {
                 self.send("NotifyPointerMotionAbsolute", &(sess, opts, node_id, x, y))
             }
+            PortalCall::MotionRel { dx, dy } => {
+                self.send("NotifyPointerMotion", &(sess, opts, dx, dy))
+            }
             PortalCall::Button { code, down } => {
                 self.send("NotifyPointerButton", &(sess, opts, code, u32::from(down)))
             }
@@ -474,6 +494,7 @@ impl InputContext {
             MutterCall::MotionAbs { x, y } => {
                 self.send("NotifyPointerMotionAbsolute", &(stream, x, y))
             }
+            MutterCall::MotionRel { dx, dy } => self.send("NotifyPointerMotionRelative", &(dx, dy)),
             MutterCall::Button { code, down } => self.send("NotifyPointerButton", &(code, down)),
             MutterCall::Axis { dx, dy, flags } => self.send("NotifyPointerAxis", &(dx, dy, flags)),
             MutterCall::AxisDiscrete { axis, steps } => {
@@ -648,7 +669,7 @@ mod tests {
     }
 
     /// FR-109 — relative mode's press, the release's twin: a button and no
-    /// motion. Relative motion itself plans nothing until P2.
+    /// motion.
     #[test]
     fn a_relative_press_never_moves_the_pointer() {
         assert_eq!(
@@ -658,7 +679,33 @@ mod tests {
                 down: true
             }]
         );
-        assert_eq!(plan1(InputMsg::MouseRel { dx: 5, dy: 5 }), vec![]);
+    }
+
+    /// FR-109 P2c — relative motion is one relative call with the counts as
+    /// they came, naming no stream; an all-zero frame plans nothing. On
+    /// mutter's own session it is `NotifyPointerMotionRelative`'s shape.
+    #[test]
+    fn relative_motion_is_one_relative_call() {
+        assert_eq!(
+            plan1(InputMsg::MouseRel { dx: 5, dy: -3 }),
+            vec![PortalCall::MotionRel { dx: 5.0, dy: -3.0 }]
+        );
+        assert_eq!(plan1(InputMsg::MouseRel { dx: 0, dy: 0 }), vec![]);
+        assert_eq!(
+            mutter_call(PortalCall::MotionRel { dx: 5.0, dy: -3.0 }),
+            Some(MutterCall::MotionRel { dx: 5.0, dy: -3.0 })
+        );
+        // No backend quirk touches it: KDE's negated smooth scroll is the
+        // wheel's alone.
+        assert_eq!(
+            for_backend(
+                PortalCall::MotionRel { dx: 5.0, dy: -3.0 },
+                BackendQuirks {
+                    negated_smooth_y: true
+                }
+            ),
+            PortalCall::MotionRel { dx: 5.0, dy: -3.0 }
+        );
     }
 
     /// Clicks position first, then press — same rule as uinput, same reason.
