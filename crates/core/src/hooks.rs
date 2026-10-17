@@ -39,8 +39,13 @@ use bson::oid::ObjectId;
 /// device holds for anyone, and ending it (the record, and the stop order to
 /// a device that is still connected) must happen while the device's row and
 /// socket are still there to address.
+///
+/// FR-90 P3 — `vault` follows it: its leases (P3-3) are held by sessions on
+/// devices, so they are revoked once the sessions have ended and while the
+/// device is still there to be told. P3-1 registers no hooks.
 pub const HOOK_ORDER: &[&str] = &[
     "hive",
+    "vault",
     "remote",
     "network",
     "fleet",

@@ -450,6 +450,9 @@ jobs:
       # `roomler-ai-mod-remote` (FR-101 P2a) joined with its first tests: how
       # the owner pod reads the session policy off the cross-pod relay (absent
       # vs unreadable), and the policy route's strict values.
+      # `roomler-ai-mod-vault` (FR-90 P3-1) with its first commit: a value
+      # moved to another place, altered, or held to another KEK does not
+      # open; a KEK never prints; paths and fields have one spelling.
       - name: Run the remaining crates' unit tests
         run: >-
           cargo test --lib
@@ -459,6 +462,7 @@ jobs:
           -p roomler-ai-mod-chat -p roomler-ai-mod-saas
           -p tcp-turn-conn -p roomler-setup-core -p roomler-setup
           -p roomler-hive-node -p roomler-ai-mod-hive -p roomler-ai-mod-remote
+          -p roomler-ai-mod-vault
 
       # FR-85 P2b — the desktop companion's unit tests ran in NO lane: the
       # macOS job only `cargo check`s it, and the step above is `--lib`, which

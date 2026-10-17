@@ -410,6 +410,27 @@ named after its folder, because a terminal's first prompt is content. An offer f
 session already held is answered with the same record. Every adoption is in `hive_audit`
 (`action: adopt`).
 
+### Vault (FR-90 P3-1, module `vault` — mounted only with `[modules] vault = true` or a `vault.tenants` list)
+
+The org gate reads like Hive's: `vault.tenants` (`ROOMLER__VAULT__TENANTS`) names the organizations
+served, a list mounts the module by itself, and a member of any other organization gets **404**
+(`the vault is not available to this organization`) after the membership check. Every route is
+for the organization's `ADMINISTRATOR`s (**403** otherwise), and **no route answers a value**.
+Every `secret:*` and `vault:verify` decision is recorded in `vault_audit`, allow and deny; an allow
+is written before it is acted on. Full treatment: [vault.md](vault.md).
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `…/vault` | `{enabled, kek: {state: ready · missing · invalid, recipient? \| reason?}, secrets, versions, other_kek}` — `other_kek` counts the versions wrapped to another KEK than the one loaded |
+| GET | `…/vault/secret` | The live secrets, by path (`?prefix=` a folder). Metadata only, each with its `rrn` (`rrn:{org slug}:secret:{path}`) and the fields that hold a value |
+| POST | `…/vault/secret` | `{path, kind: static · structured, description?, audiences?, exec_allow?, tags?, rotation_days?, disabled?, owner_id?}` — **201**; **409** when a live secret holds the path; **422** for an unknown field, `value` included |
+| GET | `…/vault/secret/{id}` | One secret and `versions[]` — `{field, n, current, kek, created_by, created_at, expires_at}`, never the sealed bytes |
+| PATCH | `…/vault/secret/{id}` | Its rules; `path` and `kind` never change (**422**). `rotation_days: 0` clears it |
+| DELETE | `…/vault/secret/{id}` | Tombstone it and destroy every version: `{deleted: true, versions_destroyed}` |
+| PUT | `…/vault/secret/{id}/value` | `{field?, value, expires_at?}` — the field's next version, sealed: `{field, n, created_at, expires_at}`. **503** without a usable KEK |
+| POST | `…/vault/verify` | Open every version (up to 10,000): `{versions, ok, failed, failures[{secret_id, field, n, reason: other_kek · dek_unreadable · tampered}], truncated}`. **503** without a usable KEK |
+| GET | `…/vault/audit` | The decisions, newest first (`?before=` RFC 3339, `?limit=` 1–200) |
+
 ### Observability
 
 | Method | Path | Purpose |

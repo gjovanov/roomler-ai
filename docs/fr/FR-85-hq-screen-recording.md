@@ -396,7 +396,7 @@ already has.
 ## Test plan
 
 ⚠️ `agents/roomlerd/tests/*.rs` **never run in CI today**: every `cargo test -p roomlerd` step is `--lib`
-(`.github/workflows/ci.yml:406,460,773`), and `tests/file_dc.rs` is in no workflow. Each new test binary below gets its own
+(`.github/workflows/ci.yml:406,463,777`), and `tests/file_dc.rs` is in no workflow. Each new test binary below gets its own
 named `--test` step. Every oracle has a **negative control** — the same assertions must fail on the wrong input.
 
 - **Unit** (the default and `ffmpeg-encoder` roomlerd lanes; `crates/remote_control`, `crates/db`, `crates/localapi`):
