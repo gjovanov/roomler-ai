@@ -151,8 +151,8 @@ flowchart LR
 
 | | Decision | Status |
 |---|---|---|
-| **D1** | The size | *(Recommended: 7 MiB for receive and send, wireguard-go's and Tailscale's choice. 4 MiB already removed every drop in §2's experiment, and 7 MiB leaves room for faster links.)* |
-| **D2** | The relay carriers' sockets (the TURN client, the FR-19 org relay) | *(Recommended: not in this FR. They carry relay paths, which the ladder prefers less, and they bind elsewhere. Measure them first.)* |
+| **D1** | The size | **7 MiB for receive and send**, as built and released in 0.4.141 (wireguard-go's and Tailscale's choice). 4 MiB already removed every drop in §2's experiment, and 7 MiB leaves room for faster links. Windows and macOS grant it in full; Linux grants it to a root daemon through FORCE |
+| **D2** | The relay carriers' sockets (the TURN client, the FR-19 org relay) | **Not in this FR.** They carry relay paths, which the ladder prefers less, and they bind elsewhere. Measure them first |
 
 ## 8. Out of scope
 
