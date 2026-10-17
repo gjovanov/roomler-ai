@@ -2135,14 +2135,15 @@ async fn connect_once(
                 // server folds these into `remote_sessions.stats`, which
                 // recorded zeros for every session before this.
                 for (session_id, peer) in peers.iter() {
-                    // FR-102 P9d — the per-peer send is one helper now, shared
-                    // with the carrier-ready arm. `false` means the WS write
-                    // failed, so stop trying the remaining peers this round (a
-                    // telemetry timeout returns `true`: skip this peer, keep
-                    // going — the original `continue`).
-                    if !send_one_session_stats(&mut ws, *session_id, peer, ctx.pump).await {
-                        break;
-                    }
+                    // FR-102 P9d — one helper, shared with the carrier-ready
+                    // arm, and it queues on EACH PEER'S OWN sender (the FR-43
+                    // seam), never on this loop's WS: a delegated session's
+                    // sample must reach the server under the daemon's
+                    // identity, the one its row carries. Peers may therefore
+                    // hold different senders, so one peer's full or closed
+                    // queue — or its telemetry timing out — skips that peer
+                    // and never stops the others.
+                    send_one_session_stats(*session_id, peer, ctx.pump).await;
                 }
                 watchdog::tick(ctx.pump);
             }
@@ -2165,17 +2166,23 @@ async fn connect_once(
                 // FR-102 P9d — the carrier observation for a LIVE session just
                 // landed (`session_carrier::observe` set the OnceLock and
                 // signalled). Send ONE `rc:session.stats` for it NOW, by the
-                // SAME road the 30 s tick uses — this loop's `peers` and its
-                // own `ws` — so a session that ends before the next tick still
-                // records its carrier. The 30 s tick is unchanged and keeps
-                // re-sending it (the server's `$set` is idempotent).
+                // SAME road the 30 s tick uses: this loop's `peers` to find
+                // the peer, and the peer's OWN sender (the FR-43 seam) to
+                // carry the sample — this loop's `outbound_tx`, which the arm
+                // above flushes to the WS one hop later, or the delegation
+                // channel for a delegated session, relayed by the daemon
+                // under its own identity. So a session that ends before the
+                // next tick still records its carrier. The 30 s tick is
+                // unchanged and keeps re-sending it (the server's `$set` is
+                // idempotent).
                 //
                 // A session already gone — ended between the signal and here —
                 // is no longer in `peers`: nothing to send, which is exactly
-                // the weak-handle property P9c kept. A failed send is logged by
-                // the shared helper and is never fatal.
+                // the weak-handle property P9c kept. A full or closed sender
+                // is logged by the shared helper, never fatal, and the next
+                // tick retries.
                 if let Some(peer) = peers.get(&sid) {
-                    let _ = send_one_session_stats(&mut ws, sid, peer, ctx.pump).await;
+                    send_one_session_stats(sid, peer, ctx.pump).await;
                 }
                 watchdog::tick(ctx.pump);
             }
@@ -2242,6 +2249,19 @@ async fn connect_once(
                     peer.stop_serving();
                     // FR-101 P3 — the audit's last sample, while the server
                     // still holds the session live (the terminate follows).
+                    //
+                    // ⚠️ Deliberately NOT the per-peer road the live samples
+                    // take (`send_one_session_stats`, FR-102 P9d): this one
+                    // must land BEFORE the terminate directly below it, and
+                    // the server drops a sample once `ended_at` is set — on
+                    // the peer's queue, the direct terminate write would
+                    // overtake it. Pre-existing follow-up, out of P9d's
+                    // scope: `delegated_out` is connection-wide, so on a
+                    // supervised Mac a worker's OWN session (its own row)
+                    // goes up the delegation channel here too, under the
+                    // daemon's identity, and the server drops it as another
+                    // device's. A fix needs the terminate on the same queue
+                    // as the sample, or a per-session delegation marker.
                     if let Some(stats) = final_session_stats(sid, peer).await
                         && let Err(e) =
                             reply_for_session(&mut ws, delegated_out.as_ref(), &stats).await
@@ -2885,9 +2905,14 @@ async fn handle_server_msg(
     // FR-102 P9d — handed to every peer built here so its carrier observation
     // can signal this loop (the `carrier_ready_rx` arm) to send one
     // `rc:session.stats` the moment the carrier is known. This is THIS loop's
-    // sender, so the signal reaches the loop whose `peers` serve the session —
-    // the daemon's, a standalone agent's, or the GUI worker's for a delegated
-    // session, which is the loop that holds the delegated peer.
+    // sender, so the signal reaches the loop whose `peers` map holds the peer
+    // — the daemon's, a standalone agent's, or the GUI worker's for a
+    // delegated session. The sample itself then leaves through the PEER's
+    // own sender, the seam chosen at `AgentPeer::new` below (`delegated` or
+    // `outbound_tx`), never through this loop's WS: on a worker that would be
+    // the wrong identity for a delegated session, and `delegated` is
+    // per-message, not per-connection, because the worker serves its own
+    // sessions under its own row as well.
     carrier_ready_tx: &mpsc::Sender<bson::oid::ObjectId>,
 ) -> Result<(), ConnectError> {
     // #1632 — a Terminate takes any consent prompt still standing for its
@@ -6053,9 +6078,23 @@ fn session_stats_msg(
     }
 }
 
-/// Send ONE `rc:session.stats` for a live session up THIS connection's own WS,
-/// the way Wave 2 built it inline. Shared by the 30 s heartbeat tick and the
+/// Queue ONE `rc:session.stats` for a live session on THE PEER'S OWN SENDER —
+/// the FR-43 P2b-2 seam every message about a session leaves through — with
+/// the sample Wave 2 built inline. Shared by the 30 s heartbeat tick and the
 /// FR-102 P9d carrier-ready trigger so the two cannot drift.
+///
+/// Why the peer's sender and not this connection's WS: on a supervised Mac
+/// (FR-43) the GUI worker that holds a delegated session's peer is its OWN
+/// enrollment with its own WS, while the session row carries the DAEMON's
+/// `agent_id`. A sample written up the worker's WS matches nothing in
+/// `merge_live_stats` (`{_id, agent_id: <the socket's>, ended_at: null}`) and
+/// is dropped without a word — with the file notes it carried. The peer's
+/// sender is the loop's `outbound_tx` for an own session (the `outbound_rx`
+/// arm writes it to the WS one hop later) and the delegation channel for a
+/// delegated one (`delegable_outbound` passes `SessionStats`; the daemon
+/// relays it under its own identity). The worker also serves its OWN sessions
+/// under its own row, which is why this is decided per peer, never
+/// connection-wide.
 ///
 /// - Real telemetry within [`SESSION_STATS_BUDGET`]. ⚠️ Never a zeros sample:
 ///   `merge_live_stats` `$set`s every counter, so a sample of zeros would
@@ -6063,17 +6102,17 @@ fn session_stats_msg(
 ///   doc spells out). A telemetry timeout therefore SKIPS this peer — it takes
 ///   nothing and sends nothing.
 /// - FR-101 P3 — the session's clipboard and file traffic ride along; the file
-///   notes are TAKEN, so a failed send hands them back with
-///   [`crate::session_telemetry::SessionCounters::restore_file_notes`].
+///   notes are TAKEN, so a sample that could not be queued hands them back
+///   with [`crate::session_telemetry::SessionCounters::restore_file_notes`].
 /// - FR-102 P9c — the recorded carrier rides it, once observed.
 ///
-/// Best-effort: telemetry must never tear down a working session, so a failed
-/// send is only logged — the heartbeat frame is what proves liveness. Returns
-/// `true` to keep going (sent, or telemetry timed out), `false` when the WS
-/// write failed (the heartbeat loop then stops this round). The P9d trigger
-/// serves one peer and ignores the value.
+/// ⚠️ `try_send`, never `.send().await`: the loop that calls this is the loop
+/// that drains `outbound_rx`, so awaiting a full queue would wait on itself. A
+/// `Full` or `Closed` queue sends nothing this round — logged, the notes
+/// restored, and the next tick retries. Best-effort either way: telemetry must
+/// never tear down a working session, and the heartbeat frame is what proves
+/// liveness. Returns whether a sample was queued.
 async fn send_one_session_stats(
-    ws: &mut Ws,
     session_id: bson::oid::ObjectId,
     peer: &AgentPeer,
     pump: &'static str,
@@ -6087,19 +6126,25 @@ async fn send_one_session_stats(
                  (wedged ICE after a network transition?)"
             );
             watchdog::tick(pump);
-            return true;
+            return false;
         }
     };
     let transfers = crate::session_telemetry::counters(session_id).take_transfers();
     let msg = session_stats_msg(session_id, &t, transfers);
-    if let Err(e) = send_msg(ws, &msg).await {
-        debug!(%session_id, %e, "session stats send failed");
-        if let ClientMsg::SessionStats { transfers, .. } = msg {
-            crate::session_telemetry::counters(session_id).restore_file_notes(transfers.files);
+    match peer.outbound().try_send(msg) {
+        Ok(()) => true,
+        Err(e) => {
+            let why = match &e {
+                mpsc::error::TrySendError::Full(_) => "queue full",
+                mpsc::error::TrySendError::Closed(_) => "queue closed",
+            };
+            debug!(%session_id, why, "session stats not queued this round — the next tick retries");
+            if let ClientMsg::SessionStats { transfers, .. } = e.into_inner() {
+                crate::session_telemetry::counters(session_id).restore_file_notes(transfers.files);
+            }
+            false
         }
-        return false;
     }
-    true
 }
 
 /// FR-101 P3 — the last `rc:session.stats` of a session that is ending, so
@@ -6409,6 +6454,127 @@ mod tests {
             ClientMsg::SessionStats { carrier, .. } => assert_eq!(carrier, None),
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// FR-102 P9d — a peer for `send_one_session_stats`: the production
+    /// `AgentPeer`, built as `handle_server_msg` builds one, with `tx` as the
+    /// sender it is constructed with (the FR-43 P2b-2 seam). Never offered
+    /// anything, so it gathers no ICE and its telemetry answers at once.
+    async fn peer_with_sender(
+        session_id: bson::oid::ObjectId,
+        tx: mpsc::Sender<ClientMsg>,
+    ) -> AgentPeer {
+        AgentPeer::new(
+            session_id,
+            &[],
+            tx,
+            crate::encode::EncoderPreference::Software,
+            "h264".into(),
+            "h264".into(),
+            None,
+            None,
+            false,
+            false,
+            roomler_ai_remote_control::permissions::Permissions::VIEW,
+            "p9d-unit".into(),
+            None,
+            crate::rc_overlay::RcOverlay::default(),
+            crate::rc_sessions::RcSessionRegistry::new(),
+            // The carrier-ready signal: nothing reads it here, the test calls
+            // the helper the arm would call.
+            mpsc::channel(1).0,
+        )
+        .await
+        .expect("AgentPeer::new")
+    }
+
+    /// FR-102 P9d — a session's stats follow THE PEER'S OWN SENDER (the FR-43
+    /// seam), not the loop's WS. Without a supervised Mac this is the only
+    /// proof of the delegated road: a peer built with sender `A` — on a
+    /// worker, the delegation channel to the daemon — puts its sample, the
+    /// carrier riding it, on `A` and nowhere else. The helper is the real one
+    /// both the 30 s tick and the carrier-ready arm call.
+    #[tokio::test]
+    async fn a_session_stats_sample_leaves_through_the_peers_own_sender() {
+        let sid = bson::oid::ObjectId::new();
+        let (a_tx, mut a_rx) = mpsc::channel::<ClientMsg>(8);
+        let peer = peer_with_sender(sid, a_tx).await;
+        peer.record_carrier_for_test(crate::session_carrier::SessionCarrier::OverlayTurn);
+
+        let queued = send_one_session_stats(sid, &peer, "p9d-test").await;
+        let first = a_rx.try_recv();
+        let second = a_rx.try_recv();
+        // A WebRTC peer frees nothing on drop: close it before any assertion
+        // can panic.
+        peer.close().await;
+
+        assert!(queued, "the sample is queued on the peer's sender");
+        match first.expect("one message on the peer's sender") {
+            ClientMsg::SessionStats {
+                session_id,
+                carrier,
+                ..
+            } => {
+                assert_eq!(session_id, sid.to_hex());
+                assert_eq!(
+                    carrier.as_deref(),
+                    Some("overlay_turn"),
+                    "the recorded carrier rides the sample"
+                );
+            }
+            other => panic!("not a session stats sample: {other:?}"),
+        }
+        assert!(
+            second.is_err(),
+            "exactly one sample, nothing else: {second:?}"
+        );
+    }
+
+    /// FR-102 P9d — `try_send`, never an await: a sender whose queue is full
+    /// (the loop that calls this drains it, so awaiting would wait on itself)
+    /// or closed queues nothing this round, hands the FR-101 P3 file notes
+    /// back for the next tick, and panics on nothing.
+    #[tokio::test]
+    async fn a_full_or_closed_sender_restores_the_file_notes_and_sends_nothing() {
+        use roomler_ai_remote_control::signaling::TransferDirection;
+        let sid = bson::oid::ObjectId::new();
+        // Capacity one: the first sample fills it.
+        let (a_tx, mut a_rx) = mpsc::channel::<ClientMsg>(1);
+        let peer = peer_with_sender(sid, a_tx).await;
+        let filled = send_one_session_stats(sid, &peer, "p9d-test").await;
+
+        // Full: the note the sample took comes back for the next tick.
+        crate::session_telemetry::counters(sid).note_file(
+            TransferDirection::ToHost,
+            "report.pdf",
+            1234,
+        );
+        let queued_full = send_one_session_stats(sid, &peer, "p9d-test").await;
+        let after_full = crate::session_telemetry::counters(sid).take_transfers();
+        let still_queued = a_rx.try_recv();
+
+        // Closed: the receiver is gone.
+        drop(a_rx);
+        crate::session_telemetry::counters(sid).note_file(
+            TransferDirection::FromHost,
+            "salaries.xlsx",
+            99,
+        );
+        let queued_closed = send_one_session_stats(sid, &peer, "p9d-test").await;
+        let after_closed = crate::session_telemetry::counters(sid).take_transfers();
+        peer.close().await;
+
+        assert!(filled, "the first sample fills the one-slot queue");
+        assert!(!queued_full, "a full queue takes no sample");
+        assert_eq!(after_full.files.len(), 1, "the file note is handed back");
+        assert_eq!(after_full.files[0].bytes, 1234);
+        assert!(
+            matches!(still_queued, Ok(ClientMsg::SessionStats { .. })),
+            "the first sample is still the only thing queued: {still_queued:?}"
+        );
+        assert!(!queued_closed, "a closed queue takes no sample");
+        assert_eq!(after_closed.files.len(), 1, "… and hands its note back too");
+        assert_eq!(after_closed.files[0].bytes, 99);
     }
 
     /// #2221 — `note_ws_down` says whether a failure STARTED an outage: the
@@ -6855,10 +7021,14 @@ mod tests {
     #[test]
     fn ws_send_timeout_fits_inside_the_watchdog_budget() {
         // The signaling pump's stall threshold is 90 s (main.rs
-        // registration). The worst un-ticked dwell in one select arm is
+        // registration). The worst un-ticked dwell in one select arm was
         // TWO bounded sends back-to-back (heartbeat + first session-stats
-        // frame — the stats loop breaks on its first error), so
-        // 2×WS_SEND_TIMEOUT must leave the watchdog real headroom, or
+        // frame). Since FR-102 P9d a session's stats are `try_send`-queued
+        // on the peer's own sender, so the heartbeat arm writes ONE frame
+        // (plus a ticked 3 s telemetry budget per peer) and the new
+        // carrier-ready arm's worst dwell is that 3 s telemetry budget with
+        // no WS write in it at all; 2×WS_SEND_TIMEOUT stays the bound, now
+        // with margin. It must leave the watchdog real headroom, or
         // the WINHOST-A 2026-08-15 failure comes back: wedged send →
         // stalled=signaling → exit(2) → full overlay teardown on a mere
         // VPN route capture. The lower bound keeps a slow-but-alive

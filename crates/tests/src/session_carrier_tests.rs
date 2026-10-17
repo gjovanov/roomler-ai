@@ -260,9 +260,11 @@ async fn a_session_whose_agent_recorded_no_carrier_has_none() {
 // ────────────────────────────────────────────────────────────────────────────
 
 use roomlerd::{config::AgentConfig, encode::EncoderPreference, enrollment, signaling};
+use std::net::IpAddr;
 use std::sync::Arc;
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -350,6 +352,22 @@ async fn wait_online(app: &TestApp, seeded: &SeededTenant, cfg: &AgentConfig) {
     panic!("the agent never came online");
 }
 
+/// The overlay's address ranges, as the agent's carrier observation reads them
+/// (`roomlerd::peer::addr_is_overlay_range`): the CGNAT `/10` the overlay
+/// lives in, and the derived-v6 ULA `fd72:6f6f:6d6c::/48`.
+fn is_overlay_range(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            s[0] == 0xfd72 && s[1] == 0x6f6f && s[2] == 0x6d6c
+        }
+    }
+}
+
 /// The stored `carrier`, or `None` if absent/null.
 async fn stored_carrier(app: &TestApp, sid: &ObjectId) -> Option<String> {
     app.db
@@ -373,7 +391,17 @@ async fn a_short_real_session_records_its_carrier() {
     // a peer and answers, and collect its ICE candidates to cross-feed.
     let mut me = MediaEngine::default();
     me.register_default_codecs().unwrap();
-    let api = APIBuilder::new().with_media_engine(me).build();
+    // No host candidate on an overlay address: on a box with an overlay
+    // interface, a pair on `100.64.0.0/10` (or the derived-v6 ULA) reads as an
+    // overlay carrier — `unknown` here, where no overlay runtime answers — not
+    // `direct`. CI's runner has no overlay; the filter makes a dev box read the
+    // same. (The agent keeps its own overlay addresses out by interface name.)
+    let mut setting = SettingEngine::default();
+    setting.set_ip_filter(Box::new(|ip| !is_overlay_range(ip)));
+    let api = APIBuilder::new()
+        .with_media_engine(me)
+        .with_setting_engine(setting)
+        .build();
     let pc = Arc::new(
         api.new_peer_connection(RTCConfiguration::default())
             .await
