@@ -523,10 +523,21 @@ pub struct WizardSteps {
 /// P3 — the install trace (spec §3e item 6): fetches by client class,
 /// tokens issued → redeemed, enrollments by method and OS. The fetch rows
 /// carry no tenant, so the exclusion set cannot apply to them; the other
-/// two exclude by tenant.
+/// two exclude by tenant. Since P3c the operator's internal networks stand
+/// in for the exclusion set on the fetches (`internal_fetches`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Install {
+    /// The counted fetches by `(asset, client, os)` — never the `internal`
+    /// rows (P3c), which are summed into `internal_fetches` instead.
     pub fetches: Measured<Vec<FetchRow>>,
+    /// P3c — fetches from the operator's internal networks
+    /// (`growth.internal_networks`), left out of `fetches` and reported here
+    /// so nothing vanishes silently. Not measured while no network is
+    /// configured and none was counted in the 28 days, never a 0 claiming
+    /// that no lab fetch happened. A digest stored before P3c reads as
+    /// `{not_measured, arrives_with: P3c}`.
+    #[serde(default = "internal_fetches_before_p3c")]
+    pub internal_fetches: Measured<Figure>,
     pub tokens: Measured<Tokens>,
     pub enrollments_by_method: Measured<Vec<MethodRow>>,
     /// P3b — the wizard's opt-in step diagnostics; not measured while
@@ -534,6 +545,12 @@ pub struct Install {
     /// before P3b holds the old `{not_measured, arrives_with: P3b}` here,
     /// which still reads as this type's other arm.
     pub wizard_steps: Measured<WizardSteps>,
+}
+
+/// A digest stored before P3c has no `internal_fetches`: it reads as not
+/// measured (its `fetches` still hold every class, the lab's included).
+fn internal_fetches_before_p3c() -> Measured<Figure> {
+    Measured::NotMeasured(NotMeasured::later("fetches from internal networks", "P3c"))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1435,22 +1452,36 @@ async fn read_tokens(
 /// them (`install:fetch:{asset, client, os}` per day), summed into the three
 /// windows. A row's day is a `YYYY-MM-DD` string, so the windows are string
 /// comparisons against the dates the windows start on.
-async fn read_fetches(state: &AppState, w: &Windows) -> Result<Vec<FetchRow>, DigestError> {
+///
+/// P3c — the `internal` rows (fetches from the operator's internal
+/// networks) never reach the table: they are summed into the second value,
+/// whatever their asset. It is `not_measured` only while this server names
+/// no internal network AND the window holds no internal row — rows counted
+/// while a network was configured are a measurement whatever the setting
+/// says today.
+async fn read_fetches(
+    state: &AppState,
+    w: &Windows,
+) -> Result<(Vec<FetchRow>, Measured<Figure>), DigestError> {
+    use roomler_ai_services::dao::growth::{
+        INSTALL_FETCH_METRIC, INSTALL_INTERNAL_CLIENT, INSTALL_SOURCE,
+    };
     let (day, d7, d28) = w.dates();
     let rows = GrowthDao::new(&state.db)
-        .read_daily(
-            roomler_ai_services::dao::growth::INSTALL_SOURCE,
-            roomler_ai_services::dao::growth::INSTALL_FETCH_METRIC,
-            &d28,
-            &day,
-        )
+        .read_daily(INSTALL_SOURCE, INSTALL_FETCH_METRIC, &d28, &day)
         .await?;
     let mut by: BTreeMap<(String, String, String), Figure> = BTreeMap::new();
+    let mut internal = Figure::default();
+    let mut internal_rows = 0usize;
     for r in rows {
         let dim = |k: &str| r.dims.get(k).cloned().unwrap_or_else(|| "unknown".into());
-        let f = by
-            .entry((dim("asset"), dim("client"), dim("os")))
-            .or_default();
+        let f = if dim("client") == INSTALL_INTERNAL_CLIENT {
+            internal_rows += 1;
+            &mut internal
+        } else {
+            by.entry((dim("asset"), dim("client"), dim("os")))
+                .or_default()
+        };
         if r.day == day {
             f.day += r.value;
         }
@@ -1459,6 +1490,19 @@ async fn read_fetches(state: &AppState, w: &Windows) -> Result<Vec<FetchRow>, Di
         }
         f.d28 += r.value;
     }
+    let (networks, refused) =
+        roomler_core::growth::InternalNetworks::parse(&state.settings.growth.internal_networks);
+    let internal = if networks.is_empty() && internal_rows == 0 {
+        // Two reasons for one state, said apart: nothing written, or nothing
+        // usable written (the boot warning names each entry and why).
+        Measured::NotMeasured(NotMeasured::now(if refused.is_empty() {
+            "no internal network configured on this server (growth.internal_networks)"
+        } else {
+            "no usable entry in growth.internal_networks (see the boot warning)"
+        }))
+    } else {
+        Measured::Value(internal)
+    };
     let mut out: Vec<FetchRow> = by
         .into_iter()
         .map(|((asset, client, os), fetches)| FetchRow {
@@ -1476,7 +1520,7 @@ async fn read_fetches(state: &AppState, w: &Windows) -> Result<Vec<FetchRow>, Di
             .then_with(|| a.client.cmp(&b.client))
             .then_with(|| a.os.cmp(&b.os))
     });
-    Ok(out)
+    Ok((out, internal))
 }
 
 /// Per-span sets of distinct run ids — the P3b counting unit.
@@ -2914,23 +2958,42 @@ pub async fn compute(
     // the enroll's claim all come from that module, so without it every
     // part reads "not mounted" rather than 0.
     let install = match &devices {
-        Some(d) => Install {
-            fetches: Measured::Value(read_fetches(state, &w).await?),
-            tokens: Measured::Value(read_tokens(state, &w, set).await?),
-            enrollments_by_method: Measured::Value(d.by_method_os.clone()),
-            // P3b — the switch off is "not measured", never a measured zero:
-            // with it off the route refuses every record, so a 0 here would
-            // claim nobody opted in when nobody could.
-            wizard_steps: if state.settings.growth.setup_diagnostics {
-                Measured::Value(read_wizard_steps(state, &w).await?)
-            } else {
-                Measured::NotMeasured(NotMeasured::now(
-                    "setup diagnostics are off on this server (growth.setup_diagnostics)",
-                ))
-            },
-        },
+        Some(d) => {
+            let (fetches, internal_fetches) = read_fetches(state, &w).await?;
+            // P3c review — the counters off is "not measured" for both fetch
+            // fields, never a measured zero: with them off nothing is counted,
+            // so an empty table or a 0 would claim nobody fetched anything.
+            const COUNTERS_OFF: &str =
+                "install counters are off on this server (growth.install_counters)";
+            let counting = state.settings.growth.install_counters;
+            Install {
+                fetches: if counting {
+                    Measured::Value(fetches)
+                } else {
+                    Measured::NotMeasured(NotMeasured::now(COUNTERS_OFF))
+                },
+                internal_fetches: if counting {
+                    internal_fetches
+                } else {
+                    Measured::NotMeasured(NotMeasured::now(COUNTERS_OFF))
+                },
+                tokens: Measured::Value(read_tokens(state, &w, set).await?),
+                enrollments_by_method: Measured::Value(d.by_method_os.clone()),
+                // P3b — the switch off is "not measured", never a measured zero:
+                // with it off the route refuses every record, so a 0 here would
+                // claim nobody opted in when nobody could.
+                wizard_steps: if state.settings.growth.setup_diagnostics {
+                    Measured::Value(read_wizard_steps(state, &w).await?)
+                } else {
+                    Measured::NotMeasured(NotMeasured::now(
+                        "setup diagnostics are off on this server (growth.setup_diagnostics)",
+                    ))
+                },
+            }
+        }
         None => Install {
             fetches: Measured::unmounted("fleet"),
+            internal_fetches: Measured::unmounted("fleet"),
             tokens: Measured::unmounted("fleet"),
             enrollments_by_method: Measured::unmounted("fleet"),
             wizard_steps: Measured::unmounted("fleet"),
@@ -3789,6 +3852,26 @@ mod tests {
         let back: Both = bson::from_document(doc).unwrap();
         assert_eq!(back, both);
         assert!(back.a.is_measured() && !back.c.is_measured());
+    }
+
+    /// P3c — an install section stored before P3c has no
+    /// `internal_fetches`: it still parses typed (through BSON, as the GET
+    /// reads it), and the field reads as not measured, arriving with P3c.
+    #[test]
+    fn an_install_section_from_before_p3c_reads_internal_as_not_measured() {
+        let zero = serde_json::json!({ "day": 0, "d7": 0, "d28": 0 });
+        let old = serde_json::json!({
+            "fetches": [],
+            "tokens": { "issued": zero, "redeemed": zero },
+            "enrollments_by_method": [],
+            "wizard_steps": { "not_measured": "wizard steps", "arrives_with": "P3b" },
+        });
+        let i: Install = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(i.internal_fetches, internal_fetches_before_p3c());
+        assert!(!i.internal_fetches.is_measured());
+        let doc = bson::to_document(&old).unwrap();
+        let back: Install = bson::from_document(doc).unwrap();
+        assert_eq!(back, i);
     }
 
     #[test]

@@ -401,6 +401,20 @@ async fn seed() -> Seeded {
     insert_fetch(&app, "2026-09-28", "install.sh", "script-sh", "unknown", 2).await;
     insert_fetch(&app, "2026-09-11", "install.sh", "script-sh", "unknown", 1).await;
     insert_fetch(&app, DAY, "installer-permachine", "wizard", "windows", 1).await;
+    // P3c — the lab's own fetches (`client: internal`), counted while a
+    // network was configured: never in the table, summed on their own line
+    // whatever the asset — and still a measurement on a server that names
+    // no network today (this one).
+    insert_fetch(&app, DAY, "install.sh", "internal", "unknown", 4).await;
+    insert_fetch(
+        &app,
+        "2026-09-28",
+        "installer-permachine",
+        "internal",
+        "windows",
+        2,
+    )
+    .await;
     insert_string_id(
         &app,
         "growth_daily",
@@ -741,6 +755,7 @@ async fn every_section_counts_the_seeded_day_exactly() {
               "fetches": { "day": 1, "d7": 1, "d28": 1 } },
         ])
     );
+    assert_eq!(fig(&j["install"]["internal_fetches"]), (4, 6, 6));
     assert_eq!(
         j["install"]["enrollments_by_method"],
         json!([
