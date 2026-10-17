@@ -26,6 +26,9 @@ bson.workspace = true
 # FR-102 P6 — the purestat puller's UTC days and its freeze horizon.
 chrono.workspace = true
 futures.workspace = true
+# FR-102 P7 — the Search Console service account's RS256 assertion (the
+# OAuth JWT-bearer grant).
+jsonwebtoken.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -33,3 +36,10 @@ tokio.workspace = true
 tracing.workspace = true
 # FR-102 P5 — the unsubscribe link's `i=` read from the raw query.
 url = "2"
+
+[dev-dependencies]
+# FR-102 P7 — an RSA key made at test time, so the service-account path
+# (a PKCS#8 key and RS256, as Google issues it) is exercised without a
+# private key in the repository. The version already in the lock file
+# (through web-push).
+rsa = { version = "0.7", features = ["getrandom"] }

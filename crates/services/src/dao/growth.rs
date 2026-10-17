@@ -95,6 +95,27 @@ pub const PURESTAT_SOURCE: &str = "purestat";
 /// again and never rewritten. Within it, every run re-pulls the day, so a
 /// late event (a visit still open at midnight, a buffered batch) lands.
 pub const PURESTAT_FREEZE_DAYS: i64 = 7;
+/// P7 — the `saas` GitHub puller's public counters: one CUMULATIVE snapshot
+/// per closed UTC day (`dims.by` `repo` · `release` · `flavour`), differenced
+/// into daily deltas by the reader. A day with no `ok` pull has no snapshot,
+/// and every delta across it is null — never split, never 0.
+pub const GITHUB_SOURCE: &str = "github";
+/// P7 — the repository's traffic, read with the optional token: views and
+/// clones per day from GitHub's 14-day series (`by: traffic`), and the
+/// referrers' 14-day ranking as read after a day closed (`by: referrer`).
+pub const GITHUB_TRAFFIC_SOURCE: &str = "github_traffic";
+/// P7 — Google Search Console, per FINAL day (a Pacific-time day, as
+/// Google dates it): `dims.by` `site` · `page` · `query` · `page_query`,
+/// metrics `clicks`, `impressions` and `position_x100` (the position
+/// weighted by impressions, ×100 — averaged over any set of rows as
+/// `Σ position_x100 / Σ impressions / 100`).
+pub const SEARCH_CONSOLE_SOURCE: &str = "search_console";
+/// P7 — Bing Webmaster's daily site totals (`by: site`, `clicks`
+/// `impressions`), and the source of its cycle's `growth_pulls` row.
+pub const BING_SOURCE: &str = "bing";
+/// P7 — Bing's weekly buckets per query and per page, at Bing's own grain,
+/// stored under the bucket's date.
+pub const BING_WEEKLY_SOURCE: &str = "bing_weekly";
 
 /// The most org-days one read loads — far above this deployment's volume
 /// (every org active every day for 25 months is ~10 rows a day); a bound,

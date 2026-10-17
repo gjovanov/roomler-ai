@@ -1101,6 +1101,11 @@ pub struct Sections {
     /// P8 — each platform's own numbers, as the promotion pipeline pushed
     /// them; `not_measured` when nothing was pushed in the 28-day window.
     pub social: Measured<Social>,
+    /// P7 — the repository's public counters (cumulative snapshots and
+    /// their deltas) and, with a token, its traffic. A row stored before P7
+    /// reads both halves as not measured.
+    #[serde(default = "super::github::GithubSection::before_p7")]
+    pub github: super::github::GithubSection,
     pub search: NotMeasured,
     /// P10 — the alerts that fired or cleared that day and the ones open at
     /// the compute; `not_measured` while `growth.alerts` is off.
@@ -3127,6 +3132,9 @@ pub async fn compute(
             "alerts are off on this server (ROOMLER__GROWTH__ALERTS)",
         ))
     };
+    // P7 — the repository's counters and traffic, as the `saas` puller
+    // stored them: snapshots differenced, never a 0 for a missing day.
+    let github = super::github::section(state, day).await?;
 
     Ok(Sections {
         headline: Headline {
@@ -3179,6 +3187,7 @@ pub async fn compute(
         quality,
         install,
         social,
+        github,
         search: NotMeasured::later("clicks, impressions, top queries and pages", "P7"),
         alerts,
     })
