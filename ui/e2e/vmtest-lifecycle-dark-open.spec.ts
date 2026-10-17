@@ -23,13 +23,18 @@ const HOLD_S = 900
 
 async function findNamedOnlineAgent(token: string): Promise<string | null> {
   for (let i = 0; i < 24; i++) {
-    const resp = await fetch(`${API_URL}/api/tenant/${TENANT_ID}/agent`, {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-    if (resp.ok) {
+    // Every page: the listing returns 25 rows unless asked for more (100 at most), and a long-lived lab device
+    // drops off the first page as the org fills with cells.
+    for (let page = 1, pages = 1; page <= pages; page++) {
+      const resp = await fetch(`${API_URL}/api/tenant/${TENANT_ID}/agent?per_page=100&page=${page}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!resp.ok) break
       const body = (await resp.json()) as {
+        total_pages?: number
         items?: Array<{ id: string; machine_name?: string; name?: string; display_name?: string; is_online: boolean }>
       }
+      pages = body.total_pages ?? 1
       const hit = body.items?.find(
         (a) => a.is_online && (a.machine_name === AGENT_NAME || a.name === AGENT_NAME || a.display_name === AGENT_NAME),
       )
