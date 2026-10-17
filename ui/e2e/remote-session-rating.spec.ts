@@ -18,6 +18,17 @@
  * Every purestat request is aborted before it leaves (a test run must never
  * reach the analytics plane). The prompt is read by its `data-testid`s, never
  * by `video, canvas`.
+ *
+ * Two targets. The `agent-e2e` harness: its single agent is "the first
+ * online one". A named device on a real server — a vmtest guest, from mars,
+ * the way `vmtest-remote.spec.ts` runs: set `E2E_AGENT_NAME` and the agent is
+ * chosen by EXACT name, never "the first online" (the vmtest org also holds
+ * the permanent anchor and other sessions' guests).
+ *
+ * ⚠️ Sessions are COOKIE-ONLY since #680/#690: each context signs in through
+ * its own request API, so the HttpOnly session cookie lands in that
+ * context's jar. Seeding `localStorage` tokens, as this spec first did, does
+ * nothing and the viewer shows the login form.
  */
 import { test, expect, type Page, type BrowserContext } from '@playwright/test'
 
@@ -27,6 +38,8 @@ const TENANT_ID = process.env.E2E_AGENT_E2E_TENANT_ID || ''
 const ADMIN_EMAIL = process.env.E2E_AGENT_E2E_ADMIN_EMAIL || 'agent-e2e-admin@roomler.local'
 const ADMIN_PASSWORD =
   process.env.E2E_AGENT_E2E_ADMIN_PASSWORD || 'agent-e2e-bootstrap-pw-2026'
+/** When set, the agent is this device, matched exactly; empty = the first online. */
+const AGENT_NAME = process.env.E2E_AGENT_NAME || ''
 
 /** The viewer's threshold (`RATING_MIN_SESSION_MS`), measured from the request. */
 const MIN_SESSION_MS = 30_000
@@ -47,27 +60,54 @@ async function adminLogin(): Promise<string> {
   return body.access_token
 }
 
+/** The online agent to drive: the named one when `E2E_AGENT_NAME` is set
+ *  (exact match on any of its names, never a fallback), else the first. */
 async function findOnlineAgent(token: string): Promise<{ id: string } | null> {
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 24; i++) {
     const resp = await fetch(`${API_URL}/api/tenant/${TENANT_ID}/agent`, {
       headers: { Authorization: `Bearer ${token}` },
     })
     if (!resp.ok) return null
-    const body = (await resp.json()) as { items?: Array<{ id: string; is_online: boolean }> }
-    const online = body.items?.find((a) => a.is_online)
+    const body = (await resp.json()) as {
+      items?: Array<{
+        id: string
+        is_online: boolean
+        machine_name?: string
+        name?: string
+        display_name?: string
+      }>
+    }
+    const online = body.items?.find(
+      (a) =>
+        a.is_online &&
+        (!AGENT_NAME ||
+          a.machine_name === AGENT_NAME ||
+          a.name === AGENT_NAME ||
+          a.display_name === AGENT_NAME),
+    )
     if (online) return online
-    await new Promise((r) => setTimeout(r, 500))
+    await new Promise((r) => setTimeout(r, AGENT_NAME ? 5_000 : 500))
   }
   return null
 }
 
-/** A context whose analytics requests never leave, signed in as the admin. */
-async function signedInContext(context: BrowserContext, token: string): Promise<void> {
+/** A context whose analytics requests never leave, signed in as the admin
+ *  through its own cookie jar. */
+async function signedInContext(context: BrowserContext): Promise<void> {
   await context.route('https://purestat.ai/**', (r) => r.abort())
-  await context.addInitScript((tok) => {
-    window.localStorage.setItem('access_token', tok)
-    window.localStorage.setItem('refresh_token', tok)
-  }, token)
+  const login = await context.request.post(`${API_URL}/api/auth/login`, {
+    data: { email: ADMIN_EMAIL, password: ADMIN_PASSWORD },
+  })
+  expect(login.ok(), `browser login failed: ${login.status()}`).toBeTruthy()
+  // The hint that makes the SPA render its shell and refresh through the
+  // cookie instead of bouncing to /login.
+  await context.addInitScript(() => {
+    try {
+      window.localStorage.setItem('roomler-signed-in', '1')
+    } catch {
+      /* storage blocked — the cookie still authenticates */
+    }
+  })
 }
 
 /** Count every rating POST the page makes. */
@@ -112,10 +152,12 @@ test.describe('AC19 — the post-session rating prompt', () => {
   }) => {
     const token = await adminLogin()
     const agent = await findOnlineAgent(token)
+    // A named device that never came online is a failure, not a skip.
+    if (AGENT_NAME) expect(agent, `agent "${AGENT_NAME}" never reported online`).toBeTruthy()
     test.skip(!agent, 'no online enrolled agent found — apply the agent-e2e overlay first')
     const remoteUrl = `${BASE_URL}/tenant/${TENANT_ID}/agent/${agent!.id}/remote`
 
-    await signedInContext(context, token)
+    await signedInContext(context)
     const seen = countFeedbackPosts(page)
     await page.goto(remoteUrl)
 
@@ -161,7 +203,7 @@ test.describe('AC19 — the post-session rating prompt', () => {
     //    next day would be: the prompt again; a rating posts exactly once.
     const fresh = await browser.newContext()
     try {
-      await signedInContext(fresh, token)
+      await signedInContext(fresh)
       const page2 = await fresh.newPage()
       const seen2 = countFeedbackPosts(page2)
       await page2.goto(remoteUrl)
