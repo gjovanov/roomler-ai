@@ -1032,8 +1032,7 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
 
     github_blocks(&mut out, &s.github);
 
-    out.push(Heading("Not yet measured".into()));
-    out.push(Line("Search".into(), not_measured(&s.search)));
+    search_blocks(&mut out, &s.search);
 
     alert_blocks(&mut out, &s.alerts, "the day");
 
@@ -1044,6 +1043,107 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
         doc.excluded.users, doc.excluded.tenants, doc.day, doc.attempts
     )));
     out
+}
+
+/// P7 — a search row as table cells: the key, clicks, impressions, and the
+/// position only where the reader gave one (from 30 impressions).
+fn search_cells(r: &super::search::SearchRow) -> Vec<String> {
+    vec![
+        r.key.clone(),
+        r.cell.clicks.to_string(),
+        r.cell.impressions.to_string(),
+        r.cell
+            .position
+            .map(|p| format!("{p:.1}"))
+            .unwrap_or_else(|| "—".into()),
+    ]
+}
+
+/// P7 — the Search section: Google over its final days, Bing at its own
+/// grain. Shared by the daily digest and the weekly roll-up.
+pub(crate) fn search_blocks(out: &mut Vec<Block>, s: &Measured<super::search::SearchSection>) {
+    use Block::*;
+    out.push(Heading("Search".into()));
+    let s = match s {
+        Measured::Value(s) => s,
+        Measured::NotMeasured(n) => {
+            out.push(Line("Search".into(), not_measured(n)));
+            return;
+        }
+    };
+    match &s.google {
+        Measured::Value(g) => {
+            out.push(Line(
+                "Google, final through".into(),
+                format!("{} (Search Console's own day)", g.through),
+            ));
+            out.push(Line("Clicks".into(), fig(&g.clicks)));
+            out.push(Line("Impressions".into(), fig(&g.impressions)));
+            out.push(Line("Days pulled".into(), fig(&g.days)));
+            if let (Some(ctr), Some(pos)) = (g.d28.ctr, g.d28.position) {
+                out.push(Line(
+                    "CTR · average position (28d)".into(),
+                    format!("{:.1} % · {pos:.1}", ctr * 100.0),
+                ));
+            }
+            for (title, rows) in [
+                ("Top queries (7d)", &g.top_queries_7d),
+                ("Top pages (7d)", &g.top_pages_7d),
+            ] {
+                if !rows.is_empty() {
+                    out.push(Table(
+                        vec![
+                            title.into(),
+                            "Clicks".into(),
+                            "Impressions".into(),
+                            "Position".into(),
+                        ],
+                        rows.iter().map(search_cells).collect(),
+                    ));
+                }
+            }
+        }
+        Measured::NotMeasured(n) => out.push(Line("Google".into(), not_measured(n))),
+    }
+    match &s.bing {
+        Measured::Value(b) => {
+            out.push(Line(
+                "Bing, daily through".into(),
+                format!("{} (Bing's own day)", b.through),
+            ));
+            out.push(Line("Bing clicks".into(), fig(&b.clicks)));
+            out.push(Line("Bing impressions".into(), fig(&b.impressions)));
+            if let Some(week) = &b.week {
+                for (title, rows) in [
+                    (
+                        format!("Bing queries, its week of {week}"),
+                        &b.top_queries_week,
+                    ),
+                    (format!("Bing pages, its week of {week}"), &b.top_pages_week),
+                ] {
+                    if !rows.is_empty() {
+                        out.push(Table(
+                            vec![
+                                title,
+                                "Clicks".into(),
+                                "Impressions".into(),
+                                "Position".into(),
+                            ],
+                            rows.iter().map(search_cells).collect(),
+                        ));
+                    }
+                }
+            }
+        }
+        Measured::NotMeasured(n) => out.push(Line("Bing".into(), not_measured(n))),
+    }
+    out.push(Note(
+        "Google's numbers are its final days only — Search Console settles two or three days \
+         behind — on its own (Pacific) dates; a position is weighted by impressions, and a CTR \
+         or a position appears only from 30 impressions. Bing's queries and pages come in Bing's \
+         weekly buckets and are never relabelled as 7 days."
+            .into(),
+    ));
 }
 
 /// P7 — a change as text: signed, or `—` when a snapshot it needs is
@@ -1665,8 +1765,9 @@ pub fn weekly_blocks(doc: &DigestDoc, s: &WeeklySections) -> Vec<Block> {
     quality_blocks(&mut out, &s.quality);
 
     // P7 — the repository at Sunday's snapshot: its 7-day changes are the
-    // week's.
+    // week's; search over the windows ending on Sunday's newest final day.
     github_blocks(&mut out, &s.github);
+    search_blocks(&mut out, &s.search);
 
     alert_blocks(&mut out, &s.alerts, "the week");
 
@@ -2232,7 +2333,33 @@ mod tests {
                     "no GitHub token configured (ROOMLER__GROWTH__GITHUB_TOKEN)",
                 )),
             },
-            search: NotMeasured::later("search", "P7"),
+            search: Measured::Value(crate::growth::search::SearchSection {
+                google: Measured::Value(crate::growth::search::GoogleReport {
+                    through: "2026-10-10".into(),
+                    clicks: f(3, 20, 70),
+                    impressions: f(150, 900, 4000),
+                    d28: crate::growth::search::SearchCell {
+                        clicks: 70,
+                        impressions: 4000,
+                        ctr: Some(0.02),
+                        position: Some(8.4),
+                    },
+                    days: f(1, 7, 28),
+                    top_queries_7d: vec![crate::growth::search::SearchRow {
+                        key: "self-hosted teamviewer alternative".into(),
+                        cell: crate::growth::search::SearchCell {
+                            clicks: 6,
+                            impressions: 12,
+                            ctr: None,
+                            position: None,
+                        },
+                    }],
+                    top_pages_7d: vec![],
+                }),
+                bing: Measured::NotMeasured(NotMeasured::now(
+                    "no Bing Webmaster API key configured (ROOMLER__GROWTH__BING_API_KEY)",
+                )),
+            }),
             alerts: Measured::Value(AlertsSection {
                 fired: vec![AlertRow {
                     rule: "spike".into(),
@@ -2461,12 +2588,28 @@ mod tests {
         assert!(text.contains(
             "Helper-release downloads (CI's vendored builds): 8000 (day +100 · 7d — · 28d —)"
         ));
+        // P7 — search: Google's final days with the day it is final
+        // through, the rates only where the reader gave them (28 days, from
+        // 30 impressions), a query below the floor with no position, and
+        // Bing saying why it is absent.
+        assert!(text.contains("== Search =="), "{text}");
+        assert!(text.contains("Google, final through: 2026-10-10 (Search Console's own day)"));
+        assert!(text.contains("Clicks: 3 (7d 20 · 28d 70)"));
+        assert!(
+            text.contains("CTR · average position (28d): 2.0 % · 8.4"),
+            "{text}"
+        );
+        assert!(text.contains("self-hosted teamviewer alternative | 6 | 12 | —"));
+        assert!(text.contains("Bing: not measured — no Bing Webmaster API key configured"));
+        assert!(text.contains("never relabelled as 7 days"));
+        assert!(!text.contains("Not yet measured"));
         assert!(text.contains("linkedin | 1 (7d 2 · 28d 5)"), "{text}");
         assert!(
             text.contains("T+7d | clicks 80 · impressions 3000"),
             "{text}"
         );
-        assert!(text.contains("not measured — arrives with P7"));
+        // P7 is built: no section of this day still waits for it.
+        assert!(!text.contains("arrives with P7"), "{text}");
         assert_eq!(subject("2026-10-13"), "Roomler daily digest — 2026-10-13");
         // P10 — the day's alerts: the open row listed once (it fired that
         // day too), with its detail as text.
@@ -2678,6 +2821,10 @@ mod tests {
                 series: vec![],
             },
             github: crate::growth::github::GithubSection::before_p7(),
+            search: Measured::NotMeasured(NotMeasured::later(
+                "clicks, impressions, top queries and pages",
+                "P7",
+            )),
         };
         let text = render_weekly_text(&doc, &s);
         // P7 — the section renders even when nothing is measured yet.

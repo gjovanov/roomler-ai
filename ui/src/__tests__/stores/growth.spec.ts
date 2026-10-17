@@ -263,6 +263,20 @@ describe('useGrowthStore', () => {
     )
   })
 
+  it('fetches the content table at the P7 route with its range', async () => {
+    const store = useGrowthStore()
+    mockApi.get.mockResolvedValue({ rows: [] })
+    await store.fetchContent()
+    expect(mockApi.get).toHaveBeenCalledWith('/admin/growth/content')
+    await store.fetchContent({ since: '2026-10-01', until: '2026-10-13', includeInternal: true })
+    expect(mockApi.get).toHaveBeenCalledWith(
+      '/admin/growth/content?since=2026-10-01&until=2026-10-13&include_internal=true',
+    )
+    // A post's cells keep the three states apart: a value, a reason, a zero.
+    expect(isNotMeasured({ not_measured: 'purestat key not configured' })).toBe(true)
+    expect(isNotMeasured({ d7: { clicks: 0, impressions: 0 }, d28: { clicks: 0, impressions: 0 }, top_queries_28d: [] })).toBe(false)
+  })
+
   it('fetches channels and manages ingest keys at the P8 routes', async () => {
     const store = useGrowthStore()
     mockApi.get.mockResolvedValue({ keys: [] })

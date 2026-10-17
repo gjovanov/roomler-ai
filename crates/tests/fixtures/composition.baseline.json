@@ -25,6 +25,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/admin/growth/content",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/admin/growth/digest",
       "methods": "GET,HEAD"
     },

@@ -233,6 +233,10 @@ pub struct WeeklySections {
     /// P7 — the repository at Sunday's snapshot (the digest's section for
     /// that day): its 7-day changes and traffic are the week's.
     pub github: super::github::GithubSection,
+    /// P7 — search for Sunday: Google's windows ending on the newest final
+    /// day on or before it (its 7 days lag the week by Google's settling),
+    /// Bing at its own grain.
+    pub search: super::digest::Measured<super::search::SearchSection>,
 }
 
 // ── Computing ────────────────────────────────────────────────────────────
@@ -443,6 +447,7 @@ pub async fn compute(
     };
     let quality = quality::compute(state, set, monday, sunday, include_internal, now).await?;
     let github = super::github::section(state, sunday).await?;
+    let search = Measured::Value(super::search::section(state, sunday).await?);
     Ok(WeeklySections {
         headline,
         funnel,
@@ -453,6 +458,7 @@ pub async fn compute(
         alerts,
         quality,
         github,
+        search,
     })
 }
 

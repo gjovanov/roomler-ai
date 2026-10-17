@@ -16,7 +16,7 @@ recorded: sessions by outcome, the time to first frame frozen before its logs ex
 100 device-days, by agent version (P9a) — and the repository on GitHub: stars, forks and release
 downloads as daily snapshots, and its traffic with a token (P7a) — and search: Google Search
 Console per final day, the blog's posts with their URL Inspection verdict, and Bing at its own
-grain (P7b).
+grain (P7b), read by the Content table and the digest's Search section (P7c).
 Spec: [`docs/fr/FR-102-growth-observability.md`](fr/FR-102-growth-observability.md) (#2127). It
 also places the existing `/observability` page, which no doc described before.
 
@@ -132,7 +132,7 @@ this server, not reachable, or not built yet is `{"not_measured": "<reason>",
 | `install` | tokens issued → redeemed; fetches by `(asset, client class, OS)`; enrollments by `(method, OS)`; the wizard's steps — runs reaching each, their outcomes and the failures by code, **opted-in runs only, labelled with their n** — [the install trace](#the-install-trace-p3), [the wizard's diagnostics](#the-wizards-opt-in-diagnostics-p3b) | `enroll_token_issued`, `growth_daily`, `agents.install`, `setup_diagnostics` | P3; wizard steps P3b (`not_measured` while `growth.setup_diagnostics` is off) |
 | `social` | posts published per platform `{day, d7, d28}`; the snapshots taken that day (at most 20), each with its post's campaign and the platform's own metric names — `not_measured` when nothing was pushed in 28 days | `growth_posts`, `growth_post_snapshots` | P8 |
 | `github` | the repository's stars, forks, watchers and release downloads at the day's snapshot, each with its day / 7-day / 28-day change (`null` where a snapshot is missing), the week's downloads by release and by flavour; with a token, views and clones per window over the measured days and GitHub's 14-day referrer ranking — [GitHub](#github-the-repositorys-counters-and-traffic-p7a) | `growth_daily` (`github`, `github_traffic`), `growth_pulls` | P7a; traffic with `ROOMLER__GROWTH__GITHUB_TOKEN` |
-| `search` | — | — | P7 (the search half) |
+| `search` | Google: the day it is final through, clicks and impressions per window over its final days (`days` pulled), the 28-day CTR and position from 30 impressions, the top queries and pages of 7 days; Bing: its daily totals and its newest weekly bucket's top rows — [the Search section](#the-search-section--the-digest-and-the-weekly-roll-up) | `growth_daily` (`search_console`, `bing`, `bing_weekly`), `growth_pulls` | P7c; `not_measured` per engine without its key |
 | `alerts` | the alert rows that `fired` or `cleared` during the day, and the ones `open` at the compute — rule, key, times, the numbers behind it; `not_measured` while the alerts are off on this server — [alerts](#the-read-key-the-weekly-roll-up-and-alerts-p10) | `growth_alerts` | P10 (`ROOMLER__GROWTH__ALERTS`) |
 
 A module that is not mounted (`[modules] remote = false`, a reduced profile) makes its part
@@ -1197,6 +1197,80 @@ the user's and covers every site that user verified), sealed into `roomler2-secr
 > Bing's OAuth has a read-only `webmaster.read` scope, but it needs an interactive consent and a
 > stored refresh token; the puller does not implement it.
 
+## The Content table and the Search section (P7c)
+
+The readers of P7b's rows, host-owned like every growth view: one row per blog post, and a Search
+section in the daily digest and the weekly roll-up.
+
+```mermaid
+flowchart LR
+  GC[("growth_content<br/>the posts, the index verdict")] --> CT["GET /api/admin/growth/content"]
+  PS[("purestat v1 query<br/>live, path · path × referrer_host")] --> CT
+  SC[("growth_daily search_console<br/>page · page_query")] --> CT
+  U[("users.signup_attribution<br/>.landing_path")] --> CT
+  X["ExclusionSet"] --> CT
+  CT --> TAB["/observability/growth → Content"]
+  SC2[("growth_daily search_console<br/>site · query · page")] --> SS["growth::search::section"]
+  BG[("growth_daily bing · bing_weekly")] --> SS
+  SS --> DG["the digest's search section"]
+  SS --> WK["the weekly roll-up's"]
+```
+
+### The Content table — `GET /api/admin/growth/content?since&until&include_internal`
+
+[`content.rs`](../crates/api/src/growth/content.rs) (`compute`,
+[`:292`](../crates/api/src/growth/content.rs)) — platform admins and the read key, the empty
+404 otherwise and with `growth.enabled = false`, the Campaigns table's range rules (`since` /
+`until` inclusive, the 28 closed days ending yesterday by default).
+
+| Column | Source | Window |
+|---|---|---|
+| post, published | `growth_content` (the blog's own feed); posts in the feed first, newest first, then the ones that left it | — |
+| visitors, reads (and the read share from 30 pageviews), median read time, top 3 channels | purestat, **live** for the range — `path` with `visitors pageviews reads median_read_s`, and `path × referrer_host` mapped through the §3b channel table — unique visitors do not add across days, so the frozen daily path rows are not summed ([`web`, `:170`](../crates/api/src/growth/content.rs)) | `[since, until]` |
+| Google 7d and 28d: clicks, impressions, CTR, position; top 5 queries over 28 days | `growth_daily {source: search_console}` — the **`page`** breakdown, matched to the post by its path whatever the host, so the anonymised queries are in it; the `page_query` breakdown for the queries ([`per_path`, `search.rs:435`](../crates/api/src/growth/search.rs)) | the 7 and 28 days ending `google_through`, the newest final day pulled on or before `until` |
+| indexed | `growth_content.inspection`: Google's verdict and coverage state, the last crawl, when it was inspected, and the newest attempt's error if it failed | as of `inspected_at` |
+| sign-ups | `users.signup_attribution.landing_path` equal to the post's path (with or without its trailing slash), created in the range, the exclusion set applied ([`signups_by_path`, `:238`](../crates/api/src/growth/content.rs)) | `[since, until]` |
+
+- **Small numbers stay honest**: CTR and position appear from 30 impressions, the read share from
+  30 pageviews; below that the counts stand alone.
+- **Three cells**: no purestat key, a 401 or a timeout makes every web cell `not_measured` with
+  the reason (`web_not_measured` at the top); no final Search Console day makes every Google cell
+  `not_measured` ("no Search Console key configured", "no final Search Console day pulled yet");
+  a post nobody inspected yet says so. A post that had none of it in the window is a measured 0.
+
+> ⚠️ **Sign-ups by landing path are a lower bound.** The site writes `landing_path` only on a
+> journey that began on a campaign link (FR-88's carry, `ui/docs/theme/attribution.js`); an
+> organic reader of a post who signs up carries none until FR-91 P3 builds the organic carry.
+> Every sign-up cell carries that note.
+
+The SPA's `/observability/growth` gains a **Content** tab
+([`GrowthContent.vue`](../ui/src/components/growth/GrowthContent.vue)): the range,
+include-internal, the reasons a column is not measured, and the table; a `not_measured` cell is a
+muted chip with its reason on hover, and every title, path and query is rendered as text, never
+`v-html`. AC17 is read here: for one post and one closed week, the clicks and impressions against
+Search Console's own Performance report for that page and those days.
+
+### The Search section — the digest and the weekly roll-up
+
+`growth::search::section` ([`search.rs:418`](../crates/api/src/growth/search.rs)) is the digest's
+`search` section ([`digest.rs:1096`](../crates/api/src/growth/digest.rs)) and, for Sunday, the
+weekly roll-up's:
+
+| Part | What | Rule |
+|---|---|---|
+| `google.through` | the newest final day pulled on or before the digest's day (Google settles 2–3 days behind, so this lags) | [`through_of`, `:262`](../crates/api/src/growth/search.rs), 14 days back at most |
+| `google.clicks`, `impressions` | day / 7d / 28d ending on `through`, from the `site` rows | only days with an `ok` pull; `days` says how many of each window that is |
+| `google.d28` | the 28 days' CTR and position | from 30 impressions; position weighted by impressions |
+| `google.top_queries_7d`, `top_pages_7d` | top 10 by clicks, then impressions | the `query` breakdown leaves Google's anonymised queries out; the `page` one holds every page |
+| `bing.through`, `clicks`, `impressions` | Bing's daily site totals, windows ending on its newest day | Bing's own (Pacific) days |
+| `bing.week`, `top_queries_week`, `top_pages_week` | Bing's newest weekly bucket and its top rows | a week as Bing cuts it, never a 7-day window; Bing's positions are not averaged |
+
+Each engine is `not_measured` with its reason (no key, nothing pulled yet, `saas` not mounted),
+never a 0; a digest stored before P7 reads `{not_measured, arrives_with: P7}` there. The email
+renders a **Search** block ([`search_blocks`, `render.rs:1051`](../crates/api/src/growth/render.rs))
+with the day Google is final through, the windows, the 28-day CTR and position, the top queries
+and pages, Bing's day and week, and a note on both lags.
+
 ## The newsletter: delivery, per-issue tags and unsubscribes (P5)
 
 What an issue did — delivered, bounced, complaints, who left through it, the visits and
@@ -1980,7 +2054,7 @@ everyone, and the viewer has no strip.
 | Orgs, machines, calls, users | platform-wide inventories and series | `/api/admin/stats/{orgs,machines,calls,users}` |
 | Usage | per-user minutes and bytes across every org | `/api/admin/stats/usage*` |
 | Attribution (FR-88) | sign-ups by campaign key and how many activated | `/api/admin/stats/attribution` |
-| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), the Channels table with the machine keys (P8, P10), the Newsletter tab (P5), the Revenue tab (P4), the Quality tab (P9a), the Weekly tab and the Alerts panel (P10); the digest's `quality.ratings` from the viewer's post-session prompt (P9b); the digest's and the weekly's `github` section (P7a) | `/api/admin/growth/*` |
+| **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), the Channels table with the machine keys (P8, P10), the Newsletter tab (P5), the Revenue tab (P4), the Quality tab (P9a), the Weekly tab and the Alerts panel (P10); the digest's `quality.ratings` from the viewer's post-session prompt (P9b); the digest's and the weekly's `github` section (P7a); the Content tab and the digest's and the weekly's `search` section (P7c) | `/api/admin/growth/*` |
 
 ## Field verification
 

@@ -21,6 +21,11 @@
 //! * **Bing** (`saas::bing_pull::run_once`): the daily totals and the weekly
 //!   buckets at Bing's own grain, Bing's `/Date(…)/` read with its offset, a
 //!   rare query's text never stored, and a refused key recorded.
+//! * **The readers** (P7c): the Content table per post — Google's 7 and 28
+//!   days ending on the newest final day, rates only from 30, the index
+//!   verdict, the sign-ups that landed on it with the exclusion set
+//!   applied, the web plane "not measured" without purestat — and the
+//!   digest's Search section through the same day.
 
 use std::{
     collections::HashMap,
@@ -1056,4 +1061,165 @@ async fn bing_lands_at_its_own_grain_and_a_refused_key_is_recorded() {
         Some(("failed".into(), Some(reason.into())))
     );
     assert_eq!(count(&bad_app, GROWTH_DAILY, doc! {}).await, 0);
+}
+
+// ── The readers: the Content table and the digest's Search section ──────
+
+/// What the pullers stored, as the Content table and the digest read it:
+/// per post, Google's 7 and 28 days ending on the newest final day (CTR and
+/// position from 30 impressions), its top queries, the index verdict, the
+/// sign-ups that landed on it (the trailing slash folded, the exclusion set
+/// applied); the web plane "not measured" without a purestat key, never 0;
+/// and the digest's Search section through the same final day.
+#[tokio::test]
+async fn the_content_table_and_the_digest_read_what_the_pullers_stored() {
+    let (base, g, f) = fake_google().await;
+    let admin = bson::oid::ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(admin.to_hex());
+    })
+    .await;
+    let token = app
+        .state
+        .auth
+        .generate_tokens(admin, "padmin@test.io", "padmin")
+        .unwrap()
+        .access_token;
+    let client = sc(&base, SECRET);
+    let t = today();
+    let d1 = ds(t - Duration::days(3));
+    *g.first_incomplete.lock().unwrap() = Some(ds(t - Duration::days(2)));
+    g.data.lock().unwrap().insert(
+        d1.clone(),
+        vec![
+            (vec!["date"], row(&[], 5.0, 200.0, 6.5)),
+            (
+                vec!["page"],
+                row(&["https://roomler.ai/blog/a/"], 4.0, 150.0, 5.0),
+            ),
+            (
+                vec!["page"],
+                row(&["https://roomler.ai/blog/b/"], 1.0, 20.0, 11.0),
+            ),
+            (vec!["query"], row(&["remote desktop"], 3.0, 100.0, 4.0)),
+            (
+                vec!["page", "query"],
+                row(
+                    &["https://roomler.ai/blog/a/", "remote desktop"],
+                    3.0,
+                    90.0,
+                    4.0,
+                ),
+            ),
+        ],
+    );
+    *f.0.lock().unwrap() = Some(feed_xml(&[
+        ("a", "Post A", "2026-09-25T22:45:13Z"),
+        ("b", "Post B", "2026-10-01T08:00:00Z"),
+    ]));
+    search_pull::run_once(&app.state.core, &client, at_day(t, 3))
+        .await
+        .unwrap();
+    content_pull::run_once(
+        &app.state.core,
+        &format!("{base}/blog/feed.xml"),
+        Some(&client),
+        at_day(t, 3),
+    )
+    .await
+    .unwrap();
+    // Two sign-ups landed on post A (one spelled without the slash), one
+    // of them by an excluded person (the platform admin); one elsewhere.
+    let users = app.db.collection::<Document>("users");
+    let created = bson::DateTime::from_millis(at_day(t - Duration::days(5), 12).timestamp_millis());
+    for (i, (id, landing)) in [
+        (bson::oid::ObjectId::new(), "/blog/a"),
+        (admin, "/blog/a/"),
+        (bson::oid::ObjectId::new(), "/pricing"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        users
+            .insert_one(doc! {
+                "_id": id, "email": format!("u{i}@test.io"), "username": format!("u{i}"),
+                "created_at": created, "deleted_at": bson::Bson::Null,
+                "signup_attribution": { "source": "linkedin", "landing_path": landing },
+            })
+            .await
+            .unwrap();
+    }
+
+    let r = app
+        .auth_get("/api/admin/growth/content", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let j: Value = r.json().await.unwrap();
+    assert_eq!(j["google_through"], json!(d1));
+    assert_eq!(
+        j["web_not_measured"]["not_measured"], "purestat key not configured",
+        "{j}"
+    );
+    let rows = j["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["path"], "/blog/b/", "newest first");
+    let a = &rows[1];
+    assert_eq!(a["title"], "Post A");
+    assert_eq!(a["web"]["not_measured"], "purestat key not configured");
+    let d7 = &a["google"]["d7"];
+    assert_eq!(
+        (d7["clicks"].as_i64(), d7["impressions"].as_i64()),
+        (Some(4), Some(150))
+    );
+    assert_eq!(d7["position"], 5.0);
+    assert!((d7["ctr"].as_f64().unwrap() - 4.0 / 150.0).abs() < 1e-9);
+    assert_eq!(a["google"]["top_queries_28d"][0]["key"], "remote desktop");
+    assert_eq!(a["index"]["verdict"], "PASS");
+    assert_eq!(a["signups"]["count"], 1, "the admin's sign-up is excluded");
+    // Post B: 20 impressions — counts, no rate.
+    let b = &rows[0];
+    assert_eq!(b["google"]["d28"]["impressions"], 20);
+    assert!(b["google"]["d28"].get("ctr").is_none());
+    assert_eq!(
+        b["index"]["coverage_state"],
+        "Crawled - currently not indexed"
+    );
+    // With include_internal the admin's sign-up counts too.
+    let raw: Value = app
+        .auth_get("/api/admin/growth/content?include_internal=true", &token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(raw["rows"][1]["signups"]["count"], 2);
+
+    // The digest's Search section for yesterday: Google through its newest
+    // final day, Bing not configured.
+    let sections = roomler_ai_api::growth::digest::compute(
+        &app.state,
+        t - Duration::days(1),
+        &roomler_core::growth::ExclusionSet::none(),
+        bson::DateTime::now(),
+    )
+    .await
+    .unwrap();
+    let s = serde_json::to_value(&sections).unwrap()["search"].clone();
+    assert_eq!(s["google"]["through"], json!(d1));
+    assert_eq!(s["google"]["clicks"]["day"], 5);
+    assert_eq!(s["google"]["d28"]["position"], 6.5);
+    assert_eq!(s["google"]["top_queries_7d"][0]["key"], "remote desktop");
+    assert!(s["bing"]["not_measured"].is_string());
+
+    // Nobody else sees the table.
+    let r = app
+        .client
+        .get(app.url("/api/admin/growth/content"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 401);
 }
