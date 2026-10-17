@@ -409,12 +409,22 @@ mod tests {
         let a = OrgRelayConn::new(a_sock, relay, VNI, "relay-a".into());
         let b = OrgRelayConn::new(b_sock, relay, VNI, "relay-a".into());
         let payload = b"wireguard-looking bytes go here";
-        a.send_to(payload, a.synth_peer()).await.unwrap();
+        // `bind` returns once its Answer is SENT; the relay binds `b` only when
+        // it processes that Answer, and a datagram that overtakes it is dropped
+        // as `NotYetBound`. On a loaded host one did, about one run in three
+        // (WSL, 2026-10-17), and a single send then waited out its 5 s. A real
+        // member rides WireGuard's own retransmits; the test resends the same
+        // way, so what it checks is the round trip, not the race.
         let mut buf = [0u8; 256];
-        let (n, from) = timeout(Duration::from_secs(5), b.recv_from(&mut buf))
-            .await
-            .expect("b receives")
-            .unwrap();
+        let mut received = None;
+        for _ in 0..20 {
+            a.send_to(payload, a.synth_peer()).await.unwrap();
+            if let Ok(r) = timeout(Duration::from_millis(250), b.recv_from(&mut buf)).await {
+                received = Some(r.unwrap());
+                break;
+            }
+        }
+        let (n, from) = received.expect("b receives");
         assert_eq!(
             &buf[..n],
             payload,
