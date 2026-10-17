@@ -265,7 +265,6 @@ use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
-use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
