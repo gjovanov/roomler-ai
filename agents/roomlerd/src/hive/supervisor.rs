@@ -1187,10 +1187,13 @@ pub fn handle_stop(session_id: ObjectId, fence: u64, reason: String, is_primary:
 /// FR-90 P2g-1 — `rc:hive.purge`: the session purged from this device
 /// ([`Supervisor::purge`]), under the start lock, so no start of it races the
 /// purge, and answered with `rc:hive.purge_ack` on `tx`, the connection it came
-/// on. The primary enrollment's only, like every Hive frame.
+/// on. The primary enrollment's only, like every Hive frame. P2k-3 —
+/// `leaving`: this device's copy alone, as a member that leaves, whose removal
+/// is not final here.
 pub fn handle_purge(
     purge_id: ObjectId,
     session_id: ObjectId,
+    leaving: bool,
     is_primary: bool,
     tx: mpsc::Sender<ClientMsg>,
 ) {
@@ -1205,7 +1208,7 @@ pub fn handle_purge(
     tokio::spawn(async move {
         let ack = {
             let _serial = sup.start_lock.lock().await;
-            sup.purge(purge_id, session_id).await
+            sup.purge(purge_id, session_id, leaving).await
         };
         let _ = tx.send(ack).await;
     });
@@ -9925,10 +9928,24 @@ done
         roomler_ai_remote_control::hive::HivePurgePart,
         Option<String>,
     ) {
+        purged_as(r, sid, false).await
+    }
+
+    /// [`purged`], as the frame says: P2k-3 — `leaving`, a member's copy
+    /// alone.
+    async fn purged_as(
+        r: &Rig,
+        sid: ObjectId,
+        leaving: bool,
+    ) -> (
+        roomler_ai_remote_control::hive::HivePurgePart,
+        roomler_ai_remote_control::hive::HivePurgePart,
+        Option<String>,
+    ) {
         let purge = ObjectId::new();
         let ack = {
             let _serial = r.sup.start_lock.lock().await;
-            r.sup.purge(purge, sid).await
+            r.sup.purge(purge, sid, leaving).await
         };
         match ack {
             ClientMsg::HivePurgeAck {
@@ -9999,6 +10016,42 @@ done
                     .as_deref()
                     .is_some_and(|d| d.contains("purged")),
             "a purged session is never started: {answer:?}"
+        );
+    }
+
+    /// FR-90 P2k-3 — a member's copy purged as it leaves goes whole, but not
+    /// the session's id: a later join of it (placement choosing the device
+    /// again, a teleport) is taken, where a removal that is final refuses it
+    /// for ever. A whole session's purge after it is final, as before.
+    #[tokio::test]
+    async fn a_copy_purged_as_its_member_leaves_may_be_taken_again() {
+        use roomler_ai_remote_control::hive::HivePurgePart::{Done, NotThere};
+        let r = rig(true, 4);
+        let sid = ObjectId::new();
+        let hex = sid.to_hex();
+        r.store.join(&hex, "owner", 1).await.unwrap();
+        assert!(r.store.holds(&hex).await.unwrap());
+
+        assert_eq!(purged_as(&r, sid, true).await, (Done, NotThere, None));
+        assert!(!r.store.holds(&hex).await.unwrap(), "its copy went whole");
+        assert!(
+            !r.store.is_purged(&hex).await.unwrap(),
+            "its removal is not final here"
+        );
+        r.store
+            .join(&hex, "owner", 2)
+            .await
+            .expect("a later join of it is taken");
+        assert!(r.store.holds(&hex).await.unwrap());
+
+        assert_eq!(purged_as(&r, sid, false).await.0, Done);
+        assert!(
+            r.store.is_purged(&hex).await.unwrap(),
+            "a whole session's purge is final"
+        );
+        assert!(
+            r.store.join(&hex, "owner", 3).await.is_err(),
+            "and refuses a join from then on"
         );
     }
 

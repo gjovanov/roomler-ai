@@ -201,6 +201,12 @@ pub fn apply_rc_ctrl(hub: &Hub, ctrl: &serde_json::Value) {
                 let msg = roomler_ai_remote_control::signaling::ServerMsg::HivePurge {
                     purge_id: pid,
                     session_id: sid,
+                    // FR-90 P2k-3 — a leaving member's copy alone; absent
+                    // from a pod before it, which sent a whole session's.
+                    leaving: ctrl
+                        .get("leaving")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
                 };
                 if hub.push_hive_purge(aid, tid, msg).is_ok() {
                     info!(agent = %aid, purge = %pid, "rc ctrl: hive purge delivered from another pod");

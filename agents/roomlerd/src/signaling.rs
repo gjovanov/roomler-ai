@@ -4952,12 +4952,19 @@ async fn handle_server_msg(
         ServerMsg::HivePurge {
             purge_id,
             session_id,
+            leaving,
         } => {
             #[cfg(hive_host)]
-            crate::hive::handle_purge(purge_id, session_id, ctx.is_primary, outbound_tx.clone());
+            crate::hive::handle_purge(
+                purge_id,
+                session_id,
+                leaving,
+                ctx.is_primary,
+                outbound_tx.clone(),
+            );
             #[cfg(not(hive_host))]
             {
-                let _ = purge_id;
+                let _ = (purge_id, leaving);
                 debug!(session = %session_id, "rc:hive.purge ignored — this build does not run agent sessions");
             }
         }

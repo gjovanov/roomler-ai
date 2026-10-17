@@ -6580,6 +6580,7 @@ mod tests {
         let purge = || ServerMsg::HivePurge {
             purge_id: ObjectId::new(),
             session_id: ObjectId::new(),
+            leaving: false,
         };
         hub.set_agent_hive_support(agent_id, true);
         hub.set_agent_hive_manage_support(agent_id, true);
@@ -6677,8 +6678,24 @@ mod tests {
             Ok(ServerMsg::HivePurge {
                 purge_id,
                 session_id,
-            }) => assert_eq!((purge_id, session_id), (purge, session)),
+                leaving,
+            }) => assert_eq!(
+                (purge_id, session_id, leaving),
+                (purge, session, false),
+                "an envelope with no word, from a pod before P2k-3: a whole session's"
+            ),
             got => panic!("the purge reached its connection: {got:?}"),
+        }
+        // FR-90 P2k-3 — a leaving member's copy alone, from another pod: the
+        // pod that holds the socket says so too.
+        let mut leaving_envelope = envelope(tenant, &[agent_id]);
+        leaving_envelope["leaving"] = serde_json::json!(true);
+        crate::ctrl::apply_rc_ctrl(&hub, &leaving_envelope);
+        match rx.try_recv() {
+            Ok(ServerMsg::HivePurge { leaving, .. }) => {
+                assert!(leaving, "a leaving member's purge says so on the device")
+            }
+            got => panic!("the leaving purge reached its connection: {got:?}"),
         }
         assert!(
             other_rx.try_recv().is_err(),

@@ -7,7 +7,7 @@
 //! |---|---|---|
 //! | 1 | a run of it here is fenced out at once (no model call, prompt or approval answer is taken) and stopped, and its task is waited for until it lets go | none: nothing is deleted while it runs |
 //! | 2 | a terminal that mirrors it stops being mirrored, and what was kept of its ended terminal goes | `store` |
-//! | 3 | the daemon's own copy: its events, index, tips, floors, membership, substitutes and blobs (`Store::purge`, which keeps its id, so a join, start or event for it is refused from then on), its runtime directory, what the device hosts, holds back and keeps in memory of it, and its replica streams | `store` |
+//! | 3 | the daemon's own copy: its events, index, tips, floors, membership, substitutes and blobs (`Store::purge`, which keeps its id, so a join, start or event for it is refused from then on; P2k-3 — for a leaving member's copy alone, `Store::purge_copy`, which keeps nothing, so placement may choose the device again), its runtime directory, what the device hosts, holds back and keeps in memory of it, and its replica streams | `store` |
 //! | 4 | as the session's account, by this device's own record of where it was worked on (the debt `Store::purge` kept): its state directory, and the refs and index its checkpoints left in the folder's repository ([`super::super::purger`]) | `account` |
 //!
 //! ⚠️ What is deleted is this device's own record of the session, never the
@@ -29,16 +29,19 @@ use crate::hive::purger;
 
 impl Supervisor {
     /// `rc:hive.purge`: purge `session` here, and the answer, per part.
+    /// P2k-3 — `leaving`: this device's copy alone, as a member that leaves:
+    /// purged whole, but its removal is not final here.
     pub(crate) async fn purge(
         self: &Arc<Self>,
         purge_id: ObjectId,
         session: ObjectId,
+        leaving: bool,
     ) -> ClientMsg {
-        let (store, account, detail) = self.purge_parts(session).await;
+        let (store, account, detail) = self.purge_parts(session, !leaving).await;
         info!(
             purge = %purge_id, session = %session, store = store.as_str(),
             account = account.as_str(), detail = detail.as_deref().unwrap_or(""),
-            "hive: purged"
+            leaving, "hive: purged"
         );
         ClientMsg::HivePurgeAck {
             purge_id,
@@ -64,7 +67,7 @@ impl Supervisor {
         for session in held {
             let (store, account, detail) = {
                 let _serial = self.start_lock.lock().await;
-                self.purge_parts(session).await
+                self.purge_parts(session, true).await
             };
             if store.closed() && account.closed() {
                 whole += 1;
@@ -83,10 +86,13 @@ impl Supervisor {
     /// Purge `session` here, every part, and how each went: the order the
     /// module's table names. P2g-3d — the device's own clock runs it too
     /// ([`super::retain`]), under the start lock, with no purge id; and so
-    /// does a removal (P2g-4a, [`Self::purge_all`]).
+    /// does a removal (P2g-4a, [`Self::purge_all`]). `final_`: the store
+    /// keeps the session's id and refuses it from then on; false (P2k-3) only
+    /// for a leaving member's copy, which may be taken again.
     pub(super) async fn purge_parts(
         self: &Arc<Self>,
         session: ObjectId,
+        final_: bool,
     ) -> (HivePurgePart, HivePurgePart, Option<String>) {
         use HivePurgePart::{Done, Failed, NotThere};
         let sid = session.to_hex();
@@ -107,7 +113,12 @@ impl Supervisor {
                 return (Failed, Failed, Some(format!("this device's store: {e}")));
             }
         };
-        if let Err(e) = store.purge(&sid).await {
+        let purged = if final_ {
+            store.purge(&sid).await
+        } else {
+            store.purge_copy(&sid).await
+        };
+        if let Err(e) = purged {
             return (Failed, Failed, Some(format!("this device's store: {e}")));
         }
         let ran = match remove_run_dir(&self.runtime.join(&sid)) {
