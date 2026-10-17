@@ -63,9 +63,9 @@ use roomler_ai_db::models::agent_log::AgentLogBatch;
 use roomler_ai_services::dao::{
     growth_digest::ExcludedCounts,
     growth_quality::{
-        ALL_VERSIONS, DURATION_EDGES_MS, Dist, EndReasonCount, FPS_EDGES, GrowthQualityDao, Pooled,
-        QualityDay, RTT_EDGES_MS, Scope, SessionQuality, TTFF_EDGES_MS, TtffQuality,
-        UNKNOWN_VERSION,
+        ALL_VERSIONS, CarrierQuality, DURATION_EDGES_MS, Dist, EndReasonCount, FPS_EDGES,
+        GrowthQualityDao, Pooled, QualityDay, RTT_EDGES_MS, Scope, SessionQuality, TTFF_EDGES_MS,
+        TtffQuality, UNKNOWN_VERSION,
     },
 };
 use roomler_core::growth::ExclusionSet;
@@ -140,6 +140,11 @@ fn f64_of(d: &Document, key: &str) -> Option<f64> {
 
 // ── Sessions ─────────────────────────────────────────────────────────────
 
+/// The carrier label of a row with none: a session from before P9c, from an
+/// agent older than the field, or one that ended before the observation
+/// landed. Never `direct`.
+pub const UNKNOWN_CARRIER: &str = "unknown";
+
 /// One `remote_sessions` row, the fields the quality rules read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionRow {
@@ -151,6 +156,8 @@ pub struct SessionRow {
     pub end_reason: Option<String>,
     pub peak_fps: Option<f64>,
     pub avg_rtt_ms: Option<f64>,
+    /// P9c — as the agent recorded it; `None` reads as [`UNKNOWN_CARRIER`].
+    pub carrier: Option<String>,
 }
 
 /// From a projected document; `None` without an id or a `created_at`.
@@ -165,6 +172,7 @@ pub fn session_row(d: &Document) -> Option<SessionRow> {
         end_reason: str_of(d, "end_reason"),
         peak_fps: stats.and_then(|s| f64_of(s, "peak_fps")),
         avg_rtt_ms: stats.and_then(|s| f64_of(s, "avg_rtt_ms")),
+        carrier: str_of(d, "carrier").filter(|c| !c.is_empty()),
     })
 }
 
@@ -172,7 +180,7 @@ pub fn session_row(d: &Document) -> Option<SessionRow> {
 pub fn session_projection() -> Document {
     doc! {
         "tenant_id": 1, "agent_id": 1, "created_at": 1, "started_at": 1, "ended_at": 1,
-        "end_reason": 1, "stats.peak_fps": 1, "stats.avg_rtt_ms": 1,
+        "end_reason": 1, "stats.peak_fps": 1, "stats.avg_rtt_ms": 1, "carrier": 1,
     }
 }
 
@@ -187,21 +195,44 @@ pub fn session_quality<'a>(rows: impl IntoIterator<Item = &'a SessionRow>) -> Se
         duration_ms: Dist::of(Vec::new(), DURATION_EDGES_MS),
         peak_fps: Dist::of(Vec::new(), FPS_EDGES),
         avg_rtt_ms: Dist::of(Vec::new(), RTT_EDGES_MS),
+        by_carrier: Vec::new(),
     };
     let mut by: BTreeMap<(bool, String), i64> = BTreeMap::new();
     let (mut durations, mut fps, mut rtt) = (Vec::new(), Vec::new(), Vec::new());
+    // P9c — per carrier: (sessions, durations, fps, rtt) of the Active ones.
+    /// P9c — one carrier's accumulator over the rows: the Active sessions
+    /// that rode it and their samples.
+    #[derive(Default)]
+    struct CarrierAcc {
+        sessions: i64,
+        durations: Vec<i64>,
+        fps: Vec<i64>,
+        rtt: Vec<i64>,
+    }
+    let mut carriers: BTreeMap<String, CarrierAcc> = BTreeMap::new();
     for r in rows {
         q.requested += 1;
         let active = r.started_ms.is_some();
-        match (r.started_ms, r.ended_ms) {
+        let duration = match (r.started_ms, r.ended_ms) {
             (Some(s), Some(e)) => {
                 q.reached_active += 1;
-                durations.push((e - s).max(0));
+                let d = (e - s).max(0);
+                durations.push(d);
+                Some(d)
             }
-            (Some(_), None) => q.reached_active += 1,
-            (None, Some(_)) => q.not_reached += 1,
-            (None, None) => q.pending += 1,
-        }
+            (Some(_), None) => {
+                q.reached_active += 1;
+                None
+            }
+            (None, Some(_)) => {
+                q.not_reached += 1;
+                None
+            }
+            (None, None) => {
+                q.pending += 1;
+                None
+            }
+        };
         let reason = match r.ended_ms {
             Some(_) => r
                 .end_reason
@@ -212,14 +243,38 @@ pub fn session_quality<'a>(rows: impl IntoIterator<Item = &'a SessionRow>) -> Se
         };
         *by.entry((active, reason)).or_insert(0) += 1;
         if active {
-            if let Some(f) = r.peak_fps.filter(|f| *f > 0.0) {
-                fps.push(f.round() as i64);
-            }
-            if let Some(m) = r.avg_rtt_ms.filter(|m| *m > 0.0) {
-                rtt.push(m.round() as i64);
-            }
+            let f = r.peak_fps.filter(|f| *f > 0.0).map(|f| f.round() as i64);
+            let m = r.avg_rtt_ms.filter(|m| *m > 0.0).map(|m| m.round() as i64);
+            fps.extend(f);
+            rtt.extend(m);
+            let slot = carriers
+                .entry(
+                    r.carrier
+                        .clone()
+                        .unwrap_or_else(|| UNKNOWN_CARRIER.to_string()),
+                )
+                .or_default();
+            slot.sessions += 1;
+            slot.durations.extend(duration);
+            slot.fps.extend(f);
+            slot.rtt.extend(m);
         }
     }
+    q.by_carrier = carriers
+        .into_iter()
+        .map(|(carrier, acc)| CarrierQuality {
+            carrier,
+            reached_active: acc.sessions,
+            duration_ms: Dist::of(acc.durations, DURATION_EDGES_MS),
+            peak_fps: Dist::of(acc.fps, FPS_EDGES),
+            avg_rtt_ms: Dist::of(acc.rtt, RTT_EDGES_MS),
+        })
+        .collect();
+    q.by_carrier.sort_by(|a, b| {
+        b.reached_active
+            .cmp(&a.reached_active)
+            .then_with(|| a.carrier.cmp(&b.carrier))
+    });
     q.by_end_reason = by
         .into_iter()
         .map(|((reached_active, reason), count)| EndReasonCount {
@@ -668,6 +723,17 @@ pub async fn freeze_scheduled(
 
 // ── Reading the frozen rows ──────────────────────────────────────────────
 
+/// P9c — one carrier over a window: the Active sessions that rode it and
+/// their pooled distributions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CarrierWindow {
+    pub carrier: String,
+    pub reached_active: i64,
+    pub duration_ms: Pooled,
+    pub peak_fps: Pooled,
+    pub avg_rtt_ms: Pooled,
+}
+
 /// A window's sessions, pooled from the frozen days.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionWindow {
@@ -682,6 +748,10 @@ pub struct SessionWindow {
     pub duration_ms: Pooled,
     pub peak_fps: Pooled,
     pub avg_rtt_ms: Pooled,
+    /// P9c — the Active sessions by carrier, most first; `unknown` for a
+    /// session with none recorded (never read as direct).
+    #[serde(default)]
+    pub by_carrier: Vec<CarrierWindow>,
     /// Frozen days with sessions measured.
     pub days: i64,
 }
@@ -804,6 +874,28 @@ pub fn fold_version(version: &str, rows: &[&QualityDay]) -> VersionQuality {
         sort_reasons(&mut by_end_reason);
         let requested: i64 = sess.iter().map(|s| s.requested).sum();
         let reached_active: i64 = sess.iter().map(|s| s.reached_active).sum();
+        // P9c — each carrier's days, pooled.
+        let mut per_carrier: BTreeMap<&str, Vec<&CarrierQuality>> = BTreeMap::new();
+        for s in &sess {
+            for c in &s.by_carrier {
+                per_carrier.entry(c.carrier.as_str()).or_default().push(c);
+            }
+        }
+        let mut by_carrier: Vec<CarrierWindow> = per_carrier
+            .into_iter()
+            .map(|(carrier, parts)| CarrierWindow {
+                carrier: carrier.to_string(),
+                reached_active: parts.iter().map(|c| c.reached_active).sum(),
+                duration_ms: Dist::pool(parts.iter().map(|c| &c.duration_ms)),
+                peak_fps: Dist::pool(parts.iter().map(|c| &c.peak_fps)),
+                avg_rtt_ms: Dist::pool(parts.iter().map(|c| &c.avg_rtt_ms)),
+            })
+            .collect();
+        by_carrier.sort_by(|a, b| {
+            b.reached_active
+                .cmp(&a.reached_active)
+                .then_with(|| a.carrier.cmp(&b.carrier))
+        });
         SessionWindow {
             requested,
             reached_active,
@@ -814,6 +906,7 @@ pub fn fold_version(version: &str, rows: &[&QualityDay]) -> VersionQuality {
             duration_ms: Dist::pool(sess.iter().map(|s| &s.duration_ms)),
             peak_fps: Dist::pool(sess.iter().map(|s| &s.peak_fps)),
             avg_rtt_ms: Dist::pool(sess.iter().map(|s| &s.avg_rtt_ms)),
+            by_carrier,
             days: sess.len() as i64,
         }
     });
@@ -1065,6 +1158,7 @@ mod tests {
             end_reason: reason.map(str::to_string),
             peak_fps: None,
             avg_rtt_ms: None,
+            carrier: None,
         }
     }
 

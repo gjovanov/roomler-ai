@@ -144,6 +144,38 @@
           </v-card-text>
         </v-card>
 
+        <!-- FR-102 P9c — the Active sessions by the carrier they rode. -->
+        <v-card v-if="carriers.length" class="mb-3">
+          <v-card-title class="text-subtitle-1 d-flex align-center flex-wrap" style="gap: 8px">
+            By carrier
+            <span class="text-caption text-medium-emphasis">
+              how the session reached the device — recorded, never chosen; absent is unknown, never direct
+            </span>
+          </v-card-title>
+          <v-card-text>
+            <v-table density="compact" class="growth-wide">
+              <thead>
+                <tr>
+                  <th class="text-left">Carrier</th>
+                  <th class="text-right">Reached Active</th>
+                  <th class="text-left">Duration</th>
+                  <th class="text-left">Peak frame rate</th>
+                  <th class="text-left">Average RTT</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="c in carriers" :key="c.carrier">
+                  <td>{{ carrierLabel(c.carrier) }}</td>
+                  <td class="text-right">{{ c.reached_active }}</td>
+                  <td class="text-caption">{{ pooledLabel(c.duration_ms) }}</td>
+                  <td class="text-caption">{{ pooledLabel(c.peak_fps, fps) }}</td>
+                  <td class="text-caption">{{ pooledLabel(c.avg_rtt_ms) }}</td>
+                </tr>
+              </tbody>
+            </v-table>
+          </v-card-text>
+        </v-card>
+
         <v-row dense class="mb-3">
           <v-col cols="12" md="5">
             <v-card class="fill-height">
@@ -285,6 +317,22 @@ function shareOf(v: VersionQuality): string | null {
 }
 
 const endReasons = computed(() => report.value?.totals?.sessions?.by_end_reason ?? [])
+const carriers = computed(() => report.value?.totals?.sessions?.by_carrier ?? [])
+
+/** A carrier code as a reader reads it; an unknown code is shown verbatim. */
+function carrierLabel(c: string): string {
+  const map: Record<string, string> = {
+    direct: 'Direct',
+    turn: 'TURN relay',
+    turn_local: 'TURN (device-local)',
+    overlay_direct: 'Overlay — direct',
+    overlay_turn: 'Overlay — TURN',
+    derp: 'Overlay — DERP',
+    org_relay: 'Overlay — org relay',
+    unknown: 'Unknown',
+  }
+  return map[c] ?? c
+}
 
 function ttffLabel(t: TtffWindow): string {
   if (t.n === 0) return 'no sample'

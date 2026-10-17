@@ -1582,6 +1582,29 @@ fn version_lines(out: &mut Vec<Block>, v: &VersionQuality) {
                 "Average RTT".into(),
                 pooled_label(&s.avg_rtt_ms, &ms_label),
             ));
+            // P9c — the Active sessions by the carrier they rode: recorded,
+            // never chosen; a session with none is `unknown`, never direct.
+            if !s.by_carrier.is_empty() {
+                out.push(Table(
+                    vec![
+                        "Carrier".into(),
+                        "Active".into(),
+                        "Duration".into(),
+                        "Avg RTT".into(),
+                    ],
+                    s.by_carrier
+                        .iter()
+                        .map(|c| {
+                            vec![
+                                c.carrier.clone(),
+                                c.reached_active.to_string(),
+                                pooled_label(&c.duration_ms, &ms_label),
+                                pooled_label(&c.avg_rtt_ms, &ms_label),
+                            ]
+                        })
+                        .collect(),
+                ));
+            }
         }
         None => out.push(Line(
             "Sessions".into(),

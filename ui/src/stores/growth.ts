@@ -732,6 +732,18 @@ export interface EndReasonCount {
   count: number
 }
 
+/** P9c — one carrier over a window: the Active sessions that rode it. */
+export interface CarrierWindow {
+  /** `direct` · `turn` · `turn_local` · `overlay_direct` · `overlay_turn` ·
+   *  `derp` · `org_relay` · `unknown` (a session with none recorded — never
+   *  read as direct). */
+  carrier: string
+  reached_active: number
+  duration_ms: Pooled
+  peak_fps: Pooled
+  avg_rtt_ms: Pooled
+}
+
 export interface SessionWindow {
   requested: number
   reached_active: number
@@ -743,6 +755,8 @@ export interface SessionWindow {
   duration_ms: Pooled
   peak_fps: Pooled
   avg_rtt_ms: Pooled
+  /** P9c — the Active sessions by the carrier they rode, most first. */
+  by_carrier: CarrierWindow[]
   days: number
 }
 

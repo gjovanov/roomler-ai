@@ -6012,6 +6012,10 @@ fn session_stats_msg(
         shared_seconds: t.shared_seconds,
         mixed_dial_seconds: t.mixed_dial_seconds,
         transfers,
+        // FR-102 P9c — absent until the carrier was observed, so an older
+        // server never sees the key and a sample before `Connected` carries
+        // nothing to misread.
+        carrier: t.carrier.map(|c| c.as_str().to_string()),
     }
 }
 

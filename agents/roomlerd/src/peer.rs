@@ -268,6 +268,11 @@ pub struct AgentPeer {
     /// FR-93 P5h — this session's controller is told when the computer goes
     /// to sleep, for as long as the session lives ([`crate::sleep_notice`]).
     _sleep_notice: crate::sleep_notice::Registration,
+    /// FR-102 P9c — the carrier this session rides, recorded once after the
+    /// peer reached `Connected` ([`crate::session_carrier::observe`]) and
+    /// carried on every `rc:session.stats` from then on. Set once; a later
+    /// path change is not recorded.
+    carrier: Arc<std::sync::OnceLock<crate::session_carrier::SessionCarrier>>,
 }
 
 /// FR-16 L0 — the in-process latency harness's one seam into a session.
@@ -315,6 +320,9 @@ pub struct SessionTelemetry {
     pub shared_seconds: u64,
     /// … of which the viewers' dials were not all equal.
     pub mixed_dial_seconds: u64,
+    /// FR-102 P9c — the carrier recorded for this session, once it is
+    /// known; `None` until the observation after `Connected` has landed.
+    pub carrier: Option<crate::session_carrier::SessionCarrier>,
 }
 
 impl AgentPeer {
@@ -875,11 +883,28 @@ impl AgentPeer {
         // refresher task below keeps the mtime fresh); on
         // `Disconnected` / `Closed` / `Failed` we remove it so the
         // supervisor's next cycle reverts to the user-context arm.
+        // FR-102 P9c — the carrier slot, filled once after `Connected`.
+        let carrier: Arc<std::sync::OnceLock<crate::session_carrier::SessionCarrier>> =
+            Arc::new(std::sync::OnceLock::new());
         {
             let tx = outbound.clone();
+            let carrier_slot = carrier.clone();
+            let pc_for_carrier = Arc::downgrade(&pc);
             pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
                 info!(session = %session_id, state = ?s, "PC state change");
                 let tx = tx.clone();
+                // FR-102 P9c — record what the session rides, once. A weak
+                // handle: the observation must not keep a closed peer alive,
+                // and a peer gone before the settle records nothing.
+                if matches!(s, RTCPeerConnectionState::Connected) && carrier_slot.get().is_none() {
+                    let slot = carrier_slot.clone();
+                    let weak = pc_for_carrier.clone();
+                    tokio::spawn(async move {
+                        let Some(pc) = weak.upgrade() else { return };
+                        let observed = crate::session_carrier::observe(&pc, session_id).await;
+                        let _ = slot.set(observed);
+                    });
+                }
                 Box::pin(async move {
                     #[cfg(all(feature = "system-context", target_os = "windows"))]
                     {
@@ -1495,6 +1520,7 @@ impl AgentPeer {
             rc_overlay,
             control_dc,
             _sleep_notice: sleep_notice,
+            carrier,
         })
     }
 
@@ -1558,6 +1584,8 @@ impl AgentPeer {
         out.input_events = c.input_events.load(Ordering::Relaxed);
         out.shared_seconds = c.shared_seconds.load(Ordering::Relaxed);
         out.mixed_dial_seconds = c.mixed_dial_seconds.load(Ordering::Relaxed);
+        // FR-102 P9c — the recorded carrier rides every sample once known.
+        out.carrier = self.carrier.get().copied();
         out
     }
 
@@ -2090,8 +2118,11 @@ async fn overlay_remote_is_relay_tier(remote_addr: &str, session_id: bson::oid::
 /// (v6, the exact prefix the runtime derives peer v6 addresses from — NOT all
 /// of fc00::/7, so a user's own VPN ULA never triggers a daemon query).
 /// mDNS names and garbage don't parse → `false`.
-#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
-fn addr_is_overlay_range(addr: &str) -> bool {
+///
+/// Ungated since FR-102 P9c: [`crate::session_carrier`] reads it in every
+/// build to tell an overlay pair from a public one, so it can no longer be
+/// gated to the encoder features that first needed it.
+pub(crate) fn addr_is_overlay_range(addr: &str) -> bool {
     match addr.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(v4)) => {
             let o = v4.octets();
