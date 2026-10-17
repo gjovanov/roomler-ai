@@ -390,6 +390,72 @@ async fn past_the_offline_grace_model_calls_stop() {
     r.sup.stop(sid, 1, "owner".into());
 }
 
+/// [`ENV_HARNESS`], but one that does not listen: it ignores both its stdin's
+/// end and SIGTERM, so a stopped run of it holds on, its token still live,
+/// until the supervisor's SIGKILL at the end of the stop grace.
+const STUBBORN_HARNESS: &str = r#"#!/bin/sh
+printf '%s\n%s\n' "$ANTHROPIC_BASE_URL" "$ANTHROPIC_API_KEY" > env.out
+trap '' TERM
+while IFS= read -r line; do
+  echo '{"type":"system","subtype":"init","session_id":"fake","model":"m","cwd":"'"$PWD"'","tools":[]}'
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}'
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":0.0}'
+done
+while :; do sleep 1; done
+"#;
+
+/// P2k-7 — AC4's stale-fence half, captured at the provider: a run demoted
+/// to a newer fence makes no model call. Its harness does not listen, so the
+/// run holds on through the stop grace with its token still live, and the
+/// fence alone refuses the call before anything leaves the host. Once the run
+/// has ended, its token is gone too.
+#[tokio::test]
+async fn a_demoted_run_makes_no_model_call() {
+    let p = provider().await;
+    let (mut r, _count) = sidecar_rig(&p, OFFLINE_GRACE).await;
+    std::fs::write(r.root.path().join("claude"), STUBBORN_HARNESS).unwrap();
+    let (sid, base, token) = started(&mut r).await;
+    let url = format!("{base}/v1/messages");
+    p.go.notify_one();
+    assert_eq!(
+        call(&url, Some(&token)).await.status().as_u16(),
+        200,
+        "at its own fence, it calls"
+    );
+    let hits = p.hits.load(Ordering::SeqCst);
+
+    r.sup.demote(sid, 2, "not_location").await;
+    assert!(r.sup.holds_live(sid), "the run has not let go yet");
+    let resp = call(&url, Some(&token)).await;
+    let status = resp.status().as_u16();
+    let v: serde_json::Value = tokio::time::timeout(WAIT, resp.json())
+        .await
+        .expect("a body that ends: forwarded to the provider, not refused?")
+        .unwrap();
+    assert_eq!(
+        (status, v["error"]["message"].as_str()),
+        (
+            401,
+            Some("the session no longer runs on this device at this fence")
+        ),
+        "fenced out at once, by the fence: the run's token is still live"
+    );
+    assert!(r.sup.holds_live(sid), "refused while the run still held on");
+
+    assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Ended);
+    let (status, kind) = error_kind(call(&url, Some(&token)).await).await;
+    assert_eq!(
+        (status, kind.as_str()),
+        (401, "authentication_error"),
+        "and once it has ended"
+    );
+    assert_eq!(
+        p.hits.load(Ordering::SeqCst),
+        hits,
+        "a run at a stale fence made a model call"
+    );
+}
+
 /// P2e-2 — [`sidecar_rig`], whose leased runs give up on the server's word
 /// after `wait`.
 async fn leased_sidecar_rig(provider: &Provider, wait: Duration) -> (Rig, tempfile::TempDir) {
