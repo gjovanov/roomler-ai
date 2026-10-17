@@ -3669,6 +3669,10 @@ async fn media_pump_vp9_444_dc(
     // frames_captured` ratio < 0.95).
     let target_fps: u32 = vp9_444_target_fps_from_env();
     let frame_duration_floor = Duration::from_micros(1_000_000 / target_fps as u64);
+    // FR-112 P2 — the software tier: pace to what the encoder sustains, and a
+    // bitrate base that follows the rate actually run at.
+    let sw_tier = crate::encode::sw_fps_60_enabled();
+    let mut pace_due: Option<std::time::Instant> = None;
     // BGRA capture; never downscale (libvpx + dcv_color_primitives
     // BGRA→I444 is fast enough at 1080p without the 2× capture
     // downsample). Operator-controlled `rc:resolution` still applies
@@ -4165,6 +4169,24 @@ async fn media_pump_vp9_444_dc(
             continue;
         }
 
+        // FR-112 P2 — cadence pacing, as the FFmpeg pump's (FR-1 P5): when the
+        // software encoder cannot hold the target, take frames on an even grid
+        // at the rate it sustains instead of a ragged mix of 16 and 33 ms gaps.
+        // Slots run from consumption, so an encode longer than the interval
+        // degrades to the natural cadence, never a burst.
+        if let Some(paced) = governor.paced_fps() {
+            let interval = Duration::from_micros(1_000_000 / paced.max(1) as u64);
+            let now = std::time::Instant::now();
+            if let Some(due) = pace_due
+                && due > now
+            {
+                tokio::time::sleep(due - now).await;
+            }
+            pace_due = Some(std::time::Instant::now() + interval);
+        } else {
+            pace_due = None;
+        }
+
         // A local first, so `capturer`'s borrow ends before the idle arm asks
         // it what it waits for (FR-93 P3e).
         let next_frame = capturer.next_frame().await;
@@ -4574,7 +4596,14 @@ async fn media_pump_vp9_444_dc(
         // P5 — quality floor-merges across the shared pipeline's viewers.
         let q_now = pipeline.min_quality(quality_state.load(std::sync::atomic::Ordering::Relaxed));
         if let Some((ew, eh)) = encoder_dims {
-            let base = encode::initial_bitrate_for_fps(ew, eh, target_fps);
+            // FR-112 P2 — the base follows the rate the pump actually runs at
+            // (paced when the encoder cannot hold the target), by √(fps/30);
+            // the kill switch keeps 0.4.141's linear base at the target.
+            let base = if sw_tier {
+                encode::bitrate_base_for_fps(ew, eh, governor.paced_fps().unwrap_or(target_fps))
+            } else {
+                encode::initial_bitrate_for_fps(ew, eh, target_fps)
+            };
             // rc.185 — chroma-aware ceiling. `initial_bitrate_for_fps` is
             // pixel×fps only; it doesn't know the chroma format. 4:4:4 (VP9
             // profile 1) carries FULL U/V planes — ~1.5× the pixel data of
@@ -4870,6 +4899,12 @@ async fn media_pump_vp9_444_dc(
             // FR-112 P1 — the window's encode cost (BGRA → YUV + libvpx, on the
             // encoder thread when `media_thread` is on).
             let avg_encode_ms = (encode_us / encode_ops.max(1)) as f64 / 1000.0;
+            // FR-112 P2 — the software tier steps once per window, on windows
+            // that encoded something: an idle window says nothing about the
+            // encoder.
+            if sw_tier && encode_ops > 0 {
+                governor.pace_software(avg_encode_ms as f32, target_fps);
+            }
             encode_us = 0;
             encode_ops = 0;
             // P8 Phase 4 — shared / mixed-dial pipeline seconds (SVC
@@ -4896,6 +4931,7 @@ async fn media_pump_vp9_444_dc(
                 settle_kf_suppressed,
                 avg_scale_ms,
                 avg_encode_ms,
+                paced_fps = ?governor.paced_fps(),
                 target_bps = governor.applied_bps(),
                 avg_qp = ?avg_qp,
                 max_qp = ?max_qp,
@@ -8936,18 +8972,27 @@ async fn media_pump_ffmpeg_dc(
     }
 }
 
-/// Read the `ROOMLERD_VP9_FPS` env var. Default 30 (pre-rc.33
-/// behaviour). Accepts 30 or 60 — any other value rounds to the
-/// nearest of those two. Operator-opt-in escape hatch for 4K capable
-/// hosts; default stays at 30 so CPU-starved boxes keep working
-/// without a config touch.
+/// The VP9-444 pump's target rate. An explicit `ROOMLERD_VP9_FPS` pins it (30
+/// or 60, any other value rounding to the nearer). Otherwise FR-112 P2: **60**,
+/// paced down by the pump to what the encoder sustains, or 30 with
+/// `ROOMLERD_SW_FPS_60=0` (0.4.141's default, when a CPU-starved host was the
+/// reason for it; the pacing now covers that host).
 #[cfg(feature = "vp9-444")]
 fn vp9_444_target_fps_from_env() -> u32 {
-    const DEFAULT_FPS: u32 = 30;
-    match node_env("VP9_FPS").and_then(|v| v.trim().parse::<u32>().ok()) {
+    vp9_444_target_fps(
+        node_env("VP9_FPS").and_then(|v| v.trim().parse::<u32>().ok()),
+        crate::encode::sw_fps_60_enabled(),
+    )
+}
+
+/// [`vp9_444_target_fps_from_env`] with its inputs passed in, for the tests.
+#[cfg(feature = "vp9-444")]
+fn vp9_444_target_fps(pinned: Option<u32>, sw_fps_60: bool) -> u32 {
+    match pinned {
         Some(fps) if fps >= 45 => 60,
         Some(_) => 30,
-        None => DEFAULT_FPS,
+        None if sw_fps_60 => 60,
+        None => 30,
     }
 }
 
@@ -12857,6 +12902,19 @@ mod codec_cap_tests {
 #[cfg(test)]
 mod tests {
     use super::quality::*;
+
+    /// FR-112 P2 — the VP9-444 target: an explicit `ROOMLERD_VP9_FPS` pins it;
+    /// otherwise 60 with the software tier on, and 30 with it off.
+    #[cfg(feature = "vp9-444")]
+    #[test]
+    fn the_vp9_target_is_60_unless_pinned_or_switched_off() {
+        assert_eq!(super::vp9_444_target_fps(None, true), 60);
+        assert_eq!(super::vp9_444_target_fps(None, false), 30, "the kill switch: 0.4.141's default");
+        assert_eq!(super::vp9_444_target_fps(Some(30), true), 30, "a pin wins over the tier");
+        assert_eq!(super::vp9_444_target_fps(Some(60), false), 60);
+        assert_eq!(super::vp9_444_target_fps(Some(50), true), 60, "rounds to the nearer");
+        assert_eq!(super::vp9_444_target_fps(Some(40), true), 30);
+    }
 
     // Badge-truth — lock the `rc:video-info` wire shape (both pumps emit
     // through this one builder; the browser's parseControlInbound reads

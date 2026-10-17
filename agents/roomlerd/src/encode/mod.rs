@@ -699,6 +699,28 @@ pub(crate) fn initial_bitrate_for_fps(width: u32, height: u32, fps: u32) -> u32 
     raw.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
 }
 
+/// FR-112 P2 — the bitrate base for a software pump running at `fps`: today's
+/// 30 fps figure, scaled by √(fps/30) rather than linearly. At 60 a moving
+/// window travels half as far between frames, so a frame needs fewer bits than
+/// at 30; and a base computed for 60 while the encoder is paced to 30 would
+/// double every frame's bits (FR-112 §2: the 60 target took the VP9 ceiling from
+/// 17.5 to 30.4 Mbps and bought nothing). At 30 it is exactly today's.
+#[cfg_attr(not(feature = "vp9-444"), allow(dead_code))]
+pub(crate) fn bitrate_base_for_fps(width: u32, height: u32, fps: u32) -> u32 {
+    let at_30 = initial_bitrate_for_fps(width, height, 30) as f64;
+    let scaled = at_30 * (fps.max(1) as f64 / 30.0).sqrt();
+    (scaled.round() as u32).clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
+}
+
+/// FR-112 P2 — software encoders target 60 fps, paced down to what the encoder
+/// sustains (`FpsPace`, fed by the pump's `avg_encode_ms`), with the bitrate
+/// base following the rate they actually run at. Default **on**;
+/// `ROOMLERD_SW_FPS_60=0` restores 0.4.141's 30 fps and its base.
+#[cfg_attr(not(feature = "vp9-444"), allow(dead_code))]
+pub fn sw_fps_60_enabled() -> bool {
+    tunnel_core::env::flag("SW_FPS_60", true)
+}
+
 /// True when the ICE transport is forced to a TURN relay — on TCP (WSL,
 /// corp-UDP-blocked nets) that path is bandwidth- + head-of-line-constrained.
 /// Set by virtual-desktop mode and the corp path via ROOMLERD_ICE_RELAY_TCP.
@@ -1518,6 +1540,23 @@ fn hw_auto_disabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-112 P2 — at 30 the base is exactly today's; at 60 it grows by √2,
+    /// not 2×; it never leaves the bitrate bounds.
+    #[test]
+    fn the_software_base_is_todays_at_30_and_grows_by_root_two_at_60() {
+        let (w, h) = (2048, 1080);
+        assert_eq!(bitrate_base_for_fps(w, h, 30), initial_bitrate_for_fps(w, h, 30));
+        let at_60 = bitrate_base_for_fps(w, h, 60) as f64;
+        let at_30 = initial_bitrate_for_fps(w, h, 30) as f64;
+        assert!((at_60 / at_30 - 2f64.sqrt()).abs() < 1e-3, "×√2, got ×{}", at_60 / at_30);
+        assert!(
+            bitrate_base_for_fps(w, h, 60) < initial_bitrate_for_fps(w, h, 60),
+            "below the linear base that starved the encoder"
+        );
+        assert_eq!(bitrate_base_for_fps(7680, 4320, 60), MAX_BITRATE_BPS);
+        assert_eq!(bitrate_base_for_fps(320, 240, 15), MIN_BITRATE_BPS);
+    }
 
     /// #2283: only Auto drops the GPU-less software MFT, and only for
     /// OpenH264. A hardware MFT, a fallback that took the D3D manager, an

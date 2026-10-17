@@ -1464,6 +1464,17 @@ impl RateGovernor {
         self.pace.paced()
     }
 
+    /// FR-112 P2 — a software pump's cadence, once per heartbeat window: the
+    /// encode EWMA paces the pump when the encoder cannot hold `target_fps`
+    /// (`FpsPace`: the sustainable rate in 5-fps steps, hysteretic, floored at
+    /// 15). Neither the bitrate factor nor the resolution tier is engaged here:
+    /// libvpx's cost barely follows the bitrate (FR-112 §2), and the VP9-444
+    /// pump takes no tier. Returns the paced rate (`None` = run at target).
+    pub fn pace_software(&mut self, avg_encode_ms: f32, target_fps: u32) -> Option<u32> {
+        let _ = self.pressure.observe(avg_encode_ms);
+        self.pace.observe(self.pressure.ewma_ms(), target_fps)
+    }
+
     /// The encode-pressure maxrate scale (1.0 = full quality) —
     /// consumed by `policy::rate_plan` every frame.
     pub fn encode_factor(&self) -> f32 {
@@ -3619,5 +3630,20 @@ mod tests {
             1,
             "the window in the stall's shadow"
         );
+    }
+
+    /// FR-112 P2 — a software encoder that cannot hold 60 is paced to what it
+    /// sustains, in 5-fps steps, and released to the target once it can.
+    #[test]
+    fn a_software_pump_is_paced_to_what_its_encoder_sustains() {
+        let mut g = gov(Instant::now());
+        assert_eq!(g.pace_software(25.0, 60), Some(40), "1000 / 25 ms = 40 fps");
+        assert_eq!(g.paced_fps(), Some(40));
+        let mut paced = Some(40);
+        for _ in 0..20 {
+            paced = g.pace_software(8.0, 60);
+        }
+        assert_eq!(paced, None, "an encoder that holds 60 runs at the target");
+        assert_eq!(g.paced_fps(), None);
     }
 }
