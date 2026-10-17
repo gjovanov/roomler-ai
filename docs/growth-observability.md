@@ -4,7 +4,8 @@ How the project learns what a post, an article or an issue produced — visits, 
 orgs, devices, usage, revenue — **joined by the campaign key and never by a person**. This
 page covers what FR-102 has shipped so far: the taxonomy (P1b), the exclusion set (P1c), the
 daily digest (P1d), the account funnel, cohorts and org views (P2), the install trace (P3) with
-the setup wizard's opt-in diagnostics (P3b), the
+the setup wizard's opt-in diagnostics (P3b) and the internal networks that keep the lab's own
+installs out of its fetch counts (P3c), the
 web plane — the purestat puller and the Campaigns table (P6) — social reach: the ingest
 routes the promotion pipeline pushes to, and the Channels table (P8) — the newsletter's
 delivery side: SendGrid's signed Event Webhook, the per-issue link tags and unsubscribes, and
@@ -201,6 +202,7 @@ sequenceDiagram
 | `growth.purestat_url` | `ROOMLER__GROWTH__PURESTAT_URL` | `https://purestat.ai` | the v1 query endpoint's base |
 | `growth.purestat_api_key` | `ROOMLER__GROWTH__PURESTAT_API_KEY` | empty | a site-scoped key (`X-API-Key`); empty ⇒ website, blog, campaigns and coverage read "not measured", the Campaigns table's web cells too, and the `saas` puller (P6) pulls nothing and says so once at boot |
 | `growth.install_counters` | `ROOMLER__GROWTH__INSTALL_COUNTERS` | `true` | the install trace's fetch counters (P3); `false` writes none. The token ledger and the enroll's `install` have no switch — they are ids on rows that exist anyway |
+| `growth.internal_networks` | `ROOMLER__GROWTH__INTERNAL_NETWORKS` | empty | comma-separated CIDRs or addresses of the operator's own networks (the lab's egress, self-hosted CI runners, never GitHub-hosted ranges, which are shared cloud space, and the operator's machines); a fetch from inside counts as `internal` instead of its class (P3c, [the lab's own fetches](#the-labs-own-fetches-p3c)); empty changes nothing and leaves the digest's internal line "not measured" |
 | `growth.setup_diagnostics` | `ROOMLER__GROWTH__SETUP_DIAGNOSTICS` | `true` | accept the setup wizard's opt-in diagnostics at `POST /api/setup/diagnostics` (P3b); `false` makes the route the empty 404 of an absent path and the digest's `wizard_steps` "not measured". On for the counters' reason: the rows are this server's own, exist only when the person ticked the wizard's box, and name nobody — unlike the three mailing jobs, which default off because they mail people |
 
 The hosted deployment turns the digest on with `ROOMLER__GROWTH__DIGEST_ENABLED=true` (and a
@@ -348,7 +350,7 @@ sequenceDiagram
     S->>S: enroll_token_issued {_id: jti, tenant_id, issued_by, issued_at}
     H->>S: GET install.sh · install.ps1 · installer/{flavour} · latest-release · setup/{platform}
     Note over H,S: UA: curl · PowerShell · roomler-setup · a browser — never roomlerd/
-    S->>S: growth_daily install:fetch {asset, client, os} += 1 — no UA, no IP
+    S->>S: growth_daily install:fetch {asset, client, os} += 1 — no UA, no IP<br/>(client = internal from the operator's internal networks, P3c)
     H->>S: POST /api/agent/enroll {…, install: {method, scope}}
     S->>S: agents.install · enroll_token_issued.redeemed_at + agent_id
     H->>S: WS hello → presence online (first online)
@@ -358,7 +360,7 @@ sequenceDiagram
 | Step | Record | Written by | Kept |
 |---|---|---|---|
 | token minted | `enroll_token_issued {_id: jti, tenant_id, issued_by, issued_at, kind: standard, redeemed_at: null, agent_id: null}` — the jti, **never the token** | `POST …/agent/enroll-token` (`agent.rs::issue_enrollment_token`), best-effort | 90 d |
-| fetch | `growth_daily {source: install, metric: fetch, dims: {asset, client, os}, day, value}` | the installer proxy, `/api/agent/latest-release`, `/api/setup/latest-release`, `/api/setup/install.sh`, `/api/setup/install.ps1`, `/api/setup/{platform}` (`install_trace::count_fetch`, spawned, best-effort) | indefinitely |
+| fetch | `growth_daily {source: install, metric: fetch, dims: {asset, client, os}, day, value}` — `client` the class, or `internal` for a fetch from the operator's internal networks (P3c) | the installer proxy, `/api/agent/latest-release`, `/api/setup/latest-release`, `/api/setup/install.sh`, `/api/setup/install.ps1`, `/api/setup/{platform}` (`install_trace::count_fetch`, spawned, best-effort) | indefinitely |
 | enroll | `agents.install {method, scope, run?}`; `enroll_token_issued.redeemed_at`, `.agent_id` (an upsert from the token's claims, so a token minted before the ledger is on record too) | `POST /api/agent/enroll` | with the row; 90 d |
 | wizard step boundary (**opt-in**) | `setup_diagnostics {run, step, outcome, elapsed_ms, error_code, os, wizard_version, ts}` — [below](#the-wizards-opt-in-diagnostics-p3b) | `POST /api/setup/diagnostics`, from the wizard, only when the box is ticked | 90 d; the daily counts frozen into `growth_daily` indefinitely |
 | first online · first session | already there: `stats_events` (presence), `remote_sessions` | — | — |
@@ -396,6 +398,48 @@ fetch of `install.sh` is honestly `unknown`.
   the database is doing. `ROOMLER__GROWTH__INSTALL_COUNTERS=false` switches the counters off.
 - A fetch is a **lower bound on intent, not an install**: a self-hoster who downloads our build
   to enroll elsewhere fetches like anyone else, and only requests that reach this server count.
+
+### The lab's own fetches (P3c)
+
+The exclusion set removes internal orgs and people, but a fetch happens before any enrollment
+and carries no tenant, so it could not remove the vmtest lab's own installs. On 2026-10-16 those
+were most of the install section's fetch counts. The operator names the internal source networks
+instead, and a fetch from inside is counted as `internal` in place of its class.
+
+```mermaid
+flowchart TD
+  F["a fetch of an installer, a manifest or a script"] --> U{"User-Agent: roomlerd/ · roomler-* (not the wizard)?"}
+  U -->|yes| N["not counted at all (the updater rule)"]
+  U -->|no| A["client address = the limiter's rule:<br/>the X-Forwarded-For entry just left of<br/>our one trusted hop's own, else the socket peer"]
+  A --> I{"inside growth.internal_networks?"}
+  I -->|yes| INT["growth_daily {asset, client: internal, os} += 1"]
+  I -->|"no, none configured, or no address"| CL["growth_daily {asset, client: class, os} += 1"]
+  A -. "compared in memory, then dropped" .-> X(("no address stored"))
+```
+
+| Rule | Where |
+|---|---|
+| The setting: comma-separated CIDRs (`203.0.113.0/24`, `2001:db8::/32`) or bare addresses (their own `/32` / `/128`). A CIDR with host bits set, or a prefix shorter than /8 (IPv4) or /16 (IPv6), is refused, never widened. An IPv4-mapped IPv6 peer (`::ffff:a.b.c.d`) is compared as the IPv4 it carries | `InternalNetworks::parse` / `contains` ([`growth.rs:171`](../crates/core/src/growth.rs), [`:221`](../crates/core/src/growth.rs)) |
+| Parsed once at boot. An entry it cannot use (not an address, host bits set, a prefix too short) is echoed in one warning with its reason and skipped, and the rest still apply. The networks in effect are logged as CIDRs | `internal_networks_from` ([`fleet/src/lib.rs:160`](../crates/modules/fleet/src/lib.rs)) |
+| **One client-address rule.** The `X-Forwarded-For` entry just left of our trusted hops' own (`app.rate_limit_trusted_hops`, 1 in production), the client the edge recorded, else the socket peer; `X-Real-IP` is never read. It moved from the api crate to core so `fleet` reads it exactly as the per-IP governor and the credential gate do. A client that seeds `X-Forwarded-For` with a lab address moves nobody: that entry sits left of the one our hop recorded | `client_ip_or_peer` ([`client_ip.rs:67`](../crates/core/src/client_ip.rs)); the handlers take `PeerAddr` ([`:90`](../crates/core/src/client_ip.rs)), an extractor that never refuses |
+| The class becomes `internal`; the asset and OS stay. The updater rule comes first, so a `roomlerd/` fetch from the lab still writes nothing | `fetch_dims` ([`install_trace.rs:188`](../crates/modules/fleet/src/install_trace.rs)), `count_fetch` ([`:211`](../crates/modules/fleet/src/install_trace.rs)) |
+| **Still no IP, anywhere.** The address is compared in memory and dropped; the row stays three enum-like dimensions and a count. The integration test scans every row for each address it used (the lab's, the outsider's, our hop's, the peer's) | `install_trace_tests::fetches_from_internal_networks_count_as_internal_and_store_no_address` |
+| Unset (the default) changes nothing: every fetch counts under its class | `ROOMLER__GROWTH__INTERNAL_NETWORKS` |
+
+> ⚠️ A network that is too broad hides real users. The `internal` line in the digest shows how
+> many fetches the setting reclassified, and the parser refuses the worst typos: a `/0`, a
+> prefix shorter than /8 or /16, or host bits set. Name the lab's egress addresses and the
+> operator's own, nothing wider. **Take them from the edge's access log for one lab run**, not from a
+> guess. A guest on mars reaches the edge on its private VM-network address, not mars's public IP; a
+> guest on zeus shows zeus's public IP.
+>
+> ⚠️ The rule trusts `app.rate_limit_trusted_hops` to match the proxies in front of the server. A
+> self-hosted image exposed directly, with nothing in front, lets a client choose its address, for
+> the rate limiter and for this count alike.
+>
+> For the first 28 days after the setting is applied, the 7d/28d internal counts start at that day,
+> while the table's 7d/28d still hold the lab's earlier fetches. With `growth.install_counters`
+> off, both fetch fields read "not measured".
 
 ### The enroll says how
 
@@ -538,7 +582,12 @@ the counts stand after the rows expire.
 
 `install` is a section of its own: `tokens {issued, redeemed}` (tokens issued in the window,
 and how many of those an enroll spent; a redeemed share only at n ≥ 30), `fetches
-[{asset, client, os, fetches}]`, `enrollments_by_method [{method, os, enrolled}]`, and since
+[{asset, client, os, fetches}]` — never the `internal` rows — and since P3c `internal_fetches`
+(their sum per window, whatever the asset, on its own line in the email: "Fetches from internal
+networks (not in the table)"; `not_measured` while this server names no network and the 28 days
+hold no internal row, so a missing setting never reads as "the lab fetched nothing"; a digest
+stored before P3c reads `arrives_with: P3c` there),
+`enrollments_by_method [{method, os, enrolled}]`, and since
 P3b `wizard_steps {runs, n_floor, done_share_28d?, steps [{step, reached, ok, failed,
 cancelled}], errors [{step, error_code, failures}]}` — every number a count of **distinct
 opted-in runs** per window, in run order, read from `setup_diagnostics` (its 90 days cover

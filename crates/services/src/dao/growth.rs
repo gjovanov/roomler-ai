@@ -58,6 +58,11 @@ pub const GROWTH_DAILY: &str = "growth_daily";
 /// and the digest must read the rows whether or not that module is compiled.
 pub const INSTALL_SOURCE: &str = "install";
 pub const INSTALL_FETCH_METRIC: &str = "fetch";
+/// P3c — the `client` dimension of a fetch from one of the operator's
+/// internal networks (`growth.internal_networks`), counted here INSTEAD of
+/// under its client class: the digest leaves these rows out of the fetch
+/// table and reports their sum on its own line.
+pub const INSTALL_INTERNAL_CLIENT: &str = "internal";
 /// P3b — the wizard's opt-in diagnostics frozen per day: `dims {step,
 /// outcome, os}`, the value the number of DISTINCT runs that ended `step`
 /// with `outcome` on `os` that day (a retry re-passing a step is one run).

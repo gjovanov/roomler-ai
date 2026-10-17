@@ -52,6 +52,7 @@ pub mod agent_socket;
 pub mod attribution;
 pub mod campaign;
 pub mod capabilities;
+pub mod client_ip;
 pub mod cluster;
 pub mod composition;
 pub mod cookies;

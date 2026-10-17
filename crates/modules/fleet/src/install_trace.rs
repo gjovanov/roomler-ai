@@ -24,8 +24,19 @@
 //! The write is spawned and best-effort: an install script must be served
 //! at wire speed whatever the database is doing, and a lost increment is a
 //! lost increment. `growth.install_counters = false` switches it off.
+//!
+//! **P3c — the lab is not a market.** A fetch carries no tenant, so the
+//! exclusion set cannot remove the lab's own installs; the operator names
+//! the internal source networks instead (`growth.internal_networks`). A
+//! counted fetch whose client address falls inside is counted under the
+//! client class [`INTERNAL_CLIENT`] instead of its own, so the classes stop
+//! inflating and the digest still says how many were left out. The address
+//! comes from [`roomler_core::client_ip`] — the per-IP limiter's rule, the
+//! only one the server has — is compared in memory, and is dropped: the
+//! row stays three enum-like dimensions and a count. The updater rule comes
+//! first: a `roomlerd/` fetch from the lab is still never counted at all.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, net::SocketAddr};
 
 use axum::http::{HeaderMap, header::USER_AGENT};
 use roomler_ai_services::dao::growth::GrowthDao;
@@ -35,7 +46,8 @@ use crate::FleetState;
 /// `growth_daily.source` for every counter here, and the `metric` of a
 /// fetch — spelled in the core DAO, which the host's digest reads them by.
 pub use roomler_ai_services::dao::growth::{
-    INSTALL_FETCH_METRIC as METRIC_FETCH, INSTALL_SOURCE as SOURCE,
+    INSTALL_FETCH_METRIC as METRIC_FETCH, INSTALL_INTERNAL_CLIENT as INTERNAL_CLIENT,
+    INSTALL_SOURCE as SOURCE,
 };
 
 /// The `asset` dimension's spellings — a grouping key in the digest, so a
@@ -170,8 +182,16 @@ pub fn os_dimension(asset: &str, ua: Option<&str>) -> &'static str {
 
 /// Pure: the dimensions one fetch counts under, or `None` when it must not
 /// be counted at all. What a test asserts and what [`count_fetch`] writes.
-pub fn fetch_dims(asset: &str, ua: Option<&str>) -> Option<BTreeMap<String, String>> {
-    let client = classify_user_agent(ua).counted()?;
+/// `internal` (P3c) — the client address fell inside one of the operator's
+/// internal networks — replaces the class with [`INTERNAL_CLIENT`]; it never
+/// makes an uncounted fetch counted.
+pub fn fetch_dims(
+    asset: &str,
+    ua: Option<&str>,
+    internal: bool,
+) -> Option<BTreeMap<String, String>> {
+    let class = classify_user_agent(ua).counted()?;
+    let client = if internal { INTERNAL_CLIENT } else { class };
     let mut dims = BTreeMap::new();
     dims.insert("asset".to_string(), asset.to_string());
     dims.insert("client".to_string(), client.to_string());
@@ -185,13 +205,24 @@ fn today_utc() -> String {
 }
 
 /// Count one fetch of `asset` by the client `headers` describe. Reads the
-/// User-Agent and nothing else about the request; spawns the write.
-pub fn count_fetch(state: &FleetState, headers: &HeaderMap, asset: &str) {
+/// User-Agent and — only to test it against the internal networks, then
+/// dropped — the client address (`peer` is the socket peer the listener
+/// recorded, the fallback of the limiter's rule); spawns the write.
+pub fn count_fetch(state: &FleetState, headers: &HeaderMap, peer: Option<SocketAddr>, asset: &str) {
     if !state.settings.growth.install_counters {
         return;
     }
     let ua = headers.get(USER_AGENT).and_then(|v| v.to_str().ok());
-    let Some(dims) = fetch_dims(asset, ua) else {
+    // P3c — one rule for "the client's address": the limiter's. Compared in
+    // memory and dropped; skipped outright while no network is configured.
+    let internal = !state.internal_networks.is_empty()
+        && roomler_core::client_ip::client_ip_or_peer(
+            headers,
+            peer,
+            state.settings.app.rate_limit_trusted_hops,
+        )
+        .is_some_and(|ip| state.internal_networks.contains(ip));
+    let Some(dims) = fetch_dims(asset, ua, internal) else {
         return;
     };
     let day = today_utc();
@@ -268,9 +299,16 @@ mod tests {
             assert_eq!(classify_user_agent(Some(ua)), UaClass::Updater, "{ua}");
             assert_eq!(UaClass::Updater.counted(), None);
             assert_eq!(
-                fetch_dims(asset::AGENT_LATEST_RELEASE, Some(ua)),
+                fetch_dims(asset::AGENT_LATEST_RELEASE, Some(ua), false),
                 None,
                 "{ua} must write nothing"
+            );
+            // P3c — from the lab too: `internal` never makes the updater
+            // counted.
+            assert_eq!(
+                fetch_dims(asset::AGENT_LATEST_RELEASE, Some(ua), true),
+                None,
+                "{ua} must write nothing from an internal network either"
             );
         }
         // Only the daemon's names: a browser whose UA merely mentions the
@@ -338,7 +376,7 @@ mod tests {
     #[test]
     fn fetch_dims_for_the_real_paths() {
         let dims = |asset: &str, ua: &str| {
-            let d = fetch_dims(asset, Some(ua)).expect("counted");
+            let d = fetch_dims(asset, Some(ua), false).expect("counted");
             (d["asset"].clone(), d["client"].clone(), d["os"].clone())
         };
         // The wizard resolving and downloading the perMachine MSI.
@@ -382,7 +420,7 @@ mod tests {
             )
         );
         // No header at all is still a fetch.
-        let d = fetch_dims(asset::INSTALL_SH, None).unwrap();
+        let d = fetch_dims(asset::INSTALL_SH, None, false).unwrap();
         assert_eq!(d["client"], "other");
         assert_eq!(d["os"], "unknown");
         // And a row carries exactly these three keys — no UA, no address.
@@ -390,5 +428,39 @@ mod tests {
             d.keys().cloned().collect::<Vec<_>>(),
             ["asset", "client", "os"]
         );
+    }
+
+    /// P3c — a fetch from an internal network keeps its asset and OS and
+    /// trades its class for `internal`, whatever the class was; the row is
+    /// still the same three keys, so nothing about the address reaches it.
+    #[test]
+    fn an_internal_fetch_is_counted_as_internal_instead_of_its_class() {
+        for ua in [
+            Some("curl/8.5.0"),
+            Some(PS51),
+            Some("roomler-setup/0.4.139"),
+            Some(CHROME_WIN),
+            None,
+        ] {
+            let d = fetch_dims(asset::INSTALL_PS1, ua, true).expect("counted");
+            assert_eq!(d["client"], INTERNAL_CLIENT, "{ua:?}");
+            assert_eq!(d["asset"], "install.ps1");
+            assert_eq!(d["os"], "windows");
+            assert_eq!(
+                d.keys().cloned().collect::<Vec<_>>(),
+                ["asset", "client", "os"]
+            );
+        }
+        // The spelling is the digest's grouping key, and no class shares it.
+        assert_eq!(INTERNAL_CLIENT, "internal");
+        for class in [
+            UaClass::Wizard,
+            UaClass::ScriptSh,
+            UaClass::ScriptPs1,
+            UaClass::Browser,
+            UaClass::Other,
+        ] {
+            assert_ne!(class.counted(), Some(INTERNAL_CLIENT));
+        }
     }
 }

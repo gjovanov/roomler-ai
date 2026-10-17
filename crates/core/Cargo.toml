@@ -36,6 +36,9 @@ bson.workspace = true
 bytes = "1"
 dashmap.workspace = true
 futures.workspace = true
+# FR-102 P3c — `growth::InternalNetworks`, the operator's internal source
+# networks (the same crate `fleet` already validates subnets with).
+ipnet = "2"
 maxminddb.workspace = true
 mongodb.workspace = true
 # S3/MinIO file-storage backend (`storage.rs`), moved with `Core` in P1b.

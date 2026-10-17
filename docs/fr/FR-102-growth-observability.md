@@ -246,6 +246,25 @@ sequenceDiagram
    ⚠️ **`roomlerd/` is never counted.** It is the updater, and by default it asks `roomler.ai` from
    self-hosted devices as well (`agents/roomlerd/src/updater.rs:37`). Counting it would be exactly the
    self-host telemetry the product promises not to collect.
+   *(P3c as built: a fetch carries no tenant, so the exclusion list (§3c.4) cannot remove the lab's own
+   installs, and on 2026-10-16 they were most of the counts (§8). The operator names the internal source
+   networks instead, `ROOMLER__GROWTH__INTERNAL_NETWORKS` (comma-separated CIDRs or bare addresses, default
+   empty, so nothing changes until it is set). A counted fetch whose client address falls inside is
+   counted under the class `internal` instead of its own, keeping its asset and OS. The updater rule comes
+   first: a `roomlerd/` fetch from the lab is still not counted at all. The address is the per-IP limiter's
+   (`roomler_core::client_ip`, moved there from the api crate so `fleet` reads it the same way): the
+   `X-Forwarded-For` entry just left of our one trusted hop's own address, the client that hop recorded,
+   else the socket peer. A client therefore cannot seed its way into the lab or out of it, and `X-Real-IP`
+   is never read. ⚠️ That holds while `app.rate_limit_trusted_hops` matches the proxies in front of the
+   server. A self-hosted image exposed directly lets a client choose its address, for the rate limiter and
+   for this count alike. The address is compared in memory and dropped, so the row stays
+   `{asset, client, os}` and a count. The digest leaves the `internal` rows out of the fetch table and
+   reports them as `install.internal_fetches`. That line reads "not measured", never a 0, in three
+   cases: no network is configured and the 28 days hold no internal row; no entry is usable; or the
+   install counters are off (then the fetch table is "not measured" too). An entry it cannot use is warned
+   about once at boot with its reason, and skipped. Refused are: not an address, host bits set
+   (`94.130.141.98/24` is refused, not widened to the /24), and a prefix shorter than /8 (IPv4) or /16
+   (IPv6). The networks in effect are logged as CIDRs.)*
 3. **The enroll says how.** `EnrollRequest` gains `install: Option<InstallInfo { method, scope }>`, additive
    and `#[serde(default)]`; an agent from before this change records `unknown`. `method` is one of `wizard`,
    `script-sh`, `script-ps1`, `msi`, `deb`, `pkg`, `manual`, `container`, `other`; `scope` is one of
@@ -699,6 +718,7 @@ hosted only). §7's retention list grows, and `docs/data-model.md`'s stale TTLs 
 | P2 | §3d: definitions, `growth_org_daily`, the funnel/cohorts/orgs/timeline endpoints, the Growth page (Overview, Orgs, Cohorts) | `ROOMLER__GROWTH__ENABLED=false` (the routes answer 404) | **live** 2026-10-15 00:10Z (`hosted-20261014-831ebcf`): #2215 `193848ff0`. AC6 by the integration lane; AC7 field-verified 2026-10-15 (§8); AC8 needs a day older than 90 days |
 | P3 | §3e 1–4 and 6: issuance record, fetch counters, the enroll's `install` (server, agent, scripts, wizard), the Install panel | counters off by config; the agent sends `install` only when it is set | **server half live** 2026-10-15 00:10Z (`hosted-20261014-831ebcf`): #2217 `36f871029`; AC10 + AC11 field-verified (§8). The agent half (`roomlerd enroll` flags/env, the scripts, the wizard, the companion) **released** in agent 0.4.137 (2026-10-15 11:51Z); AC9 field-verified on vmtest (§8) |
 | P3b | §3e 5: the wizard's opt-in diagnostics, after D4 | the checkbox; `ROOMLER__GROWTH__SETUP_DIAGNOSTICS=false` | **live** 2026-10-16 10:17Z (`hosted-20261016-d11fe94`), with the wizard half released in setup 0.4.139 (10:37Z): #2289 `abc0ac20c`. AC12 field-verified (§8). Covers the Welcome-page box (unticked, memory only), one record per step boundary buffered until `cmd_install` names the server, `POST /api/setup/diagnostics` (`fleet`; validated field by field, no IP, no UA, ≤ 48 rows per run), `setup_diagnostics` (90 d) with the nightly freeze into `growth_daily`, the digest's `wizard_steps`, the docs |
+| P3c | §3e 2: the lab's own fetches stop inflating the install counters (§8, 2026-10-16) — the operator's internal networks, by the limiter's client-address rule, counted as `internal` | `ROOMLER__GROWTH__INTERNAL_NETWORKS` empty (the default): nothing changes | **in PR #2378** (2026-10-17): `growth.internal_networks`; `roomler_core::client_ip` (the one client-address rule, moved from the api crate); `client: internal` in place of the class; the digest's `install.internal_fetches` beside a table that leaves those rows out; the integration tests (inside, outside, a seeded header, the updater, no address in any row) and the docs. No AC is ticked by it. Owed after the promote: the operator names the CIDRs, then the next digest's fetch table is read against the lab's own installs |
 | P4 | §3g: `billing_events` and the backfill, MRR movements, quota collisions, margin | the new webhook kinds are additive (unselect them on the Stripe endpoint and nothing new is recorded); `growth.enabled = false` hides the view and stops the collision counter | **live** 2026-10-15 21:33Z (`hosted-20261015-410376a`): #2246 `d44c614cd`, plus the same-second ordering fix in #2261. Owed with the operator: the six kinds selected on the Stripe endpoint, the backfill run, then AC13. Covers `billing_events` (`saas`) from the six Stripe kinds, `POST …/growth/billing/backfill`, quota collisions through `roomler_core::quota`, the monthly freeze, `GET …/growth/revenue`, the Revenue tab, the funnel's `paid`, the digest's billed section |
 | P5 | §3h: the list over time, SendGrid events (D6), per-issue tags (D5), the per-issue table | the webhook route off (no `ROOMLER__NEWSLETTER__EVENT_WEBHOOK_PUBLIC_KEY`); tags off in the sender (`ROOMLER__NEWSLETTER__LINK_TAGS=false`) | **live** 2026-10-15 17:29Z (`hosted-20261015-3df732f`): #2244 `4e26327a0` — `POST /api/sendgrid/webhook` (`saas`), the per-issue tags and `i=`, `GET …/growth/newsletter`, the Newsletter tab, the digest's delivery. The webhook stays 404 until the SendGrid Event Webhook's public key is configured (with the operator), then AC14 |
 | PS1 | §3n PS1 in purestat | — | **live** with PS0a in v0.1.8; the roomler.ai key minted 2026-10-14 (only its hash stored; sealed into `roomler2-secret`, roomler-ai-deploy#29) |
@@ -895,6 +915,10 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
   *(CI: the integration suite on #2175. Field, production 2026-10-14: the 2026-10-13 digest was stored and
   mailed once, `attempts: 1`, with both pods running; its counts equal the hand counts; its stored
   sections carry no `@`. §8.)*
+- [ ] **AC24 (P3c):** with the lab's egress networks configured (taken from the edge's access log), a
+  vmtest install's fetches count as `internal`, an outside fetch counts under its class, the digest reports
+  the internal count on its own line, and no `growth_daily` row carries an address. Red first: on the
+  deploy before P3c, or with the setting empty, the same lab fetch counts under its class.
 
 ## 6. Open decisions (defaults in bold)
 

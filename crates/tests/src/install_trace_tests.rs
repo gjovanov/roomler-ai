@@ -11,6 +11,11 @@
 //!   exactly its counter, the updater's User-Agent increments nothing, and
 //!   no User-Agent and no IP survive into `growth_daily` (every row is
 //!   scanned). The counters switch off by config.
+//! * **P3c** — a fetch from one of the operator's internal networks counts
+//!   as `internal` instead of its class, by the limiter's client-address
+//!   rule (a seeded `X-Forwarded-For` moves nobody in or out), no address
+//!   reaches a row, and the digest reports the internal fetches on their
+//!   own line — "not measured" while no network is configured.
 //! * the enroll's `install`: stored as sent, `unknown` for the old shape,
 //!   clamped to `other` for a spelling the server does not know, kept across
 //!   a re-enroll that says nothing, and an unknown field never refuses the
@@ -446,6 +451,210 @@ async fn the_release_manifest_counts_before_the_upstream_read() {
     );
 }
 
+// ── P3c: the lab is not a market ─────────────────────────────────────────
+
+/// The day's install section, computed live for TODAY (the counters write
+/// today; `compute` takes any day, the routes only closed ones).
+async fn todays_install(app: &TestApp) -> Value {
+    let today = chrono::Utc::now().date_naive();
+    let sections = roomler_ai_api::growth::digest::compute(
+        &app.state,
+        today,
+        &roomler_core::growth::ExclusionSet::none(),
+        bson::DateTime::now(),
+    )
+    .await
+    .expect("the digest computes");
+    serde_json::to_value(&sections).unwrap()["install"].clone()
+}
+
+/// P3c — a fetch whose client address falls inside one of the operator's
+/// internal networks counts as `internal`, keeping its asset and OS; an
+/// outside one counts under its class. The address is the limiter's rule —
+/// the entry just left of our ONE trusted proxy hop's own address (the
+/// client that hop recorded), else the socket peer — so a client cannot seed
+/// its way into (or out of) the lab with the header, and `X-Real-IP` is
+/// never read. The updater is still never counted, and no row carries any of
+/// the addresses involved. The digest leaves the internal rows out of its
+/// fetch table and reports them on their own.
+#[tokio::test]
+async fn fetches_from_internal_networks_count_as_internal_and_store_no_address() {
+    let app = TestApp::spawn_with_settings(|s| {
+        s.app.rate_limit_trusted_hops = 1;
+        s.growth.internal_networks = "203.0.113.0/24, 2001:db8::/32".into();
+    })
+    .await;
+    let get = |path: &str, ua: &str, xff: Option<&str>| {
+        let mut req = app.client.get(app.url(path)).header("User-Agent", ua);
+        if let Some(xff) = xff {
+            req = req.header("X-Forwarded-For", xff);
+        }
+        req.send()
+    };
+    let lab_v4 = Some("203.0.113.9, 10.10.0.1");
+    let lab_v6 = Some("2001:db8::7, 10.10.0.1");
+    let outside = Some("198.51.100.7, 10.10.0.1");
+
+    // The lab, behind our one proxy hop: internal, whatever the class.
+    let r = get("/api/setup/install.sh", "curl/8.5.0", lab_v4)
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200, "the script is served either way");
+    get("/api/setup/install.ps1", PS51, lab_v6).await.unwrap();
+    // The updater from the lab: still nothing at all.
+    get("/api/setup/install.sh", "roomlerd/0.4.141", lab_v4)
+        .await
+        .unwrap();
+    // Outside: the class.
+    get("/api/setup/install.sh", "curl/8.5.0", outside)
+        .await
+        .unwrap();
+    // Outside, seeding a lab address to the LEFT of the real one: still
+    // outside — only the entry our hop recorded is evidence.
+    get(
+        "/api/setup/install.sh",
+        "curl/8.5.0",
+        Some("203.0.113.9, 198.51.100.7, 10.10.0.1"),
+    )
+    .await
+    .unwrap();
+    // A lone entry is the client's own claim, not our hop's record: the
+    // socket peer (loopback, outside the lab) decides.
+    get("/api/setup/install.sh", "curl/8.5.0", Some("203.0.113.9"))
+        .await
+        .unwrap();
+    // `X-Real-IP` is never read: an outsider naming a lab address in it is
+    // still outside (review of #2378).
+    app.client
+        .get(app.url("/api/setup/install.sh"))
+        .header("User-Agent", "curl/8.5.0")
+        .header("X-Forwarded-For", "198.51.100.7, 10.10.0.1")
+        .header("X-Real-IP", "203.0.113.9")
+        .send()
+        .await
+        .unwrap();
+
+    let sum = |rows: &[Document]| -> i64 {
+        rows.iter()
+            .map(|r| {
+                r.get_i64("value")
+                    .unwrap_or_else(|_| i64::from(r.get_i32("value").unwrap()))
+            })
+            .sum()
+    };
+    wait_daily(&app, |rows| sum(rows) >= 6).await;
+    // Let any straggling write land — the updater's must not exist.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let rows = all_docs(&app, "growth_daily").await;
+    assert_eq!(sum(&rows), 6, "{rows:?}");
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(
+        value_of(&rows, "install.sh", "internal", "unknown"),
+        Some(1)
+    );
+    assert_eq!(
+        value_of(&rows, "install.ps1", "internal", "windows"),
+        Some(1)
+    );
+    assert_eq!(
+        value_of(&rows, "install.sh", "script-sh", "unknown"),
+        Some(4)
+    );
+
+    // No address reached a row — not the lab's, not the outsider's, not
+    // our hop's, not the peer's — and a row is still the same three keys.
+    for r in &rows {
+        assert_eq!(
+            r.get_document("dims")
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["asset", "client", "os"]
+        );
+        let text = strings_of(r).join("\n");
+        for leak in [
+            "203.0.113",
+            "2001:db8",
+            "198.51.100",
+            "10.10.0.1",
+            "127.0.0.1",
+        ] {
+            assert!(
+                !text.contains(leak),
+                "{leak:?} reached growth_daily: {text}"
+            );
+        }
+    }
+
+    // The digest: the table holds the classes only; the lab is its own
+    // line, so nothing vanishes silently.
+    let install = todays_install(&app).await;
+    assert_eq!(
+        install["fetches"],
+        json!([{ "asset": "install.sh", "client": "script-sh", "os": "unknown",
+                 "fetches": { "day": 4, "d7": 4, "d28": 4 } }])
+    );
+    assert_eq!(
+        install["internal_fetches"],
+        json!({ "day": 2, "d7": 2, "d28": 2 })
+    );
+}
+
+/// P3c — nothing changes until the operator names a network: the same lab
+/// request counts under its class, and the digest's internal line is "not
+/// measured" — never a 0 claiming no lab fetch happened.
+#[tokio::test]
+async fn without_internal_networks_nothing_changes_and_internal_is_not_measured() {
+    let app = TestApp::spawn_with_settings(|s| {
+        s.app.rate_limit_trusted_hops = 1;
+        s.growth.internal_networks = String::new();
+    })
+    .await;
+    app.client
+        .get(app.url("/api/setup/install.sh"))
+        .header("User-Agent", "curl/8.5.0")
+        .header("X-Forwarded-For", "203.0.113.9, 10.10.0.1")
+        .send()
+        .await
+        .unwrap();
+    let rows = wait_daily(&app, |rows| !rows.is_empty()).await;
+    assert_eq!(
+        value_of(&rows, "install.sh", "script-sh", "unknown"),
+        Some(1),
+        "{rows:?}"
+    );
+    assert_eq!(value_of(&rows, "install.sh", "internal", "unknown"), None);
+    let install = todays_install(&app).await;
+    assert_eq!(
+        install["internal_fetches"]["not_measured"],
+        "no internal network configured on this server (growth.internal_networks)"
+    );
+    assert_eq!(install["fetches"].as_array().map(Vec::len), Some(1));
+
+    // A configured network with nothing from it is a MEASURED zero.
+    let configured = TestApp::spawn_with_settings(|s| {
+        s.growth.internal_networks = "203.0.113.0/24".into();
+    })
+    .await;
+    assert_eq!(
+        todays_install(&configured).await["internal_fetches"],
+        json!({ "day": 0, "d7": 0, "d28": 0 })
+    );
+
+    // Something written but nothing usable — a widened host and a typo — is
+    // still not measured, and says why differently: the boot warning names
+    // each entry (review of #2378).
+    let unusable = TestApp::spawn_with_settings(|s| {
+        s.growth.internal_networks = "94.130.141.98/24, not-a-net".into();
+    })
+    .await;
+    assert_eq!(
+        todays_install(&unusable).await["internal_fetches"]["not_measured"],
+        "no usable entry in growth.internal_networks (see the boot warning)"
+    );
+}
+
 #[tokio::test]
 async fn the_counters_switch_off_by_config() {
     let app = TestApp::spawn_with_settings(|s| s.growth.install_counters = false).await;
@@ -459,6 +668,16 @@ async fn the_counters_switch_off_by_config() {
     assert_eq!(resp.status().as_u16(), 200, "the script is still served");
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(all_docs(&app, "growth_daily").await.is_empty());
+    // And the digest says so: "not measured" for both fetch fields, never an
+    // empty table or a 0 claiming nobody fetched anything (review of #2378).
+    let install = todays_install(&app).await;
+    for field in ["fetches", "internal_fetches"] {
+        assert_eq!(
+            install[field]["not_measured"],
+            "install counters are off on this server (growth.install_counters)",
+            "{field}: {install}"
+        );
+    }
 }
 
 // ── The enroll's `install` ───────────────────────────────────────────────

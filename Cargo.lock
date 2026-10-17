@@ -8582,6 +8582,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures",
+ "ipnet",
  "maxminddb",
  "mongodb",
  "object_store",

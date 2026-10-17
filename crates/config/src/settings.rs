@@ -511,6 +511,20 @@ pub struct GrowthSettings {
     /// kill switch. Env: `ROOMLER__GROWTH__INSTALL_COUNTERS`.
     #[serde(default = "growth_default_on")]
     pub install_counters: bool,
+    /// P3c — the operator's internal source networks: comma-separated CIDRs
+    /// (`203.0.113.0/24, 2001:db8::/32`) or bare addresses. A counted fetch
+    /// whose client address — derived exactly as the per-IP limiter derives
+    /// it — falls inside is counted under the client class `internal`
+    /// instead of its own, so the lab's and the operator's own installs stop
+    /// inflating the install section, and the digest says how many were left
+    /// out. The address is compared in memory and dropped; nothing stores
+    /// it. Empty — the default — changes nothing, and the digest's internal
+    /// count reads "not measured". An entry that does not parse is warned
+    /// about once at boot and skipped. Env: `ROOMLER__GROWTH__INTERNAL_NETWORKS`.
+    ///
+    /// ⚠️ `String`, not `Vec<String>`, for `digest_to`'s reason.
+    #[serde(default)]
+    pub internal_networks: String,
     /// P3b — accept the setup wizard's opt-in diagnostics at
     /// `POST /api/setup/diagnostics` (`docs/growth-observability.md`, the
     /// install trace). Default **on**, for `install_counters`'s reason: the
@@ -577,6 +591,7 @@ impl Default for GrowthSettings {
             purestat_url: growth_default_purestat_url(),
             purestat_api_key: String::new(),
             install_counters: true,
+            internal_networks: String::new(),
             setup_diagnostics: true,
             weekly_enabled: false,
             alerts: false,
@@ -1494,6 +1509,12 @@ mod growth_settings_tests {
         assert!(d.install_counters && absent.install_counters);
         let off: GrowthSettings = toml::from_str("install_counters = false").unwrap();
         assert!(!off.install_counters);
+        // P3c — no internal network unless the operator names one; the
+        // list is one string, as it arrives from the env.
+        assert!(d.internal_networks.is_empty() && absent.internal_networks.is_empty());
+        let lab: GrowthSettings =
+            toml::from_str("internal_networks = \"203.0.113.0/24, 2001:db8::/32\"").unwrap();
+        assert_eq!(lab.internal_networks, "203.0.113.0/24, 2001:db8::/32");
         // P3b — the wizard's opt-in diagnostics are accepted unless switched
         // off (the same reason as the counters: the rows are the server's
         // own, opt-in at the source, and name nobody).

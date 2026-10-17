@@ -35,7 +35,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use roomler_core::ApiError;
+use roomler_core::{ApiError, client_ip::PeerAddr};
 
 use crate::{FleetState, install_trace, releases};
 
@@ -80,11 +80,17 @@ pub struct AgentRelease {
 /// just a URL swap.
 pub async fn latest_release(
     State(state): State<FleetState>,
+    PeerAddr(peer): PeerAddr,
     headers: HeaderMap,
 ) -> Result<Json<Vec<AgentRelease>>, ApiError> {
     // FR-102 P3 — counted before the upstream read, so an outage at GitHub
     // hides no demand; the updater's own checks are never counted.
-    install_trace::count_fetch(&state, &headers, install_trace::asset::AGENT_LATEST_RELEASE);
+    install_trace::count_fetch(
+        &state,
+        &headers,
+        peer,
+        install_trace::asset::AGENT_LATEST_RELEASE,
+    );
     let releases = releases::cached(&state).await?;
     Ok(Json(filter_component_releases(releases, "agent-v")))
 }
@@ -250,6 +256,7 @@ pub async fn installer_proxy(
     State(state): State<FleetState>,
     Path(flavour): Path<String>,
     Query(params): Query<InstallerQuery>,
+    PeerAddr(peer): PeerAddr,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let normalised = normalise_flavour(&flavour)?;
@@ -257,6 +264,7 @@ pub async fn installer_proxy(
     install_trace::count_fetch(
         &state,
         &headers,
+        peer,
         &install_trace::asset::installer(normalised),
     );
     let releases = releases::cached(&state).await?;
