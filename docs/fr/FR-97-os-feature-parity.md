@@ -209,7 +209,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 2. Linux and macOS advertise clipboard image events they never send (R8); a root Linux daemon advertises a clipboard
    it cannot reach (R10).
 3. The Ctrl+Alt+Del button shows for every host. It sends three ordinary key events
-   (`ui/src/composables/useRemoteControl.ts:11426-11438`) ✔, and nothing in the agent calls `SendSAS` (grep: none) ✔.
+   (`ui/src/composables/useRemoteControl.ts:11440-11452`) ✔, and nothing in the agent calls `SendSAS` (grep: none) ✔.
    Windows does not treat a synthesised Ctrl+Alt+Del as the secure attention sequence, so the button does nothing at
    a lock screen that requires it; on Linux and macOS the chord means something else, or nothing.
 4. The enroll dialog offers the setup wizard for agents on Linux and macOS, where it installs only the tunnel client
@@ -234,7 +234,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `docs/roomler-ssh.md:311-325` | Windows `daemon` → SYSTEM | the console worker (#2021, FR-94) |
 | `docs/installation.md:21-22`, `ui/docs/content/start/install/macos.md:51-53` | install the macOS daemon with the wizard | the wizard's daemon roles are Windows-only |
 | `docs/installation.md:43-44`, `ui/docs/content/troubleshooting/install-problems.md:37-40` | downloads come from roomler.ai | true for the MSI proxy, the CLI and the wizard; `install.sh`'s `.deb`/tarball/`.pkg` and every self-update fetch from GitHub (`updater.rs:1276,1360`) |
-| `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:3113` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon. ✅ Both say so since P0c-2 |
+| `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:3173` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon. ✅ Both say so since P0c-2 |
 | `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:181-224`); DRM captures from root (opt-in) |
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`) |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93 |
@@ -242,7 +242,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 
 ### 2.9 Equal on all three: not parity, recorded so nobody files them here
 
-Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:9687`), a curtain or
+Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:9692`), a curtain or
 privacy mode, touch injection, a live microphone (two-way audio), OS toast notifications
 (`crates/agent-core/src/notify.rs:21-24`), file copy-paste through the clipboard, minidumps, and SSH agent and X11
 forwarding. Several deserve FRs of their own; none is a platform gap.

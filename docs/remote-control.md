@@ -482,7 +482,7 @@ and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5382`](../agents/roomlerd/src/peer.rs#L5382); the viewer parses it
 at [`useRemoteControl.ts:1354`](../ui/src/composables/useRemoteControl.ts#L1354)
 and puts it on the toggle's title
-([`RemoteControl.vue:3065`](../ui/src/views/remote/RemoteControl.vue#L3065)).
+([`RemoteControl.vue:3125`](../ui/src/views/remote/RemoteControl.vue#L3125)).
 
 | `code` | Means |
 |---|---|
@@ -1616,7 +1616,7 @@ that dominate a relayed connect (a DERP-relayed LAN pair measured on 2026-08-29:
 ⚠️ **Marks are per ATTEMPT, never per connect.** A recorder shared across the
 ladder would let the fast retry overwrite the lost attempt's marks and report an
 18 s connect as a 3 s one — hiding the exact defect being hunted. Each retry
-calls `beginAttempt()` (`useRemoteControl.ts:8334`) and gets a fresh recorder.
+calls `beginAttempt()` (`useRemoteControl.ts:8339`) and gets a fresh recorder.
 
 ⚠️ **An unreached mark is the finding.** The console line prints it as
 `<name>:—` and the record omits the key; the first missing mark

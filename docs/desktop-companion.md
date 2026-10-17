@@ -538,7 +538,7 @@ registered the moment it connects, and the banner used to come up then. It said 
 while nothing was shared yet. On a desktop that centres new windows, it also sat right over the
 dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat beside the
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
-dialog is the wait (`agents/roomlerd/src/peer.rs:5464`, `AskingMark`
+dialog is the wait (`agents/roomlerd/src/peer.rs:5519`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:42`). The LocalAPI row carries the mark (`asking`,
 `crates/localapi/src/lib.rs:1132`), and the banner comes up only for a session that sees the
 screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:322`). The mark goes
