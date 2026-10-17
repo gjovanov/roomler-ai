@@ -350,6 +350,74 @@ stream to a latch. It is released only once `Stopped` has arrived, from a
 thread of its own, behind a barrier on the queue. A `Stopped` that never comes
 leaks one stream instead.
 
+### 5.1b What the hello promises, and the honest no (FR-97 P0c)
+
+A word in the hello's `AgentCaps` is a promise: the viewer offers a control
+because the device said it can serve it. Before FR-97 P0c several words were
+compile-time constants, true of the build and false of the host: `opus` on
+every Mac, which streams silence; clipboard image events on every Linux and
+macOS agent, whose watchers never send them; `supports_clipboard` on a root
+Linux daemon with no clipboard to reach. Nothing at all governed
+Ctrl+Alt+Del. Since P0c the daemon takes out what the host cannot keep and
+says why, in `AgentCaps.unavailable`
+([`models.rs:529`](../crates/remote_control/src/models.rs#L529)).
+
+```mermaid
+flowchart LR
+    P["probe child<br/>compute_caps"] --> L["with_config_lists<br/>rpc · apps · files"]
+    L --> H["with_honest_words<br/>over HostFacts"]
+    H --> Hello["rc:agent.hello<br/>AgentCaps"]
+    Hello --> S[("agents.capabilities<br/>stored whole")]
+    S --> V{"viewer"}
+    V -->|lists| W["whether a control works<br/>(unchanged)"]
+    V -->|unavailable| R["why it does not:<br/>the reason on the control"]
+    V -->|not-applicable| X["the control is hidden"]
+```
+
+The decision is one daemon-side seam, `with_honest_words`
+([`caps.rs:694`](../agents/roomlerd/src/encode/caps.rs#L694)), applied in
+`detect()` ([`caps.rs:624`](../agents/roomlerd/src/encode/caps.rs#L624))
+after the config lists, over plain `HostFacts`
+([`caps.rs:636`](../agents/roomlerd/src/encode/caps.rs#L636)), so it runs and
+is tested on every OS.
+
+| Feature | When | What the hello says | What the viewer does |
+|---|---|---|---|
+| `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3060`](../agents/roomlerd/src/signaling.rs#L3060)); `no-backend` | the receive-audio toggle is off, with the device's reason |
+| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:675`](../agents/roomlerd/src/encode/caps.rs#L675)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
+| `clipboard-image-events` | everywhere but Windows, whose watcher alone reports copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
+| `sas` | Windows, Linux | `keys-only`: the button types three ordinary keys. Windows' lock and sign-in screens ignore them (until P4a's `SendSAS`); Linux desktops bind them, GNOME and KDE to log out | the button stays, and says what the keys reach |
+| `sas` | macOS | `not-applicable`: the chord means nothing there | the button is hidden |
+
+⚠️ **The lists still decide what works.** An empty `audio` list disabled the
+toggle before P0c, and still does; `unavailable` adds the why. A viewer
+that does not know the map works exactly as before.
+
+⚠️ **An absent key never means "unavailable".** Agents before P0c send no map
+at all; their lists say what they claim. The map is off the wire when empty,
+and the server stores caps whole
+([`agent.rs:445`](../crates/services/src/dao/agent.rs#L445)), so an older
+server drops it and a newer one keeps it with no migration.
+
+⚠️ **`not-applicable` is the only code that hides a control, and it is how
+the viewer adapts to the OS without reading `agent.os`.** Every other code
+leaves the control to the lists and adds the reason to it.
+
+⚠️ **The reason is the agent's sentence, composed on the host**, as the FR-80
+`hint` is (§5.1a): only the host knows what it is. The viewer shows it as
+text, capped at a tooltip's length, never as markup.
+
+⚠️ **The hello is a boot-time snapshot.** `detect()` is memoized for the life
+of the process, so a root daemon started outside every session keeps its
+`no-session` until it restarts, the same property Remote Apps' `status`
+documents ([`remote-apps.md`](remote-apps.md)).
+
+The keys are matched by equality (`Unavailable::KEYS`,
+[`models.rs:548`](../crates/remote_control/src/models.rs#L548)) and the wire
+shape is locked by `unavailable_wire_shape_is_locked`. FR-97's census
+(`scripts/fr97-caps-census.sh`) counts the map by OS as `key:code`, beside
+the words.
+
 ### 5.2 Encoder selection
 
 Picked at agent startup, redetected on GPU change:
