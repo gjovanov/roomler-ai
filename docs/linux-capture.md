@@ -819,24 +819,26 @@ flowchart LR
 | **P2b** | The frame period runs from when a frame was *asked for*, not from when it arrived. Timed from the arrival, every period also paid for the grab, so a 30 fps target ran at 1000 / (33.3 + grab): 15–16 fps with the CPU's ~34 ms read, 26–27 with the GPU's ~3 ms. Both predictions matched the measurements to within 1 fps | `next_frame`, `drm_backend.rs:1459` | — (a timing fix) |
 | **P3** | The GPU reads the scanout. EGL imports its dma-buf through Mesa's surfaceless platform, on the render node, with no display server. One GLES pass renders it at **exactly** the pump's encode box (a box filter of up to 4×4 bilinear taps a pixel), and converts any of the eight RGB scanout formats to BGRA. The CPU reads back that small frame, and the pump's resample has nothing left to do. Imports are cached per buffer, keyed as the mapping is (FR-93 P3f). `libEGL.so.1` and `libGLESv2.so.2` are loaded at runtime, so no package gains a dependency. A host without them, with a software renderer (`llvmpipe`), or whose GPU pass fails keeps the CPU path, said once in the log. The idle skip (§3.2) and the cursor plane (§3.1) are unchanged | `Egl`, `agents/roomlerd/src/capture/drm_gpu.rs:316`; `Egl::retire`, `drm_gpu.rs:445`; `Converter::open`, `drm_gpu.rs:464`; `convert`, `drm_gpu.rs:754`; `via_gpu`, `drm_backend.rs:151` | `ROOMLERD_DRM_GPU=0` |
 
-Measured on that box (GNOME, 4096×2160 `XR30`), one viewer, a continuously
-moving window (`vkcube`), the release and the candidate back to back on the
-same desktop:
+Shipped in **0.4.140**. Measured on that box (GNOME, 4096×2160 `XR30`), one
+viewer, a continuously moving window (`vkcube`), 0.4.139 and the released
+0.4.140 on the same desktop:
 
-| | 0.4.139 | FR-107 (P1–P3) |
+| | 0.4.139 | 0.4.140 |
 |---|---|---|
-| VP9 4:4:4 over the DataChannel | 6.3 fps, resample 49.5 ms | **27.9 fps**, resample 0.0 ms |
+| VP9 4:4:4 over the DataChannel | 6.3 fps, resample 49.5 ms | **27.3 fps**, resample 0.0 ms |
 | H.264 on the RTP track | 15.1 fps, capture 47.8 ms | **28.8 fps** |
 
-The grab alone, `capture-smoke` on the same candidate, 240 frames, the idle
-skip off:
+The grab alone, `capture-smoke`, 240 frames, the idle skip off:
 
-| Scanout 4096×2160 → | GPU (P3) | CPU (`ROOMLERD_DRM_GPU=0`: P1 + P2) |
-|---|---|---|
-| 2048×1080, still | **1.80 ms** | 15.25 ms |
-| 2048×1080, moving | **2.05 ms** | 15.33 ms |
-| 4096×2160, still | 7.17 ms | 23.35 ms |
-| 4096×2160, moving | 6.55 ms | 23.45 ms |
+| Scanout 4096×2160 → | 0.4.140, GPU (P3) | 0.4.140, CPU (`ROOMLERD_DRM_GPU=0`: P1 + P2) | 0.4.139 |
+|---|---|---|---|
+| 2048×1080, still | **1.92 ms** | 13.10 ms | 23.0 ms |
+| 2048×1080, moving | **1.91 ms** | 13.79 ms | 24.1 ms |
+| 4096×2160, still | 6.58 ms | 23.38 ms | 42.3 ms |
+| 4096×2160, moving | 6.47 ms | 23.53 ms | 51.0 ms |
+
+A frame from the GPU and one from the CPU path, of the same still scanout at
+2048×1080, differ by a mean of 0.10 levels of 255: the same picture.
 
 The first GPU frame costs 32–46 ms more, once per capture: the EGL context and
 the shader compile.
