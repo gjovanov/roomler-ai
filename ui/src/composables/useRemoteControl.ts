@@ -97,6 +97,7 @@ import {
 } from './relativeMouse'
 import {
   createPointerPressTracker,
+  phoneSized,
   readTouchMode,
   releaseForCancelledPointer,
   stageTouchAction,
@@ -5932,13 +5933,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   // FR-111 P2 — how a finger drives the host: `direct` (the finger is the
   // pointer) or `trackpad` (it moves the pointer, which stays between
   // touches). Remembered per browser; `direct` until decision 1 says otherwise.
+  // FR-111 decision 1 — with nothing remembered, a phone-sized screen starts in
+  // trackpad mode.
   const touchMode = ref<TouchMode>(readTouchMode((() => {
     try {
       return globalThis.localStorage
     } catch {
       return null
     }
-  })()))
+  })(), phoneSized(globalThis.screen)))
   function setTouchMode(m: TouchMode) {
     touchMode.value = m
     try {
@@ -10008,6 +10011,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
        *  picture by `factor` around the client point (`cx`, `cy`). Nothing is
        *  sent to the host. */
       onPinchZoom?: (factor: number, cx: number, cy: number) => void
+      /** FR-111 decision 4 — two fingers moving together in direct mode, by
+       *  (`dx`, `dy`) px (positive scrolls down/right). The view returns true
+       *  when it consumed them, panning a picture larger than the stage; only
+       *  otherwise do they scroll the host. */
+      onTwoFingerScroll?: (dx: number, dy: number) => boolean
     }
   ): () => void {
     // Locate the <video> once, fall back gracefully if the layout changes.
@@ -10477,6 +10485,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
             heldInputs.button(a.btn, false)
             break
           case 'wheel': {
+            // FR-111 decision 4 — a picture zoomed past the stage is panned by
+            // the two fingers; the host scrolls only when it fits.
+            if (options?.onTwoFingerScroll?.(a.dx, a.dy)) break
             const step = touchWheel.add(a.dx, a.dy)
             if (step) sendInput({ t: 'mouse_wheel', dx: step.dx, dy: step.dy, mode: 'pixel' })
             break

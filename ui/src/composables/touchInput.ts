@@ -72,13 +72,40 @@ export type TouchMode = 'direct' | 'trackpad'
 /** Where this browser remembers the touch mode. */
 export const TOUCH_MODE_STORAGE_KEY = 'roomler-rc-touch-mode'
 
-/** The remembered touch mode: `trackpad` only for that exact word, `direct`
- *  otherwise (the default until the operator decides FR-111's open decision 1),
- *  and `direct` when storage throws. */
-export function readTouchMode(storage: Pick<Storage, 'getItem'> | null | undefined): TouchMode {
+/** A screen whose shorter side is under this many CSS px is a phone's. */
+export const PHONE_SHORT_SIDE_PX = 600
+
+/** FR-111 decision 1 — is this a phone-sized screen? Read from the screen, not
+ *  the window, so a small desktop window is not a phone. */
+export function phoneSized(screen: { width: number; height: number } | null | undefined): boolean {
+  if (!screen) return false
+  const short = Math.min(screen.width, screen.height)
+  return Number.isFinite(short) && short > 0 && short < PHONE_SHORT_SIDE_PX
+}
+
+/** The touch mode: the remembered word when it is exactly `trackpad` or
+ *  `direct` (the toolbar's choice). With nothing remembered, FR-111 decision 1
+ *  (operator, 2026-10-17): `trackpad` on a phone-sized screen, `direct` on a
+ *  larger one. Storage that throws counts as nothing remembered. */
+export function readTouchMode(storage: Pick<Storage, 'getItem'> | null | undefined, phone = false): TouchMode {
+  let remembered: string | null = null
   try {
-    return storage?.getItem(TOUCH_MODE_STORAGE_KEY) === 'trackpad' ? 'trackpad' : 'direct'
+    remembered = storage?.getItem(TOUCH_MODE_STORAGE_KEY) ?? null
   } catch {
-    return 'direct'
+    remembered = null
   }
+  if (remembered === 'trackpad' || remembered === 'direct') return remembered
+  return phone ? 'trackpad' : 'direct'
+}
+
+/** FR-111 decision 4 — does the picture overflow the stage? Then two fingers
+ *  moving together pan it, and the host scrolls only once it fits. A pixel of
+ *  slack absorbs rounding in the layout. */
+export function pictureOverflows(stage: {
+  scrollWidth: number
+  clientWidth: number
+  scrollHeight: number
+  clientHeight: number
+}): boolean {
+  return stage.scrollWidth > stage.clientWidth + 1 || stage.scrollHeight > stage.clientHeight + 1
 }
