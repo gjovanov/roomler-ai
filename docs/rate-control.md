@@ -430,6 +430,23 @@ Orthogonal to the dials (the P7→P8 "sharp all the time" arc):
   motion burst (≥10 frames), burst-gated so caret blinks never metronome
   IDRs.
 
+## Software encoders at 60 fps (FR-112)
+
+The two software pumps, VP9-444 on the DataChannel and OpenH264 on the RTP track, target **60** on Linux.
+A software pace brings them down to what their encoder sustains, never below the 30 they had before. Full
+treatment, with the clock that made 60 reachable: [`encoders.md` § Software encoders](encoders.md#software-encoders-the-clock-and-60-fps-fr-112).
+What it changes here:
+
+| Lever | Before FR-112 | Now |
+|---|---|---|
+| frame rate | a constant 30 | 60, paced by `SoftwarePace` (`encode/encode_pressure.rs:217`) in 5-fps steps, never below 30 |
+| bitrate base | `w·h·fps·0.20` at the target | `bitrate_base_for_fps` (`encode/mod.rs:709`): the old figure at 30, ×√(fps/30) at the rate the pump runs at |
+| OpenH264's per-frame budget | configured for 30 whatever the rate | `set_frame_rate`: the rate the pump runs at, the keyframe period kept at 2 s |
+| the auto-fps-cap (a software encoder dropped to 30) | always | only where the tier is off: Windows and macOS by default |
+
+⚠️ The pace steps per heartbeat window on the encode cost alone. A host whose capture is the costly stage is not
+paced by it, and is limited by its own loop as before.
+
 ## Config / env reference
 
 All keys live in the agent config (`roomler config set …`) with
@@ -450,6 +467,8 @@ All keys live in the agent config (`roomler config set …`) with
 | `direct_hrd_pct` | 100 | HRD window for direct sessions, % of maxrate ([25, 200]); also the gate's hard budget. ⚠ `av1_*` encoders stay at 200 regardless (the rc.443 hang) |
 | `ROOMLERD_FFMPEG_MAXRATE_KBPS` | unset | Env only — replaces the computed ceiling in both directions (the FR-74 P0 A/B knob and the way back from P1) |
 | `ROOMLERD_VP9_DIRECT_MAX_Q` | 16 | FR-74 P3 — the libvpx VP9 4:4:4 pump's worst quality on direct transports (q-index 64); 63 = the pre-P3 behaviour |
+| `ROOMLERD_SW_FPS_60` | on (Linux), off (Windows, macOS) | FR-112 P2 — software encoders target 60, paced down to what they sustain, never below 30; `0` = 30 and the old base everywhere, `1` opts Windows or macOS in ([§ Software encoders](#software-encoders-at-60-fps-fr-112)) |
+| `ROOMLERD_ENCODER_CLOCK` | on | FR-112 P1 — the encoding and capture threads ask for their clock (a Linux `uclamp_min`); `0` = the scheduler's default ([`encoders.md`](encoders.md#software-encoders-the-clock-and-60-fps-fr-112)) |
 
 ⚠️ Three keys an older `config.toml` may still carry are **deleted, not off**
 — the daemon ignores them: `transit_classify` and `transit_hold` (FR-71
