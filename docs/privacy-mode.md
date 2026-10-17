@@ -17,8 +17,8 @@
 > | P2 | blocking the person's keyboard and mouse (`BlockInput`, Ctrl+Alt+Del to take the computer back) | not built |
 > | P3a | lock the computer when the last session ends: the device's own `lock_on_end` (Windows, Linux) | shipped (0.4.139); field-verified on Windows |
 > | P3b | an admin asking a device's sessions for a stricter lock | shipped (0.4.139, server deployed); field-verified on Windows |
-> | P3c | a new Windows service install starts at `lock_on_end = auto` | merged; ships with the next agent release |
-> | P4a | mute the host's speakers while the curtain is up (Windows), the controller keeping the audio | merged; ships with agent 0.4.140 |
+> | P3c | a new Windows service install starts at `lock_on_end = auto` | shipped (0.4.140); field-verified: a new service install reads `auto`, a new per-user install `never` |
+> | P4a | mute the host's speakers while the curtain is up (Windows), the controller keeping the audio | shipped (0.4.140); field-verified on Windows (all four AC10 phases) |
 
 While a privacy-mode session runs, **the person at the computer sees a notice instead of the
 desktop**: "This computer is being used remotely, by …". The controller keeps seeing the real

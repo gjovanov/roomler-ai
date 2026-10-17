@@ -6,8 +6,8 @@
 > | Phase | What | State |
 > |---|---|---|
 > | rc.191 | the viewer asks; the agent switches the primary display to the largest mode inside the viewer's stage, and restores it when the session ends | shipped |
-> | P1 | the device decides: its owner's `display_match`, and under `auto` whether someone is using the screen; every request answered | merged; ships with the next agent release |
-> | P1b | a locked host switches once unlocked with nobody at it; a person coming back gets their mode back | merged; ships with the next agent release |
+> | P1 | the device decides: its owner's `display_match`, and under `auto` whether someone is using the screen; every request answered | shipped (0.4.140); field-verified on Windows |
+> | P1b | a locked host switches once unlocked with nobody at it; a person coming back gets their mode back | shipped (0.4.140); field-verified on Windows |
 > | P2–P4 | Linux virtual desktops, modes no monitor offers, several displays | not built |
 
 ## Why it exists, and what went wrong with it
