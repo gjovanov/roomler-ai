@@ -60,6 +60,7 @@ pub mod cohorts;
 pub mod digest;
 pub mod exclusions;
 pub mod funnel;
+pub mod github;
 pub mod keys;
 pub mod newsletter;
 pub mod org_daily;

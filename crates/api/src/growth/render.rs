@@ -1030,6 +1030,8 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
         Measured::NotMeasured(n) => out.push(Line("Social reach".into(), not_measured(n))),
     }
 
+    github_blocks(&mut out, &s.github);
+
     out.push(Heading("Not yet measured".into()));
     out.push(Line("Search".into(), not_measured(&s.search)));
 
@@ -1042,6 +1044,104 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
         doc.excluded.users, doc.excluded.tenants, doc.day, doc.attempts
     )));
     out
+}
+
+/// P7 — a change as text: signed, or `—` when a snapshot it needs is
+/// missing (never a 0 for "not measured").
+fn delta_str(d: Option<i64>) -> String {
+    match d {
+        Some(n) if n > 0 => format!("+{n}"),
+        Some(n) => n.to_string(),
+        None => "—".into(),
+    }
+}
+
+fn deltas(d: &super::github::Delta) -> String {
+    format!(
+        "day {} · 7d {} · 28d {}",
+        delta_str(d.day),
+        delta_str(d.d7),
+        delta_str(d.d28)
+    )
+}
+
+/// P7 — the repository: counters at their snapshot with the changes, the
+/// week's downloads by release and flavour, and the traffic with its
+/// measured days. Shared by the daily digest and the weekly roll-up.
+pub(crate) fn github_blocks(out: &mut Vec<Block>, g: &super::github::GithubSection) {
+    use Block::*;
+    out.push(Heading("GitHub".into()));
+    match &g.counters {
+        Measured::Value(c) => {
+            out.push(Line(
+                "Snapshot".into(),
+                format!("{} at the close of {} (UTC)", c.repo, c.at),
+            ));
+            for (label, now, d) in [
+                ("Stars", c.stars, &c.stars_delta),
+                ("Forks", c.forks, &c.forks_delta),
+                ("Watchers", c.watchers, &c.watchers_delta),
+                (
+                    "Release downloads (all time)",
+                    c.downloads,
+                    &c.downloads_delta,
+                ),
+            ] {
+                out.push(Line(label.into(), format!("{now} ({})", deltas(d))));
+            }
+            for (title, list) in [
+                ("Downloads in 7 days, by release", &c.top_releases_7d),
+                ("Downloads in 7 days, by flavour", &c.top_flavours_7d),
+            ] {
+                match list {
+                    Measured::Value(rows) if !rows.is_empty() => out.push(Table(
+                        vec![title.into(), "Downloads".into()],
+                        rows.iter()
+                            .map(|k| vec![k.key.clone(), k.count.to_string()])
+                            .collect(),
+                    )),
+                    Measured::Value(_) => out.push(Line(title.into(), "none".into())),
+                    Measured::NotMeasured(n) => out.push(Line(title.into(), not_measured(n))),
+                }
+            }
+        }
+        Measured::NotMeasured(n) => out.push(Line("Counters".into(), not_measured(n))),
+    }
+    match &g.traffic {
+        Measured::Value(t) => {
+            out.push(Line("Views".into(), fig(&t.views)));
+            out.push(Line("Clones".into(), fig(&t.clones)));
+            out.push(Line("Days measured".into(), fig(&t.measured_days)));
+            if let Some(as_of) = &t.referrers_as_of
+                && !t.referrers.is_empty()
+            {
+                out.push(Table(
+                    vec![
+                        format!("Referrers (GitHub's 14 days, read after {as_of})"),
+                        "Views".into(),
+                        "Uniques".into(),
+                    ],
+                    t.referrers
+                        .iter()
+                        .map(|r| {
+                            vec![
+                                r.referrer.clone(),
+                                r.views.to_string(),
+                                r.uniques.to_string(),
+                            ]
+                        })
+                        .collect(),
+                ));
+            }
+        }
+        Measured::NotMeasured(n) => out.push(Line("Traffic".into(), not_measured(n))),
+    }
+    out.push(Note(
+        "A change is the difference of two daily snapshots; — means a snapshot it needs is \
+         missing. GitHub counts every download of a release asset, the fleet's self-updates and \
+         their signatures included: downloads are distribution, not installs."
+            .into(),
+    ));
 }
 
 /// P10 — one alert row as a table line: rule, key, fired, cleared, and
@@ -1528,6 +1628,10 @@ pub fn weekly_blocks(doc: &DigestDoc, s: &WeeklySections) -> Vec<Block> {
     }
 
     quality_blocks(&mut out, &s.quality);
+
+    // P7 — the repository at Sunday's snapshot: its 7-day changes are the
+    // week's.
+    github_blocks(&mut out, &s.github);
 
     alert_blocks(&mut out, &s.alerts, "the week");
 
@@ -2054,6 +2158,38 @@ mod tests {
                     .collect(),
                 }],
             }),
+            github: crate::growth::github::GithubSection {
+                counters: Measured::Value(crate::growth::github::GithubCounters {
+                    repo: "gjovanov/roomler-ai".into(),
+                    at: "2026-10-12".into(),
+                    stars: 130,
+                    forks: 11,
+                    watchers: 4,
+                    downloads: 9_000,
+                    stars_delta: crate::growth::github::Delta {
+                        day: Some(2),
+                        d7: Some(9),
+                        d28: None,
+                    },
+                    forks_delta: crate::growth::github::Delta::default(),
+                    watchers_delta: crate::growth::github::Delta::default(),
+                    downloads_delta: crate::growth::github::Delta {
+                        day: Some(40),
+                        d7: Some(300),
+                        d28: None,
+                    },
+                    top_releases_7d: Measured::Value(vec![KeyCount {
+                        key: "agent-v0.4.140".into(),
+                        count: 250,
+                    }]),
+                    top_flavours_7d: Measured::NotMeasured(NotMeasured::now(
+                        "no snapshot for 2026-10-05 to difference against",
+                    )),
+                }),
+                traffic: Measured::NotMeasured(NotMeasured::now(
+                    "no GitHub token configured (ROOMLER__GROWTH__GITHUB_TOKEN)",
+                )),
+            },
             search: NotMeasured::later("search", "P7"),
             alerts: Measured::Value(AlertsSection {
                 fired: vec![AlertRow {
@@ -2198,6 +2334,22 @@ mod tests {
         // P8 — social reach: posts per platform, and the day's snapshots in
         // the platform's own metric names.
         assert!(text.contains("== Social reach =="));
+        // P7 — the repository: the counters at their snapshot with signed
+        // changes, a missing end as "—" (never 0), the week by release, a
+        // list that cannot be differenced yet and traffic without a token
+        // as not measured, and the note that downloads are not installs.
+        assert!(text.contains("== GitHub =="), "{text}");
+        assert!(text.contains("gjovanov/roomler-ai at the close of 2026-10-12 (UTC)"));
+        assert!(
+            text.contains("Stars: 130 (day +2 · 7d +9 · 28d —)"),
+            "{text}"
+        );
+        assert!(text.contains("Forks: 11 (day — · 7d — · 28d —)"));
+        assert!(text.contains("Release downloads (all time): 9000 (day +40 · 7d +300 · 28d —)"));
+        assert!(text.contains("agent-v0.4.140 | 250"));
+        assert!(text.contains("no snapshot for 2026-10-05 to difference against"));
+        assert!(text.contains("Traffic: not measured"), "{text}");
+        assert!(text.contains("downloads are distribution, not installs"));
         assert!(text.contains("linkedin | 1 (7d 2 · 28d 5)"), "{text}");
         assert!(
             text.contains("T+7d | clicks 80 · impressions 3000"),
@@ -2414,8 +2566,12 @@ mod tests {
                 by_agent_version: vec![],
                 series: vec![],
             },
+            github: crate::growth::github::GithubSection::before_p7(),
         };
         let text = render_weekly_text(&doc, &s);
+        // P7 — the section renders even when nothing is measured yet.
+        assert!(text.contains("== GitHub =="), "{text}");
+        assert!(text.contains("Counters: not measured — arrives with P7"));
         assert!(
             text.contains("Roomler weekly roll-up — 2026-W41 (2026-10-05 → 2026-10-11)"),
             "{text}"

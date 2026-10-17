@@ -230,6 +230,9 @@ pub struct WeeklySections {
     /// by outcome, time to first frame, crashes per 100 device-days, by
     /// agent version. The Quality view's own report for Mon–Sun.
     pub quality: QualityReport,
+    /// P7 — the repository at Sunday's snapshot (the digest's section for
+    /// that day): its 7-day changes and traffic are the week's.
+    pub github: super::github::GithubSection,
 }
 
 // ── Computing ────────────────────────────────────────────────────────────
@@ -439,6 +442,7 @@ pub async fn compute(
         ))
     };
     let quality = quality::compute(state, set, monday, sunday, include_internal, now).await?;
+    let github = super::github::section(state, sunday).await?;
     Ok(WeeklySections {
         headline,
         funnel,
@@ -448,6 +452,7 @@ pub async fn compute(
         newsletter,
         alerts,
         quality,
+        github,
     })
 }
 

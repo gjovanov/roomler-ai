@@ -13,7 +13,9 @@
 //! [`sendgrid`] — SendGrid's signed Event Webhook onto the send ledger, the
 //! per-issue link tags and unsubscribes), and billed revenue (P4 — the six
 //! Stripe billing kinds into `billing_events`, and the operator's one-off
-//! backfill of Stripe's paid invoices). Everything here
+//! backfill of Stripe's paid invoices), and P7's GitHub puller
+//! ([`github_pull`] — the repository's public counters as daily cumulative
+//! snapshots, its traffic with a token). Everything here
 //! exists because roomler.ai is a hosted product; a self-hosted deployment
 //! runs without it, which is why it is an **add-on feature** on the host
 //! rather than part of any profile.
@@ -51,10 +53,12 @@ use roomler_ai_services::dao::{
 };
 use roomler_core::{Capabilities, Core, Module, TenantCtx};
 
+pub mod github_pull;
 pub mod growth_ingest;
 pub mod newsletter;
 pub mod newsletter_send;
 pub mod plan_compliance;
+pub mod pull_schedule;
 pub mod purestat_pull;
 pub mod sendgrid;
 pub mod stripe;
@@ -106,6 +110,11 @@ impl Module for SaasState {
         // pod per tick through a Redis claim, like the fleet and network
         // modules' sweepers spawned from their own init.
         purestat_pull::spawn_puller(core.clone());
+        // FR-102 P7 — the daily GitHub puller: the repository's public
+        // counters as cumulative snapshots (no credential), and its traffic
+        // with the optional token. Nothing without `growth.enabled` and a
+        // repository; one pod per tick through its own Redis claim.
+        github_pull::spawn_puller(core.clone());
         // FR-102 P5 (D6) — SendGrid's account-level open/click tracking,
         // read once and warned about loudly if on. Spawned, bounded, never
         // blocks the boot; nothing without a SendGrid key.

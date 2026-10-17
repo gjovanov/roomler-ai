@@ -1,0 +1,998 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
+//! FR-102 P7 — the GitHub puller (spec §3k): the repository's public
+//! counters, and with a token its traffic, frozen daily into `growth_daily`
+//! with one `growth_pulls` row per `(source, day)`.
+//!
+//! It is `saas`'s because it talks to the outside world for the hosted
+//! business, and no self-host profile compiles `saas` (spec principle 6).
+//! Without a repository it pulls nothing and says so once.
+//!
+//! # The public counters — `source: github`, no token
+//!
+//! Stars, forks and watchers come from `GET /repos/{repo}`; every release
+//! asset's `download_count` from `GET /repos/{repo}/releases`, paged 100 at
+//! a time. They are **cumulative**, so the puller stores a SNAPSHOT per
+//! closed UTC day and the reader differences consecutive snapshots:
+//!
+//! | `dims.by` | other dims | metrics |
+//! |---|---|---|
+//! | `repo` | `repo` | `stars` `forks` `watchers` `downloads` (every asset of every published release) |
+//! | `release` | `repo`, `release` (the tag) | `downloads` |
+//! | `flavour` | `repo`, `flavour` (the asset name without its version: `roomlerd-x86_64-pc-windows-msvc.msi`) | `downloads` |
+//!
+//! * **A snapshot is the close of a day.** Day D's snapshot is the counters
+//!   as read in the cycle that follows it, between [`CYCLE_HOUR_UTC`] and
+//!   [`SNAPSHOT_GRACE_HOURS`] later — so two consecutive snapshots are 24 h
+//!   apart give or take the grace. A cumulative counter cannot be read for
+//!   the past: a day not read inside its window has no snapshot, and every
+//!   delta across it is null (the reader's rule — never split, never 0).
+//! * **The first good read of the window stands**: a day pulled `ok` is not
+//!   re-read later in the window, which would move its snapshot's time.
+//! * Drafts are left out (their assets are not public). A zero is not
+//!   stored: on an `ok` day a missing release or flavour row is a zero.
+//! * ⚠️ GitHub counts every download of a release asset, **the fleet's
+//!   self-updates included** — the updater fetches the MSI/.deb/.pkg and
+//!   its `.asc` from GitHub directly, hosted and self-hosted devices alike,
+//!   and the installer proxy fetches from GitHub on each request. A download
+//!   is distribution, not an install, and the `.asc` flavours are mostly
+//!   updaters. Nothing here tells one deployment from another: it is
+//!   GitHub's own public aggregate.
+//!
+//! # Traffic — `source: github_traffic`, with the token
+//!
+//! GitHub keeps 14 days of it, so it is pulled daily: views and clones per
+//! day (`by: traffic`, `views` `views_uniques` `clones` `clones_uniques`),
+//! re-pulled once per cycle for the last [`TRAFFIC_HORIZON_DAYS`] closed
+//! days and frozen after; and the referrers (`by: referrer`,
+//! `referrer_views` `referrer_uniques`), which GitHub answers only as a
+//! 14-day ranking — stored under the closed day it was read after, and
+//! labelled as such by every reader. Without a token none of it is read
+//! and the readers say "not measured".
+//!
+//! # Rate
+//!
+//! A cycle is two requests plus one per hundred releases, and three more
+//! with a token — far inside the 60 an hour GitHub allows an unauthenticated
+//! address, which the releases cache (`fleet::releases`) also draws on.
+
+use std::collections::BTreeMap;
+
+use bson::DateTime;
+use chrono::Duration;
+use roomler_ai_config::GrowthSettings;
+use roomler_ai_services::dao::{
+    base::DaoResult,
+    growth::{
+        GITHUB_SOURCE, GITHUB_TRAFFIC_SOURCE, GrowthDaily, GrowthDao, GrowthPull, PullStatus,
+        PulledDay, daily_row,
+    },
+};
+use roomler_core::Core;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tracing::{info, warn};
+
+use crate::pull_schedule::{self, date_of, day_str};
+
+/// The `source` of the counters' rows.
+pub const SOURCE: &str = GITHUB_SOURCE;
+/// The `source` of the traffic rows.
+pub const TRAFFIC_SOURCE: &str = GITHUB_TRAFFIC_SOURCE;
+/// The UTC hour a cycle starts — GitHub's day is UTC.
+pub const CYCLE_HOUR_UTC: u32 = 1;
+/// A day's snapshot may be read from the cycle's start until this many
+/// hours after it; later, the day has no snapshot.
+pub const SNAPSHOT_GRACE_HOURS: i64 = 6;
+/// Traffic days re-pulled each cycle — GitHub keeps 14, today among them.
+pub const TRAFFIC_HORIZON_DAYS: i64 = 13;
+/// The scheduler's cadence — also how soon a failed read is retried.
+pub const LOOP_INTERVAL_SECS: u64 = 60 * 60;
+/// A pod that just booted waits this long before its first tick.
+pub const FIRST_TICK_DELAY_SECS: u64 = 5 * 60;
+/// Releases per page (GitHub's maximum).
+pub const PER_PAGE: usize = 100;
+/// Pages followed before the answer is called truncated.
+pub const MAX_RELEASE_PAGES: u32 = 10;
+/// Per-request ceiling.
+pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// The counters' metrics — the set a snapshot replaces.
+pub const COUNTER_METRICS: [&str; 4] = ["stars", "forks", "watchers", "downloads"];
+/// The traffic series' metrics.
+pub const TRAFFIC_METRICS: [&str; 4] = ["views", "views_uniques", "clones", "clones_uniques"];
+/// The referrer ranking's metrics, stored under the day it was read after.
+pub const REFERRER_METRICS: [&str; 2] = ["referrer_views", "referrer_uniques"];
+/// A stored flavour, release or referrer is cut to this many characters.
+pub const MAX_DIM_LEN: usize = 120;
+
+// ── The wire ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct RepoInfo {
+    #[serde(default)]
+    pub stargazers_count: i64,
+    #[serde(default)]
+    pub forks_count: i64,
+    /// GitHub's "watchers" (`watchers_count` is the stars, kept for history).
+    #[serde(default)]
+    pub subscribers_count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ReleaseAsset {
+    pub name: String,
+    #[serde(default)]
+    pub download_count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Release {
+    pub tag_name: String,
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
+    pub assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct TrafficDay {
+    /// `2026-10-14T00:00:00Z` — the UTC day the bucket counts.
+    pub timestamp: String,
+    #[serde(default)]
+    pub count: i64,
+    #[serde(default)]
+    pub uniques: i64,
+}
+
+/// `GET …/traffic/views?per=day` (`views`) or `…/clones?per=day` (`clones`).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct TrafficSeries {
+    #[serde(default)]
+    pub views: Vec<TrafficDay>,
+    #[serde(default)]
+    pub clones: Vec<TrafficDay>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Referrer {
+    pub referrer: String,
+    #[serde(default)]
+    pub count: i64,
+    #[serde(default)]
+    pub uniques: i64,
+}
+
+/// Why a read gave nothing. `Display` is the short reason a pull row
+/// stores; none carries the token or a body.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GithubError {
+    /// 401: the token is wrong or expired.
+    Unauthorized,
+    /// 403 with the token: it lacks the permission (traffic needs
+    /// "Administration: read"), or the rate limit is spent.
+    Forbidden(String),
+    /// 404: no such repository (or a private one the token cannot see).
+    NotFound,
+    /// Any other non-2xx.
+    Status(u16, String),
+    Timeout,
+    Transport(String),
+    Decode(String),
+}
+
+impl std::fmt::Display for GithubError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unauthorized => write!(f, "github unreachable: unauthorized (401)"),
+            Self::Forbidden(m) => write!(f, "github unreachable: forbidden (403) {m}"),
+            Self::NotFound => write!(f, "github unreachable: no such repository (404)"),
+            Self::Status(c, m) => write!(f, "github unreachable: HTTP {c} {m}"),
+            Self::Timeout => write!(f, "github unreachable: timed out"),
+            Self::Transport(e) => write!(f, "github unreachable: {e}"),
+            Self::Decode(e) => write!(f, "github unreachable: unreadable answer ({e})"),
+        }
+    }
+}
+
+impl GithubError {
+    /// Whether a later request of the same run could succeed. A wrong
+    /// token, a missing permission, a missing repository or an unreachable
+    /// host will not fix itself between two requests.
+    pub fn is_fatal(&self) -> bool {
+        !matches!(self, Self::Status(..) | Self::Decode(_))
+    }
+}
+
+/// Bound a server-supplied string before it lands in a stored reason.
+fn short(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(120)
+        .collect::<String>()
+}
+
+#[derive(Clone)]
+pub struct GithubClient {
+    base: String,
+    repo: String,
+    token: Option<String>,
+    http: reqwest::Client,
+}
+
+impl std::fmt::Debug for GithubClient {
+    /// No token, ever.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GithubClient")
+            .field("base", &self.base)
+            .field("repo", &self.repo)
+            .field("token", &self.token.as_ref().map(|_| "<set>"))
+            .finish_non_exhaustive()
+    }
+}
+
+impl GithubClient {
+    /// `None` without a plausible `owner/name` — nothing is ever asked.
+    pub fn from_settings(g: &GrowthSettings) -> Option<Self> {
+        let repo = g.github_repo()?.to_string();
+        let token = Some(g.github_token.trim().to_string()).filter(|t| !t.is_empty());
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("roomler-ai-api/", env!("CARGO_PKG_VERSION")))
+            .timeout(TIMEOUT)
+            .build()
+            .ok()?;
+        Some(Self {
+            base: g.github_api_url.trim_end_matches('/').to_string(),
+            repo,
+            token,
+            http,
+        })
+    }
+
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    /// Whether traffic can be read.
+    pub fn has_token(&self) -> bool {
+        self.token.is_some()
+    }
+
+    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, GithubError> {
+        let mut req = self
+            .http
+            .get(format!("{}/repos/{}{path}", self.base, self.repo))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        let sent = req.send().await.map_err(|e| {
+            if e.is_timeout() {
+                GithubError::Timeout
+            } else {
+                GithubError::Transport(short(&e.without_url().to_string()))
+            }
+        })?;
+        let status = sent.status().as_u16();
+        if !(200..300).contains(&status) {
+            let text = sent.text().await.unwrap_or_default();
+            let msg = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(short))
+                .unwrap_or_default();
+            return Err(match status {
+                401 => GithubError::Unauthorized,
+                403 | 429 => GithubError::Forbidden(msg),
+                404 => GithubError::NotFound,
+                _ => GithubError::Status(status, msg),
+            });
+        }
+        sent.json::<T>()
+            .await
+            .map_err(|e| GithubError::Decode(short(&e.without_url().to_string())))
+    }
+
+    pub async fn repo_info(&self) -> Result<RepoInfo, GithubError> {
+        self.get("").await
+    }
+
+    /// Every release, page by page; `true` when [`MAX_RELEASE_PAGES`] cut
+    /// the list short.
+    pub async fn releases(&self) -> Result<(Vec<Release>, bool), GithubError> {
+        let mut out = Vec::new();
+        for page in 1..=MAX_RELEASE_PAGES {
+            let batch: Vec<Release> = self
+                .get(&format!("/releases?per_page={PER_PAGE}&page={page}"))
+                .await?;
+            let n = batch.len();
+            out.extend(batch);
+            if n < PER_PAGE {
+                return Ok((out, false));
+            }
+        }
+        Ok((out, true))
+    }
+
+    pub async fn views(&self) -> Result<TrafficSeries, GithubError> {
+        self.get("/traffic/views?per=day").await
+    }
+
+    pub async fn clones(&self) -> Result<TrafficSeries, GithubError> {
+        self.get("/traffic/clones?per=day").await
+    }
+
+    pub async fn referrers(&self) -> Result<Vec<Referrer>, GithubError> {
+        self.get("/traffic/popular/referrers").await
+    }
+}
+
+// ── Shaping ──────────────────────────────────────────────────────────────
+
+type Dims = BTreeMap<String, String>;
+
+fn dims(pairs: &[(&str, &str)]) -> Dims {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// A dimension value as stored: control characters dropped, trimmed, cut
+/// to [`MAX_DIM_LEN`]; `None` when nothing is left.
+pub fn clean_dim(raw: &str) -> Option<String> {
+    let s: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(MAX_DIM_LEN)
+        .collect();
+    (!s.is_empty()).then_some(s)
+}
+
+/// A version token at `i`: `\d+(\.\d+){2}` with an optional `-rc.N`,
+/// `-alpha.N` or `-beta.N`; its byte length, when there is one.
+fn version_len(s: &[u8], i: usize) -> Option<usize> {
+    let mut j = i;
+    for part in 0..3 {
+        let start = j;
+        while j < s.len() && s[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == start {
+            return None;
+        }
+        if part < 2 {
+            if j >= s.len() || s[j] != b'.' {
+                return None;
+            }
+            j += 1;
+        }
+    }
+    for pre in [&b"-rc."[..], b"-alpha.", b"-beta."] {
+        if s[j..].starts_with(pre) {
+            let k = j + pre.len();
+            let mut e = k;
+            while e < s.len() && s[e].is_ascii_digit() {
+                e += 1;
+            }
+            if e > k {
+                j = e;
+            }
+            break;
+        }
+    }
+    Some(j - i)
+}
+
+/// An asset's FLAVOUR: its name without the version, so the same artifact
+/// of every release groups together — `roomlerd-0.4.140-x86_64-pc-windows-msvc.msi`
+/// is `roomlerd-x86_64-pc-windows-msvc.msi`, `roomlerd_0.4.140_amd64.deb` is
+/// `roomlerd_amd64.deb`. The FIRST version token preceded by `-`, `_` or a
+/// `v` after one of them is removed together with that separator; a name
+/// without one is its own flavour.
+pub fn flavour(asset: &str) -> String {
+    let b = asset.as_bytes();
+    for i in 1..b.len() {
+        let sep = b[i - 1];
+        let (cut_from, at) = if matches!(sep, b'-' | b'_') {
+            if b[i] == b'v' {
+                (i - 1, i + 1)
+            } else {
+                (i - 1, i)
+            }
+        } else {
+            continue;
+        };
+        if at < b.len()
+            && let Some(n) = version_len(b, at)
+        {
+            let mut out = String::with_capacity(asset.len());
+            out.push_str(&asset[..cut_from]);
+            out.push_str(&asset[at + n..]);
+            return out;
+        }
+    }
+    asset.to_string()
+}
+
+/// The counters' rows for the snapshot of `day`. Drafts are left out; a
+/// zero is not stored.
+pub fn counter_rows(
+    day: &str,
+    repo: &str,
+    info: &RepoInfo,
+    releases: &[Release],
+) -> Vec<GrowthDaily> {
+    let mut by_release: BTreeMap<String, i64> = BTreeMap::new();
+    let mut by_flavour: BTreeMap<String, i64> = BTreeMap::new();
+    let mut total = 0i64;
+    for r in releases.iter().filter(|r| !r.draft) {
+        let Some(tag) = clean_dim(&r.tag_name) else {
+            continue;
+        };
+        for a in &r.assets {
+            let n = a.download_count.max(0);
+            total += n;
+            *by_release.entry(tag.clone()).or_insert(0) += n;
+            if let Some(f) = clean_dim(&flavour(&a.name)) {
+                *by_flavour.entry(f).or_insert(0) += n;
+            }
+        }
+    }
+    let repo_dims = dims(&[("by", "repo"), ("repo", repo)]);
+    let mut rows = Vec::new();
+    for (metric, value) in [
+        ("stars", info.stargazers_count),
+        ("forks", info.forks_count),
+        ("watchers", info.subscribers_count),
+        ("downloads", total),
+    ] {
+        if value != 0 {
+            rows.push(daily_row(SOURCE, metric, repo_dims.clone(), day, value));
+        }
+    }
+    for (tag, n) in by_release {
+        if n != 0 {
+            let d = dims(&[("by", "release"), ("repo", repo), ("release", tag.as_str())]);
+            rows.push(daily_row(SOURCE, "downloads", d, day, n));
+        }
+    }
+    for (f, n) in by_flavour {
+        if n != 0 {
+            let d = dims(&[("by", "flavour"), ("repo", repo), ("flavour", f.as_str())]);
+            rows.push(daily_row(SOURCE, "downloads", d, day, n));
+        }
+    }
+    rows
+}
+
+/// The traffic rows of `day` from the two series: GitHub's bucket whose
+/// timestamp falls on that UTC day, zeros not stored.
+pub fn traffic_rows(
+    day: &str,
+    repo: &str,
+    views: &TrafficSeries,
+    clones: &TrafficSeries,
+) -> Vec<GrowthDaily> {
+    let on = |series: &[TrafficDay]| {
+        series
+            .iter()
+            .find(|t| t.timestamp.get(..10) == Some(day))
+            .map(|t| (t.count.max(0), t.uniques.max(0)))
+            .unwrap_or((0, 0))
+    };
+    let (v, vu) = on(&views.views);
+    let (c, cu) = on(&clones.clones);
+    let d = dims(&[("by", "traffic"), ("repo", repo)]);
+    [
+        ("views", v),
+        ("views_uniques", vu),
+        ("clones", c),
+        ("clones_uniques", cu),
+    ]
+    .into_iter()
+    .filter(|(_, n)| *n != 0)
+    .map(|(m, n)| daily_row(TRAFFIC_SOURCE, m, d.clone(), day, n))
+    .collect()
+}
+
+/// The referrer ranking's rows, stored under `day` — the closed day it was
+/// read after. Referrers that fold into one cleaned name are summed.
+pub fn referrer_rows(day: &str, repo: &str, referrers: &[Referrer]) -> Vec<GrowthDaily> {
+    let mut by: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    for r in referrers {
+        if let Some(name) = clean_dim(&r.referrer) {
+            let e = by.entry(name).or_insert((0, 0));
+            e.0 += r.count.max(0);
+            e.1 += r.uniques.max(0);
+        }
+    }
+    let mut rows = Vec::new();
+    for (name, (views, uniques)) in by {
+        let d = dims(&[
+            ("by", "referrer"),
+            ("repo", repo),
+            ("referrer", name.as_str()),
+        ]);
+        if views != 0 {
+            rows.push(daily_row(
+                TRAFFIC_SOURCE,
+                "referrer_views",
+                d.clone(),
+                day,
+                views,
+            ));
+        }
+        if uniques != 0 {
+            rows.push(daily_row(
+                TRAFFIC_SOURCE,
+                "referrer_uniques",
+                d,
+                day,
+                uniques,
+            ));
+        }
+    }
+    rows
+}
+
+// ── When ─────────────────────────────────────────────────────────────────
+
+/// Whether a tick at `now` owes yesterday's snapshot: inside the window
+/// that starts at the cycle's hour and lasts [`SNAPSHOT_GRACE_HOURS`], and
+/// only while yesterday has no `ok` snapshot (the first good read stands).
+pub fn snapshot_due(now: DateTime, yesterday_pull: Option<&GrowthPull>) -> bool {
+    let start = pull_schedule::cycle_start_ms(now, CYCLE_HOUR_UTC);
+    let t = now.timestamp_millis();
+    let in_window = t >= start && t < start + SNAPSHOT_GRACE_HOURS * 3_600_000;
+    in_window && yesterday_pull.is_none_or(|p| p.status != PullStatus::Ok)
+}
+
+// ── A run ────────────────────────────────────────────────────────────────
+
+/// What one run did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PullReport {
+    /// Whether yesterday's snapshot was owed, and how it went.
+    pub snapshot_due: bool,
+    pub snapshot_ok: bool,
+    /// The traffic days owed, oldest first.
+    pub traffic_due: Vec<String>,
+    pub traffic_pulled: u32,
+    pub rows_written: u64,
+    pub rows_pruned: u64,
+    /// The first error met, as stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+async fn snapshot(
+    client: &GithubClient,
+    day: &str,
+) -> Result<(Vec<GrowthDaily>, bool), GithubError> {
+    let info = client.repo_info().await?;
+    let (releases, truncated) = client.releases().await?;
+    Ok((
+        counter_rows(day, client.repo(), &info, &releases),
+        truncated,
+    ))
+}
+
+/// One run at `now`. Public so a test drives it with an injected `now` and
+/// a client pointed at a fake server; the scheduler is [`spawn_puller`]. A
+/// database error stops the run (the next tick retries); a GitHub error is
+/// recorded per day and is never a 0.
+pub async fn run_once(core: &Core, client: &GithubClient, now: DateTime) -> DaoResult<PullReport> {
+    let dao = GrowthDao::new(&core.db);
+    let today = date_of(now);
+    let yesterday = day_str(today - Duration::days(1));
+    let mut report = PullReport::default();
+
+    // The counters: yesterday's snapshot, inside its window, once.
+    let prior = dao.pulls_between(SOURCE, &yesterday, &yesterday).await?;
+    if snapshot_due(now, prior.first()) {
+        report.snapshot_due = true;
+        match snapshot(client, &yesterday).await {
+            Ok((rows, truncated)) => {
+                let c = dao
+                    .replace_daily(SOURCE, &yesterday, &COUNTER_METRICS, &rows)
+                    .await?;
+                dao.record_pull_ok(
+                    SOURCE,
+                    &yesterday,
+                    PulledDay {
+                        rows: rows.len() as u32,
+                        missing_goal: None,
+                        truncated,
+                    },
+                    now,
+                )
+                .await?;
+                if truncated {
+                    warn!(day = %yesterday, "github pull: the release list hit the page bound; the snapshot holds the first {} pages", MAX_RELEASE_PAGES);
+                }
+                report.snapshot_ok = true;
+                report.rows_written += c.written;
+                report.rows_pruned += c.pruned;
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                dao.record_pull_failed(SOURCE, &yesterday, &reason, now)
+                    .await?;
+                report.error.get_or_insert(reason);
+            }
+        }
+    }
+
+    // Traffic: the token's, re-pulled once per cycle inside the horizon.
+    if client.has_token() {
+        let from = day_str(today - Duration::days(TRAFFIC_HORIZON_DAYS));
+        let pulls = dao.pulls_between(TRAFFIC_SOURCE, &from, &yesterday).await?;
+        let due = pull_schedule::due_days(
+            now,
+            &pulls,
+            CYCLE_HOUR_UTC,
+            TRAFFIC_HORIZON_DAYS,
+            TRAFFIC_HORIZON_DAYS,
+        );
+        report.traffic_due = due.iter().map(|d| day_str(*d)).collect();
+        if !due.is_empty() {
+            let read = async {
+                Ok::<_, GithubError>((
+                    client.views().await?,
+                    client.clones().await?,
+                    client.referrers().await?,
+                ))
+            }
+            .await;
+            match read {
+                Ok((views, clones, referrers)) => {
+                    for d in &report.traffic_due {
+                        let mut rows = traffic_rows(d, client.repo(), &views, &clones);
+                        let mut metrics: Vec<&str> = TRAFFIC_METRICS.to_vec();
+                        // The ranking belongs to the latest closed day only.
+                        if *d == yesterday {
+                            rows.extend(referrer_rows(d, client.repo(), &referrers));
+                            metrics.extend(REFERRER_METRICS);
+                        }
+                        let c = dao
+                            .replace_daily(TRAFFIC_SOURCE, d, &metrics, &rows)
+                            .await?;
+                        dao.record_pull_ok(
+                            TRAFFIC_SOURCE,
+                            d,
+                            PulledDay {
+                                rows: rows.len() as u32,
+                                missing_goal: None,
+                                truncated: false,
+                            },
+                            now,
+                        )
+                        .await?;
+                        report.traffic_pulled += 1;
+                        report.rows_written += c.written;
+                        report.rows_pruned += c.pruned;
+                    }
+                }
+                Err(e) => {
+                    let reason = e.to_string();
+                    for d in &report.traffic_due {
+                        dao.record_pull_failed(TRAFFIC_SOURCE, d, &reason, now)
+                            .await?;
+                    }
+                    report.error.get_or_insert(reason);
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// The scheduler: every [`LOOP_INTERVAL_SECS`] one pod (the Redis claim)
+/// runs [`run_once`]. Only with `growth.enabled` and a repository — with
+/// none it logs that once and starts nothing.
+pub fn spawn_puller(core: Core) {
+    let growth = &core.settings.growth;
+    if !growth.enabled {
+        return;
+    }
+    let Some(client) = GithubClient::from_settings(growth) else {
+        info!(
+            "growth github puller: no repository configured (ROOMLER__GROWTH__GITHUB_REPO) — nothing is pulled"
+        );
+        return;
+    };
+    info!(
+        repo = client.repo(),
+        traffic = client.has_token(),
+        "growth github puller starting"
+    );
+    pull_schedule::spawn_hourly(
+        core,
+        "growth-github-pull",
+        FIRST_TICK_DELAY_SECS,
+        LOOP_INTERVAL_SECS,
+        move |core| {
+            let client = client.clone();
+            async move {
+                match run_once(&core, &client, DateTime::now()).await {
+                    Ok(r) if r.snapshot_due || !r.traffic_due.is_empty() => info!(
+                        snapshot_ok = r.snapshot_ok,
+                        traffic_pulled = r.traffic_pulled,
+                        rows_written = r.rows_written,
+                        error = r.error.as_deref().unwrap_or(""),
+                        "growth github pull"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!(%e, "growth github pull failed"),
+                }
+            }
+        },
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(s: &str) -> DateTime {
+        DateTime::parse_rfc3339_str(s).unwrap()
+    }
+
+    fn value(
+        rows: &[GrowthDaily],
+        by: &str,
+        key: Option<(&str, &str)>,
+        metric: &str,
+    ) -> Option<i64> {
+        rows.iter()
+            .find(|r| {
+                r.metric == metric
+                    && r.dims.get("by").map(String::as_str) == Some(by)
+                    && key.is_none_or(|(k, v)| r.dims.get(k).map(String::as_str) == Some(v))
+            })
+            .map(|r| r.value)
+    }
+
+    /// The same artifact of every release groups under one flavour; the
+    /// version goes with the separator before it.
+    #[test]
+    fn a_flavour_is_the_asset_name_without_its_version() {
+        for (name, want) in [
+            (
+                "roomlerd-0.4.140-x86_64-pc-windows-msvc.msi",
+                "roomlerd-x86_64-pc-windows-msvc.msi",
+            ),
+            (
+                "roomlerd-0.4.140-x86_64-pc-windows-msvc.msi.asc",
+                "roomlerd-x86_64-pc-windows-msvc.msi.asc",
+            ),
+            ("roomlerd_0.4.140_amd64.deb", "roomlerd_amd64.deb"),
+            (
+                "roomler-setup-0.4.139-universal-apple-darwin.tar.gz",
+                "roomler-setup-universal-apple-darwin.tar.gz",
+            ),
+            (
+                "roomler-agent-0.3.0-rc.480-x86_64-unknown-linux-gnu.deb",
+                "roomler-agent-x86_64-unknown-linux-gnu.deb",
+            ),
+            ("roomler-v0.4.7.zip", "roomler.zip"),
+            ("SHA256SUMS", "SHA256SUMS"),
+            ("ffmpeg-n7.1-win64.zip", "ffmpeg-n7.1-win64.zip"),
+        ] {
+            assert_eq!(flavour(name), want, "{name}");
+        }
+    }
+
+    /// A snapshot: the repo's counters, downloads summed per release and per
+    /// flavour, drafts left out, zeros not stored, and every row its own id.
+    #[test]
+    fn a_snapshot_sums_downloads_per_release_and_flavour_without_drafts() {
+        let info = RepoInfo {
+            stargazers_count: 120,
+            forks_count: 9,
+            subscribers_count: 0,
+        };
+        let asset = |name: &str, n: i64| ReleaseAsset {
+            name: name.into(),
+            download_count: n,
+        };
+        let releases = vec![
+            Release {
+                tag_name: "agent-v0.4.140".into(),
+                draft: false,
+                assets: vec![
+                    asset("roomlerd-0.4.140-x86_64-pc-windows-msvc.msi", 30),
+                    asset("roomlerd-0.4.140-x86_64-pc-windows-msvc.msi.asc", 25),
+                    asset("roomlerd_0.4.140_amd64.deb", 0),
+                ],
+            },
+            Release {
+                tag_name: "agent-v0.4.139".into(),
+                draft: false,
+                assets: vec![asset("roomlerd-0.4.139-x86_64-pc-windows-msvc.msi", 70)],
+            },
+            Release {
+                tag_name: "agent-v0.4.141".into(),
+                draft: true,
+                assets: vec![asset("roomlerd-0.4.141-x86_64-pc-windows-msvc.msi", 999)],
+            },
+        ];
+        let rows = counter_rows("2026-10-16", "gjovanov/roomler-ai", &info, &releases);
+        assert_eq!(value(&rows, "repo", None, "stars"), Some(120));
+        assert_eq!(value(&rows, "repo", None, "forks"), Some(9));
+        assert_eq!(
+            value(&rows, "repo", None, "watchers"),
+            None,
+            "a zero is not stored"
+        );
+        assert_eq!(
+            value(&rows, "repo", None, "downloads"),
+            Some(125),
+            "the draft is out"
+        );
+        assert_eq!(
+            value(
+                &rows,
+                "release",
+                Some(("release", "agent-v0.4.140")),
+                "downloads"
+            ),
+            Some(55)
+        );
+        assert_eq!(
+            value(
+                &rows,
+                "release",
+                Some(("release", "agent-v0.4.141")),
+                "downloads"
+            ),
+            None
+        );
+        assert_eq!(
+            value(
+                &rows,
+                "flavour",
+                Some(("flavour", "roomlerd-x86_64-pc-windows-msvc.msi")),
+                "downloads"
+            ),
+            Some(100),
+            "the MSI of both releases, one flavour"
+        );
+        assert_eq!(
+            value(
+                &rows,
+                "flavour",
+                Some(("flavour", "roomlerd_amd64.deb")),
+                "downloads"
+            ),
+            None
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.source == SOURCE && r.day == "2026-10-16")
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.dims.get("repo").map(String::as_str) == Some("gjovanov/roomler-ai"))
+        );
+        let ids: std::collections::HashSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids.len(), rows.len());
+    }
+
+    /// Traffic: the bucket of the day, by its UTC date; the referrers summed
+    /// per cleaned name; zeros not stored.
+    #[test]
+    fn traffic_and_referrers_shape_into_rows() {
+        let views: TrafficSeries = serde_json::from_str(
+            r#"{"count":30,"uniques":9,"views":[
+                {"timestamp":"2026-10-15T00:00:00Z","count":12,"uniques":4},
+                {"timestamp":"2026-10-16T00:00:00Z","count":18,"uniques":5}]}"#,
+        )
+        .unwrap();
+        let clones: TrafficSeries = serde_json::from_str(
+            r#"{"count":2,"uniques":1,"clones":[
+                {"timestamp":"2026-10-16T00:00:00Z","count":2,"uniques":1}]}"#,
+        )
+        .unwrap();
+        let rows = traffic_rows("2026-10-16", "o/r", &views, &clones);
+        assert_eq!(value(&rows, "traffic", None, "views"), Some(18));
+        assert_eq!(value(&rows, "traffic", None, "views_uniques"), Some(5));
+        assert_eq!(value(&rows, "traffic", None, "clones"), Some(2));
+        let quiet = traffic_rows("2026-10-15", "o/r", &views, &clones);
+        assert_eq!(
+            value(&quiet, "traffic", None, "clones"),
+            None,
+            "no bucket: a zero"
+        );
+        assert_eq!(value(&quiet, "traffic", None, "views"), Some(12));
+
+        let refs: Vec<Referrer> = serde_json::from_str(
+            r#"[{"referrer":"Google","count":4,"uniques":3},
+                {"referrer":"news.ycombinator.com","count":10,"uniques":8},
+                {"referrer":" Google\u0000","count":1,"uniques":1}]"#,
+        )
+        .unwrap();
+        let rows = referrer_rows("2026-10-16", "o/r", &refs);
+        assert_eq!(
+            value(
+                &rows,
+                "referrer",
+                Some(("referrer", "Google")),
+                "referrer_views"
+            ),
+            Some(5)
+        );
+        assert_eq!(
+            value(
+                &rows,
+                "referrer",
+                Some(("referrer", "news.ycombinator.com")),
+                "referrer_uniques"
+            ),
+            Some(8)
+        );
+        assert!(rows.iter().all(|r| r.source == TRAFFIC_SOURCE));
+    }
+
+    /// The snapshot window: from the cycle's hour for the grace, and only
+    /// while yesterday has no good snapshot.
+    #[test]
+    fn a_snapshot_is_owed_only_inside_its_window_and_only_once() {
+        let pull = |status: PullStatus| GrowthPull {
+            id: GrowthPull::id_of(SOURCE, "2026-10-16"),
+            source: SOURCE.into(),
+            day: "2026-10-16".into(),
+            status,
+            pulled_at: None,
+            attempted_at: at("2026-10-17T01:05:00Z"),
+            attempts: 1,
+            rows: 0,
+            error: None,
+            missing_goal: None,
+            truncated: false,
+        };
+        assert!(
+            !snapshot_due(at("2026-10-17T00:59:59Z"), None),
+            "before the cycle"
+        );
+        assert!(snapshot_due(at("2026-10-17T01:00:00Z"), None));
+        assert!(snapshot_due(at("2026-10-17T06:59:59Z"), None));
+        assert!(
+            !snapshot_due(at("2026-10-17T07:00:00Z"), None),
+            "past the grace"
+        );
+        assert!(snapshot_due(
+            at("2026-10-17T02:00:00Z"),
+            Some(&pull(PullStatus::Failed))
+        ));
+        assert!(!snapshot_due(
+            at("2026-10-17T02:00:00Z"),
+            Some(&pull(PullStatus::Ok))
+        ));
+    }
+
+    #[test]
+    fn errors_read_as_short_reasons_and_the_client_never_prints_its_token() {
+        assert_eq!(
+            GithubError::Unauthorized.to_string(),
+            "github unreachable: unauthorized (401)"
+        );
+        assert!(GithubError::NotFound.is_fatal());
+        assert!(!GithubError::Status(502, "bad gateway".into()).is_fatal());
+        let g = GrowthSettings {
+            github_token: "ghp_secret_value".into(),
+            ..Default::default()
+        };
+        let c = GithubClient::from_settings(&g).unwrap();
+        assert!(c.has_token());
+        let shown = format!("{c:?}");
+        assert!(!shown.contains("ghp_secret_value"), "{shown}");
+        let none = GrowthSettings {
+            github_repo: "not-a-repo".into(),
+            ..Default::default()
+        };
+        assert!(GithubClient::from_settings(&none).is_none());
+    }
+}
