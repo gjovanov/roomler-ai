@@ -10,8 +10,11 @@
   2026-10-17 (§8, AC15).
 - P0c, honest caps (§3.3a), merged: P0c-1, the map and the daemon's decision (#2400); P0c-2, the viewer and the
   enroll dialog (#2401); P0c-3, a netstack node's exit status, DNS and route offer, measured first (D12, #2404).
-  They reach the fleet with the next agent release and server promote; AC3's field sessions follow.
-- P3i, the host firewall, is in review: measured first (§8), decided as report-never-change (D13).
+  P0c-1 and P0c-2 shipped in 0.4.142; P0c-3 rides the next release. AC3's field sessions follow.
+- P3i, the host firewall, merged (#2414): measured first (§8), decided as report-never-change (D13). Its status
+  line rides the next release.
+- P3c-1, Linux session audio that is never a microphone, is in review: measured first (§8), and the premise was
+  wrong, since the microphone was the only thing a Linux session ever captured (§3.8, D14 for P3c-2).
 - The rest of P2–P7 is open.
 
 **Owner:** the agent on all
@@ -137,16 +140,16 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
-| R1 | System audio in a session | ✅ WASAPI loopback | 🟡 a Pulse `.monitor`, else **the default microphone** (`audio/cpal_backend.rs:277-304`) | ❌ | macOS: `NoopAudioCapture` (`audio/mod.rs:78-98`) while `opus` is advertised (`encode/caps.rs:1480`) ✔ | P0c, P2a, P3c |
+| R1 | System audio in a session | ✅ WASAPI loopback | ❌ **the default microphone, always**: cpal lists only ALSA devices, so the `.monitor` pick never matched (measured, §8). Since P3c-1 a named device only, else no track and the reason (`audio_source.rs:151`) | ❌ | macOS: no capture backend; since P0c no `opus` either (`encode/caps.rs:700`) ✔. Linux: nothing captures the session's monitor (P3c-2) | P0c, P2a, P3c |
 | R2 | Native consent panel | ✅ | ✅ X11 · ⛔ Wayland → companion | ❌ | Built (`indicator/mac.rs`), not in the release set (`release-agent.yml:2564-2580`) | P2b (D3) |
 | R3 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows (FR-56) | ❌ | `Unavailable::Platform` (`apps/mod.rs:347`); no `apps/macos.rs` | P2c |
 | R4 | Live cursor shape | ✅ | ❌ | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`) | P3a, P2d |
 | R5 | "Host is locked" consent hint | ✅ | ❌ | ❌ | Always `Unlocked` off Windows (`lock_state.rs:290-311`) | P2d, P3b |
-| R6 | Keyboard layout report / switch | ✅ | ❌ | ❌ | Windows-only cap (`caps.rs:1516-1520`) | P2d, P3e |
+| R6 | Keyboard layout report / switch | ✅ | ❌ | ❌ | Windows-only cap (`caps.rs:1527-1531`) | P2d, P3e |
 | R7 | Match remote display | ✅ | ❌ | ❌ | `display_match.rs:247` | P2d, P3e |
-| R8 | Clipboard: host → viewer image sync | ✅ | ❌ | ❌ | Forced off (`clipboard.rs:818-822`) ✔ while advertised (`caps.rs:1493-1501`) | P0c, P2e, P3e |
+| R8 | Clipboard: host → viewer image sync | ✅ | ❌ | ❌ | Forced off (`clipboard.rs:818-822`) ✔ while advertised (`caps.rs:1504-1512`) | P0c, P2e, P3e |
 | R9 | Clipboard: RTF lane | ✅ | ❌ | ❌ | `clipboard.rs:792` | P2e, P3e |
-| R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:9538-9541`) | FR-93 P7 |
+| R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:9595-9598`) | FR-93 P7 |
 | R11 | Typing text on a non-US layout (uinput) | ✅ | 🟡 US table only | ✅ | `keylayout.rs:40-46`, `uinput_backend.rs:628-634` | P3f |
 | R12 | Recording with audio | ✅ system + mic | ✅ | 🟡 picture only | No SCK audio; cpal is not a macOS dependency (`agents/roomlerd/Cargo.toml:321-322`) | P2a, P2f |
 | R13 | Dirty-rect capture (idle CPU) | ✅ WGC | ✅ X11 · ❌ Wayland | ❌ | `Damage::Unknown` (`scrap_backend.rs:222`) | D2 |
@@ -206,7 +209,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 2. Linux and macOS advertise clipboard image events they never send (R8); a root Linux daemon advertises a clipboard
    it cannot reach (R10).
 3. The Ctrl+Alt+Del button shows for every host. It sends three ordinary key events
-   (`ui/src/composables/useRemoteControl.ts:11390-11402`) ✔, and nothing in the agent calls `SendSAS` (grep: none) ✔.
+   (`ui/src/composables/useRemoteControl.ts:11440-11452`) ✔, and nothing in the agent calls `SendSAS` (grep: none) ✔.
    Windows does not treat a synthesised Ctrl+Alt+Del as the secure attention sequence, so the button does nothing at
    a lock screen that requires it; on Linux and macOS the chord means something else, or nothing.
 4. The enroll dialog offers the setup wizard for agents on Linux and macOS, where it installs only the tunnel client
@@ -231,15 +234,15 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `docs/roomler-ssh.md:311-325` | Windows `daemon` → SYSTEM | the console worker (#2021, FR-94) |
 | `docs/installation.md:21-22`, `ui/docs/content/start/install/macos.md:51-53` | install the macOS daemon with the wizard | the wizard's daemon roles are Windows-only |
 | `docs/installation.md:43-44`, `ui/docs/content/troubleshooting/install-problems.md:37-40` | downloads come from roomler.ai | true for the MSI proxy, the CLI and the wizard; `install.sh`'s `.deb`/tarball/`.pkg` and every self-update fetch from GitHub (`updater.rs:1276,1360`) |
-| `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:3099` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon. ✅ Both say so since P0c-2 |
+| `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:3173` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon. ✅ Both say so since P0c-2 |
 | `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:181-224`); DRM captures from root (opt-in) |
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`) |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93 |
-| code comments: `power.rs:649-654`, `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1766`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps |
+| code comments: `power.rs:649-654`, `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1777`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps |
 
 ### 2.9 Equal on all three: not parity, recorded so nobody files them here
 
-Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:9651`), a curtain or
+Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:9692`), a curtain or
 privacy mode, touch injection, a live microphone (two-way audio), OS toast notifications
 (`crates/agent-core/src/notify.rs:21-24`), file copy-paste through the clipboard, minidumps, and SSH agent and X11
 forwarding. Several deserve FRs of their own; none is a platform gap.
@@ -324,14 +327,14 @@ matched by equality (`Unavailable::KEYS`, `:548`), and the wire shape is locked 
 
 An agent before P0c sends no map, and an absent key never means "unavailable": its lists say what it claims.
 
-**The decision** is one daemon-side seam, `with_honest_words` (`agents/roomlerd/src/encode/caps.rs:694`), applied
+**The decision** is one daemon-side seam, `with_honest_words` (`agents/roomlerd/src/encode/caps.rs:700`), applied
 in `detect()` (`:624`) after the config lists, over plain `HostFacts` (`:636`). It runs, and is tested, on every
 OS: FR-43's practice of keeping the decision out of `cfg(target_os)`.
 
 | Feature | When | What the hello says |
 |---|---|---|
 | `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:78`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:3064`); `unavailable.audio = no-backend` |
-| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:675`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
+| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:681`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone keeps image events (`clipboard.rs:817-822`) | `events` and `images` stay: text still syncs, and an image moves on request. `not-watched` |
 | `sas` | Windows | `keys-only`: the button types three ordinary keys, which apps on the desktop get and the lock screen does not. P4a's `SendSAS` replaces it with an `input: sas` word (D11) |
 | `sas` | Linux | `keys-only`: the same keys, which the desktop binds (GNOME and KDE to log out), so the button says so rather than going |
@@ -547,9 +550,21 @@ test of the SIGKILL property itself.
   the live channel. On portal and mutter, PipeWire cursor metadata (`SPA_META_Cursor`).
 - **P3b, lock and sleep.** `host_locked` from logind's `LockedHint` (`keep_busy/logind.rs`), advisory only; sleep
   inhibited with logind `Inhibit("sleep:idle", …)` over the zbus that already ships.
-- **P3c, audio.** On the live path, refuse rather than fall back to a microphone, as the recorder already does
-  (`Source::SystemOnly`). A root daemon captures the session's monitor through the session helper it already drops
-  privileges into.
+- **P3c, audio.** Measured first (2026-10-17, §8), and the premise was wrong: the fallback to a microphone was not
+  a corner case, it was the only path. cpal 0.15 has one Linux host, ALSA, which lists `pipewire`, `pulse` and
+  `default` and never a sound server's sources, so neither the `.monitor` auto-pick nor the documented
+  `ROOMLERD_AUDIO_SOURCE=<sink>.monitor` ever matched. Every Linux session fell back to `default`: the microphone.
+  - **P3c-1, never a microphone; the viewer is told why** (built). The live path opens what a recording's computer
+    audio opens (`Source::SystemOnly`, one rule in `audio_source.rs`): a device named in `ROOMLERD_AUDIO_SOURCE`
+    (an ALSA name), else one named as a monitor, else nothing. A Linux hello offers no `opus` without a named
+    device (`no-monitor`). A track that carries no sound says why, `rc:audio-unavailable {code, detail, hint}` over
+    the control DC with FR-80's retry, from every exit of the pump; the viewer shows it once and keeps it on the
+    audio control. An owner names `pulse` with `PULSE_SOURCE=@DEFAULT_MONITOR@` to capture the speakers today
+    (measured; `docs/remote-control.md` §5.1c).
+  - **P3c-2, capture the session's monitor on every Linux host** (D14). Pulse's own client library, loaded at run
+    time like libpipewire, recording `@DEFAULT_MONITOR@`, which PulseAudio and PipeWire's Pulse server both
+    resolve. In the daemon for a per-user install; for a root daemon, in the session helper it already drops
+    privileges into (`portal-helper`, run as the seat's user). The recorder's computer audio takes the same path.
 - **P3d, files on a system install.** Resolve the seat's user (`companion::graphical_session`) and write into their
   Downloads *as that user*, the twin of `active_user_downloads_path` on Windows (`files.rs:2467-2480`).
   ⚠️ Never as root followed by a `chown`: in a directory the user owns, a root path operation can be redirected
@@ -655,7 +670,7 @@ model on Windows, so the three agree on what the mode means.
 | **P2f** | macOS microphone for recordings | the recording's `mic` option | a field Mac | S–M |
 | **P3a** | Linux cursor shape (X11, then PipeWire) | `ROOMLERD_CURSOR_CHANNEL=0` | the FR-93 lab, Xorg + Wayland | S → M |
 | **P3b** | Linux lock hint + sleep inhibit | `power_policy`; per-verb | the lab | S |
-| **P3c** | Linux audio: no microphone fallback; session capture for root | `ROOMLERD_AUDIO_SESSION=0` | the lab | M |
+| **P3c** | Linux audio. *P3c-1*: never a microphone; no `opus` without a named device; `rc:audio-unavailable` says why (built). *P3c-2*: the session's monitor through Pulse's client library, per-user and root (D14) | P3c-1: — (a privacy fix; an owner names a device to opt back in); P3c-2: `ROOMLERD_AUDIO_SESSION=0` | a Linux host with a microphone and a sound server, red on 0.4.141 | M |
 | **P3d** | Linux system-install files land as the seat user | `ROOMLERD_FILES_AS_SEAT_USER=0` | the lab | M |
 | **P3e** | Linux X11 layout, display-match, clipboard images + RTF | per-verb | the lab | M |
 | **P3f** | uinput text on any layout | `ROOMLERD_UINPUT_XKB=0` | the lab, German and French layouts | M |
@@ -775,6 +790,7 @@ one depends on it.
 | **D11** | Ctrl+Alt+Del until P4a | **Decided (per recommendation, 2026-10-17):** Windows and Linux keep the button and say what the keys reach (Linux desktops bind the chord, so hiding it would take a working key away); macOS hides it. P4a's `SendSAS` brings an `input: sas` word |
 | **D12** | A netstack node's exit status | **Decided (measured, 2026-10-17):** it is `active` for the SOCKS5 front's IPv4 dials and nothing else, so the status names the front instead of reading "never active" (the plan before the measurement, which would itself have been wrong). The DNS steer and the route offer follow from the same fact (P0c-3) |
 | **D13** | A host firewall that refuses services on the overlay address | **Decided (per recommendation, 2026-10-17):** report, never change. The firewall is the host owner's, and trusting the adapter would open every service on the host to every peer the overlay ACL admits, an ACL not yet field-proven under `enforce`. Carriers need no allow (measured). The status names the zone and what it admits; the owner opens the mesh (`firewall-cmd --zone=trusted --add-interface=roomler0`, `ufw allow in on roomler0`) |
+| **D14** | How Linux captures the computer's sound (P3c-2) | **Decided (per recommendation, 2026-10-17):** Pulse's client library (`libpulse-simple.so.0`), loaded at run time, recording `@DEFAULT_MONITOR@`: PulseAudio and PipeWire's Pulse server both resolve it, and the library is on nearly every desktop, where the ALSA `pulse` plugin often is not. Rejected: ALSA `pulse` with `PULSE_SOURCE` set by the daemon (an environment variable is process-wide and unsafe to set in a threaded process, and it would also redirect a recording's microphone); a `parec` child (one more binary to depend on). A root daemon records in the seat user's session helper, because PulseAudio admits a client by uid or cookie |
 
 ## 7. Out of scope
 
@@ -845,3 +861,6 @@ one depends on it.
 | 2026-10-17 | released 0.4.141 | mars: a throwaway Linux exit (a container with iptables, approved) and two netstack clients (no `/dev/net/tun`, no `NET_ADMIN`, `ROOMLERD_OVERLAY_NETSTACK_SOCKS=1080`), one with `overlay_exit_node` and one without | **D12 measured.** 🔴 No exit: a SOCKS5 connect to `1.1.1.1` times out. 🟢 With the exit: it completes; the exit's tcpdump shows the client's SYN from its overlay address on `roomler0`, and its MASQUERADE counts one new flow; a name curl resolves itself goes through too. A name handed to the front (`socks5h`) and an IPv6 literal are refused. Meanwhile `roomler status` said `active, v6 on, DNS NOT steered` for the whole host. The positive control (an HTTP listener on the exit's overlay address) answered in neither phase, a rig fault (`python3-minimal` has no `http.server`); the result rests on the tcpdump and NAT counts. A first take was void: a clean stop between its phases unenrolled the ephemeral client |
 | 2026-10-17 | released 0.4.141 | mars: one netstack node on a host where iptables works (`NET_ADMIN`, iptables), `overlay_exit_node_enabled = true`, never approved | 🔴 **It offers `/0`**: the server row says `can_be_exit_node: true`, `route_offer_withheld: null`, though its userspace stack forwards nothing, so every client of it would black-hole. P0c-3 withholds every route offer from a netstack node; the green check rides the release that carries it |
 | 2026-10-17 | released 0.4.141 | mars: two throwaway TUN nodes on one docker bridge (a LAN). FW ran firewalld 1.1.1, default zone `public` (ssh, dhcpv6-client), nothing putting `roomler0` in a zone; P ran no firewall | **P3i's question, the LAN half.** 🟢 **Carriers:** FW and P see each other `direct`; FW's log has `direct carrier promoted … tier=Lan probe_ms=497`. LAN-direct does not fall to relay behind firewalld, as the punched path did not on the Fedora host. 🔴 **Services:** HTTP to FW's overlay address refused (rc 7), as on the Fedora host; HTTP to its LAN address refused too (the same zone, a control). 🟢 **The remedy, scoped:** with `roomler0` in `trusted` (runtime only) the overlay address answered 200 while the LAN address stayed refused; removed, refused again. The ping probe never ran (the plain client image has no `ping`). So the UDP allow P3i was specced as is unnecessary, and what remains is saying which zone governs the adapter (D13) |
+| 2026-10-17 | cpal 0.15.3, the version the agent links | WSL (Ubuntu 24.04; WSLg's PulseAudio 17 with one sink, `RDPSink`, and one source, `RDPSource`, the microphone). A replica of the Linux pick (`pick_device` before P3c-1), then the stream it opens, with `pactl list source-outputs` while it ran | **P3c measured; its premise was wrong.** cpal's input devices were exactly `pipewire`, `pulse` and `default`, and no name ended in `.monitor`. 🔴 With nothing set, the pick fell back to `default`. 🔴 With the documented `ROOMLERD_AUDIO_SOURCE=RDPSink.monitor`: "not found among inputs", then `default` again. 🔴 Through the `pulse` device the capture sat on **`RDPSource`, the microphone, RUNNING**, while `RDPSink.monitor` stayed suspended. 🟢 `pulse` with `PULSE_SOURCE=@DEFAULT_MONITOR@`: **`RDPSink.monitor` RUNNING**, the microphone suspended. So every Linux session with audio carried the microphone (R1). The recorder's computer audio could never open there either: its refusal by name was right, and its remedy text was not. P3c-1 follows |
+| 2026-10-17 | released 0.4.142 | mars, a throwaway Debian container: a per-user agent (vmtest org, ephemeral) beside a PulseAudio server. Its default source is `mic` (a 440 Hz sine source standing in for a microphone); its speakers are a null sink, `speakers`. The production viewer, with "Receive host audio" on; the server's recording clients sampled every 3 s | 🔴 **P3c-1 red: the session carried the microphone.** The agent logged `capturing the DEFAULT INPUT (likely a microphone, not desktop audio)` on `device=default`. PulseAudio showed `ALSA plug-in [roomlerd]` recording **`mic`, RUNNING**, while `speakers.monitor` stayed SUSPENDED in all 19 samples. The viewer held a live audio track: 1,204 Opus packets in 24 s |
+| 2026-10-17 | the #2419 candidate (`ced1f472d`, built on Debian bookworm) | the same container, three cells; the candidate viewer bundle (served on the real origin) for the third | 🟢 **P3c-1 green.** *Nothing named:* the hello carries no `opus` and `unavailable.audio = no-monitor`, and the session recorded nothing, with both sources SUSPENDED in all 12 samples. *`pulse` + `PULSE_SOURCE=@DEFAULT_MONITOR@`:* `ALSA plug-in [roomlerd]` recorded **`speakers.monitor`** (RUNNING), and `mic` stayed SUSPENDED in all 14 samples. *`ROOMLERD_AUDIO_SOURCE=nope`:* nothing was recorded. The agent sent `rc:audio-unavailable` with `source_not_found` and the reason "`ROOMLERD_AUDIO_SOURCE=nope` is not a capture device here (devices: pulse, default)". The candidate viewer received it and logged "the host sends no sound (source_not_found)" with the agent's hint |

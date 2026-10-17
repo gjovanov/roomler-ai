@@ -2344,6 +2344,14 @@ watch(
     if (summary) showSnackbar(summary, 'info', 8000)
   },
 )
+// FR-97 P3c-1 — the device says this session carries no sound, and why. Said
+// once as it arrives; the audio control keeps the reason in its title.
+watch(
+  () => rc.audioUnavailable.value,
+  (reason) => {
+    if (reason) showSnackbar(reason.hint || 'This host sends no sound in this session.', 'warning', 10000)
+  },
+)
 // FR-85 P3b-3 — a deliberate Disconnect ends a recording first: to the device
 // a hang-up and the reconnect ladder's retry look the same, and a retry is
 // what it keeps a recording running for.
@@ -3113,6 +3121,12 @@ const audioTooltip = computed<string>(() => {
   // FR-101 P2c — the session policy took audio out of this session, whatever
   // the toggle says.
   if (sessionLive.value && audioRefusal.value) return audioRefusal.value
+  // FR-97 P3c-1 — the device's own word on this session's silence.
+  const silent = rc.audioUnavailable.value
+  if (sessionLive.value && silent) {
+    const said = silent.hint || 'This host sends no sound in this session.'
+    return silent.detail ? `${said} (${silent.detail})` : said
+  }
   if (!agentSupportsAudio.value) {
     // FR-97 P0c — the device says why, where it knows (no capture backend on
     // its OS); an older agent leaves only the build to blame.

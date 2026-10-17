@@ -6,13 +6,12 @@
 //!   *output* device with `build_input_stream`; the WASAPI backend
 //!   detects the output device driven as input and opens a loopback
 //!   client, so we capture exactly what's playing out of the speakers.
-//! * **Linux** — the PulseAudio *monitor* source. `ROOMLERD_AUDIO_SOURCE`
-//!   names an explicit input device (e.g.
-//!   `alsa_output.pci-0000_00_1f.3.analog-stereo.monitor`); otherwise we
-//!   look for an input device whose name ends in `.monitor` (Pulse
-//!   exposes every sink's loopback as a `*.monitor` input source), and
-//!   fall back to the plain default input device with a `warn!` if none
-//!   is found.
+//! * **Linux** — an ALSA capture device, picked by name
+//!   ([`crate::audio_source::pick_linux`]): the one `ROOMLERD_AUDIO_SOURCE`
+//!   names, else one whose name says monitor, else NOTHING. ⚠️ Never the
+//!   default input: cpal 0.15 lists only ALSA devices, never a sound server's
+//!   sources, and through PipeWire or PulseAudio the default input is the
+//!   microphone (FR-97 P3c, measured; the reasoning is in `audio_source`).
 //!
 //! cpal's data callback fires on a real-time audio thread. We must NOT
 //! block or allocate heavily there — we convert the buffer to `i16`
@@ -26,6 +25,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::sync::mpsc;
 
 use super::{AudioCapture, AudioFrame};
+#[cfg(target_os = "windows")]
+use crate::audio_source::{AudioUnavailable, AudioUnavailableCode};
 use async_trait::async_trait;
 
 /// Bounded channel depth between the RT capture callback and the async
@@ -60,22 +61,22 @@ unsafe impl Send for CpalLoopbackCapture {}
 /// Which device a capture opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// The live remote-control path: the loopback / monitor source — and on
-    /// Linux, when no monitor exists, the default INPUT, as it always has.
-    LiveLoopback,
-    /// FR-85 recording's "computer audio": the loopback / monitor source
-    /// ONLY. ⚠️ Never the Linux fallback to the default input: that is a
-    /// microphone, which a recording captures only when the person asked
-    /// for the microphone.
+    /// "Computer audio", for a live session and a recording alike: the
+    /// loopback / monitor source ONLY. ⚠️ Never the default input on Linux:
+    /// that is a microphone, which a recording captures only when the person
+    /// asked for the microphone, and a live session never does. FR-97 P3c-1
+    /// removed the live path's own variant, which fell back to it.
     SystemOnly,
     /// FR-85 recording's microphone: the default input device.
     Microphone,
 }
 
 impl CpalLoopbackCapture {
-    /// Open the platform loopback source and start the RT→async bridge.
+    /// Open the platform loopback source for a live session and start the
+    /// RT→async bridge. A failure carries an [`crate::audio_source::AudioUnavailable`]
+    /// wherever the picker knows why.
     pub fn open() -> Result<Self> {
-        Self::open_source(Source::LiveLoopback)
+        Self::open_source(Source::SystemOnly)
     }
 
     /// Open `source` and start the RT→async bridge.
@@ -253,75 +254,52 @@ fn pick_device(host: &cpal::Host, source: Source) -> Result<(cpal::Device, bool)
     #[cfg(target_os = "windows")]
     {
         // WASAPI loopback: open the default OUTPUT device as an input.
-        let dev = host
-            .default_output_device()
-            .ok_or_else(|| anyhow!("no default output device for WASAPI loopback"))?;
+        let dev = host.default_output_device().ok_or_else(|| {
+            anyhow::Error::new(AudioUnavailable::new(
+                AudioUnavailableCode::NoOutput,
+                "no default output device for WASAPI loopback",
+            ))
+        })?;
         Ok((dev, true))
     }
     #[cfg(target_os = "linux")]
     {
-        use tunnel_core::env::node_env;
-        // 1. Explicit override via env.
-        if let Some(name) = node_env("AUDIO_SOURCE")
-            && !name.trim().is_empty()
-        {
-            if let Some(dev) = find_input_by_name(host, &name) {
-                tracing::info!(source = %name, "audio: using ROOMLERD_AUDIO_SOURCE monitor");
-                return Ok((dev, false));
+        // FR-97 P3c-1 — by name, over ONE enumeration (cpal opens every PCM
+        // to list it). ⚠️ No fallback to `host.default_input_device()`: on
+        // Linux that is the sound server's default source, the microphone,
+        // and it was the only thing this ever opened (`audio_source`).
+        let named = crate::audio_source::named();
+        let mut devices: Vec<(String, cpal::Device)> = host
+            .input_devices()
+            .map(|it| it.filter_map(|d| d.name().ok().map(|n| (n, d))).collect())
+            .unwrap_or_default();
+        let names: Vec<&str> = devices.iter().map(|(n, _)| n.as_str()).collect();
+        let i = crate::audio_source::pick_linux(named.as_deref(), &names)
+            .map_err(anyhow::Error::new)?;
+        let (name, dev) = devices.swap_remove(i);
+        match named.as_deref() {
+            Some(want) if want == name => {
+                tracing::info!(source = %name, "audio: opening the ROOMLERD_AUDIO_SOURCE device");
             }
-            tracing::warn!(
-                source = %name,
-                "audio: ROOMLERD_AUDIO_SOURCE not found among input devices — falling through to auto-detect"
-            );
+            Some(want) => tracing::warn!(
+                source = %want,
+                monitor = %name,
+                "audio: ROOMLERD_AUDIO_SOURCE is not a capture device here; opening the device named as a monitor"
+            ),
+            None => tracing::info!(source = %name, "audio: opening the device named as a monitor"),
         }
-        // 2. Auto: first input device whose name ends in `.monitor`
-        //    (Pulse exposes every sink's loopback that way).
-        if let Ok(inputs) = host.input_devices() {
-            for dev in inputs {
-                if let Ok(n) = dev.name()
-                    && n.ends_with(".monitor")
-                {
-                    tracing::info!(source = %n, "audio: auto-selected PulseAudio monitor source");
-                    return Ok((dev, false));
-                }
-            }
-        }
-        // A recording asked for computer audio, not a microphone.
-        if source == Source::SystemOnly {
-            return Err(anyhow!(
-                "no PulseAudio monitor source for computer audio (set ROOMLERD_AUDIO_SOURCE=<sink>.monitor)"
-            ));
-        }
-        // 3. Fallback: default input device (a mic, most likely — NOT
-        //    desktop audio, but better than a hard failure). Warn loudly.
-        let dev = host
-            .default_input_device()
-            .ok_or_else(|| anyhow!("no PulseAudio monitor and no default input device"))?;
-        tracing::warn!(
-            device = %dev.name().unwrap_or_else(|_| "<unknown>".into()),
-            "audio: no *.monitor source found — capturing the DEFAULT INPUT (likely a microphone, not desktop audio). Set ROOMLERD_AUDIO_SOURCE=<sink>.monitor to capture system audio."
-        );
         Ok((dev, false))
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = host;
-        Err(anyhow!("cpal loopback capture is Linux/Windows only"))
+        Err(anyhow::Error::new(
+            crate::audio_source::AudioUnavailable::new(
+                crate::audio_source::AudioUnavailableCode::NotSupported,
+                "cpal loopback capture is Linux/Windows only",
+            ),
+        ))
     }
-}
-
-/// Find an input device by exact name (Linux monitor selection).
-#[cfg(target_os = "linux")]
-fn find_input_by_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
-    let inputs = host.input_devices().ok()?;
-    for dev in inputs {
-        if let Ok(n) = dev.name()
-            && n == name
-        {
-            return Some(dev);
-        }
-    }
-    None
 }
 
 /// Convert a normalized `f32` sample in `[-1.0, 1.0]` to `i16`, clamping
