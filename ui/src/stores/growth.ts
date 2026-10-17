@@ -626,8 +626,19 @@ export interface ContentIndex {
   verdict?: string
   coverage_state?: string
   last_crawl_time?: string
-  inspected_at: string
+  /** When the verdict was read — never a later failed attempt's time;
+   *  absent while no inspection has succeeded. */
+  inspected_at?: string
+  /** The newest attempt. */
+  attempted_at?: string
+  /** The newest attempt's error, when it failed. */
   error?: string
+}
+
+/** How many final days of each Google window were pulled. */
+export interface ContentGoogleDays {
+  d7: number
+  d28: number
 }
 
 export interface ContentRow {
@@ -652,6 +663,8 @@ export interface ContentReport {
   web_not_measured?: NotMeasured
   /** The newest final Search Console day the Google cells end on. */
   google_through?: string
+  /** How many of each window's days were pulled; a missing one is uncounted, not 0. */
+  google_days?: ContentGoogleDays
   google_not_measured?: NotMeasured
   rows: ContentRow[]
 }

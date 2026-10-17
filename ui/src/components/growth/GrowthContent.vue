@@ -45,7 +45,11 @@
     <template v-if="report">
       <div class="text-caption text-medium-emphasis mb-2">
         web {{ report.since }} → {{ report.until }} · Google
-        <template v-if="report.google_through">7 / 28 days to {{ report.google_through }} (the newest final day)</template>
+        <template v-if="report.google_through">
+          7 / 28 days to {{ report.google_through }} (the newest final day)<template
+            v-if="googleDaysShort(report)"
+          >, {{ googleDaysShort(report) }}</template>
+        </template>
         <template v-else>not measured</template>
         · excluded {{ report.excluded.users }} users, {{ report.excluded.tenants }} orgs
         <template v-if="report.include_internal"> · INTERNAL INCLUDED</template>
@@ -80,7 +84,7 @@
             <th class="text-right" title="clicks · impressions · CTR · position">Google 28d</th>
             <th class="text-left">Top queries (28d)</th>
             <th class="text-left">Indexed</th>
-            <th class="text-right" :title="landingNote">Sign-ups</th>
+            <th class="text-right" :title="landingNote">Sign-ups (lower bound)</th>
           </tr>
         </thead>
         <tbody>
@@ -142,13 +146,25 @@
                 :title="r.index.not_measured"
               >not measured</v-chip>
               <template v-else>
-                <v-chip size="x-small" variant="tonal" :color="verdictColor(r.index.verdict)">
+                <v-chip
+                  v-if="r.index.inspected_at"
+                  size="x-small"
+                  variant="tonal"
+                  :color="verdictColor(r.index.verdict)"
+                >
                   {{ r.index.coverage_state || r.index.verdict || 'unknown' }}
+                </v-chip>
+                <v-chip v-else size="x-small" variant="tonal" color="grey" :title="r.index.error">
+                  never inspected
                 </v-chip>
                 <div class="text-caption text-medium-emphasis">
                   <template v-if="r.index.last_crawl_time">crawled {{ r.index.last_crawl_time.slice(0, 10) }} · </template>
-                  inspected {{ r.index.inspected_at.slice(0, 10) }}
-                  <template v-if="r.index.error"> · last attempt failed</template>
+                  <template v-if="r.index.inspected_at">inspected {{ r.index.inspected_at.slice(0, 10) }}</template>
+                  <template v-if="r.index.error">
+                    <span :title="r.index.error">
+                      · last attempt {{ (r.index.attempted_at || '').slice(0, 10) }} failed
+                    </span>
+                  </template>
                 </div>
               </template>
             </td>
@@ -156,6 +172,9 @@
           </tr>
         </tbody>
       </v-table>
+      <div v-if="report.rows.length" class="text-caption text-medium-emphasis mt-2">
+        Sign-ups are a lower bound: {{ landingNote }}.
+      </div>
       <v-alert v-else-if="!report.posts_not_measured" type="info" variant="tonal" density="compact">
         The blog's feed lists no post.
       </v-alert>
@@ -202,6 +221,14 @@ function searchLabel(c: SearchCell): string {
   if (typeof c.ctr === 'number') s += ` · ${pct(c.ctr)}`
   if (typeof c.position === 'number') s += ` · #${c.position}`
   return s
+}
+
+/** "3 of 7 and 20 of 28 days pulled" when a Google window is short of
+ *  final days — those days are uncounted, not zeros — else nothing. */
+function googleDaysShort(r: ContentReport): string {
+  const d = r.google_days
+  if (!d || (d.d7 >= 7 && d.d28 >= 28)) return ''
+  return `${d.d7} of 7 and ${d.d28} of 28 days pulled`
 }
 
 function verdictColor(v: string | null | undefined): string {

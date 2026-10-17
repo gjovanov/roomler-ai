@@ -20,7 +20,10 @@
 //!   by its path.
 //! * **Bing** (`source: bing` daily, `bing_weekly` per query and page) is
 //!   Bing's own grain: daily site totals, and weekly buckets per query and
-//!   page — never relabelled as 7- or 28-day windows.
+//!   page — never relabelled as 7- or 28-day windows. It is read only while
+//!   a `bing` pull succeeded in the last [`BING_PULL_LOOKBACK_DAYS`]
+//!   (`pulled` says which day): a failing pull reads "not measured" with
+//!   the attempt's error, never as old rows shown as current.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -40,6 +43,10 @@ use crate::state::AppState;
 pub const TOP_ROWS: usize = 10;
 /// How far back `through` is looked for.
 pub const THROUGH_LOOKBACK_DAYS: i64 = 14;
+/// How far back the newest successful Bing pull may lie. Bing's rows carry
+/// their own dates, but a pull that keeps failing must read as failing, not
+/// as old numbers shown as measured.
+pub const BING_PULL_LOOKBACK_DAYS: i64 = 3;
 
 /// Clicks, impressions and the derived cells of a set of rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -114,8 +121,14 @@ pub struct GoogleReport {
 /// Bing at its own grain.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BingReport {
-    /// The newest day of Bing's daily site totals on or before the day.
+    /// The newest day of Bing's daily site totals on or before the day —
+    /// or, with none stored (a zero is not stored), the day the pull covered.
     pub through: String,
+    /// The day the newest SUCCESSFUL Bing pull covered (its cycle's
+    /// yesterday): how fresh these numbers are. Older than
+    /// [`BING_PULL_LOOKBACK_DAYS`] and the section reads "not measured".
+    #[serde(default)]
+    pub pulled: String,
     pub clicks: Figure,
     pub impressions: Figure,
     /// Bing's newest weekly bucket on or before the day, and its top rows —
@@ -322,19 +335,24 @@ pub async fn google(
 }
 
 /// Pure: Bing's report — daily totals ending on the newest daily row on or
-/// before `day`, and the newest weekly bucket's top rows.
+/// before `day`, and the newest weekly bucket's top rows — for a pull that
+/// succeeded for the day `pulled`. With no daily row stored, the windows end
+/// on `pulled` and are zero: every call returns Bing's whole history, so a
+/// day without a row is a day without a click or an impression.
 pub fn bing_report(
     day: NaiveDate,
     daily: &[GrowthDaily],
     weekly: &[GrowthDaily],
-) -> Option<BingReport> {
+    pulled: &str,
+) -> BingReport {
     let d = day_str(day);
     let through = daily
         .iter()
         .filter(|r| r.day <= d)
         .map(|r| r.day.clone())
-        .max()?;
-    let t_date = NaiveDate::parse_from_str(&through, "%Y-%m-%d").ok()?;
+        .max()
+        .unwrap_or_else(|| pulled.to_string());
+    let t_date = NaiveDate::parse_from_str(&through, "%Y-%m-%d").unwrap_or(day);
     let d7 = day_str(t_date - Duration::days(6));
     let d28 = day_str(t_date - Duration::days(27));
     let fig = |metric: &str| {
@@ -378,21 +396,61 @@ pub fn bing_report(
         }
         rows
     };
-    Some(BingReport {
+    BingReport {
         through,
+        pulled: pulled.to_string(),
         clicks,
         impressions,
         top_queries_week: top_of("query"),
         top_pages_week: top_of("page"),
         week,
-    })
+    }
 }
 
-/// Bing's part of the `search` section for `day`.
+/// Bing's part of the `search` section for `day`. It reads the `bing` pull
+/// rows first: without one that succeeded in the [`BING_PULL_LOOKBACK_DAYS`]
+/// to `day`, the stored rows — however recent their own dates — are not
+/// shown as measured, and the reason names the newest failed attempt.
 pub async fn bing(state: &AppState, day: NaiveDate) -> Result<Measured<BingReport>, DigestError> {
-    let from = day_str(day - Duration::days(THROUGH_LOOKBACK_DAYS + 27));
     let to = day_str(day);
     let dao = GrowthDao::new(&state.db);
+    let pulls = dao
+        .pulls_between(
+            BING_SOURCE,
+            &day_str(day - Duration::days(BING_PULL_LOOKBACK_DAYS)),
+            &to,
+        )
+        .await?;
+    let pulled = pulls
+        .iter()
+        .filter(|p| p.status == PullStatus::Ok)
+        .map(|p| p.day.clone())
+        .max();
+    let Some(pulled) = pulled else {
+        return Ok(Measured::NotMeasured(
+            if !state.settings.growth.bing_configured() {
+                NotMeasured::now(
+                    "no Bing Webmaster API key configured (ROOMLER__GROWTH__BING_API_KEY)",
+                )
+            } else {
+                let days = BING_PULL_LOOKBACK_DAYS + 1;
+                let newest_failure = pulls
+                    .iter()
+                    .filter_map(|p| p.error.as_ref().map(|e| (p.day.clone(), e.clone())))
+                    .max();
+                not_pulled(
+                    state,
+                    match newest_failure {
+                        Some((d, e)) => format!(
+                            "no Bing pull succeeded in the {days} days to {to}; the attempt for {d}: {e}"
+                        ),
+                        None => format!("no Bing pull in the {days} days to {to}"),
+                    },
+                )
+            },
+        ));
+    };
+    let from = day_str(day - Duration::days(THROUGH_LOOKBACK_DAYS + 27));
     let daily = dao.read_daily_by(BING_SOURCE, "site", &from, &to).await?;
     let mut weekly = dao
         .read_daily_by(BING_WEEKLY_SOURCE, "query", &from, &to)
@@ -401,17 +459,7 @@ pub async fn bing(state: &AppState, day: NaiveDate) -> Result<Measured<BingRepor
         dao.read_daily_by(BING_WEEKLY_SOURCE, "page", &from, &to)
             .await?,
     );
-    Ok(match bing_report(day, &daily, &weekly) {
-        Some(r) => Measured::Value(r),
-        None => Measured::NotMeasured(if state.settings.growth.bing_configured() {
-            not_pulled(
-                state,
-                format!("no Bing day stored in the 42 days to {}", day_str(day)),
-            )
-        } else {
-            NotMeasured::now("no Bing Webmaster API key configured (ROOMLER__GROWTH__BING_API_KEY)")
-        }),
-    })
+    Ok(Measured::Value(bing_report(day, &daily, &weekly, &pulled)))
 }
 
 /// The `search` section for `day`.
@@ -431,7 +479,9 @@ pub struct PageSearch {
     pub top_queries_28d: Vec<SearchRow>,
 }
 
-/// Pure: the per-path cells over stored `page` and `page_query` rows.
+/// Pure: the per-path cells over stored `page` and `page_query` rows, keyed
+/// by the path WITHOUT its trailing slash: `https://roomler.ai/blog/a` and
+/// `…/blog/a/` (and any host) are one post, and their rows add up.
 pub fn per_path(
     through: NaiveDate,
     pages: &[GrowthDaily],
@@ -441,7 +491,12 @@ pub fn per_path(
     let t = day_str(through);
     let d7 = day_str(through - Duration::days(6));
     let d28 = day_str(through - Duration::days(27));
-    let path_key = |r: &GrowthDaily| r.dims.get("page").and_then(|p| path_of(p));
+    let path_key = |r: &GrowthDaily| {
+        r.dims
+            .get("page")
+            .and_then(|p| path_of(p))
+            .map(|p| p.trim_end_matches('/').to_string())
+    };
     let w7 = sums_by(pages, path_key, &d7, &t, ok);
     let w28 = sums_by(pages, path_key, &d28, &t, ok);
     let mut q: HashMap<String, HashMap<String, Sum>> = HashMap::new();
@@ -606,6 +661,15 @@ mod tests {
             20,
             9.0,
         ));
+        // The same post without its trailing slash: its own row, one post.
+        pages.extend(sc(
+            "2026-10-14",
+            "page",
+            &[("page", "https://roomler.ai/blog/a")],
+            2,
+            15,
+            4.0,
+        ));
         let mut pq = sc(
             "2026-10-14",
             "page_query",
@@ -630,12 +694,17 @@ mod tests {
         ));
         let okd = ok(&["2026-10-14", "2026-10-02"]);
         let m = per_path(d("2026-10-14"), &pages, &pq, &okd);
-        let a = &m["/blog/a/"];
-        assert_eq!((a.d7.clicks, a.d7.impressions), (4, 60));
+        assert_eq!(m.len(), 1, "one post, whatever the host or the slash");
+        let a = &m["/blog/a"];
+        assert_eq!(
+            (a.d7.clicks, a.d7.impressions),
+            (6, 75),
+            "/blog/a and /blog/a/ add up"
+        );
         assert_eq!(
             (a.d28.clicks, a.d28.impressions),
-            (5, 80),
-            "both hosts, one path"
+            (7, 95),
+            "both hosts and both forms, one path"
         );
         assert_eq!(a.top_queries_28d[0].key, "remote desktop");
         assert_eq!(a.top_queries_28d.len(), 2);
@@ -672,8 +741,9 @@ mod tests {
             week("2026-10-10", "roomler", "avg_impression_position_x10", 40),
             week("2026-10-03", "old", "clicks", 9),
         ];
-        let b = bing_report(d("2026-10-16"), &daily, &weekly).unwrap();
+        let b = bing_report(d("2026-10-16"), &daily, &weekly, "2026-10-15");
         assert_eq!(b.through, "2026-10-14");
+        assert_eq!(b.pulled, "2026-10-15");
         assert_eq!(
             b.clicks,
             Figure {
@@ -686,6 +756,11 @@ mod tests {
         assert_eq!(b.top_queries_week.len(), 1);
         assert_eq!(b.top_queries_week[0].cell.impressions, 50);
         assert_eq!(b.top_queries_week[0].cell.position, None);
-        assert!(bing_report(d("2026-10-16"), &[], &weekly).is_none());
+        // A pull that succeeded with no daily row stored: Bing returned its
+        // whole history, so the windows are zero, ending on the pulled day.
+        let quiet = bing_report(d("2026-10-16"), &[], &weekly, "2026-10-15");
+        assert_eq!(quiet.through, "2026-10-15");
+        assert_eq!(quiet.clicks, Figure::default());
+        assert_eq!(quiet.week.as_deref(), Some("2026-10-10"));
     }
 }

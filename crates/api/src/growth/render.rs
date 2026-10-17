@@ -1077,8 +1077,11 @@ pub(crate) fn search_blocks(out: &mut Vec<Block>, s: &Measured<super::search::Se
                 "Google, final through".into(),
                 format!("{} (Search Console's own day)", g.through),
             ));
-            out.push(Line("Clicks".into(), fig(&g.clicks)));
-            out.push(Line("Impressions".into(), fig(&g.impressions)));
+            out.push(Line("Clicks".into(), fig_over(&g.clicks, &g.days)));
+            out.push(Line(
+                "Impressions".into(),
+                fig_over(&g.impressions, &g.days),
+            ));
             out.push(Line("Days pulled".into(), fig(&g.days)));
             if let (Some(ctr), Some(pos)) = (g.d28.ctr, g.d28.position) {
                 out.push(Line(
@@ -1109,7 +1112,10 @@ pub(crate) fn search_blocks(out: &mut Vec<Block>, s: &Measured<super::search::Se
         Measured::Value(b) => {
             out.push(Line(
                 "Bing, daily through".into(),
-                format!("{} (Bing's own day)", b.through),
+                format!(
+                    "{} (Bing's own day; read by the pull for {})",
+                    b.through, b.pulled
+                ),
             ));
             out.push(Line("Bing clicks".into(), fig(&b.clicks)));
             out.push(Line("Bing impressions".into(), fig(&b.impressions)));
@@ -2442,6 +2448,44 @@ mod tests {
         assert!(
             text.contains(
                 "Release downloads (all time, a lower bound: the release listing hit the page bound): 50"
+            ),
+            "{text}"
+        );
+    }
+
+    /// P7 — the Search block: a Google window with no final day pulled reads
+    /// "—", never 0; Bing says which pull its numbers come from.
+    #[test]
+    fn search_reads_unpulled_windows_as_a_dash_and_names_bings_pull() {
+        use crate::growth::search::{BingReport, GoogleReport, SearchCell, SearchSection};
+        let f = |day: i64, d7: i64, d28: i64| Figure { day, d7, d28 };
+        let s = Measured::Value(SearchSection {
+            google: Measured::Value(GoogleReport {
+                through: "2026-10-10".into(),
+                clicks: f(0, 4, 9),
+                impressions: f(0, 80, 300),
+                d28: SearchCell::default(),
+                days: f(0, 3, 20),
+                top_queries_7d: vec![],
+                top_pages_7d: vec![],
+            }),
+            bing: Measured::Value(BingReport {
+                through: "2026-10-12".into(),
+                pulled: "2026-10-13".into(),
+                clicks: f(1, 2, 5),
+                impressions: f(10, 40, 90),
+                week: None,
+                top_queries_week: vec![],
+                top_pages_week: vec![],
+            }),
+        });
+        let mut out = Vec::new();
+        search_blocks(&mut out, &s);
+        let text = text_document("t", "i", &out);
+        assert!(text.contains("Clicks: — (7d 4 · 28d 9)"), "{text}");
+        assert!(
+            text.contains(
+                "Bing, daily through: 2026-10-12 (Bing's own day; read by the pull for 2026-10-13)"
             ),
             "{text}"
         );

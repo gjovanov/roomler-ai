@@ -910,8 +910,8 @@ revoke. Every pushed string is rendered as text; a URL becomes a link only when 
 
 The repository is a leading indicator: a star, a fork, a release download and a visit to the
 code arrive before a sign-up does, and at today's volume they are among the few numbers big
-enough to steer by. Spec §3k; P7's search half (Search Console, Bing, the blog's posts) is the
-next section, and the Content table that reads it comes with P7c.
+enough to steer by. Spec §3k; P7's search half (Search Console, Bing, the blog's posts) and the
+Content table that reads it are the next two sections.
 
 ```mermaid
 flowchart LR
@@ -1219,18 +1219,22 @@ flowchart LR
 ### The Content table — `GET /api/admin/growth/content?since&until&include_internal`
 
 [`content.rs`](../crates/api/src/growth/content.rs) (`compute`,
-[`:292`](../crates/api/src/growth/content.rs)) — platform admins and the read key, the empty
+[`:344`](../crates/api/src/growth/content.rs)) — platform admins and the read key, the empty
 404 otherwise and with `growth.enabled = false`, the Campaigns table's range rules (`since` /
 `until` inclusive, the 28 closed days ending yesterday by default).
 
 | Column | Source | Window |
 |---|---|---|
 | post, published | `growth_content` (the blog's own feed); posts in the feed first, newest first, then the ones that left it | — |
-| visitors, reads (and the read share from 30 pageviews), median read time, top 3 channels | purestat, **live** for the range — `path` with `visitors pageviews reads median_read_s`, and `path × referrer_host` mapped through the §3b channel table — unique visitors do not add across days, so the frozen daily path rows are not summed ([`web`, `:170`](../crates/api/src/growth/content.rs)) | `[since, until]` |
-| Google 7d and 28d: clicks, impressions, CTR, position; top 5 queries over 28 days | `growth_daily {source: search_console}` — the **`page`** breakdown, matched to the post by its path whatever the host, so the anonymised queries are in it; the `page_query` breakdown for the queries ([`per_path`, `search.rs:435`](../crates/api/src/growth/search.rs)) | the 7 and 28 days ending `google_through`, the newest final day pulled on or before `until` |
-| indexed | `growth_content.inspection`: Google's verdict and coverage state, the last crawl, when it was inspected, and the newest attempt's error if it failed | as of `inspected_at` |
-| sign-ups | `users.signup_attribution.landing_path` equal to the post's path (with or without its trailing slash), created in the range, the exclusion set applied ([`signups_by_path`, `:238`](../crates/api/src/growth/content.rs)) | `[since, until]` |
+| visitors, reads (and the read share from 30 pageviews), median read time, top 3 channels | purestat, **live** for the range — `path` with `visitors pageviews reads median_read_s`, and `path × referrer_host` mapped through the §3b channel table — unique visitors do not add across days, so the frozen daily path rows are not summed ([`fold_web`, `:234`](../crates/api/src/growth/content.rs)) | `[since, until]` |
+| Google 7d and 28d: clicks, impressions, CTR, position; top 5 queries over 28 days | `growth_daily {source: search_console}` — the **`page`** breakdown, matched to the post by its path whatever the host, so the anonymised queries are in it; the `page_query` breakdown for the queries ([`per_path`, `search.rs:485`](../crates/api/src/growth/search.rs)) | the 7 and 28 days ending `google_through`, the newest final day pulled on or before `until`; **`google_days`** says how many final days of each window were pulled, and the tab says so when a window is short — an unpulled day is uncounted, not a 0 |
+| indexed | `growth_content.inspection`: Google's verdict and coverage state, the last crawl, **when that verdict was read** (`inspected_at`, never a later failed attempt's time), and the newest attempt's time and error if it failed | as of `inspected_at` |
+| sign-ups | `users.signup_attribution.landing_path` equal to the post's path (with or without its trailing slash), created in the range, the exclusion set applied ([`signups_by_path`, `:290`](../crates/api/src/growth/content.rs)) | `[since, until]` |
 
+- **A post is its path without the trailing slash.** purestat and Google count `/blog/a` and
+  `/blog/a/` apart; their rows add up here — the web counts (visitors too, an upper bound when one
+  reader opened both; the median read time is the busier form's), the Google cells, and the
+  sign-ups.
 - **Small numbers stay honest**: CTR and position appear from 30 impressions, the read share from
   30 pageviews; below that the counts stand alone.
 - **Three cells**: no purestat key, a 401 or a timeout makes every web cell `not_measured` with
@@ -1241,7 +1245,8 @@ flowchart LR
 > ⚠️ **Sign-ups by landing path are a lower bound.** The site writes `landing_path` only on a
 > journey that began on a campaign link (FR-88's carry, `ui/docs/theme/attribution.js`); an
 > organic reader of a post who signs up carries none until FR-91 P3 builds the organic carry.
-> Every sign-up cell carries that note.
+> Every sign-up cell carries that note, and the tab says it in text under the table and in the
+> column's own header ("Sign-ups (lower bound)"), not only on hover.
 
 The SPA's `/observability/growth` gains a **Content** tab
 ([`GrowthContent.vue`](../ui/src/components/growth/GrowthContent.vue)): the range,
@@ -1252,24 +1257,26 @@ Search Console's own Performance report for that page and those days.
 
 ### The Search section — the digest and the weekly roll-up
 
-`growth::search::section` ([`search.rs:418`](../crates/api/src/growth/search.rs)) is the digest's
-`search` section ([`digest.rs:1096`](../crates/api/src/growth/digest.rs)) and, for Sunday, the
+`growth::search::section` ([`search.rs:466`](../crates/api/src/growth/search.rs)) is the digest's
+`search` section ([`digest.rs:1113`](../crates/api/src/growth/digest.rs)) and, for Sunday, the
 weekly roll-up's:
 
 | Part | What | Rule |
 |---|---|---|
-| `google.through` | the newest final day pulled on or before the digest's day (Google settles 2–3 days behind, so this lags) | [`through_of`, `:262`](../crates/api/src/growth/search.rs), 14 days back at most |
+| `google.through` | the newest final day pulled on or before the digest's day (Google settles 2–3 days behind, so this lags) | [`through_of`, `:275`](../crates/api/src/growth/search.rs), 14 days back at most |
 | `google.clicks`, `impressions` | day / 7d / 28d ending on `through`, from the `site` rows | only days with an `ok` pull; `days` says how many of each window that is |
 | `google.d28` | the 28 days' CTR and position | from 30 impressions; position weighted by impressions |
 | `google.top_queries_7d`, `top_pages_7d` | top 10 by clicks, then impressions | the `query` breakdown leaves Google's anonymised queries out; the `page` one holds every page |
-| `bing.through`, `clicks`, `impressions` | Bing's daily site totals, windows ending on its newest day | Bing's own (Pacific) days |
+| `bing.pulled` | the day the newest **successful** `bing` pull covered | read first: with none in the 4 days to the digest's day the part is `not_measured`, naming the newest failed attempt — a failing pull never shows old rows as current ([`bing`, `search.rs:414`](../crates/api/src/growth/search.rs)) |
+| `bing.through`, `clicks`, `impressions` | Bing's daily site totals, windows ending on its newest day (with no row stored, on `pulled`: Bing returned its whole history, so the windows are 0) | Bing's own (Pacific) days |
 | `bing.week`, `top_queries_week`, `top_pages_week` | Bing's newest weekly bucket and its top rows | a week as Bing cuts it, never a 7-day window; Bing's positions are not averaged |
 
-Each engine is `not_measured` with its reason (no key, nothing pulled yet, `saas` not mounted),
-never a 0; a digest stored before P7 reads `{not_measured, arrives_with: P7}` there. The email
-renders a **Search** block ([`search_blocks`, `render.rs:1051`](../crates/api/src/growth/render.rs))
-with the day Google is final through, the windows, the 28-day CTR and position, the top queries
-and pages, Bing's day and week, and a note on both lags.
+Each engine is `not_measured` with its reason (no key, nothing pulled yet, a pull failing, `saas`
+not mounted), never a 0; a digest stored before P7 reads `{not_measured, arrives_with: P7}` there.
+The email renders a **Search** block ([`search_blocks`, `render.rs:1064`](../crates/api/src/growth/render.rs))
+with the day Google is final through, the windows (`—` for one with no final day pulled), the
+28-day CTR and position, the top queries and pages, Bing's day, its pull and its week, and a note
+on both lags.
 
 ## The newsletter: delivery, per-issue tags and unsubscribes (P5)
 
@@ -1427,7 +1434,7 @@ with its reason on hover, a rate appears only with n ≥ 30, subjects are render
 
 **In the digest**, the `newsletter` section gains `delivery` — the day's (and 7/28 days')
 delivered, bounced (hard), dropped, spam reports and addresses suppressed, by each event's own
-time ([`delivery_figures`, digest.rs:1816](../crates/api/src/growth/digest.rs)), `not_measured`
+time ([`delivery_figures`, digest.rs:1860](../crates/api/src/growth/digest.rs)), `not_measured`
 on a server without the webhook — `unsubscribed_via_issue`, and per issue sent that day its
 delivery so far and its unsubscribes, by the same reads and the same three cells as the table.
 
@@ -1604,9 +1611,9 @@ current month.
 - **In the digest**, the revenue section gains `billed` — MRR at the day's end per currency;
   the day's (and 7/28 days') invoices, billed cash, failed payments, first payments,
   cancellations and trials; `record_since` and `backfilled`
-  ([`billed_figures`, digest.rs:2007](../crates/api/src/growth/digest.rs)) — and `upgrade_intent`,
+  ([`billed_figures`, digest.rs:2051](../crates/api/src/growth/digest.rs)) — and `upgrade_intent`,
   the windows' collisions and the orgs that hit hardest
-  ([`upgrade_intent_section`, digest.rs:2099](../crates/api/src/growth/digest.rs)). The
+  ([`upgrade_intent_section`, digest.rs:2143](../crates/api/src/growth/digest.rs)). The
   estimate keeps its line and its label.
 - The SPA's `/observability/growth` gains a **Revenue** tab
   ([`GrowthRevenue.vue`](../ui/src/components/growth/GrowthRevenue.vue)); the Overview's funnel

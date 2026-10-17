@@ -961,13 +961,27 @@ fn bing(base: &str, key: &str) -> BingClient {
     .unwrap()
 }
 
+/// The digest's Bing part for `day`, as JSON.
+async fn read(state: &roomler_ai_api::state::AppState, day: NaiveDate) -> Value {
+    serde_json::to_value(
+        roomler_ai_api::growth::search::bing(state, day)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
 /// The daily totals and the weekly buckets land at Bing's own grain inside
 /// their horizons, under Bing's (Pacific) dates; a refused key is recorded
-/// on the cycle's row with Bing's code.
+/// on the cycle's row with Bing's code. The reader (P7c) shows Bing only
+/// while a pull succeeded in its lookback, and a failing one says why.
 #[tokio::test]
 async fn bing_lands_at_its_own_grain_and_a_refused_key_is_recorded() {
     let (base, fake) = fake_bing().await;
-    let app = TestApp::spawn().await;
+    let with_key = |key: &'static str| {
+        move |s: &mut roomler_ai_config::Settings| s.growth.bing_api_key = key.into()
+    };
+    let app = TestApp::spawn_with_settings(with_key("good")).await;
     let t = today();
     let r = bing_pull::run_once(&app.state.core, &bing(&base, "good"), at_day(t, 4))
         .await
@@ -1049,7 +1063,23 @@ async fn bing_lands_at_its_own_grain_and_a_refused_key_is_recorded() {
         .unwrap();
     assert!(!again.due);
 
-    let bad_app = TestApp::spawn().await;
+    // The reader: Bing as the pull for yesterday read it, its daily window
+    // ending on its newest row.
+    let b = read(&app.state, t - Duration::days(1)).await;
+    assert_eq!(b["pulled"], json!(y), "{b}");
+    assert_eq!(b["through"], json!(ds(t - Duration::days(2))));
+    assert_eq!(b["clicks"]["day"], 3);
+    // Four days on with no pull since, the same rows are not shown as
+    // current: "not measured", and why.
+    let stale = read(&app.state, t + Duration::days(3)).await;
+    assert!(
+        stale["not_measured"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("no Bing pull in the 4 days to")),
+        "{stale}"
+    );
+
+    let bad_app = TestApp::spawn_with_settings(with_key("revoked")).await;
     let r = bing_pull::run_once(&bad_app.state.core, &bing(&base, "revoked"), at_day(t, 4))
         .await
         .unwrap();
@@ -1061,6 +1091,13 @@ async fn bing_lands_at_its_own_grain_and_a_refused_key_is_recorded() {
         Some(("failed".into(), Some(reason.into())))
     );
     assert_eq!(count(&bad_app, GROWTH_DAILY, doc! {}).await, 0);
+    // A failing pull reads as failing, with the attempt's own reason.
+    let failing = read(&bad_app.state, t - Duration::days(1)).await;
+    let why = failing["not_measured"].as_str().unwrap_or_default();
+    assert!(
+        why.starts_with("no Bing pull succeeded in the 4 days to") && why.contains(reason),
+        "{failing}"
+    );
 }
 
 // ── The readers: the Content table and the digest's Search section ──────
@@ -1158,6 +1195,8 @@ async fn the_content_table_and_the_digest_read_what_the_pullers_stored() {
     assert_eq!(r.status().as_u16(), 200);
     let j: Value = r.json().await.unwrap();
     assert_eq!(j["google_through"], json!(d1));
+    // Every final day of both windows was pulled (no data is still a day).
+    assert_eq!(j["google_days"], json!({ "d7": 7, "d28": 28 }), "{j}");
     assert_eq!(
         j["web_not_measured"]["not_measured"], "purestat key not configured",
         "{j}"
@@ -1177,6 +1216,13 @@ async fn the_content_table_and_the_digest_read_what_the_pullers_stored() {
     assert!((d7["ctr"].as_f64().unwrap() - 4.0 / 150.0).abs() < 1e-9);
     assert_eq!(a["google"]["top_queries_28d"][0]["key"], "remote desktop");
     assert_eq!(a["index"]["verdict"], "PASS");
+    assert!(
+        a["index"]["inspected_at"]
+            .as_str()
+            .is_some_and(|s| s.starts_with(&ds(t))),
+        "the verdict's own time: {}",
+        a["index"]
+    );
     assert_eq!(a["signups"]["count"], 1, "the admin's sign-up is excluded");
     // Post B: 20 impressions — counts, no rate.
     let b = &rows[0];
