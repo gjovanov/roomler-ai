@@ -90,7 +90,8 @@ import {
 import { keepBusySetMessage, parseKeepBusyState, type KeepBusyRequest, type KeepBusyState } from './keepBusy'
 import { parseDisplayMatchState, type DisplayMatchState } from './displayMatch'
 import { createRelAccumulator, relativeButtonMessage } from './relativeMouse'
-import { createPointerPressTracker, releaseForCancelledPointer } from './touchInput'
+import { createPointerPressTracker, releaseForCancelledPointer, stageTouchAction } from './touchInput'
+import { createDirectGestures, createWheelSteps, type GestureAction, type TouchSample } from './touchGestures'
 import { parseFeaturesRefused } from './useSessionFeatures'
 
 /**
@@ -9912,6 +9913,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
        *  text + a manual Copy button so the operator can still get
        *  the content. */
       onClipboardMirrored?: (text: string, ok: boolean) => void
+      /** FR-111 — a two-finger pinch on the stage: zoom the viewer's own
+       *  picture by `factor` around the client point (`cx`, `cy`). Nothing is
+       *  sent to the host. */
+      onPinchZoom?: (factor: number, cx: number, cy: number) => void
     }
   ): () => void {
     // Locate the <video> once, fall back gracefully if the layout changes.
@@ -10064,6 +10069,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
 
     function onPointerMove(ev: PointerEvent) {
+      // FR-111 — a finger's moves are the recognizer's to read.
+      if (isGestureTouch(ev)) {
+        runGestures(touchGestures.move(touchSample(ev)))
+        return
+      }
       // FR-109 — under Pointer Lock the position is frozen and only the
       // deltas mean anything; they go out as `mouse_rel` at the input gap.
       if (relativeMouse.value) {
@@ -10098,6 +10108,17 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
 
     function onPointerDown(ev: PointerEvent) {
       ev.preventDefault()
+      // FR-111 — a finger presses nothing yet: the recognizer decides what it
+      // is (a tap, a drag, a long press, half of a two-finger gesture). One
+      // landing outside the picture starts nothing, as a mouse press there
+      // does, but a second finger during a gesture still counts.
+      if (isGestureTouch(ev)) {
+        if (!normalisedXY(ev).insideVideo && !touchGestures.active()) return
+        if (!touchGestures.active()) touchWheel.reset()
+        try { surface.setPointerCapture(ev.pointerId) } catch { /* noop */ }
+        runGestures(touchGestures.down(touchSample(ev)))
+        return
+      }
       // FR-109 — relative mode presses where the host's pointer is. The
       // motion gathered so far goes first, so the press lands after it.
       if (relativeMouse.value) {
@@ -10119,6 +10140,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
 
     function onPointerUp(ev: PointerEvent) {
+      if (isGestureTouch(ev)) {
+        try { surface.releasePointerCapture(ev.pointerId) } catch { /* noop */ }
+        runGestures(touchGestures.up(touchSample(ev)))
+        return
+      }
       pointerPresses.end(ev.pointerId)
       if (relativeMouse.value) {
         flushRel()
@@ -10150,6 +10176,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // drag (P0 measured exactly that). A cancel's position is not worth
     // trusting: release at the last point the pointer reached.
     function onPointerCancel(ev: PointerEvent) {
+      if (isGestureTouch(ev)) {
+        runGestures(touchGestures.cancel(ev.pointerId))
+        return
+      }
       const btn = pointerPresses.end(ev.pointerId)
       if (btn === undefined) return
       if (relativeMouse.value) {
@@ -10247,6 +10277,80 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // cursor. ⚠️ Every pointer MOVE updates it (onPointerMove), not only a
     // press: a press-only value is exactly the teleport this exists to avoid.
     let lastPointerNorm = { x: 0.5, y: 0.5 }
+
+    // FR-111 P1 — a finger goes through the gesture recognizer (direct mode:
+    // tap, drag, long press, two-finger tap / scroll, pinch); a mouse or a pen
+    // keeps the paths above. `roomler-rc-touch=legacy` sends a finger down the
+    // mouse's path, as before FR-111.
+    const touchGestures = createDirectGestures()
+    // A two-finger scroll's pixels, let out as whole agent wheel steps: the
+    // agent rounds every frame on its own, so a few pixels each would scroll
+    // nothing (the field showed exactly that).
+    const touchWheel = createWheelSteps()
+    const touchGesturesOn = stageTouchAction((() => {
+      try {
+        return globalThis.localStorage
+      } catch {
+        return null
+      }
+    })()) === 'none'
+    let longPressTimer: ReturnType<typeof setTimeout> | null = null
+    function isGestureTouch(ev: PointerEvent): boolean {
+      return touchGesturesOn && ev.pointerType === 'touch' && !relativeMouse.value
+    }
+    function touchSample(ev: PointerEvent): TouchSample {
+      const { x, y } = normalisedXY(ev)
+      return {
+        id: ev.pointerId,
+        px: ev.clientX,
+        py: ev.clientY,
+        nx: Math.min(1, Math.max(0, x)),
+        ny: Math.min(1, Math.max(0, y)),
+        t: performance.now(),
+      }
+    }
+    function runGestures(actions: GestureAction[]) {
+      for (const a of actions) {
+        switch (a.kind) {
+          case 'press':
+            cancelPendingMove()
+            lastPointerNorm = { x: a.x, y: a.y }
+            sendInput({ t: 'mouse_button', btn: a.btn, down: true, x: a.x, y: a.y, mon: 0 })
+            heldInputs.button(a.btn, true)
+            break
+          case 'move':
+            lastPointerNorm = { x: a.x, y: a.y }
+            pendingMove = { x: a.x, y: a.y, mon: 0 }
+            schedulePendingMove()
+            break
+          case 'release':
+            cancelPendingMove()
+            sendInput({ t: 'mouse_button', btn: a.btn, down: false, x: a.x, y: a.y, mon: 0 })
+            heldInputs.button(a.btn, false)
+            break
+          case 'wheel': {
+            const step = touchWheel.add(a.dx, a.dy)
+            if (step) sendInput({ t: 'mouse_wheel', dx: step.dx, dy: step.dy, mode: 'pixel' })
+            break
+          }
+          case 'zoom':
+            options?.onPinchZoom?.(a.factor, a.cx, a.cy)
+            break
+        }
+      }
+      // Re-arm the long press for whatever the recognizer waits on now.
+      if (longPressTimer !== null) {
+        clearTimeout(longPressTimer)
+        longPressTimer = null
+      }
+      const due = touchGestures.deadline()
+      if (due !== null) {
+        longPressTimer = setTimeout(() => {
+          longPressTimer = null
+          runGestures(touchGestures.tick(performance.now()))
+        }, Math.max(0, due - performance.now()) + 5)
+      }
+    }
 
     function releaseHeldInputs() {
       // A pending Ctrl+V deferral must not fire its 50 ms fallback AFTER
@@ -10735,6 +10839,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       surface.removeEventListener('wheel', onWheel)
       surface.removeEventListener('contextmenu', onContextMenu)
       window.removeEventListener('paste', onPaste)
+      if (longPressTimer !== null) clearTimeout(longPressTimer)
       // Release anything still held on the host BEFORE the channels close
       // (detach mid-chord must not leave a stuck modifier behind).
       releaseHeldInputs()

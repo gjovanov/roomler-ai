@@ -3054,6 +3054,32 @@ const stageTouchActionCss = (() => {
   }
   return stageTouchAction(storage)
 })()
+/** FR-111 — a pinch zooms the viewer's own picture (nothing reaches the host),
+ *  around the point between the fingers, so what they were over stays under
+ *  them. It switches to Custom zoom, starting from the size the picture is
+ *  shown at, and the stage (which scrolls in Custom zoom) follows the point. */
+function onPinchZoom(factor: number, cx: number, cy: number) {
+  const el = stageEl.value as HTMLElement | null
+  const w = videoIntrinsicW.value
+  if (!el || !Number.isFinite(w) || w <= 0) return
+  const shown = Array.from(el.querySelectorAll<HTMLElement>('.remote-video'))
+    .map((m) => m.getBoundingClientRect())
+    .find((r) => r.width > 0)
+  if (!shown) return
+  const from = rc.scaleMode.value === 'custom' ? rc.scaleCustomPercent.value : (shown.width / w) * 100
+  if (rc.scaleMode.value !== 'custom') rc.setScaleMode('custom')
+  rc.setScaleCustomPercent(from * factor)
+  const ratio = rc.scaleCustomPercent.value / from
+  const stage = el.getBoundingClientRect()
+  const ox = cx - stage.left
+  const oy = cy - stage.top
+  const px = el.scrollLeft + ox
+  const py = el.scrollTop + oy
+  void nextTick(() => {
+    el.scrollLeft = px * ratio - ox
+    el.scrollTop = py * ratio - oy
+  })
+}
 /** FR-109 — the toolbar control: a click is the gesture Pointer Lock needs.
  *  Once locked the pointer is hidden, so leaving is Esc (the browser's own
  *  rule); a click while locked leaves too, for a lock the page still sees. */
@@ -4512,6 +4538,7 @@ watch(
   ([phase, el]) => {
     if (phase === 'connected' && el && !detachInput) {
       detachInput = rc.attachInput(el as HTMLElement, {
+        onPinchZoom,
         // Phase 5: when the operator hits Ctrl+V over the viewer
         // with files in their OS clipboard, route to the upload
         // pipeline. The composable suppresses the Ctrl+V keystroke

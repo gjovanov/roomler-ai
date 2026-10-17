@@ -58,6 +58,22 @@ flowchart LR
   the viewer's picture locally and sends nothing.
 - A second finger cancels a pending single-finger press instead of dragging with it.
 
+*As built (P1):*
+- **The stage** sets `touch-action: none`, decided by `touchInput.ts` `stageTouchAction` (the kill switch
+  is the storage word `legacy`). A mouse or pen pointer the browser cancels releases exactly the button it
+  pressed (`createPointerPressTracker`, `releaseForCancelledPointer`).
+- **The gestures** are a pure state machine, `touchGestures.ts` `createDirectGestures`: touch samples in,
+  mouse actions out, no DOM and no timers. Its thresholds: an 8 px slop, a 500 ms long press, a 350 ms
+  two-finger tap, a 24 px pinch. A press is decided only once the finger says what it is. A tap clicks
+  where it landed; a drag presses where it landed and releases where it lifts; a long press clicks the
+  right button where it is. A two-finger tap clicks the right button between the fingers. A scroll is
+  `mouse_wheel` in pixels with natural direction. A pinch zooms the viewer.
+- **The wiring** (`useRemoteControl.ts`) routes only `pointerType === 'touch'` through the recognizer and
+  re-arms the long press at its deadline. A finger that lands outside the picture starts nothing, as a mouse
+  press there does, but a second finger during a gesture still counts.
+- **The zoom** (`RemoteControl.vue` `onPinchZoom`) switches to Custom zoom from the size shown, and keeps
+  the point between the fingers under them by scrolling the stage.
+
 ### 3b. Trackpad mode (P2)
 
 - The screen acts like a laptop trackpad. A one-finger drag moves the host's pointer by the finger's delta,
@@ -100,7 +116,7 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | Probes: (1) **red first**, a one-finger drag on today's stage in touch emulation, read on a vmtest Win11 host by a raw-input probe that counts button downs and ups; (2) what each engine's touch emulation gives Playwright (taps, drags, two-finger gestures), for the ACs' cells | docs only | spec and claim 2026-10-17. **(1) measured** (§8 row 1): in Chromium's touch emulation a drag is taken as a pan after 69 ms, and the host's button stays down until something else releases it. (2) is measured for Chromium only (CDP touch events reach the page and its gesture handling); WebKit and Firefox are owed |
-| P1 | Touch on the stage (3a) | viewer storage key `roomler-rc-touch=legacy` | — |
+| P1 | Touch on the stage (3a) | viewer storage key `roomler-rc-touch=legacy` | **built** (3a "as built"): the stage keeps every touch, a cancelled pointer lets go, and the direct-mode gestures. Unit tests: `touchInput.spec.ts` (8), `touchGestures.spec.ts` (11), vitest 2173. A negative control, a press tracker that never forgets a pointer, failed 3 tests. **Field-green on a candidate bundle** (this branch's `ui/dist` served into the page, §8 rows 2–4). It gets re-checked once a promote serves it |
 | P2 | Trackpad mode (3b) | the mode switch | — |
 | P3 | On-screen controls and built-in presets (3c) | the overlay's toggle | — |
 | P4 | Editor, macros, tenant presets (3d) | — | — |
@@ -109,11 +125,15 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1 (red first):** a one-finger drag on the stage of a touch browser ends with the host's button
+- [x] **AC1 (red first):** a one-finger drag on the stage of a touch browser ends with the host's button
   released (a raw-input probe on a vmtest Win11 host counts downs and ups). Red: today a drag the browser
-  cancels leaves it down.
-- [ ] **AC2:** in direct mode, long press and two-finger tap give the right button, two-finger drag scrolls
-  the host, and a pinch zooms only the viewer (nothing reaches the host).
+  cancels leaves it down. **Verified** on a candidate bundle (§8 rows 1–3). Red: production's viewer left the
+  press without a release for 4.6 s. Green: the press and its release 484 ms apart, and with the browser
+  free to cancel (the legacy switch), 78 ms apart. It gets re-checked once a promote serves P1.
+- [x] **AC2:** in direct mode, long press and two-finger tap give the right button, two-finger drag scrolls
+  the host, and a pinch zooms only the viewer (nothing reaches the host). **Verified** on a candidate bundle
+  (§8 row 4). The host read a right click for each, one wheel notch for a 135 px scroll, and nothing for a
+  pinch that zoomed the picture five times. It gets re-checked once a promote serves P1.
 - [ ] **AC3:** trackpad mode moves the host's pointer relatively, on an agent that advertises `mouse-rel`
   and on an older one, and a tap clicks where the pointer is.
 - [ ] **AC4:** on-screen buttons and the d-pad reach the host as the keys they name, read by a test-only
@@ -132,6 +152,11 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
    Alt+Tab, Ctrl+C / V / Z).
 3. **G3 at all.** Native touch injection only if a host app needs real touch (a touch-first Windows app)
    once G1 and G2 exist.
+4. **Panning a zoomed picture on a phone.** In P1, two fingers moving together scroll the host, so a picture
+   zoomed past the stage is moved around by zooming out and back in elsewhere (the zoom keeps the point
+   between the fingers under them). Recommended: while the picture is larger than the stage, two fingers
+   pan the picture and the host scrolls only when it fits, with a one-line hint. The trackpad mode (P2)
+   could instead pan to follow the host's pointer.
 
 ## 7. Out of scope
 
@@ -144,6 +169,9 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
 | # | Date | Cell | Result |
 |---|---|---|---|
 | 1 | 2026-10-17 | **P0 (1), the red: a one-finger drag on today's stage.** A fresh vmtest Win11 `--type system` guest (`vmtest-w-ins-sys-065622`) on agent 0.4.140, with `vmtest` Active at the console. The production viewer (`hosted-20261016-377f1d4`) ran in Chromium's mobile emulation (Playwright's Pixel 7: `isMobile`, `hasTouch`, a 394×725 stage), driven from the vmtest harness host. It sent real touch input through CDP `Input.dispatchTouchEvent`: a one-finger drag of 12 moves across the stage, then a plain tap as the control. A capture-phase hook logged every pointer event the page saw and every `mouse_button` the viewer sent. A test-only probe on the guest, run as the person, kept a timeline of the left button's raw downs and ups | **A drag the browser takes over leaves the host's button down.** The finger's `pointerdown` made the viewer send `mouse_button {left, down:true}`. 69 ms later Chromium fired `pointercancel`, taking the gesture as a pan, and no `pointerup` came, so no release was sent. The host's probe read the drag's press at 12.718 s and **then no release**. The tap 4.6 s later read `D@17312 U@17312`, and the tap's up is what let go. So the host's left button stays down until something else releases it, and the next touch's moves become a drag. The control tap sent its down and up within 1 ms, and the host saw both. **Wrong turn:** the first run (07:10Z) showed the same on the viewer side (`pointercancel` 78 ms after the press, no release sent). Its probe did not compile: a field named `Events` hid `Component.Events`, and Add-Type treats that warning as an error. Renamed, the probe ran in the second run |
+| 2 | 2026-10-17 | **AC1, the green: the stage keeps the drag (a candidate bundle).** Row 1's guest, cell and probe. The viewer was P1a's own `ui/dist`, served into the page on the real origin by Playwright (documents get its `index.html`, `/assets/*` comes from the bundle, `/api` and `/ws` go to production), so the cell needed no promote. The page ran `/assets/index-DHl0de8i.js` | **The drag completes, and its release reaches the host.** The stage reported `touch-action: none`. Chromium no longer cancelled: the drag delivered 14 moves, and the viewer sent the release at the drag's end point. The host read the press and its release **484 ms apart** (`D@12047 U@12531`). The control tap read `D@16531 U@16531` |
+| 3 | 2026-10-17 | **AC1's other half: a cancel that happens anyway is released.** The same, with the kill switch `roomler-rc-touch=legacy` set, so the stage was `touch-action: auto` and the browser free to cancel | **The cancel handler lets go at once.** Chromium cancelled 91 ms into the drag, and the viewer sent `mouse_button {left, up}` at the last point the finger reached, in the same millisecond. The host read the press and its release **78 ms apart** (`D@9203 U@9281`) |
+| 4 | 2026-10-17 | **AC2: the direct-mode gestures (a candidate bundle).** The same guest, with P1's own `ui/dist` in Chromium's Pixel 7 emulation. Real CDP multi-touch, 2.5 s apart: a tap (the control), a long press (800 ms), a two-finger tap (100 ms), a two-finger drag upwards (10 steps, about 135 px) and a pinch outwards. The host's probe kept a timeline of both buttons and the wheel | **Each gesture reaches the host as what it means.** Tap: `L l`, a left click. Long press: a right click 509 ms after the finger landed (`R r`). Two-finger tap: a right click between the fingers (`R r`). Scroll: **one** `mouse_wheel {dy: 100}`, which the host read as `W-120`, one notch down (the fingers went up). Pinch: the picture went from 394 to 1979 px wide, and the host read **nothing**. **Wrong turns, three runs:** the first run aimed the tap and the scroll at the stage's box, and the second at the picture element's box. On a phone the picture is letterboxed inside both, so both times the two gestures landed outside it and, as designed, did nothing. The third run aimed at the picture's own rectangle. **A finding that changed the code:** in that run the viewer sent 21 wheel frames of 6–12 px and the host read none. The agent rounds every frame to a 100 px step on its own (`enigo_backend.rs` `wheel_to_steps`), so the viewer now gathers a gesture's pixels and sends whole steps (`createWheelSteps`). The run above is with that change |
 
 ## 9. Related
 
