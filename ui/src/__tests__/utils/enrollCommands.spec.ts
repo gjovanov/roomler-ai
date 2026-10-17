@@ -16,14 +16,18 @@ describe('enrollCommands', () => {
   const ORIGIN = 'https://example.roomler.test'
   const TOKEN = 'eyJTOKEN'
   const SCOPES = ['system', 'machine', 'user'] as const
+  const manualOf = (os: OsCommands) => os.blocks.find((b) => b.id.endsWith('-manual'))!
 
-  it('covers all three OSes with three blocks each, for both kinds and every scope', () => {
+  it('covers all three OSes for both kinds and every scope', () => {
     for (const kind of ['agent', 'tunnel'] as const) {
       for (const scope of SCOPES) {
         const all = enrollCommands(kind, ORIGIN, TOKEN, scope)
         expect(all.map((o) => o.os)).toEqual(['windows', 'linux', 'macos'])
         for (const os of all) {
-          expect(os.blocks).toHaveLength(3)
+          // Script, wizard, manual — less the wizard where it cannot install
+          // an agent (FR-97 D5, below).
+          const wizardInstallsIt = kind === 'tunnel' || os.os === 'windows'
+          expect(os.blocks).toHaveLength(wizardInstallsIt ? 3 : 2)
           for (const block of os.blocks) {
             if (!block.isDownload) expect(block.command).toContain(TOKEN)
             expect(block.command).toContain(ORIGIN)
@@ -46,15 +50,15 @@ describe('enrollCommands', () => {
     expect(macos!.blocks[0]!.command).not.toContain('--system')
     // Manual enrolls use the unified daemon binary; S1b: SystemContext
     // reads the machine-global config, so its enroll writes it.
-    expect(windows!.blocks[2]!.command).toMatch(/^roomlerd enroll /)
-    expect(windows!.blocks[2]!.command).toContain('--machine-global')
-    expect(linux!.blocks[2]!.command).toMatch(
+    expect(manualOf(windows!).command).toMatch(/^roomlerd enroll /)
+    expect(manualOf(windows!).command).toContain('--machine-global')
+    expect(manualOf(linux!).command).toMatch(
       /^sudo roomlerd --config \/etc\/roomler\/config\.toml enroll /,
     )
-    expect(linux!.blocks[2]!.command).toContain(`--server ${ORIGIN}`)
+    expect(manualOf(linux!).command).toContain(`--server ${ORIGIN}`)
     // NOT `roomlerd`: on macOS the daemon lives inside the .app bundle and no
     // binary by that name exists anywhere on the machine.
-    expect(macos!.blocks[2]!.command).toMatch(/^\/Library\/Roomler\/roomlerd\.app\S* enroll /)
+    expect(manualOf(macos!).command).toMatch(/^\/Library\/Roomler\/roomlerd\.app\S* enroll /)
   })
 
   it('maps the user scope to the per-user roles', () => {
@@ -63,11 +67,11 @@ describe('enrollCommands', () => {
     expect(linux!.blocks[0]!.command).toContain('--role daemon')
     expect(linux!.blocks[0]!.command).not.toContain('--system')
     for (const os of [windows!, linux!]) {
-      expect(os.blocks[2]!.command).toMatch(/^roomlerd enroll /)
+      expect(manualOf(os).command).toMatch(/^roomlerd enroll /)
     }
     // macOS resolves to the bundle executable — see above.
-    expect(macos!.blocks[2]!.command).toMatch(/^\/Library\/Roomler\/roomlerd\.app\S* enroll /)
-    expect(windows!.blocks[2]!.command).not.toContain('--machine-global')
+    expect(manualOf(macos!).command).toMatch(/^\/Library\/Roomler\/roomlerd\.app\S* enroll /)
+    expect(manualOf(windows!).command).not.toContain('--machine-global')
   })
 
   it('maps the machine scope to the attended role without machine-global', () => {
@@ -75,10 +79,10 @@ describe('enrollCommands', () => {
     expect(windows!.blocks[0]!.command).toContain('-Role daemon-machine')
     // S1b: a plain-SCM service reads the per-user config — machine-global
     // is the SystemContext flavour's config source ONLY.
-    expect(windows!.blocks[2]!.command).not.toContain('--machine-global')
+    expect(manualOf(windows!).command).not.toContain('--machine-global')
     // Linux has no attended/SystemContext split — machine-wide = --system.
     expect(linux!.blocks[0]!.command).toContain('--role daemon --system')
-    expect(linux!.blocks[2]!.command).toMatch(/^sudo roomlerd --config /)
+    expect(manualOf(linux!).command).toMatch(/^sudo roomlerd --config /)
     expect(macos!.blocks[0]!.command).not.toContain('--system')
   })
 
@@ -121,13 +125,25 @@ describe('enrollCommands', () => {
 
   it('wizard downloads hit the setup proxy with valid platform slugs', () => {
     // setup_release.rs::normalise_platform accepts windows|linux|macos.
-    const all = enrollCommands('agent', ORIGIN, TOKEN)
+    const all = enrollCommands('tunnel', ORIGIN, TOKEN)
     const downloads = all.map((o) => o.blocks.find((b) => b.isDownload)!)
     expect(downloads.map((d) => d.command)).toEqual([
       `${ORIGIN}/api/setup/windows`,
       `${ORIGIN}/api/setup/linux`,
       `${ORIGIN}/api/setup/macos`,
     ])
+  })
+
+  it('offers the wizard for an agent only where it installs one (FR-97 D5)', () => {
+    // Off Windows, Roomler Setup installs the tunnel client and nothing else
+    // (`agents/roomler-setup`): offered for an agent there, it could not
+    // enroll the device the token was minted for.
+    for (const scope of SCOPES) {
+      const offered = enrollCommands('agent', ORIGIN, TOKEN, scope)
+        .filter((o) => o.blocks.some((b) => b.isDownload))
+        .map((o) => o.os)
+      expect(offered, scope).toEqual(['windows'])
+    }
   })
 
   it('never emits the retired binary names or a hardcoded server', () => {
@@ -209,7 +225,7 @@ describe('enrollCommands — the anchor command (FR-104)', () => {
     }
     for (const os of enrollCommands('agent', ORIGIN, TOKEN, 'system', true).slice(1)) {
       expect(anchorBlock(os)).toBeUndefined()
-      expect(os.blocks).toHaveLength(3)
+      expect(os.blocks).toHaveLength(2)
     }
     for (const os of enrollCommands('tunnel', ORIGIN, TOKEN, 'system', true)) {
       expect(anchorBlock(os)).toBeUndefined()
