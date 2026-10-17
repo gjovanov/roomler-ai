@@ -39,7 +39,7 @@ use tracing::{debug, info, warn};
 
 use crate::HiveState;
 use crate::agent_socket::clamp_words;
-use crate::model::{AgentSession, MemberState, MemberTip};
+use crate::model::{AgentSession, FenceMark, MemberState, MemberTip, past_end};
 use crate::placement::MemberRole;
 
 /// The role a member was placed in, as the join names it. `None` for a word
@@ -319,6 +319,15 @@ pub(crate) async fn on_tip(state: &HiveState, device_id: ObjectId, tip: HiveRepl
         checkpoint_hash: tip.checkpoint.map(|c| c.hash),
         at: DateTime::now(),
     };
+    // P2k-5 — the record as it was before this tip: where its fences ended,
+    // and what the record said this member's copy held.
+    let before = match state.sessions.find(tip.session_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            debug!(session = %tip.session_id, %e, "hive: the session was not read before a tip");
+            None
+        }
+    };
     match state
         .sessions
         .member_tip(tip.session_id, device_id, &stored)
@@ -329,6 +338,9 @@ pub(crate) async fn on_tip(state: &HiveState, device_id: ObjectId, tip: HiveRepl
                 session = %tip.session_id, device = %device_id, seq = stored.seq,
                 "hive: a member's tip"
             );
+            if let Some(s) = &before {
+                note_tail(state, s, device_id, &stored).await;
+            }
             // P2e-3 — the promotion moving the session to this member, if
             // one is syncing, may move the lease now.
             crate::promote::on_tip(state, tip.session_id, device_id).await;
@@ -342,6 +354,51 @@ pub(crate) async fn on_tip(state: &HiveState, device_id: ObjectId, tip: HiveRepl
         ),
         Err(e) => warn!(session = %tip.session_id, %e, "hive: a tip was not recorded"),
     }
+}
+
+/// FR-90 P2k-5 — a member whose copy is found past where its fence ended:
+/// events a primary cut off went on writing after the session moved away
+/// from it (P2e-6a), which did not carry over. The room says how many, once:
+/// only when the tip the record held for the member before was not already
+/// past that same fence's end. `s` is the record as it was before `now`.
+async fn note_tail(state: &HiveState, s: &AgentSession, device_id: ObjectId, now: &MemberTip) {
+    let held = s
+        .replicaset
+        .as_ref()
+        .and_then(|r| r.members.iter().find(|m| m.device_id == device_id))
+        .and_then(|m| m.tip.as_ref());
+    let events = newly_past(&s.fences, held, now);
+    if events == 0 {
+        return;
+    }
+    let name = match state
+        .fleet
+        .agents
+        .find_live_in_tenant(s.tenant_id, device_id)
+        .await
+    {
+        Ok(a) => a.name,
+        Err(_) => String::new(),
+    };
+    info!(
+        session = ?s.id, device = %device_id, fence = now.fence, events,
+        "hive: a copy past where its fence ended — its events did not carry over"
+    );
+    crate::room::note(state, s, crate::room::tail_note(&name, events)).await;
+}
+
+/// FR-90 P2k-5 — how many events `now` holds past where its fence ended,
+/// when the tip held before it (`held`) was not already past that same
+/// fence's end; else 0. A tail is said once: a tip again at that fence says
+/// nothing more, while a tail at another fence is a new one.
+fn newly_past(fences: &[FenceMark], held: Option<&MemberTip>, now: &MemberTip) -> i64 {
+    let events = past_end(fences, now.fence, now.seq);
+    if events <= 0
+        || held.is_some_and(|t| t.fence == now.fence && past_end(fences, t.fence, t.seq) > 0)
+    {
+        return 0;
+    }
+    events
 }
 
 /// `rc:hive.replica.manifest` — every session the device holds a copy of,
@@ -399,6 +456,60 @@ mod tests {
     use crate::model::{
         HarnessRef, ReplicaMember, Replicaset, SessionLocation, SessionOrigin, SessionStatus,
     };
+
+    /// FR-90 P2k-5 — a tail past a fence's end is said once: when the tip
+    /// held before was not already past that same fence's end. A tip within
+    /// its end, or at the current fence, says nothing; a tail at another
+    /// fence is a new one.
+    #[test]
+    fn a_tail_past_a_fences_end_is_said_once() {
+        let fences = [
+            FenceMark {
+                fence: 1,
+                seq: 5,
+                hash: "a".repeat(64),
+            },
+            FenceMark {
+                fence: 2,
+                seq: 12,
+                hash: "b".repeat(64),
+            },
+        ];
+        let at = |fence, seq| MemberTip {
+            fence,
+            seq,
+            hash: "c".repeat(64),
+            checkpoint_seq: None,
+            checkpoint_hash: None,
+            at: DateTime::now(),
+        };
+        assert_eq!(
+            newly_past(&fences, None, &at(1, 9)),
+            4,
+            "first heard: four past"
+        );
+        assert_eq!(
+            newly_past(&fences, Some(&at(1, 3)), &at(1, 9)),
+            4,
+            "held within its end before"
+        );
+        assert_eq!(
+            newly_past(&fences, Some(&at(1, 9)), &at(1, 9)),
+            0,
+            "the same tail again: said already"
+        );
+        assert_eq!(
+            newly_past(&fences, Some(&at(1, 9)), &at(2, 15)),
+            3,
+            "a tail at another fence is a new one"
+        );
+        assert_eq!(newly_past(&fences, None, &at(1, 5)), 0, "at its end");
+        assert_eq!(
+            newly_past(&fences, None, &at(3, 40)),
+            0,
+            "the current fence"
+        );
+    }
 
     fn member(role: MemberRole, state: MemberState) -> ReplicaMember {
         ReplicaMember {

@@ -154,6 +154,23 @@ pub(crate) fn moved_note(s: &AgentSession, p: &Promotion, by: &str) -> String {
     t
 }
 
+/// FR-90 P2k-5 — a device's copy found past where its fence ended: `events`
+/// it wrote after the session moved away from it (P2e-6a), which did not
+/// carry over. The device sets them aside once it follows the session again.
+pub(crate) fn tail_note(device_name: &str, events: i64) -> String {
+    if events == 1 {
+        format!(
+            "↩️ {} holds 1 event it wrote after the session moved on from it — it did not carry over, and stays set aside there",
+            name_label(device_name)
+        )
+    } else {
+        format!(
+            "↩️ {} holds {events} events it wrote after the session moved on from it — they did not carry over, and stay set aside there",
+            name_label(device_name)
+        )
+    }
+}
+
 /// FR-90 P2e-3 — the move did not happen: why, and where the session
 /// continues. `why` is composed by the caller, its names already escaped.
 pub(crate) fn move_failed_note(p: &Promotion, why: &str) -> String {
@@ -764,6 +781,23 @@ pub(crate) fn md_escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-90 P2k-5 — the tail note says how many, in the device's name,
+    /// escaped, one and many each in its own words.
+    #[test]
+    fn the_tail_note_says_how_many_events_did_not_carry_over() {
+        assert_eq!(
+            tail_note("p2k-u1", 4),
+            "↩️ **p2k\\-u1** holds 4 events it wrote after the session moved on from it — they did not carry over, and stay set aside there"
+        );
+        assert!(
+            tail_note("venus", 1).contains("holds 1 event it wrote")
+                && tail_note("venus", 1).contains("it did not carry over, and stays"),
+            "{}",
+            tail_note("venus", 1)
+        );
+        assert!(tail_note("", 2).starts_with("↩️ the device holds 2 events"));
+    }
 
     fn report(status: Option<HiveTurnStatus>) -> TurnReport {
         TurnReport {
