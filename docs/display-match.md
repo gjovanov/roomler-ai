@@ -75,7 +75,7 @@ Every request gets exactly one `rc:display-match.state`
 ⚠️ An agent from before FR-108 answers nothing, and the viewer then shows the toggle as it always did. A word
 this viewer does not know, from a newer agent, is shown as it came and never read as success
 ([`displayMatch.ts:39`](../ui/src/composables/displayMatch.ts#L39) `describeDisplayMatchRefusal`). The viewer
-puts the answer under the toggle ([`RemoteControl.vue:3736`](../ui/src/views/remote/RemoteControl.vue#L3736)
+puts the answer under the toggle ([`RemoteControl.vue:3766`](../ui/src/views/remote/RemoteControl.vue#L3766)
 `displayMatchSaid`).
 
 ⚠️ `attended` and `disabled_on_device` hand the screen back: a mode this session applied earlier is restored

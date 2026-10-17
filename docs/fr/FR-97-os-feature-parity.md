@@ -8,8 +8,8 @@
 - P0d, the measurement, merged (#2397): the native architecture in the hello, and `scripts/fr97-caps-census.sh`.
   It reaches the fleet with the next agent release and server promote. The count before P0c was taken on
   2026-10-17 (§8, AC15).
-- P0c, honest caps (§3.3a), is in review: P0c-1 the map and the daemon's decision, P0c-2 the viewer and the
-  enroll dialog. P0c-3 (the netstack exit status) is measured first (D12).
+- P0c, honest caps (§3.3a): P0c-1, the map and the daemon's decision, merged (#2400); P0c-2, the viewer and
+  the enroll dialog, is in review (#2401). P0c-3 (the netstack exit status) was measured (D12) and is next.
 - P2–P7 are open.
 
 **Owner:** the agent on all
@@ -164,7 +164,7 @@ and the consent chain's fallbacks.
 | D2 | Companion pages on a system install | ✅ | 🟡 safety pages only | ❓ | Person socket (`crates/localapi/src/lib.rs:2550-2594`); a two-half Mac may answer Routes and Devices from the user half | #1911; FR-43 P3 |
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ❌ | ✅ IOPMAssertion | A stub whose reason, "zbus is in no shipped Linux feature set" (`power.rs:649-660`), is stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | ✅ | ❌ | ✅ | Root's home or `/tmp` (`files.rs:182-206`, `2483-2521`) | P3d |
-| D5 | The setup wizard installs the daemon | ✅ | ❌ | ❌ | Tunnel client only (`agents/roomler-setup/src/commands.rs:79-103`) ✔, yet the enroll dialog offers it for agents (`ui/src/utils/enrollCommands.ts:114-119,148,164`) ✔ | P0c, D5 |
+| D5 | The setup wizard installs the daemon | ✅ | ❌ | ❌ | Tunnel client only (`agents/roomler-setup/src/commands.rs:79-103`) ✔, yet the enroll dialog offered it for agents. P0c-2 offers it for agents on Windows only (`ui/src/utils/enrollCommands.ts:136`) | P0c, D5 |
 | D6 | Hive: adopt a terminal session | ❌ | ✅ | ✅ | `hive/supervisor/adopt.rs:404` | P4c |
 
 ### 2.5 SSH and Fleet RPC
@@ -229,7 +229,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `docs/roomler-ssh.md:311-325` | Windows `daemon` → SYSTEM | the console worker (#2021, FR-94) |
 | `docs/installation.md:21-22`, `ui/docs/content/start/install/macos.md:51-53` | install the macOS daemon with the wizard | the wizard's daemon roles are Windows-only |
 | `docs/installation.md:43-44`, `ui/docs/content/troubleshooting/install-problems.md:37-40` | downloads come from roomler.ai | true for the MSI proxy, the CLI and the wizard; `install.sh`'s `.deb`/tarball/`.pkg` and every self-update fetch from GitHub (`updater.rs:1276,1360`) |
-| `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:2842` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon |
+| `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:3099` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon. ✅ Both say so since P0c-2 |
 | `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:181-224`); DRM captures from root (opt-in) |
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`) |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93 |
@@ -339,8 +339,8 @@ The census (`scripts/fr97-caps-census.sh`) counts the map as `key:code` by OS, s
 beside the words.
 
 **Out of the hello:**
-- **The wizard (D5).** The enroll dialog stops offering it for agents off Windows (`ui/src/utils/enrollCommands.ts:169`,
-  `:185`). There it installs only the tunnel client.
+- **The wizard (D5).** The enroll dialog stops offering it for agents off Windows (`ui/src/utils/enrollCommands.ts:136`,
+  used at `:176` and `:192`). There it installs only the tunnel client.
 - **A netstack node's exit status (D12).** Today it reads `active` while the OS routes nothing. Yet its SOCKS5 front
   dials an IPv4 literal as given (`crates/tunnel-core/src/overlay/netstack_socks.rs:75`), and the overlay router
   picks a peer for each packet by its allowed IPs, the exit's `/0` among them. So a literal may well reach the exit,

@@ -319,7 +319,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:4261-4347`, `:2342-2364`, `:2374-2386`, `:819-836` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:219-245` |
 | kill switch · epoch | `crates/agent-core/src/config.rs:867-851`, `:1439`, `:1527-1529`; `config_surface.rs:1072-1053` |
-| UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:177`, `:1199-1226`, `:1995-2096`; `ui/src/stores/agents.ts:887-894` |
+| UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:177`, `:1199-1226`, `:1995-2096`; `ui/src/stores/agents.ts:895-902` |
 
 ## Not built
 
