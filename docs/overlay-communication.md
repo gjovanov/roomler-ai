@@ -214,6 +214,52 @@ graph LR
 That uniformity is why adding DERP touched no WireGuard code: `DerpConn` is just
 another `RelayConn`.
 
+### The direct carrier's socket buffers (FR-110)
+
+A direct carrier is one UDP socket, and the kernel holds whatever arrives
+between two reads of it. At the OS default (208 KB to receive on Linux) a burst
+at line rate fills that in under 2 ms. The kernel then drops WireGuard
+datagrams before the daemon reads them, and TCP inside the tunnel reads every
+drop as congestion: CPU idle, throughput low. So every direct carrier socket
+asks for **7 MiB each way** as it is bound. That is `tune_carrier`
+(`crates/tunnel-core/src/overlay/sockbuf.rs:145`), called from the one seam that
+binds them all, `bind_direct_socket` (`direct.rs:1570`).
+
+```mermaid
+flowchart LR
+    B["bind_direct_socket<br/>(lan, public-dial)"] --> T["tune_carrier:<br/>ask 7 MiB rcv + snd"]
+    T -->|"Linux, root"| F["SO_RCVBUFFORCE<br/>past rmem_max"]
+    T -->|"elsewhere"| P["SO_RCVBUF<br/>(capped / stepping down)"]
+    F & P --> L["read back,<br/>one log line"]
+```
+
+| OS | How | What caps it |
+|---|---|---|
+| Linux, root | `SO_RCVBUFFORCE` / `SO_SNDBUFFORCE` (`sockbuf.rs:87`) | nothing: past `net.core.rmem_max` |
+| Linux, no `CAP_NET_ADMIN` | `SO_RCVBUF` / `SO_SNDBUF` | `net.core.rmem_max`, which is **212992 on most distributions**. That is why FORCE matters: the plain option alone changes nothing there. Under 1 MiB the line is a WARN |
+| Windows | `SO_RCVBUF` / `SO_SNDBUF` | nothing: it takes the size |
+| macOS | `SO_RCVBUF` / `SO_SNDBUF`, stepping down 7 → 4 → 2 → 1 MiB | `kern.ipc.maxsockbuf`, which refuses a larger size outright |
+
+Measured into an M2 Pro Linux host over the overlay, 256 MiB from a server
+17 ms away: **116 / 128 Mbit/s with 455 / 623 drops** (`RcvbufErrors`) at the
+default, against **509 / 513 Mbit/s with none** at 7 MiB. CPU was ~1% on both
+ends both times.
+
+⚠️ **Check the size with `ss`, not with a throughput test.** `ss -uampn` shows
+each socket's `rb`. Linux reports twice the request, so a carrier socket shows
+`rb14680064`, and every other socket of the daemon keeps the default. The
+daemon logs the granted sizes once per socket (*"overlay: carrier socket
+buffers"*) whatever `RUST_LOG` says. The packaged Linux units set
+`RUST_LOG=roomlerd=info,warn`, which drops `tunnel_core` INFO, so the logger
+appends this one target on its own (`crates/agent-core/src/logging.rs:225`). On
+Windows that line is the only evidence of the size.
+
+⚠️ **A full buffer delays instead of dropping.** A queue builds only when the
+reader falls behind the arrival rate. Datagrams then wait rather than vanish,
+and for TCP inside the tunnel a drop costs more than the wait. The kernel
+charges a socket only for what is queued, so an idle carrier costs nothing.
+Kill switch: `ROOMLERD_OVERLAY_SOCKBUF=0`.
+
 ---
 
 ## 3. The carrier cascade
@@ -730,6 +776,7 @@ prefix is still honoured.
 | `…_ROUTE_TICK_SECS` | 30 | route-guard heartbeat seconds while the subscription is live (2–300; `2` = pre-demotion cadence). Ignored — always 2 s — without a live subscription |
 | `…_ROUTE_EVICT_WINNERS_ONLY` | **on** | Windows: evict a competing VPN route only when it wins the FIB lookup (#1405); off = evict every competing row every wave |
 | `…_NETSTACK_SOCKS` | unset | userspace netstack + SOCKS5 instead of an OS TUN |
+| `…_SOCKBUF` | **on** (FR-110) | every direct carrier socket asks for 7 MiB receive and send buffers (§2); off = the OS default |
 
 Joining the mesh at all additionally requires `overlay_enabled = true` in the
 node config and a build carrying the `overlay-l3` (or `overlay-netstack`)
@@ -747,6 +794,11 @@ feature.
 | single-relay | buildhost↔fleet-host-2 netns, sym↔sym | 0 % loss, ~1.3 ms |
 | single-relay, UDP-aware anchor | UDP-blocked ↔ UDP-capable | 0 % loss, ~1–6 ms |
 | **DERP** | buildhost↔fleet-host-2, both UDP **and** coturn-TCP blocked | **0 % loss, ~2.7 ms** |
+
+**Throughput (FR-110):** TCP over a direct carrier into an M2 Pro Linux host
+went from 116–128 Mbit/s to **509–513 Mbit/s**, with the receiver's drops from
++455–623 per 256 MiB to none, once the carrier sockets asked for 7 MiB buffers
+(§2).
 
 Every tier in the cascade has now carried real WireGuard traffic between two
 genuinely separated hosts. The cascade is complete: there is no longer a network
