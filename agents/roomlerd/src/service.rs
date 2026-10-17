@@ -142,6 +142,52 @@ impl Install {
         }
     }
 
+    /// #2371 — what `roomlerd enroll` ends with. `secondary`: the enrollment
+    /// added (or refreshed) an `[[orgs]]` entry, whose loop only a daemon
+    /// restart starts. A fresh primary may land on a daemon that is stopped,
+    /// waiting for its config, or running, so each step names a command that
+    /// connects it in every one of those states. `roomlerd run` comes last, for
+    /// a host without the package: beside a service manager it is an orphan.
+    pub fn after_enroll(self, secondary: bool) -> &'static str {
+        if secondary {
+            return match self {
+                Self::LinuxSystem => {
+                    "This organization connects when the daemon restarts: \
+                     `sudo systemctl restart roomlerd`."
+                }
+                Self::Other => "This organization connects when the daemon restarts.",
+                _ => "This organization connects when the daemon restarts: `roomler restart`.",
+            };
+        }
+        match self {
+            Self::LinuxSystem => {
+                "Start the daemon: `sudo systemctl restart roomlerd`, which starts it \
+                 whether it was stopped, failed or running. On a host without the \
+                 package: `roomlerd run`."
+            }
+            Self::LinuxUser => {
+                "Start the daemon: `roomlerd service start` (`roomlerd service install` \
+                 also starts it at every login). If it is running already, \
+                 `roomler restart` connects it now. On a host without the package: \
+                 `roomlerd run`."
+            }
+            Self::WindowsService => {
+                "The Roomler service starts the agent within a minute. If it is running \
+                 already, `roomler restart` connects it now."
+            }
+            Self::WindowsTask => {
+                "Start the agent: `roomlerd service start` (`roomlerd service install` \
+                 first, if this account has no task). If it is running already, \
+                 `roomler restart` connects it now."
+            }
+            Self::MacOs => {
+                "launchd starts the agent within seconds. If it is running already, \
+                 `roomler restart` connects it now."
+            }
+            Self::Other => "Start the daemon: `roomlerd run`, or your service manager.",
+        }
+    }
+
     /// The last line of the removal's sentinel, after the `re-enroll` command
     /// it names.
     pub fn after_removal(self) -> &'static str {
@@ -1414,6 +1460,68 @@ mod tests {
             Install::WindowsService
                 .after_re_enroll(false)
                 .contains("roomler restart")
+        );
+    }
+
+    // ─── #2371: what connects a fresh enrollment ──────────────────────
+
+    /// The first command a text names, between its first pair of backticks.
+    fn first_command(says: &str) -> Option<&str> {
+        let start = says.find('`')? + 1;
+        let len = says[start..].find('`')?;
+        Some(&says[start..start + len])
+    }
+
+    #[test]
+    fn an_enrollment_never_leads_with_roomlerd_run_beside_a_service_manager() {
+        // The same orphan #2293 removed from `re-enroll`: `roomlerd run` may
+        // only be the fallback, for a host without the package, and is first
+        // only where this code knows no service manager.
+        for i in EVERY {
+            let says = i.after_enroll(false);
+            assert_eq!(
+                first_command(says) == Some("roomlerd run"),
+                i == Install::Other,
+                "{i:?}: {says}"
+            );
+            assert!(!says.contains("wait for the supervisor"), "{i:?}: {says}");
+        }
+    }
+
+    #[test]
+    fn a_fresh_linux_enrollment_names_a_restart_that_works_in_every_state() {
+        // A fresh primary may land on a unit that is stopped, failed (crash-
+        // looping on a missing config) or running: `restart` starts all three.
+        assert_eq!(
+            first_command(Install::LinuxSystem.after_enroll(false)),
+            Some("sudo systemctl restart roomlerd")
+        );
+        assert_eq!(
+            first_command(Install::LinuxUser.after_enroll(false)),
+            Some("roomlerd service start")
+        );
+        assert!(
+            Install::LinuxUser
+                .after_enroll(false)
+                .contains("`roomler restart`")
+        );
+    }
+
+    #[test]
+    fn an_added_org_is_told_to_restart_the_daemon() {
+        // A secondary org's loop starts only with the daemon (multi-org.md).
+        for i in EVERY {
+            let says = i.after_enroll(true);
+            assert!(says.contains("restarts"), "{i:?}: {says}");
+            assert!(!says.contains("roomlerd run"), "{i:?}: {says}");
+        }
+        assert_eq!(
+            first_command(Install::LinuxSystem.after_enroll(true)),
+            Some("sudo systemctl restart roomlerd")
+        );
+        assert_eq!(
+            first_command(Install::MacOs.after_enroll(true)),
+            Some("roomler restart")
         );
     }
 
