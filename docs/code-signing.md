@@ -106,7 +106,8 @@ SmartScreen reputation organically from download volume. What signing buys
 - ⚠️ What a *release* carries and what the *machine installing an update*
   checks are different questions — §7b. The agent's own check of a `.pkg`
   update is the GPG `.asc` against its pinned key, not the Apple signature, and
-  a `.pkg` is not yet bound to the release it claims to be.
+  since FR-97 P6a the version inside the `.pkg` must be the release it was
+  offered as.
 
 ## 3. Credential setup — `scripts/signing/`
 
@@ -178,14 +179,14 @@ graph LR
     PUB["publish jobs<br/>+ GPG .asc per asset<br/>+ SLSA provenance attestation"] --> REL["GitHub release"]
 
     REL --> HUMAN["§7 — a person verifying<br/>Get-AuthenticodeSignature · spctl → Notarized Developer ID<br/>gh attestation verify · gpg --verify"]
-    REL --> AGENT["§7b — the agent, before an update<br/>.msi → Authenticode publisher + embedded version<br/>.pkg · .deb → .asc vs the pinned key; version NOT bound"]
+    REL --> AGENT["§7b — the agent, before an update<br/>.msi → Authenticode publisher + embedded version<br/>.pkg · .deb · tarball → .asc vs the pinned key + embedded version"]
 ```
 
 The diagram is the chain; the table is every artifact on it. The setup,
 desktop and tunnel executables go through the same `sign-windows` step as the
-MSI payload. Note the asymmetry at the right edge: every update is
-authenticated by the machine installing it, but only the Windows **MSI** is
-also bound to the release it claims to be (§7b).
+MSI payload. At the right edge, every update is authenticated by the machine
+installing it, and is also bound to the release it claims to be: the Windows
+**MSI** from the start, the `.deb`, `.pkg` and tarball since FR-97 P6a (§7b).
 
 | Artifact | Workflow | Mechanism |
 |---|---|---|
@@ -313,8 +314,8 @@ keeps the version it is already running.
 | Gate | Module | Answers | Enforced on |
 |---|---|---|---|
 | Authenticode + publisher name | `code_signature::verify_publisher` | *Whose* bytes are these? | Windows |
-| Detached `.asc` vs the signing subkey **pinned in the binary** | `pgp_verify::verify_release_artifact` | *Whose* bytes are these? | Linux, macOS (`.deb`, `.pkg`) — the `.asc` is **required** |
-| Embedded version vs manifest claim | `artifact_version::verify_artifact_version` | *Which release* are they? | Windows (`.msi`) only |
+| Detached `.asc` vs the signing subkey **pinned in the binary** | `pgp_verify::verify_release_artifact` | *Whose* bytes are these? | Linux, macOS (`.deb`, `.pkg`, tarball) — the `.asc` is **required** |
+| Embedded version vs manifest claim | `artifact_version::verify_artifact_version` | *Which release* are they? | every installable: the `.msi`, and since FR-97 P6a the `.deb`, `.pkg` and tarball |
 
 **Neither is sufficient alone, and the second is the less obvious one.**
 `is_newer` decides to upgrade by reading the **manifest's** tag, while the
@@ -330,8 +331,8 @@ envelope** — editing it invalidates the Authenticode signature the first gate
 already enforces. Equally, the signature is what makes the embedded version
 unforgeable. Neither gate means much without the other.
 
-**On Linux and macOS the bytes are authenticated, but the release is not
-bound.** A `.deb` or `.pkg` update is refused unless its detached `.asc`
+**On Linux and macOS the bytes are authenticated by a detached `.asc`.** A
+`.deb`, `.pkg` or tarball update is refused unless its detached `.asc`
 verifies against the signing key **pinned in the binary** — a key fetched from
 the release alongside the artifact would be the same-channel trust failure as
 the SHA256. The sidecar is *required*: it is fetched from `<asset-url>.asc`
@@ -340,16 +341,66 @@ pin — a channel can withhold a signature but cannot mint one, and withholding
 is a refusal. Live-proven on the rc.481 and rc.482 macOS updates, which logged
 `installer .asc verified against the pinned release signing key` (FR-7).
 
-What these formats still lack is the version gate. `verify_artifact_version`
-has no reader for a version embedded in a `.pkg` or `.deb`, so it reports
-`Unsupported` and the update proceeds (logged at INFO, the expected steady
-state there). ⚠️ So the downgrade the MSI binding closes is **still open on
-Linux and macOS**: a genuinely-signed *older* package offered under a newer
-manifest claim verifies — the signature really is ours. It is the same gap as
-the unsigned manifest in `CLAUDE.md`'s Known Issues. (The comment on that
-`Unsupported` arm in `updater.rs` still says the format "carries no signature
-for a version to be anchored to"; since the `.asc` gate landed it does — what
-is missing is a reader, not a signature.)
+**Since FR-97 P6a the release is bound there too.** Until then
+`verify_artifact_version` had no reader for a version inside a `.deb`, `.pkg`
+or tarball, reported `Unsupported`, and the update proceeded — so a
+genuinely-signed *older* package offered under a newer manifest claim
+installed. Measured on 0.4.143 before the fix: a feed offering `agent-v0.4.999`
+with the signed 0.4.142 `.deb` passed the `.asc` gate and was staged for
+install (FR-97 §8). Each format now states its own version inside the signed
+bytes, and the updater refuses when it disagrees with the tag
+(`updater.rs:1680`):
+
+| Format | Where the artifact states its version | Read by | Anchor |
+|---|---|---|---|
+| `.msi` | `ProductVersion` in the `Property` table | the Windows Installer database API | `artifact_version.rs:429` |
+| `.deb` | `Version` in its control file, `0.4.142-1` — the Debian revision (cargo-deb's `-1`) and any epoch dropped, a `~` read back as `-` | `dpkg-deb --field`, from the dpkg the updater requires before it picks a `.deb` | `artifact_version.rs:287` |
+| `.pkg` | `version` on the component `PackageInfo`'s `<pkg-info identifier="com.roomler.agent">` | `pkgutil --expand` into a fresh directory | `artifact_version.rs:376` |
+| tarball | its one top directory, `roomlerd-<version>-<target>` | `tar -tzf`, which the tarball install runs anyway | `artifact_version.rs:333` |
+
+```mermaid
+flowchart LR
+    M["manifest<br/>tag · asset URL · digest"] --> N{"is_newer(tag)?"}
+    N -->|no| U["up to date"]
+    N -->|yes| D["download"]
+    D --> H{"digest<br/>(transport only)"}
+    H -->|mismatch| X["discard ·<br/>keep the current version"]
+    H --> S{"WHOSE bytes?<br/>Authenticode + publisher · Windows<br/>.asc vs the pinned key · Linux, macOS"}
+    S -->|no| X
+    S --> V{"WHICH release?<br/>the version inside the signed bytes<br/>= the tag's"}
+    V -->|"mismatch · unreadable"| X
+    V -->|"Unsupported: the switch off,<br/>or a .deb with no dpkg-deb"| I["install"]
+    V -->|bound| I
+```
+
+⚠️ **`Unsupported` is not a refusal.** It means nothing was proved either way:
+a `.deb` on a host with no `dpkg-deb` (whose install would fail anyway), or
+`ROOMLERD_ARTIFACT_VERSION_CHECK=0`. Logged at INFO and the install proceeds.
+An **unreadable** artifact *is* a refusal — it is about to run as root, and
+nobody can say what it is.
+
+⚠️ **A wrong reader refuses every update, fleet-wide.** So the three new
+readers sit behind `ROOMLERD_ARTIFACT_VERSION_CHECK=0` (the MSI's, older and
+proven, does not), and each was read against the real artifacts of the last
+three releases before it shipped: 12 Linux artifacts × {their own release,
+a neighbour, a fabricated `0.4.999`} gave 12 binds and 24 refusals, and the
+three `.pkg`s on a Mac 3 binds and 6 refusals (FR-97 §8).
+Re-check after any change to a reader, or to how the release workflow names
+and versions its artifacts:
+
+```bash
+gh release download agent-v<version> --repo gjovanov/roomler-ai --pattern 'roomlerd-*' --dir /tmp/rel
+for f in /tmp/rel/roomlerd-*.deb /tmp/rel/roomlerd-*.tar.gz; do   # the .pkg on a Mac
+  roomlerd artifact-version "$f" agent-v<version>                 # hidden: bound / refused / unsupported
+done
+```
+
+The `.deb`'s `Package` field is deliberately **not** bound (every published
+daemon `.deb` says `roomlerd`). A feed that swapped in the companion's `.deb` at
+the same version would gain a freeze, which withholding the update gives it
+anyway, while a name check would be one more way to refuse every update. The
+`.pkg` reader names `com.roomler.agent` for a different reason: a product
+archive can carry several components, and it must read the right one.
 
 The key, verified 2026-08-24 against `agent-v0.3.0-rc.458`: an ed25519 primary
 `[C]` (certify-only, offline, `D654B016256FD92A81634A0E2AD1E9F025973A7F`)

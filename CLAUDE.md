@@ -785,7 +785,10 @@ Fixed-and-shipped issues live in `git log` and the docs. Currently open:
 - **[MEDIUM]** [2026-08-23] **The updater's manifest is unsigned** — version + url +
   hash are not attested as a unit — and the tunnel CLI's separate `self-update` does
   not share `download_asset`, so it is not key-pinned. Publisher trust on the
-  artifact itself is closed on all three platforms (`ship-it` skill §3).
+  artifact itself is closed on all three platforms (`ship-it` skill §3), and so,
+  since FR-97 P6a, is the downgrade the manifest allowed: every installable must state
+  the claimed version inside its signed bytes (`docs/code-signing.md` §7b), so a
+  hostile manifest can withhold an update but no longer swap in an older one.
 - **[MEDIUM]** [2026-04-17, rewritten 2026-08-29 by **FR-27**, #854] Host consent now
   has a **`PromptSurface` chain** — native (`win`·`mac`·`x11`) → companion
   (`roomler-desktop` over LocalAPI) → notification (Linux, the desktop's own, with

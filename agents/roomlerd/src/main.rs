@@ -226,6 +226,18 @@ enum Command {
     /// already reports.
     #[command(hide = true, name = "caps-probe")]
     CapsProbe,
+    /// FR-97 P6a — read a downloaded release artifact's own version and bind
+    /// it to the release it is offered as, exactly as the updater does before
+    /// it installs anything. Prints the verdict; exits non-zero on a refusal.
+    /// For proving the readers against published releases; hidden, since the
+    /// updater runs the same check itself.
+    #[command(hide = true, name = "artifact-version")]
+    ArtifactVersion {
+        /// The `.msi`, `.deb`, `.pkg` or `.tar.gz`.
+        path: std::path::PathBuf,
+        /// The release it is offered as: `agent-v0.4.142` or `0.4.142`.
+        claimed: String,
+    },
     /// (internal, Linux) FR-45 P2a — run inside the console user's session and
     /// report the desktop portal's availability as one
     /// `ROOMLER_PORTAL_JSON:{…}` line.
@@ -1738,6 +1750,20 @@ async fn daemon_main() -> Result<()> {
             }
         }
         Command::ProbeTarget { seconds } => roomlerd::probe_target::run(seconds),
+        Command::ArtifactVersion { path, claimed } => {
+            use roomlerd::artifact_version::{VersionError, verify_artifact_version};
+            match verify_artifact_version(&path, &claimed) {
+                Ok(found) => {
+                    println!("bound: {} is {claimed} (it says {found})", path.display());
+                    Ok(())
+                }
+                Err(e @ VersionError::Unsupported(_)) => {
+                    println!("unsupported: {e}");
+                    Ok(())
+                }
+                Err(e) => anyhow::bail!("refused: {e}"),
+            }
+        }
         Command::CurtainSmoke { seconds } => {
             if !roomlerd::privacy::curtain_smoke(seconds)? {
                 anyhow::bail!(

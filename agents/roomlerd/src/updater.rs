@@ -1686,11 +1686,11 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
                 "artifact self-identifies as the release it was offered as"
             );
         }
-        // Not a refusal: the format carries no signature for a version to be
-        // anchored to, so enforcing one would check a claim against a claim.
-        // Logged at INFO rather than WARN — it is the expected steady state on
-        // Linux/macOS today, and a warning per update check would train
-        // operators to ignore it.
+        // Not a refusal: nothing was proved either way. Since FR-97 P6a the
+        // `.deb`, `.pkg` and tarball are bound too, so this is now a format no
+        // reader handles, a reader that cannot run here (a `.deb` with no
+        // `dpkg-deb`), or `ROOMLERD_ARTIFACT_VERSION_CHECK=0`. Logged at INFO:
+        // a warning per update check would train operators to ignore it.
         Err(e @ crate::artifact_version::VersionError::Unsupported(_)) => {
             tracing::info!(asset = %asset.name, reason = %e, "no artifact-version binding available");
         }
