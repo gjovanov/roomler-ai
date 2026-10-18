@@ -580,7 +580,7 @@ arches.
 Device **NEO16-WSL** (display name; Linux, the root `roomlerd.service` unit,
 virtual desktop, no companion), API `0.4.101`. The controller is the device's
 **owner**, so `resolve_session_authz`
-(`crates/modules/remote/src/controller.rs:442`) resolves `auto` by the owner
+(`crates/modules/remote/src/controller.rs:448`) resolves `auto` by the owner
 shortcut; the device's server policy was additionally set to `consent_mode =
 auto` for the run (as found: unset) so the directive did not rest on the
 shortcut alone. Nothing in the consent code differs between the two agent
@@ -613,7 +613,7 @@ The floor run, verbatim from the daemon (UTC; hostname prefix stripped):
 
 The attribution is in the two windows. The device's own mode is `Prompt {
 timeout: 30s }` (line 1 prints `consent_broker.mode()`,
-`agents/roomlerd/src/signaling.rs:2361`), yet the prompt stood for **300 s** —
+`agents/roomlerd/src/signaling.rs:2376`), yet the prompt stood for **300 s** —
 the server's window — which is exactly the shape `strictest_of`
 (`agents/roomlerd/src/consent.rs:136`) produces when it downgrades an `auto`
 directive: `Prompt { timeout: host_window }` (`signaling.rs:2396`). The control
@@ -661,9 +661,9 @@ back equal; one more session auto-granted in 0.3 ms and was hung up.
 
 The Devices page, API `0.4.101`, 21 devices. Each row's caption reads
 `id: … · <machine_id> · v<agent_version>`
-(`ui/src/components/admin/AgentsSection.vue:345`); the companion half,
+(`ui/src/components/admin/AgentsSection.vue:353`); the companion half,
 `· desktop v<companion_version>`, renders **only when the companion disagrees
-with the daemon** (`companionSkew`, `AgentsSection.vue:354-358,1671`), and the
+with the daemon** (`companionSkew`, `AgentsSection.vue:362-366,1826`), and the
 card view's chip follows the same rule (`:697`).
 
 | device (display name) | daemon | `companion_version` on the wire | caption shows |

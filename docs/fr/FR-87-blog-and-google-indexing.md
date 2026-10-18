@@ -32,7 +32,7 @@ Each row is also an acceptance criterion's "shown failing" run.
 | `curl -sI https://roomler.ai/docs` | `301 Location: http://roomler.ai/docs/`, a **scheme downgrade** | absolute redirect built from the pod's `:80` listener behind the TLS edge |
 | `/blog/`, `/this-does-not-exist` | **200** with the SPA shell (soft 404) | SPA fallback `nginx-pod.conf:97-99` |
 | `/docs/start/install/windows` (no slash) | 200, duplicate of the slash form | `try_files $uri $uri/index.html` serves both |
-| `/` | a client-rendered shell: an empty `<div id="app">` for any crawler that doesn't run JS | `/` is `meta.auth` (`ui/src/plugins/router.ts:119`); guests are redirected to `/landing` client-side (`:326`) |
+| `/` | a client-rendered shell: an empty `<div id="app">` for any crawler that doesn't run JS | `/` is `meta.auth` (`ui/src/plugins/router.ts:119`); guests are redirected to `/landing` client-side (`:345`) |
 | sitemap | lists `/landing /pricing /privacy /terms /imprint` (`site.ts:150`), all of which declare canonical `/` (`ui/index.html:24`) | contradictory signals |
 | docs JSON-LD | author `"G ROX LTD"` (`layout.ts:221`), but the legal name everywhere else is G ROX EOOD; no `datePublished`, `image` or `mainEntityOfPage`; the `WebSite`/`SoftwareApplication` markup spec'd by FR-60 was never built (`LayoutCtx.extraJsonLd` is never passed, `build.ts:515-523`) | — |
 | docs `<title>` | up to 71 chars (e.g. `/docs/compare/teamviewer/`) | the template `layout.ts:204-209` always appends " · section — Roomler Docs" |

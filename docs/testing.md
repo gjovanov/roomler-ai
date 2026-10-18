@@ -398,7 +398,7 @@ flowchart LR
 | arm | how the VM gets its carrier | why it exists |
 |---|---|---|
 | `direct` | the overlay's defaults — the carrier ladder picks the best path that works | the real-world numbers |
-| `relay` | `overlay_direct = false` on the VM only ([`config.rs:324`](../crates/agent-core/src/config.rs#L324)), which leaves only relayed carriers | the relayed baseline for every target, including the servers that the direct arm reaches directly |
+| `relay` | `overlay_direct = false` on the VM only ([`config.rs:411`](../crates/agent-core/src/config.rs#L411)), which leaves only relayed carriers | the relayed baseline for every target, including the servers that the direct arm reaches directly |
 
 The direct arm's corp-laptop rows are the **control** for the relay arm: those laptops have no
 direct path at all, so where both arms relay, matching numbers show the forcing knob is not what

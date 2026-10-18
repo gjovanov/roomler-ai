@@ -20,7 +20,7 @@ what it costs in installer size and ships with integration and e2e tests.
   (`crates/remote_control/src/permissions.rs:21`) and already in `requires_consent_prompt()`, but nothing in `agents/`,
   `crates/modules/` or `ui/src/` uses it. `RemoteSession.recording_url` is always `None`. `docs/remote-control.md`
   §11.3 (`:679`) promises a banner that cannot be dismissed and a red tray dot while recording; neither exists.
-- ⚠️ **Any tab can already request RECORD.** `resolve_session_authz` (`crates/modules/remote/src/controller.rs:381`)
+- ⚠️ **Any tab can already request RECORD.** `resolve_session_authz` (`crates/modules/remote/src/controller.rs:387`)
   never reads the requested permissions, and `Hub::create_session` narrows only INPUT
   (`crates/modules/fleet/src/hub.rs:1105-881`). Harmless today because no agent honours the bit. It stops being harmless
   the day one does, so the strip ships before the agent learns the bit (P3).
@@ -35,7 +35,7 @@ what it costs in installer size and ships with integration and e2e tests.
   and a synthetic source with a decodable 64-bit counter strip (`capture/synthetic_backend.rs:41`); `EncoderThread`
   (`encode/thread.rs:118`); the cells, denylist and probe cache; the child-process probe pattern (`encode/caps.rs`); the
   uid drop used by the portal helper (`capture/portal/mod.rs`); cpal loopback audio + audiopus Opus (`audio/`); the
-  consent chain and `PromptKind` (`consent.rs:157`); the config surface (`crates/agent-core/src/config_surface.rs:1055`)
+  consent chain and `PromptKind` (`consent.rs:157`); the config surface (`crates/agent-core/src/config_surface.rs:1087`)
   and LocalAPI `ConfigSet`; the capture-excluded Windows indicator (`indicator/win.rs`); the updater's
   `decide_defer` (`updater.rs:119`); the files-DC chunk pump (`peer.rs:10544`); `.roomler-partial` staging (`files.rs`).
 
@@ -198,7 +198,7 @@ Each refusal carries a named reason on the wire and in the UI.
    RECORD never reaches one.
 3. **Device gate.** `record_remote_enabled` and `record_remote_audio`, both default **OFF**, device-owned and
    **structurally absent from `DesiredConfig`** — a `record_` twin of `no_relay_key_is_server_pushable_via_desired_config`
-   (`crates/remote_control/src/models.rs:4437`). Capabilities are read once at hello, so ON takes effect at the next
+   (`crates/remote_control/src/models.rs:5039`). Capabilities are read once at hello, so ON takes effect at the next
    connect; **OFF is immediate** — new starts are refused and a running remote recording stops.
 4. **A `record` DataChannel**, attached only when the grant holds RECORD — the same attach-time gate as `files` and
    `input`. The control channel carries no permission context, so it cannot host this. Messages:

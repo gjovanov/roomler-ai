@@ -15,7 +15,7 @@
 ## Bug A — the `Key::Other` fallback reinterprets HID usages as native keycodes
 
 The viewer maps `KeyboardEvent.code` → USB-HID usage
-(`kbdCodeToHid`, `ui/src/composables/useRemoteControl.ts:9854` —
+(`kbdCodeToHid`, `ui/src/composables/useRemoteControl.ts:10012` —
 `CapsLock → 0x39` is **correct**, locked by
 `useRemoteControl.spec.ts:234`). The agent maps HID → enigo `Key` in
 `hid_to_key` (`agents/roomlerd/src/input/enigo_backend.rs:514-595`) —

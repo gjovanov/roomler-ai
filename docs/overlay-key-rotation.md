@@ -115,7 +115,7 @@ suspect first.
 ## On the device
 
 The handler sits in the WS loop that received the order, next to `ConfigPush`
-(`agents/roomlerd/src/signaling.rs:4294-4380`). Every branch **reports**, refusals
+(`agents/roomlerd/src/signaling.rs:4482-4380`). Every branch **reports**, refusals
 included — the operator is looking at a security action and each refusal has a
 different fix:
 
@@ -124,7 +124,7 @@ different fix:
 | 1 | kill switch `overlay_key_rotation == false` | `refused: disabled` | `signaling.rs:4200-4167` |
 | 2 | the device's **own** 60 s ceiling, per org — "a bound that exists only on the ordering side is not a bound" | `refused: rate_limited` | `signaling.rs:2403-2415`, `:4188-4204` |
 | 3 | mint `WgKeypair::generate()` — the enrollment mint; `None` in a build with no overlay surface | `refused: unsupported` | `agents/roomlerd/src/key_rotation.rs:19-30` |
-| 4 | **persist first**: under the daemon-wide write lock, `config::load` → set the secret on the primary scalar or on the `[[orgs]]` entry whose `tenant_id` is this loop's → bump `overlay_wg_key_epoch` → atomic `config::save` (tmp + fsync + 0600/ACL + `.prev` + rename) | on error: `failed` + detail, **identity unchanged** | `agents/roomlerd/src/remote_config.rs:219-245` |
+| 4 | **persist first**: under the daemon-wide write lock, `config::load` → set the secret on the primary scalar or on the `[[orgs]]` entry whose `tenant_id` is this loop's → bump `overlay_wg_key_epoch` → atomic `config::save` (tmp + fsync + 0600/ACL + `.prev` + rename) | on error: `failed` + detail, **identity unchanged** | `agents/roomlerd/src/remote_config.rs:309-245` |
 | 5 | queue the same report for the *next* session, then send `rc:agent.key_rotated { rotated, old_pub, new_pub, key_epoch }` on this one and give the pump 300 ms | `rotated` | `signaling.rs:4297-4301` |
 | 6 | close every peer, tunnel peer and QUIC peer this org loop carries (the `Goodbye` teardown), return `ConnectError::KeyRotated { secret, epoch }` | — | `signaling.rs:4325-4290`, `:1077` |
 | 7 | the loop adopts the key + epoch into its one config snapshot and re-enters `connect_once` **immediately** — one device re-joining, not a fleet event, so no stagger | — | `signaling.rs:819-836` |
@@ -150,7 +150,7 @@ config push, which drive machine-wide state and are therefore primary-only
 ⚠️ **Immediate and disruptive, by design.** A key that leaked must not wait for the
 holder's session to end, so the rotation ends every remote-control, overlay-SSH and
 tunnel session the device carries on that org and reconnects. The confirm dialog says
-so (`ui/src/components/admin/AgentsSection.vue:1199-1226`). A corp-VPN host may come
+so (`ui/src/components/admin/AgentsSection.vue:1215-1226`). A corp-VPN host may come
 back relay-locked after the cycle (the renumber caveat in `multi-org.md`).
 
 `overlay_wg_secret_key` stays **unwritable over LocalAPI** (`config_surface.rs:13-14`,
@@ -252,7 +252,7 @@ the grid honest for a device that has not yet updated to it — a 0.4.25 device 
 
 | key | where | default | effect |
 |---|---|---|---|
-| `overlay_key_rotation` | device config (tribool), config surface, env `ROOMLERD_OVERLAY_KEY_ROTATION` (`crates/agent-core/src/config.rs:876-851`, `config_surface.rs:1080-1053`) | **on** | `false` ⇒ every order is answered `refused: disabled`, key unchanged. Read from the start-time snapshot — **restart required** |
+| `overlay_key_rotation` | device config (tribool), config surface, env `ROOMLERD_OVERLAY_KEY_ROTATION` (`crates/agent-core/src/config.rs:963-851`, `config_surface.rs:1080-1053`) | **on** | `false` ⇒ every order is answered `refused: disabled`, key unchanged. Read from the start-time snapshot — **restart required** |
 | `overlay_wg_key_epoch` | persisted next to the key, primary scalar and per `[[orgs]]` entry (`config.rs:1417`, `:1544-1546`) | `0` | bumped per rotation; presented on every join, shown in the grid |
 | server switch | — | — | **none, deliberately**: the route is admin-initiated and permission-gated; a defective push is stopped by the device switch |
 
@@ -306,20 +306,20 @@ The server cannot see the device switch, so a switched-off device is still order
 
 | piece | where |
 |---|---|
-| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:657`, `:688`, `:702`, test `:4937`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:1796-1800` |
-| wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:2366`, `:716`; owner `network` (`:1757`, `modular-monolith.md`) |
+| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:657`, `:688`, `:702`, test `:5539`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:1812-1800` |
+| wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:2531`, `:716`; owner `network` (`:1771`, `modular-monolith.md`) |
 | models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:1770`, `:1796`, `:1821`, `:1852`, `:3305`, `:5864`, `:5879` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
 | reconcile-on-connect | `crates/modules/fleet/src/socket.rs:244-199`, `:280-302` |
 | report ingest | `crates/modules/network/src/agent_socket.rs:173` → `agent_arms.rs:81-125` |
-| identity stamp at the join | `crates/modules/network/src/overlay.rs:536-559`; `crates/services/src/dao/agent.rs:818` |
-| the conditional report write | `crates/services/src/dao/agent.rs:783-764` |
+| identity stamp at the join | `crates/modules/network/src/overlay.rs:536-559`; `crates/services/src/dao/agent.rs:907` |
+| the conditional report write | `crates/services/src/dao/agent.rs:790-764` |
 | state resolver + grid view | `crates/modules/fleet/src/agent.rs:521-676`, `:1449-1457` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:731-738` |
-| device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:4294-4380`, `:2368-2390`, `:2400-2412`, `:819-836` |
-| mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:219-245` |
-| kill switch · epoch | `crates/agent-core/src/config.rs:876-851`, `:1448`, `:1536-1538`; `config_surface.rs:1080-1053` |
-| UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:177`, `:1199-1226`, `:1995-2096`; `ui/src/stores/agents.ts:895-902` |
+| device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:4482-4380`, `:2368-2390`, `:2400-2412`, `:819-836` |
+| mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:309-245` |
+| kill switch · epoch | `crates/agent-core/src/config.rs:963-851`, `:1535`, `:1536-1538`; `config_surface.rs:1080-1053` |
+| UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:177`, `:1199-1226`, `:1995-2096`; `ui/src/stores/agents.ts:942-902` |
 
 ## Not built
 
