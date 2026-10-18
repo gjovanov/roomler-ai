@@ -1,9 +1,9 @@
 # FR-111: Touch controls — a phone or tablet as a real controller
 
-**Issue:** [#2359](https://github.com/gjovanov/roomler-ai/issues/2359) · **Status:** every criterion
-field-verified — P1–P4 merged and live (P4a #2413, P4b #2418; promoted 2026-10-18 00:15Z), AC1–AC7 ticked;
-decisions 1–4 settled by the operator, 5 and 6 built to their recommendation; P5 (native touch) not built,
-by decision 3 · **Owner:** the viewer's input path
+**Issue:** [#2359](https://github.com/gjovanov/roomler-ai/issues/2359) · **Status:** done — every criterion
+field-verified: P1–P4 merged and live (P4a #2413, P4b #2418; promoted 2026-10-18 00:15Z), AC1–AC7 ticked,
+every open decision settled by the operator (1–4 on 2026-10-17, 5–6 on 2026-10-18); P5 (native touch) not
+built, by decision 3 · **Owner:** the viewer's input path
 (`useRemoteControl.ts`, the stage, `MobileKeyboard.vue`), and from P4a the `remote` module's
 `touch_presets`; the agent only from P5 · **Anchors:** master `f93c23f74` · **Program:**
 [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 3 (§3 "Touch controls", row P11) ·
@@ -157,7 +157,7 @@ flowchart LR
   | Route | Who |
   |---|---|
   | `GET /api/tenant/{tid}/touch-preset` | any member: every viewer in the org offers them |
-  | `POST /api/tenant/{tid}/touch-preset` | `MANAGE_TENANT` (open decision 5) |
+  | `POST /api/tenant/{tid}/touch-preset` | `MANAGE_TENANT` (decision 5, settled 2026-10-18) |
   | `PUT /api/tenant/{tid}/touch-preset/{id}` | `MANAGE_TENANT`; the id resolved **within** the tenant, so a foreign one is a 404 that leaks nothing |
   | `DELETE /api/tenant/{tid}/touch-preset/{id}` | `MANAGE_TENANT`, the same |
 
@@ -168,7 +168,7 @@ flowchart LR
   - sizes and places stay within sane pixel ranges;
   - a macro has at most 32 steps, a wait at most 5 s and the whole macro at most 30 s;
   - at most 24 controls per preset and 50 presets per org, with a body limit on the routes.
-- **A member's own layout stays in the browser** (open decision 6): the editor saves to `localStorage`
+- **A member's own layout stays in the browser** (decision 6, settled 2026-10-18): the editor saves to `localStorage`
   per user, with no server and no permission, and an org admin can publish a layout to the org. *As built
   (P4b-2):* a built-in, or an org layout without the right, is read-only and copied before it changes; a
   draft is checked against the server's rules, with its codes, before any save; keys are captured from the
@@ -199,9 +199,9 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
 | P1 | Touch on the stage (3a) | viewer storage key `roomler-rc-touch=legacy` | **built** (3a "as built"): the stage keeps every touch, a cancelled pointer lets go, and the direct-mode gestures. Unit tests: `touchInput.spec.ts` (8), `touchGestures.spec.ts` (11), vitest 2173. A negative control, a press tracker that never forgets a pointer, failed 3 tests. **Field-green on a candidate bundle** (this branch's `ui/dist` served into the page, §8 rows 2–4). Re-checked on the live viewer after the 2026-10-17 promote (§8 rows 9–10) |
 | P2 | Trackpad mode (3b) | the mode switch | **built** (3b "as built"): 5 trackpad tests, plus 2 for the mode's storage, vitest green. **Field-green on a candidate bundle** on both paths (§8 rows 5–6). The default stays direct until decision 1 |
 | P3 | On-screen controls and built-in presets (3c) | the overlay's toggle | **built** (3c "as built"): the overlay, the driver, three presets built to decision 2's recommendation, remembered per device. 26 unit tests, vitest 2209. **Field-green on a candidate bundle** (§8 rows 7–8): every control reached the host as the key it names, on both pointer paths. Re-checked on the live viewer after the 2026-10-17 promote (§8 rows 9–10) |
-| P4a | The org's presets on the server: `touch_presets` (the `remote` module), its four routes, strict validation, macro steps in the schema (3d) | — (inert until P4b's viewer reads it) | **built** (3d; decision 5 open, built to its recommendation): `TouchPreset` and `TouchPresetRequest::validate` in `remote_control`, `TouchPresetDao`, the four routes in `modules/remote/src/touch_presets.rs`, the unique `(tenant_id, name)` index. Tests: 4 unit (a viewer's own JSON parses and validates, unknown fields refused at every level, 35 refusal cases each by its code, the key range) and 4 integration (who reads and writes, a foreign id as a 404, refusals by code with nothing stored and a 413, the 50 cap). The composition baseline is re-recorded for exactly the two routes and the one index |
+| P4a | The org's presets on the server: `touch_presets` (the `remote` module), its four routes, strict validation, macro steps in the schema (3d) | — (inert until P4b's viewer reads it) | **built** (3d; decision 5, settled as recommended on 2026-10-18): `TouchPreset` and `TouchPresetRequest::validate` in `remote_control`, `TouchPresetDao`, the four routes in `modules/remote/src/touch_presets.rs`, the unique `(tenant_id, name)` index. Tests: 4 unit (a viewer's own JSON parses and validates, unknown fields refused at every level, 35 refusal cases each by its code, the key range) and 4 integration (who reads and writes, a foreign id as a 404, refusals by code with nothing stored and a 413, the 50 cap). The composition baseline is re-recorded for exactly the two routes and the one index |
 | P4b-1 | The org's presets in the overlay's menu, macros played by the driver (3d) | the overlay's toggle | **built**: `orgPresets` (server rows under `org:` ids, a malformed row left out), `presetById` and `readControlsPreset` that know them, the store's `fetchOrgTouchPresets` (none on any error), the menu's "Your organization" heading, and `playMacro` / `stopMacros` in the driver (plays to its end, ignores a press while playing, releases only its own, lets go of what it still holds, never waits over 5 s), with the button lit while it plays. Tests: 8 vitest in `touchControls.spec.ts` and 1 in `TouchControls.spec.ts`; the suite 2232 green, the build green. Two negative controls each failed their test: a lift that stopped the macro, and a step that released a key it had not pressed. **The macro engine is field-green** through a member's own layout (§8 row 15, phase D): one 90 ms tap played all five steps on the host in order, both 300 ms waits read as 297 ms there, and the macro finished after the finger lifted. **The org half is field-green on the live viewer** (§8 row 18): a preset created through P4a's API was offered under "Your organization" and its macro played on the host in order |
-| P4b-2 | The editor, and a member's own presets in the browser (3d) | — (a menu item; nothing changes until a layout is saved) | **built** (3d "as built"; decision 6 open, built to its recommendation): `TouchPresetEditor.vue` (the three kinds of layout, key capture, a live preview on a sink that sends nothing), `touchPresetEdit.ts` (the server's rules and codes mirrored in `validatePreset`, a member's own layouts under `roomler-rc-touch-presets:<user id>`), the store's `saveOrgTouchPreset` / `deleteOrgTouchPreset`, and `keyboardPaused` in `useRemoteControl.ts` (no key forwarded while the editor is open, and what the keyboard held let go on pausing). Tests: 9 vitest in `touchPresetEdit.spec.ts` (every built-in passes the rules, a refusal per code) and 6 in `TouchPresetEditor.spec.ts`; the suite and the build green. Two negative controls each failed their test: an org layout editable without the right, and a capture that let one key in twice. `keyboardPaused` has no unit test (no spec instantiates the composable), so it is proven on the surface: **field-green on a candidate bundle** (§8 rows 15–16). Nothing typed while the editor was open reached the host's probe, a key held when it opened was let go there, and the keyboard came back when it closed. With the check taken out, the name's keys, the capture keys and a key-up all reached the host. **Re-checked on the live viewer** after the 2026-10-18 promote (row 17): the same answers |
+| P4b-2 | The editor, and a member's own presets in the browser (3d) | — (a menu item; nothing changes until a layout is saved) | **built** (3d "as built"; decision 6, settled as recommended on 2026-10-18): `TouchPresetEditor.vue` (the three kinds of layout, key capture, a live preview on a sink that sends nothing), `touchPresetEdit.ts` (the server's rules and codes mirrored in `validatePreset`, a member's own layouts under `roomler-rc-touch-presets:<user id>`), the store's `saveOrgTouchPreset` / `deleteOrgTouchPreset`, and `keyboardPaused` in `useRemoteControl.ts` (no key forwarded while the editor is open, and what the keyboard held let go on pausing). Tests: 9 vitest in `touchPresetEdit.spec.ts` (every built-in passes the rules, a refusal per code) and 6 in `TouchPresetEditor.spec.ts`; the suite and the build green. Two negative controls each failed their test: an org layout editable without the right, and a capture that let one key in twice. `keyboardPaused` has no unit test (no spec instantiates the composable), so it is proven on the surface: **field-green on a candidate bundle** (§8 rows 15–16). Nothing typed while the editor was open reached the host's probe, a key held when it opened was let go there, and the keyboard came back when it closed. With the check taken out, the name's keys, the capture keys and a key-up all reached the host. **Re-checked on the live viewer** after the 2026-10-18 promote (row 17): the same answers |
 | P5 | Native touch injection (3e) | agent capability word | — |
 | P6 | Docs: `docs/touch-controls.md` (mermaid, the gestures, the modes, the presets), linked from `docs/remote-control.md` §6 and indexed in `docs/README.md` | — | **done** (AC7): five mermaid diagrams, every built phase through P4 |
 
@@ -248,8 +248,8 @@ The agent still only injects (FR-92's rule). No phase reads input on the host.
 
 ## 6. Open decisions
 
-Decisions 1–4 were **decided by the operator on 2026-10-17, as recommended**. Decisions 5 and 6 are P4's,
-and open.
+Decisions 1–4 were **decided by the operator on 2026-10-17, as recommended**, and decisions 5 and 6 (P4's)
+on **2026-10-18, as recommended**.
 
 1. **The default on a phone.** Direct touch (today's) or trackpad. Recommended: trackpad on a phone-sized
    screen, direct on a tablet, switchable in the toolbar. **Decided as recommended.** Built: with nothing
@@ -272,14 +272,13 @@ and open.
    org's session policy and limits for every session. A preset runs on every member's viewer, so writing
    one is deciding for the org; reading stays open to every member. The alternative, a new permission bit,
    is one more grant to reconcile on every managed role (`docs/permissions.md`) for a setting that sends
-   only keys the member could press anyway. *Open; P4a is built to the recommendation, which a different
-   answer changes in one guard per route.*
+   only keys the member could press anyway. **Decided as recommended** (2026-10-18), so P4a stands: one
+   `MANAGE_TENANT` guard per write route.
 6. **A member's own layout** (P4). Recommended: kept in the browser (`localStorage`, per user), so a member
    needs no permission and the server holds only what the org shares. The alternative, per-user rows on
    the server, would follow a person across devices at the cost of a second, per-user collection.
-   *Open; P4b-2 is built to the recommendation: a member's own layouts are kept per user in the browser
-   (`readMyPresets`), and only publishing one to the org reaches the server. The alternative is a second
-   collection and a store change, with the editor unchanged.*
+   **Decided as recommended** (2026-10-18), so P4b-2 stands: a member's own layouts are kept per user in
+   the browser (`readMyPresets`), and only publishing one to the org reaches the server.
 
 ## 7. Out of scope
 

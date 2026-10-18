@@ -380,6 +380,14 @@ The multi-pod design is settled and documented in
 - **coturn** — TURN/STUN for remote-desktop and tunnel fallback paths. The server
   mints ephemeral HMAC credentials (`/api/turn/credentials`); multi-region
   topology is served from `/api/relay/regions`.
+  - ⚠️ **TURN is IPv4-only, by design** (FR-101 AC8, the operator's decision of
+    2026-10-18). Every TURN host the server hands out (`ROOMLER__TURN__URL` =
+    `coturn.roomler.ai`, and the `…__WORKER_URLS` `coturn-1..3.roomler.ai`) has A records
+    and no AAAA, and the coturn pods sit behind the hosts' IPv4 DNAT. A client on an
+    IPv6-only network reaches TURN through its network's NAT64/DNS64, as it reaches
+    `roomler.ai` itself, which has no AAAA either. Making TURN dual-stack takes AAAA
+    records, ip6tables DNAT on every host and dual-stack pods. A coturn restart drops
+    every relayed session, so that waits for an IPv6-only audience worth it.
 - **DERP PoPs** — `cargo build -p derp-relay` produces the standalone regional
   relay: DB-free, no JWT secret, authenticates agents by server-minted Ed25519
   tickets. One small VM per region is enough; it forwards WireGuard ciphertext it
