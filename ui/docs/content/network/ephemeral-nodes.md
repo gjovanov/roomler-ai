@@ -65,7 +65,9 @@ ephemeral.
 
 Two mechanisms, because a machine cannot always announce its own exit:
 
-- **On a clean stop**, the agent removes itself as it shuts down.
+- **On a clean stop**, the agent removes itself as it shuts down. A Windows
+  per-user install stops cleanly on `roomlerd service stop`, on sign-out and on
+  shutdown. Ending its task (Task Manager, `schtasks /End`) is not a clean stop.
 - **Otherwise**, a reaper removes ephemeral devices that have stopped reporting.
 
 An update that restarts the agent does **not** count as a shutdown — otherwise

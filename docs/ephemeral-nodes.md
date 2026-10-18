@@ -165,8 +165,9 @@ flowchart LR
 | `roomlerd service stop` | (no such command) | A clean stop: an ephemeral device unenrolls. It waits up to 15 s for the daemon to leave, then falls back to `schtasks /End` |
 | Sign-out, shutdown, restart | Killed with the session; the reaper collects an ephemeral device | A clean stop, which the window holds the session's end for, at most 5 s (`SESSION_END_BUDGET`) |
 | An installer's Restart Manager (`ENDSESSION_CLOSEAPP`) | — | Ignored: never a leave |
+| `roomlerd service stop` from an SSH login (session 0) | (no such command) | A hard stop (`schtasks /End`), and it says why: the person's event lives in their own session, which session 0 cannot see |
 | `schtasks /End`, Task Manager's End task, `taskkill /F` | A hard kill; the reaper | The same |
-| `taskkill` without `/F` (`WM_CLOSE`) | Refused: "can only be terminated forcefully" | Ignored: the daemon keeps running. Use `roomlerd service stop` |
+| `taskkill` without `/F` (`WM_CLOSE`) | Refused: "can only be terminated forcefully" | In the person's session, taskkill reports that it sent the signal, and the daemon keeps running. Use `roomlerd service stop` |
 | An auto-update | The internal arm: stays enrolled | The same |
 
 - **Which daemon.** The event is keyed by the config's instance id, the
