@@ -316,12 +316,27 @@ mod tests {
             let outcome = acquire(&cfg).unwrap();
             assert!(matches!(outcome, AcquireOutcome::Acquired(_)));
         } // <- guard drops here
-        // Brief settle for the OS to finalize the close. flock release
-        // is synchronous; named mutex CloseHandle is also synchronous;
-        // but Windows occasionally needs a yield before another
-        // CreateMutexW reports ERROR_ALREADY_EXISTS=0. Practically
-        // this is sub-microsecond; the test passes without any sleep.
-        let after = acquire(&cfg).unwrap();
+        // The release itself is synchronous: flock goes with the last close
+        // of the open file description, a named mutex with CloseHandle. What
+        // this test does not control is a SIBLING test spawning a process:
+        // on Unix the fork copies every fd, this lock's included, and the
+        // copy (O_CLOEXEC) closes only at the child's exec, so for that
+        // fork-to-exec window the lock is still held. An immediate
+        // re-acquire failed that way once in a CI lane of 2,265 tests; two
+        // threads spawning `/bin/true` beside a drop/re-acquire loop
+        // reproduced it 29 times in 20,000, and never with no spawner. So
+        // the re-acquire may wait a bounded while; a lock that never frees
+        // still fails.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let after = loop {
+            let outcome = acquire(&cfg).unwrap();
+            if matches!(outcome, AcquireOutcome::Acquired(_))
+                || std::time::Instant::now() >= deadline
+            {
+                break outcome;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         assert!(
             matches!(after, AcquireOutcome::Acquired(_)),
             "after drop, a fresh acquire should succeed"
