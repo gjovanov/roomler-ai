@@ -41,6 +41,9 @@ pub mod companion_spawn;
 pub mod desktop;
 pub mod environment;
 pub mod firewall;
+/// FR-97 P4d — a per-user daemon's clean stop at sign-out and shutdown: a
+/// hidden window hears `WM_ENDSESSION`, which no console handler does here.
+pub mod session_end;
 /// #1683 — the graceful-stop event the SCM host signals so a worker (an
 /// ephemeral device especially) self-unenrolls before it is TerminateProcess'd.
 pub mod stop_event;
