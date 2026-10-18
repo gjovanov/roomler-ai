@@ -14,6 +14,7 @@
 //! | `source_not_measured` | `purestat` | the digest's web plane read "not measured" on the two latest due days while a purestat key is configured | either day measured, or no key |
 //! | `source_not_measured` | `purestat_pull` | the `saas` puller's `growth_pulls` rows for the two latest cycled days are both absent or `failed` — once the puller has any row at all | either day `ok`, or nothing pulls here |
 //! | `source_not_measured` | `sendgrid` | on each of the two latest closed days ≥ 1 newsletter send was accepted and NOT ONE delivery event arrived, with the webhook key configured | either day recorded an event, or no key |
+//! | `source_not_measured` | `search_console_pull` · `url_inspection_pull` · `content_pull` · `github_pull` · `github_traffic_pull` · `bing_pull` | a configured `saas` puller is **failing two days running**: it still tries (an attempt in the last 26 h), and nothing it pulled has succeeded in 48 h (never, for a puller first tried ≥ 48 h ago). Measured on the clock, not on its ledger's days, because each puller dates its rows differently (Google's final day, yesterday, today) | a pull succeeds, the puller stops trying (switched off, unmounted), or it is not configured |
 //! | `spike` / `drop` | `signups` | yesterday's sign-ups against the 28 days before: baseline n ≥ 30; spike `x > m + 3√m` and `x ≥ 2m`; drop `x < m − 3√m` | yesterday is within the band |
 //! | `spike` / `drop` | `visitors` | the same, over the puller's daily `visitors` rows (`by = site`); needs yesterday's row and ≥ 21 of the 28 baseline days | the same |
 //!
@@ -44,7 +45,10 @@ use axum::{
 use bson::{Bson, DateTime, Document, doc};
 use chrono::{Duration, NaiveDate, Timelike};
 use roomler_ai_services::dao::{
-    growth::{GrowthDao, PURESTAT_SOURCE, PullStatus},
+    growth::{
+        BING_SOURCE, CONTENT_SOURCE, GITHUB_SOURCE, GITHUB_TRAFFIC_SOURCE, GrowthDao, GrowthPull,
+        PURESTAT_SOURCE, PullStatus, SEARCH_CONSOLE_SOURCE, URL_INSPECTION_SOURCE,
+    },
     growth_alert::{GrowthAlert, GrowthAlertDao},
     growth_digest::{DigestStatus, DigestStore},
 };
@@ -77,6 +81,22 @@ pub const PULL_GRACE_HOURS: u32 = 1;
 pub const PULL_CYCLE_HOUR_UTC: u32 = 1;
 /// Consecutive days a source must read "not measured" to fire.
 pub const NOT_MEASURED_DAYS: usize = 2;
+/// A puller fails "two days running" when nothing it pulled succeeded in
+/// this long (§3l).
+pub const PULL_FAILING_HOURS: i64 = 48;
+/// … while it still tries: its newest attempt is this recent. A puller with
+/// no attempt this recent was switched off or is not due, and holds nothing.
+pub const PULL_TRYING_HOURS: i64 = 26;
+/// The pullers the failing-pull keys watch: `(key, growth_pulls source)`.
+/// purestat keeps its own day-based `purestat_pull` check.
+pub const PULLERS: [(&str, &str); 6] = [
+    ("search_console_pull", SEARCH_CONSOLE_SOURCE),
+    ("url_inspection_pull", URL_INSPECTION_SOURCE),
+    ("content_pull", CONTENT_SOURCE),
+    ("github_pull", GITHUB_SOURCE),
+    ("github_traffic_pull", GITHUB_TRAFFIC_SOURCE),
+    ("bing_pull", BING_SOURCE),
+];
 /// The baseline a spike or drop is read against.
 pub const BASELINE_DAYS: i64 = 28;
 /// Baseline days the puller must have for the visitors rule.
@@ -121,7 +141,17 @@ impl Rule {
     pub fn keys(self) -> &'static [&'static str] {
         match self {
             Rule::DigestMissing => &["daily"],
-            Rule::SourceNotMeasured => &["purestat", "purestat_pull", "sendgrid"],
+            Rule::SourceNotMeasured => &[
+                "purestat",
+                "purestat_pull",
+                "sendgrid",
+                "search_console_pull",
+                "url_inspection_pull",
+                "content_pull",
+                "github_pull",
+                "github_traffic_pull",
+                "bing_pull",
+            ],
             Rule::Spike | Rule::Drop => &["signups", "visitors"],
         }
     }
@@ -369,6 +399,83 @@ async fn purestat_pull_not_measured(
     Ok(Some(doc! { "days": states, "last_error": last_error }))
 }
 
+/// Whether the `saas` puller writing `source` runs on this server at all —
+/// each puller's own start condition, so a source nobody configured holds
+/// nothing. The feed needs no credential, only the growth surface.
+fn puller_configured(g: &roomler_ai_config::GrowthSettings, source: &str) -> bool {
+    match source {
+        SEARCH_CONSOLE_SOURCE | URL_INSPECTION_SOURCE => g.search_console_configured(),
+        GITHUB_SOURCE => g.github_repo().is_some(),
+        GITHUB_TRAFFIC_SOURCE => g.github_repo().is_some() && g.github_traffic_configured(),
+        BING_SOURCE => g.bing_configured(),
+        CONTENT_SOURCE => true,
+        _ => false,
+    }
+}
+
+/// Pure (§3l): a puller "failing two days running", read on the clock from
+/// its `growth_pulls` rows. It holds when the puller still tries (its newest
+/// attempt within [`PULL_TRYING_HOURS`]) and nothing it pulled succeeded
+/// within [`PULL_FAILING_HOURS`] — for a puller that never succeeded, once
+/// its oldest attempt on record is that old, so a fresh key's first bad
+/// hours do not alert. The clock, not the rows' days: each puller dates its
+/// rows its own way (Google's final day, yesterday, today), and a row stays
+/// `ok` with the newest attempt's `error` when a retry of a pulled day fails,
+/// so the newest SUCCESS (`pulled_at`) is the one fact they all share.
+pub fn pull_failing(pulls: &[GrowthPull], now_ms: i64) -> Option<Document> {
+    let hour = 3_600_000_i64;
+    let newest_attempt = pulls
+        .iter()
+        .map(|p| p.attempted_at.timestamp_millis())
+        .max()?;
+    if newest_attempt < now_ms - PULL_TRYING_HOURS * hour {
+        return None;
+    }
+    let last_ok = pulls
+        .iter()
+        .filter_map(|p| p.pulled_at.map(|t| t.timestamp_millis()))
+        .max();
+    let failing_since = match last_ok {
+        Some(t) => t,
+        None => pulls
+            .iter()
+            .map(|p| p.attempted_at.timestamp_millis())
+            .min()?,
+    };
+    if failing_since > now_ms - PULL_FAILING_HOURS * hour {
+        return None;
+    }
+    let newest = pulls
+        .iter()
+        .max_by_key(|p| p.attempted_at.timestamp_millis())?;
+    let at = |ms: i64| rfc3339(DateTime::from_millis(ms));
+    Some(doc! {
+        "last_ok": last_ok.map(at).map_or(Bson::Null, Bson::String),
+        "last_attempt": at(newest_attempt),
+        "last_error": newest.error.clone().unwrap_or_default(),
+        "hours_failing": (now_ms - failing_since) / hour,
+    })
+}
+
+/// The failing-pull check for one `(key, source)` of [`PULLERS`].
+async fn puller_failing(
+    state: &AppState,
+    now: DateTime,
+    source: &str,
+) -> Result<Option<Document>, DigestError> {
+    let g = &state.settings.growth;
+    if !mounted(state, "saas") || !puller_configured(g, source) {
+        return Ok(None);
+    }
+    // Search Console's newest final day trails the clock by days; 35 days
+    // of ledger is far more than any puller's lookback.
+    let from = utc_date_of(now) - Duration::days(35);
+    let pulls = GrowthDao::new(&state.db)
+        .pulls_between(source, &day_str(from), "9999-12-31")
+        .await?;
+    Ok(pull_failing(&pulls, now.timestamp_millis()))
+}
+
 async fn sendgrid_not_measured(
     state: &AppState,
     now: DateTime,
@@ -541,6 +648,13 @@ pub async fn verdicts(state: &AppState, now: DateTime) -> Result<Vec<Verdict>, D
             holds: sendgrid_not_measured(state, now).await?,
         },
     ];
+    for (key, source) in PULLERS {
+        out.push(Verdict {
+            rule: Rule::SourceNotMeasured,
+            key,
+            holds: puller_failing(state, now, source).await?,
+        });
+    }
     let yesterday = utc_date_of(now) - Duration::days(1);
     let signups = signups_series(state, yesterday).await?;
     out.extend(band_verdicts("signups", yesterday, Some(&signups)));
@@ -872,9 +986,165 @@ mod tests {
         }
         assert_eq!(
             Rule::SourceNotMeasured.keys(),
-            &["purestat", "purestat_pull", "sendgrid"]
+            &[
+                "purestat",
+                "purestat_pull",
+                "sendgrid",
+                "search_console_pull",
+                "url_inspection_pull",
+                "content_pull",
+                "github_pull",
+                "github_traffic_pull",
+                "bing_pull",
+            ]
         );
+        // Every failing-pull key is evaluated, and only those.
+        let keys = Rule::SourceNotMeasured.keys();
+        assert_eq!(&keys[3..], PULLERS.map(|(k, _)| k).as_slice());
         assert_eq!(Rule::Spike.keys(), Rule::Drop.keys());
+    }
+
+    fn pull(day: &str, ok_at: Option<&str>, attempted: &str, error: Option<&str>) -> GrowthPull {
+        GrowthPull {
+            id: GrowthPull::id_of(SEARCH_CONSOLE_SOURCE, day),
+            source: SEARCH_CONSOLE_SOURCE.into(),
+            day: day.into(),
+            status: if ok_at.is_some() {
+                PullStatus::Ok
+            } else {
+                PullStatus::Failed
+            },
+            pulled_at: ok_at.map(at),
+            attempted_at: at(attempted),
+            attempts: 1,
+            rows: 0,
+            error: error.map(str::to_string),
+            missing_goal: None,
+            truncated: false,
+        }
+    }
+
+    /// §3l — "failing two days running", on the clock: a success inside 48 h
+    /// clears it; an old success with a recent failed attempt fires; a puller
+    /// that stopped trying holds nothing; a puller that never succeeded fires
+    /// only once its first attempt on record is 48 h old.
+    #[test]
+    fn a_puller_fails_two_days_running_only_while_it_still_tries() {
+        let now = at("2026-10-18T12:00:00Z").timestamp_millis();
+        assert_eq!(
+            pull_failing(&[], now),
+            None,
+            "nothing pulled, nothing to say"
+        );
+
+        // A good pull 10 h ago: fine, whatever failed after it.
+        let fine = [
+            pull(
+                "2026-10-15",
+                Some("2026-10-18T02:00:00Z"),
+                "2026-10-18T02:00:00Z",
+                None,
+            ),
+            pull("2026-10-16", None, "2026-10-18T11:00:00Z", Some("HTTP 503")),
+        ];
+        assert_eq!(pull_failing(&fine, now), None);
+
+        // The last good pull 3 days ago, failing since — still trying an hour ago.
+        let failing = [
+            pull(
+                "2026-10-13",
+                Some("2026-10-15T09:00:00Z"),
+                "2026-10-15T09:00:00Z",
+                None,
+            ),
+            pull("2026-10-14", None, "2026-10-17T10:00:00Z", Some("HTTP 403")),
+            pull("2026-10-15", None, "2026-10-18T11:00:00Z", Some("HTTP 401")),
+        ];
+        let d = pull_failing(&failing, now).expect("fires");
+        assert_eq!(d.get_str("last_ok").unwrap(), "2026-10-15T09:00:00Z");
+        assert_eq!(d.get_str("last_attempt").unwrap(), "2026-10-18T11:00:00Z");
+        assert_eq!(
+            d.get_str("last_error").unwrap(),
+            "HTTP 401",
+            "the newest attempt's"
+        );
+        assert_eq!(d.get_i64("hours_failing").unwrap(), 75);
+
+        // The same, but the newest attempt is 30 h old: switched off, not failing.
+        let stopped = [
+            pull(
+                "2026-10-13",
+                Some("2026-10-14T09:00:00Z"),
+                "2026-10-14T09:00:00Z",
+                None,
+            ),
+            pull("2026-10-14", None, "2026-10-17T06:00:00Z", Some("HTTP 401")),
+        ];
+        assert_eq!(pull_failing(&stopped, now), None);
+
+        // Never succeeded: quiet for the first 48 h, then it fires.
+        let fresh = [pull(
+            "2026-10-17",
+            None,
+            "2026-10-18T11:00:00Z",
+            Some("bad key"),
+        )];
+        assert_eq!(pull_failing(&fresh, now), None);
+        let stuck = [
+            pull("2026-10-15", None, "2026-10-16T03:00:00Z", Some("bad key")),
+            pull("2026-10-17", None, "2026-10-18T11:00:00Z", Some("bad key")),
+        ];
+        let d = pull_failing(&stuck, now).expect("fires after 48 h of trying");
+        assert_eq!(d.get("last_ok"), Some(&Bson::Null));
+        assert_eq!(d.get_i64("hours_failing").unwrap(), 57);
+
+        // An `ok` row whose newest retry failed still counts its success.
+        let retried = [pull(
+            "2026-10-16",
+            Some("2026-10-17T20:00:00Z"),
+            "2026-10-18T11:00:00Z",
+            Some("timeout"),
+        )];
+        assert_eq!(pull_failing(&retried, now), None);
+    }
+
+    /// Each failing-pull key runs only where its puller would: the feed
+    /// always, the others behind their own credentials.
+    #[test]
+    fn a_puller_is_watched_only_where_it_runs() {
+        let mut g = roomler_ai_config::GrowthSettings {
+            github_repo: String::new(),
+            github_token: String::new(),
+            search_console_key: String::new(),
+            bing_api_key: String::new(),
+            ..Default::default()
+        };
+        let on: Vec<&str> = PULLERS
+            .iter()
+            .filter(|(_, s)| puller_configured(&g, s))
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(on, ["content_pull"]);
+        g.github_repo = "owner/repo".into();
+        g.search_console_key = "{\"type\":\"service_account\"}".into();
+        g.search_console_site = "sc-domain:example.test".into();
+        let on: Vec<&str> = PULLERS
+            .iter()
+            .filter(|(_, s)| puller_configured(&g, s))
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(
+            on,
+            [
+                "search_console_pull",
+                "url_inspection_pull",
+                "content_pull",
+                "github_pull"
+            ]
+        );
+        g.github_token = "ghp_fake".into();
+        g.bing_api_key = "0123456789abcdef0123456789abcdef".into();
+        assert!(PULLERS.iter().all(|(_, s)| puller_configured(&g, s)));
     }
 
     /// The band: nothing below n = 30; a spike needs 3σ and 2× the mean; a
