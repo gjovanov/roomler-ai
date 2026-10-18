@@ -115,6 +115,7 @@ import {
 } from './touchGestures'
 import { modsOf, type ControlsSink, type MouseBtn } from './touchControls'
 import { parseFeaturesRefused } from './useSessionFeatures'
+import { ctrlAltDelFrames } from './ctrlAltDel'
 
 /**
  * Backoff ladder for the auto-reconnect path. The first three steps
@@ -12327,23 +12328,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
 
   /** Send Ctrl+Alt+Del to the remote. The browser can't capture this
    *  key combo (the OS intercepts first), so callers typically wire
-   *  this to a dedicated toolbar button. Emits the three down events
-   *  in the canonical order (CtrlÃ¢ÂÂAltÃ¢ÂÂDel) followed by releases in
-   *  reverse, matching the native SAS ordering. */
+   *  this to a dedicated toolbar button. FR-97 P4a: to an agent that
+   *  sends Windows' secure attention sequence, one `sas` frame, which
+   *  the lock and sign-in screens answer; to any other, the three keys
+   *  in the native order (`ctrlAltDelFrames`). */
   function sendCtrlAltDel() {
     const ch = channels.input
     if (!ch || ch.readyState !== 'open') return
-    // HID usage codes: LeftCtrl=0xe0, LeftAlt=0xe2, Delete=0x4c
-    // mods bitfield: ctrl=1, shift=2, alt=4, meta=8
-    const send = (msg: Record<string, unknown>) => {
-      try { ch.send(JSON.stringify(msg)) } catch { /* dropped */ }
+    for (const frame of ctrlAltDelFrames(agent?.value?.capabilities?.input)) {
+      try { ch.send(JSON.stringify(frame)) } catch { /* dropped */ }
     }
-    send({ t: 'key', code: 0xe0, down: true, mods: 1 })
-    send({ t: 'key', code: 0xe2, down: true, mods: 1 | 4 })
-    send({ t: 'key', code: 0x4c, down: true, mods: 1 | 4 })
-    send({ t: 'key', code: 0x4c, down: false, mods: 1 | 4 })
-    send({ t: 'key', code: 0xe2, down: false, mods: 1 })
-    send({ t: 'key', code: 0xe0, down: false, mods: 0 })
   }
 
   return {

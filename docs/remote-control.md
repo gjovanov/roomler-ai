@@ -387,7 +387,7 @@ is tested on every OS.
 | `audio` | Linux with no way to the computer's sound (FR-97 P3c, §5.1c) | `audio` empty; `no-sound-server` (no Pulse client library), `no-session` (a root build without the session helper), or `no-monitor` (`ROOMLERD_AUDIO_SESSION=0` with nothing named) | the same |
 | `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:726`](../agents/roomlerd/src/encode/caps.rs#L726)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone reports copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
-| `sas` | Windows, Linux | `keys-only`: the button types three ordinary keys. Windows' lock and sign-in screens ignore them (until P4a's `SendSAS`); Linux desktops bind them, GNOME and KDE to log out | the button stays, and says what the keys reach |
+| `sas` | Windows, Linux | `keys-only`: the button types three ordinary keys. Windows' lock and sign-in screens ignore them; Linux desktops bind them, GNOME and KDE to log out. A Windows host that can send the real sequence advertises `input: sas` instead and drops this entry (P4a, §5.1e) | the button stays, and says what the keys reach |
 | `sas` | macOS | `not-applicable`: the chord means nothing there | the button is hidden |
 
 ⚠️ **The lists still decide what works.** An empty `audio` list disabled the
@@ -589,6 +589,59 @@ The inhibitor lives exactly as long as its fd: logind drops it when the fd
 closes, so a daemon that crashes leaves nothing pinned. `systemd-inhibit
 --list` shows it (`roomlerd`, `block`) only while a session or an SSH or exec
 run is live.
+
+### 5.1e Ctrl+Alt+Del that reaches the lock screen (FR-97 P4a)
+
+The browser cannot capture Ctrl+Alt+Del, so the viewer has a button. Until
+P4a it typed three ordinary keys. Apps on the desktop get those, but the
+Windows lock and sign-in screens do not: they answer only the **secure
+attention sequence** (SAS), which the kernel raises for the physical chord and
+`SendSAS` raises for software. On a machine whose policy requires Ctrl+Alt+Del
+at sign-in, the viewer could see the lock screen and never get past it.
+
+`SendSAS(FALSE)` works under two conditions, and the daemon offers the real
+sequence only when both hold:
+
+| Condition | Where it holds | Read from |
+|---|---|---|
+| The caller is **LocalSystem** | the SystemContext worker of an SCM install. Not a per-user install, and not an attended worker, which runs as the signed-in person | the process's own token (`worker_role::probe_self`) |
+| The **`SoftwareSASGeneration`** policy lets services | `1` (services) or `3` (services and Ease of Access). Absent, Windows lets only Ease of Access applications | `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System` |
+
+```mermaid
+flowchart LR
+    A["the announcement<br/>(every hello)"] --> D{"SYSTEM, and the policy<br/>lets services?"}
+    D -->|yes| S["input: sas<br/>no keys-only entry"]
+    D -->|no| K["keys-only, with the<br/>half that is missing"]
+    S --> V["the button sends<br/>{t: sas}"]
+    V --> E["the injector re-checks,<br/>then SendSAS(FALSE)"]
+    K --> T["the button types<br/>the three keys"]
+```
+
+- **The decision is one pure function**
+  ([`sas.rs:87`](../agents/roomlerd/src/input/sas.rs#L87)), compiled on every
+  OS so the lanes that never run Windows tests check it. It is made at every
+  announcement ([`signaling.rs:6295`](../agents/roomlerd/src/signaling.rs#L6295)),
+  so a policy a GPO refresh changes is said at the next one. Where it says no,
+  the `keys-only` entry stays and its reason names the half that is missing.
+- **The viewer sends `{t: "sas"}` only to an agent that advertises `sas`**
+  ([`ctrlAltDel.ts:22`](../ui/src/composables/ctrlAltDel.ts#L22)): an older
+  agent cannot parse the frame. The title then says the real one reaches the
+  lock and sign-in screens.
+- **The injector checks again before it sends**
+  ([`enigo_backend.rs:275`](../agents/roomlerd/src/input/enigo_backend.rs#L275)):
+  the policy can change between the hello and the click, and a viewer is not
+  trusted to have read the hello. Elsewhere the frame does nothing.
+- **`sas.dll` is loaded when the sequence is sent, never imported**
+  ([`sas.rs:161`](../agents/roomlerd/src/input/sas.rs#L161)). A binary that
+  imports a DLL some Windows edition lacks does not start at all. It is loaded
+  from System32 only (`LOAD_LIBRARY_SEARCH_SYSTEM32`), so a SYSTEM process can
+  never load a copy planted beside the binary.
+- ⚠️ **The policy is read, never written.** It is a security setting, and on
+  a managed laptop it is the organisation's. Measured before the build
+  (2026-10-18, read-only over `roomler exec`), the three corporate laptops in
+  the fleet all set it to `1`.
+- The frame goes through the input arbiter like a key: it needs the input
+  floor and the session's input permission, as typing does.
 
 ### 5.2 Encoder selection
 

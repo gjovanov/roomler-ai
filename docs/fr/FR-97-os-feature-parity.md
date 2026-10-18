@@ -4,7 +4,7 @@
 - Shipped by 0.4.135 and field-verified: P0a, P0b, P0e, and the macOS exit client P1a + P1c (AC1, AC2, AC4, AC6,
   AC17).
 - The macOS exit, P1b (#2362), shipped in 0.4.141. Its pf-reference and Internet Sharing fix (#2377) rides 0.4.142.
-  AC5 is field-verified on a candidate of that fix (§8); a check on the 0.4.142 release is owed.
+  AC5 is field-verified on a candidate of that fix and on the 0.4.142 release (§8).
 - P0d, the measurement, merged (#2397): the native architecture in the hello, and `scripts/fr97-caps-census.sh`.
   It reaches the fleet with the next agent release and server promote. The count before P0c was taken on
   2026-10-17 (§8, AC15).
@@ -19,8 +19,9 @@
   both (§8). Both ride the next release.
 - P3b, the Linux lock hint (advisory) and a live session's logind block inhibitor (FR-55 P3), merged (#2431),
   field-verified red → green on a root daemon (§8).
-- P4d, a clean stop for a per-user Windows install (`roomlerd service stop`, sign-out, shutdown), is in review
-  (D15), field-verified red → green on a perUser Win11 guest (§8).
+- P4d, a clean stop for a per-user Windows install (`roomlerd service stop`, sign-out, shutdown), merged (#2435),
+  field-verified red → green on a perUser Win11 guest (§8).
+- P4a, a real Ctrl+Alt+Del (`SendSAS` from the SystemContext worker where the policy lets services), is in review.
 - The rest of P2–P7 is open.
 
 **Owner:** the agent on all
@@ -342,7 +343,7 @@ OS: FR-43's practice of keeping the decision out of `cfg(target_os)`.
 | `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:78`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:3064`); `unavailable.audio = no-backend` |
 | `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:726`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone keeps image events (`clipboard.rs:817-822`) | `events` and `images` stay: text still syncs, and an image moves on request. `not-watched` |
-| `sas` | Windows | `keys-only`: the button types three ordinary keys, which apps on the desktop get and the lock screen does not. P4a's `SendSAS` replaces it with an `input: sas` word (D11) |
+| `sas` | Windows | `keys-only`: the button types three ordinary keys, which apps on the desktop get and the lock screen does not. Since P4a a SystemContext worker on a host whose policy lets services says `input: sas` instead, and the button sends the real sequence (D11) |
 | `sas` | Linux | `keys-only`: the same keys, which the desktop binds (GNOME and KDE to log out), so the button says so rather than going |
 | `sas` | macOS | `not-applicable`: the chord means nothing there, and the viewer hides the button |
 
@@ -610,9 +611,15 @@ test of the SIGKILL property itself.
 
 ### 3.9 P4 — Windows
 
-- **P4a, a real Ctrl+Alt+Del.** `SendSAS(FALSE)` from the SYSTEM side (the SCM host, or the SystemContext worker).
-  It needs the `SoftwareSASGeneration` policy to allow services; check what GPO-locked corporate laptops set. The
-  viewer shows the button only when the host says it can send one.
+- **P4a, a real Ctrl+Alt+Del** (built). `SendSAS(FALSE)` from the SystemContext worker, which is SYSTEM, where the
+  `SoftwareSASGeneration` policy lets services (1 or 3). Measured first: all three corporate laptops in the fleet set
+  it to 1 (§8).
+  - The hello says `input: sas` and drops the `keys-only` entry only when both hold (`sas.rs:87`, decided at every
+    announcement). Elsewhere the reason names the missing half.
+  - The viewer sends `{t: "sas"}` only to an agent that advertises it, and the injector checks again before it sends.
+  - `sas.dll` is loaded at send time from System32 only, never imported.
+  - Not the SCM host's call for an attended worker: no channel carries input from the worker to the host, and the
+    SystemContext worker covers the installs this is for. `docs/remote-control.md` §5.1e.
 - **P4b, SFTP as `console_user`.** Spawn `sftp-server` through the `CreateProcessAsUserW` + three-pipe path the exec
   code already uses, instead of `tokio::process` (`ssh.rs:926-948`).
 - **P4c, Hive adopt.** A named pipe whose server reads `GetNamedPipeClientProcessId` → token → SID and maps it to the
@@ -702,7 +709,7 @@ model on Windows, so the three agree on what the mode means.
 | **P3g** | Linux companion for arm64 + tarball | — (a package) | the FR-93 lab, an arm64 vmtest guest | M |
 | **P3h** | Linux DNS without systemd-resolved | `ROOMLERD_DNS_NM=0` | evidence first | M |
 | **P3i** | Linux host firewall: what governs the overlay adapter, reported in `roomler status`, never changed (D13) | `ROOMLERD_HOST_FW_PROBE=0` | a firewalld node (zone `public`) and a ufw node, red then green | S |
-| **P4a** | Windows `SendSAS` | its cap word | Win11 Pro + a GPO-locked laptop | S–M |
+| **P4a** | Windows `SendSAS` from the SystemContext worker, where the policy lets services (built) | its cap word: no `sas` in the hello, no frame | Win11 SystemContext, red on 0.4.142; the corporate laptops' policy measured | S–M |
 | **P4b** | Windows SFTP as `console_user` | `ssh_sftp_as_user` | Win11 SystemContext | S–M |
 | **P4c** | Windows Hive adopt | `hive_adopt` | Win11 | M |
 | **P4d** | Windows per-user clean stop: `service stop` and a session-end window (D15, built) | `ROOMLERD_SESSION_END=0` (the window); `service stop` acts only when run | Win11, a perUser ephemeral device, red on 0.4.142 | S |
@@ -898,3 +905,5 @@ one depends on it.
 | 2026-10-18 | released 0.4.142 | zeus: a throwaway vmtest Win11 guest with the perUser MSI (the Scheduled Task, as the signed-in person in session 1), enrolled ephemeral. After each stop the server's device listing was sampled | 🔴 **P4d red.** `schtasks /End`: the row stayed, offline, at +15, +45 and +90 s, and the same id came back online on `schtasks /Run`. A sign-out: the row stayed at +15, +45 and +90 s. A restart with the daemon running: the same id came back online after the reboot. `taskkill` without `/F`: "can only be terminated forcefully". Restart Manager without force (`RmShutdown` on the installed exe, as the person): `351` (`ERROR_FAIL_SHUTDOWN`), and the daemon and its row stayed |
 | 2026-10-18 | the P4d candidate (`d12d86b07`, a release build without the FFmpeg, VP9 and hive features), in place of the release | the same guest; a fresh ephemeral enrollment as the person before each stop | 🟢 **P4d green.** `roomlerd service stop` as the person: "The daemon stopped cleanly in 0.8 s.", and the row was gone at +5 s. The daemon logged the ask, the graceful stop and `ephemeral device unenrolled itself on shutdown` within 230 ms. 🟢 **A sign-out:** the row was gone at +10 s: `kind=SignOut`, unenrolled 260 ms after `WM_ENDSESSION`. 🟢 Restart Manager without force: `351` again, and the daemon and its row stayed: `ENDSESSION_CLOSEAPP` is not a leave. ⚪ From the SSH login (session 0), `service stop` cannot see the person's event. It said so, fell back to `schtasks /End`, and the row stayed, as designed. ⚪ A first restart proved only the path: the task's daemon still held the identity deleted at the sign-out, so `IgnoreNew` dropped the start after the re-enrollment and the device never came online. Its stop (`kind=Shutdown`, unenrolled 500 ms later) removed the identity on disk. The rig now ends the task before it enrolls |
 | 2026-10-18 | the same candidate | the same guest: a fresh enrollment, online | 🟢 **A restart with the device online:** `kind=Shutdown`, unenrolled 345 ms after `WM_ENDSESSION`, and the row was gone at +15 s. 🟢 **`taskkill` without `/F`, in the person's session:** "SUCCESS: Sent termination signal…", and the daemon kept running (the same PID) with its row online: the window ignores `WM_CLOSE`. From session 0, taskkill sees no window there and refuses, as on the release |
+| 2026-10-18 | released 0.4.142 | the fleet, read-only over `roomler exec`: `reg query` of `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System` on the three online corporate laptops (GPO-managed), and on the dev box | **P4a measured before the build.** `SoftwareSASGeneration` is `1` (services may send a SAS) on **all three corporate laptops**, and on the dev box. So `SendSAS(FALSE)` from a SYSTEM worker works on the hosts P4a was asked about, and the daemon has no reason ever to write the policy |
+| 2026-10-18 | released 0.4.142 (its `.pkg`; the clients' `.deb` and MSI) | the full AC5 cell, as for the #2377 candidate: a throwaway tart Mac exit + subnet router bridged over Wi-Fi, with the ULA v6 uplink the MacBook NATs; a second Mac VM as the LAN host; a Linux exit client, a Linux subnet client, a Win11 exit client | **AC5's release check.** 🟢 The anchor NATs v4 and v6, `routes=["<the LAN host>/32", "0.0.0.0/0"]`. The Linux exit client's v4 and v6 egress were the Mac's, over `roomler0`, 3 samples of 3. The subnet client reached the LAN host's SSH through the Mac, 3 of 3. The Windows client was `active, v6 on, DNS steered` with the Mac's egress. Over the 15-minute hold the Mac forwarded 1,987 v4 and 138 v6 packets, pf `Enabled` throughout. 🟢 **`kill -9`:** pf and forwarding as a crash leaves them; the restart's purge flushed the anchor, released our reference and put forwarding back (`internet_sharing=false`), then served again. 🟢 **`kill -9` plus a reboot:** pf `Disabled`, forwarding 0/0, as found; the next start purged and served. 🟢 **A clean stop:** `pf NAT for the overlay reverted`, pf `Disabled`, forwarding 0/0, the ledger empty. ⚪ This cell has no re-offer, the clause in which the 36 s blackout appeared on 10-17; that one stays unexplained |

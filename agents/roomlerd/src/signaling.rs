@@ -6286,6 +6286,23 @@ fn stub_caps(multi_org_tun: bool) -> AgentCaps {
     if crate::input::advertises_mouse_rel() {
         caps.input.push("mouse-rel".into());
     }
+    // FR-97 P4a — the real Ctrl+Alt+Del where this process may send it: it
+    // runs as SYSTEM (the SystemContext worker) and the policy lets services.
+    // Live like the words above, so a GPO refresh that changes the policy is
+    // said at the next announcement. Elsewhere the button keeps typing keys,
+    // and the reason says which half is missing.
+    #[cfg(target_os = "windows")]
+    match crate::input::sas::availability() {
+        Ok(()) => {
+            caps.input.push("sas".into());
+            caps.unavailable.remove("sas");
+        }
+        Err(refusal) => {
+            if let Some(entry) = caps.unavailable.get_mut("sas") {
+                entry.reason = refusal.reason().into();
+            }
+        }
+    }
     // FR-93 P2b — the desktop a controller would see now, read from the
     // refresher's cache (never logind on this path). Live, like the words
     // above: the heartbeat re-announces when it changes.
