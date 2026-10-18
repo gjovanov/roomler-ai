@@ -459,7 +459,8 @@ fn uinput_unset() -> bool {
 /// FR-95 P2 — whether the arbiter's cached injector no longer matches what
 /// [`open_default`] would pick now: an automatic system capture started (with
 /// `uinput` unset) while another backend was cached, or an automatic uinput
-/// outlived both its captures and the Wayland desktop they were for. Never
+/// outlived both its captures and the desktop they were for: a Wayland one,
+/// or (FR-113) an X11 one while `x11_auto_system` is on. Never
 /// while an automatic capture is alive, locked or not: an injector swapped in
 /// there would be enigo, whose XTest reaches Xwayland windows behind the lock
 /// screen.
@@ -468,7 +469,7 @@ pub(crate) fn stale(inj: &dyn InputInjector) -> bool {
     {
         let live = crate::capture::seat_guard::live();
         if inj.automatic() {
-            !live && !crate::desktop_brief::seen_is_wayland()
+            !live && crate::capture::automatic_seat_kind().is_none()
         } else {
             live && uinput_unset()
         }

@@ -43,6 +43,22 @@ pub fn seen_is_wayland() -> bool {
         .is_some_and(|s| s.kind == "wayland")
 }
 
+/// FR-113 P1 — whether the desktop a controller would see is an X11 one, read
+/// as [`seen_is_wayland`] reads it. A greeter counts here too: the seat guard,
+/// not this, keeps an automatic capture off the login screen.
+#[cfg(target_os = "linux")]
+pub fn seen_is_x11() -> bool {
+    if let Some(brief) = current() {
+        return brief.kind == "x11";
+    }
+    // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    crate::keep_busy::logind::sessions()
+        .as_deref()
+        .and_then(|all| pick::seen_session(all, uid == 0, uid))
+        .is_some_and(|s| s.kind == "x11")
+}
+
 /// Start the refresher (once per process; a second call does nothing).
 pub fn start() {
     #[cfg(target_os = "linux")]
