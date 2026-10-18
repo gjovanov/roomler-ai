@@ -94,7 +94,7 @@ head-of-line-blocking layer *below* the SCTP one FR-17 is about, on top of the 5
    (`crates/tunnel-core/src/overlay/netcheck.rs:205`). Marked as such because this spec's
    own §8 rule is that absence of measurement is never evidence of absence of capability.
 3. **A high UDP port is a real risk** on the corp-managed hosts, and the codebase already
-   says so: `crates/remote_control/src/signaling.rs:2384` — *"a corp egress that whitelists
+   says so: `crates/remote_control/src/signaling.rs:2428` — *"a corp egress that whitelists
    STUN:3478 still drops the ~10-13k relay band."*
 
 **NOT established — the port choice is a hypothesis, not a finding.** ⚠️ An earlier draft
@@ -198,7 +198,7 @@ two bound `addr:port`s selected by VNI.
 
 **This is the one change that can break the fleet silently. It ships first, alone, as P0.**
 
-`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:2306`) documents itself as safe
+`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:2350`) documents itself as safe
 to extend — *"an unknown/absent value ⇒ the client falls back to its local computation, so
 adding a variant later is forward-compatible"* (`:1976-1978`). **The comment is wrong about
 the "unknown" half and the code does not implement it.** The enum is a plain
@@ -206,7 +206,7 @@ the "unknown" half and the code does not implement it.** The enum is a plain
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2117`) handles a
 *missing* field, not an *unrecognised* one. An unknown tag is a hard serde error failing the
 **entire enclosing `ServerMsg`**, and the agent's parse arm swallows it at `debug!`
-(`agents/roomlerd/src/signaling.rs:1529`).
+(`agents/roomlerd/src/signaling.rs:1534`).
 
 Add a variant carelessly and every pre-FR-19 agent **drops whole netmap frames** and stops
 installing peers — a fleet-wide outage delivered by the server, visible only at `debug!`.
@@ -214,7 +214,7 @@ installing peers — a fleet-wide outage delivered by the server, visible only a
 Four requirements, all in P0:
 
 1. A **`supports_org_relay` hello bit** (`#[serde(default)] bool`, the shape of
-   `supports_server_relay_strategy`, `signaling.rs:915`), gated at the existing both-ends
+   `supports_server_relay_strategy`, `signaling.rs:959`), gated at the existing both-ends
    gate in `server_relay_verdict` (`crates/api/src/ws/overlay.rs:1877`). The gate is
    **permanent**, not "until everyone upgrades".
 2. `#[serde(other)] Unknown` (or a `deserialize_with` mapping unknown → `None`), making the
@@ -371,7 +371,7 @@ Verdict machinery to extend, verified against master:
 | Server verdict entry point | `crates/api/src/ws/overlay.rs:1851` `server_relay_verdict` |
 | …delegating to the pure decision | `overlay.rs:1944` `relay_verdict_core` |
 | Measured caps supersede presence | `overlay.rs:1893-1902` (in `verdict_from_nodes`, `:1872`) |
-| Wire verdict enum | `crates/remote_control/src/signaling.rs:2308` `RelayStrategyWire` |
+| Wire verdict enum | `crates/remote_control/src/signaling.rs:2352` `RelayStrategyWire` |
 | Client-side cascade consuming it | `crates/tunnel-core/src/overlay/relay_link.rs:1016` `relay_strategy` |
 
 ### 2. Gates — and an honest account of which are actually armed
@@ -525,7 +525,7 @@ Three results, in order of consequence:
 3. **41641 is not a viable alternative**, so the high-port fallback is dead for this
    population.
 
-⚠️ **This narrows the codebase's own claim.** `signaling.rs:2063` says a corp egress
+⚠️ **This narrows the codebase's own claim.** `signaling.rs:2107` says a corp egress
 *"whitelists STUN:3478 still drops the ~10-13k relay band"*. Measured, CORPLAP-3 drops **11000
 and 41641** — it whitelists *only* 3478, so the constraint is "one allowed port", not "all
 but the relay band".
@@ -701,7 +701,7 @@ the counter was added without a reader"*. Still true: `stale_drops()`
 | server | `peer_relay_audit` (90 d TTL) — every **approval**, mint and refusal, reason enumerated, written in one place via `decide() -> Result<Granted, DenyReason>`, read behind `VIEW_EXEC_AUDIT` (`VIEW_RELAY_AUDIT` after #888). **P3b:** `GET …/peer-relay-audit` (`?agent_id=`), one row shape for both actions (`action: approve \| mint`) so "who made this device a relay, and what went through it?" is one query on `agent_id`; `PeerRelayDenyReason` is the enumerated vocabulary (12 arms, wire-locked) |
 
 ⚠️ An empty `relay_via` is not evidence of "no relay available" — it may mean the node never
-measured (`signaling.rs:1795`).
+measured (`signaling.rs:1839`).
 ⚠️ `relay_via` must resolve from **the requesting tenant's own node row**. A multi-org
 device has N per-tenant rows with independently-set names; resolving from any other would
 leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:87-90`.
@@ -719,7 +719,7 @@ Verified against `origin/master`, 2026-08-28.
 | Mint + ACL gate + rate limit | `overlay.rs:693` `handle_overlay_relay_request` (cross-tenant `:705-717`, ACL `:719-743`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |
 | **The mint itself (P3c)** | `crates/api/src/ws/org_relay.rs` — `maybe_mint` (gate 1 + idempotency + audit), `plan_mint` (gates 2–5, candidate ranking by probe reports), `revoke_where` + the four trigger wrappers, `reconcile_acl` (on every policy refan), `handle_relay_probe`; `OrgRelayState` holds sessions / per-relay VNI cursors / the Lamport clock / join extras / probes, pod-local |
 | Netmap shaping | `overlay.rs:1982` `shape_peer` |
-| Wire model | `crates/remote_control/src/signaling.rs:2328` `NetmapPeer`; `:2306` `RelayStrategyWire` |
+| Wire model | `crates/remote_control/src/signaling.rs:2372` `NetmapPeer`; `:2350` `RelayStrategyWire` |
 | Reachability report | new `rc:overlay.relay_probe`; **not** `CapVector` (`netcheck.rs:60`) |
 | Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:271` `sweep_carrier_health` |
 | Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2413`; fix `payload_is_wg_or_disco` `transport/derp.rs:222` |
@@ -731,7 +731,7 @@ Verified against `origin/master`, 2026-08-28.
 
 **Config keys** — four wiring points each, per the contract at
 `crates/agent-core/src/config_surface.rs:34-38`: field on `AgentConfig`; `const KEYS` entry
-(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:1796`),
+(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:1805`),
 whose return type is `[(&'static str, Option<bool>); 54]` — **a fixed-size array whose
 length must be bumped** — with `env_bridge_pairs_have_surface_parity` enforcing the pairing.
 

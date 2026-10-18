@@ -203,6 +203,10 @@ pub mod telemetry;
 pub mod token_renewal;
 pub mod tunnel;
 pub mod updater;
+/// FR-90 P3-3 — the device's vault key: made while `vault_enabled` is on, in
+/// memory only, its public half in the primary enrollment's hello. Compiled
+/// everywhere; without the `vault` feature it makes nothing.
+pub mod vault;
 pub mod version_sweep;
 pub mod virtual_desktop;
 pub mod watchdog;

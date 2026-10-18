@@ -481,6 +481,15 @@ pub struct AgentConfig {
     /// device owner's disk.
     #[serde(default)]
     pub hive_store_quota_mib: Option<u32>,
+    /// FR-90 P3-3 — let the org's vault lease values to the agent sessions on
+    /// this device. On, the daemon makes a vault key at start (in memory
+    /// only, a new one each start) and publishes its public half in the
+    /// primary enrollment's hello; off, it makes none, publishes none, and
+    /// the vault leases it nothing. Default OFF, and never pushable: whether
+    /// org secrets are ever decrypted on this machine is the device owner's
+    /// call alone, as whether sessions run here at all is `hive_enabled`'s.
+    #[serde(default)]
+    pub vault_enabled: bool,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -2486,6 +2495,7 @@ pub fn test_fixture() -> AgentConfig {
         hive_replica: false,
         hive_archive: false,
         hive_store_quota_mib: None,
+        vault_enabled: false,
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,

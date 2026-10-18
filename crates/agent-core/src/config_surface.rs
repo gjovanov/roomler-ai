@@ -466,6 +466,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-90 - the most this device keeps of the agent sessions it holds as a replica, in MiB (1-4194304). Never settable by the server. Empty = no bound but the disk's.",
     },
     KeyMeta {
+        key: "vault_enabled",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "bool",
+        description: "FR-90 - let the organization's vault lease secrets to the agent sessions on this device. On, the daemon makes a key at each start, in memory only, and a leased value is decrypted in the daemon, never in the session's process. Never settable by the server. Default: OFF.",
+    },
+    KeyMeta {
         key: "ssh_enabled",
         group: Group::Ssh,
         tier: Tier::Essential,
@@ -1865,6 +1873,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "hive_replica" => Some(fmt_bool(cfg.hive_replica)),
         "hive_archive" => Some(fmt_bool(cfg.hive_archive)),
         "hive_store_quota_mib" => cfg.hive_store_quota_mib.map(|n| n.to_string()),
+        "vault_enabled" => Some(fmt_bool(cfg.vault_enabled)),
         "ssh_exec_streaming" => Some(fmt_bool(cfg.ssh_exec_streaming)),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
@@ -2169,6 +2178,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
             cfg.hive_store_quota_mib =
                 parse_u32_range("hive_store_quota_mib", value, 1, 4 * 1024 * 1024)?
         }
+        "vault_enabled" => cfg.vault_enabled = parse_bool_or(value, false)?,
         "hive_update_wait_secs" => {
             cfg.hive_update_wait_secs = parse_u32_range("hive_update_wait_secs", value, 0, 7200)?
         }
@@ -4298,6 +4308,24 @@ mod tests {
         assert!(apply(&mut cfg, "hive_store_quota_mib", Some("10GiB")).is_err());
         apply(&mut cfg, "hive_store_quota_mib", None).unwrap();
         assert_eq!(cfg.hive_store_quota_mib, None, "cleared is unbound");
+    }
+
+    /// FR-90 P3-3 — whether the vault may lease values to this device's
+    /// sessions is the device owner's: off until they say so, off again when
+    /// cleared, and read at start, where the daemon makes its key.
+    #[test]
+    fn vault_enabled_defaults_off_and_clears_off() {
+        let mut cfg = crate::config::test_fixture();
+        assert!(!cfg.vault_enabled);
+        let e = entry_for(&cfg, "vault_enabled").unwrap();
+        assert_eq!(e.default.as_deref(), Some("false"));
+        assert_eq!(e.group, Group::Access.wire());
+        assert!(e.restart_required, "the key is made at start");
+        apply(&mut cfg, "vault_enabled", Some("true")).unwrap();
+        assert!(cfg.vault_enabled);
+        apply(&mut cfg, "vault_enabled", None).unwrap();
+        assert!(!cfg.vault_enabled, "cleared is off");
+        assert!(apply(&mut cfg, "vault_enabled", Some("sometimes")).is_err());
     }
 
     /// FR-90 decision 15 — a Mac session as an account whose `sudo` needs no

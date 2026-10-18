@@ -338,7 +338,8 @@ jobs:
         # of `full` again, as it was from 2026-09-26 to 09-27.
         # `hive` (FR-90 P0c) is held out of `full` until the P0 field cell,
         # so it is named here for the same reason: no other lane lints it.
-        run: cargo clippy -p roomlerd --features full,vp9-444,vp9-444-bindgen,clipboard,ssh-server,recording,hive --all-targets -- -D warnings -A dead_code
+        # `vault` (FR-90 P3-3) implies `hive` and is in no release build yet.
+        run: cargo clippy -p roomlerd --features full,vp9-444,vp9-444-bindgen,clipboard,ssh-server,recording,hive,vault --all-targets -- -D warnings -A dead_code
 
       # Overlay L3 (Phase 3) feature gate. `overlay-l3` pulls the `tun`
       # crate (Wintun on Windows / /dev/net/tun on Linux) + the TUN↔WG
@@ -566,7 +567,7 @@ jobs:
         #     writes, enigo's key and pointer mapping, and #1945's release that
         #     never moves) ran in no lane; the Xvfb step runs only its real-X modules.
         #     uinput is plain ioctls, and no test opens /dev/uinput or needs X.
-        run: cargo test -p roomlerd --features vp9-444,vp9-444-bindgen,clipboard,ssh-server,hive,portal-capture,drm-capture,uinput-input,enigo-input --lib
+        run: cargo test -p roomlerd --features vp9-444,vp9-444-bindgen,clipboard,ssh-server,hive,vault,portal-capture,drm-capture,uinput-input,enigo-input --lib
 
       - name: Test tunnel-core --features overlay-l3,overlay-netstack
         # WG handshake (direct + RelayConn) + the TUN↔WG bridge loopback
@@ -1116,8 +1117,8 @@ jobs:
       # supervisor had never compiled for a Mac at all.
       - name: cargo check + test agent sessions on macOS (FR-90 P1h — `hive`)
         run: |
-          cargo check -p roomlerd --lib --bins --features hive
-          cargo test -p roomlerd --lib --features hive -- hive::
+          cargo check -p roomlerd --lib --bins --features hive,vault
+          cargo test -p roomlerd --lib --features hive,vault -- hive:: vault::
 
       # FR-85 — the release feature set (`full`, less the vendored FFmpeg
       # and libvpx), which carries `recording` again (P4c, after the
@@ -1264,7 +1265,7 @@ jobs:
       # `hive` (FR-90 P1i): agent sessions on Windows, which no release build
       # carries yet, so this is the only place their code is linted.
       - name: Clippy roomlerd (overlay-l3 + ssh-server + hive, incl. tests)
-        run: cargo clippy -p roomlerd --features overlay-l3,ssh-server,hive --tests -- -D warnings
+        run: cargo clippy -p roomlerd --features overlay-l3,ssh-server,hive,vault --tests -- -D warnings
       # FR-92 P10b — the LocalAPI crate's Windows half ran in NO lane: its
       # tests run on Linux, where every `#[cfg(windows)]` test compiles out,
       # and tunnel-core's clippy above builds only its library. That half is
@@ -1292,7 +1293,7 @@ jobs:
         # A block scalar: `hive:: ` holds `: `, which a plain YAML scalar reads
         # as a mapping, and then this whole file fails to parse.
         run: |
-          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive -- hive:: hive_win win_service::supervisor win_service::tests
+          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault -- hive:: hive_win win_service::supervisor win_service::tests vault::
 
       # FR-99 P1b — the overlay behind `viewer-indicator`: the "being viewed"
       # border and badge, the native consent panel, and the privacy curtain

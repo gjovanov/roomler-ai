@@ -10,8 +10,9 @@ People use it too.
 > §3e (#1827). The whole design (roles, Cedar policies, leases, the modes a
 > session gets a secret in) is [`roomler-hive-design.md`](roomler-hive-design.md)
 > §8. **This page describes what is built: P3-1, the store; P3-2a, roles and
-> Cedar policies (§7); and P3-2b, a session's role, decided at its start and
-> at every move (§8).** No device and no session reaches a value yet.
+> Cedar policies (§7); P3-2b, a session's role, decided at its start and at
+> every move (§8); and P3-3a, the key a device's daemon holds for the values
+> it will be leased (§9).** No device and no session reaches a value yet.
 
 ## 1. Custody: who can read a secret
 
@@ -30,7 +31,7 @@ What that means in practice:
 | someone with a database dump only | no | every value is sealed; the data keys are wrapped to the KEK |
 | someone with a database dump **and** the KEK | yes | that is all it takes, so keep the KEK out of every backup the database goes into |
 | a member of the organization, an administrator included | no | no route answers a value in P3-1 (§6) |
-| a session or a device | no, not yet | a session's use is P3-3's lease; the value will cross to the device sealed to that device's own key |
+| a session or a device | no, not yet | a session's use is P3-3b's lease; the value will cross to the device sealed to the key its daemon holds (§9) |
 
 Customer-managed keys (the KEK in the organization's own KMS, revocable by it)
 and sovereign custody (only the organization's devices can unwrap) are P7.
@@ -344,7 +345,63 @@ the session and the device, and the **request** exactly as it was decided. A
 fork's row names the session it forks, because the fork has no id until it is
 made. `simulate/replay` decides those requests again.
 
-## 9. Audit
+## 9. The device's key (P3-3a)
+
+A value the vault leases to a session will cross to the session's device as a
+sealed box (libsodium's `crypto_box_seal`: X25519 and XSalsa20-Poly1305) for a
+key that device's daemon holds. P3-3a makes that key and tells the server
+about it. No value crosses yet: leases are P3-3b.
+
+```mermaid
+sequenceDiagram
+    participant D as roomlerd (vault_enabled on)
+    participant F as fleet (the agent socket)
+    participant R as the device's agents row
+    Note over D: the first hello on the primary enrollment's<br/>connection makes an X25519 key, in memory only
+    D->>F: rc:agent.hello {…, vault_key: base64(public half)}
+    F->>F: vault_key_is_well_formed?<br/>32 bytes, canonical standard base64, not zero
+    alt well formed, or none
+        F->>R: $set vault_key (every hello, the empty string included)
+    else malformed
+        F->>R: $set vault_key: "" and a warning
+    end
+    Note over D,R: a restart makes a new key, and its first hello replaces the stored one
+```
+
+| The device | Its hello's `vault_key` | The row's `vault_key` |
+|---|---|---|
+| `vault_enabled` off (the default) | none | empty |
+| on, the primary enrollment's connection | the public half of this run's key | that key |
+| on, a secondary organization's connection | none | empty, on that organization's row |
+| a build without the `vault` feature, or an agent before P3-3a | none | empty |
+| a key that is not well formed | as sent | empty, and the fleet logs a warning |
+
+> [!IMPORTANT]
+> - **The key lives in daemon memory, and every start makes a new one.** A
+>   leased value lives in daemon memory for its lease only, so a restart ends
+>   every lease whatever becomes of the key. A key kept on disk, where the
+>   overlay and SSH keys live, would add one thing: a way for whoever reads
+>   the config, or a backup of it, to open a sealed value captured earlier.
+>   Those two keys are identities a peer pins across restarts; nothing pins
+>   this one.
+> - **The primary enrollment's connection only.** A key given to two
+>   organizations' servers would tie the device's enrollments together
+>   ([`multi-org.md`](multi-org.md)), and agent sessions run for the primary
+>   organization only.
+> - **Never the WireGuard key**, and never derived from it.
+> - **The row names the running process.** The fleet writes the key on every
+>   hello, the empty string included, so a key never outlives the daemon that
+>   made it. The vault will seal only to the key on the row of the device a
+>   session runs on.
+
+| Piece | Where |
+|---|---|
+| the device's switch | `vault_enabled` ([`config.rs:492`](../crates/agent-core/src/config.rs#L492)), off, never pushable: [`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L8076) |
+| the key, and its half in the hello | [`vault.rs:35`](../agents/roomlerd/src/vault.rs#L35) `hello_key`, feature `vault` (it implies `hive`, and no release build carries it yet); the hello at [`signaling.rs:1532`](../agents/roomlerd/src/signaling.rs#L1532) |
+| the wire | `AgentHello::vault_key` ([`signaling.rs:363`](../crates/remote_control/src/signaling.rs#L363)) and [`vault_key_is_well_formed`](../crates/remote_control/src/signaling.rs#L120) |
+| what the fleet stores | [`socket.rs:104`](../crates/modules/fleet/src/socket.rs#L104), [`AgentDao::update_hello`](../crates/services/src/dao/agent.rs#L479), `Agent::vault_key` ([`models.rs:2016`](../crates/remote_control/src/models.rs#L2016)); no route answers it |
+
+## 10. Audit
 
 `vault_audit` holds every `secret:*` and `vault:verify` decision, allow and
 deny. Each row has the principal (`user` in P3-1), the action as a policy
@@ -366,7 +423,7 @@ and the request it decided. Rows expire after 90 days, like the other audits.
   that may be compromised. From P3-3 it goes to `vault_activity`, never here,
   as `ssh_audit` and `ssh_activity` are kept apart.
 
-## 10. Collections
+## 11. Collections
 
 | Collection | One row per | Indexes | Retention |
 |---|---|---|---|
@@ -376,11 +433,15 @@ and the request it decided. Rows expire after 90 days, like the other audits.
 | `vault_roles` | vault role (P3-2a) | unique `(tenant_id, name)` over live rows | tombstoned, kept |
 | `vault_policies` | policy (P3-2a): one Cedar statement, its effect, a revision | unique `(tenant_id, name)` over live rows; `(tenant_id, deleted_at, created_at)` | tombstoned, kept |
 
-## 11. What comes next
+P3-3a adds no collection: a device's key is a field on fleet's `agents` row
+(`vault_key`, §9).
+
+## 12. What comes next
 
 | Step | Builds |
 |---|---|
-| P3-3 | the device's own X25519 vault key, leases (requested, revoked by a push and by TTL, bound to the fence), a value sealed to the device and held in daemon memory, `vault_activity` |
+| P3-3b | leases: a session's request over its device's connection, believed only from the record's location at its fence; Cedar's `secret:use`; the value sealed to the device's key (§9); `vault_leases` and the audit |
+| P3-3c | revocation (a push, the TTL, the fence), the device's in-memory lease cache, `vault_activity` |
 | P3-4 | the toolbelt's vault tools and the approval card a policy can ask for |
 | P3-5 to P3-9 | `proxy` mode, `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |

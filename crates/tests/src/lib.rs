@@ -244,6 +244,10 @@ mod tunnel_tests;
 mod tutorial_tests;
 #[cfg(test)]
 mod usage_ledger_tests;
+/// FR-90 P3-3a — a device's vault key as the fleet stores it: from every
+/// hello, never a malformed one, and gone with the hello that drops it.
+#[cfg(test)]
+mod vault_key_tests;
 /// FR-90 P3-1 — the vault's store: off until turned on, administrators
 /// only and every decision recorded, no answer carrying a value, sealed
 /// bytes that do not open where they were moved, no sealing without a KEK.
