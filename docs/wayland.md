@@ -205,6 +205,7 @@ ones that decide this page:
 |---|---|---|---|
 | `wayland_auto` | `ROOMLERD_WAYLAND_AUTO` | **on** | a per-user daemon in its own Wayland session switches capture on by itself; off = everything opt-in, as before FR-93 P2 |
 | `wayland_auto_system` | `ROOMLERD_WAYLAND_AUTO_SYSTEM` | **on** | a system daemon switches DRM + `uinput` on by itself for a person's session it can tell (FR-95); off = the system half before FR-95 |
+| `x11_auto_system` | `ROOMLERD_X11_AUTO_SYSTEM` | **on** | the same for a person's **X11** session, where the desktop reports its lock (GNOME, KDE) (FR-113, [`linux-capture.md`](linux-capture.md) §1.2.2); off = 0.4.143: no picture of an X11 desktop by default |
 | `wayland_aware` | `ROOMLERD_WAYLAND_AWARE` | **on** | a Wayland desktop no arm may capture says `wayland_not_enabled`; off = the behaviour before FR-93, with no input-reach warning either (P1a) |
 | `drm_capture`, `uinput` | `ROOMLERD_DRM_CAPTURE`, `ROOMLERD_UINPUT` | off | the system arms (§1) |
 | `portal_capture`, `mutter_capture` | `ROOMLERD_PORTAL_CAPTURE`, `ROOMLERD_MUTTER_CAPTURE` | off | the per-user arms, explicitly; any capture key hands the choice back to the operator |
