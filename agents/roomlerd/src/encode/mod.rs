@@ -70,6 +70,12 @@ pub mod pipe;
 /// browser (pure). FR-79 made it load-bearing: the gate reads its verdict,
 /// so it runs on every constrained window.
 pub mod pipe_state;
+/// FR-70 M3a — the media plan and its shadow: the pure producer of what the
+/// media loop is allowed to know, and the per-field comparison against the
+/// pump's inline values. Pure and tested on the default build; only the
+/// FFmpeg DC pump runs it.
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+pub(crate) mod plan;
 /// FR-70 P1 — the remembered rate as a PRIOR that decays while nothing
 /// measures (pure; no clock, no I/O).
 pub mod prior;
@@ -959,22 +965,92 @@ pub(crate) fn priority_relay_cap(priority: u8, constrained: bool) -> Option<u32>
     // rebuild-free dial CEILING factor (`dial_rate_factor_pct` — the HRD
     // raises QP during motion by itself). `ROOMLERD_PRIORITY_RES_CAP=1`
     // / config `priority_res_cap` restores the rc.443 caps for A/B.
-    if !matches!(
+    if !priority_res_cap_enabled() {
+        return None;
+    }
+    // FR-70 M3a — the decision is `priority_relay_cap_for` over the caps read
+    // here, per call, exactly as before; the plan producer reads them once.
+    priority_relay_cap_for(
+        priority,
+        constrained,
+        &PriorityCaps {
+            dims_caps: true,
+            smooth_long_edge: smooth_res_cap_long_edge(),
+            relay_long_edge: relay_res_cap_long_edge(),
+        },
+    )
+}
+
+/// rc.445 — are the Priority dial's dims-caps restored (`ROOMLERD_PRIORITY_RES_CAP`
+/// / config `priority_res_cap`)? Off by default; see [`priority_relay_cap`].
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn priority_res_cap_enabled() -> bool {
+    matches!(
         node_env("PRIORITY_RES_CAP").as_deref().map(str::trim),
         Some("1") | Some("true")
-    ) {
+    )
+}
+
+/// FR-70 M3a — the Priority dial's dims-caps, resolved ONCE per pump for the
+/// plan producer (`encode::plan`): the three knobs [`priority_relay_cap`]
+/// reads per call. `Default` = the caps off, which is the shipped default.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PriorityCaps {
+    /// The rc.443 dims-caps restored for A/B (off by default since rc.445).
+    pub dims_caps: bool,
+    /// `smooth_res_cap_long_edge` — Smoother's cap on every path.
+    pub smooth_long_edge: Option<u32>,
+    /// `relay_res_cap_long_edge` — Balanced's link-physics cap on a relay.
+    pub relay_long_edge: Option<u32>,
+}
+
+impl PriorityCaps {
+    #[cfg_attr(
+        not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+        allow(dead_code)
+    )]
+    pub(crate) fn from_env() -> Self {
+        Self {
+            dims_caps: priority_res_cap_enabled(),
+            smooth_long_edge: smooth_res_cap_long_edge(),
+            relay_long_edge: relay_res_cap_long_edge(),
+        }
+    }
+}
+
+/// [`priority_relay_cap`] over explicit caps — the plan producer's form
+/// (FR-70 M3a). The reader above is this applied to the caps it reads per
+/// call; `priority_relay_cap_for_is_priority_relay_cap_over_explicit_caps`
+/// locks the two together.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn priority_relay_cap_for(
+    priority: u8,
+    constrained: bool,
+    caps: &PriorityCaps,
+) -> Option<u32> {
+    if !caps.dims_caps {
         return None;
     }
     match priority {
         // Sharpness override — native even on a relay.
         self::priority::SHARPER => None,
         // Fewer pixels on every path.
-        self::priority::SMOOTHER => smooth_res_cap_long_edge(),
+        self::priority::SMOOTHER => caps.smooth_long_edge,
         // Balanced (default + any unknown code): the link-physics hard cap
         // only on a constrained path.
         _ => {
             if constrained {
-                relay_res_cap_long_edge()
+                caps.relay_long_edge
             } else {
                 None
             }
@@ -1864,6 +1940,67 @@ mod tests {
         assert_eq!(priority_relay_cap(priority::SMOOTHER, true), Some(1024));
         assert_eq!(priority_relay_cap(priority::SMOOTHER, false), Some(1024));
         assert_eq!(priority_relay_cap(42, true), Some(1280));
+        unsafe { tunnel_core::env::test_env::clear("PRIORITY_RES_CAP") };
+    }
+
+    /// FR-70 M3a — the per-call reader is the pure form over the caps it
+    /// reads, with the switch off (the shipped default) and on.
+    #[test]
+    fn priority_relay_cap_for_is_priority_relay_cap_over_explicit_caps() {
+        let _guard = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: guarded by RELAY_ENV_LOCK against the known writers.
+        unsafe {
+            tunnel_core::env::test_env::clear("RELAY_MAX_EDGE");
+            tunnel_core::env::test_env::clear("SMOOTH_MAX_EDGE");
+            tunnel_core::env::test_env::clear("PRIORITY_RES_CAP");
+        }
+        let dials = [
+            priority::BALANCED,
+            priority::SHARPER,
+            priority::SMOOTHER,
+            42,
+        ];
+        let caps = PriorityCaps::from_env();
+        assert_eq!(
+            caps,
+            PriorityCaps {
+                dims_caps: false,
+                smooth_long_edge: Some(1024),
+                relay_long_edge: Some(1280),
+            }
+        );
+        for dial in dials {
+            for constrained in [false, true] {
+                assert_eq!(
+                    priority_relay_cap_for(dial, constrained, &caps),
+                    priority_relay_cap(dial, constrained)
+                );
+                assert_eq!(priority_relay_cap_for(dial, constrained, &caps), None);
+            }
+        }
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "PRIORITY_RES_CAP", "1") };
+        let caps = PriorityCaps::from_env();
+        assert!(caps.dims_caps);
+        for dial in dials {
+            for constrained in [false, true] {
+                assert_eq!(
+                    priority_relay_cap_for(dial, constrained, &caps),
+                    priority_relay_cap(dial, constrained),
+                    "dial {dial} constrained {constrained}"
+                );
+            }
+        }
+        assert_eq!(
+            priority_relay_cap_for(priority::BALANCED, true, &caps),
+            Some(1280)
+        );
+        assert_eq!(
+            priority_relay_cap_for(priority::SMOOTHER, false, &caps),
+            Some(1024)
+        );
+        assert_eq!(priority_relay_cap_for(priority::SHARPER, true, &caps), None);
         unsafe { tunnel_core::env::test_env::clear("PRIORITY_RES_CAP") };
     }
 

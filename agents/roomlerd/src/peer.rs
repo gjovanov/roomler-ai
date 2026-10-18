@@ -6709,6 +6709,20 @@ async fn media_pump_ffmpeg_dc(
              remembered rate, floor relief seeded from it, refine lift held while the profile is on"
         );
     }
+    // FR-70 M3a — the PLAN, in SHADOW (`encode::plan`). At the top of every
+    // pass the pump computes the plan ONCE from the facts it has at that
+    // instant and compares it, field by field, against the inline values it
+    // goes on to compute in the same pass. Nothing reads the plan: every
+    // decision below is still the inline one. The heartbeat's
+    // `plan_divergences` is the retirement gate for that inline arithmetic
+    // (fleet-zero before M3b flips the loop to read the plan), and a field's
+    // first divergence logs once per session with both values. Every knob the
+    // inline code reads from env per frame is resolved here, once, so the
+    // shadow adds no env read to the frame path (FR-70's rule). No kill
+    // switch: it changes no decision, takes no await, and this FR exists to
+    // delete switches, not add them.
+    let plan_knobs = crate::encode::plan::PlanKnobs::from_env();
+    let mut plan_shadow = crate::encode::plan::Shadow::default();
     // rc.443 — consecutive-encode-error escalation (retry → rebuild →
     // clean pump exit); see `encode::EncodeErrorLadder`.
     let mut err_ladder = crate::encode::EncodeErrorLadder::default();
@@ -7036,10 +7050,14 @@ async fn media_pump_ffmpeg_dc(
             let open_ms = started.elapsed().as_millis() as u64;
             match handle.await {
                 Ok(Ok(rebuilt)) => {
+                    // FR-70 M3a — the rate the replacement was opened at, for
+                    // the shadow's judgement after the controller's next tick.
+                    let built_rate = rebuilt.maxrate_bps() as u32;
                     if let Some(enc) = encoder.as_mut() {
                         let from = encoder_dims.unwrap_or((0, 0));
                         if timed_apply!(enc.adopt_rebuilt(rebuilt).await) {
                             encoder_dims = Some(dims);
+                            plan_shadow.note_built(built_rate, dims);
                             // The adopted encoder was built for the target
                             // the open was spawned with; the pin follows it
                             // from here, and the capture cap below it.
@@ -7093,12 +7111,17 @@ async fn media_pump_ffmpeg_dc(
                         // (the dims swap below needs it), so the rate swap
                         // guards its own staleness here: a replacement opened
                         // for dims the session has since left is discarded.
-                        let stale_dims = encoder_dims.is_some_and(|d| d != rebuilt.dims());
+                        let rebuilt_dims = rebuilt.dims();
+                        let stale_dims = encoder_dims.is_some_and(|d| d != rebuilt_dims);
                         if let Some(enc) = encoder.as_mut() {
                             if !stale_dims && timed_apply!(enc.adopt_rebuilt(rebuilt).await) {
                                 // Stale pre-swap frames yield to the fresh
                                 // IDR, exactly like the sync rebuild path.
                                 send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                // FR-70 M3a — judged against the controller's
+                                // next target: a rate swap adopted at a rate
+                                // the controller has since left is a divergence.
+                                plan_shadow.note_built(maxrate as u32, rebuilt_dims);
                                 video_info_sent = false;
                                 info!(
                                     %session_id, codec_label, maxrate_bps = maxrate,
@@ -7356,6 +7379,46 @@ async fn media_pump_ffmpeg_dc(
         // is 3.4 SECONDS of standing queue, and the gate never fired while
         // viewer paint age ran 2.3-7.1 s. A held goodput estimate may only
         // ever LOWER the reference rate.
+        // FR-70 M3a — the plan, computed ONCE here from the facts the pump has
+        // at this instant: the point where M3b's loop will READ it (after the
+        // swap adoption and the transport recheck, before the gate), and
+        // compared below against each inline value as the pass computes it.
+        // The one input that is itself a decision — the governor's standing
+        // target — is the controller's, which M4 makes the plan's. This takes
+        // the target lock and the pipeline lock once more per pass than the
+        // inline reads do; M3b removes both with the reads.
+        {
+            let (native_w, native_h) =
+                unpack_dims(capture_native_dims.load(std::sync::atomic::Ordering::Relaxed));
+            let prio = priority.load(std::sync::atomic::Ordering::Relaxed);
+            let caps = &plan_knobs.priority_caps;
+            let hrd_pct = encoder.as_ref().map_or(plan_knobs.direct_hrd_pct, |e| {
+                crate::encode::rate_profile::hrd_pct_for(e.name(), plan_knobs.direct_hrd_pct)
+            });
+            let inputs = crate::encode::plan::PlanInputs {
+                constrained,
+                target_fps,
+                paced_fps: governor.paced_fps(),
+                pipe_bps: governor.pipe_bps(std::time::Instant::now(), constrained),
+                ceiling_reference_bps: last_ceiling_bps,
+                hrd_pct,
+                target_bps: governor.applied_bps(),
+                dims: crate::encode::policy::DimsInputs {
+                    native_w,
+                    native_h,
+                    merged_target: pipeline.merged_target(*target_resolution.lock().unwrap()),
+                    merged_priority_cap: pipeline.merged_priority_cap_by(
+                        crate::encode::priority_relay_cap_for(prio, constrained, caps),
+                        |p| crate::encode::priority_relay_cap_for(p, constrained, caps),
+                    ),
+                    slow_link_cap: slow_link_profile.map(|p| p.max_long_edge),
+                    refined: idle_refine.refined(),
+                    refined_cap: plan_knobs.refined_cap,
+                    soft_cap: governor.auto_res_cap(),
+                },
+            };
+            plan_shadow.produce(&inputs, &plan_knobs);
+        }
         let queue_budget = if constrained {
             // FR-59 — the WIDENED pipe estimate, not the goodput-only one.
             // On a link where the agent's own sends never block there is no
@@ -7439,6 +7502,24 @@ async fn media_pump_ffmpeg_dc(
                 direct_lag_bound_ms,
             )
         };
+        // FR-70 M3a — the budget triple and the verdict, against the plan. On
+        // a constrained path the pump's hard budget IS its soft one and its
+        // gate has no wait bound (the triple reads `(b, b, 0)`), which is what
+        // lets one gate function serve both transports.
+        log_plan_divergences(
+            &session_id,
+            codec_label,
+            plan_shadow.check_budget(
+                queue_budget,
+                hard_budget,
+                if constrained { 0 } else { direct_lag_bound_ms },
+            ),
+        );
+        log_plan_divergences(
+            &session_id,
+            codec_label,
+            plan_shadow.check_gate_verdict(inflight_now, measured_wait_ms, byte_gate),
+        );
         // FR-35 P3b — the opener is draining whenever the ledger dips below half
         // the budget; reset the stuck timer so only a genuinely pinned queue
         // (inflight held high, not falling) is read as "seed too hot".
@@ -7540,6 +7621,12 @@ async fn media_pump_ffmpeg_dc(
         // scheduled from consumption start, so an encode longer than the
         // interval degrades to natural (still even) cadence, never a
         // burst.
+        // FR-70 M3a — the cadence, against the plan.
+        log_plan_divergences(
+            &session_id,
+            codec_label,
+            plan_shadow.check_fps(governor.paced_fps().unwrap_or(target_fps)),
+        );
         if let Some(paced) = governor.paced_fps() {
             let interval = Duration::from_micros(1_000_000 / paced.max(1) as u64);
             let now = std::time::Instant::now();
@@ -7847,6 +7934,17 @@ async fn media_pump_ffmpeg_dc(
             soft_cap: governor.auto_res_cap(),
         });
         let plan_target = dims_plan.effective_target;
+        // FR-70 M3a — the geometry, against the plan: the dims this frame's
+        // target produces, pin-independent (the pin below is the loop's — which
+        // encoder is live — not the plan's).
+        log_plan_divergences(
+            &session_id,
+            codec_label,
+            plan_shadow.check_dims(crate::encode::resample::target_dims(
+                frame.native_dims(),
+                plan_target,
+            )),
+        );
         // FR-70 M2 — the make-before-break is decided from the PLAN, never
         // from a frame: a live encoder built for `built_target` that the
         // plan has moved away from gets its replacement opened in the
@@ -8173,6 +8271,10 @@ async fn media_pump_ffmpeg_dc(
                     }
                     encoder = Some(handle);
                     encoder_dims = Some((w, h));
+                    // FR-70 M3a — the loop decided this rate and these dims by
+                    // itself; the shadow judges both against the controller's
+                    // next target and the plan after its tick below.
+                    plan_shadow.note_built(open_rate, (w, h));
                     // FR-70 M2 — this encoder was built for the target that
                     // produced this frame's dims (the pinned one if a swap
                     // was in flight, the plan's otherwise); the pin and the
@@ -8649,6 +8751,17 @@ async fn media_pump_ffmpeg_dc(
                 }
             }
         }
+        // FR-70 M3a — the controller has ticked: its target becomes the plan's
+        // `bitrate_bps` (an epoch move, not a divergence), and an encoder the
+        // loop built since the last tick — the inline open above, or a
+        // replacement adopted at the loop top — is judged against it: was it
+        // built at the plan's rate and the plan's dims? A `bitrate` divergence
+        // here is an encoder the controller re-rates on its very next tick.
+        log_plan_divergences(
+            &session_id,
+            codec_label,
+            plan_shadow.after_tick(governor.applied_bps()),
+        );
 
         let encode_start = std::time::Instant::now();
         // P5 (FR-1) — the 20-30 ms HW encode (including the BGRA→NV12
@@ -9108,6 +9221,14 @@ async fn media_pump_ffmpeg_dc(
                 // look like "the encoder never moved" when it had moved twice.
                 swaps = rate_stats.swaps,
                 dims_swaps,
+                // FR-70 M3a — the shadow plan: per-field divergences between
+                // the plan computed at the top of each pass and the pump's
+                // inline values (the retirement gate for M3b reads every
+                // field at ZERO, fleet-wide), and how many distinct plans the
+                // session has had. A field's first divergence also logs once
+                // with both values (`FR-70 M3a: the shadow plan diverged`).
+                plan_divergences = %plan_shadow.counts(),
+                plan_epoch = plan_shadow.epoch(),
                 idr_count = rate_stats.idr_count,
                 // FR-62 A2 — whether the pump is still rationing this encoder's
                 // constrained increases. false ⇒ moves land live (NVENC,
@@ -9145,6 +9266,27 @@ async fn media_pump_ffmpeg_dc(
             qp_max = 0;
             qp_n = 0;
         }
+    }
+}
+
+/// FR-70 M3a — log a field's FIRST divergence of the session between the
+/// shadow plan and the pump's inline value, with both values. The heartbeat
+/// carries the counts; this line is what names the field and the numbers.
+#[cfg(feature = "ffmpeg-encoder")]
+fn log_plan_divergences(
+    session_id: &bson::oid::ObjectId,
+    codec_label: &str,
+    first: Vec<crate::encode::plan::FirstDivergence>,
+) {
+    for d in first {
+        warn!(
+            %session_id,
+            codec_label,
+            field = d.field,
+            plan = %d.plan,
+            inline = %d.inline,
+            "FR-70 M3a: the shadow plan diverged from the pump's inline value (first time this session for this field)"
+        );
     }
 }
 
