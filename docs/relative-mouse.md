@@ -6,7 +6,7 @@
 > | Phase | What | State |
 > |---|---|---|
 > | P1 | the wire, the gate, Windows hosts (the user worker and SystemContext), the viewer's control | shipped in 0.4.140, where a Windows relative move went out ABSOLUTE (enigo's default, below). **0.4.141 carries the fix (#2352)**, field-verified on its released bytes on both Windows paths |
-> | P2 | Linux (XTest, a relative uinput device, the portal) and macOS | X11 through enigo's XTest (P2a) and a relative uinput pointer for system installs (P2b): merged, field-green on candidates. Per-user Wayland through the RemoteDesktop session, the portal's or mutter's (P2c): built, field-green on a candidate. macOS through enigo's CGEvent motion, in a GUI session with the Accessibility grant (P2d): built, field-green on a candidate |
+> | P2 | Linux (XTest, a relative uinput device, the portal) and macOS | X11 through enigo's XTest (P2a), a relative uinput pointer for system installs (P2b), per-user Wayland through the RemoteDesktop session, the portal's or mutter's (P2c), and macOS through enigo's CGEvent motion in a GUI session with the Accessibility grant (P2d): all shipped, **field-verified on the released 0.4.143**, the first release to carry all four (FR-109 §8 rows 36–39) |
 > | P3 | switching on by itself when the host hides its cursor | merged and live since the 2026-10-17 promote (the operator settled the spec's decision 1: enter on the next click), with a rule P2 made necessary: a hide counts only after the host has reported its pointer. Field-verified on the live viewer, the locked host included (FR-109 §8 rows 34–35) |
 
 ## Why it exists
@@ -140,7 +140,7 @@ each absolute move as a large jump. In relative mode the same probe read the del
 ## The viewer
 
 - **The control** is a toolbar button, shown only for an agent that advertises `mouse-rel`
-  ([`RemoteControl.vue:3223`](../ui/src/views/remote/RemoteControl.vue#L3223) `relativeMouseOffered`).
+  ([`RemoteControl.vue:3247`](../ui/src/views/remote/RemoteControl.vue#L3247) `relativeMouseOffered`).
   Pointer Lock needs a user gesture, and the click is one.
 - **Entering** asks for raw, unaccelerated deltas (`unadjustedMovement`). A browser that rejects the option
   gets plain Pointer Lock ([`useRemoteControl.ts:6032`](../ui/src/composables/useRemoteControl.ts#L6032)
@@ -191,7 +191,7 @@ stateDiagram-v2
   and then hidden on a locked Windows host, the click stayed a click; unlocked through the viewer in the
   same session, the same click entered relative mode.
 - ⚠️ **Only after this host has reported its pointer** on the channel, a `cursor:pos` or `cursor:shape`
-  ([`useRemoteControl.ts:5957`](../ui/src/composables/useRemoteControl.ts#L5957) `hostCursorTracked`). A
+  ([`useRemoteControl.ts:5987`](../ui/src/composables/useRemoteControl.ts#L5987) `hostCursorTracked`). A
   tracker that sees no pointer (a Linux host without DRM capture, macOS) sends one `cursor:hide` when the
   channel opens and nothing after it. Those Linux hosts advertise `mouse-rel` since P2, so without this rule
   their first click would take the pointer. The price is small: a Windows session that starts with the
