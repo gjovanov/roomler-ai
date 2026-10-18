@@ -169,7 +169,7 @@ mod linux {
         };
         next.input_reach = match prev {
             Some(p) if super::same_desktop(p, &next) => p.input_reach.clone(),
-            _ => crate::input::reach::predicted(route, next.kind == "wayland")
+            _ => crate::input::reach::predicted(route, next.kind == "wayland", facts.auto_system)
                 .reach
                 .wire()
                 .to_string(),
