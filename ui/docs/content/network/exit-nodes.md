@@ -14,8 +14,19 @@ abroad" arrangement, but on hardware you own.
 :::steps
 1. **Offer it.** On the machine that should be the exit, enable exit-node mode in its configuration. Offering is not enough on its own.
 2. **Approve it.** An administrator approves the device as an exit node in the dashboard. Two parties, deliberately — a device cannot promote itself.
-3. **Use it.** On the client, name the exit node you want. All of its traffic — IPv4, IPv6 and DNS — is then routed through that machine.
+3. **Use it.** On the client, name the exit node you want. All of its traffic — IPv4, IPv6 and DNS — is then routed through that machine, with the IPv6 exceptions below.
 :::
+
+## Which machines can be one
+
+| | Linux | Windows | macOS |
+|---|---|---|---|
+| **Use an exit** | IPv4, IPv6 and DNS | IPv4, IPv6 and DNS | IPv4 and DNS; IPv6 when the Mac's own connection has it, otherwise blocked rather than leaked |
+| **Be an exit** | IPv4 and IPv6, from a system (root) install | IPv4 only, and only where Windows has its Hyper-V NAT (Pro, Enterprise); IPv6 through a Windows exit is blocked rather than leaked. Windows **Home** cannot be one | IPv4, and IPv6 where the Mac has a global IPv6 route, from the root half |
+
+A machine that cannot be an exit offers nothing and says why — in
+`roomler status` and in the dashboard's routes table — rather than offering a
+route that every client taking it would lose its internet through.
 
 :::warning Offering and approving are separate on purpose
 A device that merely offers to be an exit node is not one. An admin has to

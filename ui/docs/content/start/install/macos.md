@@ -120,9 +120,9 @@ without `sudo` before assuming anything is broken.
 
 Being explicit rather than letting you discover these:
 
-- **Video encoding is software-only on Apple Silicon.** The hardware-encoder dispatch covers NVIDIA, Intel and AMD; VideoToolbox is not wired up, so H.264 uses a software encoder.
+- **No AV1.** H.264 and HEVC encode in hardware, through VideoToolbox, but Apple ships no AV1 encoder, so a Mac does not offer AV1.
 - **Remote audio capture** is not available.
-- **Per-org network adapters** (one Mac in several organizations, each with its own adapter) are not available.
+- **Per-org network adapters** (one Mac in several organizations, each with its own adapter) are built but not yet verified on a Mac.
 
 ## Uninstall
 

@@ -40,13 +40,14 @@ roomlerd run --encoder software   # skip hardware entirely
 ```
 
 @macos
-:::warning Encoding is software-only on macOS today
-The hardware-encoder dispatch covers NVIDIA, Intel and AMD; **VideoToolbox is
-not wired up**, so Apple Silicon encodes in software (openh264 for H.264,
-libvpx for the VP9 4:4:4 path).
+Apple Silicon encodes **H.264 and HEVC in hardware**, through Apple's
+VideoToolbox. A Mac also offers software H.264 (openh264) and the VP9 4:4:4
+path (libvpx), which is software on every Mac.
 
-It works well for normal desktop use. It is a real limit for high-resolution,
-high-motion content, and it is stated here rather than left to be discovered.
+:::note What a Mac does not have
+There is no AV1 hardware encoder on any shipping Mac (Apple has announced
+none), and VideoToolbox's HEVC has no 4:4:4 profile, so full-color text
+sessions use the software VP9 4:4:4 path.
 :::
 
 @linux

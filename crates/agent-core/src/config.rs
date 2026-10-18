@@ -1745,9 +1745,9 @@ pub struct AgentConfig {
     pub overlay_enabled: bool,
 
     /// Multi-org P2c: let SECONDARY `[[orgs]]` entries with
-    /// `overlay_mode = "tun"` join their own tenant's mesh over the ONE
-    /// shared TUN device (per-org facades + destination demux — see
-    /// `tunnel_core::overlay::tun_mux`). Default off: the P1 stance
+    /// `overlay_mode = "tun"` join their own tenant's mesh, each on its OWN
+    /// adapter (`per_org_systun_factory` in roomlerd's overlay.rs; W7c
+    /// deleted the shared-TUN mux this once rode). Default off: the P1 stance
     /// (secondaries never join) until the operator opts in. Requires the
     /// secondary to share the primary's `server_url` (same control plane)
     /// and to hold its own WG key; a tenant still on the shared legacy

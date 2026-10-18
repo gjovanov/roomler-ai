@@ -250,24 +250,24 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | Doc | Says | Code |
 |---|---|---|
 | `docs/overlay-exit-nodes.md:228` | macOS utun is v4-only; exit routing not wired | v6 is assigned (`tun.rs:4704-4737`); the client half is wired except for the exemptions (S1). **Fixed with P1a:** a per-OS table and a macOS client section |
-| `ui/docs/content/network/exit-nodes.md` | no platform caveat; v4, v6 and DNS all routed | Windows exits are v6 fail-closed; macOS and Windows Home cannot serve |
-| `docs/overlay-exit-nodes.md:250-252` | approval needs a re-join | the server re-fans at once (`overlay_route.rs:301,375`) |
-| `ui/docs/content/network/multi-org.md:87`, `org_join.rs:561-566` | a Mac cannot run a per-org TUN | the per-org utun code is unconditional (N10) |
-| `docs/multi-org.md` §4.4, §4b | the shared-TUN mux and mux NAT | deleted in W7c (`overlay.rs:310-316`) |
-| `docs/magicdns.md:88` | Mac names resolve through the SOCKS path | only in netstack mode |
-| `ui/docs/content/remote-desktop/codecs-and-performance.md:43-50` | macOS encodes in software; VideoToolbox not wired | VideoToolbox ships (`encode/ffmpeg/encoder.rs:97-105`) |
-| `docs/remote-control.md:264,341` | macOS captures with ScreenCaptureKit; dirty rects from SCK | CGDisplayStream through scrap (`scrap_backend.rs:8`); no SCK code anywhere |
-| `docs/remote-control.md:389-392` | the installer adds the `input` group and a udev rule | no packaging does |
-| `docs/remote-control.md:1611-1616` | VideoToolbox deferred; the audio-input entitlement is covered | VideoToolbox ships; no entitlement or usage-description key exists |
-| `docs/roomler-ssh.md:22-23` | `ssh-server` is not in the release sets | all four lanes build it |
-| `docs/roomler-ssh.md:311-325` | Windows `daemon` → SYSTEM | the console worker (#2021, FR-94) |
+| `ui/docs/content/network/exit-nodes.md` | no platform caveat; v4, v6 and DNS all routed | Windows exits are v6 fail-closed; macOS and Windows Home cannot serve. ✅ **P8:** a *Which machines can be one* table, taking P1b's macOS exit (0.4.141) into account: Linux v4+v6, Windows v4 only and not Home, macOS v4 and v6 where it has a global route |
+| `docs/overlay-exit-nodes.md:250-252` | approval needs a re-join | the server re-fans at once (`overlay_route.rs:301,375`). ✅ **P8:** approval reaches clients at once; only the exit's own OFFER needs a re-join |
+| `ui/docs/content/network/multi-org.md:87`, `org_join.rs:561-566` | a Mac cannot run a per-org TUN | the per-org utun code is unconditional (N10). ✅ **P8 (the page):** "built, not yet verified on a Mac". `org_join.rs`'s warning changes with P1d's run |
+| `docs/multi-org.md` §4.4, §4b | the shared-TUN mux and mux NAT | deleted in W7c (`overlay.rs:310-316`). ✅ **P8:** both marked history; the `overlay_tun_per_org` switch (read nowhere since W7c) corrected; `overlay_multi_org`'s doc comment and a log line no longer name the mux |
+| `docs/magicdns.md:88` | Mac names resolve through the SOCKS path | only in netstack mode. ✅ P1c's macOS row (the SCDynamicStore resolver) replaced it |
+| `ui/docs/content/remote-desktop/codecs-and-performance.md:43-50` | macOS encodes in software; VideoToolbox not wired | VideoToolbox ships (`encode/ffmpeg/encoder.rs:97-105`). ✅ **P8:** here, and the same claim in `docs/installation.md` and `ui/docs/content/start/install/macos.md`: H.264 and HEVC in hardware, no AV1 |
+| `docs/remote-control.md:264,341` | macOS captures with ScreenCaptureKit; dirty rects from SCK | CGDisplayStream through scrap (`scrap_backend.rs:8`); no SCK code anywhere. ✅ **P8:** the capture table, the prompt line, the idle-skip line (per-frame `Damage`), and a callout over §4.2's design-era tree |
+| `docs/remote-control.md:389-392` | the installer adds the `input` group and a udev rule | no packaging does. ✅ **P8:** uinput is a root install's opt-in |
+| `docs/remote-control.md:1611-1616` | VideoToolbox deferred; the audio-input entitlement is covered | VideoToolbox ships; no entitlement or usage-description key exists. ✅ **P8:** a callout: VideoToolbox and VAAPI shipped as FFmpeg encoders; no audio-input entitlement |
+| `docs/roomler-ssh.md:22-23` | `ssh-server` is not in the release sets | all four lanes build it. ✅ **P8:** here and in §6 Build |
+| `docs/roomler-ssh.md:311-325` | Windows `daemon` → SYSTEM | the console worker (#2021, FR-94). ✅ FR-94 and FR-105's docs already say so |
 | `docs/installation.md:21-22`, `ui/docs/content/start/install/macos.md:51-55` | install the macOS daemon with the wizard | the wizard's daemon roles are Windows-only. ✅ Both say so since P0c-4, as do both homepages |
-| `docs/installation.md:43-44`, `ui/docs/content/troubleshooting/install-problems.md:37-40` | downloads come from roomler.ai | true for the MSI proxy, the CLI and the wizard; `install.sh`'s `.deb`/tarball/`.pkg` and every self-update fetch from GitHub (`updater.rs:1276,1360`) |
+| `docs/installation.md:43-44`, `ui/docs/content/troubleshooting/install-problems.md:37-40` | downloads come from roomler.ai | true for the MSI proxy, the CLI and the wizard; `install.sh`'s `.deb`/tarball/`.pkg` and every self-update fetch from GitHub (`updater.rs:1276,1360`). ✅ **P8:** both name the hosts, measured 2026-10-18: the manifest's asset URLs are `github.com`, redirected to `release-assets.githubusercontent.com`; `install.ps1`'s companion is one too, and its VC++ runtime comes from `aka.ms` |
 | `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:3180` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon. ✅ Both say so since P0c-2 |
-| `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:181-224`); DRM captures from root (opt-in) |
-| `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`) |
-| `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93 |
-| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1827`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps |
+| `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:181-224`); DRM captures from root (opt-in). ⏳ **P8-2.** This row moved under it: since FR-95 (verified on 0.4.141) a system install switches DRM and uinput on by itself for the person's Wayland session, FR-113 (merged, not yet released) does the same for X11, and the wlroots portal never produced frames in the lab. Rewritten once 0.4.144 ships FR-113 |
+| `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`). ✅ **P8** |
+| `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93. ✅ FR-93 added the Wayland section; **P8** rewrote the system unit's half, which still read "only once both keys are set", for FR-95 and FR-113 (the package ships master's code) |
+| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1827`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps. ⏳ **P8-2**, except `power.rs` (P3b) |
 
 ### 2.9 Equal on all three: not parity, recorded so nobody files them here
 
@@ -885,7 +885,7 @@ model on Windows, so the three agree on what the mode means.
 | **P6f** | Private staging dir on Windows + macOS (settled: Windows by GHSA-r3xj-4wh9-xh2v, macOS measured private) | — | Win10, Win11, a Mac | S |
 | **P7a** | Linux arm64 hardware encode | the release feature set | an arm64 lab host | M |
 | **P7b** | arm64 tunnel CLI + wizard | — | an arm64 vmtest guest | S |
-| **P8** | Docs: `platform-support.md`, the user page, every §2.8 correction | — | — | M |
+| **P8** | Docs: `platform-support.md`, the user page, every §2.8 correction. *P8-1* (in review): every §2.8 row but two, each re-checked against master first. *P8-2*, after 0.4.144 ships FR-113: the Linux Wayland/root row, the stale code comments, `platform-support.md` and the user page | — | — | M |
 
 Kill switches named `ROOMLERD_*`, and `ssh_sftp_as_user`, are proposed names. `[apps] enabled`, `hive_adopt`,
 `power_policy` and `ssh_account_mode` exist today.

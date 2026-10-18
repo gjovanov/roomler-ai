@@ -143,6 +143,15 @@ So: native agent for the *host*, browser for the *controller*. This is the same 
 
 ### 4.2 Agent crate layout
 
+> 🗄️ **The original design sketch, kept for its intent; the code's layout
+> differs.** Capture is `capture/{wgc_backend, scrap_backend, drm_backend,
+> x11_damage}.rs` plus `capture/portal/`, and a Mac captures through `scrap`'s
+> CoreGraphics `CGDisplayStream` (`capture/scrap_backend.rs:8`): there is no
+> ScreenCaptureKit code. Encode is `encode/{ffmpeg/, mf/, openh264_backend,
+> libvpx}.rs` with the rate-control modules beside them, VideoToolbox among
+> FFmpeg's encoders ([encoders.md](encoders.md)). The packaging is under
+> `agents/roomlerd/packaging/` and `agents/roomlerd/wix/`.
+
 ```
 agents/roomlerd/
 ├── Cargo.toml                 # workspace member of the main repo
@@ -264,12 +273,12 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 | OS | Primary API | Why | Fallback |
 |---|---|---|---|
 | Windows 10+ | `Windows.Graphics.Capture` (WGC) via `windows` crate | DXGI surface, no permission prompt for own session, handles DPI, supports per-window | DXGI Desktop Duplication |
-| macOS 12.3+ | `ScreenCaptureKit` | Apple's blessed path; handles privacy indicators, multi-display | `CGDisplayStream` (deprecated but works) |
+| macOS | CoreGraphics `CGDisplayStream`, through `scrap` (`agents/roomlerd/src/capture/scrap_backend.rs:8`) | The one macOS capture path today: there is no ScreenCaptureKit code. It reports no damage, so every frame counts as changed | — |
 | Linux, a host with scanout (X11 or Wayland) | **DRM/KMS** — the scanout plane read below the compositor (FR-36, opt-in `ROOMLERD_DRM_CAPTURE=1`) | Compositor-independent, needs no consent, sees the greeter and a locked screen — the unattended path | the portal, then X11 |
 | Linux Wayland, **no** scanout (WSL2, containers, nested compositors) | **`xdg-desktop-portal` ScreenCast → PipeWire**, through a privilege-dropped helper in the user's session (FR-45, opt-in `ROOMLERD_PORTAL_CAPTURE=1`) — or `org.gnome.Mutter.ScreenCast` directly where no portal backend can run (`ROOMLERD_MUTTER_CAPTURE=1`, GNOME only, unattended). A **per-user** install in its own Wayland session with no key set switches these on by itself: mutter on GNOME, else the portal (FR-93 P2) | The only route a Wayland compositor sanctions; **attended** — a logged-in user and a consent dialog, never the greeter or a locked screen | X11 |
 | Linux X11 | `XShm` via scrap, with XDamage deciding whether a frame is worth taking (FR-29) | Zero-copy via shared memory; on a headless box the daemon starts its own Xvfb (`ROOMLERD_VIRTUAL_DESKTOP=1`) | `NoopCapture` carrying the reason (§5.1a) |
 
-The portal/SCK paths produce a system permission prompt the *first* time. That's a feature, not a bug — it's the user consent layer. The Linux arms, their order and their gates are [`linux-capture.md`](linux-capture.md).
+The portal path, and macOS's Screen Recording grant, produce a system permission prompt the *first* time. That's a feature, not a bug — it's the user consent layer. The Linux arms, their order and their gates are [`linux-capture.md`](linux-capture.md).
 
 ### 5.1a When capture cannot open, the session says why (FR-80)
 
@@ -679,7 +688,7 @@ H.264 is the safe default — every browser decodes it. AV1 only if the controll
 
 - Two-layer simulcast in SW (one full-res, one half-res) so the controller can switch instantly on bandwidth dips.
 - `goog-remb` / TWCC feedback drives target bitrate; reasonable bounds: 600 kbps (idle) → 25 Mbps (4K motion).
-- **Variable framerate, idle skip**: when nothing on screen changes (hashed via dirty-rect tracking from WGC/SCK), the encoder emits a 1 fps keepalive instead of a full 60 fps stream. This is the single biggest battery and bandwidth win.
+- **Variable framerate, idle skip**: when nothing on screen changes (the capturer's per-frame `Damage`, `capture/mod.rs`: WGC's dirty regions, DXGI's no-new-frame, XDamage on X11; `scrap` on macOS reports none, so there every frame counts as changed), the encoder emits a 1 fps keepalive instead of a full 60 fps stream. This is the single biggest battery and bandwidth win.
 - IDR on demand: the controller sends `{"t":"keyframe"}` over the control DC if it detects decode errors after a packet loss spike; agent issues an immediate keyframe.
 
 ## 6. Input injection
@@ -730,7 +739,7 @@ Key design choices:
 
 ### 6.1 The Wayland problem
 
-Wayland has no equivalent of XTest. The supported path is `/dev/uinput`, which requires the agent to be in the `input` group (or have `CAP_SYS_ADMIN`). Installer adds the user to `input` group + udev rule. If permission isn't granted, the agent runs in **view-only** mode and the UI clearly says so.
+Wayland has no equivalent of XTest. The supported path is `/dev/uinput`, which requires the agent to be in the `input` group (or have `CAP_SYS_ADMIN`). No package adds that group or a udev rule: uinput is an opt-in of a root (system) install, `uinput = true` (`agents/roomlerd/packaging/linux/README.Debian`). If permission isn't granted, the agent runs in **view-only** mode and the UI clearly says so.
 
 As shipped: uinput is FR-36's arm (`ROOMLERD_UINPUT=1`, paired with DRM capture; host-global, it injects into whatever has focus). Where the compositor is **nested** — WSL2, a compositor inside another — uinput publishes events that nothing reads, so the only input path is the portal's RemoteDesktop interface riding the capture session (FR-45 P4, `ROOMLERD_PORTAL_INPUT=1`), and on GNOME the person at the screen must also flip the dialog's *Allow Remote Interaction* switch. A per-user Wayland session whose portal switched itself on (FR-93 P4b, KDE and other desktops without mutter) asks for remote control with no key set. Both are in [`linux-capture.md`](linux-capture.md#43-input-rides-the-same-session-p4).
 
@@ -2348,7 +2357,14 @@ hardware` produces 1 keyframe + 9 P-frames, total 4212 bytes over
 
 ### Future phases beyond Windows
 
-Deferred per platform:
+> 🗄️ **Two of these shipped, by another route.** VideoToolbox (H.264, HEVC)
+> and VAAPI are FFmpeg encoders in the hardware cascade, not a direct
+> `VTCompressionSession` or `libva` backend ([encoders.md](encoders.md)). And
+> no audio-input entitlement exists: `packaging/macos/entitlements.plist`
+> carries only three hardened-runtime keys, all false, and there is no
+> microphone usage string. The third item still stands.
+
+Deferred per platform (as written):
 
 - **macOS**: VideoToolbox `VTCompressionSession`. Sync-ish API,
   per-user `com.apple.security.device.audio-input` entitlement
