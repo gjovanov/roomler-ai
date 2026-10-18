@@ -647,9 +647,13 @@ client of it would have black-holed.
   on them.
 - **Consent** is currently auto-granted on the agent (see the remote-control
   known issues); an exit node forwards for any approved client in its tenant.
-- **Approval requires a re-join.** After the admin toggle, the exit node's
-  netmap change reaches clients when the hub re-reads the node — restart or
-  reconnect the exit agent if a client isn't picking up the `/0`.
+- **Approval reaches clients at once; the OFFER needs a re-join.** The approve
+  and exit-node toggles re-fan the node to its peers immediately
+  (`crates/modules/network/src/routes/overlay_route.rs:350`, `:423`, through
+  `overlay::refan_node`, `crates/modules/network/src/overlay.rs:1281`), so no
+  client re-joins. What does is the exit node itself: the server refuses to
+  approve `/0` on a node that has not advertised it, so set
+  `overlay_exit_node_enabled` in its config and let it re-join first.
 
 ## Verifying it works
 

@@ -84,7 +84,7 @@ roomler org overlay <org> tun
 
 ## Platform limits
 
-- **macOS** does not support a separate network adapter per organization.
+- **macOS**: a separate network adapter per organization is built, but has not been verified on a Mac yet. Until it has, plan on one adapter, for the primary organization.
 - **Exit node** and userspace-networking roles are primary-organization only.
 
 ## Removing one

@@ -14,7 +14,7 @@ twice and they fight over the same identity.
 
                             | roomler.service | roomlerd.service
   --------------------------+-----------------+------------------
-  screen capture + input    | yes             | opt-in (drm_capture + uinput)
+  screen capture + input    | yes             | the person on screen, else opt-in
   overlay mesh (roomler0)   | no              | yes (TUN needs CAP_NET_ADMIN)
   unattended self-update    | yes (helper)    | yes
   starts before login       | no              | yes
@@ -114,17 +114,28 @@ Under the user unit, a Wayland session captures itself:
   others  the person at the screen once (KDE's "Remote Control" dialog),
           then remembers the answer.
 
-The system unit captures a desktop, Wayland or X11, only once both of these
-keys are set. They read the screen below the desktop and inject input into
-whatever has focus, the login screen included, so nothing sets them for you:
+The system unit switches capture on by itself for the person at the screen,
+Wayland or X11, when all of these hold:
+
+  - no capture key is set;
+  - the seat shows that person's own session, never the login screen;
+  - that person can be told: the desktop companion runs for them, or their
+    notifications show buttons, so they see "This screen is being viewed"
+    with Disconnect;
+  - on X11, the desktop reports its lock (GNOME Shell or KDE).
+
+It then reads the screen below the desktop and injects input there, bound to
+that person's session. wayland_auto_system / x11_auto_system = false switch
+it off. Anything else (the login screen, a desktop that cannot tell anyone)
+needs both of these keys, which read the screen and inject input into whatever
+has focus, the login screen included, so nothing sets them for you:
 
   sudo roomler config set drm_capture true
   sudo roomler config set uinput true
   sudo systemctl restart roomlerd.service
 
-Until then the viewer says "capturing it is switched off on this device" and
-names these two commands. It never shows a black screen or calls a desktop
-host headless.
+Until then the viewer names what is missing and these two commands. It never
+shows a black screen or calls a desktop host headless.
 
 What each desktop, install and session state gives, and every message the
 viewer can show: docs/wayland.md in the roomler-ai repository.
