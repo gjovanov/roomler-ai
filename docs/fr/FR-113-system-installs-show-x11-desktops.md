@@ -54,7 +54,8 @@ flowchart LR
   stays as it is: per-user X11 installs are out of scope (§7), since scrap reaches their own `DISPLAY`.
 - **The seat guard holds on X11.** FR-95 P2's guard (never the greeter, never a locked screen; the person's session
   must be the one on screen) reads logind, so it carries over. It must be shown on X11 (AC3), since a DRM read of the
-  scanout would otherwise show whatever is on screen.
+  scanout would otherwise show whatever is on screen. **It sees a lock only through `LockedHint`**, so the X11 half
+  switches on only for a desktop that sets it: GNOME Shell or KDE's `ksmserver` running as the person (D4).
 - **DRM's idle skip on X11 seats.** FR-93 P3d skips unchanged frames on Wayland seats only
   (`capture/drm_backend.rs:1044`; the X11 cell logged "every frame is read (not a Wayland seat …)"). An idle X11
   desktop through DRM would read every frame, so P1 extends the skip, or AC6 fails. **Why P3d was Wayland-only**
@@ -128,7 +129,7 @@ flowchart LR
 | **D1** | On by default for X11 system installs | *(Recommended: yes, as FR-95. The seat guard is what makes it safe, and AC3 proves it.)* **P1 implements the recommendation**; it ships in no release before the field run, and the operator can still overturn it. |
 | **D2** | DRM first, or the session's own X server (`DISPLAY` from logind's session, plus its Xauthority, whose path depends on the display manager) | *(Recommended: DRM first, as it is display-manager agnostic and proven here. The Xauthority path only for a host without DRM access.)* |
 | **D3** | The switch's name | *(Recommended: `x11_auto_system`, default on.)* **As implemented** (`ROOMLERD_X11_AUTO_SYSTEM`); off gives back 0.4.143 exactly, including P2's reason (`no_display`) and the X11 idle skip (every frame read). `wayland_auto = false` and `wayland_aware = false` turn it off too. |
-| **D4** | A locker that never sets logind's `LockedHint` | Found while writing P1. The seat guard knows a lock only by `LockedHint` (`seat_guard::guard`). GNOME sets it on Xorg too, and LightDM's `light-locker` locks by switching to a greeter session, which the guard already reads as away. An in-session locker that does not set it (xscreensaver, some xfce4-screensaver versions) would have its lock screen read, as on a Wayland compositor that does not set it. *(Recommended: measure AC2's desktop first. If its locker does not set it, refuse that desktop by default rather than stream its lock screen.)* |
+| **D4** | A locker that never sets logind's `LockedHint` | Found while writing P1. The seat guard knows a lock only by `LockedHint` (`seat_guard::guard`). GNOME sets it on Xorg too, and LightDM's `light-locker` locks by switching to a greeter session, which the guard already reads as away. An in-session locker that does not set it (xscreensaver, i3lock, slock, some xfce4-screensaver versions) would have its lock screen read, and its password field typed into by the automatic `uinput`. **Decided in P1, on the PR review (#2471):** refuse such a desktop by default. The X11 half switches on only where `gnome-shell` or `ksmserver` runs as the person (`lock_reporting_shell`, read from `/proc`, since logind's `Desktop` is empty for GDM's auto-login session). Anything else plans `SystemPlan::LockUnreported`, before the surface is probed, and `x11_not_enabled` says so and offers the explicit keys. An allowlist entry for another desktop must first show its locker setting `LockedHint` (AC2's desktop is the first candidate). |
 
 ## 7. Out of scope
 

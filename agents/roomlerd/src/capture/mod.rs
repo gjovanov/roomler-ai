@@ -596,12 +596,24 @@ impl CaptureUnavailableCode {
 /// ⚠️ A hint goes on the wire as a JSON literal, unescaped
 /// (`capture_unavailable_payload`): no double quote, no backslash.
 fn x11_hint(root: bool) -> &'static str {
-    x11_hint_with(root, NO_SURFACE.load(std::sync::atomic::Ordering::Relaxed))
+    x11_hint_with(
+        root,
+        NO_SURFACE.load(std::sync::atomic::Ordering::Relaxed),
+        NO_LOCK_REPORT.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
-/// [`x11_hint`], with the last system plan's "no surface" passed in.
-fn x11_hint_with(root: bool, no_surface: bool) -> &'static str {
-    if root && no_surface {
+/// [`x11_hint`], with the last system plan's refusals passed in: "no
+/// surface", and (FR-113 D4) "the desktop does not report its lock".
+fn x11_hint_with(root: bool, no_surface: bool, no_lock_report: bool) -> &'static str {
+    if root && no_lock_report {
+        "This computer is showing an X11 desktop whose screen locker does not report a lock to \
+         the system (GNOME and KDE do; this desktop does not), so a system install does not \
+         capture it by itself: it could not tell the lock screen from the desktop. On the host \
+         an administrator can run sudo roomler config set drm_capture true and sudo roomler \
+         config set uinput true, then sudo roomler restart. That capture reads the screen below \
+         the desktop, the lock screen included. Remote shell and file transfer still work."
+    } else if root && no_surface {
         "This computer is showing an X11 desktop, and it is not captured by itself because \
          nobody at the screen could be told they are being viewed: the session on screen has no \
          desktop companion and no notification service. Install the desktop companion (the \
@@ -735,6 +747,11 @@ pub(crate) enum SeatKind {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 static NO_SURFACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// FR-113 D4 — the last system plan found a person's X11 desktop that does not
+/// report its lock to logind: the hint names that, not only the keys.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+static NO_LOCK_REPORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// FR-93 P2 — the keys that choose Linux capture by hand. With any one of them
 /// set, to anything, the operator owns the cascade and it runs exactly as it
 /// did before P2: `drm_capture = false` removes that arm, `= true` forces it.
@@ -841,6 +858,10 @@ enum SystemPlan {
     /// As configured, because nobody at the screen could be told they are
     /// being viewed: the hint says so (AC3).
     NoSurface,
+    /// FR-113 D4 — as configured, because the person's X11 desktop does not
+    /// report its lock to logind (`LockedHint`), so the seat guard could not
+    /// tell its lock screen from the desktop: the hint says so.
+    LockUnreported,
     /// DRM and uinput as if their keys were set, bound to this logind
     /// session: the screen is read only while it is on screen, unlocked
     /// (`seat_guard`).
@@ -874,6 +895,11 @@ struct AutoKinds {
 ///   The greeter is not one: this FR never captures it by default (D-c).
 /// - `kinds`: which of the two may switch on. A person whose kind is switched
 ///   off is planned as configured, as if nobody were on screen.
+/// - FR-113 D4: an X11 person whose desktop does not report its lock to logind
+///   (`Person::lock_reported`) is refused (`LockUnreported`), before the
+///   surface is probed. The seat guard knows a lock only by `LockedHint`, and
+///   most X11 lockers outside GNOME and KDE never set it: their lock screen
+///   would be read, and its password field typed into.
 /// - `surface`: whether that person can be told they are being viewed and end
 ///   it (FR-93 P6g's notice: the companion's banner, else a notification with
 ///   Disconnect), checked live (D-b).
@@ -906,6 +932,9 @@ fn system_plan(
     if !switched_on {
         return SystemPlan::AsConfigured;
     }
+    if person.x11 && !person.lock_reported {
+        return SystemPlan::LockUnreported;
+    }
     if surface(&person) {
         SystemPlan::Auto {
             session: person.session,
@@ -931,6 +960,11 @@ struct Person {
     uid: u32,
     /// FR-113 — an X11 session (logind `Type=x11`), not a Wayland one.
     x11: bool,
+    /// FR-113 D4 — the session's desktop reports its lock to logind
+    /// (`LockedHint`), so the seat guard can see it. Always true on Wayland,
+    /// as FR-95 shipped; on X11, a lock-reporting shell runs for the person
+    /// ([`lock_reporting_shell`]).
+    lock_reported: bool,
 }
 
 /// FR-95 P2 — [`system_plan`] now, for a root daemon. Records whether the
@@ -957,6 +991,10 @@ fn system_plan_now() -> SystemPlan {
         plan == SystemPlan::NoSurface,
         std::sync::atomic::Ordering::Relaxed,
     );
+    NO_LOCK_REPORT.store(
+        plan == SystemPlan::LockUnreported,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     plan
 }
 
@@ -969,7 +1007,8 @@ fn system_plan_now() -> SystemPlan {
 /// its Xauthority (which a systemd unit has neither of, `linux-capture.md`
 /// §1), and uinput reaches Xorg through libinput as it reaches a compositor.
 /// The seat guard reads only logind (the session id, its class, its
-/// `LockedHint`), so it holds on X11 unchanged.
+/// `LockedHint`), so on X11 it holds only where the desktop sets `LockedHint`:
+/// D4, `Person::lock_reported`.
 #[cfg(all(
     target_os = "linux",
     feature = "drm-capture",
@@ -979,11 +1018,71 @@ fn person_on_screen() -> Option<Person> {
     let id = seat_guard::on_screen()?.id;
     crate::keep_busy::logind::show(&id)
         .filter(|s| s.is_user() && (s.kind == "wayland" || s.kind == "x11"))
-        .map(|s| Person {
-            x11: s.kind == "x11",
-            session: s.id,
-            uid: s.uid,
+        .map(|s| {
+            let x11 = s.kind == "x11";
+            Person {
+                lock_reported: !x11 || lock_reporting_shell(s.uid),
+                x11,
+                session: s.id,
+                uid: s.uid,
+            }
         })
+}
+
+/// FR-113 D4 — the shells whose screen lockers set logind's `LockedHint`:
+/// GNOME Shell (its screen shield, on Xorg as on Wayland) and KDE's session
+/// manager (`ksmserver`, which drives kscreenlocker). logind cannot name the
+/// desktop (its `Desktop` is empty for GDM's auto-login session, measured on
+/// Ubuntu 24.04), so the person's own processes are asked. Anything else on
+/// X11 (xscreensaver, i3lock, slock, light-locker inside a session, older
+/// xfce4-screensaver) is not trusted to report a lock.
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        feature = "drm-capture",
+        feature = "portal-capture"
+    )),
+    allow(dead_code)
+)]
+const LOCK_REPORTING_SHELLS: [&str; 2] = ["gnome-shell", "ksmserver"];
+
+/// FR-113 D4 — whether a [`LOCK_REPORTING_SHELLS`] process runs as `uid`:
+/// `/proc`'s `comm` and the real uid on its `Uid:` line. Unreadable means
+/// "no": a desktop that cannot be vouched for is refused, never streamed.
+#[cfg(all(
+    target_os = "linux",
+    feature = "drm-capture",
+    feature = "portal-capture"
+))]
+fn lock_reporting_shell(uid: u32) -> bool {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    dir.flatten().any(|entry| {
+        let path = entry.path();
+        let comm = std::fs::read_to_string(path.join("comm")).unwrap_or_default();
+        LOCK_REPORTING_SHELLS.contains(&comm.trim())
+            && std::fs::read_to_string(path.join("status"))
+                .ok()
+                .is_some_and(|status| status_uid(&status) == Some(uid))
+    })
+}
+
+/// The real uid on a `/proc/<pid>/status` text's `Uid:` line.
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        feature = "drm-capture",
+        feature = "portal-capture"
+    )),
+    allow(dead_code)
+)]
+fn status_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|uid| uid.parse().ok())
 }
 
 /// FR-113 P1 — whether a seat the desktop brief shows gets the automatic
@@ -2814,7 +2913,7 @@ fn open_with(
     let auto_system = if running_as_root() {
         match system_plan_now() {
             SystemPlan::Auto { session } => Some(session),
-            SystemPlan::AsConfigured | SystemPlan::NoSurface => None,
+            SystemPlan::AsConfigured | SystemPlan::NoSurface | SystemPlan::LockUnreported => None,
         }
     } else {
         None
@@ -3512,21 +3611,40 @@ mod wayland_reason_tests {
     /// `no_display`.
     #[test]
     fn the_x11_hint_names_what_this_install_can_use() {
-        let no_surface = x11_hint_with(true, true);
+        let no_surface = x11_hint_with(true, true, false);
         assert!(no_surface.contains("X11 desktop"), "{no_surface}");
         assert!(no_surface.contains("being viewed"), "{no_surface}");
         assert!(no_surface.contains("desktop companion"), "{no_surface}");
-        let off = x11_hint_with(true, false);
+        let off = x11_hint_with(true, false, false);
         assert!(off.contains("sudo roomler config clear"), "{off}");
         assert!(off.contains("login screen"), "{off}");
         assert!(!off.contains("x11_auto_system"), "{off}");
-        let user = x11_hint_with(false, false);
+        let user = x11_hint_with(false, false, false);
         assert!(user.contains("DISPLAY"), "{user}");
         assert!(!user.contains("sudo"), "{user}");
+        for (no_surface, no_lock_report) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                x11_hint_with(false, no_surface, no_lock_report),
+                user,
+                "the system half's refusals are not a per-user daemon's"
+            );
+        }
+    }
+
+    /// FR-113 D4 — a desktop whose locker does not report a lock is told so,
+    /// and offered only the explicit keys, which read the lock screen by the
+    /// operator's choice.
+    #[test]
+    fn an_unreported_lock_is_named_with_the_keys_that_read_it_anyway() {
+        let hint = x11_hint_with(true, false, true);
+        assert!(hint.contains("does not report a lock"), "{hint}");
+        assert!(hint.contains("GNOME and KDE do"), "{hint}");
+        assert!(hint.contains("drm_capture true"), "{hint}");
+        assert!(hint.contains("the lock screen included"), "{hint}");
         assert_eq!(
-            x11_hint_with(false, true),
-            user,
-            "no surface is the system half's"
+            x11_hint_with(true, true, true),
+            hint,
+            "it outranks no surface"
         );
     }
 
@@ -3548,8 +3666,12 @@ mod wayland_reason_tests {
         hints.push(wayland_hint(false));
         hints.push(x11_hint(true));
         hints.push(x11_hint(false));
-        for (root, no_surface) in [(true, true), (true, false), (false, true), (false, false)] {
-            hints.push(x11_hint_with(root, no_surface));
+        for root in [true, false] {
+            for no_surface in [true, false] {
+                for no_lock_report in [true, false] {
+                    hints.push(x11_hint_with(root, no_surface, no_lock_report));
+                }
+            }
         }
         for hint in hints {
             assert!(
@@ -3604,19 +3726,104 @@ mod system_auto_tests {
                 session: "3".into(),
                 uid: 1000,
                 x11: false,
+                lock_reported: true,
             })
         }
     }
 
-    /// FR-113 — a person's X11 session on screen.
+    /// FR-113 — a person's X11 session on screen, on a desktop whose locker
+    /// reports a lock (GNOME, KDE).
     fn bob_on_x11() -> impl FnOnce() -> Option<Person> {
         || {
             Some(Person {
                 session: "5".into(),
                 uid: 1000,
                 x11: true,
+                lock_reported: true,
             })
         }
+    }
+
+    /// FR-113 D4 — an X11 desktop whose locker reports nothing to logind.
+    fn carol_on_unreported_x11() -> impl FnOnce() -> Option<Person> {
+        || {
+            Some(Person {
+                session: "7".into(),
+                uid: 1000,
+                x11: true,
+                lock_reported: false,
+            })
+        }
+    }
+
+    /// FR-113 D4 — refused before the surface is probed, so no helper starts in
+    /// the person's session; and only ever on X11 (Wayland ships as FR-95 did).
+    #[test]
+    fn an_x11_desktop_that_does_not_report_its_lock_is_refused() {
+        assert_eq!(
+            system_plan(
+                true,
+                true,
+                BOTH,
+                false,
+                false,
+                carol_on_unreported_x11(),
+                untold()
+            ),
+            SystemPlan::LockUnreported
+        );
+        let wayland_unreported = || {
+            Some(Person {
+                session: "3".into(),
+                uid: 1000,
+                x11: false,
+                lock_reported: false,
+            })
+        };
+        assert_eq!(
+            system_plan(
+                true,
+                true,
+                BOTH,
+                false,
+                false,
+                wayland_unreported,
+                told(true)
+            ),
+            SystemPlan::Auto {
+                session: "3".into()
+            }
+        );
+        let x11_off = AutoKinds {
+            wayland: true,
+            x11: false,
+        };
+        assert_eq!(
+            system_plan(
+                true,
+                true,
+                x11_off,
+                false,
+                false,
+                carol_on_unreported_x11(),
+                untold()
+            ),
+            SystemPlan::AsConfigured,
+            "the switch off is 0.4.143 exactly: no refusal of its own"
+        );
+    }
+
+    /// FR-113 D4 — the real uid is the first field of `/proc/<pid>/status`'s
+    /// `Uid:` line; anything else reads as unknown, never as a match.
+    #[test]
+    fn the_status_uid_is_the_real_uid() {
+        let status =
+            "Name:\tgnome-shell\nState:\tS (sleeping)\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\n";
+        assert_eq!(super::status_uid(status), Some(1000));
+        assert_eq!(super::status_uid("Uid:\t0\t1000\t0\t0\n"), Some(0));
+        assert_eq!(super::status_uid("Name:\tx\n"), None);
+        assert_eq!(super::status_uid("Uid:\tnope\n"), None);
+        assert_eq!(super::LOCK_REPORTING_SHELLS, ["gnome-shell", "ksmserver"]);
     }
 
     fn unasked() -> impl FnOnce() -> Option<Person> {

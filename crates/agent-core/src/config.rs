@@ -1086,8 +1086,10 @@ pub struct AgentConfig {
     /// (`ROOMLERD_X11_AUTO_SYSTEM`): a root install, with no capture key set,
     /// switches DRM and uinput on by itself for the person's X11 session on
     /// screen, on the same terms (told first; read only while that session is
-    /// on screen, unlocked; never the greeter or the lock screen), and skips
-    /// an idle X11 desktop's unchanged frames by dense rows. Built-in default:
+    /// on screen, unlocked; never the greeter or the lock screen), and only
+    /// where the desktop reports its lock to logind (GNOME, KDE): any other
+    /// X11 desktop is refused with `x11_not_enabled`. It skips an idle X11
+    /// desktop's unchanged frames by dense rows. Built-in default:
     /// **ON**. `false` is the kill switch: 0.4.143 exactly (no picture of an
     /// X11 seat by default, `no_display`). `wayland_auto = false` turns it off
     /// too. Restart required.

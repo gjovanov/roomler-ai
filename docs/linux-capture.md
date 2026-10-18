@@ -425,7 +425,9 @@ flowchart TD
     W -- no --> C
     X -- "no: 0.4.143 exactly" --> C
     W -- yes --> T{"can that person be told?"}
-    X -- yes --> T
+    X -- yes --> L{"does the desktop report its lock?<br/>GNOME Shell or KDE's ksmserver<br/>runs for the person (D4)"}
+    L -- no --> U["the cascade of §1: x11_not_enabled,<br/>the hint names the unreported lock"]
+    L -- yes --> T
     T -- no --> N["the cascade of §1: wayland_not_enabled<br/>or x11_not_enabled, the hint names<br/>the missing surface"]
     T -- yes --> D["DRM + uinput, AUTOMATIC, BOUND to that<br/>session, behind the seat guard (§1.2.1)"]
 ```
@@ -436,17 +438,22 @@ flowchart TD
 | who counts | `person_on_screen`: logind class `user`, `Type=wayland` | the same, `Type=x11` |
 | capture | DRM: the scanout, below the compositor | DRM: the scanout, below the X server. Neither `DISPLAY` nor an Xauthority is needed, which a root daemon has neither of |
 | input | `uinput`, below the compositor | `uinput`: Xorg picks the device up through libinput, as a compositor does |
-| the seat guard | logind: the session id, its class, `LockedHint` | unchanged: it reads only logind. GNOME sets `LockedHint` on Xorg too |
+| the seat guard | logind: the session id, its class, `LockedHint` | unchanged: it reads only logind, so the plan switches on only for a desktop that sets `LockedHint`: GNOME Shell or KDE's `ksmserver` running for the person (`lock_reporting_shell`, D4) |
 | an idle desktop | the compositor flips: buffer + 32 rows (§3.2) | the X server draws in place: rows alone, one every 8 (§3.2) |
 | nothing captured | `wayland_not_enabled` | `x11_not_enabled` (FR-113 P2) |
 
-⚠️ **The guard knows a lock only by `LockedHint`.** GNOME sets it on Xorg as
-on Wayland. A desktop whose locker draws inside the session without setting
-it (xscreensaver, some xfce4-screensaver versions) would have its lock
-screen read, as a Wayland compositor that does not set it would. LightDM's
-`light-locker` locks by switching to a greeter session, which the guard
-already reads as `session_away`. FR-113's spec carries this as an open
-decision.
+⚠️ **The guard knows a lock only by `LockedHint`, so an X11 desktop must
+report it (D4).** GNOME Shell sets it on Xorg as on Wayland, and KDE's
+`ksmserver` drives kscreenlocker, which sets it. Most other X11 lockers do
+not: xscreensaver, i3lock, slock, older xfce4-screensaver. With one of
+those, the guard would read the lock screen, and the automatic `uinput`
+would type into its password field. So the X11 half switches on only where
+`gnome-shell` or `ksmserver` runs as the person (`lock_reporting_shell`,
+read from `/proc`, because logind's `Desktop` is empty for GDM's
+auto-login session). Any other X11 desktop is refused before the surface
+is probed, with `x11_not_enabled` and a hint that offers the explicit keys,
+which read the lock screen by the operator's own choice. An unreadable
+`/proc` counts as "no".
 
 **Kill switch**: `x11_auto_system` / `ROOMLERD_X11_AUTO_SYSTEM=0` (default on)
 gives back 0.4.143 exactly: no plan for an X11 seat, its DRM read every frame,
