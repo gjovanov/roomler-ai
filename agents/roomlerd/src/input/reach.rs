@@ -281,23 +281,44 @@ fn told_with(aware: bool, facts: impl FnOnce() -> Facts) -> Option<InputReach> {
 /// RESTART starts an Xwayland on 0.4.129 and on this build alike, because the
 /// x11 consent panel connects at start, `indicator/x11.rs`. A boot does not.
 /// This rule keeps the brief from adding to that.)
+///
+/// #2473 — `auto_system`: the plan says a root daemon's automatic system
+/// capture (FR-95, FR-113) would open (`capture::ArmFacts::auto_system`). Its
+/// `uinput` is the injector a session would get, so it counts here although no
+/// capture is live yet: the brief runs once a minute, mostly with none, and
+/// before this it predicted `none` for every such host.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn predicted(route: Option<RouteKind>, wayland_session: bool) -> InputReach {
-    let mut facts = gather_with(if wayland_session {
-        x_server_if_running
-    } else {
-        x_server
-    });
+pub fn predicted(route: Option<RouteKind>, wayland_session: bool, auto_system: bool) -> InputReach {
+    let mut facts = gather_with(
+        if wayland_session {
+            x_server_if_running
+        } else {
+            x_server
+        },
+        auto_system,
+    );
     facts.route = facts.route.or(route);
     decide(&facts)
 }
 
 fn gather() -> Facts {
-    gather_with(x_server)
+    gather_with(x_server, false)
 }
 
-/// [`gather`], with the X server read by `x`.
-fn gather_with(x: fn() -> XServer) -> Facts {
+/// FR-95 P2 / #2473 — whether the automatic `uinput` is the injector: never with
+/// `uinput` set either way (`unset`), and only while an automatic system
+/// capture is `live`, or, for the brief's prediction, `planned`.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "uinput-input", feature = "drm-capture")),
+    allow(dead_code)
+)]
+fn automatic_uinput(unset: bool, live: bool, planned: bool) -> bool {
+    unset && (live || planned)
+}
+
+/// [`gather`], with the X server read by `x`; `planned_auto` as [`predicted`]'s
+/// `auto_system`.
+fn gather_with(x: fn() -> XServer, planned_auto: bool) -> Facts {
     #[cfg(target_os = "windows")]
     let platform = Platform::Windows;
     #[cfg(target_os = "macos")]
@@ -315,16 +336,26 @@ fn gather_with(x: fn() -> XServer) -> Facts {
     #[cfg(all(target_os = "linux", feature = "uinput-input"))]
     let (uinput_on, uinput_ok) = {
         // FR-95 P2 — or switched on by itself, for an automatic system
-        // capture (`input::open_default`).
+        // capture (`input::open_default`): live, or (#2473) planned.
         #[cfg(feature = "drm-capture")]
-        let auto = super::uinput_unset() && crate::capture::seat_guard::live();
+        let auto = automatic_uinput(
+            super::uinput_unset(),
+            crate::capture::seat_guard::live(),
+            planned_auto,
+        );
         #[cfg(not(feature = "drm-capture"))]
-        let auto = false;
+        let auto = {
+            let _ = planned_auto;
+            false
+        };
         let on = super::uinput_backend::env_enabled() || auto;
         (on, on && super::uinput_backend::available())
     };
     #[cfg(not(all(target_os = "linux", feature = "uinput-input")))]
-    let (uinput_on, uinput_ok) = (false, false);
+    let (uinput_on, uinput_ok) = {
+        let _ = planned_auto;
+        (false, false)
+    };
 
     Facts {
         platform,
@@ -662,6 +693,28 @@ mod tests {
             enigo_built: true,
             x,
         }
+    }
+
+    /// #2473 — the automatic `uinput` counts while its capture is live (the
+    /// per-session verdict) AND when the plan says one would open (the brief,
+    /// which mostly runs with none live); never with `uinput` set either way.
+    #[test]
+    fn the_automatic_uinput_counts_when_live_or_planned() {
+        assert!(super::automatic_uinput(true, true, false), "live");
+        assert!(
+            super::automatic_uinput(true, false, true),
+            "planned, nothing live"
+        );
+        assert!(!super::automatic_uinput(true, false, false), "neither");
+        assert!(
+            !super::automatic_uinput(false, true, true),
+            "uinput set by the operator: the configured path decides"
+        );
+        // And what the brief then says: the injector reaches the desktop.
+        let mut f = linux(XServer::Absent);
+        f.uinput_on = true;
+        f.uinput_ok = true;
+        assert_eq!(decide(&f).reach, Reach::Full);
     }
 
     /// The FR-93 lab's per-user GNOME 50 guest, stock: XTest is all there is,
