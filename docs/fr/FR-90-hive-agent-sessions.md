@@ -2433,11 +2433,11 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     has. *Decided 2026-10-10 by the operator, on the recommendation: dropped, as Windows does.*
     Built, and field-verified (§8), so that a session holds none of those groups and on Linux
     cannot `sudo` at all:
-    - It holds none of the account's administrator groups (`exec.rs:1022`): root's own, the
+    - It holds none of the account's administrator groups (`exec.rs:1053`): root's own, the
       sudoers groups and those whose socket or device is root by another door (`docker`, `lxd`,
       `incus`, `libvirt`, `disk`). An account whose primary group is one is refused
-      (`exec.rs:1087`). The kernel then grants the session nothing by those groups.
-    - On Linux the harness starts with `no_new_privs` (`exec.rs:1144`), so nothing it runs gains
+      (`exec.rs:1118`). The kernel then grants the session nothing by those groups.
+    - On Linux the harness starts with `no_new_privs` (`exec.rs:1175`), so nothing it runs gains
       a privilege by exec: no `sudo`, whatever sudoers says of the account.
     - ⚠️ macOS has no such switch, and its `sudo` reads the account's groups from the directory,
       never from the process. A session there can still use any rule its account may use without

@@ -22,7 +22,9 @@
 - P4d, a clean stop for a per-user Windows install (`roomlerd service stop`, sign-out, shutdown), merged (#2435),
   field-verified red → green on a perUser Win11 guest (§8).
 - P4a, a real Ctrl+Alt+Del (`SendSAS` from the SCM host, asked by the SystemContext worker, where the policy lets
-  services), is in review, field-verified red → green on a Win11 lock screen that requires it (§8).
+  services), merged (#2437), field-verified red → green on a Win11 lock screen that requires it (§8).
+- P4b, SFTP and `scp` as the signed-in Windows user (`sftp-server` through `exec`'s console-user spawn, in the
+  person's profile), is in review.
 - The rest of P2–P7 is open.
 
 **Owner:** the agent on all
@@ -185,8 +187,8 @@ and the consent chain's fallbacks.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | X1 | `exec` and SSH `daemon` mode run as the machine | 🟡 the console worker: the signed-in user on attended installs (#2021) | ✅ root | 🟡 root on the `-daemon` row, the user on the other | Two identities, one per row | FR-94; FR-43 P3 |
-| X2 | `console_user` account mode | 🟡 SystemContext only | ❌ | ❌ | "a Windows concept" (`exec.rs:829`) | P5a, after FR-94 |
-| X3 | SFTP / scp as the signed-in user | ❌ | ✅ | ✅ | Refused (`ssh.rs:942`); `tokio::process` cannot take a token | P4b |
+| X2 | `console_user` account mode | 🟡 SystemContext only | ❌ | ❌ | "a Windows concept" (`exec.rs:831`) | P5a, after FR-94 |
+| X3 | SFTP / scp as the signed-in user | 🟡 built (P4b), where `sftp-server.exe` is installed | ✅ | ✅ | Was refused: `tokio::process` cannot take a token. P4b takes `exec`'s console-user spawn (`ssh.rs:1353`) | P4b |
 
 ### 2.6 Install, update, ops, architectures
 
@@ -623,8 +625,18 @@ test of the SIGKILL property itself.
     missing half. An attended worker cannot open the relay, so it stays `keys-only`.
   - The viewer sends `{t: "sas"}` only to an agent that advertises it; the injector checks again before it asks.
   - `sas.dll` is loaded at send time from System32 only, never imported. `docs/remote-control.md` §5.1e.
-- **P4b, SFTP as `console_user`.** Spawn `sftp-server` through the `CreateProcessAsUserW` + three-pipe path the exec
-  code already uses, instead of `tokio::process` (`ssh.rs:926-948`).
+- **P4b, SFTP as `console_user`** (built). `sftp-server` runs through the `CreateProcessAsUserW` + three-pipe path
+  the exec code already uses (`exec::run_console_user_program`, `exec.rs:875`), instead of `tokio::process`
+  (`ssh.rs:1353`).
+  - The command line is the quoted path alone: no shell stands in front, and nothing a client sends becomes an
+    argument.
+  - The bytes are raw. The streamed shell path redacts, and redaction inside a binary SFTP stream is corruption.
+  - It starts in the person's profile, read from the token the child runs under (`exec.rs:3317`). A service starts
+    in System32, where a bare `put` cannot land.
+  - The client gets the exit status, then EOF, then close (`scp`'s verdict), and its abort sits with the exec
+    channels', so a closed channel or a dropped session kills the tree.
+  - A `named` account still refuses on Windows. Kill switch: `ROOMLERD_SFTP_AS_USER=0` restores the refusal
+    (`ssh.rs:1155`). `docs/roomler-ssh.md` (*File transfer*) has the details.
 - **P4c, Hive adopt.** A named pipe whose server reads `GetNamedPipeClientProcessId` → token → SID and maps it to the
   session's account, asking for no credentials (`hive_win.rs:6-11`).
 - **P4d, a clean stop for Scheduled-Task installs** (built). Two channels into the arm the SCM host's event already
@@ -645,7 +657,7 @@ test of the SIGKILL property itself.
 
 `console_user` on Linux and macOS: resolve the active seat's user (Linux: logind's seat0 active session) or the
 console user (macOS: `SCDynamicStoreCopyConsoleUser`) and route into the existing `unix_priv::drop_to`
-(`exec.rs:872-888`). Refuse when nobody is at the screen. It is a privilege drop, never a gain. It waits for FR-94's
+(`exec.rs:903-919`). Refuse when nobody is at the screen. It is a privilege drop, never a gain. It waits for FR-94's
 model on Windows, so the three agree on what the mode means.
 
 ### 3.11 P6 — install, update, ops
@@ -713,7 +725,7 @@ model on Windows, so the three agree on what the mode means.
 | **P3h** | Linux DNS without systemd-resolved | `ROOMLERD_DNS_NM=0` | evidence first | M |
 | **P3i** | Linux host firewall: what governs the overlay adapter, reported in `roomler status`, never changed (D13) | `ROOMLERD_HOST_FW_PROBE=0` | a firewalld node (zone `public`) and a ufw node, red then green | S |
 | **P4a** | Windows `SendSAS` from the SCM host, which the SystemContext worker asks through a SYSTEM-only relay, where the policy lets services (built) | its cap word: no `sas` in the hello, no frame | Win11 SystemContext, red on 0.4.142; the corporate laptops' policy measured | S–M |
-| **P4b** | Windows SFTP as `console_user` | `ssh_sftp_as_user` | Win11 SystemContext | S–M |
+| **P4b** | Windows SFTP as `console_user`: `sftp-server` through `exec`'s console-user spawn, raw, in the person's profile (built) | `ROOMLERD_SFTP_AS_USER=0` | Win11 SystemContext, red on 0.4.142 | S–M |
 | **P4c** | Windows Hive adopt | `hive_adopt` | Win11 | M |
 | **P4d** | Windows per-user clean stop: `service stop` and a session-end window (D15, built) | `ROOMLERD_SESSION_END=0` (the window); `service stop` acts only when run | Win11, a perUser ephemeral device, red on 0.4.142 | S |
 | **P4e** | Windows Home + v6 serving (only if D1 picks the userspace egress) | its own | Win11 Home | L |

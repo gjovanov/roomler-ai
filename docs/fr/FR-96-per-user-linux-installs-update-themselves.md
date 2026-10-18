@@ -164,7 +164,7 @@ hand install alike, and the helper never speaks to a daemon.
 
 - ⚠️ **An SSH session counts as a session.** The likeliest replacement outside the helper is an admin's
   `apt upgrade` typed into a roomler SSH session on that very device. `ssh.rs` now counts its open connections
-  (`live_connections`, `ssh.rs:2539-2545`), and the restart waits for them.
+  (`live_connections`, `ssh.rs:2639-2645`), and the restart waits for them.
 - **`auto_update = false` does not stop it.** Running what is already installed is not an update. The kill switch
   is the FR's, `ROOMLERD_UPDATE_HELPER=0` (AC7).
 - **Root daemons are unchanged** (AC4). An admin's `apt upgrade` on a system install still leaves the root daemon

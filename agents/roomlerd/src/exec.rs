@@ -746,7 +746,9 @@ pub enum RunAs {
     /// arbitrary local user without that user's credentials.
     Named(String),
     /// The user signed in at the console, via their session token. Windows
-    /// only, and not yet implemented (see [`apply_run_as`]).
+    /// only: spawned through `CreateProcessAsUserW` (`win_console`) for exec,
+    /// the pty, and since FR-97 P4b the `sftp` subsystem; never configured on
+    /// a `tokio::process::Command` (see [`apply_run_as`]).
     ConsoleUser,
 }
 
@@ -856,6 +858,35 @@ pub(crate) fn apply_session_run_as(
 ) -> Result<(), String> {
     unix_priv::drop_to_session(cmd, account)
 }
+
+/// FR-97 P4b — run `program` itself, with no shell and no command argument, as
+/// the user signed in at the console, its stdio raw: `stdin` feeds its input,
+/// and both outputs reach `raw` as they are read, UNREDACTED, with no ceiling
+/// and no wall clock. `abort` kills its process tree. It starts in the user's
+/// profile, where OpenSSH starts it.
+///
+/// For Roomler SSH's `sftp` subsystem on Windows, where `tokio::process`
+/// cannot take a user token. The bytes are a binary protocol, which redaction
+/// (`run_streamed`'s stage) would corrupt, and the program is `sftp-server`
+/// itself, which no shell may stand in front of. The token is the console
+/// session's (`WTSQueryUserToken`), so this works only where the daemon is
+/// SYSTEM, the SystemContext worker, and says why anywhere else.
+#[cfg(all(windows, feature = "ssh-server"))]
+pub(crate) async fn run_console_user_program(
+    program: &str,
+    stdin: StdinFeed,
+    raw: ChunkSink,
+    abort: tokio_util::sync::CancellationToken,
+) -> ExecOutcome {
+    win_console::run_program(
+        program,
+        Output::Streamed { raw },
+        async move { abort.cancelled().await },
+        Some(stdin),
+    )
+    .await
+}
+
 /// FR-85 P1e-unix — the recorder's identity on Linux resolves accounts here
 /// too, so there is one way an account becomes ids (and uid 0 is refused).
 /// FR-90 P1j: and the adopt socket, which names the account its peer runs as.
@@ -3167,14 +3198,45 @@ mod win_console {
         s
     }
 
-    /// Spawn as the console user, drain both pipes, enforce the bounds.
-    ///
-    /// FR-89: `output` decides the drain — to a `Vec` against the combined
-    /// budget (Fleet RPC), or chunk by chunk into the redaction stage's raw
-    /// channel (Roomler SSH), through the very same three pipes. The
-    /// `docs/roomler-ssh.md` note that `CreateProcessAsUserW` had "no pipes
-    /// variant" was outdated the day this module shipped (P5b); what was
-    /// missing was a drain that hands bytes on instead of collecting them.
+    /// FR-97 P4b — the command line for running `program` itself: the quoted
+    /// path and nothing else. No shell stands in front of it and no command
+    /// argument follows, so nothing a caller sends can become an argument. A
+    /// path that holds a `"` (Windows allows none) is refused rather than
+    /// escaped.
+    #[cfg(feature = "ssh-server")]
+    pub(super) fn build_program_cmdline(program: &str) -> Option<String> {
+        (!program.contains('"')).then(|| format!("\"{program}\""))
+    }
+
+    /// Where the child starts.
+    enum StartIn {
+        /// The caller's directory, or (`None`) this process's own.
+        Dir(Option<String>),
+        /// FR-97 P4b — the console user's profile, read from the token the
+        /// child runs under. OpenSSH starts `sftp-server` in the user's home,
+        /// and an SFTP client resolves every relative path against wherever
+        /// it started: inheriting this process's directory (System32, for a
+        /// service) would send a bare `put` somewhere the user cannot write.
+        #[cfg_attr(not(feature = "ssh-server"), allow(dead_code))]
+        Profile,
+    }
+
+    /// The console user, as [`run_cmdline`] does for a shell command, but for
+    /// `program` itself (FR-97 P4b, `sftp-server`), started in their profile.
+    #[cfg(feature = "ssh-server")]
+    pub(super) async fn run_program(
+        program: &str,
+        output: Output,
+        cancel: impl std::future::Future<Output = ()>,
+        stdin: Option<super::StdinFeed>,
+    ) -> ExecOutcome {
+        let Some(cmdline) = build_program_cmdline(program) else {
+            return ExecOutcome::failed(format!("not a program path: {program}"));
+        };
+        run_cmdline(cmdline, StartIn::Profile, None, output, cancel, stdin).await
+    }
+
+    /// Spawn a shell command as the console user ([`run_cmdline`]).
     // 8 params: the same set `spawn_and_wait` hands over, one for one.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run(
@@ -3188,6 +3250,33 @@ mod win_console {
         stdin: Option<super::StdinFeed>,
     ) -> ExecOutcome {
         let cmdline = build_cmdline(program, args, command);
+        run_cmdline(
+            cmdline,
+            StartIn::Dir(cwd),
+            timeout_ms,
+            output,
+            cancel,
+            stdin,
+        )
+        .await
+    }
+
+    /// Spawn as the console user, drain both pipes, enforce the bounds.
+    ///
+    /// FR-89: `output` decides the drain — to a `Vec` against the combined
+    /// budget (Fleet RPC), or chunk by chunk into the redaction stage's raw
+    /// channel (Roomler SSH), through the very same three pipes. The
+    /// `docs/roomler-ssh.md` note that `CreateProcessAsUserW` had "no pipes
+    /// variant" was outdated the day this module shipped (P5b); what was
+    /// missing was a drain that hands bytes on instead of collecting them.
+    async fn run_cmdline(
+        cmdline: String,
+        start_in: StartIn,
+        timeout_ms: Option<u64>,
+        output: Output,
+        cancel: impl std::future::Future<Output = ()>,
+        stdin: Option<super::StdinFeed>,
+    ) -> ExecOutcome {
         let with_stdin = stdin.is_some();
 
         let Some(session) = supervisor::active_console_session_id() else {
@@ -3216,6 +3305,21 @@ mod win_console {
                      user; anchor the device (`roomlerd anchor create`) so commands run through \
                      its SYSTEM service."
                 ));
+            }
+        };
+
+        let cwd = match start_in {
+            StartIn::Dir(dir) => dir,
+            // The same token, so the directory is the profile of the account
+            // the child becomes even if the console changes hands meanwhile.
+            // Unreadable, it starts where this process is: the child is still
+            // the user, so that costs a relative path, never a privilege.
+            StartIn::Profile => {
+                let dir = crate::win_identity::profile_dir_of_token(token.raw());
+                if dir.is_none() {
+                    tracing::warn!(session, "console user's profile directory unreadable");
+                }
+                dir
             }
         };
 
@@ -3422,6 +3526,18 @@ mod win_console {
             let payload = &line[line.find("/c ").unwrap() + 3..];
             assert!(payload.starts_with('"') && payload.ends_with('"'));
             assert_eq!(payload.matches('"').count() % 2, 0);
+        }
+
+        /// FR-97 P4b — `sftp-server` runs itself: its quoted path, no shell, no
+        /// argument. A path with a quote in it is refused, never escaped.
+        #[cfg(feature = "ssh-server")]
+        #[test]
+        fn a_program_runs_itself_with_nothing_after_it() {
+            assert_eq!(
+                build_program_cmdline(r"C:\Windows\System32\OpenSSH\sftp-server.exe").as_deref(),
+                Some(r#""C:\Windows\System32\OpenSSH\sftp-server.exe""#)
+            );
+            assert_eq!(build_program_cmdline(r#"C:\a" -x "b.exe"#), None);
         }
     }
 }
