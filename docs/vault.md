@@ -13,9 +13,10 @@ People use it too.
 > Cedar policies (§7); P3-2b, a session's role, decided at its start and at
 > every move (§8); P3-3a, the key a device's daemon holds for the values it is
 > leased (§9); P3-3b, the vault's half of a lease (§10); P3-3c, how the
-> vault takes a lease back (§11); and P3-4a, the daemon's lease client
-> (§12).** No released agent asks for a lease yet: P3-4c's tools are the
-> first to.
+> vault takes a lease back (§11); P3-4a, the daemon's lease client (§12);
+> and P3-4b, what a session may know of the vault: its metadata tools,
+> decided by Cedar's own `secret:list` (§13).** No released agent asks for a
+> lease yet: P3-4c's tools are the first to.
 
 ## 1. Custody: who can read a secret
 
@@ -219,7 +220,7 @@ flowchart LR
     G["the guardrails<br/>(code, never rows)"] --> SET["the organization's set"]
     S --> SET
     SET --> D{"decide"}
-    Q["a request: role:assume or secret:use"] --> D
+    Q["a request: role:assume, secret:use or secret:list"] --> D
     D -->|"a permit applies, and no forbid"| A["allow"]
     D -->|"a forbid applies, or nothing permits"| N["deny"]
 ```
@@ -238,6 +239,12 @@ namespace `Roomler`:
 |---|---|---|
 | `role:assume` | `User` → `Role` | `device {os, tags, owner}` |
 | `secret:use` | `Session` → `Secret` | `mode`, `audience`, `ttl_s`, `device {os, tags, owner}`, `approval? {approver}` |
+| `secret:list` (P3-4b, §13) | `Session` → `Secret` | `device {os, tags, owner}` |
+
+`secret:list` is an action of its own, not a member of `secret:use`: an
+action group would make "use implies list" hold only for policies written
+with `in`, never for `==`. So a role lists nothing until a permit says it may,
+and a listing permit uses nothing.
 
 `os` is `linux`, `macos` or `windows`, exactly as the device rows store it; any
 other spelling is refused, never lowercased into a match. A device's tags are
@@ -251,6 +258,8 @@ text names no organization:
 |---|---|
 | `guardrail:windows-proxy-only` | any `secret:use` on Windows in a mode other than `proxy`: there is no Claude Code sandbox there (AC13; decision 17) |
 | `guardrail:prod-never-materializes` | `secret:use` in `file`, `env` or `exec` for a secret tagged `prod` or under `prod/` |
+
+Neither guardrail stops a listing: both are about using a value.
 
 **A policy is checked before it is kept** ([`check_policy`](../crates/modules/vault/src/policy.rs)):
 exactly one static Cedar statement, valid against the schema in strict mode,
@@ -613,7 +622,77 @@ sequenceDiagram
 | the frames | their arms in `handle_server_msg` ([`signaling.rs`](../agents/roomlerd/src/signaling.rs)), on the primary connection only |
 | a run's end | `Supervisor::unlive` ([`supervisor.rs`](../agents/roomlerd/src/hive/supervisor.rs)), which every way a run stops being live passes through |
 
-## 13. Audit
+## 13. A session's view of the vault (P3-4b)
+
+Before a session's model asks for a value, it needs to know what there is to
+ask for: which secrets its role may use, their kinds and fields, where a value
+may be presented, and the programs it may be handed to. P3-4b answers that,
+and nothing more: a name and its rules, never a value, nor a version's number,
+nor who wrote it (`VaultSecretMeta`,
+[`vault.rs:58`](../crates/remote_control/src/vault.rs#L58)).
+
+```mermaid
+sequenceDiagram
+    participant M as the session's model
+    participant T as its toolbelt (roomlerd)
+    participant V as vault
+    M->>T: vault_list {prefix?} · vault_describe {secret}
+    T->>V: rc:vault.list {req_id, session_id, fence, prefix} · rc:vault.describe {…, secret}
+    Note over V: believed as a lease is (§10): served, the device takes leases,<br/>the session on THIS device at its fence, live, within its ceiling, in a role
+    V->>V: Cedar's secret:list for each secret, with the device's facts from its row
+    V->>V: recorded before it is answered
+    alt allowed
+        V-->>T: rc:vault.listed {req_id, secrets, more} · rc:vault.described {req_id, secret}
+        T-->>M: the metadata, as the tool's text
+    else refused, or no answer within 15 s
+        V-->>T: rc:vault.refused {req_id, reason}
+        T-->>M: an error the model reads, naming the word
+    end
+```
+
+| | `vault_list` | `vault_describe` |
+|---|---|---|
+| Asks for | the live secrets under a folder (`prefix`), or all of them | one secret, by its path or this organization's RRN |
+| Decided by | Cedar's `secret:list`, secret by secret; only the permitted are answered | `secret:list`, for that secret |
+| Answers | at most 200 ([`MAX_LISTED`](../crates/remote_control/src/vault.rs#L52)), with `more` when a bound left some out; never which were refused, nor how many | its metadata, or `denied` · `no_secret` |
+| Recorded | one `vault_audit` row a call: op `list`, `listed N of M`, no request | one row: op `describe`, allow or deny, with the request a replay decides again |
+
+The toolbelt (FR-90 P1a, [`hive.md`](hive.md) §4) offers the two tools only
+where the device takes leases: its owner's `vault_enabled` on, a build with
+`vault`, the primary connection
+([`daemon_vault`](../agents/roomlerd/src/hive/toolbelt.rs#L274)). Wherever it
+offers them, the session's settings allow them (`permissions.allow`,
+[`launch.rs:410`](../crates/hive-node/src/launch.rs#L410)), so no person is
+asked to approve each one: they only read, and their gate is the vault's own
+policy, decided and recorded by the server. A call the harness cancels gets
+no answer, and the daemon stops waiting for it.
+
+> [!IMPORTANT]
+> - **Listing is its own permission.** A role allowed to use a secret lists
+>   nothing until a policy lets it list, and listing uses nothing: neither
+>   action implies the other (§7). Neither guardrail stops a listing.
+> - **A listing never says what it left out**, only that a bound did
+>   (`more`). A narrower prefix finds the rest.
+> - **Believed exactly as a lease is**: the same identity checks in the same
+>   order, the same refusal words and the same per-session ceiling
+>   ([`identify`](../crates/modules/vault/src/lease.rs#L498)), so a device that
+>   floods the vault with listings is refused as one flooding it with leases
+>   is.
+> - **Offered and allowed together.** The daemon decides once, at a run's
+>   launch, whether its toolbelt offers the tools, and writes the settings'
+>   allow from the same answer
+>   ([`supervisor.rs:4188`](../agents/roomlerd/src/hive/supervisor.rs#L4188)).
+>   It records whether the primary connection takes leases before it resumes
+>   any run ([`signaling.rs:1617`](../agents/roomlerd/src/signaling.rs#L1617)).
+
+| Piece | Where |
+|---|---|
+| the frames | `rc:vault.list` · `rc:vault.describe` ([`signaling.rs:1262`](../crates/remote_control/src/signaling.rs#L1262)) and `rc:vault.listed` · `rc:vault.described` ([`:4034`](../crates/remote_control/src/signaling.rs#L4034)); refusals reuse `rc:vault.refused` |
+| the decisions | `list` and `describe` ([`meta.rs:105`](../crates/modules/vault/src/meta.rs#L105)); `secret:list` in [`policy.cedarschema`](../crates/modules/vault/src/policy.cedarschema) and `Ask::ListSecret` ([`policy.rs:345`](../crates/modules/vault/src/policy.rs#L345)) |
+| the daemon's asks | `Client::list` and `Client::describe` ([`vault.rs:334`](../agents/roomlerd/src/vault.rs#L334)) |
+| the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:569`](../agents/roomlerd/src/hive/toolbelt.rs#L569)), answered by `vault_tool` ([`toolbelt.rs:603`](../agents/roomlerd/src/hive/toolbelt.rs#L603)) |
+
+## 14. Audit
 
 `vault_audit` holds every `secret:*` and `vault:verify` decision, allow and
 deny. Each row has the principal (`user` in P3-1), the action as a policy
@@ -628,8 +707,12 @@ decision decided, and a `target` of `lease:<id>` on an allow, or of
 `asked:<name>` when the name resolved to no secret. P3-3c adds every
 revocation (§11): op `revoke`, decision `revoke`, principal `vault`, the
 reason word, and a `target` of `lease:<id>`; one row per lease, written by the
-pod whose compare-and-set took it back. Rows expire after 90 days, like the
-other audits.
+pod whose compare-and-set took it back. P3-4b adds every `secret:list` (§13),
+principal `session`: op `describe`, allow or deny, with the secret and the
+request a replay decides again; op `list`, one row a call, the reason
+`listed N of M` and a `target` of `asked:<prefix>` (`asked:*` for all), with
+no request, since an aggregate is not a decision a replay could make again.
+Rows expire after 90 days, like the other audits.
 
 - **An allow is recorded before it is acted on, and fails closed.** A decision
   the vault cannot record is answered 500 and not acted on.
@@ -643,7 +726,7 @@ other audits.
   that may be compromised. From P3-4d it goes to `vault_activity`, never here,
   as `ssh_audit` and `ssh_activity` are kept apart.
 
-## 14. Collections
+## 15. Collections
 
 | Collection | One row per | Indexes | Retention |
 |---|---|---|---|
@@ -655,13 +738,13 @@ other audits.
 | `vault_leases` | value released (P3-3b): the secret, field and version; the session, its fence, its owner and its device; the key it was sealed to (`sealed_to`); the mode and audience; issued and expiry times; `revoked_at`/`revoked_why` from P3-3c (§11). Never the value | `(tenant_id, session_id)`; P3-3c `(device_id, expires_at)` (a pod's checks, a hello) and `(secret_id, expires_at)` (a change to a secret) | a week past `expires_at` (TTL); the decision stays in `vault_audit` for 90 days |
 
 P3-3a adds no collection: a device's key is a field on fleet's `agents` row
-(`vault_key`, §9).
+(`vault_key`, §9). Neither do P3-4a and P3-4b: a lease the daemon holds lives
+in its memory (§12), and a listing is a decision recorded in `vault_audit`.
 
-## 15. What comes next
+## 16. What comes next
 
 | Step | Builds |
 |---|---|
-| P3-4b | the toolbelt's metadata tools: `vault_list` and `vault_describe` for a session, decided by Cedar's `secret:list` |
 | P3-4c | the toolbelt's use tools: `vault_request`, `vault_exec` (one command with values in its environment, output scrubbed, `argv[0]` on the secret's `exec_allow`) and `vault_render` (a template into the session's secrets directory) |
 | P3-4d | `vault_activity`: the device's own report of using a value, a claim kept apart from `vault_audit` |
 | P3-4e | the approval card a policy can ask for |

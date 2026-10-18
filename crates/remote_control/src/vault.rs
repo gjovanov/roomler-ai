@@ -47,6 +47,36 @@ pub mod lease_limits {
     /// P3-3c — the leases one `rc:vault.revoke` names at most; more go in
     /// further frames.
     pub const MAX_REVOKE_IDS: usize = 64;
+    /// P3-4b — the secrets one `rc:vault.listed` names at most; past it the
+    /// answer says there is `more`, and a narrower prefix finds the rest.
+    pub const MAX_LISTED: usize = 200;
+}
+
+/// P3-4b — what a session is told of a secret: its name and its rules, never
+/// a value, nor a version's number, nor who wrote it.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct VaultSecretMeta {
+    /// `rrn:{org}:secret:{path}`: the handle a session's tools name it by.
+    pub rrn: String,
+    pub path: String,
+    /// `static` · `structured`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// The fields that hold a value: `value` for a static secret.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+    /// Where a value may be presented.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audiences: Vec<String>,
+    /// The programs a value may be handed to, as `argv[0]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exec_allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// A disabled secret is never used: its lease would be refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
 }
 
 /// Why the vault refused a lease. The words are a compatibility surface: a

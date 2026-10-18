@@ -166,7 +166,7 @@ envelope relay, an extension host inside `roomlerd`, an import-map SPA loader â€
 Hive outside core. FR-69 provides each of those already: modules mount behind one
 `Module` contract (`crates/core/src/module.rs:23`), the SPA gates on
 `/api/capabilities` (`ui/src/stores/capabilities.ts:30`), every wire variant names its
-owner (`crates/remote_control/src/signaling.rs:1638`), and an unmounted module answers
+owner (`crates/remote_control/src/signaling.rs:1665`), and an unmounted module answers
 503 (`docs/modular-monolith.md`). Hive becomes three modules:
 
 ```mermaid
@@ -949,7 +949,7 @@ field:
 ### 7.3 `ssh` by default, `exec` by exception
 
 `fleet_exec` runs as SYSTEM/root on the target â€” fleet RPC always uses
-`RunAs::Daemon` (`agents/roomlerd/src/signaling.rs:4164`) and run-as-user is explicitly
+`RunAs::Daemon` (`agents/roomlerd/src/signaling.rs:4170`) and run-as-user is explicitly
 deferred (`docs/fleet-rpc.md:197`). So agents get `ssh_run`, which runs as whatever
 account the **target** maps under SSH's gates and single-use grants, and `fleet_exec`
 only with a policy permit **and** a person's approval on each call. Both keep every gate

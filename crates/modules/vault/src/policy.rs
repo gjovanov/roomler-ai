@@ -49,9 +49,11 @@ pub fn schema() -> &'static Schema {
 pub const NS: &str = "Roomler";
 
 /// The actions a policy may name, as the wire and the audit spell them.
-pub const ACTIONS: &[&str] = &[ACTION_ASSUME, ACTION_USE];
+pub const ACTIONS: &[&str] = &[ACTION_ASSUME, ACTION_USE, ACTION_LIST];
 pub const ACTION_ASSUME: &str = "role:assume";
 pub const ACTION_USE: &str = "secret:use";
+/// P3-4b — a session listing or describing a secret.
+pub const ACTION_LIST: &str = "secret:list";
 
 /// The modes a session may ask a secret in (design §8.5). `raw` is not one:
 /// it is a person's `secret:read`, never a session's use.
@@ -339,6 +341,12 @@ pub enum Ask {
         device: DeviceFacts,
         approver: Option<ObjectId>,
     },
+    /// P3-4b — `secret:list`: may `session` list or describe `secret`?
+    ListSecret {
+        session: SessionFacts,
+        secret: SecretFacts,
+        device: DeviceFacts,
+    },
 }
 
 fn uid(ty: &str, id: &str) -> Value {
@@ -358,6 +366,43 @@ fn strings(a: &bson::Array) -> Option<Vec<String>> {
     a.iter().map(|b| b.as_str().map(String::from)).collect()
 }
 
+/// The session, in the role it assumed, and the secret, in its folders: the
+/// principal, the resource and the entities a `secret:*` request is decided
+/// over.
+fn session_and_secret(session: &SessionFacts, secret: &SecretFacts) -> (Value, Value, Vec<Value>) {
+    let session_uid = uid("Session", &session.id);
+    let mut attrs = json!({ "owner": user_ref(session.owner) });
+    if let Some(p) = &session.playbook {
+        attrs["playbook"] = json!(p);
+    }
+    let parents: Vec<Value> = session.role.iter().map(|r| uid("Role", r)).collect();
+    let mut entities = vec![json!({ "uid": session_uid, "attrs": attrs, "parents": parents })];
+    if let Some(r) = &session.role {
+        entities.push(json!({ "uid": uid("Role", r), "attrs": {}, "parents": [] }));
+    }
+    let chain = folders(&secret.path);
+    let secret_uid = uid("Secret", &format!("{}{}", secret.prefix, secret.path));
+    entities.push(json!({
+        "uid": secret_uid,
+        "attrs": { "path": secret.path, "kind": secret.kind, "tags": secret.tags },
+        "parents": chain.first()
+            .map(|f| vec![uid("SecretFolder", &format!("{}{f}", secret.prefix))])
+            .unwrap_or_default(),
+    }));
+    for (i, f) in chain.iter().enumerate() {
+        let parents: Vec<Value> = chain
+            .get(i + 1)
+            .map(|up| vec![uid("SecretFolder", &format!("{}{up}", secret.prefix))])
+            .unwrap_or_default();
+        entities.push(json!({
+            "uid": uid("SecretFolder", &format!("{}{f}", secret.prefix)),
+            "attrs": {},
+            "parents": parents,
+        }));
+    }
+    (session_uid, secret_uid, entities)
+}
+
 /// The folders above a path, innermost first: `a/b/c` → `a/b`, `a`.
 fn folders(path: &str) -> Vec<&str> {
     let mut out = Vec::new();
@@ -375,6 +420,7 @@ impl Ask {
         match self {
             Self::AssumeRole { .. } => ACTION_ASSUME,
             Self::UseSecret { .. } => ACTION_USE,
+            Self::ListSecret { .. } => ACTION_LIST,
         }
     }
 
@@ -384,6 +430,17 @@ impl Ask {
     pub fn to_doc(&self) -> bson::Document {
         let device = |d: &DeviceFacts| {
             bson::doc! { "os": &d.os, "tags": &d.tags, "owner": d.owner }
+        };
+        let session_doc = |s: &SessionFacts| {
+            bson::doc! {
+                "id": &s.id,
+                "owner": s.owner,
+                "role": s.role.clone(),
+                "playbook": s.playbook.clone(),
+            }
+        };
+        let secret_doc = |r: &SecretFacts| {
+            bson::doc! { "prefix": &r.prefix, "path": &r.path, "kind": &r.kind, "tags": &r.tags }
         };
         match self {
             Self::AssumeRole {
@@ -409,18 +466,8 @@ impl Ask {
             } => {
                 let mut doc = bson::doc! {
                     "action": ACTION_USE,
-                    "session": {
-                        "id": &session.id,
-                        "owner": session.owner,
-                        "role": session.role.clone(),
-                        "playbook": session.playbook.clone(),
-                    },
-                    "secret": {
-                        "prefix": &secret.prefix,
-                        "path": &secret.path,
-                        "kind": &secret.kind,
-                        "tags": &secret.tags,
-                    },
+                    "session": session_doc(session),
+                    "secret": secret_doc(secret),
                     "mode": mode,
                     "audience": audience,
                     "ttl_s": *ttl_s,
@@ -431,6 +478,16 @@ impl Ask {
                 }
                 doc
             }
+            Self::ListSecret {
+                session,
+                secret,
+                device: d,
+            } => bson::doc! {
+                "action": ACTION_LIST,
+                "session": session_doc(session),
+                "secret": secret_doc(secret),
+                "device": device(d),
+            },
         }
     }
 
@@ -444,6 +501,22 @@ impl Ask {
                 owner: d.get_object_id("owner").ok()?,
             })
         };
+        let session = |s: &bson::Document| -> Option<SessionFacts> {
+            Some(SessionFacts {
+                id: s.get_str("id").ok()?.to_string(),
+                owner: s.get_object_id("owner").ok()?,
+                role: s.get_str("role").ok().map(String::from),
+                playbook: s.get_str("playbook").ok().map(String::from),
+            })
+        };
+        let secret = |r: &bson::Document| -> Option<SecretFacts> {
+            Some(SecretFacts {
+                prefix: r.get_str("prefix").ok()?.to_string(),
+                path: r.get_str("path").ok()?.to_string(),
+                kind: r.get_str("kind").ok()?.to_string(),
+                tags: strings(r.get_array("tags").ok()?)?,
+            })
+        };
         match doc.get_str("action").ok()? {
             ACTION_ASSUME => Some(Self::AssumeRole {
                 user: doc.get_object_id("user").ok()?,
@@ -451,29 +524,20 @@ impl Ask {
                 role: doc.get_str("role").ok()?.to_string(),
                 device: device(doc.get_document("device").ok()?)?,
             }),
-            ACTION_USE => {
-                let s = doc.get_document("session").ok()?;
-                let r = doc.get_document("secret").ok()?;
-                Some(Self::UseSecret {
-                    session: SessionFacts {
-                        id: s.get_str("id").ok()?.to_string(),
-                        owner: s.get_object_id("owner").ok()?,
-                        role: s.get_str("role").ok().map(String::from),
-                        playbook: s.get_str("playbook").ok().map(String::from),
-                    },
-                    secret: SecretFacts {
-                        prefix: r.get_str("prefix").ok()?.to_string(),
-                        path: r.get_str("path").ok()?.to_string(),
-                        kind: r.get_str("kind").ok()?.to_string(),
-                        tags: strings(r.get_array("tags").ok()?)?,
-                    },
-                    mode: doc.get_str("mode").ok()?.to_string(),
-                    audience: doc.get_str("audience").ok()?.to_string(),
-                    ttl_s: doc.get_i64("ttl_s").ok()?,
-                    device: device(doc.get_document("device").ok()?)?,
-                    approver: doc.get_object_id("approver").ok(),
-                })
-            }
+            ACTION_USE => Some(Self::UseSecret {
+                session: session(doc.get_document("session").ok()?)?,
+                secret: secret(doc.get_document("secret").ok()?)?,
+                mode: doc.get_str("mode").ok()?.to_string(),
+                audience: doc.get_str("audience").ok()?.to_string(),
+                ttl_s: doc.get_i64("ttl_s").ok()?,
+                device: device(doc.get_document("device").ok()?)?,
+                approver: doc.get_object_id("approver").ok(),
+            }),
+            ACTION_LIST => Some(Self::ListSecret {
+                session: session(doc.get_document("session").ok()?)?,
+                secret: secret(doc.get_document("secret").ok()?)?,
+                device: device(doc.get_document("device").ok()?)?,
+            }),
             _ => None,
         }
     }
@@ -516,37 +580,7 @@ impl Ask {
                 device,
                 approver,
             } => {
-                let session_uid = uid("Session", &session.id);
-                let mut attrs = json!({ "owner": user_ref(session.owner) });
-                if let Some(p) = &session.playbook {
-                    attrs["playbook"] = json!(p);
-                }
-                let parents: Vec<Value> = session.role.iter().map(|r| uid("Role", r)).collect();
-                let mut entities =
-                    vec![json!({ "uid": session_uid, "attrs": attrs, "parents": parents })];
-                if let Some(r) = &session.role {
-                    entities.push(json!({ "uid": uid("Role", r), "attrs": {}, "parents": [] }));
-                }
-                let chain = folders(&secret.path);
-                let secret_uid = uid("Secret", &format!("{}{}", secret.prefix, secret.path));
-                entities.push(json!({
-                    "uid": secret_uid,
-                    "attrs": { "path": secret.path, "kind": secret.kind, "tags": secret.tags },
-                    "parents": chain.first()
-                        .map(|f| vec![uid("SecretFolder", &format!("{}{f}", secret.prefix))])
-                        .unwrap_or_default(),
-                }));
-                for (i, f) in chain.iter().enumerate() {
-                    let parents: Vec<Value> = chain
-                        .get(i + 1)
-                        .map(|up| vec![uid("SecretFolder", &format!("{}{up}", secret.prefix))])
-                        .unwrap_or_default();
-                    entities.push(json!({
-                        "uid": uid("SecretFolder", &format!("{}{f}", secret.prefix)),
-                        "attrs": {},
-                        "parents": parents,
-                    }));
-                }
+                let (session_uid, secret_uid, entities) = session_and_secret(session, secret);
                 let mut context = json!({
                     "mode": mode,
                     "audience": audience,
@@ -557,6 +591,19 @@ impl Ask {
                     context["approval"] = json!({ "approver": user_ref(*a) });
                 }
                 (session_uid, secret_uid, entities, context)
+            }
+            Self::ListSecret {
+                session,
+                secret,
+                device,
+            } => {
+                let (session_uid, secret_uid, entities) = session_and_secret(session, secret);
+                (
+                    session_uid,
+                    secret_uid,
+                    entities,
+                    json!({ "device": device.json() }),
+                )
             }
         };
         let principal = parse_uid(&principal)?;
@@ -659,6 +706,28 @@ mod tests {
             approver: None,
         }
     }
+
+    fn list_secret(role: Option<&str>, path: &str, os: &str) -> Ask {
+        Ask::ListSecret {
+            session: SessionFacts {
+                id: ObjectId::new().to_hex(),
+                owner: ObjectId::new(),
+                role: role.map(String::from),
+                playbook: None,
+            },
+            secret: SecretFacts {
+                prefix: ORG.into(),
+                path: path.into(),
+                kind: "static".into(),
+                tags: Vec::new(),
+            },
+            device: device(os, &[]),
+        }
+    }
+
+    const DEV_LISTS_STAGING: &str = r#"permit (principal in Roomler::Role::"dev",
+        action == Roomler::Action::"secret:list",
+        resource in Roomler::SecretFolder::"rrn:grox:secret:staging");"#;
 
     fn set_with(policies: &[&str]) -> PolicySet {
         policy_set(
@@ -936,6 +1005,47 @@ mod tests {
         assert!(folders("a").is_empty());
     }
 
+    /// P3-4b — listing is its own permission: a role allowed to use a secret
+    /// lists nothing until a policy lets it list, and listing uses nothing.
+    #[test]
+    fn a_list_permit_is_its_own_and_neither_implies_the_other() {
+        let uses = set_with(&[DEV_STAGING]);
+        assert!(
+            !decide(&uses, &list_secret(Some("dev"), "staging/db", "linux")).allow,
+            "a use permit lists nothing"
+        );
+        let lists = set_with(&[DEV_LISTS_STAGING]);
+        let ok = decide(
+            &lists,
+            &list_secret(Some("dev"), "staging/db/main", "linux"),
+        );
+        assert!(ok.allow, "{ok:?}");
+        assert_eq!(ok.determining, ["policy:0"]);
+        for ask in [
+            list_secret(Some("dev"), "prod/db", "linux"),
+            list_secret(Some("deployer"), "staging/db", "linux"),
+            list_secret(None, "staging/db", "linux"),
+            use_secret(Some("dev"), "staging/db", &[], "proxy", "linux"),
+        ] {
+            assert!(!decide(&lists, &ask).allow, "{ask:?}");
+        }
+    }
+
+    /// P3-4b — the guardrails are about using a value: neither stops a
+    /// listing, on Windows or of a production secret.
+    #[test]
+    fn no_guardrail_stops_a_listing() {
+        let any = r#"permit (principal, action == Roomler::Action::"secret:list", resource);"#;
+        let set = set_with(&[any]);
+        for ask in [
+            list_secret(Some("dev"), "staging/db", "windows"),
+            list_secret(Some("dev"), "prod/db", "linux"),
+        ] {
+            let v = decide(&set, &ask);
+            assert!(v.allow && v.errors.is_empty(), "{ask:?} {v:?}");
+        }
+    }
+
     #[test]
     fn a_recorded_request_reads_back_as_it_was_decided() {
         // P3-2b — a replay decides exactly what was decided: every fact the
@@ -954,7 +1064,13 @@ mod tests {
             *approver = Some(ObjectId::new());
             session.playbook = Some("deploy-prod".into());
         }
-        for ask in [assume, used, use_secret(None, "x", &[], "env", "linux")] {
+        let listed = list_secret(Some("dev"), "staging/db", "windows");
+        for ask in [
+            assume,
+            used,
+            use_secret(None, "x", &[], "env", "linux"),
+            listed,
+        ] {
             let back = Ask::from_doc(&ask.to_doc()).expect("reads back");
             assert_eq!(format!("{back:?}"), format!("{ask:?}"));
             // And decides alike.

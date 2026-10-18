@@ -38,16 +38,30 @@ fn belt(timing: Timing) -> Belt {
 }
 
 fn belt_for(peer: PeerId, timing: Timing) -> Belt {
+    belt_running(peer, run(), timing)
+}
+
+/// P3-4b — a toolbelt serving `run`.
+fn belt_running(peer: PeerId, run: Run, timing: Timing) -> Belt {
     let dir = tempfile::tempdir().unwrap();
     let (tx, events) = mpsc::channel(64);
     #[cfg(unix)]
-    let toolbelt = open(dir.path(), None, peer, ObjectId::new(), tx, timing).unwrap();
+    let toolbelt = open(dir.path(), None, peer, run, tx, timing).unwrap();
     #[cfg(windows)]
-    let toolbelt = open(peer, ObjectId::new(), tx, timing).unwrap();
+    let toolbelt = open(peer, run, tx, timing).unwrap();
     Belt {
         _dir: dir,
         toolbelt,
         events,
+    }
+}
+
+/// A run on a device that takes no leases: no vault tools.
+fn run() -> Run {
+    Run {
+        session: ObjectId::new(),
+        fence: 1,
+        vault: None,
     }
 }
 
@@ -422,13 +436,234 @@ async fn the_socket_is_the_sessions_alone() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("toolbelt.sock"), b"not a socket").unwrap();
     let (tx, _rx) = mpsc::channel(4);
-    let refused = open(dir.path(), None, me(), ObjectId::new(), tx.clone(), quick());
+    let refused = open(dir.path(), None, me(), run(), tx.clone(), quick());
     assert!(refused.is_err(), "a file in the socket's place is refused");
     std::fs::remove_file(dir.path().join("toolbelt.sock")).unwrap();
-    let first = open(dir.path(), None, me(), ObjectId::new(), tx.clone(), quick()).unwrap();
+    let first = open(dir.path(), None, me(), run(), tx.clone(), quick()).unwrap();
     std::mem::forget(first); // leaves a stale socket, as a crash would
-    let again = open(dir.path(), None, me(), ObjectId::new(), tx, quick());
+    let again = open(dir.path(), None, me(), run(), tx, quick());
     assert!(again.is_ok(), "a stale socket is replaced");
+}
+
+/// P3-4b — a vault that answers as told and records what it was asked; with
+/// `hold`, each answer waits until the test releases it.
+#[derive(Default)]
+struct FakeVault {
+    asked: std::sync::Mutex<Vec<(String, ObjectId, u64, String)>>,
+    hold: Option<tokio::sync::Notify>,
+}
+
+impl FakeVault {
+    fn asked(&self) -> Vec<(String, ObjectId, u64, String)> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl VaultMeta for FakeVault {
+    async fn list(&self, session: ObjectId, fence: u64, prefix: &str) -> Result<Value, String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push(("list".into(), session, fence, prefix.into()));
+        if let Some(hold) = &self.hold {
+            hold.notified().await;
+        }
+        if prefix == "refused/" {
+            return Err("the vault refused: no_role".into());
+        }
+        Ok(json!({
+            "secrets": [{"rrn": "rrn:grox:secret:db/main", "path": "db/main", "kind": "static"}],
+            "more": false,
+        }))
+    }
+
+    async fn describe(&self, session: ObjectId, fence: u64, secret: &str) -> Result<Value, String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push(("describe".into(), session, fence, secret.into()));
+        Ok(json!({"rrn": format!("rrn:grox:secret:{secret}"), "path": secret, "kind": "static"}))
+    }
+}
+
+/// A `tools/call` of one of the toolbelt's own tools, as Claude Code sends it.
+fn tool_call(id: u64, name: &str, arguments: Value) -> Value {
+    json!({
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments, "_meta": {"claudecode/toolUseId": "toolu_01FAKE"}},
+        "jsonrpc": "2.0",
+        "id": id,
+    })
+}
+
+/// P3-4b — the vault tools are offered where the device takes leases, and
+/// nowhere else: elsewhere they are unknown tools. Their settings names are
+/// the names offered, under the `roomler` server.
+#[tokio::test]
+async fn the_vault_tools_are_offered_only_where_the_device_takes_leases() {
+    let without = belt(quick());
+    let mut c = Client::connect(&without).await;
+    c.send(json!({"method": "tools/list", "jsonrpc": "2.0", "id": 1}))
+        .await;
+    let names: Vec<Value> = c.recv().await["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].clone())
+        .collect();
+    assert_eq!(names, [json!("approve")]);
+    c.send(tool_call(2, "vault_list", json!({}))).await;
+    assert_eq!(c.recv().await["error"]["code"], -32602, "not offered here");
+
+    let vault = Arc::new(FakeVault::default());
+    let with = belt_running(
+        me(),
+        Run {
+            session: ObjectId::new(),
+            fence: 1,
+            vault: Some(vault.clone()),
+        },
+        quick(),
+    );
+    let mut c = Client::connect(&with).await;
+    c.send(json!({"method": "tools/list", "jsonrpc": "2.0", "id": 1}))
+        .await;
+    let list = c.recv().await;
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["approve", "vault_list", "vault_describe"]);
+    for t in &tools[1..] {
+        assert_eq!(t["annotations"]["readOnlyHint"], true, "{t}");
+    }
+    assert_eq!(
+        tools[2]["inputSchema"]["required"],
+        json!(["secret"]),
+        "{list}"
+    );
+    let named: Vec<String> = VAULT_TOOL_NAMES
+        .iter()
+        .map(|n| format!("mcp__roomler__{n}"))
+        .collect();
+    assert_eq!(
+        named, VAULT_TOOLS,
+        "what the settings allow is what is offered"
+    );
+    assert!(
+        vault.asked().is_empty(),
+        "listing the tools asks the vault nothing"
+    );
+}
+
+/// P3-4b — a vault tool answers what the vault says for the session's run
+/// (its session and its fence), as text, or why not, as an error; nothing
+/// asks a person, and a call without its argument asks the vault nothing.
+#[tokio::test]
+async fn a_vault_tool_answers_what_the_vault_says_for_the_sessions_run() {
+    let vault = Arc::new(FakeVault::default());
+    let sid = ObjectId::new();
+    let mut b = belt_running(
+        me(),
+        Run {
+            session: sid,
+            fence: 7,
+            vault: Some(vault.clone()),
+        },
+        quick(),
+    );
+    let mut c = Client::connect(&b).await;
+    c.send(tool_call(1, "vault_list", json!({"prefix": "db/"})))
+        .await;
+    let listed = c.recv().await;
+    assert_eq!(listed["id"], 1);
+    assert!(listed["result"].get("isError").is_none(), "{listed}");
+    let text: Value =
+        serde_json::from_str(listed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["secrets"][0]["path"], "db/main");
+    assert_eq!(text["more"], false);
+
+    c.send(tool_call(2, "vault_describe", json!({"secret": "db/main"})))
+        .await;
+    let described = c.recv().await;
+    let text: Value =
+        serde_json::from_str(described["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["rrn"], "rrn:grox:secret:db/main");
+
+    c.send(tool_call(3, "vault_describe", json!({}))).await;
+    let missing = c.recv().await;
+    assert_eq!(missing["result"]["isError"], true, "{missing}");
+    assert!(
+        missing["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("secret is required")
+    );
+
+    c.send(tool_call(4, "vault_list", json!({"prefix": "refused/"})))
+        .await;
+    let refused = c.recv().await;
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert_eq!(
+        refused["result"]["content"][0]["text"],
+        "the vault refused: no_role"
+    );
+
+    assert_eq!(
+        vault.asked(),
+        [
+            ("list".to_string(), sid, 7, "db/".to_string()),
+            ("describe".to_string(), sid, 7, "db/main".to_string()),
+            ("list".to_string(), sid, 7, "refused/".to_string()),
+        ]
+    );
+    assert!(
+        b.events.try_recv().is_err(),
+        "a vault tool opens no approval"
+    );
+}
+
+/// P3-4b — a vault call the harness cancels gets no answer, as MCP asks,
+/// and the next one is answered as usual.
+#[tokio::test]
+async fn a_cancelled_vault_call_gets_no_answer() {
+    let vault = Arc::new(FakeVault {
+        hold: Some(tokio::sync::Notify::new()),
+        ..FakeVault::default()
+    });
+    let b = belt_running(
+        me(),
+        Run {
+            session: ObjectId::new(),
+            fence: 1,
+            vault: Some(vault.clone()),
+        },
+        quick(),
+    );
+    let mut c = Client::connect(&b).await;
+    c.send(tool_call(5, "vault_list", json!({}))).await;
+    tokio::time::timeout(WAIT, async {
+        while vault.asked().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the call reached the vault");
+    c.send(json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 5, "reason": "interrupted"}}))
+        .await;
+    c.send(json!({"jsonrpc": "2.0", "id": 6, "method": "ping"}))
+        .await;
+    assert_eq!(
+        c.recv().await["id"],
+        6,
+        "nothing answers the cancelled call"
+    );
+    // Released now: had the call outlived its cancellation, it would answer
+    // here, and the next call would wait forever for a release.
+    vault.hold.as_ref().unwrap().notify_one();
+    c.send(tool_call(7, "vault_list", json!({}))).await;
+    let next = c.recv().await;
+    assert_eq!(next["id"], 7, "{next}");
+    assert_eq!(vault.asked().len(), 2);
 }
 
 /// More open approvals than Claude Code ever asks for, and a question the
