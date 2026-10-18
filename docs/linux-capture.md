@@ -445,7 +445,9 @@ flowchart TD
 ⚠️ **The guard knows a lock only by `LockedHint`, so an X11 desktop must
 report it (D4).** GNOME Shell sets it on Xorg as on Wayland, and KDE's
 `ksmserver` drives kscreenlocker, which sets it. Most other X11 lockers do
-not: xscreensaver, i3lock, slock, older xfce4-screensaver. With one of
+not: xscreensaver, i3lock, slock, and xfce4-screensaver (measured on
+Ubuntu 24.04's 4.18.3: `LockedHint` stayed `no` through
+`loginctl lock-session`). With one of
 those, the guard would read the lock screen, and the automatic `uinput`
 would type into its password field. So the X11 half switches on only where
 `gnome-shell` or `ksmserver` runs as the person (`lock_reporting_shell`,
