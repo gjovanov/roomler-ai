@@ -194,6 +194,38 @@ describe('useAuthStore', () => {
     })
   })
 
+  describe('a session that arrived as a cookie (the OAuth callback)', () => {
+    it('adoptCookieSession signs in a store created signed OUT, and loads the user', async () => {
+      // After a logout the hint is gone when the page loads, so the store is
+      // created signed out. Writing only the hint (what the callback did)
+      // left this false, and `fetchMe` returned before asking the server.
+      mockApi.get.mockResolvedValueOnce(USER)
+      const store = useAuthStore()
+      expect(store.isAuthenticated).toBe(false)
+
+      await store.adoptCookieSession()
+
+      expect(store.isAuthenticated).toBe(true)
+      expect(mockApi.get).toHaveBeenCalledWith('/auth/me')
+      expect(store.user).toEqual(USER)
+      expect(localStorage.getItem(SIGNED_IN)).toBe('1')
+    })
+
+    it('forgetLocalSession signs out locally, without a server call or a navigation', () => {
+      localStorage.setItem(SIGNED_IN, '1')
+      const store = useAuthStore()
+      expect(store.isAuthenticated).toBe(true)
+
+      store.forgetLocalSession()
+
+      expect(store.isAuthenticated).toBe(false)
+      expect(store.user).toBeNull()
+      expect(localStorage.getItem(SIGNED_IN)).toBeNull()
+      expect(mockApi.post).not.toHaveBeenCalled()
+      expect(mockRouter.push).not.toHaveBeenCalled()
+    })
+  })
+
   describe('register', () => {
     it('signs in on the auto-verified path without storing a token', async () => {
       const mockUser = { id: '3', email: 'new@test.com', username: 'newuser', display_name: 'New' }

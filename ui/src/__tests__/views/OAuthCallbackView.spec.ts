@@ -13,9 +13,15 @@ import * as components from 'vuetify/components'
 import * as directives from 'vuetify/directives'
 import { createMemoryHistory, createRouter } from 'vue-router'
 
-vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ fetchMe: vi.fn(() => Promise.resolve()) }) }))
+// The store is a stub here; what the callback does to the REAL store (the
+// user menu's `isAuthenticated`) is OAuthCallbackView.session.spec.ts.
+vi.mock('@/stores/auth', () => ({
+  useAuthStore: () => ({
+    adoptCookieSession: vi.fn(() => Promise.resolve()),
+    forgetLocalSession: vi.fn(),
+  }),
+}))
 vi.mock('@/stores/ws', () => ({ useWsStore: () => ({ connect: vi.fn() }) }))
-vi.mock('@/api/session', () => ({ markSignedIn: vi.fn(), clearSignedIn: vi.fn() }))
 
 import OAuthCallbackView from '@/views/auth/OAuthCallbackView.vue'
 
