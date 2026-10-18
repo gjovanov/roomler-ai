@@ -135,6 +135,10 @@ mod client {
         pub mode: String,
         pub audience: String,
         pub ttl_secs: u32,
+        /// P3-4c-3 — asked for ahead (`vault_request`): a use tool asking
+        /// for the same secret, mode and audience takes it, and no call lets
+        /// it go. It ends at its expiry, its revocation or the run's end.
+        pub ahead: bool,
     }
 
     /// A lease this daemon holds: what it is, never its value.
@@ -147,6 +151,9 @@ mod client {
         pub field: String,
         pub n: i64,
         pub mode: String,
+        /// P3-4c-3 — what it was asked for toward, and whether ahead.
+        pub audience: String,
+        pub ahead: bool,
         /// When the server says it ends, in milliseconds of its clock.
         pub expires_at_ms: i64,
     }
@@ -440,6 +447,8 @@ mod client {
                 field: ask.field,
                 n,
                 mode: ask.mode,
+                audience: ask.audience,
+                ahead: ask.ahead,
                 expires_at_ms,
             };
             lock(&self.held).insert(
@@ -516,6 +525,39 @@ mod client {
                 }
                 None => false,
             }
+        }
+
+        /// P3-4c-3 — a lease asked for ahead for `ask`'s run, secret, field,
+        /// mode and audience, with at least `at_least` left: the one held
+        /// longest. A lease a call asked for itself is never found: that
+        /// call lets it go when it ends. (`ask.ttl_secs` and `ask.ahead` are
+        /// not read.)
+        pub fn find_ahead(&self, ask: &LeaseAsk, at_least: Duration) -> Option<String> {
+            self.prune();
+            let now = Instant::now();
+            lock(&self.held)
+                .iter()
+                .filter(|(_, h)| {
+                    let i = &h.info;
+                    i.ahead
+                        && i.session_id == ask.session_id
+                        && i.fence == ask.fence
+                        && i.secret == ask.secret
+                        && i.field == ask.field
+                        && i.mode == ask.mode
+                        && i.audience == ask.audience
+                        && h.until.saturating_duration_since(now) >= at_least
+                })
+                .max_by_key(|(_, h)| h.until)
+                .map(|(id, _)| id.clone())
+        }
+
+        /// P3-4c-3 — how long a held lease has left by this daemon's clock.
+        pub fn left(&self, lease_id: &str) -> Option<Duration> {
+            let now = Instant::now();
+            lock(&self.held)
+                .get(lease_id)
+                .map(|h| h.until.saturating_duration_since(now))
         }
 
         /// The run of `session` at `fence` ended here: its leases go with it.
@@ -749,6 +791,7 @@ mod tests {
                 mode: "env".into(),
                 audience: String::new(),
                 ttl_secs: 60,
+                ahead: false,
             }
         }
 
@@ -1111,6 +1154,73 @@ mod tests {
                 !c.attach("gone", &dir.path().join("never")),
                 "a lease not held takes no file"
             );
+        }
+
+        /// P3-4c-3 — a lease asked for ahead is found only for exactly what
+        /// it was asked for, while it has the time a call needs, and a lease
+        /// a call asked for itself is never found.
+        #[tokio::test]
+        async fn a_lease_asked_for_ahead_is_found_only_for_what_it_was_asked_for() {
+            let (c, mut rx) = connected();
+            let sid = ObjectId::new();
+            let exec_for = |audience: &str, ahead: bool| LeaseAsk {
+                mode: "exec".into(),
+                audience: audience.into(),
+                ahead,
+                ..ask(sid, 1)
+            };
+            for (id, ahead, ms) in [("A", true, 60_000), ("B", false, 120_000)] {
+                let asker = {
+                    let (c, a) = (c.clone(), exec_for("psql", ahead));
+                    tokio::spawn(async move { c.request(a).await })
+                };
+                let req_id = req_id_of(rx.recv().await.unwrap());
+                c.on_leased(&req_id, id, 1, &sealed_for_us(b"v"), in_ms(ms));
+                asker.await.unwrap().unwrap();
+            }
+            let held = c.held();
+            let a = held.iter().find(|i| i.lease_id == "A").unwrap();
+            assert_eq!((a.audience.as_str(), a.ahead), ("psql", true));
+            let soon = Duration::from_secs(10);
+            assert_eq!(
+                c.find_ahead(&exec_for("psql", false), soon).as_deref(),
+                Some("A"),
+                "the one asked for ahead, never B, which a call asked for itself"
+            );
+            assert!(c.left("A").unwrap() > Duration::from_secs(50));
+            let elsewhere = [
+                exec_for("kubectl", true),
+                LeaseAsk {
+                    mode: "file".into(),
+                    ..exec_for("psql", true)
+                },
+                LeaseAsk {
+                    field: "password".into(),
+                    ..exec_for("psql", true)
+                },
+                LeaseAsk {
+                    fence: 2,
+                    ..exec_for("psql", true)
+                },
+                LeaseAsk {
+                    session_id: ObjectId::new(),
+                    ..exec_for("psql", true)
+                },
+                LeaseAsk {
+                    secret: "db/other".into(),
+                    ..exec_for("psql", true)
+                },
+            ];
+            for other in elsewhere {
+                assert_eq!(c.find_ahead(&other, soon), None, "{other:?}");
+            }
+            assert_eq!(
+                c.find_ahead(&exec_for("psql", true), Duration::from_secs(120)),
+                None,
+                "a lease ending before the call would is not taken"
+            );
+            c.drop_run(sid, 1);
+            assert_eq!(c.find_ahead(&exec_for("psql", true), soon), None);
         }
 
         /// A lease is let go at its expiry, and held no longer than the

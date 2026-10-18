@@ -103,6 +103,10 @@ mod vault_exec;
 /// vault into the session's secrets directory.
 #[cfg(feature = "vault")]
 mod vault_render;
+/// FR-90 P3-4c-3 — `vault_request`: a lease asked for ahead, which a use
+/// takes.
+#[cfg(feature = "vault")]
+mod vault_request;
 pub mod view;
 mod workspace;
 

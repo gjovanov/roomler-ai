@@ -77,6 +77,17 @@ pub(crate) struct Handle {
     pub(crate) field: String,
 }
 
+/// As a call names it: `secret`, or `secret#field`.
+impl std::fmt::Display for Handle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.field.is_empty() {
+            f.write_str(&self.secret)
+        } else {
+            write!(f, "{}#{}", self.secret, self.field)
+        }
+    }
+}
+
 /// One `vault_exec` call, checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExecRequest {
@@ -424,20 +435,29 @@ pub(crate) async fn call(
     #[cfg(not(unix))]
     let path = ();
     let ttl = u32::try_from(req.timeout.as_secs() + 30).unwrap_or(u32::MAX);
-    // However the call ends, a cancelled one included: no lease outlives it.
+    // However the call ends, a cancelled one included: no lease it asked for
+    // itself outlives it.
     let mut held = Releasing {
         vault,
         leases: Vec::with_capacity(req.env.len()),
     };
+    let mut leases = Vec::with_capacity(req.env.len());
     for (name, handle) in &req.env {
+        // P3-4c-3 — a lease asked for ahead for this program, covering the
+        // command's whole run, is taken as it is: kept when the call ends.
+        if let Some(lease) = vault.ahead(session, fence, handle, "exec", &program, req.timeout) {
+            leases.push(lease);
+            continue;
+        }
         let lease = vault
             .lease(session, fence, handle, "exec", &program, ttl)
             .await
             .map_err(|why| format!("{name}: {why}"))?;
-        held.leases.push(lease);
+        held.leases.push(lease.clone());
+        leases.push(lease);
     }
-    let mut values = Vec::with_capacity(held.leases.len());
-    for ((name, _), lease) in req.env.iter().zip(&held.leases) {
+    let mut values = Vec::with_capacity(leases.len());
+    for ((name, _), lease) in req.env.iter().zip(&leases) {
         let value = vault
             .value(lease)
             .ok_or_else(|| format!("{name}: the lease ended before the command ran"))?;
