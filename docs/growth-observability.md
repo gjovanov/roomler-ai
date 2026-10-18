@@ -1453,8 +1453,12 @@ Turning delivery on is three steps in SendGrid and one secret here:
 2. Enable **Signature Verification** on that webhook and copy the **public key** it shows into
    the cluster secret as `ROOMLER__NEWSLETTER__EVENT_WEBHOOK_PUBLIC_KEY`; roll.
 3. **Settings → Tracking**: Open Tracking and Click Tracking **off** (and Subscription Tracking
-   off — FR-58). Give the API key `ROOMLER__EMAIL__API_KEY` the `tracking_settings.read`
-   scope so the boot check can confirm it; without the scope it logs that it could not.
+   off — FR-58). In Click Tracking, also untick **"Also enable click tracking in plain text
+   emails"**. SendGrid keeps it as `enable_text: true` under a disabled toggle, and the boot check
+   counts that as on: an answer it cannot read as off never reads as reassurance
+   ([`tracking_report`, email.rs:141](../crates/services/src/email.rs)). Give the API key
+   `ROOMLER__EMAIL__API_KEY` the `tracking_settings.read` scope so the boot check can confirm it;
+   without the scope it logs that it could not.
 4. Check: the boot log says `SendGrid Event Webhook on` and `SendGrid open and click tracking
    are off`; SendGrid's "Test Your Integration" button posts a signed sample batch, which
    answers 200 with `{"events": …, "ignored": …}` (its sample events carry no `nl_issue`).
@@ -1662,6 +1666,31 @@ curl -sS -X POST "https://roomler.ai/api/admin/growth/billing/backfill?since=202
 
 A subscription created before P4 carries no `tenant_id` in its metadata; its events are
 matched through the org's stored customer and subscription ids instead.
+
+### Field-testing billing in Stripe test mode (AC13)
+
+Production holds live keys, so a test-mode lifecycle runs against a local server. On 2026-10-17
+it ran like this (FR-102 §8):
+
+1. **Catalogue.** In test mode, create prices at the list prices (Pro €8 and Business €16 per seat
+   a month), plus a coupon for the control. Give the local server their ids as
+   `ROOMLER__STRIPE__PRICE_PRO` / `…_BUSINESS`, and the test secret key as
+   `ROOMLER__STRIPE__SECRET_KEY`.
+2. **Delivery.** `stripe listen --print-secret` gives the signing secret, which goes in as
+   `ROOMLER__STRIPE__WEBHOOK_SECRET`. Then run `stripe listen --forward-to
+   <local>/api/stripe/webhook --events <the seven kinds above>`. It renders events at the account's
+   default API version (2020-03-02 here), the shape production's endpoint receives.
+3. **Time.** Put the customer on a **test clock that starts in the past**, then advance it
+   through the lifecycle. The Revenue panel never shows a month past the current one, so a clock
+   started today would put the renewal and the churn out of view.
+4. **Read** `GET /api/admin/growth/revenue` with a range covering the clock's months.
+
+> [!WARNING]
+> **A skewed local clock reads a just-paid invoice as future.** `paid_at` is Stripe's time. A server
+> whose clock runs behind reads the newest invoice as not yet paid, until its own clock passes it:
+> MRR 0 and one invoice short, for as long as the skew. The dev box was 28 s behind on 2026-10-17;
+> compare with Stripe's HTTP `Date` header before believing a missing invoice.
+
 ## The read key, the weekly roll-up and alerts (P10)
 
 The results feed (spec §3l): the numbers the Growth page shows, readable by a machine; the
@@ -1915,8 +1944,10 @@ field, or ended before the observation landed — is `unknown`, **never read as 
   channel for a supervised Mac's delegated one, so the sample carries the daemon's identity, the one
   the session row has), so a session that **outlives** the observation records its carrier whatever
   its length. Only a session that **ends before** the observation lands records `unknown`: a pair
-  was nominated, but the settle read that names the carrier never ran. Needs an agent carrying P9d
-  to take effect; before it, short sessions read `unknown`.
+  was nominated, but the settle read that names the carrier never ran. It takes effect from agent
+  **0.4.142** on; before it, short sessions read `unknown`. On production after 0.4.142's
+  publication, every one of the 16 Active sessions shorter than 30 s carried a carrier, sessions of
+  4–5 s included (FR-102 §8).
 - **The daily digest's `quality` section** adds, live from the kept rows: `requested`,
   `reached_active`, `not_reached` and `reached_share`, `duration_ms` / `peak_fps` /
   `avg_rtt_ms` as `{day, d7, d28}` of `{n, p50, p90}`, `device_days` and
