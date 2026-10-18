@@ -399,16 +399,16 @@ account, so the device owner's map, not the server's list, is the last word. To 
 session started as `bob`: `"alice@example.com" = "bob"`.
 
 Spawning reuses the one privilege path the daemon has, `RunAs` + `apply_run_as`
-(`agents/roomlerd/src/exec.rs:437,492`), which exec, the PTY, sftp and the portal helper
+(`agents/roomlerd/src/exec.rs:442,497`), which exec, the PTY, sftp and the portal helper
 already share. No second spawn path.
 
 | OS | How | Consequence |
 |---|---|---|
-| Linux, macOS | `RunAs::Named(account)`: `setgroups → setgid → setuid` in `pre_exec`, verified afterwards (`exec.rs:733-768`); uid-0 accounts refused | any mapped account, signed in or not |
+| Linux, macOS | `RunAs::Named(account)`: `setgroups → setgid → setuid` in `pre_exec`, verified afterwards (`exec.rs:738-773`); uid-0 accounts refused | any mapped account, signed in or not |
 | Windows | the console user, through `WTSQueryUserToken` + `CreateProcessAsUserW` (`agents/roomlerd/src/pty/windows.rs:690-762`) | ⚠️ only the user signed in at the console (D2). There is no S4U or `LogonUser` path, and the daemon "will not ask for" credentials (`exec.rs:503-508`). Nobody signed in ⇒ `refused: no_console_user` |
 
 Two gaps in that path: it sets no working directory and only `TERM` in the environment
-(`agents/roomlerd/src/pty/unix.rs:148`). Hive adds `current_dir(folder)` and a login
+(`agents/roomlerd/src/pty/unix.rs:150`). Hive adds `current_dir(folder)` and a login
 environment. The folder must resolve under a `hive_roots` entry after
 canonicalisation, checked as the mapped account, so a symlink out of a root is caught by
 the account that would follow it.

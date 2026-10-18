@@ -4773,6 +4773,8 @@ async fn handle_server_msg(
                 // as the daemon unless the policy named the person at the
                 // screen (FR-97 P5a, above).
                 run_as,
+                // Where it always started, or its `cwd` (FR-97 P5b is SSH's).
+                start_in_home: false,
             };
             let ind = indicator.clone();
             tokio::spawn(async move {

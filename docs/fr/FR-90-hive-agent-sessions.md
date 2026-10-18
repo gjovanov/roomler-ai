@@ -47,16 +47,16 @@ it.
   (`crates/services/src/auth/mod.rs:148-143`); the only asymmetric key signs DERP tickets
   (`crates/remote_control/src/derp_ticket.rs:91,116`); tenant cloud-storage credentials have a
   plaintext schema (`crates/db/src/models/tenant.rs:302-220`). The vault brings its own keys.
-- **The primitives exist.** One spawn-as-user path (`agents/roomlerd/src/exec.rs:437,492`); the
-  daemon's own PTY (`agents/roomlerd/src/pty/unix.rs:106-184`, ConPTY in
+- **The primitives exist.** One spawn-as-user path (`agents/roomlerd/src/exec.rs:442,497`); the
+  daemon's own PTY (`agents/roomlerd/src/pty/unix.rs:108-187`, ConPTY in
   `agents/roomlerd/src/pty/windows.rs:180-240`); the tmux model (`agents/roomlerd/src/apps/linux.rs:389-433`);
   generic consent prompts (`agents/roomlerd/src/consent.rs:174`); the stdin-secret worker attach
   (`agents/roomlerd/src/delegate.rs:16-30`); tunnel-core carriers down to DERP and data-only WebRTC
   peers (`docs/tunnels.md:61-73`); the stateless TURN-credential helper
   (`crates/remote_control/src/turn_creds.rs:46-85`).
 - **The gaps are measured, not guessed.** `RunAs` sets no working directory and only `TERM`
-  (`agents/roomlerd/src/pty/unix.rs:148`); on Windows it reaches only the console user and will not
-  ask for credentials (`agents/roomlerd/src/exec.rs:504-509`); a root daemon's LocalAPI socket is
+  (`agents/roomlerd/src/pty/unix.rs:150`); on Windows it reaches only the console user and will not
+  ask for credentials (`agents/roomlerd/src/exec.rs:509-514`); a root daemon's LocalAPI socket is
   `0600`, so a non-root process can't reach it (`crates/localapi/src/lib.rs:3005-2958`); tunnel SOCKS5
   has no authentication (`crates/tunnel-core/src/socks5.rs:3`) and a daemon-originated flow is
   attributed to the device owner (`crates/tunnel-core/src/policy.rs:29-51`); `SplitTun` intercepts one
@@ -2457,11 +2457,11 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     has. *Decided 2026-10-10 by the operator, on the recommendation: dropped, as Windows does.*
     Built, and field-verified (§8), so that a session holds none of those groups and on Linux
     cannot `sudo` at all:
-    - It holds none of the account's administrator groups (`exec.rs:1080`): root's own, the
+    - It holds none of the account's administrator groups (`exec.rs:1115`): root's own, the
       sudoers groups and those whose socket or device is root by another door (`docker`, `lxd`,
       `incus`, `libvirt`, `disk`). An account whose primary group is one is refused
-      (`exec.rs:1145`). The kernel then grants the session nothing by those groups.
-    - On Linux the harness starts with `no_new_privs` (`exec.rs:1202`), so nothing it runs gains
+      (`exec.rs:1180`). The kernel then grants the session nothing by those groups.
+    - On Linux the harness starts with `no_new_privs` (`exec.rs:1237`), so nothing it runs gains
       a privilege by exec: no `sudo`, whatever sudoers says of the account.
     - ⚠️ macOS has no such switch, and its `sudo` reads the account's groups from the directory,
       never from the process. A session there can still use any rule its account may use without

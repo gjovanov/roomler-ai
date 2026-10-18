@@ -1007,6 +1007,8 @@ mod svc {
             cwd: claimed.cwd,
             caller: claimed.caller,
             run_as,
+            // Fleet RPC: where it always started (FR-97 P5b is SSH's).
+            start_in_home: false,
         };
         let outcome = crate::exec::shared()
             .run(req, &crate::exec::redactor())

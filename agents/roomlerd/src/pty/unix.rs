@@ -99,10 +99,12 @@ fn default_shell() -> String {
 impl PtyProcess {
     /// Spawn a login shell (or `shell -c <command>`) attached to a new pty.
     ///
-    /// `run_as` goes through the same [`crate::exec::apply_run_as`] as every
-    /// other execution path, so the identity rules — and every refusal, such as
-    /// `console_user` with nobody at the screen — are identical here. There
-    /// is deliberately no separate privilege story for interactive sessions.
+    /// `run_as` goes through the same [`crate::exec::apply_run_as`] rules as
+    /// every other execution path (by [`crate::exec::apply_run_as_at_home`],
+    /// which also starts a person's shell in their home, FR-97 P5b), so the
+    /// identity rules — and every refusal, such as `console_user` with nobody
+    /// at the screen — are identical here. There is deliberately no separate
+    /// privilege story for interactive sessions.
     pub fn spawn(
         command: Option<&str>,
         term: &str,
@@ -181,7 +183,8 @@ impl PtyProcess {
             });
         }
 
-        crate::exec::apply_run_as(&mut cmd, run_as)?;
+        // FR-97 P5b — a person's shell starts in their home, as sshd's does.
+        crate::exec::apply_run_as_at_home(&mut cmd, run_as)?;
 
         let child = cmd
             .spawn()

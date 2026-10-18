@@ -1215,7 +1215,9 @@ mod sshd {
             cmd.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            if let Err(why) = crate::exec::apply_run_as(&mut cmd, &run_as) {
+            // FR-97 P5b — in the person's home, where sshd starts `sftp-server`:
+            // a client resolves every relative path against it.
+            if let Err(why) = crate::exec::apply_run_as_at_home(&mut cmd, &run_as) {
                 let _ = handle
                     .extended_data(channel, 1, format!("roomler: {why}\r\n").into_bytes())
                     .await;
@@ -2413,6 +2415,8 @@ mod sshd {
             cwd: None,
             caller: caller.clone(),
             run_as,
+            // FR-97 P5b — in the person's home, where sshd runs a command.
+            start_in_home: true,
         };
 
         let finished = if streaming {

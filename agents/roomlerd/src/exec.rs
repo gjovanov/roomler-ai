@@ -135,6 +135,11 @@ pub struct ExecRequest {
     /// macOS). Roomler SSH sets it from the device's policy.
     #[allow(dead_code)]
     pub run_as: RunAs,
+    /// FR-97 P5b — with no [`Self::cwd`], start in the account's home, as
+    /// sshd starts a session. Roomler SSH's exec channel sets it; Fleet RPC
+    /// never does, so its commands start where they always have. Only a
+    /// person's identity has a home to start in ([`apply_run_as_at_home`]).
+    pub start_in_home: bool,
 }
 
 /// What came back. Mirrors `ClientMsg::RpcResult` one-for-one.
@@ -835,12 +840,42 @@ pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Re
         // there, when that person is root, and by a daemon that is neither
         // root nor them.
         #[cfg(unix)]
-        RunAs::ConsoleUser => unix_priv::drop_to_console(cmd, &console_account()?),
+        RunAs::ConsoleUser => unix_priv::drop_to_console(cmd, &console_account()?, false),
         #[cfg(not(any(windows, unix)))]
         RunAs::ConsoleUser => {
             Err("account_mode `console_user` has no console to read on this platform".into())
         }
     }
+}
+
+/// FR-97 P5b — [`apply_run_as`] for an SSH session, which sshd starts in the
+/// account's home: a person (`named`, `console_user`) starts there, the
+/// daemon where it is, as before. The `chdir` runs in the child after the
+/// drop, as the person, so their own rights decide (a root-squashed NFS home
+/// refuses root), and a home they cannot enter leaves the child where it
+/// was, `/`, which is sshd's fallback too. Off with
+/// `ROOMLERD_SSH_START_IN_HOME=0`. Windows' `console_user` starts in the
+/// profile through its own spawn (`win_console`, `pty::windows`).
+pub(crate) fn apply_run_as_at_home(
+    cmd: &mut tokio::process::Command,
+    who: &RunAs,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    if ssh_starts_in_home() {
+        return match who {
+            RunAs::Daemon => Ok(()),
+            RunAs::Named(account) => unix_priv::drop_to_in(cmd, account, true),
+            RunAs::ConsoleUser => unix_priv::drop_to_console(cmd, &console_account()?, true),
+        };
+    }
+    apply_run_as(cmd, who)
+}
+
+/// FR-97 P5b — does a person's SSH session start in their home? Default on;
+/// `ROOMLERD_SSH_START_IN_HOME=0` keeps the old start, the daemon's own
+/// directory.
+pub(crate) fn ssh_starts_in_home() -> bool {
+    tunnel_core::env::flag("SSH_START_IN_HOME", true)
 }
 
 /// FR-97 P5a — the account of the person at this machine's screen, for
@@ -1336,12 +1371,25 @@ mod unix_priv {
     /// `CommandExt` import that `drop_to_std` needs does not affect it,
     /// because an inherent method wins over a trait method.
     pub(super) fn drop_to(cmd: &mut tokio::process::Command, account: &str) -> Result<(), String> {
+        drop_to_in(cmd, account, false)
+    }
+
+    /// [`drop_to`], and with `at_home` (FR-97 P5b) the child starts in the
+    /// account's home ([`start_in_home`]).
+    pub(super) fn drop_to_in(
+        cmd: &mut tokio::process::Command,
+        account: &str,
+        at_home: bool,
+    ) -> Result<(), String> {
         let acct = resolve(account)?;
         cmd.env("HOME", &acct.home)
             .env("USER", &acct.name)
             .env("LOGNAME", &acct.name);
         // SAFETY: see `drop_body`.
         unsafe { cmd.pre_exec(drop_body(&acct)) };
+        if at_home {
+            start_in_home(cmd, &acct);
+        }
         Ok(())
     }
 
@@ -1351,10 +1399,12 @@ mod unix_priv {
     /// command as itself, which changes no identity, and could not drop
     /// anyway: `setgroups` needs root even to keep its own groups. Any other
     /// daemon cannot become them, and says so. uid 0 is refused by
-    /// [`resolve`], as for a named account.
+    /// [`resolve`], as for a named account. With `at_home` (P5b) the child
+    /// starts in their home.
     pub(super) fn drop_to_console(
         cmd: &mut tokio::process::Command,
         account: &str,
+        at_home: bool,
     ) -> Result<(), String> {
         let acct = resolve(account)?;
         // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
@@ -1366,7 +1416,41 @@ mod unix_priv {
             // SAFETY: see `drop_body`.
             unsafe { cmd.pre_exec(drop_body(&acct)) };
         }
+        if at_home {
+            start_in_home(cmd, &acct);
+        }
         Ok(())
+    }
+
+    /// FR-97 P5b — the child starts in `acct`'s home, as sshd starts a
+    /// session. Registered AFTER the drop, so it runs as the person: their
+    /// own rights decide whether they may enter it (a root-squashed NFS home
+    /// refuses root, and would have failed the spawn had the parent's
+    /// `current_dir` tried it as root). A home they cannot enter leaves the
+    /// child where it was, the daemon's directory, which is sshd's fallback
+    /// too; the parent says so in the log when the home is plainly missing.
+    /// Async-signal-safe: one syscall over memory the closure owns.
+    fn start_in_home(cmd: &mut tokio::process::Command, acct: &Account) {
+        if acct.home.is_empty() {
+            return;
+        }
+        if !std::path::Path::new(&acct.home).is_dir() {
+            tracing::warn!(
+                account = %acct.name, home = %acct.home,
+                "the account's home is missing: the session starts in the daemon's directory"
+            );
+        }
+        let Ok(home) = CString::new(acct.home.as_str()) else {
+            return;
+        };
+        // SAFETY: `chdir` over a string the closure owns; its result is
+        // deliberately ignored (the fallback above).
+        unsafe {
+            cmd.pre_exec(move || {
+                let _ = libc::chdir(home.as_ptr());
+                Ok(())
+            })
+        };
     }
 
     /// The pure half of [`drop_to_console`]: must a daemon running as
@@ -1413,6 +1497,38 @@ mod unix_priv {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// FR-97 P5b — a session's child starts in its account's home, and a
+        /// home it cannot enter leaves it where it was rather than failing the
+        /// spawn (sshd's fallback). The real `chdir`, in a real child.
+        #[tokio::test]
+        async fn a_session_starts_in_its_home_or_where_it_was() {
+            async fn pwd(home: &str) -> String {
+                let acct = Account {
+                    uid: 0,
+                    gid: 0,
+                    groups: vec![],
+                    home: home.into(),
+                    name: "p5b".into(),
+                };
+                let mut cmd = tokio::process::Command::new("/bin/sh");
+                cmd.args(["-c", "pwd -P"]).current_dir("/");
+                start_in_home(&mut cmd, &acct);
+                let out = cmd.output().await.expect("spawn");
+                assert!(out.status.success(), "{out:?}");
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            }
+            let home = std::env::temp_dir().join(format!("p5b-home-{}", std::process::id()));
+            std::fs::create_dir_all(&home).unwrap();
+            let real = std::fs::canonicalize(&home).unwrap();
+            assert_eq!(pwd(home.to_str().unwrap()).await, real.to_str().unwrap());
+            assert_eq!(
+                pwd("/definitely/not/a/home-p5b").await,
+                "/",
+                "a home it cannot enter leaves it where it was"
+            );
+            std::fs::remove_dir_all(&home).ok();
+        }
 
         /// FR-97 P5a — `console_user` is a drop, never a gain: a root daemon
         /// drops to the person at the screen, a daemon that is that person
@@ -1846,15 +1962,15 @@ impl ExecEngine {
         // replacement enforces the same timeout, ceiling and tree-kill.
         #[cfg(windows)]
         if matches!(req.run_as, RunAs::ConsoleUser) {
+            // FR-97 P5b — an SSH session with no directory of its own starts
+            // in the person's profile, as OpenSSH starts it.
+            let start_in = if req.start_in_home && req.cwd.is_none() && ssh_starts_in_home() {
+                win_console::StartIn::Profile
+            } else {
+                win_console::StartIn::Dir(req.cwd.clone())
+            };
             return win_console::run(
-                program,
-                args,
-                &command,
-                req.cwd.clone(),
-                timeout_ms,
-                output,
-                cancel,
-                stdin,
+                program, args, &command, start_in, timeout_ms, output, cancel, stdin,
             )
             .await;
         }
@@ -1893,7 +2009,14 @@ impl ExecEngine {
 
         // Privilege LAST, so nothing configured after it could quietly undo
         // the drop, and so a refusal costs nothing that was already spawned.
-        if let Err(e) = apply_run_as(&mut cmd, &req.run_as) {
+        // FR-97 P5b — an SSH session with no directory of its own starts in
+        // the person's home, as sshd starts it.
+        let applied = if req.start_in_home && req.cwd.is_none() {
+            apply_run_as_at_home(&mut cmd, &req.run_as)
+        } else {
+            apply_run_as(&mut cmd, &req.run_as)
+        };
+        if let Err(e) = applied {
             warn!(
                 request_id = %req.request_id, caller = %req.caller,
                 run_as = %req.run_as.label(),
@@ -2370,6 +2493,7 @@ mod tests {
             cwd: None,
             caller: "test".into(),
             run_as: RunAs::Daemon,
+            start_in_home: false,
         }
     }
 
@@ -3304,7 +3428,7 @@ mod win_console {
     }
 
     /// Where the child starts.
-    enum StartIn {
+    pub(super) enum StartIn {
         /// The caller's directory, or (`None`) this process's own.
         Dir(Option<String>),
         /// FR-97 P4b — the console user's profile, read from the token the
@@ -3312,7 +3436,7 @@ mod win_console {
         /// and an SFTP client resolves every relative path against wherever
         /// it started: inheriting this process's directory (System32, for a
         /// service) would send a bare `put` somewhere the user cannot write.
-        #[cfg_attr(not(feature = "ssh-server"), allow(dead_code))]
+        /// P5b: an SSH command with no directory of its own starts there too.
         Profile,
     }
 
@@ -3331,29 +3455,22 @@ mod win_console {
         run_cmdline(cmdline, StartIn::Profile, None, output, cancel, stdin).await
     }
 
-    /// Spawn a shell command as the console user ([`run_cmdline`]).
+    /// Spawn a shell command as the console user ([`run_cmdline`]), started
+    /// in `start_in`.
     // 8 params: the same set `spawn_and_wait` hands over, one for one.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run(
         program: &str,
         args: &[&str],
         command: &str,
-        cwd: Option<String>,
+        start_in: StartIn,
         timeout_ms: Option<u64>,
         output: Output,
         cancel: impl std::future::Future<Output = ()>,
         stdin: Option<super::StdinFeed>,
     ) -> ExecOutcome {
         let cmdline = build_cmdline(program, args, command);
-        run_cmdline(
-            cmdline,
-            StartIn::Dir(cwd),
-            timeout_ms,
-            output,
-            cancel,
-            stdin,
-        )
-        .await
+        run_cmdline(cmdline, start_in, timeout_ms, output, cancel, stdin).await
     }
 
     /// Spawn as the console user, drain both pipes, enforce the bounds.

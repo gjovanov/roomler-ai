@@ -28,7 +28,10 @@
 - P4c, Hive adopt on Windows (a named pipe whose client is named by its token, and a hook that sends nothing to
   a pipe it does not trust), merged (#2439), field-verified red → green on a Win11 SystemContext guest (§8).
 - P5a, `console_user` on Linux and macOS (the person at logind's seat0 or owning `/dev/console`, by the drop a
-  `named` account takes; refused while nobody is there), for SSH and for Fleet RPC's `run_as`, is in review.
+  `named` account takes; refused while nobody is there), for SSH and for Fleet RPC's `run_as`, merged (#2441),
+  field-verified red → green on a Linux root daemon, a Linux per-user daemon and a Mac's root daemon (§8).
+- P5b, a person's SSH session starts in their home (Linux and macOS) or profile (Windows), as sshd starts it, is
+  in review.
 - The rest of P2–P7 is open.
 
 **Owner:** the agent on all
@@ -191,8 +194,8 @@ and the consent chain's fallbacks.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | X1 | `exec` and SSH `daemon` mode run as the machine | 🟡 the console worker: the signed-in user on attended installs (#2021) | ✅ root | 🟡 root on the `-daemon` row, the user on the other | Two identities, one per row | FR-94; FR-43 P3 |
-| X2 | `console_user` account mode | 🟡 SystemContext, or the SYSTEM service (FR-105) | 🟡 built (P5a) | 🟡 built (P5a) | Was: "a Windows concept". P5a drops to the person at seat0 or owning the console (`exec.rs:802`), for SSH and exec's `run_as` | P5a |
-| X3 | SFTP / scp as the signed-in user | 🟡 built (P4b), where `sftp-server.exe` is installed | ✅ | ✅ | Was refused: `tokio::process` cannot take a token. P4b takes `exec`'s console-user spawn (`ssh.rs:1353`) | P4b |
+| X2 | `console_user` account mode | 🟡 SystemContext, or the SYSTEM service (FR-105) | 🟡 built (P5a) | 🟡 built (P5a) | Was: "a Windows concept". P5a drops to the person at seat0 or owning the console (`exec.rs:807`), for SSH and exec's `run_as` | P5a |
+| X3 | SFTP / scp as the signed-in user | 🟡 built (P4b), where `sftp-server.exe` is installed | ✅ | ✅ | Was refused: `tokio::process` cannot take a token. P4b takes `exec`'s console-user spawn (`ssh.rs:1355`) | P4b |
 
 ### 2.6 Install, update, ops, architectures
 
@@ -630,12 +633,12 @@ test of the SIGKILL property itself.
   - The viewer sends `{t: "sas"}` only to an agent that advertises it; the injector checks again before it asks.
   - `sas.dll` is loaded at send time from System32 only, never imported. `docs/remote-control.md` §5.1e.
 - **P4b, SFTP as `console_user`** (built). `sftp-server` runs through the `CreateProcessAsUserW` + three-pipe path
-  the exec code already uses (`exec::run_console_user_program`, `exec.rs:902`), instead of `tokio::process`
-  (`ssh.rs:1353`).
+  the exec code already uses (`exec::run_console_user_program`, `exec.rs:937`), instead of `tokio::process`
+  (`ssh.rs:1355`).
   - The command line is the quoted path alone: no shell stands in front, and nothing a client sends becomes an
     argument.
   - The bytes are raw. The streamed shell path redacts, and redaction inside a binary SFTP stream is corruption.
-  - It starts in the person's profile, read from the token the child runs under (`exec.rs:3412`). A service starts
+  - It starts in the person's profile, read from the token the child runs under (`exec.rs:3529`). A service starts
     in System32, where a bare `put` cannot land.
   - The client gets the exit status, then EOF, then close (`scp`'s verdict), and its abort sits with the exec
     channels', so a closed channel or a dropped session kills the tree.
@@ -677,11 +680,11 @@ test of the SIGKILL property itself.
 
 `console_user` on Linux and macOS: resolve the active seat's user (Linux: logind's seat0 active session) or the
 console user (macOS: `SCDynamicStoreCopyConsoleUser`) and route into the existing `unix_priv::drop_to`
-(`exec.rs:930-946`). Refuse when nobody is at the screen. It is a privilege drop, never a gain. It waits for FR-94's
+(`exec.rs:965-981`). Refuse when nobody is at the screen. It is a privilege drop, never a gain. It waits for FR-94's
 model on Windows, so the three agree on what the mode means.
 
 **P5a (built).** One rule for SSH's `account_mode` and Fleet RPC's `run_as`, through `apply_run_as`
-(`exec.rs:802`), so exec, the pty and `sftp` all take it:
+(`exec.rs:807`), so exec, the pty and `sftp` all take it:
 
 - **Who is at the screen.** Linux: the user of logind's `ActiveSession` on `seat0`, when that session's class is
   `user` (`companion::seat0_user`, `companion.rs:809`). It is not `graphical_session`, which takes the first
@@ -691,7 +694,7 @@ model on Windows, so the three agree on what the mode means.
   which names the same person `SCDynamicStoreCopyConsoleUser` does and keeps the companion's launch, the
   postinstall and this rule on one reading. Nobody, when: no logind or seat0, an empty seat, a greeter, the login
   window, or a system account (`_mbsetupuser` during Setup Assistant).
-- **A drop, never a gain** (`unix_priv::drop_to_console`, `exec.rs:1355`). A root daemon drops to the person;
+- **A drop, never a gain** (`unix_priv::drop_to_console`, `exec.rs:1404`). A root daemon drops to the person;
   uid 0 is refused, as for `named`. A per-user daemon whose own account is at the screen runs the command as
   itself, which changes no identity; it could not drop anyway, since `setgroups` needs root even to keep its own
   groups. A per-user daemon whose owner is not at the screen is refused.
@@ -702,6 +705,18 @@ model on Windows, so the three agree on what the mode means.
   Unix build, never Windows), the policy `PUT` stores `console_user` off Windows only for an agent whose hello
   carried it, `authorize` checks the live connection, and the hub refuses to push the field to a connection
   without the word (`hub.rs:3304`). SSH's half fails closed on its own: an older agent refuses the mode.
+
+**P5b (built).** P5a's field run found every session as a person starting in `/`, the daemon's directory, for
+`named` too, where sshd starts it in the home. Now the shell, an SSH command and `sftp` start in the person's home:
+- **Linux and macOS:** `exec::apply_run_as_at_home` registers a `chdir` to the account's home in the child AFTER
+  the drop (`unix_priv::start_in_home`), so the person's own rights decide whether they may enter it. A
+  root-squashed NFS home refuses root, so a parent-side `current_dir` would fail the whole spawn. A home they
+  cannot enter leaves the child where it was, as sshd's does.
+- **Windows `console_user`:** the pty and an SSH command start in the profile, read from the token they run under,
+  as P4b did for `sftp`.
+- **Unchanged:** `daemon` starts where it always did. Fleet RPC never sets the flag, so a command starts in its
+  `cwd` or where it always has.
+- Kill switch: `ROOMLERD_SSH_START_IN_HOME=0`.
 
 ### 3.11 P6 — install, update, ops
 
@@ -773,7 +788,7 @@ model on Windows, so the three agree on what the mode means.
 | **P4d** | Windows per-user clean stop: `service stop` and a session-end window (D15, built) | `ROOMLERD_SESSION_END=0` (the window); `service stop` acts only when run | Win11, a perUser ephemeral device, red on 0.4.142 | S |
 | **P4e** | Windows Home + v6 serving (only if D1 picks the userspace egress) | its own | Win11 Home | L |
 | **P5a** | `console_user` on Linux + macOS: the person at seat0 or owning the console, by the `named` drop, for SSH and exec's `run_as` (built) | the device's `ssh_account_mode`; the exec policy's `run_as` | the lab + a Mac | S–M |
-| **P5b** | A person's SSH session on Linux + macOS starts in their home: the pty and `sftp` for `named` and `console_user`, where sshd starts them (they start in `/`, the daemon's directory; Windows `console_user` `sftp` starts in the profile since P4b) | — | the lab | S |
+| **P5b** | A person's SSH session starts in their home: the shell, a command and `sftp` for `named` and `console_user` on Linux + macOS, and Windows `console_user`'s shell and commands in the profile (as `sftp` since P4b); the `chdir` after the drop, where sshd does it (built) | `ROOMLERD_SSH_START_IN_HOME=0` | the lab + a Win11 SystemContext guest | S |
 | **P6a** | Artifact version binding: `.deb`, `.pkg`, tarball | `ROOMLERD_ARTIFACT_VERSION_CHECK=0` | the last three releases, offline | S–M |
 | **P6b** | `roomler self-update` on Unix + the pinned PGP check | — | Linux + Mac tunnel-only hosts | M |
 | **P6c** | `service install --system` on Linux + macOS | — | vmtest | S |
@@ -846,6 +861,8 @@ one depends on it.
   itself on a clean stop.
 - [ ] **AC12 (P5a):** `console_user` runs as the person at the screen on Linux and macOS, and refuses when nobody is
   there.
+- [ ] **AC18 (P5b):** a person's SSH session (`named`, `console_user`) starts in their home on Linux and macOS and in
+  their profile on Windows, for the shell, a command and `sftp`; a home they cannot enter leaves it where it was.
 - [ ] **AC13 (P6):** a signed older `.deb` or `.pkg` under a newer manifest version is refused; `roomler self-update`
   updates a Linux and a macOS tunnel-only host; `service install --system` and `install.sh --uninstall` round-trip on
   vmtest; a SIGKILLed Mac worker leaves a crash record; a closed stdout no longer kills the macOS daemon.
@@ -983,3 +1000,7 @@ one depends on it.
 | 2026-10-18 | released 0.4.142, then the same candidate | the lab's per-user GNOME guest: the daemon runs as `wlab` under its user manager, and `wlab` is at the screen | 🔴 **Red:** the same "a Windows concept" refusal. 🟢 **Green, a per-user daemon:** the command ran as the daemon itself, uid 1000, with the unit's own groups (`wlab,nogroup,nogroup`) and no `setgroups` attempted, which would fail there; `HOME=/home/wlab`, and `pwd` the unit's `/home/wlab`. Both guests were put back afterwards: their release binary and their own `ssh_enabled = false` and key lines, then shut off |
 | 2026-10-18 | released 0.4.142 (its `.pkg`) | a throwaway tart Mac on the MacBook (NAT; the mesh reaches it through the server), the root daemon (the `-daemon` row), enrolled ephemeral with the overlay, the test key under `ssh_account_mode = "console_user"`; `admin` signed in at the GUI (the golden image logs in automatically), so `/dev/console` is `admin`'s | 🔴 **P5a red, macOS.** Exec and the pty exited 1 and `sftp` 255: "account_mode `console_user` is a Windows concept" |
 | 2026-10-18 | the P5a candidate's `.pkg` (release-lane run 39104938748, `publish_release=false`) | the same VM, the candidate installed over the release and enrolled afresh | 🟢 **P5a green, macOS.** Exec answered `user=admin uid=501 gid=20 HOME=/Users/admin USER=admin LOGNAME=admin`, the pty `admin`, and an `sftp` upload landed owned `admin`. 🟢 **Nobody at the screen:** with auto-login off and `admin`'s GUI session booted out, `/dev/console` went to `root` (loginwindow), and exec, the pty and `sftp` were refused: "nobody is signed in at this Mac's screen (the login window is showing)". ❌ **Wrong turns, recorded:** macOS `nohup` refuses outside a console session ("can't detach from console"), so the first VM never booted (fixed with `trap '' HUP` and a subshell, as the AC5 cell does). The candidate's ephemeral enrollment needs a fresh config, so the first green attempt failed to enroll until the earlier phase's config was removed. With auto-login still on, the first logout came straight back to `admin`, so that run's "nobody" step ran as `admin`, correctly |
+| 2026-10-18 | released 0.4.141 | the FR-93 lab's GNOME guest, a system install, the test key under `ssh_account_mode = "named:wlab"` (the release cannot do `console_user`), dialled over the mesh as for P5a | 🔴 **P5b red.** Exec, the pty and `sftp` all started in `/`: `pwd=/`, `wlab in /`, `Remote working directory: /`. A relative `sftp put` failed: `dest open "/rel-…": Permission denied` |
+| 2026-10-18 | the P5b candidate (`f093e614a`, a bookworm build) | the same guest, the candidate in place of the release | 🟢 **P5b green.** With `named:wlab` and with `console_user`, exec, the pty and `sftp` all started in `/home/wlab`. A relative `put` landed there, owned `wlab`, and was removed again. 🟢 **A home that cannot be entered** (`named:nobody`, home `/nonexistent`): the session ran from `/`, and the daemon logged "the account's home is missing: the session starts in the daemon's directory". 🟢 **The kill switch** (`ROOMLERD_SSH_START_IN_HOME=0`, a systemd drop-in): back to `/`. Then the release, its own lines and no drop-in, shut off |
+| 2026-10-18 | released 0.4.142 | zeus: a throwaway vmtest Win11 guest, the perMachine MSI with SystemContext, enrolled ephemeral with the overlay, the test key under `ssh_account_mode = "console_user"` | 🔴 **P5b red, Windows.** A command and the shell both started in `C:\WINDOWS\system32`, as `<guest>\vmtest`. (`sftp` was refused: 0.4.142 predates P4b) |
+| 2026-10-18 | the P5b candidate (`f093e614a`, a release build) | the same guest, the candidate in place of the release | 🟢 **P5b green, Windows.** A command and the shell started in `C:\Users\vmtest`, and `sftp` in `/C:/Users/vmtest`. 🟢 **The kill switch** in the service's environment (`roomlerd set-service-env-var`): the command and the shell were back in System32, while `sftp` stayed in the profile (P4b's, not this switch's); then removed. ❌ **Wrong turns, recorded:** the first guest's probes quoted their PowerShell, and the quoting did not survive the exec channel's wrapping (`The string is missing the terminator`), so they measured nothing. That guest's swap had overwritten the release, so the red needed a fresh guest |
