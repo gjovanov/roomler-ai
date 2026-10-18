@@ -1038,6 +1038,30 @@
         </v-dialog>
       </div>
 
+      <!-- FR-93 P5j — the computer said it was going to sleep, and this viewer
+           is redialling it. Before, every attempt read "Requesting session…" or
+           "Connection lost" for as long as the computer slept. -->
+      <div
+        v-else-if="asleepWhileRedialling"
+        class="empty-state"
+        data-testid="rc-host-asleep"
+      >
+        <v-icon size="72" color="info">mdi-sleep</v-icon>
+        <p class="text-body-1 mt-3">{{ mediaWaitingCopy('host_sleep').title }}</p>
+        <p v-if="asleepWhileRedialling.hint" class="text-body-2 text-medium-emphasis mt-2 mx-auto no-media-hint">
+          {{ asleepWhileRedialling.hint }}
+        </p>
+        <p class="text-caption text-medium-emphasis mt-2">
+          <template v-if="rc.phase.value === 'reconnecting'">
+            Reconnecting by itself once it is back (attempt {{ rc.reconnectAttempt.value }})…
+          </template>
+          <template v-else>{{ phaseLabel }}</template>
+        </p>
+        <v-btn variant="tonal" size="small" class="mt-3" @click="leave()">
+          Cancel
+        </v-btn>
+      </div>
+
       <div
         v-else-if="['requesting', 'awaiting_consent', 'negotiating'].includes(rc.phase.value)"
         class="empty-state"
@@ -4460,6 +4484,16 @@ const phaseColor = computed(() => {
 // FR-93 P2d-2 — when the host's dialog gives up, as a time of day on this
 // browser's clock (the deadline was set here, at receipt). A time rather than a
 // countdown, so the overlay needs no timer of its own.
+// FR-93 P5j — the sleep notice the composable keeps through a redial, while one
+// is in flight, over the attempt's own phase. A request to a sleeping computer
+// sits in awaiting_consent until it wakes, the server waiting for an answer the
+// computer cannot give (the lab, 0.4.142: 38 s of "Waiting for the agent to
+// allow the connection…"). An error, or a session that connects, ends it.
+const asleepWhileRedialling = computed(() => {
+  const w = rc.mediaWaiting.value
+  if (w?.for !== 'host_sleep') return null
+  return ['reconnecting', 'requesting', 'awaiting_consent', 'negotiating'].includes(rc.phase.value) ? w : null
+})
 const mediaWaitingEnds = computed(() => {
   const w = rc.mediaWaiting.value
   return w ? new Date(w.deadlineMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''

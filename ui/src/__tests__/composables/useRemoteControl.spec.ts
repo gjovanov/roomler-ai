@@ -74,6 +74,8 @@ import {
   isDeadAir,
   agentIsWaiting,
   advanceEndsWait,
+  waitKeptAcrossReconnect,
+  isKeptSleepNotice,
   mediaWaitingCopy,
   RC_MEDIA_WAITING_GRACE_MS,
   RC_MEDIA_WAITING_SETTLE_MS,
@@ -4400,6 +4402,33 @@ describe('FR-93: an agent that says it cannot capture is believed', () => {
     expect(asleep.title).toMatch(/going to sleep/)
     expect(asleep.status).toBe('the computer is asleep')
     expect(asleep.showsDeadline).toBe(false)
+  })
+
+  it('FR-93 P5j — a computer going to sleep keeps saying so through the redial, and holds nothing back', () => {
+    const now = 1_000_000
+    const asleep = { for: 'host_sleep', deadlineMs: now + 120_000, hint: 'This computer is going to sleep.' }
+    const kept = waitKeptAcrossReconnect(asleep, now)
+    expect(kept).not.toBeNull()
+    expect(kept?.for).toBe('host_sleep')
+    expect(kept?.hint).toBe(asleep.hint)
+    // The notice stays on screen, but its deadline is spent: the watchdog does
+    // not wait on it, so a new session that stays silent is re-created as usual.
+    expect(agentIsWaiting(kept, now)).toBe(false)
+    expect(agentIsWaiting(asleep, now)).toBe(true)
+    // Any other wait belonged to the session that ended.
+    for (const f of ['person_at_screen', 'screen_unlock', 'display_wake', 'session_away', 'something_newer']) {
+      expect(waitKeptAcrossReconnect({ ...asleep, for: f }, now)).toBeNull()
+    }
+    expect(waitKeptAcrossReconnect(null, now)).toBeNull()
+    // A notice already past its deadline stays past it.
+    const old = { ...asleep, deadlineMs: now - 600_000 }
+    expect(waitKeptAcrossReconnect(old, now)?.deadlineMs).toBe(old.deadlineMs)
+    // A session that connects ends the kept notice, but not the live session's
+    // own: an ICE flap that session recovers from is not a wake.
+    expect(isKeptSleepNotice(kept, now)).toBe(true)
+    expect(isKeptSleepNotice(asleep, now)).toBe(false)
+    expect(isKeptSleepNotice({ ...kept!, for: 'screen_unlock' }, now)).toBe(false)
+    expect(isKeptSleepNotice(null, now)).toBe(false)
   })
 
   it('a frameless two minutes inside a wait neither probes nor re-creates the session', () => {

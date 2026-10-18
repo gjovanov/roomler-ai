@@ -1774,6 +1774,7 @@ sequenceDiagram
     N->>N: takes the network down
     D->>L: the inhibitor's fd closed
     Note over L: the computer sleeps
+    Note over V: redials, the notice kept on the stage (P5j)
     L-->>D: PrepareForSleep(false), after the wake
     Note over V: reconnects by itself; the new session names<br/>whatever holds the picture back (a lock: §5.3)
 ```
@@ -1783,7 +1784,7 @@ sequenceDiagram
 | the inhibitor | a logind **delay** inhibitor on `sleep`, held only while a session is live: taken within 2 s of the first, let go within 2 s of the last, and never taken while a sleep is under way | a *delay* leaves the person at the computer the last word about sleep: keeping a host awake through a session is FR-55's, not this (a logind **block** inhibitor since FR-97 P3b, `remote-control.md` §5.1d). An idle daemon holds nothing (`systemd-inhibit --list` shows it only during a session). logind refuses an inhibitor for a sleep it is already carrying out (`OperationInProgress`); after `PrepareForSleep(true)` the next one waits for the wake, or for logind's `PreparingForSleep` to read false if the wake's signal was missed |
 | the notice | `rc:media-waiting {for: "host_sleep", waits_ms: 3600000}` with its hint, to every live session at once, each within 1.5 s | the notice the other waits use (P2d-2), so `ROOMLERD_MEDIA_WAITING=0` silences it too. 1.5 s keeps the whole well inside logind's 5 s |
 | the race | NetworkManager takes the network down on the same signal | measured: the notice out 44 ms (KDE) and 92 ms (GNOME) before the first failed send. A send is a few milliseconds; a host slower than that would lose it, and its viewer falls back to *Reconnecting*, as before P5h |
-| the viewer | *This computer is going to sleep.*, status *the computer is asleep*, no countdown | a viewer from before P5h shows the agent's hint under its generic title, which still names the sleep |
+| the viewer | *This computer is going to sleep.*, status *the computer is asleep*, no countdown; kept on the stage through the redial until a session connects (P5j, below) | a viewer from before P5h shows the agent's hint under its generic title, which still names the sleep |
 | the watcher | a thread on the system bus (`portal-capture`, which every shipped Linux agent carries through `full`); a lost logind is retried every 60 s | zbus's blocking API panics on a runtime thread |
 | the kill switch | `ROOMLERD_SLEEP_NOTICE=0`: no inhibitor, no notice, as before P5h | — |
 
@@ -1798,6 +1799,34 @@ wake libvirt's `dompmwakeup` 30 s later:
   notice 1.5 s before the suspend, and no refused inhibitor. GNOME locks as it
   sleeps, so after the wake the new session named the lock (§5.3) 11.2 s after
   it, most of which is the viewer's reconnect backoff.
+
+**The redial keeps the notice (FR-93 P5j).** The notice was gone long before the
+wake. When the dead link made the viewer redial, the redial's teardown cleared
+it. A request to a sleeping computer then sits in `awaiting_consent`, because
+the server waits for an answer the computer cannot give. So the stage read
+*Waiting for the agent to allow the connection…* for the rest of the sleep.
+Measured on the released 0.4.142 with S3 in the lab: 48 s that named no reason,
+the last 19 of them after the wake.
+
+Now the viewer keeps a `host_sleep` notice through the redial
+(`waitKeptAcrossReconnect`, `ui/src/composables/useRemoteControl.ts:857`). Its
+deadline is spent, so the stall watchdog is not held: a new session that stays
+silent is still re-created on the usual clock. The stage shows the notice in
+every redial phase, with that phase's own words beneath it
+(`RemoteControl.vue:1047`). A session that connects ends it
+(`isKeptSleepNotice`, `:872`), and the new session's own report or first frame
+replaces it.
+
+| the same released 0.4.142 agent, per-user, S3 | the suspend | the wake |
+|---|---|---|
+| GNOME, prod's viewer | named +0.4 s | 🔴 nothing named from 10.7 s into the sleep until 19.4 s after the wake |
+| GNOME, the P5j viewer (a candidate bundle served on the real origin) | named +0.1 s | ✅ named +0.1 s, continuously, until the new session named the lock 10.1 s after the wake |
+| KDE, prod's viewer | named +0.2 s | 🔴 nothing named from 8.3 s into the sleep until 25.2 s after the wake |
+| KDE, the P5j viewer | named +0.5 s | ✅ named +0.3 s, continuously, until the new session named KDE's share request 19.8 s after the wake |
+
+⚠️ In the lab a guest resumed from S3 keeps its virtio display off (*Display
+output is not active*) and loses its ssh soon after. The wake can be timed
+there, but the unlock cannot, and the guest has to be forced off by name.
 
 ⚠️ The lab's guests are virtual. After an S3 resume, GNOME's shell on their
 virtio-gpu display has also hung (llvmpipe), and KDE resumed black. What a wake

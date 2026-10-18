@@ -85,8 +85,9 @@ async function picture(page: Page): Promise<{ sum: number | null; lit: number | 
   })
 }
 
-/** The viewer's own status words a person would read, if any. */
-const STATUS = /(Reconnecting[^.\n]*|Connection lost[^.\n]*|No video from this device[^.\n]*|waiting for the person[^.\n]*|The person at this computer[^.\n]*|agent (is )?offline[^.\n]*|disconnected[^.\n]*|This computer's display[^.\n]*|waiting for the display[^.\n]*)/i
+/** The viewer's own status words a person would read, if any. FR-93 P5j — a
+ *  redial keeps the computer's own "going to sleep" on the stage. */
+const STATUS = /(This computer is going to sleep[^.\n]*|Reconnecting[^.\n]*|Connection lost[^.\n]*|No video from this device[^.\n]*|waiting for the person[^.\n]*|The person at this computer[^.\n]*|agent (is )?offline[^.\n]*|disconnected[^.\n]*|This computer's display[^.\n]*|waiting for the display[^.\n]*)/i
 
 type Read = { wall: number; counter: number | null; why: string; w: number; h: number; lit?: number }
 
