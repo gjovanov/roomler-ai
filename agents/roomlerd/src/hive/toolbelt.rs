@@ -240,17 +240,23 @@ pub(crate) type PeerId = String;
 pub(crate) trait VaultTools: Send + Sync {
     async fn list(&self, session: ObjectId, fence: u64, prefix: &str) -> Result<Value, String>;
     async fn describe(&self, session: ObjectId, fence: u64, secret: &str) -> Result<Value, String>;
-    /// P3-4c-1 — lease `handle` in `exec` mode for `program` (the lease's
-    /// audience), for `ttl_secs`: the lease's id, or why not.
+    /// P3-4c — lease `handle` in `mode` toward `audience` (`exec`: the
+    /// program; `file`: the file's name), for `ttl_secs`: the lease's id, or
+    /// why not.
     #[cfg(feature = "vault")]
-    async fn lease_exec(
+    async fn lease(
         &self,
         session: ObjectId,
         fence: u64,
         handle: &super::vault_exec::Handle,
-        program: &str,
+        mode: &str,
+        audience: &str,
         ttl_secs: u32,
     ) -> Result<String, String>;
+    /// P3-4c-2 — `path` was written with `lease_id`'s value: removed when the
+    /// lease is let go. `false` when the lease is no longer held.
+    #[cfg(feature = "vault")]
+    fn attach(&self, lease_id: &str, path: &std::path::Path) -> bool;
     /// The value a held lease holds, while it is held.
     #[cfg(feature = "vault")]
     fn value(&self, lease_id: &str) -> Option<zeroize::Zeroizing<Vec<u8>>>;
@@ -294,11 +300,11 @@ struct Ctx {
 /// leases: reads of the vault's metadata, never a value.
 const VAULT_TOOL_NAMES: [&str; 2] = ["vault_list", "vault_describe"];
 
-/// FR-90 P3-4c-1 — and its uses: a value handed to one command. Offered with
-/// the reads, and never allowed in the settings: each call asks a person
-/// first.
+/// FR-90 P3-4c — and its uses: a value handed to one command (c-1), or
+/// written into the session's secrets directory (c-2). Offered with the
+/// reads, and never allowed in the settings: each call asks a person first.
 #[cfg(feature = "vault")]
-const VAULT_USE_NAMES: [&str; 1] = ["vault_exec"];
+const VAULT_USE_NAMES: [&str; 2] = ["vault_exec", "vault_render"];
 
 /// Whether `name` is one of the vault tools this build offers.
 fn is_vault_tool(name: &str) -> bool {
@@ -360,12 +366,13 @@ impl VaultTools for DaemonVault {
         Ok(json!(s))
     }
 
-    async fn lease_exec(
+    async fn lease(
         &self,
         session: ObjectId,
         fence: u64,
         handle: &super::vault_exec::Handle,
-        program: &str,
+        mode: &str,
+        audience: &str,
         ttl_secs: u32,
     ) -> Result<String, String> {
         let info = crate::vault::CLIENT
@@ -374,13 +381,17 @@ impl VaultTools for DaemonVault {
                 fence,
                 secret: handle.secret.clone(),
                 field: handle.field.clone(),
-                mode: "exec".into(),
-                audience: program.into(),
+                mode: mode.into(),
+                audience: audience.into(),
                 ttl_secs,
             })
             .await
             .map_err(vault_why)?;
         Ok(info.lease_id)
+    }
+
+    fn attach(&self, lease_id: &str, path: &std::path::Path) -> bool {
+        crate::vault::CLIENT.attach(lease_id, path)
     }
 
     fn value(&self, lease_id: &str) -> Option<zeroize::Zeroizing<Vec<u8>>> {
@@ -711,6 +722,27 @@ fn vault_tools() -> Vec<Value> {
         },
         "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
     }));
+    #[cfg(feature = "vault")]
+    tools.push(json!({
+        "name": "vault_render",
+        "description": "Writes a template with values from the Roomler vault into this session's \
+                        secrets directory, as a file only this session's account can read, and \
+                        answers its path. Put each secret in the template as {{ a/path }} (or \
+                        {{ rrn:<org>:secret:<path>#<field> }}). The file is removed when its \
+                        lease ends (ttl_s, 30 to 900 seconds). Claude Code's Read tool may not \
+                        open it: hand its path to the program that needs it. A person approves \
+                        every call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "template": {"type": "string", "description": "the file's text, with {{ secret }} placeholders"},
+                "dest": {"type": "string", "description": "a bare file name, such as kubeconfig"},
+                "ttl_s": {"type": "integer", "minimum": 30, "maximum": 900},
+            },
+            "required": ["template", "dest"],
+        },
+        "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false},
+    }));
     tools
 }
 
@@ -750,6 +782,17 @@ async fn ask_vault(ctx: &Ctx, name: &str, args: &Value) -> Result<Value, String>
     #[cfg(feature = "vault")]
     if name == "vault_exec" {
         return super::vault_exec::call(
+            vault.as_ref(),
+            ctx.session,
+            ctx.fence,
+            ctx.exec.as_ref(),
+            args,
+        )
+        .await;
+    }
+    #[cfg(feature = "vault")]
+    if name == "vault_render" {
+        return super::vault_render::call(
             vault.as_ref(),
             ctx.session,
             ctx.fence,

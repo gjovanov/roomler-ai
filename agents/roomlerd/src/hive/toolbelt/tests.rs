@@ -463,6 +463,9 @@ struct FakeVault {
     released: std::sync::Mutex<Vec<String>>,
     #[cfg(feature = "vault")]
     issued: std::sync::atomic::AtomicUsize,
+    /// P3-4c-2 — each file a tool attached to a lease.
+    #[cfg(feature = "vault")]
+    attached: std::sync::Mutex<Vec<(String, std::path::PathBuf)>>,
 }
 
 impl FakeVault {
@@ -474,12 +477,13 @@ impl FakeVault {
 #[async_trait::async_trait]
 impl VaultTools for FakeVault {
     #[cfg(feature = "vault")]
-    async fn lease_exec(
+    async fn lease(
         &self,
         session: ObjectId,
         fence: u64,
         handle: &super::super::vault_exec::Handle,
-        program: &str,
+        mode: &str,
+        audience: &str,
         ttl_secs: u32,
     ) -> Result<String, String> {
         let key = if handle.field.is_empty() {
@@ -488,10 +492,10 @@ impl VaultTools for FakeVault {
             format!("{}#{}", handle.secret, handle.field)
         };
         self.asked.lock().unwrap().push((
-            "lease_exec".into(),
+            format!("lease_{mode}"),
             session,
             fence,
-            format!("{key} for {program} {ttl_secs}s"),
+            format!("{key} for {audience} {ttl_secs}s"),
         ));
         let value = self
             .values
@@ -503,6 +507,18 @@ impl VaultTools for FakeVault {
         let id = format!("L{n}");
         self.held.lock().unwrap().insert(id.clone(), value.clone());
         Ok(id)
+    }
+
+    #[cfg(feature = "vault")]
+    fn attach(&self, lease_id: &str, path: &Path) -> bool {
+        if !self.held.lock().unwrap().contains_key(lease_id) {
+            return false;
+        }
+        self.attached
+            .lock()
+            .unwrap()
+            .push((lease_id.to_string(), path.to_path_buf()));
+        true
     }
 
     #[cfg(feature = "vault")]
@@ -599,7 +615,7 @@ async fn the_vault_tools_are_offered_only_where_the_device_takes_leases() {
     assert_eq!(names[..3], ["approve", "vault_list", "vault_describe"]);
     // P3-4c-1 — and, in a build with the vault, its one use.
     #[cfg(feature = "vault")]
-    assert_eq!(names[3..], ["vault_exec"]);
+    assert_eq!(names[3..], ["vault_exec", "vault_render"]);
     #[cfg(not(feature = "vault"))]
     assert_eq!(names.len(), 3);
     for t in &tools[1..3] {
@@ -751,6 +767,8 @@ fn exec_belt(dir: &Path, values: &[(&str, &[u8])]) -> (Belt, Arc<FakeVault>, Obj
         ..FakeVault::default()
     });
     let sid = ObjectId::new();
+    // The run's own directory, as the supervisor makes it before a launch.
+    std::fs::create_dir_all(dir.join("run")).unwrap();
     let belt = belt_running(
         me(),
         Run {
@@ -761,6 +779,8 @@ fn exec_belt(dir: &Path, values: &[(&str, &[u8])]) -> (Belt, Arc<FakeVault>, Obj
                 account: None,
                 home: dir.to_path_buf(),
                 folder: dir.to_path_buf(),
+                session_dir: dir.join("run"),
+                owner: None,
             }),
         },
         quick(),
@@ -812,10 +832,22 @@ async fn vault_exec_is_offered_and_never_allowed_unasked() {
         .expect("offered");
     assert_eq!(exec["annotations"]["readOnlyHint"], false, "{exec}");
     assert_eq!(exec["inputSchema"]["required"], json!(["argv", "env"]));
-    assert!(
-        !VAULT_TOOLS.contains(&"mcp__roomler__vault_exec"),
-        "the settings never allow it: a person approves every call"
+    // P3-4c-2 — and `vault_render`, the same way.
+    let render = tools
+        .iter()
+        .find(|t| t["name"] == "vault_render")
+        .expect("offered");
+    assert_eq!(render["annotations"]["readOnlyHint"], false, "{render}");
+    assert_eq!(
+        render["inputSchema"]["required"],
+        json!(["template", "dest"])
     );
+    for tool in ["mcp__roomler__vault_exec", "mcp__roomler__vault_render"] {
+        assert!(
+            !VAULT_TOOLS.contains(&tool),
+            "the settings never allow {tool}: a person approves every call"
+        );
+    }
 }
 
 /// P3-4c-1 — a command runs as the session's run would, with the value in
@@ -953,6 +985,103 @@ async fn a_command_past_its_timeout_is_killed_with_its_group() {
         !dir.path().join("survived").exists(),
         "the group died with the command"
     );
+}
+
+/// P3-4c-2 — a template is rendered into the run's secrets directory with
+/// its values; the file is private, attached to each of its leases, and the
+/// leases are kept, since the file lives with them. The answer is a path,
+/// never a value.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn vault_render_writes_the_file_and_keeps_its_leases() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, sid) = exec_belt(
+        dir.path(),
+        &[
+            ("db/main#user", b"app-user-01"),
+            ("db/main#password", b"pw-render-77"),
+        ],
+    );
+    let mut c = Client::connect(&b).await;
+    c.send(tool_call(
+        1,
+        "vault_render",
+        json!({
+            "template": "user={{ db/main#user }}\npass={{db/main#password}}\nuser again={{ db/main#user }}\n",
+            "dest": "db.env",
+            "ttl_s": 60,
+        }),
+    ))
+    .await;
+    let m = c.recv().await;
+    assert!(m["result"].get("isError").is_none(), "{m}");
+    assert!(
+        !m.to_string().contains("pw-render"),
+        "the answer carries no value"
+    );
+    let answer: Value =
+        serde_json::from_str(m["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let path = PathBuf::from(answer["path"].as_str().unwrap());
+    let secrets = dir.path().join("run").join("secrets");
+    assert_eq!(path, secrets.join("db.env"));
+    assert_eq!(answer["ttl_s"], 60);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"user=app-user-01\npass=pw-render-77\nuser again=app-user-01\n"
+    );
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(&secrets), 0o711);
+    assert_eq!(
+        vault.asked(),
+        [
+            (
+                "lease_file".to_string(),
+                sid,
+                5,
+                "db/main#user for db.env 60s".to_string()
+            ),
+            (
+                "lease_file".to_string(),
+                sid,
+                5,
+                "db/main#password for db.env 60s".to_string()
+            ),
+        ]
+    );
+    assert_eq!(
+        *vault.attached.lock().unwrap(),
+        [("L0".to_string(), path.clone()), ("L1".to_string(), path)]
+    );
+    assert!(
+        vault.released.lock().unwrap().is_empty(),
+        "kept: the file lives with its leases"
+    );
+}
+
+/// P3-4c-2 — one refused lease writes nothing and lets the others go.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn a_refused_render_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, _) = exec_belt(dir.path(), &[("db/main", b"render-first-1")]);
+    let mut c = Client::connect(&b).await;
+    c.send(tool_call(
+        1,
+        "vault_render",
+        json!({"template": "{{ db/main }} {{ db/missing }}", "dest": "out"}),
+    ))
+    .await;
+    let m = c.recv().await;
+    assert_eq!(m["result"]["isError"], true, "{m}");
+    assert_eq!(
+        m["result"]["content"][0]["text"],
+        "db/missing: the vault refused: no_secret"
+    );
+    assert!(!dir.path().join("run").join("secrets").join("out").exists());
+    assert_eq!(*vault.released.lock().unwrap(), ["L0"]);
+    assert!(vault.attached.lock().unwrap().is_empty());
 }
 
 /// More open approvals than Claude Code ever asks for, and a question the
