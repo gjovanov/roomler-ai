@@ -1011,6 +1011,85 @@ pub async fn audit(
     ))
 }
 
+#[derive(Deserialize, Debug, Default)]
+pub struct ActivityQuery {
+    /// RFC 3339: the page before this time.
+    #[serde(default)]
+    pub before: Option<String>,
+    /// 1 to 200; 50 by default.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// One session's reports.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// The reports naming one lease: where a use joins its decision.
+    #[serde(default)]
+    pub lease_id: Option<String>,
+}
+
+/// FR-90 P3-4d — `GET /api/tenant/{tenant_id}/vault/activity`: what the
+/// organization's devices REPORT doing with their leases, newest first.
+/// Claims, never decisions: `…/vault/audit` holds those. An empty answer is
+/// not evidence of disuse, since a device reports only while its own
+/// `vault_activity_log` is on.
+pub async fn activity(
+    State(state): State<VaultState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+    Query(q): Query<ActivityQuery>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let tid = member_tenant(&state, &tenant_id, &auth).await?;
+    let perms = state
+        .tenants
+        .get_member_permissions(tid, auth.user_id)
+        .await?;
+    if !permissions::has(perms, permissions::ADMINISTRATOR) {
+        return Err(ApiError::Forbidden(
+            "only the organization's administrators reach its vault".into(),
+        ));
+    }
+    let id = |raw: &Option<String>, what: &str| -> Result<Option<ObjectId>, ApiError> {
+        raw.as_deref()
+            .map(|s| {
+                ObjectId::parse_str(s)
+                    .map_err(|_| ApiError::BadRequest(format!("{what} is not an id")))
+            })
+            .transpose()
+    };
+    let session_id = id(&q.session_id, "session_id")?;
+    let lease_id = id(&q.lease_id, "lease_id")?;
+    let before = match &q.before {
+        Some(raw) => Some(
+            DateTime::parse_rfc3339_str(raw)
+                .map_err(|_| ApiError::BadRequest("before must be an RFC 3339 time".into()))?,
+        ),
+        None => None,
+    };
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let rows = state
+        .activity
+        .recent(tid, session_id, lease_id, before, limit)
+        .await?;
+    Ok(Json(
+        rows.iter()
+            .map(|a| {
+                json!({
+                    "id": a.id.map(|i| i.to_hex()),
+                    "at": rfc3339(a.at),
+                    "device_id": a.device_id.to_hex(),
+                    "session_id": a.session_id.to_hex(),
+                    "fence": a.fence,
+                    "kind": a.kind,
+                    "lease_ids": a.lease_ids.iter().map(|l| l.to_hex()).collect::<Vec<_>>(),
+                    "target": a.target,
+                    "exit_code": a.exit_code,
+                    "timed_out": a.timed_out,
+                })
+            })
+            .collect(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -54,7 +54,7 @@ pub(crate) fn fresh_kek() -> String {
 }
 
 /// Hive and the vault on, with a KEK.
-async fn lease_app() -> TestApp {
+pub(crate) async fn lease_app() -> TestApp {
     let kek = fresh_kek();
     TestApp::spawn_with_settings(move |s| {
         s.modules.hive = true;

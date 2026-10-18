@@ -53,7 +53,7 @@ use roomler_ai_mod_hive::model::{AgentSession, SessionStatus};
 use roomler_ai_remote_control::{
     models::{Agent, OsKind, RpcCap},
     signaling::{ClientMsg, ServerMsg},
-    vault::{LeaseRefusal, lease_limits},
+    vault::{LeaseRefusal, VaultActivityKind, lease_limits, program_name_ok},
 };
 use roomler_ai_services::dao::base::DaoError;
 use roomler_core::{AgentCtx, AgentMsgHandler, AgentSocketLifecycle};
@@ -62,7 +62,7 @@ use tracing::{debug, warn};
 
 use crate::VaultState;
 use crate::crypto::{self, Binding};
-use crate::model::{VaultAuditEvent, VaultLease, VaultSecret};
+use crate::model::{VaultActivity, VaultAuditEvent, VaultLease, VaultSecret};
 use crate::policy::{self, Ask, DeviceFacts, SecretFacts, SessionFacts, Verdict};
 use crate::policy_routes::decide_for_org;
 use crate::revoke;
@@ -106,20 +106,38 @@ pub struct DescribeRequest {
     pub secret: String,
 }
 
+/// P3-4d — one `rc:vault.activity`, as it arrived: a device's claim of a
+/// use, answered with nothing.
+#[derive(Debug, Clone)]
+pub struct ActivityReport {
+    pub session_id: ObjectId,
+    pub fence: u64,
+    pub kind: String,
+    pub lease_ids: Vec<String>,
+    pub target: String,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+}
+
 /// What a session's device asked of the vault, queued in the order it came.
 #[derive(Debug, Clone)]
 pub enum Request {
     Lease(LeaseRequest),
     List(ListRequest),
     Describe(DescribeRequest),
+    /// P3-4d — in the same queue, so a flood of reports is dropped at its
+    /// bound like a flood of requests, and answered with nothing.
+    Activity(ActivityReport),
 }
 
 impl Request {
-    fn req_id(&self) -> &str {
+    /// The id an answer names; none for a report, which gets no answer.
+    fn req_id(&self) -> Option<&str> {
         match self {
-            Self::Lease(r) => &r.req_id,
-            Self::List(r) => &r.req_id,
-            Self::Describe(r) => &r.req_id,
+            Self::Lease(r) => Some(&r.req_id),
+            Self::List(r) => Some(&r.req_id),
+            Self::Describe(r) => Some(&r.req_id),
+            Self::Activity(_) => None,
         }
     }
 }
@@ -202,6 +220,23 @@ impl AgentMsgHandler for LeaseSocket {
                 fence,
                 secret,
             }),
+            ClientMsg::VaultActivity {
+                session_id,
+                fence,
+                kind,
+                lease_ids,
+                target,
+                exit_code,
+                timed_out,
+            } => Request::Activity(ActivityReport {
+                session_id,
+                fence,
+                kind,
+                lease_ids,
+                target,
+                exit_code,
+                timed_out,
+            }),
             other => return Some(other),
         };
         let queued = match self.conns.get(&ctx.conn_id).map(|q| q.value().clone()) {
@@ -212,7 +247,10 @@ impl AgentMsgHandler for LeaseSocket {
         };
         if let Err(req) = queued {
             debug!(device = %ctx.agent_id, "vault: a request found its connection's queue full");
-            let _ = ctx.tx.try_send(refusal(req.req_id(), LeaseRefusal::Busy));
+            // A report gets no answer, not even this one: it is dropped.
+            if let Some(req_id) = req.req_id() {
+                let _ = ctx.tx.try_send(refusal(req_id, LeaseRefusal::Busy));
+            }
         }
         None
     }
@@ -294,6 +332,11 @@ async fn answer_in_order(
                 },
                 Err(why) => refusal(&r.req_id, why),
             },
+            // P3-4d — kept or dropped, and answered with nothing.
+            Request::Activity(r) => {
+                activity(&state, conn, r).await;
+                continue;
+            }
         };
         let Some(tx) = tx.upgrade() else { break };
         if tx.send(answer).await.is_err() {
@@ -306,6 +349,82 @@ fn refusal(req_id: &str, why: LeaseRefusal) -> ServerMsg {
     ServerMsg::VaultRefused {
         req_id: clip(req_id, lease_limits::MAX_REQ_ID_LEN),
         reason: why.wire().into(),
+    }
+}
+
+/// P3-4d — keep a device's report of a use when every lease it names was
+/// released to this device, for this session, in the use's mode and toward
+/// its target; drop it otherwise, at debug. A report is a claim, and a claim
+/// about a lease this device was never released is no claim at all.
+async fn activity(state: &VaultState, conn: Conn, r: &ActivityReport) {
+    let dropped = |why: &str| {
+        debug!(device = %conn.device_id, session = %r.session_id, why, "vault: an activity report dropped");
+    };
+    if !state.scope.serves(conn.tenant_id) {
+        return dropped("the organization is not served");
+    }
+    let Some(kind) = VaultActivityKind::from_wire(&r.kind) else {
+        return dropped("a kind this server cannot name");
+    };
+    if r.lease_ids.is_empty()
+        || r.lease_ids.len() > lease_limits::MAX_ACTIVITY_LEASES
+        || !program_name_ok(&r.target)
+    {
+        return dropped("out of bounds");
+    }
+    let Some(mut ids) = r
+        .lease_ids
+        .iter()
+        .map(|id| ObjectId::parse_str(id).ok())
+        .collect::<Option<Vec<ObjectId>>>()
+    else {
+        return dropped("a lease id that is not one");
+    };
+    ids.sort();
+    ids.dedup();
+    if !state.activity_limiter.check(
+        r.session_id,
+        conn.device_id,
+        lease_limits::ACTIVITY_PER_MINUTE,
+    ) {
+        return dropped("past the rate");
+    }
+    match state
+        .leases
+        .all_released_for(
+            &ids,
+            conn.tenant_id,
+            conn.device_id,
+            r.session_id,
+            kind.mode(),
+            &r.target,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return dropped("a lease not released to this device for this use"),
+        Err(e) => {
+            warn!(device = %conn.device_id, %e, "vault: an activity report could not be checked");
+            return;
+        }
+    }
+    let exec = kind == VaultActivityKind::Exec;
+    let row = VaultActivity {
+        id: None,
+        tenant_id: conn.tenant_id,
+        device_id: conn.device_id,
+        session_id: r.session_id,
+        fence: i64::try_from(r.fence).unwrap_or(i64::MAX),
+        kind: kind.wire().into(),
+        lease_ids: ids,
+        target: r.target.clone(),
+        // What only a command has: never kept for a file.
+        exit_code: r.exit_code.filter(|_| exec),
+        timed_out: exec && r.timed_out,
+        at: DateTime::now(),
+    };
+    if let Err(e) = state.activity.insert(&row).await {
+        warn!(device = %conn.device_id, %e, "vault: an activity report was not kept");
     }
 }
 

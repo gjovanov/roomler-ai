@@ -430,6 +430,7 @@ is written before it is acted on. Full treatment: [vault.md](vault.md).
 | PUT | `…/vault/secret/{id}/value` | `{field?, value, expires_at?}` — the field's next version, sealed: `{field, n, created_at, expires_at}`. **503** without a usable KEK |
 | POST | `…/vault/verify` | Open every version (up to 10,000): `{versions, ok, failed, failures[{secret_id, field, n, reason: other_kek · dek_unreadable · tampered}], truncated}`. **503** without a usable KEK |
 | GET | `…/vault/audit` | The decisions, newest first (`?before=` RFC 3339, `?limit=` 1–200) |
+| GET | `…/vault/activity` | P3-4d — what devices **report** doing with their leases, newest first (`?session_id=`, `?lease_id=`, `?before=` RFC 3339, `?limit=` 1–200): `{id, at, device_id, session_id, fence, kind: exec · render, lease_ids, target, exit_code, timed_out}`. Claims, never decisions; an empty answer is not evidence of disuse |
 | GET | `…/vault/schema` | P3-2a — `{schema, actions, modes, oses, secret_prefix}`: what a policy is written against |
 | GET · POST | `…/vault/role` | P3-2a — the vault roles; `{name, description?}` declares one (**409** when a live role holds the name) |
 | DELETE | `…/vault/role/{name}` | P3-2a — tombstone a role; **409** naming the live policies that still name it |

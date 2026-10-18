@@ -251,6 +251,11 @@ mod tunnel_tests;
 mod tutorial_tests;
 #[cfg(test)]
 mod usage_ledger_tests;
+/// FR-90 P3-4d-1 — what a device reports doing with its leases: kept apart
+/// from the vault's decisions, and only for leases released to that device,
+/// for that session, in the use's mode and toward its target.
+#[cfg(test)]
+mod vault_activity_tests;
 /// FR-90 P3-3a — a device's vault key as the fleet stores it: from every
 /// hello, never a malformed one, and gone with the hello that drops it.
 #[cfg(test)]
