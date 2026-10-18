@@ -32,9 +32,13 @@
   `named` account takes; refused while nobody is there), for SSH and for Fleet RPC's `run_as`, merged (#2441),
   field-verified red → green on a Linux root daemon, a Linux per-user daemon and a Mac's root daemon (§8).
 - P5b, a person's SSH session starts in their home (Linux and macOS) or profile (Windows), as sshd starts it,
-  merged (#2443), field-verified red → green on a Linux root daemon and a Win11 SystemContext guest (§8).
+  merged (#2443), field-verified red → green on a Linux root daemon, a Win11 SystemContext guest and a Mac's root
+  daemon (§8).
 - P6a, the updater binding the `.deb`, `.pkg` and tarball to the release they are offered as (the MSI's binding,
-  on Linux and macOS), is in review: an attack red on 0.4.143, green on its candidate (§8).
+  on Linux and macOS), is in review: an attack red on 0.4.143, green on its candidate, and each reader read against
+  the last three releases' real artifacts (§8).
+- P6f needs no build: Windows got its private staging directory with GHSA-r3xj-4wh9-xh2v (0.4.142), and on macOS
+  the root update helper's temp directory was measured to be root's own (§3.11, §8).
 - The rest of P2–P7 is open.
 
 **Owner:** the agent on all
@@ -746,7 +750,13 @@ model on Windows, so the three agree on what the mode means.
 - **P6e, macOS supervision.** The FR-43 supervisor records a worker that dies before its own panic hook (stderr tail →
   `record_with_log_tail`); drop the launchd `StandardOutPath` duplication and the daemon's `eprintln!`s (#1538).
 - **P6f, a fresh private staging directory per download** on Windows and macOS, as Linux has had since FR-96's
-  security review.
+  security review. **Settled without a build.**
+  - *Windows* got exactly that with GHSA-r3xj-4wh9-xh2v, released in 0.4.142 (`updater.rs:1208`).
+  - *macOS* keeps its one fixed `roomlerd-update` directory, because the hazard is not there, measured on a Mac
+    (§8). The root update helper's launchd job sets no `TMPDIR`. With `TMPDIR` unset, `std::env::temp_dir()` on
+    Apple is `confstr(_CS_DARWIN_USER_TEMP_DIR)`: for root that is `/var/folders/zz/…/T/`, `drwx------ root`.
+  - Linux's #2055 needed a directory another account could create first, and this one no other account can create,
+    rename or unlink in.
 
 ### 3.12 P7 — architectures
 
@@ -808,7 +818,7 @@ model on Windows, so the three agree on what the mode means.
 | **P6c** | `service install --system` on Linux + macOS | — | vmtest | S |
 | **P6d** | `install.sh --uninstall` | — | vmtest | S |
 | **P6e** | macOS supervisor crash capture; #1538 | — | a field Mac | S |
-| **P6f** | Private staging dir on Windows + macOS | — | Win10, Win11, a Mac | S |
+| **P6f** | Private staging dir on Windows + macOS (settled: Windows by GHSA-r3xj-4wh9-xh2v, macOS measured private) | — | Win10, Win11, a Mac | S |
 | **P7a** | Linux arm64 hardware encode | the release feature set | an arm64 lab host | M |
 | **P7b** | arm64 tunnel CLI + wizard | — | an arm64 vmtest guest | S |
 | **P8** | Docs: `platform-support.md`, the user page, every §2.8 correction | — | — | M |
@@ -888,6 +898,9 @@ one depends on it.
 - [ ] **AC13 (P6):** a signed older `.deb` or `.pkg` under a newer manifest version is refused; `roomler self-update`
   updates a Linux and a macOS tunnel-only host; `service install --system` and `install.sh --uninstall` round-trip on
   vmtest; a SIGKILLed Mac worker leaves a crash record; a closed stdout no longer kills the macOS daemon.
+  *(The first clause is field-verified on P6a's candidate, §8: the hostile feed was red on 0.4.143 and refused on the
+  candidate. The `.pkg` reader was proven on a Mac against the real pkgs; it is re-checked on the release. The rest
+  is P6b–P6e.)*
 - [ ] **AC14 (P7):** an arm64 Linux host advertises a hardware cell and records AAC; the arm64 CLI and wizard
   install.
 - [ ] **AC15 (the rule):** P0d's server count of advertised capability words by OS, taken before P0 and after the
@@ -1035,3 +1048,6 @@ one depends on it.
 | 2026-10-18 | released 0.4.143: its own published binary (`3b42f578…`), run from its `.deb` and from its tarball with the libraries they bundle | throwaway containers on mars: Debian bookworm (dpkg present, so the updater picks the `.deb`) and Fedora 41 (no dpkg, so the tarball). `ROOMLERD_UPDATE_URL` named a hostile feed offering `agent-v0.4.999`: its assets were named `roomlerd-0.4.999-…`, pointed at the genuine 0.4.142 `.deb` and tarball, and carried their real digests. `roomlerd self-update --check-only` runs the whole download path and installs nothing | 🔴 **P6a red: the downgrade.** On both hosts: `installer .asc verified against the pinned release signing key`, then `no artifact-version binding available … no version binding is implemented for .deb artifacts` (`.gz` for the tarball), then `Update available: 0.4.143 -> agent-v0.4.999`. The staged file was the 0.4.142 package (`dpkg-deb --field`: `0.4.142-1`; the tarball's top directory `roomlerd-0.4.142-…`). A genuinely signed older release was accepted as 0.4.999 |
 | 2026-10-18 | the P6a candidate (`06fc71706`, a bookworm build with `full,overlay-l3,overlay-netstack,ssh-server`) | the same two hosts and the same feed | 🟢 **P6a green.** On both hosts the `.asc` still verified, and then: `refusing to install roomlerd-0.4.999-x86_64-unknown-linux-gnu.deb: offered as agent-v0.4.999 (which must carry version 0.4.999) but the artifact says it is 0.4.142-1 — the manifest and the package disagree about which release this is. The download was discarded and this agent keeps its current version.` The tarball arm said `0.4.142`, and nothing was left staged on either host. 🟢 **The kill switch** (`ROOMLERD_ARTIFACT_VERSION_CHECK=0`): `no artifact-version binding available … switched off`, and the release's behaviour came back: `Update available`, with the 0.4.142 `.deb` staged |
 | 2026-10-18 | the same candidate | the real Linux artifacts of 0.4.141, 0.4.142 and 0.4.143: x86_64 and aarch64, the `.deb` and the tarball, 12 files, read by `roomlerd artifact-version` in a Debian bookworm container | 🟢 **The readers against the last three releases.** Each file was read with its own release, a neighbour and a fabricated `0.4.999`: 12 binds (`it says 0.4.141-1` … `0.4.143`) and 24 refusals, 36 of 36 as expected. Every `.deb` says `Package: roomlerd`, `Version: 0.4.N-1`. Every tarball's first entry is a file under `roomlerd-0.4.N-<target>/`, whose top directory the reader takes. 🟢 The kill switch: `unsupported`, exit 0, for both formats. 🟢 A `.deb` with no `dpkg-deb` on the `PATH`: `unsupported`, never a refusal |
+| 2026-10-18 | the P6a candidate's `.pkg` (release-lane run 39128045510 on `9af197bb0`, `publish_release=false`), its `roomlerd` taken out of the pkg and never installed | a throwaway tart Mac on the MacBook, holding the real 0.4.141, 0.4.142 and 0.4.143 pkgs | 🟢 **The `.pkg` reader against the last three releases.** Each pkg's component `PackageInfo` says `identifier="com.roomler.agent"` and its own `version`. Read with its own release, a neighbour and `0.4.999`: 3 binds and 6 refusals, 9 of 9. 🟢 The kill switch: `unsupported`, exit 0. 🟢 No `pkgutil` expansion directory was left behind |
+| 2026-10-18 | released 0.4.143, then the same candidate pkg (which carries P5b: master after #2443) installed over it | the same VM, the root daemon, enrolled ephemeral with the overlay, the test key under `ssh_account_mode = "console_user"`; `admin` at the GUI | 🔴→🟢 **P5b, macOS.** On the release, exec said `pwd=/`, the pty `admin in /`, and `sftp`'s `pwd` was `/`, where a relative `put` failed. On the candidate, exec said `pwd=/Users/admin`, the pty `admin in /Users/admin`, and `sftp`'s `pwd` was `/Users/admin`, where a relative `put` landed owned `admin staff` and was removed again |
+| 2026-10-18 | the same candidate, as root | the same VM | **P6f measured: nothing to build on macOS.** `launchctl print system/com.roomler.update` shows no `TMPDIR` in the job's environment. Root's `getconf DARWIN_USER_TEMP_DIR` is `/var/folders/zz/…/T/`, `drwx------ root`. `dtruss -t mkdir` of the candidate run as root with `TMPDIR` unset showed `std::env::temp_dir()` creating its directory under that same root-private path, not `/tmp`. So the macOS staging directory sits where no other account can create, rename or unlink. The VM was destroyed |

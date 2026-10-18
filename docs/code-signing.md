@@ -382,7 +382,8 @@ nobody can say what it is.
 readers sit behind `ROOMLERD_ARTIFACT_VERSION_CHECK=0` (the MSI's, older and
 proven, does not), and each was read against the real artifacts of the last
 three releases before it shipped: 12 Linux artifacts × {their own release,
-a neighbour, a fabricated `0.4.999`} gave 12 binds and 24 refusals (FR-97 §8).
+a neighbour, a fabricated `0.4.999`} gave 12 binds and 24 refusals, and the
+three `.pkg`s on a Mac 3 binds and 6 refusals (FR-97 §8).
 Re-check after any change to a reader, or to how the release workflow names
 and versions its artifacts:
 
