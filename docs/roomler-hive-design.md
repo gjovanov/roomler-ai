@@ -399,12 +399,12 @@ account, so the device owner's map, not the server's list, is the last word. To 
 session started as `bob`: `"alice@example.com" = "bob"`.
 
 Spawning reuses the one privilege path the daemon has, `RunAs` + `apply_run_as`
-(`agents/roomlerd/src/exec.rs:436,491`), which exec, the PTY, sftp and the portal helper
+(`agents/roomlerd/src/exec.rs:437,492`), which exec, the PTY, sftp and the portal helper
 already share. No second spawn path.
 
 | OS | How | Consequence |
 |---|---|---|
-| Linux, macOS | `RunAs::Named(account)`: `setgroups → setgid → setuid` in `pre_exec`, verified afterwards (`exec.rs:732-764`); uid-0 accounts refused | any mapped account, signed in or not |
+| Linux, macOS | `RunAs::Named(account)`: `setgroups → setgid → setuid` in `pre_exec`, verified afterwards (`exec.rs:733-768`); uid-0 accounts refused | any mapped account, signed in or not |
 | Windows | the console user, through `WTSQueryUserToken` + `CreateProcessAsUserW` (`agents/roomlerd/src/pty/windows.rs:690-762`) | ⚠️ only the user signed in at the console (D2). There is no S4U or `LogonUser` path, and the daemon "will not ask for" credentials (`exec.rs:503-508`). Nobody signed in ⇒ `refused: no_console_user` |
 
 Two gaps in that path: it sets no working directory and only `TERM` in the environment
@@ -480,7 +480,7 @@ boundary.
 every agent mid-turn.
 
 - Linux: `hive-host` runs as a transient unit outside the daemon's cgroup
-  (`systemd-run --uid=…`, as the companion is started, `agents/roomlerd/src/companion.rs:511-551`),
+  (`systemd-run --uid=…`, as the companion is started, `agents/roomlerd/src/companion.rs:603-643`),
   so `systemctl restart roomlerd` leaves it running, and it reconnects to the daemon's
   per-uid socket.
 - macOS: `hive-host` starts in the user's bootstrap context (`launchctl asuser`, as
@@ -922,7 +922,7 @@ even under allow rules. Because that is UX, the daemon asks again where it matte
 | Need | Primitive | What decides it |
 |---|---|---|
 | a peer's port | on a TUN host, the overlay address or MagicDNS name directly; on a netstack host, `socks5h://` to the netstack front | the netstack front resolves peer names from the netmap and needs no DNS (`crates/tunnel-core/src/overlay/netstack_socks.rs:3-32`), but reaches overlay peers only — not subnets, not exits (`netstack.rs:1146-1150`) |
-| a private subnet behind a device | a session-scoped forward or SOCKS5 **through that device** (`CreateSocks5{node}` semantics) | the exit dials with its own resolver (`agents/roomlerd/src/tunnel/dialer.rs:20-52`); `tunnel_policies` authorize it (`crates/remote_control/src/models.rs:2453-2391`) and `tunnel_audit` records it |
+| a private subnet behind a device | a session-scoped forward or SOCKS5 **through that device** (`CreateSocks5{node}` semantics) | the exit dials with its own resolver (`agents/roomlerd/src/tunnel/dialer.rs:20-52`); `tunnel_policies` authorize it (`crates/remote_control/src/models.rs:2474-2412`) and `tunnel_audit` records it |
 | the internet from a chosen place (an office IP a cloud API allow-lists) | SOCKS5 through that device | ⚠️ **not** an overlay exit node — those are host-wide, primary-org only and reroute the whole machine (`docs/overlay-exit-nodes.md`) |
 
 The daemon needs three changes for this, named here so they aren't discovered in the
@@ -1526,7 +1526,7 @@ open (§18).
 | Threat | Controls |
 |---|---|
 | A session is remote code execution on a device | four gates, shaped like exec and SSH: `HIVE_RUN` (no managed role below `ADMINISTRATOR`); `role:assume` (default deny); per-(user, device) limits applied after the identity gates so a refusal is attributable; device-local `hive_enabled` with the account map and roots. Never SYSTEM/root. A consent prompt (`PromptKind::Hive`, floored by `consent::strictest_of`, `agents/roomlerd/src/consent.rs:153`) when the starter doesn't own the device |
-| A compromised server starts sessions everywhere | gate 4 belongs to the device. `hive_enabled` and `hive_replica` join `DesiredConfig` (`crates/remote_control/src/models.rs:1714`) and so can be pushed only to devices that opted into remote config; `hive_accounts`, `hive_roots` and `hive_archive` are never pushable, locked the way `the_device_owned_refusals_are_not_pushable` (`:5960`) locks `remote_config_enabled` |
+| A compromised server starts sessions everywhere | gate 4 belongs to the device. `hive_enabled` and `hive_replica` join `DesiredConfig` (`crates/remote_control/src/models.rs:1735`) and so can be pushed only to devices that opted into remote config; `hive_accounts`, `hive_roots` and `hive_archive` are never pushable, locked the way `the_device_owned_refusals_are_not_pushable` (`:5983`) locks `remote_config_enabled` |
 | A compromised server reads sessions | it holds no transcripts. It holds metadata, stubs, cards (if enabled), the brain and audit. It can mint a view grant for itself and open a viewer peer, as it could initiate remote control — the same trust in signalling RC already has, and every view grant is audited |
 | A replica's disk is stolen, or its device compromised | the store is daemon-owned and unreadable by other local users; placement policy keeps sensitive roles on tagged devices; purge tombstones; encryption at rest with per-session keys (P7). Until then a stolen disk exposes the sessions it held |
 | A viewer reads a session it shouldn't | view grants list session ids and expire; the replica checks the grant before serving; peers close on expiry |

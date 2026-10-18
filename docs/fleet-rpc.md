@@ -337,9 +337,9 @@ run the command as root:
 
 | Where | What is checked | Source |
 |---|---|---|
-| The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:925`](../crates/modules/fleet/src/agent_exec.rs#L925) |
-| Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:362`](../crates/modules/fleet/src/agent_exec.rs#L362) |
-| The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3270`](../crates/modules/fleet/src/hub.rs#L3270) |
+| The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:960`](../crates/modules/fleet/src/agent_exec.rs#L960) |
+| Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:359`](../crates/modules/fleet/src/agent_exec.rs#L359) |
+| The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3304`](../crates/modules/fleet/src/hub.rs#L3304) |
 | The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:4590`](../agents/roomlerd/src/signaling.rs#L4590) |
 
 The word is kept per connection, never read from the stored row, for the reason
@@ -415,7 +415,7 @@ Exit status mirrors the remote command's, so `roomler exec` composes in a
 script: a refusal or failure is non-zero here too, never a silent 0.
 
 The target is a device name or a hex agent id, resolved by the server within
-the caller's org (`crates/modules/fleet/src/socket.rs:1084` `resolve_exec_target`:
+the caller's org (`crates/modules/fleet/src/socket.rs:1089` `resolve_exec_target`:
 hex id → exact name → case-insensitive name). A dashboard **display name** is
 turned into the hex id by the CLI before the request leaves — only when no
 device name matches it, and refused when two devices share it

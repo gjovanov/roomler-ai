@@ -409,7 +409,7 @@ what would capture it. An exec sweep cannot answer "how many hosts are Wayland,
 and which arm serves each": a sweep reaches only the devices that are online.
 The server can, because every device says it in its hello.
 
-The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1329`),
+The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1345`),
 all strings, so a newer agent's word reaches an older server as a word:
 
 | field | values | from |
@@ -1347,9 +1347,9 @@ Two things that read as a broken capture and are not:
 
 Both portal-shaped arms spawn the helper through `spawn_child`, which resolves
 the session user with `companion::graphical_session()`
-(`agents/roomlerd/src/companion.rs:619`) — the same `loginctl` walk the FR-27
+(`agents/roomlerd/src/companion.rs:711`) — the same `loginctl` walk the FR-27
 consent companion uses. It accepts a session only when
-`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:657-658`),
+`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:750-753`),
 which is the right test for the attended portal and the wrong one for a
 headless mutter: **a WSL2 distro has only `tty` sessions**, and so does any
 box that runs `mutter --headless` from a service. The daemon then answers

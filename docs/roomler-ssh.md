@@ -339,9 +339,9 @@ Which Windows column applies is the server's decision per grant, recorded in
 The mode means what it means on Windows: the person signed in at the device's own
 screen, and nobody else. The agent finds them at each session, then takes the drop
 a `named` account takes (`unix_priv::drop_to_console`,
-[`exec.rs:1315`](../agents/roomlerd/src/exec.rs#L1315)). Exec, the pty and `sftp`
+[`exec.rs:1355`](../agents/roomlerd/src/exec.rs#L1355)). Exec, the pty and `sftp`
 all go through `apply_run_as`
-([`exec.rs:812`](../agents/roomlerd/src/exec.rs#L812)), so one rule covers all
+([`exec.rs:802`](../agents/roomlerd/src/exec.rs#L802)), so one rule covers all
 three.
 
 ```mermaid
@@ -364,7 +364,7 @@ flowchart TD
 
 | | Linux | macOS |
 |---|---|---|
-| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:713`](../agents/roomlerd/src/companion.rs#L713)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:465`](../agents/roomlerd/src/companion.rs#L465)) |
+| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:809`](../agents/roomlerd/src/companion.rs#L809)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:537`](../agents/roomlerd/src/companion.rs#L537)) |
 | Nobody, when | no logind, no `seat0`, an empty seat, a greeter (GDM's `gdm` at the login screen) | the login window (`root`), or a system account (`_mbsetupuser` during Setup Assistant) |
 | A text console counts | yes: a login on the machine's own VT is a person at its screen | not applicable |
 
@@ -385,9 +385,16 @@ flowchart TD
   inside the person's session.
 - ⚠️ **The server stores `console_user` off Windows only for an agent that
   advertises `console-user`** (`console_user_unsupported`,
-  [`agent_ssh.rs:1051`](../crates/modules/network/src/routes/agent_ssh.rs#L1051)).
+  [`agent_ssh.rs:1047`](../crates/modules/network/src/routes/agent_ssh.rs#L1047)).
   An agent rolled back since refuses the session itself, as every agent before
   P5a did, so this half fails closed either way.
+
+Field-proven 2026-10-18 on candidates (FR-97 §8). On a Linux root daemon
+(Ubuntu, GDM), a command, a pty and `sftp` ran as the person signed in on seat0,
+and were refused once GDM's greeter held the seat. A per-user daemon whose own
+account was at the screen ran them as itself. On a Mac's root daemon they ran as
+the GUI user and were refused at the login window. On the release, every one of
+them had been refused as "a Windows concept".
 
 **Both paths obey this, and it took a fix to make that true.** A grant carries
 the policy's `account_mode`. A key-list session has no policy behind it, so it
@@ -859,7 +866,7 @@ flowchart TD
 ```
 
 ⚠️ **Windows `console_user` takes `exec`'s console-user spawn** (FR-97 P4b,
-`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:875`).
+`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:902`).
 `tokio::process` cannot take a token, so the subsystem goes through
 `supervisor::spawn_in_session_captured`, the piped `CreateProcessAsUserW` spawn
 P5b built and FR-89 made streaming. Three details differ from a shell command
