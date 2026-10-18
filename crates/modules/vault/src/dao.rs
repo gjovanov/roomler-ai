@@ -14,7 +14,7 @@ use roomler_ai_services::dao::base::{BaseDao, DaoError, DaoResult, escape_regex}
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    VaultAuditEvent, VaultLease, VaultPolicy, VaultRole, VaultSecret, VaultVersion,
+    VaultActivity, VaultAuditEvent, VaultLease, VaultPolicy, VaultRole, VaultSecret, VaultVersion,
 };
 
 /// The most roles, and the most policies, an organization keeps.
@@ -563,11 +563,91 @@ impl VaultLeaseDao {
         Ok(r.modified_count > 0)
     }
 
+    /// P3-4d — whether every one of `ids` was released to this device, for
+    /// this session in this organization, in `mode` toward `audience`: the
+    /// one test a device's report of using them must pass.
+    pub async fn all_released_for(
+        &self,
+        ids: &[ObjectId],
+        tenant_id: ObjectId,
+        device_id: ObjectId,
+        session_id: ObjectId,
+        mode: &str,
+        audience: &str,
+    ) -> DaoResult<bool> {
+        let n = self
+            .base
+            .collection()
+            .count_documents(doc! {
+                "_id": { "$in": ids },
+                "tenant_id": tenant_id,
+                "device_id": device_id,
+                "session_id": session_id,
+                "mode": mode,
+                "audience": audience,
+            })
+            .await?;
+        Ok(usize::try_from(n).is_ok_and(|n| n == ids.len()))
+    }
+
     async fn collect(&self, filter: Document) -> DaoResult<Vec<VaultLease>> {
         let mut cursor = self.base.collection().find(filter).await?;
         let mut out = Vec::new();
         while let Some(l) = cursor.try_next().await? {
             out.push(l);
+        }
+        Ok(out)
+    }
+}
+
+/// FR-90 P3-4d — what devices report doing with their leases: claims, kept
+/// apart from the vault's decisions.
+pub struct VaultActivityDao {
+    pub base: BaseDao<VaultActivity>,
+}
+
+impl VaultActivityDao {
+    pub fn new(db: &Database) -> Self {
+        Self {
+            base: BaseDao::new(db, VaultActivity::COLLECTION),
+        }
+    }
+
+    pub async fn insert(&self, row: &VaultActivity) -> DaoResult<ObjectId> {
+        self.base.insert_one(row).await
+    }
+
+    /// The organization's reports, newest first, before `before` when given
+    /// (the next page); one session's, or those naming one lease, when
+    /// asked.
+    pub async fn recent(
+        &self,
+        tenant_id: ObjectId,
+        session_id: Option<ObjectId>,
+        lease_id: Option<ObjectId>,
+        before: Option<DateTime>,
+        limit: i64,
+    ) -> DaoResult<Vec<VaultActivity>> {
+        let mut filter = doc! { "tenant_id": tenant_id };
+        if let Some(s) = session_id {
+            filter.insert("session_id", s);
+        }
+        if let Some(l) = lease_id {
+            filter.insert("lease_ids", l);
+        }
+        if let Some(b) = before {
+            filter.insert("at", doc! { "$lt": b });
+        }
+        let mut cursor = self
+            .base
+            .collection()
+            .find(filter)
+            .sort(doc! { "at": -1, "_id": -1 })
+            .limit(limit)
+            .await?;
+        let mut out = Vec::new();
+        while let Some(a) = cursor.try_next().await? {
+            out.push(a);
         }
         Ok(out)
     }

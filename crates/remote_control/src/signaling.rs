@@ -1281,6 +1281,41 @@ pub enum ClientMsg {
         secret: String,
     },
 
+    /// FR-90 P3-4d — the device reports one use of leased values: a command
+    /// `vault_exec` ran, or a file `vault_render` wrote. A CLAIM, by a host
+    /// that may be compromised, so the server keeps it in `vault_activity`,
+    /// never with its own decisions in `vault_audit`, and only when every
+    /// lease it names was released to this device, for this session, in the
+    /// use's mode and toward its target.
+    ///
+    /// Fire-and-forget, like [`Self::SshActivity`]: no answer, and an older
+    /// server ignores it. Sent only while the device's own
+    /// `vault_activity_log` is on (default off).
+    ///
+    /// ⚠️ `tenant_id` / `agent_id` come from the authenticated WS, NOT from
+    /// this frame.
+    #[serde(rename = "rc:vault.activity")]
+    VaultActivity {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        /// A [`crate::vault::VaultActivityKind`] word; one this server cannot
+        /// name is dropped.
+        kind: String,
+        /// The leases whose values were used, at most
+        /// [`crate::vault::lease_limits::MAX_ACTIVITY_LEASES`].
+        lease_ids: Vec<String>,
+        /// `exec`: the program's bare name; `render`: the file's.
+        target: String,
+        /// `exec`: how the command ended; absent when it was killed, and for
+        /// a render.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        /// `exec`: the command ran past its timeout and was killed.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        timed_out: bool,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -2168,6 +2203,7 @@ impl ClientMsg {
             ClientMsg::VaultLease { .. } => "rc:vault.lease",
             ClientMsg::VaultList { .. } => "rc:vault.list",
             ClientMsg::VaultDescribe { .. } => "rc:vault.describe",
+            ClientMsg::VaultActivity { .. } => "rc:vault.activity",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -2291,7 +2327,8 @@ impl ClientMsg {
             | ClientMsg::HiveViewClosed { .. } => Owner::Hive,
             ClientMsg::VaultLease { .. }
             | ClientMsg::VaultList { .. }
-            | ClientMsg::VaultDescribe { .. } => Owner::Vault,
+            | ClientMsg::VaultDescribe { .. }
+            | ClientMsg::VaultActivity { .. } => Owner::Vault,
         }
     }
 }
@@ -2340,6 +2377,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:vault.lease", Owner::Vault),
     ("rc:vault.list", Owner::Vault),
     ("rc:vault.describe", Owner::Vault),
+    ("rc:vault.activity", Owner::Vault),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -5016,6 +5054,51 @@ mod tests {
                 "activity kind wire spelling changed"
             );
         }
+    }
+
+    /// FR-90 P3-4d — the device's report of a use, as it crosses the wire:
+    /// an exec's exit code and timeout ride only when present, so a render's
+    /// report is the smallest; it reads back the same.
+    #[test]
+    fn vault_activity_wire_shape_is_locked() {
+        let sid = ObjectId::new();
+        let exec = ClientMsg::VaultActivity {
+            session_id: sid,
+            fence: 3,
+            kind: crate::vault::VaultActivityKind::Exec.wire().into(),
+            lease_ids: vec!["L1".into(), "L2".into()],
+            target: "psql".into(),
+            exit_code: Some(2),
+            timed_out: false,
+        };
+        let v = serde_json::to_value(&exec).unwrap();
+        assert_eq!(v["t"], "rc:vault.activity");
+        assert_eq!(v["session_id"], sid.to_hex());
+        assert_eq!(v["kind"], "exec");
+        assert_eq!(v["lease_ids"], serde_json::json!(["L1", "L2"]));
+        assert_eq!(v["exit_code"], 2);
+        assert!(v.get("timed_out").is_none(), "false is left out: {v}");
+        let back: ClientMsg = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            back,
+            ClientMsg::VaultActivity {
+                exit_code: Some(2),
+                ..
+            }
+        ));
+        let render: ClientMsg = serde_json::from_value(serde_json::json!({
+            "t": "rc:vault.activity", "session_id": sid.to_hex(), "fence": 3,
+            "kind": "render", "lease_ids": ["L3"], "target": "db.env",
+        }))
+        .unwrap();
+        assert!(matches!(
+            render,
+            ClientMsg::VaultActivity {
+                exit_code: None,
+                timed_out: false,
+                ..
+            }
+        ));
     }
 
     /// FR-83 — the ack's wire shape. "Recorded" is the ABSENCE of `refused`,

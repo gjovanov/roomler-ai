@@ -18,8 +18,10 @@ People use it too.
 > by Cedar's own `secret:list` (§13); P3-4c-1, `vault_exec`, the first
 > tool that uses a value: one command run with values in its environment
 > (§14); P3-4c-2, `vault_render`: a template written with values into the
-> session's secrets directory, for as long as its leases (§15); and P3-4c-3,
-> `vault_request`: a lease asked for ahead, which a use takes (§16).** No released
+> session's secrets directory, for as long as its leases (§15); P3-4c-3,
+> `vault_request`: a lease asked for ahead, which a use takes (§16); and
+> P3-4d-1, the server's half of what a device reports doing with its leases,
+> kept apart from the decisions (§17).** No released
 > agent asks for a lease yet: no release build carries the `vault` feature.
 
 ## 1. Custody: who can read a secret
@@ -634,7 +636,7 @@ ask for: which secrets its role may use, their kinds and fields, where a value
 may be presented, and the programs it may be handed to. P3-4b answers that,
 and nothing more: a name and its rules, never a value, nor a version's number,
 nor who wrote it (`VaultSecretMeta`,
-[`vault.rs:75`](../crates/remote_control/src/vault.rs#L75)).
+[`vault.rs:87`](../crates/remote_control/src/vault.rs#L87)).
 
 ```mermaid
 sequenceDiagram
@@ -659,7 +661,7 @@ sequenceDiagram
 |---|---|---|
 | Asks for | the live secrets under a folder (`prefix`), or all of them | one secret, by its path or this organization's RRN |
 | Decided by | Cedar's `secret:list`, secret by secret; only the permitted are answered | `secret:list`, for that secret |
-| Answers | at most 200 ([`MAX_LISTED`](../crates/remote_control/src/vault.rs#L52)), with `more` when a bound left some out; never which were refused, nor how many | its metadata, or `denied` · `no_secret` |
+| Answers | at most 200 ([`MAX_LISTED`](../crates/remote_control/src/vault.rs#L57)), with `more` when a bound left some out; never which were refused, nor how many | its metadata, or `denied` · `no_secret` |
 | Recorded | one `vault_audit` row a call: op `list`, `listed N of M`, no request | one row: op `describe`, allow or deny, with the request a replay decides again |
 
 The toolbelt (FR-90 P1a, [`hive.md`](hive.md) §4) offers the two tools only
@@ -680,7 +682,7 @@ no answer, and the daemon stops waiting for it.
 >   (`more`). A narrower prefix finds the rest.
 > - **Believed exactly as a lease is**: the same identity checks in the same
 >   order, the same refusal words and the same per-session ceiling
->   ([`identify`](../crates/modules/vault/src/lease.rs#L498)), so a device that
+>   ([`identify`](../crates/modules/vault/src/lease.rs#L617)), so a device that
 >   floods the vault with listings is refused as one flooding it with leases
 >   is.
 > - **Offered and allowed together.** The daemon decides once, at a run's
@@ -692,7 +694,7 @@ no answer, and the daemon stops waiting for it.
 
 | Piece | Where |
 |---|---|
-| the frames | `rc:vault.list` · `rc:vault.describe` ([`signaling.rs:1262`](../crates/remote_control/src/signaling.rs#L1262)) and `rc:vault.listed` · `rc:vault.described` ([`:4263`](../crates/remote_control/src/signaling.rs#L4263)); refusals reuse `rc:vault.refused` |
+| the frames | `rc:vault.list` · `rc:vault.describe` ([`signaling.rs:1262`](../crates/remote_control/src/signaling.rs#L1262)) and `rc:vault.listed` · `rc:vault.described` ([`:4301`](../crates/remote_control/src/signaling.rs#L4301)); refusals reuse `rc:vault.refused` |
 | the decisions | `list` and `describe` ([`meta.rs:106`](../crates/modules/vault/src/meta.rs#L106)); `secret:list` in [`policy.cedarschema`](../crates/modules/vault/src/policy.cedarschema) and `Ask::ListSecret` ([`policy.rs:358`](../crates/modules/vault/src/policy.rs#L358)) |
 | the daemon's asks | `Client::list` and `Client::describe` ([`vault.rs:363`](../agents/roomlerd/src/vault.rs#L363)) |
 | the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:779`](../agents/roomlerd/src/hive/toolbelt.rs#L779)), answered by `vault_tool` ([`toolbelt.rs:889`](../agents/roomlerd/src/hive/toolbelt.rs#L889)) |
@@ -738,7 +740,7 @@ every `exec` lease whose audience is not on the secret's `exec_allow`. The
 `simulate` names it, it is recorded with its request, and no organization can
 drop it. A request recorded before the attribute existed reads back naming no
 program. `exec_allow` holds bare names only
-([`program_name_ok`](../crates/remote_control/src/vault.rs#L63), the one
+([`program_name_ok`](../crates/remote_control/src/vault.rs#L75), the one
 definition the vault's write check
 ([`routes.rs:375`](../crates/modules/vault/src/routes.rs#L375)) and the
 device share): a path could match nothing a device asks for.
@@ -879,7 +881,49 @@ sequenceDiagram
 | the tool | `vault_request` in [`toolbelt.rs:864`](../agents/roomlerd/src/hive/toolbelt.rs#L864), offered with the reads, allowed in the settings with them ([`VAULT_AHEAD_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L378)) |
 | finding the lease | `Client::find_ahead` ([`vault.rs:535`](../agents/roomlerd/src/vault.rs#L535)); how long one has left, `Client::left` ([`vault.rs:556`](../agents/roomlerd/src/vault.rs#L556)) |
 
-## 17. Audit
+## 17. What a device reports doing: `vault_activity` (P3-4d)
+
+The vault's own decisions are in `vault_audit` (§18). What a device says it
+DID with its leases is a different claim, made by a host that may be
+compromised, so it is kept apart in `vault_activity`, as `ssh_activity` is
+kept apart from `ssh_audit` ([`roomler-ssh.md`](roomler-ssh.md)). P3-4d-1
+builds the server's half: the frame, the check, the collection and the read.
+The device's half, its owner's `vault_activity_log` switch and the reports
+themselves, is P3-4d-2.
+
+```mermaid
+sequenceDiagram
+    participant D as device (roomlerd)
+    participant V as vault
+    participant A as an administrator
+    D->>V: rc:vault.activity {session_id, fence, kind: exec, lease_ids, target: "psql", exit_code}
+    Note over V: fire-and-forget: no answer, on the connection's own queue
+    V->>V: each lease released to THIS device, for this session,<br/>in the use's mode, toward its target?
+    alt every one
+        V->>V: kept in vault_activity, never vault_audit
+    else any other
+        V->>V: dropped, at debug
+    end
+    A->>V: GET …/vault/activity ?session_id= · ?lease_id=
+    V-->>A: the reports, newest first
+```
+
+| Step | What holds | Where |
+|---|---|---|
+| the frame | `rc:vault.activity {session_id, fence, kind, lease_ids, target, exit_code?, timed_out?}`. `kind` is `exec` (a command `vault_exec` ran: the program as the target, and how it ended) or `render` (a file `vault_render` wrote: its name as the target); 1 to 8 leases. Fire-and-forget, like `rc:ssh.activity`: no answer, and an older server ignores it | [`signaling.rs:1297`](../crates/remote_control/src/signaling.rs#L1297), [`vault.rs:265`](../crates/remote_control/src/vault.rs#L265) |
+| the queue | the connection's own lease queue: a flood is dropped at its bound like a flood of requests, and each connection's reports are handled in order. At most 120 a minute per session on its device | [`lease.rs:336`](../crates/modules/vault/src/lease.rs#L336) |
+| the check | every lease the report names was released to this device, for this session in this organization, in the use's mode (`exec` for `exec`, `file` for `render`) and toward its target. Otherwise, or for a kind this server cannot name or a target that is not a bare name, the report is dropped | [`lease.rs:359`](../crates/modules/vault/src/lease.rs#L359), [`dao.rs:569`](../crates/modules/vault/src/dao.rs#L569) |
+| the row | the device from the socket, the session, the kind, the leases, the target, and for a command its exit code and whether it timed out (never kept for a file), with when it arrived. 90 days | [`model.rs:291`](../crates/modules/vault/src/model.rs#L291), [`lib.rs:309`](../crates/modules/vault/src/lib.rs#L309) |
+| the read | `GET …/vault/activity`, administrators only, newest first: `?session_id=` for one session's, `?lease_id=` for those naming one lease, which is where a use joins its decision | [`routes.rs:1035`](../crates/modules/vault/src/routes.rs#L1035) |
+
+> [!WARNING]
+> - **A claim, not a decision.** A compromised device can report a use that
+>   never happened, or leave one out. The lease's decision in `vault_audit` is
+>   what survives a device that lies or goes quiet.
+> - **An empty answer is not evidence of disuse.** A device reports only while
+>   its owner's `vault_activity_log` is on, and that defaults off (P3-4d-2).
+
+## 18. Audit
 
 `vault_audit` holds every `secret:*` and `vault:verify` decision, allow and
 deny. Each row has the principal (`user` in P3-1), the action as a policy
@@ -916,10 +960,10 @@ Rows expire after
 - A request refused for its content (400, 422) or for want of a KEK (503) acts
   on nothing, so it records no allow.
 - A device's own report of using a value is a different claim, made by a host
-  that may be compromised. From P3-4d it goes to `vault_activity`, never here,
-  as `ssh_audit` and `ssh_activity` are kept apart.
+  that may be compromised. It goes to `vault_activity` (§17), never here, as
+  `ssh_audit` and `ssh_activity` are kept apart.
 
-## 18. Collections
+## 19. Collections
 
 | Collection | One row per | Indexes | Retention |
 |---|---|---|---|
@@ -929,6 +973,7 @@ Rows expire after
 | `vault_roles` | vault role (P3-2a) | unique `(tenant_id, name)` over live rows | tombstoned, kept |
 | `vault_policies` | policy (P3-2a): one Cedar statement, its effect, a revision | unique `(tenant_id, name)` over live rows; `(tenant_id, deleted_at, created_at)` | tombstoned, kept |
 | `vault_leases` | value released (P3-3b): the secret, field and version; the session, its fence, its owner and its device; the key it was sealed to (`sealed_to`); the mode and audience; issued and expiry times; `revoked_at`/`revoked_why` from P3-3c (§11). Never the value | `(tenant_id, session_id)`; P3-3c `(device_id, expires_at)` (a pod's checks, a hello) and `(secret_id, expires_at)` (a change to a secret) | a week past `expires_at` (TTL); the decision stays in `vault_audit` for 90 days |
+| `vault_activity` | a device's report of a use (P3-4d, §17): the device, the session and its fence, the kind (`exec` · `render`), the leases, the target, an exec's exit code and timeout. A claim, never a decision | `(tenant_id, at desc)`, `(tenant_id, session_id, at desc)`, `(lease_ids)` | 90 days (TTL on `at`) |
 
 P3-3a adds no collection: a device's key is a field on fleet's `agents` row
 (`vault_key`, §9). Neither do P3-4a to P3-4c-3: a lease the daemon holds,
@@ -936,11 +981,11 @@ asked for ahead or not, lives in its memory (§12, §16), a listing is a
 decision recorded in `vault_audit`, and a rendered file is on the device, for
 its lease (§15).
 
-## 19. What comes next
+## 20. What comes next
 
 | Step | Builds |
 |---|---|
-| P3-4d | `vault_activity`: the device's own report of using a value, a claim kept apart from `vault_audit` |
+| P3-4d-2 | the device's half of `vault_activity`: its owner's `vault_activity_log` switch (default off, never pushable), and a report after each `vault_exec` and `vault_render` |
 | P3-4e | the approval card a policy can ask for |
 | P3-5 to P3-9 | `proxy` mode, `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |

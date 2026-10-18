@@ -276,6 +276,45 @@ impl VaultLease {
     pub const COLLECTION: &'static str = "vault_leases";
 }
 
+/// FR-90 P3-4d — one use of leased values a device REPORTS
+/// (`rc:vault.activity`): a command `vault_exec` ran, or a file
+/// `vault_render` wrote.
+///
+/// ⚠️ A CLAIM, by a host that may be compromised: hence its own collection,
+/// apart from [`VaultAuditEvent`], the server's own decisions, as
+/// `ssh_activity` is kept apart from `ssh_audit`. Join them on the leases.
+///
+/// ⚠️ An empty result is not evidence of disuse: the device's own
+/// `vault_activity_log` defaults off, and a device that never opted in looks
+/// exactly like one nobody used.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VaultActivity {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub device_id: ObjectId,
+    pub session_id: ObjectId,
+    pub fence: i64,
+    /// `exec` | `render`.
+    pub kind: String,
+    /// The leases whose values were used: each one released to this device,
+    /// for this session, in the use's mode and toward its target.
+    pub lease_ids: Vec<ObjectId>,
+    /// `exec`: the program's bare name; `render`: the file's.
+    pub target: String,
+    /// `exec`: how the command ended; absent when it was killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub timed_out: bool,
+    /// When the server received it.
+    pub at: DateTime,
+}
+
+impl VaultActivity {
+    pub const COLLECTION: &'static str = "vault_activity";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
