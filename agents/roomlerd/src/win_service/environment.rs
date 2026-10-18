@@ -346,6 +346,32 @@ pub fn start_service(timeout: Duration) -> Result<()> {
     Ok(())
 }
 
+/// FR-97 P4d — stop the service if it is running, and wait for `STOPPED`. The
+/// `--as-service` half of `roomlerd service stop`, and the same Stop `sc stop`
+/// sends: the host asks its worker to leave through the #1683 stop event, so
+/// an ephemeral device unenrolls. Needs `SERVICE_STOP` on the service, i.e.
+/// elevation on a stock install. A service already stopped is left alone and
+/// reported as success.
+pub fn stop_service(timeout: Duration) -> Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("ServiceManager::local_computer(CONNECT)")?;
+    let service = manager
+        .open_service(
+            resolved_service_name(),
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
+        )
+        .with_context(|| format!("open_service({})", resolved_service_name()))?;
+    let status = service.query_status().context("query_status before stop")?;
+    if status.current_state == ServiceState::Stopped {
+        return Ok(());
+    }
+    if status.current_state != ServiceState::StopPending {
+        let _ = service.stop().context("service.stop()")?;
+    }
+    wait_for_state(&service, ServiceState::Stopped, timeout).context("waiting for STOPPED")?;
+    Ok(())
+}
+
 fn wait_for_state(
     service: &windows_service::service::Service,
     target: ServiceState,

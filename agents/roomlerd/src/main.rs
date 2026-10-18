@@ -940,6 +940,19 @@ enum ServiceAction {
         #[arg(long)]
         as_service: bool,
     },
+    /// Stop the running daemon NOW, cleanly, so a clean stop's work runs and
+    /// an ephemeral device removes itself. On Windows the per-user daemon of
+    /// this config is asked through its own stop event, and its Scheduled Task
+    /// is ended (`schtasks /End`) only if it does not leave in time or holds no
+    /// event; on Linux, `systemctl --user stop` the unit. macOS refuses:
+    /// launchd restarts a stopped LaunchAgent (FR-97 P4d).
+    Stop {
+        /// Windows-only: stop the `Roomler` SCM service instead (and wait for
+        /// STOPPED). Its host asks the worker to leave (#1683). Requires
+        /// elevation on a stock install.
+        #[arg(long)]
+        as_service: bool,
+    },
 }
 
 /// rc.52: pure config-path precedence ladder. `exists` is injected so
@@ -2985,12 +2998,16 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
 /// event and hands this worker as `--stop-event <name>` (#1683). When that
 /// `stop_event` is set, this waits on the event; when it fires, the OS-initiated
 /// arm runs and an ephemeral device self-unenrolls, exactly as a Unix SIGTERM
-/// makes it. Without a name (a hand-run `roomlerd run`, any non-service host),
-/// it never resolves there — as before.
-async fn terminate_signal(stop_event: Option<&str>) {
+/// makes it. Without a name (the per-user Scheduled Task install, or a hand-run
+/// `roomlerd run`) it waits on the process's own per-user event, keyed by
+/// `config_path`, which `roomlerd service stop` signals, and on Windows ending
+/// the session, which a hidden window hears (FR-97 P4d). Before P4d it never
+/// resolved there: `schtasks /End` and the session's end killed such a daemon
+/// without a word.
+async fn terminate_signal(stop_event: Option<&str>, config_path: &Path) {
     #[cfg(unix)]
     {
-        let _ = stop_event;
+        let _ = (stop_event, config_path);
         use tokio::signal::unix::{SignalKind, signal};
         match signal(SignalKind::terminate()) {
             Ok(mut sigterm) => {
@@ -3041,12 +3058,34 @@ async fn terminate_signal(stop_event: Option<&str>) {
                     }
                 }
             }
-            None => std::future::pending::<()>().await,
+            // FR-97 P4d — no service host: a per-user daemon (the Scheduled
+            // Task install, or a hand-run `run`) holds its own event, keyed by
+            // its config, which `roomlerd service stop` signals; and a hidden
+            // window turns Windows ending the session (sign-out, shutdown) into
+            // the same stop. Same arm, and so the same ephemeral self-unenroll,
+            // as the SCM host's event; before P4d nothing but `schtasks /End`
+            // or the session's end stopped such a daemon, and neither told it.
+            None => {
+                use roomlerd::win_service::{session_end, stop_event};
+                session_end::watch();
+                let channel =
+                    stop_event::user_stop_channel(&instance_lock::instance_id(config_path));
+                match stop_event::wait_for_user_stop(channel, session_end::ending).await {
+                    stop_event::UserStop::Asked => {
+                        tracing::info!(
+                            "`roomlerd service stop` asked this per-user daemon to stop"
+                        );
+                    }
+                    stop_event::UserStop::SessionEnd(kind) => {
+                        tracing::info!(?kind, "Windows is ending the session");
+                    }
+                }
+            }
         }
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = stop_event;
+        let _ = (stop_event, config_path);
         std::future::pending::<()>().await;
     }
 }
@@ -4756,7 +4795,7 @@ async fn run_cmd(
         // Being asked to stop is not failing to run. See `terminate_signal`
         // for what this cost before it existed (#1040 on Unix; #1683 on the
         // Windows SCM service, where the stop arrived only as a hard kill).
-        _ = terminate_signal(stop_event) => {
+        _ = terminate_signal(stop_event, config_path) => {
             // Under systemd the same stop reaches every harness a moment
             // after this (`KillMode=control-group`).
             #[cfg(hive_host)]
@@ -4855,6 +4894,11 @@ async fn run_cmd(
             }
         }
     }
+    // FR-97 P4d — what the session-end window holds `WM_ENDSESSION` for: past
+    // this line the clean stop, and an ephemeral device's unenroll, are done,
+    // and Windows may end the process.
+    #[cfg(target_os = "windows")]
+    roomlerd::win_service::session_end::clean_stop_done();
     // FR-84 D3 — leave with the code the supervisor relaunches on, now that
     // the clean shutdown is on disk. Only through the graceful door (a
     // requested restart is always our own internal shutdown), and never
@@ -4913,6 +4957,12 @@ async fn service_cmd(action: ServiceAction, config_path: &PathBuf) -> Result<()>
         ServiceAction::Uninstall { as_service: true } => service_uninstall_as_service(),
         ServiceAction::Status { as_service: true } => service_status_as_service(),
         ServiceAction::Start { as_service: true } => service_start_as_service(),
+        ServiceAction::Stop { as_service: false } => {
+            let how = service::stop(config_path).context("stopping the daemon")?;
+            println!("{how}");
+            Ok(())
+        }
+        ServiceAction::Stop { as_service: true } => service_stop_as_service(),
     }
 }
 
@@ -4927,6 +4977,22 @@ fn service_start_as_service() -> Result<()> {
 #[cfg(not(target_os = "windows"))]
 fn service_start_as_service() -> Result<()> {
     bail!("`service start --as-service` is Windows-only.");
+}
+
+/// FR-97 P4d — stop the SCM service and wait for STOPPED. The host asks its
+/// worker to leave through the #1683 stop event, so an ephemeral device
+/// unenrolls, as with `sc stop`.
+#[cfg(target_os = "windows")]
+fn service_stop_as_service() -> Result<()> {
+    win_service::environment::stop_service(std::time::Duration::from_secs(30))
+        .context("stopping the Roomler service")?;
+    println!("{}: stopped", win_service::NEW_SERVICE_NAME);
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn service_stop_as_service() -> Result<()> {
+    bail!("`service stop --as-service` is Windows-only.");
 }
 
 #[cfg(target_os = "windows")]

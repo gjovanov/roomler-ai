@@ -317,6 +317,48 @@ pub fn start() -> Result<()> {
     }
 }
 
+/// FR-97 P4d — stop the running daemon of the config at `config_path` now,
+/// cleanly, so a clean stop's work runs: an ephemeral device unenrolls itself.
+/// Returns what happened, in words.
+///
+/// - Windows: the per-user daemon is asked through its own stop event, and its
+///   task is ended (`TerminateProcess`) only if it does not leave in time.
+/// - Linux: `systemctl --user stop`, a SIGTERM, which the daemon already turns
+///   into a clean stop. A system install's unit is root's, so that one is named
+///   rather than stopped.
+/// - macOS: refused with the reason. launchd's KeepAlive restarts a stopped
+///   LaunchAgent, so "stop" there is `service uninstall`.
+pub fn stop(config_path: &Path) -> Result<String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::stop(config_path)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if Install::detect(config_path) == Install::LinuxSystem {
+            bail!(
+                "this daemon is the system service, which runs as root: `sudo systemctl stop \
+                 roomlerd` stops it the same way, with a SIGTERM"
+            );
+        }
+        linux::stop()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = config_path;
+        bail!(
+            "launchd restarts a stopped LaunchAgent (KeepAlive), so there is no stop to ask for: \
+             `roomlerd service uninstall` unloads it, and a clean stop there unenrolls an \
+             ephemeral device"
+        )
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = config_path;
+        bail!("auto-start is not supported on this platform")
+    }
+}
+
 /// FR-93 P5 (#2144) — at start, a per-user Linux daemon whose unit file wants it
 /// by `graphical-session.target` as well, while only `default.target` links to
 /// it (it was enabled before that target joined the unit's `[Install]`), enables
@@ -496,6 +538,115 @@ mod windows {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(
                 "schtasks /Run /TN {name} failed ({}): {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// FR-97 P4d — how long a per-user daemon gets to leave after being
+    /// asked: the SCM host's budget for its worker is 8 s, and this stop has
+    /// the same work to do (an ephemeral device's unenroll among it), with
+    /// margin.
+    const USER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+    /// FR-97 P4d — ask the per-user daemon of `config_path` to leave through
+    /// its own stop event (`win_service::stop_event`), wait for it to go, and
+    /// only then end the task, which is a `TerminateProcess`. A daemon from
+    /// before P4d holds no event, so it gets the hard stop it always got.
+    pub fn stop(config_path: &Path) -> Result<String> {
+        use crate::win_service::stop_event::{
+            signal_user_stop, user_stop_event_held, user_stop_event_name,
+        };
+        let name = user_stop_event_name(&crate::instance_lock::instance_id(config_path));
+        match signal_user_stop(&name) {
+            Ok(true) => {
+                let asked = std::time::Instant::now();
+                while asked.elapsed() < USER_STOP_GRACE {
+                    if !user_stop_event_held(&name) {
+                        return Ok(format!(
+                            "The daemon stopped cleanly in {:.1} s.",
+                            asked.elapsed().as_secs_f32()
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                end_task().with_context(|| {
+                    format!(
+                        "the daemon was asked to stop and had not left {} s later",
+                        USER_STOP_GRACE.as_secs()
+                    )
+                })?;
+                Ok(format!(
+                    "The daemon had not stopped {} s after it was asked; ended its task \
+                     (schtasks /End), a hard stop.",
+                    USER_STOP_GRACE.as_secs()
+                ))
+            }
+            Ok(false) => {
+                end_task().context("no daemon for this config holds a stop event")?;
+                if own_session() == Some(0) {
+                    // An SSH login is session 0 too: the event lives in the
+                    // person's session, which this one cannot see into.
+                    return Ok(
+                        "This command runs in session 0 (a service or an SSH login), \
+                               where a per-user daemon's stop event cannot be seen, so it \
+                               ended the task (schtasks /End), a hard stop. For a clean \
+                               stop, run `roomlerd service stop` in the person's own session."
+                            .into(),
+                    );
+                }
+                Ok(
+                    "No daemon for this config holds a stop event: none is running, or it is \
+                     from before this command could ask one to leave. Ended the task \
+                     (schtasks /End), a hard stop."
+                        .into(),
+                )
+            }
+            Err(e) => {
+                end_task().with_context(|| format!("could not ask the daemon to stop ({e})"))?;
+                Ok(format!(
+                    "Could not ask the daemon to stop ({e}); ended its task (schtasks /End), a \
+                     hard stop."
+                ))
+            }
+        }
+    }
+
+    /// The Terminal Services session this process runs in. 0 is the services
+    /// session, where an SSH login lands as well.
+    fn own_session() -> Option<u32> {
+        use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+        use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+        let mut session = 0u32;
+        // SAFETY: `session` is a valid out-pointer for the call, and the id is
+        // this process's own.
+        let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+        (ok != 0).then_some(session)
+    }
+
+    /// `schtasks /End` the registered task: a hard stop.
+    fn end_task() -> Result<()> {
+        let name = if task_exists(NEW_TASK_NAME) {
+            NEW_TASK_NAME
+        } else if task_exists(LEGACY_TASK_NAME) {
+            LEGACY_TASK_NAME
+        } else {
+            bail!(
+                "no per-user auto-start task is registered, so there is no task to end. A \
+                 device that runs as the Roomler service stops with `roomlerd service stop \
+                 --as-service`, elevated"
+            );
+        };
+        let output = schtasks()
+            .args(["/End", "/TN", name])
+            .output()
+            .context("running schtasks /End")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "schtasks /End /TN {name} failed ({}): {}",
                 output.status,
                 stderr.trim()
             );
@@ -885,6 +1036,16 @@ mod linux {
     /// still on the legacy unit starts that one). systemd spawns the daemon.
     pub fn start() -> Result<()> {
         systemctl(&["--user", "start", resolved_unit()])
+    }
+
+    /// FR-97 P4d — stop the per-user unit now: systemd sends SIGTERM, which
+    /// the daemon turns into a clean stop (an ephemeral device unenrolls).
+    pub fn stop() -> Result<String> {
+        systemctl(&["--user", "stop", resolved_unit()])?;
+        Ok(format!(
+            "systemd stopped {} (SIGTERM, a clean stop).",
+            resolved_unit()
+        ))
     }
 
     /// FR-93 P5 (#2144) — the target that has to START the unit after a

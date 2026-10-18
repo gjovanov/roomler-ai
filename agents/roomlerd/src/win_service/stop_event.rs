@@ -72,11 +72,13 @@
 
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, GetLastError, HANDLE, LocalFree,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
@@ -316,6 +318,206 @@ pub async fn wait_for_stop_event(name: &str) -> io::Result<()> {
     }
 }
 
+// ── FR-97 P4d — a per-user daemon's own stop channel ──────────────────────
+
+/// FR-97 P4d — the stop event a per-user daemon (the Scheduled Task install, or
+/// a hand-run `roomlerd run`) creates for itself, named by the instance id of
+/// its config ([`crate::instance_lock::instance_id`]). No service host stands
+/// between such a daemon and `schtasks /End`, which is a `TerminateProcess`:
+/// before P4d an ephemeral device installed that way never self-unenrolled on a
+/// stop, which an SCM install has done since #1683.
+///
+/// `Local\`: the user's own session namespace, where the task runs (an
+/// interactive token) and where the same user's `roomlerd service stop` looks.
+/// Another session cannot even see it. Default security, which is the creating
+/// token's default DACL (this user and SYSTEM): the person who owns the daemon
+/// can stop it, which Task Manager already lets them do, and no other principal
+/// gains anything. Keyed by the config, as the single-instance lock is: one
+/// person may run two daemons on two configs, and `service stop` must reach the
+/// one its own config names.
+pub const USER_STOP_EVENT_PREFIX: &str = "Local\\roomler-user-stop-";
+
+/// The per-user stop event's name for the daemon of `instance_id`.
+pub fn user_stop_event_name(instance_id: &str) -> String {
+    format!("{USER_STOP_EVENT_PREFIX}{instance_id}")
+}
+
+/// `EVENT_MODIFY_STATE` — what `service stop` asks for: enough to signal.
+const EVENT_MODIFY_STATE: u32 = 0x0002;
+
+/// The event, as the daemon holds it.
+struct UserStopEvent {
+    handle: EventHandle,
+}
+
+// SAFETY: the handle is a process-wide kernel-object reference with no thread
+// affinity, and `WaitForSingleObject` on it is thread-safe; the event lives in
+// a `static`, so it must be shareable.
+unsafe impl Sync for UserStopEvent {}
+
+impl UserStopEvent {
+    /// Create the event, manual-reset and unsignaled. `Err(AlreadyExists)`
+    /// when another live process holds the name: an instance of this config
+    /// still on its way out, whose event may already be signaled. Taking it
+    /// would stop this daemon the moment it starts.
+    fn create(name: &str) -> io::Result<Self> {
+        let name_w = to_wide(name);
+        // SAFETY: a null SECURITY_ATTRIBUTES is the documented "default
+        // security"; `name_w` is NUL-terminated. Manual-reset (1), unsignaled (0).
+        let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, name_w.as_ptr()) };
+        // SAFETY: GetLastError is a thread-local read.
+        let err = unsafe { GetLastError() };
+        if handle.is_null() {
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+        if err == ERROR_ALREADY_EXISTS {
+            // SAFETY: `handle` is the valid handle CreateEventW just returned.
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{name} is held by another process"),
+            ));
+        }
+        Ok(Self {
+            handle: EventHandle(handle),
+        })
+    }
+
+    fn is_signaled(&self) -> io::Result<bool> {
+        // SAFETY: the creator's handle carries full access; a zero timeout
+        // returns at once.
+        match unsafe { WaitForSingleObject(self.handle.0, 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+}
+
+/// What ended a per-user daemon's wait for a stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserStop {
+    /// `roomlerd service stop` signaled the event.
+    Asked,
+    /// Windows is ending the session ([`super::session_end`]).
+    SessionEnd(super::session_end::SessionEnd),
+}
+
+/// A per-user daemon's stop channel: the event's name, and the event once this
+/// process holds it. Held, never dropped, until the process exits: `service
+/// stop` reads the event's disappearance as the daemon's exit
+/// ([`user_stop_event_held`]), so the handle must outlive the shutdown that
+/// follows the signal (an ephemeral device's unenroll among it).
+pub struct UserStopChannel {
+    name: String,
+    held: OnceLock<UserStopEvent>,
+}
+
+impl UserStopChannel {
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            held: OnceLock::new(),
+        }
+    }
+
+    /// The event, created on the first try that succeeds. While another
+    /// instance of this config still holds the name, `Err(AlreadyExists)`, and
+    /// the caller tries again on its next poll: so a daemon started while the
+    /// one before it is leaving gets its channel the moment the name is free.
+    fn event(&self) -> io::Result<&UserStopEvent> {
+        if let Some(ev) = self.held.get() {
+            return Ok(ev);
+        }
+        let ev = UserStopEvent::create(&self.name)?;
+        Ok(self.held.get_or_init(|| ev))
+    }
+}
+
+/// The daemon's channel: one per process, named by the config `run` started
+/// with.
+pub fn user_stop_channel(instance_id: &str) -> &'static UserStopChannel {
+    static CHANNEL: OnceLock<UserStopChannel> = OnceLock::new();
+    CHANNEL.get_or_init(|| UserStopChannel::new(user_stop_event_name(instance_id)))
+}
+
+/// Daemon side: resolve when `roomlerd service stop` signals the channel's
+/// event, or when `ending` reports Windows ending the session. It polls, as
+/// [`wait_for_stop_event`] does and for the same reason. An event that cannot
+/// be had or probed is never read as a stop: the wait says so once, keeps
+/// watching for the session's end, and tries the event again on each poll.
+pub async fn wait_for_user_stop(
+    channel: &UserStopChannel,
+    ending: impl Fn() -> Option<super::session_end::SessionEnd>,
+) -> UserStop {
+    let mut missing = false;
+    loop {
+        if let Some(kind) = ending() {
+            return UserStop::SessionEnd(kind);
+        }
+        match channel.event().and_then(UserStopEvent::is_signaled) {
+            Ok(true) => return UserStop::Asked,
+            Ok(false) => {
+                if missing {
+                    missing = false;
+                    tracing::info!(name = %channel.name, "per-user stop event held now");
+                }
+            }
+            Err(e) => {
+                if !missing {
+                    missing = true;
+                    tracing::warn!(
+                        error = %e,
+                        name = %channel.name,
+                        "no per-user stop event yet: until there is one, `roomlerd service stop` \
+                         ends this daemon with schtasks /End (retrying)"
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(STOP_EVENT_POLL).await;
+    }
+}
+
+/// The `roomlerd service stop` side: ask the per-user daemon whose event is
+/// `name` to leave. `Ok(false)` when no daemon holds it: none is running, or it
+/// is from before P4d.
+pub fn signal_user_stop(name: &str) -> io::Result<bool> {
+    let name_w = to_wide(name);
+    // SAFETY: `name_w` is NUL-terminated; we ask for EVENT_MODIFY_STATE only.
+    let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name_w.as_ptr()) };
+    if handle.is_null() {
+        // SAFETY: GetLastError is a thread-local read.
+        let err = unsafe { GetLastError() };
+        if err == ERROR_FILE_NOT_FOUND {
+            return Ok(false);
+        }
+        return Err(io::Error::from_raw_os_error(err as i32));
+    }
+    let h = EventHandle(handle);
+    // SAFETY: `h.0` is the handle just opened with EVENT_MODIFY_STATE.
+    if unsafe { SetEvent(h.0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(true)
+}
+
+/// Whether a per-user daemon still holds the event `name`. The event lives
+/// exactly as long as some process holds a handle, and only the daemon keeps
+/// one, until it exits: so the event's disappearance is the daemon's exit.
+pub fn user_stop_event_held(name: &str) -> bool {
+    let name_w = to_wide(name);
+    // SAFETY: `name_w` is NUL-terminated; SYNCHRONIZE is enough to open it.
+    let handle = unsafe { OpenEventW(SYNCHRONIZE, 0, name_w.as_ptr()) };
+    if handle.is_null() {
+        return false;
+    }
+    drop(EventHandle(handle));
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +607,186 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(700), wait_for_stop_event(ev.name())).await
         });
         assert!(r.is_err(), "an unsignaled event must not resolve: {r:?}");
+    }
+
+    /// FR-97 P4d — a name of the test's own. Never the real one: signalling
+    /// that would stop a per-user daemon running on this machine.
+    fn user_test_name() -> String {
+        format!(
+            "Local\\roomler-user-stop-test-{}-{}",
+            std::process::id(),
+            SPAWN_SEQ.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// The per-user channel end to end: `service stop` finds nothing to signal
+    /// without a daemon, signals one that holds the event, and reads the
+    /// event's disappearance as the daemon's exit.
+    #[test]
+    fn a_service_stop_signals_the_per_user_daemon_and_sees_it_go() {
+        let name = user_test_name();
+        assert!(!user_stop_event_held(&name), "nothing holds a fresh name");
+        assert!(
+            !signal_user_stop(&name).expect("probe"),
+            "no daemon: nothing to signal"
+        );
+        let ev = UserStopEvent::create(&name).expect("create");
+        assert!(
+            user_stop_event_held(&name),
+            "a running daemon holds its event"
+        );
+        assert!(
+            !ev.is_signaled().expect("probe"),
+            "a fresh event is unsignaled"
+        );
+        assert!(
+            signal_user_stop(&name).expect("signal"),
+            "a running daemon is signalled"
+        );
+        assert!(ev.is_signaled().expect("probe"), "the daemon sees the stop");
+        drop(ev);
+        assert!(
+            !user_stop_event_held(&name),
+            "the daemon's exit is the event's disappearance"
+        );
+    }
+
+    /// A daemon starting while the one before it is still leaving must not
+    /// take that one's event, which `service stop` has already signalled: it
+    /// would stop the moment it starts.
+    #[test]
+    fn a_new_daemon_never_takes_a_name_still_held() {
+        let name = user_test_name();
+        let leaving = UserStopEvent::create(&name).expect("create");
+        assert!(signal_user_stop(&name).expect("signal"));
+        let starting = UserStopEvent::create(&name);
+        assert_eq!(
+            starting.err().map(|e| e.kind()),
+            Some(io::ErrorKind::AlreadyExists)
+        );
+        drop(leaving);
+        let after = UserStopEvent::create(&name).expect("free once the old one is gone");
+        assert!(
+            !after.is_signaled().expect("probe"),
+            "a name freed by the old daemon starts unsignaled"
+        );
+    }
+
+    fn never_ending() -> Option<super::super::session_end::SessionEnd> {
+        None
+    }
+
+    /// The daemon's wait resolves on the signal, and not before it.
+    #[test]
+    fn the_per_user_wait_resolves_on_the_signal() {
+        let name = user_test_name();
+        let channel = UserStopChannel::new(name.clone());
+        let rt = current_thread_rt();
+        let early = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(600),
+                wait_for_user_stop(&channel, never_ending),
+            )
+            .await
+        });
+        assert!(
+            early.is_err(),
+            "an unsignaled event must not resolve: {early:?}"
+        );
+        assert!(
+            user_stop_event_held(&name),
+            "the wait took the event, and it outlives the wait"
+        );
+        let n2 = name.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = signal_user_stop(&n2);
+        });
+        let r = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                wait_for_user_stop(&channel, never_ending),
+            )
+            .await
+        });
+        assert_eq!(
+            r.ok(),
+            Some(UserStop::Asked),
+            "the wait must resolve on the signal"
+        );
+    }
+
+    /// A session end resolves the wait too, with nothing signaled.
+    #[test]
+    fn the_per_user_wait_resolves_when_the_session_ends() {
+        use super::super::session_end::SessionEnd;
+        let channel = UserStopChannel::new(user_test_name());
+        let ends = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = {
+            let ends = ends.clone();
+            move || ends.load(Ordering::Acquire).then_some(SessionEnd::Shutdown)
+        };
+        let flip = ends.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            flip.store(true, Ordering::Release);
+        });
+        let rt = current_thread_rt();
+        let r = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), wait_for_user_stop(&channel, probe)).await
+        });
+        assert_eq!(r.ok(), Some(UserStop::SessionEnd(SessionEnd::Shutdown)));
+    }
+
+    /// A daemon started while the one before it is leaving: it never takes
+    /// the old, already-signaled event, so it does not stop on that signal,
+    /// and it takes the name once the old one is gone, so `service stop`
+    /// reaches it after all.
+    #[test]
+    fn a_daemon_started_while_the_last_one_leaves_gets_the_name_once_it_is_free() {
+        let name = user_test_name();
+        let leaving = UserStopEvent::create(&name).expect("create");
+        assert!(signal_user_stop(&name).expect("signal the leaving daemon"));
+        let channel = UserStopChannel::new(name.clone());
+        let rt = current_thread_rt();
+        let r = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(800),
+                wait_for_user_stop(&channel, never_ending),
+            )
+            .await
+        });
+        assert!(
+            r.is_err(),
+            "the old daemon's signal must not stop the new one: {r:?}"
+        );
+        drop(leaving);
+        let n2 = name.clone();
+        std::thread::spawn(move || {
+            // Past two polls, so the new daemon has taken the freed name.
+            std::thread::sleep(STOP_EVENT_POLL * 3);
+            let _ = signal_user_stop(&n2);
+        });
+        let r = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                wait_for_user_stop(&channel, never_ending),
+            )
+            .await
+        });
+        assert_eq!(r.ok(), Some(UserStop::Asked));
+    }
+
+    #[test]
+    fn user_stop_event_names_are_per_session_and_keyed_by_the_config() {
+        let a = user_stop_event_name(&crate::instance_lock::instance_id(std::path::Path::new(
+            "C:\\a\\config.toml",
+        )));
+        let b = user_stop_event_name(&crate::instance_lock::instance_id(std::path::Path::new(
+            "C:\\b\\config.toml",
+        )));
+        assert!(a.starts_with("Local\\roomler-user-stop-"), "{a}");
+        assert_ne!(a, b, "two configs, two daemons, two events");
     }
 
     #[test]
