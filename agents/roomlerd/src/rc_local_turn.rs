@@ -915,4 +915,42 @@ mod tests {
             );
         }
     }
+
+    /// FR-52 P4e — the `/connect` page's OPAQUE client is WebAssembly, and a
+    /// browser compiles none under a `script-src` without `'wasm-unsafe-eval'`:
+    /// drop the keyword and every outsider's login fails before its first
+    /// frame, with nothing on the server to say why. And it must stay THAT
+    /// keyword: `'unsafe-eval'` would satisfy the WebAssembly compile while
+    /// also re-opening JS `eval` to any XSS on the origin.
+    ///
+    /// The policy lives in `files/security-headers.conf`; that it is the one
+    /// served (included by the pod nginx, installed by the Dockerfile) is the
+    /// port test's to assert, above.
+    #[test]
+    fn the_deployed_csp_compiles_webassembly_and_nothing_more() {
+        let conf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../files/security-headers.conf");
+        let conf = std::fs::read_to_string(&conf_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", conf_path.display()));
+        let csp = conf
+            .lines()
+            .find(|l| l.contains("add_header Content-Security-Policy"))
+            .expect("no Content-Security-Policy in files/security-headers.conf");
+        let script_src: Vec<&str> = csp
+            .split_once("script-src ")
+            .and_then(|(_, rest)| rest.split_once(';'))
+            .map(|(v, _)| v.split_whitespace().collect())
+            .expect("CSP has no script-src directive");
+
+        assert!(
+            script_src.contains(&"'wasm-unsafe-eval'"),
+            "script-src lost 'wasm-unsafe-eval' — the /connect page cannot compile its \
+             OPAQUE client, so no outsider can log in.\nscript-src was: {script_src:?}"
+        );
+        assert!(
+            !script_src.contains(&"'unsafe-eval'"),
+            "script-src allows 'unsafe-eval' — 'wasm-unsafe-eval' is the narrow keyword \
+             WebAssembly needs; this one re-opens JS eval.\nscript-src was: {script_src:?}"
+        );
+    }
 }

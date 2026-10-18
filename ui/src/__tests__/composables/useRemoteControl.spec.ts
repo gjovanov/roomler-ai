@@ -41,6 +41,8 @@ import {
   createClipboardEchoGate,
   createHeldInputTracker,
   buildClipboardImageFrames,
+  grantAllowsClipboard,
+  dropClipboardChannel,
   buildClipboardHtmlFrames,
   buildClipboardNativeFrames,
   parseNativeClipPayload,
@@ -1409,6 +1411,55 @@ describe('normalizeClipboardText (clipboard v2)', () => {
   it('passes through CR-free text untouched', () => {
     expect(normalizeClipboardText('plain\ntext')).toBe('plain\ntext')
     expect(normalizeClipboardText('')).toBe('')
+  })
+})
+
+describe('the clipboard follows the grant (FR-52 P4e)', () => {
+  it('reads CLIPBOARD out of the effective grant, by equality', () => {
+    expect(grantAllowsClipboard('VIEW | INPUT | CLIPBOARD | FILES')).toBe(true)
+    expect(grantAllowsClipboard('VIEW|CLIPBOARD')).toBe(true)
+    // An outsider's default — the case that made this matter.
+    expect(grantAllowsClipboard('VIEW | INPUT')).toBe(false)
+    expect(grantAllowsClipboard('VIEW')).toBe(false)
+    expect(grantAllowsClipboard('')).toBe(false)
+    // A newer bit that merely contains the name is not CLIPBOARD.
+    expect(grantAllowsClipboard('VIEW | CLIPBOARD_HISTORY')).toBe(false)
+  })
+
+  it('a grant the server did not report is the request, which asks for CLIPBOARD', () => {
+    expect(grantAllowsClipboard(undefined)).toBe(true)
+    expect(grantAllowsClipboard(null)).toBe(true)
+  })
+
+  it('drops the clipboard channel — closed and forgotten, so nothing can find it open', () => {
+    let closed = 0
+    const clipboard = {
+      close: () => {
+        closed += 1
+      },
+    } as unknown as RTCDataChannel
+    const input = {} as RTCDataChannel
+    const channels: Record<string, RTCDataChannel> = { clipboard, input }
+    expect(dropClipboardChannel(channels)).toBe(true)
+    expect(closed).toBe(1)
+    expect(channels.clipboard).toBeUndefined()
+    // Only the clipboard: input, control, cursor and files are untouched.
+    expect(channels.input).toBe(input)
+    // Idempotent: a second create (the #1045 echo) finds nothing to drop.
+    expect(dropClipboardChannel(channels)).toBe(false)
+    expect(closed).toBe(1)
+  })
+
+  it('a channel that throws on close is still forgotten', () => {
+    const channels: Record<string, RTCDataChannel> = {
+      clipboard: {
+        close: () => {
+          throw new Error('InvalidStateError')
+        },
+      } as unknown as RTCDataChannel,
+    }
+    expect(dropClipboardChannel(channels)).toBe(true)
+    expect(channels.clipboard).toBeUndefined()
   })
 })
 

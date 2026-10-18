@@ -4,6 +4,8 @@ import { ref, watch, onBeforeUnmount, computed, type Ref, type ComputedRef } fro
 import { useWsStore } from '@/stores/ws'
 import { api } from '@/api/client'
 import type { Agent } from '@/stores/agents'
+import { sdpFingerprint, transportMac, verifyTransportMac } from '@/utils/extauth'
+import { friendlyExtauthRefusal } from './useExternalLogin'
 import {
   cellCodecOfTransport,
   cellsFromCaps,
@@ -606,6 +608,27 @@ export function expectedOrgTid(
   if (explicitOrgId && /^[0-9a-f]{24}$/.test(explicitOrgId)) return explicitOrgId
   return pathname.match(/^\/tenant\/([0-9a-f]{24})\b/)?.[1] ?? null
 }
+
+/**
+ * FR-52 P4e — what an EXTERNAL session rests on: the device, named by its
+ * connect code (an outsider never learns its internal id), and the login the
+ * device verified. Held in memory for one session and zeroed when it ends.
+ */
+export interface ExternalSessionAuth {
+  connectCode: string
+  attemptId: string
+  appKey: Uint8Array
+}
+
+/** An external viewer asked to offer or answer with no login in hand. */
+export const EXTERNAL_LOGIN_GONE =
+  'This session needs a fresh login. Connect again with the device password.'
+/** The device's answer did not carry the login's seal over its certificate. */
+export const EXTERNAL_ANSWER_UNSEALED =
+  'The device could not be verified, so the session was not started. Nothing was shown or sent.'
+/** Every automatic retry ends here for an external session (spec decision 10). */
+export const EXTERNAL_SESSION_ENDED =
+  'The session ended. A session from outside the organization cannot resume on its own: connect again with the device password.'
 
 /**
  * User-facing text for `rc:error` codes. Server prose can carry
@@ -3641,6 +3664,44 @@ export const CLIPBOARD_SYNC_POLL_MS = 2000
 /** Throttle between consecutive localÃ¢ÂÂremote sync attempts. */
 const CLIPBOARD_SYNC_MIN_INTERVAL_MS = 300
 
+/** Whether a session's EFFECTIVE grant (`rc:session.created.permissions`)
+ *  lets clipboard content cross, in either direction. Exact tokens: a newer
+ *  bit that merely contains the name is not CLIPBOARD. A grant the server did
+ *  not report (pre-P3) is the request, which always asks for CLIPBOARD — the
+ *  rule `inputGranted` follows for INPUT. */
+export function grantAllowsClipboard(permissions: unknown): boolean {
+  return (
+    typeof permissions !== 'string' ||
+    permissions.split('|').some((p) => p.trim() === 'CLIPBOARD')
+  )
+}
+
+/** Close and forget the `clipboard` channel of a session whose grant does not
+ *  allow it — FR-52's outsider gets `VIEW | INPUT` by default.
+ *
+ *  The channels are made in `connect()`, BEFORE the session request goes out,
+ *  so this one exists before anyone knows the grant; but `rc:session.created`
+ *  lands before the offer is even created, so it is dropped before it is ever
+ *  negotiated. Every path that moves clipboard content needs it OPEN — the
+ *  auto-sync that reads this machine's clipboard while the tab has focus, the
+ *  subscription through which the device writes to it, the toolbar's
+ *  send/get — so none of them can run. Before this, a session the device
+ *  refused clipboard to still READ the controller's clipboard and sent every
+ *  change to the device, which answered each with an error.
+ *
+ *  Returns whether a channel was dropped. */
+export function dropClipboardChannel(channels: Record<string, RTCDataChannel>): boolean {
+  const ch = channels.clipboard
+  if (!ch) return false
+  delete channels.clipboard
+  try {
+    ch.close()
+  } catch {
+    /* already closing */
+  }
+  return true
+}
+
 /** Canonicalize text for HASHING (CRLF / lone CR Ã¢ÂÂ LF). Never applied
  *  to outbound wire text Ã¢ÂÂ see [`sendClipboardWriteOverDc`]. Both
  *  sides of the echo gate hash this canonical form; the agent's
@@ -4179,9 +4240,21 @@ export function filterCapsByPreference(
  * tests + older callers can omit it and `supportsResume` falls
  * back to false (legacy rc.18 fail-fast upload semantics).
  */
-export function useRemoteControl(agent?: Ref<Agent | null>) {
+export function useRemoteControl(agent?: Ref<Agent | null>, opts?: { external?: boolean }) {
   const ws = useWsStore()
   const phase = ref<RcPhase>('idle')
+
+  // FR-52 P4e — this instance drives an EXTERNAL session (the /connect page).
+  // FIXED for the instance's life, and deliberately separate from the login
+  // it holds: with no login in hand an external viewer refuses to offer or to
+  // accept an answer — it never falls back to an unsealed, ordinary session.
+  // The browser-side twin of the device remembering an ended external session.
+  const externalMode = opts?.external === true
+  let externalAuth: ExternalSessionAuth | null = null
+  function forgetExternalAuth() {
+    externalAuth?.appKey.fill(0)
+    externalAuth = null
+  }
 
   /**
    * rc.19: resume opt-in gate. True only when the agent has
@@ -5066,6 +5139,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   // `rc:session.created.permissions`. `true` until a server says otherwise
   // (pre-P3 servers omit the field = as-requested). Reset on each connect.
   const inputGranted = ref(true)
+  // The same, for CLIPBOARD: `false` = the channel was dropped
+  // (`dropClipboardChannel`) and the view hides its clipboard controls.
+  const clipboardGranted = ref(true)
   // FR-85 P3c — RECORD survives the hub only when this controller may record
   // AND the device's owner opted in. `recordRefused` is the server's reason
   // when it did not (`controller_not_allowed`, `device_not_opted_in`), so the
@@ -7813,6 +7889,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           '[rc] session is VIEW-EFFECTIVE: another session already holds input on this host',
         )
       }
+      clipboardGranted.value = grantAllowsClipboard(perms)
+      if (!clipboardGranted.value && dropClipboardChannel(channels)) {
+        console.info('[rc] no CLIPBOARD in the grant: the clipboard channel is closed')
+      }
       markConnect('session_created')
       // FR-34 — a fresh attempt starts un-locked-known; the agent tells us
       // via rc:consent.pending if the host is locked.
@@ -7837,6 +7917,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       ) {
         hostLocked.value = true
       }
+    })
+    // FR-52 P4e — the server refused the external session ask itself: the
+    // login was already spent or expired, the device went away or is busy, or
+    // an org gate closed since the login. It answers `rc:extauth.result`, not
+    // `rc:error`, and nothing follows — so this is the end of the attempt.
+    on('rc:extauth.result', (msg) => {
+      if (!externalMode || phase.value !== 'requesting' || !externalAuth) return
+      if (msg.attempt_id != null && msg.attempt_id !== externalAuth.attemptId) return
+      if (msg.refused === undefined || msg.refused === null) return
+      failWith(friendlyExtauthRefusal(msg.refused, msg.retry_after_secs))
     })
     on('rc:ready', async (msg) => {
       // (2026-08-05 winhost-a wedge) NEVER drop rc:ready silently: the server
@@ -7870,11 +7960,23 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       try {
         const offer = await livePc.createOffer()
         await livePc.setLocalDescription(offer)
-        ws.sendRaw({
+        const offerFrame: Record<string, unknown> = {
           t: 'rc:sdp.offer',
           session_id: msg.session_id,
           sdp: offer.sdp,
-        })
+        }
+        // FR-52 P4e — an external session's offer is SEALED: a MAC over this
+        // browser's DTLS certificate, under the key only this page and the
+        // device hold. The device refuses an external offer without it.
+        if (externalMode) {
+          if (!externalAuth) throw new Error(EXTERNAL_LOGIN_GONE)
+          offerFrame.extauth_mac = await transportMac(
+            externalAuth.appKey,
+            'offer',
+            sdpFingerprint(offer.sdp ?? ''),
+          )
+        }
+        ws.sendRaw(offerFrame)
         markConnect('offer_sent')
       } catch (e) {
         failWith((e as Error).message || 'createOffer failed')
@@ -7885,6 +7987,35 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
       markConnect('answer')
       try {
+        // FR-52 P4e — an external session's answer must carry the DEVICE's
+        // seal over its own DTLS certificate, checked BEFORE the description
+        // is applied: once applied, DTLS would pin whatever certificate the
+        // answer named, and an answer that cannot prove the login's key may
+        // have been written by whoever relays the signalling. No seal, no
+        // session — and the server is told, so the device's slot frees.
+        if (externalMode) {
+          const sealed =
+            externalAuth !== null &&
+            typeof msg.extauth_mac === 'string' &&
+            (await verifyTransportMac(
+              externalAuth.appKey,
+              'answer',
+              sdpFingerprint(String(msg.sdp ?? '')),
+              msg.extauth_mac,
+            ))
+          if (!sealed) {
+            if (sessionId.value) {
+              ws.sendRaw({
+                t: 'rc:terminate',
+                session_id: sessionId.value,
+                reason: 'controller_hangup',
+              })
+            }
+            failWith(EXTERNAL_ANSWER_UNSEALED)
+            return
+          }
+        }
+        if (!pc) return // torn down while the seal was being checked
         await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp })
         remoteDescriptionSet = true
         // Flush any ICE that arrived early.
@@ -8067,6 +8198,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // terminator to release. teardown() bumps `connectGen`, so a connect()
     // still in its pre-flight stops at its next check.
     requestSent = false
+    // FR-52 P4e — a failed external session's login is spent either way.
+    forgetExternalAuth()
     teardown()
   }
 
@@ -8106,6 +8239,22 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     if (reconnectTimer !== null) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
+    }
+    // FR-52 P4e — every automatic retry funnels through here, and an EXTERNAL
+    // session takes none: its login opened exactly one session, and another
+    // costs the password again — retrying would only spend guesses on a
+    // request the server would refuse (spec, open decision 10). The server is
+    // still told, so the device's slot frees.
+    if (externalMode) {
+      if (opts?.notifyServer !== false && sessionId.value) {
+        ws.sendRaw({
+          t: 'rc:terminate',
+          session_id: sessionId.value,
+          reason: 'controller_hangup',
+        })
+      }
+      failWith(EXTERNAL_SESSION_ENDED)
+      return
     }
     // Without the original connect args we can't retry.
     if (!lastConnectArgs) {
@@ -8348,6 +8497,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     ) {
       return // already active
     }
+    // FR-52 P4e — an external viewer starts only from a login in hand.
+    if (externalMode && !externalAuth) {
+      failWith(EXTERNAL_LOGIN_GONE)
+      return
+    }
     // #1631 - this attempt's generation, re-checked after every suspension
     // below. Taken AFTER the guard: a call rejected above must not touch it,
     // the attempt it would have displaced is still the live one.
@@ -8385,6 +8539,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // one that followed it.
     mediaEverFlowed = false
     inputGranted.value = true // until rc:session.created reports otherwise
+    clipboardGranted.value = true // likewise
     // FR-85 P3c — a recording is granted per session, never carried over.
     recordGranted.value = false
     recordRefused.value = null
@@ -8504,7 +8659,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // coturn UDP) and forward its descriptor to the server (below) so the REMOTE
     // agent relays through it too. Graceful no-op on any host without one.
     let localRelay: LocalRelayDescriptor | null = null
-    if (localRelayEnabled.value) {
+    // FR-52 P4e — never for an external session: its frame cannot carry a
+    // relay descriptor (F4), and a relay on THIS host's mesh could not reach a
+    // device in someone else's organization anyway.
+    if (localRelayEnabled.value && !externalMode) {
       localRelay = await probeLocalRelay()
       if (localRelay) {
         iceServers = [localRelayIceServer(localRelay), ...iceServers]
@@ -9918,12 +10076,27 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // page's agent, and only if it is the one being asked (a device switch
     // can race the request).
     const askedCaps = agent?.value?.id === agentId ? agent.value.capabilities : undefined
-    const requestPayload: Record<string, unknown> = {
-      t: 'rc:session.request',
-      agent_id: agentId,
-      permissions: withPrivacyAsked(permissions, askedCaps),
-      browser_caps: browserCaps,
-    }
+    // FR-52 P4e — an EXTERNAL session asks with its own frame: the device by
+    // connect code and the verified login it spends — never an agent id, and
+    // with no `local_relay` or `override_reason` to carry (F4). Everything
+    // after this point (transport, chroma, framing, audio) means the same in
+    // both frames. An outsider's page reads no device row, so it has no caps
+    // to ask PRIVACY on: its grant is what it asked, under the org's ceiling.
+    const requestPayload: Record<string, unknown> =
+      externalMode && externalAuth
+        ? {
+            t: 'rc:extauth.session',
+            connect_code: externalAuth.connectCode,
+            attempt_id: externalAuth.attemptId,
+            permissions,
+            browser_caps: browserCaps,
+          }
+        : {
+            t: 'rc:session.request',
+            agent_id: agentId,
+            permissions: withPrivacyAsked(permissions, askedCaps),
+            browser_caps: browserCaps,
+          }
     // loopback-TURN corp-relay (Phase 2): forward the probed descriptor so the
     // Hub adds `turn:{overlay_ip}:{turn_port}` to the REMOTE agent's ICE servers
     // Ã¢ÂÂ it reaches that TURN over the overlay (WFP-permitted). Absent Ã¢ÂÂ the Hub
@@ -9990,7 +10163,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // consent; it's honoured ONLY if the server validates the caller as an
     // ADMINISTRATOR who isn't the owner (a non-admin's value is ignored). One-
     // shot: cleared after send so a later normal Connect isn't a silent force.
-    if (overrideReason.value.trim()) {
+    if (overrideReason.value.trim() && !externalMode) {
       requestPayload.override_reason = overrideReason.value.trim()
     }
     // #1631 - a request we abandoned to this same agent may still be
@@ -10004,6 +10177,23 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // Abandon-and-retry if the server never answers the request (WS
     // died mid-send, pod restart, ...). Cleared by rc:session.created.
     armSignalingTimeout()
+  }
+
+  /**
+   * FR-52 P4e — start an EXTERNAL session on `auth`, the login the `/connect`
+   * page just completed. Only on an instance created with `{ external: true }`.
+   *
+   * The login is spent by this one session: when it ends, its key is zeroed
+   * and another session needs the password again. System audio rides the
+   * grant (`AUDIO`) for an outsider, so asking for it is asking for the bit.
+   */
+  async function connectExternal(auth: ExternalSessionAuth) {
+    if (!externalMode) throw new Error('connectExternal on a viewer that is not external')
+    if (phase.value !== 'idle' && phase.value !== 'closed' && phase.value !== 'error') return
+    forgetExternalAuth()
+    externalAuth = auth
+    const permissions = `VIEW | INPUT | CLIPBOARD | FILES${audioEnabled.value ? ' | AUDIO' : ''}`
+    return connect(`ext:${auth.connectCode}`, permissions, false, undefined)
   }
 
   function disconnect() {
@@ -10028,6 +10218,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // evidence a timeout would have produced.
     logConnectTiming('closed')
     lastConnectArgs = null
+    // FR-52 P4e — the operator hung up: the login's key goes with the session.
+    forgetExternalAuth()
     // End of this agent's session: later picker changes are global-only
     // until the next connect() names an agent again.
     codecAgentId = null
@@ -12387,6 +12579,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     hasMedia,
     inputChannelOpen,
     inputGranted,
+    clipboardGranted,
     recordGranted,
     recordRefused,
     recording,
@@ -12399,6 +12592,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     setQuality,
     cursor,
     connect,
+    connectExternal,
     disconnect,
     /**
      * Current auto-reconnect attempt counter. 0 = not reconnecting;

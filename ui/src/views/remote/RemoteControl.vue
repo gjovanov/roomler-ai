@@ -16,8 +16,8 @@
       <v-btn
         icon="mdi-arrow-left"
         variant="text"
-        :to="{ name: 'devices', params: { tenantId } }"
-        aria-label="Back to Agents"
+        :to="isExternal ? { name: 'connect' } : { name: 'devices', params: { tenantId } }"
+        :aria-label="isExternal ? 'Back to Connect' : 'Back to Agents'"
       />
       <v-toolbar-title class="d-flex align-center text-truncate">
         <v-icon :color="statusColor" size="small" class="mr-2 flex-shrink-0">
@@ -28,7 +28,10 @@
              the mapping stays visible, unless the viewer hides it with "Hide
              device name when a display name is set" — ONE preference, shared
              with the Devices grid (Settings › Display carries it here). -->
-        <span class="text-truncate">{{ agent?.display_name || agent?.name || 'Agent' }}</span>
+        <!-- FR-52 P4e — an outsider knows the device by its connect code
+             only; its name and OS are its organization's to show. -->
+        <span v-if="isExternal" class="text-truncate">{{ externalCode || 'Device' }}</span>
+        <span v-else class="text-truncate">{{ agent?.display_name || agent?.name || 'Agent' }}</span>
         <!-- OS + version subtitle hidden on phone-sized viewports;
              they're useful context on a desktop but on mobile they
              push Connect/Disconnect off the right edge. -->
@@ -425,9 +428,11 @@
       </v-dialog>
       <!-- rc.199 — clipboard send / get: frequent connected-session
            actions, kept on the toolbar (not the Settings panel) at
-           every viewport. Relocated here from the retired Row 2. -->
+           every viewport. Relocated here from the retired Row 2.
+           Absent when the grant has no CLIPBOARD: the channel they need
+           was closed at `rc:session.created` (dropClipboardChannel). -->
       <v-btn
-        v-if="rc.phase.value === 'connected'"
+        v-if="rc.phase.value === 'connected' && rc.clipboardGranted.value"
         icon
         variant="text"
         size="small"
@@ -442,7 +447,7 @@
         <v-icon>mdi-content-paste</v-icon>
       </v-btn>
       <v-btn
-        v-if="rc.phase.value === 'connected'"
+        v-if="rc.phase.value === 'connected' && rc.clipboardGranted.value"
         icon
         variant="text"
         size="small"
@@ -1721,8 +1726,11 @@
           <!-- Clipboard auto-sync (v2). Live-effective (not gated on
                sessionLive) — the composable subscribes/unsubscribes on
                flip. Old agents: local→remote still auto-pushes; the
-               remote→local half needs the events cap (tooltip says so). -->
+               remote→local half needs the events cap (tooltip says so).
+               Absent when the grant has no CLIPBOARD: there is no
+               channel for it to sync over (dropClipboardChannel). -->
           <v-btn
+            v-if="rc.clipboardGranted.value"
             block
             variant="tonal"
             :color="clipboardAutoSyncOn ? 'primary' : undefined"
@@ -2190,7 +2198,8 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
+import { takeExternalSession } from '@/composables/useExternalLogin'
 import { useAgentStore, type Agent } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
 import {
@@ -2275,8 +2284,17 @@ import {
 } from '@/composables/rcSessionRating'
 
 const route = useRoute()
+const router = useRouter()
 const tenantId = computed(() => route.params.tenantId as string)
 const agentId = computed(() => route.params.agentId as string)
+
+// FR-52 P4e — the EXTERNAL viewer: someone outside the device's organization,
+// on a session their `/connect` login opened. Fixed at setup, never reactive:
+// the composable is built for one mode and must not switch under a session.
+// There is no tenant and no agent row to load — an outsider can read neither —
+// so the agent stays null and the viewer runs on its baseline capabilities.
+const isExternal = route.name === 'connect-session'
+const externalCode = typeof route.query.code === 'string' ? route.query.code : ''
 
 const agentStore = useAgentStore()
 const authStore = useAuthStore()
@@ -2289,7 +2307,7 @@ const hideDeviceName = useHideDeviceName(() => `${authStore.user?.id ?? 'anon'}:
 // resumable upload pump. Agent doc is populated on mount;
 // useRemoteControl's `supportsResume` computed reactively
 // flips when the load lands.
-const rc = useRemoteControl(agent)
+const rc = useRemoteControl(agent, { external: isExternal })
 const { t } = useI18n()
 const { showSuccess, showError, showSnackbar } = useSnackbar()
 // rc.199 — Vuetify viewport helper; drives the Settings dialog's
@@ -4667,6 +4685,8 @@ function saysNoSuchDevice(e: unknown): boolean {
 }
 
 async function loadAgent() {
+  // FR-52 P4e — an outsider has no tenant to list devices from.
+  if (isExternal) return
   if (!agentStore.agents.length) {
     await agentStore.fetchAgents(tenantId.value)
   }
@@ -4686,6 +4706,7 @@ async function loadAgent() {
 const AGENT_STATUS_POLL_MS = 300_000
 let agentStatusTimer: ReturnType<typeof setInterval> | null = null
 async function refreshAgentStatus() {
+  if (isExternal) return
   try {
     // `fetchAgents` swallows its own errors into an EMPTY list, so the old
     // `find(...) || null` here nulled the device on every transient blip and
@@ -4760,6 +4781,18 @@ function dismissRating() {
 }
 
 function startSession() {
+  // FR-52 P4e — an external session starts from the login `/connect` handed
+  // over, once. With none (a reload, or Connect after the session ended) the
+  // only way in is the password again.
+  if (isExternal) {
+    const auth = takeExternalSession()
+    if (!auth) {
+      void router.replace({ name: 'connect', query: externalCode ? { code: externalCode } : {} })
+      return
+    }
+    void rc.connectExternal(auth)
+    return
+  }
   if (!agent.value) return
   // Surface Chrome's clipboard-read permission prompt UNDER the
   // Connect click gesture (auto-sync's later background reads can't
@@ -4964,6 +4997,8 @@ onMounted(() => {
     orgKeepBusyDefault.value = p
   })
   agentStatusTimer = setInterval(() => void refreshAgentStatus(), AGENT_STATUS_POLL_MS)
+  // FR-52 P4e — the login on `/connect` WAS the gesture: start at once.
+  if (isExternal) startSession()
   // P6 — ghost-cursor staleness ticker (cheap; drives the 5 s fade).
   ghostTicker = setInterval(() => { ghostNow.value = Date.now() }, 1000)
   document.addEventListener('fullscreenchange', onFullscreenChange)

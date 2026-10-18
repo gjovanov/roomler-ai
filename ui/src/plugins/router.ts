@@ -155,6 +155,25 @@ const routes: RouteRecordRaw[] = [
         meta: { remountOn: 'userId' },
       },
       {
+        // FR-52 P4e — control a device in ANOTHER organization, with its
+        // connect code and the password its owner set on it. Outside the
+        // tenant subtree on purpose: the person using it belongs to no org the
+        // device is in, and may belong to none at all.
+        path: 'connect',
+        name: 'connect',
+        component: () => import('@/views/remote/ConnectView.vue'),
+        meta: { module: 'remote' },
+      },
+      {
+        // The viewer for the session that login opened. Reached only through
+        // `connect`, which hands it the login in memory; a reload lands back
+        // on the password, by design.
+        path: 'connect/session',
+        name: 'connect-session',
+        component: () => import('@/views/remote/RemoteControl.vue'),
+        meta: { module: 'remote' },
+      },
+      {
         path: 'tenant/:tenantId',
         children: [
           {
