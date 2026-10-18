@@ -72,6 +72,8 @@ mod enroll_key_tests;
 mod ephemeral_tests;
 #[cfg(test)]
 mod exec_service_tests;
+#[cfg(test)]
+mod external_access_tests;
 /// FR-102 P6 — the purestat puller (seven closed days frozen once, a frozen
 /// day never rewritten, a failed pull recorded rather than read as 0) and
 /// the Campaigns table (both planes joined by the normalised key; a revoked

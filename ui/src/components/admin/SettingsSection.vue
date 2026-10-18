@@ -143,6 +143,53 @@
       </v-card-text>
     </v-card>
 
+    <!-- FR-52 gate 1. A THIRD card, and a third server-side switch, for a
+         reason stronger than the one separating the two above: those decide
+         what a MEMBER of this organization may do, and this one decides
+         whether someone who is not a member may do anything at all. -->
+    <v-card>
+      <v-card-title class="d-flex align-center">
+        <v-icon icon="mdi-account-arrow-right-outline" color="primary" class="mr-2" />
+        External access
+      </v-card-title>
+      <v-card-text>
+        <v-alert
+          type="warning"
+          variant="tonal"
+          density="compact"
+          class="mb-4"
+          icon="mdi-shield-account-outline"
+        >
+          When enabled, people <strong>outside this organization</strong> can
+          control devices that individually opt in — the way a support
+          technician reaches a machine they do not administer. They need the
+          device's connect code and a password held
+          <strong>on the device itself</strong>, which this server never sees.
+        </v-alert>
+
+        <v-switch
+          :model-value="agentStore.orgExternalAccessEnabled === true"
+          :loading="savingExternal"
+          :disabled="savingExternal || agentStore.orgExternalAccessEnabled === null"
+          color="primary"
+          density="compact"
+          hide-details
+          label="Allow people outside this organization to control devices"
+          @update:model-value="onToggleExternal"
+        />
+        <div class="text-caption text-medium-emphasis mt-1">
+          Off by default, and turning it on opens nothing by itself. Each
+          device must be approved individually, its owner must enable it on
+          the machine and set a password there, and whoever is at the device
+          is still asked before a session starts.
+        </div>
+
+        <v-alert v-if="externalError" type="error" variant="tonal" density="compact" class="mt-3">
+          {{ externalError }}
+        </v-alert>
+      </v-card-text>
+    </v-card>
+
     <!-- FR-92 — keep busy. Unlike the cards above this is ON by default
          (operator decision) and the switch is the org's DENY, shown as
          "allow" so on reads as on. The device enforces it; a deny also stops
@@ -414,6 +461,23 @@ async function onToggleSsh(v: boolean | null) {
   }
 }
 
+// FR-52 — its own pair too. A failure to flip the external-access switch
+// must never render as an error under exec or SSH.
+const savingExternal = ref(false)
+const externalError = ref<string | null>(null)
+
+async function onToggleExternal(v: boolean | null) {
+  savingExternal.value = true
+  externalError.value = null
+  try {
+    await agentStore.setOrgExternalAccessEnabled(props.tenantId, v === true)
+  } catch (e) {
+    externalError.value = (e as Error).message
+  } finally {
+    savingExternal.value = false
+  }
+}
+
 // FR-92 — its own pair too. The switch shows "allow"; the server stores
 // the deny.
 const savingKeepBusy = ref(false)
@@ -568,5 +632,6 @@ onMounted(() => {
   void agentStore.fetchOrgKeepBusyDenied(props.tenantId)
   void agentStore.fetchOrgRcSessionPolicy(props.tenantId)
   void agentStore.fetchOrgEphemeralKeysEnabled(props.tenantId)
+  void agentStore.fetchExternalAccess(props.tenantId)
 })
 </script>

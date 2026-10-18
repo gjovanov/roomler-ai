@@ -263,6 +263,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // restart it from the companion); `preserve_operator_config` keeps an
         // owner's OFF across a re-enrollment.
         local_restart_enabled: true,
+        external_access_enabled: false,
         // Same rule for SSH, which grants strictly more than a bounded command.
         // `preserve_operator_config` keeps all three across a RE-enrollment
         // (they sit in the `..existing` tail), so a device that opted in stays
