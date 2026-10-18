@@ -106,7 +106,8 @@ SmartScreen reputation organically from download volume. What signing buys
 - ⚠️ What a *release* carries and what the *machine installing an update*
   checks are different questions — §7b. The agent's own check of a `.pkg`
   update is the GPG `.asc` against its pinned key, not the Apple signature, and
-  a `.pkg` is not yet bound to the release it claims to be.
+  since FR-97 P6a the version inside the `.pkg` must be the release it was
+  offered as.
 
 ## 3. Credential setup — `scripts/signing/`
 

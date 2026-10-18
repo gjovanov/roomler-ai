@@ -147,6 +147,9 @@ keys for publicly-trusted code signing since June 2023, so no CA issues a PFX.
   ⚠️ *(2026-09-25) For the **MSI** only: a `.pkg` or `.deb` is authenticated by
   its pinned-key `.asc` but has no version binding, so the downgrade stays open
   on Linux/macOS — `docs/code-signing.md` §7b.*
+  *(2026-10-18) Closed there too by FR-97 P6a: the `.deb`, `.pkg` and tarball
+  each carry their version inside the signed bytes, and the updater binds it to
+  the tag (`docs/code-signing.md` §7b).*
 - EV/SmartScreen instant reputation — does not exist anymore (removed 2024);
   reputation accrues per publisher across releases.
 
