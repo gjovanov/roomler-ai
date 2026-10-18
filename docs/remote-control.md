@@ -1291,6 +1291,20 @@ session that no longer existed until the window ran out. The cancel runs ahead o
 FR-43 delegation gate, because the prompt is always the daemon's even when the session
 media was handed to the GUI worker.
 
+⚠️ **So does a control socket that closes** (#2416). A server roll or a network drop
+ends the agent's connection without any `Terminate`, and every session asked about on
+that socket goes with it. A viewer that redials asks again under a new session id. On
+0.4.141 the old panel stayed up, answerable, beside the new question; its Approve did
+nothing (`outbound consent send failed (channel closed)`), and the person at the
+screen saw two prompts for what was, to them, one request. Each prompt's task now races
+its answer against its connection's own outbound channel
+(`await_prompt_or_socket_end`, `agents/roomlerd/src/signaling.rs`). That channel's
+receiver lives in the connection's loop, so it closes when the connection ends and never
+before. The prompt is then withdrawn exactly as a `Terminate` withdraws it. The same
+holds for an **exec** prompt (`roomler exec` with consent on), where it matters more: an
+Approve on a stale panel would otherwise run the command for a caller no longer waiting
+for it, and twice if that caller retried.
+
 ### 11.3 Recording & audit consent
 
 If recording is enabled for the session, the controlled side gets a persistent banner (cannot be dismissed) and a red dot in the tray icon. Mirrors macOS's screen-recording indicator behavior; users have learned to look for it.
