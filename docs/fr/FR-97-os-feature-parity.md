@@ -212,7 +212,7 @@ and the consent chain's fallbacks.
 | O1 | A per-user install updates itself | ✅ | ❌ | ✅ | #2046 | FR-96 |
 | O2 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | 🟡 built (P6a) | 🟡 built (P6a) | Was: `Unsupported`, so the install proceeded and a signed older package under a newer manifest installed (measured on 0.4.143, §8). P6a reads the `.deb`'s control `Version`, the tarball's top directory and the `.pkg`'s `PackageInfo` (`artifact_version.rs:114`) | P6a |
 | O3 | Tunnel CLI `roomler self-update` | ✅ | ❌ | ❌ | `agents/roomler-cli/src/update.rs:96-101` | P6b |
-| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:5001` | P6c |
+| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:5003` | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 apt only; the tarball has none | ❌ | A pasted recipe (`docs/installation.md:394-420`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
 | O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | ❌ | `macos_supervisor.rs` never calls `crash_recorder` | P6e |
@@ -769,6 +769,22 @@ model on Windows, so the three agree on what the mode means.
 - **P6d, `install.sh --uninstall`** for the tarball and the `.pkg`.
 - **P6e, macOS supervision.** The FR-43 supervisor records a worker that dies before its own panic hook (stderr tail →
   `record_with_log_tail`); drop the launchd `StandardOutPath` duplication and the daemon's `eprintln!`s (#1538).
+  - **P6e-1, never die on a log sink (#1538, built).** `eprintln!` panics when the write fails, and the daemon's
+    stderr is a sink it does not own.
+    - *The crash, located.* 0.4.93's panic was in `run_cmd`'s single-instance check. A duplicate `roomlerd run`
+      said "already running" there with `eprintln!` (`run_cmd` polls inside `daemon_main`'s future, #1538's frame),
+      so a benign duplicate start became a crash record.
+    - *Not tracing.* tracing-subscriber 0.3.23's `fmt::layer()` defaults `log_internal_errors` to false; its own
+      doc says true, and is stale.
+    - *The fix.* The lines the daemon prints itself go through `logging::say_on_stderr`, which drops a line it
+      cannot write: the instance lock, both watchdog exits (a panic there would lose the forced exit, since
+      the watchdog's thread is swallowed) and the recording thread's abort. The watchdog module denies the print
+      macros.
+    - *The plists.* `com.roomler.agent` and `com.roomler.daemon` send stdout to `/dev/null`. It carried only
+      tracing's console copy of the rotating log, unrotated: 13.9 MB and 42 MB on one Mac. stderr keeps its
+      file, so an agent that cannot start still says why there, and the vmtest lane reads it.
+  - **P6e-2, the supervisor's crash record** for a worker that dies before its panic hook: open. The FR-43
+    supervisor is default-off (`macos_supervise_gui_worker`).
 - **P6f, a fresh private staging directory per download** on Windows and macOS, as Linux has had since FR-96's
   security review. **Settled without a build.**
   - *Windows* got exactly that with GHSA-r3xj-4wh9-xh2v, released in 0.4.142 (`updater.rs:1208`).
@@ -837,7 +853,7 @@ model on Windows, so the three agree on what the mode means.
 | **P6b** | `roomler self-update` on Unix + the pinned PGP check | — | Linux + Mac tunnel-only hosts | M |
 | **P6c** | `service install --system` on Linux + macOS | — | vmtest | S |
 | **P6d** | `install.sh --uninstall` | — | vmtest | S |
-| **P6e** | macOS supervisor crash capture; #1538 | — | a field Mac | S |
+| **P6e** | macOS supervisor crash capture; #1538 (P6e-1, never die on a log sink: built) | — (a liveness fix) | a field Mac; a duplicate start with stderr on `/dev/full`, red on 0.4.143 | S |
 | **P6f** | Private staging dir on Windows + macOS (settled: Windows by GHSA-r3xj-4wh9-xh2v, macOS measured private) | — | Win10, Win11, a Mac | S |
 | **P7a** | Linux arm64 hardware encode | the release feature set | an arm64 lab host | M |
 | **P7b** | arm64 tunnel CLI + wizard | — | an arm64 vmtest guest | S |
@@ -925,8 +941,10 @@ one depends on it.
   updates a Linux and a macOS tunnel-only host; `service install --system` and `install.sh --uninstall` round-trip on
   vmtest; a SIGKILLed Mac worker leaves a crash record; a closed stdout no longer kills the macOS daemon.
   *(The first clause is field-verified on P6a's candidate, §8: the hostile feed was red on 0.4.143 and refused on the
-  candidate. The `.pkg` reader was proven on a Mac against the real pkgs; it is re-checked on the release. The rest
-  is P6b–P6e.)*
+  candidate. The `.pkg` reader was proven on a Mac against the real pkgs; it is re-checked on the release.
+  The last clause, a closed stdout no longer killing the daemon, is field-verified on P6e-1's candidate, §8: a
+  duplicate start with stderr on `/dev/full` panicked on 0.4.143 and left cleanly on the candidate. The plists
+  were checked under a real launchd. The rest is P6b–P6d and P6e-2.)*
 - [ ] **AC14 (P7):** an arm64 Linux host advertises a hardware cell and records AAC; the arm64 CLI and wizard
   install.
 - [ ] **AC15 (the rule):** P0d's server count of advertised capability words by OS, taken before P0 and after the
@@ -1083,3 +1101,5 @@ one depends on it.
 | 2026-10-18 | released 0.4.143 (`vmtest` lane `macos/installer/system`, both halves, TCC granted by roomler-ai-deploy#42), the deployed viewer | a throwaway tart Mac; the session against the per-user (capture) row | 🟢 **AC3, macOS.** The hello carried no `opus`, and `unavailable` said `audio = no-backend`, `clipboard-image-events = not-watched`, `sas = not-applicable`. The audio toggle was greyed with "System-audio capture is not implemented on this OS yet, so this host sends no sound", before and during the session. The Ctrl+Alt+Del button was hidden. The auto-sync tooltip said copied images are not watched, and to send or fetch one with the buttons. ❗ **Found:** macOS 15 asked "Allow 'roomlerd' to find devices on local networks?" over the per-user agent, in Apple's generic words (open, §3.7). The VM was destroyed |
 | 2026-10-18 | the deployed site after the promote of `hosted-20261018-dc258ce` (carries P0c-4) | `curl https://roomler.ai/`, the static homepage a guest and every crawler get | 🟢 **AC3's wizard clause, live.** Three install cards, one Roomler Setup (`/api/setup/windows`), no `/api/setup/linux` or `/api/setup/macos`, the Linux and macOS cards "From a terminal:", and the lead "on Windows run the graphical installer". At 13:30Z the same page had three of each |
 | 2026-10-18 | the same deploy | P6b's precondition, measured while scoping it: the tunnel distribution | ❗ `/api/tunnel/latest-release` had answered `[]` and every tunnel installer 404'd since ~09-07 (#2468): the cache's 100-deep page had lost the tunnel family. 🟢 After #2469's promote: `tunnel-v0.3.0-rc.266`, and 200 on all four installers. ❗ A real `install.sh --role tunnel` then installed nothing on Debian 12 and Ubuntu 22.04 and still said done: the `.deb` wants `libssl3t64` (#2472, fix #2474) |
+| 2026-10-18 | released 0.4.143 (its own binary, `3b42f578…`, from its `.deb`), then the P6e-1 candidate (`2a0957dc3`, a bookworm build) | a throwaway Debian container on mars. `flock` held the single-instance lock, so a second `roomlerd run` was a duplicate. The control ran with a working stderr, then the duplicate ran with stderr on `/dev/full`, where every write fails | 🔴→🟢 **P6e-1, a closed stdout no longer kills the daemon.** With a working stderr both exit 8 (`ALREADY_RUNNING_EXIT_CODE`) and say "Another roomlerd is already running". With stderr on `/dev/full`, **the release exits 101** and leaves a panic file: `std/src/io/stdio.rs:1165:9`, "failed printing to stderr: No space left on device", the same location as #1538's crash. **The candidate exits 8** and leaves no panic file |
+| 2026-10-18 | released 0.4.143's `.pkg`, then the P6e-1 branch's two plists over its own | a throwaway tart Mac, the root daemon enrolled ephemeral. Both jobs were reloaded: bootout, wait until launchd no longer knows the job, bootstrap. A control first reloaded the released plist the same way. The first attempt bootstrapped too soon after bootout, and launchd answered "5: Input/output error" | 🟢 **The plists, under a real launchd.** `plutil -lint` passed for both. The control and the branch's plists all bootstrapped. The daemon ran with `stdout path = /dev/null`, stderr still `daemon.log`. Over 30 s launchd's `daemon.log` stayed at 26,721 bytes while the daemon's rotating log grew 35,337 → 35,909. The unenrolled agent ran with stdout on `/dev/null`, and its "no config found" error still reached `/tmp/roomlerd.err.log`. No `roomlerd.out.log` was created. The VM was destroyed |

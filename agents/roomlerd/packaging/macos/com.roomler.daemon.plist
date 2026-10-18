@@ -52,8 +52,11 @@
     <key>ThrottleInterval</key>
     <integer>10</integer>
 
+    <!-- FR-97 P6e (#1538): stdout carries only tracing's console copy of the
+         rotating log, and here it grew unrotated (42 MB on one Mac). stderr
+         keeps the file, for the lines a daemon prints before its log exists. -->
     <key>StandardOutPath</key>
-    <string>/var/log/roomler/daemon.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
     <string>/var/log/roomler/daemon.log</string>
 
