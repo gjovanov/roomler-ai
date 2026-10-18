@@ -98,6 +98,22 @@ pub enum SupervisorEvent {
     SessionChanged,
 }
 
+/// #2465 — why [`run`] returned. The host turns it into the exit code it
+/// reports with `STOPPED` (`exit_code_for`), so a deliberate stop of a
+/// redundant service is no longer a failure the SCM's recovery undoes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorEnd {
+    /// A [`SupervisorEvent::Shutdown`] arrived, or the control channel closed.
+    Shutdown,
+    /// The worker found another daemon holding this config's single-instance
+    /// lock, and the orphan check read every roomlerd process without finding
+    /// an earlier host's worker: a second installed flavour serves the device.
+    Redundant,
+    /// The same refusal, but the orphan check could not read every roomlerd
+    /// process, so an earlier host's worker cannot be ruled out.
+    RedundantUnconfirmed,
+}
+
 /// Wrapper that closes the handle on drop. The Win32 `HANDLE` type
 /// is just a pointer-sized integer with no Drop semantics; without
 /// this every error path leaks an OS handle. `pub` because
@@ -107,7 +123,7 @@ pub enum SupervisorEvent {
 pub struct OwnedHandle(HANDLE);
 
 impl OwnedHandle {
-    fn new(h: HANDLE) -> Option<Self> {
+    pub(super) fn new(h: HANDLE) -> Option<Self> {
         if h.is_null() || h == INVALID_HANDLE_VALUE {
             None
         } else {
@@ -1212,7 +1228,7 @@ pub fn run(
     worker_exe: PathBuf,
     worker_args: Vec<String>,
     rx: mpsc::Receiver<SupervisorEvent>,
-) -> Result<()> {
+) -> Result<SupervisorEnd> {
     let args_borrow: Vec<&str> = worker_args.iter().map(String::as_str).collect();
 
     // Log the auto-swap kill-switch state at startup so a "no
@@ -1265,6 +1281,20 @@ pub fn run(
     // `last_active_session` is a longer memory of "who was here
     // last".
     let mut last_active_session: Option<u32> = None;
+
+    // #2465 — a crash ends a host, not its worker. A worker an earlier host of
+    // this service left running holds this config's single-instance lock, so
+    // every worker this host spawned would lose it, and the service could only
+    // flap while that one ran unsupervised. End it before the first spawn:
+    // nothing is supervised yet, so no `run --supervisor scm` worker of this
+    // binary is ours.
+    let start_reap = super::orphan::reap_orphaned_workers();
+    tracing::info!(
+        reaped = start_reap.reaped,
+        inspected = start_reap.inspected,
+        complete = start_reap.complete(),
+        "supervisor: checked for a worker an earlier host left running"
+    );
 
     loop {
         // Drain pending events without blocking, so a flurry of
@@ -1355,7 +1385,7 @@ pub fn run(
             if let Some(n) = netd.as_mut() {
                 n.shutdown();
             }
-            return Ok(());
+            return Ok(SupervisorEnd::Shutdown);
         }
 
         // Track A stage 1 — the netd child's own reap/ladder/respawn,
@@ -1400,30 +1430,61 @@ pub fn run(
                             respawn_at = None;
                         }
                         ExitReaction::Stop => {
-                            // At ERROR, not WARN: this needs an operator, and
-                            // it is the only thing that will resolve it. The
-                            // service stops cleanly rather than idling —
-                            // "Running" while supervising nothing is the
-                            // green-but-dead reading that hides the problem.
-                            //
-                            // A clean stop does NOT trigger SCM recovery
-                            // actions; those fire on unexpected termination.
-                            tracing::error!(
-                                pid = w.process.pid,
-                                code,
-                                "supervisor: another roomler daemon already holds this config's \
-                                 single-instance lock — this one is redundant. Stopping instead of \
-                                 respawning. Uninstall the duplicate daemon flavour (perMachine \
-                                 service vs perUser task) to clear this."
-                            );
-                            // No `terminate()` here, unlike the shutdown path
-                            // above: we are in the REAP arm, so the worker has
-                            // already exited. netd is a separate child and is
-                            // still running, so it does need stopping.
-                            if let Some(n) = netd.as_mut() {
-                                n.shutdown();
+                            // #2465 — a worker an earlier host of this service
+                            // left running holds the lock exactly as a second
+                            // installed flavour would. Look before stopping: if
+                            // one was there and is gone now, spawn again. (The
+                            // check at start misses one only if it could not be
+                            // read then.)
+                            let reap = super::orphan::reap_orphaned_workers();
+                            if reap.reaped > 0 {
+                                tracing::warn!(
+                                    pid = w.process.pid,
+                                    reaped = reap.reaped,
+                                    "supervisor: the worker lost the single-instance lock to a \
+                                     worker an earlier host left running; that one is gone now, \
+                                     respawning"
+                                );
+                                respawn_at = None;
+                            } else {
+                                // At ERROR, not WARN: this needs an operator,
+                                // and it is the only thing that will resolve
+                                // it. The service stops cleanly rather than
+                                // idling — "Running" while supervising nothing
+                                // is the green-but-dead reading that hides the
+                                // problem.
+                                //
+                                // Cleanly as the SCM sees it too (#2465): the
+                                // host ends `Redundant` with exit code 0, so
+                                // the recovery actions leave it stopped. Only
+                                // when the orphan check read every roomlerd
+                                // process: otherwise the host ends as a
+                                // failure, and the SCM's retry is what recovers
+                                // a lock held by a worker it could not read.
+                                tracing::error!(
+                                    pid = w.process.pid,
+                                    code,
+                                    orphan_check_complete = reap.complete(),
+                                    "supervisor: another roomler daemon already holds this \
+                                     config's single-instance lock — this one is redundant. \
+                                     Stopping instead of respawning. Uninstall the duplicate \
+                                     daemon flavour (perMachine service vs perUser task) to clear \
+                                     this."
+                                );
+                                // No `terminate()` here, unlike the shutdown
+                                // path above: we are in the REAP arm, so the
+                                // worker has already exited. netd is a separate
+                                // child and is still running, so it does need
+                                // stopping.
+                                if let Some(n) = netd.as_mut() {
+                                    n.shutdown();
+                                }
+                                return Ok(if reap.complete() {
+                                    SupervisorEnd::Redundant
+                                } else {
+                                    SupervisorEnd::RedundantUnconfirmed
+                                });
                             }
-                            return Ok(());
                         }
                         ExitReaction::Backoff(backoff) => {
                             tracing::warn!(

@@ -41,6 +41,9 @@ pub mod companion_spawn;
 pub mod desktop;
 pub mod environment;
 pub mod firewall;
+/// #2465 — the worker an earlier host of this service left running: found
+/// and ended before this host spawns its own.
+pub mod orphan;
 /// FR-97 P4a — the host's half of the real Ctrl+Alt+Del: `SendSAS` is
 /// honoured only from the service process, so the worker asks it here.
 pub mod sas_relay;
@@ -499,6 +502,18 @@ enum HostOutcome {
     SupervisorPanicked,
     /// No supervisor at all: the worker path or the startup sequence failed.
     StartupFailed,
+    /// #2465 — the worker found another daemon holding this config's
+    /// single-instance lock, and the orphan check read every roomlerd process
+    /// without finding an earlier host's worker: a second installed flavour.
+    /// The service stops CLEANLY, as the supervisor's `Stop` arm intends. A
+    /// failure code would have the SCM restart a service that can only stop
+    /// again, every minute, for as long as that flavour runs.
+    Redundant,
+    /// #2465 — the same refusal, but the orphan check could not read every
+    /// roomlerd process, so an earlier host's worker cannot be ruled out. A
+    /// failure on purpose: the SCM's retry is what recovers the device once a
+    /// worker this host could not see has gone.
+    RedundantUnconfirmed,
 }
 
 /// #2087 — the exit code the host reports with STOPPED.
@@ -509,16 +524,23 @@ enum HostOutcome {
 /// that ends on its own reports a distinct non-zero code (`sc query` shows it
 /// as `SERVICE_EXIT_CODE`), and the SCM restarts it. Before #2087 every path
 /// reported `0`, and a dead supervisor left the device dark until a reboot.
+///
+/// The one end of its own that is `0` is [`HostOutcome::Redundant`] (#2465):
+/// the service is not needed while another flavour serves the device, and
+/// restarting it could only repeat the refusal.
 fn exit_code_for(stop_requested: bool, outcome: HostOutcome) -> ServiceExitCode {
     if stop_requested {
         return ServiceExitCode::Win32(0);
     }
-    ServiceExitCode::ServiceSpecific(match outcome {
+    let code = match outcome {
+        HostOutcome::Redundant => return ServiceExitCode::Win32(0),
         HostOutcome::SupervisorReturned => 1,
         HostOutcome::SupervisorFailed => 2,
         HostOutcome::SupervisorPanicked => 3,
         HostOutcome::StartupFailed => 4,
-    })
+        HostOutcome::RedundantUnconfirmed => 5,
+    };
+    ServiceExitCode::ServiceSpecific(code)
 }
 
 /// Everything the host does after reporting `Running`: resolve the worker,
@@ -564,9 +586,14 @@ fn run_host(sup_rx: mpsc::Receiver<supervisor::SupervisorEvent>) -> HostOutcome 
     };
 
     match sup_handle.join() {
-        Ok(Ok(())) => {
+        Ok(Ok(supervisor::SupervisorEnd::Shutdown)) => {
             tracing::info!("supervisor exited cleanly");
             HostOutcome::SupervisorReturned
+        }
+        // The supervisor logged why at ERROR before it returned.
+        Ok(Ok(supervisor::SupervisorEnd::Redundant)) => HostOutcome::Redundant,
+        Ok(Ok(supervisor::SupervisorEnd::RedundantUnconfirmed)) => {
+            HostOutcome::RedundantUnconfirmed
         }
         Ok(Err(e)) => {
             tracing::error!(error = %e, "supervisor returned error");
@@ -628,7 +655,7 @@ pub(crate) fn run_startup_sequence<S: StartupSteps>(
 /// dispatcher thread waits on the handle to observe the supervisor's exit).
 struct HostSteps {
     sup_rx: Option<mpsc::Receiver<supervisor::SupervisorEvent>>,
-    handle: Option<thread::JoinHandle<Result<()>>>,
+    handle: Option<thread::JoinHandle<Result<supervisor::SupervisorEnd>>>,
 }
 
 impl StartupSteps for HostSteps {
@@ -940,11 +967,23 @@ mod tests {
         assert!(r.command.is_none() && r.reboot_msg.is_none());
     }
 
-    const OUTCOMES: [HostOutcome; 4] = [
+    /// The ends that are failures when nobody asked for a stop.
+    const FAILURES: [HostOutcome; 5] = [
         HostOutcome::SupervisorReturned,
         HostOutcome::SupervisorFailed,
         HostOutcome::SupervisorPanicked,
         HostOutcome::StartupFailed,
+        HostOutcome::RedundantUnconfirmed,
+    ];
+
+    /// Every end a host's run can have.
+    const OUTCOMES: [HostOutcome; 6] = [
+        HostOutcome::SupervisorReturned,
+        HostOutcome::SupervisorFailed,
+        HostOutcome::SupervisorPanicked,
+        HostOutcome::StartupFailed,
+        HostOutcome::RedundantUnconfirmed,
+        HostOutcome::Redundant,
     ];
 
     /// #2087 — a stop someone asked for ends `0` whatever happened during it,
@@ -956,13 +995,30 @@ mod tests {
         }
     }
 
+    /// #2465 — a service another flavour makes redundant stops cleanly, and the
+    /// SCM leaves it stopped: #2087 had turned this end into a restart every
+    /// minute. Only a CONFIRMED redundancy: one the orphan check could not
+    /// vouch for stays a failure, so the SCM's retry can still recover a
+    /// device whose lock is held by an earlier host's worker.
+    #[test]
+    fn a_redundant_service_stops_cleanly() {
+        assert_eq!(
+            exit_code_for(false, HostOutcome::Redundant),
+            ServiceExitCode::Win32(0)
+        );
+        assert!(matches!(
+            exit_code_for(false, HostOutcome::RedundantUnconfirmed),
+            ServiceExitCode::ServiceSpecific(n) if n != 0
+        ));
+    }
+
     /// #2087 — a host that ends on its own reports non-zero, so the SCM brings
     /// it back, and each cause is told apart in `sc query`.
     #[test]
     fn a_host_that_ends_on_its_own_reports_a_distinct_failure() {
         let codes: Vec<ServiceExitCode> =
-            OUTCOMES.iter().map(|&o| exit_code_for(false, o)).collect();
-        for (o, c) in OUTCOMES.iter().zip(&codes) {
+            FAILURES.iter().map(|&o| exit_code_for(false, o)).collect();
+        for (o, c) in FAILURES.iter().zip(&codes) {
             assert!(
                 matches!(c, ServiceExitCode::ServiceSpecific(n) if *n != 0),
                 "{o:?} -> {c:?}"

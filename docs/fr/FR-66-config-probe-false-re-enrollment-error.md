@@ -58,7 +58,7 @@ install's topology. Nothing is wrong.
 
 ## Root cause
 
-`agents/roomlerd/src/win_service/supervisor.rs:958` — `netd_enabled()`:
+`agents/roomlerd/src/win_service/supervisor.rs:974` — `netd_enabled()`:
 
 ```rust
 fn netd_enabled() -> bool {
