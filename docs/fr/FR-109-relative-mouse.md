@@ -22,11 +22,11 @@ Nothing to install on the controlling side stays true: Pointer Lock is a web API
 
 | What | Where |
 |---|---|
-| Every move is absolute: `mouse_move {x, y, mon}`, normalised `0..1` per monitor, so a resolution change mid-session needs no resync | [`input/mod.rs:290`](../../agents/roomlerd/src/input/mod.rs#L290) `InputMsg` |
+| Every move is absolute: `mouse_move {x, y, mon}`, normalised `0..1` per monitor, so a resolution change mid-session needs no resync | [`input/mod.rs:320`](../../agents/roomlerd/src/input/mod.rs#L320) `InputMsg` |
 | enigo moves to an absolute pixel | [`enigo_backend.rs:152`](../../agents/roomlerd/src/input/enigo_backend.rs#L152) `Coordinate::Abs` |
 | The uinput device is an absolute tablet **by design**: "a relative device would force us to track the pointer and guess at acceleration" | [`uinput_backend.rs:18`](../../agents/roomlerd/src/input/uinput_backend.rs#L18), axes at `:307` |
 | The portal path moves with `NotifyPointerMotionAbsolute` on the stream | [`portal/input.rs:468`](../../agents/roomlerd/src/capture/portal/input.rs#L468) |
-| The viewer coalesces pointer moves at the input gap and sends the last position | [`useRemoteControl.ts:5920`](../../ui/src/composables/useRemoteControl.ts#L5920), the gap's key at `:2224` |
+| The viewer coalesces pointer moves at the input gap and sends the last position | [`useRemoteControl.ts:5996`](../../ui/src/composables/useRemoteControl.ts#L5996), the gap's key at `:2247` |
 | The agent already says when the host hides its cursor (`cursor:hide`); the viewer only drops its ghost cursor | `useRemoteControl.ts:9291` |
 | No Pointer Lock anywhere in the viewer | `git grep requestPointerLock ui/src`: nothing |
 | `AgentCaps.input` today: `arbiter`, `exclusive`, `ghost-cursor` | [`caps.rs:1636`](../../agents/roomlerd/src/encode/caps.rs#L1636) |
@@ -133,7 +133,7 @@ happens while the host is locked.
 The agent only injects. It never reads input, so there is no hook, no raw-input sink and no key polling, by
 FR-92's rule. The field probes that read raw input (§5) are test scripts on throwaway guests, never part
 of `roomlerd`. A unit test holds this
-([`input/mod.rs:845`](../../agents/roomlerd/src/input/mod.rs#L845) `fr109_relative_mouse_reads_no_input`,
+([`input/mod.rs:846`](../../agents/roomlerd/src/input/mod.rs#L846) `fr109_relative_mouse_reads_no_input`,
 AC6). It scans the six files relative mode touches for hooks, raw-input registration and reads,
 keyboard-state reads, an evdev grab, XRecord, XI2 event selection and a macOS event tap. It allows exactly
 one key-state call: FR-92's own keep-busy check for a held mouse button (`buttons_held_now`), and only

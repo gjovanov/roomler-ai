@@ -115,7 +115,7 @@ property belongs to the enrollment, not to the host".
 
 ### F2 — the presence sweep cannot host the reaper: a settled-offline row leaves its scan set
 
-`find_presence_scan_set` (`crates/services/src/dao/agent.rs:368`) matches
+`find_presence_scan_set` (`crates/services/src/dao/agent.rs:375`) matches
 
 ```
 deleted_at: null  AND  ( status == Online  OR  last_presence ∈ {online, stale} )

@@ -94,7 +94,7 @@ head-of-line-blocking layer *below* the SCTP one FR-17 is about, on top of the 5
    (`crates/tunnel-core/src/overlay/netcheck.rs:205`). Marked as such because this spec's
    own §8 rule is that absence of measurement is never evidence of absence of capability.
 3. **A high UDP port is a real risk** on the corp-managed hosts, and the codebase already
-   says so: `crates/remote_control/src/signaling.rs:2495` — *"a corp egress that whitelists
+   says so: `crates/remote_control/src/signaling.rs:2660` — *"a corp egress that whitelists
    STUN:3478 still drops the ~10-13k relay band."*
 
 **NOT established — the port choice is a hypothesis, not a finding.** ⚠️ An earlier draft
@@ -198,7 +198,7 @@ two bound `addr:port`s selected by VNI.
 
 **This is the one change that can break the fleet silently. It ships first, alone, as P0.**
 
-`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:2417`) documents itself as safe
+`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:2582`) documents itself as safe
 to extend — *"an unknown/absent value ⇒ the client falls back to its local computation, so
 adding a variant later is forward-compatible"* (`:1976-1978`). **The comment is wrong about
 the "unknown" half and the code does not implement it.** The enum is a plain
@@ -371,7 +371,7 @@ Verdict machinery to extend, verified against master:
 | Server verdict entry point | `crates/api/src/ws/overlay.rs:1851` `server_relay_verdict` |
 | …delegating to the pure decision | `overlay.rs:1944` `relay_verdict_core` |
 | Measured caps supersede presence | `overlay.rs:1893-1902` (in `verdict_from_nodes`, `:1872`) |
-| Wire verdict enum | `crates/remote_control/src/signaling.rs:2419` `RelayStrategyWire` |
+| Wire verdict enum | `crates/remote_control/src/signaling.rs:2584` `RelayStrategyWire` |
 | Client-side cascade consuming it | `crates/tunnel-core/src/overlay/relay_link.rs:1016` `relay_strategy` |
 
 ### 2. Gates — and an honest account of which are actually armed
@@ -409,7 +409,7 @@ is 24 bits, so two `u32`s differing above bit 23 would alias to one session.
 
 ⚠️ **Gate 2's default is not "deny" — it is "off, and permits everything."** The first draft
 claimed four default-deny gates; there are three. `OverlayAclMode` derives `#[default] Off`
-(`crates/remote_control/src/models.rs:1755`), documented as *"every node sees every peer…
+(`crates/remote_control/src/models.rs:1789`), documented as *"every node sees every peer…
 The default, so enabling the feature never breaks a live mesh"*; `Warn` *"ship[s] the
 permissive netmap"*; and `CLAUDE.md`'s own open-issues list records that **nothing has ever
 run under `enforce` in the field**. Tailscale's `cap/relay` is an *affirmative grant*; a
@@ -719,7 +719,7 @@ Verified against `origin/master`, 2026-08-28.
 | Mint + ACL gate + rate limit | `overlay.rs:693` `handle_overlay_relay_request` (cross-tenant `:705-717`, ACL `:719-743`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |
 | **The mint itself (P3c)** | `crates/api/src/ws/org_relay.rs` — `maybe_mint` (gate 1 + idempotency + audit), `plan_mint` (gates 2–5, candidate ranking by probe reports), `revoke_where` + the four trigger wrappers, `reconcile_acl` (on every policy refan), `handle_relay_probe`; `OrgRelayState` holds sessions / per-relay VNI cursors / the Lamport clock / join extras / probes, pod-local |
 | Netmap shaping | `overlay.rs:1982` `shape_peer` |
-| Wire model | `crates/remote_control/src/signaling.rs:2439` `NetmapPeer`; `:2417` `RelayStrategyWire` |
+| Wire model | `crates/remote_control/src/signaling.rs:2604` `NetmapPeer`; `:2582` `RelayStrategyWire` |
 | Reachability report | new `rc:overlay.relay_probe`; **not** `CapVector` (`netcheck.rs:60`) |
 | Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:271` `sweep_carrier_health` |
 | Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2413`; fix `payload_is_wg_or_disco` `transport/derp.rs:222` |
@@ -730,7 +730,7 @@ Verified against `origin/master`, 2026-08-28.
 | CLI surfaces | `agents/roomler-cli/src/localclient.rs:1028` (`relay_qualified_label`), `:252` (`print_why`), `:141` (`netcheck`) |
 
 **Config keys** — four wiring points each, per the contract at
-`crates/agent-core/src/config_surface.rs:34-38`: field on `AgentConfig`; `const KEYS` entry
+`crates/agent-core/src/config_surface.rs:36-38`: field on `AgentConfig`; `const KEYS` entry
 (`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:1805`),
 whose return type is `[(&'static str, Option<bool>); 54]` — **a fixed-size array whose
 length must be bumped** — with `env_bridge_pairs_have_surface_parity` enforcing the pairing.
@@ -1156,7 +1156,7 @@ property to test (E2E-2, E2E-4), not to assert.
   Geneve's 8 bytes is +4 over TURN's ChannelData and costs nothing against DERP (WS over
   TCP). Re-check only if the overlay MTU is ever raised. ⚠️ And do **not** cite
   `roomler diagnose` as the path-MTU instrument — it is
-  `bail!("T3: diagnose not yet wired")` (`agents/roomler-cli/src/cli.rs:587`); only its
+  `bail!("T3: diagnose not yet wired")` (`agents/roomler-cli/src/cli.rs:593`); only its
   doc comment describes the probe.
 
 ---
