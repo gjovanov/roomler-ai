@@ -132,11 +132,12 @@ export const PILLARS: LandingPillar[] = [
   },
 ]
 
+/** The install section's copy. Its cards, the wizard among them, come from
+ *  `installCards` in `enrollCommands.ts`, which offers the wizard only where it
+ *  installs the agent (FR-97 D5). */
 export const DOWNLOAD = {
   title: 'Set up a device in minutes',
-  lead: 'Run the graphical installer or paste one command. Enrollment tokens come from your workspace (Devices → Enroll device).',
-  /** The wizard download each OS's button points at (the API streams it). */
-  wizard: { windows: '/api/setup/windows', linux: '/api/setup/linux', macos: '/api/setup/macos' } as Record<string, string>,
+  lead: 'Paste one command, or on Windows run the graphical installer. Enrollment tokens come from your workspace (Devices → Enroll device).',
 }
 
 export const PRICING = {

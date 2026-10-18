@@ -193,3 +193,29 @@ export function enrollCommands(
     },
   ]
 }
+
+/** One OS's install card on the homepages: `LandingView.vue` and the static `/`. */
+export interface InstallCard {
+  os: EnrollOs
+  title: string
+  /** The one-line install: the card's terminal form. */
+  command: string
+  /**
+   * The graphical installer where it installs the agent, else null. FR-97 D5,
+   * read from the same blocks as the enroll dialog: off Windows Roomler Setup
+   * has only the tunnel client to install. The homepages kept their own per-OS
+   * map until P0c-4, so they offered a visitor on a Mac or Linux a wizard that
+   * could not set up the device they came for.
+   */
+  wizardUrl: string | null
+}
+
+/** The homepages' install cards, one per OS, from the agent's commands. */
+export function installCards(origin: string): InstallCard[] {
+  return enrollCommands('agent', origin, null).map((os) => ({
+    os: os.os,
+    title: os.title,
+    command: os.blocks.find((b) => !b.isDownload)!.command,
+    wizardUrl: os.blocks.find((b) => b.isDownload)?.command ?? null,
+  }))
+}
