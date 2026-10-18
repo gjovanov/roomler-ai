@@ -2217,7 +2217,22 @@ async fn connect_once(
                 }
                 watchdog::tick(ctx.pump);
             }
-            Some(outbound_msg) = outbound_rx.recv() => {
+            Some(mut outbound_msg) = outbound_rx.recv() => {
+                // FR-52 P4 — the choke point for answers this process did not
+                // build itself: a GUI worker's (FR-43), relayed up by the
+                // delegation host. An external session's answer is sealed
+                // here; one that cannot be sealed is replaced by the
+                // session's end — never sent bare.
+                if !crate::extauth::seal_outbound(remote_cfg, &mut outbound_msg)
+                    && let ClientMsg::SdpAnswer { session_id, .. } = outbound_msg
+                {
+                    crate::extauth::end_session(remote_cfg, session_id);
+                    outbound_msg = ClientMsg::Terminate {
+                        session_id,
+                        reason: EndReason::AgentHangup,
+                        limit: None,
+                    };
+                }
                 if let Err(e) = send_msg(&mut ws, &outbound_msg).await {
                     // A failed control-WS write means the connection is
                     // done — warn-and-continue only deferred the cycle to
@@ -2387,6 +2402,7 @@ async fn connect_once(
                 pending_audio.remove(&sid);
                 pending_permissions.remove(&sid);
                 pending_session_meta.remove(&sid);
+                crate::extauth::end_session(remote_cfg, sid);
                 indicator.hide_session(sid.to_hex());
                 watchdog::tick(ctx.pump);
             }
@@ -3004,6 +3020,41 @@ async fn handle_server_msg(
         }
         indicator.hide_prompt(&session_hex);
     }
+    // FR-52 P4 — an EXTERNAL session's offer is judged HERE, ahead of the
+    // delegation below: its binding lives in this process, and a GUI worker
+    // that received the offer would have nothing to check it against. An
+    // ordinary session's offer passes untouched. A refused one ends the
+    // session rather than being dropped — a controller left waiting for an
+    // answer that never comes learns nothing, and neither does the audit.
+    if let ServerMsg::SdpOffer {
+        session_id,
+        sdp,
+        extauth_mac,
+        ..
+    } = &msg
+        && let Err(why) =
+            crate::extauth::check_offer(remote_cfg, *session_id, sdp, extauth_mac.as_deref())
+    {
+        warn!(%session_id, why, "external session: offer refused; ending the session");
+        crate::extauth::end_session(remote_cfg, *session_id);
+        let _ = reply_for_session(
+            ws,
+            delegated,
+            &ClientMsg::Terminate {
+                session_id: *session_id,
+                reason: EndReason::AgentHangup,
+                limit: None,
+            },
+        )
+        .await;
+        return Ok(());
+    }
+    // …and a session's end ends its binding HERE, for the same reason: a
+    // delegated `Terminate` never reaches the arm below. (A no-op for every
+    // session that was not external.)
+    if let ServerMsg::Terminate { session_id, .. } = &msg {
+        crate::extauth::end_session(remote_cfg, *session_id);
+    }
 
     // FR-43 P2b — hand a remote-desktop session to the GUI worker, if there is
     // one. This sits ahead of the whole dispatch rather than inside each of
@@ -3059,11 +3110,41 @@ async fn handle_server_msg(
             // FR-99 P3b — the device's lock ask, taken into the decision at
             // the session's start.
             lock_on_end,
+            external,
         } => {
             // #1882 — the device's overlay decision, resolved HERE, by the
             // daemon: it is the process whose overlay knows the blocks, and a
             // delegated session's worker gets this same value.
             let rc_overlay = crate::rc_overlay::RcOverlay::resolve(rc_overlay);
+            // FR-52 P4 — a controller from OUTSIDE the organization. Admitted
+            // by THIS device or not at all: bound to a login it verified, under
+            // its own ceiling and its own consent mode, never the server's. A
+            // refusal ends the session as the device's own act (`AgentHangup`)
+            // — reported as "a human refused you", it would be a lie.
+            let (permissions, external_consent) = match &external {
+                None => (permissions, None),
+                Some(grant) => match crate::extauth::admit_session(
+                    ctx.is_primary,
+                    remote_cfg,
+                    grant,
+                    controller_user_id,
+                    session_id,
+                    permissions,
+                )
+                .await
+                {
+                    Ok(admitted) => (admitted.permissions, Some(admitted.consent)),
+                    Err(why) => {
+                        info!(%session_id, %controller_user_id, why, "external session refused by this device");
+                        let _ = outbound_tx.try_send(ClientMsg::Terminate {
+                            session_id,
+                            reason: EndReason::AgentHangup,
+                            limit: None,
+                        });
+                        return Ok(());
+                    }
+                },
+            };
             // Multi-org — WHICH organization is asking. The server's display
             // name when it sent one; otherwise this loop's own org label,
             // which at least distinguishes secondaries.
@@ -3077,14 +3158,22 @@ async fn handle_server_msg(
             // checks whether any `[[orgs]]` entry rides alongside it (its
             // config keeps them — only the SYNTHESIZED per-org config has
             // `orgs` cleared).
+            //
+            // FR-52 P4 — an external controller is ALWAYS labelled, single-org
+            // device or not: "which org" has an answer everywhere, and it is
+            // "none of yours".
             let multi_org = !ctx.is_primary || !agent_cfg.orgs.is_empty();
-            let asking_org: Option<String> = multi_org
-                .then(|| {
-                    tenant_name
-                        .clone()
-                        .or_else(|| (!ctx.is_primary).then(|| ctx.label.clone()))
-                })
-                .flatten();
+            let asking_org: Option<String> = if external_consent.is_some() {
+                Some(crate::extauth::OUTSIDE_THE_ORG.to_string())
+            } else {
+                multi_org
+                    .then(|| {
+                        tenant_name
+                            .clone()
+                            .or_else(|| (!ctx.is_primary).then(|| ctx.label.clone()))
+                    })
+                    .flatten()
+            };
             // Pick the best codec for this session from the
             // intersection of (browser-advertised, agent-supported).
             // Stashed per session_id so the rc:sdp.offer handler can
@@ -3127,7 +3216,16 @@ async fn handle_server_msg(
             // `false` so the SdpOffer handler never tries to add a track
             // this build can't feed — matches the transport intersection
             // above.
-            let audio_negotiated = audio_enabled && !our_caps.audio.is_empty();
+            //
+            // FR-52 P4 — and an EXTERNAL session hears the machine only when
+            // its grant carries AUDIO. A ceiling the org or this device set has
+            // to bound everything that leaves the host, and system audio does;
+            // an ordinary session keeps the historical opt-in unchanged.
+            let audio_negotiated = audio_enabled
+                && !our_caps.audio.is_empty()
+                && (external_consent.is_none()
+                    || permissions
+                        .contains(roomler_ai_remote_control::permissions::Permissions::AUDIO));
             pending_audio.insert(session_id, audio_negotiated);
             // Clipboard-v2 hardening — stash the session's permission
             // bitfield so the SdpOffer handler can hand it to the
@@ -3195,18 +3293,34 @@ async fn handle_server_msg(
             let host_window = std::time::Duration::from_secs(
                 host_prompt_timeout_secs.unwrap_or(consent_timeout_secs) as u64,
             );
-            let directed_mode: Option<crate::consent::Mode> = consent_mode.map(|m| match m {
-                roomler_ai_remote_control::models::ConsentMode::Auto => {
-                    crate::consent::Mode::AutoGrant
+            let directed_mode: Option<crate::consent::Mode> = match external_consent {
+                // FR-52 P4 — for an EXTERNAL session the server's directive is
+                // not consulted at all: gate 5 is this device's, and
+                // `external_consent_mode` is its answer. The local floor below
+                // still applies — a device that asks about everyone asks about
+                // strangers too.
+                Some(crate::extauth::ExternalConsent::Auto) => {
+                    Some(crate::consent::Mode::AutoGrant)
                 }
-                // Prompt + the async owner-side channels (Email / Push /
-                // PromptThenEmail) all resolve to an on-host prompt at the
-                // agent: the server drives the owner channels itself (Phase 4)
-                // and asks the agent to prompt as the on-console path/fallback.
-                _ => crate::consent::Mode::Prompt {
-                    timeout: host_window,
-                },
-            });
+                Some(crate::extauth::ExternalConsent::Prompt) => {
+                    Some(crate::consent::Mode::Prompt {
+                        timeout: host_window,
+                    })
+                }
+                None => consent_mode.map(|m| match m {
+                    roomler_ai_remote_control::models::ConsentMode::Auto => {
+                        crate::consent::Mode::AutoGrant
+                    }
+                    // Prompt + the async owner-side channels (Email / Push /
+                    // PromptThenEmail) all resolve to an on-host prompt at the
+                    // agent: the server drives the owner channels itself
+                    // (Phase 4) and asks the agent to prompt as the on-console
+                    // path/fallback.
+                    _ => crate::consent::Mode::Prompt {
+                        timeout: host_window,
+                    },
+                }),
+            };
             // FR-27 — resolve directive AGAINST the local setting, taking the
             // stricter. This used to be `directed_mode.unwrap_or(local)`, i.e.
             // the directive simply won — so a device that had set
@@ -3317,11 +3431,16 @@ async fn handle_server_msg(
             // just waits; when the owner approves, the server sends `rc:ready`,
             // the controller offers, and the agent builds the peer from the
             // media context stashed above.
-            let owner_side_consent = matches!(
-                consent_mode,
-                Some(roomler_ai_remote_control::models::ConsentMode::Email)
-                    | Some(roomler_ai_remote_control::models::ConsentMode::Push)
-            );
+            //
+            // ⚠️ FR-52 P4 — never for an external session, whatever the server
+            // says: the device decides that one itself, and an offer it did
+            // not consent to is refused at `check_offer`.
+            let owner_side_consent = external_consent.is_none()
+                && matches!(
+                    consent_mode,
+                    Some(roomler_ai_remote_control::models::ConsentMode::Email)
+                        | Some(roomler_ai_remote_control::models::ConsentMode::Push)
+                );
             // Phase 3 — when this session will PROMPT on the host, drop a
             // `.pending` marker so the tray can pop a rich Approve/Deny modal
             // (the agent→tray signal). Auto grants + owner-side modes write
@@ -3346,6 +3465,19 @@ async fn handle_server_msg(
                 // clients), or in a build without the per-OS feature — and
                 // `show_prompt` says which by returning false.
                 //
+                // FR-52 P4 — an external request says so in its TITLE, not
+                // only in the org line: the controller's name is whatever
+                // they chose to call themselves, and the one fact the person
+                // at the machine must not miss is that they are not a
+                // colleague.
+                let (prompt_title, prompt_detail) = if external_consent.is_some() {
+                    (
+                        crate::extauth::EXTERNAL_PROMPT_TITLE,
+                        crate::extauth::EXTERNAL_PROMPT_DETAIL,
+                    )
+                } else {
+                    ("Remote control request", "")
+                };
                 // FR-99 — a grant that may cover the screen says so, on every
                 // surface, in the line the person reads before deciding; and
                 // only when this device would act on it.
@@ -3359,14 +3491,19 @@ async fn handle_server_msg(
                 // FR-101 P2b — and the features the person is asked about, by
                 // name: approving the session is what grants them. One line
                 // each; the native panel's detail box holds two.
-                let privacy_line = [privacy_line.as_str(), features_line.as_str()]
+                //
+                // FR-52 P4 — an outsider's line comes LAST: the title already
+                // says they are from outside the organization, while the lines
+                // above it name what approving grants, which a two-line box
+                // must not be the one to cut.
+                let privacy_line = [privacy_line.as_str(), features_line.as_str(), prompt_detail]
                     .into_iter()
                     .filter(|l| !l.is_empty())
                     .collect::<Vec<_>>()
                     .join("\n");
                 let view = crate::indicator::PromptView {
                     session_hex: session_hex.clone(),
-                    title: "Remote control request".into(),
+                    title: prompt_title.into(),
                     lead: format!("{controller_name} is requesting to control this device."),
                     detail: privacy_line.clone(),
                     permissions: permissions.wire_names(),
@@ -3507,6 +3644,8 @@ async fn handle_server_msg(
                 // below has been polled yet. (A spawned task has no ordering
                 // guarantee against the loop that spawned it.)
                 let prompt = consent_broker.request_with_mode(&session_hex, effective_mode);
+                // FR-52 P4 — only an external session carries the config in.
+                let external_cfg = external_consent.map(|_| remote_cfg.clone());
                 tokio::spawn(async move {
                     let decision =
                         await_prompt_or_socket_end(prompt, &outbound, &session_hex).await;
@@ -3518,10 +3657,12 @@ async fn handle_server_msg(
                     // — a panel still on screen for a resolved session is its
                     // own bug, and a stale Approve button is a dangerous one.
                     ind.hide_prompt(&session_hex);
-                    let Some(reply) = consent_reply(decision, have_surface) else {
+                    let Some(mut reply) = consent_reply(decision, have_surface) else {
                         // #1632 — the session was terminated while the
                         // question stood. The server forgot it when it sent
-                        // the Terminate; there is nobody to answer to.
+                        // the Terminate; there is nobody to answer to. (An
+                        // external binding ended with that Terminate, ahead
+                        // of the delegation gate.)
                         tracing::info!(
                             session = %session_hex,
                             ?decision,
@@ -3530,6 +3671,18 @@ async fn handle_server_msg(
                         );
                         return;
                     };
+                    // FR-52 P4 — an external grant is recorded BEFORE it leaves:
+                    // the offer it unlocks must never overtake it to
+                    // `check_offer`. A binding that ended while the question
+                    // stood cannot be granted any more; anything but a grant
+                    // ends the binding here.
+                    if let Some(cfg) = &external_cfg {
+                        if reply.granted {
+                            reply.granted = crate::extauth::grant_consent(cfg, session_id);
+                        } else {
+                            crate::extauth::end_session(cfg, session_id);
+                        }
+                    }
                     tracing::info!(
                         session = %session_hex,
                         ?decision,
@@ -3556,6 +3709,8 @@ async fn handle_server_msg(
             session_id,
             sdp,
             ice_servers,
+            // FR-52 P4 — already judged, ahead of the delegation branch.
+            extauth_mac: _,
         } => {
             info!(%session_id, sdp_len = sdp.len(), "rc:sdp.offer — creating peer");
 
@@ -3786,6 +3941,35 @@ async fn handle_server_msg(
                 }
             };
 
+            // FR-52 P4 — an external session's answer carries a MAC over THIS
+            // device's DTLS certificate, which the browser checks before it
+            // trusts the transport: whoever relays the signalling cannot stand
+            // in for the device. Sealed before the banner goes up, because an
+            // answer that cannot be sealed ends the session instead. (A GUI
+            // worker holds no binding, so its answers go up unsealed and the
+            // root daemon seals them on the way out — `seal_outbound`.)
+            let extauth_mac = match crate::extauth::seal_answer(remote_cfg, session_id, &answer_sdp)
+            {
+                crate::extauth::Seal::Ordinary => None,
+                crate::extauth::Seal::Sealed(mac) => Some(mac),
+                crate::extauth::Seal::Refused(why) => {
+                    warn!(%session_id, why, "external session: answer withheld; ending the session");
+                    let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
+                    crate::extauth::end_session(remote_cfg, session_id);
+                    let _ = reply_for_session(
+                        ws,
+                        delegated,
+                        &ClientMsg::Terminate {
+                            session_id,
+                            reason: EndReason::AgentHangup,
+                            limit: None,
+                        },
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+
             // FR-27 follow-up — the session is now established (peer built,
             // answer ready): raise the "Being viewed by …" banner and publish
             // to the LocalAPI session registry. Deferred to here from request
@@ -3808,6 +3992,7 @@ async fn handle_server_msg(
                 &ClientMsg::SdpAnswer {
                     session_id,
                     sdp: answer_sdp,
+                    extauth_mac,
                 },
             )
             .await
@@ -3918,6 +4103,9 @@ async fn handle_server_msg(
             pending_audio.remove(&session_id);
             pending_permissions.remove(&session_id);
             pending_session_meta.remove(&session_id);
+            // (FR-52 P4 — an external session's binding already ended ahead
+            // of the delegation branch, which a delegated Terminate never
+            // gets past.)
             indicator.hide_session(session_id.to_hex());
         }
 

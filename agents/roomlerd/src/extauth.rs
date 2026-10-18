@@ -14,8 +14,10 @@
 //! record, a build without the stack. Telling them apart would let whoever
 //! holds the connect code — which is dictated aloud — read the device's setup.
 
+use bson::oid::ObjectId;
 use roomler_ai_remote_control::models::ExtauthRefusal;
-use roomler_ai_remote_control::signaling::ClientMsg;
+use roomler_ai_remote_control::permissions::Permissions;
+use roomler_ai_remote_control::signaling::{ClientMsg, ExternalGrant};
 
 use crate::remote_config::RemoteConfigServices;
 
@@ -85,17 +87,215 @@ pub async fn on_ke3(
     }
 }
 
+// ─── P4 — the session a verified login opens ─────────────────────────────────
+//
+// The server admits an external session on gates 1 and 2 and names the login it
+// rests on (`Request.external`); everything else is decided HERE, and none of it
+// on the server's word. Six refusal points, in the order a session meets them:
+//
+// 1. `admit_session` — the primary org's socket; gate 3 and a password, read
+//    live; this device's own consent mode and ceiling; and the verified login,
+//    consumed (one login, one session).
+// 2. `grant_consent` — gate 5 is this device's decision; recorded before the
+//    grant leaves, so the offer it unlocks cannot overtake it.
+// 3. `check_offer` — no offer before that consent, exactly one offer, and a MAC
+//    over its DTLS certificate under the login's key: the controller that sends
+//    it is the one that proved the password, and the certificate is the one
+//    DTLS will be pinned to. Taken BEFORE an offer can be delegated to a GUI
+//    worker (FR-43), because the binding lives only in this process.
+// 4. `seal_answer` — the answer carries a MAC over the DEVICE's certificate, so
+//    the browser can check it is talking to the device and not to whoever
+//    relays the signalling. Sealing ends the binding; the key goes with it.
+//
+// ⚠️ "Not bound" means ORDINARY session and is the only answer on which an offer
+// proceeds without a MAC — so a session that WAS external is remembered after
+// its binding ends (`external_logins::Inner::ended`), never forgotten into one.
+
+/// FR-52 P4 — who is asking, wherever the person at the machine is shown it:
+/// the consent prompt and the "being viewed by" banner. Never an organization's
+/// name — the one thing this label is for is saying that it is not theirs.
+pub const OUTSIDE_THE_ORG: &str = "Outside your organization";
+
+/// FR-52 P4 — the consent prompt's title for an external request. In the title
+/// because the controller's NAME is whatever they chose to call themselves.
+pub const EXTERNAL_PROMPT_TITLE: &str = "Remote control request from OUTSIDE your organization";
+
+/// … and the line under it: what the request rests on, and what to do.
+pub const EXTERNAL_PROMPT_DETAIL: &str = "This person is not a member of your organization. \
+     They proved this device's external-access password. Approve only if you are expecting them.";
+
+/// How THIS device obtains consent for an external session
+/// (`external_consent_mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalConsent {
+    /// Ask whoever is at the machine. The default.
+    Prompt,
+    /// Unattended — chosen on this device, by whoever holds it.
+    Auto,
+}
+
+/// An external session this device admitted, on its own terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Admitted {
+    /// The grant after this device's own ceiling (`external_max_permissions`).
+    pub permissions: Permissions,
+    pub consent: ExternalConsent,
+}
+
+/// `rc:request` with `external` set → admitted on this device's terms, or the
+/// reason it is not. The reason is for this device's log: the controller is
+/// told only that the device ended the session.
+pub async fn admit_session(
+    is_primary: bool,
+    remote_cfg: &RemoteConfigServices,
+    grant: &ExternalGrant,
+    principal: ObjectId,
+    session_id: ObjectId,
+    requested: Permissions,
+) -> Result<Admitted, &'static str> {
+    #[cfg(feature = "external-access")]
+    {
+        imp::admit_session(
+            remote_cfg.external_logins(),
+            is_primary,
+            remote_cfg,
+            &grant.attempt_id,
+            &principal.to_hex(),
+            &session_id.to_hex(),
+            requested,
+            std::time::Instant::now(),
+        )
+        .await
+    }
+    #[cfg(not(feature = "external-access"))]
+    {
+        let _ = (
+            is_primary, remote_cfg, grant, principal, session_id, requested,
+        );
+        Err("this build cannot hold an external-access password")
+    }
+}
+
+/// THIS device granted consent for external session `session_id`. Call BEFORE
+/// the grant is sent. `false` = its binding is gone (it ended meanwhile): send a
+/// refusal instead of the grant.
+pub fn grant_consent(remote_cfg: &RemoteConfigServices, session_id: ObjectId) -> bool {
+    #[cfg(feature = "external-access")]
+    {
+        remote_cfg
+            .external_logins()
+            .grant_consent(&session_id.to_hex())
+    }
+    #[cfg(not(feature = "external-access"))]
+    {
+        let _ = (remote_cfg, session_id);
+        false
+    }
+}
+
+/// The session is over. A no-op for a session that was never external, so every
+/// path that ends a session may call it without asking which kind it was.
+pub fn end_session(remote_cfg: &RemoteConfigServices, session_id: ObjectId) {
+    #[cfg(feature = "external-access")]
+    remote_cfg
+        .external_logins()
+        .end_session(&session_id.to_hex());
+    #[cfg(not(feature = "external-access"))]
+    let _ = (remote_cfg, session_id);
+}
+
+/// May this `rc:sdp.offer` build a peer? `Ok` for an ordinary session and for
+/// an external one whose offer verifies; `Err(why)` = end the session.
+pub fn check_offer(
+    remote_cfg: &RemoteConfigServices,
+    session_id: ObjectId,
+    sdp: &str,
+    mac: Option<&str>,
+) -> Result<(), &'static str> {
+    #[cfg(feature = "external-access")]
+    {
+        imp::check_offer(
+            remote_cfg.external_logins(),
+            &session_id.to_hex(),
+            sdp,
+            mac,
+            std::time::Instant::now(),
+        )
+    }
+    #[cfg(not(feature = "external-access"))]
+    {
+        // No binding can exist in this build: every session is ordinary.
+        let _ = (remote_cfg, session_id, sdp, mac);
+        Ok(())
+    }
+}
+
+/// What to do with an outgoing `rc:sdp.answer`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Seal {
+    /// An ordinary session: send it as it is.
+    Ordinary,
+    /// An external session: send it with this `extauth_mac`.
+    Sealed(String),
+    /// An external session whose answer must NOT go out; end the session.
+    Refused(&'static str),
+}
+
+/// Seal an answer for `session_id`, if it is an external session's.
+pub fn seal_answer(remote_cfg: &RemoteConfigServices, session_id: ObjectId, sdp: &str) -> Seal {
+    #[cfg(feature = "external-access")]
+    {
+        imp::seal_answer(remote_cfg.external_logins(), &session_id.to_hex(), sdp)
+    }
+    #[cfg(not(feature = "external-access"))]
+    {
+        let _ = (remote_cfg, session_id, sdp);
+        Seal::Ordinary
+    }
+}
+
+/// Seal `msg` in place if it is an external session's answer — the choke point
+/// for answers that did not come from this process's own offer handler (a GUI
+/// worker's, relayed up by `delegate::DelegateHost`). `false` = it must not be
+/// sent; the caller ends the session instead.
+pub fn seal_outbound(remote_cfg: &RemoteConfigServices, msg: &mut ClientMsg) -> bool {
+    let ClientMsg::SdpAnswer {
+        session_id,
+        sdp,
+        extauth_mac,
+    } = msg
+    else {
+        return true;
+    };
+    match seal_answer(remote_cfg, *session_id, sdp) {
+        // Whatever a worker put there is not ours to vouch for.
+        Seal::Ordinary => {
+            *extauth_mac = None;
+            true
+        }
+        Seal::Sealed(mac) => {
+            *extauth_mac = Some(mac);
+            true
+        }
+        Seal::Refused(why) => {
+            tracing::warn!(%session_id, why, "external session: answer withheld");
+            false
+        }
+    }
+}
+
 #[cfg(feature = "external-access")]
 mod imp {
     use std::time::{Duration, Instant};
 
     use base64::Engine as _;
     use roomler_ai_remote_control::models::ExtauthRefusal;
+    use roomler_ai_remote_control::permissions::Permissions;
     use roomler_ai_remote_control::signaling::ClientMsg;
     use tracing::info;
 
-    use super::refused;
-    use crate::external_logins::{ExternalLogins, Refusal};
+    use super::{Admitted, ExternalConsent, Seal, refused};
+    use crate::external_logins::{BindingError, ExternalLogins, Refusal};
     use crate::remote_config::RemoteConfigServices;
 
     /// `@serenity-kit/opaque`'s encoding, strictly: a padded or standard-alphabet
@@ -200,6 +400,99 @@ mod imp {
                 info!(%attempt_id, %principal, refusal = ?r, "extauth: KE3 refused");
                 let (why, retry) = map(r);
                 refused(attempt_id, why, retry)
+            }
+        }
+    }
+
+    /// See [`super::admit_session`]. The login is consumed LAST, so a refusal
+    /// on this device's own terms leaves it unspent.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn admit_session(
+        logins: &ExternalLogins,
+        is_primary: bool,
+        remote_cfg: &RemoteConfigServices,
+        attempt_id: &str,
+        principal: &str,
+        session_id: &str,
+        requested: Permissions,
+        now: Instant,
+    ) -> Result<Admitted, &'static str> {
+        // PRIMARY ORG ONLY, as for the login: the screen, the keyboard and the
+        // password are the host's, and the host's belong to the enrollment
+        // that owns it.
+        if !is_primary {
+            return Err("not the primary org's socket");
+        }
+        let Some(terms) = remote_cfg.external_session_live().await else {
+            return Err("external access is off here (gate 3), or no password is set");
+        };
+        // An unreadable mode is a refusal, never a fallback: `auto` is the one
+        // value that skips a human, and a typo must not be what decides that.
+        let consent = match terms.consent_mode.as_deref().map(str::trim) {
+            None | Some("") | Some("prompt") => ExternalConsent::Prompt,
+            Some("auto") => ExternalConsent::Auto,
+            Some(_) => return Err("external_consent_mode is neither prompt nor auto"),
+        };
+        let permissions = match terms
+            .max_permissions
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            // Unset defers to the org's ceiling, which the server applied.
+            None => requested,
+            Some(ceiling) => match Permissions::from_wire_names(ceiling) {
+                Some(ceiling) => requested & ceiling,
+                None => return Err("external_max_permissions names an unknown permission"),
+            },
+        };
+        if permissions.is_empty() {
+            return Err("nothing the session asked for is within this device's ceiling");
+        }
+        if !logins.bind_session(attempt_id, principal, session_id, now) {
+            return Err(
+                "no verified login for this session: expired, used, or another principal's",
+            );
+        }
+        Ok(Admitted {
+            permissions,
+            consent,
+        })
+    }
+
+    pub(super) fn check_offer(
+        logins: &ExternalLogins,
+        session_id: &str,
+        sdp: &str,
+        mac: Option<&str>,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        match logins.verify_offer(session_id, sdp, mac, now) {
+            Ok(()) | Err(BindingError::NotBound) => Ok(()),
+            Err(e) => Err(describe(e)),
+        }
+    }
+
+    pub(super) fn seal_answer(logins: &ExternalLogins, session_id: &str, sdp: &str) -> Seal {
+        match logins.seal_answer(session_id, sdp) {
+            Ok(mac) => Seal::Sealed(mac),
+            Err(BindingError::NotBound) => Seal::Ordinary,
+            Err(e) => Seal::Refused(describe(e)),
+        }
+    }
+
+    fn describe(e: BindingError) -> &'static str {
+        match e {
+            BindingError::NotBound => "not an external session",
+            BindingError::Ended => "the external session is already over",
+            BindingError::NotConsented => "an offer before this device granted consent",
+            BindingError::AlreadyOffered => "a second offer",
+            BindingError::NotOffered => "an answer to no admitted offer",
+            BindingError::NoFingerprint => "the SDP names no DTLS certificate",
+            BindingError::AmbiguousFingerprint => "the SDP names more than one DTLS certificate",
+            BindingError::MissingMac => "an external offer without its MAC",
+            BindingError::BadMac => {
+                "the offer's MAC does not verify: it was not made by the login that admitted the session"
             }
         }
     }
@@ -387,6 +680,234 @@ mod imp {
             let r = on_ke1(&logins, true, &svc, "a1".into(), WHO.into(), &padded, now).await;
             assert_eq!(refusal_of(&r), Some((ExtauthRefusal::Malformed, None)));
             assert_eq!(logins.answered_guesses(now), 0);
+        }
+
+        // ─── P4 — admitting the session ─────────────────────────────────
+
+        const SESSION: &str = "66f0c0ffee0000000000000a";
+        const SESSION_B: &str = "66f0c0ffee0000000000000b";
+
+        /// A whole login through this device's own handlers, as a browser
+        /// would run it.
+        async fn verified_login(
+            logins: &ExternalLogins,
+            svc: &RemoteConfigServices,
+            attempt: &str,
+            now: Instant,
+        ) {
+            let (state, ke1) = client_ke1(&pw("right"));
+            let ClientMsg::ExtauthKe2 { ke2, .. } =
+                on_ke1(logins, true, svc, attempt.into(), WHO.into(), &ke1, now).await
+            else {
+                panic!("expected a KE2");
+            };
+            let done = state
+                .finish(
+                    &mut OsRng,
+                    pw("right").as_bytes(),
+                    CredentialResponse::<Suite>::deserialize(&b64url().decode(ke2).unwrap())
+                        .unwrap(),
+                    ClientLoginFinishParameters::default(),
+                )
+                .unwrap();
+            let ke3 = b64url().encode(done.message.serialize());
+            let outcome = on_ke3(logins, true, svc, attempt.into(), WHO.into(), &ke3, now).await;
+            assert!(matches!(
+                outcome,
+                ClientMsg::ExtauthOutcome { refused: None, .. }
+            ));
+        }
+
+        /// The device's own terms, as its owner would set them.
+        fn set_terms(
+            dir: &tempfile::TempDir,
+            enabled: bool,
+            consent: Option<&str>,
+            ceiling: Option<&str>,
+        ) {
+            let path = dir.path().join("config.toml");
+            let mut cfg = crate::config::load(&path).unwrap();
+            cfg.external_access_enabled = enabled;
+            cfg.external_consent_mode = consent.map(str::to_string);
+            cfg.external_max_permissions = ceiling.map(str::to_string);
+            crate::config::save(&path, &cfg).unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_session_is_admitted_on_the_devices_own_terms() {
+            let logins = ExternalLogins::new();
+            let (dir, svc) = device(true, Some(&pw("right")));
+            let now = Instant::now();
+            let asked = Permissions::VIEW | Permissions::INPUT | Permissions::CLIPBOARD;
+
+            // Unset: prompt, and the grant as the server clamped it.
+            verified_login(&logins, &svc, "a1", now).await;
+            let admitted = admit_session(&logins, true, &svc, "a1", WHO, SESSION, asked, now)
+                .await
+                .unwrap();
+            assert_eq!(
+                admitted,
+                Admitted {
+                    permissions: asked,
+                    consent: ExternalConsent::Prompt,
+                }
+            );
+
+            // Set: the device's ceiling INTERSECTS (FILES is not granted
+            // because it is allowed here — it was never asked for), and
+            // `auto` is honoured.
+            set_terms(&dir, true, Some("auto"), Some(" VIEW | FILES "));
+            verified_login(&logins, &svc, "a2", now).await;
+            let admitted = admit_session(&logins, true, &svc, "a2", WHO, SESSION_B, asked, now)
+                .await
+                .unwrap();
+            assert_eq!(
+                admitted,
+                Admitted {
+                    permissions: Permissions::VIEW,
+                    consent: ExternalConsent::Auto,
+                }
+            );
+        }
+
+        /// Every refusal on the device's own terms leaves the login UNSPENT and
+        /// NO binding behind: the login is consumed only once the session is
+        /// otherwise admissible. Consumed first, each refused session would
+        /// hold a binding — a table slot — until it aged out.
+        ///
+        /// ⚠️ The survivor check admits a FRESH session id. Re-admitting the
+        /// refused one on the same login is idempotent (the server re-pushes a
+        /// pending Request after a socket flap), so it would pass even with the
+        /// login consumed on the first refusal — which is how the first
+        /// version of this test let exactly that mutation through.
+        #[tokio::test]
+        async fn a_refusal_on_the_devices_terms_leaves_the_login_unspent() {
+            let logins = ExternalLogins::new();
+            let (dir, svc) = device(true, Some(&pw("right")));
+            let now = Instant::now();
+            let asked = Permissions::INPUT;
+            verified_login(&logins, &svc, "a1", now).await;
+            for (label, primary, enabled, consent, ceiling) in [
+                ("a secondary org's socket", false, true, None, None),
+                (
+                    "gate 3 switched off since the login",
+                    true,
+                    false,
+                    None,
+                    None,
+                ),
+                (
+                    "an unreadable consent mode",
+                    true,
+                    true,
+                    Some("sometimes"),
+                    None,
+                ),
+                (
+                    "an unreadable ceiling",
+                    true,
+                    true,
+                    None,
+                    Some("VIEW | TELEPORT"),
+                ),
+                (
+                    "a ceiling that leaves nothing",
+                    true,
+                    true,
+                    None,
+                    Some("VIEW"),
+                ),
+            ] {
+                set_terms(&dir, enabled, consent, ceiling);
+                let r = admit_session(&logins, primary, &svc, "a1", WHO, SESSION, asked, now).await;
+                assert!(r.is_err(), "{label}: admitted {r:?}");
+            }
+            set_terms(&dir, true, None, None);
+            assert!(
+                admit_session(&logins, true, &svc, "a1", WHO, SESSION_B, asked, now)
+                    .await
+                    .is_ok(),
+                "the login survived every refusal, and no refused session kept it"
+            );
+            assert!(
+                admit_session(
+                    &logins,
+                    true,
+                    &svc,
+                    "a1",
+                    WHO,
+                    "66f0c0ffee0000000000000c",
+                    asked,
+                    now
+                )
+                .await
+                .is_err(),
+                "and admits exactly one session"
+            );
+            assert!(
+                admit_session(
+                    &logins,
+                    true,
+                    &svc,
+                    "a9",
+                    WHO,
+                    "66f0c0ffee0000000000000d",
+                    asked,
+                    now
+                )
+                .await
+                .is_err(),
+                "no login, no session"
+            );
+        }
+
+        /// The GUI worker's answers reach the server through `seal_outbound`:
+        /// an ordinary session's answer goes as it is — minus anything a
+        /// worker claimed — and an ended external session's does not go.
+        #[tokio::test]
+        async fn the_outbound_choke_point_vouches_only_for_what_it_holds() {
+            let (_dir, svc) = device(true, Some(&pw("right")));
+            let sid = bson::oid::ObjectId::parse_str(SESSION).unwrap();
+            let mut ordinary = ClientMsg::SdpAnswer {
+                session_id: sid,
+                sdp: "v=0".into(),
+                extauth_mac: Some("forged-by-a-worker".into()),
+            };
+            assert!(super::super::seal_outbound(&svc, &mut ordinary));
+            assert!(
+                matches!(
+                    ordinary,
+                    ClientMsg::SdpAnswer {
+                        extauth_mac: None,
+                        ..
+                    }
+                ),
+                "not ours to vouch for"
+            );
+            let now = Instant::now();
+            verified_login(svc.external_logins(), &svc, "a1", now).await;
+            admit_session(
+                svc.external_logins(),
+                true,
+                &svc,
+                "a1",
+                WHO,
+                SESSION,
+                Permissions::VIEW,
+                now,
+            )
+            .await
+            .unwrap();
+            super::super::end_session(&svc, sid);
+            let mut ended = ClientMsg::SdpAnswer {
+                session_id: sid,
+                sdp: "v=0".into(),
+                extauth_mac: None,
+            };
+            assert!(
+                !super::super::seal_outbound(&svc, &mut ended),
+                "an external session's answer is never sent unsealed"
+            );
         }
     }
 }
