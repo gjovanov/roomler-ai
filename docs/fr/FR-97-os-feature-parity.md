@@ -31,8 +31,14 @@
 - P5a, `console_user` on Linux and macOS (the person at logind's seat0 or owning `/dev/console`, by the drop a
   `named` account takes; refused while nobody is there), for SSH and for Fleet RPC's `run_as`, merged (#2441),
   field-verified red → green on a Linux root daemon, a Linux per-user daemon and a Mac's root daemon (§8).
-- P5b, a person's SSH session starts in their home (Linux and macOS) or profile (Windows), as sshd starts it, is
-  in review.
+- P5b, a person's SSH session starts in their home (Linux and macOS) or profile (Windows), as sshd starts it,
+  merged (#2443), field-verified red → green on a Linux root daemon, a Win11 SystemContext guest and a Mac's root
+  daemon (§8).
+- P6a, the updater binding the `.deb`, `.pkg` and tarball to the release they are offered as (the MSI's binding,
+  on Linux and macOS), is in review: an attack red on 0.4.143, green on its candidate, and each reader read against
+  the last three releases' real artifacts (§8).
+- P6f needs no build: Windows got its private staging directory with GHSA-r3xj-4wh9-xh2v (0.4.142), and on macOS
+  the root update helper's temp directory was measured to be root's own (§3.11, §8).
 - The rest of P2–P7 is open.
 
 **Owner:** the agent on all
@@ -203,15 +209,15 @@ and the consent chain's fallbacks.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | O1 | A per-user install updates itself | ✅ | ❌ | ✅ | #2046 | FR-96 |
-| O2 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | ❌ | ❌ | `Unsupported` → the install proceeds (`artifact_version.rs:272-289`, `updater.rs:1404`): a signed older package under a newer manifest installs | P6a |
+| O2 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | 🟡 built (P6a) | 🟡 built (P6a) | Was: `Unsupported`, so the install proceeded and a signed older package under a newer manifest installed (measured on 0.4.143, §8). P6a reads the `.deb`'s control `Version`, the tarball's top directory and the `.pkg`'s `PackageInfo` (`artifact_version.rs:114`) | P6a |
 | O3 | Tunnel CLI `roomler self-update` | ✅ | ❌ | ❌ | `agents/roomler-cli/src/update.rs:96-101` | P6b |
-| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:4932` | P6c |
+| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:5001` | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 apt only; the tarball has none | ❌ | A pasted recipe (`docs/installation.md:394-420`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
 | O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | ❌ | `macos_supervisor.rs` never calls `crash_recorder` | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1170-1179` | P6f |
-| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`main.rs:3088`, `session_end.rs:220`) | P4d |
+| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`main.rs:3114`, `session_end.rs:220`) | P4d |
 | A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2312-2318`); the CLI and the wizard are universal | D6 |
 | A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:80-81`); behaviour under emulation unverified | D6 |
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` (`release-agent.yml:1093`); recordings write Opus, not AAC | P7a |
@@ -664,7 +670,7 @@ test of the SIGKILL property itself.
     through Unix tools.
   - Kill switch: `hive_adopt`, the device's own key, default off. `docs/hive.md` §8 (*On Windows*).
 - **P4d, a clean stop for Scheduled-Task installs** (built). Two channels into the arm the SCM host's event already
-  reaches (`main.rs:3088`):
+  reaches (`main.rs:3114`):
   - **`roomlerd service stop`** signals a `Local\` event keyed by the config's instance id (`stop_event.rs:338`),
     waits up to 15 s for the daemon to leave, and only then ends the task (`service.rs:558`).
   - **A hidden top-level window** turns `WM_ENDSESSION` into the stop and holds the session's end for at most 5 s,
@@ -721,10 +727,21 @@ model on Windows, so the three agree on what the mode means.
 
 ### 3.11 P6 — install, update, ops
 
-- **P6a, the artifact's own version.** `.deb` `control` (`dpkg-deb -f`, or `ar` + `tar` in-process), `.pkg`
-  `PackageInfo` (`pkgutil --expand`), the tarball's top directory; refuse a mismatch exactly as the MSI reader does.
-  ⚠️ A wrong reader refuses every update fleet-wide: land each reader behind its kill switch and prove it against the
-  last three real releases first.
+- **P6a, the artifact's own version (built).** Each format states its version inside the bytes its `.asc` signs, and
+  `download_asset` refuses when that disagrees with the tag `is_newer` read (`updater.rs:1680`), as it always has for
+  the MSI:
+  - the `.deb`: its control `Version` through `dpkg-deb --field` (`artifact_version.rs:287`), from the dpkg the
+    updater requires before it picks a `.deb`; cargo-deb's revision (`0.4.142-1`) and any epoch are dropped;
+  - the tarball: its one top directory, `roomlerd-<version>-<target>`, through `tar -tzf` (`artifact_version.rs:333`);
+  - the `.pkg`: the `version` on `<pkg-info identifier="com.roomler.agent">` in the component `PackageInfo`, through
+    `pkgutil --expand` into a fresh directory that is removed on every path (`artifact_version.rs:376`).
+  - A `.deb` on a host with no `dpkg-deb` reads `Unsupported`, which is not a refusal: its install would fail anyway.
+    An unreadable artifact *is* a refusal.
+  - The `.deb`'s `Package` is not bound. A feed that swaps in the companion's `.deb` at the same version gains a
+    freeze, which withholding gives it anyway, and a name check is one more way to refuse every update.
+  - ⚠️ A wrong reader refuses every update fleet-wide: the three sit behind `ROOMLERD_ARTIFACT_VERSION_CHECK=0` (the
+    MSI's does not), and each was read against the last three releases' real artifacts before it shipped (§8). A hidden
+    `roomlerd artifact-version <file> <tag>` runs the updater's check on a file, for that proof and its re-runs.
 - **P6b, `roomler self-update` on Unix.** Download → verify → `rename(2)` over the binary. The pinned PGP check moves to
   `tunnel-core` so the CLI can share it (CLAUDE.md's known issue; mind the `windows-sys` 0.59 / 0.61 split).
 - **P6c, `roomlerd service install --system`** on Linux (`systemctl enable --now roomlerd.service`) and macOS (bootstrap
@@ -733,7 +750,13 @@ model on Windows, so the three agree on what the mode means.
 - **P6e, macOS supervision.** The FR-43 supervisor records a worker that dies before its own panic hook (stderr tail →
   `record_with_log_tail`); drop the launchd `StandardOutPath` duplication and the daemon's `eprintln!`s (#1538).
 - **P6f, a fresh private staging directory per download** on Windows and macOS, as Linux has had since FR-96's
-  security review.
+  security review. **Settled without a build.**
+  - *Windows* got exactly that with GHSA-r3xj-4wh9-xh2v, released in 0.4.142 (`updater.rs:1208`).
+  - *macOS* keeps its one fixed `roomlerd-update` directory, because the hazard is not there, measured on a Mac
+    (§8). The root update helper's launchd job sets no `TMPDIR`. With `TMPDIR` unset, `std::env::temp_dir()` on
+    Apple is `confstr(_CS_DARWIN_USER_TEMP_DIR)`: for root that is `/var/folders/zz/…/T/`, `drwx------ root`.
+  - Linux's #2055 needed a directory another account could create first, and this one no other account can create,
+    rename or unlink in.
 
 ### 3.12 P7 — architectures
 
@@ -790,12 +813,12 @@ model on Windows, so the three agree on what the mode means.
 | **P4e** | Windows Home + v6 serving (only if D1 picks the userspace egress) | its own | Win11 Home | L |
 | **P5a** | `console_user` on Linux + macOS: the person at seat0 or owning the console, by the `named` drop, for SSH and exec's `run_as` (built) | the device's `ssh_account_mode`; the exec policy's `run_as` | the lab + a Mac | S–M |
 | **P5b** | A person's SSH session starts in their home: the shell, a command and `sftp` for `named` and `console_user` on Linux + macOS, and Windows `console_user`'s shell and commands in the profile (as `sftp` since P4b); the `chdir` after the drop, where sshd does it (built) | `ROOMLERD_SSH_START_IN_HOME=0` | the lab + a Win11 SystemContext guest | S |
-| **P6a** | Artifact version binding: `.deb`, `.pkg`, tarball | `ROOMLERD_ARTIFACT_VERSION_CHECK=0` | the last three releases, offline | S–M |
+| **P6a** | Artifact version binding: `.deb`, `.pkg`, tarball (built) | `ROOMLERD_ARTIFACT_VERSION_CHECK=0` | the last three releases' real artifacts; a hostile feed, red on 0.4.143 | S–M |
 | **P6b** | `roomler self-update` on Unix + the pinned PGP check | — | Linux + Mac tunnel-only hosts | M |
 | **P6c** | `service install --system` on Linux + macOS | — | vmtest | S |
 | **P6d** | `install.sh --uninstall` | — | vmtest | S |
 | **P6e** | macOS supervisor crash capture; #1538 | — | a field Mac | S |
-| **P6f** | Private staging dir on Windows + macOS | — | Win10, Win11, a Mac | S |
+| **P6f** | Private staging dir on Windows + macOS (settled: Windows by GHSA-r3xj-4wh9-xh2v, macOS measured private) | — | Win10, Win11, a Mac | S |
 | **P7a** | Linux arm64 hardware encode | the release feature set | an arm64 lab host | M |
 | **P7b** | arm64 tunnel CLI + wizard | — | an arm64 vmtest guest | S |
 | **P8** | Docs: `platform-support.md`, the user page, every §2.8 correction | — | — | M |
@@ -875,6 +898,9 @@ one depends on it.
 - [ ] **AC13 (P6):** a signed older `.deb` or `.pkg` under a newer manifest version is refused; `roomler self-update`
   updates a Linux and a macOS tunnel-only host; `service install --system` and `install.sh --uninstall` round-trip on
   vmtest; a SIGKILLed Mac worker leaves a crash record; a closed stdout no longer kills the macOS daemon.
+  *(The first clause is field-verified on P6a's candidate, §8: the hostile feed was red on 0.4.143 and refused on the
+  candidate. The `.pkg` reader was proven on a Mac against the real pkgs; it is re-checked on the release. The rest
+  is P6b–P6e.)*
 - [ ] **AC14 (P7):** an arm64 Linux host advertises a hardware cell and records AAC; the arm64 CLI and wizard
   install.
 - [ ] **AC15 (the rule):** P0d's server count of advertised capability words by OS, taken before P0 and after the
@@ -1019,3 +1045,9 @@ one depends on it.
 | 2026-10-18 | released 0.4.143 | the same guest, `hive_adopt = true`, the test org's admin mapped to `vmtest` | 🟢 **AC11's release check, P4c.** The adopt pipe listened. `roomler hive adopt` as the person said "this device adopts terminal sessions" and wrote three hooks. A `SessionStart` adopted the session under `<guest>\vmtest` and its SID (`origin=adopted` on the server). A second turn was counted (`turns=1`), and `SessionEnd` ended the session on the device and the server. SYSTEM was refused (`root`), and a person's write-open of the pipe was denied |
 | 2026-10-18 | released 0.4.143, and the deployed viewer (the production SPA on 0.4.143) | the same guest, `DisableCAD=0` (the sign-in and unlock screens require Ctrl+Alt+Del) and `SoftwareSASGeneration=1`; locked; screendumped before and after the click | 🟢 **AC11's release check, P4a.** The hello carried `sas`, and the button showed with its title. On the click the worker logged `asked the service to send the secure attention sequence`, and the SCM host logged `sas relay: sent the secure attention sequence` 11 ms later. The screendump went from "Press Ctrl+Alt+Delete to unlock" to the sign-in prompt with a password box. The guest was destroyed |
 | 2026-10-18 | released 0.4.143 | zeus: a throwaway vmtest Win11 guest with the perUser MSI (the Scheduled Task, as the person in session 1), enrolled ephemeral; a fresh ephemeral enrollment as the person before each stop | 🟢 **AC11's release check, P4d.** `roomlerd service stop` as the person: "The daemon stopped cleanly in 1.0 s.", the row gone at +5 s, and `ephemeral device unenrolled itself on shutdown` in the log. A sign-out: `kind=SignOut`, unenrolled 285 ms after Windows said the session was ending, the row gone at +10 s. A restart with the device online: `kind=Shutdown`, unenrolled 321 ms after, and "the clean stop is on disk; the session may end", the row gone at +15 s. From session 0 the same verb ended the task (a hard stop), said why, and left the row offline. `taskkill` without `/F` and Restart Manager without force left the daemon running. The guest was destroyed |
+| 2026-10-18 | released 0.4.143: its own published binary (`3b42f578…`), run from its `.deb` and from its tarball with the libraries they bundle | throwaway containers on mars: Debian bookworm (dpkg present, so the updater picks the `.deb`) and Fedora 41 (no dpkg, so the tarball). `ROOMLERD_UPDATE_URL` named a hostile feed offering `agent-v0.4.999`: its assets were named `roomlerd-0.4.999-…`, pointed at the genuine 0.4.142 `.deb` and tarball, and carried their real digests. `roomlerd self-update --check-only` runs the whole download path and installs nothing | 🔴 **P6a red: the downgrade.** On both hosts: `installer .asc verified against the pinned release signing key`, then `no artifact-version binding available … no version binding is implemented for .deb artifacts` (`.gz` for the tarball), then `Update available: 0.4.143 -> agent-v0.4.999`. The staged file was the 0.4.142 package (`dpkg-deb --field`: `0.4.142-1`; the tarball's top directory `roomlerd-0.4.142-…`). A genuinely signed older release was accepted as 0.4.999 |
+| 2026-10-18 | the P6a candidate (`06fc71706`, a bookworm build with `full,overlay-l3,overlay-netstack,ssh-server`) | the same two hosts and the same feed | 🟢 **P6a green.** On both hosts the `.asc` still verified, and then: `refusing to install roomlerd-0.4.999-x86_64-unknown-linux-gnu.deb: offered as agent-v0.4.999 (which must carry version 0.4.999) but the artifact says it is 0.4.142-1 — the manifest and the package disagree about which release this is. The download was discarded and this agent keeps its current version.` The tarball arm said `0.4.142`, and nothing was left staged on either host. 🟢 **The kill switch** (`ROOMLERD_ARTIFACT_VERSION_CHECK=0`): `no artifact-version binding available … switched off`, and the release's behaviour came back: `Update available`, with the 0.4.142 `.deb` staged |
+| 2026-10-18 | the same candidate | the real Linux artifacts of 0.4.141, 0.4.142 and 0.4.143: x86_64 and aarch64, the `.deb` and the tarball, 12 files, read by `roomlerd artifact-version` in a Debian bookworm container | 🟢 **The readers against the last three releases.** Each file was read with its own release, a neighbour and a fabricated `0.4.999`: 12 binds (`it says 0.4.141-1` … `0.4.143`) and 24 refusals, 36 of 36 as expected. Every `.deb` says `Package: roomlerd`, `Version: 0.4.N-1`. Every tarball's first entry is a file under `roomlerd-0.4.N-<target>/`, whose top directory the reader takes. 🟢 The kill switch: `unsupported`, exit 0, for both formats. 🟢 A `.deb` with no `dpkg-deb` on the `PATH`: `unsupported`, never a refusal |
+| 2026-10-18 | the P6a candidate's `.pkg` (release-lane run 39128045510 on `9af197bb0`, `publish_release=false`), its `roomlerd` taken out of the pkg and never installed | a throwaway tart Mac on the MacBook, holding the real 0.4.141, 0.4.142 and 0.4.143 pkgs | 🟢 **The `.pkg` reader against the last three releases.** Each pkg's component `PackageInfo` says `identifier="com.roomler.agent"` and its own `version`. Read with its own release, a neighbour and `0.4.999`: 3 binds and 6 refusals, 9 of 9. 🟢 The kill switch: `unsupported`, exit 0. 🟢 No `pkgutil` expansion directory was left behind |
+| 2026-10-18 | released 0.4.143, then the same candidate pkg (which carries P5b: master after #2443) installed over it | the same VM, the root daemon, enrolled ephemeral with the overlay, the test key under `ssh_account_mode = "console_user"`; `admin` at the GUI | 🔴→🟢 **P5b, macOS.** On the release, exec said `pwd=/`, the pty `admin in /`, and `sftp`'s `pwd` was `/`, where a relative `put` failed. On the candidate, exec said `pwd=/Users/admin`, the pty `admin in /Users/admin`, and `sftp`'s `pwd` was `/Users/admin`, where a relative `put` landed owned `admin staff` and was removed again |
+| 2026-10-18 | the same candidate, as root | the same VM | **P6f measured: nothing to build on macOS.** `launchctl print system/com.roomler.update` shows no `TMPDIR` in the job's environment. Root's `getconf DARWIN_USER_TEMP_DIR` is `/var/folders/zz/…/T/`, `drwx------ root`. `dtruss -t mkdir` of the candidate run as root with `TMPDIR` unset showed `std::env::temp_dir()` creating its directory under that same root-private path, not `/tmp`. So the macOS staging directory sits where no other account can create, rename or unlink. The VM was destroyed |
