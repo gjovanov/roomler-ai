@@ -19,14 +19,16 @@
 //! dedicated LocalAPI verbs, not surface keys), and the crash-bookkeeping
 //! fields.
 //!
-//! Every key but five is read once at daemon startup, so `restart_required`
-//! holds across the surface — except `exec_enabled` and
+//! Most keys are read once at daemon startup, so `restart_required` holds
+//! for them. [`KeyMeta::live`] marks the exceptions, among them `exec_enabled` and
 //! `remote_config_enabled`, which `RemoteConfigServices::adopt_local` puts
 //! into force the moment `ConfigSet` saves them (docs/remote-config.md §7b),
 //! `record_dir` (FR-85), read when a recording starts,
 //! `local_restart_enabled` (FR-84 D3), read by the restart verb on every
-//! request, and `files_dir`, which `files::set_files_dir` re-seeds on the
-//! same path and every drop re-reads (FR-84 D4).
+//! request, `files_dir`, which `files::set_files_dir` re-seeds on the
+//! same path and every drop re-reads (FR-84 D4), and FR-52's three
+//! `external_*` keys, read from the FILE each time an outsider knocks and
+//! each time an external session is requested.
 //! FR-84 D2 made that per-key truth part of the registry ([`KeyMeta::live`])
 //! instead of a list each client kept by hand, and gave every key a
 //! [`Group`] and a [`Tier`] so the Settings page can be more than 150 rows.
@@ -342,7 +344,10 @@ const KEYS: &[KeyMeta] = &[
         key: "external_access_enabled",
         group: Group::Access,
         tier: Tier::Standard,
-        live: false,
+        // LIVE: read from the FILE each time an outsider knocks
+        // (`RemoteConfigServices::external_access_live`) — the owner's OFF is
+        // a revocation, and it is in force for the very next knock.
+        live: true,
         kind: "bool",
         description: "Let someone OUTSIDE this device's organization control it (FR-52 gate 3). NEVER settable by the server — the whole `external_*` surface is absent from remote config, because a server able to set this could admit a stranger to a machine whose owner never agreed. Opens nothing on its own: an org admin must also approve this device, the outsider must prove the password held HERE, and whoever is at the machine is still asked. Default: OFF.",
     },
@@ -350,7 +355,9 @@ const KEYS: &[KeyMeta] = &[
         key: "external_consent_mode",
         group: Group::Access,
         tier: Tier::Standard,
-        live: false,
+        // LIVE: read from the FILE each time an external session is
+        // requested (`RemoteConfigServices::external_session_live`).
+        live: true,
         kind: "enum:prompt|auto",
         description: "How consent is obtained when the controller is from OUTSIDE this organization (FR-52 gate 5). Deliberately separate from the org's consent setting: its answer for a colleague is not automatically its answer for a stranger. `auto` is the unattended case the password exists for, and has to be chosen HERE, on this device. Default: prompt.",
     },
@@ -358,7 +365,8 @@ const KEYS: &[KeyMeta] = &[
         key: "external_max_permissions",
         group: Group::Access,
         tier: Tier::Advanced,
-        live: false,
+        // LIVE: read with the consent mode, in the same single read.
+        live: true,
         kind: "string",
         description: "Permission names joined by `|`, e.g. `VIEW | INPUT`. This device's OWN ceiling on what an external session may do. Unset defers to the org's ceiling; where both are set a session gets the INTERSECTION, so a device can narrow what its org allows but never widen it. NOTE: the external-access PASSWORD is not settable here - use `roomler rc password set`, which never writes it anywhere readable.",
     },
@@ -3077,6 +3085,11 @@ mod tests {
             "rc_audio",
             "lock_on_end",
             "display_match",
+            // FR-52 — read at use: from the config FILE at every knock and
+            // every external session request, so nothing re-seeds them.
+            "external_access_enabled",
+            "external_consent_mode",
+            "external_max_permissions",
         ]
         .into_iter()
         .map(String::from)
@@ -3110,6 +3123,25 @@ mod tests {
         assert_eq!(e.kind, "string");
         assert_eq!(e.value, None, "unset by default — the Downloads ladder");
         assert_eq!(e.default, None);
+    }
+
+    /// FR-52 — the external-access keys are LIVE: the daemon reads them from
+    /// the FILE at every knock and every external session request, so `config
+    /// set external_access_enabled false` — an owner shutting outsiders out —
+    /// is in force at once. Reporting a restart there told that owner a
+    /// revocation was not in force yet, inviting a restart of a healthy daemon
+    /// or the belief they were still exposed. Red with `live: false` on a row.
+    #[test]
+    fn the_external_access_keys_are_live() {
+        let cfg = crate::config::test_fixture();
+        for key in [
+            "external_access_enabled",
+            "external_consent_mode",
+            "external_max_permissions",
+        ] {
+            let e = entry_for(&cfg, key).expect("on the surface");
+            assert!(!e.restart_required, "{key} applies at once");
+        }
     }
 
     /// FR-84 D4 — the surface checks the SHAPE of `files_dir` (absolute or
