@@ -940,12 +940,12 @@ enum ServiceAction {
         #[arg(long)]
         as_service: bool,
     },
-    /// FR-97 P4d — stop the running daemon NOW, cleanly, so a clean stop's
-    /// work runs and an ephemeral device removes itself. On Windows the
-    /// per-user daemon of this config is asked through its own stop event, and
-    /// its Scheduled Task is ended (`schtasks /End`) only if it does not leave
-    /// in time or holds no event; on Linux, `systemctl --user stop` the unit.
-    /// macOS refuses: launchd restarts a stopped LaunchAgent.
+    /// Stop the running daemon NOW, cleanly, so a clean stop's work runs and
+    /// an ephemeral device removes itself. On Windows the per-user daemon of
+    /// this config is asked through its own stop event, and its Scheduled Task
+    /// is ended (`schtasks /End`) only if it does not leave in time or holds no
+    /// event; on Linux, `systemctl --user stop` the unit. macOS refuses:
+    /// launchd restarts a stopped LaunchAgent (FR-97 P4d).
     Stop {
         /// Windows-only: stop the `Roomler` SCM service instead (and wait for
         /// STOPPED). Its host asks the worker to leave (#1683). Requires
