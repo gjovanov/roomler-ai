@@ -34,9 +34,9 @@ timeout; the command lives exactly as long as the channel does. Everything that 
 
 | What | Where | Why it blocks streaming |
 |---|---|---|
-| The SSH exec handler hands the command to the Fleet-RPC engine with the engine's maxima | `agents/roomlerd/src/ssh.rs:1980` `run_exec` → `:2026-2027` (`timeout_ms: MAX_TIMEOUT_MS`, `max_output_bytes: MAX_OUTPUT_BYTES`) → `:2033-2035` `run_fed` | the engine returns ONE `ExecOutcome` when the process is gone |
+| The SSH exec handler hands the command to the Fleet-RPC engine with the engine's maxima | `agents/roomlerd/src/ssh.rs:1982` `run_exec` → `:2028-2029` (`timeout_ms: MAX_TIMEOUT_MS`, `max_output_bytes: MAX_OUTPUT_BYTES`) → `:2035-2037` `run_fed` | the engine returns ONE `ExecOutcome` when the process is gone |
 | The whole output is sent after the run, then the ceiling notice | `ssh.rs:2041-2048`, `:2052-2064` | nothing reaches the channel while the command runs |
-| The engine re-clamps timeout and ceiling, takes the permit, registers cancel | `agents/roomlerd/src/exec.rs:989` `run_fed`, `:1002-1003` | the clamps are for a wire the server bounded; SSH never needed them |
+| The engine re-clamps timeout and ceiling, takes the permit, registers cancel | `agents/roomlerd/src/exec.rs:1024` `run_fed`, `:1037-1038` | the clamps are for a wire the server bounded; SSH never needed them |
 | Both pipes are drained into a `Vec` against ONE shared budget | `exec.rs:1140-1144`, `read_capped` `:1209` | the reader stops at the budget; past it the child dies of SIGPIPE / `ERROR_NO_DATA` |
 | The process waits in a `select!` over `wait` / `sleep(timeout)` / `cancel` | `exec.rs:1149-1162` | a fixed wall clock kills a long transfer |
 | Windows `console_user`: `CreateProcessAsUserW` with three pipes, two blocking drain threads to EOF | `exec.rs:1909` `win_console::run`, `:1977-1980`; `agents/roomlerd/src/win_service/supervisor.rs:1835` `spawn_in_session_captured`, `:2035` `read_pipe_to_end` | the drain is "read everything, then return" — but the pipes are there; only the drain shape buffers |
