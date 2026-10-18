@@ -640,53 +640,128 @@ mod imp {
 }
 
 // ---------------------------------------------------------------------------
-// Everything else — Linux and the rest
+// Linux with D-Bus — a logind inhibitor (FR-97 P3b)
 // ---------------------------------------------------------------------------
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(all(target_os = "linux", feature = "portal-capture"))]
+mod imp {
+    /// The inhibitor lives exactly as long as this fd: logind drops it the
+    /// moment the fd closes, so a daemon that crashes cannot leave the machine
+    /// pinned awake (the shape FR-43's orphan taught).
+    pub struct Handle {
+        _fd: std::os::fd::OwnedFd,
+    }
+
+    /// Ask logind for a `block` inhibitor, from a plain thread: zbus's
+    /// blocking API panics inside the tokio runtime the keeper runs on.
+    ///
+    /// `sleep:idle` first. A per-user daemon runs outside every login session,
+    /// where logind's polkit policy grants only `idle`
+    /// (`inhibit-block-sleep` is `allow_any=no`), so it falls back to that and
+    /// says so. A root daemon gets both.
+    pub fn acquire(reason: &str) -> std::io::Result<Handle> {
+        let why = reason.to_owned();
+        std::thread::Builder::new()
+            .name("power-inhibit".into())
+            .spawn(move || inhibit(&why))?
+            .join()
+            .map_err(|_| std::io::Error::other("the logind inhibit thread panicked"))?
+    }
+
+    fn inhibit(why: &str) -> std::io::Result<Handle> {
+        let conn = zbus::blocking::Connection::system().map_err(std::io::Error::other)?;
+        let mut refused = String::from("nothing asked");
+        for what in ["sleep:idle", "idle"] {
+            match conn.call_method(
+                Some("org.freedesktop.login1"),
+                "/org/freedesktop/login1",
+                Some("org.freedesktop.login1.Manager"),
+                "Inhibit",
+                &(what, "roomlerd", why, "block"),
+            ) {
+                Ok(reply) => {
+                    let fd = reply
+                        .body()
+                        .deserialize::<zbus::zvariant::OwnedFd>()
+                        .map_err(std::io::Error::other)?;
+                    if what != "sleep:idle" {
+                        tracing::warn!(
+                            %refused,
+                            "power: logind refused a sleep inhibitor (a per-user daemon is outside every login session); holding idle only"
+                        );
+                    }
+                    tracing::info!(what, "power: logind inhibitor taken");
+                    return Ok(Handle {
+                        _fd: std::os::fd::OwnedFd::from(fd),
+                    });
+                }
+                Err(e) => refused = e.to_string(),
+            }
+        }
+        Err(std::io::Error::other(format!(
+            "logind refused an inhibitor: {refused}"
+        )))
+    }
+
+    /// Closing the fd is the release.
+    pub fn release(_h: Handle) {}
+
+    pub fn on_ac() -> Option<bool> {
+        super::sysfs_on_ac()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Everything else — a Linux build without D-Bus, and the rest
+// ---------------------------------------------------------------------------
+#[cfg(not(any(
+    target_os = "macos",
+    windows,
+    all(target_os = "linux", feature = "portal-capture")
+)))]
 mod imp {
     pub struct Handle;
 
-    /// ⚠️ Not implemented yet, and it fails LOUDLY once rather than pretending.
-    ///
-    /// logind's `Inhibit()` is D-Bus-only — there is no file or sysctl that
-    /// takes a sleep lock — and `zbus` is behind the `portal-capture` feature,
-    /// which is in NO shipped Linux feature set (`release-agent.yml`). Adding
-    /// it unconditionally would put a D-Bus stack into every Linux agent for a
-    /// setting that matters mainly on desktops, since servers do not idle-sleep.
-    ///
-    /// FR-55 P3 decides that trade with a measurement rather than here.
+    /// ⚠️ Fails LOUDLY once rather than pretending. logind's `Inhibit()` is
+    /// D-Bus-only (no file or sysctl takes a sleep lock), and this build has no
+    /// D-Bus stack: `zbus` comes with `portal-capture`, which every shipped
+    /// Linux build carries (`full`), so only a hand-built agent lands here.
     pub fn acquire(_reason: &str) -> std::io::Result<Handle> {
         Err(std::io::Error::other(
-            "no sleep-inhibit backend on this platform (FR-55 P3: logind needs D-Bus)",
+            "no sleep-inhibit backend in this build (logind needs D-Bus: the portal-capture feature)",
         ))
     }
 
     pub fn release(_h: Handle) {}
 
-    /// Readable without D-Bus, so the policy can at least be REPORTED
-    /// correctly even where it cannot yet be enforced.
     pub fn on_ac() -> Option<bool> {
-        let dir = std::fs::read_dir("/sys/class/power_supply").ok()?;
-        let mut saw_mains = false;
-        for e in dir.flatten() {
-            let p = e.path();
-            let kind = std::fs::read_to_string(p.join("type")).unwrap_or_default();
-            if kind.trim() != "Mains" {
-                continue;
-            }
-            saw_mains = true;
-            if std::fs::read_to_string(p.join("online"))
-                .map(|s| s.trim() == "1")
-                .unwrap_or(false)
-            {
-                return Some(true);
-            }
-        }
-        // A machine with a mains supply that reports offline is on battery; a
-        // machine with NO mains supply at all (a server, a VM) tells us nothing
-        // about a battery, so say so rather than guess.
-        saw_mains.then_some(false)
+        super::sysfs_on_ac()
     }
+}
+
+/// Readable without D-Bus, so the policy can at least be REPORTED correctly
+/// even where it cannot be enforced.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn sysfs_on_ac() -> Option<bool> {
+    let dir = std::fs::read_dir("/sys/class/power_supply").ok()?;
+    let mut saw_mains = false;
+    for e in dir.flatten() {
+        let p = e.path();
+        let kind = std::fs::read_to_string(p.join("type")).unwrap_or_default();
+        if kind.trim() != "Mains" {
+            continue;
+        }
+        saw_mains = true;
+        if std::fs::read_to_string(p.join("online"))
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false)
+        {
+            return Some(true);
+        }
+    }
+    // A machine with a mains supply that reports offline is on battery; a
+    // machine with NO mains supply at all (a server, a VM) tells us nothing
+    // about a battery, so say so rather than guess.
+    saw_mains.then_some(false)
 }
 
 /// Escape hatch for the macOS assertion type, so the open decision in FR-55 can

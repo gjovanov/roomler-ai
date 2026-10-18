@@ -72,7 +72,7 @@ inside one (FR-24, FR-69 AC10).
 | overlay engine (IPAM, netmaps, leases, L3 ACL, relay grants), the org relay mint, the DERP ACL cache + `/derp` upgrade + cluster convergence, tunnel clients + policies, peer relays, Roomler SSH, the ephemeral reaper | **network** | `Module::indexes_for(multi_block)` is born here — `overlay_blocks` has two schemas |
 | Stripe, the public updates list + newsletter, plan compliance | **saas** | an add-on feature on the api crate; no self-host image carries it |
 | agent sessions: `agent_sessions` + `hive_audit`, the start/stop routes and their gates, the devices' `rc:hive.*` answers, reconcile-on-connect, each session's room notes and turn stubs | **hive** (FR-90) | built ON fleet (`Module::Deps = FleetState`: the Hub) **and** chat (the session room) — chat is stateless, so hive re-creates `chat::bound::BoundChat` from the core rather than taking chat's state (rule 5). Chat stores a room's or message's `binding {module, ref}` and never interprets it; one of the two modules whose switch defaults **off** (`ModulesSettings::DEFAULT_OFF`, with `vault`), so `switched_off` lists it until an operator turns it on (`[modules] hive`, or a `hive.tenants` list — FR-90 P1g-2); leads `HOOK_ORDER` as a session holder |
-| the vault: `vault_secrets` + `vault_versions` (each value sealed under its own data key, wrapped to an `age` KEK) + `vault_audit`, the administrator's metadata routes — none answers a value; P3-2a's `vault_roles` + `vault_policies` (Cedar, checked on write) and `simulate` | **vault** (FR-90 P3-1, P3-2a) | on core alone (`Module::Deps = ()`): no edge until a step needs one. Its switch defaults **off** like hive's, and a `vault.tenants` list mounts it by itself. Second in `HOOK_ORDER`, right after `hive`: from P3-3 it holds leases that sessions hold, so it revokes them once the sessions have ended and while the device is still there to be told. Registers no hooks yet ([vault.md](vault.md)) |
+| the vault: `vault_secrets` + `vault_versions` (each value sealed under its own data key, wrapped to an `age` KEK) + `vault_audit`, the administrator's metadata routes — none answers a value; P3-2a's `vault_roles` + `vault_policies` (Cedar, checked on write) and `simulate` | **vault** (FR-90 P3-1, P3-2a, P3-2b) | on core alone (`Module::Deps = ()`): no edge until a step needs one. Its switch defaults **off** like hive's, and a `vault.tenants` list mounts it by itself. Second in `HOOK_ORDER`, right after `hive`: from P3-3 it holds leases that sessions hold, so it revokes them once the sessions have ended and while the device is still there to be told. P3-2b — it registers the **session gate** (`Hooks.session`, a `SessionGate`): hive asks it, through core, before a session takes a vault role or moves with one, since hive must never call the vault ([vault.md](vault.md) §8) |
 | the device listing (`/tenant/{tid}/device`) | **the host** | a view over fleet (required) and network (optional) — see §4's lesson |
 
 ---
@@ -339,6 +339,12 @@ forces a catch-all in every consumer everywhere — too invasive for the existin
 Core never calls a module, so the cascades that cross modules are **hooks** core invokes in
 `hooks::HOOK_ORDER`: session holders → lease holders → the record owner. A failing holder stops
 the cascade.
+
+FR-90 P3-2b adds a hook that is a **question**, not a cascade: `SessionGate`
+(`Hooks.session`), which only the vault registers. Hive owns the session, and `vault → hive` is
+the edge, so hive asks the vault whether a session may take, or move with, a vault role through
+`core.hooks.session_gate()`. ⚠️ No gate registered is a refusal for any ask that names a role,
+never a pass ([vault.md](vault.md) §8).
 
 ```mermaid
 sequenceDiagram

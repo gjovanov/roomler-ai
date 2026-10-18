@@ -25,7 +25,7 @@ The rest of the design follows from taking that sentence seriously.
 
 Everything is P2P over the session's existing `control` data channel — no
 server change, and the server never sees a window title. `peer.rs` routes three
-envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:8784`),
+envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:8823`),
 runs it on `spawn_blocking` because every backend shells out or calls FFI, and
 sends the returned reply back on the same channel. The request/reply shape and
 the id correlation are `rc:logs-fetch`'s.
@@ -72,7 +72,7 @@ Three properties of the wire are load-bearing:
 - 🔑 **Every path returns a well-formed `*.reply`**, including a panic in the
   handler (`peer.rs` catches the join error and answers `ok:false`). A request
   that got no answer is how the viewer detects an agent too old to speak
-  `rc:apps.*` at all (a 10 s timeout, `ui/src/composables/useRemoteControl.ts:6291`).
+  `rc:apps.*` at all (a 10 s timeout, `ui/src/composables/useRemoteControl.ts:6297`).
 
 ## 2. How the Linux backend finds a desktop — and as whom
 
@@ -137,7 +137,7 @@ questions asked of every row: **does the hello advertise anything this host
 cannot do**, and **does the refusal carry its reason in the reply** — not only
 in the daemon log. The hello column is `AgentCaps.apps`
 (`crates/remote_control/src/models.rs:203`), assigned once per process by
-`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:1623`,
+`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:1664`,
 `:624` via `with_config_lists` `:655`) — in the daemon, never in the
 caps-probe child (§4.3).
 
@@ -247,9 +247,9 @@ restart changes it. That is why P6 added a fourth value:
   backend (`apps::has_backend`, `mod.rs:357`), independent of what the host
   was doing at boot.
 - The viewer shows the *Remote apps* entry for `list` **or** `status`
-  (`ui/src/views/remote/RemoteControl.vue:4463` `agentSupportsApps`), never disables it, and lets
+  (`ui/src/views/remote/RemoteControl.vue:4465` `agentSupportsApps`), never disables it, and lets
   the **dialog** carry the truth from the live reply: the list, the caveats,
-  or the reason (`useRemoteControl.ts:9473`, the `apps_list_reply` arm). A greyed button with no tooltip
+  or the reason (`useRemoteControl.ts:9481`, the `apps_list_reply` arm). A greyed button with no tooltip
   was the one place a reason could not reach.
 - 🔑 **`availability_for()` is the single source for both** (`mod.rs:321`): the
   hello's `list` and the reply's `unavailable` come from one function, so they
@@ -261,12 +261,12 @@ restart changes it. That is why P6 added a fourth value:
   `enabled = false` — on every release's first boot, and on every boot of a
   host with no hardware cell (a no-hardware answer is never cached,
   `caps_cache.rs:277`). `apps` is now assigned in `detect()`, in the daemon,
-  and the child's struct carries none (`apps_caps`, `caps.rs:1623`; a test locks
+  and the child's struct carries none (`apps_caps`, `caps.rs:1664`; a test locks
   `compute_caps(..).apps.is_empty()`). The same move takes the
   privilege-dropped `loginctl`/`wmctrl` walk out of a process that exists to
   contain untrusted driver code. `files` followed in #1672 — its `browse`
   entry rode the same default the same way — and is assigned by the same
-  seam (`with_config_lists`, `caps.rs:788`; `files_caps` `:1668`), which a
+  seam (`with_config_lists`, `caps.rs:829`; `files_caps` `:1709`), which a
   test locks assignment by assignment: `detect()` itself cannot run in a
   unit test without spawning the probe child.
 - ⚠️ An agent older than P6 answers `supported: false` with nothing beside it.
@@ -385,7 +385,7 @@ label    = "Text editor"
 | `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1012`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
-`roomlerd apps-probe` (`agents/roomlerd/src/main.rs:5715`) answers the whole
+`roomlerd apps-probe` (`agents/roomlerd/src/main.rs:5736`) answers the whole
 question on the host with no session and no browser, the way `capture-smoke`
 does for pixels: which config it loaded and whether apps are enabled there,
 whether a desktop was found and as whom (the display and the cookie), what the

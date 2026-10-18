@@ -13643,3 +13643,298 @@ async fn a_search_is_paced_per_connection_and_per_minute() {
         .collect();
     assert_eq!(refusals, ["too_many_views", "rate_limited"]);
 }
+
+// ─── FR-90 P3-2b — a session's vault role ──────────────────────────────────
+
+/// Hive and the vault both on.
+async fn role_app() -> TestApp {
+    TestApp::spawn_with_settings(|s| {
+        s.modules.hive = true;
+        s.modules.vault = true;
+        s.app.rate_limit_per_sec = 100;
+        s.app.rate_limit_burst = 1000;
+    })
+    .await
+}
+
+/// `POST …/hive/session` naming a vault role.
+async fn post_start_role(
+    app: &TestApp,
+    tid: &str,
+    token: &str,
+    device_id: &str,
+    folder: &str,
+    role: &str,
+) -> Value {
+    for _ in 0..40 {
+        let resp = app
+            .auth_post(&format!("/api/tenant/{tid}/hive/session"), token)
+            .json(&json!({ "device_id": device_id, "folder": folder, "role": role }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "start");
+        let body: Value = resp.json().await.unwrap();
+        // The same registration race `start` retries past.
+        let racing = body["outcome"] == "refused"
+            && matches!(
+                body["reason"].as_str(),
+                Some("device_offline" | "device_unsupported")
+            );
+        if !racing {
+            return body;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the Hub never recorded the device as running Hive sessions");
+}
+
+/// A vault role `dev`, and one policy: `user` takes it on a device tagged
+/// `build`, and nowhere else.
+async fn dev_on_build_boxes(app: &TestApp, tid: &str, token: &str, user: &str) -> String {
+    let resp = app
+        .auth_post(&format!("/api/tenant/{tid}/vault/role"), token)
+        .json(&json!({ "name": "dev" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201, "role");
+    let text = format!(
+        r#"permit (principal == Roomler::User::"{user}", action == Roomler::Action::"role:assume", resource == Roomler::Role::"dev") when {{ context.device.tags.contains("build") }};"#
+    );
+    let resp = app
+        .auth_post(&format!("/api/tenant/{tid}/vault/policy"), token)
+        .json(&json!({ "name": "dev-on-build-boxes", "text": text }))
+        .send()
+        .await
+        .unwrap();
+    let code = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(code, 201, "{body}");
+    body["id"].as_str().unwrap().to_string()
+}
+
+async fn tag_device(app: &TestApp, agent_id: &str, tags: &[&str]) {
+    app.db
+        .collection::<Document>("agents")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(agent_id).unwrap() },
+            doc! { "$set": { "tags": tags } },
+        )
+        .await
+        .unwrap();
+}
+
+/// The vault's `role:assume` rows, in order: (op, decision, reason).
+async fn role_decisions(app: &TestApp) -> Vec<(String, String, String)> {
+    use futures::TryStreamExt;
+    let mut cursor = app
+        .db
+        .collection::<Document>("vault_audit")
+        .find(doc! { "action": "role:assume" })
+        .sort(doc! { "at": 1, "_id": 1 })
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    while let Some(d) = cursor.try_next().await.unwrap() {
+        out.push((
+            d.get_str("op").unwrap().to_string(),
+            d.get_str("decision").unwrap().to_string(),
+            d.get_str("reason").unwrap().to_string(),
+        ));
+    }
+    out
+}
+
+/// FR-90 P3-2b — a start that names a role gets it only as the vault's
+/// policies allow it, for that person, on that device: refused on a laptop,
+/// allowed on a build box (its tag lowercased), refused for a role the
+/// organization has not got. A start that names none never asks. Every
+/// decision is the vault's, recorded with the request it decided.
+#[tokio::test]
+async fn a_start_takes_a_role_only_as_the_vault_allows_it_on_that_device() {
+    let app = role_app().await;
+    let seeded = app.seed_tenant("hiverole").await;
+    let tid = seeded.tenant_id.clone();
+    let token = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "hive-role", RUNS_HIVE).await;
+    let pid = dev_on_build_boxes(&app, &tid, &token, &seeded.admin.id).await;
+
+    // Not a build box: refused before anything is made or sent.
+    let body = post_start_role(&app, &tid, &token, &dev.agent_id, "/srv/a", "dev").await;
+    assert_eq!(
+        (body["outcome"].as_str(), body["reason"].as_str()),
+        (Some("refused"), Some("role_refused")),
+        "{body}"
+    );
+    assert!(body["session"].is_null(), "{body}");
+    assert_eq!(
+        app.db
+            .collection::<Document>("agent_sessions")
+            .count_documents(doc! {})
+            .await
+            .unwrap(),
+        0
+    );
+
+    // A build box: the device's tag as an admin typed it, `Build`.
+    tag_device(&app, &dev.agent_id, &["Build"]).await;
+    let caller = post_start_role(&app, &tid, &token, &dev.agent_id, "/srv/b", "dev");
+    let target = async {
+        let frame = read_until(&mut dev.ws, "rc:hive.start")
+            .await
+            .expect("the device receives rc:hive.start");
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": frame["session_id"],
+                   "fence": frame["fence"], "account": "dev"}),
+        )
+        .await;
+        frame
+    };
+    let (body, _frame) = tokio::join!(caller, target);
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    let sid = body["session"]["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        stored(&app, &sid).await.get_str("vault_role").ok(),
+        Some("dev")
+    );
+
+    // A role the organization has not got.
+    let body = post_start_role(&app, &tid, &token, &dev.agent_id, "/srv/c", "ghost").await;
+    assert_eq!(body["reason"], "role_refused", "{body}");
+
+    // No role: the vault is not asked, and the record holds none.
+    let caller = start(&app, &tid, &token, &dev.agent_id, "/srv/d");
+    let target = async {
+        let frame = read_until(&mut dev.ws, "rc:hive.start").await.unwrap();
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": frame["session_id"],
+                   "fence": frame["fence"], "account": "dev"}),
+        )
+        .await;
+    };
+    let (body, ()) = tokio::join!(caller, target);
+    let plain = body["session"]["id"].as_str().unwrap().to_string();
+    assert!(stored(&app, &plain).await.get_str("vault_role").is_err());
+
+    assert_eq!(
+        role_decisions(&app).await,
+        [
+            (
+                "start".to_string(),
+                "deny".to_string(),
+                "default_deny".to_string()
+            ),
+            ("start".to_string(), "allow".to_string(), pid.clone()),
+            (
+                "start".to_string(),
+                "deny".to_string(),
+                "unknown_role".to_string()
+            ),
+        ]
+    );
+    // The allowed one carries the request as decided: the tag lowercased.
+    let row = app
+        .db
+        .collection::<Document>("vault_audit")
+        .find_one(doc! { "action": "role:assume", "decision": "allow" })
+        .await
+        .unwrap()
+        .unwrap();
+    let request = row.get_document("request").unwrap();
+    assert_eq!(request.get_str("role").unwrap(), "dev");
+    let device_facts = request.get_document("device").unwrap();
+    assert_eq!(device_facts.get_str("os").unwrap(), "linux");
+    assert_eq!(
+        device_facts.get_array("tags").unwrap(),
+        &vec![bson::Bson::String("build".into())]
+    );
+    assert_eq!(
+        row.get_object_id("session_id").unwrap().to_hex(),
+        sid,
+        "the decision names the session it was for"
+    );
+}
+
+/// With no vault mounted, a start that names a role is refused in words —
+/// never started without the role it asked for. One that names none starts.
+#[tokio::test]
+async fn a_role_named_with_no_vault_is_refused() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hivenovault").await;
+    let tid = seeded.tenant_id.clone();
+    let token = seeded.admin.access_token.clone();
+    let dev = device(&app, &seeded, "hive-novault", RUNS_HIVE).await;
+    let body = post_start_role(&app, &tid, &token, &dev.agent_id, "/srv/a", "dev").await;
+    assert_eq!(
+        (body["outcome"].as_str(), body["reason"].as_str()),
+        (Some("refused"), Some("vault_unavailable")),
+        "{body}"
+    );
+    assert!(
+        body["message"].as_str().unwrap().contains("vault"),
+        "{body}"
+    );
+}
+
+/// A session that holds a role moves with it only as the vault allows it on
+/// the device it moves TO: a teleport to a laptop is refused, to a build box
+/// it goes ahead.
+#[tokio::test]
+async fn a_session_moves_with_its_role_only_where_the_vault_allows_it() {
+    let app = TestApp::spawn_with_settings(|s| {
+        s.modules.hive = true;
+        s.modules.vault = true;
+        s.hive.replicaset = true;
+        s.hive.promote_prepare_secs = 4;
+        s.hive.promote_join_secs = 6;
+        s.hive.promote_drain_secs = 4;
+        s.hive.promote_sync_secs = 4;
+        s.app.rate_limit_per_sec = 100;
+        s.app.rate_limit_burst = 1000;
+    })
+    .await;
+    let mut m = teleportable(&app, "roleteleport", TELEPORT_TARGET).await;
+    let pid = dev_on_build_boxes(&app, &m.tid, &m.admin, &m.admin_id).await;
+    // The session took `dev` at its start (as the start test shows).
+    app.db
+        .collection::<Document>("agent_sessions")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&m.sid).unwrap() },
+            doc! { "$set": { "vault_role": "dev" } },
+        )
+        .await
+        .unwrap();
+
+    let (code, body) = post_teleport(&app, &m.tid, &m.admin, &m.sid, &m.b.agent_id, None).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        (body["outcome"].as_str(), body["reason"].as_str()),
+        (Some("refused"), Some("role_refused")),
+        "{body}"
+    );
+    assert!(
+        teleport_audit(&app, &m.sid)
+            .await
+            .contains(&("refused".to_string(), "role_refused".to_string())),
+        "hive's own audit says why"
+    );
+
+    tag_device(&app, &m.b.agent_id, &["build"]).await;
+    let (body, _prep) = teleport_answered(&app, &mut m, None, None).await;
+    assert_eq!(body["outcome"], "teleporting", "{body}");
+
+    assert_eq!(
+        role_decisions(&app).await,
+        [
+            (
+                "teleport".to_string(),
+                "deny".to_string(),
+                "default_deny".to_string()
+            ),
+            ("teleport".to_string(), "allow".to_string(), pid),
+        ]
+    );
+}

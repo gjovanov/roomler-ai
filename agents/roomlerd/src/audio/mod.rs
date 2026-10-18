@@ -10,10 +10,12 @@
 //! Opus packets → `TrackLocalStaticSample::write_sample`.
 //!
 //! Capture backend ([`open_default`]):
-//!   * **Linux** — the ALSA capture device the host's owner names in
-//!     `ROOMLERD_AUDIO_SOURCE`, or one named as a monitor, via cpal; otherwise
-//!     none, and the controller is told why. ⚠️ Never the default input,
-//!     which is the microphone (FR-97 P3c, [`crate::audio_source`]).
+//!   * **Linux** — the default output's monitor through Pulse's client
+//!     library ([`pulse`], FR-97 P3c-2): in this process for a per-user
+//!     daemon, through the seat user's helper for a root one. A device the
+//!     host's owner names in `ROOMLERD_AUDIO_SOURCE` wins, through cpal.
+//!     ⚠️ Never the default input, which is the microphone
+//!     ([`crate::audio_source::linux_route`]).
 //!   * **Windows** — WASAPI loopback: cpal opens the default OUTPUT
 //!     device with `build_input_stream` (cpal 0.15 special-cases an
 //!     output device driven as an input into a loopback capture).
@@ -33,6 +35,8 @@ use async_trait::async_trait;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub mod cpal_backend;
 pub mod opus_encode;
+#[cfg(target_os = "linux")]
+pub mod pulse;
 
 /// One buffer of interleaved PCM samples straight off the capture
 /// backend, BEFORE resample / upmix. `channels` and `sample_rate`
@@ -84,15 +88,13 @@ impl AudioCapture for NoopAudioCapture {
 /// Before P3c-1 this returned a [`NoopAudioCapture`] and kept the reason in
 /// the log, so the session carried a silent track nobody could explain.
 pub fn open_default() -> Result<Box<dyn AudioCapture>, crate::audio_source::AudioUnavailable> {
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
-        match cpal_backend::CpalLoopbackCapture::open() {
-            Ok(cap) => {
-                tracing::info!("audio: opened cpal loopback capture");
-                Ok(Box::new(cap))
-            }
-            Err(e) => Err(crate::audio_source::AudioUnavailable::from_error(&e)),
-        }
+        open_linux_system_audio()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        open_cpal()
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
@@ -100,5 +102,48 @@ pub fn open_default() -> Result<Box<dyn AudioCapture>, crate::audio_source::Audi
             crate::audio_source::AudioUnavailableCode::NotSupported,
             "no system-audio capture backend on this OS (macOS ScreenCaptureKit audio is FR-97 P2a)",
         ))
+    }
+}
+
+/// The loopback (Windows) or the named device (Linux), through cpal.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn open_cpal() -> Result<Box<dyn AudioCapture>, crate::audio_source::AudioUnavailable> {
+    match cpal_backend::CpalLoopbackCapture::open() {
+        Ok(cap) => {
+            tracing::info!("audio: opened cpal loopback capture");
+            Ok(Box::new(cap))
+        }
+        Err(e) => Err(crate::audio_source::AudioUnavailable::from_error(&e)),
+    }
+}
+
+/// FR-97 P3c-2 — Linux "computer audio", for a live session and the recorder
+/// alike: the route [`crate::audio_source::linux_route`] picks, which is the
+/// owner's named device or the default output's monitor, never a microphone.
+/// The library question is asked of the loader here, at the open.
+#[cfg(target_os = "linux")]
+pub fn open_linux_system_audio()
+-> Result<Box<dyn AudioCapture>, crate::audio_source::AudioUnavailable> {
+    use crate::audio_source::{LinuxRoute, linux_facts, linux_route};
+    let mut facts = linux_facts(pulse::present());
+    // A per-user daemon loads the library itself, so the loader decides where
+    // the disk check found nothing; a root daemon's helper loads it there.
+    if !facts.root && !facts.pulse_lib {
+        facts.pulse_lib = pulse::loadable();
+    }
+    match linux_route(facts)? {
+        LinuxRoute::Named => open_cpal(),
+        LinuxRoute::Pulse => pulse::PulseCapture::open(pulse::DEFAULT_MONITOR)
+            .map(|c| Box::new(c) as Box<dyn AudioCapture>),
+        #[cfg(feature = "portal-capture")]
+        LinuxRoute::Helper => {
+            pulse::HelperCapture::spawn().map(|c| Box::new(c) as Box<dyn AudioCapture>)
+        }
+        // `linux_route` never answers Helper without the helper built.
+        #[cfg(not(feature = "portal-capture"))]
+        LinuxRoute::Helper => Err(crate::audio_source::AudioUnavailable::new(
+            crate::audio_source::AudioUnavailableCode::NoSession,
+            "this build has no session helper",
+        )),
     }
 }

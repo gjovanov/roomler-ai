@@ -353,6 +353,11 @@ fn parse_uid(v: &Value) -> Result<EntityUid, String> {
     EntityUid::from_json(v.clone()).map_err(|e| format!("an entity id: {e}"))
 }
 
+/// Every element a string, or `None`.
+fn strings(a: &bson::Array) -> Option<Vec<String>> {
+    a.iter().map(|b| b.as_str().map(String::from)).collect()
+}
+
 /// The folders above a path, innermost first: `a/b/c` → `a/b`, `a`.
 fn folders(path: &str) -> Vec<&str> {
     let mut out = Vec::new();
@@ -370,6 +375,106 @@ impl Ask {
         match self {
             Self::AssumeRole { .. } => ACTION_ASSUME,
             Self::UseSecret { .. } => ACTION_USE,
+        }
+    }
+
+    /// P3-2b — the request as `vault_audit` keeps it, so a replay decides
+    /// exactly what was decided: the groups, the device's facts, the mode,
+    /// as they were then.
+    pub fn to_doc(&self) -> bson::Document {
+        let device = |d: &DeviceFacts| {
+            bson::doc! { "os": &d.os, "tags": &d.tags, "owner": d.owner }
+        };
+        match self {
+            Self::AssumeRole {
+                user,
+                groups,
+                role,
+                device: d,
+            } => bson::doc! {
+                "action": ACTION_ASSUME,
+                "user": *user,
+                "groups": groups,
+                "role": role,
+                "device": device(d),
+            },
+            Self::UseSecret {
+                session,
+                secret,
+                mode,
+                audience,
+                ttl_s,
+                device: d,
+                approver,
+            } => {
+                let mut doc = bson::doc! {
+                    "action": ACTION_USE,
+                    "session": {
+                        "id": &session.id,
+                        "owner": session.owner,
+                        "role": session.role.clone(),
+                        "playbook": session.playbook.clone(),
+                    },
+                    "secret": {
+                        "prefix": &secret.prefix,
+                        "path": &secret.path,
+                        "kind": &secret.kind,
+                        "tags": &secret.tags,
+                    },
+                    "mode": mode,
+                    "audience": audience,
+                    "ttl_s": *ttl_s,
+                    "device": device(d),
+                };
+                if let Some(a) = approver {
+                    doc.insert("approver", *a);
+                }
+                doc
+            }
+        }
+    }
+
+    /// The inverse of [`Self::to_doc`]; `None` for a row no replay can read
+    /// (a later version's shape, or a damaged one).
+    pub fn from_doc(doc: &bson::Document) -> Option<Self> {
+        let device = |d: &bson::Document| -> Option<DeviceFacts> {
+            Some(DeviceFacts {
+                os: d.get_str("os").ok()?.to_string(),
+                tags: strings(d.get_array("tags").ok()?)?,
+                owner: d.get_object_id("owner").ok()?,
+            })
+        };
+        match doc.get_str("action").ok()? {
+            ACTION_ASSUME => Some(Self::AssumeRole {
+                user: doc.get_object_id("user").ok()?,
+                groups: strings(doc.get_array("groups").ok()?)?,
+                role: doc.get_str("role").ok()?.to_string(),
+                device: device(doc.get_document("device").ok()?)?,
+            }),
+            ACTION_USE => {
+                let s = doc.get_document("session").ok()?;
+                let r = doc.get_document("secret").ok()?;
+                Some(Self::UseSecret {
+                    session: SessionFacts {
+                        id: s.get_str("id").ok()?.to_string(),
+                        owner: s.get_object_id("owner").ok()?,
+                        role: s.get_str("role").ok().map(String::from),
+                        playbook: s.get_str("playbook").ok().map(String::from),
+                    },
+                    secret: SecretFacts {
+                        prefix: r.get_str("prefix").ok()?.to_string(),
+                        path: r.get_str("path").ok()?.to_string(),
+                        kind: r.get_str("kind").ok()?.to_string(),
+                        tags: strings(r.get_array("tags").ok()?)?,
+                    },
+                    mode: doc.get_str("mode").ok()?.to_string(),
+                    audience: doc.get_str("audience").ok()?.to_string(),
+                    ttl_s: doc.get_i64("ttl_s").ok()?,
+                    device: device(doc.get_document("device").ok()?)?,
+                    approver: doc.get_object_id("approver").ok(),
+                })
+            }
+            _ => None,
         }
     }
 
@@ -829,5 +934,35 @@ mod tests {
     fn folders_are_every_prefix_innermost_first() {
         assert_eq!(folders("a/b/c"), ["a/b", "a"]);
         assert!(folders("a").is_empty());
+    }
+
+    #[test]
+    fn a_recorded_request_reads_back_as_it_was_decided() {
+        // P3-2b — a replay decides exactly what was decided: every fact the
+        // request held survives the audit row's round trip.
+        let assume = Ask::AssumeRole {
+            user: ObjectId::new(),
+            groups: vec!["member".into(), "ops".into()],
+            role: "dev".into(),
+            device: device("windows", &["Build"]),
+        };
+        let mut used = use_secret(Some("deployer"), "prod/db", &["prod"], "proxy", "macos");
+        if let Ask::UseSecret {
+            approver, session, ..
+        } = &mut used
+        {
+            *approver = Some(ObjectId::new());
+            session.playbook = Some("deploy-prod".into());
+        }
+        for ask in [assume, used, use_secret(None, "x", &[], "env", "linux")] {
+            let back = Ask::from_doc(&ask.to_doc()).expect("reads back");
+            assert_eq!(format!("{back:?}"), format!("{ask:?}"));
+            // And decides alike.
+            let set = set_with(&[r#"permit (principal, action, resource);"#]);
+            assert_eq!(decide(&set, &back), decide(&set, &ask));
+        }
+        // A row of another shape is unreadable, never a guess.
+        assert!(Ask::from_doc(&bson::doc! { "action": "secret:read" }).is_none());
+        assert!(Ask::from_doc(&bson::doc! { "action": "role:assume", "user": "x" }).is_none());
     }
 }

@@ -13,8 +13,12 @@
   P0c-1 and P0c-2 shipped in 0.4.142; P0c-3 rides the next release. AC3's field sessions follow.
 - P3i, the host firewall, merged (#2414): measured first (§8), decided as report-never-change (D13). Its status
   line rides the next release.
-- P3c-1, Linux session audio that is never a microphone, is in review: measured first (§8), and the premise was
-  wrong, since the microphone was the only thing a Linux session ever captured (§3.8, D14 for P3c-2).
+- P3c-1, Linux session audio that is never a microphone, merged (#2419): measured first (§8), and the premise was
+  wrong, since the microphone was the only thing a Linux session ever captured (§3.8). P3c-2, the session's
+  monitor through Pulse's client library on per-user and root installs (D14), merged (#2426), field-verified on
+  both (§8). Both ride the next release.
+- P3b, the Linux lock hint (advisory) and a live session's logind block inhibitor (FR-55 P3), is in review,
+  field-verified red → green on a root daemon (§8).
 - The rest of P2–P7 is open.
 
 **Owner:** the agent on all
@@ -140,16 +144,16 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
-| R1 | System audio in a session | ✅ WASAPI loopback | ❌ **the default microphone, always**: cpal lists only ALSA devices, so the `.monitor` pick never matched (measured, §8). Since P3c-1 a named device only, else no track and the reason (`audio_source.rs:151`) | ❌ | macOS: no capture backend; since P0c no `opus` either (`encode/caps.rs:700`) ✔. Linux: nothing captures the session's monitor (P3c-2) | P0c, P2a, P3c |
+| R1 | System audio in a session | ✅ WASAPI loopback | ❌ **the default microphone, always**: cpal lists only ALSA devices, so the `.monitor` pick never matched (measured, §8). Since P3c-1 a named device only, else no track and the reason (`audio_source.rs:253`) | ❌ | macOS: no capture backend; since P0c no `opus` either (`encode/caps.rs:700`) ✔. Linux: nothing captures the session's monitor (P3c-2) | P0c, P2a, P3c |
 | R2 | Native consent panel | ✅ | ✅ X11 · ⛔ Wayland → companion | ❌ | Built (`indicator/mac.rs`), not in the release set (`release-agent.yml:2564-2580`) | P2b (D3) |
 | R3 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows (FR-56) | ❌ | `Unavailable::Platform` (`apps/mod.rs:347`); no `apps/macos.rs` | P2c |
 | R4 | Live cursor shape | ✅ | ❌ | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`) | P3a, P2d |
-| R5 | "Host is locked" consent hint | ✅ | ❌ | ❌ | Always `Unlocked` off Windows (`lock_state.rs:290-311`) | P2d, P3b |
-| R6 | Keyboard layout report / switch | ✅ | ❌ | ❌ | Windows-only cap (`caps.rs:1527-1531`) | P2d, P3e |
+| R5 | "Host is locked" consent hint | ✅ | ✅ since P3b: advisory, from logind's `LockedHint`, and input passes (`lock_state.rs:331`) | ❌ | `LockState` is always `Unlocked` off Windows (`lock_state.rs:290-311`), on purpose for Linux: the hint never becomes one | P2d, P3b |
+| R6 | Keyboard layout report / switch | ✅ | ❌ | ❌ | Windows-only cap (`caps.rs:1568-1572`) | P2d, P3e |
 | R7 | Match remote display | ✅ | ❌ | ❌ | `display_match.rs:247` | P2d, P3e |
-| R8 | Clipboard: host → viewer image sync | ✅ | ❌ | ❌ | Forced off (`clipboard.rs:818-822`) ✔ while advertised (`caps.rs:1504-1512`) | P0c, P2e, P3e |
+| R8 | Clipboard: host → viewer image sync | ✅ | ❌ | ❌ | Forced off (`clipboard.rs:818-822`) ✔ while advertised (`caps.rs:1545-1553`) | P0c, P2e, P3e |
 | R9 | Clipboard: RTF lane | ✅ | ❌ | ❌ | `clipboard.rs:792` | P2e, P3e |
-| R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:9595-9598`) | FR-93 P7 |
+| R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:9646-9649`) | FR-93 P7 |
 | R11 | Typing text on a non-US layout (uinput) | ✅ | 🟡 US table only | ✅ | `keylayout.rs:40-46`, `uinput_backend.rs:628-634` | P3f |
 | R12 | Recording with audio | ✅ system + mic | ✅ | 🟡 picture only | No SCK audio; cpal is not a macOS dependency (`agents/roomlerd/Cargo.toml:321-322`) | P2a, P2f |
 | R13 | Dirty-rect capture (idle CPU) | ✅ WGC | ✅ X11 · ❌ Wayland | ❌ | `Damage::Unknown` (`scrap_backend.rs:222`) | D2 |
@@ -167,7 +171,7 @@ and the consent chain's fallbacks.
 |---|---|---|---|---|---|---|
 | D1 | Companion: tray, banner, consent, Apply now | ✅ | 🟡 | ✅ | One x86_64 `.deb` (`release-agent.yml:744-871`); Fedora, Arch and arm64 have none | P3g (with FR-93 D5/D6, FR-95) |
 | D2 | Companion pages on a system install | ✅ | 🟡 safety pages only | ❓ | Person socket (`crates/localapi/src/lib.rs:2602-2646`); a two-half Mac may answer Routes and Devices from the user half | #1911; FR-43 P3 |
-| D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ❌ | ✅ IOPMAssertion | A stub whose reason, "zbus is in no shipped Linux feature set" (`power.rs:649-660`), is stale: `portal-capture` ships zbus in `full` | P3b |
+| D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ✅ since P3b: a logind block inhibitor (`power.rs:670`) | ✅ IOPMAssertion | Was a stub whose reason, "zbus is in no shipped Linux feature set", had gone stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | ✅ | ❌ | ✅ | Root's home or `/tmp` (`files.rs:182-206`, `2483-2521`) | P3d |
 | D5 | The setup wizard installs the daemon | ✅ | ❌ | ❌ | Tunnel client only (`agents/roomler-setup/src/commands.rs:79-103`) ✔, yet the enroll dialog offered it for agents. P0c-2 offers it for agents on Windows only (`ui/src/utils/enrollCommands.ts:136`) | P0c, D5 |
 | D6 | Hive: adopt a terminal session | ❌ | ✅ | ✅ | `hive/supervisor/adopt.rs:404` | P4c |
@@ -187,13 +191,13 @@ and the consent chain's fallbacks.
 | O1 | A per-user install updates itself | ✅ | ❌ | ✅ | #2046 | FR-96 |
 | O2 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | ❌ | ❌ | `Unsupported` → the install proceeds (`artifact_version.rs:272-289`, `updater.rs:1404`): a signed older package under a newer manifest installs | P6a |
 | O3 | Tunnel CLI `roomler self-update` | ✅ | ❌ | ❌ | `agents/roomler-cli/src/update.rs:96-101` | P6b |
-| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:4848` | P6c |
+| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:4869` | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 apt only; the tarball has none | ❌ | A pasted recipe (`docs/installation.md:394-420`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
 | O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | ❌ | `macos_supervisor.rs` never calls `crash_recorder` | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1170-1179` | P6f |
-| O10 | An ephemeral device removes itself on a clean stop | 🟡 SCM installs only | ✅ | ✅ | A Scheduled-Task install has no stop signal (`main.rs:2695-2691`) | P4d |
+| O10 | An ephemeral device removes itself on a clean stop | 🟡 SCM installs only | ✅ | ✅ | A Scheduled-Task install has no stop signal (`main.rs:2716-2712`) | P4d |
 | A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2312-2318`); the CLI and the wizard are universal | D6 |
 | A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:80-81`); behaviour under emulation unverified | D6 |
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` (`release-agent.yml:1093`); recordings write Opus, not AAC | P7a |
@@ -209,7 +213,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 2. Linux and macOS advertise clipboard image events they never send (R8); a root Linux daemon advertises a clipboard
    it cannot reach (R10).
 3. The Ctrl+Alt+Del button shows for every host. It sends three ordinary key events
-   (`ui/src/composables/useRemoteControl.ts:11440-11452`) ✔, and nothing in the agent calls `SendSAS` (grep: none) ✔.
+   (`ui/src/composables/useRemoteControl.ts:11448-11460`) ✔, and nothing in the agent calls `SendSAS` (grep: none) ✔.
    Windows does not treat a synthesised Ctrl+Alt+Del as the secure attention sequence, so the button does nothing at
    a lock screen that requires it; on Linux and macOS the chord means something else, or nothing.
 4. The enroll dialog offers the setup wizard for agents on Linux and macOS, where it installs only the tunnel client
@@ -234,15 +238,15 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `docs/roomler-ssh.md:311-325` | Windows `daemon` → SYSTEM | the console worker (#2021, FR-94) |
 | `docs/installation.md:21-22`, `ui/docs/content/start/install/macos.md:51-53` | install the macOS daemon with the wizard | the wizard's daemon roles are Windows-only |
 | `docs/installation.md:43-44`, `ui/docs/content/troubleshooting/install-problems.md:37-40` | downloads come from roomler.ai | true for the MSI proxy, the CLI and the wizard; `install.sh`'s `.deb`/tarball/`.pkg` and every self-update fetch from GitHub (`updater.rs:1276,1360`) |
-| `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:3173` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon. ✅ Both say so since P0c-2 |
+| `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:3175` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon. ✅ Both say so since P0c-2 |
 | `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:181-224`); DRM captures from root (opt-in) |
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`) |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93 |
-| code comments: `power.rs:649-654`, `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1777`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps |
+| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1818`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps |
 
 ### 2.9 Equal on all three: not parity, recorded so nobody files them here
 
-Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:9692`), a curtain or
+Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:9700`), a curtain or
 privacy mode, touch injection, a live microphone (two-way audio), OS toast notifications
 (`crates/agent-core/src/notify.rs:21-24`), file copy-paste through the clipboard, minidumps, and SSH agent and X11
 forwarding. Several deserve FRs of their own; none is a platform gap.
@@ -327,14 +331,14 @@ matched by equality (`Unavailable::KEYS`, `:548`), and the wire shape is locked 
 
 An agent before P0c sends no map, and an absent key never means "unavailable": its lists say what it claims.
 
-**The decision** is one daemon-side seam, `with_honest_words` (`agents/roomlerd/src/encode/caps.rs:700`), applied
+**The decision** is one daemon-side seam, `with_honest_words` (`agents/roomlerd/src/encode/caps.rs:745`), applied
 in `detect()` (`:624`) after the config lists, over plain `HostFacts` (`:636`). It runs, and is tested, on every
 OS: FR-43's practice of keeping the decision out of `cfg(target_os)`.
 
 | Feature | When | What the hello says |
 |---|---|---|
 | `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:78`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:3064`); `unavailable.audio = no-backend` |
-| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:681`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
+| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:726`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone keeps image events (`clipboard.rs:817-822`) | `events` and `images` stay: text still syncs, and an image moves on request. `not-watched` |
 | `sas` | Windows | `keys-only`: the button types three ordinary keys, which apps on the desktop get and the lock screen does not. P4a's `SendSAS` replaces it with an `input: sas` word (D11) |
 | `sas` | Linux | `keys-only`: the same keys, which the desktop binds (GNOME and KDE to log out), so the button says so rather than going |
@@ -548,8 +552,14 @@ test of the SIGKILL property itself.
 
 - **P3a, cursor.** On X11, `XFixesGetCursorImage`, wiring the recorder's decoder (`capture/pointer.rs:187-230`) into
   the live channel. On portal and mutter, PipeWire cursor metadata (`SPA_META_Cursor`).
-- **P3b, lock and sleep.** `host_locked` from logind's `LockedHint` (`keep_busy/logind.rs`), advisory only; sleep
-  inhibited with logind `Inhibit("sleep:idle", …)` over the zbus that already ships.
+- **P3b, lock and sleep** (built). `rc:host_locked` from logind's `LockedHint` for seat0's active session, polled
+  every 2 s, **advisory only**. It never becomes a `LockState`: the Windows overlay and input suppression would blank
+  a lock screen the viewer can see and stop the keystrokes that unlock it. The message carries `input: "passes"`, so
+  the viewer's chip says input reaches the lock screen (`docs/remote-control.md` §5.1d). Kill switch:
+  `ROOMLERD_LOCK_HINT=0`. Sleep: the power keeper's Linux backend takes a logind block inhibitor over the zbus that
+  ships, from a plain thread (zbus's blocking API panics in the runtime). It takes `sleep:idle` as root and `idle`
+  only for a per-user daemon, which polkit refuses a `sleep` block. This is FR-55 P3, whose deferral reasons, no
+  D-Bus and no Linux desktops, both lapsed.
 - **P3c, audio.** Measured first (2026-10-17, §8), and the premise was wrong: the fallback to a microphone was not
   a corner case, it was the only path. cpal 0.15 has one Linux host, ALSA, which lists `pipewire`, `pulse` and
   `default` and never a sound server's sources, so neither the `.monitor` auto-pick nor the documented
@@ -561,10 +571,13 @@ test of the SIGKILL property itself.
     the control DC with FR-80's retry, from every exit of the pump; the viewer shows it once and keeps it on the
     audio control. An owner names `pulse` with `PULSE_SOURCE=@DEFAULT_MONITOR@` to capture the speakers today
     (measured; `docs/remote-control.md` §5.1c).
-  - **P3c-2, capture the session's monitor on every Linux host** (D14). Pulse's own client library, loaded at run
-    time like libpipewire, recording `@DEFAULT_MONITOR@`, which PulseAudio and PipeWire's Pulse server both
-    resolve. In the daemon for a per-user install; for a root daemon, in the session helper it already drops
-    privileges into (`portal-helper`, run as the seat's user). The recorder's computer audio takes the same path.
+  - **P3c-2, capture the session's monitor on every Linux host** (D14, built). Pulse's own client library, loaded
+    at run time like libpipewire, recording `@DEFAULT_MONITOR@`, which PulseAudio and PipeWire's Pulse server both
+    resolve (`audio/pulse.rs`). In the daemon for a per-user install; for a root daemon, in the session helper it
+    already drops privileges into (`portal-helper --audio`, run as the seat's user, PCM on its stdout). One route
+    function (`audio_source::linux_route`) decides for the hello and for each session: a named device wins, then
+    the kill switch, then the library, then root or not. The hello asks the disk, never the loader. The recorder's
+    computer audio takes the same route, in its own process, since it already runs as the person.
 - **P3d, files on a system install.** Resolve the seat's user (`companion::graphical_session`) and write into their
   Downloads *as that user*, the twin of `active_user_downloads_path` on Windows (`files.rs:2467-2480`).
   ⚠️ Never as root followed by a `chown`: in a directory the user owns, a root path operation can be redirected
@@ -669,8 +682,8 @@ model on Windows, so the three agree on what the mode means.
 | **P2e** | macOS clipboard images + RTF | `ROOMLERD_CLIPBOARD_NATIVE=0` | a field Mac | S–M |
 | **P2f** | macOS microphone for recordings | the recording's `mic` option | a field Mac | S–M |
 | **P3a** | Linux cursor shape (X11, then PipeWire) | `ROOMLERD_CURSOR_CHANNEL=0` | the FR-93 lab, Xorg + Wayland | S → M |
-| **P3b** | Linux lock hint + sleep inhibit | `power_policy`; per-verb | the lab | S |
-| **P3c** | Linux audio. *P3c-1*: never a microphone; no `opus` without a named device; `rc:audio-unavailable` says why (built). *P3c-2*: the session's monitor through Pulse's client library, per-user and root (D14) | P3c-1: — (a privacy fix; an owner names a device to opt back in); P3c-2: `ROOMLERD_AUDIO_SESSION=0` | a Linux host with a microphone and a sound server, red on 0.4.141 | M |
+| **P3b** | Linux lock hint (advisory, `input: "passes"`) + a logind block inhibitor (FR-55 P3) (built) | `ROOMLERD_LOCK_HINT=0`; `power_policy` | a vmtest Ubuntu guest, red on 0.4.142 | S |
+| **P3c** | Linux audio. *P3c-1*: never a microphone; no `opus` without a named device; `rc:audio-unavailable` says why (built). *P3c-2*: the session's monitor through Pulse's client library, per-user and root (D14, built) | P3c-1: — (a privacy fix; an owner names a device to opt back in); P3c-2: `ROOMLERD_AUDIO_SESSION=0` | a Linux host with a microphone and a sound server, red on 0.4.141 | M |
 | **P3d** | Linux system-install files land as the seat user | `ROOMLERD_FILES_AS_SEAT_USER=0` | the lab | M |
 | **P3e** | Linux X11 layout, display-match, clipboard images + RTF | per-verb | the lab | M |
 | **P3f** | uinput text on any layout | `ROOMLERD_UINPUT_XKB=0` | the lab, German and French layouts | M |
@@ -864,3 +877,8 @@ one depends on it.
 | 2026-10-17 | cpal 0.15.3, the version the agent links | WSL (Ubuntu 24.04; WSLg's PulseAudio 17 with one sink, `RDPSink`, and one source, `RDPSource`, the microphone). A replica of the Linux pick (`pick_device` before P3c-1), then the stream it opens, with `pactl list source-outputs` while it ran | **P3c measured; its premise was wrong.** cpal's input devices were exactly `pipewire`, `pulse` and `default`, and no name ended in `.monitor`. 🔴 With nothing set, the pick fell back to `default`. 🔴 With the documented `ROOMLERD_AUDIO_SOURCE=RDPSink.monitor`: "not found among inputs", then `default` again. 🔴 Through the `pulse` device the capture sat on **`RDPSource`, the microphone, RUNNING**, while `RDPSink.monitor` stayed suspended. 🟢 `pulse` with `PULSE_SOURCE=@DEFAULT_MONITOR@`: **`RDPSink.monitor` RUNNING**, the microphone suspended. So every Linux session with audio carried the microphone (R1). The recorder's computer audio could never open there either: its refusal by name was right, and its remedy text was not. P3c-1 follows |
 | 2026-10-17 | released 0.4.142 | mars, a throwaway Debian container: a per-user agent (vmtest org, ephemeral) beside a PulseAudio server. Its default source is `mic` (a 440 Hz sine source standing in for a microphone); its speakers are a null sink, `speakers`. The production viewer, with "Receive host audio" on; the server's recording clients sampled every 3 s | 🔴 **P3c-1 red: the session carried the microphone.** The agent logged `capturing the DEFAULT INPUT (likely a microphone, not desktop audio)` on `device=default`. PulseAudio showed `ALSA plug-in [roomlerd]` recording **`mic`, RUNNING**, while `speakers.monitor` stayed SUSPENDED in all 19 samples. The viewer held a live audio track: 1,204 Opus packets in 24 s |
 | 2026-10-17 | the #2419 candidate (`ced1f472d`, built on Debian bookworm) | the same container, three cells; the candidate viewer bundle (served on the real origin) for the third | 🟢 **P3c-1 green.** *Nothing named:* the hello carries no `opus` and `unavailable.audio = no-monitor`, and the session recorded nothing, with both sources SUSPENDED in all 12 samples. *`pulse` + `PULSE_SOURCE=@DEFAULT_MONITOR@`:* `ALSA plug-in [roomlerd]` recorded **`speakers.monitor`** (RUNNING), and `mic` stayed SUSPENDED in all 14 samples. *`ROOMLERD_AUDIO_SOURCE=nope`:* nothing was recorded. The agent sent `rc:audio-unavailable` with `source_not_found` and the reason "`ROOMLERD_AUDIO_SOURCE=nope` is not a capture device here (devices: pulse, default)". The candidate viewer received it and logged "the host sends no sound (source_not_found)" with the agent's hint |
+| 2026-10-17 | the P3c-2 branch, a debug build | WSL, against WSLg's PulseAudio 17: `roomlerd portal-helper --audio` run directly, its stdout counted | 🟢 **The Pulse route, alone.** The marked line `ROOMLER_AUDIO_STREAM:{"rate":48000,"channels":2}`, then 754,609 bytes in 3.9 s (48 kHz stereo s16 in real time). PulseAudio showed client `roomlerd` recording **`RDPSink.monitor`**, RUNNING, with the microphone SUSPENDED. With no server: `ROOMLER_AUDIO_FAILED` with `no_sound_server` and "Connection refused" |
+| 2026-10-17 | the P3c-2 candidate (built on Debian bookworm) | mars, the P3c-1 container: a per-user agent beside PulseAudio, `mic` the default source, `speakers` a null sink; the production viewer with audio on | 🟢 **P3c-2 green, per-user.** *Nothing named:* the hello carries `opus`. The agent logged `recording the sound server's monitor device="@DEFAULT_MONITOR@"`, and PulseAudio showed client **`roomlerd`** (libpulse itself, not the ALSA plugin) recording **`speakers.monitor`**, RUNNING, with `mic` SUSPENDED in 12/12 samples. The pump captured 2,305 frames (10 ms) and sent 1,152 Opus packets in 25 s. *`ROOMLERD_AUDIO_SESSION=0`:* the hello has no `opus` and says `no-monitor` with the kill switch's words, and nothing was recorded |
+| 2026-10-17 | released 0.4.142, then the P3c-2 candidate | zeus: a throwaway vmtest Ubuntu 24.04 guest (GNOME on Wayland, PipeWire 1.0.5 with no sound card, so the default sink is `auto_null`; GDM autologin). roomlerd runs as a root system service, enrolled ephemeral. A 440 Hz tone played in the session (`speaker-test`), and PipeWire's recording clients were sampled | 🔴 **Root red on 0.4.142.** The daemon tried the default input (`capturing the DEFAULT INPUT…`), which as root failed: `cpal loopback capture failed to open — falling back to silence`. The viewer held a silent track and no reason. PipeWire showed no recording client at all, while the tone played. 🟢 **P3c-2 green, root.** The seat user's helper logged `portal-helper: recording @DEFAULT_MONITOR@` (its own PID), and the daemon logged `the session helper records the sound server's monitor`. PipeWire showed client `roomlerd` recording **`auto_null.monitor`**, RUNNING, in every sample. The pump captured 5,014 frames in 50 s. Once the tone played, the Opus bytes climbed from 2,256 to 392,607, about 96 kb/s of sound reaching the viewer |
+| 2026-10-17 | released 0.4.142 | zeus: a throwaway vmtest Ubuntu 24.04 guest (GNOME on Wayland, GDM autologin), roomlerd a root system service, enrolled ephemeral. The production viewer held a session while seat0's session was locked and unlocked through logind; `LockedHint` and logind's inhibitors were read at every step | 🔴 **P3b red.** The lock set `LockedHint=yes`, and the viewer received no `rc:host_locked`: its chip stayed hidden throughout. During the session logind held only FR-93 P5h's `delay` inhibitor, and the daemon logged `cannot ask this OS to stay awake … no sleep-inhibit backend on this platform` |
+| 2026-10-17 | the P3b candidate (built from `0cd47f13d` on Debian bookworm), with its viewer bundle served on the real origin | the same guest, the candidate in place of the release (enrolled again), the session held 200 s | 🟢 **P3b green.** The lock reached the viewer 1 s later as `{"t":"rc:host_locked","locked":true,"input":"passes"}`, and the chip showed with the title that says input reaches the lock screen. The unlock came back as `locked:false` 1 s after it, and the chip hid. 🟢 The daemon took `sleep:idle` as a **block** inhibitor when the session began (`power: logind inhibitor taken`), held it while the screen was locked, and released it when the session ended. That was under the default `power_policy`, `never`, which a live session outranks (FR-55's first rule). ⚪ A first green run's viewer left before the unlock, so it never saw `locked:false`; the 200 s rerun saw both. ⚪ Not run: a per-user daemon, which takes `idle` only, because polkit refuses it a `sleep` block |

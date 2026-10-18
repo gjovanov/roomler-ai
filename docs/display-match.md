@@ -56,7 +56,7 @@ sequenceDiagram
 [`display_match.rs:589`](../agents/roomlerd/src/display_match.rs#L589) `may_switch` is the decision, pure and
 unit-tested. [`display_match.rs:614`](../agents/roomlerd/src/display_match.rs#L614) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:9741`](../agents/roomlerd/src/peer.rs#L9741)).
+control-channel arm sends the answer ([`peer.rs:9792`](../agents/roomlerd/src/peer.rs#L9792)).
 
 ### The answers
 
@@ -76,7 +76,7 @@ Every request gets exactly one `rc:display-match.state`
 ⚠️ An agent from before FR-108 answers nothing, and the viewer then shows the toggle as it always did. A word
 this viewer does not know, from a newer agent, is shown as it came and never read as success
 ([`displayMatch.ts:39`](../ui/src/composables/displayMatch.ts#L39) `describeDisplayMatchRefusal`). The viewer
-puts the answer under the toggle ([`RemoteControl.vue:3912`](../ui/src/views/remote/RemoteControl.vue#L3912)
+puts the answer under the toggle ([`RemoteControl.vue:3914`](../ui/src/views/remote/RemoteControl.vue#L3914)
 `displayMatchSaid`).
 
 ⚠️ `attended` and `disabled_on_device` hand the screen back: a mode this session applied earlier is restored
@@ -158,7 +158,7 @@ read as `attended` for four more minutes, and the request would be refused for n
 ## The person comes back (P1b)
 
 While a session holds a mode it applied, a watcher checks four times a second
-([`peer.rs:1423`](../agents/roomlerd/src/peer.rs#L1423), Windows only). It hands the screen back at once
+([`peer.rs:1462`](../agents/roomlerd/src/peer.rs#L1462), Windows only). It hands the screen back at once
 and tells the viewer ([`display_match.rs:727`](../agents/roomlerd/src/display_match.rs#L727)
 `on_tick`):
 

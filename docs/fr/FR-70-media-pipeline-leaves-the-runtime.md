@@ -109,7 +109,7 @@ HUD does not render the two new `HopWindow`s yet.
 
 Anchors verified against master `b4d12871`.
 
-**What the pump is today.** `media_pump_ffmpeg_dc` (`agents/roomlerd/src/peer.rs:4661–7467`,
+**What the pump is today.** `media_pump_ffmpeg_dc` (`agents/roomlerd/src/peer.rs:4700–7506`,
 27 await points) runs on a tokio worker and does everything in one loop: the
 budget gate and rate applies (`:5763`, `:6639`, `:6677`, `:6740`, `:6991`), pacing
 (`:5799`), capture (`:5813`, already a handoff to capture's own thread), the
@@ -526,7 +526,7 @@ thread behind a command channel (`encode::thread`: `encode`, `set_bitrate`,
 `request_keyframe`, `adopt_rebuilt`, `rebuild_spec{,_at_dims}`, `rate_stats`,
 `with`), and a replacement is built on that thread while the current one keeps
 producing. What did **not** move is the deciding. `media_pump_ffmpeg_dc`
-(`agents/roomlerd/src/peer.rs:4780–7895`) still computes, inside the frame path:
+(`agents/roomlerd/src/peer.rs:4819–7934`) still computes, inside the frame path:
 
 | what it decides | where | reads |
 |---|---|---|
@@ -614,17 +614,17 @@ a session whose heartbeat is indistinguishable from the release before it.
 ### ⚠️ Re-scoped 2026-09-09 — two assumptions in the design above do not hold
 
 Anchors re-verified against master `18ab3fb82`; the pump is now
-`media_pump_ffmpeg_dc` at `peer.rs:4824` and its frame loop opens at `:5673`.
+`media_pump_ffmpeg_dc` at `peer.rs:4863` and its frame loop opens at `:5712`.
 
 **1. There is no control-plane task to publish from.** The design says the plan
 is "computed by the control plane, published whole… on the tokio task that
 already runs the viewer window". That task does not exist: `tick_viewer_window`
-is called at **`peer.rs:7059`, inside the frame loop**, and self-limits to once
+is called at **`peer.rs:7098`, inside the frame loop**, and self-limits to once
 per `VIEWER_WINDOW` by returning `None`. M1 moved the ENCODER to its own thread;
 it did not move the deciding off the frame path, which is what M3 is for. So M3
 does not *publish across* an existing seam — it has to **create** the seam.
 
-**2. `pre_encode_tick` runs on EVERY frame** (`peer.rs:7245`), not once per
+**2. `pre_encode_tick` runs on EVERY frame** (`peer.rs:7284`), not once per
 window. A `Plan.bitrate_bps` recomputed per window therefore changes the
 rate-update cadence, which contradicts M3's own claim that "a plan whose fields
 are computed exactly as the pump computes them today produces byte-identical

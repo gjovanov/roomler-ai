@@ -170,11 +170,60 @@ pub trait FleetLifecycle: Send + Sync {
     }
 }
 
+/// FR-90 P3-2b — what a session's vault role is decided with: who asks, for
+/// which role, on which device, and why now. Plain data: core knows neither
+/// the agent row nor the session record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleAsk {
+    pub tenant_id: ObjectId,
+    /// The person the decision is about: the starter, the person moving the
+    /// session, the person forking it.
+    pub user_id: ObjectId,
+    pub role: String,
+    pub session_id: ObjectId,
+    /// The device the session would run on, as its row holds it: `os` the
+    /// agent's `OsKind` spelling (`linux` · `macos` · `windows`), `tags` the
+    /// admin's labels, `owner` the device's owner.
+    pub device_id: ObjectId,
+    pub device_os: String,
+    pub device_tags: Vec<String>,
+    pub device_owner: ObjectId,
+    /// `start` | `promote` | `teleport` | `fork`.
+    pub purpose: &'static str,
+}
+
+/// The gate's answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleVerdict {
+    pub allow: bool,
+    /// The policies that decided it, or why nothing could — for the audit
+    /// and the caller's refusal.
+    pub reason: String,
+}
+
+/// FR-90 P3-2b — the vault's gate on a session's role. `hive` owns the
+/// session and must never call the vault (`vault → hive` in the graph), so
+/// it asks through here, at every start that names a role and every move or
+/// fork of a session that holds one.
+///
+/// ⚠️ No gate registered (the vault not mounted) is a REFUSAL for any ask
+/// that names a role, never a pass: the caller sees `None` from
+/// [`HookRegistry::session_gate`] and refuses.
+#[async_trait]
+pub trait SessionGate: Send + Sync {
+    /// May `ask.user_id` assume `ask.role` on that device for that session?
+    /// The gate records its decision before answering; an `Err` is the gate
+    /// failing to decide, and the caller refuses.
+    async fn role_assume(&self, ask: &RoleAsk) -> anyhow::Result<RoleVerdict>;
+}
+
 /// What one module registers: the hook traits it implements.
 #[derive(Clone, Default)]
 pub struct Hooks {
     pub tenant: Option<Arc<dyn TenantLifecycle>>,
     pub fleet: Option<Arc<dyn FleetLifecycle>>,
+    /// FR-90 P3-2b — the vault's [`SessionGate`]; no other module has one.
+    pub session: Option<Arc<dyn SessionGate>>,
 }
 
 impl std::fmt::Debug for Hooks {
@@ -182,6 +231,7 @@ impl std::fmt::Debug for Hooks {
         f.debug_struct("Hooks")
             .field("tenant", &self.tenant.is_some())
             .field("fleet", &self.fleet.is_some())
+            .field("session", &self.session.is_some())
             .finish()
     }
 }
@@ -250,6 +300,19 @@ impl HookRegistry {
                     .map(|h| (*id, h))
             })
             .collect()
+    }
+
+    /// FR-90 P3-2b — the registered [`SessionGate`], the first in
+    /// [`HOOK_ORDER`] (only the vault registers one). `None` means no gate:
+    /// an ask that names a role is then refused by the caller.
+    pub fn session_gate(&self) -> Option<Arc<dyn SessionGate>> {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        HOOK_ORDER.iter().find_map(|id| {
+            inner
+                .iter()
+                .find(|(m, _)| m == id)
+                .and_then(|(_, h)| h.session.clone())
+        })
     }
 
     /// Run every `agent_removed` hook in order. The first lease a holder
@@ -556,5 +619,53 @@ mod tests {
                 .unwrap(),
             RenamePropagation::NoLiveNode
         );
+    }
+
+    struct Gate(bool);
+
+    #[async_trait]
+    impl SessionGate for Gate {
+        async fn role_assume(&self, ask: &RoleAsk) -> anyhow::Result<RoleVerdict> {
+            Ok(RoleVerdict {
+                allow: self.0,
+                reason: format!("{} for {}", ask.purpose, ask.role),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_session_gate_is_the_vaults_and_absent_without_it() {
+        let reg = HookRegistry::default();
+        // No gate: the caller must refuse an ask that names a role.
+        assert!(reg.session_gate().is_none());
+        // Hooks without one leave it absent.
+        reg.register(
+            "hive",
+            Hooks {
+                fleet: Some(Arc::new(Releases("x"))),
+                ..Default::default()
+            },
+        );
+        assert!(reg.session_gate().is_none());
+        reg.register(
+            "vault",
+            Hooks {
+                session: Some(Arc::new(Gate(true))),
+                ..Default::default()
+            },
+        );
+        let ask = RoleAsk {
+            tenant_id: ObjectId::new(),
+            user_id: ObjectId::new(),
+            role: "dev".into(),
+            session_id: ObjectId::new(),
+            device_id: ObjectId::new(),
+            device_os: "linux".into(),
+            device_tags: Vec::new(),
+            device_owner: ObjectId::new(),
+            purpose: "start",
+        };
+        let v = reg.session_gate().unwrap().role_assume(&ask).await.unwrap();
+        assert_eq!((v.allow, v.reason.as_str()), (true, "start for dev"));
     }
 }

@@ -337,6 +337,7 @@ mod tests {
             updated_at: DateTime::from_millis(5_000),
             ended_at,
             brain_rev: None,
+            vault_role: None,
             origin: SessionOrigin::Started,
             replicaset: None,
             promotion: None,
