@@ -241,7 +241,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:2615`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:191`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:341`, wired at `main.rs:3785`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:341`, wired at `main.rs:3804`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -599,26 +599,34 @@ attention sequence** (SAS), which the kernel raises for the physical chord and
 `SendSAS` raises for software. On a machine whose policy requires Ctrl+Alt+Del
 at sign-in, the viewer could see the lock screen and never get past it.
 
-`SendSAS(FALSE)` works under two conditions, and the daemon offers the real
-sequence only when both hold:
+`SendSAS(FALSE)` is honoured only from a **service process**, and only where
+the `SoftwareSASGeneration` policy lets services. ⚠️ **Measured: the
+SystemContext worker cannot call it for itself.** It runs as SYSTEM, but in the
+person's session, a child of the service and not the service. Its own
+`SendSAS(FALSE)` returned and logged, and the lock screen never moved. So the
+SCM host, the service process in session 0, sends it, and the worker only asks.
+The daemon offers the real sequence only when both of these hold:
 
 | Condition | Where it holds | Read from |
 |---|---|---|
-| The caller is **LocalSystem** | the SystemContext worker of an SCM install. Not a per-user install, and not an attended worker, which runs as the signed-in person | the process's own token (`worker_role::probe_self`) |
+| The worker **can ask the service** | the SystemContext worker of an SCM install: it is SYSTEM, the only account the relay lets signal, and the host handed it the relay (`--sas-event`). Not a per-user install, which has no service; not an attended worker, which runs as the signed-in person | the process's own token (`worker_role::probe_self`) and its argv |
 | The **`SoftwareSASGeneration`** policy lets services | `1` (services) or `3` (services and Ease of Access). Absent, Windows lets only Ease of Access applications | `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System` |
 
 ```mermaid
-flowchart LR
-    A["the announcement<br/>(every hello)"] --> D{"SYSTEM, and the policy<br/>lets services?"}
-    D -->|yes| S["input: sas<br/>no keys-only entry"]
-    D -->|no| K["keys-only, with the<br/>half that is missing"]
-    S --> V["the button sends<br/>{t: sas}"]
-    V --> E["the injector re-checks,<br/>then SendSAS(FALSE)"]
-    K --> T["the button types<br/>the three keys"]
+sequenceDiagram
+    participant V as viewer
+    participant W as worker (SYSTEM, the person's session)
+    participant H as SCM host (the service, session 0)
+    Note over W: every hello: input sas,<br/>or keys-only with the missing half
+    V->>W: {t: sas}, only if the hello said sas
+    W->>W: the arbiter (input floor + permission),<br/>then availability() again
+    W->>H: SetEvent on Global\roomler-sas-pid<br/>(DACL: SYSTEM only)
+    H->>H: the policy again, then SendSAS(FALSE)
+    Note over H: the lock screen asks for the password
 ```
 
 - **The decision is one pure function**
-  ([`sas.rs:87`](../agents/roomlerd/src/input/sas.rs#L87)), compiled on every
+  ([`sas.rs:97`](../agents/roomlerd/src/input/sas.rs#L97)), compiled on every
   OS so the lanes that never run Windows tests check it. It is made at every
   announcement ([`signaling.rs:6303`](../agents/roomlerd/src/signaling.rs#L6303)),
   and the heartbeat re-announces the moment its answer changes, so a policy a
@@ -628,12 +636,24 @@ flowchart LR
   ([`ctrlAltDel.ts:22`](../ui/src/composables/ctrlAltDel.ts#L22)): an older
   agent cannot parse the frame. The title then says the real one reaches the
   lock and sign-in screens.
-- **The injector checks again before it sends**
-  ([`enigo_backend.rs:275`](../agents/roomlerd/src/input/enigo_backend.rs#L275)):
+- **The frame goes through the input arbiter like a key**, so it needs the
+  input floor and the session's input permission, as typing does. The injector
+  then checks again
+  ([`enigo_backend.rs:277`](../agents/roomlerd/src/input/enigo_backend.rs#L277)):
   the policy can change between the hello and the click, and a viewer is not
-  trusted to have read the hello. Elsewhere the frame does nothing.
-- **`sas.dll` is loaded when the sequence is sent, never imported**
-  ([`sas.rs:161`](../agents/roomlerd/src/input/sas.rs#L161)). A binary that
+  trusted to have read the hello.
+- **The relay** ([`sas_relay.rs:43`](../agents/roomlerd/src/win_service/sas_relay.rs#L43))
+  is one named, auto-reset event per host, `Global\roomler-sas-<host pid>`,
+  whose protected DACL grants SYSTEM alone. A process that is not SYSTEM cannot
+  even open it (a test pins this), so an attended worker cannot ask for a SAS
+  and says `keys-only`. A SAS is what the physical chord raises: a SYSTEM
+  process that asks for one gains nothing it lacked. Signals that arrive while
+  one is being answered coalesce into one more, never a queue.
+- **The host re-checks the policy before it sends**
+  ([`sas.rs:139`](../agents/roomlerd/src/input/sas.rs#L139)), never trusting
+  that the worker did.
+- **`sas.dll` is loaded when the host sends, never imported**
+  ([`sas.rs:224`](../agents/roomlerd/src/input/sas.rs#L224)). A binary that
   imports a DLL some Windows edition lacks does not start at all. It is loaded
   from System32 only (`LOAD_LIBRARY_SEARCH_SYSTEM32`), so a SYSTEM process can
   never load a copy planted beside the binary.
@@ -641,8 +661,6 @@ flowchart LR
   a managed laptop it is the organisation's. Measured before the build
   (2026-10-18, read-only over `roomler exec`), the three corporate laptops in
   the fleet all set it to `1`.
-- The frame goes through the input arbiter like a key: it needs the input
-  floor and the session's input permission, as typing does.
 
 ### 5.2 Encoder selection
 

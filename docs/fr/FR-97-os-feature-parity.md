@@ -21,7 +21,8 @@
   field-verified red → green on a root daemon (§8).
 - P4d, a clean stop for a per-user Windows install (`roomlerd service stop`, sign-out, shutdown), merged (#2435),
   field-verified red → green on a perUser Win11 guest (§8).
-- P4a, a real Ctrl+Alt+Del (`SendSAS` from the SystemContext worker where the policy lets services), is in review.
+- P4a, a real Ctrl+Alt+Del (`SendSAS` from the SCM host, asked by the SystemContext worker, where the policy lets
+  services), is in review.
 - The rest of P2–P7 is open.
 
 **Owner:** the agent on all
@@ -194,13 +195,13 @@ and the consent chain's fallbacks.
 | O1 | A per-user install updates itself | ✅ | ❌ | ✅ | #2046 | FR-96 |
 | O2 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | ❌ | ❌ | `Unsupported` → the install proceeds (`artifact_version.rs:272-289`, `updater.rs:1404`): a signed older package under a newer manifest installs | P6a |
 | O3 | Tunnel CLI `roomler self-update` | ✅ | ❌ | ❌ | `agents/roomler-cli/src/update.rs:96-101` | P6b |
-| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:4913` | P6c |
+| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:4932` | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 apt only; the tarball has none | ❌ | A pasted recipe (`docs/installation.md:394-420`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
 | O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | ❌ | `macos_supervisor.rs` never calls `crash_recorder` | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1170-1179` | P6f |
-| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`main.rs:3069`, `session_end.rs:220`) | P4d |
+| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`main.rs:3088`, `session_end.rs:220`) | P4d |
 | A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2312-2318`); the CLI and the wizard are universal | D6 |
 | A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:80-81`); behaviour under emulation unverified | D6 |
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` (`release-agent.yml:1093`); recordings write Opus, not AAC | P7a |
@@ -611,21 +612,23 @@ test of the SIGKILL property itself.
 
 ### 3.9 P4 — Windows
 
-- **P4a, a real Ctrl+Alt+Del** (built). `SendSAS(FALSE)` from the SystemContext worker, which is SYSTEM, where the
-  `SoftwareSASGeneration` policy lets services (1 or 3). Measured first: all three corporate laptops in the fleet set
-  it to 1 (§8).
-  - The hello says `input: sas` and drops the `keys-only` entry only when both hold (`sas.rs:87`, decided at every
-    announcement). Elsewhere the reason names the missing half.
-  - The viewer sends `{t: "sas"}` only to an agent that advertises it, and the injector checks again before it sends.
-  - `sas.dll` is loaded at send time from System32 only, never imported.
-  - Not the SCM host's call for an attended worker: no channel carries input from the worker to the host, and the
-    SystemContext worker covers the installs this is for. `docs/remote-control.md` §5.1e.
+- **P4a, a real Ctrl+Alt+Del** (built). `SendSAS(FALSE)` from the SCM host, where the `SoftwareSASGeneration` policy
+  lets services (1 or 3). Measured first: all three corporate laptops in the fleet set it to 1 (§8).
+  - ⚠️ **Measured: the SystemContext worker cannot send it itself.** It is SYSTEM, but in the person's session, and
+    its own call returned while the lock screen stayed put (§8). Only the service process's call works.
+  - So the worker asks: it signals the host's relay, `Global\roomler-sas-<host pid>`, a SYSTEM-only, auto-reset event
+    handed to it as `--sas-event` (`sas_relay.rs:43`). The host re-checks the policy, then sends.
+  - The hello says `input: sas` and drops the `keys-only` entry only when the worker can ask and the policy allows
+    (`sas.rs:97`, decided at every announcement; the heartbeat re-announces a change). Elsewhere the reason names the
+    missing half. An attended worker cannot open the relay, so it stays `keys-only`.
+  - The viewer sends `{t: "sas"}` only to an agent that advertises it; the injector checks again before it asks.
+  - `sas.dll` is loaded at send time from System32 only, never imported. `docs/remote-control.md` §5.1e.
 - **P4b, SFTP as `console_user`.** Spawn `sftp-server` through the `CreateProcessAsUserW` + three-pipe path the exec
   code already uses, instead of `tokio::process` (`ssh.rs:926-948`).
 - **P4c, Hive adopt.** A named pipe whose server reads `GetNamedPipeClientProcessId` → token → SID and maps it to the
   session's account, asking for no credentials (`hive_win.rs:6-11`).
 - **P4d, a clean stop for Scheduled-Task installs** (built). Two channels into the arm the SCM host's event already
-  reaches (`main.rs:3069`):
+  reaches (`main.rs:3088`):
   - **`roomlerd service stop`** signals a `Local\` event keyed by the config's instance id (`stop_event.rs:338`),
     waits up to 15 s for the daemon to leave, and only then ends the task (`service.rs:558`).
   - **A hidden top-level window** turns `WM_ENDSESSION` into the stop and holds the session's end for at most 5 s,
@@ -709,7 +712,7 @@ model on Windows, so the three agree on what the mode means.
 | **P3g** | Linux companion for arm64 + tarball | — (a package) | the FR-93 lab, an arm64 vmtest guest | M |
 | **P3h** | Linux DNS without systemd-resolved | `ROOMLERD_DNS_NM=0` | evidence first | M |
 | **P3i** | Linux host firewall: what governs the overlay adapter, reported in `roomler status`, never changed (D13) | `ROOMLERD_HOST_FW_PROBE=0` | a firewalld node (zone `public`) and a ufw node, red then green | S |
-| **P4a** | Windows `SendSAS` from the SystemContext worker, where the policy lets services (built) | its cap word: no `sas` in the hello, no frame | Win11 SystemContext, red on 0.4.142; the corporate laptops' policy measured | S–M |
+| **P4a** | Windows `SendSAS` from the SCM host, which the SystemContext worker asks through a SYSTEM-only relay, where the policy lets services (built) | its cap word: no `sas` in the hello, no frame | Win11 SystemContext, red on 0.4.142; the corporate laptops' policy measured | S–M |
 | **P4b** | Windows SFTP as `console_user` | `ssh_sftp_as_user` | Win11 SystemContext | S–M |
 | **P4c** | Windows Hive adopt | `hive_adopt` | Win11 | M |
 | **P4d** | Windows per-user clean stop: `service stop` and a session-end window (D15, built) | `ROOMLERD_SESSION_END=0` (the window); `service stop` acts only when run | Win11, a perUser ephemeral device, red on 0.4.142 | S |

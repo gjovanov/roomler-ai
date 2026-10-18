@@ -89,7 +89,7 @@ each a module behind the FR-69 contract (`crates/core/src/module.rs:23`); new `E
 `crates/core/src/graph.rs:15`, the forbidden pairs untouched; `hive` first in `HOOK_ORDER`
 (`crates/core/src/hooks.rs:37`), because it holds sessions. The node side is a `roomlerd` feature,
 and its user-level half is `roomlerd hive-host`, re-exec'd as the mapped user like `portal-helper`
-(`agents/roomlerd/src/main.rs:215`) — no second binary. Wire frames are `rc:hive.*`, `rc:vault.*`,
+(`agents/roomlerd/src/main.rs:222`) — no second binary. Wire frames are `rc:hive.*`, `rc:vault.*`,
 `rc:knowhow.*` owned through `namespace()` (`crates/remote_control/src/signaling.rs:1554`); new
 `RpcCap` verbs `hive`, `hive-view` (P0d-2), `hive-replica`, `vault`, `knowhow-scan`, equality-matched
 (`crates/remote_control/src/models.rs:765,757`).
@@ -1437,7 +1437,7 @@ which ran in no lane before. Nothing calls them yet. The supervisor is wired to 
 | the mapping | `hive_win.rs:397` `names_console_user` and `:410` `check_mapping`: `name`, `DOMAIN\name` or `.\name`, case-insensitively. Anything else is `no_account`, naming who is at the console | a table of 15, including `CORP\dev` ≠ `WS-1\dev`, and `.` against a domain account |
 | the harness | `hive_win.rs:437` `harness_candidates`, `:453` `resolve_harness` | `hive_harness` alone when set; else `claude.exe`, then npm's `claude.cmd`; a directory of that name is no harness |
 | its command line | `hive_win.rs:523` `harness_command_line`: an `.exe` quoted for the C runtime; a `.cmd` through `%SystemRoot%\System32\cmd.exe /d /v:off /s /c`, an argument holding one of cmd's metacharacters (`:509`, `:513`) refused, never escaped | every argument reads back exactly through `CommandLineToArgvW`; eleven metacharacters are refused |
-| `roomlerd hive-prep` | `hive_win.rs:677` `prep`, and `:730` `run_prep`, which runs it in a job of its own with a 30 s deadline; dispatched at `main.rs:1132` | the config directory is made; memory is copied only where nothing is, so a resume keeps its edits; a folder that does not open is refused; a hang is ended at its deadline |
+| `roomlerd hive-prep` | `hive_win.rs:677` `prep`, and `:730` `run_prep`, which runs it in a job of its own with a 30 s deadline; dispatched at `main.rs:1139` | the config directory is made; memory is copied only where nothing is, so a resume keeps its edits; a folder that does not open is refused; a hang is ended at its deadline |
 
 Three decisions differ from the table above:
 
