@@ -153,7 +153,8 @@ roomler hive unadopt    # take the hooks out again
 `adopt` adds three hooks to **your own** user-level Claude Code settings
 (`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json`) and leaves
 every other setting and hook in that file as it was; `unadopt` takes out
-exactly those three. Each session you then run in a terminal is mirrored by
+exactly those three. On Windows each hook runs `roomler.exe` from the PATH the
+installer set. Each session you then run in a terminal is mirrored by
 this machine and listed for you alone in Roomler, read-only: nobody prompts it
 from there, and you may name readers. Nothing happens until this machine's
 owner turns on `hive_adopt` and maps your account in `hive_accounts`

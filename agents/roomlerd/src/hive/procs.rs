@@ -40,11 +40,18 @@ pub(crate) fn started(pid: u32) -> Option<String> {
 /// and the next turn's hook offered the session again as a new record.
 /// Claude Code is never a shell, and a shell that exec'd the hook is not
 /// there at all. `None`: no such process, or more shells than any wrapper.
-#[cfg(unix)]
+///
+/// FR-97 P4c — on Windows Claude Code runs a hook through Git Bash or
+/// PowerShell, and the installed `roomler.exe` is a shim that starts
+/// `roomlerd.exe cli` and waits for it, so the shim stands there too:
+/// `claude.exe → bash.exe → roomler.exe → roomlerd.exe`. Windows keeps a
+/// process's parent pid after that parent ends, so a "parent" created after
+/// its child is another process that took a dead one's pid, and is no one's
+/// terminal ([`imp::parent`]).
 pub(crate) fn hook_terminal(pid: u32) -> Option<u32> {
     let mut p = imp::parent(pid)?;
-    for _ in 0..MAX_WRAPPING_SHELLS {
-        if !SHELLS.contains(&imp::name(p)?.as_str()) {
+    for _ in 0..MAX_WRAPPERS {
+        if !is_wrapper(&imp::name(p)?) {
             return Some(p);
         }
         p = imp::parent(p)?;
@@ -54,11 +61,33 @@ pub(crate) fn hook_terminal(pid: u32) -> Option<u32> {
 
 /// What a hook's command line may run under, by process name.
 #[cfg(unix)]
-const SHELLS: [&str; 8] = ["sh", "dash", "bash", "zsh", "ksh", "mksh", "ash", "fish"];
+const WRAPPERS: [&str; 8] = ["sh", "dash", "bash", "zsh", "ksh", "mksh", "ash", "fish"];
+/// … on Windows: the shells Claude Code runs a hook through, and the shim.
+/// Compared without regard to case, as Windows compares file names.
+#[cfg(windows)]
+const WRAPPERS: [&str; 9] = [
+    "bash.exe",
+    "sh.exe",
+    "dash.exe",
+    "zsh.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "roomler.exe",
+    "roomler-shim.exe",
+];
 
-/// The most shells between a hook and the Claude Code that ran it.
-#[cfg(unix)]
-const MAX_WRAPPING_SHELLS: usize = 3;
+fn is_wrapper(name: &str) -> bool {
+    if cfg!(windows) {
+        WRAPPERS.iter().any(|w| name.eq_ignore_ascii_case(w))
+    } else {
+        WRAPPERS.contains(&name)
+    }
+}
+
+/// The most wrappers between a hook and the Claude Code that ran it: on
+/// Windows the shim is one more than any shell chain.
+const MAX_WRAPPERS: usize = if cfg!(windows) { 4 } else { 3 };
 
 /// Signal `pid`'s process group (the group a harness leads).
 #[cfg(unix)]
@@ -245,7 +274,8 @@ mod imp {
         Some(h)
     }
 
-    pub(super) fn started(pid: u32) -> Option<String> {
+    /// A running `pid`'s creation time, in 100 ns units since 1601.
+    fn created(pid: u32) -> Option<u64> {
         let h = open_running(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
         let zero = FILETIME {
             dwLowDateTime: 0,
@@ -258,10 +288,100 @@ mod imp {
             unsafe { GetProcessTimes(h, &mut created, &mut exited, &mut kernel, &mut user) } != 0;
         // SAFETY: the handle `open_running` gave us, closed once.
         unsafe { CloseHandle(h) };
-        ok.then(|| {
-            let t = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
-            t.to_string()
-        })
+        ok.then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+
+    pub(super) fn started(pid: u32) -> Option<String> {
+        created(pid).map(|t| t.to_string())
+    }
+
+    /// `pid`'s entry in a snapshot of every process: its parent's pid and its
+    /// executable's file name.
+    fn entry(pid: u32) -> Option<(u32, String)> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        };
+        // SAFETY: a plain snapshot; closed below.
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        // SAFETY: zeroing a POD struct, then `dwSize` as the API requires.
+        let mut e: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = None;
+        // SAFETY: a live snapshot and a sized entry, walked to its end.
+        let mut more = unsafe { Process32FirstW(snap, &mut e) } != 0;
+        while more {
+            if e.th32ProcessID == pid {
+                let len = e
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(e.szExeFile.len());
+                found = Some((
+                    e.th32ParentProcessID,
+                    String::from_utf16_lossy(&e.szExeFile[..len]),
+                ));
+                break;
+            }
+            // SAFETY: as above.
+            more = unsafe { Process32NextW(snap, &mut e) } != 0;
+        }
+        // SAFETY: the snapshot opened above, closed once.
+        unsafe { CloseHandle(snap) };
+        found
+    }
+
+    /// `pid`'s parent, if it is still the process that made `pid`. Windows
+    /// keeps the parent's pid after the parent ends, and the pid may belong to
+    /// another process by now: a "parent" that started after its child is
+    /// that other process.
+    pub(super) fn parent(pid: u32) -> Option<u32> {
+        let (ppid, _) = entry(pid)?;
+        if ppid <= 4 {
+            return None;
+        }
+        (created(ppid)? <= created(pid)?).then_some(ppid)
+    }
+
+    pub(super) fn name(pid: u32) -> Option<String> {
+        entry(pid).map(|(_, name)| name)
+    }
+
+    /// A child of `pid`, any one: what a test needs to find the process a
+    /// wrapper it started is running.
+    #[cfg(test)]
+    pub(super) fn child_of(pid: u32) -> Option<u32> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        };
+        // SAFETY: as in `entry`.
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        // SAFETY: as in `entry`.
+        let mut e: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = None;
+        // SAFETY: as in `entry`.
+        let mut more = unsafe { Process32FirstW(snap, &mut e) } != 0;
+        while more {
+            if e.th32ParentProcessID == pid {
+                found = Some(e.th32ProcessID);
+                break;
+            }
+            // SAFETY: as in `entry`.
+            more = unsafe { Process32NextW(snap, &mut e) } != 0;
+        }
+        // SAFETY: the snapshot opened above, closed once.
+        unsafe { CloseHandle(snap) };
+        found
     }
 
     pub(super) fn alive(pid: u32) -> bool {
@@ -336,6 +456,32 @@ mod win_tests {
         imp::terminate(0);
         imp::terminate(4);
         assert!(imp::alive(std::process::id()), "still here");
+    }
+
+    /// FR-97 P4c — a hook's terminal is past every wrapper: here `cmd.exe`
+    /// runs `ping` as Git Bash or PowerShell runs a hook's command line, and
+    /// the terminal found from the ping is this test process, which is no
+    /// wrapper.
+    #[test]
+    fn a_hooks_terminal_is_found_past_its_wrappers() {
+        let mut wrapper = std::process::Command::new("cmd")
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 >NUL"])
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let hook = loop {
+            if let Some(p) = imp::child_of(wrapper.id()) {
+                break p;
+            }
+            assert!(Instant::now() < deadline, "cmd started nothing");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(is_wrapper("CMD.EXE"), "names compare without case");
+        assert_eq!(imp::name(wrapper.id()).as_deref(), Some("cmd.exe"));
+        assert_eq!(hook_terminal(hook), Some(std::process::id()));
+        imp::terminate(hook);
+        let _ = wrapper.kill();
+        let _ = wrapper.wait();
     }
 }
 

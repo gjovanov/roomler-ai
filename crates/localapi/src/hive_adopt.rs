@@ -16,6 +16,15 @@
 //! a hook names: a root daemon reading `transcript_path` would read any file
 //! the requester could point it at.
 //!
+//! FR-97 P4c — on Windows the socket is a named pipe, [`PIPE_NAME`], and both
+//! ends check the other through the kernel:
+//! - the daemon names the hook by the client's token (its SID), never by what
+//!   the hook says, and refuses the service accounts as it refuses root;
+//! - the hook sends nothing unless the pipe is owned by SYSTEM, Administrators
+//!   or its own account. A pipe name is global, unlike a socket in the
+//!   daemon's runtime directory, so a process that took the name first would
+//!   otherwise receive the person's transcript.
+//!
 //! Wire: newline-delimited JSON. Each request is answered by one [`Reply`]
 //! before the next is read.
 //!
@@ -33,6 +42,9 @@ use serde::{Deserialize, Serialize};
 
 /// The socket's file name in the daemon's Hive runtime directory.
 pub const SOCKET_NAME: &str = "adopt.sock";
+
+/// FR-97 P4c — the adopt socket on Windows: one named pipe per machine.
+pub const PIPE_NAME: &str = r"\\.\pipe\roomler-hive-adopt";
 
 /// The most transcript bytes one [`Request::Lines`] carries. Whole lines only,
 /// so a hook stops before the line that would cross this and sends it next.
@@ -99,8 +111,8 @@ fn is_zero(n: &u64) -> bool {
 }
 
 /// Where a daemon on this system listens: its Hive runtime directory, which
-/// it owns and clears at boot. `None` where no daemon adopts (Windows, until
-/// its sessions land).
+/// it owns and clears at boot. `None` on Windows, where it listens on
+/// [`PIPE_NAME`] instead.
 pub fn socket_path() -> Option<std::path::PathBuf> {
     let dir = if cfg!(target_os = "linux") {
         RUNTIME_DIR_LINUX
@@ -110,6 +122,194 @@ pub fn socket_path() -> Option<std::path::PathBuf> {
         return None;
     };
     Some(std::path::Path::new(dir).join(SOCKET_NAME))
+}
+
+/// FR-97 P4c — the hook's end of [`PIPE_NAME`], kept only when the pipe is
+/// the daemon's: owned by SYSTEM, Administrators or this process's account.
+///
+/// - The pipe is opened for reading and writing data and nothing more. The
+///   daemon grants a person no more than that, and `FILE_CREATE_PIPE_INSTANCE`
+///   least of all, since with it a process could add an instance of its own
+///   under the name and take the next hook's connection. `GENERIC_WRITE`
+///   carries that right, so it is not asked for.
+/// - It is opened at identification level, so the daemon may read who is
+///   calling but not act as them.
+/// - A busy pipe (every instance taken) is waited for, briefly.
+///
+/// `NotFound`: no daemon adopts here now. `PermissionDenied`: something else
+/// holds the name, and the transcript is not sent to it.
+#[cfg(windows)]
+pub fn connect_pipe() -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use std::os::windows::io::IntoRawHandle;
+    let h = open_pipe()?.into_raw_handle();
+    // SAFETY: a pipe handle opened overlapped, owned from here by tokio.
+    match unsafe { tokio::net::windows::named_pipe::NamedPipeClient::from_raw_handle(h) } {
+        Ok(c) => Ok(c),
+        Err(e) => {
+            // SAFETY: tokio did not take it; closed once.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(h as _) };
+            Err(e)
+        }
+    }
+}
+
+/// [`connect_pipe`]'s open and check, without the async runtime: the handle,
+/// once the pipe is known to be the daemon's. Whether a device adopts is this
+/// succeeding.
+#[cfg(windows)]
+pub fn open_pipe() -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    open_pipe_at(PIPE_NAME)
+}
+
+/// [`open_pipe`] for the pipe called `name`: what tests open, on a name of
+/// their own.
+#[cfg(windows)]
+pub fn open_pipe_at(name: &str) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_PIPE_BUSY, GENERIC_READ, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OVERLAPPED, FILE_WRITE_DATA, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+        SECURITY_SQOS_PRESENT,
+    };
+    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut tries = 0;
+    let h = loop {
+        // SAFETY: a NUL-terminated name; the handle is handed to tokio below,
+        // or closed.
+        let h = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | FILE_WRITE_DATA,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                std::ptr::null_mut(),
+            )
+        };
+        if h != INVALID_HANDLE_VALUE {
+            break h;
+        }
+        let e = std::io::Error::last_os_error();
+        tries += 1;
+        if e.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) || tries > 3 {
+            return Err(e);
+        }
+        // SAFETY: a NUL-terminated name; waits at most 2 s for an instance.
+        unsafe { WaitNamedPipeW(wide.as_ptr(), 2000) };
+    };
+    if let Err(e) = server_is_trusted(h) {
+        // SAFETY: the handle opened above, not handed on; closed once.
+        unsafe { CloseHandle(h) };
+        return Err(e);
+    }
+    // SAFETY: a live handle this function opened and owns alone.
+    Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(h as _) })
+}
+
+/// Whether `pipe` is the daemon's: owned by SYSTEM, by the Administrators
+/// group, or by this process's own account, the owners the daemon's
+/// instances have (SYSTEM's, an elevated person's, or an unelevated person's
+/// own). Anyone else who took the name owns what they made, and cannot make
+/// SYSTEM or Administrators its owner without being an administrator. A pipe
+/// whose owner cannot be read is refused.
+///
+/// The OWNER, read through the pipe's own handle (its `READ_CONTROL`), and
+/// not the server process's token: a person may not open a SYSTEM process's
+/// token, so that check refused the real daemon (measured, FR-97 P4c's first
+/// field run).
+#[cfg(windows)]
+fn server_is_trusted(pipe: windows_sys::Win32::Foundation::HANDLE) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        TOKEN_QUERY, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let refused = |why: &str| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("the adopt pipe is not this device's daemon's: {why}"),
+        ))
+    };
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: a live pipe handle opened with READ_CONTROL; the owner points
+    // into `sd`, which the call allocates and is freed below.
+    let rc = unsafe {
+        GetSecurityInfo(
+            pipe,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    let verdict = if rc != 0 || owner.is_null() {
+        refused("its owner cannot be read")
+    // SAFETY: `owner` points into `sd`, alive until the free below.
+    } else if unsafe {
+        IsWellKnownSid(owner, WinLocalSystemSid) != 0
+            || IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0
+    } {
+        Ok(())
+    } else {
+        let mut mine = std::ptr::null_mut();
+        // SAFETY: this process's own token; closed below, once.
+        let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut mine) } != 0;
+        let mut buf = [0u64; 32];
+        let me = opened.then(|| token_user(mine, &mut buf)).flatten();
+        if opened {
+            // SAFETY: the token opened above, closed once.
+            unsafe { CloseHandle(mine) };
+        }
+        match me {
+            // SAFETY: both SIDs valid here: `me` in `buf`, `owner` in `sd`.
+            Some(me) if unsafe { EqualSid(owner, me) } != 0 => Ok(()),
+            Some(_) => refused("another account owns it"),
+            None => refused("this process's own account cannot be read"),
+        }
+    };
+    if !sd.is_null() {
+        // SAFETY: the one descriptor GetSecurityInfo allocated, freed once.
+        unsafe { LocalFree(sd as _) };
+    }
+    verdict
+}
+
+/// The user SID of `token`, read into `buf` (a `TOKEN_USER` and the SID it
+/// points into: a SID is at most 68 bytes, so 256 are ample, and `u64` keeps
+/// the structure aligned). The pointer is valid while `buf` is.
+#[cfg(windows)]
+fn token_user(
+    token: windows_sys::Win32::Foundation::HANDLE,
+    buf: &mut [u64; 32],
+) -> Option<windows_sys::Win32::Security::PSID> {
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_USER, TokenUser};
+    let mut len = 0u32;
+    // SAFETY: a live token with TOKEN_QUERY; `buf` is writable for the length
+    // passed and aligned for TOKEN_USER.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            std::mem::size_of_val(buf) as u32,
+            &mut len,
+        )
+    } != 0;
+    // SAFETY: on success `buf` begins with a TOKEN_USER whose SID points into
+    // `buf`.
+    ok.then(|| unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid })
 }
 
 /// The daemon's Hive runtime directory on Linux (`/run` is cleared at boot).
@@ -155,7 +355,8 @@ pub mod refusal {
     pub const ADOPT_DISABLED: &str = "adopt_disabled";
     /// The account this terminal runs as maps to nobody in `hive_accounts`.
     pub const NO_ACCOUNT: &str = "no_account";
-    /// Root's own sessions are never adopted.
+    /// Root's own sessions are never adopted, nor on Windows those of a
+    /// service account (SYSTEM, LOCAL SERVICE, NETWORK SERVICE).
     pub const ROOT: &str = "root";
     /// The server is not reachable now; the next hook offers it again.
     pub const OFFLINE: &str = "offline";
@@ -239,5 +440,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A pipe name of a test's own, never the daemon's.
+    #[cfg(windows)]
+    fn test_pipe(tag: &str) -> String {
+        format!(r"\\.\pipe\roomler-adopt-test-{tag}-{}", std::process::id())
+    }
+
+    /// FR-97 P4c — the hook keeps a pipe its own account serves (an attended
+    /// daemon is the person), opened with read and write alone.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_hook_opens_a_pipe_its_own_account_serves() {
+        let name = test_pipe("own");
+        let server = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&name)
+            .unwrap();
+        let opened = tokio::task::spawn_blocking({
+            let name = name.clone();
+            move || open_pipe_at(&name)
+        });
+        server.connect().await.unwrap();
+        assert!(
+            opened.await.unwrap().is_ok(),
+            "this account's own server is trusted"
+        );
+    }
+
+    /// … and with nothing listening says so, for `roomler hive adopt` to tell
+    /// the person.
+    #[cfg(windows)]
+    #[test]
+    fn with_no_pipe_the_hook_finds_nothing() {
+        let e = open_pipe_at(&test_pipe("none")).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
     }
 }

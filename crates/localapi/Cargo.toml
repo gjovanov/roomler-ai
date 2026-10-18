@@ -48,4 +48,7 @@ features = [
     # FR-92 P10b — and which account it runs as: its token's user, so a
     # SYSTEM / LocalService / NetworkService client can be told from a person.
     "Win32_System_Threading",       # OpenProcess, OpenProcessToken
+    # FR-97 P4c — the adopt pipe's client: opened with an exact access mask,
+    # then kept only when its server is SYSTEM or the caller's own account.
+    "Win32_Storage_FileSystem",     # CreateFileW, SECURITY_IDENTIFICATION
 ]
