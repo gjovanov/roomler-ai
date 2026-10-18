@@ -7351,6 +7351,276 @@ async fn two_writes_racing_for_the_last_room_cannot_both_fit() {
     assert_eq!(view["facts"].as_array().unwrap().len(), 6);
 }
 
+fn org_counter_key(tid: &str) -> Document {
+    doc! { "tenant_id": ObjectId::parse_str(tid).unwrap(), "scope": "org", "owner_id": null }
+}
+
+/// The org scope's counter, as the DAO keeps it (`brain_budgets`).
+async fn org_counter(app: &TestApp, tid: &str) -> Document {
+    app.db
+        .collection::<Document>("brain_budgets")
+        .find_one(org_counter_key(tid))
+        .await
+        .unwrap()
+        .expect("the org's counter")
+}
+
+/// Leave the org scope's counter as a write in flight, or a crash, would.
+async fn set_org_counter(app: &TestApp, tid: &str, update: Document) {
+    let r = app
+        .db
+        .collection::<Document>("brain_budgets")
+        .update_one(org_counter_key(tid), update)
+        .await
+        .unwrap();
+    assert_eq!(r.matched_count, 1, "the org's counter");
+}
+
+/// The org's active facts, counted from the facts themselves: (how many,
+/// their characters).
+async fn org_active(app: &TestApp, tid: &str) -> (usize, i64) {
+    let mut cursor = app
+        .db
+        .collection::<Document>("brain_facts")
+        .find(doc! { "tenant_id": ObjectId::parse_str(tid).unwrap(), "scope": "org", "status": "active" })
+        .await
+        .unwrap();
+    let (mut n, mut chars) = (0, 0);
+    while let Some(f) = cursor.next().await {
+        n += 1;
+        chars += f.unwrap().get_i64("chars").unwrap();
+    }
+    (n, chars)
+}
+
+/// `n` org facts of 500 characters; their ids.
+async fn keep_org_facts(app: &TestApp, tid: &str, admin: &str, n: usize) -> Vec<String> {
+    let mut ids = Vec::new();
+    for _ in 0..n {
+        let (code, f) = keep(
+            app,
+            tid,
+            admin,
+            json!({"scope": "org", "text": "x".repeat(500)}),
+        )
+        .await;
+        assert_eq!(code, 200, "{f}");
+        ids.push(f["id"].as_str().unwrap().to_string());
+    }
+    ids
+}
+
+fn ms_ago(ms: i64) -> bson::DateTime {
+    bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - ms)
+}
+
+/// The race above, held open: a write has taken the last room and not yet
+/// written its fact. A refusal must not recount over that reservation, or a
+/// second write takes the same room — which is how the race test failed under
+/// the whole suite's load.
+#[tokio::test]
+async fn a_reservation_in_flight_is_not_recounted_away() {
+    let app = hive_app_polling().await;
+    let seeded = app.seed_tenant("braininflight").await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    keep_org_facts(&app, &tid, &admin, 5).await;
+    let counter = org_counter(&app, &tid).await;
+    assert_eq!(
+        counter.get_i64("v").unwrap(),
+        5,
+        "each reservation is one more: {counter}"
+    );
+    let touched = counter
+        .get_datetime("touched_at")
+        .unwrap()
+        .timestamp_millis();
+    assert!(
+        bson::DateTime::now().timestamp_millis() - touched < 60_000,
+        "a reservation touches the counter: {counter}"
+    );
+    // What `reserve` leaves for those milliseconds: the room taken, no fact.
+    set_org_counter(
+        &app,
+        &tid,
+        doc! { "$inc": { "used": 500_i64, "v": 1_i64 }, "$set": { "touched_at": bson::DateTime::now() } },
+    )
+    .await;
+    let (code, body) = keep(
+        &app,
+        &tid,
+        &admin,
+        json!({"scope": "org", "text": "y".repeat(500)}),
+    )
+    .await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(
+        org_counter(&app, &tid).await.get_i64("used").unwrap(),
+        3_000,
+        "the reservation in flight is intact"
+    );
+    assert_eq!(org_active(&app, &tid).await, (5, 2_500));
+}
+
+/// A reservation a crash left behind is still given back, at the next
+/// refusal once the counter has been quiet for the window — and so is one on
+/// a counter from before the window and its version existed.
+#[tokio::test]
+async fn a_reservation_a_crash_left_behind_is_recounted_once_quiet() {
+    let app = hive_app_polling().await;
+    let seeded = app.seed_tenant("brainleak").await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let ids = keep_org_facts(&app, &tid, &admin, 5).await;
+    let quiet = ms_ago((roomler_ai_mod_hive::brain::RECOUNT_QUIET_SECS + 60) * 1000);
+    set_org_counter(
+        &app,
+        &tid,
+        doc! { "$inc": { "used": 500_i64, "v": 1_i64 }, "$set": { "touched_at": quiet } },
+    )
+    .await;
+    let (code, body) = keep(
+        &app,
+        &tid,
+        &admin,
+        json!({"scope": "org", "text": "y".repeat(500)}),
+    )
+    .await;
+    assert_eq!(code, 200, "the leaked room is recounted: {body}");
+    assert_eq!(
+        org_counter(&app, &tid).await.get_i64("used").unwrap(),
+        3_000
+    );
+    assert_eq!(org_active(&app, &tid).await, (6, 3_000));
+
+    // A counter written before `v` and `touched_at`: neither field, and a leak.
+    assert_eq!(archive_fact(&app, &tid, &admin, &ids[0]).await.0, 200);
+    set_org_counter(
+        &app,
+        &tid,
+        doc! { "$unset": { "v": "", "touched_at": "" }, "$inc": { "used": 500_i64 } },
+    )
+    .await;
+    let (code, body) = keep(
+        &app,
+        &tid,
+        &admin,
+        json!({"scope": "org", "text": "z".repeat(500)}),
+    )
+    .await;
+    assert_eq!(code, 200, "recounted without a version: {body}");
+    let counter = org_counter(&app, &tid).await;
+    assert_eq!(counter.get_i64("used").unwrap(), 3_000);
+    assert!(counter.get_i64("v").unwrap() >= 1, "{counter}");
+    assert_eq!(org_active(&app, &tid).await, (6, 3_000));
+}
+
+/// An archive in flight: its fact has left the count, its release is still
+/// to come, and the counter was touched first. A refusal must not recount
+/// over it, or the release takes the room off twice and a later write
+/// overspends. A real archive, and an edit that shrinks a fact, each touch
+/// the counter BEFORE the fact changes, then again with the release.
+#[tokio::test]
+async fn an_archive_in_flight_is_not_counted_twice() {
+    let app = hive_app_polling().await;
+    let seeded = app.seed_tenant("brainarchive").await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let ids = keep_org_facts(&app, &tid, &admin, 6).await;
+    let v = |c: &Document| c.get_i64("v").unwrap();
+
+    let before = v(&org_counter(&app, &tid).await);
+    assert_eq!(archive_fact(&app, &tid, &admin, &ids[0]).await.0, 200);
+    assert_eq!(
+        v(&org_counter(&app, &tid).await) - before,
+        2,
+        "touched, then released"
+    );
+    let before = v(&org_counter(&app, &tid).await);
+    let (code, e) = edit_fact(
+        &app,
+        &tid,
+        &admin,
+        &ids[1],
+        json!({"text": "short", "version": 1}),
+    )
+    .await;
+    assert_eq!(code, 200, "{e}");
+    assert_eq!(
+        v(&org_counter(&app, &tid).await) - before,
+        2,
+        "touched, then released"
+    );
+    let (code, e) = edit_fact(
+        &app,
+        &tid,
+        &admin,
+        &ids[1],
+        json!({"text": "x".repeat(500), "version": 2}),
+    )
+    .await;
+    assert_eq!(code, 200, "{e}");
+    keep_org_facts(&app, &tid, &admin, 1).await;
+    assert_eq!(org_active(&app, &tid).await, (6, 3_000));
+
+    // The archive of ids[2], held open after its touch and its flip.
+    set_org_counter(
+        &app,
+        &tid,
+        doc! { "$inc": { "v": 1_i64 }, "$set": { "touched_at": bson::DateTime::now() } },
+    )
+    .await;
+    let flipped = app
+        .db
+        .collection::<Document>("brain_facts")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&ids[2]).unwrap() },
+            doc! { "$set": { "status": "archived" } },
+        )
+        .await
+        .unwrap();
+    assert_eq!(flipped.modified_count, 1);
+    let (code, body) = keep(
+        &app,
+        &tid,
+        &admin,
+        json!({"scope": "org", "text": "y".repeat(500)}),
+    )
+    .await;
+    assert_eq!(
+        code, 409,
+        "not recounted over the archive in flight: {body}"
+    );
+    // Its release lands; the room it gave back fits one write, and only one.
+    set_org_counter(
+        &app,
+        &tid,
+        doc! { "$inc": { "used": -500_i64, "v": 1_i64 }, "$set": { "touched_at": bson::DateTime::now() } },
+    )
+    .await;
+    let (code, body) = keep(
+        &app,
+        &tid,
+        &admin,
+        json!({"scope": "org", "text": "y".repeat(500)}),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = keep(
+        &app,
+        &tid,
+        &admin,
+        json!({"scope": "org", "text": "z".repeat(500)}),
+    )
+    .await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(
+        org_counter(&app, &tid).await.get_i64("used").unwrap(),
+        3_000
+    );
+    assert_eq!(org_active(&app, &tid).await, (6, 3_000));
+}
+
 /// AC8's first half, on the server: a session's core memory is rendered when
 /// it is created, reaches the device BEFORE its start, and is FROZEN — a fact
 /// written afterwards is in the next session's snapshot and never in this one.
