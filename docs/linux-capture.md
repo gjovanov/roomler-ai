@@ -455,7 +455,7 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:47`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`signaling.rs:5432`). A changed brief (a login, a
+heartbeat only read that cache (`signaling.rs:5437`). A changed brief (a login, a
 logout, the greeter) re-announces the caps on the next heartbeat (`:1806`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
@@ -1102,7 +1102,7 @@ deadline. Both fall through to the rest of the cascade with the reason in the
 log. Unattended access on Linux is FR-36's DRM arm (or §5's mutter arm where
 there is no scanout) — never this one. ⚠️ Where the product says so: the spec,
 this page, the `portal_capture` description in the config surface
-(`crates/agent-core/src/config_surface.rs:988`, which every `roomler config`
+(`crates/agent-core/src/config_surface.rs:996`, which every `roomler config`
 reader sees) and the helper's own log line. Since FR-93 P2c the web viewer says
 it too: `rc:video-info` carries `capture_arm` and `attended`, and the viewer
 names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b).
@@ -1833,8 +1833,8 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 ## 7. Configuration
 
 Every key below is `restart required`; env wins over the config file. The
-keys are `crates/agent-core/src/config_surface.rs:1131-1202`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2658`).
+keys are `crates/agent-core/src/config_surface.rs:1139-1210`, and they reach
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2668`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|

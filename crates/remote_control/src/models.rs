@@ -2002,6 +2002,18 @@ pub struct Agent {
     /// key on the device is enough to move the fleet view with it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ssh_host_pubkey: String,
+    /// FR-90 P3-3a — the public half of the vault key the device's daemon
+    /// holds now, as its last hello reported it (standard base64 of 32 bytes,
+    /// [`crate::signaling::vault_key_is_well_formed`]): what the vault seals
+    /// a leased value to.
+    ///
+    /// Written on EVERY hello, the empty string included, so it never outlives
+    /// the process that made it: the daemon makes a new key at each start and
+    /// keeps it in memory only. Empty = the device takes no leases (its
+    /// `vault_enabled` is off, a build without the `vault` feature, an agent
+    /// before P3-3a, or a hello whose key was not well formed).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub vault_key: String,
     pub agent_token_hash: String,
     /// FR-103: the token generation. An agent token is accepted only while
     /// its `gen` claim equals this. Removing the device bumps it
@@ -8120,6 +8132,10 @@ mod tests {
             "hive_replica",
             "hive_archive",
             "hive_store_quota",
+            // FR-90 P3-3 — whether org secrets are ever decrypted on this
+            // machine: a server that could set it would choose where its own
+            // vault's values are opened.
+            "vault_enabled",
             // FR-99 — whether a controller may cover this screen: a server
             // that could set it could curtain any device it controls.
             "privacy_mode_allowed",

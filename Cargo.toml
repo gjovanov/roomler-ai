@@ -300,6 +300,11 @@ age = { version = "0.11", default-features = false }
 cedar-policy = { version = "4.14", default-features = false }
 chacha20poly1305 = "0.10"
 zeroize = "1"
+# FR-90 P3-3 — a leased value crosses to a device as a libsodium-compatible
+# sealed box (`crypto_box_seal`: X25519, XSalsa20-Poly1305) for the key the
+# daemon holds. The device's half is `roomlerd`'s `vault` feature. RustCrypto,
+# on the `curve25519-dalek` 4 and `aead` 0.5 the tree already builds.
+crypto_box = { version = "0.9.1", features = ["seal"] }
 
 # Agent-specific
 clap = { version = "4", features = ["derive"] }

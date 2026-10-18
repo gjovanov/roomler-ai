@@ -1525,6 +1525,11 @@ async fn connect_once(
         // it dialled. Empty here is meaningful ("this device cannot prove
         // itself"), never "trust anything".
         ssh_host_pubkey: ssh_host_pubkey_for(cfg),
+        // FR-90 P3-3a — the vault key's public half, made on this first ask
+        // and held in memory for the life of the process: the primary
+        // enrollment's connection only, and only while the owner's
+        // `vault_enabled` is on.
+        vault_key: crate::vault::hello_key(cfg.vault_enabled, ctx.is_primary),
     };
     send_msg(&mut ws, &hello).await.context("sending hello")?;
     // rc.58: explicit tick on hello — the 25 s keepalive timer hasn't

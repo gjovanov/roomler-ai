@@ -259,7 +259,7 @@ the feature works and looks broken, which is close to not working.
 The server takes caps from `rc:agent.hello` and nowhere else
 (`crates/modules/fleet/src/socket.rs:60`). `AgentHeartbeat` carries `rss_mb`,
 `cpu_pct`, `active_sessions` and `sys` — **no caps**
-(`crates/remote_control/src/signaling.rs:331`). There is no post-hello refresh
+(`crates/remote_control/src/signaling.rs:375`). There is no post-hello refresh
 path at all.
 
 That matters because the worker attaches on its own schedule: the supervisor

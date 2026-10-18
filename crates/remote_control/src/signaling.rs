@@ -103,6 +103,34 @@ pub const REJECT_REASON_SESSION_MISMATCH: &str = "session_id mismatch";
 /// reword.
 pub const LIMIT_NO_COMMON_CODEC: &str = "no_common_codec";
 
+/// FR-90 P3-3a — the length of a vault key on the wire: the standard, padded
+/// base64 of 32 bytes.
+pub const VAULT_KEY_B64_LEN: usize = 44;
+
+/// FR-90 P3-3a — is `key` a vault key as [`ClientMsg::AgentHello`] carries
+/// one: the standard, padded base64 of exactly 32 bytes, spelled canonically
+/// (the bytes encode back to the same text, so one key has one stored form),
+/// and not all zeros.
+///
+/// The server stores a hello's key only when this holds, and stores the empty
+/// string otherwise, so the vault never meets a key it cannot seal to. The
+/// zero check is a sanity check on a device's bug, not a security boundary: a
+/// device that wants its own leased values read elsewhere can send them there
+/// itself.
+pub fn vault_key_is_well_formed(key: &str) -> bool {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    if key.len() != VAULT_KEY_B64_LEN {
+        return false;
+    }
+    match STANDARD.decode(key) {
+        Ok(bytes) => {
+            bytes.len() == 32 && STANDARD.encode(&bytes) == key && bytes.iter().any(|b| *b != 0)
+        }
+        Err(_) => false,
+    }
+}
+
 /// Half-close direction in `TcpHalfClose`. SMTP / HTTP-1.1-long-poll /
 /// some legacy protocols rely on this.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,6 +345,22 @@ pub enum ClientMsg {
         /// keeps publishing.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         ssh_host_pubkey: String,
+        /// FR-90 P3-3a — the public half of this daemon's vault key, standard
+        /// base64 of the 32-byte X25519 key (see [`vault_key_is_well_formed`]):
+        /// what the vault seals a leased value to. An identity like
+        /// `ssh_host_pubkey`, so here rather than in [`AgentCaps`].
+        ///
+        /// Sent only while the device's own `vault_enabled` is on, on the
+        /// primary enrollment's connection only. The key lives in daemon
+        /// memory and a new one is made at every start, so a value sealed to
+        /// it is readable by this process alone, and by nothing that later
+        /// reads the disk.
+        ///
+        /// Empty = the device takes no leases: switched off, a secondary org's
+        /// connection, a build without the `vault` feature, or an agent that
+        /// predates the field.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        vault_key: String,
     },
 
     /// Agent periodic stats.
@@ -4522,6 +4566,7 @@ mod tests {
             advertised_routes: vec!["192.168.1.0/24".into()],
             supports_relay_regions: true,
             ssh_host_pubkey: String::new(),
+            vault_key: String::new(),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:agent.hello""#));
@@ -6266,6 +6311,7 @@ mod tests {
             advertised_routes: vec![],
             supports_relay_regions: true,
             ssh_host_pubkey: KEY.into(),
+            vault_key: String::new(),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(
@@ -6307,6 +6353,7 @@ mod tests {
             advertised_routes: vec![],
             supports_relay_regions: true,
             ssh_host_pubkey: String::new(),
+            vault_key: String::new(),
         };
         assert!(
             !serde_json::to_string(&none)
@@ -6314,6 +6361,76 @@ mod tests {
                 .contains("ssh_host_pubkey"),
             "an empty host key must be omitted, not sent as \"\""
         );
+    }
+
+    /// FR-90 P3-3a — the vault key rides the hello beside the host key: it
+    /// round-trips, an empty one is not sent, and a hello without it (every
+    /// agent before P3-3a) parses as a device that takes no leases. The key is
+    /// made here rather than written down, as every test key in the tree is.
+    #[test]
+    fn agent_hello_vault_key_roundtrips_and_absent_means_no_leases() {
+        use base64::Engine;
+        let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let hello = |vault_key: String| ClientMsg::AgentHello {
+            machine_name: "host".into(),
+            os: OsKind::Linux,
+            arch: String::new(),
+            arch_emulated: false,
+            agent_version: "0.4.142".into(),
+            displays: vec![],
+            caps: Box::new(AgentCaps::default()),
+            advertised_routes: vec![],
+            supports_relay_regions: true,
+            ssh_host_pubkey: String::new(),
+            vault_key,
+        };
+        let s = serde_json::to_string(&hello(key.clone())).unwrap();
+        assert!(s.contains(r#""vault_key""#), "{s}");
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::AgentHello { vault_key, .. } => assert_eq!(vault_key, key),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let mut old = serde_json::to_value(hello(key)).unwrap();
+        old.as_object_mut().unwrap().remove("vault_key");
+        match serde_json::from_value::<ClientMsg>(old).unwrap() {
+            ClientMsg::AgentHello { vault_key, .. } => assert!(vault_key.is_empty()),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let none = serde_json::to_string(&hello(String::new())).unwrap();
+        assert!(!none.contains("vault_key"), "{none}");
+    }
+
+    /// FR-90 P3-3a — what the server will store as a vault key: 32 bytes in
+    /// the standard alphabet's one canonical spelling, never all zeros.
+    #[test]
+    fn a_vault_key_is_32_bytes_of_canonical_standard_base64() {
+        use base64::Engine;
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE};
+        let good = STANDARD.encode([7u8; 32]);
+        assert_eq!(good.len(), VAULT_KEY_B64_LEN);
+        assert!(vault_key_is_well_formed(&good));
+        assert!(vault_key_is_well_formed(&STANDARD.encode([0xfbu8; 32])));
+
+        assert!(!vault_key_is_well_formed(""));
+        assert!(
+            !vault_key_is_well_formed(&STANDARD.encode([0u8; 32])),
+            "all zeros"
+        );
+        // 31 and 33 bytes are 44 characters too: the length alone proves nothing.
+        assert!(!vault_key_is_well_formed(&STANDARD.encode([7u8; 31])));
+        assert!(!vault_key_is_well_formed(&STANDARD.encode([7u8; 33])));
+        assert!(
+            !vault_key_is_well_formed(&URL_SAFE.encode([0xfbu8; 32])),
+            "the URL-safe alphabet"
+        );
+        // `…Bwc=` with a padding bit set: the same bytes, a second spelling.
+        let mut loose = good.clone();
+        loose.replace_range(42..43, "d");
+        assert!(!vault_key_is_well_formed(&loose), "{loose}");
+        assert!(!vault_key_is_well_formed(&format!("{good}\n")));
+        assert!(!vault_key_is_well_formed(&"!".repeat(VAULT_KEY_B64_LEN)));
     }
 
     /// FR-97 P0d — the native architecture rides the hello beside the OS.
@@ -6332,6 +6449,7 @@ mod tests {
             advertised_routes: vec![],
             supports_relay_regions: true,
             ssh_host_pubkey: String::new(),
+            vault_key: String::new(),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""arch":"aarch64""#), "{s}");
@@ -6367,6 +6485,7 @@ mod tests {
             advertised_routes: vec![],
             supports_relay_regions: false,
             ssh_host_pubkey: String::new(),
+            vault_key: String::new(),
         };
         let s = serde_json::to_string(&native).unwrap();
         assert!(
