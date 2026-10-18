@@ -2,9 +2,9 @@
 
 **Issue:** [#2041](https://github.com/gjovanov/roomler-ai/issues/2041) · **Status:** P1 delivered by FR-93 P6d–P6g; P2 lab-verified 2026-10-15; **P2 verified on the released 0.4.141**
 2026-10-17 (GNOME 50 and Plasma 6.7 system installs: AC1–AC4 and AC7 ticked; both kill switches pass); AC5 ticked
-2026-10-18 on 0.4.143 (an X11 system install is unchanged; the gap that leaves is #2450); AC6's "before" count was
-never snapshotted and cannot be recovered (the server keeps only each device's current brief, and no prod backup
-predates the roll), which waits on the operator; proposed 2026-10-12 · **Owner:** remote desktop (agent),
+2026-10-18 on 0.4.143 (an X11 system install is unchanged; the gap that leaves is FR-113, #2458); AC6 amended by the
+operator 2026-10-18 to the after count, since the "before" count was never snapshotted and cannot be recovered. ✅
+**Closed 2026-10-18**, every criterion ticked; proposed 2026-10-12 · **Owner:** remote desktop (agent),
 consent surfaces (FR-27) · **Split from:** [FR-93](FR-93-wayland-out-of-the-box.md) (its AC2, re-worded the same
 day) · **Builds on:** [FR-36](FR-36-wayland-capture.md) (DRM + uinput), [FR-27](FR-27-consent-surfaces-and-desktop-companion.md)
 (the companion and the prompt-surface chain), FR-93 P2b (the hello's desktop brief, to measure who this serves)
@@ -156,10 +156,17 @@ the person who was told is back. Their own new viewer session re-plans, and tell
     no picture by default. It is filed as #2450.
   - The same cell with the lane's own `drm_capture = true` captured the X11 session through DRM (84 of 84
     samples with a picture). Explicit keys are the operator's, and this FR leaves them alone.
-- [ ] **AC6**: P0's counts recorded before and after the roll (the server, not an exec sweep).
-  ⏳ **After** (prod, 2026-10-17 19:03Z, §8): no customer device answers `none` on Wayland. **Before** was never
-  snapshotted at the 0.4.139 roll; the devices still on older versions are what is left of it, and none of them
-  answers `none` either.
+- [x] **AC6** *(amended 2026-10-18, the operator: "do per your recommendation")*: ~~P0's counts recorded before and
+  after the roll~~ → P0's count **after** the roll, from the server (not an exec sweep), with the reason the
+  **before** count cannot exist.
+  ✅ **After** (prod, 2026-10-17 19:03Z, §8): no customer device answers `none` on Wayland.
+  **Before** was never snapshotted at the 0.4.139 roll, and it cannot be recovered after the fact:
+  - the server stores only each device's **current** desktop brief (`capabilities.desktop.capture_arm`), never its
+    history (`crates/api/src/routes/stats.rs` reads only that field);
+  - prod has no Mongo backup job (the deploy repo has none) from which a pre-roll copy could be read.
+  The devices still on releases older than 0.4.139 are what is left of "before", and none of them answers `none`
+  either. Recorded as unrecoverable rather than pinned as debt, because a pin is not how an FR closes
+  (`scripts/fr-ac-debt-baseline.txt`).
 - [x] **AC7**: Docs: `docs/linux-capture.md` and `docs/desktop-companion.md` updated in the house style, and the
   `docs/README.md` index row.
   ✅ `linux-capture.md` §1.2.1 (the plan, its mermaid, the guard, the kill switches), `desktop-companion.md`
