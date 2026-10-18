@@ -3002,6 +3002,23 @@
         ]
       },
       {
+        "collection": "vault_leases",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "session_id": 1
+            }
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
         "collection": "vault_policies",
         "indexes": [
           {
@@ -5069,6 +5086,23 @@
         ]
       },
       {
+        "collection": "vault_leases",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "session_id": 1
+            }
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
         "collection": "vault_policies",
         "indexes": [
           {
@@ -5223,6 +5257,7 @@
     "rc:hive.view.answer",
     "rc:hive.view.ice",
     "rc:hive.view.closed",
+    "rc:vault.lease",
     "rc:sdp.answer",
     "rc:consent",
     "rc:consent.pending",
@@ -5330,6 +5365,8 @@
     "rc:hive.view.offer",
     "rc:hive.view.ice",
     "rc:hive.view.close",
+    "rc:vault.leased",
+    "rc:vault.refused",
     "rc:pong",
     "rc:error",
     "rc:overlay.netmap"
@@ -5402,6 +5439,7 @@
     "rc:tunnel.udp.accept": "network",
     "rc:tunnel.udp.closed": "network",
     "rc:tunnel.udp.reject": "network",
-    "rc:tunnel.udp.request": "network"
+    "rc:tunnel.udp.request": "network",
+    "rc:vault.lease": "vault"
   }
 }

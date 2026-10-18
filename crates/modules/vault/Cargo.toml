@@ -10,14 +10,17 @@ description = "FR-90 module: vault — IAM for secrets, the server side: secrets
 name = "roomler_ai_mod_vault"
 path = "src/lib.rs"
 
-# P3-1 depends on core alone. The design's edges (`vault → hive`: a session's
-# record, its role, its room; `vault → fleet`: devices, their vault keys, the
-# Hub) arrive with the steps that use them (P3-2, P3-3), not before.
+# P3-1 depended on core alone. P3-3b adds the design's `vault → hive` edge: a
+# lease is believed only from the session record's device at its fence, read
+# through hive's own DAO. `vault → fleet` (the Hub, to push a revocation)
+# arrives with P3-3c.
 [dependencies]
 roomler-core = { path = "../../core" }
 roomler-ai-config = { path = "../../config" }
 roomler-ai-db = { path = "../../db" }
 roomler-ai-services = { path = "../../services" }
+roomler-ai-remote-control = { path = "../../remote_control" }
+roomler-ai-mod-hive = { path = "../hive" }
 
 # Envelope encryption: a data key per version under XChaCha20-Poly1305, the
 # data key wrapped to the KEK, an `age` X25519 identity — so a wrapped key
@@ -28,6 +31,12 @@ age.workspace = true
 cedar-policy.workspace = true
 chacha20poly1305.workspace = true
 zeroize.workspace = true
+# P3-3b — a leased value crosses to the device as a libsodium sealed box for
+# the vault key its daemon holds (`roomlerd`'s `vault` feature opens it).
+crypto_box.workspace = true
+base64.workspace = true
+# One lease queue per agent connection.
+dashmap.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true

@@ -1,0 +1,723 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
+//! P3-3b — leases: a value released to one agent session, sealed to the vault
+//! key of the daemon that runs it.
+//!
+//! A session's device asks over its own control connection
+//! (`rc:vault.lease`), and the vault answers on that connection: the value as
+//! a sealed box for the key the device's hello carried (`rc:vault.leased`),
+//! or one word (`rc:vault.refused`, [`LeaseRefusal`]).
+//!
+//! | Check, in order | Refused as | Recorded |
+//! |---|---|---|
+//! | the request within its bounds, in a mode that releases a stored value | `bad_request` | no |
+//! | the vault serves the organization | `not_served` | no |
+//! | the device takes leases: its hello advertised `vault` and carried a key | `unsupported` | no |
+//! | a session of the organization whose record places it on THIS device | `not_located` | no |
+//! | at the record's fence | `stale_fence` | yes |
+//! | live | `ended` | yes |
+//! | within the session's per-minute ceiling | `busy` | no |
+//! | holding a vault role | `no_role` | yes |
+//! | the secret, by path or by this organization's RRN, live | `no_secret` | yes |
+//! | not disabled | `disabled` | yes |
+//! | its field holding a value | `no_value` | yes |
+//! | a usable KEK | `unavailable` | yes |
+//! | Cedar's `secret:use` | `denied` | yes, with the request |
+//! | opened, and sealed to the device's key | `unavailable` | yes |
+//! | the allow recorded and the lease written | `undecided` | — |
+//!
+//! ⚠️ A request is believed only from the device the session's RECORD places
+//! it on, at the record's fence — hive's identity rule for its own frames. A
+//! device cannot lease for a session it does not run, and a run that lost its
+//! session to a move cannot lease for it any more.
+//!
+//! ⚠️ What a policy reads of the device comes from its ROW, never from the
+//! request.
+//!
+//! ⚠️ The allow is recorded and the lease written BEFORE the sealed value is
+//! sent: a lease the vault could not record is never released.
+//!
+//! ⚠️ Until the session is identified, a refusal is logged, not recorded:
+//! there is no session to name yet, and a device's flood of them must not
+//! become audit rows.
+
+use async_trait::async_trait;
+use base64::Engine;
+use bson::{DateTime, oid::ObjectId};
+use dashmap::DashMap;
+use roomler_ai_mod_hive::model::{AgentSession, SessionStatus};
+use roomler_ai_remote_control::{
+    models::{OsKind, RpcCap},
+    signaling::{ClientMsg, ServerMsg},
+    vault::{LeaseRefusal, lease_limits},
+};
+use roomler_ai_services::dao::base::DaoError;
+use roomler_core::{AgentCtx, AgentMsgHandler, AgentSocketLifecycle};
+use tokio::sync::mpsc::{self, error::TrySendError};
+use tracing::{debug, warn};
+
+use crate::VaultState;
+use crate::crypto::{self, Binding};
+use crate::model::{VaultAuditEvent, VaultLease, VaultSecret};
+use crate::policy::{self, Ask, DeviceFacts, SecretFacts, SessionFacts, Verdict};
+use crate::policy_routes::decide_for_org;
+use crate::rrn;
+
+/// The modes a lease may be asked in: those that hand the daemon the STORED
+/// value. `identity` releases nothing (the session authenticates as itself),
+/// `short-lived` mints a credential rather than reading one (P3-6), and
+/// `placeholder` is P3b's: a lease in any of them would release a value the
+/// policy that permits the mode never meant to.
+pub const LEASE_MODES: &[&str] = &["proxy", "file", "env", "exec"];
+
+/// One `rc:vault.lease`, as it arrived.
+#[derive(Debug, Clone)]
+pub struct LeaseRequest {
+    pub req_id: String,
+    pub session_id: ObjectId,
+    pub fence: u64,
+    pub secret: String,
+    pub field: String,
+    pub mode: String,
+    pub audience: String,
+    pub ttl_secs: u32,
+}
+
+/// What a granted lease answers with.
+#[derive(Debug)]
+pub struct Leased {
+    pub lease_id: ObjectId,
+    pub n: i64,
+    pub sealed: Vec<u8>,
+    pub expires_at: DateTime,
+}
+
+/// The connection a request arrived on: whose device, in which organization.
+#[derive(Debug, Clone, Copy)]
+pub struct Conn {
+    pub tenant_id: ObjectId,
+    pub device_id: ObjectId,
+}
+
+/// The vault's half of the agent socket: one queue per connection, answered
+/// in order by one task, so a slow decision never holds the socket's read
+/// loop and a flood is answered `busy` instead of queued.
+pub struct LeaseSocket {
+    state: VaultState,
+    conns: DashMap<String, mpsc::Sender<LeaseRequest>>,
+}
+
+impl LeaseSocket {
+    pub fn new(state: VaultState) -> Self {
+        Self {
+            state,
+            conns: DashMap::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentMsgHandler for LeaseSocket {
+    async fn handle(&self, ctx: &AgentCtx, msg: ClientMsg) -> Option<ClientMsg> {
+        let req = match msg {
+            ClientMsg::VaultLease {
+                req_id,
+                session_id,
+                fence,
+                secret,
+                field,
+                mode,
+                audience,
+                ttl_secs,
+            } => LeaseRequest {
+                req_id,
+                session_id,
+                fence,
+                secret,
+                field,
+                mode,
+                audience,
+                ttl_secs,
+            },
+            other => return Some(other),
+        };
+        let queued = match self.conns.get(&ctx.conn_id).map(|q| q.value().clone()) {
+            Some(queue) => queue.try_send(req).map_err(|e| match e {
+                TrySendError::Full(r) | TrySendError::Closed(r) => r,
+            }),
+            None => Err(req),
+        };
+        if let Err(req) = queued {
+            debug!(device = %ctx.agent_id, "vault: a lease request found its connection's queue full");
+            let _ = ctx.tx.try_send(refusal(&req.req_id, LeaseRefusal::Busy));
+        }
+        None
+    }
+}
+
+#[async_trait]
+impl AgentSocketLifecycle for LeaseSocket {
+    async fn hello(&self, ctx: &AgentCtx) {
+        let (tx, rx) = mpsc::channel(lease_limits::QUEUE_PER_CONNECTION);
+        self.conns.insert(ctx.conn_id.clone(), tx);
+        let conn = Conn {
+            tenant_id: ctx.tenant_id,
+            device_id: ctx.agent_id,
+        };
+        // Held weakly: a closed or displaced connection's channel is not
+        // kept open by the task that answers it.
+        tokio::spawn(answer_in_order(
+            self.state.clone(),
+            conn,
+            rx,
+            ctx.tx.downgrade(),
+        ));
+    }
+
+    /// Dropping the sender ends the answering task once its queue is empty.
+    async fn closing(&self, ctx: &AgentCtx) {
+        self.conns.remove(&ctx.conn_id);
+    }
+}
+
+/// Answer one connection's requests, in the order they came, until it goes.
+async fn answer_in_order(
+    state: VaultState,
+    conn: Conn,
+    mut rx: mpsc::Receiver<LeaseRequest>,
+    tx: mpsc::WeakSender<ServerMsg>,
+) {
+    while let Some(req) = rx.recv().await {
+        let answer = match lease(&state, conn, &req).await {
+            Ok(l) => ServerMsg::VaultLeased {
+                req_id: req.req_id.clone(),
+                lease_id: l.lease_id.to_hex(),
+                n: l.n,
+                sealed: base64::engine::general_purpose::STANDARD.encode(&l.sealed),
+                expires_at_ms: l.expires_at.timestamp_millis(),
+            },
+            Err(why) => refusal(&req.req_id, why),
+        };
+        let Some(tx) = tx.upgrade() else { break };
+        if tx.send(answer).await.is_err() {
+            break;
+        }
+    }
+}
+
+fn refusal(req_id: &str, why: LeaseRefusal) -> ServerMsg {
+    ServerMsg::VaultRefused {
+        req_id: clip(req_id, lease_limits::MAX_REQ_ID_LEN),
+        reason: why.wire().into(),
+    }
+}
+
+/// At most `max` bytes of `s`, cut on a character boundary.
+fn clip(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// Whether a request is within its bounds, in a mode that leases.
+fn within_bounds(req: &LeaseRequest) -> bool {
+    let printable = |s: &str| !s.chars().any(char::is_control);
+    !req.req_id.is_empty()
+        && req.req_id.len() <= lease_limits::MAX_REQ_ID_LEN
+        && printable(&req.req_id)
+        && !req.secret.is_empty()
+        && req.secret.len() <= lease_limits::MAX_SECRET_LEN
+        && req.field.len() <= lease_limits::MAX_FIELD_LEN
+        && req.audience.len() <= lease_limits::MAX_AUDIENCE_LEN
+        && printable(&req.audience)
+        && LEASE_MODES.contains(&req.mode.as_str())
+}
+
+/// The statuses a session is leased in: from its start until a stop is
+/// ordered.
+fn leasable(status: SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Starting
+            | SessionStatus::Idle
+            | SessionStatus::Running
+            | SessionStatus::AwaitingApproval
+    )
+}
+
+/// The path a request names: a path as is, or an RRN of THIS organization.
+/// `None` for anything else, another organization's RRN included — which a
+/// device is told is no secret, never that it is someone else's.
+fn path_of(asked: &str, slug: &str) -> Option<String> {
+    let path = match asked.strip_prefix("rrn:") {
+        Some(_) => asked.strip_prefix(&format!("rrn:{slug}:secret:"))?,
+        None => asked,
+    };
+    rrn::check_path(path).ok().map(str::to_string)
+}
+
+/// The spelling the device's row stores, which policies compare.
+fn os_name(os: OsKind) -> &'static str {
+    match os {
+        OsKind::Linux => "linux",
+        OsKind::Macos => "macos",
+        OsKind::Windows => "windows",
+    }
+}
+
+/// The reason a Cedar decision is recorded with.
+fn reason_of(verdict: &Verdict) -> String {
+    if !verdict.determining.is_empty() {
+        verdict.determining.join(",")
+    } else if !verdict.errors.is_empty() {
+        format!("undecided: {}", verdict.errors.join("; "))
+    } else {
+        "default_deny".to_string()
+    }
+}
+
+/// What every row about one request names.
+struct Record<'a> {
+    state: &'a VaultState,
+    conn: Conn,
+    session_id: ObjectId,
+    owner: ObjectId,
+    asked: &'a str,
+    /// Once resolved: the secret, its RRN, the field, and the version.
+    secret: Option<(ObjectId, String, String, Option<i64>)>,
+}
+
+impl Record<'_> {
+    fn event(
+        &self,
+        allow: bool,
+        reason: &str,
+        request: Option<&Ask>,
+        lease: Option<ObjectId>,
+    ) -> VaultAuditEvent {
+        let (secret_id, rrn, field, n) = match &self.secret {
+            Some((id, rrn, field, n)) => (Some(*id), Some(rrn.clone()), Some(field.clone()), *n),
+            None => (None, None, None, None),
+        };
+        let target = match (lease, &self.secret) {
+            (Some(id), _) => Some(format!("lease:{}", id.to_hex())),
+            (None, None) => Some(format!("asked:{}", self.asked)),
+            (None, Some(_)) => None,
+        };
+        VaultAuditEvent {
+            id: None,
+            tenant_id: self.conn.tenant_id,
+            principal: "session".into(),
+            user_id: self.owner,
+            action: policy::ACTION_USE.into(),
+            op: "lease".into(),
+            decision: if allow { "allow" } else { "deny" }.into(),
+            reason: reason.into(),
+            secret_id,
+            rrn,
+            field,
+            n,
+            target,
+            session_id: Some(self.session_id),
+            device_id: Some(self.conn.device_id),
+            request: request.map(Ask::to_doc),
+            at: DateTime::now(),
+        }
+    }
+
+    /// Refuse, recording why on a best-effort basis: the device is refused
+    /// whatever the database says.
+    async fn refuse(&self, why: LeaseRefusal, reason: &str) -> LeaseRefusal {
+        if let Err(e) = self
+            .state
+            .audit
+            .record(&self.event(false, reason, None, None))
+            .await
+        {
+            warn!(session = %self.session_id, %e, "vault: a lease refusal was not recorded");
+        }
+        why
+    }
+
+    /// Record a Cedar decision. An allow that is not recorded is not acted
+    /// on, so the error is the caller's to answer.
+    async fn decided(
+        &self,
+        allow: bool,
+        reason: &str,
+        ask: &Ask,
+        lease: Option<ObjectId>,
+    ) -> Result<(), DaoError> {
+        self.state
+            .audit
+            .record(&self.event(allow, reason, Some(ask), lease))
+            .await
+            .map(|_| ())
+    }
+}
+
+/// Decide one request, and release the value when it is allowed.
+pub async fn lease(
+    state: &VaultState,
+    conn: Conn,
+    req: &LeaseRequest,
+) -> Result<Leased, LeaseRefusal> {
+    if !within_bounds(req) {
+        return Err(LeaseRefusal::BadRequest);
+    }
+    if !state.scope.serves(conn.tenant_id) {
+        return Err(LeaseRefusal::NotServed);
+    }
+    let agent = match state
+        .agents
+        .find_live_in_tenant(conn.tenant_id, conn.device_id)
+        .await
+    {
+        Ok(a) => a,
+        Err(DaoError::NotFound) => return Err(LeaseRefusal::Unsupported),
+        Err(e) => {
+            warn!(device = %conn.device_id, %e, "vault: a lease's device was not read");
+            return Err(LeaseRefusal::Unavailable);
+        }
+    };
+    if !agent.capabilities.has_rpc(RpcCap::Vault) || agent.vault_key.is_empty() {
+        return Err(LeaseRefusal::Unsupported);
+    }
+    let session = match state
+        .sessions
+        .find_in_tenant(conn.tenant_id, req.session_id)
+        .await
+    {
+        Ok(s) if s.location.device_id == conn.device_id => s,
+        Ok(_) | Err(DaoError::NotFound) => {
+            warn!(
+                device = %conn.device_id, session = %req.session_id,
+                "vault: a lease for a session this device does not run"
+            );
+            return Err(LeaseRefusal::NotLocated);
+        }
+        Err(e) => {
+            warn!(session = %req.session_id, %e, "vault: a lease's session was not read");
+            return Err(LeaseRefusal::Unavailable);
+        }
+    };
+    let mut rec = Record {
+        state,
+        conn,
+        session_id: req.session_id,
+        owner: session.owner_id,
+        asked: &req.secret,
+        secret: None,
+    };
+    if u64::try_from(session.fence).ok() != Some(req.fence) {
+        let why = LeaseRefusal::StaleFence;
+        return Err(rec.refuse(why, why.wire()).await);
+    }
+    if !leasable(session.status) {
+        let why = LeaseRefusal::Ended;
+        return Err(rec.refuse(why, why.wire()).await);
+    }
+    if !state.lease_limiter.check(
+        req.session_id,
+        conn.device_id,
+        lease_limits::RATE_PER_MINUTE,
+    ) {
+        return Err(LeaseRefusal::Busy);
+    }
+    decide_and_release(state, &mut rec, &agent, &session, req).await
+}
+
+/// From the role on: the secret, the decision, the value.
+async fn decide_and_release(
+    state: &VaultState,
+    rec: &mut Record<'_>,
+    agent: &roomler_ai_remote_control::models::Agent,
+    session: &AgentSession,
+    req: &LeaseRequest,
+) -> Result<Leased, LeaseRefusal> {
+    let tid = rec.conn.tenant_id;
+    let Some(role) = session.vault_role.clone() else {
+        let why = LeaseRefusal::NoRole;
+        return Err(rec.refuse(why, why.wire()).await);
+    };
+    let Ok(slug) = crate::routes::org_slug(state, tid).await else {
+        return Err(rec.refuse(LeaseRefusal::Unavailable, "org_unread").await);
+    };
+    let secret: VaultSecret = match path_of(&req.secret, &slug) {
+        None => {
+            let why = LeaseRefusal::NoSecret;
+            return Err(rec.refuse(why, why.wire()).await);
+        }
+        Some(path) => match state.secrets.find_live_by_path(tid, &path).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                let why = LeaseRefusal::NoSecret;
+                return Err(rec.refuse(why, why.wire()).await);
+            }
+            Err(_) => return Err(rec.refuse(LeaseRefusal::Unavailable, "secret_unread").await),
+        },
+    };
+    let Some(secret_id) = secret.id else {
+        return Err(rec.refuse(LeaseRefusal::Unavailable, "secret_unread").await);
+    };
+    let field = if req.field.is_empty() {
+        rrn::STATIC_FIELD
+    } else {
+        req.field.as_str()
+    };
+    let n = secret
+        .fields
+        .get(field)
+        .map(|f| f.current)
+        .filter(|n| *n > 0);
+    rec.secret = Some((
+        secret_id,
+        rrn::secret_rrn(&slug, &secret.path),
+        field.to_string(),
+        n,
+    ));
+    if secret.disabled {
+        let why = LeaseRefusal::Disabled;
+        return Err(rec.refuse(why, why.wire()).await);
+    }
+    let Some(n) = n else {
+        let why = LeaseRefusal::NoValue;
+        return Err(rec.refuse(why, why.wire()).await);
+    };
+    let Some(kek) = state.kek.ready() else {
+        return Err(rec.refuse(LeaseRefusal::Unavailable, "no_kek").await);
+    };
+    let device = match DeviceFacts::new(os_name(agent.os), &agent.tags, agent.owner_user_id) {
+        Ok(d) => d,
+        Err(why) => {
+            return Err(rec
+                .refuse(LeaseRefusal::Denied, &format!("device: {why}"))
+                .await);
+        }
+    };
+    let ttl = req
+        .ttl_secs
+        .clamp(lease_limits::MIN_TTL_SECS, lease_limits::MAX_TTL_SECS);
+    let ask = Ask::UseSecret {
+        session: SessionFacts {
+            id: req.session_id.to_hex(),
+            owner: session.owner_id,
+            role: Some(role),
+            playbook: None,
+        },
+        secret: SecretFacts {
+            prefix: format!("rrn:{slug}:secret:"),
+            path: secret.path.clone(),
+            kind: secret.kind.clone(),
+            tags: secret.tags.clone(),
+        },
+        mode: req.mode.clone(),
+        audience: req.audience.clone(),
+        ttl_s: i64::from(ttl),
+        device,
+        approver: None,
+    };
+    let verdict = decide_for_org(state, tid, &ask).await;
+    let reason = reason_of(&verdict);
+    if !verdict.allow {
+        if let Err(e) = rec.decided(false, &reason, &ask, None).await {
+            warn!(session = %req.session_id, %e, "vault: a lease's deny was not recorded");
+        }
+        return Err(LeaseRefusal::Denied);
+    }
+
+    // Allowed: open the version and seal it for the device, BEFORE the allow
+    // is recorded, so a recorded allow is one that was ready to release.
+    let version = match state.versions.get(secret_id, field, n).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return Err(rec.refuse(LeaseRefusal::NoValue, "version_gone").await),
+        Err(_) => {
+            return Err(rec
+                .refuse(LeaseRefusal::Unavailable, "version_unread")
+                .await);
+        }
+    };
+    let at = Binding {
+        tenant_id: tid,
+        secret_id,
+        field,
+        n,
+    };
+    let sealed = {
+        let value = match kek.open(
+            &at,
+            &version.ciphertext.bytes,
+            &version.nonce.bytes,
+            &version.dek_wrapped.bytes,
+            &version.kek,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                let reason = format!("open: {}", e.as_str());
+                return Err(rec.refuse(LeaseRefusal::Unavailable, &reason).await);
+            }
+        };
+        match crypto::seal_for_device(&agent.vault_key, &value) {
+            Ok(s) => s,
+            Err(_) => return Err(rec.refuse(LeaseRefusal::Unavailable, "seal").await),
+        }
+        // `value` is zeroed here, when it drops.
+    };
+
+    let lease_id = ObjectId::new();
+    if let Err(e) = rec.decided(true, &reason, &ask, Some(lease_id)).await {
+        warn!(session = %req.session_id, %e, "vault: a lease's allow was not recorded — not released");
+        return Err(LeaseRefusal::Undecided);
+    }
+    let issued_at = DateTime::now();
+    let expires_at = DateTime::from_millis(issued_at.timestamp_millis() + i64::from(ttl) * 1000);
+    let row = VaultLease {
+        id: Some(lease_id),
+        tenant_id: tid,
+        secret_id,
+        field: field.to_string(),
+        n,
+        session_id: req.session_id,
+        fence: session.fence,
+        device_id: rec.conn.device_id,
+        owner_id: session.owner_id,
+        sealed_to: agent.vault_key.clone(),
+        mode: req.mode.clone(),
+        audience: req.audience.clone(),
+        issued_at,
+        expires_at,
+        revoked_at: None,
+        revoked_why: None,
+    };
+    if let Err(e) = state.leases.insert(&row).await {
+        warn!(session = %req.session_id, %e, "vault: a lease was not written — not released");
+        return Err(LeaseRefusal::Undecided);
+    }
+    Ok(Leased {
+        lease_id,
+        n,
+        sealed,
+        expires_at,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req() -> LeaseRequest {
+        LeaseRequest {
+            req_id: "r1".into(),
+            session_id: ObjectId::new(),
+            fence: 1,
+            secret: "db/main".into(),
+            field: String::new(),
+            mode: "env".into(),
+            audience: String::new(),
+            ttl_secs: 300,
+        }
+    }
+
+    #[test]
+    fn a_request_is_held_to_its_bounds_and_to_a_mode_that_leases() {
+        assert!(within_bounds(&req()));
+        for mode in LEASE_MODES {
+            assert!(within_bounds(&LeaseRequest {
+                mode: (*mode).into(),
+                ..req()
+            }));
+        }
+        // Modes a policy may name that release no stored value.
+        for mode in ["identity", "short-lived", "placeholder", "raw", ""] {
+            assert!(
+                !within_bounds(&LeaseRequest {
+                    mode: mode.into(),
+                    ..req()
+                }),
+                "{mode:?}"
+            );
+        }
+        for bad in [
+            LeaseRequest {
+                req_id: String::new(),
+                ..req()
+            },
+            LeaseRequest {
+                req_id: "x".repeat(lease_limits::MAX_REQ_ID_LEN + 1),
+                ..req()
+            },
+            LeaseRequest {
+                req_id: "a\nb".into(),
+                ..req()
+            },
+            LeaseRequest {
+                secret: String::new(),
+                ..req()
+            },
+            LeaseRequest {
+                secret: "s".repeat(lease_limits::MAX_SECRET_LEN + 1),
+                ..req()
+            },
+            LeaseRequest {
+                field: "f".repeat(lease_limits::MAX_FIELD_LEN + 1),
+                ..req()
+            },
+            LeaseRequest {
+                audience: "a\u{0}".into(),
+                ..req()
+            },
+        ] {
+            assert!(!within_bounds(&bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_secret_is_named_by_path_or_by_this_organizations_rrn() {
+        assert_eq!(path_of("db/main", "grox").as_deref(), Some("db/main"));
+        assert_eq!(
+            path_of("rrn:grox:secret:db/main", "grox").as_deref(),
+            Some("db/main")
+        );
+        // Another organization's RRN is no secret here — not "someone
+        // else's".
+        assert_eq!(path_of("rrn:other:secret:db/main", "grox"), None);
+        assert_eq!(path_of("rrn:grox:role:db/main", "grox"), None);
+        // A path the vault would never store.
+        assert_eq!(path_of("DB/Main", "grox"), None);
+        assert_eq!(path_of("../db", "grox"), None);
+    }
+
+    #[test]
+    fn only_a_session_short_of_a_stop_is_leased() {
+        for s in [
+            SessionStatus::Starting,
+            SessionStatus::Idle,
+            SessionStatus::Running,
+            SessionStatus::AwaitingApproval,
+        ] {
+            assert!(leasable(s), "{s:?}");
+        }
+        for s in [
+            SessionStatus::Stopping,
+            SessionStatus::Ended,
+            SessionStatus::Refused,
+            SessionStatus::Lost,
+        ] {
+            assert!(!leasable(s), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_request_id_is_echoed_clipped_on_a_character_boundary() {
+        let long = "é".repeat(lease_limits::MAX_REQ_ID_LEN);
+        let clipped = clip(&long, lease_limits::MAX_REQ_ID_LEN);
+        assert!(clipped.len() <= lease_limits::MAX_REQ_ID_LEN);
+        assert!(long.starts_with(&clipped));
+        assert_eq!(clip("short", 64), "short");
+    }
+}
