@@ -84,7 +84,7 @@ roomler org overlay <org> tun
 
 ## Platform limits
 
-- **macOS**: a separate network adapter per organization is built, but has not been verified on a Mac yet. Until it has, plan on one adapter, for the primary organization.
+- **macOS**: each organization gets its own network adapter, as on Windows and Linux (verified on macOS 15). Like the mesh itself on a Mac, it runs in the agent's system half, which runs as root.
 - **Exit node** and userspace-networking roles are primary-organization only.
 
 ## Removing one

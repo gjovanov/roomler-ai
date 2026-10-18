@@ -605,7 +605,12 @@ no blank row can render).
   real utun and asserts against `ifconfig` / `netstat -rn` that a second
   address lands, a peer `/32` lands, a subnet route lands, and each comes
   back off — plus that the utun name really is kernel-assigned, so the
-  hardcoded name cannot quietly return. (If a persistent macOS mesh member
+  hardcoded name cannot quietly return. Two orgs on one Mac were run on the
+  released 0.4.143 (FR-97 P1d, macOS 15): the primary's runtime came up on
+  one utun and the secondary's on the next, the anchor of the secondary's
+  org routed through the secondary's utun and answered 5 of 5 pings, its
+  MagicDNS bound to that utun, and a clean stop took both utuns and their
+  routes away. (If a persistent macOS mesh member
   is ever wanted, a rented Apple-silicon Mac mini is ~€0.11–0.22/h with a
   24 h minimum lease — Apple licensing, which AWS EC2 Mac carries too.)
 - **Netstack is per-org.** ~~One handle channel, one SOCKS port, one ping
