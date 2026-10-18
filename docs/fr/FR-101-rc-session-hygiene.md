@@ -1,8 +1,8 @@
 # FR-101: Remote-desktop session hygiene — sensitive features off by policy, the audit that exists emitted, sessions that end, the transport hardened
 
-**Issue:** [#2093](https://github.com/gjovanov/roomler-ai/issues/2093) · **Status:** in progress — every
-criterion but AC8 field-verified (AC1's last half, Safari, on 2026-10-17); AC8, TURN over IPv6, is an
-operations item (no coturn host has an AAAA record) · **Owner:** the agent (permission masking, the transport), the hub (policy, audit, limits),
+**Issue:** [#2093](https://github.com/gjovanov/roomler-ai/issues/2093) · **Status:** done — every
+criterion field-verified (AC1's last half, Safari, on 2026-10-17); AC8 amended by the operator on 2026-10-18
+to "IPv4-only TURN, by design, documented" and verified against production's DNS · **Owner:** the agent (permission masking, the transport), the hub (policy, audit, limits),
 the viewer (defaults) · **Anchors:** master `c2e79221b` · **Program:**
 [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 1 · **Builds on:**
 [security baseline](../security-baseline.md), [permissions](../permissions.md),
@@ -352,7 +352,15 @@ and gives labs an explicit escape before the default flips.
   ([job 115569893051](https://github.com/gjovanov/roomler-ai/actions/runs/38476959531/job/115569893051),
   569 passed). The owner is refused `rate_limited` on request 61 of 60, another device is untouched,
   and a member without the right gets `permission_denied` all 61 times, never `rate_limited`.
-- [ ] **AC8:** TURN over IPv6 is answered, or `listening-ip` is fixed and then answered.
+- [x] **AC8 (amended 2026-10-18, the operator's decision):** TURN's address family is settled and
+  documented: **IPv4-only, by design**. *First written as "TURN over IPv6 is answered, or `listening-ip` is
+  fixed and then answered". Production's coturn runs as Kubernetes pods behind the hosts' IPv4 DNAT. Either
+  reading meant restarting production TURN, and dropping every relayed session, for an IPv6-only audience
+  nothing showed. The operator chose to settle and document the IPv4-only design instead.* **Verified**
+  (§8 row 15): every TURN host the server hands out (`coturn.roomler.ai` and `coturn-1..3.roomler.ai`, from
+  `ROOMLER__TURN__URL` and `…__WORKER_URLS`) answers A records and no AAAA, and `roomler.ai` itself has no
+  AAAA either. A client on an IPv6-only network therefore reaches TURN the way it already reaches the site:
+  through its network's NAT64/DNS64. Documented in `deployment.md` (relay infrastructure).
 - [x] **AC9:** **Docs:** `docs/security-baseline.md` and `docs/remote-control.md` describe the policy switches,
   the audit rows (with a mermaid diagram of where they are written), the timeouts and the transport
   settings. Linked from `docs/README.md`. **Done** (#2235, P5):
@@ -400,6 +408,7 @@ weighed.
 | 12 | 2026-10-15 | **AC1's Firefox half, and #2231's field proof.** The same guest on 0.4.137. Playwright 1.62's Firefox (no OpenH264), then Chromium, each under a UDP capture that starts before the connect | Both went live. **Firefox:** the agent logs `RTP video track takes a codec the offer carries; the DataChannel carries the video pump_codec=h264 track_codec=vp8` and answers. The session runs on the VP9 DataChannel. The agent offers `c02b c02f`, and Firefox's ServerHello picks `c02b` (relayed, over TURN ChannelData). On 0.4.136 the same Firefox never reached DTLS (row 9). **Chromium:** the same offer, and `c02b` picked (direct). Safari is still owed |
 | 13 | 2026-10-15 | **Wrong turns** | (1) **The control's first run failed, and the harness was at fault.** On the DataChannel paths the viewer hides its `<video>`, the first child of the stage. A `video, canvas` locator picked it, got no bounding box and moved nothing, so the control idled out at 60 s like the untouched session. Re-run over the stage (`.video-frame`), it held. (2) The green's first journal read used a 60 s window that opened after the restart's lines, and found nothing. Re-read by the daemon's invocation id. (3) The "read as TLS" warning is logged twice per start, 51 ms apart. Harmless; not chased |
 | 14 | 2026-10-17 | **AC1's Safari half.** Safari 18.6 on macOS 15.7.7, in a throwaway clone of the vmtest tart golden on the operator's MacBook, driven by `safaridriver` (WebDriver, from a standard-library client), with `purestat.ai` blocked in the VM's `/etc/hosts`. Production's viewer, nothing served into the page, against a fresh vmtest Win11 `--type system` guest on the released 0.4.142 (`vmtest-w-ins-sys-224044`). The page's `RTCPeerConnection` was wrapped before Connect so its `getStats()` could be read | **Safari connects, on an ECDHE-GCM suite.** "connected" one second after Connect. The transport read `dtlsState: connected`, `dtlsCipher: TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` (`c02b`) and `tlsVersion: FEFD` (DTLS 1.2), with Safari the DTLS server (the agent is the client, as for the others). Media: H.264 at 1280×800, 167 frames decoded in the first 12 s of a static desktop, the `<video>` clock advancing, and all five data channels open. The pair was srflx to srflx over UDP, 41 ms round trip. Safari's own screenshot shows the guest's desktop in the viewer. The SRTP profile Safari chose was `AES_CM_128_HMAC_SHA1_80`; that is not this criterion's (it is about the DTLS suites), and is recorded only. **Wrong turn:** the first run clicked Connect through WebDriver, and the click never returned (and wedged `safaridriver` until the VM was deleted). The likely cause, not observed directly: a WebDriver click is a trusted gesture, and inside one Safari answers the viewer's clipboard read with its native "Paste" callout, which nobody can answer in an automated session. The second run clicked Connect from a script, which carries no gesture (WebRTC does not need one), and connected at once. The guest was destroyed by name afterwards and its row removed |
+| 15 | 2026-10-18 | **AC8, as amended: TURN's address family on production.** The TURN URLs production hands out, read from the deploy repo's `configmap-roomler2-config.yaml` (`ROOMLER__TURN__URL` = `turn:coturn.roomler.ai:3478`, `ROOMLER__TURN__WORKER_URLS` = `coturn-1..3.roomler.ai`). Each hostname resolved for A and AAAA over DNS-over-HTTPS (Cloudflare) | **IPv4 only, as designed.** `coturn.roomler.ai`: A `94.130.141.74`, `5.9.157.221`, `5.9.157.226`; AAAA NOERROR with no answer (the zone's SOA only). `coturn-1`, `-2`, `-3`: one A record each (`94.130.141.74`, `5.9.157.226`, `5.9.157.221`), and no AAAA. `roomler.ai` itself: A only. The operator settled AC8 as "IPv4-only by design, documented" rather than restart production TURN (2026-10-18), and `deployment.md` now says so |
 
 ## 9. Related
 
