@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 import { describe, it, expect } from 'vitest'
-import { DEVICE_ID_PLACEHOLDER, enrollCommands, type OsCommands } from '@/utils/enrollCommands'
+import { DEVICE_ID_PLACEHOLDER, enrollCommands, installCards, type OsCommands } from '@/utils/enrollCommands'
 
 /**
  * Locks the enrollment command templates to the shipped installer
@@ -143,6 +143,23 @@ describe('enrollCommands', () => {
         .filter((o) => o.blocks.some((b) => b.isDownload))
         .map((o) => o.os)
       expect(offered, scope).toEqual(['windows'])
+    }
+  })
+
+  it('the homepages offer the wizard by the same rule (FR-97 P0c-4)', () => {
+    // They kept their own per-OS map until P0c-4 and offered Roomler Setup on
+    // every card, where off Windows it could install only the tunnel client.
+    const cards = installCards(ORIGIN)
+    expect(cards.map((c) => [c.os, c.wizardUrl])).toEqual([
+      ['windows', `${ORIGIN}/api/setup/windows`],
+      ['linux', null],
+      ['macos', null],
+    ])
+    // Each card's terminal form is the agent's one-line install, never a download.
+    for (const card of cards) {
+      expect(card.command, card.os).toBe(
+        enrollCommands('agent', ORIGIN, null).find((o) => o.os === card.os)!.blocks[0]!.command,
+      )
     }
   })
 

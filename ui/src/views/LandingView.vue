@@ -90,6 +90,7 @@
                 <h3 class="text-h6 font-weight-bold">{{ os.title }}</h3>
               </div>
               <v-btn
+                v-if="os.wizardUrl"
                 :href="os.wizardUrl"
                 color="primary"
                 variant="tonal"
@@ -98,7 +99,9 @@
               >
                 Roomler Setup
               </v-btn>
-              <p class="text-body-2 landing-muted mb-1">Or from a terminal:</p>
+              <p class="text-body-2 landing-muted mb-1">
+                {{ os.wizardUrl ? 'Or from a terminal:' : 'From a terminal:' }}
+              </p>
               <pre class="install-cmd text-caption pa-2 rounded flex-grow-1">{{ os.command }}</pre>
             </v-card>
           </v-col>
@@ -217,7 +220,7 @@ import ArchitectureGraphic from '@/components/landing/ArchitectureGraphic.vue'
 import NewsletterPrompt from '@/components/landing/NewsletterPrompt.vue'
 import StayInTouch from '@/components/landing/StayInTouch.vue'
 import { BRAND_LOGO_LIGHT } from '@/composables/useBrand'
-import { enrollCommands } from '@/utils/enrollCommands'
+import { installCards } from '@/utils/enrollCommands'
 import { CAPABILITIES, CTA, DOWNLOAD, FALLBACK_PLANS, HERO, PILLARS, PRICING, VIDEO_TOUR, type Plan } from '@/utils/landing'
 import { FEATURED_VIDEO_ID } from '@/utils/videos'
 import VideoFacade from '@/components/common/VideoFacade.vue'
@@ -231,18 +234,16 @@ const capabilities = CAPABILITIES
 const pillars = PILLARS
 
 // One-line installs — same vitest-locked template source the in-app
-// enrollment dialog uses (token placeholder until they have one).
+// enrollment dialog uses (token placeholder until they have one), and the
+// wizard only where it installs the agent (FR-97 D5).
 const osIcon: Record<string, string> = {
   windows: 'mdi-microsoft-windows',
   linux: 'mdi-linux',
   macos: 'mdi-apple',
 }
-const downloads = enrollCommands('agent', window.location.origin, null).map((os) => ({
-  os: os.os,
-  title: os.title,
-  icon: osIcon[os.os]!,
-  wizardUrl: DOWNLOAD.wizard[os.os]!,
-  command: os.blocks[0]!.command,
+const downloads = installCards(window.location.origin).map((card) => ({
+  ...card,
+  icon: osIcon[card.os]!,
 }))
 
 // The fallback until /api/stripe/plans (the single source of truth) answers.
