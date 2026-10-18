@@ -21,7 +21,6 @@ import { ref, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useWsStore } from '@/stores/ws'
-import { markSignedIn, clearSignedIn } from '@/api/session'
 import { isOAuthSignup, trackGoal } from '@/utils/goals'
 
 const router = useRouter()
@@ -61,7 +60,7 @@ onMounted(async () => {
     .catch(() => false)
   if (!sessionOk) {
     error.value = 'Failed to complete OAuth login'
-    clearSignedIn()
+    auth.forgetLocalSession()
     return
   }
 
@@ -70,8 +69,10 @@ onMounted(async () => {
   if (createdAccount) trackGoal('signup')
 
   try {
-    markSignedIn()
-    await auth.fetchMe()
+    // Through the STORE, never the bare hint: the store was created when this
+    // page loaded, signed out after a logout, and only its own flag is what
+    // the app bar's user menu and `fetchMe()` read.
+    await auth.adoptCookieSession()
     ws.connect()
     // S2: honor a protected deep-link stashed by the router guard
     // (parity with the password login path).
@@ -91,7 +92,7 @@ onMounted(async () => {
     }
   } catch {
     error.value = 'Failed to complete OAuth login'
-    clearSignedIn()
+    auth.forgetLocalSession()
   }
 })
 </script>

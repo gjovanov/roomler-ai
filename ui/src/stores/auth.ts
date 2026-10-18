@@ -127,6 +127,34 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
+  /**
+   * A session that arrived as a cookie outside `login()`: the OAuth callback,
+   * whose redirect carried the Set-Cookie. The flag flips HERE, before
+   * `fetchMe()`, which returns early while it is false. The callback used to
+   * write only the local hint, which left this flag at the value it was
+   * seeded with when the page loaded (`false` after a logout): `user` stayed
+   * null and the app bar's user menu (`v-if="isAuthenticated"`) stayed hidden
+   * until a reload re-seeded the flag from the hint.
+   */
+  async function adoptCookieSession() {
+    signedIn.value = true
+    markSignedIn()
+    await fetchMe()
+  }
+
+  /**
+   * Forget the session locally, without asking the server to expire it: for a
+   * callback whose session the server just refused, so there is nothing to
+   * expire, and whose error must stay on screen (`logout()` would navigate
+   * away from it). The flag and the hint move together, as everywhere else in
+   * this store.
+   */
+  function forgetLocalSession() {
+    user.value = null
+    signedIn.value = false
+    clearSignedIn()
+  }
+
   async function fetchMe() {
     if (!signedIn.value) return
     try {
@@ -170,5 +198,16 @@ export const useAuthStore = defineStore('auth', () => {
     router.push({ name: 'login' })
   }
 
-  return { user, loading, error, isAuthenticated, login, register, fetchMe, logout }
+  return {
+    user,
+    loading,
+    error,
+    isAuthenticated,
+    login,
+    register,
+    adoptCookieSession,
+    forgetLocalSession,
+    fetchMe,
+    logout,
+  }
 })
