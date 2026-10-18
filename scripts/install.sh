@@ -82,12 +82,25 @@ NO_ENROLL=0
 # FR-27 — the Linux desktop companion. Empty = decide by probing for a
 # graphical session; --desktop / --no-desktop force it either way.
 DESKTOP=""
+# FR-97 P6d — `--uninstall [--keep-config]` removes what this script, or a
+# package, installed. It takes no --role, and refuses one.
+UNINSTALL=0
+KEEP_CONFIG=0
 
 usage() {
     sed -n '2,32p' "$0" 2>/dev/null || true
     echo "usage: install.sh --role daemon|tunnel [--server URL] [--token JWT] [--name NAME]"
     echo "                  [--daemon-token JWT] [--system] [--download-only] [--no-enroll]"
     echo "                  [--desktop|--no-desktop]"
+    echo "       install.sh --uninstall [--keep-config]"
+    echo
+    echo "  --uninstall     Remove every Roomler part on this machine — the daemon, the"
+    echo "                  companion, the tunnel CLI — however it was installed (this"
+    echo "                  script, a package, the tarball). Each service is stopped through"
+    echo "                  its manager first: its clean stop takes back the routes and the"
+    echo "                  DNS steer it set. Then the programs, then the config, which"
+    echo "                  holds the device's credential. --keep-config keeps the config."
+    echo "                  Then remove the device in the dashboard: that revokes it."
     echo
     echo "  --desktop       Linux only. Force the roomler-desktop companion on or off."
     echo "                  Default: installed when a graphical session is detected. It is"
@@ -117,16 +130,33 @@ while [ $# -gt 0 ]; do
         --no-enroll) NO_ENROLL=1; shift ;;
         --desktop) DESKTOP=1; shift ;;
         --no-desktop) DESKTOP=0; shift ;;
+        --uninstall) UNINSTALL=1; shift ;;
+        --keep-config) KEEP_CONFIG=1; shift ;;
         -h|--help) usage ;;
         *) echo "unknown flag: $1" >&2; usage ;;
     esac
 done
 
-case "$ROLE" in
-    daemon|tunnel) ;;
-    "") echo "error: --role daemon|tunnel is required" >&2; usage ;;
-    *) echo "error: unknown role '$ROLE' (expected daemon|tunnel)" >&2; exit 1 ;;
-esac
+if [ "$UNINSTALL" = 1 ]; then
+    # It removes every Roomler part on this machine, so a --role would read as
+    # "only this part" and remove more than was asked: refuse it, with the rest
+    # of the install options.
+    if [ -n "$ROLE" ] || [ -n "$TOKEN" ] || [ -n "$DAEMON_TOKEN" ] || [ "$SYSTEM" = 1 ] ||
+        [ "$DOWNLOAD_ONLY" = 1 ] || [ "$NO_ENROLL" = 1 ] || [ -n "$DESKTOP" ]; then
+        echo "error: --uninstall removes every Roomler part on this machine and takes no install options (only --keep-config)" >&2
+        exit 1
+    fi
+else
+    if [ "$KEEP_CONFIG" = 1 ]; then
+        echo "error: --keep-config applies to --uninstall only" >&2
+        exit 1
+    fi
+    case "$ROLE" in
+        daemon|tunnel) ;;
+        "") echo "error: --role daemon|tunnel is required" >&2; usage ;;
+        *) echo "error: unknown role '$ROLE' (expected daemon|tunnel)" >&2; exit 1 ;;
+    esac
+fi
 
 OS="$(uname -s)"
 case "$OS" in
@@ -164,7 +194,9 @@ fi
 # place the plist, so the two agree by construction.
 CONSOLE_USER=""
 CONSOLE_UID=""
-if [ "$OS" = Darwin ]; then
+# An uninstall must also work on a Mac nobody is signed in to (a headless
+# Mac with only the root half): it reads the console user itself.
+if [ "$OS" = Darwin ] && [ "$UNINSTALL" != 1 ]; then
     CONSOLE_USER="$(stat -f "%Su" /dev/console 2>/dev/null || echo "")"
     if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = root ]; then
         echo "error: no GUI session is logged in (console user is '${CONSOLE_USER:-unknown}')." >&2
@@ -469,7 +501,10 @@ install_daemon_linux() {
         systemctl --user enable --now roomler.service
         restart_old_user_daemon "$old_pid" "$helper_changed"
         say "daemon status: $(systemctl --user is-active roomler.service || true)"
-        say "NOTE: on a headless host, run 'sudo loginctl enable-linger $USER' so the user unit runs without an open session."
+        # `id -un`, not $USER: nothing sets USER in a container or a service,
+        # and under `set -u` this last line then failed an install that had
+        # worked (found by the FR-97 P6d cells).
+        say "NOTE: on a headless host, run 'sudo loginctl enable-linger $(id -un)' so the user unit runs without an open session."
     fi
 }
 
@@ -848,7 +883,586 @@ install_desktop_linux() {
     fi
 }
 
+# ─── uninstall (FR-97 P6d) ──────────────────────────────────────────────────
+#
+# `--uninstall` removes what any install path put on this machine: this
+# script, the .deb, the tarball, the companion's .rpm, the .pkg, the tunnel
+# CLI. Every step acts only on what is there, so it works on a partial
+# install, on one made by hand, and when run twice. The Windows twin is
+# `install.ps1 -Uninstall`.
+#
+# The ORDER is the design:
+#   1. Every service stops THROUGH ITS MANAGER while its files are still on
+#      disk. The stop is a SIGTERM, the daemon's clean stop: it takes back the
+#      exit routes and the DNS steer it put in the host (FR-97 P0e), and an
+#      ephemeral device unenrolls itself. Delete the files first and nothing
+#      that would heal the host at its next boot is left installed. A daemon
+#      no manager owns (started by hand, or an orphan) gets the same SIGTERM;
+#      one that ignores it is reported, never SIGKILLed, which would skip the
+#      very cleanup this order exists for. (The companion, a UI with nothing
+#      to clean up, is killed if it outlives its SIGTERM.)
+#   2. The packages, then what a tarball put down (only files no package
+#      owns), then the login registrations of EVERY account: a LaunchAgent
+#      left behind is respawned against a missing binary at every login.
+#   3. Unless --keep-config, the config. It holds the device's credential,
+#      and an uninstall that leaves a live token on disk is not one. Only the
+#      trees of the account running this (the one behind sudo; on a Mac also
+#      the console user) and root's; another account's are listed, not removed.
+#   4. "done" only if every step held. Otherwise each failure is named, and
+#      the exit status is 1.
+#
+# It cannot revoke the device. A permanent device may not remove itself from
+# the server (only an ephemeral one may, in step 1), so the last line says how.
+
+UNINSTALL_FAILED=""
+
+# Recorded, never fatal: one part that will not go must not keep the rest on
+# disk. The summary names every one.
+uninstall_failed() {
+    warn "$*"
+    UNINSTALL_FAILED="$UNINSTALL_FAILED
+  - $*"
+}
+
+# Root for one command: directly when this already is root (a container has
+# no sudo), else through sudo.
+as_root() {
+    if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi
+}
+
+# Relay a privileged helper's report: every line said, every FAILED line
+# recorded as a failure.
+relay() {
+    while IFS= read -r line; do
+        case "$line" in
+            '') ;;
+            FAILED\ *) uninstall_failed "could not ${line#FAILED }" ;;
+            *) say "$line" ;;
+        esac
+    done <<EOF
+$1
+EOF
+}
+
+# Run a small script as root, ONE privileged call for a whole list (a home
+# this account cannot read is then no obstacle), and relay its report.
+root_helper() {
+    script="$1"; shift
+    rc=0
+    out="$(as_root sh -c "$script" sh "$@" 2>&1)" || rc=$?
+    relay "$out"
+    [ "$rc" = 0 ] || uninstall_failed "run a privileged step (exit $rc)"
+}
+
+# Remove each path given that exists: a file, a link or a whole directory.
+# Every caller passes a fixed Roomler name, absolute or under a home.
+remove_paths() {
+    [ $# -gt 0 ] || return 0
+    # shellcheck disable=SC2016 # the script expands as root, not here
+    root_helper 'for p do
+        if [ -L "$p" ] || [ -e "$p" ]; then
+            if rm -rf -- "$p"; then echo "removed $p"; else echo "FAILED remove $p"; fi
+        fi
+    done' "$@"
+}
+
+# Every local account as "name home", root included. A macOS service account
+# (`_name`) never holds an install.
+local_accounts() {
+    if [ "$OS" = Darwin ]; then
+        dscl . -list /Users NFSHomeDirectory 2>/dev/null |
+            awk 'NF == 2 && $1 !~ /^_/ { print $1, $2 }'
+    else
+        awk -F: '$6 ~ /^\/./ { print $1, $6 }' /etc/passwd 2>/dev/null
+    fi
+}
+
+home_of() {
+    if [ "$OS" = Darwin ]; then
+        dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null | awk '{ print $2; exit }'
+    else
+        getent passwd "$1" 2>/dev/null | cut -d: -f6
+    fi
+}
+
+# The accounts whose own install this removes, config included: the caller,
+# or the account behind sudo; on a Mac also the console user, who runs the
+# per-user half. Root's trees go with the system's.
+uninstall_accounts() {
+    {
+        if [ "$(id -u)" != 0 ]; then
+            id -un
+        elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+            echo "$SUDO_USER"
+        fi
+        if [ "$OS" = Darwin ]; then
+            c="$(stat -f %Su /dev/console 2>/dev/null || true)"
+            if [ -n "$c" ] && [ "$c" != root ]; then echo "$c"; fi
+        fi
+    } | awk '!seen[$0]++'
+}
+
+# One account's config and state trees: the daemon's (its companion's state
+# lives in it too), the portal's restore token, the tunnel CLI's.
+account_config_paths() {
+    h="$1"
+    case "$h" in ''|/) return 0 ;; esac
+    if [ "$OS" = Darwin ]; then
+        echo "$h/Library/Application Support/live.roomler.roomler"
+        # RETIRED-NAME-ANCHOR(2): the tunnel CLI's config segment is still the
+        # old name (roomler-cli config.rs), and a pre-rename daemon tree may
+        # still hold an enrolled credential: skipping either leaves a live token.
+        echo "$h/Library/Application Support/ai.roomler.roomler-tunnel"
+        echo "$h/Library/Application Support/live.roomler.roomler-agent"
+    else
+        echo "$h/.config/roomler"
+        echo "$h/.local/share/roomler"
+        echo "$h/.local/state/roomler"
+        # RETIRED-NAME-ANCHOR(3): as above — the tunnel CLI's current config
+        # segment, then the two pre-rename daemon trees.
+        echo "$h/.config/roomler-tunnel"
+        echo "$h/.config/roomler-agent"
+        echo "$h/.local/share/roomler-agent"
+    fi
+}
+
+# Run `remove_paths` over newline-separated paths (a macOS path has a space).
+remove_listed() {
+    listed="$1"
+    set --
+    while IFS= read -r p; do
+        if [ -n "$p" ]; then set -- "$@" "$p"; fi
+    done <<EOF
+$listed
+EOF
+    remove_paths "$@"
+}
+
+# The pids of every process with exactly this name. A minimal container has
+# no procps, so read /proc there.
+find_procs() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -x "$1" 2>/dev/null || true
+    elif [ -d /proc ]; then
+        for d in /proc/[0-9]*; do
+            if [ "$(cat "$d/comm" 2>/dev/null || true)" = "$1" ]; then echo "${d#/proc/}"; fi
+        done
+    fi
+}
+
+describe_proc() {
+    if command -v ps >/dev/null 2>&1; then
+        ps -o user=,command= -p "$1" 2>/dev/null || true
+    else
+        tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null || true
+    fi
+}
+
+# Wait up to $2 seconds for every process named $1 to be gone.
+procs_gone_within() {
+    n=0
+    while [ -n "$(find_procs "$1")" ]; do
+        n=$((n + 1))
+        [ "$n" -ge "$2" ] && return 1
+        sleep 1
+    done
+    return 0
+}
+
+# Step 1's sweep: what still runs once every manager has stopped its own.
+# $2 is the grace a manager's own stop gets first: `launchctl bootout` returns
+# while the job is still draining, where systemd's stop has already waited.
+# Then the same SIGTERM. The daemon is never SIGKILLed: that would skip its
+# cleanup, so a survivor is reported. The companion is a UI with nothing to
+# clean up, so a straggler is killed, as the .pkg postinstall does.
+stop_leftovers() {
+    name="$1"; grace="$2"
+    procs_gone_within "$name" "$grace" && return 0
+    for pid in $(find_procs "$name"); do
+        say "stopping $name pid $pid, which no service manager stopped: $(describe_proc "$pid")"
+        as_root kill -TERM "$pid" 2>/dev/null || true
+    done
+    procs_gone_within "$name" 30 && return 0
+    for pid in $(find_procs "$name"); do
+        if [ "$name" = roomler-desktop ]; then
+            warn "$name pid $pid outlived its SIGTERM by 30 s; killing it (a UI, nothing to clean up)"
+            as_root kill -KILL "$pid" 2>/dev/null || true
+        else
+            uninstall_failed "stop $name pid $pid within 30 s of a SIGTERM: $(describe_proc "$pid")"
+        fi
+    done
+    if [ "$name" = roomler-desktop ] && ! procs_gone_within "$name" 5; then
+        uninstall_failed "stop $name: it outlived a SIGKILL"
+    fi
+}
+
+# Step 3's honesty: the config another account still holds, listed.
+report_other_config() {
+    targets=" $(printf '%s\n' "$1" | tr '\n' ' ') "
+    list=""
+    while read -r name home; do
+        [ "$name" = root ] && continue
+        case "$targets" in *" $name "*) continue ;; esac
+        list="$list
+$(account_config_paths "$home")"
+    done <<EOF
+$(local_accounts)
+EOF
+    set --
+    while IFS= read -r p; do
+        if [ -n "$p" ]; then set -- "$@" "$p"; fi
+    done <<EOF
+$list
+EOF
+    [ $# -gt 0 ] || return 0
+    # shellcheck disable=SC2016 # the script expands as root, not here
+    left="$(as_root sh -c 'for p do if [ -e "$p" ]; then echo "  $p"; fi; done' sh "$@" 2>/dev/null || true)"
+    if [ -n "$left" ]; then
+        say "NOTE: other accounts' Roomler config is left in place (each holds that account's own device credential):"
+        printf '%s\n' "$left"
+        say "      Remove it as that account, or as root."
+    fi
+}
+
+# ── Linux ──
+
+# The per-user unit is in the account's own systemd, reachable on that
+# account's bus: directly when this IS that account, else as root on
+# /run/user/<uid>/bus, which exists while its manager runs.
+user_systemctl() {
+    u="$1"; shift
+    uid="$(id -u "$u" 2>/dev/null)" || return 1
+    if [ "$(id -u)" = "$uid" ]; then
+        systemctl --user "$@"
+    elif [ "$(id -u)" = 0 ] && [ -S "/run/user/$uid/bus" ]; then
+        runuser -u "$u" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user "$@"
+    else
+        return 1
+    fi
+}
+
+# Stop (and disable) one unit if this host has it. An absent unit, and a
+# masked or disabled one that is not running, are left alone. "Running"
+# includes `activating`: a unit waiting out its RestartSec starts again
+# unless it is stopped.
+stop_unit() {
+    who="$1"; unit="$2"
+    if [ "$who" = system ]; then
+        st="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+        state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
+    else
+        st="$(user_systemctl "$who" is-enabled "$unit" 2>/dev/null || true)"
+        state="$(user_systemctl "$who" show -p ActiveState --value "$unit" 2>/dev/null || true)"
+    fi
+    case "$st" in
+        enabled*|linked*|alias|indirect) verb="disable --now" ;;
+        *)
+            case "$state" in
+                active|activating|deactivating|reloading) verb=stop ;;
+                *) return 0 ;;
+            esac
+            ;;
+    esac
+    label="$unit"; [ "$who" = system ] || label="$who's $unit"
+    say "stopping $label"
+    if [ "$who" = system ]; then
+        # shellcheck disable=SC2086
+        as_root systemctl $verb "$unit" >/dev/null 2>&1 || uninstall_failed "stop $label"
+    else
+        # shellcheck disable=SC2086
+        user_systemctl "$who" $verb "$unit" >/dev/null 2>&1 || uninstall_failed "stop $label"
+    fi
+}
+
+# Every account with a running user manager, as names. Root reaches each one;
+# any other caller only its own.
+accounts_with_a_user_manager() {
+    if [ "$(id -u)" = 0 ]; then
+        for d in /run/user/[0-9]*; do
+            [ -S "$d/bus" ] || continue
+            getent passwd "${d#/run/user/}" 2>/dev/null | cut -d: -f1
+        done
+    else
+        id -un
+    fi
+}
+
+uninstall_stop_linux() {
+    if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
+        say "no systemd running here: no service to stop through it"
+        return 0
+    fi
+    # The update half first, so nothing begins an install under us; then let
+    # a helper run already in flight finish, because killing it mid-install
+    # would leave dpkg holding a half-installed package for step 2.
+    stop_unit system roomler-update.timer
+    stop_unit system roomler-update.path
+    n=0
+    while [ "$(systemctl show -p SubState --value roomler-update.service 2>/dev/null || true)" = start ]; do
+        [ "$n" = 0 ] && say "waiting for roomler-update.service to finish: it is installing an update"
+        n=$((n + 1))
+        [ "$n" -ge 300 ] && { warn "roomler-update.service still runs after 300 s; stopping it"; break; }
+        sleep 1
+    done
+    stop_unit system roomler-update.service
+    stop_unit system roomlerd.service
+    for acct in $(accounts_with_a_user_manager); do
+        stop_unit "$acct" roomler.service
+    done
+}
+
+remove_packages_linux() {
+    if command -v dpkg-query >/dev/null 2>&1; then
+        pkgs=""
+        # Dependents first: the companion depends on the daemon. Then the
+        # tunnel CLI.
+        # RETIRED-NAME-ANCHOR: the last two are the packages the daemon's .deb
+        # took over (Cargo.toml `replaces`); a host that had them keeps their
+        # dpkg entries until they are removed by name.
+        for p in roomler-desktop roomlerd roomler-cli roomler-tunnel roomler-agent; do
+            # The status letter: i installed, c only its config left, n none.
+            case "$(dpkg-query -W -f='${db:Status-Abbrev}' "$p" 2>/dev/null | cut -c2 || true)" in
+                ''|n) ;;
+                c) [ "$KEEP_CONFIG" = 1 ] || pkgs="$pkgs $p" ;;
+                *) pkgs="$pkgs $p" ;;
+            esac
+        done
+        if [ -n "$pkgs" ]; then
+            mode=--purge
+            [ "$KEEP_CONFIG" = 1 ] && mode=--remove
+            say "removing the packages:$pkgs (dpkg $mode)"
+            # shellcheck disable=SC2086
+            as_root dpkg "$mode" $pkgs || uninstall_failed "remove the packages:$pkgs (dpkg $mode)"
+        fi
+    fi
+    if command -v rpm >/dev/null 2>&1 && rpm -q roomler-desktop >/dev/null 2>&1; then
+        say "removing the roomler-desktop package (rpm)"
+        as_root rpm -e roomler-desktop || uninstall_failed "remove the roomler-desktop package (rpm -e)"
+    fi
+}
+
+# What a tarball put down (scripts/stage-linux-tarball.sh, and the tunnel
+# CLI's /usr/local/bin), where no package owns it: a path a package still owns
+# is that package's to remove.
+remove_tarball_linux() {
+    set --
+    # RETIRED-NAME-ANCHOR(5): the tarball's lib dir is the binary's RPATH and
+    # its doc dir the payload's (as in repair_tarball_owners); roomler-tunnel
+    # is the CLI's legacy-name symlink, which install_tunnel_tarball creates.
+    for f in /usr/bin/roomlerd /usr/bin/roomler /usr/lib/roomler-agent \
+             /usr/lib/systemd/system/roomlerd.service /usr/lib/systemd/user/roomler.service \
+             /usr/lib/systemd/system/roomler-update.service /usr/lib/systemd/system/roomler-update.timer \
+             /usr/lib/systemd/system/roomler-update.path /usr/share/doc/roomler-agent \
+             /usr/local/bin/roomler /usr/local/bin/roomler-tunnel; do
+        { [ -L "$f" ] || [ -e "$f" ]; } || continue
+        owner=""
+        if command -v dpkg >/dev/null 2>&1; then
+            owner="$(dpkg -S "$f" 2>/dev/null | head -n 1 | cut -d: -f1 || true)"
+        fi
+        if [ -z "$owner" ] && command -v rpm >/dev/null 2>&1 && rpm -qf "$f" >/dev/null 2>&1; then
+            owner="$(rpm -qf "$f" 2>/dev/null | head -n 1 || true)"
+        fi
+        if [ -n "$owner" ]; then
+            warn "leaving $f: the package $owner owns it"
+            continue
+        fi
+        set -- "$@" "$f"
+    done
+    remove_paths "$@"
+}
+
+# Login registrations, for every account: they name a program that is gone.
+# The per-user unit's enable links (its WantedBy), and the companion's own
+# autostart entry, only where it is ours (`X-Roomler-Managed`).
+remove_registrations_linux() {
+    links=""
+    entries=""
+    while read -r name home; do
+        case "$home" in ''|/) continue ;; esac
+        links="$links
+$home/.config/systemd/user/default.target.wants/roomler.service
+$home/.config/systemd/user/graphical-session.target.wants/roomler.service"
+        entries="$entries
+$home/.config/autostart/roomler-desktop.desktop"
+    done <<EOF
+$(local_accounts)
+EOF
+    remove_listed "$links"
+    set --
+    while IFS= read -r p; do
+        if [ -n "$p" ]; then set -- "$@" "$p"; fi
+    done <<EOF
+$entries
+EOF
+    # shellcheck disable=SC2016 # the script expands as root, not here
+    root_helper 'for p do
+        if grep -qs "X-Roomler-Managed=true" "$p"; then
+            if rm -f -- "$p"; then echo "removed $p"; else echo "FAILED remove $p"; fi
+        fi
+    done' "$@"
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        as_root systemctl daemon-reload >/dev/null 2>&1 || true
+        for acct in $(accounts_with_a_user_manager); do
+            user_systemctl "$acct" daemon-reload >/dev/null 2>&1 || true
+        done
+    fi
+}
+
+uninstall_linux() {
+    uninstall_stop_linux
+    # No grace: every stop above has already waited for its unit.
+    stop_leftovers roomlerd 0
+    stop_leftovers roomler-desktop 0
+    remove_packages_linux
+    remove_tarball_linux
+    remove_registrations_linux
+    # The wake file the update helper watches (FR-96): runtime, never config.
+    remove_paths /var/tmp/roomler-update-check
+    if [ "$KEEP_CONFIG" = 1 ]; then
+        say "keeping the config (--keep-config)"
+        return 0
+    fi
+    accounts="$(uninstall_accounts)"
+    list="$(for a in $accounts root; do account_config_paths "$(home_of "$a")"; done)"
+    # The system config (/etc/roomler holds a system install's credential),
+    # the system unit's environment file and an administrator's drop-ins.
+    # RETIRED-NAME-ANCHOR: the pre-rename system config dir; a host that never
+    # migrated holds its enrolled credential there.
+    remove_paths /etc/roomler /etc/roomler-agent /etc/default/roomlerd \
+        /etc/systemd/system/roomlerd.service.d
+    remove_listed "$list"
+    report_other_config "$accounts"
+}
+
+# ── macOS ──
+
+uninstall_stop_macos() {
+    # The update helper first, and never in the middle of an install: booting
+    # it out kills its whole process group, `installer` included (the .pkg
+    # postinstall's own warning).
+    if as_root launchctl print system/com.roomler.update >/dev/null 2>&1; then
+        n=0
+        while as_root launchctl print system/com.roomler.update 2>/dev/null | grep -q 'state = running'; do
+            [ "$n" = 0 ] && say "waiting for com.roomler.update to finish: it is installing an update"
+            n=$((n + 1))
+            [ "$n" -ge 300 ] && { warn "com.roomler.update still runs after 300 s; stopping it"; break; }
+            sleep 1
+        done
+        say "stopping com.roomler.update"
+        as_root launchctl bootout system/com.roomler.update 2>/dev/null ||
+            uninstall_failed "stop com.roomler.update"
+    fi
+    # Every account's per-user half and companion: one per GUI login.
+    uids="$(dscl . -list /Users UniqueID 2>/dev/null | awk '$1 !~ /^_/ && $2 >= 500 { print $2 }' || true)"
+    # shellcheck disable=SC2016,SC2086 # the script expands as root; one uid per word
+    root_helper 'for uid do
+        for l in com.roomler.desktop com.roomler.agent; do
+            if launchctl print "gui/$uid/$l" >/dev/null 2>&1; then
+                if launchctl bootout "gui/$uid/$l" 2>/dev/null; then
+                    echo "stopping gui/$uid/$l"
+                else
+                    echo "FAILED stop gui/$uid/$l"
+                fi
+            fi
+        done
+    done' $uids
+    if as_root launchctl print system/com.roomler.daemon >/dev/null 2>&1; then
+        say "stopping com.roomler.daemon (the root half)"
+        as_root launchctl bootout system/com.roomler.daemon 2>/dev/null ||
+            uninstall_failed "stop com.roomler.daemon"
+    fi
+}
+
+uninstall_macos() {
+    uninstall_stop_macos
+    stop_leftovers roomlerd 20
+    # A companion the person opened from Finder runs under LaunchServices,
+    # which no bootout reaches.
+    stop_leftovers roomler-desktop 20
+    if [ "$KEEP_CONFIG" != 1 ]; then
+        # The two grants, while the bundle that names them is still there to
+        # resolve: a fresh install then asks again, instead of showing a toggle
+        # that is on for a binary that is gone.
+        for svc in ScreenCapture Accessibility; do
+            as_root tccutil reset "$svc" com.roomler.agent >/dev/null 2>&1 ||
+                warn "could not reset the $svc grant (tccutil reset $svc com.roomler.agent)"
+        done
+    fi
+    agents=""
+    while read -r name home; do
+        case "$home" in ''|/) continue ;; esac
+        agents="$agents
+$home/Library/LaunchAgents/com.roomler.agent.plist
+$home/Library/LaunchAgents/com.roomler.desktop.plist"
+    done <<EOF
+$(local_accounts)
+EOF
+    # /Library/LaunchAgents too: no .pkg places them there, but a plist left
+    # there by hand loads for EVERY login, against a missing binary.
+    # RETIRED-NAME-ANCHOR(6): the pre-rc.457 /Applications bundle the .pkg
+    # postinstall also sweeps, and the CLI's legacy-name symlink that
+    # install_tunnel_tarball creates.
+    remove_paths /Library/LaunchDaemons/com.roomler.daemon.plist \
+        /Library/LaunchDaemons/com.roomler.update.plist \
+        /Library/LaunchAgents/com.roomler.agent.plist \
+        /Library/LaunchAgents/com.roomler.desktop.plist /Library/Roomler \
+        /Applications/Roomler.app /Applications/roomler-agent.app \
+        /usr/local/bin/roomler /usr/local/bin/roomlerd /usr/local/bin/roomler-tunnel \
+        /private/var/tmp/roomler-update-check /var/run/roomler
+    remove_listed "$agents"
+    for id in $(pkgutil --pkgs 2>/dev/null | grep '^com\.roomler\.' || true); do
+        if as_root pkgutil --forget "$id" >/dev/null 2>&1; then
+            say "forgot the package receipt $id"
+        else
+            uninstall_failed "forget the package receipt $id"
+        fi
+    done
+    if [ "$KEEP_CONFIG" = 1 ]; then
+        say "keeping the config (--keep-config)"
+        return 0
+    fi
+    accounts="$(uninstall_accounts)"
+    list="$(for a in $accounts root; do account_config_paths "$(home_of "$a")"; done)"
+    # /etc/roomler holds the root half's credential; the logs follow it.
+    # RETIRED-NAME-ANCHOR: the pre-rename system config and log dirs, which
+    # the .pkg postinstall migrates but never deletes.
+    remove_paths /etc/roomler /etc/roomler-agent /var/log/roomler /var/log/roomler-agent \
+        /tmp/roomlerd.out.log /tmp/roomlerd.err.log \
+        /tmp/roomler-desktop.out.log /tmp/roomler-desktop.err.log
+    remove_listed "$list"
+    report_other_config "$accounts"
+}
+
+uninstall_finish() {
+    if [ -n "$UNINSTALL_FAILED" ]; then
+        echo "error: the uninstall did not complete:$UNINSTALL_FAILED" >&2
+        exit 1
+    fi
+    if [ "$KEEP_CONFIG" = 1 ]; then
+        say "Roomler is removed from this machine; its config is kept."
+    else
+        say "Roomler is removed from this machine."
+    fi
+    say "Now remove the device in the dashboard (Devices → remove): that revokes its"
+    say "  credential and releases its network address."
+    if [ "$OS" = Darwin ]; then
+        say "  A Mac that ran the root half is TWO devices there: remove both."
+    fi
+    say "done."
+    exit 0
+}
+
 # ─── main ───────────────────────────────────────────────────────────────────
+
+if [ "$UNINSTALL" = 1 ]; then
+    say "roomler install.sh — uninstall os=$OS"
+    case "$OS" in
+        Linux) uninstall_linux ;;
+        Darwin) uninstall_macos ;;
+    esac
+    uninstall_finish
+fi
 
 say "roomler install.sh — role=$ROLE os=$OS server=$SERVER"
 

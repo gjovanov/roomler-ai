@@ -58,6 +58,7 @@ Useful flags:
 | `--download-only` | Fetch and verify the artifact, install nothing |
 | `--no-enroll` | Install and set up the service, but skip enrollment (do it later) |
 | `--server <url>` | Point at a self-hosted server instead of `roomler.ai` |
+| `--uninstall` | Remove Roomler from the machine — see [Uninstall](#uninstall) |
 
 ## Check it came up
 
@@ -93,7 +94,7 @@ see [per-OS permissions](/docs/remote-desktop/per-os-permissions/).
 | System config | `/etc/roomler/config.toml` |
 | Per-user config | `~/.config/roomler/config.toml` |
 | Binaries | `/usr/bin/roomlerd`, `/usr/bin/roomler` |
-| Logs | `journalctl -u roomler` (system) or `journalctl --user -u roomler` (per user) |
+| Logs | `journalctl -u roomlerd` (system) or `journalctl --user -u roomler` (per user) |
 
 :::danger The config file holds a credential
 `config.toml` contains the agent token, and — if you enable SSH — the SSH host
@@ -128,18 +129,34 @@ a manual install.
 
 ## Uninstall
 
+One command removes everything Roomler put on the machine, however it got
+there: the daemon, the desktop companion and the tunnel CLI, from the `.deb`,
+the `.rpm`, the tarball or the install script.
+
 ```bash
-# per-user install
-systemctl --user disable --now roomler.service
-
-# system install
-sudo systemctl disable --now roomler.service
-
-sudo apt remove roomlerd     # or delete the tarball install
+curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- --uninstall
 ```
 
-Then remove the device in the dashboard under **Devices** — that revokes its
-credential and releases its mesh address.
+It stops each service through systemd **before** removing anything: the system
+`roomlerd.service`, the per-user `roomler.service` and the update helper
+(`roomler-update.timer` and `.path`). That stop is the daemon's clean stop, so
+the routes and DNS settings it added to the machine go with it. Then the
+packages and files, then the config. It prints `done.` only if every step
+worked; otherwise it lists what it could not remove and exits non-zero.
+
+| Flag | Effect |
+|---|---|
+| `--keep-config` | Keep `/etc/roomler` and `~/.config/roomler`: a reinstall comes back as the same device |
+
+Then remove the device in the dashboard under **Devices**. That revokes its
+credential and releases its mesh address. A device cannot do this for itself,
+except an ephemeral one, which removes itself when its daemon stops.
+
+:::note Other accounts on the machine
+The config that is removed is that of the account running the command (the one
+behind `sudo`), plus root's. If another account on the machine enrolled its own
+per-user install, its config stays, and the command lists where it is.
+:::
 
 ## Troubleshooting
 
