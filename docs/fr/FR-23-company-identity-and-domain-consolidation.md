@@ -134,18 +134,18 @@ The `/ws` check applies **only to the cookie path** (`handler.rs:88-113`) — a
 presence and RC signalling all die.
 
 ⚠️ **Measured 2026-08-28: "list both in the configmap" is IMPOSSIBLE today.**
-`settings.rs:557` is `Environment::default().separator("__").prefix("ROOMLER")`
+`settings.rs:564` is `Environment::default().separator("__").prefix("ROOMLER")`
 with **no `list_separator`**, and `app.cors_origins` is `Vec<String>` — so a
 scalar env var deserialising into a sequence *fails outright*
 (`invalid type: string, expected a sequence`) and the API would **refuse to
 boot**. The repo already knows this: `jwt.previous_secrets` is deliberately a
-`String` for exactly this reason (`settings.rs:414-420`), and the e2e overlay's
+`String` for exactly this reason (`settings.rs:421-427`), and the e2e overlay's
 configmap carries the same warning.
 
 Two real paths, neither of them "just set the configmap":
 
 - **A — mount a file.** `Settings::load` also reads
-  `File::with_name("config/local")` (`settings.rs:555`) and the Dockerfile's
+  `File::with_name("config/local")` (`settings.rs:562`) and the Dockerfile's
   runtime stage sets **no `WORKDIR`**, so CWD is `/` and a ConfigMap at
   `/config/local.toml` is read. No code change. ⚠️ But the source is
   `required(false)`, so **a wrong path is a silent no-op** — the API boots, the
@@ -309,7 +309,7 @@ discipline the repealed-ODR-link defect earned.
 | 2026-08-28 | Live `TermsView` / `PrivacyPolicyView` / `LandingView` chunks | each names the entity and links `/imprint`; Privacy carries `data controller` |
 | 2026-08-28 | **Defect in my own imprint** | it cited the EU ODR platform, **repealed by Reg. (EU) 2024/3228, offline since 2025-07-20**. Confirmed live (`grep -c consumers/odr` → 1), removed in #830 |
 | 2026-08-28 | `roomler.live` vs `roomler.ai` titles | `roomler.ui - roomler.ui` vs `Roomler` — the apex really is still the obsolete product |
-| 2026-08-28 | `settings.rs:543` env source | no `list_separator` ⇒ `ROOMLER__APP__CORS_ORIGINS` would **crash the API at boot**, not merely be ignored. Phase 5 is not config-only |
+| 2026-08-28 | `settings.rs:550` env source | no `list_separator` ⇒ `ROOMLER__APP__CORS_ORIGINS` would **crash the API at boot**, not merely be ignored. Phase 5 is not config-only |
 | 2026-08-28 | `ws/handler.rs:88-113` | the origin check gates the **cookie path only** ⇒ agents unaffected, browser sessions on an untrusted origin lose every socket |
 | 2026-08-28 | Cluster access | `kubectl`+`argocd` on the build host, kubeconfig at `/home/gjovanov/.kube/config`. The earlier "no kubeconfig" was wrong — it checked `/root` only |
 | 2026-08-28 | **Phase 5 shipped as a 301.** `roomler.live` (http + https) | `301 → https://roomler.ai/`; `roomler.ai` **unaffected** (200, title `Roomler`) |

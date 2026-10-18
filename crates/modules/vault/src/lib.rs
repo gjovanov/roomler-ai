@@ -38,6 +38,7 @@ pub mod lease;
 pub mod model;
 pub mod policy;
 pub mod policy_routes;
+pub mod revoke;
 pub mod routes;
 pub mod rrn;
 pub mod scope;
@@ -61,6 +62,8 @@ pub struct VaultState {
     pub agents: Arc<roomler_ai_services::dao::agent::AgentDao>,
     /// P3-3b — each session's lease requests per minute on its device.
     pub lease_limiter: Arc<roomler_core::rate_limit::RateLimiter>,
+    /// P3-3c — this pod's devices' connections, and which hold live leases.
+    pub revoker: Arc<revoke::Revoker>,
     /// The organizations the vault serves (`vault.tenants`).
     pub scope: Arc<scope::TenantScope>,
     /// The KEK, or why there is none: read once at boot.
@@ -87,8 +90,9 @@ impl Module for VaultState {
 
     /// No module STATE: hive's session reads go through its stateless DAO
     /// (the graph's `vault → hive` edge, FR-69 rule 5), and an answer to a
-    /// device goes back on the connection it came from. `fleet`'s Hub — to
-    /// push a revocation — is P3-3c's.
+    /// device goes back on the connection it came from. P3-3c's revocations
+    /// too: each pod tells the devices connected to it, on the connections
+    /// its lease socket holds, so `fleet`'s Hub is not needed.
     type Deps = ();
 
     async fn init(core: Core, settings: &Settings, _deps: ()) -> anyhow::Result<Self> {
@@ -109,10 +113,17 @@ impl Module for VaultState {
             sessions: Arc::new(roomler_ai_mod_hive::dao::AgentSessionDao::new(db)),
             agents: Arc::new(roomler_ai_services::dao::agent::AgentDao::new(db)),
             lease_limiter: Arc::new(roomler_core::rate_limit::RateLimiter::new()),
+            revoker: Arc::new(revoke::Revoker::default()),
             scope: Arc::new(scope),
             kek,
             core,
         };
+        // P3-3c — every pod sweeps the leases of the devices connected to it.
+        let sweep = match settings.vault.revoke_sweep_secs {
+            0 => revoke::DEFAULT_SWEEP_SECS,
+            secs => secs,
+        };
+        revoke::spawn_sweeper(state.clone(), std::time::Duration::from_secs(sweep));
         // P3-3b — the agent socket is fleet's; a device's `rc:vault.lease`
         // is dispatched here by `ClientMsg::namespace()`, and each
         // connection gets its own lease queue at its hello.
@@ -188,10 +199,15 @@ impl Module for VaultState {
     }
 
     /// P3-2b — the gate hive asks, through core, before a session takes a
-    /// role or moves with one ([`gate::VaultGate`]).
+    /// role or moves with one ([`gate::VaultGate`]). P3-3c — a removed
+    /// device's leases, taken back after hive has ended its sessions and
+    /// before fleet removes it ([`revoke::VaultFleetHooks`]).
     fn hooks(&self) -> Hooks {
         Hooks {
             session: Some(Arc::new(gate::VaultGate {
+                state: self.clone(),
+            })),
+            fleet: Some(Arc::new(revoke::VaultFleetHooks {
                 state: self.clone(),
             })),
             ..Default::default()
@@ -269,6 +285,10 @@ impl Module for VaultState {
                 indexes: vec![
                     index(bson::doc! { "tenant_id": 1, "session_id": 1 }),
                     index_ttl(bson::doc! { "expires_at": 1 }, 7 * 24 * 60 * 60),
+                    // P3-3c — a device's unexpired leases (its pod's sweep,
+                    // its hello), and a changed secret's.
+                    index(bson::doc! { "device_id": 1, "expires_at": 1 }),
+                    index(bson::doc! { "secret_id": 1, "expires_at": 1 }),
                 ],
             },
         ]

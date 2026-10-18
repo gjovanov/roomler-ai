@@ -91,6 +91,12 @@ pub struct VaultSettings {
     /// disagree, and the vault does not guess.
     #[serde(default)]
     pub kek_file: String,
+    /// P3-3c — how often each pod checks the leases its connected devices
+    /// hold, in seconds (`ROOMLER__VAULT__REVOKE_SWEEP_SECS`): the longest a
+    /// session's end or move, or a change made on another pod, waits to be
+    /// pushed to the device. 0 or absent: 10.
+    #[serde(default)]
+    pub revoke_sweep_secs: u64,
 }
 
 impl std::fmt::Debug for VaultSettings {
@@ -106,6 +112,7 @@ impl std::fmt::Debug for VaultSettings {
                 },
             )
             .field("kek_file", &self.kek_file)
+            .field("revoke_sweep_secs", &self.revoke_sweep_secs)
             .finish()
     }
 }
@@ -1699,6 +1706,7 @@ mod vault_settings_tests {
             tenants: "65f0000000000000000000a1".into(),
             kek: key.into(),
             kek_file: String::new(),
+            revoke_sweep_secs: 0,
         };
         let shown = format!("{s:?} {s:#?}");
         assert!(!shown.contains(key), "{shown}");

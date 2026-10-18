@@ -13,6 +13,10 @@
 //!
 //! A refusal word from a newer server that this build cannot name is still a
 //! refusal ([`LeaseRefusal::from_wire`] answers `None`), never a value.
+//!
+//! P3-3c — the server takes a lease back with `rc:vault.revoke`: the leases
+//! it names, and one word for why ([`RevokeReason`]). A device drops every
+//! lease the frame names, whatever the word, one it cannot name included.
 
 /// Bounds on a lease request, read by both ends: the server refuses past
 /// them (`bad_request`), and a device never asks past them.
@@ -40,6 +44,9 @@ pub mod lease_limits {
     /// answer is `busy` and nothing is recorded: the ceiling is what keeps a
     /// flood from becoming a flood of audit rows.
     pub const RATE_PER_MINUTE: u32 = 120;
+    /// P3-3c — the leases one `rc:vault.revoke` names at most; more go in
+    /// further frames.
+    pub const MAX_REVOKE_IDS: usize = 64;
 }
 
 /// Why the vault refused a lease. The words are a compatibility surface: a
@@ -133,6 +140,64 @@ impl LeaseRefusal {
     }
 }
 
+/// P3-3c — why the vault took a lease back. The words are a compatibility
+/// surface for the audit and the device's log, never for the decision to
+/// drop: a revoked lease is dropped whatever its word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeReason {
+    /// The session is over, or a stop was ordered.
+    SessionEnded,
+    /// The session runs at a newer fence, or on another device.
+    SessionMoved,
+    /// The field has a newer version.
+    ValueChanged,
+    /// The secret was disabled.
+    SecretDisabled,
+    /// The secret was deleted.
+    SecretDeleted,
+    /// The device's vault key is not the one the value was sealed to: the
+    /// daemon restarted, and the lease died with its memory.
+    KeyChanged,
+    /// The device was removed.
+    DeviceRemoved,
+    /// The vault no longer serves the organization (`vault.tenants`).
+    NotServed,
+}
+
+impl RevokeReason {
+    /// Exactly what crosses the wire. ⚠️ A compatibility surface, locked by
+    /// test.
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::SessionEnded => "session_ended",
+            Self::SessionMoved => "session_moved",
+            Self::ValueChanged => "value_changed",
+            Self::SecretDisabled => "secret_disabled",
+            Self::SecretDeleted => "secret_deleted",
+            Self::KeyChanged => "key_changed",
+            Self::DeviceRemoved => "device_removed",
+            Self::NotServed => "not_served",
+        }
+    }
+
+    pub const ALL: [RevokeReason; 8] = [
+        Self::SessionEnded,
+        Self::SessionMoved,
+        Self::ValueChanged,
+        Self::SecretDisabled,
+        Self::SecretDeleted,
+        Self::KeyChanged,
+        Self::DeviceRemoved,
+        Self::NotServed,
+    ];
+
+    /// Parse a revocation word. `None` for a word this build cannot name,
+    /// which still revokes.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.wire() == s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +250,28 @@ mod tests {
     #[test]
     fn the_ttl_bounds_are_ordered() {
         const { assert!(lease_limits::MIN_TTL_SECS < lease_limits::MAX_TTL_SECS) };
+    }
+
+    /// Spelled out literally, so a rename is a deliberate edit here.
+    #[test]
+    fn revoke_words_are_locked_and_round_trip() {
+        let words: Vec<&str> = RevokeReason::ALL.iter().map(|r| r.wire()).collect();
+        assert_eq!(
+            words,
+            [
+                "session_ended",
+                "session_moved",
+                "value_changed",
+                "secret_disabled",
+                "secret_deleted",
+                "key_changed",
+                "device_removed",
+                "not_served",
+            ]
+        );
+        for r in RevokeReason::ALL {
+            assert_eq!(RevokeReason::from_wire(r.wire()), Some(r));
+        }
+        assert_eq!(RevokeReason::from_wire("from_a_newer_server"), None);
     }
 }

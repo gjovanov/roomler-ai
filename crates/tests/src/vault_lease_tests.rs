@@ -29,22 +29,24 @@ use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
 use crate::tunnel_tests::{read_until, wait_agent_online};
 
-type AgentWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+pub(crate) type AgentWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// A build that runs sessions and takes leases.
-const TAKES_LEASES: &[&str] = &["exec", "hive", "vault"];
+pub(crate) const TAKES_LEASES: &[&str] = &["exec", "hive", "vault"];
 /// One that runs sessions and takes none.
-const RUNS_HIVE: &[&str] = &["exec", "hive"];
+pub(crate) const RUNS_HIVE: &[&str] = &["exec", "hive"];
 
-struct Device {
-    agent_id: String,
-    ws: AgentWs,
+pub(crate) struct Device {
+    pub(crate) agent_id: String,
+    pub(crate) ws: AgentWs,
+    /// P3-3c — the agent token, to dial again as the same device.
+    pub(crate) token: String,
     /// The device's vault key, as a daemon holds it.
-    key: crypto_box::SecretKey,
+    pub(crate) key: crypto_box::SecretKey,
 }
 
 /// A KEK made for the test, never written down.
-fn fresh_kek() -> String {
+pub(crate) fn fresh_kek() -> String {
     age::x25519::Identity::generate()
         .to_string()
         .expose_secret()
@@ -64,7 +66,12 @@ async fn lease_app() -> TestApp {
     .await
 }
 
-async fn enroll(app: &TestApp, t: &SeededTenant, machine: &str, os: &str) -> (String, String) {
+pub(crate) async fn enroll(
+    app: &TestApp,
+    t: &SeededTenant,
+    machine: &str,
+    os: &str,
+) -> (String, String) {
     let et: Value = app
         .auth_post(
             &format!("/api/tenant/{}/agent/enroll-token", t.tenant_id),
@@ -100,7 +107,7 @@ async fn enroll(app: &TestApp, t: &SeededTenant, machine: &str, os: &str) -> (St
 
 /// Enroll and connect a device: `rpc` in its hello, and its vault key's
 /// public half when `with_key`.
-async fn device(
+pub(crate) async fn device(
     app: &TestApp,
     t: &SeededTenant,
     machine: &str,
@@ -138,16 +145,21 @@ async fn device(
         .await
         .unwrap();
     wait_agent_online(app, t, &agent_id).await;
-    Device { agent_id, ws, key }
+    Device {
+        agent_id,
+        ws,
+        token,
+        key,
+    }
 }
 
-async fn send(ws: &mut AgentWs, frame: Value) {
+pub(crate) async fn send(ws: &mut AgentWs, frame: Value) {
     ws.send(Message::Text(frame.to_string().into()))
         .await
         .unwrap();
 }
 
-async fn post(app: &TestApp, t: &SeededTenant, path: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn post(app: &TestApp, t: &SeededTenant, path: &str, body: Value) -> (u16, Value) {
     let resp = app
         .auth_post(
             &format!("/api/tenant/{}{path}", t.tenant_id),
@@ -162,7 +174,7 @@ async fn post(app: &TestApp, t: &SeededTenant, path: &str, body: Value) -> (u16,
 }
 
 /// A secret with one value; its id.
-async fn secret(app: &TestApp, t: &SeededTenant, path: &str, value: &str) -> String {
+pub(crate) async fn secret(app: &TestApp, t: &SeededTenant, path: &str, value: &str) -> String {
     let (code, body) = post(
         app,
         t,
@@ -189,7 +201,7 @@ async fn secret(app: &TestApp, t: &SeededTenant, path: &str, value: &str) -> Str
 /// by anyone on any device, which may use what is under `db/`. Secrets
 /// `db/main` (the value returned), `api/key` (outside `db/`) and `db/off`
 /// (disabled).
-async fn seed_vault(app: &TestApp, t: &SeededTenant) -> String {
+pub(crate) async fn seed_vault(app: &TestApp, t: &SeededTenant) -> String {
     let (code, body) = post(app, t, "/vault/role", json!({ "name": "dev" })).await;
     assert_eq!(code, 201, "{body}");
     for (name, text) in [
@@ -240,7 +252,7 @@ async fn seed_vault(app: &TestApp, t: &SeededTenant) -> String {
 
 /// Start a session on `dev` (naming `role` when given), the device
 /// answering the start; the session's id and fence.
-async fn start(
+pub(crate) async fn start(
     app: &TestApp,
     t: &SeededTenant,
     dev: &mut Device,
@@ -290,7 +302,7 @@ async fn start(
 }
 
 /// Ask for a lease; the vault's answer to that request.
-async fn ask(dev: &mut Device, req_id: &str, mut frame: Value) -> Value {
+pub(crate) async fn ask(dev: &mut Device, req_id: &str, mut frame: Value) -> Value {
     frame["t"] = json!("rc:vault.lease");
     frame["req_id"] = json!(req_id);
     if frame.get("mode").is_none() {
@@ -318,19 +330,19 @@ async fn ask(dev: &mut Device, req_id: &str, mut frame: Value) -> Value {
     }
 }
 
-fn refused(answer: &Value) -> &str {
+pub(crate) fn refused(answer: &Value) -> &str {
     assert_eq!(answer["t"], "rc:vault.refused", "{answer}");
     answer["reason"].as_str().unwrap()
 }
 
 /// What a granted lease carries, opened with the device's own key.
-fn opened(dev: &Device, answer: &Value) -> String {
+pub(crate) fn opened(dev: &Device, answer: &Value) -> String {
     assert_eq!(answer["t"], "rc:vault.leased", "{answer}");
     let sealed = STANDARD.decode(answer["sealed"].as_str().unwrap()).unwrap();
     String::from_utf8(dev.key.unseal(&sealed).expect("the device opens its lease")).unwrap()
 }
 
-async fn rows(app: &TestApp, collection: &str, filter: Document) -> Vec<Document> {
+pub(crate) async fn rows(app: &TestApp, collection: &str, filter: Document) -> Vec<Document> {
     use futures::TryStreamExt;
     app.db
         .collection::<Document>(collection)
