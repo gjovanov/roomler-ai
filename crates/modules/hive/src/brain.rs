@@ -21,6 +21,13 @@
 //! for the last room cannot both fit. A write that does not fit FAILS VISIBLY
 //! — `409 over_budget` with the numbers — and nothing is evicted: a person
 //! consolidates (design §10.3, Hermes' rule).
+//!
+//! ⚠️ A refusal recounts the counter from the active facts, which heals a
+//! reservation a crash left behind — but only a counter no write has touched
+//! for [`RECOUNT_QUIET_SECS`], and only under a compare-and-swap on its
+//! version. A reservation still in flight (taken, its fact not yet written)
+//! looks exactly like a leaked one: recounting over it let two writes both fit
+//! the last room. So every write touches the counter BEFORE it changes a fact.
 
 use axum::{
     Json,
@@ -170,6 +177,28 @@ pub struct BrainBudget {
     pub scope: BrainScope,
     pub owner_id: Option<ObjectId>,
     pub used: i64,
+    /// One more with every write that touches the counter: the recount's
+    /// compare-and-swap. Absent on a counter no write has touched since it
+    /// was added.
+    #[serde(default)]
+    pub v: i64,
+    /// When a write last touched the counter: a reservation, a release, or
+    /// the touch before a fact changes. A counter touched within
+    /// [`RECOUNT_QUIET_SECS`] is not recounted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touched_at: Option<DateTime>,
+}
+
+/// How long a counter must have gone untouched before a refusal may recount
+/// it. A write's reservation and its fact land milliseconds apart; a counter
+/// touched more recently may be counting a write still in flight.
+pub const RECOUNT_QUIET_SECS: i64 = 60;
+
+/// Whether a counter last touched at `touched_at` may be recounted at `now`.
+/// A time ahead of `now` (another pod's clock) is recent, not quiet.
+fn recountable(touched_at: Option<DateTime>, now: DateTime) -> bool {
+    touched_at
+        .is_none_or(|t| now.timestamp_millis() - t.timestamp_millis() >= RECOUNT_QUIET_SECS * 1000)
 }
 
 impl BrainBudget {
@@ -394,7 +423,13 @@ impl BrainDao {
         let taken = self
             .budgets
             .collection()
-            .update_one(filter, doc! { "$inc": { "used": n } })
+            .update_one(
+                filter,
+                doc! {
+                    "$inc": { "used": n, "v": 1_i64 },
+                    "$set": { "touched_at": DateTime::now() },
+                },
+            )
             .upsert(true)
             .await;
         match taken {
@@ -422,11 +457,34 @@ impl BrainDao {
                 .collection()
                 .update_one(
                     budget_key(tenant, scope, owner),
-                    doc! { "$inc": { "used": -n } },
+                    doc! {
+                        "$inc": { "used": -n, "v": 1_i64 },
+                        "$set": { "touched_at": DateTime::now() },
+                    },
                 )
                 .await
                 .map_err(DaoError::Mongo)?;
         }
+        Ok(())
+    }
+
+    /// Mark the counter busy BEFORE a fact shrinks or leaves the count, so a
+    /// refusal elsewhere does not recount between the change and its release:
+    /// that would take the characters off twice.
+    async fn touch(
+        &self,
+        tenant: ObjectId,
+        scope: BrainScope,
+        owner: Option<ObjectId>,
+    ) -> DaoResult<()> {
+        self.budgets
+            .collection()
+            .update_one(
+                budget_key(tenant, scope, owner),
+                doc! { "$inc": { "v": 1_i64 }, "$set": { "touched_at": DateTime::now() } },
+            )
+            .await
+            .map_err(DaoError::Mongo)?;
         Ok(())
     }
 
@@ -448,12 +506,29 @@ impl BrainDao {
     /// the counter to it. A reservation a crash left behind (taken, with no
     /// fact to show for it) would otherwise shrink the budget for ever; a
     /// refusal is when it matters, so a refusal is when this runs.
+    ///
+    /// ⚠️ `None`, the counter left as it is, when a write touched it within
+    /// [`RECOUNT_QUIET_SECS`] or touches it while this counts. A reservation
+    /// still in flight looks exactly like a leaked one, and a fact archived
+    /// with its release still to come looks like one already released:
+    /// recounting over the first let two writes both fit the last room, and
+    /// over the second let the next write overspend.
     async fn recount(
         &self,
         tenant: ObjectId,
         scope: BrainScope,
         owner: Option<ObjectId>,
-    ) -> DaoResult<i64> {
+    ) -> DaoResult<Option<i64>> {
+        let Some(counter) = self
+            .budgets
+            .find_one(budget_key(tenant, scope, owner))
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !recountable(counter.touched_at, DateTime::now()) {
+            return Ok(None);
+        }
         let mut filter = budget_key(tenant, scope, owner);
         filter.insert("status", "active");
         let actual: i64 = self
@@ -463,16 +538,24 @@ impl BrainDao {
             .iter()
             .map(|f| f.chars)
             .sum();
-        self.budgets
+        let mut unchanged = budget_key(tenant, scope, owner);
+        if counter.v == 0 {
+            // A counter from before the version has no `v`, which a match on
+            // 0 alone would miss.
+            unchanged.insert("v", doc! { "$in": [0_i64, Bson::Null] });
+        } else {
+            unchanged.insert("v", counter.v);
+        }
+        let set = self
+            .budgets
             .collection()
             .update_one(
-                budget_key(tenant, scope, owner),
-                doc! { "$set": { "used": actual } },
+                unchanged,
+                doc! { "$set": { "used": actual }, "$inc": { "v": 1_i64 } },
             )
-            .upsert(true)
             .await
             .map_err(DaoError::Mongo)?;
-        Ok(actual)
+        Ok((set.matched_count == 1).then_some(actual))
     }
 
     /// [`Self::reserve`], and once more after a [`Self::recount`] when the
@@ -486,16 +569,14 @@ impl BrainDao {
     ) -> DaoResult<Result<(), OverBudget>> {
         match self.reserve(tenant, scope, owner, n).await? {
             Ok(()) => Ok(Ok(())),
-            Err(over) => {
-                let actual = self.recount(tenant, scope, owner).await?;
-                if actual < over.used {
+            Err(over) => match self.recount(tenant, scope, owner).await? {
+                Some(actual) if actual < over.used => {
                     warn!(tenant = %tenant, scope = scope.as_str(), counted = over.used, actual,
                         "hive: a brain budget held a reservation no fact used — recounted");
                     self.reserve(tenant, scope, owner, n).await
-                } else {
-                    Ok(Err(over))
                 }
-            }
+                _ => Ok(Err(over)),
+            },
         }
     }
 
@@ -559,6 +640,9 @@ impl BrainDao {
         {
             return Ok(EditOutcome::OverBudget(over));
         }
+        if grow < 0 {
+            self.touch(tenant, scope, owner).await?;
+        }
         let now = DateTime::now();
         let edited = self
             .facts
@@ -593,6 +677,8 @@ impl BrainDao {
         let Some(id) = current.id else {
             return Ok(None);
         };
+        self.touch(current.tenant_id, current.scope, current.owner_id)
+            .await?;
         let archived = self
             .facts
             .collection()
@@ -1266,5 +1352,24 @@ mod tests {
             "the user memory holds 1450 of its 1500 characters, and this needs 120 more — \
              shorten or archive a fact first"
         );
+    }
+
+    /// A counter is recounted only once it has been quiet for the window: a
+    /// write may still be in flight on one touched more recently, and a time
+    /// ahead of this pod's clock is recent too.
+    #[test]
+    fn only_a_quiet_counter_is_recounted() {
+        let now = DateTime::from_millis(1_800_000_000_000);
+        let ago = |ms: i64| Some(DateTime::from_millis(now.timestamp_millis() - ms));
+        let window = RECOUNT_QUIET_SECS * 1000;
+        assert!(
+            recountable(None, now),
+            "never touched (from before the field)"
+        );
+        assert!(recountable(ago(window), now));
+        assert!(recountable(ago(10 * window), now));
+        assert!(!recountable(ago(window - 1), now));
+        assert!(!recountable(ago(0), now));
+        assert!(!recountable(ago(-5_000), now), "another pod's clock, ahead");
     }
 }
