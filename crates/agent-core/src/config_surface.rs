@@ -3085,6 +3085,11 @@ mod tests {
             "rc_audio",
             "lock_on_end",
             "display_match",
+            // FR-52 — read at use: from the config FILE at every knock and
+            // every external session request, so nothing re-seeds them.
+            "external_access_enabled",
+            "external_consent_mode",
+            "external_max_permissions",
         ]
         .into_iter()
         .map(String::from)
