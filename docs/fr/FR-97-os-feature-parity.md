@@ -17,8 +17,10 @@
   wrong, since the microphone was the only thing a Linux session ever captured (§3.8). P3c-2, the session's
   monitor through Pulse's client library on per-user and root installs (D14), merged (#2426), field-verified on
   both (§8). Both ride the next release.
-- P3b, the Linux lock hint (advisory) and a live session's logind block inhibitor (FR-55 P3), is in review,
+- P3b, the Linux lock hint (advisory) and a live session's logind block inhibitor (FR-55 P3), merged (#2431),
   field-verified red → green on a root daemon (§8).
+- P4d, a clean stop for a per-user Windows install (`roomlerd service stop`, sign-out, shutdown), is in review
+  (D15).
 - The rest of P2–P7 is open.
 
 **Owner:** the agent on all
@@ -191,13 +193,13 @@ and the consent chain's fallbacks.
 | O1 | A per-user install updates itself | ✅ | ❌ | ✅ | #2046 | FR-96 |
 | O2 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | ❌ | ❌ | `Unsupported` → the install proceeds (`artifact_version.rs:272-289`, `updater.rs:1404`): a signed older package under a newer manifest installs | P6a |
 | O3 | Tunnel CLI `roomler self-update` | ✅ | ❌ | ❌ | `agents/roomler-cli/src/update.rs:96-101` | P6b |
-| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:4869` | P6c |
+| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:4913` | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 apt only; the tarball has none | ❌ | A pasted recipe (`docs/installation.md:394-420`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
 | O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | ❌ | `macos_supervisor.rs` never calls `crash_recorder` | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1170-1179` | P6f |
-| O10 | An ephemeral device removes itself on a clean stop | 🟡 SCM installs only | ✅ | ✅ | A Scheduled-Task install has no stop signal (`main.rs:2716-2712`) | P4d |
+| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`main.rs:3069`, `session_end.rs:220`) | P4d |
 | A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2312-2318`); the CLI and the wizard are universal | D6 |
 | A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:80-81`); behaviour under emulation unverified | D6 |
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` (`release-agent.yml:1093`); recordings write Opus, not AAC | P7a |
@@ -615,8 +617,18 @@ test of the SIGKILL property itself.
   code already uses, instead of `tokio::process` (`ssh.rs:926-948`).
 - **P4c, Hive adopt.** A named pipe whose server reads `GetNamedPipeClientProcessId` → token → SID and maps it to the
   session's account, asking for no credentials (`hive_win.rs:6-11`).
-- **P4d, a stop signal for Scheduled-Task installs.** A named event that `roomlerd service stop` and the companion set,
-  so an ephemeral device removes itself as SCM installs do.
+- **P4d, a clean stop for Scheduled-Task installs** (built). Two channels into the arm the SCM host's event already
+  reaches (`main.rs:3069`):
+  - **`roomlerd service stop`** signals a `Local\` event keyed by the config's instance id (`stop_event.rs:338`),
+    waits up to 15 s for the daemon to leave, and only then ends the task (`service.rs:558`).
+  - **A hidden top-level window** turns `WM_ENDSESSION` into the stop and holds the session's end for at most 5 s,
+    until the clean shutdown is on disk (`session_end.rs:220`). A console handler hears no sign-out once `user32` is
+    loaded.
+  - Restart Manager's `ENDSESSION_CLOSEAPP`, `WM_CLOSE` and `service uninstall` are never a leave (D15).
+  - `service stop --as-service` stops the SCM service (`environment.rs:355`).
+  - Kill switch: `ROOMLERD_SESSION_END=0`.
+  - The design is not the companion setting the event, as first planned (D15). `docs/ephemeral-nodes.md` has the
+    per-user section.
 - **P4e, Windows Home and Windows v6 serving.** Only through D1's userspace egress; until then P0b refuses honestly.
 
 ### 3.10 P5 — SSH and exec identity
@@ -693,7 +705,7 @@ model on Windows, so the three agree on what the mode means.
 | **P4a** | Windows `SendSAS` | its cap word | Win11 Pro + a GPO-locked laptop | S–M |
 | **P4b** | Windows SFTP as `console_user` | `ssh_sftp_as_user` | Win11 SystemContext | S–M |
 | **P4c** | Windows Hive adopt | `hive_adopt` | Win11 | M |
-| **P4d** | Windows Scheduled-Task clean stop | — | Win11, a perUser ephemeral device | S |
+| **P4d** | Windows per-user clean stop: `service stop` and a session-end window (D15, built) | `ROOMLERD_SESSION_END=0` (the window); `service stop` acts only when run | Win11, a perUser ephemeral device, red on 0.4.142 | S |
 | **P4e** | Windows Home + v6 serving (only if D1 picks the userspace egress) | its own | Win11 Home | L |
 | **P5a** | `console_user` on Linux + macOS | `ssh_account_mode` | the lab + a Mac | S–M |
 | **P6a** | Artifact version binding: `.deb`, `.pkg`, tarball | `ROOMLERD_ARTIFACT_VERSION_CHECK=0` | the last three releases, offline | S–M |
@@ -804,6 +816,7 @@ one depends on it.
 | **D12** | A netstack node's exit status | **Decided (measured, 2026-10-17):** it is `active` for the SOCKS5 front's IPv4 dials and nothing else, so the status names the front instead of reading "never active" (the plan before the measurement, which would itself have been wrong). The DNS steer and the route offer follow from the same fact (P0c-3) |
 | **D13** | A host firewall that refuses services on the overlay address | **Decided (per recommendation, 2026-10-17):** report, never change. The firewall is the host owner's, and trusting the adapter would open every service on the host to every peer the overlay ACL admits, an ACL not yet field-proven under `enforce`. Carriers need no allow (measured). The status names the zone and what it admits; the owner opens the mesh (`firewall-cmd --zone=trusted --add-interface=roomler0`, `ufw allow in on roomler0`) |
 | **D14** | How Linux captures the computer's sound (P3c-2) | **Decided (per recommendation, 2026-10-17):** Pulse's client library (`libpulse-simple.so.0`), loaded at run time, recording `@DEFAULT_MONITOR@`: PulseAudio and PipeWire's Pulse server both resolve it, and the library is on nearly every desktop, where the ALSA `pulse` plugin often is not. Rejected: ALSA `pulse` with `PULSE_SOURCE` set by the daemon (an environment variable is process-wide and unsafe to set in a threaded process, and it would also redirect a recording's microphone); a `parec` child (one more binary to depend on). A root daemon records in the seat user's session helper, because PulseAudio admits a client by uid or cookie |
+| **D15** | How a per-user Windows daemon hears a stop (P4d) | **Decided (per recommendation, 2026-10-18):** the daemon hears both stops itself: its own config-keyed event for `roomlerd service stop`, and a hidden window for the session's end. It is not the companion setting the event, as first planned: the companion has no stop action, it need not be running, and the session's end, the case it would have covered, reaches the daemon directly. Never a leave: Restart Manager's `ENDSESSION_CLOSEAPP` (or a manual MSI upgrade would unenroll an ephemeral device), `WM_CLOSE` (`taskkill` without `/F`), and `service uninstall`, which a major upgrade runs from the outgoing binary |
 
 ## 7. Out of scope
 
