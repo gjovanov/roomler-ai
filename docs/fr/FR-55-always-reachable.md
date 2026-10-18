@@ -2,7 +2,7 @@
 # FR-55: A device stays reachable instead of quietly sleeping
 
 **Status:** P0 measured, P1 + P2 shipped (`agent-v0.4.45` / `0.4.46`), P3 deferred on
-evidence, P4 + P5 open — and ⚠️ **P2's AC-power arm FAILS in the field**: a Mac that
+evidence and then built under FR-97 P3b (2026-10-17, the last section), P4 + P5 open — and ⚠️ **P2's AC-power arm FAILS in the field**: a Mac that
 falls asleep on battery and is then plugged in stays asleep all night with our
 assertion held (2026-09-24, field log). This line read "proposed" until then, with the
 field log empty, while P0–P2 had shipped and been measured — the record below restores
@@ -254,3 +254,22 @@ failure is specific to P2 — the case with nobody connected, which is the case 
 exists for. (Not claimed: that a session is otherwise protected. Input injection tickles
 `IOHIDSystem` only while someone is typing; a view-only session or an SSH session gets
 nothing from it — see `power.rs`'s module doc.)
+
+### 2026-10-17 — P3 built under FR-97 P3b: both reasons for the deferral are gone
+
+The 2026-09-01 deferral rested on two facts, and neither holds any more.
+
+- **D-Bus is already in every Linux agent.** `zbus` comes with `portal-capture`, which
+  `full`, and so every shipped Linux build, now carries (FR-45, FR-93). The inhibitor adds
+  no dependency.
+- **The fleet has Linux desktops.** FR-93 put GNOME and KDE desktops in it, and a desktop
+  idle-suspends, which is the case P3 exists for.
+
+So P3 is built as designed above: logind `Inhibit()` with `mode="block"`, the fd held for as
+long as the keeper wants the machine awake (`agents/roomlerd/src/power.rs`, the Linux
+`imp`). It runs from a plain thread, because zbus's blocking API panics inside the tokio
+runtime the keeper runs on. `what` is `sleep:idle` for a root daemon. A per-user daemon
+runs outside every login session, where logind's polkit policy grants only `idle`
+(`inhibit-block-sleep` is `allow_any=no`), so it takes `idle` and logs why. The design
+and the field record are in FR-97 (`docs/fr/FR-97-os-feature-parity.md` §3.8, §8) and
+`docs/remote-control.md` §5.1d.

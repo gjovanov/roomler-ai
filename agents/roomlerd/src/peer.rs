@@ -1408,6 +1408,45 @@ impl AgentPeer {
                 }
             });
         }
+        // FR-97 P3b — Linux: a lock screen is a screen like any other, so
+        // logind's hint goes to the viewer's chip only (`input: "passes"`),
+        // never to the pump's overlay or the input path. Each transition is
+        // retried until the control DC carries it (FR-80's helper): a host
+        // already locked when the session starts is the case that most needs
+        // saying, and the DC is rarely open yet then.
+        #[cfg(target_os = "linux")]
+        if lock_state::linux_lock_hint_enabled() {
+            let stash = control_dc.clone();
+            let until = session_end.clone();
+            tokio::spawn(async move {
+                let run = async move {
+                    let mut said = false;
+                    loop {
+                        let locked = tokio::task::spawn_blocking(lock_state::linux_locked_hint)
+                            .await
+                            .unwrap_or(false);
+                        if locked != said
+                            && send_control_notice(
+                                &stash,
+                                &host_locked_advisory_payload(locked),
+                                Duration::from_millis(500),
+                                Duration::from_secs(30),
+                                Duration::from_secs(2),
+                            )
+                            .await
+                        {
+                            said = locked;
+                        }
+                        tokio::time::sleep(lock_state::LINUX_HINT_POLL).await;
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = until.cancelled() => {}
+                    _ = run => {}
+                }
+            });
+        }
 
         // FR-108 P1b — while this session holds a display mode it applied, a
         // person who comes back (or the owner's `never`) gets the screen back
@@ -9307,6 +9346,18 @@ async fn emit_host_locked(
     }
 }
 
+/// FR-97 P3b — the Linux hint's `rc:host_locked`: the same message plus
+/// `input: "passes"`, so the viewer says the lock screen takes input rather
+/// than "input is suppressed", which is Windows' case. An older viewer ignores
+/// the field and shows its chip as before.
+///
+/// Always compiled (only Linux sends it) so the wire shape is locked by a test
+/// on every OS.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn host_locked_advisory_payload(locked: bool) -> String {
+    format!(r#"{{"t":"rc:host_locked","locked":{locked},"input":"passes"}}"#)
+}
+
 /// FR-108 P1b — tell this session's viewer what display match did on its own
 /// (at the unlock, or handing the screen back), as `rc:display-match.state`.
 async fn emit_display_match(
@@ -13042,8 +13093,21 @@ mod codec_cap_tests {
         );
     }
 
+    /// FR-97 P3b — the Linux lock hint is `rc:host_locked` plus
+    /// `input: "passes"`: the viewer's chip says the lock screen takes input.
+    #[test]
+    fn host_locked_advisory_payload_wire_shape() {
+        for locked in [true, false] {
+            let v: serde_json::Value =
+                serde_json::from_str(&super::host_locked_advisory_payload(locked)).expect("JSON");
+            assert_eq!(v["t"], "rc:host_locked");
+            assert_eq!(v["locked"], locked);
+            assert_eq!(v["input"], "passes");
+        }
+    }
+
     /// FR-97 P3c-1 — the audio notice's wire shape, which the viewer parses
-    /// (`parseControlMessage`, `rc:audio-unavailable`).
+    /// (`parseControlInbound`, `rc:audio-unavailable`).
     #[test]
     fn audio_unavailable_payload_wire_shape() {
         use crate::audio_source::{AudioUnavailable, AudioUnavailableCode};
