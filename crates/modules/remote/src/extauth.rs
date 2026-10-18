@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use bson::oid::ObjectId;
 use dashmap::DashMap;
+use roomler_ai_mod_fleet::hub::OrgPolicy;
 use roomler_ai_remote_control::connect_code;
 use roomler_ai_remote_control::models::{
     Agent, ExtauthRefusal, ExternalRcAuditAction, ExternalRcAuditEvent, RpcCap,
@@ -244,6 +245,15 @@ async fn forward(
             // records one and never puts one on the org's overlay.
             false,
             false,
+            // FR-101 / FR-99 — nor are these read for it: the owner pod hands
+            // an `rc:extauth.*` frame to `on_relayed` before its Hub sees the
+            // frame, and `handle_session` there reads the org's policy and
+            // limits off the tenant row its own gate 1 reads. `Unavailable`
+            // is the reading that refuses, were anything ever to consult it.
+            OrgPolicy::Unavailable,
+            None,
+            None,
+            None,
             frame,
         )
         .await,
