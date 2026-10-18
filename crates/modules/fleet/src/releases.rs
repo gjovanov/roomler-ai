@@ -54,7 +54,26 @@ const RELEASES_REPO: &str = "gjovanov/roomler-ai";
 /// GitHub page size — the API max. See the module docs: the shallow
 /// 30-deep page the agent/tunnel caches used loses the rarely-tagged
 /// `setup-v*` / `tunnel-v*` families behind a day or two of `agent-v*`.
+///
+/// ⚠️ 100 only delays that. A family that ships less often than 100 of the
+/// others falls off this page too, and with it every route that serves it:
+/// `tunnel-v0.3.0-rc.266` (2026-07-28) fell behind 100 newer releases by
+/// 09-07, and every tunnel-client install then 404'd for six weeks, unnoticed
+/// (#2468). So the page is never the whole story: [`fetch_releases`] recovers
+/// each family the page lacks, by tag, at any depth.
 const RELEASES_PER_PAGE: usize = 100;
+
+/// The release families the routes serve, by tag prefix
+/// (`agent_release::filter_component_releases`).
+const FAMILIES: [&str; 3] = ["agent-v", "tunnel-v", "setup-v"];
+
+/// A family's tag ordered by its version: `release_ord` on what follows the
+/// prefix. `release_ord` alone strips only `agent-`, so it reads every
+/// `tunnel-v*` and `setup-v*` tag as unparseable, and a `max_by_key` over
+/// those picks by list position, not by version.
+fn family_ord(tag: &str, prefix: &str) -> Option<(u64, u64, u64, u64)> {
+    crate::agent::release_ord(tag.strip_prefix(prefix)?)
+}
 
 /// Upstream fetch timeout.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -236,7 +255,109 @@ async fn fetch_release_by_tag(tag: &str) -> anyhow::Result<AgentRelease> {
     Ok(resp.json::<AgentRelease>().await?)
 }
 
+/// The newest page of releases, plus the newest release of every family the
+/// page no longer reaches (#2468). Two extra calls per missing family, and
+/// only while one is missing: a new release of any family lands on the page
+/// the moment it is published.
 async fn fetch_releases() -> anyhow::Result<Vec<AgentRelease>> {
+    let mut releases = fetch_release_page().await?;
+    for prefix in missing_families(&releases) {
+        match fetch_newest_of_family(prefix).await {
+            Ok(Some(r)) => {
+                tracing::info!(
+                    %prefix,
+                    tag = %r.tag_name,
+                    "releases: recovered a family the first page no longer reaches"
+                );
+                releases.push(r);
+            }
+            Ok(None) => {
+                tracing::debug!(%prefix, "releases: no published release in this family");
+            }
+            Err(e) => tracing::warn!(
+                %prefix,
+                error = %format!("{e:#}"),
+                "releases: the first page lacks this family, and recovering it failed"
+            ),
+        }
+    }
+    Ok(releases)
+}
+
+/// The families with no published (non-draft) release in `releases`.
+fn missing_families(releases: &[AgentRelease]) -> Vec<&'static str> {
+    FAMILIES
+        .into_iter()
+        .filter(|p| {
+            !releases
+                .iter()
+                .any(|r| !r.draft && r.tag_name.starts_with(p))
+        })
+        .collect()
+}
+
+/// The newest published release of one family, by its tags: GitHub's
+/// `matching-refs` lists every tag with the prefix in one unpaginated call,
+/// and the release is then fetched by tag. A tag with no release, or only a
+/// draft, falls through to the next newest (three at most).
+async fn fetch_newest_of_family(prefix: &str) -> anyhow::Result<Option<AgentRelease>> {
+    let tags = fetch_tags_with_prefix(prefix).await?;
+    let mut last_err = None;
+    for tag in newest_first(&tags, prefix).into_iter().take(3) {
+        match fetch_release_by_tag(&tag).await {
+            Ok(r) if !r.draft => return Ok(Some(r)),
+            Ok(_) => {}
+            Err(e) => last_err = Some(e.context(format!("release {tag}"))),
+        }
+    }
+    match last_err {
+        Some(e) => Err(e),
+        None => Ok(None),
+    }
+}
+
+/// One family's tags, newest version first; a tag no version can be read
+/// from is dropped. Never GitHub's order, which is lexicographic: there
+/// `tunnel-v0.3.0-rc.84` sorts after `tunnel-v0.3.0-rc.266`.
+fn newest_first(tags: &[String], prefix: &str) -> Vec<String> {
+    let mut ordered: Vec<_> = tags
+        .iter()
+        .filter_map(|t| family_ord(t, prefix).map(|o| (o, t)))
+        .collect();
+    ordered.sort_by_key(|(o, _)| std::cmp::Reverse(*o));
+    ordered.into_iter().map(|(_, t)| t.clone()).collect()
+}
+
+/// Every tag starting with `prefix`, without the `refs/tags/` part.
+async fn fetch_tags_with_prefix(prefix: &str) -> anyhow::Result<Vec<String>> {
+    #[derive(Deserialize)]
+    struct GitRef {
+        #[serde(rename = "ref")]
+        name: String,
+    }
+    let url =
+        format!("https://api.github.com/repos/{RELEASES_REPO}/git/matching-refs/tags/{prefix}");
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("roomler-ai-api/", env!("CARGO_PKG_VERSION")))
+        .timeout(FETCH_TIMEOUT)
+        .build()?;
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("GitHub returned {}", resp.status());
+    }
+    let refs: Vec<GitRef> = resp.json().await?;
+    Ok(refs
+        .into_iter()
+        .filter_map(|r| r.name.strip_prefix("refs/tags/").map(str::to_string))
+        .collect())
+}
+
+/// Page 1 of the repo's releases, newest first.
+async fn fetch_release_page() -> anyhow::Result<Vec<AgentRelease>> {
     let url = format!(
         "https://api.github.com/repos/{RELEASES_REPO}/releases?per_page={RELEASES_PER_PAGE}"
     );
@@ -278,12 +399,16 @@ impl NewestTags {
     /// reaches two digits (measured 2026-08-27). This report is how an
     /// operator confirms a cache bust actually took, so it reporting a stale
     /// tag would send them looking for the wrong bug.
+    ///
+    /// ⚠️ Ordered by [`family_ord`]: `release_ord` reads no `tunnel-v*` or
+    /// `setup-v*` tag, and over all-`None` keys `max_by_key` took whichever of
+    /// the family's releases came LAST in list order, until #2468.
     pub fn from_releases(releases: &[AgentRelease]) -> Self {
         let newest = |prefix: &str| {
             releases
                 .iter()
                 .filter(|r| !r.draft && r.tag_name.starts_with(prefix))
-                .max_by_key(|r| crate::agent::release_ord(&r.tag_name))
+                .max_by_key(|r| family_ord(&r.tag_name, prefix))
                 .map(|r| r.tag_name.clone())
         };
         Self {
@@ -481,6 +606,82 @@ mod tests {
         assert_eq!(n.agent.as_deref(), Some("agent-v0.3.0-rc.305"));
         assert!(n.tunnel.is_none());
         assert!(n.setup.is_none());
+    }
+
+    #[test]
+    fn newest_tags_orders_tunnel_and_setup_by_version_not_list_position() {
+        // #2468 — `release_ord` reads no `tunnel-v*`/`setup-v*` tag, so the
+        // report took the family's last release in list order. GitHub's order
+        // is by name, where `rc.84` sorts after `rc.266`.
+        let releases = vec![
+            release("tunnel-v0.3.0-rc.266", false),
+            release("tunnel-v0.3.0-rc.84", false),
+            release("setup-v0.4.143", false),
+            release("setup-v0.4.99", false),
+            release("agent-v0.4.143", false),
+            release("agent-v0.4.99", false),
+        ];
+        let n = NewestTags::from_releases(&releases);
+        assert_eq!(n.tunnel.as_deref(), Some("tunnel-v0.3.0-rc.266"));
+        assert_eq!(n.setup.as_deref(), Some("setup-v0.4.143"));
+        assert_eq!(n.agent.as_deref(), Some("agent-v0.4.143"));
+    }
+
+    #[test]
+    fn a_family_the_page_lacks_is_missing_and_a_draft_does_not_count() {
+        // The shape page 1 had on 2026-10-18: agent and setup releases, and
+        // no tunnel release in reach (#2468). A draft is not a release.
+        let page = vec![
+            release("agent-v0.4.143", false),
+            release("setup-v0.4.143", false),
+            release("tunnel-v0.4.144", true),
+        ];
+        assert_eq!(missing_families(&page), vec!["tunnel-v"]);
+        let whole = vec![
+            release("agent-v0.4.143", false),
+            release("setup-v0.4.143", false),
+            release("tunnel-v0.3.0-rc.266", false),
+        ];
+        assert!(missing_families(&whole).is_empty());
+        assert_eq!(missing_families(&[]), FAMILIES.to_vec());
+    }
+
+    #[test]
+    fn a_family_s_tags_are_tried_newest_version_first() {
+        let tags: Vec<String> = [
+            "tunnel-v0.3.0-rc.69",
+            "tunnel-v0.3.0-rc.266",
+            "tunnel-v0.3.0-rc.84",
+            "tunnel-v0.3.0",
+            "tunnel-vnext",
+            "agent-v0.4.1",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            newest_first(&tags, "tunnel-v"),
+            vec![
+                "tunnel-v0.3.0",
+                "tunnel-v0.3.0-rc.266",
+                "tunnel-v0.3.0-rc.84",
+                "tunnel-v0.3.0-rc.69",
+            ]
+        );
+    }
+
+    /// The real repo, over the network: every family the routes serve comes
+    /// back, however deep its newest release sits. Not in CI (GitHub's
+    /// unauthenticated quota); run it after touching the fetch:
+    /// `cargo test -p roomler-ai-mod-fleet --lib releases -- --ignored`.
+    #[tokio::test]
+    #[ignore = "network: the real GitHub API"]
+    async fn the_real_repo_serves_every_family() {
+        let releases = fetch_releases().await.expect("fetch");
+        let n = NewestTags::from_releases(&releases);
+        assert!(n.agent.is_some(), "agent: {n:?}");
+        assert!(n.setup.is_some(), "setup: {n:?}");
+        assert!(n.tunnel.is_some(), "tunnel: {n:?}");
+        eprintln!("newest: {n:?} ({} releases)", releases.len());
     }
 
     #[test]

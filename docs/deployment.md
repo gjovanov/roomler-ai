@@ -442,7 +442,20 @@ the server proxies the downloads and gets a cache-bust ping
 | `release-tunnel.yml` | `tunnel-v*` | `roomler` CLI: Windows zip, Linux tarball + `.deb`, macOS universal tarball |
 | `release-setup.yml` | `setup-v*` — cut **automatically at every `agent-v*` commit** by `release-agent.yml`'s `dispatch-setup-release` job (FR-84 S1; repo variable `SETUP_LOCKSTEP=false` disables it) | The install wizard: Linux/macOS tarballs, signed Windows EXE zip — all three or none |
 
-All assets carry `.sha256`, GPG `.asc`, and SLSA provenance; releases are
+⚠️ **The server reads one page of the newest 100 releases, and recovers by tag
+any family that page lacks** (`crates/modules/fleet/src/releases.rs`, #2468).
+Before that recovery, a family that ships less often than ~100 of the others
+fell off the page, and every route serving it 404'd. `tunnel-v0.3.0-rc.266`
+(2026-07-28) is still the newest tunnel release. From about 09-07 every
+tunnel-client install (the wizard's tunnel role, `install.ps1 -Role
+tunnel-client`, `install.sh --role tunnel`) and `roomler self-update` failed
+with `404 no release matching version=latest`, for six weeks, unnoticed. The
+tell is `GET /api/tunnel/latest-release` answering `[]`. The refresh report's
+`newest` read those two families by list position, not version, until the
+same fix.
+
+All assets carry `.sha256`, GPG `.asc`, and SLSA provenance (⚠️ except the
+last tunnel release: rc.266, cut 07-28, has only `.sha256`); releases are
 published non-prerelease so `/releases/latest` stays resolvable for the fleet's
 auto-updaters. `/api/setup/{windows,linux,macos}` serve the newest `setup-v*`,
 so the wizard a new install downloads is only as current as the last lockstep
