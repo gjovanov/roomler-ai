@@ -734,11 +734,24 @@ fn spawn_attached_as_console_user(
     let mut desktop = wide(r"winsta0\default");
     startup.si.StartupInfo.lpDesktop = desktop.as_mut_ptr();
 
+    // FR-97 P5b — in the person's profile, where OpenSSH starts their shell,
+    // read from the token the shell runs under. Unreadable (or switched off),
+    // it starts where this process is, as before: the shell is still the
+    // person, so that costs a directory, never a privilege.
+    let profile = if crate::exec::ssh_starts_in_home() {
+        let dir = crate::win_identity::profile_dir_of_token(token.raw());
+        if dir.is_none() {
+            warn!(session, "console user's profile directory unreadable");
+        }
+        dir.map(|d| wide(&d))
+    } else {
+        None
+    };
     let mut cmd = wide(cmdline);
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: `token` is a live primary token for the console session; `cmd`
-    // is a NUL-terminated mutable UTF-16 buffer; the env block and the
-    // attribute list both outlive the call.
+    // is a NUL-terminated mutable UTF-16 buffer; the env block, the attribute
+    // list and the directory all outlive the call.
     let ok = unsafe {
         CreateProcessAsUserW(
             token.raw(),
@@ -753,7 +766,7 @@ fn spawn_attached_as_console_user(
             // gave it one.
             EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
             env.raw,
-            std::ptr::null(),
+            profile.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
             &startup.si.StartupInfo,
             &mut pi,
         )

@@ -396,6 +396,29 @@ account was at the screen ran them as itself. On a Mac's root daemon they ran as
 the GUI user and were refused at the login window. On the release, every one of
 them had been refused as "a Windows concept".
 
+#### Where a session starts (FR-97 P5b)
+
+A person's session starts in their home, where sshd and Windows' OpenSSH start
+it: the shell, a command and `sftp`. Before P5b they started in the daemon's own
+directory, `/`, so `scp f node:` aimed a relative path at a directory the person
+could not write to.
+
+| Session as | Linux and macOS | Windows |
+|---|---|---|
+| `daemon` | the daemon's directory, as before | the worker's directory, as before |
+| `named` | the account's home | refused, as before |
+| `console_user` | the person's home | the person's profile (P4b did it for `sftp`) |
+
+- ⚠️ **The `chdir` runs in the child after the drop**, as the person
+  (`unix_priv::start_in_home`). A root-squashed NFS home refuses root, so a
+  parent-side `current_dir` would have failed the whole session. A home the
+  person cannot enter leaves the child where it was, which is sshd's fallback too,
+  and the daemon logs a missing home.
+- Fleet RPC is unchanged: a command starts in its `cwd`, or where it always has.
+- Kill switch: `ROOMLERD_SSH_START_IN_HOME=0` puts the old start back. On a
+  SystemContext Windows device, set it in the service's environment
+  (`roomlerd set-service-env-var`), as for `ROOMLERD_SFTP_AS_USER`.
+
 **Both paths obey this, and it took a fix to make that true.** A grant carries
 the policy's `account_mode`. A key-list session has no policy behind it, so it
 uses the device-owned `ssh_account_mode` — and while that was unset it fell

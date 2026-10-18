@@ -28,7 +28,10 @@
 - P4c, Hive adopt on Windows (a named pipe whose client is named by its token, and a hook that sends nothing to
   a pipe it does not trust), merged (#2439), field-verified red → green on a Win11 SystemContext guest (§8).
 - P5a, `console_user` on Linux and macOS (the person at logind's seat0 or owning `/dev/console`, by the drop a
-  `named` account takes; refused while nobody is there), for SSH and for Fleet RPC's `run_as`, is in review.
+  `named` account takes; refused while nobody is there), for SSH and for Fleet RPC's `run_as`, merged (#2441),
+  field-verified red → green on a Linux root daemon, a Linux per-user daemon and a Mac's root daemon (§8).
+- P5b, a person's SSH session starts in their home (Linux and macOS) or profile (Windows), as sshd starts it, is
+  in review.
 - The rest of P2–P7 is open.
 
 **Owner:** the agent on all
@@ -703,6 +706,18 @@ model on Windows, so the three agree on what the mode means.
   carried it, `authorize` checks the live connection, and the hub refuses to push the field to a connection
   without the word (`hub.rs:3304`). SSH's half fails closed on its own: an older agent refuses the mode.
 
+**P5b (built).** P5a's field run found every session as a person starting in `/`, the daemon's directory, for
+`named` too, where sshd starts it in the home. Now the shell, an SSH command and `sftp` start in the person's home:
+- **Linux and macOS:** `exec::apply_run_as_at_home` registers a `chdir` to the account's home in the child AFTER
+  the drop (`unix_priv::start_in_home`), so the person's own rights decide whether they may enter it. A
+  root-squashed NFS home refuses root, so a parent-side `current_dir` would fail the whole spawn. A home they
+  cannot enter leaves the child where it was, as sshd's does.
+- **Windows `console_user`:** the pty and an SSH command start in the profile, read from the token they run under,
+  as P4b did for `sftp`.
+- **Unchanged:** `daemon` starts where it always did. Fleet RPC never sets the flag, so a command starts in its
+  `cwd` or where it always has.
+- Kill switch: `ROOMLERD_SSH_START_IN_HOME=0`.
+
 ### 3.11 P6 — install, update, ops
 
 - **P6a, the artifact's own version.** `.deb` `control` (`dpkg-deb -f`, or `ar` + `tar` in-process), `.pkg`
@@ -773,7 +788,7 @@ model on Windows, so the three agree on what the mode means.
 | **P4d** | Windows per-user clean stop: `service stop` and a session-end window (D15, built) | `ROOMLERD_SESSION_END=0` (the window); `service stop` acts only when run | Win11, a perUser ephemeral device, red on 0.4.142 | S |
 | **P4e** | Windows Home + v6 serving (only if D1 picks the userspace egress) | its own | Win11 Home | L |
 | **P5a** | `console_user` on Linux + macOS: the person at seat0 or owning the console, by the `named` drop, for SSH and exec's `run_as` (built) | the device's `ssh_account_mode`; the exec policy's `run_as` | the lab + a Mac | S–M |
-| **P5b** | A person's SSH session on Linux + macOS starts in their home: the pty and `sftp` for `named` and `console_user`, where sshd starts them (they start in `/`, the daemon's directory; Windows `console_user` `sftp` starts in the profile since P4b) | — | the lab | S |
+| **P5b** | A person's SSH session starts in their home: the shell, a command and `sftp` for `named` and `console_user` on Linux + macOS, and Windows `console_user`'s shell and commands in the profile (as `sftp` since P4b); the `chdir` after the drop, where sshd does it (built) | `ROOMLERD_SSH_START_IN_HOME=0` | the lab + a Win11 SystemContext guest | S |
 | **P6a** | Artifact version binding: `.deb`, `.pkg`, tarball | `ROOMLERD_ARTIFACT_VERSION_CHECK=0` | the last three releases, offline | S–M |
 | **P6b** | `roomler self-update` on Unix + the pinned PGP check | — | Linux + Mac tunnel-only hosts | M |
 | **P6c** | `service install --system` on Linux + macOS | — | vmtest | S |
@@ -846,6 +861,8 @@ one depends on it.
   itself on a clean stop.
 - [ ] **AC12 (P5a):** `console_user` runs as the person at the screen on Linux and macOS, and refuses when nobody is
   there.
+- [ ] **AC18 (P5b):** a person's SSH session (`named`, `console_user`) starts in their home on Linux and macOS and in
+  their profile on Windows, for the shell, a command and `sftp`; a home they cannot enter leaves it where it was.
 - [ ] **AC13 (P6):** a signed older `.deb` or `.pkg` under a newer manifest version is refused; `roomler self-update`
   updates a Linux and a macOS tunnel-only host; `service install --system` and `install.sh --uninstall` round-trip on
   vmtest; a SIGKILLed Mac worker leaves a crash record; a closed stdout no longer kills the macOS daemon.

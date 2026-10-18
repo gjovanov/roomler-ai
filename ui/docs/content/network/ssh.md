@@ -86,6 +86,12 @@ the desktop. The session gets that person's account, not their desktop
 session, so a program that needs the desktop (a window, a notification) does
 not reach their screen.
 
+A person's session, `named` or `console_user`, starts in their home folder (on
+Windows, their profile), as an ordinary SSH server starts it. That holds for the
+shell, a command and file transfers, so `scp file node:` lands in the home. If
+the home is missing or cannot be entered, the session starts in `/` instead of
+failing.
+
 ## Port forwarding is default-deny
 
 :::warning An empty forward allow-list means *nowhere*, not *anywhere*
