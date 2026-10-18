@@ -72,6 +72,8 @@ mod enroll_key_tests;
 mod ephemeral_tests;
 #[cfg(test)]
 mod exec_service_tests;
+#[cfg(test)]
+mod external_access_tests;
 /// FR-102 P6 — the purestat puller (seven closed days frozen once, a frozen
 /// day never rewritten, a failed pull recorded rather than read as 0) and
 /// the Campaigns table (both planes joined by the normalised key; a revoked
@@ -141,8 +143,6 @@ mod growth_setup_diagnostics_tests;
 /// the exclusion list and the set every growth number applies (AC4).
 #[cfg(test)]
 mod growth_tests;
-#[cfg(test)]
-mod external_access_tests;
 #[cfg(test)]
 mod hive_tests;
 /// FR-102 P3 — the install trace: the token ledger (AC11), the fetch
