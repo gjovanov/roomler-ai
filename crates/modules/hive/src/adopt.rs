@@ -251,6 +251,7 @@ async fn decide(
         updated_at: now,
         ended_at: None,
         brain_rev: None,
+        vault_role: None,
         origin: SessionOrigin::Adopted,
         // Placed nowhere: an adopted session stays where it was adopted
         // until P2f makes it a managed one.

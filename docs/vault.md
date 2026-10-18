@@ -9,9 +9,9 @@ People use it too.
 > Spec, steps and the field log: [`fr/FR-90-hive-agent-sessions.md`](fr/FR-90-hive-agent-sessions.md)
 > §3e (#1827). The whole design (roles, Cedar policies, leases, the modes a
 > session gets a secret in) is [`roomler-hive-design.md`](roomler-hive-design.md)
-> §8. **This page describes what is built: P3-1, the store, and P3-2a, roles
-> and Cedar policies (§7).** No device and no session reaches a value yet, and
-> no session assumes a role yet (P3-2b).
+> §8. **This page describes what is built: P3-1, the store; P3-2a, roles and
+> Cedar policies (§7); and P3-2b, a session's role, decided at its start and
+> at every move (§8).** No device and no session reaches a value yet.
 
 ## 1. Custody: who can read a secret
 
@@ -190,6 +190,7 @@ All under `/api/tenant/{tenant_id}/vault`, for the organization's
 | GET · POST | `/policy` | P3-2a — the guardrails, then the organization's policies; add one `{name, description?, text}` | no | `policy:write` · `policy_create` |
 | GET · PUT · DELETE | `/policy/{id}` | P3-2a — one policy; replace it `{…, rev}` from the revision read (**409** if it moved); tombstone it. A `guardrail:*` id is **400** for both writes | no | `policy:write` · `policy_update` / `policy_delete` |
 | POST | `/simulate` | P3-2a — decide a request as the vault would, and say which policies decided it; `with` / `without` for a change not yet made | no | — (decides nothing for real) |
+| POST | `/simulate/replay` | P3-2b — `{with?, without?, days?}`: the last 1 to 7 days of recorded Cedar decisions decided again under the change; `{replayed, unreadable, flipped, flips[…], truncated}` | no | — (decides nothing for real) |
 
 > [!WARNING]
 > **No route answers a value.** In P3-1 a value goes in through `PUT …/value`
@@ -273,17 +274,85 @@ decided it: the permits that allowed it, the forbid or guardrail that denied
 it, or nothing (the default deny). With `with` (policies as if added, each
 checked as a write) and `without` (stored policies as if deleted, never a
 guardrail), it answers for a change before it is made. It decides nothing for
-real and records nothing. Replaying a change against the last 7 days of
-recorded decisions waits for P3-2b, the first step that records a Cedar
-decision.
+real and records nothing. **`simulate/replay`** (P3-2b) takes the same
+`with` / `without` and decides the last 1 to 7 days of recorded Cedar decisions
+again. Each one is decided with the request as it was then: the groups, the
+device, the mode. It answers the ones that would come out the other way, and
+counts the rows it cannot read rather than guessing at them.
 
-## 8. Audit
+## 8. A session's role (P3-2b)
+
+A session takes a role at its start, as an option on the start
+(`{device_id, folder, role}`). The vault decides it with the `role:assume`
+policies, for the starter, on that device. A session that started with no role
+holds none, and nothing in the vault is allowed it.
+
+```mermaid
+sequenceDiagram
+    participant B as the person's browser
+    participant H as hive (the session's owner)
+    participant C as core's hook registry
+    participant V as vault (SessionGate)
+    B->>H: POST …/hive/session {device_id, folder, role}
+    H->>H: the start's own gates (membership, HIVE_RUN, the device)
+    H->>C: session_gate()
+    alt no gate: the vault is not mounted
+        C-->>H: none
+        H-->>B: refused · vault_unavailable
+    else
+        C-->>H: the vault's gate
+        H->>V: role_assume {user, role, device {os, tags, owner}, purpose}
+        V->>V: Cedar role:assume, then RECORD the decision with its request
+        V-->>H: allow / deny
+        H-->>B: allow: the record holds vault_role, the device is sent the start
+        H-->>B: deny: refused · role_refused (nothing made, nothing sent)
+    end
+```
+
+**Hive never calls the vault.** The module graph has `vault → hive`, so hive
+asks through core's hook registry: [`SessionGate`](../crates/core/src/hooks.rs),
+which only the vault registers ([`gate.rs`](../crates/modules/vault/src/gate.rs)).
+Hive's side is [`vault_gate.rs`](../crates/modules/hive/src/vault_gate.rs).
+
+| When | Who is asked about | The device in the question | Refused as |
+|---|---|---|---|
+| a start that names a role | the starter | the device it starts on | `role_refused` · `vault_unavailable` · `role_undecided` |
+| a promote or a teleport of a session with a role | the person moving it | the device it moves **to** | the same, on the move's answer |
+| a fork of a session with a role | the person forking it | the device the fork runs on | the same, on the fork's answer |
+
+> [!WARNING]
+> - **A role is decided with its device, again at every move.** A policy may
+>   say "on a build box only". A session that moved with its role unchecked
+>   would carry the build box's powers to a laptop.
+> - **No vault is a refusal, never a pass.** A start or a move that names a
+>   role is refused when no vault is mounted to decide it.
+> - **The decision is recorded before it is answered.** A decision the vault
+>   cannot record is `role_undecided`, and the session does not start or move.
+
+What the gate answers:
+
+| The ask | Answer, and the reason recorded |
+|---|---|
+| the vault does not serve the organization | deny · `not_served` |
+| the role is not one of its live roles | deny · `unknown_role` |
+| the device's `os` is not a spelling the rows store | deny · `device: …` |
+| otherwise | Cedar's `role:assume`: the policies that decided it, or `default_deny` |
+
+Every decision is a `vault_audit` row with `action: role:assume`, `op` the
+purpose (`start` · `promote` · `teleport` · `fork`), `target: role:<name>`,
+the session and the device, and the **request** exactly as it was decided. A
+fork's row names the session it forks, because the fork has no id until it is
+made. `simulate/replay` decides those requests again.
+
+## 9. Audit
 
 `vault_audit` holds every `secret:*` and `vault:verify` decision, allow and
 deny. Each row has the principal (`user` in P3-1), the action as a policy
 names it, the operation, the decision and its reason (`administrator` or
 `not_administrator`), and the RRN, field and version number where there is
-one. Rows expire after 90 days, like the other audits.
+one. P3-2a adds every `policy:write` (a role's or a policy's), with its
+`target`. P3-2b adds every `role:assume` (§8), with the session, the device
+and the request it decided. Rows expire after 90 days, like the other audits.
 
 - **An allow is recorded before it is acted on, and fails closed.** A decision
   the vault cannot record is answered 500 and not acted on.
@@ -297,7 +366,7 @@ one. Rows expire after 90 days, like the other audits.
   that may be compromised. From P3-3 it goes to `vault_activity`, never here,
   as `ssh_audit` and `ssh_activity` are kept apart.
 
-## 9. Collections
+## 10. Collections
 
 | Collection | One row per | Indexes | Retention |
 |---|---|---|---|
@@ -307,11 +376,10 @@ one. Rows expire after 90 days, like the other audits.
 | `vault_roles` | vault role (P3-2a) | unique `(tenant_id, name)` over live rows | tombstoned, kept |
 | `vault_policies` | policy (P3-2a): one Cedar statement, its effect, a revision | unique `(tenant_id, name)` over live rows; `(tenant_id, deleted_at, created_at)` | tombstoned, kept |
 
-## 10. What comes next
+## 11. What comes next
 
 | Step | Builds |
 |---|---|
-| P3-2b | `role:assume` at a session's start, decided again whenever a session moves to another device; Cedar decisions recorded with their request, so `simulate` can replay a change against the last 7 days |
 | P3-3 | the device's own X25519 vault key, leases (requested, revoked by a push and by TTL, bound to the fence), a value sealed to the device and held in daemon memory, `vault_activity` |
 | P3-4 | the toolbelt's vault tools and the approval card a policy can ask for |
 | P3-5 to P3-9 | `proxy` mode, `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |

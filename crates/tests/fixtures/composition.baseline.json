@@ -977,6 +977,10 @@
       "methods": "POST"
     },
     {
+      "path": "/api/tenant/{tenant_id}/vault/simulate/replay",
+      "methods": "POST"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/vault/verify",
       "methods": "POST"
     },
