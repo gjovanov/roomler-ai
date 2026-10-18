@@ -466,6 +466,13 @@ struct FakeVault {
     /// P3-4c-2 — each file a tool attached to a lease.
     #[cfg(feature = "vault")]
     attached: std::sync::Mutex<Vec<(String, std::path::PathBuf)>>,
+    /// P3-4c-3 — each lease's time left (the TTL it was asked for, unless a
+    /// test shortens it), and the leases asked for ahead: (id, handle, mode,
+    /// audience).
+    #[cfg(feature = "vault")]
+    lefts: std::sync::Mutex<HashMap<String, Duration>>,
+    #[cfg(feature = "vault")]
+    ahead: std::sync::Mutex<Vec<(String, String, String, String)>>,
 }
 
 impl FakeVault {
@@ -486,11 +493,7 @@ impl VaultTools for FakeVault {
         audience: &str,
         ttl_secs: u32,
     ) -> Result<String, String> {
-        let key = if handle.field.is_empty() {
-            handle.secret.clone()
-        } else {
-            format!("{}#{}", handle.secret, handle.field)
-        };
+        let key = handle.to_string();
         self.asked.lock().unwrap().push((
             format!("lease_{mode}"),
             session,
@@ -506,7 +509,69 @@ impl VaultTools for FakeVault {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let id = format!("L{n}");
         self.held.lock().unwrap().insert(id.clone(), value.clone());
+        self.lefts
+            .lock()
+            .unwrap()
+            .insert(id.clone(), Duration::from_secs(u64::from(ttl_secs)));
         Ok(id)
+    }
+
+    #[cfg(feature = "vault")]
+    async fn lease_ahead(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        handle: &super::super::vault_exec::Handle,
+        mode: &str,
+        audience: &str,
+        ttl_secs: u32,
+    ) -> Result<String, String> {
+        let leased = self
+            .lease(session, fence, handle, mode, audience, ttl_secs)
+            .await;
+        if let Some(last) = self.asked.lock().unwrap().last_mut() {
+            last.0 = format!("ahead_{mode}");
+        }
+        let id = leased?;
+        self.ahead.lock().unwrap().push((
+            id.clone(),
+            handle.to_string(),
+            mode.into(),
+            audience.into(),
+        ));
+        Ok(id)
+    }
+
+    #[cfg(feature = "vault")]
+    fn ahead(
+        &self,
+        _session: ObjectId,
+        _fence: u64,
+        handle: &super::super::vault_exec::Handle,
+        mode: &str,
+        audience: &str,
+        at_least: Duration,
+    ) -> Option<String> {
+        let key = handle.to_string();
+        self.ahead
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, h, m, a)| {
+                *h == key
+                    && m == mode
+                    && a == audience
+                    && self.left(id).is_some_and(|l| l >= at_least)
+            })
+            .map(|(id, ..)| id.clone())
+    }
+
+    #[cfg(feature = "vault")]
+    fn left(&self, lease_id: &str) -> Option<Duration> {
+        if !self.held.lock().unwrap().contains_key(lease_id) {
+            return None;
+        }
+        self.lefts.lock().unwrap().get(lease_id).copied()
     }
 
     #[cfg(feature = "vault")]
@@ -613,9 +678,10 @@ async fn the_vault_tools_are_offered_only_where_the_device_takes_leases() {
     let tools = list["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names[..3], ["approve", "vault_list", "vault_describe"]);
-    // P3-4c-1 — and, in a build with the vault, its one use.
+    // P3-4c — and, in a build with the vault, its uses and (P3-4c-3) a
+    // lease asked for ahead.
     #[cfg(feature = "vault")]
-    assert_eq!(names[3..], ["vault_exec", "vault_render"]);
+    assert_eq!(names[3..], ["vault_exec", "vault_render", "vault_request"]);
     #[cfg(not(feature = "vault"))]
     assert_eq!(names.len(), 3);
     for t in &tools[1..3] {
@@ -1092,6 +1158,232 @@ async fn a_refused_render_writes_nothing() {
     assert!(!dir.path().join("run").join("secrets").join("out").exists());
     assert_eq!(*vault.released.lock().unwrap(), ["L0"]);
     assert!(vault.attached.lock().unwrap().is_empty());
+}
+
+/// P3-4c-3 — `vault_request` is offered with the reads and allowed like
+/// them; it asks a lease ahead and answers the lease, never a value; a
+/// refusal answers why.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn vault_request_asks_a_lease_ahead_and_answers_no_value() {
+    // Made at runtime: a literal beside `password` reads as one to a scanner.
+    let value = format!("ahead-{}", 11);
+    let vault = Arc::new(FakeVault {
+        values: [("db/main#password".to_string(), value.clone().into_bytes())].into(),
+        ..FakeVault::default()
+    });
+    let sid = ObjectId::new();
+    let b = belt_running(
+        me(),
+        Run {
+            session: sid,
+            fence: 1,
+            vault: Some(vault.clone()),
+            exec: None,
+        },
+        quick(),
+    );
+    let mut c = Client::connect(&b).await;
+    c.send(json!({"method": "tools/list", "jsonrpc": "2.0", "id": 1}))
+        .await;
+    let list = c.recv().await;
+    let request = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "vault_request")
+        .expect("offered")
+        .clone();
+    assert_eq!(
+        request["inputSchema"]["required"],
+        json!(["handle", "mode", "audience"])
+    );
+    let allowed: Vec<String> = VAULT_AHEAD_NAMES
+        .iter()
+        .map(|n| format!("mcp__roomler__{n}"))
+        .collect();
+    assert_eq!(allowed, VAULT_AHEAD_TOOLS, "allowed is what is offered");
+    assert!(!VAULT_USE_TOOLS.contains(&VAULT_AHEAD_TOOLS[0]));
+    c.send(tool_call(
+        2,
+        "vault_request",
+        json!({"handle": "db/main#password", "mode": "exec", "audience": "psql", "ttl_s": 600}),
+    ))
+    .await;
+    let m = c.recv().await;
+    assert!(m["result"].get("isError").is_none(), "{m}");
+    assert!(!m.to_string().contains(&value), "no value: {m}");
+    let answer: Value =
+        serde_json::from_str(m["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        answer,
+        json!({"lease_id": "L0", "handle": "db/main#password", "mode": "exec",
+               "audience": "psql", "ttl_s": 600})
+    );
+    assert_eq!(
+        vault.asked(),
+        [(
+            "ahead_exec".to_string(),
+            sid,
+            1,
+            "db/main#password for psql 600s".to_string()
+        )]
+    );
+    assert!(vault.released.lock().unwrap().is_empty(), "kept");
+    c.send(tool_call(
+        3,
+        "vault_request",
+        json!({"handle": "db/missing", "mode": "file", "audience": "db.env"}),
+    ))
+    .await;
+    let m = c.recv().await;
+    assert_eq!(m["result"]["isError"], true, "{m}");
+    assert_eq!(
+        m["result"]["content"][0]["text"],
+        "db/missing: the vault refused: no_secret"
+    );
+}
+
+/// P3-4c-3 — `vault_exec` takes a lease asked for ahead for its program
+/// instead of asking, and keeps it; one that would end during the command
+/// is not taken, and the call then asks and lets go of its own.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn vault_exec_takes_a_lease_asked_for_ahead_and_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    // Made at runtime: a literal beside `password` reads as one to a scanner.
+    let value = format!("ahead-{}", 42);
+    let (b, vault, sid) = exec_belt(dir.path(), &[("db/main#password", value.as_bytes())]);
+    let mut c = Client::connect(&b).await;
+    c.send(tool_call(
+        1,
+        "vault_request",
+        json!({"handle": "db/main#password", "mode": "exec", "audience": "sh", "ttl_s": 600}),
+    ))
+    .await;
+    assert!(c.recv().await["result"].get("isError").is_none());
+    let run = json!({
+        "argv": ["sh", "-c", "printf '%s' \"$PW\""],
+        "env": {"PW": "db/main#password"},
+    });
+    let answer = exec_answer(&mut c, 2, run.clone()).await.unwrap();
+    assert_eq!(answer["stdout"], "[vault:PW]", "{answer}");
+    assert_eq!(
+        vault.asked(),
+        [(
+            "ahead_exec".to_string(),
+            sid,
+            5,
+            "db/main#password for sh 600s".to_string()
+        )],
+        "taken: nothing asked again"
+    );
+    assert!(vault.released.lock().unwrap().is_empty(), "kept");
+    // Ending within the command's 60 s: not taken.
+    vault
+        .lefts
+        .lock()
+        .unwrap()
+        .insert("L0".into(), Duration::from_secs(5));
+    let answer = exec_answer(&mut c, 3, run).await.unwrap();
+    assert_eq!(answer["stdout"], "[vault:PW]", "{answer}");
+    assert_eq!(vault.asked()[1].0, "lease_exec");
+    assert_eq!(
+        *vault.released.lock().unwrap(),
+        ["L1"],
+        "its own let go, the one asked for ahead kept"
+    );
+}
+
+/// P3-4c-3 — `vault_render` takes a lease asked for ahead toward its file,
+/// asks for the rest, and its file lives until the first of them ends; a
+/// lease asked for ahead toward another file is not taken.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn vault_render_takes_a_lease_asked_for_ahead_toward_its_file() {
+    let dir = tempfile::tempdir().unwrap();
+    // Made at runtime: a literal beside `password` reads as one to a scanner.
+    let pass = format!("render-{}", 78);
+    let (b, vault, _) = exec_belt(
+        dir.path(),
+        &[
+            ("db/main#user", b"app-user-02"),
+            ("db/main#password", pass.as_bytes()),
+        ],
+    );
+    let mut c = Client::connect(&b).await;
+    c.send(tool_call(
+        1,
+        "vault_request",
+        json!({"handle": "db/main#user", "mode": "file", "audience": "db.env", "ttl_s": 600}),
+    ))
+    .await;
+    assert!(c.recv().await["result"].get("isError").is_none());
+    c.send(tool_call(
+        2,
+        "vault_render",
+        json!({
+            "template": "user={{ db/main#user }}\npass={{ db/main#password }}\n",
+            "dest": "db.env",
+            "ttl_s": 60,
+        }),
+    ))
+    .await;
+    let m = c.recv().await;
+    assert!(m["result"].get("isError").is_none(), "{m}");
+    let answer: Value =
+        serde_json::from_str(m["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(answer["ttl_s"], 60, "until the first of its leases ends");
+    let path = PathBuf::from(answer["path"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        format!("user=app-user-02\npass={pass}\n").into_bytes()
+    );
+    let kinds: Vec<String> = vault.asked().into_iter().map(|a| a.3).collect();
+    assert_eq!(
+        kinds,
+        [
+            "db/main#user for db.env 600s",
+            "db/main#password for db.env 60s"
+        ],
+        "the user's taken, only the password asked for"
+    );
+    assert_eq!(
+        *vault.attached.lock().unwrap(),
+        [("L0".to_string(), path.clone()), ("L1".to_string(), path)]
+    );
+    assert!(vault.released.lock().unwrap().is_empty(), "both kept");
+    // A file from the lease asked for ahead alone lives as long as it.
+    let render = |id: u64, dest: &str| {
+        tool_call(
+            id,
+            "vault_render",
+            json!({"template": "{{ db/main#user }}", "dest": dest, "ttl_s": 60}),
+        )
+    };
+    c.send(render(3, "db.env")).await;
+    let m = c.recv().await;
+    let answer: Value =
+        serde_json::from_str(m["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(answer["ttl_s"], 600, "as long as the lease it took: {m}");
+    assert_eq!(vault.asked().len(), 2, "taken: nothing asked");
+    // One that would end before the file is asked to: not taken.
+    vault
+        .lefts
+        .lock()
+        .unwrap()
+        .insert("L0".into(), Duration::from_secs(30));
+    c.send(render(4, "db.env")).await;
+    assert!(c.recv().await["result"].get("isError").is_none());
+    assert_eq!(vault.asked()[2].3, "db/main#user for db.env 60s");
+    // Nor one asked for ahead toward another file.
+    c.send(render(5, "other.env")).await;
+    assert!(c.recv().await["result"].get("isError").is_none());
+    assert_eq!(
+        vault.asked()[3].3,
+        "db/main#user for other.env 60s",
+        "asked for afresh toward another file"
+    );
 }
 
 /// More open approvals than Claude Code ever asks for, and a question the
