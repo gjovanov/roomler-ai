@@ -339,9 +339,9 @@ Which Windows column applies is the server's decision per grant, recorded in
 The mode means what it means on Windows: the person signed in at the device's own
 screen, and nobody else. The agent finds them at each session, then takes the drop
 a `named` account takes (`unix_priv::drop_to_console`,
-[`exec.rs:1355`](../agents/roomlerd/src/exec.rs#L1355)). Exec, the pty and `sftp`
+[`exec.rs:1404`](../agents/roomlerd/src/exec.rs#L1404)). Exec, the pty and `sftp`
 all go through `apply_run_as`
-([`exec.rs:802`](../agents/roomlerd/src/exec.rs#L802)), so one rule covers all
+([`exec.rs:807`](../agents/roomlerd/src/exec.rs#L807)), so one rule covers all
 three.
 
 ```mermaid
@@ -418,6 +418,13 @@ could not write to.
 - Kill switch: `ROOMLERD_SSH_START_IN_HOME=0` puts the old start back. On a
   SystemContext Windows device, set it in the service's environment
   (`roomlerd set-service-env-var`), as for `ROOMLERD_SFTP_AS_USER`.
+
+Field-proven 2026-10-18 on candidates (FR-97 §8). On a Linux root daemon, `named`
+and `console_user` sessions started in `/home/wlab`, where the release had started
+them in `/`, and a relative `sftp put` landed there instead of failing. `nobody`,
+whose home does not exist, ran from `/`. On a Windows SystemContext guest, a
+`console_user` command and shell started in `C:\Users\vmtest`, not System32. The
+kill switch put both back.
 
 **Both paths obey this, and it took a fix to make that true.** A grant carries
 the policy's `account_mode`. A key-list session has no policy behind it, so it
@@ -889,7 +896,7 @@ flowchart TD
 ```
 
 ⚠️ **Windows `console_user` takes `exec`'s console-user spawn** (FR-97 P4b,
-`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:902`).
+`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:937`).
 `tokio::process` cannot take a token, so the subsystem goes through
 `supervisor::spawn_in_session_captured`, the piped `CreateProcessAsUserW` spawn
 P5b built and FR-89 made streaming. Three details differ from a shell command
