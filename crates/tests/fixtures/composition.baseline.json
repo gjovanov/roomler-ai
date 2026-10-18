@@ -953,6 +953,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/tenant/{tenant_id}/vault/activity",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/vault/audit",
       "methods": "GET,HEAD"
     },
@@ -3032,6 +3036,35 @@
             "key": {
               "created_at": 1
             }
+          }
+        ]
+      },
+      {
+        "collection": "vault_activity",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "session_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "lease_ids": 1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
           }
         ]
       },
@@ -5173,6 +5206,35 @@
         ]
       },
       {
+        "collection": "vault_activity",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "session_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "lease_ids": 1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
         "collection": "vault_audit",
         "indexes": [
           {
@@ -5382,6 +5444,7 @@
     "rc:vault.lease",
     "rc:vault.list",
     "rc:vault.describe",
+    "rc:vault.activity",
     "rc:sdp.answer",
     "rc:consent",
     "rc:consent.pending",
@@ -5581,6 +5644,7 @@
     "rc:tunnel.udp.closed": "network",
     "rc:tunnel.udp.reject": "network",
     "rc:tunnel.udp.request": "network",
+    "rc:vault.activity": "vault",
     "rc:vault.describe": "vault",
     "rc:vault.lease": "vault",
     "rc:vault.list": "vault"

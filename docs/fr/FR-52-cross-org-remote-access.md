@@ -141,7 +141,7 @@ never consulted, and never leak that they exist.
 | 5 | Host consent | whoever is at the machine | The existing `ConsentMode` path, resolved from `external_consent_mode` rather than `AccessPolicy.consent_mode` (`crates/remote_control/src/models.rs:1367`), defaulting to `Prompt`. |
 
 Gate 5 needs one wire addition: the prompt must say the controller is **outside the
-organization**. `ServerMsg::Request` (`crates/remote_control/src/signaling.rs:2625`)
+organization**. `ServerMsg::Request` (`crates/remote_control/src/signaling.rs:2663`)
 carries `tenant_name` for the multi-org case, which answers *which* org is asking —
 not whether the asker is in one at all. A `controller_scope: external` field is
 additive and serde-defaulted, so older agents keep today's prompt text; a device

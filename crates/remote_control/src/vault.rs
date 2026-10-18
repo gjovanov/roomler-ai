@@ -17,6 +17,11 @@
 //! P3-3c — the server takes a lease back with `rc:vault.revoke`: the leases
 //! it names, and one word for why ([`RevokeReason`]). A device drops every
 //! lease the frame names, whatever the word, one it cannot name included.
+//!
+//! P3-4d — a device reports what it did with leased values in
+//! `rc:vault.activity` ([`VaultActivityKind`]): a claim the server keeps
+//! apart from its decisions, and drops unless every lease it names was
+//! released to that device, for that session, in that mode and audience.
 
 /// Bounds on a lease request, read by both ends: the server refuses past
 /// them (`bad_request`), and a device never asks past them.
@@ -52,6 +57,13 @@ pub mod lease_limits {
     pub const MAX_LISTED: usize = 200;
     /// P3-4c — the longest program name `exec_allow` holds.
     pub const MAX_PROGRAM_LEN: usize = 64;
+    /// P3-4d — the leases one `rc:vault.activity` names at most: the most
+    /// values one use hands on.
+    pub const MAX_ACTIVITY_LEASES: usize = 8;
+    /// P3-4d — the reports one session may make on its device per minute.
+    /// Past it the server drops them: a report is a claim, and a flood of
+    /// claims is not worth a flood of rows.
+    pub const ACTIVITY_PER_MINUTE: u32 = 120;
 }
 
 /// P3-4c — a program's BARE name, as `exec_allow` holds it and as a device
@@ -245,6 +257,47 @@ impl RevokeReason {
     }
 }
 
+/// P3-4d — what a device reports it did with leased values
+/// (`rc:vault.activity`). A CLAIM, by a host that may be compromised: the
+/// server keeps it in `vault_activity`, apart from its own decisions in
+/// `vault_audit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultActivityKind {
+    /// `vault_exec` ran a command with the values: the target is the program,
+    /// and the report says how the command ended.
+    Exec,
+    /// `vault_render` wrote a file with the values: the target is its name.
+    Render,
+}
+
+impl VaultActivityKind {
+    /// Exactly what crosses the wire. ⚠️ A compatibility surface, locked by
+    /// test.
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Exec => "exec",
+            Self::Render => "render",
+        }
+    }
+
+    pub const ALL: [VaultActivityKind; 2] = [Self::Exec, Self::Render];
+
+    /// The lease mode a use of this kind takes: a report must name leases
+    /// released in it.
+    pub const fn mode(self) -> &'static str {
+        match self {
+            Self::Exec => "exec",
+            Self::Render => "file",
+        }
+    }
+
+    /// Parse a report's kind. `None` for a word this build cannot name: the
+    /// server drops such a report, as an additive wire asks.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.wire() == s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +329,21 @@ mod tests {
             assert_eq!(LeaseRefusal::from_wire(r.wire()), Some(r));
         }
         assert_eq!(LeaseRefusal::from_wire("from_a_newer_server"), None);
+    }
+
+    /// P3-4d — spelled out literally, so a rename is a deliberate edit here;
+    /// each kind names the lease mode its use takes.
+    #[test]
+    fn activity_kinds_are_locked_and_name_their_mode() {
+        let words: Vec<(&str, &str)> = VaultActivityKind::ALL
+            .iter()
+            .map(|k| (k.wire(), k.mode()))
+            .collect();
+        assert_eq!(words, [("exec", "exec"), ("render", "file")]);
+        for k in VaultActivityKind::ALL {
+            assert_eq!(VaultActivityKind::from_wire(k.wire()), Some(k));
+        }
+        assert_eq!(VaultActivityKind::from_wire("teleport"), None);
     }
 
     #[test]

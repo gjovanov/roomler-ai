@@ -13,7 +13,9 @@
 //! RRNs ([`rrn`]), every decision recorded in `vault_audit` — and an
 //! administrator's metadata routes ([`routes`]), none of which answers a
 //! value. Roles and Cedar policies (P3-2), a device's leases (P3-3) and the
-//! session's tools (P3-4) are built on it.
+//! session's tools (P3-4) are built on it. A device's own report of using a
+//! lease (P3-4d) is kept apart, in `vault_activity`: a claim, never one of
+//! the vault's decisions.
 //!
 //! The module's switch defaults OFF (`[modules] vault`), and a
 //! `vault.tenants` list both switches it on and limits it to the
@@ -65,6 +67,10 @@ pub struct VaultState {
     pub lease_limiter: Arc<roomler_core::rate_limit::RateLimiter>,
     /// P3-3c — this pod's devices' connections, and which hold live leases.
     pub revoker: Arc<revoke::Revoker>,
+    /// P3-4d — what devices report doing with their leases, and each
+    /// session's reports per minute on its device.
+    pub activity: Arc<dao::VaultActivityDao>,
+    pub activity_limiter: Arc<roomler_core::rate_limit::RateLimiter>,
     /// The organizations the vault serves (`vault.tenants`).
     pub scope: Arc<scope::TenantScope>,
     /// The KEK, or why there is none: read once at boot.
@@ -115,6 +121,8 @@ impl Module for VaultState {
             agents: Arc::new(roomler_ai_services::dao::agent::AgentDao::new(db)),
             lease_limiter: Arc::new(roomler_core::rate_limit::RateLimiter::new()),
             revoker: Arc::new(revoke::Revoker::default()),
+            activity: Arc::new(dao::VaultActivityDao::new(db)),
+            activity_limiter: Arc::new(roomler_core::rate_limit::RateLimiter::new()),
             scope: Arc::new(scope),
             kek,
             core,
@@ -180,6 +188,8 @@ impl Module for VaultState {
             .route("/tenant/{tenant_id}/vault", get(routes::status))
             .route("/tenant/{tenant_id}/vault/verify", post(routes::verify))
             .route("/tenant/{tenant_id}/vault/audit", get(routes::audit))
+            // P3-4d — what devices report doing with their leases.
+            .route("/tenant/{tenant_id}/vault/activity", get(routes::activity))
             .route(
                 "/tenant/{tenant_id}/vault/schema",
                 get(policy_routes::schema),
@@ -290,6 +300,19 @@ impl Module for VaultState {
                     // its hello), and a changed secret's.
                     index(bson::doc! { "device_id": 1, "expires_at": 1 }),
                     index(bson::doc! { "secret_id": 1, "expires_at": 1 }),
+                ],
+            },
+            // P3-4d — what devices report doing with their leases: claims,
+            // kept 90 days like the decisions they are kept apart from. The
+            // organization's newest, one session's, and those naming a lease.
+            IndexSet {
+                collection: model::VaultActivity::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index(bson::doc! { "tenant_id": 1, "at": -1 }),
+                    index(bson::doc! { "tenant_id": 1, "session_id": 1, "at": -1 }),
+                    index(bson::doc! { "lease_ids": 1 }),
+                    index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
                 ],
             },
         ]
