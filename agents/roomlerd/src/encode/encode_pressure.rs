@@ -192,7 +192,10 @@ impl FpsPace {
         let pace_for = |fps: f32| {
             let quantized = (fps.max(0.0) as u32 / 5) * 5;
             if quantized + 5 <= target_fps {
-                Some(quantized.clamp(FPS_PACE_MIN, target_fps))
+                // A target under the floor (a `ROOMLERD_FFMPEG_FPS` pin of
+                // 5–14) floors at the target: `clamp` panics when its min
+                // exceeds its max.
+                Some(quantized.clamp(FPS_PACE_MIN.min(target_fps), target_fps))
             } else {
                 None
             }
@@ -242,17 +245,35 @@ pub struct SoftwarePace {
 }
 
 /// FR-112 P2d — how far past a higher step (fps) a software encoder's
-/// estimate must reach before its pace moves up to it. Half a step: wider
-/// than a settled session's wobble (the Asahi host's windows vary by under
-/// 10 %, which the EWMA turns into under ±2 fps at 50), narrower than a step,
-/// so a recovering encoder still climbs.
+/// estimate must reach before its pace moves up to it. Half a step, narrower
+/// than a step so a recovering encoder still climbs. An EWMA that swings less
+/// than this across a step boundary no longer moves the pace; a wider swing
+/// still can: the field trace's settled windows moved it by up to ±3.4 fps, and
+/// one reversal survives there, three windows apart. The cost: an encoder that
+/// sustains a step plus less than the margin runs a step lower after a dip
+/// (55, not 60, at 60–62.5 fps).
 pub const SW_PACE_UP_MARGIN_FPS: f32 = 2.5;
 
-/// [`SW_PACE_UP_MARGIN_FPS`], or `ROOMLERD_SW_PACE_UP_MARGIN` (0–10; `0`
-/// restores 0.4.142's pace, which steps up as soon as it steps down).
+/// [`SW_PACE_UP_MARGIN_FPS`], or `ROOMLERD_SW_PACE_UP_MARGIN` (0–10; `0`,
+/// `false`, `off` or `no` restores 0.4.142's pace, which steps up as soon as
+/// it steps down).
 fn sw_pace_up_margin() -> f32 {
-    node_env("SW_PACE_UP_MARGIN")
-        .and_then(|v| v.trim().parse::<f32>().ok())
+    parse_sw_pace_up_margin(node_env("SW_PACE_UP_MARGIN").as_deref())
+}
+
+/// [`sw_pace_up_margin`] without the environment, which other tests read
+/// concurrently. Anything unreadable is the default, as with every knob here.
+fn parse_sw_pace_up_margin(value: Option<&str>) -> f32 {
+    let Some(value) = value.map(str::trim) else {
+        return SW_PACE_UP_MARGIN_FPS;
+    };
+    // The spellings of "off" the other switches here accept.
+    if matches!(value.to_ascii_lowercase().as_str(), "false" | "off" | "no") {
+        return 0.0;
+    }
+    value
+        .parse::<f32>()
+        .ok()
         .filter(|v| v.is_finite() && *v >= 0.0)
         .map(|v| v.min(10.0))
         .unwrap_or(SW_PACE_UP_MARGIN_FPS)
@@ -593,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn pace_engages_quantized_and_holds_with_hysteresis() {
+    fn pace_engages_quantized_in_whole_steps() {
         let mut p = pace();
         // Fast encoder (10 ms → 100 fps sustainable) → no pacing at 60.
         assert_eq!(p.observe(10.0, 60), None);
@@ -702,6 +723,36 @@ mod tests {
             assert_eq!(p.observe(ms(f), 60), old, "at {f} fps");
         }
         assert_eq!(old, Some(30));
+    }
+
+    /// A target under the floor (an operator's 5–14 fps pin on the hardware
+    /// pump) with an encode slower than it: `clamp(15, target)` panicked and
+    /// took the session's pump down. Found in FR-112 P2d's review; older than
+    /// FR-112.
+    #[test]
+    fn a_target_under_the_floor_paces_at_the_target() {
+        assert_eq!(pace().observe(200.0, 10), Some(10));
+        assert_eq!(margin_pace().observe(200.0, 14), Some(14));
+        assert_eq!(pace().observe(200.0, 15), Some(FPS_PACE_MIN));
+    }
+
+    /// FR-112 P2d — the margin's switch reads "off" as every other switch here
+    /// does, and anything unreadable is the default.
+    #[test]
+    fn the_margin_switch_reads_off_like_the_others() {
+        assert_eq!(parse_sw_pace_up_margin(None), SW_PACE_UP_MARGIN_FPS);
+        for off in ["0", "false", "off", "no", " OFF ", "0.0"] {
+            assert_eq!(parse_sw_pace_up_margin(Some(off)), 0.0, "{off:?}");
+        }
+        assert_eq!(parse_sw_pace_up_margin(Some("4")), 4.0);
+        assert_eq!(parse_sw_pace_up_margin(Some("25")), 10.0, "capped");
+        for junk in ["-1", "NaN", "inf", "two", ""] {
+            assert_eq!(
+                parse_sw_pace_up_margin(Some(junk)),
+                SW_PACE_UP_MARGIN_FPS,
+                "{junk:?}"
+            );
+        }
     }
 
     #[test]

@@ -170,9 +170,12 @@ flowchart LR
   55 → 50 → 55 → 50 → 45 → 50, five moves in ten windows. The software pace now steps down at once (a pace the encoder
   cannot hold is the judder pacing exists to remove) and up only when the estimate clears the higher step by
   2.5 fps (`SW_PACE_UP_MARGIN_FPS`, `encode/encode_pressure.rs`; `ROOMLERD_SW_PACE_UP_MARGIN=0` restores 0.4.142's
-  pace). Half a step is wider than a settled session's wobble (under ±2 fps at 50) and narrower than a step, so a
-  recovering encoder still climbs. The hardware pace keeps margin 0. It has the same flaw, but on hardware the
-  margin costs an encoder that sustains 60–62.5 fps a 5-fps step, and that trade is measured on a hardware host
+  pace). Half a step is narrower than a step, so a recovering encoder still climbs. It absorbs an EWMA that swings
+  less than that across a step boundary, but not every swing: the trace's settled windows moved the EWMA by up to
+  ±3.4 fps, and one reversal survives there, three windows apart (the unit test's 8 moves). The 2-moves-in-40-s
+  candidate arms (§9) are the evidence, not this sizing argument. The margin has a cost: after a dip, an encoder
+  that sustains 60–62.5 fps runs at 55 instead of 60. The hardware pace keeps margin 0. It has the same flaw, but
+  on hardware that cost lands on an encoder whose whole point is 60, so the trade is measured on a hardware host
   first ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)).
 - **Never below 0.4.141.** A software pump is never paced below 30, the target it had
   (`RateGovernor::paced_software_fps`, `SW_PACE_FLOOR_FPS`). A host that cannot sustain 30 then runs exactly as
