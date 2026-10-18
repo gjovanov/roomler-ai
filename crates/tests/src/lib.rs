@@ -253,6 +253,11 @@ mod vault_key_tests;
 /// facts from its row, recorded before they are sent.
 #[cfg(test)]
 mod vault_lease_tests;
+/// FR-90 P3-3c — revocation: a session's end or move, a changed, disabled
+/// or deleted secret, a new device key, a removed device; told at once on
+/// the device's pod or at its sweep, again at every hello, never expired.
+#[cfg(test)]
+mod vault_revoke_tests;
 /// FR-90 P3-1 — the vault's store: off until turned on, administrators
 /// only and every decision recorded, no answer carrying a value, sealed
 /// bytes that do not open where they were moved, no sealing without a KEK.

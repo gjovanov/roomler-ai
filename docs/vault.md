@@ -12,8 +12,9 @@ People use it too.
 > §8. **This page describes what is built: P3-1, the store; P3-2a, roles and
 > Cedar policies (§7); P3-2b, a session's role, decided at its start and at
 > every move (§8); P3-3a, the key a device's daemon holds for the values it is
-> leased (§9); and P3-3b, the vault's half of a lease (§10).** No released
-> agent asks for a lease yet: the device's half is P3-4.
+> leased (§9); P3-3b, the vault's half of a lease (§10); and P3-3c, how the
+> vault takes a lease back (§11).** No released agent asks for a lease yet:
+> the device's half is P3-4.
 
 ## 1. Custody: who can read a secret
 
@@ -105,7 +106,7 @@ age-keygen -o kek.txt          # keep it out of every backup the database is in
   key (`PUT …/value`, `POST …/verify`) answer **503** with the reason. The
   reason is always a fixed sentence and never repeats the setting.
 - The KEK never prints. `VaultSettings`' `Debug` is written by hand
-  ([`settings.rs`](../crates/config/src/settings.rs#L96)), and so is the
+  ([`settings.rs`](../crates/config/src/settings.rs#L102)), and so is the
   KEK's ([`crypto.rs`](../crates/modules/vault/src/crypto.rs#L121)). The boot
   log names the recipient only.
 - `GET …/vault` reports `other_kek`: how many versions were wrapped to a KEK
@@ -446,6 +447,7 @@ sequenceDiagram
 | its field holding a value | `no_value` | yes |
 | a usable KEK | `unavailable` | yes |
 | Cedar's `secret:use`, the guardrails included | `denied` | yes, with the request |
+| its version not past the `expires_at` its writer gave (P3-3c) | `no_value` | yes, as `version_expired` |
 | opened, and sealed to the device's key | `unavailable` | yes |
 | the allow recorded and the lease written | `undecided` | — |
 
@@ -474,7 +476,9 @@ Each connection has its own queue (16 requests), answered in order by one
 task, so a slow decision never holds the agent socket's read loop, and one
 more request than the queue holds is answered `busy`. A TTL outside
 30 s to 900 s is clamped, and a policy reads the clamped value
-(`context.ttl_s`), so it can hold a lease shorter still.
+(`context.ttl_s`), so it can hold a lease shorter still. From P3-3c a lease
+also ends at its version's `expires_at` when that comes first, so a policy
+that read the asked TTL allowed at least what was granted.
 
 | Piece | Where |
 |---|---|
@@ -483,7 +487,77 @@ more request than the queue holds is answered `busy`. A TTL outside
 | sealing | [`crypto.rs`](../crates/modules/vault/src/crypto.rs) `seal_for_device`: libsodium's `crypto_box_seal`, a fresh ephemeral key per box |
 | the edge | `vault → hive` (`crates/core/src/graph.rs`): the session record through hive's own stateless DAO |
 
-## 11. Audit
+## 11. Revocation (P3-3c)
+
+A lease ends at its TTL, or at its version's `expires_at` when that comes
+first. The vault takes it back sooner once it stops standing, and tells the
+device on its own control connection: `rc:vault.revoke {lease_ids, reason}`.
+The device drops every lease the frame names, whatever the word (P3-4).
+
+```mermaid
+sequenceDiagram
+    participant A as an administrator · fleet's cascade
+    participant V as vault (on the device's pod)
+    participant DB as vault_leases · session record · secret · device row
+    participant D as roomlerd (the session's device)
+    alt a value written, a secret disabled or deleted, a device removed
+        A->>V: the route, or agent_removed after hive's
+        V->>DB: revoked_at + revoked_why (a compare-and-set)
+        V-->>D: rc:vault.revoke {lease_ids, reason}, at once when D is on this pod
+    else a session's end or move, a new key, the org no longer served
+        loop every vault.revoke_sweep_secs, and at each hello of D
+            V->>DB: D's unexpired leases, their sessions and secrets, D's row
+            V->>DB: revoked_at + revoked_why for each that no longer stands
+            V-->>D: rc:vault.revoke for each revoked lease it was not told of
+        end
+    end
+```
+
+| Reason | When | Told |
+|---|---|---|
+| `session_ended` | the session's record is gone, or past the statuses it is leased in: a stop was ordered, or it ended, was refused or lost | at the next sweep of the device's pod |
+| `session_moved` | the record is at another fence, or on another device | at that sweep |
+| `value_changed` | the field has a newer version | at once on the device's pod; from another pod, at that pod's next sweep |
+| `secret_disabled` · `secret_deleted` | the secret was disabled, or deleted | the same |
+| `key_changed` | the device's row holds another key than the one the value was sealed to: its daemon restarted, and the lease died with its memory | at its hello |
+| `device_removed` | the device is being removed: fleet's cascade, after hive's in `HOOK_ORDER` | at once, before its row and socket go |
+| `not_served` | the vault no longer serves the organization (`vault.tenants`) | at the next sweep or hello |
+
+> [!WARNING]
+> - **Each pod looks after the devices connected to it.** It holds their
+>   connections (the lease socket's) and checks the leases of those holding a
+>   live one every `vault.revoke_sweep_secs` (10 s by default). Nothing crosses
+>   pods: a change made on another pod writes the lease's row at once, and the
+>   device's own pod tells it at its next sweep. So revocation works with
+>   Redis down, and needs nothing from fleet's Hub.
+> - **A session is not followed, it is read again.** Hive must never call the
+>   vault (`vault → hive`), and a session ends or moves on many paths: its
+>   device's report, a stop, a purge, a promote, a teleport, a fork. Each check
+>   reads the record and asks whether the lease still stands.
+> - **No acknowledgement.** Every hello is told again of each revoked lease that
+>   has not expired, so a frame lost to a pod roll, or a device that was away,
+>   costs a repeat.
+> - **An expired lease is its own revocation**: never taken back, never told.
+> - **Told only to a build that can read the frame**: a connection whose row
+>   advertises `vault` and holds a key. An older build back on the device is
+>   not sent it, and its leases are taken back all the same (its key changed).
+> - **A removed device's leases never hold up its removal.** A failure is
+>   logged, never the cascade's refusal: a device being removed, possibly a
+>   compromised one, must not stay because the vault could not write. What it
+>   holds expires within 15 minutes whatever happens.
+> - **A version's own expiry is kept.** A version past the `expires_at` its
+>   writer gave is never released (`no_value`, recorded `version_expired`),
+>   and no lease outlives its version. P3-1 promised this of the first step to
+>   use a value; P3-3b did not keep the promise, and P3-3c does.
+
+| Piece | Where |
+|---|---|
+| the wire | `rc:vault.revoke` ([`signaling.rs`](../crates/remote_control/src/signaling.rs)); the words (`RevokeReason`) and `lease_limits::MAX_REVOKE_IDS`, 64 a frame ([`vault.rs`](../crates/remote_control/src/vault.rs)) |
+| the checks | [`revoke.rs`](../crates/modules/vault/src/revoke.rs): `verdict` (pure), `check_device`, `sweep_once`, `reconcile` at a hello, `secret_changed`, `device_removed` |
+| the connections | `Revoker` in `revoke.rs`, fed by the lease socket's lifecycle ([`lease.rs`](../crates/modules/vault/src/lease.rs)): a hello links its connection and reconciles the device, a close unlinks it unless a newer connection took over |
+| the setting | `vault.revoke_sweep_secs` (`ROOMLER__VAULT__REVOKE_SWEEP_SECS`); 0 or absent is 10 |
+
+## 12. Audit
 
 `vault_audit` holds every `secret:*` and `vault:verify` decision, allow and
 deny. Each row has the principal (`user` in P3-1), the action as a policy
@@ -495,8 +569,11 @@ and the request it decided. P3-3b adds every lease decision once its session
 is identified (§10): `secret:use`, op `lease`, principal `session` (the row's
 user is the session's owner), the session, the device, the request a Cedar
 decision decided, and a `target` of `lease:<id>` on an allow, or of
-`asked:<name>` when the name resolved to no secret. Rows expire after 90 days,
-like the other audits.
+`asked:<name>` when the name resolved to no secret. P3-3c adds every
+revocation (§11): op `revoke`, decision `revoke`, principal `vault`, the
+reason word, and a `target` of `lease:<id>`; one row per lease, written by the
+pod whose compare-and-set took it back. Rows expire after 90 days, like the
+other audits.
 
 - **An allow is recorded before it is acted on, and fails closed.** A decision
   the vault cannot record is answered 500 and not acted on.
@@ -510,7 +587,7 @@ like the other audits.
   that may be compromised. From P3-4 it goes to `vault_activity`, never here,
   as `ssh_audit` and `ssh_activity` are kept apart.
 
-## 12. Collections
+## 13. Collections
 
 | Collection | One row per | Indexes | Retention |
 |---|---|---|---|
@@ -519,16 +596,15 @@ like the other audits.
 | `vault_audit` | decision | `(tenant_id, at desc)`, `(secret_id, at)` | 90 days (TTL on `at`) |
 | `vault_roles` | vault role (P3-2a) | unique `(tenant_id, name)` over live rows | tombstoned, kept |
 | `vault_policies` | policy (P3-2a): one Cedar statement, its effect, a revision | unique `(tenant_id, name)` over live rows; `(tenant_id, deleted_at, created_at)` | tombstoned, kept |
-| `vault_leases` | value released (P3-3b): the secret, field and version; the session, its fence, its owner and its device; the key it was sealed to (`sealed_to`); the mode and audience; issued and expiry times; `revoked_at`/`revoked_why` from P3-3c. Never the value | `(tenant_id, session_id)` | a week past `expires_at` (TTL); the decision stays in `vault_audit` for 90 days |
+| `vault_leases` | value released (P3-3b): the secret, field and version; the session, its fence, its owner and its device; the key it was sealed to (`sealed_to`); the mode and audience; issued and expiry times; `revoked_at`/`revoked_why` from P3-3c (§11). Never the value | `(tenant_id, session_id)`; P3-3c `(device_id, expires_at)` (a pod's checks, a hello) and `(secret_id, expires_at)` (a change to a secret) | a week past `expires_at` (TTL); the decision stays in `vault_audit` for 90 days |
 
 P3-3a adds no collection: a device's key is a field on fleet's `agents` row
 (`vault_key`, §9).
 
-## 13. What comes next
+## 14. What comes next
 
 | Step | Builds |
 |---|---|
-| P3-3c | revocation: the server's `rc:vault.revoke` when a session ends or moves, a secret's value changes or is disabled, or the device's key changes; the TTL |
 | P3-4 | the device's half: advertising `vault`, asking for leases, opening them and holding them in daemon memory until they expire or are revoked, `vault_activity`; the toolbelt's vault tools; the approval card a policy can ask for |
 | P3-5 to P3-9 | `proxy` mode, `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |

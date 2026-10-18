@@ -8,9 +8,9 @@
 //! | `GET …/vault/secret` | the live secrets, by path (`?prefix=` a folder) | no |
 //! | `POST …/vault/secret` | declare one: its path, kind and rules — no value | no |
 //! | `GET …/vault/secret/{id}` | one secret and its versions' metadata | no |
-//! | `PATCH …/vault/secret/{id}` | change its rules (never its path or kind) | no |
-//! | `DELETE …/vault/secret/{id}` | tombstone it and destroy every version | no |
-//! | `PUT …/vault/secret/{id}/value` | write a field's next version, sealed | **yes** |
+//! | `PATCH …/vault/secret/{id}` | change its rules (never its path or kind); a disable takes its leases back (P3-3c) | no |
+//! | `DELETE …/vault/secret/{id}` | tombstone it and destroy every version; its leases taken back (P3-3c) | no |
+//! | `PUT …/vault/secret/{id}/value` | write a field's next version, sealed; the field's older leases taken back (P3-3c) | **yes** |
 //! | `POST …/vault/verify` | open every version, answer which do not | **yes** |
 //! | `GET …/vault/audit` | the decisions, newest first | no |
 //!
@@ -32,6 +32,7 @@ use axum::{
 };
 use bson::{DateTime, Document, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
+use roomler_ai_remote_control::vault::RevokeReason;
 use roomler_ai_services::dao::base::DaoError;
 use roomler_core::{ApiError, extractors::auth::AuthUser, guards::parse_tid};
 use serde::{Deserialize, Serialize};
@@ -662,6 +663,10 @@ pub async fn update(
     if !state.secrets.update_live(tid, id, set).await? {
         return Err(ApiError::NotFound("no such secret".into()));
     }
+    // P3-3c — disabled: what it has released is taken back.
+    if body.disabled == Some(true) {
+        crate::revoke::secret_changed(&state, id, None, None, RevokeReason::SecretDisabled).await;
+    }
     let secret = live_secret(&state, tid, id).await?;
     Ok(Json(SecretView::of(&secret, &slug)))
 }
@@ -686,6 +691,8 @@ pub async fn delete(
     if !state.secrets.tombstone(tid, id).await? {
         return Err(ApiError::NotFound("no such secret".into()));
     }
+    // P3-3c — what it has released is taken back.
+    crate::revoke::secret_changed(&state, id, None, None, RevokeReason::SecretDeleted).await;
     // The tombstone first: a version delete that fails after it leaves
     // ciphertext no route reaches — a leak to sweep, never a secret back.
     let destroyed = state.versions.delete_for_secret(id).await?;
@@ -834,6 +841,9 @@ async fn put_value_inner(
         }
         return Err(ApiError::NotFound("no such secret".into()));
     }
+    // P3-3c — the field's leases of older versions are taken back.
+    crate::revoke::secret_changed(state, id, Some(field), Some(n), RevokeReason::ValueChanged)
+        .await;
     if n > KEEP_VERSIONS
         && let Err(e) = state.versions.prune(id, field, n - KEEP_VERSIONS + 1).await
     {

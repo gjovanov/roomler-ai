@@ -3015,6 +3015,18 @@
               "expires_at": 1
             },
             "expireAfterSeconds": 604800
+          },
+          {
+            "key": {
+              "device_id": 1,
+              "expires_at": 1
+            }
+          },
+          {
+            "key": {
+              "secret_id": 1,
+              "expires_at": 1
+            }
           }
         ]
       },
@@ -5099,6 +5111,18 @@
               "expires_at": 1
             },
             "expireAfterSeconds": 604800
+          },
+          {
+            "key": {
+              "device_id": 1,
+              "expires_at": 1
+            }
+          },
+          {
+            "key": {
+              "secret_id": 1,
+              "expires_at": 1
+            }
           }
         ]
       },
@@ -5367,6 +5391,7 @@
     "rc:hive.view.close",
     "rc:vault.leased",
     "rc:vault.refused",
+    "rc:vault.revoke",
     "rc:pong",
     "rc:error",
     "rc:overlay.netmap"

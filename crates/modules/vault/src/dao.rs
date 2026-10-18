@@ -103,6 +103,20 @@ impl VaultSecretDao {
         Ok(r.matched_count > 0)
     }
 
+    /// P3-3c — a secret of this organization by id, tombstoned or not: what
+    /// tells a revocation that its secret was deleted rather than disabled.
+    pub async fn find_any(
+        &self,
+        tenant_id: ObjectId,
+        id: ObjectId,
+    ) -> DaoResult<Option<VaultSecret>> {
+        Ok(self
+            .base
+            .collection()
+            .find_one(doc! { "_id": id, "tenant_id": tenant_id })
+            .await?)
+    }
+
     /// Tombstone a live secret. A compare-and-set: `true` only for the call
     /// that moved it from live — two concurrent deletes cannot both act on
     /// one secret.
@@ -506,5 +520,55 @@ impl VaultLeaseDao {
     /// Record a lease; its id is the one the device is told.
     pub async fn insert(&self, lease: &VaultLease) -> DaoResult<ObjectId> {
         self.base.insert_one(lease).await
+    }
+
+    /// P3-3c — a device's leases that have not expired, revoked or not: what
+    /// its pod checks, and what each of its hellos is told again.
+    pub async fn unexpired_for_device(
+        &self,
+        device_id: ObjectId,
+        now: DateTime,
+    ) -> DaoResult<Vec<VaultLease>> {
+        self.collect(doc! { "device_id": device_id, "expires_at": { "$gt": now } })
+            .await
+    }
+
+    /// P3-3c — a secret's live leases (one field's, when given) that have not
+    /// expired: what a change to the secret takes back.
+    pub async fn live_for_secret(
+        &self,
+        secret_id: ObjectId,
+        field: Option<&str>,
+        now: DateTime,
+    ) -> DaoResult<Vec<VaultLease>> {
+        let mut filter =
+            doc! { "secret_id": secret_id, "expires_at": { "$gt": now }, "revoked_at": null };
+        if let Some(f) = field {
+            filter.insert("field", f);
+        }
+        self.collect(filter).await
+    }
+
+    /// P3-3c — take a lease back. A compare-and-set on `revoked_at`: of two
+    /// pods taking one lease back, one acts and records it.
+    pub async fn revoke(&self, id: ObjectId, why: &str, at: DateTime) -> DaoResult<bool> {
+        let r = self
+            .base
+            .collection()
+            .update_one(
+                doc! { "_id": id, "revoked_at": null },
+                doc! { "$set": { "revoked_at": at, "revoked_why": why } },
+            )
+            .await?;
+        Ok(r.modified_count > 0)
+    }
+
+    async fn collect(&self, filter: Document) -> DaoResult<Vec<VaultLease>> {
+        let mut cursor = self.base.collection().find(filter).await?;
+        let mut out = Vec::new();
+        while let Some(l) = cursor.try_next().await? {
+            out.push(l);
+        }
+        Ok(out)
     }
 }
