@@ -3,7 +3,7 @@
 **Issue:** [#1100](https://github.com/gjovanov/roomler-ai/issues/1100) ·
 **Status:** in progress — P1 · P2a–c · P3a–d · P4a–d built: an outsider proves the password to a device through the server, from any pod, and opens ONE session bound to that login by MACs over both DTLS fingerprints — decided by the device, proven against the real agent. **No page yet** (P4e) and **in no release build** (P4f) ·
 **Owner:** remote-control (pillar 1) + control plane ·
-**Anchors verified against master `41425700`** (re-verified after FR-69)
+**Anchors verified against master `19b417969`** (re-derived 2026-10-18, after the stack merged)
 
 The gap TeamViewer and AnyDesk fill and roomler does not: someone **outside the
 organization** views and controls a device, authorised by a password the device
@@ -38,7 +38,7 @@ Four properties, stated as the acceptance bar rather than as a description:
 ## 1. The gap, measured in the code
 
 Every remote-desktop session passes through **one** function:
-`resolve_session_authz` — `crates/modules/remote/src/controller.rs:375`. After the
+`resolve_session_authz` — `crates/modules/remote/src/controller.rs:532`. After the
 self-control shortcut, the whole of the cross-org story is three lines:
 
 ```rust
@@ -74,9 +74,9 @@ Two workflows sit behind the request, and they are not the same feature:
 
 `CLAUDE.md` states it for exec, SSH, peer relays and remote config, and the code
 enforces it: **the last gate is owned by the device and the server cannot write it.**
-`remote_config_enabled` (`crates/agent-core/src/config.rs:138`) is not merely
+`remote_config_enabled` (`crates/agent-core/src/config.rs:212`) is not merely
 defaulted-off — it is *structurally absent* from `DesiredConfig`, and
-`crates/remote_control/src/models.rs:1189` says so in as many words:
+`crates/remote_control/src/models.rs:2515` says so in as many words:
 
 > ⚠️ `remote_config_enabled` is deliberately ABSENT and must never be added.
 
@@ -97,14 +97,14 @@ later reviewer recognises it as the tempting shortcut rather than the obvious bu
 
 The password lives **only on the device**, in `config.toml`, under the same
 atomic + fsync + `.prev` + 0600/ACL treatment `ssh_host_key` already gets
-(`crates/agent-core/src/config.rs:199`) — and, exactly as with SSH, **if it cannot be
+(`crates/agent-core/src/config.rs:378`) — and, exactly as with SSH, **if it cannot be
 persisted the feature stays off** rather than running on a per-boot secret.
 Verification is a handshake the server merely relays.
 
 ### 2c. There is no free permission bit
 
 `VIEW_SSH_AUDIT` is `1 << 30` (`crates/db/src/models/role.rs:91`) and `ALL` is
-`(1 << 31) - 1` (`:151`); the UI mask is a signed int32 with bit 30 as the ceiling
+`(1 << 31) - 1` (`:172`); the UI mask is a signed int32 with bit 30 as the ceiling
 (#888). A `MANAGE_EXTERNAL_ACCESS` bit **is not available**. Admin approval is
 therefore a *compound* of existing bits — `MANAGE_AGENTS` **+** `REMOTE_CONTROL` —
 exactly as FR-19 used `MANAGE_AGENTS` + `EXEC_DEVICE`. Clearing an approval needs
@@ -135,13 +135,13 @@ never consulted, and never leak that they exist.
 | # | Gate | Owner | Mechanism |
 |---|---|---|---|
 | 1 | Org kill-switch | org admin | `TenantSettings.external_rc_enabled`, default `false` — the twin of `remote_exec_enabled` / `remote_ssh_enabled` (`crates/db/src/models/tenant.rs:233`) and deliberately separate from both. Off ⇒ a connect code does not resolve. |
-| 2 | Per-device approval | org admin | `Agent.external_access_policy`, shaped on `PeerRelayPolicy` (`crates/remote_control/src/models.rs:3476`): default closed, set by `MANAGE_AGENTS` + `REMOTE_CONTROL`. Carries a **permission ceiling** (an org may allow external *view* without external *input*) and an optional expiry. |
+| 2 | Per-device approval | org admin | `Agent.external_access_policy`, shaped on `PeerRelayPolicy` (`crates/remote_control/src/models.rs:3503`): default closed, set by `MANAGE_AGENTS` + `REMOTE_CONTROL`. Carries a **permission ceiling** (an org may allow external *view* without external *input*) and an optional expiry. |
 | 3 | Device opt-in | device owner, locally | `external_access_enabled` in the agent's own config, default off, **absent from `DesiredConfig`**. Alongside: `external_consent_mode`, `external_max_permissions`. The refusal that survives a compromised server. |
 | 4 | The password proof | device verifies, outsider proves | §4. The substitute for tenant membership, and the only gate the outsider can satisfy by their own action. |
-| 5 | Host consent | whoever is at the machine | The existing `ConsentMode` path, resolved from `external_consent_mode` rather than `AccessPolicy.consent_mode` (`:430`), defaulting to `Prompt`. |
+| 5 | Host consent | whoever is at the machine | The existing `ConsentMode` path, resolved from `external_consent_mode` rather than `AccessPolicy.consent_mode` (`crates/remote_control/src/models.rs:1367`), defaulting to `Prompt`. |
 
 Gate 5 needs one wire addition: the prompt must say the controller is **outside the
-organization**. `ServerMsg::Request` (`crates/remote_control/src/signaling.rs:1632`)
+organization**. `ServerMsg::Request` (`crates/remote_control/src/signaling.rs:2625`)
 carries `tenant_name` for the multi-org case, which answers *which* org is asking —
 not whether the asker is in one at all. A `controller_scope: external` field is
 additive and serde-defaulted, so older agents keep today's prompt text; a device
@@ -237,7 +237,7 @@ in the field.
 The backoff and lockout that make a 4-word password survivable are gate-4 state, so
 they live where gate 4 lives. A server-side counter does not survive the threat this
 gate exists for. Server-side per-(principal, code) ceilings ride
-`crates/api/src/rate_limit.rs:52` as a *second* limit, not the only one.
+`crates/core/src/rate_limit.rs:37` as a *second* limit, not the only one.
 
 ⚠️⚠️ **A guess is counted when KE1 is ANSWERED — never when KE3 fails.** In OPAQUE
 the *client* learns whether its password is right while opening KE2, before a KE3
@@ -366,7 +366,7 @@ Two properties of the resolution endpoint, both easy to get wrong:
   `(caller, device)`; this needs a second keying that works *before* a caller is
   known — per source IP and per code globally.
 
-The capability verb is `RpcCap::ExternalAccess` (`crates/remote_control/src/models.rs:271`),
+The capability verb is `RpcCap::ExternalAccess` (`crates/remote_control/src/models.rs:1134`),
 matched by **equality, never prefix** — the `ssh` / `ssh-consent` rule. A device that
 does not advertise it cannot be gate-2 approved, which is what keeps §3's
 `controller_scope` prompt from being a promise an old agent silently breaks.
@@ -375,8 +375,8 @@ does not advertise it cannot be gate-2 approved, which is what keeps §3's
 
 ### F1 — the hub keys controllers by `ObjectId`, so an anonymous principal forks everything
 
-`Hub::register_controller(user_id: ObjectId)` (`crates/remote_control/src/hub.rs:563`),
-`RemoteSession.controller_user_id: ObjectId` (`models.rs:2737`), the `remote_audit`
+`Hub::register_controller(user_id: ObjectId)` (`crates/modules/fleet/src/hub.rs:1178`),
+`RemoteSession.controller_user_id: ObjectId` (`models.rs:5332`), the `remote_audit`
 rows and the TURN credential all key on a real user id. A synthetic principal would
 fork the session record, the audit, the credential and the rate limiter — and leave
 *"someone controlled your machine"* in the log.
@@ -392,7 +392,7 @@ one-time code is acceptable, because the host is present and watching — the
 
 ### F3 — TURN credentials key on the user id, so the meter must key on the *device's* tenant
 
-`turn_creds::ice_servers_for(user_id, …)` (`crates/remote_control/src/turn_creds.rs:358`)
+`turn_creds::ice_servers_for(user_id, …)` (`crates/remote_control/src/turn_creds.rs:372`)
 issues under the controller's id. An external controller therefore consumes the org's
 relay capacity attributably — but they have **no tenant**, and an external session is
 relay-heavy by construction (the outsider is not on the mesh). If FR-20's ledger keys
@@ -401,8 +401,8 @@ P5, do not assume.**
 
 ### F4 — `local_relay` is validated as *an* overlay address, not as *the caller's*
 
-`is_overlay_relay_ip` (`crates/remote_control/src/hub.rs:58`) accepts any
-`100.64.0.0/10` or `fc00::/7` literal, and `hub.rs:1202` hands it to the agent as a
+`is_overlay_relay_ip` (`crates/modules/fleet/src/hub.rs:63`) accepts any
+`100.64.0.0/10` or `fc00::/7` literal, and `hub.rs:2036` hands it to the agent as a
 TURN URL. An external controller has no overlay presence, so for them the field must
 be **rejected outright** — otherwise it is a probe into the org's mesh, dialled by
 the agent, from outside the org.
@@ -420,7 +420,7 @@ CAS. P6 follows it rather than inventing one.
 | P1 | Addressing + policy, **no access path**: connect code (globally unique, rotatable), the org switch, `external_access_policy`, admin UI, `external_rc_audit` (90 d TTL). `decide_approval()` returns `Result<(), ExternalRcDenyReason>` so one place records both arms. | `external_rc_enabled = false` (default) | **SHIPPED** — 19 unit + 10 route + 6 integration tests, two guards falsified |
 | P2a | **The device can SAY it understands cross-org access, and opt in.** `RpcCap::ExternalAccess` on the hello (unconditional — a BUILD property, the `config` reasoning, never derived from the opt-in) + `external_access_enabled` (gate 3, default off) with its config-surface entry. The whole `external_*` surface is absent from `DesiredConfig`, guarded by a PREFIX test (FR-19's `relay_*` rule). ⚠️ Without this, gate 2 refuses EVERY device — no agent advertises the verb — so P1 is field-unverifiable until it lands. | `external_access_enabled = false` (default) | **SHIPPED** — both guards falsified |
 | P2b | The device-side CREDENTIAL as a *type*: the OPAQUE suite (Ristretto255 · TripleDh · **Argon2id** Ksf), the registration record, `external_consent_mode`, `external_max_permissions`. Registration runs entirely on the device — it plays both halves, nothing crosses a network — which is *why* the dashboard can show *set / not set* and CLEAR but never SET. | `external-access` feature, off in every release build | **SHIPPED** — 7 unit tests incl. a full login round-trip |
-| P2c | The way to actually set one: `roomler rc password set\|clear\|status` over a new LocalAPI verb, and the length floor. Registration + persistence happen in the DAEMON (it owns the config path and the write lock); the CLI only carries the plaintext across the local pipe, the same channel and the same authority that already flips `exec_enabled`. ⚠️ No `--password` flag, ever — argv is world-readable through `/proc/<pid>/cmdline`. | the P2a flag; nothing verifies the record until P3 | **SHIPPED** — 6 unit tests, incl. the surface allowlist and the derived-`Debug` leak |
+| P2c | The way to actually set one: `roomler rc password set\|clear\|status` over a new LocalAPI verb, and the length floor. Registration + persistence happen in the DAEMON (it owns the config path and the write lock); the CLI only carries the plaintext across the local pipe, the same channel and the same authority that already flips `exec_enabled`. ⚠️ No `--password` flag, ever — argv is world-readable through `/proc/<pid>/cmdline`. ⚠️ **Narrowed since, to the CONSOLE user** (the 2026-10-14 restack), the rule `files_dir` and `keep_busy_enabled` already had: the LocalAPI admits RDP guests too, and these gates decide who may take the console's screen. The narrowing covers setting and clearing the password and every `external_*` key (`crates/localapi/src/lib.rs:3060`, `:3067`, the refusal at `:2710`), locked by `only_the_console_user_opens_the_device_to_outsiders`. `status` stays readable by anyone. The companion does not write the file after the daemon refused (`is_daemon_owned_key`, `agents/roomler-desktop/src/commands.rs`, locked by `recording_keys_are_the_daemons_to_accept`), and the three keys are live (`the_external_access_keys_are_live`). | the P2a flag; nothing verifies the record until P3 | **SHIPPED** — 6 unit tests, incl. the surface allowlist and the derived-`Debug` leak |
 | P3a | **The compatibility surface, fixed before any wire exists.** Pinned KSF (`PinnedArgon2`, §4-0), the device's login half (`login_start` KE1→KE2, `login_finish` KE3→session key), and a cross-implementation harness (`examples/extauth_interop.rs`). **Proven against the real browser library**: RED with the old crate-default KSF (the correct password refused), GREEN after pinning with both sides deriving the same session key, and a wrong password decided at KE2 with no KE3 ever sent — the measurement §4b's counting rule rests on. Corrected the spec's browser library (`@cloudflare/opaque-ts` is draft-07 + scrypt; cannot interoperate). | `external-access` feature, in no release build | **SHIPPED** |
 | P3b | The device's login **state machine** (`external_logins.rs`): guesses debited when a KE2 leaves the device (§4b), check-and-debit in ONE critical section (a concurrent burst cannot outrun it), a success refunds only its own guess, 5 free then 30 s doubling to a 1 h cap over a 24 h window, bounded pending/verified tables with TTLs, and a verified login retained **single-use** as `AppKey = HKDF-SHA512(session key, label ‖ attempt ‖ principal)` — the principal is bound after the login because the browser library binds no OPAQUE `context`. Known-answer test against an independent HKDF. Open decisions 6 + 7. | same | **SHIPPED** |
 | P3c | The wire: `rc:extauth.*` frames (4 client, 4 server; the device's refusal decoded leniently — anything present is a refusal), the server as a blind relay (`crates/modules/remote/src/extauth.rs`: byte-identical `unavailable` for no-such-code / gate 1 / gate 2 / offline, reply before the audit write, park-before-push, only the starter finishes, gates re-checked at KE3), the device's answer in **every** build (`agents/roomlerd/src/extauth.rs`: gate 3 and the record read LIVE from the config file, primary org only), and a `login` audit action. **Proven on loopback against the real agent**: `crates/tests/src/extauth_tests.rs`, 4 tests. ⚠️ **Single-pod only** — see P3d. | P2's flag; no client surface ships | **SHIPPED** |
@@ -556,7 +556,7 @@ CAS. P6 follows it rather than inventing one.
     one the fleet view has to explain device by device.
 12. **The page cannot run its OPAQUE client under today's CSP (found while planning
     P4e).** `@serenity-kit/opaque` is opaque-ke compiled to WebAssembly, and the SPA's
-    policy (`files/nginx-pod.conf:62`) is `script-src 'self' https://purestat.ai` —
+    policy (`files/security-headers.conf:71`) is `script-src 'self' https://purestat.ai` —
     with no `'wasm-unsafe-eval'`, a browser refuses to compile any WebAssembly module,
     so the login would fail before its first frame. The CSP is one per document, and
     SPA navigation never re-fetches it, so the allowance cannot be scoped to

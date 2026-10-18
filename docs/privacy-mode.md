@@ -117,7 +117,7 @@ Two records, written by two parties, as for recordings and transfers
 | Record | Written by | Says | Where |
 |---|---|---|---|
 | `session_requested` in `remote_audit` | the server, from its own decision | whether `PRIVACY` was granted, and if not why (`privacy_stripped`) | P1a |
-| `privacy_activity` | the device, reporting (FR-99 P1d) | what it then did: each curtain up, each take-down and why, each "on" it refused | `rc:privacy.activity` ([`agent_socket.rs:170`](../crates/modules/remote/src/agent_socket.rs#L170)) |
+| `privacy_activity` | the device, reporting (FR-99 P1d) | what it then did: each curtain up, each take-down and why, each "on" it refused | `rc:privacy.activity` ([`agent_socket.rs:203`](../crates/modules/remote/src/agent_socket.rs#L203)) |
 
 ```mermaid
 sequenceDiagram
@@ -205,7 +205,7 @@ sequenceDiagram
 - The key is the device's own. It is set over the LocalAPI only by the person at the console, whose screen
   it locks, and no server can push it. An admin can ask for stricter (below).
 - **The default is `never`, except on a new Windows service install, which starts at `auto`** (P3c, the
-  spec's decision 3; [`apply_service_install_defaults`](../crates/agent-core/src/enrollment.rs#L708)). Its
+  spec's decision 3; [`apply_service_install_defaults`](../crates/agent-core/src/enrollment.rs#L713)). Its
   worker reaches the secure desktop, so the next controller can unlock what `auto` locked. Per-user installs
   keep `never`, since nothing could unlock them remotely. So does the Linux root daemon, until a field cell
   shows a remote unlock there. An install already in the field keeps its value when it is re-enrolled.

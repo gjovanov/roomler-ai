@@ -38,7 +38,7 @@ The list has been unreachable end-to-end since it shipped:
 2. **Confirm/unsubscribe outcomes are invisible.**
    `crates/api/src/routes/subscribe.rs:203-206` 303s to `{frontend_url}/?subscribe=…`,
    but `/` carries `meta:{auth:true}` and the router guard exact-matches
-   `to.fullPath === '/'` (`ui/src/plugins/router.ts:255`): a logged-out confirmer is
+   `to.fullPath === '/'` (`ui/src/plugins/router.ts:274`): a logged-out confirmer is
    bounced to `/login` with sessionStorage noise, a signed-in one renders the dashboard,
    and the `SUBSCRIBE_MESSAGES` handler (`ui/src/views/LandingView.vue:320-333`) is dead
    code.
