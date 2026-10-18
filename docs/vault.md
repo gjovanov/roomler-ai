@@ -12,9 +12,10 @@ People use it too.
 > §8. **This page describes what is built: P3-1, the store; P3-2a, roles and
 > Cedar policies (§7); P3-2b, a session's role, decided at its start and at
 > every move (§8); P3-3a, the key a device's daemon holds for the values it is
-> leased (§9); P3-3b, the vault's half of a lease (§10); and P3-3c, how the
-> vault takes a lease back (§11).** No released agent asks for a lease yet:
-> the device's half is P3-4.
+> leased (§9); P3-3b, the vault's half of a lease (§10); P3-3c, how the
+> vault takes a lease back (§11); and P3-4a, the daemon's lease client
+> (§12).** No released agent asks for a lease yet: P3-4c's tools are the
+> first to.
 
 ## 1. Custody: who can read a secret
 
@@ -122,7 +123,7 @@ A **secret** is a name and its rules, and never a value:
 | `path` | unique among the organization's live secrets; lowercase segments of `a-z 0-9 . _ -` joined by `/`. Never changes |
 | `kind` | `static` (one field, `value`) or `structured` (named fields: `username`, `password`…). `dynamic`, `template` and `llm_credential` come with the steps that give them meaning |
 | `audiences` | where a value may be presented: host patterns, a knowhow entity, a named upstream. Stored in P3-1; the daemon holds a use to them from P3-5 |
-| `exec_allow` | the programs a value may be handed to, as `argv[0]` (P3-4's `vault_exec`) |
+| `exec_allow` | the programs a value may be handed to, as `argv[0]` (P3-4c's `vault_exec`) |
 | `tags`, `owner_id`, `rotation_days`, `description` | metadata; tags get one spelling, because a policy matches them by equality |
 | `disabled` | P3-5's per-secret kill switch: a disabled secret is never used. An administrator still reads its metadata and writes its value |
 
@@ -400,7 +401,7 @@ sequenceDiagram
 | Piece | Where |
 |---|---|
 | the device's switch | `vault_enabled` ([`config.rs:492`](../crates/agent-core/src/config.rs#L492)), off, never pushable: [`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L8112) |
-| the key, and its half in the hello | [`vault.rs:35`](../agents/roomlerd/src/vault.rs#L35) `hello_key`, feature `vault` (it implies `hive`, and no release build carries it yet); the hello at [`signaling.rs:1532`](../agents/roomlerd/src/signaling.rs#L1532) |
+| the key, and its half in the hello | [`vault.rs:35`](../agents/roomlerd/src/vault.rs#L35) `hello_key`, feature `vault` (it implies `hive`, and no release build carries it yet); the hello at [`signaling.rs:1570`](../agents/roomlerd/src/signaling.rs#L1570) |
 | the wire | `AgentHello::vault_key` ([`signaling.rs:363`](../crates/remote_control/src/signaling.rs#L363)) and [`vault_key_is_well_formed`](../crates/remote_control/src/signaling.rs#L120) |
 | what the fleet stores | [`socket.rs:104`](../crates/modules/fleet/src/socket.rs#L104), [`AgentDao::update_hello`](../crates/services/src/dao/agent.rs#L479), `Agent::vault_key` ([`models.rs:2048`](../crates/remote_control/src/models.rs#L2048)); no route answers it |
 
@@ -492,7 +493,7 @@ that read the asked TTL allowed at least what was granted.
 A lease ends at its TTL, or at its version's `expires_at` when that comes
 first. The vault takes it back sooner once it stops standing, and tells the
 device on its own control connection: `rc:vault.revoke {lease_ids, reason}`.
-The device drops every lease the frame names, whatever the word (P3-4).
+The device drops every lease the frame names, whatever the word (§12).
 
 ```mermaid
 sequenceDiagram
@@ -557,7 +558,62 @@ sequenceDiagram
 | the connections | `Revoker` in `revoke.rs`, fed by the lease socket's lifecycle ([`lease.rs`](../crates/modules/vault/src/lease.rs)): a hello links its connection and reconciles the device, a close unlinks it unless a newer connection took over |
 | the setting | `vault.revoke_sweep_secs` (`ROOMLER__VAULT__REVOKE_SWEEP_SECS`); 0 or absent is 10 |
 
-## 12. Audit
+## 12. The daemon's lease client (P3-4a)
+
+The device's half of a lease: the daemon asks on its primary connection,
+opens what the vault sends with its key (§9), and holds the value in memory
+until the lease is over. P3-4a builds the client; P3-4c's tools are the first
+to ask.
+
+```mermaid
+sequenceDiagram
+    participant T as a session's tool (P3-4c)
+    participant D as roomlerd (its lease client)
+    participant V as vault
+    T->>D: a request: session, fence, secret, field, mode, audience, TTL
+    D->>V: rc:vault.lease {req_id, …} on the primary connection
+    alt leased
+        V-->>D: rc:vault.leased {req_id, lease_id, n, sealed, expires_at_ms}
+        D->>D: open with this run's key, hold it zeroized
+        D-->>T: the lease, never its value
+    else refused, or no answer within 15 s
+        V-->>D: rc:vault.refused {req_id, reason}
+        D-->>T: the vault's word, or no answer
+    end
+    Note over D: let go at its expiry, at rc:vault.revoke, or when its run ends here
+```
+
+| When | The daemon |
+|---|---|
+| `vault_enabled` on, a build with `vault` that runs sessions, the primary connection | advertises `vault` in its hello and in every re-announcement, exactly where the hello carries its key |
+| a tool asks | sends `rc:vault.lease` with a random `req_id`, and waits 15 s: a server without the vault never answers |
+| `rc:vault.leased` | opens the box with this run's key, holds the value zeroized, and answers the tool with the lease, never the value |
+| `rc:vault.refused` | answers the tool with the vault's word |
+| the lease's expiry passes | lets it go: checked at every use, and every 5 s |
+| `rc:vault.revoke` (§11) | lets go of every lease the frame names; an id it does not hold is ignored |
+| the session's run ends here | lets go of that run's leases, wherever the run stopped being live |
+| one of these frames on a secondary org's connection | drops it unopened |
+
+> [!WARNING]
+> - **A value never leaves the daemon.** A tool borrows it inside a closure
+>   (`with_value`) and nothing returns it; it is zeroed when let go.
+> - **Held no longer than the longest lease the vault grants** (900 s),
+>   whatever the server's clock says: a device whose clock runs behind cannot
+>   keep a value past its lease by more than that.
+> - **The word follows the key.** The vault answers only a connection that
+>   advertises `vault` and whose hello carried a key, so the daemon applies the
+>   word from the same inputs as the key, and every re-announcement carries it:
+>   the server replaces its stored caps with each.
+> - **A run's leases die with the run**, at its fence: another fence of the
+>   same session is another run.
+
+| Piece | Where |
+|---|---|
+| the client | [`vault.rs`](../agents/roomlerd/src/vault.rs): `Client` (`request`, `on_leased`, `on_refused`, `on_revoke`, `drop_run`, `with_value`), `takes_leases`, `apply_word` |
+| the frames | their arms in `handle_server_msg` ([`signaling.rs`](../agents/roomlerd/src/signaling.rs)), on the primary connection only |
+| a run's end | `Supervisor::unlive` ([`supervisor.rs`](../agents/roomlerd/src/hive/supervisor.rs)), which every way a run stops being live passes through |
+
+## 13. Audit
 
 `vault_audit` holds every `secret:*` and `vault:verify` decision, allow and
 deny. Each row has the principal (`user` in P3-1), the action as a policy
@@ -584,10 +640,10 @@ other audits.
 - A request refused for its content (400, 422) or for want of a KEK (503) acts
   on nothing, so it records no allow.
 - A device's own report of using a value is a different claim, made by a host
-  that may be compromised. From P3-4 it goes to `vault_activity`, never here,
+  that may be compromised. From P3-4d it goes to `vault_activity`, never here,
   as `ssh_audit` and `ssh_activity` are kept apart.
 
-## 13. Collections
+## 14. Collections
 
 | Collection | One row per | Indexes | Retention |
 |---|---|---|---|
@@ -601,10 +657,13 @@ other audits.
 P3-3a adds no collection: a device's key is a field on fleet's `agents` row
 (`vault_key`, §9).
 
-## 14. What comes next
+## 15. What comes next
 
 | Step | Builds |
 |---|---|
-| P3-4 | the device's half: advertising `vault`, asking for leases, opening them and holding them in daemon memory until they expire or are revoked, `vault_activity`; the toolbelt's vault tools; the approval card a policy can ask for |
+| P3-4b | the toolbelt's metadata tools: `vault_list` and `vault_describe` for a session, decided by Cedar's `secret:list` |
+| P3-4c | the toolbelt's use tools: `vault_request`, `vault_exec` (one command with values in its environment, output scrubbed, `argv[0]` on the secret's `exec_allow`) and `vault_render` (a template into the session's secrets directory) |
+| P3-4d | `vault_activity`: the device's own report of using a value, a claim kept apart from `vault_audit` |
+| P3-4e | the approval card a policy can ask for |
 | P3-5 to P3-9 | `proxy` mode, `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |
