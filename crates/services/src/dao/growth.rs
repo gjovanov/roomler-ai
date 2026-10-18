@@ -116,6 +116,12 @@ pub const BING_SOURCE: &str = "bing";
 /// P7 — Bing's weekly buckets per query and per page, at Bing's own grain,
 /// stored under the bucket's date.
 pub const BING_WEEKLY_SOURCE: &str = "bing_weekly";
+/// P7 — the blog feed's read (`saas::content_pull`): one `growth_pulls` row
+/// per UTC day; the posts themselves live in `growth_content`.
+pub const CONTENT_SOURCE: &str = "content";
+/// P7 — a day's URL Inspection of the blog's posts (`saas::content_pull`):
+/// one `growth_pulls` row per UTC day.
+pub const URL_INSPECTION_SOURCE: &str = "url_inspection";
 
 /// The most org-days one read loads — far above this deployment's volume
 /// (every org active every day for 25 months is ~10 rows a day); a bound,

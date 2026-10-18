@@ -25,7 +25,7 @@ use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
 use chrono::{Duration, NaiveDate};
 use roomler_ai_api::growth::{alerts, cohorts::week_start, digest, digest::DigestMailer, weekly};
 use roomler_ai_services::dao::{
-    growth::{GROWTH_PULLS, PURESTAT_SOURCE},
+    growth::{BING_SOURCE, GROWTH_PULLS, PURESTAT_SOURCE, SEARCH_CONSOLE_SOURCE},
     growth_alert::GROWTH_ALERTS,
     growth_digest::{DigestStatus, DigestStore, GROWTH_DIGESTS, GROWTH_WEEKLY},
     growth_key::{GrowthKeyDao, GrowthKeyKind},
@@ -849,7 +849,10 @@ async fn alerts_fire_once_clear_and_mail_at_most_once_a_day() {
     assert_eq!(r.status().as_u16(), 200);
     let dry: Value = r.json().await.unwrap();
     assert_eq!(dry["dry_run"], true);
-    assert_eq!(dry["verdicts"].as_array().unwrap().len(), 8);
+    // One verdict per (rule, key) the rules evaluate.
+    let pairs: usize = alerts::Rule::ALL.iter().map(|r| r.keys().len()).sum();
+    assert_eq!(pairs, 14);
+    assert_eq!(dry["verdicts"].as_array().unwrap().len(), pairs);
     assert_eq!(
         count(&app, GROWTH_ALERTS, doc! {}).await,
         3,
@@ -964,4 +967,113 @@ async fn alerts_fire_once_clear_and_mail_at_most_once_a_day() {
     let (_, j) = get_json(&off, "/api/admin/growth/alerts", &off_token).await;
     assert_eq!(j["enabled"], false);
     assert_eq!(count(&off, GROWTH_ALERTS, doc! {}).await, 0);
+}
+
+/// §3l — a configured puller failing two days running opens ONE
+/// `source_not_measured` row keyed by the puller, carrying its last success
+/// and its newest error, and the row closes once a pull succeeds. A puller
+/// that is not configured says nothing over the same failing rows.
+#[tokio::test]
+async fn a_puller_failing_two_days_running_alerts_and_clears() {
+    let (base, _fake) = fake_purestat().await;
+    let (app, _token) = admin_app(&base, "good", |s| {
+        s.growth.alerts = true;
+        // A key that does not parse: the puller never starts (whether a key
+        // PARSES is the puller's to say), and the rule still watches.
+        s.growth.search_console_key = "{}".into();
+        s.growth.search_console_site = "sc-domain:example.test".into();
+        s.growth.bing_api_key = String::new();
+    })
+    .await;
+    let now = DateTime::now();
+    let ago = |h: i64| DateTime::from_millis(now.timestamp_millis() - h * 3_600_000);
+    let t = today();
+    let pulls = app.db.collection::<Document>(GROWTH_PULLS);
+    // Search Console: the last good pull 72 h ago, failing since; Bing (no
+    // key here) carries the same failing shape.
+    for (source, back, ok_hours, attempt_hours, error) in [
+        (SEARCH_CONSOLE_SOURCE, 5, Some(72), 72, None),
+        (SEARCH_CONSOLE_SOURCE, 4, None, 30, Some("HTTP 403")),
+        (SEARCH_CONSOLE_SOURCE, 3, None, 1, Some("HTTP 403")),
+        (BING_SOURCE, 4, Some(80), 80, None),
+        (BING_SOURCE, 1, None, 1, Some("HTTP 401")),
+    ] {
+        let day = ds(t - Duration::days(back));
+        let mut d = doc! {
+            "_id": format!("{source}:{day}"), "source": source, "day": &day,
+            "status": if ok_hours.is_some() { "ok" } else { "failed" },
+            "attempted_at": ago(attempt_hours), "attempts": 2_i64, "rows": 0_i64,
+            "truncated": false,
+        };
+        if let Some(h) = ok_hours {
+            d.insert("pulled_at", ago(h));
+        }
+        if let Some(e) = error {
+            d.insert("error", e);
+        }
+        pulls.insert_one(d).await.unwrap();
+    }
+
+    let mailer = Recording::default();
+    let ev = alerts::evaluate(&app.state, Some(&mailer), false, now)
+        .await
+        .unwrap();
+    let failing: Vec<&str> = ev
+        .fired
+        .iter()
+        .filter(|a| a.rule == "source_not_measured" && a.key.ends_with("_pull"))
+        .map(|a| a.key.as_str())
+        .collect();
+    assert_eq!(failing, ["search_console_pull"], "{:?}", open_rows(&ev));
+    let row = ev
+        .fired
+        .iter()
+        .find(|a| a.key == "search_console_pull")
+        .unwrap();
+    assert_eq!(row.detail.get_str("last_error").unwrap(), "HTTP 403");
+    assert_eq!(row.detail.get_i64("hours_failing").unwrap(), 72);
+    assert!(row.detail.get_str("last_ok").is_ok(), "{:?}", row.detail);
+
+    // A second evaluation opens nothing new.
+    let again = alerts::evaluate(&app.state, Some(&mailer), false, now)
+        .await
+        .unwrap();
+    assert!(
+        !open_rows(&again).contains(&("source_not_measured".into(), "search_console_pull".into())),
+        "{:?}",
+        open_rows(&again)
+    );
+
+    // A pull succeeds: the row closes.
+    pulls
+        .update_one(
+            doc! { "_id": format!("{SEARCH_CONSOLE_SOURCE}:{}", ds(t - Duration::days(3))) },
+            doc! {
+                "$set": { "status": "ok", "pulled_at": now, "attempted_at": now },
+                "$unset": { "error": "" },
+            },
+        )
+        .await
+        .unwrap();
+    let ev = alerts::evaluate(&app.state, Some(&mailer), false, now)
+        .await
+        .unwrap();
+    let cleared: Vec<(String, String)> = ev
+        .cleared
+        .iter()
+        .map(|a| (a.rule.clone(), a.key.clone()))
+        .collect();
+    assert!(
+        cleared.contains(&("source_not_measured".into(), "search_console_pull".into())),
+        "{cleared:?}"
+    );
+    assert_eq!(
+        count(
+            &app,
+            GROWTH_ALERTS,
+            doc! { "key": "search_console_pull", "cleared_at": Bson::Null }
+        )
+        .await,
+        0
+    );
 }

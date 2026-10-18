@@ -47,10 +47,11 @@ use crate::{
     search_console::{ScClient, ScError},
 };
 
-/// The `growth_pulls` source of a feed read.
-pub const CONTENT_SOURCE: &str = "content";
-/// The `growth_pulls` source of a day's URL inspections.
-pub const INSPECTION_SOURCE: &str = "url_inspection";
+/// The `growth_pulls` sources of a feed read and of a day's URL inspections,
+/// spelled in the core DAO so the host's alert rules read the same rows.
+pub use roomler_ai_services::dao::growth::{
+    CONTENT_SOURCE, URL_INSPECTION_SOURCE as INSPECTION_SOURCE,
+};
 pub const CYCLE_HOUR_UTC: u32 = 2;
 pub const LOOP_INTERVAL_SECS: u64 = 60 * 60;
 pub const FIRST_TICK_DELAY_SECS: u64 = 8 * 60;
