@@ -23,7 +23,7 @@
 
 use crate::fixtures::test_app::TestApp;
 use crate::tunnel_tests::wait_agent_online;
-use futures::SinkExt;
+use futures::{SinkExt, StreamExt};
 use jsonwebtoken::{EncodingKey, Header};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -333,11 +333,32 @@ async fn a_device_with_no_row_is_refused_before_the_upgrade() {
     // goodbye (`rc:goodbye AgentDeleted`, exit 7): unchanged.
     let (removed_id, removed_token) = enroll(&app, &seeded, "m-2463-removed").await;
     remove(&app, &seeded, &removed_id).await;
-    assert_eq!(
-        upgrade_status(&app, "/ws", &removed_token).await,
-        101,
-        "a tombstone still upgrades to its goodbye"
+    let url = format!(
+        "ws://{}/ws?token={}&role=agent",
+        app.addr,
+        removed_token
+            .replace('+', "%2B")
+            .replace('/', "%2F")
+            .replace('=', "%3D")
     );
+    let (mut ws, _) = connect_async(&url)
+        .await
+        .expect("a tombstone still upgrades to its goodbye");
+    let goodbye = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(Ok(msg)) = ws.next().await {
+            if let Message::Text(t) = msg
+                && let Ok(v) = serde_json::from_str::<Value>(&t)
+                && v["t"] == "rc:goodbye"
+            {
+                return Some(v);
+            }
+        }
+        None
+    })
+    .await
+    .expect("a frame within 10 s")
+    .expect("the typed goodbye, not a bare close");
+    assert_eq!(goodbye["reason"], "agent_deleted", "{goodbye}");
 }
 
 /// The kill switches: `rc.token_renewal = false` answers 404 on both renew
