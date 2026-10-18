@@ -6,8 +6,10 @@
 //! [`AgentPeer`] values that back each live WebRTC PeerConnection.
 //!
 //! Reconnect strategy: exponential backoff capped at 60 s, restarted at 1 s by
-//! a connection that lived (#2221). Fatal auth errors
-//! (HTTP 401 on upgrade) exit the loop so the user can re-enroll.
+//! a connection that lived (#2221). An HTTP 401 on upgrade is `AuthRejected`:
+//! one token recovery (FR-103), then the auth ladder (30 s, 60 s, 5 min, then
+//! hourly) with the re-enrollment sentinel; it never exits. A device whose row
+//! is gone hears that 401 too (#2463). Only a typed `rc:goodbye` is fatal.
 
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};

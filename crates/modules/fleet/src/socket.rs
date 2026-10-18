@@ -1467,11 +1467,28 @@ pub async fn ws_upgrade_agent(
     // upgrades and hears its typed goodbye below, and a failed read falls
     // through to the same read inside the upgrade, as before. So this can
     // only ADD a refusal, never lose one.
-    let pre_read = state
-        .agents
-        .find_any_in_tenant(tenant_id, agent_id)
-        .await
-        .ok();
+    //
+    // #2463 — and NO row at all is refused here too, with the same plain 401
+    // `auth_agent` gives the HTTP routes for it ("no such device"). FR-51
+    // hard-deletes a reaped ephemeral row, so `NotFound` is Mongo's
+    // authoritative answer, not a wobble. Before this, the read inside the
+    // upgrade failed the same way and dropped the socket with no frame: the
+    // daemon read a network fault and reconnected every minute, forever,
+    // never hearing that its credential is dead. On 401 it recovers its token
+    // once, then waits out its auth ladder (up to an hour) and raises the
+    // re-enrollment sentinel. ⚠️ `NotFound` ONLY: any other error (a Mongo
+    // blip) still falls through, never reads as "gone".
+    let pre_read = match state.agents.find_any_in_tenant(tenant_id, agent_id).await {
+        Ok(row) => Some(row),
+        Err(roomler_ai_services::dao::base::DaoError::NotFound) => {
+            info!(%agent_id, %tenant_id, "refusing agent WS: row gone (a reaped ephemeral device?)");
+            return Response::builder()
+                .status(401)
+                .body("Unauthorized (agent)".into())
+                .unwrap();
+        }
+        Err(_) => None,
+    };
     if let Some(row) = &pre_read
         && crate::auth_agent::refusal_reason(row).is_none()
         && let Some(reason) = crate::auth_agent::generation_refusal(
@@ -1495,7 +1512,9 @@ pub async fn ws_upgrade_agent(
             // A removed device must reach the `refusal_reason` arm below and
             // get the typed `rc:goodbye AgentDeleted` it exits 7 on; a bare
             // `NotFound` here drops the socket with no frame, and the daemon
-            // reads that as a network fault and reconnects forever.
+            // reads that as a network fault and reconnects forever. (#2463: a
+            // row already gone is refused with 401 before the upgrade; this
+            // read meets `NotFound` only when the row went in between.)
             let agent = match pre_read {
                 Some(a) => a,
                 None => match state.agents.find_any_in_tenant(tenant_id, agent_id).await {
