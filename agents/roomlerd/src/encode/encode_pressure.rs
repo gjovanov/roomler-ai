@@ -149,20 +149,34 @@ pub const FPS_PACE_MIN: u32 = 15;
 /// frames at random phases — alternating 16/33 ms motion deltas, which is
 /// the residual "steps" judder even when latency is good.
 ///
-/// Pure and hysteretic: quantized to 5 fps steps, engages only when the
-/// sustainable rate sits ≥5 under target, moves only by ≥5, floors at
-/// [`FPS_PACE_MIN`] (beyond that the tier layer shrinks pixels). Kill
+/// Pure, quantized to 5 fps steps: engages only when the sustainable rate
+/// sits ≥5 under target, steps DOWN as soon as the estimate quantizes lower
+/// (a pace the encoder cannot hold is the judder above), floors at
+/// [`FPS_PACE_MIN`] (beyond that the tier layer shrinks pixels). A step UP
+/// waits until the estimate clears the higher step by `up_margin_fps`. With
+/// 0 — the hardware pace, unchanged since P5 — an estimate hovering on a step
+/// boundary moves the pace every window it crosses: two different 5-fps
+/// steps always differ by a full quantum, so "moves only by ≥5" holds nothing.
+/// The software pace runs with [`SW_PACE_UP_MARGIN_FPS`] (FR-112 P2d). Kill
 /// switch `ROOMLERD_FPS_PACE=0` / config `fps_pace`.
 pub struct FpsPace {
     paced: Option<u32>,
     enabled: bool,
+    up_margin_fps: f32,
 }
 
 impl FpsPace {
     pub fn new() -> Self {
+        Self::with_up_margin(0.0)
+    }
+
+    /// FR-112 P2d — a pace whose steps up wait for `up_margin_fps` of
+    /// headroom over the step they move to.
+    pub fn with_up_margin(up_margin_fps: f32) -> Self {
         Self {
             paced: None,
             enabled: !matches!(node_env("FPS_PACE").as_deref(), Some("0") | Some("false")),
+            up_margin_fps,
         }
     }
 
@@ -172,22 +186,25 @@ impl FpsPace {
         if !self.enabled || ewma_ms <= 0.0 || !ewma_ms.is_finite() {
             return self.paced;
         }
-        let sustainable = (1000.0 / ewma_ms).floor().clamp(0.0, 240.0) as u32;
-        let quantized = (sustainable / 5) * 5;
-        let next = if quantized + 5 <= target_fps {
-            Some(quantized.clamp(FPS_PACE_MIN, target_fps))
-        } else {
-            None
+        let sustainable = (1000.0 / ewma_ms).clamp(0.0, 240.0);
+        // An estimate's pace: its 5-fps step, or `None` (the target) once
+        // that step is within 5 of the target.
+        let pace_for = |fps: f32| {
+            let quantized = (fps.max(0.0) as u32 / 5) * 5;
+            if quantized + 5 <= target_fps {
+                Some(quantized.clamp(FPS_PACE_MIN, target_fps))
+            } else {
+                None
+            }
         };
-        let changed = match (self.paced, next) {
-            // Hysteresis: an engaged pace holds until the estimate moves a
-            // full quantum, so a session hovering on a boundary doesn't
-            // flap its cadence.
-            (Some(cur), Some(n)) => cur.abs_diff(n) >= 5,
-            (a, b) => a != b,
-        };
-        if changed {
-            self.paced = next;
+        // `None` runs at the target, the highest rate of all.
+        let rate = |pace: Option<u32>| pace.unwrap_or(u32::MAX);
+        let down = pace_for(sustainable);
+        let up = pace_for(sustainable - self.up_margin_fps);
+        if rate(down) < rate(self.paced) {
+            self.paced = down;
+        } else if rate(up) > rate(self.paced) {
+            self.paced = up;
         }
         self.paced
     }
@@ -214,16 +231,38 @@ impl Default for FpsPace {
 /// that one stops learning under `ROOMLERD_ENCODE_PRESSURE=0`, a kill switch
 /// for the hardware path's bitrate factor that must not also switch the
 /// software pace off. `ROOMLERD_FPS_PACE=0` still does, through `FpsPace`.
+///
+/// P2d: its steps up wait for [`SW_PACE_UP_MARGIN_FPS`] of headroom
+/// (`ROOMLERD_SW_PACE_UP_MARGIN`, `0` = 0.4.142's pace). Without it, 0.4.142
+/// undid a step three times, each one or two windows after taking it, on a
+/// host that could not sustain 60 (the field trace in the tests).
 pub struct SoftwarePace {
     ewma_ms: f32,
     pace: FpsPace,
+}
+
+/// FR-112 P2d — how far past a higher step (fps) a software encoder's
+/// estimate must reach before its pace moves up to it. Half a step: wider
+/// than a settled session's wobble (the Asahi host's windows vary by under
+/// 10 %, which the EWMA turns into under ±2 fps at 50), narrower than a step,
+/// so a recovering encoder still climbs.
+pub const SW_PACE_UP_MARGIN_FPS: f32 = 2.5;
+
+/// [`SW_PACE_UP_MARGIN_FPS`], or `ROOMLERD_SW_PACE_UP_MARGIN` (0–10; `0`
+/// restores 0.4.142's pace, which steps up as soon as it steps down).
+fn sw_pace_up_margin() -> f32 {
+    node_env("SW_PACE_UP_MARGIN")
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| v.min(10.0))
+        .unwrap_or(SW_PACE_UP_MARGIN_FPS)
 }
 
 impl SoftwarePace {
     pub fn new() -> Self {
         Self {
             ewma_ms: 0.0,
-            pace: FpsPace::new(),
+            pace: FpsPace::with_up_margin(sw_pace_up_margin()),
         }
     }
 
@@ -537,7 +576,20 @@ mod tests {
         FpsPace {
             paced: None,
             enabled: true,
+            up_margin_fps: 0.0,
         }
+    }
+
+    fn margin_pace() -> FpsPace {
+        FpsPace {
+            up_margin_fps: SW_PACE_UP_MARGIN_FPS,
+            ..pace()
+        }
+    }
+
+    /// The EWMA (ms) of an encoder that sustains `fps`.
+    fn ms(fps: f32) -> f32 {
+        1000.0 / fps
     }
 
     #[test]
@@ -547,7 +599,7 @@ mod tests {
         assert_eq!(p.observe(10.0, 60), None);
         // 25 ms → 40 sustainable → paced 40 (quantized, ≥5 under 60).
         assert_eq!(p.observe(25.0, 60), Some(40));
-        // 24 ms → 41 → quantizes to 40 — hysteresis holds.
+        // 24 ms → 41 → quantizes to 40 — the same step, held.
         assert_eq!(p.observe(24.0, 60), Some(40));
         // 29 ms → 34 → quantizes to 30 — a full quantum away, moves.
         assert_eq!(p.observe(29.0, 60), Some(30));
@@ -568,11 +620,96 @@ mod tests {
         assert_eq!(q.observe(16.0, 60), None);
     }
 
+    /// FR-112 P2d — two different 5-fps steps always differ by a full
+    /// quantum, so with no margin an estimate hovering on a step boundary
+    /// moves the pace every window it crosses: 0.4.142's software pace, and
+    /// the hardware pace still.
+    #[test]
+    fn without_a_margin_a_hover_on_a_boundary_flaps() {
+        let mut p = pace();
+        let paces: Vec<_> = [55.3, 54.7, 55.3, 54.7, 55.3]
+            .iter()
+            .map(|fps| p.observe(ms(*fps), 60))
+            .collect();
+        assert_eq!(paces, [Some(55), Some(50), Some(55), Some(50), Some(55)]);
+    }
+
+    /// FR-112 P2d — with the margin the same hover takes one step down and
+    /// holds there.
+    #[test]
+    fn with_the_margin_a_hover_on_a_boundary_holds() {
+        let mut p = margin_pace();
+        let paces: Vec<_> = [55.3, 54.7, 55.3, 54.7, 55.3, 55.3, 54.7]
+            .iter()
+            .map(|fps| p.observe(ms(*fps), 60))
+            .collect();
+        assert_eq!(
+            paces,
+            [
+                Some(55),
+                Some(50),
+                Some(50),
+                Some(50),
+                Some(50),
+                Some(50),
+                Some(50)
+            ]
+        );
+    }
+
+    /// FR-112 P2d — the margin delays only the steps up: down at once (several
+    /// steps if the estimate fell that far), up and back to the target only
+    /// once the estimate clears the step by the margin.
+    #[test]
+    fn the_margin_delays_only_the_steps_up() {
+        let mut p = margin_pace();
+        assert_eq!(p.observe(ms(52.0), 60), Some(50), "engages at once");
+        assert_eq!(p.observe(ms(56.0), 60), Some(50), "56: not 55 + 2.5 yet");
+        assert_eq!(p.observe(ms(58.0), 60), Some(55), "58 clears 55 + 2.5");
+        assert_eq!(p.observe(ms(61.0), 60), Some(55), "61: not 60 + 2.5 yet");
+        assert_eq!(p.observe(ms(63.0), 60), None, "63 clears the target + 2.5");
+        assert_eq!(
+            p.observe(ms(59.0), 60),
+            Some(55),
+            "under the target: at once"
+        );
+        assert_eq!(
+            p.observe(ms(41.0), 60),
+            Some(40),
+            "three steps down, at once"
+        );
+        assert_eq!(
+            p.observe(ms(200.0), 60),
+            None,
+            "far past the target: released"
+        );
+    }
+
+    /// FR-112 P2d — margin 0 is exactly the pace before it.
+    #[test]
+    fn a_zero_margin_is_the_old_pace() {
+        // No whole multiple of 5: `ms` round-trips through f32, and on a step
+        // boundary the round trip may land either side.
+        let fps: [f32; 11] = [
+            52.0, 56.0, 58.0, 61.0, 63.0, 59.0, 41.0, 57.4, 62.6, 9.0, 31.0,
+        ];
+        let mut p = pace();
+        let mut old: Option<u32> = None;
+        for f in fps {
+            // 0.4.142's rule: the estimate's step, whatever the pace was.
+            let q = (f.floor() as u32 / 5) * 5;
+            old = (q + 5 <= 60).then(|| q.clamp(FPS_PACE_MIN, 60));
+            assert_eq!(p.observe(ms(f), 60), old, "at {f} fps");
+        }
+        assert_eq!(old, Some(30));
+    }
+
     #[test]
     fn disabled_pace_never_engages() {
         let mut p = FpsPace {
             paced: None,
             enabled: false,
+            up_margin_fps: SW_PACE_UP_MARGIN_FPS,
         };
         assert_eq!(p.observe(200.0, 60), None);
         assert_eq!(p.paced(), None);
@@ -597,8 +734,84 @@ mod tests {
     fn sw_pace() -> SoftwarePace {
         SoftwarePace {
             ewma_ms: 0.0,
-            pace: pace(),
+            pace: margin_pace(),
         }
+    }
+
+    /// FR-112 P2d — the field trace that found the flap: 0.4.142 on the Asahi
+    /// host with `ROOMLERD_ENCODER_CLOCK=0` (a host that cannot sustain 60),
+    /// VP9-444, a spinning cube, every window's `avg_encode_ms` from its
+    /// heartbeats (2026-10-17 23:07Z). The lab viewer stalled and the rate
+    /// controller fell, so the encode got cheaper as the session went on.
+    const FIELD_TRACE_MS: [f32; 41] = [
+        29.172, 31.996, 50.799, 42.658, 31.138, 30.422, 31.468, 22.511, 25.669, 21.652, 20.411,
+        18.848, 20.46, 18.902, 19.933, 19.028, 18.094, 18.421, 19.267, 17.384, 18.524, 16.428,
+        19.892, 20.908, 19.638, 16.807, 16.272, 17.875, 20.57, 21.785, 20.455, 18.342, 16.877,
+        16.417, 16.032, 15.102, 13.947, 16.765, 17.628, 14.568, 14.751,
+    ];
+
+    fn replay(up_margin_fps: f32) -> Vec<Option<u32>> {
+        let mut p = SoftwarePace {
+            ewma_ms: 0.0,
+            pace: FpsPace {
+                up_margin_fps,
+                ..pace()
+            },
+        };
+        FIELD_TRACE_MS.iter().map(|ms| p.observe(*ms, 60)).collect()
+    }
+
+    /// The window indexes where the pace moved, and which way (`true` = up).
+    fn moves(paces: &[Option<u32>]) -> Vec<(usize, bool)> {
+        let rate = |p: Option<u32>| p.unwrap_or(u32::MAX);
+        paces
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| w[0] != w[1])
+            .map(|(i, w)| (i + 1, rate(w[1]) > rate(w[0])))
+            .collect()
+    }
+
+    /// FR-112 P2d — margin 0 replays what 0.4.142 logged, window for window,
+    /// including the three steps it undid one or two windows later. With the
+    /// margin none comes back that soon, and the pace moves less.
+    #[test]
+    fn the_field_trace_replays_and_the_margin_calms_it() {
+        let logged: Vec<Option<u32>> = [
+            (8, Some(30)),
+            (2, Some(35)),
+            (1, Some(40)),
+            (4, Some(45)),
+            (6, Some(50)),
+            (1, Some(55)),
+            (4, Some(50)),
+            (2, Some(55)),
+            (1, Some(50)),
+            (2, Some(45)),
+            (2, Some(50)),
+            (2, Some(55)),
+            (6, None),
+        ]
+        .iter()
+        .flat_map(|(n, pace)| std::iter::repeat_n(*pace, *n))
+        .collect();
+        assert_eq!(replay(0.0), logged, "margin 0 is what 0.4.142 logged");
+
+        let undone_within_two = |m: &[(usize, bool)]| {
+            m.windows(2)
+                .filter(|w| w[0].1 != w[1].1 && w[1].0 - w[0].0 <= 2)
+                .count()
+        };
+        let old = moves(&logged);
+        let calm = moves(&replay(SW_PACE_UP_MARGIN_FPS));
+        assert_eq!(undone_within_two(&old), 3);
+        assert_eq!(undone_within_two(&calm), 0, "{calm:?}");
+        assert_eq!((old.len(), calm.len()), (12, 8), "{old:?} vs {calm:?}");
+        assert_eq!(
+            replay(SW_PACE_UP_MARGIN_FPS).last(),
+            Some(&None),
+            "still recovers"
+        );
     }
 
     /// FR-112 P2 — a software encoder that cannot hold 60 is paced to what it
