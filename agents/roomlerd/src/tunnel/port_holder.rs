@@ -132,7 +132,8 @@ pub fn describe(h: &Holder) -> String {
 }
 
 /// Look the holder of `port` up. Blocking (a table read, a process open, on
-/// Linux a `/proc` walk): call it off the async runtime.
+/// Linux a `/proc` walk, on macOS an `lsof` run of at most 5 s): call it off
+/// the async runtime.
 pub fn lookup(port: u16) -> Holder {
     let pid = listener_pid(port);
     let Some(pid) = pid else {
@@ -311,14 +312,76 @@ fn process_state(pid: u32) -> Holder {
     }
 }
 
+// ─── macOS: `lsof` names the listening process ─────────────────────────────
+
+/// The listener's PID from `lsof`, which every macOS ships at this path.
+/// The native route, libproc's socket-info flavour, needs `socket_fdinfo`
+/// and its unions, which `libc` does not declare, and a hand-copied xnu
+/// layout that is off by a field reads as a confident wrong PID. The root
+/// daemon sees every process; a per-user one sees only its own user's, so a
+/// foreign holder is `Unknown` there, as before. `lsof` lists the processes
+/// that hold the socket now, so an inheritor is named itself (never
+/// [`Holder::Gone`]). Bounded at 5 s: a lookup must never hold its thread.
+#[cfg(target_os = "macos")]
+fn listener_pid(port: u16) -> Option<u32> {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+    let mut child = std::process::Command::new("/usr/sbin/lsof")
+        // -n -P: no DNS, no port names; -b: never block in the kernel;
+        // -w: no warnings; -t: PIDs only, one per line.
+        .args(["-nP", "-b", "-w", "-t", "-sTCP:LISTEN"])
+        .arg(format!("-iTCP:{port}"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    first_pid(&out)
+}
+
+/// The first PID in `lsof -t` output, which is one PID per line.
+#[cfg(any(target_os = "macos", test))]
+fn first_pid(lsof_terse: &str) -> Option<u32> {
+    lsof_terse.lines().find_map(|l| l.trim().parse().ok())
+}
+
+#[cfg(target_os = "macos")]
+fn process_state(pid: u32) -> Holder {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buf` holds the size passed, and the call writes at most that.
+    let n = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+        )
+    };
+    let image = (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned());
+    Holder::Alive { pid, image }
+}
+
 // ─── elsewhere: no cheap, reliable answer ──────────────────────────────────
 
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 fn listener_pid(_port: u16) -> Option<u32> {
     None
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 fn process_state(pid: u32) -> Holder {
     Holder::Alive { pid, image: None }
 }
@@ -395,6 +458,14 @@ mod tests {
             image: Some(r"C:\Program Files\Roomler\roomler-desktop.exe".into()),
         });
         assert!(companion.contains("quitting the companion"), "{companion}");
+        let mac_companion = describe(&Holder::Alive {
+            pid: 10,
+            image: Some("/Applications/Roomler.app/Contents/MacOS/roomler-desktop".into()),
+        });
+        assert!(
+            mac_companion.contains("quitting the companion"),
+            "{mac_companion}"
+        );
         let foreign = describe(&Holder::Alive {
             pid: 11,
             image: Some(r"C:\Program Files\Proxy\proxy.exe".into()),
@@ -403,9 +474,19 @@ mod tests {
         assert!(describe(&Holder::Gone { pid: 52404 }).contains("no longer exists"));
     }
 
+    /// `lsof -t` (macOS): one PID per line, and the first names the holder.
+    #[test]
+    fn lsof_terse_output_names_the_first_pid() {
+        assert_eq!(first_pid("4321\n4400\n"), Some(4321));
+        assert_eq!(first_pid(" 512 \n"), Some(512));
+        assert_eq!(first_pid(""), None, "no listener: lsof prints nothing");
+        assert_eq!(first_pid("lsof: WARNING\n77\n"), Some(77));
+    }
+
     /// The lookup against a REAL listener this test binds: it must name this
-    /// very process — the one-process shape of #1035's first report.
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    /// very process — the one-process shape of #1035's first report. (CI
+    /// runs it on Windows and Linux; no lane runs roomlerd's tests on macOS.)
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     #[test]
     fn lookup_names_this_process_for_its_own_listener() {
         let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();

@@ -300,15 +300,15 @@ pub async fn maybe_start(
     // and `?` aborts the (mis)configured start.
     //
     // Multi-org P2c: with `overlay_multi_org` on, EVERY org (primary
-    // included) goes through the process-wide shared-TUN mux, keyed by its
-    // tenant id — and netstack mode is overridden (its SOCKS front and
-    // handle channel are process-global singletons; N netstack orgs would
-    // fight over them).
+    // included) gets its OWN OS TUN adapter, keyed by its tenant id (below;
+    // it replaced the shared-TUN mux W7c deleted) — and netstack mode is
+    // overridden (its SOCKS front and handle channel are process-global
+    // singletons; N netstack orgs would fight over them).
     let tun_factory: TunFactory = if cfg.overlay_multi_org {
         if netstack_socks_port(cfg).is_some() {
             warn!(
                 "overlay: OVERLAY_NETSTACK_SOCKS is set but overlay_multi_org is on — \
-                 netstack mode is single-org; using the shared OS TUN instead"
+                 netstack mode is single-org; using this org's own OS TUN instead"
             );
         }
         // Multi-org v2 — per-org adapters: each org gets its OWN device
@@ -792,8 +792,8 @@ fn netstack_tun_factory(
             org = %org_key, port = socks_port,
             "overlay netstack: another organization already serves this loopback SOCKS \
              port. This org joins no mesh until it gets its own — set \
-             `netstack_socks_port` on its [[orgs]] entry, or put both orgs on the \
-             shared OS TUN with `overlay_multi_org`."
+             `netstack_socks_port` on its [[orgs]] entry, or give both orgs an OS \
+             TUN of their own with `overlay_multi_org`."
         );
         return None;
     }

@@ -214,8 +214,8 @@ pub async fn join_org(
             info!(
                 org = %joined_label,
                 "join_org: enabled overlay_multi_org — RESTART REQUIRED before this \
-                 device can carry a second org on the shared TUN (the primary loop \
-                 still owns the adapter un-muxed)"
+                 device can carry a second org on an OS TUN of its own (the running \
+                 primary loop chose its adapter at start)"
             );
         }
     }
@@ -562,12 +562,9 @@ pub fn set_org_overlay(
                 entry.server_url, primary_server
             );
         }
-        if cfg!(target_os = "macos") {
-            println!(
-                "warning: macOS has no multi-address TUN, so a secondary cannot join \
-                 over the shared adapter. Use `netstack`."
-            );
-        }
+        // No macOS caveat: that one was about the shared adapter W7c deleted.
+        // Every org has its own utun now, and a secondary's carries its mesh
+        // on a Mac (FR-97 P1d, measured on macOS 15).
     }
     Ok(())
 }
@@ -624,9 +621,9 @@ mod fr49_tests {
         );
     }
 
-    /// A secondary gets `netstack`, never `tun`: `tun` needs the shared
-    /// adapter, `overlay_multi_org` and the same control plane, and is
-    /// impossible on macOS. A bare flag must not install OS routes.
+    /// A secondary gets `netstack`, never `tun`: `tun` needs an OS adapter
+    /// of its own, `overlay_multi_org` and the same control plane, on macOS
+    /// too. A bare flag must not install OS routes.
     #[test]
     fn overlay_flag_never_picks_tun_for_a_secondary() {
         let mut cfg = two_org_cfg();

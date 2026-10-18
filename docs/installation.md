@@ -484,8 +484,9 @@ cascades carry `h264_videotoolbox` and `hevc_videotoolbox`
 release builds `ffmpeg-encoder`; a MacBook's probe advertises both cells
 ([encoders.md](encoders.md)). Software H.264 (openh264) and VP9-4:4:4 (libvpx)
 are offered too. There is no AV1 encode: Apple ships AV1 decode only. Remote
-audio capture is unavailable on macOS today (FR-97 P2a), and per-org adapters
-are built but not yet verified on a Mac (FR-97 P1d).
+audio capture is unavailable on macOS today (FR-97 P2a). A second organization
+gets a utun of its own, as on the other two platforms (run on macOS 15, FR-97
+P1d).
 
 ### Uninstall
 
