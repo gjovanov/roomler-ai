@@ -13,7 +13,9 @@ use mongodb::{Database, options::ReturnDocument};
 use roomler_ai_services::dao::base::{BaseDao, DaoError, DaoResult, escape_regex};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{VaultAuditEvent, VaultPolicy, VaultRole, VaultSecret, VaultVersion};
+use crate::model::{
+    VaultAuditEvent, VaultLease, VaultPolicy, VaultRole, VaultSecret, VaultVersion,
+};
 
 /// The most roles, and the most policies, an organization keeps.
 pub const MAX_ROLES: i64 = 200;
@@ -69,6 +71,17 @@ impl VaultSecretDao {
     /// foreign id or a bogus one alike.
     pub async fn get_live(&self, tenant_id: ObjectId, id: ObjectId) -> DaoResult<VaultSecret> {
         self.base.find_live_by_id_in_tenant(tenant_id, id).await
+    }
+
+    /// P3-3b — the organization's live secret at `path`, as a lease names it.
+    pub async fn find_live_by_path(
+        &self,
+        tenant_id: ObjectId,
+        path: &str,
+    ) -> DaoResult<Option<VaultSecret>> {
+        self.base
+            .find_one(doc! { "tenant_id": tenant_id, "path": path, "deleted_at": null })
+            .await
     }
 
     /// Set metadata on a live secret. `false` when there is none.
@@ -186,6 +199,18 @@ impl VaultVersionDao {
 
     pub async fn insert(&self, v: &VaultVersion) -> DaoResult<ObjectId> {
         self.base.insert_one(v).await
+    }
+
+    /// P3-3b — one version, sealed bytes and all: what a lease opens.
+    pub async fn get(
+        &self,
+        secret_id: ObjectId,
+        field: &str,
+        n: i64,
+    ) -> DaoResult<Option<VaultVersion>> {
+        self.base
+            .find_one(doc! { "secret_id": secret_id, "field": field, "n": n })
+            .await
     }
 
     /// A secret's versions, newest first per field — never their bytes.
@@ -463,5 +488,23 @@ impl VaultPolicyDao {
 
     pub async fn tombstone(&self, tenant_id: ObjectId, id: ObjectId) -> DaoResult<bool> {
         tombstone_row(&self.base, doc! { "_id": id, "tenant_id": tenant_id }).await
+    }
+}
+
+/// P3-3b — `vault_leases`: what was released to which session.
+pub struct VaultLeaseDao {
+    pub base: BaseDao<VaultLease>,
+}
+
+impl VaultLeaseDao {
+    pub fn new(db: &Database) -> Self {
+        Self {
+            base: BaseDao::new(db, VaultLease::COLLECTION),
+        }
+    }
+
+    /// Record a lease; its id is the one the device is told.
+    pub async fn insert(&self, lease: &VaultLease) -> DaoResult<ObjectId> {
+        self.base.insert_one(lease).await
     }
 }

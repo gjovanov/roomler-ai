@@ -49,6 +49,9 @@ pub mod setup_diagnostics;
 pub mod signaling;
 pub mod turn_creds;
 pub mod turn_url;
+/// FR-90 P3-3b — the vault's lease vocabulary: refusal words and bounds both
+/// ends read.
+pub mod vault;
 pub mod worker_pick;
 
 pub use error::{Error, Result};

@@ -29,11 +29,12 @@ use axum::{
 };
 use roomler_ai_config::Settings;
 use roomler_ai_db::indexes::{IndexSet, index, index_ttl, index_unique, index_unique_partial};
-use roomler_core::{Capabilities, Core, Hooks, Module, TenantCtx};
+use roomler_core::{AgentSocketHooks, Capabilities, Core, Hooks, Module, TenantCtx};
 
 pub mod crypto;
 pub mod dao;
 pub mod gate;
+pub mod lease;
 pub mod model;
 pub mod policy;
 pub mod policy_routes;
@@ -51,6 +52,15 @@ pub struct VaultState {
     /// P3-2 — the roles sessions assume, and the policies over them.
     pub roles: Arc<dao::VaultRoleDao>,
     pub policies: Arc<dao::VaultPolicyDao>,
+    /// P3-3b — what was released to which session.
+    pub leases: Arc<dao::VaultLeaseDao>,
+    /// P3-3b — a lease is believed from the session record's device at its
+    /// fence (hive's DAO, re-created: it is stateless), and sealed to the key
+    /// on that device's row.
+    pub sessions: Arc<roomler_ai_mod_hive::dao::AgentSessionDao>,
+    pub agents: Arc<roomler_ai_services::dao::agent::AgentDao>,
+    /// P3-3b — each session's lease requests per minute on its device.
+    pub lease_limiter: Arc<roomler_core::rate_limit::RateLimiter>,
     /// The organizations the vault serves (`vault.tenants`).
     pub scope: Arc<scope::TenantScope>,
     /// The KEK, or why there is none: read once at boot.
@@ -75,8 +85,10 @@ impl FromRef<VaultState> for Core {
 impl Module for VaultState {
     const ID: &'static str = "vault";
 
-    /// Core alone in P3-1: the edges to `hive` and `fleet` come with the
-    /// steps that use them.
+    /// No module STATE: hive's session reads go through its stateless DAO
+    /// (the graph's `vault → hive` edge, FR-69 rule 5), and an answer to a
+    /// device goes back on the connection it came from. `fleet`'s Hub — to
+    /// push a revocation — is P3-3c's.
     type Deps = ();
 
     async fn init(core: Core, settings: &Settings, _deps: ()) -> anyhow::Result<Self> {
@@ -87,16 +99,32 @@ impl Module for VaultState {
         // metadata routes working and answers 503 where the key is needed.
         let kek = crypto::KekState::load(&settings.vault);
         kek.log();
-        Ok(Self {
+        let state = Self {
             secrets: Arc::new(dao::VaultSecretDao::new(db)),
             versions: Arc::new(dao::VaultVersionDao::new(db)),
             audit: Arc::new(dao::VaultAuditDao::new(db)),
             roles: Arc::new(dao::VaultRoleDao::new(db)),
             policies: Arc::new(dao::VaultPolicyDao::new(db)),
+            leases: Arc::new(dao::VaultLeaseDao::new(db)),
+            sessions: Arc::new(roomler_ai_mod_hive::dao::AgentSessionDao::new(db)),
+            agents: Arc::new(roomler_ai_services::dao::agent::AgentDao::new(db)),
+            lease_limiter: Arc::new(roomler_core::rate_limit::RateLimiter::new()),
             scope: Arc::new(scope),
             kek,
             core,
-        })
+        };
+        // P3-3b — the agent socket is fleet's; a device's `rc:vault.lease`
+        // is dispatched here by `ClientMsg::namespace()`, and each
+        // connection gets its own lease queue at its hello.
+        let socket = Arc::new(lease::LeaseSocket::new(state.clone()));
+        state.core.agent_socket.register(
+            Self::ID,
+            AgentSocketHooks {
+                handler: Some(socket.clone()),
+                lifecycle: Some(socket),
+            },
+        );
+        Ok(state)
     }
 
     /// The module switch, or a `vault.tenants` list.
@@ -230,6 +258,17 @@ impl Module for VaultState {
                     ),
                     // The organization's set, oldest first.
                     index(bson::doc! { "tenant_id": 1, "deleted_at": 1, "created_at": 1 }),
+                ],
+            },
+            // P3-3b — leases: a session's, for its revocation (P3-3c); gone a
+            // week after they expire, while the audit keeps the decision for
+            // 90 days.
+            IndexSet {
+                collection: model::VaultLease::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index(bson::doc! { "tenant_id": 1, "session_id": 1 }),
+                    index_ttl(bson::doc! { "expires_at": 1 }, 7 * 24 * 60 * 60),
                 ],
             },
         ]

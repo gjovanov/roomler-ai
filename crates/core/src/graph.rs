@@ -28,16 +28,17 @@ pub const MODULES: &[&str] = &[
 /// `network`: it reaches a device over the control WS like exec does, and
 /// session content travels device-to-browser, never through a module.
 ///
-/// FR-90 P3 — `vault` has no edge yet: P3-1 is the store, on core alone.
-/// Its two (`vault → hive`: a session's record, role and room; `vault →
-/// fleet`: devices, their vault keys, the Hub) come with the steps that use
-/// them, and hive never calls the vault.
+/// FR-90 P3 — `vault → hive` (P3-3b): a lease is believed only from the
+/// device a session's record places it on, at its fence, read through hive's
+/// own DAO. `vault → fleet` (the Hub, to push a revocation) comes with P3-3c.
+/// Hive never calls the vault: it asks through core's `SessionGate` hook.
 pub const EDGES: &[(&str, &str)] = &[
     ("conference", "chat"),
     ("remote", "fleet"),
     ("network", "fleet"),
     ("hive", "fleet"),
     ("hive", "chat"),
+    ("vault", "hive"),
 ];
 
 /// The modules `id` may call, besides core.

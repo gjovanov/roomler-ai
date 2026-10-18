@@ -248,6 +248,11 @@ mod usage_ledger_tests;
 /// hello, never a malformed one, and gone with the hello that drops it.
 #[cfg(test)]
 mod vault_key_tests;
+/// FR-90 P3-3b — leases: sealed to the device's key, believed only from the
+/// session record's device at its fence, decided by Cedar with the device's
+/// facts from its row, recorded before they are sent.
+#[cfg(test)]
+mod vault_lease_tests;
 /// FR-90 P3-1 — the vault's store: off until turned on, administrators
 /// only and every decision recorded, no answer carrying a value, sealed
 /// bytes that do not open where they were moved, no sealing without a KEK.

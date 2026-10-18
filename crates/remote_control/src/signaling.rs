@@ -1226,6 +1226,34 @@ pub enum ClientMsg {
         reason: String,
     },
 
+    /// FR-90 P3-3b — a session on this device asks the vault for a value. The
+    /// vault believes it only from the device the session's record places it
+    /// on, at the record's fence, and answers on this connection with
+    /// [`ServerMsg::VaultLeased`] (the value sealed to this daemon's vault
+    /// key) or [`ServerMsg::VaultRefused`], naming `req_id`. Bounds:
+    /// [`crate::vault::lease_limits`].
+    #[serde(rename = "rc:vault.lease")]
+    VaultLease {
+        /// The device's own id for this request, echoed in the answer.
+        req_id: String,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        /// The secret, by its path or its RRN (`rrn:{org}:secret:{path}`).
+        secret: String,
+        /// The field; empty or absent = `value`, a static secret's one field.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        field: String,
+        /// How the session will use it (`env`, `file`, `exec`, `proxy`…):
+        /// what a policy reads as `context.mode`.
+        mode: String,
+        /// Where the value is meant for; a policy's `context.audience`.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        audience: String,
+        /// How long the session wants it, in seconds. The vault clamps it.
+        ttl_secs: u32,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -1932,6 +1960,8 @@ pub enum Owner {
     /// FR-90 — agent sessions: a device's answer to a start, and each
     /// session's lifecycle.
     Hive,
+    /// FR-90 P3-3b — the vault: a session's lease requests.
+    Vault,
 }
 
 impl Owner {
@@ -1942,6 +1972,7 @@ impl Owner {
             Owner::Remote => "remote",
             Owner::Network => "network",
             Owner::Hive => "hive",
+            Owner::Vault => "vault",
         }
     }
 }
@@ -1987,6 +2018,7 @@ impl ClientMsg {
             ClientMsg::HiveViewAnswer { .. } => "rc:hive.view.answer",
             ClientMsg::HiveViewIce { .. } => "rc:hive.view.ice",
             ClientMsg::HiveViewClosed { .. } => "rc:hive.view.closed",
+            ClientMsg::VaultLease { .. } => "rc:vault.lease",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -2096,6 +2128,7 @@ impl ClientMsg {
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
             | ClientMsg::HiveViewClosed { .. } => Owner::Hive,
+            ClientMsg::VaultLease { .. } => Owner::Vault,
         }
     }
 }
@@ -2141,6 +2174,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:hive.view.answer", Owner::Hive),
     ("rc:hive.view.ice", Owner::Hive),
     ("rc:hive.view.closed", Owner::Hive),
+    ("rc:vault.lease", Owner::Vault),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -3925,6 +3959,27 @@ pub enum ServerMsg {
         #[serde(default)]
         reason: String,
     },
+
+    /// FR-90 P3-3b — the vault leased a value: `sealed` is a libsodium sealed
+    /// box (`crypto_box_seal`, standard base64) for the vault key the
+    /// device's hello carried, which only that daemon opens. Sent only on the
+    /// connection that asked ([`ClientMsg::VaultLease`]), never pushed.
+    #[serde(rename = "rc:vault.leased")]
+    VaultLeased {
+        req_id: String,
+        /// The vault's id for this lease (`vault_leases.lease_id`).
+        lease_id: String,
+        /// The version leased, as the vault numbers a field's versions.
+        n: i64,
+        sealed: String,
+        /// When the device must drop it.
+        expires_at_ms: i64,
+    },
+
+    /// FR-90 P3-3b — the vault refused a lease, in one word from
+    /// [`crate::vault::LeaseRefusal`]. Never says which policy decided.
+    #[serde(rename = "rc:vault.refused")]
+    VaultRefused { req_id: String, reason: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
