@@ -48,7 +48,7 @@ use roomler_ai_remote_control::{
     error::Error as HubError,
     models::{
         Agent, ExecAuditEvent, ExecDenyReason, ExecMode, ExecOutcome, ExecPending, ExecPolicy,
-        ExecRunAs, OsKind, exec_limits,
+        ExecRunAs, OsKind, RpcCap, exec_limits,
     },
     signaling::ServerMsg,
 };
@@ -351,11 +351,14 @@ pub async fn authorize(
     }
 
     // FR-94 P4 — a policy that runs commands as the signed-in user needs the
-    // device's SYSTEM service: only SYSTEM may ask for the console user's
-    // token. Without that path the command would run as the worker, which in
-    // SystemContext mode is SYSTEM, the opposite of what the policy says.
+    // device's SYSTEM service on Windows: only SYSTEM may ask for the console
+    // user's token. Without that path the command would run as the worker,
+    // which in SystemContext mode is SYSTEM, the opposite of what the policy
+    // says. FR-97 P5a — a Linux or macOS daemon drops to the person at its
+    // screen itself, which only a build advertising `console-user` does.
     if agent.exec_policy.run_as == ExecRunAs::ConsoleUser
         && !crate::exec_service::routes_via_service(state, agent)
+        && !drops_to_console_user(state, agent)
     {
         return Err(ExecDenyReason::RunAsUnavailable);
     }
@@ -434,7 +437,7 @@ pub async fn dispatch(
 
     let (audit, outcome) = match authorize(state, tenant_id, agent, caller, &shell).await {
         Err(reason) => {
-            let message = deny_message(reason);
+            let message = deny_message(reason, agent.os);
             warn!(
                 %agent_id, user = %caller.user_id, ?reason,
                 "fleet-rpc: refused"
@@ -446,6 +449,13 @@ pub async fn dispatch(
             // FR-94 — a Windows device anchored for SYSTEM exec gets the
             // command through its service; every other device, as before.
             let via_service = crate::exec_service::routes_via_service(state, agent);
+            let run_as = agent.exec_policy.run_as;
+            // FR-97 P5a — a `console_user` command that takes no SYSTEM
+            // service goes to a Linux or macOS daemon that drops to the person
+            // at its screen (`authorize` refused every other device), told so
+            // in the frame. The hub refuses the push to a connection without
+            // the word.
+            let as_person = run_as == ExecRunAs::ConsoleUser && !via_service;
             let msg = ServerMsg::RpcExec {
                 request_id: request_id.clone(),
                 shell: shell.clone(),
@@ -456,6 +466,7 @@ pub async fn dispatch(
                 caller: caller.display.clone(),
                 consent_mode: Some(consent_mode),
                 via_service,
+                run_as: as_person.then(|| run_as.wire().to_string()),
             };
             // An attended device spends up to the prompt window waiting for a
             // human BEFORE the command's own budget starts, so the two are
@@ -464,7 +475,6 @@ pub async fn dispatch(
             if consent_mode != roomler_ai_remote_control::models::ConsentMode::Auto {
                 deadline += CONSENT_GRACE;
             }
-            let run_as = agent.exec_policy.run_as;
             let result = if via_service {
                 run_via_service(
                     state,
@@ -490,8 +500,16 @@ pub async fn dispatch(
                 Ok(outcome) => {
                     // FR-94 — the server's own routing decision. The device's
                     // claim about its identity rides in `outcome.ran_as`.
-                    audit.ran_as =
-                        Some(if via_service { run_as.wire() } else { "worker" }.to_string());
+                    // FR-97 P5a — and a daemon told to drop to the person at
+                    // its screen ran it as `console_user`.
+                    audit.ran_as = Some(
+                        if via_service || as_person {
+                            run_as.wire()
+                        } else {
+                            "worker"
+                        }
+                        .to_string(),
+                    );
                     audit.exit_code = outcome.exit_code;
                     audit.duration_ms = Some(outcome.duration_ms);
                     audit.truncated = outcome.truncated;
@@ -507,6 +525,14 @@ pub async fn dispatch(
                     );
                     (audit, outcome)
                 }
+                // FR-97 P5a — the connection the push found does not drop to
+                // the person at the screen (a rollback since `authorize`
+                // looked), so the hub sent nothing.
+                Err(HubError::ExecUnsupported(_)) if as_person => deny(
+                    audit,
+                    ExecDenyReason::RunAsUnavailable,
+                    deny_message(ExecDenyReason::RunAsUnavailable, agent.os),
+                ),
                 // The device is online but too old to understand the frame.
                 // A distinct reason, because "upgrade the agent" is a
                 // completely different action from "turn the feature on".
@@ -636,7 +662,9 @@ async fn run_via_service(
     .await
 }
 
-fn deny_message(reason: ExecDenyReason) -> String {
+/// What the caller reads for a refusal. `os` is the device's: FR-97 P5a's
+/// `console_user` is a different path on Windows and off it.
+fn deny_message(reason: ExecDenyReason, os: OsKind) -> String {
     match reason {
         ExecDenyReason::OrgDisabled => {
             "remote execution is disabled for this organization".to_string()
@@ -672,13 +700,37 @@ fn deny_message(reason: ExecDenyReason) -> String {
         ExecDenyReason::ClaimRefused => {
             "the device's service claimed a command that is not pending for it".to_string()
         }
-        ExecDenyReason::RunAsUnavailable => {
+        ExecDenyReason::RunAsUnavailable if matches!(os, OsKind::Windows) => {
             "this device's policy runs commands as the signed-in user, which only its SYSTEM \
              service can do: an administrator has not anchored it (`roomlerd anchor`), or its \
              service is not running"
                 .to_string()
         }
+        // FR-97 P5a — off Windows the daemon itself drops to that person, and
+        // only a build that advertises `console-user` does.
+        ExecDenyReason::RunAsUnavailable => {
+            "this device's policy runs commands as the person at its screen, and the agent it \
+             runs cannot: update the agent"
+                .to_string()
+        }
     }
+}
+
+/// FR-97 P5a — may a `console_user` command go to this device's own process,
+/// which drops to the person at its screen? A Linux or macOS device whose
+/// connection here advertises `console-user`, or one connected to no pod
+/// here: its push answers "offline", which is the truth, and the hub checks
+/// the word again at the push (`Hub::exec_on_agent`). Windows reaches that
+/// person only through its SYSTEM service (FR-94).
+fn drops_to_console_user(state: &FleetState, agent: &Agent) -> bool {
+    if matches!(agent.os, OsKind::Windows) {
+        return false;
+    }
+    // Not connected here (`None`): let the push say "offline".
+    agent
+        .id
+        .and_then(|id| state.rc_hub.agent_supports_console_user(id))
+        .unwrap_or(true)
 }
 
 /// Trim the persisted output sample on a CHARACTER boundary — a byte-slice of
@@ -901,9 +953,17 @@ pub async fn set_policy(
 
     // FR-94 P4 — absent keeps what is stored (see `ExecPolicyBody::run_as`).
     let run_as = body.run_as.unwrap_or(agent.exec_policy.run_as);
-    if run_as == ExecRunAs::ConsoleUser && !matches!(agent.os, OsKind::Windows) {
+    // FR-97 P5a — off Windows the daemon drops to the person at the screen
+    // itself, which only a build advertising `console-user` does. Read from
+    // the stored hello: a policy is a standing rule, and the hub checks the
+    // live connection again at every command.
+    if run_as == ExecRunAs::ConsoleUser
+        && !matches!(agent.os, OsKind::Windows)
+        && !agent.capabilities.has_rpc(RpcCap::ConsoleUser)
+    {
         return Err(ApiError::BadRequest(
-            "`console_user` is a Windows mode: a Linux or macOS daemon runs commands as root"
+            "this device's agent cannot run commands as the person at its screen: update it, \
+             or run commands as root"
                 .into(),
         ));
     }
@@ -1172,12 +1232,30 @@ mod tests {
             ExecDenyReason::ConsentDenied,
             ExecDenyReason::RateLimited,
             ExecDenyReason::AgentDisabled,
+            ExecDenyReason::SystemRequired,
+            ExecDenyReason::ClaimRefused,
+            ExecDenyReason::RunAsUnavailable,
         ] {
-            let m = deny_message(r);
-            assert!(!m.is_empty(), "{r:?} has no message");
-            // "Forbidden" tells an operator nothing about which of four gates
-            // said no, which is the entire diagnostic value here.
-            assert!(m.len() > 15, "{r:?} message is too terse: {m}");
+            for os in [OsKind::Windows, OsKind::Linux, OsKind::Macos] {
+                let m = deny_message(r, os);
+                assert!(!m.is_empty(), "{r:?} has no message");
+                // "Forbidden" tells an operator nothing about which of four
+                // gates said no, which is the entire diagnostic value here.
+                assert!(m.len() > 15, "{r:?} message is too terse: {m}");
+            }
+        }
+    }
+
+    /// FR-97 P5a — `console_user` unavailable reads as the path that device
+    /// takes: its SYSTEM service on Windows, its agent's own drop elsewhere.
+    #[test]
+    fn console_user_unavailable_names_the_path_its_os_takes() {
+        let windows = deny_message(ExecDenyReason::RunAsUnavailable, OsKind::Windows);
+        assert!(windows.contains("roomlerd anchor"), "{windows}");
+        for os in [OsKind::Linux, OsKind::Macos] {
+            let m = deny_message(ExecDenyReason::RunAsUnavailable, os);
+            assert!(m.contains("person at its screen"), "{m}");
+            assert!(!m.contains("anchor"), "{m}");
         }
     }
 }

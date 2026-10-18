@@ -129,9 +129,10 @@ pub struct ExecRequest {
     pub caller: String,
     /// Which local account to run as.
     ///
-    /// Fleet RPC always leaves this [`RunAs::Daemon`] — its whole purpose is
-    /// privileged diagnostics — so exec behaves exactly as it always has.
-    /// Roomler SSH sets it from the device's policy.
+    /// Fleet RPC leaves this [`RunAs::Daemon`] — its whole purpose is
+    /// privileged diagnostics — unless the device's policy names the person
+    /// at the screen, which the frame's `run_as` says (FR-97 P5a, Linux and
+    /// macOS). Roomler SSH sets it from the device's policy.
     #[allow(dead_code)]
     pub run_as: RunAs,
 }
@@ -745,10 +746,13 @@ pub enum RunAs {
     /// A named local account. Unix only: Windows has no way to become an
     /// arbitrary local user without that user's credentials.
     Named(String),
-    /// The user signed in at the console, via their session token. Windows
-    /// only: spawned through `CreateProcessAsUserW` (`win_console`) for exec,
-    /// the pty, and since FR-97 P4b the `sftp` subsystem; never configured on
-    /// a `tokio::process::Command` (see [`apply_run_as`]).
+    /// The person signed in at this machine's screen. On Windows by their
+    /// session token: spawned through `CreateProcessAsUserW` (`win_console`)
+    /// for exec, the pty, and since FR-97 P4b the `sftp` subsystem, never
+    /// configured on a `tokio::process::Command`. On Linux and macOS (FR-97
+    /// P5a) the account at logind's seat0 or owning `/dev/console`, by the
+    /// drop a [`Self::Named`] account takes. Refused when nobody is there
+    /// (see [`apply_run_as`]).
     ConsoleUser,
 }
 
@@ -793,8 +797,8 @@ impl RunAs {
 ///
 /// `pub(crate)` so the PTY path ([`crate::pty`]) applies the SAME rules rather
 /// than growing a second identity model for interactive sessions. Every
-/// refusal here — `console_user` off Windows, `named` on Windows — is a refusal
-/// there too, in the same words.
+/// refusal here — `console_user` with nobody at the screen, `named` on
+/// Windows — is a refusal there too, in the same words.
 pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Result<(), String> {
     // Only the Unix drop path configures the command. On Windows every
     // non-daemon mode is currently a refusal, so nothing is set — which is the
@@ -826,13 +830,36 @@ pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Re
              path, not configured on a Command"
                 .into(),
         ),
-        #[cfg(not(windows))]
-        RunAs::ConsoleUser => Err(
-            "account_mode `console_user` is a Windows concept — there is no console session token \
-             to assume here. Name a local account instead."
-                .into(),
-        ),
+        // FR-97 P5a (D7) — the person at this machine's screen, by the drop a
+        // named account takes. A drop, never a gain: refused when nobody is
+        // there, when that person is root, and by a daemon that is neither
+        // root nor them.
+        #[cfg(unix)]
+        RunAs::ConsoleUser => unix_priv::drop_to_console(cmd, &console_account()?),
+        #[cfg(not(any(windows, unix)))]
+        RunAs::ConsoleUser => {
+            Err("account_mode `console_user` has no console to read on this platform".into())
+        }
     }
+}
+
+/// FR-97 P5a — the account of the person at this machine's screen, for
+/// `console_user` off Windows (D7): logind's seat0 on Linux
+/// (`companion::seat0_user`), the owner of `/dev/console` on macOS
+/// (`companion::console_user_name`). The error names the mode and why
+/// nobody is there.
+#[cfg(unix)]
+fn console_account() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    let who = crate::companion::console_user_name();
+    #[cfg(not(target_os = "macos"))]
+    let who = crate::companion::seat0_user();
+    who.map_err(|e| {
+        format!(
+            "account_mode `console_user` runs as the person at this machine's screen, and cannot \
+             here: {e:#}"
+        )
+    })
 }
 
 /// FR-90 — a Hive session's state lives under its account's home; the home
@@ -1318,6 +1345,46 @@ mod unix_priv {
         Ok(())
     }
 
+    /// FR-97 P5a — [`drop_to`] for `console_user`: `account` is the person at
+    /// the screen. A root daemon drops to them. A daemon already running as
+    /// them (a per-user install whose owner is at the screen) runs the
+    /// command as itself, which changes no identity, and could not drop
+    /// anyway: `setgroups` needs root even to keep its own groups. Any other
+    /// daemon cannot become them, and says so. uid 0 is refused by
+    /// [`resolve`], as for a named account.
+    pub(super) fn drop_to_console(
+        cmd: &mut tokio::process::Command,
+        account: &str,
+    ) -> Result<(), String> {
+        let acct = resolve(account)?;
+        // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+        let must_drop = console_drop(unsafe { libc::geteuid() }, &acct)?;
+        cmd.env("HOME", &acct.home)
+            .env("USER", &acct.name)
+            .env("LOGNAME", &acct.name);
+        if must_drop {
+            // SAFETY: see `drop_body`.
+            unsafe { cmd.pre_exec(drop_body(&acct)) };
+        }
+        Ok(())
+    }
+
+    /// The pure half of [`drop_to_console`]: must a daemon running as
+    /// `daemon` drop to `acct` (`true`), or is it already them (`false`)?
+    fn console_drop(daemon: libc::uid_t, acct: &Account) -> Result<bool, String> {
+        if daemon == 0 {
+            return Ok(true);
+        }
+        if daemon == acct.uid {
+            return Ok(false);
+        }
+        Err(format!(
+            "account_mode `console_user` would run as {}, the person at this machine's screen, \
+             and this daemon runs as uid {daemon}, not root, so it cannot become them",
+            acct.name
+        ))
+    }
+
     /// The same drop for a synchronous `std::process::Command`.
     ///
     /// FR-45's portal helper needs it: that spawn happens on the capture
@@ -1346,6 +1413,27 @@ mod unix_priv {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// FR-97 P5a — `console_user` is a drop, never a gain: a root daemon
+        /// drops to the person at the screen, a daemon that is that person
+        /// runs as itself, and any other daemon is refused in words that name
+        /// the mode and the person.
+        #[test]
+        fn console_user_drops_from_root_runs_as_itself_and_refuses_otherwise() {
+            let person = Account {
+                uid: 1000,
+                gid: 1000,
+                groups: vec![1000, 27],
+                home: "/home/ana".into(),
+                name: "ana".into(),
+            };
+            assert_eq!(console_drop(0, &person), Ok(true), "root drops");
+            assert_eq!(console_drop(1000, &person), Ok(false), "ana is ana");
+            let refused = console_drop(1001, &person).unwrap_err();
+            assert!(refused.contains("`console_user`"), "{refused}");
+            assert!(refused.contains("would run as ana"), "{refused}");
+            assert!(refused.contains("uid 1001, not root"), "{refused}");
+        }
 
         /// FR-90 decision 13 — an agent session holds none of its account's
         /// administrator groups and every other group, in order, and an
@@ -2189,9 +2277,16 @@ mod tests {
     async fn an_unavailable_identity_refuses_instead_of_running_as_the_daemon() {
         let engine = ExecEngine::new();
 
-        // `console_user` on Unix and `named` on Windows are both
-        // structurally impossible, so exactly one of these is the local case —
-        // and whichever it is, it must refuse.
+        // `named` on Windows is structurally impossible. On Unix (FR-97 P5a)
+        // `console_user` is impossible wherever nobody is at the screen,
+        // which is every CI runner; a desktop running the tests as the
+        // person at it can honour it, so there this half proves nothing and
+        // says so rather than pass.
+        #[cfg(unix)]
+        if console_account().is_ok() {
+            eprintln!("skipped: someone is at this machine's screen, so console_user can run");
+            return;
+        }
         let impossible = if cfg!(windows) {
             RunAs::Named("nobody".into())
         } else {

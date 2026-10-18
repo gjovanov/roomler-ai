@@ -62,9 +62,9 @@
           density="compact"
           class="mt-2"
         >
-          This device had been set to <strong>the signed-in user</strong>, which only exists
-          on Windows — the agent refuses it here, so every session was failing at connect
-          time. Pick an account and save to fix it.
+          This device had been set to <strong>the signed-in user</strong>, which its agent
+          cannot do — it refuses it, so every session was failing at connect time. Update
+          the agent, or pick an account and save to fix it.
         </v-alert>
         <div
           v-if="isWindows && servedBySystem"
@@ -88,11 +88,17 @@
           attended install serves it only through the device's SYSTEM service, which
           an administrator turns on there with <code>roomlerd anchor ssh system</code>.
         </div>
-        <div v-else class="text-caption text-medium-emphasis mb-4">
-          <strong>A named account</strong> is the least surprising choice here.
-          <strong>The daemon account</strong> means <strong>root</strong> under
-          systemd — choosing it grants root on this device. "The signed-in user"
-          is not offered: it needs a Windows console session token.
+        <div v-else class="text-caption text-medium-emphasis mb-4" data-test="ssh-identity-unix">
+          <strong>A named account</strong> is the least surprising choice on a server.
+          <template v-if="offersConsoleUser">
+            <strong>The person at the device's screen</strong> is whoever is signed in
+            at its own screen, and a session is refused while nobody is.
+          </template>
+          <strong>The daemon account</strong> means <strong>root</strong> — choosing it
+          grants root on this device.
+          <template v-if="!offersConsoleUser">
+            "The person at the device's screen" needs a newer agent on this device.
+          </template>
         </div>
 
         <v-text-field
@@ -183,7 +189,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useAgentStore, type Agent, type SshPolicy } from '@/stores/agents'
-import { servesSshAsSystem } from '@/utils/sshIdentity'
+import { dropsToConsoleUser, servesSshAsSystem } from '@/utils/sshIdentity'
 
 const props = defineProps<{
   modelValue: boolean
@@ -207,13 +213,19 @@ const error = ref('')
 const agent = computed(() => props.agent)
 const orgDisabled = computed(() => agentStore.orgSshEnabled === false)
 
-/** `console_user` is a WINDOWS concept — it is `WTSQueryUserToken` +
- *  `CreateProcessAsUserW`, and the agent refuses it outright on Unix
- *  (`agents/roomlerd/src/exec.rs`, `pty/unix.rs`). Offering it on a Linux or
- *  macOS device produces a policy no agent can ever honour, and the failure
- *  surfaces at CONNECT time with "name a local account instead" — at a shell
- *  prompt, about a field that lives in this dialog. */
 const isWindows = computed(() => agent.value?.os === 'windows')
+
+/** `console_user` is the person at the device's screen: on Windows by their
+ *  session token (`WTSQueryUserToken` + `CreateProcessAsUserW`), and on Linux
+ *  and macOS (FR-97 P5a) by the agent's own drop to them, which only an agent
+ *  saying `console-user` makes — an older one refuses it outright
+ *  (`agents/roomlerd/src/exec.rs`, `pty/unix.rs`). Offering it there produces
+ *  a policy that agent can never honour, and the failure surfaces at CONNECT
+ *  time — at a shell prompt, about a field that lives in this dialog. The
+ *  server refuses to store it too. */
+const offersConsoleUser = computed(
+  () => isWindows.value || dropsToConsoleUser(agent.value?.capabilities?.rpc),
+)
 
 /** FR-105 — does this device serve SSH through its SYSTEM service now? Then
  *  both Windows identities are definite: SYSTEM, and the person at the
@@ -263,8 +275,15 @@ const namedAccount = computed({
 })
 
 const accountOptions = computed(() => [
-  ...(isWindows.value
-    ? [{ title: 'The signed-in user at the device', value: 'console_user' }]
+  ...(offersConsoleUser.value
+    ? [
+        {
+          title: isWindows.value
+            ? 'The signed-in user at the device'
+            : "The person at the device's screen",
+          value: 'console_user',
+        },
+      ]
     : []),
   {
     title: !isWindows.value
@@ -297,9 +316,10 @@ watch(
     coercedFromConsoleUser.value = false
     draft.value = { ...emptyPolicy(isWindows.value), ...(agent.value?.ssh_policy ?? {}) }
     // A policy stored before this gate existed can still say `console_user` on a Unix
-    // device. Show the corrected value with the reason rather than a select with no
-    // matching option — the dialog is where it gets fixed, so it should present the fix.
-    if (!isWindows.value && draft.value.account_mode === 'console_user') {
+    // device whose agent cannot honour it. Show the corrected value with the reason
+    // rather than a select with no matching option — the dialog is where it gets
+    // fixed, so it should present the fix.
+    if (!offersConsoleUser.value && draft.value.account_mode === 'console_user') {
       draft.value.account_mode = 'named'
       coercedFromConsoleUser.value = true
     }

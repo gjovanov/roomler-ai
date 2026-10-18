@@ -125,6 +125,13 @@ pub struct ConnectedAgent {
     /// worker's health ring. Per connection and re-announced, exactly as
     /// [`Self::supports_exec_system`].
     pub supports_ssh_system: bool,
+    /// FR-97 P5a — the agent advertises `console-user`: a Linux or macOS
+    /// build that runs a command as the person at its screen when the frame
+    /// says `run_as: console_user`. Per CONNECTION, never read from the
+    /// stored row: an older agent ignores the field and runs the command as
+    /// root, so after a rollback the row's promise would be exactly that.
+    /// `false` ⇒ [`Hub::exec_on_agent`] refuses such a frame.
+    pub supports_console_user: bool,
     /// Roomler SSH — the agent advertises `AgentCaps.rpc` containing `ssh`,
     /// i.e. it was built with the `ssh-server` feature and will record an
     /// `rc:ssh.grant`. Same rationale as [`Self::supports_exec`]: pushing a
@@ -596,6 +603,19 @@ pub struct StartedExec {
     _guard: ExecWaiterGuard,
 }
 
+/// FR-97 P5a — does this frame ask the device to run a command as someone
+/// other than itself (`rc:rpc.exec` carrying `run_as`)? Only a connection
+/// advertising `console-user` may be sent one.
+fn asks_console_user(msg: &ServerMsg) -> bool {
+    matches!(
+        msg,
+        ServerMsg::RpcExec {
+            run_as: Some(_),
+            ..
+        }
+    )
+}
+
 /// Emitted by [`Hub::create_session`] to have the API layer notify the device
 /// OWNER. Two flavours, distinguished by `override_reason`:
 /// * `None` — Email/Push consent modes: the owner must APPROVE (the API persists
@@ -776,6 +796,9 @@ impl Hub {
             supports_exec_system: false,
             // FR-105 — the same: an unrecorded word takes the worker path.
             supports_ssh_system: false,
+            // FR-97 P5a — set right after registration; an agent whose word
+            // is never recorded is sent no `run_as`.
+            supports_console_user: false,
             supports_ssh: false,
             // Same setter, same reasoning: `false` = answered without waiting,
             // exactly as before FR-83.
@@ -2291,6 +2314,26 @@ impl Hub {
             .map(|a| a.supports_ssh_system)
     }
 
+    /// FR-97 P5a — record whether this connection runs a command as the
+    /// person at its screen (`console-user`). Called after registration. A
+    /// property of the build, so a caps re-announcement cannot change it.
+    /// No-op if the agent is already gone.
+    pub fn set_agent_console_user_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_console_user = supports;
+        }
+    }
+
+    /// FR-97 P5a — does the agent, connected to THIS pod, run a command as
+    /// the person at its screen? `None` = not connected here: exec reaches
+    /// only an agent on this pod anyway ([`Self::exec_on_agent`]).
+    pub fn agent_supports_console_user(&self, agent_id: ObjectId) -> Option<bool> {
+        self.inner
+            .agents
+            .get(&agent_id)
+            .map(|a| a.supports_console_user)
+    }
+
     /// FR-83 — record whether this connection acknowledges grants
     /// (`ssh-grant-ack`), alongside [`Self::set_agent_ssh_support`] and for
     /// the same reasons. A separate setter rather than a second positional
@@ -3255,6 +3298,12 @@ impl Hub {
             if !entry.supports_exec {
                 return Err(Error::ExecUnsupported(agent_id.to_hex()));
             }
+            // FR-97 P5a — and never a `run_as` to a connection that does not
+            // know it: that agent would run the command as root. Checked
+            // here, at the push, so no caller can get it wrong.
+            if asks_console_user(&msg) && !entry.supports_console_user {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
         }
 
         let (tx, rx) = oneshot::channel();
@@ -3298,6 +3347,10 @@ impl Hub {
                 return Err(Error::AgentOffline(agent_id.to_hex()));
             }
             if !entry.supports_exec {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
+            // FR-97 P5a — as in `exec_on_agent`.
+            if asks_console_user(&msg) && !entry.supports_console_user {
                 return Err(Error::ExecUnsupported(agent_id.to_hex()));
             }
         }
@@ -6807,6 +6860,7 @@ mod tests {
             caller: "tester".into(),
             consent_mode: Some(ConsentMode::Auto),
             via_service: false,
+            run_as: None,
         }
     }
 
@@ -6890,6 +6944,70 @@ mod tests {
             agent_rx.try_recv().is_err(),
             "must not push to an old agent"
         );
+    }
+
+    /// FR-97 P5a — a command that names `run_as` reaches only a connection
+    /// advertising `console-user`. Any other agent ignores the field and runs
+    /// the command as root, so the hub sends it nothing, whatever the caller
+    /// checked before.
+    #[tokio::test]
+    async fn exec_as_the_person_reaches_only_a_connection_that_drops_to_them() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let tenant = ObjectId::new();
+        let (_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+        let as_person = |id: &str| {
+            let mut msg = exec_msg(id);
+            if let ServerMsg::RpcExec { run_as, .. } = &mut msg {
+                *run_as = Some("console_user".into());
+            }
+            msg
+        };
+
+        // No word recorded: refused, nothing pushed.
+        let err = hub
+            .exec_on_agent(
+                agent_id,
+                tenant,
+                "req-p1".into(),
+                as_person("req-p1"),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect_err("must refuse");
+        assert!(matches!(err, Error::ExecUnsupported(_)), "got {err:?}");
+        assert!(agent_rx.try_recv().is_err(), "must not push run_as");
+        assert_eq!(hub.agent_supports_console_user(agent_id), Some(false));
+
+        // The word recorded: pushed with `run_as`.
+        hub.set_agent_console_user_support(agent_id, true);
+        let h = hub.clone();
+        let waiter = tokio::spawn(async move {
+            h.exec_on_agent(
+                agent_id,
+                tenant,
+                "req-p2".into(),
+                as_person("req-p2"),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+        });
+        match agent_rx.recv().await.expect("agent got a frame") {
+            ServerMsg::RpcExec { run_as, .. } => {
+                assert_eq!(run_as.as_deref(), Some("console_user"))
+            }
+            other => panic!("expected RpcExec, got {other:?}"),
+        }
+        assert!(hub.deliver_exec_result("req-p2", ExecOutcome::default()));
+        waiter.await.unwrap().expect("exec resolved");
     }
 
     #[tokio::test]

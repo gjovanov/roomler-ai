@@ -914,20 +914,20 @@ pub async fn set_policy(
         ));
     }
 
-    // Same rule again, applied to the ONE account mode that is platform-bound.
-    // `console_user` is `WTSQueryUserToken` + `CreateProcessAsUserW`: there is no
-    // console session token to assume off Windows, so the agent refuses it
-    // (`exec.rs`, `pty/unix.rs`) and EVERY session on that device fails at connect
-    // time — after the server has already told the caller where to dial. Gating it
-    // in the dialog alone is not enough: the API would still accept a policy no
-    // agent can ever honour, which is how the default reached Linux devices in the
-    // first place (#1557).
-    if console_user_unsupported(body.account_mode, agent.os) {
-        return Err(ApiError::BadRequest(format!(
-            "account_mode `console_user` needs a Windows console session token, and this \
-             device runs {:?}. Name a local account instead.",
-            agent.os
-        )));
+    // Same rule again, applied to the ONE account mode that depends on the
+    // agent. `console_user` is the person at the device's screen: on Windows by
+    // their session token, and on Linux and macOS (FR-97 P5a) by the daemon's
+    // drop to them, which an older agent refuses (`exec.rs`, `pty/unix.rs`), so
+    // EVERY session on that device fails at connect time — after the server has
+    // already told the caller where to dial. Gating it in the dialog alone is not
+    // enough: the API would still accept a policy no agent can ever honour, which
+    // is how the default reached Linux devices in the first place (#1557).
+    if console_user_unsupported(body.account_mode, agent.os, &agent.capabilities) {
+        return Err(ApiError::BadRequest(
+            "this device's agent cannot run SSH sessions as the person at its screen: update \
+             it, or name a local account instead"
+                .into(),
+        ));
     }
 
     // Same rule, applied to consent: an agent older than P5d accepts a
@@ -1026,14 +1026,17 @@ pub async fn set_org_settings(
     }))
 }
 
-/// Would storing this `consent_mode` produce a policy the target device
-/// silently ignores?
+/// Would storing this account mode produce a policy no session on the device
+/// can satisfy?
 ///
-/// `console_user` is a Windows concept — `WTSQueryUserToken` +
-/// `CreateProcessAsUserW`. Off Windows there is no console session token to
-/// assume, so the agent refuses it (`exec.rs`, `pty/unix.rs`) and every session
-/// on that device dies at connect time, AFTER the server has already answered the
-/// caller with an address to dial.
+/// `console_user` is the person at the device's screen. On Windows it is
+/// `WTSQueryUserToken` + `CreateProcessAsUserW`. On Linux and macOS (FR-97 P5a)
+/// the daemon drops to that person, which only an agent advertising
+/// `console-user` does: an older one refuses the mode (`exec.rs`, `pty/unix.rs`)
+/// and every session on that device dies at connect time, AFTER the server has
+/// already answered the caller with an address to dial. Read from the stored
+/// hello: an agent rolled back since refuses the session itself, so this
+/// half fails closed either way.
 ///
 /// ⚠️ The dialog gates this too, but a client-only gate is not the guarantee: the
 /// API would still accept a policy no agent can honour, and it was the dialog's
@@ -1041,10 +1044,19 @@ pub async fn set_org_settings(
 /// (#1557). Same shape as the `named`-with-no-account and consent-would-be-ignored
 /// refusals above it — refuse the unsatisfiable policy at the write, not at the
 /// session.
-fn console_user_unsupported(mode: SshAccountMode, os: OsKind) -> bool {
-    mode == SshAccountMode::ConsoleUser && os != OsKind::Windows
+fn console_user_unsupported(
+    mode: SshAccountMode,
+    os: OsKind,
+    caps: &roomler_ai_remote_control::models::AgentCaps,
+) -> bool {
+    mode == SshAccountMode::ConsoleUser
+        && os != OsKind::Windows
+        && !caps.has_rpc(RpcCap::ConsoleUser)
 }
 
+/// Would storing this `consent_mode` produce a policy the target device
+/// silently ignores?
+///
 /// Agents rc.419 and earlier advertise `ssh` while destructuring
 /// `SshPolicy.consent_mode` away, so persisting a non-auto value for one would
 /// show an admin a rule reading "a human must approve" while that device let
@@ -1657,27 +1669,43 @@ mod audit_tests {
 mod tests {
     use super::*;
 
-    /// `console_user` is storable on Windows and nowhere else. The negative half
-    /// is the one that matters — before #1557 the dialog defaulted every device
-    /// to `console_user`, so a Linux or macOS device silently carried a policy
-    /// that failed every session at connect time.
+    /// `console_user` is storable on Windows, and on Linux and macOS only for an
+    /// agent that advertises `console-user` (FR-97 P5a). The negative half is the
+    /// one that matters — before #1557 the dialog defaulted every device to
+    /// `console_user`, so a Linux or macOS device silently carried a policy that
+    /// failed every session at connect time, which an older agent still would.
     #[test]
-    fn console_user_is_refused_off_windows_and_allowed_on_it() {
+    fn console_user_is_refused_where_the_agent_cannot_drop_to_the_person() {
+        use roomler_ai_remote_control::models::AgentCaps;
+        let caps = |verbs: &[&str]| AgentCaps {
+            rpc: verbs.iter().map(|v| v.to_string()).collect(),
+            ..Default::default()
+        };
+        let older = caps(&["exec", "ssh", "ssh-consent"]);
+        let p5a = caps(&["exec", "ssh", "ssh-consent", "console-user"]);
         assert!(!console_user_unsupported(
             SshAccountMode::ConsoleUser,
-            OsKind::Windows
+            OsKind::Windows,
+            &older
         ));
         for os in [OsKind::Linux, OsKind::Macos] {
             assert!(
-                console_user_unsupported(SshAccountMode::ConsoleUser, os),
-                "console_user must be refused on {os:?}"
+                console_user_unsupported(SshAccountMode::ConsoleUser, os, &older),
+                "console_user must be refused on {os:?} for an agent without the word"
+            );
+            assert!(
+                !console_user_unsupported(SshAccountMode::ConsoleUser, os, &p5a),
+                "console_user is storable on {os:?} for an agent with the word"
             );
         }
-        // The other modes are platform-independent and must pass on every OS —
+        // The other modes do not depend on the agent and must pass on every OS —
         // a guard that refused those would break Windows policies too.
         for os in [OsKind::Linux, OsKind::Macos, OsKind::Windows] {
             for mode in [SshAccountMode::Daemon, SshAccountMode::Named] {
-                assert!(!console_user_unsupported(mode, os), "{mode:?} on {os:?}");
+                assert!(
+                    !console_user_unsupported(mode, os, &older),
+                    "{mode:?} on {os:?}"
+                );
             }
         }
     }

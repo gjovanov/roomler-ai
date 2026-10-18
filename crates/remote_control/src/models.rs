@@ -1094,6 +1094,20 @@ pub enum RpcCap {
     /// a per-user install at a padlock no session can lift; the
     /// `session_requested` audit row says when an ask is not enforced.
     LockOnEnd,
+    /// FR-97 P5a — a Linux or macOS build runs `console_user` as the person
+    /// at the device's screen (logind's seat0, the owner of `/dev/console`),
+    /// and refuses when nobody is there: SSH's `account_mode`, and Fleet
+    /// RPC's `run_as`, which the server then sends in `rc:rpc.exec`. A
+    /// property of the BUILD. Windows never advertises it: its
+    /// `console_user` is the SYSTEM service's (FR-94, FR-105), keyed on the
+    /// OS.
+    ///
+    /// ⚠️ The server sends `run_as` ONLY to a connection advertising this.
+    /// An older agent ignores the field and would run the command as root,
+    /// the identity the policy refused. An older agent refuses an SSH
+    /// session's `console_user` itself ("a Windows concept"), so that half
+    /// fails closed either way, and the server still refuses to store it.
+    ConsoleUser,
 }
 
 impl RpcCap {
@@ -1137,11 +1151,12 @@ impl RpcCap {
             Self::SessionPolicy => "session-policy",
             Self::IdleTimeout => "idle-timeout",
             Self::LockOnEnd => "lock-on-end",
+            Self::ConsoleUser => "console-user",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 32] = [
+    pub const ALL: [RpcCap; 33] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1174,6 +1189,7 @@ impl RpcCap {
         Self::SessionPolicy,
         Self::IdleTimeout,
         Self::LockOnEnd,
+        Self::ConsoleUser,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -1657,23 +1673,28 @@ pub struct ExecPolicy {
     #[serde(default)]
     pub shells: Vec<String>,
     /// FR-94 P4 — which account a Windows device's commands run as through
-    /// its SYSTEM service. Default SYSTEM. Meaningless off Windows, where the
-    /// route that sets it refuses `console_user`.
+    /// its SYSTEM service. Default SYSTEM. FR-97 P5a: on Linux and macOS,
+    /// `console_user` is the person at the device's screen, to whom the
+    /// daemon drops (`rc:rpc.exec`'s `run_as`), storable only for an agent
+    /// that advertises `console-user`; `system` is root.
     #[serde(default)]
     pub run_as: ExecRunAs,
 }
 
 /// FR-94 P4 — the account a Windows command runs as, through the device's
-/// SYSTEM service ([`ExecPolicy::run_as`]).
+/// SYSTEM service ([`ExecPolicy::run_as`]). FR-97 P5a: on Linux and macOS,
+/// in the daemon itself.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecRunAs {
-    /// `NT AUTHORITY\SYSTEM`, in session 0. The default.
+    /// `NT AUTHORITY\SYSTEM`, in session 0. The default. Root off Windows.
     #[default]
     System,
     /// The user signed in at the console. The service reaches them through
     /// `WTSQueryUserToken`, which only SYSTEM may call; with nobody signed in
-    /// the command is refused.
+    /// the command is refused. Off Windows (FR-97 P5a), the person at the
+    /// screen (logind's seat0, the owner of `/dev/console`), to whom the
+    /// daemon drops; refused there too when nobody is at it.
     ConsoleUser,
 }
 
@@ -3898,6 +3919,8 @@ pub enum ExecDenyReason {
     /// this command cannot take that path (not anchored, or the service is
     /// down). Refused rather than run as whatever the worker is: in
     /// SystemContext mode that would be SYSTEM, the opposite of the policy.
+    /// FR-97 P5a: on Linux and macOS, the agent connected does not advertise
+    /// `console-user`, and would run the command as root.
     RunAsUnavailable,
 }
 
@@ -6547,6 +6570,7 @@ mod tests {
         assert_eq!(RpcCap::SessionPolicy.wire(), "session-policy");
         assert_eq!(RpcCap::IdleTimeout.wire(), "idle-timeout");
         assert_eq!(RpcCap::LockOnEnd.wire(), "lock-on-end");
+        assert_eq!(RpcCap::ConsoleUser.wire(), "console-user");
     }
 
     /// FR-101 P4b-2 — the device's idle setting as a limit: unset and `0`

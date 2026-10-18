@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 import { describe, expect, it } from 'vitest'
-import { AGENT_ACCOUNT_TITLE, servesSshAsSystem, sshAsChip } from '@/utils/sshIdentity'
+import {
+  AGENT_ACCOUNT_TITLE,
+  dropsToConsoleUser,
+  servesSshAsSystem,
+  sshAsChip,
+} from '@/utils/sshIdentity'
 
 describe('sshAsChip (FR-105)', () => {
   it("names SYSTEM only when the device's service served the session", () => {
@@ -52,5 +57,23 @@ describe('servesSshAsSystem (FR-105)', () => {
     expect(servesSshAsSystem(undefined)).toBe(false)
     expect(servesSshAsSystem(null)).toBe(false)
     expect(servesSshAsSystem([])).toBe(false)
+  })
+})
+
+describe('dropsToConsoleUser (FR-97 P5a)', () => {
+  it('reads the console-user word', () => {
+    expect(dropsToConsoleUser(['exec', 'ssh', 'console-user'])).toBe(true)
+  })
+
+  it('matches by equality, and nothing else stands in for it', () => {
+    expect(dropsToConsoleUser(['exec', 'ssh', 'ssh-system', 'console', 'console-user-x'])).toBe(
+      false,
+    )
+  })
+
+  it('is false without caps', () => {
+    expect(dropsToConsoleUser(undefined)).toBe(false)
+    expect(dropsToConsoleUser(null)).toBe(false)
+    expect(dropsToConsoleUser([])).toBe(false)
   })
 })
