@@ -20,13 +20,11 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
-use tunnel_core::localapi::hive_adopt::{self as proto, HookEvent};
-#[cfg(unix)]
-use tunnel_core::localapi::hive_adopt::{Reply, Request};
+use tunnel_core::localapi::hive_adopt::{self as proto, HookEvent, Reply, Request};
 
 /// An object whose values are kept exactly as written.
 type Obj = IndexMap<String, Box<RawValue>>;
@@ -44,6 +42,9 @@ pub const EVENTS: [(&str, bool); 3] = [
 /// at most this long at a turn's end.
 const HOOK_TIMEOUT_SECS: u64 = 30;
 
+/// FR-97 P4c — what a hook entry runs on Windows ([`HookCommand::on_path`]).
+const WINDOWS_HOOK_COMMAND: &str = "roomler.exe hive hook";
+
 /// What a hook entry runs: this very binary, with `hive hook`, as ONE shell
 /// command line.
 ///
@@ -59,11 +60,30 @@ pub struct HookCommand {
 impl HookCommand {
     /// The running binary. Embedded in the daemon (`roomlerd cli`, which the
     /// installed `roomler` shim re-execs) the entry runs `roomlerd cli hive
-    /// hook` directly, without the shim's hop.
+    /// hook` directly, without the shim's hop. On Windows, [`Self::on_path`].
     pub fn this_binary(embedded: bool) -> Result<Self> {
+        if cfg!(windows) {
+            return Ok(Self::on_path());
+        }
         let exe = std::env::current_exe().context("locating this binary")?;
         let path = exe.to_str().context("this binary's path is not UTF-8")?;
         Ok(Self::for_binary(path, embedded))
+    }
+
+    /// FR-97 P4c — the entry on Windows: the installed `roomler.exe`, found on
+    /// PATH, with no quotes at all.
+    ///
+    /// Claude Code runs a hook's command line through Git Bash there, or
+    /// through PowerShell where Git Bash is absent. A quoted path runs
+    /// differently in each: bash runs `'C:\…\roomlerd.exe' cli hive hook`, but
+    /// PowerShell reads a leading string as a value to print and needs
+    /// `& '…'`, which bash rejects. A bare word on PATH is the one form both
+    /// run as written. Both MSIs put the install folder on PATH: the machine's
+    /// for a perMachine install, the user's for a perUser one.
+    pub fn on_path() -> Self {
+        Self {
+            command: WINDOWS_HOOK_COMMAND.to_string(),
+        }
     }
 
     /// The entry for the binary at `path`.
@@ -339,26 +359,34 @@ fn write_settings(path: &Path, previous: Option<&[u8]>, text: &str) -> Result<Pa
     Ok(target)
 }
 
-/// Whether this device adopts: something listens on its adopt socket. The
-/// socket's file alone says nothing — a daemon stopped while adopting leaves
-/// one behind (P1j-5's field run).
-fn device_adopts(socket: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        std::os::unix::net::UnixStream::connect(socket).is_ok()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = socket;
-        false
-    }
+/// Whether this device adopts: something listens on its adopt socket.
+#[cfg(unix)]
+fn device_adopts() -> bool {
+    proto::socket_path().is_some_and(|s| device_adopts_at(&s))
+}
+
+/// Whether something listens on the socket at `socket`. The socket's file
+/// alone says nothing — a daemon stopped while adopting leaves one behind
+/// (P1j-5's field run).
+#[cfg(unix)]
+fn device_adopts_at(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
+
+/// FR-97 P4c — on Windows: the adopt pipe opens, and SYSTEM, Administrators or
+/// this account owns it ([`proto::open_pipe`]).
+#[cfg(windows)]
+fn device_adopts() -> bool {
+    proto::open_pipe().is_ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn device_adopts() -> bool {
+    false
 }
 
 /// `roomler hive adopt`.
 pub fn adopt(explicit: Option<PathBuf>, embedded: bool) -> Result<()> {
-    if cfg!(windows) {
-        bail!("adopting terminal sessions is not available on Windows yet");
-    }
     let path = settings_path(explicit)?;
     let previous = match std::fs::read(&path) {
         Ok(b) => Some(b),
@@ -381,12 +409,13 @@ pub fn adopt(explicit: Option<PathBuf>, embedded: bool) -> Result<()> {
     } else {
         println!("Already adopted ({}).", path.display());
     }
-    match proto::socket_path() {
-        Some(s) if device_adopts(&s) => println!("  this device adopts terminal sessions"),
-        _ => println!(
+    if device_adopts() {
+        println!("  this device adopts terminal sessions");
+    } else {
+        println!(
             "  this device does not adopt yet: its owner turns on `hive_adopt` and maps your \
              account in `hive_accounts`; until then the hooks do nothing"
-        ),
+        );
     }
     Ok(())
 }
@@ -521,15 +550,18 @@ pub async fn hook() {
     let _ = mirror(&input).await;
 }
 
-/// The hook's connection to the adopt socket: one request, one reply.
-#[cfg(unix)]
-struct Conn {
-    write: tokio::net::unix::OwnedWriteHalf,
-    replies: tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>,
+/// The hook's connection to the adopt socket: one request, one reply. The
+/// socket's two halves on Unix; the pipe's on Windows (FR-97 P4c).
+struct Conn<R, W> {
+    write: W,
+    replies: tokio::io::Lines<tokio::io::BufReader<R>>,
 }
 
-#[cfg(unix)]
-impl Conn {
+impl<R, W> Conn<R, W>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     async fn ask(&mut self, req: Request) -> Result<Reply> {
         use tokio::io::AsyncWriteExt;
         let mut line = serde_json::to_vec(&req)?;
@@ -551,17 +583,38 @@ async fn mirror(input: &HookInput) -> Result<()> {
     mirror_at(&socket, input).await
 }
 
+/// FR-97 P4c — on Windows, through the adopt pipe, once it is known to be the
+/// daemon's ([`proto::connect_pipe`]). Opened on a blocking thread: a busy
+/// pipe is waited for.
+#[cfg(windows)]
+async fn mirror(input: &HookInput) -> Result<()> {
+    // The blocking pool runs inside the runtime, so the pipe registers with it.
+    let pipe = tokio::task::spawn_blocking(proto::connect_pipe).await??;
+    let (read, write) = tokio::io::split(pipe);
+    mirror_over(read, write, input).await
+}
+
 /// [`hook`]'s work against the adopt socket at `socket`: what the daemon's
 /// own tests drive, so the two halves of the protocol are tested together.
 #[cfg(unix)]
 pub async fn mirror_at(socket: &Path, input: &HookInput) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         tokio::net::UnixStream::connect(socket),
     )
     .await??;
     let (read, write) = stream.into_split();
+    mirror_over(read, write, input).await
+}
+
+/// The protocol itself, over any connection: the hello, then the transcript's
+/// new whole lines, then the turn's end or the session's.
+pub async fn mirror_over<R, W>(read: R, write: W, input: &HookInput) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, BufReader};
     let mut conn = Conn {
         write,
         replies: BufReader::new(read).lines(),
@@ -621,7 +674,7 @@ pub async fn mirror_at(socket: &Path, input: &HookInput) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 async fn mirror(_input: &HookInput) -> Result<()> {
     Ok(())
 }
@@ -718,6 +771,25 @@ mod tests {
     /// P1j-5 — a file laid out as Claude Code writes its settings comes back
     /// from `adopt` then `unadopt` byte for byte, with a final newline or
     /// without; so does one with its leaves written inline (`THEIRS`).
+    /// FR-97 P4c — the Windows entry: `roomler.exe` found on PATH, which Git
+    /// Bash and PowerShell both run as written. `adopt` writes it and
+    /// `unadopt` knows it as its own.
+    #[test]
+    fn the_windows_entry_runs_from_path_and_is_known_as_ours() {
+        let hook = HookCommand::on_path();
+        assert_eq!(hook.command, "roomler.exe hive hook");
+        assert!(ours(&json!({"type": "command", "command": hook.command})));
+        let (added, changed) = adopt_doc(Some(THEIRS), &hook).unwrap();
+        assert!(changed);
+        assert!(added.contains("roomler.exe hive hook"), "{added}");
+        let (back, changed) = unadopt_doc(&added).unwrap();
+        assert!(changed);
+        assert_eq!(
+            back, THEIRS,
+            "the person's settings come back byte for byte"
+        );
+    }
+
     #[test]
     fn adopt_then_unadopt_gives_back_the_same_bytes() {
         let written = serde_json::to_string_pretty(&json!({
@@ -747,12 +819,12 @@ mod tests {
     fn the_device_adopts_only_while_something_listens() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("adopt.sock");
-        assert!(!device_adopts(&socket), "no socket");
+        assert!(!device_adopts_at(&socket), "no socket");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        assert!(device_adopts(&socket), "a daemon listening");
+        assert!(device_adopts_at(&socket), "a daemon listening");
         drop(listener);
         assert!(socket.exists(), "the file it leaves behind");
-        assert!(!device_adopts(&socket), "says nothing by itself");
+        assert!(!device_adopts_at(&socket), "says nothing by itself");
     }
 
     #[test]

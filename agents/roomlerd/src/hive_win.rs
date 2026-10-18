@@ -333,6 +333,104 @@ pub(crate) fn pipe_client_sid(pipe: HANDLE) -> Result<String, String> {
     sid
 }
 
+/// FR-97 P4c — who is at the far end of a server pipe instance, by the
+/// security context the pipe carries for its client: their SID and account.
+pub(crate) struct PipePeer {
+    pub sid: String,
+    pub domain: String,
+    pub name: String,
+}
+
+impl PipePeer {
+    /// `DOMAIN\name`.
+    pub fn qualified(&self) -> String {
+        format!("{}\\{}", self.domain, self.name)
+    }
+
+    /// An account that runs services, or nobody at all, rather than a person:
+    /// SYSTEM, LOCAL SERVICE, NETWORK SERVICE, and the anonymous logon a
+    /// client that forbade identification shows. The adopt pipe refuses them
+    /// as the Unix socket refuses root.
+    pub fn is_service(&self) -> bool {
+        is_service_sid(&self.sid)
+    }
+}
+
+/// The well-known SIDs of [`PipePeer::is_service`].
+pub(crate) fn is_service_sid(sid: &str) -> bool {
+    matches!(sid, "S-1-5-18" | "S-1-5-19" | "S-1-5-20" | "S-1-5-7")
+}
+
+/// FR-97 P4c — the client of a server pipe instance, by impersonating it just
+/// long enough to take its token. The caller must have read from the pipe
+/// first: Windows names the client by the last message read.
+///
+/// No pid is involved, unlike [`pipe_client_sid`]. The adopt pipe takes any
+/// interactive user, so a client that ended (its pipe handle passed to a
+/// process of its own) must never be named by whatever process took its pid.
+///
+/// The impersonation ends before any lookup. A client may allow no more than
+/// identification (tokio's default), and an LSA call made while wearing that
+/// fails with `ERROR_BAD_IMPERSONATION_LEVEL`; the token handle, opened as
+/// this process, answers the same questions after the revert.
+pub(crate) fn pipe_peer(pipe: HANDLE) -> Result<PipePeer, String> {
+    use windows_sys::Win32::Security::RevertToSelf;
+    use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+
+    /// Ends this thread's impersonation, even on an early return.
+    struct Revert;
+    impl Drop for Revert {
+        fn drop(&mut self) {
+            // SAFETY: ends this thread's impersonation.
+            if unsafe { RevertToSelf() } == 0 {
+                // A thread left wearing a client's identity would act as them
+                // in whatever it ran next. There is no safe way on; the
+                // service manager restarts the daemon.
+                std::process::abort();
+            }
+        }
+    }
+
+    // SAFETY: a live, connected server end the caller has read from.
+    if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
+        return Err(format!(
+            "ImpersonateNamedPipeClient: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let revert = Revert;
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: this thread's impersonation token, opened as the PROCESS
+    // (`OpenAsSelf` = TRUE: an identification-level token may not open
+    // itself); `token` is closed below.
+    let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } != 0;
+    let open_error = std::io::Error::last_os_error();
+    drop(revert);
+    if !opened {
+        return Err(format!("OpenThreadToken: {open_error}"));
+    }
+    let sid = sid_of_token(token);
+    let account = account_of_token(token);
+    // SAFETY: the handle OpenThreadToken gave us, closed once.
+    unsafe { CloseHandle(token) };
+    let (domain, name) = account?;
+    Ok(PipePeer {
+        sid: sid?,
+        domain,
+        name,
+    })
+}
+
+/// The pid of a server pipe instance's client, for what it is good for: the
+/// adopt sweep's terminal lookup ([`crate::hive::procs::hook_terminal`]).
+/// Never who the client is: that is [`pipe_peer`]'s.
+pub(crate) fn pipe_client_pid(pipe: HANDLE) -> Option<u32> {
+    let mut pid = 0u32;
+    // SAFETY: a live server pipe handle; `pid` is a valid out-param.
+    (unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } != 0 && pid != 0).then_some(pid)
+}
+
 /// The account a token is for, as `(domain, name)`. `token` must be live,
 /// with `TOKEN_QUERY`.
 fn account_of_token(token: HANDLE) -> Result<(String, String), String> {
@@ -822,6 +920,26 @@ pub fn session_dir_sddl(peer: &str) -> String {
 /// keeps anything below Medium integrity from writing to it.
 pub fn toolbelt_pipe_sddl(peer: &str) -> String {
     format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12008b;;;{peer})S:(ML;;NW;;;ME)")
+}
+
+/// FR-97 P4c — the adopt pipe: the toolbelt pipe's grants, with every
+/// Interactive user (`IU`) in place of one session's account, since any person
+/// at this machine may adopt their own terminal sessions.
+///
+/// - The same `0x12008b` for a person, never `GENERIC_WRITE`: its
+///   `FILE_CREATE_PIPE_INSTANCE` would let a person add an instance of their
+///   own and take another person's next hook. The hook opens the pipe with
+///   exactly this mask (`hive_adopt::open_pipe`).
+/// - The daemon's own account (`daemon`, its SID) as well as SYSTEM and
+///   Administrators. An attended worker that could not be elevated is a
+///   person whose Administrators group is deny-only, and it must still add an
+///   instance for every client. Its account's other processes gain nothing:
+///   they hold everything the daemon holds already, and another person's
+///   hook sends nothing to a pipe owned by neither SYSTEM nor that person.
+///
+/// Who each client is, the daemon reads from its token ([`pipe_peer`]).
+pub fn adopt_pipe_sddl(daemon: &str) -> String {
+    format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{daemon})(A;;0x12008b;;;IU)S:(ML;;NW;;;ME)")
 }
 
 /// The replica store's directory, `%ProgramData%\roomler\roomler\hive`, also
@@ -1929,5 +2047,94 @@ mod tests {
             );
         }
         assert!(Sddl::new(&sddl).is_ok(), "the SDDL parses");
+    }
+
+    /// FR-97 P4c — the adopt pipe gives every interactive user read and write
+    /// and never `FILE_CREATE_PIPE_INSTANCE`; everything more goes to SYSTEM,
+    /// Administrators and the daemon's own account alone.
+    #[test]
+    fn the_adopt_pipe_lets_people_in_and_only_the_daemon_add_an_instance() {
+        let me = own_sid().unwrap();
+        let sddl = adopt_pipe_sddl(&me);
+        let aces: Vec<&str> = sddl
+            .trim_start_matches("D:P(")
+            .split(")S:")
+            .next()
+            .unwrap()
+            .split(")(")
+            .collect();
+        let people = aces.iter().find(|ace| ace.ends_with(";;;IU")).unwrap();
+        let mask = people.split(';').nth(2).unwrap();
+        let mask = u32::from_str_radix(mask.trim_start_matches("0x"), 16).unwrap();
+        assert_eq!(mask, 0x12008b, "read and write data, nothing more: {sddl}");
+        assert_eq!(mask & 0x4, 0, "no FILE_CREATE_PIPE_INSTANCE: {sddl}");
+        for ace in &aces {
+            let full = ace.starts_with("A;;GA;;;")
+                && (ace.ends_with(";;;SY")
+                    || ace.ends_with(";;;BA")
+                    || ace.ends_with(&format!(";;;{me}")));
+            assert!(full || *ace == *people, "an unexpected grant: {ace}");
+        }
+        assert!(
+            sddl.ends_with("S:(ML;;NW;;;ME)"),
+            "below Medium cannot write: {sddl}"
+        );
+        assert!(Sddl::new(&sddl).is_ok(), "the SDDL parses");
+    }
+
+    /// FR-97 P4c — the accounts the adopt pipe refuses as root: the three that
+    /// run services, and the anonymous logon of a client that forbade
+    /// identification. A person's SID is not one of them.
+    #[test]
+    fn service_accounts_and_nobody_are_never_adopted() {
+        for sid in ["S-1-5-18", "S-1-5-19", "S-1-5-20", "S-1-5-7"] {
+            assert!(is_service_sid(sid), "{sid}");
+        }
+        assert!(!is_service_sid(&own_sid().unwrap()));
+        assert!(!is_service_sid("S-1-5-21-1-2-3-1001"));
+    }
+
+    /// FR-97 P4c — a pipe's client is named by its token once it has written:
+    /// here, this very process through the hook's own client, so its own SID
+    /// and account, and its pid for the terminal lookup.
+    #[tokio::test]
+    async fn the_adopt_pipe_names_its_client_by_its_token() {
+        use std::os::windows::io::{AsRawHandle, IntoRawHandle};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let name = format!(r"\\.\pipe\roomler-adopt-peer-test-{}", std::process::id());
+        let mut sddl = Sddl::new(&adopt_pipe_sddl(&own_sid().unwrap())).unwrap();
+        // SAFETY: the attributes outlive the call; the descriptor is copied.
+        let mut server = unsafe {
+            tokio::net::windows::named_pipe::ServerOptions::new()
+                .first_pipe_instance(true)
+                .reject_remote_clients(true)
+                .create_with_security_attributes_raw(&name, sddl.attributes().cast())
+        }
+        .unwrap();
+        let opened = tokio::task::spawn_blocking({
+            let name = name.clone();
+            move || tunnel_core::localapi::hive_adopt::open_pipe_at(&name)
+        });
+        server.connect().await.unwrap();
+        let raw = opened
+            .await
+            .unwrap()
+            .expect("the hook's open, with the exact mask")
+            .into_raw_handle();
+        // SAFETY: an overlapped pipe handle, owned from here by tokio.
+        let mut client =
+            unsafe { tokio::net::windows::named_pipe::NamedPipeClient::from_raw_handle(raw) }
+                .unwrap();
+        client.write_all(b"{}\n").await.unwrap();
+        let mut line = [0u8; 3];
+        server.read_exact(&mut line).await.unwrap();
+        let peer = pipe_peer(server.as_raw_handle() as _).unwrap();
+        assert_eq!(peer.sid, own_sid().unwrap());
+        assert!(!peer.is_service());
+        assert!(peer.qualified().contains('\\'), "{}", peer.qualified());
+        assert_eq!(
+            pipe_client_pid(server.as_raw_handle() as _),
+            Some(std::process::id())
+        );
     }
 }
