@@ -3253,14 +3253,19 @@ sequenceDiagram
     Note over W: the device reconnects
 ```
 
-- **The rule** (`is_orphaned_worker`, `agents/roomlerd/src/win_service/orphan.rs:156`):
-  a running `roomlerd run --supervisor scm` of this binary that this host does not
+- **The rule** (`is_orphaned_worker`, `agents/roomlerd/src/win_service/orphan.rs:153`):
+  a running `roomlerd.exe run --supervisor scm` that this host does not
   supervise. The SCM runs one host process per service, a host supervises one
   worker, and the check runs only while this host supervises none. So such a
   worker belongs to a host that is gone, or is one this host lost track of.
   - A Scheduled-Task worker (`run --supervisor task`), a hand-started `run`, the
     CLI, netd and the updater's helpers never match (`is_scm_worker_cmdline`,
-    `orphan.rs:129`).
+    `orphan.rs:137`).
+  - ⚠️ It is matched by the image **name** from the process list, never by the
+    full path. An update replaces an exe that is in use by renaming it away, so
+    an orphan that outlived an update no longer runs from the install path. A
+    full-path rule would spare exactly that orphan, and the service would then
+    stop cleanly beside it.
   - A unit test builds a command line from `worker_args`, so changing the worker's
     argv without the rule fails a test instead of silently disabling the reaper.
 - ⚠️ **It is keyed on who spawned the worker, never on when.** Creation times are
@@ -3271,14 +3276,14 @@ sequenceDiagram
   the `Stop` arm (`supervisor.rs:1432`) before it gives up: if that pass ended an
   orphan, the supervisor respawns instead of stopping.
 - **How the orphan ends.** `TerminateProcess` through the handle it was read
-  with, waited on for up to 5 s (`terminate_and_wait`, `orphan.rs:363`).
+  with, waited on for up to 5 s (`terminate_and_wait`, `orphan.rs:353`).
   - Never its stop event: that is the OS-stop path, and an ephemeral device
     self-unenrolls on it.
   - One handle per process for the read and the kill, so a recycled pid is never
     hit.
   - The command line comes from `NtQueryInformationProcess(ProcessCommandLineInformation)`,
     which needs only `PROCESS_QUERY_LIMITED_INFORMATION` (`cmdline_of`,
-    `orphan.rs:323`).
+    `orphan.rs:313`).
 - **The redundant stop is clean again.** Suppose the `Stop` arm's pass finds no
   orphan and could read every roomlerd process. Then the lock is held by a second
   installed flavour: the supervisor returns `Redundant`, and the host ends with

@@ -13,11 +13,18 @@
 //! **The rule** ([`is_orphaned_worker`]): the SCM runs one host process per
 //! service, and a host supervises at most one worker. The reaper runs only
 //! while this host supervises none (before its first spawn, and after its
-//! worker refused), so a running `run --supervisor scm` worker of THIS binary
-//! belongs to a host that is gone, or is one this host lost track of. It is
-//! keyed on who spawned the worker, never on when: creation times are wall
-//! clock, and a guest whose clock was corrected backwards measured an orphan
-//! as nine hours younger than the host that replaced it.
+//! worker refused), so a running `roomlerd.exe run --supervisor scm` belongs
+//! to a host that is gone, or is one this host lost track of. Only this
+//! service spawns that command line: a per-user install runs `--supervisor
+//! task`. It is keyed on who spawned the worker, never on when: creation
+//! times are wall clock, and a guest whose clock was corrected backwards
+//! measured an orphan as nine hours younger than the host that replaced it.
+//!
+//! The process is matched by its image NAME, from the process list, and
+//! never by its full path. The name is fixed when the process is created. The
+//! path is not: an update replaces an exe that is in use by renaming it away,
+//! and a full-path rule would then spare the very orphan that outlived the
+//! update.
 //!
 //! **How it ends**: `TerminateProcess`, never its stop event. The stop event
 //! is the OS-stop path, on which an ephemeral device self-unenrolls
@@ -63,7 +70,8 @@ const CMDLINE_BUF_BYTES: usize = std::mem::size_of::<UNICODE_STRING>() + u16::MA
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub pid: u32,
-    /// The full Win32 image path.
+    /// The full Win32 image path. Logged, never matched on: an update renames
+    /// an in-use exe away, so an orphan's path can be anything.
     pub image: String,
     pub cmdline: String,
 }
@@ -137,32 +145,13 @@ pub fn is_scm_worker_cmdline(cmdline: &str) -> bool {
         || rest.iter().any(|a| a == "--supervisor=scm")
 }
 
-/// Is `image` the same file as `own`? Win32 paths compare without case, and the
-/// `\\?\` prefix `current_exe` can carry is not part of the path.
-pub fn same_image(image: &str, own: &str) -> bool {
-    fn norm(p: &str) -> String {
-        p.strip_prefix(r"\\?\")
-            .unwrap_or(p)
-            .replace('/', "\\")
-            .to_lowercase()
-    }
-    norm(image) == norm(own)
-}
-
-/// The rule, pure so it is tested without a process: an SCM worker of this
-/// binary that is neither this host nor a worker this host supervises. The
+/// The rule, pure so it is tested without a process: an SCM worker that is
+/// neither this host nor a worker this host supervises. The candidates are
+/// already the processes with this binary's image name ([`pids_named`]). The
 /// callers pass `supervised` empty, because they run only while this host
 /// supervises no worker; the parameter keeps the rule honest if that changes.
-pub fn is_orphaned_worker(
-    c: &Candidate,
-    own_pid: u32,
-    own_image: &str,
-    supervised: &[u32],
-) -> bool {
-    c.pid != own_pid
-        && !supervised.contains(&c.pid)
-        && same_image(&c.image, own_image)
-        && is_scm_worker_cmdline(&c.cmdline)
+pub fn is_orphaned_worker(c: &Candidate, own_pid: u32, supervised: &[u32]) -> bool {
+    c.pid != own_pid && !supervised.contains(&c.pid) && is_scm_worker_cmdline(&c.cmdline)
 }
 
 /// One pass: find this service's orphaned workers and end them. Best-effort
@@ -204,11 +193,12 @@ pub fn reap_orphaned_workers() -> ReapReport {
             Opened::Read(h, c) => (h, c),
         };
         report.inspected += 1;
-        if !is_orphaned_worker(&c, own_pid, &own_image, &[]) {
+        if !is_orphaned_worker(&c, own_pid, &[]) {
             continue;
         }
         tracing::warn!(
             pid,
+            image = %c.image,
             cmdline = %c.cmdline,
             "supervisor: an earlier host of this service left its worker running; ending it so \
              this host's own worker can take over (#2465)"
@@ -434,48 +424,37 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_same_image_ignores_case_and_the_verbatim_prefix() {
-        assert!(same_image(EXE, r"c:\program files\roomler\ROOMLERD.EXE"));
-        assert!(same_image(
-            EXE,
-            r"\\?\C:\Program Files\Roomler\roomlerd.exe"
-        ));
-        assert!(!same_image(
-            EXE,
-            r"C:\Users\x\AppData\Local\Programs\Roomler\roomlerd.exe"
-        ));
-        assert!(!same_image(EXE, r"C:\Program Files\Roomler\roomler.exe"));
-    }
-
-    /// Each condition is necessary: this host, a worker it supervises, another
-    /// binary and a non-worker are all left alone.
+    /// Each condition is necessary: this host, a worker it supervises and a
+    /// non-worker are all left alone.
     #[test]
     fn the_rule_needs_every_condition() {
         let worker = r#""C:\Program Files\Roomler\roomlerd.exe" run --supervisor scm --stop-event Global\roomler-worker-stop-2452-3"#;
         let own = 1812;
-        assert!(is_orphaned_worker(&cand(3248, EXE, worker), own, EXE, &[]));
+        assert!(is_orphaned_worker(&cand(3248, EXE, worker), own, &[]));
         assert!(
-            !is_orphaned_worker(&cand(own, EXE, worker), own, EXE, &[]),
+            !is_orphaned_worker(&cand(own, EXE, worker), own, &[]),
             "this host"
         );
         assert!(
-            !is_orphaned_worker(&cand(3248, EXE, worker), own, EXE, &[3248]),
+            !is_orphaned_worker(&cand(3248, EXE, worker), own, &[3248]),
             "supervised"
         );
         assert!(
-            !is_orphaned_worker(&cand(3248, r"C:\Other\roomlerd.exe", worker), own, EXE, &[]),
-            "another install"
-        );
-        assert!(
-            !is_orphaned_worker(
-                &cand(3248, EXE, &worker.replace(" scm", " task")),
-                own,
-                EXE,
-                &[]
-            ),
+            !is_orphaned_worker(&cand(3248, EXE, &worker.replace(" scm", " task")), own, &[]),
             "a Scheduled-Task worker"
         );
+    }
+
+    /// An update replaces an exe that is in use by renaming it away, so an
+    /// orphan that outlived an update no longer runs from the install path.
+    /// It is still this service's worker, and the rule must still end it: a
+    /// full-path rule would spare exactly that one, and the service would then
+    /// stop cleanly beside it.
+    #[test]
+    fn a_worker_whose_file_was_renamed_away_is_still_an_orphan() {
+        let worker = r#""C:\Program Files\Roomler\roomlerd.exe" run --supervisor scm --stop-event Global\roomler-worker-stop-2452-3"#;
+        let renamed = cand(3248, r"C:\Config.Msi\3f1a2b.rbf", worker);
+        assert!(is_orphaned_worker(&renamed, 1812, &[]));
     }
 
     #[test]
@@ -512,7 +491,9 @@ mod tests {
             panic!("could not read this process");
         };
         let exe = std::env::current_exe().unwrap();
-        assert!(same_image(&c.image, &exe.to_string_lossy()), "{c:?}");
+        let exe_path = exe.to_string_lossy();
+        let exe_path = exe_path.strip_prefix(r"\\?\").unwrap_or(&exe_path);
+        assert!(c.image.eq_ignore_ascii_case(exe_path), "{c:?}");
         let name = exe.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
             c.cmdline.to_lowercase().contains(&name.to_lowercase()),
