@@ -44,20 +44,20 @@ sequenceDiagram
 The user scope is the session's starter's, since the starter is whose account the
 session runs as. A project scope waits for a project identity, which knowhow (P4)
 brings; `project` is refused as a scope today
-([`brain.rs:50`](../crates/modules/hive/src/brain.rs#L50)).
+([`brain.rs:57`](../crates/modules/hive/src/brain.rs#L57)).
 
-A fact is a record in `brain_facts` ([`brain.rs:137`](../crates/modules/hive/src/brain.rs#L137)):
+A fact is a record in `brain_facts` ([`brain.rs:144`](../crates/modules/hive/src/brain.rs#L144)):
 its scope and owner (the user or the device, and null for the org), its text and how
 many characters it costs, its kind, `active` or `archived`, a version, and who
 created and last changed it, when.
 
 | Rule | Why | Where |
 |---|---|---|
-| A fact is one line of plain text, at most 500 characters: control characters become spaces, and runs of whitespace collapse | a newline would let a fact write a heading of its own into the rendered file. 500 is under the smallest budget, so any one fact fits an empty scope | [`brain.rs:241`](../crates/modules/hive/src/brain.rs#L241) `clean_text` |
-| Each fact has a kind, rendered beside it as `- (warning) …`: `preference`, `convention` (the default), `path`, `gotcha`, `decision` or `warning` | the model can tell a warning from a preference | [`brain.rs:92`](../crates/modules/hive/src/brain.rs#L92) |
-| An edit names the version it read, and a fact changed or archived since is not overwritten: `409`, "read it again" | two people editing one fact | [`brain.rs:543`](../crates/modules/hive/src/brain.rs#L543) |
-| Archiving takes a fact out of every future snapshot and out of its budget, and keeps it as a record | | [`brain.rs:592`](../crates/modules/hive/src/brain.rs#L592) |
-| Any member reads the org's facts and any live device's; someone else's user memory answers 404, as a bogus id does | | [`brain.rs:1079`](../crates/modules/hive/src/brain.rs#L1079) `readable_fact` |
+| A fact is one line of plain text, at most 500 characters: control characters become spaces, and runs of whitespace collapse | a newline would let a fact write a heading of its own into the rendered file. 500 is under the smallest budget, so any one fact fits an empty scope | [`brain.rs:270`](../crates/modules/hive/src/brain.rs#L270) `clean_text` |
+| Each fact has a kind, rendered beside it as `- (warning) …`: `preference`, `convention` (the default), `path`, `gotcha`, `decision` or `warning` | the model can tell a warning from a preference | [`brain.rs:99`](../crates/modules/hive/src/brain.rs#L99) |
+| An edit names the version it read, and a fact changed or archived since is not overwritten: `409`, "read it again" | two people editing one fact | [`brain.rs:624`](../crates/modules/hive/src/brain.rs#L624) |
+| Archiving takes a fact out of every future snapshot and out of its budget, and keeps it as a record | | [`brain.rs:676`](../crates/modules/hive/src/brain.rs#L676) |
+| Any member reads the org's facts and any live device's; someone else's user memory answers 404, as a bogus id does | | [`brain.rs:1165`](../crates/modules/hive/src/brain.rs#L1165) `readable_fact` |
 | A removed member's or device's facts stay as records, and are never rendered | no session starts as that person, or runs on that device, again | |
 
 ---
@@ -67,13 +67,15 @@ created and last changed it, when.
 Each scope instance (the org, one person, one device) has ONE counter document in
 `brain_budgets`, held unique on (tenant, scope, owner) by an index. A write takes its
 characters with one conditional update, and the unique index is what turns a write
-that does not fit into a refusal ([`brain.rs:376`](../crates/modules/hive/src/brain.rs#L376)):
+that does not fit into a refusal ([`brain.rs:405`](../crates/modules/hive/src/brain.rs#L405)):
 
 ```mermaid
 flowchart TD
     W["a write that needs n characters"] --> U["one upsert on the instance's counter:<br/>inc used by n, where used is at most budget minus n"]
     U -- "the counter matched" --> OK["the fact is kept,<br/>brain_rev + 1"]
-    U -- "no room: the upsert collides<br/>with the unique index" --> RC["recount the instance<br/>from its active facts, once"]
+    U -- "no room: the upsert collides<br/>with the unique index" --> Q{"no write has touched<br/>the counter for a minute?"}
+    Q -- "it was touched:<br/>a write may be in flight" --> R
+    Q -- "quiet" --> RC["recount the instance<br/>from its active facts, once,<br/>unless a write touches it meanwhile"]
     RC -- "the counter held more than<br/>the facts use" --> U2["try the upsert again"]
     U2 -- matched --> OK
     U2 -- "still no room" --> R
@@ -84,7 +86,18 @@ flowchart TD
   part of the update, so only one of them matches.
 - **A refusal recounts once.** A reservation a crash left behind (taken, with no fact
   to show for it) would otherwise shrink the budget for ever, and a refusal is when
-  that matters ([`brain.rs:451`](../crates/modules/hive/src/brain.rs#L451)).
+  that matters ([`brain.rs:516`](../crates/modules/hive/src/brain.rs#L516)).
+- ⚠️ **But only a quiet counter, and only if it stays quiet while it counts.** A
+  reservation still in flight (taken, its fact not yet written) looks exactly like a
+  leaked one, and a fact archived with its release still to come looks like one
+  already released. Recounting over the first let two writes both fit the last room;
+  the race test failed that way under the whole integration suite's load. Recounting
+  over the second would let a later write overspend. So a recount needs a counter no
+  write has touched for `RECOUNT_QUIET_SECS` (a minute), and writes under a
+  compare-and-swap on the counter's version `v`. Every write touches the counter
+  BEFORE it changes a fact: the reservation, the touch before an edit shrinks a fact
+  or an archive takes one out, and the release. A crash's leftover is still given
+  back, at the first refusal a minute after the crash.
 - **It fails visibly, and nothing is evicted.** A person consolidates (design §10.3,
   Hermes' rule). The refusal is a `409` in the shape of every API error, with the
   numbers beside it:
@@ -106,12 +119,12 @@ back. A refused write spends nothing.
 ## 3. Revisions and the frozen snapshot
 
 `brain_revs` holds one revision per org, raised by every write that lands: a new
-fact, an edit, an archive ([`brain.rs:503`](../crates/modules/hive/src/brain.rs#L503)).
+fact, an edit, an archive ([`brain.rs:584`](../crates/modules/hive/src/brain.rs#L584)).
 A refusal raises nothing.
 
 A session pins the revision when it is created. The start route renders the
 session's snapshot there and then ([`routes.rs:594`](../crates/modules/hive/src/routes.rs#L594),
-[`brain.rs:641`](../crates/modules/hive/src/brain.rs#L641) `snapshot`), stores it in
+[`brain.rs:727`](../crates/modules/hive/src/brain.rs#L727) `snapshot`), stores it in
 `hive_session_memory` by session, kept a day, and records `brain_rev` on the
 session's record.
 
@@ -150,8 +163,8 @@ Kept in Roomler about this device, for the sessions that run on it.
 
 The first is `CLAUDE.md`, absent when the org and the starter keep nothing; the
 second is the auto-memory `MEMORY.md`, absent when the device has no facts
-([`brain.rs:283`](../crates/modules/hive/src/brain.rs#L283),
-[`:317`](../crates/modules/hive/src/brain.rs#L317)). The starter's and the device's
+([`brain.rs:312`](../crates/modules/hive/src/brain.rs#L312),
+[`:346`](../crates/modules/hive/src/brain.rs#L346)). The starter's and the device's
 names lose every character markdown reads as emphasis, code, a heading or a link, and
 every control character, and are cut to 80 characters, so a display name cannot add a
 heading of its own. Each
@@ -274,7 +287,7 @@ The whole run cost $0.24 in model calls.
 
 | Piece | Where |
 |---|---|
-| facts, budgets, revisions, snapshots, the routes | [`crates/modules/hive/src/brain.rs`](../crates/modules/hive/src/brain.rs): `reserve` `:376`, `recount` `:451`, `bump_rev` `:503`, `snapshot` `:641`, `may_write` `:785` |
+| facts, budgets, revisions, snapshots, the routes | [`crates/modules/hive/src/brain.rs`](../crates/modules/hive/src/brain.rs): `recountable` `:199`, `reserve` `:405`, `touch` `:474`, `recount` `:516`, `bump_rev` `:584`, `snapshot` `:727`, `may_write` `:877` |
 | the indexes: facts by instance, one counter per instance, snapshots with a one-day TTL | [`crates/modules/hive/src/lib.rs:304`](../crates/modules/hive/src/lib.rs#L304) |
 | the snapshot at a start, and its re-send | [`routes.rs:594`](../crates/modules/hive/src/routes.rs#L594), [`agent_socket.rs:1156`](../crates/modules/hive/src/agent_socket.rs#L1156) |
 | the frame | `ServerMsg::HiveMemory` in [`signaling.rs:3706`](../crates/remote_control/src/signaling.rs#L3706); `MAX_CORE_MEMORY_BYTES` in [`hive.rs:63`](../crates/remote_control/src/hive.rs#L63); `RpcCap::HiveMemory` (`hive-memory`), matched by equality |
