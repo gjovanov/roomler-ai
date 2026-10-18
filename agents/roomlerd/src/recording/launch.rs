@@ -1654,9 +1654,11 @@ pub(crate) mod unix {
             {
                 // A pool thread left as someone else would take that identity
                 // into whatever work it runs next. Nothing is safe after this.
-                eprintln!(
+                // FR-97 P6e (#1538) — never `eprintln!`: on a failing stderr
+                // it panics, and the thread unwinds instead of the abort.
+                crate::logging::say_on_stderr(
                     "recording: a thread could not become the daemon again after acting as the \
-                     person signed in; aborting"
+                     person signed in; aborting",
                 );
                 std::process::abort();
             }

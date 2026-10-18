@@ -3150,7 +3150,7 @@ async fn terminate_signal(stop_event: Option<&str>, config_path: &Path) {
 /// arm, because the platforms want literally opposite exit codes here.
 #[cfg(any(target_os = "linux", windows))]
 fn already_running_exit() -> Result<()> {
-    // Diverges. The `eprintln!` above and the sync stdout tracing layer
+    // Diverges. The stderr line above and the sync stdout tracing layer
     // have already emitted; only the non-blocking FILE layer can lose
     // its copy, which is the same trade `signaling.rs` makes when it
     // exits with `AGENT_DELETED_EXIT_CODE`.
@@ -3239,10 +3239,12 @@ async fn run_cmd(
         match instance_lock::acquire(config_path).context("acquiring single-instance lock")? {
             instance_lock::AcquireOutcome::Acquired(g) => g,
             instance_lock::AcquireOutcome::AlreadyRunning => {
-                eprintln!(
+                // FR-97 P6e (#1538) — never `eprintln!`: on a failing stderr it
+                // panics, and this benign exit became a crash on a Mac.
+                logging::say_on_stderr(
                     "Another roomlerd is already running for this config; exiting.\n\
                  (use `roomlerd service status` to check the auto-start hook,\n\
-                 or stop the running instance before starting a new one.)"
+                 or stop the running instance before starting a new one.)",
                 );
                 tracing::warn!("single-instance lock held by another process; exiting");
                 return already_running_exit().map(|()| None);

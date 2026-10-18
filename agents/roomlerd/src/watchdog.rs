@@ -40,6 +40,11 @@
 //! integration tests that don't [`install`] one just have ticks
 //! become silent no-ops — the pump code stays clean.
 
+// FR-97 P6e (#1538) — the print macros panic on a failing stdout or stderr, and
+// a panic on a watchdog thread is swallowed with the exit it was about to take.
+// Lines go through `crate::logging::say_on_stderr` (and `tracing`).
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -400,11 +405,14 @@ pub fn spawn_thread_watchdog(wd: Arc<Watchdog>) {
                 }
                 let stuck_for = now_at.saturating_duration_since(prev_at);
                 if stuck_for > Duration::from_secs(60) {
-                    eprintln!(
+                    // FR-97 P6e (#1538) — never `eprintln!` here: on a failing
+                    // stderr it panics, this thread dies, and the exit below,
+                    // the last line of defense, never happens.
+                    crate::logging::say_on_stderr(format_args!(
                         "watchdog-of-watchdog: async watchdog has not heartbeat in {:?}; \
                          forcing exit({STALL_EXIT_CODE})",
                         stuck_for
-                    );
+                    ));
                     // P5/A2 — this exit bypasses RAII; drop any exit-node
                     // split-default first so a stalled host doesn't stay
                     // blackholed until the supervisor's restart reconciles it.
@@ -425,7 +433,11 @@ pub fn force_exit_on_stall(stalled: &[(&'static str, Duration)]) -> bool {
         .map(|(n, d)| format!("{n}={}s", d.as_secs()))
         .collect();
     let summary = summary.join(", ");
-    eprintln!("watchdog: pumps stalled ({summary}); forcing exit({STALL_EXIT_CODE})");
+    // FR-97 P6e (#1538) — a panic here would lose the exit below (see the
+    // module doc), so never `eprintln!`.
+    crate::logging::say_on_stderr(format_args!(
+        "watchdog: pumps stalled ({summary}); forcing exit({STALL_EXIT_CODE})"
+    ));
     tracing::error!(stalled = %summary, "watchdog: forcing process exit");
 
     // Phase 1B (Task 9): emit a crash sidecar BEFORE process-exit
