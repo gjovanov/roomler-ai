@@ -55,6 +55,17 @@ namespace Roomler {
     },
   };
 
+  // P3-4b — a session listing or describing a secret: its name and rules,
+  // never a value, from the device it runs on. Nothing implies it: an
+  // organization lets a role list what it may use by permitting this too.
+  action "secret:list" appliesTo {
+    principal: [Session],
+    resource: [Secret],
+    context: {
+      device: Device,
+    },
+  };
+
   // A session using a secret: in which mode, toward which audience, for how
   // long, on which device, and whether a person approved it.
   action "secret:use" appliesTo {

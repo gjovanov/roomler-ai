@@ -100,13 +100,14 @@ pub use client::*;
 #[cfg(feature = "vault")]
 mod client {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use base64::Engine;
     use bson::oid::ObjectId;
     use roomler_ai_remote_control::signaling::ClientMsg;
-    use roomler_ai_remote_control::vault::lease_limits;
+    use roomler_ai_remote_control::vault::{VaultSecretMeta, lease_limits};
     use tokio::sync::{mpsc, oneshot};
     use tracing::{debug, info};
     use zeroize::Zeroizing;
@@ -170,9 +171,43 @@ mod client {
         value: Zeroizing<Vec<u8>>,
     }
 
-    struct Pending {
-        ask: LeaseAsk,
-        reply: oneshot::Sender<Result<LeaseInfo, LeaseError>>,
+    /// P3-4b — what a session's role may list: metadata only, and whether
+    /// the vault's bound left some out.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Listing {
+        pub secrets: Vec<VaultSecretMeta>,
+        pub more: bool,
+    }
+
+    /// What a request waits for, by kind.
+    enum Waiting {
+        Lease {
+            ask: LeaseAsk,
+            reply: oneshot::Sender<Result<LeaseInfo, LeaseError>>,
+        },
+        List {
+            reply: oneshot::Sender<Result<Listing, LeaseError>>,
+        },
+        Describe {
+            reply: oneshot::Sender<Result<VaultSecretMeta, LeaseError>>,
+        },
+    }
+
+    impl Waiting {
+        /// Answer whichever request this is with `why`.
+        fn fail(self, why: LeaseError) {
+            match self {
+                Self::Lease { reply, .. } => {
+                    let _ = reply.send(Err(why));
+                }
+                Self::List { reply } => {
+                    let _ = reply.send(Err(why));
+                }
+                Self::Describe { reply } => {
+                    let _ = reply.send(Err(why));
+                }
+            }
+        }
     }
 
     /// One daemon's leases: the process has one ([`CLIENT`]), a test makes
@@ -180,12 +215,27 @@ mod client {
     #[derive(Default)]
     pub struct Client {
         outbound: Mutex<Option<mpsc::Sender<ClientMsg>>>,
-        pending: Mutex<HashMap<String, Pending>>,
+        /// P3-4b — whether that connection takes leases: a session's vault
+        /// tools are offered only then.
+        takes: AtomicBool,
+        pending: Mutex<HashMap<String, Waiting>>,
         held: Mutex<HashMap<String, Held>>,
     }
 
     fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
         m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Forgets one request when its wait ends, however it ends.
+    struct Forget<'a> {
+        client: &'a Client,
+        req_id: &'a str,
+    }
+
+    impl Drop for Forget<'_> {
+        fn drop(&mut self) {
+            lock(&self.client.pending).remove(self.req_id);
+        }
     }
 
     fn now_ms() -> i64 {
@@ -195,10 +245,62 @@ mod client {
             .unwrap_or(0)
     }
 
+    fn new_req_id() -> String {
+        format!("{:016x}", rand::random::<u64>())
+    }
+
     impl Client {
-        /// The primary connection's outbound queue, from its hello on.
-        pub fn connected(&self, tx: mpsc::Sender<ClientMsg>) {
+        /// The primary connection's outbound queue, from its hello on, and
+        /// whether that connection takes leases.
+        pub fn connected(&self, tx: mpsc::Sender<ClientMsg>, takes: bool) {
             *lock(&self.outbound) = Some(tx);
+            self.takes.store(takes, Ordering::Relaxed);
+        }
+
+        /// P3-4b — whether the primary connection takes leases: what offers a
+        /// session its vault tools.
+        pub fn takes_leases(&self) -> bool {
+            self.takes.load(Ordering::Relaxed)
+        }
+
+        /// Send `frame` as request `req_id`, waiting as `waiting`.
+        fn send(&self, req_id: &str, frame: ClientMsg, waiting: Waiting) -> Result<(), LeaseError> {
+            let Some(tx) = lock(&self.outbound).clone() else {
+                return Err(LeaseError::NotConnected);
+            };
+            lock(&self.pending).insert(req_id.to_string(), waiting);
+            if tx.try_send(frame).is_err() {
+                lock(&self.pending).remove(req_id);
+                return Err(LeaseError::NotConnected);
+            }
+            Ok(())
+        }
+
+        /// Wait `deadline` for request `req_id`'s answer.
+        async fn wait<T>(
+            &self,
+            req_id: &str,
+            answer: oneshot::Receiver<Result<T, LeaseError>>,
+            deadline: Duration,
+        ) -> Result<T, LeaseError> {
+            // P3-4b — however the wait ends, its request waits no longer:
+            // answered, past its deadline, or its asker gone (a cancelled
+            // tool call drops this future), so nothing is left behind for a
+            // server that never answers.
+            let _forget = Forget {
+                client: self,
+                req_id,
+            };
+            match tokio::time::timeout(deadline, answer).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) | Err(_) => Err(LeaseError::NoAnswer),
+            }
+        }
+
+        /// The requests waiting for an answer.
+        #[cfg(test)]
+        pub(super) fn waiting(&self) -> usize {
+            lock(&self.pending).len()
         }
 
         /// Ask for a lease, and wait [`ANSWER_DEADLINE`] for the answer.
@@ -212,10 +314,7 @@ mod client {
             ask: LeaseAsk,
             deadline: Duration,
         ) -> Result<LeaseInfo, LeaseError> {
-            let Some(tx) = lock(&self.outbound).clone() else {
-                return Err(LeaseError::NotConnected);
-            };
-            let req_id = format!("{:016x}", rand::random::<u64>());
+            let req_id = new_req_id();
             let frame = ClientMsg::VaultLease {
                 req_id: req_id.clone(),
                 session_id: ask.session_id,
@@ -227,18 +326,58 @@ mod client {
                 ttl_secs: ask.ttl_secs,
             };
             let (reply, answer) = oneshot::channel();
-            lock(&self.pending).insert(req_id.clone(), Pending { ask, reply });
-            if tx.try_send(frame).is_err() {
-                lock(&self.pending).remove(&req_id);
-                return Err(LeaseError::NotConnected);
-            }
-            match tokio::time::timeout(deadline, answer).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) | Err(_) => {
-                    lock(&self.pending).remove(&req_id);
-                    Err(LeaseError::NoAnswer)
-                }
-            }
+            self.send(&req_id, frame, Waiting::Lease { ask, reply })?;
+            self.wait(&req_id, answer, deadline).await
+        }
+
+        /// P3-4b — what the session's role may list under `prefix`.
+        pub async fn list(
+            &self,
+            session_id: ObjectId,
+            fence: u64,
+            prefix: &str,
+        ) -> Result<Listing, LeaseError> {
+            self.list_within(session_id, fence, prefix, ANSWER_DEADLINE)
+                .await
+        }
+
+        /// P3-4b — [`Self::list`], waiting `deadline`.
+        pub async fn list_within(
+            &self,
+            session_id: ObjectId,
+            fence: u64,
+            prefix: &str,
+            deadline: Duration,
+        ) -> Result<Listing, LeaseError> {
+            let req_id = new_req_id();
+            let frame = ClientMsg::VaultList {
+                req_id: req_id.clone(),
+                session_id,
+                fence,
+                prefix: prefix.to_string(),
+            };
+            let (reply, answer) = oneshot::channel();
+            self.send(&req_id, frame, Waiting::List { reply })?;
+            self.wait(&req_id, answer, deadline).await
+        }
+
+        /// P3-4b — one secret's metadata, by its path or RRN.
+        pub async fn describe(
+            &self,
+            session_id: ObjectId,
+            fence: u64,
+            secret: &str,
+        ) -> Result<VaultSecretMeta, LeaseError> {
+            let req_id = new_req_id();
+            let frame = ClientMsg::VaultDescribe {
+                req_id: req_id.clone(),
+                session_id,
+                fence,
+                secret: secret.to_string(),
+            };
+            let (reply, answer) = oneshot::channel();
+            self.send(&req_id, frame, Waiting::Describe { reply })?;
+            self.wait(&req_id, answer, ANSWER_DEADLINE).await
         }
 
         /// `rc:vault.leased`: open it, hold it, and answer the request.
@@ -250,9 +389,14 @@ mod client {
             sealed: &str,
             expires_at_ms: i64,
         ) {
-            let Some(p) = lock(&self.pending).remove(req_id) else {
-                debug!(req_id, "vault: a lease nobody here waits for — not opened");
-                return;
+            let (ask, reply) = match lock(&self.pending).remove(req_id) {
+                Some(Waiting::Lease { ask, reply }) => (ask, reply),
+                // An answer of the wrong kind answers nothing it was asked.
+                Some(other) => return other.fail(LeaseError::NoAnswer),
+                None => {
+                    debug!(req_id, "vault: a lease nobody here waits for — not opened");
+                    return;
+                }
             };
             let opened = base64::engine::general_purpose::STANDARD
                 .decode(sealed)
@@ -260,7 +404,7 @@ mod client {
                 .and_then(|b| key().unseal(&b).ok())
                 .map(Zeroizing::new);
             let Some(value) = opened else {
-                let _ = p.reply.send(Err(LeaseError::Unopenable));
+                let _ = reply.send(Err(LeaseError::Unopenable));
                 return;
             };
             let left =
@@ -268,12 +412,12 @@ mod client {
             let until = Instant::now() + Duration::from_millis(u64::try_from(left).unwrap_or(0));
             let info = LeaseInfo {
                 lease_id: lease_id.to_string(),
-                session_id: p.ask.session_id,
-                fence: p.ask.fence,
-                secret: p.ask.secret,
-                field: p.ask.field,
+                session_id: ask.session_id,
+                fence: ask.fence,
+                secret: ask.secret,
+                field: ask.field,
                 n,
-                mode: p.ask.mode,
+                mode: ask.mode,
                 expires_at_ms,
             };
             lock(&self.held).insert(
@@ -284,16 +428,39 @@ mod client {
                     value,
                 },
             );
-            if p.reply.send(Ok(info)).is_err() {
+            if reply.send(Ok(info)).is_err() {
                 // Its asker stopped waiting: nothing will use it.
                 lock(&self.held).remove(lease_id);
             }
         }
 
-        /// `rc:vault.refused`: answer the request in the vault's word.
+        /// `rc:vault.refused`: answer the request, whatever it asked, in the
+        /// vault's word.
         pub fn on_refused(&self, req_id: &str, reason: &str) {
-            if let Some(p) = lock(&self.pending).remove(req_id) {
-                let _ = p.reply.send(Err(LeaseError::Refused(reason.to_string())));
+            if let Some(w) = lock(&self.pending).remove(req_id) {
+                w.fail(LeaseError::Refused(reason.to_string()));
+            }
+        }
+
+        /// P3-4b — `rc:vault.listed`.
+        pub fn on_listed(&self, req_id: &str, secrets: Vec<VaultSecretMeta>, more: bool) {
+            match lock(&self.pending).remove(req_id) {
+                Some(Waiting::List { reply }) => {
+                    let _ = reply.send(Ok(Listing { secrets, more }));
+                }
+                Some(other) => other.fail(LeaseError::NoAnswer),
+                None => debug!(req_id, "vault: a listing nobody here waits for"),
+            }
+        }
+
+        /// P3-4b — `rc:vault.described`.
+        pub fn on_described(&self, req_id: &str, secret: VaultSecretMeta) {
+            match lock(&self.pending).remove(req_id) {
+                Some(Waiting::Describe { reply }) => {
+                    let _ = reply.send(Ok(secret));
+                }
+                Some(other) => other.fail(LeaseError::NoAnswer),
+                None => debug!(req_id, "vault: a description nobody here waits for"),
             }
         }
 
@@ -358,10 +525,11 @@ mod client {
 
     static PRUNER: OnceLock<()> = OnceLock::new();
 
-    /// The primary connection's outbound queue, at each of its hellos; the
-    /// first also starts letting go of expired leases in the background.
-    pub fn on_connected(tx: mpsc::Sender<ClientMsg>) {
-        CLIENT.connected(tx);
+    /// The primary connection's outbound queue, at each of its hellos, and
+    /// whether it takes leases; the first also starts letting go of expired
+    /// leases in the background.
+    pub fn on_connected(tx: mpsc::Sender<ClientMsg>, takes: bool) {
+        CLIENT.connected(tx, takes);
         PRUNER.get_or_init(|| {
             tokio::spawn(async {
                 loop {
@@ -385,6 +553,16 @@ mod client {
     /// The daemon's [`Client::on_revoke`].
     pub fn on_revoke(lease_ids: &[String], reason: &str) {
         CLIENT.on_revoke(lease_ids, reason);
+    }
+
+    /// The daemon's [`Client::on_listed`].
+    pub fn on_listed(req_id: &str, secrets: Vec<VaultSecretMeta>, more: bool) {
+        CLIENT.on_listed(req_id, secrets, more);
+    }
+
+    /// The daemon's [`Client::on_described`].
+    pub fn on_described(req_id: &str, secret: VaultSecretMeta) {
+        CLIENT.on_described(req_id, secret);
     }
 
     /// The daemon's [`Client::drop_run`]: hive's supervisor calls it when a
@@ -488,10 +666,10 @@ mod tests {
         use base64::Engine;
         use bson::oid::ObjectId;
         use roomler_ai_remote_control::signaling::ClientMsg;
-        use roomler_ai_remote_control::vault::lease_limits;
+        use roomler_ai_remote_control::vault::{VaultSecretMeta, lease_limits};
         use tokio::sync::mpsc;
 
-        use super::super::{Client, LeaseAsk, LeaseError, LeaseInfo, hello_key};
+        use super::super::{Client, LeaseAsk, LeaseError, LeaseInfo, Listing, hello_key};
 
         fn in_ms(ms: i64) -> i64 {
             let now = std::time::SystemTime::now()
@@ -526,8 +704,97 @@ mod tests {
         fn connected() -> (Arc<Client>, mpsc::Receiver<ClientMsg>) {
             let c = Arc::new(Client::default());
             let (tx, rx) = mpsc::channel(8);
-            c.connected(tx);
+            c.connected(tx, true);
             (c, rx)
+        }
+
+        fn meta(path: &str) -> VaultSecretMeta {
+            VaultSecretMeta {
+                rrn: format!("rrn:grox:secret:{path}"),
+                path: path.into(),
+                kind: "static".into(),
+                description: String::new(),
+                fields: vec!["value".into()],
+                audiences: Vec::new(),
+                exec_allow: Vec::new(),
+                tags: Vec::new(),
+                disabled: false,
+            }
+        }
+
+        /// P3-4b — a listing and a description go out on the connection and
+        /// come back to their askers, never a value among them.
+        #[tokio::test]
+        async fn a_listing_and_a_description_come_back_to_their_askers() {
+            let (c, mut rx) = connected();
+            assert!(c.takes_leases());
+            let sid = ObjectId::new();
+            let lister = {
+                let c = c.clone();
+                tokio::spawn(async move { c.list(sid, 3, "db/").await })
+            };
+            let req_id = match rx.recv().await.unwrap() {
+                ClientMsg::VaultList {
+                    req_id,
+                    session_id,
+                    fence,
+                    prefix,
+                } => {
+                    assert_eq!((session_id, fence, prefix.as_str()), (sid, 3, "db/"));
+                    req_id
+                }
+                other => panic!("{other:?}"),
+            };
+            c.on_listed(&req_id, vec![meta("db/main")], true);
+            assert_eq!(
+                lister.await.unwrap().unwrap(),
+                Listing {
+                    secrets: vec![meta("db/main")],
+                    more: true,
+                }
+            );
+            let describer = {
+                let c = c.clone();
+                tokio::spawn(async move { c.describe(sid, 3, "db/main").await })
+            };
+            let req_id = match rx.recv().await.unwrap() {
+                ClientMsg::VaultDescribe { req_id, secret, .. } => {
+                    assert_eq!(secret, "db/main");
+                    req_id
+                }
+                other => panic!("{other:?}"),
+            };
+            c.on_described(&req_id, meta("db/main"));
+            assert_eq!(describer.await.unwrap().unwrap(), meta("db/main"));
+        }
+
+        /// A refusal answers whichever request it names, and an answer of the
+        /// wrong kind answers nothing that was asked: no lease is held for a
+        /// listing.
+        #[tokio::test]
+        async fn a_refusal_answers_any_request_and_a_wrong_answer_none() {
+            let (c, mut rx) = connected();
+            let lister = {
+                let c = c.clone();
+                tokio::spawn(async move { c.list(ObjectId::new(), 1, "").await })
+            };
+            let req_id = match rx.recv().await.unwrap() {
+                ClientMsg::VaultList { req_id, .. } => req_id,
+                other => panic!("{other:?}"),
+            };
+            c.on_refused(&req_id, "no_role");
+            assert_eq!(
+                lister.await.unwrap(),
+                Err(LeaseError::Refused("no_role".into()))
+            );
+            let asker = {
+                let c = c.clone();
+                tokio::spawn(async move { c.request(ask(ObjectId::new(), 1)).await })
+            };
+            let req_id = req_id_of(rx.recv().await.unwrap());
+            c.on_listed(&req_id, vec![meta("db/main")], false);
+            assert_eq!(asker.await.unwrap(), Err(LeaseError::NoAnswer));
+            assert!(c.held().is_empty());
         }
 
         fn req_id_of(frame: ClientMsg) -> String {
@@ -651,6 +918,46 @@ mod tests {
                 in_ms(60_000),
             );
             assert!(c.held().is_empty(), "a late answer is not held");
+        }
+
+        /// P3-4b — an asker that stops waiting (a cancelled tool call drops
+        /// its future) leaves nothing waiting, and the answer that comes
+        /// after opens nothing.
+        #[tokio::test]
+        async fn an_asker_that_stops_waiting_leaves_nothing_waiting() {
+            let (c, mut rx) = connected();
+            let asker = {
+                let c = c.clone();
+                tokio::spawn(async move { c.request(ask(ObjectId::new(), 1)).await })
+            };
+            let req_id = req_id_of(rx.recv().await.unwrap());
+            assert_eq!(c.waiting(), 1);
+            asker.abort();
+            let _ = asker.await;
+            assert_eq!(c.waiting(), 0, "the dropped wait forgot its request");
+            c.on_leased(
+                &req_id,
+                "after",
+                1,
+                &sealed_for_us(b"canary-vault-value"),
+                in_ms(60_000),
+            );
+            assert!(
+                c.held().is_empty(),
+                "an answer after its asker left is not held"
+            );
+            let lister = {
+                let c = c.clone();
+                tokio::spawn(async move { c.list(ObjectId::new(), 1, "").await })
+            };
+            match rx.recv().await.unwrap() {
+                ClientMsg::VaultList { .. } => {}
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(c.waiting(), 1);
+            lister.abort();
+            let _ = lister.await;
+            assert_eq!(c.waiting(), 0, "a listing's dropped wait, the same");
         }
 
         /// A box sealed to any other key does not open, and is not held.

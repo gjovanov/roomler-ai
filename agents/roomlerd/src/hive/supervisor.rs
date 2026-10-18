@@ -4183,7 +4183,10 @@ impl Supervisor {
             )
         })?;
         let sid = order.session_id.to_hex();
-        let settings = write_settings(&self.runtime, &sid).map_err(|e| {
+        // P3-4b — the vault tools, where the primary connection takes leases:
+        // offered by the toolbelt and allowed in the settings, together.
+        let vault = toolbelt::daemon_vault();
+        let settings = write_settings(&self.runtime, &sid, vault.is_some()).map_err(|e| {
             (
                 HiveRefusal::LaunchFailed,
                 format!("writing the session settings: {e}"),
@@ -4209,20 +4212,18 @@ impl Supervisor {
             ));
         }
         let dir = self.runtime.join(&sid);
-        let toolbelt = toolbelt::open(
-            &dir,
-            owner,
-            uid,
-            order.session_id,
-            approvals,
-            self.approval_timing,
-        )
-        .map_err(|e| {
-            (
-                HiveRefusal::LaunchFailed,
-                format!("opening the session's toolbelt: {e}"),
-            )
-        })?;
+        let run = toolbelt::Run {
+            session: order.session_id,
+            fence: order.fence,
+            vault,
+        };
+        let toolbelt = toolbelt::open(&dir, owner, uid, run, approvals, self.approval_timing)
+            .map_err(|e| {
+                (
+                    HiveRefusal::LaunchFailed,
+                    format!("opening the session's toolbelt: {e}"),
+                )
+            })?;
         let mcp = toolbelt_mcp_config(
             &relay,
             &[
@@ -4399,10 +4400,17 @@ impl Supervisor {
         let dir = self.runtime.join(&sid);
         session_dir(&self.runtime, &dir, &peer)
             .map_err(|e| failed("the session's runtime directory", e))?;
-        let settings = write_settings(&self.runtime, &sid)
+        // P3-4b — offered and allowed together, as on Unix.
+        let vault = toolbelt::daemon_vault();
+        let settings = write_settings(&self.runtime, &sid, vault.is_some())
             .map_err(|e| failed("writing the session settings", e))?;
         let relay = own_exe().map_err(|e| (HiveRefusal::LaunchFailed, e))?;
-        let toolbelt = toolbelt::open(peer, order.session_id, approvals, self.approval_timing)
+        let run = toolbelt::Run {
+            session: order.session_id,
+            fence: order.fence,
+            vault,
+        };
+        let toolbelt = toolbelt::open(peer, run, approvals, self.approval_timing)
             .map_err(|e| failed("opening the session's toolbelt", e))?;
         let mcp = toolbelt_mcp_config(
             &relay,
@@ -4559,7 +4567,7 @@ fn resolve_harness(cfg: &HiveConfig, home: &Path) -> Option<PathBuf> {
 ///
 /// On Windows both directories are made first, each with its DACL
 /// ([`session_dir`]), and the file takes the session directory's.
-fn write_settings(runtime: &Path, sid: &str) -> Result<PathBuf, String> {
+fn write_settings(runtime: &Path, sid: &str, vault_tools: bool) -> Result<PathBuf, String> {
     let dir = runtime.join(sid);
     #[cfg(unix)]
     for d in [runtime, dir.as_path()] {
@@ -4587,6 +4595,13 @@ fn write_settings(runtime: &Path, sid: &str) -> Result<PathBuf, String> {
         sandbox_proxy: None,
         extra_read_denies: Vec::new(),
         session_start_hook,
+        // P3-4b — the vault's reads need no person: their gate is the
+        // vault's own `secret:list`, decided and recorded by the server.
+        allow_tools: if vault_tools {
+            toolbelt::VAULT_TOOLS.map(String::from).to_vec()
+        } else {
+            Vec::new()
+        },
     }
     .to_json();
     write_doc(&dir, "settings.json", &doc)
@@ -7459,6 +7474,29 @@ done
         assert!(doc["permissions"]["deny"].to_string().contains("/proc"));
         r.sup.stop(o.session_id, 1, "owner".into());
         until_ended(&mut r, o.session_id).await;
+    }
+
+    /// FR-90 P3-4b — a session's settings allow the vault tools exactly
+    /// where its toolbelt offers them, and allow nothing anywhere else.
+    #[test]
+    fn the_settings_allow_the_vault_tools_only_where_they_are_offered() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("run");
+        let read = |sid: &str| -> serde_json::Value {
+            let path = runtime.join(sid).join("settings.json");
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        write_settings(&runtime, "offered", true).unwrap();
+        assert_eq!(
+            read("offered")["permissions"]["allow"],
+            serde_json::json!(toolbelt::VAULT_TOOLS)
+        );
+        write_settings(&runtime, "not-offered", false).unwrap();
+        let doc = read("not-offered");
+        assert!(
+            doc["permissions"].get("allow").is_none(),
+            "nothing allowed: every tool call asks: {doc}"
+        );
     }
 
     /// A reconnect replays the latest state of every session — what a dying

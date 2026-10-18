@@ -34,8 +34,8 @@ use crate::VaultState;
 use crate::dao::{MAX_POLICIES, MAX_ROLES, is_name_taken};
 use crate::model::{VaultPolicy, VaultRole};
 use crate::policy::{
-    self, ACTION_ASSUME, ACTION_USE, ACTIONS, Ask as Request, DeviceFacts, GUARDRAILS, MODES, OSES,
-    OrgNames, SecretFacts, SessionFacts, Verdict,
+    self, ACTION_ASSUME, ACTION_LIST, ACTION_USE, ACTIONS, Ask as Request, DeviceFacts, GUARDRAILS,
+    MODES, OSES, OrgNames, SecretFacts, SessionFacts, Verdict,
 };
 use crate::routes::{
     Ask, check_description, decide, live_secret, member_tenant, org_slug, record_allow, rfc3339,
@@ -113,7 +113,7 @@ pub(crate) async fn groups_of_member(
 
 /// The organization's whole set, guardrails first. ⚠️ An Err here is a
 /// set that did not build — every caller DENIES on it.
-async fn org_set(
+pub(crate) async fn org_set(
     state: &VaultState,
     tid: ObjectId,
 ) -> Result<(cedar_policy::PolicySet, Vec<VaultPolicy>), String> {
@@ -716,6 +716,43 @@ pub async fn simulate(
                 ttl_s,
                 device,
                 approver,
+            }
+        }
+        // P3-4b — whether a session in a role, on that device, may list or
+        // describe that secret.
+        ACTION_LIST => {
+            let Some(raw) = &body.principal.owner_id else {
+                return Err(ApiError::BadRequest(
+                    "principal.owner_id is required".into(),
+                ));
+            };
+            let session_owner = parse_user(raw, "principal.owner_id")?;
+            let role = match &body.principal.role {
+                Some(r) => Some(known_role(r)?),
+                None => None,
+            };
+            let Some(raw) = &body.resource.secret_id else {
+                return Err(ApiError::BadRequest(
+                    "resource.secret_id is required".into(),
+                ));
+            };
+            let sid = crate::routes::parse_secret_id(raw)?;
+            let secret = live_secret(&state, tid, sid).await?;
+            let slug = org_slug(&state, tid).await?;
+            Request::ListSecret {
+                session: SessionFacts {
+                    id: "simulated".into(),
+                    owner: session_owner,
+                    role,
+                    playbook: body.principal.playbook.clone(),
+                },
+                secret: SecretFacts {
+                    prefix: secret_rrn(&slug, ""),
+                    path: secret.path.clone(),
+                    kind: secret.kind.clone(),
+                    tags: secret.tags.clone(),
+                },
+                device,
             }
         }
         other => {
