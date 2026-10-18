@@ -1288,12 +1288,14 @@ jobs:
       # `/bin/sh` stand-in for Claude Code, and run on Linux and macOS.)
       # #2010: `win_service::tests` — the SCM host's own (the STOP_PENDING
       # report and its order against the supervisor), also in no lane before.
+      # #2465: `win_service::orphan` — which roomlerd is an earlier host's
+      # worker, and the reaper's reads through a real process handle.
       - name: Agent sessions on Windows — unit tests (FR-90 P1i)
         if: ${{ !cancelled() }}
         # A block scalar: `hive:: ` holds `: `, which a plain YAML scalar reads
         # as a mapping, and then this whole file fails to parse.
         run: |
-          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault -- hive:: hive_win win_service::supervisor win_service::tests vault::
+          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault -- hive:: hive_win win_service::supervisor win_service::tests win_service::orphan vault::
 
       # FR-99 P1b — the overlay behind `viewer-indicator`: the "being viewed"
       # border and badge, the native consent panel, and the privacy curtain
