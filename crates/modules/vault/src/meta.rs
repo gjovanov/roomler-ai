@@ -98,6 +98,7 @@ fn secret_facts(secret: &VaultSecret, slug: &str) -> SecretFacts {
         path: secret.path.clone(),
         kind: secret.kind.clone(),
         tags: secret.tags.clone(),
+        exec_allow: secret.exec_allow.clone(),
     }
 }
 

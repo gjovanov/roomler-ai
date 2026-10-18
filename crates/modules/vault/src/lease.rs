@@ -650,6 +650,7 @@ async fn decide_and_release(
             path: secret.path.clone(),
             kind: secret.kind.clone(),
             tags: secret.tags.clone(),
+            exec_allow: secret.exec_allow.clone(),
         },
         mode: req.mode.clone(),
         audience: req.audience.clone(),

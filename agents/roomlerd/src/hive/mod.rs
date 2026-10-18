@@ -96,6 +96,9 @@ mod store;
 mod sudo;
 mod supervisor;
 mod toolbelt;
+/// FR-90 P3-4c-1 — `vault_exec`: a command run with values from the vault.
+#[cfg(feature = "vault")]
+mod vault_exec;
 pub mod view;
 mod workspace;
 

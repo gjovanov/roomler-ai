@@ -481,6 +481,16 @@ mod client {
             dropped
         }
 
+        /// P3-4c — a tool is done with these leases: let them go now, not at
+        /// their expiry. Answers how many it held.
+        pub fn release(&self, lease_ids: &[String]) -> usize {
+            let mut held = lock(&self.held);
+            lease_ids
+                .iter()
+                .filter(|id| held.remove(id.as_str()).is_some())
+                .count()
+        }
+
         /// The run of `session` at `fence` ended here: its leases go with it.
         pub fn drop_run(&self, session: ObjectId, fence: u64) -> usize {
             let mut held = lock(&self.held);

@@ -62,6 +62,8 @@ fn run() -> Run {
         session: ObjectId::new(),
         fence: 1,
         vault: None,
+        #[cfg(feature = "vault")]
+        exec: None,
     }
 }
 
@@ -446,11 +448,21 @@ async fn the_socket_is_the_sessions_alone() {
 }
 
 /// P3-4b — a vault that answers as told and records what it was asked; with
-/// `hold`, each answer waits until the test releases it.
+/// `hold`, each answer waits until the test releases it. P3-4c-1: it leases
+/// in `exec` mode the `values` it holds by `secret` or `secret#field`, and
+/// remembers each lease it holds and each it was told to let go of.
 #[derive(Default)]
 struct FakeVault {
     asked: std::sync::Mutex<Vec<(String, ObjectId, u64, String)>>,
     hold: Option<tokio::sync::Notify>,
+    #[cfg(feature = "vault")]
+    values: HashMap<String, Vec<u8>>,
+    #[cfg(feature = "vault")]
+    held: std::sync::Mutex<HashMap<String, Vec<u8>>>,
+    #[cfg(feature = "vault")]
+    released: std::sync::Mutex<Vec<String>>,
+    #[cfg(feature = "vault")]
+    issued: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeVault {
@@ -460,7 +472,57 @@ impl FakeVault {
 }
 
 #[async_trait::async_trait]
-impl VaultMeta for FakeVault {
+impl VaultTools for FakeVault {
+    #[cfg(feature = "vault")]
+    async fn lease_exec(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        handle: &super::super::vault_exec::Handle,
+        program: &str,
+        ttl_secs: u32,
+    ) -> Result<String, String> {
+        let key = if handle.field.is_empty() {
+            handle.secret.clone()
+        } else {
+            format!("{}#{}", handle.secret, handle.field)
+        };
+        self.asked.lock().unwrap().push((
+            "lease_exec".into(),
+            session,
+            fence,
+            format!("{key} for {program} {ttl_secs}s"),
+        ));
+        let value = self
+            .values
+            .get(&key)
+            .ok_or_else(|| "the vault refused: no_secret".to_string())?;
+        let n = self
+            .issued
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = format!("L{n}");
+        self.held.lock().unwrap().insert(id.clone(), value.clone());
+        Ok(id)
+    }
+
+    #[cfg(feature = "vault")]
+    fn value(&self, lease_id: &str) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+        self.held
+            .lock()
+            .unwrap()
+            .get(lease_id)
+            .map(|v| zeroize::Zeroizing::new(v.clone()))
+    }
+
+    #[cfg(feature = "vault")]
+    fn release(&self, lease_ids: &[String]) {
+        let mut held = self.held.lock().unwrap();
+        for id in lease_ids {
+            held.remove(id);
+            self.released.lock().unwrap().push(id.clone());
+        }
+    }
+
     async fn list(&self, session: ObjectId, fence: u64, prefix: &str) -> Result<Value, String> {
         self.asked
             .lock()
@@ -523,6 +585,8 @@ async fn the_vault_tools_are_offered_only_where_the_device_takes_leases() {
             session: ObjectId::new(),
             fence: 1,
             vault: Some(vault.clone()),
+            #[cfg(feature = "vault")]
+            exec: None,
         },
         quick(),
     );
@@ -532,8 +596,13 @@ async fn the_vault_tools_are_offered_only_where_the_device_takes_leases() {
     let list = c.recv().await;
     let tools = list["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["approve", "vault_list", "vault_describe"]);
-    for t in &tools[1..] {
+    assert_eq!(names[..3], ["approve", "vault_list", "vault_describe"]);
+    // P3-4c-1 — and, in a build with the vault, its one use.
+    #[cfg(feature = "vault")]
+    assert_eq!(names[3..], ["vault_exec"]);
+    #[cfg(not(feature = "vault"))]
+    assert_eq!(names.len(), 3);
+    for t in &tools[1..3] {
         assert_eq!(t["annotations"]["readOnlyHint"], true, "{t}");
     }
     assert_eq!(
@@ -568,6 +637,8 @@ async fn a_vault_tool_answers_what_the_vault_says_for_the_sessions_run() {
             session: sid,
             fence: 7,
             vault: Some(vault.clone()),
+            #[cfg(feature = "vault")]
+            exec: None,
         },
         quick(),
     );
@@ -636,6 +707,8 @@ async fn a_cancelled_vault_call_gets_no_answer() {
             session: ObjectId::new(),
             fence: 1,
             vault: Some(vault.clone()),
+            #[cfg(feature = "vault")]
+            exec: None,
         },
         quick(),
     );
@@ -664,6 +737,222 @@ async fn a_cancelled_vault_call_gets_no_answer() {
     let next = c.recv().await;
     assert_eq!(next["id"], 7, "{next}");
     assert_eq!(vault.asked().len(), 2);
+}
+
+/// P3-4c-1 — a toolbelt whose run's commands run as this daemon, from `dir`,
+/// with `values` in its vault.
+#[cfg(all(feature = "vault", unix))]
+fn exec_belt(dir: &Path, values: &[(&str, &[u8])]) -> (Belt, Arc<FakeVault>, ObjectId) {
+    let vault = Arc::new(FakeVault {
+        values: values
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_vec()))
+            .collect(),
+        ..FakeVault::default()
+    });
+    let sid = ObjectId::new();
+    let belt = belt_running(
+        me(),
+        Run {
+            session: sid,
+            fence: 5,
+            vault: Some(vault.clone()),
+            exec: Some(super::super::vault_exec::ExecTarget {
+                account: None,
+                home: dir.to_path_buf(),
+                folder: dir.to_path_buf(),
+            }),
+        },
+        quick(),
+    );
+    (belt, vault, sid)
+}
+
+/// The answer to a `vault_exec` call: its JSON, or its error text.
+#[cfg(all(feature = "vault", unix))]
+async fn exec_answer(c: &mut Client, id: u64, args: Value) -> Result<Value, String> {
+    c.send(tool_call(id, "vault_exec", args)).await;
+    let m = c.recv().await;
+    assert_eq!(m["id"], id, "{m}");
+    let text = m["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    if m["result"]["isError"] == true {
+        Err(text)
+    } else {
+        Ok(serde_json::from_str(&text).unwrap())
+    }
+}
+
+/// P3-4c-1 — `vault_exec` is offered with the reads, and never allowed in
+/// the settings: each call asks a person first.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn vault_exec_is_offered_and_never_allowed_unasked() {
+    let vault = Arc::new(FakeVault::default());
+    let b = belt_running(
+        me(),
+        Run {
+            session: ObjectId::new(),
+            fence: 1,
+            vault: Some(vault.clone()),
+            exec: None,
+        },
+        quick(),
+    );
+    let mut c = Client::connect(&b).await;
+    c.send(json!({"method": "tools/list", "jsonrpc": "2.0", "id": 1}))
+        .await;
+    let list = c.recv().await;
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let exec = tools
+        .iter()
+        .find(|t| t["name"] == "vault_exec")
+        .expect("offered");
+    assert_eq!(exec["annotations"]["readOnlyHint"], false, "{exec}");
+    assert_eq!(exec["inputSchema"]["required"], json!(["argv", "env"]));
+    assert!(
+        !VAULT_TOOLS.contains(&"mcp__roomler__vault_exec"),
+        "the settings never allow it: a person approves every call"
+    );
+}
+
+/// P3-4c-1 — a command runs as the session's run would, with the value in
+/// its environment, from the run's folder; the value comes back scrubbed,
+/// the lease is asked for that program and let go after.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn vault_exec_runs_with_the_value_and_answers_it_scrubbed() {
+    let dir = tempfile::tempdir().unwrap();
+    let value: &[u8] = b"s3cr3t-pw-81";
+    let (b, vault, sid) = exec_belt(dir.path(), &[("db/main#password", value)]);
+    let mut c = Client::connect(&b).await;
+    // `CARGO_MANIFEST_DIR` is in this test's own environment: the child, run
+    // with a clean one, must not see it.
+    assert!(
+        std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+        "the daemon-side variable the child must not inherit"
+    );
+    let answer = exec_answer(
+        &mut c,
+        1,
+        json!({
+            "argv": ["sh", "-c", "printf '%s|%s|%s' \"$PW\" \"$(pwd)\" \"$CARGO_MANIFEST_DIR\""],
+            "env": {"PW": "db/main#password"},
+        }),
+    )
+    .await
+    .unwrap();
+    let here = dir.path().canonicalize().unwrap();
+    assert_eq!(
+        answer["stdout"],
+        format!("[vault:PW]|{}|", here.display()),
+        "{answer}"
+    );
+    assert_eq!(answer["exit_code"], 0);
+    assert_eq!(answer["timed_out"], false);
+    assert!(!answer.to_string().contains("s3cr3t"), "{answer}");
+    assert_eq!(
+        vault.asked(),
+        [(
+            "lease_exec".to_string(),
+            sid,
+            5,
+            "db/main#password for sh 90s".to_string()
+        )]
+    );
+    assert_eq!(*vault.released.lock().unwrap(), ["L0"]);
+    assert!(
+        vault.held.lock().unwrap().is_empty(),
+        "let go after the run"
+    );
+}
+
+/// P3-4c-1 — one refused lease runs nothing, and the leases already held are
+/// let go; a path, a program nowhere to be found, or a reserved name is
+/// refused before anything is asked.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn a_refusal_runs_nothing_and_a_bad_call_asks_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, _) = exec_belt(dir.path(), &[("db/main", b"first-value-1")]);
+    let mut c = Client::connect(&b).await;
+    let refused = exec_answer(
+        &mut c,
+        1,
+        json!({"argv": ["sh", "-c", "touch ran"], "env": {"A": "db/main", "B": "db/missing"}}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused, "B: the vault refused: no_secret");
+    assert!(!dir.path().join("ran").exists(), "nothing ran");
+    assert_eq!(*vault.released.lock().unwrap(), ["L0"]);
+    assert!(vault.held.lock().unwrap().is_empty());
+    let asked = vault.asked().len();
+    for (args, says) in [
+        (
+            json!({"argv": ["/bin/sh", "-c", "true"], "env": {"A": "db/main"}}),
+            "bare name",
+        ),
+        (
+            json!({"argv": ["no-such-program-p34c"], "env": {"A": "db/main"}}),
+            "was not found",
+        ),
+        (
+            json!({"argv": ["sh"], "env": {"LD_PRELOAD": "db/main"}}),
+            "cannot be handed",
+        ),
+        (
+            json!({"argv": ["sh"], "env": {"PATH": "db/main"}}),
+            "cannot be handed",
+        ),
+        (json!({"argv": ["sh"], "env": {}}), "env must map"),
+        (
+            json!({"argv": ["sh"], "env": {"A": "db/main"}, "timeout_s": 0}),
+            "timeout_s",
+        ),
+    ] {
+        let why = exec_answer(&mut c, 2, args.clone()).await.unwrap_err();
+        assert!(why.contains(says), "{args}: {why}");
+    }
+    assert_eq!(
+        vault.asked().len(),
+        asked,
+        "a bad call asks the vault nothing"
+    );
+}
+
+/// P3-4c-1 — the timeout kills the command and everything it started, and
+/// the lease is let go.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn a_command_past_its_timeout_is_killed_with_its_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, _) = exec_belt(dir.path(), &[("db/main", b"slow-value-22")]);
+    let mut c = Client::connect(&b).await;
+    let started = std::time::Instant::now();
+    // A child that would touch the file two seconds in, had the group been
+    // left alive past the one-second timeout.
+    let answer = exec_answer(
+        &mut c,
+        1,
+        json!({
+            "argv": ["sh", "-c", "(sleep 2; touch survived) & sleep 30"],
+            "env": {"A": "db/main"},
+            "timeout_s": 1,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer["timed_out"], true, "{answer}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(vault.held.lock().unwrap().is_empty());
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(
+        !dir.path().join("survived").exists(),
+        "the group died with the command"
+    );
 }
 
 /// More open approvals than Claude Code ever asks for, and a question the
