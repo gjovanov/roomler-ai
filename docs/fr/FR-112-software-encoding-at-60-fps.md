@@ -1,13 +1,16 @@
 # FR-112: 60 fps without a hardware encoder — the frame rate follows what the encoder sustains
 
-**Issue:** [#2394](https://github.com/gjovanov/roomler-ai/issues/2394) · **Status:** P1, P2a and P2b
-released in **0.4.142** and field-verified on it (§9), P4's docs merged after it
-([#2425](https://github.com/gjovanov/roomler-ai/pull/2425)): the Asahi host sends **56.2 fps** of VP9-444 where
-0.4.141 sends 27, H.264 **56.2** where it sends 28.7, and a still screen costs 15 % CPU instead of 44 %. AC1, AC2
-and AC4–AC8 ticked. **AC3 found a flap**: the pace's hysteresis held nothing, so a pace on a step boundary moved every
-window it crossed. P2d (a step-up margin) fixes it: on a candidate, under the same conditions, the pace moves twice
-in 40 s where 0.4.142's moves 14 times. AC3 waits for P2d's release. P3 (macOS, Windows) moved
-to [#2430](https://github.com/gjovanov/roomler-ai/issues/2430).
+**Issue:** [#2394](https://github.com/gjovanov/roomler-ai/issues/2394) · **Status:** ✅ **closed 2026-10-18**, every
+criterion field-verified on a release (§9).
+- P1, P2a and P2b are in **0.4.142**. The Asahi host sends **56.2 fps** of VP9-444 where 0.4.141 sends 27, H.264
+  **56.2** where it sends 28.7, and a still screen costs 15 % CPU instead of 44 %.
+- **AC3 found a flap**: the pace's hysteresis held nothing, so a pace on a step boundary moved every window it
+  crossed. P2d (a step-up margin) and its review's follow-ups are in **0.4.143**. There a host that cannot
+  sustain 60 settles with no pace change at all, and `ROOMLERD_SW_PACE_UP_MARGIN=0` gives back the old flapping
+  (11 moves in 40 s).
+- P4's docs: [#2425](https://github.com/gjovanov/roomler-ai/pull/2425).
+- P3 (macOS, Windows) moved to [#2430](https://github.com/gjovanov/roomler-ai/issues/2430), and the hardware
+  pace's own flaw to [#2432](https://github.com/gjovanov/roomler-ai/issues/2432).
 Spec and claim 2026-10-17, on the operator's *"why is asahi having
 less than 30fps, cant it reach 60?"* and, after the answer, *"yes do it"* · **Owner:** remote desktop (the software
 encode paths) · **Anchors:** master `a20bda769` ·
@@ -222,7 +225,7 @@ flowchart LR
 | **P1** | the encoder asks for its clock: on Linux a `uclamp_min` on the encoder thread (libvpx's workers inherit it), OpenH264's worker and the capture worker; the VP9-444 pump times its encode (`avg_encode_ms`); the VP9 bench kept as an ignored test | `ROOMLERD_ENCODER_CLOCK=0` | ✅ released in 0.4.142, field-verified on the Asahi host and a per-user lab guest (§9) | S |
 | **P2a** | the VP9-444 pump's tier: target 60, `FpsPace` fed by its encode EWMA and never below 30, the ceiling from the rate it runs at (×√2 at 60); on by default on Linux | `ROOMLERD_SW_FPS_60=0` (back to 30) | ✅ released in 0.4.142, field-verified on the Asahi host (§9) | M |
 | **P2b** | the H.264 RTP pump's tier: target 60 on Linux, the same pace (`SoftwarePace`, shared with P2a) and ceiling, OpenH264's frame rate following the rate it runs at, its runtime settings held until its first frame and its max bitrate moving with the target, the auto-fps-cap left to Windows | `ROOMLERD_SW_FPS_60=0` | ✅ released in 0.4.142, field-verified on the Asahi host (§9) | M |
-| **P2d** | the software pace's steps up wait for headroom: down at once, up only once the estimate clears the higher step by 2.5 fps (`SW_PACE_UP_MARGIN_FPS`); the hardware pace keeps margin 0 until it is measured ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)) | `ROOMLERD_SW_PACE_UP_MARGIN=0` (0.4.142's pace) | 🟡 a candidate on the Asahi host (§9): under the same conditions 0.4.142's pace moved 14 times in 40 s, the margin twice; unit: margin 0 replays 0.4.142's logged field trace window for window. The release check owed (AC3) | S |
+| **P2d** | the software pace's steps up wait for headroom: down at once, up only once the estimate clears the higher step by 2.5 fps (`SW_PACE_UP_MARGIN_FPS`); the hardware pace keeps margin 0 until it is measured ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)) | `ROOMLERD_SW_PACE_UP_MARGIN=0` (0.4.142's pace) | ✅ released in **0.4.143**, field-verified on it (§9): no pace change in 38 and 43 windows where 0.4.142 flapped, and the switch gives the flapping back. Before it: a candidate on the Asahi host (0.4.142's pace 14 moves in 40 s, the margin 2); unit: margin 0 replays 0.4.142's logged field trace window for window | S |
 | ~~**P2c**~~ | ~~software H.264's ≤ 1280-px cap decided by the measured encode~~ — dropped: the viewer's default `original` already overrides the cap (§3), and the host encodes 2048×1080 in 5.5 ms | — | — | — |
 | ~~**P3**~~ | ~~the clock elsewhere: macOS (the encoder threads' QoS class) and Windows (no power throttling for the encode thread), each measured on its own hardware first~~ — moved to [#2430](https://github.com/gjovanov/roomler-ai/issues/2430), so this FR can close on what Linux measured | per OS | → #2430 | S |
 | **P4** | docs: `docs/rate-control.md` (the software tier, the ceiling), `docs/encoders.md` (the clock, why one slice), the `docs/README.md` index row | — | ✅ `encoders.md` § Software encoders (the clock, the tier, OpenH264's settings), `rate-control.md` § Software encoders and two config rows, both index rows | S |
@@ -250,8 +253,16 @@ flowchart LR
 - [x] **AC2** — The same host over H.264/RTP: **≥ 55 fps**. Red first on 0.4.141.
   ✅ 0.4.142 as released: **56.2 fps**, target 60, never paced, a 5.2 ms encode, 0.4 cores (§9). Red: 28.7 on
   0.4.141 (§9's P2b table), and 28.7 on 0.4.142 with both kill switches.
-- [ ] **AC3** — A host that cannot sustain 60 settles at the rate it sustains: never below its 0.4.141 rate, and
+- [x] **AC3** — A host that cannot sustain 60 settles at the rate it sustains: never below its 0.4.141 rate, and
   at most one pace change in any 10 s once settled.
+  ✅ **The released 0.4.143** (P2d), the Asahi host's system service updated to it, every arm one session (§9):
+  - With `ROOMLERD_ENCODER_CLOCK=0` the host cannot sustain 60. It encodes **28.0 fps** against 27.0 on 0.4.141,
+    paced 30 in all 38 windows, **no pace change**.
+  - With the estimate put on the 40 fps step (the clock off and `ROOMLERD_VP9_CPU_USED=9`): **32.3 fps**, paced 35
+    in all 43 windows, **no pace change**.
+  - `ROOMLERD_SW_PACE_UP_MARGIN=0` on the same host gives back 0.4.142's pace: **11 moves** in 40 s, 3 undone
+    within two windows. That arm's fps is void because the lab viewer stalled; its pace log is the agent's own.
+  - The history below is how AC3 got here.
   🟡 0.4.142 with `ROOMLERD_ENCODER_CLOCK=0` (the Asahi host made one that cannot: a 31 ms VP9-444 encode)
   settles at 30, 27.7 fps encoded against 27.0 on 0.4.141, with no pace change in 38 windows (§9). But the
   same host's other arm, its encode getting cheaper as the lab viewer stalled, undid a step three times within
@@ -414,3 +425,22 @@ live check, and the host ended on the release's bytes with no drop-in left.
   where they were. The clock-off arm settles at 30 after its first estimate and stays there.
 - AC3's measure passes on the candidate: at most one pace change in any 10 s once settled. It ticks on the
   release.
+
+**The release, 0.4.143, 2026-10-18 09:53–10:02Z.** The Asahi host's system service updated itself
+(`roomlerd self-update`: `SucceededVerified`, sha256 `4d117046…`). Each arm was one session, and every restart
+waited for the per-session live check.
+
+| Arm (VP9-444, a spinning cube, 40 s) | encoded fps | encode ms (p10 · p50 · p90) | the pace per heartbeat | moves · undone within two windows |
+|---|---|---|---|---|
+| `ROOMLERD_ENCODER_CLOCK=0` (cannot sustain 60) | 28.0 (QP 11; 0.4.141: 27.0) | 28.9 · 31.2 · 32.8 | 30×38 | **0 · 0** |
+| + `ROOMLERD_VP9_CPU_USED=9` (the estimate on the 40 fps step) | 32.3 (QP 8) | 23.9 · 25.7 · 28.9 | 35×43 | **0 · 0** |
+| the same, `ROOMLERD_SW_PACE_UP_MARGIN=0` (0.4.142's pace) | void: the lab viewer stalled (decode reports 0–15) | 19.7 · 23.5 · 33.1 | 35×4 30×6 35×3 40×3 30×2 35×2 40×2 45×2 50×2 45×2 50×3 45×4 | 11 · 3 |
+
+- **AC3 passes on the release.** Both margin-on arms settled with no pace change at all, and the encoded rate never
+  fell below 0.4.141's 27.0.
+- **The switch restores 0.4.142's pace.** The stalled arm's fps is void, but its pace log is the agent's own, and
+  it flapped as 0.4.142 does.
+- ⚠️ **Wrong turn:** the run's fourth arm (the margin back on) never ran. The run was held over a `roomler ssh`
+  session, the session dropped at 10:02Z, and the script died with it before its cleanup, which left the clock-off
+  drop-in on the host. It was found and removed at 10:16Z, with no live session and the service restarted on the
+  release's bytes. Long runs now go in a transient unit, which outlives the session.
