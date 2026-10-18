@@ -41,6 +41,9 @@ pub mod companion_spawn;
 pub mod desktop;
 pub mod environment;
 pub mod firewall;
+/// FR-97 P4a — the host's half of the real Ctrl+Alt+Del: `SendSAS` is
+/// honoured only from the service process, so the worker asks it here.
+pub mod sas_relay;
 /// FR-97 P4d — a per-user daemon's clean stop at sign-out and shutdown: a
 /// hidden window hears `WM_ENDSESSION`, which no console handler does here.
 pub mod session_end;

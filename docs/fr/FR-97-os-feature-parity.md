@@ -4,7 +4,7 @@
 - Shipped by 0.4.135 and field-verified: P0a, P0b, P0e, and the macOS exit client P1a + P1c (AC1, AC2, AC4, AC6,
   AC17).
 - The macOS exit, P1b (#2362), shipped in 0.4.141. Its pf-reference and Internet Sharing fix (#2377) rides 0.4.142.
-  AC5 is field-verified on a candidate of that fix (§8); a check on the 0.4.142 release is owed.
+  AC5 is field-verified on a candidate of that fix and on the 0.4.142 release (§8).
 - P0d, the measurement, merged (#2397): the native architecture in the hello, and `scripts/fr97-caps-census.sh`.
   It reaches the fleet with the next agent release and server promote. The count before P0c was taken on
   2026-10-17 (§8, AC15).
@@ -19,8 +19,10 @@
   both (§8). Both ride the next release.
 - P3b, the Linux lock hint (advisory) and a live session's logind block inhibitor (FR-55 P3), merged (#2431),
   field-verified red → green on a root daemon (§8).
-- P4d, a clean stop for a per-user Windows install (`roomlerd service stop`, sign-out, shutdown), is in review
-  (D15), field-verified red → green on a perUser Win11 guest (§8).
+- P4d, a clean stop for a per-user Windows install (`roomlerd service stop`, sign-out, shutdown), merged (#2435),
+  field-verified red → green on a perUser Win11 guest (§8).
+- P4a, a real Ctrl+Alt+Del (`SendSAS` from the SCM host, asked by the SystemContext worker, where the policy lets
+  services), is in review, field-verified red → green on a Win11 lock screen that requires it (§8).
 - The rest of P2–P7 is open.
 
 **Owner:** the agent on all
@@ -94,7 +96,7 @@ prevent, and the guard re-asserts it on every tick.
 - A restart does not heal it: `purge_split_default` runs at boot, then the runtime re-installs from the persisted
   `overlay_exit_node`.
 - Reach: a Mac running the opt-in root daemon whose operator sets `overlay_exit_node`. The key is not in
-  `DesiredConfig` (`crates/remote_control/src/models.rs:2437`), so no server push can set it; a local
+  `DesiredConfig` (`crates/remote_control/src/models.rs:2442`), so no server push can set it; a local
   `sudo roomler config set` can, and so can an `exec` on the daemon's row. Once it lands, the control WS that the
   `exec` came in on is captured too, so the same channel cannot undo it.
 - `NetstackTun` inherits the same default. It installs no OS routes, so it cannot wedge, but `roomler status`
@@ -111,7 +113,7 @@ prevent, and the guard re-asserts it on every tick.
   nothing. Windows Home fails `New-NetNat` silently and leaves IPv4 forwarding on after the revert (#2077).
 - The server derives `can_be_exit_node` from the advertisement alone
   (`crates/modules/network/src/routes/overlay_route.rs:63`), and the admin row carries no OS (`overlay_route.rs:28-59`)
-  although every agent row has one (`models.rs:1952`).
+  although every agent row has one (`models.rs:1957`).
 - `approved_routes` survives a rejoin on purpose (`crates/services/src/dao/overlay_node.rs:239-241`), and the netmap
   fans `approved_routes` without intersecting what the node still advertises
   (`crates/modules/network/src/overlay.rs:2549`). A client accepts any peer whose fanned routes hold `/0`
@@ -151,9 +153,9 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | R3 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows (FR-56) | ❌ | `Unavailable::Platform` (`apps/mod.rs:347`); no `apps/macos.rs` | P2c |
 | R4 | Live cursor shape | ✅ | ❌ | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`) | P3a, P2d |
 | R5 | "Host is locked" consent hint | ✅ | ✅ since P3b: advisory, from logind's `LockedHint`, and input passes (`lock_state.rs:331`) | ❌ | `LockState` is always `Unlocked` off Windows (`lock_state.rs:290-311`), on purpose for Linux: the hint never becomes one | P2d, P3b |
-| R6 | Keyboard layout report / switch | ✅ | ❌ | ❌ | Windows-only cap (`caps.rs:1568-1572`) | P2d, P3e |
+| R6 | Keyboard layout report / switch | ✅ | ❌ | ❌ | Windows-only cap (`caps.rs:1570-1574`) | P2d, P3e |
 | R7 | Match remote display | ✅ | ❌ | ❌ | `display_match.rs:247` | P2d, P3e |
-| R8 | Clipboard: host → viewer image sync | ✅ | ❌ | ❌ | Forced off (`clipboard.rs:818-822`) ✔ while advertised (`caps.rs:1545-1553`) | P0c, P2e, P3e |
+| R8 | Clipboard: host → viewer image sync | ✅ | ❌ | ❌ | Forced off (`clipboard.rs:818-822`) ✔ while advertised (`caps.rs:1547-1555`) | P0c, P2e, P3e |
 | R9 | Clipboard: RTF lane | ✅ | ❌ | ❌ | `clipboard.rs:792` | P2e, P3e |
 | R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:9646-9649`) | FR-93 P7 |
 | R11 | Typing text on a non-US layout (uinput) | ✅ | 🟡 US table only | ✅ | `keylayout.rs:40-46`, `uinput_backend.rs:628-634` | P3f |
@@ -193,19 +195,19 @@ and the consent chain's fallbacks.
 | O1 | A per-user install updates itself | ✅ | ❌ | ✅ | #2046 | FR-96 |
 | O2 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | ❌ | ❌ | `Unsupported` → the install proceeds (`artifact_version.rs:272-289`, `updater.rs:1404`): a signed older package under a newer manifest installs | P6a |
 | O3 | Tunnel CLI `roomler self-update` | ✅ | ❌ | ❌ | `agents/roomler-cli/src/update.rs:96-101` | P6b |
-| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:4913` | P6c |
+| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:4932` | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 apt only; the tarball has none | ❌ | A pasted recipe (`docs/installation.md:394-420`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
 | O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | ❌ | `macos_supervisor.rs` never calls `crash_recorder` | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1170-1179` | P6f |
-| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`main.rs:3069`, `session_end.rs:220`) | P4d |
+| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`main.rs:3088`, `session_end.rs:220`) | P4d |
 | A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2312-2318`); the CLI and the wizard are universal | D6 |
 | A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:80-81`); behaviour under emulation unverified | D6 |
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` (`release-agent.yml:1093`); recordings write Opus, not AAC | P7a |
 | A4 | Tunnel CLI and wizard on Linux arm64 | — | ❌ | — | x86_64 only (`release-tunnel.yml:127-131`, `release-setup.yml:184-189`) | P7b |
 
-The server records `os` on every agent row but no architecture (`models.rs:14-18`, `:1952`), so it cannot count the
+The server records `os` on every agent row but no architecture (`models.rs:14-18`, `:1957`), so it cannot count the
 devices A1 and A2 would serve. P0d adds the native machine architecture to the hello. On Windows that is
 `IsWow64Process2`'s native machine, because an x64 build under emulation would otherwise report x86_64.
 
@@ -215,7 +217,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 2. Linux and macOS advertise clipboard image events they never send (R8); a root Linux daemon advertises a clipboard
    it cannot reach (R10).
 3. The Ctrl+Alt+Del button shows for every host. It sends three ordinary key events
-   (`ui/src/composables/useRemoteControl.ts:11448-11460`) ✔, and nothing in the agent calls `SendSAS` (grep: none) ✔.
+   (`ui/src/composables/useRemoteControl.ts:11449-11461`) ✔, and nothing in the agent calls `SendSAS` (grep: none) ✔.
    Windows does not treat a synthesised Ctrl+Alt+Del as the secure attention sequence, so the button does nothing at
    a lock screen that requires it; on Linux and macOS the chord means something else, or nothing.
 4. The enroll dialog offers the setup wizard for agents on Linux and macOS, where it installs only the tunnel client
@@ -240,15 +242,15 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `docs/roomler-ssh.md:311-325` | Windows `daemon` → SYSTEM | the console worker (#2021, FR-94) |
 | `docs/installation.md:21-22`, `ui/docs/content/start/install/macos.md:51-53` | install the macOS daemon with the wizard | the wizard's daemon roles are Windows-only |
 | `docs/installation.md:43-44`, `ui/docs/content/troubleshooting/install-problems.md:37-40` | downloads come from roomler.ai | true for the MSI proxy, the CLI and the wizard; `install.sh`'s `.deb`/tarball/`.pkg` and every self-update fetch from GitHub (`updater.rs:1276,1360`) |
-| `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:3175` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon. ✅ Both say so since P0c-2 |
+| `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:3180` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon. ✅ Both say so since P0c-2 |
 | `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:181-224`); DRM captures from root (opt-in) |
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`) |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93 |
-| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1818`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps |
+| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1820`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps |
 
 ### 2.9 Equal on all three: not parity, recorded so nobody files them here
 
-Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:9700`), a curtain or
+Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:9701`), a curtain or
 privacy mode, touch injection, a live microphone (two-way audio), OS toast notifications
 (`crates/agent-core/src/notify.rs:21-24`), file copy-paste through the clipboard, minidumps, and SSH agent and X11
 forwarding. Several deserve FRs of their own; none is a platform gap.
@@ -321,7 +323,7 @@ silence (R1). Clipboard image events sat on every Linux and macOS agent, whose w
 Ctrl+Alt+Del at all.
 
 **The shape (D10).** A word stays a promise. What a host cannot keep, the daemon takes out and explains in a new map,
-`AgentCaps.unavailable: {feature → {code, reason}}` (`crates/remote_control/src/models.rs:529`). The keys are
+`AgentCaps.unavailable: {feature → {code, reason}}` (`crates/remote_control/src/models.rs:534`). The keys are
 matched by equality (`Unavailable::KEYS`, `:548`), and the wire shape is locked by
 `unavailable_wire_shape_is_locked`. The viewer's rule:
 
@@ -339,10 +341,10 @@ OS: FR-43's practice of keeping the decision out of `cfg(target_os)`.
 
 | Feature | When | What the hello says |
 |---|---|---|
-| `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:78`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:3064`); `unavailable.audio = no-backend` |
+| `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:78`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:3071`); `unavailable.audio = no-backend` |
 | `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:726`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone keeps image events (`clipboard.rs:817-822`) | `events` and `images` stay: text still syncs, and an image moves on request. `not-watched` |
-| `sas` | Windows | `keys-only`: the button types three ordinary keys, which apps on the desktop get and the lock screen does not. P4a's `SendSAS` replaces it with an `input: sas` word (D11) |
+| `sas` | Windows | `keys-only`: the button types three ordinary keys, which apps on the desktop get and the lock screen does not. Since P4a a SystemContext worker on a host whose policy lets services says `input: sas` instead, and the button sends the real sequence (D11) |
 | `sas` | Linux | `keys-only`: the same keys, which the desktop binds (GNOME and KDE to log out), so the button says so rather than going |
 | `sas` | macOS | `not-applicable`: the chord means nothing there, and the viewer hides the button |
 
@@ -610,15 +612,23 @@ test of the SIGKILL property itself.
 
 ### 3.9 P4 — Windows
 
-- **P4a, a real Ctrl+Alt+Del.** `SendSAS(FALSE)` from the SYSTEM side (the SCM host, or the SystemContext worker).
-  It needs the `SoftwareSASGeneration` policy to allow services; check what GPO-locked corporate laptops set. The
-  viewer shows the button only when the host says it can send one.
+- **P4a, a real Ctrl+Alt+Del** (built). `SendSAS(FALSE)` from the SCM host, where the `SoftwareSASGeneration` policy
+  lets services (1 or 3). Measured first: all three corporate laptops in the fleet set it to 1 (§8).
+  - ⚠️ **Measured: the SystemContext worker cannot send it itself.** It is SYSTEM, but in the person's session, and
+    its own call returned while the lock screen stayed put (§8). Only the service process's call works.
+  - So the worker asks: it signals the host's relay, `Global\roomler-sas-<host pid>`, a SYSTEM-only, auto-reset event
+    handed to it as `--sas-event` (`sas_relay.rs:43`). The host re-checks the policy, then sends.
+  - The hello says `input: sas` and drops the `keys-only` entry only when the worker can ask and the policy allows
+    (`sas.rs:97`, decided at every announcement; the heartbeat re-announces a change). Elsewhere the reason names the
+    missing half. An attended worker cannot open the relay, so it stays `keys-only`.
+  - The viewer sends `{t: "sas"}` only to an agent that advertises it; the injector checks again before it asks.
+  - `sas.dll` is loaded at send time from System32 only, never imported. `docs/remote-control.md` §5.1e.
 - **P4b, SFTP as `console_user`.** Spawn `sftp-server` through the `CreateProcessAsUserW` + three-pipe path the exec
   code already uses, instead of `tokio::process` (`ssh.rs:926-948`).
 - **P4c, Hive adopt.** A named pipe whose server reads `GetNamedPipeClientProcessId` → token → SID and maps it to the
   session's account, asking for no credentials (`hive_win.rs:6-11`).
 - **P4d, a clean stop for Scheduled-Task installs** (built). Two channels into the arm the SCM host's event already
-  reaches (`main.rs:3069`):
+  reaches (`main.rs:3088`):
   - **`roomlerd service stop`** signals a `Local\` event keyed by the config's instance id (`stop_event.rs:338`),
     waits up to 15 s for the daemon to leave, and only then ends the task (`service.rs:558`).
   - **A hidden top-level window** turns `WM_ENDSESSION` into the stop and holds the session's end for at most 5 s,
@@ -702,7 +712,7 @@ model on Windows, so the three agree on what the mode means.
 | **P3g** | Linux companion for arm64 + tarball | — (a package) | the FR-93 lab, an arm64 vmtest guest | M |
 | **P3h** | Linux DNS without systemd-resolved | `ROOMLERD_DNS_NM=0` | evidence first | M |
 | **P3i** | Linux host firewall: what governs the overlay adapter, reported in `roomler status`, never changed (D13) | `ROOMLERD_HOST_FW_PROBE=0` | a firewalld node (zone `public`) and a ufw node, red then green | S |
-| **P4a** | Windows `SendSAS` | its cap word | Win11 Pro + a GPO-locked laptop | S–M |
+| **P4a** | Windows `SendSAS` from the SCM host, which the SystemContext worker asks through a SYSTEM-only relay, where the policy lets services (built) | its cap word: no `sas` in the hello, no frame | Win11 SystemContext, red on 0.4.142; the corporate laptops' policy measured | S–M |
 | **P4b** | Windows SFTP as `console_user` | `ssh_sftp_as_user` | Win11 SystemContext | S–M |
 | **P4c** | Windows Hive adopt | `hive_adopt` | Win11 | M |
 | **P4d** | Windows per-user clean stop: `service stop` and a session-end window (D15, built) | `ROOMLERD_SESSION_END=0` (the window); `service stop` acts only when run | Win11, a perUser ephemeral device, red on 0.4.142 | S |
@@ -898,3 +908,8 @@ one depends on it.
 | 2026-10-18 | released 0.4.142 | zeus: a throwaway vmtest Win11 guest with the perUser MSI (the Scheduled Task, as the signed-in person in session 1), enrolled ephemeral. After each stop the server's device listing was sampled | 🔴 **P4d red.** `schtasks /End`: the row stayed, offline, at +15, +45 and +90 s, and the same id came back online on `schtasks /Run`. A sign-out: the row stayed at +15, +45 and +90 s. A restart with the daemon running: the same id came back online after the reboot. `taskkill` without `/F`: "can only be terminated forcefully". Restart Manager without force (`RmShutdown` on the installed exe, as the person): `351` (`ERROR_FAIL_SHUTDOWN`), and the daemon and its row stayed |
 | 2026-10-18 | the P4d candidate (`d12d86b07`, a release build without the FFmpeg, VP9 and hive features), in place of the release | the same guest; a fresh ephemeral enrollment as the person before each stop | 🟢 **P4d green.** `roomlerd service stop` as the person: "The daemon stopped cleanly in 0.8 s.", and the row was gone at +5 s. The daemon logged the ask, the graceful stop and `ephemeral device unenrolled itself on shutdown` within 230 ms. 🟢 **A sign-out:** the row was gone at +10 s: `kind=SignOut`, unenrolled 260 ms after `WM_ENDSESSION`. 🟢 Restart Manager without force: `351` again, and the daemon and its row stayed: `ENDSESSION_CLOSEAPP` is not a leave. ⚪ From the SSH login (session 0), `service stop` cannot see the person's event. It said so, fell back to `schtasks /End`, and the row stayed, as designed. ⚪ A first restart proved only the path: the task's daemon still held the identity deleted at the sign-out, so `IgnoreNew` dropped the start after the re-enrollment and the device never came online. Its stop (`kind=Shutdown`, unenrolled 500 ms later) removed the identity on disk. The rig now ends the task before it enrolls |
 | 2026-10-18 | the same candidate | the same guest: a fresh enrollment, online | 🟢 **A restart with the device online:** `kind=Shutdown`, unenrolled 345 ms after `WM_ENDSESSION`, and the row was gone at +15 s. 🟢 **`taskkill` without `/F`, in the person's session:** "SUCCESS: Sent termination signal…", and the daemon kept running (the same PID) with its row online: the window ignores `WM_CLOSE`. From session 0, taskkill sees no window there and refuses, as on the release |
+| 2026-10-18 | released 0.4.142 | the fleet, read-only over `roomler exec`: `reg query` of `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System` on the three online corporate laptops (GPO-managed), and on the dev box | **P4a measured before the build.** `SoftwareSASGeneration` is `1` (services may send a SAS) on **all three corporate laptops**, and on the dev box. So `SendSAS(FALSE)` from a SYSTEM worker works on the hosts P4a was asked about, and the daemon has no reason ever to write the policy |
+| 2026-10-18 | released 0.4.142 (its `.pkg`; the clients' `.deb` and MSI) | the full AC5 cell, as for the #2377 candidate: a throwaway tart Mac exit + subnet router bridged over Wi-Fi, with the ULA v6 uplink the MacBook NATs; a second Mac VM as the LAN host; a Linux exit client, a Linux subnet client, a Win11 exit client | **AC5's release check.** 🟢 The anchor NATs v4 and v6, `routes=["<the LAN host>/32", "0.0.0.0/0"]`. The Linux exit client's v4 and v6 egress were the Mac's, over `roomler0`, 3 samples of 3. The subnet client reached the LAN host's SSH through the Mac, 3 of 3. The Windows client was `active, v6 on, DNS steered` with the Mac's egress. Over the 15-minute hold the Mac forwarded 1,987 v4 and 138 v6 packets, pf `Enabled` throughout. 🟢 **`kill -9`:** pf and forwarding as a crash leaves them; the restart's purge flushed the anchor, released our reference and put forwarding back (`internet_sharing=false`), then served again. 🟢 **`kill -9` plus a reboot:** pf `Disabled`, forwarding 0/0, as found; the next start purged and served. 🟢 **A clean stop:** `pf NAT for the overlay reverted`, pf `Disabled`, forwarding 0/0, the ledger empty. ⚪ This cell has no re-offer, the clause in which the 36 s blackout appeared on 10-17; that one stays unexplained |
+| 2026-10-18 | released 0.4.142 | zeus: a throwaway vmtest Win11 guest with the perMachine MSI and SystemContext (the worker runs as SYSTEM in the person's session), enrolled ephemeral. `DisableCAD=0`, so the sign-in and unlock screens require Ctrl+Alt+Del, and `SoftwareSASGeneration=1`. The viewer clicked the button on the locked screen; the guest's console was screendumped before and after | 🔴 **P4a red.** The hello carried no `sas` and the `keys-only` entry. The click typed the three keys, which the worker dispatched into the lock screen (`dispatch=ok`, foreground `LockApp.exe`), and the screen still said "Press Ctrl+Alt+Delete to unlock" |
+| 2026-10-18 | the first P4a candidate (`441d117d8`: the worker calls `SendSAS(FALSE)` itself), with its viewer served on the real origin | the same guest, the candidate in place of the release (a fresh enrollment) | ❌ **The worker's own `SendSAS` is ignored.** The hello said `input: sas`, the button's title said so, and the click reached the worker, which logged `sent the secure attention sequence`. The lock screen never moved. The worker is SYSTEM, but in the person's session, a child of the service rather than the service. Hence the relay (`6928f5e1e`). 🟢 The re-check held: with the policy unset, a stale hello still said `sas`, and the injector refused (`refusal=Policy(EaseOfAccess)`) and sent nothing. That stale hello is why the heartbeat now compares the word (`2e7be4cf2`) |
+| 2026-10-18 | the P4a candidate (`6928f5e1e`: the worker asks, the SCM host sends), with its viewer | the same guest | 🟢 **P4a green.** The click reached the worker, which logged `asked the service to send the secure attention sequence`. 3 ms later the host logged `sas relay: sent the secure attention sequence`, and the screendump showed the sign-in prompt, the account and a password box, where "Press Ctrl+Alt+Delete to unlock" had been. 🟢 **The policy unset:** within a beat, with no reconnect, the hello said `keys-only` with the policy's reason. The button typed the three keys, and the lock screen stayed |

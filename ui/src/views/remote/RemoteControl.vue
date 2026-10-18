@@ -2222,6 +2222,7 @@ import { canManageOrgSettings } from '@/utils/permissions'
 import type { KeepBusyPattern } from '@/composables/keepBusy'
 import { displayMatchSummary } from '@/composables/displayMatch'
 import { agentSupportsRelativeMouse, relativeMouseSwitchedOff } from '@/composables/relativeMouse'
+import { agentSendsSas } from '@/composables/ctrlAltDel'
 import { pictureOverflows, stageTouchAction } from '@/composables/touchInput'
 import {
   BUILTIN_PRESETS,
@@ -2331,10 +2332,14 @@ const clipboardRefusal = computed(
 const audioRefusal = computed(() => featureRefusal(rc.featuresRefused.value, 'audio'))
 // FR-97 P0c — the button types three ordinary keys. A Mac gives the chord no
 // meaning (`not-applicable`, so no button); Windows and Linux say what the
-// keys reach there, until FR-97 P4a sends the real secure attention sequence.
+// keys reach there. FR-97 P4a — a Windows host that can send the real secure
+// attention sequence advertises `sas`, and the button sends that instead.
 const sasOffered = computed(() => hostOffers(agent.value?.capabilities, 'sas'))
 const sasTitle = computed(() => {
   const base = 'Send Ctrl+Alt+Del (Ctrl+Alt+End over the viewer does the same).'
+  if (agentSendsSas(agent.value?.capabilities?.input)) {
+    return `${base} The host sends the real one, which reaches the Windows lock and sign-in screens.`
+  }
   const why = hostReason(agent.value?.capabilities, 'sas')
   return why ? `${base} ${why}` : base
 })

@@ -222,6 +222,8 @@ pub fn plan(msg: &InputMsg, logical: (f64, f64), wheel: &mut WheelAccum) -> Vec<
         // NotifyTouch*, so this is a follow-up, not a wall.
         InputMsg::Touch { .. } => vec![],
         InputMsg::Heartbeat { .. } => vec![],
+        // FR-97 P4a — Windows only; a Linux agent never advertises `sas`.
+        InputMsg::Sas => vec![],
     }
 }
 

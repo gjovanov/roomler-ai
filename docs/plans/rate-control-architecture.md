@@ -60,7 +60,7 @@ from scratchpad to `scripts/`.
 
 ## FR-A — Encoder rate changes without an IDR (first)
 
-**A0 — measure on silicon.** Extend `Command::EncoderSmoke` (`main.rs:234–244`, dispatch
+**A0 — measure on silicon.** Extend `Command::EncoderSmoke` (`main.rs:241–251`, dispatch
 `encoder_smoke_cmd` :4059) with `--reconfigure-sweep [--width/--height 1280×800]
 [--frames-per-rung 30] [--constrained] [--json]`: synthetic desktop frame with a moving 200×200
 block (solid colours make P-frames ~0 bytes and hide CBR/QVBR); 30 frames at 6 M, then rungs
@@ -138,7 +138,7 @@ Inputs: per frame `SendSample { capacity, depth, bytes_inflight, queue_budget, n
 `pre_encode_tick`'s position; per 1 s `Window { fps, struggling, age (avg,min,rtt), rx_bps,
 queue_ms, goodput, sent_bps, frames_lost, delay_slope_ms_s }` at `tick_viewer_window`; events
 (full channel, overflow, blocked-send stall). **Viewer adds** (all optional; older viewers omit;
-`decodeStatWireMessage` `useRemoteControl.ts:1209–1263`, parser `peer.rs:7309–7365`): `frames_lost`
+`decodeStatWireMessage` `useRemoteControl.ts:1210–1264`, parser `peer.rs:7309–7365`): `frames_lost`
 (chunk gaps, already in `rc-hevc-worker.ts:325`), `frames_rx`, `delay_slope_ms_s` (least-squares
 slope of the window's per-frame `arrival − wire` — `QueueDrift` in `rc-hop-stats.ts:102–138` already
 holds the pairs), `age_p95_ms`. **Bounds:** `RateDomain { floor, ceiling }` — the single source of

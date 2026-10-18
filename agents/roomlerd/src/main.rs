@@ -210,6 +210,13 @@ enum Command {
         /// a service host, and no host will be signaling that event.
         #[arg(long, hide = true)]
         stop_event: Option<String>,
+        /// FR-97 P4a (Windows) — the named event this worker signals to have
+        /// the SCM service host send the real Ctrl+Alt+Del, which only the
+        /// service process can (`win_service::sas_relay`). Only SYSTEM may
+        /// signal it, so only a SystemContext worker can use it. Passed only by
+        /// the host; hidden for the same reason as `--stop-event`.
+        #[arg(long, hide = true)]
+        sas_event: Option<String>,
     },
     /// Run the codec capability probes and print the result as one
     /// `ROOMLER_CAPS_JSON:{…}` line. Spawned by the daemon itself — never
@@ -1493,6 +1500,8 @@ async fn daemon_main() -> Result<()> {
         supervisor: None,
         // #1683 — only the SCM service host passes a stop-event name.
         stop_event: None,
+        // FR-97 P4a — and only it passes a SAS relay.
+        sas_event: None,
     });
     // Only the worker subcommand (`Run`) is the one the SCM supervisor
     // spawns + observes for crashes. On non-zero exit from that path,
@@ -1578,22 +1587,32 @@ async fn daemon_main() -> Result<()> {
             supervised,
             supervisor,
             stop_event,
-        } => run_cmd(
-            &config_path,
-            encoder.as_deref(),
-            supervised,
-            supervisor.as_deref(),
-            stop_event.as_deref(),
-        )
-        .await
-        .map(|restart| {
-            // FR-84 D3 — `run` ended through the graceful path a requested
-            // restart started. `main` exits with this code, but only once the
-            // runtime is gone (see `exit_for_requested_restart`).
-            if let Some(code) = restart {
-                let _ = REQUESTED_RESTART_EXIT.set(code);
+            sas_event,
+        } => {
+            // FR-97 P4a — the host's relay, for the real Ctrl+Alt+Del.
+            #[cfg(target_os = "windows")]
+            if let Some(name) = sas_event {
+                roomlerd::input::sas::set_host_relay(name);
             }
-        }),
+            #[cfg(not(target_os = "windows"))]
+            let _ = sas_event;
+            run_cmd(
+                &config_path,
+                encoder.as_deref(),
+                supervised,
+                supervisor.as_deref(),
+                stop_event.as_deref(),
+            )
+            .await
+            .map(|restart| {
+                // FR-84 D3 — `run` ended through the graceful path a requested
+                // restart started. `main` exits with this code, but only once
+                // the runtime is gone (see `exit_for_requested_restart`).
+                if let Some(code) = restart {
+                    let _ = REQUESTED_RESTART_EXIT.set(code);
+                }
+            })
+        }
         Command::CapsProbe => {
             roomlerd::encode::caps::print_probe_result();
             Ok(())
