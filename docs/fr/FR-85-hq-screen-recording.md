@@ -75,7 +75,7 @@ what it costs in installer size and ships with integration and e2e tests.
   not inherited, so a respawned worker cannot trip its own single-instance lock.
 - **Identity rule.** Whenever a console user exists, the recorder runs **as that user at normal integrity** — never
   SYSTEM, never root, never elevated. On Windows the worker holds the interactive admin's *elevated* linked token by
-  default (`ROOMLERD_ELEVATE_WORKER`, `agents/roomlerd/src/win_service/supervisor.rs:325`), so the recorder gets a
+  default (`ROOMLERD_ELEVATE_WORKER`, `agents/roomlerd/src/win_service/supervisor.rs:341`), so the recorder gets a
   restricted medium-integrity token; a SystemContext worker spawns it with the console user's token; a Linux root daemon
   drops to the console user the way the portal helper does. Only a host with **no console user** (headless, an Xvfb
   virtual desktop, nobody logged in) records as the daemon's identity.

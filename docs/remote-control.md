@@ -3183,7 +3183,9 @@ clean stop. A startup error before the supervisor existed did not report
 flowchart LR
     End["host's run ends"] --> Asked{"Stop / Preshutdown<br/>was requested?"}
     Asked -- yes --> Zero["STOPPED, exit 0<br/>nothing restarts it"]
-    Asked -- no --> NonZero["STOPPED, ServiceSpecific 1–4"]
+    Asked -- no --> Second{"a confirmed second<br/>flavour holds the lock?<br/>(#2465)"}
+    Second -- yes --> Zero
+    Second -- no --> NonZero["STOPPED, ServiceSpecific 1–5"]
     NonZero --> SCM["SCM failure actions:<br/>restart 5 s → 30 s → 60 s"]
     Crash["host process dies"] --> SCM
 ```
@@ -3204,11 +3206,103 @@ flowchart LR
   | The supervisor returned an error | `ServiceSpecific(2)` | restarts it |
   | The supervisor panicked | `ServiceSpecific(3)` | restarts it |
   | No supervisor at all (the worker path or the startup sequence failed) | `ServiceSpecific(4)` | restarts it |
+  | The worker found the single-instance lock held, and the orphan check read every roomlerd process without finding an earlier host's worker: a second installed flavour (#2465, §19.8.9) | `0` | leaves the service stopped |
+  | The same refusal, but some roomlerd process could not be read, so an orphan cannot be ruled out (#2465) | `ServiceSpecific(5)` | restarts it |
 
   ⚠️ A requested stop must stay `0`. With non-crash failure actions on, any other
   code would have the SCM undo an operator's, an MSI's or the OS's stop.
 - netd's shutdown reap waits a bounded `NETD_REAP_WAIT` after `kill()` instead of
   an unbounded `wait()`. `SHUTDOWN_BOUND`, and with it §19.8.7's wait hint,
   includes that wait.
+
+#### 19.8.9 A worker its host left behind (#2465)
+
+#2087's recovery brings a dead host back. Its field check found what it brings
+it back to: a host that dies (a crash, a `TerminateProcess`) does **not** take its
+worker with it.
+
+- The worker is in no job object, and it waits only on its stop event (#1683),
+  which only a live host signals.
+- So it keeps running, connected and holding the config's single-instance lock,
+  and nothing supervises it.
+
+Every host the SCM started next spawned a worker that lost that lock (`single-instance
+lock held by another process; exiting`, exit 8). The supervisor's `Stop` arm read
+that as a second installed flavour and stopped, and #2087 had made that stop a
+failure, so the service flapped:
+
+| After killing only the host | 0.4.132 (no recovery actions) | 0.4.143 (#2087, before #2465) |
+|---|---|---|
+| the SCM | 7034, no action. The service stays stopped, and `Start-Service` stops again at once | 7031: a new host at 5.4 s that stops 0.6 s later (7024), again at 30 s, then every 60 s |
+| the device | online, through the orphan | online, through the orphan |
+| a deliberate `Stop-Service` | cannot stop the orphan: the host that would signal its stop event is gone | the same |
+
+```mermaid
+sequenceDiagram
+    participant SCM
+    participant H as new host (service-run)
+    participant O as orphaned worker
+    participant W as new worker
+    Note over O: its host crashed,<br/>it still holds the lock
+    SCM->>H: restart after 5 s
+    H->>H: orphan check: run --supervisor scm,<br/>this binary, not supervised here
+    H->>O: TerminateProcess, not its stop event
+    O-->>H: exited, the lock is released
+    H->>W: spawn
+    W->>W: takes the single-instance lock
+    Note over W: the device reconnects
+```
+
+- **The rule** (`is_orphaned_worker`, `agents/roomlerd/src/win_service/orphan.rs:153`):
+  a running `roomlerd.exe run --supervisor scm` that this host does not
+  supervise. The SCM runs one host process per service, a host supervises one
+  worker, and the check runs only while this host supervises none. So such a
+  worker belongs to a host that is gone, or is one this host lost track of.
+  - A Scheduled-Task worker (`run --supervisor task`), a hand-started `run`, the
+    CLI, netd and the updater's helpers never match (`is_scm_worker_cmdline`,
+    `orphan.rs:137`).
+  - ⚠️ It is matched by the image **name** from the process list, never by the
+    full path. An update replaces an exe that is in use by renaming it away, so
+    an orphan that outlived an update no longer runs from the install path. A
+    full-path rule would spare exactly that orphan, and the service would then
+    stop cleanly beside it.
+  - A unit test builds a command line from `worker_args`, so changing the worker's
+    argv without the rule fails a test instead of silently disabling the reaper.
+- ⚠️ **It is keyed on who spawned the worker, never on when.** Creation times are
+  wall clock. On the vmtest guest whose clock had been corrected backwards by
+  nine hours, the 0.4.132 orphan read as nine hours *younger* than the host that
+  replaced it, so an "older than this host" rule would have left it running.
+- **When it runs.** Once before the first spawn (`supervisor.rs:1291`). Again in
+  the `Stop` arm (`supervisor.rs:1432`) before it gives up: if that pass ended an
+  orphan, the supervisor respawns instead of stopping.
+- **How the orphan ends.** `TerminateProcess` through the handle it was read
+  with, waited on for up to 5 s (`terminate_and_wait`, `orphan.rs:353`).
+  - Never its stop event: that is the OS-stop path, and an ephemeral device
+    self-unenrolls on it.
+  - One handle per process for the read and the kill, so a recycled pid is never
+    hit.
+  - The command line comes from `NtQueryInformationProcess(ProcessCommandLineInformation)`,
+    which needs only `PROCESS_QUERY_LIMITED_INFORMATION` (`cmdline_of`,
+    `orphan.rs:313`).
+- **The redundant stop is clean again.** Suppose the `Stop` arm's pass finds no
+  orphan and could read every roomlerd process. Then the lock is held by a second
+  installed flavour: the supervisor returns `Redundant`, and the host ends with
+  exit **0**, so the recovery actions leave the service stopped, as that arm
+  always intended. #2087 had made this end `ServiceSpecific(1)`, a restart every
+  minute.
+  - If any roomlerd could not be read, the supervisor returns
+    `RedundantUnconfirmed` and the host ends `ServiceSpecific(5)`. The SCM's retry
+    then still recovers a lock held by a worker the check could not see.
+- ⚠️ **The order of the two fixes matters.** A clean redundant stop *without* the
+  reaper brings back the dark device: the orphan holds the lock, the service
+  stops for good, and when the orphan later exits nothing starts the device
+  again.
+- ⚠️ The System log's 7024 renders a service-specific code through the Win32
+  message table. So `ServiceSpecific(1)` reads "Incorrect function." and `5`
+  reads "Access is denied." Neither is a real error: the host's own
+  `service stopping outcome=… exit_code=…` line says why it stopped.
+- **Out of scope:** the optional `netd` child (`overlay_netd`, off by default) can
+  outlive a crashed host too. A hard kill could leave netd's network state behind,
+  so it is not reaped here.
 
 <!-- RETIRED-NAME-ANCHOR-END: end of the historical appendices (§17-19). -->
