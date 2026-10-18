@@ -692,7 +692,7 @@ fn per_org_systun_factory(org_key: String, is_primary: bool) -> Option<TunFactor
 }
 #[cfg(not(feature = "overlay-l3"))]
 fn per_org_systun_factory(_org_key: String, _is_primary: bool) -> Option<TunFactory> {
-    warn!("overlay: overlay_tun_per_org requires an `overlay-l3` build; not joining");
+    warn!("overlay: a per-org adapter requires an `overlay-l3` build; not joining");
     None
 }
 

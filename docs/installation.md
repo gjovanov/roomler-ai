@@ -48,6 +48,19 @@ sequenceDiagram
     D->>S: /ws?role=agent — the machine appears in Devices
 ```
 
+⚠️ **Not every download streams through roomler.ai.** The MSI downloads (the
+wizard's and `install.ps1`'s) and the tunnel CLI's installers do
+(`/api/agent/installer/{flavour}`, `/api/tunnel/installer/…`). These fetch the asset's own URL from the manifest,
+which is GitHub's (`github.com/…/releases/download/…`, redirected to
+`release-assets.githubusercontent.com`, measured 2026-10-18):
+- `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
+- `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:325`);
+- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1545`).
+
+A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
+also fetches the Visual C++ runtime from `aka.ms` when it is missing
+(`scripts/install.ps1:147`).
+
 `machine_id` is a stable hardware hash and `(tenant_id, machine_id)` is unique —
 re-running an installer on a known machine reuses its identity instead of
 duplicating it.
@@ -450,10 +463,14 @@ command reports "daemon not running", you are probably asking the wrong half.
 | Per-user log | `/tmp/roomlerd.err.log` |
 | Root log | `/var/log/roomler/daemon.log` |
 
-Video is software-only on Apple Silicon (openh264 for H.264, libvpx for
-VP9-4:4:4): the encoder dispatch tables contain only NVIDIA/Intel/AMD names, so
-VideoToolbox is not wired up. Remote-audio capture and multi-org per-org
-adapters are also unavailable on macOS today.
+Video encodes in hardware through VideoToolbox, H.264 and HEVC: the FFmpeg
+cascades carry `h264_videotoolbox` and `hevc_videotoolbox`
+(`agents/roomlerd/src/encode/ffmpeg/encoder.rs:97`, `:161`), and the macOS
+release builds `ffmpeg-encoder`; a MacBook's probe advertises both cells
+([encoders.md](encoders.md)). Software H.264 (openh264) and VP9-4:4:4 (libvpx)
+are offered too. There is no AV1 encode: Apple ships AV1 decode only. Remote
+audio capture is unavailable on macOS today (FR-97 P2a), and per-org adapters
+are built but not yet verified on a Mac (FR-97 P1d).
 
 ### Uninstall
 

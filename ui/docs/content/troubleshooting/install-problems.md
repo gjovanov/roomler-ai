@@ -34,10 +34,15 @@ Failing here is a network problem — proxy, firewall, DNS or captive portal.
 
 ## Antivirus or endpoint protection blocked it
 
-:::tip Installers are served through the product's own origin for exactly this reason
-Downloads come from `roomler.ai` (or your own server) rather than from GitHub,
-so a corporate allow-list only has to trust one hostname. If yours blocks the
-download, allow-list that origin and retry.
+:::tip Which hosts an allow-list needs
+The Windows installer (the MSI) and the tunnel CLI are served through
+`roomler.ai` (or your own server), so for those one hostname is enough. The
+Linux and macOS daemon packages, the desktop companion and every automatic
+update come from GitHub's release downloads, so an allow-list also needs
+`github.com` and `release-assets.githubusercontent.com`, the host GitHub
+redirects downloads to. On Windows the installer script also fetches
+Microsoft's Visual C++ runtime from `aka.ms` when it is missing. If a download
+is blocked, allow-list those and retry.
 :::
 
 Every Windows binary is Authenticode-signed by **G ROX LTD**, and Linux/macOS

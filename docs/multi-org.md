@@ -244,7 +244,14 @@ its free pool → cycle every agent's WS.
 > primitive for them. They are listed in the response under
 > `reconnect_required` and pick the new address up on their next reconnect.
 
-### 4.4 P2c: the shared TUN (agent half)
+### 4.4 P2c: the shared TUN (agent half) — deleted in W7c
+
+> 🗄️ **History.** W7c (overlay v3) deleted the shared-TUN mux and the
+> compensation stack around it, once its evidence counters (`mux_nat_rewrites`,
+> `restores`, `skip_as_source_flips`) had read zero fleet-wide for 7 days. Every
+> org now gets its own adapter ([Per-org TUN adapters](#per-org-tun-adapters-the-only-path-since-w7c),
+> `agents/roomlerd/src/overlay.rs:314`). This section records how the mux
+> worked, for the history it explains.
 
 One `roomler` adapter, N per-org runtimes. Each org's `OverlayRuntime` gets a
 `MuxPort` facade (`tunnel_core::overlay::tun_mux`) that looks exactly like its
@@ -336,12 +343,13 @@ Rebuilds under the flag are PLANE-WIDE (P1-d): any org's trigger
 tears every org down (`Teardown`/ack, 3 s straggler timeout), the plane
 re-binds ONCE, and every org re-establishes on `Ready`.
 
-### Per-org TUN adapters (`overlay_tun_per_org`, default ON since rc.339)
+### Per-org TUN adapters (the only path since W7c)
 
-The second half of multi-org v2: with
-`overlay_tun_per_org` on (`ROOMLERD_OVERLAY_TUN_PER_ORG`; requires
-`overlay_multi_org`), each org gets its **own adapter** instead of a facade
-over the shared one:
+The second half of multi-org v2: with `overlay_multi_org` on, each org gets its
+**own adapter** (`per_org_systun_factory`, `agents/roomlerd/src/overlay.rs:314`).
+It shipped behind `overlay_tun_per_org`, default ON since rc.339; W7c deleted
+the switch along with the shared adapter it chose between, so neither the key
+nor `ROOMLERD_OVERLAY_TUN_PER_ORG` is read any more:
 
 - the primary KEEPS the legacy `IF_NAME` (`roomler` on Windows, `roomler0`
   on Linux) + GUID (no adapter churn on the mode flip); a secondary is
@@ -365,14 +373,19 @@ over the shared one:
 - ICE never gathers on `roomler-*` (the peer.rs interface deny-list), and
   the LAN gather's `roomler` prefix filter already covers them.
 
-Default ON since rc.339. Explicit `overlay_tun_per_org = false` is the kill
-switch: the shared-TUN mux (§2, §4b) exactly as before, retained until the
-compensation-stack deletion. Both v2 flags compose independently; the
-default state now runs both ON.
+The kill switch it shipped with (`overlay_tun_per_org = false`, back to the
+shared-TUN mux of §4.4 and §4b) went with the mux in W7c.
+`overlay_shared_carrier` (§4a) still composes independently and is still on by
+default.
 
 ---
 
-## 4b. Cross-org egress source normalization — the mux NAT (rc.328)
+## 4b. Cross-org egress source normalization — the mux NAT (rc.328) — deleted in W7c
+
+> 🗄️ **History.** This NAT compensated for two orgs' addresses on ONE shared
+> adapter. With one adapter per org there is one address per adapter, and the
+> OS picks the source correctly by itself, so W7c deleted it with the mux
+> (§4.4). Kept for the field record below.
 
 With two org addresses on the ONE shared adapter (§2), the **OS** picks the
 source address for locally-originated traffic — and with nested blocks (a

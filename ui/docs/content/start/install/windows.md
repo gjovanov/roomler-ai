@@ -92,7 +92,7 @@ roomler status
 |---|---|
 | Program files | `C:\Program Files\Roomler\` (per-machine) or `%LOCALAPPDATA%\Programs\Roomler\` (per-user) |
 | Per-user config | `%APPDATA%\roomler\config.toml` |
-| Machine-global config | `%PROGRAMDATA%\roomler\config.toml` |
+| Machine-global config | `%PROGRAMDATA%\roomler\roomler\config.toml` |
 
 :::danger The config file holds a credential
 `config.toml` contains the agent token, and — if you enable SSH — the SSH host
