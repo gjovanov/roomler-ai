@@ -298,6 +298,33 @@ impl KekState {
     }
 }
 
+/// P3-3b — why a value could not be sealed to a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceSealError {
+    /// The key is not 32 bytes in canonical standard base64.
+    BadKey,
+    /// The sealed box was refused (not expected for a well-formed key).
+    Seal,
+}
+
+/// P3-3b — `value` as a libsodium sealed box (`crypto_box_seal`: an
+/// ephemeral X25519 key, XSalsa20-Poly1305) for the device key `key_b64`
+/// (`agents.vault_key`), which only the daemon holding its secret half
+/// opens. A fresh ephemeral key per box, so two leases of one value never
+/// look alike on the wire.
+pub fn seal_for_device(key_b64: &str, value: &[u8]) -> Result<Vec<u8>, DeviceSealError> {
+    use base64::Engine;
+    if !roomler_ai_remote_control::signaling::vault_key_is_well_formed(key_b64) {
+        return Err(DeviceSealError::BadKey);
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(key_b64)
+        .map_err(|_| DeviceSealError::BadKey)?;
+    let key = crypto_box::PublicKey::from_slice(&bytes).map_err(|_| DeviceSealError::BadKey)?;
+    key.seal(&mut crypto_box::aead::OsRng, value)
+        .map_err(|_| DeviceSealError::Seal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,5 +588,42 @@ mod tests {
         assert!(!shown.contains(&secret), "{shown}");
         assert!(!shown.to_uppercase().contains("AGE-SECRET-KEY"), "{shown}");
         assert!(shown.contains(k.recipient()), "{shown}");
+    }
+
+    /// P3-3b — a value sealed for a device opens with that device's secret
+    /// half and no other; every box is new; a key that is not one is
+    /// refused before anything is sealed. The device's key is made here, as
+    /// the daemon makes it (`roomlerd`'s `vault.rs`).
+    #[test]
+    fn a_value_sealed_for_a_device_opens_only_there() {
+        use base64::Engine;
+        let rng = &mut crypto_box::aead::OsRng;
+        let device = crypto_box::SecretKey::generate(rng);
+        let published =
+            base64::engine::general_purpose::STANDARD.encode(device.public_key().as_bytes());
+
+        let a = seal_for_device(&published, b"leased-canary").unwrap();
+        let b = seal_for_device(&published, b"leased-canary").unwrap();
+        assert_ne!(a, b, "a fresh ephemeral key per box");
+        assert_eq!(device.unseal(&a).unwrap(), b"leased-canary");
+        assert_eq!(device.unseal(&b).unwrap(), b"leased-canary");
+
+        let other = crypto_box::SecretKey::generate(rng);
+        assert!(other.unseal(&a).is_err(), "another device opens nothing");
+
+        for bad in [
+            String::new(),
+            "not-a-key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+            // Bytes whose encoding needs `+` and `/`: in the URL-safe
+            // alphabet they are `-` and `_`, never a standard spelling.
+            base64::engine::general_purpose::URL_SAFE.encode([0xfbu8; 32]),
+        ] {
+            assert_eq!(
+                seal_for_device(&bad, b"x"),
+                Err(DeviceSealError::BadKey),
+                "{bad:?}"
+            );
+        }
     }
 }

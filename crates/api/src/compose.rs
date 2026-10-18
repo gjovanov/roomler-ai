@@ -210,7 +210,10 @@ impl Modules {
         }
         #[cfg(feature = "vault")]
         {
-            // On core alone in P3-1. Its switch defaults off, like hive's.
+            // No module state as a dependency: its `vault → hive` edge
+            // (P3-3b) reads session records through hive's stateless DAO, so
+            // a vault mounted without hive simply finds no session to lease
+            // for. Its switch defaults off, like hive's.
             modules.vault =
                 init_one::<roomler_ai_mod_vault::VaultState>(core.clone(), settings, ()).await?;
             if let Some(m) = &modules.vault {

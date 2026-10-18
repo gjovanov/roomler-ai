@@ -1108,6 +1108,15 @@ pub enum RpcCap {
     /// session's `console_user` itself ("a Windows concept"), so that half
     /// fails closed either way, and the server still refuses to store it.
     ConsoleUser,
+    /// FR-90 P3-3b — the agent takes vault leases: it sends `rc:vault.lease`
+    /// for its sessions and opens the sealed `rc:vault.leased` with the key
+    /// its hello carried (`AgentHello::vault_key`). Advertised only while that
+    /// key is, on the primary enrollment's connection.
+    ///
+    /// ⚠️ The vault answers a lease request only from a connection that
+    /// advertises this AND whose hello stored a key: an agent without it
+    /// cannot open what it would be sent.
+    Vault,
 }
 
 impl RpcCap {
@@ -1152,11 +1161,12 @@ impl RpcCap {
             Self::IdleTimeout => "idle-timeout",
             Self::LockOnEnd => "lock-on-end",
             Self::ConsoleUser => "console-user",
+            Self::Vault => "vault",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 33] = [
+    pub const ALL: [RpcCap; 34] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1190,6 +1200,7 @@ impl RpcCap {
         Self::IdleTimeout,
         Self::LockOnEnd,
         Self::ConsoleUser,
+        Self::Vault,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -6571,6 +6582,7 @@ mod tests {
         assert_eq!(RpcCap::IdleTimeout.wire(), "idle-timeout");
         assert_eq!(RpcCap::LockOnEnd.wire(), "lock-on-end");
         assert_eq!(RpcCap::ConsoleUser.wire(), "console-user");
+        assert_eq!(RpcCap::Vault.wire(), "vault");
     }
 
     /// FR-101 P4b-2 — the device's idle setting as a limit: unset and `0`

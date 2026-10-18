@@ -11,8 +11,9 @@ People use it too.
 > session gets a secret in) is [`roomler-hive-design.md`](roomler-hive-design.md)
 > §8. **This page describes what is built: P3-1, the store; P3-2a, roles and
 > Cedar policies (§7); P3-2b, a session's role, decided at its start and at
-> every move (§8); and P3-3a, the key a device's daemon holds for the values
-> it will be leased (§9).** No device and no session reaches a value yet.
+> every move (§8); P3-3a, the key a device's daemon holds for the values it is
+> leased (§9); and P3-3b, the vault's half of a lease (§10).** No released
+> agent asks for a lease yet: the device's half is P3-4.
 
 ## 1. Custody: who can read a secret
 
@@ -31,7 +32,8 @@ What that means in practice:
 | someone with a database dump only | no | every value is sealed; the data keys are wrapped to the KEK |
 | someone with a database dump **and** the KEK | yes | that is all it takes, so keep the KEK out of every backup the database goes into |
 | a member of the organization, an administrator included | no | no route answers a value in P3-1 (§6) |
-| a session or a device | no, not yet | a session's use is P3-3b's lease; the value will cross to the device sealed to the key its daemon holds (§9) |
+| the daemon running a session | from P3-4, what a lease releases | the vault answers a lease (§10) with the value sealed to the key that daemon holds (§9); no released agent asks for one yet |
+| the session's own process, or its model | no | a leased value is opened in the daemon, never in the harness's process, which runs as another account (P3-4's tools) |
 
 Customer-managed keys (the KEK in the organization's own KMS, revocable by it)
 and sovereign custody (only the organization's devices can unwrap) are P7.
@@ -78,7 +80,7 @@ DERP ticket key.
 `dek_wrapped` to its DEK, and the DEK opens the `ciphertext` with the binding
 as associated data: `roomler-vault/v1`, the organization id, the secret id,
 the field and the version number, NUL-separated
-([`a_wrapped_data_key_is_an_ordinary_age_file`](../crates/modules/vault/src/crypto.rs#L451)
+([`a_wrapped_data_key_is_an_ordinary_age_file`](../crates/modules/vault/src/crypto.rs#L478)
 is that recipe as a test).
 
 ## 3. The KEK
@@ -396,12 +398,92 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the device's switch | `vault_enabled` ([`config.rs:492`](../crates/agent-core/src/config.rs#L492)), off, never pushable: [`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L8100) |
+| the device's switch | `vault_enabled` ([`config.rs:492`](../crates/agent-core/src/config.rs#L492)), off, never pushable: [`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L8112) |
 | the key, and its half in the hello | [`vault.rs:35`](../agents/roomlerd/src/vault.rs#L35) `hello_key`, feature `vault` (it implies `hive`, and no release build carries it yet); the hello at [`signaling.rs:1532`](../agents/roomlerd/src/signaling.rs#L1532) |
 | the wire | `AgentHello::vault_key` ([`signaling.rs:363`](../crates/remote_control/src/signaling.rs#L363)) and [`vault_key_is_well_formed`](../crates/remote_control/src/signaling.rs#L120) |
-| what the fleet stores | [`socket.rs:104`](../crates/modules/fleet/src/socket.rs#L104), [`AgentDao::update_hello`](../crates/services/src/dao/agent.rs#L479), `Agent::vault_key` ([`models.rs:2037`](../crates/remote_control/src/models.rs#L2037)); no route answers it |
+| what the fleet stores | [`socket.rs:104`](../crates/modules/fleet/src/socket.rs#L104), [`AgentDao::update_hello`](../crates/services/src/dao/agent.rs#L479), `Agent::vault_key` ([`models.rs:2048`](../crates/remote_control/src/models.rs#L2048)); no route answers it |
 
-## 10. Audit
+## 10. Leases (P3-3b)
+
+A session gets a value as a **lease**: released to the daemon that runs it,
+sealed to that daemon's key (§9), for at most 15 minutes. The session's device
+asks over its own control connection, and the vault answers on that
+connection. P3-3b builds the vault's half; a device asks from P3-4, which
+brings the daemon's half and the session's tools.
+
+```mermaid
+sequenceDiagram
+    participant D as roomlerd (the session's device)
+    participant V as vault (its agent-socket handler)
+    participant DB as session record · device row · vault
+    D->>V: rc:vault.lease {req_id, session_id, fence, secret, field, mode, audience, ttl_secs}
+    V->>DB: the device's row (advertises vault? holds a key?)
+    V->>DB: the session record (on THIS device? at this fence? live? a role?)
+    V->>DB: the secret (by path, or this org's RRN), its current version
+    V->>V: Cedar secret:use, the device's facts from its ROW
+    alt allowed
+        V->>V: open the version (KEK), seal it to the row's key
+        V->>DB: record the allow, write vault_leases
+        V-->>D: rc:vault.leased {req_id, lease_id, n, sealed, expires_at_ms}
+    else
+        V->>DB: record the deny (once the session is known)
+        V-->>D: rc:vault.refused {req_id, reason}
+    end
+```
+
+| Check, in order | Refused as | Recorded |
+|---|---|---|
+| the request within its bounds (`lease_limits`), in a mode that releases a stored value: `proxy`, `file`, `env`, `exec` | `bad_request` | no |
+| the vault serves the organization | `not_served` | no |
+| the device takes leases: its hello advertised `vault` and carried a key | `unsupported` | no |
+| a session of the organization whose record places it on THIS device | `not_located` | no |
+| at the record's fence | `stale_fence` | yes |
+| live: starting, idle, running or awaiting an approval | `ended` | yes |
+| within the session's 120 requests a minute | `busy` | no |
+| holding a vault role (§8) | `no_role` | yes |
+| the secret, by path or by this organization's RRN, live | `no_secret` | yes |
+| not disabled | `disabled` | yes |
+| its field holding a value | `no_value` | yes |
+| a usable KEK | `unavailable` | yes |
+| Cedar's `secret:use`, the guardrails included | `denied` | yes, with the request |
+| opened, and sealed to the device's key | `unavailable` | yes |
+| the allow recorded and the lease written | `undecided` | — |
+
+> [!WARNING]
+> - **Believed only from the session's device, at its fence.** The vault reads
+>   the session's RECORD: a device cannot lease for a session it does not
+>   run, and a run that lost its session to a move cannot lease for it any
+>   more. Hive's frames follow the same rule.
+> - **The device's facts are its ROW's**, never the request's: a device
+>   cannot claim to be a build box, or not to be a Windows machine.
+> - **Recorded before released.** The allow is recorded and the lease written
+>   before the sealed value is sent; a lease the vault could not record is
+>   never released (`undecided`).
+> - **`identity`, `short-lived` and `placeholder` release no stored value.**
+>   A policy that permits `identity` means "authenticate as the session",
+>   and a lease in that mode would hand over the raw value instead, so the
+>   vault refuses it as `bad_request`.
+> - **Until the session is identified, a refusal is logged, not recorded**:
+>   there is no session to name yet, and a device's flood must not become
+>   audit rows. The per-session ceiling answers `busy` unrecorded for the
+>   same reason.
+> - **One word, never a reason that names a policy.** A device is told
+>   `denied`; which policy decided is in `vault_audit` for an administrator.
+
+Each connection has its own queue (16 requests), answered in order by one
+task, so a slow decision never holds the agent socket's read loop, and one
+more request than the queue holds is answered `busy`. A TTL outside
+30 s to 900 s is clamped, and a policy reads the clamped value
+(`context.ttl_s`), so it can hold a lease shorter still.
+
+| Piece | Where |
+|---|---|
+| the wire | `rc:vault.lease` · `rc:vault.leased` · `rc:vault.refused` ([`signaling.rs`](../crates/remote_control/src/signaling.rs)), the refusal words and bounds ([`vault.rs`](../crates/remote_control/src/vault.rs)), `RpcCap::Vault` |
+| the handler | [`lease.rs`](../crates/modules/vault/src/lease.rs): `LeaseSocket` (one queue per connection), `lease` (the checks above) |
+| sealing | [`crypto.rs`](../crates/modules/vault/src/crypto.rs) `seal_for_device`: libsodium's `crypto_box_seal`, a fresh ephemeral key per box |
+| the edge | `vault → hive` (`crates/core/src/graph.rs`): the session record through hive's own stateless DAO |
+
+## 11. Audit
 
 `vault_audit` holds every `secret:*` and `vault:verify` decision, allow and
 deny. Each row has the principal (`user` in P3-1), the action as a policy
@@ -409,7 +491,12 @@ names it, the operation, the decision and its reason (`administrator` or
 `not_administrator`), and the RRN, field and version number where there is
 one. P3-2a adds every `policy:write` (a role's or a policy's), with its
 `target`. P3-2b adds every `role:assume` (§8), with the session, the device
-and the request it decided. Rows expire after 90 days, like the other audits.
+and the request it decided. P3-3b adds every lease decision once its session
+is identified (§10): `secret:use`, op `lease`, principal `session` (the row's
+user is the session's owner), the session, the device, the request a Cedar
+decision decided, and a `target` of `lease:<id>` on an allow, or of
+`asked:<name>` when the name resolved to no secret. Rows expire after 90 days,
+like the other audits.
 
 - **An allow is recorded before it is acted on, and fails closed.** A decision
   the vault cannot record is answered 500 and not acted on.
@@ -420,10 +507,10 @@ and the request it decided. Rows expire after 90 days, like the other audits.
 - A request refused for its content (400, 422) or for want of a KEK (503) acts
   on nothing, so it records no allow.
 - A device's own report of using a value is a different claim, made by a host
-  that may be compromised. From P3-3 it goes to `vault_activity`, never here,
+  that may be compromised. From P3-4 it goes to `vault_activity`, never here,
   as `ssh_audit` and `ssh_activity` are kept apart.
 
-## 11. Collections
+## 12. Collections
 
 | Collection | One row per | Indexes | Retention |
 |---|---|---|---|
@@ -432,16 +519,16 @@ and the request it decided. Rows expire after 90 days, like the other audits.
 | `vault_audit` | decision | `(tenant_id, at desc)`, `(secret_id, at)` | 90 days (TTL on `at`) |
 | `vault_roles` | vault role (P3-2a) | unique `(tenant_id, name)` over live rows | tombstoned, kept |
 | `vault_policies` | policy (P3-2a): one Cedar statement, its effect, a revision | unique `(tenant_id, name)` over live rows; `(tenant_id, deleted_at, created_at)` | tombstoned, kept |
+| `vault_leases` | value released (P3-3b): the secret, field and version; the session, its fence, its owner and its device; the key it was sealed to (`sealed_to`); the mode and audience; issued and expiry times; `revoked_at`/`revoked_why` from P3-3c. Never the value | `(tenant_id, session_id)` | a week past `expires_at` (TTL); the decision stays in `vault_audit` for 90 days |
 
 P3-3a adds no collection: a device's key is a field on fleet's `agents` row
 (`vault_key`, §9).
 
-## 12. What comes next
+## 13. What comes next
 
 | Step | Builds |
 |---|---|
-| P3-3b | leases: a session's request over its device's connection, believed only from the record's location at its fence; Cedar's `secret:use`; the value sealed to the device's key (§9); `vault_leases` and the audit |
-| P3-3c | revocation (a push, the TTL, the fence), the device's in-memory lease cache, `vault_activity` |
-| P3-4 | the toolbelt's vault tools and the approval card a policy can ask for |
+| P3-3c | revocation: the server's `rc:vault.revoke` when a session ends or moves, a secret's value changes or is disabled, or the device's key changes; the TTL |
+| P3-4 | the device's half: advertising `vault`, asking for leases, opening them and holding them in daemon memory until they expire or are revoked, `vault_activity`; the toolbelt's vault tools; the approval card a policy can ask for |
 | P3-5 to P3-9 | `proxy` mode, `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |

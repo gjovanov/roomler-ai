@@ -61,6 +61,9 @@ ring = "0.17"
 # FR-90 P3-1 — the vault tests make their KEK at run time, so no key is ever
 # written down in the tree.
 age.workspace = true
+# FR-90 P3-3b — the lease tests' device holds a vault key of its own and opens
+# what the vault sealed to it, as `roomlerd`'s `vault` feature does.
+crypto_box.workspace = true
 
 # FR-90 P0f — the canary test (`tests/hive_canary.rs`) drives a REAL device:
 # the Hive supervisor, its replica store and its viewer peer, with sessions

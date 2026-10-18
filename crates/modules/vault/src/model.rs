@@ -235,6 +235,47 @@ impl VaultPolicy {
     pub const COLLECTION: &'static str = "vault_policies";
 }
 
+/// P3-3b — a value released to one agent session (`vault_leases`): which
+/// version of which field, to which session at which fence on which device,
+/// sealed to which device key, until when. Written after the decision is
+/// recorded and before the sealed value is sent: a lease the vault could
+/// not write is not sent. Its `_id` is the lease id the device is told.
+///
+/// Never a value: the row says what was released, the sealed box went to
+/// the device and was not kept.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VaultLease {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub secret_id: ObjectId,
+    pub field: String,
+    pub n: i64,
+    pub session_id: ObjectId,
+    pub fence: i64,
+    pub device_id: ObjectId,
+    /// The session's owner, the principal the policy decided for.
+    pub owner_id: ObjectId,
+    /// The device key the value was sealed to (`agents.vault_key` at the
+    /// time): a later hello with another key means another process, which
+    /// cannot open it (P3-3c revokes on it).
+    pub sealed_to: String,
+    pub mode: String,
+    #[serde(default)]
+    pub audience: String,
+    pub issued_at: DateTime,
+    pub expires_at: DateTime,
+    /// P3-3c — revoked before its expiry, and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_why: Option<String>,
+}
+
+impl VaultLease {
+    pub const COLLECTION: &'static str = "vault_leases";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
