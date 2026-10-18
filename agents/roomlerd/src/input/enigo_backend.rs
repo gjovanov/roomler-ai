@@ -271,14 +271,18 @@ fn dispatch<E: Mouse + Keyboard>(enigo: &mut E, msg: InputMsg) -> Result<()> {
         InputMsg::Heartbeat { .. } => {}
         // FR-97 P4a — the real Ctrl+Alt+Del, re-checked here: a viewer is
         // sent `sas` only by an agent that advertised it, but the policy can
-        // change between the hello and the click. Nothing off Windows.
+        // change between the hello and the click. The worker only asks: the
+        // service process sends it (`win_service::sas_relay`). Nothing off
+        // Windows.
         InputMsg::Sas =>
         {
             #[cfg(target_os = "windows")]
             match super::sas::availability() {
                 Ok(()) => {
                     super::sas::send()?;
-                    tracing::info!("Ctrl+Alt+Del: sent the secure attention sequence");
+                    tracing::info!(
+                        "Ctrl+Alt+Del: asked the service to send the secure attention sequence"
+                    );
                 }
                 Err(refusal) => tracing::warn!(
                     ?refusal,

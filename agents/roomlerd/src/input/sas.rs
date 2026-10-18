@@ -5,18 +5,27 @@
 //! The viewer's button typed three ordinary keys, which apps on the desktop
 //! receive and the Windows lock and sign-in screens never do: those answer only
 //! the secure attention sequence (SAS), which the kernel raises for the physical
-//! chord and `SendSAS` raises for software. `SendSAS(FALSE)` works only for a
-//! LocalSystem caller, and only where the `SoftwareSASGeneration` policy lets
-//! services generate one.
+//! chord and `SendSAS` raises for software. `SendSAS(FALSE)` is honoured only
+//! from a service process, and only where the `SoftwareSASGeneration` policy
+//! lets services generate one.
 //!
-//! So the daemon offers the real one (`input: sas` in the hello, and no
-//! `keys-only` entry) only when both hold: this process runs as SYSTEM (the
-//! SystemContext worker of an SCM install), and the policy lets services
-//! generate a SAS. Anywhere else the button keeps typing keys, and its title
-//! says why. The policy is read, never written: it is a security setting, and
-//! on a managed laptop it is the organisation's.
+//! ⚠️ **Measured: the SystemContext worker cannot send it itself.** The worker
+//! runs as SYSTEM, but in the person's session, spawned by the service and not
+//! the service: its `SendSAS(FALSE)` returns, and the lock screen never moves.
+//! So the SCM host, the service process in session 0, sends it, and the worker
+//! only asks: the host creates a named event only SYSTEM may signal
+//! (`win_service::sas_relay`) and hands its name to the worker
+//! (`--sas-event`); the worker signals it; the host's thread re-checks the
+//! policy and calls `SendSAS(FALSE)`.
 //!
-//! `sas.dll` is loaded when the sequence is sent, never imported: a binary that
+//! So the daemon offers the real sequence (`input: sas` in the hello, and no
+//! `keys-only` entry) only when both hold: this worker can ask the service (it
+//! runs as SYSTEM, the SystemContext worker of an SCM install, and was handed
+//! the relay), and the policy lets services. Anywhere else the button keeps
+//! typing keys, and its title says why. The policy is read, never written: it
+//! is a security setting, and on a managed laptop it is the organisation's.
+//!
+//! `sas.dll` is loaded when the host sends, never imported: a binary that
 //! imports a DLL some Windows edition lacks does not start at all. It is loaded
 //! from System32 only, so a SYSTEM process can never pick up a planted copy.
 //!
@@ -52,7 +61,7 @@ impl SasPolicy {
         }
     }
 
-    /// Whether a service (a LocalSystem caller of `SendSAS(FALSE)`) may.
+    /// Whether a service's `SendSAS(FALSE)` may raise it.
     pub fn lets_services(self) -> bool {
         matches!(self, Self::Services | Self::ServicesAndEaseOfAccess)
     }
@@ -61,9 +70,10 @@ impl SasPolicy {
 /// Why this host types keys instead of sending the real sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SasRefusal {
-    /// This process is not SYSTEM: a per-user install, or an SCM install whose
-    /// worker runs as the signed-in person.
-    NotSystem,
+    /// This daemon cannot ask the service to send it: a per-user install, an
+    /// SCM install whose worker runs as the signed-in person, or a daemon run
+    /// by hand.
+    NoService,
     /// The policy lets no service generate a SAS.
     Policy(SasPolicy),
 }
@@ -72,8 +82,8 @@ impl SasRefusal {
     /// One sentence for the viewer's title, after the button's own words.
     pub fn reason(self) -> &'static str {
         match self {
-            Self::NotSystem => {
-                "Ctrl+Alt+Del is sent as ordinary keys: apps on the desktop get it, but the Windows lock and sign-in screens do not. Only a service running as SYSTEM can send the real one, and this install runs as the signed-in person"
+            Self::NoService => {
+                "Ctrl+Alt+Del is sent as ordinary keys: apps on the desktop get it, but the Windows lock and sign-in screens do not. Only the Roomler service can send the real one, through a worker running as SYSTEM, and this install has none"
             }
             Self::Policy(_) => {
                 "Ctrl+Alt+Del is sent as ordinary keys: apps on the desktop get it, but the Windows lock and sign-in screens do not. Windows' software Secure Attention Sequence policy (SoftwareSASGeneration) lets no service send the real one here"
@@ -82,11 +92,11 @@ impl SasRefusal {
     }
 }
 
-/// The decision: the real sequence needs a SYSTEM caller AND a policy that
-/// lets services generate it.
-pub fn decide(is_system: bool, policy: SasPolicy) -> Result<(), SasRefusal> {
-    if !is_system {
-        return Err(SasRefusal::NotSystem);
+/// The decision: the real sequence needs a worker that can ask the service AND
+/// a policy that lets services generate it.
+pub fn decide(reaches_service: bool, policy: SasPolicy) -> Result<(), SasRefusal> {
+    if !reaches_service {
+        return Err(SasRefusal::NoService);
     }
     if !policy.lets_services() {
         return Err(SasRefusal::Policy(policy));
@@ -94,29 +104,61 @@ pub fn decide(is_system: bool, policy: SasPolicy) -> Result<(), SasRefusal> {
     Ok(())
 }
 
-/// Whether this process can send the real sequence now. Read at every
-/// announcement: a policy a GPO refresh changes is picked up at the next one.
+/// The relay the SCM host handed this worker (`--sas-event`).
 #[cfg(target_os = "windows")]
-pub fn availability() -> Result<(), SasRefusal> {
-    decide(imp::is_system(), SasPolicy::from_value(imp::read_policy()))
+static HOST_RELAY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The worker's half: remember the host's relay, once, at start.
+#[cfg(target_os = "windows")]
+pub fn set_host_relay(name: String) {
+    let _ = HOST_RELAY.set(name);
 }
 
-/// Send the secure attention sequence: what the physical chord raises.
+/// Whether this worker can have the real sequence sent now. Decided at every
+/// announcement, and the heartbeat re-announces when the answer changes.
+#[cfg(target_os = "windows")]
+pub fn availability() -> Result<(), SasRefusal> {
+    decide(
+        HOST_RELAY.get().is_some() && imp::is_system(),
+        SasPolicy::from_value(imp::read_policy()),
+    )
+}
+
+/// The worker's half of a send: ask the service, which sends it.
 #[cfg(target_os = "windows")]
 pub fn send() -> anyhow::Result<()> {
-    imp::send()
+    let Some(name) = HOST_RELAY.get() else {
+        anyhow::bail!("no service relay to ask");
+    };
+    imp::signal(name)
+}
+
+/// The service's half: called by the host's relay thread, which re-checks the
+/// policy itself, never trusting that the worker did.
+#[cfg(target_os = "windows")]
+pub fn host_send() -> anyhow::Result<()> {
+    let policy = SasPolicy::from_value(imp::read_policy());
+    if !policy.lets_services() {
+        anyhow::bail!("the policy lets no service send it ({policy:?})");
+    }
+    imp::send_sas()
 }
 
 #[cfg(target_os = "windows")]
 mod imp {
     use anyhow::{Result, bail};
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, FreeLibrary};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, FreeLibrary};
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
     };
     use windows_sys::Win32::System::Registry::{
         HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW,
     };
+    use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent};
+
+    /// `EVENT_MODIFY_STATE`: enough to signal, which the relay's DACL grants
+    /// SYSTEM alone.
+    const EVENT_MODIFY_STATE: u32 = 0x0002;
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -144,7 +186,8 @@ mod imp {
         (rc == ERROR_SUCCESS).then_some(value)
     }
 
-    /// Whether this process runs as LocalSystem (the SystemContext worker).
+    /// Whether this process runs as LocalSystem (the SystemContext worker):
+    /// the only kind the relay's DACL lets signal.
     pub fn is_system() -> bool {
         #[cfg(feature = "system-context")]
         {
@@ -158,7 +201,27 @@ mod imp {
         }
     }
 
-    pub fn send() -> Result<()> {
+    /// Signal the host's relay event.
+    pub fn signal(name: &str) -> Result<()> {
+        let name_w = wide(name);
+        // SAFETY: `name_w` is NUL-terminated; we ask for EVENT_MODIFY_STATE only.
+        let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name_w.as_ptr()) };
+        if handle.is_null() {
+            bail!("the service relay: {}", std::io::Error::last_os_error());
+        }
+        // SAFETY: `handle` was just opened with EVENT_MODIFY_STATE.
+        let ok = unsafe { SetEvent(handle) };
+        let err = std::io::Error::last_os_error();
+        // SAFETY: closed once; nothing else holds this handle.
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            bail!("the service relay: {err}");
+        }
+        Ok(())
+    }
+
+    /// `SendSAS(FALSE)`, from the service process.
+    pub fn send_sas() -> Result<()> {
         let dll = wide("sas.dll");
         // SAFETY: `dll` is a NUL-terminated UTF-16 buffer; System32 only, so a
         // copy planted beside the binary is never the one loaded.
@@ -221,23 +284,23 @@ mod tests {
     }
 
     #[test]
-    fn the_real_sequence_needs_system_and_the_policy() {
+    fn the_real_sequence_needs_the_service_and_the_policy() {
         assert_eq!(decide(true, SasPolicy::Services), Ok(()));
         assert_eq!(decide(true, SasPolicy::ServicesAndEaseOfAccess), Ok(()));
         assert_eq!(
             decide(false, SasPolicy::Services),
-            Err(SasRefusal::NotSystem),
+            Err(SasRefusal::NoService),
             "a per-user install, however open the policy"
         );
         assert_eq!(
             decide(true, SasPolicy::EaseOfAccess),
             Err(SasRefusal::Policy(SasPolicy::EaseOfAccess)),
-            "SYSTEM, but Windows' default policy"
+            "the service is there, but Windows' default policy"
         );
         assert_eq!(
             decide(false, SasPolicy::Nothing),
-            Err(SasRefusal::NotSystem),
-            "not being SYSTEM is said first: without it the policy does not matter"
+            Err(SasRefusal::NoService),
+            "no service is said first: without it the policy does not matter"
         );
     }
 
@@ -245,7 +308,7 @@ mod tests {
     /// lock screen and what would change it.
     #[test]
     fn each_refusal_says_why() {
-        assert!(SasRefusal::NotSystem.reason().contains("signed-in person"));
+        assert!(SasRefusal::NoService.reason().contains("Roomler service"));
         assert!(
             SasRefusal::Policy(SasPolicy::Nothing)
                 .reason()
