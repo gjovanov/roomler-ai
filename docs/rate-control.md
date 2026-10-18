@@ -454,6 +454,75 @@ crossed (a field trace: 55 → 50 → 55 → 50 → 45 → 50, five moves in ten
 once and up only when the encoder clears the higher step by 2.5 fps. The hardware pace keeps margin 0 until it
 is measured on hardware ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)).
 
+## The media plan, in shadow (FR-70 M3a)
+
+FR-70's M3 moves every rate and geometry decision out of the media loop into a
+**plan** the loop reads. M3a (`agent-v0.4.144`+) ships the plan's producer and
+runs it in SHADOW: nothing reads the plan yet, and the pump's inline decisions
+are unchanged, but once per pass the FFmpeg DC pump computes the plan from the
+facts it has at that instant and compares it, field by field, against the
+inline value it computes later in the same pass. The retirement gate for the
+inline arithmetic is the operator's standing rule — the counter must read
+**fleet-zero** before M3b flips the loop — so a divergence is a measured bug in
+the plan, not a regression in the field. Design and anchors:
+`docs/fr/FR-70-media-pipeline-leaves-the-runtime.md` §"M3a — as built".
+
+```mermaid
+flowchart TD
+    TOP["loop top: swap adoption, transport recheck"] --> SNAP["snapshot the FACTS<br/>native dims · merged target · dial caps · refine · soft cap<br/>pipe belief · last ceiling · encoder HRD · paced fps · standing target"]
+    SNAP --> PROD["produce(PlanInputs, PlanKnobs) → Plan{epoch}<br/>knobs resolved ONCE per pump"]
+    PROD --> GATE["inline byte gate: budget · hard · measured wait · verdict"]
+    GATE -. "check_budget · check_gate_verdict" .-> CNT["plan_divergences<br/>budget · hard_budget · lag_bound · gate · fps · dims · bitrate"]
+    GATE --> PACE["inline pacer"]
+    PACE -. "check_fps" .-> CNT
+    PACE --> CAP["capture"]
+    CAP --> DIMS["inline plan_dims → plan_target"]
+    DIMS -. "check_dims" .-> CNT
+    DIMS --> BUILD["inline open / adopted replacement<br/>note_built(rate, dims)"]
+    BUILD --> TICK["governor.pre_encode_tick"]
+    TICK -. "after_tick: republish bitrate, judge the build" .-> CNT
+    TICK --> OUT["encode → send → heartbeat<br/>plan_divergences · plan_epoch"]
+```
+
+| plan field | what it is | the inline value it is compared with |
+|---|---|---|
+| `queue_budget_bytes` | FR-59 P2 / FR-74 P1 — link time at the reference rate (the pipe belief on a relay, the LAST frame's ceiling on direct) | the pump's `queue_budget` at the gate |
+| `queue_hard_budget_bytes` | FR-74 P1b — the larger of the soft budget and the encoder's HRD reservoir; equal to the soft budget on a relay | the pump's `hard_budget` |
+| `queue_lag_bound_ms` | the measured-wait bound that qualifies the soft budget; **0 = bytes alone trip it** (the relay's rule), which is what lets `direct_gate_trips` serve both transports | the bound the gate used |
+| `fps` | the pace in force, else the target — the loop paces itself only below the target (rc.93) | `paced_fps.unwrap_or(target_fps)` |
+| `dims` | `plan_dims` reduced by the resampler's rule; `(0, 0)` before the first frame | `target_dims(native, plan_target)` each frame, and the dims of every encoder the loop builds |
+| `bitrate_bps` | the governor's standing target on the ladder — the one input that is itself a decision (the controller is M4's) | the rate of every encoder the loop builds by itself (the inline open, an adopted replacement), judged after the controller's next tick |
+| `epoch` | moves when any other field moves | — (`plan_epoch` on the heartbeat counts distinct plans) |
+
+What stays with the loop as a **fact**, deliberately: the bytes in flight, the
+send-wait EMA and its cursors (a measurement that only reads like a decision),
+the live head-of-queue age, the captured frame's own dims and the M2 pin.
+
+**Reading it.** The heartbeat carries
+`plan_divergences = PlanDivergences { budget: 0, hard_budget: 0, lag_bound: 0, gate: 0, fps: 0, dims: 0, bitrate: 0 }`
+and `plan_epoch = N`. A field's FIRST divergence of the session also logs once,
+with both values:
+
+```
+WARN FR-70 M3a: the shadow plan diverged from the pump's inline value (first time this session for this field)
+     field="dims" plan="(1920, 1200)" inline="(944, 590)"
+```
+
+Read the line, not the count: it names the field and the two numbers. The
+counts the shadow is EXPECTED to show, each a one-frame lag M3b has to design
+for rather than a bug: a native-dims change under a live session, a refine
+flip during the pass's capture (inert on the fleet default — the dial's
+dims-caps are off), a resolution or Priority write landing between the
+snapshot and the inline read, a `pipe_bps` TTL expiry between the two reads.
+Anything else is a plan bug and blocks M3b.
+
+⚠️ **No kill switch, on purpose.** The shadow changes no decision, takes no
+await, adds no env read to the frame path (every knob is resolved once per pump
+into `PlanKnobs`) and logs at most seven lines per session; a switch would be
+the twelfth of the kill switches FR-70 exists to delete, guarding nothing.
+⚠️ The VP9-444 pump and the RTP pump run no shadow (M3b decides whether the
+software pump reads the same plan; the RTP pump has no governor).
+
 ## Config / env reference
 
 All keys live in the agent config (`roomler config set …`) with

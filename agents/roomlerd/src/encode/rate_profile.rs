@@ -360,11 +360,20 @@ pub fn constrained_queue_ms() -> u64 {
 /// FR-59 P2 — floored at [`CONSTRAINED_QUEUE_MIN_BYTES`] so a momentarily
 /// absurd reference rate cannot gate every single frame.
 pub fn constrained_queue_budget_bytes(ceiling_bps: u32) -> usize {
-    let ms = constrained_queue_ms();
-    if ms == 0 {
+    constrained_queue_budget_bytes_at(ceiling_bps, constrained_queue_ms())
+}
+
+/// [`constrained_queue_budget_bytes`] with the window explicit — the FR-70
+/// M3a plan producer's form (`encode::plan`), which resolves
+/// `constrained_queue_ms` ONCE per pump instead of per frame. The reader
+/// above keeps its per-frame read and is this function applied, so the two
+/// cannot drift (locked by `the_budget_readers_equal_their_explicit_window_forms`).
+pub fn constrained_queue_budget_bytes_at(ceiling_bps: u32, queue_ms: u64) -> usize {
+    if queue_ms == 0 {
         return usize::MAX;
     }
-    (((ceiling_bps as u64).saturating_mul(ms) / 8000) as usize).max(CONSTRAINED_QUEUE_MIN_BYTES)
+    (((ceiling_bps as u64).saturating_mul(queue_ms) / 8000) as usize)
+        .max(CONSTRAINED_QUEUE_MIN_BYTES)
 }
 
 /// FR-59 P5 — a link at or below this remembered rate opens in the
@@ -523,11 +532,16 @@ pub fn direct_queue_ms() -> u64 {
 /// input disables the gate (`usize::MAX`). Floored at 48 KiB so a post-IDR
 /// drain doesn't stall production longer than the IDR's own transit.
 pub fn direct_queue_budget_bytes(rate_bps: u32) -> usize {
-    let ms = direct_queue_ms();
-    if ms == 0 || rate_bps == 0 {
+    direct_queue_budget_bytes_at(rate_bps, direct_queue_ms())
+}
+
+/// [`direct_queue_budget_bytes`] with the window explicit — the plan
+/// producer's form (FR-70 M3a); the reader above is this applied.
+pub fn direct_queue_budget_bytes_at(rate_bps: u32, queue_ms: u64) -> usize {
+    if queue_ms == 0 || rate_bps == 0 {
         return usize::MAX;
     }
-    (((rate_bps as u64).saturating_mul(ms) / 8000) as usize).max(48 * 1024)
+    (((rate_bps as u64).saturating_mul(queue_ms) / 8000) as usize).max(48 * 1024)
 }
 
 /// FR-74 P1b — the HARD byte ceiling of the direct gate: the larger of the
@@ -542,12 +556,31 @@ pub fn direct_queue_budget_bytes(rate_bps: u32) -> usize {
 /// (`direct_gate_trips`); at or above it the gate trips on bytes regardless.
 /// `0` for the rate disables the gate, like the soft budget.
 pub fn direct_queue_hard_budget_bytes(rate_bps: u32, hrd_pct: usize) -> usize {
-    let soft = direct_queue_budget_bytes(rate_bps);
+    direct_queue_hard_budget_bytes_at(rate_bps, hrd_pct, direct_queue_ms())
+}
+
+/// [`direct_queue_hard_budget_bytes`] with the window explicit — the plan
+/// producer's form (FR-70 M3a); the reader above is this applied.
+pub fn direct_queue_hard_budget_bytes_at(rate_bps: u32, hrd_pct: usize, queue_ms: u64) -> usize {
+    let soft = direct_queue_budget_bytes_at(rate_bps, queue_ms);
     if soft == usize::MAX {
         return usize::MAX;
     }
     let reservoir = (rate_bps as u64).saturating_mul(hrd_pct as u64) / 100 / 8;
     soft.max(reservoir as usize)
+}
+
+/// FR-74 P1b / FR-70 M3a — the HRD window an encoder opens with, from the
+/// transport's base percent: `av1_*` is floored at 200 % (Intel's VDENC errors
+/// on a forced IDR over the reservoir, then hangs the driver — the rc.443
+/// incident). The pure half of `ffmpeg::encoder::open_hrd_pct`, which resolves
+/// the base from env; the plan producer takes the base once.
+pub fn hrd_pct_for(encoder_name: &str, base_pct: usize) -> usize {
+    if encoder_name.starts_with("av1_") {
+        base_pct.max(200)
+    } else {
+        base_pct
+    }
 }
 
 /// FR-74 P1b — the direct gate's decision. `inflight` trips the gate when it
@@ -1140,6 +1173,61 @@ impl IdleRefine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-70 M3a — the explicit-window forms the plan producer calls are the
+    /// per-frame readers' arithmetic exactly, whatever the window says, and
+    /// at the shipped defaults they are the shipped constants.
+    #[test]
+    fn the_budget_readers_equal_their_explicit_window_forms() {
+        let cms = constrained_queue_ms();
+        let dms = direct_queue_ms();
+        for rate in [0, 1, 200_000, 395_000, 3_000_000, 43_000_000, u32::MAX] {
+            assert_eq!(
+                constrained_queue_budget_bytes(rate),
+                constrained_queue_budget_bytes_at(rate, cms)
+            );
+            assert_eq!(
+                direct_queue_budget_bytes(rate),
+                direct_queue_budget_bytes_at(rate, dms)
+            );
+            for hrd in [25, 100, 200] {
+                assert_eq!(
+                    direct_queue_hard_budget_bytes(rate, hrd),
+                    direct_queue_hard_budget_bytes_at(rate, hrd, dms)
+                );
+            }
+        }
+        assert_eq!(constrained_queue_budget_bytes_at(3_000_000, 450), 168_750);
+        assert_eq!(
+            constrained_queue_budget_bytes_at(1, 450),
+            CONSTRAINED_QUEUE_MIN_BYTES
+        );
+        assert_eq!(constrained_queue_budget_bytes_at(3_000_000, 0), usize::MAX);
+        assert_eq!(direct_queue_budget_bytes_at(43_000_000, 150), 806_250);
+        assert_eq!(direct_queue_budget_bytes_at(1, 150), 48 * 1024);
+        assert_eq!(
+            direct_queue_hard_budget_bytes_at(43_000_000, 100, 150),
+            5_375_000
+        );
+        assert_eq!(
+            direct_queue_hard_budget_bytes_at(43_000_000, 200, 150),
+            10_750_000
+        );
+        assert_eq!(direct_queue_hard_budget_bytes_at(0, 100, 150), usize::MAX);
+        assert_eq!(
+            direct_queue_hard_budget_bytes_at(43_000_000, 100, 0),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn hrd_pct_for_floors_only_av1_at_200() {
+        assert_eq!(hrd_pct_for("av1_qsv", 100), 200);
+        assert_eq!(hrd_pct_for("av1_nvenc", 200), 200);
+        assert_eq!(hrd_pct_for("hevc_qsv", 100), 100);
+        assert_eq!(hrd_pct_for("hevc_nvenc", 75), 75);
+        assert_eq!(hrd_pct_for("", 100), 100);
+    }
 
     fn t0() -> Instant {
         Instant::now()

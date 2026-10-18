@@ -802,11 +802,9 @@ pub(crate) fn open_hrd_pct(name: &str, constrained: bool) -> usize {
     } else {
         crate::encode::rate_profile::direct_hrd_pct()
     };
-    if name.starts_with("av1_") {
-        base.max(200)
-    } else {
-        base
-    }
+    // FR-70 M3a — the AV1 floor is the pure `hrd_pct_for`, which the plan
+    // producer applies to a base it resolved once.
+    crate::encode::rate_profile::hrd_pct_for(name, base)
 }
 
 impl FfmpegEncoder {

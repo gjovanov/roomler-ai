@@ -72,7 +72,7 @@ overridden.
 
 ## Phases
 
-`M0` measurement → `M1` media thread → `M2` make-before-break → `M3` plan handoff (**designed 2026-09-08**, §"M3 — the plan handoff, as designed"; not built)
+`M0` measurement → `M1` media thread → `M2` make-before-break → `M3` plan handoff (**designed 2026-09-08**, §"M3 — the plan handoff, as designed"; **M3a — the plan in SHADOW — built 2026-10-18**, §"M3a — as built"; M3b not built)
 → `M4` one controller (FR-63 B1/B2) → `M5` the deletions (FR-62 A4 + FR-63 B3) ·
 ~~`T1` transport classification~~ (→ **FR-71 #1362**, 2026-09-05) · `P1` priors decay + visible overrides.
 
@@ -692,6 +692,186 @@ that instant and assert it equals the inline value — not a cadence check. A
 window-cadence shadow would diverge by construction, so its counter could never
 reach fleet-zero and would gate nothing.
 
+## M3a — the plan in SHADOW, as built (2026-10-18)
+
+Anchors verified against branch `fr70-m3a` (master `0087c5a75` + this PR).
+Nothing the pump decides changed; every number below is computed beside the
+inline one and compared, never read.
+
+| phase | what | kill switch | gate |
+|---|---|---|---|
+| **M3a** | `encode::plan`: the `Plan`, a pure producer, and a frame-cadence shadow comparison in `media_pump_ffmpeg_dc`; heartbeat `plan_divergences` + `plan_epoch` | **none, on purpose** — the shadow changes no decision, takes no await, adds no env read to the frame path, and logs at most seven lines per session; a switch would be the twelfth of the kill switches this FR exists to delete (AC4), guarding nothing | `plan_divergences` reads **zero on every field, fleet-wide**, over a week of sessions on the release carrying it; a non-zero field is a named, measured bug in the plan, fixed before M3b |
+
+**The plan** (`agents/roomlerd/src/encode/plan.rs:70`): `bitrate_bps`, `dims`,
+`fps`, `queue_budget_bytes`, `queue_lag_bound_ms`, `epoch` as designed, plus
+**`queue_hard_budget_bytes`** — FR-74 P1b's hard ceiling landed beside the
+design, and without it the loop would still compute
+`direct_queue_hard_budget_bytes` inline, which is a decision. Two field
+semantics the design left open are now stated: `bitrate_bps` is on the ladder
+(`aimd::coarsen_bitrate`) because that is what every rate the encoder is handed
+is compared on (`set_bitrate`'s change gate, `rebuild_spec`), and
+`queue_lag_bound_ms = 0` means *bytes alone trip the budget* — the constrained
+path's rule — so the one gate function `rate_profile::direct_gate_trips` serves
+both transports: with the triple `(b, b, 0)` it reduces to today's
+`inflight >= budget` for every inflight and every wait (locked by
+`the_constrained_gate_is_the_unified_gate_at_lag_zero`, `plan.rs:652`).
+
+**The producer** (`plan.rs:191`, `produce(&PlanInputs, &PlanKnobs, prev)`) is
+pure over explicit inputs and compiles on the default build. Every knob the
+inline code reads from env per frame — `relay_max_bps`, `constrained_queue_ms`,
+`constrained_queue_measured`, `direct_queue_ms`, `direct_hrd_pct`, the
+refined-rung cap, the Priority dial's dims-caps — is resolved ONCE per pump
+into `PlanKnobs` (`plan.rs:130`), so the shadow adds **no env read to the frame
+path** (FR-70's rule) and the producer takes the arithmetic through explicit
+forms that the per-frame readers are now defined as:
+`rate_profile::{constrained_queue_budget_bytes_at,
+direct_queue_budget_bytes_at, direct_queue_hard_budget_bytes_at, hrd_pct_for}`
+(`rate_profile.rs:371,540,564,578`), `encode::priority_relay_cap_for` over
+`PriorityCaps` (`encode/mod.rs:1005,1036`), and
+`Pipeline::merged_priority_cap_by` (`media_share.rs:340`). Each reader is its
+explicit form applied, and a test locks each pair
+(`the_budget_readers_equal_their_explicit_window_forms` `rate_profile.rs:1181`,
+`priority_relay_cap_for_is_priority_relay_cap_over_explicit_caps`
+`encode/mod.rs:1949`, `the_knobs_resolve_to_what_the_per_frame_readers_read`).
+
+**Facts and decisions — the split the design asked for.** The producer reads
+facts and emits decisions; what it was NOT given is as deliberate as what it
+was:
+
+| stays with the loop (a FACT) | why |
+|---|---|
+| the bytes in flight (`inflight_bytes`) | the ledger of what the loop handed the send task |
+| `direct_wait_ema_ms` and the `gate_sw_{sum,frames}_last` cursors | a running MEASUREMENT of the loop's own send queue — it reads like a decision because it is updated per pass, but it decides nothing; only the BOUND it is judged against is the plan's |
+| the live age of the frame at the head of the queue (`send_head_enqueued_us`) | a measurement, same reason |
+| the captured frame's own dims, and the M2 pin (`built_target`) | which encoder is live is the loop's state; the plan says what to aim for |
+
+| the plan's (a DECISION) | produced from |
+|---|---|
+| `queue_budget_bytes`, `queue_hard_budget_bytes`, `queue_lag_bound_ms` | transport, the pipe belief (`governor.pipe_bps`), the ceiling the LAST frame was planned at (`last_ceiling_bps` — deliberately the previous frame's: the pump reads it at the gate, before this frame's ceiling exists), the live encoder's HRD window, the once-resolved knobs |
+| `fps` | `paced_fps.unwrap_or(target_fps)` — the pacer's only input; the loop paces itself ONLY below the target (rc.93) |
+| `dims` | `policy::plan_dims` over the merged target, the merged dial cap, the slow-link cap, the refine state and the soft cap, reduced by `resample::target_dims`; `(0, 0)` before the first frame, when the native dims are unknown |
+| `bitrate_bps` | the governor's standing target — **the one input that is itself a decision the plan does not own yet.** The controller is stateful and ticks inside the pass; a shadow cannot tick it twice, and running a second governor is M4's "one controller", not M3. See the `bitrate` check below for what the shadow CAN prove about the rate |
+
+**Where the snapshot is taken, and why there** (`peer.rs:7420`, the block
+above it): once per pass, after the swap adoption and the transport recheck and
+before the byte gate — the point where M3b's loop will READ the plan. The inputs
+are the facts the pump has at that instant: the native dims from the atomic
+the last frame published, the control-plane state (`target_resolution`,
+`priority`, the pipeline's followers), the governor's belief, pace, soft cap
+and standing target, `last_ceiling_bps`, the live encoder's name. Cost: the
+`target_resolution` mutex and the pipeline mutex each once more per pass than
+the inline reads (uncontended, tens of ns); M3b removes both along with the
+inline reads. No await, no env read.
+
+**What is compared, where** — one counter per field, on the heartbeat as
+`plan_divergences = PlanDivergences { budget, hard_budget, lag_bound, gate, fps,
+dims, bitrate }` (`peer.rs:9230`), plus `plan_epoch` (how many distinct plans
+the session has had). A field's FIRST divergence also logs once per session,
+with both values (`FR-70 M3a: the shadow plan diverged from the pump's inline
+value`, `peer.rs:9276`):
+
+| field | the plan's value vs | at | `plan.rs` |
+|---|---|---|---|
+| `budget`, `hard_budget`, `lag_bound` | the pump's `queue_budget`, `hard_budget`, and the lag bound its gate used (`(b, b, 0)` on a constrained path) | the gate, every pass (`peer.rs:7512`) | `check_budget` `:401` |
+| `gate` | the plan's triple through `direct_gate_trips` vs the verdict the pump's two arms reached from the same `inflight_now` and `measured_wait_ms` | the gate, every pass (`:7521`) | `check_gate_verdict` `:435` |
+| `fps` | `governor.paced_fps().unwrap_or(target_fps)` | the pacer, every pass that reaches it (`:7628`) | `check_fps` `:457` |
+| `dims` | `resample::target_dims(frame.native_dims(), plan_target)` — pin-independent | after capture, every frame (`:7943`); skipped while the plan has no geometry | `check_dims` `:468` |
+| `dims`, `bitrate` | the dims and rate of every encoder the loop BUILT — the inline open (`:8277`), a dims swap adopted (`:7060`), a rate swap adopted (`:7124`) — judged after the controller's next tick (`:8763`): was it built at the plan's rate (on the ladder) and the plan's dims? | `note_built` `:483`, `after_tick` `:493` |
+
+The `bitrate` check is the honest version of the rate half. The loop takes the
+controller's number at every `set_bitrate` site by construction (those five
+sites are what M3b collapses, not a divergence), so comparing there would be a
+tautology; the two places the loop decides a rate BY ITSELF are the rate it
+opens an encoder at (`min(ceiling, applied-or-seed)`, `:8152`) and the rate a
+make-before-break replacement was opened for. A `bitrate` divergence is
+therefore an encoder the controller re-rates on its very next tick — on a
+rebuild-bound backend, a second open — and it is exactly the case the open-rate
+comment at `:8148` claims never happens. The controller's own tick is folded
+into the plan as a re-publish (`after_tick` bumps the epoch, counts nothing),
+which keeps the plan a ~30 Hz object as crux (2) decided.
+
+**Scope — the VP9-444 pump and the RTP pump are NOT in M3a, by decision.**
+`media_pump_vp9_444_dc` shares `plan_dims`, `area_min_bitrate_bps`, the shared
+split and the governor, but has no byte budget, no make-before-break and a
+software pace; a shadow there would wire the same producer with three of seven
+fields structurally inert and prove nothing the FFmpeg pump's does not. M3b
+decides whether that pump reads the same `Plan` (it should, with the budget
+unbounded) — once the producer has a fleet read behind it. `media_pump` (the
+RTP track) runs its own controller with no `RateGovernor` at all (FR-112 P2b)
+and is outside this FR.
+
+**Verification, before the PR.** All on the default build unless noted:
+
+- `encode::plan::tests` — thirteen tests: each field's arithmetic against the
+  shipped constants (the 168 750-byte constrained budget at the nominal band
+  and 22 218 at FR-59 P2's 395 kbps field case; 806 250 / 5 375 000 at FR-74
+  P1's 43 Mbps direct ceiling, doubled for AV1's 200 % floor; the 16 KiB and
+  48 KiB floors; `usize::MAX` with no reference rate), the unified-gate
+  algebra, the pace, the geometry through the resampler's rule, the ladder,
+  the epoch, and the shadow's counting (each field counted on its own, the
+  first divergence reported once, dims skipped until the plan has geometry, a
+  build judged once against the controller's first target).
+- `encode::sim::tests::the_plan_producer_reproduces_the_b0_cells_budget_frame_for_frame`
+  (`sim.rs:3031`) — a `RateLaw` wrapper runs the producer beside the governor
+  law on every B0 fixture under the budget gate (AC0b corp VPN, airport
+  hotspot, DERP with stalls, LAN bursts, the early stall, the misremembered
+  fast pair, FR-70 P1's remembered-slow pair with the prior pinned and
+  decaying, the genuinely slow pair, FR-71's finding 4 — ten cells), with the
+  sim's constants explicit, and asserts the producer's budget equals the law's
+  own statement of the inline arithmetic on **every frame**: 0 divergences on
+  52 000+ frames.
+- **Negative control** (the counter must be shown to count): a planted `+ 1`
+  on the producer's constrained budget — see the record below — fails the B0
+  test on every cell's first frame and the constant test; reverted, both
+  green again. The committed half is
+  `the_shadow_counts_each_field_and_reports_the_first_once` (`plan.rs:786`),
+  which plants a divergence through the same `check_*` calls the pump makes.
+- The lanes that compile the pump wiring are the FFmpeg ones:
+  `cargo clippy -p roomlerd --features ffmpeg-encoder,vp9-444,vp9-444-bindgen --all-targets -- -D warnings`
+  and `cargo test -p roomlerd --features ffmpeg-encoder --lib`, run in WSL
+  against the vendored FFmpeg 9.0.1 tree CI uses (the `full` clippy job
+  deliberately leaves `ffmpeg-encoder` out); the rest of CI's clippy lines
+  verbatim.
+
+**Field-verification plan (the gate).** The counter does not exist on the
+current deploy, so the FAIL-first run for this phase is the planted
+divergence above (a shadow cannot be made to fail in the field without
+shipping a wrong plan). On the first release carrying M3a:
+
+1. `agent_logs` over one week, every FFmpeg DC session, every host:
+   `grep -o 'plan_divergences = [^}]*}'` — every field zero is the gate. A
+   session that logged `FR-70 M3a: the shadow plan diverged` names the field
+   and both values; that line, not the count, is what gets read.
+2. The three CORPLAP hosts (hevc_qsv relay, av1_nvenc relay, av1_qsv direct)
+   and one direct QSV host at native 2560×1600 (the floor-rise case the
+   `bitrate` check exists for) each get a driven session with a resolution
+   move each way, a Priority move, and a transport flip where one can be
+   provoked — the events that move the plan — read for `plan_epoch` moving
+   and `plan_divergences` not.
+3. Known legitimate one-frame lags the shadow WILL count, each attributable
+   from the log line and each a documented M3b design input rather than a
+   bug: a native-dims change under a live session (the atomic is the last
+   frame's), a refine flip during the pass's capture (inert on the fleet
+   default — `priority_relay_cap`'s dims-caps are off — so a count here means
+   an A/B host), a `target_resolution` or Priority write landing between the
+   snapshot and the inline read, and a `pipe_bps` TTL expiry between the two
+   reads (bounded at one per 15 s TTL). Anything else is a plan bug.
+
+**Negative control — the record (2026-10-18, WSL, default build).** Planted:
+`+ 1` on the producer's constrained budget (`produce`, the `(budget, budget,
+0)` arm), marked `NEGATIVE CONTROL` in the source for the run.
+`cargo test -p roomlerd --lib plan` → **FAILED, 3 failed / 22 passed**:
+
+| test | what it said |
+|---|---|
+| `the_plan_producer_reproduces_the_b0_cells_budget_frame_for_frame` | *AC0b corp VPN thin pipe (arm B): the producer's budget diverged on 1201 of 1201 frames — first: frame 1: plan 143438 vs inline 143437 (pipe None, target 2550000)* — the first cell, every frame, both numbers named |
+| `a_constrained_budget_is_the_reference_rate_s_window_floored_at_one_chunk` | `left: 168751, right: 168750` |
+| `no_reference_rate_means_no_gate` | the plant overflows `usize::MAX` on the disabled-gate path (a panic, caught as a failure) |
+
+Reverted (the `NEGATIVE CONTROL` marker gone, `grep -c` = 0): the same command
+→ **ok, 25 passed / 0 failed**, and `cargo fmt --all -- --check` clean. The
+counter counts; a zero from it is a measurement, not a default.
+
 ## Acceptance criteria
 
 - [ ] **AC1** — capture/scale/encode run on a dedicated thread; the async runtime
@@ -727,6 +907,25 @@ reach fleet-zero and would gate nothing.
       log.
 - [ ] **AC7** — every phase carries a before/after from the same instrument, and
       each field test is shown to FAIL on the current deploy first.
+- [x] **AC8 (M3a)** — the plan's fields are produced by ONE pure function from
+      explicit inputs, compiled and tested on the default build, with every
+      knob resolved once per pump and no env read added to the frame path.
+      **Met 2026-10-18**: `encode::plan::produce` + `PlanKnobs`; the thirteen
+      `encode::plan::tests` and the three reader-equals-explicit-form tests
+      (§"M3a — as built").
+- [x] **AC9 (M3a)** — the producer reproduces the inline arithmetic on every
+      frame of every B0 cell, and the divergence counter is shown to COUNT
+      before it is trusted to read zero. **Met 2026-10-18**: 0 divergences on
+      every frame of ten cells
+      (`the_plan_producer_reproduces_the_b0_cells_budget_frame_for_frame`);
+      the planted `+ 1` fails every cell on its first frame and the shadow's
+      own counting test plants one through the pump's `check_*` calls (the
+      negative control record in §"M3a — as built").
+- [ ] **AC10 (M3a field gate)** — `plan_divergences` reads zero on every field
+      across the fleet's FFmpeg DC sessions over a week on the release carrying
+      M3a, and every driven plan move (resolution, Priority, transport) moves
+      `plan_epoch` without a divergence. The retirement gate for the inline
+      arithmetic: M3b does not start until it holds.
 
 ## P1 — as built (2026-09-04, PR #1333)
 
