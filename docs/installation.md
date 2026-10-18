@@ -282,6 +282,13 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   cannot say. The root system unit (`roomlerd.service`) has no sandbox
   either way.
 - `--role tunnel` installs just the CLI (tarball or `.deb`).
+- **The system service from the CLI** (FR-97 P6c): `sudo roomlerd service install --as-service` (alias
+  `--system`) enables `roomlerd.service`, the root unit `install.sh --system` uses, after the fact. It refuses
+  until `/etc/roomler/config.toml` exists (`sudo roomlerd --config /etc/roomler/config.toml enroll …`): without
+  a config the unit would restart every 5 s. It warns when a per-user daemon also runs (one daemon per machine),
+  and it leaves the update helper alone, because the helper steps aside by itself while the system unit is
+  enabled. `service uninstall|status|start|stop --as-service` complete it; uninstall keeps the config
+  (`agents/roomlerd/src/service.rs`, `pub mod system`).
 - Useful flags: `--download-only`, `--no-enroll`; and `--uninstall
   [--keep-config]` removes it all again ([below](#uninstall-every-platform)).
 - Headless servers: the daemon's virtual-desktop mode gives the machine a
@@ -400,6 +407,14 @@ from `roomler peers` entirely** rather than showing as offline.
 
 Running the one-liner under `sudo` is fine: the script resolves the console
 user itself and enrolls the per-user half as them.
+
+The root half can also be added after the fact (FR-97 P6c). Enroll it with
+`sudo /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd --config /etc/roomler/config.toml enroll … --overlay`,
+then `sudo roomlerd service install --as-service` writes the enable marker and
+the LaunchDaemon and bootstraps it. `service stop --as-service` is a SIGTERM
+that stays down until the next boot or `service start --as-service`: the plist
+restarts only a failed exit, and the clean stop exits 0 (measured). The
+per-user `roomlerd service stop` works the same way.
 
 ### Grant the two permissions — nothing works until you do
 
@@ -631,7 +646,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/main.rs:1953`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/main.rs:1961`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 
