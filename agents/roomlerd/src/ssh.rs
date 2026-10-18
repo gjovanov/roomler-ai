@@ -996,13 +996,13 @@ mod sshd {
         channel_input: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
         /// Resize half of the live terminal.
         pty_handle: Option<crate::pty::PtyHandle>,
-        /// FR-89 — one abort per exec channel, fired when the client closes
-        /// that channel ([`channel_close`](russh::server::Handler::channel_close))
-        /// or when the session ends (`Drop`). A streamed command has no wall
-        /// clock, so THIS is what ends one whose reader has gone; a token
-        /// cancels synchronously, which is what `Drop` needs. Minted before
-        /// the consent wait, so a channel closed during the prompt leaves
-        /// nothing to run (the engine checks it before spawning).
+        /// FR-89 — one abort per exec channel (FR-97 P4b: and per Windows console-user
+        /// sftp channel), fired when the client closes that channel
+        /// ([`channel_close`](russh::server::Handler::channel_close)) or when the session
+        /// ends (`Drop`). A streamed command has no wall clock, so THIS is what ends
+        /// one whose reader has gone; a token cancels synchronously, which is what
+        /// `Drop` needs. Minted before the consent wait, so a channel closed during the
+        /// prompt leaves nothing to run (the engine checks it before spawning).
         exec_aborts: std::collections::HashMap<ChannelId, tokio_util::sync::CancellationToken>,
         /// FR-55 — holds the machine awake for as long as this session lives.
         ///
@@ -1133,26 +1133,33 @@ mod sshd {
             };
 
             // Windows can only spawn as another user through
-            // `CreateProcessAsUserW`. Its piped, streaming form exists —
-            // `exec`'s console-user path uses it, and since FR-89 it streams
-            // — but this subsystem spawns `sftp-server` through
-            // `tokio::process`, which cannot take a token, and is not wired
-            // to that spawn yet (FR-89, open decision 3). Refusing is the
-            // honest answer; silently running the transfer as SYSTEM would be
-            // the dangerous one. `ssh <node> 'cat f' > f` streams a file whole
-            // in the meantime.
+            // `CreateProcessAsUserW`, which `tokio::process` cannot do: a
+            // `console_user` session takes `exec`'s console-user spawn instead
+            // (FR-97 P4b, below). A named account is refused there as it is
+            // everywhere on Windows: becoming one needs its credentials.
             #[cfg(windows)]
-            if !matches!(run_as, crate::exec::RunAs::Daemon) {
+            if let crate::exec::RunAs::Named(account) = &run_as {
                 return refuse(
                     session,
                     channel,
                     self.peer,
                     "sftp",
-                    "file transfer as the signed-in user is not supported on Windows yet \
-                     (the sftp subsystem is not wired to the piped CreateProcessAsUserW \
-                     spawn). Interactive shells and commands work — `ssh <node> 'cat f' > f` \
-                     streams a file whole; scp/sftp here would otherwise run as SYSTEM, which \
-                     is why this refuses instead.",
+                    &format!(
+                        "cannot transfer files as the local account {account:?}: becoming an \
+                         arbitrary user on Windows requires that user's credentials. Use \
+                         account_mode `console_user` for the signed-in user."
+                    ),
+                );
+            }
+            #[cfg(windows)]
+            if matches!(run_as, crate::exec::RunAs::ConsoleUser) && !sftp_as_user_enabled() {
+                return refuse(
+                    session,
+                    channel,
+                    self.peer,
+                    "sftp",
+                    "SFTP as the signed-in user is switched off on this device \
+                     (ROOMLERD_SFTP_AS_USER=0).",
                 );
             }
 
@@ -1193,6 +1200,14 @@ mod sshd {
                     .extended_data(channel, 1, format!("roomler: {why}\r\n").into_bytes())
                     .await;
                 let _ = handle.close(channel).await;
+                return Ok(());
+            }
+
+            // FR-97 P4b — Windows `console_user`: `sftp-server` as the person
+            // signed in at the console, through `CreateProcessAsUserW`.
+            #[cfg(windows)]
+            if matches!(run_as, crate::exec::RunAs::ConsoleUser) {
+                self.sftp_as_console_user(program, handle, channel, caller);
                 return Ok(());
             }
 
@@ -1316,6 +1331,84 @@ mod sshd {
             }
 
             Ok(())
+        }
+
+        /// FR-97 P4b — the Windows `console_user` half of
+        /// [`start_sftp_session`](Self::start_sftp_session): `sftp-server` as
+        /// the person signed in at the console, through `exec`'s
+        /// `CreateProcessAsUserW` spawn, which `tokio::process` cannot do.
+        ///
+        /// The same splice as the `tokio::process` path, for the same reasons:
+        /// the client's bytes feed its stdin through a bounded queue, and the
+        /// client's EOF (the queue's last sender dropping) ends its input. Its
+        /// stdout reaches the channel raw, never redacted, because SFTP is a
+        /// binary protocol. Its stderr goes to this log, never the channel.
+        /// When it exits, the client gets the exit status (`scp`'s verdict on
+        /// the whole transfer), then EOF, then close. A client that has gone
+        /// kills the process tree: the channel closed or the session ended
+        /// (its abort sits beside the exec channels', FR-89), or a send
+        /// failed. It starts in the person's profile, where OpenSSH starts
+        /// it, so a relative path lands in their home.
+        #[cfg(windows)]
+        fn sftp_as_console_user(
+            &mut self,
+            program: std::path::PathBuf,
+            handle: russh::server::Handle,
+            channel: ChannelId,
+            caller: String,
+        ) {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+            self.channel_input = Some(tx);
+            let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<crate::exec::Chunk>(4);
+            let abort = tokio_util::sync::CancellationToken::new();
+            self.exec_aborts.insert(channel, abort.clone());
+            let peer = self.peer;
+            info!(
+                %peer, %caller, run_as = "console_user", privileged = false,
+                server = %program.display(),
+                "ssh: sftp session started (CreateProcessAsUserW)"
+            );
+
+            let pump_handle = handle.clone();
+            let pump_abort = abort.clone();
+            let pump = tokio::spawn(async move {
+                while let Some(chunk) = raw_rx.recv().await {
+                    match chunk.stream {
+                        crate::exec::OutStream::Stdout => {
+                            if pump_handle.data(channel, chunk.bytes).await.is_err() {
+                                pump_abort.cancel();
+                                break;
+                            }
+                        }
+                        crate::exec::OutStream::Stderr => {
+                            let s = String::from_utf8_lossy(&chunk.bytes);
+                            if !s.trim().is_empty() {
+                                warn!(%peer, msg = %s.trim(), "ssh: sftp-server stderr");
+                            }
+                        }
+                    }
+                }
+            });
+
+            let program = program.to_string_lossy().into_owned();
+            tokio::spawn(async move {
+                let outcome =
+                    crate::exec::run_console_user_program(&program, rx, raw_tx, abort).await;
+                // Every byte reaches the client before its verdict does.
+                let _ = pump.await;
+                if let Some(e) = &outcome.error {
+                    warn!(%peer, error = %e, "ssh: sftp-server as the console user");
+                    // The stderr stream, beside the binary one: the client
+                    // prints it, and the transfer was over anyway.
+                    let _ = handle
+                        .extended_data(channel, 1, format!("roomler: {e}\r\n").into_bytes())
+                        .await;
+                }
+                let status = outcome.exit_code.map(|c| c.max(0) as u32).unwrap_or(1);
+                let _ = handle.exit_status_request(channel, status).await;
+                let _ = handle.eof(channel).await;
+                let _ = handle.close(channel).await;
+            });
         }
 
         /// Start an interactive session on the terminal `pty_request` asked
@@ -1989,6 +2082,13 @@ mod sshd {
             .iter()
             .map(std::path::PathBuf::from)
             .find(|p| p.is_file())
+    }
+
+    /// FR-97 P4b's kill switch: `ROOMLERD_SFTP_AS_USER=0` puts back the
+    /// refusal a Windows `console_user` session got before P4b.
+    #[cfg(windows)]
+    fn sftp_as_user_enabled() -> bool {
+        tunnel_core::env::flag("SFTP_AS_USER", true)
     }
 
     /// Tell the client no, in a way a human reads on their terminal.

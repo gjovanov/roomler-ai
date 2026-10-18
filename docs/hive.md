@@ -300,22 +300,22 @@ the vault is allowed it.
 
 The daemon runs as root, and a session runs as the account `hive_accounts` maps the
 starter to, through the one privilege path that exec, SSH and the PTY share, as an agent session
-runs it: [`exec::apply_session_run_as`](../agents/roomlerd/src/exec.rs#L853). The
+runs it: [`exec::apply_session_run_as`](../agents/roomlerd/src/exec.rs#L855). The
 account is resolved in the parent (`getpwnam_r`, `getgrouplist`), uid 0 is refused
-([`exec.rs:955`](../agents/roomlerd/src/exec.rs#L955)), and the child only calls
+([`exec.rs:986`](../agents/roomlerd/src/exec.rs#L986)), and the child only calls
 `setgroups`, `setgid` and `setuid`, then checks that they took.
 
 ⚠️ **A session holds no administrator group** (decision 13), as Windows denies its
 sessions the Administrators group:
 - It holds none of the account's administrator groups
-  ([`exec.rs:1028`](../agents/roomlerd/src/exec.rs#L1028)): root's own, the sudoers groups
+  ([`exec.rs:1059`](../agents/roomlerd/src/exec.rs#L1059)): root's own, the sudoers groups
   (`wheel`, `sudo`, macOS's `admin`) and those whose socket or device is root by another
   door (`docker`, `lxd`, `incus`, `libvirt`, `disk`). An account whose primary group is one
-  is refused ([`exec.rs:1093`](../agents/roomlerd/src/exec.rs#L1093)). The kernel then
+  is refused ([`exec.rs:1124`](../agents/roomlerd/src/exec.rs#L1124)). The kernel then
   grants the session nothing by those groups: no docker or libvirt socket, no disk
   device, no write into macOS's `/Applications` (`root:admin 775`).
 - On Linux the harness also starts with `no_new_privs`
-  ([`exec.rs:1150`](../agents/roomlerd/src/exec.rs#L1150)), so nothing it runs gains a
+  ([`exec.rs:1181`](../agents/roomlerd/src/exec.rs#L1181)), so nothing it runs gains a
   privilege by exec: no `sudo`, whatever sudoers says of the account.
 
 | A session, as an account whose `sudo` needs no password | Linux | macOS |
@@ -823,7 +823,7 @@ The privilege path sets the account's supplementary groups from `getgrouplist`, 
 every session on that Mac failed "starting the harness: Invalid argument (os error
 22)". The list is now cut to `sysconf(_SC_NGROUPS_MAX)`, in order, the primary group
 first, so the child holds fewer groups and never more
-([`exec.rs:1010`](../agents/roomlerd/src/exec.rs#L1010) `within_ngroups_max`). Exec, SSH
+([`exec.rs:1041`](../agents/roomlerd/src/exec.rs#L1041) `within_ngroups_max`). Exec, SSH
 and the PTY share the fix, since they share the path.
 
 The cap is for `setgroups` alone. `sudo` never reads that list on a Mac, and a Linux
