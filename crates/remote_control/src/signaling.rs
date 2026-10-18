@@ -3980,6 +3980,19 @@ pub enum ServerMsg {
     /// [`crate::vault::LeaseRefusal`]. Never says which policy decided.
     #[serde(rename = "rc:vault.refused")]
     VaultRefused { req_id: String, reason: String },
+
+    /// FR-90 P3-3c — the vault took these leases back, for one reason
+    /// ([`crate::vault::RevokeReason`]): the device drops each, whatever the
+    /// word. Sent only on a connection that advertises
+    /// [`crate::models::RpcCap::Vault`]; at most
+    /// [`crate::vault::lease_limits::MAX_REVOKE_IDS`] a frame. Not
+    /// acknowledged: every hello is told again of each revoked lease that has
+    /// not yet expired, so a frame that was lost costs only a repeat.
+    #[serde(rename = "rc:vault.revoke")]
+    VaultRevoke {
+        lease_ids: Vec<String>,
+        reason: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

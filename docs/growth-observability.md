@@ -1015,7 +1015,7 @@ A digest stored before P7 reads both halves as `arrives_with: P7`.
 
 | Setting | Env | Default | Effect |
 |---|---|---|---|
-| `growth.github_repo` | `ROOMLER__GROWTH__GITHUB_REPO` | `gjovanov/roomler-ai` | the repository read; anything that is not `owner/name` (GitHub's characters only) switches the puller off ([`settings.rs:784`](../crates/config/src/settings.rs)) |
+| `growth.github_repo` | `ROOMLER__GROWTH__GITHUB_REPO` | `gjovanov/roomler-ai` | the repository read; anything that is not `owner/name` (GitHub's characters only) switches the puller off ([`settings.rs:791`](../crates/config/src/settings.rs)) |
 | `growth.github_api_url` | `ROOMLER__GROWTH__GITHUB_API_URL` | `https://api.github.com` | only a test changes it |
 | `growth.github_token` | `ROOMLER__GROWTH__GITHUB_TOKEN` | empty | the traffic's token, sent on the three traffic requests and nothing else; never logged, never in a pull row's error; empty ⇒ traffic "not measured" |
 

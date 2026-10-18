@@ -23,8 +23,12 @@
 //! | its field holding a value | `no_value` | yes |
 //! | a usable KEK | `unavailable` | yes |
 //! | Cedar's `secret:use` | `denied` | yes, with the request |
+//! | its version not past the `expires_at` its writer gave (P3-3c) | `no_value` | yes |
 //! | opened, and sealed to the device's key | `unavailable` | yes |
 //! | the allow recorded and the lease written | `undecided` | — |
+//!
+//! A lease ends at its TTL or at its version's `expires_at`, whichever comes
+//! first (P3-3c), and earlier when the vault takes it back ([`crate::revoke`]).
 //!
 //! ⚠️ A request is believed only from the device the session's RECORD places
 //! it on, at the record's fence — hive's identity rule for its own frames. A
@@ -61,6 +65,7 @@ use crate::crypto::{self, Binding};
 use crate::model::{VaultAuditEvent, VaultLease, VaultSecret};
 use crate::policy::{self, Ask, DeviceFacts, SecretFacts, SessionFacts, Verdict};
 use crate::policy_routes::decide_for_org;
+use crate::revoke;
 use crate::rrn;
 
 /// The modes a lease may be asked in: those that hand the daemon the STORED
@@ -172,11 +177,23 @@ impl AgentSocketLifecycle for LeaseSocket {
             rx,
             ctx.tx.downgrade(),
         ));
+        // P3-3c — the connection a revocation is told on, and what this
+        // device missed while it was away.
+        self.state
+            .revoker
+            .link(ctx.agent_id, &ctx.conn_id, ctx.tx.downgrade());
+        tokio::spawn(revoke::reconcile(self.state.clone(), ctx.agent_id));
     }
 
     /// Dropping the sender ends the answering task once its queue is empty.
     async fn closing(&self, ctx: &AgentCtx) {
         self.conns.remove(&ctx.conn_id);
+    }
+
+    /// P3-3c — this pod stops looking after the device, unless a newer
+    /// connection of it already took over.
+    async fn closed(&self, ctx: &AgentCtx, _removal_was_ours: bool) {
+        self.state.revoker.unlink(ctx.agent_id, &ctx.conn_id);
     }
 }
 
@@ -189,13 +206,17 @@ async fn answer_in_order(
 ) {
     while let Some(req) = rx.recv().await {
         let answer = match lease(&state, conn, &req).await {
-            Ok(l) => ServerMsg::VaultLeased {
-                req_id: req.req_id.clone(),
-                lease_id: l.lease_id.to_hex(),
-                n: l.n,
-                sealed: base64::engine::general_purpose::STANDARD.encode(&l.sealed),
-                expires_at_ms: l.expires_at.timestamp_millis(),
-            },
+            Ok(l) => {
+                // P3-3c — swept from now on, while the lease is live.
+                state.revoker.hold(conn.device_id);
+                ServerMsg::VaultLeased {
+                    req_id: req.req_id.clone(),
+                    lease_id: l.lease_id.to_hex(),
+                    n: l.n,
+                    sealed: base64::engine::general_purpose::STANDARD.encode(&l.sealed),
+                    expires_at_ms: l.expires_at.timestamp_millis(),
+                }
+            }
             Err(why) => refusal(&req.req_id, why),
         };
         let Some(tx) = tx.upgrade() else { break };
@@ -239,8 +260,8 @@ fn within_bounds(req: &LeaseRequest) -> bool {
 }
 
 /// The statuses a session is leased in: from its start until a stop is
-/// ordered.
-fn leasable(status: SessionStatus) -> bool {
+/// ordered. P3-3c revokes a lease once its session is past them.
+pub(crate) fn leasable(status: SessionStatus) -> bool {
     matches!(
         status,
         SessionStatus::Starting
@@ -542,6 +563,12 @@ async fn decide_and_release(
                 .await);
         }
     };
+    // P3-3c — a version past the `expires_at` its writer gave is never
+    // released (P3-1 promised it of the first step to use a value, and P3-3b
+    // did not keep the promise).
+    if version.expires_at.is_some_and(|t| t <= DateTime::now()) {
+        return Err(rec.refuse(LeaseRefusal::NoValue, "version_expired").await);
+    }
     let at = Binding {
         tenant_id: tid,
         secret_id,
@@ -575,7 +602,15 @@ async fn decide_and_release(
         return Err(LeaseRefusal::Undecided);
     }
     let issued_at = DateTime::now();
-    let expires_at = DateTime::from_millis(issued_at.timestamp_millis() + i64::from(ttl) * 1000);
+    let mut expires_at =
+        DateTime::from_millis(issued_at.timestamp_millis() + i64::from(ttl) * 1000);
+    // P3-3c — and no lease outlives its version: a policy that read the
+    // asked TTL allowed at least this much.
+    if let Some(until) = version.expires_at
+        && until < expires_at
+    {
+        expires_at = until;
+    }
     let row = VaultLease {
         id: Some(lease_id),
         tenant_id: tid,
