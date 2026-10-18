@@ -72,6 +72,11 @@ mod enroll_key_tests;
 mod ephemeral_tests;
 #[cfg(test)]
 mod exec_service_tests;
+// FR-52 P3c — the loopback proof: an outsider logs into the REAL agent through
+// the server. ⚠️ A test file that is not registered here compiles green and
+// runs nothing (P1 shipped one that way for a day).
+#[cfg(test)]
+mod extauth_tests;
 #[cfg(test)]
 mod external_access_tests;
 /// FR-102 P6 — the purestat puller (seven closed days frozen once, a frozen

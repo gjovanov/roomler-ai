@@ -1,8 +1,9 @@
 # FR-52: Cross-org remote access — an outsider, a device password, and a server that cannot use it
 
 **Issue:** [#1100](https://github.com/gjovanov/roomler-ai/issues/1100) ·
-**Status:** proposed · **Owner:** remote-control (pillar 1) + control plane ·
-**Anchors verified against master `8a03ff0d`** (re-verified after FR-69)
+**Status:** in progress — P1 · P2a–c · P3a–d shipped: an outsider can PROVE the password to a device through the server, from any pod, but **no session follows yet** (P4) ·
+**Owner:** remote-control (pillar 1) + control plane ·
+**Anchors verified against master `41425700`** (re-verified after FR-69)
 
 The gap TeamViewer and AnyDesk fill and roomler does not: someone **outside the
 organization** views and controls a device, authorised by a password the device
@@ -154,10 +155,40 @@ learn the password, mount an offline attack on it, replay a captured proof, or
 impersonate the device in order to harvest it. That is the textbook case for an
 **augmented PAKE**.
 
-**Decision: OPAQUE.** `opaque-ke` on the agent, `@cloudflare/opaque-ts` in the
-browser — ristretto255, no big-integer modexp, both maintained. SRP-6a has the same
-properties on paper and a long history of implementation footguns (parameter
-validation, `B = 0`, group choice); the modexp would also land in the browser bundle.
+**Decision: OPAQUE.** `opaque-ke` 4.0 on the agent and **`@serenity-kit/opaque`**
+in the browser — which is opaque-ke 4.0 itself compiled to WASM, so the two speak
+RFC 9807 by construction rather than by agreement. Ristretto255, TripleDH over
+SHA-512, Argon2id. SRP-6a has the same properties on paper and a long history of
+implementation footguns (parameter validation, `B = 0`, group choice); the modexp
+would also land in the browser bundle.
+
+> ⚠️ **Corrected in P3a (2026-09-24).** This section originally named
+> `@cloudflare/opaque-ts`. That library implements **draft v07** with **scrypt** —
+> not RFC 9807, not Argon2id — so it cannot log into an opaque-ke 4.x device at all.
+> Checked against its repository, not assumed.
+
+### 4-0. The parameters are a wire surface, and they are pinned
+
+The key-stretching function runs on the **client** — on the device at registration
+(it plays both halves) and in the outsider's browser at every login. Both must use
+byte-identical Argon2id parameters or the right password is refused. They are
+pinned in `external_access::PinnedArgon2`, whose `Default` *is* the pinned instance
+because opaque-ke falls back to `CS::Ksf::default()` whenever a caller omits the KSF:
+
+| Parameter | Value | Why |
+|---|---|---|
+| algorithm / version | Argon2id / 0x13 | RFC 9106 |
+| memory | 2^16 KiB (64 MiB) | the browser library's **default** ("memory-constrained", RFC 9106 §4) — the connect page passes no option, so there is no second copy to drift |
+| passes / lanes | 3 / 4 | same preset |
+| salt | 16 zero bytes | opaque-ke's convention; OPAQUE salts through the OPRF |
+
+⚠️ **Measured, not argued.** P2b had used `argon2::Argon2::default()` (19 MiB, 2
+passes, 1 lane). The real browser client, typing the **correct** password, could not
+log into a device registered that way — `KE2 did not verify`. After pinning, the
+same client logged in and both sides derived the same session key. A known-answer
+test computed by an *independent* Argon2id (OpenSSL, via Node 24) locks the bytes.
+The Argon2 is also `opaque_ke::argon2` now, not the workspace crate the server
+hashes user passwords with, so a workspace bump cannot move a device's record.
 
 | # | Outsider's browser | Server | Device |
 |---|---|---|---|
@@ -199,6 +230,26 @@ The backoff and lockout that make a 4-word password survivable are gate-4 state,
 they live where gate 4 lives. A server-side counter does not survive the threat this
 gate exists for. Server-side per-(principal, code) ceilings ride
 `crates/api/src/rate_limit.rs:52` as a *second* limit, not the only one.
+
+⚠️⚠️ **A guess is counted when KE1 is ANSWERED — never when KE3 fails.** In OPAQUE
+the *client* learns whether its password is right while opening KE2, before a KE3
+exists. A guessing client stops there, so the device never receives a failure to
+count. Measured with the real browser library (2026-09-24): wrong password ⇒
+`KE2 did not verify` on the client and an **abandoned** login on the device — no
+KE3, no failure event, nothing. A throttle keyed on failed KE3s would record zero
+failures from an attacker trying passwords as fast as the server relays them.
+
+So: every KE2 the device serves is debited against the budget; a KE3 that verifies
+refunds it. Two properties follow and must be kept:
+
+- The debit happens **before** the device answers, and an exhausted budget answers
+  nothing at all — a refusal that still carried a KE2 would still be an oracle.
+- Serving KE1 is cheap for the device (one OPRF evaluation and the 3DH — Argon2 is
+  the *client's* cost), so the throttle is about guesses, not CPU; it should not be
+  tuned as if it were DoS protection.
+
+Locked by `a_wrong_password_is_decided_at_ke2_so_the_device_never_sees_a_failure`,
+which fails loudly if the protocol property it relies on ever stops holding.
 
 ## 5. Addressing: how an outsider names a device
 
@@ -273,8 +324,12 @@ CAS. P6 follows it rather than inventing one.
 |---|---|---|---|
 | P1 | Addressing + policy, **no access path**: connect code (globally unique, rotatable), the org switch, `external_access_policy`, admin UI, `external_rc_audit` (90 d TTL). `decide_approval()` returns `Result<(), ExternalRcDenyReason>` so one place records both arms. | `external_rc_enabled = false` (default) | **SHIPPED** — 19 unit + 10 route + 6 integration tests, two guards falsified |
 | P2a | **The device can SAY it understands cross-org access, and opt in.** `RpcCap::ExternalAccess` on the hello (unconditional — a BUILD property, the `config` reasoning, never derived from the opt-in) + `external_access_enabled` (gate 3, default off) with its config-surface entry. The whole `external_*` surface is absent from `DesiredConfig`, guarded by a PREFIX test (FR-19's `relay_*` rule). ⚠️ Without this, gate 2 refuses EVERY device — no agent advertises the verb — so P1 is field-unverifiable until it lands. | `external_access_enabled = false` (default) | **SHIPPED** — both guards falsified |
-| P2b | The device-side CREDENTIAL: the OPAQUE registration record, `external_consent_mode`, `external_max_permissions`, `roomler rc password set\|clear\|status`, companion UI. Registration runs on the device (it holds the password momentarily); the dashboard may show *set / not set* and may CLEAR, never set. | the P2a flag | not started |
-| P3 | The handshake: `rc:extauth.*` frames, server as blind relay, agent-side verify + backoff. **Proven on loopback against the real agent first**, as FR-19's bind handshake was. | P2's flag; no client surface ships | not started |
+| P2b | The device-side CREDENTIAL as a *type*: the OPAQUE suite (Ristretto255 · TripleDh · **Argon2id** Ksf), the registration record, `external_consent_mode`, `external_max_permissions`. Registration runs entirely on the device — it plays both halves, nothing crosses a network — which is *why* the dashboard can show *set / not set* and CLEAR but never SET. | `external-access` feature, off in every release build | **SHIPPED** — 7 unit tests incl. a full login round-trip |
+| P2c | The way to actually set one: `roomler rc password set\|clear\|status` over a new LocalAPI verb, and the length floor. Registration + persistence happen in the DAEMON (it owns the config path and the write lock); the CLI only carries the plaintext across the local pipe, the same channel and the same authority that already flips `exec_enabled`. ⚠️ No `--password` flag, ever — argv is world-readable through `/proc/<pid>/cmdline`. | the P2a flag; nothing verifies the record until P3 | **SHIPPED** — 6 unit tests, incl. the surface allowlist and the derived-`Debug` leak |
+| P3a | **The compatibility surface, fixed before any wire exists.** Pinned KSF (`PinnedArgon2`, §4-0), the device's login half (`login_start` KE1→KE2, `login_finish` KE3→session key), and a cross-implementation harness (`examples/extauth_interop.rs`). **Proven against the real browser library**: RED with the old crate-default KSF (the correct password refused), GREEN after pinning with both sides deriving the same session key, and a wrong password decided at KE2 with no KE3 ever sent — the measurement §4b's counting rule rests on. Corrected the spec's browser library (`@cloudflare/opaque-ts` is draft-07 + scrypt; cannot interoperate). | `external-access` feature, in no release build | **SHIPPED** |
+| P3b | The device's login **state machine** (`external_logins.rs`): guesses debited when a KE2 leaves the device (§4b), check-and-debit in ONE critical section (a concurrent burst cannot outrun it), a success refunds only its own guess, 5 free then 30 s doubling to a 1 h cap over a 24 h window, bounded pending/verified tables with TTLs, and a verified login retained **single-use** as `AppKey = HKDF-SHA512(session key, label ‖ attempt ‖ principal)` — the principal is bound after the login because the browser library binds no OPAQUE `context`. Known-answer test against an independent HKDF. Open decisions 6 + 7. | same | **SHIPPED** |
+| P3c | The wire: `rc:extauth.*` frames (4 client, 4 server; the device's refusal decoded leniently — anything present is a refusal), the server as a blind relay (`crates/modules/remote/src/extauth.rs`: byte-identical `unavailable` for no-such-code / gate 1 / gate 2 / offline, reply before the audit write, park-before-push, only the starter finishes, gates re-checked at KE3), the device's answer in **every** build (`agents/roomlerd/src/extauth.rs`: gate 3 and the record read LIVE from the config file, primary org only), and a `login` audit action. **Proven on loopback against the real agent**: `crates/tests/src/extauth_tests.rs`, 4 tests. ⚠️ **Single-pod only** — see P3d. | P2's flag; no client surface ships | **SHIPPED** |
+| P3d | **Cross-pod.** An outsider has NO tenant, so tenant affinity cannot put their socket on the pod holding the device, and `/ws` refuses a `tid` they are not a member of — in a 2-replica deployment roughly half of them land on a pod that cannot reach it. The landing pod re-resolves the connect code and forwards the raw frame ONCE over the PR-2 rc relay (`Hop::Origin` → `Hop::Relayed`, never relayed twice); the owner pod's `rc.cmd` handler routes it to the extauth relay with the proxy sender, whose pump already routes replies back to the browser's connection. `finish` resolves the code BEFORE the attempt table, because an attempt started cross-pod lives on the other pod. Proven by `an_outsider_on_the_other_pod_still_logs_in` (device on pod 1, outsider on pod 2), falsified by disabling the forward. | same | **SHIPPED** |
 | P4 | Session establishment: the external branch in `resolve_session_authz`, transport binding at offer time, external consent path, public `/connect` page. Permission ceiling enforced **at the agent**, not merely offered by the server. | revert the authz branch; gates 1–3 still refuse | not started |
 | P5 | Visibility + accounting: owner notification on a first-ever external session by a principal and on repeated failures; audit UI beside `SshAuditSection`; per-principal revocation; relay bytes metered to the device's tenant (F3); a plan limit. | n/a — read-only surfaces | not started |
 | P6 | Ad-hoc attended support: host generates a short one-time code from tray/CLI. **Same wire** — the one-time secret takes the password's place. | separate `external_rc_mode` value; independent of unattended access | not started |
@@ -288,7 +343,17 @@ CAS. P6 follows it rather than inventing one.
 - [ ] A server that is asked to start an external session **without** a client proof
       cannot: demonstrated by driving the mint path directly against a real agent.
 - [ ] The password never appears in any server-side log, request body, or collection.
-      Demonstrated by a capture of the full exchange.
+      Demonstrated by a capture of the full exchange. **The device-side half is
+      done (P2c)**: `an_external_password_persists_and_never_lands_in_the_config_file`
+      asserts it against the config file's RAW bytes, and
+      `a_password_never_prints_itself_through_debug` covers the daemon log by
+      making `Request`'s derived `Debug` safe. Both falsified. The *server*-side
+      half needs the P3 exchange to exist before it can be captured.
+- [x] A password cannot be SET from anywhere but the device. **P2c** — no server
+      route writes it, `config set` refuses both credential keys, and
+      `no_external_credential_key_is_editable_through_the_config_surface`
+      allowlists the editable `external_*` keys so the next one added has to be
+      defended rather than inherited. Falsified by registering the verifier.
 - [ ] An SDP offer whose DTLS fingerprint is not authenticated under `K` is refused
       by the agent (negative arm run explicitly — a pass with no failing arm proves
       nothing).
@@ -341,6 +406,19 @@ CAS. P6 follows it rather than inventing one.
    approver — a fleet admin holding no root-command grant — to buy a hurdle nothing
    depends on. A dedicated bit waits on the BigInt migration. Locked by
    `the_compound_gate_does_not_restrict_a_default_admin`, so the claim cannot rot.
+6. **The guess window is in memory (P3b), so a daemon restart forgives it.**
+   Persisting it would put a disk write on an attacker-driven path and a second
+   writer beside the config's lock; not persisting it costs at most one day's
+   budget per restart. An attacker cannot restart the daemon without local access or
+   a crash bug — and a crash bug that doubled as a budget reset is the case worth
+   watching for. Shipped in memory; revisit if the crash recorder ever shows a
+   restart loop correlated with external-login traffic.
+7. **There is no hard lockout (P3b), only a capped backoff.** A lockout that needs
+   the owner to re-arm it turns anyone who knows the connect code — which is dictated
+   aloud and is not a secret — into someone who can switch external access off at
+   will. The cap (≈34 answered guesses a day against a ≥12-character password) is
+   the trade. P5's owner notification on repeated failures is the complement: a
+   human learns of a sustained attack, and rotating the connect code ends it.
 
 ## 10. Out of scope
 
@@ -372,4 +450,15 @@ CAS. P6 follows it rather than inventing one.
 |---|---|---|---|
 | 2026-09-01 | branch `fr52-cross-org-remote-access` | P1 on the dev box: `cargo test -p roomler-ai-remote-control --lib` (223 pass, 19 new), `cargo test -p roomler-ai-api --lib` (290 pass; the one failure, `auth_rate_limit::tokens_refill_over_time`, is a load-timing flake — 3/3 green in isolation, and the file is untouched by this branch), `cargo test -p roomler-ai-tests -- external_access_tests` (6/6), `bun run build` + `bun run test:unit` (949 pass), `cargo fmt --check` and `cargo clippy --all-targets -D warnings` on the four touched crates | PASS |
 | 2026-09-01 | same | **Falsification.** Removed the `REMOTE_CONTROL` half of gate 2 and added `connect_code` to `AgentResponse`, then re-ran: exactly `approval_is_compound_…` and `…never_reaches_the_device_list` went red with the intended messages, the other four stayed green. Reverted; all 6 green again. A test that has never failed proves nothing. | PASS |
-| — | — | Nothing has run in the FIELD. P1 ships no access path, so there is nothing to field-verify yet; the first field row belongs to P3. | — |
+| 2026-09-23 | branch `fr52-p2b` | **P2c on the dev box.** `fmt` · `apply-spdx --check` · clippy (localapi + node-core + cli; roomlerd; roomlerd `--features external-access`) · `cargo check -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --all-targets` · 261 unit tests. Plus **natively on Windows**, which is the lane that matters here — `rpassword` compiles against the Windows console API and the WSL lane cannot see it (`librpassword-*.rlib` confirmed in the Windows `target/debug/deps`; forced clippy on `roomler-cli` + `roomler-localapi`, rc=0). | PASS |
+| 2026-09-23 | same | **Falsification, five guards.** floor → `len()`; a change → always mint a fresh `ServerSetup`; `Secret::Debug` → print the inner string; register `external_access_verifier` on the config surface; **leak the plaintext into another config field**. Each went RED with its own message and was reverted. The last is the end-to-end test asserting the password is absent from the config file's RAW bytes. | PASS |
+| 2026-09-23 | **live 0.4.99 SYSTEM service** | **`roomler rc password status` against a REAL, pre-P2c daemon.** The request reached the daemon and came back — proving transport and dispatch — but a daemon that does not know these verbs cannot *refuse* them, it cannot **parse** them, so serde answered `unknown variant …` followed by all 22 verb names it does know, and nothing actionable. Fixed: an additive hint naming the actual problem (daemon older than the CLI), with the raw error kept underneath, because matching a foreign library's wording must degrade to noise and never to a misdiagnosis. Exit code 1, as it should be. **No unit test could have produced this**; it is the reason a live run is not optional. | FIXED |
+| 2026-09-24 | branch `fr52-p2b` + P3a | **Cross-implementation interop, run 1 — the negative control, on the code as shipped in #1563.** `examples/extauth_interop.rs` (built natively on Windows) registers a password exactly as `rc password set` does and answers one login over stdio; the client is the real `@serenity-kit/opaque@1.1.0` under bun 1.4.1, library defaults. **Correct password → `finishLogin returned nothing — KE2 did not verify`**; the device saw an abandoned login. Cause: the device registered with `argon2::Argon2::default()` (19 MiB, t=2, p=1), the browser stretches with 64 MiB, t=3, p=4. | **FAIL — as predicted** |
+| 2026-09-24 | same, KSF pinned | **Run 2.** Same harness after `PinnedArgon2`. Correct password → client `finishLogin OK in 157 ms`, device `OK`, and `sha256(session key)` identical on both sides (`f579ee9c…`). Browser↔device login is proven with the real library, not inferred from a shared crate. | **PASS** |
+| 2026-09-24 | same | **Run 3 — wrong password.** Client: `KE2 did not verify` after 155 ms. Device: `FAIL abandoned: no KE3`. The client learns the answer from KE2 alone and the device never receives a failure — the measurement §4b's "debit at KE1" rule is built on. | **PASS** (the property holds) |
+| 2026-09-24 | P3a + P3b | **Falsification, four guards.** (a) KSF one pass fewer → the independent-Argon2id known-answer test RED. (b) **Release the lock during the OPAQUE step** (the "free the lock during crypto" refactor) → a 16-thread burst had **16 of 16** KE1s answered against a budget of 5, in 3 of 3 runs — not a few extra guesses, the throttle gone. (c) A success resets the streak → exactly `a_success_refunds_its_own_guess_not_the_streak` RED, 14 green. (d) **The obvious design — debit on a failed KE3** → **8 of 15** RED, including "an abandoned login is an answered guess — counting only failed KE3s counts nothing". All reverted. | PASS |
+| 2026-09-24 | P3c | **The loopback proof.** A real API server, the REAL `roomlerd` signalling loop (`external-access`) reading a real config file, an org-less account on a real user socket, opaque-ke standing in for the browser library P3a proved compatible. (1) Correct password → KE1 → device → KE2 → client → KE3 → device → **VERIFIED**, and a `login` row in the org's audit log. (2) Five wrong passwords, each decided in the client at KE2 and never finished → the sixth knock **throttled through the real server** (`retry_after_secs` 29: real time passed and the wait rounds up). (3) No-such-code, gate 1 off, gate 2 withdrawn → three byte-identical `{"t":"rc:extauth.result","refused":"unavailable"}`. (4) A stranger holding a valid KE3 for someone else's attempt → `unknown_attempt`, and the owner still verifies. Composition baseline: +12 / −0, exactly the eight wire names and four owners. | PASS |
+| 2026-09-24 | P3c | **Falsification of the two server properties**, one run, both mutations: a distinguishable gate refusal → the identical-refusals test RED (`other` ≠ `unavailable`); the server's starter check removed → the only-the-starter test RED (`rejected`, not `unknown_attempt`). Each mutation turned exactly its own test red. Note the second: with the server's check gone, the stranger's KE3 reached the device — and the **device's** principal check still refused it. Two independent layers, observed. | PASS |
+| 2026-09-24 | P3d | **Cross-pod, two pods over one bus** (`TestApp::spawn_pair`, a real Redis): the device homed on pod 1, the outsider's socket on pod 2. KE1 → relayed → the device → KE2 → back over the conn-addressed lane → KE3 → relayed → **VERIFIED** — including `finish`, whose attempt existed only on pod 1. **Falsified**: with the forward disabled, exactly this test fails (`unavailable` where the device's challenge was expected) and the four single-pod tests stay green, so it exercises the relay rather than a shared hub. The test announces `SKIPPED` without a bus instead of passing on nothing. | PASS |
+| 2026-09-24 | P3c prep | ⚠️ **Found while rebasing onto FR-83: no CI lane runs `roomler-ai-remote-control`'s unit tests.** Every "locked by test" guard in that crate — including `ssh_does_not_imply_ssh_consent` and this FR's own `DesiredConfig` prefix guard and `external_access_tests` — has only run locally; two FR-78 tests have been red there since Vulkan became a known backend. Separately, the ClientMsg owner-table test could not run on a Windows checkout at all (CRLF; fixed here). Reported, not fixed: adding the lane needs the FR-78 tests repaired first. | reported |
+| — | — | **Still unrun: an INSTALLED daemon.** The login loop against a real agent is now proven in-process (P3c, above), and the `rc password` LocalAPI path live against the installed service (P2c). What no run has touched is both on one installed host: the LocalAPI pipe name is a compile-time constant and the singleton instance lock stops a second daemon coexisting with the service, so it needs `external-access` in a release build. That belongs with P4 — the first phase whose feature an operator could actually use — not before it. | — |

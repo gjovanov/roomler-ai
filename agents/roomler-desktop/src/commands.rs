@@ -2003,14 +2003,23 @@ pub async fn cmd_recordings_view() -> RecordingsView {
 /// the user can write the config, exactly the value the daemon refused and
 /// hide why; and a daemon too old to know the key would ignore the file and
 /// be reported "in effect now".
+///
+/// FR-52 — and every `external_*` key, by prefix like `record_`: who may open
+/// this device to people OUTSIDE its organization is the console person's
+/// call, which only the daemon can check (the pipe admits RDP guests too).
+/// Writing the file after it refused would open gate 3 — or set how strangers
+/// are let in — against the daemon's word.
 fn is_daemon_owned_key(key: &str) -> bool {
-    key.starts_with("record_") || key == "files_dir"
+    key.starts_with("record_") || key == "files_dir" || key.starts_with("external_")
 }
 
 /// The words for a daemon-owned key's refusal.
 fn explain_daemon_owned_error(key: &str, message: &str) -> String {
     if key == "files_dir" {
         explain_files_dir_error(message)
+    } else if key.starts_with("external_") {
+        // The daemon's refusal already says who may change it.
+        message.to_string()
     } else {
         explain_recording_error(message)
     }
@@ -2862,6 +2871,21 @@ mod tests {
         // FR-84 D4 made `files_dir` daemon-owned as well (see
         // `a_daemon_refusal_of_files_dir_is_final`).
         assert!(is_daemon_owned_key("files_dir"));
+        // FR-52 — the external-access surface: the console person's call,
+        // which a write behind the daemon's back would route around.
+        for key in [
+            "external_access_enabled",
+            "external_consent_mode",
+            "external_max_permissions",
+        ] {
+            assert!(is_daemon_owned_key(key), "{key}");
+        }
+        let refusal = "only the person at this device's console can open it to people outside \
+                       the organization, or change how";
+        assert_eq!(
+            explain_daemon_owned_error("external_access_enabled", refusal),
+            refusal
+        );
     }
 
     /// FR-85 P3b — the remote gates come from the service's own listing, and

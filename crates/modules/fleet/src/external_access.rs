@@ -288,21 +288,52 @@ pub struct ExternalRcAuditView {
     pub expires_at: Option<String>,
     pub at: String,
     pub denied: Option<ExternalRcDenyReason>,
+    /// FR-52 P3 — `login` rows. Carried explicitly: this view is a hand-built
+    /// shape, so a field added to the event does not reach the API until it is
+    /// named here — and a login row without its outcome would read as a
+    /// verified login to anyone scanning the log.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_refused: Option<roomler_ai_remote_control::models::ExtauthRefusal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_detail: Option<String>,
 }
 
 impl From<ExternalRcAuditEvent> for ExternalRcAuditView {
     fn from(e: ExternalRcAuditEvent) -> Self {
+        // Destructured, not field-accessed, so a field added to the event is a
+        // compile error HERE instead of silently missing from every audit read.
+        let ExternalRcAuditEvent {
+            id,
+            tenant_id: _,
+            action,
+            agent_id,
+            user_id,
+            actor,
+            approved,
+            max_permissions,
+            expires_at,
+            at,
+            denied,
+            attempt_id,
+            login_refused,
+            login_detail,
+        } = e;
         Self {
-            id: e.id.map(|i| i.to_hex()),
-            action: e.action,
-            agent_id: e.agent_id.to_hex(),
-            user_id: e.user_id.to_hex(),
-            actor: e.actor,
-            approved: e.approved,
-            max_permissions: e.max_permissions,
-            expires_at: e.expires_at.map(fmt_dt),
-            at: fmt_dt(e.at),
-            denied: e.denied,
+            id: id.map(|i| i.to_hex()),
+            action,
+            agent_id: agent_id.to_hex(),
+            user_id: user_id.to_hex(),
+            actor,
+            approved,
+            max_permissions,
+            expires_at: expires_at.map(fmt_dt),
+            at: fmt_dt(at),
+            denied,
+            attempt_id,
+            login_refused,
+            login_detail,
         }
     }
 }
@@ -444,6 +475,9 @@ pub async fn set_policy(
         expires_at: requested.expires_at,
         at: DateTime::now(),
         denied: verdict.err(),
+        attempt_id: None,
+        login_refused: None,
+        login_detail: None,
     };
     if let Err(e) = state.external_rc_audit.record(event).await {
         // Best-effort, like the other decision logs: an audit insert must
@@ -527,6 +561,9 @@ pub async fn rotate_connect_code(
                     expires_at: None,
                     at: DateTime::now(),
                     denied: None,
+                    attempt_id: None,
+                    login_refused: None,
+                    login_detail: None,
                 };
                 if let Err(e) = state.external_rc_audit.record(event).await {
                     warn!(%e, "external access: audit write failed");
