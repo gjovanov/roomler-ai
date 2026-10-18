@@ -34,14 +34,14 @@ timeout; the command lives exactly as long as the channel does. Everything that 
 
 | What | Where | Why it blocks streaming |
 |---|---|---|
-| The SSH exec handler hands the command to the Fleet-RPC engine with the engine's maxima | `agents/roomlerd/src/ssh.rs:1887` `run_exec` → `:1933-1934` (`timeout_ms: MAX_TIMEOUT_MS`, `max_output_bytes: MAX_OUTPUT_BYTES`) → `:1940-1942` `run_fed` | the engine returns ONE `ExecOutcome` when the process is gone |
-| The whole output is sent after the run, then the ceiling notice | `ssh.rs:1948-1955`, `:1959-1971` | nothing reaches the channel while the command runs |
-| The engine re-clamps timeout and ceiling, takes the permit, registers cancel | `agents/roomlerd/src/exec.rs:931` `run_fed`, `:944-945` | the clamps are for a wire the server bounded; SSH never needed them |
-| Both pipes are drained into a `Vec` against ONE shared budget | `exec.rs:1109-1113`, `read_capped` `:1178` | the reader stops at the budget; past it the child dies of SIGPIPE / `ERROR_NO_DATA` |
-| The process waits in a `select!` over `wait` / `sleep(timeout)` / `cancel` | `exec.rs:1118-1131` | a fixed wall clock kills a long transfer |
-| Windows `console_user`: `CreateProcessAsUserW` with three pipes, two blocking drain threads to EOF | `exec.rs:1878` `win_console::run`, `:1946-1949`; `agents/roomlerd/src/win_service/supervisor.rs:1835` `spawn_in_session_captured`, `:2035` `read_pipe_to_end` | the drain is "read everything, then return" — but the pipes are there; only the drain shape buffers |
-| The one-hour blocking `wait_for_exit` backstop | `exec.rs:1975-1977` | sized against `MAX_TIMEOUT_MS`; a command with no wall clock can outlive it |
-| The pty path streams with no ceiling and no timeout, and its lifetime is the channel's | `ssh.rs:1094` `start_pty_session`, the pump `:1193-1218` | the shape exec should have, minus the terminal |
+| The SSH exec handler hands the command to the Fleet-RPC engine with the engine's maxima | `agents/roomlerd/src/ssh.rs:1980` `run_exec` → `:2026-2027` (`timeout_ms: MAX_TIMEOUT_MS`, `max_output_bytes: MAX_OUTPUT_BYTES`) → `:2033-2035` `run_fed` | the engine returns ONE `ExecOutcome` when the process is gone |
+| The whole output is sent after the run, then the ceiling notice | `ssh.rs:2041-2048`, `:2052-2064` | nothing reaches the channel while the command runs |
+| The engine re-clamps timeout and ceiling, takes the permit, registers cancel | `agents/roomlerd/src/exec.rs:962` `run_fed`, `:975-976` | the clamps are for a wire the server bounded; SSH never needed them |
+| Both pipes are drained into a `Vec` against ONE shared budget | `exec.rs:1140-1144`, `read_capped` `:1209` | the reader stops at the budget; past it the child dies of SIGPIPE / `ERROR_NO_DATA` |
+| The process waits in a `select!` over `wait` / `sleep(timeout)` / `cancel` | `exec.rs:1149-1162` | a fixed wall clock kills a long transfer |
+| Windows `console_user`: `CreateProcessAsUserW` with three pipes, two blocking drain threads to EOF | `exec.rs:1909` `win_console::run`, `:1977-1980`; `agents/roomlerd/src/win_service/supervisor.rs:1835` `spawn_in_session_captured`, `:2035` `read_pipe_to_end` | the drain is "read everything, then return" — but the pipes are there; only the drain shape buffers |
+| The one-hour blocking `wait_for_exit` backstop | `exec.rs:2006-2008` | sized against `MAX_TIMEOUT_MS`; a command with no wall clock can outlive it |
+| The pty path streams with no ceiling and no timeout, and its lifetime is the channel's | `ssh.rs:1094` `start_pty_session`, the pump `:1200-1233` | the shape exec should have, minus the terminal |
 | The session deadline's doc says an exec in flight "is bounded by the engine's own wall-clock ceiling" | `ssh.rs:819-823`, `arm_session_deadline` `:850` | true today, false after this — the disconnect must cancel the command |
 | `docs/roomler-ssh.md:580-584` | "`CreateProcessAsUserW`'s streaming form currently only exists in the pty's pseudoconsole path — there is no pipes variant yet" | outdated since P5b: `spawn_in_session_captured` IS the pipes variant; it drained to EOF, and now it streams |
 
@@ -212,8 +212,10 @@ cancelled, refused) is **1**. `exit-status` is sent only after the pump has deli
    decided.*
 2. **Server-settable?** Recommendation: no (D5). Say if an org needs to switch a fleet back without touching
    each device. *Recommendation stands. Not yet decided.*
-3. **`sftp` as `console_user` on Windows** can now ride the same piped spawn. Follow-up FR, or a P3 here?
-   *Recommendation: a follow-up FR. Not yet decided.*
+3. ~~**`sftp` as `console_user` on Windows** can now ride the same piped spawn. Follow-up FR, or a P3 here?~~
+   **Settled as a follow-up: [FR-97](FR-97-os-feature-parity.md) P4b** ([#2082](https://github.com/gjovanov/roomler-ai/issues/2082))
+   runs `sftp-server` as the console user through this spawn, with raw (unredacted) bytes, in the person's
+   profile. `docs/roomler-ssh.md` (*File transfer*) has the mechanics.
 4. ~~**Default on for the first release**, with the switch as the fallback — or off for one release first?~~
    **Decided (Goran, 2026-10-07): default ON** — `ssh_exec_streaming = true` ships in the first release
    (0.4.117); the switch is the fallback. "Make ssh streaming default (merge, deploy, field test)."
@@ -222,7 +224,7 @@ cancelled, refused) is **1**. `exit-status` is sent only after the pump has deli
 
 - The pty path (unchanged; it already streams).
 - Streaming for Fleet RPC (`rc:rpc.exec` is a request/response wire; its audit row stores the output).
-- `sftp`/`scp` as a Windows non-daemon account (decision 3).
+- `sftp`/`scp` as a Windows non-daemon account (decision 3; `console_user` since FR-97 P4b).
 - `-R` (still deliberately not implemented).
 - Recording any session content (never).
 

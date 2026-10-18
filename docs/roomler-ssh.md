@@ -123,8 +123,8 @@ can be pinned out of band.
   UTF-8 arrived as U+FFFD: a 4.4 MB MP4 came back as 1.9 MB of noise. ⚠️ And
   until FR-89 it was **capped at 1 MiB** (the engine's Fleet-RPC ceiling): the
   command was cut off mid-write, died of SIGPIPE, and `ssh` exited 1 — on the
-  `console_user` corporate laptops, where `scp`/`sftp` refuse, nothing could
-  move a file over 1 MiB.
+  `console_user` corporate laptops, where `scp`/`sftp` refused until FR-97 P4b,
+  nothing could move a file over 1 MiB.
   **The client's stdin reaches the command** ([#1747](https://github.com/gjovanov/roomler-ai/issues/1747)):
   `ssh <node> 'cat > f' < file`, `tar c . | ssh <node> 'tar x'` and
   `ssh <node> 'sh -s' < script` work, and the client's EOF ends the input.
@@ -791,18 +791,58 @@ second, weaker privilege story for the one subsystem that exists to touch
 files. Same `apply_run_as`, same consent gate, same identity — and roomler
 never parses an SFTP packet.
 
-⚠️ **Windows non-daemon accounts refuse.** Spawning as another user there needs
-`CreateProcessAsUserW`. Its piped form *does* exist — `exec`'s console-user
-path has used `supervisor::spawn_in_session_captured` since P5b, and since
-FR-89 that drain streams — but this subsystem spawns `sftp-server` through
-`tokio::process`, which cannot take a token, and is not wired to that spawn
-yet (FR-89, open decision 3). Running the transfer as SYSTEM instead would be
-the dangerous answer, so it refuses and says so. Unix (all modes) and
-Windows-as-daemon work; **corplap does not get scp yet** — but
-`ssh <node> 'cat f' > f` and `ssh <node> 'cat > f' < f` stream a file whole
-there, as the signed-in user. (An earlier version of this note said the
-streaming form existed only in the pty's pseudoconsole path; that was outdated
-the day P5b shipped.)
+Which spawn serves the subsystem follows from the session's resolved identity:
+
+```mermaid
+flowchart TD
+  S["subsystem sftp<br/>gates passed, consent settled"] --> R{"run_as"}
+  R -->|"daemon · Unix named"| T["tokio::process + apply_run_as<br/>Unix: setgroups → setgid → setuid"]
+  R -->|"Windows named"| X["refused: becoming an arbitrary<br/>Windows account needs its credentials"]
+  R -->|"Windows console_user"| C["exec's console-user spawn<br/>WTSQueryUserToken → CreateProcessAsUserW"]
+  T --> Q["sftp-server as the session's account"]
+  C --> P["sftp-server as the signed-in person<br/>path only · raw bytes · their profile"]
+```
+
+⚠️ **Windows `console_user` takes `exec`'s console-user spawn** (FR-97 P4b,
+`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:875`).
+`tokio::process` cannot take a token, so the subsystem goes through
+`supervisor::spawn_in_session_captured`, the piped `CreateProcessAsUserW` spawn
+P5b built and FR-89 made streaming. Three details differ from a shell command
+on that spawn, and each one matters:
+
+| What | Why |
+|---|---|
+| The command line is the **quoted path alone**: no shell, no argument | nothing a client sends can become an argument |
+| The output is **raw, never redacted** | redaction rewrites text that looks like a secret, and inside a binary SFTP stream that is corruption |
+| It starts in the person's **profile** (`GetUserProfileDirectoryW`, on the token the child runs under) | OpenSSH starts it there, and a client resolves every relative path against where it started. A service starts in System32, so `scp f <node>:` would aim at a folder the person cannot write |
+
+The client gets the exit status, then EOF, then close, in that order (`scp`
+reads the status as its verdict on the whole transfer; see below). Like every
+console-user spawn it needs a caller that may read the console user's token
+(SYSTEM: the SystemContext worker or the service), and elsewhere it refuses
+with the reason, as `exec` does. A `named` account still refuses on Windows,
+because becoming an arbitrary user there needs that user's credentials.
+Running the transfer as SYSTEM is never the fallback. The device still needs
+OpenSSH's `sftp-server.exe`, which Windows installs with the optional OpenSSH
+Server feature: two of the three corporate laptops measured on 2026-10-18 have
+it, and the third has only the client. Without it the subsystem refuses as
+below.
+
+Kill switch: `ROOMLERD_SFTP_AS_USER=0` puts the pre-P4b refusal back. On a
+Windows service install, set it with
+`roomlerd set-service-env-var --name ROOMLERD_SFTP_AS_USER --value 0`, then
+restart the service. The SystemContext worker inherits the service's
+environment, so a machine-wide variable reaches it only after a reboot.
+⚠️ Never replace the service's registry `Environment` value by hand. On a
+SystemContext install it already holds `ROOMLERD_ENABLE_SYSTEM_SWAP=1`.
+Overwriting it turned a test device into a user-context one, whose worker,
+enrolled machine-wide, exited at once with `no config found`.
+`set-service-env-var` edits one entry and keeps the rest.
+
+Until P4b this subsystem refused every Windows non-daemon account (FR-89, open
+decision 3), so the `console_user` corporate laptops had no `scp`. There,
+`ssh <node> 'cat f' > f` and `ssh <node> 'cat > f' < f` stream a file whole as
+the signed-in user, and still work.
 
 ⚠️ **No `sftp-server` binary ⇒ refuse**, naming what to install. The probe
 covers Debian/RHEL/Arch/macOS/Windows layouts; `ROOMLER_SFTP_SERVER` overrides
@@ -812,6 +852,23 @@ channel — SFTP is binary and injected text corrupts a transfer.
 Field-proven 2026-08-22, buildhost → fleet-host-1: an `sftp put` landed
 `-rw-r--r-- root root` (matching `ssh_account_mode = daemon`), and `scp`
 round-tripped a file byte-identical in both directions.
+
+Field-proven for Windows `console_user` 2026-10-18 (FR-97 P4b) on a throwaway
+Win11 SystemContext guest, from stock OpenSSH 10 over the mesh with a key in
+the device's `ssh_authorized_keys`. On 0.4.142 the key authenticated, a command
+ran as the person, and `sftp` and `scp` were refused (exit 255). On P4b:
+
+- `pwd` said `/C:/Users/vmtest`, and a relative `put` landed there;
+- an 8 MiB file came back byte-identical over `sftp` and over `scp` (both exit 0);
+- both files on the device were owned by the signed-in account, not SYSTEM;
+- a client killed mid-upload left no `sftp-server` running (`cancelled by the caller`);
+- the kill switch brought the refusal back.
+
+⚠️ Dial roomler's port, `ssh_port` (2222 by default; 2223 is the SYSTEM
+service's, FR-105). On a device that runs its own `sshd`, port 22 over the mesh
+reaches that server, which offers passwords too. A "Permission denied
+(publickey,password,keyboard-interactive)" is that `sshd` answering, not
+roomler. The first P4b run dialled 22 and met exactly that.
 
 ### Port forwarding — `-L`, `-J`, `-W` (P7b — shipped)
 
@@ -1060,6 +1117,7 @@ unaffected (it passes via the `ADMINISTRATOR` bypass).
 | P6b | `roomler ssh <name>` — ephemeral keypair → grant → verify against the published key → hand off to the system `ssh` | **shipped** rc.446, field-proven buildhost→corplap |
 | P6c | `roomler proxy` — stdio `ProxyCommand`, so stock `ssh`/`scp`/`rsync`/`git` reach devices BY NAME | **shipped** |
 | P7a | SFTP subsystem — `sftp` and `scp` | **shipped** rc.450, field-proven buildhost→fleet-host-1 |
+| FR-97 P4b | SFTP and `scp` as the Windows `console_user`, through `exec`'s console-user spawn: raw bytes, the person's profile | **in review** [#2082](https://github.com/gjovanov/roomler-ai/issues/2082) |
 | P7b | `-L` / `-J` / `-W` via `direct-tcpip`, default-deny on `forward_acl`. **`-R` deliberately not implemented** — it would make the device bind a listening socket | **shipped** |
 | P8a | Session **activity** log — commands + exit codes, shell/SFTP/forward events, device-reported into `ssh_activity`. Deliberately NOT session content | **shipped** |
 | P8b | Admin UI for the activity feed — `SshActivitySection`, under the audit log in org Settings | **shipped** |

@@ -404,7 +404,7 @@ already share. No second spawn path.
 
 | OS | How | Consequence |
 |---|---|---|
-| Linux, macOS | `RunAs::Named(account)`: `setgroups → setgid → setuid` in `pre_exec`, verified afterwards (`exec.rs:732-762`); uid-0 accounts refused | any mapped account, signed in or not |
+| Linux, macOS | `RunAs::Named(account)`: `setgroups → setgid → setuid` in `pre_exec`, verified afterwards (`exec.rs:732-764`); uid-0 accounts refused | any mapped account, signed in or not |
 | Windows | the console user, through `WTSQueryUserToken` + `CreateProcessAsUserW` (`agents/roomlerd/src/pty/windows.rs:690-762`) | ⚠️ only the user signed in at the console (D2). There is no S4U or `LogonUser` path, and the daemon "will not ask for" credentials (`exec.rs:503-508`). Nobody signed in ⇒ `refused: no_console_user` |
 
 Two gaps in that path: it sets no working directory and only `TERM` in the environment
