@@ -9,6 +9,7 @@ tags: [teamviewer, remote-desktop, open-source, self-hosting, unattended-access]
 hero: teamviewer-alternative-tour.png
 heroAlt: The Roomler viewer in a browser tab showing a MacBook's desktop, next to the words TeamViewer alternative, open source, in a browser tab
 related: [/blog/self-hosted-teamviewer-alternative/, /docs/start/quickstart/, /docs/compare/teamviewer/]
+syndication: https://medium.com/@gjovanov/teamviewer-on-wheels-a-tour-of-the-remote-desktop-my-wifes-swearing-built-90b5811774f7
 ---
 *Full disclosure: this one is different from my last story. An AI assistant drafted it in my voice from the transcript of our new video, and I read it and signed it off before it went out. The swearing in my last story was 100% human.*
 
