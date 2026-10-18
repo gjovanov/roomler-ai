@@ -15,8 +15,9 @@ the desktop's own stop control ends the session) are in **0.4.137** (released 20
 P3i (#2278, KWin's `AB24` scanout), P4c, P5i, P6h, P6i
 and #2286 (the banner pinned to the top) are in **0.4.139** (released 2026-10-16 from `d11fe94ae`), which passed
 AC12 on real Asahi hardware (step log 93).
-Ticked: AC1–AC6, AC8–AC10, AC12, AC13, AC14. AC7's last event, the wake, waits for P5j's viewer to be
-promoted (lab-green with a candidate bundle, 2026-10-18). The operator approved the
+Ticked: every criterion. AC7 and AC11 were ticked on 2026-10-18: P5j's viewer was promoted
+(`hosted-20261018-df4803f`) and passed the wake on prod's viewer, and a Windows and a macOS session ran on the
+released 0.4.143. ✅ **Closed 2026-10-18.** The operator approved the
 plan and P0 (the
 lab on zeus, enrolled in the vmtest org: D2, D8). **D1 is decided: split.** Per-user installs go auto, system installs
 stay opt-in until a non-Debian companion ships. D3 waits for P3 · **Owner:** remote desktop (agent + viewer), vmtest (`roomler-ai-deploy`) ·
@@ -678,7 +679,7 @@ bridge for text and images in the lab before deciding.
 | ↳ P5g | a session opened during a user switch waits for it: logind's `State` tells a session in the background from a logout, the plan goes automatic for it (`OwnSession::Away`), and the open waits for the session to be on screen again before either arm (`wait_while_away`), the controller told `session_away`; an open's hook fires once per wait, so the unlock that GNOME's *Switch User* adds is told too (`linux-capture.md` §5.6) | `wayland_auto` (the automatic plan); the wait engages only where both arms would refuse | ✅ lab (`2156850a5`), GNOME 50 per-user, the viewer connecting while GDM's login screen held the seat. **🔴 before** (`b7d33af1e`, the release's plan): `wayland_not_enabled`, and no picture after the switch back. **P5g:** `session_away` at connect, held 45 s, a picture 1.6 s after the switch back; GNOME's *Switch User* (a lock, then the login screen): `session_away`, then the unlock notice 1.1 s after the switch back, then a picture 1.2 s after the unlock | S |
 | ↳ P5h | a computer going to sleep says so: while a session is live the daemon holds a logind **delay** inhibitor on sleep, never taken while a sleep is under way; on `PrepareForSleep(true)` every live session's controller is told `rc:media-waiting` `host_sleep` over its own control channel, then the inhibitor goes; the viewer words it (*This computer is going to sleep.*) (`linux-capture.md` §5.8) | `ROOMLERD_SLEEP_NOTICE=0`; `ROOMLERD_MEDIA_WAITING=0` silences it too | ✅ lab (`a81dfcf8c`, then `eb330543d`), KDE and GNOME per-user, suspend-to-RAM on. **🔴 0.4.136:** GNOME dropped 5.6 s into the suspend and named nothing for the whole sleep; KDE read *Reconnecting* 8 s in. **P5h:** the notice 1.9 s (KDE) and 1.5 s (GNOME) before the guest slept, sent 44 ms and 92 ms ahead of NetworkManager's teardown. The first candidate re-took the inhibitor during the sleep and logind refused it (`OperationInProgress`); the second takes none until the wake | S |
 | ↳ P5i | a portal stream that never sends a frame says how far it got: the helper logs each PipeWire stream state as it changes, and the open's *"no frame arrived before the deadline"* names the state the stream reached (`linux-capture.md` §4.8) | — (two log lines and words in an error) | ✅ real hardware (AC12's box, Plasma 6.6, per-user; lab builds `1c93d5944` and this one). The case that needed it: after one spell on that box, **every** new KDE stream stayed `paused` — KWin, the PipeWire driver, never triggered a frame — and each open failed at the 15 s deadline; on a fresh KWin the same still desktop went `paused → streaming` in 28 ms. **Refuted fixes, kept:** the stuck state was not a still screen (a fresh KWin streams one at once), and moving the pointer through the portal, a 30-px real move, KWin's `reconfigure` and a notification popup all left the stream `paused`. A daemon restart in mid-stream did not reproduce it. Only a new KWin (the user's every session ended) cleared it | S |
-| ↳ P5j | a computer going to sleep keeps saying so through the viewer's redial (AC7's wake). The redial's teardown cleared P5h's `host_sleep` notice, and a request to a sleeping computer sits in `awaiting_consent` (the server waits for an answer the computer cannot give), so the stage read *Waiting for the agent to allow the connection…* until the computer was back: 48 s that named no reason, the last 19 after the wake. Now the redial keeps it (`waitKeptAcrossReconnect`, its deadline spent so the stall watchdog is not held), the stage shows it in every redial phase with the phase's own words under it, and a session that connects ends it (`isKeptSleepNotice`); the next session's own report or frame replaces it | — (the viewer: the previous bundle) | ✅ lab, a candidate bundle served on the real origin against the released 0.4.142 agent, the per-user guests in S3: the wake named at +0.1 s (GNOME) and +0.3 s (KDE), continuously, until the new session named its own wait: GNOME's lock 10.1 s after the wake, KDE's share request 19.8 s after it. 🔴 first with prod's viewer: nothing named from 10.7 s into the sleep until 19.4 s after the wake (GNOME), and from 8.3 s into it until 25.2 s after (KDE) (AC7) | S |
+| ↳ P5j | a computer going to sleep keeps saying so through the viewer's redial (AC7's wake). The redial's teardown cleared P5h's `host_sleep` notice, and a request to a sleeping computer sits in `awaiting_consent` (the server waits for an answer the computer cannot give), so the stage read *Waiting for the agent to allow the connection…* until the computer was back: 48 s that named no reason, the last 19 after the wake. Now the redial keeps it (`waitKeptAcrossReconnect`, its deadline spent so the stall watchdog is not held), the stage shows it in every redial phase with the phase's own words under it, and a session that connects ends it (`isKeptSleepNotice`); the next session's own report or frame replaces it | — (the viewer: the previous bundle) | ✅ lab, a candidate bundle served on the real origin against the released 0.4.142 agent, the per-user guests in S3: the wake named at +0.1 s (GNOME) and +0.3 s (KDE), continuously, until the new session named its own wait: GNOME's lock 10.1 s after the wake, KDE's share request 19.8 s after it. 🔴 first with prod's viewer: nothing named from 10.7 s into the sleep until 19.4 s after the wake (GNOME), and from 8.3 s into it until 25.2 s after (KDE) (AC7). ✅ **prod's viewer** after the promote (`hosted-20261018-df4803f`): the wake named at +0.4 s on GNOME and KDE, continuously, until each new session named its own wait (AC7 ticked) | S |
 | **P6** | consent and indicator (§4.7) | FR-27's switches | lab GNOME + KDE | M |
 | ↳ P6a | the native X11 consent panel leaves the screen once answered or dismissed: its unmap is flushed (`indicator/x11.rs`), where nothing flushed it after the last repaint; a real-X test in CI's Xvfb lane asks the server, as a second client, whether the panel is still mapped | — | ✅ lab (`428efdc83`), GNOME 50 per-user, consent on. **🔴 0.4.135:** the session started under the panel, frozen on its countdown with live-looking buttons, on GNOME 50 and on Plasma 6.7 (both through Xwayland). **P6a:** 4 s after Approve the panel is gone and GNOME's own screen-sharing pill is up; a prompt the viewer gave up on leaves the screen too. Negative control: without the flush the test reads the panel still `VIEWABLE` | S |
 | ↳ P6b | a per-user daemon starts the companion for a prompt through its own user manager (`systemd-run --user`), and counts only the session user's own companion (`pgrep -u`): the shape `launch_once` already had | — | ✅ lab (`428efdc83`), GNOME 50 per-user with no native panel (`DISPLAY` unset for the unit). **🔴 0.4.135:** `systemd-run` on the system manager waited on polkit and failed after 25 s; no prompt anywhere, and the viewer waited. **P6b:** the companion started at once and showed the prompt, and after Approve its *Being viewed by … · Disconnect* banner, beside GNOME's pill | S |
@@ -847,7 +848,7 @@ New cells run three times before they are trusted. An entry in `expected-failure
     drm_capture"*.
 
   A user switch is P5f and P5g: red on 0.4.135 (step log 74), and named on 0.4.136 (above).
-- [ ] **AC7** — lifecycle (§4.6): each event recovers within 10 s or names its reason.
+- [x] **AC7** — lifecycle (§4.6): each event recovers within 10 s or names its reason.
   ⏳ Measured first on the releases (step log 66, §4.6): DRM passes every event but the idle blank (the last
   frame, no reason); mutter freezes at a lock for good (#2145), and its daemon did not come back after a logout and
   a login (#2144); the portal passes lock and unlock, but not logout and login (the last frame, then ~30 s of black,
@@ -911,7 +912,18 @@ New cells run three times before they are trusted. An entry in `expected-failure
   - ✅ **P5j keeps the notice.** With a candidate bundle on the real origin, the wake was named at +0.1 s (GNOME)
     and +0.3 s (KDE), continuously, until the new session named its own wait: GNOME's lock 10.1 s after the wake,
     KDE's share request 19.8 s after it.
-  - AC7 ticks once P5j's viewer is promoted and the same runs pass on prod's viewer.
+  - ✅ **On prod's viewer** (2026-10-18). P5j was promoted in `hosted-20261018-df4803f`, and the page loaded its
+    bundle `index-BJWuXwtc.js`. These were the same runs with no candidate bundle, against the per-user guests'
+    released 0.4.142 agents.
+    - GNOME: the sleep was named at +0.2 s and the wake at +0.4 s. The notice held through both redials until
+      the new session named GNOME's lock, 22.5 s after the wake.
+    - KDE: the sleep was named 5.1 s in and the wake at +0.4 s. The notice held until the new session connected,
+      13.6 s after the wake. 2.1 s later that session named KDE's share request. The gap is the new session's
+      own first-frame wait.
+    - The waits after the wake are longer than the candidate's (10.1 s and 19.8 s) because of the viewer's
+      reconnect backoff. The stage names the sleep through all of it.
+  - **Ticked 2026-10-18.** Every lifecycle event in §4.6 recovers within 10 s or names its reason, on the
+    releases and on prod's viewer.
   - **The real-hardware wake is not possible on AC12's box.** It cannot sleep: `suspend.target` and `sleep.target`
     are masked, `mem_sleep` offers `s2idle` only, and `macsmc-rtc` has no `wakealarm`. A datacenter Mac mini that
     slept would stay asleep until a power cycle.
@@ -996,7 +1008,7 @@ New cells run three times before they are trusted. An entry in `expected-failure
     defect is that a stale prompt is answerable. It is fixed on its own issue.
   - **The aarch64 companion on Asahi** is not required. AC12 covers Asahi (AC1/AC4/AC5/AC7), and a host with no
     companion has its desktop's own notification surface (P6f, P6g).
-- [ ] **AC11** — X11 hosts unchanged (FR-29's idle numbers), Windows and macOS unchanged; the kill switch
+- [x] **AC11** — X11 hosts unchanged (FR-29's idle numbers), Windows and macOS unchanged; the kill switch
   restores 0.4.124's behaviour exactly.
   ⏳ **The kill switch, in the lab** (P1a, step log 76). On the released 0.4.135, both switches gave the lab's
   0.4.125 baseline: `backend=scrap` on Xwayland, black, no reason. But the viewer also showed the input-reach
@@ -1034,7 +1046,22 @@ New cells run three times before they are trusted. An entry in `expected-failure
     had no live console session), which skipped its `#rd`. Install, enroll and overlay passed, and this session's
     picture did not depend on them.
 
-  Owed: the macOS session. The macOS lane's host is the operator's own Mac, so it waits for their go-ahead.
+  ✅ **A macOS session on the released 0.4.143** (2026-10-18). The operator approved using their own Mac as the
+  lane's host. The host was a vmtest macOS cell: a tart VM running macOS 15.7, a system install by the served
+  installer, `admin` logged in at the console.
+  - The cell itself reported `#rd` as NA, for want of an Aqua session. In fact the VM had one. Its per-user
+    (capture) half had crash-looped on a config the lane broke: the lane's BSD `sed '1i\'` dropped a newline, so
+    line 1 read `auto_update = falseserver_url = …`.
+  - The per-user half was re-enrolled on a repaired config. Screen Recording and Accessibility were granted in
+    the VM's TCC (SIP is off there).
+
+  One viewer session (prod's viewer, the same sampler) ran 45 s at 500 ms:
+  - a picture in **88 of 88** samples, 17 distinct (`capture: backend=scrap`, CoreGraphics, 2048×1536; VP9-444
+    over the DataChannel);
+  - **no** wait notice, **no** input-reach warning and **no** status line. With Accessibility granted, that is
+    nothing 0.4.124 would not have sent. Without it, the warning is P1's own (above).
+
+  **Ticked 2026-10-18** on: X11 (0.4.141), the kill switch (0.4.136), and a Windows and a macOS session (0.4.143).
 - [x] **AC12** — Asahi (real scanout) passes AC1/AC4/AC5/AC7 on the released build.
   ✅ **0.4.139, the release** (published 2026-10-16 10:15Z; step log 93), on a rented Apple M2 Pro Mac mini with
   Fedora Asahi Remix 42 (`apple-drm`, HDMI 4096×2160), GNOME 48 and Plasma 6.6 beside each other. Installed by the
@@ -1192,6 +1219,11 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-16 | `wlab-asahi`, per-user, Plasma 6.6, after ~40 sessions on one KWin (portal sessions approved, restored, and ended by daemon restarts and viewer hang-ups) | **0.4.138** and master `dab50b7f0` alike, then lab builds `4d01ecb84` and `1c93d5944` | the portal arm on KDE: no picture | 🔴 From 06:08Z every session failed after 15 s: *"the desktop portal did not share the screen: no frame arrived before the deadline"*. The helper's state log (P5i) showed every stream reach `paused` and never `streaming`. 0.4.138 failed the same way, so this is no regression. ✅ Ending all of the user's sessions, then logging in again, gave a new KWin, and the same still desktop streamed at once (`paused → streaming` 28 ms, a picture at +4 s); a later daemon restart in mid-stream left the next stream working. Not reproduced, so not fixed: recorded with the four nudges that did nothing (see P5i) |
 | 2026-10-16 | `wlab-asahi`, per-user (the served `install.sh` as the upgrade), Plasma 6.6 then GNOME 48 | **0.4.139, the release** (`/usr/bin/roomlerd`; companion `roomler-desktop-0.4.139-1.aarch64`) | AC12 per-user: AC1/AC4/AC5/AC7; #2286 on the release | ✅ **Plasma:** AC4 8/8, twice; AC5; AC7 4/4 with `kde-logout` (lock +1.5 s, unlock +1.0 s, logout named +3.3 s, login → a picture +13.1 s). ✅ **GNOME:** AC4 8/8, twice; AC5 (cursor size 96); AC7 4/4 (lock named +1.4 s, unlock live +1.8 s, logout named +0.9 s, login → a picture +10.2 s). ✅ **#2286:** the banner at the top centre on both, 360×76 logical. ⚠️ **The first Plasma run**, on a KWin started before the upgrade: AC4 7/8 (the first move), and AC7 2/4 with the generic `logout`. That is the wrong plan for KDE: a `terminate-session`, which KWin, a user service, survives, and which left the screen with no scanout. After a fresh login came the run above. ⚠️ The upgrade left the running companion on the deleted 0.4.138 binary, with its mid-screen banner, until the next login |
 | 2026-10-16 | `wlab-asahi`, system install (the served `install.sh --system`), no capture key, so FR-95 switches DRM + uinput on by itself; GNOME 48 then Plasma 6.6 | a lab build at first (a system unit drop-in left from an earlier swap, `0.4.138` code), then **0.4.139, the release** | AC12 system cells | 🔴 **The first runs measured the drop-in's lab build, not the release.** The server reporting 0.4.138 for the device gave it away. ✅ **After the revert, on the release:** Plasma AC4 8/8 twice, AC5 (DRM), AC7 4/4; GNOME AC4 8/8, AC5 (DRM), AC7 4/4. Each was *switched on by itself*, and locked and away were named with nothing read. ⚠️ On the lab build, an AC4 run straight after a login lost its moves, clicks and keys while the wheel arrived. The cause was GNOME's post-login overview: reproduced on purpose, and libinput's trace showed every event delivered. The KDE first-move observation is under AC12 |
+| 2026-10-18 | `wlab-gnome`, `wlab-kde` (per-user), `suspend-to-mem` turned on so the guests sleep `deep` (S3) and libvirt can wake them | the released **0.4.142** agents; prod's viewer | AC7: a suspend, then a wake 40 s later | 🔴 the viewer named nothing from 10.7 s into the sleep until 19.4 s after the wake (GNOME), and from 8.3 s until 25.2 s after (KDE). The agent named the sleep (P5h); the viewer's redial dropped the notice, and the request sat in `awaiting_consent` |
+| 2026-10-18 | the same | P5j, a candidate bundle served on the real origin | AC7 / P5j: the same runs | ✅ the wake named at +0.1 s (GNOME) and +0.3 s (KDE), continuously, until the new session named GNOME's lock (10.1 s after the wake) and KDE's share request (19.8 s) |
+| 2026-10-18 | the same | **prod's viewer** after the promote of `hosted-20261018-df4803f` (P5j); the released 0.4.142 agents | AC7 on prod's viewer | ✅ the sleep named at +0.2 s (GNOME) and +5.1 s (KDE), the wake at +0.4 s on both, continuously, until GNOME's lock (22.5 s after the wake) and KDE's share request (15.7 s). `suspend-to-mem` turned back off on both guests afterwards |
+| 2026-10-18 | a vmtest Windows 11 cell, a system install | **0.4.143, the release** | AC11: a Windows session | ✅ a picture in 84 of 84 samples; no wait notice, no input-reach warning, no status line |
+| 2026-10-18 | a vmtest macOS 15.7 cell (tart), a system install; the per-user half re-enrolled on a repaired config, Screen Recording and Accessibility granted in TCC | **0.4.143, the release** | AC11: a macOS session | ✅ a picture in 88 of 88 samples (`backend=scrap`, CoreGraphics); no wait notice, no input-reach warning, no status line. The lane's own `sed` had broken the per-user config (§5, AC11) |
 
 ## 12. Related
 
