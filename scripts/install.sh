@@ -645,10 +645,20 @@ install_tunnel_linux() {
         say "downloading the roomler CLI (.deb) via the proxy"
         download "$SERVER/api/tunnel/installer/linux-deb?version=latest" "$deb"
         if [ "$DOWNLOAD_ONLY" = 1 ]; then
-            say "download-only: would run: sudo dpkg -i $deb"
+            say "download-only: would run: sudo dpkg -i $deb (the tarball instead, if its dependencies cannot be met here)"
             return 0
         fi
         sudo dpkg -i "$deb" || sudo apt-get -f install -y
+        # #2472 — a .deb whose dependencies this distro cannot meet is REMOVED
+        # again by `apt-get -f`, and nothing is installed: tunnel-v0.3.0-rc.266
+        # wants libssl3t64, which Debian 12 and Ubuntu 22.04 call libssl3. The
+        # tarball needs only libssl.so.3, which both ship.
+        if ! tunnel_cli_runs; then
+            warn "the .deb did not install here (its dependencies cannot be met on this distro) — installing the tarball instead"
+            tarball="$STAGE/roomler-cli.tar.gz"
+            download "$SERVER/api/tunnel/installer/linux-x86_64?version=latest" "$tarball"
+            install_tunnel_tarball "$tarball"
+        fi
     else
         tarball="$STAGE/roomler-cli.tar.gz"
         say "downloading the roomler CLI (tarball) via the proxy"
@@ -659,6 +669,7 @@ install_tunnel_linux() {
         fi
         install_tunnel_tarball "$tarball"
     fi
+    require_tunnel_cli
     enroll_tunnel
 }
 
@@ -671,7 +682,24 @@ install_tunnel_macos() {
         return 0
     fi
     install_tunnel_tarball "$tarball"
+    require_tunnel_cli
     enroll_tunnel
+}
+
+# Does the installed CLI run here? `command -v` alone is not enough: a binary
+# for another architecture, or one missing a library, is on PATH too.
+tunnel_cli_runs() {
+    cli="$(command -v roomler || true)"
+    [ -n "$cli" ] && "$cli" --version >/dev/null 2>&1
+}
+
+# #2472 — never say "done" with nothing installed.
+require_tunnel_cli() {
+    if ! tunnel_cli_runs; then
+        echo "error: the roomler CLI did not install: no working \`roomler\` on PATH" >&2
+        exit 1
+    fi
+    say "installed: $(roomler --version 2>/dev/null | head -n 1)"
 }
 
 install_tunnel_tarball() {

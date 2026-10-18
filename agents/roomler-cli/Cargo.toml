@@ -125,6 +125,11 @@ dials the corresponding intranet destination. The Roomler API is \
 signalling-only — server never sees the payload."""
 section = "net"
 priority = "optional"
+# #2472 — explicit, never cargo-deb's `$auto`: the tunnel release builds on
+# `ubuntu-latest`, where dpkg-shlibdeps names OpenSSL `libssl3t64` (the 64-bit
+# time name of Debian 13 and Ubuntu 24.04). Debian 12 and Ubuntu 22.04 call it
+# `libssl3`, so the automatic dependency made the package uninstallable there.
+depends = "libc6 (>= 2.34), libssl3 (>= 3.0.0) | libssl3t64 (>= 3.0.0)"
 # RETIRED-NAME-ANCHOR-BEGIN
 # The dpkg takeover has to name the REAL predecessor package. A rename here
 # is not a typo, it is a silently broken upgrade: dpkg would see a brand new

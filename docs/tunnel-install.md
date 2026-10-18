@@ -159,6 +159,15 @@ sudo dpkg -i /tmp/roomler-cli.deb
 # `roomler` is now on $PATH at /usr/bin/roomler
 ```
 
+> ⚠️ **On Debian 12 and Ubuntu 22.04 this `.deb` cannot install** (#2472).
+> `tunnel-v0.3.0-rc.266` depends on `libssl3t64`, the name Debian 13 and
+> Ubuntu 24.04 use; these two call it `libssl3`. `dpkg -i` leaves the package
+> unconfigured, and `apt-get -f install` removes it again. Use the plain tarball
+> below. `install.sh --role tunnel` checks that `roomler` runs and falls back
+> to the tarball on its own. The CLI now declares both names
+> (`agents/roomler-cli/Cargo.toml`), so the next tunnel release's `.deb`
+> installs on both generations.
+
 **Linux (plain tarball):**
 
 ```bash
