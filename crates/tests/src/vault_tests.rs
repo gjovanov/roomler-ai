@@ -654,6 +654,10 @@ async fn names_kinds_and_fields_are_held_to_their_rules() {
         json!({ "path": "api", "kind": "static", "tags": ["Prod"] }),
         json!({ "path": "api", "kind": "static", "audiences": ["a b"] }),
         json!({ "path": "api", "kind": "static", "exec_allow": ["psql", "psql"] }),
+        // P3-4c — a program by its bare name: a path could only ever allow
+        // nothing.
+        json!({ "path": "api", "kind": "static", "exec_allow": ["/usr/bin/psql"] }),
+        json!({ "path": "api", "kind": "static", "exec_allow": ["-rf"] }),
         json!({ "path": "api", "kind": "static", "rotation_days": 0 }),
         json!({ "path": "api", "kind": "static", "owner_id": ObjectId::new().to_hex() }),
     ] {
@@ -898,6 +902,7 @@ async fn roles_and_policies_are_checked_before_they_are_kept() {
         [
             "guardrail:windows-proxy-only",
             "guardrail:prod-never-materializes",
+            "guardrail:exec-only-allowed-programs",
             pid.as_str()
         ],
         "{list}"

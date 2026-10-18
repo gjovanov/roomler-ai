@@ -367,6 +367,26 @@ fn check_entries(what: &str, entries: &[String]) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// P3-4c — `exec_allow` names programs by their BARE name
+/// ([`program_name_ok`](roomler_ai_remote_control::vault::program_name_ok)):
+/// the device resolves the name among the system's own directories and hands
+/// a value to nothing else, so a path could only ever allow nothing. It is
+/// refused here rather than kept to do nothing.
+fn check_programs(entries: &[String]) -> Result<(), ApiError> {
+    check_entries("exec_allow", entries)?;
+    if let Some(e) = entries
+        .iter()
+        .find(|e| !roomler_ai_remote_control::vault::program_name_ok(e))
+    {
+        return Err(ApiError::BadRequest(format!(
+            "exec_allow entry {e:?} is not a program's bare name (letters, digits, `.`, `_`, \
+             `+` or `-`, at most {} characters, not starting with `.` or `-`)",
+            roomler_ai_remote_control::vault::lease_limits::MAX_PROGRAM_LEN
+        )));
+    }
+    Ok(())
+}
+
 fn check_tags(tags: &[String]) -> Result<(), ApiError> {
     if tags.len() > MAX_LIST_ENTRIES {
         return Err(ApiError::BadRequest(format!(
@@ -516,7 +536,7 @@ pub async fn create(
     }
     check_description(&body.description)?;
     check_entries("audiences", &body.audiences)?;
-    check_entries("exec_allow", &body.exec_allow)?;
+    check_programs(&body.exec_allow)?;
     check_tags(&body.tags)?;
     if let Some(d) = body.rotation_days {
         check_rotation(d)?;
@@ -631,7 +651,7 @@ pub async fn update(
         set.insert("audiences", a.clone());
     }
     if let Some(x) = &body.exec_allow {
-        check_entries("exec_allow", x)?;
+        check_programs(x)?;
         set.insert("exec_allow", x.clone());
     }
     if let Some(t) = &body.tags {

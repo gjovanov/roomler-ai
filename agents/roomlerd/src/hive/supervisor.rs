@@ -4216,6 +4216,15 @@ impl Supervisor {
             session: order.session_id,
             fence: order.fence,
             vault,
+            // P3-4c-1 — `vault_exec` runs as the session does: its account,
+            // dropped as decision 13 drops it, its home, its folder.
+            #[cfg(feature = "vault")]
+            exec: Some(super::vault_exec::ExecTarget {
+                account: matches!(self.launcher, Launcher::AsMappedAccount)
+                    .then(|| account.to_string()),
+                home: home.clone(),
+                folder: folder.to_path_buf(),
+            }),
         };
         let toolbelt = toolbelt::open(&dir, owner, uid, run, approvals, self.approval_timing)
             .map_err(|e| {
@@ -4409,6 +4418,10 @@ impl Supervisor {
             session: order.session_id,
             fence: order.fence,
             vault,
+            // P3-4c-1 — no command runs with a value here: Windows has no
+            // sandbox for one. The vault refuses `exec` first (AC13).
+            #[cfg(feature = "vault")]
+            exec: None,
         };
         let toolbelt = toolbelt::open(peer, run, approvals, self.approval_timing)
             .map_err(|e| failed("opening the session's toolbelt", e))?;

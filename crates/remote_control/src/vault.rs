@@ -50,6 +50,23 @@ pub mod lease_limits {
     /// P3-4b — the secrets one `rc:vault.listed` names at most; past it the
     /// answer says there is `more`, and a narrower prefix finds the rest.
     pub const MAX_LISTED: usize = 200;
+    /// P3-4c — the longest program name `exec_allow` holds.
+    pub const MAX_PROGRAM_LEN: usize = 64;
+}
+
+/// P3-4c — a program's BARE name, as `exec_allow` holds it and as a device
+/// asks in `exec` mode (the lease's audience): letters, digits, `.`, `_`,
+/// `+` and `-`, not starting with `.` or `-`. Never a path: a device resolves
+/// the name among the system's own directories and hands a value to nothing
+/// else, so a path could only ever match nothing. One definition for the
+/// vault's write check and the device's own.
+pub fn program_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= lease_limits::MAX_PROGRAM_LEN
+        && !name.starts_with(['.', '-'])
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
 }
 
 /// P3-4b — what a session is told of a secret: its name and its rules, never
@@ -275,6 +292,38 @@ mod tests {
                 LeaseRefusal::Busy
             ]
         );
+    }
+
+    /// P3-4c — a bare name only: never a path, a flag, a dot entry or a
+    /// space.
+    #[test]
+    fn a_program_is_named_by_its_bare_name() {
+        for ok in [
+            "psql",
+            "kubectl",
+            "aws",
+            "python3.12",
+            "g++",
+            "pg_dump",
+            "x-y",
+        ] {
+            assert!(program_name_ok(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "/usr/bin/psql",
+            "bin/psql",
+            "..",
+            ".hidden",
+            "-rf",
+            "psql ",
+            "ps ql",
+            "psql\0",
+            "C:\\psql.exe",
+            &"p".repeat(lease_limits::MAX_PROGRAM_LEN + 1),
+        ] {
+            assert!(!program_name_ok(bad), "{bad:?}");
+        }
     }
 
     #[test]
