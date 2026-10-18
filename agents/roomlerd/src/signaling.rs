@@ -3496,15 +3496,11 @@ async fn handle_server_msg(
                 // says they are from outside the organization, while the lines
                 // above it name what approving grants, which a two-line box
                 // must not be the one to cut.
-                let privacy_line = [
-                    privacy_line.as_str(),
-                    features_line.as_str(),
-                    prompt_detail,
-                ]
-                .into_iter()
-                .filter(|l| !l.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n");
+                let privacy_line = [privacy_line.as_str(), features_line.as_str(), prompt_detail]
+                    .into_iter()
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 let view = crate::indicator::PromptView {
                     session_hex: session_hex.clone(),
                     title: prompt_title.into(),

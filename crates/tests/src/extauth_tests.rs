@@ -827,6 +827,80 @@ async fn an_outsider_opens_a_session_bound_to_their_login() {
     let _ = dev.stop.send(true);
 }
 
+/// What binds every controller of a device binds an outsider too (FR-101). The
+/// org says `files: off` and sets an idle limit; gate 2's ceiling allows FILES
+/// and the outsider asks for it. The session opens without FILES, names the
+/// org as the reason, and runs under the org's idle limit. FR-52 was built
+/// before FR-101 existed. Rebased onto it, the extauth relay first handed the
+/// Hub an unrestricted policy and no limits, so FILES survived and an
+/// outsider's session could sit idle for ever: the outside door looser than
+/// the inside one.
+#[tokio::test]
+async fn an_outsiders_session_is_bound_by_the_orgs_session_policy() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-policy").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-policy",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let owner = &seeded.admin.access_token;
+    // The ceiling allows FILES: what must take it out is the org's POLICY.
+    let policy = url(
+        &seeded,
+        &format!("/agent/{}/external-access-policy", dev.agent_id),
+    );
+    let ceiling = json!({ "approved": true, "max_permissions": "VIEW | INPUT | FILES" });
+    assert_eq!(put(&app, &policy, owner, ceiling).await, 200);
+    let files_off = json!({ "files": "off" });
+    assert_eq!(
+        put(&app, &url(&seeded, "/rc-session-policy"), owner, files_off).await,
+        200
+    );
+    let idle = json!({ "idle_secs": 600 });
+    assert_eq!(
+        put(&app, &url(&seeded, "/rc-session-limits"), owner, idle).await,
+        200
+    );
+
+    let (principal, mut ws) = outsider(&app, "extpolicy").await;
+    let (attempt_id, _key) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    send(
+        &mut ws,
+        json!({
+            "t": "rc:extauth.session",
+            "connect_code": dev.code,
+            "attempt_id": attempt_id,
+            "permissions": "VIEW | INPUT | FILES",
+        }),
+    )
+    .await;
+    let created = next_of(
+        &mut ws,
+        &["rc:session.created", "rc:extauth.result", "rc:error"],
+    )
+    .await;
+    assert_eq!(created["t"], "rc:session.created", "{created}");
+    let granted = created["permissions"].as_str().unwrap_or_default();
+    assert!(granted.contains("VIEW"), "{created}");
+    assert!(
+        !granted.contains("FILES"),
+        "the org's `files: off` binds an outsider: {created}"
+    );
+    assert_eq!(
+        created["features_refused"]["files"], "org_policy_off",
+        "{created}"
+    );
+    assert_eq!(
+        created["idle_secs"], 600,
+        "the org's idle limit binds an outsider: {created}"
+    );
+    let _ = dev.stop.send(true);
+}
+
 /// The binding is enforced BY THE DEVICE: an offer that does not carry the
 /// login's MAC over its own certificate — a key from nowhere, no MAC at all, or
 /// the right key over a swapped certificate — ends the session, and no answer

@@ -3961,6 +3961,10 @@ mod tests {
             None,
             None,
             false, // may_record
+            OrgPolicy::Read(SessionPolicy::default()),
+            None,
+            None,
+            None,
             Some(grant.clone()),
         )
         .unwrap();
@@ -4215,8 +4219,8 @@ mod tests {
         hub.deliver_consent(sid, true, None).unwrap();
         let _ready = ctl_rx.recv().await.unwrap();
         let _req = agent_rx.recv().await.unwrap();
-        hub.forward_offer(sid, "v=0".into()).unwrap();
-        hub.forward_answer(sid, "v=0".into()).unwrap();
+        hub.forward_offer(sid, "v=0".into(), None).unwrap();
+        hub.forward_answer(sid, "v=0".into(), None).unwrap();
     }
 
     /// FR-101 P4b — the next `rc:terminate` on a channel, within `within`.
@@ -4273,6 +4277,7 @@ mod tests {
                 max,
                 None,
                 None,
+                None, // external (FR-52 P4)
             )
             .unwrap()
         };
@@ -4349,6 +4354,7 @@ mod tests {
                 None,
                 idle,
                 None,
+                None, // external (FR-52 P4)
             )
             .unwrap()
         };
@@ -4383,8 +4389,8 @@ mod tests {
             ctl_rx.recv().await.unwrap(),
             ServerMsg::Ready { .. }
         ));
-        hub.forward_offer(sid, "v=0".into()).unwrap();
-        hub.forward_answer(sid, "v=0".into()).unwrap();
+        hub.forward_offer(sid, "v=0".into(), None).unwrap();
+        hub.forward_answer(sid, "v=0".into(), None).unwrap();
         let device = DispatchCtx {
             role: Role::Agent,
             user_id: None,
@@ -5108,6 +5114,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // external (FR-52 P4)
             )
             .unwrap();
             let (granted, why) = match rx.try_recv().unwrap() {
@@ -5434,6 +5441,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // external (FR-52 P4)
             )
             .unwrap();
             let (granted, refused) = match rx.try_recv().unwrap() {
@@ -5510,6 +5518,7 @@ mod tests {
             None,
             None,
             None,
+            None, // external (FR-52 P4)
         )
         .unwrap();
         match rx.try_recv().unwrap() {
