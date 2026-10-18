@@ -290,6 +290,21 @@ pub fn log_dir() -> Option<PathBuf> {
     LOG_DIR.get().cloned().flatten()
 }
 
+/// FR-97 P6e (#1538) — say one line on stderr, and never panic doing it.
+///
+/// `eprintln!` PANICS when the write fails, and a daemon's stderr is a sink it
+/// does not own: launchd's `StandardErrorPath` file, journald, a supervisor's
+/// pipe, a terminal that has since closed. On 0.4.93 a Mac's agent died exactly
+/// there: the single-instance lock's "already running" line hit a failing
+/// stderr, and a duplicate start that should have left quietly became a crash.
+/// A line the daemon prints itself goes through here instead: losing the line
+/// beats losing the process. On the watchdog's paths a panic would also lose
+/// the forced exit the line announces.
+pub fn say_on_stderr(msg: impl std::fmt::Display) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{msg}");
+}
+
 /// Path of TODAY's rolling log file, if file logging is active.
 /// Used by `crash_recorder::record` to attach a `log_tail` to crash
 /// sidecars. Returns `None` when `init()` hasn't run yet OR no log
@@ -597,6 +612,58 @@ fn format_panic(
 
 #[cfg(test)]
 mod tests {
+    // ── FR-97 P6e (#1538): a line on a failing stderr is dropped, never a panic ──
+
+    /// The child half of the test below, run by this test binary itself with
+    /// its stderr on `/dev/full`, where every write fails (ENOSPC). It does
+    /// nothing in an ordinary run.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stderr_child() {
+        match std::env::var("ROOMLER_STDERR_CHILD").as_deref() {
+            Ok("helper") => super::say_on_stderr("a line /dev/full refuses"),
+            // The control: what the daemon's own lines did before.
+            Ok("eprintln") => eprintln!("a line /dev/full refuses"),
+            _ => {}
+        }
+    }
+
+    /// `stderr_child` in a fresh test process whose stderr is `/dev/full`.
+    #[cfg(target_os = "linux")]
+    fn child_with_failing_stderr(mode: &str) -> std::process::ExitStatus {
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("open /dev/full");
+        std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "logging::tests::stderr_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("ROOMLER_STDERR_CHILD", mode)
+            .stdout(std::process::Stdio::null())
+            .stderr(full)
+            .status()
+            .expect("run the test binary")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_line_on_a_failing_stderr_is_dropped_never_a_panic() {
+        // The control first: on this stderr `eprintln!` does panic, so this
+        // test can tell a fix from a stderr that never failed.
+        assert!(
+            !child_with_failing_stderr("eprintln").success(),
+            "the control should panic on a stderr that refuses every write"
+        );
+        assert!(
+            child_with_failing_stderr("helper").success(),
+            "say_on_stderr must drop the line, not panic"
+        );
+    }
+
     // ── FR-21 P2a: the lib rename must not blank a deployed unit's logs ──
 
     #[test]

@@ -34,8 +34,13 @@
     <key>ProcessType</key>
     <string>Interactive</string>
 
+    <!-- FR-97 P6e (#1538): stdout carries only tracing's console copy of the
+         rotating log (~/Library/Application Support/live.roomler.roomler/logs),
+         and here it grew unrotated in /tmp (13.9 MB on one Mac). stderr stays
+         a file: an agent that cannot start says why there, before its log
+         exists (the vmtest lane reads it). -->
     <key>StandardOutPath</key>
-    <string>/tmp/roomlerd.out.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
     <string>/tmp/roomlerd.err.log</string>
 
