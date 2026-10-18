@@ -2547,9 +2547,9 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // the mesh on for **A**. The flag read as granted and landed on the wrong
     // org, which nothing then reported.
     //
-    // ⚠️ A secondary gets `netstack`, not `tun`. `tun` shares the primary's
-    // adapter and needs `overlay_multi_org` + the same control plane (and is
-    // impossible on macOS), so a bare flag that installed OS routes could wedge
+    // ⚠️ A secondary gets `netstack`, not `tun`. `tun` gives the org an OS
+    // adapter of its own and needs `overlay_multi_org` + the same control plane
+    // (macOS included, FR-97 P1d), so a bare flag that installed OS routes could wedge
     // a host — the one thing "never self-wedge" exists to prevent. `netstack`
     // is a userspace stack behind a loopback SOCKS5 front: no TUN, no routes,
     // no privilege. Anything else is the explicit `org overlay` verb.
