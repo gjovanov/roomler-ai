@@ -339,6 +339,14 @@ const KEYS: &[KeyMeta] = &[
         description: "Accept configuration pushed by the control plane. NEVER settable by the server — it is what keeps exec_enabled/ssh_enabled refusable by a compromised one. Turning it ON delegates that last refusal. Default: OFF.",
     },
     KeyMeta {
+        key: "external_access_enabled",
+        group: Group::Access,
+        tier: Tier::Standard,
+        live: false,
+        kind: "bool",
+        description: "Let someone OUTSIDE this device's organization control it (FR-52 gate 3). NEVER settable by the server — the whole `external_*` surface is absent from remote config, because a server able to set this could admit a stranger to a machine whose owner never agreed. Opens nothing on its own: an org admin must also approve this device, the outsider must prove the password held HERE, and whoever is at the machine is still asked. Default: OFF.",
+    },
+    KeyMeta {
         key: "local_restart_enabled",
         group: Group::Access,
         tier: Tier::Standard,
@@ -1853,6 +1861,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "companion_autostart" => Some(fmt_bool(cfg.companion_autostart)),
         "remote_config_enabled" => Some(fmt_bool(cfg.remote_config_enabled)),
         "local_restart_enabled" => Some(fmt_bool(cfg.local_restart_enabled)),
+        "external_access_enabled" => Some(fmt_bool(cfg.external_access_enabled)),
         "ssh_enabled" => Some(fmt_bool(cfg.ssh_enabled)),
         "ssh_port" => cfg.ssh_port.map(|p| p.to_string()),
         "ssh_authorized_keys" => Some(cfg.ssh_authorized_keys.join(",")),
@@ -2123,6 +2132,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // above, this grants nothing, so OFF is an owner's choice rather than
         // the fail-safe direction. Settable only from here (never pushed).
         "local_restart_enabled" => cfg.local_restart_enabled = parse_bool_or(value, true)?,
+        "external_access_enabled" => cfg.external_access_enabled = parse_bool_or(value, false)?,
         // Same fail-safe direction as `exec_enabled`: clearing the key means
         // OFF. An SSH session is strictly more than a bounded command.
         "ssh_enabled" => cfg.ssh_enabled = parse_bool_or(value, false)?,
