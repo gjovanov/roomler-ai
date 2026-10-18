@@ -280,6 +280,39 @@ pub(crate) struct ConsentReply {
 /// session out first), so the server has already forgotten the session and
 /// no verdict is owed; a `granted:false` would only be audited against
 /// nothing, or read as a refusal nobody made.
+/// #2416 — a consent prompt's answer, or [`Decision::Cancelled`] once the
+/// control socket it came over has closed (a server roll reset it, the network
+/// dropped). Its session went with that socket: a viewer that redials asks
+/// again under a new session id, and an answer to this one could only fail to
+/// send. On 0.4.141 the native panel stayed up, answerable, beside the new
+/// session's question, and its Approve did nothing ("outbound consent send
+/// failed (channel closed)"). Withdrawn here, as a `Terminate` would withdraw
+/// it: dropping `prompt` clears the broker's pending entry and the companion's
+/// `.pending` marker, and the caller takes the panel and the notification down.
+///
+/// `outbound` is this connection's sender. Its receiver lives in the
+/// connection's loop, so `closed()` resolves when that connection ends and
+/// never before. A decision that is ready at the same moment wins.
+///
+/// [`Decision::Cancelled`]: crate::consent::Decision::Cancelled
+pub(crate) async fn await_prompt_or_socket_end(
+    prompt: impl std::future::Future<Output = crate::consent::Decision>,
+    outbound: &mpsc::Sender<ClientMsg>,
+    session_hex: &str,
+) -> crate::consent::Decision {
+    tokio::select! {
+        biased;
+        decision = prompt => decision,
+        () = outbound.closed() => {
+            info!(
+                session = %session_hex,
+                "consent prompt withdrawn — its control socket closed before an answer (#2416)"
+            );
+            crate::consent::Decision::Cancelled
+        }
+    }
+}
+
 pub(crate) fn consent_reply(
     decision: crate::consent::Decision,
     have_surface: bool,
@@ -3454,7 +3487,8 @@ async fn handle_server_msg(
                 // guarantee against the loop that spawned it.)
                 let prompt = consent_broker.request_with_mode(&session_hex, effective_mode);
                 tokio::spawn(async move {
-                    let decision = prompt.await;
+                    let decision =
+                        await_prompt_or_socket_end(prompt, &outbound, &session_hex).await;
                     // FR-27 — take the native panel down however the question
                     // was answered: the click here, the CLI, the companion,
                     // the window simply expiring, or the session ending first.
@@ -4742,7 +4776,16 @@ async fn handle_server_msg(
             };
             let ind = indicator.clone();
             tokio::spawn(async move {
-                let decision = broker.request_with_mode(&request_id, consent_mode).await;
+                // #2416 — as on the RC path: a question whose control socket
+                // closed is withdrawn. Here it matters more, since an Approve
+                // given to a stale panel would run the command for a caller
+                // no longer waiting for it, and twice if that caller retried.
+                let decision = await_prompt_or_socket_end(
+                    broker.request_with_mode(&request_id, consent_mode),
+                    &outbound,
+                    &request_id,
+                )
+                .await;
                 // FR-27 — same convergence point as the RC path: take the
                 // native panel down however the question was answered.
                 ind.hide_prompt(&request_id);
@@ -6898,6 +6941,66 @@ mod tests {
         assert!(map.contains_key(&live_sid), "the live peer is re-adopted");
         assert!(!map.contains_key(&dead_sid), "the corpse is not");
         map[&live_sid].close();
+    }
+
+    /// #2416 — a prompt whose control socket closes before an answer is
+    /// withdrawn. The waiting task gets `Cancelled` (nothing goes on the wire),
+    /// and dropping the prompt clears the broker's entry and the companion's
+    /// `.pending` marker. On 0.4.141 it stood, answerable, beside the redialled
+    /// session's own question.
+    #[tokio::test]
+    async fn a_prompt_whose_socket_closes_is_withdrawn() {
+        use crate::consent::{ConsentBroker, Decision, Mode};
+        let dir = tempfile::tempdir().unwrap();
+        let mode = Mode::Prompt {
+            timeout: std::time::Duration::from_secs(300),
+        };
+        let broker = ConsentBroker::new(mode, dir.path().to_path_buf()).unwrap();
+        let hex = "6ad3d602aabbccddeeff0011";
+        let prompt = broker.request_with_mode(hex, mode);
+        let marker = broker.write_pending(hex, "{}").unwrap();
+        assert!(marker.exists());
+        let (outbound, rx) = mpsc::channel::<ClientMsg>(1);
+        drop(rx); // the connection's loop ended with it
+        let decision = await_prompt_or_socket_end(prompt, &outbound, hex).await;
+        assert_eq!(decision, Decision::Cancelled);
+        assert_eq!(
+            consent_reply(decision, true),
+            None,
+            "nothing goes on the wire"
+        );
+        assert!(!broker.cancel(hex), "the broker no longer holds the prompt");
+        assert!(!marker.exists(), "the companion's marker is gone");
+    }
+
+    /// #2416 — while the socket lives the prompt's own answer stands, and an
+    /// answer ready as the socket closes still wins.
+    #[tokio::test]
+    async fn a_prompt_on_a_live_socket_keeps_its_answer() {
+        use crate::consent::Decision;
+        let (live, _rx) = mpsc::channel::<ClientMsg>(1);
+        assert_eq!(
+            await_prompt_or_socket_end(async { Decision::Granted }, &live, "a").await,
+            Decision::Granted
+        );
+        let (closed, rx) = mpsc::channel::<ClientMsg>(1);
+        drop(rx);
+        assert_eq!(
+            await_prompt_or_socket_end(async { Decision::Denied }, &closed, "b").await,
+            Decision::Denied
+        );
+    }
+
+    /// #2416 — a socket that lives never withdraws a standing prompt.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_socket_leaves_a_standing_prompt_alone() {
+        let (live, _rx) = mpsc::channel::<ClientMsg>(1);
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            await_prompt_or_socket_end(std::future::pending(), &live, "c"),
+        )
+        .await;
+        assert!(waited.is_err(), "still standing after ten minutes");
     }
 
     /// #1632 — `Cancelled` is the ONE decision that puts nothing on the wire:
