@@ -906,6 +906,13 @@ interactive user and most verbs trust the pipe alone (`lib.rs:1073-1075`).
 Sensitive tools set `_meta["anthropic/requiresUserInteraction"]`, so Claude Code asks
 even under allow rules. Because that is UX, the daemon asks again where it matters.
 
+> **As built in P3-4c** (FR-90 spec §3e): not that marker. A `--permission-prompt-tool`
+> can never approve a tool marked as requiring user interaction (Claude Code turns its
+> allow into a deny), and the toolbelt's `approve` is that tool, so every marked tool
+> would be refused. The vault's uses are listed under the session settings'
+> `permissions.ask` instead. Claude Code reads deny, then ask, then allow, across every
+> settings file, so the ask prompts even where a repository's own settings allow the tool.
+
 > **As built in P1a** (FR-90 spec §3e has the measured contract). The stdio shim is
 > `roomlerd hive-mcp <socket>` — the daemon's own binary, short-circuited before any of
 > its start-up, because Claude Code starts it as the session's account and nothing of

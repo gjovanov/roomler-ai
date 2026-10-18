@@ -408,6 +408,16 @@ pub struct SettingsSpec {
     /// the vault's own policy. Empty leaves the key out, and every tool call
     /// nothing else allows asks.
     pub allow_tools: Vec<String>,
+    /// FR-90 P3-4c — tools a person approves on every call, whatever any other
+    /// settings file allows (`permissions.ask`): the vault's uses. Claude Code
+    /// reads deny, then ask, then allow, across every settings file, so a
+    /// repository's own `.claude/settings.json` cannot allow one past the
+    /// person. Empty leaves the key out.
+    ///
+    /// ⚠️ Not by marking the tool as one that requires user interaction: a
+    /// `--permission-prompt-tool` can never approve such a tool (Claude Code
+    /// turns its allow into a deny), and `approve` is that tool.
+    pub ask_tools: Vec<String>,
 }
 
 /// Where the sandbox sends sandboxed commands' traffic.
@@ -429,6 +439,9 @@ impl SettingsSpec {
         let mut doc = json!({"permissions": {"deny": deny}});
         if !self.allow_tools.is_empty() {
             doc["permissions"]["allow"] = json!(self.allow_tools);
+        }
+        if !self.ask_tools.is_empty() {
+            doc["permissions"]["ask"] = json!(self.ask_tools);
         }
         if let Some(helper) = &self.api_key_helper {
             doc["apiKeyHelper"] = json!(helper);
@@ -748,12 +761,18 @@ mod tests {
             extra_read_denies: vec!["Read(//var/lib/roomler/hive/secrets/**)".into()],
             session_start_hook: Some("'/usr/bin/roomlerd' hive-resume-note '/run/n'".into()),
             allow_tools: vec!["mcp__roomler__vault_list".into()],
+            ask_tools: vec!["mcp__roomler__vault_exec".into()],
         }
         .to_json();
         // P3-4b — what is allowed is named, beside the denies.
         assert_eq!(
             doc["permissions"]["allow"],
             json!(["mcp__roomler__vault_list"])
+        );
+        // P3-4c — and what a person is asked for every time.
+        assert_eq!(
+            doc["permissions"]["ask"],
+            json!(["mcp__roomler__vault_exec"])
         );
         // P2e-7 — the resume note's hook: on a resume, and (P2f-3a) on a
         // fork's first launch, never on a first start.
@@ -787,12 +806,17 @@ mod tests {
             extra_read_denies: vec![],
             session_start_hook: None,
             allow_tools: vec![],
+            ask_tools: vec![],
         }
         .to_json();
         assert!(bare.get("hooks").is_none(), "no hook, no hooks key");
         assert!(
             bare["permissions"].get("allow").is_none(),
             "nothing allowed, no allow key: every tool call asks"
+        );
+        assert!(
+            bare["permissions"].get("ask").is_none(),
+            "nothing to ask for, no ask key"
         );
         assert_eq!(
             bare["sandbox"],

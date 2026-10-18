@@ -4641,9 +4641,24 @@ fn write_settings(runtime: &Path, sid: &str, vault_tools: bool) -> Result<PathBu
         } else {
             Vec::new()
         },
+        // P3-4c — and each of its uses asks one, whatever a repository's
+        // own settings allow.
+        ask_tools: vault_use_tools(vault_tools),
     }
     .to_json();
     write_doc(&dir, "settings.json", &doc)
+}
+
+/// FR-90 P3-4c — the tools a session's settings ask a person for on every
+/// call: the vault's uses, wherever the vault tools are offered.
+fn vault_use_tools(vault_tools: bool) -> Vec<String> {
+    #[cfg(feature = "vault")]
+    if vault_tools {
+        return toolbelt::VAULT_USE_TOOLS.map(String::from).to_vec();
+    }
+    #[cfg(not(feature = "vault"))]
+    let _ = vault_tools;
+    Vec::new()
 }
 
 /// `dir/name`, written whole (a temporary, then a rename) and `0644`: the
@@ -7545,12 +7560,23 @@ done
                     .any(|d| d == rule.as_str()),
                 "{offered}"
             );
+            // P3-4c — and each of the vault's uses is ASKED for: an ask
+            // prompts whatever a repository's own settings allow.
+            assert_eq!(
+                offered["permissions"]["ask"],
+                serde_json::json!(toolbelt::VAULT_USE_TOOLS),
+                "{offered}"
+            );
         }
         write_settings(&runtime, "not-offered", false).unwrap();
         let doc = read("not-offered");
         assert!(
             doc["permissions"].get("allow").is_none(),
             "nothing allowed: every tool call asks: {doc}"
+        );
+        assert!(
+            doc["permissions"].get("ask").is_none(),
+            "no vault use offered, none to ask for: {doc}"
         );
         assert!(
             !doc["permissions"]["deny"].to_string().contains("secrets"),

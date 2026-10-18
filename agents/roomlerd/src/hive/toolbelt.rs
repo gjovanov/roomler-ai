@@ -302,7 +302,8 @@ const VAULT_TOOL_NAMES: [&str; 2] = ["vault_list", "vault_describe"];
 
 /// FR-90 P3-4c — and its uses: a value handed to one command (c-1), or
 /// written into the session's secrets directory (c-2). Offered with the
-/// reads, and never allowed in the settings: each call asks a person first.
+/// reads, and asked for in the settings ([`VAULT_USE_TOOLS`]): each call asks
+/// a person first.
 #[cfg(feature = "vault")]
 const VAULT_USE_NAMES: [&str; 2] = ["vault_exec", "vault_render"];
 
@@ -320,6 +321,16 @@ fn is_vault_tool(name: &str) -> bool {
 /// vault's own `secret:list`, not a person's approval.
 pub(crate) const VAULT_TOOLS: [&str; 2] =
     ["mcp__roomler__vault_list", "mcp__roomler__vault_describe"];
+
+/// FR-90 P3-4c — the vault's uses, as Claude Code names them: ASKED for in
+/// the session's settings (`permissions.ask`) wherever they are offered.
+/// Leaving them out of `allow` is not enough: a repository's own
+/// `.claude/settings.json` loads too, and an allow there would skip the
+/// person. Claude Code reads deny, then ask, then allow, across every
+/// settings file, so this ask prompts whatever another file allows.
+#[cfg(feature = "vault")]
+pub(crate) const VAULT_USE_TOOLS: [&str; 2] =
+    ["mcp__roomler__vault_exec", "mcp__roomler__vault_render"];
 
 /// FR-90 P3-4b — the daemon's vault for a run's toolbelt: its lease client,
 /// where the primary connection takes leases; otherwise none, and the vault
