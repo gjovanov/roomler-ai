@@ -294,6 +294,52 @@ async fn a_quarantined_or_removed_device_cannot_renew() {
     assert_eq!(renew(&app, &token).await.status(), 401, "removed");
 }
 
+/// #2463 — a device with NO row (FR-51's reaper hard-deletes an ephemeral
+/// one) is refused at the agent socket with the 401 the HTTP routes already
+/// give it, BEFORE the upgrade. It used to upgrade and drop with no frame, and
+/// the daemon reconnected every minute forever. A live device still upgrades,
+/// and a removed (tombstoned) one still upgrades to hear its typed goodbye.
+#[tokio::test]
+async fn a_device_with_no_row_is_refused_before_the_upgrade() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("i2463gone").await;
+    let (agent_id, token) = enroll(&app, &seeded, "m-2463-reaped").await;
+    assert_eq!(
+        upgrade_status(&app, "/ws", &token).await,
+        101,
+        "a live device upgrades"
+    );
+    // The reaper's hard delete (`hard_delete_ephemeral`): no tombstone left.
+    let oid = bson::oid::ObjectId::parse_str(&agent_id).unwrap();
+    let gone = app
+        .db
+        .collection::<bson::Document>("agents")
+        .delete_one(bson::doc! { "_id": oid })
+        .await
+        .unwrap();
+    assert_eq!(gone.deleted_count, 1, "the row is gone");
+    assert_eq!(
+        upgrade_status(&app, "/ws", &token).await,
+        401,
+        "no row: refused before the upgrade"
+    );
+    assert_eq!(
+        self_devices(&app, &token).await,
+        401,
+        "the HTTP routes agree"
+    );
+
+    // A removed device keeps its tombstone, upgrades, and hears its typed
+    // goodbye (`rc:goodbye AgentDeleted`, exit 7): unchanged.
+    let (removed_id, removed_token) = enroll(&app, &seeded, "m-2463-removed").await;
+    remove(&app, &seeded, &removed_id).await;
+    assert_eq!(
+        upgrade_status(&app, "/ws", &removed_token).await,
+        101,
+        "a tombstone still upgrades to its goodbye"
+    );
+}
+
 /// The kill switches: `rc.token_renewal = false` answers 404 on both renew
 /// routes; `rc.token_generation_check = false` accepts a pre-removal token
 /// again, which is the behaviour before FR-103.
