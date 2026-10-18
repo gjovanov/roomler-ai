@@ -1,8 +1,10 @@
 # FR-95: A system install shows a Wayland desktop by default, once the person at the screen can see it on every distro
 
 **Issue:** [#2041](https://github.com/gjovanov/roomler-ai/issues/2041) · **Status:** P1 delivered by FR-93 P6d–P6g; P2 lab-verified 2026-10-15; **P2 verified on the released 0.4.141**
-2026-10-17 (GNOME 50 and Plasma 6.7 system installs: AC1–AC4 and AC7 ticked; both kill switches pass; AC5's
-X11 half and AC6's "before" count owed); proposed 2026-10-12 · **Owner:** remote desktop (agent),
+2026-10-17 (GNOME 50 and Plasma 6.7 system installs: AC1–AC4 and AC7 ticked; both kill switches pass); AC5 ticked
+2026-10-18 on 0.4.143 (an X11 system install is unchanged; the gap that leaves is #2450); AC6's "before" count was
+never snapshotted and cannot be recovered (the server keeps only each device's current brief, and no prod backup
+predates the roll), which waits on the operator; proposed 2026-10-12 · **Owner:** remote desktop (agent),
 consent surfaces (FR-27) · **Split from:** [FR-93](FR-93-wayland-out-of-the-box.md) (its AC2, re-worded the same
 day) · **Builds on:** [FR-36](FR-36-wayland-capture.md) (DRM + uinput), [FR-27](FR-27-consent-surfaces-and-desktop-companion.md)
 (the companion and the prompt-surface chain), FR-93 P2b (the hello's desktop brief, to measure who this serves)
@@ -137,12 +139,23 @@ the person who was told is back. Their own new viewer session re-plans, and tell
   KDE's lock screen), and the lifecycle harness passed lock, unlock, logout and login 4/4 on each. The
   greeter was never read. One mostly black transition frame reached the viewer just after GNOME's logout, before
   the guard flipped (§8).
-- [ ] **AC5**: either kill switch gives back the behaviour before this FR exactly, and X11 hosts are unchanged.
+- [x] **AC5**: either kill switch gives back the behaviour before this FR exactly, and X11 hosts are unchanged.
   ⏳ Both kill switches pass on the released 0.4.141 (`wayland_auto_system = false` on both desktops,
   `wayland_auto = false` on GNOME): 0.4.137's overlay, word for word. X11 is unchanged by construction (the plan
   needs a Wayland session on screen). An X11 host was run on the release on 2026-10-17 (FR-93 AC11: a vmtest
   Ubuntu cell, GNOME on Xorg, the scrap arm, an idle RTP session at 1.4 % of a core), but as a **per-user**
   install, which this FR does not change. Owed: a system install on an X11 host.
+  ✅ **A system install on an X11 host, the released 0.4.143** (2026-10-18). The host was a vmtest Ubuntu 24.04
+  cell with GDM on Xorg (`WaylandEnable=false`): `loginctl` showed seat0's session `type=x11`. The system daemon
+  was re-enrolled on a default config, with no `drm_capture` and no `uinput`.
+  - The plan did not engage. The desktop brief read `kind=x11 capture_arm=x11`, and nothing was switched.
+  - The X11 arm then failed exactly as it did before this FR: `scrap enumeration failed … connection refused`,
+    then `NoopCapture`, `no_display`, because a system unit has none of the session's variables
+    (`linux-capture.md` §1).
+  - X11 is unchanged. What "unchanged" means there is a gap of its own: a system install on an X11 desktop shows
+    no picture by default. It is filed as #2450.
+  - The same cell with the lane's own `drm_capture = true` captured the X11 session through DRM (84 of 84
+    samples with a picture). Explicit keys are the operator's, and this FR leaves them alone.
 - [ ] **AC6**: P0's counts recorded before and after the roll (the server, not an exec sweep).
   ⏳ **After** (prod, 2026-10-17 19:03Z, §8): no customer device answers `none` on Wayland. **Before** was never
   snapshotted at the 0.4.139 roll; the devices still on older versions are what is left of it, and none of them
