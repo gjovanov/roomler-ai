@@ -823,9 +823,21 @@ console-user spawn it needs a caller that may read the console user's token
 with the reason, as `exec` does. A `named` account still refuses on Windows,
 because becoming an arbitrary user there needs that user's credentials.
 Running the transfer as SYSTEM is never the fallback. The device still needs
-OpenSSH's `sftp-server.exe` (one corporate laptop in the FR-81 lane had none),
-and without it the subsystem refuses as below. Kill switch:
-`ROOMLERD_SFTP_AS_USER=0` puts the pre-P4b refusal back.
+OpenSSH's `sftp-server.exe`, which Windows installs with the optional OpenSSH
+Server feature: two of the three corporate laptops measured on 2026-10-18 have
+it, and the third has only the client. Without it the subsystem refuses as
+below.
+
+Kill switch: `ROOMLERD_SFTP_AS_USER=0` puts the pre-P4b refusal back. On a
+Windows service install, set it with
+`roomlerd set-service-env-var --name ROOMLERD_SFTP_AS_USER --value 0`, then
+restart the service. The SystemContext worker inherits the service's
+environment, so a machine-wide variable reaches it only after a reboot.
+⚠️ Never replace the service's registry `Environment` value by hand. On a
+SystemContext install it already holds `ROOMLERD_ENABLE_SYSTEM_SWAP=1`.
+Overwriting it turned a test device into a user-context one, whose worker,
+enrolled machine-wide, exited at once with `no config found`.
+`set-service-env-var` edits one entry and keeps the rest.
 
 Until P4b this subsystem refused every Windows non-daemon account (FR-89, open
 decision 3), so the `console_user` corporate laptops had no `scp`. There,
@@ -840,6 +852,23 @@ channel — SFTP is binary and injected text corrupts a transfer.
 Field-proven 2026-08-22, buildhost → fleet-host-1: an `sftp put` landed
 `-rw-r--r-- root root` (matching `ssh_account_mode = daemon`), and `scp`
 round-tripped a file byte-identical in both directions.
+
+Field-proven for Windows `console_user` 2026-10-18 (FR-97 P4b) on a throwaway
+Win11 SystemContext guest, from stock OpenSSH 10 over the mesh with a key in
+the device's `ssh_authorized_keys`. On 0.4.142 the key authenticated, a command
+ran as the person, and `sftp` and `scp` were refused (exit 255). On P4b:
+
+- `pwd` said `/C:/Users/vmtest`, and a relative `put` landed there;
+- an 8 MiB file came back byte-identical over `sftp` and over `scp` (both exit 0);
+- both files on the device were owned by the signed-in account, not SYSTEM;
+- a client killed mid-upload left no `sftp-server` running (`cancelled by the caller`);
+- the kill switch brought the refusal back.
+
+⚠️ Dial roomler's port, `ssh_port` (2222 by default; 2223 is the SYSTEM
+service's, FR-105). On a device that runs its own `sshd`, port 22 over the mesh
+reaches that server, which offers passwords too. A "Permission denied
+(publickey,password,keyboard-interactive)" is that `sshd` answering, not
+roomler. The first P4b run dialled 22 and met exactly that.
 
 ### Port forwarding — `-L`, `-J`, `-W` (P7b — shipped)
 
