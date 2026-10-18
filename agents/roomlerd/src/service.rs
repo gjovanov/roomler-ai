@@ -586,6 +586,17 @@ mod windows {
             }
             Ok(false) => {
                 end_task().context("no daemon for this config holds a stop event")?;
+                if own_session() == Some(0) {
+                    // An SSH login is session 0 too: the event lives in the
+                    // person's session, which this one cannot see into.
+                    return Ok(
+                        "This command runs in session 0 (a service or an SSH login), \
+                               where a per-user daemon's stop event cannot be seen, so it \
+                               ended the task (schtasks /End), a hard stop. For a clean \
+                               stop, run `roomlerd service stop` in the person's own session."
+                            .into(),
+                    );
+                }
                 Ok(
                     "No daemon for this config holds a stop event: none is running, or it is \
                      from before this command could ask one to leave. Ended the task \
@@ -601,6 +612,18 @@ mod windows {
                 ))
             }
         }
+    }
+
+    /// The Terminal Services session this process runs in. 0 is the services
+    /// session, where an SSH login lands as well.
+    fn own_session() -> Option<u32> {
+        use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+        use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+        let mut session = 0u32;
+        // SAFETY: `session` is a valid out-pointer for the call, and the id is
+        // this process's own.
+        let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+        (ok != 0).then_some(session)
     }
 
     /// `schtasks /End` the registered task: a hard stop.
