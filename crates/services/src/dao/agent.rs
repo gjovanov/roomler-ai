@@ -149,6 +149,8 @@ impl AgentDao {
             // Unknown until the device's first hello — enrolment does not
             // reach the machine, so there is nothing to record yet.
             ssh_host_pubkey: String::new(),
+            // FR-90 P3-3a — the same: only a running daemon holds a vault key.
+            vault_key: String::new(),
             agent_token_hash,
             // FR-103 — a new row starts at generation 0; only a removal
             // advances it.
@@ -454,6 +456,7 @@ impl AgentDao {
         capabilities: &AgentCaps,
         advertised_routes: &[String],
         ssh_host_pubkey: &str,
+        vault_key: &str,
         arch: &str,
         arch_emulated: bool,
     ) -> DaoResult<bool> {
@@ -470,6 +473,10 @@ impl AgentDao {
             "capabilities": caps_bson,
             "advertised_routes": advertised_bson,
             "ssh_host_pubkey": ssh_host_pubkey,
+            // FR-90 P3-3a — on every hello too, and for a stronger reason:
+            // the daemon makes a new vault key at each start, so a key left
+            // standing would name a process that is gone.
+            "vault_key": vault_key,
             "status": bson::to_bson(&AgentStatus::Online).unwrap(),
             "last_seen_at": DateTime::now(),
         };

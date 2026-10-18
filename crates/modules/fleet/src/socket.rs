@@ -68,6 +68,7 @@ pub async fn handle_agent_socket(
             advertised_routes,
             supports_relay_regions,
             ssh_host_pubkey,
+            vault_key,
         }) => (
             machine_name,
             os,
@@ -78,6 +79,7 @@ pub async fn handle_agent_socket(
             advertised_routes,
             supports_relay_regions,
             ssh_host_pubkey,
+            vault_key,
         ),
         other => {
             warn!(?other, "agent opened WS without rc:agent.hello — closing");
@@ -94,7 +96,23 @@ pub async fn handle_agent_socket(
         advertised_routes,
         supports_relay_regions,
         ssh_host_pubkey,
+        vault_key,
     ) = hello;
+    // FR-90 P3-3a — a vault key is stored only as one the vault can seal to;
+    // anything else is stored as none, so the device takes no leases until a
+    // hello carries a key that is well formed.
+    let vault_key = if vault_key.is_empty()
+        || roomler_ai_remote_control::signaling::vault_key_is_well_formed(&vault_key)
+    {
+        vault_key
+    } else {
+        warn!(
+            %agent_id,
+            len = vault_key.len(),
+            "agent hello carried a malformed vault key — storing none"
+        );
+        String::new()
+    };
 
     // Persist: mark online, update hello fields on the Mongo row. Best-effort —
     // signaling still works if Mongo lags.
@@ -107,6 +125,7 @@ pub async fn handle_agent_socket(
             &caps,
             &advertised_routes,
             &ssh_host_pubkey,
+            &vault_key,
             &arch,
             arch_emulated,
         )

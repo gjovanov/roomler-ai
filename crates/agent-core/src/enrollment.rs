@@ -292,6 +292,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         hive_replica: false,
         hive_archive: false,
         hive_store_quota_mib: None,
+        vault_enabled: false,
         // FR-89: on, like every fresh install; `false` is the kill switch
         // an owner reaches for, never a starting point.
         ssh_exec_streaming: true,
