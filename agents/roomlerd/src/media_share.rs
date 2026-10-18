@@ -328,11 +328,25 @@ impl Pipeline {
     /// Floor-merge of the Priority dial's relay resolution cap: the smallest
     /// cap across viewers (None = uncapped for that viewer).
     pub fn merged_priority_cap(&self, own_cap: Option<u32>, constrained: bool) -> Option<u32> {
+        self.merged_priority_cap_by(own_cap, |p| {
+            crate::encode::priority_relay_cap(p, constrained)
+        })
+    }
+
+    /// [`Self::merged_priority_cap`] with the per-dial cap supplied — the
+    /// FR-70 M3a plan producer's form, which resolves the dial caps once per
+    /// pump (`encode::priority_relay_cap_for`) instead of reading env for
+    /// every follower on every frame. The reader above is this applied.
+    pub fn merged_priority_cap_by(
+        &self,
+        own_cap: Option<u32>,
+        cap_of: impl Fn(u8) -> Option<u32>,
+    ) -> Option<u32> {
         let inner = self.inner.lock().unwrap();
         let mut cap = own_cap;
         for f in &inner.followers {
             let p = f.sink.priority.load(Relaxed);
-            let fc = crate::encode::priority_relay_cap(p, constrained);
+            let fc = cap_of(p);
             cap = match (cap, fc) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (None, Some(b)) => Some(b),

@@ -2900,4 +2900,213 @@ mod tests {
             }
         }
     }
+
+    // -- FR-70 M3a: the plan producer on the cells -----------------------------
+
+    /// FR-70 M3a — a `RateLaw` that runs the plan producer beside the
+    /// governor law and counts every frame on which the producer's budget is
+    /// not the law's own statement of the inline arithmetic.
+    struct ShadowedLaw {
+        inner: GovernorLaw,
+        knobs: super::super::plan::PlanKnobs,
+        checked: std::cell::Cell<u32>,
+        diverged: std::cell::Cell<u32>,
+        first: std::cell::RefCell<Option<String>>,
+    }
+
+    impl ShadowedLaw {
+        fn new(inner: GovernorLaw) -> Self {
+            // The sim's constants, explicit — exactly as
+            // `GovernorLaw::queue_budget_bytes` states them, so nothing here
+            // reads the environment.
+            let knobs = super::super::plan::PlanKnobs {
+                relay_max_bps: inner.nominal_ceiling_bps,
+                constrained_queue_ms: 450,
+                constrained_queue_measured: true,
+                direct_queue_ms: 150,
+                direct_hrd_pct: 100,
+                refined_cap: None,
+                priority_caps: super::super::PriorityCaps::default(),
+            };
+            Self {
+                inner,
+                knobs,
+                checked: std::cell::Cell::new(0),
+                diverged: std::cell::Cell::new(0),
+                first: std::cell::RefCell::new(None),
+            }
+        }
+
+        fn inputs(&self) -> super::super::plan::PlanInputs {
+            super::super::plan::PlanInputs {
+                constrained: true,
+                target_fps: self.inner.fps,
+                paced_fps: None,
+                pipe_bps: self.inner.pipe_bps(),
+                ceiling_reference_bps: self.inner.nominal_ceiling_bps,
+                hrd_pct: 200,
+                target_bps: self.inner.target_bps(),
+                dims: super::super::policy::DimsInputs {
+                    native_w: 1920,
+                    native_h: 1200,
+                    merged_target: crate::peer::TargetResolution::Native,
+                    merged_priority_cap: None,
+                    slow_link_cap: None,
+                    refined: false,
+                    refined_cap: None,
+                    soft_cap: None,
+                },
+            }
+        }
+    }
+
+    impl RateLaw for ShadowedLaw {
+        fn label(&self) -> &'static str {
+            self.inner.label()
+        }
+
+        fn on_frame(&mut self, occupied: u32, full: bool, now: Instant) -> u32 {
+            self.inner.on_frame(occupied, full, now)
+        }
+
+        fn on_window(&mut self, w: &WindowStats, now: Instant) {
+            self.inner.on_window(w, now)
+        }
+
+        fn target_bps(&self) -> u32 {
+            self.inner.target_bps()
+        }
+
+        fn queue_budget_bytes(&self) -> usize {
+            // The harness asks once per frame, before `on_frame` — the gate's
+            // own cadence. The law's answer is the sim's statement of the
+            // inline arithmetic with the constants explicit; the producer's
+            // must equal it on every frame of every cell. The harness then
+            // gates on the law's number, so the cell itself is unchanged.
+            let inline = self.inner.queue_budget_bytes();
+            let plan = super::super::plan::produce(&self.inputs(), &self.knobs, None);
+            self.checked.set(self.checked.get() + 1);
+            if plan.queue_budget_bytes != inline {
+                self.diverged.set(self.diverged.get() + 1);
+                let mut first = self.first.borrow_mut();
+                if first.is_none() {
+                    *first = Some(format!(
+                        "frame {}: plan {} vs inline {} (pipe {:?}, target {})",
+                        self.checked.get(),
+                        plan.queue_budget_bytes,
+                        inline,
+                        self.inner.pipe_bps(),
+                        self.inner.target_bps()
+                    ));
+                }
+            }
+            inline
+        }
+
+        fn remembered_candidate_bps(&self) -> Option<u32> {
+            self.inner.remembered_candidate_bps()
+        }
+
+        fn pipe_state(&self) -> Option<PipeState> {
+            self.inner.pipe_state()
+        }
+
+        fn rejected_windows(&self) -> u32 {
+            self.inner.rejected_windows()
+        }
+
+        fn on_budget_skip(&mut self, now: Instant) {
+            self.inner.on_budget_skip(now)
+        }
+    }
+
+    /// FR-70 M3a — the plan producer reproduces the byte budget the B0 cells
+    /// gate on, frame for frame, on every fixture: the four plan cells, the
+    /// FR-63 AC0b cell, the early-stall cell, FR-70 P1's remembered-pair cells
+    /// (seed 200 k, the prior pinned and decaying) and FR-71's finding-4 cell.
+    /// One frame apart fails with the cell named. The negative control — a
+    /// planted `+ 1` in the producer — fails every cell on its first frame;
+    /// both runs are recorded in the spec's M3a section.
+    #[test]
+    fn the_plan_producer_reproduces_the_b0_cells_budget_frame_for_frame() {
+        let seeded = |law: GovernorLaw, decay: bool| law.with_prior_decay(decay).with_seed(200_000);
+        let cells: Vec<(&str, Scenario, GovernorLaw)> = vec![
+            (
+                "AC0b corp VPN thin pipe (arm B)",
+                corp_vpn_thin_pipe(),
+                arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS),
+            ),
+            (
+                "airport hotspot (arm B)",
+                airport_hotspot(),
+                arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS),
+            ),
+            (
+                "DERP with stalls (arm B)",
+                derp_with_stalls(),
+                arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS),
+            ),
+            (
+                "LAN 5M bursts (arm B)",
+                lan_wifi_burst(),
+                arm_b(FLAT_FLOOR_BPS, 5_000_000),
+            ),
+            (
+                "fast pipe, early stall (arm A)",
+                fast_pipe_early_stall(),
+                arm_a(FLAT_FLOOR_BPS, RELAY_CEILING_BPS),
+            ),
+            (
+                "fast pair misremembered (seed 200k, arm B)",
+                fast_pair_misremembered(),
+                arm_b(FLAT_FLOOR_BPS, 20_000_000).with_seed(200_000),
+            ),
+            (
+                "CORPLAP-1 remembered slow, prior pinned",
+                corplap1_remembered_slow_relay(),
+                seeded(arm_a(FLAT_FLOOR_BPS, RELAY_CEILING_BPS), false),
+            ),
+            (
+                "CORPLAP-1 remembered slow, prior decaying",
+                corplap1_remembered_slow_relay(),
+                seeded(arm_a(FLAT_FLOOR_BPS, RELAY_CEILING_BPS), true),
+            ),
+            (
+                "CORPLAP-1 genuinely slow, prior decaying",
+                corplap1_genuinely_slow_relay(),
+                seeded(arm_a(FLAT_FLOOR_BPS, RELAY_CEILING_BPS), true),
+            ),
+            (
+                "finding 4 transit stall (arm A)",
+                finding4_transit_stall(),
+                arm_a(FLAT_FLOOR_BPS, RELAY_CEILING_BPS),
+            ),
+        ];
+        for (label, sc, law) in cells {
+            let law = law.with_measure(MeasureRule::OnPushBack).with_fps(sc.fps);
+            let mut shadowed = ShadowedLaw::new(law);
+            let tr = run_opts(
+                &sc,
+                &mut shadowed,
+                SimOptions {
+                    budget_gate: true,
+                    rebuild_idr: true,
+                },
+            );
+            assert!(
+                shadowed.checked.get() > 100,
+                "{label}: the harness asked for the budget only {} times",
+                shadowed.checked.get()
+            );
+            assert_eq!(
+                shadowed.diverged.get(),
+                0,
+                "{label}: the producer's budget diverged on {} of {} frames — first: {}{}",
+                shadowed.diverged.get(),
+                shadowed.checked.get(),
+                shadowed.first.borrow().as_deref().unwrap_or("-"),
+                tr.render()
+            );
+        }
+    }
 }
