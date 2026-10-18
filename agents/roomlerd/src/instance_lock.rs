@@ -85,6 +85,14 @@ pub fn acquire(config_path: &Path) -> Result<AcquireOutcome> {
     }
 }
 
+/// The daemon instance a config path names: the fingerprint this lock is
+/// keyed by. FR-97 P4d keys a per-user daemon's stop event by it too, so
+/// `roomlerd service stop` reaches the daemon of the config it resolved, as
+/// a second `run` would collide with that daemon and no other.
+pub fn instance_id(config_path: &Path) -> String {
+    lock_id(config_path)
+}
+
 /// Stable 12-hex-char fingerprint of the config path. Collisions are
 /// astronomically unlikely; even if they occurred the worst-case is
 /// "two agents with different configs share a lock" which is the

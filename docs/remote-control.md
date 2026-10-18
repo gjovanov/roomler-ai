@@ -241,7 +241,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:2615`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:191`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:341`, wired at `main.rs:3746`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:341`, wired at `main.rs:3785`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -3014,6 +3014,10 @@ The fix is a per-worker **named stop event**
   spawn by minutes under EDR). A suppressed unenroll is logged by name. The gate
   is platform-neutral; Linux never needed it only because `dpkg -i` does not
   restart `roomlerd`.
+- **A per-user install has no host to signal it.** Since FR-97 P4d, the
+  Scheduled Task's daemon holds its own event, which `roomlerd service stop`
+  signals, and hears sign-out and shutdown through a hidden window. Both reach
+  this same arm (`docs/ephemeral-nodes.md`, "A per-user Windows install").
 - **Security** — the event's DACL (`STOP_EVENT_SDDL`, a protected `D:P`) grants
   **only SYSTEM** `EVENT_ALL_ACCESS` (the sole principal that may `SetEvent`) and
   interactive users `SYNCHRONIZE` only (wait, never signal). A worker may run as

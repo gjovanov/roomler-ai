@@ -25,11 +25,14 @@ roomlerd run          … the device works like any other …
         │       signals the worker's stop event and waits (#1683)
         │       (an update's OWN service stop is not a leave — the device
         │        stays enrolled; see below)
+        │     • Windows per-user install (the Scheduled Task): `roomlerd service
+        │       stop`, sign-out, shutdown (FR-97 P4d; see below)
         │       → the daemon calls POST /api/agent/self/unenroll
         │       → removed within seconds
         │
-        └── unclean stop (SIGKILL, power loss, network partition, or a Windows
-            worker that did not exit inside the host's graceful-stop budget)
+        └── unclean stop (SIGKILL, `schtasks /End`, power loss, network
+            partition, a Windows worker that did not exit inside the host's
+            graceful-stop budget, or a per-user daemon past its 5 s at sign-out)
                 → the server-side reaper removes it once it has been
                   silent past its TTL (default 15 min, 60 s floor)
 ```
@@ -122,6 +125,9 @@ exec roomlerd run
   #1683 the hard kill was the only path and a Windows-service ephemeral device
   always waited out the reaper's TTL. Mechanism: `docs/remote-control.md`
   (service host) and `agents/roomlerd/src/win_service/stop_event.rs`.
+- **A per-user Windows install** (the perUser MSI's Scheduled Task) has no
+  service host to ask it, so it holds a stop channel of its own and listens for
+  the session's end: [below](#a-per-user-windows-install-fr-97-p4d).
 - **An update's own service stop never unenrolls.** The MSI stops the service
   while it replaces the binary — by then the worker that spawned the installer
   has already exited 0 and the SCM host has respawned a fresh one, which receives
@@ -134,6 +140,66 @@ exec roomlerd run
   the reaper — which is what every Windows-service stop did before #1683.
 - `roomler status` on an ephemeral device says so
   (`ephemeral   yes — removes itself after inactivity, or on clean stop`).
+
+## A per-user Windows install (FR-97 P4d)
+
+The perUser MSI runs the daemon from a Scheduled Task, as the person signed in.
+No service host stands in front of it, so before P4d nothing ever told it that
+it was stopping: `schtasks /End` is a `TerminateProcess`, and sign-out and
+shutdown end it with the rest of the session. An ephemeral device installed that
+way always waited out the reaper. Two channels now carry a clean stop to it,
+into the same `os_initiated_stop` arm a Unix SIGTERM takes:
+
+```mermaid
+flowchart LR
+  A["roomlerd service stop"] -->|"SetEvent on<br/>Local\roomler-user-stop-&lt;config id&gt;"| W
+  S["sign-out · shutdown · restart"] -->|"WM_ENDSESSION to<br/>a hidden window"| W
+  R["an installer's Restart Manager<br/>(ENDSESSION_CLOSEAPP)"] -.->|ignored| K["the daemon runs on"]
+  W["terminate_signal:<br/>the OS-initiated arm"] --> U["self-unenroll, ≤ 3 s<br/>(ephemeral, no update in flight)"]
+  U --> D["clean shutdown on disk"]
+  D -->|"the window lets go of<br/>WM_ENDSESSION (≤ 5 s)"| E["Windows ends the session"]
+```
+
+| What ends the per-user daemon | Before P4d | Since P4d |
+|---|---|---|
+| `roomlerd service stop` | (no such command) | A clean stop: an ephemeral device unenrolls. It waits up to 15 s for the daemon to leave, then falls back to `schtasks /End` |
+| Sign-out, shutdown, restart | Killed with the session; the reaper collects an ephemeral device | A clean stop, which the window holds the session's end for, at most 5 s (`SESSION_END_BUDGET`) |
+| An installer's Restart Manager (`ENDSESSION_CLOSEAPP`) | — | Ignored: never a leave |
+| `roomlerd service stop` from an SSH login (session 0) | (no such command) | A hard stop (`schtasks /End`), and it says why: the person's event lives in their own session, which session 0 cannot see |
+| `schtasks /End`, Task Manager's End task, `taskkill /F` | A hard kill; the reaper | The same |
+| `taskkill` without `/F` (`WM_CLOSE`) | Refused: "can only be terminated forcefully" | In the person's session, taskkill reports that it sent the signal, and the daemon keeps running. Use `roomlerd service stop` |
+| An auto-update | The internal arm: stays enrolled | The same |
+
+- **Which daemon.** The event is keyed by the config's instance id, the
+  fingerprint the single-instance lock already uses
+  ([`instance_lock.rs:92`](../agents/roomlerd/src/instance_lock.rs#L92)). So
+  `service stop` reaches the daemon of the config it resolved, and no other.
+  `Local\` keeps the event in the person's own session, and its default DACL
+  lets that person and SYSTEM signal it, which Task Manager already allows them.
+- **Why a window.** A console program hears `CTRL_LOGOFF_EVENT` only until it
+  loads `user32.dll`, and the daemon loads it for capture and input. Windows
+  tells such a process through `WM_QUERYENDSESSION` and `WM_ENDSESSION`, sent to
+  its top-level windows, so a hidden one listens
+  ([`session_end.rs`](../agents/roomlerd/src/win_service/session_end.rs)). A
+  message-only window would hear nothing: the session's end is a broadcast.
+  `WM_QUERYENDSESSION` is answered yes and never acted on, because another
+  program can still cancel the end. Only `WM_ENDSESSION` with `wParam` TRUE
+  stops the daemon.
+- **Why Restart Manager is ignored.** An installer that finds the daemon's files
+  in use asks it to close with `ENDSESSION_CLOSEAPP`. Read as a leave, a manual
+  MSI upgrade would delete an ephemeral device, the trap #1683 closed for the
+  service. The auto-updater's own stop is the internal arm, which never
+  unenrolls.
+- **`service uninstall` does not stop the daemon, on purpose.** On a major
+  upgrade, Windows Installer runs the old product's uninstall, which runs
+  `service uninstall` from the outgoing binary (`UnregisterAutostart` in
+  `wix/main.wxs`). A stop there would unenroll an ephemeral device on every
+  manual upgrade.
+- **A daemon started while the last one is leaving** never takes that one's
+  event, which may already be signaled: it would stop the moment it started. It
+  takes the name as soon as the old daemon is gone.
+- Kill switch: `ROOMLERD_SESSION_END=0` makes no window, and a sign-out ends the
+  daemon unannounced again. `service stop` needs none: it acts only when asked.
 
 ## Quota
 
