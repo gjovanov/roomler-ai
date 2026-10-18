@@ -63,7 +63,7 @@ sequenceDiagram
 - ⚠️ **Both frames are gated at both ends.** An older agent cannot parse them. The agent advertises
   `mouse-rel` in `AgentCaps.input` only where its injector carries relative motion
   ([`mod.rs:178`](../agents/roomlerd/src/input/mod.rs#L178) `advertises_mouse_rel`, appended at every
-  announcement, [`signaling.rs:6326`](../agents/roomlerd/src/signaling.rs#L6326)). The viewer offers the
+  announcement, [`signaling.rs:6382`](../agents/roomlerd/src/signaling.rs#L6382)). The viewer offers the
   control only to an agent that says so, matched by equality
   ([`relativeMouse.ts:17`](../ui/src/composables/relativeMouse.ts#L17) `agentSupportsRelativeMouse`).
 
