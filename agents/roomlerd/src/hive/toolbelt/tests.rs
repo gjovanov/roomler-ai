@@ -848,6 +848,16 @@ async fn vault_exec_is_offered_and_never_allowed_unasked() {
             "the settings never allow {tool}: a person approves every call"
         );
     }
+    // And the settings ASK for each use offered, so no other settings file
+    // can allow one past the person.
+    let uses: Vec<String> = VAULT_USE_NAMES
+        .iter()
+        .map(|n| format!("mcp__roomler__{n}"))
+        .collect();
+    assert_eq!(
+        uses, VAULT_USE_TOOLS,
+        "what the settings ask for is every use offered"
+    );
 }
 
 /// P3-4c-1 — a command runs as the session's run would, with the value in

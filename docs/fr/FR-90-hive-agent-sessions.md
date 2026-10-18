@@ -143,7 +143,7 @@ flowchart LR
 |---|---|---|---|
 | events (`seq`, `fence`, `prev_hash`, the exact JSON) | appended by one writer, which wraps each event itself, at its own clock | a member also APPLIES the primary's envelope as received, through the same chain check. The store can do it already; the daemon's writer has no command for it | `crates/hive-node/src/store.rs:533` `append`; `agents/roomlerd/src/hive/store.rs:45` `Cmd`, `:855` |
 | the newest fence a member has seen | the tip's own, so only an event raises it | a fence FLOOR per session, raised by the server's word before any event of the new fence exists, and checked with the tip's | `crates/hive-node/src/chain.rs:162` |
-| Claude Code's history (`<config dir>/projects/hive-<uuid>/<uuid>.jsonl`), what `--resume` needs byte for byte | not kept: it lives in the account's home, and the daemon only checks that it exists | chunks by offset, each content-addressed (BLAKE3) | `crates/hive-node/src/launch.rs:166` `history_path`; `agents/roomlerd/src/hive/supervisor.rs:4906` (`session_state_dir`) |
+| Claude Code's history (`<config dir>/projects/hive-<uuid>/<uuid>.jsonl`), what `--resume` needs byte for byte | not kept: it lives in the account's home, and the daemon only checks that it exists | chunks by offset, each content-addressed (BLAKE3) | `crates/hive-node/src/launch.rs:166` `history_path`; `agents/roomlerd/src/hive/supervisor.rs:4921` (`session_state_dir`) |
 | the workspace | not kept | a git checkpoint at each turn's end, kept as a pack | design §6.3 |
 | the rest of the session's config directory | not kept | a snapshot of an allowlist at each checkpoint | below |
 | a tail a promotion cut off | — | events of an older fence past the newest common checkpoint, set aside | below |
@@ -168,7 +168,7 @@ the same line: the hook reads the transcript, never the daemon (§3h). Members n
 keep packs as they got them.
 
 **What the primary streams.** At the end of each turn (the stream-json `result`, in `Task::on_event`,
-`supervisor.rs:5385`; the run loop takes it, `checkpoint_or_stop`, `:5783`) the session's task runs `hive-checkpoint` and records a `checkpoint` event that
+`supervisor.rs:5400`; the run loop takes it, `checkpoint_or_stop`, `:5798`) the session's task runs `hive-checkpoint` and records a `checkpoint` event that
 names, by hash, everything it produced. It chains like any event, so two members holding the same
 `(seq, hash)` hold the same workspace and history too. A member on an older daemon stores the new
 kind without reading it (`crates/hive-node/src/event.rs:25`), and the browser draws no card for it.
@@ -391,7 +391,7 @@ sequenceDiagram
 |---|---|---|
 | The owner promotes, holding `HIVE_RUN` | a promotion starts the session on a device, as one of its accounts | P2e-3: `crates/modules/hive/src/promote.rs:445` (`authorize`) |
 | Prepare first, the CAS last: the target passes every start gate, as it is configured now, before anything moves, and the lease moves only when the target's own tip equals the drained one | a refusal or a stalled sync leaves the session where it was (design §6.2) | P2e-3: `crates/modules/hive/src/promote.rs:1285` (`on_prepare_ack`), `:1799` (`sync_of`), `crates/modules/hive/src/dao.rs:793` (`move_lease`); the target's gates, P2e-5a: `agents/roomlerd/src/hive/supervisor.rs:2397` (`prepare`: a start's gates without its side effects, and the copy, `:2585`) |
-| The drain waits for the turn to end, at most 60 s, then cuts it. Open approvals are withdrawn with it, and the resume note names the last tool call that has no result | a turn waiting on a person could not end, and the lease must not move while the old primary may still be calling the model | P2e-4: `agents/roomlerd/src/hive/supervisor.rs:5061` (`take_up_drain`: the approvals withdrawn at once, and one that opens meanwhile, `:5197`), `:5455` (`on_drain_deadline`: the cut, with Claude Code's own interrupt, `:5108`), `:5878` (`finish_drain`: the last checkpoint and the tip); the resume note, P2e-7; the server waits 75 s (`crates/config/src/settings.rs:157`, `hive.promote_drain_secs`) and withdraws on the record what is still open at the move (`promote.rs:1833`) |
+| The drain waits for the turn to end, at most 60 s, then cuts it. Open approvals are withdrawn with it, and the resume note names the last tool call that has no result | a turn waiting on a person could not end, and the lease must not move while the old primary may still be calling the model | P2e-4: `agents/roomlerd/src/hive/supervisor.rs:5076` (`take_up_drain`: the approvals withdrawn at once, and one that opens meanwhile, `:5212`), `:5470` (`on_drain_deadline`: the cut, with Claude Code's own interrupt, `:5123`), `:5893` (`finish_drain`: the last checkpoint and the tip); the resume note, P2e-7; the server waits 75 s (`crates/config/src/settings.rs:157`, `hive.promote_drain_secs`) and withdraws on the record what is still open at the move (`promote.rs:1833`) |
 | ⚠️ An unreachable primary is waited out. The server promotes away from a primary whose control connection it lost only `WS_RX_DEADLINE + OFFLINE_GRACE + 30 s` (230 s) after it lost it, and closes the socket of one that ignores a drain, to start that clock | by then at the latest, the device's own sidecar has stopped serving the session (`agents/roomlerd/src/signaling.rs:61`, `agents/roomlerd/src/hive/sidecar.rs:69`, `:153`). Before it, two executors could both call the model | P2e-6a: `crates/modules/hive/src/promote.rs:355` (`unreachable_reach`: 230 s, and `hive-lease` in the last hello), `:1616` (`move_from_unreachable`: to the member's own tip); the 230 s held to the device's two clocks by `agents/roomlerd/src/hive/sidecar/tests.rs:968`. As built, no socket is closed (the P2e-6a note below) |
 | Every member's floor is the new fence before the new primary writes: the target's with its join, the others' with theirs, an offline member's before anything else it hears when it connects | the old primary's late events are then refused everywhere (`chain.rs:195`) | P2e-3: every join at the move, the old primary demoted first, the target's as the primary before its move and start (`promote.rs:1833`, `:1950`); a member behind the drained tip keeps the old fence's events up to where it ended (`crates/modules/hive/src/model.rs:191`, `fences`), P2e-5b: every join carries them (`crates/modules/hive/src/replica.rs:129`, `push_join`) and the member's store takes an older fence's events up to its end (`crates/hive-node/src/chain.rs:210`, `check_next_with_ends`); P2e-5c: the target takes that join up ahead of its start, raising its copy's floor (`agents/roomlerd/src/hive/supervisor/replica.rs:394`, `ahead_of_start`) |
 | The new primary counts turns on from the record's last, which `rc:hive.move` carries with who moved the session and from where | the server ignores a stub older than its newest (`crates/modules/hive/src/dao.rs:524`) | P2e-3: `promote.rs:1943` (`before_start`); the count, P2e-5a: `agents/roomlerd/src/hive/supervisor.rs:1537` (`receive_move`), `:4094` (what the device hosts) |
@@ -673,7 +673,7 @@ from its store, the last tool call without a result. It reaches the model as `Se
 `additionalContext` (`source = resume`), through a hook in the daemon-owned `--settings`, which holds
 none before P2e-7 (`supervisor.rs:4599` `write_settings`). The hook runs as the account and prints the note
 the daemon wrote into the session's runtime directory, `0600` and the account's, as core memory is
-written (`supervisor.rs:4671` `write_memory`). It is recorded as a `note` event and never reaches the
+written (`supervisor.rs:4686` `write_memory`). It is recorded as a `note` event and never reaches the
 server. If the probe shows `-p` does not apply it, the note goes in as the harness's first input,
 marked as Hive's.
 
@@ -682,7 +682,7 @@ where its earlier turns' paths live now, and the last tool call the store holds 
 OS, the shell and the toolchain drift are not in it yet. The hook is this binary, run as the
 account as the toolbelt's relay is: `roomlerd hive-resume-note <file>` prints the note when there is
 one (`agents/roomlerd/src/hive/resume_note.rs`). The settings carry it (`supervisor.rs:4599`
-`write_settings`), and the note is written as core memory is (`supervisor.rs:4671`
+`write_settings`), and the note is written as core memory is (`supervisor.rs:4686`
 `write_memory`).
 
 **Purges and retention.** Deleting a session writes a tombstone the server keeps until every member
@@ -1511,7 +1511,7 @@ flowchart LR
 | the start, as the console user | `hive/supervisor.rs:2102` `spawn`: the mapping, the harness, the session's directory (`:2137`), its settings and MCP config, `roomlerd hive-prep` as the user (`blocking`, `:2191`), then the harness SUSPENDED into its Job Object | the blocks' own (P1i-1); the whole path is P1i-4's field run |
 | the harness's process | `hive_win.rs:1101` `HarnessChild`: the part of tokio's `Child` the session task uses, over the job, its pipes as async files | a line in, a line out, the exit code; a kill seen by the wait |
 | the stop | `hive/supervisor.rs:3124`: stdin closed, then the job ended after the grace. No signal reaches a console-less process | — |
-| the toolbelt | `hive/toolbelt.rs:531`: a named pipe, `FILE_FLAG_FIRST_PIPE_INSTANCE`, no remote client, with `hive_win.rs:921`'s DACL: SYSTEM and Administrators, and the session's account to read and write (`0x12008b`) but not to make an instance. The relay opens it with exactly that mask (`hive_win.rs:1062`); each client's account is checked again by SID (`toolbelt.rs:588`) | every approval test, over the pipe; another account's connection dropped unanswered; a name in use never taken as the first |
+| the toolbelt | `hive/toolbelt.rs:542`: a named pipe, `FILE_FLAG_FIRST_PIPE_INSTANCE`, no remote client, with `hive_win.rs:921`'s DACL: SYSTEM and Administrators, and the session's account to read and write (`0x12008b`) but not to make an instance. The relay opens it with exactly that mask (`hive_win.rs:1062`); each client's account is checked again by SID (`toolbelt.rs:599`) | every approval test, over the pipe; another account's connection dropped unanswered; a name in use never taken as the first |
 | a crash's leftover | `hive/procs.rs:120`, `:248`: creation times by `GetProcessTimes`, and an ended process reads as none even while a handle holds it open | an ended process has no start time; `take_down` ends what it is given |
 | the key helper | `hive/sidecar.rs:182`: `cmd.exe /d /s /c "<helper>"`, by its full path, passed raw | — |
 | adopting | `hive/gates.rs:65`: `hive_adopt` reads off on Windows, so the device never advertises `hive-adopt` | the owner's word on Unix, off on Windows. Since FR-97 P4c, the owner's word on Windows too, through a named pipe (`docs/hive.md` §8, *On Windows*) |
@@ -1690,6 +1690,17 @@ the design document's §7 and §8; what follows binds it to the code as it stand
   session's settings deny the Read tool there; that is UX, and the gate is the permit, the
   guardrails and a person's approval (`docs/vault.md` §15).
 
+  ⚠️ **As built (after P3-4c-2): a person's approval of each use is an ASK in the settings,
+  not an absence from `allow`.** Writing P3-4c-2 found that `vault_exec` and `vault_render` were
+  only kept out of `permissions.allow`. A repository's own `.claude/settings.json` loads too
+  (open decision 7), and its allow would have skipped the person. The session's settings now
+  list both under `permissions.ask` (`toolbelt::VAULT_USE_TOOLS`, written wherever the vault
+  tools are offered). Claude Code reads deny, then ask, then allow, across every settings file, so
+  the ask prompts whatever the repository allows. The design's
+  `_meta["anthropic/requiresUserInteraction"]` was not the way: a `--permission-prompt-tool` can
+  never approve a tool marked so (Claude Code turns its allow into a deny), and `approve` is that
+  tool (`docs/vault.md` §14).
+
 **A session's identity to the vault.** The token the sidecar mints is the device's own, bound to the
 session and its fence (`agents/roomlerd/src/hive/sidecar.rs:94`). To the server, a session is its
 record. So a vault request is a frame from the device that runs the session, naming the session and
@@ -1731,7 +1742,7 @@ device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
   (`crates/tunnel-core/src/policy.rs:37`), so `tunnel_audit` names the session and not just its
   owner.
 
-**The toolbelt grows** beyond `approve` (`agents/roomlerd/src/hive/toolbelt.rs:907`):
+**The toolbelt grows** beyond `approve` (`agents/roomlerd/src/hive/toolbelt.rs:918`):
 - the vault tools: `vault_list`, `vault_describe`, `vault_request`, `vault_exec`, `vault_render`;
 - the network tools: `net_forward`, `net_socks`;
 - `ssh_run`;
@@ -2444,6 +2455,11 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
    `approve`; a repository's `.claude/settings.json` still loads, and its `permissions.allow` rules
    merge with ours, so a repository can pre-allow its own commands. That is the user's own repository
    and account — the prompts are UX, not the boundary — but `--setting-sources` could narrow it.
+   *The vault's uses are the exception* (after P3-4c-2): a person approves each one as a gate,
+   so the session's settings list `vault_exec` and `vault_render` under `permissions.ask`, which
+   no repository's allow overrides (Claude Code reads deny, then ask, then allow, across every
+   file). `--setting-sources user` would also have closed it, but it drops a repository's hooks
+   and environment with its permissions.
 8. **Who may drive on the device** (P1c-2a) — built default-deny: a driver other than the starter
    acts only when the device's own `hive_accounts` maps them to the session's account. Driving runs
    code there as that account, since a driver answers approvals too, and the account map is the

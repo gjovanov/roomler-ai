@@ -664,7 +664,7 @@ sequenceDiagram
 The toolbelt (FR-90 P1a, [`hive.md`](hive.md) §4) offers the two tools only
 where the device takes leases: its owner's `vault_enabled` on, a build with
 `vault`, the primary connection
-([`daemon_vault`](../agents/roomlerd/src/hive/toolbelt.rs#L327)). Wherever it
+([`daemon_vault`](../agents/roomlerd/src/hive/toolbelt.rs#L338)). Wherever it
 offers them, the session's settings allow them (`permissions.allow`,
 [`launch.rs:410`](../crates/hive-node/src/launch.rs#L410)), so no person is
 asked to approve each one: they only read, and their gate is the vault's own
@@ -694,7 +694,7 @@ no answer, and the daemon stops waiting for it.
 | the frames | `rc:vault.list` · `rc:vault.describe` ([`signaling.rs:1262`](../crates/remote_control/src/signaling.rs#L1262)) and `rc:vault.listed` · `rc:vault.described` ([`:4034`](../crates/remote_control/src/signaling.rs#L4034)); refusals reuse `rc:vault.refused` |
 | the decisions | `list` and `describe` ([`meta.rs:106`](../crates/modules/vault/src/meta.rs#L106)); `secret:list` in [`policy.cedarschema`](../crates/modules/vault/src/policy.cedarschema) and `Ask::ListSecret` ([`policy.rs:358`](../crates/modules/vault/src/policy.rs#L358)) |
 | the daemon's asks | `Client::list` and `Client::describe` ([`vault.rs:356`](../agents/roomlerd/src/vault.rs#L356)) |
-| the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:663`](../agents/roomlerd/src/hive/toolbelt.rs#L663)), answered by `vault_tool` ([`toolbelt.rs:751`](../agents/roomlerd/src/hive/toolbelt.rs#L751)) |
+| the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:674`](../agents/roomlerd/src/hive/toolbelt.rs#L674)), answered by `vault_tool` ([`toolbelt.rs:762`](../agents/roomlerd/src/hive/toolbelt.rs#L762)) |
 
 ## 14. A command with values: `vault_exec` (P3-4c-1)
 
@@ -710,7 +710,7 @@ sequenceDiagram
     participant T as its toolbelt (roomlerd)
     participant V as vault
     M->>T: vault_exec {argv: ["psql", …], env: {PGPASSWORD: "db/main#password"}}
-    T->>A: approve? (the settings never allow vault_exec)
+    T->>A: approve? (the settings ask for every vault_exec)
     A-->>T: allow
     T->>T: argv[0] a bare name, found in the system's own directories, root's
     T->>V: rc:vault.lease {mode: exec, audience: "psql"}, one per env entry
@@ -745,8 +745,7 @@ device share): a path could match nothing a device asks for.
 > [!WARNING]
 > - **`exec` is a materializing mode** (design §8.5): the program holds the
 >   value, and a program that prints or sends it can leak it. Hence the
->   permit, `exec_allow`, and a person approving every call: the settings
->   never allow `vault_exec`.
+>   permit, `exec_allow`, and a person approving every call.
 > - **Scrubbing is a seatbelt, not a boundary.** A value printed in another
 >   encoding (base64, split across lines) passes it.
 > - **Windows runs nothing.** The vault refuses `exec` there first
@@ -755,9 +754,25 @@ device share): a path could match nothing a device asks for.
 > - **Homebrew's programs are refused** on macOS: `/opt/homebrew` belongs to
 >   a person, who could replace what a value is handed to.
 
+> [!IMPORTANT]
+> **A person approves every use because the settings ASK for it.** Keeping
+> it out of the allow list is not enough. The session's settings list
+> `vault_exec` and `vault_render` under `permissions.ask`
+> ([`VAULT_USE_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L332), written
+> by [`vault_use_tools`](../agents/roomlerd/src/hive/supervisor.rs#L4654)).
+> - **Why an ask:** a repository's own `.claude/settings.json` loads too (the
+>   FR-90 spec's open decision 7), and an allow there would skip the person.
+>   Claude Code reads deny, then ask, then allow, across every settings file,
+>   so an ask prompts whatever another file allows. Until this was found,
+>   while `vault_render` was written, the uses were only kept out of `allow`.
+> - ⚠️ **Not by marking the tools as requiring user interaction**
+>   ([`launch.rs:420`](../crates/hive-node/src/launch.rs#L420)). A
+>   `--permission-prompt-tool` can never approve such a tool: Claude Code
+>   turns its allow into a deny, and `approve` is that tool.
+
 | Piece | Where |
 |---|---|
-| the tool | `vault_exec` in [`toolbelt.rs:696`](../agents/roomlerd/src/hive/toolbelt.rs#L696), offered with the reads where the device takes leases, never in the settings' allow list |
+| the tool | `vault_exec` in [`toolbelt.rs:707`](../agents/roomlerd/src/hive/toolbelt.rs#L707), offered with the reads where the device takes leases, and asked for in the settings |
 | where it runs | the run's `ExecTarget`, made at launch from the session's account, home and folder ([`supervisor.rs:4234`](../agents/roomlerd/src/hive/supervisor.rs#L4234)); none on Windows |
 | letting go | `Client::release` ([`vault.rs:504`](../agents/roomlerd/src/vault.rs#L504)) |
 
@@ -775,7 +790,7 @@ sequenceDiagram
     participant T as its toolbelt (roomlerd)
     participant V as vault
     M->>T: vault_render {template: "user={{ db/main#user }}\npass={{ db/main#password }}", dest: "db.env"}
-    T->>A: approve? (the settings never allow vault_render)
+    T->>A: approve? (the settings ask for every vault_render)
     A-->>T: allow
     T->>V: rc:vault.lease {mode: file, audience: "db.env"}, one per secret
     V-->>T: rc:vault.leased, each
@@ -807,7 +822,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the tool | `vault_render` in [`toolbelt.rs:727`](../agents/roomlerd/src/hive/toolbelt.rs#L727), offered with the reads, never in the settings' allow list |
+| the tool | `vault_render` in [`toolbelt.rs:738`](../agents/roomlerd/src/hive/toolbelt.rs#L738), offered with the reads, and asked for in the settings as `vault_exec` is (§14) |
 | keeping the leases | `Releasing::keep` ([`vault_exec.rs:463`](../agents/roomlerd/src/hive/vault_exec.rs#L463)) |
 
 ## 16. Audit
