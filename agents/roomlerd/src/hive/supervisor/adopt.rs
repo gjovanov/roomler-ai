@@ -26,11 +26,17 @@
 //! `may_prompt: false`, and [`Supervisor::prompt`] refuses a session it does
 //! not run anyway.
 //!
-//! P1i-2 — nothing is adopted on Windows (the hooks CLI refuses there, and
-//! `hive_adopt` reads off): the socket and the connections it takes are
-//! compiled out, and what only they reach is unused there.
-
-#![cfg_attr(windows, allow(dead_code))]
+//! FR-97 P4c — on Windows the socket is the named pipe
+//! [`proto::PIPE_NAME`]. Its peer is the client's token, read by
+//! impersonating it after its first line (`hive_win::pipe_peer`), never a
+//! pid. SYSTEM, LOCAL SERVICE, NETWORK SERVICE and the anonymous logon are
+//! refused as root is. The pipe grants a person read and write and never
+//! `FILE_CREATE_PIPE_INSTANCE`, and the hook sends nothing unless the pipe is
+//! owned by SYSTEM, Administrators or itself (`hive_adopt::connect_pipe`). A
+//! record keeps the account's SID where Unix keeps its uid.
+//!
+//! What stays Unix-only is P2f-4a, making an ended adopted session a managed
+//! one: its history import runs as the account through Unix tools.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -47,18 +53,14 @@ use roomler_hive_node::launch::history_path_in;
 use roomler_hive_node::stream_json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-#[cfg(unix)]
 use tokio::io::{AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
-use tunnel_core::localapi::hive_adopt::{self as proto, Reply, refusal};
-#[cfg(unix)]
-use tunnel_core::localapi::hive_adopt::{HookEvent, Request};
+use tunnel_core::localapi::hive_adopt::{self as proto, HookEvent, Reply, Request, refusal};
 
 use super::{Answer, StartOrder, Supervisor};
-#[cfg(unix)]
 use crate::hive::lines::LineReader;
 use crate::hive::procs;
 use crate::hive::store::StoreHandle;
@@ -82,6 +84,34 @@ const MAX_ADOPTED: usize = 16;
 /// with agent sessions off (`hive_enabled`); the oldest falls off.
 const MAX_ENDED: usize = 1000;
 
+/// What a record keeps to tell one account's lines from another's, as the
+/// kernel names the account: its uid on Unix, its SID on Windows (FR-97 P4c).
+#[cfg(unix)]
+pub(crate) type PeerId = u32;
+#[cfg(windows)]
+pub(crate) type PeerId = String;
+
+/// Who is at the far end of one adopt connection, from the kernel, never from
+/// the hook.
+pub(crate) struct Peer {
+    pub id: PeerId,
+    /// Root, or on Windows a service account or nobody: never adopted.
+    pub privileged: bool,
+    /// The account's name as the server is told it: `name` on Unix,
+    /// `DOMAIN\name` on Windows. `None` when it has none this daemon reads.
+    pub account: Option<String>,
+    /// Every `hive_accounts` key that maps to this account (`adopt_keys` on
+    /// Unix, `adopt_keys_windows` on Windows).
+    pub keys: Vec<String>,
+    /// The hook's process: where Claude Code's is looked for
+    /// ([`procs::hook_terminal`]). Never who the peer is.
+    pub pid: Option<u32>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 /// One adopted terminal session, as this device keeps it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct Adopted {
@@ -91,9 +121,13 @@ pub(crate) struct Adopted {
     pub session: String,
     pub fence: u64,
     /// The account whose terminal it is, and its uid: the only peer whose
-    /// lines are taken for it.
+    /// lines are taken for it. On Windows the uid is 0 and unwritten, and
+    /// `sid` names the account instead (FR-97 P4c).
     pub account: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub uid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
     /// Where this copy of the transcript ends, in bytes of the source file.
     pub offset: u64,
     /// Turns begun.
@@ -123,7 +157,10 @@ pub(crate) struct EndedTerminal {
     pub session: String,
     pub harness_session: String,
     pub account: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub uid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
     #[serde(default)]
     pub folder: Option<String>,
     /// Turns begun: a managed session counts on from them.
@@ -131,6 +168,25 @@ pub(crate) struct EndedTerminal {
     /// Its mirroring was stopped from Roomler before its terminal ended.
     #[serde(default)]
     pub stopped: bool,
+}
+
+impl Adopted {
+    /// Whether `id` is the account whose terminal this is: the only peer whose
+    /// lines are taken for it.
+    fn is_peer(&self, id: &PeerId) -> bool {
+        #[cfg(unix)]
+        return self.uid == *id;
+        #[cfg(windows)]
+        return self.sid.as_deref() == Some(id.as_str());
+    }
+}
+
+/// `id` as a record keeps it: `(uid, sid)`.
+fn record_ids(id: &PeerId) -> (u32, Option<String>) {
+    #[cfg(unix)]
+    return (*id, None);
+    #[cfg(windows)]
+    return (0, Some(id.clone()));
 }
 
 /// The turn in progress.
@@ -267,6 +323,7 @@ impl AdoptedFile {
             harness_session: a.harness_session,
             account: a.account,
             uid: a.uid,
+            sid: a.sid,
             folder: a.folder,
             turns: a.turns,
             stopped: a.stopped,
@@ -279,7 +336,8 @@ impl AdoptedFile {
     }
 
     /// FR-90 P2f-4a — what this device kept of `session`, a terminal session
-    /// that ended here.
+    /// that ended here. Unix only, as making it a managed one is.
+    #[cfg(unix)]
     pub(super) fn ended_terminal(&self, session: &str) -> Option<&EndedTerminal> {
         self.ended_terminals.iter().find(|t| t.session == session)
     }
@@ -287,6 +345,7 @@ impl AdoptedFile {
     /// FR-90 P2f-4a — whether a terminal session runs here on `harness_session`
     /// now, mirrored or stopped: a `claude --resume` of an ended one is
     /// offered afresh, as a new record.
+    #[cfg(unix)]
     pub(super) fn terminal_runs(&self, harness_session: &str) -> bool {
         self.get(harness_session).is_some()
     }
@@ -500,19 +559,89 @@ impl Supervisor {
         }
     }
 
-    /// P1i-2 — nothing is adopted on Windows, so there is no socket to listen
-    /// on. `hive_adopt` reads off there ([`super::gates::HiveConfig`]), so this
-    /// is never reached; it refuses anyway rather than pretend to listen.
+    /// FR-97 P4c — on Windows: the named pipe [`proto::PIPE_NAME`], only while
+    /// the device's owner allows adopting. Its security descriptor
+    /// (`hive_win::adopt_pipe_sddl`) lets every interactive user connect and
+    /// only the daemon add an instance. Remote clients are refused outright.
+    ///
+    /// The name is global, unlike a socket in the daemon's own runtime
+    /// directory, so another process can take it first. The first instance is
+    /// therefore created as the first (`first_pipe_instance`), and retried
+    /// loudly every 30 s while the name is held. Meanwhile each hook finds a
+    /// pipe its holder owns, not SYSTEM, and sends nothing.
     #[cfg(windows)]
     pub(crate) async fn adopt_listen(self: Arc<Self>) -> Result<(), String> {
-        Err("adopting terminal sessions is not available on Windows".into())
+        use crate::hive_win::{Sddl, adopt_pipe_sddl, own_sid};
+        use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+
+        if !self.cfg.adopt {
+            return Ok(());
+        }
+        let daemon = own_sid().map_err(|e| format!("this daemon's own account: {e}"))?;
+        let mut sddl = Sddl::new(&adopt_pipe_sddl(&daemon))
+            .map_err(|e| format!("the adopt pipe's security descriptor: {e}"))?;
+        let create = |first: bool, sddl: &mut Sddl| -> std::io::Result<NamedPipeServer> {
+            // SAFETY: the attributes stay valid for the call, and the system
+            // copies the descriptor into the instance.
+            unsafe {
+                ServerOptions::new()
+                    .first_pipe_instance(first)
+                    .reject_remote_clients(true)
+                    .create_with_security_attributes_raw(proto::PIPE_NAME, sddl.attributes().cast())
+            }
+        };
+        let mut server = loop {
+            match create(true, &mut sddl) {
+                Ok(s) => break s,
+                Err(e) => {
+                    warn!(pipe = proto::PIPE_NAME, %e, "hive: the adopt pipe's name is held by another process — retrying in 30 s");
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            }
+        };
+        info!(
+            pipe = proto::PIPE_NAME,
+            "hive: adopting terminal sessions (hive_adopt)"
+        );
+        let me = Arc::clone(&self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(SWEEP_EVERY).await;
+                me.adopt_sweep();
+            }
+        });
+        loop {
+            let connected = server.connect().await;
+            // The next instance before this one is handed on, so a hook never
+            // finds the name with no instance listening.
+            let next = loop {
+                match create(false, &mut sddl) {
+                    Ok(s) => break s,
+                    Err(e) => {
+                        warn!(%e, "hive: the adopt pipe could not take another connection");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            };
+            let this = std::mem::replace(&mut server, next);
+            match connected {
+                Ok(()) => {
+                    let me = Arc::clone(&self);
+                    tokio::spawn(async move { me.adopt_conn(this).await });
+                }
+                // A client that came and went before the accept: its instance
+                // is dropped, the new one listens.
+                Err(e) => debug!(%e, "hive: an adopt pipe connection ended before it was taken"),
+            }
+        }
     }
 
-    /// P1i-2 — and no socket to leave behind.
+    /// Pipes leave nothing behind: an instance goes with its process.
     #[cfg(windows)]
     pub(crate) fn adopt_remove_stale_socket(&self) {}
 
-    /// One hook's connection: a `Hello`, then its requests, each answered.
+    /// One hook's connection: the kernel's word on who it is, then its
+    /// requests ([`Self::adopt_serve`]).
     #[cfg(unix)]
     pub(crate) async fn adopt_conn(self: Arc<Self>, stream: UnixStream) {
         let cred = match stream.peer_cred() {
@@ -522,14 +651,79 @@ impl Supervisor {
                 return;
             }
         };
-        let (uid, peer_pid) = (cred.uid(), cred.pid());
-        let (read, mut write) = stream.into_split();
+        let uid = cred.uid();
+        let account = crate::exec::account_name(uid).ok();
+        let peer = Peer {
+            id: uid,
+            privileged: uid == 0,
+            keys: account
+                .as_deref()
+                .map(|a| self.adopt_keys(a))
+                .unwrap_or_default(),
+            account,
+            pid: cred.pid().and_then(|p| u32::try_from(p).ok()),
+        };
+        let (read, write) = stream.into_split();
+        let lines = LineReader::new(BufReader::new(read), MAX_REQUEST);
+        self.adopt_serve(&peer, lines, write, None).await;
+    }
+
+    /// FR-97 P4c — one hook's pipe connection. Windows names a pipe's client by
+    /// the last message read, so who it is (`hive_win::pipe_peer`) is asked
+    /// once its first line is in; that line is then served like any other.
+    #[cfg(windows)]
+    pub(crate) async fn adopt_conn(
+        self: Arc<Self>,
+        pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+    ) {
+        use std::os::windows::io::AsRawHandle;
+        // Kept as a number across the await (a raw pointer would make this
+        // task not `Send`); the pipe's two halves keep the handle open.
+        let raw = pipe.as_raw_handle() as usize;
+        let pid = crate::hive_win::pipe_client_pid(raw as _);
+        let (read, write) = tokio::io::split(pipe);
         let mut lines = LineReader::new(BufReader::new(read), MAX_REQUEST);
+        let first = match lines.next_line().await {
+            Ok(Some(l)) => l,
+            Ok(None) | Err(_) => return,
+        };
+        let who = match crate::hive_win::pipe_peer(raw as _) {
+            Ok(w) => w,
+            Err(e) => {
+                debug!(%e, "hive: an adopt pipe client with no readable account — closed");
+                return;
+            }
+        };
+        let peer = Peer {
+            privileged: who.is_service(),
+            keys: self.adopt_keys_windows(&who.domain, &who.name),
+            account: Some(who.qualified()),
+            id: who.sid,
+            pid,
+        };
+        self.adopt_serve(&peer, lines, write, Some(first)).await;
+    }
+
+    /// A `Hello`, then the connection's requests, each answered, with
+    /// `first` (a line already read) served first.
+    async fn adopt_serve<R, W>(
+        &self,
+        peer: &Peer,
+        mut lines: LineReader<BufReader<R>>,
+        mut write: W,
+        mut first: Option<Vec<u8>>,
+    ) where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
         let mut said_hello: Option<String> = None;
         loop {
-            let line = match lines.next_line().await {
-                Ok(Some(l)) => l,
-                Ok(None) | Err(_) => return,
+            let line = match first.take() {
+                Some(l) => l,
+                None => match lines.next_line().await {
+                    Ok(Some(l)) => l,
+                    Ok(None) | Err(_) => return,
+                },
             };
             let reply = match serde_json::from_slice::<Request>(&line) {
                 Err(_) => Reply::refused(refusal::BAD_REQUEST, None),
@@ -538,9 +732,7 @@ impl Supervisor {
                     cwd,
                     event,
                 }) => {
-                    let (reply, hs) = self
-                        .adopt_hello(uid, peer_pid, &harness_session, &cwd, event)
-                        .await;
+                    let (reply, hs) = self.adopt_hello(peer, &harness_session, &cwd, event).await;
                     said_hello = hs;
                     reply
                 }
@@ -551,9 +743,9 @@ impl Supervisor {
                             from,
                             data,
                             skipped,
-                        } => self.adopt_lines(uid, hs, from, &data, skipped),
-                        Request::TurnEnded => self.adopt_turn_ended(uid, hs),
-                        Request::End { reason } => self.adopt_end(uid, hs, reason.as_deref()),
+                        } => self.adopt_lines(&peer.id, hs, from, &data, skipped),
+                        Request::TurnEnded => self.adopt_turn_ended(&peer.id, hs),
+                        Request::End { reason } => self.adopt_end(&peer.id, hs, reason.as_deref()),
                         Request::Hello { .. } => unreachable!("matched above"),
                     },
                 },
@@ -571,6 +763,7 @@ impl Supervisor {
 
     /// The `hive_accounts` keys that map to `account`, every one of them:
     /// the server adopts only when they name exactly one person.
+    #[cfg(unix)]
     pub(crate) fn adopt_keys(&self, account: &str) -> Vec<String> {
         self.cfg
             .accounts
@@ -580,13 +773,26 @@ impl Supervisor {
             .collect()
     }
 
+    /// FR-97 P4c — on Windows: every key whose account names `domain\name`
+    /// the way a start's account gate reads it (`hive_win::names_console_user`):
+    /// `name`, `DOMAIN\name`, or `.\name` for an account of this computer,
+    /// without regard to case.
+    #[cfg(windows)]
+    fn adopt_keys_windows(&self, domain: &str, name: &str) -> Vec<String> {
+        let computer = std::env::var("COMPUTERNAME").unwrap_or_default();
+        self.cfg
+            .accounts
+            .iter()
+            .filter(|(_, a)| crate::hive_win::names_console_user(a, domain, name, &computer))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     /// `Hello`: the session is held, or offered to the server now. Returns the
     /// answer and, when the connection may go on, the session it speaks for.
-    #[cfg(unix)]
     async fn adopt_hello(
         &self,
-        uid: u32,
-        peer_pid: Option<i32>,
+        peer: &Peer,
         harness_session: &str,
         cwd: &str,
         event: HookEvent,
@@ -594,7 +800,7 @@ impl Supervisor {
         if !self.cfg.adopt {
             return (Reply::refused(refusal::ADOPT_DISABLED, None), None);
         }
-        if uid == 0 {
+        if peer.privileged {
             return (Reply::refused(refusal::ROOT, None), None);
         }
         let Some(hs) = clean_harness_session(harness_session) else {
@@ -602,7 +808,7 @@ impl Supervisor {
         };
         let held = self.adopted_lock().get(&hs).cloned();
         if let Some(a) = held {
-            if a.uid != uid {
+            if !a.is_peer(&peer.id) {
                 return (Reply::refused(refusal::NOT_YOURS, None), None);
             }
             if a.stopped {
@@ -616,11 +822,10 @@ impl Supervisor {
             }
             return (Reply::ok(Some(a.offset)), Some(hs));
         }
-        let account = match crate::exec::account_name(uid) {
-            Ok(a) => a,
-            Err(_) => return (Reply::refused(refusal::NO_ACCOUNT, None), None),
+        let Some(account) = peer.account.clone() else {
+            return (Reply::refused(refusal::NO_ACCOUNT, None), None);
         };
-        let keys = self.adopt_keys(&account);
+        let keys = peer.keys.clone();
         if keys.is_empty() {
             return (Reply::refused(refusal::NO_ACCOUNT, None), None);
         }
@@ -657,16 +862,16 @@ impl Supervisor {
         };
         // The terminal is the Claude Code that ran the hook — past the shell
         // it ran the hook's command line through (`procs::hook_terminal`).
-        let terminal_pid = peer_pid
-            .and_then(|p| u32::try_from(p).ok())
-            .and_then(procs::hook_terminal);
+        let terminal_pid = peer.pid.and_then(procs::hook_terminal);
         let terminal_started = terminal_pid.and_then(procs::started);
+        let (uid, sid) = record_ids(&peer.id);
         let a = Adopted {
             harness_session: hs.clone(),
             session: session.to_hex(),
             fence,
             account,
             uid,
+            sid,
             offset: 0,
             turns: 0,
             running: None,
@@ -755,7 +960,7 @@ impl Supervisor {
     /// `Lines`: whole transcript lines from where this copy ends.
     pub(crate) fn adopt_lines(
         &self,
-        uid: u32,
+        peer: &PeerId,
         hs: &str,
         from: u64,
         data: &str,
@@ -765,7 +970,7 @@ impl Supervisor {
         let Some(a) = file.get(hs).cloned() else {
             return Reply::refused(refusal::BAD_REQUEST, None);
         };
-        if a.uid != uid {
+        if !a.is_peer(peer) {
             return Reply::refused(refusal::NOT_YOURS, None);
         }
         if a.stopped {
@@ -841,17 +1046,17 @@ impl Supervisor {
     }
 
     /// `TurnEnded` (the `Stop` hook): the turn in progress is over.
-    fn adopt_turn_ended(&self, uid: u32, hs: &str) -> Reply {
+    fn adopt_turn_ended(&self, peer: &PeerId, hs: &str) -> Reply {
         let mut ended = None;
         let updated = self.adopted_lock().update(hs, |a| {
-            if a.uid == uid && !a.stopped {
+            if a.is_peer(peer) && !a.stopped {
                 ended = a.running.take();
             }
         });
         let Some(a) = updated else {
             return Reply::refused(refusal::BAD_REQUEST, None);
         };
-        if a.uid != uid {
+        if !a.is_peer(peer) {
             return Reply::refused(refusal::NOT_YOURS, None);
         }
         if a.stopped {
@@ -873,12 +1078,12 @@ impl Supervisor {
     /// `End` (the `SessionEnd` hook): the terminal session is over, and this
     /// device forgets it. A `claude --resume` later is a new terminal run,
     /// offered afresh.
-    fn adopt_end(&self, uid: u32, hs: &str, reason: Option<&str>) -> Reply {
+    fn adopt_end(&self, peer: &PeerId, hs: &str, reason: Option<&str>) -> Reply {
         let a = self.adopted_lock().get(hs).cloned();
         let Some(a) = a else {
             return Reply::refused(refusal::BAD_REQUEST, None);
         };
-        if a.uid != uid {
+        if !a.is_peer(peer) {
             return Reply::refused(refusal::NOT_YOURS, None);
         }
         let reason = reason
@@ -1028,12 +1233,14 @@ impl Supervisor {
         folder: &Path,
         store: &StoreHandle,
     ) -> Result<Option<Imported>, Answer> {
+        // FR-97 P4c adopts on Windows, but putting a terminal's history in
+        // place runs as the account through Unix tools (`importer`).
         #[cfg(windows)]
         {
             let _ = (order, account, folder, store);
             Err(Answer::refused(
                 HiveRefusal::Other,
-                "nothing is adopted on Windows",
+                "an adopted terminal session cannot be made a managed one on Windows yet",
             ))
         }
         #[cfg(unix)]
@@ -1178,6 +1385,72 @@ pub(super) fn adopted_path(hosted: Option<&Path>) -> Option<PathBuf> {
     hosted.map(|p| p.with_file_name(ADOPTED_FILE))
 }
 
+/// FR-97 P4c — the Windows record: the account's SID where Unix keeps a uid.
+#[cfg(all(test, windows))]
+mod win_tests {
+    use super::*;
+
+    fn adopted(sid: &str) -> Adopted {
+        Adopted {
+            harness_session: "6f1c8a2e-3b7d-4e5f-9a10-2b3c4d5e6f70".into(),
+            session: ObjectId::new().to_hex(),
+            fence: 1,
+            account: r"PC\alice".into(),
+            uid: record_ids(&sid.to_string()).0,
+            sid: record_ids(&sid.to_string()).1,
+            offset: 0,
+            turns: 0,
+            running: None,
+            terminal_pid: None,
+            terminal_started: None,
+            stopped: false,
+            folder: Some(r"C:\work".into()),
+        }
+    }
+
+    #[test]
+    fn a_windows_record_names_its_account_by_sid_and_writes_no_uid() {
+        let a = adopted("S-1-5-21-1-2-3-1001");
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v["sid"], "S-1-5-21-1-2-3-1001");
+        assert!(v.get("uid").is_none(), "no uid on Windows: {v}");
+        let back: Adopted = serde_json::from_value(v).unwrap();
+        assert_eq!(back, a);
+    }
+
+    /// Lines are taken only from the account whose terminal it is, by SID: a
+    /// local and a domain account may share a name, or a RID, never a SID.
+    #[test]
+    fn only_the_terminals_own_account_is_its_peer() {
+        let a = adopted("S-1-5-21-1-2-3-1001");
+        assert!(a.is_peer(&"S-1-5-21-1-2-3-1001".to_string()));
+        assert!(
+            !a.is_peer(&"S-1-5-21-9-9-9-1001".to_string()),
+            "the same RID elsewhere"
+        );
+        let unix_written = Adopted {
+            sid: None,
+            uid: 1000,
+            ..a
+        };
+        assert!(
+            !unix_written.is_peer(&"S-1-5-21-1-2-3-1001".to_string()),
+            "a record with no SID is nobody's on Windows"
+        );
+    }
+
+    /// A record written before FR-97 P4c (a uid, no SID) still reads.
+    #[test]
+    fn a_record_with_a_uid_and_no_sid_still_reads() {
+        let mut v = serde_json::to_value(adopted("S-1-5-21-1-2-3-1001")).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("sid");
+        o.insert("uid".into(), 1000.into());
+        let back: Adopted = serde_json::from_value(v).unwrap();
+        assert_eq!((back.uid, back.sid), (1000, None));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1246,6 +1519,7 @@ mod tests {
             fence: 1,
             account: "alice".into(),
             uid: 1000,
+            sid: None,
             offset: 42,
             turns: 2,
             running: None,
@@ -1549,6 +1823,7 @@ mod tests {
             fence: 1,
             account: "alice".into(),
             uid: 1000,
+            sid: None,
             offset: 0,
             turns: 0,
             running: None,
@@ -1614,6 +1889,7 @@ mod tests {
             fence: 1,
             account: me().unwrap(),
             uid: 1000,
+            sid: None,
             offset: 7,
             turns: 1,
             running: None,
@@ -2251,6 +2527,7 @@ mod tests {
             fence: 1,
             account: "alice".into(),
             uid: 1000,
+            sid: None,
             offset: 9,
             turns: 3,
             running: None,
@@ -2268,6 +2545,7 @@ mod tests {
                 harness_session: "u2".into(),
                 account: "alice".into(),
                 uid: 1000,
+                sid: None,
                 folder: Some("/home/alice/x".into()),
                 turns: 3,
                 stopped: false,
