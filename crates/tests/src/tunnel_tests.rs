@@ -990,12 +990,16 @@ async fn connect_agent_ws_inner(
 
 /// Poll the agent row until `status == "online"` (hello processed → Hub
 /// registered), so a subsequent `send_to_agent` relay lands.
+///
+/// Up to 10 s: it returns the moment the row says online, and 2 s was too
+/// short for a hello under the full suite's load (`vault_revoke_tests`
+/// timed out here on master's lane, 2026-10-18, run 39155622658).
 pub(crate) async fn wait_agent_online(
     app: &TestApp,
     seeded: &crate::fixtures::seed::SeededTenant,
     agent_id: &str,
 ) {
-    for _ in 0..40 {
+    for _ in 0..200 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let row: Value = app
             .auth_get(
