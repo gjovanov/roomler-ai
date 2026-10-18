@@ -22,6 +22,18 @@ unit is the right answer — a root system service has no session to capture
 unless you also enable the headless display mode below.
 :::
 
+To make an installed machine a system service later, enroll the root daemon,
+then register it:
+
+```bash
+sudo roomlerd --config /etc/roomler/config.toml enroll --server https://roomler.ai --token <token> --name "$(hostname)"
+sudo roomlerd service install --as-service      # alias: --system
+```
+
+It refuses until that config exists, and it says so if a per-user daemon also
+runs on the machine: one daemon per machine is the rule, so stop the per-user
+unit as that account (`systemctl --user disable --now roomler.service`).
+
 ## Install
 
 Mint a token under **Devices → Enroll device**, then:
