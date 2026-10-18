@@ -91,9 +91,11 @@
           use its owner's permissions across the whole fleet.
         </div>
 
-        <!-- FR-94 P4 — Windows only: which account the device's SYSTEM
-             service runs a command as. -->
-        <template v-if="agent?.os === 'windows'">
+        <!-- FR-94 P4 — which account the device's SYSTEM service runs a
+             command as on Windows. FR-97 P5a — on Linux and macOS, whom the
+             agent itself runs it as, where its agent can drop to the person
+             at the screen (or a stored policy already says so). -->
+        <template v-if="offersRunAs">
           <v-select
             v-model="runAs"
             :items="runAsOptions"
@@ -104,11 +106,20 @@
             hide-details
             data-testid="exec-run-as"
           />
-          <div class="text-caption text-medium-emphasis mb-4">
+          <div v-if="isWindows" class="text-caption text-medium-emphasis mb-4">
             <strong>SYSTEM</strong> is the default.
             <strong>The signed-in user</strong> runs each command as whoever is
             signed in at the console, and is refused when nobody is. Both go
             through the device's service, so the device must be anchored.
+          </div>
+          <div v-else class="text-caption text-medium-emphasis mb-4" data-testid="exec-run-as-unix">
+            <strong>root</strong> is the default.
+            <strong>The person at the device's screen</strong> runs each command
+            as whoever is signed in at its own screen, and is refused when
+            nobody is.
+            <template v-if="!agentDropsToPerson">
+              This device's agent cannot do that yet: update it, or choose root.
+            </template>
           </div>
         </template>
 
@@ -189,6 +200,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useAgentStore, type Agent, type ExecPolicy } from '@/stores/agents'
+import { dropsToConsoleUser } from '@/utils/sshIdentity'
 
 const props = defineProps<{
   modelValue: boolean
@@ -271,10 +283,26 @@ const runAs = computed({
   },
 })
 
-const runAsOptions = [
-  { title: 'SYSTEM (default)', value: 'system' },
-  { title: 'The signed-in user', value: 'console_user' },
-]
+const isWindows = computed(() => agent.value?.os === 'windows')
+/** FR-97 P5a — a Linux or macOS agent that says `console-user`. */
+const agentDropsToPerson = computed(() => dropsToConsoleUser(agent.value?.capabilities?.rpc))
+/** Windows always; elsewhere where the agent can, or where a stored policy
+ *  already names the person, so it can be switched back to root here. */
+const offersRunAs = computed(
+  () => isWindows.value || agentDropsToPerson.value || draft.value.run_as === 'console_user',
+)
+
+const runAsOptions = computed(() =>
+  isWindows.value
+    ? [
+        { title: 'SYSTEM (default)', value: 'system' },
+        { title: 'The signed-in user', value: 'console_user' },
+      ]
+    : [
+        { title: 'root (default)', value: 'system' },
+        { title: "The person at the device's screen", value: 'console_user' },
+      ],
+)
 
 const memberOptions = computed(() =>
   agentStore.tenantMembers.map((m) => ({

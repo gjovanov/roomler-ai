@@ -359,6 +359,71 @@ mod version_tests {
     }
 }
 
+/// FR-97 P5a — who is at the screen, read from what `loginctl` and `stat`
+/// print. Pure, so every platform's test build runs them.
+#[cfg(test)]
+mod console_tests {
+    use super::{console_owner_person, seat0_active_session, session_person, show_field};
+
+    /// `key=value` lines, the whole key and nothing but it: `NameX=` is not
+    /// `Name`, and an empty value is no value.
+    #[test]
+    fn a_show_field_is_the_whole_key() {
+        let text = "NameX=wrong\nName=ana\nDisplay=\nType=wayland\n";
+        assert_eq!(show_field(text, "Name").as_deref(), Some("ana"));
+        assert_eq!(show_field(text, "Display"), None);
+        assert_eq!(show_field(text, "Seat"), None);
+    }
+
+    /// `loginctl show-seat seat0` with a session showing, and with none
+    /// (a headless server, or a VM before anyone logged in).
+    #[test]
+    fn seat0s_active_session_or_nobody() {
+        let seat = "Id=seat0\nActiveSession=2\nCanGraphical=yes\nSessions=2 c1\n";
+        assert_eq!(seat0_active_session(seat).unwrap(), "2");
+        let empty = "Id=seat0\nActiveSession=\nCanGraphical=no\nSessions=\n";
+        let e = seat0_active_session(empty).unwrap_err().to_string();
+        assert!(e.contains("seat0 has no active session"), "{e}");
+    }
+
+    /// The session's person: a user's graphical or text-console login is a
+    /// person; GDM's greeter is the login screen; another class is nobody's.
+    #[test]
+    fn the_session_showing_is_a_person_or_the_login_screen() {
+        let user = "Id=2\nName=ana\nUser=1000\nSeat=seat0\nType=wayland\nClass=user\nActive=yes\n";
+        assert_eq!(session_person("2", user).unwrap(), "ana");
+        let tty = "Id=5\nName=ops\nUser=1001\nSeat=seat0\nType=tty\nClass=user\nActive=yes\n";
+        assert_eq!(session_person("5", tty).unwrap(), "ops");
+
+        let greeter = "Id=c1\nName=gdm\nUser=120\nSeat=seat0\nType=wayland\nClass=greeter\n";
+        let e = session_person("c1", greeter).unwrap_err().to_string();
+        assert!(e.contains("the login screen is showing"), "{e}");
+
+        let lock = "Id=9\nName=x\nUser=1000\nType=x11\nClass=lock-screen\n";
+        let e = session_person("9", lock).unwrap_err().to_string();
+        assert!(e.contains("class lock-screen, not a person's"), "{e}");
+
+        let unnamed = "Id=3\nUser=1000\nType=x11\nClass=user\n";
+        let e = session_person("3", unnamed).unwrap_err().to_string();
+        assert!(e.contains("names no account"), "{e}");
+    }
+
+    /// `/dev/console`'s owner: a person, the login window (root), or a
+    /// system account during Setup Assistant.
+    #[test]
+    fn the_consoles_owner_is_a_person_or_nobody() {
+        assert_eq!(console_owner_person("ana\n").unwrap(), "ana");
+        for login_window in ["root\n", "", "  \n"] {
+            let e = console_owner_person(login_window).unwrap_err().to_string();
+            assert!(e.contains("the login window is showing"), "{e}");
+        }
+        let e = console_owner_person("_mbsetupuser\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("system account _mbsetupuser"), "{e}");
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnsureOutcome {
     AlreadyRunning,
@@ -450,14 +515,7 @@ async fn ensure_running_inner() -> Result<EnsureOutcome> {
 /// window or over SSH — where there is, correctly, nobody to prompt.
 #[cfg(target_os = "macos")]
 fn console_user_uid() -> Result<u32> {
-    let out = std::process::Command::new("stat")
-        .args(["-f", "%Su", "/dev/console"])
-        .output()
-        .context("stat /dev/console")?;
-    let user = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if user.is_empty() || user == "root" {
-        anyhow::bail!("no GUI session is logged in (console user is '{user}')");
-    }
+    let user = console_user_name()?;
     let out = std::process::Command::new("id")
         .args(["-u", &user])
         .output()
@@ -466,6 +524,40 @@ fn console_user_uid() -> Result<u32> {
         .trim()
         .parse::<u32>()
         .with_context(|| format!("parsing the uid of console user '{user}'"))
+}
+
+/// The account of the person signed in at this Mac's screen: the owner of
+/// `/dev/console`, which loginwindow hands to whoever logs in at the GUI and
+/// takes back to root at the login window. Read the way the pkg's
+/// postinstall reads it (`stat -f %Su /dev/console`), so the companion's
+/// launch, the postinstall and FR-97 P5a's `console_user` agree by
+/// construction. `Err` at the login window, and while the console belongs to
+/// a system account (`_mbsetupuser` runs Setup Assistant).
+#[cfg(target_os = "macos")]
+pub(crate) fn console_user_name() -> Result<String> {
+    let out = std::process::Command::new("stat")
+        .args(["-f", "%Su", "/dev/console"])
+        .output()
+        .context("stat /dev/console")?;
+    console_owner_person(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The pure half of [`console_user_name`]: `/dev/console`'s owner as `stat`
+/// printed it, a person's account or why there is none. macOS names every
+/// system account with a leading `_`.
+#[cfg(any(target_os = "macos", test))]
+fn console_owner_person(owner: &str) -> Result<String> {
+    let user = owner.trim();
+    if user.is_empty() || user == "root" {
+        anyhow::bail!("nobody is signed in at this Mac's screen (the login window is showing)");
+    }
+    if user.starts_with('_') {
+        anyhow::bail!(
+            "nobody is signed in at this Mac's screen (the console belongs to the system \
+             account {user})"
+        );
+    }
+    Ok(user.to_string())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -653,12 +745,7 @@ pub(crate) fn graphical_session_matching(
             .output()
             .context("loginctl show-session")?;
         let text = String::from_utf8_lossy(&show.stdout);
-        let field = |k: &str| -> Option<String> {
-            text.lines()
-                .find_map(|l| l.strip_prefix(&format!("{k}=")))
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-        };
+        let field = |k: &str| show_field(&text, k);
         let ty = field("Type").unwrap_or_default();
         if ty != "x11" && ty != "wayland" {
             continue;
@@ -694,6 +781,81 @@ pub(crate) fn graphical_session_matching(
         });
     }
     anyhow::bail!("no active graphical session — nobody is at this machine's screen")
+}
+
+/// One property out of `loginctl show-*` output, which is `key=value` per
+/// line and stable across systemd releases (see [`session_ids`]). `None`
+/// when absent or empty.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn show_field(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// FR-97 P5a — the account of the person signed in at this machine's own
+/// screen and keyboard: the user of logind's `ActiveSession` on `seat0`, when
+/// that session is a person's (`Class=user`), graphical or a text console.
+///
+/// Not [`graphical_session`], which takes the first active graphical session
+/// ANYWHERE: a remote desktop's session (xrdp) sits on no seat, and logind
+/// calls every seatless session active, so it would name someone who is not
+/// at the screen at all. `seat0` is the machine's own screen by definition,
+/// and its active session is the one showing, as Windows' console session
+/// is. `Err` says why nobody is there: no logind, an empty seat, the login
+/// screen.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn seat0_user() -> Result<String> {
+    let loginctl = |args: &[&str]| -> Result<String> {
+        let out = std::process::Command::new("loginctl")
+            .args(args)
+            .arg("--no-pager")
+            .output()
+            .context("spawning loginctl (is systemd-logind running?)")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "loginctl {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let id = seat0_active_session(&loginctl(&["show-seat", "seat0"])?)?;
+    session_person(&id, &loginctl(&["show-session", &id])?)
+}
+
+/// The pure half of [`seat0_user`]: the active session out of `loginctl
+/// show-seat seat0`.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn seat0_active_session(seat: &str) -> Result<String> {
+    show_field(seat, "ActiveSession").ok_or_else(|| {
+        anyhow::anyhow!(
+            "nobody is signed in at this machine's screen (seat0 has no active session)"
+        )
+    })
+}
+
+/// The pure half of [`seat0_user`]: the person whose session `id` is, out of
+/// `loginctl show-session <id>`, or why it is nobody's. A display manager's
+/// greeter (GDM runs one as `gdm` at the login screen) is `Class=greeter`.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn session_person(id: &str, session: &str) -> Result<String> {
+    match show_field(session, "Class").as_deref() {
+        Some("user") => {}
+        Some("greeter") => anyhow::bail!(
+            "nobody is signed in at this machine's screen (the login screen is showing, \
+             session {id})"
+        ),
+        other => anyhow::bail!(
+            "nobody is signed in at this machine's screen (seat0's session {id} is of class \
+             {}, not a person's)",
+            other.unwrap_or("unknown")
+        ),
+    }
+    show_field(session, "Name")
+        .ok_or_else(|| anyhow::anyhow!("seat0's session {id} names no account"))
 }
 
 /// Is a process with this exact name running? An exact-name match (`pgrep -x`)

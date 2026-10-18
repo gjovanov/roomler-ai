@@ -26,7 +26,9 @@
 - P4b, SFTP and `scp` as the signed-in Windows user (`sftp-server` through `exec`'s console-user spawn, in the
   person's profile), merged (#2438), field-verified red → green on a Win11 SystemContext guest (§8).
 - P4c, Hive adopt on Windows (a named pipe whose client is named by its token, and a hook that sends nothing to
-  a pipe it does not trust), is in review, field-verified red → green on a Win11 SystemContext guest (§8).
+  a pipe it does not trust), merged (#2439), field-verified red → green on a Win11 SystemContext guest (§8).
+- P5a, `console_user` on Linux and macOS (the person at logind's seat0 or owning `/dev/console`, by the drop a
+  `named` account takes; refused while nobody is there), for SSH and for Fleet RPC's `run_as`, is in review.
 - The rest of P2–P7 is open.
 
 **Owner:** the agent on all
@@ -100,7 +102,7 @@ prevent, and the guard re-asserts it on every tick.
 - A restart does not heal it: `purge_split_default` runs at boot, then the runtime re-installs from the persisted
   `overlay_exit_node`.
 - Reach: a Mac running the opt-in root daemon whose operator sets `overlay_exit_node`. The key is not in
-  `DesiredConfig` (`crates/remote_control/src/models.rs:2454`), so no server push can set it; a local
+  `DesiredConfig` (`crates/remote_control/src/models.rs:2475`), so no server push can set it; a local
   `sudo roomler config set` can, and so can an `exec` on the daemon's row. Once it lands, the control WS that the
   `exec` came in on is captured too, so the same channel cannot undo it.
 - `NetstackTun` inherits the same default. It installs no OS routes, so it cannot wedge, but `roomler status`
@@ -117,7 +119,7 @@ prevent, and the guard re-asserts it on every tick.
   nothing. Windows Home fails `New-NetNat` silently and leaves IPv4 forwarding on after the revert (#2077).
 - The server derives `can_be_exit_node` from the advertisement alone
   (`crates/modules/network/src/routes/overlay_route.rs:63`), and the admin row carries no OS (`overlay_route.rs:28-59`)
-  although every agent row has one (`models.rs:1957`).
+  although every agent row has one (`models.rs:1978`).
 - `approved_routes` survives a rejoin on purpose (`crates/services/src/dao/overlay_node.rs:239-241`), and the netmap
   fans `approved_routes` without intersecting what the node still advertises
   (`crates/modules/network/src/overlay.rs:2549`). A client accepts any peer whose fanned routes hold `/0`
@@ -189,7 +191,7 @@ and the consent chain's fallbacks.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | X1 | `exec` and SSH `daemon` mode run as the machine | 🟡 the console worker: the signed-in user on attended installs (#2021) | ✅ root | 🟡 root on the `-daemon` row, the user on the other | Two identities, one per row | FR-94; FR-43 P3 |
-| X2 | `console_user` account mode | 🟡 SystemContext only | ❌ | ❌ | "a Windows concept" (`exec.rs:831`) | P5a, after FR-94 |
+| X2 | `console_user` account mode | 🟡 SystemContext, or the SYSTEM service (FR-105) | 🟡 built (P5a) | 🟡 built (P5a) | Was: "a Windows concept". P5a drops to the person at seat0 or owning the console (`exec.rs:802`), for SSH and exec's `run_as` | P5a |
 | X3 | SFTP / scp as the signed-in user | 🟡 built (P4b), where `sftp-server.exe` is installed | ✅ | ✅ | Was refused: `tokio::process` cannot take a token. P4b takes `exec`'s console-user spawn (`ssh.rs:1353`) | P4b |
 
 ### 2.6 Install, update, ops, architectures
@@ -250,7 +252,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:181-224`); DRM captures from root (opt-in) |
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`) |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93 |
-| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1820`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps |
+| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1827`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps |
 
 ### 2.9 Equal on all three: not parity, recorded so nobody files them here
 
@@ -628,12 +630,12 @@ test of the SIGKILL property itself.
   - The viewer sends `{t: "sas"}` only to an agent that advertises it; the injector checks again before it asks.
   - `sas.dll` is loaded at send time from System32 only, never imported. `docs/remote-control.md` §5.1e.
 - **P4b, SFTP as `console_user`** (built). `sftp-server` runs through the `CreateProcessAsUserW` + three-pipe path
-  the exec code already uses (`exec::run_console_user_program`, `exec.rs:875`), instead of `tokio::process`
+  the exec code already uses (`exec::run_console_user_program`, `exec.rs:902`), instead of `tokio::process`
   (`ssh.rs:1353`).
   - The command line is the quoted path alone: no shell stands in front, and nothing a client sends becomes an
     argument.
   - The bytes are raw. The streamed shell path redacts, and redaction inside a binary SFTP stream is corruption.
-  - It starts in the person's profile, read from the token the child runs under (`exec.rs:3317`). A service starts
+  - It starts in the person's profile, read from the token the child runs under (`exec.rs:3412`). A service starts
     in System32, where a bare `put` cannot land.
   - The client gets the exit status, then EOF, then close (`scp`'s verdict), and its abort sits with the exec
     channels', so a closed channel or a dropped session kills the tree.
@@ -675,8 +677,31 @@ test of the SIGKILL property itself.
 
 `console_user` on Linux and macOS: resolve the active seat's user (Linux: logind's seat0 active session) or the
 console user (macOS: `SCDynamicStoreCopyConsoleUser`) and route into the existing `unix_priv::drop_to`
-(`exec.rs:903-919`). Refuse when nobody is at the screen. It is a privilege drop, never a gain. It waits for FR-94's
+(`exec.rs:930-946`). Refuse when nobody is at the screen. It is a privilege drop, never a gain. It waits for FR-94's
 model on Windows, so the three agree on what the mode means.
+
+**P5a (built).** One rule for SSH's `account_mode` and Fleet RPC's `run_as`, through `apply_run_as`
+(`exec.rs:802`), so exec, the pty and `sftp` all take it:
+
+- **Who is at the screen.** Linux: the user of logind's `ActiveSession` on `seat0`, when that session's class is
+  `user` (`companion::seat0_user`, `companion.rs:809`). It is not `graphical_session`, which takes the first
+  active graphical session anywhere: logind calls every seatless session active, so a remote desktop's user would
+  read as the person at the screen. A text-console login on the machine's own VT counts (D7). macOS: the owner of
+  `/dev/console`, read as the pkg's postinstall reads it (`companion::console_user_name`, `companion.rs:537`),
+  which names the same person `SCDynamicStoreCopyConsoleUser` does and keeps the companion's launch, the
+  postinstall and this rule on one reading. Nobody, when: no logind or seat0, an empty seat, a greeter, the login
+  window, or a system account (`_mbsetupuser` during Setup Assistant).
+- **A drop, never a gain** (`unix_priv::drop_to_console`, `exec.rs:1355`). A root daemon drops to the person;
+  uid 0 is refused, as for `named`. A per-user daemon whose own account is at the screen runs the command as
+  itself, which changes no identity; it could not drop anyway, since `setgroups` needs root even to keep its own
+  groups. A per-user daemon whose owner is not at the screen is refused.
+- **The person's account, not their desktop session.** Their uid, groups, `HOME`, `USER` and `LOGNAME`, as for
+  `named`; not `DISPLAY` or the session bus, and on macOS not their GUI login's launchd domain.
+- **Exec's `run_as` reaches the daemon in the frame** (`rc:rpc.exec`'s `run_as`), the one field an older agent
+  must never see: it would ignore it and run the command as root. So the agent advertises `console-user` (every
+  Unix build, never Windows), the policy `PUT` stores `console_user` off Windows only for an agent whose hello
+  carried it, `authorize` checks the live connection, and the hub refuses to push the field to a connection
+  without the word (`hub.rs:3304`). SSH's half fails closed on its own: an older agent refuses the mode.
 
 ### 3.11 P6 — install, update, ops
 
@@ -747,7 +772,8 @@ model on Windows, so the three agree on what the mode means.
 | **P4c** | Windows Hive adopt: a named pipe, its client named by its token, a hook that checks the server first (D16, built) | `hive_adopt` (the device's own key, default off) | Win11 SystemContext, red on 0.4.142 | M |
 | **P4d** | Windows per-user clean stop: `service stop` and a session-end window (D15, built) | `ROOMLERD_SESSION_END=0` (the window); `service stop` acts only when run | Win11, a perUser ephemeral device, red on 0.4.142 | S |
 | **P4e** | Windows Home + v6 serving (only if D1 picks the userspace egress) | its own | Win11 Home | L |
-| **P5a** | `console_user` on Linux + macOS | `ssh_account_mode` | the lab + a Mac | S–M |
+| **P5a** | `console_user` on Linux + macOS: the person at seat0 or owning the console, by the `named` drop, for SSH and exec's `run_as` (built) | the device's `ssh_account_mode`; the exec policy's `run_as` | the lab + a Mac | S–M |
+| **P5b** | A person's SSH session on Linux + macOS starts in their home: the pty and `sftp` for `named` and `console_user`, where sshd starts them (they start in `/`, the daemon's directory; Windows `console_user` `sftp` starts in the profile since P4b) | — | the lab | S |
 | **P6a** | Artifact version binding: `.deb`, `.pkg`, tarball | `ROOMLERD_ARTIFACT_VERSION_CHECK=0` | the last three releases, offline | S–M |
 | **P6b** | `roomler self-update` on Unix + the pinned PGP check | — | Linux + Mac tunnel-only hosts | M |
 | **P6c** | `service install --system` on Linux + macOS | — | vmtest | S |
@@ -848,7 +874,7 @@ one depends on it.
 | **D4** | One umbrella FR, or a family | One umbrella that owns the matrix, P0 and the docs; L-sized phases split into their own FRs when they start |
 | **D5** | Setup-wizard daemon roles on Linux and macOS | Stop offering the wizard for agents now (P0c); build the macOS role only if onboarding data shows people reach for it |
 | **D6** | Intel Macs; Windows ARM64 | Decide on P0d's counts. Apple has said macOS 26 is the last release for Intel Macs, which argues against A1 unless a customer needs it |
-| **D7** | What `console_user` means off Windows | The active graphical seat's user (logind seat0, the macOS console user); refuse when nobody is at the screen |
+| **D7** | What `console_user` means off Windows | The active graphical seat's user (logind seat0, the macOS console user); refuse when nobody is at the screen. P5a: seat0's active session of class `user`, graphical or a text console on the machine's own VT; never a seatless session, which logind always calls active |
 | **D8** | Order after P0 | P1 (macOS networking), then by field demand |
 | **D9** | S1 | **Decided (operator, 2026-10-13):** filed as #2081; P0a ships ahead of the rest of the FR |
 | **D10** | How a device says "not here" | **Decided (per recommendation, 2026-10-17):** `AgentCaps.unavailable`, a map of feature → `{code, reason}` beside the lists; the viewer shows the reason and hides only `not-applicable`; the lists still decide what works (§3.3a) |
@@ -952,3 +978,8 @@ one depends on it.
 | 2026-10-18 | the first P4c candidate (the hook checked the server PROCESS's token) | the same guest, the candidate in place of the release (a fresh enrollment) | ❌ **The hook refused the real daemon.** The pipe opened (`hive: adopting terminal sessions … pipe="\\.\pipe\roomler-hive-adopt"`) and `adopt` wrote its three `roomler.exe hive hook` entries, but said "this device does not adopt yet", and the hooks sent nothing. A person may not open a SYSTEM process's token, so the check could never pass for the daemon. My unit test had served the pipe from its own process. Fixed: the hook reads the pipe's OWNER instead (D16). 🟢 The daemon's side already held: a client running as SYSTEM got `{"ok":false,"refused":"root"}`, and the person's .NET client asking for `GENERIC_WRITE` was denied access |
 | 2026-10-18 | the P4c candidate (the pipe's owner checked) | the same guest | 🟢 **P4c green.** `roomler hive adopt` as the person: "this device adopts terminal sessions". A `SessionStart` hook adopted the session (`hive: a terminal session adopted`). The device's record held the account `<guest>\vmtest` and `sid = S-1-5-21-…-1000`, `vmtest`'s own, and no uid. `offset` went 313 → 621 and `turns` 0 → 1 over two turns' hooks, and `SessionEnd` moved it to the ended ones. The server listed it as `origin=adopted`, the account `<guest>\vmtest`, idle and then `ended`. 🟢 The identity rule again: SYSTEM refused `root`, and a person's `GENERIC_WRITE` was denied |
 | 2026-10-18 | the same candidate | the same guest | 🟢 **A killed terminal ends its session.** A stand-in for Claude Code, a `cscript` that runs the hook through `cmd` as Claude Code does and then stays alive, was taken for the terminal: `terminal_pid` was its pid, past the `cmd` and the `roomler.exe` shim. Killed at 05:46:29, it was found by the sweep at 05:46:42 ("an adopted session's terminal closed"), and the device and the server ended the session. ⚠️ A hook run straight from a scheduled task found no terminal: the guest's clock stepped back nine hours after boot, so Task Scheduler's `svchost` reads as created after the `cmd` it started, and the walk refuses a parent created after its child. Under Claude Code the walk ends at `claude.exe` and never reaches boot-time processes. 🟢 **A squatter:** with the daemon stopped, a LOCAL SERVICE process took the pipe's name, open to everyone. The person's hook connected and sent 0 bytes |
+| 2026-10-18 | released 0.4.141 (the refusal is byte-identical in 0.4.142) | the FR-93 lab's GNOME guest (Ubuntu, GDM; `wlab` signed in on seat0, a Wayland session), a system install: the root daemon, `ssh_enabled`, one test key in `ssh_authorized_keys` and `ssh_account_mode = "console_user"`. The client: stock OpenSSH in a throwaway container on the vmtest anchor's mesh, dialling roomler's port 2222 | 🔴 **P5a red, a root daemon.** The key authenticated. Exec, the pty and `sftp` were all refused: "account_mode `console_user` is a Windows concept — there is no console session token to assume here" (exec and pty exit 1, `sftp` 255) |
+| 2026-10-18 | the P5a candidate (`505783e99`, a bookworm build with `full,overlay-l3,overlay-netstack,ssh-server`) | the same guest, the candidate in place of the release | 🟢 **P5a green, a root daemon.** Exec answered `user=wlab uid=1000 gid=1000 groups=wlab,adm,sudo HOME=/home/wlab USER=wlab LOGNAME=wlab`, the pty `wlab`, and an `sftp` upload landed owned `wlab wlab`. The daemon logged `run_as=console_user privileged=false` for each. 🟢 **Nobody at the screen:** with the session terminated, seat0's active session became GDM's greeter (`c1`, class `greeter`; the screendump showed the login screen), while `wlab`'s seatless sessions stayed, the harness's own SSH among them. Exec, the pty and `sftp` were refused: "nobody is signed in at this machine's screen (the login screen is showing, session c1)". 🟢 **Signed in again** (a new seat0 session): `wlab` again, for all three. ⚠️ All three start in `/`, the daemon's directory, as `named` does; sshd starts in the account's home (P5b) |
+| 2026-10-18 | released 0.4.142, then the same candidate | the lab's per-user GNOME guest: the daemon runs as `wlab` under its user manager, and `wlab` is at the screen | 🔴 **Red:** the same "a Windows concept" refusal. 🟢 **Green, a per-user daemon:** the command ran as the daemon itself, uid 1000, with the unit's own groups (`wlab,nogroup,nogroup`) and no `setgroups` attempted, which would fail there; `HOME=/home/wlab`, and `pwd` the unit's `/home/wlab`. Both guests were put back afterwards: their release binary and their own `ssh_enabled = false` and key lines, then shut off |
+| 2026-10-18 | released 0.4.142 (its `.pkg`) | a throwaway tart Mac on the MacBook (NAT; the mesh reaches it through the server), the root daemon (the `-daemon` row), enrolled ephemeral with the overlay, the test key under `ssh_account_mode = "console_user"`; `admin` signed in at the GUI (the golden image logs in automatically), so `/dev/console` is `admin`'s | 🔴 **P5a red, macOS.** Exec and the pty exited 1 and `sftp` 255: "account_mode `console_user` is a Windows concept" |
+| 2026-10-18 | the P5a candidate's `.pkg` (release-lane run 39104938748, `publish_release=false`) | the same VM, the candidate installed over the release and enrolled afresh | 🟢 **P5a green, macOS.** Exec answered `user=admin uid=501 gid=20 HOME=/Users/admin USER=admin LOGNAME=admin`, the pty `admin`, and an `sftp` upload landed owned `admin`. 🟢 **Nobody at the screen:** with auto-login off and `admin`'s GUI session booted out, `/dev/console` went to `root` (loginwindow), and exec, the pty and `sftp` were refused: "nobody is signed in at this Mac's screen (the login window is showing)". ❌ **Wrong turns, recorded:** macOS `nohup` refuses outside a console session ("can't detach from console"), so the first VM never booted (fixed with `trap '' HUP` and a subshell, as the AC5 cell does). The candidate's ephemeral enrollment needs a fresh config, so the first green attempt failed to enroll until the earlier phase's config was removed. With auto-login still on, the first logout came straight back to `admin`, so that run's "nobody" step ran as `admin`, correctly |

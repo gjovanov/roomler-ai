@@ -396,10 +396,10 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the device's switch | `vault_enabled` ([`config.rs:492`](../crates/agent-core/src/config.rs#L492)), off, never pushable: [`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L8076) |
+| the device's switch | `vault_enabled` ([`config.rs:492`](../crates/agent-core/src/config.rs#L492)), off, never pushable: [`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L8100) |
 | the key, and its half in the hello | [`vault.rs:35`](../agents/roomlerd/src/vault.rs#L35) `hello_key`, feature `vault` (it implies `hive`, and no release build carries it yet); the hello at [`signaling.rs:1532`](../agents/roomlerd/src/signaling.rs#L1532) |
 | the wire | `AgentHello::vault_key` ([`signaling.rs:363`](../crates/remote_control/src/signaling.rs#L363)) and [`vault_key_is_well_formed`](../crates/remote_control/src/signaling.rs#L120) |
-| what the fleet stores | [`socket.rs:104`](../crates/modules/fleet/src/socket.rs#L104), [`AgentDao::update_hello`](../crates/services/src/dao/agent.rs#L479), `Agent::vault_key` ([`models.rs:2016`](../crates/remote_control/src/models.rs#L2016)); no route answers it |
+| what the fleet stores | [`socket.rs:104`](../crates/modules/fleet/src/socket.rs#L104), [`AgentDao::update_hello`](../crates/services/src/dao/agent.rs#L479), `Agent::vault_key` ([`models.rs:2037`](../crates/remote_control/src/models.rs#L2037)); no route answers it |
 
 ## 10. Audit
 

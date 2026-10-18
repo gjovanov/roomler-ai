@@ -73,6 +73,19 @@ then run nothing* — rather than quietly handing over a root shell.
 
 An unparseable setting is a refusal, not a fallback.
 
+| Account mode | Linux and macOS | Windows |
+|---|---|---|
+| `daemon` | root | the agent's own account: SYSTEM on a service install, the signed-in user on an attended one |
+| `named` | that local account | refused: becoming another user needs their password |
+| `console_user` | the person signed in at the machine's own screen | the user signed in at the console |
+
+`console_user` is refused while nobody is signed in at the screen, and never
+means root. On Linux "the screen" is the machine's own seat, so someone in a
+remote desktop session does not count; on a Mac it is whoever is logged in to
+the desktop. The session gets that person's account, not their desktop
+session, so a program that needs the desktop (a window, a notification) does
+not reach their screen.
+
 ## Port forwarding is default-deny
 
 :::warning An empty forward allow-list means *nowhere*, not *anywhere*

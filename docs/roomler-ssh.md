@@ -328,11 +328,73 @@ The device's `SshPolicy.account_mode` decides, and the agent maps it through
 |---|---|---|---|
 | `daemon` (default) | root | **the worker's identity**: SYSTEM in session 1 in SystemContext mode, the **signed-in user** on an attended install (FR-94 §2) | **SYSTEM, session 0**, on every install type |
 | `named` | **drops to that account** | refused — becoming an arbitrary user needs that user's credentials | refused, the same |
-| `console_user` | refused — no console session token exists | **runs as the signed-in user** (`WTSQueryUserToken` + `CreateProcessAsUserW`) where the worker is SYSTEM (SystemContext mode); refused on an attended install, where the worker cannot ask for that token, and refused if nobody is signed in | **the signed-in user**, on every install type; refused, naming why, while nobody is signed in |
+| `console_user` | **drops to the person at the screen** (FR-97 P5a): logind's seat0 on Linux, `/dev/console`'s owner on macOS; refused while nobody is signed in there, and by an agent before P5a | **runs as the signed-in user** (`WTSQueryUserToken` + `CreateProcessAsUserW`) where the worker is SYSTEM (SystemContext mode); refused on an attended install, where the worker cannot ask for that token, and refused if nobody is signed in | **the signed-in user**, on every install type; refused, naming why, while nobody is signed in |
 
 Which Windows column applies is the server's decision per grant, recorded in
 `ssh_audit` as `ran_as` (`worker`, `system`, `console_user`): see
 § Through the device's SYSTEM service.
+
+#### `console_user` on Linux and macOS (FR-97 P5a)
+
+The mode means what it means on Windows: the person signed in at the device's own
+screen, and nobody else. The agent finds them at each session, then takes the drop
+a `named` account takes (`unix_priv::drop_to_console`,
+[`exec.rs:1355`](../agents/roomlerd/src/exec.rs#L1355)). Exec, the pty and `sftp`
+all go through `apply_run_as`
+([`exec.rs:802`](../agents/roomlerd/src/exec.rs#L802)), so one rule covers all
+three.
+
+```mermaid
+flowchart TD
+  S["a session or command asks for console_user"] --> L{"who is at the screen?"}
+  L -- "Linux: loginctl show-seat seat0 → ActiveSession" --> K{"that session's Class"}
+  L -- "macOS: stat -f %Su /dev/console" --> M{"root, empty, or _system?"}
+  L -- "no logind, no seat0, no active session" --> X1["refused: nobody is signed in"]
+  K -- "greeter (the login screen), or any non-user class" --> X1
+  K -- user --> A["that session's Name"]
+  M -- yes --> X1
+  M -- no --> A
+  A --> R{"resolve the account"}
+  R -- "uid 0" --> X2["refused: never root this way"]
+  R -- ok --> D{"the daemon runs as"}
+  D -- root --> DROP["setgroups → setgid → setuid to them"]
+  D -- "that same person" --> SELF["run as itself: no change of identity"]
+  D -- "anyone else" --> X3["refused: cannot become them"]
+```
+
+| | Linux | macOS |
+|---|---|---|
+| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:809`](../agents/roomlerd/src/companion.rs#L809)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:537`](../agents/roomlerd/src/companion.rs#L537)) |
+| Nobody, when | no logind, no `seat0`, an empty seat, a greeter (GDM's `gdm` at the login screen) | the login window (`root`), or a system account (`_mbsetupuser` during Setup Assistant) |
+| A text console counts | yes: a login on the machine's own VT is a person at its screen | not applicable |
+
+- ⚠️ **seat0, never "the first graphical session".** `graphical_session` takes the
+  first active graphical session anywhere, and logind calls every seatless session
+  active, so an xrdp user would read as the person at the screen. `seat0` is the
+  machine's own screen by definition, and its active session is the one showing,
+  as Windows' console session is.
+- ⚠️ **A drop, never a gain.** A root daemon drops to the person; uid 0 is refused
+  as it is for `named`. A per-user daemon whose own account is at the screen runs
+  the command as itself, which changes no identity, and must not try to drop:
+  `setgroups` needs root even to keep the groups it already holds. A per-user
+  daemon whose owner is not at the screen is refused.
+- ⚠️ **The person's account, not their desktop session.** The command gets their
+  uid, groups, `HOME`, `USER` and `LOGNAME`, as a `named` account does, but not
+  their graphical session's environment (`DISPLAY`, the session bus), and on macOS
+  it runs outside their GUI login's launchd domain. Windows' `console_user` runs
+  inside the person's session.
+- ⚠️ **The server stores `console_user` off Windows only for an agent that
+  advertises `console-user`** (`console_user_unsupported`,
+  [`agent_ssh.rs:1047`](../crates/modules/network/src/routes/agent_ssh.rs#L1047)).
+  An agent rolled back since refuses the session itself, as every agent before
+  P5a did, so this half fails closed either way.
+
+Field-proven 2026-10-18 on candidates (FR-97 §8). On a Linux root daemon
+(Ubuntu, GDM), a command, a pty and `sftp` ran as the person signed in on seat0,
+and were refused once GDM's greeter held the seat. A per-user daemon whose own
+account was at the screen ran them as itself. On a Mac's root daemon they ran as
+the GUI user and were refused at the login window. On the release, every one of
+them had been refused as "a Windows concept".
 
 **Both paths obey this, and it took a fix to make that true.** A grant carries
 the policy's `account_mode`. A key-list session has no policy behind it, so it
@@ -804,7 +866,7 @@ flowchart TD
 ```
 
 ⚠️ **Windows `console_user` takes `exec`'s console-user spawn** (FR-97 P4b,
-`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:875`).
+`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:902`).
 `tokio::process` cannot take a token, so the subsystem goes through
 `supervisor::spawn_in_session_captured`, the piped `CreateProcessAsUserW` spawn
 P5b built and FR-89 made streaming. Three details differ from a shell command
@@ -1117,7 +1179,8 @@ unaffected (it passes via the `ADMINISTRATOR` bypass).
 | P6b | `roomler ssh <name>` — ephemeral keypair → grant → verify against the published key → hand off to the system `ssh` | **shipped** rc.446, field-proven buildhost→corplap |
 | P6c | `roomler proxy` — stdio `ProxyCommand`, so stock `ssh`/`scp`/`rsync`/`git` reach devices BY NAME | **shipped** |
 | P7a | SFTP subsystem — `sftp` and `scp` | **shipped** rc.450, field-proven buildhost→fleet-host-1 |
-| FR-97 P4b | SFTP and `scp` as the Windows `console_user`, through `exec`'s console-user spawn: raw bytes, the person's profile | **in review** [#2082](https://github.com/gjovanov/roomler-ai/issues/2082) |
+| FR-97 P4b | SFTP and `scp` as the Windows `console_user`, through `exec`'s console-user spawn: raw bytes, the person's profile | **merged** [#2438](https://github.com/gjovanov/roomler-ai/pull/2438), field-verified on a candidate |
+| FR-97 P5a | `console_user` on Linux and macOS: the person at the screen (logind's seat0, `/dev/console`'s owner), by the `named` drop; refused while nobody is there | **in review** [#2082](https://github.com/gjovanov/roomler-ai/issues/2082) |
 | P7b | `-L` / `-J` / `-W` via `direct-tcpip`, default-deny on `forward_acl`. **`-R` deliberately not implemented** — it would make the device bind a listening socket | **shipped** |
 | P8a | Session **activity** log — commands + exit codes, shell/SFTP/forward events, device-reported into `ssh_activity`. Deliberately NOT session content | **shipped** |
 | P8b | Admin UI for the activity feed — `SshActivitySection`, under the audit log in org Settings | **shipped** |
