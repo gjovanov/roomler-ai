@@ -10,7 +10,8 @@
   2026-10-17 (§8, AC15).
 - P0c, honest caps (§3.3a), merged: P0c-1, the map and the daemon's decision (#2400); P0c-2, the viewer and the
   enroll dialog (#2401); P0c-3, a netstack node's exit status, DNS and route offer, measured first (D12, #2404).
-  P0c-1 and P0c-2 shipped in 0.4.142; P0c-3 rides the next release. AC3's field sessions follow.
+  P0c-1 and P0c-2 shipped in 0.4.142, P0c-3 in 0.4.143. P0c-4, the homepages' wizard, merged (#2466) and is live
+  since the 2026-10-18 promote. AC3 is field-verified on every OS (§8).
 - P3i, the host firewall, merged (#2414): measured first (§8), decided as report-never-change (D13). Its status
   line rides the next release.
 - P3c-1, Linux session audio that is never a microphone, merged (#2419): measured first (§8), and the premise was
@@ -756,6 +757,13 @@ model on Windows, so the three agree on what the mode means.
     `roomlerd artifact-version <file> <tag>` runs the updater's check on a file, for that proof and its re-runs.
 - **P6b, `roomler self-update` on Unix.** Download → verify → `rename(2)` over the binary. The pinned PGP check moves to
   `tunnel-core` so the CLI can share it (CLAUDE.md's known issue; mind the `windows-sys` 0.59 / 0.61 split).
+  - *Found while scoping it (2026-10-18).* There was nothing to update from. Every tunnel install and `self-update`
+    had 404'd since ~09-07, because the server's release cache lost the tunnel family to depth (#2468, fixed by
+    #2469 and live).
+  - The newest tunnel release, `tunnel-v0.3.0-rc.266` (07-28), has no `.asc`. Its `.deb` installs only on Debian
+    13 / Ubuntu 24.04+ (#2472).
+  - So P6b ships after a new, operator-approved tunnel release: `release-tunnel.yml` signs `.asc` now, and #2474 has
+    the CLI declare both libssl names.
 - **P6c, `roomlerd service install --system`** on Linux (`systemctl enable --now roomlerd.service`) and macOS (bootstrap
   `com.roomler.daemon`, keeping the postinstall's enable marker in step).
 - **P6d, `install.sh --uninstall`** for the tarball and the `.pkg`.
@@ -860,12 +868,14 @@ one depends on it.
   (`ROOMLERD_PF_NAT=0`) on a serving Mac exit, 2026-10-17: the device and the admin row give the reason, and its
   exit client is back on its own uplink 8 s after the restart. It is back on the exit 4 s after the Mac offers
   again.)*
-- [ ] **AC3 (honesty):** every hello word P0c touches has a test that fails on master, and a field session per OS
+- [x] **AC3 (honesty):** every hello word P0c touches has a test that fails on master, and a field session per OS
   shows no offered control failing silently: audio, clipboard images, Ctrl+Alt+Del, the wizard.
-  *(The per-OS sessions are field-verified on 0.4.143, on the deployed viewer, 2026-10-18, §8: a Linux root
-  daemon, a Windows perUser install and a Mac's per-user agent. Each no that P0c-1 sends greys or hides its control
-  with the device's reason. The wizard clause failed on the deployed homepages and is fixed by P0c-4; AC3 is ticked
-  once that is live.)*
+  *(Field-verified 2026-10-18, §8.*
+  - *The per-OS sessions, on 0.4.143 and the deployed viewer: a Linux root daemon, a Windows perUser install and a
+    Mac's per-user agent. Each no that P0c-1 sends greys or hides its control with the device's reason.*
+  - *The wizard: the enroll dialog since P0c-2. The homepages failed on the deployed site and were fixed by P0c-4,
+    then checked live after the promote: one Roomler Setup, on Windows.*
+  - *The tests that fail on master are P0c-1's and P0c-2's, one per word (§3.3a).)*
 - [x] **AC4 (P1a):** a Mac routes v4, and v6 when its uplink has v6, through a Linux exit, with DNS steered and the WS,
   coturn and exit endpoint on the uplink (`route -n get` names the physical interface). It survives a Wi-Fi ↔
   Ethernet switch, and `kill -9` plus a reboot leaves no `/1`, no exemption and no DNS override.
@@ -1071,3 +1081,5 @@ one depends on it.
 | 2026-10-18 | released 0.4.143 (in place of the guest's own 0.4.138, put back after), the deployed viewer | the FR-93 lab's GNOME guest, a system install (the root daemon runs as a system service, with no `DISPLAY` or `WAYLAND_DISPLAY`); a Playwright session that clicks only Connect and Disconnect and reads each control's state and title | 🟢 **AC3, Linux.** The hello said `supports_clipboard: false`, `unavailable.clipboard = no-session` ("This daemon runs as root outside any desktop session, so it has no clipboard to reach") and `sas = keys-only`. The viewer greyed the clipboard send, get and auto-sync controls with that sentence. The Ctrl+Alt+Del button's title said the keys are ordinary ones that GNOME and KDE bind to log out. Audio was offered (`opus`, P3c-2's session monitor) |
 | 2026-10-18 | released 0.4.143, the deployed viewer | a throwaway vmtest Win11 guest, the perUser MSI (no SYSTEM worker) | 🟢 **AC3, Windows.** `unavailable.sas = keys-only`, and the button's title said why: apps get the keys, the lock and sign-in screens do not, and this install has no worker running as SYSTEM. The clipboard was offered in full, image events included (Windows watches them), and audio was offered. AC11's P4a check shows the SystemContext side: the real sequence, and a title that says so. The guest was destroyed |
 | 2026-10-18 | released 0.4.143 (`vmtest` lane `macos/installer/system`, both halves, TCC granted by roomler-ai-deploy#42), the deployed viewer | a throwaway tart Mac; the session against the per-user (capture) row | 🟢 **AC3, macOS.** The hello carried no `opus`, and `unavailable` said `audio = no-backend`, `clipboard-image-events = not-watched`, `sas = not-applicable`. The audio toggle was greyed with "System-audio capture is not implemented on this OS yet, so this host sends no sound", before and during the session. The Ctrl+Alt+Del button was hidden. The auto-sync tooltip said copied images are not watched, and to send or fetch one with the buttons. ❗ **Found:** macOS 15 asked "Allow 'roomlerd' to find devices on local networks?" over the per-user agent, in Apple's generic words (open, §3.7). The VM was destroyed |
+| 2026-10-18 | the deployed site after the promote of `hosted-20261018-dc258ce` (carries P0c-4) | `curl https://roomler.ai/`, the static homepage a guest and every crawler get | 🟢 **AC3's wizard clause, live.** Three install cards, one Roomler Setup (`/api/setup/windows`), no `/api/setup/linux` or `/api/setup/macos`, the Linux and macOS cards "From a terminal:", and the lead "on Windows run the graphical installer". At 13:30Z the same page had three of each |
+| 2026-10-18 | the same deploy | P6b's precondition, measured while scoping it: the tunnel distribution | ❗ `/api/tunnel/latest-release` had answered `[]` and every tunnel installer 404'd since ~09-07 (#2468): the cache's 100-deep page had lost the tunnel family. 🟢 After #2469's promote: `tunnel-v0.3.0-rc.266`, and 200 on all four installers. ❗ A real `install.sh --role tunnel` then installed nothing on Debian 12 and Ubuntu 22.04 and still said done: the `.deb` wants `libssl3t64` (#2472, fix #2474) |
