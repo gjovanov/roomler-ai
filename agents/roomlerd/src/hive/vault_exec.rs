@@ -95,6 +95,11 @@ pub(crate) struct ExecTarget {
     pub(crate) account: Option<String>,
     pub(crate) home: std::path::PathBuf,
     pub(crate) folder: std::path::PathBuf,
+    /// P3-4c-2 — the session's daemon-owned runtime directory, where its
+    /// secrets directory is made, and the account's ids the files there are
+    /// handed to (`None`: kept as this daemon's, which only a test does).
+    pub(crate) session_dir: std::path::PathBuf,
+    pub(crate) owner: Option<(u32, u32)>,
 }
 
 fn env_name_ok(name: &str) -> bool {
@@ -110,7 +115,9 @@ fn env_name_ok(name: &str) -> bool {
         && !name.starts_with("DYLD_")
 }
 
-fn handle_of(raw: &str) -> Result<Handle, String> {
+/// A secret as a call names it: a path or this org's RRN, `#field` for a
+/// structured secret's field. Shared with `vault_render`'s placeholders.
+pub(crate) fn handle_of(raw: &str) -> Result<Handle, String> {
     let (secret, field) = match raw.split_once('#') {
         Some((s, f)) => (s, f),
         None => (raw, ""),
@@ -424,7 +431,7 @@ pub(crate) async fn call(
     };
     for (name, handle) in &req.env {
         let lease = vault
-            .lease_exec(session, fence, handle, &program, ttl)
+            .lease(session, fence, handle, "exec", &program, ttl)
             .await
             .map_err(|why| format!("{name}: {why}"))?;
         held.leases.push(lease);
@@ -445,9 +452,17 @@ pub(crate) async fn call(
 }
 
 /// Lets go of a call's leases when dropped.
-struct Releasing<'a> {
-    vault: &'a dyn VaultTools,
-    leases: Vec<String>,
+pub(crate) struct Releasing<'a> {
+    pub(crate) vault: &'a dyn VaultTools,
+    pub(crate) leases: Vec<String>,
+}
+
+impl Releasing<'_> {
+    /// P3-4c-2 — the leases outlive the call after all (a rendered file
+    /// lives with them): nothing is let go here.
+    pub(crate) fn keep(mut self) {
+        self.leases.clear();
+    }
 }
 
 impl Drop for Releasing<'_> {

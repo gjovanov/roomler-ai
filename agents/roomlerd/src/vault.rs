@@ -109,7 +109,7 @@ mod client {
     use roomler_ai_remote_control::signaling::ClientMsg;
     use roomler_ai_remote_control::vault::{VaultSecretMeta, lease_limits};
     use tokio::sync::{mpsc, oneshot};
-    use tracing::{debug, info};
+    use tracing::{debug, info, warn};
     use zeroize::Zeroizing;
 
     use super::key;
@@ -169,6 +169,28 @@ mod client {
         info: LeaseInfo,
         until: Instant,
         value: Zeroizing<Vec<u8>>,
+        /// P3-4c-2 — files a tool wrote with this lease's value: removed
+        /// whenever the lease is let go, however that happens.
+        files: Vec<std::path::PathBuf>,
+    }
+
+    /// Let go of leases already taken out of the map: each value is zeroed as
+    /// it drops, and every file written with it is removed. Answers how many.
+    fn let_go(gone: Vec<Held>) -> usize {
+        let n = gone.len();
+        for h in gone {
+            for f in &h.files {
+                match std::fs::remove_file(f) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => warn!(
+                        lease = %h.info.lease_id, path = %f.display(), %e,
+                        "vault: a file written with a lease's value was not removed"
+                    ),
+                }
+            }
+        }
+        n
     }
 
     /// P3-4b — what a session's role may list: metadata only, and whether
@@ -426,11 +448,13 @@ mod client {
                     info: info.clone(),
                     until,
                     value,
+                    files: Vec::new(),
                 },
             );
             if reply.send(Ok(info)).is_err() {
                 // Its asker stopped waiting: nothing will use it.
-                lock(&self.held).remove(lease_id);
+                let gone = lock(&self.held).remove(lease_id);
+                let_go(gone.into_iter().collect());
             }
         }
 
@@ -468,13 +492,7 @@ mod client {
         /// word. An id this daemon does not hold is ignored: a hello is told
         /// again of what an earlier process held. Answers how many went.
         pub fn on_revoke(&self, lease_ids: &[String], reason: &str) -> usize {
-            let dropped = {
-                let mut held = lock(&self.held);
-                lease_ids
-                    .iter()
-                    .filter(|id| held.remove(id.as_str()).is_some())
-                    .count()
-            };
+            let dropped = let_go(self.take_ids(lease_ids));
             if dropped > 0 {
                 info!(dropped, reason, "vault: leases taken back");
             }
@@ -484,28 +502,51 @@ mod client {
         /// P3-4c — a tool is done with these leases: let them go now, not at
         /// their expiry. Answers how many it held.
         pub fn release(&self, lease_ids: &[String]) -> usize {
-            let mut held = lock(&self.held);
-            lease_ids
-                .iter()
-                .filter(|id| held.remove(id.as_str()).is_some())
-                .count()
+            let_go(self.take_ids(lease_ids))
+        }
+
+        /// P3-4c-2 — `path` was written with `lease_id`'s value: it is removed
+        /// when the lease is let go, however that happens. `false` when the
+        /// lease is not held (any more): the caller removes the file itself.
+        pub fn attach(&self, lease_id: &str, path: &std::path::Path) -> bool {
+            match lock(&self.held).get_mut(lease_id) {
+                Some(h) => {
+                    h.files.push(path.to_path_buf());
+                    true
+                }
+                None => false,
+            }
         }
 
         /// The run of `session` at `fence` ended here: its leases go with it.
         pub fn drop_run(&self, session: ObjectId, fence: u64) -> usize {
-            let mut held = lock(&self.held);
-            let before = held.len();
-            held.retain(|_, h| !(h.info.session_id == session && h.info.fence == fence));
-            before - held.len()
+            let_go(self.take(|h| h.info.session_id == session && h.info.fence == fence))
         }
 
         /// Let go of every lease past its time.
         pub fn prune(&self) -> usize {
             let now = Instant::now();
+            let_go(self.take(|h| h.until <= now))
+        }
+
+        /// The held leases `lease_ids` names, taken out of the map.
+        fn take_ids(&self, lease_ids: &[String]) -> Vec<Held> {
             let mut held = lock(&self.held);
-            let before = held.len();
-            held.retain(|_, h| h.until > now);
-            before - held.len()
+            lease_ids
+                .iter()
+                .filter_map(|id| held.remove(id.as_str()))
+                .collect()
+        }
+
+        /// Every held lease `f` picks, taken out of the map.
+        fn take(&self, f: impl Fn(&Held) -> bool) -> Vec<Held> {
+            let mut held = lock(&self.held);
+            let ids: Vec<String> = held
+                .iter()
+                .filter(|(_, h)| f(h))
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter().filter_map(|id| held.remove(id)).collect()
         }
 
         /// Use a held value without it leaving this daemon: `None` once the
@@ -1025,6 +1066,51 @@ mod tests {
             let mut left: Vec<String> = c.held().into_iter().map(|l| l.lease_id).collect();
             left.sort();
             assert_eq!(left, ["L2", "L3"]);
+        }
+
+        /// P3-4c-2 — a file written with a lease's value goes whenever the
+        /// lease does: at a revocation, a release, the run's end and its
+        /// expiry. A lease no longer held takes no file.
+        #[tokio::test]
+        async fn a_leases_files_go_whenever_it_does() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = |name: &str| {
+                let p = dir.path().join(name);
+                std::fs::write(&p, b"x").unwrap();
+                p
+            };
+            let (c, mut rx) = connected();
+            let sid = ObjectId::new();
+
+            lease(&c, &mut rx, "R", sid, 1, in_ms(60_000)).await;
+            let revoked = file("revoked");
+            assert!(c.attach("R", &revoked));
+            c.on_revoke(&["R".to_string()], "value_changed");
+            assert!(!revoked.exists(), "a revocation takes the file");
+
+            lease(&c, &mut rx, "S", sid, 1, in_ms(60_000)).await;
+            let released = file("released");
+            assert!(c.attach("S", &released));
+            c.release(&["S".to_string()]);
+            assert!(!released.exists(), "a release takes the file");
+
+            lease(&c, &mut rx, "D", sid, 2, in_ms(60_000)).await;
+            let ended = file("run-ended");
+            assert!(c.attach("D", &ended));
+            c.drop_run(sid, 2);
+            assert!(!ended.exists(), "the run's end takes the file");
+
+            lease(&c, &mut rx, "E", sid, 3, in_ms(1)).await;
+            let expired = file("expired");
+            assert!(c.attach("E", &expired));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            c.prune();
+            assert!(!expired.exists(), "the expiry takes the file");
+
+            assert!(
+                !c.attach("gone", &dir.path().join("never")),
+                "a lease not held takes no file"
+            );
         }
 
         /// A lease is let go at its expiry, and held no longer than the

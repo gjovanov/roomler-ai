@@ -718,6 +718,18 @@ pub fn end_update() {
 /// is answered with the device's actual refusal rather than silence.
 pub fn init(cfg: &AgentConfig) {
     let hive = HiveConfig::from_agent(cfg);
+    // P3-4c-2 — files `vault_render` wrote for an earlier process: no lease
+    // outlives the process that held it, so none of them is anyone's now.
+    #[cfg(all(unix, feature = "vault"))]
+    {
+        let gone = super::vault_render::sweep(&runtime_root());
+        if gone > 0 {
+            info!(
+                gone,
+                "hive: removed the secrets directories an earlier process left"
+            );
+        }
+    }
     // P1h-2 — `hive` is in the release builds, so every device runs this. One
     // whose owner never turned agent sessions on keeps no store: nothing is
     // created for it, and a start is refused `hive_disabled` before a store
@@ -4224,6 +4236,10 @@ impl Supervisor {
                     .then(|| account.to_string()),
                 home: home.clone(),
                 folder: folder.to_path_buf(),
+                // P3-4c-2 — `vault_render`'s files go under this run's own
+                // directory, handed to the session's account.
+                session_dir: dir.clone(),
+                owner,
             }),
         };
         let toolbelt = toolbelt::open(&dir, owner, uid, run, approvals, self.approval_timing)
@@ -4600,13 +4616,23 @@ fn write_settings(runtime: &Path, sid: &str, vault_tools: bool) -> Result<PathBu
     let session_start_hook = own_exe()
         .ok()
         .and_then(|exe| resume_note::hook_command(&exe, &dir.join(resume_note::NOTE_FILE)));
+    // P3-4c-2 — the session's secrets directory, where `vault_render`
+    // writes: Claude Code's Read tool is denied there (design §4). That is
+    // UX, not the gate: the permit and a person's approval are.
+    #[cfg_attr(not(all(unix, feature = "vault")), allow(unused_mut))]
+    let mut extra_read_denies = Vec::new();
+    #[cfg(all(unix, feature = "vault"))]
+    if vault_tools {
+        let secrets = dir.join(super::vault_render::SECRETS_DIR);
+        extra_read_denies.push(format!("Read(/{}/**)", secrets.display()));
+    }
     // P0e — the key helper is the DAEMON's (the sidecar runs it); the session
     // has no `apiKeyHelper`, so nothing in it can print the provider's key.
     let doc = SettingsSpec {
         api_key_helper: None,
         auto_memory_directory: None,
         sandbox_proxy: None,
-        extra_read_denies: Vec::new(),
+        extra_read_denies,
         session_start_hook,
         // P3-4b — the vault's reads need no person: their gate is the
         // vault's own `secret:list`, decided and recorded by the server.
@@ -7500,16 +7526,55 @@ done
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
         };
         write_settings(&runtime, "offered", true).unwrap();
+        let offered = read("offered");
         assert_eq!(
-            read("offered")["permissions"]["allow"],
+            offered["permissions"]["allow"],
             serde_json::json!(toolbelt::VAULT_TOOLS)
         );
+        // P3-4c-2 — and where the vault tools are offered, the Read tool is
+        // denied the session's secrets directory.
+        #[cfg(feature = "vault")]
+        {
+            let secrets = runtime.join("offered").join("secrets");
+            let rule = format!("Read(/{}/**)", secrets.display());
+            assert!(
+                offered["permissions"]["deny"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|d| d == rule.as_str()),
+                "{offered}"
+            );
+        }
         write_settings(&runtime, "not-offered", false).unwrap();
         let doc = read("not-offered");
         assert!(
             doc["permissions"].get("allow").is_none(),
             "nothing allowed: every tool call asks: {doc}"
         );
+        assert!(
+            !doc["permissions"]["deny"].to_string().contains("secrets"),
+            "no secrets directory to deny: {doc}"
+        );
+    }
+
+    /// P3-4c-2 — the daemon's start removes every secrets directory an
+    /// earlier process left, and nothing else.
+    #[cfg(feature = "vault")]
+    #[test]
+    fn the_start_removes_the_secrets_an_earlier_process_left() {
+        let root = tempfile::tempdir().unwrap();
+        for sid in ["a1", "b2"] {
+            let secrets = root.path().join(sid).join("secrets");
+            std::fs::create_dir_all(&secrets).unwrap();
+            std::fs::write(secrets.join("kubeconfig"), b"x").unwrap();
+            std::fs::write(root.path().join(sid).join("settings.json"), b"{}").unwrap();
+        }
+        assert_eq!(super::super::vault_render::sweep(root.path()), 2);
+        for sid in ["a1", "b2"] {
+            assert!(!root.path().join(sid).join("secrets").exists());
+            assert!(root.path().join(sid).join("settings.json").exists());
+        }
     }
 
     /// A reconnect replays the latest state of every session — what a dying
