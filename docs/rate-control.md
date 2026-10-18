@@ -450,7 +450,7 @@ paced by it, and is limited by its own loop as before.
 ⚠️ **A step up waits for headroom** (P2d, `SW_PACE_UP_MARGIN_FPS`, `encode/encode_pressure.rs:249`). FR-1's
 `FpsPace` was meant to hold a pace until the estimate moved a full step, but it compared two 5-fps steps, which
 always differ by one. So on 0.4.142 an estimate hovering on a step boundary moved the pace every window it
-crossed (a field trace: 55 → 50 → 55 → 50 → 45 → 50 within eight windows). The software pace now steps down at
+crossed (a field trace: 55 → 50 → 55 → 50 → 45 → 50, five moves in ten windows). The software pace now steps down at
 once and up only when the encoder clears the higher step by 2.5 fps. The hardware pace keeps margin 0 until it
 is measured on hardware ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)).
 
