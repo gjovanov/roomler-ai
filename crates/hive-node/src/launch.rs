@@ -403,6 +403,11 @@ pub struct SettingsSpec {
     /// (P2f-3a) on a fork's first launch: it prints the note when the daemon
     /// left one, and nothing else.
     pub session_start_hook: Option<String>,
+    /// FR-90 P3-4b — tools that run without asking a person
+    /// (`permissions.allow`): the toolbelt's reads of the vault, whose gate is
+    /// the vault's own policy. Empty leaves the key out, and every tool call
+    /// nothing else allows asks.
+    pub allow_tools: Vec<String>,
 }
 
 /// Where the sandbox sends sandboxed commands' traffic.
@@ -422,6 +427,9 @@ impl SettingsSpec {
         let mut deny: Vec<String> = vec!["Read(//proc/**)".to_string()];
         deny.extend(self.extra_read_denies.iter().cloned());
         let mut doc = json!({"permissions": {"deny": deny}});
+        if !self.allow_tools.is_empty() {
+            doc["permissions"]["allow"] = json!(self.allow_tools);
+        }
         if let Some(helper) = &self.api_key_helper {
             doc["apiKeyHelper"] = json!(helper);
         }
@@ -739,8 +747,14 @@ mod tests {
             }),
             extra_read_denies: vec!["Read(//var/lib/roomler/hive/secrets/**)".into()],
             session_start_hook: Some("'/usr/bin/roomlerd' hive-resume-note '/run/n'".into()),
+            allow_tools: vec!["mcp__roomler__vault_list".into()],
         }
         .to_json();
+        // P3-4b — what is allowed is named, beside the denies.
+        assert_eq!(
+            doc["permissions"]["allow"],
+            json!(["mcp__roomler__vault_list"])
+        );
         // P2e-7 — the resume note's hook: on a resume, and (P2f-3a) on a
         // fork's first launch, never on a first start.
         assert_eq!(
@@ -772,9 +786,14 @@ mod tests {
             sandbox_proxy: None,
             extra_read_denies: vec![],
             session_start_hook: None,
+            allow_tools: vec![],
         }
         .to_json();
         assert!(bare.get("hooks").is_none(), "no hook, no hooks key");
+        assert!(
+            bare["permissions"].get("allow").is_none(),
+            "nothing allowed, no allow key: every tool call asks"
+        );
         assert_eq!(
             bare["sandbox"],
             json!({"autoAllowBashIfSandboxed": false}),

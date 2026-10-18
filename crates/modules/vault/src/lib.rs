@@ -35,6 +35,7 @@ pub mod crypto;
 pub mod dao;
 pub mod gate;
 pub mod lease;
+pub mod meta;
 pub mod model;
 pub mod policy;
 pub mod policy_routes;

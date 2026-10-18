@@ -5282,6 +5282,8 @@
     "rc:hive.view.ice",
     "rc:hive.view.closed",
     "rc:vault.lease",
+    "rc:vault.list",
+    "rc:vault.describe",
     "rc:sdp.answer",
     "rc:consent",
     "rc:consent.pending",
@@ -5392,6 +5394,8 @@
     "rc:vault.leased",
     "rc:vault.refused",
     "rc:vault.revoke",
+    "rc:vault.listed",
+    "rc:vault.described",
     "rc:pong",
     "rc:error",
     "rc:overlay.netmap"
@@ -5465,6 +5469,8 @@
     "rc:tunnel.udp.closed": "network",
     "rc:tunnel.udp.reject": "network",
     "rc:tunnel.udp.request": "network",
-    "rc:vault.lease": "vault"
+    "rc:vault.describe": "vault",
+    "rc:vault.lease": "vault",
+    "rc:vault.list": "vault"
   }
 }

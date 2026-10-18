@@ -42,6 +42,18 @@
 //! own gates — the mapped account, `hive_roots` — are. A process running as
 //! the session's account can connect here too; all it can do is ASK, and the
 //! answer goes back to whoever asked.
+//!
+//! # The vault tools (FR-90 P3-4b)
+//!
+//! Where the primary connection takes leases ([`daemon_vault`]), the server
+//! also offers `vault_list` and `vault_describe`: what the session's role may
+//! LIST of the org's vault — names, kinds, fields, audiences, the programs a
+//! value may be handed to — and never a value. Each call goes to the server on
+//! that connection as the session at its fence, the vault decides it with
+//! Cedar's `secret:list` and records it, and the answer is the tool's text.
+//! They are reads whose gate is that policy, so the session's settings allow
+//! them ([`VAULT_TOOLS`]) instead of asking a person; anyone else who can
+//! connect here learns only what the session itself could.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -212,14 +224,94 @@ pub(crate) type PeerId = u32;
 #[cfg(windows)]
 pub(crate) type PeerId = String;
 
+/// FR-90 P3-4b — what a session's vault tools ask: the vault's metadata,
+/// decided for the session's role by the vault's own `secret:list`. Each
+/// answers JSON for the model, or why not. The daemon's is its lease client
+/// ([`daemon_vault`]); a test's stands in for it.
+#[async_trait::async_trait]
+pub(crate) trait VaultMeta: Send + Sync {
+    async fn list(&self, session: ObjectId, fence: u64, prefix: &str) -> Result<Value, String>;
+    async fn describe(&self, session: ObjectId, fence: u64, secret: &str) -> Result<Value, String>;
+}
+
+/// FR-90 P3-4b — the run a toolbelt serves, and what it offers that run.
+pub(crate) struct Run {
+    pub(crate) session: ObjectId,
+    /// The fence the session runs at here: the vault believes a session's
+    /// request only at its record's fence.
+    pub(crate) fence: u64,
+    /// The vault's metadata, where this device takes leases; without it the
+    /// vault tools are not offered.
+    pub(crate) vault: Option<Arc<dyn VaultMeta>>,
+}
+
 /// What every connection of one session's toolbelt shares.
 struct Ctx {
     session: ObjectId,
+    /// P3-4b — the run's fence, and its vault tools' answers.
+    fence: u64,
+    vault: Option<Arc<dyn VaultMeta>>,
     /// The only account a connection is taken from: the session's.
     peer: PeerId,
     pending: Arc<Pending>,
     events: mpsc::Sender<ApprovalEvent>,
     timing: Timing,
+}
+
+/// FR-90 P3-4b — the vault tools this server offers where the device takes
+/// leases: reads of the vault's metadata, never a value.
+const VAULT_TOOL_NAMES: [&str; 2] = ["vault_list", "vault_describe"];
+
+/// The vault tools, as Claude Code names them: allowed in the session's
+/// settings wherever they are offered, since they read and their gate is the
+/// vault's own `secret:list`, not a person's approval.
+pub(crate) const VAULT_TOOLS: [&str; 2] =
+    ["mcp__roomler__vault_list", "mcp__roomler__vault_describe"];
+
+/// FR-90 P3-4b — the daemon's vault for a run's toolbelt: its lease client,
+/// where the primary connection takes leases; otherwise none, and the vault
+/// tools are not offered.
+pub(crate) fn daemon_vault() -> Option<Arc<dyn VaultMeta>> {
+    #[cfg(feature = "vault")]
+    if crate::vault::CLIENT.takes_leases() {
+        return Some(Arc::new(DaemonVault));
+    }
+    None
+}
+
+#[cfg(feature = "vault")]
+struct DaemonVault;
+
+/// Why a vault tool got no answer, for the model.
+#[cfg(feature = "vault")]
+fn vault_why(e: crate::vault::LeaseError) -> String {
+    use crate::vault::LeaseError;
+    match e {
+        LeaseError::Refused(word) => format!("the vault refused: {word}"),
+        LeaseError::NotConnected => "this device is not connected to its server".into(),
+        LeaseError::NoAnswer => "the vault did not answer".into(),
+        LeaseError::Unopenable => "the vault's answer did not open".into(),
+    }
+}
+
+#[cfg(feature = "vault")]
+#[async_trait::async_trait]
+impl VaultMeta for DaemonVault {
+    async fn list(&self, session: ObjectId, fence: u64, prefix: &str) -> Result<Value, String> {
+        let l = crate::vault::CLIENT
+            .list(session, fence, prefix)
+            .await
+            .map_err(vault_why)?;
+        Ok(json!({ "secrets": l.secrets, "more": l.more }))
+    }
+
+    async fn describe(&self, session: ObjectId, fence: u64, secret: &str) -> Result<Value, String> {
+        let s = crate::vault::CLIENT
+            .describe(session, fence, secret)
+            .await
+            .map_err(vault_why)?;
+        Ok(json!(s))
+    }
 }
 
 /// One session's toolbelt: its socket, its open approvals, and the switch
@@ -262,7 +354,7 @@ pub(crate) fn open(
     dir: &Path,
     owner: Option<(u32, u32)>,
     uid: u32,
-    session: ObjectId,
+    run: Run,
     events: mpsc::Sender<ApprovalEvent>,
     timing: Timing,
 ) -> Result<Toolbelt, String> {
@@ -297,7 +389,9 @@ pub(crate) fn open(
     let pending = Arc::new(Pending::default());
     let stop = CancellationToken::new();
     let ctx = Arc::new(Ctx {
-        session,
+        session: run.session,
+        fence: run.fence,
+        vault: run.vault,
         peer: uid,
         pending: Arc::clone(&pending),
         events,
@@ -352,10 +446,11 @@ async fn serve(listener: UnixListener, ctx: Arc<Ctx>, stop: CancellationToken) {
 #[cfg(windows)]
 pub(crate) fn open(
     peer: PeerId,
-    session: ObjectId,
+    run: Run,
     events: mpsc::Sender<ApprovalEvent>,
     timing: Timing,
 ) -> Result<Toolbelt, String> {
+    let session = run.session;
     let name = format!(
         r"\\.\pipe\roomler-hive-{}-{}",
         session.to_hex(),
@@ -367,6 +462,8 @@ pub(crate) fn open(
     let stop = CancellationToken::new();
     let ctx = Arc::new(Ctx {
         session,
+        fence: run.fence,
+        vault: run.vault,
         peer,
         pending: Arc::clone(&pending),
         events,
@@ -467,6 +564,83 @@ fn approve_tool() -> Value {
     })
 }
 
+/// FR-90 P3-4b — the vault tools, as `tools/list` describes them: offered
+/// only where this device takes leases, metadata only.
+fn vault_tools() -> [Value; 2] {
+    [
+        json!({
+            "name": "vault_list",
+            "description": "Lists the Roomler vault secrets this session's role may list, under a \
+                            folder when one is given: each one's RRN, kind, fields, audiences, \
+                            and the programs a value may be handed to. Never a value.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prefix": {"type": "string", "description": "a folder, such as db/"},
+                },
+            },
+            "annotations": {"readOnlyHint": true},
+        }),
+        json!({
+            "name": "vault_describe",
+            "description": "Describes one Roomler vault secret this session's role may list, by \
+                            its path or RRN: its kind, fields, audiences, the programs a value \
+                            may be handed to, and whether it is disabled. Never a value.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "secret": {"type": "string", "description": "a path, or rrn:<org>:secret:<path>"},
+                },
+                "required": ["secret"],
+            },
+            "annotations": {"readOnlyHint": true},
+        }),
+    ]
+}
+
+/// One vault tool call, from asking to answering: what the vault says, as
+/// text, or why it said nothing, as an error the model reads.
+async fn vault_tool(
+    ctx: Arc<Ctx>,
+    id: Value,
+    name: String,
+    args: Value,
+    out: mpsc::Sender<String>,
+    calls: Calls,
+    cancel: CancellationToken,
+) {
+    let key = id.to_string();
+    let answered = tokio::select! {
+        a = ask_vault(&ctx, &name, &args) => Some(a),
+        _ = cancel.cancelled() => None,
+    };
+    calls.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+    // A cancelled request gets no answer (MCP); a closed one cannot.
+    let Some(answered) = answered else {
+        return;
+    };
+    let result = match answered {
+        Ok(v) => json!({"content": [{"type": "text", "text": v.to_string()}]}),
+        Err(why) => json!({"content": [{"type": "text", "text": why}], "isError": true}),
+    };
+    let _ = out.send(reply(&id, result)).await;
+}
+
+/// What the vault answers one vault tool call, for the session's run.
+async fn ask_vault(ctx: &Ctx, name: &str, args: &Value) -> Result<Value, String> {
+    let Some(vault) = &ctx.vault else {
+        return Err("this device offers no vault".into());
+    };
+    if name == "vault_list" {
+        let prefix = args.get("prefix").and_then(Value::as_str).unwrap_or("");
+        return vault.list(ctx.session, ctx.fence, prefix).await;
+    }
+    match args.get("secret").and_then(Value::as_str) {
+        Some(secret) if !secret.is_empty() => vault.describe(ctx.session, ctx.fence, secret).await,
+        _ => Err("secret is required: a path, or rrn:<org>:secret:<path>".into()),
+    }
+}
+
 /// The `initialize` result: the client's version when this server knows it,
 /// else the newest it does.
 fn initialize(params: &Value) -> Value {
@@ -560,10 +734,17 @@ async fn on_message(
     let answer = match method {
         "initialize" => reply(&id, initialize(&params)),
         "ping" => reply(&id, json!({})),
-        "tools/list" => reply(&id, json!({"tools": [approve_tool()]})),
+        "tools/list" => {
+            let mut tools = vec![approve_tool()];
+            if ctx.vault.is_some() {
+                tools.extend(vault_tools());
+            }
+            reply(&id, json!({ "tools": tools }))
+        }
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            if name != "approve" {
+            let vault = ctx.vault.is_some() && VAULT_TOOL_NAMES.contains(&name);
+            if name != "approve" && !vault {
                 error(&id, -32602, "unknown tool")
             } else {
                 let cancel = stop.child_token();
@@ -571,6 +752,19 @@ async fn on_message(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(id.to_string(), cancel.clone());
+                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                if vault {
+                    tokio::spawn(vault_tool(
+                        Arc::clone(ctx),
+                        id,
+                        name.to_string(),
+                        args,
+                        out.clone(),
+                        Arc::clone(calls),
+                        cancel,
+                    ));
+                    return;
+                }
                 let progress = params
                     .get("_meta")
                     .and_then(|m| m.get("progressToken"))
@@ -578,7 +772,7 @@ async fn on_message(
                 tokio::spawn(approve(
                     Arc::clone(ctx),
                     id,
-                    params.get("arguments").cloned().unwrap_or(Value::Null),
+                    args,
                     progress,
                     out.clone(),
                     Arc::clone(calls),

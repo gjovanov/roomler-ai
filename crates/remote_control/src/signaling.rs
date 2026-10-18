@@ -1254,6 +1254,33 @@ pub enum ClientMsg {
         ttl_secs: u32,
     },
 
+    /// FR-90 P3-4b — a session on this device asks what its role may list in
+    /// the vault, under `prefix` when one is given. Believed as a lease
+    /// request is (the session's record, at its fence, on this device), and
+    /// answered with [`ServerMsg::VaultListed`] or [`ServerMsg::VaultRefused`].
+    #[serde(rename = "rc:vault.list")]
+    VaultList {
+        req_id: String,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        /// A folder (`db` or `db/`); empty or absent = every secret.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        prefix: String,
+    },
+
+    /// FR-90 P3-4b — a session on this device asks for one secret's metadata,
+    /// by its path or its RRN. Answered with [`ServerMsg::VaultDescribed`] or
+    /// [`ServerMsg::VaultRefused`].
+    #[serde(rename = "rc:vault.describe")]
+    VaultDescribe {
+        req_id: String,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        secret: String,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -2019,6 +2046,8 @@ impl ClientMsg {
             ClientMsg::HiveViewIce { .. } => "rc:hive.view.ice",
             ClientMsg::HiveViewClosed { .. } => "rc:hive.view.closed",
             ClientMsg::VaultLease { .. } => "rc:vault.lease",
+            ClientMsg::VaultList { .. } => "rc:vault.list",
+            ClientMsg::VaultDescribe { .. } => "rc:vault.describe",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -2128,7 +2157,9 @@ impl ClientMsg {
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
             | ClientMsg::HiveViewClosed { .. } => Owner::Hive,
-            ClientMsg::VaultLease { .. } => Owner::Vault,
+            ClientMsg::VaultLease { .. }
+            | ClientMsg::VaultList { .. }
+            | ClientMsg::VaultDescribe { .. } => Owner::Vault,
         }
     }
 }
@@ -2175,6 +2206,8 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:hive.view.ice", Owner::Hive),
     ("rc:hive.view.closed", Owner::Hive),
     ("rc:vault.lease", Owner::Vault),
+    ("rc:vault.list", Owner::Vault),
+    ("rc:vault.describe", Owner::Vault),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -3992,6 +4025,24 @@ pub enum ServerMsg {
     VaultRevoke {
         lease_ids: Vec<String>,
         reason: String,
+    },
+
+    /// FR-90 P3-4b — what the session's role may list: at most
+    /// [`crate::vault::lease_limits::MAX_LISTED`] secrets, `more` when there
+    /// were more. Metadata only, never a value.
+    #[serde(rename = "rc:vault.listed")]
+    VaultListed {
+        req_id: String,
+        secrets: Vec<crate::vault::VaultSecretMeta>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        more: bool,
+    },
+
+    /// FR-90 P3-4b — one secret's metadata, never a value.
+    #[serde(rename = "rc:vault.described")]
+    VaultDescribed {
+        req_id: String,
+        secret: crate::vault::VaultSecretMeta,
     },
 }
 

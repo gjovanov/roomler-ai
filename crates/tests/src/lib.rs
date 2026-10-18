@@ -253,6 +253,11 @@ mod vault_key_tests;
 /// facts from its row, recorded before they are sent.
 #[cfg(test)]
 mod vault_lease_tests;
+/// FR-90 P3-4b — what a session may know of the vault: a listing and a
+/// description, decided by Cedar's `secret:list`, believed as a lease is,
+/// never a value.
+#[cfg(test)]
+mod vault_meta_tests;
 /// FR-90 P3-3c — revocation: a session's end or move, a changed, disabled
 /// or deleted secret, a new device key, a removed device; told at once on
 /// the device's pod or at its sweep, again at every hello, never expired.

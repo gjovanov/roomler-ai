@@ -98,9 +98,9 @@ advertises `session-policy` (P2b). Every other session goes without it:
 | Piece | Where |
 |---|---|
 | The owner's floor: `rc_clipboard`, `rc_files`, `rc_audio`, each `on` (default), `ask` or `off`. Live, read strictly when set (`maybe` is refused, where the file's reader would read it as `off`), and absent from `DesiredConfig`, so no server can switch back on what the owner switched off. Over the LocalAPI only the person at the console may set them (root counts on Unix): they govern that person's clipboard, files and audio | `crates/agent-core/src/config.rs:1517`, `config_surface.rs`; `crates/localapi/src/lib.rs:2901` |
-| The masking: the org's policy (from `rc:request`) and the floor, the stricter winning (`FeaturePolicy::stricter`, `crates/remote_control/src/models.rs:1342`, shared with the hub). `off` takes the feature out; `ask` survives only when the person here will approve the session on a prompt this agent raises (`person_asked`: never under `email`, `push` or `prompt_then_email`). Applied the moment the consent mode resolves and before anything reads the grant: the stash the channels enforce, the worker's params, the prompt | `agents/roomlerd/src/session_policy.rs:128` (`mask`), `:102`; applied at `agents/roomlerd/src/signaling.rs:3101` |
+| The masking: the org's policy (from `rc:request`) and the floor, the stricter winning (`FeaturePolicy::stricter`, `crates/remote_control/src/models.rs:1342`, shared with the hub). `off` takes the feature out; `ask` survives only when the person here will approve the session on a prompt this agent raises (`person_asked`: never under `email`, `push` or `prompt_then_email`). Applied the moment the consent mode resolves and before anything reads the grant: the stash the channels enforce, the worker's params, the prompt | `agents/roomlerd/src/session_policy.rs:128` (`mask`), `:102`; applied at `agents/roomlerd/src/signaling.rs:3107` |
 | The prompt names each `ask` feature in words ("Approving also allows clipboard, file transfer and audio."), on its own line under privacy mode's, inside the native panel's two-line detail | `session_policy.rs:183` |
-| `session-policy` in the caps, and the floor itself (`AgentCaps.session_policy`, `models.rs:511`, only when it restricts anything), re-announced on the heartbeat when the owner changes it | `signaling.rs:6464`, `:2124` |
+| `session-policy` in the caps, and the floor itself (`AgentCaps.session_policy`, `models.rs:511`, only when it restricts anything), re-announced on the heartbeat when the owner changes it | `signaling.rs:6491`, `:2130` |
 | The hub reads the floor from the caps and strips what the device will refuse, naming it `device_policy_off`; when both say `off`, the org's is the one named | `crates/modules/fleet/src/hub.rs:492` (`feature_grant`), `socket.rs:243` |
 
 - **The bypassed hub (AC4's device half).** The device holds its floor whatever the server sends. A
@@ -149,7 +149,7 @@ note per completed file, with the name hashed the moment it is noted. It sends t
 still reports. Detail, with the diagram: [`remote-control.md`](../remote-control.md) §11.3a.
 
 ⚠️ **Follow-up, found by FR-102 P9d's review (2026-10-17): the device-ended last sample on a
-supervised Mac.** The signalling loop's device-end arm (`agents/roomlerd/src/signaling.rs:2284`) sends
+supervised Mac.** The signalling loop's device-end arm (`agents/roomlerd/src/signaling.rs:2290`) sends
 that sample, then the terminate, on the connection's delegation channel whenever one is attached — for
 every session the loop holds, the worker's own included. A worker's own session (FR-43: the GUI worker
 is its own enrollment and serves its own sessions) therefore reports under the daemon's identity, and

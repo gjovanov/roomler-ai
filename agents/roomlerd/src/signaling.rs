@@ -1607,18 +1607,24 @@ async fn connect_once(
     // FR-99 P1d — the curtains the previous process died holding, reported as
     // `worker_exit` on the first healthy connection of the org each belonged to.
     crate::privacy::drain_leftovers(&cfg.tenant_id, &outbound_tx);
-    // FR-90 — the primary enrollment's connection carries this device's Hive
-    // state reports: point the supervisor at THIS one, which also replays
-    // the latest state of every session a dropped connection may have lost.
+    // FR-90 P3-4a — the primary enrollment's connection carries this
+    // device's lease requests: the vault answers each on the connection it
+    // came from. P3-4b — set BEFORE the supervisor below is pointed here, so
+    // a run it launches from now on knows whether its toolbelt offers the
+    // vault tools.
+    #[cfg(feature = "vault")]
+    if ctx.is_primary {
+        crate::vault::on_connected(
+            outbound_tx.clone(),
+            crate::vault::takes_leases(cfg.vault_enabled, ctx.is_primary),
+        );
+    }
+    // FR-90 — and its Hive state reports: point the supervisor at THIS one,
+    // which also replays the latest state of every session a dropped
+    // connection may have lost.
     #[cfg(hive_host)]
     if ctx.is_primary {
         crate::hive::on_connected(outbound_tx.clone());
-    }
-    // FR-90 P3-4a — and its lease requests: the vault answers each on the
-    // connection it came from.
-    #[cfg(feature = "vault")]
-    if ctx.is_primary {
-        crate::vault::on_connected(outbound_tx.clone());
     }
     let _sink_guard = tunnel_hub.publish_sink(outbound_tx.clone());
     // FR-43 P2b — point the delegation channel at THIS connection's outbound
@@ -5903,6 +5909,27 @@ async fn handle_server_msg(
             }
             #[cfg(not(feature = "vault"))]
             let _ = (req_id, reason);
+        }
+        // FR-90 P3-4b — a session's listing and description: metadata.
+        ServerMsg::VaultListed {
+            req_id,
+            secrets,
+            more,
+        } => {
+            #[cfg(feature = "vault")]
+            if ctx.is_primary {
+                crate::vault::on_listed(&req_id, secrets, more);
+            }
+            #[cfg(not(feature = "vault"))]
+            let _ = (req_id, secrets, more);
+        }
+        ServerMsg::VaultDescribed { req_id, secret } => {
+            #[cfg(feature = "vault")]
+            if ctx.is_primary {
+                crate::vault::on_described(&req_id, secret);
+            }
+            #[cfg(not(feature = "vault"))]
+            let _ = (req_id, secret);
         }
         ServerMsg::VaultRevoke { lease_ids, reason } => {
             #[cfg(feature = "vault")]

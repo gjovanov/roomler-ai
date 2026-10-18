@@ -136,7 +136,7 @@ is not an assumption: `pre_rc53_server_msg_rejects_goodbye_so_agent_err_arm_fire
 The trap that *does* need a forward-compat pre-roll is a new variant of a **nested** enum
 inside a frame the old agent already parses — the `RelayStrategyWire` case, where an unknown
 tag fails the *whole enclosing `ServerMsg`* and the agent silently drops entire netmaps
-(`signaling.rs:2312-2331`, `relay_strategy_lenient`). `OverlayJoinRefused` is not that shape.
+(`signaling.rs:2345-2364`, `relay_strategy_lenient`). `OverlayJoinRefused` is not that shape.
 
 ### 3c. Multi-block per org (P5) — the growth mechanism
 
