@@ -887,9 +887,13 @@ impl DrmCapture {
     /// produces a wrong picture rather than a slow one, and the caller's
     /// cascade has a working fallback.
     ///
-    /// `idle_skip` (FR-93 P3d): skip a frame nothing changed in. Only for a
-    /// Wayland seat, and the caller decides that (see `drm_idle.rs`).
-    pub fn primary(target_fps: u32, downscale: DownscalePolicy, idle_skip: bool) -> Result<Self> {
+    /// `idle_skip` (FR-93 P3d, FR-113 P1): how a frame nothing changed in is
+    /// skipped, by the seat's kind, which the caller decides (`drm_idle.rs`).
+    pub fn primary(
+        target_fps: u32,
+        downscale: DownscalePolicy,
+        idle_skip: drm_idle::IdleSkip,
+    ) -> Result<Self> {
         // Build the device on the worker thread so the fd and every mapping
         // stay on one thread for their whole life, and ack readiness back
         // synchronously so an init failure surfaces to the cascade here rather
@@ -947,7 +951,7 @@ fn worker(
     ready_tx: std_mpsc::Sender<Result<(u32, u32, String)>>,
     cmd_rx: std_mpsc::Receiver<FrameRequest>,
     downscale: DownscalePolicy,
-    idle_skip: bool,
+    idle_skip: drm_idle::IdleSkip,
     unchanged: Arc<AtomicU64>,
     output_cap: Arc<AtomicU64>,
 ) {
@@ -1041,16 +1045,25 @@ fn worker(
             GpuState::Off
         },
     };
-    // FR-93 P3d — the frame skip for an unchanged screen, Wayland seats only.
-    let mut gate = idle_skip.then(IdleGate::default);
+    // FR-93 P3d — the frame skip for an unchanged screen: a Wayland seat's,
+    // or (FR-113 P1) an X11 seat's, which samples dense rows.
+    let mut gate: Option<IdleGate> = idle_skip.gate();
     // FR-93 P3e — an empty scanout is told apart: a display switched off.
     let dark_check = wake_wait_enabled();
     info!(
         "drm capture: {}",
-        if idle_skip {
-            "a frame nothing changed in is skipped (FR-93 P3d; ROOMLERD_DRM_IDLE_SKIP=0 reads every frame)"
-        } else {
-            "every frame is read (not a Wayland seat, or ROOMLERD_DRM_IDLE_SKIP=0)"
+        match idle_skip {
+            drm_idle::IdleSkip::Flips => {
+                "a frame nothing changed in is skipped (FR-93 P3d; ROOMLERD_DRM_IDLE_SKIP=0 reads every frame)"
+            }
+            drm_idle::IdleSkip::InPlace => {
+                "a frame nothing changed in is skipped by dense rows, an X server draws in place \
+                 (FR-113 P1; ROOMLERD_DRM_IDLE_SKIP=0 or x11_auto_system = false reads every frame)"
+            }
+            drm_idle::IdleSkip::Off => {
+                "every frame is read (no Wayland seat and no X11 one with x11_auto_system on, or \
+                 ROOMLERD_DRM_IDLE_SKIP=0)"
+            }
         }
     );
 
@@ -1219,10 +1232,16 @@ fn grab(
     // `MAX_SKIP` of the last frame delivered: nothing to send. Checked before
     // any pixel is converted, which is the cost this skips.
     let now = Instant::now();
-    let shown = gate.as_ref().map(|_| drm_idle::Shown {
+    let shown = gate.as_ref().map(|g| drm_idle::Shown {
         fb: u32::from(fb),
         buffer: id.inode,
-        rows: drm_idle::sample_rows(mapping.as_slice(), width as usize * 4, height, pitch),
+        rows: drm_idle::sample_rows_n(
+            mapping.as_slice(),
+            width as usize * 4,
+            height,
+            pitch,
+            g.rows(height),
+        ),
     });
     if let (Some(gate), Some(shown)) = (gate.as_deref(), shown)
         && gate.unchanged(shown, now)

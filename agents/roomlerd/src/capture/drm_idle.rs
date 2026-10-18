@@ -30,10 +30,14 @@
 //! each "nothing" with a keepalive re-encode of its last frame, so one every
 //! frame period would spend on keepalives most of what the skip saves.
 //!
-//! ⚠️ **Wayland only.** An X server and the kernel console draw into the buffer
-//! on screen in place, so its identity never changes and only the sampled rows
-//! would see a change: a typed character could wait [`MAX_SKIP`]. The caller
-//! turns the gate on only when the seat shows a Wayland session.
+//! ⚠️ **An X server draws in place** (FR-113 P1, [`IdleSkip::InPlace`]). It and
+//! the kernel console draw into the buffer on screen, so its identity never
+//! changes and only the sampled rows can see a change. 32 rows would leave a
+//! typed character waiting up to [`MAX_SKIP`], so an X11 seat's gate samples a
+//! row every [`IN_PLACE_ROW_GAP`] rows instead: a change that tall is seen on
+//! the next tick wherever it lands, and the text caret (which moves on every
+//! keystroke) is that tall. The console gets no gate at all
+//! ([`IdleSkip::Off`]).
 //!
 //! Everything here is pure, so it is pinned by tests with no DRM device.
 
@@ -52,10 +56,48 @@ pub const MAX_SKIP: Duration = Duration::from_millis(1000);
 /// within a frame period.
 pub const IDLE_WAIT: Duration = Duration::from_millis(250);
 
-/// How many rows the change check hashes, spread evenly down the picture.
-/// 32 rows of a 1280-pixel scanout is 160 KiB a tick, against the 4 MiB a
-/// delivered frame copies.
+/// How many rows the change check hashes on a Wayland seat, spread evenly down
+/// the picture. 32 rows of a 1280-pixel scanout is 160 KiB a tick, against the
+/// 4 MiB a delivered frame copies.
 pub const SAMPLE_ROWS: u32 = 32;
+
+/// FR-113 P1 — on an X11 seat, at most this many rows apart, so a change at
+/// least this tall crosses a sampled row wherever it lands and is delivered on
+/// the next tick. The text caret (16 px or more at 1×) moves on every
+/// keystroke, so typing is seen at once; a smaller change waits [`MAX_SKIP`]
+/// at worst. The cost is an eighth of the rows a tick (512 KiB of a 1280×800
+/// scanout), against the whole picture a delivered frame reads, converts and
+/// encodes.
+pub const IN_PLACE_ROW_GAP: u32 = 8;
+
+/// How the DRM worker may skip a frame nothing changed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleSkip {
+    /// Every frame is read: the kill switch (`ROOMLERD_DRM_IDLE_SKIP=0`), the
+    /// console, or an X11 seat with `x11_auto_system = false` (0.4.143 read
+    /// every frame there, and that switch gives 0.4.143 back).
+    Off,
+    /// A Wayland seat (FR-93 P3d): the compositor flips, so the buffer and
+    /// [`SAMPLE_ROWS`] rows tell.
+    Flips,
+    /// An X11 seat (FR-113 P1): drawn in place, so rows alone, one every
+    /// [`IN_PLACE_ROW_GAP`].
+    InPlace,
+}
+
+impl IdleSkip {
+    /// The gate this mode runs, `None` for [`IdleSkip::Off`].
+    pub fn gate(self) -> Option<IdleGate> {
+        match self {
+            IdleSkip::Off => None,
+            IdleSkip::Flips => Some(IdleGate::default()),
+            IdleSkip::InPlace => Some(IdleGate {
+                last: None,
+                in_place: true,
+            }),
+        }
+    }
+}
 
 /// What the primary plane showed on one tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,9 +116,21 @@ pub struct Shown {
 #[derive(Debug, Default)]
 pub struct IdleGate {
     last: Option<(Shown, Instant)>,
+    /// FR-113 P1 — an X11 seat's gate ([`IdleSkip::InPlace`]): dense rows.
+    in_place: bool,
 }
 
 impl IdleGate {
+    /// How many rows this gate's check hashes for a `height`-row picture:
+    /// [`SAMPLE_ROWS`], or on an X11 seat one every [`IN_PLACE_ROW_GAP`].
+    pub fn rows(&self, height: u32) -> u32 {
+        if self.in_place {
+            height.div_ceil(IN_PLACE_ROW_GAP).min(height)
+        } else {
+            SAMPLE_ROWS.min(height)
+        }
+    }
+
     /// Whether a tick that shows `shown` at `now` may be skipped: the same
     /// framebuffer, buffer and rows as the last frame delivered, and that frame
     /// younger than [`MAX_SKIP`].
@@ -108,8 +162,14 @@ impl IdleGate {
 /// `h = (h ^ word) * FNV_PRIME`, a bijection of `h` for a given word: two
 /// inputs that differ in a single word always hash apart.
 pub fn sample_rows(src: &[u8], row_bytes: usize, height: u32, pitch: u32) -> u64 {
+    sample_rows_n(src, row_bytes, height, pitch, SAMPLE_ROWS)
+}
+
+/// [`sample_rows`] over `n` rows (at most `height`), the centres of `n` equal
+/// bands: [`IdleGate::rows`] says how many.
+pub fn sample_rows_n(src: &[u8], row_bytes: usize, height: u32, pitch: u32, n: u32) -> u64 {
     let mut h = FNV_OFFSET;
-    let n = SAMPLE_ROWS.min(height);
+    let n = n.min(height);
     for i in 0..n {
         let start = sampled_row(i, n, height) * pitch as usize;
         let Some(row) = src.get(start..start + row_bytes) else {
@@ -269,6 +329,74 @@ mod tests {
                 rows.last().unwrap()
             );
         }
+    }
+
+    /// FR-113 P1 — on an X11 seat the X server draws in place, so a change
+    /// must be SEEN by the rows: any band at least [`IN_PLACE_ROW_GAP`] rows
+    /// tall, wherever it lands (the caret moving on a keystroke is one), must
+    /// cross a sampled row. Every height a scanout plausibly has, every start.
+    #[test]
+    fn on_an_x11_seat_any_change_a_gap_tall_crosses_a_sampled_row() {
+        let gate = IdleSkip::InPlace.gate().expect("an X11 seat runs a gate");
+        for h in [
+            1u32, 7, 8, 9, 63, 600, 768, 800, 1012, 1080, 1440, 1600, 2160,
+        ] {
+            let n = gate.rows(h);
+            let rows: Vec<usize> = (0..n).map(|i| sampled_row(i, n, h)).collect();
+            assert!(rows.windows(2).all(|r| r[0] < r[1]), "height {h}");
+            for start in 0..h.saturating_sub(IN_PLACE_ROW_GAP - 1) as usize {
+                let band = start..start + IN_PLACE_ROW_GAP as usize;
+                assert!(
+                    rows.iter().any(|r| band.contains(r)),
+                    "height {h}: rows {band:?} cross no sampled row"
+                );
+            }
+        }
+    }
+
+    /// The same, end to end through the hash: a caret-sized change (2 px
+    /// wide, a gap tall) anywhere in an X11 seat's picture changes it.
+    #[test]
+    fn on_an_x11_seat_a_caret_sized_change_changes_the_hash() {
+        let gate = IdleSkip::InPlace.gate().unwrap();
+        let (w, h, pitch) = (320usize, 200u32, 320 * 4 + 64);
+        let base = picture(w, h as usize, pitch);
+        let n = gate.rows(h);
+        let before = sample_rows_n(&base, w * 4, h, pitch as u32, n);
+        for top in 0..(h - IN_PLACE_ROW_GAP) as usize {
+            let mut p = base.clone();
+            for y in top..top + IN_PLACE_ROW_GAP as usize {
+                for x in 100 * 4..102 * 4 {
+                    p[y * pitch + x] = !p[y * pitch + x];
+                }
+            }
+            assert_ne!(
+                sample_rows_n(&p, w * 4, h, pitch as u32, n),
+                before,
+                "a caret at rows {top}.. was missed"
+            );
+        }
+    }
+
+    /// The modes: no gate at all with the switch off, the Wayland gate as
+    /// FR-93 P3d left it, and the X11 gate's row count.
+    #[test]
+    fn each_mode_runs_its_own_gate() {
+        assert!(IdleSkip::Off.gate().is_none());
+        let flips = IdleSkip::Flips.gate().unwrap();
+        assert_eq!(flips.rows(800), SAMPLE_ROWS);
+        assert_eq!(flips.rows(20), 20, "never more rows than the picture has");
+        let in_place = IdleSkip::InPlace.gate().unwrap();
+        assert_eq!(in_place.rows(800), 100);
+        assert_eq!(in_place.rows(2160), 270);
+        assert_eq!(in_place.rows(5), 1);
+        // The Wayland hash is the one P3d shipped, row for row.
+        let (w, h, pitch) = (64usize, 96u32, 64 * 4);
+        let p = picture(w, h as usize, pitch);
+        assert_eq!(
+            sample_rows_n(&p, w * 4, h, pitch as u32, flips.rows(h)),
+            sample_rows(&p, w * 4, h, pitch as u32)
+        );
     }
 
     #[test]

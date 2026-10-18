@@ -1,7 +1,9 @@
 # FR-113: A system install on an X11 desktop shows it by default — FR-95's plan for X11 seats
 
 **Issue:** [#2458](https://github.com/gjovanov/roomler-ai/issues/2458) · **Status:** proposed 2026-10-18, spec and claim,
-on the operator's go-ahead (*"5. yes"*) from #2450 · **Owner:** remote desktop (agent) · **Anchors:** master
+on the operator's go-ahead (*"5. yes"*) from #2450. P1 + P2 written 2026-10-18 (with D1–D3 as recommended), docs in
+the same change, and field-verified on the candidate on a vmtest GNOME/Xorg cell (§8): AC1, AC4, AC5 and AC6 green
+there, AC3's lock and unlock. Each ticks on the release; AC2 and the rest of AC3 owed · **Owner:** remote desktop (agent) · **Anchors:** master
 `df4803f87` · **Builds on:** [FR-95](FR-95-system-installs-on-by-default-on-wayland.md) (the system plan, its seat guard),
 [FR-36](FR-36-wayland-capture.md) (DRM + uinput), [FR-93](FR-93-wayland-out-of-the-box.md) (the idle skip P3d, the desktop
 brief P2b), FR-80 (the reason codes)
@@ -44,18 +46,32 @@ flowchart LR
     X -. "cannot open" .-> R["the reason: an X11 session is on<br/>this seat, and the key that fixes it"]
 ```
 
-- **FR-95's plan for X11 seats.** `person_on_screen` and its twin (`mod.rs:904`) accept an X11 user session when the
-  new switch is on, and the plan then picks DRM capture + `uinput` as on Wayland. DRM reads the scanout below any
-  display server, so it does not depend on the display manager, and on X11 it is already proven (§2). `uinput` reaches
-  Xorg through libinput as it reaches a Wayland compositor.
+- **FR-95's plan for X11 seats.** `person_on_screen` accepts an X11 user session, and `system_plan` decides by the
+  session's kind with one switch each (`AutoKinds { wayland, x11 }`). The plan then picks DRM capture + `uinput` as on
+  Wayland. DRM reads the scanout below any display server, so it does not depend on the display manager, and on X11 it
+  is already proven (§2). `uinput` reaches Xorg through libinput as it reaches a Wayland compositor.
+  ⚠️ *Corrected while writing P1:* the "twin" at `mod.rs:904` is `own_session_in`, the **per-user** daemon's plan. It
+  stays as it is: per-user X11 installs are out of scope (§7), since scrap reaches their own `DISPLAY`.
 - **The seat guard holds on X11.** FR-95 P2's guard (never the greeter, never a locked screen; the person's session
   must be the one on screen) reads logind, so it carries over. It must be shown on X11 (AC3), since a DRM read of the
-  scanout would otherwise show whatever is on screen.
+  scanout would otherwise show whatever is on screen. **It sees a lock only through `LockedHint`**, so the X11 half
+  switches on only for a desktop that sets it: GNOME Shell or KDE's `ksmserver` running as the person (D4).
 - **DRM's idle skip on X11 seats.** FR-93 P3d skips unchanged frames on Wayland seats only
   (`capture/drm_backend.rs:1044`; the X11 cell logged "every frame is read (not a Wayland seat …)"). An idle X11
-  desktop through DRM would read every frame, so P1 extends the skip, or AC6 fails.
+  desktop through DRM would read every frame, so P1 extends the skip, or AC6 fails. **Why P3d was Wayland-only**
+  (`drm_idle.rs`): a Wayland compositor flips buffers, so the buffer's identity tells a change; an X server draws
+  into the buffer on screen in place, so only the sampled rows can, and 32 rows would leave a typed character up to
+  1 s late. **P1's answer** is a second mode, `drm_idle::IdleSkip::InPlace`: the same gate, with one row sampled
+  every `IN_PLACE_ROW_GAP` = 8 rows. Any change at least 8 rows tall crosses a sampled row wherever it lands, and
+  the text caret, which moves on every keystroke, is that tall, so it is delivered on the next tick. A smaller
+  change keeps P3d's 1 s bound. The cost is an eighth of the rows a tick, against the whole picture a delivered
+  frame reads, converts and encodes. No extra full-frame read, because the hash is still taken before the read
+  (hash, then read: a change between them only causes one redundant delivery).
 - **The reason when it cannot.** `linux_no_pixels_code` (`mod.rs:1803`) asks only `seat_shows_wayland` (`:1870`),
   so a reachable-but-unopened X11 seat reads `no_display` ("headless"). It should name the X11 session and the key.
+  **P2's answer:** `seat_kind()` replaces the Wayland-only question, and a new code `x11_not_enabled` carries what
+  was found and a hint by install type (`x11_hint_with`). Viewers type the code as a string and print the agent's
+  hint, so an older bundle shows it too.
 - **Its own kill switch**, `x11_auto_system` (D3), independent of FR-95's `wayland_auto_system` (`mod.rs:663`), so
   either can be turned off without the other. Explicit capture keys keep winning, as in FR-95 (`capture_keys_set`).
 
@@ -64,30 +80,56 @@ flowchart LR
 | Phase | What | Kill switch | Proven on | Size |
 |---|---|---|---|---|
 | **P0** | measure the population: system installs whose desktop brief reads `kind=x11` with no picture (the server's count, FR-93 P2b) | — | ⏳ | S |
-| **P1** | the plan for X11 seats (DRM + `uinput`), the seat guard on X11, DRM's idle skip on X11 seats | `x11_auto_system = false` | ⏳ | M |
-| **P2** | the true reason when the plan cannot capture an X11 seat | — | ⏳ | S |
-| **P3** | docs: `docs/linux-capture.md` (the plan, its X11 half, the switch), the `docs/README.md` index row | — | ⏳ | S |
+| **P1** | the plan for X11 seats (DRM + `uinput`), the seat guard on X11, DRM's idle skip on X11 seats (`IdleSkip::InPlace`) | `x11_auto_system = false` | ✅ candidate `c1ea719ab` on a vmtest GNOME/Xorg cell (§8): picture and input, the lock and the unlock, 5.5 % idle; the release run owed | M |
+| **P2** | the true reason when the plan cannot capture an X11 seat (`x11_not_enabled`) | `x11_auto_system = false` (back to `no_display`) | ✅ the same candidate: `x11_not_enabled`, and its hint on prod's viewer (§8); the release run owed | S |
+| **P3** | docs: `docs/linux-capture.md` (§1.2.2 the X11 half, §1.1 the reason, §3.2 the idle skip and its measurement, §7 the switch), the `docs/README.md` index row | — | ✅ in P1's change | S |
 
 ## 5. Acceptance criteria
 
 - [ ] **AC1** — A system install on its defaults on GNOME/Xorg shows the desktop to the viewer, with input. Red first
   on 0.4.143 (#2450).
+  ✅ **On the candidate** (`c1ea719ab`, 2026-10-18, §8). The red first, on the same cell and config: the released
+  0.4.143 sent `no_display`, and no picture. The candidate showed a picture in 62 of 62 samples, switched on by
+  itself (`backend=drm … FR-95 P2, FR-113 P1 … idle_skip=InPlace`), with the automatic `uinput`. The input was read
+  in the person's own X session (`xdotool getmouselocation`): the pointer, parked at (100, 100), stood at
+  **(716, 448)** after the viewer's move to 0.56, 0.56 of the frame (exactly 716.8, 448 on 1280×800).
+  ⏳ Ticks on the release.
 - [ ] **AC2** — The same on a second X11 display manager and desktop (LightDM/XFCE, or SDDM/Plasma on X11).
+  ⏳ Owed: a cell with a second display manager. D4 is measured there too.
 - [ ] **AC3** — The greeter and a locked screen are never streamed: lock, unlock, logout, login and a user switch on
   an X11 seat, each recovering within 10 s or naming its reason (FR-93 AC7's harness).
+  ⏳ **On the candidate, the lock and the unlock** (§8). GNOME's lock set `LockedHint`, and the guard read nothing
+  more (`guard=Locked`). The viewer named the lock 2.8 s after the guard closed; after the unlock, a new picture came
+  0.6 s later and the notice was gone at 1.1 s. One new frame arrived 2.1 s *before* the guard closed, likely the lock
+  shield's first frame: the transition FR-95 measured on Wayland, where `LockedHint` is set once the shield is up.
+  Owed: logout, login and a user switch.
 - [ ] **AC4** — Explicit keys win, and `x11_auto_system = false` gives back 0.4.143's behaviour exactly; Wayland hosts
   are unchanged.
+  ✅ **On the candidate** (§8). `ROOMLERD_X11_AUTO_SYSTEM=0` logged exactly what 0.4.143 did: no picture,
+  `code="no_display"`, reach `none`. The same cell switched back to Wayland was captured as before: FR-95's plan,
+  `idle_skip=Flips`, 56 of 56 samples with a picture. Explicit keys are `capture_keys_set`, unchanged, and are pinned
+  by unit tests. ⏳ Ticks on the release.
 - [ ] **AC5** — A plan that cannot capture an X11 seat names the X11 session and the key, never `no_display`.
+  ✅ **On the candidate** (§8). With `ROOMLERD_VIEWING_NOTICE=0` nobody could be told, and the agent sent
+  `code="x11_not_enabled"`, detail *logind shows an X11 session on this seat, and this daemon has no display of its
+  own…*. Prod's viewer showed the hint: *This computer is showing an X11 desktop, and it is not captured by itself
+  because nobody at the screen could be told they are being viewed…*. ⏳ Ticks on the release.
 - [ ] **AC6** — An idle X11 desktop through DRM costs within 2× of FR-29's X11 figure.
+  ✅ **On the candidate** (§8; `linux-capture.md` §3.2). An idle GNOME/Xorg desktop, two 60 s windows, every
+  `roomlerd` process: **5.5 % and 5.5 %** of a core, inside 6.8 %. Every frame read (`ROOMLERD_DRM_IDLE_SKIP=0`)
+  costs 46.3 % and 46.5 %. ⏳ Ticks on the release.
 - [ ] **AC7** — Docs: `docs/linux-capture.md` updated in the house style, and the `docs/README.md` index row.
+  ✅ In P1's change: §1.2.2 (the X11 half, a diagram and a table), §1.1 (the reason's rows), §3.2 (the idle skip and
+  its measurement), §7 (the switch). The index row already lists `linux-capture.md`.
 
 ## 6. Open decisions
 
 | | Decision | Status |
 |---|---|---|
-| **D1** | On by default for X11 system installs | *(Recommended: yes, as FR-95. The seat guard is what makes it safe, and AC3 proves it.)* |
+| **D1** | On by default for X11 system installs | *(Recommended: yes, as FR-95. The seat guard is what makes it safe, and AC3 proves it.)* **P1 implements the recommendation**; it ships in no release before the field run, and the operator can still overturn it. |
 | **D2** | DRM first, or the session's own X server (`DISPLAY` from logind's session, plus its Xauthority, whose path depends on the display manager) | *(Recommended: DRM first, as it is display-manager agnostic and proven here. The Xauthority path only for a host without DRM access.)* |
-| **D3** | The switch's name | *(Recommended: `x11_auto_system`, default on.)* |
+| **D3** | The switch's name | *(Recommended: `x11_auto_system`, default on.)* **As implemented** (`ROOMLERD_X11_AUTO_SYSTEM`); off gives back 0.4.143 exactly, including P2's reason (`no_display`) and the X11 idle skip (every frame read). `wayland_auto = false` and `wayland_aware = false` turn it off too. |
+| **D4** | A locker that never sets logind's `LockedHint` | Found while writing P1. The seat guard knows a lock only by `LockedHint` (`seat_guard::guard`). GNOME sets it on Xorg too, and LightDM's `light-locker` locks by switching to a greeter session, which the guard already reads as away. An in-session locker that does not set it (xscreensaver, i3lock, slock, some xfce4-screensaver versions) would have its lock screen read, and its password field typed into by the automatic `uinput`. **Decided in P1, on the PR review (#2471):** refuse such a desktop by default. The X11 half switches on only where `gnome-shell` or `ksmserver` runs as the person (`lock_reporting_shell`, read from `/proc`, since logind's `Desktop` is empty for GDM's auto-login session). Anything else plans `SystemPlan::LockUnreported`, before the surface is probed, and `x11_not_enabled` says so and offers the explicit keys. An allowlist entry for another desktop must first show its locker setting `LockedHint` (AC2's desktop is the first candidate). **Measured (2026-10-18, §8):** XFCE 4.18.3 on Ubuntu 24.04 (`xfce4-screensaver` 4.18.3) left `LockedHint` at `no` through `loginctl lock-session`, so it stays refused, and was refused in the field with the hint shown on prod's viewer. |
 
 ## 7. Out of scope
 
@@ -99,3 +141,12 @@ flowchart LR
 | Date | Host | Build | What | Result |
 |---|---|---|---|---|
 | 2026-10-18 10:19–10:26Z | a vmtest Ubuntu 24.04 cell, GDM on Xorg, a system install | the released 0.4.143 | the red (#2450) | 🔴 on its defaults: `capture_arm=x11`, `connection refused`, `no_display`, no picture. With `drm_capture = true`: DRM, 84/84 samples with a picture. |
+| 2026-10-18 14:28Z | a new kept cell, the same image (GNOME 46, GDM switched to Xorg, auto-login), the system daemon re-enrolled on a DEFAULT config | the released 0.4.143 | the red again, on this cell | 🔴 no picture; `code="no_display"`; input reach `none`; brief `kind=x11 capture_arm=x11` |
+| 2026-10-18 14:34–14:39Z | the same cell and config | candidate `c1ea719ab` (the release's Linux features minus `ffmpeg-encoder`), auto-update off | AC1 | ✅ 62/62 samples with a picture, `idle_skip=InPlace`, the automatic `uinput`. The pointer, parked at (100, 100), stood at (716, 448) after the viewer's move (`xdotool`, in the person's X session) |
+| 2026-10-18 14:40Z | the same | the same | AC3: `loginctl lock-session`, then `unlock-session` | ✅ the guard closed on `LockedHint` and read nothing; the viewer named the lock +2.8 s after; a picture +0.6 s after the unlock, live +1.1 s. One new frame 2.1 s before the guard closed (the shield's first, likely) |
+| 2026-10-18 14:43–14:57Z | the same | the same; then `ROOMLERD_DRM_IDLE_SKIP=0` | AC6: an idle desktop, two 60 s windows | ✅ 5.5 %, 5.5 % (and 5.5 % in a first run's second window) against 46.3 %, 46.5 % reading every frame |
+| 2026-10-18 15:01Z | the same | the same, `ROOMLERD_X11_AUTO_SYSTEM=0` | AC4: the kill switch | ✅ exactly 0.4.143's lines: no picture, `no_display`, reach `none` |
+| 2026-10-18 15:06Z | the same | the same, `ROOMLERD_VIEWING_NOTICE=0` | AC5: nobody to tell | ✅ `code="x11_not_enabled"`, its detail, and the no-surface hint on prod's viewer |
+| 2026-10-18 15:12Z | the same cell switched back to Wayland | the same, defaults | AC4: Wayland unchanged | ✅ FR-95's plan, `idle_skip=Flips`, the P3d line, 56/56 samples with a picture |
+| 2026-10-18 19:31Z | the same cell, back on Xorg (GNOME) | candidate `8be890c19` (D4, after the PR review) | AC1 again: `lock_reporting_shell` must find GNOME Shell | ✅ 64/64 samples with a picture, `InPlace`, the automatic `uinput`; the pointer (100,100) → (716,448) |
+| 2026-10-18 19:39Z | the same cell, the auto-login switched to **XFCE 4.18.3 on Xorg** (no `gnome-shell`, no `ksmserver`) | the same | D4: a desktop that does not report its lock | ✅ refused: no picture, no DRM read, `code="x11_not_enabled"`, and prod's viewer showed *…an X11 desktop whose screen locker does not report a lock to the system (GNOME and KDE do…)*. Measured: `loginctl lock-session` left `LockedHint` at `no` with `xfce4-screensaver` 4.18.3 running, which is exactly the case D4 exists for |

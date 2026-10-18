@@ -13056,6 +13056,7 @@ mod codec_cap_tests {
                 CaptureUnavailableCode::WaylandNotEnabled,
                 "wayland_not_enabled",
             ),
+            (CaptureUnavailableCode::X11NotEnabled, "x11_not_enabled"),
         ] {
             assert_eq!(code.wire(), wire);
             assert!(!code.hint().is_empty(), "{wire} has no operator sentence");

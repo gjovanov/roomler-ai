@@ -119,6 +119,8 @@ Two changes stop both:
 | `DISPLAY` is Xwayland | yes | `backend_error` | that arm's own error (`drm_capture is on, but DRM capture could not open: …`) |
 | no display variables; the seat shows Wayland | no | `wayland_not_enabled` | what was found (logind, or `WAYLAND_DISPLAY`), then X11's own words: on their own, "connection refused" reads like a network fault |
 | no display variables; the seat shows Wayland | yes | `backend_error` | that arm's own error |
+| no display variables; the seat shows **X11** (FR-113 P2, `x11_auto_system` on) | no | `x11_not_enabled` | what was found (*logind shows an X11 session on this seat, and this daemon has no display of its own*), then X11's own words |
+| no display variables; the seat shows X11; `x11_auto_system = false` | — | `no_display` | scrap's own error: 0.4.143's verdict, which the kill switch gives back |
 | no display variables; no graphical session | — | `no_display` | scrap's own error |
 | a `DISPLAY` that is not Xwayland, which scrap could not open | — | `backend_error` | scrap's own error |
 
@@ -344,7 +346,7 @@ switches DRM and `uinput` on by itself only when all of these hold:
   `uinput` set either way also keeps the automatic input off: `true` is the
   configured path, `false` keeps an automatic capture view-only.
 - **The seat shows a person's Wayland session** (logind class `user`), locked
-  or not. Never the greeter.
+  or not. Never the greeter. From FR-113 an X11 session counts too (§1.2.2).
 - **That person can be told.** This is checked live at every open
   (`indicator::notify::can_tell`): the desktop companion runs for them, or
   their session's notification server shows buttons. That is FR-93 P6g's
@@ -380,7 +382,8 @@ The automatic `uinput` is the injector whenever an automatic capture is
 while one **views** a person's unlocked session (`seat_guard::viewing`),
 dropping every event otherwise. The input arbiter swaps it in when such a
 capture starts, and swaps it out only once no such capture is left and the
-seat no longer shows a Wayland desktop. It never does so for a lock: what
+seat no longer shows a Wayland desktop (or, FR-113, an X11 one while
+`x11_auto_system` is on: `capture::automatic_seat_kind`). It never does so for a lock: what
 would replace it is enigo, whose XTest reaches Xwayland windows behind the lock
 screen. **Measured** (the lab's KDE system guest, 2026-10-15): with the input
 chosen on "views" alone, a viewer's first move during a lock opened enigo.
@@ -401,6 +404,63 @@ for.
 (default on) gives back the system half before FR-95. `wayland_auto = false`
 turns it off too. `ROOMLERD_VIEWING_NOTICE=0` leaves no way to tell the person,
 so a system install then switches nothing on, and its hint says why.
+
+#### 1.2.2 The same for an X11 seat (FR-113 P1)
+
+A systemd unit carries none of an X11 session's variables (`DISPLAY`,
+`XAUTHORITY`, §1), so before FR-113 a system install on an X11 desktop showed
+nothing: the plan above engaged only for a Wayland session, the X11 arm could
+not open the display, and the viewer read *headless* (`no_display`, #2450).
+From FR-113 the same plan covers a person's **X11** session on screen, on the
+same terms, under its own switch:
+
+```mermaid
+flowchart TD
+    O([open_default, a root daemon]) --> K{"wayland_aware and wayland_auto on,<br/>no capture key, no virtual desktop?"}
+    K -- no --> C["the cascade of §1"]
+    K -- yes --> P{"logind: the seat's session is a<br/>person's (class user)?"}
+    P -- "no: the greeter, a tty, nobody" --> C
+    P -- "yes, Wayland" --> W{"wayland_auto_system on?"}
+    P -- "yes, X11" --> X{"x11_auto_system on?"}
+    W -- no --> C
+    X -- "no: 0.4.143 exactly" --> C
+    W -- yes --> T{"can that person be told?"}
+    X -- yes --> L{"does the desktop report its lock?<br/>GNOME Shell or KDE's ksmserver<br/>runs for the person (D4)"}
+    L -- no --> U["the cascade of §1: x11_not_enabled,<br/>the hint names the unreported lock"]
+    L -- yes --> T
+    T -- no --> N["the cascade of §1: wayland_not_enabled<br/>or x11_not_enabled, the hint names<br/>the missing surface"]
+    T -- yes --> D["DRM + uinput, AUTOMATIC, BOUND to that<br/>session, behind the seat guard (§1.2.1)"]
+```
+
+| | Wayland seat (FR-95) | X11 seat (FR-113) |
+|---|---|---|
+| the plan | `system_plan`, `wayland_auto_system` | the same function, `x11_auto_system` (`AutoKinds`) |
+| who counts | `person_on_screen`: logind class `user`, `Type=wayland` | the same, `Type=x11` |
+| capture | DRM: the scanout, below the compositor | DRM: the scanout, below the X server. Neither `DISPLAY` nor an Xauthority is needed, which a root daemon has neither of |
+| input | `uinput`, below the compositor | `uinput`: Xorg picks the device up through libinput, as a compositor does |
+| the seat guard | logind: the session id, its class, `LockedHint` | unchanged: it reads only logind, so the plan switches on only for a desktop that sets `LockedHint`: GNOME Shell or KDE's `ksmserver` running for the person (`lock_reporting_shell`, D4) |
+| an idle desktop | the compositor flips: buffer + 32 rows (§3.2) | the X server draws in place: rows alone, one every 8 (§3.2) |
+| nothing captured | `wayland_not_enabled` | `x11_not_enabled` (FR-113 P2) |
+
+⚠️ **The guard knows a lock only by `LockedHint`, so an X11 desktop must
+report it (D4).** GNOME Shell sets it on Xorg as on Wayland, and KDE's
+`ksmserver` drives kscreenlocker, which sets it. Most other X11 lockers do
+not: xscreensaver, i3lock, slock, and xfce4-screensaver (measured on
+Ubuntu 24.04's 4.18.3: `LockedHint` stayed `no` through
+`loginctl lock-session`). With one of
+those, the guard would read the lock screen, and the automatic `uinput`
+would type into its password field. So the X11 half switches on only where
+`gnome-shell` or `ksmserver` runs as the person (`lock_reporting_shell`,
+read from `/proc`, because logind's `Desktop` is empty for GDM's
+auto-login session). Any other X11 desktop is refused before the surface
+is probed, with `x11_not_enabled` and a hint that offers the explicit keys,
+which read the lock screen by the operator's own choice. An unreadable
+`/proc` counts as "no".
+
+**Kill switch**: `x11_auto_system` / `ROOMLERD_X11_AUTO_SYSTEM=0` (default on)
+gives back 0.4.143 exactly: no plan for an X11 seat, its DRM read every frame,
+and `no_display`. `wayland_auto = false` turns it off too. The two system
+halves are independent: either switch leaves the other kind's seats alone.
 
 ### 1.3 What a device reports, and the fleet's count (FR-93 P2b)
 
@@ -660,7 +720,7 @@ flowchart TD
     T["a tick, one frame period"] --> P{"a framebuffer on<br/>the primary plane?"}
     P -- no --> N["nothing scanned out:<br/>the gate forgets; the pump hears 'no frame'"]
     P -- yes --> E["GETFB2, then the PRIME export:<br/>the framebuffer id and the dma-buf's inode"]
-    E --> S["hash 32 rows spread down the picture"]
+    E --> S["hash rows spread down the picture:<br/>32 on a Wayland seat, one every 8 on an X11 one"]
     S --> G{"the same framebuffer, buffer and rows<br/>as the last frame delivered,<br/>and that frame under 1 s old?"}
     G -- no --> F["convert and deliver the frame;<br/>the gate remembers what it showed"]
     G -- yes --> U["skip it: frames_unchanged + 1"]
@@ -675,16 +735,18 @@ flowchart TD
 | the rows | a hash of 32 rows, the centres of 32 equal bands, visible pixels only | a compositor that flips twice between two reads (A → B → A) shows the same buffer again with new pixels. A change that crosses a sampled row is seen (a single changed word always changes the hash); one that crosses none waits for the bound below |
 | the bound | no skip outlives 1 s since the last frame delivered | a change that crosses no sampled row is at most 1 s late: FR-29's bound for X11 |
 | the wait | `next_frame` keeps asking at the frame rate and says "no frame" after 250 ms of skips, as the portal arm waits on its stream (`FRAME_WAIT`) | the pump answers each "no frame" with a keepalive re-encode of its last frame, every 60 ms at most on the data-channel pumps. A "no frame" every frame period would spend on keepalives what the skip saves. A change inside the wait is still delivered within a frame period |
-| Wayland only | the gate is on only when the seat shows a Wayland session (`desktop_brief::seen_is_wayland`) | an X server and the kernel console draw into the buffer on screen **in place**, so the buffer never changes and only the sampled rows would see a change: a typed character could wait 1 s. There every frame is read, as before |
+| the seat | `drm_idle::IdleSkip`, chosen by `capture::automatic_seat_kind`: `Flips` on a Wayland seat, `InPlace` on an X11 one (FR-113 P1, while `x11_auto_system` is on), `Off` on the console | an X server and the kernel console draw into the buffer on screen **in place**, so the buffer never changes and only the rows can see a change. 32 rows would leave a typed character up to 1 s late, so an X11 seat samples one row every 8 (`IN_PLACE_ROW_GAP`): any change at least 8 rows tall crosses one wherever it lands, the text caret's included, and is delivered on the next tick. That costs an eighth of the rows a tick, against the whole picture a delivered frame reads, converts and encodes. The console reads every frame, as before |
 
 ⚠️ **The cursor plane is read on every tick, skipped or not.** A pointer that
 moves over a still desktop changes the cursor plane, not the primary, so the
 cursor channel (§3.1) keeps following it while every frame is skipped.
 
-**Kill switch**: `ROOMLERD_DRM_IDLE_SKIP=0` reads every frame again. The
-worker's log names which it does: `drm capture: a frame nothing changed in is
-skipped …`, or `… every frame is read (not a Wayland seat, or
-ROOMLERD_DRM_IDLE_SKIP=0)`.
+**Kill switch**: `ROOMLERD_DRM_IDLE_SKIP=0` reads every frame again, on both
+kinds of seat; `x11_auto_system = false` does so on an X11 seat. The worker's
+log names which it does: `drm capture: a frame nothing changed in is skipped
+…`, `… is skipped by dense rows, an X server draws in place (FR-113 P1 …)`, or
+`… every frame is read (no Wayland seat and no X11 one with x11_auto_system on,
+or ROOMLERD_DRM_IDLE_SKIP=0)`.
 
 **Measured** on the lab's GNOME 50 system guest (Ubuntu 26.04, virtio-gpu,
 1280×800, `drm_capture` + `uinput`), 2026-10-13. One viewer session on the
@@ -715,6 +777,20 @@ KWin flips the same way. On the KDE system guest (Plasma 6.7.5, virtio-gpu,
 44.5 % with `ROOMLERD_DRM_IDLE_SKIP=0`. The probe's counter was as fresh
 (111 of 111 decoded, 0.39–0.67 s old), the cursor overlay sat at both
 targets, and AC4's oracle passed all 8 checks.
+
+**An X11 seat (FR-113 P1)**, measured the same way, 2026-10-18: a vmtest Ubuntu
+24.04 cell (GNOME 46 on Xorg, virtio-gpu, 1280×800), a system install on its
+defaults, the plan switched on by itself (`idle_skip=InPlace`), one viewer on
+the default path, an idle desktop:
+
+| | `InPlace` (P1) | `ROOMLERD_DRM_IDLE_SKIP=0` (every frame, as before P1) |
+|---|---|---|
+| CPU, idle, two 60 s windows | **5.5 %, 5.5 %** | 46.3 %, 46.5 % |
+| a picture in the viewer's samples | 274 of 274 | 271 of 271 |
+| the worker's log | `skipped by dense rows, an X server draws in place` | `every frame is read` |
+
+Inside 2 × 3.4 % = 6.8 % (FR-113 AC6), and the X11 seat's input and lock rows
+of the same run are in FR-113's field log.
 
 ### 3.3 A display switched off (FR-93 P3e)
 
@@ -1869,7 +1945,7 @@ the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/co
 |---|---|---|---|
 | `drm_capture` | `ROOMLERD_DRM_CAPTURE` | off | the DRM/KMS arm (§3). Unattended; sees the greeter and a locked screen; no damage information |
 | — | `ROOMLERD_DRM_CURSOR` | **on** | FR-93 P3c (§3.1): the DRM arm reads the cursor plane for the cursor channel. Off = the viewer's own badge for the pointer, as before P3c |
-| — | `ROOMLERD_DRM_IDLE_SKIP` | **on** | FR-93 P3d (§3.2): on a Wayland seat the DRM arm skips a frame nothing changed in. Off = every frame read, converted and encoded, as before P3d |
+| — | `ROOMLERD_DRM_IDLE_SKIP` | **on** | FR-93 P3d (§3.2): on a Wayland seat the DRM arm skips a frame nothing changed in, and from FR-113 P1 on an X11 seat too, by dense rows. Off = every frame read, converted and encoded, as before P3d |
 | — | `ROOMLERD_DRM_WAKE_WAIT` | **on** | FR-93 P3e (§3.3): a display switched off is told to the controller (`display_wake`) and waited out, by a running session and by an open. Off = the last frame kept alive with no reason, and an open during the blank falls through the cascade, as before P3e |
 | — | `ROOMLERD_DRM_FOLLOW_CAP` | **on** | FR-107 P1 (§3.4): the DRM arm reads at half size whenever half the scanout still covers the pump's encode box. Off = the policy alone decides, as before P1 |
 | — | `ROOMLERD_DRM_THREADS` | **4** | FR-107 P2 (§3.4): the threads the DRM repack splits a frame across, at most the host's cores. `1` = the single pass, as before P2 |
@@ -1886,6 +1962,7 @@ the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/co
 | `wayland_aware` | `ROOMLERD_WAYLAND_AWARE` | **on** | FR-93 P1 (§1.1): a Wayland desktop that no arm may capture reports `wayland_not_enabled`, never black and never "headless". Switches no capture on. Off = the behaviour before FR-93, unchanged: no Xwayland probe, and no session told its input reach (P1a) |
 | `wayland_auto` | `ROOMLERD_WAYLAND_AUTO` | **on** | FR-93 P2 (§1.2): a **per-user** daemon in its own Wayland session, with no capture key set, switches capture on by itself: mutter on GNOME (it asks nobody), else the desktop portal (it asks the person at the screen once, P2d-3). A root daemon has its own half, `wayland_auto_system`. Off = the behaviour before P2, for both halves |
 | `wayland_auto_system` | `ROOMLERD_WAYLAND_AUTO_SYSTEM` | **on** | FR-95 P2 (§1.2.1): a **system** daemon, with no capture key set, switches DRM and `uinput` on by itself for the person's Wayland session on screen, where that person can be told they are viewed (the companion, or their notifications). It reads the screen only while that session is on screen, unlocked: never the greeter, never the lock screen. Off = the behaviour before FR-95 |
+| `x11_auto_system` | `ROOMLERD_X11_AUTO_SYSTEM` | **on** | FR-113 P1 (§1.2.2): the same for the person's **X11** session on screen, on the same terms, with the X11 idle skip (§3.2); where it cannot capture, `x11_not_enabled` names why (P2). Independent of `wayland_auto_system`; `wayland_auto = false` turns it off too. Off = 0.4.143 exactly: no picture of an X11 seat by default, and `no_display` |
 | — | `ROOMLERD_VIRTUAL_DESKTOP` (+ `_RESOLUTION`, `_WM`, `_STARTUP`) | off | the daemon's own Xvfb (§2). Turn it **off** when testing the portal arms on a host that has it, or the X11 fallback quietly serves the session in the portal's place |
 | `virtual_desktop_apps` | — | — | the FR-56 launch allowlist — for a virtual desktop **or** a logged-in X11/Xwayland session; [`remote-apps.md`](remote-apps.md) §7 |
 

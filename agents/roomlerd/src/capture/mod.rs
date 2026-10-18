@@ -526,6 +526,11 @@ pub enum CaptureUnavailableCode {
     /// daemon streamed Xwayland's empty root: a live black picture with no
     /// reason at all (the FR-93 lab, 0.4.125).
     WaylandNotEnabled,
+    /// FR-113 P2 — an X11 desktop is on the seat, and this daemon could not
+    /// show it: a system install's automatic capture is switched off, or a
+    /// capture key set, or nobody at the screen could be told. Before this
+    /// code a root daemon called such a host "headless" (`no_display`, #2450).
+    X11NotEnabled,
 }
 
 impl CaptureUnavailableCode {
@@ -538,6 +543,7 @@ impl CaptureUnavailableCode {
             Self::NotBuilt => "not_built",
             Self::BackendError => "backend_error",
             Self::WaylandNotEnabled => "wayland_not_enabled",
+            Self::X11NotEnabled => "x11_not_enabled",
         }
     }
 
@@ -575,7 +581,59 @@ impl CaptureUnavailableCode {
                  the agent log has the full line."
             }
             Self::WaylandNotEnabled => wayland_hint(running_as_root()),
+            Self::X11NotEnabled => x11_hint(running_as_root()),
         }
+    }
+}
+
+/// FR-113 P2 — the `x11_not_enabled` sentence, by install type. A root daemon
+/// reads it when its automatic capture did not switch on for the X11 session
+/// on screen: nobody there could be told (the same AC3 as Wayland's), or the
+/// operator switched it off (`x11_auto_system = false` is NOT among them: that
+/// switch gives back 0.4.143's `no_display`, by design). A per-user daemon
+/// reads it only when it was started without the session's display.
+///
+/// ⚠️ A hint goes on the wire as a JSON literal, unescaped
+/// (`capture_unavailable_payload`): no double quote, no backslash.
+fn x11_hint(root: bool) -> &'static str {
+    x11_hint_with(
+        root,
+        NO_SURFACE.load(std::sync::atomic::Ordering::Relaxed),
+        NO_LOCK_REPORT.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// [`x11_hint`], with the last system plan's refusals passed in: "no
+/// surface", and (FR-113 D4) "the desktop does not report its lock".
+fn x11_hint_with(root: bool, no_surface: bool, no_lock_report: bool) -> &'static str {
+    if root && no_lock_report {
+        "This computer is showing an X11 desktop whose screen locker does not report a lock to \
+         the system (GNOME and KDE do; this desktop does not), so a system install does not \
+         capture it by itself: it could not tell the lock screen from the desktop. On the host \
+         an administrator can run sudo roomler config set drm_capture true and sudo roomler \
+         config set uinput true, then sudo roomler restart. That capture reads the screen below \
+         the desktop, the lock screen included. Remote shell and file transfer still work."
+    } else if root && no_surface {
+        "This computer is showing an X11 desktop, and it is not captured by itself because \
+         nobody at the screen could be told they are being viewed: the session on screen has no \
+         desktop companion and no notification service. Install the desktop companion (the \
+         install script does), or on the host an administrator can run sudo roomler config set \
+         drm_capture true and sudo roomler config set uinput true, then sudo roomler restart. \
+         That capture reads the screen below the desktop, the lock screen included. Remote \
+         shell and file transfer still work."
+    } else if root {
+        "This computer is showing an X11 desktop that this system install does not capture by \
+         itself right now: nobody is signed in at the screen (the login screen is never captured \
+         by default), or automatic capture is switched off (wayland_auto), or a capture key is \
+         set. On the host an administrator can run sudo roomler config ls, clear wayland_auto \
+         and any capture key it shows as set (drm_capture, portal_capture, mutter_capture, \
+         window_capture) with sudo roomler config clear, then sudo roomler restart. Remote shell \
+         and file transfer still work."
+    } else {
+        "This computer is showing an X11 desktop, and this agent was started without access to \
+         it (no DISPLAY). Restart it from inside the desktop session, with roomler restart in a \
+         terminal there, or install the system service. Remote shell and file transfer still \
+         work."
     }
 }
 
@@ -664,10 +722,35 @@ fn wayland_auto_system() -> bool {
     tunnel_core::env::flag("WAYLAND_AUTO_SYSTEM", true)
 }
 
+/// FR-113 P1 kill switch (`ROOMLERD_X11_AUTO_SYSTEM` / `x11_auto_system`),
+/// default ON: FR-95's system half for a person's **X11** session on screen.
+/// Independent of `wayland_auto_system`, so either half can be turned off
+/// without the other; `wayland_auto = false` and `wayland_aware = false` turn
+/// this half off too (one switch for "nothing automatic", as FR-95 made them).
+/// `false` gives back 0.4.143 exactly: no plan for an X11 seat, a DRM read of
+/// one that skips no frame, and `no_display` where nothing captured.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn x11_auto_system() -> bool {
+    tunnel_core::env::flag("X11_AUTO_SYSTEM", true)
+}
+
+/// FR-113 — the kind of graphical session logind shows on the seat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum SeatKind {
+    Wayland,
+    X11,
+}
+
 /// FR-95 P2 (AC3) — the last system plan found a person's Wayland session on
 /// screen and nobody to tell them: the hint names that, not only the keys.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 static NO_SURFACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// FR-113 D4 — the last system plan found a person's X11 desktop that does not
+/// report its lock to logind: the hint names that, not only the keys.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+static NO_LOCK_REPORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// FR-93 P2 — the keys that choose Linux capture by hand. With any one of them
 /// set, to anything, the operator owns the cascade and it runs exactly as it
@@ -775,23 +858,52 @@ enum SystemPlan {
     /// As configured, because nobody at the screen could be told they are
     /// being viewed: the hint says so (AC3).
     NoSurface,
+    /// FR-113 D4 — as configured, because the person's X11 desktop does not
+    /// report its lock to logind (`LockedHint`), so the seat guard could not
+    /// tell its lock screen from the desktop: the hint says so.
+    LockUnreported,
     /// DRM and uinput as if their keys were set, bound to this logind
     /// session: the screen is read only while it is on screen, unlocked
     /// (`seat_guard`).
     Auto { session: String },
 }
 
+/// FR-113 P1 — the kinds of session on screen [`system_plan`] may switch on
+/// for: one switch each, so either half can be turned off alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        feature = "drm-capture",
+        feature = "portal-capture"
+    )),
+    allow(dead_code)
+)]
+struct AutoKinds {
+    /// `wayland_auto_system` (FR-95).
+    wayland: bool,
+    /// `x11_auto_system` (FR-113).
+    x11: bool,
+}
+
 /// FR-95 P2 as a pure function. Cheap checks first: `person` reads logind and
 /// `surface` may start a helper in the person's session, so each is asked
 /// only when everything before it allows.
 ///
-/// - `person`: the seat's session, when it is a person's Wayland session
-///   (logind class `user`), locked or not. The greeter is not one: this FR
-///   never captures it by default (D-c).
+/// - `person`: the seat's session, when it is a person's graphical session
+///   (logind class `user`), locked or not: Wayland (FR-95), or X11 (FR-113).
+///   The greeter is not one: this FR never captures it by default (D-c).
+/// - `kinds`: which of the two may switch on. A person whose kind is switched
+///   off is planned as configured, as if nobody were on screen.
+/// - FR-113 D4: an X11 person whose desktop does not report its lock to logind
+///   (`Person::lock_reported`) is refused (`LockUnreported`), before the
+///   surface is probed. The seat guard knows a lock only by `LockedHint`, and
+///   most X11 lockers outside GNOME and KDE never set it: their lock screen
+///   would be read, and its password field typed into.
 /// - `surface`: whether that person can be told they are being viewed and end
 ///   it (FR-93 P6g's notice: the companion's banner, else a notification with
 ///   Disconnect), checked live (D-b).
-/// - `wayland_auto = false` turns this half off too: one switch for "nothing
+/// - `wayland_auto = false` turns both halves off: one switch for "nothing
 ///   automatic", as before FR-95.
 #[cfg_attr(
     not(all(
@@ -804,18 +916,25 @@ enum SystemPlan {
 fn system_plan(
     aware: bool,
     auto: bool,
-    auto_system: bool,
+    kinds: AutoKinds,
     keys_set: bool,
     virtual_desktop: bool,
     person: impl FnOnce() -> Option<Person>,
     surface: impl FnOnce(&Person) -> bool,
 ) -> SystemPlan {
-    if !aware || !auto || !auto_system || keys_set || virtual_desktop {
+    if !aware || !auto || !(kinds.wayland || kinds.x11) || keys_set || virtual_desktop {
         return SystemPlan::AsConfigured;
     }
     let Some(person) = person() else {
         return SystemPlan::AsConfigured;
     };
+    let switched_on = if person.x11 { kinds.x11 } else { kinds.wayland };
+    if !switched_on {
+        return SystemPlan::AsConfigured;
+    }
+    if person.x11 && !person.lock_reported {
+        return SystemPlan::LockUnreported;
+    }
     if surface(&person) {
         SystemPlan::Auto {
             session: person.session,
@@ -825,7 +944,7 @@ fn system_plan(
     }
 }
 
-/// FR-95 P2 — a person's Wayland session on the seat.
+/// FR-95 P2 — a person's graphical session on the seat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
     not(all(
@@ -839,6 +958,13 @@ struct Person {
     /// logind's session id.
     session: String,
     uid: u32,
+    /// FR-113 — an X11 session (logind `Type=x11`), not a Wayland one.
+    x11: bool,
+    /// FR-113 D4 — the session's desktop reports its lock to logind
+    /// (`LockedHint`), so the seat guard can see it. Always true on Wayland,
+    /// as FR-95 shipped; on X11, a lock-reporting shell runs for the person
+    /// ([`lock_reporting_shell`]).
+    lock_reported: bool,
 }
 
 /// FR-95 P2 — [`system_plan`] now, for a root daemon. Records whether the
@@ -852,7 +978,10 @@ fn system_plan_now() -> SystemPlan {
     let plan = system_plan(
         wayland_aware(),
         wayland_auto(),
-        wayland_auto_system(),
+        AutoKinds {
+            wayland: wayland_auto_system(),
+            x11: x11_auto_system(),
+        },
         capture_keys_set(),
         crate::virtual_desktop::requested(),
         person_on_screen,
@@ -862,11 +991,24 @@ fn system_plan_now() -> SystemPlan {
         plan == SystemPlan::NoSurface,
         std::sync::atomic::Ordering::Relaxed,
     );
+    NO_LOCK_REPORT.store(
+        plan == SystemPlan::LockUnreported,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     plan
 }
 
-/// FR-95 P2 — the seat's session, when it is a person's Wayland session,
-/// locked or not. Never the greeter.
+/// FR-95 P2 — the seat's session, when it is a person's graphical session,
+/// locked or not: Wayland, or (FR-113) X11. Never the greeter. Which of the
+/// two may switch on is [`system_plan`]'s to decide.
+///
+/// FR-113 — an X11 seat is planned like a Wayland one: DRM reads the scanout
+/// below any display server, so it needs neither the session's `DISPLAY` nor
+/// its Xauthority (which a systemd unit has neither of, `linux-capture.md`
+/// §1), and uinput reaches Xorg through libinput as it reaches a compositor.
+/// The seat guard reads only logind (the session id, its class, its
+/// `LockedHint`), so on X11 it holds only where the desktop sets `LockedHint`:
+/// D4, `Person::lock_reported`.
 #[cfg(all(
     target_os = "linux",
     feature = "drm-capture",
@@ -875,11 +1017,86 @@ fn system_plan_now() -> SystemPlan {
 fn person_on_screen() -> Option<Person> {
     let id = seat_guard::on_screen()?.id;
     crate::keep_busy::logind::show(&id)
-        .filter(|s| s.is_user() && s.kind == "wayland")
-        .map(|s| Person {
-            session: s.id,
-            uid: s.uid,
+        .filter(|s| s.is_user() && (s.kind == "wayland" || s.kind == "x11"))
+        .map(|s| {
+            let x11 = s.kind == "x11";
+            Person {
+                lock_reported: !x11 || lock_reporting_shell(s.uid),
+                x11,
+                session: s.id,
+                uid: s.uid,
+            }
         })
+}
+
+/// FR-113 D4 — the shells whose screen lockers set logind's `LockedHint`:
+/// GNOME Shell (its screen shield, on Xorg as on Wayland) and KDE's session
+/// manager (`ksmserver`, which drives kscreenlocker). logind cannot name the
+/// desktop (its `Desktop` is empty for GDM's auto-login session, measured on
+/// Ubuntu 24.04), so the person's own processes are asked. Anything else on
+/// X11 (xscreensaver, i3lock, slock, light-locker inside a session, older
+/// xfce4-screensaver) is not trusted to report a lock.
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        feature = "drm-capture",
+        feature = "portal-capture"
+    )),
+    allow(dead_code)
+)]
+const LOCK_REPORTING_SHELLS: [&str; 2] = ["gnome-shell", "ksmserver"];
+
+/// FR-113 D4 — whether a [`LOCK_REPORTING_SHELLS`] process runs as `uid`:
+/// `/proc`'s `comm` and the real uid on its `Uid:` line. Unreadable means
+/// "no": a desktop that cannot be vouched for is refused, never streamed.
+#[cfg(all(
+    target_os = "linux",
+    feature = "drm-capture",
+    feature = "portal-capture"
+))]
+fn lock_reporting_shell(uid: u32) -> bool {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    dir.flatten().any(|entry| {
+        let path = entry.path();
+        let comm = std::fs::read_to_string(path.join("comm")).unwrap_or_default();
+        LOCK_REPORTING_SHELLS.contains(&comm.trim())
+            && std::fs::read_to_string(path.join("status"))
+                .ok()
+                .is_some_and(|status| status_uid(&status) == Some(uid))
+    })
+}
+
+/// The real uid on a `/proc/<pid>/status` text's `Uid:` line.
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        feature = "drm-capture",
+        feature = "portal-capture"
+    )),
+    allow(dead_code)
+)]
+fn status_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|uid| uid.parse().ok())
+}
+
+/// FR-113 P1 — whether a seat the desktop brief shows gets the automatic
+/// system capture's idle skip and its input: a Wayland one (FR-95), or an X11
+/// one while `x11_auto_system` is on.
+#[cfg(all(target_os = "linux", feature = "drm-capture"))]
+pub(crate) fn automatic_seat_kind() -> Option<SeatKind> {
+    if crate::desktop_brief::seen_is_wayland() {
+        Some(SeatKind::Wayland)
+    } else if x11_auto_system() && crate::desktop_brief::seen_is_x11() {
+        Some(SeatKind::X11)
+    } else {
+        None
+    }
 }
 
 /// This daemon's user's Wayland session, from logind. A user can have several
@@ -1794,18 +2011,24 @@ fn auto_portal_unusable(status: &portal::PortalStatus) -> Option<String> {
 ///
 /// - `display` / `wayland_display`: the DAEMON's own variables. A root systemd
 ///   daemon never has them, which is why they cannot answer "is there a
-///   desktop" on their own — the seat is asked (`seat_is_wayland`, lazily: it
-///   runs loginctl).
+///   desktop" on their own — the seat is asked (`seat`, lazily: it runs
+///   loginctl).
 /// - `arm_failed`: an operator switched a Wayland arm on (DRM or the portal)
 ///   and it could not open. Then the true answer is that arm's own error, not
 ///   "switched off".
+///
+/// FR-113 P2 — `seat` answers which kind of graphical session logind shows,
+/// `None` for none (also asked lazily). An X11 one reads `x11_not_enabled`
+/// while `x11_aware` (`x11_auto_system`) is on; off, it reads `no_display`, as
+/// on 0.4.143.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn linux_no_pixels_code(
     display: bool,
     wayland_display: bool,
     aware: bool,
+    x11_aware: bool,
     arm_failed: bool,
-    seat_is_wayland: impl FnOnce() -> bool,
+    seat: impl FnOnce() -> Option<SeatKind>,
 ) -> CaptureUnavailableCode {
     use CaptureUnavailableCode::*;
     if !aware {
@@ -1821,11 +2044,25 @@ fn linux_no_pixels_code(
         // open: a real error, in its own words.
         return BackendError;
     }
-    if wayland_display || seat_is_wayland() {
-        WaylandNotEnabled
-    } else {
-        NoDisplay
+    if wayland_display {
+        return WaylandNotEnabled;
     }
+    match seat() {
+        Some(SeatKind::Wayland) => WaylandNotEnabled,
+        Some(SeatKind::X11) if x11_aware => X11NotEnabled,
+        Some(SeatKind::X11) | None => NoDisplay,
+    }
+}
+
+/// FR-113 P2 — the `detail` of an `x11_not_enabled`: what the agent FOUND,
+/// ahead of X11's own words, which on their own ("no primary display:
+/// connection refused") read like a network fault (#2450).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn x11_not_enabled_detail(x11_error: &str) -> String {
+    format!(
+        "logind shows an X11 session on this seat, and this daemon has no display of its own; \
+         X11 capture said: {x11_error}"
+    )
 }
 
 /// FR-93 — the `detail` of a `wayland_not_enabled` the classifier reached:
@@ -1864,13 +2101,18 @@ fn xwayland_verdict(
     })
 }
 
-/// Is a graphical session on this host Wayland? logind knows; the daemon's
-/// environment does not (a root unit has none of the session's variables).
+/// Which kind of graphical session is on this host's seat, if any? logind
+/// knows; the daemon's environment does not (a root unit has none of the
+/// session's variables). `graphical_session` returns only `Type=x11` or
+/// `Type=wayland` sessions, and names the Wayland ones.
 #[cfg(target_os = "linux")]
-fn seat_shows_wayland() -> bool {
+fn seat_kind() -> Option<SeatKind> {
     crate::companion::graphical_session()
-        .map(|s| s.wayland_display.is_some())
-        .unwrap_or(false)
+        .ok()
+        .map(|s| match s.wayland_display {
+            Some(_) => SeatKind::Wayland,
+            None => SeatKind::X11,
+        })
 }
 
 /// Is the X server on `display` Xwayland? Asked of the server itself rather
@@ -2116,14 +2358,16 @@ pub(crate) fn classify_capture_failure(
             std::env::var_os("DISPLAY").is_some(),
             wayland_display,
             aware,
+            x11_auto_system(),
             wayland_arm_error.is_some(),
-            seat_shows_wayland,
+            seat_kind,
         );
         let detail = match (code, wayland_arm_error) {
             (CaptureUnavailableCode::BackendError, Some(err)) if aware => err.to_string(),
             (CaptureUnavailableCode::WaylandNotEnabled, _) => {
                 wayland_not_enabled_detail(wayland_display, &detail)
             }
+            (CaptureUnavailableCode::X11NotEnabled, _) => x11_not_enabled_detail(&detail),
             _ => detail,
         };
         (code, detail)
@@ -2655,7 +2899,8 @@ fn open_with(
     }
 
     // FR-95 P2 (D1's system half) — a root daemon with no capture key set, a
-    // person's Wayland session on screen, and a way to tell that person (the
+    // person's Wayland session on screen (or, FR-113, an X11 one with
+    // `x11_auto_system` on), and a way to tell that person (the
     // companion's banner, else a notification with Disconnect): DRM as if its
     // key were set, BOUND to that session, so it reads the scanout only while
     // the session is on screen, unlocked (`seat_guard`). Never the greeter,
@@ -2668,7 +2913,7 @@ fn open_with(
     let auto_system = if running_as_root() {
         match system_plan_now() {
             SystemPlan::Auto { session } => Some(session),
-            SystemPlan::AsConfigured | SystemPlan::NoSurface => None,
+            SystemPlan::AsConfigured | SystemPlan::NoSurface | SystemPlan::LockUnreported => None,
         }
     } else {
         None
@@ -2683,11 +2928,21 @@ fn open_with(
     #[cfg(all(target_os = "linux", feature = "drm-capture"))]
     {
         if drm_backend::env_enabled() || auto_system.is_some() {
-            // FR-93 P3d — skip an unchanged frame on a Wayland seat only: an X
-            // server or the console draws into the buffer on screen in place,
-            // where no buffer check sees a change.
-            let idle_skip =
-                drm_backend::idle_skip_enabled() && crate::desktop_brief::seen_is_wayland();
+            // FR-93 P3d / FR-113 P1 — how an unchanged frame is skipped. A
+            // Wayland compositor flips buffers, so the buffer and a few rows
+            // tell; an X server draws into the buffer on screen in place, so
+            // only rows can, and dense ones (`drm_idle::IdleSkip::InPlace`).
+            // The console, the kill switch, or an X11 seat with
+            // `x11_auto_system = false`: every frame is read.
+            let idle_skip = if drm_backend::idle_skip_enabled() {
+                match automatic_seat_kind() {
+                    Some(SeatKind::Wayland) => drm_idle::IdleSkip::Flips,
+                    Some(SeatKind::X11) => drm_idle::IdleSkip::InPlace,
+                    None => drm_idle::IdleSkip::Off,
+                }
+            } else {
+                drm_idle::IdleSkip::Off
+            };
             let open = || {
                 drm_backend::DrmCapture::primary(_target_fps, _downscale, idle_skip)
                     .map(|c| match auto_system.clone() {
@@ -2728,7 +2983,7 @@ fn open_with(
                     tracing::info!(
                         width = c.width(),
                         height = c.height(),
-                        idle_skip,
+                        idle_skip = ?idle_skip,
                         "capture: backend=drm (ROOMLERD_DRM_CAPTURE=1, scanout below the compositor)"
                     );
                     return Box::new(c);
@@ -2737,10 +2992,10 @@ fn open_with(
                     tracing::info!(
                         width = c.width(),
                         height = c.height(),
-                        idle_skip,
+                        idle_skip = ?idle_skip,
                         session,
                         "capture: backend=drm, switched on by itself for the person's session on \
-                         screen, read only while it is on screen, unlocked (FR-95 P2)"
+                         screen, read only while it is on screen, unlocked (FR-95 P2, FR-113 P1)"
                     );
                     return Box::new(c);
                 }
@@ -3166,14 +3421,19 @@ mod frame_tests {
 #[cfg(test)]
 mod wayland_reason_tests {
     use super::CaptureUnavailableCode::{self, *};
-    use super::{linux_no_pixels_code, wayland_hint, wayland_not_enabled_detail, xwayland_verdict};
+    use super::{
+        SeatKind, linux_no_pixels_code, wayland_hint, wayland_not_enabled_detail, x11_hint,
+        x11_hint_with, x11_not_enabled_detail, xwayland_verdict,
+    };
 
-    fn seat(answer: bool) -> impl FnOnce() -> bool {
+    fn seat(answer: Option<SeatKind>) -> impl FnOnce() -> Option<SeatKind> {
         move || answer
     }
 
-    fn seat_unasked() -> impl FnOnce() -> bool {
-        || -> bool { panic!("logind was asked, and this answer does not depend on the seat") }
+    fn seat_unasked() -> impl FnOnce() -> Option<SeatKind> {
+        || -> Option<SeatKind> {
+            panic!("logind was asked, and this answer does not depend on the seat")
+        }
     }
 
     /// The root-daemon bug (FR-93 AC2): a systemd unit has no display
@@ -3182,20 +3442,63 @@ mod wayland_reason_tests {
     #[test]
     fn a_root_daemon_asks_the_seat_before_calling_a_host_headless() {
         assert_eq!(
-            linux_no_pixels_code(false, false, true, false, seat(true)),
+            linux_no_pixels_code(
+                false,
+                false,
+                true,
+                true,
+                false,
+                seat(Some(SeatKind::Wayland))
+            ),
             WaylandNotEnabled
         );
         assert_eq!(
-            linux_no_pixels_code(false, false, true, false, seat(false)),
+            linux_no_pixels_code(false, false, true, true, false, seat(None)),
             NoDisplay,
             "a host with no graphical session is still headless"
+        );
+    }
+
+    /// FR-113 P2 (AC5) — the same bug on an X11 seat (#2450): a root daemon
+    /// whose plan did not capture an X11 session says so, never "headless".
+    #[test]
+    fn an_x11_seat_is_named_never_headless() {
+        assert_eq!(
+            linux_no_pixels_code(false, false, true, true, false, seat(Some(SeatKind::X11))),
+            X11NotEnabled
+        );
+        assert_eq!(
+            linux_no_pixels_code(false, false, true, true, true, seat_unasked()),
+            BackendError,
+            "the automatic DRM that failed says why, in its own words"
+        );
+    }
+
+    /// FR-113 AC4 — `x11_auto_system = false` gives back 0.4.143's verdict on
+    /// an X11 seat, `no_display`, and changes nothing on a Wayland one.
+    #[test]
+    fn x11_auto_system_off_gives_back_no_display_on_an_x11_seat() {
+        assert_eq!(
+            linux_no_pixels_code(false, false, true, false, false, seat(Some(SeatKind::X11))),
+            NoDisplay
+        );
+        assert_eq!(
+            linux_no_pixels_code(
+                false,
+                false,
+                true,
+                false,
+                false,
+                seat(Some(SeatKind::Wayland))
+            ),
+            WaylandNotEnabled
         );
     }
 
     #[test]
     fn the_daemons_own_wayland_display_needs_no_seat_lookup() {
         assert_eq!(
-            linux_no_pixels_code(false, true, true, false, seat_unasked()),
+            linux_no_pixels_code(false, true, true, true, false, seat_unasked()),
             WaylandNotEnabled
         );
     }
@@ -3209,7 +3512,7 @@ mod wayland_reason_tests {
             [(false, false), (false, true), (true, false), (true, true)]
         {
             assert_eq!(
-                linux_no_pixels_code(display, wayland_display, true, true, seat_unasked()),
+                linux_no_pixels_code(display, wayland_display, true, true, true, seat_unasked()),
                 BackendError,
                 "DISPLAY={display} WAYLAND_DISPLAY={wayland_display}"
             );
@@ -3221,7 +3524,7 @@ mod wayland_reason_tests {
     #[test]
     fn an_x_display_scrap_could_not_open_stays_a_backend_error() {
         assert_eq!(
-            linux_no_pixels_code(true, false, true, false, seat_unasked()),
+            linux_no_pixels_code(true, false, true, true, false, seat_unasked()),
             BackendError
         );
     }
@@ -3237,7 +3540,8 @@ mod wayland_reason_tests {
                 BackendError
             }
         };
-        for arm_failed in [false, true] {
+        for (arm_failed, x11_aware) in [(false, false), (false, true), (true, false), (true, true)]
+        {
             for (display, wayland_display) in
                 [(false, false), (false, true), (true, false), (true, true)]
             {
@@ -3246,11 +3550,13 @@ mod wayland_reason_tests {
                         display,
                         wayland_display,
                         false,
+                        x11_aware,
                         arm_failed,
                         seat_unasked()
                     ),
                     old(display, wayland_display),
-                    "DISPLAY={display} WAYLAND_DISPLAY={wayland_display} arm_failed={arm_failed}"
+                    "DISPLAY={display} WAYLAND_DISPLAY={wayland_display} arm_failed={arm_failed} \
+                     x11_aware={x11_aware}"
                 );
             }
         }
@@ -3292,6 +3598,54 @@ mod wayland_reason_tests {
         assert!(seat.chars().count() <= 200, "{seat}");
         let own = wayland_not_enabled_detail(true, x11);
         assert!(own.contains("WAYLAND_DISPLAY"), "{own}");
+        // FR-113 P2 — the X11 seat's detail, under the same cap.
+        let x = x11_not_enabled_detail(x11);
+        assert!(x.starts_with("logind shows an X11 session"), "{x}");
+        assert!(x.ends_with(x11), "{x}");
+        assert!(x.chars().count() <= 200, "{x}");
+    }
+
+    /// FR-113 P2 — each install type is told what it can use on an X11 seat:
+    /// root, the surface or the keys; a per-user daemon, the session's own
+    /// display. Never the kill switch, which is the one that gives back
+    /// `no_display`.
+    #[test]
+    fn the_x11_hint_names_what_this_install_can_use() {
+        let no_surface = x11_hint_with(true, true, false);
+        assert!(no_surface.contains("X11 desktop"), "{no_surface}");
+        assert!(no_surface.contains("being viewed"), "{no_surface}");
+        assert!(no_surface.contains("desktop companion"), "{no_surface}");
+        let off = x11_hint_with(true, false, false);
+        assert!(off.contains("sudo roomler config clear"), "{off}");
+        assert!(off.contains("login screen"), "{off}");
+        assert!(!off.contains("x11_auto_system"), "{off}");
+        let user = x11_hint_with(false, false, false);
+        assert!(user.contains("DISPLAY"), "{user}");
+        assert!(!user.contains("sudo"), "{user}");
+        for (no_surface, no_lock_report) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                x11_hint_with(false, no_surface, no_lock_report),
+                user,
+                "the system half's refusals are not a per-user daemon's"
+            );
+        }
+    }
+
+    /// FR-113 D4 — a desktop whose locker does not report a lock is told so,
+    /// and offered only the explicit keys, which read the lock screen by the
+    /// operator's choice.
+    #[test]
+    fn an_unreported_lock_is_named_with_the_keys_that_read_it_anyway() {
+        let hint = x11_hint_with(true, false, true);
+        assert!(hint.contains("does not report a lock"), "{hint}");
+        assert!(hint.contains("GNOME and KDE do"), "{hint}");
+        assert!(hint.contains("drm_capture true"), "{hint}");
+        assert!(hint.contains("the lock screen included"), "{hint}");
+        assert_eq!(
+            x11_hint_with(true, true, true),
+            hint,
+            "it outranks no surface"
+        );
     }
 
     /// The hint is spliced into the `rc:media-unavailable` JSON unescaped
@@ -3299,16 +3653,26 @@ mod wayland_reason_tests {
     /// variant for THIS process's euid — so both variants are checked here.
     #[test]
     fn every_hint_is_a_safe_json_literal() {
-        let codes: [CaptureUnavailableCode; 5] = [
+        let codes: [CaptureUnavailableCode; 6] = [
             Permission,
             NoDisplay,
             NotBuilt,
             BackendError,
             WaylandNotEnabled,
+            X11NotEnabled,
         ];
         let mut hints: Vec<&str> = codes.iter().map(|c| c.hint()).collect();
         hints.push(wayland_hint(true));
         hints.push(wayland_hint(false));
+        hints.push(x11_hint(true));
+        hints.push(x11_hint(false));
+        for root in [true, false] {
+            for no_surface in [true, false] {
+                for no_lock_report in [true, false] {
+                    hints.push(x11_hint_with(root, no_surface, no_lock_report));
+                }
+            }
+        }
         for hint in hints {
             assert!(
                 !hint
@@ -3348,15 +3712,118 @@ mod wayland_reason_tests {
 /// logind, and one with nobody on screen never starts the probe.
 #[cfg(test)]
 mod system_auto_tests {
-    use super::{Person, SystemPlan, system_plan, wayland_hint_with};
+    use super::{AutoKinds, Person, SystemPlan, system_plan, wayland_hint_with};
+
+    /// Both halves on: the default.
+    const BOTH: AutoKinds = AutoKinds {
+        wayland: true,
+        x11: true,
+    };
 
     fn alice() -> impl FnOnce() -> Option<Person> {
         || {
             Some(Person {
                 session: "3".into(),
                 uid: 1000,
+                x11: false,
+                lock_reported: true,
             })
         }
+    }
+
+    /// FR-113 — a person's X11 session on screen, on a desktop whose locker
+    /// reports a lock (GNOME, KDE).
+    fn bob_on_x11() -> impl FnOnce() -> Option<Person> {
+        || {
+            Some(Person {
+                session: "5".into(),
+                uid: 1000,
+                x11: true,
+                lock_reported: true,
+            })
+        }
+    }
+
+    /// FR-113 D4 — an X11 desktop whose locker reports nothing to logind.
+    fn carol_on_unreported_x11() -> impl FnOnce() -> Option<Person> {
+        || {
+            Some(Person {
+                session: "7".into(),
+                uid: 1000,
+                x11: true,
+                lock_reported: false,
+            })
+        }
+    }
+
+    /// FR-113 D4 — refused before the surface is probed, so no helper starts in
+    /// the person's session; and only ever on X11 (Wayland ships as FR-95 did).
+    #[test]
+    fn an_x11_desktop_that_does_not_report_its_lock_is_refused() {
+        assert_eq!(
+            system_plan(
+                true,
+                true,
+                BOTH,
+                false,
+                false,
+                carol_on_unreported_x11(),
+                untold()
+            ),
+            SystemPlan::LockUnreported
+        );
+        let wayland_unreported = || {
+            Some(Person {
+                session: "3".into(),
+                uid: 1000,
+                x11: false,
+                lock_reported: false,
+            })
+        };
+        assert_eq!(
+            system_plan(
+                true,
+                true,
+                BOTH,
+                false,
+                false,
+                wayland_unreported,
+                told(true)
+            ),
+            SystemPlan::Auto {
+                session: "3".into()
+            }
+        );
+        let x11_off = AutoKinds {
+            wayland: true,
+            x11: false,
+        };
+        assert_eq!(
+            system_plan(
+                true,
+                true,
+                x11_off,
+                false,
+                false,
+                carol_on_unreported_x11(),
+                untold()
+            ),
+            SystemPlan::AsConfigured,
+            "the switch off is 0.4.143 exactly: no refusal of its own"
+        );
+    }
+
+    /// FR-113 D4 — the real uid is the first field of `/proc/<pid>/status`'s
+    /// `Uid:` line; anything else reads as unknown, never as a match.
+    #[test]
+    fn the_status_uid_is_the_real_uid() {
+        let status =
+            "Name:\tgnome-shell\nState:\tS (sleeping)\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\n";
+        assert_eq!(super::status_uid(status), Some(1000));
+        assert_eq!(super::status_uid("Uid:\t0\t1000\t0\t0\n"), Some(0));
+        assert_eq!(super::status_uid("Name:\tx\n"), None);
+        assert_eq!(super::status_uid("Uid:\tnope\n"), None);
+        assert_eq!(super::LOCK_REPORTING_SHELLS, ["gnome-shell", "ksmserver"]);
     }
 
     fn unasked() -> impl FnOnce() -> Option<Person> {
@@ -3379,7 +3846,7 @@ mod system_auto_tests {
     #[test]
     fn a_person_who_can_be_told_is_captured_by_a_system_install() {
         assert_eq!(
-            system_plan(true, true, true, false, false, alice(), told(true)),
+            system_plan(true, true, BOTH, false, false, alice(), told(true)),
             SystemPlan::Auto {
                 session: "3".into()
             }
@@ -3390,7 +3857,7 @@ mod system_auto_tests {
     #[test]
     fn with_nobody_to_tell_nothing_switches_on_and_the_hint_says_why() {
         assert_eq!(
-            system_plan(true, true, true, false, false, alice(), told(false)),
+            system_plan(true, true, BOTH, false, false, alice(), told(false)),
             SystemPlan::NoSurface
         );
         let hint = wayland_hint_with(true, true);
@@ -3413,26 +3880,97 @@ mod system_auto_tests {
     #[test]
     fn without_a_person_on_screen_nothing_switches_on() {
         assert_eq!(
-            system_plan(true, true, true, false, false, || None, untold()),
+            system_plan(true, true, BOTH, false, false, || None, untold()),
             SystemPlan::AsConfigured
         );
     }
 
-    /// AC5 — every switch gives back the system half before FR-95, and asks
-    /// nothing: `wayland_auto_system`, `wayland_auto`, `wayland_aware`.
+    /// AC5 — every switch gives back the system half before FR-95.
+    /// `wayland_auto` and `wayland_aware` turn both halves off and ask nothing,
+    /// as do both halves' own switches together. With only
+    /// `wayland_auto_system` off, logind IS asked (FR-113: an X11 session may
+    /// still switch on), and a Wayland person is planned as configured.
     #[test]
     fn every_kill_switch_gives_back_the_old_system_half() {
-        for (aware, auto, auto_system) in [
-            (true, true, false),
-            (true, false, true),
-            (false, true, true),
-        ] {
+        for (aware, auto) in [(true, false), (false, true)] {
             assert_eq!(
-                system_plan(aware, auto, auto_system, false, false, unasked(), untold()),
+                system_plan(aware, auto, BOTH, false, false, unasked(), untold()),
                 SystemPlan::AsConfigured,
-                "aware={aware} auto={auto} auto_system={auto_system}"
+                "aware={aware} auto={auto}"
             );
         }
+        let none = AutoKinds {
+            wayland: false,
+            x11: false,
+        };
+        assert_eq!(
+            system_plan(true, true, none, false, false, unasked(), untold()),
+            SystemPlan::AsConfigured
+        );
+        let wayland_off = AutoKinds {
+            wayland: false,
+            x11: true,
+        };
+        assert_eq!(
+            system_plan(true, true, wayland_off, false, false, alice(), untold()),
+            SystemPlan::AsConfigured
+        );
+    }
+
+    /// FR-113 P1 (AC1) — a person's X11 session on screen, who can be told:
+    /// DRM and uinput, bound to that session, exactly as on Wayland; nobody to
+    /// tell, nothing switches on (and the hint says why, `x11_hint_with`).
+    #[test]
+    fn a_person_on_x11_who_can_be_told_is_captured_by_a_system_install() {
+        assert_eq!(
+            system_plan(true, true, BOTH, false, false, bob_on_x11(), told(true)),
+            SystemPlan::Auto {
+                session: "5".into()
+            }
+        );
+        assert_eq!(
+            system_plan(true, true, BOTH, false, false, bob_on_x11(), told(false)),
+            SystemPlan::NoSurface
+        );
+    }
+
+    /// FR-113 AC4 — each half has its own switch: `x11_auto_system = false`
+    /// gives back 0.4.143 on an X11 seat and leaves a Wayland one alone, and
+    /// `wayland_auto_system = false` leaves an X11 one alone.
+    #[test]
+    fn each_half_has_its_own_switch() {
+        let x11_off = AutoKinds {
+            wayland: true,
+            x11: false,
+        };
+        assert_eq!(
+            system_plan(true, true, x11_off, false, false, bob_on_x11(), untold()),
+            SystemPlan::AsConfigured
+        );
+        assert_eq!(
+            system_plan(true, true, x11_off, false, false, alice(), told(true)),
+            SystemPlan::Auto {
+                session: "3".into()
+            }
+        );
+        let wayland_off = AutoKinds {
+            wayland: false,
+            x11: true,
+        };
+        assert_eq!(
+            system_plan(
+                true,
+                true,
+                wayland_off,
+                false,
+                false,
+                bob_on_x11(),
+                told(true)
+            ),
+            SystemPlan::Auto {
+                session: "5".into()
+            }
+        );
     }
 
     /// A capture key, to any value, is the operator's choice: `drm_capture =
@@ -3440,7 +3978,7 @@ mod system_auto_tests {
     #[test]
     fn an_explicit_key_always_wins() {
         assert_eq!(
-            system_plan(true, true, true, true, false, unasked(), untold()),
+            system_plan(true, true, BOTH, true, false, unasked(), untold()),
             SystemPlan::AsConfigured
         );
     }
@@ -3449,7 +3987,7 @@ mod system_auto_tests {
     #[test]
     fn a_virtual_desktop_is_never_replaced() {
         assert_eq!(
-            system_plan(true, true, true, false, true, unasked(), untold()),
+            system_plan(true, true, BOTH, false, true, unasked(), untold()),
             SystemPlan::AsConfigured
         );
     }
@@ -3464,6 +4002,7 @@ mod system_auto_tests {
             .map(|(k, _)| *k)
             .collect();
         assert!(bridged.contains(&"WAYLAND_AUTO_SYSTEM"), "{bridged:?}");
+        assert!(bridged.contains(&"X11_AUTO_SYSTEM"), "{bridged:?}");
     }
 }
 

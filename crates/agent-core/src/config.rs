@@ -1135,6 +1135,19 @@ pub struct AgentConfig {
     /// off too. Restart required.
     #[serde(default)]
     pub wayland_auto_system: Option<bool>,
+    /// FR-113 P1 — the same system half for an **X11** desktop
+    /// (`ROOMLERD_X11_AUTO_SYSTEM`): a root install, with no capture key set,
+    /// switches DRM and uinput on by itself for the person's X11 session on
+    /// screen, on the same terms (told first; read only while that session is
+    /// on screen, unlocked; never the greeter or the lock screen), and only
+    /// where the desktop reports its lock to logind (GNOME, KDE): any other
+    /// X11 desktop is refused with `x11_not_enabled`. It skips an idle X11
+    /// desktop's unchanged frames by dense rows. Built-in default:
+    /// **ON**. `false` is the kill switch: 0.4.143 exactly (no picture of an
+    /// X11 seat by default, `no_display`). `wayland_auto = false` turns it off
+    /// too. Restart required.
+    #[serde(default)]
+    pub x11_auto_system: Option<bool>,
     /// FR-93 P4 — a mutter screencast is driven by mutter's own RemoteDesktop,
     /// which takes the viewer's mouse and keyboard (`ROOMLERD_MUTTER_INPUT`).
     /// Built-in default: **ON**.
@@ -2664,6 +2677,7 @@ pub fn test_fixture() -> AgentConfig {
         wayland_aware: None,
         wayland_auto: None,
         wayland_auto_system: None,
+        x11_auto_system: None,
         mutter_input: None,
         x11_damage: None,
         overlay_key_rotation: None,
@@ -2834,7 +2848,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 88] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 89] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2872,6 +2886,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 88]
         ("WAYLAND_AWARE", cfg.wayland_aware),
         ("WAYLAND_AUTO", cfg.wayland_auto),
         ("WAYLAND_AUTO_SYSTEM", cfg.wayland_auto_system),
+        ("X11_AUTO_SYSTEM", cfg.x11_auto_system),
         ("MUTTER_INPUT", cfg.mutter_input),
         ("X11_DAMAGE", cfg.x11_damage),
         ("OVERLAY_KEY_ROTATION", cfg.overlay_key_rotation),

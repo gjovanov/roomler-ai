@@ -376,6 +376,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         wayland_aware: None,
         wayland_auto: None,
         wayland_auto_system: None,
+        x11_auto_system: None,
         mutter_input: None,
         x11_damage: None,
         overlay_key_rotation: None,
