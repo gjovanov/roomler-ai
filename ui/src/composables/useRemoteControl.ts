@@ -843,6 +843,36 @@ export function agentIsWaiting(waiting: RcMediaWaiting | null, nowMs: number): b
   return waiting !== null && nowMs < waiting.deadlineMs + RC_MEDIA_WAITING_GRACE_MS
 }
 
+/** FR-93 P5j — the wait a redial keeps on screen. A computer that said it was
+ *  going to sleep keeps saying so while this viewer redials it: the dead link
+ *  is the sleep's consequence, not news. Before this, the redial's teardown
+ *  cleared the notice, and a request to a sleeping computer sits in
+ *  awaiting_consent: the stage read "Waiting for the agent to allow the
+ *  connection…" until the computer was back (0.4.142 in the lab: 48 s that
+ *  named no reason, the last 19 of them after the wake). Its deadline is
+ *  spent, so it holds nothing back: a
+ *  new session that stays silent is re-created on the usual clock. Any other
+ *  wait belonged to the session that ended. The next session's own report
+ *  replaces it, and its first frame ends it. */
+export function waitKeptAcrossReconnect(
+  waiting: RcMediaWaiting | null,
+  nowMs: number,
+): RcMediaWaiting | null {
+  if (waiting?.for !== 'host_sleep') return null
+  return {
+    ...waiting,
+    deadlineMs: Math.min(waiting.deadlineMs, nowMs - RC_MEDIA_WAITING_GRACE_MS),
+  }
+}
+
+/** FR-93 P5j — is this the sleep notice a redial kept? A session that connects
+ *  ends it: the computer evidently woke, and the session reports its own wait
+ *  or its frames. A notice of the live session (its deadline not spent: an ICE
+ *  flap the same session recovers from) is not one. */
+export function isKeptSleepNotice(waiting: RcMediaWaiting | null, nowMs: number): boolean {
+  return waiting?.for === 'host_sleep' && !agentIsWaiting(waiting, nowMs)
+}
+
 /** FR-93 P5f — how long after a notice arrives a frame the watchdog counts may
  *  still have come in before it: one stats poll (`STATS_POLL_MS`) and its
  *  latency, on the RTP path. */
@@ -8140,7 +8170,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
     reconnectAttempt.value = attemptIdx + 1
     phase.value = 'reconnecting'
+    // FR-93 P5j — a computer going to sleep keeps saying so through the redial.
+    const kept = waitKeptAcrossReconnect(mediaWaiting.value, Date.now())
     teardown()
+    if (kept) mediaWaiting.value = kept
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null
       fireReconnectAttempt()
@@ -8608,6 +8641,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (state === 'connected') {
         markConnect('pc_connected')
         phase.value = 'connected'
+        // FR-93 P5j — a session that connects is a computer that woke.
+        if (isKeptSleepNotice(mediaWaiting.value, Date.now())) mediaWaiting.value = null
         // Stand down the pending retry timer, but KEEP the attempt counters:
         // reaching `connected` is not proof the session works. A pair with no
         // usable ICE candidate connects every time and then sits in dead air
