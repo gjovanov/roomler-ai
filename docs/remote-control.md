@@ -232,7 +232,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 |---|---|---|
 | A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:386` |
 | An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:409`, `crates/modules/fleet/src/hub.rs:1587` |
-| A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1466`, `peer.rs:1508`, `peer.rs:1434` |
+| A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1505`, `peer.rs:1547`, `peer.rs:1473` |
 
 "Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, learned as each runtime brings its TUN up: `crates/tunnel-core/src/overlay_footprint.rs`, fed at `runtime.rs:2148`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
 
@@ -519,13 +519,13 @@ sequenceDiagram
     V-->>V: a snackbar once, and the reason<br/>on the audio control's title
 ```
 
-The pump ([`peer.rs:12390`](../agents/roomlerd/src/peer.rs#L12390)) sends it
+The pump ([`peer.rs:12441`](../agents/roomlerd/src/peer.rs#L12441)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
-[`peer.rs:5382`](../agents/roomlerd/src/peer.rs#L5382); the viewer parses it
-at [`useRemoteControl.ts:1354`](../ui/src/composables/useRemoteControl.ts#L1354)
+[`peer.rs:5421`](../agents/roomlerd/src/peer.rs#L5421); the viewer parses it
+at [`useRemoteControl.ts:1356`](../ui/src/composables/useRemoteControl.ts#L1356)
 and puts it on the toggle's title
-([`RemoteControl.vue:3125`](../ui/src/views/remote/RemoteControl.vue#L3125)).
+([`RemoteControl.vue:3127`](../ui/src/views/remote/RemoteControl.vue#L3127)).
 
 | `code` | Means |
 |---|---|
@@ -549,6 +549,46 @@ same loopback or monitor only. On Linux it takes `linux_route` too
 the recorder already runs as the person at the screen, it records the monitor
 in its own process. Before P3c-2 it refused its start on every Linux host,
 because the `.monitor` pick never matched.
+
+### 5.1d A locked host, and a session that keeps the host awake (FR-97 P3b)
+
+What the viewer is told when the host's screen locks, and what holds the
+machine awake while a session is live, per OS:
+
+| | Windows | Linux | macOS |
+|---|---|---|---|
+| The lock signal | the input desktop moves to `winsta0\Winlogon` (`lock_state`) | logind's `LockedHint` for seat0's active session, polled every 2 s ([`lock_state.rs:331`](../agents/roomlerd/src/lock_state.rs#L331)); GNOME, KDE and light-locker set it | P2d |
+| What the session does | paints the "Host locked" overlay and suppresses input: the worker can neither capture nor inject there | **nothing**: the lock screen is captured like any other screen, and input reaches it | — |
+| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:9357`](../agents/roomlerd/src/peer.rs#L9357)), retried until the control DC carries it | — |
+| The viewer's chip | "input is suppressed" | "Your input reaches it, so you can type the password to unlock" ([`RemoteControl.vue:78`](../ui/src/views/remote/RemoteControl.vue#L78)) | — |
+| Holding the machine awake while a session is live (FR-55) | `PowerCreateRequest` | a logind **block** inhibitor ([`power.rs:670`](../agents/roomlerd/src/power.rs#L670)): `sleep:idle` for a root daemon, `idle` only for a per-user one | `IOPMAssertion` |
+
+⚠️ **The Linux hint is advisory and never a `LockState`.** The pump's overlay
+and the input path keep reading the Windows probe, which says Unlocked on
+Linux. Feeding the hint there would blank a lock screen the viewer can see and
+stop the very keystrokes that unlock it. `ROOMLERD_LOCK_HINT=0` turns the hint
+off.
+
+⚠️ **The inhibitor is the FR-55 half, and it sits beside FR-93 P5h's.** P5h
+holds a logind **delay** inhibitor during a session so that a sleep the person
+chooses is announced to the viewer first ([`linux-capture.md`](linux-capture.md)).
+The **block** inhibitor is FR-55's own design for Linux (`what="sleep"`,
+`mode="block"`, [FR-55](fr/FR-55-always-reachable.md)): an idle timer must not
+end a live session. What a desktop does with an explicit suspend or a closed
+lid while a block is held is the desktop's and logind's own
+(`LidSwitchIgnoreInhibited=` and the rest); the field cell measures the idle
+case.
+
+⚠️ **A per-user daemon gets `idle` only.** It runs outside every login
+session, and logind's polkit policy grants a `sleep` block only to session
+processes (`inhibit-block-sleep` is `allow_any=no`). It falls back to `idle`
+and logs why. A desktop's own idle suspend may still end such a session; a
+system install, the default, has both.
+
+The inhibitor lives exactly as long as its fd: logind drops it when the fd
+closes, so a daemon that crashes leaves nothing pinned. `systemd-inhibit
+--list` shows it (`roomlerd`, `block`) only while a session or an SSH or exec
+run is live.
 
 ### 5.2 Encoder selection
 
@@ -1499,8 +1539,8 @@ sequenceDiagram
 
 | | |
 |---|---|
-| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:12311`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:12289`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:3535`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:12320`) |
+| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:12362`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:12340`). An offer with no `m=video` is answered without the track |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:3535`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:12371`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:555`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:284`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:649`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:348`, #2326) |
@@ -1663,7 +1703,7 @@ that dominate a relayed connect (a DERP-relayed LAN pair measured on 2026-08-29:
 ⚠️ **Marks are per ATTEMPT, never per connect.** A recorder shared across the
 ladder would let the fast retry overwrite the lost attempt's marks and report an
 18 s connect as a 3 s one — hiding the exact defect being hunted. Each retry
-calls `beginAttempt()` (`useRemoteControl.ts:8339`) and gets a fresh recorder.
+calls `beginAttempt()` (`useRemoteControl.ts:8346`) and gets a fresh recorder.
 
 ⚠️ **An unreached mark is the finding.** The console line prints it as
 `<name>:—` and the record omits the key; the first missing mark
@@ -1766,7 +1806,7 @@ leaves **no server row at all** (the request never reached a hub), and
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
-the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4282`)
+the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4284`)
 posts **one record**: the console line, persisted.
 
 ```jsonc
@@ -1799,7 +1839,7 @@ posts **one record**: the console line, persisted.
 | outcome | means | snackbar |
 |---|---|---|
 | `first_frame` | the attempt painted; `ttff_ms` is set | per the rules above |
-| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:3940`) | stall warning |
+| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:3942`) | stall warning |
 | `closed` | the operator hung up, the view unmounted, or a terminal `rc:error` failed it (`error_code` says which) | none |
 | `retried` | the ladder advanced past a live attempt for another reason — a transient `rc:error` it rides, an ICE failure, dead air before the first frame (`scheduleReconnect`, `:7157`) | none |
 
@@ -1982,7 +2022,7 @@ system guest, idle 60 s after each of three 2-minute DRM sessions, with gdb's
 | session 3 | 303 MB | 256 MB | 290 MB | **9.2 MB** | 32 |
 | one `malloc_trim(0)` | **89 MB** | **42 MB** | 290 MB | 9.2 MB | 32 |
 
-So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1643`) asks for a trim, and
+So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1682`) asks for a trim, and
 `agents/roomlerd/src/mem_trim.rs:33` runs `malloc_trim(0)` once, on a short-lived
 `mem-trim` thread, **5 s after the last session ended**. The delay lets the
 encoder thread finish freeing (`encode/thread.rs:257` joins it), and sessions

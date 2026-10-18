@@ -310,6 +310,36 @@ pub use nowin::{probe_lock_state, probe_lock_state_detailed, probe_lock_state_se
 #[cfg(target_os = "windows")]
 pub use win::{probe_lock_state, probe_lock_state_detailed, probe_lock_state_service};
 
+/// FR-97 P3b — how often a Linux session asks logind whether the screen is
+/// locked. A lock is a person stepping away, so a couple of seconds late is
+/// fine, and each ask is one `loginctl` run.
+#[cfg(target_os = "linux")]
+pub const LINUX_HINT_POLL: Duration = Duration::from_secs(2);
+
+/// FR-97 P3b — Linux: logind's `LockedHint` for seat0's active session, the
+/// screen a session sees. GNOME, KDE and light-locker set it; a locker that
+/// does not (xscreensaver, i3lock) reads as unlocked, as `keep_busy` notes.
+///
+/// ⚠️ ADVISORY, and deliberately not a [`LockState`]. On Windows a lock moves
+/// the input desktop where the worker can neither capture nor inject, so the
+/// pump paints an overlay and suppresses input. A Linux lock screen is
+/// captured like any other screen, and input reaches it: the person at the
+/// viewer unlocks by typing. This feeds only the viewer's chip
+/// (`rc:host_locked` with `input: "passes"`), never the overlay or the input
+/// path. `ROOMLERD_LOCK_HINT=0` turns it off.
+#[cfg(target_os = "linux")]
+pub fn linux_locked_hint() -> bool {
+    crate::lock_on_end::linux_active_session()
+        .is_some_and(|id| crate::lock_on_end::linux_session_hint(&id, "LockedHint"))
+}
+
+/// FR-97 P3b's kill switch for [`linux_locked_hint`]: on unless
+/// `ROOMLERD_LOCK_HINT=0`.
+#[cfg(target_os = "linux")]
+pub fn linux_lock_hint_enabled() -> bool {
+    tunnel_core::env::node_env("LOCK_HINT").is_none_or(|v| v.trim() != "0")
+}
+
 /// Spawn a tokio task that polls `probe_lock_state` every
 /// `POLL_INTERVAL` and emits transitions on the returned
 /// `tokio::sync::watch::Receiver<LockState>`. The watch channel

@@ -2055,12 +2055,21 @@ describe('parseControlInbound', () => {
 
   it('parses a well-formed rc:host_locked locked=true', () => {
     const r = parseControlInbound('{"t":"rc:host_locked","locked":true}')
-    expect(r).toEqual({ kind: 'host_locked', locked: true })
+    expect(r).toEqual({ kind: 'host_locked', locked: true, inputPasses: false })
   })
 
   it('parses a well-formed rc:host_locked locked=false', () => {
     const r = parseControlInbound('{"t":"rc:host_locked","locked":false}')
-    expect(r).toEqual({ kind: 'host_locked', locked: false })
+    expect(r).toEqual({ kind: 'host_locked', locked: false, inputPasses: false })
+  })
+
+  it('FR-97 P3b: a Linux lock hint says the lock screen takes input', () => {
+    // The agent's payload (`host_locked_advisory_payload`, peer.rs).
+    const r = parseControlInbound('{"t":"rc:host_locked","locked":true,"input":"passes"}')
+    expect(r).toEqual({ kind: 'host_locked', locked: true, inputPasses: true })
+    // Only the one word counts: anything else is Windows' meaning.
+    const other = parseControlInbound('{"t":"rc:host_locked","locked":true,"input":"suppressed"}')
+    expect(other).toEqual({ kind: 'host_locked', locked: true, inputPasses: false })
   })
 
   // FR-93 P1 — the agent's wire shape (input/reach.rs `payload`, locked there).
