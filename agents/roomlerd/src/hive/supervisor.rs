@@ -4635,18 +4635,30 @@ fn write_settings(runtime: &Path, sid: &str, vault_tools: bool) -> Result<PathBu
         extra_read_denies,
         session_start_hook,
         // P3-4b — the vault's reads need no person: their gate is the
-        // vault's own `secret:list`, decided and recorded by the server.
-        allow_tools: if vault_tools {
-            toolbelt::VAULT_TOOLS.map(String::from).to_vec()
-        } else {
-            Vec::new()
-        },
+        // vault's own `secret:list`, decided and recorded by the server; and
+        // (P3-4c-3) neither does asking a lease ahead, which hands nothing.
+        allow_tools: vault_allow_tools(vault_tools),
         // P3-4c — and each of its uses asks one, whatever a repository's
         // own settings allow.
         ask_tools: vault_use_tools(vault_tools),
     }
     .to_json();
     write_doc(&dir, "settings.json", &doc)
+}
+
+/// FR-90 P3-4b — the tools a session's settings allow without a person,
+/// wherever the vault tools are offered: the vault's reads, and (P3-4c-3)
+/// asking a lease ahead. Each is decided and recorded by the vault itself,
+/// and none hands the session a value.
+fn vault_allow_tools(vault_tools: bool) -> Vec<String> {
+    if !vault_tools {
+        return Vec::new();
+    }
+    #[cfg_attr(not(feature = "vault"), allow(unused_mut))]
+    let mut tools = toolbelt::VAULT_TOOLS.map(String::from).to_vec();
+    #[cfg(feature = "vault")]
+    tools.extend(toolbelt::VAULT_AHEAD_TOOLS.map(String::from));
+    tools
 }
 
 /// FR-90 P3-4c — the tools a session's settings ask a person for on every
@@ -7542,10 +7554,12 @@ done
         };
         write_settings(&runtime, "offered", true).unwrap();
         let offered = read("offered");
-        assert_eq!(
-            offered["permissions"]["allow"],
-            serde_json::json!(toolbelt::VAULT_TOOLS)
-        );
+        #[cfg_attr(not(feature = "vault"), allow(unused_mut))]
+        let mut allowed: Vec<&str> = toolbelt::VAULT_TOOLS.to_vec();
+        // P3-4c-3 — asking a lease ahead is allowed with the reads.
+        #[cfg(feature = "vault")]
+        allowed.extend(toolbelt::VAULT_AHEAD_TOOLS);
+        assert_eq!(offered["permissions"]["allow"], serde_json::json!(allowed));
         // P3-4c-2 — and where the vault tools are offered, the Read tool is
         // denied the session's secrets directory.
         #[cfg(feature = "vault")]

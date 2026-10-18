@@ -55,13 +55,18 @@
 //! them ([`VAULT_TOOLS`]) instead of asking a person; anyone else who can
 //! connect here learns only what the session itself could.
 //!
-//! # `vault_exec` (FR-90 P3-4c-1)
+//! # The vault's uses (FR-90 P3-4c)
 //!
-//! Offered with them: one command, run as the session's account with values
-//! from the vault in its environment, its output scrubbed
-//! ([`super::vault_exec`]). It hands a value to a program, so the settings
-//! never allow it: every call asks a person through `approve` first, and the
-//! vault decides each lease (`exec` mode, the program as its audience).
+//! Offered with them: `vault_exec`, one command run as the session's account
+//! with values from the vault in its environment, its output scrubbed
+//! ([`super::vault_exec`]), and `vault_render`, a template written with values
+//! into the session's secrets directory ([`super::vault_render`]). Each hands
+//! a value on, so the settings ASK for every call ([`VAULT_USE_TOOLS`]), which
+//! no repository's own allow rule overrides, and the vault decides each lease.
+//! And `vault_request` ([`super::vault_request`]) asks for a lease ahead, which
+//! a use naming the same secret toward the same audience takes; it hands the
+//! session nothing, so the settings allow it with the reads
+//! ([`VAULT_AHEAD_TOOLS`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -253,6 +258,34 @@ pub(crate) trait VaultTools: Send + Sync {
         audience: &str,
         ttl_secs: u32,
     ) -> Result<String, String>;
+    /// P3-4c-3 — lease `handle` AHEAD (`vault_request`): held until its
+    /// expiry, its revocation or the run's end, and taken by a use tool that
+    /// asks for the same secret, mode and audience. Its id, or why not.
+    #[cfg(feature = "vault")]
+    async fn lease_ahead(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        handle: &super::vault_exec::Handle,
+        mode: &str,
+        audience: &str,
+        ttl_secs: u32,
+    ) -> Result<String, String>;
+    /// P3-4c-3 — how long a held lease has left; `None` once it is let go.
+    #[cfg(feature = "vault")]
+    fn left(&self, lease_id: &str) -> Option<Duration>;
+    /// P3-4c-3 — a lease asked for ahead for this run, `handle`, `mode` and
+    /// `audience`, with at least `at_least` left.
+    #[cfg(feature = "vault")]
+    fn ahead(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        handle: &super::vault_exec::Handle,
+        mode: &str,
+        audience: &str,
+        at_least: Duration,
+    ) -> Option<String>;
     /// P3-4c-2 — `path` was written with `lease_id`'s value: removed when the
     /// lease is let go. `false` when the lease is no longer held.
     #[cfg(feature = "vault")]
@@ -307,10 +340,17 @@ const VAULT_TOOL_NAMES: [&str; 2] = ["vault_list", "vault_describe"];
 #[cfg(feature = "vault")]
 const VAULT_USE_NAMES: [&str; 2] = ["vault_exec", "vault_render"];
 
+/// FR-90 P3-4c-3 — and a lease asked for ahead, which a use takes. Allowed
+/// in the settings like the reads ([`VAULT_AHEAD_TOOLS`]): it hands the
+/// session nothing, and its gate is the vault's own `secret:use`, decided
+/// and recorded by the server. Each use of the lease still asks a person.
+#[cfg(feature = "vault")]
+const VAULT_AHEAD_NAMES: [&str; 1] = ["vault_request"];
+
 /// Whether `name` is one of the vault tools this build offers.
 fn is_vault_tool(name: &str) -> bool {
     #[cfg(feature = "vault")]
-    if VAULT_USE_NAMES.contains(&name) {
+    if VAULT_USE_NAMES.contains(&name) || VAULT_AHEAD_NAMES.contains(&name) {
         return true;
     }
     VAULT_TOOL_NAMES.contains(&name)
@@ -331,6 +371,11 @@ pub(crate) const VAULT_TOOLS: [&str; 2] =
 #[cfg(feature = "vault")]
 pub(crate) const VAULT_USE_TOOLS: [&str; 2] =
     ["mcp__roomler__vault_exec", "mcp__roomler__vault_render"];
+
+/// FR-90 P3-4c-3 — asking a lease ahead, as Claude Code names it: allowed
+/// with the reads wherever it is offered.
+#[cfg(feature = "vault")]
+pub(crate) const VAULT_AHEAD_TOOLS: [&str; 1] = ["mcp__roomler__vault_request"];
 
 /// FR-90 P3-4b — the daemon's vault for a run's toolbelt: its lease client,
 /// where the primary connection takes leases; otherwise none, and the vault
@@ -355,6 +400,29 @@ fn vault_why(e: crate::vault::LeaseError) -> String {
         LeaseError::NotConnected => "this device is not connected to its server".into(),
         LeaseError::NoAnswer => "the vault did not answer".into(),
         LeaseError::Unopenable => "the vault's answer did not open".into(),
+    }
+}
+
+/// P3-4c-3 — a lease ask for `vault_request`, or the query that finds what
+/// one leased.
+#[cfg(feature = "vault")]
+fn ahead_ask(
+    session: ObjectId,
+    fence: u64,
+    handle: &super::vault_exec::Handle,
+    mode: &str,
+    audience: &str,
+    ttl_secs: u32,
+) -> crate::vault::LeaseAsk {
+    crate::vault::LeaseAsk {
+        session_id: session,
+        fence,
+        secret: handle.secret.clone(),
+        field: handle.field.clone(),
+        mode: mode.into(),
+        audience: audience.into(),
+        ttl_secs,
+        ahead: true,
     }
 }
 
@@ -395,10 +463,46 @@ impl VaultTools for DaemonVault {
                 mode: mode.into(),
                 audience: audience.into(),
                 ttl_secs,
+                ahead: false,
             })
             .await
             .map_err(vault_why)?;
         Ok(info.lease_id)
+    }
+
+    async fn lease_ahead(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        handle: &super::vault_exec::Handle,
+        mode: &str,
+        audience: &str,
+        ttl_secs: u32,
+    ) -> Result<String, String> {
+        let info = crate::vault::CLIENT
+            .request(ahead_ask(session, fence, handle, mode, audience, ttl_secs))
+            .await
+            .map_err(vault_why)?;
+        Ok(info.lease_id)
+    }
+
+    fn left(&self, lease_id: &str) -> Option<Duration> {
+        crate::vault::CLIENT.left(lease_id)
+    }
+
+    fn ahead(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        handle: &super::vault_exec::Handle,
+        mode: &str,
+        audience: &str,
+        at_least: Duration,
+    ) -> Option<String> {
+        crate::vault::CLIENT.find_ahead(
+            &ahead_ask(session, fence, handle, mode, audience, 0),
+            at_least,
+        )
     }
 
     fn attach(&self, lease_id: &str, path: &std::path::Path) -> bool {
@@ -669,8 +773,9 @@ fn approve_tool() -> Value {
 }
 
 /// FR-90 P3-4b — the vault tools, as `tools/list` describes them: offered
-/// only where this device takes leases. The reads, and from P3-4c-1 the
-/// use: `vault_exec`.
+/// only where this device takes leases. The reads, and from P3-4c the uses
+/// (`vault_exec`, `vault_render`) and a lease asked for ahead
+/// (`vault_request`).
 fn vault_tools() -> Vec<Value> {
     #[cfg_attr(not(feature = "vault"), allow(unused_mut))]
     let mut tools = vec![
@@ -754,6 +859,28 @@ fn vault_tools() -> Vec<Value> {
         },
         "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false},
     }));
+    #[cfg(feature = "vault")]
+    tools.push(json!({
+        "name": "vault_request",
+        "description": "Asks the Roomler vault for a lease ahead of using it, and answers the \
+                        lease's id and how long it lasts, never a value. mode is exec (for \
+                        vault_exec, audience the program's bare name) or file (for vault_render, \
+                        audience the file's bare name). A later vault_exec or vault_render that \
+                        names the same secret toward the same audience takes this lease instead \
+                        of asking again, while it lasts (ttl_s, 30 to 900 seconds). Each of \
+                        those calls still asks a person.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string", "description": "a secret: a path or rrn:<org>:secret:<path>, with #<field> for a structured secret's field"},
+                "mode": {"type": "string", "enum": ["exec", "file"]},
+                "audience": {"type": "string", "description": "exec: the program's bare name, such as psql; file: the file's bare name, such as kubeconfig"},
+                "ttl_s": {"type": "integer", "minimum": 30, "maximum": 900},
+            },
+            "required": ["handle", "mode", "audience"],
+        },
+        "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false},
+    }));
     tools
 }
 
@@ -811,6 +938,10 @@ async fn ask_vault(ctx: &Ctx, name: &str, args: &Value) -> Result<Value, String>
             args,
         )
         .await;
+    }
+    #[cfg(feature = "vault")]
+    if name == "vault_request" {
+        return super::vault_request::call(vault.as_ref(), ctx.session, ctx.fence, args).await;
     }
     if name == "vault_list" {
         let prefix = args.get("prefix").and_then(Value::as_str).unwrap_or("");

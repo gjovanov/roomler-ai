@@ -56,14 +56,6 @@ pub(crate) struct RenderRequest {
     pub(crate) ttl: u32,
 }
 
-fn show(h: &Handle) -> String {
-    if h.field.is_empty() {
-        h.secret.clone()
-    } else {
-        format!("{}#{}", h.secret, h.field)
-    }
-}
-
 /// Split a template into its text and its `{{ handle }}` placeholders. A
 /// `{{` never closed is refused rather than kept as text: a placeholder the
 /// writer meant would otherwise land in the file as written.
@@ -266,35 +258,51 @@ pub(crate) async fn call(
     args: &Value,
 ) -> Result<Value, String> {
     let req = parse(args)?;
+    // The leases this call asks for itself: let go if nothing is written.
     let mut held = Releasing {
         vault,
         leases: Vec::with_capacity(req.handles.len()),
     };
+    let mut leases = Vec::with_capacity(req.handles.len());
+    let wanted = std::time::Duration::from_secs(u64::from(req.ttl));
     for h in &req.handles {
+        // P3-4c-3 — a lease asked for ahead toward this file, lasting at
+        // least as long as the file is asked to, is taken as it is.
+        if let Some(lease) = vault.ahead(session, fence, h, "file", &req.dest, wanted) {
+            leases.push(lease);
+            continue;
+        }
         let lease = vault
             .lease(session, fence, h, "file", &req.dest, req.ttl)
             .await
-            .map_err(|why| format!("{}: {why}", show(h)))?;
-        held.leases.push(lease);
+            .map_err(|why| format!("{h}: {why}"))?;
+        held.leases.push(lease.clone());
+        leases.push(lease);
     }
-    let mut values = Vec::with_capacity(held.leases.len());
-    for (h, lease) in req.handles.iter().zip(&held.leases) {
+    let mut values = Vec::with_capacity(leases.len());
+    for (h, lease) in req.handles.iter().zip(&leases) {
         values.push(
-            vault.value(lease).ok_or_else(|| {
-                format!("{}: the lease ended before the file was written", show(h))
-            })?,
+            vault
+                .value(lease)
+                .ok_or_else(|| format!("{h}: the lease ended before the file was written"))?,
         );
     }
     let path = write_with(target, &req, &values)?;
     // The file lives with its leases: whichever is let go first removes it.
-    for lease in &held.leases {
+    for lease in &leases {
         if !vault.attach(lease, &path) {
             let _ = std::fs::remove_file(&path);
             return Err("a lease ended before the file was handed over: it is removed".into());
         }
     }
     held.keep();
-    Ok(serde_json::json!({ "path": path.to_string_lossy(), "ttl_s": req.ttl }))
+    // How long it lives: until the first of its leases ends.
+    let ttl_s = leases
+        .iter()
+        .filter_map(|l| vault.left(l))
+        .min()
+        .map_or(0, |d| d.as_secs());
+    Ok(serde_json::json!({ "path": path.to_string_lossy(), "ttl_s": ttl_s }))
 }
 
 /// Render the checked call into its file.
