@@ -19,11 +19,11 @@ flowchart TB
     WGUI -->|GUI| WIZ["roomler-setup wizard<br/>role picker → MSI"]
     WGUI -->|terminal| PS1["irm roomler.ai/api/setup/install.ps1 | iex"]
     OS1 -->|Linux| SH["curl roomler.ai/api/setup/install.sh | sh<br/>--role daemon (.deb x86_64/arm64)"]
-    OS1 -->|macOS| PKG["install.sh --role daemon (.pkg, arm64)<br/>or the wizard"]
+    OS1 -->|macOS| PKG["install.sh --role daemon (.pkg, arm64)<br/>(the wizard's daemon roles are Windows-only)"]
 
     TC --> OS2{"OS?"}
     OS2 -->|Windows| TCW["wizard (tunnel-client role)<br/>or the zip"]
-    OS2 -->|Linux/macOS| TCU["install.sh --role tunnel<br/>(tarball / .deb)"]
+    OS2 -->|Linux/macOS| TCU["install.sh --role tunnel<br/>(tarball / .deb)<br/>or the wizard (tunnel client only)"]
 ```
 
 Everything needs an **enrollment token** — minted in the admin UI

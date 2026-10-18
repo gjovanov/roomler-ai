@@ -14,7 +14,7 @@
  * newsletter form, and live prices. Without JavaScript the page is complete:
  * every section renders, and the newsletter block points at sign-up.
  */
-import { enrollCommands } from '../../src/utils/enrollCommands.ts'
+import { installCards } from '../../src/utils/enrollCommands.ts'
 import {
   CAPABILITIES,
   CTA,
@@ -130,16 +130,17 @@ export function renderHome(ctx: HomeCtx): string {
       `</div></div>`,
   ).join('')
 
-  const downloads = enrollCommands('agent', SITE_ORIGIN, null)
-    .map((os) => {
-      const cmd = os.blocks.find((b) => !b.isDownload)
-      return (
-        `<div class="home-card home-card--os"><h3 class="home-card__title home-os">${icon(OS_ICON[os.os]!, { size: 22 })}<span>${escapeHtml(os.title)}</span></h3>` +
-        `<p><a class="btn btn--tonal" href="${escapeHtml(DOWNLOAD.wizard[os.os]!)}">${icon('download', { size: 17 })}<span>Roomler Setup</span></a></p>` +
-        (cmd ? `<p class="home-muted">Or from a terminal:</p><pre class="home-cmd"><code>${escapeHtml(cmd.command)}</code></pre>` : '') +
-        `</div>`
-      )
-    })
+  // The wizard only where it installs the agent (FR-97 D5), as the SPA's copy.
+  const downloads = installCards(SITE_ORIGIN)
+    .map(
+      (card) =>
+        `<div class="home-card home-card--os"><h3 class="home-card__title home-os">${icon(OS_ICON[card.os]!, { size: 22 })}<span>${escapeHtml(card.title)}</span></h3>` +
+        (card.wizardUrl
+          ? `<p><a class="btn btn--tonal" href="${escapeHtml(card.wizardUrl)}">${icon('download', { size: 17 })}<span>Roomler Setup</span></a></p>`
+          : '') +
+        `<p class="home-muted">${card.wizardUrl ? 'Or from a terminal:' : 'From a terminal:'}</p><pre class="home-cmd"><code>${escapeHtml(card.command)}</code></pre>` +
+        `</div>`,
+    )
     .join('')
 
   const main = `<main id="main" class="home">

@@ -30,8 +30,10 @@ room, and mint a fresh one if it goes astray.
 
 ## 3 · Install the agent
 
-Pick your operating system. The graphical installer and the one-line form do the
-same thing — the wizard just asks the questions instead of taking flags.
+Pick your operating system. On Windows the graphical installer and the one-line
+form do the same thing — the wizard just asks the questions instead of taking
+flags. On macOS and Linux the agent installs from the one line: there the wizard
+sets up only the tunnel client.
 
 :::enroll
 :::

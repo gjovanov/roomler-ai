@@ -11,7 +11,7 @@ machine**, and **an enrollment token** that ties the two together.
 :::steps
 1. **Create a workspace.** Sign up and name your organization — the name labels every device and invite.
 2. **Mint an enrollment token.** In the dashboard, go to **Devices → Enroll device**. Tokens are single-use and short-lived.
-3. **Install the agent** on the machine you want to reach, pasting the token into the command. One line, or a graphical installer.
+3. **Install the agent** on the machine you want to reach, pasting the token into the command. One line, or on Windows a graphical installer.
 4. **Open the machine** from the Devices list. Its screen appears in a browser tab.
 :::
 
