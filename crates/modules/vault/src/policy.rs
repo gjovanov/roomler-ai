@@ -103,6 +103,16 @@ when {
   ["file", "env", "exec"].contains(context.mode)
 };"#,
     },
+    // P3-4c — the confused deputy's guard (design §8.5): a handle smuggled
+    // into any other command resolves to nothing. The device sends the
+    // program's bare name as the audience, and runs only that program.
+    Guardrail {
+        id: "guardrail:exec-only-allowed-programs",
+        why: "in `exec` mode a value is handed only to a program its secret names in \
+              `exec_allow`, by bare name: a handle smuggled into any other command is refused",
+        text: r#"forbid (principal, action == Roomler::Action::"secret:use", resource)
+when { context.mode == "exec" && !(resource.exec_allow.contains(context.audience)) };"#,
+    },
 ];
 
 /// What a policy may name of its organization.
@@ -308,6 +318,9 @@ pub struct SecretFacts {
     pub path: String,
     pub kind: String,
     pub tags: Vec<String>,
+    /// P3-4c — the programs a value may be handed to in `exec` mode, by bare
+    /// name. Empty: no program at all.
+    pub exec_allow: Vec<String>,
 }
 
 /// A session, as a `secret:use` names it.
@@ -384,7 +397,12 @@ fn session_and_secret(session: &SessionFacts, secret: &SecretFacts) -> (Value, V
     let secret_uid = uid("Secret", &format!("{}{}", secret.prefix, secret.path));
     entities.push(json!({
         "uid": secret_uid,
-        "attrs": { "path": secret.path, "kind": secret.kind, "tags": secret.tags },
+        "attrs": {
+            "path": secret.path,
+            "kind": secret.kind,
+            "tags": secret.tags,
+            "exec_allow": secret.exec_allow,
+        },
         "parents": chain.first()
             .map(|f| vec![uid("SecretFolder", &format!("{}{f}", secret.prefix))])
             .unwrap_or_default(),
@@ -440,7 +458,13 @@ impl Ask {
             }
         };
         let secret_doc = |r: &SecretFacts| {
-            bson::doc! { "prefix": &r.prefix, "path": &r.path, "kind": &r.kind, "tags": &r.tags }
+            bson::doc! {
+                "prefix": &r.prefix,
+                "path": &r.path,
+                "kind": &r.kind,
+                "tags": &r.tags,
+                "exec_allow": &r.exec_allow,
+            }
         };
         match self {
             Self::AssumeRole {
@@ -515,6 +539,12 @@ impl Ask {
                 path: r.get_str("path").ok()?.to_string(),
                 kind: r.get_str("kind").ok()?.to_string(),
                 tags: strings(r.get_array("tags").ok()?)?,
+                // P3-4c — a request recorded before the field existed named
+                // no program: decided again, its exec is refused.
+                exec_allow: match r.get_array("exec_allow") {
+                    Ok(a) => strings(a)?,
+                    Err(_) => Vec::new(),
+                },
             })
         };
         match doc.get_str("action").ok()? {
@@ -693,14 +723,17 @@ mod tests {
                 role: role.map(String::from),
                 playbook: None,
             },
+            // P3-4c — a program the secret names, so an `exec` here meets
+            // every guardrail but the one a test is about.
             secret: SecretFacts {
                 prefix: ORG.into(),
                 path: path.into(),
                 kind: "static".into(),
                 tags: tags.iter().map(|t| t.to_string()).collect(),
+                exec_allow: vec!["psql".into()],
             },
             mode: mode.into(),
-            audience: String::new(),
+            audience: "psql".into(),
             ttl_s: 900,
             device: device(os, &[]),
             approver: None,
@@ -720,6 +753,7 @@ mod tests {
                 path: path.into(),
                 kind: "static".into(),
                 tags: Vec::new(),
+                exec_allow: Vec::new(),
             },
             device: device(os, &[]),
         }
@@ -851,6 +885,66 @@ mod tests {
             )
             .allow
         );
+    }
+
+    /// P3-4c — `exec` hands a value only to a program its secret names, by
+    /// bare name; every other mode is not held to the list.
+    #[test]
+    fn exec_reaches_only_a_program_its_secret_names() {
+        let any = r#"permit (principal, action == Roomler::Action::"secret:use", resource);"#;
+        let set = set_with(&[any]);
+        let with = |audience: &str, allow: &[&str], mode: &str| {
+            let mut ask = use_secret(Some("dev"), "staging/db", &[], mode, "linux");
+            if let Ask::UseSecret {
+                secret,
+                audience: a,
+                ..
+            } = &mut ask
+            {
+                *a = audience.into();
+                secret.exec_allow = allow.iter().map(|p| p.to_string()).collect();
+            }
+            ask
+        };
+        let ok = decide(&set, &with("psql", &["psql", "kubectl"], "exec"));
+        assert!(ok.allow && ok.errors.is_empty(), "{ok:?}");
+        for (audience, allow) in [
+            ("curl", &["psql"][..]),
+            ("/usr/bin/psql", &["psql"][..]),
+            ("psql", &[][..]),
+            ("", &["psql"][..]),
+        ] {
+            let v = decide(&set, &with(audience, allow, "exec"));
+            assert!(!v.allow, "{audience:?} {allow:?}: {v:?}");
+            assert_eq!(
+                v.determining,
+                ["guardrail:exec-only-allowed-programs"],
+                "{audience:?}"
+            );
+        }
+        for mode in ["env", "file", "proxy"] {
+            assert!(decide(&set, &with("curl", &[], mode)).allow, "{mode}");
+        }
+    }
+
+    /// P3-4c — a request recorded before `exec_allow` existed reads back
+    /// naming no program, so decided again its exec is refused.
+    #[test]
+    fn a_request_recorded_without_exec_allow_reads_back_naming_no_program() {
+        let ask = use_secret(Some("dev"), "staging/db", &[], "exec", "linux");
+        let mut doc = ask.to_doc();
+        doc.get_document_mut("secret")
+            .unwrap()
+            .remove("exec_allow")
+            .expect("written today");
+        let back = Ask::from_doc(&doc).expect("still reads");
+        let Ask::UseSecret { secret, .. } = &back else {
+            panic!("{back:?}")
+        };
+        assert!(secret.exec_allow.is_empty());
+        let any = r#"permit (principal, action == Roomler::Action::"secret:use", resource);"#;
+        let v = decide(&set_with(&[any]), &back);
+        assert_eq!(v.determining, ["guardrail:exec-only-allowed-programs"]);
     }
 
     #[test]

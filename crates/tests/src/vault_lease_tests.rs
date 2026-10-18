@@ -632,3 +632,52 @@ async fn a_windows_device_is_leased_values_only_for_a_proxy() {
         );
     }
 }
+
+/// FR-90 P3-4c-1 — an `exec` lease is released only for a program its
+/// secret names in `exec_allow`, by the bare name a device asks with as the
+/// lease's audience. Any other program, a path, or none is refused by the
+/// `exec-only-allowed-programs` guardrail, recorded with its request.
+#[tokio::test]
+async fn an_exec_lease_reaches_only_a_program_its_secret_names() {
+    let app = lease_app().await;
+    let t = app.seed_tenant("vaultexec").await;
+    let value = seed_vault(&app, &t).await;
+    let main = rows(&app, "vault_secrets", doc! { "path": "db/main" }).await;
+    let id = main[0].get_object_id("_id").unwrap().to_hex();
+    let resp = app
+        .client
+        .patch(app.url(&format!("/api/tenant/{}/vault/secret/{id}", t.tenant_id)))
+        .header("Authorization", format!("Bearer {}", t.admin.access_token))
+        .json(&json!({ "exec_allow": ["psql", "kubectl"] }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let mut dev = device(&app, &t, "lease-exec", "linux", TAKES_LEASES, true).await;
+    let (sid, fence) = start(&app, &t, &mut dev, "/srv/exec", Some("dev")).await;
+    let frame = |audience: &str| {
+        json!({ "session_id": sid, "fence": fence, "secret": "db/main", "mode": "exec",
+                "audience": audience })
+    };
+    let ok = ask(&mut dev, "e-psql", frame("psql")).await;
+    assert_eq!(opened(&dev, &ok), value);
+    for (i, audience) in ["curl", "/usr/bin/psql", ""].iter().enumerate() {
+        let answer = ask(&mut dev, &format!("e-{i}"), frame(audience)).await;
+        assert_eq!(refused(&answer), "denied", "{audience:?}: {answer}");
+    }
+    let denied = rows(
+        &app,
+        "vault_audit",
+        doc! { "action": "secret:use", "decision": "deny" },
+    )
+    .await;
+    assert_eq!(denied.len(), 3);
+    for row in &denied {
+        assert_eq!(
+            row.get_str("reason").unwrap(),
+            "guardrail:exec-only-allowed-programs",
+            "{row:?}"
+        );
+        assert!(row.contains_key("request"), "replayable: {row:?}");
+    }
+}

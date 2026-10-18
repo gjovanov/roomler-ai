@@ -54,6 +54,14 @@
 //! They are reads whose gate is that policy, so the session's settings allow
 //! them ([`VAULT_TOOLS`]) instead of asking a person; anyone else who can
 //! connect here learns only what the session itself could.
+//!
+//! # `vault_exec` (FR-90 P3-4c-1)
+//!
+//! Offered with them: one command, run as the session's account with values
+//! from the vault in its environment, its output scrubbed
+//! ([`super::vault_exec`]). It hands a value to a program, so the settings
+//! never allow it: every call asks a person through `approve` first, and the
+//! vault decides each lease (`exec` mode, the program as its audience).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -224,14 +232,31 @@ pub(crate) type PeerId = u32;
 #[cfg(windows)]
 pub(crate) type PeerId = String;
 
-/// FR-90 P3-4b — what a session's vault tools ask: the vault's metadata,
-/// decided for the session's role by the vault's own `secret:list`. Each
-/// answers JSON for the model, or why not. The daemon's is its lease client
+/// FR-90 P3-4b — what a session's vault tools ask the vault: its metadata,
+/// decided for the session's role by the vault's own `secret:list`, and from
+/// P3-4c-1 the leases a command is handed. The daemon's is its lease client
 /// ([`daemon_vault`]); a test's stands in for it.
 #[async_trait::async_trait]
-pub(crate) trait VaultMeta: Send + Sync {
+pub(crate) trait VaultTools: Send + Sync {
     async fn list(&self, session: ObjectId, fence: u64, prefix: &str) -> Result<Value, String>;
     async fn describe(&self, session: ObjectId, fence: u64, secret: &str) -> Result<Value, String>;
+    /// P3-4c-1 — lease `handle` in `exec` mode for `program` (the lease's
+    /// audience), for `ttl_secs`: the lease's id, or why not.
+    #[cfg(feature = "vault")]
+    async fn lease_exec(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        handle: &super::vault_exec::Handle,
+        program: &str,
+        ttl_secs: u32,
+    ) -> Result<String, String>;
+    /// The value a held lease holds, while it is held.
+    #[cfg(feature = "vault")]
+    fn value(&self, lease_id: &str) -> Option<zeroize::Zeroizing<Vec<u8>>>;
+    /// Let go of these leases now.
+    #[cfg(feature = "vault")]
+    fn release(&self, lease_ids: &[String]);
 }
 
 /// FR-90 P3-4b — the run a toolbelt serves, and what it offers that run.
@@ -240,9 +265,13 @@ pub(crate) struct Run {
     /// The fence the session runs at here: the vault believes a session's
     /// request only at its record's fence.
     pub(crate) fence: u64,
-    /// The vault's metadata, where this device takes leases; without it the
-    /// vault tools are not offered.
-    pub(crate) vault: Option<Arc<dyn VaultMeta>>,
+    /// The vault, where this device takes leases; without it the vault tools
+    /// are not offered.
+    pub(crate) vault: Option<Arc<dyn VaultTools>>,
+    /// P3-4c-1 — where and as whom the session's commands run; none where no
+    /// command runs (Windows: no sandbox for a value there).
+    #[cfg(feature = "vault")]
+    pub(crate) exec: Option<super::vault_exec::ExecTarget>,
 }
 
 /// What every connection of one session's toolbelt shares.
@@ -250,7 +279,10 @@ struct Ctx {
     session: ObjectId,
     /// P3-4b — the run's fence, and its vault tools' answers.
     fence: u64,
-    vault: Option<Arc<dyn VaultMeta>>,
+    vault: Option<Arc<dyn VaultTools>>,
+    /// P3-4c-1 — where `vault_exec` runs a command.
+    #[cfg(feature = "vault")]
+    exec: Option<super::vault_exec::ExecTarget>,
     /// The only account a connection is taken from: the session's.
     peer: PeerId,
     pending: Arc<Pending>,
@@ -262,6 +294,21 @@ struct Ctx {
 /// leases: reads of the vault's metadata, never a value.
 const VAULT_TOOL_NAMES: [&str; 2] = ["vault_list", "vault_describe"];
 
+/// FR-90 P3-4c-1 — and its uses: a value handed to one command. Offered with
+/// the reads, and never allowed in the settings: each call asks a person
+/// first.
+#[cfg(feature = "vault")]
+const VAULT_USE_NAMES: [&str; 1] = ["vault_exec"];
+
+/// Whether `name` is one of the vault tools this build offers.
+fn is_vault_tool(name: &str) -> bool {
+    #[cfg(feature = "vault")]
+    if VAULT_USE_NAMES.contains(&name) {
+        return true;
+    }
+    VAULT_TOOL_NAMES.contains(&name)
+}
+
 /// The vault tools, as Claude Code names them: allowed in the session's
 /// settings wherever they are offered, since they read and their gate is the
 /// vault's own `secret:list`, not a person's approval.
@@ -271,7 +318,7 @@ pub(crate) const VAULT_TOOLS: [&str; 2] =
 /// FR-90 P3-4b — the daemon's vault for a run's toolbelt: its lease client,
 /// where the primary connection takes leases; otherwise none, and the vault
 /// tools are not offered.
-pub(crate) fn daemon_vault() -> Option<Arc<dyn VaultMeta>> {
+pub(crate) fn daemon_vault() -> Option<Arc<dyn VaultTools>> {
     #[cfg(feature = "vault")]
     if crate::vault::CLIENT.takes_leases() {
         return Some(Arc::new(DaemonVault));
@@ -296,7 +343,7 @@ fn vault_why(e: crate::vault::LeaseError) -> String {
 
 #[cfg(feature = "vault")]
 #[async_trait::async_trait]
-impl VaultMeta for DaemonVault {
+impl VaultTools for DaemonVault {
     async fn list(&self, session: ObjectId, fence: u64, prefix: &str) -> Result<Value, String> {
         let l = crate::vault::CLIENT
             .list(session, fence, prefix)
@@ -311,6 +358,37 @@ impl VaultMeta for DaemonVault {
             .await
             .map_err(vault_why)?;
         Ok(json!(s))
+    }
+
+    async fn lease_exec(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        handle: &super::vault_exec::Handle,
+        program: &str,
+        ttl_secs: u32,
+    ) -> Result<String, String> {
+        let info = crate::vault::CLIENT
+            .request(crate::vault::LeaseAsk {
+                session_id: session,
+                fence,
+                secret: handle.secret.clone(),
+                field: handle.field.clone(),
+                mode: "exec".into(),
+                audience: program.into(),
+                ttl_secs,
+            })
+            .await
+            .map_err(vault_why)?;
+        Ok(info.lease_id)
+    }
+
+    fn value(&self, lease_id: &str) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+        crate::vault::CLIENT.with_value(lease_id, |v| zeroize::Zeroizing::new(v.to_vec()))
+    }
+
+    fn release(&self, lease_ids: &[String]) {
+        crate::vault::CLIENT.release(lease_ids);
     }
 }
 
@@ -392,6 +470,8 @@ pub(crate) fn open(
         session: run.session,
         fence: run.fence,
         vault: run.vault,
+        #[cfg(feature = "vault")]
+        exec: run.exec,
         peer: uid,
         pending: Arc::clone(&pending),
         events,
@@ -464,6 +544,8 @@ pub(crate) fn open(
         session,
         fence: run.fence,
         vault: run.vault,
+        #[cfg(feature = "vault")]
+        exec: run.exec,
         peer,
         pending: Arc::clone(&pending),
         events,
@@ -565,9 +647,11 @@ fn approve_tool() -> Value {
 }
 
 /// FR-90 P3-4b — the vault tools, as `tools/list` describes them: offered
-/// only where this device takes leases, metadata only.
-fn vault_tools() -> [Value; 2] {
-    [
+/// only where this device takes leases. The reads, and from P3-4c-1 the
+/// use: `vault_exec`.
+fn vault_tools() -> Vec<Value> {
+    #[cfg_attr(not(feature = "vault"), allow(unused_mut))]
+    let mut tools = vec![
         json!({
             "name": "vault_list",
             "description": "Lists the Roomler vault secrets this session's role may list, under a \
@@ -595,7 +679,39 @@ fn vault_tools() -> [Value; 2] {
             },
             "annotations": {"readOnlyHint": true},
         }),
-    ]
+    ];
+    #[cfg(feature = "vault")]
+    tools.push(json!({
+        "name": "vault_exec",
+        "description": "Runs one command with values from the Roomler vault in its environment, \
+                        as this session's account, from its folder. argv[0] is the program's bare \
+                        name: it must be on each secret's exec_allow, and installed in the \
+                        system's own directories. env maps each variable to a secret (a path, or \
+                        rrn:<org>:secret:<path>, with #<field> for a structured secret's field). \
+                        The output comes back with each value replaced by [vault:NAME]. A person \
+                        approves every call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "argv": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "description": "the program's bare name, then its arguments",
+                },
+                "env": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "NAME → secret, such as {\"PGPASSWORD\": \"db/main#password\"}",
+                },
+                "timeout_s": {"type": "integer", "minimum": 1, "maximum": 300},
+            },
+            "required": ["argv", "env"],
+        },
+        "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
+    }));
+    tools
 }
 
 /// One vault tool call, from asking to answering: what the vault says, as
@@ -631,6 +747,17 @@ async fn ask_vault(ctx: &Ctx, name: &str, args: &Value) -> Result<Value, String>
     let Some(vault) = &ctx.vault else {
         return Err("this device offers no vault".into());
     };
+    #[cfg(feature = "vault")]
+    if name == "vault_exec" {
+        return super::vault_exec::call(
+            vault.as_ref(),
+            ctx.session,
+            ctx.fence,
+            ctx.exec.as_ref(),
+            args,
+        )
+        .await;
+    }
     if name == "vault_list" {
         let prefix = args.get("prefix").and_then(Value::as_str).unwrap_or("");
         return vault.list(ctx.session, ctx.fence, prefix).await;
@@ -743,7 +870,7 @@ async fn on_message(
         }
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            let vault = ctx.vault.is_some() && VAULT_TOOL_NAMES.contains(&name);
+            let vault = ctx.vault.is_some() && is_vault_tool(name);
             if name != "approve" && !vault {
                 error(&id, -32602, "unknown tool")
             } else {
