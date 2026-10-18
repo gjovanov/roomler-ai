@@ -241,7 +241,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:2615`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:191`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:341`, wired at `main.rs:3785`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:341`, wired at `main.rs:3804`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -360,7 +360,7 @@ macOS agent, whose watchers never send them; `supports_clipboard` on a root
 Linux daemon with no clipboard to reach. Nothing at all governed
 Ctrl+Alt+Del. Since P0c the daemon takes out what the host cannot keep and
 says why, in `AgentCaps.unavailable`
-([`models.rs:529`](../crates/remote_control/src/models.rs#L529)).
+([`models.rs:534`](../crates/remote_control/src/models.rs#L534)).
 
 ```mermaid
 flowchart LR
@@ -383,11 +383,11 @@ is tested on every OS.
 
 | Feature | When | What the hello says | What the viewer does |
 |---|---|---|---|
-| `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3064`](../agents/roomlerd/src/signaling.rs#L3064)); `no-backend` | the receive-audio toggle is off, with the device's reason |
+| `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3071`](../agents/roomlerd/src/signaling.rs#L3071)); `no-backend` | the receive-audio toggle is off, with the device's reason |
 | `audio` | Linux with no way to the computer's sound (FR-97 P3c, §5.1c) | `audio` empty; `no-sound-server` (no Pulse client library), `no-session` (a root build without the session helper), or `no-monitor` (`ROOMLERD_AUDIO_SESSION=0` with nothing named) | the same |
 | `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:726`](../agents/roomlerd/src/encode/caps.rs#L726)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone reports copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
-| `sas` | Windows, Linux | `keys-only`: the button types three ordinary keys. Windows' lock and sign-in screens ignore them (until P4a's `SendSAS`); Linux desktops bind them, GNOME and KDE to log out | the button stays, and says what the keys reach |
+| `sas` | Windows, Linux | `keys-only`: the button types three ordinary keys. Windows' lock and sign-in screens ignore them; Linux desktops bind them, GNOME and KDE to log out. A Windows host that can send the real sequence advertises `input: sas` instead and drops this entry (P4a, §5.1e) | the button stays, and says what the keys reach |
 | `sas` | macOS | `not-applicable`: the chord means nothing there | the button is hidden |
 
 ⚠️ **The lists still decide what works.** An empty `audio` list disabled the
@@ -414,7 +414,7 @@ of the process, so a root daemon started outside every session keeps its
 documents ([`remote-apps.md`](remote-apps.md)).
 
 The keys are matched by equality (`Unavailable::KEYS`,
-[`models.rs:548`](../crates/remote_control/src/models.rs#L548)) and the wire
+[`models.rs:553`](../crates/remote_control/src/models.rs#L553)) and the wire
 shape is locked by `unavailable_wire_shape_is_locked`. FR-97's census
 (`scripts/fr97-caps-census.sh`) counts the map by OS as `key:code`, beside
 the words.
@@ -523,9 +523,9 @@ The pump ([`peer.rs:12441`](../agents/roomlerd/src/peer.rs#L12441)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5421`](../agents/roomlerd/src/peer.rs#L5421); the viewer parses it
-at [`useRemoteControl.ts:1356`](../ui/src/composables/useRemoteControl.ts#L1356)
+at [`useRemoteControl.ts:1357`](../ui/src/composables/useRemoteControl.ts#L1357)
 and puts it on the toggle's title
-([`RemoteControl.vue:3127`](../ui/src/views/remote/RemoteControl.vue#L3127)).
+([`RemoteControl.vue:3132`](../ui/src/views/remote/RemoteControl.vue#L3132)).
 
 | `code` | Means |
 |---|---|
@@ -589,6 +589,78 @@ The inhibitor lives exactly as long as its fd: logind drops it when the fd
 closes, so a daemon that crashes leaves nothing pinned. `systemd-inhibit
 --list` shows it (`roomlerd`, `block`) only while a session or an SSH or exec
 run is live.
+
+### 5.1e Ctrl+Alt+Del that reaches the lock screen (FR-97 P4a)
+
+The browser cannot capture Ctrl+Alt+Del, so the viewer has a button. Until
+P4a it typed three ordinary keys. Apps on the desktop get those, but the
+Windows lock and sign-in screens do not: they answer only the **secure
+attention sequence** (SAS), which the kernel raises for the physical chord and
+`SendSAS` raises for software. On a machine whose policy requires Ctrl+Alt+Del
+at sign-in, the viewer could see the lock screen and never get past it.
+
+`SendSAS(FALSE)` is honoured only from a **service process**, and only where
+the `SoftwareSASGeneration` policy lets services. ⚠️ **Measured: the
+SystemContext worker cannot call it for itself.** It runs as SYSTEM, but in the
+person's session, a child of the service and not the service. Its own
+`SendSAS(FALSE)` returned and logged, and the lock screen never moved. So the
+SCM host, the service process in session 0, sends it, and the worker only asks.
+The daemon offers the real sequence only when both of these hold:
+
+| Condition | Where it holds | Read from |
+|---|---|---|
+| The worker **can ask the service** | the SystemContext worker of an SCM install: it is SYSTEM, the only account the relay lets signal, and the host handed it the relay (`--sas-event`). Not a per-user install, which has no service; not an attended worker, which runs as the signed-in person | the process's own token (`worker_role::probe_self`) and its argv |
+| The **`SoftwareSASGeneration`** policy lets services | `1` (services) or `3` (services and Ease of Access). Absent, Windows lets only Ease of Access applications | `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System` |
+
+```mermaid
+sequenceDiagram
+    participant V as viewer
+    participant W as worker (SYSTEM, the person's session)
+    participant H as SCM host (the service, session 0)
+    Note over W: every hello: input sas,<br/>or keys-only with the missing half
+    V->>W: {t: sas}, only if the hello said sas
+    W->>W: the arbiter (input floor + permission),<br/>then availability() again
+    W->>H: SetEvent on Global\roomler-sas-pid<br/>(DACL: SYSTEM only)
+    H->>H: the policy again, then SendSAS(FALSE)
+    Note over H: the lock screen asks for the password
+```
+
+- **The decision is one pure function**
+  ([`sas.rs:97`](../agents/roomlerd/src/input/sas.rs#L97)), compiled on every
+  OS so the lanes that never run Windows tests check it. It is made at every
+  announcement ([`signaling.rs:6303`](../agents/roomlerd/src/signaling.rs#L6303)),
+  and the heartbeat re-announces the moment its answer changes, so a policy a
+  GPO refresh changes reaches the server within a beat. Where it says no, the
+  `keys-only` entry stays and its reason names the half that is missing.
+- **The viewer sends `{t: "sas"}` only to an agent that advertises `sas`**
+  ([`ctrlAltDel.ts:22`](../ui/src/composables/ctrlAltDel.ts#L22)): an older
+  agent cannot parse the frame. The title then says the real one reaches the
+  lock and sign-in screens.
+- **The frame goes through the input arbiter like a key**, so it needs the
+  input floor and the session's input permission, as typing does. The injector
+  then checks again
+  ([`enigo_backend.rs:277`](../agents/roomlerd/src/input/enigo_backend.rs#L277)):
+  the policy can change between the hello and the click, and a viewer is not
+  trusted to have read the hello.
+- **The relay** ([`sas_relay.rs:43`](../agents/roomlerd/src/win_service/sas_relay.rs#L43))
+  is one named, auto-reset event per host, `Global\roomler-sas-<host pid>`,
+  whose protected DACL grants SYSTEM alone. A process that is not SYSTEM cannot
+  even open it (a test pins this), so an attended worker cannot ask for a SAS
+  and says `keys-only`. A SAS is what the physical chord raises: a SYSTEM
+  process that asks for one gains nothing it lacked. Signals that arrive while
+  one is being answered coalesce into one more, never a queue.
+- **The host re-checks the policy before it sends**
+  ([`sas.rs:139`](../agents/roomlerd/src/input/sas.rs#L139)), never trusting
+  that the worker did.
+- **`sas.dll` is loaded when the host sends, never imported**
+  ([`sas.rs:224`](../agents/roomlerd/src/input/sas.rs#L224)). A binary that
+  imports a DLL some Windows edition lacks does not start at all. It is loaded
+  from System32 only (`LOAD_LIBRARY_SEARCH_SYSTEM32`), so a SYSTEM process can
+  never load a copy planted beside the binary.
+- ⚠️ **The policy is read, never written.** It is a security setting, and on
+  a managed laptop it is the organisation's. Measured before the build
+  (2026-10-18, read-only over `roomler exec`), the three corporate laptops in
+  the fleet all set it to `1`.
 
 ### 5.2 Encoder selection
 
@@ -1274,7 +1346,7 @@ org or a device that sets nothing.
 | Stored in | `TenantSettings.rc_session` ([`tenant.rs:116`](../crates/db/src/models/tenant.rs#L116)) | `rc_clipboard`, `rc_files`, `rc_audio` in the device's `config.toml` |
 | Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:2901`](../crates/localapi/src/lib.rs#L2901)); live, no restart |
 | Pushable by a server | — | **never**: absent from `DesiredConfig`, so a compromised server cannot switch back on what the owner switched off |
-| Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:506`](../crates/remote_control/src/models.rs#L506)) and re-announced on the heartbeat when it changes |
+| Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:511`](../crates/remote_control/src/models.rs#L511)) and re-announced on the heartbeat when it changes |
 
 ```mermaid
 sequenceDiagram
@@ -1307,7 +1379,7 @@ session goes without it, with a reason:
 
 - ⚠️ **The device enforces the floor itself.** The hub's strip is so the viewer can say why before
   the person clicks. The agent masks the grant ([`mask`, `session_policy.rs:128`](../agents/roomlerd/src/session_policy.rs#L128),
-  applied at [`signaling.rs:3077`](../agents/roomlerd/src/signaling.rs#L3077)) the moment the consent
+  applied at [`signaling.rs:3084`](../agents/roomlerd/src/signaling.rs#L3084)) the moment the consent
   mode resolves, before anything reads it. A request carrying `FILES` with no policy at all, as from a
   bypassed hub, is masked to no `FILES` when the floor says `off`
   (`the_device_floor_holds_when_the_server_sends_no_policy`). Field-verified on 0.4.136, with the red
@@ -1540,10 +1612,10 @@ sequenceDiagram
 | | |
 |---|---|
 | Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:12362`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:12340`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:3535`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:12371`) |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:3542`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:12371`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:555`), on both ends' `rc:terminate` and in the `session_ended` audit row |
-| Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:284`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:649`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:348`, #2326) |
+| Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:285`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:650`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:349`, #2326) |
 | Tests | the predicate on recorded offers (`codec_cap_tests` in `peer.rs`); the field's own offer, which `create_answer` fails on, is the one it refuses (`agents/roomlerd/tests/dc_track_codec.rs`); who may name the code (`only_the_device_names_no_common_codec`, `hub.rs:4272`); the real agent through a real server, with an H.264 offer as the control (`crates/tests/src/rc_no_common_codec_tests.rs:147`) |
 
 ⚠️ **The consent prompt has already been answered** by the time the offer
@@ -1603,7 +1675,7 @@ own `rc:terminate`), not on the controller-ended one, where `ended_at` is alread
 hears the terminate and `merge_live_stats` matches nothing. So a session with no tick after the
 observation — overwhelmingly a short one — recorded none, which the freeze reads as `unknown`. Since
 P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:944`)
-and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2169`), by the
+and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2176`), by the
 same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:6119`) queues the sample on
 **the peer's own sender**, the FR-43 seam the peer was built with (`peer.rs:285`) — the loop's outbound
 queue for its own session, flushed to the WS one hop later, or the delegation channel for a delegated
@@ -1681,7 +1753,7 @@ flowchart LR
 
 | mark | waits on | set at | server record | persisted (part 4) |
 |---|---|---|---|---|
-| `ws_ready` | the signalling socket — re-keyed and redialled when the device's org differs from the page's, up to `RC_PREFLIGHT_WS_WAIT_MS` (`useRemoteControl.ts:253`) | `connect()` pre-flight | — | ✅ |
+| `ws_ready` | the signalling socket — re-keyed and redialled when the device's org differs from the page's, up to `RC_PREFLIGHT_WS_WAIT_MS` (`useRemoteControl.ts:254`) | `connect()` pre-flight | — | ✅ |
 | `turn_ready` | `GET /turn/credentials` | pre-flight | — | ✅ |
 | `probes_ready` | the loopback-relay probe + the browser's decode-capability probes (cached since #861: 28 ms cold, 7 ms warm) | pre-flight | — | ✅ |
 | `request_sent` | nothing — the instant `rc:session.request` left | `connect()` | — | ✅ |
@@ -1703,7 +1775,7 @@ that dominate a relayed connect (a DERP-relayed LAN pair measured on 2026-08-29:
 ⚠️ **Marks are per ATTEMPT, never per connect.** A recorder shared across the
 ladder would let the fast retry overwrite the lost attempt's marks and report an
 18 s connect as a 3 s one — hiding the exact defect being hunted. Each retry
-calls `beginAttempt()` (`useRemoteControl.ts:8346`) and gets a fresh recorder.
+calls `beginAttempt()` (`useRemoteControl.ts:8347`) and gets a fresh recorder.
 
 ⚠️ **An unreached mark is the finding.** The console line prints it as
 `<name>:—` and the record omits the key; the first missing mark
@@ -1715,7 +1787,7 @@ phases**. A single total could not tell them apart.
 #### 12.1.2 The phase-aware bound (part 1)
 
 One timeout used to guard two different questions. `signalingTimeoutFor(phase)`
-(`useRemoteControl.ts:237`) is total over `RcPhase`, so a new phase must declare
+(`useRemoteControl.ts:238`) is total over `RcPhase`, so a new phase must declare
 its own bound instead of inheriting the ICE-sized one:
 
 | phase | waits on | bound | why |
@@ -1761,7 +1833,7 @@ sequenceDiagram
 
 The viewer surfaces the code (`rcErrorMessage`) — a first connect fails fast
 with an attributable reason, and an attempt already inside the ladder advances
-on it instead (`isRetryableRcErrorCode`, `useRemoteControl.ts:334`) — so the
+on it instead (`isRetryableRcErrorCode`, `useRemoteControl.ts:335`) — so the
 undeliverable case never waits for any timer. ⚠️ **What the server genuinely
 cannot see** is the case
 actually observed in the field: a session that *reached* the agent, gathered
@@ -1806,7 +1878,7 @@ leaves **no server row at all** (the request never reached a hub), and
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
-the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4284`)
+the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4285`)
 posts **one record**: the console line, persisted.
 
 ```jsonc
@@ -1839,7 +1911,7 @@ posts **one record**: the console line, persisted.
 | outcome | means | snackbar |
 |---|---|---|
 | `first_frame` | the attempt painted; `ttff_ms` is set | per the rules above |
-| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:3942`) | stall warning |
+| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:3943`) | stall warning |
 | `closed` | the operator hung up, the view unmounted, or a terminal `rc:error` failed it (`error_code` says which) | none |
 | `retried` | the ladder advanced past a live attempt for another reason — a transient `rc:error` it rides, an ICE failure, dead air before the first frame (`scheduleReconnect`, `:7157`) | none |
 

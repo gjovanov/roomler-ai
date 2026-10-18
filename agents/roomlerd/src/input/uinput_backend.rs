@@ -697,6 +697,8 @@ impl InputInjector for UinputInjector {
                 Ok(())
             }
             InputMsg::Heartbeat { .. } => Ok(()),
+            // FR-97 P4a — Windows only; a Linux agent never advertises `sas`.
+            InputMsg::Sas => Ok(()),
         }
     }
 

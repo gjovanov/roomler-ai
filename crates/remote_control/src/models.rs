@@ -282,6 +282,11 @@ pub struct AgentCaps {
     ///   (`mouse_rel`) and presses where the pointer is (`mouse_press`). A
     ///   viewer sends either only to an agent advertising it, because an
     ///   older agent cannot parse them.
+    /// * `sas` — FR-97 P4a: the agent sends Windows' secure attention sequence
+    ///   (`SendSAS`) for `{"t":"sas"}`, which the lock and sign-in screens
+    ///   answer where three ordinary keys reach nothing. Advertised only by a
+    ///   SYSTEM worker on a host whose policy lets services send it; a viewer
+    ///   sends it only to an agent advertising it.
     ///
     /// Empty / unset = a pre-P6 agent → the P3 single-holder rule stays.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

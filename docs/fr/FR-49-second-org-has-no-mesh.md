@@ -23,7 +23,7 @@ let mut entry = crate::config::OrgEntry {
     overlay_mode: crate::config::OrgOverlayMode::Off,
 ```
 
-`agents/roomlerd/src/main.rs:1738-1712` — `--overlay` exists, and sets the
+`agents/roomlerd/src/main.rs:1757-1731` — `--overlay` exists, and sets the
 **primary's** flag regardless of which identity was just enrolled:
 
 ```rust
@@ -44,8 +44,8 @@ device is genuinely, silently absent from the second org's mesh, and:
 
 | Surface | What it shows | What it omits |
 |---|---|---|
-| `roomlerd enroll` output (`main.rs:1747`) | "Enrolled into an ADDITIONAL org as …" + "manage them with `roomlerd org ls`" | any mention of the mesh |
-| `roomlerd org ls` (`main.rs:1926`) | LABEL · PRIMARY · ENABLED · ORG · SERVER | **no overlay column** |
+| `roomlerd enroll` output (`main.rs:1766`) | "Enrolled into an ADDITIONAL org as …" + "manage them with `roomlerd org ls`" | any mention of the mesh |
+| `roomlerd org ls` (`main.rs:1945`) | LABEL · PRIMARY · ENABLED · ORG · SERVER | **no overlay column** |
 | `roomler status` (`localapi::OrgStatus`) | label · agent id · enabled · connected · stopped · update-ignored | **no overlay field** — the org's WS *is* connected, so it reads healthy |
 | `roomler peers` (`localclient.rs:1398`) | one `── org: <label> ──` section per org **that has peers** | an overlay-off org produces **no section at all** — identical to an org whose peers are simply offline |
 | the dashboard | the device row, online | it is the server's view; the server was never told |
@@ -62,7 +62,7 @@ must not render identically.
 ## And there is no supported way to turn it on
 
 `roomlerd org` offers `ls · rm · enable · disable · set-primary`
-(`main.rs:548-569`). None of them touches `overlay_mode`. The only path is to
+(`main.rs:555-576`). None of them touches `overlay_mode`. The only path is to
 open `config.toml` — the file that also holds the agent token and the SSH host
 private key, is written atomically with a `.prev` sibling, and on Windows lives
 under a machine-global ACL-restricted directory. Hand-editing it is not a

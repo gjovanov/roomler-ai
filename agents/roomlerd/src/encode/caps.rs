@@ -781,7 +781,9 @@ pub(crate) fn with_honest_words(mut caps: AgentCaps, facts: &HostFacts) -> Agent
     }
     // The viewer's button types three ordinary keys everywhere.
     let sas = match facts.os {
-        // Until FR-97 P4a calls SendSAS.
+        // A host that may send the real one (FR-97 P4a: SYSTEM, and a policy
+        // that lets services) says so live, in the announcement, and drops
+        // this entry; the rest keep it with the reason for theirs.
         OsKind::Windows => Unavailable::new(
             "keys-only",
             "Ctrl+Alt+Del is sent as ordinary keys: apps on the desktop get it, but the Windows lock and sign-in screens do not",

@@ -68,6 +68,10 @@ pub mod arbiter;
 // (`rc:input-reach`) instead of injecting into nothing in silence.
 pub mod reach;
 
+// FR-97 P4a — the real Ctrl+Alt+Del (`SendSAS`) where Windows lets this
+// process send it. The decision compiles everywhere; the call is Windows-only.
+pub mod sas;
+
 #[cfg(feature = "enigo-input")]
 pub mod enigo_backend;
 
@@ -386,6 +390,14 @@ pub enum InputMsg {
         seq: u64,
         ts_ms: u64,
     },
+    /// FR-97 P4a — the secure attention sequence: what the physical
+    /// Ctrl+Alt+Del raises, and what the Windows lock and sign-in screens
+    /// answer where three ordinary keys reach nothing. `SendSAS` on a host
+    /// that can send it ([`sas::availability`]); nothing anywhere else.
+    ///
+    /// ⚠️ Sent only to an agent that advertises `sas`: an older agent cannot
+    /// parse it.
+    Sas,
 }
 
 pub trait InputInjector: Send {
@@ -708,6 +720,17 @@ mod tests {
         // Whole counts only: the viewer carries the fraction, so a float is a
         // viewer bug, refused rather than truncated here.
         assert!(serde_json::from_str::<InputMsg>(r#"{"t":"mouse_rel","dx":0.5,"dy":0}"#).is_err());
+    }
+
+    /// FR-97 P4a — the viewer's word for the real Ctrl+Alt+Del, both ways.
+    #[test]
+    fn fr97_p4a_the_wire_spells_sas() {
+        let sas: InputMsg = serde_json::from_str(r#"{"t":"sas"}"#).unwrap();
+        assert_eq!(sas, InputMsg::Sas);
+        assert_eq!(
+            serde_json::to_string(&InputMsg::Sas).unwrap(),
+            r#"{"t":"sas"}"#
+        );
     }
 
     /// FR-109 — the kill switch reads only an explicit false word; unset or

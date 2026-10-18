@@ -1490,6 +1490,10 @@ async fn connect_once(
     // FR-92 — and whether the hello advertised keep-busy, so a flipped
     // `keep_busy_enabled` reaches the server within a beat.
     let mut last_announced_keep_busy = hello_caps.input.iter().any(|w| w == "keep-busy");
+    // FR-97 P4a — and whether it advertised the real Ctrl+Alt+Del, so a
+    // policy a GPO refresh changes reaches the server within a beat, instead
+    // of a viewer sending a sequence the host may no longer send.
+    let mut last_announced_sas = hello_caps.input.iter().any(|w| w == "sas");
     // FR-93 P2b — and the desktop brief it carried, so a login, a logout or
     // the greeter reaches the server within a beat.
     let mut last_announced_desktop = hello_caps.desktop.clone();
@@ -2055,6 +2059,7 @@ async fn connect_once(
                     .flatten()
                     .unwrap_or_else(record_caps);
                 let keep_busy_now = crate::keep_busy::advertised();
+                let sas_now = sas_advertised();
                 let desktop_now = crate::desktop_brief::current();
                 let exec_system_now = crate::exec_service::advertised_for(&cfg.agent_id);
                 let ssh_system_now =
@@ -2071,6 +2076,7 @@ async fn connect_once(
                 let caps = if caps_now == last_announced_permissions
                     && record_now == last_announced_record
                     && keep_busy_now == last_announced_keep_busy
+                    && sas_now == last_announced_sas
                     && desktop_now == last_announced_desktop
                     && exec_system_now == last_announced_exec_system
                     && ssh_system_now == last_announced_ssh_system
@@ -2082,6 +2088,7 @@ async fn connect_once(
                     last_announced_permissions = caps_now.clone();
                     last_announced_record = record_now.clone();
                     last_announced_keep_busy = keep_busy_now;
+                    last_announced_sas = sas_now;
                     last_announced_desktop = desktop_now;
                     last_announced_exec_system = exec_system_now;
                     last_announced_ssh_system = ssh_system_now;
@@ -6286,6 +6293,24 @@ fn stub_caps(multi_org_tun: bool) -> AgentCaps {
     if crate::input::advertises_mouse_rel() {
         caps.input.push("mouse-rel".into());
     }
+    // FR-97 P4a — the real Ctrl+Alt+Del where this process may send it: it
+    // runs as SYSTEM (the SystemContext worker) and the policy lets services.
+    // Live like the words above, and the heartbeat compares it
+    // (`sas_advertised`), so a GPO refresh that changes the policy is news
+    // within a beat. Elsewhere the button keeps typing keys, and the reason
+    // says which half is missing.
+    #[cfg(target_os = "windows")]
+    match crate::input::sas::availability() {
+        Ok(()) => {
+            caps.input.push("sas".into());
+            caps.unavailable.remove("sas");
+        }
+        Err(refusal) => {
+            if let Some(entry) = caps.unavailable.get_mut("sas") {
+                entry.reason = refusal.reason().into();
+            }
+        }
+    }
     // FR-93 P2b — the desktop a controller would see now, read from the
     // refresher's cache (never logind on this path). Live, like the words
     // above: the heartbeat re-announces when it changes.
@@ -6316,6 +6341,20 @@ fn stub_caps(multi_org_tun: bool) -> AgentCaps {
         caps.rpc.push(RpcCap::LockOnEnd.wire().to_string());
     }
     caps
+}
+
+/// FR-97 P4a — whether this process may send the real Ctrl+Alt+Del now, the
+/// `sas` word `stub_caps` puts in the hello. The heartbeat compares it, so a
+/// changed policy is news within a beat.
+fn sas_advertised() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        crate::input::sas::availability().is_ok()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
 }
 
 /// FR-99 P1b — the `privacy-*` words in an `rpc` list, in order: what the

@@ -270,21 +270,19 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<Job>) {
         // chars as real virtual keys, not VK_PACKET. If `dispatch=err`, injection
         // itself failed. If letters arrive as `path=key(real-VK)` (not key_text),
         // the deployed browser is sending VK codes → fix is browser-side.
-        if log_key {
-            if let Some(desc) = &key_diag {
-                let dispatch = match &dispatch_result {
-                    Ok(_) => "ok".to_string(),
-                    Err(e) => format!("err: {e}"),
-                };
-                tracing::info!(
-                    seq = key_events,
-                    detail = %desc,
-                    dispatch = %dispatch,
-                    worker_integrity = %self_integrity_label(),
-                    foreground = %foreground_window_diag(),
-                    "system-context input: key dispatch diagnostic (rc.121)"
-                );
-            }
+        if log_key && let Some(desc) = &key_diag {
+            let dispatch = match &dispatch_result {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("err: {e}"),
+            };
+            tracing::info!(
+                seq = key_events,
+                detail = %desc,
+                dispatch = %dispatch,
+                worker_integrity = %self_integrity_label(),
+                foreground = %foreground_window_diag(),
+                "system-context input: key dispatch diagnostic (rc.121)"
+            );
         }
         match dispatch_result {
             Ok(_) => {

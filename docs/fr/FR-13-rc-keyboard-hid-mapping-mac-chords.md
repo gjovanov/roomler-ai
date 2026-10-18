@@ -15,10 +15,10 @@
 ## Bug A — the `Key::Other` fallback reinterprets HID usages as native keycodes
 
 The viewer maps `KeyboardEvent.code` → USB-HID usage
-(`kbdCodeToHid`, `ui/src/composables/useRemoteControl.ts:9853` —
+(`kbdCodeToHid`, `ui/src/composables/useRemoteControl.ts:9854` —
 `CapsLock → 0x39` is **correct**, locked by
 `useRemoteControl.spec.ts:234`). The agent maps HID → enigo `Key` in
-`hid_to_key` (`agents/roomlerd/src/input/enigo_backend.rs:493-574`) —
+`hid_to_key` (`agents/roomlerd/src/input/enigo_backend.rs:514-595`) —
 which has **no arm for 0x39**, so the caller falls through
 (`enigo_backend.rs:210-218`) to:
 
@@ -42,7 +42,7 @@ enigo 0.6.1 + core-graphics 0.25): `Pause` → **changes host volume** (mac),
 `Numpad3`/`Numpad5` → **opens the Start menu** (`VK_LWIN`/`VK_RWIN`, Windows),
 `Numpad7` → **VK_SLEEP sleeps the host** (Windows), NumLock/ScrollLock/
 PrintScreen and the whole numpad type wrong letters/digits on both.
-The composable's comment at `useRemoteControl.ts:9915-9917` ("works enough")
+The composable's comment at `useRemoteControl.ts:9916-9918` ("works enough")
 encodes the wrong assumption.
 
 ### Fix A (agent — one release)
@@ -51,11 +51,11 @@ encodes the wrong assumption.
    enigo, correct on all three OSes), numpad digits/operators
    (0x54–0x63), `IntlBackslash`, `ContextMenu`; platform-gate
    PrintScreen/Pause/NumLock/ScrollLock with the existing `0x49` cfg
-   precedent (`enigo_backend.rs:545-550`).
+   precedent (`enigo_backend.rs:566-571`).
 2. **Kill the unsound fallback**: unmapped HID → `tracing::debug!` + drop,
    never `Key::Other` (a HID usage is never a valid VK/CGKeyCode/keysym).
 3. Regression lock: extend `hid_table_covers_navigation_keys`
-   (`enigo_backend.rs:715-722`) and add a `BROWSER_EMITTED_HID` table test
+   (`enigo_backend.rs:736-743`) and add a `BROWSER_EMITTED_HID` table test
    asserting **every code `kbdCodeToHid` can emit maps to `Some(_)`** — the
    contract that silently broke.
 
@@ -67,7 +67,7 @@ SIGINT in a terminal and `pageDown:` in Cocoa text views, not copy/paste.
 There is no Ctrl→Cmd translation anywhere in the path.
 
 Key finding that shrinks the fix: **the hard half already works.** The
-deferred Ctrl+V flow (`useRemoteControl.ts:8005-8046`) pushes the browser
+deferred Ctrl+V flow (`useRemoteControl.ts:8006-8047`) pushes the browser
 clipboard to the host over the clipboard DC (arboard → NSPasteboard on mac,
 ack-gated) *before* replaying the chord — only the final replayed chord is
 wrong. Ctrl+C's only mechanism is the keystroke itself, so the host clipboard
