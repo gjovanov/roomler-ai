@@ -439,7 +439,7 @@ What it changes here:
 
 | Lever | Before FR-112 | Now |
 |---|---|---|
-| frame rate | a constant 30 | 60, paced by `SoftwarePace` (`encode/encode_pressure.rs:239`) in 5-fps steps, never below 30: down at once, up only with 2.5 fps of headroom (P2d) |
+| frame rate | a constant 30 | 60, paced by `SoftwarePace` (`encode/encode_pressure.rs:242`) in 5-fps steps, never below 30: down at once, up only with 2.5 fps of headroom (P2d) |
 | bitrate base | `w·h·fps·0.20` at the target | `bitrate_base_for_fps` (`encode/mod.rs:709`): the old figure at 30, ×√(fps/30) at the rate the pump runs at |
 | OpenH264's per-frame budget | configured for 30 whatever the rate | `set_frame_rate`: the rate the pump runs at, the keyframe period kept at 2 s |
 | the auto-fps-cap (a software encoder dropped to 30) | always | only where the tier is off: Windows and macOS by default |
@@ -447,9 +447,9 @@ What it changes here:
 ⚠️ The pace steps per heartbeat window on the encode cost alone. A host whose capture is the costly stage is not
 paced by it, and is limited by its own loop as before.
 
-⚠️ **A step up waits for headroom** (P2d, `SW_PACE_UP_MARGIN_FPS`, `encode/encode_pressure.rs:249`). FR-1's
+⚠️ **A step up waits for headroom** (P2d, `SW_PACE_UP_MARGIN_FPS`, `encode/encode_pressure.rs:255`). FR-1's
 `FpsPace` was meant to hold a pace until the estimate moved a full step, but it compared two 5-fps steps, which
-always differ by one. So on 0.4.142 an estimate hovering on a step boundary moved the pace every window it
+always differ by at least a whole step. So on 0.4.142 an estimate hovering on a step boundary moved the pace every window it
 crossed (a field trace: 55 → 50 → 55 → 50 → 45 → 50, five moves in ten windows). The software pace now steps down at
 once and up only when the encoder clears the higher step by 2.5 fps. The hardware pace keeps margin 0 until it
 is measured on hardware ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)).
