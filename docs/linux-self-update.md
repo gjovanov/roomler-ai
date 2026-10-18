@@ -225,7 +225,7 @@ sequenceDiagram
     Note over P: the timer fires too: 5 min after boot (at once if started later), then every 6 h
     P->>U: start roomler-update.service
     U->>U: consume/move-aside the wake; space ≥60 s from the last run; the opt-out; the cooldown
-    U->>U: check_once, then download_asset → a FRESH private dir (the pinned release key)
+    U->>U: check_once, then download_asset → a FRESH private dir (the pinned release key, then the version inside it = the tag's: FR-97 P6a)
     U->>U: install as root: apt-get / dpkg, or the tarball
     Note over D: notices its binary was replaced, restarts onto it once idle (P2b)
 ```

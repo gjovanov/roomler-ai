@@ -436,7 +436,7 @@ Claude Code starts its MCP servers itself, as the session's account, over stdio.
 the server it starts is a relay, `roomlerd hive-mcp <socket>`, which pipes its stdin
 and stdout to the session's endpoint. The relay is short-circuited at the top of
 `daemon_main`, so it runs none of the daemon's start-up
-([`main.rs:1170`](../agents/roomlerd/src/main.rs#L1170)), and the daemon speaks MCP on
+([`main.rs:1182`](../agents/roomlerd/src/main.rs#L1182)), and the daemon speaks MCP on
 the other end.
 
 | | Linux, macOS | Windows |
@@ -4029,9 +4029,9 @@ docker run -d --name hive-archive --hostname hive-archive-1 \
 
 | Rule | Why | Where |
 |---|---|---|
-| The posture is written with the enrolled config, before its first save | the first start is already an archive replica; a script appending keys to the file afterwards would land them under whatever `[table]` came last | [`archive_replica.rs:66`](../agents/roomlerd/src/archive_replica.rs#L66), [`main.rs:2528`](../agents/roomlerd/src/main.rs#L2528) |
-| Refused before the single-use token is spent: an existing config, an ephemeral enrollment, a build that holds no copies | the volume is the device, and folding an existing enrollment into one would make some other device an archive replica in place; FR-51 deletes an ephemeral device once it falls silent | [`archive_replica.rs:40`](../agents/roomlerd/src/archive_replica.rs#L40), [`main.rs:2435`](../agents/roomlerd/src/main.rs#L2435) |
-| An archive replica enrolled before P2k-4 joins the mesh at its first start in a newer image, and its config is saved once; a port it already had is kept. Only in the image, which says so in its environment (`ROOMLERD_ARCHIVE_IMAGE=1`) | it updates by a new container on the same volume, so that start is the one place an older enrollment can take the newer posture; a device whose owner offers it as an archive replica outside the image keeps the overlay its owner chose | [`archive_replica.rs:111`](../agents/roomlerd/src/archive_replica.rs#L111), [`main.rs:3247`](../agents/roomlerd/src/main.rs#L3247) |
+| The posture is written with the enrolled config, before its first save | the first start is already an archive replica; a script appending keys to the file afterwards would land them under whatever `[table]` came last | [`archive_replica.rs:66`](../agents/roomlerd/src/archive_replica.rs#L66), [`main.rs:2554`](../agents/roomlerd/src/main.rs#L2554) |
+| Refused before the single-use token is spent: an existing config, an ephemeral enrollment, a build that holds no copies | the volume is the device, and folding an existing enrollment into one would make some other device an archive replica in place; FR-51 deletes an ephemeral device once it falls silent | [`archive_replica.rs:40`](../agents/roomlerd/src/archive_replica.rs#L40), [`main.rs:2461`](../agents/roomlerd/src/main.rs#L2461) |
+| An archive replica enrolled before P2k-4 joins the mesh at its first start in a newer image, and its config is saved once; a port it already had is kept. Only in the image, which says so in its environment (`ROOMLERD_ARCHIVE_IMAGE=1`) | it updates by a new container on the same volume, so that start is the one place an older enrollment can take the newer posture; a device whose owner offers it as an archive replica outside the image keeps the overlay its owner chose | [`archive_replica.rs:111`](../agents/roomlerd/src/archive_replica.rs#L111), [`main.rs:3273`](../agents/roomlerd/src/main.rs#L3273) |
 | The entrypoint enrolls only when the volume holds no config, and never prints the token; a failed enrollment writes nothing, so the next start tries again | the token is single use and 10 minutes long; every later start runs from the volume | [`hive-archive-entrypoint.sh:24`](../scripts/hive-archive-entrypoint.sh#L24) |
 | Not root: its own account, uid 10001, whose home is the volume, so the store and every file the daemon keeps live there with the config | it runs no session as anyone, so it needs no account but its own | [`Dockerfile.hive-archive:73`](../Dockerfile.hive-archive#L73) |
 | Built and smoke-tested on every PR that touches it; published only by a dispatch, `dry_run` on by default | publishing puts a public package under the operator's account, as the self-host image (FR-42) | [`hive-archive-image.yml:23`](../.github/workflows/hive-archive-image.yml#L23) |
