@@ -127,21 +127,24 @@ Being explicit rather than letting you discover these:
 ## Uninstall
 
 ```bash
-launchctl bootout "gui/$(id -u)/com.roomler.agent"
-launchctl bootout "gui/$(id -u)/com.roomler.desktop"
-sudo launchctl bootout system/com.roomler.daemon    # if the root half is installed
-sudo launchctl bootout system/com.roomler.update    # the update helper
-rm -f ~/Library/LaunchAgents/com.roomler.{agent,desktop}.plist
-sudo rm -f /Library/LaunchDaemons/com.roomler.{daemon,update}.plist
-sudo rm -rf /Library/Roomler /Applications/Roomler.app \
-            /usr/local/bin/roomler /usr/local/bin/roomlerd /etc/roomler
-
-# The privacy grants are bound to the binary you just deleted. Clearing them
-# means a fresh install prompts again, instead of showing a toggle that is ON
-# but attached to something no longer there.
-sudo tccutil reset ScreenCapture com.roomler.agent
-sudo tccutil reset Accessibility com.roomler.agent
+curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- --uninstall
 ```
+
+It stops both halves through launchd **before** removing anything: the
+per-user agent and the menu-bar app (for every account that has them), then the
+root half and the update helper. That stop is the daemon's clean stop, so the
+routes and DNS settings it added to the Mac go with it. Then it removes
+`/Library/Roomler`, `/Applications/Roomler.app`, the CLI, the package receipt
+and the config, which holds the credentials. It also resets the Screen Recording
+and Accessibility grants, so a fresh install asks for them again rather than
+showing a toggle that is on for a binary that is gone.
+
+It prints `done.` only if every step worked; otherwise it lists what it could
+not remove and exits non-zero.
+
+| Flag | Effect |
+|---|---|
+| `--keep-config` | Keep the config and the two grants: a reinstall comes back as the same device |
 
 Then remove the device row — or **both** rows, if you installed the root half —
 in the dashboard under **Devices**. That revokes the credentials and releases

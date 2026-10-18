@@ -36,8 +36,12 @@
   merged (#2443), field-verified red → green on a Linux root daemon, a Win11 SystemContext guest and a Mac's root
   daemon (§8).
 - P6a, the updater binding the `.deb`, `.pkg` and tarball to the release they are offered as (the MSI's binding,
-  on Linux and macOS), is in review: an attack red on 0.4.143, green on its candidate, and each reader read against
-  the last three releases' real artifacts (§8).
+  on Linux and macOS), merged (#2464): an attack red on 0.4.143, green on its candidate, and each reader read
+  against the last three releases' real artifacts (§8).
+- P6e-1, a daemon that never dies on a log sink (#1538: no panicking prints, no unbounded launchd stdout), merged
+  (#2478), red → green on a Linux container and under a real launchd (§8).
+- P6d, `install.sh --uninstall`, is in review, field-verified on the branch (§8): six containers, a vmtest Ubuntu
+  guest per install type and a tart Mac with both halves, against the served script's red.
 - P6f needs no build: Windows got its private staging directory with GHSA-r3xj-4wh9-xh2v (0.4.142), and on macOS
   the root update helper's temp directory was measured to be root's own (§3.11, §8).
 - The rest of P2–P7 is open.
@@ -141,7 +145,7 @@ prevent, and the guard re-asserts it on every tick.
 
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
-| N1 | In the mesh on a default install | ✅ | ✅ | ❌ | The default `.pkg` installs the per-user half, which cannot create a utun; the mesh needs `--daemon-token`, a second enrollment and a second device row (`scripts/install.sh:508-511`, `packaging/macos/com.roomler.daemon.plist` header) | FR-43 P3 |
+| N1 | In the mesh on a default install | ✅ | ✅ | ❌ | The default `.pkg` installs the per-user half, which cannot create a utun; the mesh needs `--daemon-token`, a second enrollment and a second device row (`scripts/install.sh:543-546`, `packaging/macos/com.roomler.daemon.plist` header) | FR-43 P3 |
 | N2 | Exit node, client | ✅ | ✅ | ✅ P1a + P1c (AC4, AC6 field-verified) | S1; no original-default capture (`tun.rs:1931-1939`, `3471-3503` are `cfg(any(linux, windows))`) | P0a, P1a |
 | N3 | Exit node, serving v4 | 🟡 WinNAT; Home ❌ | ✅ iptables | ✅ P1b: pf, in our own anchor (0.4.141; #2377 in 0.4.142; AC5, §8) | Silent no-op (`nat.rs:376-378`); Home: #2077 | P0b, P1b, P4e |
 | N4 | Exit node, serving v6 | ⛔ WinNAT has no v6 (`nat.rs:268-274`) | ✅ ip6tables | ✅ P1b: pf NAT66 to a stable address (global first, else a ULA), where an unscoped v6 default exists (0.4.141; AC5, §8) | — | P1b; Windows: D1 |
@@ -213,7 +217,7 @@ and the consent chain's fallbacks.
 | O2 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | 🟡 built (P6a) | 🟡 built (P6a) | Was: `Unsupported`, so the install proceeded and a signed older package under a newer manifest installed (measured on 0.4.143, §8). P6a reads the `.deb`'s control `Version`, the tarball's top directory and the `.pkg`'s `PackageInfo` (`artifact_version.rs:114`) | P6a |
 | O3 | Tunnel CLI `roomler self-update` | ✅ | ❌ | ❌ | `agents/roomler-cli/src/update.rs:96-101` | P6b |
 | O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:5003` | P6c |
-| O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 apt only; the tarball has none | ❌ | A pasted recipe (`docs/installation.md:394-420`) | P6d |
+| O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 built (P6d) | 🟡 built (P6d) | Was: apt alone on Linux, the tarball nothing, and macOS a pasted recipe. P6d's `install.sh --uninstall` removes what any path installed, after a clean stop through each service's manager (`install.sh:886`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
 | O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | ❌ | `macos_supervisor.rs` never calls `crash_recorder` | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
@@ -623,7 +627,7 @@ test of the SIGKILL property itself.
 - **P3f, uinput text on any layout.** `dlopen` libxkbcommon (the libpipewire pattern) and map char → keycode under the
   host's keymap.
 - **P3g, a companion where there is none** (with FR-93 D5/D6 and FR-95): an arm64 `.deb` and a tarball build;
-  `install.sh` already has the hook (`scripts/install.sh:742-750`).
+  `install.sh` already has the hook (`scripts/install.sh:777-785`).
 - **P3h, DNS without systemd-resolved.** NetworkManager when it owns `resolv.conf`, else a managed `resolv.conf` with a
   restore. Evidence first: which fleet distros lack resolved.
 - **P3i, host firewall.** The evidence (§8, 2026-10-17) answered the question this phase opened on:
@@ -766,7 +770,31 @@ model on Windows, so the three agree on what the mode means.
     the CLI declare both libssl names.
 - **P6c, `roomlerd service install --system`** on Linux (`systemctl enable --now roomlerd.service`) and macOS (bootstrap
   `com.roomler.daemon`, keeping the postinstall's enable marker in step).
-- **P6d, `install.sh --uninstall`** for the tarball and the `.pkg`.
+- **P6d, `install.sh --uninstall [--keep-config]` (built).** One command removes what any install path put on a Linux
+  or macOS machine: this script, the `.deb`, the companion's `.rpm`, the tarball, the `.pkg`, the tunnel CLI. Every
+  step acts only on what is there, so it also works on a partial install and when run twice (`install.sh:886`).
+  - **The order is the design.** Every service stops through its manager while its files are still on disk
+    (`uninstall_stop_linux`, `uninstall_stop_macos`). The stop is a SIGTERM, the daemon's clean stop, so P0e's purge
+    takes back the exit `/1`s and the DNS steer, and an ephemeral device unenrolls itself. A daemon no manager owns
+    gets the same SIGTERM; one that ignores it for 30 s is reported, never SIGKILLed, while the companion, a UI, is
+    killed (`stop_leftovers`). The sweep signals at once on Linux, where systemd's stop already waited, and after
+    up to 20 s of `bootout` drain on a Mac. Then come the packages (one `dpkg --purge`, the dependent first;
+    `rpm -e roomler-desktop`), the tarball's files no package owns, and every account's login registrations.
+    Last, unless `--keep-config`, the config, which holds the device's credential.
+  - **An update in flight finishes first.** The update helper stops before the daemon, and a run still in
+    `SubState=start` (on a Mac, `state = running`) is waited out. Killing it mid-install would hand the package step
+    a half-installed package, and on a Mac it kills `installer` with the job's process group.
+  - **Registrations go for every account; config only for the caller's and root's.** The caller is the account
+    behind `sudo`, and on a Mac also the console user. Another account's config is that account's own device
+    credential: it is listed, not removed.
+  - It takes no `--role` and refuses one. It removes every part, and a role would read as "only this part".
+  - It cannot revoke the device. A permanent device may not remove itself (`self_unenroll` answers 403), so the last
+    line points at **Devices → remove**.
+  - *Found by its own cells:* the per-user install's last line read `$USER` under `set -u`. Nothing sets `USER` in a
+    container or a service, so an install that had worked exited 2. Fixed in the same change, with `$(id -un)`.
+  - *Open, Windows parity, by reading only:* nothing removes the config on Windows. `install.ps1 -Uninstall` doesn't,
+    the MSI's tables have no `RemoveFolderEx`, and `roomlerd service uninstall` deletes no file but its own task XML.
+    So a Windows uninstall would leave the credential that the Unix uninstall now removes. This is unmeasured.
 - **P6e, macOS supervision.** The FR-43 supervisor records a worker that dies before its own panic hook (stderr tail →
   `record_with_log_tail`); drop the launchd `StandardOutPath` duplication and the daemon's `eprintln!`s (#1538).
   - **P6e-1, never die on a log sink (#1538, built).** `eprintln!` panics when the write fails, and the daemon's
@@ -852,7 +880,7 @@ model on Windows, so the three agree on what the mode means.
 | **P6a** | Artifact version binding: `.deb`, `.pkg`, tarball (built) | `ROOMLERD_ARTIFACT_VERSION_CHECK=0` | the last three releases' real artifacts; a hostile feed, red on 0.4.143 | S–M |
 | **P6b** | `roomler self-update` on Unix + the pinned PGP check | — | Linux + Mac tunnel-only hosts | M |
 | **P6c** | `service install --system` on Linux + macOS | — | vmtest | S |
-| **P6d** | `install.sh --uninstall` | — | vmtest | S |
+| **P6d** | `install.sh --uninstall [--keep-config]` (built) | — (a new flag; the install path is unchanged) | six throwaway containers on four distros, a vmtest Ubuntu guest per install type, a tart Mac with both halves; red on the served script | S |
 | **P6e** | macOS supervisor crash capture; #1538 (P6e-1, never die on a log sink: built) | — (a liveness fix) | a field Mac; a duplicate start with stderr on `/dev/full`, red on 0.4.143 | S |
 | **P6f** | Private staging dir on Windows + macOS (settled: Windows by GHSA-r3xj-4wh9-xh2v, macOS measured private) | — | Win10, Win11, a Mac | S |
 | **P7a** | Linux arm64 hardware encode | the release feature set | an arm64 lab host | M |
@@ -944,7 +972,10 @@ one depends on it.
   candidate. The `.pkg` reader was proven on a Mac against the real pkgs; it is re-checked on the release.
   The last clause, a closed stdout no longer killing the daemon, is field-verified on P6e-1's candidate, §8: a
   duplicate start with stderr on `/dev/full` panicked on 0.4.143 and left cleanly on the candidate. The plists
-  were checked under a real launchd. The rest is P6b–P6d and P6e-2.)*
+  were checked under a real launchd. The `install.sh --uninstall` round trip is field-verified on P6d's branch, §8:
+  the served script refused the flag, and the branch's removed a released install, both halves on a Mac and each
+  install type on a vmtest Ubuntu guest, after a clean stop in which each ephemeral device removed itself. It is
+  checked again on the served script once it ships. The rest is P6b, P6c and P6e-2.)*
 - [ ] **AC14 (P7):** an arm64 Linux host advertises a hardware cell and records AAC; the arm64 CLI and wizard
   install.
 - [ ] **AC15 (the rule):** P0d's server count of advertised capability words by OS, taken before P0 and after the
@@ -1103,3 +1134,7 @@ one depends on it.
 | 2026-10-18 | the same deploy | P6b's precondition, measured while scoping it: the tunnel distribution | ❗ `/api/tunnel/latest-release` had answered `[]` and every tunnel installer 404'd since ~09-07 (#2468): the cache's 100-deep page had lost the tunnel family. 🟢 After #2469's promote: `tunnel-v0.3.0-rc.266`, and 200 on all four installers. ❗ A real `install.sh --role tunnel` then installed nothing on Debian 12 and Ubuntu 22.04 and still said done: the `.deb` wants `libssl3t64` (#2472, fix #2474) |
 | 2026-10-18 | released 0.4.143 (its own binary, `3b42f578…`, from its `.deb`), then the P6e-1 candidate (`2a0957dc3`, a bookworm build) | a throwaway Debian container on mars. `flock` held the single-instance lock, so a second `roomlerd run` was a duplicate. The control ran with a working stderr, then the duplicate ran with stderr on `/dev/full`, where every write fails | 🔴→🟢 **P6e-1, a closed stdout no longer kills the daemon.** With a working stderr both exit 8 (`ALREADY_RUNNING_EXIT_CODE`) and say "Another roomlerd is already running". With stderr on `/dev/full`, **the release exits 101** and leaves a panic file: `std/src/io/stdio.rs:1165:9`, "failed printing to stderr: No space left on device", the same location as #1538's crash. **The candidate exits 8** and leaves no panic file |
 | 2026-10-18 | released 0.4.143's `.pkg`, then the P6e-1 branch's two plists over its own | a throwaway tart Mac, the root daemon enrolled ephemeral. Both jobs were reloaded: bootout, wait until launchd no longer knows the job, bootstrap. A control first reloaded the released plist the same way. The first attempt bootstrapped too soon after bootout, and launchd answered "5: Input/output error" | 🟢 **The plists, under a real launchd.** `plutil -lint` passed for both. The control and the branch's plists all bootstrapped. The daemon ran with `stdout path = /dev/null`, stderr still `daemon.log`. Over 30 s launchd's `daemon.log` stayed at 26,721 bytes while the daemon's rotating log grew 35,337 → 35,909. The unenrolled agent ran with stdout on `/dev/null`, and its "no config found" error still reached `/tmp/roomlerd.err.log`. No `roomlerd.out.log` was created. The VM was destroyed |
+| 2026-10-18 | the served `install.sh` (prod, `hosted-20261018-dc258ce`), then the P6d branch's | six throwaway containers on mars, the released 0.4.143 packages installed `--no-enroll`: Debian 12 with no procps; Ubuntu 24.04; Fedora 41, which has no dpkg and so took the tarball; the tunnel CLI alone on Debian 12 and 13; Debian 12 with the companion | 🔴 The served script refused `--uninstall`: "unknown flag", exit 1. 🟢 **P6d in containers**, on the final script: deb 42/42, keep 17/17, tar 25/25, tunnel 7/7 on both, desktop 10/10. One `dpkg --purge roomler-desktop roomlerd` took the companion and the daemon, the dependent first. An orphan `roomlerd run` that no manager owned took the SIGTERM and exited 0, a clean stop. A path that a dummy package owned (the tunnel CLI's legacy-name symlink in `/usr/local/bin`) was left, with the reason printed. Another account's config was listed and left, while its enable link and its own autostart entry went; an autostart entry without the marker stayed. The tarball's files went, and no parent directory with them. A second run removed nothing and exited 0. `--keep-config` kept both configs and dpkg's `rc` state, and the next plain run purged both. ❗ **Found:** the per-user install's last line read `$USER` under `set -u`, which no container sets, so an install that had worked exited 2 (fixed in the same change) |
+| 2026-10-18 | released 0.4.143 (`vmtest` lane `ubuntu/script/user`, kept), then the branch's `install.sh --uninstall`, run as the user | a throwaway Ubuntu 24.04 GNOME guest: the per-user unit, the companion running in the session, the update helper's timer and path on, the device enrolled ephemeral | 🟢 **P6d, a Linux per-user install.** It stopped the timer and the path, then `vmtest`'s `roomler.service` through the user's own systemd. The daemon logged "OS/service-manager stop received; shutting down gracefully", "ephemeral device unenrolled itself on shutdown" 0.24 s later, and systemd "Stopped roomler.service". The companion took its SIGTERM, and one `dpkg --purge` took both packages. The config, the portal token's folder and the root helper's tree went. After: no unit file, no process, no package, every path absent. The row was gone from the listing 324 s after the stop, short of the reaper's TTL + 180 s, so the device removed itself. A second run exited 0 and removed nothing. The run took 3 min: on that guest each `sudo` costs 15 s (`sudo true`, 15 021 ms). Noted on the way: the stop logs a WARN, "the OS route monitor exited — respawning it", because systemd's SIGTERM reaches the monitor too. The guest was destroyed |
+| 2026-10-18 | released 0.4.143 (`vmtest` lane `ubuntu/script/system`, kept), then the branch's `install.sh --uninstall` under `sudo` | a throwaway Ubuntu 24.04 GNOME guest: the root `roomlerd.service` with the kernel TUN `roomler0`, the overlay's routes and resolved's split-DNS link (`~vmtest.roomler.ai`), the companion running in the person's session, the device enrolled ephemeral | 🟢 **P6d, a Linux system install.** It stopped `roomlerd.service` through systemd. The daemon logged "OS/service-manager stop received; shutting down gracefully", then "ephemeral device unenrolled itself on shutdown" 0.24 s later. The companion took its SIGTERM at once, and one `dpkg --purge` took both packages. `/etc/roomler`, the caller's tree and root's tree went. After: no unit file, no process, no package, no `roomler0` and no route through it, and no DNS link but the uplink's. The row was absent at the first poll, 95 s after the stop. A second run exited 0 and removed nothing. The whole run took 19 s, 15 of them the outer `sudo`. The guest was destroyed |
+| 2026-10-18 | released 0.4.143's `.pkg`, both halves, then the branch's `install.sh --uninstall` under `sudo`; run twice, the second time on the final script | a throwaway tart Mac with `admin` at the GUI; the root half enrolled ephemeral with the overlay, the per-user half enrolled ephemeral too | 🟢 **P6d, macOS.** Before: four launchd jobs, three processes, the overlay's `utun4` with 3 routes through it, the split-DNS entry, the `com.roomler.agent` receipt and both TCC grants. The uninstall (1–2 s, exit 0) booted out `com.roomler.update`, `gui/501`'s companion and agent, then the root half. The root daemon logged its graceful stop, then "ephemeral device unenrolled itself on shutdown" 0.38 s later, then "magicdns: OS split-DNS reverted". After: no job, no process, no `utun4` and no route through one, no DNS entry, no receipt, no TCC row, and every path absent. Both rows were absent at the first poll, 2 s after the stop. A second run exited 0 and removed nothing. The VM was destroyed |
