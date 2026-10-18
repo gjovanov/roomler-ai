@@ -269,7 +269,8 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   cannot say. The root system unit (`roomlerd.service`) has no sandbox
   either way.
 - `--role tunnel` installs just the CLI (tarball or `.deb`).
-- Useful flags: `--download-only`, `--no-enroll`.
+- Useful flags: `--download-only`, `--no-enroll`; and `--uninstall
+  [--keep-config]` removes it all again ([below](#uninstall-every-platform)).
 - Headless servers: the daemon's virtual-desktop mode gives the machine a
   display, so "Connect" drops you into a live console.
 - Design notes for the tarball/self-update path: [linux-self-update.md](linux-self-update.md).
@@ -457,33 +458,18 @@ adapters are also unavailable on macOS today.
 ### Uninstall
 
 ```bash
-launchctl bootout "gui/$(id -u)/com.roomler.agent"
-launchctl bootout "gui/$(id -u)/com.roomler.desktop"
-sudo launchctl bootout system/com.roomler.daemon          # if the root half is installed
-sudo launchctl bootout system/com.roomler.update          # the update helper (installed by default)
-rm -f ~/Library/LaunchAgents/com.roomler.{agent,desktop}.plist
-sudo rm -f /Library/LaunchDaemons/com.roomler.{daemon,update}.plist
-sudo rm -rf /Library/Roomler /Applications/Roomler.app /Applications/roomler-agent.app \
-            /usr/local/bin/roomler /usr/local/bin/roomlerd \
-            /etc/roomler /etc/roomler-agent
-# ⚠️ /etc/roomler is the CURRENT root config dir and holds the agent token.
-# This line used to remove only the legacy /etc/roomler-agent, so an uninstall
-# left a live credential on disk.
-# `sudo`, and both trees: an install done under sudo before rc.454 wrote the
-# config into your home owned by root, so a plain rm cannot remove it.
-# `live.roomler.roomler-agent` is the pre-rename path and may also be present.
-sudo rm -rf ~/Library/Application\ Support/live.roomler.roomler \
-            ~/Library/Application\ Support/live.roomler.roomler-agent
-
-# The two privacy grants are bound to the binary you just deleted. Clearing
-# them means the fresh install prompts again instead of showing a toggle that
-# is ON but attached to something no longer there.
-sudo tccutil reset ScreenCapture com.roomler.agent
-sudo tccutil reset Accessibility com.roomler.agent
+curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- --uninstall
 ```
 
-Remove the device row(s) in the admin UI too — deletion there releases the
-overlay lease.
+The same command as on Linux — [Uninstall: every platform](#uninstall-every-platform)
+has what it removes and in which order. On a Mac it boots both halves out
+through launchd before a single file goes, for every account that has the
+per-user half, and it resets the two privacy grants while the bundle that names
+them still exists, so a fresh install asks again instead of showing a toggle
+that is ON for a binary that is gone.
+
+Remove the device row(s) in the admin UI too: a Mac that ran the root half is
+two rows, and deleting them releases the overlay lease.
 
 ## After install: the companion opens, and starts at login (FR-84 D6)
 
@@ -581,17 +567,92 @@ material, and how to verify an artifact by hand. The installer proxies exist
 precisely so corporate networks can allow-list `roomler.ai` instead of
 `github.com`.
 
-## Uninstall / cleanup
+## Uninstall: every platform
 
-- **Windows**: uninstall the MSI (per-user or per-machine) from Apps; the agent's
-  version sweep also removes older same-flavour MSIs after upgrades.
-  `roomlerd service uninstall` removes a manually-installed service/task.
-- **Linux**: `apt remove roomlerd` (or delete the tarball install) and
-  `systemctl --user disable --now roomler.service`.
-- **macOS**: see [Uninstall](#uninstall) above — there may be TWO halves to
-  remove (the per-user LaunchAgent and, if installed, the root LaunchDaemon).
+- **Windows**: uninstall the MSI (per-user or per-machine) from Apps, or run
+  `install.ps1 -Uninstall`; the agent's version sweep also removes older
+  same-flavour MSIs after upgrades. `roomlerd service uninstall` removes a
+  manually-installed service/task.
+- **Linux and macOS** (FR-97 P6d): one command, whatever put Roomler there —
+  this script, the `.deb`, the companion's `.rpm`, the tarball, the `.pkg`, the
+  tunnel CLI. Every step acts only on what is present, so it also works on a
+  partial install and when run twice.
+
+  ```bash
+  curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- --uninstall [--keep-config]
+  ```
+
+  It takes no `--role` and refuses one: it removes every Roomler part on the
+  machine, and a role would read as "only this part".
 - Server side, delete the device (**Devices → remove**): this revokes its
   credential and releases its overlay address back to the pool.
+
+### The order is the design
+
+`scripts/install.sh:886` (the section) — `uninstall_linux` at `:1312`,
+`uninstall_macos` at `:1377`.
+
+```mermaid
+flowchart TD
+    S["1 · stop every service THROUGH ITS MANAGER, files still on disk<br/>systemd: update timer + path, a helper run in flight finishes,<br/>roomlerd.service, each account's roomler.service<br/>launchd: com.roomler.update (never mid-install),<br/>every gui/&lt;uid&gt; agent + companion, com.roomler.daemon"]
+    L["1b · whatever still runs (an orphan, a hand-started daemon):<br/>SIGTERM; a daemon still there 30 s later is REPORTED,<br/>never SIGKILLed (the companion, a UI, is killed)"]
+    P["2 · the packages · the tarball's files no package owns ·<br/>every account's login registrations"]
+    K{"--keep-config?"}
+    C["3 · the config trees — /etc/roomler, the caller's and root's;<br/>another account's are LISTED, not removed"]
+    D["4 · 'done.' only if every step held —<br/>else each failure named, exit 1"]
+    S --> L --> P --> K
+    K -- no --> C --> D
+    K -- yes --> D
+```
+
+| Step | Linux | macOS |
+|---|---|---|
+| 1 · stop | `roomler-update.timer` + `.path`, a `roomler-update.service` run still in `SubState=start` waited out, then `roomlerd.service`, then each account's `roomler.service` on its user bus (`stop_unit`, `:1149`) | `com.roomler.update` once it is no longer `state = running`, every account's `gui/<uid>/com.roomler.{desktop,agent}`, then `com.roomler.daemon` (`:1340`) |
+| 1b · sweep | `roomlerd` and `roomler-desktop` by exact name — `pgrep -x`, or `/proc/*/comm` where procps is absent (`stop_leftovers`, `:1078`) | the same; it also reaches a companion opened from Finder, which runs under LaunchServices, out of any bootout's reach |
+| 2 · programs | `dpkg --purge` of the companion, the daemon, the tunnel CLI and the two names the daemon's `.deb` replaced (dependent first, one call); `rpm -e roomler-desktop`; the tarball payload of `scripts/stage-linux-tarball.sh` and the tunnel CLI's `/usr/local/bin` (`:1248`); every account's `roomler.service` enable links and the companion's own autostart entry (`X-Roomler-Managed`) | the two privacy grants, the two LaunchDaemons, every account's LaunchAgents, `/Library/Roomler`, `/Applications/Roomler.app`, `/usr/local/bin/roomler{,d}`, the `com.roomler.*` package receipts |
+| 3 · config | `/etc/roomler`, `/etc/default/roomlerd`, `roomlerd.service.d/`; for the caller (the account behind `sudo`) and root: `~/.config/roomler`, `~/.local/share/roomler`, `~/.local/state/roomler`, the tunnel CLI's tree, the pre-rename trees | `/etc/roomler`, `/var/log/roomler`, the `/tmp` logs; for the caller, the console user and root: `~/Library/Application Support/live.roomler.roomler`, the tunnel CLI's tree, the pre-rename trees |
+
+⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
+the daemon's clean stop: it takes back the exit routes and the DNS steer it put
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/main.rs:1953`),
+and an ephemeral device unenrolls itself. Delete the files first and the host
+keeps pins and a steer that nothing installed will ever heal.
+
+⚠️ **Never SIGKILL the daemon.** A daemon that ignores the SIGTERM for 30 s is
+reported, and the exit is 1: a SIGKILL would skip exactly the cleanup this
+order is for. The companion is a UI with nothing to clean up, so one that
+outlives its SIGTERM is killed, as the `.pkg` postinstall does.
+
+⚠️ **The sweep's grace differs by manager.** systemd's stop has already waited
+for its unit, so on Linux the sweep signals at once. `launchctl bootout`
+returns while the job is still draining, so on a Mac it first waits up to
+20 s.
+
+⚠️ **An update in flight finishes first.** Stopping `roomler-update.service`
+mid-install would hand step 2 a half-installed package; on a Mac, booting
+`com.roomler.update` out mid-install kills its whole process group,
+`installer` included (the `.pkg` postinstall's own warning).
+
+⚠️ **The config is the credential.** `config.toml` holds the agent token (and
+the SSH host key). Removing the program and leaving the token on disk is not an
+uninstall; `--keep-config` is the explicit exception, for a reinstall that
+should come back as the same device. Every removal runs as root, in one
+privileged call per list: an install done under `sudo` before rc.454 left the
+per-user config owned by root, which a plain `rm` cannot remove.
+
+⚠️ **Registrations go for every account; config only for the caller's and
+root's.** A LaunchAgent left in another account's `~/Library/LaunchAgents` is
+respawned against a missing binary at each of that account's logins, so those
+go. Another account's config is that account's own device credential: it is
+listed, never removed.
+
+⚠️ **A path a package owns is that package's.** The tarball sweep removes a
+file only when neither `dpkg -S` nor `rpm -qf` names an owner.
+
+⚠️ **It cannot revoke the device.** A permanent device may not remove itself
+from the server — `self_unenroll` answers 403, so a compromised host cannot
+erase its own fleet record — and the last line it prints points at
+**Devices → remove**.
 
 The agent's `config.toml` (server URL, tokens, per-node settings like
 `encoder_preference`, `overlay_*`, `tunnel_routes`) lives under
