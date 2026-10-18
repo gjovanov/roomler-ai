@@ -90,12 +90,13 @@ async fn check_for_org(
     Ok(checked)
 }
 
-/// The roomler roles (Cedar `Group`s) a member holds, by name.
-async fn groups_of(
+/// The roomler roles (Cedar `Group`s) a member holds, by name. Empty for
+/// someone who is not a member: no `Group` policy names them.
+pub(crate) async fn groups_of_member(
     state: &VaultState,
     tid: ObjectId,
     user: ObjectId,
-) -> Result<Vec<String>, ApiError> {
+) -> Result<Vec<String>, DaoError> {
     let ids = state.tenants.member_role_ids(tid, user).await?;
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -656,7 +657,7 @@ pub async fn simulate(
             };
             Request::AssumeRole {
                 user,
-                groups: groups_of(&state, tid, user).await?,
+                groups: groups_of_member(&state, tid, user).await?,
                 role: known_role(role)?,
                 device,
             }
@@ -725,33 +726,7 @@ pub async fn simulate(
         }
     };
 
-    // The set as it would be: the stored policies, less `without`, plus
-    // `with` (each checked as a write would check it).
-    let stored = state.policies.list_live(tid).await?;
-    for id in &body.without {
-        if id.starts_with("guardrail:") {
-            return Err(ApiError::BadRequest(
-                "a guardrail cannot be left out".into(),
-            ));
-        }
-        if !stored
-            .iter()
-            .any(|p| policy::stored_id(p.id.unwrap_or_default()) == *id)
-        {
-            return Err(ApiError::BadRequest(format!(
-                "{id} is not one of this organization's policies"
-            )));
-        }
-    }
-    let mut texts: Vec<(String, String)> = stored
-        .iter()
-        .map(|p| (policy::stored_id(p.id.unwrap_or_default()), p.text.clone()))
-        .filter(|(id, _)| !body.without.contains(id))
-        .collect();
-    for (i, text) in body.with.iter().enumerate() {
-        check_for_org(&state, tid, text).await?;
-        texts.push((format!("with:{i}"), text.clone()));
-    }
+    let (texts, stored) = set_as_changed(&state, tid, &body.with, &body.without).await?;
     let verdict = match policy::policy_set(texts.iter().map(|(id, t)| (id.clone(), t.as_str()))) {
         Ok(set) => policy::decide(&set, &ask),
         Err(why) => Verdict::deny(why),
@@ -775,6 +750,124 @@ pub async fn simulate(
         "decision": if verdict.allow { "allow" } else { "deny" },
         "determining": determining,
         "errors": verdict.errors,
+    })))
+}
+
+/// The organization's set as it would be: its stored policies less
+/// `without` (never a guardrail; only its own), plus `with`, each checked as
+/// a write would check it. The texts under their policy ids, and the stored
+/// rows (for their names).
+async fn set_as_changed(
+    state: &VaultState,
+    tid: ObjectId,
+    with: &[String],
+    without: &[String],
+) -> Result<(Vec<(String, String)>, Vec<VaultPolicy>), ApiError> {
+    let stored = state.policies.list_live(tid).await?;
+    for id in without {
+        if id.starts_with("guardrail:") {
+            return Err(ApiError::BadRequest(
+                "a guardrail cannot be left out".into(),
+            ));
+        }
+        if !stored
+            .iter()
+            .any(|p| policy::stored_id(p.id.unwrap_or_default()) == *id)
+        {
+            return Err(ApiError::BadRequest(format!(
+                "{id} is not one of this organization's policies"
+            )));
+        }
+    }
+    let mut texts: Vec<(String, String)> = stored
+        .iter()
+        .map(|p| (policy::stored_id(p.id.unwrap_or_default()), p.text.clone()))
+        .filter(|(id, _)| !without.contains(id))
+        .collect();
+    for (i, text) in with.iter().enumerate() {
+        check_for_org(state, tid, text).await?;
+        texts.push((format!("with:{i}"), text.clone()));
+    }
+    Ok((texts, stored))
+}
+
+/// The most recorded decisions one replay decides again, and the most
+/// flips it lists (it counts them all).
+pub const MAX_REPLAY: i64 = 5_000;
+pub const MAX_FLIPS: usize = 200;
+
+/// `POST …/vault/simulate/replay`.
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Replay {
+    #[serde(default)]
+    pub with: Vec<String>,
+    #[serde(default)]
+    pub without: Vec<String>,
+    /// How far back, 1 to 7 days; 7 by default (design §8.4).
+    #[serde(default)]
+    pub days: Option<u32>,
+}
+
+/// `POST /api/tenant/{tenant_id}/vault/simulate/replay` — the last days'
+/// recorded Cedar decisions (each with the request it decided: the groups,
+/// the device, the mode, as they were then) decided again under the set as
+/// it would be with `with` and without `without`; answers the ones that
+/// would come out the other way. Decides nothing for real, records nothing.
+pub async fn replay(
+    State(state): State<VaultState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<Replay>,
+) -> Result<Json<Value>, ApiError> {
+    let tid = member_tenant(&state, &tenant_id, &auth).await?;
+    admin_only(&state, tid, &auth).await?;
+    let days = body.days.unwrap_or(7);
+    if !(1..=7).contains(&days) {
+        return Err(ApiError::BadRequest("days must be 1 to 7".into()));
+    }
+    let (texts, _) = set_as_changed(&state, tid, &body.with, &body.without).await?;
+    let set = policy::policy_set(texts.iter().map(|(id, t)| (id.clone(), t.as_str())))
+        .map_err(|why| ApiError::BadRequest(format!("the changed set does not build: {why}")))?;
+    let since = DateTime::from_millis(
+        DateTime::now().timestamp_millis() - i64::from(days) * 24 * 60 * 60 * 1000,
+    );
+    let rows = state.audit.decisions_since(tid, since, MAX_REPLAY).await?;
+    let (mut replayed, mut unreadable, mut flipped) = (0usize, 0usize, 0usize);
+    let mut flips = Vec::new();
+    for row in &rows {
+        let Some(ask) = row.request.as_ref().and_then(Request::from_doc) else {
+            unreadable += 1;
+            continue;
+        };
+        replayed += 1;
+        let was = row.decision == "allow";
+        let now = policy::decide(&set, &ask);
+        if now.allow != was {
+            flipped += 1;
+            if flips.len() < MAX_FLIPS {
+                flips.push(json!({
+                    "at": rfc3339(row.at),
+                    "action": row.action,
+                    "op": row.op,
+                    "user_id": row.user_id.to_hex(),
+                    "target": row.target,
+                    "session_id": row.session_id.map(|i| i.to_hex()),
+                    "device_id": row.device_id.map(|i| i.to_hex()),
+                    "was": if was { "allow" } else { "deny" },
+                    "now": if now.allow { "allow" } else { "deny" },
+                    "determining": now.determining,
+                }));
+            }
+        }
+    }
+    Ok(Json(json!({
+        "days": days,
+        "replayed": replayed,
+        "unreadable": unreadable,
+        "flipped": flipped,
+        "flips": flips,
+        "truncated": rows.len() as i64 >= MAX_REPLAY,
     })))
 }
 

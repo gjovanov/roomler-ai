@@ -30,6 +30,7 @@ chacha20poly1305.workspace = true
 zeroize.workspace = true
 
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 bson.workspace = true
 futures.workspace = true

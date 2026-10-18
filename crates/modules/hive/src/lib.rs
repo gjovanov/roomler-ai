@@ -69,6 +69,7 @@ pub mod room;
 pub mod routes;
 pub mod scope;
 pub mod stream;
+mod vault_gate;
 pub mod view;
 
 /// The module's state: the core, the fleet module it is built on, and what
@@ -347,6 +348,7 @@ impl Module for HiveState {
         Hooks {
             tenant: Some(h.clone()),
             fleet: Some(h),
+            session: None,
         }
     }
 }

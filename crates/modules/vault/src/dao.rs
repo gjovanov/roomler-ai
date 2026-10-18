@@ -266,6 +266,33 @@ impl VaultAuditDao {
         self.base.insert_one(event).await
     }
 
+    /// P3-2b — the Cedar decisions since `since` (the rows that carry the
+    /// request they decided), newest first, at most `limit`: what a replay
+    /// decides again.
+    pub async fn decisions_since(
+        &self,
+        tenant_id: ObjectId,
+        since: DateTime,
+        limit: i64,
+    ) -> DaoResult<Vec<VaultAuditEvent>> {
+        let mut cursor = self
+            .base
+            .collection()
+            .find(doc! {
+                "tenant_id": tenant_id,
+                "at": { "$gte": since },
+                "request": { "$exists": true },
+            })
+            .sort(doc! { "at": -1, "_id": -1 })
+            .limit(limit)
+            .await?;
+        let mut out = Vec::new();
+        while let Some(e) = cursor.try_next().await? {
+            out.push(e);
+        }
+        Ok(out)
+    }
+
     /// The organization's decisions, newest first, before `before` when
     /// given (the next page).
     pub async fn recent(

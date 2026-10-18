@@ -943,6 +943,7 @@ mod tests {
             updated_at: now,
             ended_at: None,
             brain_rev: None,
+            vault_role: None,
             origin: SessionOrigin::Started,
             replicaset: None,
             promotion: None,

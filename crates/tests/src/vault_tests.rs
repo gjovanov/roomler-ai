@@ -1130,3 +1130,107 @@ async fn simulate_says_what_would_decide_a_request() {
         "simulate records nothing"
     );
 }
+
+/// P3-2b — `simulate/replay`: the recorded Cedar decisions, each with the
+/// request it decided, decided again under a change not yet made; it
+/// answers the ones that would come out the other way, counts a row it
+/// cannot read, and records nothing.
+#[tokio::test]
+async fn a_change_is_replayed_against_the_recorded_decisions() {
+    let app = vault_app(Some(fresh_kek())).await;
+    let t = app.seed_tenant("vaultreplay").await;
+    let me = ObjectId::parse_str(&t.admin.id).unwrap();
+    let tid = ObjectId::parse_str(&t.tenant_id).unwrap();
+    post_json(&app, &t, "/role", json!({ "name": "dev" })).await;
+    let text = format!(
+        r#"permit (principal == Roomler::User::"{}", action == Roomler::Action::"role:assume", resource == Roomler::Role::"dev") when {{ context.device.tags.contains("build") }};"#,
+        t.admin.id
+    );
+    let (code, body, p) = post_json(
+        &app,
+        &t,
+        "/policy",
+        json!({ "name": "dev-on-build", "text": text }),
+    )
+    .await;
+    assert_eq!(code, 201, "{body}");
+    let pid = p["id"].as_str().unwrap().to_string();
+
+    // Two decisions as the gate records them — one allowed on a build box,
+    // one denied on a laptop — and a row a later version wrote.
+    let row = |decision: &str, tags: Vec<&str>| {
+        doc! {
+            "tenant_id": tid,
+            "principal": "user",
+            "user_id": me,
+            "action": "role:assume",
+            "op": "start",
+            "decision": decision,
+            "reason": "recorded",
+            "target": "role:dev",
+            "session_id": ObjectId::new(),
+            "device_id": ObjectId::new(),
+            "request": {
+                "action": "role:assume",
+                "user": me,
+                "groups": ["owner"],
+                "role": "dev",
+                "device": { "os": "linux", "tags": tags, "owner": me },
+            },
+            "at": bson::DateTime::now(),
+        }
+    };
+    let audit = app.db.collection::<Document>("vault_audit");
+    audit.insert_one(row("allow", vec!["build"])).await.unwrap();
+    audit.insert_one(row("deny", vec![])).await.unwrap();
+    let mut odd = row("allow", vec![]);
+    odd.insert("request", doc! { "action": "secret:read" });
+    audit.insert_one(odd).await.unwrap();
+    let before = audit.count_documents(doc! {}).await.unwrap();
+
+    let replay = |body: Value| post_json(&app, &t, "/simulate/replay", body);
+    let counts = |v: &Value| {
+        (
+            v["replayed"].as_i64().unwrap(),
+            v["unreadable"].as_i64().unwrap(),
+            v["flipped"].as_i64().unwrap(),
+        )
+    };
+
+    // No change: nothing flips; the odd row is counted, not guessed.
+    let (code, text, v) = replay(json!({})).await;
+    assert_eq!(code, 200, "{text}");
+    assert_eq!(counts(&v), (2, 1, 0), "{v}");
+
+    // Without the permit, the build box's allow would be a deny.
+    let (_, _, v) = replay(json!({ "without": [pid] })).await;
+    assert_eq!(counts(&v), (2, 1, 1), "{v}");
+    assert_eq!(
+        (v["flips"][0]["was"].clone(), v["flips"][0]["now"].clone()),
+        (json!("allow"), json!("deny")),
+        "{v}"
+    );
+
+    // With a permit for every device, the laptop's deny would be an allow.
+    let anywhere = format!(
+        r#"permit (principal == Roomler::User::"{}", action == Roomler::Action::"role:assume", resource == Roomler::Role::"dev");"#,
+        t.admin.id
+    );
+    let (_, _, v) = replay(json!({ "with": [anywhere] })).await;
+    assert_eq!(counts(&v), (2, 1, 1), "{v}");
+    assert_eq!(v["flips"][0]["now"], json!("allow"), "{v}");
+    assert_eq!(v["flips"][0]["determining"], json!(["with:0"]), "{v}");
+
+    for bad in [
+        json!({ "days": 8 }),
+        json!({ "without": ["guardrail:windows-proxy-only"] }),
+    ] {
+        let (code, _, body) = replay(bad.clone()).await;
+        assert_eq!(code, 400, "{bad} → {body}");
+    }
+    assert_eq!(
+        audit.count_documents(doc! {}).await.unwrap(),
+        before,
+        "a replay records nothing"
+    );
+}

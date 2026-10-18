@@ -164,6 +164,17 @@ pub struct VaultAuditEvent {
     /// `policy:write` was about.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// P3-2b — for a Cedar decision, the session and the device it was
+    /// decided for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<ObjectId>,
+    /// P3-2b — for a Cedar decision, the request exactly as it was decided
+    /// ([`crate::policy::Ask`], in [`crate::policy::Ask::to_doc`]'s form), so
+    /// `simulate`'s replay decides it again under a changed set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<bson::Document>,
     pub at: DateTime,
 }
 
