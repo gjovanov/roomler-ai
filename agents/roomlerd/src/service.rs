@@ -326,8 +326,12 @@ pub fn start() -> Result<()> {
 /// - Linux: `systemctl --user stop`, a SIGTERM, which the daemon already turns
 ///   into a clean stop. A system install's unit is root's, so that one is named
 ///   rather than stopped.
-/// - macOS: refused with the reason. launchd's KeepAlive restarts a stopped
-///   LaunchAgent, so "stop" there is `service uninstall`.
+/// - macOS: `launchctl kill SIGTERM` the LaunchAgent. The clean stop exits 0,
+///   and the plist's `KeepAlive = {SuccessfulExit = false}` restarts only a
+///   FAILED exit, so it stays down until the next login or `service start`.
+///   P4d refused here, believing launchd would restart it; FR-97 P6c measured
+///   on macOS 15 that it does not (exit 0, `runs` unchanged for 24 s), and the
+///   stop confirms that each time rather than assuming it.
 pub fn stop(config_path: &Path) -> Result<String> {
     #[cfg(target_os = "windows")]
     {
@@ -337,8 +341,8 @@ pub fn stop(config_path: &Path) -> Result<String> {
     {
         if Install::detect(config_path) == Install::LinuxSystem {
             bail!(
-                "this daemon is the system service, which runs as root: `sudo systemctl stop \
-                 roomlerd` stops it the same way, with a SIGTERM"
+                "this daemon is the system service, which runs as root: `sudo roomlerd service \
+                 stop --as-service` stops it the same way, with a SIGTERM"
             );
         }
         linux::stop()
@@ -346,11 +350,7 @@ pub fn stop(config_path: &Path) -> Result<String> {
     #[cfg(target_os = "macos")]
     {
         let _ = config_path;
-        bail!(
-            "launchd restarts a stopped LaunchAgent (KeepAlive), so there is no stop to ask for: \
-             `roomlerd service uninstall` unloads it, and a clean stop there unenrolls an \
-             ephemeral device"
-        )
+        macos::stop()
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
@@ -407,6 +407,233 @@ pub fn status() -> Result<AutostartStatus> {
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
         Ok(AutostartStatus::Unknown)
+    }
+}
+
+/// FR-97 P6c — `service <verb> --as-service` (alias `--system`) on Linux and
+/// macOS: the root daemon, under the OS's own service manager. It is the verb
+/// Windows has had for the SCM, and it registers what the package already
+/// ships: systemd's `roomlerd.service`, launchd's `com.roomler.daemon`.
+///
+/// The decisions live here, free of `cfg`, so the Linux test run proves the
+/// macOS ones too (CI only compiles macOS). The per-OS modules run the tools.
+pub mod system {
+    /// The OS a decision is for.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Os {
+        Linux,
+        MacOs,
+    }
+
+    /// The root daemon's config on both: the system unit's `ROOMLERD_CONFIG`
+    /// and the LaunchDaemon's `--config` (pinned by tests against both).
+    pub const CONFIG: &str = "/etc/roomler/config.toml";
+    /// The system unit the `.deb` and the tarball ship.
+    pub const LINUX_UNIT: &str = "roomlerd.service";
+    /// Where that unit file is, on a usr-merged host and a split one.
+    pub const LINUX_UNIT_FILES: [&str; 2] = [
+        "/usr/lib/systemd/system/roomlerd.service",
+        "/lib/systemd/system/roomlerd.service",
+    ];
+    // FR-96's update helper (`roomler-update.timer` + `.path`) is left as it
+    // is, both ways: it steps aside by itself while this unit is enabled
+    // (`SYSTEM_DAEMON_ENABLE_LINKS` in updater.rs) and serves again once it
+    // is not, so one updater per host holds with no step here, and an
+    // administrator's own disable of the helper is never undone.
+    pub const MACOS_LABEL: &str = "com.roomler.daemon";
+    pub const MACOS_PLIST: &str = "/Library/LaunchDaemons/com.roomler.daemon.plist";
+    /// The plist the `.pkg` carries inside the bundle; its postinstall copies
+    /// it to [`MACOS_PLIST`] when the marker below exists.
+    pub const MACOS_PLIST_SOURCE: &str =
+        "/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.daemon.plist";
+    /// The postinstall's opt-in for the root half. Its ABSENCE makes the next
+    /// package upgrade remove the LaunchDaemon, so install writes it and
+    /// uninstall removes it: the verb and every later upgrade agree.
+    pub const MACOS_MARKER: &str = "/etc/roomler/enable-daemon";
+    const MACOS_DAEMON_BIN: &str = "/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd";
+
+    /// Why `service install --as-service` cannot go ahead, or `None`. Asked
+    /// before the service manager is touched, so a refusal changes nothing.
+    ///
+    /// ⚠️ A missing config is a refusal, not a warning: without one the
+    /// daemon exits 1, which neither unit's `RestartPreventExitStatus` covers
+    /// (`7 8`), so systemd and launchd would restart it every few seconds,
+    /// for good. The root daemon is its own enrollment.
+    pub fn install_refusal(
+        os: Os,
+        root: bool,
+        shipped: bool,
+        config_present: bool,
+    ) -> Option<String> {
+        if !root {
+            return Some(format!(
+                "registering the system service needs root: run `sudo roomlerd service install \
+                 --as-service`. The {} runs as root.",
+                what(os)
+            ));
+        }
+        if !shipped {
+            return Some(match os {
+                Os::Linux => format!(
+                    "{} is not on this host (looked in {}): reinstall the package or the tarball, \
+                     which ship it",
+                    LINUX_UNIT,
+                    LINUX_UNIT_FILES.join(" and ")
+                ),
+                Os::MacOs => format!(
+                    "{MACOS_PLIST_SOURCE} is missing: reinstall the .pkg, which ships it inside \
+                     the bundle"
+                ),
+            });
+        }
+        if !config_present {
+            return Some(format!(
+                "{CONFIG} does not exist. The {} is its own enrollment, and without a config it \
+                 would restart every few seconds. Enroll it first:\n  {}\nthen run this again.",
+                what(os),
+                enroll_hint(os)
+            ));
+        }
+        None
+    }
+
+    fn what(os: Os) -> &'static str {
+        match os {
+            Os::Linux => "system daemon (roomlerd.service)",
+            Os::MacOs => "root half (com.roomler.daemon)",
+        }
+    }
+
+    /// The command that writes the root daemon's config. On a Mac it turns
+    /// the overlay on too: the root half exists for the overlay (the
+    /// per-user half captures the screen), as `install.sh --daemon-token` does.
+    pub fn enroll_hint(os: Os) -> String {
+        match os {
+            Os::Linux => format!(
+                "sudo roomlerd --config {CONFIG} enroll --server <url> --token <enrollment-jwt> \
+                 --name <label>"
+            ),
+            Os::MacOs => format!(
+                "sudo {MACOS_DAEMON_BIN} --config {CONFIG} enroll --server <url> --token \
+                 <enrollment-jwt> --name <label> --overlay"
+            ),
+        }
+    }
+
+    /// The `service status --as-service` answer on Linux and macOS.
+    ///
+    /// ⚠️ It names its own unit and never reads `Roomler: …`: the companion
+    /// polls this command every 10 s on every OS and reads a `Roomler:` line
+    /// as WINDOWS' SCM service (`scm_answer` in roomler-desktop). A Unix host
+    /// answering in that shape would be shown as one. Pinned by a test.
+    pub fn status_line(os: Os, loaded: &str, enabled: &str) -> String {
+        match os {
+            Os::Linux => format!("{LINUX_UNIT}: {loaded}, {enabled}"),
+            Os::MacOs => format!("{MACOS_LABEL}: {loaded}, {enabled}"),
+        }
+    }
+
+    /// The real uid from a `/proc/<pid>/status`'s `Uid:` line.
+    pub fn uid_of_status(status: &str) -> Option<u32> {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|uid| uid.parse().ok())
+    }
+
+    /// The warning for a `roomlerd` that runs as another account beside the
+    /// root one: one daemon per machine (CLAUDE.md), and the person's unit
+    /// is theirs to stop.
+    pub fn other_daemon_warning(pid: u32, uid: u32) -> String {
+        format!(
+            "another roomlerd runs as uid {uid} (pid {pid}). One daemon per machine: as that \
+             account, run `systemctl --user disable --now roomler.service`"
+        )
+    }
+}
+
+/// FR-97 P6c — register the root daemon with the system service manager and
+/// start it. Returns what was done, to print.
+pub fn install_system() -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::install_system()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::install_system()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        bail!("the system service is registered with the SCM on Windows (win_service)")
+    }
+}
+
+/// FR-97 P6c — stop the root daemon and deregister it. Idempotent. The config
+/// stays: removing the enrollment is `install.sh --uninstall`'s.
+pub fn uninstall_system() -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::uninstall_system()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::uninstall_system()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        bail!("the system service is deregistered from the SCM on Windows (win_service)")
+    }
+}
+
+/// FR-97 P6c — the root daemon's state under its service manager.
+pub fn status_system() -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(linux::status_system())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(macos::status_system())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        bail!("the system service's state comes from the SCM on Windows (win_service)")
+    }
+}
+
+/// FR-97 P6c — start the registered root daemon now, through its manager.
+pub fn start_system() -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::start_system()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::start_system()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        bail!("the system service is started through the SCM on Windows (win_service)")
+    }
+}
+
+/// FR-97 P6c — stop the root daemon now: its clean stop runs, and an
+/// ephemeral device removes itself. On a Mac through `launchctl kill SIGTERM`:
+/// a clean exit stays down (the plist restarts only a failed one).
+pub fn stop_system() -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::stop_system()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::stop_system()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        bail!("the system service is stopped through the SCM on Windows (win_service)")
     }
 }
 
@@ -1048,6 +1275,131 @@ mod linux {
         ))
     }
 
+    // ── FR-97 P6c: the root daemon, `roomlerd.service` ──
+
+    pub fn install_system() -> Result<String> {
+        let shipped = system::LINUX_UNIT_FILES
+            .iter()
+            .any(|p| std::path::Path::new(p).exists());
+        if let Some(why) = system::install_refusal(
+            system::Os::Linux,
+            crate::appdirs::running_as_root(),
+            shipped,
+            std::path::Path::new(system::CONFIG).exists(),
+        ) {
+            bail!("{why}");
+        }
+        let mut done = Vec::new();
+        systemctl(&["daemon-reload"])?;
+        systemctl(&["enable", "--now", system::LINUX_UNIT])?;
+        // `enable --now` starts the unit only when it is not active: a re-run
+        // over a running one changes nothing.
+        done.push(format!(
+            "{} enabled and running (root, {})",
+            system::LINUX_UNIT,
+            system::CONFIG
+        ));
+        for (pid, uid) in other_daemons() {
+            done.push(format!(
+                "WARNING: {}",
+                system::other_daemon_warning(pid, uid)
+            ));
+        }
+        Ok(done.join("\n"))
+    }
+
+    pub fn uninstall_system() -> Result<String> {
+        if !crate::appdirs::running_as_root() {
+            bail!(
+                "deregistering the system service needs root: run `sudo roomlerd service uninstall --as-service`"
+            );
+        }
+        let mut done = Vec::new();
+        let (enabled, active) = unit_state(system::LINUX_UNIT);
+        if enabled == "not-found" {
+            done.push(format!(
+                "{} is not on this host: nothing to do",
+                system::LINUX_UNIT
+            ));
+        } else if enabled == "disabled" && active != "active" {
+            done.push(format!(
+                "{} is already stopped and disabled; {} is kept",
+                system::LINUX_UNIT,
+                system::CONFIG
+            ));
+        } else {
+            // `disable --now` waits for the stop: the daemon's clean stop runs.
+            systemctl(&["disable", "--now", system::LINUX_UNIT])?;
+            done.push(format!(
+                "{} stopped (a clean stop) and disabled; {} is kept",
+                system::LINUX_UNIT,
+                system::CONFIG
+            ));
+        }
+        Ok(done.join("\n"))
+    }
+
+    pub fn status_system() -> String {
+        let (enabled, active) = unit_state(system::LINUX_UNIT);
+        system::status_line(system::Os::Linux, &active, &enabled)
+    }
+
+    pub fn start_system() -> Result<String> {
+        systemctl(&["start", system::LINUX_UNIT])?;
+        Ok(format!("systemd started {}.", system::LINUX_UNIT))
+    }
+
+    pub fn stop_system() -> Result<String> {
+        systemctl(&["stop", system::LINUX_UNIT])?;
+        Ok(format!(
+            "systemd stopped {} (SIGTERM, a clean stop).",
+            system::LINUX_UNIT
+        ))
+    }
+
+    /// A system unit's `(is-enabled, is-active)` answers; `not-found` when
+    /// systemd has no such unit.
+    fn unit_state(unit: &str) -> (String, String) {
+        let ask = |verb: &str| {
+            Command::new("systemctl")
+                .args([verb, unit])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "not-found".to_string())
+        };
+        (ask("is-enabled"), ask("is-active"))
+    }
+
+    /// Every `roomlerd` that runs as an account other than root, from /proc.
+    fn other_daemons() -> Vec<(u32, u32)> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+            if comm.trim() != "roomlerd" {
+                continue;
+            }
+            let status = std::fs::read_to_string(entry.path().join("status")).unwrap_or_default();
+            if let Some(uid) = system::uid_of_status(&status)
+                && uid != 0
+            {
+                found.push((pid, uid));
+            }
+        }
+        found
+    }
+
     /// FR-93 P5 (#2144) — the target that has to START the unit after a
     /// logout, because `PartOf=` stops it with the session.
     const SESSION_TARGET: &str = "graphical-session.target";
@@ -1443,6 +1795,231 @@ mod macos {
         }
     }
 
+    // ── FR-97 P6c: the root half, `com.roomler.daemon` ──
+
+    fn running_as_root() -> bool {
+        // SAFETY: `geteuid` is a thread-safe read of the caller's own credentials.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn target() -> String {
+        format!("system/{}", system::MACOS_LABEL)
+    }
+
+    /// Is the root half loaded, and its `state`?
+    fn job_state() -> Option<String> {
+        state_of(&target())
+    }
+
+    /// `bootout` returns while the job is still draining, and a `bootstrap`
+    /// in that window fails "5: Input/output error" (the .pkg postinstall's
+    /// `replace_launchd_service`, field-caught on self-updates): wait until
+    /// launchd no longer knows the job.
+    fn bootout_and_wait() {
+        let _ = Command::new("launchctl")
+            .args(["bootout", &target()])
+            .output();
+        for _ in 0..30 {
+            if job_state().is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+
+    pub fn install_system() -> Result<String> {
+        let source = std::path::Path::new(system::MACOS_PLIST_SOURCE);
+        if let Some(why) = system::install_refusal(
+            system::Os::MacOs,
+            running_as_root(),
+            source.exists(),
+            std::path::Path::new(system::CONFIG).exists(),
+        ) {
+            bail!("{why}");
+        }
+        // The marker first: it is what keeps the job across the next .pkg
+        // upgrade, whose postinstall removes the LaunchDaemon without it.
+        std::fs::create_dir_all("/etc/roomler").context("creating /etc/roomler")?;
+        if !std::path::Path::new(system::MACOS_MARKER).exists() {
+            std::fs::write(system::MACOS_MARKER, b"")
+                .with_context(|| format!("writing {}", system::MACOS_MARKER))?;
+        }
+        // Already registered with this very plist: nothing to redo. A reload
+        // would be a stop, and an ephemeral device removes itself on a stop,
+        // then restarts into exit 7, which `KeepAlive` restarts (a failed exit).
+        let installed = std::fs::read(system::MACOS_PLIST).ok();
+        if job_state().is_some() && installed.is_some() && installed == std::fs::read(source).ok() {
+            return Ok(format!(
+                "{} is already registered with the shipped plist: left as it is",
+                system::MACOS_LABEL
+            ));
+        }
+        std::fs::copy(source, system::MACOS_PLIST)
+            .with_context(|| format!("copying {}", system::MACOS_PLIST))?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(system::MACOS_PLIST, std::fs::Permissions::from_mode(0o644))
+                .with_context(|| format!("chmod 644 {}", system::MACOS_PLIST))?;
+        }
+        bootout_and_wait();
+        let mut last = String::new();
+        for attempt in 1..=5 {
+            let out = Command::new("launchctl")
+                .args(["bootstrap", "system", system::MACOS_PLIST])
+                .output()
+                .context("running launchctl bootstrap")?;
+            if out.status.success() {
+                return Ok(format!(
+                    "{} bootstrapped into the system domain (root, {}); {} keeps it across \
+                     package upgrades",
+                    system::MACOS_LABEL,
+                    system::CONFIG,
+                    system::MACOS_MARKER
+                ));
+            }
+            last = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if attempt < 5 {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+        bail!(
+            "launchctl bootstrap system {} failed five times: {last}",
+            system::MACOS_PLIST
+        )
+    }
+
+    pub fn uninstall_system() -> Result<String> {
+        if !running_as_root() {
+            bail!(
+                "deregistering the system service needs root: run `sudo roomlerd service uninstall --as-service`"
+            );
+        }
+        let was_loaded = job_state().is_some();
+        bootout_and_wait();
+        let mut done = Vec::new();
+        if was_loaded {
+            done.push(format!("{} booted out (a clean stop)", system::MACOS_LABEL));
+        }
+        for path in [system::MACOS_PLIST, system::MACOS_MARKER] {
+            match std::fs::remove_file(path) {
+                Ok(()) => done.push(format!("removed {path}")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("removing {path}")),
+            }
+        }
+        if done.is_empty() {
+            done.push(format!(
+                "{} is not registered: nothing to do",
+                system::MACOS_LABEL
+            ));
+        }
+        done.push(format!("{} is kept", system::CONFIG));
+        Ok(done.join("\n"))
+    }
+
+    pub fn status_system() -> String {
+        let loaded = job_state().unwrap_or_else(|| "not loaded".to_string());
+        let marker = if std::path::Path::new(system::MACOS_MARKER).exists() {
+            "enabled"
+        } else {
+            "not enabled"
+        };
+        system::status_line(system::Os::MacOs, &loaded, marker)
+    }
+
+    pub fn start_system() -> Result<String> {
+        let out = Command::new("launchctl")
+            .args(["kickstart", &target()])
+            .output()
+            .context("running launchctl kickstart")?;
+        if !out.status.success() {
+            bail!(
+                "launchctl kickstart {} failed ({}): {} (is it registered? `sudo roomlerd \
+                 service install --as-service` registers it)",
+                target(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(format!("launchd started {}.", system::MACOS_LABEL))
+    }
+
+    /// SIGTERM through launchd: the daemon's clean stop, which exits 0. Both
+    /// plists' `KeepAlive` is `{SuccessfulExit = false}`, so launchd restarts
+    /// a job only after a FAILED exit and this one stays down until `after`.
+    /// Measured on macOS 15 for both jobs (FR-97 P6c: exit 0, `runs`
+    /// unchanged for 24 s), and checked here each time rather than assumed:
+    /// the job must read `not running`, and still read it a moment later.
+    fn sigterm_and_confirm(target: &str, label: &str, after: &str) -> Result<String> {
+        if state_of(target).is_none() {
+            bail!("{label} is not loaded: nothing to stop");
+        }
+        let out = Command::new("launchctl")
+            .args(["kill", "SIGTERM", target])
+            .output()
+            .context("running launchctl kill")?;
+        if !out.status.success() {
+            bail!(
+                "launchctl kill SIGTERM {target} failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let down = || state_of(target).is_some_and(|s| s != "running");
+        for _ in 0..30 {
+            if down() {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                if down() {
+                    return Ok(format!(
+                        "launchd stopped {label} (SIGTERM, a clean stop). It starts again {after}."
+                    ));
+                }
+                bail!(
+                    "{label} stopped, and launchd started it again: its exit did not read as clean"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        bail!("{label} still runs 30 s after its SIGTERM")
+    }
+
+    /// A launchd job's `state` (`running`, `not running`, …), `None` when
+    /// launchd does not know it.
+    fn state_of(target: &str) -> Option<String> {
+        let out = Command::new("launchctl")
+            .args(["print", target])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        Some(
+            text.lines()
+                .find_map(|l| l.trim().strip_prefix("state = ").map(str::to_string))
+                .unwrap_or_else(|| "loaded".to_string()),
+        )
+    }
+
+    /// FR-97 P6c (the stop P4d left refused) — the per-user LaunchAgent.
+    pub fn stop() -> Result<String> {
+        // SAFETY: `getuid` takes no arguments and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        sigterm_and_confirm(
+            &format!("gui/{uid}/{PLIST}"),
+            PLIST,
+            "at the next login or with `roomlerd service start`",
+        )
+    }
+
+    pub fn stop_system() -> Result<String> {
+        sigterm_and_confirm(
+            &target(),
+            system::MACOS_LABEL,
+            "at the next boot or with `sudo roomlerd service start --as-service`",
+        )
+    }
+
     fn plist_path() -> Result<std::path::PathBuf> {
         let home = directories::BaseDirs::new()
             .map(|d| d.home_dir().to_path_buf())
@@ -1483,6 +2060,108 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── FR-97 P6c: the system service's decisions, on every OS ──
+
+    #[test]
+    fn a_system_install_is_refused_in_order_root_then_the_unit_then_the_config() {
+        use system::{Os, install_refusal};
+        for os in [Os::Linux, Os::MacOs] {
+            let not_root = install_refusal(os, false, true, true).expect("refused");
+            assert!(not_root.contains("needs root"), "{not_root}");
+            // Root comes first: a non-root caller learns nothing it cannot act on.
+            assert!(
+                install_refusal(os, false, false, false)
+                    .unwrap()
+                    .contains("needs root")
+            );
+            let unshipped = install_refusal(os, true, false, true).expect("refused");
+            assert!(unshipped.contains("reinstall"), "{unshipped}");
+            let unenrolled = install_refusal(os, true, true, false).expect("refused");
+            assert!(unenrolled.contains(system::CONFIG), "{unenrolled}");
+            assert!(unenrolled.contains("enroll"), "{unenrolled}");
+            assert_eq!(install_refusal(os, true, true, true), None);
+        }
+    }
+
+    #[test]
+    fn the_enroll_hint_writes_the_config_the_service_reads() {
+        use system::{CONFIG, Os, enroll_hint};
+        let linux = enroll_hint(Os::Linux);
+        assert!(linux.starts_with("sudo roomlerd --config /etc/roomler/config.toml enroll "));
+        let mac = enroll_hint(Os::MacOs);
+        assert!(mac.contains(&format!("--config {CONFIG} enroll ")), "{mac}");
+        // The root half exists for the overlay, as `install.sh --daemon-token`.
+        assert!(mac.ends_with("--overlay"), "{mac}");
+        assert!(
+            !linux.contains("--overlay"),
+            "a Linux system node is not forced onto the mesh"
+        );
+    }
+
+    /// The companion polls `service status --as-service` on every OS and
+    /// reads a `Roomler:` line as WINDOWS' SCM service (`scm_answer` in
+    /// roomler-desktop). A Unix answer must never take that shape.
+    #[test]
+    fn the_unix_status_line_never_reads_as_windows_scm_answer() {
+        use system::{Os, status_line};
+        for os in [Os::Linux, Os::MacOs] {
+            for (loaded, enabled) in [
+                ("active", "enabled"),
+                ("running", "enabled"),
+                ("not loaded", "not enabled"),
+            ] {
+                let line = status_line(os, loaded, enabled);
+                assert!(
+                    !line.to_ascii_lowercase().starts_with("roomler:"),
+                    "{line} would read as the SCM service"
+                );
+            }
+        }
+        assert_eq!(
+            status_line(Os::Linux, "active", "enabled"),
+            "roomlerd.service: active, enabled"
+        );
+        assert_eq!(
+            status_line(Os::MacOs, "running", "enabled"),
+            "com.roomler.daemon: running, enabled"
+        );
+    }
+
+    #[test]
+    fn the_real_uid_comes_from_the_status_uid_line() {
+        let status = "Name:\troomlerd\nUmask:\t0022\nState:\tS (sleeping)\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n";
+        assert_eq!(system::uid_of_status(status), Some(1000));
+        assert_eq!(system::uid_of_status("Uid:\t0\t0\t0\t0\n"), Some(0));
+        assert_eq!(system::uid_of_status("Name:\tx\n"), None);
+        assert_eq!(system::uid_of_status("Uid:\tnot-a-number\n"), None);
+    }
+
+    /// The paths are the packaging's, pinned against the files that ship
+    /// them: a rename on either side fails here, not on a host.
+    #[test]
+    fn the_system_service_paths_are_the_packagings() {
+        let unit = include_str!("../packaging/linux/roomlerd.service");
+        assert!(
+            unit.contains(&format!("Environment=ROOMLERD_CONFIG={}", system::CONFIG)),
+            "roomlerd.service's ROOMLERD_CONFIG moved"
+        );
+        // That the update helper steps aside by THIS unit's enable link is
+        // updater.rs's own lock (`the_system_daemon_links_are_its_install_target`).
+        let plist = include_str!("../packaging/macos/com.roomler.daemon.plist");
+        assert!(plist.contains(&format!("<string>{}</string>", system::MACOS_LABEL)));
+        assert!(plist.contains(&format!("<string>{}</string>", system::CONFIG)));
+        let postinstall = include_str!("../packaging/macos/postinstall");
+        assert!(postinstall.contains(&format!(
+            "DAEMON_PLIST_SOURCE=\"{}\"",
+            system::MACOS_PLIST_SOURCE
+        )));
+        assert!(postinstall.contains(&format!("DAEMON_PLIST_TARGET=\"{}\"", system::MACOS_PLIST)));
+        assert!(
+            postinstall.contains(&format!("[ -f {} ]", system::MACOS_MARKER)),
+            "the postinstall's daemon gate reads another marker"
+        );
+    }
 
     #[test]
     fn only_the_companions_two_probes_skip_the_daemon_startup() {

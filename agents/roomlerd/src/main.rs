@@ -923,28 +923,31 @@ enum MediaAction {
 enum ServiceAction {
     /// Register the agent for auto-start on the next login.
     Install {
-        /// Windows-only opt-in: register `Roomler` with
-        /// the Service Control Manager (LocalSystem, AutoStart) instead
-        /// of the default per-user Scheduled Task. Use for fleet /
-        /// unattended deployments or when the host needs to be
-        /// reachable before any user logs in. Requires elevation.
-        #[arg(long)]
+        /// Register the ROOT daemon with the OS's own service manager instead
+        /// of the per-user auto-start: on Windows the `Roomler` SCM service
+        /// (LocalSystem, AutoStart), on Linux the system unit
+        /// `roomlerd.service`, on macOS the LaunchDaemon `com.roomler.daemon`
+        /// (FR-97 P6c). For fleet / unattended hosts, or ones that must be
+        /// reachable before anyone logs in. Requires elevation. On Linux and
+        /// macOS the root daemon is its own enrollment, in
+        /// /etc/roomler/config.toml, and it is refused until that exists.
+        #[arg(long, visible_alias = "system")]
         as_service: bool,
     },
     /// Remove the auto-start hook. Idempotent.
     Uninstall {
-        /// Mirror of `install --as-service`: removes the
-        /// `Roomler` SCM entry rather than the Scheduled
-        /// Task. Idempotent. Requires elevation.
-        #[arg(long)]
+        /// Mirror of `install --as-service`: stops the system service (a clean
+        /// stop) and deregisters it, rather than the per-user hook. The config
+        /// stays. Idempotent. Requires elevation.
+        #[arg(long, visible_alias = "system")]
         as_service: bool,
     },
     /// Print the current auto-start status.
     Status {
-        /// Report the SCM-registered `Roomler` state
-        /// (Running / Stopped / NotInstalled) instead of the
-        /// Scheduled Task.
-        #[arg(long)]
+        /// Report the system service's state instead of the per-user hook's:
+        /// `Roomler: Running | Stopped | NotInstalled` on Windows, the unit's
+        /// or the job's on Linux and macOS.
+        #[arg(long, visible_alias = "system")]
         as_service: bool,
     },
     /// Start the registered daemon NOW, through its service manager:
@@ -954,22 +957,27 @@ enum ServiceAction {
     /// running. This is the caller half of a restart under the Scheduled
     /// Task (FR-84 D3, `roomler restart`, the companion's "Apply now").
     Start {
-        /// Windows-only: start the `Roomler` SCM service instead (and wait
-        /// for RUNNING). Requires elevation on a stock install.
-        #[arg(long)]
+        /// Start the system service instead: the `Roomler` SCM service (and
+        /// wait for RUNNING), `roomlerd.service`, or `com.roomler.daemon`.
+        /// Requires elevation on a stock install.
+        #[arg(long, visible_alias = "system")]
         as_service: bool,
     },
     /// Stop the running daemon NOW, cleanly, so a clean stop's work runs and
     /// an ephemeral device removes itself. On Windows the per-user daemon of
     /// this config is asked through its own stop event, and its Scheduled Task
     /// is ended (`schtasks /End`) only if it does not leave in time or holds no
-    /// event; on Linux, `systemctl --user stop` the unit. macOS refuses:
-    /// launchd restarts a stopped LaunchAgent (FR-97 P4d).
+    /// event; on Linux, `systemctl --user stop` the unit; on macOS, a SIGTERM
+    /// through launchd, after which the LaunchAgent stays down until the next
+    /// login or `service start` (its plist restarts only a failed exit,
+    /// measured in FR-97 P6c; P4d had refused here).
     Stop {
-        /// Windows-only: stop the `Roomler` SCM service instead (and wait for
-        /// STOPPED). Its host asks the worker to leave (#1683). Requires
-        /// elevation on a stock install.
-        #[arg(long)]
+        /// Stop the system service instead. Windows waits for STOPPED, and
+        /// its host asks the worker to leave (#1683). Linux stops
+        /// `roomlerd.service`. macOS sends `com.roomler.daemon` a SIGTERM;
+        /// that clean stop stays down until the next boot or `service start
+        /// --as-service`. Requires elevation on a stock install.
+        #[arg(long, visible_alias = "system")]
         as_service: bool,
     },
 }
@@ -5021,9 +5029,11 @@ fn service_start_as_service() -> Result<()> {
     Ok(())
 }
 
+/// FR-97 P6c — the root daemon, through systemd or launchd.
 #[cfg(not(target_os = "windows"))]
 fn service_start_as_service() -> Result<()> {
-    bail!("`service start --as-service` is Windows-only.");
+    println!("{}", service::start_system()?);
+    Ok(())
 }
 
 /// FR-97 P4d — stop the SCM service and wait for STOPPED. The host asks its
@@ -5037,9 +5047,11 @@ fn service_stop_as_service() -> Result<()> {
     Ok(())
 }
 
+/// FR-97 P6c — the root daemon's clean stop, through systemd or launchd.
 #[cfg(not(target_os = "windows"))]
 fn service_stop_as_service() -> Result<()> {
-    bail!("`service stop --as-service` is Windows-only.");
+    println!("{}", service::stop_system()?);
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -5064,12 +5076,12 @@ fn service_install_as_service() -> Result<()> {
     Ok(())
 }
 
+/// FR-97 P6c — register the root daemon the package ships with the OS's own
+/// service manager (`roomlerd.service`, `com.roomler.daemon`) and start it.
 #[cfg(not(target_os = "windows"))]
 fn service_install_as_service() -> Result<()> {
-    bail!(
-        "`service install --as-service` is Windows-only. \
-         Use the default `service install` for systemd / launchd auto-start on this platform."
-    );
+    println!("{}", service::install_system()?);
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -5085,9 +5097,12 @@ fn service_uninstall_as_service() -> Result<()> {
     Ok(())
 }
 
+/// FR-97 P6c — stop the root daemon (a clean stop) and deregister it. The
+/// config stays.
 #[cfg(not(target_os = "windows"))]
 fn service_uninstall_as_service() -> Result<()> {
-    bail!("`service uninstall --as-service` is Windows-only.");
+    println!("{}", service::uninstall_system()?);
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -5097,9 +5112,12 @@ fn service_status_as_service() -> Result<()> {
     Ok(())
 }
 
+/// FR-97 P6c — the root daemon's state. ⚠️ Never a `Roomler:` line: the
+/// companion reads that as Windows' SCM service (`service::system::status_line`).
 #[cfg(not(target_os = "windows"))]
 fn service_status_as_service() -> Result<()> {
-    bail!("`service status --as-service` is Windows-only.");
+    println!("{}", service::status_system()?);
+    Ok(())
 }
 
 /// Env var the supervisor reads to gate the SystemContext worker swap.

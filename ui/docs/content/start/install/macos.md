@@ -154,5 +154,5 @@ the mesh address.
 
 - **Screen is the wallpaper and nothing else** → the Screen Recording grant. See above.
 - **Clicks and keys do nothing** → the Accessibility grant.
-- **The Mac is missing from `roomler peers`** → you installed the user half only. Add the root half with `--daemon-token`.
+- **The Mac is missing from `roomler peers`** → you installed the user half only. Add the root half with `--daemon-token`, or enroll it (`sudo /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd --config /etc/roomler/config.toml enroll … --overlay`) and run `sudo roomlerd service install --as-service`.
 - **More** → [Troubleshooting](/docs/troubleshooting/).

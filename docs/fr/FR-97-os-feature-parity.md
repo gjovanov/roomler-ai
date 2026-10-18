@@ -40,8 +40,10 @@
   against the last three releases' real artifacts (§8).
 - P6e-1, a daemon that never dies on a log sink (#1538: no panicking prints, no unbounded launchd stdout), merged
   (#2478), red → green on a Linux container and under a real launchd (§8).
-- P6d, `install.sh --uninstall`, is in review, field-verified on the branch (§8): six containers, a vmtest Ubuntu
+- P6d, `install.sh --uninstall`, merged (#2485), field-verified on the branch (§8): six containers, a vmtest Ubuntu
   guest per install type and a tart Mac with both halves, against the served script's red.
+- P6c, `service install --as-service` (alias `--system`) on Linux and macOS, is in review: field-verified on a
+  vmtest Ubuntu guest against 0.4.143's refusal, and the macOS stop's mechanism measured on a tart Mac (§8).
 - P6f needs no build: Windows got its private staging directory with GHSA-r3xj-4wh9-xh2v (0.4.142), and on macOS
   the root update helper's temp directory was measured to be root's own (§3.11, §8).
 - The rest of P2–P7 is open.
@@ -216,13 +218,13 @@ and the consent chain's fallbacks.
 | O1 | A per-user install updates itself | ✅ | ❌ | ✅ | #2046 | FR-96 |
 | O2 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | 🟡 built (P6a) | 🟡 built (P6a) | Was: `Unsupported`, so the install proceeded and a signed older package under a newer manifest installed (measured on 0.4.143, §8). P6a reads the `.deb`'s control `Version`, the tarball's top directory and the `.pkg`'s `PackageInfo` (`artifact_version.rs:114`) | P6a |
 | O3 | Tunnel CLI `roomler self-update` | ✅ | ❌ | ❌ | `agents/roomler-cli/src/update.rs:96-101` | P6b |
-| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | ❌ | ❌ | `main.rs:5003` | P6c |
+| O4 | One CLI verb registers the system service | ✅ `service install --as-service` | 🟡 built (P6c) | 🟡 built (P6c) | Was: refused as "Windows-only". P6c gives the same verb (alias `--system`) its Unix meaning: `roomlerd.service` enabled, or `com.roomler.daemon` bootstrapped, refused until the root daemon's own config exists (`service.rs`, `pub mod system`) | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 built (P6d) | 🟡 built (P6d) | Was: apt alone on Linux, the tarball nothing, and macOS a pasted recipe. P6d's `install.sh --uninstall` removes what any path installed, after a clean stop through each service's manager (`install.sh:886`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
 | O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | ❌ | `macos_supervisor.rs` never calls `crash_recorder` | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1170-1179` | P6f |
-| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`main.rs:3114`, `session_end.rs:220`) | P4d |
+| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`main.rs:3122`, `session_end.rs:220`) | P4d |
 | A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2312-2318`); the CLI and the wizard are universal | D6 |
 | A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:80-81`); behaviour under emulation unverified | D6 |
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` (`release-agent.yml:1093`); recordings write Opus, not AAC | P7a |
@@ -687,9 +689,9 @@ test of the SIGKILL property itself.
     through Unix tools.
   - Kill switch: `hive_adopt`, the device's own key, default off. `docs/hive.md` §8 (*On Windows*).
 - **P4d, a clean stop for Scheduled-Task installs** (built). Two channels into the arm the SCM host's event already
-  reaches (`main.rs:3114`):
+  reaches (`main.rs:3122`):
   - **`roomlerd service stop`** signals a `Local\` event keyed by the config's instance id (`stop_event.rs:338`),
-    waits up to 15 s for the daemon to leave, and only then ends the task (`service.rs:558`).
+    waits up to 15 s for the daemon to leave, and only then ends the task (`service.rs:785`).
   - **A hidden top-level window** turns `WM_ENDSESSION` into the stop and holds the session's end for at most 5 s,
     until the clean shutdown is on disk (`session_end.rs:220`). A console handler hears no sign-out once `user32` is
     loaded.
@@ -768,8 +770,29 @@ model on Windows, so the three agree on what the mode means.
     13 / Ubuntu 24.04+ (#2472).
   - So P6b ships after a new, operator-approved tunnel release: `release-tunnel.yml` signs `.asc` now, and #2474 has
     the CLI declare both libssl names.
-- **P6c, `roomlerd service install --system`** on Linux (`systemctl enable --now roomlerd.service`) and macOS (bootstrap
-  `com.roomler.daemon`, keeping the postinstall's enable marker in step).
+- **P6c, `roomlerd service install --as-service` (alias `--system`) on Linux and macOS (built).** The verb Windows has
+  had for the SCM now registers the root daemon the package ships, under the OS's own manager. `uninstall`, `status`,
+  `start` and `stop` follow it (`service.rs`: the cfg-free `pub mod system` and the two per-OS halves).
+  - **Linux:** `daemon-reload`, then `systemctl enable --now roomlerd.service`. Uninstall is `disable --now`, a clean
+    stop; the config stays.
+  - **macOS:** the enable marker first, because its absence makes the next `.pkg` upgrade remove the LaunchDaemon.
+    Then the bundle's plist into `/Library/LaunchDaemons`, then a bootstrap that waits out `bootout`'s drain. A re-run
+    over the same plist changes nothing: a reload is a stop, which an ephemeral device would not survive.
+  - **Refused until the root daemon's own config exists.** Without one the daemon exits 1, which neither unit's
+    `RestartPreventExitStatus=7 8` covers, so it would restart every few seconds for good. The refusal prints the
+    enroll command, with `--overlay` on a Mac, where the root half exists for the overlay.
+  - **One updater per host, with no step here.** FR-96's helper steps aside by itself while `roomlerd.service` is
+    enabled (`SYSTEM_DAEMON_ENABLE_LINKS`) and serves again once it is not. So the verb never touches it, and an
+    administrator's own disable of the helper is never undone.
+  - **One daemon per machine.** A `roomlerd` running as another account beside the new root one is named in a
+    warning, with the command that stops it: it is that account's to stop.
+  - **The status line names its own unit.** The companion polls `service status --as-service` on every OS and reads
+    a `Roomler:` line as Windows' SCM service. A Unix answer never takes that shape, pinned by a test that a negative
+    control showed failing.
+  - **A macOS stop that stays stopped.** `launchctl kill SIGTERM` is the daemon's clean stop, which exits 0, and
+    both plists' `KeepAlive = {SuccessfulExit = false}` restarts only a failed exit. Measured on macOS 15 (§8): both
+    jobs read `not running`, exit 0, for 24 s. The stop confirms it each time. P4d's per-user macOS `service stop`
+    had refused on the belief that launchd would restart the agent; it now stops the same way.
 - **P6d, `install.sh --uninstall [--keep-config]` (built).** One command removes what any install path put on a Linux
   or macOS machine: this script, the `.deb`, the companion's `.rpm`, the tarball, the `.pkg`, the tunnel CLI. Every
   step acts only on what is there, so it also works on a partial install and when run twice (`install.sh:886`).
@@ -879,7 +902,7 @@ model on Windows, so the three agree on what the mode means.
 | **P5b** | A person's SSH session starts in their home: the shell, a command and `sftp` for `named` and `console_user` on Linux + macOS, and Windows `console_user`'s shell and commands in the profile (as `sftp` since P4b); the `chdir` after the drop, where sshd does it (built) | `ROOMLERD_SSH_START_IN_HOME=0` | the lab + a Win11 SystemContext guest | S |
 | **P6a** | Artifact version binding: `.deb`, `.pkg`, tarball (built) | `ROOMLERD_ARTIFACT_VERSION_CHECK=0` | the last three releases' real artifacts; a hostile feed, red on 0.4.143 | S–M |
 | **P6b** | `roomler self-update` on Unix + the pinned PGP check | — | Linux + Mac tunnel-only hosts | M |
-| **P6c** | `service install --system` on Linux + macOS | — | vmtest | S |
+| **P6c** | `service install --as-service` (alias `--system`) on Linux + macOS (built) | — (a new verb) | a vmtest Ubuntu guest, red on 0.4.143; the macOS stop's mechanism on a tart Mac | S |
 | **P6d** | `install.sh --uninstall [--keep-config]` (built) | — (a new flag; the install path is unchanged) | six throwaway containers on four distros, a vmtest Ubuntu guest per install type, a tart Mac with both halves; red on the served script | S |
 | **P6e** | macOS supervisor crash capture; #1538 (P6e-1, never die on a log sink: built) | — (a liveness fix) | a field Mac; a duplicate start with stderr on `/dev/full`, red on 0.4.143 | S |
 | **P6f** | Private staging dir on Windows + macOS (settled: Windows by GHSA-r3xj-4wh9-xh2v, macOS measured private) | — | Win10, Win11, a Mac | S |
@@ -975,7 +998,9 @@ one depends on it.
   were checked under a real launchd. The `install.sh --uninstall` round trip is field-verified on P6d's branch, §8:
   the served script refused the flag, and the branch's removed a released install, both halves on a Mac and each
   install type on a vmtest Ubuntu guest, after a clean stop in which each ephemeral device removed itself. It is
-  checked again on the served script once it ships. The rest is P6b, P6c and P6e-2.)*
+  checked again on the served script once it ships. The `service install --system` round trip is field-verified on
+  Linux on P6c's branch, §8 (red on 0.4.143). On a Mac its stop's mechanism is measured on the released pkg, and
+  the verb itself runs on the release check. The rest is P6b and P6e-2.)*
 - [ ] **AC14 (P7):** an arm64 Linux host advertises a hardware cell and records AAC; the arm64 CLI and wizard
   install.
 - [ ] **AC15 (the rule):** P0d's server count of advertised capability words by OS, taken before P0 and after the
@@ -1138,3 +1163,5 @@ one depends on it.
 | 2026-10-18 | released 0.4.143 (`vmtest` lane `ubuntu/script/user`, kept), then the branch's `install.sh --uninstall`, run as the user | a throwaway Ubuntu 24.04 GNOME guest: the per-user unit, the companion running in the session, the update helper's timer and path on, the device enrolled ephemeral | 🟢 **P6d, a Linux per-user install.** It stopped the timer and the path, then `vmtest`'s `roomler.service` through the user's own systemd. The daemon logged "OS/service-manager stop received; shutting down gracefully", "ephemeral device unenrolled itself on shutdown" 0.24 s later, and systemd "Stopped roomler.service". The companion took its SIGTERM, and one `dpkg --purge` took both packages. The config, the portal token's folder and the root helper's tree went. After: no unit file, no process, no package, every path absent. The row was gone from the listing 324 s after the stop, short of the reaper's TTL + 180 s, so the device removed itself. A second run exited 0 and removed nothing. The run took 3 min: on that guest each `sudo` costs 15 s (`sudo true`, 15 021 ms). Noted on the way: the stop logs a WARN, "the OS route monitor exited — respawning it", because systemd's SIGTERM reaches the monitor too. The guest was destroyed |
 | 2026-10-18 | released 0.4.143 (`vmtest` lane `ubuntu/script/system`, kept), then the branch's `install.sh --uninstall` under `sudo` | a throwaway Ubuntu 24.04 GNOME guest: the root `roomlerd.service` with the kernel TUN `roomler0`, the overlay's routes and resolved's split-DNS link (`~vmtest.roomler.ai`), the companion running in the person's session, the device enrolled ephemeral | 🟢 **P6d, a Linux system install.** It stopped `roomlerd.service` through systemd. The daemon logged "OS/service-manager stop received; shutting down gracefully", then "ephemeral device unenrolled itself on shutdown" 0.24 s later. The companion took its SIGTERM at once, and one `dpkg --purge` took both packages. `/etc/roomler`, the caller's tree and root's tree went. After: no unit file, no process, no package, no `roomler0` and no route through it, and no DNS link but the uplink's. The row was absent at the first poll, 95 s after the stop. A second run exited 0 and removed nothing. The whole run took 19 s, 15 of them the outer `sudo`. The guest was destroyed |
 | 2026-10-18 | released 0.4.143's `.pkg`, both halves, then the branch's `install.sh --uninstall` under `sudo`; run twice, the second time on the final script | a throwaway tart Mac with `admin` at the GUI; the root half enrolled ephemeral with the overlay, the per-user half enrolled ephemeral too | 🟢 **P6d, macOS.** Before: four launchd jobs, three processes, the overlay's `utun4` with 3 routes through it, the split-DNS entry, the `com.roomler.agent` receipt and both TCC grants. The uninstall (1–2 s, exit 0) booted out `com.roomler.update`, `gui/501`'s companion and agent, then the root half. The root daemon logged its graceful stop, then "ephemeral device unenrolled itself on shutdown" 0.38 s later, then "magicdns: OS split-DNS reverted". After: no job, no process, no `utun4` and no route through one, no DNS entry, no receipt, no TCC row, and every path absent. Both rows were absent at the first poll, 2 s after the stop. A second run exited 0 and removed nothing. The VM was destroyed |
+| 2026-10-18 | released 0.4.143's `.pkg`, both halves enrolled ephemeral | a throwaway tart Mac (macOS 15), `admin` at the GUI | 🟢 **P6c's macOS stop, its mechanism.** `launchctl kill SIGTERM system/com.roomler.daemon`: within 2 s it read `state = not running`, `last exit code = 0`, `runs = 1`, and so for all 24 s, with no restart. `gui/501/com.roomler.agent` did the same (`runs` stayed 3). Both rows were absent afterwards: each clean stop unenrolled its ephemeral device. ❗ **Found:** P4d's per-user macOS `service stop` refused because "launchd restarts a stopped LaunchAgent (KeepAlive)". It does not after a clean exit: both plists restart only a failed one (`SuccessfulExit = false`). The VM was destroyed |
+| 2026-10-18 | released 0.4.143 (`vmtest` lane `ubuntu/script/user`, kept), then the P6c candidate (`9cea44d8`, a default-feature release build, run from `/tmp`) | a throwaway Ubuntu 24.04 GNOME guest: the per-user unit running, the update helper's timer and path on, `roomlerd.service` shipped but disabled | 🔴 The release refused the verb: "`service install --as-service` is Windows-only", and `status --as-service` the same, both exit 1. 🟢 **P6c, Linux.** The candidate refused without root, then (as `--system`) without `/etc/roomler/config.toml`, printing the enroll command. After a root ephemeral enrollment it enabled and started `roomlerd.service` and warned "another roomlerd runs as uid 1000 … One daemon per machine". The update helper's timer and path stayed as they were. Status read `roomlerd.service: active, enabled` under both spellings, never `Roomler:`, and the root row appeared on the server. `stop --as-service` was a clean stop ("shutting down gracefully", then "ephemeral device unenrolled itself" 0.23 s later), and the row was gone at the first poll, 15 s after. `uninstall --as-service` disabled the unit and kept the config, a second run exited 0, and status read `inactive, disabled`. The per-user daemon ran throughout. The guest was destroyed |
