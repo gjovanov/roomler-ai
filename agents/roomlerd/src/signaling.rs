@@ -1497,6 +1497,11 @@ async fn connect_once(
     if !ctx.is_primary {
         strip_replica_verbs(&mut hello_caps.rpc);
     }
+    // FR-90 P3-4a — `vault` exactly where the hello carries the key.
+    crate::vault::apply_word(
+        &mut hello_caps.rpc,
+        crate::vault::takes_leases(cfg.vault_enabled, ctx.is_primary),
+    );
     // FR-94 — `exec-system` on exactly the connection of the device this
     // machine's SYSTEM service is anchored for, and the heartbeat re-announces
     // when that changes (an anchor written or removed while connected).
@@ -1608,6 +1613,12 @@ async fn connect_once(
     #[cfg(hive_host)]
     if ctx.is_primary {
         crate::hive::on_connected(outbound_tx.clone());
+    }
+    // FR-90 P3-4a — and its lease requests: the vault answers each on the
+    // connection it came from.
+    #[cfg(feature = "vault")]
+    if ctx.is_primary {
+        crate::vault::on_connected(outbound_tx.clone());
     }
     let _sink_guard = tunnel_hub.publish_sink(outbound_tx.clone());
     // FR-43 P2b — point the delegation channel at THIS connection's outbound
@@ -2142,6 +2153,10 @@ async fn connect_once(
                     if !ctx.is_primary {
                         strip_replica_verbs(&mut c.rpc);
                     }
+                    crate::vault::apply_word(
+                        &mut c.rpc,
+                        crate::vault::takes_leases(cfg.vault_enabled, ctx.is_primary),
+                    );
                     crate::exec_service::apply_word(&mut c.rpc, exec_system_now);
                     crate::ssh_service::apply_word(&mut c.rpc, ssh_system_now);
                     c.record = record_now;
@@ -5855,6 +5870,47 @@ async fn handle_server_msg(
                     }
                 }
             });
+        }
+
+        // FR-90 P3-4a — the vault's answers to this daemon's lease requests,
+        // and its revocations. Leases are the primary enrollment's only: a
+        // secondary org's connection never asks, so what arrives there is
+        // dropped unopened. Never logged with the frame: `sealed` is a value,
+        // if a sealed one.
+        ServerMsg::VaultLeased {
+            req_id,
+            lease_id,
+            n,
+            sealed,
+            expires_at_ms,
+        } => {
+            #[cfg(feature = "vault")]
+            if ctx.is_primary {
+                crate::vault::on_leased(&req_id, &lease_id, n, &sealed, expires_at_ms);
+            } else {
+                debug!(%lease_id, "rc:vault.leased on a secondary org's connection — dropped unopened");
+            }
+            #[cfg(not(feature = "vault"))]
+            {
+                let _ = (req_id, n, sealed, expires_at_ms);
+                debug!(%lease_id, "rc:vault.leased ignored — this build takes no leases");
+            }
+        }
+        ServerMsg::VaultRefused { req_id, reason } => {
+            #[cfg(feature = "vault")]
+            if ctx.is_primary {
+                crate::vault::on_refused(&req_id, &reason);
+            }
+            #[cfg(not(feature = "vault"))]
+            let _ = (req_id, reason);
+        }
+        ServerMsg::VaultRevoke { lease_ids, reason } => {
+            #[cfg(feature = "vault")]
+            if ctx.is_primary {
+                crate::vault::on_revoke(&lease_ids, &reason);
+            }
+            #[cfg(not(feature = "vault"))]
+            let _ = (lease_ids, reason);
         }
 
         // Remaining tunnel-flow `ServerMsg` variants

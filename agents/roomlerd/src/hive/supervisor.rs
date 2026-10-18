@@ -3865,6 +3865,11 @@ impl Supervisor {
         if live.get(&session).is_some_and(|l| l.fence == fence) {
             live.remove(&session);
         }
+        drop(live);
+        // FR-90 P3-4a — what the vault leased to this run goes with it. Every
+        // way a run stops being live here passes through this.
+        #[cfg(feature = "vault")]
+        crate::vault::drop_run(session, fence);
     }
 
     /// P1d-2 — a session resumed after its daemon went down. A turn the
