@@ -1022,6 +1022,19 @@ New cells run three times before they are trusted. An entry in `expected-failure
   picture, the scrap arm, no wait and no reach warning.
 
   Owed: a Windows and a macOS session on a release that carries P1a.
+
+  ✅ **A Windows session on the released 0.4.143** (2026-10-18). The host was a vmtest Windows 11 cell, a system
+  install of what the server served as latest at 10:32Z (0.4.143, published 09:52Z; the harness does not record
+  the installed version). One viewer session (prod's viewer, the lifecycle spec's sampler) ran 45 s at 500 ms:
+  - a picture in **84 of 84** samples, 83 of them distinct;
+  - **no** wait notice, **no** input-reach warning and **no** status line: nothing 0.4.124 would not have sent.
+    That is the code's own claim (above): the reach verdict is `full` on Windows, and only the Linux DRM and
+    portal backends report a wait.
+  - The cell's own `#companion-autostart` and `#desktop` checks failed with `in_console_session=False` (the VM
+    had no live console session), which skipped its `#rd`. Install, enroll and overlay passed, and this session's
+    picture did not depend on them.
+
+  Owed: the macOS session. The macOS lane's host is the operator's own Mac, so it waits for their go-ahead.
 - [x] **AC12** — Asahi (real scanout) passes AC1/AC4/AC5/AC7 on the released build.
   ✅ **0.4.139, the release** (published 2026-10-16 10:15Z; step log 93), on a rented Apple M2 Pro Mac mini with
   Fedora Asahi Remix 42 (`apple-drm`, HDMI 4096×2160), GNOME 48 and Plasma 6.6 beside each other. Installed by the
