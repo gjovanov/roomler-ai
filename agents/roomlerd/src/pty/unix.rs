@@ -101,7 +101,7 @@ impl PtyProcess {
     ///
     /// `run_as` goes through the same [`crate::exec::apply_run_as`] as every
     /// other execution path, so the identity rules — and every refusal, such as
-    /// `console_user` being a Windows-only concept — are identical here. There
+    /// `console_user` with nobody at the screen — are identical here. There
     /// is deliberately no separate privilege story for interactive sessions.
     pub fn spawn(
         command: Option<&str>,
@@ -496,18 +496,22 @@ mod tests {
         let _ = pty.wait().await;
     }
 
-    /// `console_user` is a Windows concept, and the PTY path must refuse it for
-    /// exactly the same reason and with the same words as every other execution
-    /// path — one identity model, not two.
+    /// The PTY path refuses what every other execution path refuses, for the
+    /// same reason and in the same words — one identity model, not two.
+    /// `console_user` with nobody at the screen (FR-97 P5a) is the refusal
+    /// every CI runner meets; a desktop running the tests as the person at it
+    /// can honour it, so there this test proves nothing and says so.
     #[test]
     fn the_identity_rules_are_the_same_ones_exec_enforces() {
-        let err = PtyProcess::spawn(
-            None,
-            "xterm",
-            WinSize { cols: 80, rows: 24 },
-            &crate::exec::RunAs::ConsoleUser,
-        )
-        .expect_err("console_user cannot be honoured on unix");
+        let who = crate::exec::RunAs::ConsoleUser;
+        let mut probe = tokio::process::Command::new("/bin/true");
+        let Err(exec_says) = crate::exec::apply_run_as(&mut probe, &who) else {
+            eprintln!("skipped: someone is at this machine's screen, so console_user can run");
+            return;
+        };
+        let err = PtyProcess::spawn(None, "xterm", WinSize { cols: 80, rows: 24 }, &who)
+            .expect_err("the pty must refuse what exec refuses");
+        assert_eq!(err, exec_says, "the same refusal, in the same words");
         assert!(
             err.contains("console_user"),
             "the refusal must name the mode, got {err:?}"

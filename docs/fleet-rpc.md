@@ -296,7 +296,11 @@ flowchart TD
   V -- no --> Q{"Windows, and the org requires SYSTEM?"}
   Q -- yes --> D2["refused: system_required"]
   Q -- no --> C{"run_as = console_user?"}
-  C -- yes --> D3["refused: run_as_unavailable"]
+  C -- yes --> L{"Linux or macOS, and this connection<br/>advertises console-user? (FR-97 P5a)"}
+  L -- no --> D3["refused: run_as_unavailable"]
+  L -- yes --> PU["rc:rpc.exec run_as = console_user: the daemon drops<br/>to the person at its screen, ran_as = console_user"]
+  PU --> T2{"someone at the screen?"}
+  T2 -- no --> D6["refused on the device: nobody is signed in"]
   C -- no --> W["the process holding the agent socket runs it<br/>(Windows: the worker, ran_as = worker)"]
   V -- yes --> P["exec_pending row; rc:rpc.exec via_service to the worker"]
   P --> K{"the person's exec_enabled, consent,<br/>then the anchor's exec_enabled"}
@@ -322,13 +326,35 @@ mode is SYSTEM, the opposite of the policy. A policy `PUT` that does not name
 `run_as` keeps the stored one: a stale client saving the policy must not turn
 the signed-in user back into SYSTEM.
 
+**Off Windows (FR-97 P5a)** the same policy means the person at the device's
+screen: logind's seat0 on Linux, the owner of `/dev/console` on macOS. No
+service is involved: the root daemon drops to them itself, by the drop a `named`
+SSH account takes, and refuses when nobody is at the screen
+([`roomler-ssh.md`](roomler-ssh.md) § `console_user` on Linux and macOS). The
+server says so in the frame (`rc:rpc.exec`'s `run_as`), and it is the one frame
+field an older agent must never be sent, because it would ignore the field and
+run the command as root:
+
+| Where | What is checked | Source |
+|---|---|---|
+| The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:960`](../crates/modules/fleet/src/agent_exec.rs#L960) |
+| Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:359`](../crates/modules/fleet/src/agent_exec.rs#L359) |
+| The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3304`](../crates/modules/fleet/src/hub.rs#L3304) |
+| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:4590`](../agents/roomlerd/src/signaling.rs#L4590) |
+
+The word is kept per connection, never read from the stored row, for the reason
+`ssh-grant-ack` is: after a rollback the row still promises what the running
+agent does not do.
+
 **An org can require SYSTEM.** With `exec_require_system` on (workspace
 Settings, `PUT /api/tenant/{tid}/exec-settings`), a Windows command that cannot
 take the SYSTEM path is refused as `system_required` instead of running as the
 signed-in user.
 
 Every `exec_audit` row that ran records the server's own routing decision as
-`ran_as`: `system` or `console_user` through the service, `worker` otherwise.
+`ran_as`: `system` or `console_user` through the service, `console_user` for a
+Linux or macOS daemon told to drop to the person at its screen (FR-97 P5a),
+`worker` otherwise.
 That is what the audit view shows. The result the caller gets carries the
 device's claim instead, and only the service makes one: a worker's answer has
 no `ran_as`. The audit row is authoritative.
@@ -389,7 +415,7 @@ Exit status mirrors the remote command's, so `roomler exec` composes in a
 script: a refusal or failure is non-zero here too, never a silent 0.
 
 The target is a device name or a hex agent id, resolved by the server within
-the caller's org (`crates/modules/fleet/src/socket.rs:1084` `resolve_exec_target`:
+the caller's org (`crates/modules/fleet/src/socket.rs:1089` `resolve_exec_target`:
 hex id → exact name → case-insensitive name). A dashboard **display name** is
 turned into the hex id by the CLI before the request leaves — only when no
 device name matches it, and refused when two devices share it

@@ -2793,6 +2793,17 @@ pub enum ServerMsg {
         /// running the command itself, as an identity it was not asked for.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         via_service: bool,
+        /// FR-97 P5a — who runs it in this process: `console_user`, the
+        /// person at the device's screen, instead of the daemon. Sent only to
+        /// a Linux or macOS device advertising `console-user`
+        /// ([`crate::models::RpcCap::ConsoleUser`]): an older agent ignores
+        /// the field and would run the command as root, the identity the
+        /// policy refused. Absent ⇒ the daemon, as ever. A word this build
+        /// does not know is refused, never run as the daemon. A string, not
+        /// [`crate::models::ExecRunAs`]: a newer server's word must fail the
+        /// command, not the whole frame, which a caller would wait out.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_as: Option<String>,
     },
 
     /// Kill an in-flight [`Self::RpcExec`] and its whole process tree. The
@@ -8664,6 +8675,7 @@ mod tests {
             caller: "goran".into(),
             consent_mode: Some(crate::models::ConsentMode::Auto),
             via_service: false,
+            run_as: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:rpc.exec""#));
@@ -8676,6 +8688,11 @@ mod tests {
         assert!(
             !s.contains("via_service"),
             "via_service must be omitted when false: {s}"
+        );
+        // FR-97 P5a — and `run_as` when absent, for the same reason.
+        assert!(
+            !s.contains("run_as"),
+            "run_as must be omitted when None: {s}"
         );
         match serde_json::from_str::<ServerMsg>(&s).unwrap() {
             ServerMsg::RpcExec {
@@ -8705,11 +8722,23 @@ mod tests {
             ServerMsg::RpcExec {
                 consent_mode,
                 via_service,
+                run_as,
                 ..
             } => {
                 assert_eq!(consent_mode, None);
                 // FR-94 — and an absent `via_service` is the worker path.
                 assert!(!via_service);
+                // FR-97 P5a — and an absent `run_as` is the daemon.
+                assert_eq!(run_as, None);
+            }
+            other => panic!("expected RpcExec, got {other:?}"),
+        }
+        let as_person = r#"{"t":"rc:rpc.exec","request_id":"r4","shell":"bash",
+            "command":"id","timeout_ms":1000,"max_output_bytes":1024,"caller":"x",
+            "run_as":"console_user"}"#;
+        match serde_json::from_str::<ServerMsg>(as_person).unwrap() {
+            ServerMsg::RpcExec { run_as, .. } => {
+                assert_eq!(run_as.as_deref(), Some("console_user"))
             }
             other => panic!("expected RpcExec, got {other:?}"),
         }

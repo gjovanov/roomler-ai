@@ -4553,6 +4553,7 @@ async fn handle_server_msg(
             caller,
             consent_mode,
             via_service,
+            run_as,
         } => {
             // FR-94 — a command meant for the SYSTEM service. Only a Windows
             // build advertises `exec-system`, so a server should never send
@@ -4581,6 +4582,30 @@ async fn handle_server_msg(
                     .await;
                 return Ok(());
             }
+            // FR-97 P5a — who runs it: the daemon, as Fleet RPC always has,
+            // unless the device's policy names the person at the screen,
+            // which the server sends only to a build advertising
+            // `console-user`. A word this build does not know is refused,
+            // before anyone is asked to approve it, never run as the daemon.
+            let run_as = match run_as.as_deref().map(crate::exec_service::run_as_of) {
+                None => crate::exec::RunAs::Daemon,
+                Some(Ok((who, _))) => who,
+                Some(Err(why)) => {
+                    warn!(%request_id, %caller, %why, "rc:rpc.exec refused — unknown run_as");
+                    let _ = outbound_tx
+                        .send(ClientMsg::RpcResult {
+                            request_id,
+                            exit_code: None,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            truncated: false,
+                            duration_ms: 0,
+                            error: Some(why),
+                        })
+                        .await;
+                    return Ok(());
+                }
+            };
             // Gate 4, read LIVE (docs/remote-config.md): a pushed change takes
             // effect on the next command, with no restart — which is why
             // this is the atomic and not the startup snapshot.
@@ -4710,9 +4735,10 @@ async fn handle_server_msg(
                 cwd,
                 caller: caller.clone(),
                 // Fleet RPC is privileged diagnostics by design — the whole
-                // point is `netsh`, route tables and service state. It has
-                // always run as the daemon and continues to.
-                run_as: crate::exec::RunAs::Daemon,
+                // point is `netsh`, route tables and service state. It runs
+                // as the daemon unless the policy named the person at the
+                // screen (FR-97 P5a, above).
+                run_as,
             };
             let ind = indicator.clone();
             tokio::spawn(async move {

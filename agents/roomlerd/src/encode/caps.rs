@@ -1786,6 +1786,13 @@ fn rpc_caps() -> Vec<String> {
         RpcCap::Config,
         RpcCap::ConfigReport,
     ];
+    // FR-97 P5a — a Linux or macOS build runs `console_user` as the person at
+    // its screen: SSH's account mode, and the `run_as` of `rc:rpc.exec`,
+    // which the server sends only to a connection advertising this. A
+    // property of the BUILD, like `exec`: whether anyone is at the screen is
+    // asked at each command. Windows' `console_user` is its service's.
+    #[cfg(unix)]
+    caps.push(RpcCap::ConsoleUser);
     if cfg!(feature = "ssh-server") {
         caps.push(RpcCap::Ssh);
         // P5d. Distinct from `ssh` because agents rc.419 and earlier advertise
@@ -2228,6 +2235,14 @@ mod tests {
             advertised.iter().any(|v| v == RpcCap::SshGrantAck.wire()),
             cfg!(feature = "ssh-server"),
             "ssh-grant-ack must be advertised exactly when the SSH server is built"
+        );
+        // FR-97 P5a — `console-user` on every Unix build and never on
+        // Windows, whose `console_user` is its SYSTEM service's: a Windows
+        // worker sent `run_as` would answer for an identity it never offered.
+        assert_eq!(
+            advertised.iter().any(|v| v == RpcCap::ConsoleUser.wire()),
+            cfg!(unix),
+            "console-user must be advertised exactly on Unix builds"
         );
     }
 

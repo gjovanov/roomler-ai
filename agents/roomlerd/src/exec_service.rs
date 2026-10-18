@@ -694,16 +694,17 @@ pub struct Posted<'a> {
     pub ran_as: Option<&'a str>,
 }
 
-/// The identity a claim's `run_as` names. An unknown word is a refusal,
-/// never SYSTEM: a newer server naming a mode this build does not know must
-/// not have its intent upgraded (`exec::RunAs::from_wire`'s rule).
+/// The identity a claim's `run_as` names, and since FR-97 P5a an
+/// `rc:rpc.exec` frame's on Linux and macOS. An unknown word is a refusal,
+/// never the daemon: a newer server naming a mode this build does not know
+/// must not have its intent upgraded (`exec::RunAs::from_wire`'s rule).
 pub fn run_as_of(word: &str) -> Result<(crate::exec::RunAs, &'static str), String> {
     match word {
         "system" => Ok((crate::exec::RunAs::Daemon, "system")),
         "console_user" => Ok((crate::exec::RunAs::ConsoleUser, "console_user")),
         other => Err(format!(
             "the server asked to run as {other:?}, which this build does not know; refusing \
-             rather than run it as SYSTEM"
+             rather than run it as SYSTEM or root"
         )),
     }
 }

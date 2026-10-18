@@ -117,6 +117,17 @@ async fn enrollment_token(app: &TestApp, seeded: &crate::fixtures::seed::SeededT
 
 /// A raw agent socket whose hello advertises `rpc`.
 async fn connect_agent(app: &TestApp, token: &str, machine: &str, rpc: &[&str]) -> AgentWs {
+    connect_agent_os(app, token, machine, "windows", rpc).await
+}
+
+/// [`connect_agent`] for a device of another OS (FR-97 P5a).
+async fn connect_agent_os(
+    app: &TestApp,
+    token: &str,
+    machine: &str,
+    os: &str,
+    rpc: &[&str],
+) -> AgentWs {
     let url = format!(
         "ws://{}/ws?token={}&role=agent",
         app.addr,
@@ -130,7 +141,7 @@ async fn connect_agent(app: &TestApp, token: &str, machine: &str, rpc: &[&str]) 
         json!({
             "t": "rc:agent.hello",
             "machine_name": machine,
-            "os": "windows",
+            "os": os,
             "agent_version": "0.4.131",
             "displays": [],
             "caps": {
@@ -984,11 +995,13 @@ async fn console_user_without_the_service_is_refused() {
     assert_eq!(rows[0]["denied"], json!("run_as_unavailable"));
 }
 
-/// `console_user` is a Windows mode, and a PUT that does not name `run_as`
-/// keeps the stored one: the policy PUT is a full replace, and a stale client
-/// saving it must not turn `console_user` back into SYSTEM.
+/// `console_user` is storable on Windows, and off it only for an agent that
+/// advertises `console-user` (FR-97 P5a; this Linux device has never said
+/// hello). A PUT that does not name `run_as` keeps the stored one: the
+/// policy PUT is a full replace, and a stale client saving it must not turn
+/// `console_user` back into SYSTEM.
 #[tokio::test]
-async fn run_as_is_windows_only_and_survives_a_put_that_omits_it() {
+async fn run_as_needs_a_device_that_can_and_survives_a_put_that_omits_it() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("fr94ra").await;
     let (linux_id, _) = enroll_os(&app, &seeded, "m-fr94-ra-l", "HOST-L", "linux").await;
@@ -1034,6 +1047,108 @@ async fn run_as_is_windows_only_and_survives_a_put_that_omits_it() {
     .await
     .unwrap();
     assert_eq!(back["run_as"], json!("system"));
+}
+
+// ---------------------------------------------------------------------------
+// FR-97 P5a — `console_user` on Linux and macOS: the daemon drops to the
+// person at its screen itself, told so in the frame.
+// ---------------------------------------------------------------------------
+
+/// A Linux agent that advertises `console-user` takes a `console_user`
+/// policy, and its command arrives with `run_as`, through no service; the
+/// audit records the identity. An agent without the word cannot have the
+/// policy stored: it would ignore the field and run the command as root.
+#[tokio::test]
+async fn console_user_on_linux_goes_to_the_daemon_that_drops_to_the_person() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr97cu").await;
+    set_org_exec(&app, &seeded, json!({ "remote_exec_enabled": true })).await;
+    let policy = json!({ "mode": "on", "consent_mode": "auto", "run_as": "console_user" });
+
+    let (old_id, old_token) = enroll_os(&app, &seeded, "m-fr97-old", "HOST-O", "linux").await;
+    let _old = connect_agent_os(&app, &old_token, "HOST-O", "linux", &["exec"]).await;
+    wait_agent_online(&app, &seeded, &old_id).await;
+    let refused = put_policy(&app, &seeded, &old_id, policy.clone()).await;
+    assert_eq!(refused.status(), 400, "an agent without the word");
+
+    let (agent_id, agent_token) = enroll_os(&app, &seeded, "m-fr97-cu", "HOST-P", "linux").await;
+    let mut ws = connect_agent_os(
+        &app,
+        &agent_token,
+        "HOST-P",
+        "linux",
+        &["exec", "console-user"],
+    )
+    .await;
+    wait_agent_online(&app, &seeded, &agent_id).await;
+    let set = put_policy(&app, &seeded, &agent_id, policy).await;
+    assert!(set.status().is_success(), "{:?}", set.status());
+
+    let exec = spawn_exec(&app, &seeded, &agent_id, "id -un");
+    let frame = read_until(&mut ws, "rc:rpc.exec").await.expect("frame");
+    assert_eq!(frame["run_as"], json!("console_user"), "{frame}");
+    assert!(frame.get("via_service").is_none(), "no service: {frame}");
+    let request_id = frame["request_id"].as_str().unwrap().to_string();
+    ws.send(Message::Text(
+        json!({
+            "t": "rc:rpc.result", "request_id": request_id,
+            "exit_code": 0, "stdout": "ana\n", "duration_ms": 4,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let out = tokio::time::timeout(Duration::from_secs(10), exec)
+        .await
+        .expect("the caller should resolve")
+        .unwrap();
+    assert_eq!(out["stdout"], json!("ana\n"), "{out}");
+
+    let rows = audit_rows(&app, &seeded).await;
+    let ran = rows
+        .iter()
+        .find(|r| r["request_id"] == json!(request_id) && r["denied"].is_null())
+        .expect("the run is audited");
+    assert_eq!(ran["ran_as"], json!("console_user"));
+}
+
+/// The default policy on Linux sends no `run_as`, so every agent's frame
+/// stays what it was, and the audit says the agent's own process ran it.
+#[tokio::test]
+async fn a_root_policy_on_linux_sends_no_run_as() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr97root").await;
+    set_org_exec(&app, &seeded, json!({ "remote_exec_enabled": true })).await;
+    let (agent_id, agent_token) = enroll_os(&app, &seeded, "m-fr97-root", "HOST-R", "linux").await;
+    let mut ws = connect_agent_os(
+        &app,
+        &agent_token,
+        "HOST-R",
+        "linux",
+        &["exec", "console-user"],
+    )
+    .await;
+    wait_agent_online(&app, &seeded, &agent_id).await;
+    let set = put_policy(
+        &app,
+        &seeded,
+        &agent_id,
+        json!({ "mode": "on", "consent_mode": "auto" }),
+    )
+    .await;
+    assert!(set.status().is_success(), "{:?}", set.status());
+
+    let exec = spawn_exec(&app, &seeded, &agent_id, "id -un");
+    let frame = read_until(&mut ws, "rc:rpc.exec").await.expect("frame");
+    assert!(frame.get("run_as").is_none(), "{frame}");
+    let request_id = frame["request_id"].as_str().unwrap().to_string();
+    worker_answers(&mut ws, &request_id, "declined").await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), exec)
+        .await
+        .expect("the caller should resolve");
+    let rows = audit_rows(&app, &seeded).await;
+    assert_eq!(rows[0]["ran_as"], json!("worker"));
 }
 
 // ---------------------------------------------------------------------------

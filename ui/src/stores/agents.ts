@@ -386,9 +386,11 @@ export interface ExecPolicy {
   consent_mode: ConsentMode | null
   /** Empty = any shell the host supports. */
   shells: string[]
-  /** FR-94 P4 — Windows only: the account its SYSTEM service runs a command
-   *  as. Absent when saving = keep what the device has (the server never
-   *  resets it), which is why the dialog's closed default leaves it out. */
+  /** FR-94 P4 — the account a Windows device's SYSTEM service runs a command
+   *  as. FR-97 P5a: on Linux and macOS, root (`system`) or the person at the
+   *  device's screen, for an agent that says `console-user`. Absent when
+   *  saving = keep what the device has (the server never resets it), which is
+   *  why the dialog's closed default leaves it out. */
   run_as?: 'system' | 'console_user'
 }
 
@@ -401,7 +403,9 @@ export type SshMode = 'off' | 'on'
  *  the console-session worker — the signed-in user on an attended install,
  *  SYSTEM in SystemContext mode — and `console_user` is refused on an
  *  attended install (it needs SYSTEM's `WTSQueryUserToken`). The SSH dialog
- *  still says "SYSTEM"; correcting it is FR-94's SSH follow-up (§8). */
+ *  still says "SYSTEM"; correcting it is FR-94's SSH follow-up (§8). On
+ *  Linux and macOS `console_user` is the person at the device's screen
+ *  (FR-97 P5a), for an agent that says `console-user`. */
 export type SshAccountMode = 'daemon' | 'console_user' | 'named'
 
 /** Roomler SSH gate 3 — the per-device session policy.

@@ -73,3 +73,11 @@ export function sshAsChip(
 export function servesSshAsSystem(rpc: readonly string[] | null | undefined): boolean {
   return (rpc ?? []).some((w) => w === 'ssh-system')
 }
+
+/** FR-97 P5a — does this Linux or macOS device run `console_user` itself, as
+ *  the person at its screen? Its agent's `console-user` word. Windows never
+ *  says it: there the signed-in user is the SYSTEM service's, keyed on the OS.
+ *  Matched by EQUALITY, like every capability word. */
+export function dropsToConsoleUser(rpc: readonly string[] | null | undefined): boolean {
+  return (rpc ?? []).some((w) => w === 'console-user')
+}

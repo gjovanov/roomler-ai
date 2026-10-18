@@ -233,6 +233,11 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_ssh_system_support(agent_id, caps.has_rpc(RpcCap::SshSystem));
+    // FR-97 P5a — whether a command may name `run_as: console_user` to this
+    // connection. Per connection: an older agent would ignore the field.
+    state
+        .rc_hub
+        .set_agent_console_user_support(agent_id, caps.has_rpc(RpcCap::ConsoleUser));
     state
         .rc_hub
         .set_agent_ssh_grant_ack(agent_id, acks_ssh_grants);
