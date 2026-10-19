@@ -903,6 +903,7 @@ async fn roles_and_policies_are_checked_before_they_are_kept() {
             "guardrail:windows-proxy-only",
             "guardrail:prod-never-materializes",
             "guardrail:exec-only-allowed-programs",
+            "guardrail:proxy-only-named-audiences",
             pid.as_str()
         ],
         "{list}"
@@ -1002,8 +1003,19 @@ async fn simulate_says_what_would_decide_a_request() {
     let me = t.admin.id.clone();
     let slug = t.tenant_slug.clone();
     post_json(&app, &t, "/role", json!({ "name": "dev" })).await;
-    let (_, _, staging) = create(&app, &t, json!({ "path": "staging/db", "kind": "static" })).await;
-    let (_, _, prod) = create(&app, &t, json!({ "path": "prod/db", "kind": "static" })).await;
+    // P3-5a — each names the upstream a proxy may present it to.
+    let (_, _, staging) = create(
+        &app,
+        &t,
+        json!({ "path": "staging/db", "kind": "static", "audiences": ["db.internal:5432"] }),
+    )
+    .await;
+    let (_, _, prod) = create(
+        &app,
+        &t,
+        json!({ "path": "prod/db", "kind": "static", "audiences": ["db.internal:5432"] }),
+    )
+    .await;
     let staging = staging["id"].as_str().unwrap().to_string();
     let prod = prod["id"].as_str().unwrap().to_string();
     let permit = format!(
@@ -1034,6 +1046,7 @@ async fn simulate_says_what_would_decide_a_request() {
             "principal": { "role": "dev", "owner_id": me },
             "resource": { "secret_id": secret },
             "mode": mode,
+            "audience": "db.internal:5432",
             "device": { "os": os, "tags": [], "owner_id": me },
         });
         if let (Some(b), Some(e)) = (body.as_object_mut(), extra.as_object()) {
@@ -1065,6 +1078,23 @@ async fn simulate_says_what_would_decide_a_request() {
         decided(&v),
         ("deny".into(), vec![]),
         "nothing permits prod: {v}"
+    );
+
+    // P3-5a — a proxy toward an upstream the secret does not name.
+    let (_, _, v) = sim(
+        &staging,
+        "proxy",
+        "linux",
+        json!({ "audience": "evil.example:5432" }),
+    )
+    .await;
+    assert_eq!(
+        decided(&v),
+        (
+            "deny".into(),
+            vec!["guardrail:proxy-only-named-audiences".into()]
+        ),
+        "{v}"
     );
 
     let (_, _, v) = sim(&staging, "env", "windows", json!({})).await;

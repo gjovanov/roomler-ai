@@ -611,10 +611,13 @@ async fn a_windows_device_is_leased_values_only_for_a_proxy() {
         .await;
         assert_eq!(refused(&answer), "denied", "{mode}: {answer}");
     }
+    // P3-5a — toward an upstream the secret names, as every proxy is.
+    name_audience(&app, &t, "db/main", "db.internal:5432").await;
     let answer = ask(
         &mut win,
         "w-proxy",
-        json!({ "session_id": sid, "fence": fence, "secret": "db/main", "mode": "proxy" }),
+        json!({ "session_id": sid, "fence": fence, "secret": "db/main", "mode": "proxy",
+                "audience": "db.internal:5432" }),
     )
     .await;
     assert_eq!(opened(&win, &answer), value);
@@ -630,6 +633,63 @@ async fn a_windows_device_is_leased_values_only_for_a_proxy() {
             row.get_str("reason").unwrap().contains("windows"),
             "{row:?}"
         );
+    }
+}
+
+/// P3-5a — `audience` as the only upstream the secret at `path` names.
+pub(crate) async fn name_audience(app: &TestApp, t: &SeededTenant, path: &str, audience: &str) {
+    let found = rows(app, "vault_secrets", doc! { "path": path }).await;
+    let id = found[0].get_object_id("_id").unwrap().to_hex();
+    let resp = app
+        .client
+        .patch(app.url(&format!("/api/tenant/{}/vault/secret/{id}", t.tenant_id)))
+        .header("Authorization", format!("Bearer {}", t.admin.access_token))
+        .json(&json!({ "audiences": [audience] }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+}
+
+/// FR-90 P3-5a — a `proxy` lease is released only toward an upstream its
+/// secret names in `audiences`, exactly: the daemon authenticates with the
+/// value to whatever the lease names, so anything else is refused by the
+/// `proxy-only-named-audiences` guardrail, recorded with its request.
+#[tokio::test]
+async fn a_proxy_lease_reaches_only_an_upstream_its_secret_names() {
+    let app = lease_app().await;
+    let t = app.seed_tenant("vaultproxy").await;
+    let value = seed_vault(&app, &t).await;
+    name_audience(&app, &t, "db/main", "db.internal:5432").await;
+    let mut dev = device(&app, &t, "lease-proxy", "linux", TAKES_LEASES, true).await;
+    let (sid, fence) = start(&app, &t, &mut dev, "/srv/proxy", Some("dev")).await;
+    let frame = |audience: &str| {
+        json!({ "session_id": sid, "fence": fence, "secret": "db/main", "mode": "proxy",
+                "audience": audience })
+    };
+    let ok = ask(&mut dev, "p-ok", frame("db.internal:5432")).await;
+    assert_eq!(opened(&dev, &ok), value);
+    for (i, audience) in ["evil.example:5432", "db.internal:6432", "db.internal", ""]
+        .iter()
+        .enumerate()
+    {
+        let answer = ask(&mut dev, &format!("p-{i}"), frame(audience)).await;
+        assert_eq!(refused(&answer), "denied", "{audience:?}: {answer}");
+    }
+    let denied = rows(
+        &app,
+        "vault_audit",
+        doc! { "action": "secret:use", "decision": "deny" },
+    )
+    .await;
+    assert_eq!(denied.len(), 4);
+    for row in &denied {
+        assert_eq!(
+            row.get_str("reason").unwrap(),
+            "guardrail:proxy-only-named-audiences",
+            "{row:?}"
+        );
+        assert!(row.contains_key("request"), "replayable: {row:?}");
     }
 }
 

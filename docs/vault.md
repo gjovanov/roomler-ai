@@ -21,10 +21,11 @@ People use it too.
 > session's secrets directory, for as long as its leases (§15); P3-4c-3,
 > `vault_request`: a lease asked for ahead, which a use takes (§16);
 > P3-4d, what a device reports doing with its leases where its owner has it
-> report, kept apart from the decisions (§17); and P3-4e-1 and P3-4e-2, the
-> approval a policy may ask for: a card in the session's room that one of
-> its drivers answers, and a session's tools that wait for the answer
-> (§18).** No released
+> report, kept apart from the decisions (§17); P3-4e, the approval a policy
+> may ask for: a card in the session's room that one of its drivers
+> answers, a session's tools that wait for the answer, and the card's
+> buttons in the web app (§18); and P3-5a, a secret's `audiences` held to
+> for `proxy` mode, the first step of the proxies (§7).** No released
 > agent asks for a lease yet: no release build carries the `vault` feature.
 
 ## 1. Custody: who can read a secret
@@ -242,7 +243,7 @@ namespace `Roomler`:
 | `User` `in Group` | a person; one `Group` per roomler role they hold (`owner`, `admin`, `member`, … and the organization's own) |
 | `Role` | a vault role, `Roomler::Role::"dev"` |
 | `Session` `in Role` | an agent session in the role it assumed; `owner`, and `playbook` when it runs one |
-| `Secret` `in SecretFolder` | `rrn:{org}:secret:{path}`, with `path`, `kind`, `tags` and (P3-4c-1) `exec_allow`; a folder per path prefix, each in the one above |
+| `Secret` `in SecretFolder` | `rrn:{org}:secret:{path}`, with `path`, `kind`, `tags`, (P3-4c-1) `exec_allow` and (P3-5a) `audiences`; a folder per path prefix, each in the one above |
 
 | Action | Principal → resource | Context |
 |---|---|---|
@@ -277,8 +278,16 @@ text names no organization:
 | `guardrail:windows-proxy-only` | any `secret:use` on Windows in a mode other than `proxy`: there is no Claude Code sandbox there (AC13; decision 17) |
 | `guardrail:prod-never-materializes` | `secret:use` in `file`, `env` or `exec` for a secret tagged `prod` or under `prod/` |
 | `guardrail:exec-only-allowed-programs` (P3-4c-1, §14) | `secret:use` in `exec` mode whose audience, the program a device hands the value to, is not on the secret's `exec_allow` |
+| `guardrail:proxy-only-named-audiences` (P3-5a) | `secret:use` in `proxy` mode whose audience, the upstream the daemon authenticates to with the value, is not on the secret's `audiences`, exactly as written |
 
-No guardrail stops a listing: all three are about using a value.
+No guardrail stops a listing: all four are about using a value.
+
+> [!WARNING]
+> **Before P3-5a a secret's `audiences` were kept and shown, and enforced nowhere.** No device asked
+> for a `proxy` lease before then, but one would have been released toward any audience. A
+> `proxy` lease now reaches only an upstream its secret names, and a recorded request from before
+> the field reads back naming none, so a replay refuses it as today's vault would. Matching is exact:
+> `db.internal:5432` is not `db.internal`, `DB.internal:5432` or `db.internal:6432`.
 
 **A policy is checked before it is kept** ([`check_policy`](../crates/modules/vault/src/policy.rs)):
 exactly one static Cedar statement, valid against the schema in strict mode,
@@ -697,7 +706,7 @@ no answer, and the daemon stops waiting for it.
 >   (`more`). A narrower prefix finds the rest.
 > - **Believed exactly as a lease is**: the same identity checks in the same
 >   order, the same refusal words and the same per-session ceiling
->   ([`identify`](../crates/modules/vault/src/lease.rs#L685)), so a device that
+>   ([`identify`](../crates/modules/vault/src/lease.rs#L686)), so a device that
 >   floods the vault with listings is refused as one flooding it with leases
 >   is.
 > - **Offered and allowed together.** The daemon decides once, at a run's
@@ -710,7 +719,7 @@ no answer, and the daemon stops waiting for it.
 | Piece | Where |
 |---|---|
 | the frames | `rc:vault.list` · `rc:vault.describe` ([`signaling.rs:1262`](../crates/remote_control/src/signaling.rs#L1262)) and `rc:vault.listed` · `rc:vault.described` ([`:4308`](../crates/remote_control/src/signaling.rs#L4308)); refusals reuse `rc:vault.refused` |
-| the decisions | `list` and `describe` ([`meta.rs:106`](../crates/modules/vault/src/meta.rs#L106)); `secret:list` in [`policy.cedarschema`](../crates/modules/vault/src/policy.cedarschema) and `Ask::ListSecret` ([`policy.rs:367`](../crates/modules/vault/src/policy.rs#L367)) |
+| the decisions | `list` and `describe` ([`meta.rs:107`](../crates/modules/vault/src/meta.rs#L107)); `secret:list` in [`policy.cedarschema`](../crates/modules/vault/src/policy.cedarschema) and `Ask::ListSecret` ([`policy.rs:380`](../crates/modules/vault/src/policy.rs#L380)) |
 | the daemon's asks | `Client::list` and `Client::describe` ([`vault.rs:458`](../agents/roomlerd/src/vault.rs#L458)) |
 | the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:814`](../agents/roomlerd/src/hive/toolbelt.rs#L814)), answered by `vault_tool` ([`toolbelt.rs:924`](../agents/roomlerd/src/hive/toolbelt.rs#L924)) |
 
@@ -1008,13 +1017,13 @@ owner.
 
 | Piece | What holds | Where |
 |---|---|---|
-| the refusal | `awaiting_approval`, retryable. `rc:vault.refused` carries `approval_id` with it, and with no other word | [`vault.rs:162`](../crates/remote_control/src/vault.rs#L162), [`signaling.rs:4282`](../crates/remote_control/src/signaling.rs#L4282), [`lease.rs:670`](../crates/modules/vault/src/lease.rs#L670) |
-| the decision | after Cedar's deny: a usable yes, a waiting card, a no, or a new card where a driver's yes would allow it | [`lease.rs:853`](../crates/modules/vault/src/lease.rs#L853), [`approval.rs:93`](../crates/modules/vault/src/approval.rs#L93) |
-| the approver | Cedar reads `context.approval.approver` in a `Group` per roomler role they hold, as a person assuming a role is. A recorded request keeps the groups (`approver_groups`), so a replay decides it as it was decided | [`policy.rs:341`](../crates/modules/vault/src/policy.rs#L341), [`policy.rs:654`](../crates/modules/vault/src/policy.rs#L654), [`policy.rs:526`](../crates/modules/vault/src/policy.rs#L526) |
+| the refusal | `awaiting_approval`, retryable. `rc:vault.refused` carries `approval_id` with it, and with no other word | [`vault.rs:162`](../crates/remote_control/src/vault.rs#L162), [`signaling.rs:4282`](../crates/remote_control/src/signaling.rs#L4282), [`lease.rs:671`](../crates/modules/vault/src/lease.rs#L671) |
+| the decision | after Cedar's deny: a usable yes, a waiting card, a no, or a new card where a driver's yes would allow it | [`lease.rs:854`](../crates/modules/vault/src/lease.rs#L854), [`approval.rs:93`](../crates/modules/vault/src/approval.rs#L93) |
+| the approver | Cedar reads `context.approval.approver` in a `Group` per roomler role they hold, as a person assuming a role is. A recorded request keeps the groups (`approver_groups`), so a replay decides it as it was decided | [`policy.rs:354`](../crates/modules/vault/src/policy.rs#L354), [`policy.rs:675`](../crates/modules/vault/src/policy.rs#L675), [`policy.rs:541`](../crates/modules/vault/src/policy.rs#L541) |
 | who may answer | a driver who reads the session, while it is live: hive's own rule for its approvals. Their yes must be one the policy accepts, decided by Cedar with them as the approver when it is given, and again when a lease would spend it. A card is posted only where some driver could give one | [`access.rs:70`](../crates/modules/hive/src/access.rs#L70), [`approval.rs:151`](../crates/modules/vault/src/approval.rs#L151), [`approval.rs:622`](../crates/modules/vault/src/approval.rs#L622) |
 | the card | a message the session authors in its room, bound to `{module: "vault", ref: <approval id>}` and pushed to its drivers as hive's own approvals are. It names the secret's handle, the mode, the audience, the TTL and the deadline, and is edited as the approval moves on: approved, used, denied, expired, withdrawn | [`room.rs:654`](../crates/modules/hive/src/room.rs#L654), [`approval.rs:286`](../crates/modules/vault/src/approval.rs#L286) |
 | the routes | `GET …/vault/approval/{id}`: the approval as the session's readers see it, with `may_answer` (the caller drives it now) and `may_approve` (and the policy would take their yes) for the caller. `POST …/vault/approval/{id}` `{answer: "approve" \| "deny"}` | [`approval.rs:595`](../crates/modules/vault/src/approval.rs#L595), [`approval.rs:622`](../crates/modules/vault/src/approval.rs#L622) |
-| one yes, one lease | the lease spends the yes by compare-and-set (`approved` → `used`) before its allow is recorded | [`lease.rs:941`](../crates/modules/vault/src/lease.rs#L941), [`dao.rs:816`](../crates/modules/vault/src/dao.rs#L816) |
+| one yes, one lease | the lease spends the yes by compare-and-set (`approved` → `used`) before its allow is recorded | [`lease.rs:942`](../crates/modules/vault/src/lease.rs#L942), [`dao.rs:816`](../crates/modules/vault/src/dao.rs#L816) |
 | the windows | a card waits 10 min for an answer (`APPROVAL_ANSWER_SECS`); a yes is usable for 5 min from the answer (`APPROVAL_USE_SECS`) | [`vault.rs:75`](../crates/remote_control/src/vault.rs#L75) |
 | the device's wait (P3-4e-2) | `awaiting_approval` reaches the lease client with its approval's id, and a tool's lease (`vault_exec`, `vault_render`, `vault_request`) asks again while the card waits: after 2 s, the pause doubling to 15 s, for at most the card's 10 minutes. Each ask is a decision the vault records, which is why the pause grows. A lease goes on as any lease does; a `denied` tells the model a driver may have said no; a card nobody answered in time names its approval and says to ask again once a driver can answer a new card. A cancelled tool call stops the asking | [`vault.rs:413`](../agents/roomlerd/src/vault.rs#L413), [`vault.rs:568`](../agents/roomlerd/src/vault.rs#L568), [`toolbelt.rs:400`](../agents/roomlerd/src/hive/toolbelt.rs#L400), [`toolbelt.rs:483`](../agents/roomlerd/src/hive/toolbelt.rs#L483) |
 | the web app (P3-4e-3) | under a message bound to `{module: "vault"}`, the approval as `GET …/vault/approval/{id}` gives it: where it stands, the deadline while it waits, and **Approve** / **Deny** for a driver who may answer it now, **Approve** only where the policy would take their yes (`may_approve`, else off with why). A refusal is shown in the server's words. The vault edits the card's message whenever the approval moves on, and the new `updated_at` reads it again. The buttons only reflect what the route says; every decision stays the server's | [`VaultApprovalCard.vue`](../ui/src/components/vault/VaultApprovalCard.vue), [`MessageBubble.vue`](../ui/src/components/chat/MessageBubble.vue) |
@@ -1121,5 +1130,6 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-5 to P3-9 | `proxy` mode, `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
+| P3-5b to P3-5f | `proxy` mode's endpoints, as designed in the spec (§3e): Postgres, then MongoDB, HTTP named upstreams, the Kubernetes API and the SSH agent |
+| P3-6 to P3-9 | `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |
