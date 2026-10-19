@@ -1431,27 +1431,31 @@ A remote-control feature is the most-abused capability in any product. Mitigatio
 - **An outsider is never recorded and never covers the screen** (FR-52 §10 and decision 13). A controller from outside the organization is never granted `RECORD` (`controller_not_allowed`) or `PRIVACY` (`privacy_refused` `outside_the_org`). The person at the device let a stranger in on a password, and is the only one placed to see what that stranger does. The device strips both again when it admits the session, so a compromised server cannot hand them back.
 - **No prompt-bombing** (FR-101 P4a). A caller may send one device at most 60 session requests a minute, checked after the authz gate, so a caller who may not ask is refused by identity first. Past the ceiling the answer is `rc:error` `rate_limited`, which the viewer does not retry. Each request can put a consent prompt in front of the person at the device, and the control WS is outside the per-IP HTTP governor.
 
-### 11.4a The device proves it is the one answering (FR-100 P1–P2a)
+### 11.4a The device and the browser prove who they are (FR-100 P1–P2b)
 
 The SDP is the only thing that says whose DTLS key is whose (webrtc-rs checks each side's certificate against
 the fingerprint in the SDP), and the hub rebuilds every offer and answer frame around it. So whoever holds the
-hub, its Redis, or the device's signalling leg could swap the device's fingerprint for their own, and the
-viewer would complete DTLS with them. FR-100 ties the answer to a key only the device holds:
+hub, its Redis, or a signalling leg could swap a fingerprint for their own, and the other side would complete
+DTLS with them. FR-100 ties the answer to a key only the device holds, and the offer to a key only this browser
+holds:
 
 ```mermaid
 sequenceDiagram
   autonumber
   participant B as Viewer (browser)
-  participant H as Hub (relays only)
+  participant H as Hub (relays; records the verdict)
   participant D as Device (roomlerd)
   Note over D: P1a: one P-256 key per enrollment,<br/>peer-auth/&lt;tenant&gt;.json; the public half<br/>rides the hello and the device row
-  B->>H: rc:sdp.offer + peer_auth {nonce}
+  Note over B: P2b: one P-256 key per user,<br/>non-extractable, in IndexedDB
+  B->>H: rc:sdp.offer + peer_auth {nonce, key, sig}
   H->>D: relayed verbatim
-  Note over D: transcript = label, role "answer", session,<br/>agent, user, offer fp, answer fp, nonce
-  D->>H: rc:sdp.answer + peer_auth {key, sig}
-  H->>B: relayed verbatim
-  Note over B: verify BEFORE setRemoteDescription;<br/>pin the key per (user, device) on first use
-  B-->>D: DTLS only with the certificate the signature named
+  Note over D: P1c: verify the offer (role "offer", empty answer fp);<br/>look the key up for this user, remember it if new
+  Note over D: P1b: sign the answer (role "answer",<br/>both fingerprints, the same nonce)
+  D->>H: rc:sdp.answer + peer_auth {key, sig} + peer_auth_verdict
+  Note over H: records the verdict on session_started<br/>(the device's word), relays the rest
+  H->>B: rc:sdp.answer + peer_auth {key, sig}
+  Note over B: P2a: verify BEFORE setRemoteDescription;<br/>pin the key per (user, device) on first use
+  B-->>D: DTLS only with the certificates both signatures named
 ```
 
 - **When the page asks** ([`shouldAskPeerAuth`, `peerAuth.ts:152`](../ui/src/utils/peerAuth.ts#L152)): an
@@ -1531,6 +1535,13 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   `key` and `sig` over the transcript with role `offer` and an empty answer fingerprint
   ([`offerAsk`, `peerAuth.ts:506`](../ui/src/utils/peerAuth.ts#L506)). A browser that cannot keep a key asks
   unsigned, and the device records `absent`: a key made per page would reach it as a new browser on every visit.
+
+> ⚠️ **The verdict is the device's word, kept on the server's row.** `remote_audit` otherwise holds the server's
+> own decisions, while a device's claims live apart (`transfer_activity`, `ssh_activity`, `privacy_activity`).
+> `session_started.peer_auth` is the exception, on purpose: it describes the session's start, and the fleet's
+> audit week counts it per session. The hub only checks that it is one of the four words; it cannot check the
+> judgement behind it. A compromised device can misreport only its own trust decision, which it controls
+> anyway. Read a `verified` as "the device says it knew this browser", never as "the server verified".
 
 ### 11.5 The host's Disconnect (FR-27 P10)
 
