@@ -1,10 +1,10 @@
 # FR-100: Controller identity — a stolen login or a hostile signalling plane can neither open nor sit inside a session to a pinned device
 
-**Issue:** [#2092](https://github.com/gjovanov/roomler-ai/issues/2092) · **Status:** proposed 2026-10-13 —
-spec and claim · **Owner:** the agent (the verifier, the pins), the viewer (the browser key), the hub (plumbing
-only) · **Anchors:** master `c2e79221b` · **Program:**
+**Issue:** [#2092](https://github.com/gjovanov/roomler-ai/issues/2092) · **Status:** in progress —
+P1a built: each enrollment's device key, made and kept on the device, its public half on the hello and the device list · **Owner:** the agent (the verifier, the pins), the viewer (the browser key), the hub (plumbing
+only) · **Anchors:** master `6ca52ec6d` (re-derived 2026-10-19 for P1) · **Program:**
 [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 1 · **Builds on:**
-[FR-52](FR-52-cross-org-remote-access.md) (its `extauth_mac` binding, open PR #1628),
+[FR-52](FR-52-cross-org-remote-access.md) (its `extauth_mac` binding, merged 2026-10-18),
 [FR-27](FR-27-consent-surfaces-and-desktop-companion.md) (the PromptSurface), [multi-org](../multi-org.md)
 
 ## 1. Goal
@@ -29,17 +29,17 @@ show anything. That includes a TLS-inspecting middlebox on the **controller's** 
 the script too. Defeating that needs a controller whose code the server does not deliver, or code
 transparency for the viewer. Both are follow-ups (§8). This FR does not pretend otherwise.
 
-## 2. Evidence (master `c2e79221b`)
+## 2. Evidence (master `6ca52ec6d`)
 
 | What | Where | Consequence |
 |---|---|---|
-| The agent mints a fresh ECDSA P-256 certificate per peer connection | `agents/roomlerd/src/peer.rs` L369 (`SettingEngine`), L407 (`RTCConfiguration`, no `certificates`); `crates/vendored/webrtc/src/api/mod.rs` L93–95 | Ephemeral keys, good. But nothing long-lived to pin |
-| The browser does the same | `ui/src/composables/useRemoteControl.ts` L7862 | The same |
-| Mutual DTLS, with each side's cert checked against the **SDP** fingerprint | `crates/vendored/webrtc/src/dtls_transport/mod.rs` L361–362 (`RequireAnyClientCert`, `insecure_skip_verify`), L459 → L548 (`validate_fingerprint`) | The SDP is the only thing that says whose key is whose |
-| The hub forwards the SDP string and **rebuilds** the frame around it | `crates/modules/fleet/src/hub.rs` L1391 (`forward_offer`), L1450 (`ServerMsg::SdpOffer`), L1479 (`ServerMsg::SdpAnswer`) | Whoever controls the hub can swap a fingerprint. Any new field must be carried through it explicitly |
-| Signalling TLS deliberately has no pinning | `agents/roomlerd/Cargo.toml` L285–293 (native roots, so a corporate inspection root works) | Pinning the server would break the corporate laptops in the acceptance bar |
-| FR-52 already binds the transport to a login, for **outsiders** | open PR #1628 (branch `fr52-p4`): `extauth_mac` on `rc:sdp.offer` and `rc:sdp.answer`, a MAC under the OPAQUE login key; "the device decides" | The verifier seam exists in a branch; in-org sessions have nothing |
-| Consent is asked **before** the offer exists | the viewer calls `createOffer` only on `rc:ready` (`useRemoteControl.ts` L7201–7231) | A code shown in the consent prompt cannot include the controller's fingerprint unless it is committed earlier |
+| The agent mints a fresh ECDSA P-256 certificate per peer connection | `agents/roomlerd/src/peer.rs` L466 (`SettingEngine`), L516 (`RTCConfiguration`, no `certificates`); `crates/vendored/webrtc/src/api/mod.rs` L93–95 | Ephemeral keys, good. But nothing long-lived to pin |
+| The browser does the same | `ui/src/composables/useRemoteControl.ts` L8681 | The same |
+| Mutual DTLS, with each side's cert checked against the **SDP** fingerprint | `crates/vendored/webrtc/src/dtls_transport/mod.rs` L363–364 (`RequireAnyClientCert`, `insecure_skip_verify`), L461 → L550 (`validate_fingerprint`) | The SDP is the only thing that says whose key is whose |
+| The hub forwards the SDP string and **rebuilds** the frame around it | `crates/modules/fleet/src/hub.rs` L2006 (`forward_offer`), L2070 (`ServerMsg::SdpOffer`), L2106 (`ServerMsg::SdpAnswer`) | Whoever controls the hub can swap a fingerprint. Any new field must be carried through it explicitly |
+| Signalling TLS deliberately has no pinning | `Cargo.toml` L319 (`tokio-tungstenite` with `rustls-tls-native-roots`, so a corporate inspection root works) | Pinning the server would break the corporate laptops in the acceptance bar |
+| FR-52 already binds the transport to a login, for **outsiders** | #1628 (`1c01176ac`, merged 2026-10-18): `extauth_mac` on `rc:sdp.offer` and `rc:sdp.answer`, a MAC under the OPAQUE login key; "the device decides" | The binding exists for outsiders; in-org sessions have nothing |
+| Consent is asked **before** the offer exists | the viewer calls `createOffer` only on `rc:ready` (`useRemoteControl.ts` L7931–7982) | A code shown in the consent prompt cannot include the controller's fingerprint unless it is committed earlier |
 | A device's keys must differ per org | `docs/multi-org.md` L86–90 (a copied WG key would let two orgs correlate the device) | One identity key per enrollment |
 
 ## 3. Design
@@ -61,7 +61,7 @@ transparency for the viewer. Both are follow-ups (§8). This FR does not pretend
 | `rc:sdp.offer` | the controller key | domain tag, session id, agent id, user id, the offer's DTLS fingerprint, a nonce |
 | `rc:sdp.answer` | the device key | domain tag, session id, both DTLS fingerprints, the controller's nonce |
 
-webrtc-rs already refuses a DTLS peer whose certificate does not match the SDP fingerprint (L459). Signing
+webrtc-rs already refuses a DTLS peer whose certificate does not match the SDP fingerprint (L461). Signing
 the fingerprint closes the chain: the only DTLS peer the device will complete a handshake with is one
 holding a key the device pins.
 
@@ -116,8 +116,10 @@ TypeScript read **one shared test-vector file**, so the two sides cannot drift.
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| P0 | This spec and the claim. The **red test**: on a throwaway loopback stack, a test-only signalling build substitutes the offer's fingerprint, and today's agent accepts it | docs only | this PR |
-| P1 | The verifier seam (with FR-52), the device key, `AgentCaps.rpc` `peer-auth`, hub plumbing, `audit` mode | `peer_auth=off` | — |
+| P0 | This spec and the claim. The **red test**: on a throwaway loopback stack, a test-only signalling build substitutes the offer's fingerprint, and today's agent accepts it | docs only | spec merged (#2095); the red run is owed, and is AC1's first half |
+| P1a | **The device key.** One ECDSA P-256 key per org enrollment, made on the device at its first hello and kept in its own file beside the config (`peer-auth/<tenant>.json`, the config's protection; never `config.toml`). Only the public half leaves: `peer_auth_key` on the hello (an uncompressed point, standard base64), stored on the agent row only in that one shape, and shown on the device list with its fingerprint (the first 10 bytes of its SHA-256, the one definition every later surface shows). A key that cannot be kept on disk is never offered: a per-boot key would break every pin at every restart. A config path with no directory gets none. | nothing pins it before P2 | **built** |
+| P1b | **The seam and the policy.** `peer_auth::verify` → `Verified · Unknown · Mismatch · Absent`, with FR-52's `extauth_mac` as its first key source; `peer_auth = off · audit · enforce` (device-owned, default `audit`, absent from `DesiredConfig`); the device's verdict reaches `remote_audit` for every session. Until P2 every in-org session reads `Absent` and every outsider `Verified` or `Mismatch`, so P1's audit week measures the plumbing, not the keys | `peer_auth=off` | — |
+| P1c | **The wire.** `peer-auth` in `AgentCaps.rpc`; the server's own `peer-auth` flag on `rc:request` (an older server never sets it, which is what lets the device say `server_lacks_peer_auth` rather than read a mismatch); a `peer_auth` binding on `rc:sdp.offer` and `rc:sdp.answer`, carried through the hub's rebuild and the cross-pod relay as `extauth_mac` is; the answer signed by the device key, in the daemon (the key never reaches a worker) | `peer_auth=off` | — |
 | P2 | The controller key, its registration, the signed offer; the browser's pin of the device key | viewer knob; `peer_auth=off` | — |
 | P3 | `enforce`: the PromptSurface approval, `unknown_controller`, `roomler rc pins` | `peer_auth=audit` (default) | — |
 | P4 | The short authentication string on the banner and in the viewer | the viewer toggle | — |

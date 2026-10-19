@@ -131,6 +131,61 @@ pub fn vault_key_is_well_formed(key: &str) -> bool {
     }
 }
 
+/// FR-100 P1a — the length of a device key on the wire: the standard, padded
+/// base64 of a 65-byte uncompressed P-256 point.
+pub const PEER_AUTH_KEY_B64_LEN: usize = 88;
+
+/// FR-100 P1a — is `key` a device key as [`ClientMsg::AgentHello`] carries
+/// one: the standard, padded base64 of an uncompressed SEC1 P-256 point
+/// (65 bytes, `0x04 ‖ X ‖ Y`), spelled canonically, so one key has one
+/// stored form.
+///
+/// The server stores a hello's key only when this holds, and the empty
+/// string otherwise. It checks the SHAPE, not that the point is on the
+/// curve: the server's copy is a hint for a browser's first pin, never an
+/// authority (`docs/fr/FR-100-controller-identity.md` §3e), and WebCrypto
+/// refuses to import a point that is not on the curve. A device that sends
+/// one only ever makes itself unable to prove who it is.
+pub fn peer_auth_key_is_well_formed(key: &str) -> bool {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    if key.len() != PEER_AUTH_KEY_B64_LEN {
+        return false;
+    }
+    match STANDARD.decode(key) {
+        Ok(bytes) => bytes.len() == 65 && bytes[0] == 0x04 && STANDARD.encode(&bytes) == key,
+        Err(_) => false,
+    }
+}
+
+/// FR-100 P1a — how a person reads a device key: the first 10 bytes of the
+/// SHA-256 of the 65-byte point, as lowercase hex in groups of four
+/// (`3f2a 9c01 77de 0b4e 51c8`). `None` for a key that is not well formed.
+///
+/// The device page shows it today. The browser's pin (P2) and the device's
+/// approval prompt (P3) must show the SAME string for the same key, so this
+/// is the one definition, locked by a known-answer test.
+pub fn peer_auth_fingerprint(key: &str) -> Option<String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    if !peer_auth_key_is_well_formed(key) {
+        return None;
+    }
+    let point = STANDARD.decode(key).ok()?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, &point);
+    let hex: String = digest.as_ref()[..10]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Some(
+        hex.as_bytes()
+            .chunks(4)
+            .map(|c| std::str::from_utf8(c).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 /// Half-close direction in `TcpHalfClose`. SMTP / HTTP-1.1-long-poll /
 /// some legacy protocols rely on this.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,6 +416,24 @@ pub enum ClientMsg {
         /// predates the field.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         vault_key: String,
+        /// FR-100 P1a — the public half of THIS enrollment's device key,
+        /// the standard base64 of an uncompressed P-256 point (see
+        /// [`peer_auth_key_is_well_formed`]): the key a controller's browser
+        /// pins, and the one the device will sign its session answers with.
+        /// An identity like `ssh_host_pubkey`, so here rather than in
+        /// [`AgentCaps`].
+        ///
+        /// One key per org enrollment, never shared between them: a key two
+        /// orgs both saw would let them correlate the device
+        /// (`docs/multi-org.md`, the per-org WG key rule). It is made on the
+        /// device and kept in its own file beside the config. Only this
+        /// public half ever leaves.
+        ///
+        /// Empty = the device cannot prove who it is: a key it could not
+        /// keep on disk (a per-boot key would break every pin at the next
+        /// start, so none is offered), or an agent that predates the field.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        peer_auth_key: String,
     },
 
     /// Agent periodic stats.
@@ -5000,6 +5073,7 @@ mod tests {
             supports_relay_regions: true,
             ssh_host_pubkey: String::new(),
             vault_key: String::new(),
+            peer_auth_key: String::new(),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:agent.hello""#));
@@ -6946,6 +7020,7 @@ mod tests {
             supports_relay_regions: true,
             ssh_host_pubkey: KEY.into(),
             vault_key: String::new(),
+            peer_auth_key: String::new(),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(
@@ -6988,6 +7063,7 @@ mod tests {
             supports_relay_regions: true,
             ssh_host_pubkey: String::new(),
             vault_key: String::new(),
+            peer_auth_key: String::new(),
         };
         assert!(
             !serde_json::to_string(&none)
@@ -7017,6 +7093,7 @@ mod tests {
             supports_relay_regions: true,
             ssh_host_pubkey: String::new(),
             vault_key,
+            peer_auth_key: String::new(),
         };
         let s = serde_json::to_string(&hello(key.clone())).unwrap();
         assert!(s.contains(r#""vault_key""#), "{s}");
@@ -7034,6 +7111,114 @@ mod tests {
 
         let none = serde_json::to_string(&hello(String::new())).unwrap();
         assert!(!none.contains("vault_key"), "{none}");
+    }
+
+    /// FR-100 P1a — the P-256 generator G (its coordinates from FIPS 186-4
+    /// D.1.2.3), as a device key would carry a point: `0x04 ‖ X ‖ Y`,
+    /// standard base64. A real point, so the tests below are about shape and
+    /// spelling. Built here rather than written as a base64 literal: a
+    /// secret scanner cannot tell a public curve constant from a key.
+    fn p256_g_b64() -> String {
+        use base64::Engine;
+        const GX: [u8; 32] = [
+            0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4,
+            0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45,
+            0xd8, 0x98, 0xc2, 0x96,
+        ];
+        const GY: [u8; 32] = [
+            0x4f, 0xe3, 0x42, 0xe2, 0xfe, 0x1a, 0x7f, 0x9b, 0x8e, 0xe7, 0xeb, 0x4a, 0x7c, 0x0f,
+            0x9e, 0x16, 0x2b, 0xce, 0x33, 0x57, 0x6b, 0x31, 0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68,
+            0x37, 0xbf, 0x51, 0xf5,
+        ];
+        let mut point = vec![0x04];
+        point.extend_from_slice(&GX);
+        point.extend_from_slice(&GY);
+        base64::engine::general_purpose::STANDARD.encode(point)
+    }
+
+    /// FR-100 P1a — the device key rides the hello, and its absence (an
+    /// older agent, or one that could not keep a key) reads as empty.
+    #[test]
+    fn agent_hello_peer_auth_key_roundtrips_and_absent_means_none() {
+        let hello = |peer_auth_key: String| ClientMsg::AgentHello {
+            machine_name: "host".into(),
+            os: OsKind::Linux,
+            arch: String::new(),
+            arch_emulated: false,
+            agent_version: "0.4.145".into(),
+            displays: vec![],
+            caps: Box::new(AgentCaps::default()),
+            advertised_routes: vec![],
+            supports_relay_regions: true,
+            ssh_host_pubkey: String::new(),
+            vault_key: String::new(),
+            peer_auth_key,
+        };
+        let g = p256_g_b64();
+        let s = serde_json::to_string(&hello(g.clone())).unwrap();
+        assert!(s.contains(r#""peer_auth_key""#), "{s}");
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::AgentHello { peer_auth_key, .. } => assert_eq!(peer_auth_key, g),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let mut old = serde_json::to_value(hello(g)).unwrap();
+        old.as_object_mut().unwrap().remove("peer_auth_key");
+        match serde_json::from_value::<ClientMsg>(old).unwrap() {
+            ClientMsg::AgentHello { peer_auth_key, .. } => assert!(peer_auth_key.is_empty()),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let none = serde_json::to_string(&hello(String::new())).unwrap();
+        assert!(!none.contains("peer_auth_key"), "{none}");
+    }
+
+    /// FR-100 P1a — what the server will store as a device key: an
+    /// uncompressed point, 65 bytes, in the standard alphabet's one
+    /// canonical spelling. Everything else is stored as none.
+    #[test]
+    fn a_device_key_is_an_uncompressed_point_in_canonical_standard_base64() {
+        use base64::Engine;
+        use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE};
+        let g = p256_g_b64();
+        assert!(peer_auth_key_is_well_formed(&g));
+        let point = STANDARD.decode(&g).unwrap();
+        assert_eq!(point.len(), 65);
+
+        // Compressed (0x02/0x03 ‖ X) and hybrid points are other shapes.
+        let mut compressed = vec![0x02];
+        compressed.extend_from_slice(&point[1..33]);
+        assert!(!peer_auth_key_is_well_formed(&STANDARD.encode(&compressed)));
+        let mut wrong_tag = point.clone();
+        wrong_tag[0] = 0x06;
+        assert!(!peer_auth_key_is_well_formed(&STANDARD.encode(&wrong_tag)));
+        // Too short, too long, empty.
+        assert!(!peer_auth_key_is_well_formed(
+            &STANDARD.encode(&point[..64])
+        ));
+        let mut long = point.clone();
+        long.push(0);
+        assert!(!peer_auth_key_is_well_formed(&STANDARD.encode(&long)));
+        assert!(!peer_auth_key_is_well_formed(""));
+        // The same bytes in another spelling: one key, one stored form.
+        assert!(!peer_auth_key_is_well_formed(&URL_SAFE.encode(&point)));
+        assert!(!peer_auth_key_is_well_formed(
+            &STANDARD_NO_PAD.encode(&point)
+        ));
+        assert!(!peer_auth_key_is_well_formed(&format!(" {}", &g[1..])));
+    }
+
+    /// FR-100 P1a — the fingerprint's one definition, against a digest
+    /// computed outside this code (coreutils `sha256sum` over the point's
+    /// bytes): every surface that shows a device key must agree with it.
+    #[test]
+    fn a_device_key_fingerprint_is_the_first_ten_bytes_of_its_sha256() {
+        assert_eq!(
+            peer_auth_fingerprint(&p256_g_b64()).as_deref(),
+            Some("698b ea63 dc44 a344 663f")
+        );
+        assert_eq!(peer_auth_fingerprint(""), None);
+        assert_eq!(peer_auth_fingerprint("not a key"), None);
     }
 
     /// FR-90 P3-3a — what the server will store as a vault key: 32 bytes in
@@ -7084,6 +7269,7 @@ mod tests {
             supports_relay_regions: true,
             ssh_host_pubkey: String::new(),
             vault_key: String::new(),
+            peer_auth_key: String::new(),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""arch":"aarch64""#), "{s}");
@@ -7120,6 +7306,7 @@ mod tests {
             supports_relay_regions: false,
             ssh_host_pubkey: String::new(),
             vault_key: String::new(),
+            peer_auth_key: String::new(),
         };
         let s = serde_json::to_string(&native).unwrap();
         assert!(

@@ -361,6 +361,12 @@ export interface Agent {
   /** FR-40 — the standing rotation order and where it stands. Absent = a
    *  rotation was never ordered for this device. */
   key_rotation?: KeyRotation
+  /** FR-100 P1a — the public half of the device key this enrollment last said
+   *  hello with (a P-256 point, standard base64), and its fingerprint as a
+   *  person reads it. Both absent until the device sends a key. A hint for a
+   *  browser's first pin, never an authority. */
+  peer_auth_key?: string
+  peer_auth_fingerprint?: string
   /** Multi-region relay PoPs: the agent's nearest relay region id (derived
    *  server-side from its STUN probe reports), e.g. "us-east". Absent/null =
    *  never probed or all probes timed out — the default region serves it. */

@@ -959,6 +959,7 @@ mod tests {
             keep_busy: None,
             ssh_host_pubkey: String::new(),
             vault_key: String::new(),
+            peer_auth_key: String::new(),
             agent_token_hash: String::new(),
             token_gen: 0,
             token_exp: None,

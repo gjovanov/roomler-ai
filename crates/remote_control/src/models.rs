@@ -2080,6 +2080,20 @@ pub struct Agent {
     /// before P3-3a, or a hello whose key was not well formed).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vault_key: String,
+    /// FR-100 P1a — the public half of this enrollment's device key, as its
+    /// last hello reported it ([`crate::signaling::peer_auth_key_is_well_formed`]).
+    /// A HINT for a browser's first pin, never an authority: the browser
+    /// pins the key that signed what it received, and a change is the
+    /// browser's to flag, not the server's to approve
+    /// (`docs/fr/FR-100-controller-identity.md` §3e).
+    ///
+    /// Written on EVERY hello, the empty string included, as
+    /// `ssh_host_pubkey` is: a device rolled back to a build that predates
+    /// the key no longer signs with it, and a key left standing here would
+    /// have browsers expecting a signature that never comes. Empty = the
+    /// device cannot prove who it is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub peer_auth_key: String,
     pub agent_token_hash: String,
     /// FR-103: the token generation. An agent token is accepted only while
     /// its `gen` claim equals this. Removing the device bumps it
