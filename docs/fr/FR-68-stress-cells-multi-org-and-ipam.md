@@ -303,7 +303,7 @@ and can run against prod.
   unknown `--type`, and advertising a cell with no driver breaks a matrix run.
 
 ⚠️ **The guest sequence must resolve two rules that collide.** Flipping
-`overlay_multi_org` requires a daemon restart (`org_join.rs:98-102,191-216`),
+`overlay_multi_org` requires a daemon restart (`org_join.rs:98-102,208-233`),
 while FR-51 says never SIGTERM an ephemeral daemon — it self-unenrolls and its
 row is deleted. Resolution: write the FULL config (both enrollments + the flag)
 *before* the daemon's single clean start. install → stop the auto-started

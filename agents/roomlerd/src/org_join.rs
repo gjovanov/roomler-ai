@@ -182,9 +182,26 @@ pub async fn join_org(
             "netstack" => OrgOverlayMode::Netstack,
             _ => OrgOverlayMode::Off,
         };
+        let claimed = netstack_ports_claimed(&merged, &joined_label);
         if let Some(entry) = merged.orgs.iter_mut().find(|o| o.label == joined_label) {
             mode_changed = entry.overlay_mode != want;
             entry.overlay_mode = want;
+            // #2493 — a netstack org joins only with a port of its own; a newly
+            // assigned one restarts this org's loop like a mode change would.
+            if want == OrgOverlayMode::Netstack {
+                let port_before = entry.netstack_socks_port;
+                match assign_netstack_port(entry, &claimed) {
+                    Some(port) => {
+                        mode_changed |= port_before.is_none();
+                        info!(org = %joined_label, port, "join_org: netstack, SOCKS5 front on the loopback");
+                    }
+                    None => warn!(
+                        org = %joined_label,
+                        "join_org: netstack, but no free loopback port for its SOCKS front; it joins \
+                         no mesh until `netstack_socks_port` is set on its [[orgs]] entry"
+                    ),
+                }
+            }
         }
         // An admin explicitly asking this device to join a second org's mesh
         // IS the host-level opt-in `overlay_multi_org` exists to represent.
@@ -456,6 +473,103 @@ mod tests {
 // binary compiles (clippy --tests) and never RUNS. `apply_overlay_flag` is
 // exactly the kind of thing that needs a lock that can fire.
 
+/// #2493 — the loopback ports an org's SOCKS5 front is picked from: below
+/// every OS's ephemeral range (Linux starts at 32768, Windows and macOS at
+/// 49152), so no outgoing connection takes the port between the pick and the
+/// daemon's bind.
+pub(crate) const NETSTACK_PORTS: std::ops::RangeInclusive<u16> = 10800..=10899;
+
+/// #2493 — the first port in [`NETSTACK_PORTS`] that no other enrollment
+/// claims and that is free on the loopback right now. `None` when every one
+/// is taken.
+pub(crate) fn pick_netstack_port(claimed: &[u16]) -> Option<u16> {
+    NETSTACK_PORTS
+        .filter(|p| !claimed.contains(p))
+        .find(|p| loopback_port_free(*p))
+}
+
+/// Nothing answers on `127.0.0.1:port`, and it binds there. The bind alone is
+/// not enough on Windows and macOS, which let a loopback bind shadow another
+/// program's listener on the wildcard address. The connect sees that listener
+/// without opening a listening socket of its own, so it raises no firewall
+/// prompt. Windows can take about two seconds to report a refused loopback
+/// connect, so the connect gives up after 200 ms: a listener accepts long
+/// before that.
+fn loopback_port_free(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_err()
+        && std::net::TcpListener::bind(addr).is_ok()
+}
+
+/// The ports other enrollments' fronts claim: every other org's entry, and
+/// the primary's process-wide key.
+fn netstack_ports_claimed(cfg: &AgentConfig, except: &str) -> Vec<u16> {
+    cfg.orgs
+        .iter()
+        .filter(|o| o.label != except)
+        .filter_map(|o| o.netstack_socks_port)
+        .chain(
+            tunnel_core::env::node_env("OVERLAY_NETSTACK_SOCKS")
+                .and_then(|v| v.trim().parse::<u16>().ok()),
+        )
+        .collect()
+}
+
+/// #2493 — a `netstack` org without a port of its own gets the first free
+/// one: without one it joins nothing (one TCP listener cannot serve two orgs,
+/// so `AgentConfig::for_org` withholds), and before #2493 nothing said so.
+/// Returns the port it has now, newly picked or not; `None` = it has none and
+/// none was free.
+fn assign_netstack_port(org: &mut OrgEntry, claimed: &[u16]) -> Option<u16> {
+    if org.overlay_mode == OrgOverlayMode::Netstack && org.netstack_socks_port.is_none() {
+        org.netstack_socks_port = pick_netstack_port(claimed);
+    }
+    org.netstack_socks_port
+}
+
+/// The line a CLI verb prints about a netstack org's front.
+fn say_netstack_front(label: &str, port: Option<u16>) {
+    match port {
+        Some(port) => {
+            println!("Org {label:?} reaches its mesh through the SOCKS5 front at 127.0.0.1:{port}.")
+        }
+        None => println!(
+            "warning: no free loopback port in {}–{} for org {label:?}'s SOCKS5 front, so \
+             it joins no mesh until it has one: set `netstack_socks_port` on its [[orgs]] entry.",
+            NETSTACK_PORTS.start(),
+            NETSTACK_PORTS.end()
+        ),
+    }
+}
+
+/// #2493 — at daemon start, every `netstack` org without a port gets one, so a
+/// config written before the fix joins its mesh too. `true` = the config
+/// changed and must be saved.
+pub fn heal_netstack_ports(cfg: &mut AgentConfig) -> bool {
+    let mut changed = false;
+    for i in 0..cfg.orgs.len() {
+        if cfg.orgs[i].overlay_mode != OrgOverlayMode::Netstack
+            || cfg.orgs[i].netstack_socks_port.is_some()
+        {
+            continue;
+        }
+        let label = cfg.orgs[i].label.clone();
+        let claimed = netstack_ports_claimed(cfg, &label);
+        match assign_netstack_port(&mut cfg.orgs[i], &claimed) {
+            Some(port) => {
+                info!(org = %label, port, "overlay: a netstack org had no SOCKS port; it has its own now (#2493)");
+                changed = true;
+            }
+            None => warn!(
+                org = %label,
+                "overlay: no free loopback port for this netstack org's SOCKS front; it joins no \
+                 mesh until `netstack_socks_port` is set on its [[orgs]] entry"
+            ),
+        }
+    }
+    changed
+}
+
 /// FR-49 — apply `enroll --overlay` to the identity that was ACTUALLY enrolled.
 ///
 /// Before this it unconditionally set `cfg.overlay_enabled`, the PRIMARY's flag:
@@ -463,12 +577,12 @@ mod tests {
 /// B with `overlay_mode = off` and turned the mesh on for **A**. The flag read
 /// as granted and landed on the wrong org, and nothing reported it.
 ///
-/// ⚠️ A secondary gets `netstack`, not `tun`. `tun` shares the primary's adapter
-/// and needs `overlay_multi_org` plus the same control plane (and is impossible
-/// on macOS), so a bare flag that installed OS routes could wedge a host — the
-/// thing "never self-wedge" exists to prevent. `netstack` is a userspace stack
-/// behind a loopback SOCKS5 front: no TUN, no routes, no privilege. Anything
-/// else is the explicit `org overlay` verb.
+/// ⚠️ A secondary gets `netstack`, not `tun`. `tun` gives the org an OS adapter
+/// of its own and needs `overlay_multi_org` plus the same control plane (macOS
+/// included, FR-97 P1d), so a bare flag that installed OS routes could wedge a
+/// host — the thing "never self-wedge" exists to prevent. `netstack` is a
+/// userspace stack behind a loopback SOCKS5 front: no TUN, no routes, no
+/// privilege. Anything else is the explicit `org overlay` verb.
 ///
 /// ⚠️ One-way, like the primary flag it replaces: an enrollment refresh must
 /// never drop a host out of a mesh it had already joined.
@@ -480,6 +594,7 @@ pub fn apply_overlay_flag(
     match outcome {
         EnrollOutcome::RefreshedOrg { label } | EnrollOutcome::AppendedOrg { label } => {
             let label = label.clone();
+            let claimed = netstack_ports_claimed(cfg, &label);
             let Some(org) = cfg.orgs.iter_mut().find(|o| o.label == label) else {
                 return;
             };
@@ -494,6 +609,10 @@ pub fn apply_overlay_flag(
                     org = %label, mode = org.overlay_mode.wire(),
                     "--overlay: org already participates, left unchanged"
                 );
+            }
+            // #2493 — and the port without which netstack joins nothing.
+            if org.overlay_mode == crate::config::OrgOverlayMode::Netstack {
+                say_netstack_front(&label, assign_netstack_port(org, &claimed));
             }
         }
         _ => {
@@ -526,20 +645,42 @@ pub fn set_org_overlay(
     // Read what we need for the advisories BEFORE taking the mutable borrow.
     let multi_org = cfg.overlay_multi_org;
     let primary_server = cfg.server_url.clone();
+    let claimed = netstack_ports_claimed(cfg, label);
     let Some(entry) = cfg.orgs.iter_mut().find(|o| o.label == label) else {
         bail!("no org labelled {label:?} — see `roomlerd org ls`");
     };
     let before = entry.overlay_mode;
     entry.overlay_mode = parsed;
+    // #2493 — netstack joins only with a port of its own. An org set to
+    // netstack before the fix has none, and gets one here even when its mode
+    // does not change.
+    let port_before = entry.netstack_socks_port;
+    let front = (parsed == crate::config::OrgOverlayMode::Netstack)
+        .then(|| assign_netstack_port(entry, &claimed));
+    let port_added = port_before.is_none() && entry.netstack_socks_port.is_some();
     if before == parsed {
-        println!("Org {label:?} overlay is already {}.", parsed.wire());
+        if port_added {
+            println!(
+                "Org {label:?} overlay is already {}, and now has a SOCKS5 port of its own. \
+                 Restart the daemon to apply.",
+                parsed.wire()
+            );
+        } else {
+            println!("Org {label:?} overlay is already {}.", parsed.wire());
+        }
+    } else {
+        println!(
+            "Org {label:?} overlay {} → {}. Restart the daemon to apply.",
+            before.wire(),
+            parsed.wire()
+        );
+    }
+    if let Some(port) = front {
+        say_netstack_front(label, port);
+    }
+    if before == parsed {
         return Ok(());
     }
-    println!(
-        "Org {label:?} overlay {} → {}. Restart the daemon to apply.",
-        before.wire(),
-        parsed.wire()
-    );
 
     // Warn about the two preconditions `tun` has that `netstack` does not,
     // HERE rather than at the next daemon start — a refusal buried in a log an
@@ -712,5 +853,120 @@ mod fr49_tests {
             crate::config::OrgOverlayMode::Off,
             "no refusal may have written anything"
         );
+    }
+
+    /// #2493 — `--overlay` on a second org picks it a free loopback port in
+    /// the netstack range, never one another org claims. Without a port
+    /// `for_org` withholds, so before the fix such an org joined nothing (the
+    /// field red on 0.4.143).
+    #[test]
+    fn overlay_flag_gives_a_netstack_org_its_own_port() {
+        let mut cfg = two_org_cfg();
+        let mut beta = cfg.orgs[0].clone();
+        beta.label = "beta".into();
+        beta.tenant_id = "t3id".into();
+        beta.overlay_mode = crate::config::OrgOverlayMode::Netstack;
+        beta.netstack_socks_port = Some(*NETSTACK_PORTS.start());
+        cfg.orgs.push(beta);
+        apply_overlay_flag(
+            &mut cfg,
+            &crate::enrollment::EnrollOutcome::AppendedOrg {
+                label: "acme".into(),
+            },
+        );
+        let mut acme = cfg.find_org("acme").unwrap().clone();
+        let port = acme.netstack_socks_port.expect("a port of its own");
+        assert!(NETSTACK_PORTS.contains(&port), "{port}");
+        assert_ne!(
+            Some(port),
+            cfg.find_org("beta").unwrap().netstack_socks_port,
+            "never another org's"
+        );
+        // And with its port (and its own key), the org joins.
+        acme.overlay_wg_secret_key = Some("ACME-KEY".into());
+        assert!(cfg.for_org(&acme).overlay_enabled);
+    }
+
+    /// #2493 — the verb gives a netstack org a port too; one set to netstack
+    /// before the fix (mode unchanged, no port) gets its port all the same;
+    /// an explicit port is kept; `tun` never gets one.
+    #[test]
+    fn org_overlay_verb_gives_netstack_a_port_and_heals_one_without() {
+        let mut cfg = two_org_cfg();
+        set_org_overlay(&mut cfg, "acme", "netstack").unwrap();
+        let first = cfg.find_org("acme").unwrap().netstack_socks_port;
+        assert!(
+            first.is_some_and(|p| NETSTACK_PORTS.contains(&p)),
+            "{first:?}"
+        );
+        cfg.orgs[0].netstack_socks_port = None;
+        set_org_overlay(&mut cfg, "acme", "netstack").unwrap();
+        assert!(
+            cfg.find_org("acme").unwrap().netstack_socks_port.is_some(),
+            "healed although the mode did not change"
+        );
+        cfg.orgs[0].netstack_socks_port = Some(1090);
+        set_org_overlay(&mut cfg, "acme", "netstack").unwrap();
+        assert_eq!(
+            cfg.find_org("acme").unwrap().netstack_socks_port,
+            Some(1090)
+        );
+        let mut cfg = two_org_cfg();
+        set_org_overlay(&mut cfg, "acme", "tun").unwrap();
+        assert!(cfg.find_org("acme").unwrap().netstack_socks_port.is_none());
+    }
+
+    /// #2493 — the pick never tries a claimed port and skips a bound one. It
+    /// works at the TOP of the range, because the other tests pick from its
+    /// bottom.
+    #[test]
+    fn the_netstack_port_pick_skips_claimed_and_busy_ports() {
+        let bind = |p: u16| std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, p)).ok();
+        let (lo, hi) = NETSTACK_PORTS
+            .rev()
+            .skip(1)
+            .zip(NETSTACK_PORTS.rev())
+            .find(|(lo, hi)| bind(*lo).is_some() && bind(*hi).is_some())
+            .expect("two free ports at the top of the range");
+        let claimed: Vec<u16> = NETSTACK_PORTS.filter(|p| *p != lo && *p != hi).collect();
+        let held = bind(lo).expect("hold the lower one");
+        assert_eq!(
+            pick_netstack_port(&claimed),
+            Some(hi),
+            "a bound port is skipped"
+        );
+        drop(held);
+        assert_eq!(
+            pick_netstack_port(&claimed),
+            Some(lo),
+            "the lowest free one first"
+        );
+        let all: Vec<u16> = NETSTACK_PORTS.collect();
+        assert_eq!(pick_netstack_port(&all), None, "every port claimed: none");
+        assert!(
+            *NETSTACK_PORTS.end() < 32768,
+            "below every OS's ephemeral range"
+        );
+    }
+
+    /// #2493 — at daemon start every netstack org without a port gets one;
+    /// `tun` and `off` orgs, and a port already set, are left alone; `true`
+    /// only when something changed.
+    #[test]
+    fn heal_gives_portless_netstack_orgs_a_port_and_nothing_else() {
+        let mut cfg = two_org_cfg();
+        assert!(!heal_netstack_ports(&mut cfg), "an off org: nothing to do");
+        cfg.orgs[0].overlay_mode = crate::config::OrgOverlayMode::Netstack;
+        assert!(
+            heal_netstack_ports(&mut cfg),
+            "a portless netstack org is healed"
+        );
+        let port = cfg.orgs[0].netstack_socks_port.expect("its port");
+        assert!(NETSTACK_PORTS.contains(&port));
+        assert!(!heal_netstack_ports(&mut cfg), "it has one: nothing to do");
+        assert_eq!(cfg.orgs[0].netstack_socks_port, Some(port));
+        cfg.orgs[0].overlay_mode = crate::config::OrgOverlayMode::Tun;
+        cfg.orgs[0].netstack_socks_port = None;
+        assert!(!heal_netstack_ports(&mut cfg), "a tun org never gets one");
     }
 }

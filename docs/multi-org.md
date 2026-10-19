@@ -250,7 +250,7 @@ its free pool → cycle every agent's WS.
 > compensation stack around it, once its evidence counters (`mux_nat_rewrites`,
 > `restores`, `skip_as_source_flips`) had read zero fleet-wide for 7 days. Every
 > org now gets its own adapter ([Per-org TUN adapters](#per-org-tun-adapters-the-only-path-since-w7c),
-> `agents/roomlerd/src/overlay.rs:314`). This section records how the mux
+> `agents/roomlerd/src/overlay.rs:318`). This section records how the mux
 > worked, for the history it explains.
 
 One `roomler` adapter, N per-org runtimes. Each org's `OverlayRuntime` gets a
@@ -288,9 +288,12 @@ That org's overlay withholds until one tenant renumbers (§4.3); the other
 orgs' meshes stay up.
 
 Still primary-only, deliberately: **exit-node roles** (split-defaults and the
-NRPT "." steer are host-global) and **netstack mode** (its SOCKS front and
-handle channel are process-global singletons — with `overlay_multi_org` on,
-the OS TUN is used regardless of `ROOMLERD_OVERLAY_NETSTACK_SOCKS`).
+NRPT "." steer are host-global). A **secondary in netstack mode** runs its own
+stack and SOCKS5 front (#2493), on the loopback port its `[[orgs]]` entry
+names. It needs neither `overlay_multi_org` nor the primary's control plane,
+because it opens no adapter and installs no route. Only the PRIMARY's env-key
+netstack still yields to `overlay_multi_org`: with the flag on, the primary
+uses its OS TUN regardless of `ROOMLERD_OVERLAY_NETSTACK_SOCKS`.
 
 ---
 
@@ -346,7 +349,7 @@ re-binds ONCE, and every org re-establishes on `Ready`.
 ### Per-org TUN adapters (the only path since W7c)
 
 The second half of multi-org v2: with `overlay_multi_org` on, each org gets its
-**own adapter** (`per_org_systun_factory`, `agents/roomlerd/src/overlay.rs:314`).
+**own adapter** (`per_org_systun_factory`, `agents/roomlerd/src/overlay.rs:318`).
 It shipped behind `overlay_tun_per_org`, default ON since rc.339; W7c deleted
 the switch along with the shared adapter it chose between, so neither the key
 nor `ROOMLERD_OVERLAY_TUN_PER_ORG` is read any more:
@@ -621,6 +624,25 @@ no blank row can render).
   message. The primary reads `ROOMLERD_OVERLAY_NETSTACK_SOCKS`; a
   secondary sets `netstack_socks_port` on its `[[orgs]]` entry and
   deliberately does not inherit the env key.
+  ⚠️ **Until #2493 the secondary half of this was dead code.**
+  `AgentConfig::for_org` switched every non-`tun` secondary's overlay off, so
+  a netstack secondary joined nothing while every surface said `overlay
+  netstack`. FR-49 had made netstack the default for `enroll --overlay`, which
+  made this the common case, and #2493 measured it on 0.4.143: no listener on
+  the port, no peers, no log line. Now `for_org` turns a netstack secondary on
+  when it has its own port and key (`crates/agent-core/src/config.rs:2095-2101`),
+  and `derived_netstack` sends it to its stack rather than to the per-org TUN
+  that the device-wide `overlay_multi_org` would pick
+  (`agents/roomlerd/src/overlay.rs:311`). A port that is unset is **picked**:
+  - at `enroll --overlay`, `org overlay <org> netstack` and a pushed join;
+  - at daemon start, for an entry from before the fix.
+
+  The pick is the first free loopback port in 10800–10899, below every OS's
+  ephemeral range, that no other enrollment claims
+  (`agents/roomlerd/src/org_join.rs`, `pick_netstack_port`). Free means
+  nothing answers there and it binds: Windows and macOS let a loopback bind
+  shadow another program's listener on the wildcard address, which only the
+  connect sees. The CLI prints where the front is.
 - **Block reclaim** — `POST /api/admin/overlay-block/reclaim`, platform
   operator, dry-run by default. Quarantine stays permanent by default for
   the original reason (a device that missed a renumber may still believe it
