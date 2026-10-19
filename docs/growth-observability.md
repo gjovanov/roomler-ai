@@ -326,7 +326,7 @@ flowchart LR
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/admin/growth/funnel?since&until&by&include_internal` | the funnel, time to value, and a per-dimension breakdown (`by` = `source` · `medium` · `campaign` · `content` · `channel` · `self_reported` · `landing_path`) |
+| GET | `/api/admin/growth/funnel?since&until&by&include_internal` | the funnel, time to value, and a per-dimension breakdown (`by` = `source` · `medium` · `campaign` · `content` · `channel` · `self_reported` · `landing_path`). `since` and `until` take RFC 3339, `YYYY-MM-DD` or unix seconds. A bare-day `until` is the **whole day**, inclusive as on every other growth route; an instant is the exclusive end ([`parse_until`, funnel.rs:723](../crates/api/src/growth/funnel.rs)). Default: the 90 days to now |
 | GET | `/api/admin/growth/cohorts?unit=week&since` | weekly cohorts W0..W12, and the WAO series |
 | GET | `/api/admin/growth/orgs?limit&include_internal` | the per-org table |
 | GET | `/api/admin/growth/org/{tenant_id}/timeline` | one org's milestones |

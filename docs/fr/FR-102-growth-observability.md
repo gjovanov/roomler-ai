@@ -859,8 +859,9 @@ indicators (P6, P7, P8) say more than the account funnel can, so they are not po
   hand count from Mongo (field log).
   *(2026-10-15 on `hosted-20261015-cb26a2f`, a platform-admin read from the operator's own session: closed
   week 2026-08-31 … 09-06, the funnel's sign-ups 4, orgs created ≤ 7 d 2, activated ≤ 7 d 0, each equal to
-  the Mongo hand count under the same exclusions. ⚠️ The funnel's `until` is exclusive while the Campaigns
-  route's is inclusive — a follow-up. §8.)*
+  the Mongo hand count under the same exclusions. ⚠️ The funnel's bare-day `until` was exclusive while
+  every other growth route's is inclusive. Since 2026-10-19 (`parse_until`, `crates/api/src/growth/funnel.rs:723`)
+  a bare `YYYY-MM-DD` is the whole day, and an instant is still the exclusive end. §8.)*
 - [ ] **AC8 (P2):** `growth_org_daily` for a day older than 90 days still shows tunnel and SSH use after the
   audit rows expired; an org's rows are gone after the org is deleted.
   *(Partly verified, not yet ticked.
