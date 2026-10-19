@@ -37,7 +37,8 @@ docker push "registry.roomler.ai/roomlerd-e2e:$TAG"   # mars is logged in to it
 ```
 
 Never `latest`: the overlay pins the tag, so a night's agent is a known
-build. Image size sanity-check: ~80–100 MiB. If it's >200 MiB something
+build. Image size sanity-check: ~150 MiB with `recording` (FR-114 measured
+147 MiB on 2026-10-19; it was ~80–100 MiB before FR-85). If it's >200 MiB something
 pulled in scrap-capture transitively — re-check the
 `--no-default-features` + feature list in `Dockerfile.agent-e2e`.
 
@@ -95,6 +96,19 @@ StatefulSet it says so in its log, and the six specs skip as before.
   **Phase 5** (tunnel) — all depend on Chunk 1C being done.
 
 ## Known gotchas
+
+- **Enrollment needs TLS or LOOPBACK** (FR-114, measured 2026-10-19). An
+  enrollment token travels over TLS: `roomlerd enroll` promotes a remote
+  `http://` to `https://` (`normalize_server_url`,
+  `crates/agent-core/src/enrollment.rs`; FR-101 P1b, no plaintext escape), and
+  `https://roomler2` times out on a server that serves plain HTTP. So each agent
+  pod carries a `server-proxy` sidecar (socat, `127.0.0.1:18080 → roomler2:80`),
+  and `ROOMLER_E2E_SERVER` points at it. Loopback is exempt, so signalling and
+  the WebSocket ride the proxy; media is WebRTC, pod to pod.
+- **The agents' config is `emptyDir`**: each pod restart enrolls a fresh device
+  (a new row; the old one goes offline) with a fresh FR-100 device key. The
+  specs pick an online agent, and a fresh Playwright context is always "first
+  use" for a pinned key.
 
 - **Pod DNS name vs `machine_name`**: the agent's `rc:agent.hello`
   payload includes `machine_name` = `$HOSTNAME` (the Pod's hostname,

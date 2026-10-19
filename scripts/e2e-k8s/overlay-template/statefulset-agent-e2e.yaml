@@ -36,12 +36,26 @@ spec:
       # for ~60 s so the Job's typical ~5 s completion fits within
       # the agent's startup wait window.
       containers:
+        # FR-114 — an enrollment token travels over TLS unless the server is
+        # LOOPBACK (`normalize_server_url`, crates/agent-core/src/enrollment.rs;
+        # FR-101 P1b: no plaintext escape). The e2e server serves plain HTTP on
+        # `roomler2:80`, so the agent reaches it through this byte-transparent
+        # proxy on the pod's own 127.0.0.1, which every container in the pod
+        # shares. Signalling and the WebSocket ride it; media is WebRTC, pod to pod.
+        - name: server-proxy
+          image: alpine/socat:1.8.0.0
+          args: ["TCP-LISTEN:18080,fork,reuseaddr,bind=127.0.0.1", "TCP:roomler2:80"]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 200m, memory: 64Mi }
         - name: agent
           image: gjovanov/roomlerd-e2e:latest # rewritten by kustomization images:
           imagePullPolicy: IfNotPresent
           env:
+            # The loopback proxy above, never `http://roomler2` itself: the
+            # agent would promote that to https:// and time out.
             - name: ROOMLER_E2E_SERVER
-              value: http://roomler2
+              value: http://127.0.0.1:18080
             - name: ROOMLER_E2E_ADMIN_EMAIL
               valueFrom:
                 secretKeyRef:
