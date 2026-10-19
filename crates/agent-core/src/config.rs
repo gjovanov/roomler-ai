@@ -1613,6 +1613,17 @@ pub struct AgentConfig {
     /// only by the person at the console, whose screen it would change.
     #[serde(default)]
     pub display_match: DisplayMatchPolicy,
+    /// FR-100 P1c — whether this device checks the browser that offers it a
+    /// session: `audit` (the default) verifies the controller's signature over
+    /// its offer, pins each browser key it sees per user, records the verdict
+    /// and refuses nothing; `off` does none of it. `enforce` arrives with P3.
+    /// Read LIVE: every offer is judged by the value at that moment.
+    ///
+    /// ⚠️ Device-owned: absent from `DesiredConfig`, and set over the LocalAPI
+    /// only by the person at the console. The device signs its own answers
+    /// whatever this says: that protects the browser and costs nothing.
+    #[serde(default)]
+    pub peer_auth: PeerAuthPolicy,
     /// FR-101 P2b — this device's own floor for the clipboard in a remote
     /// session: `on` (the default), `ask` (only on a session the person here
     /// approves, on a prompt that names it) or `off`. The stricter of this and
@@ -2613,6 +2624,40 @@ impl<'de> Deserialize<'de> for DisplayMatchPolicy {
     }
 }
 
+/// FR-100 P1c — whether this device checks the browser that offers it a
+/// session (see `AgentConfig::peer_auth`).
+///
+/// ⚠️ A value this build does not know reads as [`Self::Audit`], never as an
+/// error: it must not fail the whole config file. A newer build's `enforce`,
+/// read by this one, keeps checking and recording without refusing anything
+/// this build cannot enforce.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PeerAuthPolicy {
+    /// Neither check, nor pin, nor record. The device still signs its answers.
+    Off,
+    /// Check every offer, pin each new browser key per user, record the
+    /// verdict, refuse nothing (the default).
+    #[default]
+    Audit,
+}
+
+impl<'de> Deserialize<'de> for PeerAuthPolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Text(String),
+            Other(serde::de::IgnoredAny),
+        }
+        Ok(match Raw::deserialize(d)? {
+            Raw::Text(s) if s == "off" => Self::Off,
+            // "audit", a newer build's word, and anything that is not a string.
+            _ => Self::Audit,
+        })
+    }
+}
+
 /// Resolve the default config path. Can be overridden by `--config` on the CLI.
 /// Default for `enable_remote_browse` — `true` so a 0.3.0 install
 /// preserves self-controlled-host auto-grant semantics. Operators on
@@ -2839,6 +2884,7 @@ pub fn test_fixture() -> AgentConfig {
         privacy_mode_allowed: false,
         lock_on_end: Default::default(),
         display_match: Default::default(),
+        peer_auth: Default::default(),
         rc_clipboard: Default::default(),
         rc_files: Default::default(),
         rc_audio: Default::default(),

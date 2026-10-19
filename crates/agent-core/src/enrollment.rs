@@ -443,6 +443,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         lock_on_end: Default::default(),
         // FR-108 — display match only while nobody is using the screen.
         display_match: Default::default(),
+        // FR-100 P1c — check every browser that offers a session; refuse none.
+        peer_auth: Default::default(),
         // FR-101 P2b — no floor of the device's own until its owner sets one.
         rc_clipboard: Default::default(),
         rc_files: Default::default(),

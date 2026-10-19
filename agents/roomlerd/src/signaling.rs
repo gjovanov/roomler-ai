@@ -2249,6 +2249,7 @@ async fn connect_once(
                     remote_cfg.config_path(),
                     &cfg.tenant_id,
                     &cfg.agent_id,
+                    remote_cfg.peer_auth_policy(),
                     &mut outbound_msg,
                 );
                 if let Err(e) = send_msg(&mut ws, &outbound_msg).await {
@@ -3083,6 +3084,19 @@ async fn handle_server_msg(
         remote_cfg
             .peer_auth_offers()
             .note_offer(*session_id, sdp, peer_auth.as_ref());
+        // FR-100 P1c — and the browser behind it is judged HERE, for the same
+        // reason: the pins are the daemon's, and a GUI worker holds none.
+        remote_cfg.peer_auth_offers().judge_offer(
+            *session_id,
+            sdp,
+            peer_auth.as_ref(),
+            &crate::peer_auth::OfferCheck {
+                policy: remote_cfg.peer_auth_policy(),
+                config_path: remote_cfg.config_path(),
+                tenant_id,
+                agent_id: &agent_cfg.agent_id,
+            },
+        );
     }
     // …and a session's end ends its binding HERE, for the same reason: a
     // delegated `Terminate` never reaches the arm below. (A no-op for every
@@ -4031,6 +4045,15 @@ async fn handle_server_msg(
                 session_id,
                 &answer_sdp,
             );
+            // FR-100 P1c — and what the device concluded about the browser
+            // that offered it, for the hub to record: an outsider's session
+            // (sealed above) by FR-52's MAC, an in-org one by its offer.
+            let peer_auth_verdict = crate::peer_auth::answer_verdict(
+                remote_cfg.peer_auth_offers(),
+                remote_cfg.peer_auth_policy(),
+                session_id,
+                extauth_mac.is_some(),
+            );
 
             // FR-27 follow-up — the session is now established (peer built,
             // answer ready): raise the "Being viewed by …" banner and publish
@@ -4056,6 +4079,7 @@ async fn handle_server_msg(
                     sdp: answer_sdp,
                     extauth_mac,
                     peer_auth,
+                    peer_auth_verdict,
                 },
             )
             .await

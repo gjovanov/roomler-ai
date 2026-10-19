@@ -82,6 +82,18 @@ pub struct RemoteConfigServices {
     /// frames pass through the daemon. Here for `external_logins`' reason:
     /// one per daemon, never a static the integration tests' agents share.
     peer_auth_offers: Arc<crate::peer_auth::PendingOffers>,
+    /// FR-100 P1c — the LIVE `peer_auth` policy, read at every offer. `audit`
+    /// until [`Self::adopt_local`] seeds the configured value; only the
+    /// person at the console can change it, and never the server.
+    peer_auth_policy: Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// FR-100 P1c — the policy in an atomic: `0` off, `1` audit.
+fn policy_bits(p: crate::peer_auth::PeerAuthPolicy) -> u8 {
+    match p {
+        crate::peer_auth::PeerAuthPolicy::Off => 0,
+        crate::peer_auth::PeerAuthPolicy::Audit => 1,
+    }
 }
 
 /// FR-52 P4 — the device's own terms for an external session, as stored.
@@ -110,6 +122,17 @@ impl RemoteConfigServices {
             #[cfg(feature = "external-access")]
             external_logins: Arc::new(crate::external_logins::ExternalLogins::new()),
             peer_auth_offers: Arc::new(crate::peer_auth::PendingOffers::default()),
+            peer_auth_policy: Arc::new(std::sync::atomic::AtomicU8::new(policy_bits(
+                crate::peer_auth::PeerAuthPolicy::Audit,
+            ))),
+        }
+    }
+
+    /// FR-100 P1c — the device's `peer_auth` policy at this moment.
+    pub fn peer_auth_policy(&self) -> crate::peer_auth::PeerAuthPolicy {
+        match self.peer_auth_policy.load(Ordering::Relaxed) {
+            0 => crate::peer_auth::PeerAuthPolicy::Off,
+            _ => crate::peer_auth::PeerAuthPolicy::Audit,
         }
     }
 
@@ -223,6 +246,9 @@ impl RemoteConfigServices {
         self.exec_enabled.store(cfg.exec_enabled, Ordering::Relaxed);
         self.remote_config_enabled
             .store(cfg.remote_config_enabled, Ordering::Relaxed);
+        // FR-100 P1c — the next offer is judged under the owner's new word.
+        self.peer_auth_policy
+            .store(policy_bits(cfg.peer_auth), Ordering::Relaxed);
     }
 
     /// Reconcile the on-disk config against `desired`, persist, and put the

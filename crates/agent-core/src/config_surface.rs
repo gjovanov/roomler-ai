@@ -1764,6 +1764,15 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-108 - whether a remote controller's display match may switch this computer's display mode to fit their window: auto (default: only while nobody is using this screen, that is no one has touched its keyboard or mouse for 5 minutes) | always (whenever asked) | never. Windows. A locked screen is switched only once it is unlocked. The original mode comes back when the session ends. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
     },
     KeyMeta {
+        key: "peer_auth",
+        group: Group::RemoteDesktop,
+        tier: Tier::Standard,
+        // LIVE: every offer is judged by the value at that moment.
+        live: true,
+        kind: "string",
+        description: "FR-100 - whether this device checks the browser that offers it a remote session: audit (default: verify the browser's signature over its offer, remember each browser key per user, record the result, refuse nothing) | off (none of it). enforce arrives later and cannot be set yet. Whatever this says, the device still signs its own answers, so the browser can check it. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
+    },
+    KeyMeta {
         key: "rc_clipboard",
         group: Group::RemoteDesktop,
         tier: Tier::Standard,
@@ -2085,6 +2094,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "privacy_mode_allowed" => Some(fmt_bool(cfg.privacy_mode_allowed)),
         "lock_on_end" => Some(fmt_lock_on_end(cfg.lock_on_end)),
         "display_match" => Some(fmt_display_match(cfg.display_match)),
+        "peer_auth" => Some(fmt_peer_auth(cfg.peer_auth)),
         "rc_clipboard" => Some(fmt_feature_policy(cfg.rc_clipboard)),
         "rc_files" => Some(fmt_feature_policy(cfg.rc_files)),
         "rc_audio" => Some(fmt_feature_policy(cfg.rc_audio)),
@@ -2141,6 +2151,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "privacy_mode_allowed" => cfg.privacy_mode_allowed = parse_bool_or(value, false)?,
         "lock_on_end" => cfg.lock_on_end = parse_lock_on_end(value)?,
         "display_match" => cfg.display_match = parse_display_match(value)?,
+        "peer_auth" => cfg.peer_auth = parse_peer_auth(value)?,
         // FR-101 P2b — cleared means the default, `on`; a value is read
         // strictly here, where a typo is made, rather than becoming `off`
         // silently the way an unknown value in the file reads.
@@ -2961,6 +2972,40 @@ fn parse_display_match(v: Option<&str>) -> Result<crate::config::DisplayMatchPol
     }
 }
 
+fn fmt_peer_auth(p: crate::config::PeerAuthPolicy) -> String {
+    use crate::config::PeerAuthPolicy;
+    match p {
+        PeerAuthPolicy::Off => "off",
+        PeerAuthPolicy::Audit => "audit",
+    }
+    .to_string()
+}
+
+/// FR-100 P1c — `peer_auth` as a person sets it: `off` or `audit`, in any case;
+/// cleared is `audit`, the default. `enforce` is refused by name until P3
+/// brings the controller keys and the prompts it needs: before them it would
+/// refuse every session to this device, which is a self-wedge, not a setting.
+/// Anything else is refused, where the file's reader would have read it as
+/// `audit` without a word.
+fn parse_peer_auth(v: Option<&str>) -> Result<crate::config::PeerAuthPolicy, String> {
+    use crate::config::PeerAuthPolicy;
+    match v
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("audit") => Ok(PeerAuthPolicy::Audit),
+        Some("off") => Ok(PeerAuthPolicy::Off),
+        Some("enforce") => Err(
+            "peer_auth = enforce arrives with FR-100 P3; until then this device can check and \
+             record the browsers that connect (audit) or not check them (off)"
+                .to_string(),
+        ),
+        Some(_) => Err("peer_auth must be off | audit".to_string()),
+    }
+}
+
 fn fmt_feature_policy(p: roomler_ai_remote_control::models::FeaturePolicy) -> String {
     use roomler_ai_remote_control::models::FeaturePolicy;
     match p {
@@ -3095,6 +3140,8 @@ mod tests {
             "rc_audio",
             "lock_on_end",
             "display_match",
+            // FR-100 P1c — re-seeded by `adopt_local`; every offer reads it.
+            "peer_auth",
             // FR-52 — read at use: from the config FILE at every knock and
             // every external session request, so nothing re-seeds them.
             "external_access_enabled",
@@ -3624,6 +3671,56 @@ mod tests {
         ] {
             let got: One = toml::from_str(text).expect(text);
             assert_eq!(got.display_match, want, "{text}");
+        }
+    }
+
+    /// FR-100 P1c — `peer_auth` takes `off` and `audit` in any case, echoes
+    /// them and clears to `audit`. `enforce` is refused BY NAME until P3 (before
+    /// the controller keys and the prompts exist it would refuse every session
+    /// to this device), and anything else is refused too; a refusal changes
+    /// nothing.
+    #[test]
+    fn peer_auth_set_echo_clear_and_no_enforce_yet() {
+        use crate::config::PeerAuthPolicy;
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(cfg.peer_auth, PeerAuthPolicy::Audit);
+        apply(&mut cfg, "peer_auth", Some(" OFF ")).unwrap();
+        assert_eq!(cfg.peer_auth, PeerAuthPolicy::Off);
+        assert_eq!(
+            entry_for(&cfg, "peer_auth").unwrap().value.as_deref(),
+            Some("off")
+        );
+        apply(&mut cfg, "peer_auth", None).unwrap();
+        assert_eq!(cfg.peer_auth, PeerAuthPolicy::Audit);
+        let refused = apply(&mut cfg, "peer_auth", Some("enforce")).unwrap_err();
+        assert!(refused.contains("P3"), "the refusal says when: {refused}");
+        assert!(apply(&mut cfg, "peer_auth", Some("strict")).is_err());
+        assert_eq!(
+            cfg.peer_auth,
+            PeerAuthPolicy::Audit,
+            "a refused value changes nothing"
+        );
+    }
+
+    /// FR-100 P1c — a value in the file that this build does not know (a newer
+    /// build's `enforce`) reads as `audit`: keep checking, refuse nothing this
+    /// build cannot enforce, and never fail the file.
+    #[test]
+    fn peer_auth_reads_an_unknown_value_as_audit() {
+        use crate::config::PeerAuthPolicy;
+        #[derive(serde::Deserialize)]
+        struct One {
+            peer_auth: PeerAuthPolicy,
+        }
+        for (text, want) in [
+            ("peer_auth = \"off\"", PeerAuthPolicy::Off),
+            ("peer_auth = \"audit\"", PeerAuthPolicy::Audit),
+            ("peer_auth = \"enforce\"", PeerAuthPolicy::Audit),
+            ("peer_auth = \"OFF\"", PeerAuthPolicy::Audit),
+            ("peer_auth = 0", PeerAuthPolicy::Audit),
+        ] {
+            let got: One = toml::from_str(text).expect(text);
+            assert_eq!(got.peer_auth, want, "{text}");
         }
     }
 

@@ -187,14 +187,43 @@ pub fn peer_auth_fingerprint(key: &str) -> Option<String> {
 }
 
 /// FR-100 P1b — what a controller's offer carries for the device to sign
-/// against. In P1b that is only the nonce. The controller's own key and its
-/// signature over the offer arrive with P2, as fields an older reader skips.
+/// against: the nonce. With P2b the browser also signs its offer, and `key`
+/// and `sig` carry that: fields an older reader skips, and an older viewer
+/// never sends.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PeerAuthOffer {
     /// The browser's fresh nonce, base64url without padding, 16 to 32 bytes
     /// ([`peer_auth_nonce_is_well_formed`]). It is what makes a signed answer
     /// this offer's and no other's.
     pub nonce: String,
+    /// FR-100 P2b — the browser's own key, in the device key's shape
+    /// ([`peer_auth_key_is_well_formed`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// FR-100 P2b — the browser's signature over the transcript with role
+    /// `offer` and an EMPTY answer fingerprint ([`peer_auth_transcript`]),
+    /// base64url without padding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
+}
+
+/// FR-100 P1c — what the device concluded about the browser that offered a
+/// session, as its answer reports it and the session's audit records it:
+/// - `absent`: the offer carried no browser signature;
+/// - `unknown`: a signature that verifies, by a key the device had not seen
+///   for this user (under `audit` it is now remembered);
+/// - `verified`: a signature that verifies, by a key the device remembers
+///   for this user, or an outsider's session FR-52's MAC admitted;
+/// - `mismatch`: a signature that does not verify over this session.
+///
+/// ⚠️ A STRING on the wire, never an enum: a word a newer device sends must
+/// not fail an older server's whole answer frame. Readers check it with
+/// [`peer_auth_verdict_is_known`] and record nothing they do not know.
+pub const PEER_AUTH_VERDICTS: [&str; 4] = ["absent", "unknown", "verified", "mismatch"];
+
+/// FR-100 P1c — is `verdict` one of [`PEER_AUTH_VERDICTS`]? Equality only.
+pub fn peer_auth_verdict_is_known(verdict: &str) -> bool {
+    PEER_AUTH_VERDICTS.contains(&verdict)
 }
 
 /// FR-100 P1b — the device's signature over its answer: the transcript
@@ -1555,6 +1584,14 @@ pub enum ClientMsg {
         /// any session whose offer did not ask.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         peer_auth: Option<PeerAuthAnswer>,
+        /// FR-100 P1c — what the device concluded about the browser that
+        /// offered this session (one of [`PEER_AUTH_VERDICTS`]), for the hub to
+        /// record. Sent whether or not the offer asked for a signed answer, so
+        /// a session nobody signed is recorded as `absent` rather than not at
+        /// all. Absent when the device's `peer_auth` is `off`, and from a build
+        /// without it. A string, never an enum: see [`PEER_AUTH_VERDICTS`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_auth_verdict: Option<String>,
     },
 
     /// Agent decision on a control request.
@@ -7584,6 +7621,8 @@ mod tests {
             extauth_mac: None,
             peer_auth: Some(PeerAuthOffer {
                 nonce: nonce_0_to_15(),
+                key: None,
+                sig: None,
             }),
         };
         let v = serde_json::to_value(&offer).unwrap();
@@ -7599,9 +7638,36 @@ mod tests {
             sdp: "v=0".into(),
             extauth_mac: None,
             peer_auth: None,
+            peer_auth_verdict: None,
         };
         let v = serde_json::to_value(&answer).unwrap();
         assert!(v.get("peer_auth").is_none(), "{v}");
+        assert!(v.get("peer_auth_verdict").is_none(), "{v}");
+    }
+
+    /// FR-100 P1c — the device's verdict rides its answer as a plain string.
+    /// An older server reads the frame, field and all (it skips what it does
+    /// not know); a newer device's word reaches this server as a word, and is
+    /// checked against the vocabulary before anything records it.
+    #[test]
+    fn the_answer_carries_the_verdict_as_a_word_older_readers_skip() {
+        let raw = r#"{"t":"rc:sdp.answer","session_id":"66f0c0ffee0000000000000a",
+            "sdp":"v=0","peer_auth_verdict":"some-future-word"}"#;
+        let ClientMsg::SdpAnswer {
+            peer_auth_verdict, ..
+        } = serde_json::from_str::<ClientMsg>(raw).expect("an unknown word never fails the frame")
+        else {
+            panic!("not an answer")
+        };
+        assert_eq!(peer_auth_verdict.as_deref(), Some("some-future-word"));
+        assert!(!peer_auth_verdict_is_known("some-future-word"));
+        for word in ["absent", "unknown", "verified", "mismatch"] {
+            assert!(peer_auth_verdict_is_known(word), "{word}");
+        }
+        // Equality only: a prefix or a case change is not a verdict.
+        assert!(!peer_auth_verdict_is_known("verified-ish"));
+        assert!(!peer_auth_verdict_is_known("Verified"));
+        assert!(!peer_auth_verdict_is_known(""));
     }
 
     /// FR-90 P3-3a — what the server will store as a vault key: 32 bytes in

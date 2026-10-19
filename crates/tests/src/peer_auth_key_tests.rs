@@ -18,6 +18,11 @@
 //! P1b — and the real agent signs the answer an offer asked for (a nonce),
 //! with the key on its row, over that session's transcript, while an offer
 //! that did not ask is answered exactly as before.
+//!
+//! P1c — and the real agent judges the browser behind every in-org offer
+//! (`absent` · `unknown` · `verified` · `mismatch`), remembering each browser
+//! key beside its device key, while the hub records the verdict on the
+//! session's audit row and refuses nothing.
 
 use std::time::Duration;
 
@@ -346,6 +351,27 @@ async fn offer_and_answer(
     Value,
     std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
 ) {
+    let nonce = nonce.map(str::to_string);
+    offer_and_answer_with(app, token, agent_id, move |_, _| {
+        nonce.map(|n| json!({ "nonce": n }))
+    })
+    .await
+}
+
+/// [`offer_and_answer`], with the offer's `peer_auth` built by `ask` once the
+/// session id and the offer's SDP exist: FR-100 P2b's signed offer covers both.
+async fn offer_and_answer_with(
+    app: &TestApp,
+    token: &str,
+    agent_id: &str,
+    ask: impl FnOnce(&str, &str) -> Option<Value>,
+) -> (
+    Ws,
+    String,
+    String,
+    Value,
+    std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
+) {
     use crate::rc_idle_limit_tests::next_of;
     use webrtc::api::APIBuilder;
     use webrtc::api::media_engine::MediaEngine;
@@ -388,8 +414,8 @@ async fn offer_and_answer(
         .await
         .expect("rc:ready (the agent auto-grants)");
     let mut frame = json!({ "t": "rc:sdp.offer", "session_id": sid, "sdp": offer.sdp });
-    if let Some(nonce) = nonce {
-        frame["peer_auth"] = json!({ "nonce": nonce });
+    if let Some(peer_auth) = ask(&sid, &offer.sdp) {
+        frame["peer_auth"] = peer_auth;
     }
     ctl.send(Message::Text(frame.to_string().into()))
         .await
@@ -477,6 +503,187 @@ async fn the_real_agent_signs_the_answer_an_offer_asked_for() {
         "an offer that did not ask is answered unsigned: {answer}"
     );
     let _ = pc.close().await;
+
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), agent).await;
+}
+
+// ─── P1c — the device checks the browser ────────────────────────────────
+
+/// A browser the test holds: a P-256 key made fresh (never a literal), its
+/// public half as an offer carries it.
+struct TestBrowser {
+    pair: ring::signature::EcdsaKeyPair,
+    key: String,
+}
+
+fn test_browser() -> TestBrowser {
+    use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+    let pair =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let key = STANDARD.encode(pair.public_key().as_ref());
+    TestBrowser { pair, key }
+}
+
+/// `browser`'s `peer_auth` for an offer: signed over the transcript with role
+/// `offer` and an EMPTY answer fingerprint, for `signed_sid`, which a test may
+/// set to ANOTHER session's id.
+fn signed_ask(
+    browser: &TestBrowser,
+    signed_sid: &str,
+    agent_id: &str,
+    user_id: &str,
+    offer_sdp: &str,
+    nonce: &str,
+) -> Value {
+    use roomler_ai_remote_control::signaling::{peer_auth_transcript, sdp_dtls_fingerprint};
+    let transcript = peer_auth_transcript(
+        "offer",
+        signed_sid,
+        agent_id,
+        user_id,
+        &sdp_dtls_fingerprint(offer_sdp).unwrap(),
+        "",
+        nonce,
+    )
+    .unwrap();
+    let sig = browser
+        .pair
+        .sign(&ring::rand::SystemRandom::new(), &transcript)
+        .unwrap();
+    json!({
+        "nonce": nonce,
+        "key": browser.key,
+        "sig": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.as_ref()),
+    })
+}
+
+/// The verdict on session `sid`'s `session_started` audit row, once the hub's
+/// sink has flushed it (every 200 ms). `None` = recorded without one.
+async fn recorded_verdict(app: &TestApp, sid: &str) -> Option<String> {
+    use roomler_ai_remote_control::models::RemoteAuditEvent;
+    let sid = ObjectId::parse_str(sid).unwrap();
+    for _ in 0..50 {
+        if let Some(row) = app
+            .db
+            .collection::<Document>(RemoteAuditEvent::COLLECTION)
+            .find_one(doc! { "session_id": sid, "event.kind": "session_started" })
+            .await
+            .unwrap()
+        {
+            return row
+                .get_document("event")
+                .unwrap()
+                .get_str("peer_auth")
+                .ok()
+                .map(str::to_string);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("no session_started row for {sid}");
+}
+
+/// End one session as a viewer does, and close its peer (dropping one frees
+/// none of its sockets).
+async fn hang_up(
+    mut ctl: Ws,
+    sid: &str,
+    pc: std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
+) {
+    ctl.send(Message::Text(
+        json!({ "t": "rc:terminate", "session_id": sid, "reason": "controller_hangup" })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let _ = pc.close().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+/// The real agent judges the browser behind every in-org offer, and the hub
+/// records the verdict on the session's audit row, which is what AC4's fleet
+/// week counts. An offer nobody signed is `absent`. A browser's first signed
+/// offer is `unknown`, and its key is remembered beside the device key; its
+/// next offer is `verified`. A signature made for another session is a
+/// `mismatch`, and under `audit` the session is answered all the same.
+#[tokio::test]
+async fn the_device_judges_the_browser_and_the_hub_records_the_verdict() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("peerauth-verdict").await;
+    let cfg = crate::rc_idle_limit_tests::enrol(&app, &seeded, "peer-auth-verdict").await;
+    let agent_id = cfg.agent_id.clone();
+    let pins =
+        std::path::Path::new("peer-auth").join(format!("{}.controllers.json", cfg.tenant_id));
+    let dir = tempfile::tempdir().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let agent = spawn_keyed_agent(cfg.clone(), dir.path().join("config.toml"), stop_rx);
+    crate::rc_idle_limit_tests::wait_online(&app, &seeded, &cfg).await;
+    let _ = wait_for_any_key(&app, &agent_id).await;
+    let token = &seeded.admin.access_token;
+    let admin = seeded.admin.id.clone();
+    let chrome = test_browser();
+
+    let (ctl, sid, _, answer, pc) =
+        offer_and_answer(&app, token, &agent_id, Some(nonce().as_str())).await;
+    assert_eq!(
+        recorded_verdict(&app, &sid).await.as_deref(),
+        Some("absent"),
+        "nobody signed the offer: {answer}"
+    );
+    assert!(
+        answer.get("peer_auth_verdict").is_none(),
+        "the hub records the verdict; it never relays it: {answer}"
+    );
+    hang_up(ctl, &sid, pc).await;
+
+    let (ctl, sid, _, _, pc) = offer_and_answer_with(&app, token, &agent_id, |sid, sdp| {
+        Some(signed_ask(&chrome, sid, &agent_id, &admin, sdp, &nonce()))
+    })
+    .await;
+    assert_eq!(
+        recorded_verdict(&app, &sid).await.as_deref(),
+        Some("unknown"),
+        "a browser the device has not met"
+    );
+    assert!(
+        dir.path().join(&pins).exists(),
+        "its key is remembered beside the device key"
+    );
+    hang_up(ctl, &sid, pc).await;
+
+    let (ctl, sid, _, _, pc) = offer_and_answer_with(&app, token, &agent_id, |sid, sdp| {
+        Some(signed_ask(&chrome, sid, &agent_id, &admin, sdp, &nonce()))
+    })
+    .await;
+    assert_eq!(
+        recorded_verdict(&app, &sid).await.as_deref(),
+        Some("verified"),
+        "the same browser, met before"
+    );
+    hang_up(ctl, &sid, pc).await;
+
+    let elsewhere = ObjectId::new().to_hex();
+    let (ctl, sid, _, answer, pc) = offer_and_answer_with(&app, token, &agent_id, |_, sdp| {
+        Some(signed_ask(
+            &chrome,
+            &elsewhere,
+            &agent_id,
+            &admin,
+            sdp,
+            &nonce(),
+        ))
+    })
+    .await;
+    assert!(answer["sdp"].is_string(), "audit refuses nothing: {answer}");
+    assert_eq!(
+        recorded_verdict(&app, &sid).await.as_deref(),
+        Some("mismatch"),
+        "a signature made for another session"
+    );
+    hang_up(ctl, &sid, pc).await;
 
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), agent).await;

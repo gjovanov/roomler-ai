@@ -4058,6 +4058,9 @@ async fn run_cmd(
         cfg.exec_enabled,
         cfg.remote_config_enabled,
     );
+    // FR-100 P1c — and every other live key it holds (`peer_auth`), from the
+    // same config: a fresh `new` judges offers under `audit` until told.
+    remote_cfg.adopt_local(&cfg);
     // FR-90 — the agent-session supervisor, from this start's `hive_*` keys
     // (restart-required). Built with every gate closed too, so a start is
     // answered with the device's actual refusal rather than silence.
