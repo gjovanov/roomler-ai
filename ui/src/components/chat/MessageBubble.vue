@@ -76,6 +76,15 @@
         <!-- Normal display -->
         <div v-else class="text-body-2 message-content" v-html="renderedContent" />
 
+        <!-- FR-90 P3-4e-3 — a vault approval card: its answer, under its text. -->
+        <vault-approval-card
+          v-if="tenantId && message.binding?.module === 'vault'"
+          :tenant-id="tenantId"
+          :approval-id="message.binding.ref"
+          :stamp="message.updated_at"
+          class="mt-2"
+        />
+
         <!-- Attachments -->
         <div v-if="message.attachments && message.attachments.length > 0" class="mt-2 d-flex flex-wrap ga-2">
           <template v-for="att in message.attachments" :key="att.file_id">
@@ -155,6 +164,7 @@ import { computed, ref, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { renderMarkdown } from '@/composables/useMarkdown'
 import EmojiPicker from '@/components/chat/EmojiPicker.vue'
 import MessageEditor from '@/components/chat/MessageEditor.vue'
+import VaultApprovalCard from '@/components/vault/VaultApprovalCard.vue'
 
 interface Reaction {
   emoji: string
@@ -184,6 +194,9 @@ interface Message {
   attachments: Attachment[]
   created_at: string
   updated_at: string
+  /** FR-90 — the module a message belongs to, which chat stores and never
+   *  reads: `vault` for an approval card (P3-4e). */
+  binding?: { module: string; ref: string }
 }
 
 const props = defineProps<{
@@ -191,6 +204,8 @@ const props = defineProps<{
   compact?: boolean
   editable?: boolean
   unread?: boolean
+  /** FR-90 P3-4e-3 — the room's organization, for a vault card's answer. */
+  tenantId?: string
 }>()
 
 const emit = defineEmits<{
