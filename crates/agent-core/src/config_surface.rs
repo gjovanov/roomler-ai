@@ -506,6 +506,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-90 - let the organization's vault lease secrets to the agent sessions on this device. On, the daemon makes a key at each start, in memory only, and a leased value is decrypted in the daemon, never in the session's process. Never settable by the server. Default: OFF.",
     },
     KeyMeta {
+        key: "vault_activity_log",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "bool",
+        description: "FR-90 - report to the org what this device does with the values its vault leases it: each command a session ran with them (the program and how it ended) and each file it wrote (the name). Never a value. Never settable by the server. Default: OFF.",
+    },
+    KeyMeta {
         key: "ssh_enabled",
         group: Group::Ssh,
         tier: Tier::Essential,
@@ -1917,6 +1925,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "hive_archive" => Some(fmt_bool(cfg.hive_archive)),
         "hive_store_quota_mib" => cfg.hive_store_quota_mib.map(|n| n.to_string()),
         "vault_enabled" => Some(fmt_bool(cfg.vault_enabled)),
+        "vault_activity_log" => Some(fmt_bool(cfg.vault_activity_log)),
         "ssh_exec_streaming" => Some(fmt_bool(cfg.ssh_exec_streaming)),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
@@ -2266,6 +2275,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                 parse_u32_range("hive_store_quota_mib", value, 1, 4 * 1024 * 1024)?
         }
         "vault_enabled" => cfg.vault_enabled = parse_bool_or(value, false)?,
+        "vault_activity_log" => cfg.vault_activity_log = parse_bool_or(value, false)?,
         "hive_update_wait_secs" => {
             cfg.hive_update_wait_secs = parse_u32_range("hive_update_wait_secs", value, 0, 7200)?
         }
@@ -4439,6 +4449,24 @@ mod tests {
         apply(&mut cfg, "vault_enabled", None).unwrap();
         assert!(!cfg.vault_enabled, "cleared is off");
         assert!(apply(&mut cfg, "vault_enabled", Some("sometimes")).is_err());
+    }
+
+    /// FR-90 P3-4d-2 — whether the device reports what it does with its
+    /// leases is the device owner's, as `ssh_activity_log` is: off until they
+    /// say so, off again when cleared, read at the primary connection.
+    #[test]
+    fn vault_activity_log_defaults_off_and_clears_off() {
+        let mut cfg = crate::config::test_fixture();
+        assert!(!cfg.vault_activity_log);
+        let e = entry_for(&cfg, "vault_activity_log").unwrap();
+        assert_eq!(e.default.as_deref(), Some("false"));
+        assert_eq!(e.group, Group::Access.wire());
+        assert!(e.restart_required);
+        apply(&mut cfg, "vault_activity_log", Some("true")).unwrap();
+        assert!(cfg.vault_activity_log);
+        apply(&mut cfg, "vault_activity_log", None).unwrap();
+        assert!(!cfg.vault_activity_log, "cleared is off");
+        assert!(apply(&mut cfg, "vault_activity_log", Some("sometimes")).is_err());
     }
 
     /// FR-90 decision 15 — a Mac session as an account whose `sudo` needs no

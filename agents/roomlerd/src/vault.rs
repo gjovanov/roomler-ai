@@ -107,7 +107,7 @@ mod client {
     use base64::Engine;
     use bson::oid::ObjectId;
     use roomler_ai_remote_control::signaling::ClientMsg;
-    use roomler_ai_remote_control::vault::{VaultSecretMeta, lease_limits};
+    use roomler_ai_remote_control::vault::{VaultActivityKind, VaultSecretMeta, lease_limits};
     use tokio::sync::{mpsc, oneshot};
     use tracing::{debug, info, warn};
     use zeroize::Zeroizing;
@@ -247,8 +247,27 @@ mod client {
         /// P3-4b — whether that connection takes leases: a session's vault
         /// tools are offered only then.
         takes: AtomicBool,
+        /// P3-4d-2 — whether the device's owner has it report what it does
+        /// with its leases (`vault_activity_log`).
+        reports: AtomicBool,
         pending: Mutex<HashMap<String, Waiting>>,
         held: Mutex<HashMap<String, Held>>,
+    }
+
+    /// P3-4d-2 — one use of leased values, as the device reports it
+    /// (`rc:vault.activity`): never a value.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Report {
+        pub session_id: ObjectId,
+        pub fence: u64,
+        pub kind: VaultActivityKind,
+        /// The leases whose values were used.
+        pub lease_ids: Vec<String>,
+        /// `exec`: the program's bare name; `render`: the file's.
+        pub target: String,
+        /// `exec`: how the command ended; `None` when it was killed.
+        pub exit_code: Option<i32>,
+        pub timed_out: bool,
     }
 
     fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -290,6 +309,42 @@ mod client {
         /// session its vault tools.
         pub fn takes_leases(&self) -> bool {
             self.takes.load(Ordering::Relaxed)
+        }
+
+        /// P3-4d-2 — whether to report what this daemon does with its leases:
+        /// the device's own `vault_activity_log`, set at each primary hello.
+        pub fn set_reports(&self, on: bool) {
+            self.reports.store(on, Ordering::Relaxed);
+        }
+
+        /// P3-4d-2 — tell the vault this daemon used leased values
+        /// (`rc:vault.activity`), where the device's owner has it report;
+        /// nothing otherwise. Fire-and-forget: a full or closed connection
+        /// drops the report rather than hold the call that made it. Answers
+        /// whether it was queued.
+        pub fn report(&self, r: Report) -> bool {
+            if !self.reports.load(Ordering::Relaxed) || r.lease_ids.is_empty() {
+                return false;
+            }
+            let Some(tx) = lock(&self.outbound).clone() else {
+                return false;
+            };
+            let frame = ClientMsg::VaultActivity {
+                session_id: r.session_id,
+                fence: r.fence,
+                kind: r.kind.wire().into(),
+                lease_ids: r.lease_ids,
+                target: r.target,
+                exit_code: r.exit_code,
+                timed_out: r.timed_out,
+            };
+            match tx.try_send(frame) {
+                Ok(()) => true,
+                Err(e) => {
+                    debug!(%e, "vault: an activity report was dropped");
+                    false
+                }
+            }
         }
 
         /// Send `frame` as request `req_id`, waiting as `waiting`.
@@ -618,11 +673,13 @@ mod client {
 
     static PRUNER: OnceLock<()> = OnceLock::new();
 
-    /// The primary connection's outbound queue, at each of its hellos, and
-    /// whether it takes leases; the first also starts letting go of expired
-    /// leases in the background.
-    pub fn on_connected(tx: mpsc::Sender<ClientMsg>, takes: bool) {
+    /// The primary connection's outbound queue, at each of its hellos,
+    /// whether it takes leases, and (P3-4d-2) whether the device reports what
+    /// it does with them; the first also starts letting go of expired leases
+    /// in the background.
+    pub fn on_connected(tx: mpsc::Sender<ClientMsg>, takes: bool, reports: bool) {
         CLIENT.connected(tx, takes);
+        CLIENT.set_reports(reports);
         PRUNER.get_or_init(|| {
             tokio::spawn(async {
                 loop {
@@ -759,10 +816,10 @@ mod tests {
         use base64::Engine;
         use bson::oid::ObjectId;
         use roomler_ai_remote_control::signaling::ClientMsg;
-        use roomler_ai_remote_control::vault::{VaultSecretMeta, lease_limits};
+        use roomler_ai_remote_control::vault::{VaultActivityKind, VaultSecretMeta, lease_limits};
         use tokio::sync::mpsc;
 
-        use super::super::{Client, LeaseAsk, LeaseError, LeaseInfo, Listing, hello_key};
+        use super::super::{Client, LeaseAsk, LeaseError, LeaseInfo, Listing, Report, hello_key};
 
         fn in_ms(ms: i64) -> i64 {
             let now = std::time::SystemTime::now()
@@ -1221,6 +1278,57 @@ mod tests {
             );
             c.drop_run(sid, 1);
             assert_eq!(c.find_ahead(&exec_for("psql", true), soon), None);
+        }
+
+        /// P3-4d-2 — a report goes out on the connection only where the
+        /// device's owner has it report, names its leases and never a value,
+        /// and is dropped rather than wait on a full connection.
+        #[tokio::test]
+        async fn a_report_goes_out_only_where_the_owner_has_it_report() {
+            let c = Arc::new(Client::default());
+            let (tx, mut rx) = mpsc::channel(1);
+            c.connected(tx, true);
+            let sid = ObjectId::new();
+            let report = || Report {
+                session_id: sid,
+                fence: 2,
+                kind: VaultActivityKind::Exec,
+                lease_ids: vec!["L1".into()],
+                target: "psql".into(),
+                exit_code: Some(0),
+                timed_out: false,
+            };
+            assert!(!c.report(report()), "off by default: nothing sent");
+            assert!(rx.try_recv().is_err());
+
+            c.set_reports(true);
+            assert!(c.report(report()));
+            match rx.try_recv().unwrap() {
+                ClientMsg::VaultActivity {
+                    session_id,
+                    fence,
+                    kind,
+                    lease_ids,
+                    target,
+                    exit_code,
+                    timed_out,
+                } => {
+                    assert_eq!((session_id, fence), (sid, 2));
+                    assert_eq!((kind.as_str(), target.as_str()), ("exec", "psql"));
+                    assert_eq!(lease_ids, ["L1"]);
+                    assert_eq!((exit_code, timed_out), (Some(0), false));
+                }
+                other => panic!("expected a report, got {other:?}"),
+            }
+            assert!(c.report(report()));
+            assert!(
+                !c.report(report()),
+                "the connection holds one: the next is dropped, not waited for"
+            );
+            let _ = rx.try_recv();
+            let mut no_lease = report();
+            no_lease.lease_ids.clear();
+            assert!(!c.report(no_lease), "no lease used, nothing to report");
         }
 
         /// A lease is let go at its expiry, and held no longer than the
