@@ -1476,7 +1476,7 @@ async fn vault_render_takes_a_lease_asked_for_ahead_toward_its_file() {
 
 /// P3-5b-2 — the answer to a `vault_connect` call: its JSON, or its error
 /// text.
-#[cfg(all(feature = "vault", unix))]
+#[cfg(feature = "vault")]
 async fn connect_answer(c: &mut Client, id: u64, args: Value) -> Result<Value, String> {
     c.send(tool_call(id, "vault_connect", args)).await;
     let m = c.recv().await;
@@ -1792,6 +1792,146 @@ async fn a_proxy_connection_from_another_account_is_refused() {
     }
     // Root passes the socket's own permissions; the endpoint's check does not.
     let mut pg = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    let _ = pg.write_all(&startup(&[("database", "d")])).await;
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(
+        WAIT,
+        tokio::io::AsyncReadExt::read_to_end(&mut pg, &mut rest),
+    )
+    .await;
+    assert!(ended.is_ok(), "the connection was closed");
+    assert!(rest.is_empty(), "and answered nothing: {rest:?}");
+    assert!(saw.try_recv().is_err(), "no upstream was dialled");
+}
+
+/// P3-5b-4 — a vault holding a secret's user and password, and the CA its
+/// upstream's certificate is made under.
+#[cfg(all(feature = "vault", windows))]
+fn proxy_vault(password: &str, ca: &str) -> Arc<FakeVault> {
+    Arc::new(FakeVault {
+        values: [
+            ("db/main#user", b"app".to_vec()),
+            ("db/main#password", password.as_bytes().to_vec()),
+            ("pki/db-ca", ca.as_bytes().to_vec()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect(),
+        ..FakeVault::default()
+    })
+}
+
+/// P3-5b-4 — on Windows the endpoint is a loopback port. The answer names it,
+/// and says the loopback leg is plain. A client of this account gets a
+/// session as the secret's user, and when a lease goes, the connection goes.
+#[cfg(all(feature = "vault", windows))]
+#[tokio::test]
+async fn vault_connect_serves_a_loopback_endpoint() {
+    use crate::vault_proxy::testing::{Saw, Upstreams, fake, made, message, next, startup};
+    let pw = made();
+    let (ca, port, mut saw) = fake(Upstreams::Scram(pw.clone())).await;
+    let vault = proxy_vault(&pw, &ca);
+    let b = belt_running(
+        me(),
+        Run {
+            session: ObjectId::new(),
+            fence: 5,
+            vault: Some(vault.clone()),
+            exec: None,
+        },
+        quick(),
+    );
+    let mut c = Client::connect(&b).await;
+    let answer = connect_answer(
+        &mut c,
+        1,
+        json!({
+            "handle": "db/main",
+            "engine": "postgres",
+            "upstream": format!("localhost:{port}"),
+            "database": "orders",
+            "ca": "pki/db-ca",
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !answer.to_string().contains(&pw),
+        "the answer holds no value"
+    );
+    assert_eq!(answer["host"], "127.0.0.1");
+    assert_eq!(answer["env"]["PGSSLMODE"], "disable");
+    let dial = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+    assert_eq!(
+        answer["uri"],
+        format!("postgresql://127.0.0.1:{dial}/orders?sslmode=disable")
+    );
+    let mut pg = tokio::net::TcpStream::connect(("127.0.0.1", dial))
+        .await
+        .unwrap();
+    pg.write_all(&startup(&[("user", "whoever"), ("database", "orders")]))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut pg).await, (b'R', vec![0, 0, 0, 0]));
+    assert_eq!(next(&mut pg).await.0, b'S');
+    assert_eq!(next(&mut pg).await.0, b'K');
+    assert_eq!(next(&mut pg).await.0, b'Z');
+    assert_eq!(
+        saw.recv().await.unwrap(),
+        Saw::Startup(vec![
+            ("user".into(), "app".into()),
+            ("database".into(), "orders".into()),
+        ])
+    );
+    pg.write_all(&message(b'Q', b"select 1\0")).await.unwrap();
+    assert_eq!(next(&mut pg).await.0, b'C');
+    assert_eq!(next(&mut pg).await.0, b'Z');
+    // The password's lease goes, and with it the connection.
+    vault.release(&["L1".to_string()]);
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(
+        WAIT,
+        tokio::io::AsyncReadExt::read_to_end(&mut pg, &mut rest),
+    )
+    .await;
+    assert!(ended.is_ok(), "the connection ended with the lease");
+}
+
+/// P3-5b-4 — a loopback connection from a process that does not run as the
+/// session's account is refused. Here the session's account is another's,
+/// so this test's own connection is the one refused.
+#[cfg(all(feature = "vault", windows))]
+#[tokio::test]
+async fn a_loopback_connection_from_another_account_is_refused() {
+    use crate::vault_proxy::testing::{Upstreams, fake, made, startup};
+    let pw = made();
+    let (ca, port, mut saw) = fake(Upstreams::Scram(pw.clone())).await;
+    let vault = proxy_vault(&pw, &ca);
+    // SYSTEM, unless this test is SYSTEM: then LOCAL SERVICE.
+    let other = match crate::hive_win::own_sid().unwrap().as_str() {
+        "S-1-5-18" => "S-1-5-19",
+        _ => "S-1-5-18",
+    }
+    .to_string();
+    let answer = super::super::vault_connect::call(
+        vault,
+        ObjectId::new(),
+        5,
+        None,
+        &other,
+        &json!({
+            "handle": "db/main",
+            "engine": "postgres",
+            "upstream": format!("localhost:{port}"),
+            "ca": "pki/db-ca",
+        }),
+    )
+    .await
+    .unwrap();
+    let dial = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+    let mut pg = tokio::net::TcpStream::connect(("127.0.0.1", dial))
+        .await
+        .unwrap();
     let _ = pg.write_all(&startup(&[("database", "d")])).await;
     let mut rest = Vec::new();
     let ended = tokio::time::timeout(

@@ -9,7 +9,7 @@
 //! |---|---|
 //! | the call | `handle` (a structured secret, by its path or this org's RRN, with no `#field`), `engine` (`postgres`), `upstream` (`host:port`, exactly as the secret's `audiences` names it), `database` (optional), `ca` (optional: a secret whose value is the upstream's CA, PEM), `ttl_s` (30 to 900, default 300) |
 //! | the leases | the secret's `user` and `password`, and `ca`'s, each in `proxy` mode toward the upstream: the vault's `proxy-only-named-audiences` refuses an upstream the secret does not name, recorded. A lease asked for ahead toward the same upstream is taken as it is |
-//! | the endpoint | `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, which a Postgres client dials as `host=<that directory>`: both directories the daemon's own (`0711`), the socket handed to the session's account (`0600`), and each connection's peer uid checked again |
+//! | the endpoint | Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, which a Postgres client dials as `host=<that directory>`: both directories the daemon's own (`0711`), the socket handed to the session's account (`0600`), and each connection's peer uid checked again. Windows (P3-5b-4): `127.0.0.1` on a port the system picks, each connection's process found in the connection table and served only if its token is the session's account |
 //! | a connection | [`crate::vault_proxy::pg`]: the client never authenticates; the upstream, by SCRAM-SHA-256 inside verified TLS, with the values read from the leases as each connection starts |
 //! | its life | closed, with every connection it holds, when its first lease is let go: its expiry, `rc:vault.revoke`, the run's end; every one an earlier process left, at the daemon's start |
 //!
@@ -18,15 +18,16 @@
 //! secret's user there, so the session's settings ASK for every call, as for
 //! the other uses.
 //!
-//! Windows serves no endpoint yet (P3-5b-4: loopback TCP, each connection's
-//! process identified): a call there is refused before anything is leased.
+//! Windows has no Unix socket most database clients can dial, so its
+//! endpoint is a loopback port (P3-5b-4). Any process on the device can
+//! connect to it; only one running as the session's account is served.
 
 use std::sync::Arc;
 
 use bson::oid::ObjectId;
 use serde_json::Value;
 
-use super::toolbelt::VaultTools;
+use super::toolbelt::{PeerId, VaultTools};
 use super::vault_exec::{ExecTarget, Handle, handle_of};
 
 /// How long an endpoint lives when the call names no TTL.
@@ -49,7 +50,6 @@ impl Engine {
         }
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
     fn wire(self) -> &'static str {
         match self {
             Self::Postgres => "postgres",
@@ -58,9 +58,8 @@ impl Engine {
 }
 
 /// One `vault_connect` call, checked: what is refused here never reaches the
-/// vault. (Served only on Unix, for now.)
+/// vault.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct ConnectRequest {
     /// The structured secret whose `user` and `password` the endpoint
     /// authenticates with.
@@ -80,7 +79,6 @@ pub(crate) struct ConnectRequest {
 impl ConnectRequest {
     /// The values the endpoint is leased, in order: `user`, `password`, then
     /// the CA when the call names one.
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn handles(&self) -> Vec<Handle> {
         let field = |f: &str| Handle {
             secret: self.secret.clone(),
@@ -202,27 +200,30 @@ pub(crate) fn parse(args: &Value) -> Result<ConnectRequest, String> {
 
 /// What a session's `vault_connect` call answers: where its endpoint is, with
 /// a connection string that holds no credential, and how long it lasts; or
-/// why there is none.
+/// why there is none. On Unix the endpoint is a socket handed to `target`'s
+/// account; on Windows (P3-5b-4) a loopback port whose every connection must
+/// come from a process running as `peer`, the session's account as its
+/// toolbelt takes it.
 pub(crate) async fn call(
     vault: Arc<dyn VaultTools>,
     session: ObjectId,
     fence: u64,
     target: Option<&ExecTarget>,
+    peer: &PeerId,
     args: &Value,
 ) -> Result<Value, String> {
-    #[cfg(not(unix))]
-    {
-        // Checked all the same, so a call is told what is wrong with it.
-        parse(args)?;
-        let _ = (vault, session, fence, target);
-        Err("this device serves no proxy endpoint yet: on Windows it comes in a later step".into())
-    }
+    let req = parse(args)?;
     #[cfg(unix)]
-    {
-        let req = parse(args)?;
-        let target = target.ok_or("this device serves no endpoint for a session")?;
-        endpoint::open(vault, session, fence, target, req).await
-    }
+    let at = {
+        let _ = peer;
+        endpoint::At(target.ok_or("this device serves no endpoint for a session")?)
+    };
+    #[cfg(windows)]
+    let at = {
+        let _ = target;
+        endpoint::At(peer.as_str())
+    };
+    endpoint::open(vault, session, fence, at, req).await
 }
 
 /// Every endpoint directory an earlier process left under `runtime_root`: no
@@ -249,31 +250,27 @@ pub(crate) fn sweep(runtime_root: &std::path::Path) -> usize {
 #[cfg(all(unix, test))]
 pub(crate) use endpoint::MAX_ENDPOINTS;
 
-#[cfg(unix)]
 mod endpoint {
     use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
     use std::sync::{Arc, LazyLock, Mutex};
     use std::time::Duration;
 
     use bson::oid::ObjectId;
     use serde_json::{Value, json};
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::{UnixListener, UnixStream};
+    use tokio::io::{AsyncWrite, AsyncWriteExt};
     use tokio_util::sync::CancellationToken;
     use tracing::{debug, warn};
     use zeroize::Zeroizing;
 
     use super::super::toolbelt::VaultTools;
-    use super::super::vault_exec::{ExecTarget, Releasing};
+    use super::super::vault_exec::Releasing;
     use super::{ConnectRequest, Engine};
     use crate::vault_proxy::{pg, tls};
 
-    /// Each session's endpoints, under its runtime directory.
-    pub(crate) const PROXIES_DIR: &str = "proxies";
-    /// The port a Postgres endpoint's socket is named for: a client dials
-    /// `host=<directory>` and, unless told otherwise, port 5432.
-    pub(crate) const PG_PORT: u16 = 5432;
+    #[cfg(unix)]
+    pub(crate) use self::place::PROXIES_DIR;
+    pub(crate) use self::place::{At, bind};
+
     /// Endpoints one run holds open at once. Taken before anything is
     /// leased, so a call past it asks the vault nothing.
     pub(crate) const MAX_ENDPOINTS: usize = 8;
@@ -325,8 +322,6 @@ mod endpoint {
         host: String,
         port: u16,
         tls: tokio_rustls::TlsConnector,
-        /// The only account a connection is taken from: the session's.
-        peer: u32,
     }
 
     impl Endpoint {
@@ -350,73 +345,6 @@ mod endpoint {
             .map(|s| Zeroizing::new(s.to_string()))
     }
 
-    /// `dir`, made if absent: the daemon's own, `0711`, so the session's
-    /// account reaches what it names and lists nothing. A link or anything but
-    /// a directory in its place is refused, never followed.
-    fn private_dir(dir: &Path) -> Result<(), String> {
-        use std::os::unix::fs::PermissionsExt;
-        match std::fs::symlink_metadata(dir) {
-            Ok(m) if !m.file_type().is_dir() => {
-                return Err(format!("{} is not a plain directory", dir.display()));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            }
-            Err(e) => return Err(format!("{}: {e}", dir.display())),
-        }
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o711))
-            .map_err(|e| format!("{}: {e}", dir.display()))
-    }
-
-    /// A new endpoint's directory, `<session_dir>/proxies/<id>`, and its
-    /// socket, bound and handed to `owner` at `0600`. The directory is
-    /// removed again if any step fails.
-    fn bind(
-        session_dir: &Path,
-        owner: Option<(u32, u32)>,
-    ) -> Result<(PathBuf, UnixListener), String> {
-        use std::os::unix::fs::PermissionsExt;
-        let root = session_dir.join(PROXIES_DIR);
-        private_dir(&root)?;
-        // A short id, so the socket's path stays well inside `sun_path` (104
-        // bytes on macOS); `create_dir`, not `create_dir_all`, so a name
-        // already there is drawn again, never joined.
-        let mut drawn = 0;
-        let dir = loop {
-            let dir = root.join(format!("{:08x}", rand::random::<u32>()));
-            match std::fs::create_dir(&dir) {
-                Ok(()) => break dir,
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && drawn < 3 => drawn += 1,
-                Err(e) => return Err(format!("{}: {e}", dir.display())),
-            }
-        };
-        let made = (|| {
-            private_dir(&dir)?;
-            let socket = dir.join(format!(".s.PGSQL.{PG_PORT}"));
-            let listener =
-                UnixListener::bind(&socket).map_err(|e| format!("{}: {e}", socket.display()))?;
-            // Bound under the daemon's umask: until these two calls, only
-            // the daemon can connect. Then the session's account, and nobody
-            // else.
-            owner
-                .map(|(u, g)| std::os::unix::fs::chown(&socket, Some(u), Some(g)))
-                .unwrap_or(Ok(()))
-                .and_then(|()| {
-                    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-                })
-                .map_err(|e| format!("{}: {e}", socket.display()))?;
-            Ok(listener)
-        })();
-        match made {
-            Ok(listener) => Ok((dir, listener)),
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                Err(e)
-            }
-        }
-    }
-
     /// Percent-encode `s` for a URI, leaving what reads plainly: letters,
     /// digits, `-._~`, and `/` where `slash` says.
     fn encode(s: &str, slash: bool) -> String {
@@ -431,11 +359,19 @@ mod endpoint {
         out
     }
 
+    /// How a client reaches an endpoint, as the answer says it.
+    pub(crate) struct Dial {
+        host: String,
+        port: u16,
+        uri: String,
+        env: serde_json::Map<String, Value>,
+    }
+
     pub(crate) async fn open(
         vault: Arc<dyn VaultTools>,
         session: ObjectId,
         fence: u64,
-        target: &ExecTarget,
+        at: At<'_>,
         req: ConnectRequest,
     ) -> Result<Value, String> {
         let Engine::Postgres = req.engine;
@@ -483,14 +419,14 @@ mod endpoint {
         };
         let tls = tls::connector(ca.as_deref().map(String::as_str))
             .map_err(|e| format!("the upstream's TLS: {e}"))?;
-        let (dir, listener) = bind(&target.session_dir, target.owner)?;
+        let bound = bind(&at)?;
         let stop = CancellationToken::new();
         // The endpoint lives with its leases: whichever is let go first
         // closes it, and every connection it holds.
         for lease in &leases {
             if !vault.stop_with(lease, stop.clone()) {
                 stop.cancel();
-                let _ = std::fs::remove_dir_all(&dir);
+                bound.close();
                 return Err(
                     "a lease ended before the endpoint was handed over: it is closed".into(),
                 );
@@ -504,6 +440,7 @@ mod endpoint {
             .filter_map(|l| vault.left(l))
             .min()
             .map_or(0, |d| d.as_secs());
+        let dial = bound.dial(req.database.as_deref());
         let endpoint = Arc::new(Endpoint {
             vault: Arc::clone(&vault),
             user_lease: leases[0].clone(),
@@ -511,31 +448,16 @@ mod endpoint {
             host: req.host.clone(),
             port: req.port,
             tls,
-            // SAFETY: geteuid reads our own credentials; it cannot fail.
-            peer: target
-                .owner
-                .map_or_else(|| unsafe { libc::geteuid() }, |(u, _)| u),
         });
-        tokio::spawn(serve(listener, endpoint, stop, dir.clone(), own, slot));
-
-        let host = dir.to_string_lossy().into_owned();
-        let mut uri = String::from("postgresql:///");
-        let mut env = serde_json::Map::new();
-        env.insert("PGHOST".into(), json!(host));
-        env.insert("PGPORT".into(), json!(PG_PORT.to_string()));
-        if let Some(db) = &req.database {
-            uri.push_str(&encode(db, false));
-            env.insert("PGDATABASE".into(), json!(db));
-        }
-        uri.push_str(&format!("?host={}&port={PG_PORT}", encode(&host, true)));
+        tokio::spawn(serve(bound, endpoint, stop, own, slot));
         Ok(json!({
             "engine": req.engine.wire(),
             "upstream": req.upstream,
-            "host": host,
-            "port": PG_PORT,
+            "host": dial.host,
+            "port": dial.port,
             "database": req.database,
-            "uri": uri,
-            "env": env,
+            "uri": dial.uri,
+            "env": dial.env,
             "ttl_s": ttl_s,
             "note": "Connect with any user name and no password: the endpoint signs in to the \
                      upstream as the secret's user. It closes, with its connections, when its \
@@ -545,14 +467,13 @@ mod endpoint {
 
     /// Serve one endpoint until its first lease is let go: each connection
     /// from the session's account, at most [`MAX_CONNECTIONS`] at once, one
-    /// Postgres session each. Then its directory goes, the leases its call
-    /// asked for itself (`own`) are let go rather than held to their expiry,
-    /// and its place among the run's endpoints goes with it.
+    /// Postgres session each. Then it closes, the leases its call asked for
+    /// itself (`own`) are let go rather than held to their expiry, and its
+    /// place among the run's endpoints goes with it.
     async fn serve(
-        listener: UnixListener,
+        bound: place::Bound,
         endpoint: Arc<Endpoint>,
         stop: CancellationToken,
-        dir: PathBuf,
         own: Vec<String>,
         _slot: Slot,
     ) {
@@ -560,10 +481,10 @@ mod endpoint {
         loop {
             let got = tokio::select! {
                 _ = stop.cancelled() => break,
-                got = listener.accept() => got,
+                got = bound.accept() => got,
             };
             let stream = match got {
-                Ok((stream, _)) => stream,
+                Ok(stream) => stream,
                 Err(e) => {
                     // Out of descriptors and the like: back off rather than spin.
                     warn!(%e, "vault: a proxy endpoint could not accept");
@@ -571,19 +492,9 @@ mod endpoint {
                     continue;
                 }
             };
-            match stream.peer_cred() {
-                Ok(c) if c.uid() == endpoint.peer => {}
-                Ok(c) => {
-                    warn!(
-                        uid = c.uid(),
-                        "vault: a proxy connection from another account — refused"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    warn!(%e, "vault: a proxy peer could not be identified — refused");
-                    continue;
-                }
+            if let Err(why) = bound.admits(&stream) {
+                warn!(%why, "vault: a proxy connection not from the session's account — refused");
+                continue;
             }
             let Ok(permit) = Arc::clone(&open).try_acquire_owned() else {
                 tokio::spawn(refuse(
@@ -608,15 +519,254 @@ mod endpoint {
                 }
             });
         }
-        drop(listener);
-        let _ = std::fs::remove_dir_all(&dir);
+        bound.close();
         endpoint.vault.release(&own);
     }
 
     /// Tell a client why it is not served, as Postgres would, and hang up.
-    async fn refuse(mut stream: UnixStream, why: String) {
+    async fn refuse<S: AsyncWrite + Unpin>(mut stream: S, why: String) {
         let _ =
             tokio::time::timeout(Duration::from_secs(2), stream.write_all(&pg::fatal(&why))).await;
+    }
+
+    /// Unix: a socket in a directory of the session's runtime directory,
+    /// handed to the session's account, each connection's uid checked.
+    #[cfg(unix)]
+    mod place {
+        use std::path::{Path, PathBuf};
+
+        use serde_json::json;
+        use tokio::net::{UnixListener, UnixStream};
+
+        use super::super::super::vault_exec::ExecTarget;
+        use super::{Dial, encode};
+
+        /// Each session's endpoints, under its runtime directory.
+        pub(crate) const PROXIES_DIR: &str = "proxies";
+        /// The port a Postgres endpoint's socket is named for: a client dials
+        /// `host=<directory>` and, unless told otherwise, port 5432.
+        pub(crate) const PG_PORT: u16 = 5432;
+
+        /// Where an endpoint is served: the session's runtime directory, and
+        /// the account its socket is handed to.
+        pub(crate) struct At<'a>(pub(crate) &'a ExecTarget);
+
+        /// A bound endpoint: its socket, its directory, and the one uid a
+        /// connection is taken from.
+        pub(crate) struct Bound {
+            listener: UnixListener,
+            dir: PathBuf,
+            peer: u32,
+        }
+
+        impl Bound {
+            pub(crate) async fn accept(&self) -> std::io::Result<UnixStream> {
+                self.listener.accept().await.map(|(stream, _)| stream)
+            }
+
+            /// Whether a connection comes from the session's account.
+            pub(crate) fn admits(&self, stream: &UnixStream) -> Result<(), String> {
+                match stream.peer_cred() {
+                    Ok(c) if c.uid() == self.peer => Ok(()),
+                    Ok(c) => Err(format!("uid {}", c.uid())),
+                    Err(e) => Err(format!("a peer that could not be identified: {e}")),
+                }
+            }
+
+            pub(crate) fn dial(&self, database: Option<&str>) -> Dial {
+                let host = self.dir.to_string_lossy().into_owned();
+                let mut env = serde_json::Map::new();
+                env.insert("PGHOST".into(), json!(host));
+                env.insert("PGPORT".into(), json!(PG_PORT.to_string()));
+                let mut uri = String::from("postgresql:///");
+                if let Some(db) = database {
+                    uri.push_str(&encode(db, false));
+                    env.insert("PGDATABASE".into(), json!(db));
+                }
+                uri.push_str(&format!("?host={}&port={PG_PORT}", encode(&host, true)));
+                Dial {
+                    host,
+                    port: PG_PORT,
+                    uri,
+                    env,
+                }
+            }
+
+            /// Close the socket, and remove its directory.
+            pub(crate) fn close(self) {
+                drop(self.listener);
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        /// `dir`, made if absent: the daemon's own, `0711`, so the session's
+        /// account reaches what it names and lists nothing. A link or
+        /// anything but a directory in its place is refused, never followed.
+        fn private_dir(dir: &Path) -> Result<(), String> {
+            use std::os::unix::fs::PermissionsExt;
+            match std::fs::symlink_metadata(dir) {
+                Ok(m) if !m.file_type().is_dir() => {
+                    return Err(format!("{} is not a plain directory", dir.display()));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                }
+                Err(e) => return Err(format!("{}: {e}", dir.display())),
+            }
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o711))
+                .map_err(|e| format!("{}: {e}", dir.display()))
+        }
+
+        /// A new endpoint's directory, `<session_dir>/proxies/<id>`, and its
+        /// socket, bound and handed to the session's account at `0600`. The
+        /// directory is removed again if any step fails.
+        pub(crate) fn bind(at: &At<'_>) -> Result<Bound, String> {
+            use std::os::unix::fs::PermissionsExt;
+            let ExecTarget {
+                session_dir, owner, ..
+            } = at.0;
+            let root = session_dir.join(PROXIES_DIR);
+            private_dir(&root)?;
+            // A short id, so the socket's path stays well inside `sun_path`
+            // (104 bytes on macOS); `create_dir`, not `create_dir_all`, so a
+            // name already there is drawn again, never joined.
+            let mut drawn = 0;
+            let dir = loop {
+                let dir = root.join(format!("{:08x}", rand::random::<u32>()));
+                match std::fs::create_dir(&dir) {
+                    Ok(()) => break dir,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && drawn < 3 => {
+                        drawn += 1
+                    }
+                    Err(e) => return Err(format!("{}: {e}", dir.display())),
+                }
+            };
+            let made = (|| {
+                private_dir(&dir)?;
+                let socket = dir.join(format!(".s.PGSQL.{PG_PORT}"));
+                let listener = UnixListener::bind(&socket)
+                    .map_err(|e| format!("{}: {e}", socket.display()))?;
+                // Bound under the daemon's umask: until these two calls, only
+                // the daemon can connect. Then the session's account, and
+                // nobody else.
+                owner
+                    .map(|(u, g)| std::os::unix::fs::chown(&socket, Some(u), Some(g)))
+                    .unwrap_or(Ok(()))
+                    .and_then(|()| {
+                        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+                    })
+                    .map_err(|e| format!("{}: {e}", socket.display()))?;
+                Ok(listener)
+            })();
+            match made {
+                Ok(listener) => Ok(Bound {
+                    listener,
+                    dir,
+                    // SAFETY: geteuid reads our own credentials; it cannot fail.
+                    peer: owner.map_or_else(|| unsafe { libc::geteuid() }, |(u, _)| u),
+                }),
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// P3-5b-4 — Windows: a loopback port, each connection's process found
+    /// in the system's connection table and refused unless its token is the
+    /// session's account. Most Windows database clients cannot dial a Unix
+    /// socket.
+    ///
+    /// ⚠️ Any process on the device can connect to the port; only the
+    /// session's account is served. The port cannot be taken over by another
+    /// account's socket: Windows makes a bound port shareable only where its
+    /// first socket asked for that (`SO_REUSEADDR`), which this one does not,
+    /// and the daemon's own account (SYSTEM) is the only exception.
+    #[cfg(windows)]
+    mod place {
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+        use serde_json::json;
+        use tokio::net::{TcpListener, TcpStream};
+
+        use super::{Dial, encode};
+
+        /// Where an endpoint is served: for the session's account, by SID.
+        pub(crate) struct At<'a>(pub(crate) &'a str);
+
+        /// A bound endpoint: its listener, its address, and the one account a
+        /// connection is taken from.
+        pub(crate) struct Bound {
+            listener: TcpListener,
+            addr: SocketAddrV4,
+            peer: String,
+        }
+
+        impl Bound {
+            pub(crate) async fn accept(&self) -> std::io::Result<TcpStream> {
+                self.listener.accept().await.map(|(stream, _)| stream)
+            }
+
+            /// Whether a connection comes from a process running as the
+            /// session's account: its row of the connection table names the
+            /// process, and the process's token the account.
+            pub(crate) fn admits(&self, stream: &TcpStream) -> Result<(), String> {
+                let SocketAddr::V4(client) = stream.peer_addr().map_err(|e| e.to_string())? else {
+                    return Err("a client that is not IPv4 loopback".into());
+                };
+                let pid = crate::hive_win::tcp_client_pid(client, self.addr)
+                    .ok_or("a connection no process owns any more")?;
+                let sid = crate::hive_win::process_sid(pid)?;
+                if sid == self.peer {
+                    Ok(())
+                } else {
+                    Err(format!("{sid} (pid {pid})"))
+                }
+            }
+
+            pub(crate) fn dial(&self, database: Option<&str>) -> Dial {
+                let (host, port) = (self.addr.ip().to_string(), self.addr.port());
+                let mut env = serde_json::Map::new();
+                env.insert("PGHOST".into(), json!(host));
+                env.insert("PGPORT".into(), json!(port.to_string()));
+                // The loopback leg is plain; the upstream's is TLS.
+                env.insert("PGSSLMODE".into(), json!("disable"));
+                let mut uri = format!("postgresql://{host}:{port}/");
+                if let Some(db) = database {
+                    uri.push_str(&encode(db, false));
+                    env.insert("PGDATABASE".into(), json!(db));
+                }
+                uri.push_str("?sslmode=disable");
+                Dial {
+                    host,
+                    port,
+                    uri,
+                    env,
+                }
+            }
+
+            pub(crate) fn close(self) {
+                drop(self.listener);
+            }
+        }
+
+        /// A listener on `127.0.0.1`, on a port the system picks.
+        pub(crate) fn bind(at: &At<'_>) -> Result<Bound, String> {
+            let failed = |e: std::io::Error| format!("a loopback port: {e}");
+            let std = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(failed)?;
+            std.set_nonblocking(true).map_err(failed)?;
+            let listener = TcpListener::from_std(std).map_err(failed)?;
+            let SocketAddr::V4(addr) = listener.local_addr().map_err(failed)? else {
+                return Err("a loopback port that is not IPv4".into());
+            };
+            Ok(Bound {
+                listener,
+                addr,
+                peer: at.0.to_string(),
+            })
+        }
     }
 }
 
