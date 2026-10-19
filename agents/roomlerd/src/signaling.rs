@@ -6093,13 +6093,17 @@ async fn handle_server_msg(
                 debug!(%lease_id, "rc:vault.leased ignored — this build takes no leases");
             }
         }
-        ServerMsg::VaultRefused { req_id, reason, .. } => {
+        ServerMsg::VaultRefused {
+            req_id,
+            reason,
+            approval_id,
+        } => {
             #[cfg(feature = "vault")]
             if ctx.is_primary {
-                crate::vault::on_refused(&req_id, &reason);
+                crate::vault::on_refused(&req_id, &reason, approval_id.as_deref());
             }
             #[cfg(not(feature = "vault"))]
-            let _ = (req_id, reason);
+            let _ = (req_id, reason, approval_id);
         }
         // FR-90 P3-4b — a session's listing and description: metadata.
         ServerMsg::VaultListed {
