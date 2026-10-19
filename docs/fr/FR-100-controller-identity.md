@@ -147,7 +147,8 @@ TypeScript read **one shared test-vector file**, so the two sides cannot drift.
   mismatch.
 - [ ] **AC6:** the Rust and TypeScript implementations agree on the shared transcript and SAS vectors. On an
   attended vmtest session, the code read at the host matches the viewer's.
-- [ ] **AC7:** one device enrolled in two orgs presents two different device keys.
+- [x] **AC7:** one device enrolled in two orgs presents two different device keys. Field-verified on 0.4.145
+  (§9 row 4): two key files on the device, and two different fingerprints on its two rows.
 - [ ] **AC8:** **Docs:** `docs/remote-control.md` gains the binding: a mermaid sequence of the signed offer
   and answer, the policy table, the threat model including what it does not defeat, and the pin
   commands. `docs/security-baseline.md` gains the control. Linked from `docs/README.md`.
@@ -187,8 +188,10 @@ weighed.
 | # | Date | Cell | Result |
 |---|---|---|---|
 | 1 | 2026-10-19 | P1a, device side, on the published 0.4.145: Ubuntu (systemd, root) and Win11 (SYSTEM) | **Pass.** Linux: `/etc/roomler/peer-auth` 0700 root, the key file 0600 root (247 B). Windows: the file's ACL is SYSTEM and Administrators only. "made this enrollment's device key" logged once; sessions unchanged ([#2092](https://github.com/gjovanov/roomler-ai/issues/2092#issuecomment-6268118628)) |
-| 2 | 2026-10-19 | P1a, server side, prod `hosted-20261019-dd59ede` (promoted 16:16:49Z) | **Pass.** A 0.4.145 row carries `peer_auth_key` and `peer_auth_fingerprint`; a 0.4.143 row carries neither; 19 of 20 live 0.4.145 rows were keyed (the 20th to re-read). The red holds by construction: no server before the roll stored the field ([#2092](https://github.com/gjovanov/roomler-ai/issues/2092#issuecomment-6271891415)) |
+| 2 | 2026-10-19 | P1a, server side, prod `hosted-20261019-dd59ede` (promoted 16:16:49Z) | **Pass.** A 0.4.145 row carries `peer_auth_key` and `peer_auth_fingerprint`; a 0.4.143 row carries neither; 19 of 20 live 0.4.145 rows were keyed. The 20th, an offline device, last said hello at 13:52Z, before the roll, so no server that stores the field had heard from it; it is keyed at its next hello ([#2092](https://github.com/gjovanov/roomler-ai/issues/2092#issuecomment-6272860204)). The red holds by construction: no server before the roll stored the field ([#2092](https://github.com/gjovanov/roomler-ai/issues/2092#issuecomment-6271891415)) |
 | 3 | 2026-10-19 | P1b, prod `hosted-20261019-dd59ede`, the agent-e2e lane with three 0.4.145 agents | **No regression.** The remote-session suite passed 7/7 through #2517's relay. This is not a signature crossing it: no browser asked before P2a ([#2092](https://github.com/gjovanov/roomler-ai/issues/2092#issuecomment-6271945686)) |
+| 4 | 2026-10-19 | AC7: a Windows 11 laptop on 0.4.145, a per-user daemon enrolled in two orgs | **Pass.** Two key files in the daemon's config dir, one per tenant (247 B each; names read, never contents), and two different fingerprints on the device's two rows (`7bca a4ce …` and `848b 1b21 …`). The red holds by construction: before 0.4.145 no row carried a key ([#2092](https://github.com/gjovanov/roomler-ai/issues/2092#issuecomment-6272581699)) |
+| 5 | 2026-10-19 | P2a **red**, prod `hosted-20261019-dd59ede` (before #2539): the production viewer from Playwright on mars → a fresh vmtest Ubuntu system cell on 0.4.145 | **Red, as expected.** The viewer's `/ws` was routed through `page.routeWebSocket`, with `RTCPeerConnection` wrapped to log every `setRemoteDescription`. The control arm connected, unasked and unsigned. In the `forged` arm, each answer's fingerprint was rewritten on the signalling leg, and **13 of 13 forged answers were applied** in 75 s, each followed by a DTLS failure and a silent retry, with no refusal and no reason ([#2092](https://github.com/gjovanov/roomler-ai/issues/2092#issuecomment-6272786441)). The green is owed after #2539's promote, with the same spec plus a pin-rewrite arm |
 
 ## 10. Related
 
