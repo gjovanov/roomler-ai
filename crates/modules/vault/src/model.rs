@@ -315,6 +315,72 @@ impl VaultActivity {
     pub const COLLECTION: &'static str = "vault_activity";
 }
 
+/// P3-4e — where an approval stands. `pending` waits for a driver;
+/// `approved` and `denied` are their answer; `used` is a yes a lease spent;
+/// `expired` is one nobody answered, or nobody used, in time; `withdrawn` is
+/// one for a session that has since moved or ended.
+pub mod approval_status {
+    pub const PENDING: &str = "pending";
+    pub const APPROVED: &str = "approved";
+    pub const DENIED: &str = "denied";
+    pub const USED: &str = "used";
+    pub const EXPIRED: &str = "expired";
+    pub const WITHDRAWN: &str = "withdrawn";
+}
+
+/// P3-4e — a person's approval a policy asked for (`context has approval`):
+/// ONE use of one secret's field, by one session at its fence on its
+/// device, in one mode, toward one audience, for at most `ttl_s`. Its card
+/// is a message the session authors in its room, bound to
+/// `{module: "vault", ref: <approval id>}`.
+///
+/// ⚠️ Single use: the lease a yes allows wins a compare-and-set on
+/// `approved` before its allow is recorded, so one yes never becomes two
+/// leases.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VaultApproval {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub session_id: ObjectId,
+    pub fence: i64,
+    pub device_id: ObjectId,
+    /// The session's owner, whom its audit rows name.
+    pub owner_id: ObjectId,
+    pub secret_id: ObjectId,
+    /// The secret's RRN when it was asked for.
+    pub rrn: String,
+    pub field: String,
+    pub mode: String,
+    pub audience: String,
+    /// The longest lease a yes allows, in seconds: what was asked, clamped.
+    pub ttl_s: i64,
+    /// One of [`approval_status`].
+    pub status: String,
+    pub requested_at: DateTime,
+    /// Until when it may be answered; once it is approved, until when it
+    /// may be used.
+    pub expires_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<DateTime>,
+    /// The lease that spent a yes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_at: Option<DateTime>,
+    /// Its card: the session's room, and the message in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<ObjectId>,
+}
+
+impl VaultApproval {
+    pub const COLLECTION: &'static str = "vault_approvals";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

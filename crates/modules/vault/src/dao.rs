@@ -14,7 +14,8 @@ use roomler_ai_services::dao::base::{BaseDao, DaoError, DaoResult, escape_regex}
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    VaultActivity, VaultAuditEvent, VaultLease, VaultPolicy, VaultRole, VaultSecret, VaultVersion,
+    VaultActivity, VaultApproval, VaultAuditEvent, VaultLease, VaultPolicy, VaultRole, VaultSecret,
+    VaultVersion, approval_status,
 };
 
 /// The most roles, and the most policies, an organization keeps.
@@ -650,5 +651,220 @@ impl VaultActivityDao {
             out.push(a);
         }
         Ok(out)
+    }
+}
+
+/// FR-90 P3-4e — what one approval is FOR: this session at this fence on
+/// this device, this secret's field, in this mode toward this audience.
+#[derive(Debug, Clone, Copy)]
+pub struct ApprovalKey<'a> {
+    pub tenant_id: ObjectId,
+    pub session_id: ObjectId,
+    pub fence: i64,
+    pub device_id: ObjectId,
+    pub secret_id: ObjectId,
+    pub field: &'a str,
+    pub mode: &'a str,
+    pub audience: &'a str,
+}
+
+/// FR-90 P3-4e — the approvals policies asked for, and their answers.
+pub struct VaultApprovalDao {
+    pub base: BaseDao<VaultApproval>,
+}
+
+impl VaultApprovalDao {
+    pub fn new(db: &Database) -> Self {
+        Self {
+            base: BaseDao::new(db, VaultApproval::COLLECTION),
+        }
+    }
+
+    /// A new pending approval. `None` when one is pending for the same
+    /// request already: the unique index arbitrates two asks at once, and
+    /// the loser reads the winner's ([`Self::live_for`]).
+    pub async fn insert_pending(&self, row: &VaultApproval) -> DaoResult<Option<ObjectId>> {
+        match self.base.insert_one(row).await {
+            Ok(id) => Ok(Some(id)),
+            Err(DaoError::DuplicateKey(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// One request's approvals that may still be answered or used, newest
+    /// first: whether its deny waits on a card, stands on a person's no, or
+    /// is lifted by their yes.
+    pub async fn live_for(
+        &self,
+        key: &ApprovalKey<'_>,
+        now: DateTime,
+    ) -> DaoResult<Vec<VaultApproval>> {
+        let mut cursor = self
+            .base
+            .collection()
+            .find(doc! {
+                "tenant_id": key.tenant_id,
+                "session_id": key.session_id,
+                "fence": key.fence,
+                "device_id": key.device_id,
+                "secret_id": key.secret_id,
+                "field": key.field,
+                "mode": key.mode,
+                "audience": key.audience,
+                "status": { "$in": [
+                    approval_status::PENDING,
+                    approval_status::APPROVED,
+                    approval_status::DENIED,
+                ] },
+                "expires_at": { "$gt": now },
+            })
+            .sort(doc! { "requested_at": -1, "_id": -1 })
+            .limit(16)
+            .await?;
+        let mut out = Vec::new();
+        while let Some(a) = cursor.try_next().await? {
+            out.push(a);
+        }
+        Ok(out)
+    }
+
+    /// One request's approvals past their deadline that nothing has ended
+    /// yet. A pending one holds the request's one pending place in the
+    /// unique index, so it is ended before a new card is opened.
+    pub async fn stale_for(
+        &self,
+        key: &ApprovalKey<'_>,
+        now: DateTime,
+    ) -> DaoResult<Vec<VaultApproval>> {
+        let mut cursor = self
+            .base
+            .collection()
+            .find(doc! {
+                "tenant_id": key.tenant_id,
+                "session_id": key.session_id,
+                "fence": key.fence,
+                "device_id": key.device_id,
+                "secret_id": key.secret_id,
+                "field": key.field,
+                "mode": key.mode,
+                "audience": key.audience,
+                "status": { "$in": [approval_status::PENDING, approval_status::APPROVED] },
+                "expires_at": { "$lte": now },
+            })
+            .limit(16)
+            .await?;
+        let mut out = Vec::new();
+        while let Some(a) = cursor.try_next().await? {
+            out.push(a);
+        }
+        Ok(out)
+    }
+
+    /// One approval of the organization.
+    pub async fn find_in_tenant(
+        &self,
+        tenant_id: ObjectId,
+        id: ObjectId,
+    ) -> DaoResult<Option<VaultApproval>> {
+        Ok(self
+            .base
+            .collection()
+            .find_one(doc! { "_id": id, "tenant_id": tenant_id })
+            .await?)
+    }
+
+    /// A driver's answer, while the approval is pending and not past its
+    /// deadline: a yes is usable for `use_secs` from now, a no stands until
+    /// the card's own deadline. `None` when someone answered first or
+    /// nobody did in time.
+    pub async fn answer(
+        &self,
+        id: ObjectId,
+        approve: bool,
+        by: ObjectId,
+        now: DateTime,
+        use_secs: u32,
+    ) -> DaoResult<Option<VaultApproval>> {
+        let mut set = doc! {
+            "status": if approve { approval_status::APPROVED } else { approval_status::DENIED },
+            "answered_by": by,
+            "answered_at": now,
+        };
+        if approve {
+            set.insert(
+                "expires_at",
+                DateTime::from_millis(now.timestamp_millis() + i64::from(use_secs) * 1000),
+            );
+        }
+        Ok(self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! {
+                    "_id": id,
+                    "status": approval_status::PENDING,
+                    "expires_at": { "$gt": now },
+                },
+                doc! { "$set": set },
+            )
+            .return_document(ReturnDocument::After)
+            .await?)
+    }
+
+    /// Spend a yes on `lease_id`. Winning this compare-and-set IS the one
+    /// use: `false` when the yes is spent already or past its use.
+    pub async fn spend(&self, id: ObjectId, lease_id: ObjectId, now: DateTime) -> DaoResult<bool> {
+        let r = self
+            .base
+            .collection()
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "status": approval_status::APPROVED,
+                    "expires_at": { "$gt": now },
+                },
+                doc! { "$set": {
+                    "status": approval_status::USED,
+                    "lease_id": lease_id,
+                    "used_at": now,
+                } },
+            )
+            .await?;
+        Ok(r.modified_count == 1)
+    }
+
+    /// End an approval nobody can act on any more — pending or approved, to
+    /// `expired` or `withdrawn`. `None` when another call ended it first, so
+    /// its card is edited once.
+    pub async fn end(&self, id: ObjectId, status: &str) -> DaoResult<Option<VaultApproval>> {
+        Ok(self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! {
+                    "_id": id,
+                    "status": { "$in": [approval_status::PENDING, approval_status::APPROVED] },
+                },
+                doc! { "$set": { "status": status } },
+            )
+            .return_document(ReturnDocument::After)
+            .await?)
+    }
+
+    /// Its card, once posted.
+    pub async fn set_card(
+        &self,
+        id: ObjectId,
+        room_id: ObjectId,
+        message_id: ObjectId,
+    ) -> DaoResult<()> {
+        self.base
+            .collection()
+            .update_one(
+                doc! { "_id": id },
+                doc! { "$set": { "room_id": room_id, "message_id": message_id } },
+            )
+            .await?;
+        Ok(())
     }
 }

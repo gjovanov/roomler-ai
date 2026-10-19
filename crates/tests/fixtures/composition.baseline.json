@@ -957,6 +957,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/tenant/{tenant_id}/vault/approval/{approval_id}",
+      "methods": "GET,HEAD,POST"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/vault/audit",
       "methods": "GET,HEAD"
     },
@@ -3063,6 +3067,39 @@
           {
             "key": {
               "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "vault_approvals",
+        "indexes": [
+          {
+            "key": {
+              "session_id": 1,
+              "fence": 1,
+              "device_id": 1,
+              "secret_id": 1,
+              "field": 1,
+              "mode": 1,
+              "audience": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "status": "pending"
+            }
+          },
+          {
+            "key": {
+              "session_id": 1,
+              "secret_id": 1,
+              "requested_at": -1
+            }
+          },
+          {
+            "key": {
+              "requested_at": 1
             },
             "expireAfterSeconds": 7776000
           }
@@ -5229,6 +5266,39 @@
           {
             "key": {
               "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "vault_approvals",
+        "indexes": [
+          {
+            "key": {
+              "session_id": 1,
+              "fence": 1,
+              "device_id": 1,
+              "secret_id": 1,
+              "field": 1,
+              "mode": 1,
+              "audience": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "status": "pending"
+            }
+          },
+          {
+            "key": {
+              "session_id": 1,
+              "secret_id": 1,
+              "requested_at": -1
+            }
+          },
+          {
+            "key": {
+              "requested_at": 1
             },
             "expireAfterSeconds": 7776000
           }

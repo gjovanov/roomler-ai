@@ -23,8 +23,10 @@
 //! | its field holding a value | `no_value` | yes |
 //! | a usable KEK | `unavailable` | yes |
 //! | Cedar's `secret:use` | `denied` | yes, with the request |
+//! | P3-4e — where it denied: a driver's yes that lifts it ([`crate::approval`]), else a card that waits for one | `awaiting_approval` · `denied` | yes, with the request |
 //! | its version not past the `expires_at` its writer gave (P3-3c) | `no_value` | yes |
 //! | opened, and sealed to the device's key | `unavailable` | yes |
+//! | P3-4e — a yes that allowed it spent (compare-and-set) | `denied` | yes |
 //! | the allow recorded and the lease written | `undecided` | — |
 //!
 //! A lease ends at its TTL or at its version's `expires_at`, whichever comes
@@ -61,7 +63,9 @@ use tokio::sync::mpsc::{self, error::TrySendError};
 use tracing::{debug, warn};
 
 use crate::VaultState;
+use crate::approval::{self, Next};
 use crate::crypto::{self, Binding};
+use crate::dao::ApprovalKey;
 use crate::model::{VaultActivity, VaultAuditEvent, VaultLease, VaultSecret};
 use crate::policy::{self, Ask, DeviceFacts, SecretFacts, SessionFacts, Verdict};
 use crate::policy_routes::decide_for_org;
@@ -138,6 +142,23 @@ impl Request {
             Self::List(r) => Some(&r.req_id),
             Self::Describe(r) => Some(&r.req_id),
             Self::Activity(_) => None,
+        }
+    }
+}
+
+/// P3-4e — a lease's refusal: the word, and with `awaiting_approval` the
+/// approval its card waits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refused {
+    pub why: LeaseRefusal,
+    pub approval: Option<ObjectId>,
+}
+
+impl From<LeaseRefusal> for Refused {
+    fn from(why: LeaseRefusal) -> Self {
+        Self {
+            why,
+            approval: None,
         }
     }
 }
@@ -314,7 +335,11 @@ async fn answer_in_order(
                         expires_at_ms: l.expires_at.timestamp_millis(),
                     }
                 }
-                Err(why) => refusal(&r.req_id, why),
+                Err(refused) => ServerMsg::VaultRefused {
+                    req_id: clip(&r.req_id, lease_limits::MAX_REQ_ID_LEN),
+                    reason: refused.why.wire().into(),
+                    approval_id: refused.approval.map(|a| a.to_hex()),
+                },
             },
             // P3-4b — metadata, never a value.
             Request::List(r) => match crate::meta::list(&state, conn, r).await {
@@ -349,6 +374,7 @@ fn refusal(req_id: &str, why: LeaseRefusal) -> ServerMsg {
     ServerMsg::VaultRefused {
         req_id: clip(req_id, lease_limits::MAX_REQ_ID_LEN),
         reason: why.wire().into(),
+        approval_id: None,
     }
 }
 
@@ -486,6 +512,41 @@ pub(crate) fn os_name(os: OsKind) -> &'static str {
     }
 }
 
+/// The `secret:use` request a lease is decided as — and P3-4e's answer to
+/// an approval, decided again with the person as the approver: the session
+/// in the role it assumed, the secret as its row holds it, and the device's
+/// facts from ITS row.
+pub(crate) fn use_ask(
+    slug: &str,
+    session: &AgentSession,
+    secret: &VaultSecret,
+    device: DeviceFacts,
+    mode: &str,
+    audience: &str,
+    ttl_s: i64,
+) -> Ask {
+    Ask::UseSecret {
+        session: SessionFacts {
+            id: session.id.map(|i| i.to_hex()).unwrap_or_default(),
+            owner: session.owner_id,
+            role: session.vault_role.clone(),
+            playbook: None,
+        },
+        secret: SecretFacts {
+            prefix: format!("rrn:{slug}:secret:"),
+            path: secret.path.clone(),
+            kind: secret.kind.clone(),
+            tags: secret.tags.clone(),
+            exec_allow: secret.exec_allow.clone(),
+        },
+        mode: mode.to_string(),
+        audience: audience.to_string(),
+        ttl_s,
+        device,
+        approver: None,
+    }
+}
+
 /// The reason a Cedar decision is recorded with.
 pub(crate) fn reason_of(verdict: &Verdict) -> String {
     if !verdict.determining.is_empty() {
@@ -510,6 +571,9 @@ pub(crate) struct Record<'a> {
     /// `secret:list`), and what exactly: `lease` · `list` · `describe`.
     pub(crate) action: &'static str,
     pub(crate) op: &'static str,
+    /// P3-4e — the approval a deny waits on or stands on, which its row
+    /// names as the target.
+    pub(crate) approval: Option<ObjectId>,
 }
 
 impl Record<'_> {
@@ -532,7 +596,7 @@ impl Record<'_> {
         let target = match (lease, &self.secret) {
             (Some(id), _) => Some(format!("lease:{}", id.to_hex())),
             (None, None) => Some(format!("asked:{}", self.asked)),
-            (None, Some(_)) => None,
+            (None, Some(_)) => self.approval.map(|id| format!("approval:{}", id.to_hex())),
         };
         VaultAuditEvent {
             id: None,
@@ -587,13 +651,9 @@ impl Record<'_> {
 }
 
 /// Decide one request, and release the value when it is allowed.
-pub async fn lease(
-    state: &VaultState,
-    conn: Conn,
-    req: &LeaseRequest,
-) -> Result<Leased, LeaseRefusal> {
+pub async fn lease(state: &VaultState, conn: Conn, req: &LeaseRequest) -> Result<Leased, Refused> {
     if !within_bounds(req) {
-        return Err(LeaseRefusal::BadRequest);
+        return Err(LeaseRefusal::BadRequest.into());
     }
     let (agent, session, mut rec) = identify(
         state,
@@ -605,7 +665,15 @@ pub async fn lease(
         "lease",
     )
     .await?;
-    decide_and_release(state, &mut rec, &agent, &session, req).await
+    decide_and_release(state, &mut rec, &agent, &session, req)
+        .await
+        .map_err(|why| Refused {
+            why,
+            // P3-4e — only `awaiting_approval` names the approval.
+            approval: rec
+                .approval
+                .filter(|_| why == LeaseRefusal::AwaitingApproval),
+        })
 }
 
 /// What every request is believed on, whatever it asks: the vault serves the
@@ -668,6 +736,7 @@ pub(crate) async fn identify<'a>(
         secret: None,
         action,
         op,
+        approval: None,
     };
     if u64::try_from(session.fence).ok() != Some(fence) {
         let why = LeaseRefusal::StaleFence;
@@ -695,10 +764,10 @@ async fn decide_and_release(
     req: &LeaseRequest,
 ) -> Result<Leased, LeaseRefusal> {
     let tid = rec.conn.tenant_id;
-    let Some(role) = session.vault_role.clone() else {
+    if session.vault_role.is_none() {
         let why = LeaseRefusal::NoRole;
         return Err(rec.refuse(why, why.wire()).await);
-    };
+    }
     let Ok(slug) = crate::routes::org_slug(state, tid).await else {
         return Err(rec.refuse(LeaseRefusal::Unavailable, "org_unread").await);
     };
@@ -757,27 +826,62 @@ async fn decide_and_release(
     let ttl = req
         .ttl_secs
         .clamp(lease_limits::MIN_TTL_SECS, lease_limits::MAX_TTL_SECS);
-    let ask = Ask::UseSecret {
-        session: SessionFacts {
-            id: req.session_id.to_hex(),
-            owner: session.owner_id,
-            role: Some(role),
-            playbook: None,
-        },
-        secret: SecretFacts {
-            prefix: format!("rrn:{slug}:secret:"),
-            path: secret.path.clone(),
-            kind: secret.kind.clone(),
-            tags: secret.tags.clone(),
-            exec_allow: secret.exec_allow.clone(),
-        },
-        mode: req.mode.clone(),
-        audience: req.audience.clone(),
-        ttl_s: i64::from(ttl),
+    let mut ask = use_ask(
+        &slug,
+        session,
+        &secret,
         device,
-        approver: None,
-    };
-    let verdict = decide_for_org(state, tid, &ask).await;
+        &req.mode,
+        &req.audience,
+        i64::from(ttl),
+    );
+    let mut verdict = decide_for_org(state, tid, &ask).await;
+    // P3-4e — a deny a person's yes may lift.
+    let mut approved = None;
+    if !verdict.allow {
+        let key = ApprovalKey {
+            tenant_id: tid,
+            session_id: req.session_id,
+            fence: session.fence,
+            device_id: rec.conn.device_id,
+            secret_id,
+            field,
+            mode: &req.mode,
+            audience: &req.audience,
+        };
+        let rrn = rrn::secret_rrn(&slug, &secret.path);
+        match approval::after_deny(state, session, &key, &rrn, i64::from(ttl), &ask).await {
+            Ok(Next::Deny) => {}
+            Ok(Next::Use {
+                approval_id,
+                approver,
+            }) => {
+                if let Ask::UseSecret { approver: a, .. } = &mut ask {
+                    *a = Some(approver);
+                }
+                verdict = decide_for_org(state, tid, &ask).await;
+                if verdict.allow {
+                    approved = Some(approval_id);
+                }
+            }
+            Ok(Next::Awaiting(id)) => {
+                rec.approval = Some(id);
+                let why = LeaseRefusal::AwaitingApproval;
+                if let Err(e) = rec.decided(false, why.wire(), &ask, None).await {
+                    warn!(session = %req.session_id, %e, "vault: a lease awaiting approval was not recorded");
+                }
+                return Err(why);
+            }
+            Ok(Next::Refused(id)) => {
+                rec.approval = Some(id);
+                if let Err(e) = rec.decided(false, "approval_denied", &ask, None).await {
+                    warn!(session = %req.session_id, %e, "vault: a lease's deny was not recorded");
+                }
+                return Err(LeaseRefusal::Denied);
+            }
+            Err(why) => return Err(rec.refuse(LeaseRefusal::Unavailable, why).await),
+        }
+    }
     let reason = reason_of(&verdict);
     if !verdict.allow {
         if let Err(e) = rec.decided(false, &reason, &ask, None).await {
@@ -831,6 +935,25 @@ async fn decide_and_release(
     };
 
     let lease_id = ObjectId::new();
+    // P3-4e — the yes is spent BEFORE the allow is recorded: winning the
+    // compare-and-set is its one use, so a lost race releases nothing, and a
+    // failure after it only wastes a yes.
+    if let Some(approval_id) = approved {
+        rec.approval = Some(approval_id);
+        match state
+            .approvals
+            .spend(approval_id, lease_id, DateTime::now())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Err(rec.refuse(LeaseRefusal::Denied, "approval_spent").await),
+            Err(_) => {
+                return Err(rec
+                    .refuse(LeaseRefusal::Unavailable, "approval_unread")
+                    .await);
+            }
+        }
+    }
     if let Err(e) = rec.decided(true, &reason, &ask, Some(lease_id)).await {
         warn!(session = %req.session_id, %e, "vault: a lease's allow was not recorded — not released");
         return Err(LeaseRefusal::Undecided);
@@ -866,6 +989,9 @@ async fn decide_and_release(
     if let Err(e) = state.leases.insert(&row).await {
         warn!(session = %req.session_id, %e, "vault: a lease was not written — not released");
         return Err(LeaseRefusal::Undecided);
+    }
+    if let Some(approval_id) = approved {
+        approval::spent(state, session, approval_id).await;
     }
     Ok(Leased {
         lease_id,

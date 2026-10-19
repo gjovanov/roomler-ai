@@ -334,6 +334,15 @@ pub struct SessionFacts {
     pub playbook: Option<String>,
 }
 
+/// P3-4e — the person who said yes to an approval card, as a policy reads
+/// them: `context.approval.approver`, in a `Group` per roomler role they
+/// hold, so `approver in Roomler::Group::"admin"` holds for an admin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Approver {
+    pub id: ObjectId,
+    pub groups: Vec<String>,
+}
+
 /// One request to decide.
 #[derive(Debug, Clone)]
 pub enum Ask {
@@ -352,7 +361,7 @@ pub enum Ask {
         audience: String,
         ttl_s: i64,
         device: DeviceFacts,
-        approver: Option<ObjectId>,
+        approver: Option<Approver>,
     },
     /// P3-4b — `secret:list`: may `session` list or describe `secret`?
     ListSecret {
@@ -368,6 +377,21 @@ fn uid(ty: &str, id: &str) -> Value {
 
 fn user_ref(id: ObjectId) -> Value {
     json!({ "__entity": uid("User", &id.to_hex()) })
+}
+
+/// A person and each group they are in, as entities: the user, then every
+/// group once.
+fn user_in_groups(user: ObjectId, groups: &[String]) -> Vec<Value> {
+    let groups: BTreeSet<&str> = groups.iter().map(String::as_str).collect();
+    let mut entities = vec![json!({
+        "uid": uid("User", &user.to_hex()),
+        "attrs": {},
+        "parents": groups.iter().map(|g| uid("Group", g)).collect::<Vec<_>>(),
+    })];
+    for g in groups {
+        entities.push(json!({ "uid": uid("Group", g), "attrs": {}, "parents": [] }));
+    }
+    entities
 }
 
 fn parse_uid(v: &Value) -> Result<EntityUid, String> {
@@ -498,7 +522,8 @@ impl Ask {
                     "device": device(d),
                 };
                 if let Some(a) = approver {
-                    doc.insert("approver", *a);
+                    doc.insert("approver", a.id);
+                    doc.insert("approver_groups", a.groups.clone());
                 }
                 doc
             }
@@ -547,6 +572,18 @@ impl Ask {
                 },
             })
         };
+        let approver = match doc.get_object_id("approver") {
+            Ok(id) => Some(Approver {
+                id,
+                // P3-4e — a request recorded before the groups were named
+                // had none, and was decided without them.
+                groups: match doc.get_array("approver_groups") {
+                    Ok(a) => strings(a)?,
+                    Err(_) => Vec::new(),
+                },
+            }),
+            Err(_) => None,
+        };
         match doc.get_str("action").ok()? {
             ACTION_ASSUME => Some(Self::AssumeRole {
                 user: doc.get_object_id("user").ok()?,
@@ -561,7 +598,7 @@ impl Ask {
                 audience: doc.get_str("audience").ok()?.to_string(),
                 ttl_s: doc.get_i64("ttl_s").ok()?,
                 device: device(doc.get_document("device").ok()?)?,
-                approver: doc.get_object_id("approver").ok(),
+                approver,
             }),
             ACTION_LIST => Some(Self::ListSecret {
                 session: session(doc.get_document("session").ok()?)?,
@@ -585,14 +622,7 @@ impl Ask {
             } => {
                 let user_uid = uid("User", &user.to_hex());
                 let role_uid = uid("Role", role);
-                let mut entities = vec![json!({
-                    "uid": user_uid,
-                    "attrs": {},
-                    "parents": groups.iter().map(|g| uid("Group", g)).collect::<Vec<_>>(),
-                })];
-                for g in groups {
-                    entities.push(json!({ "uid": uid("Group", g), "attrs": {}, "parents": [] }));
-                }
+                let mut entities = user_in_groups(*user, groups);
                 entities.push(json!({ "uid": role_uid, "attrs": {}, "parents": [] }));
                 (
                     user_uid,
@@ -610,7 +640,7 @@ impl Ask {
                 device,
                 approver,
             } => {
-                let (session_uid, secret_uid, entities) = session_and_secret(session, secret);
+                let (session_uid, secret_uid, mut entities) = session_and_secret(session, secret);
                 let mut context = json!({
                     "mode": mode,
                     "audience": audience,
@@ -618,7 +648,10 @@ impl Ask {
                     "device": device.json(),
                 });
                 if let Some(a) = approver {
-                    context["approval"] = json!({ "approver": user_ref(*a) });
+                    context["approval"] = json!({ "approver": user_ref(a.id) });
+                    // P3-4e — in the groups they hold, or a policy that names
+                    // an approver's group could never hold.
+                    entities.extend(user_in_groups(a.id, &a.groups));
                 }
                 (session_uid, secret_uid, entities, context)
             }
@@ -1003,13 +1036,76 @@ mod tests {
         let mut ask = use_secret(Some("deployer"), "deploy/key", &[], "proxy", "linux");
         assert!(!decide(&set, &ask).allow, "no approval");
         if let Ask::UseSecret { approver, .. } = &mut ask {
-            *approver = Some(ObjectId::new());
+            *approver = Some(Approver {
+                id: ObjectId::new(),
+                groups: Vec::new(),
+            });
         }
         assert!(decide(&set, &ask).allow);
         if let Ask::UseSecret { ttl_s, .. } = &mut ask {
             *ttl_s = 3600;
         }
         assert!(!decide(&set, &ask).allow, "too long");
+    }
+
+    /// P3-4e — a policy may say WHO approves: the approver is read in the
+    /// groups they hold, as a person assuming a role is. One person's yes
+    /// is not another's, and a person in no named group allows nothing.
+    #[test]
+    fn a_policy_may_name_whose_approval_counts() {
+        let p = r#"permit (principal in Roomler::Role::"deployer",
+            action == Roomler::Action::"secret:use", resource)
+            when { context has approval && context.approval.approver in Roomler::Group::"admin" };"#;
+        let set = set_with(&[p]);
+        let mut ask = use_secret(Some("deployer"), "deploy/key", &[], "proxy", "linux");
+        let approved_by = |ask: &mut Ask, groups: &[&str]| {
+            if let Ask::UseSecret { approver, .. } = ask {
+                *approver = Some(Approver {
+                    id: ObjectId::new(),
+                    groups: groups.iter().map(|g| g.to_string()).collect(),
+                });
+            }
+        };
+        assert!(!decide(&set, &ask).allow, "no approval");
+        approved_by(&mut ask, &["member"]);
+        assert!(!decide(&set, &ask).allow, "a member's yes");
+        approved_by(&mut ask, &[]);
+        assert!(!decide(&set, &ask).allow, "a yes from no group");
+        // A group named twice is one group, never an entity Cedar refuses.
+        approved_by(&mut ask, &["member", "admin", "admin"]);
+        let v = decide(&set, &ask);
+        assert!(v.allow && v.errors.is_empty(), "an admin's yes: {v:?}");
+    }
+
+    /// P3-4e — four eyes: a policy may refuse a session's owner as the
+    /// approver of their own session's use, and take anyone else's yes.
+    #[test]
+    fn a_policy_may_refuse_an_owners_yes_to_their_own_session() {
+        let p = r#"permit (principal in Roomler::Role::"deployer",
+            action == Roomler::Action::"secret:use", resource)
+            when { context has approval };"#;
+        let f = r#"forbid (principal, action == Roomler::Action::"secret:use", resource)
+            when { context has approval && context.approval.approver == principal.owner };"#;
+        let set = set_with(&[p, f]);
+        let mut ask = use_secret(Some("deployer"), "deploy/key", &[], "proxy", "linux");
+        let Ask::UseSecret { session, .. } = &ask else {
+            unreachable!()
+        };
+        let owner = session.owner;
+        let approved_by = |ask: &mut Ask, id: ObjectId| {
+            if let Ask::UseSecret { approver, .. } = ask {
+                *approver = Some(Approver {
+                    id,
+                    groups: vec!["admin".into()],
+                });
+            }
+        };
+        approved_by(&mut ask, owner);
+        let v = decide(&set, &ask);
+        assert!(!v.allow, "the owner's own yes: {v:?}");
+        assert_eq!(v.determining, ["policy:1"], "the forbid decided it");
+        approved_by(&mut ask, ObjectId::new());
+        assert!(decide(&set, &ask).allow, "another's yes");
     }
 
     #[test]
@@ -1155,7 +1251,10 @@ mod tests {
             approver, session, ..
         } = &mut used
         {
-            *approver = Some(ObjectId::new());
+            *approver = Some(Approver {
+                id: ObjectId::new(),
+                groups: vec!["admin".into(), "ops".into()],
+            });
             session.playbook = Some("deploy-prod".into());
         }
         let listed = list_secret(Some("dev"), "staging/db", "windows");
@@ -1174,5 +1273,36 @@ mod tests {
         // A row of another shape is unreadable, never a guess.
         assert!(Ask::from_doc(&bson::doc! { "action": "secret:read" }).is_none());
         assert!(Ask::from_doc(&bson::doc! { "action": "role:assume", "user": "x" }).is_none());
+    }
+
+    /// P3-4e — an approver recorded before their groups were reads back in
+    /// none, as it was decided then; groups that are not names make the row
+    /// one no replay can read.
+    #[test]
+    fn an_approver_recorded_without_groups_reads_back_in_none() {
+        let id = ObjectId::new();
+        let mut ask = use_secret(Some("deployer"), "deploy/key", &[], "proxy", "linux");
+        if let Ask::UseSecret { approver, .. } = &mut ask {
+            *approver = Some(Approver {
+                id,
+                groups: vec!["admin".into()],
+            });
+        }
+        let mut doc = ask.to_doc();
+        doc.remove("approver_groups");
+        match Ask::from_doc(&doc) {
+            Some(Ask::UseSecret {
+                approver: Some(a), ..
+            }) => assert_eq!(
+                a,
+                Approver {
+                    id,
+                    groups: Vec::new()
+                }
+            ),
+            other => panic!("{other:?}"),
+        }
+        doc.insert("approver_groups", vec![bson::Bson::Int32(1)]);
+        assert!(Ask::from_doc(&doc).is_none());
     }
 }
