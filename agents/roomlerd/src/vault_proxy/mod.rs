@@ -22,9 +22,6 @@ pub(crate) mod http;
 pub(crate) mod mongo;
 pub(crate) mod pg;
 pub(crate) mod scram;
-/// P3-5f-1 builds the SSH agent; P3-5f-2's endpoint is its first caller,
-/// until which nothing outside its tests reaches it.
-#[allow(dead_code)]
 pub(crate) mod ssh_agent;
 #[cfg(test)]
 pub(crate) mod testing;

@@ -57,9 +57,9 @@ const HOSTBOUND: &str = "publickey-hostbound-v00@openssh.com";
 
 /// The PEM label OpenSSH writes its private keys under. The armor is read
 /// around it, so no whole header is ever written out here.
-const LABEL: &str = "OPENSSH PRIVATE KEY";
+pub(super) const LABEL: &str = "OPENSSH PRIVATE KEY";
 /// `PROTOCOL.key`'s `AUTH_MAGIC`, with the NUL OpenSSH writes after it.
-const MAGIC: &[u8] = b"openssh-key-v1\0";
+pub(super) const MAGIC: &[u8] = b"openssh-key-v1\0";
 
 const NOT_OPENSSH: &str = "key is not an OpenSSH private key (the format ssh-keygen writes, \
                            its armor labelled OPENSSH PRIVATE KEY)";
@@ -166,6 +166,26 @@ impl Agent {
             hosts: hosts(host_keys)?,
             user: user.map(str::to_string),
         })
+    }
+
+    /// P3-5f-2 — the secret's host keys as `known_hosts` lines for `host`
+    /// (`[host]:port` where the port is not 22), so the session's `ssh`
+    /// checks the host by the very keys the agent binds to. Public keys
+    /// only: nothing in them is secret.
+    pub(crate) fn known_hosts(&self, host: &str, port: u16) -> String {
+        let name = if port == 22 {
+            host.to_string()
+        } else {
+            format!("[{host}]:{port}")
+        };
+        let mut out = String::new();
+        for key in &self.hosts {
+            // `hosts` read each one's type already: it is there, and text.
+            let key_type = Reader::new(key).text().unwrap_or_default();
+            let encoded = base64::engine::general_purpose::STANDARD.encode(key);
+            out.push_str(&format!("{name} {key_type} {encoded}\n"));
+        }
+        out
     }
 
     /// `IDENTITIES_ANSWER`: the key, unless the connection's binding was
@@ -700,11 +720,11 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn put_u32(out: &mut Vec<u8>, v: u32) {
+pub(super) fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
-fn put_string(out: &mut Vec<u8>, s: &[u8]) {
+pub(super) fn put_string(out: &mut Vec<u8>, s: &[u8]) {
     // Every string here is far below 4 GiB: a message is at most 256 KiB.
     put_u32(out, s.len() as u32);
     out.extend_from_slice(s);
@@ -712,7 +732,7 @@ fn put_string(out: &mut Vec<u8>, s: &[u8]) {
 
 /// A non-negative integer as an `mpint`: no leading zero, and one put back
 /// where the first byte would read as a sign.
-fn put_mpint(out: &mut Vec<u8>, v: &[u8]) {
+pub(super) fn put_mpint(out: &mut Vec<u8>, v: &[u8]) {
     let first = v.iter().position(|&b| b != 0).unwrap_or(v.len());
     let v = &v[first..];
     if v.first().is_some_and(|b| b & 0x80 != 0) {

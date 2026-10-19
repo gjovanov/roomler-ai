@@ -4,7 +4,7 @@
 //!
 //! | Step | What holds |
 //! |---|---|
-//! | the call | `handle` (a path or this org's RRN, `#field` for a field), `mode` (`exec`, `file` or `proxy`, the modes a use takes), `audience` (a bare name: the program `vault_exec` will run, or the file `vault_render` will write; for `proxy`, the upstream `vault_connect` will sign in to, `host:port`), `ttl_s` (30 to 900, default 300) |
+//! | the call | `handle` (a path or this org's RRN, `#field` for a field), `mode` (`exec`, `file` or `proxy`, the modes a use takes), `audience` (a bare name: the program `vault_exec` will run, or the file `vault_render` will write; for `proxy`, the upstream `vault_connect` will sign in to: `host:port`, an origin, or (P3-5f-2) `ssh://[user@]host[:port]`), `ttl_s` (30 to 900, default 300) |
 //! | the lease | asked for once, decided by the vault's `secret:use` with its guardrails, recorded; held in daemon memory, never handed to the session |
 //! | its use | a later `vault_exec`, `vault_render` or `vault_connect` naming the same secret toward the same audience takes it, while it covers what that call needs, instead of asking again; every such call still asks a person |
 //! | its end | its expiry, `rc:vault.revoke`, or the run's end: no call lets it go |
@@ -55,15 +55,18 @@ pub(crate) fn parse(args: &Value) -> Result<AheadRequest, String> {
         .and_then(Value::as_str)
         .ok_or("audience is required: the program's or the file's bare name, or an upstream")?;
     // P3-5b-2 — an upstream, as `vault_connect` will name it: a database's
-    // `host:port`, or (P3-5d-2) an HTTP upstream's origin.
+    // `host:port`, (P3-5d-2) an HTTP upstream's origin, or (P3-5f-2) an SSH
+    // host's `ssh://` upstream.
     if mode == "proxy" {
         let named = super::vault_connect::upstream_of(audience).is_ok()
-            || super::vault_connect::origin_of(audience).is_ok();
+            || super::vault_connect::origin_of(audience).is_ok()
+            || super::vault_connect::ssh_of(audience).is_ok();
         if !named {
             return Err(format!(
                 "a proxy's audience is its upstream, as vault_connect will name it: a database's \
-                 host:port (such as db.internal:5432), or an origin for http (such as \
-                 https://github.com): got {audience:?}"
+                 host:port (such as db.internal:5432), an origin for http and kubernetes (such as \
+                 https://github.com), or an ssh host (such as ssh://git@github.com): got \
+                 {audience:?}"
             ));
         }
     }
