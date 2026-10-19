@@ -1905,6 +1905,24 @@ the design document's §7 and §8; what follows binds it to the code as it stand
     client end is the test's own and not another uid's, and the HTTP endpoint's tests run there
     too.
 
+  ⚠️ **As built (P3-5e-1): P3-5e split, the engine first; an upgrade's tunnel lives inside its
+  session.**
+  - **The split.** P3-5e-1 is the HTTP engine's half alone, with no caller: a client certificate
+    in the handshake, an upgrade relayed, impersonation dropped. `vault_connect` serving it, and
+    the kubeconfig, are P3-5e-2.
+  - **One engine, two flavours.** A Kubernetes endpoint is an HTTP one (`Flavor::Kubernetes`):
+    the upgrade and the impersonation rule are the flavour's, so a plain HTTP endpoint relays no
+    upgrade and drops no header it did before.
+  - **The certificate, per connection.** The upstream's roots are read once, at the call; a
+    connection that presents a certificate gets a connector made for it, so the key lives in that
+    connection's TLS and nowhere longer.
+  - **The tunnel, inside the session.** A switched connection is not a task of its own: the
+    client connection's session awaits it once the connection is handed over. Whatever ends the
+    session (the endpoint's stop, the first lease let go) ends the tunnel too. A detached task
+    would have outlived the lease.
+  - **An upgrade gets a connection of its own.** A switched connection carries no more requests,
+    so it is never the client connection's kept upstream connection.
+
 **A session's identity to the vault.** The token the sidecar mints is the device's own, bound to the
 session and its fence (`agents/roomlerd/src/hive/sidecar.rs:94`). To the server, a session is its
 record. So a vault request is a frame from the device that runs the session, naming the session and
@@ -1961,8 +1979,8 @@ holds it (AC12).
   carries no `speculativeAuthenticate`, and every byte after it is relayed. One host at first (a
   single node or a `mongos`): SRV discovery and replica-set failover come later.
 - **Engines with no proxy** (MySQL, SQL Server, Redis) take `short-lived` (P3-6). HTTP named
-  upstreams are P3-5d, designed below; Kubernetes and the SSH agent follow (P3-5e, P3-5f), each
-  with a design note of its own when it starts.
+  upstreams are P3-5d and the Kubernetes API P3-5e, each designed below; the SSH agent follows
+  (P3-5f), with a design note of its own when it starts.
 
 **P3-5d, HTTP named upstreams, as designed.** A session reaches an HTTP API or a git server through
 an endpoint that adds the secret's credential to every request it sends on. Design §8.5 sketched
@@ -1988,6 +2006,25 @@ its path.
   than `Authorization`; an audience scoped to a path; URLs rewritten in bodies, or in headers other
   than `Location`; and a session inside Claude Code's sandbox, which reaches the network only
   through its egress proxy (P3-7).
+
+**P3-5e, the Kubernetes API, as designed.** A session reaches a cluster's API through an endpoint
+that presents the secret's credential, and gets a kubeconfig that holds none (design §8.5). It is
+P3-5d's HTTP endpoint with three differences: how an API server is signed in to, what `kubectl`
+streams over, and what the endpoint will not forward.
+
+| Piece | Design |
+|---|---|
+| the upstream | the API server's origin, `https://<host>[:<port>]`, held to the secret's `audiences` exactly, as for `http`. The cluster's CA is the secret's `ca`, as a kubeconfig's `certificate-authority-data` is |
+| the credential | `bearer`: a service account's token, or an OIDC one, in `Authorization` as for `http`. Or `client-cert`: the secret's `cert` and `key` (PEM), presented in the TLS handshake as a kubeconfig's `client-certificate-data` and `client-key-data` are. The key is read from its lease as each connection starts, and goes into that connection's TLS alone; TLS proves it without sending it |
+| upgrades | `kubectl exec`, `attach`, `port-forward` and `cp` switch protocols: SPDY (`SPDY/3.1`), or WebSocket from Kubernetes 1.30. The endpoint carries a request's `Upgrade` to the API server on a connection of its own, and on its `101` joins the two ends byte for byte. The tunnel is carried within the client connection's session, so the endpoint's stop ends it. `http` relays no upgrade, and `kubernetes` none to another protocol |
+| what is refused | `Impersonate-User`, `Impersonate-Group`, `Impersonate-Uid` and every `Impersonate-Extra-*`, all dropped. The session acts as the secret's identity, and never through it as another (`kubectl --as`), whatever that identity's RBAC allows |
+| the answer | the endpoint's `uri`, and a kubeconfig: one cluster whose `server` is the endpoint, one context, one user with no credential. Nothing in it is secret: the session writes it where it likes and names it in `KUBECONFIG` |
+
+- **What `proxy` cannot promise here.** A bearer token is shown to the API server whole, as any
+  `Authorization` is. A client certificate's key never is.
+- **Not in P3-5e:** a kubeconfig the daemon writes, or one rendered from knowhow's cluster entity
+  (P4); `exec` credential plugins; HTTP/2 to the API server; a `TokenRequest` minted for the
+  session (`short-lived`, P3-6).
 
 **Audit.** `vault_audit` holds every decision the server makes, allow and deny, with the 90-day TTL
 of the network module's audits (`crates/modules/network/src/lib.rs:748`). `vault_activity` is the
@@ -2037,7 +2074,9 @@ device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
 | P3-5d-1 | the HTTP engine: one client connection's requests sent on to one origin over verified TLS, the secret's credential in `Authorization`, the client's own credentials and hop-by-hop headers dropped, a redirect to the upstream pointed back; no caller yet | the `vault` feature in no release build | — |
 | P3-5d-2 | `vault_connect` serving it: `engine: "http"`, an origin, `auth`; the loopback endpoint on Linux (`/proc/net/tcp`) and Windows; git's `insteadOf` in `env`; `vault_request` asking ahead toward an origin | device `vault_enabled = false`; per-secret `disabled` | — |
 | P3-5d-3 | the macOS endpoint: each connection's account read from `libproc` | device `vault_enabled = false` | — |
-| P3-5e, P3-5f | the Kubernetes API, the SSH agent | the same | — |
+| P3-5e-1 | the HTTP engine's half for Kubernetes: a client certificate in the TLS handshake, an upgrade relayed and joined (for `kubernetes` only), `Impersonate-*` dropped; no caller yet | the `vault` feature in no release build | — |
+| P3-5e-2 | `vault_connect` serving it: `engine: "kubernetes"`, `auth` `bearer` or `client-cert`, the kubeconfig answer | device `vault_enabled = false`; per-secret `disabled` | — |
+| P3-5f | the SSH agent | the same | — |
 | P3-6 | `short-lived`: database users and GitHub App tokens first, then AWS STS and a Kubernetes `TokenRequest` | per provider | — |
 | P3-7 | authenticated session SOCKS, `Principal::Session`, `net_forward` and `net_socks` | `vault.tenants` | — |
 | P3-8 | `ssh_run` and `fleet_exec` as tools | the existing SSH and exec gates | — |
@@ -2374,7 +2413,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3-5c-2 | `vault_connect` serving the MongoDB engine (`docs/vault.md` §19): `engine: "mongodb"`, `auth_source` (default `admin`; refused for Postgres); on Unix the socket `mongodb-27017.sock`, dialled by its path, the `uri` `mongodb://<%-encoded path>/<db>?directConnection=true` (no `port`), on Windows `mongodb://127.0.0.1:<port>/<db>?directConnection=true`, `MONGODB_URI` in `env`; each connection's upstream built in the call's engine; a refusal in the engine's wire (a MongoDB client's first message answered, `mongo::refuse`) | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2518 `75af803b1` |
 | P3-5d-1 | the HTTP engine (`docs/vault.md` §19) and P3-5d's design (§3e "P3-5d, HTTP named upstreams, as designed"), with no caller yet (P3-5d-2's endpoint is the first): one client connection's requests sent on to one upstream origin over TLS verified as for the databases, HTTP/1.1, dialled at the first request and again when the upstream closes it; the secret's credential in `Authorization` alone, `Basic` (its `user` and `password`) or `Bearer` (its `token`), marked sensitive, and a value it cannot carry never sent; origin-form only (`CONNECT`, an absolute or authority form and `*` refused); the client's own `Authorization` and `Proxy-Authorization` and every hop-by-hop header dropped, `Host` the upstream's; bodies streamed both ways; a `Location` on the upstream's own origin pointed back at the endpoint, matched whole, and `Alt-Svc` and `Strict-Transport-Security` dropped; a refused client answered `503`; hyper's client half compiled in | the `vault` feature in no release build | **merged** #2520 `85591be0c` |
 | P3-5d-2 | `vault_connect` serving the HTTP engine (`docs/vault.md` §19): `engine: "http"`, the upstream an origin (`https://host[:port]`, no path, user or `:443`), `auth` `basic` or `bearer`, required for `http` and refused for a database; the leases `#user` and `#password`, or `#token`, and the CA; a value `Authorization` cannot carry refused at the call; the endpoint served through one seam (`Place`), a socket for a database on Unix, a loopback port for `http` everywhere and for every engine on Windows; Linux's check of a loopback connection's account from `/proc/net/tcp` and `tcp6` (the client end's row, never one in TIME_WAIT or with no inode); macOS refused before anything is leased; the answer's `uri` the endpoint's origin, its `env` git's `insteadOf` and `GIT_TERMINAL_PROMPT=0`; `vault_request` asking ahead toward an origin; the engine's dead-code allowance gone | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2521 `4201988ca` |
-| P3-5d-3 | the macOS HTTP endpoint (`docs/vault.md` §19): each loopback connection's account read from `libproc` (`proc_listpids`, `PROC_PIDLISTFDS`, `PROC_PIDFDSOCKETINFO`), served only where its client end is held, and held only, by processes running as the session's account (the kernel never fills a socket's `soi_stat`, so who made it cannot be read); the SDK's socket structs mirrored, their offsets asserted at compile time; the HTTP endpoint's tests run on macOS too, and its refusal there goes | device `vault_enabled = false`; the `vault` feature in no release build | **in review** |
+| P3-5d-3 | the macOS HTTP endpoint (`docs/vault.md` §19): each loopback connection's account read from `libproc` (`proc_listpids`, `PROC_PIDLISTFDS`, `PROC_PIDFDSOCKETINFO`), served only where its client end is held, and held only, by processes running as the session's account (the kernel never fills a socket's `soi_stat`, so who made it cannot be read); the SDK's socket structs mirrored, their offsets asserted at compile time; the HTTP endpoint's tests run on macOS too, and its refusal there goes | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2522 `db6cd18ce` |
+| P3-5e-1 | the HTTP engine's half for Kubernetes (`docs/vault.md` §19) and P3-5e's design (§3e "P3-5e, the Kubernetes API, as designed"), with no caller yet: `Flavor::Kubernetes`; `Credential::Handshake`, a client certificate presented by a connector made for the one connection (`tls::identity`, `tls::connector_for`, the roots read once by `tls::roots`); an upgrade to `websocket` or `SPDY/3.1` relayed on a connection of its own and the two ends joined on the API server's `101`, the tunnel carried within the client connection's session; `h2c` and every upgrade on a plain endpoint never relayed; every `Impersonate-*` header dropped | the `vault` feature in no release build | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |

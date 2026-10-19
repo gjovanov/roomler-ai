@@ -572,6 +572,18 @@ impl HttpSaw {
 /// | `/close` | `Connection: close`: the connection ends after it |
 /// | anything else | `ok` |
 pub(crate) async fn fake_http() -> (String, u16, mpsc::UnboundedReceiver<HttpSaw>) {
+    let (pem, acceptor, listener, port) = tls_server().await;
+    (pem, port, run_http(acceptor, listener, port))
+}
+
+/// The fake HTTPS upstream's answers, on `listener`, through `acceptor`. A
+/// request for `/exec` that asks to upgrade is switched (`101`), and every
+/// byte sent after is echoed (P3-5e-1).
+fn run_http(
+    acceptor: TlsAcceptor,
+    listener: TcpListener,
+    port: u16,
+) -> mpsc::UnboundedReceiver<HttpSaw> {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
@@ -580,7 +592,6 @@ pub(crate) async fn fake_http() -> (String, u16, mpsc::UnboundedReceiver<HttpSaw
     use hyper::{Request, Response, StatusCode};
     use hyper_util::rt::TokioIo;
 
-    let (pem, acceptor, listener, port) = tls_server().await;
     let (tx, rx) = mpsc::unbounded_channel();
     let conns = Arc::new(AtomicUsize::new(0));
     tokio::spawn(async move {
@@ -595,8 +606,13 @@ pub(crate) async fn fake_http() -> (String, u16, mpsc::UnboundedReceiver<HttpSaw
                 let Ok(s) = acceptor.accept(tcp).await else {
                     return;
                 };
-                let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                let service = hyper::service::service_fn(move |mut req: Request<Incoming>| {
                     let tx = tx.clone();
+                    // P3-5e-1 — an exec stream asked for: switch, then echo.
+                    let upgrade = (req.uri().path() == "/exec")
+                        .then(|| req.headers().get("upgrade").cloned())
+                        .flatten();
+                    let on = upgrade.is_some().then(|| hyper::upgrade::on(&mut req));
                     async move {
                         let (parts, body) = req.into_parts();
                         let body = body
@@ -680,16 +696,95 @@ pub(crate) async fn fake_http() -> (String, u16, mpsc::UnboundedReceiver<HttpSaw
                             }
                             _ => {}
                         }
+                        if let (Some(protocol), Some(on)) = (upgrade, on) {
+                            *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+                            *resp.body_mut() = Full::new(Bytes::new());
+                            resp.headers_mut().insert("upgrade", protocol);
+                            resp.headers_mut()
+                                .insert("connection", "Upgrade".parse().unwrap());
+                            tokio::spawn(async move {
+                                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                                let Ok(switched) = on.await else {
+                                    return;
+                                };
+                                let mut io = TokioIo::new(switched);
+                                let mut buf = [0u8; 4096];
+                                while let Ok(n) = io.read(&mut buf).await {
+                                    if n == 0 || io.write_all(&buf[..n]).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            });
+                        }
                         Ok::<_, std::convert::Infallible>(resp)
                     }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(s), service)
+                    .with_upgrades()
                     .await;
             });
         }
     });
-    (pem, port, rx)
+    rx
+}
+
+/// P3-5e-1 — an upstream that asks for a client certificate, as a
+/// Kubernetes API server does: what it answers is the fake HTTPS
+/// upstream's, and a connection that presents no certificate its client CA
+/// made is refused in the handshake.
+pub(crate) struct FakeMtls {
+    /// The upstream's own CA, PEM.
+    pub(crate) ca: String,
+    pub(crate) port: u16,
+    pub(crate) saw: mpsc::UnboundedReceiver<HttpSaw>,
+    /// A client certificate its CA made, and its key: PEM, made for this
+    /// test.
+    pub(crate) cert: String,
+    pub(crate) key: String,
+}
+
+pub(crate) async fn fake_http_mtls() -> FakeMtls {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use tokio_rustls::rustls::RootCertStore;
+    use tokio_rustls::rustls::server::WebPkiClientVerifier;
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let issuer_key = KeyPair::generate().unwrap();
+    let mut issuer = CertificateParams::new(Vec::<String>::new()).unwrap();
+    issuer.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let issuer = issuer.self_signed(&issuer_key).unwrap();
+    let client_key = KeyPair::generate().unwrap();
+    let client = CertificateParams::new(vec!["hive-session".to_string()])
+        .unwrap()
+        .signed_by(&client_key, &issuer, &issuer_key)
+        .unwrap();
+    let mut client_roots = RootCertStore::empty();
+    client_roots.add(issuer.der().clone()).unwrap();
+    let verifier =
+        WebPkiClientVerifier::builder_with_provider(Arc::new(client_roots), Arc::clone(&provider))
+            .build()
+            .unwrap();
+    let own = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let config = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(
+            vec![own.cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(own.key_pair.serialize_der().into()),
+        )
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let saw = run_http(TlsAcceptor::from(Arc::new(config)), listener, port);
+    FakeMtls {
+        ca: own.cert.pem(),
+        port,
+        saw,
+        cert: client.pem(),
+        key: client_key.serialize_pem(),
+    }
 }
 
 /// P3-5d-1 — a CA's PEM that vouches for no upstream a test runs.
