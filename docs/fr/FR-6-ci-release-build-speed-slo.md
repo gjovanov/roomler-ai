@@ -99,6 +99,10 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 21 | 10-10 | The cache limit back to the **free 10 GB** (the paid tier went read-only when another repository spent the account's budget), and two cuts to master's working set: the plain recorder lane restores `recorder-audio`'s family (works, ~600 MB); a `cargo-cache-trim` step dropped the crate archives before each save (**a no-op**: rust-cache's own `cargo metadata` downloads them again before saving) | #1939 |
 | 21b | 10-10 | The trim removed from all 14 jobs. The integration lane builds with `line-tables-only` instead of full debuginfo | #1944 |
 | 22 | 10-11 | **Six cargo caches move to the free release-asset store** (`seed-cache` assets `ci-<family>-<os>-<arch>-*`, `.github/actions/ci-seed-restore` + `ci-seed-save`): integration, both installer smokes, and `ci.yml`'s macOS overlay check and two Windows lanes. The Actions cache keeps only the seven Linux lanes plus apt and bun | #1954 |
+| 23a | 10-19 | The cargo-cache salt step removes every Rust toolchain but the pinned one before rust-cache computes its key (Linux). rust-cache hashes `rustc -vV` of **every installed toolchain**, so the runner image's own `stable` was in every key: a GitHub image rollout (1.99.0 → 1.99.1) gave each family two keys, and the janitor deleted each in turn as superseded | #2544 |
+| 23b | 10-19 | Integration-suite dispatch inputs `threads`, `mongo_tmpfs` and `report_time` (libtest's per-test durations; the slowest tests, seconds per module and mongod's descriptor peaks go to the step summary) | #2544 |
+| 23c | 10-19 | The release-asset cache key covers every manifest: profile and feature settings shape the dependency builds, and Cargo.lock records neither | #2544 |
+| 23d | 10-19 | The crypto crates (Argon2, OPAQUE, the curve and AEAD crates) build at `opt-level = 3` in the dev and test profiles: the integration suite's test time −34% | #2544 |
 
 ## Acceptance criteria
 
@@ -245,6 +249,23 @@ itself on the affected run's page. Baseline when the program started: releases t
   tag built in such a window misses the 10-min goal on this job alone. Lever: the CI
   lanes' answer, `cache-apt-pkgs-action` sets that the master rehearsal saves and tag
   builds restore. Cost: a second package list to keep in step.
+- **The integration suite after wave 23 (2026-10-19): ~18–21 min, above the 10-min goal.**
+  Measured levers, from the field log:
+  - Every third-party crate at opt-level 2 in dev/test (`[profile.dev.package."*"]`): test
+    time 1,725 s against 2,488 s with wave 23d's crypto list. It costs one ~12-min cold
+    rebuild of every dependency in every dev-profile lane, slower cold local builds, and
+    deps that a debugger steps through optimized.
+  - More threads need fewer open files in mongod, not just more CPU: each test creates and
+    drops ~246 WiredTiger files, and 4 threads exhausted the 64,000-descriptor ceiling. The
+    options are a higher ceiling (the leaked-database check catches a real leak either
+    way), sharding the suite across runners (each with its own mongod, but each also takes
+    one of the account's 20 concurrent job slots, which were full on 10-19), or a pool of
+    pre-indexed test databases emptied between tests instead of dropped and re-created
+    (removes the churn and ~1 s of setup per test, at the price of a harness change every
+    module's tests ride on).
+  - The 43 tests over 10 s (16% of test time) wait out real windows (an unanswered start, a
+    silent device, a throttle). Shorter windows under test settings would cut most of it;
+    those belong to the FR-90 and FR-52 owners.
 
 ## Out of scope
 
@@ -544,3 +565,47 @@ itself on the affected run's page. Baseline when the program started: releases t
     `installer-smoke-windows` entry appeared at 00:00:31Z, written by the last run on the
     old workflow (38095828862, `f47dfb5a1`, started before the merge), and was deleted.
   - Settled pool: **7.48 GiB in 12 entries**, against the free 10 GiB.
+- 2026-10-19: **"the tests got slow": two causes, wave 23 (#2544).**
+  - **CI lanes cold.** PR run 39288740822: lint 22.5 min, unit tests 19.2, profiles 10.1,
+    each with `No cache found`. The jobs that missed ran on runner image 20261018.339.1 and
+    the ones that hit on 20261012.334.1. rust-cache's "Rust Versions" listed two toolchains,
+    1.95.0 (ours) and the image's own `stable`, 1.99.0 on the old image and 1.99.1 on the
+    new, so each family had two keys (`…-6a930126-…`, `…-013f3a70-…`). Each miss built cold
+    and saved, and the janitor then deleted the other image's key as superseded: `ci-lint`
+    at 16:38, 17:23 and 17:58 UTC. With wave 23a, every Linux job on both images lists only
+    1.95.0 and computes one env hash, `0e351699` (PR run 39305294563). The salt step costs
+    1–2 s.
+  - **The integration suite**, run 39288740923: the build was warm (2.4 min), and the suite
+    was 30.6 min. Its 819 tests in one binary at `--test-threads=2` took 1,494 s. On master
+    the suite step had grown from a mean of 19.5 min on 10-14 to 27–29 min on 10-17..10-19
+    (max 35.7). With `report_time` (839 tests including the hive binaries):
+
+    | arm (dispatch run) | threads | Mongo data | test time | median | mongod fd peak |
+    |---|---|---|---|---|---|
+    | A, as is (39305102217) | 2 | disk | 3,772 s | 3.88 s | 19.4 k |
+    | B (39305113225) | 2 | tmpfs | 3,281 s | 3.34 s | 28.2 k |
+    | C (39305123577) | 4 | disk | 6,481 s | 7.27 s | 32.8 k |
+    | D (39305139703) | 4 | tmpfs | 4,823 s | 5.20 s | 31.4 k |
+    | crypto opt-level 3 (39312440997) | 2 | disk | 2,488 s | 2.48 s | 22.4 k |
+    | all deps opt-level 2 (39312466654) | 2 | disk | 1,725 s | 1.57 s | 35.2 k |
+    | crypto, 4 threads (39312454242) | 4 | tmpfs | **mongod died** | | 63.8 k |
+
+  - Password hashing was most of it. `health_check_returns_ok` took 1.1 s, a register 2.1 s
+    and a register + login 2.5 s: one unoptimized `Argon2::default()` op cost 0.5–0.9 s, and
+    `seed_tenant` (612 call sites) does four. 547 of the 839 tests took 2–5 s. Optimizing
+    the crypto crates alone took the extauth KE1 throttle test from 23.1 s to 3.9.
+  - Doubling the threads nearly doubled each test's time (arm C): the suite is CPU-bound on
+    a 4-vCPU runner, so threads were not the lever until the crypto was optimized.
+  - ⚠️ **More threads against ONE mongod hit its descriptor ceiling.** Every test creates
+    and drops a database of ~246 WiredTiger files, and the dropped ones stay open until
+    mongod reaps them. At 2 threads the curve is a sawtooth (22 k peaks, cleared every
+    4–6 min); with fast tests at 4 threads it climbed ~10 k a minute to 63,769 of 64,000,
+    and mongod aborted. Each later test then waited out the driver's 30 s, and the job
+    hit its 75-min limit. Faster tests mean more churn, so the 2-thread margin shrinks too
+    (35 k with every dependency optimized).
+  - The PR's CI run waited 20–64 min in the queue before its jobs started. The account's
+    20 concurrent jobs were full (experiment runs, other sessions' PRs, a release), so
+    sharding the suite across runners costs queue slots as well as minutes.
+  - Not shipped: all third-party crates at opt-level 2 (test time −54% against −34%). It
+    costs a ~12-min cold rebuild of every dependency in every dev-profile lane, and slower
+    cold local builds. That trade-off is the operator's (see Open decisions).
