@@ -522,4 +522,149 @@ async fn bulk_stale_pin_skips_per_agent() {
         .expect("one refused row");
     // The 0.4.2 box is the one protected; the rc.400 box gets the push.
     assert!(refused_row["refused"].as_str().unwrap().contains("0.4.2"));
+    assert_eq!(refused_row["refused_code"], "pin_downgrade");
+}
+
+// ─── FR-67 P7: an update the device said it will not act on ────
+
+/// Stamp what a device's hello would have said about a pushed update
+/// (`capabilities.update_mode`) onto its row: a device enrolled over HTTP
+/// never says hello. `None` = an agent from before P7, which says nothing.
+async fn set_update_mode(app: &TestApp, agent_id: &str, mode: Option<&str>) {
+    let aid = ObjectId::parse_str(agent_id).unwrap();
+    let update = match mode {
+        Some(m) => bson::doc! { "$set": { "capabilities.update_mode": m } },
+        None => bson::doc! { "$unset": { "capabilities.update_mode": "" } },
+    };
+    let res = app
+        .db
+        .collection::<bson::Document>("agents")
+        .update_one(bson::doc! { "_id": aid }, update)
+        .await
+        .unwrap();
+    assert_eq!(res.matched_count, 1, "no agent row {agent_id}");
+}
+
+/// The 2026-10-19 incident: "Update all" counted a device as pushed three
+/// times while the device logged `rc:agent.update ignored` three times — a
+/// secondary enrollment, and only a machine's primary drives its updater. The
+/// server now refuses, up front and with the reason, a push the device said
+/// it will not act on: a 409 on one device, a `refused` row with its
+/// `refused_code` in a bulk. A device that says nothing (an older agent) is
+/// pushed as before.
+#[tokio::test]
+async fn an_update_the_device_said_it_will_not_act_on_is_refused_with_why() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("fr67p7").await;
+    let admin = &t.admin.access_token;
+
+    // Three devices, the free plan's cap: the third plays both a device that
+    // acts on the push (`self`) and one from before P7 (no word at all).
+    let mut ids = Vec::new();
+    for (mach, name, mode) in [
+        ("mach-p7-sec", "Secondary Box", Some("primary_org")),
+        ("mach-p7-off", "Frozen Box", Some("off")),
+        ("mach-p7-self", "Updating Box", Some("self")),
+    ] {
+        let aid = enroll(&app, &t.tenant_id, admin, mach, name, "0.4.146").await;
+        set_update_mode(&app, &aid, mode).await;
+        ids.push(aid);
+    }
+    let [secondary, off, acts] = &ids[..] else {
+        unreachable!()
+    };
+
+    // The dashboard reads the same word off the device row.
+    let row = get_agent(&app, &t.tenant_id, secondary, admin).await;
+    assert_eq!(row["capabilities"]["update_mode"], "primary_org");
+
+    // One device: a 409 naming the way out. `force` does not override it:
+    // force overrides the server's own downgrade guard, while the device
+    // ignores or drops the frame whatever the server sends.
+    for (aid, want) in [(secondary, "set-primary"), (off, "auto_update")] {
+        for body in [json!({}), json!({ "force": true })] {
+            let resp = app
+                .auth_post(
+                    &format!("/api/tenant/{}/agent/{aid}/update", t.tenant_id),
+                    admin,
+                )
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 409, "{want} {body}");
+            let text = resp.text().await.unwrap_or_default();
+            assert!(text.contains(want), "{want}: {text}");
+        }
+    }
+    // A device that acts on it, or says nothing, is pushed as before (offline
+    // in tests ⇒ delivered=false, but the push is ACCEPTED).
+    for mode in [Some("self"), None] {
+        set_update_mode(&app, acts, mode).await;
+        let resp: Value = app
+            .auth_post(
+                &format!("/api/tenant/{}/agent/{acts}/update", t.tenant_id),
+                admin,
+            )
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(resp["delivered"].as_bool(), Some(false), "{mode:?} {resp}");
+        assert!(resp.get("refused").is_none(), "{mode:?} {resp}");
+        assert!(resp.get("refused_code").is_none(), "{mode:?} {resp}");
+    }
+
+    // "Update all": the two are skipped, each with a code a client branches
+    // on, and the batch does not fail.
+    let bulk = |body: Value| {
+        let app = &app;
+        let tid = t.tenant_id.clone();
+        async move {
+            app.auth_post(&format!("/api/tenant/{tid}/agent/update"), admin)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let code_of = |resp: &Value, aid: &str| -> Value {
+        resp["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["agent_id"] == aid)
+            .map(|r| r["refused_code"].clone())
+            .unwrap_or_else(|| panic!("no row for {aid}: {resp}"))
+    };
+    for mode in [Some("self"), None] {
+        set_update_mode(&app, acts, mode).await;
+        let resp = bulk(json!({})).await;
+        assert_eq!(resp["requested"].as_u64(), Some(3), "{mode:?} {resp}");
+        assert_eq!(resp["refused"].as_u64(), Some(2), "{mode:?} {resp}");
+        assert_eq!(code_of(&resp, secondary), "primary_org");
+        assert_eq!(code_of(&resp, off), "auto_update_off");
+        assert!(code_of(&resp, acts).is_null(), "{mode:?} {resp}");
+    }
+
+    // A pin that would downgrade carries FR-2's own code; with `force` the
+    // pin passes FR-2's guard and still meets the device's refusal.
+    let resp = bulk(json!({ "agent_ids": [secondary, acts], "pin": "agent-v0.4.140" })).await;
+    assert_eq!(code_of(&resp, secondary), "pin_downgrade");
+    assert_eq!(code_of(&resp, acts), "pin_downgrade");
+    let resp = bulk(json!({
+        "agent_ids": [secondary, acts],
+        "pin": "agent-v0.4.140",
+        "force": true,
+    }))
+    .await;
+    assert_eq!(code_of(&resp, secondary), "primary_org");
+    assert!(code_of(&resp, acts).is_null(), "{resp}");
+    assert_eq!(resp["refused"].as_u64(), Some(1), "{resp}");
 }

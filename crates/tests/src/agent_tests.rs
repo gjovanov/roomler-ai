@@ -314,6 +314,100 @@ async fn same_machine_enrolls_into_two_tenants_and_both_connect() {
     let _ = tokio::time::timeout(Duration::from_secs(2), org_task).await;
 }
 
+/// FR-67 P7 — the field case end to end (2026-10-19): one machine in two
+/// orgs, and an admin of the SECONDARY org clicks "Update all". Only the
+/// machine's primary enrollment drives its self-updater, so the secondary's
+/// loop ignores the push. Its hello now says so (`update_mode: primary_org`),
+/// and the server skips it with that code, where it used to count a frame the
+/// device ignored as an update delivered.
+#[tokio::test]
+async fn update_all_from_a_secondary_org_is_refused_not_counted_delivered() {
+    let app = TestApp::spawn().await;
+    let t1 = app.seed_tenant("p7prim").await;
+    let t2 = app.seed_tenant("p7sec").await;
+    let fresh1 = enrol_via_agent_lib(&app, &t1, "mach-p7-1", "Two-org box").await;
+    let (cfg, _) = enrollment::apply_enrollment(None, fresh1, None, false).unwrap();
+    let fresh2 = enrol_via_agent_lib(&app, &t2, "mach-p7-1", "Two-org box").await;
+    let (cfg, _) = enrollment::apply_enrollment(Some(cfg), fresh2, Some("second"), false).unwrap();
+    let org_cfg = cfg.for_org(&cfg.orgs[0]);
+
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let prim_task = spawn_agent_signaling(cfg.clone(), stop_rx.clone());
+    let org_task = spawn_agent_signaling_as(
+        signaling::OrgCtx::secondary(
+            "second",
+            roomlerd::token_slot::TokenSlot::new(org_cfg.agent_token.clone()),
+        ),
+        org_cfg.clone(),
+        stop_rx,
+    );
+
+    // Online = the hello was processed, so the caps it carried are stored.
+    let mut both_online = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if agent_is_online(&app, &t1, &cfg.agent_id).await
+            && agent_is_online(&app, &t2, &org_cfg.agent_id).await
+        {
+            both_online = true;
+            break;
+        }
+    }
+    assert!(both_online, "both enrollments must come online");
+
+    let update_mode = |tenant: &crate::fixtures::seed::SeededTenant, agent_id: &str| {
+        let app = &app;
+        let path = format!("/api/tenant/{}/agent/{agent_id}", tenant.tenant_id);
+        let token = tenant.admin.access_token.clone();
+        async move {
+            let row: Value = app
+                .auth_get(&path, &token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            row["capabilities"]["update_mode"].clone()
+        }
+    };
+    assert_eq!(update_mode(&t2, &org_cfg.agent_id).await, "primary_org");
+    // The primary says what ITS updater does: no updater runs in this test
+    // process, so `off` — the word the daemon's own hello computes.
+    assert_eq!(
+        update_mode(&t1, &cfg.agent_id).await,
+        roomlerd::updater::update_mode(true)
+    );
+
+    // The click, in the secondary org.
+    let resp: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/update", t2.tenant_id),
+            &t2.admin.access_token,
+        )
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["requested"], 1, "{resp}");
+    assert_eq!(resp["delivered"], 0, "not counted as delivered: {resp}");
+    assert_eq!(resp["refused"], 1, "{resp}");
+    assert_eq!(resp["results"][0]["refused_code"], "primary_org", "{resp}");
+    assert!(
+        resp["results"][0]["refused"]
+            .as_str()
+            .is_some_and(|r| r.contains("roomlerd org set-primary")),
+        "the reason names the way out: {resp}"
+    );
+
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), prim_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), org_task).await;
+}
+
 /// #1750 — a SECONDARY org whose admin removed the device: the server
 /// refuses the org's WS with `rc:goodbye AgentDeleted`, and its loop must END
 /// (not retry) on the TYPED error `run_cmd`'s supervisors log at DEBUG — the
