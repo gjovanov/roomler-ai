@@ -1638,6 +1638,11 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         // additional org from a pushed token, no restart). Build-independent:
         // the enroll + config paths are in every flavour.
         multi_org: vec!["join".into()],
+        // FR-67 P7 — `None` HERE on purpose: whether an update is acted on
+        // depends on the connection (primary or secondary org) and on the
+        // daemon's updater, neither of which the probe child knows.
+        // `signaling::stub_caps` fills it at every announcement.
+        update_mode: None,
         // Fleet RPC — build-independent (the exec engine is std process
         // spawning, no feature-gated backend). Advertising the capability
         // says only "this agent understands the verbs": the org kill-switch,
