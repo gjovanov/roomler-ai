@@ -929,6 +929,7 @@ mod imp {
                 sdp: "v=0".into(),
                 extauth_mac: Some("forged-by-a-worker".into()),
                 peer_auth: None,
+                peer_auth_verdict: None,
             };
             assert!(super::super::seal_outbound(&svc, &mut ordinary));
             assert!(
@@ -961,6 +962,7 @@ mod imp {
                 sdp: "v=0".into(),
                 extauth_mac: None,
                 peer_auth: None,
+                peer_auth_verdict: None,
             };
             assert!(
                 !super::super::seal_outbound(&svc, &mut ended),

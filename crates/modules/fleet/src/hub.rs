@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use roomler_ai_remote_control::audit::AuditSink;
 use roomler_ai_remote_control::consent::{
@@ -2083,12 +2083,19 @@ impl Hub {
     /// Forward agent's SDP answer to the controller. `extauth_mac` (FR-52 P4)
     /// and `peer_auth` (FR-100 P1b, the device's signature) relayed verbatim,
     /// as for the offer: the browser is the party that checks them.
+    ///
+    /// FR-100 P1c — `peer_auth_verdict`, what the device concluded about the
+    /// browser that offered the session, is the hub's to RECORD, not to relay:
+    /// it lands on the session's `SessionStarted` audit row. A word this build
+    /// does not know is not recorded (a newer device's vocabulary is not this
+    /// server's to guess at), and nothing about it ever fails the answer.
     pub fn forward_answer(
         &self,
         session_id: ObjectId,
         sdp: String,
         extauth_mac: Option<String>,
         peer_auth: Option<roomler_ai_remote_control::signaling::PeerAuthAnswer>,
+        peer_auth_verdict: Option<String>,
     ) -> Result<()> {
         let (controller_tx, user_id, region) = {
             let arc = self
@@ -2124,7 +2131,15 @@ impl Hub {
         let (sid, aid, oid, max_duration) = self.with_session(session_id, |s| {
             Ok((s.id, s.agent_id, s.tenant_id, s.max_duration.take()))
         })?;
-        self.audit(sid, aid, oid, AuditKind::SessionStarted);
+        let peer_auth = peer_auth_verdict.filter(|v| {
+            let known = roomler_ai_remote_control::signaling::peer_auth_verdict_is_known(v);
+            if !known {
+                debug!(session = %sid.to_hex(), verdict = %v.escape_debug(),
+                    "peer-auth: a verdict this server does not know, not recorded");
+            }
+            known
+        });
+        self.audit(sid, aid, oid, AuditKind::SessionStarted { peer_auth });
         // FR-101 P4b — the org's maximum length runs from here, the moment the
         // session went live, not from the request: consent can take minutes.
         // Taken above, so a renegotiation never arms a second timer. A session
@@ -3696,10 +3711,11 @@ impl Hub {
                     sdp,
                     extauth_mac,
                     peer_auth,
+                    peer_auth_verdict,
                 },
             ) => {
                 self.check_session_party(ctx, session_id)?;
-                self.forward_answer(session_id, sdp, extauth_mac, peer_auth)
+                self.forward_answer(session_id, sdp, extauth_mac, peer_auth, peer_auth_verdict)
             }
             (
                 Role::Agent,
@@ -4280,6 +4296,9 @@ mod tests {
         // Any string: the hub never reads the nonce, only carries it.
         let ask = PeerAuthOffer {
             nonce: "a nonce the hub never reads".into(),
+            // FR-100 P2b's fields ride the same struct, so verbatim covers them.
+            key: Some("a key the hub never reads".into()),
+            sig: Some("a signature the hub never reads".into()),
         };
         hub.forward_offer(sid, "v=0".into(), None, Some(ask.clone()))
             .unwrap();
@@ -4291,8 +4310,14 @@ mod tests {
             key: "the device's key".into(),
             sig: "its signature".into(),
         };
-        hub.forward_answer(sid, "v=0".into(), None, Some(signed.clone()))
-            .unwrap();
+        hub.forward_answer(
+            sid,
+            "v=0".into(),
+            None,
+            Some(signed.clone()),
+            Some("verified".into()),
+        )
+        .unwrap();
         loop {
             if let ServerMsg::SdpAnswer { peer_auth, .. } = ctl_rx.recv().await.unwrap() {
                 assert_eq!(peer_auth, Some(signed));
@@ -4313,7 +4338,8 @@ mod tests {
         let _ready = ctl_rx.recv().await.unwrap();
         let _req = agent_rx.recv().await.unwrap();
         hub.forward_offer(sid, "v=0".into(), None, None).unwrap();
-        hub.forward_answer(sid, "v=0".into(), None, None).unwrap();
+        hub.forward_answer(sid, "v=0".into(), None, None, None)
+            .unwrap();
     }
 
     /// FR-101 P4b — the next `rc:terminate` on a channel, within `within`.
@@ -4483,7 +4509,8 @@ mod tests {
             ServerMsg::Ready { .. }
         ));
         hub.forward_offer(sid, "v=0".into(), None, None).unwrap();
-        hub.forward_answer(sid, "v=0".into(), None, None).unwrap();
+        hub.forward_answer(sid, "v=0".into(), None, None, None)
+            .unwrap();
         let device = DispatchCtx {
             role: Role::Agent,
             user_id: None,
@@ -4688,6 +4715,7 @@ mod tests {
                 sdp: "v=0".into(),
                 extauth_mac: None,
                 peer_auth: None,
+                peer_auth_verdict: None,
             },
             ClientMsg::Consent {
                 session_id: sid,
