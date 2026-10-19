@@ -300,9 +300,8 @@ pub(crate) trait VaultTools: Send + Sync {
     fn attach(&self, lease_id: &str, path: &std::path::Path) -> bool;
     /// P3-5b-2 — `stop` is cancelled when `lease_id` is let go: what a tool
     /// serves with its value (a proxy endpoint) ends with it. `false` when the
-    /// lease is no longer held. (Only Unix serves an endpoint yet.)
+    /// lease is no longer held.
     #[cfg(feature = "vault")]
-    #[cfg_attr(not(unix), allow(dead_code))]
     fn stop_with(&self, lease_id: &str, stop: CancellationToken) -> bool;
     /// The value a held lease holds, while it is held.
     #[cfg(feature = "vault")]
@@ -1033,6 +1032,7 @@ async fn ask_vault(ctx: &Ctx, name: &str, args: &Value) -> Result<Value, String>
             ctx.session,
             ctx.fence,
             ctx.exec.as_ref(),
+            &ctx.peer,
             args,
         )
         .await;

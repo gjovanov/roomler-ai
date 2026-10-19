@@ -707,10 +707,10 @@ test of the SIGKILL property itself.
 - **P4c, Hive adopt** (built). The adopt socket is a named pipe, `\\.\pipe\roomler-hive-adopt`
   (`hive/supervisor/adopt.rs:573`), and each end checks the other through the kernel (D16):
   - The daemon names a client by its token, impersonating it just long enough after its first line
-    (`hive_win.rs:376`), never by its pid. SYSTEM, LOCAL SERVICE, NETWORK SERVICE and the anonymous logon are refused
+    (`hive_win.rs:445`), never by its pid. SYSTEM, LOCAL SERVICE, NETWORK SERVICE and the anonymous logon are refused
     as root is.
   - A person gets `0x12008b`, read and write data. Only SYSTEM, Administrators and the daemon's own account add
-    instances (`hive_win.rs:941`). The first instance is the first, retried every 30 s while another process holds the
+    instances (`hive_win.rs:1010`). The first instance is the first, retried every 30 s while another process holds the
     name.
   - The hook opens the pipe with exactly that mask, at identification level, and sends nothing unless the pipe is
     owned by SYSTEM, Administrators or the hook's own account (`hive_adopt.rs:226`). The owner, not the server
