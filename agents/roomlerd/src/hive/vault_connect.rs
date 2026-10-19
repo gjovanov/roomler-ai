@@ -2,16 +2,16 @@
 // Copyright (C) 2026 G ROX EOOD
 //! FR-90 P3-5b-2 — `vault_connect`: an endpoint this daemon serves for the
 //! session's account, which authenticates to a database (from P3-5d-2, an
-//! HTTP upstream too) with a secret's value, for as long as its leases. The
-//! session gets a connection string with no credential in it; the value
-//! stays in daemon memory (AC12).
+//! HTTP upstream too; from P3-5f-2, an SSH host, as its agent) with a
+//! secret's value, for as long as its leases. The session gets a connection
+//! string with no credential in it; the value stays in daemon memory (AC12).
 //!
 //! | Step | What holds |
 //! |---|---|
-//! | the call | `handle` (a structured secret, by its path or this org's RRN, with no `#field`), `engine` (`postgres`, from P3-5c-2 `mongodb`, from P3-5d-2 `http`), `upstream` (`host:port` for a database, an origin `https://host[:port]` for `http`, exactly as the secret's `audiences` names it), `auth` (`http`'s: `basic` or `bearer`), `database` (optional), `ca` (optional: a secret whose value is the upstream's CA, PEM), `auth_source` (MongoDB's: the database the user is defined in, default `admin`), `ttl_s` (30 to 900, default 300) |
-//! | the leases | the secret's `user` and `password` (for `bearer`, its `token`), and `ca`'s, each in `proxy` mode toward the upstream: the vault's `proxy-only-named-audiences` refuses an upstream the secret does not name, recorded. A lease asked for ahead toward the same upstream is taken as it is |
-//! | the endpoint | a database's on Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, which a Postgres client dials as `host=<that directory>`, or `…/mongodb-27017.sock`, which a MongoDB client dials by its path: both directories the daemon's own (`0711`), the socket handed to the session's account (`0600`), and each connection's peer uid checked again. Every endpoint on Windows (P3-5b-4), and an HTTP one everywhere (P3-5d-2): `127.0.0.1` on a port the system picks, each connection's account read from the system's table of connections and served only if it is the session's |
-//! | a connection | the call's engine, [`crate::vault_proxy::pg`], [`crate::vault_proxy::mongo`] or [`crate::vault_proxy::http`]: the client never authenticates; the upstream, by SCRAM-SHA-256 or by `Authorization` inside verified TLS, with the values read from the leases as each connection starts |
+//! | the call | `handle` (a structured secret, by its path or this org's RRN, with no `#field`), `engine` (`postgres`, from P3-5c-2 `mongodb`, from P3-5d-2 `http`, from P3-5e-2 `kubernetes`, from P3-5f-2 `ssh`), `upstream` (`host:port` for a database, an origin `https://host[:port]` for `http` and `kubernetes`, `ssh://[user@]host[:port]` for `ssh`, exactly as the secret's `audiences` names it), `auth` (`http`'s and `kubernetes`'s: `basic`, `bearer` or `client-cert`), `database` (optional), `ca` (optional: a secret whose value is the upstream's CA, PEM), `auth_source` (MongoDB's: the database the user is defined in, default `admin`), `ttl_s` (30 to 900, default 300) |
+//! | the leases | the secret's `user` and `password` (for `bearer`, its `token`; for `client-cert`, its `cert` and `key`; for `ssh`, its `key` and `host_keys`), and `ca`'s, each in `proxy` mode toward the upstream: the vault's `proxy-only-named-audiences` refuses an upstream the secret does not name, recorded. A lease asked for ahead toward the same upstream is taken as it is |
+//! | the endpoint | a database's on Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, which a Postgres client dials as `host=<that directory>`, or `…/mongodb-27017.sock`, which a MongoDB client dials by its path; (P3-5f-2) an SSH agent's, `…/ssh-agent.sock`, named in `SSH_AUTH_SOCK`: each directory the daemon's own (`0711`), the socket handed to the session's account (`0600`), and each connection's peer uid checked again. Every database endpoint on Windows (P3-5b-4), and an HTTP one everywhere (P3-5d-2): `127.0.0.1` on a port the system picks, each connection's account read from the system's table of connections and served only if it is the session's. No SSH agent on Windows until P3-5f-3 |
+//! | a connection | the call's engine, [`crate::vault_proxy::pg`], [`crate::vault_proxy::mongo`], [`crate::vault_proxy::http`] or [`crate::vault_proxy::ssh_agent`]: the client never authenticates; the upstream, by SCRAM-SHA-256 or by `Authorization` or a client certificate inside verified TLS, with the values read from the leases as each connection starts. An agent relays nothing: it signs the session's own `ssh` in to the host |
 //! | its life | closed, with every connection it holds, when its first lease is let go: its expiry, `rc:vault.revoke`, the run's end; every one an earlier process left, at the daemon's start |
 //!
 //! ⚠️ `proxy` hands the session no value: what it holds is an endpoint that
@@ -51,6 +51,9 @@ pub(crate) enum Engine {
     /// P3-5e-2 — a Kubernetes API server: an HTTP endpoint that also relays
     /// `kubectl`'s upgrades and drops impersonation.
     Kubernetes,
+    /// P3-5f-2 — an SSH host: an agent that signs the session's own `ssh` in
+    /// to it with the secret's key, and relays nothing.
+    Ssh,
 }
 
 impl Engine {
@@ -60,6 +63,7 @@ impl Engine {
             "mongodb" => Some(Self::Mongodb),
             "http" => Some(Self::Http),
             "kubernetes" => Some(Self::Kubernetes),
+            "ssh" => Some(Self::Ssh),
             _ => None,
         }
     }
@@ -70,6 +74,7 @@ impl Engine {
             Self::Mongodb => "mongodb",
             Self::Http => "http",
             Self::Kubernetes => "kubernetes",
+            Self::Ssh => "ssh",
         }
     }
 
@@ -126,18 +131,25 @@ pub(crate) struct ConnectRequest {
     /// P3-5d-2 — `http`'s: how the value is presented. `None` for a
     /// database.
     pub(crate) auth: Option<Auth>,
+    /// P3-5f-2 — `ssh`'s: the one account the key signs in as, where the
+    /// upstream names one.
+    pub(crate) user: Option<String>,
     pub(crate) ttl: u32,
 }
 
 impl ConnectRequest {
     /// The values the endpoint is leased, in order: `user` and `password`
-    /// (a database's, or `basic`'s), `token` (`bearer`'s), or `cert` and
-    /// `key` (`client-cert`'s); then the CA when the call names one.
+    /// (a database's, or `basic`'s), `token` (`bearer`'s), `cert` and `key`
+    /// (`client-cert`'s), or (P3-5f-2) `key` and `host_keys` (`ssh`'s); then
+    /// the CA when the call names one.
     pub(crate) fn handles(&self) -> Vec<Handle> {
         let field = |f: &str| Handle {
             secret: self.secret.clone(),
             field: f.into(),
         };
+        if self.engine == Engine::Ssh {
+            return vec![field("key"), field("host_keys")];
+        }
         let mut handles = match self.auth {
             Some(Auth::Bearer) => vec![field("token")],
             Some(Auth::ClientCert) => vec![field("cert"), field("key")],
@@ -232,6 +244,65 @@ pub(crate) fn origin_of(raw: &str) -> Result<(String, u16), String> {
     Ok((host, port))
 }
 
+/// P3-5f-2 — an SSH host, as an audience names one:
+/// `ssh://[<user>@]<host>[:<port>]`, with no path, and the port written only
+/// where it is not 22, so a host has one spelling. A database's audience and
+/// an origin are other strings, so a secret named for one never opens
+/// another. A user in it is the one account the key signs in as. Answers the
+/// user, the host, unbracketed, and the port.
+pub(crate) fn ssh_of(raw: &str) -> Result<(Option<String>, String, u16), String> {
+    use roomler_ai_remote_control::vault::lease_limits::MAX_AUDIENCE_LEN;
+    let bad = || {
+        format!(
+            "upstream must be ssh://host, ssh://host:port or ssh://user@host, as the secret's \
+             audiences name it (such as ssh://git@github.com): got {raw:?}"
+        )
+    };
+    if raw.len() > MAX_AUDIENCE_LEN {
+        return Err(bad());
+    }
+    let rest = raw.strip_prefix("ssh://").ok_or_else(bad)?;
+    if rest.contains(['/', '?', '#']) {
+        return Err(bad());
+    }
+    let (user, authority) = match rest.split_once('@') {
+        Some((user, authority)) => (Some(user), authority),
+        None => (None, rest),
+    };
+    if authority.contains('@') {
+        return Err(bad());
+    }
+    // A POSIX account name, as ssh would carry it: no shell to quote for.
+    let user_ok = |u: &str| {
+        !u.is_empty()
+            && u.len() <= 32
+            && u.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            && !u.starts_with(['-', '.'])
+    };
+    if user.is_some_and(|u| !user_ok(u)) {
+        return Err(format!(
+            "upstream's user must be 1 to 32 letters, digits, '.', '_' or '-', not starting with \
+             '-' or '.': got {raw:?}"
+        ));
+    }
+    // A name with no colon, or a bracketed IPv6 address, names no port.
+    let ported = authority.contains(':') && !authority.ends_with(']');
+    let (host, port) = if ported {
+        upstream_of(authority)
+    } else {
+        upstream_of(&format!("{authority}:22"))
+    }
+    .map_err(|_| bad())?;
+    if ported && port == 22 {
+        let plain = raw.strip_suffix(":22").unwrap_or(raw);
+        return Err(format!(
+            "upstream names port 22, which an ssh upstream leaves out: write {plain}"
+        ));
+    }
+    Ok((user.map(str::to_string), host, port))
+}
+
 pub(crate) fn parse(args: &Value) -> Result<ConnectRequest, String> {
     use roomler_ai_remote_control::vault::lease_limits::{MAX_TTL_SECS, MIN_TTL_SECS};
     let raw = args
@@ -249,14 +320,21 @@ pub(crate) fn parse(args: &Value) -> Result<ConnectRequest, String> {
         .get("engine")
         .and_then(Value::as_str)
         .and_then(Engine::of)
-        .ok_or("engine must be postgres, mongodb, http or kubernetes")?;
+        .ok_or("engine must be postgres, mongodb, http, kubernetes or ssh")?;
     let upstream = args.get("upstream").and_then(Value::as_str).ok_or(
-        "upstream is required: host:port for a database, or https://host[:port] for http and \
-         kubernetes, as the secret's audiences name it",
+        "upstream is required: host:port for a database, https://host[:port] for http and \
+         kubernetes, or ssh://[user@]host[:port] for ssh, as the secret's audiences name it",
     )?;
-    let (host, port) = match engine {
-        Engine::Http | Engine::Kubernetes => origin_of(upstream)?,
-        Engine::Postgres | Engine::Mongodb => upstream_of(upstream)?,
+    let (user, host, port) = match engine {
+        Engine::Http | Engine::Kubernetes => {
+            let (host, port) = origin_of(upstream)?;
+            (None, host, port)
+        }
+        Engine::Postgres | Engine::Mongodb => {
+            let (host, port) = upstream_of(upstream)?;
+            (None, host, port)
+        }
+        Engine::Ssh => ssh_of(upstream)?,
     };
     let auth = match args.get("auth") {
         None | Some(Value::Null) if engine == Engine::Http => {
@@ -274,6 +352,9 @@ pub(crate) fn parse(args: &Value) -> Result<ConnectRequest, String> {
             );
         }
         None | Some(Value::Null) => None,
+        Some(_) if engine == Engine::Ssh => {
+            return Err("auth is http's: an ssh endpoint signs with the secret's key".into());
+        }
         Some(_) if !engine.is_http() => {
             return Err("auth is http's: a database is signed in to by SCRAM".into());
         }
@@ -297,6 +378,9 @@ pub(crate) fn parse(args: &Value) -> Result<ConnectRequest, String> {
                     .into(),
             );
         }
+        Some(_) if engine == Engine::Ssh => {
+            return Err("database is a database's: an ssh endpoint stands for a host".into());
+        }
         Some(Value::String(d))
             if !d.is_empty() && d.len() <= MAX_DATABASE && !d.chars().any(char::is_control) =>
         {
@@ -310,6 +394,9 @@ pub(crate) fn parse(args: &Value) -> Result<ConnectRequest, String> {
     };
     let ca = match args.get("ca") {
         None | Some(Value::Null) => None,
+        Some(_) if engine == Engine::Ssh => {
+            return Err("ca is TLS's: an ssh host is checked by the secret's own host_keys".into());
+        }
         Some(Value::String(c)) => Some(handle_of(c)?),
         Some(_) => return Err("ca must name a secret whose value is a PEM CA".into()),
     };
@@ -326,6 +413,11 @@ pub(crate) fn parse(args: &Value) -> Result<ConnectRequest, String> {
                 "auth_source is MongoDB's: an http endpoint presents the secret in Authorization \
                  or in the handshake"
                     .into(),
+            );
+        }
+        Some(_) if engine == Engine::Ssh => {
+            return Err(
+                "auth_source is MongoDB's: an ssh endpoint signs with the secret's key".into(),
             );
         }
         Some(Value::String(a)) if mongo_database_ok(a) => Some(a.clone()),
@@ -355,6 +447,7 @@ pub(crate) fn parse(args: &Value) -> Result<ConnectRequest, String> {
         ca,
         auth_source,
         auth,
+        user,
         ttl,
     })
 }
@@ -751,7 +844,7 @@ mod endpoint {
     use super::super::toolbelt::VaultTools;
     use super::super::vault_exec::Releasing;
     use super::{Auth, ConnectRequest, Engine};
-    use crate::vault_proxy::{http, mongo, pg, tls};
+    use crate::vault_proxy::{http, mongo, pg, ssh_agent, tls};
 
     #[cfg(unix)]
     pub(crate) use self::socket::PROXIES_DIR;
@@ -849,13 +942,20 @@ mod endpoint {
         /// P3-5d-2 — the endpoint's own origin, where an HTTP endpoint
         /// points a redirect to its upstream back to.
         front: String,
+        /// P3-5f-2 — an SSH agent's: the secret its key is listed under, and
+        /// the one account it signs in as, where the upstream names one.
+        secret: String,
+        user: Option<String>,
     }
 
-    /// One connection's upstream, in its engine.
+    /// One connection's upstream, in its engine: for an SSH agent, the key
+    /// it signs with and the hosts it signs a sign-in to (boxed: a key pair
+    /// is far larger than the other engines' upstreams).
     enum Session {
         Pg(pg::Upstream),
         Mongo(mongo::Upstream),
         Http(http::Upstream),
+        Ssh(Box<ssh_agent::Agent>),
     }
 
     impl Endpoint {
@@ -907,6 +1007,16 @@ mod endpoint {
                         },
                     })
                 }
+                // P3-5f-2 — the key and the hosts, read from the leases now.
+                Engine::Ssh => Session::Ssh(Box::new(
+                    ssh_agent::Agent::new(
+                        &self.read(0)?,
+                        &self.read(1)?,
+                        &self.secret,
+                        self.user.as_deref(),
+                    )
+                    .ok()?,
+                )),
             })
         }
     }
@@ -971,6 +1081,8 @@ mod endpoint {
         tls: tokio_rustls::TlsConnector,
         roots: Arc<tokio_rustls::rustls::RootCertStore>,
         slot: Slot,
+        /// P3-5f-2 — an SSH agent's: the hosts' keys, for the answer.
+        known_hosts: Option<String>,
     }
 
     pub(crate) async fn open(
@@ -982,6 +1094,17 @@ mod endpoint {
     ) -> Result<Value, String> {
         if req.engine.is_http() {
             loopback::identifies()?;
+        }
+        // P3-5f-2 — an agent is a Unix socket: Windows serves one from
+        // P3-5f-3, as a named pipe, and until then refuses before anything is
+        // leased.
+        #[cfg(windows)]
+        if req.engine == Engine::Ssh {
+            return Err(
+                "an ssh endpoint is an agent's socket, which this device serves on Linux and macOS: \
+                 Windows serves none yet"
+                    .into(),
+            );
         }
         let slot = Slot::take(session, fence).ok_or_else(|| {
             format!("this session holds {MAX_ENDPOINTS} endpoints already: let one end first")
@@ -1025,11 +1148,26 @@ mod endpoint {
             Some(_) => Some(value(&leases[count], &handles[count])?),
             None => None,
         };
-        let roots = tls::roots(ca.as_deref().map(String::as_str))
-            .map_err(|e| format!("the upstream's TLS: {e}"))?;
+        // P3-5f-2 — an agent speaks no TLS: its roots are never read, so a
+        // device with none in its store still serves one.
+        let roots = if req.engine == Engine::Ssh {
+            Arc::new(tokio_rustls::rustls::RootCertStore::empty())
+        } else {
+            tls::roots(ca.as_deref().map(String::as_str))
+                .map_err(|e| format!("the upstream's TLS: {e}"))?
+        };
         let tls = tls::connector_for(Arc::clone(&roots), None)
             .map_err(|e| format!("the upstream's TLS: {e}"))?;
-        match req.auth {
+        let known_hosts = match req.auth {
+            // P3-5f-2 — the key and the hosts, proven once here; the agent's
+            // refusals name no byte of either. The hosts' keys are public:
+            // the answer's `known_hosts` carries them.
+            None if req.engine == Engine::Ssh => {
+                let agent =
+                    ssh_agent::Agent::new(&values[0], &values[1], &req.secret, req.user.as_deref())
+                        .map_err(|why| format!("{}: {why}", req.secret))?;
+                Some(agent.known_hosts(&req.host, req.port))
+            }
             // P3-5e-2 — an identity TLS can present, proven once here. The
             // refusal names no parser's words: they could quote the key.
             Some(Auth::ClientCert) => {
@@ -1043,6 +1181,7 @@ mod endpoint {
                         req.secret
                     ));
                 }
+                None
             }
             None => {
                 let user = &values[0];
@@ -1052,6 +1191,7 @@ mod endpoint {
                         handles[0]
                     ));
                 }
+                None
             }
             Some(auth) => {
                 let carried = credential(auth, |i| values.get(i).cloned())
@@ -1065,8 +1205,9 @@ mod endpoint {
                         req.secret
                     ));
                 }
+                None
             }
-        }
+        };
         drop(values);
         let handover = Handover {
             vault: &vault,
@@ -1076,6 +1217,7 @@ mod endpoint {
             tls,
             roots,
             slot,
+            known_hosts,
         };
         let answer = match req.engine {
             Engine::Http | Engine::Kubernetes => {
@@ -1085,9 +1227,9 @@ mod endpoint {
                 start(bound, dial, front, &req, handover)?
             }
             #[cfg(unix)]
-            Engine::Postgres | Engine::Mongodb => {
+            Engine::Postgres | Engine::Mongodb | Engine::Ssh => {
                 let bound = socket::bind(&at, req.engine)?;
-                let dial = bound.dial(req.engine, req.database.as_deref());
+                let dial = bound.dial(req.engine, req.database.as_deref(), &req.upstream);
                 start(bound, dial, String::new(), &req, handover)?
             }
             #[cfg(windows)]
@@ -1095,6 +1237,12 @@ mod endpoint {
                 let bound = loopback::bind(&at)?;
                 let dial = bound.dial(req.engine, req.database.as_deref(), &req.upstream);
                 start(bound, dial, String::new(), &req, handover)?
+            }
+            // Refused before anything was leased, above; and were it not, the
+            // leases the call took are let go as `held` drops.
+            #[cfg(windows)]
+            Engine::Ssh => {
+                return Err("an ssh endpoint is an agent's socket: Windows serves none yet".into());
             }
         };
         // Handed to the endpoint, which lets them go when it closes.
@@ -1139,9 +1287,18 @@ mod endpoint {
             auth_source: req.auth_source.clone(),
             auth: req.auth,
             front,
+            secret: req.secret.clone(),
+            user: req.user.clone(),
         });
         tokio::spawn(serve(bound, endpoint, stop, h.own, h.slot));
         let note = match req.engine {
+            Engine::Ssh => {
+                "Run ssh with env set, and with known_hosts written to a file of your own and \
+                 named in -o UserKnownHostsFile=<file> (for git, GIT_SSH_COMMAND=\"ssh -o \
+                 UserKnownHostsFile=<file>\"): it signs in to the upstream with the secret's key, \
+                 which never leaves this daemon. The agent signs a sign-in to that host only, \
+                 from OpenSSH 8.9 on. It closes, with its connections, when its lease ends."
+            }
             Engine::Http => {
                 "Send requests to uri as you would to the upstream, with no credential: the \
                  endpoint adds the secret's. For git, set env, and use the upstream's own URLs. \
@@ -1172,6 +1329,9 @@ mod endpoint {
         });
         if req.engine == Engine::Kubernetes {
             answer["kubeconfig"] = json!(kubeconfig(&dial.uri));
+        }
+        if let Some(known_hosts) = h.known_hosts {
+            answer["known_hosts"] = json!(known_hosts);
         }
         Ok(answer)
     }
@@ -1242,6 +1402,7 @@ mod endpoint {
                         Session::Pg(up) => pg::serve(stream, up).await,
                         Session::Mongo(up) => mongo::serve(stream, up).await,
                         Session::Http(up) => http::serve(stream, up).await,
+                        Session::Ssh(agent) => ssh_agent::serve(stream, agent).await,
                     }
                 };
                 tokio::select! {
@@ -1261,7 +1422,8 @@ mod endpoint {
     /// Tell a client why it is not served, in its engine's wire, and hang
     /// up: a Postgres client is sent a fatal error; a MongoDB client, which
     /// speaks first, has its first message answered; an HTTP client, its
-    /// first request.
+    /// first request. An agent's protocol carries no reason, so (P3-5f-2) an
+    /// SSH agent's client is only hung up on, and its `ssh` moves on.
     async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(engine: Engine, mut stream: S, why: String) {
         let told = async {
             match engine {
@@ -1271,6 +1433,10 @@ mod endpoint {
                     if let Err(e) = http::refuse(&mut stream, &why).await {
                         debug!(%e, "vault: a refused HTTP client was not told why");
                     }
+                    Ok(())
+                }
+                Engine::Ssh => {
+                    debug!(%why, "vault: an SSH agent's client refused");
                     Ok(())
                 }
             }
@@ -1298,6 +1464,8 @@ mod endpoint {
         /// P3-5c-2 — a MongoDB endpoint's socket: a client dials a host that
         /// ends in `.sock` as a socket's path.
         pub(crate) const MONGO_SOCKET: &str = "mongodb-27017.sock";
+        /// P3-5f-2 — an SSH agent's socket, which `SSH_AUTH_SOCK` names.
+        pub(crate) const SSH_SOCKET: &str = "ssh-agent.sock";
 
         /// A bound endpoint: its socket, its directory, and the one uid a
         /// connection is taken from.
@@ -1332,8 +1500,25 @@ mod endpoint {
         }
 
         impl Bound {
-            pub(crate) fn dial(&self, engine: Engine, database: Option<&str>) -> Dial {
+            pub(crate) fn dial(
+                &self,
+                engine: Engine,
+                database: Option<&str>,
+                upstream: &str,
+            ) -> Dial {
                 let mut env = serde_json::Map::new();
+                if engine == Engine::Ssh {
+                    // The session's own `ssh` dials the upstream itself; the
+                    // socket is its agent.
+                    let host = self.socket.to_string_lossy().into_owned();
+                    env.insert("SSH_AUTH_SOCK".into(), json!(host));
+                    return Dial {
+                        host,
+                        port: None,
+                        uri: upstream.to_string(),
+                        env,
+                    };
+                }
                 if engine == Engine::Mongodb {
                     // The socket's whole path, `/` and all, encoded as the host.
                     let host = self.socket.to_string_lossy().into_owned();
@@ -1415,6 +1600,7 @@ mod endpoint {
                 private_dir(&dir)?;
                 let socket = dir.join(match engine {
                     Engine::Mongodb => MONGO_SOCKET.to_string(),
+                    Engine::Ssh => SSH_SOCKET.to_string(),
                     Engine::Postgres | Engine::Http | Engine::Kubernetes => {
                         format!(".s.PGSQL.{PG_PORT}")
                     }
@@ -1598,6 +1784,15 @@ mod endpoint {
                         host,
                         port: Some(port),
                         uri: self.front(),
+                        env,
+                    },
+                    // P3-5f-2 — an agent is never served on a loopback port
+                    // (a socket on Unix, none yet on Windows); answered
+                    // plainly all the same.
+                    Engine::Ssh => Dial {
+                        host,
+                        port: Some(port),
+                        uri: upstream.to_string(),
                         env,
                     },
                     Engine::Mongodb => {

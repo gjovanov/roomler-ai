@@ -16,6 +16,7 @@ use tokio_rustls::rustls::{self, ServerConfig};
 
 use super::pg::{CANCEL_REQUEST, SSL_REQUEST, frame, parse_params, read_message, read_startup};
 use super::scram::server::ScramServer;
+use super::ssh_agent::{LABEL, MAGIC, put_string, put_u32};
 
 /// A message from the client's side: `tag`, then `body`.
 pub(crate) fn message(tag: u8, body: &[u8]) -> Vec<u8> {
@@ -793,4 +794,255 @@ pub(crate) fn stranger() -> String {
         .unwrap()
         .cert
         .pem()
+}
+
+/// P3-5f — SSH strings, one after another (RFC 4251 §5).
+pub(crate) fn strings(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for part in parts {
+        put_string(&mut out, part);
+    }
+    out
+}
+
+/// P3-5f — a PEM block: `raw` under `label`, in lines of 70 as `ssh-keygen`
+/// writes. The armor is made here, so no whole header is ever written out.
+pub(crate) fn armor(label: &str, raw: &[u8]) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+    let mut pem = format!("-----BEGIN {label}-----\n");
+    for line in encoded.as_bytes().chunks(70) {
+        pem.push_str(std::str::from_utf8(line).unwrap());
+        pem.push('\n');
+    }
+    pem.push_str(&format!("-----END {label}-----\n"));
+    pem
+}
+
+/// P3-5f — an OpenSSH private key file, laid out as `PROTOCOL.key` lays one
+/// out, each part one a test may make wrong.
+pub(crate) struct KeyFile {
+    pub(crate) cipher: &'static str,
+    pub(crate) kdf: &'static str,
+    pub(crate) keys: u32,
+    pub(crate) public: Vec<u8>,
+    pub(crate) checks: (u32, u32),
+    pub(crate) private: Vec<u8>,
+    pub(crate) padding: Option<Vec<u8>>,
+}
+
+impl KeyFile {
+    /// A key file as `ssh-keygen` writes one: unencrypted, one key.
+    pub(crate) fn new(public: Vec<u8>, private: Vec<u8>) -> Self {
+        let check = rand::random::<u32>();
+        Self {
+            cipher: "none",
+            kdf: "none",
+            keys: 1,
+            public,
+            checks: (check, check),
+            private,
+            padding: None,
+        }
+    }
+
+    pub(crate) fn pem(&self) -> String {
+        let mut list = Vec::new();
+        put_u32(&mut list, self.checks.0);
+        put_u32(&mut list, self.checks.1);
+        list.extend_from_slice(&self.private);
+        put_string(&mut list, b"made for the test");
+        match &self.padding {
+            Some(padding) => list.extend_from_slice(padding),
+            None => {
+                let mut i = 1u8;
+                while list.len() % 8 != 0 {
+                    list.push(i);
+                    i += 1;
+                }
+            }
+        }
+        let mut body = MAGIC.to_vec();
+        put_string(&mut body, self.cipher.as_bytes());
+        put_string(&mut body, self.kdf.as_bytes());
+        put_string(&mut body, b"");
+        put_u32(&mut body, self.keys);
+        put_string(&mut body, &self.public);
+        put_string(&mut body, &list);
+        armor(LABEL, &body)
+    }
+}
+
+/// P3-5f-2 — an Ed25519 key made for the test, as a secret's `key` holds
+/// one, and its public half as SSH writes it. Unix: its tests serve the
+/// agent on a socket, which Windows does not.
+#[cfg(unix)]
+pub(crate) fn openssh_key() -> (String, Vec<u8>) {
+    use ring::signature::KeyPair as _;
+    let seed: [u8; 32] = rand::random();
+    let pk = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed)
+        .unwrap()
+        .public_key()
+        .as_ref()
+        .to_vec();
+    let public = strings(&[b"ssh-ed25519", &pk]);
+    let private = strings(&[b"ssh-ed25519", &pk, &[&seed[..], &pk[..]].concat()]);
+    (KeyFile::new(public.clone(), private).pem(), public)
+}
+
+/// P3-5f — whether `program` runs here. Under CI it must: a test that
+/// stopped there would pass having proven nothing.
+pub(crate) fn present(program: &str) -> bool {
+    let runs = std::process::Command::new(program)
+        .arg("-?")
+        .output()
+        .is_ok();
+    if !runs {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{program} is not on this CI runner"
+        );
+        eprintln!("{program} is not on this system: the test stops here");
+    }
+    runs
+}
+
+/// P3-5f — an SSH host for the tests (russh): it lets `git` in with one key,
+/// and answers any command with exit status 0.
+#[cfg(all(unix, feature = "ssh-server"))]
+pub(crate) struct Sshd {
+    allowed: russh::keys::ssh_key::PublicKey,
+}
+
+#[cfg(all(unix, feature = "ssh-server"))]
+impl russh::server::Handler for Sshd {
+    type Error = russh::Error;
+
+    // russh calls this once it has checked the sign-in's signature.
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        key: &russh::keys::ssh_key::PublicKey,
+    ) -> Result<russh::server::Auth, Self::Error> {
+        Ok(
+            if user == "git" && key.key_data() == self.allowed.key_data() {
+                russh::server::Auth::Accept
+            } else {
+                russh::server::Auth::reject()
+            },
+        )
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        _channel: russh::Channel<russh::server::Msg>,
+        reply: russh::server::ChannelOpenHandle,
+        _session: &mut russh::server::Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: russh::ChannelId,
+        _data: &[u8],
+        session: &mut russh::server::Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_success(channel)?;
+        session.exit_status_request(channel, 0)?;
+        session.eof(channel)?;
+        session.close(channel)?;
+        Ok(())
+    }
+}
+
+/// P3-5f — serve [`Sshd`] on a loopback port, with `host_key`: the port.
+#[cfg(all(unix, feature = "ssh-server"))]
+pub(crate) async fn sshd(
+    host_key: russh::keys::ssh_key::PrivateKey,
+    allowed: russh::keys::ssh_key::PublicKey,
+) -> u16 {
+    let config = Arc::new(russh::server::Config {
+        keys: vec![host_key],
+        auth_rejection_time: Duration::from_millis(10),
+        auth_rejection_time_initial: Some(Duration::ZERO),
+        ..Default::default()
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (config, allowed) = (config.clone(), allowed.clone());
+            tokio::spawn(async move {
+                if let Ok(session) =
+                    russh::server::run_stream(config, stream, Sshd { allowed }).await
+                {
+                    let _ = session.await;
+                }
+            });
+        }
+    });
+    port
+}
+
+/// P3-5f — OpenSSH's own `ssh` to `git@127.0.0.1:<port>`, `agent` its
+/// agent's socket, checking the host by `known_hosts` alone. `-v`, so its
+/// log says whether it bound the agent.
+#[cfg(all(unix, feature = "ssh-server"))]
+pub(crate) async fn run_ssh(
+    agent: &std::path::Path,
+    port: u16,
+    known_hosts: &std::path::Path,
+) -> std::process::Output {
+    let ssh = tokio::process::Command::new("ssh")
+        .args([
+            "-v",
+            "-F",
+            "/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+        ])
+        .args([
+            "-o",
+            "GlobalKnownHostsFile=/dev/null",
+            "-o",
+            "PreferredAuthentications=publickey",
+        ])
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
+        .arg("-o")
+        .arg(format!("IdentityAgent={}", agent.display()))
+        .args(["-p", &port.to_string(), "git@127.0.0.1", "true"])
+        .env_remove("SSH_AUTH_SOCK")
+        .output();
+    tokio::time::timeout(Duration::from_secs(30), ssh)
+        .await
+        .expect("ssh within 30 s")
+        .unwrap()
+}
+
+/// P3-5f-2 — an SSH host made for the test: its key pair, its key as SSH
+/// writes it, and its line as a secret's `host_keys` names it,
+/// `ssh-ed25519 <base64>`. Unix, as [`openssh_key`].
+#[cfg(unix)]
+pub(crate) fn ssh_host() -> (ring::signature::Ed25519KeyPair, Vec<u8>, String) {
+    use base64::Engine as _;
+    use ring::signature::KeyPair as _;
+    let seed: [u8; 32] = rand::random();
+    let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+    let key = strings(&[b"ssh-ed25519", pair.public_key().as_ref()]);
+    let line = format!(
+        "ssh-ed25519 {}",
+        base64::engine::general_purpose::STANDARD.encode(&key)
+    );
+    (pair, key, line)
+}
+
+/// P3-5f-2 — an SSH host's key line made for the test, its pair let go.
+#[cfg(unix)]
+pub(crate) fn ssh_host_line() -> String {
+    ssh_host().2
 }

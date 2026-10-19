@@ -12,7 +12,7 @@ use ring::signature::{self as sig, KeyPair as _, RsaKeyPair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 use super::*;
-use crate::vault_proxy::testing::made;
+use crate::vault_proxy::testing::{KeyFile, armor, made, present, strings};
 
 const WAIT: Duration = Duration::from_secs(10);
 const HANDLE: &str = "git/deploy";
@@ -25,80 +25,6 @@ fn random<const N: usize>() -> [u8; N] {
 
 fn b64(raw: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(raw)
-}
-
-/// SSH strings, one after another.
-fn strings(parts: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for part in parts {
-        put_string(&mut out, part);
-    }
-    out
-}
-
-/// An OpenSSH private key file, laid out as `PROTOCOL.key` lays one out,
-/// each part one a test may make wrong.
-struct KeyFile {
-    cipher: &'static str,
-    kdf: &'static str,
-    keys: u32,
-    public: Vec<u8>,
-    checks: (u32, u32),
-    private: Vec<u8>,
-    padding: Option<Vec<u8>>,
-}
-
-impl KeyFile {
-    fn new(public: Vec<u8>, private: Vec<u8>) -> Self {
-        let check = u32::from_be_bytes(random::<4>());
-        Self {
-            cipher: "none",
-            kdf: "none",
-            keys: 1,
-            public,
-            checks: (check, check),
-            private,
-            padding: None,
-        }
-    }
-
-    fn pem(&self) -> String {
-        let mut list = Vec::new();
-        put_u32(&mut list, self.checks.0);
-        put_u32(&mut list, self.checks.1);
-        list.extend_from_slice(&self.private);
-        put_string(&mut list, b"made for the test");
-        match &self.padding {
-            Some(padding) => list.extend_from_slice(padding),
-            None => {
-                let mut i = 1u8;
-                while list.len() % 8 != 0 {
-                    list.push(i);
-                    i += 1;
-                }
-            }
-        }
-        let mut body = MAGIC.to_vec();
-        put_string(&mut body, self.cipher.as_bytes());
-        put_string(&mut body, self.kdf.as_bytes());
-        put_string(&mut body, b"");
-        put_u32(&mut body, self.keys);
-        put_string(&mut body, &self.public);
-        put_string(&mut body, &list);
-        armor(LABEL, &body)
-    }
-}
-
-/// A PEM block: `raw` under `label`, in lines of 70 as `ssh-keygen` writes.
-fn armor(label: &str, raw: &[u8]) -> String {
-    let encoded = b64(raw);
-    let mut pem = format!("-----BEGIN {label}-----\n");
-    for line in encoded.as_bytes().chunks(70) {
-        pem.push_str(std::str::from_utf8(line).unwrap());
-        pem.push('\n');
-    }
-    pem.push_str(&format!("-----END {label}-----\n"));
-    pem
 }
 
 /// What a PEM block holds, whatever its label: its lines between the two
@@ -842,23 +768,6 @@ fn the_secrets_host_keys_are_read_strictly() {
     }
 }
 
-/// Whether `program` runs here. Under CI it must: a test that stopped there
-/// would pass having proven nothing.
-fn present(program: &str) -> bool {
-    let runs = std::process::Command::new(program)
-        .arg("-?")
-        .output()
-        .is_ok();
-    if !runs {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "{program} is not on this CI runner"
-        );
-        eprintln!("{program} is not on this system: the test stops here");
-    }
-    runs
-}
-
 /// `ssh-keygen`'s own key in `dir`: its private file and its public line.
 fn keygen(dir: &std::path::Path, name: &str, passphrase: &str, args: &[&str]) -> (String, String) {
     let path = dir.join(name);
@@ -977,85 +886,6 @@ async fn an_rsa_host_is_bound_by_a_sha2_signature() {
     }
 }
 
-/// An SSH host for the test (russh): it lets `git` in with one key, and
-/// answers any command with exit status 0.
-#[cfg(all(unix, feature = "ssh-server"))]
-struct Sshd {
-    allowed: russh::keys::ssh_key::PublicKey,
-}
-
-#[cfg(all(unix, feature = "ssh-server"))]
-impl russh::server::Handler for Sshd {
-    type Error = russh::Error;
-
-    // russh calls this once it has checked the sign-in's signature.
-    async fn auth_publickey(
-        &mut self,
-        user: &str,
-        key: &russh::keys::ssh_key::PublicKey,
-    ) -> Result<russh::server::Auth, Self::Error> {
-        Ok(
-            if user == "git" && key.key_data() == self.allowed.key_data() {
-                russh::server::Auth::Accept
-            } else {
-                russh::server::Auth::reject()
-            },
-        )
-    }
-
-    async fn channel_open_session(
-        &mut self,
-        _channel: russh::Channel<russh::server::Msg>,
-        reply: russh::server::ChannelOpenHandle,
-        _session: &mut russh::server::Session,
-    ) -> Result<(), Self::Error> {
-        reply.accept().await;
-        Ok(())
-    }
-
-    async fn exec_request(
-        &mut self,
-        channel: russh::ChannelId,
-        _data: &[u8],
-        session: &mut russh::server::Session,
-    ) -> Result<(), Self::Error> {
-        session.channel_success(channel)?;
-        session.exit_status_request(channel, 0)?;
-        session.eof(channel)?;
-        session.close(channel)?;
-        Ok(())
-    }
-}
-
-/// Serve [`Sshd`] on a loopback port, with `host_key`: the port.
-#[cfg(all(unix, feature = "ssh-server"))]
-async fn sshd(
-    host_key: russh::keys::ssh_key::PrivateKey,
-    allowed: russh::keys::ssh_key::PublicKey,
-) -> u16 {
-    let config = std::sync::Arc::new(russh::server::Config {
-        keys: vec![host_key],
-        auth_rejection_time: Duration::from_millis(10),
-        auth_rejection_time_initial: Some(Duration::ZERO),
-        ..Default::default()
-    });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let (config, allowed) = (config.clone(), allowed.clone());
-            tokio::spawn(async move {
-                if let Ok(session) =
-                    russh::server::run_stream(config, stream, Sshd { allowed }).await
-                {
-                    let _ = session.await;
-                }
-            });
-        }
-    });
-    port
-}
-
 /// Run OpenSSH's own `ssh` to `git@127.0.0.1:<port>`, its agent `agent`
 /// served on a socket in `dir`, checking the host by `known_hosts` alone.
 #[cfg(all(unix, feature = "ssh-server"))]
@@ -1077,33 +907,7 @@ async fn ssh_through(
             });
         }
     });
-    let ssh = tokio::process::Command::new("ssh")
-        .args([
-            "-v",
-            "-F",
-            "/dev/null",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-        ])
-        .args([
-            "-o",
-            "GlobalKnownHostsFile=/dev/null",
-            "-o",
-            "PreferredAuthentications=publickey",
-        ])
-        .arg("-o")
-        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
-        .arg("-o")
-        .arg(format!("IdentityAgent={}", socket.display()))
-        .args(["-p", &port.to_string(), "git@127.0.0.1", "true"])
-        .env_remove("SSH_AUTH_SOCK")
-        .output();
-    tokio::time::timeout(Duration::from_secs(30), ssh)
-        .await
-        .expect("ssh within 30 s")
-        .unwrap()
+    crate::vault_proxy::testing::run_ssh(&socket, port, known_hosts).await
 }
 
 /// P3-5f-1 — OpenSSH's own `ssh` signs in through the agent. It binds the
@@ -1114,6 +918,7 @@ async fn ssh_through(
 #[cfg(all(unix, feature = "ssh-server"))]
 #[tokio::test]
 async fn openssh_signs_in_through_the_agent_to_a_named_host_only() {
+    use crate::vault_proxy::testing::sshd;
     use russh::keys::ssh_key;
     if !present("ssh") {
         return;
