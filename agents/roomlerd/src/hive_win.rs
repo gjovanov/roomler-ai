@@ -308,6 +308,14 @@ pub(crate) fn pipe_client_sid(pipe: HANDLE) -> Result<String, String> {
             std::io::Error::last_os_error()
         ));
     }
+    process_sid(pid)
+}
+
+/// The SID string of the account a process runs as, by its pid, from its
+/// token. A pid read from elsewhere can name another process by now, if its
+/// own exited: callers compare the account, and refuse any but the one they
+/// serve.
+pub(crate) fn process_sid(pid: u32) -> Result<String, String> {
     // SAFETY: a plain open; closed below.
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if process.is_null() {
@@ -331,6 +339,67 @@ pub(crate) fn pipe_client_sid(pipe: HANDLE) -> Result<String, String> {
     // SAFETY: the handle OpenProcessToken gave us, closed once.
     unsafe { CloseHandle(token) };
     sid
+}
+
+/// FR-90 P3-5b-4 — the pid of the process at the client end of a loopback
+/// TCP connection this daemon accepted: the row of the system's connection
+/// table whose local end is `client` and whose remote end is `server`.
+/// `None` when no row is that connection (its client has gone).
+pub(crate) fn tcp_client_pid(
+    client: std::net::SocketAddrV4,
+    server: std::net::SocketAddrV4,
+) -> Option<u32> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_CONNECTIONS,
+    };
+    const AF_INET: u32 = 2;
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+    // An address as a row holds it (network order, as stored), and a port
+    // (network order, in the low word).
+    let addr = |ip: &std::net::Ipv4Addr| u32::from_ne_bytes(ip.octets());
+    let port = |raw: u32| u16::from_be((raw & 0xffff) as u16);
+    let mut size = 0u32;
+    // The table grows when connections open between the size it reports and
+    // the read: asked again with the room it then says it needs.
+    for _ in 0..4 {
+        let mut buf = vec![0u32; (size as usize).div_ceil(4) + 1];
+        let mut len = (buf.len() * 4) as u32;
+        // SAFETY: `buf` holds `len` bytes, aligned for the rows' u32 fields.
+        let rc = unsafe {
+            GetExtendedTcpTable(
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                0,
+                AF_INET,
+                TCP_TABLE_OWNER_PID_CONNECTIONS,
+                0,
+            )
+        };
+        if rc == ERROR_INSUFFICIENT_BUFFER {
+            size = len;
+            continue;
+        }
+        if rc != 0 {
+            return None;
+        }
+        let room = (buf.len() - 1) * 4 / std::mem::size_of::<MIB_TCPROW_OWNER_PID>();
+        let n = (buf[0] as usize).min(room);
+        // SAFETY: the table is `dwNumEntries` then that many rows, which the
+        // API wrote into `buf`; `n` is bounded by the room `buf` has.
+        let rows = unsafe {
+            std::slice::from_raw_parts(buf.as_ptr().add(1).cast::<MIB_TCPROW_OWNER_PID>(), n)
+        };
+        return rows
+            .iter()
+            .find(|r| {
+                r.dwLocalAddr == addr(client.ip())
+                    && port(r.dwLocalPort) == client.port()
+                    && r.dwRemoteAddr == addr(server.ip())
+                    && port(r.dwRemotePort) == server.port()
+            })
+            .map(|r| r.dwOwningPid);
+    }
+    None
 }
 
 /// FR-97 P4c — who is at the far end of a server pipe instance, by the
@@ -2136,5 +2205,25 @@ mod tests {
             pipe_client_pid(server.as_raw_handle() as _),
             Some(std::process::id())
         );
+    }
+
+    /// P3-5b-4 — a loopback connection this test makes is found in the
+    /// connection table as this process's, and this process's account is
+    /// read from its token; a connection that is not there is no one's.
+    #[test]
+    fn a_loopback_connection_names_the_process_that_made_it() {
+        use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let SocketAddr::V4(server) = listener.local_addr().unwrap() else {
+            panic!("IPv4");
+        };
+        let _client = TcpStream::connect(server).unwrap();
+        let (_accepted, SocketAddr::V4(client)) = listener.accept().unwrap() else {
+            panic!("IPv4");
+        };
+        assert_eq!(tcp_client_pid(client, server), Some(std::process::id()));
+        assert_eq!(process_sid(std::process::id()), own_sid());
+        let nobody = SocketAddrV4::new(*server.ip(), 1);
+        assert_eq!(tcp_client_pid(nobody, server), None);
     }
 }
