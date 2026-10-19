@@ -147,6 +147,11 @@ pub enum StripeError {
     InvalidInterval(String),
     #[error("Invalid currency: {0} (usd or eur)")]
     InvalidCurrency(String),
+    /// FR-115 — the configured Price has no amount in this currency (an EUR
+    /// `currency_options` entry was never added to it). Said plainly rather
+    /// than handed to Stripe, whose error names a currency, not a fix.
+    #[error("This plan is not sold in {0} yet. Choose another currency.")]
+    CurrencyNotOffered(String),
     #[error("Stripe API error: {0}")]
     ApiError(String),
     #[error("Invalid webhook signature")]
@@ -302,6 +307,21 @@ impl StripeService {
             return Err(StripeError::AlreadySubscribed);
         }
 
+        // FR-115 — the Price must carry the currency asked for. The live
+        // Prices of 2026-07-27 were USD only, so an EUR checkout would
+        // otherwise surface as Stripe's own error until their EUR
+        // `currency_options` are added. One read per checkout.
+        let sold_in = self.price_currencies(&price_id).await?;
+        if !sold_in.iter().any(|c| c == p.currency.as_str()) {
+            warn!(
+                price = %price_id, currency = p.currency.as_str(), ?sold_in,
+                "checkout refused: the Price is not sold in this currency"
+            );
+            return Err(StripeError::CurrencyNotOffered(
+                p.currency.as_str().to_ascii_uppercase(),
+            ));
+        }
+
         // Reuse or create Stripe customer
         let customer_id = match tenant.billing.as_ref().and_then(|b| b.customer_id.clone()) {
             Some(cid) => cid,
@@ -380,6 +400,29 @@ impl StripeService {
             "checkout session created"
         );
         Ok(CheckoutResponse { url })
+    }
+
+    /// FR-115 — the currencies a Price is sold in: its own currency plus
+    /// every `currency_options` key, lower-case.
+    pub async fn price_currencies(&self, price_id: &str) -> Result<Vec<String>, StripeError> {
+        let price = self
+            .get_json(&format!(
+                "/v1/prices/{price_id}?expand%5B%5D=currency_options"
+            ))
+            .await?;
+        let mut out: Vec<String> = Vec::new();
+        if let Some(c) = price["currency"].as_str() {
+            out.push(c.to_ascii_lowercase());
+        }
+        if let Some(opts) = price["currency_options"].as_object() {
+            for k in opts.keys() {
+                let k = k.to_ascii_lowercase();
+                if !out.contains(&k) {
+                    out.push(k);
+                }
+            }
+        }
+        Ok(out)
     }
 
     // ---- Plan change (FR-115) ---------------------------------------------

@@ -402,7 +402,8 @@ fn stripe_err(e: roomler_ai_services::stripe::StripeError) -> ApiError {
         e @ StripeError::AlreadySubscribed => ApiError::Conflict(e.to_string()),
         e @ (StripeError::NotSubscribed
         | StripeError::InvalidInterval(_)
-        | StripeError::InvalidCurrency(_)) => ApiError::BadRequest(e.to_string()),
+        | StripeError::InvalidCurrency(_)
+        | StripeError::CurrencyNotOffered(_)) => ApiError::BadRequest(e.to_string()),
         StripeError::ApiError(msg) => ApiError::Internal(format!("Stripe API error: {msg}")),
         StripeError::Mongo(e) => ApiError::Internal(e.to_string()),
         StripeError::Storage(msg) => ApiError::Internal(msg),

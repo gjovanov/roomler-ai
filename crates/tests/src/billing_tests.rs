@@ -1035,6 +1035,9 @@ mod fr115 {
         calls: Arc<Mutex<Vec<Call>>>,
         /// The subscription's item: (price, quantity).
         item: Arc<Mutex<(String, u32)>>,
+        /// FR-115 — the currencies every Price is sold in; `None` = USD and
+        /// EUR, the shape the live Prices take once their EUR option exists.
+        currencies: Arc<Mutex<Option<Vec<String>>>>,
     }
 
     impl Fake {
@@ -1062,6 +1065,26 @@ mod fr115 {
     /// A Stripe that answers the calls FR-115 makes and records each one.
     async fn fake_stripe(fake: Fake) -> String {
         let app = Router::new()
+            .route(
+                "/v1/prices/{id}",
+                get(|State(f): State<Fake>, Path(id): Path<String>| async move {
+                    f.record("GET", format!("/v1/prices/{id}"), vec![]);
+                    let currencies = f
+                        .currencies
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| vec!["usd".into(), "eur".into()]);
+                    let options: serde_json::Map<String, serde_json::Value> = currencies
+                        .iter()
+                        .map(|c| (c.clone(), serde_json::json!({ "unit_amount": 800 })))
+                        .collect();
+                    axum::Json(serde_json::json!({
+                        "id": id, "object": "price", "currency": currencies[0],
+                        "currency_options": options,
+                    }))
+                }),
+            )
             .route(
                 "/v1/customers",
                 post(|State(f): State<Fake>, Form(form): Form<Vec<(String, String)>>| async move {
@@ -1291,6 +1314,43 @@ mod fr115 {
         assert_eq!(resp.status().as_u16(), 503);
         assert!(resp.text().await.unwrap().contains("annual"));
         assert!(fake.calls().is_empty(), "nothing may reach Stripe");
+    }
+
+    /// The live Prices of 2026-07-27 are USD only: until their EUR option
+    /// is added, an EUR checkout is refused in words a person can act on,
+    /// before any customer or session is created.
+    #[tokio::test]
+    async fn a_currency_the_price_does_not_carry_is_refused_plainly() {
+        let fake = Fake::default();
+        *fake.currencies.lock().unwrap() = Some(vec!["usd".into()]);
+        let base = fake_stripe(fake.clone()).await;
+        let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+        let t = app.seed_tenant("fr115-usd-only").await;
+
+        let resp = checkout(
+            &app,
+            &t,
+            serde_json::json!({ "plan": "pro", "currency": "eur" }),
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 400);
+        let body = resp.text().await.unwrap_or_default();
+        assert!(body.contains("not sold in EUR"), "got: {body}");
+        assert!(
+            fake.calls()
+                .iter()
+                .all(|c| c.path != "/v1/checkout/sessions" && c.path != "/v1/customers"),
+            "nothing may be created for a currency the Price does not carry"
+        );
+
+        // USD still works.
+        let resp = checkout(
+            &app,
+            &t,
+            serde_json::json!({ "plan": "pro", "currency": "usd" }),
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 200);
     }
 
     /// The double-billing bug: "Switch to Business" used to run a second
