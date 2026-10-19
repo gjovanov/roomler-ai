@@ -3037,6 +3037,19 @@ where
                             .into(),
                     }
                 }
+                // FR-100 P1c — and whether this device checks the browsers that
+                // connect to it: switching the check off weakens the console
+                // person's own remote access, and the pipe admits RDP guests
+                // and non-admins too. Equality.
+                Ok(Request::ConfigSet { key, .. })
+                    if key == "peer_auth" && !peer.is_console_user() =>
+                {
+                    Response::Error {
+                        message: "only the person at this device's console can change \
+                              whether this device checks the browsers that connect to it"
+                            .into(),
+                    }
+                }
                 // FR-101 P2b — and what a remote session may take from this
                 // console: its clipboard, its files, its audio. Equality.
                 Ok(Request::ConfigSet { key, .. })
@@ -7372,6 +7385,42 @@ mod tests {
             let r = ask(
                 me,
                 r#"{"t":"config_set","d":{"key":"display_match","value":"never"}}"#,
+            )
+            .await;
+            assert!(!is_console_refusal(&r), "{r:?}");
+        }
+    }
+
+    /// FR-100 P1c — whether this device checks the browsers that connect to it
+    /// is the console person's call: an unidentified peer is refused, set AND
+    /// clear, on the exact key only.
+    #[tokio::test]
+    async fn only_the_console_user_decides_peer_auth() {
+        for line in [
+            r#"{"t":"config_set","d":{"key":"peer_auth","value":"off"}}"#,
+            r#"{"t":"config_set","d":{"key":"peer_auth"}}"#,
+        ] {
+            let r = ask(ClientPeer::UNKNOWN, line).await;
+            assert!(
+                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("browsers")),
+                "{line} → {r:?}"
+            );
+        }
+        let r = ask(
+            ClientPeer::UNKNOWN,
+            r#"{"t":"config_set","d":{"key":"peer_auth_x","value":"off"}}"#,
+        )
+        .await;
+        assert!(!is_console_refusal(&r), "{r:?}");
+        let me = ClientPeer {
+            session_id: console_session_id(),
+            uid: own_uid(),
+            system_account: None,
+        };
+        if me.is_console_user() {
+            let r = ask(
+                me,
+                r#"{"t":"config_set","d":{"key":"peer_auth","value":"audit"}}"#,
             )
             .await;
             assert!(!is_console_refusal(&r), "{r:?}");

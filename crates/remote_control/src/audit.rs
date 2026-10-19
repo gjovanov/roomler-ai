@@ -152,7 +152,7 @@ async fn project_session(sessions: &Collection<RemoteSession>, ev: &RemoteAuditE
                 .map(|_| ())
         }
         AuditKind::ConsentGranted => set_phase(sessions, ev, SessionPhase::Negotiating).await,
-        AuditKind::SessionStarted => sessions
+        AuditKind::SessionStarted { .. } => sessions
             .update_one(
                 doc! { "_id": ev.session_id },
                 doc! { "$set": {
