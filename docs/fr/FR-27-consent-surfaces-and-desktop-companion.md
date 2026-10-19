@@ -613,7 +613,7 @@ The floor run, verbatim from the daemon (UTC; hostname prefix stripped):
 
 The attribution is in the two windows. The device's own mode is `Prompt {
 timeout: 30s }` (line 1 prints `consent_broker.mode()`,
-`agents/roomlerd/src/signaling.rs:2392`), yet the prompt stood for **300 s** —
+`agents/roomlerd/src/signaling.rs:2393`), yet the prompt stood for **300 s** —
 the server's window — which is exactly the shape `strictest_of`
 (`agents/roomlerd/src/consent.rs:136`) produces when it downgrades an `auto`
 directive: `Prompt { timeout: host_window }` (`signaling.rs:2397`). The control

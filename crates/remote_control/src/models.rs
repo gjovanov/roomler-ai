@@ -5941,7 +5941,21 @@ pub enum AuditKind {
     ConsentGranted,
     ConsentDenied,
     ConsentTimedOut,
-    SessionStarted,
+    /// The answer reached the controller: the session is live.
+    SessionStarted {
+        /// FR-100 P1c — what the device concluded about the browser that
+        /// offered the session, as its answer said (one of
+        /// `signaling::PEER_AUTH_VERDICTS`; anything else is not recorded).
+        /// `None` from a device without it or with `peer_auth = off`, and on
+        /// every row written before it.
+        ///
+        /// ⚠️ A field, never a new variant, so a pod on an older build reads
+        /// the row mid-rollout: with no field this serialises exactly as the
+        /// unit variant it replaced, and an older pod's unit variant skips the
+        /// field it does not know. Both directions are locked by tests.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_auth: Option<String>,
+    },
     SessionEnded {
         reason: EndReason,
         /// FR-101 P4b — which limit ended it, when one did: `max_duration`
@@ -7190,6 +7204,44 @@ mod tests {
         assert!(
             !serde_json::to_string(&back).unwrap().contains("external_"),
             "an external_* key survived a decode/encode round trip"
+        );
+    }
+
+    /// FR-100 P1c: **no `peer_auth*` key may ever be server-pushable.**
+    ///
+    /// `peer_auth` is how a device checks the browser that offers it a
+    /// session, and that check exists to hold when the server does not. A
+    /// server that could push `peer_auth = off` would switch it off on every
+    /// device in the tenant, which is exactly the hostile-server case FR-100
+    /// is built against. Prefix, not name, and the literal spelled out in
+    /// full, for the reasons the `external_*` test above gives.
+    #[test]
+    fn no_peer_auth_key_is_server_pushable_via_desired_config() {
+        let full = DesiredConfig {
+            exec_enabled: Some(true),
+            ssh_enabled: Some(true),
+            ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA".into()]),
+            ssh_account_mode: Some("console_user".into()),
+            ssh_port: Some(2222),
+            encoder_cells_deny: Some("none".into()),
+            revision: 7,
+            updated_by: None,
+            updated_at: None,
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert!(
+            !json.contains("peer_auth"),
+            "a peer_auth* key reached DesiredConfig -- a server able to switch \
+             off the device's check of the browsers connecting to it: {json}"
+        );
+        let back: DesiredConfig = serde_json::from_str(
+            r#"{"exec_enabled":true,"peer_auth":"off","peer_auth_pins":"reset","revision":1}"#,
+        )
+        .expect("unknown keys must be ignored, not fail the frame");
+        assert_eq!(back.exec_enabled, Some(true));
+        assert!(
+            !serde_json::to_string(&back).unwrap().contains("peer_auth"),
+            "a peer_auth* key survived a decode/encode round trip"
         );
     }
 
@@ -8943,6 +8995,61 @@ mod tests {
             | AuditKind::PermissionsChanged { permissions } => *permissions,
             other => panic!("not a permissions-carrying event: {other:?}"),
         }
+    }
+
+    /// FR-100 P1c — `SessionStarted` became a struct variant with one optional
+    /// field, and a rollout runs old and new pods side by side over the same
+    /// rows. Both directions, through the driver's own pair
+    /// (`to_raw_document_buf` / `from_slice`):
+    /// - a row written before the field reads as `SessionStarted { peer_auth:
+    ///   None }`, and a new row with no verdict is byte-identical to it;
+    /// - an OLDER pod, whose `SessionStarted` is still a unit variant, reads a
+    ///   new row carrying a verdict: an internally tagged unit variant skips a
+    ///   field it does not know.
+    #[test]
+    fn session_started_reads_both_ways_across_the_verdict_field() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum OlderKind {
+            SessionStarted,
+        }
+        #[derive(Deserialize)]
+        struct OlderRow {
+            event: OlderKind,
+        }
+
+        let old_shape = bson::doc! { "kind": "session_started" };
+        let read: AuditKind = bson::from_document(old_shape.clone()).unwrap();
+        assert!(
+            matches!(read, AuditKind::SessionStarted { peer_auth: None }),
+            "{read:?}"
+        );
+        assert_eq!(
+            bson::to_document(&AuditKind::SessionStarted { peer_auth: None }).unwrap(),
+            old_shape,
+            "no verdict writes exactly the row an older pod wrote"
+        );
+
+        let new_row = audit_row(AuditKind::SessionStarted {
+            peer_auth: Some("verified".into()),
+        });
+        let raw = bson::to_raw_document_buf(&new_row).unwrap();
+        assert_eq!(
+            raw.get_document("event")
+                .unwrap()
+                .get_str("peer_auth")
+                .unwrap(),
+            "verified"
+        );
+        let older: OlderRow =
+            bson::from_slice(raw.as_bytes()).expect("an older pod reads a new row");
+        assert_eq!(older.event, OlderKind::SessionStarted);
+        let back: RemoteAuditEvent = bson::from_slice(raw.as_bytes()).unwrap();
+        assert!(
+            matches!(&back.event, AuditKind::SessionStarted { peer_auth: Some(v) } if v == "verified"),
+            "{:?}",
+            back.event
+        );
     }
 
     /// `AuditSink::flush` → `insert_many` → `bson::to_raw_document_buf`; the

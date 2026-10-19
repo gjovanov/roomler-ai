@@ -104,6 +104,10 @@ struct Pending {
     user_id: bson::oid::ObjectId,
     /// `(offer fingerprint, nonce)` while an offer that asked is unanswered.
     asked: Option<(String, String)>,
+    /// FR-100 P1c — what the device concluded about the browser that made the
+    /// current offer, until its answer reports it. `None` before the offer is
+    /// judged, and under `peer_auth = off`.
+    verdict: Option<Verdict>,
     noted_at: std::time::Instant,
     seq: u64,
 }
@@ -139,6 +143,7 @@ impl PendingOffers {
             Pending {
                 user_id,
                 asked: None,
+                verdict: None,
                 noted_at: now,
                 seq,
             },
@@ -166,6 +171,8 @@ impl PendingOffers {
             return;
         };
         pending.asked = None;
+        // A verdict belongs to one offer: a re-offer is judged afresh.
+        pending.verdict = None;
         let Some(ask) = ask else {
             return;
         };
@@ -201,6 +208,45 @@ impl PendingOffers {
             offer_fingerprint,
             nonce,
         })
+    }
+
+    /// FR-100 P1c — judge the browser behind `session_id`'s offer under
+    /// `check`, and keep the verdict for the answer to report. Only for an
+    /// in-org session this daemon noted at its request (an outsider's is
+    /// judged by FR-52's MAC, at the answer). `None` under `peer_auth = off`.
+    ///
+    /// Called right after [`Self::note_offer`], in the daemon and ahead of
+    /// any delegation, for the reason `note_offer` is.
+    pub fn judge_offer(
+        &self,
+        session_id: bson::oid::ObjectId,
+        offer_sdp: &str,
+        ask: Option<&roomler_ai_remote_control::signaling::PeerAuthOffer>,
+        check: &OfferCheck<'_>,
+    ) -> Option<Verdict> {
+        let user_id = {
+            let table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+            table.sessions.get(&session_id)?.user_id
+        };
+        let verdict = match check.policy {
+            PeerAuthPolicy::Off => None,
+            PeerAuthPolicy::Audit => Some(judge(session_id, user_id, offer_sdp, ask, check)),
+        };
+        if let Some(v) = verdict {
+            tracing::info!(%session_id, verdict = v.wire(), "peer-auth: the browser behind this offer");
+        }
+        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pending) = table.sessions.get_mut(&session_id) {
+            pending.verdict = verdict;
+        }
+        verdict
+    }
+
+    /// FR-100 P1c — the verdict on `session_id`'s current offer, consumed: one
+    /// report per offer, as one signature per offer.
+    fn take_verdict(&self, session_id: bson::oid::ObjectId) -> Option<Verdict> {
+        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        table.sessions.get_mut(&session_id)?.verdict.take()
     }
 }
 
@@ -282,22 +328,279 @@ fn signed_answer(
 /// answers this process did not build itself (a GUI worker's, relayed up by
 /// the delegation host). Whatever the worker put in `peer_auth` is not the
 /// daemon's to vouch for, so it is replaced by the daemon's own signature, or
-/// by none.
+/// by none. FR-100 P1c — the same for `peer_auth_verdict`: the daemon judged
+/// the offer before delegating it, and a worker holds no pins to judge with.
+/// Run after FR-52's sealing, which is what marks an outsider's answer.
 pub fn sign_outbound(
     offers: &PendingOffers,
     config_path: &Path,
     tenant_id: &str,
     agent_id: &str,
+    policy: PeerAuthPolicy,
     msg: &mut roomler_ai_remote_control::signaling::ClientMsg,
 ) {
     if let roomler_ai_remote_control::signaling::ClientMsg::SdpAnswer {
         session_id,
         sdp,
+        extauth_mac,
         peer_auth,
-        ..
+        peer_auth_verdict,
     } = msg
     {
         *peer_auth = sign_answer(offers, config_path, tenant_id, agent_id, *session_id, sdp);
+        *peer_auth_verdict = answer_verdict(offers, policy, *session_id, extauth_mac.is_some());
+    }
+}
+
+/// FR-100 P1c — the verdict `session_id`'s answer reports, as the wire spells
+/// it. An outsider's session (its answer sealed under FR-52's login key) is
+/// `verified`: FR-52 admitted it on a MAC the device checked, and refused it
+/// otherwise. An in-org session reports what [`PendingOffers::judge_offer`]
+/// found. Nothing under `peer_auth = off`.
+pub fn answer_verdict(
+    offers: &PendingOffers,
+    policy: PeerAuthPolicy,
+    session_id: bson::oid::ObjectId,
+    external: bool,
+) -> Option<String> {
+    if policy == PeerAuthPolicy::Off {
+        return None;
+    }
+    let verdict = if external {
+        Some(Verdict::Verified)
+    } else {
+        offers.take_verdict(session_id)
+    };
+    verdict.map(|v| v.wire().to_string())
+}
+
+// ─── FR-100 P1c — the device checks the browser ─────────────────────────────
+
+pub use crate::config::PeerAuthPolicy;
+
+/// FR-100 P1c — what the device concluded about the browser that offered a
+/// session. The words the answer carries are
+/// [`roomler_ai_remote_control::signaling::PEER_AUTH_VERDICTS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// The offer carried no browser signature.
+    Absent,
+    /// A signature that verifies, by a key not yet seen for this user. Under
+    /// `audit` it is now remembered, so the user's next session from that
+    /// browser reads `Verified`.
+    Unknown,
+    /// A signature that verifies, by a key remembered for this user; or an
+    /// outsider admitted by FR-52's MAC.
+    Verified,
+    /// A signature that does not verify over this session, or an offer that
+    /// names no single certificate for one to cover.
+    Mismatch,
+}
+
+impl Verdict {
+    /// The word on the wire and in the audit.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Verdict::Absent => "absent",
+            Verdict::Unknown => "unknown",
+            Verdict::Verified => "verified",
+            Verdict::Mismatch => "mismatch",
+        }
+    }
+}
+
+/// FR-100 P1c — what judging an offer needs beyond the offer: the device's
+/// policy at that moment, and the enrollment whose pins it reads.
+pub struct OfferCheck<'a> {
+    pub policy: PeerAuthPolicy,
+    pub config_path: &'a Path,
+    pub tenant_id: &'a str,
+    pub agent_id: &'a str,
+}
+
+/// The verdict on one offer: verify the browser's signature over the
+/// transcript (role `offer`, an EMPTY answer fingerprint), then look its key
+/// up among the keys this enrollment has seen for the user, remembering it if
+/// new. A key that cannot be remembered still reads `Unknown`: the signature
+/// held, but nothing vouches for the key yet.
+fn judge(
+    session_id: bson::oid::ObjectId,
+    user_id: bson::oid::ObjectId,
+    offer_sdp: &str,
+    ask: Option<&roomler_ai_remote_control::signaling::PeerAuthOffer>,
+    check: &OfferCheck<'_>,
+) -> Verdict {
+    use roomler_ai_remote_control::signaling::{
+        peer_auth_nonce_is_well_formed, peer_auth_transcript, peer_auth_verify,
+        sdp_dtls_fingerprint,
+    };
+    let Some((key, sig, nonce)) =
+        ask.and_then(|a| Some((a.key.as_deref()?, a.sig.as_deref()?, a.nonce.as_str())))
+    else {
+        return Verdict::Absent;
+    };
+    if !peer_auth_nonce_is_well_formed(nonce) {
+        return Verdict::Mismatch;
+    }
+    let Ok(offer_fingerprint) = sdp_dtls_fingerprint(offer_sdp) else {
+        return Verdict::Mismatch;
+    };
+    let Some(transcript) = peer_auth_transcript(
+        "offer",
+        &session_id.to_hex(),
+        check.agent_id,
+        &user_id.to_hex(),
+        &offer_fingerprint,
+        "",
+        nonce,
+    ) else {
+        return Verdict::Mismatch;
+    };
+    if !peer_auth_verify(key, &transcript, sig) {
+        return Verdict::Mismatch;
+    }
+    match remember(check.config_path, check.tenant_id, user_id, key) {
+        Ok(true) => Verdict::Verified,
+        Ok(false) => Verdict::Unknown,
+        Err(why) => {
+            tracing::warn!(%session_id, %why, "peer-auth: a browser key that cannot be remembered");
+            Verdict::Unknown
+        }
+    }
+}
+
+/// FR-100 P1c — the browser keys this enrollment has seen, per user: what
+/// `audit` remembers on first sight, so that `enforce` (P3) asks only about a
+/// browser the device has never met. Public keys only; what matters is that
+/// the file is the device's own memory, so it lives beside the device key, in
+/// the same directory and with the same protections.
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct PinFile {
+    version: u32,
+    /// The user's id (lowercase hex) → the keys seen for that user, oldest
+    /// first.
+    users: std::collections::BTreeMap<String, Vec<PinnedKey>>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PinnedKey {
+    /// As the offer carried it: the device key's shape, standard base64 of the
+    /// 65-byte point.
+    key: String,
+    /// When the device first saw it, RFC 3339.
+    first_seen: String,
+}
+
+/// A person with more browsers than this loses the oldest one's pin first.
+const MAX_KEYS_PER_USER: usize = 16;
+/// The file stays small on a device a whole org connects to: past this, the
+/// user whose newest key is oldest is forgotten first.
+const MAX_USERS: usize = 256;
+
+/// Where `tenant_id`'s pins live: `<config dir>/peer-auth/<tenant id>.controllers.json`,
+/// beside its key and under the same naming rule.
+fn pins_path(config_path: &Path, tenant_id: &str) -> Result<PathBuf, String> {
+    let key = key_path(config_path, tenant_id)?;
+    Ok(key.with_file_name(format!(
+        "{}.controllers.json",
+        tenant_id.to_ascii_lowercase()
+    )))
+}
+
+/// Has `user_id` offered with `key` before, on this enrollment? Remembered now
+/// if not (`Ok(false)`). Read once per process and kept in memory; a new key
+/// is written through, whole or not at all, BEFORE it counts as remembered.
+fn remember(
+    config_path: &Path,
+    tenant_id: &str,
+    user_id: bson::oid::ObjectId,
+    key: &str,
+) -> Result<bool, String> {
+    static PINS: OnceLock<Mutex<HashMap<PathBuf, PinFile>>> = OnceLock::new();
+    let path = pins_path(config_path, tenant_id)?;
+    let mut all = PINS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let file = match all.entry(path.clone()) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => e.insert(load_pins(&path)?),
+    };
+    let user = user_id.to_hex();
+    if file
+        .users
+        .get(&user)
+        .is_some_and(|keys| keys.iter().any(|k| k.key == key))
+    {
+        return Ok(true);
+    }
+    let mut next = file.clone();
+    next.version = VERSION;
+    let keys = next.users.entry(user).or_default();
+    keys.push(PinnedKey {
+        key: key.to_string(),
+        first_seen: bson::DateTime::now()
+            .try_to_rfc3339_string()
+            .unwrap_or_default(),
+    });
+    if keys.len() > MAX_KEYS_PER_USER {
+        let excess = keys.len() - MAX_KEYS_PER_USER;
+        keys.drain(..excess);
+    }
+    while next.users.len() > MAX_USERS {
+        let Some(stalest) = next
+            .users
+            .iter()
+            .min_by(|a, b| newest(a.1).cmp(newest(b.1)))
+            .map(|(u, _)| u.clone())
+        else {
+            break;
+        };
+        next.users.remove(&stalest);
+    }
+    let bytes = serde_json::to_vec_pretty(&next).map_err(|e| e.to_string())?;
+    write_private(&path, &bytes)?;
+    *file = next;
+    Ok(false)
+}
+
+/// The newest `first_seen` among `keys`: RFC 3339 in UTC sorts as text.
+fn newest(keys: &[PinnedKey]) -> &str {
+    keys.iter()
+        .map(|k| k.first_seen.as_str())
+        .max()
+        .unwrap_or("")
+}
+
+/// The pins at `path`. None yet is an empty set. A file that is not a pin
+/// file starts over (it is only ever a cache of first sightings, and the
+/// verdicts say so as `unknown` again); a NEWER version is left alone, and
+/// nothing is remembered on top of it.
+fn load_pins(path: &Path) -> Result<PinFile, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            #[derive(Deserialize)]
+            struct Header {
+                version: u32,
+            }
+            match serde_json::from_slice::<Header>(&bytes) {
+                Ok(h) if h.version != VERSION => Err(format!(
+                    "{} is a pin file this build does not read (version {}); left alone",
+                    path.display(),
+                    h.version
+                )),
+                Ok(_) => serde_json::from_slice(&bytes).or_else(|e| {
+                    tracing::warn!(path = %path.display(), %e, "peer-auth: the browser-key file is unreadable; starting it over");
+                    Ok(PinFile::default())
+                }),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), %e, "peer-auth: the browser-key file is unreadable; starting it over");
+                    Ok(PinFile::default())
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PinFile::default()),
+        Err(e) => Err(format!("reading {}: {e}", path.display())),
     }
 }
 
@@ -654,7 +957,11 @@ mod tests {
     }
 
     fn ask() -> PeerAuthOffer {
-        PeerAuthOffer { nonce: nonce() }
+        PeerAuthOffer {
+            nonce: nonce(),
+            key: None,
+            sig: None,
+        }
     }
 
     /// The transcript the browser would rebuild for this session's answer.
@@ -717,6 +1024,8 @@ mod tests {
         assert!(sign(&offers, session).is_none(), "the offer did not ask");
         let bad = PeerAuthOffer {
             nonce: "too-short".into(),
+            key: None,
+            sig: None,
         };
         offers.note_offer(session, OFFER_SDP, Some(&bad));
         assert!(
@@ -787,10 +1096,20 @@ mod tests {
             sdp: ANSWER_SDP.into(),
             extauth_mac: None,
             peer_auth: forged(),
+            // FR-100 P1c — a worker's verdict is not the daemon's either.
+            peer_auth_verdict: Some("verified".into()),
         };
-        sign_outbound(&offers, &cfg, TENANT_A, AGENT, &mut msg);
+        sign_outbound(
+            &offers,
+            &cfg,
+            TENANT_A,
+            AGENT,
+            PeerAuthPolicy::Audit,
+            &mut msg,
+        );
         let ClientMsg::SdpAnswer {
             peer_auth: Some(signed),
+            peer_auth_verdict,
             ..
         } = msg
         else {
@@ -801,6 +1120,10 @@ mod tests {
             &transcript_for(session, user),
             &signed.sig
         ));
+        assert_eq!(
+            peer_auth_verdict, None,
+            "the daemon judged nothing here, so it reports nothing"
+        );
 
         // Nothing noted for this one: the worker's claim is dropped, not kept.
         let mut msg = ClientMsg::SdpAnswer {
@@ -808,12 +1131,21 @@ mod tests {
             sdp: ANSWER_SDP.into(),
             extauth_mac: None,
             peer_auth: forged(),
+            peer_auth_verdict: Some("verified".into()),
         };
-        sign_outbound(&offers, &cfg, TENANT_A, AGENT, &mut msg);
+        sign_outbound(
+            &offers,
+            &cfg,
+            TENANT_A,
+            AGENT,
+            PeerAuthPolicy::Audit,
+            &mut msg,
+        );
         assert!(matches!(
             msg,
             ClientMsg::SdpAnswer {
                 peer_auth: None,
+                peer_auth_verdict: None,
                 ..
             }
         ));
@@ -841,6 +1173,362 @@ mod tests {
             )
             .is_none(),
             "the oldest session was forgotten"
+        );
+    }
+
+    // ─── P1c — the device checks the browser ────────────────────────────
+
+    /// A browser: a P-256 key the test holds, its public half as an offer
+    /// carries it. Made fresh, never a literal.
+    struct Browser {
+        pair: EcdsaKeyPair,
+        key: String,
+    }
+
+    fn browser() -> Browser {
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let key = STANDARD.encode(pair.public_key().as_ref());
+        Browser { pair, key }
+    }
+
+    /// `browser`'s offer for this session and user, signed over the
+    /// transcript with role `offer` and an EMPTY answer fingerprint.
+    fn signed_offer(browser: &Browser, session: ObjectId, user: ObjectId) -> PeerAuthOffer {
+        let transcript = peer_auth_transcript(
+            "offer",
+            &session.to_hex(),
+            AGENT,
+            &user.to_hex(),
+            "sha-256 AA:BB:CC",
+            "",
+            &nonce(),
+        )
+        .unwrap();
+        let sig = browser
+            .pair
+            .sign(&SystemRandom::new(), &transcript)
+            .unwrap();
+        PeerAuthOffer {
+            nonce: nonce(),
+            key: Some(browser.key.clone()),
+            sig: Some(base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                sig.as_ref(),
+            )),
+        }
+    }
+
+    fn check<'a>(cfg: &'a Path, policy: PeerAuthPolicy) -> OfferCheck<'a> {
+        OfferCheck {
+            policy,
+            config_path: cfg,
+            tenant_id: TENANT_A,
+            agent_id: AGENT,
+        }
+    }
+
+    /// One in-org offer, noted and judged as the daemon does it.
+    fn judged(
+        offers: &PendingOffers,
+        cfg: &Path,
+        policy: PeerAuthPolicy,
+        session: ObjectId,
+        user: ObjectId,
+        ask: &PeerAuthOffer,
+    ) -> Option<Verdict> {
+        offers.note_request(session, user);
+        offers.note_offer(session, OFFER_SDP, Some(ask));
+        offers.judge_offer(session, OFFER_SDP, Some(ask), &check(cfg, policy))
+    }
+
+    #[test]
+    fn an_offer_nobody_signed_reads_absent_and_is_reported_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let offers = PendingOffers::default();
+        let session = ObjectId::new();
+        let verdict = judged(
+            &offers,
+            &config_in(&dir),
+            PeerAuthPolicy::Audit,
+            session,
+            ObjectId::new(),
+            &ask(),
+        );
+        assert_eq!(verdict, Some(Verdict::Absent));
+        assert_eq!(
+            answer_verdict(&offers, PeerAuthPolicy::Audit, session, false).as_deref(),
+            Some("absent")
+        );
+        assert_eq!(
+            answer_verdict(&offers, PeerAuthPolicy::Audit, session, false),
+            None,
+            "one report per offer"
+        );
+        // An offer that did not even ask is judged too: nobody signed it.
+        let other = ObjectId::new();
+        offers.note_request(other, ObjectId::new());
+        offers.note_offer(other, OFFER_SDP, None);
+        assert_eq!(
+            offers.judge_offer(
+                other,
+                OFFER_SDP,
+                None,
+                &check(&config_in(&dir), PeerAuthPolicy::Audit)
+            ),
+            Some(Verdict::Absent)
+        );
+    }
+
+    /// Trust on first use, per user: a browser's first offer is `unknown` and
+    /// remembered; its next is `verified`; the same key for ANOTHER user is
+    /// that user's first sighting.
+    #[test]
+    fn a_browser_is_unknown_once_then_verified_per_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_in(&dir);
+        let offers = PendingOffers::default();
+        let chrome = browser();
+        let user = ObjectId::new();
+        let first = ObjectId::new();
+        let ask = signed_offer(&chrome, first, user);
+        assert_eq!(
+            judged(&offers, &cfg, PeerAuthPolicy::Audit, first, user, &ask),
+            Some(Verdict::Unknown)
+        );
+        assert!(
+            pins_path(&cfg, TENANT_A).unwrap().exists(),
+            "remembered on disk"
+        );
+        let second = ObjectId::new();
+        let ask = signed_offer(&chrome, second, user);
+        assert_eq!(
+            judged(&offers, &cfg, PeerAuthPolicy::Audit, second, user, &ask),
+            Some(Verdict::Verified)
+        );
+        let someone_else = ObjectId::new();
+        let third = ObjectId::new();
+        let ask = signed_offer(&chrome, third, someone_else);
+        assert_eq!(
+            judged(
+                &offers,
+                &cfg,
+                PeerAuthPolicy::Audit,
+                third,
+                someone_else,
+                &ask
+            ),
+            Some(Verdict::Unknown)
+        );
+    }
+
+    /// A signature that does not cover THIS session is a mismatch, whatever
+    /// it would verify over: another session, another user, a nonce that is
+    /// not a nonce. So is an offer that names no single certificate.
+    #[test]
+    fn a_signature_over_anything_else_is_a_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_in(&dir);
+        let offers = PendingOffers::default();
+        let chrome = browser();
+        let user = ObjectId::new();
+
+        let session = ObjectId::new();
+        let for_another_session = signed_offer(&chrome, ObjectId::new(), user);
+        assert_eq!(
+            judged(
+                &offers,
+                &cfg,
+                PeerAuthPolicy::Audit,
+                session,
+                user,
+                &for_another_session
+            ),
+            Some(Verdict::Mismatch)
+        );
+
+        let session = ObjectId::new();
+        let for_another_user = signed_offer(&chrome, session, ObjectId::new());
+        assert_eq!(
+            judged(
+                &offers,
+                &cfg,
+                PeerAuthPolicy::Audit,
+                session,
+                user,
+                &for_another_user
+            ),
+            Some(Verdict::Mismatch)
+        );
+
+        let session = ObjectId::new();
+        let mut bad_nonce = signed_offer(&chrome, session, user);
+        bad_nonce.nonce = "too-short".into();
+        assert_eq!(
+            judged(
+                &offers,
+                &cfg,
+                PeerAuthPolicy::Audit,
+                session,
+                user,
+                &bad_nonce
+            ),
+            Some(Verdict::Mismatch)
+        );
+
+        let session = ObjectId::new();
+        let ask = signed_offer(&chrome, session, user);
+        offers.note_request(session, user);
+        offers.note_offer(session, "v=0\r\n", Some(&ask));
+        assert_eq!(
+            offers.judge_offer(
+                session,
+                "v=0\r\n",
+                Some(&ask),
+                &check(&cfg, PeerAuthPolicy::Audit)
+            ),
+            Some(Verdict::Mismatch),
+            "no certificate for the signature to cover"
+        );
+        assert!(
+            !pins_path(&cfg, TENANT_A).unwrap().exists(),
+            "a mismatch is never remembered"
+        );
+    }
+
+    /// `off` judges nothing, remembers nothing and reports nothing, for an
+    /// outsider's session too.
+    #[test]
+    fn off_judges_remembers_and_reports_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_in(&dir);
+        let offers = PendingOffers::default();
+        let session = ObjectId::new();
+        let user = ObjectId::new();
+        let ask = signed_offer(&browser(), session, user);
+        assert_eq!(
+            judged(&offers, &cfg, PeerAuthPolicy::Off, session, user, &ask),
+            None
+        );
+        assert_eq!(
+            answer_verdict(&offers, PeerAuthPolicy::Off, session, false),
+            None
+        );
+        assert_eq!(
+            answer_verdict(&offers, PeerAuthPolicy::Off, session, true),
+            None
+        );
+        assert!(!pins_path(&cfg, TENANT_A).unwrap().exists());
+    }
+
+    /// An outsider's session is never noted in-org: its answer reports
+    /// `verified`, because FR-52 admitted it on a MAC the device checked.
+    #[test]
+    fn an_outsiders_answer_reports_verified() {
+        let offers = PendingOffers::default();
+        assert_eq!(
+            answer_verdict(&offers, PeerAuthPolicy::Audit, ObjectId::new(), true).as_deref(),
+            Some("verified")
+        );
+        assert_eq!(
+            answer_verdict(&offers, PeerAuthPolicy::Audit, ObjectId::new(), false),
+            None,
+            "an in-org session nobody judged reports nothing"
+        );
+    }
+
+    /// A re-offer is judged afresh: the first offer's verdict never answers
+    /// the second.
+    #[test]
+    fn a_re_offer_drops_the_earlier_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_in(&dir);
+        let offers = PendingOffers::default();
+        let session = ObjectId::new();
+        let user = ObjectId::new();
+        let ask = signed_offer(&browser(), session, user);
+        judged(&offers, &cfg, PeerAuthPolicy::Audit, session, user, &ask);
+        offers.note_offer(session, OFFER_SDP, None);
+        assert_eq!(
+            answer_verdict(&offers, PeerAuthPolicy::Audit, session, false),
+            None,
+            "noted but not yet judged"
+        );
+    }
+
+    /// A person with more browsers than the cap loses the OLDEST one's pin.
+    #[test]
+    fn a_users_pins_are_bounded_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_in(&dir);
+        let user = ObjectId::new();
+        let keys: Vec<String> = (0..=MAX_KEYS_PER_USER).map(|_| browser().key).collect();
+        for key in &keys {
+            assert_eq!(remember(&cfg, TENANT_A, user, key), Ok(false));
+        }
+        let stored: PinFile =
+            serde_json::from_slice(&std::fs::read(pins_path(&cfg, TENANT_A).unwrap()).unwrap())
+                .unwrap();
+        let kept: Vec<&str> = stored.users[&user.to_hex()]
+            .iter()
+            .map(|k| k.key.as_str())
+            .collect();
+        assert_eq!(kept.len(), MAX_KEYS_PER_USER);
+        assert!(!kept.contains(&keys[0].as_str()), "the oldest went first");
+        assert!(kept.contains(&keys[MAX_KEYS_PER_USER].as_str()));
+    }
+
+    /// A rollback must not destroy a newer agent's pins: the file is left as
+    /// it was, and nothing is remembered on top of it (the verdict still says
+    /// `unknown`, honestly).
+    #[test]
+    fn a_newer_pin_file_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_in(&dir);
+        let path = pins_path(&cfg, TENANT_A).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let newer = br#"{"version":2,"users":{"from":"the future"}}"#;
+        std::fs::write(&path, newer).unwrap();
+        let offers = PendingOffers::default();
+        let session = ObjectId::new();
+        let user = ObjectId::new();
+        let ask = signed_offer(&browser(), session, user);
+        assert_eq!(
+            judged(&offers, &cfg, PeerAuthPolicy::Audit, session, user, &ask),
+            Some(Verdict::Unknown)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), newer);
+    }
+
+    /// A bare config name has no directory: nothing is remembered, nothing is
+    /// written where the process stands, and the verdict says `unknown`.
+    #[test]
+    fn a_config_path_without_a_directory_remembers_nothing() {
+        let bare = Path::new("unused-in-tests.toml");
+        let offers = PendingOffers::default();
+        let session = ObjectId::new();
+        let user = ObjectId::new();
+        let ask = signed_offer(&browser(), session, user);
+        assert_eq!(
+            judged(&offers, bare, PeerAuthPolicy::Audit, session, user, &ask),
+            Some(Verdict::Unknown)
+        );
+        assert!(!Path::new(DIR_NAME).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_pins_are_readable_by_their_owner_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_in(&dir);
+        remember(&cfg, TENANT_A, ObjectId::new(), &browser().key).unwrap();
+        let path = pins_path(&cfg, TENANT_A).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 }
