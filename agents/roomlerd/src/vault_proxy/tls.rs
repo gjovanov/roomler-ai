@@ -12,12 +12,63 @@ use std::sync::Arc;
 
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
-use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
 
 /// A connector that trusts the system's roots, and `ca` (PEM, one or more
 /// certificates) when the secret holds one.
 pub(crate) fn connector(ca: Option<&str>) -> Result<TlsConnector, String> {
+    connector_for(roots(ca)?, None)
+}
+
+/// P3-5e-1 — a client certificate's chain and its key, as TLS presents them
+/// to an upstream that asks for one (a Kubernetes API server, most often).
+// P3-5e-2's endpoint is the first to make one.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Identity {
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+}
+
+/// An identity from the secret's `cert` (PEM: the certificate, then any
+/// intermediates) and `key` (PEM: PKCS#8, PKCS#1 or SEC1).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn identity(cert: &str, key: &str) -> Result<Identity, String> {
+    let chain = CertificateDer::pem_slice_iter(cert.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("the secret's client certificate does not read as PEM: {e}"))?;
+    if chain.is_empty() {
+        return Err("the secret's client certificate holds no certificate".into());
+    }
+    let key = PrivateKeyDer::from_pem_slice(key.as_bytes())
+        .map_err(|e| format!("the secret's key does not read as a PEM private key: {e}"))?;
+    Ok(Identity { chain, key })
+}
+
+/// A connector that verifies against `roots`, and presents `identity` where
+/// one is given (P3-5e-1). Built for each connection that presents one, so
+/// a key lives only in that connection's TLS.
+pub(crate) fn connector_for(
+    roots: Arc<RootCertStore>,
+    identity: Option<Identity>,
+) -> Result<TlsConnector, String> {
+    let builder =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| e.to_string())?
+            .with_root_certificates(roots);
+    let config = match identity {
+        None => builder.with_no_client_auth(),
+        Some(Identity { chain, key }) => builder.with_client_auth_cert(chain, key).map_err(|e| {
+            format!("the secret's client certificate and key are not an identity TLS can present: {e}")
+        })?,
+    };
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+/// The roots an upstream is verified against: the system's, and `ca` (PEM,
+/// one or more certificates) when the secret holds one.
+pub(crate) fn roots(ca: Option<&str>) -> Result<Arc<RootCertStore>, String> {
     let mut roots = RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs().certs {
         // One root the store cannot take is not a reason to trust none.
@@ -39,13 +90,7 @@ pub(crate) fn connector(ca: Option<&str>) -> Result<TlsConnector, String> {
     if roots.is_empty() {
         return Err("no root to verify an upstream against".into());
     }
-    let config =
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .map_err(|e| e.to_string())?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-    Ok(TlsConnector::from(Arc::new(config)))
+    Ok(Arc::new(roots))
 }
 
 /// The name the upstream's certificate must carry: a DNS name or an IP

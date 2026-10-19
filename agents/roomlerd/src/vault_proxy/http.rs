@@ -10,10 +10,12 @@
 //! | its headers | the client's own `Authorization` and `Proxy-Authorization` dropped, with every hop-by-hop header and those `Connection` names; `Host` made the upstream's; the secret's `Authorization` added, marked sensitive |
 //! | the upstream | TCP, then TLS verified ([`super::tls`]), HTTP/1.1: dialled at the connection's first request, and again whenever the upstream has closed it |
 //! | the response | streamed back, never buffered. A `Location` on the upstream's own origin is pointed back at the endpoint; one anywhere else goes back unchanged, and the client follows it with no value. `Alt-Svc` and `Strict-Transport-Security`, which would describe the upstream as if it were the endpoint, are dropped |
+//! | a Kubernetes API server (P3-5e-1) | the same, and: a client certificate presented in the TLS handshake where the secret holds one (no header carries it); an upgrade to `websocket` or `SPDY/3.1` relayed, the two connections joined on the API server's `101` (`kubectl exec`, `attach`, `port-forward`), within the client connection's life; every `Impersonate-*` header dropped, so the session never acts through the secret's identity as another |
 //!
 //! ⚠️ The credential goes only in `Authorization`, in the form the call
-//! named (`Basic` or `Bearer`). A header the session could name is a header
-//! an upstream might echo back in a response the session reads.
+//! named (`Basic` or `Bearer`), or in the handshake. A header the session
+//! could name is a header an upstream might echo back in a response the
+//! session reads.
 //!
 //! ⚠️ The proxy never follows a redirect itself. The client does, and only
 //! one that stays on the upstream comes back through the endpoint.
@@ -53,8 +55,19 @@ const HEADER_DEADLINE: Duration = Duration::from_secs(30);
 const NOT_A_PROXY: &str = "this endpoint stands for one upstream: send it a request for a path, as \
                            you would the upstream";
 
-/// How the secret's value is presented: always in `Authorization`, in the
-/// form the call named.
+/// P3-5e-1 — what the endpoint stands for: an HTTP upstream (P3-5d), or a
+/// Kubernetes API server, whose endpoint also relays an upgrade and drops
+/// impersonation.
+// P3-5e-2's endpoint is the first to name `Kubernetes`.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flavor {
+    Plain,
+    Kubernetes,
+}
+
+/// How the secret's value is presented: in `Authorization`, in the form the
+/// call named, or (P3-5e-1) as a client certificate in the TLS handshake.
 pub(crate) enum Credential {
     /// RFC 7617: the secret's `user` and `password`.
     Basic {
@@ -63,15 +76,32 @@ pub(crate) enum Credential {
     },
     /// RFC 6750: the secret's `token`.
     Bearer(Zeroizing<String>),
+    /// P3-5e-1 — a client certificate, presented by the upstream's
+    /// connector in the handshake: no header carries it, and TLS proves the
+    /// key without sending it.
+    // P3-5e-2's endpoint is the first to present one.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Handshake,
 }
 
 impl Credential {
+    /// What each request carries: `Authorization`'s value, or nothing for a
+    /// certificate the handshake presents; `Err` for a value the header
+    /// cannot carry.
+    fn authorization(&self) -> Result<Option<HeaderValue>, ()> {
+        match self {
+            Self::Handshake => Ok(None),
+            _ => self.header().map(Some).ok_or(()),
+        }
+    }
+
     /// `Authorization`'s value, marked sensitive: `None` for a value it
-    /// cannot carry. A user with a colon, which Basic cannot tell from the
-    /// password; a token that is empty, or holds a space, a control
-    /// character or a byte that is not ASCII.
+    /// cannot carry, and for a certificate. A user with a colon, which Basic
+    /// cannot tell from the password; a token that is empty, or holds a
+    /// space, a control character or a byte that is not ASCII.
     pub(crate) fn header(&self) -> Option<HeaderValue> {
         let raw = match self {
+            Self::Handshake => return None,
             Self::Basic { user, password } => {
                 if user.contains(':') {
                     return None;
@@ -104,6 +134,8 @@ pub(crate) struct Upstream {
     /// The endpoint's own origin, such as `http://127.0.0.1:<port>`: where a
     /// redirect to the upstream is pointed back to.
     pub(crate) front: String,
+    /// P3-5e-1 — what the endpoint stands for.
+    pub(crate) flavor: Flavor,
 }
 
 impl Upstream {
@@ -123,28 +155,41 @@ impl Upstream {
     }
 }
 
+/// P3-5e-1 — a connection that switched protocols: the two ends joined,
+/// carried by the client connection's own future so it ends with it.
+type Tunnel = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
 /// Serve one client connection until it ends: each request sent on to the
-/// upstream with the credential, each response streamed back.
+/// upstream with the credential, each response streamed back, and (P3-5e-1)
+/// an upgraded connection carried as a tunnel until it closes. Whoever
+/// drops this future ends both.
 pub(crate) async fn serve<C>(client: C, up: &Upstream) -> Result<(), String>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let host = HeaderValue::from_str(&up.authority()).map_err(|e| e.to_string())?;
-    let authorization = up.credential.header();
+    let authorization = up.credential.authorization();
     // The connection's upstream leg, between its requests: hyper serves a
     // connection's requests one at a time, so it is taken out while one is
     // sent and put back with its response.
     let leg = Mutex::new(None::<Leg>);
+    let tunnel = Mutex::new(None::<Tunnel>);
     let service = hyper::service::service_fn(|req| {
-        let (host, authorization, leg) = (&host, authorization.as_ref(), &leg);
-        async move { Ok::<_, Infallible>(forward(req, up, host, authorization, leg).await) }
+        let (host, authorization, leg, tunnel) = (&host, &authorization, &leg, &tunnel);
+        async move { Ok::<_, Infallible>(forward(req, up, host, authorization, leg, tunnel).await) }
     });
-    hyper::server::conn::http1::Builder::new()
+    let served = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_DEADLINE)
         .serve_connection(TokioIo::new(client), service)
-        .await
-        .map_err(|e| e.to_string())
+        .with_upgrades()
+        .await;
+    // The connection was handed over to an upgrade: carry it here.
+    let switched = tunnel.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(switched) = switched {
+        switched.await;
+    }
+    served.map_err(|e| e.to_string())
 }
 
 /// Tell a client why it is not served: its first request answered `503`
@@ -167,22 +212,36 @@ where
 
 /// One request, sent on and answered; or refused, with why.
 async fn forward(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     up: &Upstream,
     host: &HeaderValue,
-    authorization: Option<&HeaderValue>,
+    authorization: &Result<Option<HeaderValue>, ()>,
     leg: &Mutex<Option<Leg>>,
+    tunnel: &Mutex<Option<Tunnel>>,
 ) -> Response<Body> {
-    let Some(authorization) = authorization else {
+    let Ok(authorization) = authorization else {
         return answer(
             StatusCode::BAD_GATEWAY,
             "the secret's value is not one an Authorization header can carry",
         );
     };
-    let req = match outbound(req, host, authorization) {
+    // P3-5e-1 — an upgrade a Kubernetes endpoint relays, taken before the
+    // request is rewritten.
+    let upgrade = match up.flavor {
+        Flavor::Kubernetes => upgrade_of(req.headers()),
+        Flavor::Plain => None,
+    };
+    let near = upgrade.is_some().then(|| hyper::upgrade::on(&mut req));
+    let mut req = match outbound(req, host, authorization.as_ref(), up.flavor) {
         Ok(req) => req,
         Err(status) => return answer(status, NOT_A_PROXY),
     };
+    if let (Some(protocol), Some(near)) = (upgrade, near) {
+        req.headers_mut().insert(header::UPGRADE, protocol);
+        req.headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+        return switch(req, up, near, tunnel).await;
+    }
     let held = leg.lock().unwrap_or_else(|e| e.into_inner()).take();
     match send(held, req, up).await {
         Ok((resp, kept)) => {
@@ -193,12 +252,94 @@ async fn forward(
     }
 }
 
+/// P3-5e-1 — send an upgrade on a connection of its own. Where the upstream
+/// switches (`101`), the two ends are joined as the client connection's
+/// tunnel and the response goes back with the upgrade's headers; any other
+/// answer goes back as it came.
+async fn switch(
+    req: Request<Incoming>,
+    up: &Upstream,
+    near: hyper::upgrade::OnUpgrade,
+    tunnel: &Mutex<Option<Tunnel>>,
+) -> Response<Body> {
+    let mut send = match dial_once(up).await {
+        Ok(send) => send,
+        Err(why) => return answer(StatusCode::BAD_GATEWAY, &why),
+    };
+    let mut resp = match send.send_request(req).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            return answer(StatusCode::BAD_GATEWAY, &format!("{}: {e}", up.authority()));
+        }
+    };
+    if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        return inbound(resp, up);
+    }
+    let far = hyper::upgrade::on(&mut resp);
+    let protocol = resp.headers().get(header::UPGRADE).cloned();
+    let joined: Tunnel = Box::pin(async move {
+        let (Ok(near), Ok(far)) = tokio::join!(near, far) else {
+            return;
+        };
+        let (mut near, mut far) = (TokioIo::new(near), TokioIo::new(far));
+        if let Err(e) = tokio::io::copy_bidirectional(&mut near, &mut far).await {
+            debug!(%e, "vault: an upgraded proxy connection ended with an error");
+        }
+    });
+    *tunnel.lock().unwrap_or_else(|e| e.into_inner()) = Some(joined);
+    let mut out = inbound(resp, up);
+    out.headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+    if let Some(protocol) = protocol {
+        out.headers_mut().insert(header::UPGRADE, protocol);
+    }
+    out
+}
+
+/// P3-5e-1 — the protocol a request asks to switch to, where it is one
+/// `kubectl` streams over: `SPDY/3.1`, or `websocket` (from Kubernetes
+/// 1.30). Any other (`h2c` among them) is never relayed.
+fn upgrade_of(headers: &HeaderMap) -> Option<HeaderValue> {
+    let asked = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|t| t.trim().eq_ignore_ascii_case("upgrade"));
+    let protocol = headers.get(header::UPGRADE)?;
+    let known = protocol
+        .to_str()
+        .is_ok_and(|p| p.eq_ignore_ascii_case("websocket") || p.eq_ignore_ascii_case("SPDY/3.1"));
+    (asked && known).then(|| protocol.clone())
+}
+
+/// P3-5e-1 — drop every impersonation header: the session acts as the
+/// secret's identity, never through it as another (`kubectl --as`),
+/// whatever that identity's RBAC allows.
+fn impersonation(headers: &mut HeaderMap) {
+    let named: Vec<HeaderName> = headers
+        .keys()
+        .filter(|n| {
+            let n = n.as_str();
+            matches!(
+                n,
+                "impersonate-user" | "impersonate-group" | "impersonate-uid"
+            ) || n.starts_with("impersonate-extra-")
+        })
+        .cloned()
+        .collect();
+    for name in named {
+        headers.remove(name);
+    }
+}
+
 /// The request as the upstream gets it: or the status that refuses one
 /// that is not for a path on the upstream.
 fn outbound(
     req: Request<Incoming>,
     host: &HeaderValue,
-    authorization: &HeaderValue,
+    authorization: Option<&HeaderValue>,
+    flavor: Flavor,
 ) -> Result<Request<Incoming>, StatusCode> {
     if req.method() == Method::CONNECT {
         return Err(StatusCode::METHOD_NOT_ALLOWED);
@@ -218,10 +359,15 @@ fn outbound(
     for name in [header::AUTHORIZATION, header::HOST, header::EXPECT] {
         parts.headers.remove(name);
     }
+    if flavor == Flavor::Kubernetes {
+        impersonation(&mut parts.headers);
+    }
     parts.headers.insert(header::HOST, host.clone());
-    parts
-        .headers
-        .insert(header::AUTHORIZATION, authorization.clone());
+    if let Some(authorization) = authorization {
+        parts
+            .headers
+            .insert(header::AUTHORIZATION, authorization.clone());
+    }
     Ok(Request::from_parts(parts, body))
 }
 
@@ -356,8 +502,8 @@ async fn send(
     ))
 }
 
-/// A new leg: TCP, TLS verified, an HTTP/1.1 handshake.
-async fn dial(up: &Upstream) -> Result<Leg, String> {
+/// TCP, then TLS verified, within the deadline.
+async fn connect(up: &Upstream) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
     let name = tls::server_name(&up.host)?;
     let connected = async {
         let tcp = TcpStream::connect((up.host.as_str(), up.port))
@@ -368,14 +514,19 @@ async fn dial(up: &Upstream) -> Result<Leg, String> {
             .await
             .map_err(|e| format!("TLS to {}: {e}", up.host))
     };
-    let stream = tokio::time::timeout(CONNECT_DEADLINE, connected)
+    tokio::time::timeout(CONNECT_DEADLINE, connected)
         .await
         .map_err(|_| {
             format!(
                 "{} did not answer within {CONNECT_DEADLINE:?}",
                 up.authority()
             )
-        })??;
+        })?
+}
+
+/// A new leg: TCP, TLS verified, an HTTP/1.1 handshake.
+async fn dial(up: &Upstream) -> Result<Leg, String> {
+    let stream = connect(up).await?;
     let (send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|e| format!("{}: {e}", up.authority()))?;
@@ -385,6 +536,22 @@ async fn dial(up: &Upstream) -> Result<Leg, String> {
         }
     });
     Ok(Leg { send, task })
+}
+
+/// P3-5e-1 — a connection for one upgrade. Its task runs until it hands the
+/// connection over to the upgrade, or the connection ends; never kept as a
+/// leg, since a switched connection carries no more requests.
+async fn dial_once(up: &Upstream) -> Result<SendRequest<Incoming>, String> {
+    let stream = connect(up).await?;
+    let (send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(|e| format!("{}: {e}", up.authority()))?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.with_upgrades().await {
+            debug!(%e, "vault: an upgraded proxy's upstream connection ended with an error");
+        }
+    });
+    Ok(send)
 }
 
 #[cfg(test)]
