@@ -1276,7 +1276,7 @@ Such a build runs no session and sends no manifest, so a Windows device that upd
 or a build made without `hive` does the same. The reconcile of a connection the hub records without
 `hive` now ends those sessions as an empty manifest would, before it reads what is pending, and it
 reads only its own registration: a connection a newer one displaced, or one already gone, decides
-nothing (`crates/modules/hive/src/agent_socket.rs:1005`, `crates/modules/fleet/src/hub.rs:2456`
+nothing (`crates/modules/hive/src/agent_socket.rs:1005`, `crates/modules/fleet/src/hub.rs:2474`
 `agent_supports_hive_on`).
 
 **Updates and restarts (P1d).** Today a session's harness is the daemon's child: an update, a crash

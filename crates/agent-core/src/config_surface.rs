@@ -368,7 +368,7 @@ const KEYS: &[KeyMeta] = &[
         // LIVE: read with the consent mode, in the same single read.
         live: true,
         kind: "string",
-        description: "Permission names joined by `|`, e.g. `VIEW | INPUT`. This device's OWN ceiling on what an external session may do. Unset defers to the org's ceiling; where both are set a session gets the INTERSECTION, so a device can narrow what its org allows but never widen it. NOTE: the external-access PASSWORD is not settable here - use `roomler rc password set`, which never writes it anywhere readable.",
+        description: "Permission names joined by `|`, e.g. `VIEW | INPUT`. This device's OWN ceiling on what an external session may do. Unset defers to the org's ceiling; where both are set a session gets the INTERSECTION, so a device can narrow what its org allows but never widen it. RECORD and PRIVACY are never granted to an external session, whatever this names. NOTE: the external-access PASSWORD is not settable here - use `roomler rc password set`, which never writes it anywhere readable.",
     },
     KeyMeta {
         key: "local_restart_enabled",

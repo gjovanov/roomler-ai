@@ -51,7 +51,7 @@ sequenceDiagram
     P->>A: roomler config set privacy_mode_allowed true (console only)
     A->>S: caps re-announced with privacy-mode
     V->>S: rc:session.request ... | PRIVACY (only from a device that serves it)
-    Note over S: privacy_grant: device_cannot_curtain, break_glass,<br/>device_not_opted_in strip it, each with its reason
+    Note over S: privacy_grant: device_cannot_curtain, break_glass,<br/>outside_the_org, device_not_opted_in strip it, each with its reason
     S->>A: rc:request with PRIVACY
     A->>P: consent prompt: "They may also cover this screen while they work."
     V->>A: rc:privacy.set on (the privacy DataChannel)
@@ -63,14 +63,14 @@ sequenceDiagram
 ```
 
 The viewer asks for `PRIVACY` only from a device that advertises `privacy-mode`
-([`withPrivacyAsked`, `usePrivacyMode.ts:80`](../ui/src/composables/usePrivacyMode.ts#L80)).
+([`withPrivacyAsked`, `usePrivacyMode.ts:81`](../ui/src/composables/usePrivacyMode.ts#L81)).
 A device that could curtain but whose owner has not allowed it advertises only
 `privacy-available`; the viewer then asks for nothing and shows no control.
 
 ## Who can say no, and what the viewer says
 
 The server strips `PRIVACY` before the device ever sees it
-([`privacy_grant`, `hub.rs:406`](../crates/modules/fleet/src/hub.rs#L406)). The first reason
+([`privacy_grant`, `hub.rs:414`](../crates/modules/fleet/src/hub.rs#L414)). The first reason
 that applies wins, and it reaches the viewer (`rc:session.created.privacy_refused`) and the
 session's `session_requested` audit row (`privacy_stripped`):
 
@@ -78,7 +78,16 @@ session's `session_requested` audit row (`privacy_stripped`):
 |---|---|---|
 | `device_cannot_curtain` | an agent before FR-99, or a platform with no curtain (macOS, Linux) | no control: there is nothing anyone could switch on |
 | `break_glass` | the session skipped consent (an ADMINISTRATOR force) | a disabled control with the reason |
+| `outside_the_org` | the controller is from outside the device's organization ([FR-52](fr/FR-52-cross-org-remote-access.md), decision 13) | none in practice: an outsider's page never asks for it |
 | `device_not_opted_in` | the owner has not allowed it | a disabled control with the reason |
+
+> ⚠️ **An outsider never covers the screen.** The person at the device let a stranger in on a
+> password and a name the stranger chose, and is the only one placed to see what that stranger
+> then does. A curtain would hide it from them, the same reason break-glass is refused. The
+> device strips `PRIVACY` again when it admits an outsider's session
+> ([`admit_session`, `extauth.rs:460`](../agents/roomlerd/src/extauth.rs#L460)), together with
+> `RECORD`, so the server's strip is not the only one. No `external_max_permissions` an owner sets
+> lets either back in.
 
 The device decides again at every "on", whatever the server sent
 ([`set`, `privacy.rs:541`](../agents/roomlerd/src/privacy.rs#L541)):
@@ -93,7 +102,7 @@ The device decides again at every "on", whatever the server sent
 Turning it off is never refused. The curtain comes down when the controller turns it off, when
 the session ends, and when **the owner switches privacy mode off mid-session**. The viewer is
 then told unasked ("Privacy mode is off: this device's owner hasn't allowed privacy mode").
-Every reason is said in words ([`describePrivacyReason`, `usePrivacyMode.ts:46`](../ui/src/composables/usePrivacyMode.ts#L46)).
+Every reason is said in words ([`describePrivacyReason`, `usePrivacyMode.ts:47`](../ui/src/composables/usePrivacyMode.ts#L47)).
 
 ## How the curtain works
 

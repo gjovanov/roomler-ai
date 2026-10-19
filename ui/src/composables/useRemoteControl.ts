@@ -10081,7 +10081,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>, opts?: { external?: 
     // with no `local_relay` or `override_reason` to carry (F4). Everything
     // after this point (transport, chroma, framing, audio) means the same in
     // both frames. An outsider's page reads no device row, so it has no caps
-    // to ask PRIVACY on: its grant is what it asked, under the org's ceiling.
+    // to ask PRIVACY on, and an outsider is never granted it anyway (FR-52
+    // decision 13: the server strips it, and so does the device). Its grant
+    // is what it asked, under the org's ceiling.
     const requestPayload: Record<string, unknown> =
       externalMode && externalAuth
         ? {
