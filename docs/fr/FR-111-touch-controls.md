@@ -25,8 +25,8 @@ advertised), so it works with every deployed agent and needs no release.
 
 | What | Where |
 |---|---|
-| A finger is the mouse: pointer events with no `pointerType` branch; a touch down is `mouse_button` down at that point | [`useRemoteControl.ts:10493`](../../ui/src/composables/useRemoteControl.ts#L10493) `onPointerDown`, `:10355` `onPointerUp` |
-| The stage listens for `pointerdown`, `pointerup`, `pointermove` and `wheel`, and nothing else | [`useRemoteControl.ts:10905`](../../ui/src/composables/useRemoteControl.ts#L10905) |
+| A finger is the mouse: pointer events with no `pointerType` branch; a touch down is `mouse_button` down at that point | [`useRemoteControl.ts:10495`](../../ui/src/composables/useRemoteControl.ts#L10495) `onPointerDown`, `:10357` `onPointerUp` |
+| The stage listens for `pointerdown`, `pointerup`, `pointermove` and `wheel`, and nothing else | [`useRemoteControl.ts:10907`](../../ui/src/composables/useRemoteControl.ts#L10907) |
 | **No `pointercancel` handler** anywhere in the viewer, and **no `touch-action`** in the UI. A touch browser that turns a drag into a pan or a zoom fires `pointercancel` and never `pointerup`; P0 measures what the host is left with | `git grep -n -e pointercancel -e touch-action ui/src`: nothing; the stage's CSS, [`RemoteControl.vue:4730`](../../ui/src/views/remote/RemoteControl.vue#L4730) |
 | The soft keyboard is the only touch-specific control: an off-screen textarea whose input becomes key frames | [`MobileKeyboard.vue`](../../ui/src/components/remote/MobileKeyboard.vue) |
 | The viewer knows where the host's pointer is (`cursor:pos` on the cursor channel), which a trackpad mode needs for absolute moves | [`useRemoteControl.ts:9327`](../../ui/src/composables/useRemoteControl.ts#L9327) |

@@ -247,7 +247,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 2. Linux and macOS advertise clipboard image events they never send (R8); a root Linux daemon advertises a clipboard
    it cannot reach (R10).
 3. The Ctrl+Alt+Del button shows for every host. It sends three ordinary key events
-   (`ui/src/composables/useRemoteControl.ts:11641-11461`) ✔, and nothing in the agent calls `SendSAS` (grep: none) ✔.
+   (`ui/src/composables/useRemoteControl.ts:11643-11461`) ✔, and nothing in the agent calls `SendSAS` (grep: none) ✔.
    Windows does not treat a synthesised Ctrl+Alt+Del as the secure attention sequence, so the button does nothing at
    a lock screen that requires it; on Linux and macOS the chord means something else, or nothing.
 4. The enroll dialog offers the setup wizard for agents on Linux and macOS, where it installs only the tunnel client
@@ -750,7 +750,7 @@ model on Windows, so the three agree on what the mode means.
   must never see: it would ignore it and run the command as root. So the agent advertises `console-user` (every
   Unix build, never Windows), the policy `PUT` stores `console_user` off Windows only for an agent whose hello
   carried it, `authorize` checks the live connection, and the hub refuses to push the field to a connection
-  without the word (`hub.rs:3304`). SSH's half fails closed on its own: an older agent refuses the mode.
+  without the word (`hub.rs:3369`). SSH's half fails closed on its own: an older agent refuses the mode.
 
 **P5b (built).** P5a's field run found every session as a person starting in `/`, the daemon's directory, for
 `named` too, where sshd starts it in the home. Now the shell, an SSH command and `sftp` start in the person's home:

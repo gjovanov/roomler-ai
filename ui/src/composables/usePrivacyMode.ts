@@ -34,6 +34,7 @@ export const PRIVACY_REASONS: Record<string, string> = {
   // the server
   device_cannot_curtain: "this device can't cover its screen",
   break_glass: 'privacy mode is never available when consent was skipped',
+  outside_the_org: "privacy mode is never available from outside the device's organization",
   device_not_opted_in: "this device's owner hasn't allowed privacy mode",
   // the device
   not_granted: "this session isn't allowed to cover the screen",
