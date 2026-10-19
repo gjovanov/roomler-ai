@@ -25,8 +25,9 @@
 //! shape once per session, and never replaces a cached id.
 //!
 //! On Linux the DRM arm reads the hardware cursor plane (FR-93 P3c,
-//! `capture::drm_cursor`). There `id` is a hash of the image and its
-//! hotspot, since a cursor plane has no handle that names a shape.
+//! `capture::drm_cursor`), and the X11 arm reads XFixes into the same slot
+//! (FR-97 P3a, `capture::x11_cursor`). There `id` is a hash of the image and
+//! its hotspot, since neither has a handle that names a shape.
 
 use crate::capture::CursorInfo;
 use std::time::Duration;
@@ -90,8 +91,8 @@ pub struct CursorTracker {
     /// Whether the caller has already received a `shape` payload for
     /// the current `shape_id`. Resets when the handle changes. Only
     /// consulted on Windows with the mf-encoder feature, and on Linux
-    /// with DRM capture (FR-93 P3c); other builds keep the field but
-    /// never read it. Allowed dead.
+    /// with DRM or X11 capture (FR-93 P3c, FR-97 P3a); other builds keep
+    /// the field but never read it. Allowed dead.
     #[allow(dead_code)]
     last_advertised_shape: Option<u64>,
 }
@@ -124,13 +125,18 @@ impl CursorTracker {
                 shape,
             })
         }
-        #[cfg(all(target_os = "linux", feature = "drm-capture"))]
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "drm-capture", feature = "scrap-capture")
+        ))]
         {
             // FR-93 P3c — the DRM arm's hardware cursor, which its worker reads
-            // off the cursor plane every frame (`capture::drm_cursor`). The
-            // other Linux arms put the pointer in their frames and publish
-            // nothing, so this stays `None` for them: the viewer's badge, as
-            // before, and never a second pointer over the streamed one.
+            // off the cursor plane every frame (`capture::drm_cursor`), and
+            // from FR-97 P3a the X11 arm's pointer, which its worker reads from
+            // XFixes into the same slot (`capture::x11_cursor`). mutter and the
+            // portal put the pointer in their frames and publish nothing, so
+            // this stays `None` for them: the viewer's badge, as before, and
+            // never a second pointer over the streamed one.
             let snapshot = super::drm_cursor::latest()?;
             let new_shape = self.last_advertised_shape != Some(snapshot.shape_id);
             let shape = new_shape.then(|| (*snapshot.shape).clone());
@@ -146,12 +152,15 @@ impl CursorTracker {
         }
         #[cfg(not(any(
             all(target_os = "windows", feature = "mf-encoder"),
-            all(target_os = "linux", feature = "drm-capture")
+            all(
+                target_os = "linux",
+                any(feature = "drm-capture", feature = "scrap-capture")
+            )
         )))]
         {
-            // macOS, and Linux builds without DRM capture: not wired.
-            // NSCursor would slot in here. Returning None falls back to the
-            // browser's synthetic-badge rendering.
+            // macOS, and Linux builds with neither DRM nor X11 capture: not
+            // wired. NSCursor would slot in here. Returning None falls back to
+            // the browser's synthetic-badge rendering.
             None
         }
     }

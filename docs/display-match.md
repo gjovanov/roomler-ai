@@ -220,7 +220,7 @@ sequenceDiagram
   refuses to delete the mode in use ([`display_match.rs:226`](../agents/roomlerd/src/display_match.rs#L226)).
 - **The capture opens again at the new size.** X11's capturer takes its size when it opens, so every switch
   and restore bumps a counter the capture worker watches
-  ([`scrap_backend.rs:235`](../agents/roomlerd/src/capture/scrap_backend.rs#L235)). The encoder already
+  ([`scrap_backend.rs:243`](../agents/roomlerd/src/capture/scrap_backend.rs#L243)). The encoder already
   rebuilds when the frame size changes.
 - **A failing Xorg costs the switch, never the desktop:** if it does not come up, the desktop runs on Xvfb
   ([`virtual_desktop.rs:741`](../agents/roomlerd/src/virtual_desktop.rs#L741) `spawn_x_server`).
