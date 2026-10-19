@@ -48,6 +48,9 @@ pub(crate) enum Engine {
     Mongodb,
     /// P3-5d-2 — an HTTP upstream: an API, or a git server.
     Http,
+    /// P3-5e-2 — a Kubernetes API server: an HTTP endpoint that also relays
+    /// `kubectl`'s upgrades and drops impersonation.
+    Kubernetes,
 }
 
 impl Engine {
@@ -56,6 +59,7 @@ impl Engine {
             "postgres" => Some(Self::Postgres),
             "mongodb" => Some(Self::Mongodb),
             "http" => Some(Self::Http),
+            "kubernetes" => Some(Self::Kubernetes),
             _ => None,
         }
     }
@@ -65,19 +69,29 @@ impl Engine {
             Self::Postgres => "postgres",
             Self::Mongodb => "mongodb",
             Self::Http => "http",
+            Self::Kubernetes => "kubernetes",
         }
+    }
+
+    /// Whether the endpoint speaks HTTP: an origin for its upstream, `auth`
+    /// for its credential, a loopback port everywhere.
+    fn is_http(self) -> bool {
+        matches!(self, Self::Http | Self::Kubernetes)
     }
 }
 
-/// P3-5d-2 — how an HTTP endpoint presents the secret's value: always in
-/// `Authorization`, in the form the call names. The session never names a
-/// header: one it could name is one an upstream might echo back.
+/// P3-5d-2 — how an HTTP endpoint presents the secret's value: in
+/// `Authorization`, in the form the call names, or (P3-5e-2) as a client
+/// certificate in the TLS handshake. The session never names a header: one
+/// it could name is one an upstream might echo back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Auth {
     /// The secret's `user` and `password` (RFC 7617).
     Basic,
     /// The secret's `token` (RFC 6750).
     Bearer,
+    /// P3-5e-2 — the secret's `cert` and `key` (PEM), a client certificate.
+    ClientCert,
 }
 
 /// Whether `name` is a MongoDB database name: 1 to 63 bytes, none of the
@@ -117,8 +131,8 @@ pub(crate) struct ConnectRequest {
 
 impl ConnectRequest {
     /// The values the endpoint is leased, in order: `user` and `password`
-    /// (a database's, or `basic`'s), or `token` (`bearer`'s); then the CA
-    /// when the call names one.
+    /// (a database's, or `basic`'s), `token` (`bearer`'s), or `cert` and
+    /// `key` (`client-cert`'s); then the CA when the call names one.
     pub(crate) fn handles(&self) -> Vec<Handle> {
         let field = |f: &str| Handle {
             secret: self.secret.clone(),
@@ -126,6 +140,7 @@ impl ConnectRequest {
         };
         let mut handles = match self.auth {
             Some(Auth::Bearer) => vec![field("token")],
+            Some(Auth::ClientCert) => vec![field("cert"), field("key")],
             Some(Auth::Basic) | None => vec![field("user"), field("password")],
         };
         handles.extend(self.ca.clone());
@@ -234,34 +249,48 @@ pub(crate) fn parse(args: &Value) -> Result<ConnectRequest, String> {
         .get("engine")
         .and_then(Value::as_str)
         .and_then(Engine::of)
-        .ok_or("engine must be postgres, mongodb or http")?;
+        .ok_or("engine must be postgres, mongodb, http or kubernetes")?;
     let upstream = args.get("upstream").and_then(Value::as_str).ok_or(
-        "upstream is required: host:port for a database, or https://host[:port] for http, as the \
-         secret's audiences name it",
+        "upstream is required: host:port for a database, or https://host[:port] for http and \
+         kubernetes, as the secret's audiences name it",
     )?;
     let (host, port) = match engine {
-        Engine::Http => origin_of(upstream)?,
+        Engine::Http | Engine::Kubernetes => origin_of(upstream)?,
         Engine::Postgres | Engine::Mongodb => upstream_of(upstream)?,
     };
     let auth = match args.get("auth") {
         None | Some(Value::Null) if engine == Engine::Http => {
             return Err(
-                "auth is required for http: basic (the secret's user and password) or bearer \
-                 (its token)"
+                "auth is required for http: basic (the secret's user and password), bearer (its \
+                 token) or client-cert (its cert and key)"
+                    .into(),
+            );
+        }
+        None | Some(Value::Null) if engine == Engine::Kubernetes => {
+            return Err(
+                "auth is required for kubernetes: bearer (the secret's token) or client-cert (its \
+                 cert and key)"
                     .into(),
             );
         }
         None | Some(Value::Null) => None,
-        Some(_) if engine != Engine::Http => {
+        Some(_) if !engine.is_http() => {
             return Err("auth is http's: a database is signed in to by SCRAM".into());
+        }
+        // P3-5e-2 — no API server takes Basic since Kubernetes 1.19.
+        Some(Value::String(a)) if a == "basic" && engine == Engine::Kubernetes => {
+            return Err(
+                "auth for kubernetes is bearer or client-cert: an API server takes no basic".into(),
+            );
         }
         Some(Value::String(a)) if a == "basic" => Some(Auth::Basic),
         Some(Value::String(a)) if a == "bearer" => Some(Auth::Bearer),
-        Some(_) => return Err("auth must be basic or bearer".into()),
+        Some(Value::String(a)) if a == "client-cert" => Some(Auth::ClientCert),
+        Some(_) => return Err("auth must be basic, bearer or client-cert".into()),
     };
     let database = match args.get("database") {
         None | Some(Value::Null) => None,
-        Some(_) if engine == Engine::Http => {
+        Some(_) if engine.is_http() => {
             return Err(
                 "database is a database's: an http endpoint stands for an origin, and each \
                  request names its own path"
@@ -292,9 +321,10 @@ pub(crate) fn parse(args: &Value) -> Result<ConnectRequest, String> {
                     .into(),
             );
         }
-        Some(_) if engine == Engine::Http => {
+        Some(_) if engine.is_http() => {
             return Err(
-                "auth_source is MongoDB's: an http endpoint presents the secret in Authorization"
+                "auth_source is MongoDB's: an http endpoint presents the secret in Authorization \
+                 or in the handshake"
                     .into(),
             );
         }
@@ -807,6 +837,10 @@ mod endpoint {
         host: String,
         port: u16,
         tls: tokio_rustls::TlsConnector,
+        /// P3-5e-2 — the roots `tls` verifies against: a connection that
+        /// presents a client certificate gets a connector of its own over
+        /// them.
+        roots: Arc<tokio_rustls::rustls::RootCertStore>,
         /// The engine it speaks, MongoDB's auth database, and (P3-5d-2) how
         /// an HTTP endpoint presents the value.
         engine: Engine,
@@ -850,14 +884,29 @@ mod endpoint {
                     auth_source: self.auth_source.clone().unwrap_or_else(|| "admin".into()),
                     tls,
                 }),
-                Engine::Http => Session::Http(http::Upstream {
-                    host,
-                    port,
-                    credential: credential(self.auth?, |i| self.read(i))?,
-                    tls,
-                    front: self.front.clone(),
-                    flavor: http::Flavor::Plain,
-                }),
+                Engine::Http | Engine::Kubernetes => {
+                    let auth = self.auth?;
+                    // P3-5e-2 — a certificate goes into this connection's
+                    // TLS alone, read from its leases now.
+                    let tls = match auth {
+                        Auth::ClientCert => {
+                            let identity = tls::identity(&self.read(0)?, &self.read(1)?).ok()?;
+                            tls::connector_for(Arc::clone(&self.roots), Some(identity)).ok()?
+                        }
+                        Auth::Basic | Auth::Bearer => tls,
+                    };
+                    Session::Http(http::Upstream {
+                        host,
+                        port,
+                        credential: credential(auth, |i| self.read(i))?,
+                        tls,
+                        front: self.front.clone(),
+                        flavor: match self.engine {
+                            Engine::Kubernetes => http::Flavor::Kubernetes,
+                            _ => http::Flavor::Plain,
+                        },
+                    })
+                }
             })
         }
     }
@@ -874,6 +923,8 @@ mod endpoint {
                 password: read(1)?,
             },
             Auth::Bearer => http::Credential::Bearer(read(0)?),
+            // P3-5e-2 — presented by the connection's own connector.
+            Auth::ClientCert => http::Credential::Handshake,
         })
     }
 
@@ -918,6 +969,7 @@ mod endpoint {
         /// comes after them.
         values: usize,
         tls: tokio_rustls::TlsConnector,
+        roots: Arc<tokio_rustls::rustls::RootCertStore>,
         slot: Slot,
     }
 
@@ -928,7 +980,7 @@ mod endpoint {
         at: At<'_>,
         req: ConnectRequest,
     ) -> Result<Value, String> {
-        if req.engine == Engine::Http {
+        if req.engine.is_http() {
             loopback::identifies()?;
         }
         let slot = Slot::take(session, fence).ok_or_else(|| {
@@ -969,7 +1021,29 @@ mod endpoint {
         for (lease, h) in leases.iter().zip(&handles).take(count) {
             values.push(value(lease, h)?);
         }
+        let ca = match req.ca {
+            Some(_) => Some(value(&leases[count], &handles[count])?),
+            None => None,
+        };
+        let roots = tls::roots(ca.as_deref().map(String::as_str))
+            .map_err(|e| format!("the upstream's TLS: {e}"))?;
+        let tls = tls::connector_for(Arc::clone(&roots), None)
+            .map_err(|e| format!("the upstream's TLS: {e}"))?;
         match req.auth {
+            // P3-5e-2 — an identity TLS can present, proven once here. The
+            // refusal names no parser's words: they could quote the key.
+            Some(Auth::ClientCert) => {
+                let presentable = tls::identity(&values[0], &values[1])
+                    .and_then(|id| tls::connector_for(Arc::clone(&roots), Some(id)))
+                    .is_ok();
+                if !presentable {
+                    return Err(format!(
+                        "{}: its cert and key are not a client certificate TLS can present (both \
+                         PEM: the certificate, with any intermediates, then its private key)",
+                        req.secret
+                    ));
+                }
+            }
             None => {
                 let user = &values[0];
                 if user.is_empty() || user.chars().any(char::is_control) {
@@ -994,22 +1068,17 @@ mod endpoint {
             }
         }
         drop(values);
-        let ca = match req.ca {
-            Some(_) => Some(value(&leases[count], &handles[count])?),
-            None => None,
-        };
-        let tls = tls::connector(ca.as_deref().map(String::as_str))
-            .map_err(|e| format!("the upstream's TLS: {e}"))?;
         let handover = Handover {
             vault: &vault,
             leases: &leases,
             own: held.leases.clone(),
             values: count,
             tls,
+            roots,
             slot,
         };
         let answer = match req.engine {
-            Engine::Http => {
+            Engine::Http | Engine::Kubernetes => {
                 let bound = loopback::bind(&at)?;
                 let dial = bound.dial(req.engine, None, &req.upstream);
                 let front = bound.front();
@@ -1065,6 +1134,7 @@ mod endpoint {
             host: req.host.clone(),
             port: req.port,
             tls: h.tls,
+            roots: h.roots,
             engine: req.engine,
             auth_source: req.auth_source.clone(),
             auth: req.auth,
@@ -1077,13 +1147,19 @@ mod endpoint {
                  endpoint adds the secret's. For git, set env, and use the upstream's own URLs. \
                  It closes, with its connections, when its lease ends."
             }
+            Engine::Kubernetes => {
+                "Write kubeconfig to a file of your own and point KUBECONFIG at it: kubectl then \
+                 reaches the cluster as the secret's identity, with no credential of its own, \
+                 exec, attach and port-forward included. It closes, with its connections, when \
+                 its lease ends."
+            }
             Engine::Postgres | Engine::Mongodb => {
                 "Connect with any user name and no password: the endpoint signs in to the \
                  upstream as the secret's user. It closes, with its connections, when its lease \
                  ends."
             }
         };
-        Ok(json!({
+        let mut answer = json!({
             "engine": req.engine.wire(),
             "upstream": req.upstream,
             "host": dial.host,
@@ -1093,7 +1169,22 @@ mod endpoint {
             "env": dial.env,
             "ttl_s": ttl_s,
             "note": note,
-        }))
+        });
+        if req.engine == Engine::Kubernetes {
+            answer["kubeconfig"] = json!(kubeconfig(&dial.uri));
+        }
+        Ok(answer)
+    }
+
+    /// P3-5e-2 — a kubeconfig for the endpoint: one cluster whose server is
+    /// it, one context, one user with no credential. Nothing in it is secret.
+    fn kubeconfig(server: &str) -> String {
+        format!(
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: roomler-vault\n  cluster:\n    \
+             server: {server}\ncontexts:\n- name: roomler-vault\n  context:\n    cluster: \
+             roomler-vault\n    user: roomler-vault\ncurrent-context: roomler-vault\nusers:\n- \
+             name: roomler-vault\n  user: {{}}\n"
+        )
     }
 
     /// Serve one endpoint until its first lease is let go: each connection
@@ -1176,7 +1267,7 @@ mod endpoint {
             match engine {
                 Engine::Postgres => stream.write_all(&pg::fatal(&why)).await,
                 Engine::Mongodb => mongo::refuse(&mut stream, &why).await,
-                Engine::Http => {
+                Engine::Http | Engine::Kubernetes => {
                     if let Err(e) = http::refuse(&mut stream, &why).await {
                         debug!(%e, "vault: a refused HTTP client was not told why");
                     }
@@ -1324,7 +1415,9 @@ mod endpoint {
                 private_dir(&dir)?;
                 let socket = dir.join(match engine {
                     Engine::Mongodb => MONGO_SOCKET.to_string(),
-                    Engine::Postgres | Engine::Http => format!(".s.PGSQL.{PG_PORT}"),
+                    Engine::Postgres | Engine::Http | Engine::Kubernetes => {
+                        format!(".s.PGSQL.{PG_PORT}")
+                    }
                 });
                 let listener = UnixListener::bind(&socket)
                     .map_err(|e| format!("{}: {e}", socket.display()))?;
@@ -1499,6 +1592,14 @@ mod endpoint {
                             env,
                         }
                     }
+                    // P3-5e-2 — the kubeconfig in the answer names the
+                    // endpoint; nothing goes in the environment.
+                    Engine::Kubernetes => Dial {
+                        host,
+                        port: Some(port),
+                        uri: self.front(),
+                        env,
+                    },
                     Engine::Mongodb => {
                         let uri = format!(
                             "mongodb://{host}:{port}/{}?directConnection=true",
