@@ -206,33 +206,180 @@ fn process_home() -> Option<String> {
     }
 }
 
+/// FR-97 P3d — who a received file is written as.
+///
+/// A Linux system install is root, and its sessions show the person at the
+/// screen; a file sent to them used to land in root's own Downloads, where
+/// they could not see it. It now lands in THEIR folder, and every path step
+/// there (the staging folder, the data file, the final rename, a resume, the
+/// orphan sweep) runs on a thread that took on their filesystem identity
+/// (`crate::fs_identity`), never as root followed by a `chown`: in a folder
+/// the person owns, a link they planted would otherwise be followed with
+/// root's rights, and the staging folder's `meta.json`, which a resume reads,
+/// is theirs to edit. "The person" is the one at seat0
+/// (`companion::seat0_user`, FR-97 P5a's definition), never whoever asked.
+/// `ROOMLERD_FILES_AS_SEAT_USER=0` keeps the daemon's own identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FsAs {
+    /// This process: every Windows and macOS install, every user install,
+    /// and a root daemon with nobody at seat0.
+    Daemon,
+    /// (Linux root) the person signed in at seat0.
+    #[cfg(target_os = "linux")]
+    Person {
+        account: crate::fs_identity::Account,
+        home: PathBuf,
+    },
+}
+
+impl FsAs {
+    /// Who a transfer starting now writes as.
+    pub(crate) fn now() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `geteuid` reads this process's own credentials.
+            if unsafe { libc::geteuid() } == 0 && tunnel_core::env::flag("FILES_AS_SEAT_USER", true)
+            {
+                match seat_person() {
+                    Ok(person) => return person,
+                    Err(e) => tracing::debug!(
+                        %e,
+                        "files: nobody at seat0 — received files are written as the daemon"
+                    ),
+                }
+            }
+        }
+        Self::Daemon
+    }
+
+    /// Run blocking filesystem work as this identity, on a blocking thread:
+    /// an identity belongs to the thread that takes it on, never to an async
+    /// worker.
+    pub(crate) async fn run<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        let who = self.clone();
+        tokio::task::spawn_blocking(move || who.run_here(f))
+            .await
+            .context("a file-transfer step's thread")?
+    }
+
+    /// [`Self::run`] on THIS thread, which must be a blocking one.
+    fn run_here<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        match self {
+            Self::Daemon => f(),
+            #[cfg(target_os = "linux")]
+            Self::Person { account, .. } => {
+                let _as_them = crate::fs_identity::FsIdentity::begin(account)
+                    .map_err(|e| anyhow!("acting as {} for a received file: {e}", account.name))?;
+                f()
+            }
+        }
+    }
+
+    /// The writer FR-84 D4's placement rules check: for the person, the
+    /// daemon is still privileged, and the person's home is the active one.
+    fn writer(&self) -> files_dir::Writer {
+        match self {
+            Self::Daemon => writer_context(),
+            #[cfg(target_os = "linux")]
+            Self::Person { home, .. } => files_dir::Writer {
+                privileged: true,
+                active_home: Some(home.to_string_lossy().into_owned()),
+            },
+        }
+    }
+}
+
+/// The person at seat0, as an account (uid 0 refused) and a home.
+#[cfg(target_os = "linux")]
+fn seat_person() -> std::result::Result<FsAs, String> {
+    let name = crate::companion::seat0_user().map_err(|e| format!("{e:#}"))?;
+    let account = crate::fs_identity::Account::by_name(&name)?;
+    let home = crate::exec::account_home(&name)?;
+    Ok(FsAs::Person { account, home })
+}
+
+/// The person's Downloads: `XDG_DOWNLOAD_DIR` from their own
+/// `user-dirs.dirs` when it names a folder inside their home that exists,
+/// else `~/Downloads` when it exists, else their home. Read as the person
+/// (the caller runs it under their identity).
+#[cfg(target_os = "linux")]
+fn person_downloads(home: &std::path::Path) -> PathBuf {
+    let from_xdg = std::fs::read_to_string(home.join(".config/user-dirs.dirs"))
+        .ok()
+        .and_then(|text| xdg_download_dir(&text, home));
+    if let Some(dir) = from_xdg.filter(|d| d.is_dir()) {
+        return dir;
+    }
+    let plain = home.join("Downloads");
+    if plain.is_dir() {
+        return plain;
+    }
+    home.to_path_buf()
+}
+
+/// The pure half of [`person_downloads`]: `XDG_DOWNLOAD_DIR` out of a
+/// `user-dirs.dirs`, with `$HOME` expanded, and only when it stays inside
+/// `home` (the file is the person's to write, so it may name anything).
+#[cfg(any(target_os = "linux", test))]
+fn xdg_download_dir(text: &str, home: &std::path::Path) -> Option<PathBuf> {
+    let value = text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("XDG_DOWNLOAD_DIR=")?;
+        Some(rest.trim().trim_matches('"').to_string())
+    })?;
+    let path = match value.strip_prefix("$HOME") {
+        Some(rel) => home.join(rel.trim_start_matches('/')),
+        None => PathBuf::from(&value),
+    };
+    let inside = path
+        .components()
+        .all(|c| !matches!(c, std::path::Component::ParentDir))
+        && path.starts_with(home)
+        && path != home;
+    inside.then_some(path)
+}
+
 /// FR-84 D4 — the SET-time gate: everything a drop will demand of the value
 /// at use time (shape, placement for THIS writer, creatable and writable),
 /// run now so a `ConfigSet` the daemon would not honour is refused with the
 /// reason instead of saved and silently ignored. The refusal text is what the
 /// desktop shows verbatim.
 pub fn validate_files_dir_setting(raw: &str) -> Result<PathBuf, String> {
-    files_dir::validate(raw, &writer_context(), &files_dir::Rules::from_env())
+    // FR-97 P3d — for whoever a drop would be written as now, and as them:
+    // the gate creates the folder and probes a write.
+    let who = FsAs::now();
+    let writer = who.writer();
+    who.run_here(|| {
+        Ok(files_dir::validate(
+            raw,
+            &writer,
+            &files_dir::Rules::from_env(),
+        ))
+    })
+    .unwrap_or_else(|e| Err(format!("{e:#}")))
 }
 
-/// `raw` as it resolves for THIS writer right now — shape, placement, the
+/// `raw` as it resolves for `writer` right now — shape, placement, the
 /// on-disk link check and "a folder could be here" — with nothing created
-/// or written: what a drop would use, short of the write probe.
-fn resolve_without_creating(raw: &str) -> Result<PathBuf, String> {
-    let writer = writer_context();
+/// or written: what a drop would use, short of the write probe. Run under
+/// the identity the writer describes.
+fn resolve_without_creating(raw: &str, writer: &files_dir::Writer) -> Result<PathBuf, String> {
     let rules = files_dir::Rules::from_env();
-    let p = files_dir::resolve(raw, &writer, &rules)?;
-    files_dir::check_placement_on_disk(&p, &writer, &rules)?;
+    let p = files_dir::resolve(raw, writer, &rules)?;
+    files_dir::check_placement_on_disk(&p, writer, &rules)?;
     files_dir::check_creatable(&p)?;
     Ok(p)
 }
 
-/// The configured folder via [`resolve_without_creating`]. `Ok(None)` = no
-/// folder configured.
-fn configured_folder_without_creating() -> Result<Option<PathBuf>, String> {
+/// The configured folder via [`resolve_without_creating`], for `who` and
+/// under their identity. `Ok(None)` = no folder configured.
+fn configured_folder_without_creating(who: &FsAs) -> Result<Option<PathBuf>, String> {
     match configured_files_dir() {
         None => Ok(None),
-        Some(raw) => resolve_without_creating(&raw).map(Some),
+        Some(raw) => resolve_without_creating(&raw, &who.writer()).map(Some),
     }
 }
 
@@ -331,8 +478,19 @@ fn spawn_effective_refresh() {
 }
 
 fn compute_effective_files_dir(raw: Option<&str>) -> Option<String> {
+    // FR-97 P3d — for whoever a drop would be written as now, and as them
+    // (a blocking thread: the status refresh's own, or `ConfigSet`'s).
+    let who = FsAs::now();
+    who.run_here(|| Ok(compute_effective_files_dir_as(&who, raw)))
+        .unwrap_or_else(|e| {
+            tracing::debug!(%e, "files: the effective folder could not be computed as its writer");
+            None
+        })
+}
+
+fn compute_effective_files_dir_as(who: &FsAs, raw: Option<&str>) -> Option<String> {
     if let Some(raw) = raw {
-        match resolve_without_creating(raw) {
+        match resolve_without_creating(raw, &who.writer()) {
             Ok(p) => return Some(p.to_string_lossy().into_owned()),
             Err(e) => tracing::debug!(
                 files_dir = %raw,
@@ -341,7 +499,7 @@ fn compute_effective_files_dir(raw: Option<&str>) -> Option<String> {
             ),
         }
     }
-    default_download_dir(false)
+    default_download_dir_as(who, false)
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
 }
@@ -386,9 +544,19 @@ pub fn active_transfer_count() -> usize {
 /// **Test isolation**: `cargo test` runs in parallel by default and
 /// the registry is process-global, so use [`reset_partial_registry`]
 /// at the start of every test that touches partial state.
-pub static PARTIAL_REGISTRY: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
+pub(crate) static PARTIAL_REGISTRY: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, PartialEntry>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// One registered partial: its `meta.json`, and who staged it. FR-97 P3d —
+/// a resume, a cancel and the sweep act on the partial AS whoever staged
+/// it: in the person's own folder, `meta.json` is theirs to edit, and a
+/// resume renames to the folder it names.
+#[derive(Debug, Clone)]
+pub(crate) struct PartialEntry {
+    pub(crate) meta_path: PathBuf,
+    pub(crate) who: FsAs,
+}
 
 /// Test-only escape hatch — clears the partial registry between
 /// `cargo test` cases that touch the same global. Production code
@@ -599,24 +767,38 @@ pub async fn sweep_orphans() -> (usize, usize) {
     // FR-84 D4 — a partial lives next to the folder its transfer targeted:
     // walk the default folder AND the configured one (when set, usable and
     // different), so a `files_dir` change strands no resumable upload.
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Ok(d) = default_download_dir(false) {
-        roots.push(d);
-    }
-    // Only a folder that still passes for this writer — the sweep deletes,
-    // so it must never walk a configured value the placement rule refuses.
-    if let Ok(Some(c)) = configured_folder_without_creating()
-        && !roots.contains(&c)
-    {
-        roots.push(c);
-    }
+    // FR-97 P3d — for, and as, whoever a drop would be written as now: on a
+    // Linux system install, the person at seat0, in their own folder.
+    let who = FsAs::now();
+    let w = who.clone();
+    let roots = who
+        .run(move || {
+            let mut roots: Vec<PathBuf> = Vec::new();
+            if let Ok(d) = default_download_dir_as(&w, false) {
+                roots.push(d);
+            }
+            // Only a folder that still passes for this writer — the sweep
+            // deletes, so it must never walk a configured value the
+            // placement rule refuses.
+            if let Ok(Some(c)) = configured_folder_without_creating(&w)
+                && !roots.contains(&c)
+            {
+                roots.push(c);
+            }
+            Ok(roots)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(%e, "sweep_orphans: could not resolve the drop folders as their writer");
+            Vec::new()
+        });
     if roots.is_empty() {
         tracing::debug!("sweep_orphans: Downloads dir not resolvable; skipping");
         return (0, 0);
     }
     let (mut kept, mut swept) = (0, 0);
     for root in &roots {
-        let (k, s) = sweep_orphans_in(root).await;
+        let (k, s) = sweep_orphans_dir_as(&who, root.join(".roomler-partial")).await;
         kept += k;
         swept += s;
     }
@@ -628,7 +810,7 @@ pub async fn sweep_orphans() -> (usize, usize) {
 /// staging\` (no `.roomler-partial` parent). Mirror of [`sweep_orphans_in`]
 /// minus the parent-join — the contents-of-directory loop is identical.
 pub async fn sweep_orphans_root(dir: &std::path::Path) -> (usize, usize) {
-    sweep_orphans_dir(dir).await
+    sweep_orphans_dir_as(&FsAs::Daemon, dir.to_path_buf()).await
 }
 
 /// Test-friendly variant taking an explicit root. Production code
@@ -638,34 +820,69 @@ pub async fn sweep_orphans_root(dir: &std::path::Path) -> (usize, usize) {
 /// Windows (where `download_dir()` ignores HOME and resolves via
 /// `KNOWNFOLDERID`).
 pub async fn sweep_orphans_in(root: &std::path::Path) -> (usize, usize) {
-    let dir = root.join(".roomler-partial");
-    sweep_orphans_dir(&dir).await
+    sweep_orphans_dir_as(&FsAs::Daemon, root.join(".roomler-partial")).await
 }
 
 /// Shared sweep body — reads `dir` as a directory whose children are
 /// `<id>/{meta.json,data}` triples, removes those older than
 /// [`PARTIAL_ORPHAN_TTL_SECS`] and registers survivors. Used by both
 /// the legacy `<Downloads>/.roomler-partial/` layout and the rc.22
-/// `%PROGRAMDATA%\roomler\<segment>\staging\` layout.
-async fn sweep_orphans_dir(dir: &std::path::Path) -> (usize, usize) {
+/// `%PROGRAMDATA%\roomler\<segment>\staging\` layout. FR-97 P3d — the
+/// walk and every removal run as `who`, and a survivor is registered as
+/// staged by `who`, so a later resume acts as them too.
+async fn sweep_orphans_dir_as(who: &FsAs, dir: PathBuf) -> (usize, usize) {
     let now = chrono::Utc::now().timestamp();
-    let mut kept = 0usize;
-    let mut swept = 0usize;
-
-    let mut rd = match tokio::fs::read_dir(dir).await {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::debug!(dir = %dir.display(), "sweep_orphans: dir absent; nothing to do");
-            return (0, 0);
-        }
+    let walked = dir.clone();
+    let (survivors, swept) = match who
+        .run(move || Ok(sweep_orphans_dir_here(&walked, now)))
+        .await
+    {
+        Ok(v) => v,
         Err(e) => {
-            tracing::warn!(dir = %dir.display(), %e, "sweep_orphans: read_dir failed");
+            tracing::warn!(dir = %dir.display(), %e, "sweep_orphans: could not act as the folder's writer");
             return (0, 0);
         }
     };
-    while let Ok(Some(entry)) = rd.next_entry().await {
+    let kept = survivors.len();
+    if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
+        for (id, meta_path) in survivors {
+            g.insert(
+                id,
+                PartialEntry {
+                    meta_path,
+                    who: who.clone(),
+                },
+            );
+        }
+    }
+    if kept + swept > 0 {
+        tracing::info!(kept, swept, "sweep_orphans: complete");
+    }
+    (kept, swept)
+}
+
+/// The sweep's filesystem half, on THIS (blocking) thread under the
+/// caller's identity: the survivors as `(id, meta.json)`, and how many
+/// partials were removed.
+fn sweep_orphans_dir_here(dir: &std::path::Path, now: i64) -> (Vec<(String, PathBuf)>, usize) {
+    let mut survivors = Vec::new();
+    let mut swept = 0usize;
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(dir = %dir.display(), "sweep_orphans: dir absent; nothing to do");
+            return (survivors, 0);
+        }
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), %e, "sweep_orphans: read_dir failed");
+            return (survivors, 0);
+        }
+    };
+    for entry in rd.flatten() {
         let path = entry.path();
-        if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+        // `DirEntry::file_type` does not follow a link: a link to a folder
+        // is skipped, never walked.
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
         let id = match path.file_name().and_then(|s| s.to_str()) {
@@ -673,11 +890,11 @@ async fn sweep_orphans_dir(dir: &std::path::Path) -> (usize, usize) {
             None => continue,
         };
         let meta_path = path.join("meta.json");
-        let meta_bytes = match tokio::fs::read(&meta_path).await {
+        let meta_bytes = match std::fs::read(&meta_path) {
             Ok(b) => b,
             Err(_) => {
                 // No meta.json — partial state corrupt, prune.
-                let _ = tokio::fs::remove_dir_all(&path).await;
+                let _ = std::fs::remove_dir_all(&path);
                 swept += 1;
                 continue;
             }
@@ -686,7 +903,7 @@ async fn sweep_orphans_dir(dir: &std::path::Path) -> (usize, usize) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(meta = %meta_path.display(), %e, "sweep_orphans: corrupt meta.json; removing");
-                let _ = tokio::fs::remove_dir_all(&path).await;
+                let _ = std::fs::remove_dir_all(&path);
                 swept += 1;
                 continue;
             }
@@ -697,19 +914,13 @@ async fn sweep_orphans_dir(dir: &std::path::Path) -> (usize, usize) {
                 age_h = (now - meta.created_at_unix) / 3600,
                 "sweep_orphans: removing orphaned partial"
             );
-            let _ = tokio::fs::remove_dir_all(&path).await;
+            let _ = std::fs::remove_dir_all(&path);
             swept += 1;
             continue;
         }
-        if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
-            g.insert(id.clone(), meta_path);
-        }
-        kept += 1;
+        survivors.push((id, meta_path));
     }
-    if kept + swept > 0 {
-        tracing::info!(kept, swept, "sweep_orphans: complete");
-    }
-    (kept, swept)
+    (survivors, swept)
 }
 
 /// Incoming control messages over the `files` DC (string payloads).
@@ -933,6 +1144,10 @@ pub(crate) struct IncomingTransfer {
     /// rc.19: folder-upload context preserved for end-time rename
     /// (used by `commit_partial` to recreate the directory tree).
     pub rel_path: Option<String>,
+    /// FR-97 P3d: who this transfer writes as, fixed when it began (or
+    /// resumed): the end-time rename and its cleanup run as them too, even
+    /// after someone else has signed in at the screen.
+    pub who: FsAs,
     /// rc.19: increments [`ACTIVE_TRANSFERS`] on creation, decrements
     /// on drop. Last field so it drops AFTER `file` — guarantees the
     /// kernel page cache has reached the disk-flush queue before the
@@ -1025,6 +1240,23 @@ impl FilesHandler {
         rel_path: Option<&str>,
         dest_path: Option<&str>,
     ) -> Result<PathBuf> {
+        // FR-97 P3d — who this transfer writes as, for its whole life: on a
+        // Linux system install the person at seat0, in their own folder.
+        self.begin_as(FsAs::now(), id, name, expected, rel_path, dest_path)
+            .await
+    }
+
+    /// [`Self::begin`] as an explicit identity: the seam the root-only tests
+    /// use, since a test runner has nobody at seat0.
+    pub(crate) async fn begin_as(
+        &self,
+        who: FsAs,
+        id: String,
+        name: String,
+        expected: u64,
+        rel_path: Option<&str>,
+        dest_path: Option<&str>,
+    ) -> Result<PathBuf> {
         // Before anything lands on disk (a message straddling the session's
         // end); an upload that got past this is dropped by `end_session`.
         self.refuse_if_ended()?;
@@ -1040,7 +1272,7 @@ impl FilesHandler {
         // Downloads with a warning so the upload doesn't silently
         // drop the operator's data.
         let target_dir = match dest_path.filter(|p| !p.is_empty()) {
-            Some(dp) => match resolve_dest_path(dp).await {
+            Some(dp) => match resolve_dest_path_as(&who, dp).await {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!(
@@ -1048,25 +1280,14 @@ impl FilesHandler {
                         %e,
                         "files: dest_path rejected; falling back to Downloads"
                     );
-                    download_dir().context("resolving Downloads folder")?
+                    download_dir_for(&who)
+                        .await
+                        .context("resolving Downloads folder")?
                 }
             },
-            None => download_dir().context("resolving Downloads folder")?,
-        };
-        // Folder upload: resolve `rel_path` to a path under the
-        // target dir, sanitising each component. Falls back to flat
-        // upload when rel_path is empty / missing / refused by
-        // sanitisation. This is the *reserved* final path; the real
-        // rename target is recomputed at `end()` time per M4 fix.
-        let reserved_final = match rel_path.filter(|p| !p.is_empty()) {
-            Some(rel) => resolve_folder_upload_path(&target_dir, rel).unwrap_or_else(|| {
-                tracing::warn!(
-                    rel_path = rel,
-                    "files: rel_path rejected; falling back to flat upload"
-                );
-                unique_path(&target_dir, &sanitize_filename(&name))
-            }),
-            None => unique_path(&target_dir, &sanitize_filename(&name)),
+            None => download_dir_for(&who)
+                .await
+                .context("resolving Downloads folder")?,
         };
         let filename = sanitize_filename(&name);
 
@@ -1075,57 +1296,104 @@ impl FilesHandler {
         // B2 fixes). `end()` renames to a freshly-resolved final path.
         let partial_dir = partial_dir_for(&target_dir, &id);
 
-        // B1 fix — reject if an existing partial dir is on disk for
-        // this id. The browser MUST send `files:resume` instead, or
-        // generate a new UUID. Without this check `File::create(data)`
-        // below would truncate the existing partial. The
-        // `PARTIAL_REGISTRY` lookup is an optimisation — the
-        // authoritative test is the on-disk dir.
-        if tokio::fs::metadata(&partial_dir).await.is_ok() {
-            return Err(anyhow!(
-                "id {id} already has partial state; send files:resume"
-            ));
-        }
+        // Every step below touches the target folder, so all of it runs as
+        // `who` (FR-97 P3d).
+        let (reserved_final, meta_path, file) = {
+            let (target_dir, partial_dir, filename, id) = (
+                target_dir.clone(),
+                partial_dir.clone(),
+                filename.clone(),
+                id.clone(),
+            );
+            let rel_for_path = rel_path.filter(|p| !p.is_empty()).map(str::to_string);
+            let rel_for_meta = rel_path.map(str::to_string);
+            who.run(move || {
+                // Folder upload: resolve `rel_path` to a path under the
+                // target dir, sanitising each component. Falls back to flat
+                // upload when rel_path is empty / missing / refused by
+                // sanitisation. This is the *reserved* final path; the real
+                // rename target is recomputed at `end()` time per M4 fix.
+                let reserved_final = match rel_for_path.as_deref() {
+                    Some(rel) => {
+                        resolve_folder_upload_path(&target_dir, rel).unwrap_or_else(|| {
+                            tracing::warn!(
+                                rel_path = rel,
+                                "files: rel_path rejected; falling back to flat upload"
+                            );
+                            unique_path(&target_dir, &filename)
+                        })
+                    }
+                    None => unique_path(&target_dir, &filename),
+                };
 
-        let parent_partial = partial_dir
-            .parent()
-            .expect("partial_dir has a parent by construction");
-        tokio::fs::create_dir_all(parent_partial)
-            .await
-            .with_context(|| format!("creating {}", parent_partial.display()))?;
-        set_hidden(parent_partial);
-        tokio::fs::create_dir_all(&partial_dir)
-            .await
-            .with_context(|| format!("creating {}", partial_dir.display()))?;
+                // B1 fix — reject if an existing partial dir is on disk for
+                // this id. The browser MUST send `files:resume` instead, or
+                // generate a new UUID. Without this check the data file
+                // below would truncate the existing partial. The
+                // `PARTIAL_REGISTRY` lookup is an optimisation — the
+                // authoritative test is the on-disk dir. `symlink_metadata`:
+                // a link planted there counts as "on disk" too.
+                if std::fs::symlink_metadata(&partial_dir).is_ok() {
+                    return Err(anyhow!(
+                        "id {id} already has partial state; send files:resume"
+                    ));
+                }
 
-        // Write meta.json BEFORE opening the data file. If meta
-        // write fails the staging dir is left empty (cheap to clean).
-        let meta = PartialMeta {
-            protocol_version: 1,
-            filename: filename.clone(),
-            expected_size: expected,
-            dest_dir: target_dir.clone(),
-            reserved_final_path: reserved_final.clone(),
-            created_at_unix: chrono::Utc::now().timestamp(),
-            rel_path: rel_path.map(|s| s.to_string()),
+                let parent_partial = partial_dir
+                    .parent()
+                    .expect("partial_dir has a parent by construction");
+                std::fs::create_dir_all(parent_partial)
+                    .with_context(|| format!("creating {}", parent_partial.display()))?;
+                set_hidden(parent_partial);
+                // `create_dir`, never `_all`: this id's folder is made now,
+                // or the begin fails — an existing one is never adopted.
+                std::fs::create_dir(&partial_dir)
+                    .with_context(|| format!("creating {}", partial_dir.display()))?;
+
+                // Write meta.json BEFORE opening the data file. If meta
+                // write fails the staging dir is left empty (cheap to clean).
+                let meta = PartialMeta {
+                    protocol_version: 1,
+                    filename: filename.clone(),
+                    expected_size: expected,
+                    dest_dir: target_dir.clone(),
+                    reserved_final_path: reserved_final.clone(),
+                    created_at_unix: chrono::Utc::now().timestamp(),
+                    rel_path: rel_for_meta,
+                };
+                let meta_path = partial_dir.join("meta.json");
+                let meta_bytes =
+                    serde_json::to_vec_pretty(&meta).context("serialising partial meta.json")?;
+                std::fs::write(&meta_path, &meta_bytes)
+                    .with_context(|| format!("writing {}", meta_path.display()))?;
+
+                // `create_new`: the folder is new, so the file must be too;
+                // a link planted in its place refuses the open.
+                let data_path = partial_dir.join("data");
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&data_path)
+                    .with_context(|| format!("creating {}", data_path.display()))?;
+                Ok((reserved_final, meta_path, file))
+            })
+            .await?
         };
-        let meta_path = partial_dir.join("meta.json");
-        let meta_bytes =
-            serde_json::to_vec_pretty(&meta).context("serialising partial meta.json")?;
-        tokio::fs::write(&meta_path, &meta_bytes)
-            .await
-            .with_context(|| format!("writing {}", meta_path.display()))?;
-
-        let data_path = partial_dir.join("data");
-        let file = File::create(&data_path)
-            .await
-            .with_context(|| format!("creating {}", data_path.display()))?;
+        // The open file carries the identity's rights from here on; the
+        // writes through it need no identity of their own.
+        let file = File::from_std(file);
 
         // Populate the in-memory registry so a same-process resume
         // request (DC drop without agent restart) can find this
         // partial without re-running the orphan sweep.
         if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
-            g.insert(id.clone(), meta_path);
+            g.insert(
+                id.clone(),
+                PartialEntry {
+                    meta_path,
+                    who: who.clone(),
+                },
+            );
         }
 
         let mut guard = self.incoming.lock().await;
@@ -1146,6 +1414,7 @@ impl FilesHandler {
             filename,
             last_synced: 0,
             rel_path: rel_path.map(|s| s.to_string()),
+            who,
             _active_guard: ActiveTransferGuard::new(),
         });
         Ok(reserved_final)
@@ -1243,66 +1512,76 @@ impl FilesHandler {
 
         // M4 fix: re-run unique_path at rename time so an operator
         // who created a colliding file mid-upload doesn't make us
-        // overwrite their work.
-        let actual_final_path = match state.rel_path.as_deref().filter(|p| !p.is_empty()) {
-            Some(rel) => resolve_folder_upload_path(&state.dest_dir, rel)
-                .unwrap_or_else(|| unique_path(&state.dest_dir, &state.filename)),
-            None => unique_path(&state.dest_dir, &state.filename),
-        };
-        if let Some(parent) = actual_final_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("creating final parent {}", parent.display()))?;
-        }
+        // overwrite their work. FR-97 P3d: every step in the target
+        // folder runs as whoever began the transfer.
+        let (dest_dir, filename, rel, partial_dir) = (
+            state.dest_dir.clone(),
+            state.filename.clone(),
+            state.rel_path.clone(),
+            state.partial_dir.clone(),
+        );
+        let actual_final_path = state
+            .who
+            .run(move || {
+                let actual_final_path = match rel.as_deref().filter(|p| !p.is_empty()) {
+                    Some(rel) => resolve_folder_upload_path(&dest_dir, rel)
+                        .unwrap_or_else(|| unique_path(&dest_dir, &filename)),
+                    None => unique_path(&dest_dir, &filename),
+                };
+                if let Some(parent) = actual_final_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("creating final parent {}", parent.display()))?;
+                }
 
-        let data_path = state.partial_dir.join("data");
-        // rc.22 — the staging dir may now be on a different volume than
-        // the final destination (PROGRAMDATA = C:, dest_path could be
-        // D:\, a network mapped drive, or operator-redirected
-        // Downloads). `tokio::fs::rename` returns
-        // `ErrorKind::CrossesDevices` in that case (Windows
-        // `ERROR_NOT_SAME_DEVICE` / Linux `EXDEV`); fall back to copy +
-        // remove. Cross-volume costs an extra pass through the file
-        // (35 MB ≈ 200 ms on NVMe, single-digit seconds on HDD or
-        // 1 GbE SMB) which is acceptable for a one-shot at end-time —
-        // the per-chunk write loop is what we want to keep on PROGRAMDATA.
-        match tokio::fs::rename(&data_path, &actual_final_path).await {
-            Ok(()) => {}
-            Err(e) if is_cross_volume_error(&e) => {
-                tracing::info!(
-                    from = %data_path.display(),
-                    to = %actual_final_path.display(),
-                    "files: cross-volume staging → final; copy+remove fallback"
-                );
-                tokio::fs::copy(&data_path, &actual_final_path)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "cross-volume copy {} -> {}",
+                let data_path = partial_dir.join("data");
+                // rc.22 — the staging dir may now be on a different volume than
+                // the final destination (PROGRAMDATA = C:, dest_path could be
+                // D:\, a network mapped drive, or operator-redirected
+                // Downloads). `rename` returns `ErrorKind::CrossesDevices` in
+                // that case (Windows `ERROR_NOT_SAME_DEVICE` / Linux `EXDEV`);
+                // fall back to copy + remove. Cross-volume costs an extra pass
+                // through the file (35 MB ≈ 200 ms on NVMe, single-digit
+                // seconds on HDD or 1 GbE SMB) which is acceptable for a
+                // one-shot at end-time — the per-chunk write loop is what we
+                // want to keep on PROGRAMDATA.
+                match std::fs::rename(&data_path, &actual_final_path) {
+                    Ok(()) => {}
+                    Err(e) if is_cross_volume_error(&e) => {
+                        tracing::info!(
+                            from = %data_path.display(),
+                            to = %actual_final_path.display(),
+                            "files: cross-volume staging → final; copy+remove fallback"
+                        );
+                        std::fs::copy(&data_path, &actual_final_path).with_context(|| {
+                            format!(
+                                "cross-volume copy {} -> {}",
+                                data_path.display(),
+                                actual_final_path.display()
+                            )
+                        })?;
+                        std::fs::remove_file(&data_path).ok();
+                    }
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e).context(format!(
+                            "renaming {} -> {}",
                             data_path.display(),
                             actual_final_path.display()
-                        )
-                    })?;
-                tokio::fs::remove_file(&data_path).await.ok();
-            }
-            Err(e) => {
-                return Err(anyhow::Error::from(e).context(format!(
-                    "renaming {} -> {}",
-                    data_path.display(),
-                    actual_final_path.display()
-                )));
-            }
-        }
+                        )));
+                    }
+                }
 
-        // Cleanup: remove the per-id staging dir + registry entry.
-        let _ = tokio::fs::remove_dir_all(&state.partial_dir).await;
+                // Cleanup: remove the per-id staging dir, then the parent
+                // `.roomler-partial/` dir if it's now empty so the staging
+                // convention stays invisible (best-effort).
+                let _ = std::fs::remove_dir_all(&partial_dir);
+                if let Some(parent) = partial_dir.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+                Ok(actual_final_path)
+            })
+            .await?;
         if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
             g.remove(&state.id);
-        }
-        // Best-effort: remove the parent `.roomler-partial/` dir if
-        // it's now empty so the staging convention stays invisible.
-        if let Some(parent) = state.partial_dir.parent() {
-            let _ = tokio::fs::remove_dir(parent).await;
         }
 
         Ok((actual_final_path, state.received))
@@ -1369,13 +1648,23 @@ impl FilesHandler {
             };
             // meta_path is <dest_dir>/.roomler-partial/<id>/meta.json;
             // parent is the per-id staging dir.
-            g.get(id).and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            g.get(id).and_then(|e| {
+                e.meta_path
+                    .parent()
+                    .map(|p| (p.to_path_buf(), e.who.clone()))
+            })
         };
-        if let Some(dir) = staging {
-            let _ = tokio::fs::remove_dir_all(&dir).await;
-            if let Some(parent) = dir.parent() {
-                let _ = tokio::fs::remove_dir(parent).await;
-            }
+        if let Some((dir, who)) = staging {
+            // FR-97 P3d — removed as whoever staged it.
+            let _ = who
+                .run(move || {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    if let Some(parent) = dir.parent() {
+                        let _ = std::fs::remove_dir(parent);
+                    }
+                    Ok(())
+                })
+                .await;
             if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
                 g.remove(id);
             }
@@ -1411,19 +1700,22 @@ impl FilesHandler {
         // the canonical Downloads-rooted location for cross-restart
         // discovery survivors. Poison-tolerant — the HashMap has no
         // invariants a panicking test/peer could break.
-        let meta_path = {
+        let entry = {
             let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
             g.get(id).cloned()
         };
-        let meta_path = match meta_path {
-            Some(p) => p,
+        let (meta_path, who) = match entry {
+            Some(e) => (e.meta_path, e.who),
             None => {
                 // On-demand fallback (sweep may have raced or the
                 // partial lives under the staging root but registry
                 // was cleared). rc.22 — the staging root depends on
                 // the strategy: PROGRAMDATA on Windows (always-on by
                 // default), or `<Downloads>/.roomler-partial/` for the
-                // legacy escape-hatch path / non-Windows.
+                // legacy escape-hatch path / non-Windows. FR-97 P3d —
+                // probed, like everything after, as whoever a drop would
+                // be written as now.
+                let who = FsAs::now();
                 let canonical = {
                     #[cfg(target_os = "windows")]
                     {
@@ -1439,64 +1731,72 @@ impl FilesHandler {
                     }
                     #[cfg(not(target_os = "windows"))]
                     {
-                        download_dir()
+                        download_dir_for(&who)
+                            .await
                             .context("resolving Downloads for on-demand resume probe")?
                             .join(".roomler-partial")
                             .join(id)
                             .join("meta.json")
                     }
                 };
-                if tokio::fs::metadata(&canonical).await.is_err() {
+                let probe = canonical.clone();
+                if !who
+                    .run(move || Ok(std::fs::metadata(&probe).is_ok()))
+                    .await?
+                {
                     return Err(anyhow!("no partial state for id {id}"));
                 }
-                canonical
+                (canonical, who)
             }
         };
 
-        let meta_bytes = tokio::fs::read(&meta_path)
-            .await
-            .with_context(|| format!("reading {}", meta_path.display()))?;
-        let meta: PartialMeta = serde_json::from_slice(&meta_bytes)
-            .with_context(|| format!("parsing {}", meta_path.display()))?;
-        let partial_dir = meta_path
-            .parent()
-            .ok_or_else(|| anyhow!("meta_path has no parent"))?
-            .to_path_buf();
-        let data_path = partial_dir.join("data");
+        // FR-97 P3d — read, truncate and reopen as whoever staged the
+        // partial: in the person's own folder, `meta.json` is theirs to
+        // edit, and the end-time rename goes where it says.
+        let (meta, partial_dir, accepted, file) = who
+            .run(move || {
+                let meta_bytes = std::fs::read(&meta_path)
+                    .with_context(|| format!("reading {}", meta_path.display()))?;
+                let meta: PartialMeta = serde_json::from_slice(&meta_bytes)
+                    .with_context(|| format!("parsing {}", meta_path.display()))?;
+                let partial_dir = meta_path
+                    .parent()
+                    .ok_or_else(|| anyhow!("meta_path has no parent"))?
+                    .to_path_buf();
+                let data_path = partial_dir.join("data");
 
-        // disk_size — the source of truth for how much survived. May
-        // be smaller than the browser's requested offset (kill
-        // happened between sync_data calls).
-        let disk_meta = tokio::fs::metadata(&data_path)
-            .await
-            .with_context(|| format!("stat {}", data_path.display()))?;
-        let disk_size = disk_meta.len();
+                // disk_size — the source of truth for how much survived. May
+                // be smaller than the browser's requested offset (kill
+                // happened between sync_data calls).
+                let disk_size = std::fs::metadata(&data_path)
+                    .with_context(|| format!("stat {}", data_path.display()))?
+                    .len();
 
-        // B3 truncation: align to 256 KiB so resumes match the
-        // existing files:progress cadence the browser uses for
-        // bytesAcked.
-        const ALIGN_MASK: u64 = !(256 * 1024 - 1);
-        let accepted = requested_offset.min(disk_size) & ALIGN_MASK;
+                // B3 truncation: align to 256 KiB so resumes match the
+                // existing files:progress cadence the browser uses for
+                // bytesAcked.
+                const ALIGN_MASK: u64 = !(256 * 1024 - 1);
+                let accepted = requested_offset.min(disk_size) & ALIGN_MASK;
 
-        // Truncate the file in place to accepted, then open for
-        // append. tokio::fs::File doesn't have set_len-and-seek in
-        // one shot; we set_len first, then OpenOptions to append.
-        {
-            let truncate_file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .open(&data_path)
-                .await
-                .with_context(|| format!("opening {} for truncate", data_path.display()))?;
-            truncate_file
-                .set_len(accepted)
-                .await
-                .with_context(|| format!("truncating {} to {accepted}", data_path.display()))?;
-        }
-        let file = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&data_path)
-            .await
-            .with_context(|| format!("re-opening {} for append", data_path.display()))?;
+                // Truncate the file in place to accepted, then open for
+                // append.
+                {
+                    let truncate_file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&data_path)
+                        .with_context(|| format!("opening {} for truncate", data_path.display()))?;
+                    truncate_file.set_len(accepted).with_context(|| {
+                        format!("truncating {} to {accepted}", data_path.display())
+                    })?;
+                }
+                let file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&data_path)
+                    .with_context(|| format!("re-opening {} for append", data_path.display()))?;
+                Ok((meta, partial_dir, accepted, file))
+            })
+            .await?;
+        let file = File::from_std(file);
 
         // Reinstall state on THIS DC. Refuse if the slot is already
         // populated — browser is misbehaving if it sends resume
@@ -1518,6 +1818,7 @@ impl FilesHandler {
             filename: meta.filename.clone(),
             last_synced: accepted,
             rel_path: meta.rel_path.clone(),
+            who,
             _active_guard: ActiveTransferGuard::new(),
         });
         tracing::info!(
@@ -1729,13 +2030,37 @@ fn validate_outgoing_path(input: &str) -> Result<PathBuf> {
 /// `dest_path` field on `files:begin`. On error, the caller falls
 /// back to the default Downloads/ target with a warning log so the
 /// upload doesn't silently drop the operator's data.
+#[cfg(test)]
 async fn resolve_dest_path(input: &str) -> Result<PathBuf> {
     resolve_dest_path_for(input, &writer_context(), &files_dir::Rules::from_env()).await
 }
 
+/// FR-97 P3d — [`resolve_dest_path`] for `who`, AS `who`: the path is
+/// canonicalised (links followed) with their rights, and for the person at
+/// seat0 the placement rule's active home is theirs.
+async fn resolve_dest_path_as(who: &FsAs, input: &str) -> Result<PathBuf> {
+    let (input, writer) = (input.to_string(), who.writer());
+    who.run(move || resolve_dest_path_here(&input, &writer, &files_dir::Rules::from_env()))
+        .await
+}
+
 /// [`resolve_dest_path`] for an explicit writer — the seam the tests use,
 /// since a test process is never SYSTEM.
+#[cfg(test)]
 async fn resolve_dest_path_for(
+    input: &str,
+    writer: &files_dir::Writer,
+    rules: &files_dir::Rules,
+) -> Result<PathBuf> {
+    let (input, writer, rules) = (input.to_string(), writer.clone(), rules.clone());
+    FsAs::Daemon
+        .run(move || resolve_dest_path_here(&input, &writer, &rules))
+        .await
+}
+
+/// The body of the dest_path checks, on THIS (blocking) thread under the
+/// identity `writer` describes.
+fn resolve_dest_path_here(
     input: &str,
     writer: &files_dir::Writer,
     rules: &files_dir::Rules,
@@ -1748,9 +2073,8 @@ async fn resolve_dest_path_for(
             canonical.display()
         ));
     }
-    let meta = tokio::fs::metadata(&canonical)
-        .await
-        .with_context(|| format!("stat {}", canonical.display()))?;
+    let meta =
+        std::fs::metadata(&canonical).with_context(|| format!("stat {}", canonical.display()))?;
     if !meta.is_dir() {
         return Err(anyhow!(
             "dest_path is not a directory: {}",
@@ -2432,6 +2756,48 @@ fn split_stem_ext(name: &str) -> (&str, &str) {
 /// shape, placement for the identity doing the writing and the user signed
 /// in now, links followed, created if missing, a write probe — and a
 /// refusal is logged and falls back rather than failing the drop.
+/// FR-97 P3d — the drop folder for `who`, resolved as them (the configured
+/// folder's gate creates it and probes a write).
+async fn download_dir_for(who: &FsAs) -> Result<PathBuf> {
+    let w = who.clone();
+    who.run(move || download_dir_as(&w)).await
+}
+
+/// [`download_dir`] for `who`, on a thread under their identity. For the
+/// person at seat0: the configured folder when it passes for them (inside
+/// THEIR home, FR-84 D4's rule), else their own Downloads.
+fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
+    match who {
+        FsAs::Daemon => download_dir(),
+        #[cfg(target_os = "linux")]
+        FsAs::Person { home, .. } => {
+            if let Some(raw) = configured_files_dir() {
+                let writer = who.writer();
+                match files_dir::validate(&raw, &writer, &files_dir::Rules::from_env()) {
+                    Ok(dir) => return Ok(dir),
+                    Err(e) => tracing::warn!(
+                        files_dir = %raw,
+                        active_home = ?writer.active_home,
+                        %e,
+                        "files: configured files_dir refused for the person at seat0 — this \
+                         transfer lands in their Downloads"
+                    ),
+                }
+            }
+            Ok(person_downloads(home))
+        }
+    }
+}
+
+/// [`default_download_dir`] for `who`, on a thread under their identity.
+fn default_download_dir_as(who: &FsAs, log: bool) -> Result<PathBuf> {
+    match who {
+        FsAs::Daemon => default_download_dir(log),
+        #[cfg(target_os = "linux")]
+        FsAs::Person { home, .. } => Ok(person_downloads(home)),
+    }
+}
+
 fn download_dir() -> Result<PathBuf> {
     if let Some(raw) = configured_files_dir() {
         let writer = writer_context();
@@ -3882,7 +4248,10 @@ mod tests {
         // explicit drop and flags the guard against the await below.)
         {
             let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-            assert_eq!(g.get(&id).map(|p| p.as_path()), Some(meta_path.as_path()));
+            assert_eq!(
+                g.get(&id).map(|e| e.meta_path.as_path()),
+                Some(meta_path.as_path())
+            );
         }
 
         h.abort().await;
@@ -4422,3 +4791,194 @@ mod tests {
     }
 }
 // RETIRED-NAME-ANCHOR-END
+
+/// FR-97 P3d — a received file on a Linux system install, written as the
+/// person at seat0. The identity half needs root: CI runs this module under
+/// sudo with `ROOMLERD_TEST_REQUIRE_ROOT`, so it cannot pass by skipping.
+/// `xdg_download_dir` is pure and runs everywhere.
+#[cfg(test)]
+mod seat_user_tests {
+    use super::*;
+
+    #[test]
+    fn the_xdg_download_dir_is_taken_only_inside_home() {
+        let home = std::path::Path::new("/home/ana");
+        let pick = |text: &str| xdg_download_dir(text, home);
+        assert_eq!(
+            pick("XDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\n"),
+            Some(home.join("Downloads"))
+        );
+        assert_eq!(
+            pick(
+                "# written by xdg-user-dirs-update\nXDG_DESKTOP_DIR=\"$HOME/Desktop\"\nXDG_DOWNLOAD_DIR=\"$HOME/Téléchargements\"\n"
+            ),
+            Some(home.join("Téléchargements"))
+        );
+        assert_eq!(
+            pick("XDG_DOWNLOAD_DIR=\"/home/ana/dl\""),
+            Some(home.join("dl"))
+        );
+        // The file is the person's to write, so it may name anything: only a
+        // folder inside their home is taken.
+        assert_eq!(pick("XDG_DOWNLOAD_DIR=\"/etc\""), None);
+        assert_eq!(pick("XDG_DOWNLOAD_DIR=\"$HOME/../bob\""), None);
+        assert_eq!(
+            pick("XDG_DOWNLOAD_DIR=\"$HOME/\""),
+            None,
+            "the home itself means unset"
+        );
+        assert_eq!(pick(""), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    mod as_root {
+        use super::*;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        fn root() -> bool {
+            // SAFETY: reads our own credentials.
+            let root = unsafe { libc::geteuid() } == 0;
+            if !root && std::env::var_os("ROOMLERD_TEST_REQUIRE_ROOT").is_some() {
+                panic!("ROOMLERD_TEST_REQUIRE_ROOT is set and this test is not running as root");
+            }
+            root
+        }
+
+        /// A home `nobody` owns, as a person's is theirs.
+        fn nobodys_home() -> (tempfile::TempDir, crate::fs_identity::Account) {
+            let person =
+                crate::fs_identity::Account::by_name("nobody").expect("the `nobody` account");
+            let home = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::os::unix::fs::chown(home.path(), Some(person.uid), Some(person.gid)).unwrap();
+            (home, person)
+        }
+
+        fn as_person(person: &crate::fs_identity::Account, home: &std::path::Path) -> FsAs {
+            FsAs::Person {
+                account: person.clone(),
+                home: home.to_path_buf(),
+            }
+        }
+
+        /// The file is born the person's, in their folder, and nothing of the
+        /// staging is left. 0.4.143 wrote it `root:root` into `/tmp` (FR-97
+        /// §8, P3d's red).
+        #[tokio::test]
+        async fn a_received_file_is_born_the_persons() {
+            if !root() {
+                return;
+            }
+            let (home, person) = nobodys_home();
+            let h = FilesHandler::new();
+            let id = format!("p3d-born-{}", std::process::id());
+            h.begin_as(
+                as_person(&person, home.path()),
+                id.clone(),
+                "probe.txt".into(),
+                5,
+                None,
+                None,
+            )
+            .await
+            .expect("begin as the person");
+            h.chunk(b"hello").await.expect("chunk");
+            let (path, bytes) = h.end(&id).await.expect("end");
+            assert_eq!(bytes, 5);
+            assert_eq!(
+                path,
+                home.path().join("probe.txt"),
+                "no Downloads: their home"
+            );
+            let md = std::fs::metadata(&path).unwrap();
+            assert_eq!(
+                (md.uid(), md.gid()),
+                (person.uid, person.gid),
+                "born the person's"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+            assert!(
+                !home.path().join(".roomler-partial").exists(),
+                "the staging is gone"
+            );
+        }
+
+        /// A link the person planted where the staging goes is followed with
+        /// THEIR rights: into a folder only root may write, the begin is
+        /// refused and nothing lands there. The control: root's own rights go
+        /// straight through the same link.
+        #[tokio::test]
+        async fn a_link_in_the_persons_folder_gets_only_the_persons_rights() {
+            if !root() {
+                return;
+            }
+            let (home, person) = nobodys_home();
+            let roots_only = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(roots_only.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let link = home.path().join(".roomler-partial");
+            std::os::unix::fs::symlink(roots_only.path(), &link).unwrap();
+            std::os::unix::fs::lchown(&link, Some(person.uid), Some(person.gid)).unwrap();
+
+            // The control: as root, the planted link leads straight in.
+            let probe = link.join("root-probe");
+            std::fs::create_dir(&probe).expect("root creates through the planted link");
+            std::fs::remove_dir(&probe).unwrap();
+
+            let h = FilesHandler::new();
+            let id = format!("p3d-link-{}", std::process::id());
+            let err = h
+                .begin_as(
+                    as_person(&person, home.path()),
+                    id,
+                    "probe.txt".into(),
+                    5,
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("the person cannot write where the link leads");
+            assert!(format!("{err:#}").contains("Permission denied"), "{err:#}");
+            assert_eq!(
+                std::fs::read_dir(roots_only.path()).unwrap().count(),
+                0,
+                "nothing landed in root's folder"
+            );
+        }
+
+        /// Their Downloads when they have one, and the folder their own
+        /// `user-dirs.dirs` names when it names one.
+        #[tokio::test]
+        async fn the_persons_downloads_is_theirs_to_name() {
+            if !root() {
+                return;
+            }
+            let (home, person) = nobodys_home();
+            let theirs = |p: &std::path::Path| {
+                std::fs::create_dir_all(p).unwrap();
+                std::os::unix::fs::chown(p, Some(person.uid), Some(person.gid)).unwrap();
+            };
+            let who = as_person(&person, home.path());
+            assert_eq!(
+                download_dir_for(&who).await.unwrap(),
+                home.path().to_path_buf()
+            );
+            theirs(&home.path().join("Downloads"));
+            assert_eq!(
+                download_dir_for(&who).await.unwrap(),
+                home.path().join("Downloads")
+            );
+            theirs(&home.path().join(".config"));
+            theirs(&home.path().join("Fichiers"));
+            std::fs::write(
+                home.path().join(".config/user-dirs.dirs"),
+                "XDG_DOWNLOAD_DIR=\"$HOME/Fichiers\"\n",
+            )
+            .unwrap();
+            assert_eq!(
+                download_dir_for(&who).await.unwrap(),
+                home.path().join("Fichiers")
+            );
+        }
+    }
+}
