@@ -44,7 +44,9 @@ use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 
 use crate::flow_listener::Carry;
-use crate::forward::{FlowDemux, HalfCloseSink, SessionThroughput, run_flow, run_flow_quic};
+use crate::forward::{
+    FlowCancel, FlowCanceller, FlowDemux, HalfCloseSink, SessionThroughput, run_flow, run_flow_quic,
+};
 use crate::signaling_link::{TunnelSignalingSink, TunnelSignalingSource};
 use crate::transport::quic::{self, QuicConnection, QuicPeer};
 use crate::transport::relay;
@@ -473,6 +475,33 @@ pub struct Carrier {
     _terminate: TerminateOnDrop,
 }
 
+/// #2129 — the client-side trigger: ends a DC carrier's live flows when the
+/// carrier is dropped. Wraps the session's [`FlowCanceller`] and fires it from
+/// [`Drop`], so every way a carrier stops owning its session — `kill_flow`
+/// aborting the flow task, the session dying, a re-upgrade drain reaching
+/// zero, [`run_tunnel_session`] returning — ends the live flows with it. The
+/// exit side triggers the same cancel explicitly from `AgentTunnelPeer::close`
+/// instead; this type exists because the client has no equivalent method — the
+/// carrier is simply dropped.
+struct CancelOnDrop(FlowCanceller);
+
+impl CancelOnDrop {
+    fn new() -> Self {
+        Self(FlowCanceller::new())
+    }
+
+    /// A per-flow handle onto the canceller.
+    fn handle(&self) -> FlowCancel {
+        self.0.handle()
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// The data plane a [`Carrier`] pumps bytes on.
 enum Plane {
     /// `webrtc-dc-v1`: the DC pool, one [`FlowDemux`] per channel, flows
@@ -482,6 +511,12 @@ enum Plane {
         _peer: Arc<TunnelPeer>,
         demuxes: Arc<Vec<FlowDemux>>,
         rr_counter: Arc<AtomicUsize>,
+        /// #2129 — cancels this carrier's live DC flows when the carrier is
+        /// dropped (a kill, the session dying, a re-upgrade cycle's drain
+        /// reaching zero, the standalone CLI's session end). Its [`Drop`]
+        /// fires the cancel; an FR-86 drain drops the carrier only at 0
+        /// in-flight connections, so there is nothing to cancel there.
+        cancel: CancelOnDrop,
     },
     /// `quic-v1` / `quic-derp-v1`: one bidirectional stream per flow on the
     /// session's connection.
@@ -587,11 +622,14 @@ impl Carrier {
             Plane::Dc {
                 demuxes,
                 rr_counter,
+                cancel,
                 ..
             } => {
                 let dc_index_chosen =
                     (rr_counter.fetch_add(1, Ordering::Relaxed) % demuxes.len()) as u8;
                 let demuxes = Arc::clone(demuxes);
+                // #2129 — this flow observes the carrier's cancellation.
+                let cancel = cancel.handle();
                 tokio::spawn(async move {
                     let _in_flight = in_flight;
                     // Resolve the destination: the static `--remote`, or the
@@ -646,6 +684,7 @@ impl Carrier {
                         socks,
                         flow_timeout_streak,
                         session_dead,
+                        cancel,
                     )
                     .await
                     {
@@ -1228,6 +1267,8 @@ async fn establish_webrtc(
             _peer: peer_for_dispatch,
             demuxes,
             rr_counter: Arc::new(AtomicUsize::new(0)),
+            // #2129 — dropping this carrier ends its live DC flows.
+            cancel: CancelOnDrop::new(),
         },
         _terminate: terminate,
     })
@@ -1261,6 +1302,9 @@ async fn handle_local_connection(
     // P7 backstop — see `handle_local_connection_quic`.
     flow_timeout_streak: Arc<std::sync::atomic::AtomicU32>,
     session_dead: Arc<Notify>,
+    // #2129 — the carrier's cancellation; ends this flow if the session ends
+    // while it is live.
+    cancel: FlowCancel,
 ) -> Result<()> {
     // Send the request.
     sink.send(ClientMsg::TcpForwardRequest {
@@ -1351,7 +1395,7 @@ async fn handle_local_connection(
     // endpoints ever see tunnel payload (it rides the data channel), so
     // if we don't send them the audit row records zero forever.
     let stats_for_audit = Arc::clone(&stats);
-    let close_reason = run_flow(tcp, dc, flow_id, from_dc, on_local_eof, stats).await;
+    let close_reason = run_flow(tcp, dc, flow_id, from_dc, on_local_eof, stats, cancel).await;
     info!(flow_id, ?close_reason, "flow ended");
 
     // Audit close. TCP-side counters, not `dc_send`/`dc_recv`: those carry
@@ -3261,5 +3305,187 @@ mod tests {
 
         let _ = stop_a.send(());
         let _ = stop_b.send(());
+    }
+
+    /// Build a real client-side WebRTC-DC [`Carrier`] over a loopback peer
+    /// pair: the offerer is the client, the answerer stands in for the exit.
+    /// Both are returned so the caller can keep them alive — holding the exit
+    /// keeps the DC pool open, so the ONLY thing that can end a live flow is
+    /// the carrier being dropped. The real [`dispatch_loop`] routes
+    /// `TcpForwardAccept` from `TestControl::src_tx` into the reply registry.
+    async fn dc_carrier_for_test(
+        session_id: ObjectId,
+    ) -> (Carrier, TestControl, Arc<TunnelPeer>, TunnelPeer) {
+        let offerer = TunnelPeer::new(vec![]).await.unwrap();
+        let answerer = TunnelPeer::new(vec![]).await.unwrap();
+        let answerer_pc = answerer.peer_connection();
+        offerer.on_local_ice_candidate(move |c| {
+            let pc = Arc::clone(&answerer_pc);
+            Box::pin(async move {
+                if let Some(c) = c
+                    && let Ok(init) = c.to_json()
+                {
+                    let _ = pc.add_ice_candidate(init).await;
+                }
+            })
+        });
+        let offerer_pc = offerer.peer_connection();
+        answerer.on_local_ice_candidate(move |c| {
+            let pc = Arc::clone(&offerer_pc);
+            Box::pin(async move {
+                if let Some(c) = c
+                    && let Ok(init) = c.to_json()
+                {
+                    let _ = pc.add_ice_candidate(init).await;
+                }
+            })
+        });
+        let offer = offerer.create_offer().await.unwrap();
+        let answer = answerer.accept_offer(&offer.sdp).await.unwrap();
+        offerer.accept_answer(&answer.sdp).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), offerer.wait_pool_open())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), answerer.wait_pool_open())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let session = Arc::new(SessionThroughput::default());
+        let peer = Arc::new(offerer);
+        let mut demuxes = Vec::with_capacity(peer.pool_size() as usize);
+        for idx in 0..peer.pool_size() {
+            demuxes.push(FlowDemux::install(peer.dc(idx).unwrap(), Some(session.clone())).await);
+        }
+        let demuxes = Arc::new(demuxes);
+
+        let (sink_tx, sink_rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let sink: Arc<dyn TunnelSignalingSink> = Arc::new(MockSink { tx: sink_tx });
+        let (src_tx, src_rx) = mpsc::channel::<ServerMsg>(8);
+        let source: Box<dyn TunnelSignalingSource> = Box::new(MockSource { rx: src_rx });
+        let reply_registry: ReplyRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let active_flows: ActiveFlows = Arc::new(Mutex::new(HashMap::new()));
+        let pool_ready = Arc::new(Notify::new());
+        let (done_tx, dispatcher_done) = watch::channel(());
+        let dispatcher = AbortOnDrop({
+            let peer = Arc::clone(&peer);
+            let reply_registry = Arc::clone(&reply_registry);
+            let active_flows = Arc::clone(&active_flows);
+            let pool_ready = Arc::clone(&pool_ready);
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                let _done = done_tx;
+                dispatch_loop(
+                    source,
+                    &peer,
+                    session_id,
+                    reply_registry,
+                    active_flows,
+                    pool_ready,
+                    sink,
+                )
+                .await
+            })
+        });
+        let carrier = Carrier {
+            transport: TRANSPORT_WEBRTC_DC_V1,
+            session_id,
+            sink: sink.clone(),
+            target: Target::Static {
+                host: "echo.intranet".into(),
+                port: 22,
+            },
+            session,
+            reply_registry,
+            active_flows,
+            flow_counter: Arc::new(AtomicU32::new(1)),
+            flow_timeout_streak: Arc::new(AtomicU32::new(0)),
+            session_dead: Arc::new(Notify::new()),
+            in_flight: Arc::new(AtomicU64::new(0)),
+            idle: Arc::new(Notify::new()),
+            dispatcher_done,
+            _dispatcher: dispatcher,
+            plane: Plane::Dc {
+                _peer: Arc::clone(&peer),
+                demuxes,
+                rr_counter: Arc::new(AtomicUsize::new(0)),
+                cancel: CancelOnDrop::new(),
+            },
+            _terminate: TerminateOnDrop::new(sink, session_id),
+        };
+        (carrier, TestControl { sink_rx, src_tx }, peer, answerer)
+    }
+
+    /// #2129 — dropping a WebRTC-DC carrier with a LIVE connection ends that
+    /// connection: the app sees EOF/RST and the flow stops, rather than the
+    /// flow hanging on an idle app + an idle exit while the DC stays open. The
+    /// exit stand-in is held alive precisely so the ONLY thing that can end
+    /// the flow is the carrier drop. (An FR-86 drain drops a carrier only at 0
+    /// in-flight connections, so the same drop cancels nothing there.) Run
+    /// under a timeout so a regression fails red instead of hanging.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_a_dc_carrier_ends_its_live_connection() {
+        use tokio::io::AsyncReadExt;
+
+        let session_id = ObjectId::new();
+        let (carrier, mut ctl, _client_peer, _exit_peer) = dc_carrier_for_test(session_id).await;
+
+        // A local app connects; the accepted side is carried.
+        let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut app = tokio::net::TcpStream::connect(local.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (tcp, peer_addr) = local.accept().await.unwrap();
+        carrier.carry(tcp, peer_addr);
+        assert_eq!(carrier.active(), 1, "the carried connection is in flight");
+
+        // Drive the forward accept through the real dispatcher so the flow runs.
+        let flow_id = match next_client_msg(&mut ctl.sink_rx, "TcpForwardRequest").await {
+            ClientMsg::TcpForwardRequest {
+                session_id: sid,
+                flow_id,
+                ..
+            } => {
+                assert_eq!(sid, session_id);
+                flow_id
+            }
+            other => panic!("expected TcpForwardRequest, got {other:?}"),
+        };
+        ctl.src_tx
+            .send(ServerMsg::TcpForwardAccept {
+                session_id,
+                flow_id,
+                dc_index: 0,
+            })
+            .await
+            .unwrap();
+
+        // The flow is live; the app and the exit are both idle. It must not
+        // end on its own while the carrier lives.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut b = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), app.read(&mut b))
+                .await
+                .is_err(),
+            "the live connection stays open while the carrier lives"
+        );
+
+        // Drop the carrier: its DC plane's cancel-on-drop ends the live flow.
+        drop(carrier);
+
+        let eof = tokio::time::timeout(Duration::from_secs(2), app.read(&mut b))
+            .await
+            .expect("dropping the carrier must end the live connection within 2 s");
+        assert!(
+            matches!(eof, Ok(0) | Err(_)),
+            "the app sees EOF or RST, not live bytes: {eof:?}"
+        );
+
+        // Keep the exit peer alive until here, so only the carrier drop could
+        // have ended the flow.
+        drop(_exit_peer);
+        drop(_client_peer);
     }
 }
