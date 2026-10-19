@@ -200,3 +200,20 @@ async fn a_first_message_past_its_bound_and_an_unvouched_upstream_are_refused() 
     );
     assert!(session.await.unwrap().is_err());
 }
+
+/// P3-5c-2 — a client the endpoint does not serve has its first message
+/// answered with why, as a refusal answers it.
+#[tokio::test]
+async fn a_client_the_endpoint_does_not_serve_is_told_why() {
+    let (mut c, mut proxy) = tokio::io::duplex(64 * 1024);
+    c.write_all(&handshake(5)).await.unwrap();
+    refuse(&mut proxy, "the endpoint's lease has ended")
+        .await
+        .unwrap();
+    let m = reply(&mut c).await;
+    assert_eq!((m.op_code, m.response_to), (OP_REPLY, 5));
+    assert_eq!(
+        reply_doc(&m).get_str("errmsg"),
+        Ok("the endpoint's lease has ended")
+    );
+}

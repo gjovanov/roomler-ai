@@ -505,7 +505,7 @@ sequenceDiagram
 | Only a driver's grant answers; a reader's `answer` is refused on the device | | device [`view.rs:1033`](../agents/roomlerd/src/hive/view.rs#L1033) |
 | Unanswered for 25 minutes is a denial that says so. Progress goes to Claude Code every 60 s while a person decides, and the tool-call timeout in the MCP config is 30 minutes | what the model reads is our answer, never a transport error | [`toolbelt.rs:102`](../agents/roomlerd/src/hive/toolbelt.rs#L102) |
 | At most 4 approvals are open per session, and a fifth is refused at once | Claude Code asks one at a time (measured), so more is not Claude Code | [`toolbelt.rs:108`](../agents/roomlerd/src/hive/toolbelt.rs#L108) |
-| The harness letting go (`notifications/cancelled`, a closed relay), a stop, or the session's end withdraws an open approval | | [`toolbelt.rs:1260`](../agents/roomlerd/src/hive/toolbelt.rs#L1260) |
+| The harness letting go (`notifications/cancelled`, a closed relay), a stop, or the session's end withdraws an open approval | | [`toolbelt.rs:1261`](../agents/roomlerd/src/hive/toolbelt.rs#L1261) |
 | A denial reaches the model as a failed tool result with our words verbatim, for example "Alice denied this: not now" | the model knows who said no, and why | |
 
 ---

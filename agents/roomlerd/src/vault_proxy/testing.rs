@@ -509,3 +509,25 @@ pub(crate) fn op_query(request_id: i32, collection: &str, query: &bson::Document
     out.extend(body);
     out
 }
+
+/// P3-5c-2 — a client's MongoDB command, as an `OP_MSG`.
+pub(crate) fn mongo_command(request_id: i32, body: &bson::Document) -> Vec<u8> {
+    super::mongo::op_msg(request_id, 0, body)
+}
+
+/// The next MongoDB reply on `r`, within 10 s: its op code, the request it
+/// answers, and its document.
+pub(crate) async fn mongo_reply<R: AsyncRead + Unpin>(r: &mut R) -> (i32, i32, bson::Document) {
+    use super::mongo::{OP_MSG, OP_REPLY, op_msg_document, read_message};
+    let m = tokio::time::timeout(Duration::from_secs(10), read_message(r, 1 << 20))
+        .await
+        .expect("an answer within 10 s")
+        .expect("a message");
+    let doc = match m.op_code {
+        OP_MSG => op_msg_document(m.body()).unwrap(),
+        // Flags, a cursor, where it starts, how many: then the document.
+        OP_REPLY => bson::Document::from_reader(&mut &m.body()[20..]).unwrap(),
+        other => panic!("a reply of op code {other}"),
+    };
+    (m.op_code, m.response_to, doc)
+}
