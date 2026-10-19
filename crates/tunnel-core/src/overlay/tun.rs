@@ -3776,13 +3776,13 @@ mod system {
         /// Multi-org P2c — assign an ADDITIONAL local address (a secondary
         /// org's self-IP with its block's prefix) to the live device.
         ///
-        /// The shared TUN comes up with the FIRST org's address via [`up`];
-        /// each further org adds its own here so the host answers on every
-        /// org's address and each block's connected route exists. Idempotent:
-        /// re-adding an address the device already holds succeeds (the
-        /// reconnect path re-registers every session). Sync + blocking by
-        /// design — it runs inside the TUN factory, exactly like the blocking
-        /// bring-up work in [`up`] itself.
+        /// ⚠️ No production caller since W7c deleted the shared TUN: every org
+        /// now has an adapter of its own, holding one address (N10). The macOS
+        /// kernel test below still puts a second address on a utun through it.
+        /// Idempotent: re-adding an address the device already holds succeeds.
+        /// Sync + blocking by design, like the bring-up work in [`up`] itself;
+        /// its P2c callers ran it inside the TUN factory, on every reconnect's
+        /// re-registration.
         ///
         /// [`up`]: Self::up
         pub fn add_address_sync(&self, ip: Ipv4Addr, prefix: u8) -> std::io::Result<()> {
@@ -3871,10 +3871,10 @@ mod system {
             }
         }
 
-        /// Multi-org P2c — take a secondary org's address back off the
-        /// shared adapter (its runtime is gone, or its registration was
-        /// refused). Best-effort: a failure here only leaves an idle address
-        /// behind, never breaks a live org.
+        /// Multi-org P2c — take a secondary org's address back off the device
+        /// ([`Self::add_address_sync`]'s inverse). ⚠️ No production caller since
+        /// W7c, as for that. Best-effort: a failure here only leaves an idle
+        /// address behind, never breaks a live org.
         pub fn del_address_sync(&self, ip: Ipv4Addr, prefix: u8) {
             let run = |prog: &str, args: &[String]| {
                 let _ = std::process::Command::new(prog).args(args).output();
@@ -3924,7 +3924,7 @@ mod system {
         /// Dual-stack: the device also gets this node's *derived* overlay
         /// IPv6 ([`derive_overlay_v6`](crate::overlay::router::derive_overlay_v6))
         /// on the ULA `/96` (best-effort, on
-        /// Linux and Windows) — the OS-TUN mirror of the netstack's
+        /// Linux, Windows and macOS) — the OS-TUN mirror of the netstack's
         /// dual-addressed iface. The connected `/96` route auto-installs,
         /// making every peer's derived v6 on-link; the WG bridge routes it
         /// by unmapping the ULA destination to its embedded v4
@@ -4278,8 +4278,8 @@ mod system {
     }
 
     /// Change B — every IPv4 address on every interface EXCEPT the overlay
-    /// adapter itself (matched by interface NAME, so a sibling org's address
-    /// on the shared adapter is excluded too) and loopback. Deliberately
+    /// adapter itself (matched by interface NAME, as are the sibling orgs' own
+    /// adapters, #1237 below) and loopback. Deliberately
     /// UNFILTERED otherwise — unlike `direct::gather_lan_ips`, which *skips*
     /// CGNAT addresses, because an ISP-CGNAT WAN address is exactly what the
     /// floor gate must detect. `None` when enumeration fails OR the overlay
