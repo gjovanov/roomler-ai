@@ -18,9 +18,9 @@
 //! tracker (`capture::cursor::CursorTracker`) reads it with [`latest`]. The
 //! wire is the Windows cursor's: `cursor:shape`, `cursor:pos`, `cursor:hide`.
 //!
-//! ⚠️ **Only the DRM arm writes here.** mutter's and the portal's streams embed
-//! the cursor in their frames, so a second one from the channel would double
-//! it. Those arms publish nothing, and the tracker keeps answering `None` there.
+//! ⚠️ **Only an arm whose frames carry no pointer writes here**: the DRM arm, and
+//! the X11 arm from FR-97 P3a (`x11_cursor.rs`). mutter's and the portal's streams
+//! embed it, so they publish nothing, and the tracker keeps answering `None` there.
 //!
 //! Everything below the slot is pure, so the conversions are pinned by tests
 //! with no DRM device.

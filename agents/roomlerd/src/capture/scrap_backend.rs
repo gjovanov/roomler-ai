@@ -184,7 +184,7 @@ impl ScrapCapture {
                     }
                 };
                 #[allow(unused_mut)]
-                let (mut cap, mut w, mut h, _origin) = match init_outcome {
+                let (mut cap, mut w, mut h, origin) = match init_outcome {
                     Ok(v) => {
                         let _ = ready_tx.send(Ok((v.1, v.2, v.3)));
                         v
@@ -221,6 +221,14 @@ impl ScrapCapture {
                 // off, in which case every tick captures exactly as before.
                 #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
                 let mut damage = super::x11_damage::DamageTracker::open();
+                // FR-97 P3a — XShm frames carry no pointer, so the worker reads
+                // it from XFixes for the cursor channel, on a connection of its
+                // own, built here for the same thread affinity. `None` = no
+                // XFixes or switched off: the viewer draws its stand-in.
+                #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+                let mut x11_cursor = super::x11_cursor::X11Cursor::open(origin);
+                #[cfg(not(all(target_os = "linux", feature = "scrap-capture")))]
+                let _ = origin;
                 // FR-108 P2 — the X11 capturer takes its size when it opens, so
                 // a display-match switch on the virtual desktop opens it again.
                 #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
@@ -341,6 +349,14 @@ impl ScrapCapture {
                                 }
                             }
                         }
+                    }
+                    // FR-97 P3a — the pointer, on every request and before the
+                    // damage check below can skip the frame: a pointer moving
+                    // over an unchanged screen damages nothing, and must still
+                    // move on the viewer's side.
+                    #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+                    if let Some(c) = x11_cursor.as_mut() {
+                        c.publish();
                     }
                     // FR-29 P1 — skip the full-screen XShm readback when the
                     // server says nothing changed. `Ok(None)` is the pump's
