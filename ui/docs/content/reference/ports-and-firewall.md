@@ -36,15 +36,19 @@ remote desktop.
 
 ## Allow-listing by hostname
 
-Installers and updates are served through your server's own origin rather than
-GitHub, so a corporate allow-list only needs:
+The control connection and the Windows installer use your server's own origin.
+Packages and updates come from GitHub's release downloads, so a corporate
+allow-list needs:
 
 | Host | For |
 |---|---|
-| `roomler.ai` — or your own server's hostname | Everything: API, control connection, downloads, updates, the relay floor |
+| `roomler.ai` — or your own server's hostname | The API, the control connection, the relay floor, the Windows installer (MSI) and the tunnel CLI |
+| `github.com` and `release-assets.githubusercontent.com` | The Linux and macOS packages, the desktop companion, and every automatic update |
+| `aka.ms` | Windows only: Microsoft's Visual C++ runtime, when the installer script finds it missing |
 
-That single-origin property is deliberate, and it is what makes the agent
-updatable on a managed network.
+Wherever a download comes from, the agent checks it before installing: the
+publisher's signature on Windows, and on Linux and macOS a GPG signature
+against a key built into the agent.
 
 ## What a self-hosted server needs
 
