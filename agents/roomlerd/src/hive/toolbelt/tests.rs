@@ -1493,3 +1493,22 @@ async fn the_relay_pipes_both_ways_and_ends_with_the_harness() {
     let gone = relay_io(nowhere, tokio::io::empty(), tokio::io::sink()).await;
     assert!(gone.is_err());
 }
+
+/// FR-90 P3-4e-2 — what the model is told when a lease needed a person: a
+/// card nobody answered in time names its approval and says to ask again
+/// once someone can answer it; a `denied` says a driver may have said no.
+#[cfg(feature = "vault")]
+#[test]
+fn a_tool_says_plainly_what_an_approval_came_to() {
+    use crate::vault::LeaseError;
+    let waited = vault_why(LeaseError::AwaitingApproval("A1".into()));
+    assert!(waited.contains("approval A1"), "{waited}");
+    assert!(waited.contains("nobody answered"), "{waited}");
+    let no = vault_why(LeaseError::Refused("denied".into()));
+    assert!(no.contains("said no"), "{no}");
+    assert_eq!(
+        vault_why(LeaseError::Refused("no_role".into())),
+        "the vault refused: no_role"
+    );
+    assert_eq!(APPROVAL_WINDOW, Duration::from_secs(600));
+}

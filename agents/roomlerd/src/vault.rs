@@ -107,7 +107,9 @@ mod client {
     use base64::Engine;
     use bson::oid::ObjectId;
     use roomler_ai_remote_control::signaling::ClientMsg;
-    use roomler_ai_remote_control::vault::{VaultActivityKind, VaultSecretMeta, lease_limits};
+    use roomler_ai_remote_control::vault::{
+        LeaseRefusal, VaultActivityKind, VaultSecretMeta, lease_limits,
+    };
     use tokio::sync::{mpsc, oneshot};
     use tracing::{debug, info, warn};
     use zeroize::Zeroizing;
@@ -117,6 +119,12 @@ mod client {
     /// How long a request waits for the vault's answer. A server without the
     /// vault mounted never answers one.
     pub const ANSWER_DEADLINE: Duration = Duration::from_secs(15);
+
+    /// P3-4e-2 — how soon a request whose card waits for a person is asked
+    /// again, and how seldom at most: each ask is a decision the vault
+    /// records, so the pause doubles to its ceiling.
+    const APPROVAL_FIRST_PAUSE: Duration = Duration::from_secs(2);
+    const APPROVAL_MAX_PAUSE: Duration = Duration::from_secs(15);
 
     /// How often the daemon lets go of what has expired, though nothing asked.
     const PRUNE_EVERY: Duration = Duration::from_secs(5);
@@ -164,6 +172,10 @@ mod client {
         /// The vault refused, in one word: a `LeaseRefusal`'s, or a newer
         /// server's this build cannot name, which is a refusal all the same.
         Refused(String),
+        /// P3-4e — the vault's policies allow this only with a person's yes,
+        /// and its card waits in the session's room: the approval's id.
+        /// [`Client::request_until_approved`] asks again while it waits.
+        AwaitingApproval(String),
         /// No connection to ask on.
         NotConnected,
         /// No answer within the deadline.
@@ -392,6 +404,34 @@ mod client {
             self.request_within(ask, ANSWER_DEADLINE).await
         }
 
+        /// P3-4e-2 — ask for a lease, and while the vault answers that its
+        /// card waits for a person, ask again: 2 s later, then twice as long
+        /// each time up to 15 s, until a lease, any other answer, or `window`
+        /// since the first wait (a card's own: `APPROVAL_ANSWER_SECS`). A card
+        /// still waiting then is the answer. A caller that stops waiting (a
+        /// cancelled tool call drops this future) stops the asking with it.
+        pub async fn request_until_approved(
+            &self,
+            ask: LeaseAsk,
+            window: Duration,
+        ) -> Result<LeaseInfo, LeaseError> {
+            let mut since = None;
+            let mut pause = APPROVAL_FIRST_PAUSE;
+            loop {
+                match self.request(ask.clone()).await {
+                    Err(LeaseError::AwaitingApproval(id)) => {
+                        let since = *since.get_or_insert_with(tokio::time::Instant::now);
+                        if since.elapsed() + pause > window {
+                            return Err(LeaseError::AwaitingApproval(id));
+                        }
+                        tokio::time::sleep(pause).await;
+                        pause = (pause * 2).min(APPROVAL_MAX_PAUSE);
+                    }
+                    other => return other,
+                }
+            }
+        }
+
         /// Ask for a lease, and wait `deadline` for the answer.
         pub async fn request_within(
             &self,
@@ -523,10 +563,15 @@ mod client {
         }
 
         /// `rc:vault.refused`: answer the request, whatever it asked, in the
-        /// vault's word.
-        pub fn on_refused(&self, req_id: &str, reason: &str) {
+        /// vault's word — P3-4e: `awaiting_approval` with the approval it
+        /// names.
+        pub fn on_refused(&self, req_id: &str, reason: &str, approval_id: Option<&str>) {
             if let Some(w) = lock(&self.pending).remove(req_id) {
-                w.fail(LeaseError::Refused(reason.to_string()));
+                w.fail(if reason == LeaseRefusal::AwaitingApproval.wire() {
+                    LeaseError::AwaitingApproval(approval_id.unwrap_or_default().to_string())
+                } else {
+                    LeaseError::Refused(reason.to_string())
+                });
             }
         }
 
@@ -696,8 +741,8 @@ mod client {
     }
 
     /// The daemon's [`Client::on_refused`].
-    pub fn on_refused(req_id: &str, reason: &str) {
-        CLIENT.on_refused(req_id, reason);
+    pub fn on_refused(req_id: &str, reason: &str, approval_id: Option<&str>) {
+        CLIENT.on_refused(req_id, reason, approval_id);
     }
 
     /// The daemon's [`Client::on_revoke`].
@@ -933,7 +978,7 @@ mod tests {
                 ClientMsg::VaultList { req_id, .. } => req_id,
                 other => panic!("{other:?}"),
             };
-            c.on_refused(&req_id, "no_role");
+            c.on_refused(&req_id, "no_role", None);
             assert_eq!(
                 lister.await.unwrap(),
                 Err(LeaseError::Refused("no_role".into()))
@@ -953,6 +998,17 @@ mod tests {
                 ClientMsg::VaultLease { req_id, .. } => req_id,
                 other => panic!("{other:?}"),
             }
+        }
+
+        /// P3-4e-2 — the next lease request on the connection, within a
+        /// minute of the test's paused clock: an ask that never comes fails
+        /// the test rather than hanging it.
+        async fn next_ask(rx: &mut mpsc::Receiver<ClientMsg>) -> String {
+            let frame = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+                .await
+                .expect("a lease request within a minute")
+                .expect("the connection is open");
+            req_id_of(frame)
         }
 
         /// Lease `lease_id` for (`session`, `fence`), the vault answering
@@ -1036,12 +1092,95 @@ mod tests {
                 let c = c.clone();
                 tokio::spawn(async move { c.request(ask(ObjectId::new(), 1)).await })
             };
-            c.on_refused(&req_id_of(rx.recv().await.unwrap()), "denied");
+            c.on_refused(&req_id_of(rx.recv().await.unwrap()), "denied", None);
             assert_eq!(
                 asker.await.unwrap(),
                 Err(LeaseError::Refused("denied".into()))
             );
             assert!(c.held().is_empty());
+        }
+
+        /// P3-4e-2 — a lease whose card waits for a person is asked for
+        /// again, 2 s and then 4 s later, each time as a request of its own,
+        /// until the yes leases it.
+        #[tokio::test(start_paused = true)]
+        async fn a_lease_a_card_waits_on_is_asked_again_until_a_yes() {
+            let (c, mut rx) = connected();
+            let sid = ObjectId::new();
+            let asker = {
+                let c = c.clone();
+                tokio::spawn(async move {
+                    c.request_until_approved(ask(sid, 1), Duration::from_secs(600))
+                        .await
+                })
+            };
+            let first = next_ask(&mut rx).await;
+            let t0 = tokio::time::Instant::now();
+            c.on_refused(&first, "awaiting_approval", Some("A1"));
+            let second = next_ask(&mut rx).await;
+            assert_ne!(second, first, "a request of its own");
+            assert_eq!(t0.elapsed().as_secs(), 2);
+            let t1 = tokio::time::Instant::now();
+            c.on_refused(&second, "awaiting_approval", Some("A1"));
+            let third = next_ask(&mut rx).await;
+            assert_eq!(t1.elapsed().as_secs(), 4);
+            c.on_leased(
+                &third,
+                "L1",
+                1,
+                &sealed_for_us(b"canary-vault-value"),
+                in_ms(60_000),
+            );
+            assert_eq!(asker.await.unwrap().unwrap().lease_id, "L1");
+        }
+
+        /// P3-4e-2 — a no after a wait is the answer, and nothing asks again.
+        #[tokio::test(start_paused = true)]
+        async fn a_no_after_a_wait_is_the_answer() {
+            let (c, mut rx) = connected();
+            let asker = {
+                let c = c.clone();
+                tokio::spawn(async move {
+                    c.request_until_approved(ask(ObjectId::new(), 1), Duration::from_secs(600))
+                        .await
+                })
+            };
+            let first = next_ask(&mut rx).await;
+            c.on_refused(&first, "awaiting_approval", Some("A1"));
+            c.on_refused(&next_ask(&mut rx).await, "denied", None);
+            assert_eq!(
+                asker.await.unwrap(),
+                Err(LeaseError::Refused("denied".into()))
+            );
+            assert!(rx.try_recv().is_err(), "nothing asked again");
+        }
+
+        /// P3-4e-2 — a card nobody answers ends the wait at its window: asked
+        /// at 0, 2, 6, 14 and 29 s (the pause doubling to 15 s), and the
+        /// card still waiting is the answer, naming it.
+        #[tokio::test(start_paused = true)]
+        async fn a_card_nobody_answers_ends_the_wait_at_its_window() {
+            let (c, mut rx) = connected();
+            let t0 = tokio::time::Instant::now();
+            let asker = {
+                let c = c.clone();
+                tokio::spawn(async move {
+                    c.request_until_approved(ask(ObjectId::new(), 1), Duration::from_secs(30))
+                        .await
+                })
+            };
+            let mut at = Vec::new();
+            for _ in 0..5 {
+                let req_id = next_ask(&mut rx).await;
+                at.push(t0.elapsed().as_secs());
+                c.on_refused(&req_id, "awaiting_approval", Some("A1"));
+            }
+            assert_eq!(
+                asker.await.unwrap(),
+                Err(LeaseError::AwaitingApproval("A1".into()))
+            );
+            assert_eq!(at, [0, 2, 6, 14, 29]);
+            assert!(rx.try_recv().is_err(), "nothing asked past the window");
         }
 
         /// Without a connection there is no request; without an answer in

@@ -637,7 +637,7 @@ sequenceDiagram
 - **The decision is one pure function**
   ([`sas.rs:97`](../agents/roomlerd/src/input/sas.rs#L97)), compiled on every
   OS so the lanes that never run Windows tests check it. It is made at every
-  announcement ([`signaling.rs:6643`](../agents/roomlerd/src/signaling.rs#L6643)),
+  announcement ([`signaling.rs:6647`](../agents/roomlerd/src/signaling.rs#L6647)),
   and the heartbeat re-announces the moment its answer changes, so a policy a
   GPO refresh changes reaches the server within a beat. Where it says no, the
   `keys-only` entry stays and its reason names the half that is missing.
@@ -1699,7 +1699,7 @@ hears the terminate and `merge_live_stats` matches nothing. So a session with no
 observation — overwhelmingly a short one — recorded none, which the freeze reads as `unknown`. Since
 P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:944`)
 and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2203`), by the
-same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:6509`) queues the sample on
+same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:6513`) queues the sample on
 **the peer's own sender**, the FR-43 seam the peer was built with (`peer.rs:285`) — the loop's outbound
 queue for its own session, flushed to the WS one hop later, or the delegation channel for a delegated
 session, so a supervised Mac's sample reaches the server under the daemon's identity, the one the

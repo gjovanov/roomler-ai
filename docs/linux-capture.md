@@ -515,7 +515,7 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:47`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`signaling.rs:6477`). A changed brief (a login, a
+heartbeat only read that cache (`signaling.rs:6481`). A changed brief (a login, a
 logout, the greeter) re-announces the caps on the next heartbeat (`:2112`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
