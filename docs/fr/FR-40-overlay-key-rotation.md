@@ -23,7 +23,7 @@ were not printed (re-checked with a masked scan of the transcript, 2026-08-30).
 
 There is **no remedy for that today** short of re-enrolling the device: no rotation on the CLI,
 none over LocalAPI (`overlay_wg_secret_key` is deliberately unwritable there,
-`crates/agent-core/src/config_surface.rs:2260-2130`), none on the web. Re-enrolling needs a fresh
+`crates/agent-core/src/config_surface.rs:2269-2139`), none on the web. Re-enrolling needs a fresh
 enrollment token, local or `exec` access as SYSTEM/root, a daemon restart, and it is not what an
 operator reaches for when a key leaks — they reach for "rotate".
 
@@ -39,9 +39,9 @@ additionally refuses a registration whose pubkey is not the row's (`derp.rs:339-
 | piece | where | note |
 |---|---|---|
 | primary key mint | `agents/roomlerd/src/main.rs:3428-3435` | lazy, at daemon start, `WgKeypair::generate()` → `config::save`; the ONLY primary mint |
-| secondary-org mint | `crates/agent-core/src/enrollment.rs:613-617` | at enroll-append; never copied from the primary (cross-org correlation) |
-| storage | `crates/agent-core/src/config.rs:1794` (primary), `:1924` (`OrgEntry`), `for_org` at `:2063-2088` | the key is **per org** — `for_org` scopes it, unlike `exec_enabled`/`ssh_*` which are host-global |
-| atomic save | `config.rs:2141` | tmp + `sync_all` + 0600/ACL + `.prev` + rename, under the daemon-wide write lock (`org_join.rs:48`) |
+| secondary-org mint | `crates/agent-core/src/enrollment.rs:614-618` | at enroll-append; never copied from the primary (cross-org correlation) |
+| storage | `crates/agent-core/src/config.rs:1803` (primary), `:1933` (`OrgEntry`), `for_org` at `:2072-2097` | the key is **per org** — `for_org` scopes it, unlike `exec_enabled`/`ssh_*` which are host-global |
+| atomic save | `config.rs:3301` | tmp + `sync_all` + 0600/ACL + `.prev` + rename, under the daemon-wide write lock (`org_join.rs:48`) |
 | how a session gets its key | `agents/roomlerd/src/signaling.rs:444-449`, `:881-883`; `overlay.rs:210-217` | from the in-memory `AgentConfig` snapshot taken at start — **never re-read from disk per session** |
 | runtime identity | `agents/roomlerd/src/overlay.rs:79-86` (`RuntimeFingerprint::same_shape` includes `wg_public_key`), `:236-243`, `:425-433` | a changed secret already fails re-attach and rebuilds the runtime |
 | existing per-org cycle | `main.rs:2883-2904` (`spawn_org`: stop the previous loop, re-load config from disk, respawn) | the primary loop has NO stop handle |
@@ -49,7 +49,7 @@ additionally refuses a registration whose pubkey is not the row's (`derp.rs:339-
 | peer fan-out | `overlay.rs:531-561` → `OverlayNetmapDelta { upserts, removes }` (`signaling.rs:3465`) | an upsert IS the update; the re-join already carries the new key to every peer |
 | peer reinstall | `crates/tunnel-core/src/overlay/runtime/establish.rs:1147-1180` | "peer's WG public key changed — reinstalling its carrier" (`PeerRoute::Keep`) |
 | DERP | `crates/api/src/ws/derp.rs:339-362` (pubkey must equal the row's), `derp_acl.rs:99-140` rebuilt on every join (`overlay.rs:481-490`) | the row must carry the new key BEFORE the node re-registers — the join does exactly that |
-| the push precedent | `crates/api/src/routes/remote_control.rs:831-872` (`trigger_agent_update`, `MANAGE_AGENTS`, `Hub::send_to_agent`), agent arm `signaling.rs:2766-2788` (primary-only) | `UpdateNow` is sent BLIND — no cap gate |
+| the push precedent | `crates/api/src/routes/remote_control.rs:831-872` (`trigger_agent_update`, `MANAGE_AGENTS`, `Hub::send_to_agent`), agent arm `signaling.rs:2767-2789` (primary-only) | `UpdateNow` is sent BLIND — no cap gate |
 | the report-back precedent | `ClientMsg::ConfigStatus` (`signaling.rs:505`), `record_config_report` (`ws/remote_control.rs:940-985`), `config_audit` (`models.rs:2385-2348`) | the shape to copy: revision-bumped request, device reports the revision, server resolves ONE state |
 | capability verbs | `crates/remote_control/src/models.rs:271-384` | `RpcCap` — no rotation verb exists |
 | UI | `ui/src/components/admin/AgentsSection.vue:1908-1906`, `ui/src/stores/agents.ts:743-704` | "Update now"; **no view shows the overlay public key anywhere** |

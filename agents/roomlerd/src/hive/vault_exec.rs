@@ -468,7 +468,21 @@ pub(crate) async fn call(
         }
         values.push((name.clone(), value));
     }
-    run_with(target, &req, &values, &path).await
+    let answer = run_with(target, &req, &values, &path).await?;
+    // P3-4d-2 — the command ran with these values: reported where the
+    // device's owner has it report, with how it ended, never a value.
+    vault.report(crate::vault::Report {
+        session_id: session,
+        fence,
+        kind: roomler_ai_remote_control::vault::VaultActivityKind::Exec,
+        lease_ids: leases,
+        target: program,
+        exit_code: answer["exit_code"]
+            .as_i64()
+            .and_then(|c| i32::try_from(c).ok()),
+        timed_out: answer["timed_out"].as_bool().unwrap_or(false),
+    });
+    Ok(answer)
 }
 
 /// Lets go of a call's leases when dropped.

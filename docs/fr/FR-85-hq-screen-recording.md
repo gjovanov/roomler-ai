@@ -35,7 +35,7 @@ what it costs in installer size and ships with integration and e2e tests.
   and a synthetic source with a decodable 64-bit counter strip (`capture/synthetic_backend.rs:41`); `EncoderThread`
   (`encode/thread.rs:118`); the cells, denylist and probe cache; the child-process probe pattern (`encode/caps.rs`); the
   uid drop used by the portal helper (`capture/portal/mod.rs`); cpal loopback audio + audiopus Opus (`audio/`); the
-  consent chain and `PromptKind` (`consent.rs:157`); the config surface (`crates/agent-core/src/config_surface.rs:1087`)
+  consent chain and `PromptKind` (`consent.rs:157`); the config surface (`crates/agent-core/src/config_surface.rs:1095`)
   and LocalAPI `ConfigSet`; the capture-excluded Windows indicator (`indicator/win.rs`); the updater's
   `decide_defer` (`updater.rs:119`); the files-DC chunk pump (`peer.rs:10544`); `.roomler-partial` staging (`files.rs`).
 
@@ -133,7 +133,7 @@ what it costs in installer size and ships with integration and e2e tests.
   create + write + delete probe — Defender Controlled Folder Access lets `metadata()` succeed and then blocks the write.
   Otherwise `%USERPROFILE%\Roomler Recordings`. macOS `~/Movies/Roomler`; Linux `$(xdg-user-dir VIDEOS)/Roomler`.
 - **Override**: `record_dir`, a device-owned config key and the surface's first path-valued key. The validator in
-  `config_surface.rs:1055` refuses relative paths, `~`, UNC, `\\?\` and device paths, and reparse components.
+  `config_surface.rs:1063` refuses relative paths, `~`, UNC, `\\?\` and device paths, and reparse components.
   roomler-desktop sets it through `ConfigSet` with a native folder picker — a Rust command over
   `tauri_plugin_dialog::DialogExt`, because the webview has no dialog capability today — plus "Reset to default".
 - **Write rule.** The recorder writes into the folder only when it runs as that folder's user. It stages in

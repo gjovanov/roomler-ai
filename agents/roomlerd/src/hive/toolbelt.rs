@@ -296,6 +296,10 @@ pub(crate) trait VaultTools: Send + Sync {
     /// Let go of these leases now.
     #[cfg(feature = "vault")]
     fn release(&self, lease_ids: &[String]);
+    /// P3-4d-2 — a use of leased values, reported where the device's owner
+    /// has it report; nothing otherwise. Never waits.
+    #[cfg(feature = "vault")]
+    fn report(&self, r: crate::vault::Report);
 }
 
 /// FR-90 P3-4b — the run a toolbelt serves, and what it offers that run.
@@ -515,6 +519,10 @@ impl VaultTools for DaemonVault {
 
     fn release(&self, lease_ids: &[String]) {
         crate::vault::CLIENT.release(lease_ids);
+    }
+
+    fn report(&self, r: crate::vault::Report) {
+        crate::vault::CLIENT.report(r);
     }
 }
 

@@ -473,6 +473,9 @@ struct FakeVault {
     lefts: std::sync::Mutex<HashMap<String, Duration>>,
     #[cfg(feature = "vault")]
     ahead: std::sync::Mutex<Vec<(String, String, String, String)>>,
+    /// P3-4d-2 — each use reported.
+    #[cfg(feature = "vault")]
+    reports: std::sync::Mutex<Vec<crate::vault::Report>>,
 }
 
 impl FakeVault {
@@ -572,6 +575,11 @@ impl VaultTools for FakeVault {
             return None;
         }
         self.lefts.lock().unwrap().get(lease_id).copied()
+    }
+
+    #[cfg(feature = "vault")]
+    fn report(&self, r: crate::vault::Report) {
+        self.reports.lock().unwrap().push(r);
     }
 
     #[cfg(feature = "vault")]
@@ -975,6 +983,20 @@ async fn vault_exec_runs_with_the_value_and_answers_it_scrubbed() {
         vault.held.lock().unwrap().is_empty(),
         "let go after the run"
     );
+    // P3-4d-2 — and the use is reported: the lease, the program, how it
+    // ended; never a value.
+    assert_eq!(
+        *vault.reports.lock().unwrap(),
+        [crate::vault::Report {
+            session_id: sid,
+            fence: 5,
+            kind: roomler_ai_remote_control::vault::VaultActivityKind::Exec,
+            lease_ids: vec!["L0".into()],
+            target: "sh".into(),
+            exit_code: Some(0),
+            timed_out: false,
+        }]
+    );
 }
 
 /// P3-4c-1 — one refused lease runs nothing, and the leases already held are
@@ -1029,6 +1051,10 @@ async fn a_refusal_runs_nothing_and_a_bad_call_asks_nothing() {
         asked,
         "a bad call asks the vault nothing"
     );
+    assert!(
+        vault.reports.lock().unwrap().is_empty(),
+        "nothing ran, nothing is reported"
+    );
 }
 
 /// P3-4c-1 — the timeout kills the command and everything it started, and
@@ -1056,6 +1082,10 @@ async fn a_command_past_its_timeout_is_killed_with_its_group() {
     assert_eq!(answer["timed_out"], true, "{answer}");
     assert!(started.elapsed() < Duration::from_secs(10));
     assert!(vault.held.lock().unwrap().is_empty());
+    // P3-4d-2 — reported as killed: no exit code, timed out.
+    let reports = vault.reports.lock().unwrap().clone();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!((reports[0].exit_code, reports[0].timed_out), (None, true));
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert!(
         !dir.path().join("survived").exists(),
@@ -1134,6 +1164,16 @@ async fn vault_render_writes_the_file_and_keeps_its_leases() {
         vault.released.lock().unwrap().is_empty(),
         "kept: the file lives with its leases"
     );
+    // P3-4d-2 — and the use is reported: both leases, the file's name.
+    let reports = vault.reports.lock().unwrap().clone();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(
+        reports[0].kind,
+        roomler_ai_remote_control::vault::VaultActivityKind::Render
+    );
+    assert_eq!(reports[0].lease_ids, ["L0", "L1"]);
+    assert_eq!(reports[0].target, "db.env");
+    assert_eq!(reports[0].exit_code, None);
 }
 
 /// P3-4c-2 — one refused lease writes nothing and lets the others go.
@@ -1158,6 +1198,10 @@ async fn a_refused_render_writes_nothing() {
     assert!(!dir.path().join("run").join("secrets").join("out").exists());
     assert_eq!(*vault.released.lock().unwrap(), ["L0"]);
     assert!(vault.attached.lock().unwrap().is_empty());
+    assert!(
+        vault.reports.lock().unwrap().is_empty(),
+        "nothing written, nothing reported"
+    );
 }
 
 /// P3-4c-3 — `vault_request` is offered with the reads and allowed like
