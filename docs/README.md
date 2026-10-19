@@ -28,6 +28,7 @@ flowchart TB
         ATA["agent-tunnel-architecture.md"]
         ARCH["architecture.md"]
         MM["modular-monolith.md"]
+        PS["platform-support.md"]
     end
 
     subgraph rd["🖥️ 1 · Remote desktop"]
@@ -71,6 +72,7 @@ flowchart TB
     ARCH --> rd & net & collab
     ARCH --> MM
     ARCH --> hive
+    PS --> rd & net & ops
     MM --> ops
     rd & net --> ops
     rd & net & collab & hive --> REF
@@ -85,6 +87,7 @@ flowchart TB
 | [compare/](compare/README.md) | Head-to-head against Tailscale, RustDesk, TeamViewer, MeshCentral, NetBird and StarDesk — each page naming what the other product does better, first |
 | [agent-tunnel-architecture.md](agent-tunnel-architecture.md) | The remote-access stack (daemon + CLI + coordination) in five minutes — written for end users and operators |
 | [architecture.md](architecture.md) | The whole system: control plane vs the three data planes, workspace crate map, deployment topology |
+| [platform-support.md](platform-support.md) | What each OS serves (FR-97): the install types and who each runs as, a table per pillar with the code each verdict comes from, and the reason for every feature an OS rules out |
 | [modular-monolith.md](modular-monolith.md) | How the server is composed (FR-69): `roomler-core` + six modules behind one `Module` contract, the DAG, the five build profiles and what each leaves out, runtime capability gating, wire ownership, the hooks that carry the inverse cascades, and the composition baseline that gates every move — and (FR-75) how each profile is proven to CARRY TRAFFIC rather than merely link: a throwaway cell per profile whose 404-vs-401 door probes assert every absence positively, then chat + a real call, remote-desktop frames, and a two-agent overlay ping |
 
 ## 🖥️ 1 · Desktop sharing & remote control
@@ -119,7 +122,7 @@ port forwards, SOCKS5, SSH without sshd, and exit nodes on top.*
 | [peer-relays.md](peer-relays.md) | The org relay (FR-19): one of the org's own devices forwarding its peers' WireGuard ciphertext over UDP 3478, so relayed pairs stop crossing the API pod — why it is a relay kind and not a tier, the five default-deny gates and who owns each, the mint and its audit vocabulary, the two-key bind, revocation as a push, **what the relay operator can still see**, and the measured ~74× pod offload |
 | [overlay-exit-nodes.md](overlay-exit-nodes.md) | Tailscale-style exit nodes: full-egress routing (v4+v6+DNS) with the never-self-wedge safety model; what each OS can do as client and as exit, and how a Mac pins its exemptions (FR-97 P1a); a netstack client, whose exit carries only its SOCKS5 front's IPv4 dials, never steers the host's DNS and never serves as an exit (FR-97 P0c-3) |
 | [overlay-wfp.md](overlay-wfp.md) | Windows: surviving a Group-Policy-locked firewall via the Windows Filtering Platform — and the daemon's own Defender rule, written by the service host before the worker's first bind (#1698) |
-| [multi-org.md](multi-org.md) | One device in N organizations: `[[orgs]]`, address blocks, the shared carrier plane, mux NAT |
+| [multi-org.md](multi-org.md) | One device in N organizations: `[[orgs]]`, address blocks, the shared carrier plane, an adapter per organization (the shared-TUN mux and its NAT are history since W7c) |
 | [overlay-key-rotation.md](overlay-key-rotation.md) | Retiring a device's overlay (WireGuard) key from the device grid (FR-40): an **order, never a delivery** — the device mints locally, persists first, reports with public keys only and re-joins, the join is the proof, and the server never sees a private key; the four cells of the route's decision (`pushed` · `queued` · 409 `rate_limited` · 409 `agent_unsupported`), the server-resolved states the chip names, reconcile-on-connect and the three field-run races it must not re-run, the device kill switch, what is deliberately not rotated |
 | [tunnels.md](tunnels.md) | Concepts & protocol: forwards, SOCKS5 (TCP+UDP), mesh mode, declared routes, transports, the flow-owned listener + carriers (FR-86), LocalAPI, CLI |
 | [tunnel-install.md](tunnel-install.md) | Step-by-step runbook: install, enroll, ACL policy, open and test a forward from a corporate network |

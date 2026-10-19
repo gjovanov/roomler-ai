@@ -1860,7 +1860,7 @@ fn rpc_caps() -> Vec<String> {
     // FR-90 — a build that runs agent sessions answers `rc:hive.start` and
     // reports with `rc:hive.state`. A property of the BUILD, like `ssh`: the
     // device still refuses unless its owner switched `hive_enabled` on, and
-    // says so in the ack. Linux only in P0.
+    // says so in the ack. Every `hive_host` build: Linux, macOS, Windows.
     #[cfg(hive_host)]
     caps.push(RpcCap::Hive);
     // FR-90 P0d-2 — and serves a session's transcript to a browser over a

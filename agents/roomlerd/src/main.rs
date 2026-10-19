@@ -4642,8 +4642,8 @@ async fn run_cmd(
                 // The PER-ORG shutdown, not the global one — that is what
                 // makes a single org cyclable.
                 let rx = org_sd_rx;
-                // Cleanup handles: release this org's shared-TUN claim when
-                // its loop ends, unless a re-spawn replaced us (see below).
+                // Cleanup handles: release this org's adapter and SOCKS claims
+                // when its loop ends, unless a re-spawn replaced us (see below).
                 let cleanup_stops = org_stops.clone();
                 let cleanup_label = org.label.clone();
                 let cleanup_tenant = org.tenant_id.clone();
@@ -4694,8 +4694,8 @@ async fn run_cmd(
                                 }
                             }
                         }
-                        // This org is done — hand its shared-TUN address back
-                        // (docs/multi-org.md §12: it used to linger until the
+                        // This org is done — hand its adapter and SOCKS port back
+                        // (docs/multi-org.md §12: they used to linger until the
                         // daemon restarted).
                         //
                         // ONLY when no replacement took our slot: a RE-spawn
@@ -4717,7 +4717,7 @@ async fn run_cmd(
                             }
                             // The overlay module only exists in a build with
                             // an overlay surface; without one there is no
-                            // shared TUN to release.
+                            // adapter or SOCKS port to release.
                             #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
                             roomlerd::overlay::release_org(&cleanup_tenant);
                             #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]

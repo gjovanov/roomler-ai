@@ -53,17 +53,25 @@ desktop. The root half of the install exists for the mesh and tunnels, not for
 capture.
 
 @linux
-Two options, depending on the machine.
+Three options, depending on the machine.
 
 **A machine with a desktop** — install the per-user unit and it shares the
-session you are logged into. Both X11 and Wayland are supported.
+session you are logged into, on X11 or Wayland. It starts when you log in.
+
+**A system install** (`--system`) runs as root from boot. On GNOME and KDE it
+shows the desktop of the person signed in at the screen by itself, while that
+session is unlocked and the person can be told who is viewing. It never shows
+the login screen or a locked screen on its own. To reach those too, switch
+screen capture and input on in the device's configuration (`drm_capture` and
+`uinput`): the agent then reads whatever the screen shows, the login screen
+included, which is the Linux counterpart of the Windows system mode.
 
 **A headless machine** — enable the agent's virtual-display mode in its
 configuration. The machine then has a screen to capture, so *View screen* drops
 you into a live console instead of failing.
 
-Set it in the device's configuration rather than through an environment
-variable, so it survives a reboot and applies to a daemon started outside
+Set these in the device's configuration rather than through an environment
+variable, so they survive a reboot and apply to a daemon started outside
 systemd.
 :::
 

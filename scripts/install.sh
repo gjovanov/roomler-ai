@@ -20,8 +20,8 @@
 #   --system          (daemon role, Linux only) install as a ROOT systemd
 #                     SYSTEM service instead of the per-user unit. Pick this
 #                     for a headless / server / WSL node: root is what lets
-#                     the overlay bring up its TUN. You lose screen capture +
-#                     input injection, which need a logged-in X session.
+#                     the overlay bring up its TUN. It shows the person's
+#                     GNOME or KDE desktop while it is on screen (FR-95/113).
 #                     Config goes to /etc/roomler/config.toml. Both kinds
 #                     update unattended: a system install's root daemon
 #                     installs its own updates, and a per-user install gets a
@@ -483,7 +483,7 @@ install_daemon_linux() {
 
     if [ "$SYSTEM" = 1 ]; then
         disable_update_helper
-        say "enabling the systemd SYSTEM unit (root — self-update + overlay TUN work; no screen capture)"
+        say "enabling the systemd SYSTEM unit (root: self-update, the overlay TUN, and the desktop of the person on screen)"
         sudo systemctl daemon-reload || true
         sudo systemctl enable --now roomlerd.service
         say "daemon status: $(sudo systemctl is-active roomlerd.service || true)"
