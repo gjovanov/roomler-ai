@@ -731,7 +731,7 @@ hive-test-launcher = ["hive"]
 # P3-4c, and even compiled, `vault_enabled` is off by default.
 vault = ["hive", "dep:crypto_box", "dep:zeroize", "dep:tokio-rustls", "dep:rustls-native-certs", "dep:hmac", "dep:pbkdf2", "dep:stringprep"]
 # Everything needed for a full remote-control session, software only.
-full = ["media", "enigo-input", "clipboard", "audio", "drm-capture", "uinput-input", "portal-capture", "recording"]
+full = ["media", "enigo-input", "clipboard", "audio", "drm-capture", "uinput-input", "portal-capture", "recording", "external-access"]
 # Everything needed including the MF hardware encoder. Production
 # Windows MSI builds with this.
 full-hw = ["full", "mf-encoder", "wgc-capture", "viewer-indicator"]
@@ -820,16 +820,17 @@ overlay-netstack = ["roomler-ai-tunnel-core/overlay-netstack", "roomler-node-cor
 # price of the feature and the reason it is opt-in per build.
 ssh-server = ["dep:russh", "overlay-netstack"]
 
-# FR-52 — cross-org remote access: the device half of gate 4. Opt-in per build
-# like `ssh-server`. +7 crates (see the opaque-ke dep comment).
+# FR-52 — cross-org remote access: the device half of gate 4. +7 crates (see
+# the opaque-ke dep comment).
 #
-# ⚠️ Deliberately NOT in any release feature set yet, and that is the honest
-# state rather than an oversight: nothing CONSUMES the credential until the P3
-# handshake lands, so shipping the OPAQUE stack to the fleet today would add
-# weight to every agent for a gate no session can reach. It joins the release
-# sets with P3 — the `ssh-server` rule (ship it with its gates closed so a
-# device can be opted in without waiting for a release) applies once there is
-# something to opt in TO.
+# In `full`, and so in every release build, since P4f (decision 11, operator,
+# 2026-10-19). This is the `ssh-server` rule: ship it with its gates closed, so a
+# device can be opted in without waiting for a release. Compiled in, it changes
+# nothing on a device until its org turns external access on (gate 1), an
+# admin approves the device (gate 2), and its owner opts in and sets a password
+# ON the device (gate 3). It is in `full` rather than in each release list
+# because a feature only some builds can serve is one the fleet view would
+# have to explain device by device.
 #
 # ⚠️ Advertising `RpcCap::ExternalAccess` is deliberately NOT gated on this
 # feature. The verb means "this build can tell the person at the machine that a
