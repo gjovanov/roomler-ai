@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
+//! FR-90 P3-5 — the vault's proxies: an endpoint the daemon serves that
+//! authenticates upstream with a leased value, so the session, its model and
+//! its transcript never hold the value (`docs/fr/FR-90-hive-agent-sessions.md`
+//! §3e, "P3-5, `proxy` mode, as designed").
+//!
+//! | Module | What |
+//! |---|---|
+//! | [`scram`] | SCRAM-SHA-256, the client's half: a proof of the password, never the password |
+//! | [`tls`] | TLS to an upstream, always verified: the system's roots, and a CA the secret holds |
+//! | [`pg`] | one Postgres session: the client let in by the endpoint, the upstream by SCRAM |
+//!
+//! P3-5b-1 builds these; P3-5b-2's endpoint and `vault_connect` tool are
+//! their first caller.
+
+pub(crate) mod pg;
+pub(crate) mod scram;
+pub(crate) mod tls;
