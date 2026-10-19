@@ -2494,6 +2494,9 @@ impl OverlayRuntime {
             os_steer_active: _dns_os_guard.as_ref().is_some_and(|g| g.active()),
             upstream: dns_upstream.to_string(),
             answer_aaaa: crate::env::node_env("DNS_AAAA").as_deref() != Some("0"),
+            os_steer_bypassed: _dns_os_guard
+                .as_ref()
+                .and_then(|g| g.bypassed().map(str::to_string)),
         });
 
         let mut fallback = tokio::time::interval(FALLBACK_TICK);
@@ -3027,6 +3030,9 @@ impl OverlayRuntime {
                             os_steer_active: _dns_os_guard.as_ref().is_some_and(|g| g.active()),
                             upstream: dns_upstream.to_string(),
                             answer_aaaa: crate::env::node_env("DNS_AAAA").as_deref() != Some("0"),
+                            os_steer_bypassed: _dns_os_guard
+                                .as_ref()
+                                .and_then(|g| g.bypassed().map(str::to_string)),
                         });
                     }
                     // FR-19 P4b — expire org-relay sessions past their lifetime
