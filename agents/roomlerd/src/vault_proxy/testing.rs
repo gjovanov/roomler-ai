@@ -42,6 +42,17 @@ pub(crate) enum Upstreams {
     /// SCRAM with this password, after a protocol negotiation and with a
     /// notice before its `AuthenticationOk`.
     Negotiates(String),
+    /// P3-5b-3 — SCRAM with this password, bound to its own certificate,
+    /// and the GS2 header it saw reported.
+    Binds(String),
+    /// Offers no `-PLUS`, and cannot bind: an older server, or a pooler.
+    PlainOnly(String),
+    /// Offers no `-PLUS`, though it binds: what a relay that strips `-PLUS`
+    /// from the offer leaves.
+    Stripped(String),
+    /// Offers `-PLUS`, and binds to another certificate than the one the
+    /// proxy saw: what the real upstream sees behind a TLS-terminating relay.
+    BindsElsewhere(String),
 }
 
 /// What the fake upstream saw.
@@ -52,6 +63,8 @@ pub(crate) enum Saw {
     Cancel(Vec<u8>),
     /// Bytes from the proxy after a refusal: what a password would be.
     After(Vec<u8>),
+    /// P3-5b-3 — the SASL mechanism and the GS2 header the proxy chose.
+    Sasl(String, String),
 }
 
 /// A TLS upstream on a random port of 127.0.0.1, with a certificate for
@@ -60,6 +73,8 @@ pub(crate) enum Saw {
 pub(crate) async fn fake(how: Upstreams) -> (String, u16, mpsc::UnboundedReceiver<Saw>) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let pem = cert.cert.pem();
+    // P3-5b-3 — this channel's binding data, as Postgres computes its own.
+    let own_binding = super::tls::server_end_point(cert.cert.der()).unwrap();
     let config =
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
@@ -80,6 +95,7 @@ pub(crate) async fn fake(how: Upstreams) -> (String, u16, mpsc::UnboundedReceive
                 return;
             };
             let (acceptor, tx, how) = (acceptor.clone(), tx.clone(), how.clone());
+            let own_binding = own_binding.clone();
             tokio::spawn(async move {
                 let Ok(packet) = read_startup(&mut tcp).await else {
                     return;
@@ -120,22 +136,49 @@ pub(crate) async fn fake(how: Upstreams) -> (String, u16, mpsc::UnboundedReceive
                     Upstreams::Scram(ref password)
                     | Upstreams::Forged(ref password)
                     | Upstreams::SkipFinal(ref password)
-                    | Upstreams::Negotiates(ref password) => {
+                    | Upstreams::Negotiates(ref password)
+                    | Upstreams::Binds(ref password)
+                    | Upstreams::PlainOnly(ref password)
+                    | Upstreams::Stripped(ref password)
+                    | Upstreams::BindsElsewhere(ref password) => {
                         let negotiates = matches!(how, Upstreams::Negotiates(_));
                         if negotiates {
                             // Minor version 0, and one option it does not know.
                             let v = b"\0\0\0\0\0\0\0\x01_pq_.x\0";
                             s.write_all(&frame(Some(b'v'), v)).await.unwrap();
                         }
-                        s.write_all(&r(10, b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0"))
-                            .await
-                            .unwrap();
+                        let offer: &[u8] = match how {
+                            Upstreams::PlainOnly(_) | Upstreams::Stripped(_) => {
+                                b"SCRAM-SHA-256\0\0"
+                            }
+                            _ => b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0",
+                        };
+                        s.write_all(&r(10, offer)).await.unwrap();
                         let (tag, body) = read_message(&mut s, 64 * 1024).await.unwrap();
                         assert_eq!(tag, b'p');
-                        let first = &body[b"SCRAM-SHA-256\0".len() + 4..];
+                        // SASLInitialResponse: the mechanism, its length, its data.
+                        let nul = body.iter().position(|b| *b == 0).unwrap();
+                        let mechanism = String::from_utf8(body[..nul].to_vec()).unwrap();
+                        let first = &body[nul + 1 + 4..];
                         let mut srv = ScramServer::new(password, b"a-salt", 4096, "upnonce");
+                        srv = match how {
+                            Upstreams::PlainOnly(_) => srv,
+                            Upstreams::BindsElsewhere(_) => {
+                                srv.binding(b"the hash of a relay's own certificate".to_vec())
+                            }
+                            _ => srv.binding(own_binding.clone()),
+                        };
                         let forged = matches!(how, Upstreams::Forged(_));
                         let server_first = srv.server_first(std::str::from_utf8(first).unwrap());
+                        if matches!(
+                            how,
+                            Upstreams::Binds(_)
+                                | Upstreams::PlainOnly(_)
+                                | Upstreams::Stripped(_)
+                                | Upstreams::BindsElsewhere(_)
+                        ) {
+                            let _ = tx.send(Saw::Sasl(mechanism, srv.gs2().to_string()));
+                        }
                         s.write_all(&r(11, server_first.as_bytes())).await.unwrap();
                         let (_, fin) = read_message(&mut s, 64 * 1024).await.unwrap();
                         match srv.server_final(std::str::from_utf8(&fin).unwrap()) {
@@ -155,13 +198,22 @@ pub(crate) async fn fake(how: Upstreams) -> (String, u16, mpsc::UnboundedReceive
                                 }
                                 s.write_all(&r(0, &[])).await.unwrap();
                             }
-                            Err(_) => {
+                            Err(why) => {
+                                // Postgres's own words for each refusal.
+                                let (code, message) = match why.as_str() {
+                                    "e=invalid-proof" => {
+                                        ("28P01", "password authentication failed for user \"app\"")
+                                    }
+                                    "e=channel-bindings-dont-match" => {
+                                        ("08P01", "SCRAM channel binding check failed")
+                                    }
+                                    "e=server-does-support-channel-binding" => {
+                                        ("08P01", "SCRAM channel binding negotiation error")
+                                    }
+                                    _ => ("08P01", "malformed SCRAM message"),
+                                };
                                 let mut e = Vec::new();
-                                for (c, t) in [
-                                    (b'S', "FATAL"),
-                                    (b'C', "28P01"),
-                                    (b'M', "password authentication failed for user \"app\""),
-                                ] {
+                                for (c, t) in [(b'S', "FATAL"), (b'C', code), (b'M', message)] {
                                     e.push(c);
                                     e.extend(t.as_bytes());
                                     e.push(0);
