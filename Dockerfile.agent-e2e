@@ -144,6 +144,19 @@ echo "[bootstrap] enrolling agent name=$AGENT_NAME"
   --token "$ENROLL_JWT" \
   --name "$AGENT_NAME"
 
+# FR-114 — the recording specs each need a device in ONE state: a recorder
+# whose owner opted in to remote recording, a recorder NOT opted in, and no
+# recorder at all (run-agent-e2e.sh). `record_remote_enabled` is device-owned
+# (the server cannot push it), so the opt-in is written here, for the
+# ordinals the StatefulSet names. A top-level key goes BEFORE any [table],
+# and prepending is always valid TOML.
+ORD="${AGENT_NAME##*-}"
+case " ${ROOMLER_E2E_RECORD_REMOTE_ORDINALS:-} " in
+  *" $ORD "*)
+    sed -i '1i record_remote_enabled = true' "$CONFIG_PATH"
+    echo "[bootstrap] remote recording opted in (ordinal $ORD)"
+    ;;
+esac
 touch /results/.bootstrap-done
 echo "[bootstrap] config written to $CONFIG_PATH; ready to run"
 EOF
@@ -160,6 +173,12 @@ COPY <<'EOF' /usr/local/bin/run-agent-e2e.sh
 #!/bin/sh
 set -eu
 /usr/local/bin/agent-bootstrap.sh
+# FR-114 — the "no recorder" device: the recorder's own kill switch, so the
+# agent advertises an empty `record` capability, for the ordinals named.
+ORD="${HOSTNAME##*-}"
+case " ${ROOMLER_E2E_NO_RECORDER_ORDINALS:-} " in
+  *" $ORD "*) export ROOMLERD_RECORDING=0; echo "[run] recording switched off (ordinal $ORD)" ;;
+esac
 exec /usr/local/bin/roomlerd --config "${ROOMLERD_CONFIG_PATH:-/etc/roomler/config.toml}" run
 EOF
 RUN chmod +x /usr/local/bin/run-agent-e2e.sh
