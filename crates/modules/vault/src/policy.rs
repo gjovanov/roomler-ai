@@ -113,6 +113,16 @@ when {
         text: r#"forbid (principal, action == Roomler::Action::"secret:use", resource)
 when { context.mode == "exec" && !(resource.exec_allow.contains(context.audience)) };"#,
     },
+    // P3-5a — the proxy's confused deputy: the daemon authenticates with the
+    // value to whatever upstream the session names, so the upstream must be
+    // one the secret names. Exactly, as `exec_allow` matches a program.
+    Guardrail {
+        id: "guardrail:proxy-only-named-audiences",
+        why: "in `proxy` mode a value is presented only to an upstream its secret names in \
+              `audiences`, exactly: a session pointing a proxy anywhere else is refused",
+        text: r#"forbid (principal, action == Roomler::Action::"secret:use", resource)
+when { context.mode == "proxy" && !(resource.audiences.contains(context.audience)) };"#,
+    },
 ];
 
 /// What a policy may name of its organization.
@@ -321,6 +331,9 @@ pub struct SecretFacts {
     /// P3-4c — the programs a value may be handed to in `exec` mode, by bare
     /// name. Empty: no program at all.
     pub exec_allow: Vec<String>,
+    /// P3-5a — where a value may be presented: in `proxy` mode, the upstream
+    /// the daemon authenticates to. Empty: nowhere.
+    pub audiences: Vec<String>,
 }
 
 /// A session, as a `secret:use` names it.
@@ -426,6 +439,7 @@ fn session_and_secret(session: &SessionFacts, secret: &SecretFacts) -> (Value, V
             "kind": secret.kind,
             "tags": secret.tags,
             "exec_allow": secret.exec_allow,
+            "audiences": secret.audiences,
         },
         "parents": chain.first()
             .map(|f| vec![uid("SecretFolder", &format!("{}{f}", secret.prefix))])
@@ -488,6 +502,7 @@ impl Ask {
                 "kind": &r.kind,
                 "tags": &r.tags,
                 "exec_allow": &r.exec_allow,
+                "audiences": &r.audiences,
             }
         };
         match self {
@@ -567,6 +582,12 @@ impl Ask {
                 // P3-4c — a request recorded before the field existed named
                 // no program: decided again, its exec is refused.
                 exec_allow: match r.get_array("exec_allow") {
+                    Ok(a) => strings(a)?,
+                    Err(_) => Vec::new(),
+                },
+                // P3-5a — likewise no audience: decided again, its proxy use
+                // is refused.
+                audiences: match r.get_array("audiences") {
                     Ok(a) => strings(a)?,
                     Err(_) => Vec::new(),
                 },
@@ -757,13 +778,15 @@ mod tests {
                 playbook: None,
             },
             // P3-4c — a program the secret names, so an `exec` here meets
-            // every guardrail but the one a test is about.
+            // every guardrail but the one a test is about; P3-5a — and an
+            // audience, likewise for a `proxy`.
             secret: SecretFacts {
                 prefix: ORG.into(),
                 path: path.into(),
                 kind: "static".into(),
                 tags: tags.iter().map(|t| t.to_string()).collect(),
                 exec_allow: vec!["psql".into()],
+                audiences: vec!["psql".into()],
             },
             mode: mode.into(),
             audience: "psql".into(),
@@ -787,6 +810,7 @@ mod tests {
                 kind: "static".into(),
                 tags: Vec::new(),
                 exec_allow: Vec::new(),
+                audiences: Vec::new(),
             },
             device: device(os, &[]),
         }
@@ -955,9 +979,84 @@ mod tests {
                 "{audience:?}"
             );
         }
-        for mode in ["env", "file", "proxy"] {
+        // P3-5a — `proxy` is held by a guardrail of its own, to the
+        // secret's audiences.
+        for mode in ["env", "file"] {
             assert!(decide(&set, &with("curl", &[], mode)).allow, "{mode}");
         }
+    }
+
+    /// P3-5a — a proxy presents a value only to an upstream its secret
+    /// names, exactly as written; no mode that presents nothing to an
+    /// upstream is held to the audiences.
+    #[test]
+    fn a_proxy_reaches_only_an_audience_its_secret_names() {
+        let any = r#"permit (principal, action == Roomler::Action::"secret:use", resource);"#;
+        let set = set_with(&[any]);
+        let with = |audience: &str, audiences: &[&str], mode: &str| {
+            let mut ask = use_secret(Some("dev"), "staging/db", &[], mode, "linux");
+            if let Ask::UseSecret {
+                secret,
+                audience: a,
+                ..
+            } = &mut ask
+            {
+                *a = audience.into();
+                secret.audiences = audiences.iter().map(|p| p.to_string()).collect();
+            }
+            ask
+        };
+        let ok = decide(
+            &set,
+            &with(
+                "db.internal:5432",
+                &["db.internal:5432", "replica:5432"],
+                "proxy",
+            ),
+        );
+        assert!(ok.allow && ok.errors.is_empty(), "{ok:?}");
+        for (audience, audiences) in [
+            ("evil.example:5432", &["db.internal:5432"][..]),
+            // Another port is another upstream.
+            ("db.internal:6432", &["db.internal:5432"][..]),
+            ("db.internal", &["db.internal:5432"][..]),
+            // Exactly as the secret writes it.
+            ("DB.internal:5432", &["db.internal:5432"][..]),
+            // A secret that names none is presented nowhere.
+            ("db.internal:5432", &[][..]),
+            ("", &["db.internal:5432"][..]),
+        ] {
+            let v = decide(&set, &with(audience, audiences, "proxy"));
+            assert!(!v.allow, "{audience:?} {audiences:?}: {v:?}");
+            assert_eq!(
+                v.determining,
+                ["guardrail:proxy-only-named-audiences"],
+                "{audience:?}"
+            );
+        }
+        for mode in ["env", "file"] {
+            assert!(decide(&set, &with("anywhere", &[], mode)).allow, "{mode}");
+        }
+    }
+
+    /// P3-5a — a request recorded before `audiences` existed reads back
+    /// naming none, so decided again its proxy use is refused.
+    #[test]
+    fn a_request_recorded_without_audiences_reads_back_naming_none() {
+        let ask = use_secret(Some("dev"), "staging/db", &[], "proxy", "linux");
+        let mut doc = ask.to_doc();
+        doc.get_document_mut("secret")
+            .unwrap()
+            .remove("audiences")
+            .expect("written today");
+        let back = Ask::from_doc(&doc).expect("still reads");
+        let Ask::UseSecret { secret, .. } = &back else {
+            panic!("{back:?}")
+        };
+        assert!(secret.audiences.is_empty());
+        let any = r#"permit (principal, action == Roomler::Action::"secret:use", resource);"#;
+        let v = decide(&set_with(&[any]), &back);
+        assert_eq!(v.determining, ["guardrail:proxy-only-named-audiences"]);
     }
 
     /// P3-4c — a request recorded before `exec_allow` existed reads back

@@ -538,6 +538,7 @@ pub(crate) fn use_ask(
             kind: secret.kind.clone(),
             tags: secret.tags.clone(),
             exec_allow: secret.exec_allow.clone(),
+            audiences: secret.audiences.clone(),
         },
         mode: mode.to_string(),
         audience: audience.to_string(),

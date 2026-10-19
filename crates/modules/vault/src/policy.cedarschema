@@ -29,11 +29,14 @@ namespace Roomler {
   entity SecretFolder in [SecretFolder];
   // P3-4c — `exec_allow`: the programs, by bare name, a value of this secret
   // may be handed to in `exec` mode (a guardrail holds every exec to it).
+  // P3-5a — `audiences`: where a value may be presented, which a guardrail
+  // holds every `proxy` use to: the upstream the daemon authenticates to.
   entity Secret in [SecretFolder] = {
     path: String,
     kind: String,
     tags: Set<String>,
     exec_allow: Set<String>,
+    audiences: Set<String>,
   };
 
   // The device a request is made on, as its row holds it: `os` is `linux`,

@@ -1798,6 +1798,35 @@ start.
 
 `placeholder` is P3b. `raw` stays for people only.
 
+**P3-5, `proxy` mode, as designed.** A session reaches a database (and later an HTTP API, a cluster,
+an SSH host) through an endpoint its daemon serves, and the daemon authenticates upstream with the
+leased value. The value stays in daemon memory: no transcript, model request or session environment
+holds it (AC12).
+
+| Piece | Design |
+|---|---|
+| the upstream | the lease's audience: the one `host:port` the daemon connects to, which the secret must name in `audiences`, exactly. Before P3-5a the vault stored a secret's audiences and enforced nothing, which for `proxy` would let a session point the daemon's credential at any host. The guardrail `proxy-only-named-audiences` closes it, as `exec_allow` closes `exec` |
+| the endpoint | a Unix socket in the session's runtime directory (the daemon's, `0711`), handed to the session's account at `0600`, each connection's peer uid checked against it, as the toolbelt's socket is. Not a loopback TCP port: any account on the device can connect to one, and the proxy authenticates for whoever does |
+| the client | never authenticates. The proxy's own upstream connection does, before a byte of the client's is relayed: Postgres answers the client's startup with `AuthenticationOk` (any password, or none), and MongoDB's client connects with no credentials at all. So the value never crosses the endpoint, in either direction |
+| upstream security | TLS required, the upstream's certificate verified (the system's roots, or a CA the secret holds in a field `ca`); SCRAM-SHA-256, with channel binding (`-PLUS`) where the upstream offers it. Cleartext, MD5 and every other mechanism are refused: an upstream that is not who it claims, or that asks for a form of the value it could replay elsewhere, gets nothing |
+| the value | a structured secret: `user` and `password`, and optionally `ca`; the password SASLprepped (RFC 4013) |
+| the lifetime | one lease per endpoint at first: the endpoint and its open connections close when the lease is let go (expiry, revocation, the run's end). A longer use asks again |
+| the tool | `vault_connect {handle, engine, upstream, database?, ttl_s?}`, asked for in the session's settings like the other uses: the endpoint, and a connection string with no credential in it |
+| Windows | `proxy` is Windows's only mode, but its database clients mostly cannot dial a Unix socket. A later step serves loopback TCP there, each connection's process identified (`GetExtendedTcpTable`, then the process token's SID) and refused unless it runs as the session's account |
+
+- **Postgres** (P3-5b): the client's `SSLRequest` and `GSSENCRequest` are answered `N` (the socket is
+  local). A `CancelRequest` goes to the upstream as is: the `BackendKeyData` the client holds is the
+  upstream's, relayed unchanged. The startup's `user` is replaced by the secret's, its `database`
+  kept, and `replication` refused. Then `AuthenticationOk`, the upstream's `ParameterStatus`,
+  `BackendKeyData` and `ReadyForQuery`, and bytes both ways.
+- **MongoDB** (P3-5c): the proxy's upstream connection runs `hello` and SCRAM-SHA-256 first. The
+  client's `mongodb://<socket>/?directConnection=true` has no credentials, so its own `hello`
+  carries no `speculativeAuthenticate`, and every byte after it is relayed. One host at first (a
+  single node or a `mongos`): SRV discovery and replica-set failover come later.
+- **Engines with no proxy** (MySQL, SQL Server, Redis) take `short-lived` (P3-6). HTTP named
+  upstreams, Kubernetes and the SSH agent follow (P3-5d to P3-5f), each with a design note of its
+  own when it starts.
+
 **Audit.** `vault_audit` holds every decision the server makes, allow and deny, with the 90-day TTL
 of the network module's audits (`crates/modules/network/src/lib.rs:748`). `vault_activity` is the
 device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
@@ -1836,7 +1865,10 @@ device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
 | P3-4e-1 | the approval card, the vault's half: where only a driver's yes could allow a lease, a card in the session's room and `awaiting_approval`; the answer route; one yes, one lease | `vault.tenants` | — |
 | P3-4e-2 | the approval card, the device's half: what the session's tools say while a card waits, and when they ask again | device `vault_enabled = false` | — |
 | P3-4e-3 | the approval card in the web app: its Approve and Deny | the SPA only | — |
-| P3-5 | `proxy` mode: Postgres and MongoDB first, then HTTP named upstreams, Kubernetes and the SSH agent | per-secret `disabled` | AC12 |
+| P3-5a | `proxy` mode's design, and the vault's half: a secret's `audiences` in Cedar, and the guardrail `proxy-only-named-audiences` | `vault.tenants` | — |
+| P3-5b | the device's proxy endpoint and `vault_connect`, with Postgres | device `vault_enabled = false`; per-secret `disabled` | AC12 |
+| P3-5c | MongoDB | the same | AC12 |
+| P3-5d to P3-5f | HTTP named upstreams (git through `insteadOf`), the Kubernetes API, the SSH agent | the same | — |
 | P3-6 | `short-lived`: database users and GitHub App tokens first, then AWS STS and a Kubernetes `TokenRequest` | per provider | — |
 | P3-7 | authenticated session SOCKS, `Principal::Session`, `net_forward` and `net_socks` | `vault.tenants` | — |
 | P3-8 | `ssh_run` and `fleet_exec` as tools | the existing SSH and exec gates | — |
@@ -2163,7 +2195,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3-4d-2 | `vault_activity`, the device's half (`docs/vault.md` §17): the device-owned `vault_activity_log` (default off; never pushable, a test holding every remote configuration to leaving it out), read at each primary hello; `Client::report`, fire-and-forget (a full connection drops it, never waits), nothing where the switch is off or no lease was used; a report after a `vault_exec` that ran (the program, its exit code or its timeout) and a `vault_render` that wrote (the file's name), naming every lease the use took, asked for there or ahead; none for a call refused before anything ran or was written | device `vault_activity_log = false`; the `vault` feature in no release build | **merged** #2495 `0b4e6e312` |
 | P3-4e-1 | the approval card, the vault's half (`docs/vault.md` §18): where Cedar denies a lease, a usable yes to that very request (session, fence, device, secret's field, mode, audience, no longer than the card's TTL) is decided again with its approver, and spent by compare-and-set before the allow is recorded; else a waiting card answers `awaiting_approval` (retryable; `rc:vault.refused` gains an optional `approval_id`), a driver's no `denied`, and a new card is posted only where the yes of a driver who may answer now would allow it (hive's `access::may_answer`; the card through hive's `room::post_approval_card`, bound to `{module: "vault", ref}`, pushed to the drivers); the approver an entity in a `Group` per roomler role, recorded with the request (`approver_groups`); `GET`/`POST …/vault/approval/{id}` (readers see, drivers answer, Cedar decides the yes); `vault_approvals` (one pending card per request by a unique index, a stale one ended first; 90 d TTL); a card waits 10 min, a yes is usable for 5 | `vault.tenants` | **merged** #2497 `2022ce0eb` |
 | P3-4e-2 | the approval card, the device's half (`docs/vault.md` §12, §18): `awaiting_approval` reaches the lease client as `LeaseError::AwaitingApproval` with its approval's id; `Client::request_until_approved` asks again after 2 s, the pause doubling to 15 s, for at most the card's window (`APPROVAL_ANSWER_SECS`), a lease or any other word ending it; the toolbelt's leases (`vault_exec`, `vault_render`, `vault_request`) wait through it; the model told plainly when a card nobody answered in time (its approval's id) or a `denied` ends the wait | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2498 `923b5415d` |
-| P3-4e-3 | the approval card in the web app (`docs/vault.md` §18, `docs/ui.md`): under a message bound to `{module: "vault"}` (`MessageBubble`, the room's organization passed down from `ChatView`), `components/vault/VaultApprovalCard` reads `GET …/vault/approval/{id}`: where it stands, the deadline while pending, **Approve** / **Deny** for a driver who may answer it now (`may_answer`), **Approve** only where the policy takes their yes (`may_approve`); a refusal in the server's words, then read again; read again at every edit of the card (the message's `updated_at`); nothing shown for a card the person cannot read | the SPA only | **in review** |
+| P3-4e-3 | the approval card in the web app (`docs/vault.md` §18, `docs/ui.md`): under a message bound to `{module: "vault"}` (`MessageBubble`, the room's organization passed down from `ChatView`), `components/vault/VaultApprovalCard` reads `GET …/vault/approval/{id}`: where it stands, the deadline while pending, **Approve** / **Deny** for a driver who may answer it now (`may_answer`), **Approve** only where the policy takes their yes (`may_approve`); a refusal in the server's words, then read again; read again at every edit of the card (the message's `updated_at`); nothing shown for a card the person cannot read | the SPA only | **merged** #2499 `f675cf68f` |
+| P3-5a | `proxy` mode's design (§3e "P3-5, `proxy` mode, as designed"), and the vault's half (`docs/vault.md` §7): `audiences` on Cedar's `Secret` entity, read from the secret's row in every decision and kept with a recorded request (a row from before reads none); the guardrail `proxy-only-named-audiences`, which refuses a `proxy` use whose audience the secret does not name, exactly; the integration tests' proxy leases name their upstream | `vault.tenants` | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
