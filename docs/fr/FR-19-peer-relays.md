@@ -525,7 +525,7 @@ Three results, in order of consequence:
 3. **41641 is not a viable alternative**, so the high-port fallback is dead for this
    population.
 
-⚠️ **This narrows the codebase's own claim.** `signaling.rs:4792` says a corp egress
+⚠️ **This narrows the codebase's own claim.** `signaling.rs:4799` says a corp egress
 *"whitelists STUN:3478 still drops the ~10-13k relay band"*. Measured, CORPLAP-3 drops **11000
 and 41641** — it whitelists *only* 3478, so the constraint is "one allowed port", not "all
 but the relay band".

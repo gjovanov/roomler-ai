@@ -256,6 +256,10 @@ mod usage_ledger_tests;
 /// for that session, in the use's mode and toward its target.
 #[cfg(test)]
 mod vault_activity_tests;
+/// FR-90 P3-4e — the approval a policy may ask for: one card in the
+/// session's room, a driver's answer, and the one lease a yes allows.
+#[cfg(test)]
+mod vault_approval_tests;
 /// FR-90 P3-3a — a device's vault key as the fleet stores it: from every
 /// hello, never a malformed one, and gone with the hello that drops it.
 #[cfg(test)]

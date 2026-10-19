@@ -22,6 +22,11 @@
 //! `rc:vault.activity` ([`VaultActivityKind`]): a claim the server keeps
 //! apart from its decisions, and drops unless every lease it names was
 //! released to that device, for that session, in that mode and audience.
+//!
+//! P3-4e — a policy may allow a use only with a person's approval. The vault
+//! then posts a card into the session's room and refuses
+//! `awaiting_approval`, naming the approval; once a driver has said yes, the
+//! same request is answered with a lease, which spends the approval.
 
 /// Bounds on a lease request, read by both ends: the server refuses past
 /// them (`bad_request`), and a device never asks past them.
@@ -64,6 +69,13 @@ pub mod lease_limits {
     /// Past it the server drops them: a report is a claim, and a flood of
     /// claims is not worth a flood of rows.
     pub const ACTIVITY_PER_MINUTE: u32 = 120;
+    /// P3-4e — how long an approval card waits for a driver's answer, in
+    /// seconds. Until then the same request is refused `awaiting_approval`,
+    /// and asking again posts no second card.
+    pub const APPROVAL_ANSWER_SECS: u32 = 600;
+    /// P3-4e — how long a yes stays usable, in seconds from the answer: the
+    /// session asks again within it, and the one lease it gets spends it.
+    pub const APPROVAL_USE_SECS: u32 = 300;
 }
 
 /// P3-4c — a program's BARE name, as `exec_allow` holds it and as a device
@@ -144,6 +156,10 @@ pub enum LeaseRefusal {
     Undecided,
     /// Too many of this connection's requests are waiting already.
     Busy,
+    /// P3-4e — the vault's policies allow this only with a person's
+    /// approval: a card waits in the session's room, and the same request is
+    /// answered once a driver has said yes (a no makes it `denied`).
+    AwaitingApproval,
 }
 
 impl LeaseRefusal {
@@ -165,10 +181,11 @@ impl LeaseRefusal {
             Self::Unavailable => "unavailable",
             Self::Undecided => "undecided",
             Self::Busy => "busy",
+            Self::AwaitingApproval => "awaiting_approval",
         }
     }
 
-    pub const ALL: [LeaseRefusal; 14] = [
+    pub const ALL: [LeaseRefusal; 15] = [
         Self::NotServed,
         Self::Unsupported,
         Self::BadRequest,
@@ -183,6 +200,7 @@ impl LeaseRefusal {
         Self::Unavailable,
         Self::Undecided,
         Self::Busy,
+        Self::AwaitingApproval,
     ];
 
     /// Parse a refusal word. `None` for a word this build cannot name, which
@@ -192,10 +210,14 @@ impl LeaseRefusal {
     }
 
     /// Whether the same request could be answered later: the vault was
-    /// unavailable, the decision went unrecorded, or the queue was full.
-    /// Every other word is the vault's answer to THIS request as it stands.
+    /// unavailable, the decision went unrecorded, the queue was full, or a
+    /// person has yet to answer its approval card. Every other word is the
+    /// vault's answer to THIS request as it stands.
     pub const fn is_retryable(self) -> bool {
-        matches!(self, Self::Unavailable | Self::Undecided | Self::Busy)
+        matches!(
+            self,
+            Self::Unavailable | Self::Undecided | Self::Busy | Self::AwaitingApproval
+        )
     }
 }
 
@@ -323,6 +345,7 @@ mod tests {
                 "unavailable",
                 "undecided",
                 "busy",
+                "awaiting_approval",
             ]
         );
         for r in LeaseRefusal::ALL {
@@ -357,9 +380,18 @@ mod tests {
             [
                 LeaseRefusal::Unavailable,
                 LeaseRefusal::Undecided,
-                LeaseRefusal::Busy
+                LeaseRefusal::Busy,
+                LeaseRefusal::AwaitingApproval,
             ]
         );
+    }
+
+    #[test]
+    fn a_yes_is_usable_for_less_time_than_a_card_waits() {
+        const {
+            assert!(lease_limits::APPROVAL_USE_SECS > 0);
+            assert!(lease_limits::APPROVAL_USE_SECS <= lease_limits::APPROVAL_ANSWER_SECS);
+        };
     }
 
     /// P3-4c — a bare name only: never a path, a flag, a dot entry or a
