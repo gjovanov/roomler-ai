@@ -39,9 +39,9 @@ pub(crate) struct Upstream {
     pub(crate) tls: tokio_rustls::TlsConnector,
 }
 
-const SSL_REQUEST: u32 = 80_877_103;
+pub(super) const SSL_REQUEST: u32 = 80_877_103;
 const GSSENC_REQUEST: u32 = 80_877_104;
-const CANCEL_REQUEST: u32 = 80_877_102;
+pub(super) const CANCEL_REQUEST: u32 = 80_877_102;
 /// The longest startup packet a client may send (Postgres's own limit).
 const MAX_STARTUP: usize = 10_000;
 /// The longest upstream message before the session starts.
@@ -124,6 +124,13 @@ where
     {
         return Err(Refusal::Tell(
             "a replication connection is not something the proxy relays".into(),
+        ));
+    }
+    // The secret's user ends a NUL-separated startup: one holding a NUL (or
+    // nothing) would name parameters of its own.
+    if up.user.is_empty() || up.user.contains('\0') {
+        return Err(Refusal::Tell(
+            "the secret's user is not a name Postgres takes".into(),
         ));
     }
     params.retain(|(k, _)| k != "user");
@@ -300,7 +307,7 @@ async fn send(upstream: &mut TlsStream<TcpStream>, tag: u8, body: &[u8]) -> Resu
 }
 
 /// A startup-phase packet, without its length: its code, then the rest.
-async fn read_startup<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>, String> {
+pub(super) async fn read_startup<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>, String> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)
         .await
@@ -317,7 +324,7 @@ async fn read_startup<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>, String
 }
 
 /// One message: its tag, and its body without the length.
-async fn read_message<R: AsyncRead + Unpin>(
+pub(super) async fn read_message<R: AsyncRead + Unpin>(
     r: &mut R,
     max: usize,
 ) -> Result<(u8, Vec<u8>), String> {
@@ -338,7 +345,7 @@ async fn read_message<R: AsyncRead + Unpin>(
 
 /// The startup's parameters: pairs of text, each ended by a NUL, and an
 /// empty name to end them.
-fn parse_params(raw: &[u8]) -> Result<Vec<(String, String)>, String> {
+pub(super) fn parse_params(raw: &[u8]) -> Result<Vec<(String, String)>, String> {
     let mut rest = raw;
     let mut params = Vec::new();
     loop {
@@ -366,7 +373,7 @@ fn cstr(rest: &mut &[u8]) -> Result<String, String> {
 }
 
 /// A message: its tag (none for a startup packet), its length, its body.
-fn frame(tag: Option<u8>, body: &[u8]) -> Vec<u8> {
+pub(super) fn frame(tag: Option<u8>, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 5);
     out.extend(tag);
     out.extend(((body.len() + 4) as u32).to_be_bytes());
@@ -374,8 +381,9 @@ fn frame(tag: Option<u8>, body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The proxy's refusal, as Postgres writes a fatal error.
-fn fatal(why: &str) -> Vec<u8> {
+/// The proxy's refusal, as Postgres writes a fatal error: what the endpoint
+/// answers a connection it does not serve, too.
+pub(crate) fn fatal(why: &str) -> Vec<u8> {
     let mut body = Vec::new();
     for (code, text) in [
         (b'S', "FATAL"),
@@ -412,213 +420,10 @@ fn auth_name(code: u32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use tokio::io::DuplexStream;
-    use tokio::net::TcpListener;
-    use tokio::sync::mpsc;
-    use tokio_rustls::TlsAcceptor;
-    use tokio_rustls::rustls::{self, ServerConfig};
 
-    use super::super::scram::server::ScramServer;
+    use super::super::testing::*;
     use super::*;
-
-    /// How the fake upstream behaves.
-    #[derive(Clone, PartialEq)]
-    enum Upstreams {
-        /// SCRAM with this password, then a session that answers queries.
-        Scram(String),
-        /// Declines TLS.
-        NoTls,
-        /// Asks for a cleartext password.
-        Cleartext,
-        /// Checks the proof for this password, then signs wrong: a server
-        /// that never held it.
-        Forged(String),
-        /// Checks the proof, then lets the session in without signing at
-        /// all.
-        SkipFinal(String),
-        /// Trusts the connection: `AuthenticationOk` at once.
-        Trusting,
-        /// SCRAM with this password, after a protocol negotiation and with a
-        /// notice before its `AuthenticationOk`.
-        Negotiates(String),
-    }
-
-    /// What the fake upstream saw.
-    #[derive(Debug, PartialEq)]
-    enum Saw {
-        Startup(Vec<(String, String)>),
-        Query(String),
-        Cancel(Vec<u8>),
-        /// Bytes from the proxy after a refusal: what a password would be.
-        After(Vec<u8>),
-    }
-
-    /// A TLS upstream on a random port of 127.0.0.1, with a certificate for
-    /// `localhost` made for this test; its CA's PEM, its port, and what it
-    /// saw.
-    async fn fake(how: Upstreams) -> (String, u16, mpsc::UnboundedReceiver<Saw>) {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let pem = cert.cert.pem();
-        let config =
-            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_no_client_auth()
-                .with_single_cert(
-                    vec![cert.cert.der().clone()],
-                    rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
-                )
-                .unwrap();
-        let acceptor = TlsAcceptor::from(Arc::new(config));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut tcp, _)) = listener.accept().await else {
-                    return;
-                };
-                let (acceptor, tx, how) = (acceptor.clone(), tx.clone(), how.clone());
-                tokio::spawn(async move {
-                    let Ok(packet) = read_startup(&mut tcp).await else {
-                        return;
-                    };
-                    assert_eq!(&packet[..4], &SSL_REQUEST.to_be_bytes());
-                    if how == Upstreams::NoTls {
-                        tcp.write_all(b"N").await.unwrap();
-                        let rest = what_follows(&mut tcp).await;
-                        let _ = tx.send(Saw::After(rest));
-                        return;
-                    }
-                    tcp.write_all(b"S").await.unwrap();
-                    // A proxy that refused the certificate hangs up mid-handshake.
-                    let Ok(mut s) = acceptor.accept(tcp).await else {
-                        return;
-                    };
-                    let Ok(packet) = read_startup(&mut s).await else {
-                        return;
-                    };
-                    if packet[..4] == CANCEL_REQUEST.to_be_bytes() {
-                        let _ = tx.send(Saw::Cancel(packet));
-                        return;
-                    }
-                    let _ = tx.send(Saw::Startup(parse_params(&packet[4..]).unwrap()));
-                    let r = |code: u32, more: &[u8]| {
-                        let mut b = code.to_be_bytes().to_vec();
-                        b.extend(more);
-                        frame(Some(b'R'), &b)
-                    };
-                    match how {
-                        Upstreams::Cleartext => {
-                            s.write_all(&r(3, &[])).await.unwrap();
-                            let rest = what_follows(&mut s).await;
-                            let _ = tx.send(Saw::After(rest));
-                            return;
-                        }
-                        Upstreams::Trusting => s.write_all(&r(0, &[])).await.unwrap(),
-                        Upstreams::Scram(ref password)
-                        | Upstreams::Forged(ref password)
-                        | Upstreams::SkipFinal(ref password)
-                        | Upstreams::Negotiates(ref password) => {
-                            let negotiates = matches!(how, Upstreams::Negotiates(_));
-                            if negotiates {
-                                // Minor version 0, and one option it does not know.
-                                let v = b"\0\0\0\0\0\0\0\x01_pq_.x\0";
-                                s.write_all(&frame(Some(b'v'), v)).await.unwrap();
-                            }
-                            s.write_all(&r(10, b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0"))
-                                .await
-                                .unwrap();
-                            let (tag, body) = read_message(&mut s, 64 * 1024).await.unwrap();
-                            assert_eq!(tag, b'p');
-                            let first = &body[b"SCRAM-SHA-256\0".len() + 4..];
-                            let mut srv = ScramServer::new(password, b"a-salt", 4096, "upnonce");
-                            let forged = matches!(how, Upstreams::Forged(_));
-                            let server_first =
-                                srv.server_first(std::str::from_utf8(first).unwrap());
-                            s.write_all(&r(11, server_first.as_bytes())).await.unwrap();
-                            let (_, fin) = read_message(&mut s, 64 * 1024).await.unwrap();
-                            match srv.server_final(std::str::from_utf8(&fin).unwrap()) {
-                                Ok(_) if forged => {
-                                    let forged = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=";
-                                    s.write_all(&r(12, forged.as_bytes())).await.unwrap();
-                                    s.write_all(&r(0, &[])).await.unwrap();
-                                }
-                                Ok(_) if matches!(how, Upstreams::SkipFinal(_)) => {
-                                    s.write_all(&r(0, &[])).await.unwrap();
-                                }
-                                Ok(v) => {
-                                    s.write_all(&r(12, v.as_bytes())).await.unwrap();
-                                    if negotiates {
-                                        let notice = b"SNOTICE\0Mheld\0\0";
-                                        s.write_all(&frame(Some(b'N'), notice)).await.unwrap();
-                                    }
-                                    s.write_all(&r(0, &[])).await.unwrap();
-                                }
-                                Err(_) => {
-                                    let mut e = Vec::new();
-                                    for (c, t) in [
-                                        (b'S', "FATAL"),
-                                        (b'C', "28P01"),
-                                        (b'M', "password authentication failed for user \"app\""),
-                                    ] {
-                                        e.push(c);
-                                        e.extend(t.as_bytes());
-                                        e.push(0);
-                                    }
-                                    e.push(0);
-                                    s.write_all(&frame(Some(b'E'), &e)).await.unwrap();
-                                    return;
-                                }
-                            }
-                        }
-                        Upstreams::NoTls => unreachable!(),
-                    }
-                    // The session: a parameter, the cancel key, ready.
-                    s.write_all(&frame(Some(b'S'), b"server_version\x0017.2\x00"))
-                        .await
-                        .unwrap();
-                    s.write_all(&frame(Some(b'K'), &[0, 0, 0, 7, 1, 2, 3, 4]))
-                        .await
-                        .unwrap();
-                    s.write_all(&frame(Some(b'Z'), b"I")).await.unwrap();
-                    while let Ok((tag, body)) = read_message(&mut s, 1 << 20).await {
-                        if tag == b'X' {
-                            return;
-                        }
-                        let q = String::from_utf8_lossy(&body[..body.len() - 1]).into_owned();
-                        let _ = tx.send(Saw::Query(q));
-                        s.write_all(&frame(Some(b'C'), b"SELECT 1\x00"))
-                            .await
-                            .unwrap();
-                        s.write_all(&frame(Some(b'Z'), b"I")).await.unwrap();
-                    }
-                });
-            }
-        });
-        (pem, port, rx)
-    }
-
-    /// A password made for one test run, never written down.
-    fn made() -> String {
-        format!("made-{:016x}", rand::random::<u64>())
-    }
-
-    /// What the proxy sends in the two seconds after a refusal: nothing,
-    /// when it hangs up as it should.
-    async fn what_follows<S: AsyncRead + Unpin>(s: &mut S) -> Vec<u8> {
-        let mut got = Vec::new();
-        let mut buf = [0u8; 4096];
-        while let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await {
-            if n == 0 {
-                break;
-            }
-            got.extend(&buf[..n]);
-        }
-        got
-    }
 
     fn upstream(ca: Option<&str>, port: u16, password: &str) -> Upstream {
         Upstream {
@@ -628,25 +433,6 @@ mod tests {
             password: Zeroizing::new(password.into()),
             tls: tls::connector(ca).unwrap(),
         }
-    }
-
-    fn startup(params: &[(&str, &str)]) -> Vec<u8> {
-        let mut body = (3u32 << 16).to_be_bytes().to_vec();
-        for (k, v) in params {
-            body.extend(k.as_bytes());
-            body.push(0);
-            body.extend(v.as_bytes());
-            body.push(0);
-        }
-        body.push(0);
-        frame(None, &body)
-    }
-
-    async fn next(c: &mut DuplexStream) -> (u8, Vec<u8>) {
-        tokio::time::timeout(Duration::from_secs(10), read_message(c, 1 << 20))
-            .await
-            .expect("an answer within 10 s")
-            .expect("a message")
     }
 
     /// Serve one client of `up` over a pipe; the client's end, and the
@@ -833,6 +619,30 @@ mod tests {
             assert!(session.await.unwrap().is_err());
             assert!(saw.try_recv().is_err(), "no upstream was dialled");
         }
+    }
+
+    /// The secret's user ends the startup the upstream reads: one holding a
+    /// NUL would name parameters of its own (`replication` among them), and
+    /// one that is empty names nobody. Each is refused before any upstream is
+    /// dialled.
+    #[tokio::test]
+    async fn a_user_that_would_name_parameters_of_its_own_is_refused() {
+        let pw = made();
+        let (ca, port, mut saw) = fake(Upstreams::Scram(pw.clone())).await;
+        for user in ["app\0replication\0database", ""] {
+            let mut up = upstream(Some(&ca), port, &pw);
+            up.user = user.into();
+            let (mut c, session) = client_of(up);
+            c.write_all(&startup(&[("database", "d")])).await.unwrap();
+            let (_, body) = next(&mut c).await;
+            assert!(
+                error_message(&body).contains("not a name Postgres takes"),
+                "{user:?}: {}",
+                error_message(&body)
+            );
+            assert!(session.await.unwrap().is_err());
+        }
+        assert!(saw.try_recv().is_err(), "no upstream was dialled");
     }
 
     /// An upstream that trusts the connection asks for nothing, and the

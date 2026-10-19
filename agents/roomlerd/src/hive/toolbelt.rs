@@ -67,6 +67,14 @@
 //! a use naming the same secret toward the same audience takes; it hands the
 //! session nothing, so the settings allow it with the reads
 //! ([`VAULT_AHEAD_TOOLS`]).
+//!
+//! # `proxy` (FR-90 P3-5b-2)
+//!
+//! `vault_connect` serves an endpoint for the session's account that
+//! authenticates to a database with a secret's value
+//! ([`super::vault_connect`]): the session gets a connection string with no
+//! credential in it, for as long as the leases. Asked for in the settings with
+//! the other uses: it acts as the secret's user.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -290,6 +298,12 @@ pub(crate) trait VaultTools: Send + Sync {
     /// lease is let go. `false` when the lease is no longer held.
     #[cfg(feature = "vault")]
     fn attach(&self, lease_id: &str, path: &std::path::Path) -> bool;
+    /// P3-5b-2 — `stop` is cancelled when `lease_id` is let go: what a tool
+    /// serves with its value (a proxy endpoint) ends with it. `false` when the
+    /// lease is no longer held. (Only Unix serves an endpoint yet.)
+    #[cfg(feature = "vault")]
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn stop_with(&self, lease_id: &str, stop: CancellationToken) -> bool;
     /// The value a held lease holds, while it is held.
     #[cfg(feature = "vault")]
     fn value(&self, lease_id: &str) -> Option<zeroize::Zeroizing<Vec<u8>>>;
@@ -338,11 +352,11 @@ struct Ctx {
 const VAULT_TOOL_NAMES: [&str; 2] = ["vault_list", "vault_describe"];
 
 /// FR-90 P3-4c — and its uses: a value handed to one command (c-1), or
-/// written into the session's secrets directory (c-2). Offered with the
-/// reads, and asked for in the settings ([`VAULT_USE_TOOLS`]): each call asks
-/// a person first.
+/// written into the session's secrets directory (c-2), and (P3-5b-2) an
+/// endpoint that authenticates with one. Offered with the reads, and asked
+/// for in the settings ([`VAULT_USE_TOOLS`]): each call asks a person first.
 #[cfg(feature = "vault")]
-const VAULT_USE_NAMES: [&str; 2] = ["vault_exec", "vault_render"];
+const VAULT_USE_NAMES: [&str; 3] = ["vault_exec", "vault_render", "vault_connect"];
 
 /// FR-90 P3-4c-3 — and a lease asked for ahead, which a use takes. Allowed
 /// in the settings like the reads ([`VAULT_AHEAD_TOOLS`]): it hands the
@@ -373,8 +387,11 @@ pub(crate) const VAULT_TOOLS: [&str; 2] =
 /// person. Claude Code reads deny, then ask, then allow, across every
 /// settings file, so this ask prompts whatever another file allows.
 #[cfg(feature = "vault")]
-pub(crate) const VAULT_USE_TOOLS: [&str; 2] =
-    ["mcp__roomler__vault_exec", "mcp__roomler__vault_render"];
+pub(crate) const VAULT_USE_TOOLS: [&str; 3] = [
+    "mcp__roomler__vault_exec",
+    "mcp__roomler__vault_render",
+    "mcp__roomler__vault_connect",
+];
 
 /// FR-90 P3-4c-3 — asking a lease ahead, as Claude Code names it: allowed
 /// with the reads wherever it is offered.
@@ -538,6 +555,10 @@ impl VaultTools for DaemonVault {
 
     fn attach(&self, lease_id: &str, path: &std::path::Path) -> bool {
         crate::vault::CLIENT.attach(lease_id, path)
+    }
+
+    fn stop_with(&self, lease_id: &str, stop: CancellationToken) -> bool {
+        crate::vault::CLIENT.stop_with(lease_id, stop)
     }
 
     fn value(&self, lease_id: &str) -> Option<zeroize::Zeroizing<Vec<u8>>> {
@@ -896,20 +917,47 @@ fn vault_tools() -> Vec<Value> {
     }));
     #[cfg(feature = "vault")]
     tools.push(json!({
+        "name": "vault_connect",
+        "description": "Opens an endpoint on this device that signs in to a database as a Roomler \
+                        vault secret's user, and answers how to connect to it: a Postgres client \
+                        connects to its host (a socket directory) and port with any user name and \
+                        no password, and never sees the secret's value. handle names a structured \
+                        secret with user and password fields; upstream is the database's \
+                        host:port, exactly as the secret's audiences name it; ca names a secret \
+                        holding the database's CA certificate (PEM) when the system does not \
+                        trust it. The endpoint closes with its lease (ttl_s, 30 to 900 seconds). \
+                        A person approves every call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string", "description": "a structured secret: a path or rrn:<org>:secret:<path>, with no #field"},
+                "engine": {"type": "string", "enum": ["postgres"]},
+                "upstream": {"type": "string", "description": "host:port, such as db.internal:5432"},
+                "database": {"type": "string", "description": "the database to name in the connection string"},
+                "ca": {"type": "string", "description": "a secret whose value is the upstream's CA certificate, PEM"},
+                "ttl_s": {"type": "integer", "minimum": 30, "maximum": 900},
+            },
+            "required": ["handle", "engine", "upstream"],
+        },
+        "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
+    }));
+    #[cfg(feature = "vault")]
+    tools.push(json!({
         "name": "vault_request",
         "description": "Asks the Roomler vault for a lease ahead of using it, and answers the \
                         lease's id and how long it lasts, never a value. mode is exec (for \
-                        vault_exec, audience the program's bare name) or file (for vault_render, \
-                        audience the file's bare name). A later vault_exec or vault_render that \
-                        names the same secret toward the same audience takes this lease instead \
-                        of asking again, while it lasts (ttl_s, 30 to 900 seconds). Each of \
-                        those calls still asks a person.",
+                        vault_exec, audience the program's bare name), file (for vault_render, \
+                        audience the file's bare name) or proxy (for vault_connect, audience the \
+                        upstream's host:port, one lease per field it signs in with: #user, \
+                        #password). A later use that names the same secret toward the same \
+                        audience takes this lease instead of asking again, while it lasts \
+                        (ttl_s, 30 to 900 seconds). Each of those calls still asks a person.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "handle": {"type": "string", "description": "a secret: a path or rrn:<org>:secret:<path>, with #<field> for a structured secret's field"},
-                "mode": {"type": "string", "enum": ["exec", "file"]},
-                "audience": {"type": "string", "description": "exec: the program's bare name, such as psql; file: the file's bare name, such as kubeconfig"},
+                "mode": {"type": "string", "enum": ["exec", "file", "proxy"]},
+                "audience": {"type": "string", "description": "exec: the program's bare name, such as psql; file: the file's bare name, such as kubeconfig; proxy: the upstream's host:port"},
                 "ttl_s": {"type": "integer", "minimum": 30, "maximum": 900},
             },
             "required": ["handle", "mode", "audience"],
@@ -977,6 +1025,17 @@ async fn ask_vault(ctx: &Ctx, name: &str, args: &Value) -> Result<Value, String>
     #[cfg(feature = "vault")]
     if name == "vault_request" {
         return super::vault_request::call(vault.as_ref(), ctx.session, ctx.fence, args).await;
+    }
+    #[cfg(feature = "vault")]
+    if name == "vault_connect" {
+        return super::vault_connect::call(
+            Arc::clone(vault),
+            ctx.session,
+            ctx.fence,
+            ctx.exec.as_ref(),
+            args,
+        )
+        .await;
     }
     if name == "vault_list" {
         let prefix = args.get("prefix").and_then(Value::as_str).unwrap_or("");
