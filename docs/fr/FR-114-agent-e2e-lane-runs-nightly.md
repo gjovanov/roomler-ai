@@ -1,7 +1,8 @@
 # FR-114: The agent-e2e lane runs every night — remote-session specs against a real agent in the e2e namespace
 
-**Issue:** [#2524](https://github.com/gjovanov/roomler-ai/issues/2524) · **Status:** proposed 2026-10-19 — spec and
-claim, on the operator's go-ahead (*"do the test based on your best judgement … proceed"*) · **Owner:** testing (the
+**Issue:** [#2524](https://github.com/gjovanov/roomler-ai/issues/2524) · **Status:** P1 + P2 shipped 2026-10-19 (#2534
+`2a8a8c552`; deploy #45 `225cbb9cc`), P3's on-demand run green; the first nightly (AC5) pending. Proposed 2026-10-19 on
+the operator's go-ahead (*"do the test based on your best judgement … proceed"*) · **Owner:** testing (the
 e2e pod lane) · **Anchors:** master `95238f1b3` · **Builds on:** `scripts/e2e-k8s/AGENT-E2E.md` (the harness as it
 was first written), [FR-102](FR-102-growth-observability.md) AC19 (whose pod-lane run this owes)
 
@@ -61,25 +62,25 @@ flowchart LR
 
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
-| P1 | the four specs' cookie sign-in; `Dockerfile.agent-e2e` on rust 1.95, with the bootstrap finding the tenant by slug; the seed reading the tenant from `GET /api/tenant`; the template's registry; the nightly's tenant discovery; `AGENT-E2E.md` and `docs/testing.md` | revert the PR | — |
-| P2 | build and push `roomlerd-e2e`; install the overlay into the deploy repo (`k8s/overlays/e2e`, manual apply, never ArgoCD-synced); apply; the seed; all three agents online | `kubectl -n roomler-ai-e2e delete statefulset agent-e2e` (the nightly then skips as today) | — |
-| P3 | an on-demand run of the six specs in the `pwrunner`; then the next nightly | as P2 | — |
+| P1 | the four specs' cookie sign-in; `Dockerfile.agent-e2e` on rust 1.95, with the bootstrap finding the tenant by slug; the seed reading the tenant from `GET /api/tenant`; the template's registry; the nightly's tenant discovery; `AGENT-E2E.md` and `docs/testing.md` | revert the PR | **merged** #2534 `2a8a8c552` |
+| P2 | build and push `roomlerd-e2e`; install the overlay into the deploy repo (`k8s/overlays/e2e`, manual apply, never ArgoCD-synced); apply; the seed; all three agents online | `kubectl -n roomler-ai-e2e delete statefulset agent-e2e` (the nightly then skips as today) | **done**: `agent-e2e-20261019-2a8a8c5`, deploy #45 `225cbb9cc`, applied |
+| P3 | an on-demand run of the six specs in the `pwrunner`; then the next nightly | as P2 | on-demand **7/7**; the nightly pending |
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1 (P1):** no spec in `ui/e2e/` seeds `access_token` or `refresh_token` into `localStorage`
+- [x] **AC1 (P1):** no spec in `ui/e2e/` seeds `access_token` or `refresh_token` into `localStorage`
   (`grep -rn "setItem('access_token'" ui/e2e` finds nothing), and the four sign in through the context's cookie jar.
-- [ ] **AC2 (P2):** `roomlerd-e2e` builds from master with the workspace's toolchain and is pushed to
+- [x] **AC2 (P2):** `roomlerd-e2e` builds from master with the workspace's toolchain and is pushed to
   `registry.roomler.ai` under a dated tag that the overlay pins.
-- [ ] **AC3 (P2):** after a fresh apply, with no hand edit to any Secret, all three `agent-e2e` pods are Ready with no
+- [x] **AC3 (P2):** after a fresh apply, with no hand edit to any Secret, all three `agent-e2e` pods are Ready with no
   restarts and all three agents are online in the e2e server's `agent-e2e` tenant, each advertising its recording
   state (§6.2). Red first: today's seed fails at the `/me` read.
-- [ ] **AC4 (P3):** an on-demand run in the `pwrunner` sidecar runs all six agent-e2e specs: none skips. Each passes,
+- [x] **AC4 (P3):** an on-demand run in the `pwrunner` sidecar runs all six agent-e2e specs: none skips. Each passes,
   or its failure is diagnosed and either fixed or entered in `scripts/e2e-expected-failures.txt` with the reason.
   `remote-session-rating.spec.ts` passes, which is FR-102 AC19's pod-lane run.
 - [ ] **AC5 (P3):** the first nightly after P2 skips seven fewer tests than the night before (the six specs hold
   seven tests; the reporter counts tests). The lane's verdict holds, or names what newly failed.
-- [ ] **AC6 (docs):** `docs/testing.md` documents the agent-e2e lane in the house style (a mermaid diagram, a table,
+- [x] **AC6 (docs):** `docs/testing.md` documents the agent-e2e lane in the house style (a mermaid diagram, a table,
   `file:line` anchors), `scripts/e2e-k8s/AGENT-E2E.md` matches what was run, and `docs/README.md`'s index row for
   `testing.md` names the lane.
 
@@ -104,3 +105,12 @@ flowchart LR
 
 | Date | Build | What was checked | Result |
 |---|---|---|---|
+| 2026-10-19 01:30Z | the nightly, e2e server `hosted-20261018-368ac01`, no harness | the night before P2 (AC5's baseline) | **15 skipped**, the six agent-e2e specs (seven tests) among them: no `E2E_AGENT_E2E_TENANT_ID` |
+| 2026-10-19 14:41:24Z | master's template (`95238f1b3`) applied to `roomler-ai-e2e` | AC3's red: the seed as it was | **Red.** `register` → 201, then `could not extract tenant_id from /me`: the seed cannot finish, so nothing could enroll without a hand-rebaked Secret |
+| 2026-10-19 ~14:30–14:46Z | candidate `roomlerd-e2e:agent-e2e-20261019-adada12-p1` (the P1 branch) | P2 rehearsal: two agents | First apply: both agents **crash-looped**. `roomlerd enroll` promoted `http://roomler2` to `https://` (`normalize_server_url`, `crates/agent-core/src/enrollment.rs`; FR-101 P1b, no plaintext escape) and timed out. Fixed by the `server-proxy` sidecar (socat, `127.0.0.1:18080 → roomler2:80`; loopback is exempt). Then both 2/2 with 0 restarts, the tenant found by slug, `rc:agent.hello sent` |
+| 2026-10-19 ~14:50–15:00Z | same candidate, two agents | P3 rehearsal | Run 1: the upload spec **failed**. The agent logged `files: complete` 160 ms after `begin`, while the spec polled a page-wide status for 2 min with the Transfers popover closed. The spec now opens the popover and reads its own row. Run 2: **5 passed, 2 skipped**; the skips were the recording states no device had (an opt-in, no recorder) |
+| 2026-10-19 15:10–15:14Z | candidate `agent-e2e-20261019-cc74490-p1`, three agents | the recording states by ordinal | `agent-e2e-1` (opted in) **crash-looped**, 6 restarts in 3 min: `TOML parse error at line 31 … record_remote_enabled = false`. `roomlerd enroll` already writes the key at the root, so the prepended `= true` was a duplicate key and the daemon refused the whole config. The bootstrap now replaces the root table's line and checks one `= true` is left (`582d7ec`). An OrderedReady StatefulSet will not roll past a pod that is not Ready, so recovery was the P2 kill switch plus a fresh apply |
+| 2026-10-19 15:25–15:29Z | candidate `agent-e2e-20261019-582d7ec-p1` (digest `sha256:cb799c89…a818`); e2e server `hosted-20261018-368ac01` | AC3 and AC4, fresh apply | **Green.** 3/3 Ready, 0 restarts, no Secret edited. `record`: `-0` `["available"]`, `-1` `["available","remote"]`, `-2` none. The six specs: **7 passed, 0 skipped** (2.2 min), the rating spec (FR-102 AC19) among them. The recording smoke accepts a worded refusal too, so the agent's log is the oracle: `remote recording started … ended reason=requested bytes=2404` |
+| 2026-10-19 16:20–16:23Z | the same agents; the e2e server moved to `hosted-20261019-dd59ede`, the image prod had run since 16:16:59Z | the suite on the new prod image (also that roll's RC check: FR-100 #2517 changed the hub's offer/answer relay) | **7 passed, 0 skipped**; REC again (4207 bytes) |
+| 2026-10-19 16:27Z | deploy branch `fr114-agent-e2e` vs the live namespace | `kubectl diff -k k8s/overlays/e2e` before the apply | Five objects. Two are P2's: the agent image and the seed Job. Three are **drift that predates P2**, not applied: `StatefulSet/minio` (deploy #27/#28's pin, never applied to e2e; minio's data is an emptyDir, so applying it wipes the e2e store), `Deployment/roomler2` (the `pwrunner` container's position only, which restarts the server), `ConfigMap/roomler2-config` (labels). Recorded on deploy #45 |
+| 2026-10-19 16:28–16:32Z | **master** `2a8a8c552` → `agent-e2e-20261019-2a8a8c5`: the **same digest** as the candidate (the agent's sources did not change between the two, so the binary rebuilt bit-for-bit). Deploy #45 `225cbb9cc` | AC2 and AC3 on the final tag, then AC4 | Applied: the four objects alone, byte-identical to deploy #45's files, a fresh apply. 3/3 Ready, 0 restarts; `record` as above. **7 passed, 0 skipped** (2.2 min) |
