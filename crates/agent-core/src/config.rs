@@ -1773,9 +1773,9 @@ pub struct AgentConfig {
     /// and to hold its own WG key; a tenant still on the shared legacy
     /// `/10` can coexist with carved-block orgs, but TWO un-migrated
     /// tenants on one host are refused at TUN registration (renumber one —
-    /// `docs/multi-org.md` §4.3). Mutually exclusive with netstack mode
-    /// (`ROOMLERD_OVERLAY_NETSTACK_SOCKS`): when this is on, the OS
-    /// TUN path is used regardless.
+    /// `docs/multi-org.md` §4.3). Overrides the PRIMARY's netstack mode
+    /// (`ROOMLERD_OVERLAY_NETSTACK_SOCKS`) with its OS TUN; a netstack
+    /// secondary keeps its own stack either way (#2493).
     #[serde(default)]
     pub overlay_multi_org: bool,
 

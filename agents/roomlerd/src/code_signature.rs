@@ -36,11 +36,11 @@
 //! ## Platforms other than Windows
 //!
 //! `verify_publisher` reports [`Unsupported`](VerifyError::Unsupported) off
-//! Windows. The Linux `.deb` and macOS `.pkg` ship detached GPG `.asc`
-//! signatures, but verifying those needs the release public key pinned in this
-//! binary, which is a separate change — the caller decides what to do with an
-//! unsupported platform, and today it keeps the previous behaviour rather than
-//! blocking updates on a check that cannot run.
+//! Windows. There the anchor is each release's detached GPG `.asc`, checked
+//! against the signing key compiled into this binary (`pgp_verify.rs`): the
+//! updater refuses a Linux or macOS artifact whose signature does not verify
+//! (`updater.rs`). Both checks are one idea, an identity compiled in, never
+//! one fetched from the release.
 
 use std::fmt;
 use std::path::Path;

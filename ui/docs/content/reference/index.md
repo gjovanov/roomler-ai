@@ -14,6 +14,7 @@ are for when you already know what you want and need the exact spelling.
 - **[Configuration](/docs/reference/configuration/)** icon:blueprint — Agent `config.toml` keys, where the file lives per platform, and which settings the server can and cannot change.
 - **[Ports and firewall](/docs/reference/ports-and-firewall/)** icon:network — What must be reachable, and what never needs opening inbound.
 - **[HTTP API](/docs/reference/api/)** icon:book — Authentication, organization scoping, rate limits and route groups.
+- **[Platform support](/docs/reference/platform-support/)** icon:compare — What works on Windows, Linux and macOS, and why where an OS cannot.
 :::
 
 ## Two things that catch people

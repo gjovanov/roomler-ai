@@ -13,13 +13,15 @@ just want different flags.
 
 | Mode | Flag | Runs as | Use it for |
 |---|---|---|---|
-| **System** | `--system` | root, systemd **system** unit | Servers, headless boxes, cluster nodes, containers |
+| **System** | `--system` | root, systemd **system** unit | Servers, headless boxes, cluster nodes, containers, and desktops that should be on the private network from boot |
 | **Per user** | *(default)* | you, systemd **user** unit | Desktops where you want to share the session you are actually logged into |
 
-:::tip Desktops want the per-user unit
-Screen capture needs a logged-in session. On a desktop, the default per-user
-unit is the right answer — a root system service has no session to capture
-unless you also enable the headless display mode below.
+:::tip On a desktop, either works
+The per-user unit shares the session you are logged into, on any desktop. A
+system install also shows a GNOME or KDE desktop by itself, while the person
+signed in there is at the screen, the session is unlocked, and they can be told
+who is viewing. It never shows the login or lock screen on its own. Only a
+system install puts the machine on the private network with its own adapter.
 :::
 
 To make an installed machine a system service later, enroll the root daemon,

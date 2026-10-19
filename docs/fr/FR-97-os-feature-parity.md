@@ -45,8 +45,9 @@
 - P6c, `service install --as-service` (alias `--system`) on Linux and macOS, merged (#2488): field-verified on a
   vmtest Ubuntu guest against 0.4.143's refusal and again on the 0.4.144 candidate, and the macOS stop's mechanism
   measured on a tart Mac (§8).
-- P8-1, every §2.8 doc correction but two, each re-checked against master first, merged (#2489). P8-2 follows
-  0.4.144.
+- P8-1, every §2.8 doc correction but two, each re-checked against master first, merged (#2489). P8-2 (#2548):
+  `docs/platform-support.md` and its user page, the stale code comments and W7c's last leftovers. AC16 waits only
+  on the two public Wayland pages of #2533.
 - P1d, a Mac's per-org utun, merged (#2492). Run once on the released 0.4.143 (§8): one root daemon in two orgs,
   each on its own utun, and the secondary's mesh through its own. The stale warning is gone, and the port holder
   names a Mac's listener. Its netstack run found #2493 (a second org in netstack mode joined no mesh), fixed on its
@@ -186,7 +187,7 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | R1 | System audio in a session | ✅ WASAPI loopback | ❌ **the default microphone, always**: cpal lists only ALSA devices, so the `.monitor` pick never matched (measured, §8). Since P3c-1 a named device only, else no track and the reason (`audio_source.rs:253`) | ❌ | macOS: no capture backend; since P0c no `opus` either (`encode/caps.rs:700`) ✔. Linux: nothing captures the session's monitor (P3c-2) | P0c, P2a, P3c |
 | R2 | Native consent panel | ✅ | ✅ X11 · ⛔ Wayland → companion | ❌ | Built (`indicator/mac.rs`), not in the release set (`release-agent.yml:2564-2580`) | P2b (D3) |
 | R3 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows (FR-56) | ❌ | `Unavailable::Platform` (`apps/mod.rs:347`); no `apps/macos.rs` | P2c |
-| R4 | Live cursor shape | ✅ | ❌ | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`) | P3a, P2d |
+| R4 | Live cursor shape | ✅ | 🟡 the DRM arm's hardware cursor (FR-93 P3c, 0.4.134); X11 ❌; a Wayland compositor draws it into the frames | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`). *P8-2:* the inventory missed the DRM arm (`agents/roomlerd/src/capture/cursor.rs:127-146`) | P3a, P2d |
 | R5 | "Host is locked" consent hint | ✅ | ✅ since P3b: advisory, from logind's `LockedHint`, and input passes (`lock_state.rs:331`) | ❌ | `LockState` is always `Unlocked` off Windows (`lock_state.rs:290-311`), on purpose for Linux: the hint never becomes one | P2d, P3b |
 | R6 | Keyboard layout report / switch | ✅ | ❌ | ❌ | Windows-only cap (`caps.rs:1570-1574`) | P2d, P3e |
 | R7 | Match remote display | ✅ | ❌ | ❌ | `display_match.rs:247` | P2d, P3e |
@@ -208,7 +209,7 @@ and the consent chain's fallbacks.
 
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
-| D1 | Companion: tray, banner, consent, Apply now | ✅ | 🟡 | ✅ | One x86_64 `.deb` (`release-agent.yml:744-871`); Fedora, Arch and arm64 have none | P3g (with FR-93 D5/D6, FR-95) |
+| D1 | Companion: tray, banner, consent, Apply now | ✅ | 🟡 | ✅ | One x86_64 `.deb` (`release-agent.yml:744-871`); Fedora, Arch and arm64 have none. *P8-2:* FR-93 P6d added an x86_64 `.rpm` (`.github/workflows/release-agent.yml:822-827`); arm64 and Arch still have none | P3g (with FR-93 D5/D6, FR-95) |
 | D2 | Companion pages on a system install | ✅ | 🟡 safety pages only | ❓ | Person socket (`crates/localapi/src/lib.rs:2735-2646`); a two-half Mac may answer Routes and Devices from the user half | #1911; FR-43 P3 |
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ✅ since P3b: a logind block inhibitor (`power.rs:670`) | ✅ IOPMAssertion | Was a stub whose reason, "zbus is in no shipped Linux feature set", had gone stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | ✅ | 🟡 built (P3d) | ✅ | Was: `/tmp`, owned `root:root`, measured on 0.4.143 (§8). P3d: the person at seat0's Downloads, every step as them (`agents/roomlerd/src/files.rs:223-294`) | P3d |
@@ -278,11 +279,13 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `docs/installation.md:21-22`, `ui/docs/content/start/install/macos.md:51-55` | install the macOS daemon with the wizard | the wizard's daemon roles are Windows-only. ✅ Both say so since P0c-4, as do both homepages |
 | `docs/installation.md:43-44`, `ui/docs/content/troubleshooting/install-problems.md:37-40` | downloads come from roomler.ai | true for the MSI proxy, the CLI and the wizard; `install.sh`'s `.deb`/tarball/`.pkg` and every self-update fetch from GitHub (`updater.rs:1276,1360`). ✅ **P8:** both name the hosts, measured 2026-10-18: the manifest's asset URLs are `github.com`, redirected to `release-assets.githubusercontent.com`; `install.ps1`'s companion is one too, and its VC++ runtime comes from `aka.ms` |
 | `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:3180` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon. ✅ Both say so since P0c-2 |
-| `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:181-224`); DRM captures from root (opt-in). ⏳ **P8-2.** This row moved under it: since FR-95 (verified on 0.4.141) a system install switches DRM and uinput on by itself for the person's Wayland session, FR-113 (merged, not yet released) does the same for X11, and the wlroots portal never produced frames in the lab. Rewritten once 0.4.144 ships FR-113 |
+| `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:181-224`); DRM captures from root (opt-in). ⏳ **P8-2.** This row moved under it: since FR-95 (verified on 0.4.141) a system install switches DRM and uinput on by itself for the person's Wayland session, FR-113 (merged, not yet released) does the same for X11, and the wlroots portal never produced frames in the lab. ✅ **P8-2** (#2548), once FR-113 shipped (0.4.144, closed on 0.4.145): `unattended-access.md`'s Linux tab, and the same claim in `ui/docs/content/start/install/linux.md`'s tip and in `scripts/install.sh`'s `--system` help and its enable line. ⏳ `per-os-permissions.md` and `troubleshooting/black-screen.md` ride #2533 |
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`). ✅ **P8** |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93. ✅ FR-93 added the Wayland section; **P8** rewrote the system unit's half, which still read "only once both keys are set", for FR-95 and FR-113 (the package ships master's code) |
-| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1827`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps. ⏳ **P8-2**, except `power.rs` (P3b) |
-| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:227`), `crates/tunnel-core/src/overlay/mod.rs:92`, `crates/tunnel-core/src/overlay/tun.rs:3779`, `:3875`, `:4282`, `agents/roomlerd/src/main.rs:4685` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:580-585`). ⏳ **P8-2** for the rest |
+| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1827`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps. ✅ **P8-2** (#2548): `agents/roomlerd/src/lock_overlay.rs:32-34`, `agents/roomlerd/src/code_signature.rs:38-43`, `agents/roomlerd/src/post_install.rs:78-81`, `agents/roomlerd/src/encode/caps.rs:1858`, `crates/tunnel-core/src/overlay/tun.rs:3926-3927`, and one found writing the page, "v6 exit egress is Linux-only" since P1b (`crates/tunnel-core/src/overlay/nat.rs:453-454`). `power.rs` was P3b's |
+| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:227`), `crates/tunnel-core/src/overlay/mod.rs:92`, `crates/tunnel-core/src/overlay/tun.rs:3779`, `:3875`, `:4282`, `agents/roomlerd/src/main.rs:4697` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:580-585`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
+| `ui/docs/content/reference/ports-and-firewall.md`, "Allow-listing by hostname" | installers and updates come from the server's own origin, so an allow-list needs only `roomler.ai` | the same split as the `installation.md` row above. ✅ **P8-2** (#2548), found writing the user page: it names GitHub's two hosts and `aka.ms` too |
+| `docs/README.md`'s `multi-org.md` row | the doc covers the mux NAT | history since W7c (the `multi-org.md` row above). ✅ **P8-2** (#2548) |
 
 ### 2.9 Equal on all three: not parity, recorded so nobody files them here
 
@@ -949,7 +952,7 @@ model on Windows, so the three agree on what the mode means.
 | **P6f** | Private staging dir on Windows + macOS (settled: Windows by GHSA-r3xj-4wh9-xh2v, macOS measured private) | — | Win10, Win11, a Mac | S |
 | **P7a** | Linux arm64 hardware encode | the release feature set | an arm64 lab host | M |
 | **P7b** | arm64 tunnel CLI + wizard | — | an arm64 vmtest guest | S |
-| **P8** | Docs: `platform-support.md`, the user page, every §2.8 correction. *P8-1* merged (#2489): every §2.8 row but two, each re-checked against master first. *P8-2*, after 0.4.144 ships FR-113: the Linux Wayland/root row, the stale code comments, `platform-support.md` and the user page | — | — | M |
+| **P8** | Docs: `platform-support.md`, the user page, every §2.8 correction. *P8-1* merged (#2489): every §2.8 row but two, each re-checked against master first. *P8-2* (#2548), after 0.4.144 shipped FR-113: `platform-support.md` and the user page, written against 0.4.145; the stale code comments and W7c's last leftovers; the Linux system-install claims, but for the two public Wayland pages, which ride #2533 | — | — | M |
 
 Kill switches named `ROOMLERD_*`, and `ssh_sftp_as_user`, are proposed names. `[apps] enabled`, `hive_adopt`,
 `power_policy` and `ssh_account_mode` exist today.
@@ -1058,6 +1061,8 @@ one depends on it.
 - [ ] **AC16 (docs):** `docs/platform-support.md` (a mermaid map, the per-pillar tables, the reason for every ⛔,
   `file:line` anchors), the user-facing `ui/docs/content/reference/platform-support.md`, every row of §2.8
   corrected, and the `docs/README.md` index row.
+  *(P8-2, #2548: both pages, the index row, and every §2.8 row but the two public Wayland pages,
+  `per-os-permissions.md` and `black-screen.md`, which ride #2533.)*
 - [x] **AC17 (P0e):** a Linux and a Windows exit client that change networks under an active exit re-pin through the
   new uplink within one sweep, and the control WS stays up; after a `kill -9` and a network change, no exemption
   route is left on any of the three OSes. Red first on the current release. *(Linux and Windows red on 0.4.134 →

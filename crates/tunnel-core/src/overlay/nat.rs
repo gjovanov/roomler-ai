@@ -451,7 +451,7 @@ async fn setup(
     // P5/S3b — WinNAT (`New-NetNat`) has NO IPv6 API, so a Windows exit node
     // cannot NAT v6. Clients routing through a Windows exit stay v6-fail-closed
     // (their global v6 is encapsulated but dropped here — never leaked). v6 exit
-    // egress is Linux-only; see docs/remote-control (S5).
+    // egress is Linux's (ip6tables) and macOS's (pf NAT66, FR-97 P1b).
     info!(
         "overlay: IPv6 exit NAT unavailable on Windows (WinNAT is v4-only); v6 stays fail-closed"
     );
