@@ -1,4 +1,4 @@
-import { type Page, expect } from '@playwright/test'
+import { type BrowserContext, type Page, expect } from '@playwright/test'
 
 const API_URL = process.env.E2E_API_URL || 'http://localhost:5001'
 const MAILPIT_URL = process.env.E2E_MAILPIT_URL || 'http://localhost:8025'
@@ -84,6 +84,31 @@ export async function loginViaUi(page: Page, username: string, password: string)
   await page.locator('input[type="password"]').fill(password)
   await page.getByRole('button', { name: /login/i }).click()
   await expect(page).toHaveURL(/\/$/, { timeout: 5000 })
+}
+
+/**
+ * Sign a browser context in through its OWN cookie jar, with no login form.
+ *
+ * Sessions are cookie-only since #691: an `access_token` seeded into
+ * `localStorage` grants nothing, and the viewer shows the login form. Posting
+ * the login through `context.request` lands the HttpOnly session cookie in
+ * that context's jar. The `roomler-signed-in` hint makes the SPA render its
+ * shell and refresh through the cookie instead of bouncing to /login. purestat
+ * is aborted, so a test run never feeds the analytics a real visit feeds.
+ */
+export async function signInContext(context: BrowserContext, email: string, password: string) {
+  await context.route('https://purestat.ai/**', (r) => r.abort())
+  const login = await context.request.post(`${API_URL}/api/auth/login`, {
+    data: { email, password },
+  })
+  expect(login.ok(), `browser login failed: ${login.status()}`).toBeTruthy()
+  await context.addInitScript(() => {
+    try {
+      window.localStorage.setItem('roomler-signed-in', '1')
+    } catch {
+      /* storage blocked — the cookie still authenticates */
+    }
+  })
 }
 
 /** Join a room via the API */

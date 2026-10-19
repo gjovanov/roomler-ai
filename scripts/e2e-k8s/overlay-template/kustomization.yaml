@@ -35,12 +35,10 @@ resources:
   - statefulset-minio.yaml
   # Phase 1 Chunk 1B — agent-e2e harness. The seed Job runs once per
   # namespace lifetime to create the admin + tenant; the StatefulSet
-  # runs 2 replicas of the synthetic-frame agent enrolled against
-  # that tenant. Secret pins the credentials + tenant_id the agents
-  # bootstrap with. After the first seed-Job run, paste the printed
-  # tenant_id into secret-agent-e2e-bootstrap.yaml + re-apply the
-  # overlay so the agent StatefulSet uses the real id (it ships
-  # with a placeholder zero-id that will loop until rebaked).
+  # runs 3 replicas of the synthetic-frame agent enrolled against
+  # that tenant. The Secret holds the admin's credentials; the agents,
+  # the seed and the nightly find the tenant by its slug (FR-114), so
+  # nothing is rebaked after the first seed or a wiped DB.
   - secret-agent-e2e-bootstrap.yaml
   - job-agent-e2e-seed.yaml
   - service-agent-e2e.yaml
@@ -50,15 +48,16 @@ resources:
 # you want e2e to validate a newer build than what's on roomler.ai.
 images:
   - name: gjovanov/roomler-ai
-    newName: <internal-registry>/roomler-ai
+    newName: registry.roomler.ai/roomler-ai
     newTag: v20260506-c89d55489f21
   # Phase 1 Chunk 1B — agent-e2e Linux image, built from
-  # Dockerfile.agent-e2e. Pinned to `latest` for the first iteration
-  # while the bootstrap flow stabilises; switch to a sha-tagged
-  # image once the runbook is locked.
+  # Dockerfile.agent-e2e. FR-114: pinned to the DATED tag that was pushed,
+  # never `latest` (install-overlay.sh pins it from AGENT_E2E_TAG), so a
+  # night's agent is a known build. The placeholder fails a pull loudly
+  # rather than run an unknown agent.
   - name: gjovanov/roomlerd-e2e
-    newName: <internal-registry>/roomlerd-e2e
-    newTag: latest
+    newName: registry.roomler.ai/roomlerd-e2e
+    newTag: set-by-AGENT_E2E_TAG
 
 commonLabels:
   env: e2e

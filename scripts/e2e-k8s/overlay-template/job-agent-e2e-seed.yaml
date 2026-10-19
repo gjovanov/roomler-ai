@@ -64,8 +64,7 @@ spec:
                 echo "[seed] register failed:"; cat /tmp/reg.json; exit 1
               fi
 
-              # Login to get an access_token + harvest the tenant_id
-              # from the response (`/api/auth/me` returns memberships).
+              # Login to get an access_token, then read the tenant back.
               LOGIN_BODY=$(printf '{"email":"%s","password":"%s"}' "$ADMIN_EMAIL" "$ADMIN_PASSWORD")
               LOGIN_RESP=$(curl -fsS -X POST "$SERVER/api/auth/login" \
                 -H 'content-type: application/json' -d "$LOGIN_BODY")
@@ -74,26 +73,18 @@ spec:
                 echo "[seed] login failed:"; echo "$LOGIN_RESP"; exit 1
               fi
 
-              ME_RESP=$(curl -fsS "$SERVER/api/auth/me" -H "authorization: Bearer $TOKEN")
-              TENANT_ID=$(echo "$ME_RESP" | grep -oE '"tenant_id":"[^"]+"' | head -1 | sed 's/.*"tenant_id":"\([^"]*\)".*/\1/')
+              # FR-114 — the tenant by its SLUG: `/api/auth/me` no longer
+              # carries a tenant_id, and `GET /api/tenant` answers the
+              # caller's tenants as flat rows (id, name, slug, owner_id, plan).
+              TENANTS=$(curl -fsS "$SERVER/api/tenant" -H "authorization: Bearer $TOKEN")
+              TENANT_ID=$(echo "$TENANTS" | grep -oE '\{[^{}]*"slug":"'"$TENANT_SLUG"'"[^{}]*\}' | grep -oE '"id":"[0-9a-f]{24}"' | head -1 | cut -d'"' -f4)
               if [ -z "$TENANT_ID" ]; then
-                echo "[seed] could not extract tenant_id from /me:"; echo "$ME_RESP"; exit 1
+                echo "[seed] no tenant with slug $TENANT_SLUG in GET /api/tenant:"; echo "$TENANTS"; exit 1
               fi
               echo "[seed] tenant_id=$TENANT_ID"
 
-              # We can't write the Secret from inside a Pod without
-              # extra RBAC for `patch secrets`. Instead, the agent
-              # StatefulSet reads ADMIN_* + TENANT_ID from a plain
-              # ConfigMap+Secret already in the overlay (see
-              # configmap-agent-e2e.yaml + secret-agent-e2e.yaml).
-              # This Job's only post-condition is "the admin user
-              # exists with the documented credentials and is a
-              # member of the documented tenant_slug." We assert
-              # that by reading TENANT_ID back here and comparing
-              # against the pinned value; a mismatch indicates a
-              # stale Secret + needs operator action.
-              if [ -n "${EXPECTED_TENANT_ID:-}" ] && [ "$TENANT_ID" != "$EXPECTED_TENANT_ID" ]; then
-                echo "[seed] WARN: live tenant_id=$TENANT_ID, Secret pins $EXPECTED_TENANT_ID — re-bake the Secret"
-              fi
-
+              # This Job's only post-condition is "the admin user exists
+              # with the documented credentials and is a member of the
+              # documented tenant_slug". Nothing pins the id: the agents
+              # and the nightly find the tenant by the same slug (FR-114).
               echo "[seed] OK — admin + tenant ready; tenant_id=$TENANT_ID"
