@@ -719,6 +719,7 @@ pub async fn simulate(
                     kind: secret.kind.clone(),
                     tags: secret.tags.clone(),
                     exec_allow: secret.exec_allow.clone(),
+                    audiences: secret.audiences.clone(),
                 },
                 mode,
                 audience: body.audience.clone().unwrap_or_default(),
@@ -761,6 +762,7 @@ pub async fn simulate(
                     kind: secret.kind.clone(),
                     tags: secret.tags.clone(),
                     exec_allow: secret.exec_allow.clone(),
+                    audiences: secret.audiences.clone(),
                 },
                 device,
             }

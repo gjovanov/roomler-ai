@@ -99,6 +99,7 @@ fn secret_facts(secret: &VaultSecret, slug: &str) -> SecretFacts {
         kind: secret.kind.clone(),
         tags: secret.tags.clone(),
         exec_allow: secret.exec_allow.clone(),
+        audiences: secret.audiences.clone(),
     }
 }
 
