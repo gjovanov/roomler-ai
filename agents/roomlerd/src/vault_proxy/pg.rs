@@ -9,7 +9,7 @@
 //! | its `CancelRequest` | sent to the upstream as it came, over TLS: the key it names is the upstream's own, relayed unchanged |
 //! | its startup | read; `replication` refused, each one it names; `user` replaced by the secret's; everything else kept |
 //! | the upstream | TCP, `SSLRequest`, TLS verified ([`super::tls`]); an upstream that declines TLS is refused |
-//! | its authentication | SCRAM-SHA-256 only, the server's signature checked; cleartext, MD5 and every other kind refused |
+//! | its authentication | SCRAM-SHA-256 only, the server's signature checked, bound to the certificate the proxy verified where the upstream offers `-PLUS` (P3-5b-3); cleartext, MD5 and every other kind refused |
 //! | then | `AuthenticationOk` to the client, and every byte both ways |
 //!
 //! ⚠️ The client never authenticates: the endpoint is its credential (a
@@ -27,7 +27,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use zeroize::Zeroizing;
 
-use super::scram::ScramClient;
+use super::scram::{Binding, ScramClient};
 use super::tls;
 
 /// Where, and as whom, the proxy authenticates.
@@ -137,6 +137,14 @@ where
     params.insert(0, ("user".into(), up.user.clone()));
 
     let mut upstream = connect(up).await.map_err(Refusal::Tell)?;
+    // P3-5b-3 — the binding data of the channel just verified: the
+    // certificate the upstream presented, hashed as RFC 5929 says.
+    let bindable = upstream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .and_then(tls::server_end_point);
     let mut body = version.to_be_bytes().to_vec();
     for (k, v) in &params {
         body.extend(k.as_bytes());
@@ -178,15 +186,30 @@ where
                             .split(|b| *b == 0)
                             .filter(|m| !m.is_empty())
                             .collect();
-                        if !offered.contains(&b"SCRAM-SHA-256".as_slice()) {
-                            return Err(Refusal::Tell(
-                                "the upstream offers no SCRAM-SHA-256, the only way the proxy authenticates"
-                                    .into(),
-                            ));
-                        }
-                        let c = ScramClient::new("", &up.password).map_err(Refusal::Tell)?;
+                        let plus = offered.contains(&b"SCRAM-SHA-256-PLUS".as_slice());
+                        let plain = offered.contains(&b"SCRAM-SHA-256".as_slice());
+                        // Bound where the upstream offers it and its
+                        // certificate defines binding data; `y` where it
+                        // offers none though the proxy could bind, so an
+                        // upstream that strips `-PLUS` in transit is caught.
+                        let (mechanism, binding) = match (&bindable, plus, plain) {
+                            (Some(data), true, _) => {
+                                ("SCRAM-SHA-256-PLUS", Binding::ServerEndPoint(data.clone()))
+                            }
+                            (Some(_), false, true) => ("SCRAM-SHA-256", Binding::Unoffered),
+                            (None, _, true) => ("SCRAM-SHA-256", Binding::No),
+                            _ => {
+                                return Err(Refusal::Tell(
+                                    "the upstream offers no SCRAM-SHA-256 the proxy can use, the \
+                                     only way it authenticates"
+                                        .into(),
+                                ));
+                            }
+                        };
+                        let c =
+                            ScramClient::bound("", &up.password, binding).map_err(Refusal::Tell)?;
                         let first = c.client_first();
-                        let mut msg = b"SCRAM-SHA-256\0".to_vec();
+                        let mut msg = format!("{mechanism}\0").into_bytes();
                         msg.extend((first.len() as u32).to_be_bytes());
                         msg.extend(first.as_bytes());
                         send(&mut upstream, b'p', &msg).await?;
@@ -676,6 +699,71 @@ mod tests {
         c.write_all(&frame(Some(b'X'), b"")).await.unwrap();
         drop(c);
         assert!(session.await.unwrap().is_ok());
+    }
+
+    /// P3-5b-3 — the exchange binds to the certificate the proxy verified
+    /// where the upstream offers `-PLUS`, and says it could have (`y`) where
+    /// it offers none, which an upstream without binding takes.
+    #[tokio::test]
+    async fn the_exchange_binds_where_it_can_and_says_so_where_it_cannot() {
+        for (how, mechanism, gs2) in [
+            (
+                Upstreams::Binds as fn(String) -> Upstreams,
+                "SCRAM-SHA-256-PLUS",
+                "p=tls-server-end-point,,",
+            ),
+            (Upstreams::PlainOnly, "SCRAM-SHA-256", "y,,"),
+        ] {
+            let pw = made();
+            let (ca, port, mut saw) = fake(how(pw.clone())).await;
+            let (mut c, session) = client_of(upstream(Some(&ca), port, &pw));
+            c.write_all(&startup(&[("database", "d")])).await.unwrap();
+            assert_eq!(next(&mut c).await, (b'R', vec![0, 0, 0, 0]), "{gs2}");
+            assert!(matches!(saw.recv().await.unwrap(), Saw::Startup(_)));
+            assert_eq!(
+                saw.recv().await.unwrap(),
+                Saw::Sasl(mechanism.into(), gs2.into())
+            );
+            c.write_all(&message(b'X', b"")).await.unwrap();
+            drop(c);
+            assert!(session.await.unwrap().is_ok());
+        }
+    }
+
+    /// P3-5b-3 — what binding catches. An upstream that binds but was
+    /// offered to the proxy without `-PLUS` (a relay stripped it) refuses
+    /// the proxy's `y` as a downgrade. And behind a TLS-terminating relay,
+    /// the real upstream's own certificate is not the one the proxy bound
+    /// to, so it refuses the binding. Each refusal reaches the client in the
+    /// upstream's words, and no session starts.
+    #[tokio::test]
+    async fn a_stripped_offer_and_a_relayed_channel_are_refused() {
+        for (how, gs2, words) in [
+            (
+                Upstreams::Stripped as fn(String) -> Upstreams,
+                "y,,",
+                "SCRAM channel binding negotiation error",
+            ),
+            (
+                Upstreams::BindsElsewhere,
+                "p=tls-server-end-point,,",
+                "SCRAM channel binding check failed",
+            ),
+        ] {
+            let pw = made();
+            let (ca, port, mut saw) = fake(how(pw.clone())).await;
+            let (mut c, session) = client_of(upstream(Some(&ca), port, &pw));
+            c.write_all(&startup(&[("database", "d")])).await.unwrap();
+            let (tag, body) = next(&mut c).await;
+            assert_eq!(tag, b'E', "{gs2}");
+            assert_eq!(error_message(&body), words);
+            assert!(session.await.unwrap().is_err());
+            assert!(matches!(saw.recv().await.unwrap(), Saw::Startup(_)));
+            assert!(
+                matches!(saw.recv().await.unwrap(), Saw::Sasl(_, g) if g == gs2),
+                "the proxy said {gs2}"
+            );
+        }
     }
 
     /// A cancel goes to the upstream as it came, over TLS.
