@@ -26,9 +26,10 @@ People use it too.
 > answers, a session's tools that wait for the answer, and the card's
 > buttons in the web app (§18); P3-5a, a secret's `audiences` held to for
 > `proxy` mode, the first step of the proxies (§7); P3-5b-1, the Postgres
-> engine a proxy endpoint serves; and P3-5b-2, `vault_connect` and its
+> engine a proxy endpoint serves; P3-5b-2, `vault_connect` and its
 > endpoint, which signs in to a database as a secret's user for the
-> session's account (§19).** No released
+> session's account; and P3-5b-3, the exchange bound to the certificate
+> the proxy verified (§19).** No released
 > agent asks for a lease yet: no release build carries the `vault` feature.
 
 ## 1. Custody: who can read a secret
@@ -1098,12 +1099,12 @@ sequenceDiagram
 | Step | What the engine does | Where |
 |---|---|---|
 | the client's `SSLRequest`, `GSSENCRequest` | answered `N`: the endpoint is a local socket | `agents/roomlerd/src/vault_proxy/pg.rs:100` |
-| its `CancelRequest` | sent to the upstream as it came, over TLS: the key it names is the upstream's own, relayed unchanged | `pg.rs:107`, `pg.rs:295` |
+| its `CancelRequest` | sent to the upstream as it came, over TLS: the key it names is the upstream's own, relayed unchanged | `pg.rs:107`, `pg.rs:318` |
 | its startup | `replication` refused, each one it names (Postgres takes the last, so a "no" first is no cover); `user` replaced by the secret's; everything else kept | `pg.rs:119`, `pg.rs:136` |
-| the upstream | TCP, an `SSLRequest` it must accept, and TLS verified against the system's roots and the secret's `ca` | `pg.rs:259`, `agents/roomlerd/src/vault_proxy/tls.rs:20` |
-| its authentication | SCRAM-SHA-256 only, and the server's signature checked before the session starts | `pg.rs:169`, `pg.rs:181`, `pg.rs:215` |
-| what it says meanwhile | a protocol negotiation passed on at once, since a client takes one only before its `AuthenticationOk`; a notice held until after it | `pg.rs:233`, `pg.rs:240` |
-| then | `AuthenticationOk` to the client, and every byte both ways | `pg.rs:249` |
+| the upstream | TCP, an `SSLRequest` it must accept, and TLS verified against the system's roots and the secret's `ca` | `pg.rs:282`, `agents/roomlerd/src/vault_proxy/tls.rs:20` |
+| its authentication | SCRAM-SHA-256 only, and the server's signature checked before the session starts; bound to the certificate the proxy verified where the upstream offers `-PLUS` (P3-5b-3) | `pg.rs:177`, `pg.rs:189`, `pg.rs:195`, `pg.rs:238` |
+| what it says meanwhile | a protocol negotiation passed on at once, since a client takes one only before its `AuthenticationOk`; a notice held until after it | `pg.rs:256`, `pg.rs:263` |
+| then | `AuthenticationOk` to the client, and every byte both ways | `pg.rs:272` |
 
 > ⚠️ **The client never authenticates.** The endpoint is its credential: a
 > socket only the session's account can reach (P3-5b-2). The client is never
@@ -1114,7 +1115,7 @@ sequenceDiagram
 
 | What | The refusal says |
 |---|---|
-| an upstream that declines TLS | "the upstream declined TLS" (`pg.rs:282`) |
+| an upstream that declines TLS | "the upstream declined TLS" (`pg.rs:305`) |
 | a certificate that no root and no `ca` vouches for | "TLS to *host*: …" |
 | a cleartext or MD5 password asked for, or Kerberos, GSSAPI or SSPI | "the upstream asked for …; the proxy authenticates with SCRAM-SHA-256 only" |
 | SASL without SCRAM-SHA-256 | "the upstream offers no SCRAM-SHA-256" |
@@ -1123,7 +1124,7 @@ sequenceDiagram
 | a client asking for a replication connection | refused before any upstream is dialled |
 
 The proxy's refusals reach the client as Postgres writes a fatal error
-(`FATAL`, SQLSTATE `08004`), saying why (`pg.rs:386`). An upstream's own
+(`FATAL`, SQLSTATE `08004`), saying why (`pg.rs:409`). An upstream's own
 error, such as a wrong password or an unknown database, is relayed as the
 upstream wrote it.
 
@@ -1132,17 +1133,23 @@ upstream wrote it.
 
 | Rule | Why | Where |
 |---|---|---|
-| the password SASLprepped (RFC 4013) | both ends derive the key from the same form: a no-break space is a space, a control character is refused | `scram.rs:55` |
-| the server's nonce must extend this exchange's | a server first message from another exchange is refused | `scram.rs:91` |
-| at most 10,000,000 iterations | past that, an exchange is a way to make the daemon burn CPU (Postgres and MongoDB default to 4096 and 15000) | `scram.rs:31`, `scram.rs:101` |
-| a mandatory extension (`m=`) refused | as the RFC requires of a client that does not know it | `scram.rs:86` |
-| the server's signature compared in constant time | a server that cannot sign never had the password | `scram.rs:129`, `scram.rs:143` |
-| `n,,`: no channel binding yet | P3-5b-3 binds to `tls-server-end-point` where the upstream offers `-PLUS` | `scram.rs:34` |
+| the password SASLprepped (RFC 4013) | both ends derive the key from the same form: a no-break space is a space, a control character is refused | `scram.rs:108` |
+| the server's nonce must extend this exchange's | a server first message from another exchange is refused | `scram.rs:145` |
+| at most 10,000,000 iterations | past that, an exchange is a way to make the daemon burn CPU (Postgres and MongoDB default to 4096 and 15000) | `scram.rs:33`, `scram.rs:155` |
+| a mandatory extension (`m=`) refused | as the RFC requires of a client that does not know it | `scram.rs:140` |
+| the server's signature compared in constant time | a server that cannot sign never had the password | `scram.rs:185`, `scram.rs:199` |
+| bound to the channel (P3-5b-3) | where the upstream offers `-PLUS`, `p=tls-server-end-point`: the certificate the proxy verified, hashed with the hash its signature names (RFC 5929: MD5 and SHA-1 become SHA-256), inside what the proof covers. Where it offers none, `y`. `n` only where the certificate defines no binding data (Ed25519, RSASSA-PSS) | `scram.rs:38`, `tls.rs:125` |
 
-> ⚠️ **No channel binding yet.** Inside verified TLS, SCRAM already proves
-> that both ends hold the password. Binding adds catching a TLS terminator
-> the system also trusts (an inspection proxy whose CA is in the OS store)
-> relaying the exchange: P3-5b-3.
+> ⚠️ **What binding catches.** Inside verified TLS, SCRAM proves that both
+> ends hold the password; binding adds the certificate the proxy saw to
+> what the proof covers. Behind a TLS terminator the system also trusts (an
+> inspection proxy whose CA is in the OS store), the real upstream compares
+> the binding with its own certificate and refuses ("SCRAM channel binding
+> check failed"). A relay that strips `-PLUS` from the offer meets the
+> proxy's `y`, which an upstream that binds refuses as a downgrade ("SCRAM
+> channel binding negotiation error"). Both refusals are the upstream's,
+> relayed in its words. An upstream that cannot bind (an older server, a
+> pooler) takes `y`, so nothing that worked stops working.
 >
 > ⚠️ **TLS is never unverified.** A proxy authenticates with a value, and a
 > value presented to an upstream nobody verified is presented to whoever
@@ -1166,7 +1173,12 @@ for each test:
 - a trusting upstream, told nothing;
 - a cancel;
 - the order of a negotiation and a notice;
-- RFC 7677's exchange, byte for byte.
+- RFC 7677's exchange, byte for byte;
+- (P3-5b-3) the exchange bound where the upstream offers `-PLUS`, and `y`
+  where it offers none; a stripped offer and a relayed channel, each
+  refused by the upstream; the binding's hash for P-256 and P-384
+  certificates made in the test, none for Ed25519 or RSASSA-PSS, and SHA-1
+  made SHA-256.
 
 ### The endpoint and `vault_connect` (P3-5b-2)
 
@@ -1297,7 +1309,6 @@ its lease (§15).
 | Step | Builds |
 |---|---|
 | P3-5b-4 | the Windows endpoint: loopback TCP, each connection's process identified and refused unless it runs as the session's account |
-| P3-5b-3 | SCRAM channel binding (`tls-server-end-point`) where the upstream offers `-PLUS` |
 | P3-5c to P3-5f | `proxy` mode's other engines, as designed in the spec (§3e): MongoDB, HTTP named upstreams, the Kubernetes API and the SSH agent |
 | P3-6 to P3-9 | `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |
