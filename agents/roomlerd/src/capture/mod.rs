@@ -26,7 +26,7 @@ pub mod x11_damage;
 /// on Windows or macOS. The only backend that can see a Wayland desktop.
 #[cfg(all(target_os = "linux", feature = "drm-capture"))]
 pub mod drm_backend;
-#[cfg(all(target_os = "linux", feature = "drm-capture"))]
+#[cfg(target_os = "linux")]
 pub mod drm_cursor;
 /// FR-107 P3 — the DRM arm's GPU path: the scanout imported through EGL and
 /// scaled by one GLES pass, with the CPU repack as its fallback.
@@ -38,6 +38,9 @@ pub mod drm_idle;
 /// read the screen now: the person who was told, on screen, unlocked.
 #[cfg(all(target_os = "linux", feature = "drm-capture"))]
 pub(crate) mod seat_guard;
+/// FR-97 P3a — the X11 pointer, read from XFixes for the cursor channel.
+#[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+pub mod x11_cursor;
 
 /// FR-45 P1 — desktop-portal availability. Detection only: whether ScreenCast
 /// exists at all, and why not. The capture path itself is P2/P3.

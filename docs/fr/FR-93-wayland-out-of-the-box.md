@@ -91,7 +91,7 @@ The vmtest Ubuntu lane never saw this because it sets the opt-in keys itself
    stale mapping (inference).
 7. **No cursor from DRM**: only the primary plane is read. In a virtio-gpu VM *and* on real GPUs mutter and
    KWin keep the pointer on the cursor plane (§2.5), so it is absent from every DRM frame; the live cursor
-   channel is Windows-only (`cursor.rs:88-94`).
+   channel is Windows-only (`cursor.rs:89-95`).
 8. **The portal negotiates no buffer type** — no `SPA_PARAM_Buffers`, no modifier in EnumFormat
    (`portal/pipewire.rs:1100-1113`, `pod.rs:290-350`). That yields MemFd from GNOME and KWin today (§2.5); a
    DmaBuf-only producer costs a 15 s timeout and a silent fall-through (`pipewire.rs:787-791`, `:1173-1185`).
