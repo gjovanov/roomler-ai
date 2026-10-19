@@ -30,8 +30,10 @@ People use it too.
 > P3-5c-2 serves; P3-5b-2, `vault_connect` and its
 > endpoint, which signs in to a database as a secret's user for the
 > session's account; P3-5b-3, the exchange bound to the certificate the
-> proxy verified; and P3-5b-4, the endpoint on Windows, a loopback port
-> that serves only the session's account (§19).** No released
+> proxy verified; P3-5b-4, the endpoint on Windows, a loopback port
+> that serves only the session's account; and P3-5d-1, the HTTP engine,
+> which sends a client's requests on to one upstream with the secret's
+> credential added (§19).** No released
 > agent asks for a lease yet: no release build carries the `vault` feature.
 
 ## 1. Custody: who can read a secret
@@ -1234,6 +1236,65 @@ reaches the upstream; a server that cannot sign; a server before 4.4 given
 its empty exchange; and a first message past its bound, and an upstream no
 root vouches for.
 
+### The HTTP engine (P3-5d-1)
+
+The third engine, in `agents/roomlerd/src/vault_proxy/http.rs`: one client
+connection on the endpoint, each of its requests sent on to one upstream
+origin with the secret's credential added. Nothing serves it yet: P3-5d-2's
+`vault_connect` will, with git through `insteadOf` (the spec's §3e, "P3-5d,
+HTTP named upstreams, as designed").
+
+```mermaid
+sequenceDiagram
+    participant C as client (git, curl)
+    participant P as the proxy (roomlerd)
+    participant U as upstream (https://git.example)
+    C->>P: GET /org/repo.git/info/refs, no credential
+    Note over P: origin-form only<br/>the client's own Authorization dropped
+    P->>U: TCP, then TLS, the certificate verified
+    P->>U: the request, Host: git.example,<br/>Authorization: the secret's
+    U-->>P: 200, or a 302 to https://git.example/…
+    Note over P: a Location on the upstream's origin<br/>pointed back at the endpoint
+    P-->>C: the response, streamed
+```
+
+| Step | What the engine does | Where |
+|---|---|---|
+| a request | origin-form only: `CONNECT` answered `405`, an absolute or authority form and `*` answered `400`; nothing reaches the upstream | `http.rs:198`, `http.rs:203` |
+| its headers | the client's `Authorization` and `Proxy-Authorization` dropped, with every hop-by-hop header and those its `Connection` names; `Host` the upstream's; the secret's `Authorization` added, marked sensitive | `http.rs:218`, `http.rs:247` |
+| the credential | `Basic` from the secret's `user` and `password`, or `Bearer` from its `token`. A user with a colon, or a token that is empty or holds a space, a control character or a byte that is not ASCII, is never sent: the client is answered `502` | `http.rs:58`, `http.rs:73` |
+| the upstream | TCP and TLS within 10 s, verified against the system's roots and the secret's `ca`; HTTP/1.1, one connection per client connection, dialled at its first request and again when the upstream closes it, a request it never wrote sent once more | `http.rs:360`, `http.rs:331` |
+| the response | streamed back; a `Location` on the upstream's own origin pointed back at the endpoint; `Alt-Svc`, `Strict-Transport-Security` and the hop-by-hop headers dropped | `http.rs:229`, `http.rs:277` |
+| a refusal | the client's request answered `503` with the reason, and the connection closed | `http.rs:152` |
+
+> [!WARNING]
+> - **`Authorization` shows the upstream the value.** SCRAM never shows a
+>   database the password; an HTTP credential is presented whole, inside
+>   TLS the proxy verified. An upstream that echoes the header back hands
+>   the value to the session, so the secret's `audiences` are the trust.
+> - **The session never names a header.** The form (`Basic` or `Bearer`) is
+>   the call's; the header is always `Authorization`. A header the session
+>   could name is one an upstream might reflect.
+> - **The proxy never follows a redirect.** The client does. A redirect to
+>   the upstream's own origin comes back through the endpoint, the origin
+>   matched whole, never as a prefix; one anywhere else reaches the client
+>   unchanged and is followed with no value.
+> - **Only `Location` is rewritten.** URLs in a body, or in a `Link`
+>   header, still name the upstream: a client follows them through the
+>   endpoint by their path.
+
+**Tested** against a fake HTTPS upstream over real TLS:
+- the secret's token in the one `Authorization` the upstream sees, `Host` its own, and none of the
+  client's credentials or hop-by-hop headers; `Basic` from the user and password;
+- a value no header can carry, never sent;
+- `CONNECT`, an absolute form (even one naming the upstream) and `*`, refused with nothing sent;
+- redirects pointed back only to the whole origin; the upstream's hop-by-hop and origin headers
+  dropped;
+- a chunked body streamed both ways, with no length added;
+- an upstream no root vouches for, and one that answers in the clear, sent nothing;
+- one upstream connection for a client connection's requests, until the upstream closes it;
+- a refused client told why.
+
 ### The endpoint and `vault_connect` (P3-5b-2, P3-5b-4, P3-5c-2)
 
 `vault_connect` is the toolbelt's tool for `proxy` mode. The daemon leases the
@@ -1370,6 +1431,7 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-5d to P3-5f | `proxy` mode's other engines, as designed in the spec (§3e): HTTP named upstreams, the Kubernetes API and the SSH agent |
+| P3-5d-2, P3-5d-3 | `vault_connect` serving the HTTP engine, as designed in the spec (§3e, "P3-5d, HTTP named upstreams, as designed"): an origin as the upstream, `Basic` or `Bearer`, git through `insteadOf`, and the loopback endpoint with each connection's account read on Linux, then on macOS |
+| P3-5e, P3-5f | `proxy` mode's last engines: the Kubernetes API and the SSH agent |
 | P3-6 to P3-9 | `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |
