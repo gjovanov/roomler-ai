@@ -69,6 +69,7 @@ fn a_call_names_a_secret_an_engine_and_an_upstream() {
             port: 5432,
             database: None,
             ca: None,
+            auth_source: None,
             ttl: DEFAULT_TTL,
         }
     );
@@ -101,6 +102,25 @@ fn a_call_names_a_secret_an_engine_and_an_upstream() {
         ],
         "and the CA's value, where the call names one"
     );
+    // P3-5c-2 — MongoDB, its auth database `admin` unless the call names one.
+    let mongo = parse(&json!({
+        "handle": "db/docs",
+        "engine": "mongodb",
+        "upstream": "mongo.internal:27017",
+    }))
+    .unwrap();
+    assert_eq!(
+        (mongo.engine, mongo.auth_source.as_deref()),
+        (Engine::Mongodb, Some("admin"))
+    );
+    let named = parse(&json!({
+        "handle": "db/docs",
+        "engine": "mongodb",
+        "upstream": "mongo.internal:27017",
+        "auth_source": "users",
+    }))
+    .unwrap();
+    assert_eq!(named.auth_source.as_deref(), Some("users"));
 }
 
 #[test]
@@ -128,6 +148,12 @@ fn a_call_no_endpoint_could_serve_is_refused() {
         with("ca", json!("")),
         with("ttl_s", json!(29)),
         with("ttl_s", json!(901)),
+        // P3-5c-2 — an auth database is MongoDB's, and a database's name.
+        with("auth_source", json!("admin")),
+        json!({"handle": "db/main", "engine": "mongodb", "upstream": "m:27017", "auth_source": "a/b"}),
+        json!({"handle": "db/main", "engine": "mongodb", "upstream": "m:27017", "auth_source": ""}),
+        json!({"handle": "db/main", "engine": "mongodb", "upstream": "m:27017", "auth_source": "x".repeat(64)}),
+        json!({"handle": "db/main", "engine": "mongodb", "upstream": "m:27017", "auth_source": 7}),
     ] {
         assert!(parse(&bad).is_err(), "{bad}");
     }

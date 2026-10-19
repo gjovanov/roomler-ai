@@ -26,7 +26,8 @@ People use it too.
 > answers, a session's tools that wait for the answer, and the card's
 > buttons in the web app (§18); P3-5a, a secret's `audiences` held to for
 > `proxy` mode, the first step of the proxies (§7); P3-5b-1, the Postgres
-> engine a proxy endpoint serves, and P3-5c-1 the MongoDB one; P3-5b-2, `vault_connect` and its
+> engine a proxy endpoint serves, and P3-5c-1 the MongoDB one, which
+> P3-5c-2 serves; P3-5b-2, `vault_connect` and its
 > endpoint, which signs in to a database as a secret's user for the
 > session's account; P3-5b-3, the exchange bound to the certificate the
 > proxy verified; and P3-5b-4, the endpoint on Windows, a loopback port
@@ -727,7 +728,7 @@ no answer, and the daemon stops waiting for it.
 | the frames | `rc:vault.list` · `rc:vault.describe` ([`signaling.rs:1262`](../crates/remote_control/src/signaling.rs#L1262)) and `rc:vault.listed` · `rc:vault.described` ([`:4308`](../crates/remote_control/src/signaling.rs#L4308)); refusals reuse `rc:vault.refused` |
 | the decisions | `list` and `describe` ([`meta.rs:107`](../crates/modules/vault/src/meta.rs#L107)); `secret:list` in [`policy.cedarschema`](../crates/modules/vault/src/policy.cedarschema) and `Ask::ListSecret` ([`policy.rs:380`](../crates/modules/vault/src/policy.rs#L380)) |
 | the daemon's asks | `Client::list` and `Client::describe` ([`vault.rs:465`](../agents/roomlerd/src/vault.rs#L465)) |
-| the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:834`](../agents/roomlerd/src/hive/toolbelt.rs#L834)), answered by `vault_tool` ([`toolbelt.rs:971`](../agents/roomlerd/src/hive/toolbelt.rs#L971)) |
+| the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:834`](../agents/roomlerd/src/hive/toolbelt.rs#L834)), answered by `vault_tool` ([`toolbelt.rs:972`](../agents/roomlerd/src/hive/toolbelt.rs#L972)) |
 
 ## 14. A command with values: `vault_exec` (P3-4c-1)
 
@@ -908,7 +909,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the tool | `vault_request` in [`toolbelt.rs:945`](../agents/roomlerd/src/hive/toolbelt.rs#L945), offered with the reads, allowed in the settings with them ([`VAULT_AHEAD_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L398)) |
+| the tool | `vault_request` in [`toolbelt.rs:946`](../agents/roomlerd/src/hive/toolbelt.rs#L946), offered with the reads, allowed in the settings with them ([`VAULT_AHEAD_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L398)) |
 | finding the lease | `Client::find_ahead` ([`vault.rs:657`](../agents/roomlerd/src/vault.rs#L657)); how long one has left, `Client::left` ([`vault.rs:678`](../agents/roomlerd/src/vault.rs#L678)) |
 
 ## 17. What a device reports doing: `vault_activity` (P3-4d)
@@ -1185,7 +1186,7 @@ for each test:
 
 The second engine, in `agents/roomlerd/src/vault_proxy/mongo.rs`: one
 client connection on the endpoint, one upstream connection the proxy signs
-in itself. Nothing calls it yet; P3-5c-2 serves it from `vault_connect`.
+in itself. P3-5c-2 serves it from `vault_connect`, below.
 
 ```mermaid
 sequenceDiagram
@@ -1211,7 +1212,7 @@ sequenceDiagram
 | its authentication | SCRAM-SHA-256 by `saslStart` and `saslContinue` in the auth database, the user named in the exchange (MongoDB takes it from there, not from a startup), `skipEmptyExchange` asked for, and the empty exchange given to a server before 4.4 that still asks for it | `mongo.rs:145`, `mongo.rs:186` |
 | the server's signature | checked before a byte of the client's is sent: a server that cannot sign is refused | `mongo.rs:183` |
 | then | the client's first message, then every byte both ways | `mongo.rs:106` |
-| a refusal | answers the client's first message as a server would: an `OP_REPLY` to an `OP_QUERY`, an `OP_MSG` to an `OP_MSG`, `ok: 0` with the reason and the code of a failed sign-in (18) | `mongo.rs:357` |
+| a refusal | answers the client's first message as a server would: an `OP_REPLY` to an `OP_QUERY`, an `OP_MSG` to an `OP_MSG`, `ok: 0` with the reason and the code of a failed sign-in (18) | `mongo.rs:373` |
 
 > [!WARNING]
 > - **The proxy sends no `hello` of its own.** A server takes client
@@ -1233,7 +1234,7 @@ reaches the upstream; a server that cannot sign; a server before 4.4 given
 its empty exchange; and a first message past its bound, and an upstream no
 root vouches for.
 
-### The endpoint and `vault_connect` (P3-5b-2, P3-5b-4)
+### The endpoint and `vault_connect` (P3-5b-2, P3-5b-4, P3-5c-2)
 
 `vault_connect` is the toolbelt's tool for `proxy` mode. The daemon leases the
 secret's `user` and `password` toward the upstream, serves the engine above on
@@ -1264,14 +1265,14 @@ sequenceDiagram
 
 | Step | What holds | Where |
 |---|---|---|
-| the call | `handle`: a structured secret, by its path or this org's RRN, with no `#field`. `engine`: `postgres`. `upstream`: `host:port`, exactly as the secret's `audiences` names it (a host name, an IPv4 address or a bracketed IPv6 one; one spelling per port). `database`: optional, named in the connection string. `ca`: optional, a secret whose value is the upstream's CA (PEM). `ttl_s`: 30 to 900, default 300 | `vault_connect.rs:139`, `vault_connect.rs:97` |
-| its place | at most 8 endpoints per run, taken before the vault is asked, so a call past it asks the vault nothing | `vault_connect.rs:290` |
-| the leases | the secret's `user` and `password`, and the CA's, each in `proxy` mode toward the upstream: `proxy-only-named-audiences` refuses an upstream the secret does not name (§7), recorded. A lease `vault_request` asked for ahead toward the same upstream (§16) is taken as it is | `vault_connect.rs:370` |
-| the values | read once to check them (a user Postgres takes; a CA that parses), then again from the leases as each connection starts, never kept by the endpoint | `vault_connect.rs:330` |
-| the endpoint | Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, both directories the daemon's (`0711`), the socket handed to the session's account (`0600`); a Postgres client dials it as `host=<that directory>`, port 5432. Windows (P3-5b-4): `127.0.0.1`, on a port the system picks | `vault_connect.rs:624`, `vault_connect.rs:756` |
-| a connection | from the session's account only, root's refused too: on Unix its peer uid is checked again; on Windows its process is found in the connection table (`GetExtendedTcpTable`), and its token's SID compared with the session's. At most 16 at once, one engine session each | `vault_connect.rs:570`, `vault_connect.rs:715`, `agents/roomlerd/src/hive_win.rs:348`, `hive_win.rs:318` |
-| its life | the first of its leases to be let go (its expiry, `rc:vault.revoke`, the run's end) cancels the endpoint's stop, which closes its socket and every connection it holds. The leases the call asked for itself are then let go too, rather than held to their expiry. An earlier process's endpoints go at the daemon's start | `vault_connect.rs:427`, `vault_connect.rs:523`, `vault_connect.rs:233` |
-| the answer | `host`, `port`, `database`, a `uri` and `env` (`PGHOST`, `PGPORT`, `PGDATABASE`), `ttl_s`: no `PGPASSWORD`, no value. On Unix the `uri` is `postgresql:///<db>?host=<dir>&port=5432`; on Windows `postgresql://127.0.0.1:<port>/<db>?sslmode=disable`, with `PGSSLMODE=disable` (the loopback leg is plain; the upstream's is TLS) | `vault_connect.rs:453` |
+| the call | `handle`: a structured secret, by its path or this org's RRN, with no `#field`. `engine`: `postgres`, or (P3-5c-2) `mongodb`. `upstream`: `host:port`, exactly as the secret's `audiences` names it (a host name, an IPv4 address or a bracketed IPv6 one; one spelling per port). `database`: optional, named in the connection string. `ca`: optional, a secret whose value is the upstream's CA (PEM). `auth_source`: MongoDB's, the database the secret's user is defined in, default `admin` (a Postgres call that names one is refused). `ttl_s`: 30 to 900, default 300 | `vault_connect.rs:156`, `vault_connect.rs:114` |
+| its place | at most 8 endpoints per run, taken before the vault is asked, so a call past it asks the vault nothing | `vault_connect.rs:324` |
+| the leases | the secret's `user` and `password`, and the CA's, each in `proxy` mode toward the upstream: `proxy-only-named-audiences` refuses an upstream the secret does not name (§7), recorded. A lease `vault_request` asked for ahead toward the same upstream (§16) is taken as it is | `vault_connect.rs:427` |
+| the values | read once to check them (a user Postgres takes; a CA that parses), then again from the leases as each connection starts, never kept by the endpoint | `vault_connect.rs:373` |
+| the endpoint | Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, both directories the daemon's (`0711`), the socket handed to the session's account (`0600`); a Postgres client dials it as `host=<that directory>`, port 5432. For MongoDB the socket is `…/mongodb-27017.sock`, which a driver dials by its path (a host that ends in `.sock`). Windows (P3-5b-4): `127.0.0.1`, on a port the system picks | `vault_connect.rs:724`, `vault_connect.rs:874` |
+| a connection | from the session's account only, root's refused too: on Unix its peer uid is checked again; on Windows its process is found in the connection table (`GetExtendedTcpTable`), and its token's SID compared with the session's. At most 16 at once, one engine session each | `vault_connect.rs:654`, `vault_connect.rs:819`, `agents/roomlerd/src/hive_win.rs:348`, `hive_win.rs:318` |
+| its life | the first of its leases to be let go (its expiry, `rc:vault.revoke`, the run's end) cancels the endpoint's stop, which closes its socket and every connection it holds. The leases the call asked for itself are then let go too, rather than held to their expiry. An earlier process's endpoints go at the daemon's start | `vault_connect.rs:486`, `vault_connect.rs:596`, `vault_connect.rs:267` |
+| the answer | `host`, `port`, `database`, a `uri` and `env` (`PGHOST`, `PGPORT`, `PGDATABASE`), `ttl_s`: no `PGPASSWORD`, no value. On Unix the `uri` is `postgresql:///<db>?host=<dir>&port=5432`; on Windows `postgresql://127.0.0.1:<port>/<db>?sslmode=disable`, with `PGSSLMODE=disable` (the loopback leg is plain; the upstream's is TLS). For MongoDB it is `mongodb://<the socket's path, %-encoded>/<db>?directConnection=true` on Unix, with no `port`, and `mongodb://127.0.0.1:<port>/<db>?directConnection=true` on Windows, in `MONGODB_URI` too; `directConnection` keeps a driver on the one host, never discovering a member to dial around the proxy | `vault_connect.rs:514` |
 
 > [!WARNING]
 > - **The settings ASK for every call.** `vault_connect` hands the session no
@@ -1290,6 +1291,9 @@ sequenceDiagram
 >   shares a bound port only where its first socket asked for that
 >   (`SO_REUSEADDR`), which this one does not, and the daemon's own account
 >   (SYSTEM) is the only exception.
+> - **A refusal speaks the engine's wire** (P3-5c-2). A Postgres client is
+>   sent a fatal error; a MongoDB client, which speaks first, has its first
+>   message answered with the reason, as a server answers it.
 > - **A use is not reported yet.** `vault_activity` (§17) takes `exec` and
 >   `render`; a `proxy` endpoint's opening is a later step's report.
 
@@ -1366,7 +1370,6 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-5c-2 | `vault_connect` serving the MongoDB engine: `engine: "mongodb"`, its socket and its connection string |
 | P3-5d to P3-5f | `proxy` mode's other engines, as designed in the spec (§3e): HTTP named upstreams, the Kubernetes API and the SSH agent |
 | P3-6 to P3-9 | `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |
