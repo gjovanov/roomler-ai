@@ -181,6 +181,28 @@ impl LiveSession {
     pub fn is_terminal(&self) -> bool {
         self.phase == SessionPhase::Closed
     }
+
+    /// Admit the controller's SDP offer: only in `Negotiating`, and only once.
+    ///
+    /// An offer is the controller's reply to `rc:ready`, which goes out when
+    /// consent is GRANTED (`AwaitingConsent → Negotiating`), and the agent
+    /// builds a peer from whatever offer reaches it. So this is where consent
+    /// is enforced for the media path: an offer admitted in `AwaitingConsent`
+    /// streamed the screen while the host's prompt was still up, and a second
+    /// offer rebuilt the agent's peer after its per-session grant had been
+    /// consumed by the first — under the DEFAULT grant, so a view-only session
+    /// came back with input and clipboard. Every controller the server ships
+    /// sends exactly one offer, on `rc:ready`.
+    pub fn admit_offer(&mut self) -> Result<()> {
+        if self.phase != SessionPhase::Negotiating {
+            return Err(Error::BadPhase(self.id.to_hex(), phase_name(self.phase)));
+        }
+        if self.offer_seen {
+            return Err(Error::BadPhase(self.id.to_hex(), "offer_already_forwarded"));
+        }
+        self.offer_seen = true;
+        Ok(())
+    }
 }
 
 fn phase_name(p: SessionPhase) -> &'static str {
@@ -242,5 +264,21 @@ mod tests {
         let mut s = fixture();
         s.transition(SessionPhase::Closed).unwrap();
         assert!(s.transition(SessionPhase::Active).is_err());
+    }
+
+    #[test]
+    fn an_offer_is_admitted_only_after_consent_and_only_once() {
+        let mut s = fixture();
+        s.transition(SessionPhase::AwaitingConsent).unwrap();
+        assert!(s.admit_offer().is_err(), "before consent");
+        assert!(
+            !s.offer_seen,
+            "a refused offer does not stand the reaper down"
+        );
+        s.transition(SessionPhase::Negotiating).unwrap();
+        s.admit_offer().unwrap();
+        assert!(s.admit_offer().is_err(), "a second offer");
+        s.transition(SessionPhase::Active).unwrap();
+        assert!(s.admit_offer().is_err(), "a re-offer on a live session");
     }
 }
