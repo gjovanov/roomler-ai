@@ -43,14 +43,18 @@
 - P6d, `install.sh --uninstall`, merged (#2485), field-verified on the branch (§8): six containers, a vmtest Ubuntu
   guest per install type and a tart Mac with both halves, against the served script's red.
 - P6c, `service install --as-service` (alias `--system`) on Linux and macOS, merged (#2488): field-verified on a
-  vmtest Ubuntu guest against 0.4.143's refusal, and the macOS stop's mechanism measured on a tart Mac (§8).
+  vmtest Ubuntu guest against 0.4.143's refusal and again on the 0.4.144 candidate, and the macOS stop's mechanism
+  measured on a tart Mac (§8).
 - P8-1, every §2.8 doc correction but two, each re-checked against master first, merged (#2489). P8-2 follows
   0.4.144.
 - P1d, a Mac's per-org utun, merged (#2492). Run once on the released 0.4.143 (§8): one root daemon in two orgs,
   each on its own utun, and the secondary's mesh through its own. The stale warning is gone, and the port holder
-  names a Mac's listener.
-- P3d, a received file on a Linux system install written as the person at seat0, is in review: red on 0.4.143
-  (`/tmp`, `root:root`), green on a candidate (§8).
+  names a Mac's listener. Its netstack run found #2493 (a second org in netstack mode joined no mesh), fixed on its
+  own.
+- P3d, a received file on a Linux system install written as the person at seat0, merged (#2496): red on 0.4.143
+  (`/tmp`, `root:root`), green on its branch and again on the 0.4.144 candidate (§8).
+- P3h's evidence is in (§8): no fleet host lacks systemd-resolved, and a WSL instance bypasses it, so P3h opens
+  with reporting that.
 - P6f needs no build: Windows got its private staging directory with GHSA-r3xj-4wh9-xh2v (0.4.142), and on macOS
   the root update helper's temp directory was measured to be root's own (§3.11, §8).
 - The rest of P2–P7 is open.
@@ -652,6 +656,16 @@ test of the SIGKILL property itself.
   `install.sh` already has the hook (`scripts/install.sh:777-785`).
 - **P3h, DNS without systemd-resolved.** NetworkManager when it owns `resolv.conf`, else a managed `resolv.conf` with a
   restore. Evidence first: which fleet distros lack resolved.
+  - *The census (2026-10-19, read-only, §8):* none does. The fleet lists 8 Linux rows; the 3 offline are stale rows of
+    old releases. Of the 5 online, 3 answered `roomler exec`: Ubuntu 24.04 servers, resolved active, `resolv.conf`
+    on its stub, no NetworkManager. The other 2 have exec off, a device setting the census respects. One of them, a
+    WSL instance, was read on its own host; the other, an Asahi (Fedora) laptop, stays unread.
+  - What the census found instead is a resolved that is **bypassed**. WSL writes its own `resolv.conf`
+    (`/mnt/wsl/resolv.conf`, the Windows host's DNS proxy). The steer sits on `roomler0`, where `resolvectl` answers
+    with it, but `getent` never asks resolved. Names resolve there only because the Windows host steers the same
+    domains through its own NRPT rules; without that host's daemon they would not.
+  - So P3h starts with an honest report, not the NetworkManager path: `roomler status` says when `resolv.conf` does
+    not lead to resolved, and names the file it leads to. NetworkManager waits for a host that needs it.
 - **P3i, host firewall.** The evidence (§8, 2026-10-17) answered the question this phase opened on:
   - Punched and LAN-direct carriers do not fall to relay behind firewalld. Both ends probe, so conntrack lets each
     side's reply in (`tier=Lan`, 497 ms). The UDP allow first specced here is unnecessary.
@@ -907,11 +921,11 @@ model on Windows, so the three agree on what the mode means.
 | **P3a** | Linux cursor shape (X11, then PipeWire) | `ROOMLERD_CURSOR_CHANNEL=0` | the FR-93 lab, Xorg + Wayland | S → M |
 | **P3b** | Linux lock hint (advisory, `input: "passes"`) + a logind block inhibitor (FR-55 P3) (built) | `ROOMLERD_LOCK_HINT=0`; `power_policy` | a vmtest Ubuntu guest, red on 0.4.142 | S |
 | **P3c** | Linux audio. *P3c-1*: never a microphone; no `opus` without a named device; `rc:audio-unavailable` says why (built). *P3c-2*: the session's monitor through Pulse's client library, per-user and root (D14, built) | P3c-1: — (a privacy fix; an owner names a device to opt back in); P3c-2: `ROOMLERD_AUDIO_SESSION=0` | a Linux host with a microphone and a sound server, red on 0.4.141 | M |
-| **P3d** | Linux system-install files land as the seat user (built). *In review:* red on 0.4.143 (`/tmp`, `root:root`), green on a candidate (§8); the root-only tests run under `sudo` in CI | `ROOMLERD_FILES_AS_SEAT_USER=0` | a vmtest Ubuntu system guest, the deployed viewer | M |
+| **P3d** | Linux system-install files land as the seat user (merged, #2496). Red on 0.4.143 (`/tmp`, `root:root`), green on its branch and on the 0.4.144 candidate (§8); the root-only tests run under `sudo` in CI | `ROOMLERD_FILES_AS_SEAT_USER=0` | a vmtest Ubuntu system guest, the deployed viewer | M |
 | **P3e** | Linux X11 layout, display-match, clipboard images + RTF | per-verb | the lab | M |
 | **P3f** | uinput text on any layout | `ROOMLERD_UINPUT_XKB=0` | the lab, German and French layouts | M |
 | **P3g** | Linux companion for arm64 + tarball | — (a package) | the FR-93 lab, an arm64 vmtest guest | M |
-| **P3h** | Linux DNS without systemd-resolved | `ROOMLERD_DNS_NM=0` | evidence first | M |
+| **P3h** | Linux DNS without systemd-resolved. *The evidence (§8, 2026-10-19):* no fleet host lacks resolved, and a WSL instance bypasses it, so P3h opens with reporting that | `ROOMLERD_DNS_NM=0` | the fleet census; a WSL instance for the report | M |
 | **P3i** | Linux host firewall: what governs the overlay adapter, reported in `roomler status`, never changed (D13) | `ROOMLERD_HOST_FW_PROBE=0` | a firewalld node (zone `public`) and a ufw node, red then green | S |
 | **P4a** | Windows `SendSAS` from the SCM host, which the SystemContext worker asks through a SYSTEM-only relay, where the policy lets services (built) | its cap word: no `sas` in the hello, no frame | Win11 SystemContext, red on 0.4.142; the corporate laptops' policy measured | S–M |
 | **P4b** | Windows SFTP as `console_user`: `sftp-server` through `exec`'s console-user spawn, raw, in the person's profile (built) | `ROOMLERD_SFTP_AS_USER=0` | Win11 SystemContext, red on 0.4.142 | S–M |
@@ -922,7 +936,7 @@ model on Windows, so the three agree on what the mode means.
 | **P5b** | A person's SSH session starts in their home: the shell, a command and `sftp` for `named` and `console_user` on Linux + macOS, and Windows `console_user`'s shell and commands in the profile (as `sftp` since P4b); the `chdir` after the drop, where sshd does it (built) | `ROOMLERD_SSH_START_IN_HOME=0` | the lab + a Win11 SystemContext guest | S |
 | **P6a** | Artifact version binding: `.deb`, `.pkg`, tarball (built) | `ROOMLERD_ARTIFACT_VERSION_CHECK=0` | the last three releases' real artifacts; a hostile feed, red on 0.4.143 | S–M |
 | **P6b** | `roomler self-update` on Unix + the pinned PGP check | — | Linux + Mac tunnel-only hosts | M |
-| **P6c** | `service install --as-service` (alias `--system`) on Linux + macOS (merged, #2488) | — (a new verb) | a vmtest Ubuntu guest, red on 0.4.143; the macOS stop's mechanism on a tart Mac | S |
+| **P6c** | `service install --as-service` (alias `--system`) on Linux + macOS (merged, #2488) | — (a new verb) | a vmtest Ubuntu guest, red on 0.4.143; the 0.4.144 candidate; the macOS stop's mechanism on a tart Mac | S |
 | **P6d** | `install.sh --uninstall [--keep-config]` (built) | — (a new flag; the install path is unchanged) | six throwaway containers on four distros, a vmtest Ubuntu guest per install type, a tart Mac with both halves; red on the served script | S |
 | **P6e** | macOS supervisor crash capture; #1538 (P6e-1, never die on a log sink: built) | — (a liveness fix) | a field Mac; a duplicate start with stderr on `/dev/full`, red on 0.4.143 | S |
 | **P6f** | Private staging dir on Windows + macOS (settled: Windows by GHSA-r3xj-4wh9-xh2v, macOS measured private) | — | Win10, Win11, a Mac | S |
@@ -991,6 +1005,8 @@ one depends on it.
 - [ ] **AC9 (P3a–P3f):** on the Linux lab, the cursor shape follows; the locked hint arrives; a session holds sleep
   off; session audio is never a microphone; received files land as the seat user; layout, display-match and image
   sync work on X11; uinput types a German and a French string.
+  *(The files clause is field-verified, §8: red on 0.4.143, where an upload landed in `/tmp` as `root:root`; green
+  on P3d's branch and again on the 0.4.144 candidate, in the seat user's `~/Downloads` and owned by them.)*
 - [ ] **AC10 (P3g):** a Fedora system install and an arm64 install show the "being viewed" banner and answer a
   consent prompt.
 - [x] **AC11 (P4a–P4d):** Ctrl+Alt+Del reaches a Windows lock screen that requires it; SFTP as `console_user` writes
@@ -1019,7 +1035,7 @@ one depends on it.
   the served script refused the flag, and the branch's removed a released install, both halves on a Mac and each
   install type on a vmtest Ubuntu guest, after a clean stop in which each ephemeral device removed itself. It is
   checked again on the served script once it ships. The `service install --system` round trip is field-verified on
-  Linux on P6c's branch, §8 (red on 0.4.143). On a Mac its stop's mechanism is measured on the released pkg, and
+  Linux on P6c's branch and again on the 0.4.144 candidate, §8 (red on 0.4.143). On a Mac its stop's mechanism is measured on the released pkg, and
   the verb itself runs on the release check. The rest is P6b and P6e-2.)*
 - [ ] **AC14 (P7):** an arm64 Linux host advertises a hardware cell and records AAC; the arm64 CLI and wizard
   install.
@@ -1189,3 +1205,5 @@ one depends on it.
 | 2026-10-18 | P1d's port-holder lookup by hand: `/usr/sbin/lsof -nP -b -w -t -sTCP:LISTEN -iTCP:<port>`, as the code runs it | a throwaway tart Mac (macOS 15.7.7), three runs | 🟢 **P1d's port holder, its source.** A root listener: its PID (32–51 ms warm; 1.7 s on one cold first call). A client's socket on the same port (CLOSE_WAIT) is not counted: the listener alone, while every TCP holder of the port read both. A parent and its child sharing one listener: both, the parent first. As the console user, a root listener reads empty, so `Unknown`; the user's own listener reads its PID as root and as the user. Nothing on the port: empty, exit 1. ❌ The first two runs' "connection open" case tested nothing: an `nc` client hung up at once (EOF on stdin), and a perl client that holds its connection replaced it. The image comes from `proc_pidpath`; the whole path runs on 0.4.144's candidate |
 | 2026-10-18 | released 0.4.143 (`vmtest` lane `ubuntu/script/system`, kept), the deployed viewer (Playwright on mars) | a throwaway Ubuntu 24.04 GNOME guest: `roomlerd.service` as root, the vmtest user at seat0 (session 2, Wayland, active) | 🔴 **P3d red.** One probe uploaded through the viewer's own file input ("Uploaded p3d-probe-red1.txt") landed at **`/tmp/p3d-probe-red1.txt`, `root:root` 644**: root has no XDG Downloads, so the ladder ends in the temp folder. The daemon's own startup line said the drop folder was "the active user's Downloads". The guest was destroyed |
 | 2026-10-19 | the P3d candidate (`8420fb51`, a default-feature release build of the branch) swapped into the same lane's kept guest under a fresh ephemeral enrollment, after the released daemon's clean stop; the deployed viewer | a throwaway Ubuntu 24.04 GNOME guest as in the red: `roomlerd.service` as root, the vmtest user at seat0 (session 2) | 🟢 **P3d green.** The same upload landed at **`/home/vmtest/Downloads/p3d-probe-green1.txt`, `vmtest:vmtest` 644**. It was the only copy, and nothing of the staging was left in the folder. The daemon logged `files: complete … path=/home/vmtest/Downloads/p3d-probe-green1.txt`. The guest was destroyed |
+| 2026-10-19 | the 0.4.144 candidate (release run 39211926782 on `9d86e5b7b`, publishing off, signing on): its x86_64 `.deb`, `dpkg -i` over the released 0.4.143 package, then a fresh ephemeral enrollment; the deployed viewer | two throwaway Ubuntu 24.04 GNOME guests on zeus, `vmtest` lanes `ubuntu/script/system` and `ubuntu/script/user`, kept until the run and then destroyed by name | 🟢 **P3d and P6c on the release candidate.** *P3d* (the system guest, the vmtest user at seat0): the viewer read agent `0.4.144`, and its upload landed at `/home/vmtest/Downloads/`, `vmtest:vmtest` 644, the daemon logging `files: complete` with that path. *P6c* (the per-user guest, its uid-1000 daemon running): the released 0.4.143 refused `service install --as-service` as Windows-only. The candidate refused without root and, under root, without `/etc/roomler/config.toml`, naming the enroll to run. Once enrolled, it enabled and started `roomlerd.service` (root, that config) and warned that the uid-1000 daemon also runs. The root daemon's row appeared; `stop --as-service` stopped it cleanly ("ephemeral device unenrolled itself on shutdown") and the row was gone 15 s later; `uninstall --as-service` stopped and disabled it and kept the config |
+| 2026-10-19 | the releases each host runs (0.4.143) | the operator's fleet, read-only: the 5 Linux devices online of the 8 listed. A probe through `roomler exec`: `/etc/os-release`, whether systemd, systemd-resolved and NetworkManager are active, where `/etc/resolv.conf` leads, whether `resolvectl` and `nmcli` exist, and the daemon's MagicDNS line | **P3h census: no host lacks resolved.** 3 Ubuntu 24.04 servers: resolved active, `resolv.conf` → `/run/systemd/resolve/stub-resolv.conf`, NetworkManager inactive, MagicDNS active. 2 have exec off (respected). One of those, a WSL instance, was read on its own host: resolved is active and holds the steer on `roomler0` (`resolvectl query` answers from that link), but `/etc/resolv.conf` → `/mnt/wsl/resolv.conf`, `nameserver 10.255.255.254`, so `getent` asks the Windows host, which answers through its own NRPT rules for the same domains. Resolved there is bypassed, not missing. The 3 offline rows are stale ones of older releases |
