@@ -108,7 +108,7 @@ survives a compromised server. Someone with local access sets it.
 secondary org's admin must not be able to mint sessions onto the device owner's
 listener. The server refuses (`SecondaryOrg`), and the device independently drops all
 three relay frames when they arrive on a secondary org's socket
-([`agents/roomlerd/src/overlay.rs:980`](../agents/roomlerd/src/overlay.rs#L980)).
+([`agents/roomlerd/src/overlay.rs:985`](../agents/roomlerd/src/overlay.rs#L985)).
 
 ## The mint — what the server decides
 

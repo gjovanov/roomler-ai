@@ -299,16 +299,20 @@ pub async fn maybe_start(
     // Either surface can be absent at build time; the helper warns + `None`s,
     // and `?` aborts the (mis)configured start.
     //
-    // Multi-org P2c: with `overlay_multi_org` on, EVERY org (primary
+    // Multi-org P2c: with `overlay_multi_org` on, every `tun` org (primary
     // included) gets its OWN OS TUN adapter, keyed by its tenant id (below;
-    // it replaced the shared-TUN mux W7c deleted) — and netstack mode is
-    // overridden (its SOCKS front and handle channel are process-global
-    // singletons; N netstack orgs would fight over them).
-    let tun_factory: TunFactory = if cfg.overlay_multi_org {
-        if netstack_socks_port(cfg).is_some() {
+    // it replaced the shared-TUN mux W7c deleted). A secondary in `netstack`
+    // mode (#2493, `derived_netstack`) takes its own stack and SOCKS front on
+    // the port its `[[orgs]]` entry names instead: the flag is device-wide,
+    // and it used to send such an org down the TUN path, where `for_org` had
+    // already switched it off. The PRIMARY's env-key netstack still yields to
+    // the flag, as before. The warning is about that env key, so a `tun`
+    // secondary keeping the port it had in netstack mode stays quiet.
+    let tun_factory: TunFactory = if cfg.overlay_multi_org && !cfg.derived_netstack {
+        if !cfg.derived_org && netstack_socks_port(cfg).is_some() {
             warn!(
                 "overlay: OVERLAY_NETSTACK_SOCKS is set but overlay_multi_org is on — \
-                 netstack mode is single-org; using this org's own OS TUN instead"
+                 the primary's netstack yields to that flag; using its own OS TUN instead"
             );
         }
         // Multi-org v2 — per-org adapters: each org gets its OWN device
@@ -403,10 +407,11 @@ pub async fn maybe_start(
         // carrier-endpoint exemptions), when `overlay_exit_node` is set.
         .with_exit_node(cfg.overlay_exit_node.clone(), exit_server_ips)
         // FR-97 P0c-3 — the netstack front, when that is the device chosen
-        // above (never under multi-org, which overrides netstack): an exit then
-        // carries only what the front dials, and the host's DNS is left alone.
+        // above (under multi-org, only for a netstack secondary, #2493): an
+        // exit then carries only what the front dials, and the host's DNS is
+        // left alone.
         .with_netstack_socks(
-            (!cfg.overlay_multi_org)
+            (!cfg.overlay_multi_org || cfg.derived_netstack)
                 .then(|| netstack_socks_port(cfg))
                 .flatten(),
         )

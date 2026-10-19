@@ -3434,6 +3434,16 @@ async fn run_cmd(
         }
     }
 
+    // #2493 — a secondary in `netstack` mode joins only with a loopback port
+    // of its own. One enrolled before the fix has none and joined nothing, so
+    // it gets the first free port now, persisted like the key above.
+    #[cfg(feature = "overlay-netstack")]
+    if roomlerd::org_join::heal_netstack_ports(&mut cfg)
+        && let Err(e) = config::save(config_path, &cfg)
+    {
+        tracing::warn!(error = %e, "overlay: failed to persist the netstack orgs' SOCKS ports");
+    }
+
     // Roomler SSH (P2) — mint this node's SSH host identity on the first
     // SSH-enabled start, same shape as the WG key above: generated locally,
     // persisted through `config::save` (atomic + fsync + `.prev` + 0600 / ACL),

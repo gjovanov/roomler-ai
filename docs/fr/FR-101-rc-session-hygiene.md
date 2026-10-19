@@ -235,8 +235,8 @@ limit and ends the session itself. The hub's part is to tell it the limit and to
 
   | Entry point | Where | Before P1b |
   |---|---|---|
-  | The agent's enrollment: `roomlerd enroll` / `re-enroll`, the wizard's agent role, the desktop companion | [`enrollment.rs:556`](../../crates/agent-core/src/enrollment.rs#L556) | promoted, but only a lower-case `http://` |
-  | Every load of the agent config: `server_url`, `ws_url`, each `[[orgs]]` entry's | [`config.rs:3274`](../../crates/agent-core/src/config.rs#L3274) → [`secure_server_urls`, `:2369`](../../crates/agent-core/src/config.rs#L2369) | dialled as written |
+  | The agent's enrollment: `roomlerd enroll` / `re-enroll`, the wizard's agent role, the desktop companion | [`enrollment.rs:557`](../../crates/agent-core/src/enrollment.rs#L557) | promoted, but only a lower-case `http://` |
+  | Every load of the agent config: `server_url`, `ws_url`, each `[[orgs]]` entry's | [`config.rs:3294`](../../crates/agent-core/src/config.rs#L3294) → [`secure_server_urls`, `:2388`](../../crates/agent-core/src/config.rs#L2388) | dialled as written |
   | `roomler enroll` and the wizard's tunnel role | [`roomler-cli/src/config.rs:67`](../../agents/roomler-cli/src/config.rs#L67), called at [`cli.rs:1183`](../../agents/roomler-cli/src/cli.rs#L1183) and [`orchestrator_tunnel.rs:236`](../../agents/roomler-setup/src/orchestrator_tunnel.rs#L236) | the tunnel token was posted as written |
   | The tunnel CLI's config, from the file or `ROOMLER_TUNNEL_SERVER` | [`roomler-cli/src/config.rs:46`](../../agents/roomler-cli/src/config.rs#L46) | dialled as written |
   | `roomlerd anchor create` (FR-104) | `exec_service::origin_ok` | refuses plaintext already; unchanged |
