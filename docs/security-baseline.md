@@ -460,6 +460,28 @@ honours an ask (`lock_enforced`). The ask can only make the owner's own `lock_on
 only an install that can lift the lock remotely takes one, so it can never cost an operator remote
 access to a per-user install.
 
+**A session's DTLS keys are bound to keys the two ends hold, not to the signalling path** (FR-100,
+[remote-control.md](remote-control.md) §11.4a). The SDP fingerprints are the only thing tying each side's DTLS
+certificate to an identity, and the hub rebuilds every offer and answer frame around them. So a hostile hub,
+its Redis, or a TLS-inspecting box on a signalling leg could otherwise stand in for either end.
+
+| Who signs | With what | Checked by | Shipped |
+|---|---|---|---|
+| The device, its answer | a P-256 key per enrollment, made on the device; the private half in `<config dir>/peer-auth/<tenant>.json` with the config's protection (0600 on Unix), never sent | the browser, **before** it applies the answer; the key is pinned per (user, device) on first use | key + signature 0.4.145 (P1a, P1b); the browser's check P2a |
+| The browser, its offer | a P-256 key per user, made in the browser, non-extractable, kept in IndexedDB | the device, which remembers each browser key per user in `<tenant>.controllers.json` | the signature P2b; the device's check 0.4.146 (P1c) |
+
+- **The browser fails closed.** A different key, or a signature that does not verify, ends the attempt
+  before any media or input flows, and only the person's click trusts a changed key.
+- **The device refuses nothing yet.** `peer_auth = audit` judges, remembers and records. `enforce` (P3) is
+  refused by name at `config set` until the controller prompts exist: before them it would refuse every
+  session to the device, which is a self-wedge. The policy is device-owned, console-only over the LocalAPI,
+  and never pushable (`no_peer_auth_key_is_server_pushable_via_desired_config`).
+- ⚠️ **Not stopped yet.** An attacker in the signalling path who strips the nonce or the signatures gets an
+  **Unverified** session, not a refusal, until P3. And whoever serves the viewer's JavaScript can make the
+  browser's key sign anything (FR-100 §1).
+- ⚠️ **The verdict on `session_started` is the device's word**, kept on the server's row on purpose (§11.4a):
+  the hub checks the word, never the judgement behind it.
+
 ---
 
 ## 5 · Network-facing surfaces
