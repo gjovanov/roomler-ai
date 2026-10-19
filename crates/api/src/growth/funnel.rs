@@ -529,7 +529,9 @@ pub struct FunnelQuery {
     /// before `until`.
     #[serde(default)]
     pub since: Option<String>,
-    /// Exclusive. Default: now.
+    /// An instant (RFC 3339 or unix seconds) is the exclusive end. A bare
+    /// `YYYY-MM-DD` is the WHOLE day, as on every other growth route
+    /// (`parse_until`). Default: now.
     #[serde(default)]
     pub until: Option<String>,
     #[serde(default)]
@@ -711,6 +713,30 @@ pub(crate) async fn read(
     })
 }
 
+/// The funnel's `until`, read the way every other growth route reads a day.
+/// A bare `YYYY-MM-DD` is the WHOLE day, so the window ends at the next
+/// midnight (exclusive); an instant (RFC 3339 or unix seconds) stays the
+/// exclusive end it names. Before this, `until=2026-10-18` meant "before the
+/// 18th" here and "through the 18th" on the Campaigns, Channels, Newsletter
+/// and Quality routes, so one range read two different sets of days (FR-102
+/// AC7's follow-up). `since` needs no such rule: a day's start is the day.
+fn parse_until(raw: &str) -> Result<DateTime, ApiError> {
+    let at = parse_instant(raw, "until")?;
+    if !is_bare_day(raw) {
+        return Ok(at);
+    }
+    at.timestamp_millis()
+        .checked_add(DAY_MS)
+        .map(DateTime::from_millis)
+        .ok_or_else(|| ApiError::BadRequest(format!("until is out of range, got {raw:?}")))
+}
+
+/// `YYYY-MM-DD` and nothing else: the shape `parse_instant` reads as a day.
+fn is_bare_day(raw: &str) -> bool {
+    let b = raw.trim().as_bytes();
+    b.len() == 10 && b[4] == b'-' && b[7] == b'-'
+}
+
 /// `GET /api/admin/growth/funnel?since&until&by&include_internal`
 pub async fn get_funnel(
     State(state): State<AppState>,
@@ -719,7 +745,7 @@ pub async fn get_funnel(
 ) -> Result<Json<FunnelReport>, ApiError> {
     let now = DateTime::now();
     let until = match q.until.as_deref() {
-        Some(s) => parse_instant(s, "until")?,
+        Some(s) => parse_until(s)?,
         None => now,
     };
     let since = match q.since.as_deref() {
@@ -1058,6 +1084,35 @@ mod tests {
                 .pending,
             0
         );
+    }
+
+    /// AC7's follow-up: a bare-day `until` is the whole day, as on every other
+    /// growth route; an instant keeps naming the exclusive end it says.
+    #[test]
+    fn a_bare_day_until_is_the_whole_day_and_an_instant_is_exact() {
+        let ms = |raw: &str| parse_until(raw).unwrap().timestamp_millis();
+        let day = parse_instant("2026-10-18", "until")
+            .unwrap()
+            .timestamp_millis();
+        // The whole of the 18th: the window ends at the 19th's midnight.
+        assert_eq!(ms("2026-10-18"), day + DAY_MS);
+        assert_eq!(
+            ms(" 2026-10-18 "),
+            day + DAY_MS,
+            "trimmed as parse_instant trims"
+        );
+        // Instants are exact, whichever spelling.
+        assert_eq!(ms("2026-10-18T00:00:00Z"), day);
+        assert_eq!(
+            ms("2026-10-18T13:30:00Z"),
+            day + 13 * 3_600_000 + 30 * 60_000
+        );
+        assert_eq!(ms(&(day / 1000).to_string()), day);
+        // A day is not a prefix match: anything else is still a 400.
+        assert!(parse_until("2026-10-18X").is_err());
+        assert!(parse_until("yesterday").is_err());
+        assert!(!is_bare_day("2026-10-18T00:00:00Z"));
+        assert!(!is_bare_day("1760745600"));
     }
 
     /// P6 — a grouping by any key counts exactly what the funnel's own

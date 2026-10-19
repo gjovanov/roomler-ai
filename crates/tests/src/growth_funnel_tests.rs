@@ -390,6 +390,68 @@ async fn unmounted_steps_are_null_with_the_module_named() {
     assert_eq!(j["value_basis"], json!(["conference"]));
 }
 
+/// AC7's follow-up — a bare-day `until` is the WHOLE day, as on every other
+/// growth route, so `since=D&until=D` counts a sign-up made at noon on D (it
+/// was a 400 "since must be before until"). An instant `until` keeps its
+/// exclusive meaning: the same day spelled as its midnight is an empty window.
+#[tokio::test]
+async fn a_bare_day_until_is_the_whole_day() {
+    let (app, _admin, token) = admin_app(true).await;
+    let a = ObjectId::new();
+    user(
+        &app,
+        a,
+        "a@test.io",
+        ago(3),
+        Some(doc! { "source": "youtube" }),
+    )
+    .await;
+    let day = |days_ago: i64| {
+        (org_daily::parse_day_of(DateTime::now()) - chrono::Duration::days(days_ago))
+            .format("%Y-%m-%d")
+            .to_string()
+    };
+    let (d, next) = (day(3), day(2));
+
+    let r = app
+        .auth_get(
+            &format!("/api/admin/growth/funnel?since={d}&until={d}"),
+            &token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let j: Value = r.json().await.unwrap();
+    assert_eq!(j["steps"]["signup"], 1, "{}", j["steps"]);
+
+    // The window is exactly that day: the next one holds no sign-up.
+    let j: Value = app
+        .auth_get(
+            &format!("/api/admin/growth/funnel?since={next}&until={next}"),
+            &token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(j["steps"]["signup"], 0, "{}", j["steps"]);
+
+    // An instant is exact: D's midnight as `until` ends the window where it
+    // starts.
+    let r = app
+        .auth_get(
+            &format!("/api/admin/growth/funnel?since={d}&until={d}T00:00:00Z"),
+            &token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 400);
+}
+
 /// AC8 — a day's tunnel and SSH use is folded into `growth_org_daily`, and
 /// the row still reports it after the audit rows are deleted (the 90-day
 /// TTL). Deleting the org removes its rows (and its frozen daily rows).
