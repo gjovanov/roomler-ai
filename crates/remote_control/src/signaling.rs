@@ -186,6 +186,152 @@ pub fn peer_auth_fingerprint(key: &str) -> Option<String> {
     )
 }
 
+/// FR-100 P1b — what a controller's offer carries for the device to sign
+/// against. In P1b that is only the nonce. The controller's own key and its
+/// signature over the offer arrive with P2, as fields an older reader skips.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PeerAuthOffer {
+    /// The browser's fresh nonce, base64url without padding, 16 to 32 bytes
+    /// ([`peer_auth_nonce_is_well_formed`]). It is what makes a signed answer
+    /// this offer's and no other's.
+    pub nonce: String,
+}
+
+/// FR-100 P1b — the device's signature over its answer: the transcript
+/// ([`peer_auth_transcript`], role `answer`) signed with the enrollment's
+/// device key. ECDSA P-256 over SHA-256, as the fixed-size `r ‖ s` that
+/// WebCrypto verifies, base64url without padding.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PeerAuthAnswer {
+    /// The key that signed, as the hello carries it
+    /// ([`peer_auth_key_is_well_formed`]). A browser pins THIS, on first use;
+    /// the server's copy is only ever a hint.
+    pub key: String,
+    pub sig: String,
+}
+
+/// FR-100 P1b — the label every peer-auth signature is scoped by. Part of the
+/// wire: changing it invalidates every signature in both directions.
+pub const PEER_AUTH_LABEL: &[u8] = b"roomler-peer-auth-v1";
+
+/// FR-100 P1b — the bytes a peer-auth signature covers: the label, then each
+/// field as `u16be(len) ‖ bytes` (FR-52's transport MAC frames its fields the
+/// same way), in this order:
+/// 1. the role, `offer` or `answer`, so one side's signature can never be
+///    replayed as the other's;
+/// 2. the session id, the agent id and the user id, 24 lowercase hex digits
+///    each, so it holds for one session between one user and one device;
+/// 3. the offer's DTLS fingerprint and the answer's, as
+///    [`sdp_dtls_fingerprint`] normalises them: what the handshake then holds
+///    each side to. For role `offer` (P2) the answer does not exist yet, and
+///    its fingerprint is the empty string;
+/// 4. the browser's nonce, which makes it fresh.
+///
+/// `None` when a field is too long to frame, which no well-formed input is:
+/// the caller then signs nothing. The viewer builds the same bytes, and both
+/// are held to one known answer.
+pub fn peer_auth_transcript(
+    role: &str,
+    session_id: &str,
+    agent_id: &str,
+    user_id: &str,
+    offer_fingerprint: &str,
+    answer_fingerprint: &str,
+    nonce: &str,
+) -> Option<Vec<u8>> {
+    let fields = [
+        role,
+        session_id,
+        agent_id,
+        user_id,
+        offer_fingerprint,
+        answer_fingerprint,
+        nonce,
+    ];
+    let mut out = Vec::with_capacity(
+        PEER_AUTH_LABEL.len() + fields.iter().map(|f| f.len() + 2).sum::<usize>(),
+    );
+    out.extend_from_slice(PEER_AUTH_LABEL);
+    for field in fields {
+        let len = u16::try_from(field.len()).ok()?;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(field.as_bytes());
+    }
+    Some(out)
+}
+
+/// FR-100 P1b — is `nonce` a browser's nonce as [`PeerAuthOffer`] carries one:
+/// base64url without padding of 16 to 32 bytes, spelled canonically. Anything
+/// else is not signed against.
+pub fn peer_auth_nonce_is_well_formed(nonce: &str) -> bool {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    if nonce.len() > 43 {
+        return false;
+    }
+    match URL_SAFE_NO_PAD.decode(nonce) {
+        Ok(bytes) => (16..=32).contains(&bytes.len()) && URL_SAFE_NO_PAD.encode(&bytes) == nonce,
+        Err(_) => false,
+    }
+}
+
+/// FR-100 P1b — does `sig` (base64url, the fixed 64-byte `r ‖ s`) verify over
+/// `transcript` under `key` (a device key as the hello carries it)? The
+/// browser's check, in Rust, so the tests here and the server's can prove
+/// what a device signed.
+pub fn peer_auth_verify(key: &str, transcript: &[u8], sig: &str) -> bool {
+    use base64::Engine;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    if !peer_auth_key_is_well_formed(key) {
+        return false;
+    }
+    let (Ok(point), Ok(sig)) = (STANDARD.decode(key), URL_SAFE_NO_PAD.decode(sig)) else {
+        return false;
+    };
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, point)
+        .verify(transcript, &sig)
+        .is_ok()
+}
+
+/// Why an SDP's DTLS fingerprint could not be read
+/// ([`sdp_dtls_fingerprint`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdpFingerprintError {
+    /// The SDP names no DTLS certificate.
+    Missing,
+    /// It names more than one, or a line is not exactly a hash name and one
+    /// value.
+    Ambiguous,
+}
+
+/// The one DTLS fingerprint an SDP names, as `"<hash> <HEX:PAIRS>"`, with the
+/// hash name lowercased and the hex uppercased. Repeated `a=fingerprint:`
+/// lines are fine when they agree (a bundle repeats it per media section);
+/// two different ones are ambiguous.
+///
+/// FR-52 P4 wrote it for the external binding's MAC; FR-100 P1b moved it here
+/// unchanged, because the device signs over the same fingerprints in every
+/// build, and two copies of a normalisation are two chances to disagree.
+pub fn sdp_dtls_fingerprint(sdp: &str) -> Result<String, SdpFingerprintError> {
+    let mut found: Option<String> = None;
+    for line in sdp.lines() {
+        let Some(value) = line.trim().strip_prefix("a=fingerprint:") else {
+            continue;
+        };
+        let mut parts = value.split_whitespace();
+        let (Some(hash), Some(hex), None) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(SdpFingerprintError::Ambiguous);
+        };
+        let normalised = format!("{} {}", hash.to_ascii_lowercase(), hex.to_ascii_uppercase());
+        match &found {
+            None => found = Some(normalised),
+            Some(seen) if *seen == normalised => {}
+            Some(_) => return Err(SdpFingerprintError::Ambiguous),
+        }
+    }
+    found.ok_or(SdpFingerprintError::Missing)
+}
+
 /// Half-close direction in `TcpHalfClose`. SMTP / HTTP-1.1-long-poll /
 /// some legacy protocols rely on this.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1402,6 +1548,13 @@ pub enum ClientMsg {
         /// read what the outsider types.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         extauth_mac: Option<String>,
+        /// FR-100 P1b — the device's signature over this answer, made with
+        /// its device key, when the offer asked for one (a nonce) on an
+        /// in-org session. A browser that pinned the key checks it before
+        /// trusting the transport. Absent from a build without it, and on
+        /// any session whose offer did not ask.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_auth: Option<PeerAuthAnswer>,
     },
 
     /// Agent decision on a control request.
@@ -1527,6 +1680,11 @@ pub enum ClientMsg {
         /// server could open the session with a peer of its own.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         extauth_mac: Option<String>,
+        /// FR-100 P1b — asks the device to sign its answer: the browser's
+        /// nonce (P2 adds the controller's own key and signature). Relayed to
+        /// the device verbatim.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_auth: Option<PeerAuthOffer>,
     },
 
     // ─── either side → server ────────────────────────────────────────
@@ -2866,6 +3024,10 @@ pub enum ServerMsg {
         /// cannot check it (it never holds the key) and must not drop it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         extauth_mac: Option<String>,
+        /// FR-100 P1b — relayed verbatim from the controller's offer, like
+        /// `extauth_mac`: the nonce the device signs its answer against.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_auth: Option<PeerAuthOffer>,
     },
 
     /// Server forwards SDP answer from agent → controller.
@@ -2878,6 +3040,11 @@ pub enum ServerMsg {
         /// FR-52 P4 — relayed verbatim from the device's answer.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         extauth_mac: Option<String>,
+        /// FR-100 P1b — relayed verbatim from the device's answer: its
+        /// signature, which the server neither checks nor may drop. The
+        /// browser is the party that verifies it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_auth: Option<PeerAuthAnswer>,
     },
 
     /// Forward ICE candidate to the peer.
@@ -7219,6 +7386,171 @@ mod tests {
         );
         assert_eq!(peer_auth_fingerprint(""), None);
         assert_eq!(peer_auth_fingerprint("not a key"), None);
+    }
+
+    /// FR-100 P1b — the framing, by hand: the label, then each field as a
+    /// big-endian u16 length and its bytes, in the documented order.
+    #[test]
+    fn a_peer_auth_transcript_frames_each_field_with_its_length() {
+        let t = peer_auth_transcript("offer", "a", "b", "c", "d", "e", "f").unwrap();
+        let mut want = b"roomler-peer-auth-v1".to_vec();
+        want.extend_from_slice(&[0, 5]);
+        want.extend_from_slice(b"offer");
+        for field in [b"a", b"b", b"c", b"d", b"e", b"f"] {
+            want.extend_from_slice(&[0, 1]);
+            want.extend_from_slice(field);
+        }
+        assert_eq!(t, want);
+        // The framing is what keeps two field splits apart.
+        assert_ne!(
+            peer_auth_transcript("answer", "ab", "c", "d", "e", "f", "g"),
+            peer_auth_transcript("answer", "a", "bc", "d", "e", "f", "g")
+        );
+        // Nothing well formed is too long to frame; a field that is gets no
+        // transcript, so nothing is signed.
+        assert_eq!(
+            peer_auth_transcript("answer", &"x".repeat(70_000), "b", "c", "d", "e", "f"),
+            None
+        );
+    }
+
+    /// FR-100 P1b — a realistic transcript against a digest computed outside
+    /// this code (bash `printf` for the bytes, coreutils `sha256sum`). The
+    /// viewer's implementation (P2a) is held to the same vector.
+    #[test]
+    fn a_peer_auth_transcript_matches_its_known_answer() {
+        let t = peer_auth_transcript(
+            "answer",
+            "66f0c0ffee0000000000000a",
+            "66f0c0ffee0000000000000b",
+            "66f0c0ffee0000000000000c",
+            "sha-256 AA:BB:CC",
+            "sha-256 DD:EE:FF",
+            &nonce_0_to_15(),
+        )
+        .unwrap();
+        assert_eq!(t.len(), 166);
+        let digest = ring::digest::digest(&ring::digest::SHA256, &t);
+        let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "9e9736b2e6a5db65f5c536bf0cba1042fdca9517c63fd18d6bb8454206e7ac94"
+        );
+    }
+
+    /// FR-100 P1b — the nonce the vectors use: bytes 0 to 15, base64url without
+    /// padding. Built here rather than written as a base64 literal: a secret
+    /// scanner cannot tell a counting sequence from a key.
+    fn nonce_0_to_15() -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode((0u8..16).collect::<Vec<u8>>())
+    }
+
+    /// FR-100 P1b — a nonce is 16 to 32 random bytes in canonical base64url.
+    #[test]
+    fn a_peer_auth_nonce_is_16_to_32_bytes_of_canonical_base64url() {
+        use base64::Engine;
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
+        assert!(peer_auth_nonce_is_well_formed(&nonce_0_to_15()));
+        assert!(peer_auth_nonce_is_well_formed(
+            &URL_SAFE_NO_PAD.encode([0xfbu8; 32])
+        ));
+        // Too short, too long, empty.
+        assert!(!peer_auth_nonce_is_well_formed(
+            &URL_SAFE_NO_PAD.encode([1u8; 15])
+        ));
+        assert!(!peer_auth_nonce_is_well_formed(
+            &URL_SAFE_NO_PAD.encode([1u8; 33])
+        ));
+        assert!(!peer_auth_nonce_is_well_formed(""));
+        // The same bytes in other spellings.
+        assert!(!peer_auth_nonce_is_well_formed(
+            &URL_SAFE.encode([0xfbu8; 16])
+        ));
+        assert!(!peer_auth_nonce_is_well_formed(
+            &STANDARD.encode([0xfbu8; 16])
+        ));
+    }
+
+    /// FR-100 P1b — a signature made with a P-256 key verifies over the
+    /// transcript it was made over, and over nothing else.
+    #[test]
+    fn a_peer_auth_signature_verifies_over_its_own_transcript_only() {
+        use base64::Engine;
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+        let rng = ring::rand::SystemRandom::new();
+        let pair = |rng: &ring::rand::SystemRandom| {
+            let pkcs8 =
+                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, rng).unwrap();
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), rng).unwrap()
+        };
+        let device = pair(&rng);
+        let key = STANDARD.encode(device.public_key().as_ref());
+        let t =
+            peer_auth_transcript("answer", "s", "a", "u", "sha-256 AA", "sha-256 BB", "n").unwrap();
+        let sig = URL_SAFE_NO_PAD.encode(device.sign(&rng, &t).unwrap().as_ref());
+        assert!(peer_auth_verify(&key, &t, &sig));
+        // Another field, another key, another signature: no.
+        let other_t =
+            peer_auth_transcript("answer", "s", "a", "u", "sha-256 AA", "sha-256 CC", "n").unwrap();
+        assert!(!peer_auth_verify(&key, &other_t, &sig));
+        let other_key = STANDARD.encode(pair(&rng).public_key().as_ref());
+        assert!(!peer_auth_verify(&other_key, &t, &sig));
+        assert!(!peer_auth_verify(&key, &t, "not a signature"));
+        assert!(!peer_auth_verify("not a key", &t, &sig));
+    }
+
+    /// FR-100 P1b (from FR-52 P4) — the one fingerprint an SDP names,
+    /// normalised; agreeing repeats are one, disagreeing ones are ambiguous.
+    #[test]
+    fn an_sdp_names_one_dtls_fingerprint_normalised() {
+        let one = "v=0\r\na=fingerprint:SHA-256 ab:cd:ef\r\nm=application\r\na=fingerprint:sha-256 AB:CD:EF\r\n";
+        assert_eq!(sdp_dtls_fingerprint(one).as_deref(), Ok("sha-256 AB:CD:EF"));
+        let two = "a=fingerprint:sha-256 AB:CD:EF\r\na=fingerprint:sha-256 AB:CD:00\r\n";
+        assert_eq!(
+            sdp_dtls_fingerprint(two),
+            Err(SdpFingerprintError::Ambiguous)
+        );
+        let odd = "a=fingerprint:sha-256 AB:CD EF\r\n";
+        assert_eq!(
+            sdp_dtls_fingerprint(odd),
+            Err(SdpFingerprintError::Ambiguous)
+        );
+        assert_eq!(
+            sdp_dtls_fingerprint("v=0\r\n"),
+            Err(SdpFingerprintError::Missing)
+        );
+    }
+
+    /// FR-100 P1b — the offer's ask and the answer's signature ride their
+    /// frames, absent when unset, and an older frame without them still reads.
+    #[test]
+    fn the_offer_and_answer_carry_peer_auth_and_absent_means_none() {
+        let offer = ClientMsg::SdpOffer {
+            session_id: ObjectId::new(),
+            sdp: "v=0".into(),
+            extauth_mac: None,
+            peer_auth: Some(PeerAuthOffer {
+                nonce: nonce_0_to_15(),
+            }),
+        };
+        let v = serde_json::to_value(&offer).unwrap();
+        assert_eq!(v["peer_auth"]["nonce"], nonce_0_to_15());
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("peer_auth");
+        match serde_json::from_value::<ClientMsg>(old).unwrap() {
+            ClientMsg::SdpOffer { peer_auth, .. } => assert_eq!(peer_auth, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let answer = ClientMsg::SdpAnswer {
+            session_id: ObjectId::new(),
+            sdp: "v=0".into(),
+            extauth_mac: None,
+            peer_auth: None,
+        };
+        let v = serde_json::to_value(&answer).unwrap();
+        assert!(v.get("peer_auth").is_none(), "{v}");
     }
 
     /// FR-90 P3-3a — what the server will store as a vault key: 32 bytes in

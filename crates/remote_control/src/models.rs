@@ -1147,6 +1147,18 @@ pub enum RpcCap {
     /// ⚠️ `external-access` and `external-session` share a prefix; neither is a
     /// prefix of the other, and matching stays equality regardless.
     ExternalSession,
+    /// FR-100 P1b — this build signs its session answer with its device key
+    /// (`AgentHello.peer_auth_key`) when the offer asks for it (a nonce in
+    /// `rc:sdp.offer`'s `peer_auth`). The signature covers the session's
+    /// transcript, both DTLS fingerprints included
+    /// ([`crate::signaling::peer_auth_transcript`]), so a browser that pinned
+    /// the key catches a hub that swapped the device's certificate.
+    ///
+    /// A BUILD property, like `config`: an enrollment that could not keep a
+    /// key sends an empty `peer_auth_key` and signs nothing, while still
+    /// advertising this. No other verb starts with `peer`, and matching stays
+    /// equality regardless.
+    PeerAuth,
 }
 
 impl RpcCap {
@@ -1194,11 +1206,12 @@ impl RpcCap {
             Self::Vault => "vault",
             Self::ExternalAccess => "external-access",
             Self::ExternalSession => "external-session",
+            Self::PeerAuth => "peer-auth",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 36] = [
+    pub const ALL: [RpcCap; 37] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1235,6 +1248,7 @@ impl RpcCap {
         Self::Vault,
         Self::ExternalAccess,
         Self::ExternalSession,
+        Self::PeerAuth,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -7252,6 +7266,7 @@ mod tests {
         assert_eq!(RpcCap::Vault.wire(), "vault");
         assert_eq!(RpcCap::ExternalAccess.wire(), "external-access");
         assert_eq!(RpcCap::ExternalSession.wire(), "external-session");
+        assert_eq!(RpcCap::PeerAuth.wire(), "peer-auth");
     }
 
     /// FR-101 P4b-2 — the device's idle setting as a limit: unset and `0`

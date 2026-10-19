@@ -2008,6 +2008,9 @@ impl Hub {
         session_id: ObjectId,
         sdp: String,
         extauth_mac: Option<String>,
+        // FR-100 P1b — relayed verbatim, as `extauth_mac` is: the nonce the
+        // device signs its answer against. The hub never reads it.
+        peer_auth: Option<roomler_ai_remote_control::signaling::PeerAuthOffer>,
     ) -> Result<()> {
         let (agent_id, local_relay, rc_overlay, region) = self.with_session(session_id, |s| {
             // The negotiating reaper stands down once an offer exists — from
@@ -2072,17 +2075,20 @@ impl Hub {
                 sdp,
                 ice_servers: ice,
                 extauth_mac,
+                peer_auth,
             })
             .map_err(|_| Error::SendFailed)
     }
 
     /// Forward agent's SDP answer to the controller. `extauth_mac` (FR-52 P4)
-    /// relayed verbatim, as for the offer.
+    /// and `peer_auth` (FR-100 P1b, the device's signature) relayed verbatim,
+    /// as for the offer: the browser is the party that checks them.
     pub fn forward_answer(
         &self,
         session_id: ObjectId,
         sdp: String,
         extauth_mac: Option<String>,
+        peer_auth: Option<roomler_ai_remote_control::signaling::PeerAuthAnswer>,
     ) -> Result<()> {
         let (controller_tx, user_id, region) = {
             let arc = self
@@ -2108,6 +2114,7 @@ impl Hub {
             sdp,
             ice_servers: ice,
             extauth_mac,
+            peer_auth,
         })
         .map_err(|_| Error::SendFailed)?;
 
@@ -3676,10 +3683,11 @@ impl Hub {
                     session_id,
                     sdp,
                     extauth_mac,
+                    peer_auth,
                 },
             ) => {
                 self.check_session_party(ctx, session_id)?;
-                self.forward_offer(session_id, sdp, extauth_mac)
+                self.forward_offer(session_id, sdp, extauth_mac, peer_auth)
             }
             (
                 Role::Agent,
@@ -3687,10 +3695,11 @@ impl Hub {
                     session_id,
                     sdp,
                     extauth_mac,
+                    peer_auth,
                 },
             ) => {
                 self.check_session_party(ctx, session_id)?;
-                self.forward_answer(session_id, sdp, extauth_mac)
+                self.forward_answer(session_id, sdp, extauth_mac, peer_auth)
             }
             (
                 Role::Agent,
@@ -4218,12 +4227,78 @@ mod tests {
         // Drain the agent's Request so the offer forward has room.
         let _req = agent_rx.recv().await.unwrap();
 
-        hub.forward_offer(sid, "v=0".into(), None).unwrap();
+        hub.forward_offer(sid, "v=0".into(), None, None).unwrap();
         tokio::time::sleep(NEGOTIATING_TIMEOUT + Duration::from_secs(1)).await;
         assert!(
             ctl_rx.try_recv().is_err(),
             "session with an offer must not be reaped at the deadline"
         );
+    }
+
+    /// FR-100 P1b — the hub relays both halves of peer auth verbatim: the
+    /// browser's ask to the agent, the device's signature to the browser. It
+    /// checks neither, and must drop neither.
+    #[tokio::test]
+    async fn the_hub_relays_peer_auth_verbatim_both_ways() {
+        use roomler_ai_remote_control::signaling::{PeerAuthAnswer, PeerAuthOffer};
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            false,
+        );
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let sid = hub
+            .create_session(
+                agent_id,
+                ObjectId::new(),
+                "Goran".into(),
+                ctl_tx,
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                None, // chunk_framing
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let _created = ctl_rx.recv().await.unwrap();
+        hub.deliver_consent(sid, true, None).unwrap();
+        let _ready = ctl_rx.recv().await.unwrap();
+        let _req = agent_rx.recv().await.unwrap();
+
+        // Any string: the hub never reads the nonce, only carries it.
+        let ask = PeerAuthOffer {
+            nonce: "a nonce the hub never reads".into(),
+        };
+        hub.forward_offer(sid, "v=0".into(), None, Some(ask.clone()))
+            .unwrap();
+        match agent_rx.recv().await.unwrap() {
+            ServerMsg::SdpOffer { peer_auth, .. } => assert_eq!(peer_auth, Some(ask)),
+            other => panic!("expected the offer, got {other:?}"),
+        }
+        let signed = PeerAuthAnswer {
+            key: "the device's key".into(),
+            sig: "its signature".into(),
+        };
+        hub.forward_answer(sid, "v=0".into(), None, Some(signed.clone()))
+            .unwrap();
+        loop {
+            if let ServerMsg::SdpAnswer { peer_auth, .. } = ctl_rx.recv().await.unwrap() {
+                assert_eq!(peer_auth, Some(signed));
+                break;
+            }
+        }
     }
 
     /// FR-101 P4b — drive a session to live: consent, offer, answer.
@@ -4237,8 +4312,8 @@ mod tests {
         hub.deliver_consent(sid, true, None).unwrap();
         let _ready = ctl_rx.recv().await.unwrap();
         let _req = agent_rx.recv().await.unwrap();
-        hub.forward_offer(sid, "v=0".into(), None).unwrap();
-        hub.forward_answer(sid, "v=0".into(), None).unwrap();
+        hub.forward_offer(sid, "v=0".into(), None, None).unwrap();
+        hub.forward_answer(sid, "v=0".into(), None, None).unwrap();
     }
 
     /// FR-101 P4b — the next `rc:terminate` on a channel, within `within`.
@@ -4407,8 +4482,8 @@ mod tests {
             ctl_rx.recv().await.unwrap(),
             ServerMsg::Ready { .. }
         ));
-        hub.forward_offer(sid, "v=0".into(), None).unwrap();
-        hub.forward_answer(sid, "v=0".into(), None).unwrap();
+        hub.forward_offer(sid, "v=0".into(), None, None).unwrap();
+        hub.forward_answer(sid, "v=0".into(), None, None).unwrap();
         let device = DispatchCtx {
             role: Role::Agent,
             user_id: None,
@@ -4593,6 +4668,7 @@ mod tests {
                 session_id: sid,
                 sdp: "v=0".into(),
                 extauth_mac: None,
+                peer_auth: None,
             },
             ClientMsg::Ice {
                 session_id: sid,
@@ -4611,6 +4687,7 @@ mod tests {
                 session_id: sid,
                 sdp: "v=0".into(),
                 extauth_mac: None,
+                peer_auth: None,
             },
             ClientMsg::Consent {
                 session_id: sid,
@@ -6158,7 +6235,7 @@ mod tests {
             )
             .unwrap();
 
-        hub.forward_offer(sid, "v=0".into(), None).unwrap();
+        hub.forward_offer(sid, "v=0".into(), None, None).unwrap();
 
         let mut told = None;
         let mut turn_urls: Vec<String> = Vec::new();

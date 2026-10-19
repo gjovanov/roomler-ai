@@ -1715,6 +1715,7 @@ mod routing_tests {
             sdp: String::new(),
             ice_servers: Vec::new(),
             extauth_mac: None,
+            peer_auth: None,
         }));
         assert!(delegable_inbound(&ServerMsg::Ice {
             session_id: oid(),
@@ -1740,6 +1741,7 @@ mod routing_tests {
             session_id: oid(),
             sdp: String::new(),
             extauth_mac: None,
+            peer_auth: None,
         }));
         assert!(delegable_outbound(&ClientMsg::Ice {
             session_id: oid(),
@@ -1846,6 +1848,7 @@ mod role_tests {
             session_id: sid,
             sdp: "v=0".into(),
             extauth_mac: None,
+            peer_auth: None,
         })
         .await
         .unwrap();

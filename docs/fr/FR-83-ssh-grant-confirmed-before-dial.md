@@ -67,9 +67,9 @@ arrived 4.4 s late still had ~50 s of its 60 s life left — the window was ther
 | step | where | what it does |
 |---|---|---|
 | push | `crates/modules/network/src/routes/agent_ssh.rs:395` | `rc_hub.push_ssh_grant(…)` |
-| enqueue | `crates/modules/fleet/src/hub.rs:2325` → `send_to_agent` | `try_send` onto the agent's outbound mpsc — returns when **queued** |
+| enqueue | `crates/modules/fleet/src/hub.rs:2332` → `send_to_agent` | `try_send` onto the agent's outbound mpsc — returns when **queued** |
 | answer | `crates/modules/network/src/routes/agent_ssh.rs:407` | `Ok(Granted { address, … })` — immediately |
-| record | `agents/roomlerd/src/signaling.rs:3821` → `ssh.rs:2173` | `record_grant` pushes into `GRANTS` whenever the frame arrives |
+| record | `agents/roomlerd/src/signaling.rs:3866` → `ssh.rs:2173` | `record_grant` pushes into `GRANTS` whenever the frame arrives |
 | auth | `agents/roomlerd/src/ssh.rs:2269` (`take_grant_for`) | reads `GRANTS`; no entry ⇒ `rejected — no live grant` |
 
 ```mermaid
@@ -138,7 +138,7 @@ is of `ssh-consent`, and `starts_with` would mark every `ssh` agent ack-capable 
 server would then wait 10 s on every grant to an agent that never answers.
 
 ⚠️ The server reads it from the **Hub entry** (distilled at registration,
-`crates/modules/fleet/src/socket.rs:168`, like `supports_ssh`), never from the stored
+`crates/modules/fleet/src/socket.rs:184`, like `supports_ssh`), never from the stored
 agent row. The row reflects the last hello, which after a rollback promises an ack the
 running agent never sends — every grant to that device would wait out the bound and then
 be refused.
@@ -172,14 +172,14 @@ caller hears the server's reason rather than its own timeout; and it leaves ≥ 
 
 ### 4. The agent — acknowledge after recording, and every refusal
 
-The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:3821`) acknowledges **after**
+The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:3866`) acknowledges **after**
 `record_grant` returns: the grant is in `GRANTS` — the table the auth path reads — before
 the frame leaves, so "confirmed" means "redeemable". `record_grant`'s `Result<(), String>`
 becomes a typed rejection so the arm can say *which* refusal it was; the log text is
 unchanged.
 
 The ack is sent unconditionally by an ack-capable build. An older server cannot parse the
-frame and drops it at `debug!` (`crates/modules/fleet/src/socket.rs:718`) — harmless, and
+frame and drops it at `debug!` (`crates/modules/fleet/src/socket.rs:734`) — harmless, and
 one small frame per grant.
 
 ### Compatibility, both directions
