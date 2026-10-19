@@ -250,3 +250,6 @@ daemon. Its primary was in an org with no overlay, and its secondary was enrolle
 The front answers REP 4 for every failed connect, so the TIME is what tells a refusal from no path: the netstack
 fails at once only on a reset, and waits out its 15 s connect timeout otherwise.
 
+Shipped in 0.4.145. The same container check passed on its candidate (release run 39248610025) and on the
+published release, which carries the candidate's binary, and #2493 was closed (2026-10-19).
+
