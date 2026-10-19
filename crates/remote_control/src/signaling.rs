@@ -7438,6 +7438,57 @@ mod tests {
         );
     }
 
+    /// FR-100 P2a — a signature made OUTSIDE both implementations: an OpenSSL
+    /// 3.5 P-256 key (its private half deleted after signing) over the
+    /// known-answer transcript, converted from DER to `r ‖ s`. The viewer's
+    /// tests verify the same vector with WebCrypto, so ring and the browser are
+    /// held to one signer neither of them wrote. Bytes, not base64 literals: a
+    /// secret scanner cannot tell a public key or a signature from a secret.
+    #[test]
+    fn a_signature_made_outside_both_implementations_verifies() {
+        use base64::Engine;
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        const POINT: [u8; 65] = [
+            0x04, 0xdf, 0x87, 0x14, 0xf1, 0x2a, 0x41, 0xd2, 0x32, 0x32, 0x0a, 0x24, 0xea, 0xb5,
+            0x75, 0x78, 0xc7, 0x4e, 0x63, 0xa3, 0x4d, 0x57, 0xad, 0x90, 0x8a, 0x92, 0xb1, 0xde,
+            0xca, 0x53, 0x7a, 0xa5, 0xfb, 0xfd, 0x9a, 0x83, 0x24, 0x1b, 0x9c, 0xdd, 0xd1, 0x06,
+            0xbd, 0x0c, 0x7e, 0x0e, 0x0a, 0x87, 0x4e, 0xb1, 0x48, 0x14, 0x0d, 0x14, 0xe3, 0x4a,
+            0x9e, 0x7c, 0xe3, 0xba, 0x07, 0xf4, 0xa7, 0x8e, 0xc4,
+        ];
+        const SIG: [u8; 64] = [
+            0x73, 0x2a, 0xa2, 0x53, 0xdc, 0x6e, 0x3a, 0x5b, 0x06, 0xaa, 0x6d, 0x32, 0x37, 0x5a,
+            0x5e, 0x08, 0x8e, 0xe1, 0x28, 0x8f, 0x5c, 0x7e, 0x00, 0xd7, 0xba, 0x16, 0x4f, 0x98,
+            0x9c, 0xc4, 0x29, 0x6c, 0x38, 0x9f, 0xaa, 0xf2, 0x9c, 0x7b, 0x64, 0xe7, 0x23, 0xb3,
+            0x97, 0xb2, 0xe3, 0xb3, 0x46, 0xab, 0x49, 0xb9, 0x74, 0x1b, 0x27, 0x6d, 0x99, 0x71,
+            0xee, 0x95, 0xb3, 0x71, 0x83, 0x2d, 0xe5, 0xb3,
+        ];
+        let key = STANDARD.encode(POINT);
+        let sig = URL_SAFE_NO_PAD.encode(SIG);
+        let kat = |user: &str| {
+            peer_auth_transcript(
+                "answer",
+                "66f0c0ffee0000000000000a",
+                "66f0c0ffee0000000000000b",
+                user,
+                "sha-256 AA:BB:CC",
+                "sha-256 DD:EE:FF",
+                &nonce_0_to_15(),
+            )
+            .unwrap()
+        };
+        assert!(peer_auth_key_is_well_formed(&key));
+        assert!(peer_auth_verify(
+            &key,
+            &kat("66f0c0ffee0000000000000c"),
+            &sig
+        ));
+        assert!(!peer_auth_verify(
+            &key,
+            &kat("66f0c0ffee0000000000000d"),
+            &sig
+        ));
+    }
+
     /// FR-100 P1b — the nonce the vectors use: bytes 0 to 15, base64url without
     /// padding. Built here rather than written as a base64 literal: a secret
     /// scanner cannot tell a counting sequence from a key.

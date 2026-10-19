@@ -70,8 +70,12 @@ function own(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
   return new Uint8Array(bytes)
 }
 
-/** `u16be(len) ‖ bytes` for each field, after the label. */
-function framed(label: string, ...fields: string[]): Uint8Array<ArrayBuffer> {
+/**
+ * `u16be(len) ‖ bytes` for each field, after the label. Exported for FR-100's
+ * transcript (`utils/peerAuth.ts`), which frames its fields the same way: one
+ * copy of a wire surface, not two.
+ */
+export function framed(label: string, ...fields: string[]): Uint8Array<ArrayBuffer> {
   const parts = [utf8.encode(label)]
   for (const f of fields) {
     const bytes = utf8.encode(f)

@@ -532,9 +532,9 @@ The pump ([`peer.rs:12441`](../agents/roomlerd/src/peer.rs#L12441)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5421`](../agents/roomlerd/src/peer.rs#L5421); the viewer parses it
-at [`useRemoteControl.ts:1380`](../ui/src/composables/useRemoteControl.ts#L1380)
+at [`useRemoteControl.ts:1413`](../ui/src/composables/useRemoteControl.ts#L1413)
 and puts it on the toggle's title
-([`RemoteControl.vue:3150`](../ui/src/views/remote/RemoteControl.vue#L3150)).
+([`RemoteControl.vue:3190`](../ui/src/views/remote/RemoteControl.vue#L3190)).
 
 | `code` | Means |
 |---|---|
@@ -569,7 +569,7 @@ machine awake while a session is live, per OS:
 | The lock signal | the input desktop moves to `winsta0\Winlogon` (`lock_state`) | logind's `LockedHint` for seat0's active session, polled every 2 s ([`lock_state.rs:331`](../agents/roomlerd/src/lock_state.rs#L331)); GNOME, KDE and light-locker set it | P2d |
 | What the session does | paints the "Host locked" overlay and suppresses input: the worker can neither capture nor inject there | **nothing**: the lock screen is captured like any other screen, and input reaches it | — |
 | `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:9357`](../agents/roomlerd/src/peer.rs#L9357)), retried until the control DC carries it | — |
-| The viewer's chip | "input is suppressed" | "Your input reaches it, so you can type the password to unlock" ([`RemoteControl.vue:81`](../ui/src/views/remote/RemoteControl.vue#L81)) | — |
+| The viewer's chip | "input is suppressed" | "Your input reaches it, so you can type the password to unlock" ([`RemoteControl.vue:98`](../ui/src/views/remote/RemoteControl.vue#L98)) | — |
 | Holding the machine awake while a session is live (FR-55) | `PowerCreateRequest` | a logind **block** inhibitor ([`power.rs:670`](../agents/roomlerd/src/power.rs#L670)): `sleep:idle` for a root daemon, `idle` only for a per-user one | `IOPMAssertion` |
 
 ⚠️ **The Linux hint is advisory and never a `LockState`.** The pump's overlay
@@ -1431,6 +1431,69 @@ A remote-control feature is the most-abused capability in any product. Mitigatio
 - **An outsider is never recorded and never covers the screen** (FR-52 §10 and decision 13). A controller from outside the organization is never granted `RECORD` (`controller_not_allowed`) or `PRIVACY` (`privacy_refused` `outside_the_org`). The person at the device let a stranger in on a password, and is the only one placed to see what that stranger does. The device strips both again when it admits the session, so a compromised server cannot hand them back.
 - **No prompt-bombing** (FR-101 P4a). A caller may send one device at most 60 session requests a minute, checked after the authz gate, so a caller who may not ask is refused by identity first. Past the ceiling the answer is `rc:error` `rate_limited`, which the viewer does not retry. Each request can put a consent prompt in front of the person at the device, and the control WS is outside the per-IP HTTP governor.
 
+### 11.4a The device proves it is the one answering (FR-100 P1–P2a)
+
+The SDP is the only thing that says whose DTLS key is whose (webrtc-rs checks each side's certificate against
+the fingerprint in the SDP), and the hub rebuilds every offer and answer frame around it. So whoever holds the
+hub, its Redis, or the device's signalling leg could swap the device's fingerprint for their own, and the
+viewer would complete DTLS with them. FR-100 ties the answer to a key only the device holds:
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant B as Viewer (browser)
+  participant H as Hub (relays only)
+  participant D as Device (roomlerd)
+  Note over D: P1a: one P-256 key per enrollment,<br/>peer-auth/&lt;tenant&gt;.json; the public half<br/>rides the hello and the device row
+  B->>H: rc:sdp.offer + peer_auth {nonce}
+  H->>D: relayed verbatim
+  Note over D: transcript = label, role "answer", session,<br/>agent, user, offer fp, answer fp, nonce
+  D->>H: rc:sdp.answer + peer_auth {key, sig}
+  H->>B: relayed verbatim
+  Note over B: verify BEFORE setRemoteDescription;<br/>pin the key per (user, device) on first use
+  B-->>D: DTLS only with the certificate the signature named
+```
+
+- **When the page asks** ([`shouldAskPeerAuth`, `peerAuth.ts:152`](../ui/src/utils/peerAuth.ts#L152)): an
+  in-org session, to a device that advertises `peer-auth` (equality, never a prefix) and whose row carries a
+  well-formed key, from a page that knows who is signed in (the signature names them) and can verify at all.
+  An outsider's session is bound by [FR-52](fr/FR-52-cross-org-remote-access.md)'s MAC over the same
+  fingerprints instead, under the key its password login produced. A non-secure origin has no
+  `crypto.subtle`, and a page that cannot verify does not ask
+  ([`peerAuthCanVerify`, `peerAuth.ts:138`](../ui/src/utils/peerAuth.ts#L138)), or every answer would read
+  as a bad signature.
+- **What the device signs** ([`peer_auth_transcript`, `signaling.rs:233`](../crates/remote_control/src/signaling.rs#L233);
+  [`sign_answer`, `peer_auth.rs:219`](../agents/roomlerd/src/peer_auth.rs#L219)): the transcript above,
+  ECDSA P-256 over SHA-256 as WebCrypto verifies it. The daemon signs at both places an answer leaves it, so a
+  GUI worker that built the answer never holds the key.
+- **What the page does with the answer** ([`judgePeerAuth`, `peerAuth.ts:267`](../ui/src/utils/peerAuth.ts#L267),
+  [`applyPeerAuthVerdict`, `peerAuth.ts:358`](../ui/src/utils/peerAuth.ts#L358)), always before the answer
+  is applied:
+
+  | Verdict | The page |
+  |---|---|
+  | `first-use`: verified, by a key this browser had not pinned for this device | pins it, connects, toolbar **Verified** |
+  | `pinned`: verified, by the pinned key | connects, toolbar **Verified** |
+  | `key-changed`: verified, by **another** key | stops: `rc:terminate`, nothing shown or sent; both fingerprints in the message; **Trust the new key and connect** pins that one key on the person's click |
+  | `bad-signature`: does not verify over this session (or the answer names no single certificate) | stops, the same way; nothing to trust |
+  | `unsigned`: asked, no signature | connects, toolbar **Unverified** (a pod from before the field existed drops it mid-roll) |
+  | `not-asked` | connects, exactly as before |
+
+- **The pins** ([`storagePins`, `peerAuth.ts:201`](../ui/src/utils/peerAuth.ts#L201)) are public keys in this
+  origin's `localStorage` (`roomler.peerAuth.pins.v1`, keyed `user:device`). A browser that refuses storage
+  keeps them for the page's life, so the next visit is first use again, never a false alarm. The server's copy
+  of the key (the device row) is a hint for the person to compare, never what the page trusts.
+- **The kill switch** is per browser: `localStorage['roomler.peerAuth.ask'] = 'off'` stops asking.
+
+> ⚠️ **What P2a does not stop yet.** An unsigned answer proceeds. An attacker in the signalling path who strips
+> the nonce or the signature gets an **Unverified** session rather than a refusal. Refusing an unsigned answer
+> from a device this browser has pinned is P3's `enforce`. And whoever serves the viewer's JavaScript can make
+> the page say anything (FR-100 §1); this binding protects against the signalling path, not against the origin.
+
+> ⚠️ A device that is reinstalled with its config wiped makes a new key, and every browser that pinned the old
+> one stops at **key changed** until the person trusts the new one. That is the point: from the browser's side,
+> a reinstalled device and an impostor look the same until a person compares the fingerprints.
+
 ### 11.5 The host's Disconnect (FR-27 P10)
 
 The person at the device can end a session from their own screen — the
@@ -1639,7 +1702,7 @@ sequenceDiagram
 | Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:3769`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:12371`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:574`), on both ends' `rc:terminate` and in the `session_ended` audit row |
-| Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:287`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:673`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:351`, #2326) |
+| Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:302`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:706`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:366`, #2326) |
 | Tests | the predicate on recorded offers (`codec_cap_tests` in `peer.rs`); the field's own offer, which `create_answer` fails on, is the one it refuses (`agents/roomlerd/tests/dc_track_codec.rs`); who may name the code (`only_the_device_names_no_common_codec`, `hub.rs:4567`); the real agent through a real server, with an H.264 offer as the control (`crates/tests/src/rc_no_common_codec_tests.rs:147`) |
 
 ⚠️ **The consent prompt has already been answered** by the time the offer
@@ -1777,7 +1840,7 @@ flowchart LR
 
 | mark | waits on | set at | server record | persisted (part 4) |
 |---|---|---|---|---|
-| `ws_ready` | the signalling socket — re-keyed and redialled when the device's org differs from the page's, up to `RC_PREFLIGHT_WS_WAIT_MS` (`useRemoteControl.ts:256`) | `connect()` pre-flight | — | ✅ |
+| `ws_ready` | the signalling socket — re-keyed and redialled when the device's org differs from the page's, up to `RC_PREFLIGHT_WS_WAIT_MS` (`useRemoteControl.ts:271`) | `connect()` pre-flight | — | ✅ |
 | `turn_ready` | `GET /turn/credentials` | pre-flight | — | ✅ |
 | `probes_ready` | the loopback-relay probe + the browser's decode-capability probes (cached since #861: 28 ms cold, 7 ms warm) | pre-flight | — | ✅ |
 | `request_sent` | nothing — the instant `rc:session.request` left | `connect()` | — | ✅ |
@@ -1811,7 +1874,7 @@ phases**. A single total could not tell them apart.
 #### 12.1.2 The phase-aware bound (part 1)
 
 One timeout used to guard two different questions. `signalingTimeoutFor(phase)`
-(`useRemoteControl.ts:240`) is total over `RcPhase`, so a new phase must declare
+(`useRemoteControl.ts:255`) is total over `RcPhase`, so a new phase must declare
 its own bound instead of inheriting the ICE-sized one:
 
 | phase | waits on | bound | why |
@@ -1857,7 +1920,7 @@ sequenceDiagram
 
 The viewer surfaces the code (`rcErrorMessage`) — a first connect fails fast
 with an attributable reason, and an attempt already inside the ladder advances
-on it instead (`isRetryableRcErrorCode`, `useRemoteControl.ts:337`) — so the
+on it instead (`isRetryableRcErrorCode`, `useRemoteControl.ts:352`) — so the
 undeliverable case never waits for any timer. ⚠️ **What the server genuinely
 cannot see** is the case
 actually observed in the field: a session that *reached* the agent, gathered
