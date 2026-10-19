@@ -2176,28 +2176,93 @@ impl AgentConfig {
     }
 }
 
-/// Multi-org P1 — swap a secondary enrollment into the PRIMARY (scalar)
-/// slot; the demoted primary takes the promoted org's `[[orgs]]` position
+/// What [`promote_org_to_primary`] did to each enrollment's place on the
+/// mesh, so the CLI can say it rather than leave an operator to find out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Promotion {
+    /// The label the demoted primary now has in `[[orgs]]`.
+    pub demoted_label: String,
+    /// The new primary is on the mesh (its own OS TUN): it was a `tun` entry.
+    pub primary_on: bool,
+    /// The promoted entry was on the mesh through the userspace netstack. A
+    /// primary cannot take that from config (its netstack is the env key
+    /// `ROOMLERD_OVERLAY_NETSTACK_SOCKS`, which `overlay_multi_org`
+    /// overrides), so it starts off.
+    pub primary_was_netstack: bool,
+    /// The demoted entry's overlay mode.
+    pub demoted_mode: OrgOverlayMode,
+    /// The old primary was on the mesh and could not stay on it as a
+    /// secondary: a per-org TUN needs `overlay_multi_org`, and a `tun` org
+    /// the primary's control plane.
+    pub demoted_lost_mesh: bool,
+}
+
+/// Multi-org — swap a secondary enrollment into the PRIMARY (scalar) slot;
+/// the demoted primary takes the promoted org's `[[orgs]]` position, under
+/// `demoted_label` when given (sanitized, refused on a collision), else
 /// under the promoted org's old label. Machine identity and operator knobs
 /// stay put; the org-scoped fields (WG key, advertised routes, exit offer)
-/// travel with their enrollments. The overlay TUN follows the primary slot,
-/// so the swapped-in primary starts `overlay_enabled = false` (P1: the
-/// operator opts back in explicitly) and the demoted entry parks at
-/// `OrgOverlayMode::Off` until P2's per-org overlay lands.
-pub fn promote_org_to_primary(cfg: &mut AgentConfig, label: &str) -> Result<()> {
+/// travel with their enrollments.
+///
+/// #2540 — mesh participation travels too, where it maps exactly. Multi-org
+/// P1 parked both at off "until P2's per-org overlay lands"; P2 (FR-49)
+/// landed, and a swap run to fix updates then took a two-org host off both
+/// meshes (measured on the operator's Asahi box, 2026-10-19).
+/// - The new primary is on iff its entry was `tun`: that org already ran an
+///   OS TUN on this host. `netstack` cannot become a netstack primary
+///   through config, so it starts off, and [`Promotion`] says so.
+/// - The demoted entry is `tun` iff the old primary was on the mesh with
+///   `overlay_multi_org` on (so it ran its own OS TUN) and both orgs share a
+///   control plane, as `tun` requires. Otherwise off, as before.
+///
+/// The exit node a primary USES (`overlay_exit_node`) is org-specific and is
+/// cleared; an exit node it OFFERS travels with its enrollment.
+pub fn promote_org_to_primary(
+    cfg: &mut AgentConfig,
+    label: &str,
+    demoted_label: Option<&str>,
+) -> Result<Promotion> {
     let Some(idx) = cfg.orgs.iter().position(|o| o.label == label) else {
         anyhow::bail!("no org labelled {label:?} — see `roomlerd org ls`");
     };
+    let demoted_label = match demoted_label {
+        None => cfg.orgs[idx].label.clone(),
+        Some(raw) => {
+            let Some(clean) = sanitize_org_label(raw) else {
+                anyhow::bail!(
+                    "{raw:?} is not a usable org label (letters, digits and dashes; not \"primary\")"
+                );
+            };
+            if cfg
+                .orgs
+                .iter()
+                .enumerate()
+                .any(|(i, o)| i != idx && o.label == clean)
+            {
+                anyhow::bail!("another org is already labelled {clean:?} — see `roomlerd org ls`");
+            }
+            clean
+        }
+    };
     let entry = cfg.orgs.remove(idx);
+    let same_plane = entry.server_url == cfg.server_url;
+    let primary_on = entry.overlay_mode == OrgOverlayMode::Tun;
+    let primary_was_netstack = entry.overlay_mode == OrgOverlayMode::Netstack;
+    let old_primary_on = cfg.overlay_enabled;
+    let demoted_mode = if old_primary_on && cfg.overlay_multi_org && same_plane {
+        OrgOverlayMode::Tun
+    } else {
+        OrgOverlayMode::Off
+    };
     let demoted = OrgEntry {
-        label: entry.label.clone(),
+        label: demoted_label.clone(),
         server_url: cfg.server_url.clone(),
         ws_url: cfg.ws_url.clone(),
         agent_token: cfg.agent_token.clone(),
         agent_id: cfg.agent_id.clone(),
         tenant_id: cfg.tenant_id.clone(),
         enabled: true,
-        overlay_mode: OrgOverlayMode::Off,
+        overlay_mode: demoted_mode,
         overlay_wg_secret_key: cfg.overlay_wg_secret_key.clone(),
         overlay_wg_key_epoch: cfg.overlay_wg_key_epoch,
         overlay_advertised_routes: cfg.overlay_advertised_routes.clone(),
@@ -2216,9 +2281,15 @@ pub fn promote_org_to_primary(cfg: &mut AgentConfig, label: &str) -> Result<()> 
     cfg.overlay_exit_node_enabled = entry.overlay_exit_node_enabled;
     cfg.overlay_exit_node = None;
     cfg.advertise_routes = entry.advertise_routes;
-    cfg.overlay_enabled = false;
+    cfg.overlay_enabled = primary_on;
     cfg.orgs.insert(idx, demoted);
-    Ok(())
+    Ok(Promotion {
+        demoted_label,
+        primary_on,
+        primary_was_netstack,
+        demoted_mode,
+        demoted_lost_mesh: old_primary_on && demoted_mode == OrgOverlayMode::Off,
+    })
 }
 
 /// Normalize an operator-supplied org label: lowercase, spaces/`_` → `-`,
@@ -3957,7 +4028,7 @@ tenant_id = "tid2"
         acme.advertise_routes = vec!["192.168.9.0/24".into()];
         cfg.orgs = vec![org_fixture("zeta", "tid-z"), acme];
 
-        promote_org_to_primary(&mut cfg, "acme").unwrap();
+        let done = promote_org_to_primary(&mut cfg, "acme", None).unwrap();
 
         // Promoted identity + org-scoped fields are now the scalars…
         assert_eq!(cfg.server_url, "https://acme.invalid");
@@ -3966,8 +4037,10 @@ tenant_id = "tid2"
         assert_eq!(cfg.tenant_id, "tid-acme");
         assert_eq!(cfg.overlay_wg_secret_key.as_deref(), Some("ACME-KEY"));
         assert_eq!(cfg.advertise_routes, vec!["192.168.9.0/24".to_string()]);
-        // …the TUN opt-in resets (operator re-opts per the P1 contract)…
+        // …acme was off the mesh, so the primary is (#2540: it follows the
+        // promoted entry), and the exit node it USED, org-specific, clears…
         assert!(!cfg.overlay_enabled);
+        assert!(!done.primary_on);
         assert!(cfg.overlay_exit_node.is_none());
         // …operator knobs stay put…
         assert!(matches!(
@@ -3983,11 +4056,136 @@ tenant_id = "tid2"
         assert_eq!(demoted.tenant_id, "tid");
         assert_eq!(demoted.agent_token, "tok");
         assert_eq!(demoted.overlay_wg_secret_key.as_deref(), Some("PRIM-KEY"));
+        // The old primary was on the mesh, but with no `overlay_multi_org` and
+        // on another control plane than acme it cannot stay on as `tun`.
         assert_eq!(demoted.overlay_mode, OrgOverlayMode::Off);
+        assert!(done.demoted_lost_mesh);
+        assert_eq!(done.demoted_label, "acme");
         assert!(demoted.enabled);
 
         // Unknown label is a hard error, config untouched.
-        assert!(promote_org_to_primary(&mut cfg, "ghost").is_err());
+        assert!(promote_org_to_primary(&mut cfg, "ghost", None).is_err());
+    }
+
+    /// #2540 — the swap that took a two-org host off both meshes. Both on
+    /// their own OS TUN (`overlay_multi_org`, one control plane): both stay.
+    #[test]
+    fn promote_keeps_both_orgs_on_the_mesh_when_it_maps_exactly() {
+        let mut cfg = fixture();
+        cfg.overlay_enabled = true;
+        cfg.overlay_multi_org = true;
+        let mut grox = org_fixture("grox", "tid-grox");
+        grox.overlay_mode = OrgOverlayMode::Tun;
+        cfg.orgs = vec![grox];
+
+        let done = promote_org_to_primary(&mut cfg, "grox", Some("vmtest")).unwrap();
+
+        assert_eq!(cfg.tenant_id, "tid-grox");
+        assert!(
+            cfg.overlay_enabled,
+            "the promoted tun org stays on the mesh"
+        );
+        assert!(cfg.overlay_multi_org, "a device-wide knob, untouched");
+        assert_eq!(cfg.orgs.len(), 1);
+        assert_eq!(cfg.orgs[0].tenant_id, "tid");
+        assert_eq!(cfg.orgs[0].label, "vmtest");
+        assert_eq!(
+            cfg.orgs[0].overlay_mode,
+            OrgOverlayMode::Tun,
+            "the old primary stays on"
+        );
+        assert_eq!(
+            done,
+            Promotion {
+                demoted_label: "vmtest".into(),
+                primary_on: true,
+                primary_was_netstack: false,
+                demoted_mode: OrgOverlayMode::Tun,
+                demoted_lost_mesh: false,
+            }
+        );
+        assert!(cfg.validate_orgs().is_empty());
+    }
+
+    /// A netstack secondary cannot become a netstack primary through config
+    /// (the primary's netstack is an env key that `overlay_multi_org`
+    /// overrides): it starts off, and the swap says why.
+    #[test]
+    fn promote_a_netstack_org_starts_its_primary_off_and_says_so() {
+        let mut cfg = fixture();
+        cfg.overlay_enabled = true;
+        cfg.overlay_multi_org = true;
+        let mut ns = org_fixture("ns", "tid-ns");
+        ns.overlay_mode = OrgOverlayMode::Netstack;
+        cfg.orgs = vec![ns];
+
+        let done = promote_org_to_primary(&mut cfg, "ns", None).unwrap();
+
+        assert!(!cfg.overlay_enabled);
+        assert!(!done.primary_on);
+        assert!(done.primary_was_netstack);
+        assert_eq!(
+            done.demoted_mode,
+            OrgOverlayMode::Tun,
+            "the old primary still maps"
+        );
+    }
+
+    /// Without `overlay_multi_org` a secondary has no per-org TUN, and a
+    /// `tun` secondary must share the primary's control plane: the demoted
+    /// org parks off in both cases, and the swap reports the mesh it lost.
+    #[test]
+    fn promote_parks_the_demoted_org_off_without_multi_org_or_across_planes() {
+        for (multi_org, plane) in [
+            (false, "https://example.invalid"),
+            (true, "https://other.invalid"),
+        ] {
+            let mut cfg = fixture();
+            cfg.overlay_enabled = true;
+            cfg.overlay_multi_org = multi_org;
+            let mut b = org_fixture("b", "tid-b");
+            b.server_url = plane.into();
+            b.overlay_mode = OrgOverlayMode::Tun;
+            cfg.orgs = vec![b];
+
+            let done = promote_org_to_primary(&mut cfg, "b", None).unwrap();
+
+            assert!(
+                cfg.overlay_enabled,
+                "the promoted tun org stays on ({multi_org}, {plane})"
+            );
+            assert_eq!(
+                cfg.orgs[0].overlay_mode,
+                OrgOverlayMode::Off,
+                "({multi_org}, {plane})"
+            );
+            assert!(done.demoted_lost_mesh, "({multi_org}, {plane})");
+        }
+        // An old primary that was off the mesh loses nothing.
+        let mut cfg = fixture();
+        cfg.orgs = vec![org_fixture("b", "tid-b")];
+        let done = promote_org_to_primary(&mut cfg, "b", None).unwrap();
+        assert!(!done.demoted_lost_mesh);
+    }
+
+    /// `--demoted-label`: sanitized, never "primary", never a label another
+    /// org already has; a refusal leaves the config untouched.
+    #[test]
+    fn promote_with_a_demoted_label() {
+        let mut cfg = fixture();
+        cfg.orgs = vec![org_fixture("acme", "tid-a"), org_fixture("beta", "tid-b")];
+        let before = cfg.orgs.clone();
+        assert!(promote_org_to_primary(&mut cfg, "acme", Some("beta")).is_err());
+        assert!(promote_org_to_primary(&mut cfg, "acme", Some("Primary")).is_err());
+        assert!(promote_org_to_primary(&mut cfg, "acme", Some("!!")).is_err());
+        assert_eq!(cfg.orgs, before);
+        assert_eq!(cfg.tenant_id, "tid");
+
+        let done = promote_org_to_primary(&mut cfg, "acme", Some("Old Home")).unwrap();
+        assert_eq!(done.demoted_label, "old-home");
+        assert_eq!(cfg.orgs[0].label, "old-home");
+        assert_eq!(cfg.orgs[0].tenant_id, "tid");
+        assert_eq!(cfg.tenant_id, "tid-a");
     }
 
     #[test]

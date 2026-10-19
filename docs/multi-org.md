@@ -92,6 +92,32 @@ re-enroll finds the existing row.
 CLI: `roomler org ls | rm | enable | disable | set-primary`, `enroll --label`,
 `re-enroll --org <label>` (with a same-tenant guard).
 
+**`org set-primary <label> [--demoted-label <name>]`** swaps a secondary into
+the primary slot. Do this when the organization that should manage the machine
+is not its primary. The primary drives the machine-wide effects:
+- **the self-updater:** an `rc:agent.update` ("Update" or "Update all" in a
+  secondary org's dashboard) is ignored, with a WARN;
+- **attention sentinels;**
+- **declared tunnel routes.**
+
+The demoted primary moves into `[[orgs]]` under `--demoted-label`, or else under
+the promoted org's old label. The change applies at the next daemon start.
+
+⚠️ **Each enrollment keeps its place on the mesh where that maps exactly**
+(#2540). Before this, a swap took both off, which multi-org P1 did on purpose
+"until P2's per-org overlay lands". P2 landed, and a swap run to fix updates
+then cost a two-org host its mesh path, measured on 2026-10-19.
+
+| Before | After the swap | Why |
+|---|---|---|
+| the promoted secondary was `tun` | the new primary is **on** (its own OS TUN) | it already ran an OS TUN on this host |
+| the promoted secondary was `netstack` | the new primary is **off** | a primary's netstack is the env key `ROOMLERD_OVERLAY_NETSTACK_SOCKS`, which `overlay_multi_org` overrides; config cannot express it |
+| the old primary was on, with `overlay_multi_org`, on the same control plane | the demoted entry is **`tun`** | it ran its own OS TUN; a `tun` org needs the primary's control plane |
+| the old primary was on, without either | the demoted entry is **off** | `roomlerd org overlay <label> netstack` keeps it on |
+
+The command prints the outcome for each enrollment, with the way back on where
+it could not keep one.
+
 **Per-org supervisors.** `run_cmd` starts one supervised loop per enabled org.
 `OrgCtx` threads the per-enrollment identity through `run` / `connect_once` /
 `handle_server_msg`, which buys:
