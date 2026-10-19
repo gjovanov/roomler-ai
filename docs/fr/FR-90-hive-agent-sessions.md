@@ -2121,6 +2121,64 @@ host; the endpoint only signs, and only a sign-in to that host.
   under a passphrase; agent forwarding; `SSHSIG`, for git's commit signing; a `ProxyJump` whose jump
   host takes the same key; and Windows, the step after.
 
+**P3-6, `short-lived`, as designed.** A session gets a credential minted for it. `proxy` gave it an
+endpoint, and `file`, `env` and `exec` a stored value. Here the vault stores the *issuer*: what can
+mint, such as a database account that may create users or a GitHub App's key, and what a minted
+credential may do, such as the roles it joins or the repositories its token reaches. The session
+names the secret as it names any other. What it gets lives as long as its lease, and reaches only
+what the issuer's configuration lets it. The session can read it for that long (design §8.5); it
+never sees the issuer.
+
+| Piece | Design |
+|---|---|
+| the secret | a new kind, `dynamic`, naming a `provider`. Its stored fields are the issuer's, under the names its provider gives them, and a field the provider does not name is refused on write. For `postgres`: `admin_user`, `admin_password`, `database` and `grants` (the roles a minted user joins, one per line), and optionally `ca`. For `github_app`: `app_id`, `installation_id` and `private_key` (PEM), and optionally `repositories` and `permissions`, which narrow every token it mints. It names exactly one audience, the place its provider mints toward: the database's `host:port`, or `https://api.github.com` |
+| what a session names | the minted credential's fields, under the names its provider gives them: `postgres`'s `user`, `password`, `host`, `port` and `database`; `github_app`'s `token`. An issuer's field is never released to a session, in any mode: naming one is refused as naming a field with no value is |
+| a lease | asked for in `short-lived`, for the secret as a whole (it names no field), and answered with a bundle sealed to the device's key. For a provider the device mints for, the bundle is the issuer's fields; for one the server mints for, it is the minted credential. The vault leases a dynamic secret in no other mode, and leases nothing else in `short-lived`, whatever the device asks. A new version of any of its fields takes its leases back |
+| one credential per lease | every field a call names of one dynamic secret (`PGUSER` and `PGPASSWORD`) comes from one credential, minted once for the lease. Two calls with leases of their own get two credentials. A lease asked for ahead (`vault_request`) serves each call that takes it with the one credential it minted |
+| the tools | `vault_exec` (`env`) and `vault_render` (a file) serve a dynamic secret as they serve a stored one. `vault_connect` does not: an endpoint that signs in with a minted user is a later step |
+| the mode | `short-lived`, in Cedar's context as any mode is. The seeded Windows guardrail refuses it there, where no materializing mode runs. The prod guardrail does not refuse it: a credential that lives for minutes is what that guardrail pushes toward |
+| its life | the lease's TTL, as the call asks within the tool's bounds. At the lease's end (its expiry, `rc:vault.revoke`, the run's end) the credential is revoked where the provider can be told: a database user dropped, a token deleted. Where the provider cannot be told, the credential lives to its own expiry, and the audit says when that is |
+| the kill switch | `vault.providers`: the providers this server serves, by default every one built. A provider left out is refused `not_served`. Per secret, `disabled` |
+| who mints | the device, for a database user: only the device reaches the database, as for `proxy`. The issuer's fields stay in daemon memory, zeroized as a `proxy` value is. For a GitHub App token, decision 18 |
+
+**Postgres users** (P3-6b):
+- **The mint.** The issuer signs in as `admin_user` by SCRAM-SHA-256, over TLS verified as for
+  `proxy` (`ca`, or the system's roots). Then it runs
+  `CREATE ROLE "roomler_<lease>" LOGIN PASSWORD '<verifier>' VALID UNTIL '<the lease's end>' IN ROLE <grants>`,
+  and comments the role with its lease. Each name is quoted as an identifier.
+  - **The password is 32 random bytes, and it goes as its SCRAM-SHA-256 verifier**, never itself.
+    So a database that logs its statements logs no password.
+  - `IN ROLE` needs the issuer to hold `CREATEROLE` and, from Postgres 16, `ADMIN OPTION` on each
+    grant.
+  - A mint the database refuses is refused at the call, in the database's own words.
+- **The revocation.** `ALTER ROLE … NOLOGIN`, then the role's sessions ended, then `DROP ROLE`.
+  - **The sessions end only where the issuer may end them** (`pg_terminate_backend` needs
+    `pg_signal_backend`, or the role's own privileges). Where it may not, `NOLOGIN` still refuses
+    new sessions, and those already open run until they close.
+  - **A role that owns objects** is reassigned to the issuer first, in `database`
+    (`REASSIGN OWNED BY … TO …`, `DROP OWNED BY …`). A role that still owns objects in another
+    database cannot be dropped, and the audit says so.
+- **A daemon that dies before revoking.** `VALID UNTIL` refuses the role's logins after its lease
+  anyway. The issuer's next mint drops every role it made, by its comment, whose `VALID UNTIL` has
+  passed.
+
+**GitHub App tokens** (P3-6c):
+- **The mint.** A JWT (RS256, `iss` the App's id, `iat` 60 s back for clock skew, `exp` 9 minutes
+  on), signed with `private_key`. Then
+  `POST /app/installations/{installation_id}/access_tokens`, with the secret's `repositories` and
+  `permissions`. GitHub mints every token for an hour.
+- **The revocation.** `DELETE /installation/token`, with the token itself, at the lease's end. A
+  revocation that fails leaves the token alive to its hour, and the audit records both times.
+- **The audience** is `https://api.github.com`. GitHub Enterprise Server comes later.
+
+- **What `short-lived` cannot promise.** The session holds the credential, so whatever runs as it
+  can use or copy it until its revocation. What bounds the credential is its lifetime and the
+  issuer's scope, and both are the issuer's configuration, never the session's.
+- **Not in P3-6's first steps:** MySQL, SQL Server and Redis users (P3-6d); AWS STS (P3-6e), which
+  needs a stored AWS key until P7's federation; a Kubernetes `TokenRequest` (P3-6f); `vault_connect`
+  signing in with a minted user; a connection string among a database user's fields; GitHub
+  Enterprise Server; rotating the issuer's own credential.
+
 **Audit.** `vault_audit` holds every decision the server makes, allow and deny, with the 90-day TTL
 of the network module's audits (`crates/modules/network/src/lib.rs:748`). `vault_activity` is the
 device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
@@ -2174,7 +2232,13 @@ device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
 | P3-5f-1 | P3-5f's design, and the SSH agent engine: the agent protocol, the key and its signatures in `ring`, a sign-in signed only on a connection bound to one of the secret's hosts; no caller yet | the `vault` feature in no release build | — |
 | P3-5f-2 | `vault_connect` serving it: `engine: "ssh"`, the Unix socket on Linux and macOS, `SSH_AUTH_SOCK` and `known_hosts` in the answer; OpenSSH's own `ssh` and `sshd`, end to end | device `vault_enabled = false`; per-secret `disabled` | — |
 | P3-5f-3 | the Windows endpoint: a named pipe, its DACL the session's account's, each client's token checked | device `vault_enabled = false` | — |
-| P3-6 | `short-lived`: database users and GitHub App tokens first, then AWS STS and a Kubernetes `TokenRequest` | per provider | — |
+| P3-6a | `short-lived`'s design (§3e "P3-6, `short-lived`, as designed"), and decision 18 | docs only | — |
+| P3-6b-1 | the vault's half: the `dynamic` kind and its providers' fields, checked on write; a dynamic secret leased in `short-lived` alone, answered with its bundle; `vault.providers` | `vault.tenants`; `vault.providers` | — |
+| P3-6b-2 | Postgres users, minted on the device: one per lease, revoked at its end, the expired ones swept at each mint; `vault_exec` and `vault_render` serving a dynamic secret | device `vault_enabled = false`; `vault.providers` | — |
+| P3-6c | GitHub App tokens, minted where decision 18 says | `vault.providers` | — |
+| P3-6d | MySQL, SQL Server and Redis users | `vault.providers` | — |
+| P3-6e | AWS STS, with a stored AWS key until P7's federation | `vault.providers` | — |
+| P3-6f | a Kubernetes `TokenRequest` | `vault.providers` | — |
 | P3-7 | authenticated session SOCKS, `Principal::Session`, `net_forward` and `net_socks` | `vault.tenants` | — |
 | P3-8 | `ssh_run` and `fleet_exec` as tools | the existing SSH and exec gates | — |
 | P3-9 | `roomler connect <handle>` for people (knowhow's `roomler_connect(entity)` waits for P4) | — | — |
@@ -2515,7 +2579,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3-5e-2 | `vault_connect` serving a Kubernetes API server (`docs/vault.md` §19): `engine: "kubernetes"`, an origin and `auth` as for `http`, `basic` refused for it; `auth: "client-cert"` for `kubernetes` and `http`, leasing the secret's `#cert` and `#key`, proven at the call by making a connector with them (the refusal naming no parser's words), then presented in each connection's own TLS over the roots the endpoint read once; the connections served with `Flavor::Kubernetes`; the answer's `kubeconfig` (one cluster whose `server` is the endpoint, one context, one user with no credential); the engine's dead-code allowances gone, `tls::connector` the tests' only | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2530 `95238f1b3` |
 | P3-5f-1 | the SSH agent (`docs/vault.md` §19) and P3-5f's design (§3e "P3-5f, the SSH agent, as designed"), with no caller yet: `vault_proxy::ssh_agent`, one key from the secret's `key` (OpenSSH's own format, unencrypted; Ed25519, or ECDSA on P-256 or P-384) and the hosts from its `host_keys`; `REQUEST_IDENTITIES` the one key under the handle's name, none after a refused binding; `session-bind@openssh.com` taken once and never for forwarding, the host's key one of `host_keys` and its signature over the session identifier checked by `ring` (Ed25519, ECDSA, `rsa-sha2-256` and `-512`); `SIGN_REQUEST` signed only for a sign-in (RFC 4252 §7, `publickey` or `publickey-hostbound-v00@openssh.com`) for the bound session, as the audience's user where it names one; everything else `SSH_AGENT_FAILURE` | the `vault` feature in no release build | **merged** #2536 `a78abf84f` |
 | P3-5f-2 | `vault_connect` serving the SSH agent (`docs/vault.md` §19): `engine: "ssh"`, the upstream `ssh://[user@]host[:port]` (no path, no `:22`; a user in it the one account the key signs in as), `auth`, `ca`, `database` and `auth_source` refused for it; the leases `#key` and `#host_keys`, proven at the call by the agent's own reading; the database endpoint's socket on Linux and macOS, `ssh-agent.sock`, each connection its own agent; no TLS roots read; Windows refused before anything is leased; the answer's `host` the socket, `env` `SSH_AUTH_SOCK`, `uri` the upstream, and `known_hosts` the hosts' keys under its name; `vault_request` asking ahead toward an `ssh://` host; the agent's dead-code allowance gone | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2543 `c9ccfba66` |
-| P3-5f-3 | the SSH agent on Windows (`docs/vault.md` §19): a named pipe, `\\.\pipe\roomler-vault-<id>`, made as the toolbelt pipe is (`pipe_instance` shared) but its DACL the session's account's to open for reading and writing whole (`agent_pipe_sddl`, `GRGW`: Win32-OpenSSH opens an agent with `GENERIC_READ | GENERIC_WRITE`), local clients only, each client's token SID compared with the session's (`pipe_client_sid`), the next instance made before a client is looked at; its name in `host` and `SSH_AUTH_SOCK`; Windows's refusal gone | device `vault_enabled = false`; the `vault` feature in no release build | **in review** |
+| P3-5f-3 | the SSH agent on Windows (`docs/vault.md` §19): a named pipe, `\\.\pipe\roomler-vault-<id>`, made as the toolbelt pipe is (`pipe_instance` shared) but its DACL the session's account's to open for reading and writing whole (`agent_pipe_sddl`, `GRGW`: Win32-OpenSSH opens an agent with `GENERIC_READ | GENERIC_WRITE`), local clients only, each client's token SID compared with the session's (`pipe_client_sid`), the next instance made before a client is looked at; its name in `host` and `SSH_AUTH_SOCK`; Windows's refusal gone | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2549 `d3bdac564` |
+| P3-6a | `short-lived`'s design (§3e "P3-6, `short-lived`, as designed") and decision 18, docs only: the `dynamic` kind, its stored fields the issuer's and its session's fields the minted credential's; a lease of one in `short-lived` alone, answered with a bundle sealed to the device (the issuer's fields where the device mints, the credential where the server does); one credential per lease; revocation where the provider can be told; `vault.providers`; Postgres users minted on the device (the password sent as its SCRAM-SHA-256 verifier, the role commented with its lease and swept by that comment); GitHub App tokens, minted where decision 18 says | docs only | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -3024,6 +3089,23 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     - **Windows:** `proxy` mode only, by a seeded guardrail.
 
     *Confirmed 2026-10-17 by the operator: every position, as recommended. P3-1 may start.*
+18. **Where a GitHub App token is minted** (P3-6c), for the operator to confirm (P3-6a, §3e "P3-6,
+    `short-lived`, as designed"). Nothing before P3-6c depends on the answer: a database user is
+    minted on the device under either one, since only the device reaches the database.
+    - *Recommended: on the server.*
+      - The App's key never leaves the server. That key can mint a token for every repository the
+        App is installed on.
+      - The mint is the server's own record in `vault_audit`, not a device's claim.
+      - The server already reaches GitHub, for sign-in. It dials `api.github.com` alone, so an org
+        names nothing the server would dial.
+      - What it costs: a self-hosted server with no way out to GitHub cannot serve the provider.
+    - *Or: on the device*, the key leased to the daemon as a `proxy` value is:
+      - one path for every provider;
+      - the mint comes from the device's own address, so an org's GitHub IP allow list needs only
+        its devices;
+      - nothing new leaves the server.
+      - What it costs: every device the policy lets lease the App holds its key in daemon memory
+        while the lease lasts.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
