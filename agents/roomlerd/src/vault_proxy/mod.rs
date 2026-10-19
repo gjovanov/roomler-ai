@@ -12,15 +12,20 @@
 //! | [`pg`] | one Postgres session: the client let in by the endpoint, the upstream by SCRAM |
 //! | [`mongo`] | one MongoDB session: the same, by SCRAM in `saslStart` and `saslContinue` (P3-5c-1) |
 //! | [`http`] | one HTTP client connection: each request sent on to one upstream origin, the secret's credential in `Authorization` (P3-5d-1) |
+//! | [`ssh_agent`] | one SSH agent connection: the secret's key, signing a sign-in to one of the secret's hosts and nothing else (P3-5f-1) |
 //!
-//! P3-5b-1 builds these, P3-5c-1 the MongoDB engine and P3-5d-1 the HTTP
-//! one; the endpoint (`hive::vault_connect`) serves them, one session per
-//! connection.
+//! P3-5b-1 builds these, P3-5c-1 the MongoDB engine, P3-5d-1 the HTTP one
+//! and P3-5f-1 the SSH agent; the endpoint (`hive::vault_connect`) serves
+//! them, one session per connection.
 
 pub(crate) mod http;
 pub(crate) mod mongo;
 pub(crate) mod pg;
 pub(crate) mod scram;
+/// P3-5f-1 builds the SSH agent; P3-5f-2's endpoint is its first caller,
+/// until which nothing outside its tests reaches it.
+#[allow(dead_code)]
+pub(crate) mod ssh_agent;
 #[cfg(test)]
 pub(crate) mod testing;
 pub(crate) mod tls;
