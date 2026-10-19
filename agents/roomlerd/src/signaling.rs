@@ -2240,6 +2240,17 @@ async fn connect_once(
                         limit: None,
                     };
                 }
+                // FR-100 P1b — and an in-org answer is signed here, with the
+                // device key the worker never holds, against the offer the
+                // daemon noted before delegating it. Whatever the worker put
+                // in `peer_auth` is replaced. (A Terminate passes untouched.)
+                crate::peer_auth::sign_outbound(
+                    remote_cfg.peer_auth_offers(),
+                    remote_cfg.config_path(),
+                    &cfg.tenant_id,
+                    &cfg.agent_id,
+                    &mut outbound_msg,
+                );
                 if let Err(e) = send_msg(&mut ws, &outbound_msg).await {
                     // A failed control-WS write means the connection is
                     // done — warn-and-continue only deferred the cycle to
@@ -3056,11 +3067,29 @@ async fn handle_server_msg(
         .await;
         return Ok(());
     }
+    // FR-100 P1b — every offer's ask (a nonce) is noted HERE too, ahead of
+    // the delegation below: the daemon signs the answer, whichever process
+    // builds it, against the offer that passed through the daemon. Not in a
+    // GUI worker handling a delegated offer: it holds no key, and the daemon
+    // has already noted this one.
+    if delegated.is_none()
+        && let ServerMsg::SdpOffer {
+            session_id,
+            sdp,
+            peer_auth,
+            ..
+        } = &msg
+    {
+        remote_cfg
+            .peer_auth_offers()
+            .note_offer(*session_id, sdp, peer_auth.as_ref());
+    }
     // …and a session's end ends its binding HERE, for the same reason: a
     // delegated `Terminate` never reaches the arm below. (A no-op for every
-    // session that was not external.)
+    // session that was not external.) FR-100 P1b's notes end with it.
     if let ServerMsg::Terminate { session_id, .. } = &msg {
         crate::extauth::end_session(remote_cfg, *session_id);
+        remote_cfg.peer_auth_offers().forget(*session_id);
     }
 
     // FR-43 P2b — hand a remote-desktop session to the GUI worker, if there is
@@ -3152,6 +3181,16 @@ async fn handle_server_msg(
                     }
                 },
             };
+            // FR-100 P1b — an in-org session's controller, for the device's
+            // signature over the answer. Noted here, in the daemon, because a
+            // request is never delegated: whichever process builds the
+            // answer, the daemon signs it. An outsider's session is bound by
+            // FR-52's MAC instead, and is not noted.
+            if external_consent.is_none() {
+                remote_cfg
+                    .peer_auth_offers()
+                    .note_request(session_id, controller_user_id);
+            }
             // Multi-org — WHICH organization is asking. The server's display
             // name when it sent one; otherwise this loop's own org label,
             // which at least distinguishes secondaries.
@@ -3718,6 +3757,8 @@ async fn handle_server_msg(
             ice_servers,
             // FR-52 P4 — already judged, ahead of the delegation branch.
             extauth_mac: _,
+            // FR-100 P1b — already noted there too, for the answer's signature.
+            peer_auth: _,
         } => {
             info!(%session_id, sdp_len = sdp.len(), "rc:sdp.offer — creating peer");
 
@@ -3976,6 +4017,20 @@ async fn handle_server_msg(
                     return Ok(());
                 }
             };
+            // FR-100 P1b — and an in-org session's answer is signed with this
+            // enrollment's device key when its offer asked (a nonce). Unsigned
+            // otherwise: nothing to sign against, or no key kept. A GUI worker
+            // finds nothing noted here and holds no key, so its answer goes up
+            // unsigned and the daemon signs it on the way out
+            // (`peer_auth::sign_outbound`).
+            let peer_auth = crate::peer_auth::sign_answer(
+                remote_cfg.peer_auth_offers(),
+                remote_cfg.config_path(),
+                tenant_id,
+                &agent_cfg.agent_id,
+                session_id,
+                &answer_sdp,
+            );
 
             // FR-27 follow-up — the session is now established (peer built,
             // answer ready): raise the "Being viewed by …" banner and publish
@@ -4000,6 +4055,7 @@ async fn handle_server_msg(
                     session_id,
                     sdp: answer_sdp,
                     extauth_mac,
+                    peer_auth,
                 },
             )
             .await

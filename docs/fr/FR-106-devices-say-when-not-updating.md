@@ -32,7 +32,7 @@ one install by a person does. The chip is how the operator learns that a person 
   cache in `crate::releases`). Nothing on the server or the device has to change. That matters, because a stuck
   device cannot receive an agent change anyway.
 - The server cannot tell a per-user daemon from a system one for these devices. `desktop.session` is logind's
-  class for the session a viewer would see (`crates/remote_control/src/models.rs:1813-1797`), which reads
+  class for the session a viewer would see (`crates/remote_control/src/models.rs:1827-1797`), which reads
   `user` for a system daemon on a logged-in desktop too. FR-102's install record (`install {method, scope}`)
   exists only for devices enrolled after it shipped. So the Linux tooltip names both remedies.
 
@@ -66,8 +66,8 @@ Pieces (all UI):
 |---|---|
 | `updateStallChip(version, online, os, releases, now)`, a pure function, the credential chip's shape | `ui/src/utils/updateStall.ts` (new), beside `ui/src/utils/credentialExpiry.ts` |
 | the release list, fetched once per session and kept 30 min: about 560 KB, 91 KB gzipped, 64 releases back to 0.4.74 on 2026-10-16. A slim server route would save bytes but adds a route to the composition baseline, so it is not worth it for one admin page | the agents store, `ui/src/stores/agents.ts` |
-| the chip in the table view, after the credential chip | `ui/src/components/admin/AgentsSection.vue:386-388` |
-| the chip in the card view, after the version chip | `ui/src/components/admin/AgentsSection.vue:749-747` |
+| the chip in the table view, after the credential chip | `ui/src/components/admin/AgentsSection.vue:396-388` |
+| the chip in the card view, after the version chip | `ui/src/components/admin/AgentsSection.vue:759-747` |
 
 ## 4. Phases
 

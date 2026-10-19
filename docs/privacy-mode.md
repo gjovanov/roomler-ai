@@ -85,7 +85,7 @@ session's `session_requested` audit row (`privacy_stripped`):
 > password and a name the stranger chose, and is the only one placed to see what that stranger
 > then does. A curtain would hide it from them, the same reason break-glass is refused. The
 > device strips `PRIVACY` again when it admits an outsider's session
-> ([`admit_session`, `extauth.rs:460`](../agents/roomlerd/src/extauth.rs#L460)), together with
+> ([`admit_session`, `extauth.rs:463`](../agents/roomlerd/src/extauth.rs#L463)), together with
 > `RECORD`, so the server's strip is not the only one. No `external_max_permissions` an owner sets
 > lets either back in.
 

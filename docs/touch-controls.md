@@ -194,10 +194,10 @@ sequenceDiagram
 ```
 
 - **The data is the viewer's own preset**, stored as it is: rows of buttons, d-pads and sticks
-  ([`models.rs:5521`](../crates/remote_control/src/models.rs#L5521) `TouchPreset`). P4 adds one action
+  ([`models.rs:5549`](../crates/remote_control/src/models.rs#L5549) `TouchPreset`). P4 adds one action
   beside a chord of keys and a mouse button: a **macro**, a list of steps, each a key or a mouse button
   pressed, released or tapped, then a wait
-  ([`models.rs:5639`](../crates/remote_control/src/models.rs#L5639) `MacroStep`).
+  ([`models.rs:5667`](../crates/remote_control/src/models.rs#L5667) `MacroStep`).
 - **Who:** any member reads them, since every viewer in the org offers them. Writing takes `MANAGE_TENANT`,
   like the org's session policy, because a stored preset runs on every member's viewer
   ([`touch_presets.rs:88`](../crates/modules/remote/src/touch_presets.rs#L88) `list`,
@@ -207,13 +207,13 @@ sequenceDiagram
   is a 404 that leaks nothing
   ([`touch_presets.rs:152`](../crates/modules/remote/src/touch_presets.rs#L152) `update`,
   [`touch_presets.rs:185`](../crates/modules/remote/src/touch_presets.rs#L185) `delete`).
-- **Read strictly** ([`models.rs:5693`](../crates/remote_control/src/models.rs#L5693) `validate`). Each
+- **Read strictly** ([`models.rs:5721`](../crates/remote_control/src/models.rs#L5721) `validate`). Each
   refusal is a 422 with a code, and nothing is stored:
 
   | Refused | Code |
   |---|---|
   | an unknown field at any level, a key past a byte, a malformed body | `invalid_json` |
-  | a key the keyboard path cannot send: only the Keyboard/Keypad page's keys and its eight modifiers ([`models.rs:5668`](../crates/remote_control/src/models.rs#L5668) `touch_key_ok`) | `key_invalid` |
+  | a key the keyboard path cannot send: only the Keyboard/Keypad page's keys and its eight modifiers ([`models.rs:5696`](../crates/remote_control/src/models.rs#L5696) `touch_key_ok`) | `key_invalid` |
   | a name empty, over 48 characters or with a control character | `name_empty`, `name_invalid` |
   | a label over 16 characters, an id over 32 or repeated within the preset | `label_invalid`, `id_invalid`, `id_duplicate` |
   | no controls or more than 24, an empty row or one of more than 12 buttons, a chord of more than 4 keys | `no_controls`, `too_many_controls`, `row_buttons`, `chord_keys` |
@@ -232,7 +232,7 @@ sequenceDiagram
   session connects on a device that offers the controls
   ([`RemoteControl.vue:3316`](../ui/src/views/remote/RemoteControl.vue#L3316) `orgTouchList`). Any member's
   viewer fetches them
-  ([`agents.ts:1453`](../ui/src/stores/agents.ts#L1453) `fetchOrgTouchPresets`). An older server without
+  ([`agents.ts:1459`](../ui/src/stores/agents.ts#L1459) `fetchOrgTouchPresets`). An older server without
   the route, or any error, means none, and the built-ins are offered as before.
 - **Under their own ids.** An org preset is `org:<its server id>`
   ([`touchControls.ts:230`](../ui/src/composables/touchControls.ts#L230) `ORG_PRESET_PREFIX`), so it can
@@ -273,7 +273,7 @@ layout:
 |---|---|---|
 | **Built-in** | nobody: **Copy** makes it a draft of the member's own | the build |
 | **This browser** | the member, with no permission (decision 6, settled as recommended on 2026-10-18) | `localStorage['roomler-rc-touch-presets:<user id>']`, per user ([`touchPresetEdit.ts:251`](../ui/src/composables/touchPresetEdit.ts#L251) `readMyPresets`) |
-| **Your organization** | an org admin (`MANAGE_TENANT`); anyone else sees it read-only and may copy it ([`TouchPresetEditor.vue:399`](../ui/src/components/remote/TouchPresetEditor.vue#L399) `readOnly`) | the server, P4a's routes ([`agents.ts:1472`](../ui/src/stores/agents.ts#L1472) `saveOrgTouchPreset`) |
+| **Your organization** | an org admin (`MANAGE_TENANT`); anyone else sees it read-only and may copy it ([`TouchPresetEditor.vue:399`](../ui/src/components/remote/TouchPresetEditor.vue#L399) `readOnly`) | the server, P4a's routes ([`agents.ts:1478`](../ui/src/stores/agents.ts#L1478) `saveOrgTouchPreset`) |
 
 - **A draft is checked against the server's own rules before it is saved anywhere**
   ([`touchPresetEdit.ts:104`](../ui/src/composables/touchPresetEdit.ts#L104) `validatePreset`), with the

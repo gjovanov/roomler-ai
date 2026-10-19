@@ -76,7 +76,7 @@ Two workflows sit behind the request, and they are not the same feature:
 enforces it: **the last gate is owned by the device and the server cannot write it.**
 `remote_config_enabled` (`crates/agent-core/src/config.rs:212`) is not merely
 defaulted-off — it is *structurally absent* from `DesiredConfig`, and
-`crates/remote_control/src/models.rs:2515` says so in as many words:
+`crates/remote_control/src/models.rs:2543` says so in as many words:
 
 > ⚠️ `remote_config_enabled` is deliberately ABSENT and must never be added.
 
@@ -135,13 +135,13 @@ never consulted, and never leak that they exist.
 | # | Gate | Owner | Mechanism |
 |---|---|---|---|
 | 1 | Org kill-switch | org admin | `TenantSettings.external_rc_enabled`, default `false` — the twin of `remote_exec_enabled` / `remote_ssh_enabled` (`crates/db/src/models/tenant.rs:233`) and deliberately separate from both. Off ⇒ a connect code does not resolve. |
-| 2 | Per-device approval | org admin | `Agent.external_access_policy`, shaped on `PeerRelayPolicy` (`crates/remote_control/src/models.rs:3503`): default closed, set by `MANAGE_AGENTS` + `REMOTE_CONTROL`. Carries a **permission ceiling** (an org may allow external *view* without external *input*) and an optional expiry. |
+| 2 | Per-device approval | org admin | `Agent.external_access_policy`, shaped on `PeerRelayPolicy` (`crates/remote_control/src/models.rs:3531`): default closed, set by `MANAGE_AGENTS` + `REMOTE_CONTROL`. Carries a **permission ceiling** (an org may allow external *view* without external *input*) and an optional expiry. |
 | 3 | Device opt-in | device owner, locally | `external_access_enabled` in the agent's own config, default off, **absent from `DesiredConfig`**. Alongside: `external_consent_mode`, `external_max_permissions`. The refusal that survives a compromised server. |
 | 4 | The password proof | device verifies, outsider proves | §4. The substitute for tenant membership, and the only gate the outsider can satisfy by their own action. |
-| 5 | Host consent | whoever is at the machine | The existing `ConsentMode` path, resolved from `external_consent_mode` rather than `AccessPolicy.consent_mode` (`crates/remote_control/src/models.rs:1367`), defaulting to `Prompt`. |
+| 5 | Host consent | whoever is at the machine | The existing `ConsentMode` path, resolved from `external_consent_mode` rather than `AccessPolicy.consent_mode` (`crates/remote_control/src/models.rs:1381`), defaulting to `Prompt`. |
 
 Gate 5 needs one wire addition: the prompt must say the controller is **outside the
-organization**. `ServerMsg::Request` (`crates/remote_control/src/signaling.rs:2663`)
+organization**. `ServerMsg::Request` (`crates/remote_control/src/signaling.rs:2894`)
 carries `tenant_name` for the multi-org case, which answers *which* org is asking —
 not whether the asker is in one at all. A `controller_scope: external` field is
 additive and serde-defaulted, so older agents keep today's prompt text; a device

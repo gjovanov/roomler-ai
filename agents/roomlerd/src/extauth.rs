@@ -259,10 +259,13 @@ pub fn seal_answer(remote_cfg: &RemoteConfigServices, session_id: ObjectId, sdp:
 /// worker's, relayed up by `delegate::DelegateHost`). `false` = it must not be
 /// sent; the caller ends the session instead.
 pub fn seal_outbound(remote_cfg: &RemoteConfigServices, msg: &mut ClientMsg) -> bool {
+    // `peer_auth` is FR-100's, signed at the same choke point by
+    // `peer_auth::sign_outbound`, which runs after this.
     let ClientMsg::SdpAnswer {
         session_id,
         sdp,
         extauth_mac,
+        ..
     } = msg
     else {
         return true;
@@ -925,6 +928,7 @@ mod imp {
                 session_id: sid,
                 sdp: "v=0".into(),
                 extauth_mac: Some("forged-by-a-worker".into()),
+                peer_auth: None,
             };
             assert!(super::super::seal_outbound(&svc, &mut ordinary));
             assert!(
@@ -956,6 +960,7 @@ mod imp {
                 session_id: sid,
                 sdp: "v=0".into(),
                 extauth_mac: None,
+                peer_auth: None,
             };
             assert!(
                 !super::super::seal_outbound(&svc, &mut ended),
