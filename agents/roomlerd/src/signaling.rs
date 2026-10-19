@@ -1619,6 +1619,7 @@ async fn connect_once(
         crate::vault::on_connected(
             outbound_tx.clone(),
             crate::vault::takes_leases(cfg.vault_enabled, ctx.is_primary),
+            cfg.vault_activity_log,
         );
     }
     // FR-90 — and its Hive state reports: point the supervisor at THIS one,

@@ -8841,6 +8841,10 @@ mod tests {
             // machine: a server that could set it would choose where its own
             // vault's values are opened.
             "vault_enabled",
+            // FR-90 P3-4d-2 — whether the device describes what it does with
+            // its leases: the device's own word about itself, as
+            // `ssh_activity_log` is.
+            "vault_activity_log",
             // FR-99 — whether a controller may cover this screen: a server
             // that could set it could curtain any device it controls.
             "privacy_mode_allowed",

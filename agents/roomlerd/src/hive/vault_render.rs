@@ -302,6 +302,17 @@ pub(crate) async fn call(
         .filter_map(|l| vault.left(l))
         .min()
         .map_or(0, |d| d.as_secs());
+    // P3-4d-2 — the file holds these values: reported where the device's
+    // owner has it report, by its name, never a value.
+    vault.report(crate::vault::Report {
+        session_id: session,
+        fence,
+        kind: roomler_ai_remote_control::vault::VaultActivityKind::Render,
+        lease_ids: leases,
+        target: req.dest.clone(),
+        exit_code: None,
+        timed_out: false,
+    });
     Ok(serde_json::json!({ "path": path.to_string_lossy(), "ttl_s": ttl_s }))
 }
 

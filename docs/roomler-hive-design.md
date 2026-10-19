@@ -956,7 +956,7 @@ field:
 ### 7.3 `ssh` by default, `exec` by exception
 
 `fleet_exec` runs as SYSTEM/root on the target — fleet RPC always uses
-`RunAs::Daemon` (`agents/roomlerd/src/signaling.rs:4358`) and run-as-user is explicitly
+`RunAs::Daemon` (`agents/roomlerd/src/signaling.rs:4359`) and run-as-user is explicitly
 deferred (`docs/fleet-rpc.md:197`). So agents get `ssh_run`, which runs as whatever
 account the **target** maps under SSH's gates and single-use grants, and `fleet_exec`
 only with a policy permit **and** a person's approval on each call. Both keep every gate

@@ -577,6 +577,15 @@ pub struct AgentConfig {
     /// call alone, as whether sessions run here at all is `hive_enabled`'s.
     #[serde(default)]
     pub vault_enabled: bool,
+    /// FR-90 P3-4d-2 — report to the organization what this device does with
+    /// the values its vault leases it: each command a session ran with them
+    /// (the program and how it ended) and each file it wrote (the name),
+    /// never a value. Off by default because it is the DEVICE that decides
+    /// what it says about itself, as `ssh_activity_log` is; the org's record
+    /// of what it released lives in `vault_audit` and does not depend on this
+    /// key. Never pushable.
+    #[serde(default)]
+    pub vault_activity_log: bool,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -2601,6 +2610,7 @@ pub fn test_fixture() -> AgentConfig {
         hive_archive: false,
         hive_store_quota_mib: None,
         vault_enabled: false,
+        vault_activity_log: false,
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,
