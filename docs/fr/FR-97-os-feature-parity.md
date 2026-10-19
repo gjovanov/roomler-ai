@@ -57,6 +57,9 @@
 - P3h's evidence is in (§8): no fleet host lacks systemd-resolved, and a WSL instance bypasses it, so P3h opens
   with reporting that. P3h-1, the report, merged (#2515) and shipped in 0.4.145: red on 0.4.144 (`active` while
   `getent` never reaches the steer), green on its branch and on the 0.4.145 candidate (§8).
+- P3a, the X11 pointer on the cursor channel (read from XFixes, published where the DRM arm's cursor plane goes),
+  merged (#2555): red on 0.4.145, one `cursor:hide` and nothing else; green on its candidate, on a per-user GNOME
+  install over Xorg (§8).
 - P6f needs no build: Windows got its private staging directory with GHSA-r3xj-4wh9-xh2v (0.4.142), and on macOS
   the root update helper's temp directory was measured to be root's own (§3.11, §8).
 - The rest of P2–P7 is open.
@@ -187,7 +190,7 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | R1 | System audio in a session | ✅ WASAPI loopback | ❌ **the default microphone, always**: cpal lists only ALSA devices, so the `.monitor` pick never matched (measured, §8). Since P3c-1 a named device only, else no track and the reason (`audio_source.rs:253`) | ❌ | macOS: no capture backend; since P0c no `opus` either (`encode/caps.rs:700`) ✔. Linux: nothing captures the session's monitor (P3c-2) | P0c, P2a, P3c |
 | R2 | Native consent panel | ✅ | ✅ X11 · ⛔ Wayland → companion | ❌ | Built (`indicator/mac.rs`), not in the release set (`release-agent.yml:2564-2580`) | P2b (D3) |
 | R3 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows (FR-56) | ❌ | `Unavailable::Platform` (`apps/mod.rs:347`); no `apps/macos.rs` | P2c |
-| R4 | Live cursor shape | ✅ | 🟡 the DRM arm's hardware cursor (FR-93 P3c, 0.4.134); X11 ❌; a Wayland compositor draws it into the frames | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`). *P8-2:* the inventory missed the DRM arm (`agents/roomlerd/src/capture/cursor.rs:127-146`) | P3a, P2d |
+| R4 | Live cursor shape | ✅ | ✅ X11 since P3a (XFixes), and the DRM arm's hardware cursor (FR-93 P3c, 0.4.134); a per-user Wayland compositor draws it into the frames | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`). *P8-2:* the inventory missed the DRM arm (`agents/roomlerd/src/capture/cursor.rs:128-152`) | P3a, P2d |
 | R5 | "Host is locked" consent hint | ✅ | ✅ since P3b: advisory, from logind's `LockedHint`, and input passes (`lock_state.rs:331`) | ❌ | `LockState` is always `Unlocked` off Windows (`lock_state.rs:290-311`), on purpose for Linux: the hint never becomes one | P2d, P3b |
 | R6 | Keyboard layout report / switch | ✅ | ❌ | ❌ | Windows-only cap (`caps.rs:1570-1574`) | P2d, P3e |
 | R7 | Match remote display | ✅ | ❌ | ❌ | `display_match.rs:247` | P2d, P3e |
@@ -607,6 +610,13 @@ test of the SIGKILL property itself.
 
 - **P3a, cursor.** On X11, `XFixesGetCursorImage`, wiring the recorder's decoder (`capture/pointer.rs:187-230`) into
   the live channel. On portal and mutter, PipeWire cursor metadata (`SPA_META_Cursor`).
+  - *As built for X11 (#2555):* the capture worker reads XFixes on a connection of its own, on every frame request,
+    and publishes into the slot the DRM arm's cursor plane uses, so the tracker needed no change
+    (`agents/roomlerd/src/capture/x11_cursor.rs`, `docs/linux-capture.md` §2.1). The shape is read on `CursorNotify`,
+    the position by `QueryPointer`; a fully transparent cursor reads as `cursor:hide`; a theme's standard names carry
+    the Windows tracker's CSS keywords. Kill switch `ROOMLERD_X11_CURSOR=0`.
+  - The portal and mutter arms draw the pointer into their frames, so their viewers see the real one already, at the
+    video's latency. Moving them to the metadata stays open.
 - **P3b, lock and sleep** (built). `rc:host_locked` from logind's `LockedHint` for seat0's active session, polled
   every 2 s, **advisory only**. It never becomes a `LockState`: the Windows overlay and input suppression would blank
   a lock screen the viewer can see and stop the keystrokes that unlock it. The message carries `input: "passes"`, so
@@ -928,7 +938,7 @@ model on Windows, so the three agree on what the mode means.
 | **P2d** | macOS lock hint, layout, display-match | per-verb caps | a field Mac | M |
 | **P2e** | macOS clipboard images + RTF | `ROOMLERD_CLIPBOARD_NATIVE=0` | a field Mac | S–M |
 | **P2f** | macOS microphone for recordings | the recording's `mic` option | a field Mac | S–M |
-| **P3a** | Linux cursor shape (X11, then PipeWire) | `ROOMLERD_CURSOR_CHANNEL=0` | the FR-93 lab, Xorg + Wayland | S → M |
+| **P3a** | Linux cursor shape: X11 from XFixes (merged #2555); PipeWire's cursor metadata for the portal and mutter arms stays open | `ROOMLERD_X11_CURSOR=0` | a vmtest Ubuntu cell on Xorg, a per-user install, red on 0.4.145 | S → M |
 | **P3b** | Linux lock hint (advisory, `input: "passes"`) + a logind block inhibitor (FR-55 P3) (built) | `ROOMLERD_LOCK_HINT=0`; `power_policy` | a vmtest Ubuntu guest, red on 0.4.142 | S |
 | **P3c** | Linux audio. *P3c-1*: never a microphone; no `opus` without a named device; `rc:audio-unavailable` says why (built). *P3c-2*: the session's monitor through Pulse's client library, per-user and root (D14, built) | P3c-1: — (a privacy fix; an owner names a device to opt back in); P3c-2: `ROOMLERD_AUDIO_SESSION=0` | a Linux host with a microphone and a sound server, red on 0.4.141 | M |
 | **P3d** | Linux system-install files land as the seat user (merged, #2496). Red on 0.4.143 (`/tmp`, `root:root`), green on its branch and on the 0.4.144 candidate (§8); the root-only tests run under `sudo` in CI | `ROOMLERD_FILES_AS_SEAT_USER=0` | a vmtest Ubuntu system guest, the deployed viewer | M |
@@ -1016,7 +1026,9 @@ one depends on it.
   off; session audio is never a microphone; received files land as the seat user; layout, display-match and image
   sync work on X11; uinput types a German and a French string.
   *(The files clause is field-verified, §8: red on 0.4.143, where an upload landed in `/tmp` as `root:root`; green
-  on P3d's branch and again on the 0.4.144 candidate, in the seat user's `~/Downloads` and owned by them.)*
+  on P3d's branch and again on the 0.4.144 candidate, in the seat user's `~/Downloads` and owned by them. The cursor
+  clause on X11 is field-verified on P3a's candidate, §8: 0.4.145 sent one `cursor:hide` and nothing else, the
+  candidate the shape and its positions; it is checked again on the release.)*
 - [ ] **AC10 (P3g):** a Fedora system install and an arm64 install show the "being viewed" banner and answer a
   consent prompt.
 - [x] **AC11 (P4a–P4d):** Ctrl+Alt+Del reaches a Windows lock screen that requires it; SFTP as `console_user` writes
@@ -1228,3 +1240,4 @@ one depends on it.
 | 2026-10-19 | released 0.4.144's `.pkg` | two throwaway tart Macs on the MacBook (macOS 15), `admin` at the GUI, the root daemon enrolled ephemeral with the overlay, once under `console_user`, once under `named:admin` | 🟢 **AC18, macOS, on the release.** Under both modes: exec `pwd=/Users/admin`, the pty `admin in /Users/admin`, `sftp` in `/Users/admin`, where a relative `put` landed owned `admin staff`. Both VMs were torn down |
 | 2026-10-19 | released 0.4.144, then the P3h-1 candidate (`41c204b08`, a release-profile build with `overlay-l3,overlay-netstack,ssh-server`) | the Linux AC18 guest afterwards, made WSL-shaped on purpose: `/etc/resolv.conf` a plain file naming the guest's upstream, nsswitch Ubuntu's (no `resolve`); each daemon under a fresh ephemeral enrollment with the overlay | 🔴→🟢 **P3h-1.** On the release, `roomler status` said `magicdns vmtest.roomler.ai (active, …)`, while `getent hosts` for the anchor's name returned nothing and `resolvectl query` answered it from `roomler0`: the steer was in place and unasked. On the candidate the same host said `(steered but BYPASSED, …)` and, below, `/etc/resolv.conf asks 10.10.120.1, and nsswitch has no resolve: this host's own lookups never reach the steer`; the daemon warned the same at steer time. The guest was destroyed |
 | 2026-10-19 | the 0.4.145 candidate (release run 39248610025 on `745ddb1e1`): its `.deb` (package `0.4.145-1`) over the served 0.4.144 | a throwaway vmtest Ubuntu 24.04 system guest on zeus, made WSL-shaped as above | 🔴→🟢 **P3h-1 on the release candidate.** 0.4.144: `magicdns vmtest.roomler.ai (active, …)` while `getent` returned nothing. The candidate: `(steered but BYPASSED, …)`, the reason line and the daemon's warning. The guest was destroyed. The published 0.4.145 carries the same binary (`07412c9f…`) |
+| 2026-10-19 | released 0.4.145 (`07412c9f…`), then the P3a candidate (`e1c59bdd…`, a release-profile build of the branch without `ffmpeg-encoder`) | a throwaway vmtest Ubuntu 24.04 cell on zeus, GDM switched to Xorg (GNOME 46, auto-login), a per-user install, each run a fresh ephemeral enrollment; the production viewer (Playwright) tapping its own cursor channel and putting the pointer at (0.25, 0.25), (0.75, 0.6), (0.5, 0.5) of a 1280×800 picture | 🔴→🟢 **P3a.** 0.4.145, twice (`capture: backend=scrap`): one `cursor:hide`, no shape, no position. The candidate: one `cursor:shape` (18×24, `css: default`), no hide, and positions (320, 200), (959, 479), (640, 400), its log saying `capture: the X11 pointer is on the cursor channel (FR-97 P3a) xfixes=5`. The candidate with `ROOMLERD_X11_CURSOR=0`: one `cursor:hide` again, and `the X11 pointer stays off the cursor channel`. The cell was destroyed by name |
