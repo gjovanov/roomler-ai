@@ -400,12 +400,31 @@ struct DaemonVault;
 fn vault_why(e: crate::vault::LeaseError) -> String {
     use crate::vault::LeaseError;
     match e {
+        // P3-4e-2 — what the model needs to act on: a person said no, which
+        // asking again will not change.
+        LeaseError::Refused(word) if word == "denied" => {
+            "the vault refused: denied (its policies do not allow this use, or a driver of this \
+             session said no to it)"
+                .into()
+        }
         LeaseError::Refused(word) => format!("the vault refused: {word}"),
+        // The tool waited the card's whole window ([`APPROVAL_WINDOW`]).
+        LeaseError::AwaitingApproval(id) => format!(
+            "this use needs a person's approval, and nobody answered its card in the session's \
+             room in time (approval {id}); ask again once a driver is there to answer a new card"
+        ),
         LeaseError::NotConnected => "this device is not connected to its server".into(),
         LeaseError::NoAnswer => "the vault did not answer".into(),
         LeaseError::Unopenable => "the vault's answer did not open".into(),
     }
 }
+
+/// P3-4e-2 — how long a vault tool waits for a person to answer a card the
+/// vault posted for its lease: the card's own window, after which it ends.
+#[cfg(feature = "vault")]
+pub(crate) const APPROVAL_WINDOW: Duration = Duration::from_secs(
+    roomler_ai_remote_control::vault::lease_limits::APPROVAL_ANSWER_SECS as u64,
+);
 
 /// P3-4c-3 — a lease ask for `vault_request`, or the query that finds what
 /// one leased.
@@ -458,17 +477,22 @@ impl VaultTools for DaemonVault {
         audience: &str,
         ttl_secs: u32,
     ) -> Result<String, String> {
+        // P3-4e-2 — through a card the vault posts, if its policies ask for
+        // a person's yes: the call waits for the answer.
         let info = crate::vault::CLIENT
-            .request(crate::vault::LeaseAsk {
-                session_id: session,
-                fence,
-                secret: handle.secret.clone(),
-                field: handle.field.clone(),
-                mode: mode.into(),
-                audience: audience.into(),
-                ttl_secs,
-                ahead: false,
-            })
+            .request_until_approved(
+                crate::vault::LeaseAsk {
+                    session_id: session,
+                    fence,
+                    secret: handle.secret.clone(),
+                    field: handle.field.clone(),
+                    mode: mode.into(),
+                    audience: audience.into(),
+                    ttl_secs,
+                    ahead: false,
+                },
+                APPROVAL_WINDOW,
+            )
             .await
             .map_err(vault_why)?;
         Ok(info.lease_id)
@@ -484,7 +508,10 @@ impl VaultTools for DaemonVault {
         ttl_secs: u32,
     ) -> Result<String, String> {
         let info = crate::vault::CLIENT
-            .request(ahead_ask(session, fence, handle, mode, audience, ttl_secs))
+            .request_until_approved(
+                ahead_ask(session, fence, handle, mode, audience, ttl_secs),
+                APPROVAL_WINDOW,
+            )
             .await
             .map_err(vault_why)?;
         Ok(info.lease_id)
