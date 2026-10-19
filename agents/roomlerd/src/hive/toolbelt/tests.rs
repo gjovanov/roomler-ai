@@ -2429,8 +2429,11 @@ async fn a_certificate_tls_cannot_present_is_refused_at_the_call() {
 
 /// P3-5f-2 — one message to the SSH agent on `s`, and its answer: the
 /// agent protocol's framing, a length and then the message.
-#[cfg(all(feature = "vault", unix))]
-async fn agent_ask(s: &mut tokio::net::UnixStream, message: &[u8]) -> Vec<u8> {
+#[cfg(feature = "vault")]
+async fn agent_ask<S>(s: &mut S, message: &[u8]) -> Vec<u8>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::AsyncReadExt;
     let mut framed = u32::try_from(message.len()).unwrap().to_be_bytes().to_vec();
     framed.extend_from_slice(message);
@@ -2445,30 +2448,14 @@ async fn agent_ask(s: &mut tokio::net::UnixStream, message: &[u8]) -> Vec<u8> {
     answer
 }
 
-/// P3-5f-2 — `vault_connect` serves an SSH agent. It leases the secret's
-/// `key` and `host_keys` toward the upstream, and answers the agent's socket
-/// in `SSH_AUTH_SOCK` and the hosts' keys as `known_hosts`, with no key in
-/// the answer. The agent lists the one key, under the secret's name, takes a
-/// binding to the secret's host, and signs a sign-in as the audience's user
-/// alone. When a lease goes, the socket goes with every connection it held.
-#[cfg(all(feature = "vault", unix))]
-#[tokio::test]
-async fn vault_connect_serves_an_ssh_agent() {
-    use tokio::io::AsyncReadExt;
-
-    use crate::vault_proxy::testing::{openssh_key, ssh_host, strings};
-    let (pem, public) = openssh_key();
-    let (host_pair, host_key, host) = ssh_host();
-    let dir = tempfile::tempdir().unwrap();
-    let (b, vault, sid) = exec_belt(
-        dir.path(),
-        &[
-            ("ssh/deploy#key", pem.as_bytes()),
-            ("ssh/deploy#host_keys", host.as_bytes()),
-        ],
-    );
+/// P3-5f-2 — a `vault_connect` call for an SSH agent toward
+/// `ssh://git@build.internal:2222`, the secret's `pem` and `host` in the
+/// vault: the answer, checked for what every system answers alike, and the
+/// leases it asked for.
+#[cfg(feature = "vault")]
+async fn ssh_answer(b: &Belt, vault: &FakeVault, sid: ObjectId, pem: &str, host: &str) -> Value {
     let upstream = "ssh://git@build.internal:2222";
-    let mut c = Client::connect(&b).await;
+    let mut c = Client::connect(b).await;
     let answer = connect_answer(
         &mut c,
         1,
@@ -2485,9 +2472,7 @@ async fn vault_connect_serves_an_ssh_agent() {
             "the answer holds no piece of the key"
         );
     }
-    let socket = answer["host"].as_str().unwrap().to_string();
-    assert!(socket.ends_with("/ssh-agent.sock"), "{answer}");
-    assert_eq!(answer["env"]["SSH_AUTH_SOCK"], socket.as_str());
+    assert_eq!(answer["env"]["SSH_AUTH_SOCK"], answer["host"], "{answer}");
     assert_eq!(answer["uri"], upstream);
     assert_eq!(answer["port"], Value::Null);
     assert_eq!(
@@ -2506,41 +2491,83 @@ async fn vault_connect_serves_an_ssh_agent() {
         vault.asked(),
         [lease("ssh/deploy#key"), lease("ssh/deploy#host_keys")]
     );
-    // The agent lists the one key, under the secret's name.
-    let mut s = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    answer
+}
+
+/// P3-5f-2 — what the agent answers on `s`: the one key, under the secret's
+/// name; a binding to the secret's host, taken; a sign-in as the audience's
+/// user signed, and as another refused, so the upstream's user reached it.
+#[cfg(feature = "vault")]
+async fn the_agent_signs_in_as_git_alone<S>(
+    s: &mut S,
+    public: &[u8],
+    host_pair: &ring::signature::Ed25519KeyPair,
+    host_key: &[u8],
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use crate::vault_proxy::testing::strings;
     let mut listed = vec![12, 0, 0, 0, 1];
     listed.extend_from_slice(&u32::try_from(public.len()).unwrap().to_be_bytes());
-    listed.extend_from_slice(&public);
+    listed.extend_from_slice(public);
     listed.extend_from_slice(&10u32.to_be_bytes());
     listed.extend_from_slice(b"ssh/deploy");
-    assert_eq!(agent_ask(&mut s, &[11]).await, listed);
+    assert_eq!(agent_ask(s, &[11]).await, listed);
     // A binding to the secret's host, as `ssh` sends one after its key
     // exchange: taken.
     let session_id: [u8; 32] = rand::random();
     let mut bind = vec![27];
     bind.extend(strings(&[
         b"session-bind@openssh.com",
-        &host_key,
+        host_key,
         &session_id,
         &strings(&[b"ssh-ed25519", host_pair.sign(&session_id).as_ref()]),
     ]));
     bind.push(0);
-    assert_eq!(agent_ask(&mut s, &bind).await, [6], "the binding taken");
-    // A sign-in as the audience's user is signed; as another, refused: the
-    // upstream's user reached the agent.
+    assert_eq!(agent_ask(s, &bind).await, [6], "the binding taken");
     let sign = |user: &[u8]| {
         let mut data = strings(&[&session_id]);
         data.push(50);
         data.extend(strings(&[user, b"ssh-connection", b"publickey"]));
         data.push(1);
-        data.extend(strings(&[b"ssh-ed25519", &public]));
+        data.extend(strings(&[b"ssh-ed25519", public]));
         let mut m = vec![13];
-        m.extend(strings(&[&public, &data]));
+        m.extend(strings(&[public, &data]));
         m.extend_from_slice(&0u32.to_be_bytes());
         m
     };
-    assert_eq!(agent_ask(&mut s, &sign(b"root")).await, [5], "as root");
-    assert_eq!(agent_ask(&mut s, &sign(b"git")).await[0], 14, "as git");
+    assert_eq!(agent_ask(s, &sign(b"root")).await, [5], "as root");
+    assert_eq!(agent_ask(s, &sign(b"git")).await[0], 14, "as git");
+}
+
+/// P3-5f-2 — `vault_connect` serves an SSH agent on a socket. It leases the
+/// secret's `key` and `host_keys` toward the upstream, and answers the
+/// agent's socket in `SSH_AUTH_SOCK` and the hosts' keys as `known_hosts`,
+/// with no key in the answer. The agent lists the one key, under the
+/// secret's name, takes a binding to the secret's host, and signs a sign-in
+/// as the audience's user alone. When a lease goes, the socket goes with
+/// every connection it held.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn vault_connect_serves_an_ssh_agent() {
+    use tokio::io::AsyncReadExt;
+
+    use crate::vault_proxy::testing::{openssh_key, ssh_host};
+    let (pem, public) = openssh_key();
+    let (host_pair, host_key, host) = ssh_host();
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, sid) = exec_belt(
+        dir.path(),
+        &[
+            ("ssh/deploy#key", pem.as_bytes()),
+            ("ssh/deploy#host_keys", host.as_bytes()),
+        ],
+    );
+    let answer = ssh_answer(&b, &vault, sid, &pem, &host).await;
+    let socket = answer["host"].as_str().unwrap().to_string();
+    assert!(socket.ends_with("/ssh-agent.sock"), "{answer}");
+    let mut s = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    the_agent_signs_in_as_git_alone(&mut s, &public, &host_pair, &host_key).await;
     // A lease let go closes the agent, and the connection it held.
     vault.release(&["L0".to_string()]);
     let mut rest = Vec::new();
@@ -2552,15 +2579,135 @@ async fn vault_connect_serves_an_ssh_agent() {
     );
 }
 
+/// P3-5f-3 — on Windows the agent is a named pipe, `\\.\pipe\roomler-vault-*`,
+/// as Win32-OpenSSH dials `SSH_AUTH_SOCK`: the same answer, the same agent,
+/// and the pipe gone, with every connection it held, when a lease goes.
+#[cfg(all(feature = "vault", windows))]
+#[tokio::test]
+async fn vault_connect_serves_an_ssh_agent_on_a_named_pipe() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    use crate::vault_proxy::testing::{openssh_key, ssh_host};
+    let (pem, public) = openssh_key();
+    let (host_pair, host_key, host) = ssh_host();
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, sid) = http_belt(
+        dir.path(),
+        &[
+            ("ssh/deploy#key", pem.as_bytes()),
+            ("ssh/deploy#host_keys", host.as_bytes()),
+        ],
+    );
+    let answer = ssh_answer(&b, &vault, sid, &pem, &host).await;
+    let name = answer["host"].as_str().unwrap().to_string();
+    assert!(name.starts_with(r"\\.\pipe\roomler-vault-"), "{answer}");
+    let mut s = ClientOptions::new().open(&name).unwrap();
+    the_agent_signs_in_as_git_alone(&mut s, &public, &host_pair, &host_key).await;
+    // A second connection, while the first holds its instance, finds the
+    // next one listening (busy only for as long as it takes to make it).
+    let mut t = None;
+    for _ in 0..50 {
+        match ClientOptions::new().open(&name) {
+            Ok(c) => {
+                t = Some(c);
+                break;
+            }
+            Err(e) if e.raw_os_error() == Some(231) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("a second connection: {e}"),
+        }
+    }
+    let mut t = t.expect("a second connection within 5 s");
+    assert_eq!(
+        agent_ask(&mut t, &[11]).await[0],
+        12,
+        "the key listed to it too"
+    );
+    // A lease let go closes the agent, and the connections it held.
+    vault.release(&["L0".to_string()]);
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(WAIT, s.read_to_end(&mut rest)).await;
+    assert!(ended.is_ok(), "the agent's connection ended with its lease");
+    let ended = tokio::time::timeout(WAIT, t.read_to_end(&mut rest)).await;
+    assert!(ended.is_ok(), "and the second one");
+    // And the pipe with it: no instance left, so its name is gone. (A pipe
+    // whose every instance is busy is another error: never taken for gone.)
+    let mut gone = false;
+    for _ in 0..50 {
+        match ClientOptions::new().open(&name) {
+            Err(e) if e.raw_os_error() == Some(2) => {
+                gone = true;
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    assert!(gone, "the pipe went with its lease");
+}
+
+/// P3-5f-3 — Windows' own `ssh.exe` (Win32-OpenSSH, 8.9 or later, so it
+/// binds) signs in through `vault_connect`'s agent pipe with nothing but the
+/// answer: `SSH_AUTH_SOCK`, and `known_hosts` written to a file. The host is
+/// russh, in the test, and lets in only the secret's key.
+#[cfg(all(feature = "vault", feature = "ssh-server", windows))]
+#[tokio::test]
+async fn win32_openssh_signs_in_through_vault_connect() {
+    use russh::keys::ssh_key;
+
+    use crate::vault_proxy::testing::{WIN32_SSH, openssh_key, present, run_win32_ssh, sshd};
+    if !present(WIN32_SSH) {
+        return;
+    }
+    let host_key =
+        ssh_key::PrivateKey::from_openssh(crate::ssh::generate_host_key().unwrap()).unwrap();
+    let host_line = host_key.public_key().to_openssh().unwrap();
+    let (pem, public) = openssh_key();
+    let port = sshd(host_key, ssh_key::PublicKey::from_bytes(&public).unwrap()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (b, _vault, _sid) = http_belt(
+        dir.path(),
+        &[
+            ("ssh/deploy#key", pem.as_bytes()),
+            ("ssh/deploy#host_keys", host_line.as_bytes()),
+        ],
+    );
+    let mut c = Client::connect(&b).await;
+    let answer = connect_answer(
+        &mut c,
+        1,
+        json!({
+            "handle": "ssh/deploy",
+            "engine": "ssh",
+            "upstream": format!("ssh://git@127.0.0.1:{port}"),
+        }),
+    )
+    .await
+    .unwrap();
+    let known_hosts = dir.path().join("known_hosts");
+    std::fs::write(&known_hosts, answer["known_hosts"].as_str().unwrap()).unwrap();
+    let empty = dir.path().join("empty_config");
+    std::fs::write(&empty, "").unwrap();
+    let agent = answer["env"]["SSH_AUTH_SOCK"].as_str().unwrap();
+    let out = run_win32_ssh(agent, port, &known_hosts, &empty).await;
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{log}");
+    assert!(
+        log.contains("bound agent to hostkey"),
+        "ssh.exe bound the agent: {log}"
+    );
+}
+
 /// P3-5f-2 — a key the agent cannot sign with is refused at the call, and
 /// its leases let go; the refusal names no byte of the value.
-#[cfg(all(feature = "vault", unix))]
+#[cfg(feature = "vault")]
 #[tokio::test]
 async fn an_ssh_key_the_agent_cannot_sign_with_is_refused_at_the_call() {
     use crate::vault_proxy::testing::{made, ssh_host_line};
     let (key, host) = (made(), ssh_host_line());
     let dir = tempfile::tempdir().unwrap();
-    let (b, vault, _sid) = exec_belt(
+    let (b, vault, _sid) = http_belt(
         dir.path(),
         &[
             ("ssh/deploy#key", key.as_bytes()),
@@ -2638,25 +2785,6 @@ async fn openssh_signs_in_through_vault_connect() {
         log.contains("bound agent to hostkey"),
         "ssh bound the agent: {log}"
     );
-}
-
-/// P3-5f-2 — Windows serves no SSH agent yet: the call is refused before
-/// anything is leased.
-#[cfg(all(feature = "vault", windows))]
-#[tokio::test]
-async fn vault_connect_serves_no_ssh_agent_on_windows_yet() {
-    let dir = tempfile::tempdir().unwrap();
-    let (b, vault, _sid) = http_belt(dir.path(), &[]);
-    let mut c = Client::connect(&b).await;
-    let refused = connect_answer(
-        &mut c,
-        1,
-        json!({"handle": "ssh/deploy", "engine": "ssh", "upstream": "ssh://git@github.com"}),
-    )
-    .await
-    .unwrap_err();
-    assert!(refused.contains("Windows serves none yet"), "{refused}");
-    assert!(vault.asked().is_empty(), "nothing leased");
 }
 
 /// P3-5d-2 — a value `Authorization` cannot carry is refused at the call,

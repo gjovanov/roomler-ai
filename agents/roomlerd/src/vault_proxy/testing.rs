@@ -874,9 +874,7 @@ impl KeyFile {
 }
 
 /// P3-5f-2 — an Ed25519 key made for the test, as a secret's `key` holds
-/// one, and its public half as SSH writes it. Unix: its tests serve the
-/// agent on a socket, which Windows does not.
-#[cfg(unix)]
+/// one, and its public half as SSH writes it.
 pub(crate) fn openssh_key() -> (String, Vec<u8>) {
     use ring::signature::KeyPair as _;
     let seed: [u8; 32] = rand::random();
@@ -909,12 +907,12 @@ pub(crate) fn present(program: &str) -> bool {
 
 /// P3-5f — an SSH host for the tests (russh): it lets `git` in with one key,
 /// and answers any command with exit status 0.
-#[cfg(all(unix, feature = "ssh-server"))]
+#[cfg(feature = "ssh-server")]
 pub(crate) struct Sshd {
     allowed: russh::keys::ssh_key::PublicKey,
 }
 
-#[cfg(all(unix, feature = "ssh-server"))]
+#[cfg(feature = "ssh-server")]
 impl russh::server::Handler for Sshd {
     type Error = russh::Error;
 
@@ -958,7 +956,7 @@ impl russh::server::Handler for Sshd {
 }
 
 /// P3-5f — serve [`Sshd`] on a loopback port, with `host_key`: the port.
-#[cfg(all(unix, feature = "ssh-server"))]
+#[cfg(feature = "ssh-server")]
 pub(crate) async fn sshd(
     host_key: russh::keys::ssh_key::PrivateKey,
     allowed: russh::keys::ssh_key::PublicKey,
@@ -1024,10 +1022,52 @@ pub(crate) async fn run_ssh(
         .unwrap()
 }
 
+/// P3-5f-3 — Windows' own `ssh.exe`, Win32-OpenSSH in System32 (9.5 on this
+/// machine and on GitHub's runners): the `ssh` a Windows session has.
+#[cfg(all(windows, feature = "ssh-server"))]
+pub(crate) const WIN32_SSH: &str = r"C:\Windows\System32\OpenSSH\ssh.exe";
+
+/// P3-5f-3 — [`WIN32_SSH`] to `git@127.0.0.1:<port>`, `agent` its agent's
+/// pipe in `SSH_AUTH_SOCK`, checking the host by `known_hosts` alone, with
+/// `empty` (an empty file) for its configuration. Paths go with forward
+/// slashes, which Win32-OpenSSH takes and its option parser cannot misread as
+/// escapes. `-v`, so its log says whether it bound the agent.
+#[cfg(all(windows, feature = "ssh-server"))]
+pub(crate) async fn run_win32_ssh(
+    agent: &str,
+    port: u16,
+    known_hosts: &std::path::Path,
+    empty: &std::path::Path,
+) -> std::process::Output {
+    let slashed = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
+    let ssh = tokio::process::Command::new(WIN32_SSH)
+        .arg("-v")
+        .arg("-F")
+        .arg(slashed(empty))
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "PreferredAuthentications=publickey",
+        ])
+        .arg("-o")
+        .arg(format!("GlobalKnownHostsFile={}", slashed(empty)))
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", slashed(known_hosts)))
+        .args(["-p", &port.to_string(), "git@127.0.0.1", "true"])
+        .env("SSH_AUTH_SOCK", agent)
+        .output();
+    tokio::time::timeout(Duration::from_secs(30), ssh)
+        .await
+        .expect("ssh.exe within 30 s")
+        .unwrap()
+}
+
 /// P3-5f-2 — an SSH host made for the test: its key pair, its key as SSH
 /// writes it, and its line as a secret's `host_keys` names it,
-/// `ssh-ed25519 <base64>`. Unix, as [`openssh_key`].
-#[cfg(unix)]
+/// `ssh-ed25519 <base64>`.
 pub(crate) fn ssh_host() -> (ring::signature::Ed25519KeyPair, Vec<u8>, String) {
     use base64::Engine as _;
     use ring::signature::KeyPair as _;
@@ -1042,7 +1082,6 @@ pub(crate) fn ssh_host() -> (ring::signature::Ed25519KeyPair, Vec<u8>, String) {
 }
 
 /// P3-5f-2 — an SSH host's key line made for the test, its pair let go.
-#[cfg(unix)]
 pub(crate) fn ssh_host_line() -> String {
     ssh_host().2
 }

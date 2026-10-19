@@ -10,7 +10,7 @@
 //! |---|---|
 //! | the call | `handle` (a structured secret, by its path or this org's RRN, with no `#field`), `engine` (`postgres`, from P3-5c-2 `mongodb`, from P3-5d-2 `http`, from P3-5e-2 `kubernetes`, from P3-5f-2 `ssh`), `upstream` (`host:port` for a database, an origin `https://host[:port]` for `http` and `kubernetes`, `ssh://[user@]host[:port]` for `ssh`, exactly as the secret's `audiences` names it), `auth` (`http`'s and `kubernetes`'s: `basic`, `bearer` or `client-cert`), `database` (optional), `ca` (optional: a secret whose value is the upstream's CA, PEM), `auth_source` (MongoDB's: the database the user is defined in, default `admin`), `ttl_s` (30 to 900, default 300) |
 //! | the leases | the secret's `user` and `password` (for `bearer`, its `token`; for `client-cert`, its `cert` and `key`; for `ssh`, its `key` and `host_keys`), and `ca`'s, each in `proxy` mode toward the upstream: the vault's `proxy-only-named-audiences` refuses an upstream the secret does not name, recorded. A lease asked for ahead toward the same upstream is taken as it is |
-//! | the endpoint | a database's on Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, which a Postgres client dials as `host=<that directory>`, or `…/mongodb-27017.sock`, which a MongoDB client dials by its path; (P3-5f-2) an SSH agent's, `…/ssh-agent.sock`, named in `SSH_AUTH_SOCK`: each directory the daemon's own (`0711`), the socket handed to the session's account (`0600`), and each connection's peer uid checked again. Every database endpoint on Windows (P3-5b-4), and an HTTP one everywhere (P3-5d-2): `127.0.0.1` on a port the system picks, each connection's account read from the system's table of connections and served only if it is the session's. No SSH agent on Windows until P3-5f-3 |
+//! | the endpoint | a database's on Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, which a Postgres client dials as `host=<that directory>`, or `…/mongodb-27017.sock`, which a MongoDB client dials by its path; (P3-5f-2) an SSH agent's, `…/ssh-agent.sock`, named in `SSH_AUTH_SOCK`: each directory the daemon's own (`0711`), the socket handed to the session's account (`0600`), and each connection's peer uid checked again. Every database endpoint on Windows (P3-5b-4), and an HTTP one everywhere (P3-5d-2): `127.0.0.1` on a port the system picks, each connection's account read from the system's table of connections and served only if it is the session's. An SSH agent on Windows (P3-5f-3): a named pipe, `\\.\pipe\roomler-vault-<id>`, its DACL the session's account's to open as Win32-OpenSSH does, each connection's account read from its token by SID |
 //! | a connection | the call's engine, [`crate::vault_proxy::pg`], [`crate::vault_proxy::mongo`], [`crate::vault_proxy::http`] or [`crate::vault_proxy::ssh_agent`]: the client never authenticates; the upstream, by SCRAM-SHA-256 or by `Authorization` or a client certificate inside verified TLS, with the values read from the leases as each connection starts. An agent relays nothing: it signs the session's own `ssh` in to the host |
 //! | its life | closed, with every connection it holds, when its first lease is let go: its expiry, `rc:vault.revoke`, the run's end; every one an earlier process left, at the daemon's start |
 //!
@@ -1095,17 +1095,6 @@ mod endpoint {
         if req.engine.is_http() {
             loopback::identifies()?;
         }
-        // P3-5f-2 — an agent is a Unix socket: Windows serves one from
-        // P3-5f-3, as a named pipe, and until then refuses before anything is
-        // leased.
-        #[cfg(windows)]
-        if req.engine == Engine::Ssh {
-            return Err(
-                "an ssh endpoint is an agent's socket, which this device serves on Linux and macOS: \
-                 Windows serves none yet"
-                    .into(),
-            );
-        }
         let slot = Slot::take(session, fence).ok_or_else(|| {
             format!("this session holds {MAX_ENDPOINTS} endpoints already: let one end first")
         })?;
@@ -1238,11 +1227,13 @@ mod endpoint {
                 let dial = bound.dial(req.engine, req.database.as_deref(), &req.upstream);
                 start(bound, dial, String::new(), &req, handover)?
             }
-            // Refused before anything was leased, above; and were it not, the
-            // leases the call took are let go as `held` drops.
+            // P3-5f-3 — Windows: a named pipe, which Win32-OpenSSH dials as
+            // `SSH_AUTH_SOCK` names it.
             #[cfg(windows)]
             Engine::Ssh => {
-                return Err("an ssh endpoint is an agent's socket: Windows serves none yet".into());
+                let bound = pipe::bind(&at)?;
+                let dial = bound.dial(&req.upstream);
+                start(bound, dial, String::new(), &req, handover)?
             }
         };
         // Handed to the endpoint, which lets them go when it closes.
@@ -1630,6 +1621,107 @@ mod endpoint {
                     let _ = std::fs::remove_dir_all(&dir);
                     Err(e)
                 }
+            }
+        }
+    }
+
+    /// P3-5f-3 — Windows: a named pipe for an SSH agent, which Win32-OpenSSH
+    /// dials as `SSH_AUTH_SOCK` names it. Its DACL lets the session's account
+    /// open it as Win32-OpenSSH opens an agent, for reading and writing whole
+    /// ([`crate::hive_win::agent_pipe_sddl`]); local clients only; and each
+    /// connection's account is read from its token by SID and served only if
+    /// it is the session's.
+    #[cfg(windows)]
+    pub(super) mod pipe {
+        use std::os::windows::io::AsRawHandle;
+
+        use serde_json::json;
+        use tokio::net::windows::named_pipe::NamedPipeServer;
+
+        use super::super::super::toolbelt::pipe_instance;
+        use super::{At, Dial, Place};
+
+        /// A bound endpoint: the pipe's name and grants, the instance that
+        /// listens next, and the one SID a connection is taken from.
+        pub(crate) struct Bound {
+            name: String,
+            sddl: String,
+            next: tokio::sync::Mutex<NamedPipeServer>,
+            peer: String,
+        }
+
+        impl Place for Bound {
+            type Stream = NamedPipeServer;
+
+            async fn accept(&self) -> std::io::Result<NamedPipeServer> {
+                let mut next = self.next.lock().await;
+                if let Err(e) = next.connect().await {
+                    // An instance a client failed on is not listened on again.
+                    *next = pipe_instance(&self.name, &self.sddl, false)?;
+                    return Err(e);
+                }
+                // The next instance before this client is looked at, so a
+                // second connection always finds one listening.
+                let fresh = pipe_instance(&self.name, &self.sddl, false)?;
+                Ok(std::mem::replace(&mut *next, fresh))
+            }
+
+            /// Whether a connection comes from the session's account.
+            fn admits(&self, stream: &NamedPipeServer) -> Result<(), String> {
+                match crate::hive_win::pipe_client_sid(stream.as_raw_handle() as _) {
+                    Ok(sid) if sid == self.peer => Ok(()),
+                    Ok(sid) => Err(format!("SID {sid}")),
+                    Err(e) => Err(format!("a peer that could not be identified: {e}")),
+                }
+            }
+
+            /// Close the pipe: its listening instance goes with it, and the
+            /// name with its last instance.
+            fn close(self) {}
+        }
+
+        impl Bound {
+            /// The session's own `ssh` dials the upstream itself; the pipe
+            /// is its agent.
+            pub(crate) fn dial(&self, upstream: &str) -> Dial {
+                let mut env = serde_json::Map::new();
+                env.insert("SSH_AUTH_SOCK".into(), json!(self.name));
+                Dial {
+                    host: self.name.clone(),
+                    port: None,
+                    uri: upstream.to_string(),
+                    env,
+                }
+            }
+        }
+
+        /// A new endpoint's pipe, `\\.\pipe\roomler-vault-<id>`: its first
+        /// instance made now, so the name is the daemon's before the session
+        /// is told it.
+        pub(crate) fn bind(at: &At<'_>) -> Result<Bound, String> {
+            bind_as(at.0, at.0)
+        }
+
+        /// The pipe under `grantee`'s grants, admitting `peer`'s
+        /// connections: one and the same account, but for a test that
+        /// proves the comparison.
+        pub(crate) fn bind_as(grantee: &str, peer: &str) -> Result<Bound, String> {
+            let name = format!(r"\\.\pipe\roomler-vault-{:016x}", rand::random::<u64>());
+            let sddl = crate::hive_win::agent_pipe_sddl(grantee);
+            let first = pipe_instance(&name, &sddl, true).map_err(|e| format!("{name}: {e}"))?;
+            Ok(Bound {
+                name,
+                sddl,
+                next: tokio::sync::Mutex::new(first),
+                peer: peer.to_string(),
+            })
+        }
+
+        #[cfg(test)]
+        impl Bound {
+            /// The pipe's name.
+            pub(crate) fn name(&self) -> &str {
+                &self.name
             }
         }
     }
