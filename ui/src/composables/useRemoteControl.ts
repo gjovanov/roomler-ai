@@ -353,6 +353,34 @@ export function readyRecoveryAction(
   return hasRetryArgs ? 'reschedule' : 'fail'
 }
 
+/** What an inbound `rc:terminate` does, once it is known to be this session's. */
+export type TerminateAction = 'keep-error' | 'reconnect' | 'close'
+
+/**
+ * Decision for an inbound `rc:terminate` that passed the session gate (a
+ * `reconnecting` page has already ignored it). Pure for tests.
+ *
+ * - `keep-error`: this page already failed the session. Only `failWith` sets
+ *   `error`, and it has torn everything down, so the terminate (typically the
+ *   server's echo of the one the failing path sent) has nothing left to end.
+ *   Turning the error into a plain `closed` would hide the error view, which is
+ *   where the person reads why and where FR-100's "Trust the new key and
+ *   connect" lives; field-caught on prod 2026-10-19, the button never showed.
+ * - `reconnect`: an involuntary end, with the original request to replay.
+ * - `close`: everything else; deliberate endings stay terminal.
+ */
+export function terminateAction(args: {
+  phase: RcPhase
+  retryable: boolean
+  canReplay: boolean
+}): TerminateAction {
+  if (args.phase === 'error') return 'keep-error'
+  if (args.retryable && args.canReplay && args.phase !== 'idle' && args.phase !== 'closed') {
+    return 'reconnect'
+  }
+  return 'close'
+}
+
 export function isRetryableRcErrorCode(code: unknown): boolean {
   return code === 'agent_busy' || code === 'agent_offline' || code === 'session_not_found'
 }
@@ -8233,14 +8261,15 @@ export function useRemoteControl(
       // Involuntary endings (agent WS displacement Ã¢ÂÂ the classic
       // "host joined a VPN" symptom Ã¢ÂÂ or a transient agent error)
       // auto-re-create the session instead of dumping the operator
-      // to a dead viewer. Deliberate endings stay terminal.
-      if (
-        isRetryableTerminateReason(msg.reason, msg.limit)
-        && lastConnectArgs
-        && phase.value !== 'idle'
-        && phase.value !== 'closed'
-        && phase.value !== 'error'
-      ) {
+      // to a dead viewer. Deliberate endings stay terminal. And a session
+      // this page already failed keeps its error (`terminateAction`).
+      const action = terminateAction({
+        phase: phase.value,
+        retryable: isRetryableTerminateReason(msg.reason, msg.limit),
+        canReplay: !!lastConnectArgs,
+      })
+      if (action === 'keep-error') return
+      if (action === 'reconnect') {
         console.info('[rc] session ended (', msg.reason, ') Ã¢ÂÂ auto-reconnecting')
         // Server already ended the session Ã¢ÂÂ don't send a redundant
         // terminate for it.
