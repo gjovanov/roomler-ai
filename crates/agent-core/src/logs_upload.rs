@@ -17,6 +17,9 @@
 //!   diagnostic data; the rolling on-disk file logs retain everything.
 //! - 401 / 403 from server → batch dropped, longer backoff (likely
 //!   JWT expired / agent unenrolled).
+//! - #2512: the control socket heard the server refuse this enrollment's
+//!   token → nothing is posted (batches held, shed when full) until a new
+//!   token or the socket's next accepted upgrade.
 //! - Other transient failures → batch retained, exponential backoff
 //!   capped at 60 s.
 
@@ -229,11 +232,31 @@ pub struct UploadConfig {
     pub source: LogSource,
 }
 
+/// The uploader's clock: [`Pace::PRODUCTION`], or a fast one in a test.
+#[derive(Debug, Clone, Copy)]
+struct Pace {
+    flush: std::time::Duration,
+    initial_backoff: std::time::Duration,
+    max_backoff: std::time::Duration,
+}
+
+impl Pace {
+    const PRODUCTION: Pace = Pace {
+        flush: std::time::Duration::from_secs(FLUSH_INTERVAL_SECS),
+        initial_backoff: std::time::Duration::from_secs(INITIAL_RETRY_BACKOFF_SECS),
+        max_backoff: std::time::Duration::from_secs(MAX_RETRY_BACKOFF_SECS),
+    };
+}
+
 /// Long-running task: drain the channel every [`FLUSH_INTERVAL_SECS`]
 /// and POST batches up to [`MAX_BATCH_LINES`] lines.
 ///
 /// Exits cleanly when the layer is dropped (channel closes).
-pub async fn run_uploader(mut rx: mpsc::Receiver<LogLine>, config: UploadConfig) {
+pub async fn run_uploader(rx: mpsc::Receiver<LogLine>, config: UploadConfig) {
+    run_uploader_paced(rx, config, Pace::PRODUCTION).await
+}
+
+async fn run_uploader_paced(mut rx: mpsc::Receiver<LogLine>, config: UploadConfig, pace: Pace) {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -254,10 +277,10 @@ pub async fn run_uploader(mut rx: mpsc::Receiver<LogLine>, config: UploadConfig)
         config.agent_id,
     );
     let mut buf: Vec<LogLine> = Vec::with_capacity(MAX_BATCH_LINES);
-    let mut backoff_secs = INITIAL_RETRY_BACKOFF_SECS;
+    let mut backoff = pace.initial_backoff;
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(FLUSH_INTERVAL_SECS)).await;
+        tokio::time::sleep(pace.flush).await;
 
         // Drain up to MAX_BATCH_LINES from the channel without
         // blocking on an empty channel.
@@ -279,6 +302,19 @@ pub async fn run_uploader(mut rx: mpsc::Receiver<LogLine>, config: UploadConfig)
             continue;
         }
 
+        // #2512 — the server refuses this enrollment's token, as the control
+        // socket heard it (`TokenSlot::is_refused`). A POST now is one it
+        // will only 401, and a device whose row was gone posted every 5 s,
+        // forever. Hold the batch (shedding as below) until a new token or
+        // the socket's next accepted upgrade.
+        if config.agent_jwt.is_refused() {
+            if closed {
+                return;
+            }
+            shed_oldest_half_if_full(&mut buf);
+            continue;
+        }
+
         let payload = serde_json::json!({
             "source": config.source.as_str(),
             "agent_version": config.agent_version,
@@ -296,7 +332,7 @@ pub async fn run_uploader(mut rx: mpsc::Receiver<LogLine>, config: UploadConfig)
         match send {
             Ok(resp) if resp.status().is_success() => {
                 buf.clear();
-                backoff_secs = INITIAL_RETRY_BACKOFF_SECS;
+                backoff = pace.initial_backoff;
             }
             Ok(resp)
                 if resp.status() == reqwest::StatusCode::UNAUTHORIZED
@@ -305,7 +341,11 @@ pub async fn run_uploader(mut rx: mpsc::Receiver<LogLine>, config: UploadConfig)
                 // Permanent for this JWT — drop the batch to free buf.
                 // Common cause: agent unenrolled or token rotated.
                 buf.clear();
-                backoff_secs = MAX_RETRY_BACKOFF_SECS;
+                // #2512 — and wait the long backoff out, as the module doc
+                // promises. This arm used to set it and go straight back to
+                // the flush tick, so nothing ever waited on it.
+                backoff = pace.max_backoff;
+                tokio::time::sleep(backoff.saturating_sub(pace.flush)).await;
             }
             Ok(resp) => {
                 // Other non-success (500, 422, etc.) — keep batch, backoff.
@@ -314,11 +354,8 @@ pub async fn run_uploader(mut rx: mpsc::Receiver<LogLine>, config: UploadConfig)
                 // a tight retry loop.
                 let status = resp.status();
                 tracing::warn!(target: "roomlerd::logs_upload", %status, "logs upload non-success");
-                tokio::time::sleep(std::time::Duration::from_secs(
-                    backoff_secs.saturating_sub(FLUSH_INTERVAL_SECS),
-                ))
-                .await;
-                backoff_secs = (backoff_secs * 2).min(MAX_RETRY_BACKOFF_SECS);
+                tokio::time::sleep(backoff.saturating_sub(pace.flush)).await;
+                backoff = (backoff * 2).min(pace.max_backoff);
             }
             Err(e) => {
                 // Transport-level failure (DNS / connect / timeout) —
@@ -327,21 +364,22 @@ pub async fn run_uploader(mut rx: mpsc::Receiver<LogLine>, config: UploadConfig)
                 // tracing::debug so the rolling log stays useful but
                 // doesn't flood.
                 tracing::debug!(target: "roomlerd::logs_upload", %e, "logs upload error");
-                tokio::time::sleep(std::time::Duration::from_secs(
-                    backoff_secs.saturating_sub(FLUSH_INTERVAL_SECS),
-                ))
-                .await;
-                backoff_secs = (backoff_secs * 2).min(MAX_RETRY_BACKOFF_SECS);
+                tokio::time::sleep(backoff.saturating_sub(pace.flush)).await;
+                backoff = (backoff * 2).min(pace.max_backoff);
             }
         }
 
-        // If batch hits the cap after a failure (queue keeps growing),
-        // shed the oldest half so the buf doesn't grow unboundedly.
-        // Lost diagnostic data is preferable to OOM.
-        if buf.len() >= MAX_BATCH_LINES {
-            let drop_n = buf.len() / 2;
-            buf.drain(0..drop_n);
-        }
+        shed_oldest_half_if_full(&mut buf);
+    }
+}
+
+/// If the batch hits the cap after a failure (the queue keeps growing),
+/// shed the oldest half so the buf doesn't grow unboundedly. Lost diagnostic
+/// data is preferable to OOM.
+fn shed_oldest_half_if_full(buf: &mut Vec<LogLine>) {
+    if buf.len() >= MAX_BATCH_LINES {
+        let drop_n = buf.len() / 2;
+        buf.drain(0..drop_n);
     }
 }
 
@@ -428,5 +466,144 @@ mod tests {
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// The production pace scaled down 100×: flush every 50 ms, back off
+    /// from 50 ms up to 600 ms.
+    const FAST: Pace = Pace {
+        flush: Duration::from_millis(50),
+        initial_backoff: Duration::from_millis(50),
+        max_backoff: Duration::from_millis(600),
+    };
+
+    /// A loopback HTTP server that reads each whole request, counts it, and
+    /// answers `status` with an empty body. Returns its base URL and the count.
+    async fn counting_server(status: &'static str) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let posts = Arc::new(AtomicUsize::new(0));
+        let seen = posts.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut req: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let mut want: Option<usize> = None;
+                    loop {
+                        if let Some(total) = want
+                            && req.len() >= total
+                        {
+                            break;
+                        }
+                        let n = s.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        req.extend_from_slice(&chunk[..n]);
+                        if want.is_none()
+                            && let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            let head = String::from_utf8_lossy(&req[..end]).to_ascii_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            want = Some(end + 4 + len);
+                        }
+                    }
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let reply = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = s.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        (base, posts)
+    }
+
+    fn config(base: &str, token: &crate::token_slot::TokenSlot) -> UploadConfig {
+        UploadConfig {
+            server_url: base.to_string(),
+            tenant_id: "t1".into(),
+            agent_id: "a1".into(),
+            agent_jwt: token.clone(),
+            agent_version: "0.0.0-test".into(),
+            host_id_hash: hash_hostname("host"),
+            source: LogSource::Agent,
+        }
+    }
+
+    /// Feed one line every 10 ms until the channel closes, as a busy daemon's
+    /// log does, so every flush finds a batch.
+    fn feed(tx: mpsc::Sender<LogLine>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let line = LogLine {
+                    ts: DateTime::now(),
+                    level: LogLevel::Warn,
+                    target: "test".into(),
+                    msg: "overlay derp: /derp connect failed".into(),
+                    fields: Document::new(),
+                };
+                if tx.send(line).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+    }
+
+    /// #2512 — a 401 waits out the long backoff, as the module doc says.
+    /// Before, the arm set the backoff and went straight back to the flush
+    /// tick: one POST per flush, forever (88 in 13 minutes in the field).
+    #[tokio::test]
+    async fn a_401_waits_the_long_backoff_out() {
+        let (base, posts) = counting_server("401 Unauthorized").await;
+        let token = crate::token_slot::TokenSlot::new("gone");
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let feeder = feed(tx);
+        let uploader = tokio::spawn(run_uploader_paced(rx, config(&base, &token), FAST));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        uploader.abort();
+        feeder.abort();
+        let n = posts.load(Ordering::SeqCst);
+        // At ~50 ms, ~650 ms and ~1250 ms, where the flush tick alone made ~30.
+        assert!((1..=4).contains(&n), "{n} POSTs in 1.5 s against a 401");
+    }
+
+    /// #2512 — while the control socket's verdict on the token is "refused",
+    /// nothing is posted at all. A renewed token resumes the uploads.
+    #[tokio::test]
+    async fn a_refused_token_posts_nothing_until_it_changes() {
+        let (base, posts) = counting_server("204 No Content").await;
+        let token = crate::token_slot::TokenSlot::new("gone");
+        assert!(token.mark_refused("gone"));
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let feeder = feed(tx);
+        let uploader = tokio::spawn(run_uploader_paced(rx, config(&base, &token), FAST));
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            0,
+            "a refused token posts nothing"
+        );
+        assert!(token.set("renewed".into()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while posts.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a renewed token's uploads resume on the next flush"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        uploader.abort();
+        feeder.abort();
     }
 }
