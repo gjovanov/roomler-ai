@@ -27,7 +27,9 @@
 # (Windows or with Xvfb) — see Phase 2 plan.
 
 # --- Stage 1: Rust build ---
-FROM rust:1.88-bookworm AS builder
+# FR-114 — the workspace's toolchain (the main `Dockerfile`'s): edition 2024
+# and today's dependencies do not build on the 1.88 this stage used to pin.
+FROM rust:1.95-bookworm AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake \
     && rm -rf /var/lib/apt/lists/*
@@ -82,7 +84,10 @@ set -eu
 SERVER="${ROOMLER_E2E_SERVER:?ROOMLER_E2E_SERVER must point at the in-cluster API}"
 ADMIN_EMAIL="${ROOMLER_E2E_ADMIN_EMAIL:?seed admin email}"
 ADMIN_PASS="${ROOMLER_E2E_ADMIN_PASSWORD:?seed admin password}"
-TENANT_ID="${ROOMLER_E2E_TENANT_ID:?seed tenant id (ObjectId hex)}"
+# FR-114 — the tenant is found by its SLUG after the login, unless an id is
+# pinned: a pasted id went stale with every wiped e2e DB.
+TENANT_SLUG="${ROOMLER_E2E_TENANT_SLUG:-agent-e2e}"
+TENANT_ID="${ROOMLER_E2E_TENANT_ID:-}"
 AGENT_NAME="${HOSTNAME:-agent-e2e}"
 CONFIG_PATH="${ROOMLERD_CONFIG_PATH:-/etc/roomler/config.toml}"
 
@@ -110,6 +115,18 @@ if [ -z "$TOKEN" ]; then
   exit 1
 fi
 
+if [ -z "$TENANT_ID" ] || [ "$TENANT_ID" = "000000000000000000000000" ]; then
+  echo "[bootstrap] resolving tenant slug=$TENANT_SLUG"
+  # `GET /api/tenant` answers flat rows (id, name, slug, owner_id, plan), so
+  # the row is one {...} with no nesting; the last stage is `cut`, so an empty
+  # match is an empty string, not a `set -e` exit.
+  TENANTS="$(curl -fsS "$SERVER/api/tenant" -H "authorization: Bearer $TOKEN")"
+  TENANT_ID="$(printf '%s' "$TENANTS" | grep -oE '\{[^{}]*"slug":"'"$TENANT_SLUG"'"[^{}]*\}' | grep -oE '"id":"[0-9a-f]{24}"' | head -1 | cut -d'"' -f4)"
+  if [ -z "$TENANT_ID" ]; then
+    echo "[bootstrap] FAILED: $ADMIN_EMAIL is in no tenant with slug $TENANT_SLUG; has the seed Job run?" >&2
+    exit 1
+  fi
+fi
 echo "[bootstrap] minting enrollment token for tenant=$TENANT_ID"
 ENROLL_RESP="$(curl -fsS -X POST "$SERVER/api/tenant/$TENANT_ID/agent/enroll-token" \
   -H "authorization: Bearer $TOKEN")"
@@ -127,6 +144,32 @@ echo "[bootstrap] enrolling agent name=$AGENT_NAME"
   --token "$ENROLL_JWT" \
   --name "$AGENT_NAME"
 
+# FR-114 — the recording specs each need a device in ONE state: a recorder
+# whose owner opted in to remote recording, a recorder NOT opted in, and no
+# recorder at all (run-agent-e2e.sh). `record_remote_enabled` is device-owned
+# (the server cannot push it), so the opt-in is written here, for the
+# ordinals the StatefulSet names.
+# ⚠️ REPLACE the root table's line, never add one: enroll already writes the
+# default (`= false`), TOML refuses a duplicate key, and the daemon refuses the
+# whole config — measured 2026-10-19, a prepended copy crash-looped the pod.
+# `0,/^\[/` is the root table (everything before the first [table]); a config
+# without the key gets it prepended, which is valid TOML for a root key.
+ORD="${AGENT_NAME##*-}"
+case " ${ROOMLER_E2E_RECORD_REMOTE_ORDINALS:-} " in
+  *" $ORD "*)
+    if sed -n '0,/^\[/p' "$CONFIG_PATH" | grep -qE '^[[:space:]]*record_remote_enabled[[:space:]]*='; then
+      sed -i -E '0,/^\[/ s/^[[:space:]]*record_remote_enabled[[:space:]]*=.*/record_remote_enabled = true/' "$CONFIG_PATH"
+    else
+      sed -i '1i record_remote_enabled = true' "$CONFIG_PATH"
+    fi
+    ROOT_KEY="$(sed -n '0,/^\[/p' "$CONFIG_PATH" | grep -E '^[[:space:]]*record_remote_enabled[[:space:]]*=' || true)"
+    if [ "$ROOT_KEY" != "record_remote_enabled = true" ]; then
+      echo "[bootstrap] FAILED to opt in to remote recording: the root table holds [$ROOT_KEY]" >&2
+      exit 1
+    fi
+    echo "[bootstrap] remote recording opted in (ordinal $ORD)"
+    ;;
+esac
 touch /results/.bootstrap-done
 echo "[bootstrap] config written to $CONFIG_PATH; ready to run"
 EOF
@@ -143,6 +186,12 @@ COPY <<'EOF' /usr/local/bin/run-agent-e2e.sh
 #!/bin/sh
 set -eu
 /usr/local/bin/agent-bootstrap.sh
+# FR-114 — the "no recorder" device: the recorder's own kill switch, so the
+# agent advertises an empty `record` capability, for the ordinals named.
+ORD="${HOSTNAME##*-}"
+case " ${ROOMLER_E2E_NO_RECORDER_ORDINALS:-} " in
+  *" $ORD "*) export ROOMLERD_RECORDING=0; echo "[run] recording switched off (ordinal $ORD)" ;;
+esac
 exec /usr/local/bin/roomlerd --config "${ROOMLERD_CONFIG_PATH:-/etc/roomler/config.toml}" run
 EOF
 RUN chmod +x /usr/local/bin/run-agent-e2e.sh

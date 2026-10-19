@@ -7,8 +7,8 @@ was first written), [FR-102](FR-102-growth-observability.md) AC19 (whose pod-lan
 
 ## 1. Goal
 
-Every remote-desktop spec in `ui/e2e/` that needs an agent runs in the nightly pod lane, against two synthetic-frame
-agents enrolled in the e2e server, and fails the night when it fails. Today all six are listed and skipped: the lane
+Every remote-desktop spec in `ui/e2e/` that needs an agent runs in the nightly pod lane, against three synthetic-frame
+agents enrolled in the e2e server (one per recording state, §6.2), and fails the night when it fails. Today all six are listed and skipped: the lane
 reads like coverage and is none.
 
 ## 2. Evidence (2026-10-17 … 10-19)
@@ -32,7 +32,7 @@ flowchart LR
       pw["pwrunner sidecar<br/>Playwright"]
     end
     seed["Job agent-e2e-seed<br/>admin + tenant 'agent-e2e'"]
-    sts["StatefulSet agent-e2e ×2<br/>roomlerd-e2e, synthetic frames"]
+    sts["StatefulSet agent-e2e ×3<br/>roomlerd-e2e, synthetic frames"]
   end
   seed -->|"register (AUTO_VERIFY), idempotent"| app
   sts -->|"login → GET /api/tenant (slug) →<br/>enroll-token → roomlerd enroll"| app
@@ -62,7 +62,7 @@ flowchart LR
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
 | P1 | the four specs' cookie sign-in; `Dockerfile.agent-e2e` on rust 1.95, with the bootstrap finding the tenant by slug; the seed reading the tenant from `GET /api/tenant`; the template's registry; the nightly's tenant discovery; `AGENT-E2E.md` and `docs/testing.md` | revert the PR | — |
-| P2 | build and push `roomlerd-e2e`; install the overlay into the deploy repo (`k8s/overlays/e2e`, manual apply, never ArgoCD-synced); apply; the seed; both agents online | `kubectl -n roomler-ai-e2e delete statefulset agent-e2e` (the nightly then skips as today) | — |
+| P2 | build and push `roomlerd-e2e`; install the overlay into the deploy repo (`k8s/overlays/e2e`, manual apply, never ArgoCD-synced); apply; the seed; all three agents online | `kubectl -n roomler-ai-e2e delete statefulset agent-e2e` (the nightly then skips as today) | — |
 | P3 | an on-demand run of the six specs in the `pwrunner`; then the next nightly | as P2 | — |
 
 ## 5. Acceptance criteria
@@ -71,13 +71,14 @@ flowchart LR
   (`grep -rn "setItem('access_token'" ui/e2e` finds nothing), and the four sign in through the context's cookie jar.
 - [ ] **AC2 (P2):** `roomlerd-e2e` builds from master with the workspace's toolchain and is pushed to
   `registry.roomler.ai` under a dated tag that the overlay pins.
-- [ ] **AC3 (P2):** after a fresh apply, with no hand edit to any Secret, both `agent-e2e` pods are Ready and both
-  agents are online in the e2e server's `agent-e2e` tenant. Red first: today's seed fails at the `/me` read.
+- [ ] **AC3 (P2):** after a fresh apply, with no hand edit to any Secret, all three `agent-e2e` pods are Ready with no
+  restarts and all three agents are online in the e2e server's `agent-e2e` tenant, each advertising its recording
+  state (§6.2). Red first: today's seed fails at the `/me` read.
 - [ ] **AC4 (P3):** an on-demand run in the `pwrunner` sidecar runs all six agent-e2e specs: none skips. Each passes,
   or its failure is diagnosed and either fixed or entered in `scripts/e2e-expected-failures.txt` with the reason.
   `remote-session-rating.spec.ts` passes, which is FR-102 AC19's pod-lane run.
-- [ ] **AC5 (P3):** the first nightly after P2 skips six fewer specs than the night before. The lane's verdict holds,
-  or names what newly failed.
+- [ ] **AC5 (P3):** the first nightly after P2 skips seven fewer tests than the night before (the six specs hold
+  seven tests; the reporter counts tests). The lane's verdict holds, or names what newly failed.
 - [ ] **AC6 (docs):** `docs/testing.md` documents the agent-e2e lane in the house style (a mermaid diagram, a table,
   `file:line` anchors), `scripts/e2e-k8s/AGENT-E2E.md` matches what was run, and `docs/README.md`'s index row for
   `testing.md` names the lane.
@@ -86,7 +87,12 @@ flowchart LR
 
 1. **Which agent build the lane tests.** **The image built from master at P2, re-built by hand when an agent change
    needs it.** Option: re-build it per agent release so the lane always tests the released agent.
-2. **How many agents.** **Two** (the template's), so a switch-device spec has somewhere to switch to.
+2. **How many agents.** ~~Two (the template's)~~ → **three, decided 2026-10-19**: one per recording state the recording
+   specs need, by pod ordinal: `agent-e2e-0` records but its owner has not opted in (`remote-recording-refused`),
+   `agent-e2e-1` has opted in (`record_remote_enabled`, `remote-recording-smoke`), `agent-e2e-2` has no recorder
+   (`ROOMLERD_RECORDING=0`, `remote-recording-refused` P3c-2). The switch-device spec still has somewhere to switch to.
+   Measured: on two agents, neither opted in, the rehearsal skipped two of the seven tests. The opt-in is device-owned
+   (the server cannot push it), so the agent's bootstrap writes it as the owner would.
 
 ## 7. Out of scope
 

@@ -19,79 +19,79 @@ without operator setup.
     `tenant_id: 000…0` that MUST be rebaked after the first seed.**
   - `service-agent-e2e.yaml` — headless Service for predictable Pod
     DNS (`agent-e2e-0.agent-e2e.roomler-ai-e2e.svc.cluster.local`).
-  - `statefulset-agent-e2e.yaml` — 2-replica StatefulSet of the
-    synthetic-frame agents.
+  - `statefulset-agent-e2e.yaml` — 3-replica StatefulSet of the
+    synthetic-frame agents, one per recording state (FR-114):
+    `agent-e2e-0` records but is not opted in, `agent-e2e-1` is opted
+    in to remote recording, `agent-e2e-2` has no recorder.
   - `kustomization.yaml` — extended to include the 4 new files plus
     the new image rewrite (`gjovanov/roomlerd-e2e` →
     `<internal-registry>/roomlerd-e2e:latest`).
 
-## Bring-up steps (run from the build host)
+## Bring-up steps (FR-114: run on mars, the build host)
 
-### 1. Build + push the agent-e2e image
+### 1. Build + push the agent-e2e image, under a DATED tag
 
 ```bash
-: "${BUILD_HOST:=<your-build-host>}"
-: "${REGISTRY:=<internal-registry>}"
-: "${REPO:=$HOME/roomler-ai}"
-
-ssh "$BUILD_HOST"
-cd "$REPO" && git pull
-docker build -f Dockerfile.agent-e2e -t "$REGISTRY/roomlerd-e2e:latest" .
-docker push "$REGISTRY/roomlerd-e2e:latest"
+cd <a clean roomler-ai checkout at master>
+TAG="agent-e2e-$(date -u +%Y%m%d)-$(git rev-parse --short=7 HEAD)"
+docker build -f Dockerfile.agent-e2e -t "registry.roomler.ai/roomlerd-e2e:$TAG" .
+docker push "registry.roomler.ai/roomlerd-e2e:$TAG"   # mars is logged in to it
 ```
 
-Image size sanity-check: ~80–100 MiB. If it's >200 MiB something
+Never `latest`: the overlay pins the tag, so a night's agent is a known
+build. Image size sanity-check: ~150 MiB with `recording` (FR-114 measured
+147 MiB on 2026-10-19; it was ~80–100 MiB before FR-85). If it's >200 MiB something
 pulled in scrap-capture transitively — re-check the
 `--no-default-features` + feature list in `Dockerfile.agent-e2e`.
 
-### 2. Apply the overlay (placeholder tenant_id phase)
+### 2. Add the harness to the deploy repo's overlay, then apply
+
+⚠️ **The deploy repo's `k8s/overlays/e2e` is the live truth and has moved on
+from `overlay-template/`** (the roomler2 Deployment's `pwrunner` sidecar, the
+config, the secrets). `install-overlay.sh` therefore copies only files the
+deploy copy lacks and REPORTS the ones that differ. It never overwrites, and
+it pins each image's tag by name. Run it against your OWN deploy checkout,
+never a shared one with someone's uncommitted work:
 
 ```bash
-: "${DEPLOY_REPO:=$HOME/roomler-ai-deploy}"
-# Ensure the overlay template is in the deploy repo (idempotent):
-bash "$REPO/scripts/e2e-k8s/install-overlay.sh"
-kubectl apply -k "$DEPLOY_REPO/k8s/overlays/e2e/"
+AGENT_E2E_TAG="$TAG" DEPLOY_REPO=<your deploy worktree> \
+  bash scripts/e2e-k8s/install-overlay.sh
+# It WARNS for each agent-e2e resource the kept kustomization.yaml does not
+# list: add the four files under `resources:` and the `gjovanov/roomlerd-e2e`
+# entry under `images:` by hand, commit, open a deploy-repo PR.
+kubectl diff -k <your deploy worktree>/k8s/overlays/e2e/   # read it FIRST
+kubectl apply -k <your deploy worktree>/k8s/overlays/e2e/
 ```
 
-The agent Pods will come up but **loop on `tenant not found`** —
-the placeholder `tenant_id: 000…0` in the Secret doesn't match the
-real tenant the seed Job creates. That's expected for this first
-apply.
+The diff should name only the agent-e2e objects. Anything else (roomler2's
+config, its secrets, the `pwrunner` sidecar) is drift between the deploy copy
+and the cluster: stop and find out who changed which side before applying. A
+full apply resets the e2e roomler2 to the overlay's image pin; the nightly
+sets it to prod's image again on its next run.
 
-### 3. Read the live tenant_id from the seed Job logs
+### 3. Nothing to rebake
+
+The seed Job registers the admin and the `agent-e2e` tenant (idempotent; the
+e2e server auto-verifies). The agents, the seed and the nightly each find the
+tenant **by its slug** through `GET /api/tenant`, so a wiped e2e DB needs no
+hand edit: a fresh tenant gets a fresh id and everyone still finds it.
 
 ```bash
-kubectl -n roomler-ai-e2e logs job/agent-e2e-seed | grep 'tenant_id='
-# → [seed] tenant_id=<24-hex-chars>
+kubectl -n roomler-ai-e2e logs job/agent-e2e-seed | tail -3
+# → [seed] OK — admin + tenant ready; tenant_id=<24-hex-chars>
 ```
 
-### 4. Rebake the Secret + re-apply
-
-Edit `secret-agent-e2e-bootstrap.yaml` in the overlay-template dir,
-paste the real `tenant_id`, then:
+### 4. Verify the agents are online
 
 ```bash
-bash "$REPO/scripts/e2e-k8s/install-overlay.sh"  # re-copies into deploy repo
-kubectl apply -k "$DEPLOY_REPO/k8s/overlays/e2e/"
-kubectl -n roomler-ai-e2e rollout restart statefulset/agent-e2e
-```
-
-### 5. Verify the agents are online
-
-```bash
-# Wait for both Pods to be Ready:
-kubectl -n roomler-ai-e2e wait --for=condition=Ready --timeout=120s \
+kubectl -n roomler-ai-e2e wait --for=condition=Ready --timeout=300s \
   pod -l app=agent-e2e
-
-# Check the agent records exist in the API:
-TOKEN=$(curl -fsS -X POST http://roomler2.roomler-ai-e2e/api/auth/login \
-  -H 'content-type: application/json' \
-  -d '{"email":"agent-e2e-admin@roomler.local","password":"agent-e2e-bootstrap-pw-2026"}' \
-  | jq -r .access_token)
-curl -fsS http://roomler2.roomler-ai-e2e/api/tenant/<tenant_id>/agent \
-  -H "authorization: Bearer $TOKEN" | jq '.[] | {name, machine_name, is_online}'
-# → two entries, both is_online: true
+kubectl -n roomler-ai-e2e logs agent-e2e-0 | grep -E '\[bootstrap\] (minting|config written)'
 ```
+
+The nightly (`scripts/e2e-nightly.sh`, §3b) then finds the tenant the same
+way and passes `E2E_AGENT_E2E_TENANT_ID` to its runs. Without the
+StatefulSet it says so in its log, and the six specs skip as before.
 
 ## What does NOT ship in this chunk
 
@@ -105,6 +105,19 @@ curl -fsS http://roomler2.roomler-ai-e2e/api/tenant/<tenant_id>/agent \
   **Phase 5** (tunnel) — all depend on Chunk 1C being done.
 
 ## Known gotchas
+
+- **Enrollment needs TLS or LOOPBACK** (FR-114, measured 2026-10-19). An
+  enrollment token travels over TLS: `roomlerd enroll` promotes a remote
+  `http://` to `https://` (`normalize_server_url`,
+  `crates/agent-core/src/enrollment.rs`; FR-101 P1b, no plaintext escape), and
+  `https://roomler2` times out on a server that serves plain HTTP. So each agent
+  pod carries a `server-proxy` sidecar (socat, `127.0.0.1:18080 → roomler2:80`),
+  and `ROOMLER_E2E_SERVER` points at it. Loopback is exempt, so signalling and
+  the WebSocket ride the proxy; media is WebRTC, pod to pod.
+- **The agents' config is `emptyDir`**: each pod restart enrolls a fresh device
+  (a new row; the old one goes offline) with a fresh FR-100 device key. The
+  specs pick an online agent, and a fresh Playwright context is always "first
+  use" for a pinned key.
 
 - **Pod DNS name vs `machine_name`**: the agent's `rc:agent.hello`
   payload includes `machine_name` = `$HOSTNAME` (the Pod's hostname,

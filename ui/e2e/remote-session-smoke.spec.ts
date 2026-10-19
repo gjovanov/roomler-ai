@@ -38,6 +38,7 @@
  *    against PROD; Phase 3 promotes that to the CI fixture agent.
  */
 import { test, expect, type Page } from '@playwright/test'
+import { signInContext } from './fixtures/test-helpers'
 
 const API_URL = process.env.E2E_API_URL || 'http://localhost:5001'
 const BASE_URL = process.env.E2E_BASE_URL || 'http://localhost:5000'
@@ -107,15 +108,12 @@ test.describe('Remote session smoke against the agent-e2e harness', () => {
     test.skip(!agent, 'no online enrolled agent found — apply the agent-e2e overlay first')
     const agentId = agent!.id
 
-    // -------- Seed the SPA's auth state via localStorage --------
-    // The SPA reads access_token + refresh_token from localStorage
-    // on boot. Pre-seeding bypasses the login form so the smoke
-    // stays focused on the remote-control flow (auth has its own
-    // dedicated spec).
-    await context.addInitScript((tok) => {
-      window.localStorage.setItem('access_token', tok)
-      window.localStorage.setItem('refresh_token', tok)
-    }, token)
+    // -------- Sign the browser in through its own cookie jar --------
+    // Sessions are cookie-only (#691): a token in localStorage grants
+    // nothing. Signing in through the context's request API skips the
+    // login form, so the smoke stays on the remote-control flow (auth
+    // has its own dedicated spec).
+    await signInContext(context, ADMIN_EMAIL, ADMIN_PASSWORD)
 
     // -------- Navigate to the agent's remote view --------
     const remoteUrl = `${BASE_URL}/tenant/${TENANT_ID}/agent/${agentId}/remote`

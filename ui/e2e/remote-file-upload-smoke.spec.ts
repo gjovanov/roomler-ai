@@ -36,6 +36,7 @@
  *    smoke pack).
  */
 import { test, expect, type Page } from '@playwright/test'
+import { signInContext } from './fixtures/test-helpers'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -120,10 +121,8 @@ test.describe('Remote file-DC upload smoke against the agent-e2e harness', () =>
     test.skip(!agent, 'no online enrolled agent found — apply the agent-e2e overlay first')
     const agentId = agent!.id
 
-    await context.addInitScript((tok) => {
-      window.localStorage.setItem('access_token', tok)
-      window.localStorage.setItem('refresh_token', tok)
-    }, token)
+    // Cookie-only sessions (#691): sign in through the context's jar.
+    await signInContext(context, ADMIN_EMAIL, ADMIN_PASSWORD)
 
     const remoteUrl = `${BASE_URL}/tenant/${TENANT_ID}/agent/${agentId}/remote`
     await page.goto(remoteUrl)
@@ -142,40 +141,31 @@ test.describe('Remote file-DC upload smoke against the agent-e2e harness', () =>
       const fileInput = page.locator('input[type="file"]').first()
       await fileInput.setInputFiles(payload.path)
 
-      // Transfers panel: one row per in-flight transfer, labelled
-      // by filename. Confirm our row appears before assuming the
-      // upload was accepted at all (vs the file input being a
-      // separate "open image" path that doesn't go through the DC).
-      const uploadName = payload.name
-      const escapedName = uploadName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      const transferRow = page.locator(`text=/${escapedName}/i`).first()
+      // FR-114 — the transfers live in the toolbar's chip POPOVER, closed by
+      // default (RemoteControl.vue, the "Transfers chip"); a status pill
+      // anywhere on the page is not the transfer's. Measured 2026-10-19: the
+      // agent logged `files: complete` 160 ms after `begin`, while the old
+      // page-wide `text=/complete/i` poll waited out its 2 min on a closed
+      // popover. Open it, find OUR row by name, read the status from its
+      // class (`transfer-${status}`).
+      await page
+        .getByRole('button', { name: /transfer\(s\) in progress/i })
+        .click({ timeout: 30_000 })
+      const transferRow = page.locator('.transfer-row', { hasText: payload.name }).first()
       await expect(
         transferRow,
-        'transfer row never appeared in Transfers panel'
+        'transfer row never appeared in the Transfers popover'
       ).toBeVisible({ timeout: 30_000 })
 
-      // Poll for completion. Per remote-upload-winhost-a.spec.ts there's
-      // no terminal `exhausted` state any more — only `complete` or
-      // `error`. With a 1 MiB payload over in-cluster network the
-      // expected dwell is well under 30 s; 2 min ceiling absorbs
-      // CI vCPU jitter + cold-start.
-      const completionDeadline = Date.now() + 2 * 60 * 1000
-      let lastStatus = ''
-      while (Date.now() < completionDeadline) {
-        const completePill = page.locator('text=/complete/i').first()
-        const errorPill = page.locator('text=/^error$/i').first()
-        if (await completePill.isVisible().catch(() => false)) {
-          lastStatus = 'complete'
-          break
-        }
-        if (await errorPill.isVisible().catch(() => false)) {
-          lastStatus = 'error'
-          break
-        }
-        await page.waitForTimeout(1000)
-      }
-
-      expect(lastStatus, 'transfer did not reach complete within 2 min').toBe('complete')
+      // Only `complete` or `error` end a transfer (no terminal `exhausted`
+      // any more). 1 MiB over the pod network is well under 30 s; the 2 min
+      // ceiling absorbs CI vCPU jitter and the encoder's cold start.
+      await expect(transferRow, 'transfer did not end within 2 min').toHaveClass(
+        /transfer-(complete|error)\b/,
+        { timeout: 2 * 60 * 1000 },
+      )
+      const cls = (await transferRow.getAttribute('class')) ?? ''
+      expect(cls, `the transfer ended as: ${cls}`).toMatch(/transfer-complete\b/)
     } finally {
       // Clean up the tmpfile regardless of pass/fail.
       try {
