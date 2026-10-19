@@ -740,9 +740,14 @@ pub(crate) fn open(
     })
 }
 
-/// One listening instance of a toolbelt's pipe.
+/// One listening instance of a toolbelt's pipe, or (P3-5f-3) of a vault SSH
+/// agent's, under `sddl`, local clients only.
 #[cfg(windows)]
-fn pipe_instance(name: &str, sddl: &str, first: bool) -> std::io::Result<NamedPipeServer> {
+pub(crate) fn pipe_instance(
+    name: &str,
+    sddl: &str,
+    first: bool,
+) -> std::io::Result<NamedPipeServer> {
     let mut sd = crate::hive_win::Sddl::new(sddl)?;
     // SAFETY: the attributes live in `sd` across the call, and the system
     // copies the descriptor into the instance.

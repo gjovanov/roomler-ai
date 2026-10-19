@@ -1974,6 +1974,26 @@ the design document's §7 and §8; what follows binds it to the code as it stand
   - **Tested end to end with OpenSSH.** Its own `ssh` signs in through `vault_connect`'s agent,
     to a russh host in the test, with nothing but the answer: its `env` and its `known_hosts`.
 
+  ⚠️ **As built (P3-5f-3): on Windows the agent is a named pipe whose grant is not the toolbelt
+  pipe's; P3-5f is complete.**
+  - **The toolbelt's pipe, but for one grant.** `\\.\pipe\roomler-vault-<id>` is made as the
+    session's toolbelt pipe is (`pipe_instance`, local clients only, each client's token SID
+    compared with the session's, the next instance made before a client is looked at), except
+    its DACL: the session's account may open it for reading and writing whole (`GRGW`,
+    `agent_pipe_sddl`).
+  - **Why the grant differs.** Win32-OpenSSH opens an agent with `GENERIC_READ |
+    GENERIC_WRITE` (its `fileio_connect`). The toolbelt pipe's `0x12008b` leaves out three of
+    those rights, and a session's token has its Administrators group deny-only, so its `ssh.exe`
+    would be refused. Only an elevated test would pass, by its Administrators grant: the first
+    draft did, on this machine. `GENERIC_WRITE` lets that account add an instance of its own,
+    which on this pipe gains it nothing it lacks.
+  - **The same answer.** `host` and `SSH_AUTH_SOCK` name the pipe, which Win32-OpenSSH dials
+    as a path; everything else is as on Unix.
+  - **Tested with Windows' own `ssh.exe`.** GitHub's Windows runners carry Win32-OpenSSH 9.5,
+    which binds, so its `ssh.exe` signs in through the pipe in CI with nothing but the answer.
+    The grant itself is tested with the SYSTEM and Administrators grants taken out, so
+    elevation cannot pass for it.
+
 **A session's identity to the vault.** The token the sidecar mints is the device's own, bound to the
 session and its fence (`agents/roomlerd/src/hive/sidecar.rs:94`). To the server, a session is its
 record. So a vault request is a frame from the device that runs the session, naming the session and
@@ -2112,7 +2132,7 @@ device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
   (`crates/tunnel-core/src/policy.rs:37`), so `tunnel_audit` names the session and not just its
   owner.
 
-**The toolbelt grows** beyond `approve` (`agents/roomlerd/src/hive/toolbelt.rs:1161`):
+**The toolbelt grows** beyond `approve` (`agents/roomlerd/src/hive/toolbelt.rs:1166`):
 - the vault tools: `vault_list`, `vault_describe`, `vault_request`, `vault_exec`, `vault_render`;
 - the network tools: `net_forward`, `net_socks`;
 - `ssh_run`;
@@ -2494,7 +2514,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3-5e-1 | the HTTP engine's half for Kubernetes (`docs/vault.md` §19) and P3-5e's design (§3e "P3-5e, the Kubernetes API, as designed"), with no caller yet: `Flavor::Kubernetes`; `Credential::Handshake`, a client certificate presented by a connector made for the one connection (`tls::identity`, `tls::connector_for`, the roots read once by `tls::roots`); an upgrade to `websocket` or `SPDY/3.1` relayed on a connection of its own and the two ends joined on the API server's `101`, the tunnel carried within the client connection's session; `h2c` and every upgrade on a plain endpoint never relayed; every `Impersonate-*` header dropped | the `vault` feature in no release build | **merged** #2527 `61ac565c0` |
 | P3-5e-2 | `vault_connect` serving a Kubernetes API server (`docs/vault.md` §19): `engine: "kubernetes"`, an origin and `auth` as for `http`, `basic` refused for it; `auth: "client-cert"` for `kubernetes` and `http`, leasing the secret's `#cert` and `#key`, proven at the call by making a connector with them (the refusal naming no parser's words), then presented in each connection's own TLS over the roots the endpoint read once; the connections served with `Flavor::Kubernetes`; the answer's `kubeconfig` (one cluster whose `server` is the endpoint, one context, one user with no credential); the engine's dead-code allowances gone, `tls::connector` the tests' only | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2530 `95238f1b3` |
 | P3-5f-1 | the SSH agent (`docs/vault.md` §19) and P3-5f's design (§3e "P3-5f, the SSH agent, as designed"), with no caller yet: `vault_proxy::ssh_agent`, one key from the secret's `key` (OpenSSH's own format, unencrypted; Ed25519, or ECDSA on P-256 or P-384) and the hosts from its `host_keys`; `REQUEST_IDENTITIES` the one key under the handle's name, none after a refused binding; `session-bind@openssh.com` taken once and never for forwarding, the host's key one of `host_keys` and its signature over the session identifier checked by `ring` (Ed25519, ECDSA, `rsa-sha2-256` and `-512`); `SIGN_REQUEST` signed only for a sign-in (RFC 4252 §7, `publickey` or `publickey-hostbound-v00@openssh.com`) for the bound session, as the audience's user where it names one; everything else `SSH_AGENT_FAILURE` | the `vault` feature in no release build | **merged** #2536 `a78abf84f` |
-| P3-5f-2 | `vault_connect` serving the SSH agent (`docs/vault.md` §19): `engine: "ssh"`, the upstream `ssh://[user@]host[:port]` (no path, no `:22`; a user in it the one account the key signs in as), `auth`, `ca`, `database` and `auth_source` refused for it; the leases `#key` and `#host_keys`, proven at the call by the agent's own reading; the database endpoint's socket on Linux and macOS, `ssh-agent.sock`, each connection its own agent; no TLS roots read; Windows refused before anything is leased; the answer's `host` the socket, `env` `SSH_AUTH_SOCK`, `uri` the upstream, and `known_hosts` the hosts' keys under its name; `vault_request` asking ahead toward an `ssh://` host; the agent's dead-code allowance gone | device `vault_enabled = false`; the `vault` feature in no release build | **in review** |
+| P3-5f-2 | `vault_connect` serving the SSH agent (`docs/vault.md` §19): `engine: "ssh"`, the upstream `ssh://[user@]host[:port]` (no path, no `:22`; a user in it the one account the key signs in as), `auth`, `ca`, `database` and `auth_source` refused for it; the leases `#key` and `#host_keys`, proven at the call by the agent's own reading; the database endpoint's socket on Linux and macOS, `ssh-agent.sock`, each connection its own agent; no TLS roots read; Windows refused before anything is leased; the answer's `host` the socket, `env` `SSH_AUTH_SOCK`, `uri` the upstream, and `known_hosts` the hosts' keys under its name; `vault_request` asking ahead toward an `ssh://` host; the agent's dead-code allowance gone | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2543 `c9ccfba66` |
+| P3-5f-3 | the SSH agent on Windows (`docs/vault.md` §19): a named pipe, `\\.\pipe\roomler-vault-<id>`, made as the toolbelt pipe is (`pipe_instance` shared) but its DACL the session's account's to open for reading and writing whole (`agent_pipe_sddl`, `GRGW`: Win32-OpenSSH opens an agent with `GENERIC_READ | GENERIC_WRITE`), local clients only, each client's token SID compared with the session's (`pipe_client_sid`), the next instance made before a client is looked at; its name in `host` and `SSH_AUTH_SOCK`; Windows's refusal gone | device `vault_enabled = false`; the `vault` feature in no release build | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
