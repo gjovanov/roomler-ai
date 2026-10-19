@@ -69,6 +69,22 @@ and the cluster: stop and find out who changed which side before applying. A
 full apply resets the e2e roomler2 to the overlay's image pin; the nightly
 sets it to prod's image again on its next run.
 
+To apply the harness ALONE (what FR-114 did on 2026-10-19, when the diff also
+named minio and roomler2), list just the four files in a throwaway
+kustomization next to copies of them, with the overlay's `namespace`,
+`commonLabels` and `gjovanov/roomlerd-e2e` image entry, so the labels and
+selectors match a later full apply:
+
+```bash
+mkdir -p ~/agent-e2e-only && cd ~/agent-e2e-only
+cp <deploy>/k8s/overlays/e2e/{secret-agent-e2e-bootstrap,job-agent-e2e-seed,service-agent-e2e,statefulset-agent-e2e}.yaml .
+# kustomization.yaml: namespace roomler-ai-e2e; those four under resources:;
+# the images: entry; commonLabels env: e2e + app.kubernetes.io/instance: roomler-ai-e2e
+kubectl diff -k .     # only the agent objects
+kubectl -n roomler-ai-e2e delete statefulset agent-e2e --ignore-not-found   # a fresh apply
+kubectl apply -k .
+```
+
 ### 3. Nothing to rebake
 
 The seed Job registers the admin and the `agent-e2e` tenant (idempotent; the
@@ -114,6 +130,20 @@ StatefulSet it says so in its log, and the six specs skip as before.
   pod carries a `server-proxy` sidecar (socat, `127.0.0.1:18080 → roomler2:80`),
   and `ROOMLER_E2E_SERVER` points at it. Loopback is exempt, so signalling and
   the WebSocket ride the proxy; media is WebRTC, pod to pod.
+- **`roomlerd enroll` writes `record_remote_enabled = false` at the config's
+  root.** The opt-in therefore REPLACES that line (`Dockerfile.agent-e2e`'s
+  bootstrap). A second copy is a duplicate TOML key, and the daemon refuses
+  the whole config (measured: a crash loop).
+- **A crash-looping agent pod stalls a rolling update**: an OrderedReady
+  StatefulSet will not roll past a pod that is not Ready, and it recreates a
+  deleted pod at the OLD revision. Recover with a fresh apply: delete the
+  StatefulSet (the kill switch), then apply.
+- **A wiped e2e DB** (`mongodb-0` is an emptyDir; a recreated pod loses it)
+  takes the admin and the tenant with it. Each agent's row is gone, so each
+  agent exits, and its bootstrap then fails at the login until the seed has
+  run again. Re-apply the harness: the seed Job (TTL 0) runs again, and each
+  agent recovers on its next restart. Until then the nightly logs "its tenant
+  did not resolve", and the seven tests skip.
 - **The agents' config is `emptyDir`**: each pod restart enrolls a fresh device
   (a new row; the old one goes offline) with a fresh FR-100 device key. The
   specs pick an online agent, and a fresh Playwright context is always "first
