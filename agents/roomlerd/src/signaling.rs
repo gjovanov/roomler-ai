@@ -1457,6 +1457,17 @@ async fn connect_once(
                 if let tokio_tungstenite::tungstenite::Error::Http(ref resp) = e
                     && resp.status().as_u16() == 401
                 {
+                    // #2512 — the server refuses this token: say so on the
+                    // slot, so the DERP dialer and the log uploader stop
+                    // spending requests it will only 401, until a new token
+                    // or the next accepted upgrade.
+                    if ctx.token.mark_refused(&token) {
+                        info!(
+                            org = %ctx.label,
+                            "agent token refused; DERP dials and log uploads for this \
+                             enrollment wait until it is accepted again or replaced"
+                        );
+                    }
                     return Err(ConnectError::AuthRejected);
                 }
                 return Err(ConnectError::Transient(
@@ -1490,6 +1501,13 @@ async fn connect_once(
     crate::exec::register_secret(&token);
     // FR-103 — the server accepted this token: the renewal task looks now.
     ctx.renewal_connected.notify_one();
+    // #2512 — and the loops that held their requests on its refusal resume.
+    if ctx.token.mark_accepted(&token) {
+        info!(
+            org = %ctx.label,
+            "agent token accepted again; DERP dials and log uploads resume"
+        );
+    }
 
     // Say hello.
     let mut hello_caps = stub_caps(cfg.overlay_multi_org);

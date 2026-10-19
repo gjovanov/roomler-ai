@@ -2870,6 +2870,32 @@ recommending `roomlerd re-enroll --token <jwt>` (new CLI
 that preserves `machine_id` + `machine_name` from the existing
 config). Sentinel auto-cleared on auth recovery.
 
+**One verdict for every loop that uses the token** (#2512): the
+control socket is not the only thing a device dials with its token.
+Its DERP dialer and its log uploader used to reach their own
+verdicts. A device whose row was gone kept re-dialling `/derp` every
+10 s and posting its logs every 5 s, while its control socket waited
+out the ladder above. In the field that was 72 dials and 88 posts in
+13 minutes, against 4 control-socket attempts. The control socket
+now records the server's answer on the enrollment's `TokenSlot`
+(`crates/agent-core/src/token_slot.rs`):
+
+- a 401 on its upgrade marks the token refused;
+- an accepted upgrade, or a new token (an FR-103 renewal, a token
+  re-enrolled on disk), lifts it.
+
+While the token reads refused, the DERP dialer does not dial
+(`derp.rs`, `central_url_per_attempt`) and the uploader posts
+nothing (`logs_upload.rs`). Both resume within one backoff step once
+it lifts.
+
+⚠️ The verdict is the control socket's alone. `/derp` answers 401 for
+any lookup error, a Mongo blip included, so a dialer that believed
+its own 401 would drop every device's DERP floor on one database
+wobble. The uploader's own 401 now waits out its 60 s backoff, as
+its doc always said. Before, it set that backoff and went straight
+back to its 5 s tick.
+
 ### 19.2 Update-path hardening (0.1.51)
 
 **Configurable update cadence**: `update_check_interval_h: Option<u32>`
