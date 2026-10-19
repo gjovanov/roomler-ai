@@ -856,6 +856,7 @@ mod endpoint {
                     credential: credential(self.auth?, |i| self.read(i))?,
                     tls,
                     front: self.front.clone(),
+                    flavor: http::Flavor::Plain,
                 }),
             })
         }

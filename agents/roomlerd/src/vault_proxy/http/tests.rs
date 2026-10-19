@@ -20,8 +20,8 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
-use super::{Credential, Upstream, point_back, refuse, serve};
-use crate::vault_proxy::testing::{HttpSaw, fake_http, made, stranger};
+use super::{Credential, Flavor, Upstream, point_back, refuse, serve};
+use crate::vault_proxy::testing::{HttpSaw, fake_http, fake_http_mtls, made, stranger};
 use crate::vault_proxy::tls;
 
 type ClientBody = BoxBody<Bytes, Infallible>;
@@ -40,6 +40,15 @@ fn upstream(host: &str, port: u16, ca: &str, credential: Credential) -> Upstream
         credential,
         tls: tls::connector(Some(ca)).unwrap(),
         front: FRONT.to_string(),
+        flavor: Flavor::Plain,
+    }
+}
+
+/// P3-5e-1 — the same, standing for a Kubernetes API server.
+fn kube(host: &str, port: u16, ca: &str, credential: Credential) -> Upstream {
+    Upstream {
+        flavor: Flavor::Kubernetes,
+        ..upstream(host, port, ca, credential)
     }
 }
 
@@ -446,4 +455,201 @@ async fn a_refused_client_is_told_why() {
     let (status, _, body) = ask(&mut c, get("/x")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(body.contains("lease has ended"), "{body}");
+}
+
+/// P3-5e-1 — a client certificate is presented in the handshake, and no
+/// header carries anything of it. Without one, an upstream that asks for
+/// one refuses the handshake, and no request reaches it.
+#[tokio::test]
+async fn a_client_certificate_is_presented_in_the_handshake() {
+    let mut f = fake_http_mtls().await;
+    let identity = tls::identity(&f.cert, &f.key).unwrap();
+    let presented = Upstream {
+        tls: tls::connector_for(tls::roots(Some(&f.ca)).unwrap(), Some(identity)).unwrap(),
+        ..kube("localhost", f.port, &f.ca, Credential::Handshake)
+    };
+    let mut c = client(presented).await;
+    let (status, _, body) = ask(&mut c, get("/api/v1/namespaces")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let s = saw(&mut f.saw).await;
+    assert_eq!(s.target, "/api/v1/namespaces");
+    assert!(
+        s.values("authorization").is_empty(),
+        "no header carries a certificate: {s:?}"
+    );
+    let mut c = client(kube("localhost", f.port, &f.ca, Credential::Handshake)).await;
+    let (status, _, body) = ask(&mut c, get("/api/v1/namespaces")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    nothing_more(&mut f.saw).await;
+}
+
+/// P3-5e-1 — an identity is a certificate and a key, both PEM: anything
+/// else is refused before a handshake.
+#[test]
+fn an_identity_that_is_not_one_is_refused() {
+    let own = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let (cert, key) = (own.cert.pem(), own.key_pair.serialize_pem());
+    assert!(tls::identity(&cert, &key).is_ok());
+    for (cert, key) in [
+        ("not a certificate", key.as_str()),
+        ("", key.as_str()),
+        (cert.as_str(), ""),
+        (cert.as_str(), cert.as_str()),
+    ] {
+        assert!(
+            tls::identity(cert, key).is_err(),
+            "{cert:.20} with {key:.20}"
+        );
+    }
+}
+
+/// The head of one response on `s`, within 10 s: every byte to its blank
+/// line, and none after.
+async fn head_of(s: &mut tokio::io::DuplexStream) -> String {
+    let read = async {
+        let mut got = Vec::new();
+        let mut byte = [0u8; 1];
+        while !got.ends_with(b"\r\n\r\n") {
+            let n = s.read(&mut byte).await.unwrap();
+            assert_eq!(
+                n,
+                1,
+                "the endpoint hung up: {:?}",
+                String::from_utf8_lossy(&got)
+            );
+            got.push(byte[0]);
+        }
+        String::from_utf8_lossy(&got).into_owned()
+    };
+    tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .expect("a response within 10 s")
+}
+
+/// P3-5e-1 — a Kubernetes endpoint carries an upgrade to the API server,
+/// and on its `101` joins the two connections: what the client sends after
+/// comes back from the upstream's end, the secret's token having gone with
+/// the request.
+#[tokio::test]
+async fn kubernetes_relays_an_upgrade_and_joins_the_two_ends() {
+    let (ca, port, mut rx) = fake_http().await;
+    let token = made();
+    let (mut near, far) = tokio::io::duplex(1 << 16);
+    let up = Arc::new(kube("localhost", port, &ca, bearer(&token)));
+    tokio::spawn(async move {
+        let _ = serve(far, &up).await;
+    });
+    near.write_all(
+        b"GET /exec HTTP/1.1\r\nHost: 127.0.0.1:1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let head = head_of(&mut near).await;
+    assert!(head.starts_with("HTTP/1.1 101 "), "{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("upgrade: websocket"),
+        "{head}"
+    );
+    let s = saw(&mut rx).await;
+    assert_eq!(s.values("upgrade"), ["websocket"]);
+    assert_eq!(s.values("authorization"), [format!("Bearer {token}")]);
+    near.write_all(b"through the tunnel").await.unwrap();
+    let mut echoed = [0u8; 18];
+    tokio::time::timeout(Duration::from_secs(10), near.read_exact(&mut echoed))
+        .await
+        .expect("an echo within 10 s")
+        .unwrap();
+    assert_eq!(&echoed, b"through the tunnel");
+}
+
+/// P3-5e-1 — no upgrade is relayed where the endpoint is a plain HTTP one,
+/// nor to a protocol `kubectl` does not stream over (`h2c`): the request
+/// goes on as an ordinary one.
+#[tokio::test]
+async fn no_other_upgrade_is_relayed() {
+    let (ca, port, mut rx) = fake_http().await;
+    for (up, protocol) in [
+        (
+            upstream("localhost", port, &ca, bearer(&made())),
+            "websocket",
+        ),
+        (kube("localhost", port, &ca, bearer(&made())), "h2c"),
+    ] {
+        let (mut near, far) = tokio::io::duplex(1 << 16);
+        let up = Arc::new(up);
+        tokio::spawn(async move {
+            let _ = serve(far, &up).await;
+        });
+        let request = format!(
+            "GET /exec HTTP/1.1\r\nHost: 127.0.0.1:1\r\nConnection: Upgrade\r\nUpgrade: \
+             {protocol}\r\n\r\n"
+        );
+        near.write_all(request.as_bytes()).await.unwrap();
+        let head = head_of(&mut near).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{protocol}: {head}");
+        let s = saw(&mut rx).await;
+        assert!(s.values("upgrade").is_empty(), "{protocol} relayed: {s:?}");
+    }
+}
+
+/// P3-5e-1 — a Kubernetes endpoint drops every impersonation header, so the
+/// session never acts through the secret's identity as another; a plain
+/// HTTP one has no such header to mean anything, and passes them on.
+#[tokio::test]
+async fn kubernetes_drops_every_impersonation_header() {
+    let (ca, port, mut rx) = fake_http().await;
+    let impersonating = || {
+        Request::get("/api/v1/secrets")
+            .header("host", "127.0.0.1:1")
+            .header("impersonate-user", "admin")
+            .header("impersonate-group", "system:masters")
+            .header("impersonate-uid", "0")
+            .header("impersonate-extra-scopes", "all")
+            .header("x-kept", "yes")
+            .body(empty())
+            .unwrap()
+    };
+    let mut c = client(kube("localhost", port, &ca, bearer(&made()))).await;
+    let (status, _, _) = ask(&mut c, impersonating()).await;
+    assert_eq!(status, StatusCode::OK);
+    let s = saw(&mut rx).await;
+    assert!(
+        !s.headers.iter().any(|(n, _)| n.starts_with("impersonate-")),
+        "impersonation reached the API server: {s:?}"
+    );
+    assert_eq!(s.values("x-kept"), ["yes"]);
+    let mut c = client(upstream("localhost", port, &ca, bearer(&made()))).await;
+    let (status, _, _) = ask(&mut c, impersonating()).await;
+    assert_eq!(status, StatusCode::OK);
+    let s = saw(&mut rx).await;
+    assert_eq!(s.values("impersonate-user"), ["admin"]);
+}
+
+/// P3-5e-1 — a tunnel lives within its client connection's session: when
+/// that ends (the endpoint's lease let go), the joined connection ends too.
+#[tokio::test]
+async fn a_tunnel_ends_with_its_session() {
+    let (ca, port, _rx) = fake_http().await;
+    let (mut near, far) = tokio::io::duplex(1 << 16);
+    let up = Arc::new(kube("localhost", port, &ca, bearer(&made())));
+    let session = tokio::spawn(async move {
+        let _ = serve(far, &up).await;
+    });
+    near.write_all(
+        b"GET /exec HTTP/1.1\r\nHost: 127.0.0.1:1\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let head = head_of(&mut near).await;
+    assert!(head.starts_with("HTTP/1.1 101 "), "{head}");
+    near.write_all(b"once").await.unwrap();
+    let mut echoed = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(10), near.read_exact(&mut echoed))
+        .await
+        .expect("an echo within 10 s")
+        .unwrap();
+    session.abort();
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(Duration::from_secs(10), near.read_to_end(&mut rest)).await;
+    assert!(ended.is_ok(), "the tunnel ended with its session");
 }
