@@ -8,7 +8,11 @@ import { sdpFingerprint, transportMac, verifyTransportMac } from '@/utils/extaut
 import {
   applyPeerAuthVerdict,
   browserStorage,
+  controllerKeyFor,
+  indexedDbKeyBackend,
   judgePeerAuth,
+  offerAsk,
+  withinMs,
   newPeerAuthNonce,
   peerAuthAskDisabled,
   peerAuthCanVerify,
@@ -4320,6 +4324,10 @@ export function useRemoteControl(
   const peerAuth = ref<PeerAuthJudgement | null>(null)
   let peerAuthPinStore: PeerAuthPins | null = null
   const peerAuthPins = (): PeerAuthPins => (peerAuthPinStore ??= storagePins(browserStorage()))
+  // FR-100 P2b — this browser's own key for the attempt's user, loading from
+  // the moment the request goes out so the offer never waits on it. `null`
+  // when this browser cannot keep one: the offer then asks without signing.
+  let peerAuthKey: Promise<CryptoKeyPair | null> | null = null
 
   /**
    * FR-100 P2a — ask the device this request names to sign its answer? Only
@@ -8083,7 +8091,17 @@ export function useRemoteControl(
         if (peerAuthPlan && askedSid && offerFingerprint !== null) {
           const nonce = newPeerAuthNonce()
           peerAuthAsked = { ...peerAuthPlan, sessionId: askedSid, nonce, offerFingerprint }
-          offerFrame.peer_auth = { nonce }
+          // FR-100 P2b — and this browser signs the offer with its own key,
+          // for the device to judge (P1c). A key store that hangs past 1.5 s
+          // is not waited for: the offer then only asks.
+          offerFrame.peer_auth = await offerAsk({
+            nonce,
+            sessionId: askedSid,
+            agentId: peerAuthPlan.agentId,
+            userId: peerAuthPlan.userId,
+            offerFingerprint,
+            pair: peerAuthKey ? await withinMs(peerAuthKey, 1500) : null,
+          })
         }
         ws.sendRaw(offerFrame)
         markConnect('offer_sent')
@@ -8607,6 +8625,7 @@ export function useRemoteControl(
     // (`peerAuth`) stays: the error view reads it after a refusal.
     peerAuthPlan = null
     peerAuthAsked = null
+    peerAuthKey = null
     cursor.value = { pos: null, shapes: new Map() }
     mediaIntrinsicW.value = 0
     mediaIntrinsicH.value = 0
@@ -10339,8 +10358,12 @@ export function useRemoteControl(
     // same-agent request onto the live session. Stop the terminator first.
     abandonedRequests.disarm(agentId)
     // FR-100 P2a — whether this attempt's offer asks the device to sign its
-    // answer, decided for the agent this request names.
+    // answer, decided for the agent this request names. P2b — and, when it
+    // asks, this browser's key starts loading now, while consent runs.
     peerAuthPlan = planPeerAuth(agentId)
+    peerAuthKey = peerAuthPlan
+      ? controllerKeyFor(peerAuthPlan.userId, indexedDbKeyBackend())
+      : null
     ws.sendRaw(requestPayload)
     requestSent = true
     markConnect('request_sent')

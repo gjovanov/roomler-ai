@@ -9,9 +9,14 @@ import { toBase64Url } from '@/utils/extauth'
 import {
   applyPeerAuthVerdict,
   browserStorage,
+  controllerKeyFor,
+  controllerPublicKey,
   deviceKeyPoint,
+  indexedDbKeyBackend,
   judgePeerAuth,
   newPeerAuthNonce,
+  offerAsk,
+  withinMs,
   peerAuthAskDisabled,
   peerAuthBadge,
   peerAuthCanVerify,
@@ -381,5 +386,116 @@ describe('FR-100 P2a: acting on a verdict', () => {
       if (real) Object.defineProperty(globalThis, 'crypto', real)
     }
     expect(peerAuthCanVerify()).toBe(true)
+  })
+})
+
+describe('FR-100 P2b: the browser signs its offer', () => {
+  /** A backend the tests hold: a Map, with knobs for a full store and a racing tab. */
+  const mapBackend = (opts: { keeps?: boolean; addThrows?: boolean } = {}) => {
+    const m = new Map<string, CryptoKeyPair>()
+    return {
+      m,
+      backend: {
+        read: async (u: string) => m.get(u),
+        add: async (u: string, p: CryptoKeyPair) => {
+          if (opts.addThrows) throw new Error('ConstraintError: another tab kept one')
+          if (opts.keeps !== false && !m.has(u)) m.set(u, p)
+        },
+      },
+    }
+  }
+
+  it('frames the offer transcript as the device does: an empty answer fingerprint', async () => {
+    // The known answer was computed outside both implementations (Perl's
+    // Digest::SHA over the same framing); the device's tests pin it too.
+    const t = peerAuthTranscript(
+      'offer',
+      '66f0c0ffee0000000000000a',
+      '66f0c0ffee0000000000000b',
+      '66f0c0ffee0000000000000c',
+      'sha-256 AA:BB:CC',
+      '',
+      NONCE,
+    )!
+    expect(t.length).toBe(149)
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', t))
+    expect(hex(digest)).toBe('3c3da0182f79f04f878356ddbb0983d748b8152a15912a92d095429756428840')
+  })
+
+  it('makes one non-extractable key per user and keeps returning it', async () => {
+    const { backend } = mapBackend()
+    const first = await controllerKeyFor('u1', backend)
+    expect(first).not.toBeNull()
+    expect(first!.privateKey.extractable).toBe(false)
+    const again = await controllerKeyFor('u1', backend)
+    expect(await controllerPublicKey(again!)).toBe(await controllerPublicKey(first!))
+    const other = await controllerKeyFor('u2', backend)
+    expect(await controllerPublicKey(other!)).not.toBe(await controllerPublicKey(first!))
+  })
+
+  it('takes the key another tab kept first, and has none where nothing can be kept', async () => {
+    const { m, backend } = mapBackend({ addThrows: true })
+    const keptByTheOtherTab = (await crypto.subtle.generateKey(
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      false,
+      ['sign', 'verify'],
+    )) as CryptoKeyPair
+    const racing = {
+      read: async (u: string) => (m.size === 0 ? undefined : m.get(u)),
+      add: async (u: string, p: CryptoKeyPair) => {
+        m.set(u, keptByTheOtherTab)
+        return backend.add(u, p)
+      },
+    }
+    const got = await controllerKeyFor('u1', racing)
+    expect(await controllerPublicKey(got!)).toBe(await controllerPublicKey(keptByTheOtherTab))
+
+    expect(await controllerKeyFor('u1', mapBackend({ keeps: false }).backend)).toBeNull()
+    expect(await controllerKeyFor('u1', null)).toBeNull()
+    // This spec runs in Node, which has no IndexedDB: no backend, so no key.
+    expect(indexedDbKeyBackend()).toBeNull()
+  })
+
+  it('signs the offer so the device verifies it, and asks unsigned without a key', async () => {
+    const { backend } = mapBackend()
+    const pair = (await controllerKeyFor('66f0c0ffee0000000000000c', backend))!
+    const ids = {
+      nonce: NONCE,
+      sessionId: '66f0c0ffee0000000000000a',
+      agentId: '66f0c0ffee0000000000000b',
+      userId: '66f0c0ffee0000000000000c',
+      offerFingerprint: 'sha-256 AA:BB:CC',
+    }
+    const ask = await offerAsk({ ...ids, pair })
+    expect(ask.nonce).toBe(NONCE)
+    expect(deviceKeyPoint(ask.key)).not.toBeNull()
+    const transcript = peerAuthTranscript(
+      'offer',
+      ids.sessionId,
+      ids.agentId,
+      ids.userId,
+      ids.offerFingerprint,
+      '',
+      NONCE,
+    )!
+    expect(await verifyPeerAuth(ask.key!, transcript, ask.sig!)).toBe(true)
+    // Over this offer only: as an answer, or for another session, it fails.
+    const asAnswer = peerAuthTranscript(
+      'answer',
+      ids.sessionId,
+      ids.agentId,
+      ids.userId,
+      ids.offerFingerprint,
+      '',
+      NONCE,
+    )!
+    expect(await verifyPeerAuth(ask.key!, asAnswer, ask.sig!)).toBe(false)
+
+    expect(await offerAsk({ ...ids, pair: null })).toEqual({ nonce: NONCE })
+  })
+
+  it('gives up on a key store that never answers', async () => {
+    const never = new Promise<CryptoKeyPair | null>(() => {})
+    expect(await withinMs(never, 20)).toBeNull()
   })
 })
