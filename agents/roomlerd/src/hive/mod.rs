@@ -96,6 +96,10 @@ mod store;
 mod sudo;
 mod supervisor;
 mod toolbelt;
+/// FR-90 P3-5b-2 — `vault_connect`: an endpoint that signs in to a database
+/// with a secret's value, for the session's account, as long as its leases.
+#[cfg(feature = "vault")]
+mod vault_connect;
 /// FR-90 P3-4c-1 — `vault_exec`: a command run with values from the vault.
 #[cfg(feature = "vault")]
 mod vault_exec;

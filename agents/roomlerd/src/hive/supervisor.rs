@@ -729,6 +729,15 @@ pub fn init(cfg: &AgentConfig) {
                 "hive: removed the secrets directories an earlier process left"
             );
         }
+        // P3-5b-2 — and the endpoints `vault_connect` served: their sockets
+        // would only refuse, and their directories hold nothing else.
+        let gone = super::vault_connect::sweep(&runtime_root());
+        if gone > 0 {
+            info!(
+                gone,
+                "hive: removed the proxy endpoints an earlier process left"
+            );
+        }
     }
     // P1h-2 — `hive` is in the release builds, so every device runs this. One
     // whose owner never turned agent sessions on keeps no store: nothing is
@@ -7615,6 +7624,13 @@ done
             assert!(!root.path().join(sid).join("secrets").exists());
             assert!(root.path().join(sid).join("settings.json").exists());
         }
+        // P3-5b-2 — and every endpoint directory, the rest kept.
+        let endpoint = root.path().join("a1").join("proxies").join("0123abcd");
+        std::fs::create_dir_all(&endpoint).unwrap();
+        std::fs::write(endpoint.join(".s.PGSQL.5432"), b"").unwrap();
+        assert_eq!(super::super::vault_connect::sweep(root.path()), 1);
+        assert!(!root.path().join("a1").join("proxies").exists());
+        assert!(root.path().join("a1").join("settings.json").exists());
     }
 
     /// A reconnect replays the latest state of every session — what a dying

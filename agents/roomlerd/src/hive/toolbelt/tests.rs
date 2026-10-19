@@ -476,6 +476,9 @@ struct FakeVault {
     /// P3-4d-2 — each use reported.
     #[cfg(feature = "vault")]
     reports: std::sync::Mutex<Vec<crate::vault::Report>>,
+    /// P3-5b-2 — what each lease stops when it is let go.
+    #[cfg(feature = "vault")]
+    stops: std::sync::Mutex<Vec<(String, CancellationToken)>>,
 }
 
 impl FakeVault {
@@ -595,6 +598,18 @@ impl VaultTools for FakeVault {
     }
 
     #[cfg(feature = "vault")]
+    fn stop_with(&self, lease_id: &str, stop: CancellationToken) -> bool {
+        if !self.held.lock().unwrap().contains_key(lease_id) {
+            return false;
+        }
+        self.stops
+            .lock()
+            .unwrap()
+            .push((lease_id.to_string(), stop));
+        true
+    }
+
+    #[cfg(feature = "vault")]
     fn value(&self, lease_id: &str) -> Option<zeroize::Zeroizing<Vec<u8>>> {
         self.held
             .lock()
@@ -609,6 +624,12 @@ impl VaultTools for FakeVault {
         for id in lease_ids {
             held.remove(id);
             self.released.lock().unwrap().push(id.clone());
+            // What it served stops, as the daemon's client stops it.
+            for (lease, stop) in self.stops.lock().unwrap().iter() {
+                if lease == id {
+                    stop.cancel();
+                }
+            }
         }
     }
 
@@ -686,10 +707,18 @@ async fn the_vault_tools_are_offered_only_where_the_device_takes_leases() {
     let tools = list["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names[..3], ["approve", "vault_list", "vault_describe"]);
-    // P3-4c — and, in a build with the vault, its uses and (P3-4c-3) a
-    // lease asked for ahead.
+    // P3-4c — and, in a build with the vault, its uses, (P3-5b-2) an
+    // endpoint, and (P3-4c-3) a lease asked for ahead.
     #[cfg(feature = "vault")]
-    assert_eq!(names[3..], ["vault_exec", "vault_render", "vault_request"]);
+    assert_eq!(
+        names[3..],
+        [
+            "vault_exec",
+            "vault_render",
+            "vault_connect",
+            "vault_request"
+        ]
+    );
     #[cfg(not(feature = "vault"))]
     assert_eq!(names.len(), 3);
     for t in &tools[1..3] {
@@ -916,7 +945,22 @@ async fn vault_exec_is_offered_and_never_allowed_unasked() {
         render["inputSchema"]["required"],
         json!(["template", "dest"])
     );
-    for tool in ["mcp__roomler__vault_exec", "mcp__roomler__vault_render"] {
+    // P3-5b-2 — and `vault_connect`: no value handed on, but it acts as the
+    // secret's user.
+    let connect = tools
+        .iter()
+        .find(|t| t["name"] == "vault_connect")
+        .expect("offered");
+    assert_eq!(connect["annotations"]["readOnlyHint"], false, "{connect}");
+    assert_eq!(
+        connect["inputSchema"]["required"],
+        json!(["handle", "engine", "upstream"])
+    );
+    for tool in [
+        "mcp__roomler__vault_exec",
+        "mcp__roomler__vault_render",
+        "mcp__roomler__vault_connect",
+    ] {
         assert!(
             !VAULT_TOOLS.contains(&tool),
             "the settings never allow {tool}: a person approves every call"
@@ -1428,6 +1472,336 @@ async fn vault_render_takes_a_lease_asked_for_ahead_toward_its_file() {
         "db/main#user for other.env 60s",
         "asked for afresh toward another file"
     );
+}
+
+/// P3-5b-2 — the answer to a `vault_connect` call: its JSON, or its error
+/// text.
+#[cfg(all(feature = "vault", unix))]
+async fn connect_answer(c: &mut Client, id: u64, args: Value) -> Result<Value, String> {
+    c.send(tool_call(id, "vault_connect", args)).await;
+    let m = c.recv().await;
+    assert_eq!(m["id"], id, "{m}");
+    let text = m["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    if m["result"]["isError"] == true {
+        Err(text)
+    } else {
+        Ok(serde_json::from_str(&text).unwrap())
+    }
+}
+
+/// P3-5b-2 — `vault_connect` leases the secret's user and password, and its
+/// CA, toward the upstream it names, and serves an endpoint only the
+/// session's account reaches. A client that sends no password gets a session
+/// there as the secret's user, and the answer holds no value. When a lease
+/// goes, the endpoint goes with every connection it held, and the call's
+/// other leases are let go rather than held to their expiry.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn vault_connect_serves_an_endpoint_that_signs_in_as_the_secrets_user() {
+    use crate::vault_proxy::testing::{Saw, Upstreams, fake, made, message, next, startup};
+    let pw = made();
+    let (ca, port, mut saw) = fake(Upstreams::Scram(pw.clone())).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, sid) = exec_belt(
+        dir.path(),
+        &[
+            ("db/main#user", b"app"),
+            ("db/main#password", pw.as_bytes()),
+            ("pki/db-ca", ca.as_bytes()),
+        ],
+    );
+    let upstream = format!("localhost:{port}");
+    let mut c = Client::connect(&b).await;
+    let answer = connect_answer(
+        &mut c,
+        1,
+        json!({
+            "handle": "db/main",
+            "engine": "postgres",
+            "upstream": upstream,
+            "database": "orders",
+            "ca": "pki/db-ca",
+            "ttl_s": 60,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !answer.to_string().contains(&pw),
+        "the answer holds no value"
+    );
+    let host = PathBuf::from(answer["host"].as_str().unwrap());
+    let proxies = dir.path().join("run").join("proxies");
+    assert_eq!(host.parent(), Some(proxies.as_path()));
+    assert_eq!(answer["port"], 5432);
+    assert_eq!(answer["database"], "orders");
+    assert_eq!(answer["ttl_s"], 60);
+    assert_eq!(answer["env"]["PGHOST"], json!(host.to_string_lossy()));
+    assert_eq!(answer["env"]["PGDATABASE"], "orders");
+    assert!(
+        answer["uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("postgresql:///orders?host=/"),
+        "{answer}"
+    );
+    let socket = host.join(".s.PGSQL.5432");
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&proxies), 0o711);
+    assert_eq!(mode(&host), 0o711);
+    assert_eq!(mode(&socket), 0o600);
+    let lease = |h: &str| {
+        (
+            "lease_proxy".to_string(),
+            sid,
+            5,
+            format!("{h} for {upstream} 60s"),
+        )
+    };
+    assert_eq!(
+        vault.asked(),
+        [
+            lease("db/main#user"),
+            lease("db/main#password"),
+            lease("pki/db-ca")
+        ]
+    );
+
+    // A client with no password: a session, as the secret's user.
+    let mut pg = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    pg.write_all(&startup(&[("user", "whoever"), ("database", "orders")]))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut pg).await, (b'R', vec![0, 0, 0, 0]));
+    assert_eq!(next(&mut pg).await.0, b'S');
+    assert_eq!(next(&mut pg).await.0, b'K');
+    assert_eq!(next(&mut pg).await.0, b'Z');
+    assert_eq!(
+        saw.recv().await.unwrap(),
+        Saw::Startup(vec![
+            ("user".into(), "app".into()),
+            ("database".into(), "orders".into()),
+        ])
+    );
+    pg.write_all(&message(b'Q', b"select 1\0")).await.unwrap();
+    assert_eq!(next(&mut pg).await.0, b'C');
+    assert_eq!(next(&mut pg).await.0, b'Z');
+    assert_eq!(saw.recv().await.unwrap(), Saw::Query("select 1".into()));
+    assert!(
+        vault.released.lock().unwrap().is_empty(),
+        "kept while the endpoint serves"
+    );
+
+    // The password's lease goes: the endpoint closes, its connection with it,
+    // and the call's other leases are let go.
+    vault.release(&["L1".to_string()]);
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(
+        WAIT,
+        tokio::io::AsyncReadExt::read_to_end(&mut pg, &mut rest),
+    )
+    .await;
+    assert!(ended.is_ok(), "the connection ended with the lease");
+    let gone = async {
+        while host.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(WAIT, gone)
+        .await
+        .expect("the endpoint's directory goes");
+    let released = || {
+        let mut r = vault.released.lock().unwrap().clone();
+        r.sort();
+        r.dedup();
+        r
+    };
+    let lets_go = async {
+        while released().len() < 3 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(WAIT, lets_go)
+        .await
+        .expect("the call's leases are let go");
+    assert_eq!(released(), ["L0", "L1", "L2"]);
+    assert!(
+        tokio::net::UnixStream::connect(&socket).await.is_err(),
+        "nothing left to dial"
+    );
+}
+
+/// P3-5b-2 — a refused lease opens no endpoint and lets the call's others
+/// go; a call the device refuses asks the vault nothing.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn a_refused_connect_opens_no_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, _) = exec_belt(dir.path(), &[("db/main#user", b"app")]);
+    let mut c = Client::connect(&b).await;
+    let refused = connect_answer(
+        &mut c,
+        1,
+        json!({"handle": "db/main", "engine": "postgres", "upstream": "db.internal:5432"}),
+    )
+    .await;
+    assert_eq!(
+        refused,
+        Err("db/main#password: the vault refused: no_secret".into())
+    );
+    assert_eq!(*vault.released.lock().unwrap(), ["L0"]);
+    assert!(vault.stops.lock().unwrap().is_empty());
+    assert!(
+        !dir.path().join("run").join("proxies").exists(),
+        "no endpoint"
+    );
+    let asked = vault.asked().len();
+    for bad in [
+        json!({"handle": "db/main#password", "engine": "postgres", "upstream": "db.internal:5432"}),
+        json!({"handle": "db/main", "engine": "mysql", "upstream": "db.internal:5432"}),
+        json!({"handle": "db/main", "engine": "postgres", "upstream": "db.internal"}),
+    ] {
+        assert!(connect_answer(&mut c, 2, bad).await.is_err());
+    }
+    assert_eq!(vault.asked().len(), asked, "nothing asked of the vault");
+}
+
+/// P3-5b-2 — a run holds a bounded number of endpoints: one more is refused
+/// before the vault is asked, and an endpoint that closes gives its place
+/// back.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn a_run_holds_a_bounded_number_of_endpoints() {
+    use super::super::vault_connect::MAX_ENDPOINTS;
+    use crate::vault_proxy::testing::{Upstreams, fake, made};
+    // An upstream to name, never dialled: its CA is what the endpoint trusts.
+    let (ca, port, _saw) = fake(Upstreams::Trusting).await;
+    let pw = made();
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, _) = exec_belt(
+        dir.path(),
+        &[
+            ("db/main#user", b"app"),
+            ("db/main#password", pw.as_bytes()),
+            ("pki/db-ca", ca.as_bytes()),
+        ],
+    );
+    let call = json!({
+        "handle": "db/main",
+        "engine": "postgres",
+        "upstream": format!("localhost:{port}"),
+        "ca": "pki/db-ca",
+    });
+    let mut c = Client::connect(&b).await;
+    let mut first = None;
+    for id in 0..MAX_ENDPOINTS as u64 {
+        let answer = connect_answer(&mut c, id, call.clone()).await.unwrap();
+        first.get_or_insert(PathBuf::from(answer["host"].as_str().unwrap()));
+    }
+    let asked = vault.asked().len();
+    let refused = connect_answer(&mut c, 100, call.clone()).await.unwrap_err();
+    assert!(refused.contains("endpoints already"), "{refused}");
+    assert_eq!(vault.asked().len(), asked, "nothing asked of the vault");
+    // The first endpoint's CA lease goes, and with it the endpoint.
+    vault.release(&["L2".to_string()]);
+    let first = first.unwrap();
+    let gone = async {
+        while first.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(WAIT, gone).await.unwrap();
+    let mut again = Err(String::new());
+    for id in 200..250 {
+        again = connect_answer(&mut c, id, call.clone()).await;
+        if again.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(again.is_ok(), "its place is given back: {again:?}");
+}
+
+/// P3-5b-2 — a connection from any account but the session's is refused,
+/// root's included: the socket is handed to the session's account, and each
+/// connection's uid is checked again. Handing a socket to another account
+/// needs root, as the daemon has; anywhere else this test says so and stops.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn a_proxy_connection_from_another_account_is_refused() {
+    use crate::vault_proxy::testing::{Upstreams, fake, made, startup};
+    // SAFETY: geteuid reads our own credentials; it cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipped: handing a socket to another account needs root");
+        return;
+    }
+    let pw = made();
+    let (ca, port, mut saw) = fake(Upstreams::Scram(pw.clone())).await;
+    let dir = tempfile::tempdir().unwrap();
+    let vault = Arc::new(FakeVault {
+        values: [
+            ("db/main#user", b"app".to_vec()),
+            ("db/main#password", pw.as_bytes().to_vec()),
+            ("pki/db-ca", ca.as_bytes().to_vec()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect(),
+        ..FakeVault::default()
+    });
+    std::fs::create_dir_all(dir.path().join("run")).unwrap();
+    // The session runs as an account that is not this test's.
+    let other = (4242, 4242);
+    let b = belt_running(
+        me(),
+        Run {
+            session: ObjectId::new(),
+            fence: 5,
+            vault: Some(vault.clone()),
+            exec: Some(super::super::vault_exec::ExecTarget {
+                account: None,
+                home: dir.path().to_path_buf(),
+                folder: dir.path().to_path_buf(),
+                session_dir: dir.path().join("run"),
+                owner: Some(other),
+            }),
+        },
+        quick(),
+    );
+    let mut c = Client::connect(&b).await;
+    let answer = connect_answer(
+        &mut c,
+        1,
+        json!({
+            "handle": "db/main",
+            "engine": "postgres",
+            "upstream": format!("localhost:{port}"),
+            "ca": "pki/db-ca",
+        }),
+    )
+    .await
+    .unwrap();
+    let socket = PathBuf::from(answer["host"].as_str().unwrap()).join(".s.PGSQL.5432");
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(&socket).unwrap();
+        assert_eq!((m.uid(), m.gid()), other, "handed to the session's account");
+    }
+    // Root passes the socket's own permissions; the endpoint's check does not.
+    let mut pg = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    let _ = pg.write_all(&startup(&[("database", "d")])).await;
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(
+        WAIT,
+        tokio::io::AsyncReadExt::read_to_end(&mut pg, &mut rest),
+    )
+    .await;
+    assert!(ended.is_ok(), "the connection was closed");
+    assert!(rest.is_empty(), "and answered nothing: {rest:?}");
+    assert!(saw.try_recv().is_err(), "no upstream was dialled");
 }
 
 /// More open approvals than Claude Code ever asks for, and a question the

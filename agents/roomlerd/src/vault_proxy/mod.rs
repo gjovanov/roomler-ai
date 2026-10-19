@@ -11,9 +11,11 @@
 //! | [`tls`] | TLS to an upstream, always verified: the system's roots, and a CA the secret holds |
 //! | [`pg`] | one Postgres session: the client let in by the endpoint, the upstream by SCRAM |
 //!
-//! P3-5b-1 builds these; P3-5b-2's endpoint and `vault_connect` tool are
-//! their first caller.
+//! P3-5b-1 builds these; P3-5b-2's endpoint (`hive::vault_connect`) serves
+//! them, one session per connection.
 
 pub(crate) mod pg;
 pub(crate) mod scram;
+#[cfg(test)]
+pub(crate) mod testing;
 pub(crate) mod tls;
