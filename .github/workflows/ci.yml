@@ -567,7 +567,15 @@ jobs:
         #     writes, enigo's key and pointer mapping, and #1945's release that
         #     never moves) ran in no lane; the Xvfb step runs only its real-X modules.
         #     uinput is plain ioctls, and no test opens /dev/uinput or needs X.
-        run: cargo test -p roomlerd --features vp9-444,vp9-444-bindgen,clipboard,ssh-server,hive,vault,portal-capture,drm-capture,uinput-input,enigo-input --lib
+        #   - FR-52's device half (`external-access`): a seventh. The OPAQUE
+        #     login's replies, the device's admission (its own ceiling and
+        #     consent mode, and the RECORD/PRIVACY an outsider never holds),
+        #     the MAC binding and the single-use login table are all behind
+        #     the feature, and no lane enabled it. The integration crate builds
+        #     the agent WITH it, but only as a dependency, and a dependency's
+        #     own tests never run. opaque-ke and argon2 are pure Rust; the suite
+        #     takes ~20 s.
+        run: cargo test -p roomlerd --features vp9-444,vp9-444-bindgen,clipboard,ssh-server,hive,vault,portal-capture,drm-capture,uinput-input,enigo-input,external-access --lib
 
       - name: Test tunnel-core --features overlay-l3,overlay-netstack
         # WG handshake (direct + RelayConn) + the TUN↔WG bridge loopback
