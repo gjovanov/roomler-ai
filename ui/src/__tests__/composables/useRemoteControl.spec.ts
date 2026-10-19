@@ -70,6 +70,7 @@ import {
   isRetryableRcErrorCode,
   isFalloutOfEndedSession,
   readyRecoveryAction,
+  terminateAction,
   sessionGateAllows,
   nextStallAction,
   nextStallTicks,
@@ -4312,6 +4313,37 @@ describe('2026-08-05 consent wedge: readyRecoveryAction', () => {
 
   it('fails honestly when there is nothing to retry with', () => {
     expect(readyRecoveryAction(true, false, false)).toBe('fail')
+  })
+})
+
+describe('FR-100 P2a field: terminateAction', () => {
+  it('leaves a failed session failed, whatever the terminate says', () => {
+    // Field-caught on prod 2026-10-19: a key-changed refusal sent rc:terminate
+    // and failed the session, the server's echo then turned the error into a
+    // plain close, and the error view, with "Trust the new key and connect",
+    // never showed.
+    for (const retryable of [true, false]) {
+      for (const canReplay of [true, false]) {
+        expect(terminateAction({ phase: 'error', retryable, canReplay })).toBe('keep-error')
+      }
+    }
+  })
+
+  it('reconnects an involuntary end it can replay, and closes everything else', () => {
+    expect(terminateAction({ phase: 'connected', retryable: true, canReplay: true })).toBe(
+      'reconnect',
+    )
+    expect(terminateAction({ phase: 'negotiating', retryable: true, canReplay: true })).toBe(
+      'reconnect',
+    )
+    expect(terminateAction({ phase: 'connected', retryable: true, canReplay: false })).toBe(
+      'close',
+    )
+    expect(terminateAction({ phase: 'connected', retryable: false, canReplay: true })).toBe(
+      'close',
+    )
+    expect(terminateAction({ phase: 'idle', retryable: true, canReplay: true })).toBe('close')
+    expect(terminateAction({ phase: 'closed', retryable: true, canReplay: true })).toBe('close')
   })
 })
 

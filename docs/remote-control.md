@@ -532,7 +532,7 @@ The pump ([`peer.rs:12441`](../agents/roomlerd/src/peer.rs#L12441)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5421`](../agents/roomlerd/src/peer.rs#L5421); the viewer parses it
-at [`useRemoteControl.ts:1417`](../ui/src/composables/useRemoteControl.ts#L1417)
+at [`useRemoteControl.ts:1445`](../ui/src/composables/useRemoteControl.ts#L1445)
 and puts it on the toggle's title
 ([`RemoteControl.vue:3190`](../ui/src/views/remote/RemoteControl.vue#L3190)).
 
@@ -1431,27 +1431,31 @@ A remote-control feature is the most-abused capability in any product. Mitigatio
 - **An outsider is never recorded and never covers the screen** (FR-52 §10 and decision 13). A controller from outside the organization is never granted `RECORD` (`controller_not_allowed`) or `PRIVACY` (`privacy_refused` `outside_the_org`). The person at the device let a stranger in on a password, and is the only one placed to see what that stranger does. The device strips both again when it admits the session, so a compromised server cannot hand them back.
 - **No prompt-bombing** (FR-101 P4a). A caller may send one device at most 60 session requests a minute, checked after the authz gate, so a caller who may not ask is refused by identity first. Past the ceiling the answer is `rc:error` `rate_limited`, which the viewer does not retry. Each request can put a consent prompt in front of the person at the device, and the control WS is outside the per-IP HTTP governor.
 
-### 11.4a The device proves it is the one answering (FR-100 P1–P2a)
+### 11.4a The device and the browser prove who they are (FR-100 P1–P2b)
 
 The SDP is the only thing that says whose DTLS key is whose (webrtc-rs checks each side's certificate against
 the fingerprint in the SDP), and the hub rebuilds every offer and answer frame around it. So whoever holds the
-hub, its Redis, or the device's signalling leg could swap the device's fingerprint for their own, and the
-viewer would complete DTLS with them. FR-100 ties the answer to a key only the device holds:
+hub, its Redis, or a signalling leg could swap a fingerprint for their own, and the other side would complete
+DTLS with them. FR-100 ties the answer to a key only the device holds, and the offer to a key only this browser
+holds:
 
 ```mermaid
 sequenceDiagram
   autonumber
   participant B as Viewer (browser)
-  participant H as Hub (relays only)
+  participant H as Hub (relays; records the verdict)
   participant D as Device (roomlerd)
   Note over D: P1a: one P-256 key per enrollment,<br/>peer-auth/&lt;tenant&gt;.json; the public half<br/>rides the hello and the device row
-  B->>H: rc:sdp.offer + peer_auth {nonce}
+  Note over B: P2b: one P-256 key per user,<br/>non-extractable, in IndexedDB
+  B->>H: rc:sdp.offer + peer_auth {nonce, key, sig}
   H->>D: relayed verbatim
-  Note over D: transcript = label, role "answer", session,<br/>agent, user, offer fp, answer fp, nonce
-  D->>H: rc:sdp.answer + peer_auth {key, sig}
-  H->>B: relayed verbatim
-  Note over B: verify BEFORE setRemoteDescription;<br/>pin the key per (user, device) on first use
-  B-->>D: DTLS only with the certificate the signature named
+  Note over D: P1c: verify the offer (role "offer", empty answer fp);<br/>look the key up for this user, remember it if new
+  Note over D: P1b: sign the answer (role "answer",<br/>both fingerprints, the same nonce)
+  D->>H: rc:sdp.answer + peer_auth {key, sig} + peer_auth_verdict
+  Note over H: records the verdict on session_started<br/>(the device's word), relays the rest
+  H->>B: rc:sdp.answer + peer_auth {key, sig}
+  Note over B: P2a: verify BEFORE setRemoteDescription;<br/>pin the key per (user, device) on first use
+  B-->>D: DTLS only with the certificates both signatures named
 ```
 
 - **When the page asks** ([`shouldAskPeerAuth`, `peerAuth.ts:152`](../ui/src/utils/peerAuth.ts#L152)): an
@@ -1531,6 +1535,13 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   `key` and `sig` over the transcript with role `offer` and an empty answer fingerprint
   ([`offerAsk`, `peerAuth.ts:506`](../ui/src/utils/peerAuth.ts#L506)). A browser that cannot keep a key asks
   unsigned, and the device records `absent`: a key made per page would reach it as a new browser on every visit.
+
+> ⚠️ **The verdict is the device's word, kept on the server's row.** `remote_audit` otherwise holds the server's
+> own decisions, while a device's claims live apart (`transfer_activity`, `ssh_activity`, `privacy_activity`).
+> `session_started.peer_auth` is the exception, on purpose: it describes the session's start, and the fleet's
+> audit week counts it per session. The hub only checks that it is one of the four words; it cannot check the
+> judgement behind it. A compromised device can misreport only its own trust decision, which it controls
+> anyway. Read a `verified` as "the device says it knew this browser", never as "the server verified".
 
 ### 11.5 The host's Disconnect (FR-27 P10)
 
@@ -1740,7 +1751,7 @@ sequenceDiagram
 | Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:3783`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:12371`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:574`), on both ends' `rc:terminate` and in the `session_ended` audit row |
-| Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:306`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:710`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:370`, #2326) |
+| Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:306`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:738`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:398`, #2326) |
 | Tests | the predicate on recorded offers (`codec_cap_tests` in `peer.rs`); the field's own offer, which `create_answer` fails on, is the one it refuses (`agents/roomlerd/tests/dc_track_codec.rs`); who may name the code (`only_the_device_names_no_common_codec`, `hub.rs:4594`); the real agent through a real server, with an H.264 offer as the control (`crates/tests/src/rc_no_common_codec_tests.rs:147`) |
 
 ⚠️ **The consent prompt has already been answered** by the time the offer
@@ -1958,7 +1969,7 @@ sequenceDiagram
 
 The viewer surfaces the code (`rcErrorMessage`) — a first connect fails fast
 with an attributable reason, and an attempt already inside the ladder advances
-on it instead (`isRetryableRcErrorCode`, `useRemoteControl.ts:356`) — so the
+on it instead (`isRetryableRcErrorCode`, `useRemoteControl.ts:384`) — so the
 undeliverable case never waits for any timer. ⚠️ **What the server genuinely
 cannot see** is the case
 actually observed in the field: a session that *reached* the agent, gathered
