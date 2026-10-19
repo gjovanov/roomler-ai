@@ -23,7 +23,7 @@ set, switches mutter on by itself, or the portal where mutter is absent (§1.2).
 
 ## 1. The cascade
 
-`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2199`) tries the
+`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2202`) tries the
 backends in this order and returns the first that opens. On Linux the Windows
 arms (SystemContext, WGC) do not exist, so the order is:
 
@@ -583,6 +583,58 @@ display connects: the only viewer of that Xvfb is a remote controller, so the
 native consent panel would be drawn where nobody can see it (`indicator/x11.rs:193`
 reads the daemon's own `ROOMLERD_VIRTUAL_DESKTOP` and declines). Detail in
 [`remote-control.md` §11.2](remote-control.md#112-consent).
+
+### 2.1 The pointer (FR-97 P3a)
+
+X11 draws the pointer as a sprite over the framebuffer, so an XShm frame never
+carries it. Until P3a the cursor channel said nothing on this arm, and the
+viewer drew a stand-in at the controller's own mouse. Now the capture worker
+reads the pointer from XFixes, on a connection of its own, and publishes it in
+the slot the DRM arm's cursor plane uses (§3.1). The channel's tracker sends it
+from there with no change of its own
+(`agents/roomlerd/src/capture/x11_cursor.rs`):
+
+```mermaid
+sequenceDiagram
+    participant X as the X server
+    participant W as the capture worker<br/>(X11Cursor)
+    participant S as drm_cursor::publish / latest
+    participant T as CursorTracker::poll<br/>(the cursor channel, 120 Hz)
+    participant V as the viewer
+    W->>X: at open: XFixes, SelectCursorInput(root, DisplayCursor)
+    loop every frame request, a skipped one too
+        X-->>W: CursorNotify, when the cursor changed
+        alt changed, or a second since the last read
+            W->>X: GetCursorImageAndName: place, hotspot, ARGB, name
+        else
+            W->>X: QueryPointer: the place only
+        end
+        W->>S: the hotspot on the captured monitor, and the shape
+    end
+    T->>S: latest()
+    T->>V: cursor:shape once per id, cursor:pos each tick, cursor:hide
+```
+
+| | What | Why |
+|---|---|---|
+| when | every frame request, before the damage check can skip the frame | a pointer moving over a still desktop damages nothing, and must still move on the viewer's side |
+| the shape | read on `CursorNotify`, and at least every second | otherwise one small `QueryPointer` a frame: a 64×64 image every frame would be 16 KB a request |
+| the image | premultiplied ARGB, straightened and cropped by the DRM arm's own conversion (`straighten_and_crop`) | the wire wants straight alpha, and a theme's image is padded |
+| the place | the hotspot less the captured monitor's origin on the root window | the viewer draws the image at the place less the hotspot (§3.1) |
+| a name | the CSS keyword for the names themes give their standard cursors: `left_ptr` is `default`, `xterm` is `text`, `hand2` is `pointer` | the viewer shows its own native cursor for one, as for the Windows tracker's stock cursors |
+| an invisible cursor | `cursor:hide` | an app hides the pointer with a fully transparent cursor, and FR-109's relative mouse waits for exactly that |
+
+**Kill switch**: `ROOMLERD_X11_CURSOR=0` opens no XFixes connection and
+publishes nothing. The viewer draws its stand-in, as before P3a.
+
+**Field** (FR-97 §8, 2026-10-19): a per-user install on GNOME 46 over Xorg,
+the production viewer putting the pointer at three places on a 1280×800
+picture:
+
+| | 0.4.145 | the P3a candidate | the candidate, `ROOMLERD_X11_CURSOR=0` |
+|---|---|---|---|
+| the cursor channel | one `cursor:hide`, nothing else | one `cursor:shape` (18×24, `css: default`), then `cursor:pos` | one `cursor:hide`, nothing else |
+| the pointer at (0.25, 0.25), (0.75, 0.6), (0.5, 0.5) | — | (320, 200), (959, 479), (640, 400) | — |
 
 ## 3. The DRM arm (FR-36)
 
@@ -1959,6 +2011,7 @@ the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/co
 |---|---|---|---|
 | `drm_capture` | `ROOMLERD_DRM_CAPTURE` | off | the DRM/KMS arm (§3). Unattended; sees the greeter and a locked screen; no damage information |
 | — | `ROOMLERD_DRM_CURSOR` | **on** | FR-93 P3c (§3.1): the DRM arm reads the cursor plane for the cursor channel. Off = the viewer's own badge for the pointer, as before P3c |
+| — | `ROOMLERD_X11_CURSOR` | **on** | FR-97 P3a (§2.1): the X11 arm reads the pointer from XFixes for the cursor channel. Off = the viewer's own stand-in for the pointer, as before P3a |
 | — | `ROOMLERD_DRM_IDLE_SKIP` | **on** | FR-93 P3d (§3.2): on a Wayland seat the DRM arm skips a frame nothing changed in, and from FR-113 P1 on an X11 seat too, by dense rows. Off = every frame read, converted and encoded, as before P3d |
 | — | `ROOMLERD_DRM_WAKE_WAIT` | **on** | FR-93 P3e (§3.3): a display switched off is told to the controller (`display_wake`) and waited out, by a running session and by an open. Off = the last frame kept alive with no reason, and an open during the blank falls through the cascade, as before P3e |
 | — | `ROOMLERD_DRM_FOLLOW_CAP` | **on** | FR-107 P1 (§3.4): the DRM arm reads at half size whenever half the scanout still covers the pump's encode box. Off = the policy alone decides, as before P1 |
@@ -2026,6 +2079,7 @@ defect — the capture arms only expose it by being knobs.
 | `agents/roomlerd/src/desktop_brief.rs` | FR-93 P2b: the hello's `desktop` brief, its `desktop-brief` refresher (`start` `:47`) and the session a controller would see (`seen_session` `:96`); P3d's `seen_is_wayland` (`:34`); `planned_arm`, P4's `planned_input_route` and `arm_facts` live beside the cascade in `capture/mod.rs` (`:789`, `:816`, `:832`) |
 | `agents/roomlerd/src/keep_busy/logind.rs` | the logind facts the cascade, the brief and keep busy read (`Session` `:36`, `parse_show` `:72`, `sessions` `:157`); FR-93 P5g: a session in the background, never one closing (`in_background` `:65`) |
 | `agents/roomlerd/src/capture/scrap_backend.rs` · `x11_damage.rs` | the X11 arm and its damage listener |
+| `agents/roomlerd/src/capture/x11_cursor.rs` | FR-97 P3a: the X11 pointer for the cursor channel (`X11Cursor::open`, `publish`), its shape (`shape_of`) and its CSS keyword (`css_for`) |
 | `agents/roomlerd/src/virtual_desktop.rs` | Xvfb + WM + startup apps for `ROOMLERD_VIRTUAL_DESKTOP=1` |
 | `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled` `:209`, `primary` `:718`) and the scanout's channel order, both depths (`Layout::of` `:557`, `repack_to_bgra` `:579`, `repack_bgra_half` `:1102`); FR-93 P3c: the plane table with each plane's type (`read_planes` `:258`), the primary by type (`primary_plane` `:306`), the cursor caps (`enable_cursor_caps` `:385`) and the per-frame cursor read (`CursorReader` `:398`, `read_cursor_pixels` `:480`); FR-93 P3d/P3f: the buffer's identity (`BufferId` `:118`) and the mapping's key (`maps` `:132`), the kill switch (`idle_skip_enabled` `:333`), the gate in `grab` (`:915`), and the still screen waited out in `next_frame` (`:1175`); FR-93 P3e: a display switched off (`display_off` `:356`, for an open `display_is_off` `:374`), told apart in the worker loop (`:872`), waited out in `next_frame` (`:1237`, `DARK_POLL` `:348`) and reported by `waits_for` (`:1266`), and its kill switch (`wake_wait_enabled` `:341`); FR-93 P3h: a scanout this daemon may not read, refused at open (`unreadable` `:908`) |
 | `agents/roomlerd/src/capture/drm_cursor.rs` | FR-93 P3c: the published cursor (`publish` `:64`, `latest` `:71`) and the pure conversions (`straighten_and_crop` `:108`, `place` `:167`, `shape_id` `:181`, `pick_primary` `:208`) |
