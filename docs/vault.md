@@ -24,8 +24,9 @@ People use it too.
 > report, kept apart from the decisions (§17); P3-4e, the approval a policy
 > may ask for: a card in the session's room that one of its drivers
 > answers, a session's tools that wait for the answer, and the card's
-> buttons in the web app (§18); and P3-5a, a secret's `audiences` held to
-> for `proxy` mode, the first step of the proxies (§7).** No released
+> buttons in the web app (§18); P3-5a, a secret's `audiences` held to for
+> `proxy` mode, the first step of the proxies (§7); and P3-5b-1, the
+> Postgres engine that a proxy endpoint will serve (§19).** No released
 > agent asks for a lease yet: no release build carries the `vault` feature.
 
 ## 1. Custody: who can read a secret
@@ -907,7 +908,7 @@ sequenceDiagram
 
 ## 17. What a device reports doing: `vault_activity` (P3-4d)
 
-The vault's own decisions are in `vault_audit` (§19). What a device says it
+The vault's own decisions are in `vault_audit` (§20). What a device says it
 DID with its leases is a different claim, made by a host that may be
 compromised, so it is kept apart in `vault_activity`, as `ssh_activity` is
 kept apart from `ssh_audit` ([`roomler-ssh.md`](roomler-ssh.md)). P3-4d-1
@@ -1057,7 +1058,114 @@ owner.
 >   whose yes counts among them; it cannot let anyone else answer. There is no
 >   approver role outside the drivers: such a person is named a driver first.
 
-## 19. Audit
+## 19. `proxy` mode (P3-5)
+
+In `proxy` mode the daemon serves an endpoint that authenticates upstream
+with the leased value, so the session, its model and its transcript never
+hold the value (AC12). A secret's `audiences` say which upstreams it may
+reach (§7). The design is the spec's §3e, "P3-5, `proxy` mode, as designed".
+P3-5b-1 builds the first engine, Postgres's, in `roomlerd`'s module
+`vault_proxy` (`agents/roomlerd/src/vault_proxy/mod.rs`). Nothing calls it
+yet: P3-5b-2's endpoint and `vault_connect` tool will be its first caller.
+
+```mermaid
+sequenceDiagram
+    participant C as client (psql)
+    participant P as the proxy (roomlerd)
+    participant U as upstream (Postgres)
+    C->>P: SSLRequest
+    P-->>C: N (the endpoint is a local socket)
+    C->>P: startup {user: anyone, database}
+    Note over P: replication refused<br/>user := the secret's
+    P->>U: TCP, SSLRequest
+    U-->>P: S
+    Note over P,U: TLS, the certificate verified
+    P->>U: startup {user: the secret's, database}
+    U-->>P: AuthenticationSASL [SCRAM-SHA-256, …]
+    P->>U: client-first (a nonce)
+    U-->>P: server-first (its nonce, salt, iterations)
+    P->>U: client-final (a proof, never the password)
+    U-->>P: server-final (its signature)
+    Note over P: the signature checked: only<br/>a server holding the password makes it
+    U-->>P: AuthenticationOk
+    P-->>C: AuthenticationOk, unasked
+    C->>U: every byte, both ways, through P
+```
+
+| Step | What the engine does | Where |
+|---|---|---|
+| the client's `SSLRequest`, `GSSENCRequest` | answered `N`: the endpoint is a local socket | `agents/roomlerd/src/vault_proxy/pg.rs:100` |
+| its `CancelRequest` | sent to the upstream as it came, over TLS: the key it names is the upstream's own, relayed unchanged | `pg.rs:107`, `pg.rs:288` |
+| its startup | `replication` refused, each one it names (Postgres takes the last, so a "no" first is no cover); `user` replaced by the secret's; everything else kept | `pg.rs:119`, `pg.rs:129` |
+| the upstream | TCP, an `SSLRequest` it must accept, and TLS verified against the system's roots and the secret's `ca` | `pg.rs:252`, `agents/roomlerd/src/vault_proxy/tls.rs:20` |
+| its authentication | SCRAM-SHA-256 only, and the server's signature checked before the session starts | `pg.rs:162`, `pg.rs:174`, `pg.rs:208` |
+| what it says meanwhile | a protocol negotiation passed on at once, since a client takes one only before its `AuthenticationOk`; a notice held until after it | `pg.rs:226`, `pg.rs:233` |
+| then | `AuthenticationOk` to the client, and every byte both ways | `pg.rs:242` |
+
+> ⚠️ **The client never authenticates.** The endpoint is its credential: a
+> socket only the session's account can reach (P3-5b-2). The client is never
+> asked for a password, and the secret's never crosses the endpoint, in
+> either direction.
+
+**What it refuses**, each before the password could leave:
+
+| What | The refusal says |
+|---|---|
+| an upstream that declines TLS | "the upstream declined TLS" (`pg.rs:275`) |
+| a certificate that no root and no `ca` vouches for | "TLS to *host*: …" |
+| a cleartext or MD5 password asked for, or Kerberos, GSSAPI or SSPI | "the upstream asked for …; the proxy authenticates with SCRAM-SHA-256 only" |
+| SASL without SCRAM-SHA-256 | "the upstream offers no SCRAM-SHA-256" |
+| a server that signs wrong: it never held the password | "… it does not hold the password" |
+| a server that began SCRAM and lets the session in unsigned | "… without proving it holds the password" |
+| a client asking for a replication connection | refused before any upstream is dialled |
+
+The proxy's refusals reach the client as Postgres writes a fatal error
+(`FATAL`, SQLSTATE `08004`), saying why (`pg.rs:378`). An upstream's own
+error, such as a wrong password or an unknown database, is relayed as the
+upstream wrote it.
+
+**SCRAM-SHA-256** (RFC 5802, RFC 7677), the client's half
+(`agents/roomlerd/src/vault_proxy/scram.rs`):
+
+| Rule | Why | Where |
+|---|---|---|
+| the password SASLprepped (RFC 4013) | both ends derive the key from the same form: a no-break space is a space, a control character is refused | `scram.rs:55` |
+| the server's nonce must extend this exchange's | a server first message from another exchange is refused | `scram.rs:91` |
+| at most 10,000,000 iterations | past that, an exchange is a way to make the daemon burn CPU (Postgres and MongoDB default to 4096 and 15000) | `scram.rs:31`, `scram.rs:101` |
+| a mandatory extension (`m=`) refused | as the RFC requires of a client that does not know it | `scram.rs:86` |
+| the server's signature compared in constant time | a server that cannot sign never had the password | `scram.rs:129`, `scram.rs:143` |
+| `n,,`: no channel binding yet | P3-5b-3 binds to `tls-server-end-point` where the upstream offers `-PLUS` | `scram.rs:34` |
+
+> ⚠️ **No channel binding yet.** Inside verified TLS, SCRAM already proves
+> that both ends hold the password. Binding adds catching a TLS terminator
+> the system also trusts (an inspection proxy whose CA is in the OS store)
+> relaying the exchange: P3-5b-3.
+>
+> ⚠️ **TLS is never unverified.** A proxy authenticates with a value, and a
+> value presented to an upstream nobody verified is presented to whoever
+> answered. The system's roots are trusted (a corporate CA in the OS store
+> included, as the daemon's own connection trusts it), and so is the
+> secret's `ca` when it holds one (`tls.rs:22`, `tls.rs:26`). Only `ring` is
+> linked: `tokio-rustls` without its default `aws-lc-rs`.
+
+**Bounds.** A session has 30 s to start, both sides together, and an
+upstream has 10 s to accept a connection (`pg.rs:50`, `pg.rs:52`). A
+client's startup packet is at most 10,000 bytes (Postgres's own limit), and
+an upstream's message before the session at most 64 KiB (`pg.rs:46`,
+`pg.rs:48`).
+
+**Tested** against a fake upstream over real TLS, with a certificate made
+for each test:
+- the whole road, with a client that sends no password;
+- the upstream's own refusal, relayed;
+- each refusal above, with what the upstream saw after it searched for the
+  password;
+- a trusting upstream, told nothing;
+- a cancel;
+- the order of a negotiation and a notice;
+- RFC 7677's exchange, byte for byte.
+
+## 20. Audit
 
 `vault_audit` holds every `secret:*` and `vault:verify` decision, allow and
 deny. Each row has the principal (`user` in P3-1), the action as a policy
@@ -1107,7 +1215,7 @@ Rows expire after
   that may be compromised. It goes to `vault_activity` (§17), never here, as
   `ssh_audit` and `ssh_activity` are kept apart.
 
-## 20. Collections
+## 21. Collections
 
 | Collection | One row per | Indexes | Retention |
 |---|---|---|---|
@@ -1126,10 +1234,12 @@ asked for ahead or not, lives in its memory (§12, §16), a listing is a
 decision recorded in `vault_audit`, and a rendered file is on the device, for
 its lease (§15).
 
-## 21. What comes next
+## 22. What comes next
 
 | Step | Builds |
 |---|---|
-| P3-5b to P3-5f | `proxy` mode's endpoints, as designed in the spec (§3e): Postgres, then MongoDB, HTTP named upstreams, the Kubernetes API and the SSH agent |
+| P3-5b-2 | the device's proxy endpoint and `vault_connect`, serving the Postgres engine (§19) for one lease |
+| P3-5b-3 | SCRAM channel binding (`tls-server-end-point`) where the upstream offers `-PLUS` |
+| P3-5c to P3-5f | `proxy` mode's other engines, as designed in the spec (§3e): MongoDB, HTTP named upstreams, the Kubernetes API and the SSH agent |
 | P3-6 to P3-9 | `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |
